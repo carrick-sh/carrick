@@ -66,7 +66,7 @@ use carrick_runtime::xlat_census::{
 use serde::Serialize;
 
 /// Schema tag on the emitted JSON. Bump when a field's meaning changes.
-const REPORT_SCHEMA: &str = "carrick.xlat-census.v3";
+const REPORT_SCHEMA: &str = "carrick.xlat-census.v2";
 
 /// Filename prefix `xlat_census::flush` writes (`xlat-<pid>-<stamp>-<seq>.txt`).
 const CENSUS_FILE_PREFIX: &str = "xlat-";
@@ -308,23 +308,6 @@ pub(crate) struct StoreSection {
     pub load_ms_total: u64,
     /// Milliseconds summed across processes inside store `publish`.
     pub publish_ms_total: u64,
-    pub shared_augment_claim_won: u64,
-    pub shared_augment_claim_live_lost: u64,
-    pub shared_augment_claim_yielded: u64,
-    pub shared_augment_claim_stale_takeover: u64,
-    pub shared_augment_claim_error: u64,
-    pub shared_unit_initial_publish: u64,
-    pub shared_unit_merge: u64,
-    pub shared_unit_blocks_added: u64,
-    pub shared_unit_duplicate_coalesced: u64,
-    pub shared_unit_conflict: u64,
-    pub shared_unit_repair: u64,
-    pub shared_unit_capacity_refused: u64,
-    pub shared_unit_preflight_refused: u64,
-    pub shared_unit_io_failed: u64,
-    pub shared_unit_validation_failed: u64,
-    pub shared_unit_empty_release: u64,
-    pub shared_unit_post_rename_sync_failed: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -629,7 +612,6 @@ fn store_section(files: &[CensusFile]) -> StoreSection {
     let mut load_ns_total = 0u64;
     let mut publish_ns_total = 0u64;
     let mut processes_that_claimed_recording = 0u64;
-    let mut augmentation = [0u64; 17];
 
     for file in files {
         let store = &file.store;
@@ -641,27 +623,6 @@ fn store_section(files: &[CensusFile]) -> StoreSection {
         load_ns_total = load_ns_total.saturating_add(store.load_ns);
         publish_ns_total = publish_ns_total.saturating_add(store.publish_ns);
         recording_declined = recording_declined.saturating_add(store.recording_declined);
-        for (slot, value) in augmentation.iter_mut().zip([
-            store.shared_augment_claim_won,
-            store.shared_augment_claim_live_lost,
-            store.shared_augment_claim_yielded,
-            store.shared_augment_claim_stale_takeover,
-            store.shared_augment_claim_error,
-            store.shared_unit_initial_publish,
-            store.shared_unit_merge,
-            store.shared_unit_blocks_added,
-            store.shared_unit_duplicate_coalesced,
-            store.shared_unit_conflict,
-            store.shared_unit_repair,
-            store.shared_unit_capacity_refused,
-            store.shared_unit_preflight_refused,
-            store.shared_unit_io_failed,
-            store.shared_unit_validation_failed,
-            store.shared_unit_empty_release,
-            store.shared_unit_post_rename_sync_failed,
-        ]) {
-            *slot = slot.saturating_add(value);
-        }
         for (skip, count) in &store.skipped {
             let entry = skipped.entry(*skip).or_insert(0);
             *entry = entry.saturating_add(*count);
@@ -727,23 +688,6 @@ fn store_section(files: &[CensusFile]) -> StoreSection {
         processes_that_claimed_recording,
         load_ms_total: load_ns_total / 1_000_000,
         publish_ms_total: publish_ns_total / 1_000_000,
-        shared_augment_claim_won: augmentation[0],
-        shared_augment_claim_live_lost: augmentation[1],
-        shared_augment_claim_yielded: augmentation[2],
-        shared_augment_claim_stale_takeover: augmentation[3],
-        shared_augment_claim_error: augmentation[4],
-        shared_unit_initial_publish: augmentation[5],
-        shared_unit_merge: augmentation[6],
-        shared_unit_blocks_added: augmentation[7],
-        shared_unit_duplicate_coalesced: augmentation[8],
-        shared_unit_conflict: augmentation[9],
-        shared_unit_repair: augmentation[10],
-        shared_unit_capacity_refused: augmentation[11],
-        shared_unit_preflight_refused: augmentation[12],
-        shared_unit_io_failed: augmentation[13],
-        shared_unit_validation_failed: augmentation[14],
-        shared_unit_empty_release: augmentation[15],
-        shared_unit_post_rename_sync_failed: augmentation[16],
     }
 }
 
@@ -841,37 +785,6 @@ pub(crate) fn run_xlat_census(dir: &Path, top: usize, observed: Option<u64>) -> 
             scan.failures.len(),
             dir.display()
         );
-    }
-    validate_campaign_invariants(&report)?;
-    Ok(())
-}
-
-fn validate_campaign_invariants(report: &CensusReport) -> Result<()> {
-    let recurring_contained = report.coverage.contained.translations
-        > report.coverage.contained.blocks
-        && report.store.shared_augment_claim_won > 0;
-    let publications = report
-        .store
-        .shared_unit_initial_publish
-        .saturating_add(report.store.shared_unit_merge)
-        .saturating_add(report.store.shared_unit_repair);
-    if recurring_contained && (publications == 0 || report.store.shared_unit_blocks_added == 0) {
-        bail!(
-            "recurring contained translations won augmentation claims but produced no successful merge or added blocks"
-        );
-    }
-    if report
-        .processes
-        .observed
-        .is_some_and(|observed| observed != report.processes.incarnations)
-    {
-        bail!("process-incarnation coverage is incomplete");
-    }
-    if report.processes.flush_balance != 0
-        || report.processes.reexec_successors_missing != 0
-        || report.processes.sequence_anomalies != 0
-    {
-        bail!("process flush lineage is imbalanced");
     }
     Ok(())
 }
@@ -1094,29 +1007,6 @@ mod tests {
     }
 
     #[test]
-    fn recurring_contained_work_requires_a_merge_with_added_blocks() {
-        let mut scan = two_process_scan();
-        for file in &mut scan.files {
-            file.store.shared_augment_claim_won = 1;
-        }
-        let report = aggregate(&scan, 8, None);
-        assert!(validate_campaign_invariants(&report).is_err());
-        scan.files[0].store.shared_unit_merge = 1;
-        scan.files[0].store.shared_unit_blocks_added = 1;
-        assert!(validate_campaign_invariants(&aggregate(&scan, 8, None)).is_ok());
-    }
-
-    #[test]
-    fn incomplete_process_coverage_and_flush_imbalance_fail_invariants() {
-        let report = aggregate(&two_process_scan(), 8, Some(3));
-        assert!(validate_campaign_invariants(&report).is_err());
-
-        let mut scan = fork_exec_scan();
-        scan.files[0].reason = CensusFlush::InProcessExec;
-        assert!(validate_campaign_invariants(&aggregate(&scan, 8, None)).is_err());
-    }
-
-    #[test]
     fn a_re_exec_successor_that_never_flushed_is_reported_not_swallowed() {
         let mut scan = fork_exec_scan();
         // Drop pid 3's post-exec incarnation: it translated and then died by a
@@ -1304,7 +1194,6 @@ mod tests {
                 misses: BTreeMap::from([(UnitMissReason::NoAuthority, 2)]),
                 load_ns: 0,
                 publish_ns: 0,
-                ..CensusStore::default()
             };
         }
         if let Some(file) = scan.files.get_mut(1) {
@@ -1319,7 +1208,6 @@ mod tests {
                 misses: BTreeMap::new(),
                 load_ns: 3_000_000,
                 publish_ns: 0,
-                ..CensusStore::default()
             };
         }
         let report = aggregate(&scan, 8, None);

@@ -611,340 +611,6 @@ class CampaignContractTest(unittest.TestCase):
     def setUp(self):
         self.root = pathlib.Path(tempfile.mkdtemp()).resolve()
         self.addCleanup(lambda: shutil.rmtree(self.root, ignore_errors=True))
-        self.store_seed, self.active_store, self.store_validator = self.sparse_store_fixture()
-
-    def run_campaign(self, *args, **kwargs):
-        kwargs.setdefault("store_seed_dir", self.store_seed)
-        kwargs.setdefault("active_store_dir", self.active_store)
-        return native_go_build_abba.run_campaign(*args, **kwargs)
-
-    def sparse_store_fixture(self) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
-        campaign_root = self.root / "target/perf/native-store-augmentation"
-        seed = campaign_root / "mechanism/seed"
-        active = campaign_root / "abba/active-store"
-        validator = self.root / "target/release/examples/native_manifest_census"
-        if not seed.exists():
-            seed.mkdir(parents=True)
-            unit = seed / ("0" * 64 + ".unit-v1")
-            unit.write_bytes(b"validated sparse unit fixture\n")
-            unit.chmod(0o444)
-            validator.parent.mkdir(parents=True, exist_ok=True)
-            validator.write_text(
-                "#!/bin/sh\n"
-                "for path in \"$1\"/*.unit-v1; do\n"
-                "  printf '{\"schema\":\"carrick.native-manifest-census.v4\",\"path\":\"%s\"}\\n' \"$path\"\n"
-                "done\n"
-            )
-            validator.chmod(0o555)
-        return seed, active, validator
-
-    def test_run_requires_immutable_validated_sparse_seed(self):
-        receipt = self.root / "arm.json"
-        overlay = self.root / "overlay.json"
-        base = [
-            "run",
-            "--harness-repo",
-            str(self.root),
-            "--control-receipt",
-            str(receipt),
-            "--candidate-receipt",
-            str(receipt),
-            "--control-overlay",
-            str(overlay),
-            "--candidate-overlay",
-            str(overlay),
-            "--output",
-            str(self.root / "campaign.json"),
-        ]
-        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            native_go_build_abba.parse_args(base)
-
-        seed, active, validator = self.sparse_store_fixture()
-        args = native_go_build_abba.parse_args(
-            [
-                *base,
-                "--store-seed-dir",
-                str(seed),
-                "--active-store-dir",
-                str(active),
-            ]
-        )
-        self.assertEqual(args.store_seed_dir, seed)
-        self.assertEqual(args.active_store_dir, active)
-
-    def test_every_warmup_and_sample_restores_exact_seed(self):
-        seed, active, validator = self.sparse_store_fixture()
-        expected = native_go_build.validate_sparse_store_tree(
-            seed,
-            validator=validator,
-            require_read_only=True,
-        )
-        receipt = self.receipt("control")
-        control = self.arm(
-            "A",
-            receipt,
-            self.overlay(
-                CARRICK_DSR_PERSISTENT_STORE="1",
-                CARRICK_DSR_STORE_AUGMENTATION="0",
-            ),
-        )
-        candidate = self.arm(
-            "B",
-            receipt,
-            self.overlay(CARRICK_DSR_PERSISTENT_STORE="1"),
-        )
-        positions = native_go_build_abba._campaign_positions(8)
-        observed = []
-        call_index = 0
-
-        def run_sample(_repo, _engine, index, _timeout, **kwargs):
-            nonlocal call_index
-            position = positions[call_index]
-            call_index += 1
-            active_receipt = native_go_build.validate_sparse_store_tree(
-                active,
-                validator=validator,
-                require_read_only=True,
-            )
-            observed.append(
-                (position["position"], active_receipt["tree_sha256"])
-            )
-            active_unit = active / ("0" * 64 + ".unit-v1")
-            active_unit.chmod(0o644)
-            active_unit.write_bytes(b"mutated by sample\n")
-            arm = control if position["arm"] == "A" else candidate
-            return self.sample(
-                arm,
-                index=index,
-                run_id=kwargs["current_run_id"],
-            )
-
-        output = self.root / "restore-every-position.json"
-        with self.campaign_fixtures(control, candidate, run_sample):
-            artifact = self.run_campaign(
-                self.root,
-                control,
-                candidate,
-                output,
-                cooldown_seconds=0,
-            )
-
-        self.assertEqual(len(observed), 34)
-        self.assertEqual(
-            {tree_hash for _position, tree_hash in observed},
-            {expected["tree_sha256"]},
-        )
-        self.assertEqual(
-            {
-                row["sparse_store_restore"]["active"]["tree_sha256"]
-                for row in artifact["samples"]
-            },
-            {expected["tree_sha256"]},
-        )
-
-    def test_both_arms_use_same_active_store_path(self):
-        receipt = self.receipt("control")
-        active = self.root / "target/perf/native-store-augmentation/abba/active-store"
-        control, candidate = native_go_build_abba.bind_active_store(
-            self.arm(
-                "A",
-                receipt,
-                self.overlay(
-                    CARRICK_DSR_PERSISTENT_STORE="1",
-                    CARRICK_DSR_STORE_AUGMENTATION="0",
-                ),
-            ),
-            self.arm(
-                "B",
-                receipt,
-                self.overlay(CARRICK_DSR_PERSISTENT_STORE="1"),
-            ),
-            active,
-        )
-        self.assertEqual(
-            dict(control.environment)["CARRICK_DSR_STORE_DIR"],
-            str(active.resolve()),
-        )
-        self.assertEqual(
-            dict(candidate.environment)["CARRICK_DSR_STORE_DIR"],
-            str(active.resolve()),
-        )
-
-    def test_seed_hash_and_per_sample_restore_hash_are_receipt_bound(self):
-        seed, active, validator = self.sparse_store_fixture()
-        restored = native_go_build.restore_sparse_store_seed(
-            seed,
-            active,
-            campaign_root=self.root / "target/perf/native-store-augmentation",
-            validator=validator,
-        )
-        self.assertEqual(
-            restored["seed"]["tree_sha256"],
-            restored["active"]["tree_sha256"],
-        )
-        self.assertEqual(restored["seed"]["entries"], restored["active"]["entries"])
-        self.assertEqual(
-            restored["validator"]["sha256"],
-            native_go_build.sha256_file(validator),
-        )
-
-    def test_mutated_or_symlinked_seed_fails_before_next_sample(self):
-        seed, active, validator = self.sparse_store_fixture()
-        receipt = self.receipt("control")
-        control = self.arm(
-            "A",
-            receipt,
-            self.overlay(
-                CARRICK_DSR_PERSISTENT_STORE="1",
-                CARRICK_DSR_STORE_AUGMENTATION="0",
-            ),
-        )
-        candidate = self.arm(
-            "B",
-            receipt,
-            self.overlay(CARRICK_DSR_PERSISTENT_STORE="1"),
-        )
-        unit = seed / ("0" * 64 + ".unit-v1")
-        sample_calls = 0
-
-        def run_sample(_repo, _engine, index, _timeout, **kwargs):
-            nonlocal sample_calls
-            sample_calls += 1
-            unit.chmod(0o644)
-            unit.write_bytes(b"mutated but read-only again\n")
-            unit.chmod(0o444)
-            return self.sample(
-                control,
-                index=index,
-                run_id=kwargs["current_run_id"],
-            )
-
-        output = self.root / "mutated-seed.json"
-        with (
-            self.campaign_fixtures(control, candidate, run_sample),
-            self.assertRaisesRegex(
-                native_go_build_abba.CampaignEvidenceError,
-                "seed or restore receipt drifted",
-            ),
-        ):
-            self.run_campaign(
-                self.root,
-                control,
-                candidate,
-                output,
-                cooldown_seconds=0,
-            )
-        self.assertEqual(sample_calls, 1)
-        self.assertEqual(len(json.loads(output.read_text())["samples"]), 1)
-
-        unit.unlink()
-        unit.symlink_to(self.root / "outside.unit-v1")
-        with self.assertRaisesRegex(ValueError, "symlink"):
-            native_go_build.restore_sparse_store_seed(
-                seed,
-                active,
-                campaign_root=self.root / "target/perf/native-store-augmentation",
-                validator=validator,
-            )
-
-    def test_failed_active_publish_rolls_back_exact_prior_directory(self):
-        seed, active, validator = self.sparse_store_fixture()
-        native_go_build.restore_sparse_store_seed(
-            seed,
-            active,
-            campaign_root=self.root / "target/perf/native-store-augmentation",
-            validator=validator,
-        )
-        marker = active / "prior-active-marker"
-        marker.write_text("prior active store\n")
-        real_replace = os.replace
-        replace_calls = 0
-
-        def fail_second_replace(source, destination):
-            nonlocal replace_calls
-            replace_calls += 1
-            if replace_calls == 2:
-                raise OSError("injected active-store publication failure")
-            return real_replace(source, destination)
-
-        with (
-            mock.patch.object(
-                native_go_build.os,
-                "replace",
-                side_effect=fail_second_replace,
-            ),
-            self.assertRaisesRegex(OSError, "injected active-store"),
-        ):
-            native_go_build.restore_sparse_store_seed(
-                seed,
-                active,
-                campaign_root=self.root / "target/perf/native-store-augmentation",
-                validator=validator,
-            )
-
-        self.assertEqual(marker.read_text(), "prior active store\n")
-        self.assertEqual(replace_calls, 3)
-
-    def test_decision_requires_primary_median_ratio_at_most_point_90(self):
-        def decision(ratio):
-            metric = {
-                "median_quad_ratio": ratio,
-                "bootstrap": {
-                    "one_sided_upper": 0.89,
-                    "two_sided_lower": 0.7,
-                    "two_sided_upper": 0.99,
-                },
-                "sign_test": {
-                    "probability": {
-                        "numerator": 1,
-                        "denominator": 100,
-                        "probability": 0.01,
-                    }
-                },
-            }
-            return native_go_build_abba._campaign_decision(
-                {
-                    "quad_count": 8,
-                    "metrics": {
-                        "cpu_s": metric,
-                        "cpu_user_s": dict(metric),
-                        "cpu_sys_s": dict(metric),
-                        "elapsed_ms": dict(metric),
-                        "workload_ms": dict(metric),
-                    },
-                },
-                complete=True,
-            )
-
-        self.assertFalse(decision(0.9000001)["statistical_pass"])
-        self.assertTrue(decision(0.90)["statistical_pass"])
-
-    def test_battery_source_is_metadata_not_an_exclusion(self):
-        calls = iter(
-            (
-                subprocess.CompletedProcess(
-                    ["pmset", "-g", "batt"],
-                    0,
-                    "Now drawing from 'Battery Power'\n",
-                    "",
-                ),
-                subprocess.CompletedProcess(
-                    ["pmset", "-g", "therm"],
-                    0,
-                    "No thermal warning\nNo performance warning\nNo CPU power status\n",
-                    "",
-                ),
-            )
-        )
-        with mock.patch.object(
-            native_go_build_abba.subprocess,
-            "run",
-            side_effect=lambda *_args, **_kwargs: next(calls),
-        ):
-            evidence = native_go_build_abba._darwin_power_preflight()
-        self.assertEqual(evidence["power_source"], "Battery Power")
-        self.assertNotIn("battery_allowed", evidence)
-        self.assertNotIn("battery_authorized", evidence)
 
     def receipt(self, name: str) -> native_go_build_abba.ArmReceipt:
         arm = self.root / name
@@ -1018,7 +684,6 @@ class CampaignContractTest(unittest.TestCase):
     ) -> dict[str, object]:
         receipt = arm.receipt
         environment = dict(arm.environment)
-        environment["CARRICK_DSR_STORE_DIR"] = str(self.active_store.resolve())
         executed_image_ref = (
             receipt.image_repo_digests[0]
             if image_ref is None
@@ -1120,7 +785,6 @@ class CampaignContractTest(unittest.TestCase):
         current_image: dict[str, object] | None = None,
         sleep=None,
     ):
-        real_subprocess_run = subprocess.run
         receipt_calls = 0
         receipts = {
             control.receipt.path.resolve(): control.receipt,
@@ -1135,8 +799,6 @@ class CampaignContractTest(unittest.TestCase):
             return receipts[path.resolve()]
 
         def command(command, **_kwargs):
-            if pathlib.Path(command[0]).resolve() == self.store_validator.resolve():
-                return real_subprocess_run(command, **_kwargs)
             if command == ["pmset", "-g", "batt"]:
                 return subprocess.CompletedProcess(command, 0, battery, "")
             if command == ["pmset", "-g", "therm"]:
@@ -1546,7 +1208,7 @@ class CampaignContractTest(unittest.TestCase):
         output = self.root / "invalid.json"
 
         with self.assertRaisesRegex(ValueError, "at least eight"):
-            self.run_campaign(
+            native_go_build_abba.run_campaign(
                 self.root,
                 arm,
                 self.arm("B", receipt),
@@ -1554,7 +1216,7 @@ class CampaignContractTest(unittest.TestCase):
                 quads=7,
             )
         with self.assertRaisesRegex(ValueError, "timeout_seconds"):
-            self.run_campaign(
+            native_go_build_abba.run_campaign(
                 self.root,
                 arm,
                 self.arm("B", receipt),
@@ -1562,7 +1224,7 @@ class CampaignContractTest(unittest.TestCase):
                 timeout_seconds=0,
             )
         with self.assertRaisesRegex(ValueError, "at most 127"):
-            self.run_campaign(
+            native_go_build_abba.run_campaign(
                 self.root,
                 arm,
                 self.arm("B", receipt),
@@ -1586,10 +1248,6 @@ class CampaignContractTest(unittest.TestCase):
             str(overlay),
             "--candidate-overlay",
             str(overlay),
-            "--store-seed-dir",
-            str(self.store_seed),
-            "--active-store-dir",
-            str(self.active_store),
             "--output",
             str(self.root / "campaign.json"),
         ]
@@ -1597,9 +1255,10 @@ class CampaignContractTest(unittest.TestCase):
 
         self.assertEqual(args.command, "run")
         self.assertFalse(hasattr(args, "resume"))
-        self.assertFalse(hasattr(args, "allow_battery"))
-        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            native_go_build_abba.parse_args([*argv, "--allow-battery"])
+        self.assertFalse(args.allow_battery)
+        self.assertTrue(
+            native_go_build_abba.parse_args([*argv, "--allow-battery"]).allow_battery
+        )
 
     def test_existing_campaign_output_cannot_be_resumed_or_overwritten(self):
         receipt = self.receipt("control")
@@ -1610,7 +1269,7 @@ class CampaignContractTest(unittest.TestCase):
         output.write_bytes(sentinel)
 
         with self.assertRaisesRegex(FileExistsError, "cannot resume"):
-            self.run_campaign(
+            native_go_build_abba.run_campaign(
                 self.root,
                 control,
                 candidate,
@@ -1633,7 +1292,7 @@ class CampaignContractTest(unittest.TestCase):
             ) as writer,
             self.assertRaisesRegex(RuntimeError, "stop after initial"),
         ):
-            self.run_campaign(
+            native_go_build_abba.run_campaign(
                 self.root,
                 control,
                 candidate,
@@ -1681,10 +1340,6 @@ class CampaignContractTest(unittest.TestCase):
                     str(overlay),
                     "--candidate-overlay",
                     str(overlay),
-                    "--store-seed-dir",
-                    str(self.store_seed),
-                    "--active-store-dir",
-                    str(self.active_store),
                     "--output",
                     str(output),
                 ]
@@ -1757,12 +1412,19 @@ class CampaignContractTest(unittest.TestCase):
             "run",
             side_effect=lambda *_args, **_kwargs: next(battery_calls),
         ):
-            battery_result = native_go_build_abba._darwin_power_preflight()
+            battery_result = native_go_build_abba._darwin_power_preflight(
+                allow_battery=True
+            )
         self.assertEqual(battery_result["power_source"], "Battery Power")
-        self.assertNotIn("battery_authorized", battery_result)
+        self.assertTrue(battery_result["battery_authorized"])
         self.assertIn("Battery Power", battery_result["battery_output"])
 
         rejected = (
+            (
+                "Now drawing from 'Battery Power'\n",
+                accepted_thermal,
+                "AC Power",
+            ),
             (
                 "Now drawing from 'AC Power'\n",
                 "CPU_Speed_Limit = 99\nScheduler_Limit = 100\nCPU_Available = 1\n",
@@ -1815,6 +1477,11 @@ class CampaignContractTest(unittest.TestCase):
         candidate = self.arm("B", receipt)
         scenarios = (
             {
+                "name": "battery power",
+                "kwargs": {"battery": "Now drawing from 'Battery Power'\n"},
+                "reason": "AC Power",
+            },
+            {
                 "name": "thermal warning",
                 "kwargs": {"thermal": "CPU_Speed_Limit = 75\n"},
                 "reason": "thermal",
@@ -1864,7 +1531,7 @@ class CampaignContractTest(unittest.TestCase):
                         scenario["reason"],
                     ),
                 ):
-                    self.run_campaign(
+                    native_go_build_abba.run_campaign(
                         self.root,
                         control,
                         candidate,
@@ -1906,7 +1573,7 @@ class CampaignContractTest(unittest.TestCase):
                         "ambient Carrick",
                     ),
                 ):
-                    self.run_campaign(
+                    native_go_build_abba.run_campaign(
                         self.root,
                         control,
                         candidate,
@@ -1959,7 +1626,7 @@ class CampaignContractTest(unittest.TestCase):
                 "receipt drift before quad",
             ),
         ):
-            self.run_campaign(
+            native_go_build_abba.run_campaign(
                 self.root,
                 control,
                 candidate,
@@ -2048,7 +1715,7 @@ class CampaignContractTest(unittest.TestCase):
                         scenario["reason"],
                     ),
                 ):
-                    self.run_campaign(
+                    native_go_build_abba.run_campaign(
                         self.root,
                         control,
                         candidate,
@@ -2130,7 +1797,7 @@ class CampaignContractTest(unittest.TestCase):
                         scenario["reason"],
                     ),
                 ):
-                    self.run_campaign(
+                    native_go_build_abba.run_campaign(
                         self.root,
                         control,
                         candidate,
@@ -2178,7 +1845,7 @@ class CampaignContractTest(unittest.TestCase):
                         f"injected marker failure at {failure_index}",
                     ),
                 ):
-                    self.run_campaign(
+                    native_go_build_abba.run_campaign(
                         self.root,
                         control,
                         candidate,
@@ -2240,7 +1907,7 @@ class CampaignContractTest(unittest.TestCase):
             run_sample,
             sleep=cooldown,
         ) as sample_mock:
-            artifact = self.run_campaign(
+            artifact = native_go_build_abba.run_campaign(
                 self.root,
                 control,
                 candidate,
@@ -2302,7 +1969,7 @@ class CampaignContractTest(unittest.TestCase):
             candidate,
             run_sample,
         ):
-            artifact = self.run_campaign(
+            artifact = native_go_build_abba.run_campaign(
                 self.root,
                 control,
                 candidate,
@@ -2347,7 +2014,7 @@ class CampaignContractTest(unittest.TestCase):
             candidate,
             run_sample,
         ):
-            artifact = self.run_campaign(
+            artifact = native_go_build_abba.run_campaign(
                 self.root,
                 control,
                 candidate,
@@ -2386,7 +2053,7 @@ class CampaignContractTest(unittest.TestCase):
             candidate,
             run_sample,
         ):
-            artifact = self.run_campaign(
+            artifact = native_go_build_abba.run_campaign(
                 self.root,
                 control,
                 candidate,
@@ -2494,7 +2161,7 @@ class CampaignContractTest(unittest.TestCase):
                 "matching immutable repo digest",
             ),
         ):
-            self.run_campaign(
+            native_go_build_abba.run_campaign(
                 self.root,
                 control,
                 candidate,
@@ -2623,7 +2290,7 @@ class CampaignContractTest(unittest.TestCase):
                 return_value=[],
             ) as census,
         ):
-            artifact = self.run_campaign(
+            artifact = native_go_build_abba.run_campaign(
                 self.root,
                 control,
                 candidate,
@@ -2653,7 +2320,6 @@ class CampaignContractTest(unittest.TestCase):
             "bootstrap": {
                 "one_sided_upper": 0.9,
                 "two_sided_lower": 0.7,
-                "two_sided_upper": 0.9,
             },
             "sign_test": {
                 "probability": {
@@ -2735,7 +2401,7 @@ class CampaignContractTest(unittest.TestCase):
                         "sample evidence",
                     ),
                 ):
-                    self.run_campaign(
+                    native_go_build_abba.run_campaign(
                         self.root,
                         control,
                         candidate,
@@ -2793,7 +2459,7 @@ class CampaignContractTest(unittest.TestCase):
                         "sample evidence",
                     ),
                 ):
-                    self.run_campaign(
+                    native_go_build_abba.run_campaign(
                         self.root,
                         control,
                         candidate,

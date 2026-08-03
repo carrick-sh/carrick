@@ -7,16 +7,6 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
-use crate::pending_augmentation::RecordingOwner;
-
-mod unit_bundle;
-pub use unit_bundle::{
-    DecodedUnitBundle, MergeKind, MergeOutcome, MergeRefusal, NormalizedUnion, StoredBlockArtifact,
-    TRANSLATION_UNIT_SCHEMA_V6, UNIT_BUNDLE_HEADER_BYTES_V1, UNIT_BUNDLE_MAGIC_V1,
-    UNIT_BUNDLE_SCHEMA_V1, UnitStoreFailure, UnitStoreFailureClass, decode_unit_bundle_v1,
-    decode_unit_bundle_v1_for_diagnostics, encode_unit_bundle_v1, merge_normalized_artifacts,
-};
-
 // 4: the reserved-resident virtualization template (new emitted shapes and
 // the `CommitReservedResident` recovery action, wire tag 21).
 // 5: the lean indirect-branch lookup (flag-free probe, flavor-gated
@@ -38,13 +28,10 @@ pub use unit_bundle::{
 // v4 whole-manifest decode cost more per exec than the retranslation the
 // store avoided (~11.6 ms of ~1.79M-record varint decode on the go
 // toolchain unit, ~98% of it pc map + recovery).
-// 9: one-inode `unit-v1` bundles with V6 block indexes. Each row binds the
-// guest source extent and INITIAL generation, so a later producer can merge
-// only byte-identical normalized artifacts at the same guest start.
-pub const TRANSLATOR_ABI_CURRENT: u32 = 9;
+pub const TRANSLATOR_ABI_CURRENT: u32 = 8;
+pub const TRANSLATION_UNIT_SCHEMA_V5: u32 = 5;
 pub const MAX_TRANSLATION_UNIT_CODE_BYTES: usize = 64 * 1024 * 1024;
 pub const TRANSLATION_UNIT_BASE_EXPORT: &str = "carrick_aot_unit_base";
-const TRANSLATION_UNIT_METADATA_DECODE_LIMIT: usize = 256 * 1024 * 1024;
 const DARWIN_HOST_PAGE_SIZE: u64 = 16 * 1024;
 static SHARED_MANIFEST_ARC_ENABLED: OnceLock<bool> = OnceLock::new();
 static SHARED_SOURCE_FINGERPRINT_REUSE_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -386,29 +373,17 @@ impl Eq for TranslationUnitManifest {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingTranslationUnit {
     pub key: TranslationUnitKey,
-    /// Canonical owned artifacts. Publication, deterministic union, and the
-    /// crash-readable pending ABI all consume this same representation.
-    pub blocks: Vec<StoredBlockArtifact>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RecordingClaim {
-    pub owner: RecordingOwner,
-    pub stale_takeover: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ClaimOutcome {
-    Won(RecordingClaim),
-    LiveOwner,
-    Yielded,
+    /// Concatenated per-block template words, relocation immediates ZEROED
+    /// (unbaked). Nothing is patched at pack time: same-unit links, trusted
+    /// entries, and process values are all resolved at install by per-block
+    /// replay plus `publish_emitted`'s pending-link patching.
+    pub code: Vec<u8>,
+    pub blocks: Vec<PortableBlockRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PortableBlockCandidate {
     pub guest_start: GuestVa,
-    pub source_end: GuestVa,
-    pub generation: crate::types::CodeGeneration,
     pub requires_sensitive_metadata: bool,
     /// The FULL native-tap recording (`ArtifactRecord::template` from the
     /// one native emission), words included.
@@ -416,12 +391,6 @@ pub struct PortableBlockCandidate {
 }
 
 impl PendingTranslationUnit {
-    pub(crate) fn normalize_candidate(
-        candidate: PortableBlockCandidate,
-    ) -> Result<StoredBlockArtifact, crate::types::DsrError> {
-        StoredBlockArtifact::from_candidate(candidate, shared_recovery_runs_enabled())
-    }
-
     pub fn pack(
         key: TranslationUnitKey,
         candidates: Vec<PortableBlockCandidate>,
@@ -434,22 +403,57 @@ impl PendingTranslationUnit {
         candidates: Vec<PortableBlockCandidate>,
         recovery_runs: bool,
     ) -> Result<Self, crate::types::DsrError> {
+        let mut code = Vec::new();
         let mut blocks = Vec::with_capacity(candidates.len());
         let mut guest_starts = BTreeSet::new();
         for candidate in candidates {
+            let words = candidate.template.words();
+            if words.is_empty() {
+                return Err(crate::types::DsrError::CachePolicy(format!(
+                    "translation unit candidate 0x{:x} carries no recorded words",
+                    candidate.guest_start.raw()
+                )));
+            }
+            let entry_offset = u32::try_from(code.len()).map_err(|_| {
+                crate::types::DsrError::CachePolicy(
+                    "translation unit entry offset exceeds u32".to_string(),
+                )
+            })?;
+            let code_len = u32::try_from(words.len().saturating_mul(4)).map_err(|_| {
+                crate::types::DsrError::CachePolicy(
+                    "translation unit block length exceeds u32".to_string(),
+                )
+            })?;
+            if code.len().saturating_add(code_len as usize) > MAX_TRANSLATION_UNIT_CODE_BYTES {
+                return Err(crate::types::DsrError::CachePolicy(
+                    "translation unit exceeds the 64 MiB branch-range cap".to_string(),
+                ));
+            }
             if !guest_starts.insert(candidate.guest_start) {
                 return Err(crate::types::DsrError::CachePolicy(format!(
                     "translation unit contains duplicate block 0x{:x}",
                     candidate.guest_start.raw()
                 )));
             }
-            blocks.push(StoredBlockArtifact::from_candidate(
-                candidate,
-                recovery_runs,
-            )?);
+            for word in words {
+                code.extend_from_slice(&word.to_le_bytes());
+            }
+            blocks.push(PortableBlockRecord {
+                guest_start: candidate.guest_start,
+                entry_offset,
+                code_len,
+                requires_sensitive_metadata: candidate.requires_sensitive_metadata,
+                template: candidate
+                    .template
+                    .into_unit_record_metadata(recovery_runs)?,
+            });
         }
-        blocks.sort_by_key(|block| block.guest_start);
-        Ok(Self { key, blocks })
+        if code.is_empty() {
+            return Err(crate::types::DsrError::CachePolicy(
+                "translation unit contains no blocks".to_string(),
+            ));
+        }
+        Ok(Self { key, code, blocks })
     }
 }
 
@@ -577,6 +581,16 @@ impl UnitMissReason {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublishOutcome {
+    Winner,
+    Existing,
+    /// Another process held the unit's store lock: it is emitting this same
+    /// unit right now, so this publisher dropped its copy instead of
+    /// blocking on a rival's emission.
+    Yielded,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TranslationMetadataLoadEvidence {
     pub bytes_read: u64,
@@ -654,17 +668,15 @@ pub trait TranslationUnitStore: Send + Sync {
         source_words: &[u32],
     ) -> Result<Option<SharedLoadedTranslationUnit>, UnitMissReason>;
 
-    fn claim_recording(
-        &self,
-        key: &TranslationUnitKey,
-        owner: &RecordingOwner,
-    ) -> Result<ClaimOutcome, UnitStoreFailure>;
+    fn publish(&self, pending: &PendingTranslationUnit) -> Result<PublishOutcome, UnitMissReason>;
 
-    fn merge(
-        &self,
-        pending: &PendingTranslationUnit,
-        claim: &RecordingClaim,
-    ) -> Result<MergeOutcome, UnitStoreFailure>;
+    /// Elect at most one portable-template recorder after a unit has proven
+    /// that it recurs in this container. The default keeps fixture and
+    /// non-Darwin stores simple; Darwin persists the election in the private
+    /// container cache directory.
+    fn claim_recording(&self, _key: &TranslationUnitKey) -> bool {
+        true
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -768,7 +780,7 @@ impl TranslationUnitManifest {
     /// never the metadata size, or the attach cost the v5 wire removed
     /// creeps back.
     pub fn validate_ranges_detailed(&self) -> Result<(), ManifestDefect> {
-        if self.schema != TRANSLATION_UNIT_SCHEMA_V6 {
+        if self.schema != TRANSLATION_UNIT_SCHEMA_V5 {
             return Err(ManifestDefect::Schema);
         }
         if self.key.translator_abi() != TRANSLATOR_ABI_CURRENT {
@@ -906,62 +918,242 @@ impl TranslationUnitManifest {
         })
     }
 
-    /// Build an in-memory V6 replay view for fixtures that already own their
-    /// code bytes. Persistent stores decode the one-inode `unit-v1` wire.
+    /// Build a manifest by round-tripping records through THE wire, so a
+    /// fixture or in-memory store is bit-identical to what the persistent
+    /// store would serve. There is deliberately no way to hand-assemble the
+    /// decoded form.
     pub fn from_blocks(
         key: &TranslationUnitKey,
         code_sha256: [u8; 32],
         code_len: u64,
         blocks: &[PortableBlockRecord],
     ) -> Result<Self, crate::types::DsrError> {
-        let config =
-            bincode::config::standard().with_limit::<TRANSLATION_UNIT_METADATA_DECODE_LIMIT>();
-        let mut index = Vec::with_capacity(blocks.len());
-        let mut payload = Vec::new();
-        for block in blocks {
-            let (hot, cold) = block.template.clone().into_unit_wire_parts();
-            let hot = bincode::serde::encode_to_vec(hot, config).map_err(|error| {
-                crate::types::DsrError::CachePolicy(format!(
-                    "encode in-memory unit hot metadata: {error}"
-                ))
-            })?;
-            let cold = bincode::serde::encode_to_vec(cold, config).map_err(|error| {
-                crate::types::DsrError::CachePolicy(format!(
-                    "encode in-memory unit cold metadata: {error}"
-                ))
-            })?;
-            let payload_offset = payload.len();
-            payload.extend_from_slice(&hot);
-            payload.extend_from_slice(&cold);
-            index.push(UnitBlockIndexEntry {
-                guest_start: block.guest_start,
-                entry_offset: block.entry_offset,
-                code_len: block.code_len,
-                requires_sensitive_metadata: block.requires_sensitive_metadata,
-                payload_offset,
-                hot_len: hot.len(),
-                cold_len: cold.len(),
-            });
-        }
-        let payload_len = payload.len();
-        Ok(Self {
-            schema: TRANSLATION_UNIT_SCHEMA_V6,
-            key: key.clone(),
-            code_sha256,
-            base_export: translation_unit_base_export(key).map_err(|error| {
-                crate::types::DsrError::CachePolicy(format!(
-                    "derive in-memory unit base export: {error}"
-                ))
-            })?,
-            code_len,
-            index,
-            payload: UnitPayload {
-                bytes: Arc::new(payload),
-                start: 0,
-                len: payload_len,
-            },
+        let bytes = encode_translation_unit_metadata(key, code_sha256, code_len, blocks)?;
+        decode_translation_unit_metadata(Arc::new(bytes)).map_err(|reason| {
+            crate::types::DsrError::CachePolicy(format!(
+                "encoded unit metadata failed to decode: {reason:?}"
+            ))
         })
     }
+}
+
+/// Magic prefix of the serialized unit metadata (`{stem}.metadata-v5`). A
+/// file without it — foreign, truncated, or written by any pre-index
+/// binary — refuses to decode and reads as a schema miss, never as a
+/// lower-quality unit.
+pub const TRANSLATION_UNIT_METADATA_MAGIC: [u8; 8] = *b"CUNITV5\0";
+const TRANSLATION_UNIT_METADATA_DECODE_LIMIT: usize = 256 * 1024 * 1024;
+/// Fixed wire width of one index row: guest_start u64, entry_offset u32,
+/// code_len u32, flags u32, hot_len u32, cold_len u32, all little-endian.
+const UNIT_BLOCK_INDEX_ROW_BYTES: usize = 28;
+const UNIT_BLOCK_FLAG_SENSITIVE: u32 = 1;
+
+/// The bincode-encoded (varint) leading header of the v5 metadata file; the
+/// fixed-width index and the per-block blob payload follow it raw.
+#[derive(Serialize, Deserialize)]
+struct WireUnitHeader {
+    schema: u32,
+    key: TranslationUnitKey,
+    code_sha256: [u8; 32],
+    base_export: String,
+    code_len: u64,
+    block_count: u64,
+    payload_len: u64,
+}
+
+/// Serialize unit metadata: magic, a small bincode header, a fixed-width
+/// per-block index, then every block's hot blob immediately followed by its
+/// cold blob, tightly packed in index order (the decoder recomputes and
+/// ENFORCES the packing, so offsets never appear on the wire).
+pub fn encode_translation_unit_metadata(
+    key: &TranslationUnitKey,
+    code_sha256: [u8; 32],
+    code_len: u64,
+    blocks: &[PortableBlockRecord],
+) -> Result<Vec<u8>, crate::types::DsrError> {
+    let config = bincode::config::standard().with_limit::<TRANSLATION_UNIT_METADATA_DECODE_LIMIT>();
+    let base_export = translation_unit_base_export(key).map_err(|error| {
+        crate::types::DsrError::CachePolicy(format!("derive unit base export: {error}"))
+    })?;
+    let mut index = Vec::with_capacity(blocks.len() * UNIT_BLOCK_INDEX_ROW_BYTES);
+    let mut payload = Vec::new();
+    for record in blocks {
+        let (hot, cold) = record.template.clone().into_unit_wire_parts();
+        let hot_blob = bincode::serde::encode_to_vec(&hot, config).map_err(|error| {
+            crate::types::DsrError::CachePolicy(format!("encode unit block hot blob: {error}"))
+        })?;
+        let cold_blob = bincode::serde::encode_to_vec(&cold, config).map_err(|error| {
+            crate::types::DsrError::CachePolicy(format!("encode unit block cold blob: {error}"))
+        })?;
+        let hot_len = u32::try_from(hot_blob.len()).map_err(|_| {
+            crate::types::DsrError::CachePolicy("unit block hot blob exceeds u32".to_string())
+        })?;
+        let cold_len = u32::try_from(cold_blob.len()).map_err(|_| {
+            crate::types::DsrError::CachePolicy("unit block cold blob exceeds u32".to_string())
+        })?;
+        let mut flags = 0_u32;
+        if record.requires_sensitive_metadata {
+            flags |= UNIT_BLOCK_FLAG_SENSITIVE;
+        }
+        index.extend_from_slice(&record.guest_start.raw().to_le_bytes());
+        index.extend_from_slice(&record.entry_offset.to_le_bytes());
+        index.extend_from_slice(&record.code_len.to_le_bytes());
+        index.extend_from_slice(&flags.to_le_bytes());
+        index.extend_from_slice(&hot_len.to_le_bytes());
+        index.extend_from_slice(&cold_len.to_le_bytes());
+        payload.extend_from_slice(&hot_blob);
+        payload.extend_from_slice(&cold_blob);
+    }
+    let header = WireUnitHeader {
+        schema: TRANSLATION_UNIT_SCHEMA_V5,
+        key: key.clone(),
+        code_sha256,
+        base_export,
+        code_len,
+        block_count: blocks.len() as u64,
+        payload_len: payload.len() as u64,
+    };
+    let header_bytes = bincode::serde::encode_to_vec(&header, config).map_err(|error| {
+        crate::types::DsrError::CachePolicy(format!("encode unit metadata header: {error}"))
+    })?;
+    let header_len = u32::try_from(header_bytes.len()).map_err(|_| {
+        crate::types::DsrError::CachePolicy("unit metadata header exceeds u32".to_string())
+    })?;
+    let mut bytes = TRANSLATION_UNIT_METADATA_MAGIC.to_vec();
+    bytes.extend_from_slice(&header_len.to_le_bytes());
+    bytes.extend_from_slice(&header_bytes);
+    bytes.extend_from_slice(&index);
+    bytes.extend_from_slice(&payload);
+    Ok(bytes)
+}
+
+fn read_le_u32(bytes: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,
+    ))
+}
+
+fn read_le_u64(bytes: &[u8], at: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(
+        bytes.get(at..at.checked_add(8)?)?.try_into().ok()?,
+    ))
+}
+
+/// Structural decode of the v5 metadata: magic, header, index geometry and
+/// EXACT extent accounting (index rows == block count, payload == declared
+/// length, file ends where the payload ends). No per-block blob is decoded
+/// here — a blob decodes on the block's first lookup (hot) or first fault
+/// (cold), fail-closed per block. Semantic invariants (schema/ABI/extents
+/// against `code_len`) stay in [`TranslationUnitManifest::validate_ranges`].
+///
+/// `bytes` is the WHOLE file, kept alive by the returned manifest (the
+/// store passes its mmap; fixtures pass the encoded vector) — this is what
+/// makes per-block decode possible without copying the payload.
+pub fn decode_translation_unit_metadata(
+    bytes: Arc<dyn AsRef<[u8]> + Send + Sync>,
+) -> Result<TranslationUnitManifest, UnitMissReason> {
+    let data: &[u8] = (*bytes).as_ref();
+    let body = data
+        .strip_prefix(&TRANSLATION_UNIT_METADATA_MAGIC)
+        .ok_or(UnitMissReason::Schema)?;
+    let header_len =
+        usize::try_from(read_le_u32(body, 0).ok_or(UnitMissReason::Schema)?).unwrap_or(usize::MAX);
+    let header_bytes = body
+        .get(
+            4..4_usize
+                .checked_add(header_len)
+                .ok_or(UnitMissReason::Schema)?,
+        )
+        .ok_or(UnitMissReason::Schema)?;
+    let config = bincode::config::standard().with_limit::<TRANSLATION_UNIT_METADATA_DECODE_LIMIT>();
+    let (header, consumed): (WireUnitHeader, usize) =
+        bincode::serde::decode_from_slice(header_bytes, config)
+            .map_err(|_| UnitMissReason::Schema)?;
+    if consumed != header_bytes.len() {
+        return Err(UnitMissReason::Schema);
+    }
+    let block_count =
+        usize::try_from(header.block_count).map_err(|_| UnitMissReason::ManifestRange)?;
+    let payload_len =
+        usize::try_from(header.payload_len).map_err(|_| UnitMissReason::ManifestRange)?;
+    let index_start = 4_usize
+        .checked_add(header_len)
+        .ok_or(UnitMissReason::Schema)?;
+    let index_len = block_count
+        .checked_mul(UNIT_BLOCK_INDEX_ROW_BYTES)
+        .ok_or(UnitMissReason::ManifestRange)?;
+    let payload_start = index_start
+        .checked_add(index_len)
+        .ok_or(UnitMissReason::ManifestRange)?;
+    let expected_total = payload_start
+        .checked_add(payload_len)
+        .ok_or(UnitMissReason::ManifestRange)?;
+    if body.len() != expected_total {
+        return Err(UnitMissReason::Schema);
+    }
+    let index_bytes = body
+        .get(index_start..payload_start)
+        .ok_or(UnitMissReason::Schema)?;
+    let mut index = Vec::with_capacity(block_count);
+    let mut payload_offset = 0_usize;
+    for row in 0..block_count {
+        let at = row * UNIT_BLOCK_INDEX_ROW_BYTES;
+        let guest_start = read_le_u64(index_bytes, at).ok_or(UnitMissReason::Schema)?;
+        let entry_offset = read_le_u32(index_bytes, at + 8).ok_or(UnitMissReason::Schema)?;
+        let block_code_len = read_le_u32(index_bytes, at + 12).ok_or(UnitMissReason::Schema)?;
+        let flags = read_le_u32(index_bytes, at + 16).ok_or(UnitMissReason::Schema)?;
+        let hot_len =
+            usize::try_from(read_le_u32(index_bytes, at + 20).ok_or(UnitMissReason::Schema)?)
+                .map_err(|_| UnitMissReason::ManifestRange)?;
+        let cold_len =
+            usize::try_from(read_le_u32(index_bytes, at + 24).ok_or(UnitMissReason::Schema)?)
+                .map_err(|_| UnitMissReason::ManifestRange)?;
+        if flags & !UNIT_BLOCK_FLAG_SENSITIVE != 0 {
+            return Err(UnitMissReason::Schema);
+        }
+        let blob_len = hot_len
+            .checked_add(cold_len)
+            .ok_or(UnitMissReason::ManifestRange)?;
+        let blob_end = payload_offset
+            .checked_add(blob_len)
+            .ok_or(UnitMissReason::ManifestRange)?;
+        if blob_end > payload_len {
+            return Err(UnitMissReason::ManifestRange);
+        }
+        index.push(UnitBlockIndexEntry {
+            guest_start: GuestVa(guest_start),
+            entry_offset,
+            code_len: block_code_len,
+            requires_sensitive_metadata: flags & UNIT_BLOCK_FLAG_SENSITIVE != 0,
+            payload_offset,
+            hot_len,
+            cold_len,
+        });
+        payload_offset = blob_end;
+    }
+    // Tight packing: the last blob must end exactly at the payload's end,
+    // or the file carries bytes no index row accounts for.
+    if payload_offset != payload_len {
+        return Err(UnitMissReason::Schema);
+    }
+    // The payload region is addressed relative to the whole buffer.
+    let payload_abs_start = TRANSLATION_UNIT_METADATA_MAGIC
+        .len()
+        .checked_add(payload_start)
+        .ok_or(UnitMissReason::ManifestRange)?;
+    Ok(TranslationUnitManifest {
+        schema: header.schema,
+        key: header.key,
+        code_sha256: header.code_sha256,
+        base_export: header.base_export,
+        code_len: header.code_len,
+        index,
+        payload: UnitPayload {
+            bytes,
+            start: payload_abs_start,
+            len: payload_len,
+        },
+    })
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1143,8 +1335,6 @@ mod tests {
         .expect("record native-tap candidate");
         PortableBlockCandidate {
             guest_start,
-            source_end: GuestVa(guest_start.raw() + 4),
-            generation: CodeGeneration::INITIAL,
             requires_sensitive_metadata: false,
             template: artifact.template,
         }
@@ -1212,7 +1402,7 @@ mod tests {
     }
 
     #[test]
-    fn pack_retains_canonical_normalized_native_tap_artifacts() {
+    fn pack_concatenates_unbaked_native_tap_words_per_block() {
         let first = native_tap_candidate(GuestVa(0x400000));
         let second = native_tap_candidate(GuestVa(0x400100));
         let first_words = first.template.words().to_vec();
@@ -1225,28 +1415,36 @@ mod tests {
         let pending = PendingTranslationUnit::pack(fixture_key(), vec![first, second])
             .expect("pack native-tap candidates");
         assert_eq!(pending.blocks.len(), 2);
+        assert_eq!(pending.blocks[0].entry_offset, 0);
         assert_eq!(
-            pending.blocks[0].code.len(),
+            pending.blocks[0].code_len as usize,
             first_words.len() * 4,
             "first block's extent is its recorded word count"
         );
-        assert_eq!(pending.blocks[0].source_end, GuestVa(0x400004));
-        assert_eq!(pending.blocks[0].generation, CodeGeneration::INITIAL);
-        assert_eq!(pending.blocks[1].code.len(), second_words.len() * 4);
+        assert_eq!(
+            pending.blocks[1].entry_offset as usize,
+            first_words.len() * 4
+        );
+        // The code image is EXACTLY the recorded words in order — no
+        // same-unit patching, no sidecar rewriting, nothing baked.
+        let mut expected = Vec::new();
+        for word in first_words.iter().chain(&second_words) {
+            expected.extend_from_slice(&word.to_le_bytes());
+        }
+        assert_eq!(pending.code, expected);
         for block in &pending.blocks {
-            let template = block.decode_template().expect("decode normalized metadata");
-            let counts = template.metadata_counts();
+            let counts = block.template.metadata_counts();
             assert_eq!(counts.words, 0, "stored records carry no words");
             assert_eq!(counts.source_words, 0, "stored records carry no source");
             assert!(
-                template.trusted_entry().is_some(),
+                block.template.trusted_entry().is_some(),
                 "the stored record keeps the trusted entry"
             );
         }
     }
 
     #[test]
-    fn pack_rejects_duplicates_and_empty_templates_but_allows_empty_batch() {
+    fn pack_rejects_duplicate_blocks_and_empty_candidates() {
         let candidate = native_tap_candidate(GuestVa(0x400000));
         let duplicate = candidate.clone();
         assert!(matches!(
@@ -1254,16 +1452,16 @@ mod tests {
             Err(crate::types::DsrError::CachePolicy(message))
                 if message.contains("duplicate block")
         ));
-        let empty = PendingTranslationUnit::pack(fixture_key(), Vec::new())
-            .expect("empty pending unit releases a lease without publication");
-        assert!(empty.blocks.is_empty());
+        assert!(matches!(
+            PendingTranslationUnit::pack(fixture_key(), Vec::new()),
+            Err(crate::types::DsrError::CachePolicy(message))
+                if message.contains("no blocks")
+        ));
         assert!(matches!(
             PendingTranslationUnit::pack(
                 fixture_key(),
                 vec![PortableBlockCandidate {
                     guest_start: GuestVa(0x400000),
-                    source_end: GuestVa(0x400004),
-                    generation: CodeGeneration::INITIAL,
                     requires_sensitive_metadata: false,
                     template: empty_template(),
                 }],
@@ -1271,6 +1469,56 @@ mod tests {
             Err(crate::types::DsrError::CachePolicy(message))
                 if message.contains("no recorded words")
         ));
+    }
+
+    #[test]
+    fn unit_metadata_encode_decode_round_trips_and_refuses_foreign_payloads() {
+        let blocks = vec![
+            manifest_block(0x400000, 0, 16),
+            manifest_block(0x400010, 16, 16),
+        ];
+        let bytes = encode_translation_unit_metadata(&fixture_key(), [0x33; 32], 32, &blocks)
+            .expect("encode metadata");
+        assert!(bytes.starts_with(&TRANSLATION_UNIT_METADATA_MAGIC));
+        let decoded =
+            decode_translation_unit_metadata(Arc::new(bytes.clone())).expect("decode metadata");
+        assert_eq!(decoded, manifest_fixture());
+        decoded.validate_ranges().expect("index invariants hold");
+        decoded.validate_deep().expect("deep invariants hold");
+        // Per-block round trip: the reassembled records equal the inputs
+        // (words and source words excepted — the wire cannot carry them).
+        for (at, block) in blocks.iter().enumerate() {
+            let record = decoded.block_record(at).expect("decode block record");
+            assert_eq!(record, *block);
+        }
+        // No magic: a pre-index or foreign file refuses as Schema.
+        assert_eq!(
+            decode_translation_unit_metadata(Arc::new(bytes[1..].to_vec())),
+            Err(UnitMissReason::Schema)
+        );
+        // Trailing bytes: a torn or tampered payload refuses as Schema.
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(
+            decode_translation_unit_metadata(Arc::new(trailing)),
+            Err(UnitMissReason::Schema)
+        );
+        // Truncation refuses — at EVERY byte length, not just the last:
+        // the header, the index rows, and the payload must all be exactly
+        // accounted for.
+        for cut in [
+            bytes.len() - 1,
+            bytes.len() - 17,
+            TRANSLATION_UNIT_METADATA_MAGIC.len() + 3,
+            TRANSLATION_UNIT_METADATA_MAGIC.len() + 12,
+            4,
+        ] {
+            assert_eq!(
+                decode_translation_unit_metadata(Arc::new(bytes[..cut].to_vec())),
+                Err(UnitMissReason::Schema),
+                "a {cut}-byte prefix must refuse"
+            );
+        }
     }
 
     #[test]
@@ -1508,20 +1756,17 @@ mod tests {
         let entries =
             PendingTranslationUnit::pack_with_recovery_runs(fixture_key(), vec![candidate], false)
                 .expect("pack with entries");
-        let runs_template = runs.blocks[0]
-            .decode_template()
-            .expect("decode run metadata");
-        let entries_template = entries.blocks[0]
-            .decode_template()
-            .expect("decode entry metadata");
-        assert!(runs_template.recovery_is_run_encoded());
-        assert!(!entries_template.recovery_is_run_encoded());
+        assert!(runs.blocks[0].template.recovery_is_run_encoded());
+        assert!(!entries.blocks[0].template.recovery_is_run_encoded());
         assert_eq!(
-            runs_template.metadata_counts().recovery_entries,
+            runs.blocks[0].template.metadata_counts().recovery_entries,
             entry_count
         );
         assert_eq!(
-            entries_template.metadata_counts().recovery_entries,
+            entries.blocks[0]
+                .template
+                .metadata_counts()
+                .recovery_entries,
             entry_count
         );
     }
