@@ -30,6 +30,23 @@ use crate::snapshot::NativeUcontextSnapshot;
 use crate::{artifact_spike, block, emit, gateway, types};
 use carrick_dsr::host::NativeHostJit;
 
+/// Preserve the typed read failure while naming the control-flow boundary
+/// that supplied its would-be guest PC. Translation failures are cold, so the
+/// diagnostic string is allocated only after a read has already failed; the
+/// production translation fast path pays no formatting or state-tracking cost.
+fn with_memory_read_origin(
+    error: types::DsrError,
+    origin: impl FnOnce() -> String,
+) -> types::DsrError {
+    match error {
+        types::DsrError::MemoryRead { pc, detail } => types::DsrError::MemoryRead {
+            pc,
+            detail: format!("{detail}; translation-origin={}", origin()),
+        },
+        other => other,
+    }
+}
+
 /// Projection of a [`types::NativeDsrExit`] onto the probe tuple, retargeted
 /// onto `carrick_dsr::probes`' mirrored `DsrExitKind` when the translator
 /// orchestration (its only consumer) moved into this crate. Verbatim mapping
@@ -3916,11 +3933,19 @@ impl ThreadTranslator {
     fn resolve_indirect<const PROFILE: bool>(
         &mut self,
         memory: &NativeMappedMemory,
-        _source: carrick_guest_mem::GuestVa,
+        source: carrick_guest_mem::GuestVa,
         target: carrick_guest_mem::GuestVa,
     ) -> Result<(types::CacheVa, types::CodeGeneration), types::DsrError> {
         self.stats.add(ResolverStat::ResolverExits, 1);
-        let translated = self.translate::<PROFILE>(memory, target)?;
+        let translated = self.translate::<PROFILE>(memory, target).map_err(|error| {
+            with_memory_read_origin(error, || {
+                format!(
+                    "indirect-resolver source=0x{:x} target=0x{:x}",
+                    source.raw(),
+                    target.raw()
+                )
+            })
+        })?;
         self.publish_indirect_target(memory, target, &translated)?;
         probes::dsr_cache_event(
             self.tid,
@@ -4235,7 +4260,11 @@ impl ThreadTranslator {
             // No explicit eviction on a generation mismatch: the slot is keyed by
             // guest VA and `translate` overwrites it below with the fresh
             // generation.
-            let translated = self.translate::<PROFILE>(memory, guest)?;
+            let translated = self.translate::<PROFILE>(memory, guest).map_err(|error| {
+                with_memory_read_origin(error, || {
+                    format!("prepare-entry guest=0x{:x}", guest.raw())
+                })
+            })?;
             let outcome = match translated.outcome {
                 TranslationOutcome::BlockIndexHit => probes::DsrPrepareOutcome::BlockIndexHit,
                 TranslationOutcome::SharedUnit => probes::DsrPrepareOutcome::BlockIndexHit,
@@ -4406,7 +4435,13 @@ impl ThreadTranslator {
                             target.raw(),
                             error.probe_outcome(),
                         );
-                        return Err(error);
+                        return Err(with_memory_read_origin(error, || {
+                            format!(
+                                "direct-resolver source=0x{:x} target=0x{:x}",
+                                source.raw(),
+                                target.raw()
+                            )
+                        }));
                     }
                 };
                 self.publish_indirect_target(memory, target, &translated)?;
@@ -4698,6 +4733,63 @@ mod tests {
         assert!(
             super::persistent_store_enabled_from(Some(std::ffi::OsStr::new("1"))),
             "=1 is the exact opt-in"
+        );
+    }
+
+    #[test]
+    fn prepare_memory_read_names_the_loop_entry_origin() {
+        let process = Arc::new(
+            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator"),
+        );
+        let mut translator = ThreadTranslator::for_process(process, 41);
+        let memory = crate::mapped_memory::NativeMappedMemory::shared_install_test_fixture(4096);
+        let mut snapshot = super::NativeUcontextSnapshot::default();
+        snapshot.pc = 0x1073_36538;
+
+        let error = match translator.prepare_entry::<false>(&memory, &snapshot) {
+            Err(error) => error,
+            Ok(_) => panic!("an unmapped loop-entry PC must fail translation"),
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("translation-origin=prepare-entry guest=0x107336538"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn direct_resolver_memory_read_names_source_and_target_origin() {
+        let process = Arc::new(
+            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator"),
+        );
+        let cache_entry = process.cache_host_range().start;
+        let mut translator = ThreadTranslator::for_process(process, 42);
+        let memory = crate::mapped_memory::NativeMappedMemory::shared_install_test_fixture(4096);
+        let source = GuestVa(0x40_0100);
+        let target = GuestVa(0x1073_36538);
+        let prepared = super::PreparedEntry {
+            entry: types::CacheVa::published(HostVa(
+                usize::try_from(cache_entry).expect("cache address fits usize"),
+            )),
+            generation: types::CodeGeneration::INITIAL,
+            address_mode: memory.address_mode(),
+        };
+        let exit = super::PreparedExit {
+            exit: types::NativeDsrExit::ResolveDirect { source, target },
+        };
+        let mut snapshot = super::NativeUcontextSnapshot::default();
+
+        let error = translator
+            .finish_exit(&memory, &mut snapshot, prepared, exit)
+            .expect_err("an unmapped direct target must fail translation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("translation-origin=direct-resolver source=0x400100 target=0x107336538"),
+            "{error}"
         );
     }
 
