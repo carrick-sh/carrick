@@ -1082,6 +1082,19 @@ pub fn scan_eligibility(elf: &[u8]) -> Result<Result<usize, DirectIneligible>, i
     scan_eligibility_inner(elf, false)
 }
 
+/// The scan as [`DirectLoadGroup::load_with_interpreter`] applies it to the
+/// MAIN image: `PT_INTERP` does not refuse (the loader maps the interpreter
+/// as a second member image), so the verdict is "this image's own text is
+/// tier-D provable". The census uses it to report a dynamic binary's REAL
+/// standing instead of a blanket `NeedsInterpreter`; whether the run holds
+/// still depends on the interpreter and every `DT_NEEDED` library passing
+/// the same scan at their own load/window time.
+pub fn scan_eligibility_as_interpreted(
+    elf: &[u8],
+) -> Result<Result<usize, DirectIneligible>, io::Error> {
+    scan_eligibility_inner(elf, true)
+}
+
 /// The scan, with the one policy knob the interpreter chain needs: a group
 /// load via [`DirectLoadGroup::load_with_interpreter`] RESOLVES `PT_INTERP`
 /// (the interpreter becomes a second member image), so the main image is
