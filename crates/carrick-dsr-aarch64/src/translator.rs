@@ -875,9 +875,13 @@ impl TranslatedRangeCatalog {
         // of the private range carrying unit identity — the dlopen-era rule
         // ("must not overlap the private cache") inverted into containment.
         if !(self.private.start <= range.start && range.end <= self.private.end) {
-            return Err(types::DsrError::CachePolicy(
-                "shared translated range must lie inside the private cache".to_string(),
-            ));
+            return Err(types::DsrError::CachePolicy(format!(
+                "shared translated range 0x{:x}..0x{:x} must lie inside the private cache 0x{:x}..0x{:x}",
+                range.start.raw(),
+                range.end.raw(),
+                self.private.start.raw(),
+                self.private.end.raw(),
+            )));
         }
         if self.shared.iter().any(|entry| entry.unit_id == unit_id) {
             return Err(types::DsrError::CachePolicy(

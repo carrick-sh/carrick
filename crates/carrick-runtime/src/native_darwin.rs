@@ -8006,6 +8006,27 @@ mod tests {
         fork_test_with_timeout(std::time::Duration::from_secs(5), test);
     }
 
+    /// Runs a fork-test child body and never returns.
+    ///
+    /// A panic in a forked test child must not unwind: the unwind would
+    /// re-enter the forked COPY of the libtest harness, whose completed-test
+    /// channel wakes a `std::thread` parker backed by a libdispatch
+    /// semaphore. That Mach port is fork-poisoned, so libdispatch traps with
+    /// a `brk` and the child dies with SIGTRAP — and because libtest's output
+    /// capture is never flushed in the child, the panic message vanishes.
+    /// The supervisor then reports only `forked test status=0x5`, hiding the
+    /// real assertion. Catch the panic, print it on the inherited stderr
+    /// (bypassing the captured sink), and `_exit(101)` so the supervisor's
+    /// status assertion names a panic rather than a signal.
+    fn run_fork_test_child(test: impl FnOnce()) -> ! {
+        std::panic::set_hook(Box::new(|info| {
+            let message = format!("fork-test child {info}\n");
+            let _ = unsafe { libc::write(2, message.as_ptr().cast(), message.len()) };
+        }));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test));
+        unsafe { libc::_exit(if outcome.is_ok() { 0 } else { 101 }) }
+    }
+
     fn prepare_exec_reset_authority(
         memory: &NativeMappedMemory,
     ) -> (dsr::ThreadTranslator, dsr::DirectBindingExecResetToken) {
@@ -8074,13 +8095,14 @@ mod tests {
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
         if pid == 0 {
-            assert_eq!(
-                unsafe { libc::setpgid(0, 0) },
-                0,
-                "create test process group"
-            );
-            test();
-            unsafe { libc::_exit(0) };
+            run_fork_test_child(|| {
+                assert_eq!(
+                    unsafe { libc::setpgid(0, 0) },
+                    0,
+                    "create test process group"
+                );
+                test();
+            });
         }
         // The parent-side call closes the short race before the child sets its
         // own process group. ESRCH/EACCES are harmless because the child call
@@ -8122,13 +8144,14 @@ mod tests {
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
         if pid == 0 {
-            assert_eq!(
-                unsafe { libc::getpgrp() },
-                inherited_process_group,
-                "nested child must remain in the outer supervision group"
-            );
-            test();
-            unsafe { libc::_exit(0) };
+            run_fork_test_child(|| {
+                assert_eq!(
+                    unsafe { libc::getpgrp() },
+                    inherited_process_group,
+                    "nested child must remain in the outer supervision group"
+                );
+                test();
+            });
         }
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -9814,8 +9837,15 @@ mod tests {
             retiring
                 .activate_translated_range_catalog()
                 .expect("activate retiring catalog");
+            // The copied-unit transport installs shared units INSIDE the
+            // private cache, so a valid shared entry is a subrange of the
+            // retiring translator's own cache.
+            let retiring_cache = retiring.cache_host_range();
             retiring
-                .add_translated_range_for_test(71, 0x2000_0000..0x2001_0000)
+                .add_translated_range_for_test(
+                    71,
+                    retiring_cache.start + 0x1_0000..retiring_cache.start + 0x2_0000,
+                )
                 .expect("seed retiring shared catalog entry");
             retiring
                 .set_translated_range_epoch_for_test(u64::MAX)
@@ -10214,8 +10244,15 @@ mod tests {
             inherited_process
                 .activate_translated_range_catalog()
                 .expect("activate inherited catalog");
+            // The copied-unit transport installs shared units INSIDE the
+            // private cache, so a valid shared entry is a subrange of the
+            // inherited translator's own cache.
+            let inherited_cache = inherited_process.cache_host_range();
             inherited_process
-                .add_translated_range_for_test(72, 0x2200_0000..0x2201_0000)
+                .add_translated_range_for_test(
+                    72,
+                    inherited_cache.start + 0x1_0000..inherited_cache.start + 0x2_0000,
+                )
                 .expect("seed inherited shared range");
             let inherited_before = inherited_process.translated_range_catalog_state_for_test();
             let mut exec_thread =
