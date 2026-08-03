@@ -80,6 +80,124 @@ impl GuestMemory for IdentityMemory {
     }
 }
 
+/// The exec stack for a directly-executed guest: a host allocation holding
+/// the argc/argv/envp/auxv image execve(2) would build, with `sp()` ready for
+/// [`carrick_native_darwin::direct::DirectLoadGroup::enter_on_stack`].
+///
+/// Guest VA is host VA on this tier, so the pointers serialized into the
+/// arrays are the allocation's own addresses — nothing to relocate. The
+/// serializer and the auxv builder are carrick-mem's, shared with the VMM
+/// lanes: one implementation of the exec-stack ABI, not a second drifting
+/// copy. The vDSO is NOT advertised (`AT_SYSINFO_EHDR` absent) because tier D
+/// does not map one; libc falls back to real syscalls, which the islands
+/// service.
+pub struct DirectStack {
+    base: *mut u8,
+    len: usize,
+    sp: u64,
+    auxv_image: Vec<u8>,
+}
+
+// SAFETY: the mapping is owned solely by this value and unmapped in `Drop`.
+unsafe impl Send for DirectStack {}
+
+impl DirectStack {
+    /// Linux's default `RLIMIT_STACK`.
+    pub const SIZE: usize = 8 * 1024 * 1024;
+
+    /// Build the stack for `main_elf` mapped at `main_bias` (the load group's
+    /// `main().bias()`).
+    ///
+    /// `interpreter_base` is the interpreter's load bias when the image is
+    /// dynamic — it becomes `AT_BASE`, which ld.so requires to find itself; a
+    /// missing `AT_BASE` on a dynamic target and a bogus one on a static
+    /// target are both real, shipped bug shapes, so the caller states it
+    /// explicitly.
+    pub fn build(
+        main_elf: &[u8],
+        main_bias: u64,
+        interpreter_base: Option<u64>,
+        argv: &[Vec<u8>],
+        envp: &[Vec<u8>],
+    ) -> std::io::Result<Self> {
+        use goblin::elf::header::EM_AARCH64;
+        let plan = carrick_mem::elf::plan_elf_load_bytes_for(main_elf, EM_AARCH64)
+            .map_err(std::io::Error::other)?
+            .with_load_bias(main_bias);
+        let auxv = carrick_mem::memory::linux_auxv_from_load_plan_with_vdso(
+            &plan,
+            interpreter_base,
+            false,
+        );
+        let len = Self::SIZE;
+        // SAFETY: fresh anonymous host mapping; the kernel picks the address.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        let base = base.cast::<u8>();
+        let stack_top = base as u64 + len as u64;
+        let (region, sp, auxv_image) = carrick_mem::memory::build_linux_initial_stack(
+            argv.to_vec(),
+            envp.to_vec(),
+            &auxv,
+            None,
+            stack_top,
+            len as u64,
+        )
+        .map_err(|error| {
+            // SAFETY: undo the mapping this constructor owns before failing.
+            unsafe { libc::munmap(base.cast(), len) };
+            std::io::Error::other(error)
+        })?;
+        // Everything the serializer initialized sits at or above the SP
+        // offset (strings at the top, pointer arrays at SP); the pages below
+        // are the guest's to grow into and stay untouched zero-fill.
+        let initialized = (sp - region.start) as usize;
+        // SAFETY: `region` spans exactly [base, base+len); copying its
+        // initialized tail into the live mapping at the same offsets.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                region.bytes()[initialized..].as_ptr(),
+                base.add(initialized),
+                region.bytes().len() - initialized,
+            );
+        }
+        Ok(Self {
+            base,
+            len,
+            sp,
+            auxv_image,
+        })
+    }
+
+    /// The initial guest SP: 16-aligned, pointing at argc.
+    pub fn sp(&self) -> u64 {
+        self.sp
+    }
+
+    /// The exact auxv byte image on the stack (`/proc/self/auxv`'s content).
+    pub fn auxv_image(&self) -> &[u8] {
+        &self.auxv_image
+    }
+}
+
+impl Drop for DirectStack {
+    fn drop(&mut self) {
+        // SAFETY: this value owns the mapping.
+        unsafe { libc::munmap(self.base.cast(), self.len) };
+    }
+}
+
 /// Why a directly-executed guest stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DirectRunOutcome {
@@ -404,12 +522,127 @@ mod tests {
         );
     }
 
+    /// The tier-D exec stack: a REAL Linux process begins with argc/argv/
+    /// envp/auxv on its stack, and the guest must find them through nothing
+    /// but SP. The fixture reads argc from `[sp]` and `argv[0]` from
+    /// `[sp+8]`, writes the first bytes of `argv[0]` to stdout, and exits
+    /// with argc as its code — so a wrong layout fails loudly on three
+    /// independent axes. The Rust side additionally walks the built stack
+    /// past envp into the auxv and checks the interpreter contract values
+    /// (`AT_PHDR`/`AT_ENTRY`; `AT_BASE` belongs to the interpreter chain).
+    #[test]
+    fn exec_stack_hands_argv_envp_auxv_to_the_guest() {
+        const NR_EXIT: u32 = 93;
+        let elf = elf_with_code(&[
+            ldr_sp_imm(20, 0), // x20 = argc
+            ldr_sp_imm(1, 8),  // x1 = argv[0] (the string's stack address)
+            movz(0, 1, 0),     // fd 1
+            movz(2, 5, 0),     // len 5: "hello"
+            movz(8, NR_WRITE, 0),
+            SVC_0,
+            mov_reg(0, 20), // exit(argc)
+            movz(8, NR_EXIT, 0),
+            SVC_0,
+        ]);
+        let group = DirectLoadGroup::load(&elf, island_handler())
+            .expect("load")
+            .expect("eligible");
+        let stack = DirectStack::build(
+            &elf,
+            group.main().bias(),
+            None,
+            &[b"hello-stack".to_vec(), b"arg1".to_vec()],
+            &[b"PATH=/usr/bin".to_vec()],
+        )
+        .expect("stack builds");
+
+        // Rust-side walk BEFORE entering: sp -> argc, argv[..], NULL,
+        // envp[..], NULL, auxv pairs. This proves the auxv contract without
+        // trusting the guest.
+        // SAFETY: the stack was just built in host memory; reading it back.
+        let word = |offset_words: u64| -> u64 {
+            unsafe { *((stack.sp() + offset_words * 8) as *const u64) }
+        };
+        assert_eq!(word(0), 2, "argc");
+        let argv0 = word(1);
+        // SAFETY: argv[0] points into the same stack allocation.
+        let argv0_bytes = unsafe { std::slice::from_raw_parts(argv0 as *const u8, 12) };
+        assert_eq!(&argv0_bytes[..11], b"hello-stack");
+        assert_eq!(word(3), 0, "argv NULL terminator");
+        let envp0 = word(4);
+        // SAFETY: envp[0] points into the same stack allocation.
+        let envp0_bytes = unsafe { std::slice::from_raw_parts(envp0 as *const u8, 13) };
+        assert_eq!(envp0_bytes, b"PATH=/usr/bin");
+        assert_eq!(word(5), 0, "envp NULL terminator");
+        let mut auxv = std::collections::HashMap::new();
+        let mut cursor = 6;
+        loop {
+            let (a_type, a_val) = (word(cursor), word(cursor + 1));
+            if a_type == carrick_abi::LINUX_AT_NULL {
+                break;
+            }
+            auxv.insert(a_type, a_val);
+            cursor += 2;
+        }
+        assert_eq!(
+            auxv.get(&carrick_abi::LINUX_AT_ENTRY),
+            Some(&group.main().entry()),
+            "AT_ENTRY is the main image's BIASED entry"
+        );
+        let phdr = auxv
+            .get(&carrick_abi::LINUX_AT_PHDR)
+            .expect("AT_PHDR present");
+        assert!(
+            *phdr > group.main().bias(),
+            "AT_PHDR is a runtime address inside the mapped image"
+        );
+        assert!(
+            !auxv.contains_key(&carrick_abi::LINUX_AT_BASE),
+            "no interpreter, no AT_BASE (a bogus AT_BASE was a real bug)"
+        );
+        assert!(
+            auxv.contains_key(&carrick_abi::LINUX_AT_RANDOM),
+            "AT_RANDOM present (glibc stack canary init reads it)"
+        );
+
+        // Now the guest's own view.
+        let mut runner =
+            DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
+        let entry = group.main().entry();
+        let sp = stack.sp();
+        // SAFETY: the image is patched and built with `island_handler`; the
+        // guest leaves through its exit.
+        unsafe { with_runner(&mut runner, || group.enter_on_stack(entry, sp)) };
+        assert_eq!(
+            runner.outcome(),
+            Some(&DirectRunOutcome::Exited { code: 2 }),
+            "the guest read argc == 2 through its own SP"
+        );
+        assert_eq!(
+            runner.dispatcher().stdout(),
+            b"hello",
+            "the guest wrote argv[0]'s bytes read via the stack"
+        );
+    }
+
+    /// `ldr xt, [sp, #imm]`
+    const fn ldr_sp_imm(rt: u32, byte_offset: u32) -> u32 {
+        0xf940_0000 | ((byte_offset / 8) << 10) | (31 << 5) | rt
+    }
+
     /// Minimal ET_DYN wrapper with a section header table, which tier D's
     /// eligibility scan requires (it walks SHF_EXECINSTR sections).
+    ///
+    /// Real-binary shape where it matters for the exec stack: the FIRST
+    /// `PT_LOAD` covers the ELF header and program headers at vaddr 0 (every
+    /// real toolchain binary does this), which is what lets the load planner
+    /// derive `AT_PHDR` — a fixture whose phdrs sit outside every segment
+    /// would rightly get no `AT_PHDR` at all.
     fn elf_with_code(code: &[u32]) -> Vec<u8> {
         let code_bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
         let entry: u64 = 0x1000;
-        let mut elf = vec![0_u8; 0x40 + 56];
+        let headers_len: u64 = 0x40 + 2 * 56;
+        let mut elf = vec![0_u8; headers_len as usize];
         elf[..4].copy_from_slice(b"\x7fELF");
         elf[4] = 2;
         elf[5] = 1;
@@ -419,8 +652,15 @@ mod tests {
         elf[0x18..0x20].copy_from_slice(&entry.to_le_bytes());
         elf[0x20..0x28].copy_from_slice(&0x40_u64.to_le_bytes());
         elf[0x36..0x38].copy_from_slice(&56_u16.to_le_bytes());
-        elf[0x38..0x3a].copy_from_slice(&1_u16.to_le_bytes());
+        elf[0x38..0x3a].copy_from_slice(&2_u16.to_le_bytes());
+        // PT_LOAD [0]: the headers, read-only at vaddr 0.
         let ph = 0x40;
+        elf[ph..ph + 4].copy_from_slice(&1_u32.to_le_bytes());
+        elf[ph + 4..ph + 8].copy_from_slice(&4_u32.to_le_bytes()); // PF_R
+        elf[ph + 0x20..ph + 0x28].copy_from_slice(&headers_len.to_le_bytes());
+        elf[ph + 0x28..ph + 0x30].copy_from_slice(&headers_len.to_le_bytes());
+        // PT_LOAD [1]: the code.
+        let ph = 0x40 + 56;
         elf[ph..ph + 4].copy_from_slice(&1_u32.to_le_bytes());
         elf[ph + 4..ph + 8].copy_from_slice(&5_u32.to_le_bytes());
         elf[ph + 0x08..ph + 0x10].copy_from_slice(&entry.to_le_bytes());

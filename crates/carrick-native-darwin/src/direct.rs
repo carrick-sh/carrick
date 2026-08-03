@@ -1099,6 +1099,77 @@ impl DirectLoadGroup {
             );
         }
     }
+
+    /// Jump to `pc` with the guest's stack pointer switched to `sp`.
+    ///
+    /// This is PROCESS ENTRY: `sp` points at a freshly built argc/argv/envp/
+    /// auxv image — exactly what the kernel hands a new Linux process — and
+    /// the guest finds everything it needs through nothing but SP. The host
+    /// stack discipline is captured BEFORE the switch, so a handler-requested
+    /// leave restores Rust's own stack as usual.
+    ///
+    /// Register state matches Linux exec entry where it is load-bearing:
+    /// **x0 is ZERO** — the ABI reserves it for a `rtld_fini` pointer the
+    /// startup code atexit-registers when nonzero, so garbage there crashes
+    /// the guest at exit — and the other GPRs are zeroed for hygiene. Two
+    /// cannot be: some register must carry the branch target (x9 holds `pc`
+    /// at entry) and `blr` defines x30 (the host landing point, per the
+    /// enter contract). The ELF ABI leaves entry registers unspecified, so
+    /// neither is guest-visible semantics. x18 is Darwin's and untouchable.
+    ///
+    /// # Safety
+    /// As [`Self::enter`], plus: the guest MUST leave through the handler
+    /// (guest-leave contract). The fixture-style balanced `ret` is NOT
+    /// survivable here — it would land in Rust still on the guest stack.
+    pub unsafe fn enter_on_stack(&self, pc: u64, sp: u64) {
+        self.arm_current_thread();
+        let ctx = std::ptr::from_ref::<GuestContext>(self.context.as_ref()) as u64;
+        // Same gateway shape as `enter` (see the clobber discussion there);
+        // the differences are the SP switch after the host capture and the
+        // register scrub before the branch.
+        // SAFETY: `pc` is inside a patched, i-cache-invalidated mapping.
+        unsafe {
+            std::arch::asm!(
+                // x19 and x29 cannot be named as clobbers - LLVM reserves both
+                // - so preserve them by hand around the guest.
+                "stp x19, x29, [sp, #-16]!",
+                // Capture the HOST stack discipline for the island leave leg
+                // BEFORE switching to the guest stack.
+                "mov x9, sp",
+                "str x9, [x0, #{host_sp}]",
+                "adr x9, 2f",
+                "str x9, [x0, #{host_lr}]",
+                // The branch target moves to x9 so every argument register
+                // can be scrubbed; then the guest gets its own stack.
+                "mov x9, x2",
+                "mov sp, x1",
+                // Zero what a fresh Linux process would see zeroed. x0 is the
+                // one that MATTERS (rtld_fini); the rest are hygiene.
+                "mov x0, xzr", "mov x1, xzr", "mov x2, xzr", "mov x3, xzr",
+                "mov x4, xzr", "mov x5, xzr", "mov x6, xzr", "mov x7, xzr",
+                "mov x8, xzr", "mov x10, xzr", "mov x11, xzr", "mov x12, xzr",
+                "mov x13, xzr", "mov x14, xzr", "mov x15, xzr", "mov x16, xzr",
+                "mov x17, xzr", "mov x19, xzr", "mov x20, xzr", "mov x21, xzr",
+                "mov x22, xzr", "mov x23, xzr", "mov x24, xzr", "mov x25, xzr",
+                "mov x26, xzr", "mov x27, xzr", "mov x28, xzr", "mov x29, xzr",
+                "blr x9",
+                "2:",
+                "ldp x19, x29, [sp], #16",
+                host_sp = const GuestContext::HOST_SP,
+                host_lr = const GuestContext::HOST_LR,
+                in("x0") ctx,
+                in("x1") sp,
+                in("x2") pc,
+                out("x9") _,
+                out("x20") _, out("x21") _, out("x22") _, out("x23") _,
+                out("x24") _, out("x25") _, out("x26") _, out("x27") _,
+                out("x28") _,
+                out("d8") _, out("d9") _, out("d10") _, out("d11") _,
+                out("d12") _, out("d13") _, out("d14") _, out("d15") _,
+                clobber_abi("C"),
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------- ELF bits
@@ -1910,6 +1981,57 @@ mod tests {
             !group.context().leave_requested(),
             "the leave leg re-armed the flag for the next entry"
         );
+    }
+
+    /// Process entry runs on a PREPARED stack: `enter_on_stack` must switch
+    /// the guest to the provided SP (where argc/argv/envp/auxv live), give it
+    /// a zeroed x0 (the ABI's rtld_fini slot — glibc atexit-registers a
+    /// nonzero x0, so garbage there crashes at exit), and still honour the
+    /// guest-leave contract from the new stack.
+    #[test]
+    fn enter_on_stack_switches_to_the_provided_stack_and_zeroes_x0() {
+        extern "C" fn record_and_leave(ctx: *mut GuestContext) {
+            // SAFETY: the island passes the context this image was built with.
+            let ctx = unsafe { &mut *ctx };
+            SEEN.with(|seen| seen.borrow_mut().push((ctx.syscall_nr(), ctx.args())));
+            ctx.request_leave();
+        }
+        const CHECK_NR: u64 = 0x0ff9;
+        let code: Vec<u32> = vec![
+            // x1 = the word at [sp]: proves the guest runs on OUR stack.
+            ldr_imm(1, 31, 0),
+            // x0 arrives from `enter_on_stack` and must be ZERO; the fixture
+            // moves it to x2 so the syscall reports it (x0 is the nr's arg 0
+            // slot and would be overwritten by the check number setup).
+            mov_reg(2, 0),
+            movz(8, CHECK_NR as u32, 0),
+            SVC_0,
+            // Unreachable: the handler requested a leave.
+            RET,
+        ];
+        let elf = elf_with_code(&code);
+        let group = DirectLoadGroup::load(&elf, record_and_leave)
+            .expect("load")
+            .expect("eligible");
+        // A 16-aligned guest stack. SP points INTO the allocation with
+        // headroom below it — the island borrows a 16-byte slot below SP, so
+        // an SP at the allocation's base would push past the front edge.
+        let mut stack = vec![0_u64; 64];
+        stack[32] = 0xfeed_face_cafe_f00d;
+        let sp = std::ptr::from_ref(&stack[32]) as u64;
+        assert_eq!(sp % 16, 0, "Vec<u64> backing is 16-aligned on this host");
+        seen_clear();
+        let entry = group.main().entry();
+        // SAFETY: patched image, entry inside it; the handler requests a
+        // leave, which is the only sanctioned exit from a custom stack.
+        unsafe { group.enter_on_stack(entry, sp) };
+        let seen = seen_snapshot();
+        assert_eq!(seen.len(), 1, "the guest reached its syscall and left");
+        assert_eq!(
+            seen[0].1[1], 0xfeed_face_cafe_f00d,
+            "the guest read ITS OWN stack through the provided SP"
+        );
+        assert_eq!(seen[0].1[2], 0, "x0 (the rtld_fini slot) arrived zeroed");
     }
 
     /// The load-group seam: EVERY image in a guest's load group shares ONE
