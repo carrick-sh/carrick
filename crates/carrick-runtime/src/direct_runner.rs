@@ -824,6 +824,22 @@ impl DirectRunner {
                 self.outcome = Some(DirectRunOutcome::Exited { code });
                 ServiceVerdict::Leave
             }
+            // A thread-creating clone is the roadmap Phase 1 item 4 boundary:
+            // tier D's TLS/x18/context slots are per-LOAD-GROUP, coherent for
+            // a single-threaded guest but NOT per-thread. Spawning a second
+            // guest thread here would have both threads read one TLS base —
+            // incoherent by construction — so tier D fails CLOSED with the
+            // boundary named rather than run an unsound thread. Single-
+            // threaded guests (dash, cpython's own `-c`) never reach this.
+            Ok(DispatchOutcome::CloneThread { .. }) => {
+                self.outcome = Some(DirectRunOutcome::Unsupported {
+                    syscall: number,
+                    outcome: "thread-creating clone: tier D slots are per-load-group, \
+                              not per-thread (roadmap Phase 1 item 4)"
+                        .to_string(),
+                });
+                ServiceVerdict::Leave
+            }
             Ok(other) => {
                 self.outcome = Some(DirectRunOutcome::Unsupported {
                     syscall: number,
@@ -1629,6 +1645,57 @@ __attribute__((naked)) void _start(void) {
             runner.dispatcher().stdout(),
             b"hi\n",
             "the builtin echo's bytes came through the one dispatcher"
+        );
+    }
+
+    /// A thread-creating `clone(2)` LEAVES named at the item-4 boundary:
+    /// tier D's TLS/x18/context slots are per-load-group, not per-thread, so
+    /// spawning a second guest thread would be unsound. A single-threaded
+    /// guest never reaches this; a `pthread_create`-shaped clone
+    /// (`CLONE_VM|CLONE_THREAD|CLONE_SIGHAND`) must fail closed, not run.
+    #[test]
+    fn thread_creating_clone_leaves_at_the_per_thread_boundary() {
+        const NR_CLONE: u32 = 220;
+        const NR_EXIT: u32 = 93;
+        // flags = CLONE_VM|CLONE_THREAD|CLONE_SIGHAND|CLONE_FS|CLONE_FILES,
+        // the pthread shape the dispatcher classifies as CloneThread.
+        const FLAGS: u32 = 0x100 | 0x1_0000 | 0x800 | 0x200 | 0x400;
+        let elf = elf_with_code(&[
+            mov_reg(20, 30),
+            movz(0, FLAGS & 0xffff, 0),
+            movk(0, FLAGS >> 16, 16), // x0 = flags
+            movz(1, 0x1000, 0),       // x1 = a nonzero child stack
+            movz(2, 0, 0),
+            movz(3, 0, 0),
+            movz(4, 0, 0),
+            movz(8, NR_CLONE, 0),
+            SVC_0,
+            // POISON: a runner that ran an unsound thread would resume here.
+            movz(0, 5, 0),
+            movz(8, NR_EXIT, 0),
+            SVC_0,
+        ]);
+        let group = DirectLoadGroup::load(&elf, island_handler())
+            .expect("load")
+            .expect("eligible");
+        let mut runner =
+            DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
+        let entry = group.main().entry();
+        // SAFETY: patched image built with `island_handler`.
+        unsafe { with_runner(&mut runner, &group, || group.enter(entry)) };
+        assert!(
+            matches!(
+                runner.outcome(),
+                Some(&DirectRunOutcome::Unsupported { syscall: 220, ref outcome })
+                    if outcome.contains("per-thread") && outcome.contains("item 4")
+            ),
+            "the thread clone left AT the per-thread boundary, named: {:?}",
+            runner.outcome()
+        );
+        assert_eq!(
+            runner.syscalls(),
+            1,
+            "the guest left AT the clone; the poison exit never ran"
         );
     }
 
