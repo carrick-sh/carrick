@@ -20,11 +20,15 @@
  * nonzero internal catalog epoch is checked for monotonicity but normalized to
  * a per-image raw stream so an initial reset stays at zero, a fork replay moves
  * the inherited child to one, and a successful exec starts a fresh image zero.
+ * Elapsed authority starts when that first complete native-owner catalog begins
+ * and stops when the owner exits. Launcher setup and post-owner teardown have no
+ * eligible wall ticks and therefore are deliberately outside the denominator.
  */
 
 dtrace:::BEGIN
 {
-	started = timestamp;
+	started = 0;
+	stopped = 0;
 	root_pid = (pid_t)0;
 	target_exit_reason = 0;
 	timed_out = 0;
@@ -145,6 +149,7 @@ carrick*:::host-translated-range-reset
     birth_seen[pid] != 0 && (uint64_t)arg0 > (uint64_t)0/
 {
 	root_pid = (pid_t)pid;
+	started = timestamp;
 	tracked[pid] = 1;
 	image_generation[pid] = (uint64_t)1;
 	current_epoch[pid] = (uint64_t)0;
@@ -507,6 +512,7 @@ proc:::exit
 	    pid, birth_sec[pid], birth_usec[pid], image_generation[pid],
 	    current_epoch[pid], arg0);
 	target_exit_reason = pid == root_pid ? arg0 : target_exit_reason;
+	stopped = pid == root_pid ? timestamp : stopped;
 	tracked[pid] = 0;
 	range_ready[pid] = 0;
 	exec_observed[pid] = 0;
@@ -544,5 +550,5 @@ dtrace:::END
 	    offcpu_violations != 0 || probe_errors != 0, timed_out, identity_violations,
 	    lifecycle_violations, range_violations, kernel_violations,
 	    offcpu_violations, probe_errors, target_exit_reason, live_pids,
-	    timestamp - started);
+	    (stopped != 0 ? stopped : timestamp) - started);
 }
