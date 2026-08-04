@@ -18,7 +18,7 @@ const JSON_SCHEMA: &str = "carrick.dsr-profile.v1";
 const V2_PROTOCOL_PREFIX: &str = "DSRPROF2";
 const V2_STACK_PREFIX: &str = "DSRSTACK2";
 const V2_ERROR_PREFIX: &str = "DSRERROR2";
-const V2_RAW_SCHEMA: &str = "carrick.dsrprof.raw.v2";
+const V2_RAW_SCHEMA: &str = "carrick.dsrprof.raw.v3";
 const NATIVE_FAULT_RAW_SCHEMA: &str = "carrick.native-fault.raw.v3";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -421,6 +421,7 @@ struct V2Validator {
     wall_state: BTreeMap<String, u64>,
     cpu_user_summary: BTreeMap<(RawProcessImageKey, u64), u64>,
     cpu_kernel_summary: BTreeMap<(RawProcessImageKey, String, u64), u64>,
+    cpu_kernel_syscall_summary: BTreeMap<String, u64>,
     cpu_samples: u64,
     dtrace_errors: u64,
     transition_events_seen: bool,
@@ -663,6 +664,7 @@ impl V2Validator {
                 self.kernel_transition(&record, KernelTransition::TerminalClose)
             }
             "cpu-kernel" => self.cpu_kernel(&record),
+            "cpu-kernel-syscall" => self.cpu_kernel_syscall(&record),
             "offcpu-block" => self.offcpu_block(&record),
             "offcpu-wake" => self.offcpu_wake(&record),
             "offcpu" => self.offcpu_summary(&record),
@@ -1427,6 +1429,24 @@ impl V2Validator {
         Ok(())
     }
 
+    fn cpu_kernel_syscall(&mut self, record: &V2Record) -> Result<()> {
+        record.exact_fields(&["count", "function"])?;
+        let function = record.required("function")?.to_owned();
+        validate_percent_token(&function, "kernel syscall function")?;
+        let count = record.decimal_u64("count")?;
+        if count == 0 {
+            bail!("cpu-kernel-syscall count must be positive");
+        }
+        if self
+            .cpu_kernel_syscall_summary
+            .insert(function, count)
+            .is_some()
+        {
+            bail!("duplicate cpu-kernel-syscall summary identity");
+        }
+        Ok(())
+    }
+
     fn require_no_open_kernel_state(&self, birth: ProcessBirthKey, boundary: &str) -> Result<()> {
         if self
             .kernel_stacks
@@ -1892,6 +1912,28 @@ impl V2Validator {
         }
         if self.cpu_samples == 0 {
             bail!("DSRPROF2 stream has no resolved CPU samples");
+        }
+        let named_syscall_samples = self
+            .cpu_kernel_summary
+            .iter()
+            .filter(|((_, class, _), _)| class == "kernel-named-syscall")
+            .try_fold(0_u64, |total, (_, count)| {
+                total
+                    .checked_add(*count)
+                    .ok_or_else(|| anyhow!("DSRPROF2 named-syscall CPU sample population overflow"))
+            })?;
+        let syscall_function_samples =
+            self.cpu_kernel_syscall_summary
+                .values()
+                .try_fold(0_u64, |total, count| {
+                    total.checked_add(*count).ok_or_else(|| {
+                        anyhow!("DSRPROF2 per-syscall CPU sample population overflow")
+                    })
+                })?;
+        if syscall_function_samples != named_syscall_samples {
+            bail!(
+                "DSRPROF2 per-syscall CPU samples total {syscall_function_samples}, expected named-syscall population {named_syscall_samples}"
+            );
         }
         for stack in &self.stacks {
             self.require_summary_key(stack.key)?;
@@ -2747,6 +2789,14 @@ fn build_v2_profile_summary(
                 Some(class.clone()),
                 Some(*pc),
             ),
+            Some(*count),
+            None,
+        )?;
+    }
+    for (function, count) in &validator.cpu_kernel_syscall_summary {
+        add_v2_exact_metric(
+            &mut grouped,
+            v2_profile_scope("cpu-kernel-syscall", None, Some(function.clone()), None),
             Some(*count),
             None,
         )?;
@@ -3907,6 +3957,15 @@ mod tests {
             exact("cpu-user-pc", Some(1), Some(0x1100)).unwrap()["metric"]["count"],
             3
         );
+        let kernel_syscall = rows
+            .iter()
+            .find(|row| {
+                row["scope"]["phase"] == "cpu-kernel-syscall"
+                    && row["scope"]["kind"] == "read"
+                    && row["metric"]["type"] == "exact"
+            })
+            .expect("named kernel syscall bucket");
+        assert_eq!(kernel_syscall["metric"]["count"], 2);
         let offcpu = exact("offcpu-voluntary-pc", Some(1), Some(0x1150)).unwrap();
         assert_eq!(offcpu["metric"]["count"], 1);
         assert_eq!(offcpu["metric"]["total_ns"], 500);
@@ -3943,6 +4002,46 @@ mod tests {
                 && row["metric"]["pid"] == 1
         }));
         assert_eq!(rows.last().unwrap()["metric"]["type"], "completion");
+    }
+
+    #[test]
+    fn dsrprof2_rejects_incomplete_kernel_syscall_sample_census() {
+        let fixture = include_str!("../tests/fixtures/dsrprof2-valid.raw");
+        let row = "DSRPROF2|cpu-kernel-syscall|function=read|count=2";
+        for corrupt in [
+            fixture.replacen(&format!("{row}\n"), "", 1),
+            fixture.replacen(row, "DSRPROF2|cpu-kernel-syscall|function=read|count=1", 1),
+            fixture.replacen(
+                row,
+                concat!(
+                    "DSRPROF2|cpu-kernel-syscall|function=read|count=1\n",
+                    "DSRPROF2|cpu-kernel-syscall|function=read|count=1"
+                ),
+                1,
+            ),
+        ] {
+            let error =
+                ProfileSummary::from_lines(corrupt.lines(), ProfileCaptureStatus::default())
+                    .expect_err("an incomplete per-syscall census must fail closed");
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains("per-syscall CPU samples")
+                    || rendered.contains("duplicate cpu-kernel-syscall"),
+                "unexpected error: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn dsrprof2_rejects_invalid_kernel_syscall_function() {
+        let raw = include_str!("../tests/fixtures/dsrprof2-valid.raw").replacen(
+            "function=read|count=2",
+            "function=bad%zz|count=2",
+            1,
+        );
+        let error = ProfileSummary::from_lines(raw.lines(), ProfileCaptureStatus::default())
+            .expect_err("an invalid syscall token must fail closed");
+        assert!(format!("{error:#}").contains("invalid percent escape"));
     }
 
     #[test]
@@ -3985,6 +4084,11 @@ mod tests {
             .lines()
             .map(str::to_owned)
             .collect::<Vec<_>>();
+        let syscall = lines
+            .iter_mut()
+            .find(|line| line.starts_with("DSRPROF2|cpu-kernel-syscall|"))
+            .expect("kernel syscall summary row");
+        *syscall = "DSRPROF2|cpu-kernel-syscall|function=read|count=4".to_owned();
         let completion = lines
             .iter()
             .position(|line| line.starts_with("DSRPROF2|complete|"))
@@ -4033,6 +4137,11 @@ mod tests {
             .replacen(
                 "class=kernel-named-syscall|pc=0xfffffe0010010010|count=2",
                 "class=kernel-named-syscall|pc=0xfffffe0010010010|count=3",
+                1,
+            )
+            .replacen(
+                "DSRPROF2|cpu-kernel-syscall|function=read|count=2",
+                "DSRPROF2|cpu-kernel-syscall|function=read|count=3",
                 1,
             )
             .replacen(
@@ -4124,7 +4233,7 @@ mod tests {
             ],
         )
         .expect("valid launch authority");
-        let header = "DSRPROF2|header|profile=native-wall|raw_schema=carrick.dsrprof.raw.v2|os_build=26A123|program_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|birth_qualification_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|terminal_qualification_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc|wall_hz=197|cpu_hz=499";
+        let header = "DSRPROF2|header|profile=native-wall|raw_schema=carrick.dsrprof.raw.v3|os_build=26A123|program_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|birth_qualification_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|terminal_qualification_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc|wall_hz=197|cpu_hz=499";
 
         let mut validator = V2Validator::with_authority(authority.clone());
         validator

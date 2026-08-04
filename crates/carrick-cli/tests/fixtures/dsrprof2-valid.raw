@@ -1,4 +1,4 @@
-DSRPROF2|header|profile=native-wall|raw_schema=carrick.dsrprof.raw.v2|os_build=26A123|program_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|birth_qualification_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|terminal_qualification_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc|wall_hz=197|cpu_hz=499
+DSRPROF2|header|profile=native-wall|raw_schema=carrick.dsrprof.raw.v3|os_build=26A123|program_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|birth_qualification_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|terminal_qualification_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc|wall_hz=197|cpu_hz=499
 DSRPROF2|target-birth|pid=100|start_sec=10|start_usec=20|image=1|epoch=0
 DSRPROF2|range-reset|pid=100|start_sec=10|start_usec=20|image=1|epoch=0
 DSRPROF2|range-private|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|sequence=1|start=0x1000|end=0x2000
@@ -10,6 +10,7 @@ DSRPROF2|host-image-catalog|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|c
 DSRPROF2|guest-image-base|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|base=0x400000
 DSRPROF2|cpu-user|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|pc=0x1100|count=3
 DSRPROF2|cpu-kernel|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|class=kernel-named-syscall|pc=0xfffffe0010010010|count=2
+DSRPROF2|cpu-kernel-syscall|function=read|count=2
 DSRPROF2|kernel-enter|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|provider=syscall|function=read|class=named-syscall|timestamp_ns=1000
 DSRPROF2|kernel-return|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|provider=syscall|function=read|class=named-syscall|timestamp_ns=1200
 DSRPROF2|offcpu-block|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|episode=1|kind=voluntary|pc=0x1150|timestamp_ns=1300
