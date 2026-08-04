@@ -936,6 +936,17 @@ pub(crate) enum DebugCommand {
         #[arg(long = "processes-observed")]
         processes_observed: Option<u64>,
     },
+    /// Parse a complete `CARRICK_EXEC_STAMPS` v2 export, validate every
+    /// fork/exec/exit/reap relationship, and print CPU/wall attribution JSON.
+    ExecStampCensus {
+        /// One complete `EXECSTAMP2` export from a single Carrick invocation.
+        input: PathBuf,
+        /// In-guest workload wall from that invocation's successful
+        /// `WORKLOAD_NS` marker. Used only for the explicitly labelled wall
+        /// upper bound; CPU shares use the export's exact run-complete rusage.
+        #[arg(long = "workload-ns")]
+        workload_ns: u64,
+    },
     /// Decode an AArch64 ESR_EL1 value into its exception class, IL, ISS
     /// (with DFSC for data aborts) so the operator doesn't have to hand-
     /// parse syndromes during an interactive session.

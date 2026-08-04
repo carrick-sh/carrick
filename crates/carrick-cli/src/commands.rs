@@ -1024,16 +1024,13 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 result.exit_code
             };
 
-            // NATIVEPERF v2 supervisor record: emitted exactly once, only when
-            // CARRICK_DSR_PROFILE=1 (a no-op env read otherwise) AND this is
-            // the one true top-level process recorded at `main` entry. The pid
-            // gate matters: interactive `-t` runs fork a pty-relay supervisor
-            // and a runtime child that BOTH bubble back to this tail with the
-            // env var inherited (see `supervisor_perf`'s module docs), and
-            // only the top-level Launcher — whose blocking wait chain has
-            // already reaped the whole guest process tree by this point — may
-            // emit. Placed before every exit path (interactive/json/raw) so it
-            // fires uniformly.
+            // Top-level diagnostics: the NATIVEPERF supervisor record is gated
+            // by CARRICK_DSR_PROFILE, while the exact exec-stamp run-complete
+            // denominator is gated independently by CARRICK_EXEC_STAMPS. Both
+            // share the one-true-top-level PID check: interactive `-t` runs
+            // fork descendants that also reach this tail, but only the
+            // Launcher has reaped the complete guest tree. Placed before every
+            // exit path (interactive/json/raw) so both exports fire uniformly.
             crate::supervisor_perf::emit_supervisor_record_if_profiling();
 
             // Interactive / tty: the guest's stdio already went straight to the
@@ -1331,6 +1328,9 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 top,
                 processes_observed,
             } => crate::debug_census::run_xlat_census(&dir, top, processes_observed)?,
+            DebugCommand::ExecStampCensus { input, workload_ns } => {
+                crate::debug_exec_stamps::run_exec_stamp_census(&input, workload_ns)?
+            }
             _ => bail!("debug (guest address-space inspection) is HVF-only on this build"),
         },
         Commands::TraceChild {

@@ -50,6 +50,9 @@ pub(crate) fn run_debug(command: DebugCommand) -> anyhow::Result<()> {
         } => {
             crate::debug_census::run_xlat_census(&dir, top, processes_observed)?;
         }
+        DebugCommand::ExecStampCensus { input, workload_ns } => {
+            crate::debug_exec_stamps::run_exec_stamp_census(&input, workload_ns)?;
+        }
         DebugCommand::DecodeEsr { syndrome } => {
             let stripped = syndrome.trim();
             let value = if let Some(hex) = stripped

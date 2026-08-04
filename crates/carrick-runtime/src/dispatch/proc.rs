@@ -3332,7 +3332,11 @@ impl SyscallDispatcher {
             if terminal_reap {
                 // Untraced lifecycle gauge (CARRICK_EXEC_STAMPS): closes the
                 // child's `PreHostExit` window from the parent side.
-                crate::exec_stamps::stamp(crate::exec_stamps::ExecStampPhase::WaitReaped);
+                crate::exec_stamps::stamp_wait_reaped(
+                    result as u32,
+                    host_status,
+                    &host_rusage,
+                );
                 this.publish_terminal_child_exit_signal(result);
                 // The child host process is now dead; tear down its leaked host VM
                 // node (bhyve's named /dev/vmm/carrick-<pid>-* persists past the

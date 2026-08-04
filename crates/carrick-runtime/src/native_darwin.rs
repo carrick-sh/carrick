@@ -2467,7 +2467,10 @@ fn run_image_in_current_process(
             completion,
         },
     )? {
-        NativeThreadLoopOutcome::ProcessExit(code) => Ok(code),
+        NativeThreadLoopOutcome::ProcessExit(code) => {
+            crate::exec_stamps::stamp(crate::exec_stamps::ExecStampPhase::RuntimeReturn);
+            Ok(code)
+        }
         NativeThreadLoopOutcome::ThreadDone => {
             thread_runtime.join_spawned_threads()?;
             // A sibling spawned AFTER this leader exited may have execve'd,
@@ -6874,7 +6877,12 @@ fn handle_native_fork(
     crate::probes::fork_pre(request.guest_pc, 0, request.guest_pstate);
     // Untraced lifecycle gauge (CARRICK_EXEC_STAMPS): the parent-side fork
     // window opens here and closes at `CloneParentReturn` below.
-    crate::exec_stamps::stamp(crate::exec_stamps::ExecStampPhase::CloneEnter);
+    let fork_link_id = crate::exec_stamps::next_fork_link_id();
+    crate::exec_stamps::stamp_fork(
+        crate::exec_stamps::ExecStampPhase::CloneEnter,
+        fork_link_id,
+        0,
+    );
     // Serialize forks (and exclude a concurrent execve teardown): the same
     // CAS token the HVF fork barrier uses. A loser parks at the in-flight
     // fork's barrier so its drain counts this thread; a loser that observes
@@ -7197,7 +7205,11 @@ fn handle_native_fork(
         // Untraced lifecycle gauge: the delta from the parent's `CloneEnter`
         // is the host fork itself; the delta to this pid's `ExecveDispatch`
         // (or `ExitBegin`) is repair plus the child's pre-exec guest window.
-        crate::exec_stamps::stamp(crate::exec_stamps::ExecStampPhase::ForkChildStart);
+        crate::exec_stamps::stamp_fork(
+            crate::exec_stamps::ExecStampPhase::ForkChildStart,
+            fork_link_id,
+            child_parent,
+        );
         let child_repair_start = Instant::now();
         let mut child_phase_start = child_repair_start;
         // Repair the inherited barrier state FIRST: the quiesce/fork flags
@@ -7383,7 +7395,11 @@ fn handle_native_fork(
     // child pid (nonzero), which is what makes the D script's parent clause
     // distinguishable from its `arg0 == 0` child clause.
     crate::probes::fork_post(child, request.guest_pc, 0);
-    crate::exec_stamps::stamp(crate::exec_stamps::ExecStampPhase::CloneParentReturn);
+    crate::exec_stamps::stamp_fork(
+        crate::exec_stamps::ExecStampPhase::CloneParentReturn,
+        fork_link_id,
+        child as u32,
+    );
     Ok(NativeForkFlow::Resume {
         value: i64::from(guest_child_pid),
         fork_child: false,

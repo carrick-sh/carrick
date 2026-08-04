@@ -125,6 +125,7 @@ mod debug;
 // `debug_census` only parses text files the native lane wrote, so — like
 // `debug_layout` and unlike `debug` — it is declared on every platform.
 mod debug_census;
+mod debug_exec_stamps;
 mod debug_layout;
 mod fs_setup;
 mod lifecycle;
