@@ -1,10 +1,9 @@
 # Native-lane performance: state of play
 
 **Date:** 2026-08-04 · **Branch:** `codex/native-store-default` · **Latest
-decision:** accept the refreshed broad CPU attribution and carry an export-only
-guest-memory-intent census; zero-fill fault service clears the 10% opportunity
-screen twice, but no production patch is authorized until one non-overlapping
-semantic sequence does too ·
+decision:** stop memory lowering below the 10% opportunity gate; retain the
+published-block index split after a controlled **8.50% total-CPU reduction**
+and carry the now-exposed exclusive translation writer ·
 **Scope:** Darwin/aarch64 native backend (`--exec-backend native`, the shipped
 default). VMM is explicitly NOT the target: one process per VM against a
 ~127-VM macOS ceiling makes it a dead end for build-shaped workloads.
@@ -121,6 +120,29 @@ prior exact N1/N2/C1/C2 binding puts all zero-fill service at a favorable
 owner census found no individual owner above 10%. Full evidence:
 [`docs/perf-results/2026-08-04-current-default-broad-cpu-attribution.md`](docs/perf-results/2026-08-04-current-default-broad-cpu-attribution.md).
 
+The approved lifecycle-complete memory-intent census is now complete. Two
+captures closed 11,671 / 11,789 intents with zero aborted records or lifecycle
+errors. The largest exact semantic sequence was anonymous-private mmap work
+while the guest operation was active: 927,321 / 935,942 zfod faults. Even
+charging the favorable 3.84 us cost to all of them projects to only **6.5569% /
+6.3527%** of ordinary CPU. No memory sequence clears 10%, so no production
+lowering was selected; the export-only diagnostic remains.
+
+The named-syscall/stack split then found `psynch_cvwait` at **17.7664% /
+17.5852%** of all sampled CPU. Exact user stacks assigned **15.2293% /
+15.1220%** to one process-wide translation-state lock: warm published-block
+lookups were 10.20-10.27%, and indirect trusted-entry lookups another
+4.85-5.03%. Commit `64bebc26` moved those two read-only paths to a 64-shard
+published-block mirror while leaving authoritative translation/publication
+semantics under the original lock. An eight-quad signed-binary ABBA measured
+total-CPU ratio **0.91498** (95% interval **[0.91023, 0.92113]**, 8/8 wins,
+exact sign p=1/256): a retained **8.50% CPU reduction**. System CPU fell 23.46%.
+Workload-wall ratio was 0.98593 but its interval crossed parity, so no wall win
+or official Carrick/Docker refresh is claimed. Candidate stacks prove the old
+reader paths disappeared and the remaining wait is exclusive translation.
+Full evidence:
+[`docs/perf-results/2026-08-04-memory-intent-and-published-block-lock.md`](docs/perf-results/2026-08-04-memory-intent-and-published-block-lock.md).
+
 ## What landed (2026-08-02/03, six waves, all merged with `just ci` green)
 
 **Exec pipeline.** Payload SHA-256 removed from the default artifact digest
@@ -166,23 +188,22 @@ went 1.66 s → <10 ms. Identical host syscall sequence, identical guest ABI.
 
 ## What's next
 
-The exec/exit, context-traffic, fault-publication, residual-allocation, and
-broad-attribution lines are closed at measurement. Their exact exporters and
-censuses remain opt-in diagnostics. A crashed run can also be read from a saved
-core through the always-on event ring. No official ratio refresh is warranted
-because the broad result selected the next measurement, not a production
-candidate.
+The exec/exit, context-traffic, fault-publication, residual-allocation, broad-
+attribution, and memory-intent lines are closed at measurement. Their exact
+exporters and censuses remain opt-in diagnostics. A crashed run can also be
+read from a saved core through the always-on event ring. The lock split is a
+retained CPU win, but no official ratio refresh is warranted because wall time
+did not resolve below parity.
 
-1. **Attribute guest memory intent to exact zero-fill pages.** Add one
-   export-only, lifecycle-complete census of guest `mmap`, `madvise`,
-   `mprotect`, and `munmap`, grouped into non-overlapping semantic sequences,
-   mapping provenance, bytes, and subsequent exact zero-fill pages. Current
-   source already lowers writable private/anonymous `MADV_DONTNEED` through a
-   fresh anonymous `MAP_FIXED` replacement, while private `MADV_FREE` is a
-   success no-op; do not assume `MADV_FREE_REUSABLE` is a win before measuring
-   the actual sequence. Select a Darwin lowering only if one sequence clears
-   10% of ordinary CPU twice. If none does, stop and split the stable 28.72%
-   named-syscall population next.
+1. **Shorten or partition exclusive translation without making the JIT cache
+   concurrently writable.** Candidate stacks now end at
+   `RawRwLock::lock_exclusive_slow -> translate_read_mostly`; the warm-reader
+   mechanism is gone. Baseline phase counters put decode at 10.52%, emission at
+   14.26%, publication at 3.71%, and the complete nested translation interval
+   at 25.46% of ordinary CPU. First test a narrow per-key election and move only
+   independently computable decode/planning outside the global write lock,
+   then revalidate generation/publication under the lock. Do not change the
+   bump cursor or its `Send`/`Sync` safety argument without a separate design.
 2. **Keep eager full translation as a deferred future design, not the next
    patch.** Translating a complete eligible image once up front could amortize
    publication and avoid the losing per-process merge path measured here. It
@@ -196,25 +217,29 @@ candidate.
 
 ## Confidence
 
-- **Very high (99%):** both broad captures are structurally complete and bound
-  to the same clean runtime binary and persistent store. Every drop/error/live
-  counter is zero and resolved CPU coverage exceeds 99.94%.
-- **Very high (98%):** the broad and kernel-class populations are stable.
-  Darwin-kernel drift is 0.2075 percentage points, named-syscall drift 0.0187,
-  and non-syscall drift 0.2261.
-- **High (92%):** anonymous zero-fill service is large enough to justify the
-  next census. It clears 10% in both exact ordinary bindings even when narrowed
-  to host-other pages, and the current non-syscall kernel sample population
-  independently agrees on scale.
-- **Medium (60%):** one guest memory-intent sequence will clear 10%. The current
-  3.84 us projection is deliberately favorable and may split across several
-  guest mechanisms; the census is designed to stop cleanly if it does.
+- **Very high (99%):** the memory line is correctly stopped. Both accepted
+  captures are lifecycle-complete, and the largest exact sequence reaches only
+  6.56% / 6.35% under a deliberately favorable cost model.
+- **Very high (98%):** the original ProcessState reader mechanism is correctly
+  attributed. Two clean captures agree within 0.11 percentage points on the
+  combined lock path, and candidate captures show both source paths gone.
+- **Very high (98%):** the lock split reduces total CPU. All 8/8 ABBA quads win,
+  the 95% interval excludes parity by 7.89 percentage points, and the system-
+  CPU movement agrees with the `psynch_cvwait` mechanism.
+- **High (94%):** the mirror preserves publication/invalidation semantics.
+  Publication ordering is explicit, all 226 crate tests pass, and the full
+  serialized repository gate is green.
+- **Medium (60%):** a narrow exclusive-lock change can deliver the next >=10%
+  step. Waiting is independently ~15.2% of sampled CPU and translation phases
+  total ~25.5%, but moving decode outside the lock can duplicate work and may
+  trade wait CPU for extra user CPU unless per-key ownership is precise.
 - **High (95%):** the official shipped-default result remains 10.4446x. No
-  rejected candidate code is retained and no projection was substituted for a
-  fresh Carrick/Docker run.
+  projection or unresolved wall result was substituted for a fresh
+  Carrick/Docker run.
 - **High (90%):** the sequential ≥10% policy is the right route toward 3x.
-  Nothing yet predicts a single 3.48x win, but each retained experiment must
-  remove a measured, source-distinct cost and preserve the Linux ABI.
+  The 8.50% lock split is a justified exception because it removes a measured,
+  source-distinct wait and enables the next lock reduction; it is not described
+  as sufficient movement toward 3x by itself.
 
 ## Discipline that earned its keep (do not relearn these)
 
@@ -239,21 +264,17 @@ candidate.
 
 ## Branch state at handoff
 
-`80a469da617b0eec4d8e69ee639cbfe287767cfd` remains the source authority for
-the accepted allocation/fault/CPU bindings. Its feature binary has SHA-256
-`c46323009b8d944c67dd0692137e1409f57254e18a3ec77cdac19f2e48dbb555`
-and UUID `444B9BDA-4565-3E15-8655-6535A4307375`; its ordinary binary has
-SHA-256 `a77c7d5243a4d6eaae195d3d8e49bde5b8c46db6eedff9db8db5cf4b2a11e8c0`
-and UUID `E0338A4E-19B3-3885-9489-5AE625AD2CE7`. Commits `932f8e28` through
-`80a469da` retain the export-only tagged allocator, lifecycle closure, strict
-ALLOCOWNER3/NATIVEPERF reader, and source-distinct owners. The ordinary binary
-contains no allocation runtime marker and default guest semantics do not
-change. `RUST_TEST_THREADS=1 just ci` passed at that source authority.
-The accepted refreshed broad captures are bound to clean runtime source
-`daebb0203c854b507b2441eee98fa341f353dd20` and signed binary SHA-256
-`d43c38bc2eec4d99170f869100fc901580c8781a95c4a77eccb4106821f3f037`.
-The branch retains its trace-control repairs through `daebb020`, host-catalog
-coalescing at `0f24eb54`, and machine-readable kernel classes at `900e6d57`.
+Current code authority is
+`64bebc26b72ffd1f7a9ba581fded0f91fca21f63`. Commits `87ab04f9` and
+`44de0656` retain the export-only, lifecycle-complete memory-intent census;
+`98ae5e26` and `c4be3c23` retain exact syscall and `psynch_cvwait` stack
+attribution; `64bebc26` is the measured published-block index split. The
+candidate signed binary has SHA-256
+`aa423abce65be7408a4e565bec04383c7eb0dfeec8a3e72f56fb1cc8f96fd5df`
+and UUID `75781D46-91FC-3A89-AFA6-283E00EA06FA`. The clean detached ABBA
+control remains at `c4be3c23` in `.worktrees/native-lock-control` with binary
+SHA-256 `8e13747930c4c954654e7a08aa21c4e41b13eea6e096a1fc64ec30facbb4cd9f`.
+`RUST_TEST_THREADS=1 just ci` passed at this source authority after the ABBA.
 Nothing has been pushed and local `main` has not moved. Target-only raw ABBA,
 mechanism, signed-binary, store, attribution, and scoreboard receipts remain
 under `target/perf/` and are intentionally not committed.
