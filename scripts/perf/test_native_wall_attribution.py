@@ -275,6 +275,33 @@ class NativeWallAttributionTest(unittest.TestCase):
         )
         self.assertTrue(summary["accepted"])
 
+    def test_identical_dyld_catalogs_across_exec_images_coalesce(self):
+        rows = profile_rows(jit_samples=400)
+        catalog = {
+            "type": "image-catalog",
+            "pid": 42,
+            "ranges": [
+                {
+                    "start": 0x8000,
+                    "end": 0xA000,
+                    "path": "/usr/lib/libSystem.B.dylib",
+                }
+            ],
+        }
+        rows[-1:-1] = [
+            row("image-catalog", catalog, kind="image-1-epoch-0", pid=42),
+            row("image-catalog", catalog, kind="image-2-epoch-0", pid=42),
+            row("cpu-user-pc", exact(count=50), pid=42, source_pc=0x9000),
+        ]
+
+        summary = native_wall_attribution.summarize(
+            native_wall_attribution.load_profile(self.write_profile(rows)),
+            pathlib.Path("/unused/carrick"),
+        )
+
+        self.assertEqual(summary["cpu"]["darwin-userspace"]["samples"], 50)
+        self.assertTrue(summary["accepted"])
+
     def test_exact_host_range_without_symbol_is_other_carrick(self):
         rows = profile_rows(jit_samples=400)
         rows.insert(

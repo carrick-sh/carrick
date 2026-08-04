@@ -345,7 +345,9 @@ def _dyld_image_ranges(
                 raise ValueError(f"image catalog for pid {pid} has invalid path")
             ranges.append((start, end, path))
         if pid in catalogs:
-            raise ValueError(f"duplicate image catalog for pid {pid}")
+            if catalogs[pid] != ranges:
+                raise ValueError(f"conflicting image catalogs for pid {pid}")
+            continue
         catalogs[pid] = ranges
     return catalogs
 
