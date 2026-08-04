@@ -909,7 +909,7 @@ mod tests {
     fn native_wall_reports_dtrace_fault_details() {
         assert!(
             BUNDLED_NATIVE_WALL_D
-                .contains("DSRERROR2|epid=%d|action=%d|offset=%d|fault=%d|value=%#x")
+                .contains("DSRERROR2|fault|epid=%d|action=%d|offset=%d|fault=%d|value=%#x")
         );
     }
 
