@@ -471,6 +471,12 @@ fn trusted_route_profile_is_cli_visible_and_has_a_target_completion_marker() {
     assert_eq!(script.matches("SHAPE1|complete|").count(), 1);
     assert!(script.contains("target_completed=%d"));
     assert!(script.contains("target_exit_reason=%d"));
+    assert!(script.contains("carrick*:::dsr-cache-bounds"));
+    assert!(script.contains("jit_start[pid] = arg0;"));
+    assert!(script.contains("jit_end[pid] = arg1;"));
+    assert!(script.contains("jit_start[args[0]->pr_pid] = jit_start[pid];"));
+    assert!(script.contains("jit_end[args[0]->pr_pid] = jit_end[pid];"));
+    assert!(script.contains("arg1 >= jit_start[pid] && arg1 < jit_end[pid]"));
 }
 
 #[test]
