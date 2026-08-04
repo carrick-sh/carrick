@@ -126,6 +126,7 @@ mod debug;
 // `debug_layout` and unlike `debug` — it is declared on every platform.
 mod debug_census;
 mod debug_exec_stamps;
+mod debug_jit_shape;
 mod debug_layout;
 mod fs_setup;
 mod lifecycle;
