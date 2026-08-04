@@ -27,6 +27,7 @@ default        = ["syscall-shim", "platform-macos"]
 # because libmalloc sub-allocates a few large regions. Opt-in: it makes the
 # binary much slower, so it is a measurement build, never a shipping one.
 alloc-census   = ["dep:dhat"]
+alloc-owner-census = ["carrick-runtime/alloc-owner-census"]
 syscall-shim   = ["carrick-runtime/syscall-shim"]
 # Exactly one platform-* is active at a time; `default` keeps macOS building
 # exactly as today. `platform-linux` links NO HVF.

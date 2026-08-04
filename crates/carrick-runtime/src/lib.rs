@@ -273,6 +273,8 @@ pub use carrick_dsr_aarch64::translator::xlat_census;
 // Allocation-owner census records are rendered by the AArch64 translator-side
 // diagnostic and parsed by the portable CLI. Re-export the single typed wire
 // authority so the CLI does not acquire a direct guest-ISA dependency.
+#[cfg(feature = "alloc-owner-census")]
+pub use carrick_dsr_aarch64::alloc_owner_census;
 pub use carrick_dsr_aarch64::alloc_owner_wire;
 // The guest-virtual address domain the census records are keyed on. Exported
 // beside `xlat_census` so an out-of-crate aggregator keys its sets on the typed

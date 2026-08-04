@@ -28,6 +28,7 @@ workspace = true
 
 [features]
 default = ["platform-macos"]
+alloc-owner-census = ["carrick-dsr-aarch64/alloc-owner-census"]
 # Guest-side syscall shim (docs/syscall-shim-design.md). NO default here on
 # purpose: the binary (carrick-cli) is the single control point. carrick-cli's
 # default enables it for normal builds; dependents that use carrick-runtime as a
