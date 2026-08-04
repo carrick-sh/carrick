@@ -227,8 +227,11 @@ zero PC rows, arithmetic overflow, and any reconciliation failure.
 The existing `carrick.code-snapshot.v4` JSON/`.bin` pairs remain the instruction
 byte authority. The profile uses a fresh dedicated directory. Snapshot loading
 is strengthened to reject subdirectories, symlinks, unknown files, incomplete
-pairs, duplicate stems, wrong schemas, length or digest mismatches, unaligned or
-overflowing ranges, and overlapping same-PID resolving ranges.
+pairs, wrong schemas, length or digest mismatches, unaligned or overflowing
+ranges, and overlapping same-PID resolving ranges. Within one real directory,
+the same recognized extension plus the same stem implies the same filename, so
+it cannot appear twice; same-stem `.json`/`.bin` entries are instead the
+required pair.
 
 One shared Rust snapshot module computes a deterministic manifest over each
 sorted stem, metadata digest, and payload digest, using NUL separators between

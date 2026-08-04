@@ -173,7 +173,7 @@ fn manifest_is_sorted_and_domain_separated() {
 }
 ```
 
-Also cover: directory and nested-directory rejection; incomplete pair; duplicate stem; wrong schema; JSON and payload digest mismatch; `code_len` mismatch; empty code; non-four-byte code length; unaligned cache base/block endpoints; overflowing and out-of-payload block ranges; overlapping resolving ranges for one PID; duplicate PID snapshots whose ranges do not overlap; and pair/PID/block/byte counters.
+Also cover: directory and nested-directory rejection; incomplete pair; wrong schema; JSON and payload digest mismatch; `code_len` mismatch; empty code; non-four-byte code length; unaligned cache base/block endpoints; overflowing and out-of-payload block ranges; overlapping resolving ranges for one PID; duplicate PID snapshots whose ranges do not overlap; and pair/PID/block/byte counters. Within one real directory, the same recognized extension plus the same stem implies the same filename, so a duplicate-stem case is not representable; same-stem `.json`/`.bin` entries are the required pair.
 
 Run:
 
