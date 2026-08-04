@@ -60,12 +60,6 @@ dtrace:::BEGIN
 	live_pids = 0;
 	next_fork_id = (uint64_t)0;
 	pending_forks = 0;
-	memory_intent_entries = 0;
-	memory_intent_returns = 0;
-	memory_inflight = 0;
-	memory_total_zfod = 0;
-	memory_exported_zfod = 0;
-	memory_unexported_zfod = 0;
 
 	/* Fix retained dynamic-array values at their intended widths. */
 	tracked[(pid_t)0] = 0;
@@ -133,8 +127,7 @@ carrick*:::syscall-entry
 	memory_arg3[pid, tid] = this->args[3];
 	memory_arg4[pid, tid] = this->args[4];
 	memory_arg5[pid, tid] = this->args[5];
-	memory_intent_entries++;
-	memory_inflight++;
+	@memory_intent_entries = count();
 }
 
 carrick*:::syscall-return
@@ -148,8 +141,7 @@ carrick*:::syscall-return
 	    memory_arg1[pid, tid], memory_arg2[pid, tid], memory_arg3[pid, tid],
 	    memory_arg4[pid, tid], memory_arg5[pid, tid], (int64_t)arg2,
 	    (int32_t)arg3);
-	memory_intent_returns++;
-	memory_inflight--;
+	@memory_intent_returns = count();
 	memory_number[pid, tid] = (uint64_t)0;
 	memory_active_sequence[pid, tid] = (uint64_t)0;
 	memory_entry_ns[pid, tid] = (uint64_t)0;
@@ -455,7 +447,7 @@ vminfo:::zfod
 /(pid == $target || progenyof($target)) &&
     (birth_seen[pid] != 0 || pending_fork_id[pid] != (uint64_t)0)/
 {
-	memory_total_zfod++;
+	@memory_total_zfod = count();
 }
 
 vminfo:::zfod
@@ -474,7 +466,7 @@ vminfo:::zfod
 	    memory_active_sequence[pid, tid],
 	    memory_number[pid, tid] != (uint64_t)0 ?
 	    "active-memory" : "guest-arena");
-	memory_exported_zfod++;
+	@memory_exported_zfod = count();
 }
 
 vminfo:::zfod
@@ -489,7 +481,7 @@ vminfo:::zfod
     ((uint64_t)arg2 >= (uint64_t)0x000000a000000000 &&
     (uint64_t)arg2 < (uint64_t)0x000000a800000000)))/
 {
-	memory_unexported_zfod++;
+	@memory_unexported_zfod = count();
 }
 
 vminfo:::cow_fault
@@ -602,6 +594,43 @@ vminfo:::zfod
 	    image_generation[pid], (uint64_t)arg2] = count();
 }
 
+/*
+ * A thread/process can terminate without returning from its current guest
+ * syscall. Export that terminal edge explicitly so entry closure remains exact;
+ * an aborted operation owns in-window faults but never mutates replayed VM
+ * state. Whichever terminal provider fires first clears the slot, preventing a
+ * duplicate record when both lwp-exit and process exit are observed.
+ */
+proc:::lwp-exit
+/tracked[pid] && memory_number[pid, tid] != (uint64_t)0/
+{
+	printf("NFAULT2|memory-intent-abort|pid=%d|start_sec=%d|start_usec=%d|image=%d|tid=%d|sequence=%d|number=%d|entry_ns=%d|terminal_ns=%d|arg0=%d|arg1=%d|arg2=%d|arg3=%d|arg4=%d|arg5=%d|reason=thread-exit\n",
+	    pid, birth_sec[pid], birth_usec[pid], image_generation[pid], tid,
+	    memory_active_sequence[pid, tid], memory_number[pid, tid],
+	    memory_entry_ns[pid, tid], timestamp, memory_arg0[pid, tid],
+	    memory_arg1[pid, tid], memory_arg2[pid, tid], memory_arg3[pid, tid],
+	    memory_arg4[pid, tid], memory_arg5[pid, tid]);
+	@memory_intent_aborts = count();
+	memory_number[pid, tid] = (uint64_t)0;
+	memory_active_sequence[pid, tid] = (uint64_t)0;
+	memory_entry_ns[pid, tid] = (uint64_t)0;
+}
+
+proc:::exit
+/tracked[pid] && memory_number[pid, tid] != (uint64_t)0/
+{
+	printf("NFAULT2|memory-intent-abort|pid=%d|start_sec=%d|start_usec=%d|image=%d|tid=%d|sequence=%d|number=%d|entry_ns=%d|terminal_ns=%d|arg0=%d|arg1=%d|arg2=%d|arg3=%d|arg4=%d|arg5=%d|reason=process-exit\n",
+	    pid, birth_sec[pid], birth_usec[pid], image_generation[pid], tid,
+	    memory_active_sequence[pid, tid], memory_number[pid, tid],
+	    memory_entry_ns[pid, tid], timestamp, memory_arg0[pid, tid],
+	    memory_arg1[pid, tid], memory_arg2[pid, tid], memory_arg3[pid, tid],
+	    memory_arg4[pid, tid], memory_arg5[pid, tid]);
+	@memory_intent_aborts = count();
+	memory_number[pid, tid] = (uint64_t)0;
+	memory_active_sequence[pid, tid] = (uint64_t)0;
+	memory_entry_ns[pid, tid] = (uint64_t)0;
+}
+
 /* Retire only the exact tracked incarnation; the launcher exit ends capture. */
 proc:::exit
 /tracked[pid]/
@@ -660,9 +689,12 @@ dtrace:::END
 	    @prebirth_rejected_as);
 	printa("NFAULT2|prebirth-rejected|outcome=zfod|fork_id=%d|count=%@u\n",
 	    @prebirth_rejected_zfod);
-	printf("NFAULT2|memory-census|total_zfod=%d|exported_zfod=%d|unexported_zfod=%d|intent_entries=%d|intent_returns=%d|inflight=%d\n",
-	    memory_total_zfod, memory_exported_zfod, memory_unexported_zfod,
-	    memory_intent_entries, memory_intent_returns, memory_inflight);
+	printa("NFAULT2|memory-count|kind=total-zfod|count=%@u\n", @memory_total_zfod);
+	printa("NFAULT2|memory-count|kind=exported-zfod|count=%@u\n", @memory_exported_zfod);
+	printa("NFAULT2|memory-count|kind=unexported-zfod|count=%@u\n", @memory_unexported_zfod);
+	printa("NFAULT2|memory-count|kind=intent-entries|count=%@u\n", @memory_intent_entries);
+	printa("NFAULT2|memory-count|kind=intent-returns|count=%@u\n", @memory_intent_returns);
+	printa("NFAULT2|memory-count|kind=intent-aborts|count=%@u\n", @memory_intent_aborts);
 	printf("NFAULT2|complete|profile=native-fault|bounded=%d|timed_out=%d|target_exit=%d|target_exit_reason=%d|identity_violations=%d|lifecycle_violations=%d|catalog_violations=%d|probe_errors=%d|live_at_end=%d|pending_forks=%d|elapsed_ns=%d\n",
 	    timed_out || target_exit == 0 || root_pid == (pid_t)0 ||
 	    identity_violations != 0 || lifecycle_violations != 0 ||
