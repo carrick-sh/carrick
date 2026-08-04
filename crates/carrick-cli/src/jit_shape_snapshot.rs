@@ -125,9 +125,7 @@ impl SnapshotSet {
             } else {
                 &mut bin_paths
             };
-            if target.insert(stem.clone(), path).is_some() {
-                bail!("duplicate snapshot stem `{stem}`");
-            }
+            target.insert(stem, path);
         }
         if json_paths.is_empty() && bin_paths.is_empty() {
             bail!(
