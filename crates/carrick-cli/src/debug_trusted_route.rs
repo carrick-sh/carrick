@@ -19,7 +19,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
-use crate::trace_profile::{TrustedRouteCaptureReceipt, TrustedRoutePcRow, parse_trusted_route_pc};
+use crate::trace_profile::{
+    TrustedRouteCaptureReceipt, TrustedRoutePcRow, parse_trusted_route_fork, parse_trusted_route_pc,
+};
 
 const REPORT_SCHEMA: &str = "carrick.trusted-route-census.v2";
 const SNAPSHOT_SCHEMA: &str = "carrick.code-snapshot.v3";
@@ -86,6 +88,7 @@ pub(crate) struct TrustedRouteCensusReport {
     pub(crate) snapshots_sha256: String,
     pub(crate) total_pc_samples: u64,
     pub(crate) matched_samples: u64,
+    pub(crate) inherited_samples: u64,
     pub(crate) missing_pid_samples: u64,
     pub(crate) missing_range_samples: u64,
     pub(crate) routes: RouteTallies,
@@ -209,9 +212,16 @@ pub(crate) fn build_trusted_route_census(
     let snapshot_set = load_snapshots(snapshots_path)?;
     let trace_text = std::str::from_utf8(&trace).context("trusted-route trace is not UTF-8")?;
     let mut rows = Vec::new();
+    let mut fork_parents = BTreeMap::new();
     for (line_index, raw_line) in trace_text.lines().enumerate() {
         let line = raw_line.trim();
-        if line.starts_with("PC ") {
+        if line.starts_with("SHAPE1|fork|") {
+            let (parent, child) = parse_trusted_route_fork(line)
+                .with_context(|| format!("malformed fork row at line {}", line_index + 1))?;
+            if fork_parents.insert(child, parent).is_some() {
+                bail!("duplicate fork lineage for child {child}");
+            }
+        } else if line.starts_with("PC ") {
             rows.push(
                 parse_trusted_route_pc(line)
                     .with_context(|| format!("malformed PC row at line {}", line_index + 1))?,
@@ -233,6 +243,7 @@ pub(crate) fn build_trusted_route_census(
     }
 
     let mut matched_samples = 0_u64;
+    let mut inherited_samples = 0_u64;
     let mut missing_pid_samples = 0_u64;
     let mut missing_range_samples = 0_u64;
     let mut routes = RouteTallies::default();
@@ -244,11 +255,28 @@ pub(crate) fn build_trusted_route_census(
                 checked_add_population(missing_pid_samples, row.samples, "missing-PID samples")?;
             continue;
         };
-        let snapshot = snapshots
-            .partition_point(|snapshot| snapshot.index.cache_base <= row.pc)
-            .checked_sub(1)
-            .and_then(|index| snapshots.get(index))
-            .filter(|snapshot| row.pc < snapshot.cache_end);
+        let mut snapshot = snapshot_containing(snapshots, row.pc);
+        if snapshot.is_none() {
+            let mut ancestor = fork_parents.get(&row.pid).copied();
+            let mut seen = BTreeSet::new();
+            while let Some(pid) = ancestor {
+                if !seen.insert(pid) {
+                    bail!("fork lineage contains a cycle at PID {pid}");
+                }
+                if let Some(parent_snapshots) = snapshot_set.by_pid.get(&pid)
+                    && let Some(inherited) = snapshot_containing(parent_snapshots, row.pc)
+                {
+                    snapshot = Some(inherited);
+                    inherited_samples = checked_add_population(
+                        inherited_samples,
+                        row.samples,
+                        "inherited samples",
+                    )?;
+                    break;
+                }
+                ancestor = fork_parents.get(&pid).copied();
+            }
+        }
         let Some(snapshot) = snapshot else {
             missing_range_samples = checked_add_population(
                 missing_range_samples,
@@ -306,6 +334,7 @@ pub(crate) fn build_trusted_route_census(
         snapshots_sha256: snapshot_set.sha256,
         total_pc_samples,
         matched_samples,
+        inherited_samples,
         missing_pid_samples,
         missing_range_samples,
         routes,
@@ -319,6 +348,14 @@ pub(crate) fn build_trusted_route_census(
         block_count: snapshot_set.block_count,
         validation_failures,
     })
+}
+
+fn snapshot_containing(snapshots: &[LoadedSnapshot], pc: u64) -> Option<&LoadedSnapshot> {
+    snapshots
+        .partition_point(|snapshot| snapshot.index.cache_base <= pc)
+        .checked_sub(1)
+        .and_then(|index| snapshots.get(index))
+        .filter(|snapshot| pc < snapshot.cache_end)
 }
 
 fn validate_jit_share(jit_share: f64) -> Result<()> {
@@ -1188,17 +1225,25 @@ mod tests {
         write_snapshot_named(directory, &pid.to_string(), pid, base);
     }
 
-    fn raw_trace(rows: &[(u32, u64, u64)]) -> String {
+    fn raw_trace_with_forks(rows: &[(u32, u64, u64)], forks: &[(u32, u32)]) -> String {
         let pc_samples = rows.iter().map(|row| row.2).sum::<u64>();
-        let mut raw = format!(
+        let mut raw = String::new();
+        for &(parent, child) in forks {
+            raw.push_str(&format!("SHAPE1|fork|parent={parent}|child={child}\n"));
+        }
+        raw.push_str(&format!(
             "SHAPE1|section=totals\nSHAPE1|samples={}\nSHAPE1|copyin-errors=0\nSHAPE1|section=region\nSHAPE1|region=jit-or-guest|count={pc_samples}\nSHAPE1|section=pc\n",
             pc_samples + 91
-        );
+        ));
         for &(pid, pc, samples) in rows {
             raw.push_str(&format!("PC {pid} 0x{pc:x} {samples}\n"));
         }
         raw.push_str("SHAPE1|complete|bounded=0|target_completed=1|target_exit_reason=1\n");
         raw
+    }
+
+    fn raw_trace(rows: &[(u32, u64, u64)]) -> String {
+        raw_trace_with_forks(rows, &[])
     }
 
     fn provenance() -> ProfileProvenance {
@@ -1323,6 +1368,24 @@ mod tests {
         assert_eq!(report.missing_range_samples, 0);
         assert_eq!(report.routes.fallthrough, 8);
         assert_eq!(report.block_count, 3);
+        assert!(report.validation_failures.is_empty());
+    }
+
+    #[test]
+    fn trusted_route_census_resolves_inherited_child_samples_through_its_parent() {
+        let fixture = make_fixture(&[(44, 0x1000, 5), (44, 0x3000, 3)]);
+        write_snapshot(&fixture.snapshots, 44, 0x3000);
+        let raw = raw_trace_with_forks(&[(44, 0x1000, 5), (44, 0x3000, 3)], &[(42, 44)]);
+        write_capture(&fixture.trace, &fixture.capture, &raw);
+
+        let report =
+            build_trusted_route_census(&fixture.trace, &fixture.capture, &fixture.snapshots, 0.45)
+                .expect("fork-inherited range resolves through its exact parent");
+
+        assert_eq!(report.matched_samples, 8);
+        assert_eq!(report.inherited_samples, 5);
+        assert_eq!(report.missing_pid_samples, 0);
+        assert_eq!(report.missing_range_samples, 0);
         assert!(report.validation_failures.is_empty());
     }
 

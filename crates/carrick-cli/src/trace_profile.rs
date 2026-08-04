@@ -2559,6 +2559,7 @@ impl TrustedRouteCaptureReceipt {
         let mut bounded = None;
         let mut target_completed = None;
         let mut target_exit_reason = None;
+        let mut fork_parents = BTreeMap::new();
 
         for (index, raw_line) in contents.lines().enumerate() {
             let line = raw_line.trim();
@@ -2572,6 +2573,16 @@ impl TrustedRouteCaptureReceipt {
                 );
             }
             match line {
+                _ if line.starts_with("SHAPE1|fork|") => {
+                    if section.is_some() {
+                        bail!("misplaced fork lineage at line {}", index + 1);
+                    }
+                    let (parent, child) = parse_trusted_route_fork(line)
+                        .with_context(|| format!("invalid fork lineage at line {}", index + 1))?;
+                    if fork_parents.insert(child, parent).is_some() {
+                        bail!("duplicate fork lineage for child {child}");
+                    }
+                }
                 "SHAPE1|section=totals" => {
                     if section.replace(TrustedRouteSection::Totals).is_some() {
                         bail!(
@@ -2761,6 +2772,21 @@ pub(crate) fn parse_trusted_route_pc(line: &str) -> Result<TrustedRoutePcRow> {
         bail!("PC row has zero samples");
     }
     Ok(TrustedRoutePcRow { pid, pc, samples })
+}
+
+pub(crate) fn parse_trusted_route_fork(line: &str) -> Result<(u32, u32)> {
+    let fields = parse_shape_fields(line, "SHAPE1|fork|")?;
+    if fields.len() != 2 {
+        bail!("trusted-route fork lineage has unknown or missing fields");
+    }
+    let parent = u32::try_from(parse_shape_field_u64(&fields, "parent")?)
+        .context("trusted-route fork parent exceeds u32")?;
+    let child = u32::try_from(parse_shape_field_u64(&fields, "child")?)
+        .context("trusted-route fork child exceeds u32")?;
+    if parent == 0 || child == 0 || parent == child {
+        bail!("trusted-route fork lineage has invalid process IDs");
+    }
+    Ok((parent, child))
 }
 
 fn parse_shape_fields(line: &str, prefix: &str) -> Result<BTreeMap<String, String>> {

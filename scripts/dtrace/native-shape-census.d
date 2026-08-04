@@ -59,6 +59,7 @@ dtrace:::BEGIN
 proc:::create
 /tracked[pid]/
 {
+	printf("SHAPE1|fork|parent=%d|child=%d\n", pid, args[0]->pr_pid);
 	tracked[args[0]->pr_pid] = 1;
 	jit_start[args[0]->pr_pid] = jit_start[pid];
 	jit_end[args[0]->pr_pid] = jit_end[pid];

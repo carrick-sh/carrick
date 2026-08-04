@@ -477,6 +477,7 @@ fn trusted_route_profile_is_cli_visible_and_has_a_target_completion_marker() {
     assert!(script.contains("jit_start[args[0]->pr_pid] = jit_start[pid];"));
     assert!(script.contains("jit_end[args[0]->pr_pid] = jit_end[pid];"));
     assert!(script.contains("arg1 >= jit_start[pid] && arg1 < jit_end[pid]"));
+    assert!(script.contains("SHAPE1|fork|parent=%d|child=%d"));
 }
 
 #[test]
