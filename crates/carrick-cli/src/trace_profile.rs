@@ -1295,6 +1295,7 @@ impl V2Validator {
 
     fn host_image_catalog(&mut self, record: &V2Record) -> Result<()> {
         record.exact_fields(&[
+            "catalog_pid",
             "epoch",
             "image",
             "payload",
@@ -1313,11 +1314,12 @@ impl V2Validator {
                 bail!("DSRPROF2 host image catalog probe failed: {err}")
             }
         };
-        if payload.pid != u64::from(key.birth.pid) {
+        let catalog_pid = record.decimal_u32("catalog_pid")?;
+        if payload.pid != u64::from(catalog_pid) {
             bail!(
-                "DSRPROF2 host image catalog pid {} does not match record pid {}",
+                "DSRPROF2 host image catalog pid {} does not match canonical catalog pid {}",
                 payload.pid,
-                key.birth.pid
+                catalog_pid
             );
         }
         if payload.ranges.is_empty() {
@@ -3935,6 +3937,17 @@ mod tests {
                 && row["metric"]["pid"] == 1
         }));
         assert_eq!(rows.last().unwrap()["metric"]["type"], "completion");
+    }
+
+    #[test]
+    fn dsrprof2_host_catalog_can_replay_a_canonical_process_payload() {
+        let raw = include_str!("../tests/fixtures/dsrprof2-valid.raw").replacen(
+            "catalog_pid=100|payload={\"ok\":{\"pid\":100",
+            "catalog_pid=999|payload={\"ok\":{\"pid\":999",
+            1,
+        );
+        ProfileSummary::from_lines(raw.lines(), ProfileCaptureStatus::default())
+            .expect("a canonical dyld catalog can be replayed for another process image");
     }
 
     #[test]

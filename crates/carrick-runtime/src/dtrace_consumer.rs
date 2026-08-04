@@ -906,6 +906,12 @@ mod tests {
     }
 
     #[test]
+    fn native_wall_copies_one_canonical_host_catalog() {
+        assert!(BUNDLED_NATIVE_WALL_D.contains("canonical_host_image_catalog = copyinstr(arg0);"));
+        assert_eq!(BUNDLED_NATIVE_WALL_D.matches("copyinstr(arg0)").count(), 1);
+    }
+
+    #[test]
     fn native_wall_reports_dtrace_fault_details() {
         assert!(
             BUNDLED_NATIVE_WALL_D

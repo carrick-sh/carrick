@@ -6,7 +6,7 @@ DSRPROF2|range-shared|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|sequenc
 DSRPROF2|range-shared|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|sequence=3|unit_id=8|start=0x4000|end=0x4800
 DSRPROF2|range-ready|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|final_sequence=3
 DSRPROF2|host-image-base|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|base=0x100000000
-DSRPROF2|host-image-catalog|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|payload={"ok":{"pid":100,"ranges":[{"start":4294967296,"end":4294971392,"path":"/carrick"}]}}
+DSRPROF2|host-image-catalog|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|catalog_pid=100|payload={"ok":{"pid":100,"ranges":[{"start":4294967296,"end":4294971392,"path":"/carrick"}]}}
 DSRPROF2|guest-image-base|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|base=0x400000
 DSRPROF2|cpu-user|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|pc=0x1100|count=3
 DSRPROF2|cpu-kernel|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|class=kernel-named-syscall|pc=0xfffffe0010010010|count=2
