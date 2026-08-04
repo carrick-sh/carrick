@@ -3,11 +3,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, bail};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest as _, Sha256};
+
+use crate::jit_shape_snapshot::{ResolutionOrigin, SnapshotSet};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct PcSample {
@@ -202,185 +204,6 @@ fn set_once<T>(slot: &mut Option<T>, value: T, name: &str, line: usize) -> anyho
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SnapshotMetadata {
-    schema: String,
-    pid: u32,
-    cache_base: u64,
-    code_len: usize,
-    code_sha256: String,
-    blocks: Vec<(u64, u64)>,
-}
-
-#[derive(Debug)]
-struct Snapshot {
-    path: PathBuf,
-    base: u64,
-    code: Vec<u8>,
-    blocks: Vec<(u64, u64)>,
-}
-
-impl Snapshot {
-    fn contains(&self, pc: u64) -> bool {
-        let Some(end) = self.base.checked_add(self.code.len() as u64) else {
-            return false;
-        };
-        pc >= self.base && pc < end
-    }
-
-    fn word_at(&self, pc: u64) -> anyhow::Result<u32> {
-        let offset = pc
-            .checked_sub(self.base)
-            .with_context(|| format!("PC {pc:#x} precedes snapshot base {:#x}", self.base))?;
-        if offset % 4 != 0 {
-            bail!(
-                "PC {pc:#x} is not word-aligned in snapshot {}",
-                self.path.display()
-            );
-        }
-        let offset = usize::try_from(offset).context("snapshot offset does not fit usize")?;
-        let end = offset
-            .checked_add(4)
-            .context("snapshot word offset overflow")?;
-        let bytes = self
-            .code
-            .get(offset..end)
-            .with_context(|| format!("PC {pc:#x} is truncated in {}", self.path.display()))?;
-        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-    }
-}
-
-#[derive(Debug)]
-struct SnapshotSet {
-    by_pid: BTreeMap<u32, Vec<Snapshot>>,
-    manifest_sha256: String,
-    count: usize,
-    blocks: usize,
-}
-
-fn load_snapshots(dir: &Path) -> anyhow::Result<SnapshotSet> {
-    let entries =
-        fs::read_dir(dir).with_context(|| format!("read snapshot directory {}", dir.display()))?;
-    let mut json_paths = BTreeMap::new();
-    let mut bin_paths = BTreeMap::new();
-    for entry in entries {
-        let entry = entry.with_context(|| format!("read entry in {}", dir.display()))?;
-        if !entry
-            .file_type()
-            .with_context(|| format!("read file type for {}", entry.path().display()))?
-            .is_file()
-        {
-            continue;
-        }
-        let path = entry.path();
-        let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        if !matches!(extension, "json" | "bin") {
-            continue;
-        }
-        let stem = path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .with_context(|| format!("non-UTF-8 snapshot name {}", path.display()))?
-            .to_owned();
-        let target = if extension == "json" {
-            &mut json_paths
-        } else {
-            &mut bin_paths
-        };
-        if target.insert(stem.clone(), path.clone()).is_some() {
-            bail!("duplicate snapshot `{stem}.{extension}`");
-        }
-    }
-    if json_paths.is_empty() && bin_paths.is_empty() {
-        bail!("snapshot directory {} contains no snapshots", dir.display());
-    }
-    let json_stems = json_paths.keys().cloned().collect::<BTreeSet<_>>();
-    let bin_stems = bin_paths.keys().cloned().collect::<BTreeSet<_>>();
-    if json_stems != bin_stems {
-        let missing_bins = json_stems.difference(&bin_stems).collect::<Vec<_>>();
-        let missing_json = bin_stems.difference(&json_stems).collect::<Vec<_>>();
-        bail!(
-            "snapshot pairs are incomplete: missing .bin for {missing_bins:?}; missing .json for {missing_json:?}"
-        );
-    }
-
-    let mut by_pid: BTreeMap<u32, Vec<Snapshot>> = BTreeMap::new();
-    let mut manifest = Sha256::new();
-    for (stem, json_path) in json_paths {
-        let bin_path = bin_paths
-            .get(&stem)
-            .with_context(|| format!("snapshot {stem} lost its paired payload"))?;
-        let json = fs::read(&json_path)
-            .with_context(|| format!("read snapshot metadata {}", json_path.display()))?;
-        let metadata: SnapshotMetadata = serde_json::from_slice(&json)
-            .with_context(|| format!("parse snapshot metadata {}", json_path.display()))?;
-        if metadata.schema != "carrick.code-snapshot.v4" {
-            bail!(
-                "snapshot {} has unsupported schema `{}`",
-                json_path.display(),
-                metadata.schema
-            );
-        }
-        let code = fs::read(bin_path)
-            .with_context(|| format!("read snapshot payload {}", bin_path.display()))?;
-        if code.len() != metadata.code_len {
-            bail!(
-                "snapshot {} length {} does not match authenticated length {}",
-                bin_path.display(),
-                code.len(),
-                metadata.code_len
-            );
-        }
-        if code.len() % 4 != 0 {
-            bail!("snapshot {} length is not word-aligned", bin_path.display());
-        }
-        metadata
-            .cache_base
-            .checked_add(code.len() as u64)
-            .with_context(|| format!("snapshot {} address range overflows", bin_path.display()))?;
-        let code_sha256 = format!("{:x}", Sha256::digest(&code));
-        if code_sha256 != metadata.code_sha256 {
-            bail!(
-                "snapshot {} SHA-256 {} does not match authenticated digest {}",
-                bin_path.display(),
-                code_sha256,
-                metadata.code_sha256
-            );
-        }
-        let json_sha256 = format!("{:x}", Sha256::digest(&json));
-        manifest.update(stem.as_bytes());
-        manifest.update([0]);
-        manifest.update(json_sha256.as_bytes());
-        manifest.update([0]);
-        manifest.update(code_sha256.as_bytes());
-        manifest.update(b"\n");
-        by_pid.entry(metadata.pid).or_default().push(Snapshot {
-            path: bin_path.clone(),
-            base: metadata.cache_base,
-            code,
-            blocks: metadata.blocks,
-        });
-    }
-    for snapshots in by_pid.values_mut() {
-        snapshots.sort_by(|left, right| left.path.cmp(&right.path));
-    }
-    let count = by_pid.values().map(Vec::len).sum();
-    let blocks = by_pid
-        .values()
-        .flatten()
-        .map(|snapshot| snapshot.blocks.len())
-        .sum();
-    Ok(SnapshotSet {
-        by_pid,
-        manifest_sha256: format!("{:x}", manifest.finalize()),
-        count,
-        blocks,
-    })
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ResolvedWord {
     word: u32,
@@ -392,67 +215,11 @@ fn resolve_sample(
     snapshots: &SnapshotSet,
     parents: &BTreeMap<u32, u32>,
 ) -> anyhow::Result<ResolvedWord> {
-    let own = snapshots.by_pid.get(&sample.pid).with_context(|| {
-        format!(
-            "pid {} has samples but no authenticated snapshot",
-            sample.pid
-        )
-    })?;
-    let own_matches = own
-        .iter()
-        .filter(|snapshot| snapshot.contains(sample.pc))
-        .collect::<Vec<_>>();
-    match own_matches.as_slice() {
-        [snapshot] => {
-            return Ok(ResolvedWord {
-                word: snapshot.word_at(sample.pc)?,
-                inherited: false,
-            });
-        }
-        [] => {}
-        matches => {
-            bail!(
-                "pid {} PC {:#x} resolves in {} own snapshots",
-                sample.pid,
-                sample.pc,
-                matches.len()
-            );
-        }
-    }
-
-    let mut candidates = Vec::new();
-    let mut cursor = sample.pid;
-    let mut seen = BTreeSet::new();
-    while let Some(&parent) = parents.get(&cursor) {
-        if !seen.insert(cursor) {
-            bail!("fork ancestry cycle while resolving pid {}", sample.pid);
-        }
-        if let Some(parent_snapshots) = snapshots.by_pid.get(&parent) {
-            candidates.extend(
-                parent_snapshots
-                    .iter()
-                    .filter(|snapshot| snapshot.contains(sample.pc)),
-            );
-        }
-        cursor = parent;
-    }
-    match candidates.as_slice() {
-        [snapshot] => Ok(ResolvedWord {
-            word: snapshot.word_at(sample.pc)?,
-            inherited: true,
-        }),
-        [] => bail!(
-            "pid {} PC {:#x} resolves in no own or ancestor snapshot",
-            sample.pid,
-            sample.pc
-        ),
-        matches => bail!(
-            "pid {} PC {:#x} resolves ambiguously in {} ancestor snapshots",
-            sample.pid,
-            sample.pc,
-            matches.len()
-        ),
-    }
+    let resolved = snapshots.resolve(sample.pid, sample.pc, parents)?;
+    Ok(ResolvedWord {
+        word: resolved.word,
+        inherited: matches!(resolved.origin, ResolutionOrigin::Ancestor { .. }),
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -567,7 +334,7 @@ fn build_report(
         bail!("--jit-share-of-total must be finite and in the interval (0, 1]");
     }
     let trace = parse_trace(trace_bytes)?;
-    let snapshots = load_snapshots(snapshot_dir)?;
+    let snapshots = SnapshotSet::load(snapshot_dir)?;
     let mut own_samples = 0_u64;
     let mut inherited_samples = 0_u64;
     let mut families: BTreeMap<&'static str, u64> = BTreeMap::new();
@@ -645,7 +412,7 @@ fn build_report(
         schema: "carrick.jit-shape-census.v1",
         inputs: InputsSection {
             trace_sha256: format!("{:x}", Sha256::digest(trace_bytes)),
-            snapshot_manifest_sha256: snapshots.manifest_sha256,
+            snapshot_manifest_sha256: snapshots.manifest().sha256.clone(),
             jit_share_of_total_cpu,
         },
         trace: TraceSection {
@@ -656,9 +423,12 @@ fn build_report(
             fork_links: trace.parents.len(),
         },
         snapshots: SnapshotSection {
-            files: snapshots.count,
-            pids: snapshots.by_pid.len(),
-            indexed_blocks: snapshots.blocks,
+            files: usize::try_from(snapshots.manifest().pairs)
+                .context("snapshot pair count does not fit usize")?,
+            pids: usize::try_from(snapshots.manifest().pids)
+                .context("snapshot PID count does not fit usize")?,
+            indexed_blocks: usize::try_from(snapshots.manifest().blocks)
+                .context("snapshot block count does not fit usize")?,
         },
         coverage: CoverageSection {
             matched_jit_samples,
@@ -750,6 +520,7 @@ fn context_semantic_label(slot: u32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jit_shape_snapshot::write_v4_test_snapshot;
 
     const GOOD_TRACE: &str = "\
 SHAPE1|fork|parent=10|child=11
@@ -800,140 +571,6 @@ SHAPE1|complete|bounded=0|target_completed=1|target_exit_reason=1
         }
     }
 
-    fn write_snapshot(dir: &std::path::Path, stem: &str, pid: u32, base: u64, words: &[u32]) {
-        let code = words
-            .iter()
-            .flat_map(|word| word.to_le_bytes())
-            .collect::<Vec<_>>();
-        std::fs::write(dir.join(format!("{stem}.bin")), &code).expect("write snapshot bytes");
-        let metadata = serde_json::json!({
-            "schema": "carrick.code-snapshot.v4",
-            "pid": pid,
-            "cache_base": base,
-            "code_len": code.len(),
-            "code_sha256": format!("{:x}", Sha256::digest(&code)),
-            "blocks": [[0x4000, base]],
-        });
-        std::fs::write(
-            dir.join(format!("{stem}.json")),
-            serde_json::to_vec(&metadata).expect("serialize snapshot metadata"),
-        )
-        .expect("write snapshot metadata");
-    }
-
-    #[test]
-    fn snapshot_loader_rejects_missing_or_unauthenticated_payloads() {
-        let cases = ["missing", "schema", "length", "hash"];
-        for case in cases {
-            let dir = tempfile::tempdir().expect("snapshot tempdir");
-            write_snapshot(dir.path(), "10-1", 10, 0x1000, &[0xd503_201f]);
-            let json_path = dir.path().join("10-1.json");
-            let bin_path = dir.path().join("10-1.bin");
-            match case {
-                "missing" => std::fs::remove_file(bin_path).expect("remove payload"),
-                "schema" => {
-                    let mut value: serde_json::Value =
-                        serde_json::from_slice(&std::fs::read(&json_path).expect("read metadata"))
-                            .expect("parse metadata");
-                    value["schema"] = "old".into();
-                    std::fs::write(json_path, serde_json::to_vec(&value).unwrap()).unwrap();
-                }
-                "length" => std::fs::write(bin_path, []).expect("truncate payload"),
-                "hash" => std::fs::write(bin_path, 1_u32.to_le_bytes()).expect("mutate payload"),
-                _ => unreachable!(),
-            }
-            assert!(
-                load_snapshots(dir.path()).is_err(),
-                "accepted {case} payload"
-            );
-        }
-    }
-
-    #[test]
-    fn resolver_requires_one_own_or_one_ancestor_snapshot() {
-        let dir = tempfile::tempdir().expect("snapshot tempdir");
-        write_snapshot(dir.path(), "10-1", 10, 0x1000, &[0xf942_3791]);
-        write_snapshot(dir.path(), "11-1", 11, 0x3000, &[0xd503_201f]);
-        let snapshots = load_snapshots(dir.path()).expect("load snapshots");
-        let parents = BTreeMap::from([(11, 10)]);
-        let inherited = resolve_sample(
-            PcSample {
-                pid: 11,
-                pc: 0x1000,
-                count: 4,
-            },
-            &snapshots,
-            &parents,
-        )
-        .expect("resolve inherited sample");
-        assert_eq!(inherited.word, 0xf942_3791);
-        assert!(inherited.inherited);
-
-        assert!(
-            resolve_sample(
-                PcSample {
-                    pid: 12,
-                    pc: 0x1000,
-                    count: 1,
-                },
-                &snapshots,
-                &parents,
-            )
-            .is_err()
-        );
-        assert!(
-            resolve_sample(
-                PcSample {
-                    pid: 11,
-                    pc: 0x2000,
-                    count: 1,
-                },
-                &snapshots,
-                &parents,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn resolver_rejects_ambiguous_own_or_ancestor_ranges() {
-        let own_dir = tempfile::tempdir().expect("own tempdir");
-        write_snapshot(own_dir.path(), "10-1", 10, 0x1000, &[0xd503_201f]);
-        write_snapshot(own_dir.path(), "10-2", 10, 0x1000, &[0xd65f_03c0]);
-        let own = load_snapshots(own_dir.path()).expect("load own snapshots");
-        assert!(
-            resolve_sample(
-                PcSample {
-                    pid: 10,
-                    pc: 0x1000,
-                    count: 1,
-                },
-                &own,
-                &BTreeMap::new(),
-            )
-            .is_err()
-        );
-
-        let ancestor_dir = tempfile::tempdir().expect("ancestor tempdir");
-        write_snapshot(ancestor_dir.path(), "9-1", 9, 0x1000, &[0xd503_201f]);
-        write_snapshot(ancestor_dir.path(), "10-1", 10, 0x1000, &[0xd65f_03c0]);
-        write_snapshot(ancestor_dir.path(), "11-1", 11, 0x3000, &[0xd503_201f]);
-        let ancestors = load_snapshots(ancestor_dir.path()).expect("load ancestor snapshots");
-        let parents = BTreeMap::from([(10, 9), (11, 10)]);
-        assert!(
-            resolve_sample(
-                PcSample {
-                    pid: 11,
-                    pc: 0x1000,
-                    count: 1,
-                },
-                &ancestors,
-                &parents,
-            )
-            .is_err()
-        );
-    }
-
     #[test]
     fn decodes_only_exact_64_bit_context_rows() {
         let cases = [
@@ -957,8 +594,8 @@ SHAPE1|complete|bounded=0|target_completed=1|target_exit_reason=1
     #[test]
     fn full_report_binds_inputs_and_counts_inherited_samples() {
         let dir = tempfile::tempdir().expect("snapshot tempdir");
-        write_snapshot(dir.path(), "10-1", 10, 0x1000, &[0xf942_3791]);
-        write_snapshot(dir.path(), "11-1", 11, 0x3000, &[0xd503_201f]);
+        write_v4_test_snapshot(dir.path(), "10-1", 10, 0x1000, &[0xf942_3791]);
+        write_v4_test_snapshot(dir.path(), "11-1", 11, 0x3000, &[0xd503_201f]);
         let trace = GOOD_TRACE.replace("0x2000", "0x1000");
 
         let report = build_report(trace.as_bytes(), dir.path(), 0.5).expect("build report");
