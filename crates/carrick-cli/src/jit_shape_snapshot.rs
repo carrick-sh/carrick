@@ -642,7 +642,7 @@ mod tests {
                 }),
             ),
             (
-                "overflow",
+                "cache range overflow",
                 Box::new(|fixture| {
                     fixture.mutate_metadata("41-1", |metadata| {
                         metadata["cache_base"] = (u64::MAX - 3).into()
@@ -666,6 +666,16 @@ mod tests {
                 "accepted {name}"
             );
         }
+    }
+
+    #[test]
+    fn snapshot_loader_rejects_overflowing_block_endpoint_before_range_check() {
+        let fixture = SnapshotFixture::one_pair(41, 0x1000, &[0x20, 0x00, 0x1f, 0xd6]);
+        fixture.mutate_metadata("41-1", |metadata| {
+            metadata["blocks"] = serde_json::json!([[0x4000, u64::MAX - 3]])
+        });
+        let error = SnapshotSet::load(fixture.path()).unwrap_err();
+        assert!(error.to_string().contains("block endpoint overflows"));
     }
 
     #[test]
