@@ -3091,6 +3091,10 @@ impl ProcessState {
         memory: &NativeMappedMemory,
         guest: carrick_guest_mem::GuestVa,
     ) -> Result<TranslationResult, types::DsrError> {
+        #[cfg(feature = "alloc-owner-census")]
+        let _owner = crate::alloc_owner_census::scope(
+            crate::alloc_owner_wire::AllocationOwner::TranslationOrchestration,
+        );
         let observation = memory.dsr_generation_observation(guest)?;
         let source_page = observation.page();
         let generation = observation.expected();
@@ -4829,6 +4833,26 @@ mod tests {
     use carrick_guest_mem::{GuestVa, HostVa};
     use std::ptr::NonNull;
     use std::sync::{Arc, Barrier};
+
+    #[cfg(feature = "alloc-owner-census")]
+    #[test]
+    fn allocation_owner_translation_orchestration_wraps_process_translation() {
+        let source = include_str!("translator.rs");
+        let body = source
+            .split_once("    pub fn translate(\n")
+            .expect("process translation function")
+            .1
+            .split_once("    /// Record one published block")
+            .expect("process translation function end")
+            .0;
+        let owner = body
+            .find("AllocationOwner::TranslationOrchestration")
+            .expect("translation orchestration owner");
+        let observation = body
+            .find("let observation = memory.dsr_generation_observation(guest)?")
+            .expect("translation generation observation");
+        assert!(owner < observation);
+    }
 
     #[cfg(feature = "alloc-owner-census")]
     use crate::alloc_owner_census::test_support as allocation_census;
