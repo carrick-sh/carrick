@@ -3821,6 +3821,17 @@ mod tests {
             );
         }
         assert!(!script.contains("NFAULT2|prebirth|"));
+        for line in script.lines().filter(|line| {
+            line.contains("arg2")
+                && (line.contains("0x0001000000000000")
+                    || line.contains("0x3fff")
+                    || line.contains(", arg2]"))
+        }) {
+            assert!(
+                line.contains("(uint64_t)arg2"),
+                "NFAULT2 uses signed vminfo address: {line}"
+            );
+        }
     }
 
     #[test]

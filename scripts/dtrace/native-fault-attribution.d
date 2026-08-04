@@ -12,8 +12,10 @@
  * PROVIDER ABI (LIVE-QUALIFIED ON THE CAPTURE HOST)
  * ------------------------------------------------
  * `vminfo:::as_fault` and `vminfo:::zfod` arg2 are the exact 16 KiB host-page
- * base. The profile rejects zero, noncanonical, and non-16-KiB-aligned arg2
- * values. `vminfo:::cow_fault` arg2 is not address-qualified and is count-only.
+ * base. Darwin exposes the argument as a signed scalar, so every address use
+ * casts it to uint64_t before rejecting zero, noncanonical/high-half, and
+ * non-16-KiB-aligned values. `vminfo:::cow_fault` arg2 is not
+ * address-qualified and is count-only.
  * Process identity comes from Carrick's checked PROC_PIDTBSDINFO birth tuple;
  * fork inheritance comes from proc:::create plus the child's own birth probe.
  * The process/thread terminal map and header below are substituted only after
@@ -396,45 +398,57 @@ vminfo:::cow_fault
 
 vminfo:::as_fault
 /pending_fork_id[pid] != (uint64_t)0 && birth_seen[pid] == 0 &&
-    (arg2 == 0 || arg2 >= 0x0001000000000000 || (arg2 & 0x3fff) != 0)/
+    ((uint64_t)arg2 == (uint64_t)0 ||
+    (uint64_t)arg2 >= (uint64_t)0x0001000000000000 ||
+    ((uint64_t)arg2 & (uint64_t)0x3fff) != (uint64_t)0)/
 {
 	@prebirth_rejected_as[pending_fork_id[pid]] = count();
 }
 
 vminfo:::zfod
 /pending_fork_id[pid] != (uint64_t)0 && birth_seen[pid] == 0 &&
-    (arg2 == 0 || arg2 >= 0x0001000000000000 || (arg2 & 0x3fff) != 0)/
+    ((uint64_t)arg2 == (uint64_t)0 ||
+    (uint64_t)arg2 >= (uint64_t)0x0001000000000000 ||
+    ((uint64_t)arg2 & (uint64_t)0x3fff) != (uint64_t)0)/
 {
 	@prebirth_rejected_zfod[pending_fork_id[pid]] = count();
 }
 
 vminfo:::as_fault
 /pending_fork_id[pid] != (uint64_t)0 && birth_seen[pid] == 0 &&
-    arg2 != 0 && arg2 < 0x0001000000000000 && (arg2 & 0x3fff) == 0 &&
-    (((arg2 >> 14) ^ (pid * 0x9e3779b9)) & 0x3f) == 0/
+    (uint64_t)arg2 != (uint64_t)0 &&
+    (uint64_t)arg2 < (uint64_t)0x0001000000000000 &&
+    ((uint64_t)arg2 & (uint64_t)0x3fff) == (uint64_t)0 &&
+    ((((uint64_t)arg2 >> 14) ^ (pid * 0x9e3779b9)) & 0x3f) == 0/
 {
-	@prebirth_page_as[pending_fork_id[pid], arg2] = count();
+	@prebirth_page_as[pending_fork_id[pid], (uint64_t)arg2] = count();
 }
 
 vminfo:::zfod
 /pending_fork_id[pid] != (uint64_t)0 && birth_seen[pid] == 0 &&
-    arg2 != 0 && arg2 < 0x0001000000000000 && (arg2 & 0x3fff) == 0 &&
-    (((arg2 >> 14) ^ (pid * 0x9e3779b9)) & 0x3f) == 0/
+    (uint64_t)arg2 != (uint64_t)0 &&
+    (uint64_t)arg2 < (uint64_t)0x0001000000000000 &&
+    ((uint64_t)arg2 & (uint64_t)0x3fff) == (uint64_t)0 &&
+    ((((uint64_t)arg2 >> 14) ^ (pid * 0x9e3779b9)) & 0x3f) == 0/
 {
-	@prebirth_page_zfod[pending_fork_id[pid], arg2] = count();
+	@prebirth_page_zfod[pending_fork_id[pid], (uint64_t)arg2] = count();
 }
 
 /* Exact provider-shape rejection counts remain separate from page sampling. */
 vminfo:::as_fault
 /(pid == $target || progenyof($target)) && birth_seen[pid] != 0 &&
-    (arg2 == 0 || arg2 >= 0x0001000000000000 || (arg2 & 0x3fff) != 0)/
+    ((uint64_t)arg2 == (uint64_t)0 ||
+    (uint64_t)arg2 >= (uint64_t)0x0001000000000000 ||
+    ((uint64_t)arg2 & (uint64_t)0x3fff) != (uint64_t)0)/
 {
 	@rejected_as[pid, birth_sec[pid], birth_usec[pid]] = count();
 }
 
 vminfo:::zfod
 /(pid == $target || progenyof($target)) && birth_seen[pid] != 0 &&
-    (arg2 == 0 || arg2 >= 0x0001000000000000 || (arg2 & 0x3fff) != 0)/
+    ((uint64_t)arg2 == (uint64_t)0 ||
+    (uint64_t)arg2 >= (uint64_t)0x0001000000000000 ||
+    ((uint64_t)arg2 & (uint64_t)0x3fff) != (uint64_t)0)/
 {
 	@rejected_zfod[pid, birth_sec[pid], birth_usec[pid]] = count();
 }
@@ -442,20 +456,24 @@ vminfo:::zfod
 /* Deterministic 1/64 samples of exact qualified 16 KiB host pages. */
 vminfo:::as_fault
 /(pid == $target || progenyof($target)) && birth_seen[pid] != 0 &&
-    arg2 != 0 && arg2 < 0x0001000000000000 && (arg2 & 0x3fff) == 0 &&
-    (((arg2 >> 14) ^ (pid * 0x9e3779b9)) & 0x3f) == 0/
+    (uint64_t)arg2 != (uint64_t)0 &&
+    (uint64_t)arg2 < (uint64_t)0x0001000000000000 &&
+    ((uint64_t)arg2 & (uint64_t)0x3fff) == (uint64_t)0 &&
+    ((((uint64_t)arg2 >> 14) ^ (pid * 0x9e3779b9)) & 0x3f) == 0/
 {
 	@page_as[pid, birth_sec[pid], birth_usec[pid],
-	    image_generation[pid], arg2] = count();
+	    image_generation[pid], (uint64_t)arg2] = count();
 }
 
 vminfo:::zfod
 /(pid == $target || progenyof($target)) && birth_seen[pid] != 0 &&
-    arg2 != 0 && arg2 < 0x0001000000000000 && (arg2 & 0x3fff) == 0 &&
-    (((arg2 >> 14) ^ (pid * 0x9e3779b9)) & 0x3f) == 0/
+    (uint64_t)arg2 != (uint64_t)0 &&
+    (uint64_t)arg2 < (uint64_t)0x0001000000000000 &&
+    ((uint64_t)arg2 & (uint64_t)0x3fff) == (uint64_t)0 &&
+    ((((uint64_t)arg2 >> 14) ^ (pid * 0x9e3779b9)) & 0x3f) == 0/
 {
 	@page_zfod[pid, birth_sec[pid], birth_usec[pid],
-	    image_generation[pid], arg2] = count();
+	    image_generation[pid], (uint64_t)arg2] = count();
 }
 
 /* Retire only the exact tracked incarnation; the launcher exit ends capture. */
