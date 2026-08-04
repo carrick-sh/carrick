@@ -221,6 +221,16 @@ pub fn stamp_run_complete() {
     );
 }
 
+/// A detached native guest thread can become the process-exit owner. Its
+/// thread closure terminates with raw `_exit(2)`, bypassing both the initial
+/// thread's runtime-return seam and the CLI tail, so export both terminal
+/// records immediately before the irreversible host exit.
+pub(crate) fn spawned_guest_process_exit(code: i32) -> ! {
+    stamp(ExecStampPhase::RuntimeReturn);
+    stamp(ExecStampPhase::PreHostExit);
+    unsafe { libc::_exit(code) }
+}
+
 fn stamp_record(phase: ExecStampPhase, related: RelatedProcess) {
     let Some(path) = std::env::var_os("CARRICK_EXEC_STAMPS") else {
         return;
@@ -410,5 +420,30 @@ mod tests {
         let line = contents.trim_end();
         assert!(line.contains("|phase=run-complete|valid=15|"), "{line}");
         assert!(line.contains("|related_pid=0|link_id=0|related_status=0|"));
+    }
+
+    #[test]
+    fn spawned_guest_process_exit_exports_both_terminal_stamps_before_raw_exit() {
+        let dir = tempfile::tempdir().expect("stamp tempdir");
+        let path = dir.path().join("stamps.txt");
+        // SAFETY: this suite is serialized by the repository's test recipe.
+        unsafe { std::env::set_var("CARRICK_EXEC_STAMPS", &path) };
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
+        if child == 0 {
+            spawned_guest_process_exit(23);
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("CARRICK_EXEC_STAMPS") };
+        assert!(libc::WIFEXITED(status), "status={status:#x}");
+        assert_eq!(libc::WEXITSTATUS(status), 23);
+        let contents = std::fs::read_to_string(&path).expect("stamp file");
+        let phases: Vec<_> = contents
+            .lines()
+            .map(|line| line.split('|').nth(2).expect("phase field"))
+            .collect();
+        assert_eq!(phases, ["phase=runtime-return", "phase=pre-host-exit"]);
     }
 }
