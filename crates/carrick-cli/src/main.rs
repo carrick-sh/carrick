@@ -132,8 +132,9 @@ mod commands;
 // `runtime::DebugStateSnapshot`; HVF-only.
 #[cfg(feature = "platform-macos")]
 mod debug;
-// `debug_census` only parses text files the native lane wrote, so — like
-// `debug_layout` and unlike `debug` — it is declared on every platform.
+// The census modules only parse text files the native lane wrote, so — like
+// `debug_layout` and unlike `debug` — they are declared on every platform.
+mod debug_alloc_owner;
 mod debug_census;
 mod debug_exec_stamps;
 mod debug_jit_shape;
@@ -142,6 +143,7 @@ mod fs_setup;
 mod lifecycle;
 #[cfg(target_os = "macos")]
 mod native_fault_profile;
+mod native_perf_epochs;
 mod native_profile_qualification;
 // `perf_stats` + the bulk of `trace_profile` back the BSD libdtrace-based
 // `carrick trace --profile` pipeline. Other hosts retain only the shared

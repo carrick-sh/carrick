@@ -50,6 +50,25 @@ pub(crate) fn run_debug(command: DebugCommand) -> anyhow::Result<()> {
         } => {
             crate::debug_census::run_xlat_census(&dir, top, processes_observed)?;
         }
+        DebugCommand::AllocOwnerCensus {
+            dir,
+            native_perf,
+            expected_process_epochs,
+            expected_pids,
+            normal_host_allocation_opportunity_share,
+            qualification_share_of_total,
+        } => {
+            crate::debug_alloc_owner::run_alloc_owner_census(
+                &crate::debug_alloc_owner::AllocOwnerCensusRequest {
+                    dir,
+                    native_perf,
+                    expected_process_epochs,
+                    expected_pids,
+                    normal_host_allocation_opportunity_share,
+                    qualification_share_of_total,
+                },
+            )?;
+        }
         DebugCommand::ExecStampCensus { input, workload_ns } => {
             crate::debug_exec_stamps::run_exec_stamp_census(&input, workload_ns)?;
         }
