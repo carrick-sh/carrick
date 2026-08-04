@@ -651,6 +651,11 @@ fn exec_capsule_with<F>(
 where
     F: FnOnce(HostExecRequest<'_>) -> std::io::Error,
 {
+    #[cfg(feature = "alloc-owner-census")]
+    let next_allocation_exec_epoch = payload
+        .guest_exec
+        .as_ref()
+        .map(|guest| guest.profile_exec_epoch);
     let payload_prepared_record = payload
         .guest_exec
         .as_ref()
@@ -679,6 +684,18 @@ where
         .chain(std::iter::once(std::ptr::null()))
         .collect::<Vec<_>>();
     let env = std::env::vars_os()
+        .filter(|(key, _)| {
+            #[cfg(feature = "alloc-owner-census")]
+            {
+                key.as_os_str().as_bytes()
+                    != carrick_dsr_aarch64::alloc_owner_census::EXEC_EPOCH_ENV.as_bytes()
+            }
+            #[cfg(not(feature = "alloc-owner-census"))]
+            {
+                let _ = key;
+                true
+            }
+        })
         .map(|(key, value)| {
             let mut entry = key.as_os_str().as_bytes().to_vec();
             entry.push(b'=');
@@ -686,11 +703,37 @@ where
             CString::new(entry)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let env_ptrs = env
+    let base_env_ptrs = env
         .iter()
         .map(|value| value.as_ptr())
         .chain(std::iter::once(std::ptr::null()))
         .collect::<Vec<_>>();
+    #[cfg(not(feature = "alloc-owner-census"))]
+    let env_ptrs = base_env_ptrs;
+    #[cfg(feature = "alloc-owner-census")]
+    let (env_ptrs, _allocation_exec_epoch_entry) = {
+        let mut env_ptrs = base_env_ptrs;
+        let entry = if let Some(next_exec_epoch) = next_allocation_exec_epoch {
+            let _observer = carrick_dsr_aarch64::alloc_owner_census::observer_pause();
+            let entry = CString::new(format!(
+                "{}={next_exec_epoch}",
+                carrick_dsr_aarch64::alloc_owner_census::EXEC_EPOCH_ENV
+            ))?;
+            let Some(null) = env_ptrs.pop() else {
+                anyhow::bail!("host environment pointer vector has no terminator");
+            };
+            if !null.is_null() {
+                anyhow::bail!("host environment pointer vector has an invalid terminator");
+            }
+            env_ptrs.reserve(1);
+            env_ptrs.push(entry.as_ptr());
+            env_ptrs.push(std::ptr::null());
+            Some(entry)
+        } else {
+            None
+        };
+        (env_ptrs, entry)
+    };
 
     let mut prepared_host_fds = HostFdFlagTransaction::default();
     if let Some(guest) = &payload.guest_exec {
@@ -764,6 +807,10 @@ where
         crate::probes::DsrCacheLifecyclePhase::HostSelfReexecBegin,
     );
     crate::exec_stamps::stamp(crate::exec_stamps::ExecStampPhase::PreExec);
+    #[cfg(feature = "alloc-owner-census")]
+    let _allocation_attempt = next_allocation_exec_epoch
+        .map(carrick_dsr_aarch64::alloc_owner_census::begin_host_exec_attempt)
+        .transpose()?;
     let exec_error = invoke_exec(HostExecRequest {
         executable: &executable_c,
         argv: &argv_ptrs,
@@ -1248,6 +1295,9 @@ mod tests {
         take_native_exec_capsule_lifecycle_capture, write_capsule,
     };
 
+    #[cfg(feature = "alloc-owner-census")]
+    use carrick_dsr_aarch64::alloc_owner_census::test_support as allocation_census;
+
     const HOST_PAGE_SIZE: u64 = 16 * 1024;
 
     /// The prepared-artifact fixtures encode the 16 KiB host page geometry,
@@ -1708,6 +1758,72 @@ mod tests {
         });
 
         assert!(result.is_err());
+    }
+
+    #[cfg(feature = "alloc-owner-census")]
+    #[test]
+    fn native_exec_capsule_drains_at_invoke_and_replaces_the_owner_epoch_environment() {
+        use carrick_dsr_aarch64::alloc_owner_wire::AllocationOwner;
+        use std::ffi::CStr;
+
+        const EXEC_EPOCH_ENV: &str = "CARRICK_ALLOC_OWNER_EXEC_EPOCH";
+
+        let _census = allocation_census::lock();
+        let output_dir = std::env::temp_dir().join(format!(
+            "carrick-alloc-owner-census-tests-{}",
+            std::process::id()
+        ));
+        match std::fs::remove_dir_all(&output_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove allocation census test directory: {error}"),
+        }
+        std::fs::create_dir_all(&output_dir).expect("create allocation census test directory");
+        allocation_census::configure_output_dir(&output_dir);
+        allocation_census::reset_and_arm(6, 0);
+        allocation_census::record(AllocationOwner::PublicationMap, 41);
+
+        let prior_epoch = std::env::var_os(EXEC_EPOCH_ENV);
+        unsafe { std::env::set_var(EXEC_EPOCH_ENV, "stale") };
+
+        let mut payload = sample();
+        let xsig = tempfile::tempfile().expect("xsignal file");
+        let survivor = tempfile::tempfile().expect("survivor file");
+        let close_on_exec = tempfile::tempfile().expect("close-on-exec file");
+        install_transport_fds(&mut payload, &xsig, &survivor, &close_on_exec);
+        let mut invoke_state = None;
+        let mut matching_epoch_entries = Vec::new();
+
+        let result = exec_capsule_with(payload, [0x67; 16], None, |request| {
+            invoke_state = Some(allocation_census::state());
+            matching_epoch_entries = request
+                .env
+                .iter()
+                .copied()
+                .take_while(|entry| !entry.is_null())
+                .map(|entry| unsafe { CStr::from_ptr(entry) }.to_bytes().to_vec())
+                .filter(|entry| entry.starts_with(format!("{EXEC_EPOCH_ENV}=").as_bytes()))
+                .collect();
+            std::io::Error::from_raw_os_error(libc::ENOENT)
+        });
+
+        unsafe {
+            match prior_epoch {
+                Some(value) => std::env::set_var(EXEC_EPOCH_ENV, value),
+                None => std::env::remove_var(EXEC_EPOCH_ENV),
+            }
+        }
+
+        assert!(result.is_err());
+        assert_eq!(invoke_state, Some(allocation_census::State::Transition));
+        assert_eq!(
+            matching_epoch_entries,
+            [b"CARRICK_ALLOC_OWNER_EXEC_EPOCH=7"]
+        );
+        assert_eq!(allocation_census::state(), allocation_census::State::Armed);
+        assert_eq!(allocation_census::identity(), (6, 1));
+        assert!(!allocation_census::lifecycle_error());
+        allocation_census::reset_disabled();
     }
 
     #[test]
