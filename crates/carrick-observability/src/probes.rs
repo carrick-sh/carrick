@@ -2940,6 +2940,7 @@ mod real {
                 }
             }
         }
+        ranges.sort_by_key(|range| range.start);
         HostImageCatalog {
             pid: std::process::id(),
             ranges,
@@ -3805,6 +3806,13 @@ mod real {
 
             assert_eq!(catalog.pid, std::process::id());
             assert!(catalog.ranges.iter().all(|range| range.start < range.end));
+            assert!(
+                catalog
+                    .ranges
+                    .windows(2)
+                    .all(|pair| pair[0].end <= pair[1].start),
+                "host image catalog is not sorted and non-overlapping"
+            );
             assert!(
                 catalog
                     .ranges
