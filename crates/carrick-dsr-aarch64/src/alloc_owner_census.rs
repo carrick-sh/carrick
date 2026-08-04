@@ -84,6 +84,11 @@ static COUNTERS: [OwnerCounters; AllocationOwner::COUNT] =
 static OVERFLOW: AtomicBool = AtomicBool::new(false);
 static LIFECYCLE_ERROR: AtomicBool = AtomicBool::new(false);
 static CONFIGURED: AtomicBool = AtomicBool::new(false);
+// Main-entry configuration is inherited into native fork children, but the
+// launch supervisor itself has no NATIVEPERF process epoch and must never
+// enter the portfolio. Initial/guest fork repair or exec-epoch transport turns
+// this on for precisely the DSR process images the authority can join.
+static PROCESS_PARTICIPATES: AtomicBool = AtomicBool::new(false);
 static EXEC_EPOCH: AtomicU64 = AtomicU64::new(0);
 static FRAGMENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static STATE: AtomicU8 = AtomicU8::new(CensusState::Disabled as u8);
@@ -166,7 +171,9 @@ fn record_non_null(ptr: *mut u8, operation: AllocationOperation, requested_bytes
 }
 
 fn record_success(operation: AllocationOperation, requested_bytes: usize) {
-    if STATE.load(Ordering::Relaxed) != CensusState::Armed as u8 {
+    if STATE.load(Ordering::Relaxed) != CensusState::Armed as u8
+        || !PROCESS_PARTICIPATES.load(Ordering::Relaxed)
+    {
         return;
     }
     let Ok(requested_bytes) = u64::try_from(requested_bytes) else {
@@ -248,6 +255,7 @@ fn init_main_from_environment_with(
     }
     let Some(directory) = std::env::var_os("CARRICK_ALLOC_OWNER_CENSUS_DIR") else {
         CONFIGURED.store(false, Ordering::Relaxed);
+        PROCESS_PARTICIPATES.store(false, Ordering::Relaxed);
         return Ok(false);
     };
     let directory =
@@ -272,25 +280,29 @@ fn init_main_from_environment_with(
             .set(directory)
             .map_err(|_| CensusError::Configuration("output directory initialized concurrently"))?;
     }
-    let exec_epoch = match std::env::var_os(EXEC_EPOCH_ENV) {
-        None => 0,
-        Some(raw) => raw
-            .to_str()
-            .ok_or(CensusError::Configuration(
-                "CARRICK_ALLOC_OWNER_EXEC_EPOCH is not UTF-8",
-            ))?
-            .parse::<u64>()
-            .map_err(|_| {
-                CensusError::Configuration("CARRICK_ALLOC_OWNER_EXEC_EPOCH is not a u64")
-            })?,
+    let (exec_epoch, process_participates) = match std::env::var_os(EXEC_EPOCH_ENV) {
+        None => (0, false),
+        Some(raw) => (
+            raw.to_str()
+                .ok_or(CensusError::Configuration(
+                    "CARRICK_ALLOC_OWNER_EXEC_EPOCH is not UTF-8",
+                ))?
+                .parse::<u64>()
+                .map_err(|_| {
+                    CensusError::Configuration("CARRICK_ALLOC_OWNER_EXEC_EPOCH is not a u64")
+                })?,
+            true,
+        ),
     };
     reset_counters_and_tls();
     LIFECYCLE_ERROR.store(false, Ordering::Relaxed);
     EXEC_EPOCH.store(exec_epoch, Ordering::Relaxed);
     FRAGMENT_SEQUENCE.store(0, Ordering::Relaxed);
     CONFIGURED.store(true, Ordering::Relaxed);
+    PROCESS_PARTICIPATES.store(process_participates, Ordering::Relaxed);
     if let Err(error) = register_atexit_with(register_atexit) {
         CONFIGURED.store(false, Ordering::Relaxed);
+        PROCESS_PARTICIPATES.store(false, Ordering::Relaxed);
         return Err(error);
     }
     STATE.store(CensusState::Armed as u8, Ordering::Release);
@@ -422,7 +434,9 @@ impl Drop for HostExecAttempt {
 
 /// Drain immediately before host `execve`; dropping the guard means it returned.
 pub fn begin_host_exec_attempt(next_exec_epoch: u64) -> Result<HostExecAttempt, CensusError> {
-    if STATE.load(Ordering::Acquire) == CensusState::Disabled as u8 {
+    if STATE.load(Ordering::Acquire) == CensusState::Disabled as u8
+        || !PROCESS_PARTICIPATES.load(Ordering::Acquire)
+    {
         return Ok(HostExecAttempt {
             active: false,
             epoch: 0,
@@ -481,7 +495,9 @@ impl Drop for InProcessExecTransition {
 
 /// Drain the outgoing allocation epoch at the in-process exec commit.
 pub fn begin_in_process_exec(next_exec_epoch: u64) -> Result<InProcessExecTransition, CensusError> {
-    if STATE.load(Ordering::Acquire) == CensusState::Disabled as u8 {
+    if STATE.load(Ordering::Acquire) == CensusState::Disabled as u8
+        || !PROCESS_PARTICIPATES.load(Ordering::Acquire)
+    {
         return Ok(InProcessExecTransition {
             active: false,
             next_exec_epoch,
@@ -501,6 +517,17 @@ pub fn begin_in_process_exec(next_exec_epoch: u64) -> Result<InProcessExecTransi
 pub fn drain_terminal(reason: AllocationFlushReason) -> Result<bool, CensusError> {
     match CensusState::from_raw(STATE.load(Ordering::Acquire)) {
         Some(CensusState::Disabled | CensusState::Terminal) => Ok(false),
+        Some(CensusState::Armed) if !PROCESS_PARTICIPATES.load(Ordering::Acquire) => {
+            STATE
+                .compare_exchange(
+                    CensusState::Armed as u8,
+                    CensusState::Terminal as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map_err(|_| lifecycle_error("non-participant terminal drain lost armed state"))?;
+            Ok(false)
+        }
         Some(CensusState::Armed) => {
             STATE
                 .compare_exchange(
@@ -526,14 +553,17 @@ pub fn drain_terminal(reason: AllocationFlushReason) -> Result<bool, CensusError
 /// First child-only action after `fork`: discard every inherited observation.
 pub fn reset_after_fork_child_first_action() {
     if !CONFIGURED.load(Ordering::Relaxed) {
+        PROCESS_PARTICIPATES.store(false, Ordering::Relaxed);
         STATE.store(CensusState::Disabled as u8, Ordering::Relaxed);
         return;
     }
     STATE.store(CensusState::Disabled as u8, Ordering::Relaxed);
+    PROCESS_PARTICIPATES.store(false, Ordering::Relaxed);
     reset_counters_and_tls();
     LIFECYCLE_ERROR.store(false, Ordering::Relaxed);
     EXEC_EPOCH.store(0, Ordering::Relaxed);
     FRAGMENT_SEQUENCE.store(0, Ordering::Relaxed);
+    PROCESS_PARTICIPATES.store(true, Ordering::Relaxed);
     STATE.store(CensusState::Armed as u8, Ordering::Release);
 }
 
@@ -687,6 +717,7 @@ fn test_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 fn reset_for_test() {
     STATE.store(CensusState::Disabled as u8, Ordering::Relaxed);
+    PROCESS_PARTICIPATES.store(false, Ordering::Relaxed);
     reset_counters_and_tls();
     LIFECYCLE_ERROR.store(false, Ordering::Relaxed);
     EXEC_EPOCH.store(0, Ordering::Relaxed);
@@ -698,6 +729,7 @@ fn reset_for_test() {
 #[cfg(test)]
 fn set_armed_for_test(epoch: u64) {
     CONFIGURED.store(true, Ordering::Relaxed);
+    PROCESS_PARTICIPATES.store(true, Ordering::Relaxed);
     EXEC_EPOCH.store(epoch, Ordering::Relaxed);
     FRAGMENT_SEQUENCE.store(0, Ordering::Relaxed);
     STATE.store(CensusState::Armed as u8, Ordering::Relaxed);
@@ -845,6 +877,7 @@ pub mod test_support {
         reset_counters_and_tls();
         LIFECYCLE_ERROR.store(false, Ordering::Relaxed);
         CONFIGURED.store(true, Ordering::Relaxed);
+        PROCESS_PARTICIPATES.store(true, Ordering::Relaxed);
         EXEC_EPOCH.store(epoch, Ordering::Relaxed);
         FRAGMENT_SEQUENCE.store(fragment, Ordering::Relaxed);
         STATE.store(CensusState::Armed as u8, Ordering::Release);
@@ -852,6 +885,7 @@ pub mod test_support {
 
     pub fn reset_disabled() {
         STATE.store(CensusState::Disabled as u8, Ordering::Relaxed);
+        PROCESS_PARTICIPATES.store(false, Ordering::Relaxed);
         reset_counters_and_tls();
         LIFECYCLE_ERROR.store(false, Ordering::Relaxed);
         EXEC_EPOCH.store(0, Ordering::Relaxed);
@@ -919,7 +953,8 @@ mod tests {
         AllocationFlushReason, AllocationOwner, AllocationOwnerCensusFile,
     };
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Barrier};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
 
     fn prepare_output_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1065,25 +1100,61 @@ mod tests {
     fn thread_local_owners_feed_distinct_process_global_rows() {
         let _test = test_lock();
         reset_for_test();
-        set_armed_for_test(0);
-        let barrier = Arc::new(Barrier::new(3));
-        let first_barrier = Arc::clone(&barrier);
+        let ready = Arc::new(AtomicUsize::new(0));
+        let go = Arc::new(AtomicBool::new(false));
+        let recorded = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let first_ready = Arc::clone(&ready);
+        let first_go = Arc::clone(&go);
+        let first_recorded = Arc::clone(&recorded);
+        let first_release = Arc::clone(&release);
         let first = std::thread::spawn(move || {
-            let _owner = scope(AllocationOwner::DecodeReadBuffers);
-            first_barrier.wait();
-            record_success_for_test(AllocationOperation::Alloc, 100);
+            first_ready.fetch_add(1, Ordering::Release);
+            while !first_go.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+            {
+                let _owner = scope(AllocationOwner::DecodeReadBuffers);
+                record_success_for_test(AllocationOperation::Alloc, 100);
+            }
+            first_recorded.fetch_add(1, Ordering::Release);
+            while !first_release.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
         });
-        let second_barrier = Arc::clone(&barrier);
+        let second_ready = Arc::clone(&ready);
+        let second_go = Arc::clone(&go);
+        let second_recorded = Arc::clone(&recorded);
+        let second_release = Arc::clone(&release);
         let second = std::thread::spawn(move || {
-            let _owner = scope(AllocationOwner::PublicationIndexes);
-            second_barrier.wait();
-            record_success_for_test(AllocationOperation::AllocZeroed, 200);
+            second_ready.fetch_add(1, Ordering::Release);
+            while !second_go.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+            {
+                let _owner = scope(AllocationOwner::PublicationIndexes);
+                record_success_for_test(AllocationOperation::AllocZeroed, 200);
+            }
+            second_recorded.fetch_add(1, Ordering::Release);
+            while !second_release.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
         });
-        barrier.wait();
+
+        while ready.load(Ordering::Acquire) != 2 {
+            std::hint::spin_loop();
+        }
+        set_armed_for_test(0);
+        go.store(true, Ordering::Release);
+        while recorded.load(Ordering::Acquire) != 2 {
+            std::hint::spin_loop();
+        }
+        STATE.store(CensusState::Disabled as u8, Ordering::Release);
+        let snapshot = snapshot_for_test();
+        release.store(true, Ordering::Release);
         first.join().expect("first owner thread");
         second.join().expect("second owner thread");
 
-        let snapshot = snapshot_for_test();
         assert_eq!(
             snapshot[AllocationOwner::DecodeReadBuffers as usize].requested_bytes,
             100
@@ -1245,6 +1316,7 @@ mod tests {
         reset_after_fork_child_first_action();
         assert_eq!(state_for_test(), CensusState::Armed);
         assert_eq!(identity_for_test(), (0, 0));
+        assert!(PROCESS_PARTICIPATES.load(Ordering::Relaxed));
         assert_eq!(current_owner_for_test(), AllocationOwner::Other);
         assert!(!overflowed_for_test());
         assert_eq!(
@@ -1331,6 +1403,7 @@ mod tests {
         assert!(init_main_from_environment().unwrap());
         assert_eq!(state_for_test(), CensusState::Armed);
         assert_eq!(identity_for_test(), (12, 0));
+        assert!(PROCESS_PARTICIPATES.load(Ordering::Relaxed));
 
         reset_for_test();
         unsafe {
@@ -1354,6 +1427,29 @@ mod tests {
         }
         assert!(!init_main_from_environment().unwrap());
         assert_eq!(state_for_test(), CensusState::Disabled);
+        assert!(!PROCESS_PARTICIPATES.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn configured_main_that_never_enters_native_dsr_exports_nothing() {
+        let _test = test_lock();
+        let dir = prepare_output_dir();
+        reset_for_test();
+        reset_atexit_registration_for_test();
+        unsafe {
+            std::env::set_var("CARRICK_ALLOC_OWNER_CENSUS_DIR", &dir);
+            std::env::remove_var("CARRICK_ALLOC_OWNER_EXEC_EPOCH");
+        }
+        assert!(init_main_from_environment_with_for_test(|| 0).unwrap());
+        assert!(!PROCESS_PARTICIPATES.load(Ordering::Relaxed));
+        record_success_for_test(AllocationOperation::Alloc, 4096);
+
+        invoke_atexit_for_test();
+
+        assert!(records(&dir).is_empty());
+        unsafe {
+            std::env::remove_var("CARRICK_ALLOC_OWNER_CENSUS_DIR");
+        }
     }
 
     #[test]

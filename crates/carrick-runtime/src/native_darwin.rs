@@ -2287,6 +2287,8 @@ fn run_image_in_child(
     }
 
     if pid == 0 {
+        #[cfg(feature = "alloc-owner-census")]
+        reset_native_fork_child_allocation_owner_first_action();
         close_fd(stdout_pipe.0);
         close_fd(stderr_pipe.0);
         child_dup2_or_exit(stdout_pipe.1, libc::STDOUT_FILENO);
@@ -7956,6 +7958,33 @@ fn last_io_error(context: &str) -> RuntimeError {
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+
+    #[cfg(feature = "alloc-owner-census")]
+    #[test]
+    fn initial_native_launch_fork_resets_allocation_census_before_child_work() {
+        let source = include_str!("native_darwin.rs");
+        let launch = source
+            .split_once("fn run_image_in_child(")
+            .expect("native launch function")
+            .1
+            .split_once("fn run_image_in_current_process(")
+            .expect("native launch function end")
+            .0;
+        let child = launch
+            .split_once("if pid == 0 {")
+            .expect("native launch child arm")
+            .1;
+        let reset = child
+            .find("reset_native_fork_child_allocation_owner_first_action();")
+            .expect("allocation census reset in initial launch child");
+        let first_child_work = child
+            .find("close_fd(stdout_pipe.0);")
+            .expect("first launch-child fd close");
+        assert!(
+            reset < first_child_work,
+            "allocation census reset must be the first launch-child action"
+        );
+    }
 
     #[test]
     fn code_snapshot_metadata_authenticates_exact_bytes() {
