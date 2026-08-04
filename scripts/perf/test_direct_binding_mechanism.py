@@ -318,6 +318,8 @@ class MechanismFixture:
                         "principal_drops": 0,
                         "aggregation_drops": 0,
                         "dynamic_drops": 0,
+                        "dynamic_rinse_drops": 0,
+                        "dynamic_dirty_drops": 0,
                         "other_drops": 0,
                         "interrupted": False,
                     },
@@ -411,6 +413,31 @@ class DirectBindingMechanismTest(unittest.TestCase):
                 publish=1,
             ),
         )
+
+    @staticmethod
+    def rewrite_completion_drops(
+        receipt: mechanism.CaptureReceipt,
+        transform,
+    ) -> mechanism.CaptureReceipt:
+        payload = json.loads(receipt.path.read_text())
+        drops = payload["summary"]["completion"]["drops"]
+        transform(drops)
+        summary_path = pathlib.Path(
+            payload["artifacts"]["summary_jsonl"]["path"]
+        )
+        rows = [
+            json.loads(line) for line in summary_path.read_text().splitlines()
+        ]
+        for row in rows:
+            row["completion"]["drops"] = copy.deepcopy(drops)
+        summary_path.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows)
+        )
+        payload["artifacts"]["summary_jsonl"] = mechanism.bind_artifact(
+            summary_path
+        )
+        mechanism.write_json_atomic(receipt.path, payload)
+        return mechanism.parse_receipt(receipt.path)
 
     def test_complete_vector_and_eligible_collapse_are_published(self):
         precursor, candidate = self.good_pair()
@@ -1166,6 +1193,87 @@ class DirectBindingMechanismTest(unittest.TestCase):
 
         with self.assertRaisesRegex(mechanism.EvidenceError, "drops"):
             mechanism.compare(precursor, mechanism.parse_receipt(candidate.path))
+
+    def test_accepts_exact_current_seven_field_drop_schema(self):
+        precursor, candidate = self.good_pair()
+
+        result = mechanism.compare(precursor, candidate)
+
+        self.assertTrue(result["accepted"])
+
+    def test_rejects_nonzero_dynamic_rinse_and_dirty_drop_counters(self):
+        precursor, _ = self.good_pair()
+        precursor = self.rewrite_completion_drops(
+            precursor,
+            lambda drops: None,
+        )
+        for field in ("dynamic_rinse_drops", "dynamic_dirty_drops"):
+            with self.subTest(field=field):
+                candidate = self.fixture.receipt(
+                    f"candidate-{field}",
+                    gateway=100,
+                    direct=4,
+                    indirect=20,
+                    eligible=4,
+                    publish=1,
+                )
+                candidate = self.rewrite_completion_drops(
+                    candidate,
+                    lambda drops, field=field: drops.__setitem__(field, 1),
+                )
+
+                with self.assertRaisesRegex(
+                    mechanism.EvidenceError,
+                    "DTrace drops",
+                ):
+                    mechanism.compare(
+                        precursor,
+                        candidate,
+                    )
+
+    def test_rejects_missing_or_extra_completion_drop_fields(self):
+        precursor, _ = self.good_pair()
+        precursor = self.rewrite_completion_drops(
+            precursor,
+            lambda drops: None,
+        )
+        for label, mutate in (
+            (
+                "missing",
+                lambda drops: drops.pop("dynamic_rinse_drops"),
+            ),
+            (
+                "extra",
+                lambda drops: drops.__setitem__("future_drops", 0),
+            ),
+        ):
+            with self.subTest(label=label):
+                candidate = self.fixture.receipt(
+                    f"candidate-{label}",
+                    gateway=100,
+                    direct=4,
+                    indirect=20,
+                    eligible=4,
+                    publish=1,
+                )
+                candidate = self.rewrite_completion_drops(candidate, mutate)
+
+                with self.assertRaisesRegex(mechanism.EvidenceError, "drops"):
+                    mechanism.compare(precursor, candidate)
+
+    def test_requires_boolean_false_interrupted_drop_status(self):
+        precursor, candidate = self.good_pair()
+        precursor = self.rewrite_completion_drops(
+            precursor,
+            lambda drops: None,
+        )
+        candidate = self.rewrite_completion_drops(
+            candidate,
+            lambda drops: drops.__setitem__("interrupted", 0),
+        )
+
+        with self.assertRaisesRegex(mechanism.EvidenceError, "interruption"):
+            mechanism.compare(precursor, candidate)
 
     def test_bounded_interrupted_or_nonzero_status_rejects_the_pair(self):
         precursor, _ = self.good_pair()

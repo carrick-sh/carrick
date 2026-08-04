@@ -44,6 +44,8 @@ DROP_FIELDS = (
     "principal_drops",
     "aggregation_drops",
     "dynamic_drops",
+    "dynamic_rinse_drops",
+    "dynamic_dirty_drops",
     "other_drops",
 )
 HEX_OFFSET = re.compile(r"\+0[xX][0-9a-fA-F]+$")
@@ -149,6 +151,10 @@ def _validate_completion(
     if incomplete_pairs != 0:
         raise EvidenceError(f"{description} has incomplete duration pairs")
     drops = _mapping(completion.get("drops"), f"{description} completion drops")
+    if set(drops) != {"interrupted", *DROP_FIELDS}:
+        raise EvidenceError(
+            f"{description} completion drops have unknown or missing fields"
+        )
     if drops.get("interrupted") is not False:
         raise EvidenceError(f"{description} capture was interrupted")
     for field in DROP_FIELDS:

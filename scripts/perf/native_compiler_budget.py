@@ -1983,14 +1983,19 @@ def parse_dtrace_summary(
         "principal_drops",
         "aggregation_drops",
         "dynamic_drops",
+        "dynamic_rinse_drops",
+        "dynamic_dirty_drops",
         "other_drops",
     }
     if not isinstance(drops, dict) or set(drops) != drop_fields:
         raise BudgetError("DTrace drop record is malformed")
     if completion["incomplete_pairs"] != 0:
         raise BudgetError("DTrace summary has incomplete pairs")
-    if any(bool(value) for value in drops.values()):
-        raise BudgetError("DTrace summary reports drops or interruption")
+    if drops["interrupted"] is not False:
+        raise BudgetError("DTrace summary interrupted must be boolean false")
+    for field in drop_fields - {"interrupted"}:
+        if _nonnegative_int(drops[field], f"DTrace drops.{field}") != 0:
+            raise BudgetError("DTrace summary reports drops or interruption")
     if completion["bounded"] or not completion["complete"] or completion[
         "target_exit_reason"
     ] != 1:

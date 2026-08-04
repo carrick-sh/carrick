@@ -35,6 +35,8 @@ def completion() -> dict[str, object]:
             "principal_drops": 0,
             "aggregation_drops": 0,
             "dynamic_drops": 0,
+            "dynamic_rinse_drops": 0,
+            "dynamic_dirty_drops": 0,
             "other_drops": 0,
         },
     }
@@ -663,6 +665,49 @@ class NativeKernelAttributionTests(unittest.TestCase):
                 bad = copy.deepcopy(good_a)
                 mutate(bad)
                 document = self.analyze_rows(bad, good_b)
+                self.assertEqual(document["result"], "rejected")
+                self.assertTrue(document["evidence_errors"])
+
+    def test_accepts_exact_current_seven_field_drop_schema(self) -> None:
+        document = self.analyze_rows(
+            profile_rows("run-a", [("alpha", 100)]),
+            profile_rows("run-b", [("alpha", 100)]),
+        )
+
+        self.assertFalse(document["evidence_errors"])
+
+    def test_rejects_nonzero_dynamic_rinse_and_dirty_drop_counters(self) -> None:
+        good_b = profile_rows("run-b", [("alpha", 100)])
+        for field in ("dynamic_rinse_drops", "dynamic_dirty_drops"):
+            with self.subTest(field=field):
+                bad = profile_rows("run-a", [("alpha", 100)])
+                for row in bad:
+                    row["completion"]["drops"][field] = 1
+
+                document = self.analyze_rows(bad, good_b)
+
+                self.assertEqual(document["result"], "rejected")
+                self.assertTrue(document["evidence_errors"])
+
+    def test_rejects_missing_or_extra_completion_drop_fields(self) -> None:
+        good_b = profile_rows("run-b", [("alpha", 100)])
+        for label, mutate in (
+            (
+                "missing",
+                lambda drops: drops.pop("dynamic_rinse_drops"),
+            ),
+            (
+                "extra",
+                lambda drops: drops.__setitem__("future_drops", 0),
+            ),
+        ):
+            with self.subTest(label=label):
+                bad = profile_rows("run-a", [("alpha", 100)])
+                for row in bad:
+                    mutate(row["completion"]["drops"])
+
+                document = self.analyze_rows(bad, good_b)
+
                 self.assertEqual(document["result"], "rejected")
                 self.assertTrue(document["evidence_errors"])
 

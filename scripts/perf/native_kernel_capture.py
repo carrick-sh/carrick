@@ -43,6 +43,8 @@ DROP_FIELDS = (
     "principal_drops",
     "aggregation_drops",
     "dynamic_drops",
+    "dynamic_rinse_drops",
+    "dynamic_dirty_drops",
     "other_drops",
 )
 

@@ -25,6 +25,14 @@ RECEIPT_SCHEMA = "carrick.direct-binding-capture-receipt.v1"
 PAIR_SCHEMA = "carrick.direct-binding-capture-pair.v1"
 SUMMARY_SCHEMA = "carrick.dsr-profile.v1"
 PROFILE = "dsr-indirect"
+DROP_FIELDS = (
+    "principal_drops",
+    "aggregation_drops",
+    "dynamic_drops",
+    "dynamic_rinse_drops",
+    "dynamic_dirty_drops",
+    "other_drops",
+)
 BINDING_EVENT_KINDS = frozenset(range(7, 13))
 CLEAR_REASONS = frozenset(range(1, 5))
 VALIDATION_REASONS = frozenset(range(1, 7))
@@ -347,15 +355,10 @@ def _summary_completion(receipt: CaptureReceipt) -> dict[str, object]:
             "summary completion missing field(s): " + ", ".join(sorted(missing))
         )
     drops = _mapping(completion["drops"], "summary completion drops")
-    for field in (
-        "principal_drops",
-        "aggregation_drops",
-        "dynamic_drops",
-        "other_drops",
-        "interrupted",
-    ):
-        if field not in drops:
-            raise EvidenceError(f"summary completion drops missing {field}")
+    if set(drops) != {"interrupted", *DROP_FIELDS}:
+        raise EvidenceError(
+            "summary completion drops have unknown or missing fields"
+        )
     return completion
 
 
@@ -489,16 +492,11 @@ def validate_receipt(
     ) != 0:
         raise EvidenceError("capture summary reports incomplete probe pairs")
     drops = _mapping(completion["drops"], "summary completion drops")
-    if bool(drops["interrupted"]):
+    if drops["interrupted"] is not False:
         raise EvidenceError("capture summary reports interruption")
     if any(
         _receipt_int(drops[field], f"summary completion drops.{field}") != 0
-        for field in (
-            "principal_drops",
-            "aggregation_drops",
-            "dynamic_drops",
-            "other_drops",
-        )
+        for field in DROP_FIELDS
     ):
         raise EvidenceError("capture summary reports DTrace drops")
     summary = _mapping(receipt.payload.get("summary"), "summary")
@@ -595,6 +593,8 @@ def synthetic_summary_rows(
             "principal_drops": 0,
             "aggregation_drops": 0,
             "dynamic_drops": 0,
+            "dynamic_rinse_drops": 0,
+            "dynamic_dirty_drops": 0,
             "other_drops": 0,
             "interrupted": False,
         },
@@ -1958,6 +1958,8 @@ def _summary_copy(path: pathlib.Path) -> dict[str, object]:
                     "principal_drops": 0,
                     "aggregation_drops": 0,
                     "dynamic_drops": 0,
+                    "dynamic_rinse_drops": 0,
+                    "dynamic_dirty_drops": 0,
                     "other_drops": 0,
                     "interrupted": False,
                 },

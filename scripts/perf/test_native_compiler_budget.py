@@ -185,6 +185,8 @@ def dtrace_rows(run_id="run-1", pid=42):
             "principal_drops": 0,
             "aggregation_drops": 0,
             "dynamic_drops": 0,
+            "dynamic_rinse_drops": 0,
+            "dynamic_dirty_drops": 0,
             "other_drops": 0,
         },
     }
@@ -1833,6 +1835,109 @@ class ReviewFixContractTests(unittest.TestCase):
             with self.assertRaisesRegex(budget.BudgetError, "canonical decimal"):
                 budget.parse_dtrace_summary(summary, expected_run_id="run-1", raw_path=raw)
 
+    def test_dtrace_summary_accepts_exact_current_seven_field_drop_schema(self):
+        with tempfile.TemporaryDirectory() as temp:
+            artifact = pathlib.Path(temp)
+            summary = artifact / "dtrace-summary.jsonl"
+            raw = artifact / "dtrace.raw"
+            rows = dtrace_rows(run_id="run-1", pid=42)
+            summary.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows)
+            )
+            raw.write_text(
+                "".join(line + "\n" for line in dtrace_raw_lines(pid=42))
+            )
+
+            budget.parse_dtrace_summary(
+                summary,
+                expected_run_id="run-1",
+                raw_path=raw,
+            )
+
+    def test_dtrace_summary_rejects_nonzero_dynamic_rinse_and_dirty_drops(self):
+        with tempfile.TemporaryDirectory() as temp:
+            artifact = pathlib.Path(temp)
+            summary = artifact / "dtrace-summary.jsonl"
+            raw = artifact / "dtrace.raw"
+            raw.write_text(
+                "".join(line + "\n" for line in dtrace_raw_lines(pid=42))
+            )
+            for field in ("dynamic_rinse_drops", "dynamic_dirty_drops"):
+                with self.subTest(field=field):
+                    rows = dtrace_rows(run_id="run-1", pid=42)
+                    for row in rows:
+                        row["completion"]["drops"][field] = 1
+                    summary.write_text(
+                        "".join(json.dumps(row) + "\n" for row in rows)
+                    )
+
+                    with self.assertRaisesRegex(
+                        budget.BudgetError,
+                        "drops or interruption",
+                    ):
+                        budget.parse_dtrace_summary(
+                            summary,
+                            expected_run_id="run-1",
+                            raw_path=raw,
+                        )
+
+    def test_dtrace_summary_requires_boolean_false_interrupted(self):
+        with tempfile.TemporaryDirectory() as temp:
+            artifact = pathlib.Path(temp)
+            summary = artifact / "dtrace-summary.jsonl"
+            raw = artifact / "dtrace.raw"
+            rows = dtrace_rows(run_id="run-1", pid=42)
+            for row in rows:
+                row["completion"]["drops"]["interrupted"] = 0
+            summary.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows)
+            )
+            raw.write_text(
+                "".join(line + "\n" for line in dtrace_raw_lines(pid=42))
+            )
+
+            with self.assertRaisesRegex(budget.BudgetError, "interrupted"):
+                budget.parse_dtrace_summary(
+                    summary,
+                    expected_run_id="run-1",
+                    raw_path=raw,
+                )
+
+    def test_dtrace_summary_rejects_missing_or_extra_drop_fields(self):
+        with tempfile.TemporaryDirectory() as temp:
+            artifact = pathlib.Path(temp)
+            summary = artifact / "dtrace-summary.jsonl"
+            raw = artifact / "dtrace.raw"
+            raw.write_text(
+                "".join(line + "\n" for line in dtrace_raw_lines(pid=42))
+            )
+            for label, mutate in (
+                (
+                    "missing",
+                    lambda drops: drops.pop("dynamic_rinse_drops"),
+                ),
+                (
+                    "extra",
+                    lambda drops: drops.__setitem__("future_drops", 0),
+                ),
+            ):
+                with self.subTest(label=label):
+                    rows = dtrace_rows(run_id="run-1", pid=42)
+                    mutate(rows[0]["completion"]["drops"])
+                    summary.write_text(
+                        "".join(json.dumps(row) + "\n" for row in rows)
+                    )
+
+                    with self.assertRaisesRegex(
+                        budget.BudgetError,
+                        "drop record is malformed",
+                    ):
+                        budget.parse_dtrace_summary(
+                            summary,
+                            expected_run_id="run-1",
+                            raw_path=raw,
+                        )
+
     def test_checked_in_w1_evidence_is_immutable_and_rejected_as_stale(self):
         evidence_path = EVIDENCE_ROOT / "native-compiler-w1-current-profile-v1.json"
         evidence = json.loads(evidence_path.read_text())
@@ -1969,7 +2074,7 @@ class ReviewFixContractTests(unittest.TestCase):
             with self.assertRaisesRegex(budget.BudgetError, "raw count"):
                 budget.parse_dtrace_summary(summary, expected_run_id="run-1", raw_path=raw)
 
-    def test_retained_real_plane_c_artifacts_parse_and_round_trip(self):
+    def test_retained_old_schema_plane_c_summary_is_rejected(self):
         root = EVIDENCE_ROOT / "real-plane-c-v1"
         run_id = "nativeperf-w2-internal-runtime-atomic-1-4472f5b0"
         with tempfile.TemporaryDirectory() as temp:
@@ -1978,24 +2083,15 @@ class ReviewFixContractTests(unittest.TestCase):
             summary_bytes = gzip.decompress((root / "dtrace-summary.jsonl.gz").read_bytes())
             (artifact / "dtrace.raw").write_bytes(raw_bytes)
             (artifact / "dtrace-summary.jsonl").write_bytes(summary_bytes)
-            evidence = budget.parse_dtrace_summary(
-                artifact / "dtrace-summary.jsonl",
-                expected_run_id=run_id,
-                raw_path=artifact / "dtrace.raw",
-            )
-            self.assertTrue(evidence.complete)
-            self.assertFalse(evidence.bounded)
-            self.assertEqual(evidence.raw_sha256, sha256(raw_bytes))
-            self.assertEqual(len(evidence.per_pid_gateway_counts), 23)
-            self.assertEqual(len(evidence.ordering), 1448)
-            self.assertTrue(any(entry[2] is None for entry in evidence.ordering))
-            encoded = json.loads(json.dumps(budget._dtrace_json(evidence)))
-            self.assertEqual(budget._parse_dtrace_json(encoded), evidence)
-            record = json.loads(gzip.decompress((root / "record.json.gz").read_bytes()))
-            decoded = budget.parse_result_row(record)
-            self.assertEqual(decoded.run_id, run_id)
-            self.assertEqual(decoded.plane, "dtrace")
-            self.assertEqual(decoded.dtrace, evidence)
+            with self.assertRaisesRegex(
+                budget.BudgetError,
+                "drop record is malformed",
+            ):
+                budget.parse_dtrace_summary(
+                    artifact / "dtrace-summary.jsonl",
+                    expected_run_id=run_id,
+                    raw_path=artifact / "dtrace.raw",
+                )
 
     def test_dtrace_summary_rejects_unknown_metric_types(self):
         with tempfile.TemporaryDirectory() as temp:

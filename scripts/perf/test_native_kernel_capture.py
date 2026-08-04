@@ -36,6 +36,8 @@ def completion() -> dict[str, object]:
             "principal_drops": 0,
             "aggregation_drops": 0,
             "dynamic_drops": 0,
+            "dynamic_rinse_drops": 0,
+            "dynamic_dirty_drops": 0,
             "other_drops": 0,
         },
     }
@@ -2347,6 +2349,8 @@ class NativeKernelCaptureTests(unittest.TestCase):
                         "principal_drops",
                         "aggregation_drops",
                         "dynamic_drops",
+                        "dynamic_rinse_drops",
+                        "dynamic_dirty_drops",
                         "other_drops",
                     )
                 ],
@@ -2462,6 +2466,54 @@ class NativeKernelCaptureTests(unittest.TestCase):
             "unknown drop counter",
         ):
             native_kernel_capture.validate_receipt(receipt_a)
+
+    def test_accepts_exact_current_seven_field_drop_schema(self) -> None:
+        rows = summary_rows(
+            "drop-schema",
+            "a" * 40,
+            "b" * 64,
+            ["run", "fixture"],
+            source_pc=0xFFFFFE0010000010,
+        )
+        path = self.root / "drop-schema.jsonl"
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+        native_kernel_capture._read_summary(path)
+        native_kernel_capture._validate_completion(
+            {"completion": completion()}
+        )
+
+    def test_rejects_nonzero_dynamic_rinse_and_dirty_drop_counters(self) -> None:
+        for field in ("dynamic_rinse_drops", "dynamic_dirty_drops"):
+            with self.subTest(field=field):
+                rows = summary_rows(
+                    "drop-schema",
+                    "a" * 40,
+                    "b" * 64,
+                    ["run", "fixture"],
+                    source_pc=0xFFFFFE0010000010,
+                )
+                for row in rows:
+                    row["completion"]["drops"][field] = 1
+                path = self.root / f"{field}.jsonl"
+                path.write_text(
+                    "".join(json.dumps(row) + "\n" for row in rows)
+                )
+                with self.assertRaisesRegex(
+                    native_kernel_capture.EvidenceError,
+                    "completion/drop state",
+                ):
+                    native_kernel_capture._read_summary(path)
+
+                receipt_completion = completion()
+                receipt_completion["drops"][field] = 1
+                with self.assertRaisesRegex(
+                    native_kernel_capture.EvidenceError,
+                    "completion/drop state",
+                ):
+                    native_kernel_capture._validate_completion(
+                        {"completion": receipt_completion}
+                    )
 
     def test_analysis_requires_absent_output_and_valid_receipts(self) -> None:
         _, receipt_a, receipt_b, _ = self.capture_success()
