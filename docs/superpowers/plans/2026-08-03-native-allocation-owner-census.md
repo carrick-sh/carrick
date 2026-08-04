@@ -67,6 +67,15 @@ and native-fault tooling.
 - Use red-first tests, narrow commits, `apply_patch` for edits, and
   `RUST_TEST_THREADS=1 just ci` before accepting evidence.
 
+## Deferred future improvement: eager translation amortization
+
+Evaluate a separate mode that translates a complete eligible image up front
+and amortizes that cost over later execution. This is explicitly deferred until
+the current export-only owner portfolio is bound to normal-binary opportunity.
+It cannot replace this work: JIT-on-JIT workloads, dynamically generated code,
+late-loaded images, exec successors, and invalidation still require correct and
+efficient runtime translation.
+
 ---
 
 ## File map
@@ -122,7 +131,7 @@ and native-fault tooling.
 - Every file contains exactly eight owner rows in enum order and a SHA-256
   footer over every preceding byte.
 
-- [ ] **Step 1: Add the red vocabulary round-trip test**
+- [x] **Step 1: Add the red vocabulary round-trip test**
 
 Create the module and add this literal test before defining the types:
 
@@ -153,7 +162,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the test and prove red**
+- [x] **Step 2: Run the test and prove red**
 
 Run:
 
@@ -163,7 +172,7 @@ cargo test -p carrick-dsr-aarch64 alloc_owner_wire::tests::owner_tokens_are_clos
 
 Expected: compile failure because `AllocationOwner` is not defined.
 
-- [ ] **Step 3: Add the exact typed vocabulary**
+- [x] **Step 3: Add the exact typed vocabulary**
 
 Implement these public types and exhaustive token matches:
 
@@ -215,7 +224,7 @@ pub struct OwnerSnapshot {
 The token matches must use exactly the strings from the design; no fallback
 variant is permitted.
 
-- [ ] **Step 4: Add red deterministic-record and rejection tests**
+- [x] **Step 4: Add red deterministic-record and rejection tests**
 
 Construct one `AllocationOwnerCensusFile` with literal owner counts and assert:
 
@@ -252,7 +261,7 @@ error for: unknown header field, unknown owner, duplicate owner, missing owner,
 reordered owner, mismatched total, changed payload with stale checksum,
 truncated footer, `overflow=1`, and `lifecycle_error=1`.
 
-- [ ] **Step 5: Run the record tests and prove red**
+- [x] **Step 5: Run the record tests and prove red**
 
 Run:
 
@@ -262,7 +271,7 @@ cargo test -p carrick-dsr-aarch64 alloc_owner_wire::tests -- --nocapture
 
 Expected: compile failure because `AllocationOwnerCensusFile` is absent.
 
-- [ ] **Step 6: Implement deterministic render and strict parse**
+- [x] **Step 6: Implement deterministic render and strict parse**
 
 Use this exact line grammar:
 
@@ -279,7 +288,7 @@ and compare the footer to `Sha256::digest` of all bytes through the `TOTAL`
 newline. `overflow=1` and `lifecycle_error=1` parse as typed fields but return a
 validation error from `parse`, so no caller can accidentally aggregate them.
 
-- [ ] **Step 7: Expose the single Rust authority and run green**
+- [x] **Step 7: Expose the single Rust authority and run green**
 
 Add:
 
@@ -303,7 +312,7 @@ cargo clippy -p carrick-dsr-aarch64 -p carrick-runtime --all-targets -- -D warni
 
 Expected: all tests pass and clippy is clean.
 
-- [ ] **Step 8: Commit the wire authority**
+- [x] **Step 8: Commit the wire authority**
 
 ```bash
 git add crates/carrick-dsr-aarch64/src/alloc_owner_wire.rs crates/carrick-dsr-aarch64/src/lib.rs crates/carrick-runtime/src/lib.rs
@@ -352,7 +361,7 @@ rename failure. `OwnerScope`, `ObserverPause`, `HostExecAttempt`, and
 implementations restore only already-initialized atomic/TLS state and never
 allocate.
 
-- [ ] **Step 1: Wire the non-default feature chain**
+- [x] **Step 1: Wire the non-default feature chain**
 
 Add exact features:
 
@@ -370,7 +379,7 @@ alloc-owner-census = ["carrick-runtime/alloc-owner-census"]
 Declare and re-export the feature module only under
 `cfg(feature = "alloc-owner-census")` in the DSR crate and runtime facade.
 
-- [ ] **Step 2: Add red scope and accounting tests**
+- [x] **Step 2: Add red scope and accounting tests**
 
 Inside the new module, serialize stateful tests with a test-only static mutex.
 Add literal tests for nested restoration and operation semantics:
@@ -417,7 +426,7 @@ owner. Use a test-only delegating allocator hook or operation recorder to prove
 the success/null/dealloc cases without relying on an allocator failure that the
 host may not reproduce naturally.
 
-- [ ] **Step 3: Run the core tests and prove red**
+- [x] **Step 3: Run the core tests and prove red**
 
 ```bash
 RUST_TEST_THREADS=1 cargo test -p carrick-dsr-aarch64 --features alloc-owner-census alloc_owner_census::tests -- --nocapture
@@ -425,7 +434,7 @@ RUST_TEST_THREADS=1 cargo test -p carrick-dsr-aarch64 --features alloc-owner-cen
 
 Expected: compile failure because the allocator and lifecycle state are absent.
 
-- [ ] **Step 4: Implement the const TLS and relaxed counters**
+- [x] **Step 4: Implement the const TLS and relaxed counters**
 
 Use one fixed counter array and a no-drop TLS cell:
 
@@ -452,7 +461,7 @@ static OVERFLOW: std::sync::atomic::AtomicBool =
 uses `fetch_add(Ordering::Relaxed)` and sets `OVERFLOW` when
 `old.checked_add(delta).is_none()`.
 
-- [ ] **Step 5: Implement all four GlobalAlloc operations**
+- [x] **Step 5: Implement all four GlobalAlloc operations**
 
 Use the original request unchanged and account only after a non-null result:
 
@@ -492,7 +501,7 @@ unsafe impl std::alloc::GlobalAlloc for TaggedSystem {
 Import `GlobalAlloc as _` so method resolution is explicit. `record_non_null`
 must do nothing unless state is exactly `Armed`.
 
-- [ ] **Step 6: Add red lifecycle transition tests**
+- [x] **Step 6: Add red lifecycle transition tests**
 
 Test this complete matrix under the state lock:
 
@@ -515,7 +524,7 @@ Test this complete matrix under the state lock:
 - the exported record excludes every allocation performed by its own
   snapshot/render/path/write machinery.
 
-- [ ] **Step 7: Implement lifecycle state and atomic export**
+- [x] **Step 7: Implement lifecycle state and atomic export**
 
 Represent state with an `AtomicU8` closed over
 `Disabled`, `Armed`, `ObserverPaused`, `Transition`, and `Terminal`. Store the
@@ -539,7 +548,7 @@ fragment in atomics, and transition failures in `LIFECYCLE_ERROR`.
 path/string setup while disabled, then arms. A malformed internal epoch is an
 error. Environment access never occurs in `GlobalAlloc`.
 
-- [ ] **Step 8: Run the focused feature gates**
+- [x] **Step 8: Run the focused feature gates**
 
 ```bash
 RUST_TEST_THREADS=1 cargo test -p carrick-dsr-aarch64 --features alloc-owner-census alloc_owner_census::tests -- --nocapture
@@ -548,7 +557,7 @@ cargo clippy -p carrick-dsr-aarch64 -p carrick-runtime --all-targets --features 
 
 Expected: lifecycle, overflow, allocator, and export tests pass.
 
-- [ ] **Step 9: Commit the allocator core**
+- [x] **Step 9: Commit the allocator core**
 
 ```bash
 git add crates/carrick-dsr-aarch64/Cargo.toml crates/carrick-dsr-aarch64/src/lib.rs crates/carrick-dsr-aarch64/src/alloc_owner_census.rs crates/carrick-runtime/Cargo.toml crates/carrick-runtime/src/lib.rs crates/carrick-cli/Cargo.toml
@@ -571,7 +580,7 @@ git commit -m "diagnostics(native): add tagged allocation census"
   `(pid, exec_epoch)` and excludes allocations made by existing diagnostic
   serializers.
 
-- [ ] **Step 1: Add red feature-guard and main-entry tests**
+- [x] **Step 1: Add red feature-guard and main-entry tests**
 
 Add compile guards in `main.rs` tests/fixture coverage and assert:
 
@@ -591,7 +600,7 @@ called immediately after `ExecStampPhase::MainEntry`, before
 `record_top_level_pid`, environment configuration, probe registration, or CLI
 parse. Add a source-order assertion next to the existing main-entry contract.
 
-- [ ] **Step 2: Add red fork-child ordering test**
+- [x] **Step 2: Add red fork-child ordering test**
 
 Extend the existing native fork child event vocabulary with
 `AllocationOwnerReset` and assert the first child-only event is exactly:
@@ -611,7 +620,7 @@ assert through the existing parent/child result channel that the parent retains
 its exact epoch, fragment, and counter delta while the child starts at epoch 0,
 fragment 0 with zero inherited counts.
 
-- [ ] **Step 3: Add red host-exec and in-process transition tests**
+- [x] **Step 3: Add red host-exec and in-process transition tests**
 
 In `native_exec_capsule.rs`, extend the injectable `exec_capsule_with` tests to
 assert:
@@ -633,7 +642,7 @@ prior terminal runtime drain makes the callback a no-op. Add an observer-pause
 fixture that performs known allocations inside and after the pause and proves
 only the post-pause production allocation reaches the outgoing record.
 
-- [ ] **Step 4: Run lifecycle tests and prove red**
+- [x] **Step 4: Run lifecycle tests and prove red**
 
 ```bash
 RUST_TEST_THREADS=1 cargo test -p carrick-runtime --features alloc-owner-census native_fork_child -- --nocapture
@@ -643,7 +652,7 @@ RUST_TEST_THREADS=1 cargo test -p carrick-dsr-aarch64 --features alloc-owner-cen
 
 Expected: failures because the lifecycle calls and ordering events are absent.
 
-- [ ] **Step 5: Install the CLI allocator and atexit backstop**
+- [x] **Step 5: Install the CLI allocator and atexit backstop**
 
 Add:
 
@@ -659,7 +668,7 @@ static ALLOC_OWNER_CENSUS: carrick_runtime::alloc_owner_census::TaggedSystem =
 returns an `anyhow::Error` and fails the diagnostic invocation before product
 dispatch.
 
-- [ ] **Step 6: Install the fork-first and process-exit boundaries**
+- [x] **Step 6: Install the fork-first and process-exit boundaries**
 
 In the `if child == 0` arm immediately after `libc::fork`, make the first
 statement:
@@ -680,7 +689,7 @@ drain allocation ownership before `maybe_dump_code_snapshot`, NATIVEPERF
 finalization, and xlat-census flush. Log export errors with `tracing::warn!` and
 continue the existing exit path.
 
-- [ ] **Step 7: Exclude existing diagnostic serializers without draining**
+- [x] **Step 7: Exclude existing diagnostic serializers without draining**
 
 At host self-reexec, wrap `translator.finalize_profile_epoch()` and
 `xlat_census::flush(HostSelfReexec)` in one `observer_pause()` guard, drop it,
@@ -691,7 +700,7 @@ At in-process exec, wrap only the existing early
 replacement, dispatcher reset, and translator preparation remain armed under
 the outgoing epoch.
 
-- [ ] **Step 8: Move host-exec allocation drain to the real pre-exec seam**
+- [x] **Step 8: Move host-exec allocation drain to the real pre-exec seam**
 
 In `exec_capsule_with`, read `guest.profile_exec_epoch` as the next owner epoch.
 Filter any inherited `CARRICK_ALLOC_OWNER_EXEC_EPOCH` from the regular host
@@ -710,7 +719,7 @@ let _allocation_attempt =
 Keep the guard live across `invoke_exec`. Its destructor is the only failed
 host-exec rearm path.
 
-- [ ] **Step 9: Align in-process owner and NATIVEPERF epochs**
+- [x] **Step 9: Align in-process owner and NATIVEPERF epochs**
 
 Inside `PreparedThreadExecHandoff::commit_with_sink`:
 
@@ -724,7 +733,7 @@ Inside `PreparedThreadExecHandoff::commit_with_sink`:
 An overflowed NATIVEPERF epoch leaves the allocation record invalid; it never
 wraps to epoch 0.
 
-- [ ] **Step 10: Run lifecycle tests green**
+- [x] **Step 10: Run lifecycle tests green**
 
 ```bash
 RUST_TEST_THREADS=1 cargo test -p carrick-runtime --features alloc-owner-census native_fork_child -- --nocapture
@@ -735,7 +744,7 @@ cargo clippy -p carrick-cli -p carrick-runtime -p carrick-dsr-aarch64 --all-targ
 
 Expected: all lifecycle/order tests pass and clippy is clean.
 
-- [ ] **Step 11: Commit lifecycle integration**
+- [x] **Step 11: Commit lifecycle integration**
 
 ```bash
 git add crates/carrick-cli/src/main.rs crates/carrick-runtime/src/native_darwin.rs crates/carrick-runtime/src/native_exec_capsule.rs crates/carrick-dsr-aarch64/src/translator.rs
@@ -760,7 +769,7 @@ git commit -m "diagnostics(native): close allocation census lifecycle"
 - Feature-off statements compile away under `cfg(feature =
   "alloc-owner-census")`.
 
-- [ ] **Step 1: Enable the tagged allocator only for the DSR unit-test binary**
+- [x] **Step 1: Enable the tagged allocator only for the DSR unit-test binary**
 
 In `alloc_owner_census.rs`, add this crate-local test allocator so semantic
 tests observe real `Vec`/`Box` allocations without defining a second allocator
@@ -775,7 +784,7 @@ static TEST_ALLOC_OWNER_CENSUS: TaggedSystem = TaggedSystem;
 All tests that arm/reset global census state must hold the Task 2 test lock and
 compare snapshot deltas, not absolute harness totals.
 
-- [ ] **Step 2: Add red source-owner tests**
+- [x] **Step 2: Add red source-owner tests**
 
 Add focused tests that execute one existing fixture per owner and assert a
 positive delta only in the named row:
@@ -794,7 +803,7 @@ The emitter test must also assert that map/recovery bytes are not charged to
 `BlockAssemblerTransient` by measuring each collection's known requested
 capacity delta separately.
 
-- [ ] **Step 3: Run semantic tests and prove red**
+- [x] **Step 3: Run semantic tests and prove red**
 
 ```bash
 RUST_TEST_THREADS=1 cargo test -p carrick-dsr-aarch64 --features alloc-owner-census allocation_owner -- --nocapture
@@ -802,7 +811,7 @@ RUST_TEST_THREADS=1 cargo test -p carrick-dsr-aarch64 --features alloc-owner-cen
 
 Expected: assertions fail because every allocation is still `other`.
 
-- [ ] **Step 4: Tag decode/read and transient assembly scopes**
+- [x] **Step 4: Tag decode/read and transient assembly scopes**
 
 At the first statement of
 `plan_superblock_with_reader_for_counter_plan`, install a
@@ -813,7 +822,7 @@ At the first statement of `assemble_block_inner`, install a
 `BlockAssemblerTransient` scope. It covers `VecAssembler`, dynasm labels and
 relocations, emitted bytes, direct links, `EmitItem`, and pending-edge staging.
 
-- [ ] **Step 5: Give map and recovery their exact inner scopes**
+- [x] **Step 5: Give map and recovery their exact inner scopes**
 
 Wrap the initial `entries = Vec::with_capacity(...)` in a `PublicationMap`
 scope. Add one helper:
@@ -837,7 +846,7 @@ has a mutable reference. Do not alter the entry values or loop bounds.
 Put a `PublicationMap` scope inside `map_next` around its sole `entries.push` so
 capacity growth beyond the estimate remains correctly owned.
 
-- [ ] **Step 6: Tag indirect cache, shared support, and publication indexes**
+- [x] **Step 6: Tag indirect cache, shared support, and publication indexes**
 
 Install:
 
@@ -853,7 +862,7 @@ Install:
 These scopes include relevant callees and library internals; do not tag
 individual BTreeMap or serializer allocation sites.
 
-- [ ] **Step 7: Run semantic tests green and inspect feature-off codegen**
+- [x] **Step 7: Run semantic tests green and inspect feature-off codegen**
 
 ```bash
 RUST_TEST_THREADS=1 cargo test -p carrick-dsr-aarch64 --features alloc-owner-census allocation_owner -- --nocapture
@@ -865,7 +874,7 @@ cargo clippy -p carrick-dsr-aarch64 --all-targets -- -D warnings
 Expected: feature tests show positive disjoint owner deltas; ordinary tests and
 both clippy modes pass.
 
-- [ ] **Step 8: Commit semantic tags**
+- [x] **Step 8: Commit semantic tags**
 
 ```bash
 git add crates/carrick-dsr-aarch64/src/block.rs crates/carrick-dsr-aarch64/src/emit.rs crates/carrick-dsr-aarch64/src/gateway.rs crates/carrick-dsr-aarch64/src/shared_cache.rs crates/carrick-dsr-aarch64/src/translator.rs crates/carrick-dsr-aarch64/src/alloc_owner_census.rs
@@ -919,7 +928,7 @@ flush counts, NATIVEPERF coverage, `H`, `P`, `Q`, authority label, `other`
 verdict, candidate rows, and one top-level `valid` bit. It is rendered through
 one pretty-JSON function used by both fixtures and the command.
 
-- [ ] **Step 1: Add red NATIVEPERF authority tests**
+- [x] **Step 1: Add red NATIVEPERF authority tests**
 
 Use literal complete core/resolver/supervisor lines for two PIDs, one exec
 successor, and one worker thread. Assert:
@@ -937,7 +946,7 @@ resolver-process, `complete=0`, `overflowed=1`, gateway/reconciled mismatch,
 duplicate supervisor, missing supervisor, non-contiguous exec epochs, unknown
 required numeric field, and checked-sum overflow.
 
-- [ ] **Step 2: Run the parser tests and prove red**
+- [x] **Step 2: Run the parser tests and prove red**
 
 ```bash
 cargo test -p carrick-cli native_perf_epochs -- --nocapture
@@ -945,7 +954,7 @@ cargo test -p carrick-cli native_perf_epochs -- --nocapture
 
 Expected: compile failure because `NativePerfEpochAuthority` is absent.
 
-- [ ] **Step 3: Implement exact NATIVEPERF group parsing**
+- [x] **Step 3: Implement exact NATIVEPERF group parsing**
 
 Group complete thread frames by `(pid, tid, era)`. Require exactly one `core`
 and one `resolver-process` frame per group. Read `exec_epoch` and
@@ -961,7 +970,7 @@ Use checked sums for translations, thread counts, and supervisor total CPU.
 Other recognized NATIVEPERF frames may be ignored only after their common
 identity fields parse; `invalid` frames are fatal.
 
-- [ ] **Step 4: Add the CLI request with explicit workload authority**
+- [x] **Step 4: Add the CLI request with explicit workload authority**
 
 Add this `DebugCommand` variant:
 
@@ -984,7 +993,7 @@ AllocOwnerCensus {
 Wire it in both macOS `debug::run_debug` and the portable non-HVF debug match.
 Declare both new modules in `main.rs`.
 
-- [ ] **Step 5: Add red fragment/lifecycle/portfolio fixtures**
+- [x] **Step 5: Add red fragment/lifecycle/portfolio fixtures**
 
 Create temporary `ALLOCOWNER1` files with Task 1's renderer and a literal
 NATIVEPERF stream. The accepted fixture must contain:
@@ -1009,7 +1018,7 @@ including stable schema, owner order, flush counts, coverage counts, `H =
 the same fixture twice and require byte-identical JSON; never snapshot-update
 this golden as part of the implementation command.
 
-- [ ] **Step 6: Run aggregator tests and prove red**
+- [x] **Step 6: Run aggregator tests and prove red**
 
 ```bash
 cargo test -p carrick-cli debug_alloc_owner -- --nocapture
@@ -1017,7 +1026,7 @@ cargo test -p carrick-cli debug_alloc_owner -- --nocapture
 
 Expected: compile failure because the aggregator/report is absent.
 
-- [ ] **Step 7: Implement strict discovery, join, and report**
+- [x] **Step 7: Implement strict discovery, join, and report**
 
 Discover only `alloc-owner-*.txt`; a matching temp file is a truncation error.
 Parse every discovered file or fail. Key fragments by
@@ -1048,7 +1057,7 @@ not opportunity. When `H` is present, a candidate is carried only when
 then owner token. Because allocator events have one innermost owner, candidate
 shares are non-overlapping and their sum may not exceed `H`.
 
-- [ ] **Step 8: Run CLI tests green**
+- [x] **Step 8: Run CLI tests green**
 
 ```bash
 cargo test -p carrick-cli native_perf_epochs -- --nocapture
@@ -1059,7 +1068,7 @@ cargo clippy -p carrick-cli --all-targets -- -D warnings
 
 Expected: strict parser, lifecycle, coverage, opportunity, and CLI tests pass.
 
-- [ ] **Step 9: Commit the aggregator**
+- [x] **Step 9: Commit the aggregator**
 
 ```bash
 git add crates/carrick-cli/src/native_perf_epochs.rs crates/carrick-cli/src/debug_alloc_owner.rs crates/carrick-cli/src/main.rs crates/carrick-cli/src/args.rs crates/carrick-cli/src/commands.rs crates/carrick-cli/src/debug.rs
@@ -1078,7 +1087,7 @@ git commit -m "diagnostics(debug): aggregate allocation owners"
 - Produces one ordinary signed binary receipt and one feature signed binary
   lifecycle smoke. Neither is campaign evidence yet.
 
-- [ ] **Step 1: Run the full source gate before a guest**
+- [x] **Step 1: Run the full source gate before a guest**
 
 ```bash
 RUST_TEST_THREADS=1 just ci
@@ -1087,7 +1096,7 @@ RUST_TEST_THREADS=1 just ci
 Expected: fmt, clippy, typed-domain lint, deny, check-matrix, check, doc, host
 tests, and integration tests all pass.
 
-- [ ] **Step 2: Build/sign the ordinary binary and prove no runtime instrument**
+- [x] **Step 2: Build/sign the ordinary binary and prove no runtime instrument**
 
 ```bash
 just build
@@ -1103,7 +1112,7 @@ Expected: signed ordinary binary with DOF, and both negative instrumentation
 searches empty. The portable debug parser may remain linked; runtime allocator
 and lifecycle markers may not.
 
-- [ ] **Step 3: Build/sign the feature binary and run a lifecycle smoke**
+- [x] **Step 3: Build/sign the feature binary and run a lifecycle smoke**
 
 ```bash
 just build --features alloc-owner-census
@@ -1132,7 +1141,7 @@ counts. If the `/bin/true` topology is not 1/1, rerun only the aggregation with
 those independently derived exact counts; never weaken the join, guess a count,
 or edit a record to fit an assumption.
 
-- [ ] **Step 4: Inspect the smoke and restore the ordinary binary**
+- [x] **Step 4: Inspect the smoke and restore the ordinary binary**
 
 Require one `BUILD_OK`, rc 0, no `*.tmp`, every record parseable, contiguous
 fragments, exact NATIVEPERF join, nonzero cumulative bytes, no overflow/lifecycle
@@ -1147,7 +1156,7 @@ git status --short
 Expected: no survivors, ordinary signed binary restored, and only intended
 source/docs changes.
 
-- [ ] **Step 5: Record verification in the plan and commit any test-driven fix**
+- [x] **Step 5: Record verification in the plan and commit any test-driven fix**
 
 Mark completed steps and append literal command results. If the smoke exposed a
 source defect, fix it red-first, rerun Steps 1-4, and commit only the affected
@@ -1158,6 +1167,52 @@ git commit -m "fix(native): close allocation census lifecycle gap"
 ```
 
 Do not create an empty commit when no fix was needed.
+
+#### Task 6 verification (2026-08-03)
+
+- `RUST_TEST_THREADS=1 just ci`: PASS. The authoritative source gate completed
+  fmt, clippy, typed-domain lint, deny, check-matrix, check, doc, host tests, and
+  integration tests; the runtime results included 1,160 unit tests passing with
+  5 ignored and 296 integration tests passing.
+- Ordinary signed binary: SHA-256
+  `a02a5296228a7ec84f5424e483253a56c9c073df384d1bf86b65dd8faf3e1b68`,
+  Mach-O UUID `17001A3C-07E3-39BB-801E-4810B1B9D18E`. The hypervisor
+  entitlement and `__dof_carrick` were present. Both allocator-environment and
+  lifecycle-symbol negative searches were empty. `xcrun dwarfdump --uuid` was
+  used because the unqualified `dwarfdump` on this host is the GNU tool.
+- Feature signed binary: SHA-256
+  `7c3d242aec7717c1867a7006021d004e5a2be5aac84eaf6f0556c68efab803ec`,
+  Mach-O UUID `360426F9-1A2B-344E-8DC2-6A9DB57C97FC`; entitlement and DOF
+  checks passed.
+- The first smoke exposed a real lifecycle defect: the launch supervisor
+  exported a record with no NATIVEPERF epoch, and the initial native child
+  inherited supervisor counters. Red tests covered both failures. The fix makes
+  only DSR process images participants and resets the initial native fork child
+  before its first fd close. It is commit `592c76dd` (`fix(native): close
+  allocation census lifecycle gap`).
+- Post-fix focused authority: 26/26 allocator-census tests passed; the complete
+  feature-on runtime suite passed 1,163 tests with 5 ignored; all 204 CLI unit
+  tests passed; feature-on runtime and CLI clippy passed with warnings denied.
+- Signed smoke: rc 0, exactly one `BUILD_OK`, exactly 3 final records, 0 temp
+  files, 0 overflow/lifecycle flags, and 0 run-id-scoped survivors. Strict
+  NATIVEPERF independently reported 3 process epochs, 2 PIDs, 3 threads, 505
+  translations, and 367,880,000 ns supervisor CPU. Allocation authority joined
+  the same 3 epochs and 2 PIDs, with 33,593,764 cumulative requested bytes and
+  flushes `{host-self-reexec-attempt: 1, process-exit: 2}`.
+- The default `P=0.1` report correctly failed coverage because `other` was
+  0.5403341524933021 of this tiny smoke. No performance claim was accepted. A
+  second explicit lifecycle-only aggregation with `P=1.0` returned valid with
+  the same exact join; it validates export plumbing only.
+- The pre-fix failure evidence remains recoverable at
+  `target/perf/alloc-owner-smoke.pre-fix`; the corrected smoke is at
+  `target/perf/alloc-owner-smoke`. The ordinary release binary was restored and
+  reproduced its exact SHA-256, UUID, entitlement, DOF, and negative marker
+  checks.
+- An extra non-authoritative `cargo test -p carrick-cli --features
+  alloc-owner-census` entered guest-running `run-elf` fixtures outside the
+  accepted `just ci` lane. Its representative signal-10-before-first-trap
+  failure reproduced with the ordinary feature-off binary and is not caused by
+  the census change; it was excluded rather than mislabeled green.
 
 ---
 
