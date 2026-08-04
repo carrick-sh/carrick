@@ -1,9 +1,10 @@
 # Native-lane performance: state of play
 
-**Date:** 2026-08-03 · **Branch:** `codex/native-store-default` · **Latest
-implementation decision:** stop the residual allocation workstream; the
-largest source-distinct owner projects to 8.3375% / 8.0484% of total CPU under
-the favorable fault-cost ceiling, below the 10% opportunity gate ·
+**Date:** 2026-08-04 · **Branch:** `codex/native-store-default` · **Latest
+decision:** accept the refreshed broad CPU attribution and carry an export-only
+guest-memory-intent census; zero-fill fault service clears the 10% opportunity
+screen twice, but no production patch is authorized until one non-overlapping
+semantic sequence does too ·
 **Scope:** Darwin/aarch64 native backend (`--exec-backend native`, the shipped
 default). VMM is explicitly NOT the target: one process per VM against a
 ~127-VM macOS ceiling makes it a dead end for build-shaped workloads.
@@ -106,6 +107,20 @@ host-zfod model; every other named owner is below 2.3%. No allocation
 optimization was selected. Full evidence:
 [`docs/perf-results/2026-08-03-native-allocation-owner-census.md`](docs/perf-results/2026-08-03-native-allocation-owner-census.md).
 
+The refreshed current-default broad CPU attribution is now complete. Two
+independent, naturally completed captures used the same clean runtime source,
+binary, and locked store; every DTrace drop/error/lifecycle counter was zero,
+wall timer coverage was 100%, and resolved CPU coverage was 99.94% in both.
+Darwin kernel is the stable dominant category at **50.6261% / 50.8335%** of all
+sampled CPU. It divides into named-syscall work at **28.7315% / 28.7129%** and
+non-syscall work at **21.8945% / 22.1207%**, both above the campaign gate. The
+prior exact N1/N2/C1/C2 binding puts all zero-fill service at a favorable
+**25.3299% / 24.4248%** opportunity ceiling; even its host-other subset is
+**15.9822% / 15.4279%**. This carries a memory-intent census, not a patch: the
+3.84 us input is a favorable cost model, and the already-complete allocation
+owner census found no individual owner above 10%. Full evidence:
+[`docs/perf-results/2026-08-04-current-default-broad-cpu-attribution.md`](docs/perf-results/2026-08-04-current-default-broad-cpu-attribution.md).
+
 ## What landed (2026-08-02/03, six waves, all merged with `just ci` green)
 
 **Exec pipeline.** Payload SHA-256 removed from the default artifact digest
@@ -151,20 +166,23 @@ went 1.66 s → <10 ms. Identical host syscall sequence, identical guest ABI.
 
 ## What's next
 
-The exec/exit, context-traffic, fault-publication, and residual-allocation lines
-are closed at attribution rather than carried into production experiments.
-Their exact exporters and censuses remain opt-in diagnostics. A crashed run can
-also be read from a saved core through the always-on event ring. No official
-ratio refresh is warranted because none retained a production candidate.
-`RUST_TEST_THREADS=1 just ci` passes at the current source authority.
+The exec/exit, context-traffic, fault-publication, residual-allocation, and
+broad-attribution lines are closed at measurement. Their exact exporters and
+censuses remain opt-in diagnostics. A crashed run can also be read from a saved
+core through the always-on event ring. No official ratio refresh is warranted
+because the broad result selected the next measurement, not a production
+candidate.
 
-1. **Refresh the complete current-default CPU attribution.** The last broad
-   user/kernel/JIT/dylib split predates the persistent-store default and several
-   retained codegen, filesystem, and exec wins. Run two ordinary-binary,
-   tracer-self-excluded captures and repartition current user, kernel, JIT,
-   dylib, syscall, and fault CPU. Select a source-distinct next bucket only if
-   it clears 10% twice. This is the non-regrettable way to re-rank after four
-   independently stopped sub-10% lines instead of extrapolating a stale budget.
+1. **Attribute guest memory intent to exact zero-fill pages.** Add one
+   export-only, lifecycle-complete census of guest `mmap`, `madvise`,
+   `mprotect`, and `munmap`, grouped into non-overlapping semantic sequences,
+   mapping provenance, bytes, and subsequent exact zero-fill pages. Current
+   source already lowers writable private/anonymous `MADV_DONTNEED` through a
+   fresh anonymous `MAP_FIXED` replacement, while private `MADV_FREE` is a
+   success no-op; do not assume `MADV_FREE_REUSABLE` is a win before measuring
+   the actual sequence. Select a Darwin lowering only if one sequence clears
+   10% of ordinary CPU twice. If none does, stop and split the stable 28.72%
+   named-syscall population next.
 2. **Keep eager full translation as a deferred future design, not the next
    patch.** Translating a complete eligible image once up front could amortize
    publication and avoid the losing per-process merge path measured here. It
@@ -178,21 +196,25 @@ ratio refresh is warranted because none retained a production candidate.
 
 ## Confidence
 
-- **Very high (98%):** allocation lifecycle and coverage are complete. Both v3
-  captures reconcile 140/140 independent process-image epochs, 71 pids, and
-  every deterministic record with zero lifecycle/overflow/temp error.
-- **Very high (98%):** the owner distribution is stable. Total requested bytes
-  differ by 0.0086%, `other` by 0.0017 percentage points, and the three largest
-  owners keep the same ordering.
-- **High (97%):** no allocation owner clears the production gate. The largest
-  owner reaches only 8.34% / 8.05% under a deliberately favorable ceiling;
-  untallied `other` projects to only 1.40% / 1.35% and cannot hide a candidate.
+- **Very high (99%):** both broad captures are structurally complete and bound
+  to the same clean runtime binary and persistent store. Every drop/error/live
+  counter is zero and resolved CPU coverage exceeds 99.94%.
+- **Very high (98%):** the broad and kernel-class populations are stable.
+  Darwin-kernel drift is 0.2075 percentage points, named-syscall drift 0.0187,
+  and non-syscall drift 0.2261.
+- **High (92%):** anonymous zero-fill service is large enough to justify the
+  next census. It clears 10% in both exact ordinary bindings even when narrowed
+  to host-other pages, and the current non-syscall kernel sample population
+  independently agrees on scale.
+- **Medium (60%):** one guest memory-intent sequence will clear 10%. The current
+  3.84 us projection is deliberately favorable and may split across several
+  guest mechanisms; the census is designed to stop cleanly if it does.
 - **High (95%):** the official shipped-default result remains 10.4446x. No
   rejected candidate code is retained and no projection was substituted for a
   fresh Carrick/Docker run.
-- **High (90%):** a fresh broad CPU attribution is the right next measurement.
-  The current official gap is still large, but the prior complete bucket model
-  is stale enough that choosing another patch from it would be speculative.
+- **High (90%):** the sequential ≥10% policy is the right route toward 3x.
+  Nothing yet predicts a single 3.48x win, but each retained experiment must
+  remove a measured, source-distinct cost and preserve the Linux ABI.
 
 ## Discipline that earned its keep (do not relearn these)
 
@@ -217,8 +239,8 @@ ratio refresh is warranted because none retained a production candidate.
 
 ## Branch state at handoff
 
-`80a469da617b0eec4d8e69ee639cbfe287767cfd` is the source authority for the
-accepted allocation/fault/CPU captures. Its feature binary has SHA-256
+`80a469da617b0eec4d8e69ee639cbfe287767cfd` remains the source authority for
+the accepted allocation/fault/CPU bindings. Its feature binary has SHA-256
 `c46323009b8d944c67dd0692137e1409f57254e18a3ec77cdac19f2e48dbb555`
 and UUID `444B9BDA-4565-3E15-8655-6535A4307375`; its ordinary binary has
 SHA-256 `a77c7d5243a4d6eaae195d3d8e49bde5b8c46db6eedff9db8db5cf4b2a11e8c0`
@@ -227,6 +249,11 @@ and UUID `E0338A4E-19B3-3885-9489-5AE625AD2CE7`. Commits `932f8e28` through
 ALLOCOWNER3/NATIVEPERF reader, and source-distinct owners. The ordinary binary
 contains no allocation runtime marker and default guest semantics do not
 change. `RUST_TEST_THREADS=1 just ci` passed at that source authority.
+The accepted refreshed broad captures are bound to clean runtime source
+`daebb0203c854b507b2441eee98fa341f353dd20` and signed binary SHA-256
+`d43c38bc2eec4d99170f869100fc901580c8781a95c4a77eccb4106821f3f037`.
+The branch retains its trace-control repairs through `daebb020`, host-catalog
+coalescing at `0f24eb54`, and machine-readable kernel classes at `900e6d57`.
 Nothing has been pushed and local `main` has not moved. Target-only raw ABBA,
 mechanism, signed-binary, store, attribution, and scoreboard receipts remain
 under `target/perf/` and are intentionally not committed.
