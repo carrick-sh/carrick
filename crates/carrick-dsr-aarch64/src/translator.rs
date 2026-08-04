@@ -372,7 +372,6 @@ impl PreparedDirectBindingExecReset<'_, '_, '_> {
         state.pending.clear();
         state.direct_link_incoming.clear();
         state.trusted_entries.clear();
-        state.trusted_route_entries.clear();
         state.stats = ResolverStats::default();
         state.reported_stats = ResolverStats::default();
         state.sensitive.clear();
@@ -616,34 +615,11 @@ impl PreparedThreadExecHandoff<'_> {
 
 /// One process's published JIT code plus its guest-to-cache block index,
 /// copied out for offline diagnostics (see `ProcessTranslator::code_snapshot`).
-#[derive(Debug)]
 pub struct CodeSnapshot {
     pub cache_base: u64,
     pub code: Vec<u8>,
     /// `(guest_va, cache_entry_host_va)` for every published private block.
     pub blocks: Vec<(u64, u64)>,
-    pub trusted_routes: Vec<TrustedRouteSnapshot>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-pub struct TrustedRouteSnapshot {
-    pub guest_start: u64,
-    pub generation: u64,
-    pub origin: TrustedRouteOrigin,
-    pub fallthrough: std::ops::Range<u64>,
-    pub direct: std::ops::Range<u64>,
-    pub indirect: std::ops::Range<u64>,
-    pub fallthrough_branch: u64,
-    pub direct_branch: u64,
-    pub indirect_branch: u64,
-    pub common_body: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum TrustedRouteOrigin {
-    Owned,
-    UnitReplay,
 }
 
 pub struct ProcessTranslator {
@@ -880,8 +856,6 @@ pub struct ProcessState {
     /// guard the link's existence (plus Phase 2a severing) makes redundant.
     pub trusted_entries:
         BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), types::CacheOffset>,
-    pub trusted_route_entries:
-        BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), TrustedRouteEntries>,
     pub stats: ResolverStats,
     pub reported_stats: ResolverStats,
     pub sensitive: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), SensitiveMetadata>,
@@ -919,16 +893,6 @@ pub struct ProcessState {
     /// Resolved once from `block::superblock_segment_limit()`; the only site
     /// that reads the switch, so planner and emitter tests stay deterministic.
     superblock_segments: usize,
-    trusted_route_split: emit::TrustedRouteSplit,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TrustedRouteEntries {
-    pub fallthrough: types::CacheVa,
-    pub direct: types::CacheVa,
-    pub indirect: types::CacheVa,
-    pub sequence_bytes: u32,
-    pub common_body: types::CacheVa,
 }
 
 struct SharedTranslationConfiguration {
@@ -2178,14 +2142,6 @@ impl ProcessTranslator {
         capacity: usize,
         host: &'static dyn NativeHostJit,
     ) -> Result<Self, types::DsrError> {
-        Self::new_with_host_and_route_split(capacity, host, emit::trusted_route_split_enabled())
-    }
-
-    fn new_with_host_and_route_split(
-        capacity: usize,
-        host: &'static dyn NativeHostJit,
-        trusted_route_split: emit::TrustedRouteSplit,
-    ) -> Result<Self, types::DsrError> {
         artifact_spike::ensure_authority_if_enabled()?;
         let cache = cache::TranslationCache::new(capacity, host)?;
         let cache_range = cache.host_range();
@@ -2209,7 +2165,6 @@ impl ProcessTranslator {
                 pending: BTreeMap::new(),
                 direct_link_incoming: BTreeMap::new(),
                 trusted_entries: BTreeMap::new(),
-                trusted_route_entries: BTreeMap::new(),
                 stats: ResolverStats::default(),
                 reported_stats: ResolverStats::default(),
                 sensitive: BTreeMap::new(),
@@ -2232,7 +2187,6 @@ impl ProcessTranslator {
                     cache_range.end,
                 )?,
                 superblock_segments: block::superblock_segment_limit(),
-                trusted_route_split,
             }),
         };
         probes::dsr_cache_capacity(
@@ -2299,7 +2253,7 @@ impl ProcessTranslator {
     /// no writer expectations: the read guard excludes emitters, and at the
     /// process-exit seam where this runs no sibling thread is left to patch
     /// direct links.
-    pub fn code_snapshot(&self) -> Result<CodeSnapshot, types::DsrError> {
+    pub fn code_snapshot(&self) -> CodeSnapshot {
         let state = self.state.read();
         let range = state.cache.host_range();
         let used = state.cache.used_bytes().min(range.end - range.start);
@@ -2312,124 +2266,11 @@ impl ProcessTranslator {
             .iter()
             .map(|((guest, _generation), entry)| (guest.raw(), entry.host().0 as u64))
             .collect();
-        if !code.len().is_multiple_of(4) {
-            return Err(types::DsrError::CachePolicy(format!(
-                "code snapshot length {} is not instruction aligned",
-                code.len()
-            )));
-        }
-        let words = code
-            .chunks_exact(4)
-            .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
-            .collect::<Vec<_>>();
-        let cache_base = range.start as u64;
-        let mut trusted_routes = Vec::with_capacity(state.trusted_route_entries.len());
-        for (&(guest, generation), routes) in &state.trusted_route_entries {
-            let entry = state.blocks.get(&(guest, generation)).ok_or_else(|| {
-                types::DsrError::CachePolicy(format!(
-                    "trusted route for guest 0x{:x} generation {} has no block",
-                    guest.raw(),
-                    generation.get()
-                ))
-            })?;
-            let published = state
-                .published_block_containing(entry.host().raw())
-                .filter(|published| published.entry == *entry)
-                .ok_or_else(|| {
-                    types::DsrError::CachePolicy(format!(
-                        "trusted route for guest 0x{:x} generation {} has no published metadata",
-                        guest.raw(),
-                        generation.get()
-                    ))
-                })?;
-            let origin = match &published.metadata {
-                PublishedBlockMetadata::Owned { .. } => TrustedRouteOrigin::Owned,
-                PublishedBlockMetadata::Unit { .. } => TrustedRouteOrigin::UnitReplay,
-            };
-            let relative = |address: types::CacheVa, name: &str| {
-                let address = address.host().raw() as u64;
-                let offset = address.checked_sub(cache_base).ok_or_else(|| {
-                    types::DsrError::CachePolicy(format!(
-                        "trusted {name} route address 0x{address:x} precedes cache"
-                    ))
-                })?;
-                u32::try_from(offset).map_err(|_| {
-                    types::DsrError::CachePolicy(format!(
-                        "trusted {name} route offset {offset} exceeds u32"
-                    ))
-                })
-            };
-            let fallthrough = relative(routes.fallthrough, "fallthrough")?;
-            let derived = emit::derive_trusted_route_offsets(
-                &words,
-                fallthrough,
-                generation,
-                emit::TrustedRouteSplit::Enabled,
-            )?
-            .ok_or_else(|| {
-                types::DsrError::CachePolicy("trusted route derivation was disabled".to_string())
-            })?;
-            let expected = TrustedRouteEntries {
-                fallthrough: types::CacheVa::published(carrick_guest_mem::HostVa(
-                    range.start + derived.fallthrough.get() as usize,
-                )),
-                direct: types::CacheVa::published(carrick_guest_mem::HostVa(
-                    range.start + derived.direct.get() as usize,
-                )),
-                indirect: types::CacheVa::published(carrick_guest_mem::HostVa(
-                    range.start + derived.indirect.get() as usize,
-                )),
-                sequence_bytes: derived.sequence_bytes,
-                common_body: types::CacheVa::published(carrick_guest_mem::HostVa(
-                    range.start + derived.common_body.get() as usize,
-                )),
-            };
-            if *routes != expected {
-                return Err(types::DsrError::CachePolicy(format!(
-                    "trusted route geometry mismatch for guest 0x{:x} generation {}",
-                    guest.raw(),
-                    generation.get()
-                )));
-            }
-            let sequence_bytes = u64::from(routes.sequence_bytes);
-            let span = |start: types::CacheVa| -> Result<std::ops::Range<u64>, types::DsrError> {
-                let start = start.host().raw() as u64;
-                let end = start.checked_add(sequence_bytes).ok_or_else(|| {
-                    types::DsrError::CachePolicy("trusted route span overflow".to_string())
-                })?;
-                Ok(start..end)
-            };
-            let fallthrough = span(routes.fallthrough)?;
-            let direct = span(routes.direct)?;
-            let indirect = span(routes.indirect)?;
-            trusted_routes.push(TrustedRouteSnapshot {
-                guest_start: guest.raw(),
-                generation: generation.get(),
-                origin,
-                fallthrough_branch: fallthrough.end,
-                direct_branch: direct.end,
-                indirect_branch: indirect.end,
-                fallthrough,
-                direct,
-                indirect,
-                common_body: routes.common_body.host().raw() as u64,
-            });
-        }
-        trusted_routes.sort_by_key(|route| route.fallthrough.start);
-        for pair in trusted_routes.windows(2) {
-            if pair[0].indirect_branch >= pair[1].fallthrough.start {
-                return Err(types::DsrError::CachePolicy(format!(
-                    "trusted route spans overlap between guest 0x{:x} and 0x{:x}",
-                    pair[0].guest_start, pair[1].guest_start
-                )));
-            }
-        }
-        Ok(CodeSnapshot {
+        CodeSnapshot {
             cache_base: range.start as u64,
             code,
             blocks,
-            trusted_routes,
-        })
+        }
     }
 
     pub fn configure_shared_image(
@@ -2879,13 +2720,7 @@ impl ProcessState {
                 types::DsrError::CachePolicy(format!("shared unit hot blob refused: {reason:?}"))
             })
             .and_then(|hot| {
-                artifact_spike::replay_unit_block(
-                    &mut self.cache,
-                    words,
-                    hot,
-                    &bindings,
-                    self.trusted_route_split,
-                )
+                artifact_spike::replay_unit_block(&mut self.cache, words, hot, &bindings)
             });
         let emitted = match replayed {
             Ok(emitted) => emitted,
@@ -3111,31 +2946,6 @@ impl ProcessState {
         // recording zero duplicate publications in production profiles.
         let emitted_len = emitted.len();
         let trusted_entry = emitted.trusted_entry();
-        let trusted_routes = emitted
-            .trusted_routes()
-            .map(|routes| {
-                let absolute = |offset: types::CacheOffset| {
-                    entry
-                        .host()
-                        .raw()
-                        .checked_add(offset.get() as usize)
-                        .map(carrick_guest_mem::HostVa)
-                        .map(types::CacheVa::published)
-                        .ok_or_else(|| {
-                            types::DsrError::CachePolicy(
-                                "trusted route absolute address overflow".to_string(),
-                            )
-                        })
-                };
-                Ok::<TrustedRouteEntries, types::DsrError>(TrustedRouteEntries {
-                    fallthrough: absolute(routes.fallthrough)?,
-                    direct: absolute(routes.direct)?,
-                    indirect: absolute(routes.indirect)?,
-                    sequence_bytes: routes.sequence_bytes,
-                    common_body: absolute(routes.common_body)?,
-                })
-            })
-            .transpose()?;
         let (map, links, recovery) = emitted.into_runtime_metadata();
         // A unit-replayed block's emission carries EMPTY map/recovery (its
         // fault metadata lives undecoded in the unit); the caller supplies
@@ -3150,9 +2960,6 @@ impl ProcessState {
         self.blocks.insert(key, entry);
         if let Some(offset) = trusted_entry {
             self.trusted_entries.insert(key, offset);
-        }
-        if let Some(routes) = trusted_routes {
-            self.trusted_route_entries.insert(key, routes);
         }
         self.dependencies.record(source_page, key.0, key.1);
         for link in links {
@@ -3546,22 +3353,20 @@ impl ProcessState {
                 // candidate IS the native emission — not a second
                 // authority-mode assembly.
                 let (emitted, artifact) = if artifact_eligible || unit_candidate_segment.is_some() {
-                    emit::emit_block_recording_artifact_optional_with_route_split(
+                    emit::emit_block_recording_artifact_optional(
                         &mut self.cache,
                         &block,
                         emit::GenerationGuard::new(observation.current_atomic(), generation),
                         memory.address_mode().into(),
                         artifact_source_words.clone().unwrap_or_default(),
-                        self.trusted_route_split,
                     )?
                 } else {
                     (
-                        emit::emit_block_with_generation_and_route_split(
+                        emit::emit_block_with_generation(
                             &mut self.cache,
                             &block,
                             emit::GenerationGuard::new(observation.current_atomic(), generation),
                             memory.address_mode().into(),
-                            self.trusted_route_split,
                         )?,
                         None,
                     )
@@ -3742,9 +3547,6 @@ impl ProcessState {
         key: (carrick_guest_mem::GuestVa, types::CodeGeneration),
         entry: types::CacheVa,
     ) -> types::CacheVa {
-        if let Some(routes) = self.trusted_route_entries.get(&key) {
-            return routes.direct;
-        }
         match self.trusted_entries.get(&key) {
             Some(offset) => types::CacheVa::published(carrick_guest_mem::HostVa(
                 entry.host().raw() + offset.get() as usize,
@@ -4121,22 +3923,14 @@ impl ThreadTranslator {
         translated: &TranslationResult,
     ) -> Result<(), types::DsrError> {
         if self.process.private_target_authority.owns(translated.entry) {
-            let trusted_code = {
-                let state = self.process.state.read();
-                state
-                    .trusted_route_entries
-                    .get(&(target, translated.generation))
-                    .map(|routes| routes.indirect.host().raw() as u64)
-                    .or_else(|| {
-                        state
-                            .trusted_entries
-                            .get(&(target, translated.generation))
-                            .map(|offset| {
-                                translated.entry.host().raw() as u64 + u64::from(offset.get())
-                            })
-                    })
-            };
-            if let Some(trusted_code) = trusted_code {
+            let trusted = self
+                .process
+                .state
+                .read()
+                .trusted_entries
+                .get(&(target, translated.generation))
+                .copied();
+            if let Some(offset) = trusted {
                 // The same atomic the target's emitted guard materializes:
                 // the page-generation cell `memory.dsr_generation_observation`
                 // hands the translate/guard wiring. Its address is stable for
@@ -4147,7 +3941,7 @@ impl ThreadTranslator {
                 let generation_atomic = std::ptr::from_ref(observation.current_atomic()) as u64;
                 self.indirect_cache.publish_private_trusted(
                     target,
-                    trusted_code,
+                    translated.entry.host().raw() as u64 + u64::from(offset.get()),
                     generation_atomic,
                     translated.generation,
                 );
@@ -4936,7 +4730,6 @@ mod tests {
         TranslatedRangeRecorder, merge_sensitive_metadata, translation_source_words_required,
     };
     use crate::types;
-    use carrick_dsr::cache::PageGenerationTable;
     use carrick_dsr::host::{ForkChildJit, JitRegion, NativeHostJit};
     use carrick_dsr::probes::{
         DsrCacheLifecyclePhase, TranslatedPrivateRange, TranslatedRangeAdd, TranslatedRangeEpoch,
@@ -5677,7 +5470,7 @@ mod tests {
             published.entry()
         };
 
-        let snapshot = translator.code_snapshot().expect("valid code snapshot");
+        let snapshot = translator.code_snapshot();
 
         let base = translator.cache_host_range().start;
         assert_eq!(snapshot.cache_base, base);
@@ -5692,172 +5485,6 @@ mod tests {
             &0xd65f_03c0_u32.to_le_bytes()
         );
         assert_eq!(snapshot.blocks, vec![(0x40_0000, entry.host().0 as u64)]);
-        assert!(snapshot.trusted_routes.is_empty());
-    }
-
-    fn diagnostic_snapshot_fixture(words: &[u32]) -> ProcessTranslator {
-        let translator = ProcessTranslator::new_with_host_and_route_split(
-            64 * 1024,
-            &TEST_HOST_JIT,
-            crate::emit::TrustedRouteSplit::Enabled,
-        )
-        .expect("translator");
-        let mut state = translator.state.write();
-        let published = state.cache.publish_words(words).expect("publish");
-        let entry = published.entry();
-        let key = (GuestVa(0x40_0000), types::CodeGeneration::claimed(7));
-        let generations = PageGenerationTable::new(4096).expect("generation table");
-        state.push_published(super::PublishedBlock {
-            entry,
-            len: words.len() * 4,
-            metadata: super::PublishedBlockMetadata::Owned {
-                map: Vec::new(),
-                recovery: Vec::new(),
-            },
-            _generation: generations.observe(key.0).expect("generation observation"),
-        });
-        state.blocks.insert(key, entry);
-        let at = |offset: usize| types::CacheVa::published(HostVa(entry.host().raw() + offset));
-        state.trusted_route_entries.insert(
-            key,
-            super::TrustedRouteEntries {
-                fallthrough: at(0),
-                direct: at(16),
-                indirect: at(32),
-                sequence_bytes: 12,
-                common_body: at(48),
-            },
-        );
-        drop(state);
-        translator
-    }
-
-    #[test]
-    fn code_snapshot_exports_validated_trusted_route_spans() {
-        let translator = diagnostic_snapshot_fixture(&[
-            0xd280_00f1,
-            0xf902_3f91,
-            0xf942_3791,
-            0x1400_0009,
-            0xd280_00f1,
-            0xf902_3f91,
-            0xf942_3791,
-            0x1400_0005,
-            0xd280_00f1,
-            0xf902_3f91,
-            0xf942_3791,
-            0x1400_0001,
-            0xd503_201f,
-        ]);
-
-        let snapshot = translator
-            .code_snapshot()
-            .expect("valid diagnostic snapshot");
-        let route = snapshot.trusted_routes.first().expect("one route row");
-        let base = snapshot.cache_base;
-        assert_eq!(route.guest_start, 0x40_0000);
-        assert_eq!(route.generation, 7);
-        assert_eq!(route.fallthrough, base..base + 12);
-        assert_eq!(route.direct, base + 16..base + 28);
-        assert_eq!(route.indirect, base + 32..base + 44);
-        assert_eq!(route.fallthrough_branch, base + 12);
-        assert_eq!(route.direct_branch, base + 28);
-        assert_eq!(route.indirect_branch, base + 44);
-        assert_eq!(route.common_body, base + 48);
-        assert_eq!(route.origin, super::TrustedRouteOrigin::Owned);
-    }
-
-    #[test]
-    fn code_snapshot_rejects_mismatched_trusted_route_sequences() {
-        let translator = diagnostic_snapshot_fixture(&[
-            0xd280_00f1,
-            0xf902_3f91,
-            0xf942_3791,
-            0x1400_0009,
-            0xd503_201f,
-            0xf902_3f91,
-            0xf942_3791,
-            0x1400_0005,
-            0xd280_00f1,
-            0xf902_3f91,
-            0xf942_3791,
-            0x1400_0001,
-            0xd503_201f,
-        ]);
-
-        let error = translator
-            .code_snapshot()
-            .expect_err("unequal trusted sequences must fail closed");
-        assert!(
-            error.to_string().contains("trusted route sequences differ"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn code_snapshot_rejects_trusted_route_without_block() {
-        let translator = diagnostic_snapshot_fixture(&[
-            0xd280_00f1,
-            0xf902_3f91,
-            0xf942_3791,
-            0x1400_0009,
-            0xd280_00f1,
-            0xf902_3f91,
-            0xf942_3791,
-            0x1400_0005,
-            0xd280_00f1,
-            0xf902_3f91,
-            0xf942_3791,
-            0x1400_0001,
-            0xd503_201f,
-        ]);
-        translator.state.write().blocks.clear();
-
-        let error = translator
-            .code_snapshot()
-            .expect_err("orphan trusted route must fail closed");
-        assert!(
-            error.to_string().contains("has no block"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn code_snapshot_rejects_stale_trusted_route_geometry() {
-        let translator = diagnostic_snapshot_fixture(&[
-            0xd280_00f1,
-            0xf902_3f91,
-            0xf942_3791,
-            0x1400_0009,
-            0xd280_00f1,
-            0xf902_3f91,
-            0xf942_3791,
-            0x1400_0005,
-            0xd280_00f1,
-            0xf902_3f91,
-            0xf942_3791,
-            0x1400_0001,
-            0xd503_201f,
-        ]);
-        {
-            let mut state = translator.state.write();
-            let routes = state
-                .trusted_route_entries
-                .values_mut()
-                .next()
-                .expect("one trusted route");
-            routes.direct = routes.fallthrough;
-        }
-
-        let error = translator
-            .code_snapshot()
-            .expect_err("stale route geometry must fail closed");
-        assert!(
-            error
-                .to_string()
-                .contains("trusted route geometry mismatch"),
-            "unexpected error: {error}"
-        );
     }
 
     /// The native-tap unit contract, end to end at the translator level:
@@ -5950,25 +5577,16 @@ mod tests {
             memory: &NativeMappedMemory,
             plan: &BlockPlan,
         ) -> (PortableBlockCandidate, emit::EmittedBlock, Vec<u32>) {
-            record_candidate_with_route_split(memory, plan, emit::TrustedRouteSplit::Disabled)
-        }
-
-        fn record_candidate_with_route_split(
-            memory: &NativeMappedMemory,
-            plan: &BlockPlan,
-            route_split: emit::TrustedRouteSplit,
-        ) -> (PortableBlockCandidate, emit::EmittedBlock, Vec<u32>) {
             let observation = memory
                 .dsr_generation_observation(plan.start)
                 .expect("record-time observation");
             let mut scratch = crate::test_jit::test_cache(256 * 1024);
-            let (emitted, artifact) = emit::emit_block_recording_artifact_with_route_split(
+            let (emitted, artifact) = emit::emit_block_recording_artifact(
                 &mut scratch,
                 plan,
                 emit::GenerationGuard::new(observation.current_atomic(), CodeGeneration::INITIAL),
                 emit::EmitAddressMode::Direct,
                 vec![0xd503_201f],
-                route_split,
             )
             .expect("record native-tap candidate");
             // Capture the reference words BEFORE any patching can occur.
@@ -6039,24 +5657,12 @@ mod tests {
             unit: SharedLoadedTranslationUnit,
             code: Arc<Vec<u8>>,
         ) -> LookupFixture {
-            fixture_for_unit_with_route_split(unit, code, emit::TrustedRouteSplit::Disabled)
-        }
-
-        fn fixture_for_unit_with_route_split(
-            unit: SharedLoadedTranslationUnit,
-            code: Arc<Vec<u8>>,
-            route_split: emit::TrustedRouteSplit,
-        ) -> LookupFixture {
             let store = Arc::new(LookupFixtureStore {
                 unit: std::sync::Mutex::new(Some(unit)),
                 loads: std::sync::atomic::AtomicU64::new(0),
             });
-            let translator = ProcessTranslator::new_with_host_and_route_split(
-                256 * 1024,
-                &TEST_HOST_JIT,
-                route_split,
-            )
-            .expect("translator");
+            let translator =
+                ProcessTranslator::new_with_host(256 * 1024, &TEST_HOST_JIT).expect("translator");
             translator
                 .configure_shared_image(
                     crate::shared_cache::SharedImageConfig {
@@ -6084,13 +5690,6 @@ mod tests {
         /// Build a unit from `candidates`, round-trip it through the wire, and
         /// serve it through a `fixture_for_unit` translator.
         fn lookup_fixture(candidates: Vec<PortableBlockCandidate>) -> LookupFixture {
-            lookup_fixture_with_route_split(candidates, emit::TrustedRouteSplit::Disabled)
-        }
-
-        fn lookup_fixture_with_route_split(
-            candidates: Vec<PortableBlockCandidate>,
-            route_split: emit::TrustedRouteSplit,
-        ) -> LookupFixture {
             let pending = PendingTranslationUnit::pack(unit_key(), candidates).expect("pack unit");
             // Round-trip the manifest through the exact wire the store
             // persists, so serde of relocations, trusted entries, direct
@@ -6110,7 +5709,7 @@ mod tests {
                 code.as_ptr() as usize,
                 Arc::clone(&code) as Arc<dyn Send + Sync>,
             );
-            fixture_for_unit_with_route_split(unit, code, route_split)
+            fixture_for_unit(unit, code)
         }
 
         /// Look one guest block up through the shared lane, as `translate`'s
@@ -6356,23 +5955,11 @@ mod tests {
             memory: &NativeMappedMemory,
             candidates: Vec<PortableBlockCandidate>,
         ) -> Result<LookupFixture, types::DsrError> {
-            attach_and_replay_all_with_route_split(
-                memory,
-                candidates,
-                emit::TrustedRouteSplit::Disabled,
-            )
-        }
-
-        fn attach_and_replay_all_with_route_split(
-            memory: &NativeMappedMemory,
-            candidates: Vec<PortableBlockCandidate>,
-            route_split: emit::TrustedRouteSplit,
-        ) -> Result<LookupFixture, types::DsrError> {
             let guests: Vec<GuestVa> = candidates
                 .iter()
                 .map(|candidate| candidate.guest_start)
                 .collect();
-            let fixture = lookup_fixture_with_route_split(candidates, route_split);
+            let fixture = lookup_fixture(candidates);
             for guest in guests {
                 lookup(&fixture, memory, guest)?;
             }
@@ -6458,115 +6045,6 @@ mod tests {
             }
             let installed_b = read_words(entry_b, target_words.len() * 4);
             assert_eq!(installed_b, target_words);
-        }
-
-        #[test]
-        fn diagnostic_replay_routes_direct_links_to_only_the_direct_copy() {
-            let memory = NativeMappedMemory::shared_install_test_fixture(4096);
-            let (branch, native_branch, branch_words) = record_candidate_with_route_split(
-                &memory,
-                &branch_plan(BLOCK_A, BLOCK_B),
-                emit::TrustedRouteSplit::Enabled,
-            );
-            let (target, _native_target, _target_words) = record_candidate_with_route_split(
-                &memory,
-                &syscall_plan(BLOCK_B),
-                emit::TrustedRouteSplit::Enabled,
-            );
-            let link = native_branch.direct_links()[0];
-
-            let installed = attach_and_replay_all_with_route_split(
-                &memory,
-                vec![branch, target],
-                emit::TrustedRouteSplit::Enabled,
-            )
-            .expect("replay diagnostic two-block unit");
-            let state = installed.translator.state.read();
-            let entry_a = *state
-                .blocks
-                .get(&(BLOCK_A, CodeGeneration::INITIAL))
-                .expect("installed branch block");
-            let routes_b = *state
-                .trusted_route_entries
-                .get(&(BLOCK_B, CodeGeneration::INITIAL))
-                .expect("target diagnostic routes");
-
-            assert_ne!(routes_b.fallthrough, routes_b.direct);
-            assert_ne!(routes_b.direct, routes_b.indirect);
-            let installed_a = read_words(entry_a, branch_words.len() * 4);
-            let slot_index = (link.slot.get() / 4) as usize;
-            let expected_branch = encode_aarch64_direct_branch(
-                cache::LinkSite {
-                    source: entry_a,
-                    slot: link.slot,
-                },
-                routes_b.direct,
-            )
-            .expect("encode diagnostic direct route");
-            assert_eq!(
-                installed_a[slot_index], expected_branch,
-                "patched direct link must land only at the direct route copy"
-            );
-            let snapshot = installed
-                .translator
-                .code_snapshot()
-                .expect("replayed route snapshot");
-            assert!(
-                snapshot.trusted_routes.iter().all(|route| {
-                    route.origin == crate::translator::TrustedRouteOrigin::UnitReplay
-                }),
-                "every installed route must retain its unit-replay origin"
-            );
-        }
-
-        #[test]
-        fn diagnostic_flavor_one_publication_uses_only_the_indirect_copy() {
-            let memory = NativeMappedMemory::shared_install_test_fixture(4096);
-            let (target, _native_target, _target_words) = record_candidate_with_route_split(
-                &memory,
-                &syscall_plan(BLOCK_B),
-                emit::TrustedRouteSplit::Enabled,
-            );
-            let installed = attach_and_replay_all_with_route_split(
-                &memory,
-                vec![target],
-                emit::TrustedRouteSplit::Enabled,
-            )
-            .expect("replay diagnostic target");
-            let process = Arc::new(installed.translator);
-            let (entry, routes) = {
-                let state = process.state.read();
-                (
-                    *state
-                        .blocks
-                        .get(&(BLOCK_B, CodeGeneration::INITIAL))
-                        .expect("installed target block"),
-                    *state
-                        .trusted_route_entries
-                        .get(&(BLOCK_B, CodeGeneration::INITIAL))
-                        .expect("target diagnostic routes"),
-                )
-            };
-            let translated = crate::translator::TranslationResult {
-                entry,
-                generation: CodeGeneration::INITIAL,
-                outcome: crate::translator::TranslationOutcome::SharedUnit,
-                emitted_bytes: 0,
-                cache_used_bytes: 0,
-            };
-            let mut thread = crate::translator::ThreadTranslator::for_process(process, 17);
-            thread
-                .publish_indirect_target(&memory, BLOCK_B, &translated)
-                .expect("publish flavor-1 target");
-            let (_tagged_generation, _generation_atomic, trusted_code) = thread
-                .indirect_cache
-                .entry_snapshot(BLOCK_B)
-                .expect("published indirect cache entry");
-            assert_eq!(
-                trusted_code,
-                routes.indirect.host().raw() as u64,
-                "flavor-1 cache must publish only the indirect route copy"
-            );
         }
 
         #[test]

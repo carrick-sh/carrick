@@ -50,28 +50,6 @@ pub(crate) fn run_debug(command: DebugCommand) -> anyhow::Result<()> {
         } => {
             crate::debug_census::run_xlat_census(&dir, top, processes_observed)?;
         }
-        DebugCommand::TrustedRouteCensus {
-            trace,
-            capture,
-            snapshots,
-            jit_share,
-            output,
-        } => crate::debug_trusted_route::run_trusted_route_census(
-            &trace,
-            &capture,
-            &snapshots,
-            jit_share,
-            output.as_deref(),
-        )?,
-        DebugCommand::TrustedRouteCapture {
-            evidence_dir,
-            jit_share,
-            command,
-        } => crate::debug_trusted_route::run_trusted_route_capture(
-            &evidence_dir,
-            jit_share,
-            &command,
-        )?,
         DebugCommand::DecodeEsr { syndrome } => {
             let stripped = syndrome.trim();
             let value = if let Some(hex) = stripped

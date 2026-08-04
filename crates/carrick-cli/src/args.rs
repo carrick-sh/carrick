@@ -796,8 +796,7 @@ pub(crate) enum Commands {
         /// Run one of Carrick's bounded, machine-readable DSR profiles.
         #[arg(long, value_enum, conflicts_with = "script")]
         profile: Option<TraceProfileKind>,
-        /// Atomically publish the parsed profile. Generic profiles use
-        /// versioned JSONL; trusted-route uses one versioned JSON receipt.
+        /// Atomically publish the parsed profile as versioned JSONL.
         #[arg(long, value_name = "FILE", requires = "profile")]
         summary_jsonl: Option<std::path::PathBuf>,
         /// Write DTrace events + aggregations to this file instead of stdout.
@@ -936,38 +935,6 @@ pub(crate) enum DebugCommand {
         /// `CARRICK_DSR_PROFILE`'s main-thread eras are counted the same way.
         #[arg(long = "processes-observed")]
         processes_observed: Option<u64>,
-    },
-    /// Validate a lossless trusted-entry route trace against atomic retirement
-    /// snapshots and export route residency plus projected total-CPU shares.
-    TrustedRouteCensus {
-        /// Raw `carrick trace --profile trusted-route` output.
-        #[arg(long)]
-        trace: PathBuf,
-        /// The matching `carrick.trusted-route-capture.v1` receipt.
-        #[arg(long)]
-        capture: PathBuf,
-        /// Directory containing v2 snapshot JSON commit markers and `.bin`s.
-        #[arg(long)]
-        snapshots: PathBuf,
-        /// Receipt-bound fraction of total CPU attributed to emitted JIT code.
-        #[arg(long = "jit-share")]
-        jit_share: f64,
-        /// Atomically publish the report here instead of writing it to stdout.
-        #[arg(long)]
-        output: Option<PathBuf>,
-    },
-    /// Populate an isolated diagnostic translation store, run the same native
-    /// workload under the trusted-route profile, and export a validated census.
-    TrustedRouteCapture {
-        /// Fresh evidence root. Its `store` child must be absent or empty.
-        #[arg(long = "evidence-dir")]
-        evidence_dir: PathBuf,
-        /// Receipt-bound fraction of total CPU attributed to emitted JIT code.
-        #[arg(long = "jit-share")]
-        jit_share: f64,
-        /// Carrick workload beginning with `run`, supplied after `--`.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
-        command: Vec<String>,
     },
     /// Decode an AArch64 ESR_EL1 value into its exception class, IL, ISS
     /// (with DFSC for data aborts) so the operator doesn't have to hand-
@@ -1195,60 +1162,6 @@ mod tests {
             ])
             .is_ok(),
             "timeout diagnostics need a standalone snapshot command"
-        );
-    }
-
-    #[test]
-    fn trusted_route_census_requires_all_evidence_inputs() {
-        assert!(
-            Cli::try_parse_from([
-                "carrick",
-                "debug",
-                "trusted-route-census",
-                "--trace",
-                "/tmp/trace.raw",
-                "--capture",
-                "/tmp/capture.json",
-                "--snapshots",
-                "/tmp/snapshots",
-                "--jit-share",
-                "0.46505",
-                "--output",
-                "/tmp/report.json",
-            ])
-            .is_ok()
-        );
-        assert!(
-            Cli::try_parse_from([
-                "carrick",
-                "debug",
-                "trusted-route-census",
-                "--trace",
-                "/tmp/trace.raw",
-            ])
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn trusted_route_capture_requires_an_evidence_root_and_run_workload() {
-        assert!(
-            Cli::try_parse_from([
-                "carrick",
-                "debug",
-                "trusted-route-capture",
-                "--evidence-dir",
-                "/tmp/evidence",
-                "--jit-share",
-                "0.46505",
-                "--",
-                "run",
-                "--exec-backend",
-                "native",
-                "ubuntu:24.04",
-                "true",
-            ])
-            .is_ok()
         );
     }
 }

@@ -117,7 +117,6 @@ pub struct EmittedBlock {
     /// links may target it because eager link severing (Phase 2a)
     /// invalidates links when their target's page bumps.
     trusted_entry: Option<CacheOffset>,
-    trusted_routes: Option<TrustedRouteOffsets>,
 }
 
 struct AssembledBlock {
@@ -131,182 +130,10 @@ struct AssembledBlock {
     direct_links: Vec<DirectLink>,
     recovery: Vec<RecoveryEntry>,
     trusted_entry: Option<CacheOffset>,
-    trusted_routes: Option<TrustedRouteOffsets>,
 }
 
 fn direct_instruction_bytes_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("0"))
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TrustedRouteSplit {
-    Disabled,
-    Enabled,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TrustedRouteOffsets {
-    pub fallthrough: CacheOffset,
-    pub direct: CacheOffset,
-    pub indirect: CacheOffset,
-    pub sequence_bytes: u32,
-    pub common_body: CacheOffset,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TrustedSequenceWords {
-    words: [u32; 6],
-    len: u8,
-}
-
-impl TrustedSequenceWords {
-    pub(crate) fn as_slice(&self) -> &[u32] {
-        &self.words[..usize::from(self.len)]
-    }
-
-    pub(crate) fn byte_len(self) -> u32 {
-        u32::from(self.len) * 4
-    }
-}
-
-/// The words every trusted arrival must execute before the common guest body.
-///
-/// Keep this allocation-free: the normal production emitter calls the same
-/// helper once per translated block, while diagnostic replay uses its literal
-/// result as the independent equality oracle for all three spans.
-pub(crate) fn trusted_sequence_words(expected: CodeGeneration) -> TrustedSequenceWords {
-    let mut words = [0_u32; 6];
-    let mut len = 0_usize;
-    let mut value = expected.get();
-    words[len] = 0xd280_0011 | (((value & 0xffff) as u32) << 5);
-    len += 1;
-    let mut halfword = 1_u32;
-    value >>= 16;
-    while value != 0 {
-        let half = (value & 0xffff) as u32;
-        if half != 0 {
-            words[len] = 0xf280_0011 | (halfword << 21) | (half << 5);
-            len += 1;
-        }
-        value >>= 16;
-        halfword += 1;
-    }
-    words[len] = 0xf900_0000 | ((super::gateway::CTX_GENERATION / 8) << 10) | (28 << 5) | 17;
-    len += 1;
-    words[len] = 0xf940_0000 | ((1128 / 8) << 10) | (28 << 5) | 17;
-    len += 1;
-    TrustedSequenceWords {
-        words,
-        len: len as u8,
-    }
-}
-
-fn trusted_route_split_from(value: Option<&std::ffi::OsStr>) -> TrustedRouteSplit {
-    if value == Some(std::ffi::OsStr::new("1")) {
-        TrustedRouteSplit::Enabled
-    } else {
-        TrustedRouteSplit::Disabled
-    }
-}
-
-pub(crate) fn trusted_route_split_enabled() -> TrustedRouteSplit {
-    static MODE: std::sync::OnceLock<TrustedRouteSplit> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| {
-        trusted_route_split_from(std::env::var_os("CARRICK_DSR_TRUSTED_ROUTE_SPLIT").as_deref())
-    })
-}
-
-pub(crate) fn derive_trusted_route_offsets(
-    words: &[u32],
-    trusted_offset: u32,
-    expected: CodeGeneration,
-    mode: TrustedRouteSplit,
-) -> Result<Option<TrustedRouteOffsets>, DsrError> {
-    if mode == TrustedRouteSplit::Disabled {
-        return Ok(None);
-    }
-    if !trusted_offset.is_multiple_of(4) {
-        return Err(DsrError::CachePolicy(format!(
-            "trusted route offset {trusted_offset} is not instruction aligned"
-        )));
-    }
-    let sequence = trusted_sequence_words(expected);
-    let sequence_bytes = sequence.byte_len();
-    let stride = sequence_bytes
-        .checked_add(4)
-        .ok_or_else(|| DsrError::CachePolicy("trusted route stride overflow".to_string()))?;
-    let direct_offset = trusted_offset
-        .checked_add(stride)
-        .ok_or_else(|| DsrError::CachePolicy("trusted direct offset overflow".to_string()))?;
-    let indirect_offset =
-        trusted_offset
-            .checked_add(stride.checked_mul(2).ok_or_else(|| {
-                DsrError::CachePolicy("trusted indirect stride overflow".to_string())
-            })?)
-            .ok_or_else(|| DsrError::CachePolicy("trusted indirect offset overflow".to_string()))?;
-    let common_body_offset = trusted_offset
-        .checked_add(stride.checked_mul(3).ok_or_else(|| {
-            DsrError::CachePolicy("trusted common-body stride overflow".to_string())
-        })?)
-        .ok_or_else(|| DsrError::CachePolicy("trusted common-body offset overflow".to_string()))?;
-    let code_bytes = u32::try_from(words.len().saturating_mul(4)).map_err(|_| {
-        DsrError::CachePolicy("trusted route code length does not fit u32".to_string())
-    })?;
-    if common_body_offset >= code_bytes {
-        return Err(DsrError::CachePolicy(format!(
-            "trusted route common body {common_body_offset} is outside {code_bytes} code bytes"
-        )));
-    }
-
-    for (name, start) in [
-        ("fallthrough", trusted_offset),
-        ("direct", direct_offset),
-        ("indirect", indirect_offset),
-    ] {
-        let start_index = usize::try_from(start / 4)
-            .map_err(|_| DsrError::CachePolicy("trusted route index overflow".to_string()))?;
-        let end_index = start_index
-            .checked_add(sequence.as_slice().len())
-            .ok_or_else(|| DsrError::CachePolicy("trusted route span overflow".to_string()))?;
-        let actual = words.get(start_index..end_index).ok_or_else(|| {
-            DsrError::CachePolicy(format!("trusted {name} route sequence is outside code"))
-        })?;
-        if actual != sequence.as_slice() {
-            return Err(DsrError::CachePolicy(format!(
-                "trusted route sequences differ at {name}"
-            )));
-        }
-        let branch = *words.get(end_index).ok_or_else(|| {
-            DsrError::CachePolicy(format!("trusted {name} route branch is outside code"))
-        })?;
-        if branch & 0xfc00_0000 != 0x1400_0000 {
-            return Err(DsrError::CachePolicy(format!(
-                "trusted {name} route has no unconditional branch"
-            )));
-        }
-        let signed_words = (((branch & 0x03ff_ffff) << 6) as i32 >> 6) as i64;
-        let target_index = i64::try_from(end_index)
-            .ok()
-            .and_then(|index| index.checked_add(signed_words))
-            .and_then(|index| usize::try_from(index).ok())
-            .ok_or_else(|| {
-                DsrError::CachePolicy(format!("trusted {name} branch target overflow"))
-            })?;
-        if target_index != common_body_offset as usize / 4 {
-            return Err(DsrError::CachePolicy(format!(
-                "trusted {name} route branch targets byte {}, expected {common_body_offset}",
-                target_index.saturating_mul(4)
-            )));
-        }
-    }
-
-    Ok(Some(TrustedRouteOffsets {
-        fallthrough: CacheOffset::published(trusted_offset),
-        direct: CacheOffset::published(direct_offset),
-        indirect: CacheOffset::published(indirect_offset),
-        sequence_bytes,
-        common_body: CacheOffset::published(common_body_offset),
-    }))
 }
 
 /// Publish dynasm's byte stream directly by default. The old `Vec<u32>`
@@ -347,7 +174,6 @@ impl AssembledBlock {
             direct_links: self.direct_links,
             recovery: self.recovery,
             trusted_entry: self.trusted_entry,
-            trusted_routes: self.trusted_routes,
         })
     }
 }
@@ -612,7 +438,6 @@ impl EmittedBlock {
         direct_links: Vec<DirectLink>,
         recovery: Vec<RecoveryEntry>,
         trusted_entry: Option<CacheOffset>,
-        trusted_routes: Option<TrustedRouteOffsets>,
     ) -> Result<Self, DsrError> {
         Ok(Self {
             code,
@@ -622,7 +447,6 @@ impl EmittedBlock {
             // Recorded templates carry the native trusted entry (replay
             // validates the baked expected generation before honoring it).
             trusted_entry,
-            trusted_routes,
         })
     }
 
@@ -630,10 +454,6 @@ impl EmittedBlock {
     /// has one (Absolute-guarded blocks, native or replayed).
     pub const fn trusted_entry(&self) -> Option<CacheOffset> {
         self.trusted_entry
-    }
-
-    pub const fn trusted_routes(&self) -> Option<TrustedRouteOffsets> {
-        self.trusted_routes
     }
 
     pub const fn entry(&self) -> CacheVa {
@@ -4553,24 +4373,7 @@ pub fn emit_block_with_generation(
     guard: GenerationGuard,
     mode: EmitAddressMode,
 ) -> Result<EmittedBlock, DsrError> {
-    emit_block_with_generation_and_route_split(
-        cache,
-        plan,
-        guard,
-        mode,
-        trusted_route_split_enabled(),
-    )
-}
-
-pub(crate) fn emit_block_with_generation_and_route_split(
-    cache: &mut TranslationCache,
-    plan: &BlockPlan,
-    guard: GenerationGuard,
-    mode: EmitAddressMode,
-    route_split: TrustedRouteSplit,
-) -> Result<EmittedBlock, DsrError> {
-    assemble_block_inner_with_route_split(plan, Some(guard), mode, None, route_split)?
-        .publish(cache)
+    assemble_block_inner(plan, Some(guard), mode, None)?.publish(cache)
 }
 
 pub fn emit_block_recording_artifact(
@@ -4580,32 +4383,8 @@ pub fn emit_block_recording_artifact(
     mode: EmitAddressMode,
     source_words: Vec<u32>,
 ) -> Result<(EmittedBlock, ArtifactRecord), DsrError> {
-    emit_block_recording_artifact_with_route_split(
-        cache,
-        plan,
-        guard,
-        mode,
-        source_words,
-        trusted_route_split_enabled(),
-    )
-}
-
-pub(crate) fn emit_block_recording_artifact_with_route_split(
-    cache: &mut TranslationCache,
-    plan: &BlockPlan,
-    guard: GenerationGuard,
-    mode: EmitAddressMode,
-    source_words: Vec<u32>,
-    route_split: TrustedRouteSplit,
-) -> Result<(EmittedBlock, ArtifactRecord), DsrError> {
-    let (emitted, artifact) = emit_block_recording_artifact_optional_with_route_split(
-        cache,
-        plan,
-        guard,
-        mode,
-        source_words,
-        route_split,
-    )?;
+    let (emitted, artifact) =
+        emit_block_recording_artifact_optional(cache, plan, guard, mode, source_words)?;
     let artifact = artifact.ok_or_else(|| {
         DsrError::CachePolicy("emitted block was ineligible for artifact recording".to_string())
     })?;
@@ -4619,35 +4398,11 @@ pub fn emit_block_recording_artifact_optional(
     mode: EmitAddressMode,
     source_words: Vec<u32>,
 ) -> Result<(EmittedBlock, Option<ArtifactRecord>), DsrError> {
-    emit_block_recording_artifact_optional_with_route_split(
-        cache,
-        plan,
-        guard,
-        mode,
-        source_words,
-        trusted_route_split_enabled(),
-    )
-}
-
-pub(crate) fn emit_block_recording_artifact_optional_with_route_split(
-    cache: &mut TranslationCache,
-    plan: &BlockPlan,
-    guard: GenerationGuard,
-    mode: EmitAddressMode,
-    source_words: Vec<u32>,
-    route_split: TrustedRouteSplit,
-) -> Result<(EmittedBlock, Option<ArtifactRecord>), DsrError> {
     let mut recording = ArtifactRecording::default();
     if let EmitAddressMode::Biased { host_bias } = mode {
         recording.bind(ProcessValue::HostBias, host_bias.get())?;
     }
-    let assembled = assemble_block_inner_with_route_split(
-        plan,
-        Some(guard),
-        mode,
-        Some(&mut recording),
-        route_split,
-    )?;
+    let assembled = assemble_block_inner(plan, Some(guard), mode, Some(&mut recording))?;
     let artifact = recording
         .finish(
             assembled.instruction_words(),
@@ -5497,27 +5252,7 @@ fn assemble_block_inner(
     plan: &BlockPlan,
     guard: Option<GenerationGuard>,
     mode: EmitAddressMode,
-    recording: Option<&mut ArtifactRecording>,
-) -> Result<AssembledBlock, DsrError> {
-    assemble_block_inner_with_route_split(
-        plan,
-        guard,
-        mode,
-        recording,
-        trusted_route_split_enabled(),
-    )
-}
-
-#[allow(
-    clippy::needless_option_as_deref,
-    reason = "block lowering reborrows optional recording across independent emission paths"
-)]
-fn assemble_block_inner_with_route_split(
-    plan: &BlockPlan,
-    guard: Option<GenerationGuard>,
-    mode: EmitAddressMode,
     mut recording: Option<&mut ArtifactRecording>,
-    route_split: TrustedRouteSplit,
 ) -> Result<AssembledBlock, DsrError> {
     let mut assembler = VecAssembler::<Aarch64Relocation>::new(0);
     // Count the fused segments too: a superblock maps several segments' worth
@@ -5541,7 +5276,6 @@ fn assemble_block_inner_with_route_split(
     // entry, against one per GATEWAY entry now, and a direct-linked chain runs
     // many blocks per gateway entry.
     let mut trusted_entry: Option<CacheOffset> = None;
-    let mut trusted_routes: Option<TrustedRouteOffsets> = None;
     let lean_guard = lean_generation_guard_enabled();
     let stale = guard.map(|_| assembler.new_dynamic_label());
     if !lean_guard {
@@ -5739,50 +5473,45 @@ fn assemble_block_inner_with_route_split(
         // edges land past the guard exactly like native code. The entry's
         // narrow materialization bakes `expected` in, so the recording
         // carries the value and replay refuses a different generation.
-        let expected = guard.expected;
-        let offset = current_offset(&assembler)?;
-        trusted_entry = Some(offset);
-        if let Some(recording) = recording.as_deref_mut() {
-            recording.record_trusted_entry(offset, expected.get())?;
-        }
-        let sequence = trusted_sequence_words(expected);
-        match route_split {
-            TrustedRouteSplit::Disabled => {
-                for &word in sequence.as_slice() {
-                    emit_word(&mut assembler, &mut entries, plan.start, word)?;
-                }
+        {
+            let expected = guard.expected;
+            let offset = current_offset(&assembler)?;
+            trusted_entry = Some(offset);
+            if let Some(recording) = recording.as_deref_mut() {
+                recording.record_trusted_entry(offset, expected.get())?;
             }
-            TrustedRouteSplit::Enabled => {
-                let common_body = assembler.new_dynamic_label();
-                let mut starts = [None; 3];
-                for start in &mut starts {
-                    *start = Some(current_offset(&assembler)?);
-                    for &word in sequence.as_slice() {
-                        emit_word(&mut assembler, &mut entries, plan.start, word)?;
-                    }
-                    map_next(&assembler, &mut entries, plan.start)?;
-                    dynasmrt::dynasm!(assembler
-                        ; .arch aarch64
-                        ; b =>common_body
-                    );
+            let mut value = expected.get();
+            emit_word(
+                &mut assembler,
+                &mut entries,
+                plan.start,
+                0xd280_0011 | (((value & 0xffff) as u32) << 5),
+            )?;
+            let mut hw = 1_u32;
+            value >>= 16;
+            while value != 0 {
+                let half = (value & 0xffff) as u32;
+                if half != 0 {
+                    emit_word(
+                        &mut assembler,
+                        &mut entries,
+                        plan.start,
+                        0xf280_0011 | (hw << 21) | (half << 5),
+                    )?;
                 }
-                dynasmrt::dynasm!(assembler
-                    ; .arch aarch64
-                    ; =>common_body
-                );
-                let common_body = current_offset(&assembler)?;
-                let [Some(fallthrough), Some(direct), Some(indirect)] = starts else {
-                    unreachable!("fixed trusted-route cardinality")
-                };
-                trusted_routes = Some(TrustedRouteOffsets {
-                    fallthrough,
-                    direct,
-                    indirect,
-                    sequence_bytes: sequence.byte_len(),
-                    common_body,
-                });
+                value >>= 16;
+                hw += 1;
             }
         }
+        // A direct-linked chain can enter the gateway from a different block
+        // than the one that began this translated run. Publish this block's
+        // generation so sensitive-exit metadata is resolved against the block
+        // that actually produced the exit.
+        map_next(&assembler, &mut entries, plan.start)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; str x17, [x28, super::gateway::CTX_GENERATION]
+        );
         let guard_end = current_offset(&assembler)?;
         for offset in (guard_start.get()..guard_end.get()).step_by(4) {
             recovery.push(RecoveryEntry {
@@ -5791,7 +5520,7 @@ fn assemble_block_inner_with_route_split(
             });
         }
     }
-    if lean_guard && guard.is_none() {
+    if lean_guard {
         // x17 is the internal indirect-edge register, and the guard above
         // spends it. Its guest value is saved at every block exit and is
         // restored here, before the first guest instruction executes.
@@ -6579,7 +6308,6 @@ fn assemble_block_inner_with_route_split(
     let map = InstructionMap::new(entries)?;
     Ok(AssembledBlock {
         trusted_entry,
-        trusted_routes,
         instruction_bytes: bytes,
         #[cfg(test)]
         words,
@@ -7111,30 +6839,6 @@ mod tests {
         )));
     }
 
-    /// A typo or inherited truthy spelling must never perturb production
-    /// emission. Only the documented exact value may select the diagnostic
-    /// three-route shape.
-    #[test]
-    fn trusted_route_split_requires_exact_one() {
-        assert_eq!(trusted_route_split_from(None), TrustedRouteSplit::Disabled);
-        assert_eq!(
-            trusted_route_split_from(Some(std::ffi::OsStr::new("0"))),
-            TrustedRouteSplit::Disabled
-        );
-        assert_eq!(
-            trusted_route_split_from(Some(std::ffi::OsStr::new("true"))),
-            TrustedRouteSplit::Disabled
-        );
-        assert_eq!(
-            trusted_route_split_from(Some(std::ffi::OsStr::new("01"))),
-            TrustedRouteSplit::Disabled
-        );
-        assert_eq!(
-            trusted_route_split_from(Some(std::ffi::OsStr::new("1"))),
-            TrustedRouteSplit::Enabled
-        );
-    }
-
     fn copy_plan() -> BlockPlan {
         BlockPlan {
             start: GuestVa(0x4000),
@@ -7382,102 +7086,6 @@ mod tests {
             "trusted entry words: {:#010x?}",
             &assembled.words[index..(index + 4).min(assembled.words.len())]
         );
-    }
-
-    /// The disabled arm is the production contract, not merely a semantic
-    /// equivalent: it must preserve the exact trusted-entry words and expose
-    /// no diagnostic geometry.
-    #[test]
-    fn disabled_trusted_route_split_preserves_the_one_entry_shape() {
-        let generation = std::sync::atomic::AtomicU64::new(7);
-        let assembled = assemble_block_inner_with_route_split(
-            &copy_plan(),
-            Some(GenerationGuard::new(
-                &generation,
-                CodeGeneration::claimed(7),
-            )),
-            EmitAddressMode::Direct,
-            None,
-            TrustedRouteSplit::Disabled,
-        )
-        .expect("assemble normal trusted-entry block");
-        let offset = assembled
-            .trusted_entry
-            .expect("private absolute-guarded block has a trusted entry");
-        let index = offset.get() as usize / 4;
-        assert_eq!(
-            &assembled.words[index..index + 3],
-            &[0xd280_00f1, 0xf902_3f91, 0xf942_3791]
-        );
-        assert_eq!(assembled.trusted_routes, None);
-    }
-
-    /// Route attribution is carried entirely by PC residency: every arrival
-    /// pays the same trusted words and one branch to the same body, so no hot
-    /// counter or probe can bias one route relative to another.
-    #[test]
-    fn enabled_trusted_route_split_emits_equal_sequences_and_recovery() {
-        for (generation, expected_sequence_words) in [
-            (CodeGeneration::INITIAL, 3_usize),
-            (CodeGeneration::claimed(7), 3),
-            (CodeGeneration::claimed(0x1_0000), 4),
-            (CodeGeneration::claimed(0x1_0000_0001), 4),
-        ] {
-            let current = std::sync::atomic::AtomicU64::new(generation.get());
-            let assembled = assemble_block_inner_with_route_split(
-                &copy_plan(),
-                Some(GenerationGuard::new(&current, generation)),
-                EmitAddressMode::Direct,
-                None,
-                TrustedRouteSplit::Enabled,
-            )
-            .expect("assemble diagnostic trusted-entry block");
-            let routes = assembled.trusted_routes.expect("diagnostic route geometry");
-            assert_eq!(
-                assembled.trusted_entry,
-                Some(routes.fallthrough),
-                "the existing wire offset remains the first route"
-            );
-            assert_eq!(routes.sequence_bytes as usize, expected_sequence_words * 4);
-
-            let sequence_words = routes.sequence_bytes as usize / 4;
-            let starts = [routes.fallthrough, routes.direct, routes.indirect]
-                .map(|offset| offset.get() as usize / 4);
-            let first = &assembled.words[starts[0]..starts[0] + sequence_words];
-            assert_eq!(
-                first,
-                &assembled.words[starts[1]..starts[1] + sequence_words]
-            );
-            assert_eq!(
-                first,
-                &assembled.words[starts[2]..starts[2] + sequence_words]
-            );
-
-            for start in starts {
-                let branch_index = start + sequence_words;
-                let branch = assembled.words[branch_index];
-                assert_eq!(branch & 0xfc00_0000, 0x1400_0000, "not an AArch64 B");
-                let signed_words = (((branch & 0x03ff_ffff) << 6) as i32 >> 6) as isize;
-                assert_eq!(
-                    (branch_index as isize + signed_words) as usize,
-                    routes.common_body.get() as usize / 4,
-                    "route branch must land at the common body"
-                );
-            }
-
-            for byte_offset in (routes.fallthrough.get()..routes.common_body.get()).step_by(4) {
-                let action = assembled
-                    .recovery
-                    .iter()
-                    .find(|entry| entry.cache.get() == byte_offset)
-                    .map(|entry| entry.action);
-                assert_eq!(
-                    action,
-                    Some(RecoveryAction::RestoreGuestX17),
-                    "diagnostic word at byte {byte_offset} lacks x17 recovery"
-                );
-            }
-        }
     }
 
     /// Recording is a pure tap, never a second emission mode: recording the

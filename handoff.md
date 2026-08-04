@@ -1,7 +1,8 @@
 # Native-lane performance: state of play
 
 **Date:** 2026-08-03 · **Branch:** `codex/native-store-default` · **Latest
-implementation decision:** rejected augmentation cleanup `291359b4` ·
+implementation decision:** stop trusted-entry route work; no route clears the
+10% opportunity gate ·
 **Scope:** Darwin/aarch64 native backend (`--exec-backend native`, the shipped
 default). VMM is explicitly NOT the target: one process per VM against a
 ~127-VM macOS ceiling makes it a dead end for build-shaped workloads.
@@ -45,6 +46,16 @@ eight-quad same-binary ABBA measured child CPU ratio **1.0728**, paired 95%
 interval **[1.0653, 1.0806]**, and workload-wall ratio **1.2786**. The candidate
 lost every quad, so it and its temporary controls were removed. Full evidence:
 [`docs/perf-results/2026-08-03-native-store-monotonic-augmentation.md`](docs/perf-results/2026-08-03-native-store-monotonic-augmentation.md).
+
+The approved trusted-entry route attribution is now complete. Two independent,
+naturally completed 997 Hz captures agreed within 0.1703 percentage points on
+the dominant route. Direct arrival projects to only 4.17% of total CPU;
+indirect arrival to 3.77%; even removing all three route copies projects to
+only 7.96%. All samples joined to exact JIT ranges, both native-emitted and
+persistent-unit replay origins were observed, and all DTrace drop/error counts
+were zero. The route line is therefore stopped without a production candidate.
+Full evidence:
+[`docs/perf-results/2026-08-03-trusted-entry-route-attribution.md`](docs/perf-results/2026-08-03-trusted-entry-route-attribution.md).
 
 ## What landed (2026-08-02/03, six waves, all merged with `just ci` green)
 
@@ -98,17 +109,14 @@ state. Same-binary regression screens and an official ratio refresh were
 intentionally skipped: a candidate that already regresses the primary workload
 cannot be rescued by secondary screens.
 
-1. **Finish the approved trusted-entry route attribution before selecting a
-   fix.** Current-default DTrace requalification is complete: JIT execution is
-   46.505% of total CPU; context loads/stores are 34.3% of matched emitted
-   instructions (a separate-run projection of 15.95% total CPU); and the
-   generation-materialize/publish/guest-x17-reload sequence is 26.23% of
-   matched emitted instructions (projected 12.2% total CPU). Its three arrival
-   routes are still conflated. The diagnostic design is committed at
-   [`docs/superpowers/specs/2026-08-03-trusted-entry-route-attribution-design.md`](docs/superpowers/specs/2026-08-03-trusted-entry-route-attribution-design.md)
-   and awaits written-spec review before its TDD implementation plan. Use
-   LLDB/core evidence for any crash or silent process loss. Pursue only a
-   freshly measured >=10% end-to-end opportunity.
+1. **Attribute process exec/exit amplification without traced timing.** Add
+   Rust-owned lifecycle counters whose export is opt-in and measure them on
+   both the cold build and the 20-exec workload. Bind counts to source, signed
+   binary, workload, store, and successful completion receipts; pursue a
+   production change only if the measured amplification supports a >=10%
+   end-to-end opportunity. If either workload crashes or silently loses a
+   process, stop timing interpretation and use `carrick debug lldb-run` or a
+   saved core plus the exported always-on event ring as authority.
 2. **Keep eager full translation as a deferred future design, not the next
    patch.** Translating a complete eligible image once up front could amortize
    publication and avoid the losing per-process merge path measured here. It
@@ -122,23 +130,19 @@ cannot be rescued by secondary screens.
 
 ## Confidence
 
-- **Very high (99%):** monotonic augmentation as implemented is an end-to-end
-  regression. Same binary, identical restored seed, eight counterbalanced
-  quads, 0/8 wins, and the entire paired CPU interval is above 1.0.
-- **High (97%):** the causal tradeoff is understood. System CPU improved 7.2%,
-  but user CPU regressed 13.1%; the reconciled publication counters measured
-  the work that overwhelms the translation savings.
+- **Very high (99%):** the two trusted-route captures are lossless and fully
+  joined: all drop/error/coverage counters are zero, exact JIT bounds resolve
+  every sample, and both workloads reached `BUILD_OK`.
+- **High (97%):** trusted-route shares are stable. The same route dominates and
+  differs by only 0.1703 percentage points across independent stores.
+- **High (95%):** no trusted-entry route supports a >=10% total-CPU candidate.
+  The largest is 4.17%, and even all three together project to only 7.96%.
 - **High (95%):** the official shipped-default result remains 10.4446x. No
   rejected candidate code is retained and no projection was substituted for a
   fresh Carrick/Docker run.
-- **High (95%):** emitted JIT execution is the largest freshly measured CPU
-  bucket at 46.505% of all build CPU.
-- **High (85%):** the common trusted-entry sequence is a specific hotspot at
-  26.23% of matched JIT samples, projected at 12.2% total CPU. This is a
-  separate-run projection, not timing.
-- **Medium (60%):** one arrival route supports a >=10% end-to-end production
-  candidate. The route split exists to replace this uncertainty with measured
-  shares before changing semantics.
+- **Medium (70%):** process exec/exit amplification is the best next measured
+  target. The 20-exec spread is 72.16x, but its contribution to the cold build
+  still needs direct untraced counter evidence before any fix is selected.
 
 ## Discipline that earned its keep (do not relearn these)
 
@@ -163,9 +167,11 @@ cannot be rescued by secondary screens.
 
 ## Branch state at handoff
 
-`291359b4` is the narrow rejection cleanup; `5b89272b` is the approved
-diagnostic design. The current-default spread evidence and this handoff update
-are the only subsequent source changes. Nothing has been pushed and local
-`main` has not moved. Target-only raw ABBA, mechanism, signed-binary, store,
-attribution, and scoreboard receipts remain under `target/perf/` and are
-intentionally not committed.
+`d8856374` is the source and signed-binary authority for the two accepted route
+captures; the subsequent decision cleanup removes the route-copy emitter,
+routing, snapshot, and capture/census CLI while restoring the three production
+codegen files byte-for-byte to `030c0e8c`. The stricter exact-JIT DTrace script
+is retained as a durable diagnostic artifact. Nothing has been pushed and
+local `main` has not moved. Target-only raw ABBA, mechanism, signed-binary,
+store, attribution, and scoreboard receipts remain under `target/perf/` and
+are intentionally not committed.
