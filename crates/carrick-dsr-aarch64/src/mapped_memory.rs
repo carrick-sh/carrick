@@ -262,12 +262,21 @@ impl NativeMemoryHandle {
     /// `NativeMemoryConfig`'s doc comment. Returns a cheap `Arc` clone (a
     /// refcount bump, not a copy of the ranges); the caller can then read
     /// the ranges without holding ANY lock at all. Only exercised directly
-    /// by tests today (`biased_guest_fault_address`, below, is the
-    /// production caller); kept `pub` as the general-purpose
-    /// lock-free accessor future hot-path callers should reach for.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// by the once-per-image native diagnostics handoff and by
+    /// `biased_guest_fault_address`; both consumers see the same immutable
+    /// snapshot that exec replaces wholesale.
     pub fn owned_host_ranges(&self) -> Arc<Vec<std::ops::Range<carrick_guest_mem::HostVa>>> {
         Arc::clone(&self.config.read().owned_host_ranges)
+    }
+
+    /// Atomically snapshots the exact host-page geometry and owned ranges for
+    /// once-per-image diagnostics. Reading both fields under one config guard
+    /// prevents an exec replacement from producing a mixed catalog.
+    pub fn owned_host_range_catalog(
+        &self,
+    ) -> (Arc<Vec<std::ops::Range<carrick_guest_mem::HostVa>>>, u64) {
+        let config = self.config.read();
+        (Arc::clone(&config.owned_host_ranges), config.host_page_size)
     }
 
     /// Reverse-translates a Biased-mode host fault address to its guest VA

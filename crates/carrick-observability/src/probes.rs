@@ -510,6 +510,178 @@ fn validate_translated_range(range: &Range<HostVa>) -> Result<(), TranslatedRang
     Ok(())
 }
 
+/// Rejected native-owned host-range identity or mapped extent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum NativeOwnedRangeError {
+    #[error("native-owned range epoch must be nonzero")]
+    ZeroEpoch,
+    #[error("native-owned range sequence must be nonzero")]
+    ZeroSequence,
+    #[error("native-owned range sequence overflow")]
+    SequenceOverflow,
+    #[error("native-owned range catalog must not be empty")]
+    EmptyCatalog,
+    #[error("native-owned range host page size must be a nonzero power of two")]
+    InvalidPageSize,
+    #[error("native-owned range is empty at 0x{address:x}")]
+    EmptyRange { address: usize },
+    #[error("native-owned range is reversed: 0x{start:x}..0x{end:x}")]
+    ReversedRange { start: usize, end: usize },
+    #[error(
+        "native-owned range is not host-page aligned: 0x{start:x}..0x{end:x} (page size {page_size})"
+    )]
+    UnalignedRange {
+        start: usize,
+        end: usize,
+        page_size: usize,
+    },
+    #[error(
+        "native-owned ranges overlap or are out of order: previous end 0x{previous_end:x}, next start 0x{next_start:x}"
+    )]
+    OverlappingRanges {
+        previous_end: usize,
+        next_start: usize,
+    },
+}
+
+/// Nonzero identity for one process-image native-owned range catalog.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeOwnedRangeEpoch(NonZeroU64);
+
+impl NativeOwnedRangeEpoch {
+    pub fn new(value: u64) -> Result<Self, NativeOwnedRangeError> {
+        NonZeroU64::new(value)
+            .map(Self)
+            .ok_or(NativeOwnedRangeError::ZeroEpoch)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Nonzero monotonically increasing identity for one catalog addition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeOwnedRangeSequence(NonZeroU64);
+
+impl NativeOwnedRangeSequence {
+    pub fn new(value: u64) -> Result<Self, NativeOwnedRangeError> {
+        NonZeroU64::new(value)
+            .map(Self)
+            .ok_or(NativeOwnedRangeError::ZeroSequence)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Reset the native-owned range catalog for one process-image epoch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeOwnedRangeReset {
+    epoch: NativeOwnedRangeEpoch,
+}
+
+impl NativeOwnedRangeReset {
+    pub const fn reset(epoch: NativeOwnedRangeEpoch) -> Self {
+        Self { epoch }
+    }
+
+    pub const fn epoch(self) -> NativeOwnedRangeEpoch {
+        self.epoch
+    }
+}
+
+/// Exact half-open host extent owned by the active native guest image.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeOwnedRange {
+    epoch: NativeOwnedRangeEpoch,
+    sequence: NativeOwnedRangeSequence,
+    range: Range<HostVa>,
+}
+
+impl NativeOwnedRange {
+    pub fn new(
+        epoch: NativeOwnedRangeEpoch,
+        sequence: NativeOwnedRangeSequence,
+        range: Range<HostVa>,
+        host_page_size: usize,
+    ) -> Result<Self, NativeOwnedRangeError> {
+        validate_native_owned_range(&range, host_page_size)?;
+        Ok(Self {
+            epoch,
+            sequence,
+            range,
+        })
+    }
+
+    pub const fn epoch(&self) -> NativeOwnedRangeEpoch {
+        self.epoch
+    }
+
+    pub const fn sequence(&self) -> NativeOwnedRangeSequence {
+        self.sequence
+    }
+
+    pub const fn range(&self) -> &Range<HostVa> {
+        &self.range
+    }
+}
+
+/// Close a complete, nonempty native-owned range catalog.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeOwnedRangeReady {
+    epoch: NativeOwnedRangeEpoch,
+    final_sequence: NonZeroU64,
+}
+
+impl NativeOwnedRangeReady {
+    pub fn ready(
+        epoch: NativeOwnedRangeEpoch,
+        final_sequence: u64,
+    ) -> Result<Self, NativeOwnedRangeError> {
+        let final_sequence =
+            NonZeroU64::new(final_sequence).ok_or(NativeOwnedRangeError::EmptyCatalog)?;
+        Ok(Self {
+            epoch,
+            final_sequence,
+        })
+    }
+
+    pub const fn epoch(self) -> NativeOwnedRangeEpoch {
+        self.epoch
+    }
+
+    pub const fn final_sequence(self) -> u64 {
+        self.final_sequence.get()
+    }
+}
+
+fn validate_native_owned_range(
+    range: &Range<HostVa>,
+    host_page_size: usize,
+) -> Result<(), NativeOwnedRangeError> {
+    if host_page_size == 0 || !host_page_size.is_power_of_two() {
+        return Err(NativeOwnedRangeError::InvalidPageSize);
+    }
+    let start = range.start.raw();
+    let end = range.end.raw();
+    if start == end {
+        return Err(NativeOwnedRangeError::EmptyRange { address: start });
+    }
+    if start > end {
+        return Err(NativeOwnedRangeError::ReversedRange { start, end });
+    }
+    if !start.is_multiple_of(host_page_size) || !end.is_multiple_of(host_page_size) {
+        return Err(NativeOwnedRangeError::UnalignedRange {
+            start,
+            end,
+            page_size: host_page_size,
+        });
+    }
+    Ok(())
+}
+
 dsr_ordinal_enum! {
     /// Typed reason a translated DSR run slice returned to Rust.
     pub enum DsrExitKind {
@@ -1469,6 +1641,77 @@ mod translated_range_probe_abi {
     }
 }
 
+#[cfg(test)]
+mod native_owned_range_probe_abi {
+    use super::*;
+
+    #[test]
+    fn native_owned_range_identity_and_extent_fail_closed() {
+        assert_eq!(
+            NativeOwnedRangeEpoch::new(0),
+            Err(NativeOwnedRangeError::ZeroEpoch)
+        );
+        assert_eq!(
+            NativeOwnedRangeSequence::new(0),
+            Err(NativeOwnedRangeError::ZeroSequence)
+        );
+
+        let epoch = NativeOwnedRangeEpoch::new(7).expect("nonzero epoch");
+        let sequence = NativeOwnedRangeSequence::new(2).expect("nonzero sequence");
+        for range in [
+            HostVa(0x4000)..HostVa(0x4000),
+            HostVa(0x8000)..HostVa(0x4000),
+            HostVa(0x4001)..HostVa(0x8000),
+            HostVa(0x4000)..HostVa(0x8001),
+        ] {
+            assert!(NativeOwnedRange::new(epoch, sequence, range, 0x4000).is_err());
+        }
+
+        let range = NativeOwnedRange::new(epoch, sequence, HostVa(0x4000)..HostVa(0xc000), 0x4000)
+            .expect("aligned nonempty range");
+        assert_eq!(range.epoch().get(), 7);
+        assert_eq!(range.sequence().get(), 2);
+        assert_eq!(range.range(), &(HostVa(0x4000)..HostVa(0xc000)));
+    }
+
+    #[test]
+    fn native_owned_range_ready_requires_the_exact_nonzero_frontier() {
+        let epoch = NativeOwnedRangeEpoch::new(9).expect("nonzero epoch");
+        assert_eq!(
+            NativeOwnedRangeReady::ready(epoch, 0),
+            Err(NativeOwnedRangeError::EmptyCatalog)
+        );
+        let ready = NativeOwnedRangeReady::ready(epoch, 3).expect("ready frontier");
+        assert_eq!(ready.epoch().get(), 9);
+        assert_eq!(ready.final_sequence(), 3);
+    }
+
+    #[test]
+    fn native_owned_range_wrappers_accept_only_typed_events() {
+        let _: fn(NativeOwnedRangeReset) = super::host_native_owned_range_reset;
+        let _: fn(NativeOwnedRange) = super::host_native_owned_range_add;
+        let _: fn(NativeOwnedRangeReady) = super::host_native_owned_range_ready;
+    }
+
+    #[test]
+    fn native_owned_range_provider_and_stub_abis_are_literal() {
+        let source = include_str!("probes.rs");
+        for signature in [
+            "fn host__native__owned__range__reset(_: u64) {}",
+            "fn host__native__owned__range__add(_: u64, _: u64, _: u64, _: u64) {}",
+            "fn host__native__owned__range__ready(_: u64, _: u64) {}",
+            "stub!(host_native_owned_range_reset(event: super::NativeOwnedRangeReset));",
+            "stub!(host_native_owned_range_add(event: super::NativeOwnedRange));",
+            "stub!(host_native_owned_range_ready(event: super::NativeOwnedRangeReady));",
+        ] {
+            assert!(
+                source.contains(signature),
+                "missing literal ABI: {signature}"
+            );
+        }
+    }
+}
+
 #[cfg(any(
     target_os = "macos",
     all(
@@ -1634,6 +1877,9 @@ mod real {
         fn host__translated__private__range(_: u64, _: u64, _: u64, _: u64) {}
         fn host__translated__shared__range(_: u64, _: u64, _: u64, _: u64, _: u64) {}
         fn host__translated__range__ready(_: u64, _: u64) {}
+        fn host__native__owned__range__reset(_: u64) {}
+        fn host__native__owned__range__add(_: u64, _: u64, _: u64, _: u64) {}
+        fn host__native__owned__range__ready(_: u64, _: u64) {}
         fn dsr__cache__lifecycle(_: i32, _: u32, _: u64, _: u64, _: u64) {}
         fn dsr__exec__map__detail(_: i32, _: u32, _: u64, _: u64, _: u64) {}
         // arg2 is the ADDRESS of a `SyscallArgs` ([u64; 6]); DTrace copyin's 48
@@ -2258,6 +2504,31 @@ mod real {
     #[inline(always)]
     pub fn host_translated_range_ready(event: super::TranslatedRangeReady) {
         carrick_usdt::host__translated__range__ready!(|| {
+            (event.epoch().get(), event.final_sequence())
+        });
+    }
+
+    #[inline(always)]
+    pub fn host_native_owned_range_reset(event: super::NativeOwnedRangeReset) {
+        carrick_usdt::host__native__owned__range__reset!(|| event.epoch().get());
+    }
+
+    #[inline(always)]
+    pub fn host_native_owned_range_add(event: super::NativeOwnedRange) {
+        carrick_usdt::host__native__owned__range__add!(|| {
+            let range = event.range();
+            (
+                event.epoch().get(),
+                event.sequence().get(),
+                range.start.raw() as u64,
+                range.end.raw() as u64,
+            )
+        });
+    }
+
+    #[inline(always)]
+    pub fn host_native_owned_range_ready(event: super::NativeOwnedRangeReady) {
+        carrick_usdt::host__native__owned__range__ready!(|| {
             (event.epoch().get(), event.final_sequence())
         });
     }
@@ -3769,6 +4040,9 @@ mod stub {
     stub!(host_translated_private_range(event: super::TranslatedPrivateRange));
     stub!(host_translated_shared_range(event: super::TranslatedSharedRange));
     stub!(host_translated_range_ready(event: super::TranslatedRangeReady));
+    stub!(host_native_owned_range_reset(event: super::NativeOwnedRangeReset));
+    stub!(host_native_owned_range_add(event: super::NativeOwnedRange));
+    stub!(host_native_owned_range_ready(event: super::NativeOwnedRangeReady));
     stub!(dsr_cache_lifecycle(tid: i32, phase: super::DsrCacheLifecyclePhase, used_bytes: u64, block_count: u64, generation_count: u64));
     stub!(dsr_exec_map_detail(tid: i32, kind: super::DsrExecMapDetailKind, duration_ns: u64, bytes: u64, operations: u64));
     stub!(fork_pre(pc: u64, elr: u64, cpsr: u64));
