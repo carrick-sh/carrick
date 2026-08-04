@@ -1,8 +1,8 @@
 # Native-lane performance: state of play
 
 **Date:** 2026-08-03 · **Branch:** `codex/native-store-default` · **Latest
-implementation decision:** stop trusted-entry route work; no route clears the
-10% opportunity gate ·
+implementation decision:** stop exec/exit work; the cold-build lifecycle share
+is 8.824%, below the 10% opportunity gate ·
 **Scope:** Darwin/aarch64 native backend (`--exec-backend native`, the shipped
 default). VMM is explicitly NOT the target: one process per VM against a
 ~127-VM macOS ceiling makes it a dead end for build-shaped workloads.
@@ -57,6 +57,19 @@ were zero. The route line is therefore stopped without a production candidate.
 Full evidence:
 [`docs/perf-results/2026-08-03-trusted-entry-route-attribution.md`](docs/perf-results/2026-08-03-trusted-entry-route-attribution.md).
 
+The approved exec/exit attribution is also complete. The opt-in `EXECSTAMP2`
+export and fail-closed Rust census reconciled every exec, fork, terminal exit,
+and reap in two independent 20-exec runs and two independent cold builds. The
+micro named exec-total at a stable 16.80% of invocation CPU, but that same
+segment was only 4.98% on the cold build. The cold build's complete strict
+lifecycle opportunity was **8.858% / 8.791%** (mean **8.824%**), below the
+campaign gate. The separately reported child-to-exec window averaged 9.644%,
+mixed guest execution with Carrick repair, and did not name the same segment.
+The first capture was correctly rejected for a missing spawned-thread terminal
+stamp; the fixed exporter then closed all accepted trees exactly. No production
+exec/exit hypothesis was selected. Full evidence:
+[`docs/perf-results/2026-08-03-current-exec-exit-attribution.md`](docs/perf-results/2026-08-03-current-exec-exit-attribution.md).
+
 ## What landed (2026-08-02/03, six waves, all merged with `just ci` green)
 
 **Exec pipeline.** Payload SHA-256 removed from the default artifact digest
@@ -102,21 +115,23 @@ went 1.66 s → <10 ms. Identical host syscall sequence, identical guest ABI.
 
 ## What's next
 
-The rejected branch is closed cleanly: 219/219 AArch64 DSR tests, 61/61
-native-Darwin tests, 87/87 performance/DTrace harness tests, and
-`RUST_TEST_THREADS=1 just ci` all pass against the exact pre-candidate source
-state. Same-binary regression screens and an official ratio refresh were
-intentionally skipped: a candidate that already regresses the primary workload
-cannot be rescued by secondary screens.
+The exec/exit line is closed at attribution rather than carried into a
+production experiment. The exact exporter and census remain as opt-in
+diagnostics because they also provide process-exit receipts and fail closed on
+silent loss; a crashed run can instead be read from a saved core through the
+always-on event ring. No official ratio refresh is warranted because no
+production candidate was retained. `RUST_TEST_THREADS=1 just ci` passes on the
+closed tree.
 
-1. **Attribute process exec/exit amplification without traced timing.** Add
-   Rust-owned lifecycle counters whose export is opt-in and measure them on
-   both the cold build and the 20-exec workload. Bind counts to source, signed
-   binary, workload, store, and successful completion receipts; pursue a
-   production change only if the measured amplification supports a >=10%
-   end-to-end opportunity. If either workload crashes or silently loses a
-   process, stop timing interpretation and use `carrick debug lldb-run` or a
-   saved core plus the exported always-on event ring as authority.
+1. **Census liveness-elidable borrowed-register traffic as one class.** The
+   current-default shape census puts all four borrowed-register saves/restores
+   at 33.7% of executed emitted instructions, about 15% of total build CPU.
+   Start at the internal-fallthrough x17 seam, then apply the same block-liveness
+   proof to x19/x15/x16 and measure the aggregate dynamic coverage. Do not
+   preselect an x17-only patch: x17 projects to only about 6.8% of total CPU.
+   Implement a production candidate only if a current-default census shows a
+   correctness-preserving, non-overlapping class worth at least 10% of total
+   CPU; then require its own controlled end-to-end gate.
 2. **Keep eager full translation as a deferred future design, not the next
    patch.** Translating a complete eligible image once up front could amortize
    publication and avoid the losing per-process merge path measured here. It
@@ -130,19 +145,21 @@ cannot be rescued by secondary screens.
 
 ## Confidence
 
-- **Very high (99%):** the two trusted-route captures are lossless and fully
-  joined: all drop/error/coverage counters are zero, exact JIT bounds resolve
-  every sample, and both workloads reached `BUILD_OK`.
-- **High (97%):** trusted-route shares are stable. The same route dominates and
-  differs by only 0.1703 percentage points across independent stores.
-- **High (95%):** no trusted-entry route supports a >=10% total-CPU candidate.
-  The largest is 4.17%, and even all three together project to only 7.96%.
+- **Very high (99%):** accepted exec/exit coverage is exact. All fork, exec,
+  terminal-exit, and reap relationships reconcile; the deliberately rejected
+  capture proves missing terminal records fail closed.
+- **High (97%):** the strict cold-build lifecycle share is stable. Independent
+  empty-store runs differ by only 0.067 percentage points.
+- **High (95%):** exec/exit is below the production-candidate gate. Both cold
+  runs are below 9%, while the micro's dominant exec-total segment falls to
+  about 5% on the build.
 - **High (95%):** the official shipped-default result remains 10.4446x. No
   rejected candidate code is retained and no projection was substituted for a
   fresh Carrick/Docker run.
-- **Medium (70%):** process exec/exit amplification is the best next measured
-  target. The 20-exec spread is 72.16x, but its contribution to the cold build
-  still needs direct untraced counter evidence before any fix is selected.
+- **Medium (75%):** liveness-elidable borrowed-register traffic is the best next
+  attribution target. The aggregate class projects to about 15% of total CPU,
+  but the dynamically provable dead subset is not yet measured and x17 alone
+  cannot clear the gate.
 
 ## Discipline that earned its keep (do not relearn these)
 
@@ -167,11 +184,12 @@ cannot be rescued by secondary screens.
 
 ## Branch state at handoff
 
-`d8856374` is the source and signed-binary authority for the two accepted route
-captures; the subsequent decision cleanup removes the route-copy emitter,
-routing, snapshot, and capture/census CLI while restoring the three production
-codegen files byte-for-byte to `030c0e8c`. The stricter exact-JIT DTrace script
-is retained as a durable diagnostic artifact. Nothing has been pushed and
-local `main` has not moved. Target-only raw ABBA, mechanism, signed-binary,
-store, attribution, and scoreboard receipts remain under `target/perf/` and
-are intentionally not committed.
+`d0db17970c4b4286f2fef13c5586c73e3e94a132` is the source authority for the
+four accepted exec/exit captures. Their signed binary has SHA-256
+`57343c865ba07ee9e56890f6c9a8f095c9d541548f7a48a42abbe4b551c561f6`
+and Mach-O UUID `FFA89D28-EB3A-30F8-9CAF-82DC24E5CC94`. Commits `868a551d`
+and `d0db1797` retain only the opt-in exporter, fail-closed census, tests, and
+the spawned-thread terminal-stamp repair; they do not alter default execution.
+Nothing has been pushed and local `main` has not moved. Target-only raw ABBA,
+mechanism, signed-binary, store, attribution, and scoreboard receipts remain
+under `target/perf/` and are intentionally not committed.
