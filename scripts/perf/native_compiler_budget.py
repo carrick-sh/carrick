@@ -1159,13 +1159,19 @@ def validate_profile(run: ProfileRun) -> None:
         ):
             raise BudgetError(f"direct resolver reconciliation mismatch for {identity}")
         nested = thread.value("resolver-times", "nested_translation_ns")
-        nested_active_parts = sum(
-            thread.value("resolver-times", field)
-            for field in (
-                "nested_translation_decode_ns",
-                "nested_translation_plan_ns",
-                "nested_translation_emit_ns",
+        decode = thread.value("resolver-times", "nested_translation_decode_ns")
+        optimistic_discard = thread.value(
+            "resolver-process", "optimistic_decode_discard_ns"
+        )
+        if optimistic_discard > decode:
+            raise BudgetError(
+                f"optimistic decode discard time exceeds total decode for {identity}"
             )
+        successful_decode = decode - optimistic_discard
+        nested_active_parts = (
+            successful_decode
+            + thread.value("resolver-times", "nested_translation_plan_ns")
+            + thread.value("resolver-times", "nested_translation_emit_ns")
         )
         if nested_active_parts > nested:
             raise BudgetError(f"nested translation subphases exceed total for {identity}")
