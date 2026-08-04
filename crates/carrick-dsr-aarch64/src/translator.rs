@@ -2337,6 +2337,10 @@ impl ProcessTranslator {
         &self,
         memory: &NativeMappedMemory,
     ) -> Result<Vec<crate::shared_cache::PublishOutcome>, types::DsrError> {
+        #[cfg(feature = "alloc-owner-census")]
+        let _owner = crate::alloc_owner_census::scope(
+            crate::alloc_owner_wire::AllocationOwner::SharedTranslationSupport,
+        );
         let (configuration, mut batches) = {
             let mut state = self.state.write();
             if state.shared_publish_attempted {
@@ -2542,6 +2546,10 @@ impl ProcessState {
                 }
             };
         }
+        #[cfg(feature = "alloc-owner-census")]
+        let _owner = crate::alloc_owner_census::scope(
+            crate::alloc_owner_wire::AllocationOwner::SharedTranslationSupport,
+        );
         let key = configuration.image.key_for_segment(segment);
         let source_words = Arc::clone(&segment.source_words);
         let store = Arc::clone(&configuration.store);
@@ -2959,6 +2967,10 @@ impl ProcessState {
         metadata: Option<PublishedBlockMetadata>,
         census: xlat_census::PublicationCensus,
     ) -> Result<TranslationResult, types::DsrError> {
+        #[cfg(feature = "alloc-owner-census")]
+        let _owner = crate::alloc_owner_census::scope(
+            crate::alloc_owner_wire::AllocationOwner::PublicationIndexes,
+        );
         let entry = emitted.entry();
         // `ProcessState::translate` owns `&mut self` from the process
         // translator's write guard. It re-checks `blocks` after acquiring
@@ -5747,6 +5759,56 @@ mod tests {
                 .chunks_exact(4)
                 .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
                 .collect()
+        }
+
+        #[cfg(feature = "alloc-owner-census")]
+        #[test]
+        fn allocation_owner_publication_indexes_owns_process_index_growth() {
+            use crate::alloc_owner_census::test_support as census;
+            use crate::alloc_owner_wire::AllocationOwner;
+            use crate::translator::{TranslationOutcome, xlat_census};
+
+            let _census = census::lock();
+            let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+            let process =
+                ProcessTranslator::new_with_host(256 * 1024, &TEST_HOST_JIT).expect("translator");
+            let plan = syscall_plan(BLOCK_A);
+            let observation = memory
+                .dsr_generation_observation(BLOCK_A)
+                .expect("publication observation");
+            let source_page = observation.page();
+            let mut state = process.state.write();
+            let emitted = emit::emit_block(&mut state.cache, &plan, emit::EmitAddressMode::Direct)
+                .expect("emit publication fixture");
+            let emitted_bytes = u64::try_from(emitted.len()).expect("emitted byte count");
+            census::reset_and_arm(0, 0);
+            let before = census::snapshot();
+
+            let published = state
+                .publish_emitted(
+                    &memory,
+                    (BLOCK_A, CodeGeneration::INITIAL),
+                    source_page,
+                    observation,
+                    emitted,
+                    emitted_bytes,
+                    TranslationOutcome::Translated,
+                    xlat_census::PublicationCensus::Fresh {
+                        entry: BLOCK_A,
+                        block_start: plan.start,
+                        block_end: plan.end,
+                    },
+                )
+                .expect("publish allocation-owner fixture");
+            std::hint::black_box(published);
+            let after = census::snapshot();
+
+            census::assert_only_requested_bytes_increased(
+                &before,
+                &after,
+                &[AllocationOwner::PublicationIndexes],
+            );
+            census::reset_disabled();
         }
 
         /// Serves exactly one pre-built unit; counts store consults so tests

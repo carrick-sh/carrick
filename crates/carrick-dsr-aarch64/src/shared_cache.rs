@@ -403,6 +403,10 @@ impl PendingTranslationUnit {
         candidates: Vec<PortableBlockCandidate>,
         recovery_runs: bool,
     ) -> Result<Self, crate::types::DsrError> {
+        #[cfg(feature = "alloc-owner-census")]
+        let _owner = crate::alloc_owner_census::scope(
+            crate::alloc_owner_wire::AllocationOwner::SharedTranslationSupport,
+        );
         let mut code = Vec::new();
         let mut blocks = Vec::with_capacity(candidates.len());
         let mut guest_starts = BTreeSet::new();
@@ -971,6 +975,10 @@ pub fn encode_translation_unit_metadata(
     code_len: u64,
     blocks: &[PortableBlockRecord],
 ) -> Result<Vec<u8>, crate::types::DsrError> {
+    #[cfg(feature = "alloc-owner-census")]
+    let _owner = crate::alloc_owner_census::scope(
+        crate::alloc_owner_wire::AllocationOwner::SharedTranslationSupport,
+    );
     let config = bincode::config::standard().with_limit::<TRANSLATION_UNIT_METADATA_DECODE_LIMIT>();
     let base_export = translation_unit_base_export(key).map_err(|error| {
         crate::types::DsrError::CachePolicy(format!("derive unit base export: {error}"))
@@ -1052,6 +1060,10 @@ fn read_le_u64(bytes: &[u8], at: usize) -> Option<u64> {
 pub fn decode_translation_unit_metadata(
     bytes: Arc<dyn AsRef<[u8]> + Send + Sync>,
 ) -> Result<TranslationUnitManifest, UnitMissReason> {
+    #[cfg(feature = "alloc-owner-census")]
+    let _owner = crate::alloc_owner_census::scope(
+        crate::alloc_owner_wire::AllocationOwner::SharedTranslationSupport,
+    );
     let data: &[u8] = (*bytes).as_ref();
     let body = data
         .strip_prefix(&TRANSLATION_UNIT_METADATA_MAGIC)
@@ -1399,6 +1411,62 @@ mod tests {
                 manifest_block(0x400010, 16, 16),
             ],
         )
+    }
+
+    #[cfg(feature = "alloc-owner-census")]
+    #[test]
+    fn allocation_owner_shared_translation_support_owns_pack_and_metadata_wire() {
+        use crate::alloc_owner_census::test_support as census;
+        use crate::alloc_owner_wire::AllocationOwner;
+
+        let _census = census::lock();
+        let candidates = vec![
+            native_tap_candidate(GuestVa(0x400000)),
+            native_tap_candidate(GuestVa(0x400100)),
+        ];
+        census::reset_and_arm(0, 0);
+        let before_pack = census::snapshot();
+
+        let pending = PendingTranslationUnit::pack(fixture_key(), candidates)
+            .expect("pack allocation-owner unit");
+        let after_pack = census::snapshot();
+        census::assert_only_requested_bytes_increased(
+            &before_pack,
+            &after_pack,
+            &[AllocationOwner::SharedTranslationSupport],
+        );
+        census::reset_disabled();
+
+        census::reset_and_arm(0, 0);
+        let before_encode = census::snapshot();
+        let bytes = encode_translation_unit_metadata(
+            &pending.key,
+            [0x44; 32],
+            pending.code.len() as u64,
+            &pending.blocks,
+        )
+        .expect("encode allocation-owner metadata");
+        let after_encode = census::snapshot();
+        census::assert_only_requested_bytes_increased(
+            &before_encode,
+            &after_encode,
+            &[AllocationOwner::SharedTranslationSupport],
+        );
+        census::reset_disabled();
+
+        let bytes = Arc::new(bytes);
+        census::reset_and_arm(0, 0);
+        let before_decode = census::snapshot();
+        let manifest = decode_translation_unit_metadata(bytes).expect("decode owner metadata");
+        std::hint::black_box(manifest);
+        let after_decode = census::snapshot();
+
+        census::assert_only_requested_bytes_increased(
+            &before_decode,
+            &after_decode,
+            &[AllocationOwner::SharedTranslationSupport],
+        );
+        census::reset_disabled();
     }
 
     #[test]

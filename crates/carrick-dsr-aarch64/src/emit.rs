@@ -515,11 +515,23 @@ fn map_next(
     entries: &mut Vec<PcMapEntry>,
     guest: GuestVa,
 ) -> Result<(), DsrError> {
+    #[cfg(feature = "alloc-owner-census")]
+    let _owner =
+        crate::alloc_owner_census::scope(crate::alloc_owner_wire::AllocationOwner::PublicationMap);
     entries.push(PcMapEntry {
         guest,
         cache: current_offset(assembler)?,
     });
     Ok(())
+}
+
+#[inline]
+fn push_recovery(recovery: &mut Vec<RecoveryEntry>, entry: RecoveryEntry) {
+    #[cfg(feature = "alloc-owner-census")]
+    let _owner = crate::alloc_owner_census::scope(
+        crate::alloc_owner_wire::AllocationOwner::PublicationRecovery,
+    );
+    recovery.push(entry);
 }
 
 fn emit_mov_u64(
@@ -714,12 +726,15 @@ fn emit_pc_relative_address(
         hw += 1;
     }
     if let Some(offset) = virtual_snapshot_offset(register) {
-        recovery.push(RecoveryEntry {
-            cache: current_offset(assembler)?,
-            action: RecoveryAction::CommitReservedResident {
-                virtual_register: register,
+        push_recovery(
+            recovery,
+            RecoveryEntry {
+                cache: current_offset(assembler)?,
+                action: RecoveryAction::CommitReservedResident {
+                    virtual_register: register,
+                },
             },
-        });
+        );
         emit_word(
             assembler,
             entries,
@@ -756,10 +771,13 @@ fn emit_recovering_scratch_sequence(
     emit_word(assembler, entries, guest, save)?;
     if let Some(invalid_guest) = target.invalid_biased_guest() {
         for halfword in 0..4_u32 {
-            recovery.push(RecoveryEntry {
-                cache: current_offset(assembler)?,
-                action: RecoveryAction::RestoreScratch { register: scratch },
-            });
+            push_recovery(
+                recovery,
+                RecoveryEntry {
+                    cache: current_offset(assembler)?,
+                    action: RecoveryAction::RestoreScratch { register: scratch },
+                },
+            );
             let immediate = ((invalid_guest.raw() >> (halfword * 16)) & 0xffff) as u32;
             let base = if halfword == 0 {
                 0xd280_0000
@@ -773,10 +791,13 @@ fn emit_recovering_scratch_sequence(
                 base | (halfword << 21) | (immediate << 5) | scratch,
             )?;
         }
-        recovery.push(RecoveryEntry {
-            cache: current_offset(assembler)?,
-            action: RecoveryAction::RestoreScratch { register: scratch },
-        });
+        push_recovery(
+            recovery,
+            RecoveryEntry {
+                cache: current_offset(assembler)?,
+                action: RecoveryAction::RestoreScratch { register: scratch },
+            },
+        );
         emit_word(
             assembler,
             entries,
@@ -785,10 +806,13 @@ fn emit_recovering_scratch_sequence(
         )?;
     }
     for halfword in 0..4_u32 {
-        recovery.push(RecoveryEntry {
-            cache: current_offset(assembler)?,
-            action: RecoveryAction::RestoreScratch { register: scratch },
-        });
+        push_recovery(
+            recovery,
+            RecoveryEntry {
+                cache: current_offset(assembler)?,
+                action: RecoveryAction::RestoreScratch { register: scratch },
+            },
+        );
         let immediate = ((target.raw() >> (halfword * 16)) & 0xffff) as u32;
         let base = if halfword == 0 {
             0xd280_0000
@@ -802,23 +826,29 @@ fn emit_recovering_scratch_sequence(
             base | (halfword << 21) | (immediate << 5) | scratch,
         )?;
     }
-    recovery.push(RecoveryEntry {
-        cache: current_offset(assembler)?,
-        action: if target.invalid_biased_guest().is_some() {
-            RecoveryAction::RestoreScratchInvalidBiasedLiteral { register: scratch }
-        } else {
-            RecoveryAction::RestoreScratch { register: scratch }
+    push_recovery(
+        recovery,
+        RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: if target.invalid_biased_guest().is_some() {
+                RecoveryAction::RestoreScratchInvalidBiasedLiteral { register: scratch }
+            } else {
+                RecoveryAction::RestoreScratch { register: scratch }
+            },
         },
-    });
+    );
     emit_word(assembler, entries, guest, memory_word)?;
     if let Some((virtual_register, snapshot_offset)) = commit_virtual {
-        recovery.push(RecoveryEntry {
-            cache: current_offset(assembler)?,
-            action: RecoveryAction::CommitVirtualizedAndRestoreScratch {
-                register: scratch,
-                virtual_register,
+        push_recovery(
+            recovery,
+            RecoveryEntry {
+                cache: current_offset(assembler)?,
+                action: RecoveryAction::CommitVirtualizedAndRestoreScratch {
+                    register: scratch,
+                    virtual_register,
+                },
             },
-        });
+        );
         emit_word(
             assembler,
             entries,
@@ -826,10 +856,13 @@ fn emit_recovering_scratch_sequence(
             0xf900_0000 | ((snapshot_offset / 8) << 10) | (28 << 5) | scratch,
         )?;
     }
-    recovery.push(RecoveryEntry {
-        cache: current_offset(assembler)?,
-        action: RecoveryAction::RestoreScratchCompleted { register: scratch },
-    });
+    push_recovery(
+        recovery,
+        RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: RecoveryAction::RestoreScratchCompleted { register: scratch },
+        },
+    );
     emit_word(assembler, entries, guest, restore)?;
     Ok(())
 }
@@ -1027,10 +1060,13 @@ fn record_recovery_range(
     action: RecoveryAction,
 ) {
     for offset in (start.get()..end.get()).step_by(4) {
-        recovery.push(RecoveryEntry {
-            cache: CacheOffset::published(offset),
-            action,
-        });
+        push_recovery(
+            recovery,
+            RecoveryEntry {
+                cache: CacheOffset::published(offset),
+                action,
+            },
+        );
     }
 }
 
@@ -1072,10 +1108,13 @@ fn emit_indirect_exit(
     if link.is_some() {
         // x30 still holds the guest value and slot 1168 is not yet written,
         // so this word is covered by the x15/x17-only action.
-        recovery.push(RecoveryEntry {
-            cache: current_offset(assembler)?,
-            action: RecoveryAction::RestoreIndirectLean,
-        });
+        push_recovery(
+            recovery,
+            RecoveryEntry {
+                cache: current_offset(assembler)?,
+                action: RecoveryAction::RestoreIndirectLean,
+            },
+        );
         map_next(assembler, entries, guest)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
@@ -1606,10 +1645,13 @@ fn record_guest_x17_recovery_range(
     end: CacheOffset,
 ) {
     for offset in (start.get()..end.get()).step_by(4) {
-        recovery.push(RecoveryEntry {
-            cache: CacheOffset::published(offset),
-            action: RecoveryAction::RestoreGuestX17,
-        });
+        push_recovery(
+            recovery,
+            RecoveryEntry {
+                cache: CacheOffset::published(offset),
+                action: RecoveryAction::RestoreGuestX17,
+            },
+        );
     }
 }
 
@@ -1664,50 +1706,65 @@ fn emit_internal_fallthrough_edge(
             guest,
             0xf900_0000 | ((1128 / 8) << 10) | (28 << 5) | 17,
         )?;
-        recovery.push(RecoveryEntry {
-            cache: current_offset(assembler)?,
-            action: RecoveryAction::RestoreGuestX17,
-        });
+        push_recovery(
+            recovery,
+            RecoveryEntry {
+                cache: current_offset(assembler)?,
+                action: RecoveryAction::RestoreGuestX17,
+            },
+        );
         emit_word(
             assembler,
             entries,
             guest,
             0xf940_0000 | ((offset / 8) << 10) | (28 << 5) | 17,
         )?;
-        recovery.push(RecoveryEntry {
-            cache: current_offset(assembler)?,
-            action: RecoveryAction::RestoreGuestX17,
-        });
+        push_recovery(
+            recovery,
+            RecoveryEntry {
+                cache: current_offset(assembler)?,
+                action: RecoveryAction::RestoreGuestX17,
+            },
+        );
         emit_word(
             assembler,
             entries,
             guest,
             relocated_direct_word(word, exit, Some(17))?,
         )?;
-        recovery.push(RecoveryEntry {
-            cache: current_offset(assembler)?,
-            action: RecoveryAction::RestoreGuestX17,
-        });
+        push_recovery(
+            recovery,
+            RecoveryEntry {
+                cache: current_offset(assembler)?,
+                action: RecoveryAction::RestoreGuestX17,
+            },
+        );
         map_next(assembler, entries, guest)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
             ; b =>fallthrough
         );
         let slot = current_offset(assembler)?;
-        recovery.push(RecoveryEntry {
-            cache: slot,
-            action: RecoveryAction::RestoreGuestX17,
-        });
+        push_recovery(
+            recovery,
+            RecoveryEntry {
+                cache: slot,
+                action: RecoveryAction::RestoreGuestX17,
+            },
+        );
         map_next(assembler, entries, guest)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
             ; b =>stub
             ; =>fallthrough
         );
-        recovery.push(RecoveryEntry {
-            cache: current_offset(assembler)?,
-            action: RecoveryAction::RestoreGuestX17,
-        });
+        push_recovery(
+            recovery,
+            RecoveryEntry {
+                cache: current_offset(assembler)?,
+                action: RecoveryAction::RestoreGuestX17,
+            },
+        );
         emit_word(
             assembler,
             entries,
@@ -2034,10 +2091,13 @@ fn emit_dual_virtual(
         0xf940_0000 | ((second_offset / 8) << 10) | (context_scratch << 5) | x28_scratch,
         rewritten,
     ] {
-        recovery.push(RecoveryEntry {
-            cache: current_offset(assembler)?,
-            action: restore,
-        });
+        push_recovery(
+            recovery,
+            RecoveryEntry {
+                cache: current_offset(assembler)?,
+                action: restore,
+            },
+        );
         emit_word(assembler, entries, guest, instruction)?;
     }
     let commits: &[u32] = match commit_virtual {
@@ -2079,10 +2139,13 @@ fn emit_dual_virtual(
                 virtual_scratch,
             }
         };
-        recovery.push(RecoveryEntry {
-            cache: current_offset(assembler)?,
-            action,
-        });
+        push_recovery(
+            recovery,
+            RecoveryEntry {
+                cache: current_offset(assembler)?,
+                action,
+            },
+        );
         emit_word(
             assembler,
             entries,
@@ -2095,10 +2158,13 @@ fn emit_dual_virtual(
         0xf940_0000 | ((1120 / 8) << 10) | (context_scratch << 5) | x28_scratch,
         0xf940_0000 | ((1128 / 8) << 10) | (28 << 5) | context_scratch,
     ] {
-        recovery.push(RecoveryEntry {
-            cache: current_offset(assembler)?,
-            action: completed_restore,
-        });
+        push_recovery(
+            recovery,
+            RecoveryEntry {
+                cache: current_offset(assembler)?,
+                action: completed_restore,
+            },
+        );
         emit_word(assembler, entries, guest, instruction)?;
     }
     Ok(())
@@ -2360,10 +2426,13 @@ fn emit_virtualized_register(
         }
         emit_word(assembler, entries, guest, resident.rewritten)?;
         if resident.needs_store {
-            recovery.push(RecoveryEntry {
-                cache: current_offset(assembler)?,
-                action: RecoveryAction::CommitReservedResident { virtual_register },
-            });
+            push_recovery(
+                recovery,
+                RecoveryEntry {
+                    cache: current_offset(assembler)?,
+                    action: RecoveryAction::CommitReservedResident { virtual_register },
+                },
+            );
             emit_word(
                 assembler,
                 entries,
@@ -2394,46 +2463,61 @@ fn emit_virtualized_register(
     emit_word(assembler, entries, guest, save)?;
     emit_word(assembler, entries, guest, save_context)?;
     emit_word(assembler, entries, guest, mirror_context)?;
-    recovery.push(RecoveryEntry {
-        cache: current_offset(assembler)?,
-        action: RecoveryAction::RestoreScratchAndContext {
-            register: scratch,
-            context_register: context_scratch,
+    push_recovery(
+        recovery,
+        RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: RecoveryAction::RestoreScratchAndContext {
+                register: scratch,
+                context_register: context_scratch,
+            },
         },
-    });
+    );
     emit_word(assembler, entries, guest, load_virtual)?;
-    recovery.push(RecoveryEntry {
-        cache: current_offset(assembler)?,
-        action: RecoveryAction::RestoreScratchAndContext {
-            register: scratch,
-            context_register: context_scratch,
+    push_recovery(
+        recovery,
+        RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: RecoveryAction::RestoreScratchAndContext {
+                register: scratch,
+                context_register: context_scratch,
+            },
         },
-    });
+    );
     emit_word(assembler, entries, guest, rewritten)?;
-    recovery.push(RecoveryEntry {
-        cache: current_offset(assembler)?,
-        action: RecoveryAction::CommitVirtualizedAndRestoreScratchAndContext {
-            register: scratch,
-            context_register: context_scratch,
-            virtual_register,
+    push_recovery(
+        recovery,
+        RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: RecoveryAction::CommitVirtualizedAndRestoreScratchAndContext {
+                register: scratch,
+                context_register: context_scratch,
+                virtual_register,
+            },
         },
-    });
+    );
     emit_word(assembler, entries, guest, store_virtual)?;
-    recovery.push(RecoveryEntry {
-        cache: current_offset(assembler)?,
-        action: RecoveryAction::RestoreScratchAndContextCompleted {
-            register: scratch,
-            context_register: context_scratch,
+    push_recovery(
+        recovery,
+        RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: RecoveryAction::RestoreScratchAndContextCompleted {
+                register: scratch,
+                context_register: context_scratch,
+            },
         },
-    });
+    );
     emit_word(assembler, entries, guest, restore)?;
-    recovery.push(RecoveryEntry {
-        cache: current_offset(assembler)?,
-        action: RecoveryAction::RestoreScratchAndContextCompleted {
-            register: scratch,
-            context_register: context_scratch,
+    push_recovery(
+        recovery,
+        RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: RecoveryAction::RestoreScratchAndContextCompleted {
+                register: scratch,
+                context_register: context_scratch,
+            },
         },
-    });
+    );
     emit_word(assembler, entries, guest, restore_context)?;
     Ok(())
 }
@@ -2446,10 +2530,13 @@ fn emit_counter_recovery_word(
     word: u32,
     action: CounterReadRecovery,
 ) -> Result<(), DsrError> {
-    recovery.push(RecoveryEntry {
-        cache: current_offset(assembler)?,
-        action: RecoveryAction::RecoverCounterRead(action),
-    });
+    push_recovery(
+        recovery,
+        RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: RecoveryAction::RecoverCounterRead(action),
+        },
+    );
     emit_word(assembler, entries, guest, word)
 }
 
@@ -2582,10 +2669,13 @@ fn emit_counter_read(
         0xca0f_0210, // eor x16, x16, x15 -- compare without changing NZCV
         pre_commit,
     )?;
-    recovery.push(RecoveryEntry {
-        cache: current_offset(assembler)?,
-        action: RecoveryAction::RecoverCounterRead(pre_commit),
-    });
+    push_recovery(
+        recovery,
+        RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: RecoveryAction::RecoverCounterRead(pre_commit),
+        },
+    );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
@@ -2920,10 +3010,13 @@ fn emit_with_biased_recovery(
     word: u32,
     action: BiasedMemoryRecovery,
 ) -> Result<(), DsrError> {
-    recovery.push(RecoveryEntry {
-        cache: current_offset(assembler)?,
-        action: RecoveryAction::RecoverBiasedMemory(action),
-    });
+    push_recovery(
+        recovery,
+        RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: RecoveryAction::RecoverBiasedMemory(action),
+        },
+    );
     emit_word(assembler, entries, guest, word)
 }
 
@@ -2940,10 +3033,13 @@ fn emit_biased_cbz(
     target: DynamicLabel,
     action: BiasedMemoryRecovery,
 ) -> Result<(), DsrError> {
-    recovery.push(RecoveryEntry {
-        cache: current_offset(assembler)?,
-        action: RecoveryAction::RecoverBiasedMemory(action),
-    });
+    push_recovery(
+        recovery,
+        RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: RecoveryAction::RecoverBiasedMemory(action),
+        },
+    );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
@@ -2960,10 +3056,13 @@ fn emit_biased_branch(
     target: DynamicLabel,
     action: BiasedMemoryRecovery,
 ) -> Result<(), DsrError> {
-    recovery.push(RecoveryEntry {
-        cache: current_offset(assembler)?,
-        action: RecoveryAction::RecoverBiasedMemory(action),
-    });
+    push_recovery(
+        recovery,
+        RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: RecoveryAction::RecoverBiasedMemory(action),
+        },
+    );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
@@ -4489,10 +4588,16 @@ fn emit_biased_exclusive_word(
     scratch: super::types::BiasedExclusiveScratch,
     resume: BiasedExclusiveResume,
 ) -> Result<(), DsrError> {
-    recovery.push(RecoveryEntry {
-        cache: current_offset(assembler)?,
-        action: RecoveryAction::RecoverBiasedExclusive(BiasedExclusiveRecovery { scratch, resume }),
-    });
+    push_recovery(
+        recovery,
+        RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: RecoveryAction::RecoverBiasedExclusive(BiasedExclusiveRecovery {
+                scratch,
+                resume,
+            }),
+        },
+    );
     emit_word(assembler, entries, guest, word)
 }
 
@@ -4509,10 +4614,16 @@ fn emit_biased_exclusive_branch(
     scratch: super::types::BiasedExclusiveScratch,
     resume: BiasedExclusiveResume,
 ) -> Result<(), DsrError> {
-    recovery.push(RecoveryEntry {
-        cache: current_offset(assembler)?,
-        action: RecoveryAction::RecoverBiasedExclusive(BiasedExclusiveRecovery { scratch, resume }),
-    });
+    push_recovery(
+        recovery,
+        RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: RecoveryAction::RecoverBiasedExclusive(BiasedExclusiveRecovery {
+                scratch,
+                resume,
+            }),
+        },
+    );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
@@ -4540,13 +4651,16 @@ fn emit_biased_exclusive_mov_u64(
     emit_mov_u64(assembler, entries, guest, register, value, recording)?;
     let end = current_offset(assembler)?;
     for offset in (start.get()..end.get()).step_by(4) {
-        recovery.push(RecoveryEntry {
-            cache: CacheOffset::published(offset),
-            action: RecoveryAction::RecoverBiasedExclusive(BiasedExclusiveRecovery {
-                scratch,
-                resume,
-            }),
-        });
+        push_recovery(
+            recovery,
+            RecoveryEntry {
+                cache: CacheOffset::published(offset),
+                action: RecoveryAction::RecoverBiasedExclusive(BiasedExclusiveRecovery {
+                    scratch,
+                    resume,
+                }),
+            },
+        );
     }
     Ok(())
 }
@@ -4631,10 +4745,13 @@ fn emit_biased_exclusive_region(
     // At the second spill boundary neither scratch has changed yet. A Noop is
     // the complete recovery action until this store publishes the bias value;
     // the following scratch-mutating instruction begins typed dual restore.
-    recovery.push(RecoveryEntry {
-        cache: current_offset(assembler)?,
-        action: RecoveryAction::Noop,
-    });
+    push_recovery(
+        recovery,
+        RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: RecoveryAction::Noop,
+        },
+    );
     emit_word(
         assembler,
         entries,
@@ -5254,20 +5371,30 @@ fn assemble_block_inner(
     mode: EmitAddressMode,
     mut recording: Option<&mut ArtifactRecording>,
 ) -> Result<AssembledBlock, DsrError> {
+    #[cfg(feature = "alloc-owner-census")]
+    let _owner = crate::alloc_owner_census::scope(
+        crate::alloc_owner_wire::AllocationOwner::BlockAssemblerTransient,
+    );
     let mut assembler = VecAssembler::<Aarch64Relocation>::new(0);
     // Count the fused segments too: a superblock maps several segments' worth
     // of words, and translation time is a real cost here -- deep fusion already
     // taxes it (see `block::SUPERBLOCK_SEGMENT_LIMIT`), so do not add
     // reallocation on top of that.
-    let mut entries = Vec::with_capacity(
-        plan.instructions.len()
-            + plan
-                .extensions
-                .iter()
-                .map(|extension| extension.instructions.len() + 6)
-                .sum::<usize>()
-            + 8,
-    );
+    let mut entries = {
+        #[cfg(feature = "alloc-owner-census")]
+        let _owner = crate::alloc_owner_census::scope(
+            crate::alloc_owner_wire::AllocationOwner::PublicationMap,
+        );
+        Vec::with_capacity(
+            plan.instructions.len()
+                + plan
+                    .extensions
+                    .iter()
+                    .map(|extension| extension.instructions.len() + 6)
+                    .sum::<usize>()
+                + 8,
+        )
+    };
     let mut direct_links = Vec::with_capacity(plan.extensions.len() + 2);
     let mut recovery = Vec::new();
     // No `str wzr, [x28, #1152]` here any more: `gateway_aarch64.S` claims phase
@@ -5288,10 +5415,13 @@ fn assemble_block_inner(
             ; .arch aarch64
             ; ldr x17, [x28, #1128]
         );
-        recovery.push(RecoveryEntry {
-            cache: restore_x17,
-            action: RecoveryAction::RestoreGuestX17,
-        });
+        push_recovery(
+            &mut recovery,
+            RecoveryEntry {
+                cache: restore_x17,
+                action: RecoveryAction::RestoreGuestX17,
+            },
+        );
     }
     if let (Some(guard), Some(stale)) = (guard, stale)
         && !lean_guard
@@ -5302,20 +5432,26 @@ fn assemble_block_inner(
             ; .arch aarch64
             ; str x16, [x28, #1120]
         );
-        recovery.push(RecoveryEntry {
-            cache: guard_start,
-            action: RecoveryAction::Noop,
-        });
+        push_recovery(
+            &mut recovery,
+            RecoveryEntry {
+                cache: guard_start,
+                action: RecoveryAction::Noop,
+            },
+        );
         let save_x17 = current_offset(&assembler)?;
         map_next(&assembler, &mut entries, plan.start)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
             ; str x17, [x28, #1128]
         );
-        recovery.push(RecoveryEntry {
-            cache: save_x17,
-            action: RecoveryAction::Noop,
-        });
+        push_recovery(
+            &mut recovery,
+            RecoveryEntry {
+                cache: save_x17,
+                action: RecoveryAction::Noop,
+            },
+        );
         let read_pstate = current_offset(&assembler)?;
         emit_word(
             &mut assembler,
@@ -5323,20 +5459,26 @@ fn assemble_block_inner(
             plan.start,
             0xd53b_4210, // mrs x16, nzcv
         )?;
-        recovery.push(RecoveryEntry {
-            cache: read_pstate,
-            action: RecoveryAction::Noop,
-        });
+        push_recovery(
+            &mut recovery,
+            RecoveryEntry {
+                cache: read_pstate,
+                action: RecoveryAction::Noop,
+            },
+        );
         let save_pstate = current_offset(&assembler)?;
         map_next(&assembler, &mut entries, plan.start)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
             ; str x16, [x28, #936]
         );
-        recovery.push(RecoveryEntry {
-            cache: save_pstate,
-            action: RecoveryAction::RestoreGenerationGuardRegisters,
-        });
+        push_recovery(
+            &mut recovery,
+            RecoveryEntry {
+                cache: save_pstate,
+                action: RecoveryAction::RestoreGenerationGuardRegisters,
+            },
+        );
         let guard_ready = current_offset(&assembler)?;
         emit_mov_u64(
             &mut assembler,
@@ -5401,10 +5543,13 @@ fn assemble_block_inner(
         );
         let guard_end = current_offset(&assembler)?;
         for offset in (guard_ready.get()..guard_end.get()).step_by(4) {
-            recovery.push(RecoveryEntry {
-                cache: CacheOffset::published(offset),
-                action: RecoveryAction::RestoreGenerationGuard,
-            });
+            push_recovery(
+                &mut recovery,
+                RecoveryEntry {
+                    cache: CacheOffset::published(offset),
+                    action: RecoveryAction::RestoreGenerationGuard,
+                },
+            );
         }
     }
     if let (Some(guard), Some(stale)) = (guard, stale)
@@ -5514,10 +5659,13 @@ fn assemble_block_inner(
         );
         let guard_end = current_offset(&assembler)?;
         for offset in (guard_start.get()..guard_end.get()).step_by(4) {
-            recovery.push(RecoveryEntry {
-                cache: CacheOffset::published(offset),
-                action: RecoveryAction::RestoreGuestX17,
-            });
+            push_recovery(
+                &mut recovery,
+                RecoveryEntry {
+                    cache: CacheOffset::published(offset),
+                    action: RecoveryAction::RestoreGuestX17,
+                },
+            );
         }
     }
     if lean_guard {
@@ -5530,10 +5678,13 @@ fn assemble_block_inner(
             ; .arch aarch64
             ; ldr x17, [x28, #1128]
         );
-        recovery.push(RecoveryEntry {
-            cache: restore_x17,
-            action: RecoveryAction::RestoreGuestX17,
-        });
+        push_recovery(
+            &mut recovery,
+            RecoveryEntry {
+                cache: restore_x17,
+                action: RecoveryAction::RestoreGuestX17,
+            },
+        );
     }
     if !plan.extensions.is_empty() && matches!(plan.exit, PlannedExit::ExclusiveRegion { .. }) {
         // The planner never builds this (it refuses to fuse across or into a
@@ -6018,10 +6169,13 @@ fn assemble_block_inner(
                     .and_then(gpr_index)
                     .and_then(virtual_snapshot_offset);
                 if let Some(offset) = virtual_offset {
-                    recovery.push(RecoveryEntry {
-                        cache: current_offset(&assembler)?,
-                        action: RecoveryAction::RestoreGuestX17,
-                    });
+                    push_recovery(
+                        &mut recovery,
+                        RecoveryEntry {
+                            cache: current_offset(&assembler)?,
+                            action: RecoveryAction::RestoreGuestX17,
+                        },
+                    );
                     emit_word(
                         &mut assembler,
                         &mut entries,
@@ -6030,10 +6184,13 @@ fn assemble_block_inner(
                     )?;
                 }
                 if virtual_offset.is_some() {
-                    recovery.push(RecoveryEntry {
-                        cache: current_offset(&assembler)?,
-                        action: RecoveryAction::RestoreGuestX17,
-                    });
+                    push_recovery(
+                        &mut recovery,
+                        RecoveryEntry {
+                            cache: current_offset(&assembler)?,
+                            action: RecoveryAction::RestoreGuestX17,
+                        },
+                    );
                 }
                 emit_word(
                     &mut assembler,
@@ -6042,10 +6199,13 @@ fn assemble_block_inner(
                     relocated_direct_word(word, exit, virtual_offset.map(|_| 17))?,
                 )?;
                 if virtual_offset.is_some() {
-                    recovery.push(RecoveryEntry {
-                        cache: current_offset(&assembler)?,
-                        action: RecoveryAction::RestoreGuestX17,
-                    });
+                    push_recovery(
+                        &mut recovery,
+                        RecoveryEntry {
+                            cache: current_offset(&assembler)?,
+                            action: RecoveryAction::RestoreGuestX17,
+                        },
+                    );
                 }
                 let fall_slot = current_offset(&assembler)?;
                 // `b +2` skips exactly the taken-branch word below to reach the
@@ -6058,10 +6218,13 @@ fn assemble_block_inner(
                 // gateway stub emitted below it.
                 let taken_stub = assembler.new_dynamic_label();
                 if virtual_offset.is_some() {
-                    recovery.push(RecoveryEntry {
-                        cache: taken_slot,
-                        action: RecoveryAction::RestoreGuestX17,
-                    });
+                    push_recovery(
+                        &mut recovery,
+                        RecoveryEntry {
+                            cache: taken_slot,
+                            action: RecoveryAction::RestoreGuestX17,
+                        },
+                    );
                 }
                 map_next(&assembler, &mut entries, exit_guest)?;
                 dynasmrt::dynasm!(assembler
@@ -6261,10 +6424,13 @@ fn assemble_block_inner(
             );
             let stale_end = current_offset(&assembler)?;
             for offset in (stale_start.get()..stale_end.get()).step_by(4) {
-                recovery.push(RecoveryEntry {
-                    cache: CacheOffset::published(offset),
-                    action: RecoveryAction::RestoreGenerationGuard,
-                });
+                push_recovery(
+                    &mut recovery,
+                    RecoveryEntry {
+                        cache: CacheOffset::published(offset),
+                        action: RecoveryAction::RestoreGenerationGuard,
+                    },
+                );
             }
         }
         let exit_start = current_offset(&assembler)?;
@@ -6284,10 +6450,13 @@ fn assemble_block_inner(
             // in it still needs guest x17 rebuilt from slot 1128.
             let exit_end = current_offset(&assembler)?;
             for offset in (exit_start.get()..exit_end.get()).step_by(4) {
-                recovery.push(RecoveryEntry {
-                    cache: CacheOffset::published(offset),
-                    action: RecoveryAction::RestoreGuestX17,
-                });
+                push_recovery(
+                    &mut recovery,
+                    RecoveryEntry {
+                        cache: CacheOffset::published(offset),
+                        action: RecoveryAction::RestoreGuestX17,
+                    },
+                );
             }
         }
     }
@@ -6860,6 +7029,91 @@ mod tests {
             },
             extensions: Vec::new(),
         }
+    }
+
+    #[cfg(feature = "alloc-owner-census")]
+    #[test]
+    fn allocation_owner_block_assembly_splits_transient_map_and_recovery_storage() {
+        use crate::alloc_owner_census::test_support as census;
+        use crate::alloc_owner_wire::AllocationOwner;
+
+        let _census = census::lock();
+        let plan = copy_plan();
+        let generation = std::sync::atomic::AtomicU64::new(CodeGeneration::INITIAL.get());
+        census::reset_and_arm(0, 0);
+        let before_snapshot = census::snapshot();
+        let before_transient = census::requested_bytes(AllocationOwner::BlockAssemblerTransient);
+        let before_map = census::requested_bytes(AllocationOwner::PublicationMap);
+        let before_recovery = census::requested_bytes(AllocationOwner::PublicationRecovery);
+
+        let assembled = assemble_block_inner(
+            &plan,
+            Some(GenerationGuard::new(&generation, CodeGeneration::INITIAL)),
+            EmitAddressMode::Direct,
+            None,
+        )
+        .expect("assemble allocation-owner fixture");
+        let transient =
+            census::requested_bytes(AllocationOwner::BlockAssemblerTransient) - before_transient;
+        let map = census::requested_bytes(AllocationOwner::PublicationMap) - before_map;
+        let recovery =
+            census::requested_bytes(AllocationOwner::PublicationRecovery) - before_recovery;
+        let after_snapshot = census::snapshot();
+
+        let cumulative_vec_requests =
+            |initial_capacity: usize, final_capacity: usize, element_size: usize| {
+                let mut capacity = initial_capacity;
+                let mut requested_capacity = initial_capacity;
+                if capacity == 0 && final_capacity != 0 {
+                    capacity = 4;
+                    requested_capacity = capacity;
+                }
+                while capacity < final_capacity {
+                    capacity *= 2;
+                    requested_capacity += capacity;
+                }
+                assert_eq!(capacity, final_capacity, "fixture Vec growth changed");
+                u64::try_from(requested_capacity * element_size)
+                    .expect("cumulative Vec requested bytes")
+            };
+
+        assert!(
+            transient > 0,
+            "transient assembly owner recorded no allocations"
+        );
+        assert!(map > 0, "publication-map owner recorded no allocations");
+        assert!(
+            recovery > 0,
+            "publication-recovery owner recorded no allocations"
+        );
+        assert_eq!(
+            map,
+            cumulative_vec_requests(
+                plan.instructions.len() + 8,
+                assembled.map.entries.capacity(),
+                std::mem::size_of::<PcMapEntry>(),
+            ),
+            "map capacity must be charged only to publication-map"
+        );
+        assert_eq!(
+            recovery,
+            cumulative_vec_requests(
+                0,
+                assembled.recovery.capacity(),
+                std::mem::size_of::<RecoveryEntry>(),
+            ),
+            "recovery growth must be charged only to publication-recovery"
+        );
+        census::assert_only_requested_bytes_increased(
+            &before_snapshot,
+            &after_snapshot,
+            &[
+                AllocationOwner::PublicationMap,
+                AllocationOwner::PublicationRecovery,
+                AllocationOwner::BlockAssemblerTransient,
+            ],
+        );
+        census::reset_disabled();
     }
 
     /// Every word a guarded block emits before its first copied guest
