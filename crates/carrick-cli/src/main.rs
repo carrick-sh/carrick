@@ -146,6 +146,9 @@ mod lifecycle;
 mod native_fault_profile;
 mod native_perf_epochs;
 mod native_profile_qualification;
+// The authenticated raw protocol is wired by follow-on trace CLI work.
+#[allow(dead_code)]
+mod native_shape_profile;
 // `perf_stats` + the bulk of `trace_profile` back the BSD libdtrace-based
 // `carrick trace --profile` pipeline. Other hosts retain only the shared
 // `TraceProfileKind` argument vocabulary.
