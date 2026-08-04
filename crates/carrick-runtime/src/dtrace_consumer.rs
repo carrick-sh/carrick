@@ -90,6 +90,8 @@ pub const BUNDLED_DSR_PROFILE_D: &str = include_str!("../../../scripts/dtrace/ds
 pub const BUNDLED_DSR_INDIRECT_D: &str = include_str!("../../../scripts/dtrace/dsr-indirect.d");
 pub const BUNDLED_DSR_FORK_D: &str = include_str!("../../../scripts/dtrace/dsr-fork.d");
 pub const BUNDLED_NATIVE_WALL_D: &str = include_str!("../../../scripts/dtrace/native-wall.d");
+pub const BUNDLED_NATIVE_SHAPE_D: &str =
+    include_str!("../../../scripts/dtrace/native-shape-census.d");
 pub const BUNDLED_NATIVE_FAULT_D: &str =
     include_str!("../../../scripts/dtrace/native-fault-attribution.d");
 pub const BUNDLED_NATIVE_BIRTH_QUALIFY_D: &str =
@@ -765,10 +767,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     use super::invoke_post_stop;
     use super::{
-        BUNDLED_NATIVE_WALL_D, DTRACE_CONSUME_NEXT, DTRACE_CONSUME_THIS, DTRACEACT_EXIT,
-        DTRACEDROP_AGGREGATION, DTRACEDROP_DYNAMIC, DTRACEDROP_DYNDIRTY, DTRACEDROP_DYNRINSE,
-        DTRACEDROP_PRINCIPAL, DTraceRunReport, DtraceRecDesc, TRACE_CHILD_COMMAND,
-        TraceDropCredentials, TraceOptions, chewrec, join_ids, record_drop, trace_exec_argv,
+        BUNDLED_NATIVE_SHAPE_D, BUNDLED_NATIVE_WALL_D, DTRACE_CONSUME_NEXT, DTRACE_CONSUME_THIS,
+        DTRACEACT_EXIT, DTRACEDROP_AGGREGATION, DTRACEDROP_DYNAMIC, DTRACEDROP_DYNDIRTY,
+        DTRACEDROP_DYNRINSE, DTRACEDROP_PRINCIPAL, DTraceRunReport, DtraceRecDesc,
+        TRACE_CHILD_COMMAND, TraceDropCredentials, TraceOptions, chewrec, join_ids, record_drop,
+        trace_exec_argv,
     };
     use std::ffi::CString;
     use std::path::Path;
@@ -922,6 +925,37 @@ mod tests {
     #[test]
     fn native_wall_watchdog_allows_perturbed_cold_builds_to_finish() {
         assert!(BUNDLED_NATIVE_WALL_D.contains("tick-180s"));
+    }
+
+    #[test]
+    fn native_shape_template_is_snapshot_only_and_tracks_one_population() {
+        let source = BUNDLED_NATIVE_SHAPE_D;
+        assert!(source.contains("/* CARRICK_NSHAPE2_HEADER */"));
+        assert!(source.contains("/* CARRICK_NSHAPE2_TERMINALS */"));
+        assert_eq!(source.matches("\nprofile-997\n").count(), 1);
+        assert!(source.contains("arg1 != 0 && arg0 == 0"));
+        assert!(source.contains("arg0 != 0 && arg1 == 0"));
+        assert!(source.contains("(arg0 == 0) == (arg1 == 0)"));
+        assert!(source.contains("tick-180s"));
+        assert!(!source.contains("copyin("));
+        assert!(!source.contains("SHAPE1"));
+    }
+
+    #[test]
+    fn native_shape_template_tracks_lifecycle_and_exact_sections() {
+        let source = BUNDLED_NATIVE_SHAPE_D;
+        assert!(source.contains("tracked[args[0]->pr_pid] == 0"));
+        assert!(source.contains("admitted++"));
+        assert!(source.contains("live++"));
+        assert!(source.contains("exited++"));
+        assert!(source.contains("live--"));
+        assert!(source.contains("jit_start[args[0]->pr_pid] = jit_start[pid]"));
+        assert!(source.contains("jit_end[args[0]->pr_pid] = jit_end[pid]"));
+        assert!(source.contains("target_completed && live == 0"));
+        assert!(source.contains("NSHAPE2|section=mode"));
+        assert!(source.contains("NSHAPE2|section=region"));
+        assert!(source.contains("NSHAPE2|section=pc"));
+        assert_eq!(source.matches("NSHAPE2|complete").count(), 1);
     }
 
     #[test]
