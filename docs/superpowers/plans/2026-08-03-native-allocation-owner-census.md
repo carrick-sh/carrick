@@ -1233,7 +1233,7 @@ Do not create an empty commit when no fix was needed.
 - Does not implement a production optimization or change the official 10.4446x
   ratio.
 
-- [ ] **Step 1: Freeze source, store, workload, and binaries**
+- [x] **Step 1: Freeze source, store, workload, and binaries**
 
 Use the locked persistent store:
 
@@ -1247,7 +1247,7 @@ host topology/core counts, thermal/power metadata, and a normalized store
 manifest. The source must be clean except target-only receipts. Build/sign the
 feature binary, then record its SHA-256, UUID, signature, and DOF.
 
-- [ ] **Step 2: Run feature captures A and B sequentially**
+- [x] **Step 2: Run feature captures A and B sequentially**
 
 For `arm=A` and `arm=B`, use a fresh output directory and unique run ID. Run
 this exact workload with the arm substituted literally:
@@ -1273,7 +1273,7 @@ independently parsed NATIVEPERF process epochs, 71 PIDs, all-thread translation
 totals, no temp/invalid/overflow/lifecycle records, unchanged normalized store,
 and zero survivors before accepting either arm. Discard feature wall/CPU time.
 
-- [ ] **Step 3: Aggregate feature captures without opportunity claims**
+- [x] **Step 3: Aggregate feature captures without opportunity claims**
 
 Run the ordinary parser surface after each capture with no normal opportunity
 argument:
@@ -1290,7 +1290,7 @@ Repeat for B. Require both reports valid except for the explicitly named
 strict-fallback opportunity authority. Owner shares and all-thread translation
 totals must be reported separately, not pooled.
 
-- [ ] **Step 4: Fail closed and expand tags if `other` can hide a candidate**
+- [x] **Step 4: Fail closed and expand tags if `other` can hide a candidate**
 
 Compute each run's fallback `Q = 0.10`. If either run has `other_share >= Q`,
 the capture is **INVALID**, not STOP. Return to Task 4, use the DHAT stack table
@@ -1321,7 +1321,7 @@ remain nested and take precedence, so this owner records only the residual
 translation work. The wire/report schemas become `ALLOCOWNER3` /
 `carrick.alloc-owner-census.v3`; v2 arm A is preserved separately.
 
-- [ ] **Step 5: Restore and authenticate the ordinary binary**
+- [x] **Step 5: Restore and authenticate the ordinary binary**
 
 ```bash
 just build
@@ -1334,7 +1334,7 @@ otool -l target/release/carrick | rg '__dof_carrick'
 Record the ordinary binary receipt and prove runtime instrumentation markers are
 absent as in Task 6.
 
-- [ ] **Step 6: Run ordinary NFAULT bindings N1 and N2**
+- [x] **Step 6: Run ordinary NFAULT bindings N1 and N2**
 
 For each binding, use the existing authenticated Rust-owned native-fault
 profile, the same workload/store, a unique run ID, fresh raw and summary paths,
@@ -1359,7 +1359,7 @@ marker and `BUILD_OK`, all DTrace loss/error/lifecycle/catalog counters zero,
 every sampled page joined, unchanged store, and zero survivors. Traced elapsed
 time remains perturbation only.
 
-- [ ] **Step 7: Run ordinary untraced CPU bindings C1 and C2**
+- [x] **Step 7: Run ordinary untraced CPU bindings C1 and C2**
 
 Run the exact workload twice more under only `CARRICK_DSR_PROFILE=1`, with
 unique run IDs and separate stderr:
@@ -1385,7 +1385,7 @@ complete thread/resolver pairs, and a positive checked
 `supervisor_self_cpu_ns + supervisor_children_cpu_ns`. Do not run alongside
 NFAULT, Docker, or another Carrick workload.
 
-- [ ] **Step 8: Derive two explicit normal opportunity shares**
+- [x] **Step 8: Derive two explicit normal opportunity shares**
 
 For binding 1, combine feature A owner shares, N1's exact zfod total and sampled
 host-other zfod share, and C1's supervisor total CPU. For binding 2, combine B,
@@ -1403,7 +1403,7 @@ Keep exact measured counts, sampled share, cost-model input, proportional
 projection, and favorable ceiling in separate fields. Reject `H <= 0`, `H > 1`,
 overflow, or a non-finite result.
 
-- [ ] **Step 9: Re-run reports with each normal binding**
+- [x] **Step 9: Re-run reports with each normal binding**
 
 Pass each computed `H` through
 `--normal-host-allocation-opportunity-share`. Require the printed `Q = 0.10/H`,
@@ -1412,7 +1412,7 @@ proportional projected total-CPU share is at least 0.10 in both reports. Rank
 qualifiers by the smaller of the two projections. Do not add owner percentages
 or favorable ceilings that reuse the same fault pot.
 
-- [ ] **Step 10: Write durable evidence and update the controller**
+- [x] **Step 10: Write durable evidence and update the controller**
 
 The evidence document must include:
 
@@ -1431,7 +1431,16 @@ The evidence document must include:
 Append one typed ledger row, update `handoff.md` with the next highest-ranked
 candidate or next bucket, and mark this plan's executed results.
 
-- [ ] **Step 11: Run final gates and commit evidence**
+Executed result: accepted v3 A/B report `other = 0.08762817760306377 /
+0.08761103544115145`; N1/N2 host-other zfod share `0.6309593632174277 /
+0.6316492135675247`; C1/C2 ordinary total CPU `23.211641 / 24.081648` s; and
+normal host-allocation opportunity `H = 0.15982158413687544 /
+0.15427892385119382`. No owner clears 10% in both bindings. Publication
+recovery ranks first but projects to only `0.08337533643586419 /
+0.08048397140359405`, so the portfolio decision is STOP and the next bucket is
+a refreshed current-default broad CPU attribution.
+
+- [x] **Step 11: Run final gates and commit evidence**
 
 ```bash
 git diff --check
