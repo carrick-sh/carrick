@@ -18,7 +18,8 @@ const JSON_SCHEMA: &str = "carrick.dsr-profile.v1";
 const V2_PROTOCOL_PREFIX: &str = "DSRPROF2";
 const V2_STACK_PREFIX: &str = "DSRSTACK2";
 const V2_ERROR_PREFIX: &str = "DSRERROR2";
-const V2_RAW_SCHEMA: &str = "carrick.dsrprof.raw.v3";
+const V2_RAW_SCHEMA: &str = "carrick.dsrprof.raw.v4";
+const TARGET_KERNEL_SYSCALL_STACK: &str = "psynch_cvwait";
 const NATIVE_FAULT_RAW_SCHEMA: &str = "carrick.native-fault.raw.v3";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1935,6 +1936,28 @@ impl V2Validator {
                 "DSRPROF2 per-syscall CPU samples total {syscall_function_samples}, expected named-syscall population {named_syscall_samples}"
             );
         }
+        let target_syscall_samples = self
+            .cpu_kernel_syscall_summary
+            .get(TARGET_KERNEL_SYSCALL_STACK)
+            .copied()
+            .unwrap_or(0);
+        let mut target_stack_samples = 0_u64;
+        for stack in &self.stacks {
+            let Some(function) = stack.kind.strip_prefix("kernel-syscall-") else {
+                continue;
+            };
+            if function != TARGET_KERNEL_SYSCALL_STACK {
+                bail!("unknown targeted kernel syscall stack {function:?}");
+            }
+            target_stack_samples = target_stack_samples
+                .checked_add(stack.count)
+                .ok_or_else(|| anyhow!("targeted kernel syscall stack population overflow"))?;
+        }
+        if target_stack_samples != target_syscall_samples {
+            bail!(
+                "targeted {TARGET_KERNEL_SYSCALL_STACK} stack samples total {target_stack_samples}, expected syscall population {target_syscall_samples}"
+            );
+        }
         for stack in &self.stacks {
             self.require_summary_key(stack.key)?;
             if stack.kind.is_empty() || stack.count == 0 || stack.frames.is_empty() {
@@ -2372,7 +2395,7 @@ where
                     for frame in frames {
                         addresses.insert(raw_kernel_address(&frame)?);
                     }
-                } else if !kind.starts_with("offcpu-") {
+                } else if !kind.starts_with("offcpu-") && !kind.starts_with("kernel-syscall-") {
                     bail!("unknown DSRSTACK2 attribution kind {kind:?}");
                 }
             } else if line.is_empty() {
@@ -2922,13 +2945,15 @@ fn build_v2_profile_summary(
     let mut offcpu_stack_population = BTreeMap::<String, (u64, u64)>::new();
     let mut raw_stack_keys = BTreeSet::<(RawProcessImageKey, String, Vec<String>)>::new();
     let mut presented_stacks =
-        BTreeMap::<(String, u64, String, Vec<String>), (u64, Option<u64>)>::new();
+        BTreeMap::<(String, u64, String, Option<u64>, Vec<String>), (u64, Option<u64>)>::new();
     for stack in validator.stacks {
         if !raw_stack_keys.insert((stack.key, stack.kind.clone(), stack.frames.clone())) {
             bail!("duplicate DSRSTACK2 record for one process-image key");
         }
         let pid = instance_for(stack.key)?;
-        let (phase, value_ns) = if let Some(kind) = stack.kind.strip_prefix("offcpu-") {
+        let (phase, presented_kind, source_pc, value_ns) = if let Some(kind) =
+            stack.kind.strip_prefix("offcpu-")
+        {
             let population = offcpu_stack_population.entry(kind.to_owned()).or_default();
             population.0 = population
                 .0
@@ -2938,7 +2963,30 @@ fn build_v2_profile_summary(
                 .1
                 .checked_add(stack.total_ns)
                 .ok_or_else(|| anyhow!("DSRPROF2 off-CPU stack duration overflow"))?;
-            (format!("offcpu-{kind}-stack"), Some(stack.total_ns))
+            (
+                format!("offcpu-{kind}-stack"),
+                stack.kind.clone(),
+                None,
+                Some(stack.total_ns),
+            )
+        } else if let Some(function) = stack.kind.strip_prefix("kernel-syscall-") {
+            if function != TARGET_KERNEL_SYSCALL_STACK {
+                bail!("unknown DSRPROF2 targeted syscall stack {function:?}");
+            }
+            if stack.total_ns != 0 {
+                bail!("DSRPROF2 targeted syscall stack unexpectedly carries duration");
+            }
+            let host_base = validator
+                .epochs
+                .get(&stack.key)
+                .and_then(|epoch| epoch.host_image_base)
+                .ok_or_else(|| anyhow!("targeted syscall stack has no exact host image base"))?;
+            (
+                "cpu-kernel-syscall-stack".to_owned(),
+                function.to_owned(),
+                Some(host_base),
+                None,
+            )
         } else {
             if !matches!(
                 stack.kind.as_str(),
@@ -2952,10 +3000,15 @@ fn build_v2_profile_summary(
             kernel_stack_samples = kernel_stack_samples
                 .checked_add(stack.count)
                 .ok_or_else(|| anyhow!("DSRPROF2 kernel stack population overflow"))?;
-            ("cpu-kernel-stack".to_owned(), None)
+            (
+                "cpu-kernel-stack".to_owned(),
+                stack.kind.clone(),
+                None,
+                None,
+            )
         };
         let presented = presented_stacks
-            .entry((phase, pid, stack.kind, stack.frames))
+            .entry((phase, pid, presented_kind, source_pc, stack.frames))
             .or_insert((0, value_ns.map(|_| 0)));
         presented.0 = presented
             .0
@@ -2971,9 +3024,9 @@ fn build_v2_profile_summary(
             _ => bail!("DSRPROF2 presented stack changed metric shape"),
         }
     }
-    for ((phase, pid, kind, frames), (count, value_ns)) in presented_stacks {
+    for ((phase, pid, kind, source_pc, frames), (count, value_ns)) in presented_stacks {
         metrics.push(ProfileOutputMetric {
-            scope: v2_profile_scope(phase, Some(pid), Some(kind.clone()), None),
+            scope: v2_profile_scope(phase, Some(pid), Some(kind.clone()), source_pc),
             metric: ProfileMetric::StackTrace {
                 state: kind,
                 pid: Some(pid),
@@ -3961,11 +4014,21 @@ mod tests {
             .iter()
             .find(|row| {
                 row["scope"]["phase"] == "cpu-kernel-syscall"
-                    && row["scope"]["kind"] == "read"
+                    && row["scope"]["kind"] == "psynch_cvwait"
                     && row["metric"]["type"] == "exact"
             })
             .expect("named kernel syscall bucket");
         assert_eq!(kernel_syscall["metric"]["count"], 2);
+        let syscall_stack = rows
+            .iter()
+            .find(|row| {
+                row["scope"]["phase"] == "cpu-kernel-syscall-stack"
+                    && row["scope"]["kind"] == "psynch_cvwait"
+                    && row["metric"]["type"] == "stack-trace"
+            })
+            .expect("psynch_cvwait caller stack");
+        assert_eq!(syscall_stack["metric"]["count"], 2);
+        assert_eq!(syscall_stack["scope"]["source_pc"], 0x100000000_u64);
         let offcpu = exact("offcpu-voluntary-pc", Some(1), Some(0x1150)).unwrap();
         assert_eq!(offcpu["metric"]["count"], 1);
         assert_eq!(offcpu["metric"]["total_ns"], 500);
@@ -4007,15 +4070,19 @@ mod tests {
     #[test]
     fn dsrprof2_rejects_incomplete_kernel_syscall_sample_census() {
         let fixture = include_str!("../tests/fixtures/dsrprof2-valid.raw");
-        let row = "DSRPROF2|cpu-kernel-syscall|function=read|count=2";
+        let row = "DSRPROF2|cpu-kernel-syscall|function=psynch_cvwait|count=2";
         for corrupt in [
             fixture.replacen(&format!("{row}\n"), "", 1),
-            fixture.replacen(row, "DSRPROF2|cpu-kernel-syscall|function=read|count=1", 1),
+            fixture.replacen(
+                row,
+                "DSRPROF2|cpu-kernel-syscall|function=psynch_cvwait|count=1",
+                1,
+            ),
             fixture.replacen(
                 row,
                 concat!(
-                    "DSRPROF2|cpu-kernel-syscall|function=read|count=1\n",
-                    "DSRPROF2|cpu-kernel-syscall|function=read|count=1"
+                    "DSRPROF2|cpu-kernel-syscall|function=psynch_cvwait|count=1\n",
+                    "DSRPROF2|cpu-kernel-syscall|function=psynch_cvwait|count=1"
                 ),
                 1,
             ),
@@ -4035,13 +4102,48 @@ mod tests {
     #[test]
     fn dsrprof2_rejects_invalid_kernel_syscall_function() {
         let raw = include_str!("../tests/fixtures/dsrprof2-valid.raw").replacen(
-            "function=read|count=2",
+            "function=psynch_cvwait|count=2",
             "function=bad%zz|count=2",
             1,
         );
         let error = ProfileSummary::from_lines(raw.lines(), ProfileCaptureStatus::default())
             .expect_err("an invalid syscall token must fail closed");
         assert!(format!("{error:#}").contains("invalid percent escape"));
+    }
+
+    #[test]
+    fn dsrprof2_rejects_incomplete_targeted_syscall_stacks() {
+        let fixture = include_str!("../tests/fixtures/dsrprof2-valid.raw");
+        let block = concat!(
+            "DSRSTACK2|begin|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|kind=kernel-syscall-psynch_cvwait|count=2|total_ns=0\n",
+            "\n",
+            "0x100001100\n",
+            "0x100001200\n",
+            "DSRSTACK2|end\n",
+        );
+        for corrupt in [
+            fixture.replacen(block, "", 1),
+            fixture.replacen(
+                "kind=kernel-syscall-psynch_cvwait|count=2|total_ns=0",
+                "kind=kernel-syscall-psynch_cvwait|count=1|total_ns=0",
+                1,
+            ),
+            fixture.replacen(
+                "kind=kernel-syscall-psynch_cvwait|count=2|total_ns=0",
+                "kind=kernel-syscall-kevent|count=2|total_ns=0",
+                1,
+            ),
+        ] {
+            let error =
+                ProfileSummary::from_lines(corrupt.lines(), ProfileCaptureStatus::default())
+                    .expect_err("the targeted syscall stack census must fail closed");
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains("targeted psynch_cvwait stack samples")
+                    || rendered.contains("unknown targeted kernel syscall stack"),
+                "unexpected error: {rendered}"
+            );
+        }
     }
 
     #[test]
@@ -4084,11 +4186,6 @@ mod tests {
             .lines()
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        let syscall = lines
-            .iter_mut()
-            .find(|line| line.starts_with("DSRPROF2|cpu-kernel-syscall|"))
-            .expect("kernel syscall summary row");
-        *syscall = "DSRPROF2|cpu-kernel-syscall|function=read|count=4".to_owned();
         let completion = lines
             .iter()
             .position(|line| line.starts_with("DSRPROF2|complete|"))
@@ -4096,6 +4193,7 @@ mod tests {
         lines.splice(
             completion..completion,
             [
+                "DSRPROF2|cpu-kernel-syscall|function=read|count=2",
                 "DSRPROF2|cpu-kernel|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|class=kernel-named-syscall|pc=0xfffffe0010030030|count=1",
                 "DSRSTACK2|begin|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|kind=kernel-named-syscall|count=1|total_ns=0",
                 "",
@@ -4140,8 +4238,13 @@ mod tests {
                 1,
             )
             .replacen(
-                "DSRPROF2|cpu-kernel-syscall|function=read|count=2",
-                "DSRPROF2|cpu-kernel-syscall|function=read|count=3",
+                "DSRPROF2|cpu-kernel-syscall|function=psynch_cvwait|count=2",
+                "DSRPROF2|cpu-kernel-syscall|function=psynch_cvwait|count=3",
+                1,
+            )
+            .replacen(
+                "kind=kernel-syscall-psynch_cvwait|count=2|total_ns=0",
+                "kind=kernel-syscall-psynch_cvwait|count=3|total_ns=0",
                 1,
             )
             .replacen(
@@ -4233,7 +4336,7 @@ mod tests {
             ],
         )
         .expect("valid launch authority");
-        let header = "DSRPROF2|header|profile=native-wall|raw_schema=carrick.dsrprof.raw.v3|os_build=26A123|program_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|birth_qualification_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|terminal_qualification_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc|wall_hz=197|cpu_hz=499";
+        let header = "DSRPROF2|header|profile=native-wall|raw_schema=carrick.dsrprof.raw.v4|os_build=26A123|program_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|birth_qualification_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|terminal_qualification_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc|wall_hz=197|cpu_hz=499";
 
         let mut validator = V2Validator::with_authority(authority.clone());
         validator

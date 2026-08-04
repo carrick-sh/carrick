@@ -26,7 +26,10 @@
  *
  * PERTURBATION: HIGH. This profile combines profile-499 CPU sampling,
  * profile-197 wall sampling, kernel stack aggregation, syscall/mach-trap
- * bracketing, and Carrick lifecycle USDT. On the 2026-08-03 cold-Go captures
+ * bracketing, a targeted user-stack census for sampled psynch_cvwait kernel
+ * work, and Carrick lifecycle USDT. The targeted stack is valid because a
+ * Darwin syscall begins only after Carrick restores its host stack. On the
+ * 2026-08-03 cold-Go captures
  * bound to source c7e36c87, it stretched an untraced ~9.3 s process to
  * 16.2-17.7 s and raised the sampled kernel share to 52-53%. Absolute elapsed
  * and traced-vs-untraced shares are therefore diagnostic only; cite only
@@ -552,6 +555,16 @@ profile-499
 	    kernel_depth[pid, tid] - 1]] = count();
 }
 
+profile-499
+/tracked[pid] && range_ready[pid] && arg0 != 0 &&
+    kernel_depth[pid, tid] > (uint64_t)1 &&
+    kernel_function[pid, tid, kernel_depth[pid, tid] - 1] ==
+    "psynch_cvwait"/
+{
+	@cpu_psynch_cvwait_stack[pid, birth_sec[pid], birth_usec[pid],
+	    image_generation[pid], current_epoch[pid], ustack(24)] = count();
+}
+
 tick-197hz
 /root_pid != (pid_t)0 && live_pids > 0/
 {
@@ -597,6 +610,8 @@ dtrace:::END
 	    @cpu_kernel_syscall);
 	printa("DSRSTACK2|begin|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|kind=%s|count=%@d|total_ns=0\n%kDSRSTACK2|end\n",
 	    @cpu_kernel_stack);
+	printa("DSRSTACK2|begin|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|kind=kernel-syscall-psynch_cvwait|count=%@d|total_ns=0\n%kDSRSTACK2|end\n",
+	    @cpu_psynch_cvwait_stack);
 	printa("DSRPROF2|offcpu|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|kind=%s|pc=%#x|count=%@d|total_ns=%@d\n",
 	    @off_count, @off_ns);
 	printa("DSRSTACK2|begin|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|kind=offcpu-%s|count=%@d|total_ns=%@d\n%kDSRSTACK2|end\n",
