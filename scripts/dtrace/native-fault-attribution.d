@@ -9,6 +9,15 @@
  * owned by each active native guest image; the Rust parser joins sampled pages
  * to those catalogs and classifies guest-owned versus host-other faults.
  *
+ * The profile also exports every completed guest mmap/munmap/mprotect/madvise
+ * operation and every exact zfod event either inside one of those operations or
+ * subsequently inside the native heap/mmap arenas. Everything else is counted
+ * in an explicit unexported remainder. The Rust reader requires
+ * exported+unexported == the exact provider total and zero operations in flight.
+ * This is intentionally an export contract: semantic-sequence replay remains an
+ * offline operation and cannot perturb the ordinary runtime when no consumer is
+ * attached.
+ *
  * PROVIDER ABI (LIVE-QUALIFIED ON THE CAPTURE HOST)
  * ------------------------------------------------
  * `vminfo:::as_fault` and `vminfo:::zfod` arg2 are the exact 16 KiB host-page
@@ -23,16 +32,18 @@
  *
  * PERTURBATION
  * ------------
- * HIGH. Fault probes fire roughly two million times on the cold-Go workload.
- * Exact totals are lossless, but page aggregation is sampled because the old
+ * VERY HIGH. Fault probes fire roughly two million times on the cold-Go
+ * workload, and eligible zfod events now enter the principal buffer. Exact
+ * totals are lossless, but page aggregation remains sampled because the old
  * exact page census made libdtrace spend material CPU in aggregation snapshots.
  * Traced elapsed time is diagnostic metadata, never performance authority.
  */
 #pragma D option quiet
 #pragma D option aggsize=64m
 #pragma D option dynvarsize=64m
-#pragma D option bufsize=32m
+#pragma D option bufsize=64m
 #pragma D option temporal=true
+#pragma D option switchrate=10ms
 
 dtrace:::BEGIN
 {
@@ -49,6 +60,12 @@ dtrace:::BEGIN
 	live_pids = 0;
 	next_fork_id = (uint64_t)0;
 	pending_forks = 0;
+	memory_intent_entries = 0;
+	memory_intent_returns = 0;
+	memory_inflight = 0;
+	memory_total_zfod = 0;
+	memory_exported_zfod = 0;
+	memory_unexported_zfod = 0;
 
 	/* Fix retained dynamic-array values at their intended widths. */
 	tracked[(pid_t)0] = 0;
@@ -72,6 +89,16 @@ dtrace:::BEGIN
 	pending_parent_epoch[(pid_t)0] = (uint64_t)0;
 	pending_catalog_frontier[(pid_t)0] = (uint64_t)0;
 	pending_fork_id[(pid_t)0] = (uint64_t)0;
+	memory_sequence[(pid_t)0] = (uint64_t)0;
+	memory_number[(pid_t)0, (uint64_t)0] = (uint64_t)0;
+	memory_active_sequence[(pid_t)0, (uint64_t)0] = (uint64_t)0;
+	memory_entry_ns[(pid_t)0, (uint64_t)0] = (uint64_t)0;
+	memory_arg0[(pid_t)0, (uint64_t)0] = (uint64_t)0;
+	memory_arg1[(pid_t)0, (uint64_t)0] = (uint64_t)0;
+	memory_arg2[(pid_t)0, (uint64_t)0] = (uint64_t)0;
+	memory_arg3[(pid_t)0, (uint64_t)0] = (uint64_t)0;
+	memory_arg4[(pid_t)0, (uint64_t)0] = (uint64_t)0;
+	memory_arg5[(pid_t)0, (uint64_t)0] = (uint64_t)0;
 
 	terminal_scope["", ""] = 0;
 
@@ -80,6 +107,53 @@ dtrace:::BEGIN
 	/* CARRICK_NFAULT2_TERMINALS */
 }
 
+/*
+ * Guest memory-intent wire capture. Canonical AArch64 Linux syscall numbers:
+ * munmap=215, mmap=222, mprotect=226, madvise=233. arg2 is the address of
+ * Carrick's six contiguous native-u64 SyscallArgs words, qualified by the
+ * existing guest-mmap-shape profile. A completed record is emitted only from
+ * the matching return, but carries both timestamps so offline replay can place
+ * exact zfod events that occurred inside the operation.
+ */
+carrick*:::syscall-entry
+/tracked[pid] && ((uint64_t)arg0 == (uint64_t)215 ||
+    (uint64_t)arg0 == (uint64_t)222 ||
+    (uint64_t)arg0 == (uint64_t)226 ||
+    (uint64_t)arg0 == (uint64_t)233) &&
+    memory_number[pid, tid] == (uint64_t)0/
+{
+	this->args = (uint64_t *)copyin(arg2, 48);
+	memory_sequence[pid]++;
+	memory_number[pid, tid] = (uint64_t)arg0;
+	memory_active_sequence[pid, tid] = memory_sequence[pid];
+	memory_entry_ns[pid, tid] = timestamp;
+	memory_arg0[pid, tid] = this->args[0];
+	memory_arg1[pid, tid] = this->args[1];
+	memory_arg2[pid, tid] = this->args[2];
+	memory_arg3[pid, tid] = this->args[3];
+	memory_arg4[pid, tid] = this->args[4];
+	memory_arg5[pid, tid] = this->args[5];
+	memory_intent_entries++;
+	memory_inflight++;
+}
+
+carrick*:::syscall-return
+/tracked[pid] && memory_number[pid, tid] != (uint64_t)0 &&
+    memory_number[pid, tid] == (uint64_t)arg0/
+{
+	printf("NFAULT2|memory-intent|pid=%d|start_sec=%d|start_usec=%d|image=%d|tid=%d|sequence=%d|number=%d|entry_ns=%d|return_ns=%d|arg0=%d|arg1=%d|arg2=%d|arg3=%d|arg4=%d|arg5=%d|retval=%d|errno=%d\n",
+	    pid, birth_sec[pid], birth_usec[pid], image_generation[pid], tid,
+	    memory_active_sequence[pid, tid], memory_number[pid, tid],
+	    memory_entry_ns[pid, tid], timestamp, memory_arg0[pid, tid],
+	    memory_arg1[pid, tid], memory_arg2[pid, tid], memory_arg3[pid, tid],
+	    memory_arg4[pid, tid], memory_arg5[pid, tid], (int64_t)arg2,
+	    (int32_t)arg3);
+	memory_intent_returns++;
+	memory_inflight--;
+	memory_number[pid, tid] = (uint64_t)0;
+	memory_active_sequence[pid, tid] = (uint64_t)0;
+	memory_entry_ns[pid, tid] = (uint64_t)0;
+}
 /* A D action fault makes the exact stream non-authoritative. */
 dtrace:::ERROR
 {
@@ -173,9 +247,13 @@ carrick*:::host-native-owned-range-reset
 	identity_violations++;
 }
 
-/* Latch the complete parent catalog identity at host fork creation. */
+/*
+ * Latch the complete parent catalog identity at host fork creation. Darwin's
+ * proc:::create also reports same-PID thread creation on this host; those are
+ * not process-tree edges and must not consume a fork id or lifecycle slot.
+ */
 proc:::create
-/tracked[pid]/
+/tracked[pid] && (pid_t)args[0]->pr_pid != (pid_t)pid/
 {
 	this->child = (pid_t)args[0]->pr_pid;
 	next_fork_id++;
@@ -366,6 +444,54 @@ vminfo:::zfod
 	@total_zfod[pid, birth_sec[pid], birth_usec[pid]] = count();
 }
 
+/*
+ * Exact temporal export for the portion a guest-memory sequence can own.
+ * Native Darwin maps the guest heap and private mmap arena at their guest VAs,
+ * so arg2 can be compared directly. Faults elsewhere are still exact in the
+ * ordinary totals and enter the explicit unexported remainder unless they
+ * occurred while one of the four guest memory syscalls was active.
+ */
+vminfo:::zfod
+/(pid == $target || progenyof($target)) &&
+    (birth_seen[pid] != 0 || pending_fork_id[pid] != (uint64_t)0)/
+{
+	memory_total_zfod++;
+}
+
+vminfo:::zfod
+/tracked[pid] && (uint64_t)arg2 != (uint64_t)0 &&
+    (uint64_t)arg2 < (uint64_t)0x0001000000000000 &&
+    ((uint64_t)arg2 & (uint64_t)0x3fff) == (uint64_t)0 &&
+    (memory_number[pid, tid] != (uint64_t)0 ||
+    ((uint64_t)arg2 >= (uint64_t)0x0000000800000000 &&
+    (uint64_t)arg2 < (uint64_t)0x0000000808000000) ||
+    ((uint64_t)arg2 >= (uint64_t)0x000000a000000000 &&
+    (uint64_t)arg2 < (uint64_t)0x000000a800000000))/
+{
+	printf("NFAULT2|fault-event|outcome=zfod|pid=%d|start_sec=%d|start_usec=%d|image=%d|tid=%d|timestamp_ns=%d|page=%#x|active_number=%d|active_sequence=%d|scope=%s\n",
+	    pid, birth_sec[pid], birth_usec[pid], image_generation[pid], tid,
+	    timestamp, (uint64_t)arg2, memory_number[pid, tid],
+	    memory_active_sequence[pid, tid],
+	    memory_number[pid, tid] != (uint64_t)0 ?
+	    "active-memory" : "guest-arena");
+	memory_exported_zfod++;
+}
+
+vminfo:::zfod
+/(pid == $target || progenyof($target)) &&
+    (birth_seen[pid] != 0 || pending_fork_id[pid] != (uint64_t)0) &&
+    !(tracked[pid] && (uint64_t)arg2 != (uint64_t)0 &&
+    (uint64_t)arg2 < (uint64_t)0x0001000000000000 &&
+    ((uint64_t)arg2 & (uint64_t)0x3fff) == (uint64_t)0 &&
+    (memory_number[pid, tid] != (uint64_t)0 ||
+    ((uint64_t)arg2 >= (uint64_t)0x0000000800000000 &&
+    (uint64_t)arg2 < (uint64_t)0x0000000808000000) ||
+    ((uint64_t)arg2 >= (uint64_t)0x000000a000000000 &&
+    (uint64_t)arg2 < (uint64_t)0x000000a800000000)))/
+{
+	memory_unexported_zfod++;
+}
+
 vminfo:::cow_fault
 /(pid == $target || progenyof($target)) && birth_seen[pid] != 0/
 {
@@ -534,6 +660,9 @@ dtrace:::END
 	    @prebirth_rejected_as);
 	printa("NFAULT2|prebirth-rejected|outcome=zfod|fork_id=%d|count=%@u\n",
 	    @prebirth_rejected_zfod);
+	printf("NFAULT2|memory-census|total_zfod=%d|exported_zfod=%d|unexported_zfod=%d|intent_entries=%d|intent_returns=%d|inflight=%d\n",
+	    memory_total_zfod, memory_exported_zfod, memory_unexported_zfod,
+	    memory_intent_entries, memory_intent_returns, memory_inflight);
 	printf("NFAULT2|complete|profile=native-fault|bounded=%d|timed_out=%d|target_exit=%d|target_exit_reason=%d|identity_violations=%d|lifecycle_violations=%d|catalog_violations=%d|probe_errors=%d|live_at_end=%d|pending_forks=%d|elapsed_ns=%d\n",
 	    timed_out || target_exit == 0 || root_pid == (pid_t)0 ||
 	    identity_violations != 0 || lifecycle_violations != 0 ||

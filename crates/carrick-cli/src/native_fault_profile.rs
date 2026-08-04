@@ -11,7 +11,7 @@ use tempfile::NamedTempFile;
 
 use crate::trace_profile::{ProfileCaptureStatus, ProfileProvenance, V2ProfileAuthority};
 
-const JSON_SCHEMA: &str = "carrick.native-fault-attribution.v2";
+const JSON_SCHEMA: &str = "carrick.native-fault-attribution.v3";
 const PAGE_SIZE: u64 = 16_384;
 const PAGE_SAMPLE_MODULUS: u64 = 64;
 
@@ -102,6 +102,36 @@ struct PageSample {
     count: u64,
 }
 
+#[derive(Clone, Debug)]
+struct MemoryIntentRecord {
+    key: ImageKey,
+    tid: u64,
+    sequence: u64,
+    number: u64,
+    entry_ns: u64,
+    return_ns: u64,
+    args: [u64; 6],
+    retval: i64,
+    errno: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MemoryFaultScope {
+    ActiveMemory,
+    GuestArena,
+}
+
+#[derive(Clone, Debug)]
+struct MemoryFaultEvent {
+    key: ImageKey,
+    tid: u64,
+    timestamp_ns: u64,
+    page: u64,
+    active_number: u64,
+    active_sequence: u64,
+    scope: MemoryFaultScope,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ProcessState {
     image: u64,
@@ -182,6 +212,33 @@ pub(crate) struct NativeFaultHotPage {
     count: u64,
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+pub(crate) struct NativeMemoryCensus {
+    total_zfod: u64,
+    exported_zfod: u64,
+    unexported_zfod: u64,
+    intent_records: u64,
+    active_memory_faults: u64,
+    guest_arena_faults: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct NativeMemoryOperationBucket {
+    operation: &'static str,
+    shape: String,
+    calls: u64,
+    requested_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct NativeMemoryFaultBucket {
+    phase: &'static str,
+    semantic_sequence: String,
+    mapping_provenance: String,
+    exact_zfod: u64,
+    share_of_all_zfod: f64,
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 struct NativeFaultProvenance {
     run_id: String,
@@ -213,6 +270,9 @@ pub(crate) struct NativeFaultSummary {
     ownership: Vec<NativeFaultOwnershipBucket>,
     processes: Vec<NativeFaultProcessSummary>,
     hot_pages: Vec<NativeFaultHotPage>,
+    memory_census: NativeMemoryCensus,
+    memory_operations: Vec<NativeMemoryOperationBucket>,
+    memory_faults: Vec<NativeMemoryFaultBucket>,
     pub(crate) excluded_processes: u64,
     provenance: NativeFaultProvenance,
 }
@@ -295,6 +355,12 @@ impl RawRecord {
             value => bail!("{} field {name} is not 0 or 1: {value:?}", self.kind),
         }
     }
+
+    fn signed_number(&self, name: &str) -> Result<i64> {
+        self.text(name)?
+            .parse::<i64>()
+            .with_context(|| format!("{} field {name} is not signed decimal", self.kind))
+    }
 }
 
 #[derive(Default)]
@@ -315,6 +381,14 @@ struct NativeFaultValidator {
     prebirth_pages: BTreeMap<(Outcome, u64, u64), u64>,
     prebirth_totals: BTreeMap<(u64, Outcome), u64>,
     prebirth_rejected: BTreeMap<(u64, Outcome), u64>,
+    last_memory_sequence: BTreeMap<BirthKey, u64>,
+    memory_intents: u64,
+    fault_events: u64,
+    active_memory_faults: u64,
+    guest_arena_faults: u64,
+    memory_census: Option<(u64, u64, u64, u64, u64, u64)>,
+    memory_intent_records: Vec<MemoryIntentRecord>,
+    memory_fault_events: Vec<MemoryFaultEvent>,
 }
 
 impl NativeFaultValidator {
@@ -704,6 +778,139 @@ impl NativeFaultValidator {
         Ok(())
     }
 
+    fn add_memory_intent(&mut self, record: &RawRecord) -> Result<()> {
+        let key = image_from(record, "pid", "start_sec", "start_usec", "image")?;
+        self.require_birth(key.birth, "memory-intent")?;
+        let state = active_state(&mut self.states, key.birth, "memory-intent")?;
+        if state.image != key.image {
+            bail!("memory-intent image drift from active process state");
+        }
+        let tid = nonzero(record.number("tid")?, "memory-intent tid")?;
+        let sequence = nonzero(record.number("sequence")?, "memory-intent sequence")?;
+        let expected = self
+            .last_memory_sequence
+            .get(&key.birth)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("memory-intent sequence overflow"))?;
+        if sequence != expected {
+            bail!("memory-intent sequence {sequence} does not match expected {expected}");
+        }
+        self.last_memory_sequence.insert(key.birth, sequence);
+        let number = record.number("number")?;
+        if !matches!(number, 215 | 222 | 226 | 233) {
+            bail!("unknown memory-intent syscall number {number}");
+        }
+        let entry_ns = nonzero(record.number("entry_ns")?, "memory-intent entry_ns")?;
+        let return_ns = nonzero(record.number("return_ns")?, "memory-intent return_ns")?;
+        if return_ns < entry_ns {
+            bail!("memory-intent return precedes entry");
+        }
+        let args = [
+            record.number("arg0")?,
+            record.number("arg1")?,
+            record.number("arg2")?,
+            record.number("arg3")?,
+            record.number("arg4")?,
+            record.number("arg5")?,
+        ];
+        let retval = record.signed_number("retval")?;
+        let errno = record.number("errno")?;
+        let Ok(errno) = u32::try_from(errno) else {
+            bail!("memory-intent errno exceeds i32");
+        };
+        self.memory_intent_records.push(MemoryIntentRecord {
+            key,
+            tid,
+            sequence,
+            number,
+            entry_ns,
+            return_ns,
+            args,
+            retval,
+            errno,
+        });
+        self.memory_intents = self
+            .memory_intents
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("memory-intent record count overflow"))?;
+        Ok(())
+    }
+
+    fn add_fault_event(&mut self, record: &RawRecord) -> Result<()> {
+        if Outcome::parse(record.text("outcome")?, true)? != Outcome::Zfod {
+            bail!("memory fault-event outcome must be zfod");
+        }
+        let key = image_from(record, "pid", "start_sec", "start_usec", "image")?;
+        self.require_birth(key.birth, "fault-event")?;
+        let state = active_state(&mut self.states, key.birth, "fault-event")?;
+        if state.image != key.image {
+            bail!("fault-event image drift from active process state");
+        }
+        let tid = nonzero(record.number("tid")?, "fault-event tid")?;
+        let timestamp_ns = nonzero(record.number("timestamp_ns")?, "fault-event timestamp_ns")?;
+        let page = record.number("page")?;
+        if page == 0 || page >= 0x0001_0000_0000_0000 || !page.is_multiple_of(PAGE_SIZE) {
+            bail!("fault-event page is zero, noncanonical, or not page aligned");
+        }
+        let active_number = record.number("active_number")?;
+        let active_sequence = record.number("active_sequence")?;
+        let scope = record.text("scope")?;
+        let scope = match scope {
+            "active-memory" => {
+                if !matches!(active_number, 215 | 222 | 226 | 233) || active_sequence == 0 {
+                    bail!("active-memory fault lacks a valid memory intent");
+                }
+                self.active_memory_faults = self
+                    .active_memory_faults
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("active memory fault count overflow"))?;
+                MemoryFaultScope::ActiveMemory
+            }
+            "guest-arena" => {
+                if active_number != 0 || active_sequence != 0 {
+                    bail!("guest-arena fault unexpectedly names an active memory intent");
+                }
+                self.guest_arena_faults = self
+                    .guest_arena_faults
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("guest arena fault count overflow"))?;
+                MemoryFaultScope::GuestArena
+            }
+            other => bail!("unknown fault-event scope {other:?}"),
+        };
+        self.memory_fault_events.push(MemoryFaultEvent {
+            key,
+            tid,
+            timestamp_ns,
+            page,
+            active_number,
+            active_sequence,
+            scope,
+        });
+        self.fault_events = self
+            .fault_events
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("fault-event count overflow"))?;
+        Ok(())
+    }
+
+    fn add_memory_census(&mut self, record: &RawRecord) -> Result<()> {
+        let values = (
+            record.number("total_zfod")?,
+            record.number("exported_zfod")?,
+            record.number("unexported_zfod")?,
+            record.number("intent_entries")?,
+            record.number("intent_returns")?,
+            record.number("inflight")?,
+        );
+        if self.memory_census.replace(values).is_some() {
+            bail!("duplicate memory-census record");
+        }
+        Ok(())
+    }
+
     fn add_completion(&mut self, record: &RawRecord) -> Result<()> {
         if record.text("profile")? != "native-fault" {
             bail!("completion profile is not native-fault");
@@ -939,6 +1146,64 @@ impl NativeFaultSummary {
                     record.require_fields(&["outcome", "fork_id", "count"], line_number)?;
                     validator.add_prebirth_total(&record, record.kind == "prebirth-rejected")?;
                 }
+                "memory-intent" => {
+                    record.require_fields(
+                        &[
+                            "pid",
+                            "start_sec",
+                            "start_usec",
+                            "image",
+                            "tid",
+                            "sequence",
+                            "number",
+                            "entry_ns",
+                            "return_ns",
+                            "arg0",
+                            "arg1",
+                            "arg2",
+                            "arg3",
+                            "arg4",
+                            "arg5",
+                            "retval",
+                            "errno",
+                        ],
+                        line_number,
+                    )?;
+                    validator.add_memory_intent(&record)?;
+                }
+                "fault-event" => {
+                    record.require_fields(
+                        &[
+                            "outcome",
+                            "pid",
+                            "start_sec",
+                            "start_usec",
+                            "image",
+                            "tid",
+                            "timestamp_ns",
+                            "page",
+                            "active_number",
+                            "active_sequence",
+                            "scope",
+                        ],
+                        line_number,
+                    )?;
+                    validator.add_fault_event(&record)?;
+                }
+                "memory-census" => {
+                    record.require_fields(
+                        &[
+                            "total_zfod",
+                            "exported_zfod",
+                            "unexported_zfod",
+                            "intent_entries",
+                            "intent_returns",
+                            "inflight",
+                        ],
+                        line_number,
+                    )?;
+                    validator.add_memory_census(&record)?;
+                }
                 "complete" => {
                     record.require_fields(
                         &[
@@ -986,6 +1251,60 @@ impl NativeFaultSummary {
         bind_prebirth_records(&mut validator)?;
         let reachable = reachable_births(target.birth, &validator.creates)?;
         validate_catalogs_and_exits(&validator, target, &reachable, completion)?;
+        let (total_zfod, exported_zfod, unexported_zfod, intent_entries, intent_returns, inflight) =
+            validator
+                .memory_census
+                .ok_or_else(|| anyhow!("native-fault stream has no memory-census record"))?;
+        if inflight != 0 {
+            bail!("memory census ended with {inflight} in-flight operation(s)");
+        }
+        if intent_entries != validator.memory_intents {
+            bail!(
+                "memory intent entry count {intent_entries} does not match {} exported records",
+                validator.memory_intents
+            );
+        }
+        if intent_returns != validator.memory_intents {
+            bail!(
+                "memory intent return count {intent_returns} does not match {} exported records",
+                validator.memory_intents
+            );
+        }
+        if exported_zfod != validator.fault_events {
+            bail!(
+                "exported zfod count {exported_zfod} does not match {} fault events",
+                validator.fault_events
+            );
+        }
+        let reconciled_total = exported_zfod
+            .checked_add(unexported_zfod)
+            .ok_or_else(|| anyhow!("memory census zfod count overflow"))?;
+        if total_zfod != reconciled_total {
+            bail!("memory census total zfod does not reconcile exported and unexported counts");
+        }
+        let exact_zfod = validator
+            .totals
+            .iter()
+            .filter(|((_, outcome), _)| *outcome == Outcome::Zfod)
+            .try_fold(0u64, |sum, (_, count)| sum.checked_add(*count))
+            .ok_or_else(|| anyhow!("exact zfod total overflow"))?;
+        if total_zfod != exact_zfod {
+            bail!("memory census total zfod {total_zfod} does not match exact total {exact_zfod}");
+        }
+        let memory_census = NativeMemoryCensus {
+            total_zfod,
+            exported_zfod,
+            unexported_zfod,
+            intent_records: validator.memory_intents,
+            active_memory_faults: validator.active_memory_faults,
+            guest_arena_faults: validator.guest_arena_faults,
+        };
+        let (memory_operations, memory_faults) = summarize_memory_intent(
+            &validator.memory_intent_records,
+            &validator.memory_fault_events,
+            total_zfod,
+            unexported_zfod,
+        )?;
 
         let mut classified = Vec::new();
         let mut sampled_by_process_outcome = BTreeMap::<(BirthKey, Outcome), u64>::new();
@@ -1098,6 +1417,9 @@ impl NativeFaultSummary {
             ownership,
             processes,
             hot_pages,
+            memory_census,
+            memory_operations,
+            memory_faults,
             excluded_processes,
             provenance: NativeFaultProvenance::default(),
         })
@@ -1693,6 +2015,334 @@ fn build_hot_pages(
     Ok(rows)
 }
 
+#[derive(Clone, Debug)]
+struct ObservedPageState {
+    semantic_sequence: String,
+    mapping_provenance: String,
+}
+
+fn memory_operation_name(number: u64) -> Result<&'static str> {
+    match number {
+        215 => Ok("munmap"),
+        222 => Ok("mmap"),
+        226 => Ok("mprotect"),
+        233 => Ok("madvise"),
+        other => bail!("unknown memory syscall number {other}"),
+    }
+}
+
+fn mmap_provenance(flags: u64) -> String {
+    let backing = if flags & 0x20 != 0 { "anon" } else { "file" };
+    let sharing = if flags & 0x01 != 0 {
+        "shared"
+    } else if flags & 0x02 != 0 {
+        "private"
+    } else {
+        "unknown-sharing"
+    };
+    format!("{backing}-{sharing}")
+}
+
+fn memory_operation_shape(intent: &MemoryIntentRecord) -> Result<String> {
+    Ok(match intent.number {
+        215 => "unmap".to_owned(),
+        222 => mmap_provenance(intent.args[3]),
+        226 => format!("prot-{:#x}", intent.args[2]),
+        233 => match intent.args[2] {
+            4 => "dontneed".to_owned(),
+            8 => "free".to_owned(),
+            advice => format!("advice-{advice}"),
+        },
+        other => bail!("unknown memory syscall number {other}"),
+    })
+}
+
+fn host_page_bounds(start: u64, len: u64) -> Result<Option<(u64, u64)>> {
+    if len == 0 {
+        return Ok(None);
+    }
+    let start = start & !(PAGE_SIZE - 1);
+    let raw_end = start
+        .checked_add(len)
+        .ok_or_else(|| anyhow!("memory intent range overflow"))?;
+    let end = raw_end
+        .checked_add(PAGE_SIZE - 1)
+        .map(|value| value & !(PAGE_SIZE - 1))
+        .ok_or_else(|| anyhow!("memory intent page rounding overflow"))?;
+    Ok((start < end).then_some((start, end)))
+}
+
+fn summarize_memory_intent(
+    intents: &[MemoryIntentRecord],
+    faults: &[MemoryFaultEvent],
+    total_zfod: u64,
+    unexported_zfod: u64,
+) -> Result<(
+    Vec<NativeMemoryOperationBucket>,
+    Vec<NativeMemoryFaultBucket>,
+)> {
+    let mut operation_counts = BTreeMap::<(&'static str, String), (u64, u64)>::new();
+    let mut intent_by_sequence = BTreeMap::<(BirthKey, u64), &MemoryIntentRecord>::new();
+    for intent in intents {
+        let operation = memory_operation_name(intent.number)?;
+        let shape = memory_operation_shape(intent)?;
+        let bucket = operation_counts.entry((operation, shape)).or_insert((0, 0));
+        bucket.0 = bucket
+            .0
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("memory operation count overflow"))?;
+        bucket.1 = bucket
+            .1
+            .checked_add(intent.args[1])
+            .ok_or_else(|| anyhow!("memory operation byte count overflow"))?;
+        if intent_by_sequence
+            .insert((intent.key.birth, intent.sequence), intent)
+            .is_some()
+        {
+            bail!("duplicate memory intent sequence during summary");
+        }
+    }
+
+    let mut fault_counts = BTreeMap::<(&'static str, String, String), u64>::new();
+    let mut add_fault = |phase: &'static str, semantic: String, provenance: String| -> Result<()> {
+        let count = fault_counts
+            .entry((phase, semantic, provenance))
+            .or_default();
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("memory fault bucket overflow"))?;
+        Ok(())
+    };
+
+    for fault in faults
+        .iter()
+        .filter(|fault| fault.scope == MemoryFaultScope::ActiveMemory)
+    {
+        let intent = intent_by_sequence
+            .get(&(fault.key.birth, fault.active_sequence))
+            .copied()
+            .ok_or_else(|| anyhow!("active fault has no completed memory intent"))?;
+        if intent.key != fault.key
+            || intent.tid != fault.tid
+            || intent.number != fault.active_number
+        {
+            bail!("active fault identity does not match its memory intent");
+        }
+        if fault.timestamp_ns < intent.entry_ns || fault.timestamp_ns > intent.return_ns {
+            bail!("active fault timestamp falls outside its memory intent");
+        }
+        let operation = memory_operation_name(intent.number)?;
+        let shape = memory_operation_shape(intent)?;
+        let provenance = if intent.number == 222 {
+            shape.clone()
+        } else {
+            "existing-mapping".to_owned()
+        };
+        add_fault(
+            "during-operation",
+            format!("{operation}-{shape}"),
+            provenance,
+        )?;
+    }
+
+    let mut intents_by_image = BTreeMap::<ImageKey, Vec<&MemoryIntentRecord>>::new();
+    for intent in intents {
+        intents_by_image.entry(intent.key).or_default().push(intent);
+    }
+    let mut faults_by_image = BTreeMap::<ImageKey, Vec<&MemoryFaultEvent>>::new();
+    for fault in faults
+        .iter()
+        .filter(|fault| fault.scope == MemoryFaultScope::GuestArena)
+    {
+        faults_by_image.entry(fault.key).or_default().push(fault);
+    }
+
+    for (key, image_faults) in faults_by_image {
+        #[derive(Clone, Copy)]
+        enum TimelineEvent {
+            Begin(usize),
+            Fault(usize),
+            End(usize),
+        }
+
+        let image_intents = intents_by_image.get(&key).cloned().unwrap_or_default();
+        let candidate_pages = image_faults
+            .iter()
+            .map(|fault| fault.page)
+            .collect::<BTreeSet<_>>();
+        let mut timeline = Vec::<(u64, u8, TimelineEvent)>::new();
+        for (index, intent) in image_intents.iter().enumerate() {
+            timeline.push((intent.entry_ns, 0, TimelineEvent::Begin(index)));
+            timeline.push((intent.return_ns, 2, TimelineEvent::End(index)));
+        }
+        for (index, fault) in image_faults.iter().enumerate() {
+            timeline.push((fault.timestamp_ns, 1, TimelineEvent::Fault(index)));
+        }
+        timeline.sort_by_key(|(timestamp, order, _)| (*timestamp, *order));
+
+        let mut active = BTreeSet::<(u64, u64)>::new();
+        let mut page_state = BTreeMap::<u64, ObservedPageState>::new();
+        for (_, _, event) in timeline {
+            match event {
+                TimelineEvent::Begin(index) => {
+                    let intent = image_intents[index];
+                    active.insert((intent.tid, intent.sequence));
+                }
+                TimelineEvent::Fault(index) => {
+                    let fault = image_faults[index];
+                    if !active.is_empty() {
+                        add_fault(
+                            "subsequent-touch",
+                            "concurrent-memory-operation".to_owned(),
+                            "mixed-or-transitioning".to_owned(),
+                        )?;
+                    } else if let Some(state) = page_state.get(&fault.page) {
+                        add_fault(
+                            "subsequent-touch",
+                            state.semantic_sequence.clone(),
+                            state.mapping_provenance.clone(),
+                        )?;
+                    } else {
+                        add_fault(
+                            "subsequent-touch",
+                            "initial-exec-brk-or-fork".to_owned(),
+                            "not-created-by-observed-mmap".to_owned(),
+                        )?;
+                    }
+                }
+                TimelineEvent::End(index) => {
+                    let intent = image_intents[index];
+                    if !active.remove(&(intent.tid, intent.sequence)) {
+                        bail!("memory intent timeline ended an inactive operation");
+                    }
+                    if intent.errno != 0 || intent.retval < 0 {
+                        continue;
+                    }
+                    let operation = memory_operation_name(intent.number)?;
+                    let start = if intent.number == 222 {
+                        u64::try_from(intent.retval)
+                            .map_err(|_| anyhow!("successful mmap returned a negative address"))?
+                    } else {
+                        intent.args[0]
+                    };
+                    let Some((start, end)) = host_page_bounds(start, intent.args[1])? else {
+                        continue;
+                    };
+                    let affected = candidate_pages
+                        .range(start..end)
+                        .copied()
+                        .collect::<Vec<_>>();
+                    for page in affected {
+                        let prior = page_state.get(&page).cloned();
+                        let provenance = if intent.number == 222 {
+                            mmap_provenance(intent.args[3])
+                        } else {
+                            prior
+                                .as_ref()
+                                .map(|state| state.mapping_provenance.clone())
+                                .unwrap_or_else(|| "preexisting-or-unknown".to_owned())
+                        };
+                        let semantic_sequence = match intent.number {
+                            215 => "munmap".to_owned(),
+                            222 => {
+                                if prior
+                                    .as_ref()
+                                    .is_some_and(|state| state.semantic_sequence == "munmap")
+                                {
+                                    "mmap-reuse".to_owned()
+                                } else {
+                                    "mmap-fresh".to_owned()
+                                }
+                            }
+                            226 if intent.args[2] == 0 => "mprotect-none".to_owned(),
+                            226 if prior.as_ref().is_some_and(|state| {
+                                state.semantic_sequence == "mprotect-none"
+                            }) =>
+                            {
+                                "mprotect-reenable".to_owned()
+                            }
+                            226 => "mprotect-other".to_owned(),
+                            233 if intent.args[2] == 4 => "madvise-dontneed".to_owned(),
+                            233 if intent.args[2] == 8 => "madvise-free".to_owned(),
+                            233 => format!("madvise-{}", intent.args[2]),
+                            _ => format!("{operation}-unknown"),
+                        };
+                        page_state.insert(
+                            page,
+                            ObservedPageState {
+                                semantic_sequence,
+                                mapping_provenance: provenance,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        if !active.is_empty() {
+            bail!("memory intent timeline ended with active operations");
+        }
+    }
+
+    if unexported_zfod != 0 {
+        fault_counts.insert(
+            (
+                "unexported",
+                "outside-active-memory-and-native-arenas".to_owned(),
+                "host-other-or-untracked".to_owned(),
+            ),
+            unexported_zfod,
+        );
+    }
+    let reconciled_faults = fault_counts
+        .values()
+        .try_fold(0u64, |sum, count| sum.checked_add(*count))
+        .ok_or_else(|| anyhow!("memory fault summary overflow"))?;
+    if reconciled_faults != total_zfod {
+        bail!(
+            "memory fault buckets total {reconciled_faults} does not match exact zfod {total_zfod}"
+        );
+    }
+
+    let memory_operations = operation_counts
+        .into_iter()
+        .map(
+            |((operation, shape), (calls, requested_bytes))| NativeMemoryOperationBucket {
+                operation,
+                shape,
+                calls,
+                requested_bytes,
+            },
+        )
+        .collect();
+    let mut memory_faults = fault_counts
+        .into_iter()
+        .map(
+            |((phase, semantic_sequence, mapping_provenance), exact_zfod)| {
+                NativeMemoryFaultBucket {
+                    phase,
+                    semantic_sequence,
+                    mapping_provenance,
+                    exact_zfod,
+                    share_of_all_zfod: if total_zfod == 0 {
+                        0.0
+                    } else {
+                        exact_zfod as f64 / total_zfod as f64
+                    },
+                }
+            },
+        )
+        .collect::<Vec<_>>();
+    memory_faults.sort_by(|left, right| {
+        right
+            .exact_zfod
+            .cmp(&left.exact_zfod)
+            .then_with(|| left.phase.cmp(right.phase))
+            .then_with(|| left.semantic_sequence.cmp(&right.semantic_sequence))
+            .then_with(|| left.mapping_provenance.cmp(&right.mapping_provenance))
+    });
+    Ok((memory_operations, memory_faults))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1734,6 +2384,8 @@ mod tests {
 \nNFAULT2|catalog-reset|pid=10|start_sec=100|start_usec=20|image=1|epoch=7\
 \nNFAULT2|catalog-range|pid=10|start_sec=100|start_usec=20|image=1|epoch=7|sequence=1|start=0x10000|end=0x18000\
 \nNFAULT2|catalog-ready|pid=10|start_sec=100|start_usec=20|image=1|epoch=7|final_sequence=1\
+\nNFAULT2|memory-intent|pid=10|start_sec=100|start_usec=20|image=1|tid=10|sequence=1|number=222|entry_ns=100|return_ns=200|arg0=0|arg1=16384|arg2=3|arg3=34|arg4=18446744073709551615|arg5=0|retval=65536|errno=0\
+\nNFAULT2|fault-event|outcome=zfod|pid=10|start_sec=100|start_usec=20|image=1|tid=10|timestamp_ns=250|page=0x10000|active_number=0|active_sequence=0|scope=guest-arena\
 \nNFAULT2|birth|pid=11|start_sec=101|start_usec=21\
 \nNFAULT2|process-create|child_pid=11|child_sec=101|child_usec=21|child_image=1|child_epoch=7|fork_id=41|parent_pid=10|parent_sec=100|parent_usec=20|parent_image=1|parent_epoch=7\
 \nNFAULT2|fork-inherit|child_pid=11|child_sec=101|child_usec=21|child_image=1|child_epoch=7|fork_id=41|parent_pid=10|parent_sec=100|parent_usec=20|parent_image=1|parent_epoch=7|range_frontier=1\
@@ -1754,6 +2406,7 @@ mod tests {
 \nNFAULT2|total|outcome=zfod|pid=11|start_sec=101|start_usec=21|count=6\
 \nNFAULT2|total|outcome=cow_fault|pid=11|start_sec=101|start_usec=21|count=1\
 \nNFAULT2|rejected|outcome=zfod|pid=10|start_sec=100|start_usec=20|count=2\
+\nNFAULT2|memory-census|total_zfod=96|exported_zfod=1|unexported_zfod=95|intent_entries=1|intent_returns=1|inflight=0\
 \nNFAULT2|complete|profile=native-fault|bounded=0|timed_out=0|target_exit=1|target_exit_reason=1|identity_violations=0|lifecycle_violations=0|catalog_violations=0|probe_errors=0|live_at_end=0|pending_forks=0|elapsed_ns=9000000\n",
             authority().header_record()
         )
@@ -1781,7 +2434,7 @@ mod tests {
     #[test]
     fn accepts_parent_catalog_target_image_zero_fork_inheritance_and_host_other() {
         let summary = parse(&fixture()).expect("valid fixture");
-        assert_eq!(summary.schema, "carrick.native-fault-attribution.v2");
+        assert_eq!(summary.schema, "carrick.native-fault-attribution.v3");
         assert!(!summary.gating_eligible);
         assert_eq!(summary.exact_total("zfod"), Some(16));
         assert_eq!(summary.excluded_processes, 1);
@@ -1791,6 +2444,23 @@ mod tests {
         assert_eq!(json["birth_qualification_sha256"], BIRTH_SHA256);
         assert_eq!(json["terminal_qualification_sha256"], TERMINAL_SHA256);
         assert_eq!(json["page_sample_modulus"], 64);
+        assert_eq!(json["memory_census"]["total_zfod"], 96);
+        assert_eq!(json["memory_census"]["exported_zfod"], 1);
+        assert_eq!(json["memory_census"]["unexported_zfod"], 95);
+        assert_eq!(json["memory_census"]["intent_records"], 1);
+        assert_eq!(json["memory_operations"][0]["operation"], "mmap");
+        assert_eq!(json["memory_operations"][0]["shape"], "anon-private");
+        assert_eq!(json["memory_operations"][0]["calls"], 1);
+        assert_eq!(json["memory_operations"][0]["requested_bytes"], 16_384);
+        let subsequent = json["memory_faults"]
+            .as_array()
+            .expect("memory fault rows")
+            .iter()
+            .find(|row| row["phase"] == "subsequent-touch")
+            .expect("subsequent mmap fault row");
+        assert_eq!(subsequent["semantic_sequence"], "mmap-fresh");
+        assert_eq!(subsequent["mapping_provenance"], "anon-private");
+        assert_eq!(subsequent["exact_zfod"], 1);
 
         let guest = summary
             .ownership_bucket("zfod", "guest-owned")
@@ -1808,6 +2478,43 @@ mod tests {
         assert_eq!(host.distinct_process_pages, 1);
         assert_eq!(host.repeat_excess, 1);
         assert_eq!(host.scaled_event_estimate, 128);
+    }
+
+    #[test]
+    fn rejects_unreconciled_memory_intent_export() {
+        assert_rejected(
+            fixture().replace("exported_zfod=1", "exported_zfod=2"),
+            "exported zfod",
+        );
+        assert_rejected(
+            fixture().replace("intent_returns=1", "intent_returns=2"),
+            "intent return",
+        );
+        assert_rejected(fixture().replace("inflight=0", "inflight=1"), "in-flight");
+    }
+
+    #[test]
+    fn joins_active_fault_to_the_exact_memory_operation_window() {
+        let active = fixture().replace(
+            "timestamp_ns=250|page=0x10000|active_number=0|active_sequence=0|scope=guest-arena",
+            "timestamp_ns=150|page=0x10000|active_number=222|active_sequence=1|scope=active-memory",
+        );
+        let summary = parse(&active).expect("active fault joins its mmap");
+        let json = serde_json::to_value(&summary).expect("serialize active summary");
+        let row = json["memory_faults"]
+            .as_array()
+            .expect("memory fault rows")
+            .iter()
+            .find(|row| row["phase"] == "during-operation")
+            .expect("during-operation row");
+        assert_eq!(row["semantic_sequence"], "mmap-anon-private");
+        assert_eq!(row["mapping_provenance"], "anon-private");
+        assert_eq!(row["exact_zfod"], 1);
+
+        assert_rejected(
+            active.replace("timestamp_ns=150", "timestamp_ns=250"),
+            "outside its memory intent",
+        );
     }
 
     #[test]
@@ -1853,10 +2560,15 @@ mod tests {
             "zero",
         );
         assert_rejected(
-            fixture().replace(
-                "outcome=zfod|pid=10|start_sec=100|start_usec=20|count=10",
-                "outcome=zfod|pid=10|start_sec=100|start_usec=20|count=4",
-            ),
+            fixture()
+                .replace(
+                    "outcome=zfod|pid=10|start_sec=100|start_usec=20|count=10",
+                    "outcome=zfod|pid=10|start_sec=100|start_usec=20|count=4",
+                )
+                .replace(
+                    "total_zfod=96|exported_zfod=1|unexported_zfod=95",
+                    "total_zfod=90|exported_zfod=1|unexported_zfod=89",
+                ),
             "exceed",
         );
     }
@@ -1933,6 +2645,10 @@ mod tests {
             &fixture(),
             "NFAULT2|complete|",
             "NFAULT2|prebirth-page|outcome=zfod|fork_id=41|page=0x10000|count=2\nNFAULT2|prebirth-total|outcome=zfod|fork_id=41|count=2",
+        )
+        .replace(
+            "total_zfod=96|exported_zfod=1|unexported_zfod=95",
+            "total_zfod=98|exported_zfod=1|unexported_zfod=97",
         );
         let summary = parse(&raw).expect("prebirth records bind to child");
         assert_eq!(summary.exact_total("zfod"), Some(18));
@@ -1994,7 +2710,7 @@ mod tests {
         let contents = fs::read_to_string(path).expect("read report");
         assert_eq!(contents.lines().count(), 1);
         let json: serde_json::Value = serde_json::from_str(contents.trim()).expect("parse report");
-        assert_eq!(json["schema"], "carrick.native-fault-attribution.v2");
+        assert_eq!(json["schema"], "carrick.native-fault-attribution.v3");
         assert_eq!(json["provenance"]["run_id"], "fault-run");
         assert_eq!(json["provenance"]["git_dirty"], false);
         assert_eq!(json["gating_eligible"], false);

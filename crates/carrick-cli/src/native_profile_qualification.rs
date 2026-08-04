@@ -953,7 +953,7 @@ mod tests {
             .expect("render native-fault profile");
         assert_eq!(rendered.program.matches("NFAULT2|header|").count(), 1);
         assert!(rendered.program.contains(
-            "profile=native-fault|raw_schema=carrick.native-fault.raw.v2|os_build=26A123|"
+            "profile=native-fault|raw_schema=carrick.native-fault.raw.v3|os_build=26A123|"
         ));
         assert_eq!(
             rendered.program.matches("terminal_scope[").count(),
