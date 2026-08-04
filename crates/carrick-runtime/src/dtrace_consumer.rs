@@ -906,6 +906,14 @@ mod tests {
     }
 
     #[test]
+    fn native_wall_reports_dtrace_fault_details() {
+        assert!(
+            BUNDLED_NATIVE_WALL_D
+                .contains("DSRERROR2|epid=%d|action=%d|offset=%d|fault=%d|value=%#x")
+        );
+    }
+
+    #[test]
     fn record_consumer_suppresses_exit_status_but_formats_protocol_records() {
         let exit = DtraceRecDesc {
             action: DTRACEACT_EXIT,
