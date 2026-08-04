@@ -2506,10 +2506,7 @@ impl ProcessState {
             // it records its own census outcome — exactly one record per
             // lookup, `replayed` or a skip.
             return match self.replay_attached_unit_block(memory, guest)? {
-                AttachedReplayOutcome::Replayed(entry) => {
-                    xlat_census::record_lookup_replayed();
-                    Ok(Some(entry))
-                }
+                AttachedReplayOutcome::Replayed(entry) => Ok(Some(entry)),
                 AttachedReplayOutcome::Regenerated => {
                     xlat_census::record_lookup_skipped(xlat_census::LookupSkip::Regenerated);
                     Ok(None)
@@ -2767,6 +2764,7 @@ impl ProcessState {
                 block,
                 bindings,
             }),
+            xlat_census::PublicationCensus::UnitReplay,
         ) {
             Ok(_) => {}
             Err(types::DsrError::GenerationChanged { .. }) => {
@@ -2907,6 +2905,7 @@ impl ProcessState {
         emitted: emit::EmittedBlock,
         emitted_bytes: u64,
         outcome: TranslationOutcome,
+        census: xlat_census::PublicationCensus,
     ) -> Result<TranslationResult, types::DsrError> {
         self.publish_emitted_with_metadata(
             memory,
@@ -2917,6 +2916,7 @@ impl ProcessState {
             emitted_bytes,
             outcome,
             None,
+            census,
         )
     }
 
@@ -2934,6 +2934,7 @@ impl ProcessState {
         emitted_bytes: u64,
         outcome: TranslationOutcome,
         metadata: Option<PublishedBlockMetadata>,
+        census: xlat_census::PublicationCensus,
     ) -> Result<TranslationResult, types::DsrError> {
         let entry = emitted.entry();
         // `ProcessState::translate` owns `&mut self` from the process
@@ -2947,6 +2948,46 @@ impl ProcessState {
         let emitted_len = emitted.len();
         let trusted_entry = emitted.trusted_entry();
         let (map, links, recovery) = emitted.into_runtime_metadata();
+        let owns_metadata = metadata.is_none();
+        xlat_census::record_publication(census, || {
+            let capacity_bytes = |capacity: usize, element_size: usize| {
+                u64::try_from(capacity)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(u64::try_from(element_size).unwrap_or(u64::MAX))
+            };
+            xlat_census::CensusMemory {
+                private_blocks: u64::from(owns_metadata),
+                unit_blocks: u64::from(!owns_metadata),
+                jit_bytes_written: u64::try_from(emitted_len).unwrap_or(u64::MAX),
+                owned_map_entries: if owns_metadata {
+                    u64::try_from(map.len()).unwrap_or(u64::MAX)
+                } else {
+                    0
+                },
+                owned_map_capacity_bytes: if owns_metadata {
+                    capacity_bytes(map.capacity(), std::mem::size_of::<emit::PcMapEntry>())
+                } else {
+                    0
+                },
+                owned_recovery_entries: if owns_metadata {
+                    u64::try_from(recovery.len()).unwrap_or(u64::MAX)
+                } else {
+                    0
+                },
+                owned_recovery_capacity_bytes: if owns_metadata {
+                    capacity_bytes(
+                        recovery.capacity(),
+                        std::mem::size_of::<emit::RecoveryEntry>(),
+                    )
+                } else {
+                    0
+                },
+                direct_link_capacity_bytes: capacity_bytes(
+                    links.capacity(),
+                    std::mem::size_of::<emit::DirectLink>(),
+                ),
+            }
+        });
         // A unit-replayed block's emission carries EMPTY map/recovery (its
         // fault metadata lives undecoded in the unit); the caller supplies
         // the handle instead.
@@ -3153,6 +3194,7 @@ impl ProcessState {
                         emitted,
                         emitted_bytes,
                         TranslationOutcome::ArtifactReplay,
+                        xlat_census::PublicationCensus::ArtifactReplay,
                     );
                 }
             }
@@ -3479,8 +3521,12 @@ impl ProcessState {
                 emitted,
                 emitted_bytes,
                 TranslationOutcome::Translated,
+                xlat_census::PublicationCensus::Fresh {
+                    entry: guest,
+                    block_start: block.start,
+                    block_end: block.end,
+                },
             );
-            xlat_census::record(guest, block.start, block.end);
             if let Some(started) = publication_started {
                 self.stats
                     .add_elapsed(ResolverStat::TranslationPublicationNs, started.elapsed());
@@ -6670,10 +6716,10 @@ pub mod xlat_census {
 
     /// Schema tag on line 1 of every census file. Bump it when a field's
     /// meaning changes; [`CensusFile::parse`] fails closed on anything else.
-    /// V4: the STORE line gained `replayed=` (lookups served by lazily
-    /// replaying a block from an already-attached unit), and `segment-repeat`
-    /// narrowed to "consulted segment, block NOT covered by its unit".
-    pub const CENSUS_SCHEMA: &str = "XLATCENSUS4";
+    /// V5: every file carries one exact `MEMORY` row for publication-owned
+    /// retained metadata, JIT bytes, and transient direct-link capacity. The
+    /// row is source-local accounting, not an address-shape inference.
+    pub const CENSUS_SCHEMA: &str = "XLATCENSUS5";
 
     /// Where a translated block sits relative to this process's configured
     /// shared-translation segments.
@@ -6921,6 +6967,78 @@ pub mod xlat_census {
         pub translations: u64,
     }
 
+    /// Source-local allocation facts for blocks published during one drained
+    /// process-image epoch. Every byte count is measured at the allocation's
+    /// retaining call site; none is inferred from a VM address.
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct CensusMemory {
+        /// Blocks translated privately and retaining owned map/recovery Vecs.
+        pub private_blocks: u64,
+        /// Blocks replayed from an attached unit. Their cold metadata remains
+        /// mapped in the unit rather than becoming owned Vecs.
+        pub unit_blocks: u64,
+        /// Executable bytes copied into the process-private JIT cache by both
+        /// publication routes.
+        pub jit_bytes_written: u64,
+        /// Logical entries retained in private instruction maps.
+        pub owned_map_entries: u64,
+        /// Heap capacity retained by private instruction-map Vecs.
+        pub owned_map_capacity_bytes: u64,
+        /// Logical entries retained in private recovery tables.
+        pub owned_recovery_entries: u64,
+        /// Heap capacity retained by private recovery Vecs.
+        pub owned_recovery_capacity_bytes: u64,
+        /// Final capacity of direct-link Vecs consumed and dropped during
+        /// publication. Kept separate because it is transient, not retained.
+        pub direct_link_capacity_bytes: u64,
+    }
+
+    impl CensusMemory {
+        fn is_empty(self) -> bool {
+            self == Self::default()
+        }
+
+        fn add(&mut self, other: Self) {
+            self.private_blocks = self.private_blocks.saturating_add(other.private_blocks);
+            self.unit_blocks = self.unit_blocks.saturating_add(other.unit_blocks);
+            self.jit_bytes_written = self
+                .jit_bytes_written
+                .saturating_add(other.jit_bytes_written);
+            self.owned_map_entries = self
+                .owned_map_entries
+                .saturating_add(other.owned_map_entries);
+            self.owned_map_capacity_bytes = self
+                .owned_map_capacity_bytes
+                .saturating_add(other.owned_map_capacity_bytes);
+            self.owned_recovery_entries = self
+                .owned_recovery_entries
+                .saturating_add(other.owned_recovery_entries);
+            self.owned_recovery_capacity_bytes = self
+                .owned_recovery_capacity_bytes
+                .saturating_add(other.owned_recovery_capacity_bytes);
+            self.direct_link_capacity_bytes = self
+                .direct_link_capacity_bytes
+                .saturating_add(other.direct_link_capacity_bytes);
+        }
+    }
+
+    /// Why a block reached the publication seam. Keeping this typed prevents
+    /// an artifact replay from being counted as either a fresh translation or
+    /// a shared-unit replay while all three paths share one armed census check.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum PublicationCensus {
+        /// A block emitted from guest instructions in this process image.
+        Fresh {
+            entry: GuestVa,
+            block_start: GuestVa,
+            block_end: GuestVa,
+        },
+        /// A block replayed from an attached shared translation unit.
+        UnitReplay,
+        /// A block replayed from the legacy whole-artifact cache.
+        ArtifactReplay,
+    }
+
     /// A single drained census, as written to `xlat-<pid>-<stamp>-<seq>.txt`.
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct CensusFile {
@@ -6935,6 +7053,8 @@ pub mod xlat_census {
         /// What this process's shared-unit lookups did. Drained by the same
         /// flush, so a file is one process incarnation's complete story.
         pub store: CensusStore,
+        /// Allocation facts drained at the same image/lifecycle boundary.
+        pub memory: CensusMemory,
     }
 
     /// A census file that does not parse. Fails closed: an aggregator must
@@ -6980,6 +7100,18 @@ pub mod xlat_census {
                 self.store.recording_declined,
                 self.store.load_ns,
                 self.store.publish_ns,
+            );
+            let _ = writeln!(
+                out,
+                "MEMORY|private_blocks={}|unit_blocks={}|jit_bytes_written={}|owned_map_entries={}|owned_map_capacity_bytes={}|owned_recovery_entries={}|owned_recovery_capacity_bytes={}|direct_link_capacity_bytes={}",
+                self.memory.private_blocks,
+                self.memory.unit_blocks,
+                self.memory.jit_bytes_written,
+                self.memory.owned_map_entries,
+                self.memory.owned_map_capacity_bytes,
+                self.memory.owned_recovery_entries,
+                self.memory.owned_recovery_capacity_bytes,
+                self.memory.direct_link_capacity_bytes,
             );
             for (skip, count) in &self.store.skipped {
                 let _ = writeln!(out, "SKIP|{}|{count}", skip.token());
@@ -7042,9 +7174,11 @@ pub mod xlat_census {
                 }),
                 records: Vec::new(),
                 store: CensusStore::default(),
+                memory: CensusMemory::default(),
             };
             let distinct = parse_u64(field(&fields, "distinct", header_line)?, header_line)?;
             let mut saw_store = false;
+            let mut saw_memory = false;
             for (index, line) in lines {
                 let line_number = index.saturating_add(1);
                 let mut columns = line.split('|');
@@ -7068,6 +7202,16 @@ pub mod xlat_census {
                         file.store = parsed;
                         saw_store = true;
                     }
+                    Some("MEMORY") => {
+                        if saw_memory {
+                            return Err(CensusParseError {
+                                line: line_number,
+                                reason: "census file has a second MEMORY line".to_string(),
+                            });
+                        }
+                        file.memory = parse_memory(line, line_number)?;
+                        saw_memory = true;
+                    }
                     Some("SKIP") => {
                         let (skip, count) = parse_skip(&mut columns, line_number)?;
                         let entry = file.store.skipped.entry(skip).or_insert(0);
@@ -7090,7 +7234,8 @@ pub mod xlat_census {
                     _ => {
                         return Err(CensusParseError {
                             line: line_number,
-                            reason: "expected a STORE, SKIP, MISS, SEG or VA line".to_string(),
+                            reason: "expected a STORE, MEMORY, SKIP, MISS, SEG or VA line"
+                                .to_string(),
                         });
                     }
                 }
@@ -7099,6 +7244,12 @@ pub mod xlat_census {
                 return Err(CensusParseError {
                     line: header_line,
                     reason: "census file has no STORE line".to_string(),
+                });
+            }
+            if !saw_memory {
+                return Err(CensusParseError {
+                    line: header_line,
+                    reason: "census file has no MEMORY line".to_string(),
                 });
             }
             // Identities that hold by construction at the recording site. A
@@ -7253,6 +7404,75 @@ pub mod xlat_census {
         })
     }
 
+    fn parse_memory(line_text: &str, line: usize) -> Result<CensusMemory, CensusParseError> {
+        const NAMES: [&str; 8] = [
+            "private_blocks",
+            "unit_blocks",
+            "jit_bytes_written",
+            "owned_map_entries",
+            "owned_map_capacity_bytes",
+            "owned_recovery_entries",
+            "owned_recovery_capacity_bytes",
+            "direct_link_capacity_bytes",
+        ];
+        let mut parts = line_text.split('|');
+        if parts.next() != Some("MEMORY") {
+            return Err(CensusParseError {
+                line,
+                reason: "expected a MEMORY line".to_string(),
+            });
+        }
+        let mut values = BTreeMap::new();
+        for part in parts {
+            let (name, value) = part.split_once('=').ok_or_else(|| CensusParseError {
+                line,
+                reason: format!("memory field {part:?} is not key=value"),
+            })?;
+            if !NAMES.contains(&name) {
+                return Err(CensusParseError {
+                    line,
+                    reason: format!("unknown memory field {name:?}"),
+                });
+            }
+            if values.insert(name, value).is_some() {
+                return Err(CensusParseError {
+                    line,
+                    reason: format!("duplicate memory field {name:?}"),
+                });
+            }
+        }
+        if values.len() != NAMES.len() {
+            let missing = NAMES
+                .into_iter()
+                .filter(|name| !values.contains_key(name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(CensusParseError {
+                line,
+                reason: format!("memory line is missing {missing}"),
+            });
+        }
+        let value = |name| {
+            values.get(name).copied().ok_or_else(|| CensusParseError {
+                line,
+                reason: format!("memory line is missing {name}"),
+            })
+        };
+        Ok(CensusMemory {
+            private_blocks: parse_u64(value("private_blocks")?, line)?,
+            unit_blocks: parse_u64(value("unit_blocks")?, line)?,
+            jit_bytes_written: parse_u64(value("jit_bytes_written")?, line)?,
+            owned_map_entries: parse_u64(value("owned_map_entries")?, line)?,
+            owned_map_capacity_bytes: parse_u64(value("owned_map_capacity_bytes")?, line)?,
+            owned_recovery_entries: parse_u64(value("owned_recovery_entries")?, line)?,
+            owned_recovery_capacity_bytes: parse_u64(
+                value("owned_recovery_capacity_bytes")?,
+                line,
+            )?,
+            direct_link_capacity_bytes: parse_u64(value("direct_link_capacity_bytes")?, line)?,
+        })
+    }
+
     fn parse_skip<'a>(
         columns: &mut impl Iterator<Item = &'a str>,
         line: usize,
@@ -7327,6 +7547,42 @@ pub mod xlat_census {
         total: u64,
         records: BTreeMap<(GuestVa, Option<u32>, SegmentCoverage), u64>,
         image: Option<CensusImage>,
+        memory: CensusMemory,
+    }
+
+    impl CensusState {
+        /// Add both halves of one publication transaction. Returns whether the
+        /// store's lock-free replay counter must also advance.
+        fn add_publication(
+            &mut self,
+            publication: PublicationCensus,
+            memory: CensusMemory,
+        ) -> bool {
+            self.memory.add(memory);
+            match publication {
+                PublicationCensus::Fresh {
+                    entry,
+                    block_start,
+                    block_end,
+                } => {
+                    self.total = self.total.saturating_add(1);
+                    let key = {
+                        let (segment, coverage) = self
+                            .image
+                            .as_ref()
+                            .map_or((None, SegmentCoverage::Outside), |image| {
+                                classify(&image.segments, entry, block_start, block_end)
+                            });
+                        (entry, segment, coverage)
+                    };
+                    let count = self.records.entry(key).or_insert(0);
+                    *count = count.saturating_add(1);
+                    false
+                }
+                PublicationCensus::UnitReplay => true,
+                PublicationCensus::ArtifactReplay => false,
+            }
+        }
     }
 
     /// Shared-unit lookup outcomes, as lock-free counters.
@@ -7490,17 +7746,6 @@ pub mod xlat_census {
         bump_loaded();
     }
 
-    /// A lookup was served by replaying a block from an already-attached
-    /// unit — the store itself was not consulted, so this is counted beside
-    /// (never inside) the `consulted` identity.
-    pub fn record_lookup_replayed() {
-        if !armed() {
-            return;
-        }
-        arm_backstop();
-        bump_replayed();
-    }
-
     /// The store had no files for this key, and `claim_recording` returned
     /// `claimed`. The election's verdict rides along because "the store missed"
     /// and "the store missed AND declined to let us record" are different
@@ -7544,7 +7789,7 @@ pub mod xlat_census {
         out
     }
 
-    /// Install the image whose blocks subsequent [`record`] calls belong to.
+    /// Install the image whose fresh [`record_publication`] calls belong to.
     ///
     /// Called from `NativeMappedMemory::configure_shared_translation` for every
     /// process image, including each `execve` replacement, and independently of
@@ -7628,27 +7873,25 @@ pub mod xlat_census {
         (None, SegmentCoverage::Outside)
     }
 
-    /// Called on every FRESH translation (never on a cache hit).
-    pub fn record(entry: GuestVa, block_start: GuestVa, block_end: GuestVa) {
+    /// Record exact allocation facts and the publication outcome with ONE
+    /// cached armed check. Fresh translations formerly called `record` after
+    /// publication and shared-unit replays called `record_lookup_replayed`
+    /// before returning; folding those identities into this seam avoids adding
+    /// a second diagnostic branch to either shipped hot path.
+    pub fn record_publication(
+        publication: PublicationCensus,
+        memory: impl FnOnce() -> CensusMemory,
+    ) {
         if !armed() {
             return;
         }
         arm_backstop();
-        let Ok(mut state) = state().lock() else {
-            return;
-        };
-        state.total = state.total.saturating_add(1);
-        let key = {
-            let (segment, coverage) = state
-                .image
-                .as_ref()
-                .map_or((None, SegmentCoverage::Outside), |image| {
-                    classify(&image.segments, entry, block_start, block_end)
-                });
-            (entry, segment, coverage)
-        };
-        let count = state.records.entry(key).or_insert(0);
-        *count = count.saturating_add(1);
+        let memory = memory();
+        if let Ok(mut state) = state().lock()
+            && state.add_publication(publication, memory)
+        {
+            bump_replayed();
+        }
     }
 
     /// A `fork` child inherits `total`/`records` by COW but performs none of the
@@ -7678,6 +7921,7 @@ pub mod xlat_census {
         if let Ok(mut state) = state().lock() {
             state.total = 0;
             state.records.clear();
+            state.memory = CensusMemory::default();
         }
     }
 
@@ -7701,12 +7945,13 @@ pub mod xlat_census {
         // Drained under the same guard the records are, so the two halves of a
         // process's story cannot be split across two files.
         let store = drain_store_counters();
-        if guard.total == 0 && store.is_empty() {
+        if guard.total == 0 && store.is_empty() && guard.memory.is_empty() {
             return;
         }
         let total = std::mem::take(&mut guard.total);
         let records = std::mem::take(&mut guard.records);
         let image = guard.image.clone();
+        let memory = std::mem::take(&mut guard.memory);
         drop(guard);
         let pid = unsafe { libc::getpid() };
         let sequence = FLUSH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -7731,6 +7976,7 @@ pub mod xlat_census {
                 )
                 .collect(),
             store,
+            memory,
         };
         let _ = std::fs::write(
             format!("{dir}/xlat-{pid}-{stamp}-{sequence}.txt"),
@@ -7847,6 +8093,78 @@ pub mod xlat_census {
         }
 
         #[test]
+        fn publication_transaction_accumulates_memory_and_only_fresh_blocks() {
+            let mut state = CensusState {
+                image: Some(CensusImage {
+                    identity: "11".repeat(32),
+                    segments: vec![CensusSegment {
+                        guest_start: GuestVa(0x40_0000),
+                        guest_len: 0x1000,
+                        unit_stem: "22".repeat(32),
+                    }],
+                }),
+                ..CensusState::default()
+            };
+            let private = CensusMemory {
+                private_blocks: 1,
+                jit_bytes_written: 96,
+                owned_map_entries: 2,
+                owned_map_capacity_bytes: 64,
+                owned_recovery_entries: 3,
+                owned_recovery_capacity_bytes: 128,
+                direct_link_capacity_bytes: 32,
+                ..CensusMemory::default()
+            };
+            assert!(!state.add_publication(
+                PublicationCensus::Fresh {
+                    entry: GuestVa(0x40_0010),
+                    block_start: GuestVa(0x40_0010),
+                    block_end: GuestVa(0x40_0020),
+                },
+                private,
+            ));
+
+            let unit = CensusMemory {
+                unit_blocks: 1,
+                jit_bytes_written: 48,
+                direct_link_capacity_bytes: 16,
+                ..CensusMemory::default()
+            };
+            assert!(state.add_publication(PublicationCensus::UnitReplay, unit));
+
+            let artifact = CensusMemory {
+                private_blocks: 1,
+                jit_bytes_written: 24,
+                owned_map_entries: 1,
+                owned_map_capacity_bytes: 32,
+                ..CensusMemory::default()
+            };
+            assert!(!state.add_publication(PublicationCensus::ArtifactReplay, artifact,));
+
+            assert_eq!(state.total, 1, "only fresh translation increments total");
+            assert_eq!(
+                state.records,
+                BTreeMap::from([(
+                    (GuestVa(0x40_0010), Some(0), SegmentCoverage::Contained,),
+                    1,
+                )])
+            );
+            assert_eq!(
+                state.memory,
+                CensusMemory {
+                    private_blocks: 2,
+                    unit_blocks: 1,
+                    jit_bytes_written: 168,
+                    owned_map_entries: 3,
+                    owned_map_capacity_bytes: 96,
+                    owned_recovery_entries: 3,
+                    owned_recovery_capacity_bytes: 128,
+                    direct_link_capacity_bytes: 48,
+                }
+            );
+        }
+
+        #[test]
         fn renders_the_record_shape() {
             let file = CensusFile {
                 pid: 4242,
@@ -7876,12 +8194,14 @@ pub mod xlat_census {
                     },
                 ],
                 store: store(),
+                memory: CensusMemory::default(),
             };
             let identity = "cd".repeat(32);
             let stem = "aa".repeat(32);
             let expected = format!(
-                "XLATCENSUS4|pid=4242|seq=1|reason=host-self-reexec|total=5|distinct=2|image={identity}|segments=1\n\
+                "XLATCENSUS5|pid=4242|seq=1|reason=host-self-reexec|total=5|distinct=2|image={identity}|segments=1\n\
                  STORE|consulted=4|loaded=1|replayed=7|file_miss=1|recording_claimed=0|recording_declined=1|load_ns=1500000|publish_ns=2500000\n\
+                 MEMORY|private_blocks=0|unit_blocks=0|jit_bytes_written=0|owned_map_entries=0|owned_map_capacity_bytes=0|owned_recovery_entries=0|owned_recovery_capacity_bytes=0|direct_link_capacity_bytes=0\n\
                  SKIP|lane-unconfigured|9\n\
                  SKIP|segment-repeat|40\n\
                  MISS|no-authority|2\n\
@@ -7911,9 +8231,20 @@ pub mod xlat_census {
                     skipped: BTreeMap::from([(LookupSkip::LaneUnconfigured, 1)]),
                     ..CensusStore::default()
                 },
+                memory: CensusMemory {
+                    private_blocks: 1,
+                    unit_blocks: 2,
+                    jit_bytes_written: 4096,
+                    owned_map_entries: 3,
+                    owned_map_capacity_bytes: 64,
+                    owned_recovery_entries: 5,
+                    owned_recovery_capacity_bytes: 512,
+                    direct_link_capacity_bytes: 96,
+                },
             };
-            let expected = "XLATCENSUS4|pid=7|seq=0|reason=process-exit|total=1|distinct=1|image=-|segments=0\n\
+            let expected = "XLATCENSUS5|pid=7|seq=0|reason=process-exit|total=1|distinct=1|image=-|segments=0\n\
                             STORE|consulted=0|loaded=0|replayed=0|file_miss=0|recording_claimed=0|recording_declined=0|load_ns=0|publish_ns=0\n\
+                            MEMORY|private_blocks=1|unit_blocks=2|jit_bytes_written=4096|owned_map_entries=3|owned_map_capacity_bytes=64|owned_recovery_entries=5|owned_recovery_capacity_bytes=512|direct_link_capacity_bytes=96\n\
                             SKIP|lane-unconfigured|1\n\
                             VA|0x1000|-|outside|1\n";
             assert_eq!(file.render(), expected);
@@ -7922,8 +8253,9 @@ pub mod xlat_census {
 
         #[test]
         fn parse_fails_closed_on_a_truncated_or_mislabelled_file() {
-            const HEADER: &str = "XLATCENSUS4|pid=1|seq=0|reason=process-exit|total=0|distinct=0|image=-|segments=0\n";
+            const HEADER: &str = "XLATCENSUS5|pid=1|seq=0|reason=process-exit|total=0|distinct=0|image=-|segments=0\n";
             const STORE: &str = "STORE|consulted=0|loaded=0|replayed=0|file_miss=0|recording_claimed=0|recording_declined=0|load_ns=0|publish_ns=0\n";
+            const MEMORY: &str = "MEMORY|private_blocks=0|unit_blocks=0|jit_bytes_written=0|owned_map_entries=0|owned_map_capacity_bytes=0|owned_recovery_entries=0|owned_recovery_capacity_bytes=0|direct_link_capacity_bytes=0\n";
             let cases = [
                 (String::new(), "empty"),
                 (
@@ -7939,39 +8271,39 @@ pub mod xlat_census {
                     "superseded schema v3",
                 ),
                 (
-                    format!("{HEADER}{STORE}").replace("distinct=0", "distinct=1"),
+                    format!("{HEADER}{STORE}{MEMORY}").replace("distinct=0", "distinct=1"),
                     "distinct mismatch",
                 ),
                 (
-                    format!("{HEADER}{STORE}").replace("process-exit", "fell-over"),
+                    format!("{HEADER}{STORE}{MEMORY}").replace("process-exit", "fell-over"),
                     "reason",
                 ),
                 (
-                    format!("{HEADER}{STORE}VA|400010|-|outside|1\n").replace("total=0", "total=1")
+                    format!("{HEADER}{STORE}{MEMORY}VA|400010|-|outside|1\n").replace("total=0", "total=1")
                         .replace("distinct=0", "distinct=1"),
                     "unprefixed hex",
                 ),
                 (
-                    format!("{HEADER}{STORE}SEG|0|0x1000|0x10|aa\n"),
+                    format!("{HEADER}{STORE}{MEMORY}SEG|0|0x1000|0x10|aa\n"),
                     "segment without image",
                 ),
                 (HEADER.to_string(), "no STORE line"),
                 (
-                    format!("{HEADER}{STORE}SKIP|not-a-skip|1\n"),
+                    format!("{HEADER}{STORE}{MEMORY}SKIP|not-a-skip|1\n"),
                     "unknown skip reason",
                 ),
                 (
-                    format!("{HEADER}{STORE}MISS|not-a-reason|1\n"),
+                    format!("{HEADER}{STORE}{MEMORY}MISS|not-a-reason|1\n"),
                     "unknown miss reason",
                 ),
                 (
                     // consulted must equal loaded + file_miss + misses.
-                    format!("{HEADER}{STORE}").replace("consulted=0", "consulted=3"),
+                    format!("{HEADER}{STORE}{MEMORY}").replace("consulted=0", "consulted=3"),
                     "store outcomes do not account for consulted",
                 ),
                 (
                     // A file miss always carries exactly one election verdict.
-                    format!("{HEADER}{STORE}").replace(
+                    format!("{HEADER}{STORE}{MEMORY}").replace(
                         "consulted=0|loaded=0|replayed=0|file_miss=0",
                         "consulted=1|loaded=0|replayed=0|file_miss=1",
                     ),
@@ -7980,8 +8312,23 @@ pub mod xlat_census {
                 (
                     // Two STORE lines: the second used to overwrite the first
                     // wholesale, so "last one wins" parsed clean.
-                    format!("{HEADER}{STORE}{STORE}"),
+                    format!("{HEADER}{STORE}{STORE}{MEMORY}"),
                     "second STORE line",
+                ),
+                (
+                    format!("{HEADER}{STORE}"),
+                    "missing MEMORY line",
+                ),
+                (
+                    format!("{HEADER}{STORE}{MEMORY}{MEMORY}"),
+                    "second MEMORY line",
+                ),
+                (
+                    format!("{HEADER}{STORE}{MEMORY}").replace(
+                        "direct_link_capacity_bytes=0",
+                        "surprise=0",
+                    ),
+                    "unknown MEMORY field",
                 ),
             ];
             for (text, what) in cases {
@@ -8001,9 +8348,11 @@ pub mod xlat_census {
         /// the maps. It parsed clean and reported zero.
         #[test]
         fn skip_counts_before_the_store_line_are_not_discarded_by_it() {
-            const HEADER: &str = "XLATCENSUS4|pid=1|seq=0|reason=process-exit|total=0|distinct=0|image=-|segments=0\n";
+            const HEADER: &str = "XLATCENSUS5|pid=1|seq=0|reason=process-exit|total=0|distinct=0|image=-|segments=0\n";
             const STORE: &str = "STORE|consulted=0|loaded=0|replayed=0|file_miss=0|recording_claimed=0|recording_declined=0|load_ns=0|publish_ns=0\n";
-            let reordered = format!("{HEADER}SKIP|segment-repeat|7\nMISS|no-authority|0\n{STORE}");
+            const MEMORY: &str = "MEMORY|private_blocks=0|unit_blocks=0|jit_bytes_written=0|owned_map_entries=0|owned_map_capacity_bytes=0|owned_recovery_entries=0|owned_recovery_capacity_bytes=0|direct_link_capacity_bytes=0\n";
+            let reordered =
+                format!("{HEADER}SKIP|segment-repeat|7\nMISS|no-authority|0\n{STORE}{MEMORY}");
             let file = CensusFile::parse(&reordered).expect("reordered file parses");
             assert_eq!(
                 file.store.skipped.get(&LookupSkip::SegmentRepeat).copied(),
@@ -8089,6 +8438,7 @@ pub mod xlat_census {
                 image: None,
                 records: Vec::new(),
                 store: drained,
+                memory: CensusMemory::default(),
             };
             assert_eq!(CensusFile::parse(&file.render()), Ok(file));
         }
