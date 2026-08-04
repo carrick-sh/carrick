@@ -308,9 +308,9 @@ pub enum DTraceError {
     SignalHandler(std::io::Error),
     #[error("dtrace_setopt('{key}'='{val}') failed: {msg}")]
     SetOpt {
-        key: String,
-        val: String,
-        msg: String,
+        key: Box<str>,
+        val: Box<str>,
+        msg: Box<str>,
     },
     #[error("dtrace_program_strcompile failed: {0}")]
     Compile(String),
@@ -331,6 +331,41 @@ pub enum DTraceError {
     #[cfg(target_os = "macos")]
     #[error("DTrace post-stop callback failed: {0}")]
     PostStop(String),
+}
+
+#[derive(Debug)]
+pub struct DTraceObservedFailure {
+    pub error: DTraceError,
+    pub report: DTraceRunReport,
+    pub child_launched: bool,
+}
+
+#[derive(Default)]
+struct DTraceObservation {
+    report: DTraceRunReport,
+    child_launched: bool,
+}
+
+impl DTraceObservation {
+    fn report(&self) -> DTraceRunReport {
+        self.report
+    }
+
+    fn report_mut(&mut self) -> &mut DTraceRunReport {
+        &mut self.report
+    }
+
+    fn mark_child_launched(&mut self) {
+        self.child_launched = true;
+    }
+
+    fn failure(&self, error: DTraceError) -> DTraceObservedFailure {
+        DTraceObservedFailure {
+            error,
+            report: self.report,
+            child_launched: self.child_launched,
+        }
+    }
 }
 
 struct TraceOutput {
@@ -524,6 +559,18 @@ pub fn run_child_under_dtrace(
     opts: &TraceOptions,
 ) -> Result<DTraceRunReport, DTraceError> {
     run_child_under_dtrace_impl(child_path, child_argv, opts, |_, _| Ok(()))
+        .map_err(|failure| failure.error)
+        .map(|(report, ())| report)
+}
+
+/// Spawn `child_path` under DTrace while preserving whether the traced child
+/// was continued and the exact loss/interruption report on every failure.
+pub fn run_child_under_dtrace_observed(
+    child_path: &Path,
+    child_argv: &[String],
+    opts: &TraceOptions,
+) -> Result<DTraceRunReport, DTraceObservedFailure> {
+    run_child_under_dtrace_impl(child_path, child_argv, opts, |_, _| Ok(()))
         .map(|(report, ())| report)
 }
 
@@ -544,6 +591,7 @@ where
     run_child_under_dtrace_impl(child_path, child_argv, opts, |hdl, report| {
         invoke_post_stop(hdl.cast(), report, post_stop)
     })
+    .map_err(|failure| failure.error)
 }
 
 #[cfg(target_os = "macos")]
@@ -571,8 +619,10 @@ fn run_child_under_dtrace_impl<T>(
     child_argv: &[String],
     opts: &TraceOptions,
     post_stop: impl FnOnce(*mut DtraceHdl, DTraceRunReport) -> Result<T, DTraceError>,
-) -> Result<(DTraceRunReport, T), DTraceError> {
-    let trace_argv = trace_exec_argv(child_path, child_argv, opts.drop_credentials.as_ref())?;
+) -> Result<(DTraceRunReport, T), DTraceObservedFailure> {
+    let mut observation = DTraceObservation::default();
+    let trace_argv = trace_exec_argv(child_path, child_argv, opts.drop_credentials.as_ref())
+        .map_err(|error| observation.failure(error))?;
     let mut argv_ptrs: Vec<*const c_char> = trace_argv.argv.iter().map(|s| s.as_ptr()).collect();
     argv_ptrs.push(std::ptr::null());
 
@@ -583,19 +633,19 @@ fn run_child_under_dtrace_impl<T>(
     let out = TraceOutput::open(
         opts.out_path.as_deref(),
         opts.drop_credentials.as_ref().map(|c| (c.uid, c.gid)),
-    )?;
-    let hdl = DtraceHandle::open()?;
+    )
+    .map_err(|error| observation.failure(error))?;
+    let hdl = DtraceHandle::open().map_err(|error| observation.failure(error))?;
     let interrupted = Arc::new(AtomicBool::new(false));
-    let mut report = DTraceRunReport::default();
     if unsafe {
         dtrace_handle_drop(
             hdl.as_ptr(),
             handle_drop,
-            (&mut report as *mut DTraceRunReport).cast(),
+            (observation.report_mut() as *mut DTraceRunReport).cast(),
         )
     } != 0
     {
-        return Err(DTraceError::HandleDrop(hdl.errmsg()));
+        return Err(observation.failure(DTraceError::HandleDrop(hdl.errmsg())));
     }
 
     // Sensible runtime defaults are appended to in `all_opts` below.
@@ -619,23 +669,24 @@ fn run_child_under_dtrace_impl<T>(
         let vc = CString::new(*v).unwrap();
         if unsafe { dtrace_setopt(hdl.as_ptr(), kc.as_ptr(), vc.as_ptr()) } != 0 {
             let msg = hdl.errmsg();
-            return Err(DTraceError::SetOpt {
+            return Err(observation.failure(DTraceError::SetOpt {
                 key: (*k).into(),
                 val: (*v).into(),
-                msg,
-            });
+                msg: msg.into_boxed_str(),
+            }));
         }
     }
 
-    let proc_h = DtraceProcess::create(&hdl, trace_argv.exec_path.as_ptr(), argv_ptrs.as_ptr())?;
+    let proc_h = DtraceProcess::create(&hdl, trace_argv.exec_path.as_ptr(), argv_ptrs.as_ptr())
+        .map_err(|error| observation.failure(error))?;
 
     let program_src: &str = opts.script.as_deref().unwrap_or(BUNDLED_D_SCRIPT);
     let program_c = match CString::new(program_src) {
         Ok(program_c) => program_c,
         Err(_) => {
-            return Err(DTraceError::Compile(
+            return Err(observation.failure(DTraceError::Compile(
                 "D script contains a nul byte".to_owned(),
-            ));
+            )));
         }
     };
     let prog = unsafe {
@@ -650,25 +701,27 @@ fn run_child_under_dtrace_impl<T>(
     };
     if prog.is_null() {
         let msg = hdl.errmsg();
-        return Err(DTraceError::Compile(msg));
+        return Err(observation.failure(DTraceError::Compile(msg)));
     }
 
     if unsafe { dtrace_program_exec(hdl.as_ptr(), prog, std::ptr::null_mut()) } != 0 {
         let msg = hdl.errmsg();
-        return Err(DTraceError::Exec(msg));
+        return Err(observation.failure(DTraceError::Exec(msg)));
     }
 
     if unsafe { dtrace_go(hdl.as_ptr()) } != 0 {
         let msg = hdl.errmsg();
-        return Err(DTraceError::Go(msg));
+        return Err(observation.failure(DTraceError::Go(msg)));
     }
 
     // libdtrace installs its own process-signal handlers during activation.
     // Register after `dtrace_go` so signal-hook chains that final handler
     // instead of having our flag handler replaced before the consume loop.
-    let _interrupt_registrations = InterruptRegistrations::install(&interrupted)?;
+    let _interrupt_registrations = InterruptRegistrations::install(&interrupted)
+        .map_err(|error| observation.failure(error))?;
 
     unsafe { dtrace_proc_continue(hdl.as_ptr(), proc_h.as_ptr()) };
+    observation.mark_child_launched();
 
     // When a custom D script is supplied, the user is responsible for bounding
     // it (the skill mandates a `tick-Ns { exit(0) }`), so we let it OUTLIVE the
@@ -696,7 +749,7 @@ fn run_child_under_dtrace_impl<T>(
         let child_state = unsafe { proc_state(proc_h.as_ptr()) };
         let child_terminal = child_state == PS_DEAD || child_state == PS_UNDEAD;
         if interrupted.load(Ordering::Acquire) {
-            report.interrupted = true;
+            observation.report_mut().interrupted = true;
             break;
         }
         match status {
@@ -708,20 +761,21 @@ fn run_child_under_dtrace_impl<T>(
             }
             _ => {
                 let msg = hdl.errmsg();
-                return Err(DTraceError::Work(msg));
+                return Err(observation.failure(DTraceError::Work(msg)));
             }
         }
     }
 
     unsafe { dtrace_stop(hdl.as_ptr()) };
-    report.interrupted |= interrupted.load(Ordering::Acquire);
+    observation.report_mut().interrupted |= interrupted.load(Ordering::Acquire);
     if opts.print_remaining_aggregates {
         unsafe { dtrace_aggregate_snap(hdl.as_ptr()) };
         unsafe { dtrace_aggregate_print(hdl.as_ptr(), out.fp(), std::ptr::null_mut()) };
     }
     unsafe { fflush(out.fp()) };
-    let post_stop_result = post_stop(hdl.as_ptr(), report)?;
-    Ok((report, post_stop_result))
+    let post_stop_result = post_stop(hdl.as_ptr(), observation.report())
+        .map_err(|error| observation.failure(error))?;
+    Ok((observation.report(), post_stop_result))
 }
 
 fn trace_exec_argv(
@@ -769,9 +823,10 @@ mod tests {
     use super::{
         BUNDLED_NATIVE_SHAPE_D, BUNDLED_NATIVE_WALL_D, DTRACE_CONSUME_NEXT, DTRACE_CONSUME_THIS,
         DTRACEACT_EXIT, DTRACEDROP_AGGREGATION, DTRACEDROP_DYNAMIC, DTRACEDROP_DYNDIRTY,
-        DTRACEDROP_DYNRINSE, DTRACEDROP_PRINCIPAL, DTraceRunReport, DtraceRecDesc,
-        TRACE_CHILD_COMMAND, TraceDropCredentials, TraceOptions, chewrec, join_ids, record_drop,
-        trace_exec_argv,
+        DTRACEDROP_DYNRINSE, DTRACEDROP_PRINCIPAL, DTraceError, DTraceObservation,
+        DTraceObservedFailure, DTraceRunReport, DtraceRecDesc, TRACE_CHILD_COMMAND,
+        TraceDropCredentials, TraceOptions, chewrec, join_ids, record_drop,
+        run_child_under_dtrace_observed, trace_exec_argv,
     };
     use std::ffi::CString;
     use std::path::Path;
@@ -780,6 +835,55 @@ mod tests {
         argv.iter()
             .map(|s| s.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn observed_public_surface_preserves_launch_state_on_failure() {
+        let _surface: fn(
+            &Path,
+            &[String],
+            &TraceOptions,
+        ) -> Result<DTraceRunReport, DTraceObservedFailure> = run_child_under_dtrace_observed;
+    }
+
+    #[test]
+    fn observed_compile_exec_and_go_failures_precede_child_launch() {
+        for error in [
+            DTraceError::Compile("compile".to_owned()),
+            DTraceError::Exec("exec".to_owned()),
+            DTraceError::Go("go".to_owned()),
+        ] {
+            let failure = DTraceObservation::default().failure(error);
+            assert!(!failure.child_launched);
+            assert_eq!(failure.report, DTraceRunReport::default());
+        }
+    }
+
+    #[test]
+    fn observed_post_continue_failures_retain_exact_loss_and_interruption_report() {
+        let report = DTraceRunReport {
+            principal_drops: 1,
+            aggregation_drops: 2,
+            dynamic_drops: 3,
+            dynamic_rinse_drops: 4,
+            dynamic_dirty_drops: 5,
+            other_drops: 6,
+            interrupted: true,
+        };
+        let mut observation = DTraceObservation::default();
+        *observation.report_mut() = report;
+        observation.mark_child_launched();
+
+        let work = observation.failure(DTraceError::Work("work".to_owned()));
+        assert!(work.child_launched);
+        assert_eq!(work.report, report);
+
+        #[cfg(target_os = "macos")]
+        {
+            let post_stop = observation.failure(DTraceError::PostStop("post-stop".to_owned()));
+            assert!(post_stop.child_launched);
+            assert_eq!(post_stop.report, report);
+        }
     }
 
     #[cfg(target_os = "macos")]

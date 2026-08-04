@@ -122,7 +122,7 @@ use crate::native_shape_profile::validate_native_shape_trace_arguments;
 use crate::native_shape_profile::{
     CaptureIdentity, NativeShapeAuthority, NativeShapeTarget,
     claim_native_shape_snapshot_directory, establish_native_shape_run_id,
-    require_native_shape_snapshot_absent, validate_native_shape_host,
+    require_native_shape_snapshot_absent, run_native_shape_capture, validate_native_shape_host,
 };
 use crate::runtime_util::{
     block_on_oci, emit_raw, human_age, human_size, parse_env_file, parse_mount_flag,
@@ -1629,6 +1629,38 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     print_remaining_aggregates: profile.is_none(),
                 };
                 #[cfg(target_os = "macos")]
+                if profile == Some(crate::trace_profile::TraceProfileKind::NativeShape) {
+                    let raw_path = output_path
+                        .ok_or_else(|| anyhow::anyhow!("native-shape trace has no raw output"))?;
+                    let receipt_path = summary_jsonl.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("native-shape trace has no capture receipt output")
+                    })?;
+                    let snapshot_directory =
+                        native_shape_snapshots.as_deref().ok_or_else(|| {
+                            anyhow::anyhow!("native-shape trace has no snapshot directory")
+                        })?;
+                    let authority = native_shape_authority.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("NSHAPE2 stream has no capture authority")
+                    })?;
+                    let owner = drop_credentials
+                        .as_ref()
+                        .map(|value| (value.uid, value.gid));
+                    run_native_shape_capture(
+                        authority,
+                        raw_path,
+                        snapshot_directory,
+                        receipt_path,
+                        owner,
+                        || {
+                            carrick_runtime::dtrace_consumer::run_child_under_dtrace_observed(
+                                &me, &command, &opts,
+                            )
+                        },
+                        || CaptureIdentity::capture(&me),
+                    )?;
+                    return Ok(());
+                }
+                #[cfg(target_os = "macos")]
                 let (report, sampled_kernel_overlay) = if profile
                     .is_some_and(uses_live_kernel_symbols)
                 {
@@ -1678,17 +1710,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     let capture_status = report.into();
                     #[cfg(target_os = "macos")]
                     {
-                        if requested_profile == crate::trace_profile::TraceProfileKind::NativeShape
-                        {
-                            let _authority = native_shape_authority.as_ref().ok_or_else(|| {
-                                anyhow::anyhow!("NSHAPE2 stream has no capture authority")
-                            })?;
-                            let _ = capture_status;
-                            bail!(
-                                "native-shape dedicated capture finalization is not yet available"
-                            );
-                        } else if requested_profile
-                            == crate::trace_profile::TraceProfileKind::NativeFault
+                        if requested_profile == crate::trace_profile::TraceProfileKind::NativeFault
                         {
                             let authority = native_profile_authority.clone().ok_or_else(|| {
                                 anyhow::anyhow!("NFAULT2 stream has no launch authority")
