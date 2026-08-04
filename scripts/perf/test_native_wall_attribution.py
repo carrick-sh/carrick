@@ -30,6 +30,8 @@ def completion(drops: int = 0) -> dict[str, object]:
             "principal_drops": drops,
             "aggregation_drops": 0,
             "dynamic_drops": 0,
+            "dynamic_rinse_drops": 0,
+            "dynamic_dirty_drops": 0,
             "other_drops": 0,
             "interrupted": False,
         },
@@ -475,6 +477,57 @@ class NativeWallAttributionTest(unittest.TestCase):
                 profile, pathlib.Path("/unused/carrick")
             )
             self.assertFalse(summary["accepted"], name)
+
+    def test_accepts_exact_current_seven_field_drop_schema(self):
+        profile = native_wall_attribution.load_profile(
+            self.write_profile(profile_rows())
+        )
+
+        self.assertEqual(
+            set(profile.completion["drops"]),
+            {
+                "interrupted",
+                "principal_drops",
+                "aggregation_drops",
+                "dynamic_drops",
+                "dynamic_rinse_drops",
+                "dynamic_dirty_drops",
+                "other_drops",
+            },
+        )
+
+    def test_rejects_nonzero_dynamic_rinse_and_dirty_drop_counters(self):
+        for field in ("dynamic_rinse_drops", "dynamic_dirty_drops"):
+            with self.subTest(field=field):
+                rows = profile_rows()
+                for value in rows:
+                    value["completion"]["drops"][field] = 1
+
+                with self.assertRaisesRegex(ValueError, field.replace("_", " ")):
+                    native_wall_attribution.load_profile(
+                        self.write_profile(rows, f"{field}.jsonl")
+                    )
+
+    def test_rejects_missing_or_extra_completion_drop_fields(self):
+        for label, mutate in (
+            (
+                "missing",
+                lambda drops: drops.pop("dynamic_rinse_drops"),
+            ),
+            (
+                "extra",
+                lambda drops: drops.__setitem__("future_drops", 0),
+            ),
+        ):
+            with self.subTest(label=label):
+                rows = profile_rows()
+                for value in rows:
+                    mutate(value["completion"]["drops"])
+
+                with self.assertRaisesRegex(ValueError, "drop status"):
+                    native_wall_attribution.load_profile(
+                        self.write_profile(rows, f"{label}.jsonl")
+                    )
 
     def test_accepts_stable_cpu_classification_above_eighty_five_percent(self):
         summary = native_wall_attribution.summarize(

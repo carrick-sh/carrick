@@ -100,6 +100,16 @@ class Profile:
     rows: tuple[ProfileRow, ...]
 
 
+DROP_FIELDS = (
+    "principal_drops",
+    "aggregation_drops",
+    "dynamic_drops",
+    "dynamic_rinse_drops",
+    "dynamic_dirty_drops",
+    "other_drops",
+)
+
+
 def _require_int(value: Any, description: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{description} must be an integer")
@@ -121,15 +131,13 @@ def _completion_failures(completion: dict[str, Any]) -> list[str]:
         failures.append("capture overflowed a high-cardinality aggregation")
     if completion.get("incomplete_pairs") != 0:
         failures.append("capture contains incomplete duration pairs")
+    if set(drops) != {"interrupted", *DROP_FIELDS}:
+        failures.append("completion has malformed drop status fields")
+        return failures
     if drops.get("interrupted") is not False:
         failures.append("capture was interrupted")
-    for name in (
-        "principal_drops",
-        "aggregation_drops",
-        "dynamic_drops",
-        "other_drops",
-    ):
-        if drops.get(name) != 0:
+    for name in DROP_FIELDS:
+        if _require_int(drops.get(name), f"completion drops.{name}") != 0:
             failures.append(f"capture has nonzero {name.replace('_', ' ')}")
     return failures
 
