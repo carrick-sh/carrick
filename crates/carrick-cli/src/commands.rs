@@ -1365,12 +1365,14 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             }
             DebugCommand::JitShapeCensus {
                 trace,
+                capture,
                 snapshots,
-                jit_share_of_total,
+                output,
             } => crate::debug_jit_shape::run_jit_shape_census(
                 &trace,
+                &capture,
                 &snapshots,
-                jit_share_of_total,
+                output.as_deref(),
             )?,
             _ => bail!("debug (guest address-space inspection) is HVF-only on this build"),
         },

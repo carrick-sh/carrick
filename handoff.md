@@ -1,9 +1,10 @@
 # Native-lane performance: state of play
 
 **Date:** 2026-08-04 · **Branch:** `codex/native-store-default` · **Latest
-decision:** fresh current-retained-tree v5 attribution is accepted, but carry no
-new source-distinct family; the proposed next step is an authenticated typed
-`NativeShape` profile/Rust census and awaits explicit design approval ·
+decision:** the authenticated typed `NativeShape` design is approved and Tasks
+1–5 replace the unauthenticated Python path with capture/receipt and Rust census
+tooling; Tasks 6–8, live captures, and attribution carry remain pending, and the
+official 10.1776x scoreboard is unchanged ·
 **Scope:** Darwin/aarch64 native backend (`--exec-backend native`, the shipped
 default). VMM is explicitly NOT the target: one process per VM against a
 ~127-VM macOS ceiling makes it a dead end for build-shaped workloads.
@@ -272,17 +273,13 @@ user-requested serialized current-default refresh is nevertheless complete and
 sets the official absolute scoreboard to 10.1776x without converting that
 scoreboard movement into a causal lock-split claim.
 
-1. **Await explicit design approval for `NativeShape`; do not implement or
-   capture it yet.** The fresh broad pair makes translated guest the next stable
-   unsplit bucket at 25.88% / 25.33% of all CPU. The existing generic
-   `native-cpu-attribution.d` plus `shape_classify.py` mechanism is not evidence
-   authority: generic `carrick trace --script` lacks a typed receipt/program
-   hash and the classifier does not bind raw trace, snapshots, source, binary,
-   image, command, or run IDs. The proposed next task is to adapt it into an
-   authenticated typed `NativeShape` profile and Rust census (or an equivalently
-   complete immutable manifest), then require one non-overlapping, non-closed
-   emitted shape to clear 10% of all CPU twice. This is a proposal, not an
-   approved design, guest-operation mapping, or source-change recommendation.
+1. **Complete approved `NativeShape` Tasks 6–8 before capture or carry.** Tasks
+   1–5 now provide the typed capture/receipt and authenticated Rust v2 census,
+   replacing the unauthenticated external Python classifier path. The strict
+   determinant-locked pair comparator, freshness/source audit, final gates and
+   independent review remain pending, as do all live captures and attribution
+   carry. No mechanism or production change is selected, and the official
+   10.1776x scoreboard is unchanged.
 2. **Keep eager full translation as a deferred future design, not the next
    patch.** Translating a complete eligible image once up front could amortize
    publication and avoid the losing per-process merge path measured here. It
@@ -315,10 +312,11 @@ scoreboard movement into a causal lock-split claim.
 - **High (97%):** the preserved optimistic-discard diagnostics and validator
   remain semantically useful. They are typed, fail closed, passed 165 tests,
   and naturally report zero on the restored serialized path.
-- **Unscored pending attribution:** no specific next implementation candidate
-  is promoted from the losing arm or fresh broad pair. Confidence will be
-  assigned only after an explicitly approved, authenticated `NativeShape`
-  design names a non-closed source-distinct >=10% opportunity.
+- **Unscored pending attribution:** Tasks 1–5 establish the approved
+  authenticated `NativeShape` capture and Rust census tooling, but no specific
+  implementation candidate is promoted. Tasks 6–8, live captures, and a
+  non-closed source-distinct >=10% opportunity twice remain before carry or a
+  confidence score.
 - **Very high (99%):** the fresh v5 A/B pair is valid. Both exact receipts,
   every reconciliation and coverage gate, deterministic regeneration, and the
   stable broad analyzer agree.

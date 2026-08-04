@@ -377,9 +377,10 @@ concern — it is half the product.
   of the old profile was the profiler — gives **user 67.6% / kernel 32.4%**, and
   within user **66.4% unsymbolized (the JIT cache), 13.3% carrick's Rust, 8.7%
   memcpy/memset, 7.8% malloc**. Emitted-code execution is **~45% of all build
-  CPU**. The shape census (`scripts/perf/shape_classify.py`) puts the
-  DSR-overhead floor at **52.4% of executed emitted instructions, down from
-  81.3%**, and the residue is concentrated in ONE thing: slot 1128 is the
+  CPU**. The historical shape census put the DSR-overhead floor at **52.4% of
+  executed emitted instructions, down from 81.3%**; current attribution uses
+  the authenticated `carrick debug jit-shape-census` tooling. The historical
+  residue was concentrated in ONE thing: slot 1128 is the
   guest's virtualized **x17** (physical x17 is the DSR edge register, borrowed to
   hold virtual branch conditions), and every such edge publishes it
   (`str x17,[x28,#1128]`) and restores it (`ldr x17,[x28,#1128]`). The general

@@ -979,15 +979,18 @@ pub(crate) enum DebugCommand {
     /// Join a complete native AArch64 sampled-PC trace to authenticated JIT
     /// retirement snapshots and report exact emitted context traffic.
     JitShapeCensus {
-        /// Complete SHAPE1 stream from native-shape-census.d.
+        /// Complete NSHAPE2 stream from the native-shape profile.
         trace: PathBuf,
+        /// Accepted native-shape capture receipt authenticating this trace.
+        #[arg(long)]
+        capture: PathBuf,
         /// Directory containing paired v4 JSON and binary JIT snapshots.
         #[arg(long)]
         snapshots: PathBuf,
-        /// Independently measured share of total workload CPU executing JIT
-        /// code. Retained verbatim to make total-CPU projections auditable.
-        #[arg(long = "jit-share-of-total")]
-        jit_share_of_total: f64,
+        /// Publish the deterministic census without overwriting an artifact.
+        /// Omit to write the same bytes to stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
     /// Decode an AArch64 ESR_EL1 value into its exception class, IL, ISS
     /// (with DFSC for data aborts) so the operator doesn't have to hand-
@@ -1163,7 +1166,7 @@ pub(crate) enum NetworkCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands};
+    use super::{Cli, Commands, DebugCommand};
     use crate::trace_profile::TraceProfileKind;
     use clap::Parser;
 
@@ -1201,6 +1204,104 @@ mod tests {
         assert_eq!(
             native_shape_snapshots.as_deref(),
             Some(std::path::Path::new("/tmp/native-shape.snapshots"))
+        );
+    }
+
+    #[test]
+    fn jit_shape_census_requires_capture_and_snapshots_but_not_output() {
+        let cli = Cli::try_parse_from([
+            "carrick",
+            "debug",
+            "jit-shape-census",
+            "/tmp/native-shape.raw",
+            "--capture",
+            "/tmp/native-shape.capture.jsonl",
+            "--snapshots",
+            "/tmp/native-shape.snapshots",
+        ])
+        .expect("authenticated census arguments should parse without --output");
+        let Commands::Debug {
+            command:
+                DebugCommand::JitShapeCensus {
+                    trace,
+                    capture,
+                    snapshots,
+                    output,
+                },
+        } = cli.command
+        else {
+            panic!("expected jit-shape-census command");
+        };
+        assert_eq!(trace, std::path::Path::new("/tmp/native-shape.raw"));
+        assert_eq!(
+            capture,
+            std::path::Path::new("/tmp/native-shape.capture.jsonl")
+        );
+        assert_eq!(
+            snapshots,
+            std::path::Path::new("/tmp/native-shape.snapshots")
+        );
+        assert_eq!(output, None);
+
+        for missing in [
+            vec![
+                "carrick",
+                "debug",
+                "jit-shape-census",
+                "/tmp/native-shape.raw",
+                "--snapshots",
+                "/tmp/native-shape.snapshots",
+            ],
+            vec![
+                "carrick",
+                "debug",
+                "jit-shape-census",
+                "/tmp/native-shape.raw",
+                "--capture",
+                "/tmp/native-shape.capture.jsonl",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(missing).is_err(),
+                "accepted command missing an authenticated input"
+            );
+        }
+    }
+
+    #[test]
+    fn jit_shape_census_accepts_output_and_rejects_removed_ratio() {
+        let with_output = Cli::try_parse_from([
+            "carrick",
+            "debug",
+            "jit-shape-census",
+            "/tmp/native-shape.raw",
+            "--capture",
+            "/tmp/native-shape.capture.jsonl",
+            "--snapshots",
+            "/tmp/native-shape.snapshots",
+            "--output",
+            "/tmp/native-shape.census.json",
+        ]);
+        assert!(
+            with_output.is_ok(),
+            "--output should be optional and accepted"
+        );
+
+        assert!(
+            Cli::try_parse_from([
+                "carrick",
+                "debug",
+                "jit-shape-census",
+                "/tmp/native-shape.raw",
+                "--capture",
+                "/tmp/native-shape.capture.jsonl",
+                "--snapshots",
+                "/tmp/native-shape.snapshots",
+                "--jit-share-of-total",
+                "0.45",
+            ])
+            .is_err(),
+            "the unauthenticated imported JIT ratio must be unknown"
         );
     }
 

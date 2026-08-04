@@ -1166,6 +1166,27 @@ impl NativeShapeCaptureReceipt {
     }
 }
 
+/// Parse the exact canonical one-line receipt emitted by Task 4 and require
+/// that it represents accepted evidence. Offline consumers must not grow a
+/// second, weaker interpretation of the receipt schema.
+pub(crate) fn parse_accepted_capture_receipt(bytes: &[u8]) -> Result<NativeShapeCaptureReceipt> {
+    if bytes.last() != Some(&b'\n') || bytes.iter().filter(|byte| **byte == b'\n').count() != 1 {
+        bail!("native-shape capture receipt must be exactly one newline-terminated JSON object");
+    }
+    let receipt: NativeShapeCaptureReceipt = serde_json::from_slice(&bytes[..bytes.len() - 1])
+        .context("parse native-shape capture receipt")?;
+    receipt.validate_for_publication()?;
+    if receipt.outcome != CaptureOutcome::Accepted {
+        bail!("native-shape capture receipt is rejected");
+    }
+    let mut canonical = serde_json::to_vec(&receipt).context("serialize native-shape capture")?;
+    canonical.push(b'\n');
+    if canonical != bytes {
+        bail!("native-shape capture receipt is not canonical Task 4 output");
+    }
+    Ok(receipt)
+}
+
 pub(crate) fn finalize_capture(
     request: NativeShapeFinalizeRequest<'_>,
 ) -> Result<NativeShapeCaptureReceipt> {
@@ -1276,7 +1297,7 @@ pub(crate) fn finalize_capture(
     Ok(receipt)
 }
 
-fn load_snapshot_set_from_real_directory(directory: &Path) -> Result<SnapshotSet> {
+pub(crate) fn load_snapshot_set_from_real_directory(directory: &Path) -> Result<SnapshotSet> {
     use std::os::unix::fs::MetadataExt;
 
     let before = fs::symlink_metadata(directory)
