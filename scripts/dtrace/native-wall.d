@@ -544,6 +544,14 @@ profile-499
 	    stack(24)] = count();
 }
 
+profile-499
+/tracked[pid] && range_ready[pid] && arg0 != 0 &&
+    kernel_depth[pid, tid] > (uint64_t)1/
+{
+	@cpu_kernel_syscall[kernel_function[pid, tid,
+	    kernel_depth[pid, tid] - 1]] = count();
+}
+
 tick-197hz
 /root_pid != (pid_t)0 && live_pids > 0/
 {
@@ -585,6 +593,8 @@ dtrace:::END
 	    @cpu_user);
 	printa("DSRPROF2|cpu-kernel|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|class=%s|pc=%#x|count=%@d\n",
 	    @cpu_kernel);
+	printa("DSRPROF2|cpu-kernel-syscall|function=%s|count=%@d\n",
+	    @cpu_kernel_syscall);
 	printa("DSRSTACK2|begin|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|kind=%s|count=%@d|total_ns=0\n%kDSRSTACK2|end\n",
 	    @cpu_kernel_stack);
 	printa("DSRPROF2|offcpu|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|kind=%s|pc=%#x|count=%@d|total_ns=%@d\n",
