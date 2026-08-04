@@ -9,7 +9,7 @@ ranked portfolio of non-overlapping owners whose normal-binary opportunity is at
 least 10%.
 
 **Architecture:** A portable wire module in `carrick-dsr-aarch64` owns the
-closed owner/reason vocabulary and strict `ALLOCOWNER2` parser. A feature-gated
+closed owner/reason vocabulary and strict `ALLOCOWNER3` parser. A feature-gated
 sibling module owns the `System`-delegating allocator, TLS scopes, relaxed
 atomics, fork/exec/exit state machine, and atomic exports; the runtime inserts
 only feature-gated lifecycle calls and semantic scopes. Focused CLI modules
@@ -81,7 +81,7 @@ efficient runtime translation.
 ## File map
 
 - Create `crates/carrick-dsr-aarch64/src/alloc_owner_wire.rs`: closed owner and
-  flush vocabularies; current `ALLOCOWNER2` record, deterministic render,
+  flush vocabularies; current `ALLOCOWNER3` record, deterministic render,
   checksum, and
   strict parser. Portable and allocation-observer-free.
 - Create `crates/carrick-dsr-aarch64/src/alloc_owner_census.rs`: feature-gated
@@ -1309,6 +1309,17 @@ active executable-span/source-word/segment preparation body, leaves the
 all-disabled fast return outside the scope, and bumps the wire/report schemas to
 `ALLOCOWNER2` / `carrick.alloc-owner-census.v2`. V1 capture artifacts are
 preserved separately and are not mixed with v2 evidence.
+
+V2 arm A also failed closed, narrowly but authoritatively: all 140 records
+parsed and joined, while `other = 0.10036888623108418`. The new source owner
+captured `0.033414074090056346`, so it worked, but the result is not rounded
+into a pass. The DHAT stack table's largest remaining outer semantic boundary
+is `ProcessState::translate` (9,109,059,802 / 10,319,258,502 gross cumulative
+requested bytes in partial scouts A/B). V3 adds exactly
+`translation-orchestration` around that boundary. Existing narrower scopes
+remain nested and take precedence, so this owner records only the residual
+translation work. The wire/report schemas become `ALLOCOWNER3` /
+`carrick.alloc-owner-census.v3`; v2 arm A is preserved separately.
 
 - [ ] **Step 5: Restore and authenticate the ordinary binary**
 
