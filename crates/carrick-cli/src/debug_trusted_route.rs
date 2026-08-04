@@ -21,8 +21,8 @@ use tempfile::NamedTempFile;
 
 use crate::trace_profile::{TrustedRouteCaptureReceipt, TrustedRoutePcRow, parse_trusted_route_pc};
 
-const REPORT_SCHEMA: &str = "carrick.trusted-route-census.v1";
-const SNAPSHOT_SCHEMA: &str = "carrick.code-snapshot.v2";
+const REPORT_SCHEMA: &str = "carrick.trusted-route-census.v2";
+const SNAPSHOT_SCHEMA: &str = "carrick.code-snapshot.v3";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct RouteTallies {
@@ -59,6 +59,25 @@ pub(crate) struct RouteShares {
     pub(crate) indirect: f64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct OriginTallies {
+    pub(crate) owned: u64,
+    pub(crate) unit_replay: u64,
+}
+
+impl OriginTallies {
+    fn add(&mut self, origin: SnapshotOrigin, samples: u64) -> Result<()> {
+        let slot = match origin {
+            SnapshotOrigin::Owned => &mut self.owned,
+            SnapshotOrigin::UnitReplay => &mut self.unit_replay,
+        };
+        *slot = slot
+            .checked_add(samples)
+            .ok_or_else(|| anyhow!("trusted-route origin population overflow"))?;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct TrustedRouteCensusReport {
     pub(crate) schema: &'static str,
@@ -74,6 +93,8 @@ pub(crate) struct TrustedRouteCensusReport {
     pub(crate) route_shares: RouteShares,
     pub(crate) jit_share: f64,
     pub(crate) projected_total_cpu: RouteShares,
+    pub(crate) route_origins: OriginTallies,
+    pub(crate) route_samples_by_origin: OriginTallies,
     pub(crate) sequence_bytes: u32,
     /// Diagnostic trusted-entry rows, one per instrumented published block.
     pub(crate) block_count: u64,
@@ -104,6 +125,7 @@ struct SnapshotIndex {
 struct SnapshotRoute {
     guest_start: u64,
     generation: u64,
+    origin: SnapshotOrigin,
     fallthrough: std::ops::Range<u64>,
     direct: std::ops::Range<u64>,
     indirect: std::ops::Range<u64>,
@@ -111,6 +133,13 @@ struct SnapshotRoute {
     direct_branch: u64,
     indirect_branch: u64,
     common_body: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum SnapshotOrigin {
+    Owned,
+    UnitReplay,
 }
 
 struct LoadedSnapshot {
@@ -123,6 +152,7 @@ struct SnapshotSet {
     sha256: String,
     sequence_bytes: u32,
     block_count: u64,
+    route_origins: OriginTallies,
 }
 
 pub(crate) fn run_trusted_route_census(
@@ -207,6 +237,7 @@ pub(crate) fn build_trusted_route_census(
     let mut missing_range_samples = 0_u64;
     let mut routes = RouteTallies::default();
     let mut artificial_branches = RouteTallies::default();
+    let mut route_samples_by_origin = OriginTallies::default();
     for row in rows {
         let Some(snapshots) = snapshot_set.by_pid.get(&row.pid) else {
             missing_pid_samples =
@@ -227,11 +258,12 @@ pub(crate) fn build_trusted_route_census(
             continue;
         };
         matched_samples = checked_add_population(matched_samples, row.samples, "matched samples")?;
-        if let Some((route, branch)) = classify_route(&snapshot.index.trusted_routes, row) {
+        if let Some((route, branch, origin)) = classify_route(&snapshot.index.trusted_routes, row) {
             if branch {
                 artificial_branches.add(route, row.samples)?;
             } else {
                 routes.add(route, row.samples)?;
+                route_samples_by_origin.add(origin, row.samples)?;
             }
         }
     }
@@ -258,6 +290,13 @@ pub(crate) fn build_trusted_route_census(
             "{missing_range_samples} sample(s) fall outside their PID snapshot cache range"
         ));
     }
+    if snapshot_set.route_origins.owned == 0 {
+        validation_failures.push("snapshot set has zero owned trusted-route spans".to_owned());
+    }
+    if snapshot_set.route_origins.unit_replay == 0 {
+        validation_failures
+            .push("snapshot set has zero unit-replay trusted-route spans".to_owned());
+    }
     let route_shares = shares(routes, route_total);
     let projected_total_cpu = projected(routes, total_pc_samples, jit_share);
     Ok(TrustedRouteCensusReport {
@@ -274,6 +313,8 @@ pub(crate) fn build_trusted_route_census(
         route_shares,
         jit_share,
         projected_total_cpu,
+        route_origins: snapshot_set.route_origins,
+        route_samples_by_origin,
         sequence_bytes: snapshot_set.sequence_bytes,
         block_count: snapshot_set.block_count,
         validation_failures,
@@ -317,7 +358,10 @@ fn projected(routes: RouteTallies, total_pc_samples: u64, jit_share: f64) -> Rou
     }
 }
 
-fn classify_route(routes: &[SnapshotRoute], row: TrustedRoutePcRow) -> Option<(Route, bool)> {
+fn classify_route(
+    routes: &[SnapshotRoute],
+    row: TrustedRoutePcRow,
+) -> Option<(Route, bool, SnapshotOrigin)> {
     let candidate = routes
         .partition_point(|route| route.fallthrough.start <= row.pc)
         .checked_sub(1)
@@ -336,10 +380,10 @@ fn classify_route(routes: &[SnapshotRoute], row: TrustedRoutePcRow) -> Option<(R
         ),
     ] {
         if span.contains(&row.pc) {
-            return Some((kind, false));
+            return Some((kind, false, candidate.origin));
         }
         if row.pc == branch {
-            return Some((kind, true));
+            return Some((kind, true, candidate.origin));
         }
     }
     None
@@ -363,6 +407,7 @@ fn load_snapshots(directory: &Path) -> Result<SnapshotSet> {
     let mut manifest = Vec::new();
     let mut sequence_bytes = None;
     let mut block_count = 0_u64;
+    let mut route_origins = OriginTallies::default();
     for index_path in indexes {
         let index_name = index_path
             .file_name()
@@ -421,6 +466,9 @@ fn load_snapshots(directory: &Path) -> Result<SnapshotSet> {
                     .context("snapshot trusted-route count exceeds u64")?,
             )
             .ok_or_else(|| anyhow!("snapshot trusted-route count overflow"))?;
+        for route in &index.trusted_routes {
+            route_origins.add(route.origin, 1)?;
+        }
         by_pid
             .entry(index.pid)
             .or_insert_with(Vec::new)
@@ -450,6 +498,7 @@ fn load_snapshots(directory: &Path) -> Result<SnapshotSet> {
         sha256: format!("{:x}", Sha256::digest(&manifest)),
         sequence_bytes: sequence_bytes.unwrap_or(0),
         block_count,
+        route_origins,
     })
 }
 
@@ -1113,6 +1162,7 @@ mod tests {
             "trusted_routes": [{
                 "guest_start": 0x40_0000_u64 + u64::from(pid),
                 "generation": 7,
+                "origin": if pid == 43 { "unit-replay" } else { "owned" },
                 "fallthrough": {"start": base, "end": base + 12},
                 "direct": {"start": base + 16, "end": base + 28},
                 "indirect": {"start": base + 32, "end": base + 44},
@@ -1242,6 +1292,20 @@ mod tests {
         assert!((report.projected_total_cpu.indirect - 38.0 * 0.45 / 109.0).abs() < 1e-12);
         assert_eq!(report.sequence_bytes, 12);
         assert_eq!(report.block_count, 2);
+        assert_eq!(
+            report.route_origins,
+            OriginTallies {
+                owned: 1,
+                unit_replay: 1,
+            }
+        );
+        assert_eq!(
+            report.route_samples_by_origin,
+            OriginTallies {
+                owned: 60,
+                unit_replay: 18,
+            }
+        );
         assert!(report.validation_failures.is_empty());
     }
 

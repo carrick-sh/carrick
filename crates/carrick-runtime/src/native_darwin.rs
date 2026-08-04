@@ -3362,7 +3362,7 @@ fn maybe_dump_code_snapshot(translator: &dsr::ThreadTranslator) {
 
 fn code_snapshot_index(pid: u32, snapshot: &dsr::CodeSnapshot) -> serde_json::Value {
     serde_json::json!({
-        "schema": "carrick.code-snapshot.v2",
+        "schema": "carrick.code-snapshot.v3",
         "pid": pid,
         "cache_base": snapshot.cache_base,
         "code_len": snapshot.code.len(),
@@ -7855,6 +7855,7 @@ mod tests {
             trusted_routes: vec![dsr::TrustedRouteSnapshot {
                 guest_start: 0x40_0000,
                 generation: 7,
+                origin: dsr::TrustedRouteOrigin::Owned,
                 fallthrough: 0x1000..0x100c,
                 direct: 0x1010..0x101c,
                 indirect: 0x1020..0x102c,
@@ -7867,7 +7868,7 @@ mod tests {
 
         let index = code_snapshot_index(42, &snapshot);
 
-        assert_eq!(index["schema"], "carrick.code-snapshot.v2");
+        assert_eq!(index["schema"], "carrick.code-snapshot.v3");
         assert_eq!(index["pid"], 42);
         assert_eq!(index["code_len"], 64);
         assert_eq!(
@@ -7875,6 +7876,7 @@ mod tests {
             format!("{:x}", sha2::Sha256::digest(&snapshot.code))
         );
         assert_eq!(index["trusted_routes"][0]["generation"], 7);
+        assert_eq!(index["trusted_routes"][0]["origin"], "owned");
         assert_eq!(index["trusted_routes"][0]["direct"]["start"], 0x1010);
         assert_eq!(index["trusted_routes"][0]["common_body"], 0x1030);
     }
@@ -7900,7 +7902,7 @@ mod tests {
         let index: serde_json::Value =
             serde_json::from_slice(&std::fs::read(index_path).expect("published snapshot index"))
                 .expect("valid snapshot JSON");
-        assert_eq!(index["schema"], "carrick.code-snapshot.v2");
+        assert_eq!(index["schema"], "carrick.code-snapshot.v3");
     }
 
     struct RecordingNativeImagePublisher<'a> {
