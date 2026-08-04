@@ -1948,7 +1948,7 @@ impl TraceProfileKind {
     }
 
     pub(crate) const fn requires_runtime_profile(self) -> bool {
-        matches!(self, Self::Dsr | Self::DsrFork)
+        matches!(self, Self::Dsr | Self::DsrFork | Self::NativeWall)
     }
 
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
@@ -4487,10 +4487,11 @@ mod tests {
     }
 
     #[test]
-    fn profiles_using_prepare_phases_require_runtime_instrumentation() {
+    fn profiles_requiring_runtime_metadata_enable_runtime_instrumentation() {
         assert!(TraceProfileKind::Dsr.requires_runtime_profile());
         assert!(!TraceProfileKind::DsrIndirect.requires_runtime_profile());
         assert!(TraceProfileKind::DsrFork.requires_runtime_profile());
+        assert!(TraceProfileKind::NativeWall.requires_runtime_profile());
     }
 
     #[test]
