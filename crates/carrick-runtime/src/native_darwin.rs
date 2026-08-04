@@ -5113,9 +5113,9 @@ impl NativeThreadRuntime {
                     )
                 }));
                 match result {
-                    Ok(Ok(NativeThreadLoopOutcome::ProcessExit(code))) => unsafe {
-                        libc::_exit(code);
-                    },
+                    Ok(Ok(NativeThreadLoopOutcome::ProcessExit(code))) => {
+                        crate::exec_stamps::spawned_guest_process_exit(code);
+                    }
                     // A spawned sibling retired by an exec replacement ends
                     // exactly like a normal thread exit; only the INITIAL
                     // thread's caller distinguishes the two.
