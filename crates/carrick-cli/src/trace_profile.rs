@@ -394,7 +394,10 @@ impl V2ProfileAuthority {
                 self.birth_qualification_sha256,
                 self.terminal_qualification_sha256,
             ),
-            TraceProfileKind::Dsr | TraceProfileKind::DsrFork | TraceProfileKind::DsrIndirect => {
+            TraceProfileKind::Dsr
+            | TraceProfileKind::DsrFork
+            | TraceProfileKind::DsrIndirect
+            | TraceProfileKind::NativeShape => {
                 unreachable!("non-native profile cannot construct V2ProfileAuthority")
             }
         }
@@ -2043,6 +2046,7 @@ pub(crate) enum TraceProfileKind {
     DsrIndirect,
     DsrFork,
     NativeFault,
+    NativeShape,
     NativeWall,
 }
 
@@ -2053,12 +2057,16 @@ impl TraceProfileKind {
             Self::DsrIndirect => "dsr-indirect",
             Self::DsrFork => "dsr-fork",
             Self::NativeFault => "native-fault",
+            Self::NativeShape => "native-shape",
             Self::NativeWall => "native-wall",
         }
     }
 
     pub(crate) const fn requires_runtime_profile(self) -> bool {
-        matches!(self, Self::Dsr | Self::DsrFork | Self::NativeWall)
+        matches!(
+            self,
+            Self::Dsr | Self::DsrFork | Self::NativeShape | Self::NativeWall
+        )
     }
 
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
@@ -2068,6 +2076,7 @@ impl TraceProfileKind {
             Self::DsrIndirect => carrick_runtime::dtrace_consumer::BUNDLED_DSR_INDIRECT_D,
             Self::DsrFork => carrick_runtime::dtrace_consumer::BUNDLED_DSR_FORK_D,
             Self::NativeFault => carrick_runtime::dtrace_consumer::BUNDLED_NATIVE_FAULT_D,
+            Self::NativeShape => carrick_runtime::dtrace_consumer::BUNDLED_NATIVE_SHAPE_D,
             Self::NativeWall => carrick_runtime::dtrace_consumer::BUNDLED_NATIVE_WALL_D,
         }
     }
@@ -2078,6 +2087,7 @@ impl TraceProfileKind {
             "dsr-indirect" => Ok(Self::DsrIndirect),
             "dsr-fork" => Ok(Self::DsrFork),
             "native-fault" => Ok(Self::NativeFault),
+            "native-shape" => Ok(Self::NativeShape),
             "native-wall" => Ok(Self::NativeWall),
             other => bail!("unknown DSR profile {other:?}"),
         }
@@ -4965,6 +4975,7 @@ mod tests {
         assert!(TraceProfileKind::Dsr.requires_runtime_profile());
         assert!(!TraceProfileKind::DsrIndirect.requires_runtime_profile());
         assert!(TraceProfileKind::DsrFork.requires_runtime_profile());
+        assert!(TraceProfileKind::NativeShape.requires_runtime_profile());
         assert!(TraceProfileKind::NativeWall.requires_runtime_profile());
     }
 

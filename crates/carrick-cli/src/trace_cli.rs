@@ -56,6 +56,7 @@ pub(crate) struct TraceSudoInvocation<'a> {
     pub(crate) profile: Option<TraceProfileKind>,
     pub(crate) summary_jsonl: Option<&'a Path>,
     pub(crate) trace_out: Option<&'a Path>,
+    pub(crate) native_shape_snapshots: Option<&'a Path>,
     pub(crate) uid: u32,
     pub(crate) gid: u32,
     pub(crate) groups: &'a [u32],
@@ -86,6 +87,10 @@ pub(crate) fn trace_sudo_argv(invocation: &TraceSudoInvocation<'_>) -> Vec<OsStr
     }
     if let Some(path) = invocation.trace_out {
         argv.push(OsString::from("--trace-out"));
+        argv.push(path.as_os_str().to_owned());
+    }
+    if let Some(path) = invocation.native_shape_snapshots {
+        argv.push(OsString::from("--native-shape-snapshots"));
         argv.push(path.as_os_str().to_owned());
     }
     argv.push(OsString::from("--trace-uid"));
@@ -243,6 +248,7 @@ mod tests {
             profile: Some(TraceProfileKind::DsrIndirect),
             summary_jsonl: Some(Path::new("/tmp/summary.jsonl")),
             trace_out: Some(Path::new("/tmp/raw.trace")),
+            native_shape_snapshots: None,
             uid: 501,
             gid: 20,
             groups: &[20, 12],
@@ -289,6 +295,7 @@ mod tests {
             profile: Some(TraceProfileKind::NativeFault),
             summary_jsonl: None,
             trace_out: Some(Path::new("/tmp/native-fault.raw")),
+            native_shape_snapshots: None,
             uid: 501,
             gid: 20,
             groups: &[],
@@ -315,6 +322,57 @@ mod tests {
                 "--",
                 "run-elf",
                 "/tmp/fault-probe",
+            ]
+        );
+    }
+
+    #[test]
+    fn native_shape_sudo_argv_preserves_snapshots_before_identity_and_run_id() {
+        let environment = [(
+            OsString::from("CARRICK_RUN_ID"),
+            OsString::from("native-shape-test"),
+        )];
+        let command = ["run".to_owned(), "/bin/true".to_owned()];
+        let argv = trace_sudo_argv(&TraceSudoInvocation {
+            executable: Path::new("/tmp/carrick"),
+            flowindent: false,
+            script: None,
+            profile: Some(TraceProfileKind::NativeShape),
+            summary_jsonl: Some(Path::new("/tmp/native-shape.jsonl")),
+            trace_out: Some(Path::new("/tmp/native-shape.raw")),
+            native_shape_snapshots: Some(Path::new("/tmp/native-shape.snapshots")),
+            uid: 501,
+            gid: 20,
+            groups: &[],
+            forwarded_env: &environment,
+            command: &command,
+        });
+        let strings = argv
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            strings,
+            [
+                "/tmp/carrick",
+                "trace",
+                "--profile",
+                "native-shape",
+                "--summary-jsonl",
+                "/tmp/native-shape.jsonl",
+                "--trace-out",
+                "/tmp/native-shape.raw",
+                "--native-shape-snapshots",
+                "/tmp/native-shape.snapshots",
+                "--trace-uid",
+                "501",
+                "--trace-gid",
+                "20",
+                "--forward-env",
+                "CARRICK_RUN_ID=native-shape-test",
+                "--",
+                "run",
+                "/bin/true",
             ]
         );
     }
