@@ -1,9 +1,9 @@
 # Native-lane performance: state of play
 
 **Date:** 2026-08-04 · **Branch:** `codex/native-store-default` · **Latest
-decision:** stop and revert optimistic decode outside the translation writer
-after a controlled **13.74% total-CPU regression**; preserve its typed discard
-diagnostics and return to fresh attribution on the retained tree ·
+decision:** fresh current-retained-tree v5 attribution is accepted, but carry no
+new source-distinct family; the proposed next step is an authenticated typed
+`NativeShape` profile/Rust census and awaits explicit design approval ·
 **Scope:** Darwin/aarch64 native backend (`--exec-backend native`, the shipped
 default). VMM is explicitly NOT the target: one process per VM against a
 ~127-VM macOS ceiling makes it a dead end for build-shaped workloads.
@@ -162,6 +162,62 @@ proven; the no-retain decision does not depend on resolving it. Commits
 23/23 native smoke gate. Full evidence:
 [`docs/perf-results/2026-08-04-native-optimistic-decode.md`](docs/perf-results/2026-08-04-native-optimistic-decode.md).
 
+The first restored-tree refresh then failed closed twice without contributing
+performance evidence. At unchanged runtime/evidence `90e35cc6` and binary
+SHA-256 `82572dd3f7da5f2a4252782038f2c52bec8b30f6cdd7f1fc3a121f13ccceae51`,
+Task 8 A1 found 5,082 named-syscall kernel samples but only 5,081 samples in an
+independently aggregated per-function view. A2 serialized a positive-duration
+off-CPU stack with `count=0`, `total_ns=5125`: independent `ustack(24)`
+evaluations had produced count and duration keys differing by a strict-prefix
+extension. Both workloads reached natural, clean `BUILD_OK`, but both receipts
+remain rejected and no B or attribution was admitted.
+
+Commit `6fa105d2` (`fix(trace): unify native wall sample authority`) repairs both
+producer flaws as raw v5: one aggregation owns kernel class, normalized
+function, and PC, and one stack evaluation owns duration-only off-CPU evidence.
+Kernel and targeted `psynch_cvwait` stacks remain exact positive-count
+authority. Focused gates passed 63/63 trace-profile Rust tests, 21/21 integration
+tests, and 58/58 affected Python consumer tests; Clippy/fmt/diff and
+forbidden-shape scans passed. Independent review approved with no findings and
+97% confidence. This was tracing/control-plane repair, not a runtime performance
+change.
+
+Task 10's first live v5 A proved the producer shape naturally and losslessly,
+but its outer Python wrapper rejected only because its stale exact drop schema
+did not know `dynamic_rinse_drops` and `dynamic_dirty_drops`. It remains
+excluded; there was no retry, B, or attribution. Commit `8214c136`
+(`fix(perf): synchronize trace drop schema`) updates all five strict Python
+consumers to require the exact seven-field object: literal
+`interrupted=false` plus six typed-zero counters. Missing, extra, mistyped, or
+nonzero values fail closed. Named tests passed 16/16, affected modules 260/260,
+and full Python discovery 516/516; independent review approved with no findings
+and 97% confidence.
+
+Task 12 finally accepted two fresh natural v5 captures at clean `8214c136`,
+runtime/CLI source `6fa105d2`, and frozen signed binary SHA-256
+`74a1c9be5325402bcf8d3c96e85d6551a5c7378dc067671dee2b5f64927418fd`.
+A/B receipts are
+`f33f58965cad00bf60c2bbec8bfbb1a56c09057219852382b09385242fe17349` /
+`1e3a349e72f2087c9db3a4166cca134dcf5bf06b18860035ff59e92b7a91d13c`;
+Every drop, lifecycle, cleanup, contamination, kernel PC/stack, off-CPU
+duration, symbolization, and >=99% coverage gate passed. Regenerated analysis
+matches the wrapper artifact at SHA-256
+`8dadf9dd2c93a19ecf10e71fc29f443c9553ae1a465b8378cdcb45fcc001f02e`;
+broad attribution is
+`6aac67d71e571bf6f5b1eec9fbf8b9c4bfed3a3fa8e1a9275b4d93b618bccc18`.
+
+The fresh stable all-CPU split is Darwin kernel **48.0232% / 48.7901%**,
+translated guest **25.8818% / 25.3278%**, Darwin userspace **10.0290% /
+9.9863%**, other Carrick **8.3174% / 8.5377%**, and translation **6.0589% /
+5.9643%**. Kernel divides into named-syscall **27.7520% / 28.8889%** and
+non-syscall **20.2712% / 19.9012%**. Carry no new family: exact host
+`psynch_cvwait` is **11.1172% / 11.5775%**, but it is the already-attributed
+closed lock line; the apparent larger `ml_set_interrupts_enabled_with_debug`
+family is a rejected symbolizer alias, profiler/fasttrap and closed lines remain
+excluded, and every remaining specific host syscall is below 6%. These shares
+do not map whole host-syscall populations to guest operations. DTrace remains
+mechanism evidence only, and the official scoreboard remains **10.1776x**.
+
 ## What landed (2026-08-02/03, six waves, all merged with `just ci` green)
 
 **Exec pipeline.** Payload SHA-256 removed from the default artifact digest
@@ -216,15 +272,17 @@ user-requested serialized current-default refresh is nevertheless complete and
 sets the official absolute scoreboard to 10.1776x without converting that
 scoreboard movement into a causal lock-split claim.
 
-1. **Attribute the next current-retained-tree bucket before selecting another
-   production candidate.** The optimistic decode experiment proves that a
-   material wait-stack reduction can still increase product CPU. Do not present
-   the stopped exclusive-writer line as the next candidate, and do not infer a
-   replacement from its losing arm. Reprofile the restored serialized tree,
-   bind the next source-distinct mechanism to at least 10% end-to-end CPU or
-   wall opportunity, then test one lowering hypothesis at a time. Smaller wins
-   may be retained only when measured as non-regrettable enablers, following the
-   user-approved sequential-improvement policy.
+1. **Await explicit design approval for `NativeShape`; do not implement or
+   capture it yet.** The fresh broad pair makes translated guest the next stable
+   unsplit bucket at 25.88% / 25.33% of all CPU. The existing generic
+   `native-cpu-attribution.d` plus `shape_classify.py` mechanism is not evidence
+   authority: generic `carrick trace --script` lacks a typed receipt/program
+   hash and the classifier does not bind raw trace, snapshots, source, binary,
+   image, command, or run IDs. The proposed next task is to adapt it into an
+   authenticated typed `NativeShape` profile and Rust census (or an equivalently
+   complete immutable manifest), then require one non-overlapping, non-closed
+   emitted shape to clear 10% of all CPU twice. This is a proposal, not an
+   approved design, guest-operation mapping, or source-change recommendation.
 2. **Keep eager full translation as a deferred future design, not the next
    patch.** Translating a complete eligible image once up front could amortize
    publication and avoid the losing per-process merge path measured here. It
@@ -258,8 +316,19 @@ scoreboard movement into a causal lock-split claim.
   remain semantically useful. They are typed, fail closed, passed 165 tests,
   and naturally report zero on the restored serialized path.
 - **Unscored pending attribution:** no specific next implementation candidate
-  is promoted from the losing arm. Confidence will be assigned only after a
-  fresh current-retained-tree profile names a source-distinct >=10% opportunity.
+  is promoted from the losing arm or fresh broad pair. Confidence will be
+  assigned only after an explicitly approved, authenticated `NativeShape`
+  design names a non-closed source-distinct >=10% opportunity.
+- **Very high (99%):** the fresh v5 A/B pair is valid. Both exact receipts,
+  every reconciliation and coverage gate, deterministic regeneration, and the
+  stable broad analyzer agree.
+- **Very high (98%):** the fresh pair carries no new selectable family. The
+  apparent interrupt alias is excluded, the only qualifying exact syscall is
+  the already-closed lock line, and all remaining specific syscalls are below
+  6%.
+- **High (90%):** authenticated emitted-shape attribution is the smallest
+  non-regrettable next split, but no implementation confidence is claimed
+  before explicit design approval.
 - **High (95%):** the official shipped-default result is now 10.1776x. No
   projection or unresolved wall result was substituted for a fresh
   Carrick/Docker run.
@@ -291,19 +360,26 @@ scoreboard movement into a causal lock-split claim.
 
 ## Branch state at handoff
 
-Current restored code authority before this handoff/evidence commit is
-`89e82b84`. Commits `87ab04f9` and
+Current branch authority before this controller-hygiene commit is
+`8214c136`. Current runtime/CLI trace authority is `6fa105d2`; the only later
+commit is the reviewed Python consumer repair `8214c136`. Commits `87ab04f9` and
 `44de0656` retain the export-only, lifecycle-complete memory-intent census;
 `98ae5e26` and `c4be3c23` retain exact syscall and `psynch_cvwait` stack
 attribution; `64bebc26` is the measured published-block index split. The losing
 optimistic implementation commits `3733eeef` and `9e0b0817` are neutralized by
 reverts `89e82b84` and `99ce4d0c`; diagnostics commit `d4c84088` and parser
-commit `9a2788d6` remain. The restored signed binary has SHA-256
-`82572dd3f7da5f2a4252782038f2c52bec8b30f6cdd7f1fc3a121f13ccceae51`.
+commit `9a2788d6` remain. The frozen signed v5 binary has SHA-256
+`74a1c9be5325402bcf8d3c96e85d6551a5c7378dc067671dee2b5f64927418fd`.
 The clean detached optimistic-decode ABBA control remains at `a5bd4971` in
 `.worktrees/native-optimistic-control`; do not delete it until controller
-closeout. `RUST_TEST_THREADS=1 just ci` and `just conformance-native smoke`
-(23/23 MATCH) passed at restored source authority. Nothing has been pushed and
-local `main` has not moved. Target-only raw ABBA, mechanism, signed-binary,
-store, attribution, and scoreboard receipts remain under `target/perf/` and
-are intentionally not committed.
+closeout. The last full `RUST_TEST_THREADS=1 just ci` and
+`just conformance-native smoke` (23/23 MATCH) apply to the restored runtime tree
+at `89e82b84` and evidence/handoff commit `90e35cc6`. Later `6fa105d2` trace
+producer/parser and `8214c136` Python consumer changes have focused gates,
+independent reviews, and the fresh accepted v5 A/B qualification described
+above; no full `just ci` or native smoke is claimed at current HEAD. Nothing has
+been pushed and local `main` has not moved. Target-only raw ABBA, mechanism,
+signed-binary, store, attribution, and scoreboard receipts remain under
+`target/perf/` and are intentionally not committed. Eager full translation is
+deferred, incremental augmentation remains required for JIT-on-JIT, and Tier D
+remains default-off.
