@@ -119,7 +119,7 @@ struct LoadedSnapshot {
 }
 
 struct SnapshotSet {
-    by_pid: BTreeMap<u32, LoadedSnapshot>,
+    by_pid: BTreeMap<u32, Vec<LoadedSnapshot>>,
     sha256: String,
     sequence_bytes: u32,
     block_count: u64,
@@ -208,19 +208,24 @@ pub(crate) fn build_trusted_route_census(
     let mut routes = RouteTallies::default();
     let mut artificial_branches = RouteTallies::default();
     for row in rows {
-        let Some(snapshot) = snapshot_set.by_pid.get(&row.pid) else {
+        let Some(snapshots) = snapshot_set.by_pid.get(&row.pid) else {
             missing_pid_samples =
                 checked_add_population(missing_pid_samples, row.samples, "missing-PID samples")?;
             continue;
         };
-        if row.pc < snapshot.index.cache_base || row.pc >= snapshot.cache_end {
+        let snapshot = snapshots
+            .partition_point(|snapshot| snapshot.index.cache_base <= row.pc)
+            .checked_sub(1)
+            .and_then(|index| snapshots.get(index))
+            .filter(|snapshot| row.pc < snapshot.cache_end);
+        let Some(snapshot) = snapshot else {
             missing_range_samples = checked_add_population(
                 missing_range_samples,
                 row.samples,
                 "missing-range samples",
             )?;
             continue;
-        }
+        };
         matched_samples = checked_add_population(matched_samples, row.samples, "matched samples")?;
         if let Some((route, branch)) = classify_route(&snapshot.index.trusted_routes, row) {
             if branch {
@@ -245,7 +250,7 @@ pub(crate) fn build_trusted_route_census(
     }
     if missing_pid_samples != 0 {
         validation_failures.push(format!(
-            "{missing_pid_samples} sample(s) name a PID without one snapshot commit marker"
+            "{missing_pid_samples} sample(s) name a PID without a snapshot commit marker"
         ));
     }
     if missing_range_samples != 0 {
@@ -416,12 +421,10 @@ fn load_snapshots(directory: &Path) -> Result<SnapshotSet> {
                     .context("snapshot trusted-route count exceeds u64")?,
             )
             .ok_or_else(|| anyhow!("snapshot trusted-route count overflow"))?;
-        if by_pid
-            .insert(index.pid, LoadedSnapshot { index, cache_end })
-            .is_some()
-        {
-            bail!("PID has duplicate snapshot JSON commit markers");
-        }
+        by_pid
+            .entry(index.pid)
+            .or_insert_with(Vec::new)
+            .push(LoadedSnapshot { index, cache_end });
         let code_name = code_path
             .file_name()
             .and_then(|name| name.to_str())
@@ -432,6 +435,15 @@ fn load_snapshots(directory: &Path) -> Result<SnapshotSet> {
             Sha256::digest(&index_bytes)
         )?;
         writeln!(&mut manifest, "bin {code_name} {code_sha256}")?;
+    }
+    for (pid, snapshots) in &mut by_pid {
+        snapshots.sort_by_key(|snapshot| snapshot.index.cache_base);
+        if snapshots
+            .windows(2)
+            .any(|pair| pair[0].cache_end > pair[1].index.cache_base)
+        {
+            bail!("PID {pid} has overlapping snapshot cache ranges");
+        }
     }
     Ok(SnapshotSet {
         by_pid,
@@ -1112,14 +1124,18 @@ mod tests {
         })
     }
 
-    fn write_snapshot(directory: &Path, pid: u32, base: u64) {
+    fn write_snapshot_named(directory: &Path, name: &str, pid: u32, base: u64) {
         let code = bytes(&words());
-        fs::write(directory.join(format!("{pid}.bin")), &code).expect("snapshot code");
+        fs::write(directory.join(format!("{name}.bin")), &code).expect("snapshot code");
         fs::write(
-            directory.join(format!("{pid}.json")),
+            directory.join(format!("{name}.json")),
             serde_json::to_vec(&snapshot_value(pid, base, &code)).expect("snapshot JSON"),
         )
         .expect("snapshot index");
+    }
+
+    fn write_snapshot(directory: &Path, pid: u32, base: u64) {
+        write_snapshot_named(directory, &pid.to_string(), pid, base);
     }
 
     fn raw_trace(rows: &[(u32, u64, u64)]) -> String {
@@ -1227,6 +1243,34 @@ mod tests {
         assert_eq!(report.sequence_bytes, 12);
         assert_eq!(report.block_count, 2);
         assert!(report.validation_failures.is_empty());
+    }
+
+    #[test]
+    fn trusted_route_census_accepts_nonoverlapping_exec_snapshots_for_one_pid() {
+        let fixture = make_fixture(&[(42, 0x1000, 3), (42, 0x3000, 5)]);
+        write_snapshot_named(&fixture.snapshots, "42-exec-2", 42, 0x3000);
+
+        let report =
+            build_trusted_route_census(&fixture.trace, &fixture.capture, &fixture.snapshots, 0.45)
+                .expect("non-overlapping snapshots for one PID");
+
+        assert_eq!(report.matched_samples, 8);
+        assert_eq!(report.missing_pid_samples, 0);
+        assert_eq!(report.missing_range_samples, 0);
+        assert_eq!(report.routes.fallthrough, 8);
+        assert_eq!(report.block_count, 3);
+        assert!(report.validation_failures.is_empty());
+    }
+
+    #[test]
+    fn trusted_route_census_rejects_overlapping_exec_snapshots_for_one_pid() {
+        let fixture = make_fixture(&valid_rows());
+        write_snapshot_named(&fixture.snapshots, "42-overlap", 42, 0x1020);
+
+        assert!(
+            build_trusted_route_census(&fixture.trace, &fixture.capture, &fixture.snapshots, 0.45,)
+                .is_err()
+        );
     }
 
     #[test]

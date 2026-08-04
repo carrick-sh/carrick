@@ -4363,6 +4363,12 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                             }
                         }
                         publish_native_shared_candidates(&translator, &memory);
+                        // A fork child may execute inherited translated code
+                        // before this in-process exec installs its replacement
+                        // translator. Preserve the outgoing cache lifetime for
+                        // offline sampled-PC joins; the final-exit snapshot
+                        // below will publish the non-overlapping replacement.
+                        maybe_dump_code_snapshot(&translator);
                         // In-process `execve` replaces guest memory but not
                         // carrick's own statics, so without a flush here the
                         // outgoing and incoming images' translations merge into
