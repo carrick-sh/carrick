@@ -3341,6 +3341,30 @@ fn finalize_native_process_exit(
 /// the last-thread exit seam, so an offline sampled-PC census can classify
 /// emitted words after the (short-lived) process is gone. Never enabled on a
 /// measurement path; failures only warn.
+#[derive(serde::Serialize)]
+struct CodeSnapshotMetadata<'a> {
+    schema: &'static str,
+    pid: u32,
+    cache_base: u64,
+    code_len: usize,
+    code_sha256: String,
+    blocks: &'a [(u64, u64)],
+}
+
+fn code_snapshot_metadata<'a>(
+    pid: u32,
+    snapshot: &'a dsr::CodeSnapshot,
+) -> CodeSnapshotMetadata<'a> {
+    CodeSnapshotMetadata {
+        schema: "carrick.code-snapshot.v4",
+        pid,
+        cache_base: snapshot.cache_base,
+        code_len: snapshot.code.len(),
+        code_sha256: format!("{:x}", sha2::Sha256::digest(&snapshot.code)),
+        blocks: &snapshot.blocks,
+    }
+}
+
 fn maybe_dump_code_snapshot(translator: &dsr::ThreadTranslator) {
     let Some(dir) = std::env::var_os("CARRICK_DSR_CODE_SNAPSHOT_DIR") else {
         return;
@@ -3354,14 +3378,11 @@ fn maybe_dump_code_snapshot(translator: &dsr::ThreadTranslator) {
     let base = std::path::PathBuf::from(&dir);
     let code_path = base.join(format!("{pid}-{stamp}.bin"));
     let index_path = base.join(format!("{pid}-{stamp}.json"));
-    let index = serde_json::json!({
-        "pid": pid,
-        "cache_base": snapshot.cache_base,
-        "code_len": snapshot.code.len(),
-        "blocks": snapshot.blocks,
+    let index = serde_json::to_vec(&code_snapshot_metadata(pid, &snapshot))
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+    let written = index.and_then(|index| {
+        std::fs::write(&code_path, &snapshot.code).and_then(|()| std::fs::write(&index_path, index))
     });
-    let written = std::fs::write(&code_path, &snapshot.code)
-        .and_then(|_| std::fs::write(&index_path, serde_json::to_vec(&index).unwrap_or_default()));
     if let Err(error) = written {
         tracing::warn!(%error, "code snapshot dump failed");
     }
@@ -7812,6 +7833,35 @@ fn last_io_error(context: &str) -> RuntimeError {
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn code_snapshot_metadata_authenticates_exact_bytes() {
+        let code = [0xd503_201f_u32, 0xd65f_03c0]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let snapshot = dsr::CodeSnapshot {
+            cache_base: 0x1234_0000,
+            code,
+            blocks: vec![(0x4000, 0x1234_0000)],
+        };
+
+        let metadata = serde_json::to_value(code_snapshot_metadata(7, &snapshot))
+            .expect("serialize code snapshot metadata");
+
+        assert_eq!(metadata["schema"], "carrick.code-snapshot.v4");
+        assert_eq!(metadata["pid"], 7);
+        assert_eq!(metadata["cache_base"], 0x1234_0000_u64);
+        assert_eq!(metadata["code_len"], 8);
+        assert_eq!(
+            metadata["code_sha256"],
+            "b3f6ed2e7b427c480736e26eaa0aa0f034d7bffcc009530a7a3a56ff851544e4"
+        );
+        assert_eq!(
+            metadata["blocks"],
+            serde_json::json!([[0x4000, 0x1234_0000]])
+        );
+    }
 
     fn handoff_guest_image() -> NativeGuestImageCompatibility {
         NativeGuestImageCompatibility {
