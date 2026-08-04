@@ -192,7 +192,7 @@ There is no runtime environment-variable branch in the shipping allocator.
 
 ### 5.1 Owners
 
-The initial wire-stable owner enum is:
+The current v2 wire-stable owner enum is:
 
 ```rust
 enum AllocationOwner {
@@ -204,6 +204,7 @@ enum AllocationOwner {
     IndirectTargetCache,
     SharedTranslationSupport,
     PublicationIndexes,
+    TranslationSourcePreparation,
 }
 ```
 
@@ -218,6 +219,7 @@ decode-read-buffers
 indirect-target-cache
 shared-translation-support
 publication-indexes
+translation-source-preparation
 ```
 
 The enum and parser are closed: an unknown owner is an error, not a bucket to
@@ -244,7 +246,9 @@ the concrete collection type. Examples:
 - shared-store staging and mapped-unit support are
   `shared-translation-support`; and
 - interval maps, route tables, or equivalent lookup structures installed when
-  publishing are `publication-indexes`.
+  publishing are `publication-indexes`; and
+- executable-span copies, source-word vectors, and segment construction before
+  shared/artifact translation configuration are `translation-source-preparation`.
 
 Everything outside an active scope is `other`. Scopes must wrap the smallest
 complete semantic operation, including relevant callees, rather than individual
@@ -440,11 +444,16 @@ arming, outside allocator callbacks.
 
 ## 7. Wire schema and typed aggregator
 
-The first schema is a line-oriented, deterministic `ALLOCOWNER1` record. Its
-logical fields are:
+The current schema is a line-oriented, deterministic `ALLOCOWNER2` record. V1
+was superseded after the first full capture left `other = 13.3776%`, above the
+10% coverage gate. The DHAT discovery table independently identified
+`configure_shared_translation` as the largest remaining semantic boundary
+(491,358,336 / 499,394,240 cumulative requested bytes in the partial A/B
+scouts), so v2 adds exactly `translation-source-preparation`. Its logical fields
+are:
 
 ```text
-schema=1
+schema=2
 pid=<host pid>
 exec_epoch=<NATIVEPERF v5 u64>
 fragment_sequence=<u64>
