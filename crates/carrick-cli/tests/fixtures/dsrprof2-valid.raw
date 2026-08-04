@@ -1,4 +1,4 @@
-DSRPROF2|header|profile=native-wall|raw_schema=carrick.dsrprof.raw.v4|os_build=26A123|program_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|birth_qualification_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|terminal_qualification_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc|wall_hz=197|cpu_hz=499
+DSRPROF2|header|profile=native-wall|raw_schema=carrick.dsrprof.raw.v5|os_build=26A123|program_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|birth_qualification_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|terminal_qualification_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc|wall_hz=197|cpu_hz=499
 DSRPROF2|target-birth|pid=100|start_sec=10|start_usec=20|image=1|epoch=0
 DSRPROF2|range-reset|pid=100|start_sec=10|start_usec=20|image=1|epoch=0
 DSRPROF2|range-private|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|sequence=1|start=0x1000|end=0x2000
@@ -9,14 +9,13 @@ DSRPROF2|host-image-base|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|base
 DSRPROF2|host-image-catalog|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|catalog_pid=100|payload={"ok":{"pid":100,"ranges":[{"start":4294967296,"end":4294971392,"path":"/carrick"}]}}
 DSRPROF2|guest-image-base|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|base=0x400000
 DSRPROF2|cpu-user|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|pc=0x1100|count=3
-DSRPROF2|cpu-kernel|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|class=kernel-named-syscall|pc=0xfffffe0010010010|count=2
-DSRPROF2|cpu-kernel-syscall|function=psynch_cvwait|count=2
+DSRPROF2|cpu-kernel|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|class=kernel-named-syscall|function=psynch_cvwait|pc=0xfffffe0010010010|count=2
 DSRPROF2|kernel-enter|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|provider=syscall|function=read|class=named-syscall|timestamp_ns=1000
 DSRPROF2|kernel-return|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|provider=syscall|function=read|class=named-syscall|timestamp_ns=1200
 DSRPROF2|offcpu-block|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|episode=1|kind=voluntary|pc=0x1150|timestamp_ns=1300
 DSRPROF2|offcpu-wake|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|episode=1|observed_pid=100|observed_sec=10|observed_usec=20|observed_image=1|observed_epoch=0|timestamp_ns=1800
 DSRPROF2|offcpu|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|kind=voluntary|pc=0x1150|count=1|total_ns=500
-DSRSTACK2|begin|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|kind=offcpu-voluntary|count=1|total_ns=500
+DSRSTACK2|begin|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|kind=offcpu-voluntary|total_ns=500
 
 0x1150
 0x1200
@@ -57,7 +56,7 @@ DSRPROF2|range-ready|pid=101|start_sec=11|start_usec=21|image=2|epoch=0|final_se
 DSRPROF2|process-exit|pid=101|start_sec=11|start_usec=21|image=2|epoch=0|reason=1
 DSRPROF2|process-exit|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|reason=1
 DSRPROF2|offcpu|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|kind=runnable|pc=0x6500|count=1|total_ns=100
-DSRSTACK2|begin|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|kind=offcpu-runnable|count=1|total_ns=100
+DSRSTACK2|begin|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|kind=offcpu-runnable|total_ns=100
 
 0x6500
 0x6600

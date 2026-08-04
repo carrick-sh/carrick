@@ -246,27 +246,28 @@ fn dsrprof2_names_dynamic_drop_subcategories() {
 
 #[test]
 fn dsrprof2_preserves_exact_stack_blocks() {
-    let process_create = "DSRPROF2|process-create|child_pid=101|child_sec=11|child_usec=21|child_image=1|child_epoch=0|parent_pid=100|parent_sec=10|parent_usec=20|parent_image=1|parent_epoch=0";
+    let existing_stack = concat!(
+        "DSRSTACK2|begin|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|kind=offcpu-voluntary|total_ns=500\n\n",
+        "0x1150\n",
+        "0x1200\n",
+        "DSRSTACK2|end\n",
+    );
     let stack = concat!(
-        "DSRSTACK2|begin|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|kind=offcpu-voluntary|count=1|total_ns=500\n\n",
+        "DSRSTACK2|begin|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|kind=offcpu-voluntary|total_ns=500\n\n",
         "libsystem_kernel.dylib`__psynch_cvwait+0xa\n",
         "carrick`wait_for_translation+0x20\n",
         "DSRSTACK2|end\n",
     );
-    let valid = DSRPROF2_FIXTURE.replacen(process_create, &format!("{stack}{process_create}"), 1);
+    let valid = DSRPROF2_FIXTURE.replacen(existing_stack, stack, 1);
     validate_dsrprof2_fixture(&valid, &[]).success();
 
     for corrupt_stack in [
-        "DSRSTACK2|begin|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|kind=offcpu-voluntary|count=1|total_ns=500\nDSRSTACK2|end\n",
-        "DSRSTACK2|begin|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|kind=offcpu-voluntary|count=1|total_ns=500|extra=1\nframe\nDSRSTACK2|end\n",
+        "DSRSTACK2|begin|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|kind=offcpu-voluntary|total_ns=500\nDSRSTACK2|end\n",
+        "DSRSTACK2|begin|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|kind=offcpu-voluntary|total_ns=500|extra=1\nframe\nDSRSTACK2|end\n",
         "DSRSTACK2|end\n",
-        "DSRSTACK2|begin|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|kind=offcpu-voluntary|count=1|total_ns=500\nDSRPROF2|wall-state|kind=on-cpu|count=1\nDSRSTACK2|end\n",
+        "DSRSTACK2|begin|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|kind=offcpu-voluntary|total_ns=500\nDSRPROF2|wall-state|kind=on-cpu|count=1\nDSRSTACK2|end\n",
     ] {
-        let corrupt = DSRPROF2_FIXTURE.replacen(
-            process_create,
-            &format!("{corrupt_stack}{process_create}"),
-            1,
-        );
+        let corrupt = DSRPROF2_FIXTURE.replacen(existing_stack, corrupt_stack, 1);
         validate_dsrprof2_fixture(&corrupt, &[]).failure();
     }
 }
@@ -584,6 +585,35 @@ fn native_wall_profile_emits_categorized_completion_contract() {
         script.contains("|unit_id=%u|start=%#x|end=%#x"),
         "64-bit translated unit identities must use unsigned DTrace serialization"
     );
+}
+
+#[test]
+fn native_wall_profile_uses_single_sample_and_offcpu_stack_authorities() {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/dtrace/native-wall.d");
+    let script = std::fs::read_to_string(path).unwrap();
+    let kernel_sample = script
+        .split("\n\n")
+        .find(|clause| {
+            clause.starts_with("profile-499\n")
+                && clause.contains("@cpu_kernel[")
+                && clause.contains("@cpu_kernel_stack[")
+        })
+        .expect("authoritative kernel sampling clause");
+    assert!(kernel_sample.contains("this->function ="));
+    assert!(kernel_sample.contains("this->class, this->function, arg0"));
+    assert!(!script.contains(concat!("@cpu_kernel_", "syscall")));
+    assert!(script.contains(
+        "DSRPROF2|cpu-kernel|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|class=%s|function=%s|pc=%#x|count=%@d"
+    ));
+
+    let offcpu_completion = script
+        .split("\n\n")
+        .find(|clause| clause.starts_with("sched:::on-cpu\n") && clause.contains("@off_stack_ns["))
+        .expect("off-CPU completion clause");
+    assert_eq!(offcpu_completion.matches("ustack(24)").count(), 1);
+    assert!(!script.contains(concat!("@off_stack_", "count")));
+    assert!(script.contains("kind=offcpu-%s|total_ns=%@d\\n%kDSRSTACK2|end\\n"));
 }
 
 #[test]

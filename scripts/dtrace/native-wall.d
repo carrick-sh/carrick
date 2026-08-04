@@ -487,9 +487,6 @@ sched:::on-cpu
 	@off_ns[pid, birth_sec[pid], birth_usec[pid],
 	    off_image[pid, tid], off_epoch[pid, tid], this->kind,
 	    off_pc[pid, tid]] = sum(this->delta);
-	@off_stack_count[pid, birth_sec[pid], birth_usec[pid],
-	    off_image[pid, tid], off_epoch[pid, tid], this->kind,
-	    ustack(24)] = count();
 	@off_stack_ns[pid, birth_sec[pid], birth_usec[pid],
 	    off_image[pid, tid], off_epoch[pid, tid], this->kind,
 	    ustack(24)] = sum(this->delta);
@@ -540,19 +537,13 @@ profile-499
 {
 	this->class = kernel_depth[pid, tid] <= (uint64_t)1 ?
 	    "kernel-non-syscall" : "kernel-named-syscall";
+	this->function = kernel_depth[pid, tid] <= (uint64_t)1 ?
+	    "none" : kernel_function[pid, tid, kernel_depth[pid, tid] - 1];
 	@cpu_kernel[pid, birth_sec[pid], birth_usec[pid], image_generation[pid],
-	    current_epoch[pid], this->class, arg0] = count();
+	    current_epoch[pid], this->class, this->function, arg0] = count();
 	@cpu_kernel_stack[pid, birth_sec[pid], birth_usec[pid],
 	    image_generation[pid], current_epoch[pid], this->class,
 	    stack(24)] = count();
-}
-
-profile-499
-/tracked[pid] && range_ready[pid] && arg0 != 0 &&
-    kernel_depth[pid, tid] > (uint64_t)1/
-{
-	@cpu_kernel_syscall[kernel_function[pid, tid,
-	    kernel_depth[pid, tid] - 1]] = count();
 }
 
 profile-499
@@ -604,18 +595,16 @@ dtrace:::END
 {
 	printa("DSRPROF2|cpu-user|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|pc=%#x|count=%@d\n",
 	    @cpu_user);
-	printa("DSRPROF2|cpu-kernel|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|class=%s|pc=%#x|count=%@d\n",
+	printa("DSRPROF2|cpu-kernel|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|class=%s|function=%s|pc=%#x|count=%@d\n",
 	    @cpu_kernel);
-	printa("DSRPROF2|cpu-kernel-syscall|function=%s|count=%@d\n",
-	    @cpu_kernel_syscall);
 	printa("DSRSTACK2|begin|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|kind=%s|count=%@d|total_ns=0\n%kDSRSTACK2|end\n",
 	    @cpu_kernel_stack);
 	printa("DSRSTACK2|begin|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|kind=kernel-syscall-psynch_cvwait|count=%@d|total_ns=0\n%kDSRSTACK2|end\n",
 	    @cpu_psynch_cvwait_stack);
 	printa("DSRPROF2|offcpu|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|kind=%s|pc=%#x|count=%@d|total_ns=%@d\n",
 	    @off_count, @off_ns);
-	printa("DSRSTACK2|begin|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|kind=offcpu-%s|count=%@d|total_ns=%@d\n%kDSRSTACK2|end\n",
-	    @off_stack_count, @off_stack_ns);
+	printa("DSRSTACK2|begin|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|kind=offcpu-%s|total_ns=%@d\n%kDSRSTACK2|end\n",
+	    @off_stack_ns);
 	printa("DSRPROF2|wall-state|kind=%s|count=%@d\n", @wall_state);
 	printf("DSRPROF2|complete|profile=native-wall|bounded=%d|timed_out=%d|identity_violations=%d|lifecycle_violations=%d|range_violations=%d|kernel_violations=%d|offcpu_violations=%d|probe_errors=%d|target_exit_reason=%d|live_at_end=%d|elapsed_ns=%d\n",
 	    timed_out || identity_violations != 0 || lifecycle_violations != 0 ||
