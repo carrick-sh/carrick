@@ -17,6 +17,7 @@ const PROTOCOL_PREFIX: &str = "DSRPROF1";
 const JSON_SCHEMA: &str = "carrick.dsr-profile.v1";
 const V2_PROTOCOL_PREFIX: &str = "DSRPROF2";
 const V2_STACK_PREFIX: &str = "DSRSTACK2";
+const V2_ERROR_PREFIX: &str = "DSRERROR2";
 const V2_RAW_SCHEMA: &str = "carrick.dsrprof.raw.v2";
 const NATIVE_FAULT_RAW_SCHEMA: &str = "carrick.native-fault.raw.v2";
 
@@ -421,6 +422,7 @@ struct V2Validator {
     cpu_user_summary: BTreeMap<(RawProcessImageKey, u64), u64>,
     cpu_kernel_summary: BTreeMap<(RawProcessImageKey, String, u64), u64>,
     cpu_samples: u64,
+    dtrace_errors: u64,
     transition_events_seen: bool,
     terminal_qualifications: BTreeSet<(String, String, String)>,
     open_stack: Option<V2StackRecord>,
@@ -577,6 +579,14 @@ where
                 .with_context(|| format!("invalid stack begin at line {}", index + 1))?;
             continue;
         }
+        if line.starts_with("DSRERROR2|") {
+            let record = V2Record::parse(line, V2_ERROR_PREFIX)
+                .with_context(|| format!("invalid DTrace error at line {}", index + 1))?;
+            validator
+                .dtrace_error(&record)
+                .with_context(|| format!("invalid DTrace error at line {}", index + 1))?;
+            continue;
+        }
         if !line.starts_with("DSRPROF2|") {
             bail!("unknown raw profile line {}: {line:?}", index + 1);
         }
@@ -597,6 +607,23 @@ where
 }
 
 impl V2Validator {
+    fn dtrace_error(&mut self, record: &V2Record) -> Result<()> {
+        if record.tag != "fault" {
+            bail!("unknown DSRERROR2 tag {:?}", record.tag);
+        }
+        record.exact_fields(&["action", "epid", "fault", "offset", "value"])?;
+        let _epid = record.decimal_u64("epid")?;
+        let _action = record.decimal_u64("action")?;
+        let _offset = record.decimal_u64("offset")?;
+        let _fault = record.decimal_u64("fault")?;
+        let _value = record.address("value")?;
+        self.dtrace_errors = self
+            .dtrace_errors
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("DTrace error count overflow"))?;
+        Ok(())
+    }
+
     fn apply(&mut self, record: V2Record) -> Result<()> {
         if !self.header_seen && record.tag != "header" {
             bail!("DSRPROF2 header must be the first record");
@@ -1777,6 +1804,13 @@ impl V2Validator {
         if timed_out > 1 {
             bail!("DSRPROF2 completion timed_out field must be 0 or 1");
         }
+        let probe_errors = record.decimal_u64("probe_errors")?;
+        if probe_errors != self.dtrace_errors {
+            bail!(
+                "DSRPROF2 completion probe_errors={probe_errors} disagrees with {} DSRERROR2 records",
+                self.dtrace_errors
+            );
+        }
         let violations = [
             (
                 "identity_violations",
@@ -1795,7 +1829,7 @@ impl V2Validator {
                 "offcpu_violations",
                 record.decimal_u64("offcpu_violations")?,
             ),
-            ("probe_errors", record.decimal_u64("probe_errors")?),
+            ("probe_errors", probe_errors),
         ];
         let expected_bounded = timed_out != 0 || violations.iter().any(|(_, count)| *count != 0);
         if bounded != u64::from(expected_bounded) {
@@ -3901,6 +3935,29 @@ mod tests {
                 && row["metric"]["pid"] == 1
         }));
         assert_eq!(rows.last().unwrap()["metric"]["type"], "completion");
+    }
+
+    #[test]
+    fn dsrprof2_fault_diagnostic_reaches_integrity_failure() {
+        let raw = include_str!("../tests/fixtures/dsrprof2-valid.raw")
+            .replacen(
+                "DSRPROF2|process-create|",
+                concat!(
+                    "DSRERROR2|fault|epid=3484|action=7|offset=12|fault=1|value=0x1234\n",
+                    "DSRPROF2|process-create|"
+                ),
+                1,
+            )
+            .replacen("bounded=0", "bounded=1", 1)
+            .replacen("probe_errors=0", "probe_errors=1", 1);
+
+        let error = ProfileSummary::from_lines(raw.lines(), ProfileCaptureStatus::default())
+            .expect_err("a DTrace fault must fail closed after its diagnostic is parsed");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("probe_errors=1"),
+            "unexpected error: {rendered}"
+        );
     }
 
     #[test]
