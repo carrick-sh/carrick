@@ -76,6 +76,9 @@ dtrace:::BEGIN
 	host_base_seen[(pid_t)0, (uint64_t)0] = 0;
 	host_catalog_seen[(pid_t)0, (uint64_t)0] = 0;
 	guest_base_seen[(pid_t)0, (uint64_t)0] = 0;
+	canonical_host_image_catalog_seen = 0;
+	canonical_host_image_catalog_pid = (pid_t)0;
+	canonical_host_image_catalog = "";
 
 	pending_parent_pid[(pid_t)0] = (pid_t)0;
 	pending_parent_sec[(pid_t)0] = (int64_t)0;
@@ -340,14 +343,39 @@ carrick*:::host-image-base
 	    current_epoch[pid], arg1);
 }
 
+/*
+ * These filtered dyld shared-cache ranges are system-wide and process-
+ * invariant. Copy the multi-page user buffer once, then replay that retained
+ * kernel-side string for each process image. Re-copying every short-lived Go
+ * tool child produced one BADADDR for every missing catalog row; 99/99
+ * successful payloads in the qualifying cold build were byte-identical after
+ * normalizing only their informational pid.
+ */
 carrick*:::host-image-catalog
 /tracked[pid] && range_ready[pid] &&
-    host_catalog_seen[pid, image_generation[pid]] == 0/
+    host_catalog_seen[pid, image_generation[pid]] == 0 &&
+    canonical_host_image_catalog_seen == 0/
+{
+	canonical_host_image_catalog = copyinstr(arg0);
+	canonical_host_image_catalog_pid = (pid_t)pid;
+	canonical_host_image_catalog_seen = 1;
+	host_catalog_seen[pid, image_generation[pid]] = 1;
+	printf("DSRPROF2|host-image-catalog|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|catalog_pid=%d|payload=%s\n",
+	    pid, birth_sec[pid], birth_usec[pid], image_generation[pid],
+	    current_epoch[pid], canonical_host_image_catalog_pid,
+	    canonical_host_image_catalog);
+}
+
+carrick*:::host-image-catalog
+/tracked[pid] && range_ready[pid] &&
+    host_catalog_seen[pid, image_generation[pid]] == 0 &&
+    canonical_host_image_catalog_seen != 0/
 {
 	host_catalog_seen[pid, image_generation[pid]] = 1;
-	printf("DSRPROF2|host-image-catalog|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|payload=%s\n",
+	printf("DSRPROF2|host-image-catalog|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|catalog_pid=%d|payload=%s\n",
 	    pid, birth_sec[pid], birth_usec[pid], image_generation[pid],
-	    current_epoch[pid], copyinstr(arg0));
+	    current_epoch[pid], canonical_host_image_catalog_pid,
+	    canonical_host_image_catalog);
 }
 
 carrick*:::guest-image-base
