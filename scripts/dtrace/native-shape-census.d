@@ -24,10 +24,17 @@
  * `proc:::create`, `proc:::exit`, and `profile-997` all list on this host;
  * successful captures on this host qualified `proc:::create` child identity as
  * `args[0]->pr_pid`, `proc:::exit` arg0 as the CLD_* exit reason, profile arg1
- * as the sampled PC, and carrick's `host-image-base` arguments as
- * (pid, Mach-O base).
+ * as the sampled PC, and carrick's `dsr-cache-bounds` arguments as the exact
+ * half-open JIT-cache range [arg0, arg1).
  * The 997 Hz sampling plus aggregation is perturbing; use it only for
  * same-instrument attribution ratios, never absolute timing.
+ *
+ * The exact JIT predicate below is load-bearing. A 2026-08-03 trusted-route
+ * capture using the older "not main Mach-O/shared-cache" approximation admitted
+ * 9,296 host-text samples after self-reexec and 20 samples from the orchestrator
+ * PID. Those samples correctly failed the offline snapshot join. Cache bounds
+ * are inherited across fork until the child publishes its own range, matching
+ * the native-jit-aware profiler's already-qualified lifecycle contract.
  *
  * HAZARD (2026-07-28, unexplained): enabling the copyin clause below against
  * a live native-DSR guest killed the guest 2/2 times within about a second
@@ -41,7 +48,8 @@
 dtrace:::BEGIN
 {
 	tracked[$target] = 1;
-	host_base[$target] = (uint64_t)0;
+	jit_start[$target] = (uint64_t)0;
+	jit_end[$target] = (uint64_t)0;
 	copyin_errors = 0;
 	bounded = 0;
 	target_completed = 0;
@@ -52,14 +60,16 @@ proc:::create
 /tracked[pid]/
 {
 	tracked[args[0]->pr_pid] = 1;
-	host_base[args[0]->pr_pid] = (uint64_t)host_base[pid];
+	jit_start[args[0]->pr_pid] = jit_start[pid];
+	jit_end[args[0]->pr_pid] = jit_end[pid];
 }
 
 proc:::exit
 /tracked[pid] && pid != $target/
 {
 	tracked[pid] = 0;
-	host_base[pid] = (uint64_t)0;
+	jit_start[pid] = (uint64_t)0;
+	jit_end[pid] = (uint64_t)0;
 }
 
 proc:::exit
@@ -70,19 +80,20 @@ proc:::exit
 	exit(0);
 }
 
-carrick*:::host-image-base
-/tracked[pid]/
+carrick*:::dsr-cache-bounds
+/(pid == $target || progenyof($target))/
 {
-	host_base[arg0] = (uint64_t)arg1;
+	tracked[pid] = 1;
+	jit_start[pid] = arg0;
+	jit_end[pid] = arg1;
 }
 
 profile-997
 /tracked[pid] && arg1 != 0/
 {
 	@total = count();
-	@region[(host_base[pid] != 0 && arg1 >= host_base[pid] &&
-	    arg1 < host_base[pid] + 0x2000000) ? "host-text" :
-	    (arg1 >= 0x180000000 ? "shared-cache" : "jit-or-guest")] = count();
+	@region[(jit_end[pid] != 0 && arg1 >= jit_start[pid] &&
+	    arg1 < jit_end[pid]) ? "jit" : "non-jit"] = count();
 }
 
 /*
@@ -93,9 +104,8 @@ profile-997
  * history; see the HAZARD note above before resurrecting it.
  */
 profile-997
-/tracked[pid] && arg1 != 0 && arg1 < 0x180000000 &&
-    (host_base[pid] == 0 || arg1 < host_base[pid] ||
-    arg1 >= host_base[pid] + 0x2000000)/
+/tracked[pid] && arg1 != 0 && jit_end[pid] != 0 &&
+    arg1 >= jit_start[pid] && arg1 < jit_end[pid]/
 {
 	@pc[pid, arg1] = count();
 }
