@@ -109,6 +109,8 @@ dtrace:::BEGIN
 dtrace:::ERROR
 {
 	probe_errors++;
+	printf("DSRERROR2|epid=%d|action=%d|offset=%d|fault=%d|value=%#x\n",
+	    arg0, arg1, arg2, arg3, arg4);
 }
 
 /* Retain every valid in-scope Carrick-published process incarnation. */
