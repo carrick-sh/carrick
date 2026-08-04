@@ -839,6 +839,10 @@ impl NativeMappedMemory {
         if !artifact_enabled && !shared_enabled && !census_enabled {
             return Ok(());
         }
+        #[cfg(feature = "alloc-owner-census")]
+        let _owner = crate::alloc_owner_census::scope(
+            crate::alloc_owner_wire::AllocationOwner::TranslationSourcePreparation,
+        );
         let translator = (artifact_enabled || shared_enabled)
             .then(|| self.dsr_process_translator())
             .transpose()?;
@@ -5051,6 +5055,30 @@ pub fn relocate_vdso_vvar_loads(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "alloc-owner-census")]
+    #[test]
+    fn allocation_owner_translation_source_preparation_wraps_active_enumeration() {
+        let source = include_str!("mapped_memory.rs");
+        let body = source
+            .split_once("pub fn configure_shared_translation(")
+            .expect("translation source preparation function")
+            .1
+            .split_once("pub fn note_dsr_code_mutation(")
+            .expect("translation source preparation function end")
+            .0;
+        let inactive_return = body
+            .find("if !artifact_enabled && !shared_enabled && !census_enabled")
+            .expect("inactive fast return");
+        let owner = body
+            .find("AllocationOwner::TranslationSourcePreparation")
+            .expect("translation source preparation owner");
+        let enumeration = body
+            .find("let mut executable_spans = image")
+            .expect("executable span enumeration");
+        assert!(inactive_return < owner);
+        assert!(owner < enumeration);
+    }
 
     fn direct_test_memory(host_start: usize, len: usize, page_size: u64) -> NativeMappedMemory {
         NativeMappedMemory {
