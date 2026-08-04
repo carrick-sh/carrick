@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::{BufWriter, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -11,10 +13,13 @@ use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tempfile::NamedTempFile;
 
 use crate::args::{Cli, Commands};
+use crate::jit_shape_snapshot::{SnapshotManifest, SnapshotSet};
 use crate::trace_profile::TraceProfileKind;
 
+pub(crate) const CAPTURE_SCHEMA: &str = "carrick.native-shape-capture.v1";
 pub(crate) const RAW_SCHEMA: &str = "carrick.native-shape.raw.v2";
 pub(crate) const SAMPLING_HZ: u64 = 997;
 const AUTHORITY_SCHEMA: &str = "carrick.native-shape-authority.v1";
@@ -572,6 +577,175 @@ pub(crate) struct NativeShapeLifecycle {
     pub(crate) probe_errors: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum CaptureOutcome {
+    Accepted,
+    Rejected,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeShapeDrops {
+    pub(crate) principal_drops: u64,
+    pub(crate) aggregation_drops: u64,
+    pub(crate) dynamic_drops: u64,
+    pub(crate) dynamic_rinse_drops: u64,
+    pub(crate) dynamic_dirty_drops: u64,
+    pub(crate) other_drops: u64,
+    pub(crate) interrupted: bool,
+}
+
+impl NativeShapeDrops {
+    fn evidence_errors(self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for (label, count) in [
+            ("principal", self.principal_drops),
+            ("aggregation", self.aggregation_drops),
+            ("dynamic", self.dynamic_drops),
+            ("dynamic rinse", self.dynamic_rinse_drops),
+            ("dynamic dirty", self.dynamic_dirty_drops),
+            ("other", self.other_drops),
+        ] {
+            if count != 0 {
+                errors.push(format!("DTrace {label} drops: {count}"));
+            }
+        }
+        if self.interrupted {
+            errors.push("DTrace interrupted".to_owned());
+        }
+        errors
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+impl From<carrick_runtime::dtrace_consumer::DTraceRunReport> for NativeShapeDrops {
+    fn from(report: carrick_runtime::dtrace_consumer::DTraceRunReport) -> Self {
+        Self {
+            principal_drops: report.principal_drops,
+            aggregation_drops: report.aggregation_drops,
+            dynamic_drops: report.dynamic_drops,
+            dynamic_rinse_drops: report.dynamic_rinse_drops,
+            dynamic_dirty_drops: report.dynamic_dirty_drops,
+            other_drops: report.other_drops,
+            interrupted: report.interrupted,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeShapeCounts {
+    pub(crate) all_cpu: u64,
+    pub(crate) user_cpu: u64,
+    pub(crate) kernel_cpu: u64,
+    pub(crate) invalid_cpu: u64,
+    pub(crate) jit_user: u64,
+    pub(crate) non_jit_user: u64,
+    pub(crate) pc_rows: u64,
+    pub(crate) pc_samples: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeShapeCaptureReceipt {
+    pub(crate) schema: String,
+    pub(crate) outcome: CaptureOutcome,
+    pub(crate) evidence_errors: Vec<String>,
+    pub(crate) authority: Option<NativeShapeAuthority>,
+    pub(crate) authority_sha256: Option<String>,
+    pub(crate) raw_trace_sha256: Option<String>,
+    pub(crate) snapshot_manifest: Option<SnapshotManifest>,
+    pub(crate) counts: Option<NativeShapeCounts>,
+    pub(crate) lifecycle: Option<NativeShapeLifecycle>,
+    pub(crate) drops: NativeShapeDrops,
+}
+
+pub(crate) struct NativeShapeFinalizeRequest<'a> {
+    pub(crate) authority: &'a NativeShapeAuthority,
+    pub(crate) raw_path: &'a Path,
+    pub(crate) snapshot_directory: &'a Path,
+    pub(crate) drops: NativeShapeDrops,
+    pub(crate) post_identity: Result<CaptureIdentity>,
+    pub(crate) trace_error: Option<String>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+#[derive(Debug)]
+pub(crate) struct NativeShapeObservedRun {
+    pub(crate) drops: NativeShapeDrops,
+    pub(crate) trace_error: Option<String>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub(crate) fn classify_native_shape_observation(
+    observed: Result<
+        carrick_runtime::dtrace_consumer::DTraceRunReport,
+        carrick_runtime::dtrace_consumer::DTraceObservedFailure,
+    >,
+) -> Result<NativeShapeObservedRun> {
+    match observed {
+        Ok(report) => Ok(NativeShapeObservedRun {
+            drops: report.into(),
+            trace_error: None,
+        }),
+        Err(failure) if failure.child_launched => Ok(NativeShapeObservedRun {
+            drops: failure.report.into(),
+            trace_error: Some(failure.error.to_string()),
+        }),
+        Err(failure) => Err(anyhow!(
+            "trace failed before child launch: {}",
+            failure.error
+        )),
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_native_shape_capture<TraceRun, PostIdentity>(
+    authority: &NativeShapeAuthority,
+    raw_path: &Path,
+    snapshot_directory: &Path,
+    receipt_path: &Path,
+    owner: Option<(u32, u32)>,
+    trace_run: TraceRun,
+    post_identity: PostIdentity,
+) -> Result<NativeShapeCaptureReceipt>
+where
+    TraceRun: FnOnce() -> Result<
+        carrick_runtime::dtrace_consumer::DTraceRunReport,
+        carrick_runtime::dtrace_consumer::DTraceObservedFailure,
+    >,
+    PostIdentity: FnOnce() -> Result<CaptureIdentity>,
+{
+    prepare_capture_output(receipt_path, owner).context("preflight native-shape capture output")?;
+    let observed = classify_native_shape_observation(trace_run())?;
+    let receipt = finalize_capture(NativeShapeFinalizeRequest {
+        authority,
+        raw_path,
+        snapshot_directory,
+        drops: observed.drops,
+        post_identity: post_identity(),
+        trace_error: observed.trace_error,
+    })?;
+    write_capture_atomic(receipt_path, &receipt, owner)?;
+    eprintln!(
+        "carrick trace: native-shape capture {} (errors={})",
+        match receipt.outcome {
+            CaptureOutcome::Accepted => "accepted",
+            CaptureOutcome::Rejected => "rejected",
+        },
+        receipt.evidence_errors.len()
+    );
+    if receipt.outcome == CaptureOutcome::Rejected {
+        bail!(
+            "native-shape capture rejected; receipt published at {}",
+            receipt_path.display()
+        );
+    }
+    Ok(receipt)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NativeShapeRaw {
     pub(crate) all_cpu: u64,
@@ -897,6 +1071,285 @@ impl RawBuilder {
     }
 }
 
+impl NativeShapeCaptureReceipt {
+    fn validate_for_publication(&self) -> Result<()> {
+        if self.schema != CAPTURE_SCHEMA {
+            bail!("native-shape capture schema is not {CAPTURE_SCHEMA}");
+        }
+        if self.evidence_errors.iter().any(String::is_empty) {
+            bail!("native-shape capture contains an empty evidence error");
+        }
+        match self.outcome {
+            CaptureOutcome::Accepted => {
+                if !self.evidence_errors.is_empty() {
+                    bail!("accepted native-shape capture has evidence errors");
+                }
+                if !self.drops.evidence_errors().is_empty() {
+                    bail!("accepted native-shape capture has DTrace loss or interruption");
+                }
+                let authority = self
+                    .authority
+                    .as_ref()
+                    .context("accepted native-shape capture has null authority")?;
+                let authority_sha256 = self
+                    .authority_sha256
+                    .as_deref()
+                    .context("accepted native-shape capture has null authority_sha256")?;
+                if authority.sha256()? != authority_sha256 {
+                    bail!("native-shape capture authority digest does not match authority");
+                }
+                validate_sha256(
+                    self.raw_trace_sha256
+                        .as_deref()
+                        .context("accepted native-shape capture has null raw_trace_sha256")?,
+                    "capture raw_trace_sha256",
+                )?;
+                let manifest = self
+                    .snapshot_manifest
+                    .as_ref()
+                    .context("accepted native-shape capture has null snapshot_manifest")?;
+                validate_sha256(&manifest.sha256, "capture snapshot manifest SHA-256")?;
+                let counts = self
+                    .counts
+                    .as_ref()
+                    .context("accepted native-shape capture has null counts")?;
+                let classified = counts
+                    .user_cpu
+                    .checked_add(counts.kernel_cpu)
+                    .and_then(|value| value.checked_add(counts.invalid_cpu))
+                    .context("capture CPU count overflow")?;
+                if classified != counts.all_cpu
+                    || counts.invalid_cpu != 0
+                    || counts.jit_user.checked_add(counts.non_jit_user) != Some(counts.user_cpu)
+                    || counts.pc_samples != counts.jit_user
+                    || counts.pc_rows == 0
+                {
+                    bail!("accepted native-shape capture counts do not reconcile");
+                }
+                let lifecycle = self
+                    .lifecycle
+                    .as_ref()
+                    .context("accepted native-shape capture has null lifecycle")?;
+                if lifecycle.bounded
+                    || !lifecycle.target_completed
+                    || lifecycle.target_exit_reason != NORMAL_TARGET_EXIT_REASON
+                    || lifecycle.live_at_end != 0
+                    || lifecycle.probe_errors != 0
+                    || lifecycle.admitted != lifecycle.exited
+                {
+                    bail!("accepted native-shape capture lifecycle is not complete");
+                }
+            }
+            CaptureOutcome::Rejected => {
+                if self.evidence_errors.is_empty() {
+                    bail!("rejected native-shape capture has no evidence errors");
+                }
+                if self.authority.is_some()
+                    || self.authority_sha256.is_some()
+                    || self.raw_trace_sha256.is_some()
+                    || self.snapshot_manifest.is_some()
+                    || self.counts.is_some()
+                    || self.lifecycle.is_some()
+                {
+                    bail!("rejected native-shape capture retains partially trusted evidence");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn finalize_capture(
+    request: NativeShapeFinalizeRequest<'_>,
+) -> Result<NativeShapeCaptureReceipt> {
+    let mut evidence_errors = Vec::new();
+
+    if let Some(error) = request.trace_error {
+        evidence_errors.push(format!("trace execution: {error}"));
+    }
+    evidence_errors.extend(request.drops.evidence_errors());
+
+    let expected_identity = CaptureIdentity {
+        git_head: request.authority.git_head.clone(),
+        git_dirty: request.authority.git_dirty,
+        executable_sha256: request.authority.executable_sha256.clone(),
+        host: request.authority.host.clone(),
+        host_arch: request.authority.host_arch.clone(),
+        os_build: request.authority.os_build.clone(),
+    };
+    match request.post_identity {
+        Ok(identity) => {
+            if let Err(error) = expected_identity.require_exact_match(&identity) {
+                evidence_errors.push(format!("post-capture identity: {error:#}"));
+            }
+        }
+        Err(error) => evidence_errors.push(format!("post-capture identity: {error:#}")),
+    }
+
+    let mut raw_trace_sha256 = None;
+    let mut raw = None;
+    match fs::read(request.raw_path) {
+        Ok(bytes) => {
+            raw_trace_sha256 = Some(format!("{:x}", Sha256::digest(&bytes)));
+            match NativeShapeRaw::parse(&bytes, request.authority) {
+                Ok(parsed) => raw = Some(parsed),
+                Err(error) => evidence_errors.push(format!("raw trace parse: {error:#}")),
+            }
+        }
+        Err(error) => evidence_errors.push(format!(
+            "raw trace read: read {}: {error}",
+            request.raw_path.display()
+        )),
+    }
+
+    let snapshots = match load_snapshot_set_from_real_directory(request.snapshot_directory) {
+        Ok(snapshots) => Some(snapshots),
+        Err(error) => {
+            evidence_errors.push(format!("snapshot load: {error:#}"));
+            None
+        }
+    };
+
+    let mut resolved_samples = 0_u64;
+    if let (Some(raw), Some(snapshots)) = (raw.as_ref(), snapshots.as_ref()) {
+        for sample in &raw.pc_samples {
+            match snapshots.resolve(sample.pid, sample.pc, &raw.parents) {
+                Ok(_instruction) => match resolved_samples.checked_add(sample.count) {
+                    Some(value) => resolved_samples = value,
+                    None => evidence_errors.push("PC resolution: sample count overflow".to_owned()),
+                },
+                Err(error) => evidence_errors.push(format!(
+                    "PC resolution: pid={} pc={:#x} count={}: {error:#}",
+                    sample.pid, sample.pc, sample.count
+                )),
+            }
+        }
+    }
+
+    let receipt = if evidence_errors.is_empty() {
+        let raw = raw.context("accepted capture lost parsed raw evidence")?;
+        let snapshots = snapshots.context("accepted capture lost snapshot evidence")?;
+        let pc_rows = u64::try_from(raw.pc_samples.len()).context("PC row count exceeds u64")?;
+        NativeShapeCaptureReceipt {
+            schema: CAPTURE_SCHEMA.to_owned(),
+            outcome: CaptureOutcome::Accepted,
+            evidence_errors,
+            authority: Some(request.authority.clone()),
+            authority_sha256: Some(request.authority.sha256()?),
+            raw_trace_sha256,
+            snapshot_manifest: Some(snapshots.manifest().clone()),
+            counts: Some(NativeShapeCounts {
+                all_cpu: raw.all_cpu,
+                user_cpu: raw.user_cpu,
+                kernel_cpu: raw.kernel_cpu,
+                invalid_cpu: raw.invalid_cpu,
+                jit_user: raw.jit_user,
+                non_jit_user: raw.non_jit_user,
+                pc_rows,
+                pc_samples: resolved_samples,
+            }),
+            lifecycle: Some(raw.lifecycle),
+            drops: request.drops,
+        }
+    } else {
+        NativeShapeCaptureReceipt {
+            schema: CAPTURE_SCHEMA.to_owned(),
+            outcome: CaptureOutcome::Rejected,
+            evidence_errors,
+            authority: None,
+            authority_sha256: None,
+            raw_trace_sha256: None,
+            snapshot_manifest: None,
+            counts: None,
+            lifecycle: None,
+            drops: request.drops,
+        }
+    };
+    receipt.validate_for_publication()?;
+    Ok(receipt)
+}
+
+fn load_snapshot_set_from_real_directory(directory: &Path) -> Result<SnapshotSet> {
+    use std::os::unix::fs::MetadataExt;
+
+    let before = fs::symlink_metadata(directory)
+        .with_context(|| format!("inspect snapshot root {}", directory.display()))?;
+    if !before.is_dir() || before.file_type().is_symlink() {
+        bail!("snapshot root is not a real non-symlink directory");
+    }
+    let snapshots = SnapshotSet::load(directory)?;
+    let after = fs::symlink_metadata(directory)
+        .with_context(|| format!("reinspect snapshot root {}", directory.display()))?;
+    if !after.is_dir()
+        || after.file_type().is_symlink()
+        || (before.dev(), before.ino()) != (after.dev(), after.ino())
+    {
+        bail!("snapshot root changed while loading evidence");
+    }
+    Ok(snapshots)
+}
+
+fn capture_output_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|value| !value.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+fn set_temporary_owner(temporary: &NamedTempFile, owner: Option<(u32, u32)>) -> Result<()> {
+    if let Some((uid, gid)) = owner {
+        let result = unsafe { libc::fchown(temporary.as_raw_fd(), uid, gid) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error()).context("set native-shape capture owner");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn prepare_capture_output(path: &Path, owner: Option<(u32, u32)>) -> Result<()> {
+    let parent = capture_output_parent(path);
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create capture output directory {}", parent.display()))?;
+    let temporary = NamedTempFile::new_in(parent)
+        .with_context(|| format!("create temporary capture in {}", parent.display()))?;
+    set_temporary_owner(&temporary, owner)
+}
+
+pub(crate) fn write_capture_atomic(
+    path: &Path,
+    receipt: &NativeShapeCaptureReceipt,
+    owner: Option<(u32, u32)>,
+) -> Result<()> {
+    receipt.validate_for_publication()?;
+    let parent = capture_output_parent(path);
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create capture output directory {}", parent.display()))?;
+    let mut temporary = NamedTempFile::new_in(parent)
+        .with_context(|| format!("create temporary capture in {}", parent.display()))?;
+    {
+        let mut writer = BufWriter::new(temporary.as_file_mut());
+        serde_json::to_writer(&mut writer, receipt).context("serialize native-shape capture")?;
+        writer
+            .write_all(b"\n")
+            .context("terminate native-shape capture JSON line")?;
+        writer
+            .flush()
+            .context("flush native-shape capture JSON line")?;
+    }
+    temporary
+        .as_file()
+        .sync_all()
+        .context("sync native-shape capture JSON line")?;
+    set_temporary_owner(&temporary, owner)?;
+    temporary.persist(path).map_err(|error| {
+        anyhow!(
+            "publish native-shape capture {}: {}",
+            path.display(),
+            error.error
+        )
+    })?;
+    Ok(())
+}
+
 fn rooted_vertices(target_pid: u32, parents: &BTreeMap<u32, u32>) -> Result<BTreeSet<u32>> {
     if parents.contains_key(&target_pid) {
         bail!("target PID appears as a fork child");
@@ -1079,6 +1532,7 @@ fn validate_percent_token(value: &str, field: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jit_shape_snapshot::write_v4_test_snapshot;
     use std::ffi::OsStr;
     use std::path::Path;
 
@@ -1176,6 +1630,502 @@ mod tests {
             host_arch: "aarch64".to_owned(),
             os_build: "26A5388g".to_owned(),
         }
+    }
+
+    fn write_valid_capture_evidence(root: &Path) -> (PathBuf, PathBuf) {
+        let raw_path = root.join("capture.raw");
+        fs::write(&raw_path, valid_raw()).expect("write raw capture fixture");
+        let snapshot_directory = root.join("snapshots");
+        fs::create_dir(&snapshot_directory).expect("create snapshot fixture directory");
+        write_v4_test_snapshot(&snapshot_directory, "10-1", 10, 0x1000, &[0xd503_201f]);
+        write_v4_test_snapshot(&snapshot_directory, "11-1", 11, 0x2000, &[0xd65f_03c0]);
+        (raw_path, snapshot_directory)
+    }
+
+    fn rejected_fixture(errors: Vec<String>) -> NativeShapeCaptureReceipt {
+        NativeShapeCaptureReceipt {
+            schema: CAPTURE_SCHEMA.to_owned(),
+            outcome: CaptureOutcome::Rejected,
+            evidence_errors: errors,
+            authority: None,
+            authority_sha256: None,
+            raw_trace_sha256: None,
+            snapshot_manifest: None,
+            counts: None,
+            lifecycle: None,
+            drops: NativeShapeDrops::default(),
+        }
+    }
+
+    #[test]
+    fn native_shape_capture_serialization_is_one_deterministic_json_line() {
+        let fixture = tempfile::tempdir().expect("receipt fixture directory");
+        let path = fixture.path().join("capture.jsonl");
+        let receipt = rejected_fixture(vec![
+            "trace execution: failed".to_owned(),
+            "raw trace parse: invalid".to_owned(),
+        ]);
+        write_capture_atomic(&path, &receipt, None).expect("write rejected receipt");
+        let first = fs::read(&path).expect("read first receipt");
+        write_capture_atomic(&path, &receipt, None).expect("rewrite rejected receipt");
+        let second = fs::read(&path).expect("read second receipt");
+        let expected = concat!(
+            "{\"schema\":\"carrick.native-shape-capture.v1\",",
+            "\"outcome\":\"rejected\",",
+            "\"evidence_errors\":[\"trace execution: failed\",\"raw trace parse: invalid\"],",
+            "\"authority\":null,\"authority_sha256\":null,\"raw_trace_sha256\":null,",
+            "\"snapshot_manifest\":null,\"counts\":null,\"lifecycle\":null,",
+            "\"drops\":{\"principal_drops\":0,\"aggregation_drops\":0,",
+            "\"dynamic_drops\":0,\"dynamic_rinse_drops\":0,",
+            "\"dynamic_dirty_drops\":0,\"other_drops\":0,\"interrupted\":false}}\n"
+        )
+        .as_bytes();
+        assert_eq!(first, expected);
+        assert_eq!(second, expected);
+        assert_eq!(first.iter().filter(|byte| **byte == b'\n').count(), 1);
+
+        let unknown = String::from_utf8(first)
+            .expect("receipt is UTF-8")
+            .replacen("\"schema\":", "\"unknown\":0,\"schema\":", 1);
+        assert!(
+            serde_json::from_str::<NativeShapeCaptureReceipt>(&unknown).is_err(),
+            "unknown receipt fields must fail closed"
+        );
+    }
+
+    #[test]
+    fn native_shape_capture_accepts_only_complete_resolved_evidence() {
+        let fixture = tempfile::tempdir().expect("capture fixture directory");
+        let (raw_path, snapshot_directory) = write_valid_capture_evidence(fixture.path());
+        let authority = fixture_authority();
+        let receipt = finalize_capture(NativeShapeFinalizeRequest {
+            authority: &authority,
+            raw_path: &raw_path,
+            snapshot_directory: &snapshot_directory,
+            drops: NativeShapeDrops::default(),
+            post_identity: Ok(fixture_identity()),
+            trace_error: None,
+        })
+        .expect("finalize valid capture");
+
+        assert_eq!(receipt.outcome, CaptureOutcome::Accepted);
+        assert!(receipt.evidence_errors.is_empty());
+        assert_eq!(receipt.authority.as_ref(), Some(&authority));
+        assert_eq!(
+            receipt.counts,
+            Some(NativeShapeCounts {
+                all_cpu: 100,
+                user_cpu: 70,
+                kernel_cpu: 30,
+                invalid_cpu: 0,
+                jit_user: 40,
+                non_jit_user: 30,
+                pc_rows: 2,
+                pc_samples: 40,
+            })
+        );
+        assert_eq!(
+            receipt.lifecycle,
+            Some(NativeShapeLifecycle {
+                bounded: false,
+                target_completed: true,
+                target_exit_reason: 1,
+                target_pid: 10,
+                admitted: 2,
+                exited: 2,
+                live_at_end: 0,
+                probe_errors: 0,
+            })
+        );
+        let manifest = receipt
+            .snapshot_manifest
+            .as_ref()
+            .expect("accepted snapshot manifest");
+        assert_eq!(
+            (
+                manifest.pairs,
+                manifest.pids,
+                manifest.blocks,
+                manifest.bytes
+            ),
+            (2, 2, 2, 8)
+        );
+        assert!(receipt.authority_sha256.is_some());
+        assert!(receipt.raw_trace_sha256.is_some());
+        let encoded = serde_json::to_string(&receipt).expect("serialize accepted receipt");
+        assert!(!encoded.contains(":null"), "{encoded}");
+
+        let invalid_path = fixture.path().join("invalid-accepted.jsonl");
+        let mut incomplete = receipt.clone();
+        incomplete.lifecycle = None;
+        assert!(write_capture_atomic(&invalid_path, &incomplete, None).is_err());
+        assert!(!invalid_path.exists());
+
+        let invalid_path = fixture.path().join("invalid-rejected.jsonl");
+        let mut partially_trusted = receipt;
+        partially_trusted.outcome = CaptureOutcome::Rejected;
+        partially_trusted.evidence_errors = vec!["trace execution: failed".to_owned()];
+        assert!(write_capture_atomic(&invalid_path, &partially_trusted, None).is_err());
+        assert!(!invalid_path.exists());
+    }
+
+    #[test]
+    fn native_shape_capture_each_dtrace_loss_and_interruption_rejects_independently() {
+        let fixture = tempfile::tempdir().expect("capture fixture directory");
+        let (raw_path, snapshot_directory) = write_valid_capture_evidence(fixture.path());
+        let authority = fixture_authority();
+        let cases = [
+            (
+                NativeShapeDrops {
+                    principal_drops: 1,
+                    ..NativeShapeDrops::default()
+                },
+                "DTrace principal drops: 1",
+            ),
+            (
+                NativeShapeDrops {
+                    aggregation_drops: 2,
+                    ..NativeShapeDrops::default()
+                },
+                "DTrace aggregation drops: 2",
+            ),
+            (
+                NativeShapeDrops {
+                    dynamic_drops: 3,
+                    ..NativeShapeDrops::default()
+                },
+                "DTrace dynamic drops: 3",
+            ),
+            (
+                NativeShapeDrops {
+                    dynamic_rinse_drops: 4,
+                    ..NativeShapeDrops::default()
+                },
+                "DTrace dynamic rinse drops: 4",
+            ),
+            (
+                NativeShapeDrops {
+                    dynamic_dirty_drops: 5,
+                    ..NativeShapeDrops::default()
+                },
+                "DTrace dynamic dirty drops: 5",
+            ),
+            (
+                NativeShapeDrops {
+                    other_drops: 6,
+                    ..NativeShapeDrops::default()
+                },
+                "DTrace other drops: 6",
+            ),
+            (
+                NativeShapeDrops {
+                    interrupted: true,
+                    ..NativeShapeDrops::default()
+                },
+                "DTrace interrupted",
+            ),
+        ];
+
+        for (drops, expected_error) in cases {
+            let receipt = finalize_capture(NativeShapeFinalizeRequest {
+                authority: &authority,
+                raw_path: &raw_path,
+                snapshot_directory: &snapshot_directory,
+                drops,
+                post_identity: Ok(fixture_identity()),
+                trace_error: None,
+            })
+            .expect("finalize lossy capture");
+            assert_eq!(receipt.outcome, CaptureOutcome::Rejected);
+            assert_eq!(receipt.evidence_errors, [expected_error]);
+            assert!(receipt.authority.is_none());
+            assert!(receipt.raw_trace_sha256.is_none());
+            assert!(receipt.snapshot_manifest.is_none());
+            assert!(receipt.counts.is_none());
+            assert!(receipt.lifecycle.is_none());
+        }
+    }
+
+    #[test]
+    fn native_shape_capture_accumulates_safe_errors_in_authoritative_order() {
+        let fixture = tempfile::tempdir().expect("capture fixture directory");
+        let raw_path = fixture.path().join("capture.raw");
+        fs::write(&raw_path, b"not an NSHAPE2 stream\n").expect("write malformed raw capture");
+        let snapshot_directory = fixture.path().join("snapshots");
+        fs::create_dir(&snapshot_directory).expect("create invalid snapshot directory");
+        fs::write(snapshot_directory.join("unknown"), b"unknown")
+            .expect("write invalid snapshot entry");
+        let authority = fixture_authority();
+        let mut drifted = fixture_identity();
+        drifted.host = "other-host".to_owned();
+
+        let receipt = finalize_capture(NativeShapeFinalizeRequest {
+            authority: &authority,
+            raw_path: &raw_path,
+            snapshot_directory: &snapshot_directory,
+            drops: NativeShapeDrops {
+                principal_drops: 2,
+                interrupted: true,
+                ..NativeShapeDrops::default()
+            },
+            post_identity: Ok(drifted),
+            trace_error: Some("work failed".to_owned()),
+        })
+        .expect("finalize rejected capture");
+
+        assert_eq!(receipt.outcome, CaptureOutcome::Rejected);
+        assert_eq!(receipt.evidence_errors.len(), 6);
+        assert_eq!(receipt.evidence_errors[0], "trace execution: work failed");
+        assert_eq!(receipt.evidence_errors[1], "DTrace principal drops: 2");
+        assert_eq!(receipt.evidence_errors[2], "DTrace interrupted");
+        assert!(receipt.evidence_errors[3].starts_with("post-capture identity: "));
+        assert!(receipt.evidence_errors[4].starts_with("raw trace parse: "));
+        assert!(receipt.evidence_errors[5].starts_with("snapshot load: "));
+        assert!(receipt.authority.is_none());
+        assert!(receipt.authority_sha256.is_none());
+        assert!(receipt.raw_trace_sha256.is_none());
+        assert!(receipt.snapshot_manifest.is_none());
+        assert!(receipt.counts.is_none());
+        assert!(receipt.lifecycle.is_none());
+    }
+
+    #[test]
+    fn native_shape_capture_rejects_unresolved_pc_and_symlink_snapshot_root() {
+        let fixture = tempfile::tempdir().expect("capture fixture directory");
+        let (raw_path, snapshot_directory) = write_valid_capture_evidence(fixture.path());
+        fs::remove_file(snapshot_directory.join("11-1.json")).expect("remove child metadata");
+        fs::remove_file(snapshot_directory.join("11-1.bin")).expect("remove child payload");
+        let authority = fixture_authority();
+        let unresolved = finalize_capture(NativeShapeFinalizeRequest {
+            authority: &authority,
+            raw_path: &raw_path,
+            snapshot_directory: &snapshot_directory,
+            drops: NativeShapeDrops::default(),
+            post_identity: Ok(fixture_identity()),
+            trace_error: None,
+        })
+        .expect("finalize unresolved capture");
+        assert_eq!(unresolved.outcome, CaptureOutcome::Rejected);
+        assert_eq!(unresolved.evidence_errors.len(), 1);
+        assert!(unresolved.evidence_errors[0].starts_with("PC resolution: "));
+
+        let real_snapshots = fixture.path().join("real-snapshots");
+        fs::rename(&snapshot_directory, &real_snapshots).expect("move real snapshots");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_snapshots, &snapshot_directory)
+            .expect("create snapshot root symlink");
+        let substituted = finalize_capture(NativeShapeFinalizeRequest {
+            authority: &authority,
+            raw_path: &raw_path,
+            snapshot_directory: &snapshot_directory,
+            drops: NativeShapeDrops::default(),
+            post_identity: Ok(fixture_identity()),
+            trace_error: None,
+        })
+        .expect("finalize substituted snapshot root");
+        assert_eq!(substituted.outcome, CaptureOutcome::Rejected);
+        assert!(substituted.evidence_errors[0].starts_with("snapshot load: "));
+        assert!(substituted.evidence_errors[0].contains("real non-symlink directory"));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    fn native_shape_capture_observed_boundary_skips_only_prelaunch_receipts() {
+        use carrick_runtime::dtrace_consumer::{
+            DTraceError, DTraceObservedFailure, DTraceRunReport,
+        };
+
+        let prelaunch = classify_native_shape_observation(Err(DTraceObservedFailure {
+            error: DTraceError::Compile("bad program".to_owned()),
+            report: DTraceRunReport::default(),
+            child_launched: false,
+        }))
+        .expect_err("prelaunch failure must not reach receipt finalization");
+        assert!(prelaunch.to_string().contains("bad program"));
+
+        let report = DTraceRunReport {
+            principal_drops: 7,
+            interrupted: true,
+            ..DTraceRunReport::default()
+        };
+        let postlaunch = classify_native_shape_observation(Err(DTraceObservedFailure {
+            error: DTraceError::Work("consume failed".to_owned()),
+            report,
+            child_launched: true,
+        }))
+        .expect("postlaunch failure must retain finalizable evidence");
+        assert_eq!(postlaunch.drops, NativeShapeDrops::from(report));
+        assert_eq!(
+            postlaunch.trace_error.as_deref(),
+            Some("dtrace_work failed: consume failed")
+        );
+
+        let completed = classify_native_shape_observation(Ok(report))
+            .expect("completed trace must reach finalization");
+        assert_eq!(completed.drops, NativeShapeDrops::from(report));
+        assert!(completed.trace_error.is_none());
+    }
+
+    #[test]
+    fn native_shape_capture_output_preflight_creates_no_receipt() {
+        let fixture = tempfile::tempdir().expect("output fixture directory");
+        let path = fixture.path().join("nested/capture.jsonl");
+        prepare_capture_output(&path, None).expect("preflight writable receipt output");
+        assert!(path.parent().expect("receipt parent").is_dir());
+        assert!(!path.exists(), "preflight must not claim a receipt");
+
+        let blocked_parent = fixture.path().join("blocked");
+        fs::write(&blocked_parent, b"not a directory").expect("write blocking parent");
+        let blocked = blocked_parent.join("capture.jsonl");
+        assert!(prepare_capture_output(&blocked, None).is_err());
+        assert!(!blocked.exists());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    fn native_shape_capture_command_preflight_failure_does_not_run_or_publish() {
+        let fixture = tempfile::tempdir().expect("command fixture directory");
+        let (raw_path, snapshot_directory) = write_valid_capture_evidence(fixture.path());
+        let blocked_parent = fixture.path().join("blocked");
+        fs::write(&blocked_parent, b"not a directory").expect("write blocking parent");
+        let receipt_path = blocked_parent.join("capture.jsonl");
+        let error = run_native_shape_capture(
+            &fixture_authority(),
+            &raw_path,
+            &snapshot_directory,
+            &receipt_path,
+            None,
+            || panic!("trace must not run after receipt output preflight failure"),
+            || panic!("identity must not run before a trace"),
+        )
+        .expect_err("preflight failure must return nonzero");
+        assert!(error.to_string().contains("capture output"));
+        assert!(!receipt_path.exists());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    fn native_shape_capture_command_prelaunch_failure_publishes_no_receipt() {
+        use carrick_runtime::dtrace_consumer::{
+            DTraceError, DTraceObservedFailure, DTraceRunReport,
+        };
+
+        let fixture = tempfile::tempdir().expect("command fixture directory");
+        let (raw_path, snapshot_directory) = write_valid_capture_evidence(fixture.path());
+        let receipt_path = fixture.path().join("capture.jsonl");
+        let error = run_native_shape_capture(
+            &fixture_authority(),
+            &raw_path,
+            &snapshot_directory,
+            &receipt_path,
+            None,
+            || {
+                Err(DTraceObservedFailure {
+                    error: DTraceError::Compile("bad program".to_owned()),
+                    report: DTraceRunReport::default(),
+                    child_launched: false,
+                })
+            },
+            || panic!("identity must not run for a prelaunch failure"),
+        )
+        .expect_err("prelaunch failure must return nonzero");
+        assert!(error.to_string().contains("before child launch"));
+        assert!(!receipt_path.exists());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    fn native_shape_capture_command_postlaunch_failure_publishes_rejection() {
+        use carrick_runtime::dtrace_consumer::{
+            DTraceError, DTraceObservedFailure, DTraceRunReport,
+        };
+
+        let fixture = tempfile::tempdir().expect("command fixture directory");
+        let (raw_path, snapshot_directory) = write_valid_capture_evidence(fixture.path());
+        let receipt_path = fixture.path().join("capture.jsonl");
+        let error = run_native_shape_capture(
+            &fixture_authority(),
+            &raw_path,
+            &snapshot_directory,
+            &receipt_path,
+            None,
+            || {
+                Err(DTraceObservedFailure {
+                    error: DTraceError::Work("consume failed".to_owned()),
+                    report: DTraceRunReport::default(),
+                    child_launched: true,
+                })
+            },
+            || Ok(fixture_identity()),
+        )
+        .expect_err("postlaunch failure must return nonzero");
+        assert!(error.to_string().contains("capture rejected"));
+        let receipt: NativeShapeCaptureReceipt = serde_json::from_slice(
+            &fs::read(&receipt_path).expect("read rejected capture receipt"),
+        )
+        .expect("parse rejected capture receipt");
+        assert_eq!(receipt.outcome, CaptureOutcome::Rejected);
+        assert_eq!(
+            receipt.evidence_errors[0],
+            "trace execution: dtrace_work failed: consume failed"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    fn native_shape_capture_command_normal_invalid_evidence_publishes_rejection() {
+        use carrick_runtime::dtrace_consumer::DTraceRunReport;
+
+        let fixture = tempfile::tempdir().expect("command fixture directory");
+        let (raw_path, snapshot_directory) = write_valid_capture_evidence(fixture.path());
+        fs::write(&raw_path, b"invalid\n").expect("corrupt raw capture");
+        let receipt_path = fixture.path().join("capture.jsonl");
+        let error = run_native_shape_capture(
+            &fixture_authority(),
+            &raw_path,
+            &snapshot_directory,
+            &receipt_path,
+            None,
+            || Ok(DTraceRunReport::default()),
+            || Ok(fixture_identity()),
+        )
+        .expect_err("invalid completed evidence must return nonzero");
+        assert!(error.to_string().contains("capture rejected"));
+        let receipt: NativeShapeCaptureReceipt = serde_json::from_slice(
+            &fs::read(&receipt_path).expect("read rejected capture receipt"),
+        )
+        .expect("parse rejected capture receipt");
+        assert_eq!(receipt.outcome, CaptureOutcome::Rejected);
+        assert!(receipt.evidence_errors[0].starts_with("raw trace parse: "));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    fn native_shape_capture_command_valid_evidence_publishes_acceptance() {
+        use carrick_runtime::dtrace_consumer::DTraceRunReport;
+
+        let fixture = tempfile::tempdir().expect("command fixture directory");
+        let (raw_path, snapshot_directory) = write_valid_capture_evidence(fixture.path());
+        let receipt_path = fixture.path().join("capture.jsonl");
+        let receipt = run_native_shape_capture(
+            &fixture_authority(),
+            &raw_path,
+            &snapshot_directory,
+            &receipt_path,
+            None,
+            || Ok(DTraceRunReport::default()),
+            || Ok(fixture_identity()),
+        )
+        .expect("valid completed evidence must succeed");
+        assert_eq!(receipt.outcome, CaptureOutcome::Accepted);
+        assert_eq!(
+            fs::read(&receipt_path).expect("read accepted capture receipt"),
+            {
+                let mut encoded = serde_json::to_vec(&receipt).expect("encode accepted receipt");
+                encoded.push(b'\n');
+                encoded
+            }
+        );
     }
 
     #[test]
