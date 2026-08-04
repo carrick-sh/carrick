@@ -765,10 +765,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     use super::invoke_post_stop;
     use super::{
-        DTRACE_CONSUME_NEXT, DTRACE_CONSUME_THIS, DTRACEACT_EXIT, DTRACEDROP_AGGREGATION,
-        DTRACEDROP_DYNAMIC, DTRACEDROP_DYNDIRTY, DTRACEDROP_DYNRINSE, DTRACEDROP_PRINCIPAL,
-        DTraceRunReport, DtraceRecDesc, TRACE_CHILD_COMMAND, TraceDropCredentials, TraceOptions,
-        chewrec, join_ids, record_drop, trace_exec_argv,
+        BUNDLED_NATIVE_WALL_D, DTRACE_CONSUME_NEXT, DTRACE_CONSUME_THIS, DTRACEACT_EXIT,
+        DTRACEDROP_AGGREGATION, DTRACEDROP_DYNAMIC, DTRACEDROP_DYNDIRTY, DTRACEDROP_DYNRINSE,
+        DTRACEDROP_PRINCIPAL, DTraceRunReport, DtraceRecDesc, TRACE_CHILD_COMMAND,
+        TraceDropCredentials, TraceOptions, chewrec, join_ids, record_drop, trace_exec_argv,
     };
     use std::ffi::CString;
     use std::path::Path;
@@ -898,6 +898,11 @@ mod tests {
     #[test]
     fn default_trace_options_print_remaining_aggregates() {
         assert!(TraceOptions::default().print_remaining_aggregates);
+    }
+
+    #[test]
+    fn native_wall_reserves_space_for_wide_dynamic_values() {
+        assert!(BUNDLED_NATIVE_WALL_D.contains("#pragma D option dynvarsize=512m"));
     }
 
     #[test]
