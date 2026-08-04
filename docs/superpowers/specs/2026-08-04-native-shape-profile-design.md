@@ -165,13 +165,15 @@ program is added. Its durable header continues to document provider ABI facts
 and high perturbation. The new protocol prefix is `NSHAPE2`, with raw schema
 `carrick.native-shape.raw.v2`.
 
-The wire order is exact: header first, zero or more fork rows while the target
-runs, then the final sections and completion:
+The wire order is exact: header first, zero or more fork/exit lifecycle rows
+while the target tree runs, then the final sections and completion:
 
 ```text
 NSHAPE2|header|profile=native-shape|raw_schema=...|...authority fields...
 NSHAPE2|fork|parent=<u32>|child=<u32>
+NSHAPE2|exit|pid=<u32>|reason=<i32>
 NSHAPE2|section=mode
+NSHAPE2|mode|kind=all|count=<u64>
 NSHAPE2|mode|kind=user|count=<u64>
 NSHAPE2|mode|kind=kernel|count=<u64>
 NSHAPE2|mode|kind=invalid|count=<u64>
@@ -180,19 +182,24 @@ NSHAPE2|region|kind=jit|count=<u64>
 NSHAPE2|region|kind=non-jit|count=<u64>
 NSHAPE2|section=pc
 NSHAPE2|pc|pid=<u32>|pc=0x<u64>|count=<u64>
-NSHAPE2|complete|bounded=<0|1>|target_completed=<0|1>|target_exit_reason=<i32>|admitted=<u64>|exited=<u64>|live_at_end=<u64>|probe_errors=<u64>
+NSHAPE2|complete|bounded=<0|1>|target_completed=<0|1>|target_exit_reason=<i32>|target_pid=<u32>|admitted=<u64>|exited=<u64>|live_at_end=<u64>|probe_errors=<u64>
 ```
 
 Each mode and region row occurs exactly once; at least one PC row is required.
 
 The profile tracks `$target` plus descendants admitted by `proc:::create`,
 inherits cache bounds across fork until the child publishes its own
-`dsr-cache-bounds`, and records each parent/child link. It maintains admitted,
-exited, and live-process counts. Target exit does not end the trace until every
-tracked descendant is gone. A 180-second fallback remains solely to prevent a
-runaway trace; any bounded completion is rejected.
+`dsr-cache-bounds`, and records each parent/child link plus one exit row per
+tracked process. Per-CPU-safe aggregations authoritatively maintain admitted,
+exited, live-process, and probe-error counts. A scalar `live_hint` exists only
+to decide when to request exit and is never evidence: an early racy zero is
+rejected by aggregate/graph reconciliation, while a late value reaches the
+180-second bound and is rejected. Target completion/reason and bounded remain
+single-event scalars. Target exit does not normally end the trace until the
+hint observes every tracked descendant gone.
 
-The one `profile-997` population is divided as follows:
+An independently aggregated `all_cpu` count receives every tracked
+`profile-997` firing. That one population is then divided as follows:
 
 - only `arg1 != 0`: user CPU; further divided into exact JIT and non-JIT
   regions;
@@ -204,16 +211,19 @@ contains exactly one header, mode totals, region totals, PC section, and
 completion. Its required reconciliations are:
 
 ```text
-all_cpu = user_cpu + kernel_cpu
+all_cpu = user_cpu + kernel_cpu + invalid_cpu
+invalid_cpu = 0
 user_cpu = jit_user + non_jit_user
 jit_user = sum(pc rows)
-invalid_cpu = 0
 ```
 
 The completion record requires natural target completion, the qualified normal
-exit reason, `admitted == exited`, `live_at_end == 0`, and zero probe/lifecycle
-errors. `admitted` starts at one for `$target` and increments once for each
-accepted child; every tracked process increments `exited` once. DTrace's six
+exit reason, a unique rooted tree at `target_pid`, and complete aggregate/row
+reconciliation. Every fork parent must be reachable from the target, every
+admitted PID has exactly one exit row, every exit and PC PID is admitted, the
+target exit row agrees with the completion reason, `admitted` equals the rooted
+vertex count, `exited` equals the unique exit count, and
+`live_at_end == admitted - exited == 0`. Probe errors are zero. DTrace's six
 numeric drop classes plus `interrupted` come from the runtime
 `DTraceRunReport`; every numeric field must be typed zero and `interrupted`
 must be literal false.
@@ -263,7 +273,7 @@ sample fails the capture/census.
 - run ID, Git HEAD/dirty state, executable SHA-256, host, image, exact argv,
   and argv SHA-256;
 - launch-qualification receipt hashes;
-- user, kernel, JIT, non-JIT, invalid, and PC-row/sample counts;
+- all, user, kernel, JIT, non-JIT, invalid, and PC-row/sample counts;
 - natural/lifecycle completion fields; and
 - the exact seven-field DTrace interruption/drop object.
 
@@ -313,7 +323,7 @@ Each family and exact-word row reports:
 
 ```text
 share_of_jit = row_samples / jit_user
-share_of_all_cpu = row_samples / (user_cpu + kernel_cpu)
+share_of_all_cpu = row_samples / all_cpu
 ```
 
 No imported ratio, traced elapsed time, or Docker time enters the census.

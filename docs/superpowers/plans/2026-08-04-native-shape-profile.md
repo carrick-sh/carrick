@@ -81,7 +81,6 @@ impl SnapshotSet {
 ```rust
 // crates/carrick-cli/src/native_shape_profile.rs
 pub(crate) const RAW_SCHEMA: &str = "carrick.native-shape.raw.v2";
-pub(crate) const CAPTURE_SCHEMA: &str = "carrick.native-shape-capture.v1";
 pub(crate) const SAMPLING_HZ: u64 = 997;
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -111,14 +110,8 @@ impl NativeShapeAuthority {
     pub(crate) fn header_record(&self) -> anyhow::Result<String>;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum CaptureOutcome {
-    Accepted,
-    Rejected,
-}
-
 pub(crate) struct NativeShapeRaw {
+    pub(crate) all_cpu: u64,
     pub(crate) user_cpu: u64,
     pub(crate) kernel_cpu: u64,
     pub(crate) invalid_cpu: u64,
@@ -126,6 +119,7 @@ pub(crate) struct NativeShapeRaw {
     pub(crate) non_jit_user: u64,
     pub(crate) pc_samples: Vec<PcSample>,
     pub(crate) parents: std::collections::BTreeMap<u32, u32>,
+    pub(crate) exits: std::collections::BTreeMap<u32, i32>,
     pub(crate) lifecycle: NativeShapeLifecycle,
 }
 
@@ -280,11 +274,11 @@ Expected: compile failure because the constant is absent and the old source stil
 
 **Step 2: Write the NSHAPE2 D program**
 
-Replace the durable D file in place. Preserve and update its provider-ABI and perturbation header. Use a single `profile-997` clause with mutually exclusive user, kernel, and invalid counters. Only user/JIT samples enter `@pc[pid, arg1]`.
+Replace the durable D file in place. Preserve and update its provider-ABI and perturbation header. Use a single `profile-997` clause. Per-CPU-safe aggregations seed and maintain independent all, user, kernel, invalid, JIT, and non-JIT counts; every tracked firing enters all, then exactly one mode and every user sample exactly one region. Only user/JIT samples enter `@pc[pid, arg1]`.
 
-Initialize `admitted=1`, `live=1`, and `exited=0` for `$target`. A tracked `proc:::create` admits each child once, publishes the fork row, and inherits current JIT bounds. A tracked `proc:::exit` increments `exited`, decrements `live`, clears state, records target completion/reason when applicable, and calls `exit(0)` only when the target has completed and `live==0`. `tick-180s` sets `bounded=1` and exits. `dtrace:::ERROR` increments `probe_errors`.
+Seed aggregate admitted/live at one and exited/probe-errors at zero for `$target`. A tracked `proc:::create` admits each child once, publishes the fork row, inherits current JIT bounds, and updates aggregate admitted/live. A tracked `proc:::exit` publishes one exact exit row, updates aggregate exited/live with `sum(+1)`/`sum(-1)`, clears state, and records target completion/reason when applicable. A scalar `live_hint` may only request exit when the target has completed and the hint appears zero; it is explicitly non-authoritative and acceptance relies on aggregate/graph reconciliation. `tick-180s` sets `bounded=1` and exits. `dtrace:::ERROR` updates aggregate probe-errors.
 
-Print the immutable rendered header first from `dtrace:::BEGIN`; print sections in `mode`, `region`, `pc`, `complete` order from `dtrace:::END`. Ensure zero-valued named mode/region rows are still printed exactly once by using scalar counters rather than relying on absent aggregations.
+Print the immutable rendered header first from `dtrace:::BEGIN`; print sections in `mode`, `region`, `pc`, `complete` order from `dtrace:::END`. Seed every named aggregation so zero-valued mode/region/lifecycle values still print exactly once. Emit completion as the live-qualified contiguous scalar `printf` prefix, multi-aggregation `printa` middle, and scalar `printf` newline suffix, including `target_pid`.
 
 **Step 3: Add red strict parser and authority tests**
 
@@ -292,9 +286,10 @@ Register `mod native_shape_profile;` and implement only fixtures first. Tests mu
 
 ```rust
 #[test]
-fn nshap2_reconciles_one_cpu_population() {
+fn nshape2_reconciles_one_cpu_population() {
     let authority = fixture_authority();
-    let raw = NativeShapeRaw::parse(valid_raw(&authority).as_bytes(), &authority).unwrap();
+    let raw = NativeShapeRaw::parse(valid_raw().as_bytes(), &authority).unwrap();
+    assert_eq!(raw.all_cpu, 100);
     assert_eq!(raw.user_cpu, 70);
     assert_eq!(raw.kernel_cpu, 30);
     assert_eq!(raw.jit_user, 40);
@@ -303,16 +298,16 @@ fn nshap2_reconciles_one_cpu_population() {
 }
 
 #[test]
-fn nshap2_rejects_shape1_and_authority_substitution() {
+fn nshape2_rejects_shape1_and_authority_substitution() {
     let authority = fixture_authority();
     assert!(NativeShapeRaw::parse(b"SHAPE1|samples=1\n", &authority).is_err());
     let mut other = authority.clone();
     other.run_id = "different-run".to_owned();
-    assert!(NativeShapeRaw::parse(valid_raw(&authority).as_bytes(), &other).is_err());
+    assert!(NativeShapeRaw::parse(valid_raw().as_bytes(), &other).is_err());
 }
 ```
 
-Test header-first ordering, exact fields and field order, duplicate/unknown/missing records, section order, duplicate fork parent, self-parent, ancestry cycle, zero PC rows, zero JIT samples, invalid mode nonzero, every checked-add overflow, all three reconciliation equations, bounded completion, abnormal target reason, incomplete target, admitted/exited mismatch, live nonzero, probe errors, and trailing records after completion.
+Hand-write the valid raw header/stream independently of `header_record()`. Test header-first ordering, exact fields and field order, duplicate/unknown/missing records, section order, duplicate fork parent, self-parent, ancestry cycle, disconnected components, unknown/duplicate/missing exit rows, unknown PC PID, zero PC rows, zero JIT samples, invalid mode nonzero, every checked arithmetic overflow, independent all/mode reconciliation, user/region and JIT/PC reconciliation, bounded completion, abnormal or disagreeing target reason, incomplete target, aggregate/row admitted/exited mismatch, live nonzero, probe errors, and trailing records after completion.
 
 Run:
 
@@ -329,7 +324,7 @@ Implement `NativeShapeAuthority::sha256`, `header_record`, argv hashing, percent
 ```rust
 enum ParseState {
     Header,
-    ForksOrModeSection,
+    LifecycleOrModeSection,
     ModeRows { seen: u8 },
     RegionSection,
     RegionRows { seen: u8 },
@@ -522,6 +517,19 @@ Expected: compile failure because the observed result does not exist.
 
 **Step 2: Define the exact receipt schema and red serialization tests**
 
+Task 4 introduces receipt-only vocabulary here, not in the raw-protocol task:
+
+```rust
+pub(crate) const CAPTURE_SCHEMA: &str = "carrick.native-shape-capture.v1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum CaptureOutcome {
+    Accepted,
+    Rejected,
+}
+```
+
 Use fixed nested structs, not `serde_json::Value` or maps:
 
 ```rust
@@ -553,7 +561,7 @@ pub(crate) struct NativeShapeDrops {
 }
 ```
 
-`NativeShapeCounts` contains `user_cpu`, `kernel_cpu`, `all_cpu`, `invalid_cpu`, `jit_user`, `non_jit_user`, `pc_rows`, and `pc_samples`, all `u64`. `NativeShapeLifecycle` contains `bounded`, `target_completed`, `target_exit_reason`, `admitted`, `exited`, `live_at_end`, and `probe_errors` with integer/bool types matching the raw protocol.
+`NativeShapeCounts` contains `user_cpu`, `kernel_cpu`, `all_cpu`, `invalid_cpu`, `jit_user`, `non_jit_user`, `pc_rows`, and `pc_samples`, all `u64`. `NativeShapeLifecycle` contains `bounded`, `target_completed`, `target_exit_reason`, `target_pid`, `admitted`, `exited`, `live_at_end`, and `probe_errors` with integer/bool types matching the raw protocol.
 
 Tests must prove exactly one newline-terminated JSON object, deterministic bytes, accepted receipts with no null fields and empty errors, rejected receipts with ordered errors and explicit nulls, denial of unknown fields, and each of the six nonzero drop counters plus interruption independently forcing rejection.
 
