@@ -897,6 +897,11 @@ pub fn store_if_enabled() -> Result<Option<ArtifactStore>, DsrError> {
         .transpose()
 }
 
+#[cfg(test)]
+pub(crate) fn empty_store_for_test() -> Result<ArtifactStore, DsrError> {
+    ArtifactAuthority::create_for_test()?.map_store()
+}
+
 pub fn adopt_for_resume(snapshot: &ArtifactSpikeReexecConfig) -> anyhow::Result<()> {
     let authority = adopt(snapshot)
         .map_err(|error| anyhow::anyhow!("adopt artifact spike authority: {error}"))?;
