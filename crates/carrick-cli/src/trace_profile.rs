@@ -363,6 +363,18 @@ impl V2ProfileAuthority {
         &self.program_sha256
     }
 
+    pub(crate) fn os_build(&self) -> &str {
+        &self.os_build
+    }
+
+    pub(crate) fn birth_qualification_sha256(&self) -> &str {
+        &self.birth_qualification_sha256
+    }
+
+    pub(crate) fn terminal_qualification_sha256(&self) -> &str {
+        &self.terminal_qualification_sha256
+    }
+
     pub(crate) fn header_record(&self) -> String {
         match self.profile {
             TraceProfileKind::NativeWall => format!(
@@ -3794,6 +3806,21 @@ mod tests {
             profile.bundled_script(),
             carrick_runtime::dtrace_consumer::BUNDLED_NATIVE_FAULT_D
         );
+        let script = profile.bundled_script();
+        for record in [
+            "NFAULT2|process-create|",
+            "fork_id=%d",
+            "NFAULT2|prebirth-page|",
+            "NFAULT2|prebirth-total|",
+            "NFAULT2|prebirth-rejected|",
+            "pending_forks=%d",
+        ] {
+            assert!(
+                script.contains(record),
+                "missing NFAULT2 fork-window record {record}"
+            );
+        }
+        assert!(!script.contains("NFAULT2|prebirth|"));
     }
 
     #[test]

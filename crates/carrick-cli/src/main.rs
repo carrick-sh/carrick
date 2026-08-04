@@ -130,6 +130,8 @@ mod debug_jit_shape;
 mod debug_layout;
 mod fs_setup;
 mod lifecycle;
+#[cfg(target_os = "macos")]
+mod native_fault_profile;
 mod native_profile_qualification;
 // `perf_stats` + the bulk of `trace_profile` back the BSD libdtrace-based
 // `carrick trace --profile` pipeline. Other hosts retain only the shared

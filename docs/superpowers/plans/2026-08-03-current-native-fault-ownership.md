@@ -191,6 +191,8 @@ Commit:
 - Create: `crates/carrick-cli/src/native_fault_profile.rs`
 - Modify: `crates/carrick-cli/src/main.rs`
 - Modify: `crates/carrick-cli/src/commands.rs`
+- Modify: `crates/carrick-cli/src/trace_profile.rs`
+- Modify: `scripts/dtrace/native-fault-attribution.d`
 
 **Interfaces:**
 - Produces `NativeFaultSummary::from_path(path, capture_status, authority)`.
@@ -198,7 +200,7 @@ Commit:
   capture completion, exact totals, sample coverage, ownership buckets,
   per-process counts, hot pages, and perturbation metadata.
 
-- [ ] **Step 1: Write red parser and ownership tests**
+- [x] **Step 1: Write red parser and ownership tests**
 
 Use hand-written NFAULT2 fixtures. Assert success for one parent catalog, one
 fork-inherited child page, one guest-owned page, and one host-other page.
@@ -211,7 +213,7 @@ page only partially covered by a declared range.
 The expected ownership counts are literal fixture values; no production helper
 computes the expected side.
 
-- [ ] **Step 2: Run the module test and prove red**
+- [x] **Step 2: Run the module test and prove red**
 
 Run:
 
@@ -219,7 +221,7 @@ Run:
 
 Expected: compile failure because NativeFaultSummary is absent.
 
-- [ ] **Step 3: Implement strict parsing and catalog inheritance**
+- [x] **Step 3: Implement strict parsing and catalog inheritance**
 
 Parse only exact NFAULT2 record field sets. Use checked arithmetic throughout.
 Build immutable catalogs keyed by process birth, image generation, and epoch.
@@ -227,7 +229,15 @@ Resolve a child catalog through exactly one acyclic parent chain. Intersect
 `[page, page + 16384)` against sorted declared ranges and require either full
 ownership by one range or no intersection.
 
-- [ ] **Step 4: Implement the versioned report and trace-command handoff**
+A live fork smoke exposed an otherwise-unowned window between `proc:::create`
+and the child's checked birth publication (149 fault events in the first
+reproducer). NFAULT2 now assigns a unique fork id at creation, emits exact
+per-outcome totals plus deterministic sampled pages for that window, repeats
+the id with the authenticated child/inheritance records, and requires zero
+pending forks at completion. The parser binds those records to the exact child
+and inherited catalog; it neither drops them nor trusts PID shape.
+
+- [x] **Step 4: Implement the versioned report and trace-command handoff**
 
 Report exact global totals separately from deterministic sampled ownership.
 For each ownership bucket include sampled events, distinct process-pages,
@@ -237,7 +247,7 @@ provenance, command, capture report, and `gating_eligible=false` because the
 instrument is perturbing. Write the report atomically through
 `--summary-jsonl`.
 
-- [ ] **Step 5: Run focused and CLI gates, then commit**
+- [x] **Step 5: Run focused and CLI gates, then commit**
 
 Run:
 
@@ -245,9 +255,15 @@ Run:
     RUST_TEST_THREADS=1 cargo test -p carrick-cli --bin carrick
     cargo clippy -p carrick-cli --all-targets -- -D warnings
 
+Also compiled the final D program with `sudo dtrace -Z -e -s` and passed live
+natural `/bin/true`, in-process exec, and fork-plus-exec smokes through the
+atomic summary handoff. The fork-plus-exec rerun retained its pre-birth events
+under `fork_id=1`, completed with `pending_forks=0`, and produced a report with
+zero DTrace drops and zero lifecycle/catalog/probe violations.
+
 Commit:
 
-    git add crates/carrick-cli/src/native_fault_profile.rs crates/carrick-cli/src/main.rs crates/carrick-cli/src/commands.rs
+    git add crates/carrick-cli/src/native_fault_profile.rs crates/carrick-cli/src/main.rs crates/carrick-cli/src/commands.rs crates/carrick-cli/src/trace_profile.rs scripts/dtrace/native-fault-attribution.d docs/superpowers/plans/2026-08-03-current-native-fault-ownership.md
     git commit -m "diagnostics(debug): classify native fault ownership"
 
 ---

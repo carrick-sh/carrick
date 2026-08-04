@@ -45,6 +45,8 @@ dtrace:::BEGIN
 	catalog_violations = 0;
 	probe_errors = 0;
 	live_pids = 0;
+	next_fork_id = (uint64_t)0;
+	pending_forks = 0;
 
 	/* Fix retained dynamic-array values at their intended widths. */
 	tracked[(pid_t)0] = 0;
@@ -67,6 +69,7 @@ dtrace:::BEGIN
 	pending_parent_image[(pid_t)0] = (uint64_t)0;
 	pending_parent_epoch[(pid_t)0] = (uint64_t)0;
 	pending_catalog_frontier[(pid_t)0] = (uint64_t)0;
+	pending_fork_id[(pid_t)0] = (uint64_t)0;
 
 	terminal_scope["", ""] = 0;
 
@@ -115,10 +118,12 @@ carrick*:::host-process-birth
 /* A fork child is admitted only after its checked birth tuple arrives. */
 carrick*:::host-process-birth
 /pending_parent_pid[pid] != (pid_t)0 && tracked[pid] == 0 &&
+    pending_fork_id[pid] != (uint64_t)0 &&
     (uint32_t)arg0 == (uint32_t)pid && (int64_t)arg1 > 0 &&
     (int32_t)arg2 >= 0 && (int32_t)arg2 < 1000000/
 {
 	this->parent = pending_parent_pid[pid];
+	this->fork_id = pending_fork_id[pid];
 	tracked[pid] = 1;
 	image_generation[pid] = (uint64_t)1;
 	catalog_epoch[pid] = pending_parent_epoch[pid];
@@ -128,16 +133,18 @@ carrick*:::host-process-birth
 	catalog_seen[pid, (uint64_t)1] = 1;
 	catalog_expected[pid] = 0;
 	live_pids++;
-	printf("NFAULT2|process-create|child_pid=%d|child_sec=%d|child_usec=%d|child_image=1|child_epoch=%d|parent_pid=%d|parent_sec=%d|parent_usec=%d|parent_image=%d|parent_epoch=%d\n",
-	    pid, birth_sec[pid], birth_usec[pid], catalog_epoch[pid],
+	printf("NFAULT2|process-create|child_pid=%d|child_sec=%d|child_usec=%d|child_image=1|child_epoch=%d|fork_id=%d|parent_pid=%d|parent_sec=%d|parent_usec=%d|parent_image=%d|parent_epoch=%d\n",
+	    pid, birth_sec[pid], birth_usec[pid], catalog_epoch[pid], this->fork_id,
 	    this->parent, pending_parent_sec[pid], pending_parent_usec[pid],
 	    pending_parent_image[pid], pending_parent_epoch[pid]);
-	printf("NFAULT2|fork-inherit|child_pid=%d|child_sec=%d|child_usec=%d|child_image=1|child_epoch=%d|parent_pid=%d|parent_sec=%d|parent_usec=%d|parent_image=%d|parent_epoch=%d|range_frontier=%d\n",
-	    pid, birth_sec[pid], birth_usec[pid], catalog_epoch[pid],
+	printf("NFAULT2|fork-inherit|child_pid=%d|child_sec=%d|child_usec=%d|child_image=1|child_epoch=%d|fork_id=%d|parent_pid=%d|parent_sec=%d|parent_usec=%d|parent_image=%d|parent_epoch=%d|range_frontier=%d\n",
+	    pid, birth_sec[pid], birth_usec[pid], catalog_epoch[pid], this->fork_id,
 	    this->parent, pending_parent_sec[pid], pending_parent_usec[pid],
 	    pending_parent_image[pid], pending_parent_epoch[pid],
 	    pending_catalog_frontier[pid]);
 	pending_parent_pid[pid] = (pid_t)0;
+	pending_fork_id[pid] = (uint64_t)0;
+	pending_forks--;
 }
 
 /* The first valid owned-range reset selects the native owner, not its launcher. */
@@ -169,9 +176,13 @@ proc:::create
 /tracked[pid]/
 {
 	this->child = (pid_t)args[0]->pr_pid;
+	next_fork_id++;
+	this->fork_id = next_fork_id;
 	this->valid = catalog_ready[pid] && catalog_frontier[pid] > (uint64_t)0;
 	this->duplicate = tracked[this->child] != 0 ||
-	    pending_parent_pid[this->child] != (pid_t)0;
+	    pending_parent_pid[this->child] != (pid_t)0 ||
+	    pending_fork_id[this->child] != (uint64_t)0;
+	this->valid = this->valid && this->fork_id != (uint64_t)0;
 	lifecycle_violations += !this->valid || this->duplicate ? 1 : 0;
 	pending_parent_pid[this->child] = this->valid && !this->duplicate ?
 	    (pid_t)pid : pending_parent_pid[this->child];
@@ -185,6 +196,9 @@ proc:::create
 	    catalog_epoch[pid] : pending_parent_epoch[this->child];
 	pending_catalog_frontier[this->child] = this->valid && !this->duplicate ?
 	    catalog_frontier[pid] : pending_catalog_frontier[this->child];
+	pending_fork_id[this->child] = this->valid && !this->duplicate ?
+	    this->fork_id : pending_fork_id[this->child];
+	pending_forks += this->valid && !this->duplicate ? 1 : 0;
 	/* Attribute any post-fork/pre-birth samples to the inherited image. */
 	image_generation[this->child] = this->valid && !this->duplicate ?
 	    (uint64_t)1 : image_generation[this->child];
@@ -356,13 +370,58 @@ vminfo:::cow_fault
 	@total_cow[pid, birth_sec[pid], birth_usec[pid]] = count();
 }
 
-/* Explicitly count the narrow fork-child window before its birth publication. */
-vminfo:::as_fault,
-vminfo:::zfod,
-vminfo:::cow_fault
-/pending_parent_pid[pid] != (pid_t)0 && birth_seen[pid] == 0/
+/*
+ * Preserve the narrow fork-child window before its birth publication. The
+ * unique fork id is emitted again with the later checked child birth, so Rust
+ * can bind these totals/pages to the exact child and inherited catalog without
+ * trusting PID shape or dropping work from the target-tree census.
+ */
+vminfo:::as_fault
+/pending_fork_id[pid] != (uint64_t)0 && birth_seen[pid] == 0/
 {
-	@prebirth[pid] = count();
+	@prebirth_total_as[pending_fork_id[pid]] = count();
+}
+
+vminfo:::zfod
+/pending_fork_id[pid] != (uint64_t)0 && birth_seen[pid] == 0/
+{
+	@prebirth_total_zfod[pending_fork_id[pid]] = count();
+}
+
+vminfo:::cow_fault
+/pending_fork_id[pid] != (uint64_t)0 && birth_seen[pid] == 0/
+{
+	@prebirth_total_cow[pending_fork_id[pid]] = count();
+}
+
+vminfo:::as_fault
+/pending_fork_id[pid] != (uint64_t)0 && birth_seen[pid] == 0 &&
+    (arg2 == 0 || arg2 >= 0x0001000000000000 || (arg2 & 0x3fff) != 0)/
+{
+	@prebirth_rejected_as[pending_fork_id[pid]] = count();
+}
+
+vminfo:::zfod
+/pending_fork_id[pid] != (uint64_t)0 && birth_seen[pid] == 0 &&
+    (arg2 == 0 || arg2 >= 0x0001000000000000 || (arg2 & 0x3fff) != 0)/
+{
+	@prebirth_rejected_zfod[pending_fork_id[pid]] = count();
+}
+
+vminfo:::as_fault
+/pending_fork_id[pid] != (uint64_t)0 && birth_seen[pid] == 0 &&
+    arg2 != 0 && arg2 < 0x0001000000000000 && (arg2 & 0x3fff) == 0 &&
+    (((arg2 >> 14) ^ (pid * 0x9e3779b9)) & 0x3f) == 0/
+{
+	@prebirth_page_as[pending_fork_id[pid], arg2] = count();
+}
+
+vminfo:::zfod
+/pending_fork_id[pid] != (uint64_t)0 && birth_seen[pid] == 0 &&
+    arg2 != 0 && arg2 < 0x0001000000000000 && (arg2 & 0x3fff) == 0 &&
+    (((arg2 >> 14) ^ (pid * 0x9e3779b9)) & 0x3f) == 0/
+{
+	@prebirth_page_zfod[pending_fork_id[pid], arg2] = count();
 }
 
 /* Exact provider-shape rejection counts remain separate from page sampling. */
@@ -443,12 +502,27 @@ dtrace:::END
 	    @rejected_as);
 	printa("NFAULT2|rejected|outcome=zfod|pid=%d|start_sec=%d|start_usec=%d|count=%@u\n",
 	    @rejected_zfod);
-	printa("NFAULT2|prebirth|pid=%d|count=%@u\n", @prebirth);
-	printf("NFAULT2|complete|profile=native-fault|bounded=%d|timed_out=%d|target_exit=%d|target_exit_reason=%d|identity_violations=%d|lifecycle_violations=%d|catalog_violations=%d|probe_errors=%d|live_at_end=%d|elapsed_ns=%d\n",
+	printa("NFAULT2|prebirth-page|outcome=as_fault|fork_id=%d|page=%#x|count=%@u\n",
+	    @prebirth_page_as);
+	printa("NFAULT2|prebirth-page|outcome=zfod|fork_id=%d|page=%#x|count=%@u\n",
+	    @prebirth_page_zfod);
+	printa("NFAULT2|prebirth-total|outcome=as_fault|fork_id=%d|count=%@u\n",
+	    @prebirth_total_as);
+	printa("NFAULT2|prebirth-total|outcome=zfod|fork_id=%d|count=%@u\n",
+	    @prebirth_total_zfod);
+	printa("NFAULT2|prebirth-total|outcome=cow_fault|fork_id=%d|count=%@u\n",
+	    @prebirth_total_cow);
+	printa("NFAULT2|prebirth-rejected|outcome=as_fault|fork_id=%d|count=%@u\n",
+	    @prebirth_rejected_as);
+	printa("NFAULT2|prebirth-rejected|outcome=zfod|fork_id=%d|count=%@u\n",
+	    @prebirth_rejected_zfod);
+	printf("NFAULT2|complete|profile=native-fault|bounded=%d|timed_out=%d|target_exit=%d|target_exit_reason=%d|identity_violations=%d|lifecycle_violations=%d|catalog_violations=%d|probe_errors=%d|live_at_end=%d|pending_forks=%d|elapsed_ns=%d\n",
 	    timed_out || target_exit == 0 || root_pid == (pid_t)0 ||
 	    identity_violations != 0 || lifecycle_violations != 0 ||
-	    catalog_violations != 0 || probe_errors != 0 || live_pids != 0,
+	    catalog_violations != 0 || probe_errors != 0 || live_pids != 0 ||
+	    pending_forks != 0,
 	    timed_out, target_exit, target_exit_reason, identity_violations,
 	    lifecycle_violations, catalog_violations, probe_errors, live_pids,
+	    pending_forks,
 	    started == 0 ? 0 : (stopped != 0 ? stopped : timestamp) - started);
 }
