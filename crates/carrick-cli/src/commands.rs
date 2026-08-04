@@ -124,10 +124,7 @@ use crate::trace_cli::{
 };
 use crate::trace_profile::validate_v2_path;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-use crate::trace_profile::{
-    ProfileSummary, TrustedRouteCaptureReceipt, capture_provenance, write_summary_atomic,
-    write_trusted_route_capture_atomic,
-};
+use crate::trace_profile::{ProfileSummary, capture_provenance, write_summary_atomic};
 #[cfg(target_os = "macos")]
 use crate::trace_profile::{kernel_sample_addresses_from_path, path_has_v2_header};
 
@@ -1334,19 +1331,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 top,
                 processes_observed,
             } => crate::debug_census::run_xlat_census(&dir, top, processes_observed)?,
-            DebugCommand::TrustedRouteCensus {
-                trace,
-                capture,
-                snapshots,
-                jit_share,
-                output,
-            } => crate::debug_trusted_route::run_trusted_route_census(
-                &trace,
-                &capture,
-                &snapshots,
-                jit_share,
-                output.as_deref(),
-            )?,
             _ => bail!("debug (guest address-space inspection) is HVF-only on this build"),
         },
         Commands::TraceChild {
@@ -1552,49 +1536,36 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     let raw_path = output_path
                         .ok_or_else(|| anyhow::anyhow!("profile trace has no output path"))?;
                     let capture_status = report.into();
-                    let provenance = capture_provenance(&me, &command)?;
-                    let owner = drop_credentials
-                        .as_ref()
-                        .map(|value| (value.uid, value.gid));
-                    if requested_profile == crate::trace_profile::TraceProfileKind::TrustedRoute {
-                        let receipt = TrustedRouteCaptureReceipt::from_path(
+                    #[cfg(target_os = "macos")]
+                    let mut summary = if requested_profile
+                        == crate::trace_profile::TraceProfileKind::NativeWall
+                        && path_has_v2_header(raw_path)?
+                    {
+                        let authority = native_profile_authority.clone().ok_or_else(|| {
+                            anyhow::anyhow!("DSRPROF2 stream has no launch authority")
+                        })?;
+                        ProfileSummary::from_v2_path_with_authority(
                             raw_path,
                             capture_status,
-                            provenance,
-                        )?;
-                        eprintln!("{}", receipt.render_human());
-                        if let Some(summary_path) = summary_jsonl.as_deref() {
-                            write_trusted_route_capture_atomic(summary_path, &receipt, owner)?;
-                        }
+                            authority,
+                        )?
                     } else {
-                        #[cfg(target_os = "macos")]
-                        let mut summary = if requested_profile
-                            == crate::trace_profile::TraceProfileKind::NativeWall
-                            && path_has_v2_header(raw_path)?
-                        {
-                            let authority = native_profile_authority.clone().ok_or_else(|| {
-                                anyhow::anyhow!("DSRPROF2 stream has no launch authority")
-                            })?;
-                            ProfileSummary::from_v2_path_with_authority(
-                                raw_path,
-                                capture_status,
-                                authority,
-                            )?
-                        } else {
-                            ProfileSummary::from_path(raw_path, capture_status)?
-                        };
-                        #[cfg(target_os = "freebsd")]
-                        let mut summary = ProfileSummary::from_path(raw_path, capture_status)?;
-                        summary.require_profile(requested_profile)?;
-                        #[cfg(target_os = "macos")]
-                        if let Some(overlay) = sampled_kernel_overlay {
-                            summary.attach_sampled_kernel_overlay(overlay)?;
-                        }
-                        summary.set_provenance(provenance);
-                        eprintln!("{}", summary.render_human());
-                        if let Some(summary_path) = summary_jsonl.as_deref() {
-                            write_summary_atomic(summary_path, &summary, owner)?;
-                        }
+                        ProfileSummary::from_path(raw_path, capture_status)?
+                    };
+                    #[cfg(target_os = "freebsd")]
+                    let mut summary = ProfileSummary::from_path(raw_path, capture_status)?;
+                    summary.require_profile(requested_profile)?;
+                    #[cfg(target_os = "macos")]
+                    if let Some(overlay) = sampled_kernel_overlay {
+                        summary.attach_sampled_kernel_overlay(overlay)?;
+                    }
+                    summary.set_provenance(capture_provenance(&me, &command)?);
+                    eprintln!("{}", summary.render_human());
+                    if let Some(summary_path) = summary_jsonl.as_deref() {
+                        let owner = drop_credentials
+                            .as_ref()
+                            .map(|value| (value.uid, value.gid));
+                        write_summary_atomic(summary_path, &summary, owner)?;
                     }
                 }
             }
@@ -2556,7 +2527,6 @@ mod tests {
             TraceProfileKind::Dsr,
             TraceProfileKind::DsrIndirect,
             TraceProfileKind::DsrFork,
-            TraceProfileKind::TrustedRoute,
         ] {
             assert!(!uses_live_kernel_symbols(profile));
             assert!(!uses_native_launch_qualification(profile));

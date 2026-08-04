@@ -2395,7 +2395,6 @@ pub fn replay_artifact(
         &template.relocations,
         template.trusted_entry,
         bindings,
-        crate::emit::trusted_route_split_enabled(),
     )
 }
 
@@ -2413,7 +2412,6 @@ pub fn replay_artifact_owned(
         &template.relocations,
         template.trusted_entry,
         bindings,
-        crate::emit::trusted_route_split_enabled(),
     )
 }
 
@@ -2434,7 +2432,6 @@ pub(crate) fn replay_unit_block(
     words: Vec<u32>,
     hot: UnitBlockHotWire,
     bindings: &ArtifactBindings,
-    route_split: crate::emit::TrustedRouteSplit,
 ) -> Result<EmittedBlock, DsrError> {
     if let Some(trusted) = hot.trusted_entry {
         let index = usize::try_from(trusted.offset / 4)
@@ -2456,7 +2453,6 @@ pub(crate) fn replay_unit_block(
         &hot.relocations,
         hot.trusted_entry,
         bindings,
-        route_split,
     )
 }
 
@@ -2507,7 +2503,6 @@ fn replay_artifact_parts(
     relocations: &[ArtifactRelocation],
     trusted_entry: Option<TrustedEntryTemplate>,
     bindings: &ArtifactBindings,
-    route_split: crate::emit::TrustedRouteSplit,
 ) -> Result<EmittedBlock, DsrError> {
     // The trusted entry's narrow materialization BAKES the recorded expected
     // generation into the words; a replay at any other generation would leave
@@ -2526,17 +2521,6 @@ fn replay_artifact_parts(
         })
         .transpose()?;
     apply_replay_relocations(&mut words, relocations, bindings)?;
-    let trusted_routes = trusted_entry
-        .map(|trusted| {
-            crate::emit::derive_trusted_route_offsets(
-                &words,
-                trusted.offset,
-                crate::types::CodeGeneration::claimed(trusted.expected),
-                route_split,
-            )
-        })
-        .transpose()?
-        .flatten();
     let recovery = recovery
         .into_iter()
         .map(|entry| {
@@ -2547,14 +2531,7 @@ fn replay_artifact_parts(
         })
         .collect::<Result<Vec<_>, DsrError>>()?;
     let code = cache.publish_words(&words)?;
-    EmittedBlock::from_artifact_parts(
-        code,
-        map,
-        direct_links,
-        recovery,
-        trusted_offset,
-        trusted_routes,
-    )
+    EmittedBlock::from_artifact_parts(code, map, direct_links, recovery, trusted_offset)
 }
 
 #[cfg(test)]
@@ -2564,68 +2541,12 @@ mod tests {
         BiasedBase, BiasedBaseCoordinate, BiasedMemoryRecovery, DirectLink, DirectLinkKind,
         DirectStubEnvelope, PcMapEntry, RecoveryAction, RecoveryEntry,
     };
-    use crate::types::{CacheOffset, CodeGeneration};
+    use crate::types::CacheOffset;
     use carrick_dsr::address::NativeHostBias;
     use carrick_guest_mem::GuestVa;
     use std::os::fd::AsRawFd;
 
     const IMM16_MASK: u32 = 0x001f_ffe0;
-
-    /// Three literal generation-7 trusted routes. Each route's final `b`
-    /// targets word 12, the common body; expectations here are hand-derived
-    /// rather than built with the emitter helper under test.
-    fn diagnostic_trusted_route_words() -> Vec<u32> {
-        vec![
-            0xd280_00f1,
-            0xf902_3f91,
-            0xf942_3791,
-            0x1400_0009,
-            0xd280_00f1,
-            0xf902_3f91,
-            0xf942_3791,
-            0x1400_0005,
-            0xd280_00f1,
-            0xf902_3f91,
-            0xf942_3791,
-            0x1400_0001,
-            0xd503_201f,
-        ]
-    }
-
-    #[test]
-    fn replay_derives_trusted_routes_from_the_existing_wire_entry() {
-        let words = diagnostic_trusted_route_words();
-        let routes = crate::emit::derive_trusted_route_offsets(
-            &words,
-            0,
-            CodeGeneration::claimed(7),
-            crate::emit::TrustedRouteSplit::Enabled,
-        )
-        .expect("valid diagnostic geometry")
-        .expect("enabled mode derives routes");
-        assert_eq!(routes.fallthrough.get(), 0);
-        assert_eq!(routes.direct.get(), 16);
-        assert_eq!(routes.indirect.get(), 32);
-        assert_eq!(routes.sequence_bytes, 12);
-        assert_eq!(routes.common_body.get(), 48);
-    }
-
-    #[test]
-    fn replay_rejects_a_nonidentical_trusted_route_before_publication() {
-        let mut words = diagnostic_trusted_route_words();
-        words[4] = 0xd280_0111;
-        let error = crate::emit::derive_trusted_route_offsets(
-            &words,
-            0,
-            CodeGeneration::claimed(7),
-            crate::emit::TrustedRouteSplit::Enabled,
-        )
-        .expect_err("one changed direct-route word must fail closed");
-        assert!(
-            error.to_string().contains("trusted route sequences differ"),
-            "unexpected error: {error}"
-        );
-    }
 
     fn mov_wide(register: u8, value: u64) -> [u32; 4] {
         std::array::from_fn(|halfword| {

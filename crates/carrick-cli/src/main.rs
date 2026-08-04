@@ -126,7 +126,6 @@ mod debug;
 // `debug_layout` and unlike `debug` — it is declared on every platform.
 mod debug_census;
 mod debug_layout;
-mod debug_trusted_route;
 mod fs_setup;
 mod lifecycle;
 mod native_profile_qualification;
