@@ -140,6 +140,7 @@ mod debug_exec_stamps;
 mod debug_jit_shape;
 mod debug_layout;
 mod fs_setup;
+mod jit_shape_snapshot;
 mod lifecycle;
 #[cfg(target_os = "macos")]
 mod native_fault_profile;
