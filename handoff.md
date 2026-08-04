@@ -1,9 +1,9 @@
 # Native-lane performance: state of play
 
 **Date:** 2026-08-03 · **Branch:** `codex/native-store-default` · **Latest
-implementation decision:** stop the current translation-publication memory
-hypothesis; initialized metadata plus JIT bytes written project to 7.411% /
-7.425% of total CPU, below the 10% opportunity gate ·
+implementation decision:** stop the residual allocation workstream; the
+largest source-distinct owner projects to 8.3375% / 8.0484% of total CPU under
+the favorable fault-cost ceiling, below the 10% opportunity gate ·
 **Scope:** Darwin/aarch64 native backend (`--exec-backend native`, the shipped
 default). VMM is explicitly NOT the target: one process per VM against a
 ~127-VM macOS ceiling makes it a dead end for build-shaped workloads.
@@ -93,6 +93,19 @@ only **7.4111% / 7.4247%** of total CPU. No production allocation or metadata
 change was selected. Full evidence:
 [`docs/perf-results/2026-08-03-current-native-fault-ownership.md`](docs/perf-results/2026-08-03-current-native-fault-ownership.md).
 
+The approved lifecycle-complete allocation-owner census is now complete. The
+opt-in tagged `System` allocator exported every fork/self-reexec/process-exit
+fragment and the strict Rust reader joined **140/140 process-image epochs and
+71 pids** in both accepted runs. Its coverage fallback worked as intended:
+v1 failed at 13.3776% `other`, v2 failed at 10.0369%, and the one-boundary-at-a-
+time v3 refinement accepted at **8.7628% / 8.7611%**. Two ordinary NFAULT2
+captures and two untraced NATIVEPERF CPU denominators bound the complete owner
+portfolio to normal execution. The largest owner, publication recovery, is
+only **8.3375% / 8.0484%** of total CPU even under the favorable 3.84 us per
+host-zfod model; every other named owner is below 2.3%. No allocation
+optimization was selected. Full evidence:
+[`docs/perf-results/2026-08-03-native-allocation-owner-census.md`](docs/perf-results/2026-08-03-native-allocation-owner-census.md).
+
 ## What landed (2026-08-02/03, six waves, all merged with `just ci` green)
 
 **Exec pipeline.** Payload SHA-256 removed from the default artifact digest
@@ -138,22 +151,20 @@ went 1.66 s → <10 ms. Identical host syscall sequence, identical guest ABI.
 
 ## What's next
 
-The exec/exit and context-traffic lines are closed at attribution rather than
-carried into production experiments. Their exact exporters and censuses remain
-opt-in diagnostics. A crashed run can also be read from a saved core through
-the always-on event ring. No official ratio refresh is warranted because
-neither line retained a production candidate. `RUST_TEST_THREADS=1 just ci`
-passes at the current source authority.
+The exec/exit, context-traffic, fault-publication, and residual-allocation lines
+are closed at attribution rather than carried into production experiments.
+Their exact exporters and censuses remain opt-in diagnostics. A crashed run can
+also be read from a saved core through the always-on event ring. No official
+ratio refresh is warranted because none retained a production candidate.
+`RUST_TEST_THREADS=1 just ci` passes at the current source authority.
 
-1. **Attribute the residual host-allocation first-touch population.** The
-   current fault captures establish that host-other dominates zfod, while the
-   largest named source (translation publication metadata plus JIT bytes)
-   explains about 47% of the scaled host-other population and fails the 10%
-   gate. Add export-only cumulative allocation/initialization counters at
-   source-distinct remaining owners, close them at exec/exit, and carry a
-   production candidate forward only if the same owner clears 10% in two
-   agreeing captures. Core decoding of these counters is a future diagnostic;
-   the always-on event ring remains the crash path for lifecycle history.
+1. **Refresh the complete current-default CPU attribution.** The last broad
+   user/kernel/JIT/dylib split predates the persistent-store default and several
+   retained codegen, filesystem, and exec wins. Run two ordinary-binary,
+   tracer-self-excluded captures and repartition current user, kernel, JIT,
+   dylib, syscall, and fault CPU. Select a source-distinct next bucket only if
+   it clears 10% twice. This is the non-regrettable way to re-rank after four
+   independently stopped sub-10% lines instead of extrapolating a stale budget.
 2. **Keep eager full translation as a deferred future design, not the next
    patch.** Translating a complete eligible image once up front could amortize
    publication and avoid the losing per-process merge path measured here. It
@@ -167,21 +178,21 @@ passes at the current source authority.
 
 ## Confidence
 
-- **Very high (98%):** current fault ownership is stable and complete. Both
-  captures completed naturally with every loss/identity/catalog counter zero;
-  host-other zfod differs by only 0.472 percentage points.
-- **Very high (98%):** the translation-publication source census is stable.
-  Both accepted runs reconcile 140/140 independent process-image epochs and
-  initialized metadata differs by only 0.052%.
-- **High (96%):** the named publication-memory mechanism does not clear the
-  production gate. Two deliberately favorable projections remain below 7.7%
-  in both bindings; untallied allocator churn was not promoted into a result.
+- **Very high (98%):** allocation lifecycle and coverage are complete. Both v3
+  captures reconcile 140/140 independent process-image epochs, 71 pids, and
+  every deterministic record with zero lifecycle/overflow/temp error.
+- **Very high (98%):** the owner distribution is stable. Total requested bytes
+  differ by 0.0086%, `other` by 0.0017 percentage points, and the three largest
+  owners keep the same ordering.
+- **High (97%):** no allocation owner clears the production gate. The largest
+  owner reaches only 8.34% / 8.05% under a deliberately favorable ceiling;
+  untallied `other` projects to only 1.40% / 1.35% and cannot hide a candidate.
 - **High (95%):** the official shipped-default result remains 10.4446x. No
   rejected candidate code is retained and no projection was substituted for a
   fresh Carrick/Docker run.
-- **Medium-high (80%):** residual host-allocation first touch is the best next
-  lane. The population has measured mass, but it is not yet source-distinct and
-  therefore cannot authorize a patch.
+- **High (90%):** a fresh broad CPU attribution is the right next measurement.
+  The current official gap is still large, but the prior complete bucket model
+  is stale enough that choosing another patch from it would be speculative.
 
 ## Discipline that earned its keep (do not relearn these)
 
@@ -206,14 +217,16 @@ passes at the current source authority.
 
 ## Branch state at handoff
 
-`0e35a2d37b8f74acdb83c245f5fcfe7257f892b3` is the source authority for the
-accepted fault and publication-memory captures. Its signed binary has SHA-256
-`813201a8f0b71f495c2771b7e2deee941c1c6ec9832aca0bf7d571be7f065819`
-and Mach-O UUID `407C0AF5-5880-3A2F-816F-5CBDA63CBB42`. Commits `aa29e872`
-through `0e35a2d3` retain the authenticated owned-range publication, NFAULT2
-profile, fail-closed Rust ownership reader, and export-only publication-memory
-census. They do not alter default guest semantics. `RUST_TEST_THREADS=1 just
-ci` passed at that source authority.
+`80a469da617b0eec4d8e69ee639cbfe287767cfd` is the source authority for the
+accepted allocation/fault/CPU captures. Its feature binary has SHA-256
+`c46323009b8d944c67dd0692137e1409f57254e18a3ec77cdac19f2e48dbb555`
+and UUID `444B9BDA-4565-3E15-8655-6535A4307375`; its ordinary binary has
+SHA-256 `a77c7d5243a4d6eaae195d3d8e49bde5b8c46db6eedff9db8db5cf4b2a11e8c0`
+and UUID `E0338A4E-19B3-3885-9489-5AE625AD2CE7`. Commits `932f8e28` through
+`80a469da` retain the export-only tagged allocator, lifecycle closure, strict
+ALLOCOWNER3/NATIVEPERF reader, and source-distinct owners. The ordinary binary
+contains no allocation runtime marker and default guest semantics do not
+change. `RUST_TEST_THREADS=1 just ci` passed at that source authority.
 Nothing has been pushed and local `main` has not moved. Target-only raw ABBA,
 mechanism, signed-binary, store, attribution, and scoreboard receipts remain
 under `target/perf/` and are intentionally not committed.
