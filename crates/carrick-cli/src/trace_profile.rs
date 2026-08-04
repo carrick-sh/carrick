@@ -19,7 +19,7 @@ const V2_PROTOCOL_PREFIX: &str = "DSRPROF2";
 const V2_STACK_PREFIX: &str = "DSRSTACK2";
 const V2_ERROR_PREFIX: &str = "DSRERROR2";
 const V2_RAW_SCHEMA: &str = "carrick.dsrprof.raw.v2";
-const NATIVE_FAULT_RAW_SCHEMA: &str = "carrick.native-fault.raw.v2";
+const NATIVE_FAULT_RAW_SCHEMA: &str = "carrick.native-fault.raw.v3";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ProcessBirthKey {
@@ -3850,6 +3850,11 @@ mod tests {
             "NFAULT2|prebirth-total|",
             "NFAULT2|prebirth-rejected|",
             "pending_forks=%d",
+            "NFAULT2|memory-intent|",
+            "NFAULT2|fault-event|outcome=zfod|",
+            "NFAULT2|memory-census|",
+            "carrick*:::syscall-entry",
+            "carrick*:::syscall-return",
         ] {
             assert!(
                 script.contains(record),
