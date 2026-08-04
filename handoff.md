@@ -1,9 +1,9 @@
 # Native-lane performance: state of play
 
 **Date:** 2026-08-04 · **Branch:** `codex/native-store-default` · **Latest
-decision:** stop memory lowering below the 10% opportunity gate; retain the
-published-block index split after a controlled **8.50% total-CPU reduction**
-and carry the now-exposed exclusive translation writer ·
+decision:** stop and revert optimistic decode outside the translation writer
+after a controlled **13.74% total-CPU regression**; preserve its typed discard
+diagnostics and return to fresh attribution on the retained tree ·
 **Scope:** Darwin/aarch64 native backend (`--exec-backend native`, the shipped
 default). VMM is explicitly NOT the target: one process per VM against a
 ~127-VM macOS ceiling makes it a dead end for build-shaped workloads.
@@ -146,6 +146,22 @@ translation.
 Full evidence:
 [`docs/perf-results/2026-08-04-memory-intent-and-published-block-lock.md`](docs/perf-results/2026-08-04-memory-intent-and-published-block-lock.md).
 
+The exclusive-writer follow-up is now measured and stopped. Moving pure decode
+and planning outside the writer materially reduced the exact targeted
+mechanism: same-instrument `psynch_cvwait` share fell 19.4-20.9% relative, and
+the strict adjacent writer stack fell 26.6-29.7%. The authoritative
+same-workload eight-quad ABBA nevertheless measured candidate/control total
+child CPU **1.137399 [1.124574, 1.146825]**, user CPU **1.112970
+[1.102824, 1.122284]**, system CPU **1.218661 [1.193188, 1.225041]**, and
+workload wall **1.014402 [1.005370, 1.022172]**. The candidate won 0/8 quads
+on every metric. The precise extra-cost root cause remains inferred rather than
+proven; the no-retain decision does not depend on resolving it. Commits
+`9e0b0817` and `3733eeef` were reverted in that order as `99ce4d0c` and
+`89e82b84`. The reviewed diagnostics in `d4c84088` and parser correction in
+`9a2788d6` remain, and the restored tree passed the full serialized CI and
+23/23 native smoke gate. Full evidence:
+[`docs/perf-results/2026-08-04-native-optimistic-decode.md`](docs/perf-results/2026-08-04-native-optimistic-decode.md).
+
 ## What landed (2026-08-02/03, six waves, all merged with `just ci` green)
 
 **Exec pipeline.** Payload SHA-256 removed from the default artifact digest
@@ -200,15 +216,15 @@ user-requested serialized current-default refresh is nevertheless complete and
 sets the official absolute scoreboard to 10.1776x without converting that
 scoreboard movement into a causal lock-split claim.
 
-1. **Shorten or partition exclusive translation without making the JIT cache
-   concurrently writable.** Candidate stacks now end at
-   `RawRwLock::lock_exclusive_slow -> translate_read_mostly`; the warm-reader
-   mechanism is gone. Baseline phase counters put decode at 10.52%, emission at
-   14.26%, publication at 3.71%, and the complete nested translation interval
-   at 25.46% of ordinary CPU. First test a narrow per-key election and move only
-   independently computable decode/planning outside the global write lock,
-   then revalidate generation/publication under the lock. Do not change the
-   bump cursor or its `Send`/`Sync` safety argument without a separate design.
+1. **Attribute the next current-retained-tree bucket before selecting another
+   production candidate.** The optimistic decode experiment proves that a
+   material wait-stack reduction can still increase product CPU. Do not present
+   the stopped exclusive-writer line as the next candidate, and do not infer a
+   replacement from its losing arm. Reprofile the restored serialized tree,
+   bind the next source-distinct mechanism to at least 10% end-to-end CPU or
+   wall opportunity, then test one lowering hypothesis at a time. Smaller wins
+   may be retained only when measured as non-regrettable enablers, following the
+   user-approved sequential-improvement policy.
 2. **Keep eager full translation as a deferred future design, not the next
    patch.** Translating a complete eligible image once up front could amortize
    publication and avoid the losing per-process merge path measured here. It
@@ -234,10 +250,16 @@ scoreboard movement into a causal lock-split claim.
 - **High (94%):** the mirror preserves publication/invalidation semantics.
   Publication ordering is explicit, all 226 crate tests pass, and the full
   serialized repository gate is green.
-- **Medium (60%):** a narrow exclusive-lock change can deliver the next >=10%
-  step. Waiting is independently ~15.2% of sampled CPU and translation phases
-  total ~25.5%, but moving decode outside the lock can duplicate work and may
-  trade wait CPU for extra user CPU unless per-key ownership is precise.
+- **Very high (99%):** the optimistic decode-outside-writer candidate is a
+  regression and must not be retained. The accepted 34-sample campaign lost all
+  eight quads, and every CPU and wall interval excludes parity in the wrong
+  direction.
+- **High (97%):** the preserved optimistic-discard diagnostics and validator
+  remain semantically useful. They are typed, fail closed, passed 165 tests,
+  and naturally report zero on the restored serialized path.
+- **Unscored pending attribution:** no specific next implementation candidate
+  is promoted from the losing arm. Confidence will be assigned only after a
+  fresh current-retained-tree profile names a source-distinct >=10% opportunity.
 - **High (95%):** the official shipped-default result is now 10.1776x. No
   projection or unresolved wall result was substituted for a fresh
   Carrick/Docker run.
@@ -269,17 +291,19 @@ scoreboard movement into a causal lock-split claim.
 
 ## Branch state at handoff
 
-Current code authority is
-`64bebc26b72ffd1f7a9ba581fded0f91fca21f63`. Commits `87ab04f9` and
+Current restored code authority before this handoff/evidence commit is
+`89e82b84`. Commits `87ab04f9` and
 `44de0656` retain the export-only, lifecycle-complete memory-intent census;
 `98ae5e26` and `c4be3c23` retain exact syscall and `psynch_cvwait` stack
-attribution; `64bebc26` is the measured published-block index split. The
-candidate signed binary has SHA-256
-`aa423abce65be7408a4e565bec04383c7eb0dfeec8a3e72f56fb1cc8f96fd5df`
-and UUID `75781D46-91FC-3A89-AFA6-283E00EA06FA`. The clean detached ABBA
-control remains at `c4be3c23` in `.worktrees/native-lock-control` with binary
-SHA-256 `8e13747930c4c954654e7a08aa21c4e41b13eea6e096a1fc64ec30facbb4cd9f`.
-`RUST_TEST_THREADS=1 just ci` passed at this source authority after the ABBA.
-Nothing has been pushed and local `main` has not moved. Target-only raw ABBA,
-mechanism, signed-binary, store, attribution, and scoreboard receipts remain
-under `target/perf/` and are intentionally not committed.
+attribution; `64bebc26` is the measured published-block index split. The losing
+optimistic implementation commits `3733eeef` and `9e0b0817` are neutralized by
+reverts `89e82b84` and `99ce4d0c`; diagnostics commit `d4c84088` and parser
+commit `9a2788d6` remain. The restored signed binary has SHA-256
+`82572dd3f7da5f2a4252782038f2c52bec8b30f6cdd7f1fc3a121f13ccceae51`.
+The clean detached optimistic-decode ABBA control remains at `a5bd4971` in
+`.worktrees/native-optimistic-control`; do not delete it until controller
+closeout. `RUST_TEST_THREADS=1 just ci` and `just conformance-native smoke`
+(23/23 MATCH) passed at restored source authority. Nothing has been pushed and
+local `main` has not moved. Target-only raw ABBA, mechanism, signed-binary,
+store, attribution, and scoreboard receipts remain under `target/perf/` and
+are intentionally not committed.
