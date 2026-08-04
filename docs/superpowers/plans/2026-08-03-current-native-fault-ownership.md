@@ -131,7 +131,7 @@ Commit:
   rows, exact outcome totals, rejected-provider counts, and one natural
   completion record.
 
-- [ ] **Step 1: Write red profile-selection and render tests**
+- [x] **Step 1: Write red profile-selection and render tests**
 
 Assert that `native-fault` parses, survives sudo argv reconstruction, selects
 the bundled script, requires native launch qualification, does not request
@@ -139,7 +139,7 @@ kernel symbolization, and renders exactly one header plus the qualified
 terminal map. The production mutation caught is silently running an
 unauthenticated or user-supplied D program while labeling it native-fault.
 
-- [ ] **Step 2: Run the CLI tests and prove red**
+- [x] **Step 2: Run the CLI tests and prove red**
 
 Run:
 
@@ -148,7 +148,7 @@ Run:
 Expected: compile failure because NativeFault and its bundled program do not
 exist.
 
-- [ ] **Step 3: Implement profile plumbing and authenticated rendering**
+- [x] **Step 3: Implement profile plumbing and authenticated rendering**
 
 Bundle the existing script under BUNDLED_NATIVE_FAULT_D. Hash the immutable
 template, not the receipt-substituted program, and render:
@@ -158,7 +158,7 @@ template, not the receipt-substituted program, and render:
 Reuse the accepted birth and terminal qualification receipts. Do not request
 the native-wall KDK symbol callback.
 
-- [ ] **Step 4: Rewrite the existing D program as NFAULT2**
+- [x] **Step 4: Rewrite the existing D program as NFAULT2**
 
 Track active process birth keys, fork inheritance, exec attempts/successes, and
 the current complete owned-range catalog. Key sampled as_fault and zfod pages
@@ -167,7 +167,7 @@ all-tracked totals and explicit invalid-address, pre-birth, no-catalog,
 lifecycle, catalog, and D action error counters. Print completion only when
 the target exits naturally and every tracked process is retired.
 
-- [ ] **Step 5: Run profile tests and D compilation, then commit**
+- [x] **Step 5: Run profile tests and D compilation, then commit**
 
 Run:
 

@@ -9,6 +9,8 @@ use sha2::{Digest, Sha256};
 
 const DSRPROF2_HEADER_PLACEHOLDER: &str = "/* CARRICK_DSRPROF2_HEADER */";
 const DSRPROF2_TERMINALS_PLACEHOLDER: &str = "/* CARRICK_DSRPROF2_TERMINALS */";
+const NFAULT2_HEADER_PLACEHOLDER: &str = "/* CARRICK_NFAULT2_HEADER */";
+const NFAULT2_TERMINALS_PLACEHOLDER: &str = "/* CARRICK_NFAULT2_TERMINALS */";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -131,11 +133,13 @@ impl NativeProfileQualification {
     }
 
     #[cfg(target_os = "macos")]
-    pub(crate) fn v2_profile_authority(
+    fn profile_authority(
         &self,
+        profile: crate::trace_profile::TraceProfileKind,
         profile_program: &str,
     ) -> Result<crate::trace_profile::V2ProfileAuthority> {
-        crate::trace_profile::V2ProfileAuthority::new(
+        crate::trace_profile::V2ProfileAuthority::new_for_profile(
+            profile,
             &self.os_build,
             &sha256_hex(profile_program.as_bytes()),
             &self.birth_receipt_sha256,
@@ -155,25 +159,54 @@ impl NativeProfileQualification {
         &self,
         profile_template: &str,
     ) -> Result<RenderedNativeProfileProgram> {
-        let placeholder_count = profile_template
-            .match_indices(DSRPROF2_HEADER_PLACEHOLDER)
-            .count();
+        self.render_profile_program(
+            crate::trace_profile::TraceProfileKind::NativeWall,
+            profile_template,
+            DSRPROF2_HEADER_PLACEHOLDER,
+            DSRPROF2_TERMINALS_PLACEHOLDER,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn render_native_fault_profile_program(
+        &self,
+        profile_template: &str,
+    ) -> Result<RenderedNativeProfileProgram> {
+        self.render_profile_program(
+            crate::trace_profile::TraceProfileKind::NativeFault,
+            profile_template,
+            NFAULT2_HEADER_PLACEHOLDER,
+            NFAULT2_TERMINALS_PLACEHOLDER,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn render_profile_program(
+        &self,
+        profile: crate::trace_profile::TraceProfileKind,
+        profile_template: &str,
+        header_placeholder: &str,
+        terminals_placeholder: &str,
+    ) -> Result<RenderedNativeProfileProgram> {
+        let placeholder_count = profile_template.match_indices(header_placeholder).count();
         if placeholder_count != 1 {
             bail!(
-                "native-wall profile template must contain exactly one DSRPROF2 header placeholder, found {placeholder_count}"
+                "{} profile template must contain exactly one header placeholder, found {placeholder_count}",
+                profile.as_str(),
             );
         }
         let terminal_placeholder_count = profile_template
-            .match_indices(DSRPROF2_TERMINALS_PLACEHOLDER)
+            .match_indices(terminals_placeholder)
             .count();
         if terminal_placeholder_count != 1 {
             bail!(
-                "native-wall profile template must contain exactly one DSRPROF2 terminal placeholder, found {terminal_placeholder_count}"
+                "{} profile template must contain exactly one terminal placeholder, found {terminal_placeholder_count}",
+                profile.as_str(),
             );
         }
         // The authority names the immutable bundled template. Hashing the
         // receipt-substituted program would make the header self-referential.
-        let authority = self.v2_profile_authority(profile_template)?;
+        let authority = self.profile_authority(profile, profile_template)?;
         let header_action = format!("printf(\"{}\\n\");", authority.header_record());
         let terminal_actions = self
             .terminals
@@ -191,8 +224,8 @@ impl NativeProfileQualification {
             .collect::<Vec<_>>()
             .join("\n\t");
         let program = profile_template
-            .replacen(DSRPROF2_HEADER_PLACEHOLDER, &header_action, 1)
-            .replacen(DSRPROF2_TERMINALS_PLACEHOLDER, &terminal_actions, 1);
+            .replacen(header_placeholder, &header_action, 1)
+            .replacen(terminals_placeholder, &terminal_actions, 1);
         Ok(RenderedNativeProfileProgram { program, authority })
     }
 }
@@ -893,6 +926,49 @@ mod tests {
         ] {
             assert!(first.render_v2_profile_program(malformed).is_err());
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_fault_render_has_one_authenticated_header_and_terminal_map() {
+        const TEMPLATE: &str = concat!(
+            "dtrace:::BEGIN\n{\n",
+            "\t/* CARRICK_NFAULT2_HEADER */\n",
+            "\t/* CARRICK_NFAULT2_TERMINALS */\n",
+            "}\n",
+        );
+        let qualification = build_qualification(
+            BIRTH,
+            THREAD,
+            PROCESS,
+            DTraceRunReport::default(),
+            DTraceRunReport::default(),
+            DTraceRunReport::default(),
+            "26A123",
+        )
+        .expect("valid qualification");
+
+        let rendered = qualification
+            .render_native_fault_profile_program(TEMPLATE)
+            .expect("render native-fault profile");
+        assert_eq!(rendered.program.matches("NFAULT2|header|").count(), 1);
+        assert!(rendered.program.contains(
+            "profile=native-fault|raw_schema=carrick.native-fault.raw.v2|os_build=26A123|"
+        ));
+        assert_eq!(
+            rendered.program.matches("terminal_scope[").count(),
+            qualification.terminals.len()
+        );
+        assert!(
+            rendered
+                .program
+                .contains("terminal_scope[\"syscall\", \"bsdthread_terminate\"] = 1;")
+        );
+        assert!(
+            rendered
+                .program
+                .contains("terminal_scope[\"syscall\", \"exit\"] = 2;")
+        );
     }
 
     #[test]

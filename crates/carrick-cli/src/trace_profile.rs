@@ -18,6 +18,7 @@ const JSON_SCHEMA: &str = "carrick.dsr-profile.v1";
 const V2_PROTOCOL_PREFIX: &str = "DSRPROF2";
 const V2_STACK_PREFIX: &str = "DSRSTACK2";
 const V2_RAW_SCHEMA: &str = "carrick.dsrprof.raw.v2";
+const NATIVE_FAULT_RAW_SCHEMA: &str = "carrick.native-fault.raw.v2";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ProcessBirthKey {
@@ -275,6 +276,7 @@ struct V2OffcpuEpisode {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct V2ProfileAuthority {
+    profile: TraceProfileKind,
     os_build: String,
     program_sha256: String,
     birth_qualification_sha256: String,
@@ -283,6 +285,7 @@ pub(crate) struct V2ProfileAuthority {
 }
 
 impl V2ProfileAuthority {
+    #[cfg(test)]
     pub(crate) fn new(
         os_build: &str,
         program_sha256: &str,
@@ -290,6 +293,30 @@ impl V2ProfileAuthority {
         terminal_qualification_sha256: &str,
         terminal_qualifications: impl IntoIterator<Item = (String, String, String)>,
     ) -> Result<Self> {
+        Self::new_for_profile(
+            TraceProfileKind::NativeWall,
+            os_build,
+            program_sha256,
+            birth_qualification_sha256,
+            terminal_qualification_sha256,
+            terminal_qualifications,
+        )
+    }
+
+    pub(crate) fn new_for_profile(
+        profile: TraceProfileKind,
+        os_build: &str,
+        program_sha256: &str,
+        birth_qualification_sha256: &str,
+        terminal_qualification_sha256: &str,
+        terminal_qualifications: impl IntoIterator<Item = (String, String, String)>,
+    ) -> Result<Self> {
+        if !matches!(
+            profile,
+            TraceProfileKind::NativeFault | TraceProfileKind::NativeWall
+        ) {
+            bail!("profile {:?} does not use native launch authority", profile);
+        }
         validate_percent_token(os_build, "authority os_build")?;
         for (value, field) in [
             (program_sha256, "authority program_sha256"),
@@ -323,6 +350,7 @@ impl V2ProfileAuthority {
             bail!("authority must qualify both thread and process termination");
         }
         Ok(Self {
+            profile,
             os_build: os_build.to_owned(),
             program_sha256: program_sha256.to_owned(),
             birth_qualification_sha256: birth_qualification_sha256.to_owned(),
@@ -336,13 +364,25 @@ impl V2ProfileAuthority {
     }
 
     pub(crate) fn header_record(&self) -> String {
-        format!(
-            "DSRPROF2|header|profile=native-wall|raw_schema={V2_RAW_SCHEMA}|os_build={}|program_sha256={}|birth_qualification_sha256={}|terminal_qualification_sha256={}|wall_hz=197|cpu_hz=499",
-            self.os_build,
-            self.program_sha256(),
-            self.birth_qualification_sha256,
-            self.terminal_qualification_sha256,
-        )
+        match self.profile {
+            TraceProfileKind::NativeWall => format!(
+                "DSRPROF2|header|profile=native-wall|raw_schema={V2_RAW_SCHEMA}|os_build={}|program_sha256={}|birth_qualification_sha256={}|terminal_qualification_sha256={}|wall_hz=197|cpu_hz=499",
+                self.os_build,
+                self.program_sha256(),
+                self.birth_qualification_sha256,
+                self.terminal_qualification_sha256,
+            ),
+            TraceProfileKind::NativeFault => format!(
+                "NFAULT2|header|profile=native-fault|raw_schema={NATIVE_FAULT_RAW_SCHEMA}|os_build={}|program_sha256={}|birth_qualification_sha256={}|terminal_qualification_sha256={}|page_sample_modulus=64",
+                self.os_build,
+                self.program_sha256(),
+                self.birth_qualification_sha256,
+                self.terminal_qualification_sha256,
+            ),
+            TraceProfileKind::Dsr | TraceProfileKind::DsrFork | TraceProfileKind::DsrIndirect => {
+                unreachable!("non-native profile cannot construct V2ProfileAuthority")
+            }
+        }
     }
 }
 
@@ -1880,6 +1920,7 @@ pub(crate) enum TraceProfileKind {
     Dsr,
     DsrIndirect,
     DsrFork,
+    NativeFault,
     NativeWall,
 }
 
@@ -1889,6 +1930,7 @@ impl TraceProfileKind {
             Self::Dsr => "dsr",
             Self::DsrIndirect => "dsr-indirect",
             Self::DsrFork => "dsr-fork",
+            Self::NativeFault => "native-fault",
             Self::NativeWall => "native-wall",
         }
     }
@@ -1903,6 +1945,7 @@ impl TraceProfileKind {
             Self::Dsr => carrick_runtime::dtrace_consumer::BUNDLED_DSR_PROFILE_D,
             Self::DsrIndirect => carrick_runtime::dtrace_consumer::BUNDLED_DSR_INDIRECT_D,
             Self::DsrFork => carrick_runtime::dtrace_consumer::BUNDLED_DSR_FORK_D,
+            Self::NativeFault => carrick_runtime::dtrace_consumer::BUNDLED_NATIVE_FAULT_D,
             Self::NativeWall => carrick_runtime::dtrace_consumer::BUNDLED_NATIVE_WALL_D,
         }
     }
@@ -1912,6 +1955,7 @@ impl TraceProfileKind {
             "dsr" => Ok(Self::Dsr),
             "dsr-indirect" => Ok(Self::DsrIndirect),
             "dsr-fork" => Ok(Self::DsrFork),
+            "native-fault" => Ok(Self::NativeFault),
             "native-wall" => Ok(Self::NativeWall),
             other => bail!("unknown DSR profile {other:?}"),
         }
@@ -3737,6 +3781,20 @@ pub(crate) fn write_summary_atomic(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    fn native_fault_profile_selection_is_bundled_and_runtime_profile_free() {
+        let profile = TraceProfileKind::parse_protocol("native-fault")
+            .expect("native-fault profile spelling");
+        assert_eq!(profile, TraceProfileKind::NativeFault);
+        assert_eq!(profile.as_str(), "native-fault");
+        assert!(!profile.requires_runtime_profile());
+        assert_eq!(
+            profile.bundled_script(),
+            carrick_runtime::dtrace_consumer::BUNDLED_NATIVE_FAULT_D
+        );
+    }
 
     #[test]
     fn dsrprof2_summary_preserves_birth_keyed_metrics() {

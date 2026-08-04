@@ -278,4 +278,44 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn native_fault_profile_survives_sudo_argv_reconstruction() {
+        let command = ["run-elf".to_owned(), "/tmp/fault-probe".to_owned()];
+        let argv = trace_sudo_argv(&TraceSudoInvocation {
+            executable: Path::new("/tmp/carrick"),
+            flowindent: false,
+            script: None,
+            profile: Some(TraceProfileKind::NativeFault),
+            summary_jsonl: None,
+            trace_out: Some(Path::new("/tmp/native-fault.raw")),
+            uid: 501,
+            gid: 20,
+            groups: &[],
+            forwarded_env: &[],
+            command: &command,
+        });
+        let strings = argv
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            strings,
+            [
+                "/tmp/carrick",
+                "trace",
+                "--profile",
+                "native-fault",
+                "--trace-out",
+                "/tmp/native-fault.raw",
+                "--trace-uid",
+                "501",
+                "--trace-gid",
+                "20",
+                "--",
+                "run-elf",
+                "/tmp/fault-probe",
+            ]
+        );
+    }
 }

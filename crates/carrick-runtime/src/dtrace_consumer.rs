@@ -90,6 +90,8 @@ pub const BUNDLED_DSR_PROFILE_D: &str = include_str!("../../../scripts/dtrace/ds
 pub const BUNDLED_DSR_INDIRECT_D: &str = include_str!("../../../scripts/dtrace/dsr-indirect.d");
 pub const BUNDLED_DSR_FORK_D: &str = include_str!("../../../scripts/dtrace/dsr-fork.d");
 pub const BUNDLED_NATIVE_WALL_D: &str = include_str!("../../../scripts/dtrace/native-wall.d");
+pub const BUNDLED_NATIVE_FAULT_D: &str =
+    include_str!("../../../scripts/dtrace/native-fault-attribution.d");
 pub const BUNDLED_NATIVE_BIRTH_QUALIFY_D: &str =
     include_str!("../../../scripts/dtrace/native-birth-qualify.d");
 pub const BUNDLED_NATIVE_TERMINAL_QUALIFY_D: &str =
