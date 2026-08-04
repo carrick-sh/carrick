@@ -936,6 +936,28 @@ pub(crate) enum DebugCommand {
         #[arg(long = "processes-observed")]
         processes_observed: Option<u64>,
     },
+    /// Strictly join allocation-owner fragments to a complete NATIVEPERF
+    /// export and print the non-overlapping owner opportunity portfolio.
+    AllocOwnerCensus {
+        /// Directory holding `alloc-owner-*.txt` fragments from one run.
+        dir: PathBuf,
+        /// Complete NATIVEPERF export from the same run.
+        #[arg(long = "native-perf")]
+        native_perf: PathBuf,
+        /// Independently expected process-image epochs in the run.
+        #[arg(long = "expected-process-epochs")]
+        expected_process_epochs: u64,
+        /// Independently expected distinct host PIDs in the run.
+        #[arg(long = "expected-pids")]
+        expected_pids: u64,
+        /// Measured share of total workload CPU attributable to ordinary host
+        /// allocation work. Omit only for the strict coverage-only fallback.
+        #[arg(long = "normal-host-allocation-opportunity-share")]
+        normal_host_allocation_opportunity_share: Option<f64>,
+        /// Minimum projected share of total workload CPU worth pursuing.
+        #[arg(long = "qualification-share-of-total", default_value_t = 0.10)]
+        qualification_share_of_total: f64,
+    },
     /// Parse a complete `CARRICK_EXEC_STAMPS` v2 export, validate every
     /// fork/exec/exit/reap relationship, and print CPU/wall attribution JSON.
     ExecStampCensus {
@@ -1186,6 +1208,30 @@ mod tests {
             ])
             .is_ok(),
             "timeout diagnostics need a standalone snapshot command"
+        );
+    }
+
+    #[test]
+    fn alloc_owner_census_accepts_explicit_join_authority() {
+        assert!(
+            Cli::try_parse_from([
+                "carrick",
+                "debug",
+                "alloc-owner-census",
+                "/tmp/owners",
+                "--native-perf",
+                "/tmp/nativeperf.txt",
+                "--expected-process-epochs",
+                "140",
+                "--expected-pids",
+                "70",
+                "--normal-host-allocation-opportunity-share",
+                "0.30",
+                "--qualification-share-of-total",
+                "0.10",
+            ])
+            .is_ok(),
+            "allocation-owner aggregation needs explicit workload identity and opportunity authority"
         );
     }
 }
