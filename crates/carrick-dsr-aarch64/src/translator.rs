@@ -516,6 +516,81 @@ impl ThreadBlockCache {
     }
 }
 
+type PublishedBlockKey = (carrick_guest_mem::GuestVa, types::CodeGeneration);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PublishedBlockLookup {
+    entry: types::CacheVa,
+    trusted_entry: Option<types::CacheOffset>,
+}
+
+/// Independently synchronized mirror of the published block index.
+///
+/// `ProcessState`'s write lock deliberately spans decode, emit, publication,
+/// dependency updates, and direct-link patching. Warm cross-thread lookups used
+/// to take that same lock for one `BTreeMap::get`, so a translator doing useful
+/// write-side work forced every reader into Darwin's `psynch_cvwait`. The mirror
+/// is published only after a block is executable and its invalidation dependency
+/// is registered. Its lock therefore covers just a lookup or one index update,
+/// never translation.
+///
+/// Sharding keeps unrelated publications from stopping unrelated readers. The
+/// per-thread cache remains the first-level path; this is the process-wide
+/// second level for a thread's first encounter with an already-published block.
+struct PublishedBlockIndex {
+    shards: Box<[RwLock<BTreeMap<PublishedBlockKey, PublishedBlockLookup>>]>,
+}
+
+impl PublishedBlockIndex {
+    const SHARDS: usize = 64;
+    const SHIFT: u32 = 64 - Self::SHARDS.trailing_zeros();
+
+    fn new() -> Self {
+        Self {
+            shards: (0..Self::SHARDS)
+                .map(|_| RwLock::new(BTreeMap::new()))
+                .collect(),
+        }
+    }
+
+    #[inline]
+    fn shard(key: PublishedBlockKey) -> usize {
+        let guest = key.0.raw() >> 2;
+        let generation = key.1.get().rotate_left(29);
+        let mixed = (guest ^ generation).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (mixed >> Self::SHIFT) as usize
+    }
+
+    #[inline]
+    fn get(
+        &self,
+        guest: carrick_guest_mem::GuestVa,
+        generation: types::CodeGeneration,
+    ) -> Option<PublishedBlockLookup> {
+        let key = (guest, generation);
+        self.shards[Self::shard(key)].read().get(&key).copied()
+    }
+
+    fn insert(&self, key: PublishedBlockKey, lookup: PublishedBlockLookup) {
+        self.shards[Self::shard(key)].write().insert(key, lookup);
+    }
+
+    fn remove(&self, key: PublishedBlockKey) {
+        self.shards[Self::shard(key)].write().remove(&key);
+    }
+
+    fn clear(&self) {
+        for shard in &self.shards {
+            shard.write().clear();
+        }
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.shards.iter().all(|shard| shard.read().is_empty())
+    }
+}
+
 pub struct ThreadTranslator {
     // Fields are `pub` + doc(hidden)-by-convention: the runtime's
     // still-resident, JIT-entangled test suites (and the oracle) reach into
@@ -648,6 +723,7 @@ pub struct CodeSnapshot {
 pub struct ProcessTranslator {
     // `pub` for the runtime's still-resident test suites (see ThreadTranslator).
     pub state: RwLock<ProcessState>,
+    published_blocks: Arc<PublishedBlockIndex>,
     private_target_authority: Box<gateway::TargetCacheAuthority>,
     private_jit_epoch: Arc<crate::direct_binding::PrivateJitEpoch>,
     exec_reset_identity: Arc<DirectBindingExecProcessIdentity>,
@@ -861,6 +937,7 @@ impl Drop for ProcessTranslator {
 
 pub struct ProcessState {
     pub cache: cache::TranslationCache,
+    published_blocks: Arc<PublishedBlockIndex>,
     translated_ranges: TranslatedRangeCatalog,
     pub artifact_store: Option<artifact_spike::ArtifactStore>,
     pub blocks: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), types::CacheVa>,
@@ -2172,6 +2249,7 @@ impl ProcessTranslator {
             carrick_guest_mem::HostVa(cache_range.start)
                 ..carrick_guest_mem::HostVa(cache_range.end),
         )?;
+        let published_blocks = Arc::new(PublishedBlockIndex::new());
         let translator = Self {
             private_target_authority: Box::new(gateway::TargetCacheAuthority::new(
                 cache_range.start,
@@ -2180,8 +2258,10 @@ impl ProcessTranslator {
             )),
             private_jit_epoch: crate::direct_binding::PrivateJitEpoch::process_owner(),
             exec_reset_identity: Arc::new(DirectBindingExecProcessIdentity),
+            published_blocks: Arc::clone(&published_blocks),
             state: RwLock::new(ProcessState {
                 cache,
+                published_blocks,
                 translated_ranges,
                 artifact_store: artifact_spike::store_if_enabled()?,
                 blocks: BTreeMap::new(),
@@ -2900,8 +2980,9 @@ impl ProcessState {
     }
 
     /// Read-only warm-cache-hit lookup: the fast path for
-    /// `ThreadTranslator::translate` under `ProcessTranslator::state.read()`.
-    /// Never mutates -- callable concurrently from any number of readers.
+    /// `ThreadTranslator::translate` under the original process-state read
+    /// lock. Retained as the authoritative write-path recheck; warm readers
+    /// now use `ProcessTranslator::published_blocks` instead.
     ///
     /// `blocks` is keyed by `(guest, generation)`, and `generation` here MUST
     /// be the CALLER'S freshly observed current generation (the same value
@@ -3075,6 +3156,17 @@ impl ProcessState {
                 self.patch_direct_link_if_reachable(site, entry, key.0)?;
             }
         }
+        // Publish to the independently synchronized read index only after all
+        // fallible process-state bookkeeping succeeds. A partial publication
+        // that returns an error remains discoverable by the authoritative
+        // `blocks` recheck below, which repairs this mirror before serving it.
+        self.published_blocks.insert(
+            key,
+            PublishedBlockLookup {
+                entry,
+                trusted_entry,
+            },
+        );
         Ok(TranslationResult {
             entry,
             generation: key.1,
@@ -3105,6 +3197,7 @@ impl ProcessState {
         }
         for stale in stale_blocks {
             self.blocks.remove(&stale);
+            self.published_blocks.remove(stale);
             probes::dsr_cache_event(
                 tid,
                 probes::DsrCacheEventKind::Invalidate,
@@ -3117,10 +3210,17 @@ impl ProcessState {
         if self.profiling {
             self.stats.add(ResolverStat::CacheLookups, 1);
         }
-        if let Some(entry) = self.blocks.get(&key) {
+        if let Some(entry) = self.blocks.get(&key).copied() {
             if self.profiling {
                 self.stats.add(ResolverStat::CacheLookupHits, 1);
             }
+            self.published_blocks.insert(
+                key,
+                PublishedBlockLookup {
+                    entry,
+                    trusted_entry: self.trusted_entries.get(&key).copied(),
+                },
+            );
             probes::dsr_cache_event(
                 tid,
                 probes::DsrCacheEventKind::BlockHit,
@@ -3129,7 +3229,7 @@ impl ProcessState {
                 u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
             );
             return Ok(TranslationResult {
-                entry: *entry,
+                entry,
                 generation,
                 outcome: TranslationOutcome::BlockIndexHit,
                 emitted_bytes: 0,
@@ -3726,6 +3826,7 @@ impl ProcessState {
     }
 
     fn clear_published(&mut self) {
+        self.published_blocks.clear();
         self.published.clear();
         self.private_published_index.clear();
     }
@@ -3894,41 +3995,33 @@ impl ThreadTranslator {
                 cache_used_bytes: self.last_cache_used_bytes,
             });
         }
-        {
-            // Scoped so the read guard is dropped before any write-path
-            // fallback tries to acquire the write lock (RwLock is not
-            // reentrant: read-then-write on the same thread would deadlock).
-            let state = probes::acquire_with_synchronization_reason(
-                probes::DsrSynchronizationKind::ProcessStateRead,
-                || self.process.state.read(),
+        if let Some(published) = self.process.published_blocks.get(guest, generation) {
+            self.block_cache.insert(guest, generation, published.entry);
+            probes::dsr_cache_event(
+                self.tid,
+                probes::DsrCacheEventKind::BlockHit,
+                guest.raw(),
+                generation.get(),
+                // The gauge is diagnostic only. Reading the exact bump-cache
+                // cursor would reintroduce the process-state lock this index
+                // exists to avoid, so retain the last value this thread saw
+                // on a write-path publication.
+                self.last_cache_used_bytes,
             );
-            if let Some(entry) = state.cached_block(guest, generation) {
-                let cache_used_bytes = u64::try_from(state.cache.used_bytes()).unwrap_or(u64::MAX);
-                drop(state);
-                self.last_cache_used_bytes = cache_used_bytes;
-                self.block_cache.insert(guest, generation, entry);
-                probes::dsr_cache_event(
-                    self.tid,
-                    probes::DsrCacheEventKind::BlockHit,
-                    guest.raw(),
-                    generation.get(),
-                    cache_used_bytes,
-                );
-                return Ok(TranslationResult {
-                    entry,
-                    generation,
-                    outcome: TranslationOutcome::BlockIndexHit,
-                    emitted_bytes: 0,
-                    cache_used_bytes,
-                });
-            }
+            return Ok(TranslationResult {
+                entry: published.entry,
+                generation,
+                outcome: TranslationOutcome::BlockIndexHit,
+                emitted_bytes: 0,
+                cache_used_bytes: self.last_cache_used_bytes,
+            });
         }
-        // Miss under the read guard: fall through to the exclusive write
-        // path. `ProcessState::translate` re-checks `blocks.get` itself as
-        // its very first lookup (after a no-op `invalidate_page` when the
-        // page hasn't changed), so a block another thread inserted in the
-        // read-drop-to-write-acquire gap is found there -- no duplicate
-        // translation -- and a genuine miss is translated exactly as before.
+        // A process-index miss falls through to the exclusive write path.
+        // `ProcessState::translate` re-checks `blocks.get` itself as its very
+        // first lookup (after a no-op `invalidate_page` when the page hasn't
+        // changed), so a block another thread inserted in the index-to-write
+        // gap is found there -- no duplicate translation -- and a genuine
+        // miss is translated exactly as before.
         let mut state = probes::acquire_with_synchronization_reason(
             probes::DsrSynchronizationKind::ProcessStateWrite,
             || self.process.state.write(),
@@ -4008,9 +4101,9 @@ impl ThreadTranslator {
     ///   entry) keeps flavor 0: the guarded entry plus a
     ///   `TargetCacheAuthority` the emitted slow path installs.
     ///
-    /// Callable only after `translate()` returned — that call takes and
-    /// RELEASES the process-state write lock internally, so the short read
-    /// lock here cannot deadlock.
+    /// Callable only after `translate()` returned — publication into the
+    /// independently synchronized block index happens before that call
+    /// returns, so no process-state lock is needed here.
     fn publish_indirect_target(
         &mut self,
         memory: &NativeMappedMemory,
@@ -4020,11 +4113,10 @@ impl ThreadTranslator {
         if self.process.private_target_authority.owns(translated.entry) {
             let trusted = self
                 .process
-                .state
-                .read()
-                .trusted_entries
-                .get(&(target, translated.generation))
-                .copied();
+                .published_blocks
+                .get(target, translated.generation)
+                .filter(|published| published.entry == translated.entry)
+                .and_then(|published| published.trusted_entry);
             if let Some(offset) = trusted {
                 // The same atomic the target's emitted guard materializes:
                 // the page-generation cell `memory.dsr_generation_observation`
@@ -5614,6 +5706,27 @@ mod tests {
     }
 
     #[test]
+    fn warm_process_lookup_does_not_take_the_translation_state_lock() {
+        let source = include_str!("translator.rs");
+        let body = source
+            .split_once("    fn translate_read_mostly(\n")
+            .expect("read-mostly translation function")
+            .1
+            .split_once("    fn translate<const PROFILE: bool>(\n")
+            .expect("read-mostly translation function end")
+            .0;
+
+        assert!(
+            body.contains("self.process.published_blocks.get(guest, generation)"),
+            "warm process hits must use the independently synchronized published-block index"
+        );
+        assert!(
+            !body.contains("self.process.state.read()"),
+            "a translating writer must not force warm process hits into psynch_cvwait"
+        );
+    }
+
+    #[test]
     fn cache_host_range_matches_configured_executable_capacity() {
         let translator =
             ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
@@ -6210,6 +6323,17 @@ mod tests {
                 "the installed block registers the SAME trusted entry native \
                  emission exposes — patched links will land past the guard"
             );
+            let published = installed
+                .translator
+                .published_blocks
+                .get(key.0, key.1)
+                .expect("installed block is visible in the warm-reader index");
+            assert_eq!(published.entry, entry);
+            assert_eq!(
+                published.trusted_entry.map(|offset| offset.get()),
+                Some(trusted.offset),
+                "the warm-reader index must mirror trusted-entry authority"
+            );
             let installed_words = read_words(entry, native_words.len() * 4);
             assert_eq!(
                 installed_words, native_words,
@@ -6315,6 +6439,7 @@ mod tests {
                 fixture.translator.state.read().blocks.is_empty(),
                 "no block may publish from a refused unit"
             );
+            assert!(fixture.translator.published_blocks.is_empty());
             let second = lookup(&fixture, &memory, BLOCK_A).expect("second lookup");
             assert_eq!(second, None, "a detached unit must not retry replay");
             assert_eq!(
@@ -6348,6 +6473,7 @@ mod tests {
                 "a block recorded at INITIAL must not publish on a regenerated page"
             );
             assert!(state.trusted_entries.is_empty());
+            assert!(installed.translator.published_blocks.is_empty());
         }
 
         #[test]
