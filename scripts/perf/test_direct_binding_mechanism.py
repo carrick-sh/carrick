@@ -59,7 +59,7 @@ def nativeperf_lines(
         "optimistic_decode_discard_ns=17|cache_lookups=1|"
         "cache_lookup_hits=0|invalidated_blocks=0",
         prefix
-        + "resolver-times|nested_translation_ns=3|nested_translation_decode_ns=1|"
+        + "resolver-times|nested_translation_ns=3|nested_translation_decode_ns=18|"
         "nested_translation_plan_ns=1|nested_translation_emit_ns=1|"
         "nested_translation_publication_ns=0",
         prefix + "cache-gauge|cache_used_bytes=64|cache_capacity_bytes=4096",

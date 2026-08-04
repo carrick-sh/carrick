@@ -589,7 +589,17 @@ FRAME_NAMES = (
 )
 
 
-def nativeperf_frames(pid=10, tid=11, era=12):
+def nativeperf_frames(
+    pid=10,
+    tid=11,
+    era=12,
+    *,
+    translation_ns=3,
+    decode_ns=18,
+    discard_ns=17,
+    plan_ns=1,
+    emit_ns=1,
+):
     prefix = f"NATIVEPERF1|thread|complete=1|pid={pid}|tid={tid}|era={era}|frame="
     return [
         prefix + "core|gateway_entries=2|reconciled_exits=2|overflowed=0",
@@ -616,11 +626,12 @@ def nativeperf_frames(pid=10, tid=11, era=12):
         "one_entry_hits=0|gateway_entries=2|syscall_exits=1|direct_resolver_exits=1",
         prefix
         + "resolver-process|translations=1|optimistic_decode_discards=2|"
-        "optimistic_decode_discard_ns=17|cache_lookups=1|"
+        f"optimistic_decode_discard_ns={discard_ns}|cache_lookups=1|"
         "cache_lookup_hits=0|invalidated_blocks=0",
         prefix
-        + "resolver-times|nested_translation_ns=3|nested_translation_decode_ns=1|"
-        "nested_translation_plan_ns=1|nested_translation_emit_ns=1|"
+        + f"resolver-times|nested_translation_ns={translation_ns}|"
+        f"nested_translation_decode_ns={decode_ns}|"
+        f"nested_translation_plan_ns={plan_ns}|nested_translation_emit_ns={emit_ns}|"
         "nested_translation_publication_ns=0",
         prefix + "cache-gauge|cache_used_bytes=64|cache_capacity_bytes=4096",
     ]
@@ -770,6 +781,53 @@ def nativeperf_frames_v3_with_exclusive(
 
 
 class NativePerfTests(unittest.TestCase):
+    def test_profile_accepts_winner_bound_after_subtracting_optimistic_discard_decode(self):
+        profile = budget.parse_nativeperf(
+            nativeperf_frames(
+                translation_ns=3,
+                decode_ns=18,
+                discard_ns=17,
+                plan_ns=1,
+                emit_ns=1,
+            )
+        )
+
+        budget.validate_profile(profile)
+
+    def test_profile_rejects_optimistic_discard_time_above_total_decode(self):
+        profile = budget.parse_nativeperf(
+            nativeperf_frames(
+                translation_ns=20,
+                decode_ns=1,
+                discard_ns=19,
+                plan_ns=1,
+                emit_ns=1,
+            )
+        )
+
+        with self.assertRaisesRegex(
+            budget.BudgetError,
+            "optimistic decode discard time exceeds total decode",
+        ):
+            budget.validate_profile(profile)
+
+    def test_profile_still_rejects_unexplained_active_subphase_excess(self):
+        profile = budget.parse_nativeperf(
+            nativeperf_frames(
+                translation_ns=3,
+                decode_ns=4,
+                discard_ns=0,
+                plan_ns=1,
+                emit_ns=1,
+            )
+        )
+
+        with self.assertRaisesRegex(
+            budget.BudgetError,
+            "nested translation subphases exceed total",
+        ):
+            budget.validate_profile(profile)
+
     def test_profile_requires_complete_unique_nine_frame_groups(self):
         profile = budget.parse_nativeperf(nativeperf_frames())
         budget.validate_profile(profile)
