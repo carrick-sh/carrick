@@ -270,6 +270,10 @@ pub use carrick_dsr_x86::{X86DsrProfilerLayout, x86_dsr_profiler_layout};
 // every host, and reading a census captured on a Darwin/aarch64 rig is a
 // perfectly reasonable thing to do elsewhere.
 pub use carrick_dsr_aarch64::translator::xlat_census;
+// Allocation-owner census records are rendered by the AArch64 translator-side
+// diagnostic and parsed by the portable CLI. Re-export the single typed wire
+// authority so the CLI does not acquire a direct guest-ISA dependency.
+pub use carrick_dsr_aarch64::alloc_owner_wire;
 // The guest-virtual address domain the census records are keyed on. Exported
 // beside `xlat_census` so an out-of-crate aggregator keys its sets on the typed
 // address instead of degrading them to `u64` at the crate boundary.
