@@ -55,8 +55,9 @@ def nativeperf_lines(
         f"one_entry_hits=0|gateway_entries={gateway}|syscall_exits={syscall}|"
         f"direct_resolver_exits={direct}",
         prefix
-        + "resolver-process|translations=1|duplicate_publications=0|"
-        "cache_lookups=1|cache_lookup_hits=0|invalidated_blocks=0",
+        + "resolver-process|translations=1|optimistic_decode_discards=2|"
+        "optimistic_decode_discard_ns=17|cache_lookups=1|"
+        "cache_lookup_hits=0|invalidated_blocks=0",
         prefix
         + "resolver-times|nested_translation_ns=3|nested_translation_decode_ns=1|"
         "nested_translation_plan_ns=1|nested_translation_emit_ns=1|"
@@ -439,14 +440,15 @@ class DirectBindingMechanismTest(unittest.TestCase):
             ],
         )
 
-    def test_profile_script_allows_natural_unbounded_completion(self):
+    def test_profile_script_preserves_natural_exit_and_bounded_fallback(self):
         script = (
             pathlib.Path(__file__).resolve().parents[2]
             / "scripts/dtrace/dsr-indirect.d"
         ).read_text()
 
-        self.assertNotIn("bounded = 1", script)
-        self.assertNotRegex(script, r"(?m)^tick-[0-9]+s$")
+        self.assertIn("tracked[pid] = 0;\n    active = 0;\n    exit(0);", script)
+        self.assertIn("bounded = 1;\n    exit(0);", script)
+        self.assertRegex(script, r"(?m)^tick-1s\n/secs >= 60/$")
 
     def test_capture_environment_rejects_every_foreign_ambient_control(self):
         for value in ("1", ""):

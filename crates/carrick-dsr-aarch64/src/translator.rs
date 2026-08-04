@@ -1156,7 +1156,8 @@ pub struct ResolverStats {
     pub resolver_exits: u64,
     pub one_entry_hits: u64,
     pub translations: u64,
-    pub duplicate_publications: u64,
+    pub optimistic_decode_discards: u64,
+    pub optimistic_decode_discard_ns: u64,
     pub gateway_entries: u64,
     pub syscall_exits: u64,
     pub direct_resolver_exits: u64,
@@ -1200,7 +1201,8 @@ pub enum ResolverStat {
     ResolverExits,
     OneEntryHits,
     Translations,
-    DuplicatePublications,
+    OptimisticDecodeDiscards,
+    OptimisticDecodeDiscardNs,
     GatewayEntries,
     SyscallExits,
     DirectResolverExits,
@@ -1236,11 +1238,12 @@ pub enum ResolverStat {
 }
 
 impl ResolverStat {
-    const ALL: [Self; 32] = [
+    const ALL: [Self; 33] = [
         Self::ResolverExits,
         Self::OneEntryHits,
         Self::Translations,
-        Self::DuplicatePublications,
+        Self::OptimisticDecodeDiscards,
+        Self::OptimisticDecodeDiscardNs,
         Self::GatewayEntries,
         Self::SyscallExits,
         Self::DirectResolverExits,
@@ -1276,7 +1279,8 @@ impl ResolverStat {
             Self::ResolverExits => "resolver_exits",
             Self::OneEntryHits => "one_entry_hits",
             Self::Translations => "translations",
-            Self::DuplicatePublications => "duplicate_publications",
+            Self::OptimisticDecodeDiscards => "optimistic_decode_discards",
+            Self::OptimisticDecodeDiscardNs => "optimistic_decode_discard_ns",
             Self::GatewayEntries => "gateway_entries",
             Self::SyscallExits => "syscall_exits",
             Self::DirectResolverExits => "direct_resolver_exits",
@@ -1315,7 +1319,8 @@ impl ResolverStats {
             ResolverStat::ResolverExits => self.resolver_exits,
             ResolverStat::OneEntryHits => self.one_entry_hits,
             ResolverStat::Translations => self.translations,
-            ResolverStat::DuplicatePublications => self.duplicate_publications,
+            ResolverStat::OptimisticDecodeDiscards => self.optimistic_decode_discards,
+            ResolverStat::OptimisticDecodeDiscardNs => self.optimistic_decode_discard_ns,
             ResolverStat::GatewayEntries => self.gateway_entries,
             ResolverStat::SyscallExits => self.syscall_exits,
             ResolverStat::DirectResolverExits => self.direct_resolver_exits,
@@ -1352,7 +1357,8 @@ impl ResolverStats {
             ResolverStat::ResolverExits => self.resolver_exits = value,
             ResolverStat::OneEntryHits => self.one_entry_hits = value,
             ResolverStat::Translations => self.translations = value,
-            ResolverStat::DuplicatePublications => self.duplicate_publications = value,
+            ResolverStat::OptimisticDecodeDiscards => self.optimistic_decode_discards = value,
+            ResolverStat::OptimisticDecodeDiscardNs => self.optimistic_decode_discard_ns = value,
             ResolverStat::GatewayEntries => self.gateway_entries = value,
             ResolverStat::SyscallExits => self.syscall_exits = value,
             ResolverStat::DirectResolverExits => self.direct_resolver_exits = value,
@@ -1813,7 +1819,8 @@ impl ThreadTranslator {
             resolver_exits: self.stats.resolver_exits,
             one_entry_hits: self.stats.one_entry_hits,
             translations: process.stats.translations,
-            duplicate_publications: process.stats.duplicate_publications,
+            optimistic_decode_discards: process.stats.optimistic_decode_discards,
+            optimistic_decode_discard_ns: process.stats.optimistic_decode_discard_ns,
             gateway_entries: self.stats.gateway_entries,
             syscall_exits: self.stats.syscall_exits,
             direct_resolver_exits: self.stats.direct_resolver_exits,
@@ -1861,8 +1868,9 @@ impl ThreadTranslator {
 
     /// Claim this process epoch's OUTSTANDING process-wide resolver delta for
     /// the calling thread's record. The process-wide counters (translations,
-    /// cache lookups/hits, invalidated blocks, translation_*_ns, duplicate
-    /// publications) are SHARED by every thread of the process, so they are
+    /// cache lookups/hits, invalidated blocks, translation_*_ns, optimistic
+    /// decode discard counters) are SHARED by every thread of the process, so
+    /// they are
     /// published as a delta against a single `reported_stats` checkpoint that
     /// this call advances: whatever accrued since the last claim is assigned
     /// to exactly ONE record, and the next claimer starts from the new
@@ -1880,7 +1888,8 @@ impl ThreadTranslator {
             resolver_exits: self.stats.resolver_exits,
             one_entry_hits: self.stats.one_entry_hits,
             translations: delta.translations,
-            duplicate_publications: delta.duplicate_publications,
+            optimistic_decode_discards: delta.optimistic_decode_discards,
+            optimistic_decode_discard_ns: delta.optimistic_decode_discard_ns,
             gateway_entries: self.stats.gateway_entries,
             syscall_exits: self.stats.syscall_exits,
             direct_resolver_exits: self.stats.direct_resolver_exits,
@@ -1930,8 +1939,9 @@ impl ThreadTranslator {
     ///
     /// Deliberately does NOT claim the process-wide delta: every field that is
     /// a delta against the shared `reported_stats` checkpoint
-    /// (`translations`, `duplicate_publications`, `cache_lookups`,
-    /// `cache_lookup_hits`, `invalidated_blocks`, `translation_*_ns`) is
+    /// (`translations`, `optimistic_decode_discards`,
+    /// `optimistic_decode_discard_ns`, `cache_lookups`, `cache_lookup_hits`,
+    /// `invalidated_blocks`, `translation_*_ns`) is
     /// reported as ZERO here, BY CONSTRUCTION, and the checkpoint is left
     /// untouched.
     ///
@@ -1981,7 +1991,8 @@ impl ThreadTranslator {
             // Process-wide deltas: owned by the draining thread's own record
             // (see the doc comment above); structurally zero here.
             translations: 0,
-            duplicate_publications: 0,
+            optimistic_decode_discards: 0,
+            optimistic_decode_discard_ns: 0,
             cache_lookups: 0,
             cache_lookup_hits: 0,
             invalidated_blocks: 0,
@@ -4186,7 +4197,8 @@ impl ThreadTranslator {
             resolver_exits: self.stats.resolver_exits,
             one_entry_hits: self.stats.one_entry_hits,
             translations: process.translations,
-            duplicate_publications: process.duplicate_publications,
+            optimistic_decode_discards: process.optimistic_decode_discards,
+            optimistic_decode_discard_ns: process.optimistic_decode_discard_ns,
             gateway_entries: self.stats.gateway_entries,
             syscall_exits: self.stats.syscall_exits,
             direct_resolver_exits: self.stats.direct_resolver_exits,
