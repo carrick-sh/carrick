@@ -180,7 +180,7 @@ impl SnapshotSet {
             if code.len() % 4 != 0 {
                 bail!("snapshot {} length is not word-aligned", bin_path.display());
             }
-            if metadata.cache_base % 4 != 0 {
+            if !metadata.cache_base.is_multiple_of(4) {
                 bail!(
                     "snapshot {} cache base is not word-aligned",
                     bin_path.display()
@@ -373,6 +373,8 @@ mod tests {
 
     use super::{ResolutionOrigin, SnapshotSet};
 
+    type FixtureMutation = Box<dyn Fn(&SnapshotFixture)>;
+
     struct SnapshotFixture {
         directory: tempfile::TempDir,
     }
@@ -555,7 +557,7 @@ mod tests {
 
     #[test]
     fn snapshot_loader_rejects_bad_v4_metadata_and_payloads() {
-        let cases: [(&str, Box<dyn Fn(&SnapshotFixture)>); 6] = [
+        let cases: [(&str, FixtureMutation); 6] = [
             (
                 "wrong schema",
                 Box::new(|fixture| {
@@ -615,7 +617,7 @@ mod tests {
 
     #[test]
     fn snapshot_loader_rejects_invalid_address_and_block_ranges() {
-        let cases: [(&str, Box<dyn Fn(&SnapshotFixture)>); 5] = [
+        let cases: [(&str, FixtureMutation); 5] = [
             (
                 "unaligned cache base",
                 Box::new(|fixture| {
