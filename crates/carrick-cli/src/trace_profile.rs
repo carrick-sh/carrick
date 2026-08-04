@@ -3852,7 +3852,8 @@ mod tests {
             "pending_forks=%d",
             "NFAULT2|memory-intent|",
             "NFAULT2|fault-event|outcome=zfod|",
-            "NFAULT2|memory-census|",
+            "NFAULT2|memory-count|",
+            "NFAULT2|memory-intent-abort|",
             "carrick*:::syscall-entry",
             "carrick*:::syscall-return",
         ] {

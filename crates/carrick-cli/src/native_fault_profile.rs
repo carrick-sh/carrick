@@ -113,6 +113,7 @@ struct MemoryIntentRecord {
     args: [u64; 6],
     retval: i64,
     errno: u32,
+    completed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -218,6 +219,8 @@ pub(crate) struct NativeMemoryCensus {
     exported_zfod: u64,
     unexported_zfod: u64,
     intent_records: u64,
+    completed_intents: u64,
+    aborted_intents: u64,
     active_memory_faults: u64,
     guest_arena_faults: u64,
 }
@@ -386,9 +389,11 @@ struct NativeFaultValidator {
     fault_events: u64,
     active_memory_faults: u64,
     guest_arena_faults: u64,
-    memory_census: Option<(u64, u64, u64, u64, u64, u64)>,
+    memory_counts: BTreeMap<String, u64>,
     memory_intent_records: Vec<MemoryIntentRecord>,
     memory_fault_events: Vec<MemoryFaultEvent>,
+    completed_memory_intents: u64,
+    aborted_memory_intents: u64,
 }
 
 impl NativeFaultValidator {
@@ -778,7 +783,7 @@ impl NativeFaultValidator {
         Ok(())
     }
 
-    fn add_memory_intent(&mut self, record: &RawRecord) -> Result<()> {
+    fn add_memory_intent(&mut self, record: &RawRecord, completed: bool) -> Result<()> {
         let key = image_from(record, "pid", "start_sec", "start_usec", "image")?;
         self.require_birth(key.birth, "memory-intent")?;
         let state = active_state(&mut self.states, key.birth, "memory-intent")?;
@@ -803,7 +808,12 @@ impl NativeFaultValidator {
             bail!("unknown memory-intent syscall number {number}");
         }
         let entry_ns = nonzero(record.number("entry_ns")?, "memory-intent entry_ns")?;
-        let return_ns = nonzero(record.number("return_ns")?, "memory-intent return_ns")?;
+        let end_field = if completed {
+            "return_ns"
+        } else {
+            "terminal_ns"
+        };
+        let return_ns = nonzero(record.number(end_field)?, "memory-intent end timestamp")?;
         if return_ns < entry_ns {
             bail!("memory-intent return precedes entry");
         }
@@ -815,10 +825,19 @@ impl NativeFaultValidator {
             record.number("arg4")?,
             record.number("arg5")?,
         ];
-        let retval = record.signed_number("retval")?;
-        let errno = record.number("errno")?;
-        let Ok(errno) = u32::try_from(errno) else {
-            bail!("memory-intent errno exceeds i32");
+        let (retval, errno) = if completed {
+            let retval = record.signed_number("retval")?;
+            let errno = record.number("errno")?;
+            let Ok(errno) = u32::try_from(errno) else {
+                bail!("memory-intent errno exceeds u32");
+            };
+            (retval, errno)
+        } else {
+            match record.text("reason")? {
+                "thread-exit" | "process-exit" => {}
+                other => bail!("unknown memory-intent abort reason {other:?}"),
+            }
+            (-1, 0)
         };
         self.memory_intent_records.push(MemoryIntentRecord {
             key,
@@ -830,11 +849,20 @@ impl NativeFaultValidator {
             args,
             retval,
             errno,
+            completed,
         });
         self.memory_intents = self
             .memory_intents
             .checked_add(1)
             .ok_or_else(|| anyhow!("memory-intent record count overflow"))?;
+        let counter = if completed {
+            &mut self.completed_memory_intents
+        } else {
+            &mut self.aborted_memory_intents
+        };
+        *counter = counter
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("memory-intent outcome count overflow"))?;
         Ok(())
     }
 
@@ -896,17 +924,22 @@ impl NativeFaultValidator {
         Ok(())
     }
 
-    fn add_memory_census(&mut self, record: &RawRecord) -> Result<()> {
-        let values = (
-            record.number("total_zfod")?,
-            record.number("exported_zfod")?,
-            record.number("unexported_zfod")?,
-            record.number("intent_entries")?,
-            record.number("intent_returns")?,
-            record.number("inflight")?,
-        );
-        if self.memory_census.replace(values).is_some() {
-            bail!("duplicate memory-census record");
+    fn add_memory_count(&mut self, record: &RawRecord) -> Result<()> {
+        let kind = record.text("kind")?;
+        if !matches!(
+            kind,
+            "total-zfod"
+                | "exported-zfod"
+                | "unexported-zfod"
+                | "intent-entries"
+                | "intent-returns"
+                | "intent-aborts"
+        ) {
+            bail!("unknown memory-count kind {kind:?}");
+        }
+        let count = nonzero(record.number("count")?, "memory-count")?;
+        if self.memory_counts.insert(kind.to_owned(), count).is_some() {
+            bail!("duplicate memory-count record for {kind}");
         }
         Ok(())
     }
@@ -1169,7 +1202,31 @@ impl NativeFaultSummary {
                         ],
                         line_number,
                     )?;
-                    validator.add_memory_intent(&record)?;
+                    validator.add_memory_intent(&record, true)?;
+                }
+                "memory-intent-abort" => {
+                    record.require_fields(
+                        &[
+                            "pid",
+                            "start_sec",
+                            "start_usec",
+                            "image",
+                            "tid",
+                            "sequence",
+                            "number",
+                            "entry_ns",
+                            "terminal_ns",
+                            "arg0",
+                            "arg1",
+                            "arg2",
+                            "arg3",
+                            "arg4",
+                            "arg5",
+                            "reason",
+                        ],
+                        line_number,
+                    )?;
+                    validator.add_memory_intent(&record, false)?;
                 }
                 "fault-event" => {
                     record.require_fields(
@@ -1190,19 +1247,9 @@ impl NativeFaultSummary {
                     )?;
                     validator.add_fault_event(&record)?;
                 }
-                "memory-census" => {
-                    record.require_fields(
-                        &[
-                            "total_zfod",
-                            "exported_zfod",
-                            "unexported_zfod",
-                            "intent_entries",
-                            "intent_returns",
-                            "inflight",
-                        ],
-                        line_number,
-                    )?;
-                    validator.add_memory_census(&record)?;
+                "memory-count" => {
+                    record.require_fields(&["kind", "count"], line_number)?;
+                    validator.add_memory_count(&record)?;
                 }
                 "complete" => {
                     record.require_fields(
@@ -1251,24 +1298,37 @@ impl NativeFaultSummary {
         bind_prebirth_records(&mut validator)?;
         let reachable = reachable_births(target.birth, &validator.creates)?;
         validate_catalogs_and_exits(&validator, target, &reachable, completion)?;
-        let (total_zfod, exported_zfod, unexported_zfod, intent_entries, intent_returns, inflight) =
-            validator
-                .memory_census
-                .ok_or_else(|| anyhow!("native-fault stream has no memory-census record"))?;
-        if inflight != 0 {
-            bail!("memory census ended with {inflight} in-flight operation(s)");
-        }
+        let memory_count = |kind: &str| validator.memory_counts.get(kind).copied().unwrap_or(0);
+        let total_zfod = memory_count("total-zfod");
+        let exported_zfod = memory_count("exported-zfod");
+        let unexported_zfod = memory_count("unexported-zfod");
+        let intent_entries = memory_count("intent-entries");
+        let intent_returns = memory_count("intent-returns");
+        let intent_aborts = memory_count("intent-aborts");
         if intent_entries != validator.memory_intents {
             bail!(
                 "memory intent entry count {intent_entries} does not match {} exported records",
                 validator.memory_intents
             );
         }
-        if intent_returns != validator.memory_intents {
+        if intent_returns != validator.completed_memory_intents {
             bail!(
-                "memory intent return count {intent_returns} does not match {} exported records",
-                validator.memory_intents
+                "memory intent return count {intent_returns} does not match {} completed records",
+                validator.completed_memory_intents
             );
+        }
+        if intent_aborts != validator.aborted_memory_intents {
+            bail!(
+                "memory intent abort count {intent_aborts} does not match {} terminal records",
+                validator.aborted_memory_intents
+            );
+        }
+        if intent_entries
+            != intent_returns
+                .checked_add(intent_aborts)
+                .ok_or_else(|| anyhow!("memory intent closure count overflow"))?
+        {
+            bail!("memory intent entries do not reconcile returns plus terminal aborts");
         }
         if exported_zfod != validator.fault_events {
             bail!(
@@ -1296,6 +1356,8 @@ impl NativeFaultSummary {
             exported_zfod,
             unexported_zfod,
             intent_records: validator.memory_intents,
+            completed_intents: validator.completed_memory_intents,
+            aborted_intents: validator.aborted_memory_intents,
             active_memory_faults: validator.active_memory_faults,
             guest_arena_faults: validator.guest_arena_faults,
         };
@@ -2215,7 +2277,7 @@ fn summarize_memory_intent(
                     if !active.remove(&(intent.tid, intent.sequence)) {
                         bail!("memory intent timeline ended an inactive operation");
                     }
-                    if intent.errno != 0 || intent.retval < 0 {
+                    if !intent.completed || intent.errno != 0 || intent.retval < 0 {
                         continue;
                     }
                     let operation = memory_operation_name(intent.number)?;
@@ -2406,7 +2468,11 @@ mod tests {
 \nNFAULT2|total|outcome=zfod|pid=11|start_sec=101|start_usec=21|count=6\
 \nNFAULT2|total|outcome=cow_fault|pid=11|start_sec=101|start_usec=21|count=1\
 \nNFAULT2|rejected|outcome=zfod|pid=10|start_sec=100|start_usec=20|count=2\
-\nNFAULT2|memory-census|total_zfod=96|exported_zfod=1|unexported_zfod=95|intent_entries=1|intent_returns=1|inflight=0\
+\nNFAULT2|memory-count|kind=total-zfod|count=96\
+\nNFAULT2|memory-count|kind=exported-zfod|count=1\
+\nNFAULT2|memory-count|kind=unexported-zfod|count=95\
+\nNFAULT2|memory-count|kind=intent-entries|count=1\
+\nNFAULT2|memory-count|kind=intent-returns|count=1\
 \nNFAULT2|complete|profile=native-fault|bounded=0|timed_out=0|target_exit=1|target_exit_reason=1|identity_violations=0|lifecycle_violations=0|catalog_violations=0|probe_errors=0|live_at_end=0|pending_forks=0|elapsed_ns=9000000\n",
             authority().header_record()
         )
@@ -2448,6 +2514,8 @@ mod tests {
         assert_eq!(json["memory_census"]["exported_zfod"], 1);
         assert_eq!(json["memory_census"]["unexported_zfod"], 95);
         assert_eq!(json["memory_census"]["intent_records"], 1);
+        assert_eq!(json["memory_census"]["completed_intents"], 1);
+        assert_eq!(json["memory_census"]["aborted_intents"], 0);
         assert_eq!(json["memory_operations"][0]["operation"], "mmap");
         assert_eq!(json["memory_operations"][0]["shape"], "anon-private");
         assert_eq!(json["memory_operations"][0]["calls"], 1);
@@ -2483,14 +2551,17 @@ mod tests {
     #[test]
     fn rejects_unreconciled_memory_intent_export() {
         assert_rejected(
-            fixture().replace("exported_zfod=1", "exported_zfod=2"),
+            fixture().replace("kind=exported-zfod|count=1", "kind=exported-zfod|count=2"),
             "exported zfod",
         );
         assert_rejected(
-            fixture().replace("intent_returns=1", "intent_returns=2"),
+            fixture().replace("kind=intent-returns|count=1", "kind=intent-returns|count=2"),
             "intent return",
         );
-        assert_rejected(fixture().replace("inflight=0", "inflight=1"), "in-flight");
+        assert_rejected(
+            fixture().replace("kind=intent-entries|count=1", "kind=intent-entries|count=2"),
+            "entry count",
+        );
     }
 
     #[test]
@@ -2515,6 +2586,30 @@ mod tests {
             active.replace("timestamp_ns=150", "timestamp_ns=250"),
             "outside its memory intent",
         );
+    }
+
+    #[test]
+    fn closes_a_terminal_memory_operation_without_mutating_mapping_state() {
+        let aborted = fixture()
+            .replace(
+                "NFAULT2|memory-intent|pid=10|start_sec=100|start_usec=20|image=1|tid=10|sequence=1|number=222|entry_ns=100|return_ns=200|arg0=0|arg1=16384|arg2=3|arg3=34|arg4=18446744073709551615|arg5=0|retval=65536|errno=0",
+                "NFAULT2|memory-intent-abort|pid=10|start_sec=100|start_usec=20|image=1|tid=10|sequence=1|number=222|entry_ns=100|terminal_ns=200|arg0=0|arg1=16384|arg2=3|arg3=34|arg4=18446744073709551615|arg5=0|reason=process-exit",
+            )
+            .replace(
+                "kind=intent-returns|count=1",
+                "kind=intent-aborts|count=1",
+            );
+        let summary = parse(&aborted).expect("terminal operation closes exactly");
+        let json = serde_json::to_value(&summary).expect("serialize terminal summary");
+        assert_eq!(json["memory_census"]["completed_intents"], 0);
+        assert_eq!(json["memory_census"]["aborted_intents"], 1);
+        let subsequent = json["memory_faults"]
+            .as_array()
+            .expect("memory fault rows")
+            .iter()
+            .find(|row| row["phase"] == "subsequent-touch")
+            .expect("post-terminal fault row");
+        assert_eq!(subsequent["semantic_sequence"], "initial-exec-brk-or-fork");
     }
 
     #[test]
@@ -2565,9 +2660,10 @@ mod tests {
                     "outcome=zfod|pid=10|start_sec=100|start_usec=20|count=10",
                     "outcome=zfod|pid=10|start_sec=100|start_usec=20|count=4",
                 )
+                .replace("kind=total-zfod|count=96", "kind=total-zfod|count=90")
                 .replace(
-                    "total_zfod=96|exported_zfod=1|unexported_zfod=95",
-                    "total_zfod=90|exported_zfod=1|unexported_zfod=89",
+                    "kind=unexported-zfod|count=95",
+                    "kind=unexported-zfod|count=89",
                 ),
             "exceed",
         );
@@ -2647,8 +2743,12 @@ mod tests {
             "NFAULT2|prebirth-page|outcome=zfod|fork_id=41|page=0x10000|count=2\nNFAULT2|prebirth-total|outcome=zfod|fork_id=41|count=2",
         )
         .replace(
-            "total_zfod=96|exported_zfod=1|unexported_zfod=95",
-            "total_zfod=98|exported_zfod=1|unexported_zfod=97",
+            "kind=total-zfod|count=96",
+            "kind=total-zfod|count=98",
+        )
+        .replace(
+            "kind=unexported-zfod|count=95",
+            "kind=unexported-zfod|count=97",
         );
         let summary = parse(&raw).expect("prebirth records bind to child");
         assert_eq!(summary.exact_total("zfod"), Some(18));
