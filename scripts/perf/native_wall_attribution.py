@@ -56,6 +56,10 @@ CPU_CATEGORIES = (
     "other-carrick",
     "unresolved",
 )
+KERNEL_CLASSES = (
+    "kernel-named-syscall",
+    "kernel-non-syscall",
+)
 CATEGORY_RULES = (
     ("translation", ("carrick_dsr_aarch64", "dynasm", "translate", "emit")),
     (
@@ -473,11 +477,16 @@ def summarize(profile: Profile, binary: pathlib.Path) -> dict[str, object]:
     host_symbols = _host_symbols(binary, host_ranges, host_addresses)
 
     cpu_counts = Counter({category: 0 for category in CPU_CATEGORIES})
+    kernel_counts = Counter({category: 0 for category in KERNEL_CLASSES})
     darwin_user_images: Counter[str] = Counter()
     for row in cpu_rows:
         samples = _exact_count(row)
         if row.phase == "cpu-kernel-pc":
             cpu_counts["darwin-kernel"] += samples
+            if row.kind not in KERNEL_CLASSES:
+                failures.append(f"unknown kernel class {row.kind!r}")
+            else:
+                kernel_counts[row.kind] += samples
             continue
         if row.pid is None or row.source_pc is None:
             cpu_counts["unresolved"] += samples
@@ -614,6 +623,10 @@ def summarize(profile: Profile, binary: pathlib.Path) -> dict[str, object]:
                 }
                 for path, samples in darwin_user_images.most_common()
             ],
+            "kernel-classes": {
+                category: _metric_bucket(kernel_counts[category], total_cpu_samples)
+                for category in KERNEL_CLASSES
+            },
         },
         "offcpu": {
             "voluntary_ns": voluntary_ns,
@@ -669,10 +682,24 @@ def compare(a: dict[str, object], b: dict[str, object]) -> dict[str, object]:
             failures.append(
                 f"{category} moved {delta * 100:.2f} percentage points"
             )
+    kernel_deltas: dict[str, float] = {}
+    kernel_a = cpu_a["kernel-classes"]
+    kernel_b = cpu_b["kernel-classes"]
+    assert isinstance(kernel_a, dict) and isinstance(kernel_b, dict)
+    for category in KERNEL_CLASSES:
+        share_a = float(kernel_a[category]["share"])
+        share_b = float(kernel_b[category]["share"])
+        delta = abs(share_a - share_b)
+        kernel_deltas[category] = delta
+        if max(share_a, share_b) >= 0.10 and delta > MAX_CATEGORY_DELTA:
+            failures.append(
+                f"{category} moved {delta * 100:.2f} percentage points"
+            )
     return {
         "accepted": not failures,
         "dominant_category": dominant_a if dominant_a == dominant_b else None,
         "category_absolute_deltas": deltas,
+        "kernel_class_absolute_deltas": kernel_deltas,
         "failures": failures,
     }
 
