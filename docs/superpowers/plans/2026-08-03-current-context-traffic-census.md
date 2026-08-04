@@ -55,14 +55,14 @@ native-Darwin code-snapshot export.
   `code_len`, `code_sha256`, and `blocks`; the adjacent `.bin` is the exact
   hashed payload.
 
-- [ ] **Step 1: Write the failing snapshot contract test**
+- [x] **Step 1: Write the failing snapshot contract test**
 
 Add a helper-level test which serializes a two-word snapshot and asserts the
 metadata names schema `carrick.code-snapshot.v4`, length `8`, and the SHA-256 of
 the exact little-endian bytes. Keep this below the snapshot helper rather than
 forking a guest in a unit test.
 
-- [ ] **Step 2: Run the focused test and verify red**
+- [x] **Step 2: Run the focused test and verify red**
 
 Run:
 
@@ -72,7 +72,7 @@ RUST_TEST_THREADS=1 cargo test -p carrick-runtime native_darwin::tests::code_sna
 
 Expected: FAIL because the existing JSON has no schema or digest.
 
-- [ ] **Step 3: Extract and use an authenticated metadata builder**
+- [x] **Step 3: Extract and use an authenticated metadata builder**
 
 Add this private serialized shape in `native_darwin.rs`:
 
@@ -93,7 +93,7 @@ Build it from `CodeSnapshot`, with
 existing `.bin`-then-`.json` publication order. The export remains best-effort
 and opt-in exactly as today.
 
-- [ ] **Step 4: Run focused runtime tests and commit**
+- [x] **Step 4: Run focused runtime tests and commit**
 
 Run:
 
@@ -129,14 +129,14 @@ struct ForkLink { parent: u32, child: u32 }
 struct Snapshot { pid: u32, base: u64, code: Vec<u8>, blocks: Vec<(u64, u64)> }
 ```
 
-- [ ] **Step 1: Write red parser-validity tests**
+- [x] **Step 1: Write red parser-validity tests**
 
 Construct in-memory `SHAPE1` fixtures and assert rejection of: no completion,
 `bounded=1`, `target_completed=0`, nonzero `copyin-errors`, duplicate completion,
 duplicate parent for one child, truncated PC rows, and the printed total not
 equal to `jit + non-jit`. Add one green fixture with a fork row and two PC rows.
 
-- [ ] **Step 2: Run the module test target and verify red**
+- [x] **Step 2: Run the module test target and verify red**
 
 Run:
 
@@ -146,7 +146,7 @@ cargo test -p carrick-cli debug_jit_shape -- --nocapture
 
 Expected: compile FAIL because `debug_jit_shape` is not implemented.
 
-- [ ] **Step 3: Implement the strict `SHAPE1` parser**
+- [x] **Step 3: Implement the strict `SHAPE1` parser**
 
 Accept only these records from the existing D program:
 
@@ -163,7 +163,7 @@ SHAPE1|complete|bounded=0|target_completed=1|target_exit_reason=1
 Ignore other non-protocol DTrace text, but require exactly one copyin, total,
 each region, and complete record. Use checked addition for every aggregation.
 
-- [ ] **Step 4: Write red snapshot authentication and ancestry tests**
+- [x] **Step 4: Write red snapshot authentication and ancestry tests**
 
 Use `tempfile::TempDir` to build v4 JSON/`.bin` pairs. Assert rejection of a
 missing `.bin`, wrong schema, length mismatch, hash mismatch, duplicate
@@ -172,7 +172,7 @@ own/ancestor ranges, and a child PC resolving in two ancestors. Assert success
 when the child's own snapshot exists and exactly one recorded ancestor resolves
 the inherited PC.
 
-- [ ] **Step 5: Implement snapshot loading and unique resolution**
+- [x] **Step 5: Implement snapshot loading and unique resolution**
 
 Verify every JSON and byte payload before indexing it. Resolve against exactly
 one own range first. Only if none matches, walk the acyclic fork parent chain;
@@ -180,7 +180,7 @@ require the child to have an authenticated snapshot and accept exactly one
 ancestor candidate across the entire chain. Report own and inherited sample
 counts separately.
 
-- [ ] **Step 6: Run focused tests and commit**
+- [x] **Step 6: Run focused tests and commit**
 
 Run:
 
@@ -217,7 +217,7 @@ carrick debug jit-shape-census TRACE --snapshots DIR --jit-share-of-total 0.4650
   hashes, coverage, instruction families, exact context rows, and shares of
   matched-JIT and projected total CPU.
 
-- [ ] **Step 1: Write red AArch64 decode tests**
+- [x] **Step 1: Write red AArch64 decode tests**
 
 Pin these exact words and expected rows:
 
@@ -234,7 +234,7 @@ enter the 64-bit context table. Decode `slot = imm12 * 8`, `register = Rt`, and
 direction from the opcode; never infer a semantic name from the physical
 register alone.
 
-- [ ] **Step 2: Implement family and semantic-row aggregation**
+- [x] **Step 2: Implement family and semantic-row aggregation**
 
 Classify at least the existing durable families (`ctx-load64`, `ctx-store64`,
 `ctx-load32`, `ctx-store32`, `ctx-pair`, `guard-ldar`, `nzcv-mrs`, `nzcv-msr`,
@@ -264,21 +264,21 @@ The report must print every row, not only a top-N list. Each row carries
 `samples`, `share_of_matched_jit`, and
 `projected_share_of_total_cpu = share_of_matched_jit * jit_share_of_total`.
 
-- [ ] **Step 3: Wire the portable debug subcommand**
+- [x] **Step 3: Wire the portable debug subcommand**
 
 Add `DebugCommand::JitShapeCensus { trace, snapshots,
 jit_share_of_total }`, dispatch it on macOS and non-macOS builds like the two
 existing text-only census commands, and declare the module unconditionally in
 `main.rs`. Reject NaN, infinity, zero, and values above one.
 
-- [ ] **Step 4: Add a full-report fixture test**
+- [x] **Step 4: Add a full-report fixture test**
 
 Use two snapshots and one inherited sample. Assert exact input digest,
 snapshot-manifest digest, own/inherited counts, zero missing counts, exact slot
 rows, matched-JIT denominator, and the projected share multiplication. Mutate
 one byte of one `.bin` and prove the command fails before printing JSON.
 
-- [ ] **Step 5: Run focused and CLI gates, then commit**
+- [x] **Step 5: Run focused and CLI gates, then commit**
 
 Run:
 
@@ -313,7 +313,7 @@ git commit -m "feat(debug): census exact JIT context traffic"
 - Produces: two complete `carrick.jit-shape-census.v1` reports and a source map
   from each material row to its emitter/recovery contract.
 
-- [ ] **Step 1: Run full source validation and build/sign**
+- [x] **Step 1: Run full source validation and build/sign**
 
 Run:
 
@@ -328,7 +328,7 @@ Record clean source SHA, executable SHA-256, UUID, signature, DOF, D-program
 SHA-256, image digest/architecture, store identity, power/thermal metadata, and
 zero scoped survivors.
 
-- [ ] **Step 2: Run two naturally completed shape captures**
+- [x] **Step 2: Run two naturally completed shape captures**
 
 For A and B independently: create a new empty store, warm it once untraced,
 then trace the canonical cold-`GOCACHE` build with the same store and a new
@@ -337,7 +337,7 @@ naturally. Require exactly one `BUILD_OK`, one positive `WORKLOAD_NS`, status
 zero, `copyin-errors=0`, `bounded=0`, `target_completed=1`, and zero scoped
 survivors. Never cite the traced wall time.
 
-- [ ] **Step 3: Run the Rust census and source-audit every material row**
+- [x] **Step 3: Run the Rust census and source-audit every material row**
 
 Run for each capture:
 
@@ -352,7 +352,7 @@ Bind each report and raw stream by SHA-256. Audit rows against `emit.rs`,
 `1128/x17` mixes exit/entry and internal-edge guest-x17 authority, and
 `1160/x15` is indirect-exit recovery.
 
-- [ ] **Step 4: Apply the opportunity gate**
+- [x] **Step 4: Apply the opportunity gate**
 
 Require the same source-backed, non-overlapping mechanism to project at least
 10% of total CPU in both captures. A proposed physical-register residency
@@ -361,7 +361,7 @@ GPR at every word. If it does not clear the gate, record STOP and do not write a
 production candidate. If it clears, write a separate production design before
 editing emission.
 
-- [ ] **Step 5: Commit evidence and handoff**
+- [x] **Step 5: Commit evidence and handoff**
 
 Run `git diff --check`, update the official scoreboard only if an untraced
 Carrick/Docker gate actually ran (it should not for an attribution-only stop),

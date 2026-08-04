@@ -1,8 +1,9 @@
 # Native-lane performance: state of play
 
 **Date:** 2026-08-03 · **Branch:** `codex/native-store-default` · **Latest
-implementation decision:** stop exec/exit work; the cold-build lifecycle share
-is 8.824%, below the 10% opportunity gate ·
+implementation decision:** stop current context-traffic work; the largest
+source-distinct mechanism is x17 authority at 7.00% / 7.18% of projected total
+CPU, below the 10% opportunity gate ·
 **Scope:** Darwin/aarch64 native backend (`--exec-backend native`, the shipped
 default). VMM is explicitly NOT the target: one process per VM against a
 ~127-VM macOS ceiling makes it a dead end for build-shaped workloads.
@@ -70,6 +71,17 @@ stamp; the fixed exporter then closed all accepted trees exactly. No production
 exec/exit hypothesis was selected. Full evidence:
 [`docs/perf-results/2026-08-03-current-exec-exit-attribution.md`](docs/perf-results/2026-08-03-current-exec-exit-attribution.md).
 
+The approved exact context-traffic census is now complete. The new Rust
+diagnostic fail-closed joins sampled JIT PCs to authenticated retirement
+snapshots and classifies each 64-bit context access by exact slot, physical
+register, and direction. Two independent accepted cold-build captures joined
+every JIT sample. Aggregate context traffic projects to **16.0730% / 16.1738%**
+of total CPU, but source audit splits it into distinct mechanisms. The largest,
+x17 authority through slot 1128, is only **7.0008% / 7.1812%**. No
+non-overlapping mechanism clears 10%, so no emitter candidate was selected.
+Full evidence:
+[`docs/perf-results/2026-08-03-current-context-traffic.md`](docs/perf-results/2026-08-03-current-context-traffic.md).
+
 ## What landed (2026-08-02/03, six waves, all merged with `just ci` green)
 
 **Exec pipeline.** Payload SHA-256 removed from the default artifact digest
@@ -115,23 +127,21 @@ went 1.66 s → <10 ms. Identical host syscall sequence, identical guest ABI.
 
 ## What's next
 
-The exec/exit line is closed at attribution rather than carried into a
-production experiment. The exact exporter and census remain as opt-in
-diagnostics because they also provide process-exit receipts and fail closed on
-silent loss; a crashed run can instead be read from a saved core through the
-always-on event ring. No official ratio refresh is warranted because no
-production candidate was retained. `RUST_TEST_THREADS=1 just ci` passes on the
-closed tree.
+The exec/exit and context-traffic lines are closed at attribution rather than
+carried into production experiments. Their exact exporters and censuses remain
+opt-in diagnostics. A crashed run can also be read from a saved core through
+the always-on event ring. No official ratio refresh is warranted because
+neither line retained a production candidate. `RUST_TEST_THREADS=1 just ci`
+passes at the current source authority.
 
-1. **Census liveness-elidable borrowed-register traffic as one class.** The
-   current-default shape census puts all four borrowed-register saves/restores
-   at 33.7% of executed emitted instructions, about 15% of total build CPU.
-   Start at the internal-fallthrough x17 seam, then apply the same block-liveness
-   proof to x19/x15/x16 and measure the aggregate dynamic coverage. Do not
-   preselect an x17-only patch: x17 projects to only about 6.8% of total CPU.
-   Implement a production candidate only if a current-default census shows a
-   correctness-preserving, non-overlapping class worth at least 10% of total
-   CPU; then require its own controlled end-to-end gate.
+1. **Refresh current-default kernel and memory attribution.** Use the existing
+   native-wall and fault-address DTrace profiles on the current signed tip.
+   Bind fault pages to guest mappings versus Carrick or libmalloc allocations,
+   and name the Darwin primitive induced by one guest operation. Carry a
+   production candidate forward only if the same source-backed mechanism is at
+   least 10% of total cold-build CPU in two agreeing captures. If guest page
+   management dominates, use Go's Darwin allocator lowering as the dual-port
+   oracle before proposing a host primitive.
 2. **Keep eager full translation as a deferred future design, not the next
    patch.** Translating a complete eligible image once up front could amortize
    publication and avoid the losing per-process merge path measured here. It
@@ -145,21 +155,21 @@ closed tree.
 
 ## Confidence
 
-- **Very high (99%):** accepted exec/exit coverage is exact. All fork, exec,
-  terminal-exit, and reap relationships reconcile; the deliberately rejected
-  capture proves missing terminal records fail closed.
-- **High (97%):** the strict cold-build lifecycle share is stable. Independent
-  empty-store runs differ by only 0.067 percentage points.
-- **High (95%):** exec/exit is below the production-candidate gate. Both cold
-  runs are below 9%, while the micro's dominant exec-total segment falls to
-  about 5% on the build.
+- **Very high (99%):** accepted exact context coverage is complete. Every JIT
+  sample resolves to one authenticated own or unique ancestor snapshot; zero
+  samples are missing.
+- **High (97%):** the context distribution is stable. Independent captures put
+  aggregate context traffic within 0.101 percentage points and x17 authority
+  within 0.181 percentage points.
+- **High (96%):** no source-distinct context mechanism clears the production
+  gate. The largest is below 7.2% in both captures; the 16% aggregate is
+  explicitly multiple mechanisms.
 - **High (95%):** the official shipped-default result remains 10.4446x. No
   rejected candidate code is retained and no projection was substituted for a
   fresh Carrick/Docker run.
-- **Medium (75%):** liveness-elidable borrowed-register traffic is the best next
-  attribution target. The aggregate class projects to about 15% of total CPU,
-  but the dynamically provable dead subset is not yet measured and x17 alone
-  cannot clear the gate.
+- **Medium-high (78%):** refreshed kernel/memory attribution is the best next
+  lane. Prior evidence gives that side enough mass, but its current-default
+  mechanism distribution must be re-qualified before selecting a patch.
 
 ## Discipline that earned its keep (do not relearn these)
 
@@ -184,12 +194,13 @@ closed tree.
 
 ## Branch state at handoff
 
-`d0db17970c4b4286f2fef13c5586c73e3e94a132` is the source authority for the
-four accepted exec/exit captures. Their signed binary has SHA-256
-`57343c865ba07ee9e56890f6c9a8f095c9d541548f7a48a42abbe4b551c561f6`
-and Mach-O UUID `FFA89D28-EB3A-30F8-9CAF-82DC24E5CC94`. Commits `868a551d`
-and `d0db1797` retain only the opt-in exporter, fail-closed census, tests, and
-the spawned-thread terminal-stamp repair; they do not alter default execution.
+`cacda86854f3c55a59802f16e8161b172e8d107f` is the source authority for the
+two accepted context captures. Its signed binary has SHA-256
+`67ac424a88fb14f3b4f131831b7293bd9ccfe8da43a3ff2f9e885ab2f7bcb794`
+and Mach-O UUID `7A0140A6-894D-34D1-B774-6A395266601B`. Commits `ba5b4420`
+and `cacda868` retain only the authenticated opt-in snapshot export,
+fail-closed Rust census, CLI wiring, and tests; they do not alter default
+execution. `RUST_TEST_THREADS=1 just ci` passed at that source authority.
 Nothing has been pushed and local `main` has not moved. Target-only raw ABBA,
 mechanism, signed-binary, store, attribution, and scoreboard receipts remain
 under `target/perf/` and are intentionally not committed.
