@@ -1,14 +1,347 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
+use carrick_image::ImageReference;
+use carrick_spec::ExecBackendRequest;
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use crate::args::{Cli, Commands};
+use crate::trace_profile::TraceProfileKind;
 
 pub(crate) const RAW_SCHEMA: &str = "carrick.native-shape.raw.v2";
 pub(crate) const SAMPLING_HZ: u64 = 997;
 const AUTHORITY_SCHEMA: &str = "carrick.native-shape-authority.v1";
 const PROFILE: &str = "native-shape";
 const NORMAL_TARGET_EXIT_REASON: i32 = 1;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeShapeTarget {
+    pub(crate) image: String,
+    pub(crate) image_digest: String,
+    pub(crate) argv: Vec<String>,
+    pub(crate) argv_sha256: String,
+}
+
+impl NativeShapeTarget {
+    pub(crate) fn parse(command: &[String]) -> Result<Self> {
+        if command.is_empty() {
+            bail!("native-shape target command is empty");
+        }
+
+        let mut argv = Vec::<OsString>::with_capacity(command.len() + 1);
+        argv.push(OsString::from("carrick"));
+        argv.extend(command.iter().map(OsString::from));
+        let matches = Cli::command()
+            .try_get_matches_from(argv)
+            .context("parse native-shape target command")?;
+        let Some((subcommand, run_matches)) = matches.subcommand() else {
+            bail!("native-shape target must be a run subcommand");
+        };
+        if subcommand != "run" {
+            bail!("native-shape target must be a run subcommand");
+        }
+        if run_matches.value_source("exec_backend") != Some(ValueSource::CommandLine) {
+            bail!("native-shape target requires explicit command-line --exec-backend native");
+        }
+
+        let parsed = Cli::from_arg_matches(&matches).context("decode native-shape target")?;
+        let Commands::Run {
+            image,
+            exec_backend,
+            command: target_command,
+            ..
+        } = parsed.command
+        else {
+            bail!("native-shape target must be a run subcommand");
+        };
+        if exec_backend != ExecBackendRequest::Native {
+            bail!("native-shape target requires explicit command-line --exec-backend native");
+        }
+        if target_command.is_empty() {
+            bail!("native-shape run target command is empty");
+        }
+
+        let reference = ImageReference::parse(&image).context("parse native-shape image")?;
+        let image_digest = reference
+            .digest()
+            .context("native-shape image must be digest-pinned")?
+            .to_owned();
+        validate_image_digest(&image_digest)?;
+        let target = Self {
+            image: reference.canonical(),
+            image_digest,
+            argv: command.to_vec(),
+            argv_sha256: argv_sha256(command)?,
+        };
+        target.validate()?;
+        Ok(target)
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_image_digest(&self.image_digest)?;
+        let image = ImageReference::parse(&self.image).context("validate native-shape image")?;
+        if image.canonical() != self.image || image.digest() != Some(self.image_digest.as_str()) {
+            bail!("native-shape image identity is not canonical and digest-consistent");
+        }
+        if self.argv.is_empty() || self.argv_sha256 != argv_sha256(&self.argv)? {
+            bail!("native-shape target argv identity is inconsistent");
+        }
+        Ok(())
+    }
+}
+
+fn validate_image_digest(digest: &str) -> Result<()> {
+    let hexadecimal = digest
+        .strip_prefix("sha256:")
+        .context("native-shape image digest must use sha256")?;
+    validate_lower_hex(hexadecimal, 64, "native-shape image digest")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CaptureIdentity {
+    pub(crate) git_head: String,
+    pub(crate) git_dirty: bool,
+    pub(crate) executable_sha256: String,
+    pub(crate) host: String,
+    pub(crate) host_arch: String,
+    pub(crate) os_build: String,
+}
+
+impl CaptureIdentity {
+    pub(crate) fn capture(executable: &Path) -> Result<Self> {
+        let git_head = required_command_text("git", &["rev-parse", "HEAD"], "Git HEAD")?;
+        let git_status = command_stdout("git", &["status", "--porcelain"], "Git status")?;
+        let git_dirty = !git_status.is_empty();
+        let executable_bytes = fs::read(executable)
+            .with_context(|| format!("read capture executable {}", executable.display()))?;
+        let identity = Self {
+            git_head,
+            git_dirty,
+            executable_sha256: format!("{:x}", Sha256::digest(executable_bytes)),
+            host: required_command_text("hostname", &[], "hostname")?,
+            host_arch: std::env::consts::ARCH.to_owned(),
+            os_build: required_command_text(
+                "/usr/sbin/sysctl",
+                &["-n", "kern.osversion"],
+                "Darwin kern.osversion",
+            )?,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        validate_lower_hex(&self.git_head, 40, "capture Git HEAD")?;
+        if self.git_dirty {
+            bail!("native-shape capture requires a clean Git worktree");
+        }
+        validate_sha256(&self.executable_sha256, "capture executable_sha256")?;
+        for (value, field) in [
+            (&self.host, "capture hostname"),
+            (&self.host_arch, "capture host architecture"),
+            (&self.os_build, "capture OS build"),
+        ] {
+            if value.is_empty() {
+                bail!("{field} is unknown or empty");
+            }
+        }
+        validate_percent_token(&self.os_build, "capture OS build")?;
+        Ok(())
+    }
+
+    pub(crate) fn require_exact_match(&self, observed: &Self) -> Result<()> {
+        self.validate().context("validate pre-capture identity")?;
+        observed
+            .validate()
+            .context("validate post-capture identity")?;
+        if self != observed {
+            bail!("native-shape capture identity drifted");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn recapture_and_require_exact_match(&self, executable: &Path) -> Result<Self> {
+        let observed = Self::capture(executable)?;
+        self.require_exact_match(&observed)?;
+        Ok(observed)
+    }
+}
+
+fn command_stdout(program: &str, arguments: &[&str], label: &str) -> Result<Vec<u8>> {
+    let output = Command::new(program)
+        .args(arguments)
+        .output()
+        .with_context(|| format!("run {label} command"))?;
+    if !output.status.success() {
+        bail!("{label} command failed with {}", output.status);
+    }
+    Ok(output.stdout)
+}
+
+fn required_command_text(program: &str, arguments: &[&str], label: &str) -> Result<String> {
+    let bytes = command_stdout(program, arguments, label)?;
+    let output = String::from_utf8(bytes).with_context(|| format!("decode {label} output"))?;
+    let output = output.trim();
+    if output.is_empty() {
+        bail!("{label} is unknown or empty");
+    }
+    Ok(output.to_owned())
+}
+
+pub(crate) fn validate_native_shape_host(os: &str, arch: &str) -> Result<()> {
+    if os != "macos" || arch != "aarch64" {
+        bail!("native-shape requires a Darwin/AArch64 host");
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_native_shape_trace_arguments(
+    profile: Option<TraceProfileKind>,
+    script: Option<&Path>,
+    trace_out: Option<&Path>,
+    summary_jsonl: Option<&Path>,
+    snapshot_directory: Option<&Path>,
+    current_directory: &Path,
+) -> Result<()> {
+    if profile != Some(TraceProfileKind::NativeShape) {
+        if snapshot_directory.is_some() {
+            bail!("--native-shape-snapshots requires --profile native-shape");
+        }
+        return Ok(());
+    }
+    if script.is_some() {
+        bail!("--profile native-shape cannot be combined with --script");
+    }
+
+    let trace_out = trace_out.context("native-shape requires --trace-out")?;
+    let summary_jsonl = summary_jsonl.context("native-shape requires --summary-jsonl")?;
+    let snapshot_directory =
+        snapshot_directory.context("native-shape requires --native-shape-snapshots")?;
+    let raw = lexical_absolute(trace_out, current_directory)?;
+    let receipt = lexical_absolute(summary_jsonl, current_directory)?;
+    let snapshots = lexical_absolute(snapshot_directory, current_directory)?;
+    if raw == receipt {
+        bail!("--trace-out and --summary-jsonl must name different files");
+    }
+    if raw == snapshots || receipt == snapshots {
+        bail!("native-shape output file must not alias the snapshot directory");
+    }
+    Ok(())
+}
+
+fn lexical_absolute(path: &Path, current_directory: &Path) -> Result<PathBuf> {
+    if !current_directory.is_absolute() {
+        bail!("native-shape current directory is not absolute");
+    }
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        current_directory.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(value) => normalized.push(value),
+        }
+    }
+    if !normalized.is_absolute() {
+        bail!("native-shape path did not normalize to an absolute path");
+    }
+    Ok(normalized)
+}
+
+pub(crate) fn require_native_shape_snapshot_absent(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => bail!(
+            "native-shape snapshot path already exists: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("inspect native-shape snapshot path {}", path.display())),
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn claim_native_shape_snapshot_directory(path: &Path, uid: u32, gid: u32) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    fs::create_dir(path)
+        .with_context(|| format!("create native-shape snapshot directory {}", path.display()))?;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect native-shape snapshot directory {}", path.display()))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        bail!("native-shape snapshot path is not a real directory");
+    }
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("open native-shape snapshot directory {}", path.display()))?;
+    let opened = directory
+        .metadata()
+        .with_context(|| format!("inspect opened snapshot directory {}", path.display()))?;
+    if !opened.is_dir() {
+        bail!("opened native-shape snapshot path is not a directory");
+    }
+    let result = unsafe { libc::fchown(directory.as_raw_fd(), uid, gid) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("set native-shape snapshot directory owner");
+    }
+    Ok(())
+}
+
+pub(crate) fn resolve_native_shape_run_id(
+    existing: Option<&OsStr>,
+    utc_timestamp: &str,
+    pid: u32,
+) -> Result<String> {
+    if let Some(existing) = existing {
+        let value = existing
+            .to_str()
+            .context("CARRICK_RUN_ID must be valid UTF-8")?;
+        if value.is_empty() {
+            bail!("CARRICK_RUN_ID must not be empty");
+        }
+        return Ok(value.to_owned());
+    }
+    if utc_timestamp.is_empty() {
+        bail!("native-shape UTC timestamp is empty");
+    }
+    Ok(format!("native-shape-{utc_timestamp}-{pid}"))
+}
+
+pub(crate) fn establish_native_shape_run_id() -> Result<String> {
+    let existing = std::env::var_os("CARRICK_RUN_ID");
+    let run_id = resolve_native_shape_run_id(
+        existing.as_deref(),
+        &chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string(),
+        std::process::id(),
+    )?;
+    if existing.is_none() {
+        // SAFETY: callers establish the run ID in the single-threaded CLI
+        // preflight, before qualification or traced-child work begins.
+        unsafe { std::env::set_var("CARRICK_RUN_ID", &run_id) };
+    }
+    Ok(run_id)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -33,6 +366,42 @@ pub(crate) struct NativeShapeAuthority {
 }
 
 impl NativeShapeAuthority {
+    pub(crate) fn new(
+        identity: &CaptureIdentity,
+        target: &NativeShapeTarget,
+        run_id: &str,
+        program_template: &str,
+        birth_qualification_sha256: &str,
+        terminal_qualification_sha256: &str,
+    ) -> Result<Self> {
+        identity.validate()?;
+        target.validate()?;
+        if run_id.is_empty() {
+            bail!("native-shape run ID must not be empty");
+        }
+        let authority = Self {
+            schema: AUTHORITY_SCHEMA.to_owned(),
+            profile: PROFILE.to_owned(),
+            raw_schema: RAW_SCHEMA.to_owned(),
+            git_head: identity.git_head.clone(),
+            git_dirty: identity.git_dirty,
+            executable_sha256: identity.executable_sha256.clone(),
+            host: identity.host.clone(),
+            host_arch: identity.host_arch.clone(),
+            os_build: identity.os_build.clone(),
+            image: target.image.clone(),
+            target_argv: target.argv.clone(),
+            target_argv_sha256: target.argv_sha256.clone(),
+            run_id: run_id.to_owned(),
+            program_template_sha256: format!("{:x}", Sha256::digest(program_template.as_bytes())),
+            birth_qualification_sha256: birth_qualification_sha256.to_owned(),
+            terminal_qualification_sha256: terminal_qualification_sha256.to_owned(),
+            sampling_hz: SAMPLING_HZ,
+        };
+        authority.validate()?;
+        Ok(authority)
+    }
+
     pub(crate) fn sha256(&self) -> Result<String> {
         self.validate()?;
         let encoded = serde_json::to_vec(self).context("serialize native-shape authority")?;
@@ -658,6 +1027,8 @@ fn validate_percent_token(value: &str, field: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
+    use std::path::Path;
 
     const ARGV_SHA256: &str = "3bc262561e1269c1333d39405fcadf5cdb5f917fe31e34b256b7767e54ed7a80";
     const AUTHORITY_SHA256: &str =
@@ -736,6 +1107,282 @@ mod tests {
     fn replace_once(raw: &str, from: &str, to: &str) -> String {
         assert_eq!(raw.matches(from).count(), 1, "fixture mutation source");
         raw.replacen(from, to, 1)
+    }
+
+    fn fixture_identity() -> CaptureIdentity {
+        CaptureIdentity {
+            git_head: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            git_dirty: false,
+            executable_sha256: "1".repeat(64),
+            host: "test-host".to_owned(),
+            host_arch: "aarch64".to_owned(),
+            os_build: "26A5388g".to_owned(),
+        }
+    }
+
+    #[test]
+    fn native_shape_paths_require_dedicated_outputs_and_do_not_alias() {
+        let cwd = Path::new("/tmp/native-shape-cwd");
+        let raw = Path::new("capture.raw");
+        let receipt = Path::new("capture.jsonl");
+        let snapshots = Path::new("capture.snapshots");
+
+        for missing in 0..3 {
+            let (raw, receipt, snapshots) = match missing {
+                0 => (None, Some(receipt), Some(snapshots)),
+                1 => (Some(raw), None, Some(snapshots)),
+                2 => (Some(raw), Some(receipt), None),
+                _ => unreachable!(),
+            };
+            assert!(
+                validate_native_shape_trace_arguments(
+                    Some(crate::trace_profile::TraceProfileKind::NativeShape),
+                    None,
+                    raw,
+                    receipt,
+                    snapshots,
+                    cwd,
+                )
+                .is_err()
+            );
+        }
+
+        assert!(
+            validate_native_shape_trace_arguments(
+                Some(crate::trace_profile::TraceProfileKind::NativeShape),
+                None,
+                Some(Path::new("nested/../same")),
+                Some(Path::new("same")),
+                Some(snapshots),
+                cwd,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("different")
+        );
+        for (raw, receipt, snapshots) in [
+            ("snapshots/../capture.raw", "receipt", "./capture.raw"),
+            ("raw", "nested/../capture.jsonl", "capture.jsonl"),
+        ] {
+            assert!(
+                validate_native_shape_trace_arguments(
+                    Some(crate::trace_profile::TraceProfileKind::NativeShape),
+                    None,
+                    Some(Path::new(raw)),
+                    Some(Path::new(receipt)),
+                    Some(Path::new(snapshots)),
+                    cwd,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("snapshot")
+            );
+        }
+
+        validate_native_shape_trace_arguments(
+            Some(crate::trace_profile::TraceProfileKind::NativeShape),
+            None,
+            Some(raw),
+            Some(receipt),
+            Some(snapshots),
+            cwd,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn native_shape_snapshot_option_is_exclusive_to_native_shape() {
+        let cwd = Path::new("/tmp/native-shape-cwd");
+        for profile in [
+            None,
+            Some(crate::trace_profile::TraceProfileKind::Dsr),
+            Some(crate::trace_profile::TraceProfileKind::DsrIndirect),
+            Some(crate::trace_profile::TraceProfileKind::DsrFork),
+            Some(crate::trace_profile::TraceProfileKind::NativeFault),
+            Some(crate::trace_profile::TraceProfileKind::NativeWall),
+        ] {
+            assert!(
+                validate_native_shape_trace_arguments(
+                    profile,
+                    None,
+                    None,
+                    None,
+                    Some(Path::new("snapshots")),
+                    cwd,
+                )
+                .is_err()
+            );
+            validate_native_shape_trace_arguments(profile, None, None, None, None, cwd).unwrap();
+        }
+
+        assert!(
+            validate_native_shape_trace_arguments(
+                None,
+                Some(Path::new("custom.d")),
+                None,
+                None,
+                Some(Path::new("snapshots")),
+                cwd,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn native_shape_requires_darwin_aarch64_host() {
+        validate_native_shape_host("macos", "aarch64").unwrap();
+        for (os, arch) in [
+            ("linux", "aarch64"),
+            ("freebsd", "x86_64"),
+            ("macos", "x86_64"),
+        ] {
+            assert!(validate_native_shape_host(os, arch).is_err());
+        }
+    }
+
+    #[test]
+    fn native_shape_requires_command_line_native_and_digest_image() {
+        let accepted_argv = [
+            "run".to_owned(),
+            "--exec-backend".to_owned(),
+            "native".to_owned(),
+            "docker.io/library/ubuntu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "/bin/true".to_owned(),
+        ];
+        let accepted = NativeShapeTarget::parse(&accepted_argv).unwrap();
+        assert_eq!(
+            accepted.image,
+            "docker.io/library/ubuntu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            accepted.image_digest,
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(accepted.argv, accepted_argv);
+        assert_eq!(accepted.argv_sha256, argv_sha256(&accepted_argv).unwrap());
+
+        let defaulted = [
+            "run".to_owned(),
+            "docker.io/library/ubuntu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "/bin/true".to_owned(),
+        ];
+        assert!(
+            NativeShapeTarget::parse(&defaulted)
+                .unwrap_err()
+                .to_string()
+                .contains("explicit")
+        );
+    }
+
+    #[test]
+    fn native_shape_rejects_non_run_vmm_unpinned_and_empty_targets() {
+        let digest = "docker.io/library/ubuntu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        for argv in [
+            vec!["pull".to_owned(), digest.to_owned()],
+            vec![
+                "run".to_owned(),
+                "--exec-backend".to_owned(),
+                "vmm".to_owned(),
+                digest.to_owned(),
+                "/bin/true".to_owned(),
+            ],
+            vec![
+                "run".to_owned(),
+                "--exec-backend".to_owned(),
+                "native".to_owned(),
+                "ubuntu:24.04".to_owned(),
+                "/bin/true".to_owned(),
+            ],
+            vec![
+                "run".to_owned(),
+                "--exec-backend".to_owned(),
+                "native".to_owned(),
+                "ubuntu@sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                    .to_owned(),
+                "/bin/true".to_owned(),
+            ],
+            vec![
+                "run".to_owned(),
+                "--exec-backend".to_owned(),
+                "native".to_owned(),
+                digest.to_owned(),
+            ],
+            Vec::new(),
+        ] {
+            assert!(
+                NativeShapeTarget::parse(&argv).is_err(),
+                "accepted {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_shape_identity_is_strict_and_exactly_comparable() {
+        let expected = fixture_identity();
+        expected.validate().unwrap();
+        expected.require_exact_match(&expected).unwrap();
+
+        for mutation in 0..6 {
+            let mut observed = expected.clone();
+            match mutation {
+                0 => observed.git_head = "f".repeat(40),
+                1 => observed.git_dirty = true,
+                2 => observed.executable_sha256 = "2".repeat(64),
+                3 => observed.host = "other-host".to_owned(),
+                4 => observed.host_arch = "x86_64".to_owned(),
+                5 => observed.os_build = "26A999".to_owned(),
+                _ => unreachable!(),
+            }
+            assert!(expected.require_exact_match(&observed).is_err());
+        }
+
+        let mut unknown = expected;
+        unknown.host.clear();
+        assert!(unknown.validate().is_err());
+    }
+
+    #[test]
+    fn native_shape_run_id_is_nonempty_and_stable() {
+        assert_eq!(
+            resolve_native_shape_run_id(
+                Some(OsStr::new("caller-selected")),
+                "20260804T120000.000Z",
+                42,
+            )
+            .unwrap(),
+            "caller-selected"
+        );
+        assert_eq!(
+            resolve_native_shape_run_id(None, "20260804T120000.000Z", 42).unwrap(),
+            "native-shape-20260804T120000.000Z-42"
+        );
+        assert!(
+            resolve_native_shape_run_id(Some(OsStr::new("")), "20260804T120000.000Z", 42).is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_shape_snapshot_claim_requires_a_fresh_real_directory() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+
+        let fixture = tempfile::tempdir().unwrap();
+        let snapshots = fixture.path().join("snapshots");
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        claim_native_shape_snapshot_directory(&snapshots, uid, gid).unwrap();
+        let metadata = std::fs::symlink_metadata(&snapshots).unwrap();
+        assert!(metadata.is_dir());
+        assert!(!metadata.file_type().is_symlink());
+        assert_eq!(metadata.uid(), uid);
+        assert_eq!(metadata.gid(), gid);
+        assert!(claim_native_shape_snapshot_directory(&snapshots, uid, gid).is_err());
+
+        let target = fixture.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = fixture.path().join("snapshot-link");
+        symlink(&target, &link).unwrap();
+        assert!(claim_native_shape_snapshot_directory(&link, uid, gid).is_err());
     }
 
     #[test]

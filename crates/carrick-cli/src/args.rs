@@ -799,6 +799,13 @@ pub(crate) enum Commands {
         /// Atomically publish the parsed profile as versioned JSONL.
         #[arg(long, value_name = "FILE", requires = "profile")]
         summary_jsonl: Option<std::path::PathBuf>,
+        /// Fresh directory for native-shape retirement snapshots.
+        #[arg(
+            long = "native-shape-snapshots",
+            value_name = "DIR",
+            requires = "profile"
+        )]
+        native_shape_snapshots: Option<std::path::PathBuf>,
         /// Write DTrace events + aggregations to this file instead of stdout.
         /// Essential when tracing an interactive (`-t`) guest: without it the
         /// probe output intermixes with the guest's own terminal stream. The
@@ -1156,8 +1163,46 @@ pub(crate) enum NetworkCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::Cli;
+    use super::{Cli, Commands};
+    use crate::trace_profile::TraceProfileKind;
     use clap::Parser;
+
+    #[test]
+    fn native_shape_profile_parses_with_all_dedicated_outputs() {
+        let cli = Cli::try_parse_from([
+            "carrick",
+            "trace",
+            "--profile",
+            "native-shape",
+            "--trace-out",
+            "/tmp/native-shape.raw",
+            "--summary-jsonl",
+            "/tmp/native-shape.capture.jsonl",
+            "--native-shape-snapshots",
+            "/tmp/native-shape.snapshots",
+            "--",
+            "run",
+            "--exec-backend",
+            "native",
+            "docker.io/library/ubuntu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "/bin/true",
+        ])
+        .expect("native-shape trace command should parse");
+
+        let Commands::Trace {
+            profile,
+            native_shape_snapshots,
+            ..
+        } = cli.command
+        else {
+            panic!("expected trace command");
+        };
+        assert_eq!(profile, Some(TraceProfileKind::NativeShape));
+        assert_eq!(
+            native_shape_snapshots.as_deref(),
+            Some(std::path::Path::new("/tmp/native-shape.snapshots"))
+        );
+    }
 
     #[test]
     fn network_inspect_accepts_multiple_names_like_docker() {

@@ -116,6 +116,14 @@ use crate::native_fault_profile::NativeFaultSummary;
 #[cfg(target_os = "macos")]
 use crate::native_profile_qualification::run_native_profile_qualifications;
 use crate::native_profile_qualification::validate_qualification_paths;
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+use crate::native_shape_profile::validate_native_shape_trace_arguments;
+#[cfg(target_os = "macos")]
+use crate::native_shape_profile::{
+    CaptureIdentity, NativeShapeAuthority, NativeShapeTarget,
+    claim_native_shape_snapshot_directory, establish_native_shape_run_id,
+    require_native_shape_snapshot_absent, validate_native_shape_host,
+};
 use crate::runtime_util::{
     block_on_oci, emit_raw, human_age, human_size, parse_env_file, parse_mount_flag,
     parse_publish_specs, parse_volume_mount, resolve_volumes_from_specs, truncate_str,
@@ -140,6 +148,7 @@ fn uses_native_launch_qualification(profile: crate::trace_profile::TraceProfileK
     matches!(
         profile,
         crate::trace_profile::TraceProfileKind::NativeFault
+            | crate::trace_profile::TraceProfileKind::NativeShape
             | crate::trace_profile::TraceProfileKind::NativeWall
     )
 }
@@ -1386,6 +1395,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             script,
             profile,
             summary_jsonl,
+            native_shape_snapshots,
             trace_out,
             command,
             forward_env,
@@ -1401,6 +1411,38 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         // SAFETY: single-threaded at this point (pre-runtime).
                         unsafe { std::env::set_var(k, v) };
                     }
+                }
+                let current_directory =
+                    std::env::current_dir().context("resolve trace current directory")?;
+                validate_native_shape_trace_arguments(
+                    profile,
+                    script.as_deref(),
+                    trace_out.as_deref(),
+                    summary_jsonl.as_deref(),
+                    native_shape_snapshots.as_deref(),
+                    &current_directory,
+                )?;
+                #[cfg(target_os = "macos")]
+                let (native_shape_target, native_shape_run_id) =
+                    if profile == Some(crate::trace_profile::TraceProfileKind::NativeShape) {
+                        validate_native_shape_host(std::env::consts::OS, std::env::consts::ARCH)?;
+                        let target = NativeShapeTarget::parse(&command)?;
+                        let run_id = establish_native_shape_run_id()?;
+                        let snapshot_directory =
+                            native_shape_snapshots.as_deref().ok_or_else(|| {
+                                anyhow::anyhow!("native-shape snapshot directory disappeared")
+                            })?;
+                        require_native_shape_snapshot_absent(snapshot_directory)?;
+                        (Some(target), Some(run_id))
+                    } else {
+                        (None, None)
+                    };
+                #[cfg(target_os = "freebsd")]
+                if profile == Some(crate::trace_profile::TraceProfileKind::NativeShape) {
+                    crate::native_shape_profile::validate_native_shape_host(
+                        std::env::consts::OS,
+                        std::env::consts::ARCH,
+                    )?;
                 }
                 if profile.is_some_and(|kind| kind.requires_runtime_profile()) {
                     // The broad profile's prepare/run probes are const-specialized
@@ -1452,6 +1494,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         profile,
                         summary_jsonl: summary_jsonl.as_deref(),
                         trace_out: trace_out.as_deref(),
+                        native_shape_snapshots: native_shape_snapshots.as_deref(),
                         uid: unsafe { libc::getuid() },
                         gid: unsafe { libc::getgid() },
                         groups: &groups,
@@ -1461,6 +1504,30 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     let err = std::process::Command::new("sudo").args(&forwarded).exec();
                     bail!("carrick trace: failed to re-exec under sudo: {}", err);
                 }
+                let drop_credentials = trace_drop_credentials(trace_uid, trace_gid, &trace_groups);
+                #[cfg(target_os = "macos")]
+                let native_shape_identity = if profile
+                    == Some(crate::trace_profile::TraceProfileKind::NativeShape)
+                {
+                    let identity = CaptureIdentity::capture(&me)?;
+                    let snapshot_directory =
+                        native_shape_snapshots.as_deref().ok_or_else(|| {
+                            anyhow::anyhow!("native-shape snapshot directory disappeared")
+                        })?;
+                    let owner = drop_credentials
+                        .as_ref()
+                        .map(|value| (value.uid, value.gid))
+                        .unwrap_or_else(|| unsafe { (libc::getuid(), libc::getgid()) });
+                    claim_native_shape_snapshot_directory(snapshot_directory, owner.0, owner.1)?;
+                    // SAFETY: this root-side preflight is still
+                    // single-threaded and precedes qualification/trace work.
+                    unsafe {
+                        std::env::set_var("CARRICK_DSR_CODE_SNAPSHOT_DIR", snapshot_directory)
+                    };
+                    Some(identity)
+                } else {
+                    None
+                };
                 let script_template = match (&script, profile) {
                     (Some(path), None) => {
                         Some(std::fs::read_to_string(path).with_context(|| {
@@ -1481,7 +1548,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 let output_path = trace_out
                     .as_deref()
                     .or_else(|| internal_trace.as_ref().map(tempfile::NamedTempFile::path));
-                let drop_credentials = trace_drop_credentials(trace_uid, trace_gid, &trace_groups);
                 #[cfg(target_os = "macos")]
                 let native_profile_qualification =
                     if profile.is_some_and(uses_native_launch_qualification) {
@@ -1493,7 +1559,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         None
                     };
                 #[cfg(target_os = "macos")]
-                let (script_src, native_profile_authority) =
+                let (script_src, native_profile_authority, native_shape_authority) =
                     if let Some(qualification) = native_profile_qualification.as_ref() {
                         let profile_template = script_template
                             .as_deref()
@@ -1501,21 +1567,49 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         let requested = profile.ok_or_else(|| {
                             anyhow::anyhow!("native launch qualification has no profile")
                         })?;
-                        let rendered = match requested {
-                            crate::trace_profile::TraceProfileKind::NativeFault => qualification
-                                .render_native_fault_profile_program(profile_template)?,
+                        match requested {
+                            crate::trace_profile::TraceProfileKind::NativeFault => {
+                                let rendered = qualification
+                                    .render_native_fault_profile_program(profile_template)?;
+                                (Some(rendered.program), Some(rendered.authority), None)
+                            }
                             crate::trace_profile::TraceProfileKind::NativeWall => {
-                                qualification.render_v2_profile_program(profile_template)?
+                                let rendered =
+                                    qualification.render_v2_profile_program(profile_template)?;
+                                (Some(rendered.program), Some(rendered.authority), None)
+                            }
+                            crate::trace_profile::TraceProfileKind::NativeShape => {
+                                let identity = native_shape_identity.as_ref().ok_or_else(|| {
+                                    anyhow::anyhow!("native-shape capture identity is absent")
+                                })?;
+                                let target = native_shape_target.as_ref().ok_or_else(|| {
+                                    anyhow::anyhow!("native-shape target identity is absent")
+                                })?;
+                                let run_id = native_shape_run_id.as_deref().ok_or_else(|| {
+                                    anyhow::anyhow!("native-shape run ID is absent")
+                                })?;
+                                let authority = NativeShapeAuthority::new(
+                                    identity,
+                                    target,
+                                    run_id,
+                                    profile_template,
+                                    qualification.birth_receipt_sha256(),
+                                    qualification.terminal_receipt_sha256(),
+                                )?;
+                                let rendered = qualification.render_native_shape_profile_program(
+                                    profile_template,
+                                    authority,
+                                )?;
+                                (Some(rendered.program), None, Some(rendered.authority))
                             }
                             crate::trace_profile::TraceProfileKind::Dsr
                             | crate::trace_profile::TraceProfileKind::DsrFork
                             | crate::trace_profile::TraceProfileKind::DsrIndirect => {
                                 unreachable!("non-native profile requested native qualification")
                             }
-                        };
-                        (Some(rendered.program), Some(rendered.authority))
+                        }
                     } else {
-                        (script_template, None)
+                        (script_template, None, None)
                     };
                 #[cfg(target_os = "freebsd")]
                 let script_src = script_template;
@@ -1584,7 +1678,17 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     let capture_status = report.into();
                     #[cfg(target_os = "macos")]
                     {
-                        if requested_profile == crate::trace_profile::TraceProfileKind::NativeFault
+                        if requested_profile == crate::trace_profile::TraceProfileKind::NativeShape
+                        {
+                            let _authority = native_shape_authority.as_ref().ok_or_else(|| {
+                                anyhow::anyhow!("NSHAPE2 stream has no capture authority")
+                            })?;
+                            let _ = capture_status;
+                            bail!(
+                                "native-shape dedicated capture finalization is not yet available"
+                            );
+                        } else if requested_profile
+                            == crate::trace_profile::TraceProfileKind::NativeFault
                         {
                             let authority = native_profile_authority.clone().ok_or_else(|| {
                                 anyhow::anyhow!("NFAULT2 stream has no launch authority")
@@ -1632,6 +1736,10 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     }
                     #[cfg(target_os = "freebsd")]
                     {
+                        if requested_profile == crate::trace_profile::TraceProfileKind::NativeShape
+                        {
+                            bail!("native-shape requires a Darwin/AArch64 host");
+                        }
                         let mut summary = ProfileSummary::from_path(raw_path, capture_status)?;
                         summary.require_profile(requested_profile)?;
                         summary.set_provenance(capture_provenance(&me, &command)?);
@@ -1652,6 +1760,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     script,
                     profile,
                     summary_jsonl,
+                    native_shape_snapshots,
                     trace_out,
                     command,
                     forward_env,
@@ -2602,6 +2711,10 @@ mod tests {
         assert!(!uses_live_kernel_symbols(TraceProfileKind::NativeFault));
         assert!(uses_native_launch_qualification(
             TraceProfileKind::NativeFault
+        ));
+        assert!(!uses_live_kernel_symbols(TraceProfileKind::NativeShape));
+        assert!(uses_native_launch_qualification(
+            TraceProfileKind::NativeShape
         ));
         for profile in [
             TraceProfileKind::Dsr,

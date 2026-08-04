@@ -11,6 +11,8 @@ const DSRPROF2_HEADER_PLACEHOLDER: &str = "/* CARRICK_DSRPROF2_HEADER */";
 const DSRPROF2_TERMINALS_PLACEHOLDER: &str = "/* CARRICK_DSRPROF2_TERMINALS */";
 const NFAULT2_HEADER_PLACEHOLDER: &str = "/* CARRICK_NFAULT2_HEADER */";
 const NFAULT2_TERMINALS_PLACEHOLDER: &str = "/* CARRICK_NFAULT2_TERMINALS */";
+const NSHAPE2_HEADER_PLACEHOLDER: &str = "/* CARRICK_NSHAPE2_HEADER */";
+const NSHAPE2_TERMINALS_PLACEHOLDER: &str = "/* CARRICK_NSHAPE2_TERMINALS */";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -91,6 +93,12 @@ pub(crate) struct NativeProfileQualification {
 pub(crate) struct RenderedNativeProfileProgram {
     pub(crate) program: String,
     pub(crate) authority: crate::trace_profile::V2ProfileAuthority,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) struct RenderedNativeShapeProfileProgram {
+    pub(crate) program: String,
+    pub(crate) authority: crate::native_shape_profile::NativeShapeAuthority,
 }
 
 pub(crate) fn validate_qualification_paths(
@@ -178,6 +186,63 @@ impl NativeProfileQualification {
             NFAULT2_HEADER_PLACEHOLDER,
             NFAULT2_TERMINALS_PLACEHOLDER,
         )
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn render_native_shape_profile_program(
+        &self,
+        profile_template: &str,
+        authority: crate::native_shape_profile::NativeShapeAuthority,
+    ) -> Result<RenderedNativeShapeProfileProgram> {
+        let header_count = profile_template
+            .match_indices(NSHAPE2_HEADER_PLACEHOLDER)
+            .count();
+        if header_count != 1 {
+            bail!(
+                "native-shape profile template must contain exactly one header placeholder, found {header_count}"
+            );
+        }
+        let terminal_count = profile_template
+            .match_indices(NSHAPE2_TERMINALS_PLACEHOLDER)
+            .count();
+        if terminal_count != 1 {
+            bail!(
+                "native-shape profile template must contain exactly one terminal placeholder, found {terminal_count}"
+            );
+        }
+        if authority.os_build != self.os_build {
+            bail!("native-shape authority OS build does not match qualification");
+        }
+        if authority.program_template_sha256 != sha256_hex(profile_template.as_bytes()) {
+            bail!("native-shape authority template hash does not match bundled D program");
+        }
+        if authority.birth_qualification_sha256 != self.birth_receipt_sha256 {
+            bail!("native-shape authority birth qualification hash does not match");
+        }
+        if authority.terminal_qualification_sha256 != self.terminal_receipt_sha256 {
+            bail!("native-shape authority terminal qualification hash does not match");
+        }
+
+        let header_action = format!("printf(\"{}\\n\");", authority.header_record()?);
+        let terminal_actions = self
+            .terminals
+            .iter()
+            .map(|terminal| {
+                let scope = match terminal.scope {
+                    TerminalScope::Thread => 1,
+                    TerminalScope::Process => 2,
+                };
+                format!(
+                    "terminal_scope[\"{}\", \"{}\"] = {scope};",
+                    terminal.provider, terminal.function
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\t");
+        let program = profile_template
+            .replacen(NSHAPE2_HEADER_PLACEHOLDER, &header_action, 1)
+            .replacen(NSHAPE2_TERMINALS_PLACEHOLDER, &terminal_actions, 1);
+        Ok(RenderedNativeShapeProfileProgram { program, authority })
     }
 
     #[cfg(target_os = "macos")]
@@ -968,6 +1033,88 @@ mod tests {
             rendered
                 .program
                 .contains("terminal_scope[\"syscall\", \"exit\"] = 2;")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_shape_render_binds_strict_capture_authority() {
+        const TEMPLATE: &str = concat!(
+            "dtrace:::BEGIN\n{\n",
+            "\t/* CARRICK_NSHAPE2_HEADER */\n",
+            "\t/* CARRICK_NSHAPE2_TERMINALS */\n",
+            "}\n",
+        );
+        let qualification = build_qualification(
+            BIRTH,
+            THREAD,
+            PROCESS,
+            DTraceRunReport::default(),
+            DTraceRunReport::default(),
+            DTraceRunReport::default(),
+            "26A123",
+        )
+        .expect("valid qualification");
+        let identity = crate::native_shape_profile::CaptureIdentity {
+            git_head: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            git_dirty: false,
+            executable_sha256: "1".repeat(64),
+            host: "test-host".to_owned(),
+            host_arch: "aarch64".to_owned(),
+            os_build: "26A123".to_owned(),
+        };
+        let argv = vec![
+            "run".to_owned(),
+            "--exec-backend".to_owned(),
+            "native".to_owned(),
+            "docker.io/library/ubuntu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "/bin/true".to_owned(),
+        ];
+        let target = crate::native_shape_profile::NativeShapeTarget::parse(&argv).unwrap();
+        let authority = crate::native_shape_profile::NativeShapeAuthority::new(
+            &identity,
+            &target,
+            "native-shape-test",
+            TEMPLATE,
+            qualification.birth_receipt_sha256(),
+            qualification.terminal_receipt_sha256(),
+        )
+        .unwrap();
+
+        let rendered = qualification
+            .render_native_shape_profile_program(TEMPLATE, authority.clone())
+            .unwrap();
+        assert_eq!(rendered.authority, authority);
+        assert_eq!(rendered.program.matches("NSHAPE2|header|").count(), 1);
+        assert_eq!(rendered.program.matches("terminal_scope[").count(), 2);
+        assert_eq!(
+            rendered.authority.program_template_sha256,
+            format!("{:x}", Sha256::digest(TEMPLATE.as_bytes()))
+        );
+
+        for malformed in [
+            "dtrace:::BEGIN { }",
+            "/* CARRICK_NSHAPE2_HEADER */\n/* CARRICK_NSHAPE2_HEADER */\n",
+            "/* CARRICK_NSHAPE2_HEADER */\n",
+            concat!(
+                "/* CARRICK_NSHAPE2_HEADER */\n",
+                "/* CARRICK_NSHAPE2_TERMINALS */\n",
+                "/* CARRICK_NSHAPE2_TERMINALS */\n",
+            ),
+        ] {
+            assert!(
+                qualification
+                    .render_native_shape_profile_program(malformed, authority.clone())
+                    .is_err()
+            );
+        }
+
+        let mut substituted = authority;
+        substituted.os_build = "26A999".to_owned();
+        assert!(
+            qualification
+                .render_native_shape_profile_program(TEMPLATE, substituted)
+                .is_err()
         );
     }
 
