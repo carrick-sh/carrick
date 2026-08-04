@@ -968,6 +968,9 @@ impl RawBuilder {
         let jit_user = self.jit_user.context("missing JIT user count")?;
         let non_jit_user = self.non_jit_user.context("missing non-JIT user count")?;
         let lifecycle = self.lifecycle.context("missing completion record")?;
+        if lifecycle.target_pid == 0 {
+            bail!("native-shape target PID must be nonzero");
+        }
 
         let classified_cpu = user_cpu
             .checked_add(kernel_cpu)
@@ -1123,6 +1126,7 @@ impl NativeShapeCaptureReceipt {
                     || counts.jit_user.checked_add(counts.non_jit_user) != Some(counts.user_cpu)
                     || counts.pc_samples != counts.jit_user
                     || counts.pc_rows == 0
+                    || counts.pc_samples < counts.pc_rows
                 {
                     bail!("accepted native-shape capture counts do not reconcile");
                 }
@@ -1133,6 +1137,9 @@ impl NativeShapeCaptureReceipt {
                 if lifecycle.bounded
                     || !lifecycle.target_completed
                     || lifecycle.target_exit_reason != NORMAL_TARGET_EXIT_REASON
+                    || lifecycle.target_pid == 0
+                    || lifecycle.admitted == 0
+                    || lifecycle.exited == 0
                     || lifecycle.live_at_end != 0
                     || lifecycle.probe_errors != 0
                     || lifecycle.admitted != lifecycle.exited
@@ -1306,6 +1313,17 @@ fn set_temporary_owner(temporary: &NamedTempFile, owner: Option<(u32, u32)>) -> 
 }
 
 pub(crate) fn prepare_capture_output(path: &Path, owner: Option<(u32, u32)>) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => bail!(
+            "native-shape capture receipt already exists: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect capture output {}", path.display()));
+        }
+    }
     let parent = capture_output_parent(path);
     fs::create_dir_all(parent)
         .with_context(|| format!("create capture output directory {}", parent.display()))?;
@@ -1340,12 +1358,19 @@ pub(crate) fn write_capture_atomic(
         .sync_all()
         .context("sync native-shape capture JSON line")?;
     set_temporary_owner(&temporary, owner)?;
-    temporary.persist(path).map_err(|error| {
-        anyhow!(
-            "publish native-shape capture {}: {}",
-            path.display(),
-            error.error
-        )
+    temporary.persist_noclobber(path).map_err(|error| {
+        if error.error.kind() == std::io::ErrorKind::AlreadyExists {
+            anyhow!(
+                "native-shape capture receipt already exists: {}",
+                path.display()
+            )
+        } else {
+            anyhow!(
+                "publish native-shape capture {} without clobbering: {}",
+                path.display(),
+                error.error
+            )
+        }
     })?;
     Ok(())
 }
@@ -1657,18 +1682,32 @@ mod tests {
         }
     }
 
+    fn accepted_fixture(root: &Path) -> NativeShapeCaptureReceipt {
+        let (raw_path, snapshot_directory) = write_valid_capture_evidence(root);
+        finalize_capture(NativeShapeFinalizeRequest {
+            authority: &fixture_authority(),
+            raw_path: &raw_path,
+            snapshot_directory: &snapshot_directory,
+            drops: NativeShapeDrops::default(),
+            post_identity: Ok(fixture_identity()),
+            trace_error: None,
+        })
+        .expect("finalize valid capture fixture")
+    }
+
     #[test]
     fn native_shape_capture_serialization_is_one_deterministic_json_line() {
         let fixture = tempfile::tempdir().expect("receipt fixture directory");
-        let path = fixture.path().join("capture.jsonl");
+        let first_path = fixture.path().join("first.jsonl");
+        let second_path = fixture.path().join("second.jsonl");
         let receipt = rejected_fixture(vec![
             "trace execution: failed".to_owned(),
             "raw trace parse: invalid".to_owned(),
         ]);
-        write_capture_atomic(&path, &receipt, None).expect("write rejected receipt");
-        let first = fs::read(&path).expect("read first receipt");
-        write_capture_atomic(&path, &receipt, None).expect("rewrite rejected receipt");
-        let second = fs::read(&path).expect("read second receipt");
+        write_capture_atomic(&first_path, &receipt, None).expect("write first rejected receipt");
+        write_capture_atomic(&second_path, &receipt, None).expect("write second rejected receipt");
+        let first = fs::read(&first_path).expect("read first receipt");
+        let second = fs::read(&second_path).expect("read second receipt");
         let expected = concat!(
             "{\"schema\":\"carrick.native-shape-capture.v1\",",
             "\"outcome\":\"rejected\",",
@@ -1690,6 +1729,103 @@ mod tests {
         assert!(
             serde_json::from_str::<NativeShapeCaptureReceipt>(&unknown).is_err(),
             "unknown receipt fields must fail closed"
+        );
+    }
+
+    #[test]
+    fn native_shape_capture_write_never_clobbers_preexisting_accepted_receipt() {
+        let fixture = tempfile::tempdir().expect("receipt fixture directory");
+        let receipt_path = fixture.path().join("capture.jsonl");
+        let accepted = accepted_fixture(fixture.path());
+        write_capture_atomic(&receipt_path, &accepted, None).expect("write accepted receipt");
+        let accepted_bytes = fs::read(&receipt_path).expect("read accepted receipt");
+
+        let rejected = rejected_fixture(vec!["trace execution: failed".to_owned()]);
+        let error = write_capture_atomic(&receipt_path, &rejected, None)
+            .expect_err("rejected receipt must not replace accepted evidence");
+        assert!(format!("{error:#}").contains("already exists"));
+        assert_eq!(
+            fs::read(&receipt_path).expect("reread accepted receipt"),
+            accepted_bytes
+        );
+    }
+
+    #[test]
+    fn native_shape_capture_rejects_structurally_impossible_accepted_receipts() {
+        type Mutation = fn(&mut NativeShapeCaptureReceipt);
+        let mutations: [(&str, Mutation); 4] = [
+            ("zero PC rows", |receipt| {
+                receipt.counts.as_mut().expect("counts").pc_rows = 0;
+            }),
+            ("fewer PC samples than rows", |receipt| {
+                receipt.counts.as_mut().expect("counts").pc_rows = 41;
+            }),
+            ("zero target PID", |receipt| {
+                receipt.lifecycle.as_mut().expect("lifecycle").target_pid = 0;
+            }),
+            ("zero admitted and exited", |receipt| {
+                let lifecycle = receipt.lifecycle.as_mut().expect("lifecycle");
+                lifecycle.admitted = 0;
+                lifecycle.exited = 0;
+            }),
+        ];
+
+        for (label, mutate) in mutations {
+            let fixture = tempfile::tempdir().expect("receipt fixture directory");
+            let mut receipt = accepted_fixture(fixture.path());
+            mutate(&mut receipt);
+            let receipt_path = fixture.path().join("capture.jsonl");
+            assert!(
+                write_capture_atomic(&receipt_path, &receipt, None).is_err(),
+                "accepted impossible state published: {label}"
+            );
+            assert!(!receipt_path.exists(), "partial receipt for {label}");
+        }
+    }
+
+    #[test]
+    fn native_shape_raw_builder_rejects_zero_target_pid_even_when_tree_reconciles() {
+        let builder = RawBuilder {
+            all_cpu: Some(100),
+            user_cpu: Some(70),
+            kernel_cpu: Some(30),
+            invalid_cpu: Some(0),
+            jit_user: Some(40),
+            non_jit_user: Some(30),
+            pc_samples: vec![
+                PcSample {
+                    pid: 0,
+                    pc: 0x1000,
+                    count: 15,
+                },
+                PcSample {
+                    pid: 11,
+                    pc: 0x2000,
+                    count: 25,
+                },
+            ],
+            pc_keys: BTreeSet::from([(0, 0x1000), (11, 0x2000)]),
+            parents: BTreeMap::from([(11, 0)]),
+            exits: BTreeMap::from([(0, 1), (11, 1)]),
+            lifecycle: Some(NativeShapeLifecycle {
+                bounded: false,
+                target_completed: true,
+                target_exit_reason: 1,
+                target_pid: 0,
+                admitted: 2,
+                exited: 2,
+                live_at_end: 0,
+                probe_errors: 0,
+            }),
+        };
+        let error = builder
+            .finish()
+            .expect_err("zero target PID must fail at the semantic builder layer");
+        assert!(error.to_string().contains("target PID must be nonzero"));
+
+        parse_rejected_for(
+            replace_once(&valid_raw(), "target_pid=10", "target_pid=0"),
+            "completion target_pid must be nonzero",
         );
     }
 
@@ -1979,6 +2115,15 @@ mod tests {
         let blocked = blocked_parent.join("capture.jsonl");
         assert!(prepare_capture_output(&blocked, None).is_err());
         assert!(!blocked.exists());
+
+        let existing = fixture.path().join("existing.jsonl");
+        fs::write(&existing, b"existing receipt\n").expect("write existing receipt");
+        let existing_bytes = fs::read(&existing).expect("read existing receipt");
+        assert!(prepare_capture_output(&existing, None).is_err());
+        assert_eq!(
+            fs::read(&existing).expect("reread existing receipt"),
+            existing_bytes
+        );
     }
 
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
@@ -2069,6 +2214,38 @@ mod tests {
             receipt.evidence_errors[0],
             "trace execution: dtrace_work failed: consume failed"
         );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    fn native_shape_capture_command_publish_race_never_clobbers_winner() {
+        use carrick_runtime::dtrace_consumer::{
+            DTraceError, DTraceObservedFailure, DTraceRunReport,
+        };
+
+        let fixture = tempfile::tempdir().expect("command fixture directory");
+        let (raw_path, snapshot_directory) = write_valid_capture_evidence(fixture.path());
+        let receipt_path = fixture.path().join("capture.jsonl");
+        let winner = b"race winner remains authoritative\n";
+        let error = run_native_shape_capture(
+            &fixture_authority(),
+            &raw_path,
+            &snapshot_directory,
+            &receipt_path,
+            None,
+            || {
+                fs::write(&receipt_path, winner).expect("publish racing winner");
+                Err(DTraceObservedFailure {
+                    error: DTraceError::Work("consume failed".to_owned()),
+                    report: DTraceRunReport::default(),
+                    child_launched: true,
+                })
+            },
+            || Ok(fixture_identity()),
+        )
+        .expect_err("racing receipt must make no-clobber publication fail");
+        assert!(format!("{error:#}").contains("already exists"));
+        assert_eq!(fs::read(&receipt_path).expect("read racing winner"), winner);
     }
 
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
