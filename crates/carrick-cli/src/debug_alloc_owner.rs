@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::native_perf_epochs::NativePerfEpochAuthority;
 
-const REPORT_SCHEMA: &str = "carrick.alloc-owner-census.v2";
+const REPORT_SCHEMA: &str = "carrick.alloc-owner-census.v3";
 const FILE_PREFIX: &str = "alloc-owner-";
 const FILE_SUFFIX: &str = ".txt";
 const TEMP_SUFFIX: &str = ".txt.tmp";
@@ -951,7 +951,7 @@ mod tests {
     }
 
     const GOLDEN_REPORT: &str = r#"{
-  "schema": "carrick.alloc-owner-census.v2",
+  "schema": "carrick.alloc-owner-census.v3",
   "valid": true,
   "errors": [],
   "files": {
@@ -1053,6 +1053,14 @@ mod tests {
     },
     {
       "owner": "translation-source-preparation",
+      "requested_bytes": 0,
+      "share": 0.0,
+      "alloc_calls": 0,
+      "zeroed_calls": 0,
+      "realloc_calls": 0
+    },
+    {
+      "owner": "translation-orchestration",
       "requested_bytes": 0,
       "share": 0.0,
       "alloc_calls": 0,
