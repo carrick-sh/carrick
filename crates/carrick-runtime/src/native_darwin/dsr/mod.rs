@@ -336,12 +336,6 @@ mod tests {
                         "unexpected outcomes: first={first:?} second={second:?}"
                     ));
                 }
-                if state.stats.duplicate_publications != 0 {
-                    return Err(format!(
-                        "exclusive ProcessState translation recorded {} impossible duplicate publications",
-                        state.stats.duplicate_publications
-                    ));
-                }
                 drop(state);
                 let (used_bytes, block_count, generation_count) = process.lifecycle_snapshot();
                 if used_bytes == 0 || block_count != 1 || generation_count != 1 {
@@ -1361,7 +1355,8 @@ mod tests {
                 // residue and the rest silently got 0.
                 for field in [
                     "translations",
-                    "duplicate_publications",
+                    "optimistic_decode_discards",
+                    "optimistic_decode_discard_ns",
                     "cache_lookups",
                     "cache_lookup_hits",
                     "invalidated_blocks",

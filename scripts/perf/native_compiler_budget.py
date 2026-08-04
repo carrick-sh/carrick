@@ -84,7 +84,8 @@ FRAME_FIELDS = {
     },
     "resolver-process": {
         "translations",
-        "duplicate_publications",
+        "optimistic_decode_discards",
+        "optimistic_decode_discard_ns",
         "cache_lookups",
         "cache_lookup_hits",
         "invalidated_blocks",

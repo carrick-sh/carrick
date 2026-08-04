@@ -615,7 +615,8 @@ def nativeperf_frames(pid=10, tid=11, era=12):
         + "resolver-thread|translate_phase_nested_ns=3|resolver_exits=1|"
         "one_entry_hits=0|gateway_entries=2|syscall_exits=1|direct_resolver_exits=1",
         prefix
-        + "resolver-process|translations=1|duplicate_publications=0|cache_lookups=1|"
+        + "resolver-process|translations=1|optimistic_decode_discards=2|"
+        "optimistic_decode_discard_ns=17|cache_lookups=1|"
         "cache_lookup_hits=0|invalidated_blocks=0",
         prefix
         + "resolver-times|nested_translation_ns=3|nested_translation_decode_ns=1|"
@@ -795,12 +796,39 @@ class NativePerfTests(unittest.TestCase):
             2,
         )
         self.assertEqual(
+            sum(
+                thread.value("resolver-process", "optimistic_decode_discards")
+                for thread in profile.threads
+            ),
+            4,
+        )
+        self.assertEqual(
+            sum(
+                thread.value("resolver-process", "optimistic_decode_discard_ns")
+                for thread in profile.threads
+            ),
+            34,
+        )
+        self.assertEqual(
             [thread.value("cache-gauge", "cache_used_bytes") for thread in profile.threads],
             [64, 1],
         )
         missing_delta = [line for line in first if "frame=resolver-process" not in line]
         with self.assertRaisesRegex(budget.BudgetError, "missing profile frames.*resolver-process"):
             budget.parse_nativeperf(missing_delta)
+
+    def test_profile_rejects_obsolete_resolver_process_field(self):
+        lines = nativeperf_frames()
+        obsolete = "duplicate" + "_publications"
+        lines[6] = lines[6].replace(
+            "optimistic_decode_discards=2|optimistic_decode_discard_ns=17|",
+            f"{obsolete}=0|",
+        )
+        with self.assertRaisesRegex(
+            budget.BudgetError,
+            f"unknown field\\(s\\) in resolver-process: {obsolete}",
+        ):
+            budget.parse_nativeperf(lines)
 
     def test_profile_decision_inputs_use_hottest_thread_and_cpu_deltas(self):
         profile = budget.parse_nativeperf(nativeperf_frames())
@@ -1747,17 +1775,19 @@ class ReviewFixContractTests(unittest.TestCase):
             with self.assertRaisesRegex(budget.BudgetError, "canonical decimal"):
                 budget.parse_dtrace_summary(summary, expected_run_id="run-1", raw_path=raw)
 
-    def test_checked_in_w1_evidence_declares_and_reconciles_raw_artifact(self):
+    def test_checked_in_w1_evidence_is_immutable_and_rejected_as_stale(self):
         evidence_path = EVIDENCE_ROOT / "native-compiler-w1-current-profile-v1.json"
         evidence = json.loads(evidence_path.read_text())
         self.assertIn("raw_profile_evidence_path", evidence)
         artifact = EVIDENCE_ROOT / evidence["raw_profile_evidence_path"]
         raw_bytes = gzip.decompress(artifact.read_bytes())
         self.assertEqual(sha256(raw_bytes), evidence["raw_profile_sha256"])
-        manifest = budget.load_manifest(
-            pathlib.Path(__file__).resolve().parent / "manifests" / "native-compiler-w2-v1.json"
-        )
-        self.assertEqual(manifest.name, "w2-internal-runtime-atomic")
+        with self.assertRaisesRegex(budget.BudgetError, "unknown field"):
+            budget.load_manifest(
+                pathlib.Path(__file__).resolve().parent
+                / "manifests"
+                / "native-compiler-w2-v1.json"
+            )
 
     def test_w1_evidence_rejects_raw_artifact_content_drift(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1809,7 +1839,7 @@ class ReviewFixContractTests(unittest.TestCase):
             with self.assertRaisesRegex(budget.BudgetError, "escape"):
                 budget.load_manifest(path)
 
-    def test_retained_w2_representative_profile_reconciles_with_manifest(self):
+    def test_retained_w2_representative_profile_is_immutable_and_rejected_as_stale(self):
         manifest = json.loads(
             (
                 pathlib.Path(__file__).resolve().parent
@@ -1822,21 +1852,10 @@ class ReviewFixContractTests(unittest.TestCase):
             (EVIDENCE_ROOT / "native-compiler-w2-representative-profile-v1.log.gz").read_bytes()
         )
         self.assertEqual(sha256(raw_bytes), representativeness["profile_stderr_sha256"])
-        profile = budget.parse_nativeperf(
-            raw_bytes.decode("utf-8", errors="replace").splitlines()
-        )
-        budget.validate_profile(profile)
-        hottest = max(profile.threads, key=lambda thread: thread.gateway_entries)
-        self.assertEqual(
-            {
-                "gateway_entries": hottest.gateway_entries,
-                "exit_resolve_direct": hottest.value("exits", "exit_resolve_direct"),
-                "exit_resolve_indirect": hottest.value("exits", "exit_resolve_indirect"),
-                "exit_sensitive": hottest.value("exits", "exit_sensitive"),
-                "sensitive_exclusive": hottest.value("sensitive", "sensitive_exclusive"),
-            },
-            representativeness["w2_hottest"],
-        )
+        with self.assertRaisesRegex(budget.BudgetError, "unknown field"):
+            budget.parse_nativeperf(
+                raw_bytes.decode("utf-8", errors="replace").splitlines()
+            )
 
     def test_blocked_cpu_rung_selects_scheduler_slice_from_measured_cpu(self):
         # Migrated from the removed wall-based blocked-residual rung: the
