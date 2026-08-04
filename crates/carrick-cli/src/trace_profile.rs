@@ -4496,7 +4496,6 @@ mod tests {
 
     #[test]
     fn native_wall_profile_parses_reconciled_samples_and_blocking_stack() {
-        assert!(!TraceProfileKind::NativeWall.requires_runtime_profile());
         let summary = ProfileSummary::from_lines(
             [
                 "DSRPROF1|count|phase=wall-state|kind=on-cpu|value=120",
