@@ -18,6 +18,8 @@
 //! Darwin JIT, the assembled gateway, or the C trap shim, none of which link
 //! from this crate before the host-seam slice (M0.6) lands.
 
+#[cfg(feature = "alloc-owner-census")]
+pub mod alloc_owner_census;
 pub mod alloc_owner_wire;
 pub mod artifact_spike;
 pub mod block;
