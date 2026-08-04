@@ -83,8 +83,8 @@ use crate::probes::{
     NativeForkPhase, NativeForkRole, NativeSyscallBranchKind, NativeSyscallServiceOutcome,
 };
 use crate::runtime::{RunResult, RuntimeError, maybe_dump_debug_state};
-use carrick_guest_mem::RepointPrivateError;
 use carrick_guest_mem::protections::MemoryProtections;
+use carrick_guest_mem::{HostVa, RepointPrivateError};
 use carrick_hal::{
     ForkOutcome, RawSyscall, Reg, RegAccess, SysReg, SyscallTrap, TrapError, VcpuRegistry,
 };
@@ -143,6 +143,12 @@ use carrick_dsr::test_hooks::{
 /// silent park).
 static NATIVE_IMAGE_REPLACED_BY_EXEC: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Monotonic identity for native-owned range catalogs within one host process
+/// image. `fork(2)` deliberately inherits the current value; a later guest
+/// exec in either process advances its own copy.
+static NATIVE_OWNED_RANGE_EPOCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Must an EXITED leader park forever instead of surfacing the
 /// no-process-exit diagnostic? True while a sibling's execve owns the
@@ -2452,6 +2458,7 @@ fn run_image_in_current_process(
     if process_entry == NativeCurrentProcessEntry::SelfReexecRestore {
         crate::exec_stamps::stamp(crate::exec_stamps::ExecStampPhase::RuntimeReady);
     }
+    let (owned_host_ranges, host_page_size) = memory.owned_host_range_catalog();
     match run_native_thread_loop(
         dispatcher,
         memory,
@@ -2464,6 +2471,8 @@ fn run_image_in_current_process(
             initial_sp,
             guest_image,
             host_images,
+            owned_host_ranges,
+            host_page_size,
             completion,
         },
     )? {
@@ -2577,6 +2586,8 @@ enum NativeThreadStart {
         initial_sp: u64,
         guest_image: NativeGuestImageCompatibility,
         host_images: Option<crate::probes::PreparedHostImagePublication>,
+        owned_host_ranges: Arc<Vec<std::ops::Range<HostVa>>>,
+        host_page_size: u64,
         completion: NativeInitialProcessCompletion,
     },
     Detached {
@@ -2602,10 +2613,53 @@ trait NativeImagePublisher {
     fn host_base(&mut self, metadata: &crate::probes::PreparedHostImagePublication);
     fn host_catalog(&mut self, metadata: &crate::probes::PreparedHostImagePublication);
     fn guest(&mut self, metadata: &NativeGuestImageCompatibility);
+    fn owned(&mut self, ranges: &[std::ops::Range<HostVa>], host_page_size: u64);
     fn host_jit(&mut self, range: std::ops::Range<u64>);
 }
 
 struct NativeProbeImagePublisher;
+
+struct PreparedNativeOwnedRangeCatalog {
+    reset: crate::probes::NativeOwnedRangeReset,
+    additions: Vec<crate::probes::NativeOwnedRange>,
+    ready: crate::probes::NativeOwnedRangeReady,
+}
+
+fn prepare_native_owned_range_catalog(
+    epoch: crate::probes::NativeOwnedRangeEpoch,
+    ranges: &[std::ops::Range<HostVa>],
+    host_page_size: u64,
+) -> Result<PreparedNativeOwnedRangeCatalog, crate::probes::NativeOwnedRangeError> {
+    let host_page_size = usize::try_from(host_page_size)
+        .map_err(|_| crate::probes::NativeOwnedRangeError::InvalidPageSize)?;
+    let mut additions = Vec::with_capacity(ranges.len());
+    let mut previous_end = None;
+    for (index, range) in ranges.iter().enumerate() {
+        let sequence_value = u64::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_add(1))
+            .ok_or(crate::probes::NativeOwnedRangeError::SequenceOverflow)?;
+        let sequence = crate::probes::NativeOwnedRangeSequence::new(sequence_value)?;
+        let event =
+            crate::probes::NativeOwnedRange::new(epoch, sequence, range.clone(), host_page_size)?;
+        if previous_end.is_some_and(|end: HostVa| end > range.start) {
+            return Err(crate::probes::NativeOwnedRangeError::OverlappingRanges {
+                previous_end: previous_end.map_or(0, HostVa::raw),
+                next_start: range.start.raw(),
+            });
+        }
+        previous_end = Some(range.end);
+        additions.push(event);
+    }
+    let final_sequence = u64::try_from(additions.len())
+        .map_err(|_| crate::probes::NativeOwnedRangeError::SequenceOverflow)?;
+    let ready = crate::probes::NativeOwnedRangeReady::ready(epoch, final_sequence)?;
+    Ok(PreparedNativeOwnedRangeCatalog {
+        reset: crate::probes::NativeOwnedRangeReset::reset(epoch),
+        additions,
+        ready,
+    })
+}
 
 impl NativeImagePublisher for NativeProbeImagePublisher {
     fn host_base(&mut self, metadata: &crate::probes::PreparedHostImagePublication) {
@@ -2624,6 +2678,33 @@ impl NativeImagePublisher for NativeProbeImagePublisher {
         crate::probes::guest_image_base(metadata.base, metadata.entry, &metadata.resolved_path);
         #[cfg(test)]
         record_native_process_handoff_event(NativeProcessHandoffEvent::Guest);
+    }
+
+    fn owned(&mut self, ranges: &[std::ops::Range<HostVa>], host_page_size: u64) {
+        let Ok(previous_epoch) = NATIVE_OWNED_RANGE_EPOCH.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |current| current.checked_add(1),
+        ) else {
+            return;
+        };
+        let Some(epoch_value) = previous_epoch.checked_add(1) else {
+            return;
+        };
+        let Ok(epoch) = crate::probes::NativeOwnedRangeEpoch::new(epoch_value) else {
+            return;
+        };
+        let Ok(catalog) = prepare_native_owned_range_catalog(epoch, ranges, host_page_size) else {
+            return;
+        };
+
+        crate::probes::host_native_owned_range_reset(catalog.reset);
+        for event in catalog.additions {
+            crate::probes::host_native_owned_range_add(event);
+        }
+        crate::probes::host_native_owned_range_ready(catalog.ready);
+        #[cfg(test)]
+        record_native_process_handoff_event(NativeProcessHandoffEvent::HostOwned);
     }
 
     fn host_jit(&mut self, range: std::ops::Range<u64>) {
@@ -2659,6 +2740,8 @@ fn publish_native_process_images(
     process: &dsr::ProcessTranslator,
     host_images: Option<&crate::probes::PreparedHostImagePublication>,
     guest_image: &NativeGuestImageCompatibility,
+    owned_host_ranges: &[std::ops::Range<HostVa>],
+    host_page_size: u64,
     publisher: &mut impl NativeImagePublisher,
 ) {
     // The USDT closure performs the dyld walk only when a consumer enables the
@@ -2669,6 +2752,7 @@ fn publish_native_process_images(
         publisher.host_catalog(host_images);
     }
     publisher.guest(guest_image);
+    publisher.owned(owned_host_ranges, host_page_size);
     publisher.host_jit(process.cache_host_range());
 }
 
@@ -2696,6 +2780,8 @@ fn install_native_thread_start_with<
             initial_sp,
             guest_image,
             host_images,
+            owned_host_ranges,
+            host_page_size,
             completion,
         } => {
             let installed = prepare_activate_publish_commit_native_process(
@@ -2707,6 +2793,8 @@ fn install_native_thread_start_with<
                         selected,
                         host_images.as_ref(),
                         &guest_image,
+                        &owned_host_ranges,
+                        host_page_size,
                         publisher,
                     );
                 },
@@ -2772,6 +2860,7 @@ enum NativeProcessHandoffEvent {
     HostBase,
     HostCatalog,
     Guest,
+    HostOwned,
     HostJit,
     InstallationCommit,
     SnapshotInstalled,
@@ -2908,6 +2997,8 @@ fn complete_native_in_process_exec_handoff(
     process: Arc<dsr::ProcessTranslator>,
     host_images: Option<&crate::probes::PreparedHostImagePublication>,
     guest_image: &NativeGuestImageCompatibility,
+    owned_host_ranges: &[std::ops::Range<HostVa>],
+    host_page_size: u64,
     translator: &mut dsr::ThreadTranslator,
     entry: u64,
     initial_sp: u64,
@@ -2926,6 +3017,8 @@ fn complete_native_in_process_exec_handoff(
                 selected,
                 host_images,
                 guest_image,
+                owned_host_ranges,
+                host_page_size,
                 &mut NativeProbeImagePublisher,
             );
         },
@@ -4425,10 +4518,13 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         translator.begin_exec_reset();
                         translator.begin_exec_handoff();
                         let next_process = memory.read().dsr_process_translator()?;
+                        let (owned_host_ranges, host_page_size) = memory.owned_host_range_catalog();
                         complete_native_in_process_exec_handoff(
                             next_process,
                             host_images.as_ref(),
                             &guest_image,
+                            &owned_host_ranges,
+                            host_page_size,
                             &mut translator,
                             entry,
                             initial_sp,
@@ -7875,10 +7971,18 @@ mod tests {
         crate::probes::prepare_host_image_publication()
     }
 
+    fn handoff_owned_ranges() -> [std::ops::Range<HostVa>; 2] {
+        [
+            HostVa(0x4000)..HostVa(0xc000),
+            HostVa(0x1_0000)..HostVa(0x1_4000),
+        ]
+    }
+
     struct RecordingNativeImagePublisher<'a> {
         events: &'a RefCell<Vec<&'static str>>,
         expected_host_images: Option<*const crate::probes::PreparedHostImagePublication>,
         expected_guest: &'a NativeGuestImageCompatibility,
+        expected_owned_host_ranges: Option<&'a [std::ops::Range<HostVa>]>,
         expected_host_jit: std::ops::Range<u64>,
         require_same_guest_address: bool,
     }
@@ -7911,10 +8015,65 @@ mod tests {
             self.events.borrow_mut().push("guest");
         }
 
+        fn owned(
+            &mut self,
+            ranges: &[std::ops::Range<carrick_guest_mem::HostVa>],
+            host_page_size: u64,
+        ) {
+            assert_eq!(host_page_size, 16 * 1024);
+            if let Some(expected) = self.expected_owned_host_ranges {
+                assert_eq!(ranges, expected);
+            }
+            self.events.borrow_mut().push("host-owned");
+        }
+
         fn host_jit(&mut self, range: std::ops::Range<u64>) {
             assert_eq!(range, self.expected_host_jit);
             self.events.borrow_mut().push("host-jit");
         }
+    }
+
+    #[test]
+    fn native_owned_catalog_has_unique_sequences_and_exact_ready_frontier() {
+        let epoch = crate::probes::NativeOwnedRangeEpoch::new(11).expect("epoch");
+        let catalog = prepare_native_owned_range_catalog(epoch, &handoff_owned_ranges(), 16 * 1024)
+            .expect("valid catalog");
+
+        assert_eq!(catalog.reset.epoch(), epoch);
+        assert_eq!(
+            catalog
+                .additions
+                .iter()
+                .map(|event| event.sequence().get())
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(catalog.ready.epoch(), epoch);
+        assert_eq!(catalog.ready.final_sequence(), 2);
+    }
+
+    #[test]
+    fn native_owned_catalog_rejects_incomplete_or_ambiguous_inputs() {
+        let epoch = crate::probes::NativeOwnedRangeEpoch::new(12).expect("epoch");
+        assert!(matches!(
+            prepare_native_owned_range_catalog(epoch, &[], 16 * 1024),
+            Err(crate::probes::NativeOwnedRangeError::EmptyCatalog)
+        ));
+        assert!(matches!(
+            prepare_native_owned_range_catalog(
+                epoch,
+                &[
+                    HostVa(0x4000)..HostVa(0xc000),
+                    HostVa(0x8000)..HostVa(0x1_0000),
+                ],
+                16 * 1024,
+            ),
+            Err(crate::probes::NativeOwnedRangeError::OverlappingRanges { .. })
+        ));
+        assert!(matches!(
+            prepare_native_owned_range_catalog(epoch, &[HostVa(0x4001)..HostVa(0x8000)], 16 * 1024,),
+            Err(crate::probes::NativeOwnedRangeError::UnalignedRange { .. })
+        ));
     }
 
     #[test]
@@ -7923,11 +8082,13 @@ mod tests {
         let process_range = process.cache_host_range();
         let host_images = handoff_host_images();
         let guest_image = handoff_guest_image();
+        let owned_host_ranges = handoff_owned_ranges();
         let events = RefCell::new(Vec::new());
         let mut publisher = RecordingNativeImagePublisher {
             events: &events,
             expected_host_images: Some(&raw const host_images),
             expected_guest: &guest_image,
+            expected_owned_host_ranges: Some(&owned_host_ranges),
             expected_host_jit: process_range,
             require_same_guest_address: true,
         };
@@ -7944,6 +8105,8 @@ mod tests {
                     selected,
                     Some(&host_images),
                     &guest_image,
+                    &owned_host_ranges,
+                    16 * 1024,
                     &mut publisher,
                 );
             },
@@ -7970,6 +8133,7 @@ mod tests {
                 "host-base",
                 "host-catalog",
                 "guest",
+                "host-owned",
                 "host-jit",
                 "install",
                 "completion",
@@ -7987,6 +8151,7 @@ mod tests {
             events: &events,
             expected_host_images: Some(&raw const host_images),
             expected_guest: &guest_image,
+            expected_owned_host_ranges: None,
             expected_host_jit: process.cache_host_range(),
             require_same_guest_address: true,
         };
@@ -8003,6 +8168,8 @@ mod tests {
                     selected,
                     Some(&host_images),
                     &guest_image,
+                    &handoff_owned_ranges(),
+                    16 * 1024,
                     &mut publisher,
                 );
             },
@@ -8061,6 +8228,8 @@ mod tests {
                 Arc::clone(&replacement),
                 None,
                 &guest_image,
+                &handoff_owned_ranges(),
+                16 * 1024,
                 &mut retiring_thread,
                 guest_image.entry,
                 0x50_0000,
@@ -8163,6 +8332,8 @@ mod tests {
                     initial_sp: 0x50_0000,
                     guest_image,
                     host_images: None,
+                    owned_host_ranges: Arc::new(handoff_owned_ranges().into()),
+                    host_page_size: 16 * 1024,
                     completion: NativeInitialProcessCompletion::SelfReexec,
                 },
                 &dispatcher,
@@ -8202,6 +8373,7 @@ mod tests {
             events: &initial_events,
             expected_host_images: None,
             expected_guest: &guest_image,
+            expected_owned_host_ranges: None,
             expected_host_jit: initial_process.cache_host_range(),
             require_same_guest_address: false,
         };
@@ -8210,6 +8382,8 @@ mod tests {
             initial_sp: 0x50_0000,
             guest_image: handoff_guest_image(),
             host_images: None,
+            owned_host_ranges: Arc::new(handoff_owned_ranges().into()),
+            host_page_size: 16 * 1024,
             completion: NativeInitialProcessCompletion::Boot,
         };
         install_native_thread_start_with(
@@ -8233,7 +8407,14 @@ mod tests {
         .expect("install initial thread");
         assert_eq!(
             initial_events.into_inner(),
-            ["activate", "guest", "host-jit", "install", "completion"]
+            [
+                "activate",
+                "guest",
+                "host-owned",
+                "host-jit",
+                "install",
+                "completion"
+            ]
         );
         assert_eq!(
             initial_process.translated_range_catalog_state_for_test(),
@@ -8247,6 +8428,7 @@ mod tests {
             events: &detached_events,
             expected_host_images: None,
             expected_guest: &guest_image,
+            expected_owned_host_ranges: None,
             expected_host_jit: detached_process.cache_host_range(),
             require_same_guest_address: false,
         };
@@ -9284,6 +9466,10 @@ mod tests {
             assert_eq!(shared.host_page_size(), expected_host_page_size);
             assert_eq!(shared.linux_page_size(), expected_linux_page_size);
             assert_eq!(shared.owned_host_ranges(), expected_owned_host_ranges);
+            assert_eq!(
+                shared.owned_host_range_catalog(),
+                (expected_owned_host_ranges, expected_host_page_size)
+            );
         });
     }
 
@@ -10368,6 +10554,7 @@ mod tests {
                 events: &events,
                 expected_host_images: None,
                 expected_guest: &guest_image,
+                expected_owned_host_ranges: None,
                 expected_host_jit: candidate.cache_host_range(),
                 require_same_guest_address: true,
             };
@@ -10382,7 +10569,14 @@ mod tests {
                     selected.activate_translated_range_catalog()
                 },
                 |selected| {
-                    publish_native_process_images(selected, None, &guest_image, &mut publisher);
+                    publish_native_process_images(
+                        selected,
+                        None,
+                        &guest_image,
+                        &handoff_owned_ranges(),
+                        16 * 1024,
+                        &mut publisher,
+                    );
                 },
                 |prepared| {
                     events.borrow_mut().push("install");
@@ -10396,7 +10590,14 @@ mod tests {
             .expect("activate and install fresh replacement");
             assert_eq!(
                 events.into_inner(),
-                ["activate", "guest", "host-jit", "install", "completion"],
+                [
+                    "activate",
+                    "guest",
+                    "host-owned",
+                    "host-jit",
+                    "install",
+                    "completion"
+                ],
             );
             assert_eq!(
                 candidate.translated_range_catalog_state_for_test(),
@@ -10542,6 +10743,10 @@ mod tests {
             assert_eq!(shared.host_page_size(), guard.host_page_size);
             assert_eq!(shared.linux_page_size(), guard.linux_page_size);
             assert_eq!(shared.owned_host_ranges(), guard.owned_host_ranges);
+            assert_eq!(
+                shared.owned_host_range_catalog(),
+                (Arc::clone(&guard.owned_host_ranges), guard.host_page_size)
+            );
             assert_ne!(
                 shared.owned_host_ranges(),
                 source_owned_host_ranges,
@@ -10761,6 +10966,7 @@ mod tests {
                     events: &events,
                     expected_host_images: None,
                     expected_guest: &guest_image,
+                    expected_owned_host_ranges: None,
                     expected_host_jit: inherited_process.cache_host_range(),
                     require_same_guest_address: true,
                 };
@@ -10776,7 +10982,14 @@ mod tests {
                     },
                     dsr::ProcessTranslator::activate_translated_range_catalog,
                     |selected| {
-                        publish_native_process_images(selected, None, &guest_image, &mut publisher);
+                        publish_native_process_images(
+                            selected,
+                            None,
+                            &guest_image,
+                            &handoff_owned_ranges(),
+                            16 * 1024,
+                            &mut publisher,
+                        );
                     },
                     dsr::PreparedThreadExecHandoff::commit,
                     || Ok::<_, dsr::types::DsrError>(()),

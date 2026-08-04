@@ -62,7 +62,7 @@ existing native launch qualification, existing libdtrace trace runner.
 - Consumes `NativeMappedMemory::owned_host_ranges`, which is immutable within
   one image and wholesale-replaced only by exec.
 
-- [ ] **Step 1: Write red typed-catalog and handoff-order tests**
+- [x] **Step 1: Write red typed-catalog and handoff-order tests**
 
 Add literal tests that reject zero epochs/sequences, empty/reversed/unaligned
 ranges, duplicate sequence, and ready frontiers that do not equal the
@@ -74,7 +74,7 @@ handoff expects this exact order:
 The production mutation these tests catch is publishing a partial or stale
 mapping catalog before the replacement image is fully active.
 
-- [ ] **Step 2: Run the focused tests and prove red**
+- [x] **Step 2: Run the focused tests and prove red**
 
 Run:
 
@@ -84,14 +84,14 @@ Run:
 Expected: compile failure because the typed owned-range events and publisher
 method do not exist.
 
-- [ ] **Step 3: Implement the minimal typed event wire**
+- [x] **Step 3: Implement the minimal typed event wire**
 
 Add newtype-validated epoch and sequence values plus one validated range event.
 Add matching real and stub probe signatures. The reset and ready events carry
 one scalar each; add carries epoch, sequence, start, and end. Keep all raw
 ordinals private to the wrappers.
 
-- [ ] **Step 4: Publish one complete catalog per initial or replacement image**
+- [x] **Step 4: Publish one complete catalog per initial or replacement image**
 
 Give NativeImagePublisher an
 `owned(&[Range<HostVa>])` method and pass the current NativeMemoryHandle into
@@ -100,7 +100,7 @@ monotonic nonzero epochs; fork inherits the current epoch and catalog through
 copy-on-write. Fire reset, every exact range in sorted non-overlapping order,
 then ready. Refuse publication on epoch overflow.
 
-- [ ] **Step 5: Run focused gates and commit**
+- [x] **Step 5: Run focused gates and commit**
 
 Run:
 
