@@ -112,6 +112,8 @@ use crate::debug_layout::native_x86_layout_json;
 #[cfg(feature = "platform-macos")]
 use crate::fs_setup::install_fs_backend;
 #[cfg(target_os = "macos")]
+use crate::native_fault_profile::NativeFaultSummary;
+#[cfg(target_os = "macos")]
 use crate::native_profile_qualification::run_native_profile_qualifications;
 use crate::native_profile_qualification::validate_qualification_paths;
 use crate::runtime_util::{
@@ -1564,35 +1566,65 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         .ok_or_else(|| anyhow::anyhow!("profile trace has no output path"))?;
                     let capture_status = report.into();
                     #[cfg(target_os = "macos")]
-                    let mut summary = if requested_profile
-                        == crate::trace_profile::TraceProfileKind::NativeWall
-                        && path_has_v2_header(raw_path)?
                     {
-                        let authority = native_profile_authority.clone().ok_or_else(|| {
-                            anyhow::anyhow!("DSRPROF2 stream has no launch authority")
-                        })?;
-                        ProfileSummary::from_v2_path_with_authority(
-                            raw_path,
-                            capture_status,
-                            authority,
-                        )?
-                    } else {
-                        ProfileSummary::from_path(raw_path, capture_status)?
-                    };
-                    #[cfg(target_os = "freebsd")]
-                    let mut summary = ProfileSummary::from_path(raw_path, capture_status)?;
-                    summary.require_profile(requested_profile)?;
-                    #[cfg(target_os = "macos")]
-                    if let Some(overlay) = sampled_kernel_overlay {
-                        summary.attach_sampled_kernel_overlay(overlay)?;
+                        if requested_profile == crate::trace_profile::TraceProfileKind::NativeFault
+                        {
+                            let authority = native_profile_authority.clone().ok_or_else(|| {
+                                anyhow::anyhow!("NFAULT2 stream has no launch authority")
+                            })?;
+                            let mut summary =
+                                NativeFaultSummary::from_path(raw_path, capture_status, authority)?;
+                            summary.set_provenance(capture_provenance(&me, &command)?);
+                            eprintln!("{}", summary.render_human());
+                            if let Some(summary_path) = summary_jsonl.as_deref() {
+                                let owner = drop_credentials
+                                    .as_ref()
+                                    .map(|value| (value.uid, value.gid));
+                                summary.write_atomic(summary_path, owner)?;
+                            }
+                        } else {
+                            let mut summary = if requested_profile
+                                == crate::trace_profile::TraceProfileKind::NativeWall
+                                && path_has_v2_header(raw_path)?
+                            {
+                                let authority =
+                                    native_profile_authority.clone().ok_or_else(|| {
+                                        anyhow::anyhow!("DSRPROF2 stream has no launch authority")
+                                    })?;
+                                ProfileSummary::from_v2_path_with_authority(
+                                    raw_path,
+                                    capture_status,
+                                    authority,
+                                )?
+                            } else {
+                                ProfileSummary::from_path(raw_path, capture_status)?
+                            };
+                            summary.require_profile(requested_profile)?;
+                            if let Some(overlay) = sampled_kernel_overlay {
+                                summary.attach_sampled_kernel_overlay(overlay)?;
+                            }
+                            summary.set_provenance(capture_provenance(&me, &command)?);
+                            eprintln!("{}", summary.render_human());
+                            if let Some(summary_path) = summary_jsonl.as_deref() {
+                                let owner = drop_credentials
+                                    .as_ref()
+                                    .map(|value| (value.uid, value.gid));
+                                write_summary_atomic(summary_path, &summary, owner)?;
+                            }
+                        }
                     }
-                    summary.set_provenance(capture_provenance(&me, &command)?);
-                    eprintln!("{}", summary.render_human());
-                    if let Some(summary_path) = summary_jsonl.as_deref() {
-                        let owner = drop_credentials
-                            .as_ref()
-                            .map(|value| (value.uid, value.gid));
-                        write_summary_atomic(summary_path, &summary, owner)?;
+                    #[cfg(target_os = "freebsd")]
+                    {
+                        let mut summary = ProfileSummary::from_path(raw_path, capture_status)?;
+                        summary.require_profile(requested_profile)?;
+                        summary.set_provenance(capture_provenance(&me, &command)?);
+                        eprintln!("{}", summary.render_human());
+                        if let Some(summary_path) = summary_jsonl.as_deref() {
+                            let owner = drop_credentials
+                                .as_ref()
+                                .map(|value| (value.uid, value.gid));
+                            write_summary_atomic(summary_path, &summary, owner)?;
+                        }
                     }
                 }
             }
