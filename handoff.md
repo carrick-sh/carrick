@@ -20,18 +20,18 @@ an appendix of rejected alternatives so nobody re-litigates them.
 
 ## Where we are
 
-The authoritative shipped-default cold-build scoreboard is the serialized,
-five-sample Carrick-then-Docker run in
-[`docs/perf-results/2026-08-03-persistent-store-default-confirmation.md`](docs/perf-results/2026-08-03-persistent-store-default-confirmation.md):
+The authoritative shipped-default cold-build scoreboard is the refreshed,
+serialized five-sample Carrick-then-Docker run in
+[`docs/perf-results/2026-08-04-current-default-wall-refresh.md`](docs/perf-results/2026-08-04-current-default-wall-refresh.md):
 
 | metric | Carrick | Docker | ratio |
 |---|---:|---:|---:|
-| cold `go build` workload wall | 8,575 ms | 821 ms | **10.4446x** |
-| cold `go build` process elapsed | 9,326 ms | 977 ms | **9.5455x** |
+| cold `go build` workload wall | 8,254 ms | 811 ms | **10.1776x** |
+| cold `go build` process elapsed | 8,991 ms | 995 ms | **9.0362x** |
 
-This is still the official ratio. Reaching 3x requires removing another 71.28%
-of Carrick's current workload wall (a 3.4815x reduction); reaching the 2x
-product bar requires removing 80.85% (5.2223x).
+This supersedes the prior 10.4446x result. Reaching 3x requires removing another
+70.52% of Carrick's current workload wall (a 3.3925x reduction); reaching the
+2x product bar requires removing 80.35% (5.0888x).
 
 The required current-default three-sample workload spread is also complete:
 compute **3.3868x**, fs-walk **18.9286x**, 20-exec `compile -V` **72.1579x**,
@@ -137,9 +137,12 @@ published-block mirror while leaving authoritative translation/publication
 semantics under the original lock. An eight-quad signed-binary ABBA measured
 total-CPU ratio **0.91498** (95% interval **[0.91023, 0.92113]**, 8/8 wins,
 exact sign p=1/256): a retained **8.50% CPU reduction**. System CPU fell 23.46%.
-Workload-wall ratio was 0.98593 but its interval crossed parity, so no wall win
-or official Carrick/Docker refresh is claimed. Candidate stacks prove the old
-reader paths disappeared and the remaining wait is exclusive translation.
+Workload-wall ratio was 0.98593 but its interval crossed parity, so no causal
+wall win is claimed. A subsequent serialized shipped-default refresh measured
+8,254 ms Carrick / 811 ms Docker = **10.1776x**; that is current scoreboard
+authority, while the ABBA remains mechanism authority. Candidate stacks prove
+the old reader paths disappeared and the remaining wait is exclusive
+translation.
 Full evidence:
 [`docs/perf-results/2026-08-04-memory-intent-and-published-block-lock.md`](docs/perf-results/2026-08-04-memory-intent-and-published-block-lock.md).
 
@@ -192,8 +195,10 @@ The exec/exit, context-traffic, fault-publication, residual-allocation, broad-
 attribution, and memory-intent lines are closed at measurement. Their exact
 exporters and censuses remain opt-in diagnostics. A crashed run can also be
 read from a saved core through the always-on event ring. The lock split is a
-retained CPU win, but no official ratio refresh is warranted because wall time
-did not resolve below parity.
+retained CPU win; its ABBA wall interval did not resolve below parity. The
+user-requested serialized current-default refresh is nevertheless complete and
+sets the official absolute scoreboard to 10.1776x without converting that
+scoreboard movement into a causal lock-split claim.
 
 1. **Shorten or partition exclusive translation without making the JIT cache
    concurrently writable.** Candidate stacks now end at
@@ -233,7 +238,7 @@ did not resolve below parity.
   step. Waiting is independently ~15.2% of sampled CPU and translation phases
   total ~25.5%, but moving decode outside the lock can duplicate work and may
   trade wait CPU for extra user CPU unless per-key ownership is precise.
-- **High (95%):** the official shipped-default result remains 10.4446x. No
+- **High (95%):** the official shipped-default result is now 10.1776x. No
   projection or unresolved wall result was substituted for a fresh
   Carrick/Docker run.
 - **High (90%):** the sequential ≥10% policy is the right route toward 3x.

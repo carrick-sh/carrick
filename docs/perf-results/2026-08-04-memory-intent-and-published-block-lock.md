@@ -30,9 +30,11 @@ probability is 1/256. This is below the campaign's preferred 10% step size but
 is retained: it removes a measured source-distinct wait, has a narrow
 correctness surface, and exposes the next larger exclusive-lock mechanism.
 
-Wall time is not claimed as improved. The workload-wall median paired ratio was
-0.98593, but its 95% interval **[0.98174, 1.00320]** crosses parity. The
-official shipped-default Carrick/Docker ratio therefore remains **10.4446x**.
+Wall time is not causally claimed as improved. The workload-wall median paired
+ratio was 0.98593, but its 95% interval **[0.98174, 1.00320]** crosses parity.
+At this experiment's decision point the official shipped-default ratio remained
+10.4446x; the subsequent serialized refresh supersedes it with 10.1776x in
+[`2026-08-04-current-default-wall-refresh.md`](2026-08-04-current-default-wall-refresh.md).
 
 ## Memory-intent evidence
 

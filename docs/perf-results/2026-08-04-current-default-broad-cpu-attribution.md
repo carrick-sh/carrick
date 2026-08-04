@@ -27,8 +27,9 @@ experiment.
 
 This is mechanism evidence, not timing authority. DTrace materially perturbs
 the workload, so the 27.94-28.58 s traced elapsed values are discarded. The
-official shipped-default cold-build result remains **10.4446x** native-arm64
-Docker.
+then-official shipped-default result remained 10.4446x native-arm64 Docker.
+The later untraced serialized refresh supersedes it with 10.1776x in
+[`2026-08-04-current-default-wall-refresh.md`](2026-08-04-current-default-wall-refresh.md).
 
 ## Bound inputs
 
