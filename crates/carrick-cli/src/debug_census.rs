@@ -66,7 +66,7 @@ use carrick_runtime::xlat_census::{
 use serde::Serialize;
 
 /// Schema tag on the emitted JSON. Bump when a field's meaning changes.
-const REPORT_SCHEMA: &str = "carrick.xlat-census.v2";
+const REPORT_SCHEMA: &str = "carrick.xlat-census.v3";
 
 /// Filename prefix `xlat_census::flush` writes (`xlat-<pid>-<stamp>-<seq>.txt`).
 const CENSUS_FILE_PREFIX: &str = "xlat-";
@@ -242,6 +242,24 @@ pub(crate) struct ProcessesSection {
     pub coverage: Option<f64>,
 }
 
+/// Exact source-local publication allocation totals. These deliberately do
+/// not convert bytes into fault cost; the fault-ownership report owns that
+/// separate denominator.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct MemorySection {
+    pub private_blocks: u64,
+    pub unit_blocks: u64,
+    pub jit_bytes_written: u64,
+    pub owned_map_entries: u64,
+    pub owned_map_capacity_bytes: u64,
+    pub owned_recovery_entries: u64,
+    pub owned_recovery_capacity_bytes: u64,
+    pub owned_metadata_capacity_bytes: u64,
+    pub direct_link_capacity_bytes: u64,
+    pub owned_metadata_bytes_per_private_block: f64,
+    pub recovery_share_of_owned_metadata: f64,
+}
+
 /// What the shared-translation store did, summed over every process.
 ///
 /// This is the section that discriminates the three explanations for a cache
@@ -319,6 +337,7 @@ pub(crate) struct CensusReport {
     pub unit_keys: UnitKeysSection,
     pub store: StoreSection,
     pub processes: ProcessesSection,
+    pub memory: MemorySection,
 }
 
 /// A census directory read into memory: the files that parsed, and the ones
@@ -588,6 +607,53 @@ pub(crate) fn aggregate(scan: &CensusScan, top: usize, observed: Option<u64>) ->
         },
         store: store_section(&scan.files),
         processes: process_section(&scan.files, observed),
+        memory: memory_section(&scan.files),
+    }
+}
+
+fn memory_section(files: &[CensusFile]) -> MemorySection {
+    let mut private_blocks = 0u64;
+    let mut unit_blocks = 0u64;
+    let mut jit_bytes_written = 0u64;
+    let mut owned_map_entries = 0u64;
+    let mut owned_map_capacity_bytes = 0u64;
+    let mut owned_recovery_entries = 0u64;
+    let mut owned_recovery_capacity_bytes = 0u64;
+    let mut direct_link_capacity_bytes = 0u64;
+    for file in files {
+        private_blocks = private_blocks.saturating_add(file.memory.private_blocks);
+        unit_blocks = unit_blocks.saturating_add(file.memory.unit_blocks);
+        jit_bytes_written = jit_bytes_written.saturating_add(file.memory.jit_bytes_written);
+        owned_map_entries = owned_map_entries.saturating_add(file.memory.owned_map_entries);
+        owned_map_capacity_bytes =
+            owned_map_capacity_bytes.saturating_add(file.memory.owned_map_capacity_bytes);
+        owned_recovery_entries =
+            owned_recovery_entries.saturating_add(file.memory.owned_recovery_entries);
+        owned_recovery_capacity_bytes =
+            owned_recovery_capacity_bytes.saturating_add(file.memory.owned_recovery_capacity_bytes);
+        direct_link_capacity_bytes =
+            direct_link_capacity_bytes.saturating_add(file.memory.direct_link_capacity_bytes);
+    }
+    let owned_metadata_capacity_bytes =
+        owned_map_capacity_bytes.saturating_add(owned_recovery_capacity_bytes);
+    MemorySection {
+        private_blocks,
+        unit_blocks,
+        jit_bytes_written,
+        owned_map_entries,
+        owned_map_capacity_bytes,
+        owned_recovery_entries,
+        owned_recovery_capacity_bytes,
+        owned_metadata_capacity_bytes,
+        direct_link_capacity_bytes,
+        owned_metadata_bytes_per_private_block: ratio(
+            owned_metadata_capacity_bytes,
+            private_blocks,
+        ),
+        recovery_share_of_owned_metadata: ratio(
+            owned_recovery_capacity_bytes,
+            owned_metadata_capacity_bytes,
+        ),
     }
 }
 
@@ -792,7 +858,9 @@ pub(crate) fn run_xlat_census(dir: &Path, top: usize, observed: Option<u64>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carrick_runtime::xlat_census::{CensusImage, CensusRecord, CensusSegment, CensusStore};
+    use carrick_runtime::xlat_census::{
+        CensusImage, CensusMemory, CensusRecord, CensusSegment, CensusStore,
+    };
 
     fn stem(byte: u8) -> String {
         format!("{byte:02x}").repeat(32)
@@ -854,6 +922,16 @@ mod tests {
                     image: Some(image("cafe")),
                     records: records.clone(),
                     store: lane_off_store(4),
+                    memory: CensusMemory {
+                        private_blocks: 4,
+                        jit_bytes_written: 400,
+                        owned_map_entries: 20,
+                        owned_map_capacity_bytes: 320,
+                        owned_recovery_entries: 40,
+                        owned_recovery_capacity_bytes: 2880,
+                        direct_link_capacity_bytes: 64,
+                        ..CensusMemory::default()
+                    },
                 },
                 CensusFile {
                     pid: 11,
@@ -863,6 +941,16 @@ mod tests {
                     image: Some(image("cafe")),
                     records,
                     store: lane_off_store(4),
+                    memory: CensusMemory {
+                        private_blocks: 3,
+                        unit_blocks: 1,
+                        jit_bytes_written: 500,
+                        owned_map_entries: 15,
+                        owned_map_capacity_bytes: 240,
+                        owned_recovery_entries: 30,
+                        owned_recovery_capacity_bytes: 2160,
+                        direct_link_capacity_bytes: 96,
+                    },
                 },
             ],
             failures: Vec::new(),
@@ -880,6 +968,22 @@ mod tests {
         assert_eq!(report.translations.distinct_scoped_blocks, 4);
         assert!((report.translations.redundancy_upper - 2.0).abs() < f64::EPSILON);
         assert!((report.translations.redundancy_lower - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn publication_memory_is_summed_without_mixing_retained_and_transient_bytes() {
+        let report = aggregate(&two_process_scan(), 8, None);
+        assert_eq!(report.memory.private_blocks, 7);
+        assert_eq!(report.memory.unit_blocks, 1);
+        assert_eq!(report.memory.jit_bytes_written, 900);
+        assert_eq!(report.memory.owned_map_entries, 35);
+        assert_eq!(report.memory.owned_map_capacity_bytes, 560);
+        assert_eq!(report.memory.owned_recovery_entries, 70);
+        assert_eq!(report.memory.owned_recovery_capacity_bytes, 5040);
+        assert_eq!(report.memory.owned_metadata_capacity_bytes, 5600);
+        assert_eq!(report.memory.direct_link_capacity_bytes, 160);
+        assert!((report.memory.owned_metadata_bytes_per_private_block - 800.0).abs() < 1e-9);
+        assert!((report.memory.recovery_share_of_owned_metadata - 0.9).abs() < 1e-9);
     }
 
     #[test]
@@ -980,6 +1084,7 @@ mod tests {
             image: Some(image("cafe")),
             records: vec![record(0x40_0010, Some(0), SegmentCoverage::Contained, 1)],
             store: lane_off_store(1),
+            memory: CensusMemory::default(),
         };
         CensusScan {
             files: vec![
@@ -1261,6 +1366,7 @@ mod tests {
                 loaded: 1,
                 ..CensusStore::default()
             },
+            memory: CensusMemory::default(),
         });
         let report = aggregate(&scan, 8, None);
         assert_eq!(report.translations.total, 8);
@@ -1284,5 +1390,6 @@ mod tests {
         assert_eq!(json["processes"]["incarnations"], 2);
         assert_eq!(json["store"]["lookups"], 8);
         assert_eq!(json["store"]["skipped"]["lane-unconfigured"], 8);
+        assert_eq!(json["memory"]["owned_metadata_capacity_bytes"], 5600);
     }
 }
