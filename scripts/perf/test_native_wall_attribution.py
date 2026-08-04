@@ -148,6 +148,7 @@ def profile_rows(
         row(
             "cpu-kernel-pc",
             exact(count=kernel_samples),
+            kind="kernel-non-syscall",
             source_pc=0xFFFF_0000,
             drops=drops,
         ),
@@ -213,6 +214,14 @@ class NativeWallAttributionTest(unittest.TestCase):
         self.assertAlmostEqual(summary["wall_state"]["on-cpu"]["share"], 120 / 197)
         self.assertEqual(summary["reconciliation"]["wall_samples"], 197)
         self.assertAlmostEqual(summary["cpu"]["translated-guest"]["share"], 450 / 499)
+        self.assertEqual(
+            summary["cpu"]["kernel-classes"]["kernel-non-syscall"]["samples"],
+            49,
+        )
+        self.assertEqual(
+            summary["cpu"]["kernel-classes"]["kernel-named-syscall"]["samples"],
+            0,
+        )
         self.assertEqual(summary["cpu"]["unresolved"]["samples"], 0)
         self.assertAlmostEqual(summary["offcpu"]["top_stack_coverage"], 0.9)
         self.assertTrue(summary["accepted"])
@@ -506,6 +515,28 @@ class NativeWallAttributionTest(unittest.TestCase):
         self.assertFalse(comparison["accepted"])
         self.assertTrue(
             any("percentage points" in reason for reason in comparison["failures"])
+        )
+
+    def test_comparison_reports_kernel_class_stability(self):
+        stable_a = native_wall_attribution.summarize(
+            native_wall_attribution.load_profile(
+                self.write_profile(profile_rows(kernel_samples=60), "a.jsonl")
+            ),
+            pathlib.Path("/unused/carrick"),
+        )
+        stable_b = native_wall_attribution.summarize(
+            native_wall_attribution.load_profile(
+                self.write_profile(profile_rows(kernel_samples=62), "b.jsonl")
+            ),
+            pathlib.Path("/unused/carrick"),
+        )
+
+        comparison = native_wall_attribution.compare(stable_a, stable_b)
+
+        self.assertTrue(comparison["accepted"])
+        self.assertAlmostEqual(
+            comparison["kernel_class_absolute_deltas"]["kernel-non-syscall"],
+            abs(60 / 510 - 62 / 512),
         )
 
 
