@@ -629,6 +629,7 @@ pub struct CodeSnapshot {
 pub struct TrustedRouteSnapshot {
     pub guest_start: u64,
     pub generation: u64,
+    pub origin: TrustedRouteOrigin,
     pub fallthrough: std::ops::Range<u64>,
     pub direct: std::ops::Range<u64>,
     pub indirect: std::ops::Range<u64>,
@@ -636,6 +637,13 @@ pub struct TrustedRouteSnapshot {
     pub direct_branch: u64,
     pub indirect_branch: u64,
     pub common_body: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TrustedRouteOrigin {
+    Owned,
+    UnitReplay,
 }
 
 pub struct ProcessTranslator {
@@ -2317,13 +2325,27 @@ impl ProcessTranslator {
         let cache_base = range.start as u64;
         let mut trusted_routes = Vec::with_capacity(state.trusted_route_entries.len());
         for (&(guest, generation), routes) in &state.trusted_route_entries {
-            if !state.blocks.contains_key(&(guest, generation)) {
-                return Err(types::DsrError::CachePolicy(format!(
+            let entry = state.blocks.get(&(guest, generation)).ok_or_else(|| {
+                types::DsrError::CachePolicy(format!(
                     "trusted route for guest 0x{:x} generation {} has no block",
                     guest.raw(),
                     generation.get()
-                )));
-            }
+                ))
+            })?;
+            let published = state
+                .published_block_containing(entry.host().raw())
+                .filter(|published| published.entry == *entry)
+                .ok_or_else(|| {
+                    types::DsrError::CachePolicy(format!(
+                        "trusted route for guest 0x{:x} generation {} has no published metadata",
+                        guest.raw(),
+                        generation.get()
+                    ))
+                })?;
+            let origin = match &published.metadata {
+                PublishedBlockMetadata::Owned { .. } => TrustedRouteOrigin::Owned,
+                PublishedBlockMetadata::Unit { .. } => TrustedRouteOrigin::UnitReplay,
+            };
             let relative = |address: types::CacheVa, name: &str| {
                 let address = address.host().raw() as u64;
                 let offset = address.checked_sub(cache_base).ok_or_else(|| {
@@ -2383,6 +2405,7 @@ impl ProcessTranslator {
             trusted_routes.push(TrustedRouteSnapshot {
                 guest_start: guest.raw(),
                 generation: generation.get(),
+                origin,
                 fallthrough_branch: fallthrough.end,
                 direct_branch: direct.end,
                 indirect_branch: indirect.end,
@@ -4913,6 +4936,7 @@ mod tests {
         TranslatedRangeRecorder, merge_sensitive_metadata, translation_source_words_required,
     };
     use crate::types;
+    use carrick_dsr::cache::PageGenerationTable;
     use carrick_dsr::host::{ForkChildJit, JitRegion, NativeHostJit};
     use carrick_dsr::probes::{
         DsrCacheLifecyclePhase, TranslatedPrivateRange, TranslatedRangeAdd, TranslatedRangeEpoch,
@@ -5682,6 +5706,16 @@ mod tests {
         let published = state.cache.publish_words(words).expect("publish");
         let entry = published.entry();
         let key = (GuestVa(0x40_0000), types::CodeGeneration::claimed(7));
+        let generations = PageGenerationTable::new(4096).expect("generation table");
+        state.push_published(super::PublishedBlock {
+            entry,
+            len: words.len() * 4,
+            metadata: super::PublishedBlockMetadata::Owned {
+                map: Vec::new(),
+                recovery: Vec::new(),
+            },
+            _generation: generations.observe(key.0).expect("generation observation"),
+        });
         state.blocks.insert(key, entry);
         let at = |offset: usize| types::CacheVa::published(HostVa(entry.host().raw() + offset));
         state.trusted_route_entries.insert(
@@ -5730,6 +5764,7 @@ mod tests {
         assert_eq!(route.direct_branch, base + 28);
         assert_eq!(route.indirect_branch, base + 44);
         assert_eq!(route.common_body, base + 48);
+        assert_eq!(route.origin, super::TrustedRouteOrigin::Owned);
     }
 
     #[test]
@@ -6471,6 +6506,16 @@ mod tests {
             assert_eq!(
                 installed_a[slot_index], expected_branch,
                 "patched direct link must land only at the direct route copy"
+            );
+            let snapshot = installed
+                .translator
+                .code_snapshot()
+                .expect("replayed route snapshot");
+            assert!(
+                snapshot.trusted_routes.iter().all(|route| {
+                    route.origin == crate::translator::TrustedRouteOrigin::UnitReplay
+                }),
+                "every installed route must retain its unit-replay origin"
             );
         }
 
