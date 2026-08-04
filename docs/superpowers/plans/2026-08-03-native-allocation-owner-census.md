@@ -9,7 +9,7 @@ ranked portfolio of non-overlapping owners whose normal-binary opportunity is at
 least 10%.
 
 **Architecture:** A portable wire module in `carrick-dsr-aarch64` owns the
-closed owner/reason vocabulary and strict `ALLOCOWNER1` parser. A feature-gated
+closed owner/reason vocabulary and strict `ALLOCOWNER2` parser. A feature-gated
 sibling module owns the `System`-delegating allocator, TLS scopes, relaxed
 atomics, fork/exec/exit state machine, and atomic exports; the runtime inserts
 only feature-gated lifecycle calls and semantic scopes. Focused CLI modules
@@ -81,7 +81,8 @@ efficient runtime translation.
 ## File map
 
 - Create `crates/carrick-dsr-aarch64/src/alloc_owner_wire.rs`: closed owner and
-  flush vocabularies; `ALLOCOWNER1` record, deterministic render, checksum, and
+  flush vocabularies; current `ALLOCOWNER2` record, deterministic render,
+  checksum, and
   strict parser. Portable and allocation-observer-free.
 - Create `crates/carrick-dsr-aarch64/src/alloc_owner_census.rs`: feature-gated
   tagged allocator, TLS scope, atomics, lifecycle state, export authority, and
@@ -1297,6 +1298,17 @@ only to name the largest remaining semantic boundary, add one closed owner with
 a bumped wire/report schema, add red source-owner tests, rerun `just ci`, and
 repeat feature captures A/B from clean output directories. Do not interpret a
 large `other` bucket.
+
+Initial v1 arm A failed closed exactly as designed: 140/140 process epochs, 71
+PIDs, 437 threads, 766,422 translations, an unchanged locked store, and
+`other = 0.13377593049607772`. The accepted DHAT discovery table names
+`configure_shared_translation` as the largest remaining semantic boundary,
+with 491,358,336 / 499,394,240 cumulative requested bytes in scouts A/B. The v2
+fallback therefore adds one owner, `translation-source-preparation`, around the
+active executable-span/source-word/segment preparation body, leaves the
+all-disabled fast return outside the scope, and bumps the wire/report schemas to
+`ALLOCOWNER2` / `carrick.alloc-owner-census.v2`. V1 capture artifacts are
+preserved separately and are not mixed with v2 evidence.
 
 - [ ] **Step 5: Restore and authenticate the ordinary binary**
 
