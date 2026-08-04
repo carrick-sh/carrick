@@ -68,6 +68,9 @@ impl NativeShapeTarget {
             bail!("native-shape run target command is empty");
         }
 
+        if let Some((_, digest)) = image.rsplit_once('@') {
+            validate_image_digest(digest).context("validate native-shape image digest")?;
+        }
         let reference = ImageReference::parse(&image).context("parse native-shape image")?;
         let image_digest = reference
             .digest()
@@ -284,9 +287,9 @@ pub(crate) fn claim_native_shape_snapshot_directory(path: &Path, uid: u32, gid: 
 
     fs::create_dir(path)
         .with_context(|| format!("create native-shape snapshot directory {}", path.display()))?;
-    let metadata = fs::symlink_metadata(path)
+    let created_metadata = fs::symlink_metadata(path)
         .with_context(|| format!("inspect native-shape snapshot directory {}", path.display()))?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    if !created_metadata.is_dir() || created_metadata.file_type().is_symlink() {
         bail!("native-shape snapshot path is not a real directory");
     }
     let directory = fs::OpenOptions::new()
@@ -294,16 +297,61 @@ pub(crate) fn claim_native_shape_snapshot_directory(path: &Path, uid: u32, gid: 
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(path)
         .with_context(|| format!("open native-shape snapshot directory {}", path.display()))?;
-    let opened = directory
+    let opened_metadata = directory
         .metadata()
         .with_context(|| format!("inspect opened snapshot directory {}", path.display()))?;
-    if !opened.is_dir() {
+    if !opened_metadata.is_dir() {
         bail!("opened native-shape snapshot path is not a directory");
     }
     let result = unsafe { libc::fchown(directory.as_raw_fd(), uid, gid) };
     if result != 0 {
         return Err(std::io::Error::last_os_error())
             .context("set native-shape snapshot directory owner");
+    }
+    let final_metadata = fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "reinspect native-shape snapshot directory {} after ownership",
+            path.display()
+        )
+    })?;
+    validate_snapshot_claim_metadata(
+        &created_metadata,
+        &opened_metadata,
+        &final_metadata,
+        uid,
+        gid,
+    )?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_snapshot_claim_metadata(
+    created: &fs::Metadata,
+    opened: &fs::Metadata,
+    final_path: &fs::Metadata,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    for (label, metadata) in [
+        ("post-create", created),
+        ("opened", opened),
+        ("final pathname", final_path),
+    ] {
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            bail!("native-shape snapshot {label} object is not a real directory");
+        }
+    }
+    let created_identity = (created.dev(), created.ino());
+    if (opened.dev(), opened.ino()) != created_identity {
+        bail!("native-shape snapshot opened directory differs from created directory");
+    }
+    if (final_path.dev(), final_path.ino()) != created_identity {
+        bail!("native-shape snapshot final pathname differs from created directory");
+    }
+    if final_path.uid() != expected_uid || final_path.gid() != expected_gid {
+        bail!("native-shape snapshot final owner does not match trace uid/gid");
     }
     Ok(())
 }
@@ -472,12 +520,16 @@ impl NativeShapeAuthority {
                 bail!("{field} must not be empty");
             }
         }
-        if self.target_argv.is_empty() {
-            bail!("authority target_argv must not be empty");
+        if self.host_arch != "aarch64" {
+            bail!("native-shape authority host_arch must be aarch64");
         }
-        let observed_argv_sha256 = argv_sha256(&self.target_argv)?;
-        if self.target_argv_sha256 != observed_argv_sha256 {
+        let target = NativeShapeTarget::parse(&self.target_argv)
+            .context("native-shape authority target argv is invalid")?;
+        if self.target_argv_sha256 != target.argv_sha256 {
             bail!("authority target_argv_sha256 does not match target_argv");
+        }
+        if self.image != target.image {
+            bail!("native-shape authority image does not match canonical target argv image");
         }
         if self.sampling_hz != SAMPLING_HZ {
             bail!("native-shape authority sampling frequency is not {SAMPLING_HZ}");
@@ -1030,9 +1082,9 @@ mod tests {
     use std::ffi::OsStr;
     use std::path::Path;
 
-    const ARGV_SHA256: &str = "3bc262561e1269c1333d39405fcadf5cdb5f917fe31e34b256b7767e54ed7a80";
+    const ARGV_SHA256: &str = "0963ca356c238c24a4e5fe8644feafc07941d94b0cc9e9118a312821b8584f65";
     const AUTHORITY_SHA256: &str =
-        "e1ac6ae7c357cec38eae5885cdbf44c875bb5561bc88be8eb93f37ec0feed0a1";
+        "97c2468f4384acb3f176ecbc30a45a3d1aa8f2112213f7059d59424149cb731a";
     const FIXTURE_HEADER: &str = concat!(
         "NSHAPE2|header|profile=native-shape|raw_schema=carrick.native-shape.raw.v2",
         "|os_build=26A5388g",
@@ -1040,7 +1092,7 @@ mod tests {
         "|birth_qualification_sha256=3333333333333333333333333333333333333333333333333333333333333333",
         "|terminal_qualification_sha256=4444444444444444444444444444444444444444444444444444444444444444",
         "|sampling_hz=997",
-        "|authority_sha256=e1ac6ae7c357cec38eae5885cdbf44c875bb5561bc88be8eb93f37ec0feed0a1"
+        "|authority_sha256=97c2468f4384acb3f176ecbc30a45a3d1aa8f2112213f7059d59424149cb731a"
     );
 
     fn fixture_authority() -> NativeShapeAuthority {
@@ -1052,10 +1104,16 @@ mod tests {
             git_dirty: false,
             executable_sha256: "1".repeat(64),
             host: "test-host".to_owned(),
-            host_arch: "arm64".to_owned(),
+            host_arch: "aarch64".to_owned(),
             os_build: "26A5388g".to_owned(),
-            image: "image".to_owned(),
-            target_argv: vec!["go".to_owned(), "build".to_owned(), "./cmd".to_owned()],
+            image: "docker.io/library/ubuntu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            target_argv: vec![
+                "run".to_owned(),
+                "--exec-backend".to_owned(),
+                "native".to_owned(),
+                "docker.io/library/ubuntu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                "/bin/true".to_owned(),
+            ],
             target_argv_sha256: ARGV_SHA256.to_owned(),
             run_id: "native-shape-test".to_owned(),
             program_template_sha256: "2".repeat(64),
@@ -1073,7 +1131,7 @@ mod tests {
             "|birth_qualification_sha256=3333333333333333333333333333333333333333333333333333333333333333",
             "|terminal_qualification_sha256=4444444444444444444444444444444444444444444444444444444444444444",
             "|sampling_hz=997",
-            "|authority_sha256=e1ac6ae7c357cec38eae5885cdbf44c875bb5561bc88be8eb93f37ec0feed0a1\n",
+            "|authority_sha256=97c2468f4384acb3f176ecbc30a45a3d1aa8f2112213f7059d59424149cb731a\n",
             "NSHAPE2|fork|parent=10|child=11\n",
             "NSHAPE2|exit|pid=11|reason=1\n",
             "NSHAPE2|exit|pid=10|reason=1\n",
@@ -1385,6 +1443,49 @@ mod tests {
         assert!(claim_native_shape_snapshot_directory(&link, uid, gid).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn native_shape_snapshot_claim_rejects_opened_or_final_inode_substitution() {
+        let fixture = tempfile::tempdir().unwrap();
+        let claimed = fixture.path().join("claimed");
+        let substituted = fixture.path().join("substituted");
+        std::fs::create_dir(&claimed).unwrap();
+        std::fs::create_dir(&substituted).unwrap();
+        let claimed_metadata = std::fs::symlink_metadata(&claimed).unwrap();
+        let substituted_metadata = std::fs::symlink_metadata(&substituted).unwrap();
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+
+        validate_snapshot_claim_metadata(
+            &claimed_metadata,
+            &claimed_metadata,
+            &claimed_metadata,
+            uid,
+            gid,
+        )
+        .unwrap();
+        assert!(
+            validate_snapshot_claim_metadata(
+                &claimed_metadata,
+                &substituted_metadata,
+                &claimed_metadata,
+                uid,
+                gid,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_snapshot_claim_metadata(
+                &claimed_metadata,
+                &claimed_metadata,
+                &substituted_metadata,
+                uid,
+                gid,
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn authority_hashes_use_canonical_json_and_length_delimited_argv() {
         let authority = fixture_authority();
@@ -1443,6 +1544,98 @@ mod tests {
         for mutation in mutations {
             assert!(mutation.header_record().is_err(), "{mutation:?}");
             assert!(mutation.sha256().is_err(), "{mutation:?}");
+        }
+    }
+
+    #[test]
+    fn authority_rejects_self_consistent_target_and_arch_substitutions() {
+        const IMAGE: &str = "docker.io/library/ubuntu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        fn substituted(argv: &[&str], image: &str) -> NativeShapeAuthority {
+            let mut authority = fixture_authority();
+            authority.target_argv = argv.iter().map(|value| (*value).to_owned()).collect();
+            authority.target_argv_sha256 = argv_sha256(&authority.target_argv).unwrap();
+            authority.image = image.to_owned();
+            authority
+        }
+
+        let mut cases = vec![
+            (
+                "defaulted native",
+                substituted(&["run", IMAGE, "/bin/true"], IMAGE),
+                "explicit",
+            ),
+            (
+                "explicit VMM",
+                substituted(&["run", "--exec-backend", "vmm", IMAGE, "/bin/true"], IMAGE),
+                "explicit",
+            ),
+            (
+                "non-run command",
+                substituted(&["pull", IMAGE], IMAGE),
+                "run subcommand",
+            ),
+            (
+                "tag-only image",
+                substituted(
+                    &[
+                        "run",
+                        "--exec-backend",
+                        "native",
+                        "ubuntu:24.04",
+                        "/bin/true",
+                    ],
+                    "docker.io/library/ubuntu:24.04",
+                ),
+                "digest-pinned",
+            ),
+            (
+                "malformed digest image",
+                substituted(
+                    &[
+                        "run",
+                        "--exec-backend",
+                        "native",
+                        "ubuntu@sha256:aaaa",
+                        "/bin/true",
+                    ],
+                    "docker.io/library/ubuntu@sha256:aaaa",
+                ),
+                "digest",
+            ),
+            (
+                "empty guest command",
+                substituted(&["run", "--exec-backend", "native", IMAGE], IMAGE),
+                "target command is empty",
+            ),
+            (
+                "image differs from argv",
+                substituted(
+                    &["run", "--exec-backend", "native", IMAGE, "/bin/true"],
+                    "docker.io/library/ubuntu@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                ),
+                "image does not match",
+            ),
+        ];
+        let mut wrong_arch = fixture_authority();
+        wrong_arch.host_arch = "x86_64".to_owned();
+        cases.push(("wrong host architecture", wrong_arch, "aarch64"));
+
+        for (label, authority, expected) in cases {
+            let sha_error = authority
+                .sha256()
+                .expect_err("self-consistent substituted authority was accepted");
+            assert!(
+                format!("{sha_error:#}").contains(expected),
+                "{label}: {sha_error:#}"
+            );
+            let header_error = authority
+                .header_record()
+                .expect_err("substituted authority rendered an authenticated header");
+            assert!(
+                format!("{header_error:#}").contains(expected),
+                "{label}: {header_error:#}"
+            );
         }
     }
 
