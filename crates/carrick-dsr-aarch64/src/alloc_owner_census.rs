@@ -13,6 +13,10 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 /// never forwarded into the guest environment.
 pub const EXEC_EPOCH_ENV: &str = "CARRICK_ALLOC_OWNER_EXEC_EPOCH";
 
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOC_OWNER_CENSUS: TaggedSystem = TaggedSystem;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 enum CensusState {
@@ -879,6 +883,28 @@ pub mod test_support {
 
     pub fn snapshot() -> [OwnerSnapshot; AllocationOwner::COUNT] {
         super::snapshot()
+    }
+
+    pub fn requested_bytes(owner: AllocationOwner) -> u64 {
+        COUNTERS[owner as usize]
+            .requested_bytes
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn assert_only_requested_bytes_increased(
+        before: &[OwnerSnapshot; AllocationOwner::COUNT],
+        after: &[OwnerSnapshot; AllocationOwner::COUNT],
+        expected: &[AllocationOwner],
+    ) {
+        for owner in AllocationOwner::ALL {
+            let before = before[owner as usize].requested_bytes;
+            let after = after[owner as usize].requested_bytes;
+            if expected.contains(&owner) {
+                assert!(after > before, "{} did not increase", owner.token());
+            } else {
+                assert_eq!(after, before, "{} changed unexpectedly", owner.token());
+            }
+        }
     }
 
     pub fn lifecycle_error() -> bool {

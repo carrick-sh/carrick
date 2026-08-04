@@ -284,6 +284,10 @@ pub fn plan_superblock_with_reader_for_counter_plan(
     segment_limit: usize,
     mut read: impl FnMut(GuestVa) -> Result<u32, DsrError>,
 ) -> Result<BlockPlan, DsrError> {
+    #[cfg(feature = "alloc-owner-census")]
+    let _owner = crate::alloc_owner_census::scope(
+        crate::alloc_owner_wire::AllocationOwner::DecodeReadBuffers,
+    );
     let mut plan = plan_segment_with_reader(
         start,
         generation,
@@ -1078,6 +1082,51 @@ pub fn plan_block_with_segments(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "alloc-owner-census")]
+    #[test]
+    fn allocation_owner_decode_read_buffers_owns_superblock_planning() {
+        use crate::alloc_owner_census::test_support as census;
+        use crate::alloc_owner_wire::AllocationOwner;
+
+        let _census = census::lock();
+        let start = GuestVa(0x4000);
+        let mut words = vec![0xd503_201f; 31];
+        words.push(0xd400_0001);
+        census::reset_and_arm(0, 0);
+        let before = census::snapshot();
+
+        let plan = plan_superblock_with_reader_for_counter_plan(
+            start,
+            CodeGeneration::INITIAL,
+            32,
+            0x1000,
+            ExclusiveFusionPolicy::BiasedDisabled,
+            counter::host_counter_plan(),
+            1,
+            |pc| {
+                let offset = usize::try_from((pc.raw() - start.raw()) / 4)
+                    .map_err(|_| DsrError::BlockPolicy("test offset overflow".to_string()))?;
+                words
+                    .get(offset)
+                    .copied()
+                    .ok_or_else(|| DsrError::MemoryRead {
+                        pc: pc.raw(),
+                        detail: "test region exhausted".to_string(),
+                    })
+            },
+        )
+        .expect("plan allocation-owner fixture");
+        let after = census::snapshot();
+
+        assert_eq!(plan.instructions.len(), 31);
+        census::assert_only_requested_bytes_increased(
+            &before,
+            &after,
+            &[AllocationOwner::DecodeReadBuffers],
+        );
+        census::reset_disabled();
+    }
 
     fn plan_words(
         words: &[u32],

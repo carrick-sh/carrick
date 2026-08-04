@@ -341,6 +341,10 @@ pub struct IndirectTargetCache {
 
 impl IndirectTargetCache {
     pub fn new() -> Self {
+        #[cfg(feature = "alloc-owner-census")]
+        let _owner = crate::alloc_owner_census::scope(
+            crate::alloc_owner_wire::AllocationOwner::IndirectTargetCache,
+        );
         let entries = (0..INDIRECT_CACHE_ENTRIES)
             .map(|_| IndirectTargetCacheSet {
                 ways: std::array::from_fn(|_| IndirectTargetCacheEntry {
@@ -1130,6 +1134,28 @@ pub use native_gateway::*;
 #[cfg(test)]
 mod indirect_cache_tests {
     use super::*;
+
+    #[cfg(feature = "alloc-owner-census")]
+    #[test]
+    fn allocation_owner_indirect_target_cache_owns_cache_storage() {
+        use crate::alloc_owner_census::test_support as census;
+        use crate::alloc_owner_wire::AllocationOwner;
+
+        let _census = census::lock();
+        census::reset_and_arm(0, 0);
+        let before = census::snapshot();
+
+        let cache = IndirectTargetCache::new();
+        std::hint::black_box(&cache);
+        let after = census::snapshot();
+
+        census::assert_only_requested_bytes_increased(
+            &before,
+            &after,
+            &[AllocationOwner::IndirectTargetCache],
+        );
+        census::reset_disabled();
+    }
 
     #[test]
     fn indirect_cache_uses_compact_two_way_2mib_layout() {
