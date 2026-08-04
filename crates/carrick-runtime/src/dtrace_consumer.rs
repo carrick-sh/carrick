@@ -936,6 +936,19 @@ mod tests {
         assert!(source.contains("arg1 != 0 && arg0 == 0"));
         assert!(source.contains("arg0 != 0 && arg1 == 0"));
         assert!(source.contains("(arg0 == 0) == (arg1 == 0)"));
+        assert!(source.contains("@all_cpu = sum(0)"));
+        assert!(source.contains("@user_cpu = sum(0)"));
+        assert!(source.contains("@kernel_cpu = sum(0)"));
+        assert!(source.contains("@invalid_cpu = sum(0)"));
+        assert!(source.contains("@jit_user = sum(0)"));
+        assert!(source.contains("@non_jit_user = sum(0)"));
+        assert!(source.contains("@all_cpu = sum(1)"));
+        assert!(source.contains("@user_cpu = sum(1)"));
+        assert!(source.contains("@kernel_cpu = sum(1)"));
+        assert!(source.contains("@invalid_cpu = sum(1)"));
+        assert!(source.contains("@jit_user = sum(1)"));
+        assert!(source.contains("@non_jit_user = sum(1)"));
+        assert!(!source.contains("user_cpu++"));
         assert!(source.contains("tick-180s"));
         assert!(!source.contains("copyin("));
         assert!(!source.contains("SHAPE1"));
@@ -945,16 +958,23 @@ mod tests {
     fn native_shape_template_tracks_lifecycle_and_exact_sections() {
         let source = BUNDLED_NATIVE_SHAPE_D;
         assert!(source.contains("tracked[args[0]->pr_pid] == 0"));
-        assert!(source.contains("admitted++"));
-        assert!(source.contains("live++"));
-        assert!(source.contains("exited++"));
-        assert!(source.contains("live--"));
+        assert!(source.contains("@admitted = sum(1)"));
+        assert!(source.contains("@exited = sum(0)"));
+        assert!(source.contains("@live = sum(1)"));
+        assert!(source.contains("@live = sum(-1)"));
+        assert!(source.contains("@probe_errors = sum(0)"));
+        assert!(source.contains("live_hint"));
+        assert!(source.contains("non-authoritative"));
         assert!(source.contains("jit_start[args[0]->pr_pid] = jit_start[pid]"));
         assert!(source.contains("jit_end[args[0]->pr_pid] = jit_end[pid]"));
-        assert!(source.contains("target_completed && live == 0"));
+        assert!(source.contains("target_completed && live_hint == 0"));
+        assert!(source.contains("NSHAPE2|exit|pid=%d|reason=%d"));
         assert!(source.contains("NSHAPE2|section=mode"));
+        assert!(source.contains("NSHAPE2|mode|kind=all|count=%@d"));
         assert!(source.contains("NSHAPE2|section=region"));
         assert!(source.contains("NSHAPE2|section=pc"));
+        assert!(source.contains("|target_pid=%d|admitted="));
+        assert!(source.contains("%@d|exited=%@d|live_at_end=%@d|probe_errors=%@d"));
         assert_eq!(source.matches("NSHAPE2|complete").count(), 1);
     }
 

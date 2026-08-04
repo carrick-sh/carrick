@@ -18,6 +18,12 @@
  * `dsr-cache-bounds` arguments are the exact half-open JIT-cache range
  * [arg0, arg1). Cache bounds are inherited across fork until a child publishes
  * its own range.
+ * On 2026-08-04, scalar-prefix + multi-aggregation printa + scalar-suffix was
+ * qualified live as one contiguous record, and sum(+1) followed by sum(-1)
+ * emitted zero. Sampling and lifecycle evidence therefore use per-CPU-safe
+ * aggregations. `live_hint` is intentionally non-authoritative: it only decides
+ * when to request exit. The emitted aggregate counts and process graph decide
+ * whether the capture is accepted offline.
  *
  * The 997 Hz sampling plus aggregation is perturbing. Use only same-instrument
  * attribution ratios from this trace; never cite its duration as wall evidence.
@@ -32,18 +38,20 @@ dtrace:::BEGIN
 	tracked[$target] = 1;
 	jit_start[$target] = (uint64_t)0;
 	jit_end[$target] = (uint64_t)0;
-	admitted = 1;
-	exited = 0;
-	live = 1;
+	live_hint = 1;
 	bounded = 0;
 	target_completed = 0;
 	target_exit_reason = 0;
-	probe_errors = 0;
-	user_cpu = 0;
-	kernel_cpu = 0;
-	invalid_cpu = 0;
-	jit_user = 0;
-	non_jit_user = 0;
+	@admitted = sum(1);
+	@exited = sum(0);
+	@live = sum(1);
+	@probe_errors = sum(0);
+	@all_cpu = sum(0);
+	@user_cpu = sum(0);
+	@kernel_cpu = sum(0);
+	@invalid_cpu = sum(0);
+	@jit_user = sum(0);
+	@non_jit_user = sum(0);
 }
 
 proc:::create
@@ -52,16 +60,19 @@ proc:::create
 	tracked[args[0]->pr_pid] = 1;
 	jit_start[args[0]->pr_pid] = jit_start[pid];
 	jit_end[args[0]->pr_pid] = jit_end[pid];
-	admitted++;
-	live++;
+	@admitted = sum(1);
+	@live = sum(1);
+	live_hint++;
 	printf("NSHAPE2|fork|parent=%d|child=%d\n", pid, args[0]->pr_pid);
 }
 
 proc:::exit
 /tracked[pid]/
 {
-	exited++;
-	live--;
+	@exited = sum(1);
+	@live = sum(-1);
+	live_hint--;
+	printf("NSHAPE2|exit|pid=%d|reason=%d\n", pid, arg0);
 	tracked[pid] = 0;
 	jit_start[pid] = (uint64_t)0;
 	jit_end[pid] = (uint64_t)0;
@@ -69,7 +80,7 @@ proc:::exit
 		target_completed = 1;
 		target_exit_reason = arg0;
 	}
-	if (target_completed && live == 0) {
+	if (target_completed && live_hint == 0) {
 		exit(0);
 	}
 }
@@ -84,25 +95,26 @@ carrick*:::dsr-cache-bounds
 profile-997
 /tracked[pid]/
 {
+	@all_cpu = sum(1);
 	if (arg1 != 0 && arg0 == 0) {
-		user_cpu++;
+		@user_cpu = sum(1);
 		if (jit_end[pid] != 0 && arg1 >= jit_start[pid] &&
 		    arg1 < jit_end[pid]) {
-			jit_user++;
+			@jit_user = sum(1);
 			@pc[pid, arg1] = count();
 		} else {
-			non_jit_user++;
+			@non_jit_user = sum(1);
 		}
 	} else if (arg0 != 0 && arg1 == 0) {
-		kernel_cpu++;
+		@kernel_cpu = sum(1);
 	} else if ((arg0 == 0) == (arg1 == 0)) {
-		invalid_cpu++;
+		@invalid_cpu = sum(1);
 	}
 }
 
 dtrace:::ERROR
 {
-	probe_errors++;
+	@probe_errors = sum(1);
 }
 
 tick-180s
@@ -114,15 +126,18 @@ tick-180s
 dtrace:::END
 {
 	printf("NSHAPE2|section=mode\n");
-	printf("NSHAPE2|mode|kind=user|count=%d\n", user_cpu);
-	printf("NSHAPE2|mode|kind=kernel|count=%d\n", kernel_cpu);
-	printf("NSHAPE2|mode|kind=invalid|count=%d\n", invalid_cpu);
+	printa("NSHAPE2|mode|kind=all|count=%@d\n", @all_cpu);
+	printa("NSHAPE2|mode|kind=user|count=%@d\n", @user_cpu);
+	printa("NSHAPE2|mode|kind=kernel|count=%@d\n", @kernel_cpu);
+	printa("NSHAPE2|mode|kind=invalid|count=%@d\n", @invalid_cpu);
 	printf("NSHAPE2|section=region\n");
-	printf("NSHAPE2|region|kind=jit|count=%d\n", jit_user);
-	printf("NSHAPE2|region|kind=non-jit|count=%d\n", non_jit_user);
+	printa("NSHAPE2|region|kind=jit|count=%@d\n", @jit_user);
+	printa("NSHAPE2|region|kind=non-jit|count=%@d\n", @non_jit_user);
 	printf("NSHAPE2|section=pc\n");
 	printa("NSHAPE2|pc|pid=%d|pc=0x%x|count=%@d\n", @pc);
-	printf("NSHAPE2|complete|bounded=%d|target_completed=%d|target_exit_reason=%d|admitted=%d|exited=%d|live_at_end=%d|probe_errors=%d\n",
-	    bounded, target_completed, target_exit_reason, admitted, exited, live,
-	    probe_errors);
+	printf("NSHAPE2|complete|bounded=%d|target_completed=%d|target_exit_reason=%d|target_pid=%d|admitted=",
+	    bounded, target_completed, target_exit_reason, $target);
+	printa("%@d|exited=%@d|live_at_end=%@d|probe_errors=%@d",
+	    @admitted, @exited, @live, @probe_errors);
+	printf("\n");
 }

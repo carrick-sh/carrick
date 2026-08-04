@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub(crate) const RAW_SCHEMA: &str = "carrick.native-shape.raw.v2";
-pub(crate) const CAPTURE_SCHEMA: &str = "carrick.native-shape-capture.v1";
 pub(crate) const SAMPLING_HZ: u64 = 997;
 const AUTHORITY_SCHEMA: &str = "carrick.native-shape-authority.v1";
 const PROFILE: &str = "native-shape";
@@ -131,13 +130,6 @@ pub(crate) fn argv_sha256(argv: &[String]) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum CaptureOutcome {
-    Accepted,
-    Rejected,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PcSample {
@@ -152,6 +144,7 @@ pub(crate) struct NativeShapeLifecycle {
     pub(crate) bounded: bool,
     pub(crate) target_completed: bool,
     pub(crate) target_exit_reason: i32,
+    pub(crate) target_pid: u32,
     pub(crate) admitted: u64,
     pub(crate) exited: u64,
     pub(crate) live_at_end: u64,
@@ -160,6 +153,7 @@ pub(crate) struct NativeShapeLifecycle {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NativeShapeRaw {
+    pub(crate) all_cpu: u64,
     pub(crate) user_cpu: u64,
     pub(crate) kernel_cpu: u64,
     pub(crate) invalid_cpu: u64,
@@ -167,13 +161,14 @@ pub(crate) struct NativeShapeRaw {
     pub(crate) non_jit_user: u64,
     pub(crate) pc_samples: Vec<PcSample>,
     pub(crate) parents: BTreeMap<u32, u32>,
+    pub(crate) exits: BTreeMap<u32, i32>,
     pub(crate) lifecycle: NativeShapeLifecycle,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ParseState {
     Header,
-    ForksOrModeSection,
+    LifecycleOrModeSection,
     ModeRows { seen: u8 },
     RegionSection,
     RegionRows { seen: u8 },
@@ -185,6 +180,7 @@ enum ParseState {
 
 #[derive(Default)]
 struct RawBuilder {
+    all_cpu: Option<u64>,
     user_cpu: Option<u64>,
     kernel_cpu: Option<u64>,
     invalid_cpu: Option<u64>,
@@ -193,6 +189,7 @@ struct RawBuilder {
     pc_samples: Vec<PcSample>,
     pc_keys: BTreeSet<(u32, u64)>,
     parents: BTreeMap<u32, u32>,
+    exits: BTreeMap<u32, i32>,
     lifecycle: Option<NativeShapeLifecycle>,
 }
 
@@ -221,9 +218,9 @@ impl NativeShapeRaw {
                                 "line {line_number}: native-shape header does not match authority"
                             );
                         }
-                        state = ParseState::ForksOrModeSection;
+                        state = ParseState::LifecycleOrModeSection;
                     }
-                    ParseState::ForksOrModeSection => {
+                    ParseState::LifecycleOrModeSection => {
                         if current == "NSHAPE2|section=mode" {
                             state = ParseState::ModeRows { seen: 0 };
                         } else if current.starts_with("NSHAPE2|fork|") {
@@ -231,16 +228,24 @@ impl NativeShapeRaw {
                             let parent = parse_u32(fields[0], "fork parent")?;
                             let child = parse_u32(fields[1], "fork child")?;
                             add_parent(&mut builder.parents, parent, child)?;
+                        } else if current.starts_with("NSHAPE2|exit|") {
+                            let fields = exact_fields(current, "exit", &["pid", "reason"])?;
+                            let pid = parse_u32(fields[0], "exit pid")?;
+                            let reason = parse_i32(fields[1], "exit reason")?;
+                            if builder.exits.insert(pid, reason).is_some() {
+                                bail!("line {line_number}: duplicate exit row");
+                            }
                         } else {
-                            bail!("line {line_number}: expected fork or mode section");
+                            bail!("line {line_number}: expected lifecycle row or mode section");
                         }
                     }
                     ParseState::ModeRows { seen } => {
                         let expected_kind = match seen {
-                            0 => "user",
-                            1 => "kernel",
-                            2 => "invalid",
-                            _ => unreachable!("mode state advances after three rows"),
+                            0 => "all",
+                            1 => "user",
+                            2 => "kernel",
+                            3 => "invalid",
+                            _ => unreachable!("mode state advances after four rows"),
                         };
                         let fields = exact_fields(current, "mode", &["kind", "count"])?;
                         if fields[0] != expected_kind {
@@ -248,12 +253,13 @@ impl NativeShapeRaw {
                         }
                         let count = parse_u64(fields[1], "mode count")?;
                         match seen {
-                            0 => builder.user_cpu = Some(count),
-                            1 => builder.kernel_cpu = Some(count),
-                            2 => builder.invalid_cpu = Some(count),
+                            0 => builder.all_cpu = Some(count),
+                            1 => builder.user_cpu = Some(count),
+                            2 => builder.kernel_cpu = Some(count),
+                            3 => builder.invalid_cpu = Some(count),
                             _ => unreachable!(),
                         }
-                        state = if seen == 2 {
+                        state = if seen == 3 {
                             ParseState::RegionSection
                         } else {
                             ParseState::ModeRows { seen: seen + 1 }
@@ -322,6 +328,7 @@ impl NativeShapeRaw {
                                 "bounded",
                                 "target_completed",
                                 "target_exit_reason",
+                                "target_pid",
                                 "admitted",
                                 "exited",
                                 "live_at_end",
@@ -335,10 +342,11 @@ impl NativeShapeRaw {
                                 fields[2],
                                 "completion target_exit_reason",
                             )?,
-                            admitted: parse_u64(fields[3], "completion admitted")?,
-                            exited: parse_u64(fields[4], "completion exited")?,
-                            live_at_end: parse_u64(fields[5], "completion live_at_end")?,
-                            probe_errors: parse_u64(fields[6], "completion probe_errors")?,
+                            target_pid: parse_u32(fields[3], "completion target_pid")?,
+                            admitted: parse_u64(fields[4], "completion admitted")?,
+                            exited: parse_u64(fields[5], "completion exited")?,
+                            live_at_end: parse_u64(fields[6], "completion live_at_end")?,
+                            probe_errors: parse_u64(fields[7], "completion probe_errors")?,
                         });
                         state = ParseState::Finished;
                     }
@@ -358,6 +366,7 @@ impl NativeShapeRaw {
 
 impl RawBuilder {
     fn finish(self) -> Result<NativeShapeRaw> {
+        let all_cpu = self.all_cpu.context("missing all CPU count")?;
         let user_cpu = self.user_cpu.context("missing user CPU count")?;
         let kernel_cpu = self.kernel_cpu.context("missing kernel CPU count")?;
         let invalid_cpu = self.invalid_cpu.context("missing invalid CPU count")?;
@@ -365,17 +374,21 @@ impl RawBuilder {
         let non_jit_user = self.non_jit_user.context("missing non-JIT user count")?;
         let lifecycle = self.lifecycle.context("missing completion record")?;
 
-        user_cpu
+        let classified_cpu = user_cpu
             .checked_add(kernel_cpu)
+            .and_then(|subtotal| subtotal.checked_add(invalid_cpu))
             .context("total CPU sample count overflow")?;
+        if classified_cpu != all_cpu {
+            bail!("all CPU count does not reconcile with classified modes");
+        }
+        if invalid_cpu != 0 {
+            bail!("invalid CPU sample count is nonzero");
+        }
         let regions = jit_user
             .checked_add(non_jit_user)
             .context("user region sample count overflow")?;
         if regions != user_cpu {
             bail!("user CPU count does not reconcile with JIT and non-JIT regions");
-        }
-        if invalid_cpu != 0 {
-            bail!("invalid CPU sample count is nonzero");
         }
         if jit_user == 0 {
             bail!("JIT user sample count is zero");
@@ -389,15 +402,44 @@ impl RawBuilder {
             bail!("JIT user count does not reconcile with PC rows");
         }
 
-        let fork_count = u64::try_from(self.parents.len()).context("fork count exceeds u64")?;
-        let expected_admitted = fork_count
-            .checked_add(1)
-            .context("admitted process count overflow")?;
-        if lifecycle.admitted != expected_admitted {
-            bail!("admitted process count does not reconcile with fork rows");
+        let expected_live = lifecycle
+            .admitted
+            .checked_sub(lifecycle.exited)
+            .context("exited process count exceeds admitted process count")?;
+        if lifecycle.live_at_end != expected_live {
+            bail!("live process count does not reconcile with admitted minus exited");
         }
-        if lifecycle.admitted != lifecycle.exited {
-            bail!("admitted and exited process counts do not reconcile");
+
+        let admitted_vertices = rooted_vertices(lifecycle.target_pid, &self.parents)?;
+        let expected_admitted = u64::try_from(admitted_vertices.len())
+            .context("admitted process vertex count exceeds u64")?;
+        if lifecycle.admitted != expected_admitted {
+            bail!("admitted process count does not reconcile with rooted process tree");
+        }
+
+        for pid in self.exits.keys() {
+            if !admitted_vertices.contains(pid) {
+                bail!("exit PID is not admitted by the rooted process tree");
+            }
+        }
+        for pid in &admitted_vertices {
+            if !self.exits.contains_key(pid) {
+                bail!("admitted PID is missing an exit row");
+            }
+        }
+        let unique_exits = u64::try_from(self.exits.len()).context("exit row count exceeds u64")?;
+        if lifecycle.exited != unique_exits {
+            bail!("exited process count does not reconcile with unique exit rows");
+        }
+
+        if lifecycle.live_at_end != 0 {
+            bail!("native-shape processes remain live at completion");
+        }
+
+        for sample in &self.pc_samples {
+            if !admitted_vertices.contains(&sample.pid) {
+                bail!("PC PID is not admitted by the rooted process tree");
+            }
         }
         if lifecycle.bounded {
             bail!("native-shape capture reached its time bound");
@@ -408,14 +450,19 @@ impl RawBuilder {
         if lifecycle.target_exit_reason != NORMAL_TARGET_EXIT_REASON {
             bail!("native-shape target exit reason is not normal");
         }
-        if lifecycle.live_at_end != 0 {
-            bail!("native-shape processes remain live at completion");
+        let target_exit_reason = self
+            .exits
+            .get(&lifecycle.target_pid)
+            .context("native-shape target is missing an exit row")?;
+        if *target_exit_reason != lifecycle.target_exit_reason {
+            bail!("target exit reason does not agree with the target exit row");
         }
         if lifecycle.probe_errors != 0 {
             bail!("native-shape DTrace probe errors are nonzero");
         }
 
         Ok(NativeShapeRaw {
+            all_cpu,
             user_cpu,
             kernel_cpu,
             invalid_cpu,
@@ -423,9 +470,38 @@ impl RawBuilder {
             non_jit_user,
             pc_samples: self.pc_samples,
             parents: self.parents,
+            exits: self.exits,
             lifecycle,
         })
     }
+}
+
+fn rooted_vertices(target_pid: u32, parents: &BTreeMap<u32, u32>) -> Result<BTreeSet<u32>> {
+    if parents.contains_key(&target_pid) {
+        bail!("target PID appears as a fork child");
+    }
+
+    let mut all_vertices = BTreeSet::from([target_pid]);
+    let mut children = BTreeMap::<u32, Vec<u32>>::new();
+    for (&child, &parent) in parents {
+        all_vertices.insert(parent);
+        all_vertices.insert(child);
+        children.entry(parent).or_default().push(child);
+    }
+
+    let mut rooted = BTreeSet::from([target_pid]);
+    let mut pending = vec![target_pid];
+    while let Some(parent) = pending.pop() {
+        for child in children.get(&parent).into_iter().flatten() {
+            if rooted.insert(*child) {
+                pending.push(*child);
+            }
+        }
+    }
+    if rooted != all_vertices {
+        bail!("fork graph contains a component disconnected from target PID");
+    }
+    Ok(rooted)
 }
 
 fn exact_fields<'a>(line: &'a str, record: &str, names: &[&str]) -> Result<Vec<&'a str>> {
@@ -586,6 +662,15 @@ mod tests {
     const ARGV_SHA256: &str = "3bc262561e1269c1333d39405fcadf5cdb5f917fe31e34b256b7767e54ed7a80";
     const AUTHORITY_SHA256: &str =
         "e1ac6ae7c357cec38eae5885cdbf44c875bb5561bc88be8eb93f37ec0feed0a1";
+    const FIXTURE_HEADER: &str = concat!(
+        "NSHAPE2|header|profile=native-shape|raw_schema=carrick.native-shape.raw.v2",
+        "|os_build=26A5388g",
+        "|program_template_sha256=2222222222222222222222222222222222222222222222222222222222222222",
+        "|birth_qualification_sha256=3333333333333333333333333333333333333333333333333333333333333333",
+        "|terminal_qualification_sha256=4444444444444444444444444444444444444444444444444444444444444444",
+        "|sampling_hz=997",
+        "|authority_sha256=e1ac6ae7c357cec38eae5885cdbf44c875bb5561bc88be8eb93f37ec0feed0a1"
+    );
 
     fn fixture_authority() -> NativeShapeAuthority {
         NativeShapeAuthority {
@@ -609,23 +694,32 @@ mod tests {
         }
     }
 
-    fn valid_raw(authority: &NativeShapeAuthority) -> String {
-        format!(
-            "{}\n\
-             NSHAPE2|fork|parent=10|child=11\n\
-             NSHAPE2|section=mode\n\
-             NSHAPE2|mode|kind=user|count=70\n\
-             NSHAPE2|mode|kind=kernel|count=30\n\
-             NSHAPE2|mode|kind=invalid|count=0\n\
-             NSHAPE2|section=region\n\
-             NSHAPE2|region|kind=jit|count=40\n\
-             NSHAPE2|region|kind=non-jit|count=30\n\
-             NSHAPE2|section=pc\n\
-             NSHAPE2|pc|pid=10|pc=0x1000|count=15\n\
-             NSHAPE2|pc|pid=11|pc=0x2000|count=25\n\
-             NSHAPE2|complete|bounded=0|target_completed=1|target_exit_reason=1|admitted=2|exited=2|live_at_end=0|probe_errors=0\n",
-            authority.header_record().unwrap()
+    fn valid_raw() -> String {
+        concat!(
+            "NSHAPE2|header|profile=native-shape|raw_schema=carrick.native-shape.raw.v2",
+            "|os_build=26A5388g",
+            "|program_template_sha256=2222222222222222222222222222222222222222222222222222222222222222",
+            "|birth_qualification_sha256=3333333333333333333333333333333333333333333333333333333333333333",
+            "|terminal_qualification_sha256=4444444444444444444444444444444444444444444444444444444444444444",
+            "|sampling_hz=997",
+            "|authority_sha256=e1ac6ae7c357cec38eae5885cdbf44c875bb5561bc88be8eb93f37ec0feed0a1\n",
+            "NSHAPE2|fork|parent=10|child=11\n",
+            "NSHAPE2|exit|pid=11|reason=1\n",
+            "NSHAPE2|exit|pid=10|reason=1\n",
+            "NSHAPE2|section=mode\n",
+            "NSHAPE2|mode|kind=all|count=100\n",
+            "NSHAPE2|mode|kind=user|count=70\n",
+            "NSHAPE2|mode|kind=kernel|count=30\n",
+            "NSHAPE2|mode|kind=invalid|count=0\n",
+            "NSHAPE2|section=region\n",
+            "NSHAPE2|region|kind=jit|count=40\n",
+            "NSHAPE2|region|kind=non-jit|count=30\n",
+            "NSHAPE2|section=pc\n",
+            "NSHAPE2|pc|pid=10|pc=0x1000|count=15\n",
+            "NSHAPE2|pc|pid=11|pc=0x2000|count=25\n",
+            "NSHAPE2|complete|bounded=0|target_completed=1|target_exit_reason=1|target_pid=10|admitted=2|exited=2|live_at_end=0|probe_errors=0\n"
         )
+        .to_owned()
     }
 
     fn parse_rejected(raw: impl AsRef<[u8]>) {
@@ -649,18 +743,7 @@ mod tests {
         let authority = fixture_authority();
         assert_eq!(argv_sha256(&authority.target_argv).unwrap(), ARGV_SHA256);
         assert_eq!(authority.sha256().unwrap(), AUTHORITY_SHA256);
-        assert_eq!(
-            authority.header_record().unwrap(),
-            concat!(
-                "NSHAPE2|header|profile=native-shape|raw_schema=carrick.native-shape.raw.v2",
-                "|os_build=26A5388g",
-                "|program_template_sha256=2222222222222222222222222222222222222222222222222222222222222222",
-                "|birth_qualification_sha256=3333333333333333333333333333333333333333333333333333333333333333",
-                "|terminal_qualification_sha256=4444444444444444444444444444444444444444444444444444444444444444",
-                "|sampling_hz=997",
-                "|authority_sha256=e1ac6ae7c357cec38eae5885cdbf44c875bb5561bc88be8eb93f37ec0feed0a1"
-            )
-        );
+        assert_eq!(authority.header_record().unwrap(), FIXTURE_HEADER);
 
         let joined = vec!["go".to_owned(), "build./cmd".to_owned()];
         assert_ne!(argv_sha256(&joined).unwrap(), ARGV_SHA256);
@@ -717,9 +800,10 @@ mod tests {
     }
 
     #[test]
-    fn nshap2_reconciles_one_cpu_population() {
+    fn nshape2_reconciles_one_cpu_population() {
         let authority = fixture_authority();
-        let raw = NativeShapeRaw::parse(valid_raw(&authority).as_bytes(), &authority).unwrap();
+        let raw = NativeShapeRaw::parse(valid_raw().as_bytes(), &authority).unwrap();
+        assert_eq!(raw.all_cpu, 100);
         assert_eq!(raw.user_cpu, 70);
         assert_eq!(raw.kernel_cpu, 30);
         assert_eq!(raw.invalid_cpu, 0);
@@ -727,12 +811,14 @@ mod tests {
         assert_eq!(raw.non_jit_user, 30);
         assert_eq!(raw.pc_samples.iter().map(|row| row.count).sum::<u64>(), 40);
         assert_eq!(raw.parents, [(11, 10)].into_iter().collect());
+        assert_eq!(raw.exits, [(10, 1), (11, 1)].into_iter().collect());
         assert_eq!(
             raw.lifecycle,
             NativeShapeLifecycle {
                 bounded: false,
                 target_completed: true,
                 target_exit_reason: 1,
+                target_pid: 10,
                 admitted: 2,
                 exited: 2,
                 live_at_end: 0,
@@ -742,19 +828,18 @@ mod tests {
     }
 
     #[test]
-    fn nshap2_rejects_shape1_and_authority_substitution() {
+    fn nshape2_rejects_shape1_and_authority_substitution() {
         let authority = fixture_authority();
         assert!(NativeShapeRaw::parse(b"SHAPE1|samples=1\n", &authority).is_err());
         let mut other = authority.clone();
         other.run_id = "different-run".to_owned();
-        assert!(NativeShapeRaw::parse(valid_raw(&authority).as_bytes(), &other).is_err());
+        assert!(NativeShapeRaw::parse(valid_raw().as_bytes(), &other).is_err());
     }
 
     #[test]
-    fn nshap2_requires_header_first_with_exact_fields_and_order() {
-        let authority = fixture_authority();
-        let raw = valid_raw(&authority);
-        let header = authority.header_record().unwrap();
+    fn nshape2_requires_header_first_with_exact_fields_and_order() {
+        let raw = valid_raw();
+        let header = FIXTURE_HEADER;
 
         parse_rejected(replace_once(
             &raw,
@@ -774,18 +859,17 @@ mod tests {
         parse_rejected(replace_once(&raw, "|sampling_hz=997", ""));
         parse_rejected(format!("junk\n{raw}"));
         parse_rejected(replace_once(&raw, &format!("{header}\n"), ""));
-        parse_rejected(replace_once(&raw, &header, &format!("{header}\n{header}")));
+        parse_rejected(replace_once(&raw, header, &format!("{header}\n{header}")));
     }
 
     #[test]
-    fn nshap2_rejects_unknown_duplicate_missing_and_reordered_records() {
-        let authority = fixture_authority();
-        let raw = valid_raw(&authority);
+    fn nshape2_rejects_unknown_duplicate_missing_and_reordered_records() {
+        let raw = valid_raw();
 
         parse_rejected(replace_once(
             &raw,
-            "NSHAPE2|mode|kind=user|count=70",
-            "NSHAPE2|mode|kind=user|count=70\nNSHAPE2|mode|kind=user|count=70",
+            "NSHAPE2|mode|kind=all|count=100",
+            "NSHAPE2|mode|kind=all|count=100\nNSHAPE2|mode|kind=all|count=100",
         ));
         parse_rejected(replace_once(
             &raw,
@@ -819,6 +903,11 @@ mod tests {
         ));
         parse_rejected(replace_once(
             &raw,
+            "NSHAPE2|exit|pid=11|reason=1",
+            "NSHAPE2|exit|reason=1|pid=11",
+        ));
+        parse_rejected(replace_once(
+            &raw,
             "NSHAPE2|pc|pid=10|pc=0x1000|count=15",
             "NSHAPE2|pc|pid=10|pc=0x1000|count=15\nNSHAPE2|pc|pid=10|pc=0x1000|count=15",
         ));
@@ -831,7 +920,7 @@ mod tests {
         parse_rejected(replace_once(&raw, "count=15", "count=015"));
         parse_rejected(replace_once(
             &raw,
-            "NSHAPE2|complete|bounded=0|target_completed=1|target_exit_reason=1|admitted=2|exited=2|live_at_end=0|probe_errors=0\n",
+            "NSHAPE2|complete|bounded=0|target_completed=1|target_exit_reason=1|target_pid=10|admitted=2|exited=2|live_at_end=0|probe_errors=0\n",
             "",
         ));
         parse_rejected(format!("{raw}NSHAPE2|section=pc\n"));
@@ -841,9 +930,8 @@ mod tests {
     }
 
     #[test]
-    fn nshap2_rejects_invalid_fork_graphs() {
-        let authority = fixture_authority();
-        let raw = valid_raw(&authority);
+    fn nshape2_rejects_invalid_fork_graphs() {
+        let raw = valid_raw();
         let fork = "NSHAPE2|fork|parent=10|child=11";
 
         parse_rejected(replace_once(
@@ -862,9 +950,58 @@ mod tests {
     }
 
     #[test]
-    fn nshap2_rejects_zero_or_inconsistent_sample_populations() {
-        let authority = fixture_authority();
-        let raw = valid_raw(&authority);
+    fn nshape2_rejects_disconnected_or_unadmitted_process_evidence() {
+        let raw = valid_raw();
+        let disconnected = replace_once(
+            &replace_once(
+                &replace_once(
+                    &raw,
+                    "NSHAPE2|fork|parent=10|child=11",
+                    "NSHAPE2|fork|parent=10|child=11\nNSHAPE2|fork|parent=20|child=21",
+                ),
+                "NSHAPE2|exit|pid=11|reason=1",
+                "NSHAPE2|exit|pid=11|reason=1\nNSHAPE2|exit|pid=21|reason=1\nNSHAPE2|exit|pid=20|reason=1",
+            ),
+            "|admitted=2|exited=2|",
+            "|admitted=4|exited=4|",
+        );
+        parse_rejected_for(disconnected, "disconnected");
+
+        parse_rejected_for(
+            replace_once(
+                &raw,
+                "NSHAPE2|pc|pid=11|pc=0x2000",
+                "NSHAPE2|pc|pid=12|pc=0x2000",
+            ),
+            "PC PID is not admitted",
+        );
+        parse_rejected_for(
+            replace_once(
+                &raw,
+                "NSHAPE2|exit|pid=11|reason=1",
+                "NSHAPE2|exit|pid=12|reason=1",
+            ),
+            "exit PID is not admitted",
+        );
+        parse_rejected(replace_once(
+            &raw,
+            "NSHAPE2|exit|pid=11|reason=1",
+            "NSHAPE2|exit|pid=11|reason=1\nNSHAPE2|exit|pid=11|reason=1",
+        ));
+        parse_rejected(replace_once(&raw, "NSHAPE2|exit|pid=11|reason=1\n", ""));
+        parse_rejected_for(
+            replace_once(
+                &raw,
+                "NSHAPE2|exit|pid=10|reason=1",
+                "NSHAPE2|exit|pid=10|reason=2",
+            ),
+            "target exit reason",
+        );
+    }
+
+    #[test]
+    fn nshape2_rejects_zero_or_inconsistent_sample_populations() {
+        let raw = valid_raw();
 
         parse_rejected(replace_once(&raw, "pc=0x1000", "pc=0x0"));
         parse_rejected(replace_once(&raw, "count=15", "count=0"));
@@ -874,23 +1011,33 @@ mod tests {
             "",
         ));
         parse_rejected(replace_once(&raw, "kind=jit|count=40", "kind=jit|count=0"));
-        parse_rejected(replace_once(
-            &raw,
+        parse_rejected_for(
+            replace_once(&raw, "kind=all|count=100", "kind=all|count=101"),
+            "all CPU count does not reconcile",
+        );
+        let invalid = replace_once(
+            &replace_once(&raw, "kind=all|count=100", "kind=all|count=101"),
             "kind=invalid|count=0",
             "kind=invalid|count=1",
-        ));
-        parse_rejected(replace_once(
-            &raw,
+        );
+        parse_rejected_for(invalid, "invalid CPU sample count is nonzero");
+        let regions = replace_once(
+            &replace_once(&raw, "kind=all|count=100", "kind=all|count=101"),
             "kind=user|count=70",
             "kind=user|count=71",
-        ));
-        parse_rejected(replace_once(&raw, "kind=jit|count=40", "kind=jit|count=41"));
+        );
+        parse_rejected_for(regions, "user CPU count does not reconcile");
+        let pcs = replace_once(
+            &replace_once(&raw, "kind=jit|count=40", "kind=jit|count=41"),
+            "kind=non-jit|count=30",
+            "kind=non-jit|count=29",
+        );
+        parse_rejected_for(pcs, "JIT user count does not reconcile");
     }
 
     #[test]
-    fn nshap2_rejects_every_population_addition_overflow() {
-        let authority = fixture_authority();
-        let raw = valid_raw(&authority);
+    fn nshape2_rejects_every_population_addition_overflow() {
+        let raw = valid_raw();
         let max = u64::MAX;
 
         let total_overflow = replace_once(
@@ -917,11 +1064,39 @@ mod tests {
         );
         parse_rejected_for(total_overflow, "total CPU sample count overflow");
 
+        let invalid_overflow = replace_once(
+            &replace_once(
+                &replace_once(
+                    &replace_once(
+                        &replace_once(&raw, "kind=all|count=100", &format!("kind=all|count={max}")),
+                        "kind=user|count=70",
+                        &format!("kind=user|count={}", max - 1),
+                    ),
+                    "kind=kernel|count=30",
+                    "kind=kernel|count=1",
+                ),
+                "kind=invalid|count=0",
+                "kind=invalid|count=1",
+            ),
+            "kind=jit|count=40",
+            &format!("kind=jit|count={}", max - 1),
+        );
+        let invalid_overflow = replace_once(
+            &replace_once(
+                &invalid_overflow,
+                "kind=non-jit|count=30",
+                "kind=non-jit|count=0",
+            ),
+            "count=15\nNSHAPE2|pc|pid=11|pc=0x2000|count=25",
+            &format!("count={}\n", max - 1),
+        );
+        parse_rejected_for(invalid_overflow, "total CPU sample count overflow");
+
         let region_overflow = replace_once(
             &replace_once(
                 &replace_once(
                     &replace_once(
-                        &raw,
+                        &replace_once(&raw, "kind=all|count=100", &format!("kind=all|count={max}")),
                         "kind=user|count=70",
                         &format!("kind=user|count={max}"),
                     ),
@@ -941,7 +1116,11 @@ mod tests {
                 &replace_once(
                     &replace_once(
                         &replace_once(
-                            &raw,
+                            &replace_once(
+                                &raw,
+                                "kind=all|count=100",
+                                &format!("kind=all|count={max}"),
+                            ),
                             "kind=user|count=70",
                             &format!("kind=user|count={max}"),
                         ),
@@ -961,14 +1140,14 @@ mod tests {
     }
 
     #[test]
-    fn nshap2_rejects_non_authoritative_completion() {
-        let authority = fixture_authority();
-        let raw = valid_raw(&authority);
+    fn nshape2_rejects_non_authoritative_completion() {
+        let raw = valid_raw();
 
         for (from, to) in [
             ("bounded=0", "bounded=1"),
             ("target_completed=1", "target_completed=0"),
             ("target_exit_reason=1", "target_exit_reason=2"),
+            ("target_pid=10", "target_pid=12"),
             ("admitted=2", "admitted=3"),
             ("exited=2", "exited=1"),
             ("live_at_end=0", "live_at_end=1"),
@@ -982,6 +1161,20 @@ mod tests {
             "|admitted=2|exited=2",
             "|exited=2|admitted=2",
         ));
+        parse_rejected_for(
+            replace_once(&raw, "|exited=2|", "|exited=3|"),
+            "exited process count exceeds admitted",
+        );
+        parse_rejected_for(
+            replace_once(&raw, "|admitted=2|exited=2|", "|admitted=3|exited=3|"),
+            "admitted process count does not reconcile",
+        );
+        let exited_rows = replace_once(
+            &replace_once(&raw, "|exited=2|", "|exited=1|"),
+            "|live_at_end=0|",
+            "|live_at_end=1|",
+        );
+        parse_rejected_for(exited_rows, "exited process count does not reconcile");
         parse_rejected(replace_once(
             &raw,
             "|probe_errors=0",
