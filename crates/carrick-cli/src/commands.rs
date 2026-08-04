@@ -1331,6 +1331,15 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             DebugCommand::ExecStampCensus { input, workload_ns } => {
                 crate::debug_exec_stamps::run_exec_stamp_census(&input, workload_ns)?
             }
+            DebugCommand::JitShapeCensus {
+                trace,
+                snapshots,
+                jit_share_of_total,
+            } => crate::debug_jit_shape::run_jit_shape_census(
+                &trace,
+                &snapshots,
+                jit_share_of_total,
+            )?,
             _ => bail!("debug (guest address-space inspection) is HVF-only on this build"),
         },
         Commands::TraceChild {

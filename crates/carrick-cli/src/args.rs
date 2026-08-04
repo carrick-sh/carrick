@@ -947,6 +947,19 @@ pub(crate) enum DebugCommand {
         #[arg(long = "workload-ns")]
         workload_ns: u64,
     },
+    /// Join a complete native AArch64 sampled-PC trace to authenticated JIT
+    /// retirement snapshots and report exact emitted context traffic.
+    JitShapeCensus {
+        /// Complete SHAPE1 stream from native-shape-census.d.
+        trace: PathBuf,
+        /// Directory containing paired v4 JSON and binary JIT snapshots.
+        #[arg(long)]
+        snapshots: PathBuf,
+        /// Independently measured share of total workload CPU executing JIT
+        /// code. Retained verbatim to make total-CPU projections auditable.
+        #[arg(long = "jit-share-of-total")]
+        jit_share_of_total: f64,
+    },
     /// Decode an AArch64 ESR_EL1 value into its exception class, IL, ISS
     /// (with DFSC for data aborts) so the operator doesn't have to hand-
     /// parse syndromes during an interactive session.
