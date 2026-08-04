@@ -9,10 +9,11 @@ pub enum AllocationOwner {
     IndirectTargetCache = 5,
     SharedTranslationSupport = 6,
     PublicationIndexes = 7,
+    TranslationSourcePreparation = 8,
 }
 
 impl AllocationOwner {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Other,
         Self::PublicationMap,
         Self::PublicationRecovery,
@@ -21,6 +22,7 @@ impl AllocationOwner {
         Self::IndirectTargetCache,
         Self::SharedTranslationSupport,
         Self::PublicationIndexes,
+        Self::TranslationSourcePreparation,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -34,6 +36,7 @@ impl AllocationOwner {
             Self::IndirectTargetCache => "indirect-target-cache",
             Self::SharedTranslationSupport => "shared-translation-support",
             Self::PublicationIndexes => "publication-indexes",
+            Self::TranslationSourcePreparation => "translation-source-preparation",
         }
     }
 
@@ -47,6 +50,7 @@ impl AllocationOwner {
             "indirect-target-cache" => Some(Self::IndirectTargetCache),
             "shared-translation-support" => Some(Self::SharedTranslationSupport),
             "publication-indexes" => Some(Self::PublicationIndexes),
+            "translation-source-preparation" => Some(Self::TranslationSourcePreparation),
             _ => None,
         }
     }
@@ -100,7 +104,7 @@ impl OwnerSnapshot {
     }
 }
 
-/// One deterministic `ALLOCOWNER1` process-image fragment.
+/// One deterministic `ALLOCOWNER2` process-image fragment.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AllocationOwnerCensusFile {
     pub pid: i32,
@@ -114,17 +118,17 @@ pub struct AllocationOwnerCensusFile {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AllocationOwnerWireError {
-    #[error("invalid ALLOCOWNER1 record: {0}")]
+    #[error("invalid ALLOCOWNER2 record: {0}")]
     Invalid(&'static str),
-    #[error("invalid ALLOCOWNER1 integer field {0}")]
+    #[error("invalid ALLOCOWNER2 integer field {0}")]
     InvalidInteger(&'static str),
-    #[error("ALLOCOWNER1 counter overflow")]
+    #[error("ALLOCOWNER2 counter overflow")]
     CounterOverflow,
-    #[error("ALLOCOWNER1 record reports counter overflow")]
+    #[error("ALLOCOWNER2 record reports counter overflow")]
     RecordedOverflow,
-    #[error("ALLOCOWNER1 record reports a lifecycle error")]
+    #[error("ALLOCOWNER2 record reports a lifecycle error")]
     RecordedLifecycleError,
-    #[error("failed to format ALLOCOWNER1 record")]
+    #[error("failed to format ALLOCOWNER2 record")]
     Format,
 }
 
@@ -152,7 +156,7 @@ impl AllocationOwnerCensusFile {
         let mut payload = String::new();
         writeln!(
             payload,
-            "ALLOCOWNER1|pid={}|exec_epoch={}|fragment={}|reason={}|armed_at=main-entry|overflow={}|lifecycle_error={}",
+            "ALLOCOWNER2|pid={}|exec_epoch={}|fragment={}|reason={}|armed_at=main-entry|overflow={}|lifecycle_error={}",
             self.pid,
             self.exec_epoch,
             self.fragment_sequence,
@@ -220,7 +224,7 @@ impl AllocationOwnerCensusFile {
         }
 
         let header = exact_fields(lines[0], 8, "header")?;
-        if header[0] != "ALLOCOWNER1" {
+        if header[0] != "ALLOCOWNER2" {
             return Err(AllocationOwnerWireError::Invalid("unknown schema"));
         }
         let pid = parse_i32(exact_value(header[1], "pid", "pid")?, "pid")?;
@@ -366,6 +370,7 @@ mod tests {
             "indirect-target-cache",
             "shared-translation-support",
             "publication-indexes",
+            "translation-source-preparation",
         ];
         assert_eq!(AllocationOwner::COUNT, expected.len());
         for (owner, token) in AllocationOwner::ALL.into_iter().zip(expected) {
@@ -418,9 +423,20 @@ mod tests {
         let first = file.render().expect("render fixture");
         let second = file.render().expect("render fixture twice");
         assert_eq!(first, second);
+        assert!(first.starts_with("ALLOCOWNER2|"));
         assert_eq!(AllocationOwnerCensusFile::parse(&first).unwrap(), file);
         assert_eq!(file.total_bytes().unwrap(), 4096);
         assert_eq!(file.total_calls().unwrap(), 6);
+    }
+
+    #[test]
+    fn v2_parser_rejects_a_checksum_valid_v1_record() {
+        let v1 = with_recomputed_checksum(fixture().render().expect("render fixture").replacen(
+            "ALLOCOWNER2|",
+            "ALLOCOWNER1|",
+            1,
+        ));
+        assert!(AllocationOwnerCensusFile::parse(&v1).is_err());
     }
 
     fn with_recomputed_checksum(mut text: String) -> String {
