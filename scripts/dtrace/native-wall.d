@@ -545,7 +545,7 @@ proc:::exit
 	exit(0);
 }
 
-tick-60s
+tick-180s
 {
 	timed_out = 1;
 	exit(0);

@@ -914,6 +914,11 @@ mod tests {
     }
 
     #[test]
+    fn native_wall_watchdog_allows_perturbed_cold_builds_to_finish() {
+        assert!(BUNDLED_NATIVE_WALL_D.contains("tick-180s"));
+    }
+
+    #[test]
     fn record_consumer_suppresses_exit_status_but_formats_protocol_records() {
         let exit = DtraceRecDesc {
             action: DTRACEACT_EXIT,
