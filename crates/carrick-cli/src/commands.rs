@@ -135,7 +135,11 @@ fn uses_live_kernel_symbols(profile: crate::trace_profile::TraceProfileKind) -> 
 
 #[cfg(target_os = "macos")]
 fn uses_native_launch_qualification(profile: crate::trace_profile::TraceProfileKind) -> bool {
-    profile == crate::trace_profile::TraceProfileKind::NativeWall
+    matches!(
+        profile,
+        crate::trace_profile::TraceProfileKind::NativeFault
+            | crate::trace_profile::TraceProfileKind::NativeWall
+    )
 }
 
 const BIRTH_FIXTURE_MARKER: &[u8] = b"BIRTH_FIXTURE_OK\n\0";
@@ -1472,10 +1476,24 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 #[cfg(target_os = "macos")]
                 let (script_src, native_profile_authority) =
                     if let Some(qualification) = native_profile_qualification.as_ref() {
-                        let profile_template = script_template.as_deref().ok_or_else(|| {
-                            anyhow::anyhow!("native-wall profile has no D program")
+                        let profile_template = script_template
+                            .as_deref()
+                            .ok_or_else(|| anyhow::anyhow!("native profile has no D program"))?;
+                        let requested = profile.ok_or_else(|| {
+                            anyhow::anyhow!("native launch qualification has no profile")
                         })?;
-                        let rendered = qualification.render_v2_profile_program(profile_template)?;
+                        let rendered = match requested {
+                            crate::trace_profile::TraceProfileKind::NativeFault => qualification
+                                .render_native_fault_profile_program(profile_template)?,
+                            crate::trace_profile::TraceProfileKind::NativeWall => {
+                                qualification.render_v2_profile_program(profile_template)?
+                            }
+                            crate::trace_profile::TraceProfileKind::Dsr
+                            | crate::trace_profile::TraceProfileKind::DsrFork
+                            | crate::trace_profile::TraceProfileKind::DsrIndirect => {
+                                unreachable!("non-native profile requested native qualification")
+                            }
+                        };
                         (Some(rendered.program), Some(rendered.authority))
                     } else {
                         (script_template, None)
@@ -1485,7 +1503,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 #[cfg(target_os = "macos")]
                 if let Some(qualification) = native_profile_qualification.as_ref() {
                     eprintln!(
-                        "carrick trace: native-wall launch qualification accepted (birth={}, terminal={})",
+                        "carrick trace: native launch qualification accepted (birth={}, terminal={})",
                         qualification.birth_receipt_sha256(),
                         qualification.terminal_receipt_sha256()
                     );
@@ -2531,6 +2549,10 @@ mod tests {
         assert!(uses_live_kernel_symbols(TraceProfileKind::NativeWall));
         assert!(uses_native_launch_qualification(
             TraceProfileKind::NativeWall
+        ));
+        assert!(!uses_live_kernel_symbols(TraceProfileKind::NativeFault));
+        assert!(uses_native_launch_qualification(
+            TraceProfileKind::NativeFault
         ));
         for profile in [
             TraceProfileKind::Dsr,
