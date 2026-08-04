@@ -527,13 +527,13 @@ struct PublishedBlockLookup {
 
 /// Independently synchronized mirror of the published block index.
 ///
-/// A fresh miss uses locked preparation, unlocked pure decode, then locked
-/// authoritative commit for emission, publication, dependency updates, and
-/// direct-link patching. Warm cross-thread lookups used to take that process
-/// lock for one `BTreeMap::get`, so write-side work forced every reader into
-/// Darwin's `psynch_cvwait`. The mirror is published only after a block is
-/// executable and its invalidation dependency is registered. Its lock therefore
-/// covers just a lookup or one index update, never translation.
+/// `ProcessState`'s write lock deliberately spans decode, emit, publication,
+/// dependency updates, and direct-link patching. Warm cross-thread lookups used
+/// to take that same lock for one `BTreeMap::get`, so a translator doing useful
+/// write-side work forced every reader into Darwin's `psynch_cvwait`. The mirror
+/// is published only after a block is executable and its invalidation dependency
+/// is registered. Its lock therefore covers just a lookup or one index update,
+/// never translation.
 ///
 /// Sharding keeps unrelated publications from stopping unrelated readers. The
 /// per-thread cache remains the first-level path; this is the process-wide
@@ -4051,9 +4051,9 @@ impl ProcessState {
 }
 
 impl ThreadTranslator {
-    /// Three-phase translation on a miss: locked preparation, unlocked pure
-    /// decode, then locked authoritative commit. Warm hits retain their
-    /// lock-free per-thread or independently synchronized process-index paths.
+    /// Two-phase translate: a fully concurrent READ fast path for a warm
+    /// cache hit, falling back to locked preparation, unlocked decode, and
+    /// locked authoritative commit on a miss.
     ///
     /// The generation is derived the SAME way locked preparation derives it
     /// (`memory.dsr_generation_observation(guest).expected()`) -- this call is
@@ -4179,14 +4179,7 @@ impl ThreadTranslator {
         );
         let translated = match decoded {
             Ok(block) => state.commit_translation(memory, preparation, block, decode_elapsed),
-            Err(error) => {
-                if let Some(elapsed) = decode_elapsed {
-                    state
-                        .stats
-                        .add_elapsed(ResolverStat::TranslationDecodeNs, elapsed);
-                }
-                Err(error)
-            }
+            Err(error) => Err(error),
         };
         let translated = state.finish_started_translation(tid, guest, generation, translated)?;
         drop(state);
@@ -6028,7 +6021,6 @@ mod tests {
         let process = Arc::new(
             ProcessTranslator::new_with_host(256 * 1024, &TEST_HOST_JIT).expect("translator"),
         );
-        process.state.write().profiling = true;
         let mut translator = ThreadTranslator::for_process(Arc::clone(&process), 4);
         let cache_used_before = process.lifecycle_snapshot().0;
 
@@ -6047,7 +6039,6 @@ mod tests {
         assert_eq!(process.lifecycle_snapshot().0, cache_used_before);
         let state = process.state.read();
         assert_eq!(state.stats.translations, 0);
-        assert!(state.stats.translation_decode_ns > 0);
         assert_eq!(state.stats.optimistic_decode_discards, 0);
         assert!(state.blocks.is_empty());
     }
