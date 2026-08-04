@@ -2964,6 +2964,11 @@ impl ProcessState {
                 } else {
                     0
                 },
+                owned_map_len_bytes: if owns_metadata {
+                    capacity_bytes(map.len(), std::mem::size_of::<emit::PcMapEntry>())
+                } else {
+                    0
+                },
                 owned_map_capacity_bytes: if owns_metadata {
                     capacity_bytes(map.capacity(), std::mem::size_of::<emit::PcMapEntry>())
                 } else {
@@ -2971,6 +2976,11 @@ impl ProcessState {
                 },
                 owned_recovery_entries: if owns_metadata {
                     u64::try_from(recovery.len()).unwrap_or(u64::MAX)
+                } else {
+                    0
+                },
+                owned_recovery_len_bytes: if owns_metadata {
+                    capacity_bytes(recovery.len(), std::mem::size_of::<emit::RecoveryEntry>())
                 } else {
                     0
                 },
@@ -6982,10 +6992,14 @@ pub mod xlat_census {
         pub jit_bytes_written: u64,
         /// Logical entries retained in private instruction maps.
         pub owned_map_entries: u64,
+        /// Initialized bytes retained in private instruction-map Vecs.
+        pub owned_map_len_bytes: u64,
         /// Heap capacity retained by private instruction-map Vecs.
         pub owned_map_capacity_bytes: u64,
         /// Logical entries retained in private recovery tables.
         pub owned_recovery_entries: u64,
+        /// Initialized bytes retained in private recovery Vecs.
+        pub owned_recovery_len_bytes: u64,
         /// Heap capacity retained by private recovery Vecs.
         pub owned_recovery_capacity_bytes: u64,
         /// Final capacity of direct-link Vecs consumed and dropped during
@@ -7007,12 +7021,18 @@ pub mod xlat_census {
             self.owned_map_entries = self
                 .owned_map_entries
                 .saturating_add(other.owned_map_entries);
+            self.owned_map_len_bytes = self
+                .owned_map_len_bytes
+                .saturating_add(other.owned_map_len_bytes);
             self.owned_map_capacity_bytes = self
                 .owned_map_capacity_bytes
                 .saturating_add(other.owned_map_capacity_bytes);
             self.owned_recovery_entries = self
                 .owned_recovery_entries
                 .saturating_add(other.owned_recovery_entries);
+            self.owned_recovery_len_bytes = self
+                .owned_recovery_len_bytes
+                .saturating_add(other.owned_recovery_len_bytes);
             self.owned_recovery_capacity_bytes = self
                 .owned_recovery_capacity_bytes
                 .saturating_add(other.owned_recovery_capacity_bytes);
@@ -7103,13 +7123,15 @@ pub mod xlat_census {
             );
             let _ = writeln!(
                 out,
-                "MEMORY|private_blocks={}|unit_blocks={}|jit_bytes_written={}|owned_map_entries={}|owned_map_capacity_bytes={}|owned_recovery_entries={}|owned_recovery_capacity_bytes={}|direct_link_capacity_bytes={}",
+                "MEMORY|private_blocks={}|unit_blocks={}|jit_bytes_written={}|owned_map_entries={}|owned_map_len_bytes={}|owned_map_capacity_bytes={}|owned_recovery_entries={}|owned_recovery_len_bytes={}|owned_recovery_capacity_bytes={}|direct_link_capacity_bytes={}",
                 self.memory.private_blocks,
                 self.memory.unit_blocks,
                 self.memory.jit_bytes_written,
                 self.memory.owned_map_entries,
+                self.memory.owned_map_len_bytes,
                 self.memory.owned_map_capacity_bytes,
                 self.memory.owned_recovery_entries,
+                self.memory.owned_recovery_len_bytes,
                 self.memory.owned_recovery_capacity_bytes,
                 self.memory.direct_link_capacity_bytes,
             );
@@ -7405,13 +7427,15 @@ pub mod xlat_census {
     }
 
     fn parse_memory(line_text: &str, line: usize) -> Result<CensusMemory, CensusParseError> {
-        const NAMES: [&str; 8] = [
+        const NAMES: [&str; 10] = [
             "private_blocks",
             "unit_blocks",
             "jit_bytes_written",
             "owned_map_entries",
+            "owned_map_len_bytes",
             "owned_map_capacity_bytes",
             "owned_recovery_entries",
+            "owned_recovery_len_bytes",
             "owned_recovery_capacity_bytes",
             "direct_link_capacity_bytes",
         ];
@@ -7458,19 +7482,30 @@ pub mod xlat_census {
                 reason: format!("memory line is missing {name}"),
             })
         };
-        Ok(CensusMemory {
+        let memory = CensusMemory {
             private_blocks: parse_u64(value("private_blocks")?, line)?,
             unit_blocks: parse_u64(value("unit_blocks")?, line)?,
             jit_bytes_written: parse_u64(value("jit_bytes_written")?, line)?,
             owned_map_entries: parse_u64(value("owned_map_entries")?, line)?,
+            owned_map_len_bytes: parse_u64(value("owned_map_len_bytes")?, line)?,
             owned_map_capacity_bytes: parse_u64(value("owned_map_capacity_bytes")?, line)?,
             owned_recovery_entries: parse_u64(value("owned_recovery_entries")?, line)?,
+            owned_recovery_len_bytes: parse_u64(value("owned_recovery_len_bytes")?, line)?,
             owned_recovery_capacity_bytes: parse_u64(
                 value("owned_recovery_capacity_bytes")?,
                 line,
             )?,
             direct_link_capacity_bytes: parse_u64(value("direct_link_capacity_bytes")?, line)?,
-        })
+        };
+        if memory.owned_map_len_bytes > memory.owned_map_capacity_bytes
+            || memory.owned_recovery_len_bytes > memory.owned_recovery_capacity_bytes
+        {
+            return Err(CensusParseError {
+                line,
+                reason: "initialized metadata bytes exceed retained capacity".to_string(),
+            });
+        }
+        Ok(memory)
     }
 
     fn parse_skip<'a>(
@@ -8109,9 +8144,11 @@ pub mod xlat_census {
                 private_blocks: 1,
                 jit_bytes_written: 96,
                 owned_map_entries: 2,
+                owned_map_len_bytes: 32,
                 owned_map_capacity_bytes: 64,
                 owned_recovery_entries: 3,
-                owned_recovery_capacity_bytes: 128,
+                owned_recovery_len_bytes: 288,
+                owned_recovery_capacity_bytes: 384,
                 direct_link_capacity_bytes: 32,
                 ..CensusMemory::default()
             };
@@ -8136,6 +8173,7 @@ pub mod xlat_census {
                 private_blocks: 1,
                 jit_bytes_written: 24,
                 owned_map_entries: 1,
+                owned_map_len_bytes: 16,
                 owned_map_capacity_bytes: 32,
                 ..CensusMemory::default()
             };
@@ -8156,9 +8194,11 @@ pub mod xlat_census {
                     unit_blocks: 1,
                     jit_bytes_written: 168,
                     owned_map_entries: 3,
+                    owned_map_len_bytes: 48,
                     owned_map_capacity_bytes: 96,
                     owned_recovery_entries: 3,
-                    owned_recovery_capacity_bytes: 128,
+                    owned_recovery_len_bytes: 288,
+                    owned_recovery_capacity_bytes: 384,
                     direct_link_capacity_bytes: 48,
                 }
             );
@@ -8201,7 +8241,7 @@ pub mod xlat_census {
             let expected = format!(
                 "XLATCENSUS5|pid=4242|seq=1|reason=host-self-reexec|total=5|distinct=2|image={identity}|segments=1\n\
                  STORE|consulted=4|loaded=1|replayed=7|file_miss=1|recording_claimed=0|recording_declined=1|load_ns=1500000|publish_ns=2500000\n\
-                 MEMORY|private_blocks=0|unit_blocks=0|jit_bytes_written=0|owned_map_entries=0|owned_map_capacity_bytes=0|owned_recovery_entries=0|owned_recovery_capacity_bytes=0|direct_link_capacity_bytes=0\n\
+                 MEMORY|private_blocks=0|unit_blocks=0|jit_bytes_written=0|owned_map_entries=0|owned_map_len_bytes=0|owned_map_capacity_bytes=0|owned_recovery_entries=0|owned_recovery_len_bytes=0|owned_recovery_capacity_bytes=0|direct_link_capacity_bytes=0\n\
                  SKIP|lane-unconfigured|9\n\
                  SKIP|segment-repeat|40\n\
                  MISS|no-authority|2\n\
@@ -8236,15 +8276,17 @@ pub mod xlat_census {
                     unit_blocks: 2,
                     jit_bytes_written: 4096,
                     owned_map_entries: 3,
+                    owned_map_len_bytes: 48,
                     owned_map_capacity_bytes: 64,
                     owned_recovery_entries: 5,
+                    owned_recovery_len_bytes: 480,
                     owned_recovery_capacity_bytes: 512,
                     direct_link_capacity_bytes: 96,
                 },
             };
             let expected = "XLATCENSUS5|pid=7|seq=0|reason=process-exit|total=1|distinct=1|image=-|segments=0\n\
                             STORE|consulted=0|loaded=0|replayed=0|file_miss=0|recording_claimed=0|recording_declined=0|load_ns=0|publish_ns=0\n\
-                            MEMORY|private_blocks=1|unit_blocks=2|jit_bytes_written=4096|owned_map_entries=3|owned_map_capacity_bytes=64|owned_recovery_entries=5|owned_recovery_capacity_bytes=512|direct_link_capacity_bytes=96\n\
+                            MEMORY|private_blocks=1|unit_blocks=2|jit_bytes_written=4096|owned_map_entries=3|owned_map_len_bytes=48|owned_map_capacity_bytes=64|owned_recovery_entries=5|owned_recovery_len_bytes=480|owned_recovery_capacity_bytes=512|direct_link_capacity_bytes=96\n\
                             SKIP|lane-unconfigured|1\n\
                             VA|0x1000|-|outside|1\n";
             assert_eq!(file.render(), expected);
@@ -8255,7 +8297,7 @@ pub mod xlat_census {
         fn parse_fails_closed_on_a_truncated_or_mislabelled_file() {
             const HEADER: &str = "XLATCENSUS5|pid=1|seq=0|reason=process-exit|total=0|distinct=0|image=-|segments=0\n";
             const STORE: &str = "STORE|consulted=0|loaded=0|replayed=0|file_miss=0|recording_claimed=0|recording_declined=0|load_ns=0|publish_ns=0\n";
-            const MEMORY: &str = "MEMORY|private_blocks=0|unit_blocks=0|jit_bytes_written=0|owned_map_entries=0|owned_map_capacity_bytes=0|owned_recovery_entries=0|owned_recovery_capacity_bytes=0|direct_link_capacity_bytes=0\n";
+            const MEMORY: &str = "MEMORY|private_blocks=0|unit_blocks=0|jit_bytes_written=0|owned_map_entries=0|owned_map_len_bytes=0|owned_map_capacity_bytes=0|owned_recovery_entries=0|owned_recovery_len_bytes=0|owned_recovery_capacity_bytes=0|direct_link_capacity_bytes=0\n";
             let cases = [
                 (String::new(), "empty"),
                 (
@@ -8330,6 +8372,11 @@ pub mod xlat_census {
                     ),
                     "unknown MEMORY field",
                 ),
+                (
+                    format!("{HEADER}{STORE}{MEMORY}")
+                        .replace("owned_map_len_bytes=0", "owned_map_len_bytes=1"),
+                    "initialized metadata exceeds capacity",
+                ),
             ];
             for (text, what) in cases {
                 assert!(
@@ -8350,7 +8397,7 @@ pub mod xlat_census {
         fn skip_counts_before_the_store_line_are_not_discarded_by_it() {
             const HEADER: &str = "XLATCENSUS5|pid=1|seq=0|reason=process-exit|total=0|distinct=0|image=-|segments=0\n";
             const STORE: &str = "STORE|consulted=0|loaded=0|replayed=0|file_miss=0|recording_claimed=0|recording_declined=0|load_ns=0|publish_ns=0\n";
-            const MEMORY: &str = "MEMORY|private_blocks=0|unit_blocks=0|jit_bytes_written=0|owned_map_entries=0|owned_map_capacity_bytes=0|owned_recovery_entries=0|owned_recovery_capacity_bytes=0|direct_link_capacity_bytes=0\n";
+            const MEMORY: &str = "MEMORY|private_blocks=0|unit_blocks=0|jit_bytes_written=0|owned_map_entries=0|owned_map_len_bytes=0|owned_map_capacity_bytes=0|owned_recovery_entries=0|owned_recovery_len_bytes=0|owned_recovery_capacity_bytes=0|direct_link_capacity_bytes=0\n";
             let reordered =
                 format!("{HEADER}SKIP|segment-repeat|7\nMISS|no-authority|0\n{STORE}{MEMORY}");
             let file = CensusFile::parse(&reordered).expect("reordered file parses");

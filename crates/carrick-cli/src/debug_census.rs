@@ -251,13 +251,18 @@ pub(crate) struct MemorySection {
     pub unit_blocks: u64,
     pub jit_bytes_written: u64,
     pub owned_map_entries: u64,
+    pub owned_map_len_bytes: u64,
     pub owned_map_capacity_bytes: u64,
     pub owned_recovery_entries: u64,
+    pub owned_recovery_len_bytes: u64,
     pub owned_recovery_capacity_bytes: u64,
+    pub owned_metadata_len_bytes: u64,
     pub owned_metadata_capacity_bytes: u64,
+    pub owned_metadata_spare_capacity_bytes: u64,
     pub direct_link_capacity_bytes: u64,
-    pub owned_metadata_bytes_per_private_block: f64,
-    pub recovery_share_of_owned_metadata: f64,
+    pub owned_metadata_len_bytes_per_private_block: f64,
+    pub owned_metadata_capacity_bytes_per_private_block: f64,
+    pub recovery_share_of_owned_metadata_len: f64,
 }
 
 /// What the shared-translation store did, summed over every process.
@@ -616,8 +621,10 @@ fn memory_section(files: &[CensusFile]) -> MemorySection {
     let mut unit_blocks = 0u64;
     let mut jit_bytes_written = 0u64;
     let mut owned_map_entries = 0u64;
+    let mut owned_map_len_bytes = 0u64;
     let mut owned_map_capacity_bytes = 0u64;
     let mut owned_recovery_entries = 0u64;
+    let mut owned_recovery_len_bytes = 0u64;
     let mut owned_recovery_capacity_bytes = 0u64;
     let mut direct_link_capacity_bytes = 0u64;
     for file in files {
@@ -625,34 +632,45 @@ fn memory_section(files: &[CensusFile]) -> MemorySection {
         unit_blocks = unit_blocks.saturating_add(file.memory.unit_blocks);
         jit_bytes_written = jit_bytes_written.saturating_add(file.memory.jit_bytes_written);
         owned_map_entries = owned_map_entries.saturating_add(file.memory.owned_map_entries);
+        owned_map_len_bytes = owned_map_len_bytes.saturating_add(file.memory.owned_map_len_bytes);
         owned_map_capacity_bytes =
             owned_map_capacity_bytes.saturating_add(file.memory.owned_map_capacity_bytes);
         owned_recovery_entries =
             owned_recovery_entries.saturating_add(file.memory.owned_recovery_entries);
+        owned_recovery_len_bytes =
+            owned_recovery_len_bytes.saturating_add(file.memory.owned_recovery_len_bytes);
         owned_recovery_capacity_bytes =
             owned_recovery_capacity_bytes.saturating_add(file.memory.owned_recovery_capacity_bytes);
         direct_link_capacity_bytes =
             direct_link_capacity_bytes.saturating_add(file.memory.direct_link_capacity_bytes);
     }
+    let owned_metadata_len_bytes = owned_map_len_bytes.saturating_add(owned_recovery_len_bytes);
     let owned_metadata_capacity_bytes =
         owned_map_capacity_bytes.saturating_add(owned_recovery_capacity_bytes);
+    let owned_metadata_spare_capacity_bytes =
+        owned_metadata_capacity_bytes.saturating_sub(owned_metadata_len_bytes);
     MemorySection {
         private_blocks,
         unit_blocks,
         jit_bytes_written,
         owned_map_entries,
+        owned_map_len_bytes,
         owned_map_capacity_bytes,
         owned_recovery_entries,
+        owned_recovery_len_bytes,
         owned_recovery_capacity_bytes,
+        owned_metadata_len_bytes,
         owned_metadata_capacity_bytes,
+        owned_metadata_spare_capacity_bytes,
         direct_link_capacity_bytes,
-        owned_metadata_bytes_per_private_block: ratio(
+        owned_metadata_len_bytes_per_private_block: ratio(owned_metadata_len_bytes, private_blocks),
+        owned_metadata_capacity_bytes_per_private_block: ratio(
             owned_metadata_capacity_bytes,
             private_blocks,
         ),
-        recovery_share_of_owned_metadata: ratio(
-            owned_recovery_capacity_bytes,
-            owned_metadata_capacity_bytes,
+        recovery_share_of_owned_metadata_len: ratio(
+            owned_recovery_len_bytes,
+            owned_metadata_len_bytes,
         ),
     }
 }
@@ -926,9 +944,11 @@ mod tests {
                         private_blocks: 4,
                         jit_bytes_written: 400,
                         owned_map_entries: 20,
+                        owned_map_len_bytes: 320,
                         owned_map_capacity_bytes: 320,
                         owned_recovery_entries: 40,
-                        owned_recovery_capacity_bytes: 2880,
+                        owned_recovery_len_bytes: 3840,
+                        owned_recovery_capacity_bytes: 4800,
                         direct_link_capacity_bytes: 64,
                         ..CensusMemory::default()
                     },
@@ -946,9 +966,11 @@ mod tests {
                         unit_blocks: 1,
                         jit_bytes_written: 500,
                         owned_map_entries: 15,
+                        owned_map_len_bytes: 240,
                         owned_map_capacity_bytes: 240,
                         owned_recovery_entries: 30,
-                        owned_recovery_capacity_bytes: 2160,
+                        owned_recovery_len_bytes: 2880,
+                        owned_recovery_capacity_bytes: 3360,
                         direct_link_capacity_bytes: 96,
                     },
                 },
@@ -977,13 +999,27 @@ mod tests {
         assert_eq!(report.memory.unit_blocks, 1);
         assert_eq!(report.memory.jit_bytes_written, 900);
         assert_eq!(report.memory.owned_map_entries, 35);
+        assert_eq!(report.memory.owned_map_len_bytes, 560);
         assert_eq!(report.memory.owned_map_capacity_bytes, 560);
         assert_eq!(report.memory.owned_recovery_entries, 70);
-        assert_eq!(report.memory.owned_recovery_capacity_bytes, 5040);
-        assert_eq!(report.memory.owned_metadata_capacity_bytes, 5600);
+        assert_eq!(report.memory.owned_recovery_len_bytes, 6720);
+        assert_eq!(report.memory.owned_recovery_capacity_bytes, 8160);
+        assert_eq!(report.memory.owned_metadata_len_bytes, 7280);
+        assert_eq!(report.memory.owned_metadata_capacity_bytes, 8720);
+        assert_eq!(report.memory.owned_metadata_spare_capacity_bytes, 1440);
         assert_eq!(report.memory.direct_link_capacity_bytes, 160);
-        assert!((report.memory.owned_metadata_bytes_per_private_block - 800.0).abs() < 1e-9);
-        assert!((report.memory.recovery_share_of_owned_metadata - 0.9).abs() < 1e-9);
+        assert!((report.memory.owned_metadata_len_bytes_per_private_block - 1040.0).abs() < 1e-9);
+        assert!(
+            (report
+                .memory
+                .owned_metadata_capacity_bytes_per_private_block
+                - (8720.0 / 7.0))
+                .abs()
+                < 1e-9
+        );
+        assert!(
+            (report.memory.recovery_share_of_owned_metadata_len - (6720.0 / 7280.0)).abs() < 1e-9
+        );
     }
 
     #[test]
@@ -1390,6 +1426,7 @@ mod tests {
         assert_eq!(json["processes"]["incarnations"], 2);
         assert_eq!(json["store"]["lookups"], 8);
         assert_eq!(json["store"]["skipped"]["lane-unconfigured"], 8);
-        assert_eq!(json["memory"]["owned_metadata_capacity_bytes"], 5600);
+        assert_eq!(json["memory"]["owned_metadata_len_bytes"], 7280);
+        assert_eq!(json["memory"]["owned_metadata_capacity_bytes"], 8720);
     }
 }
