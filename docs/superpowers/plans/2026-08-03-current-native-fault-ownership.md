@@ -280,14 +280,14 @@ Commit:
   signed source and unchanged isolated warmed persistent stores.
 - Produces one source-backed GO or STOP decision.
 
-- [ ] **Step 1: Run full validation and build/sign**
+- [x] **Step 1: Run full validation and build/sign**
 
 Run `RUST_TEST_THREADS=1 just ci`, then `just build`. Record source SHA,
 executable SHA-256, Mach-O UUID, signature, DOF presence, D-template SHA-256,
 qualification receipt hashes, image digest/architecture, exact store content
 manifest, host topology, power/thermal metadata, and zero scoped survivors.
 
-- [ ] **Step 2: Run two naturally completed cold-build captures**
+- [x] **Step 2: Run two naturally completed cold-build captures**
 
 For A and B independently, reuse one previously warmed isolated store only
 after recording its content manifest. Use a unique CARRICK_RUN_ID and a fresh
@@ -296,7 +296,7 @@ WORKLOAD_NS, target status zero, natural NFAULT2 completion, all loss/error
 counters zero, every sampled page joined, unchanged store manifest, and zero
 survivors. Never cite traced wall time.
 
-- [ ] **Step 3: Bind ownership to one source mechanism**
+- [x] **Step 3: Bind ownership to one source mechanism**
 
 If guest-owned zfod dominates, split the owned range with source-authoritative
 heap/mmap/image layout and compare the guest operation with Go's Darwin
@@ -305,7 +305,7 @@ allocation census or a new Rust allocator counter to name the retaining call
 site; do not infer one from address shape. Keep exact event counts, sample
 shares, and projected total-CPU opportunity separate.
 
-- [ ] **Step 4: Apply the 10% gate**
+- [x] **Step 4: Apply the 10% gate**
 
 Require the same correctness-preserving, non-overlapping source mechanism to
 project at least 10% of total cold-build CPU in both captures. If it does not,
@@ -313,9 +313,19 @@ record STOP and select the next bucket. If it does, write a separate
 single-variable production design and controlled ABBA plan before editing
 runtime behavior.
 
-- [ ] **Step 5: Commit evidence and update the controller**
+- [x] **Step 5: Commit evidence and update the controller**
 
 Run `git diff --check`. Do not change the official 10.4446x ratio unless a
 fresh serialized untraced Carrick-then-Docker comparison actually ran. Commit
 the evidence, ledger row, completed plan, and handoff as one narrow
-attribution-only change.
+evidence-only change.
+
+**Executed result:** A/B fault captures and D/E source censuses all used clean
+source `0e35a2d3` and signed binary SHA-256 `813201a8…5819`. Host-other zfod was
+63.2115% / 62.7395%. Initialized PC-map/recovery metadata plus JIT bytes written
+projected to 7.4111% / 7.4247% of total CPU even with the favorable 3.84
+us/fault input, so the decision is **STOP**. One pre-acceptance source run was
+rejected for `flush_balance=-1`; both accepted source runs reconciled 140/140
+independent NATIVEPERF process-image epochs. Full receipts and the next
+measurement are recorded in
+`docs/perf-results/2026-08-03-current-native-fault-ownership.md`.

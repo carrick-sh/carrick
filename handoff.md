@@ -1,9 +1,9 @@
 # Native-lane performance: state of play
 
 **Date:** 2026-08-03 · **Branch:** `codex/native-store-default` · **Latest
-implementation decision:** stop current context-traffic work; the largest
-source-distinct mechanism is x17 authority at 7.00% / 7.18% of projected total
-CPU, below the 10% opportunity gate ·
+implementation decision:** stop the current translation-publication memory
+hypothesis; initialized metadata plus JIT bytes written project to 7.411% /
+7.425% of total CPU, below the 10% opportunity gate ·
 **Scope:** Darwin/aarch64 native backend (`--exec-backend native`, the shipped
 default). VMM is explicitly NOT the target: one process per VM against a
 ~127-VM macOS ceiling makes it a dead end for build-shaped workloads.
@@ -82,6 +82,17 @@ non-overlapping mechanism clears 10%, so no emitter candidate was selected.
 Full evidence:
 [`docs/perf-results/2026-08-03-current-context-traffic.md`](docs/perf-results/2026-08-03-current-context-traffic.md).
 
+The refreshed current-default fault ownership line is now complete. Two
+source-identical NFAULT2 captures put host-other at **63.2115% / 62.7395%** of
+sampled zfod, with exact `as_fault` and `zfod` totals agreeing within 0.67% and
+0.52%. Two independent export-only translation censuses then reconciled
+140/140 process-image epochs apiece and named 6.873/6.877 GB of initialized PC
+map/recovery metadata plus 618.7/618.9 MB of JIT output. Even charging the old,
+favorable 3.84 us all-system-CPU cost to every corresponding page projects
+only **7.4111% / 7.4247%** of total CPU. No production allocation or metadata
+change was selected. Full evidence:
+[`docs/perf-results/2026-08-03-current-native-fault-ownership.md`](docs/perf-results/2026-08-03-current-native-fault-ownership.md).
+
 ## What landed (2026-08-02/03, six waves, all merged with `just ci` green)
 
 **Exec pipeline.** Payload SHA-256 removed from the default artifact digest
@@ -134,14 +145,15 @@ the always-on event ring. No official ratio refresh is warranted because
 neither line retained a production candidate. `RUST_TEST_THREADS=1 just ci`
 passes at the current source authority.
 
-1. **Refresh current-default kernel and memory attribution.** Use the existing
-   native-wall and fault-address DTrace profiles on the current signed tip.
-   Bind fault pages to guest mappings versus Carrick or libmalloc allocations,
-   and name the Darwin primitive induced by one guest operation. Carry a
-   production candidate forward only if the same source-backed mechanism is at
-   least 10% of total cold-build CPU in two agreeing captures. If guest page
-   management dominates, use Go's Darwin allocator lowering as the dual-port
-   oracle before proposing a host primitive.
+1. **Attribute the residual host-allocation first-touch population.** The
+   current fault captures establish that host-other dominates zfod, while the
+   largest named source (translation publication metadata plus JIT bytes)
+   explains about 47% of the scaled host-other population and fails the 10%
+   gate. Add export-only cumulative allocation/initialization counters at
+   source-distinct remaining owners, close them at exec/exit, and carry a
+   production candidate forward only if the same owner clears 10% in two
+   agreeing captures. Core decoding of these counters is a future diagnostic;
+   the always-on event ring remains the crash path for lifecycle history.
 2. **Keep eager full translation as a deferred future design, not the next
    patch.** Translating a complete eligible image once up front could amortize
    publication and avoid the losing per-process merge path measured here. It
@@ -155,21 +167,21 @@ passes at the current source authority.
 
 ## Confidence
 
-- **Very high (99%):** accepted exact context coverage is complete. Every JIT
-  sample resolves to one authenticated own or unique ancestor snapshot; zero
-  samples are missing.
-- **High (97%):** the context distribution is stable. Independent captures put
-  aggregate context traffic within 0.101 percentage points and x17 authority
-  within 0.181 percentage points.
-- **High (96%):** no source-distinct context mechanism clears the production
-  gate. The largest is below 7.2% in both captures; the 16% aggregate is
-  explicitly multiple mechanisms.
+- **Very high (98%):** current fault ownership is stable and complete. Both
+  captures completed naturally with every loss/identity/catalog counter zero;
+  host-other zfod differs by only 0.472 percentage points.
+- **Very high (98%):** the translation-publication source census is stable.
+  Both accepted runs reconcile 140/140 independent process-image epochs and
+  initialized metadata differs by only 0.052%.
+- **High (96%):** the named publication-memory mechanism does not clear the
+  production gate. Two deliberately favorable projections remain below 7.7%
+  in both bindings; untallied allocator churn was not promoted into a result.
 - **High (95%):** the official shipped-default result remains 10.4446x. No
   rejected candidate code is retained and no projection was substituted for a
   fresh Carrick/Docker run.
-- **Medium-high (78%):** refreshed kernel/memory attribution is the best next
-  lane. Prior evidence gives that side enough mass, but its current-default
-  mechanism distribution must be re-qualified before selecting a patch.
+- **Medium-high (80%):** residual host-allocation first touch is the best next
+  lane. The population has measured mass, but it is not yet source-distinct and
+  therefore cannot authorize a patch.
 
 ## Discipline that earned its keep (do not relearn these)
 
@@ -194,13 +206,14 @@ passes at the current source authority.
 
 ## Branch state at handoff
 
-`cacda86854f3c55a59802f16e8161b172e8d107f` is the source authority for the
-two accepted context captures. Its signed binary has SHA-256
-`67ac424a88fb14f3b4f131831b7293bd9ccfe8da43a3ff2f9e885ab2f7bcb794`
-and Mach-O UUID `7A0140A6-894D-34D1-B774-6A395266601B`. Commits `ba5b4420`
-and `cacda868` retain only the authenticated opt-in snapshot export,
-fail-closed Rust census, CLI wiring, and tests; they do not alter default
-execution. `RUST_TEST_THREADS=1 just ci` passed at that source authority.
+`0e35a2d37b8f74acdb83c245f5fcfe7257f892b3` is the source authority for the
+accepted fault and publication-memory captures. Its signed binary has SHA-256
+`813201a8f0b71f495c2771b7e2deee941c1c6ec9832aca0bf7d571be7f065819`
+and Mach-O UUID `407C0AF5-5880-3A2F-816F-5CBDA63CBB42`. Commits `aa29e872`
+through `0e35a2d3` retain the authenticated owned-range publication, NFAULT2
+profile, fail-closed Rust ownership reader, and export-only publication-memory
+census. They do not alter default guest semantics. `RUST_TEST_THREADS=1 just
+ci` passed at that source authority.
 Nothing has been pushed and local `main` has not moved. Target-only raw ABBA,
 mechanism, signed-binary, store, attribution, and scoreboard receipts remain
 under `target/perf/` and are intentionally not committed.
