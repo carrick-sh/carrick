@@ -319,14 +319,16 @@ mod tests {
         if child == 0 {
             let result = (|| -> Result<(), String> {
                 let (memory, guest) = mapped_dsr_test_memory(&[0xd400_0001])?;
-                let process =
-                    super::test_process_translator(16 * 1024).map_err(|error| error.to_string())?;
-                let mut state = process.state.write();
-                let first = state
-                    .translate(0, &memory, guest)
+                let process = std::sync::Arc::new(
+                    super::test_process_translator(16 * 1024).map_err(|error| error.to_string())?,
+                );
+                let mut translator =
+                    super::ThreadTranslator::for_process(std::sync::Arc::clone(&process), 0);
+                let first = translator
+                    .translate_for_test(&memory, guest)
                     .map_err(|error| error.to_string())?;
-                let second = state
-                    .translate(0, &memory, guest)
+                let second = translator
+                    .translate_for_test(&memory, guest)
                     .map_err(|error| error.to_string())?;
                 if first.outcome != super::TranslationOutcome::Translated
                     || second.outcome != super::TranslationOutcome::BlockIndexHit
@@ -336,7 +338,6 @@ mod tests {
                         "unexpected outcomes: first={first:?} second={second:?}"
                     ));
                 }
-                drop(state);
                 let (used_bytes, block_count, generation_count) = process.lifecycle_snapshot();
                 if used_bytes == 0 || block_count != 1 || generation_count != 1 {
                     return Err(format!(
@@ -378,14 +379,15 @@ mod tests {
         if child == 0 {
             let result = (|| -> Result<(), String> {
                 let (memory, guest) = mapped_dsr_test_memory(&[0xd400_0001])?;
-                let process =
-                    super::test_process_translator(16 * 1024).map_err(|error| error.to_string())?;
+                let process = std::sync::Arc::new(
+                    super::test_process_translator(16 * 1024).map_err(|error| error.to_string())?,
+                );
                 // Populate the block via the write path, exactly as the real
                 // miss path does.
-                let translated = process
-                    .state
-                    .write()
-                    .translate(0, &memory, guest)
+                let mut translator =
+                    super::ThreadTranslator::for_process(std::sync::Arc::clone(&process), 0);
+                let translated = translator
+                    .translate_for_test(&memory, guest)
                     .map_err(|error| error.to_string())?;
 
                 let observation = memory
@@ -434,12 +436,13 @@ mod tests {
         if child == 0 {
             let result = (|| -> Result<(), String> {
                 let (memory, guest) = mapped_dsr_test_memory(&[0xd400_0001])?;
-                let process =
-                    super::test_process_translator(16 * 1024).map_err(|error| error.to_string())?;
-                let first = process
-                    .state
-                    .write()
-                    .translate(0, &memory, guest)
+                let process = std::sync::Arc::new(
+                    super::test_process_translator(16 * 1024).map_err(|error| error.to_string())?,
+                );
+                let mut translator =
+                    super::ThreadTranslator::for_process(std::sync::Arc::clone(&process), 0);
+                let first = translator
+                    .translate_for_test(&memory, guest)
                     .map_err(|error| error.to_string())?;
 
                 // Mutate the guest code: bumps the page's generation, so
@@ -464,10 +467,8 @@ mod tests {
                 }
 
                 // The write path re-translates cleanly at the new generation.
-                let second = process
-                    .state
-                    .write()
-                    .translate(0, &memory, guest)
+                let second = translator
+                    .translate_for_test(&memory, guest)
                     .map_err(|error| error.to_string())?;
                 if second.generation != new_generation {
                     return Err(format!(
@@ -900,6 +901,12 @@ mod tests {
             state
                 .stats
                 .add(super::ResolverStat::SharedDirectEdgeGroupBuilds, 31);
+            state
+                .stats
+                .add(super::ResolverStat::OptimisticDecodeDiscards, 7);
+            state
+                .stats
+                .add(super::ResolverStat::OptimisticDecodeDiscardNs, 19);
         }
         let first_frames = first.take_profile_frames().expect("first record");
         process
@@ -919,6 +926,8 @@ mod tests {
             ("shared_owned_immutable_records", 23),
             ("shared_guest_range_derivations", 29),
             ("shared_direct_edge_group_builds", 31),
+            ("optimistic_decode_discards", 7),
+            ("optimistic_decode_discard_ns", 19),
         ] {
             assert_eq!(protocol_value(&first_frames, field), expected, "{field}");
             assert_eq!(protocol_value(&second_frames, field), 0, "{field}");
@@ -927,6 +936,16 @@ mod tests {
             protocol_value(&first_frames, "translations")
                 + protocol_value(&second_frames, "translations"),
             12
+        );
+        assert_eq!(
+            protocol_value(&first_frames, "optimistic_decode_discards")
+                + protocol_value(&second_frames, "optimistic_decode_discards"),
+            7
+        );
+        assert_eq!(
+            protocol_value(&first_frames, "optimistic_decode_discard_ns")
+                + protocol_value(&second_frames, "optimistic_decode_discard_ns"),
+            19
         );
     }
 

@@ -443,7 +443,8 @@ impl PreparedExit {
 /// **Invalidation contract, unchanged from the single slot it replaces.** Both
 /// paths that remove blocks stay covered:
 ///
-/// * PER-PAGE invalidation (`ProcessState::translate`'s `blocks.remove(&stale)`)
+/// * PER-PAGE invalidation (`ProcessState::prepare_translation`'s
+///   `blocks.remove(&stale)`)
 ///   ADVANCES that page's generation. Entries are keyed `(guest, generation)` and
 ///   the generation is re-observed on every lookup, so a stale entry simply stops
 ///   matching. Nothing to do.
@@ -1075,6 +1076,28 @@ pub struct TranslationResult {
     pub outcome: TranslationOutcome,
     pub emitted_bytes: u64,
     pub cache_used_bytes: u64,
+}
+
+struct TranslationPreparation {
+    tid: i32,
+    guest: carrick_guest_mem::GuestVa,
+    key: (carrick_guest_mem::GuestVa, types::CodeGeneration),
+    source_page: carrick_guest_mem::GuestVa,
+    observation: cache::PageGenerationObservation,
+    artifact_address_mode: emit::EmitAddressMode,
+    artifact_key: Option<artifact_spike::ArtifactKey>,
+    artifact_template: Option<artifact_spike::ArtifactTemplate>,
+    profiling: bool,
+    translation_started: Option<std::time::Instant>,
+    superblock_segments: usize,
+}
+
+// Fresh translation is already a cold miss path. Keep its owned preparation
+// inline so the lock split does not add a heap allocation or persistent state.
+#[allow(clippy::large_enum_variant)]
+enum PreparedTranslation {
+    Complete(TranslationResult),
+    Fresh(TranslationPreparation),
 }
 
 pub struct PublishedBlock {
@@ -3064,7 +3087,7 @@ impl ProcessState {
             crate::alloc_owner_wire::AllocationOwner::PublicationIndexes,
         );
         let entry = emitted.entry();
-        // `ProcessState::translate` owns `&mut self` from the process
+        // `ProcessState::commit_translation` owns `&mut self` from the process
         // translator's write guard. It re-checks `blocks` after acquiring
         // that guard, then retains exclusive access through this publication.
         // A second mutex-protected publication index cannot arbitrate a race
@@ -3187,17 +3210,40 @@ impl ProcessState {
         })
     }
 
-    #[doc(hidden)]
-    pub fn translate(
+    fn finish_started_translation(
+        &self,
+        tid: i32,
+        guest: carrick_guest_mem::GuestVa,
+        generation: types::CodeGeneration,
+        result: Result<TranslationResult, types::DsrError>,
+    ) -> Result<TranslationResult, types::DsrError> {
+        let (cache_pc, emitted_bytes, outcome) = match &result {
+            Ok(translated) => (
+                translated.entry.host().raw() as u64,
+                translated.emitted_bytes,
+                probes::DsrOperationOutcome::Success,
+            ),
+            Err(error) => (0, 0, error.probe_outcome()),
+        };
+        probes::dsr_translate_end(tid, guest.raw(), cache_pc, emitted_bytes, outcome);
+        if matches!(&result, Err(types::DsrError::CacheCapacity { .. })) {
+            probes::dsr_cache_event(
+                tid,
+                probes::DsrCacheEventKind::CapacityFailure,
+                guest.raw(),
+                generation.get(),
+                u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
+            );
+        }
+        result
+    }
+
+    fn prepare_translation(
         &mut self,
         tid: i32,
         memory: &NativeMappedMemory,
         guest: carrick_guest_mem::GuestVa,
-    ) -> Result<TranslationResult, types::DsrError> {
-        #[cfg(feature = "alloc-owner-census")]
-        let _owner = crate::alloc_owner_census::scope(
-            crate::alloc_owner_wire::AllocationOwner::TranslationOrchestration,
-        );
+    ) -> Result<PreparedTranslation, types::DsrError> {
         let observation = memory.dsr_generation_observation(guest)?;
         let source_page = observation.page();
         let generation = observation.expected();
@@ -3239,22 +3285,22 @@ impl ProcessState {
                 generation.get(),
                 u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
             );
-            return Ok(TranslationResult {
+            return Ok(PreparedTranslation::Complete(TranslationResult {
                 entry,
                 generation,
                 outcome: TranslationOutcome::BlockIndexHit,
                 emitted_bytes: 0,
                 cache_used_bytes: u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
-            });
+            }));
         }
         if let Some(entry) = self.try_load_shared_unit(memory, guest, generation)? {
-            return Ok(TranslationResult {
+            return Ok(PreparedTranslation::Complete(TranslationResult {
                 entry,
                 generation,
                 outcome: TranslationOutcome::SharedUnit,
                 emitted_bytes: 0,
                 cache_used_bytes: u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
-            });
+            }));
         }
         probes::dsr_cache_event(
             tid,
@@ -3297,7 +3343,7 @@ impl ProcessState {
                 artifact_spike::ArtifactKey::from_source(guest, words, artifact_address_mode)
             })
         });
-        let result = (|| -> Result<TranslationResult, types::DsrError> {
+        let prepared = (|| -> Result<PreparedTranslation, types::DsrError> {
             let mut artifact_template = if artifact_lookup_allowed {
                 artifact_key.and_then(|artifact_key| {
                     self.artifact_store
@@ -3346,43 +3392,112 @@ impl ProcessState {
                         generation.get(),
                         u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
                     );
-                    return self.publish_emitted(
-                        memory,
-                        key,
-                        source_page,
-                        observation,
-                        emitted,
-                        emitted_bytes,
-                        TranslationOutcome::ArtifactReplay,
-                        xlat_census::PublicationCensus::ArtifactReplay,
-                    );
+                    return self
+                        .publish_emitted(
+                            memory,
+                            key,
+                            source_page,
+                            observation,
+                            emitted,
+                            emitted_bytes,
+                            TranslationOutcome::ArtifactReplay,
+                            xlat_census::PublicationCensus::ArtifactReplay,
+                        )
+                        .map(PreparedTranslation::Complete);
                 }
             }
-            probes::dsr_translate_subphase_begin(
+            Ok(PreparedTranslation::Fresh(TranslationPreparation {
                 tid,
-                probes::DsrTranslationSubphase::Decode,
-                guest.raw(),
-                generation.get(),
-            );
-            let decode_started = self.profiling.then(std::time::Instant::now);
-            let block_result = block::plan_block_with_segments(
-                memory,
                 guest,
-                generation,
-                256,
-                self.superblock_segments,
-            );
-            if let Some(started) = decode_started {
-                self.stats
-                    .add_elapsed(ResolverStat::TranslationDecodeNs, started.elapsed());
+                key,
+                source_page,
+                observation,
+                artifact_address_mode,
+                artifact_key,
+                artifact_template,
+                profiling: self.profiling,
+                translation_started,
+                superblock_segments: self.superblock_segments,
+            }))
+        })();
+
+        match prepared {
+            Ok(PreparedTranslation::Fresh(preparation)) => {
+                Ok(PreparedTranslation::Fresh(preparation))
             }
-            probes::dsr_translate_subphase_end(
+            Ok(PreparedTranslation::Complete(result)) => self
+                .finish_started_translation(tid, guest, generation, Ok(result))
+                .map(PreparedTranslation::Complete),
+            Err(error) => self
+                .finish_started_translation(tid, guest, generation, Err(error))
+                .map(PreparedTranslation::Complete),
+        }
+    }
+
+    fn commit_translation(
+        &mut self,
+        memory: &NativeMappedMemory,
+        preparation: TranslationPreparation,
+        block: block::BlockPlan,
+        decode_elapsed: Option<std::time::Duration>,
+    ) -> Result<TranslationResult, types::DsrError> {
+        let TranslationPreparation {
+            tid,
+            guest,
+            key,
+            source_page,
+            observation,
+            artifact_address_mode,
+            artifact_key,
+            artifact_template,
+            profiling: _,
+            translation_started,
+            superblock_segments: _,
+        } = preparation;
+        let generation = key.1;
+        if let Some(elapsed) = decode_elapsed {
+            self.stats
+                .add_elapsed(ResolverStat::TranslationDecodeNs, elapsed);
+        }
+        if observation.current() != generation {
+            return Err(types::DsrError::GenerationChanged {
+                page: source_page.raw(),
+                expected: generation.get(),
+                observed: observation.current().get(),
+            });
+        }
+        if let Some(entry) = self.blocks.get(&key).copied() {
+            self.stats.add(ResolverStat::CacheLookupHits, 1);
+            if self.profiling {
+                self.stats.add(ResolverStat::OptimisticDecodeDiscards, 1);
+                if let Some(elapsed) = decode_elapsed {
+                    self.stats
+                        .add_elapsed(ResolverStat::OptimisticDecodeDiscardNs, elapsed);
+                }
+            }
+            self.published_blocks.insert(
+                key,
+                PublishedBlockLookup {
+                    entry,
+                    trusted_entry: self.trusted_entries.get(&key).copied(),
+                },
+            );
+            probes::dsr_cache_event(
                 tid,
-                probes::DsrTranslationSubphase::Decode,
+                probes::DsrCacheEventKind::BlockHit,
                 guest.raw(),
                 generation.get(),
+                u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
             );
-            let block = block_result?;
+            return Ok(TranslationResult {
+                entry,
+                generation,
+                outcome: TranslationOutcome::BlockIndexHit,
+                emitted_bytes: 0,
+                cache_used_bytes: u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
+            });
+        }
+        (|| -> Result<TranslationResult, types::DsrError> {
             let block_word_count = usize::try_from(
                 block
                     .end
@@ -3698,27 +3813,7 @@ impl ProcessState {
                 generation.get(),
             );
             publication_result
-        })();
-
-        let (cache_pc, emitted_bytes, outcome) = match &result {
-            Ok(translated) => (
-                translated.entry.host().raw() as u64,
-                translated.emitted_bytes,
-                probes::DsrOperationOutcome::Success,
-            ),
-            Err(error) => (0, 0, error.probe_outcome()),
-        };
-        probes::dsr_translate_end(tid, guest.raw(), cache_pc, emitted_bytes, outcome);
-        if matches!(&result, Err(types::DsrError::CacheCapacity { .. })) {
-            probes::dsr_cache_event(
-                tid,
-                probes::DsrCacheEventKind::CapacityFailure,
-                guest.raw(),
-                generation.get(),
-                u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
-            );
-        }
-        result
+        })()
     }
 
     /// Record one published block. THE publication point: both the private
@@ -3957,27 +4052,38 @@ impl ProcessState {
 
 impl ThreadTranslator {
     /// Two-phase translate: a fully concurrent READ fast path for a warm
-    /// cache hit, falling back to the exclusive WRITE path (the existing,
-    /// unchanged `ProcessState::translate`: invalidate + lookup + translate
-    /// + insert) on a miss.
+    /// cache hit, falling back to locked preparation, unlocked decode, and
+    /// locked authoritative commit on a miss.
     ///
-    /// The generation is derived the SAME way `ProcessState::translate`
-    /// derives it (`memory.dsr_generation_observation(guest).expected()`) --
-    /// this call is `&self` on `NativeMappedMemory` and touches only the
-    /// per-page generation table (a different, cheap lock), never
-    /// `ProcessState`. Recomputing it again inside the write-path `translate`
-    /// on a miss is redundant but harmless (idempotent, no side effects on
-    /// `ProcessState`).
+    /// The generation is derived the SAME way locked preparation derives it
+    /// (`memory.dsr_generation_observation(guest).expected()`) -- this call is
+    /// `&self` on `NativeMappedMemory` and touches only the per-page generation
+    /// table (a different, cheap lock), never `ProcessState`. Recomputing it
+    /// during preparation on a miss is redundant but harmless (idempotent, no
+    /// side effects on `ProcessState`).
     ///
     /// See `ProcessState::cached_block` for why a hit found here can never be
     /// a stale (pre-mutation) block, and
     /// `docs/superpowers/specs/2026-07-15-dsr-translation-cache-read-mostly-design.md`
     /// for the full design.
-    fn translate_read_mostly(
+    fn translate_read_mostly_with<D>(
         &mut self,
         memory: &NativeMappedMemory,
         guest: carrick_guest_mem::GuestVa,
-    ) -> Result<TranslationResult, types::DsrError> {
+        decode: D,
+    ) -> Result<TranslationResult, types::DsrError>
+    where
+        D: FnOnce(
+            &NativeMappedMemory,
+            carrick_guest_mem::GuestVa,
+            types::CodeGeneration,
+            usize,
+        ) -> Result<block::BlockPlan, types::DsrError>,
+    {
+        #[cfg(feature = "alloc-owner-census")]
+        let _owner = crate::alloc_owner_census::scope(
+            crate::alloc_owner_wire::AllocationOwner::TranslationOrchestration,
+        );
         let generation = memory.dsr_generation_observation(guest)?.expected();
         // Per-thread fast path, taken BEFORE any lock. Every gateway exit reaches
         // this function, and the shared read guard below was measured as the
@@ -4027,22 +4133,79 @@ impl ThreadTranslator {
                 cache_used_bytes: self.last_cache_used_bytes,
             });
         }
-        // A process-index miss falls through to the exclusive write path.
-        // `ProcessState::translate` re-checks `blocks.get` itself as its very
-        // first lookup (after a no-op `invalidate_page` when the page hasn't
-        // changed), so a block another thread inserted in the index-to-write
-        // gap is found there -- no duplicate translation -- and a genuine
-        // miss is translated exactly as before.
+        // A process-index miss falls through to locked preparation. Fresh
+        // decoding then runs without the writer; locked commit revalidates the
+        // generation and authoritative block index before deriving metadata or
+        // emitting code.
         let mut state = probes::acquire_with_synchronization_reason(
             probes::DsrSynchronizationKind::ProcessStateWrite,
             || self.process.state.write(),
         );
-        let translated = state.translate(self.tid, memory, guest)?;
+        let prepared = state.prepare_translation(self.tid, memory, guest)?;
+        let preparation = match prepared {
+            PreparedTranslation::Complete(translated) => {
+                drop(state);
+                self.last_cache_used_bytes = translated.cache_used_bytes;
+                self.block_cache
+                    .insert(guest, translated.generation, translated.entry);
+                return Ok(translated);
+            }
+            PreparedTranslation::Fresh(preparation) => preparation,
+        };
+        drop(state);
+
+        let tid = preparation.tid;
+        let generation = preparation.key.1;
+        let superblock_segments = preparation.superblock_segments;
+        probes::dsr_translate_subphase_begin(
+            tid,
+            probes::DsrTranslationSubphase::Decode,
+            guest.raw(),
+            generation.get(),
+        );
+        let decode_started = preparation.profiling.then(std::time::Instant::now);
+        let decoded = decode(memory, guest, generation, superblock_segments);
+        let decode_elapsed = decode_started.map(|started| started.elapsed());
+        probes::dsr_translate_subphase_end(
+            tid,
+            probes::DsrTranslationSubphase::Decode,
+            guest.raw(),
+            generation.get(),
+        );
+
+        let mut state = probes::acquire_with_synchronization_reason(
+            probes::DsrSynchronizationKind::ProcessStateWrite,
+            || self.process.state.write(),
+        );
+        let translated = match decoded {
+            Ok(block) => state.commit_translation(memory, preparation, block, decode_elapsed),
+            Err(error) => Err(error),
+        };
+        let translated = state.finish_started_translation(tid, guest, generation, translated)?;
         drop(state);
         self.last_cache_used_bytes = translated.cache_used_bytes;
         self.block_cache
             .insert(guest, translated.generation, translated.entry);
         Ok(translated)
+    }
+
+    fn translate_read_mostly(
+        &mut self,
+        memory: &NativeMappedMemory,
+        guest: carrick_guest_mem::GuestVa,
+    ) -> Result<TranslationResult, types::DsrError> {
+        self.translate_read_mostly_with(memory, guest, |memory, guest, generation, segments| {
+            block::plan_block_with_segments(memory, guest, generation, 256, segments)
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn translate_for_test(
+        &mut self,
+        memory: &NativeMappedMemory,
+        guest: carrick_guest_mem::GuestVa,
+    ) -> Result<TranslationResult, types::DsrError> {
+        self.translate_read_mostly(memory, guest)
     }
 
     fn translate<const PROFILE: bool>(
@@ -4940,20 +5103,20 @@ mod tests {
 
     #[cfg(feature = "alloc-owner-census")]
     #[test]
-    fn allocation_owner_translation_orchestration_wraps_process_translation() {
+    fn allocation_owner_translation_orchestration_wraps_read_mostly_translation() {
         let source = include_str!("translator.rs");
         let body = source
-            .split_once("    pub fn translate(\n")
-            .expect("process translation function")
+            .split_once("    fn translate_read_mostly_with<")
+            .expect("translation orchestration function")
             .1
-            .split_once("    /// Record one published block")
-            .expect("process translation function end")
+            .split_once("    fn translate_read_mostly(\n")
+            .expect("translation orchestration function end")
             .0;
         let owner = body
             .find("AllocationOwner::TranslationOrchestration")
             .expect("translation orchestration owner");
         let observation = body
-            .find("let observation = memory.dsr_generation_observation(guest)?")
+            .find("let generation = memory.dsr_generation_observation(guest)?.expected();")
             .expect("translation generation observation");
         assert!(owner < observation);
     }
@@ -4962,6 +5125,20 @@ mod tests {
     use crate::alloc_owner_census::test_support as allocation_census;
 
     const PC: GuestVa = GuestVa(0x1000);
+
+    fn syscall_plan(guest: GuestVa, generation: types::CodeGeneration) -> crate::block::BlockPlan {
+        crate::block::BlockPlan {
+            start: guest,
+            end: GuestVa(guest.raw() + 4),
+            generation,
+            instructions: Vec::new(),
+            exit: crate::block::PlannedExit::Syscall {
+                guest,
+                resume: GuestVa(guest.raw() + 4),
+            },
+            extensions: Vec::new(),
+        }
+    }
 
     /// The persistent store is default-ON with an exact `=0` rollback hatch.
     /// Pinned on the pure parser because the runtime gate caches the
@@ -5721,10 +5898,10 @@ mod tests {
     fn warm_process_lookup_does_not_take_the_translation_state_lock() {
         let source = include_str!("translator.rs");
         let body = source
-            .split_once("    fn translate_read_mostly(\n")
+            .split_once("    fn translate_read_mostly_with<")
             .expect("read-mostly translation function")
             .1
-            .split_once("    fn translate<const PROFILE: bool>(\n")
+            .split_once("    fn translate_read_mostly(\n")
             .expect("read-mostly translation function end")
             .0;
 
@@ -5736,6 +5913,218 @@ mod tests {
             !body.contains("self.process.state.read()"),
             "a translating writer must not force warm process hits into psynch_cvwait"
         );
+    }
+
+    #[test]
+    fn fresh_block_decode_is_outside_the_process_state_writer() {
+        let source = include_str!("translator.rs");
+        let body = source
+            .split_once("    fn translate_read_mostly_with<")
+            .expect("optimistic translation orchestrator")
+            .1
+            .split_once("    fn translate_read_mostly(\n")
+            .expect("orchestrator end")
+            .0;
+        let first_drop = body
+            .find("drop(state);")
+            .expect("release preparation writer");
+        let decode = body.find("decode(").expect("decoder call");
+        let second_write = body[first_drop + 1..]
+            .find("self.process.state.write()")
+            .map(|offset| first_drop + 1 + offset)
+            .expect("commit writer");
+        assert!(first_drop < decode && decode < second_write);
+    }
+
+    #[test]
+    fn concurrent_same_key_decode_emits_and_publishes_once() {
+        let memory = crate::mapped_memory::NativeMappedMemory::shared_install_test_fixture(4096);
+        let process = Arc::new(
+            ProcessTranslator::new_with_host(256 * 1024, &TEST_HOST_JIT).expect("translator"),
+        );
+        process.state.write().profiling = true;
+        let barrier = Arc::new(Barrier::new(2));
+        let first_barrier = Arc::clone(&barrier);
+        let second_barrier = Arc::clone(&barrier);
+        let mut first_translator = ThreadTranslator::for_process(Arc::clone(&process), 1);
+        let mut second_translator = ThreadTranslator::for_process(Arc::clone(&process), 2);
+
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                first_translator.translate_read_mostly_with(
+                    &memory,
+                    PC,
+                    |_memory, guest, generation, _segments| {
+                        first_barrier.wait();
+                        Ok(syscall_plan(guest, generation))
+                    },
+                )
+            });
+            let second = scope.spawn(|| {
+                second_translator.translate_read_mostly_with(
+                    &memory,
+                    PC,
+                    |_memory, guest, generation, _segments| {
+                        second_barrier.wait();
+                        Ok(syscall_plan(guest, generation))
+                    },
+                )
+            });
+            (
+                first.join().expect("first translator thread"),
+                second.join().expect("second translator thread"),
+            )
+        });
+        let first = first.expect("first translation");
+        let second = second.expect("second translation");
+
+        assert_eq!(first.entry, second.entry);
+        assert_eq!(process.lifecycle_snapshot().1, 1);
+        let stats = process.state.read().stats;
+        assert_eq!(stats.translations, 1);
+        assert_eq!(stats.optimistic_decode_discards, 1);
+        assert!(stats.optimistic_decode_discard_ns > 0);
+        assert!(stats.translation_decode_ns >= stats.optimistic_decode_discard_ns);
+    }
+
+    #[test]
+    fn generation_change_during_decode_rejects_the_plan_without_mutation() {
+        let memory = crate::mapped_memory::NativeMappedMemory::shared_install_test_fixture(4096);
+        let process = Arc::new(
+            ProcessTranslator::new_with_host(256 * 1024, &TEST_HOST_JIT).expect("translator"),
+        );
+        let mut translator = ThreadTranslator::for_process(Arc::clone(&process), 3);
+        let cache_used_before = process.lifecycle_snapshot().0;
+
+        let error = translator
+            .translate_read_mostly_with(&memory, PC, |memory, guest, generation, _segments| {
+                memory
+                    .note_dsr_code_mutation(guest.raw(), 4)
+                    .expect("generation bump")
+                    .expect("changed generation");
+                Ok(syscall_plan(guest, generation))
+            })
+            .expect_err("generation-changing decode must fail");
+
+        assert!(matches!(error, types::DsrError::GenerationChanged { .. }));
+        assert_eq!(process.lifecycle_snapshot().1, 0);
+        assert_eq!(process.lifecycle_snapshot().0, cache_used_before);
+        let state = process.state.read();
+        assert_eq!(state.stats.translations, 0);
+        assert_eq!(state.stats.optimistic_decode_discards, 0);
+        assert!(state.blocks.is_empty());
+    }
+
+    #[test]
+    fn decode_error_does_not_mutate_translation_state() {
+        let memory = crate::mapped_memory::NativeMappedMemory::shared_install_test_fixture(4096);
+        let process = Arc::new(
+            ProcessTranslator::new_with_host(256 * 1024, &TEST_HOST_JIT).expect("translator"),
+        );
+        let mut translator = ThreadTranslator::for_process(Arc::clone(&process), 4);
+        let cache_used_before = process.lifecycle_snapshot().0;
+
+        let error = translator
+            .translate_read_mostly_with(&memory, PC, |_memory, _guest, _generation, _segments| {
+                Err(types::DsrError::BlockPolicy(
+                    "injected decode failure".into(),
+                ))
+            })
+            .expect_err("decode failure must propagate");
+
+        assert!(
+            matches!(error, types::DsrError::BlockPolicy(message) if message == "injected decode failure")
+        );
+        assert_eq!(process.lifecycle_snapshot().1, 0);
+        assert_eq!(process.lifecycle_snapshot().0, cache_used_before);
+        let state = process.state.read();
+        assert_eq!(state.stats.translations, 0);
+        assert_eq!(state.stats.optimistic_decode_discards, 0);
+        assert!(state.blocks.is_empty());
+    }
+
+    #[test]
+    fn fresh_translation_probe_lifecycle_has_one_common_end() {
+        let source = include_str!("translator.rs");
+        let production = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("production/test boundary")
+            .0;
+        assert_eq!(
+            production.matches("probes::dsr_translate_begin(").count(),
+            1
+        );
+        assert_eq!(production.matches("probes::dsr_translate_end(").count(), 1);
+    }
+
+    #[test]
+    fn artifact_replay_precedes_fresh_decode() {
+        let memory = crate::mapped_memory::NativeMappedMemory::shared_install_test_fixture(4096);
+        let generation = types::CodeGeneration::INITIAL;
+        let plan = syscall_plan(PC, generation);
+        let observation = memory
+            .dsr_generation_observation(PC)
+            .expect("recording observation");
+        let mut recording_cache = crate::test_jit::test_cache(256 * 1024);
+        let (_emitted, artifact) = crate::emit::emit_block_recording_artifact(
+            &mut recording_cache,
+            &plan,
+            crate::emit::GenerationGuard::new(observation.current_atomic(), generation),
+            crate::emit::EmitAddressMode::Direct,
+            vec![0xd400_0001],
+        )
+        .expect("record artifact fixture");
+        let digest = [0x4d; 32];
+        let key = crate::artifact_spike::ArtifactKey::from_image_digest(
+            PC,
+            digest,
+            crate::emit::EmitAddressMode::Direct,
+        );
+        let store = crate::artifact_spike::empty_store_for_test().expect("empty artifact store");
+        store
+            .insert(key, &artifact.template)
+            .expect("insert artifact fixture");
+
+        let process = Arc::new(
+            ProcessTranslator::new_with_host(256 * 1024, &TEST_HOST_JIT).expect("translator"),
+        );
+        {
+            let mut state = process.state.write();
+            state.artifact_image_digest = Some(digest);
+            state.artifact_store = Some(store);
+        }
+        let mut translator = ThreadTranslator::for_process(Arc::clone(&process), 5);
+        let decoder_calls = std::sync::atomic::AtomicU64::new(0);
+
+        let translated = translator
+            .translate_read_mostly_with(&memory, PC, |_memory, _guest, _generation, _segments| {
+                decoder_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                panic!("artifact replay must precede fresh decode")
+            })
+            .expect("artifact replay");
+
+        assert_eq!(
+            translated.outcome,
+            super::TranslationOutcome::ArtifactReplay
+        );
+        assert_eq!(decoder_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(process.lifecycle_snapshot().1, 1);
+    }
+
+    #[test]
+    fn artifact_lookup_precedes_fresh_preparation() {
+        let source = include_str!("translator.rs");
+        let production = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("production/test boundary")
+            .0;
+        let lookup = production
+            .find("store.lookup(artifact_key)")
+            .expect("artifact lookup");
+        let fresh = production
+            .find("PreparedTranslation::Fresh(TranslationPreparation {")
+            .expect("fresh preparation");
+        assert!(lookup < fresh);
     }
 
     #[test]
@@ -5808,7 +6197,8 @@ mod tests {
             decode_translation_unit_metadata, encode_translation_unit_metadata,
         };
         use crate::translator::{
-            AttachedReplayOutcome, ProcessTranslator, encode_aarch64_direct_branch,
+            AttachedReplayOutcome, ProcessTranslator, ThreadTranslator, TranslationOutcome,
+            encode_aarch64_direct_branch,
         };
         use crate::types::{CodeGeneration, DirectExit, DirectKind};
         use crate::{emit, types};
@@ -6130,6 +6520,34 @@ mod tests {
                 state.stats.shared_translations_avoided, 2,
                 "every replayed block avoided one fresh translation"
             );
+        }
+
+        #[test]
+        fn shared_unit_replay_precedes_fresh_decode() {
+            let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+            let (candidate, _native, _words) = record_candidate(&memory, &syscall_plan(BLOCK_A));
+            let LookupFixture {
+                translator,
+                store: _store,
+                _code,
+            } = lookup_fixture(vec![candidate]);
+            let process = Arc::new(translator);
+            let mut thread = ThreadTranslator::for_process(Arc::clone(&process), 7);
+            let decoder_calls = std::sync::atomic::AtomicU64::new(0);
+
+            let translated = thread
+                .translate_read_mostly_with(
+                    &memory,
+                    BLOCK_A,
+                    |_memory, _guest, _generation, _segments| {
+                        decoder_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        panic!("shared-unit replay must precede fresh decode")
+                    },
+                )
+                .expect("shared-unit translation");
+
+            assert_eq!(translated.outcome, TranslationOutcome::SharedUnit);
+            assert_eq!(decoder_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
         }
 
         /// The census contract rides on `AttachedReplayOutcome`: the lookup
