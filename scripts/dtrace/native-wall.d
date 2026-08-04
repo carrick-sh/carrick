@@ -1,5 +1,5 @@
 #pragma D option quiet
-#pragma D option dynvarsize=128m
+#pragma D option dynvarsize=512m
 #pragma D option bufsize=64m
 #pragma D option aggsize=64m
 #pragma D option ustackframes=24
