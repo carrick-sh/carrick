@@ -74,10 +74,16 @@ pub(crate) fn run_debug(command: DebugCommand) -> anyhow::Result<()> {
         }
         DebugCommand::JitShapeCensus {
             trace,
+            capture,
             snapshots,
-            jit_share_of_total,
+            output,
         } => {
-            crate::debug_jit_shape::run_jit_shape_census(&trace, &snapshots, jit_share_of_total)?;
+            crate::debug_jit_shape::run_jit_shape_census(
+                &trace,
+                &capture,
+                &snapshots,
+                output.as_deref(),
+            )?;
         }
         DebugCommand::DecodeEsr { syndrome } => {
             let stripped = syndrome.trim();
