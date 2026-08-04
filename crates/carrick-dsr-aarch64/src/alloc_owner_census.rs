@@ -9,6 +9,10 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
+/// Internal host-self-reexec transport. This is consumed at main entry and
+/// never forwarded into the guest environment.
+pub const EXEC_EPOCH_ENV: &str = "CARRICK_ALLOC_OWNER_EXEC_EPOCH";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 enum CensusState {
@@ -81,6 +85,9 @@ static FRAGMENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static STATE: AtomicU8 = AtomicU8::new(CensusState::Disabled as u8);
 static OUTPUT_DIR: OnceLock<PathBuf> = OnceLock::new();
 static AEXIT_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(any(test, feature = "test-hooks"))]
+static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 static TEST_MONOTONIC_NS: AtomicU64 = AtomicU64::new(0);
@@ -261,7 +268,7 @@ fn init_main_from_environment_with(
             .set(directory)
             .map_err(|_| CensusError::Configuration("output directory initialized concurrently"))?;
     }
-    let exec_epoch = match std::env::var_os("CARRICK_ALLOC_OWNER_EXEC_EPOCH") {
+    let exec_epoch = match std::env::var_os(EXEC_EPOCH_ENV) {
         None => 0,
         Some(raw) => raw
             .to_str()
@@ -388,12 +395,16 @@ fn begin_transition(reason: AllocationFlushReason) -> Result<(), CensusError> {
 
 /// Guard spanning the final host `execve` attempt.
 pub struct HostExecAttempt {
+    active: bool,
     epoch: u64,
     next_fragment: u64,
 }
 
 impl Drop for HostExecAttempt {
     fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
         if STATE.load(Ordering::Acquire) != CensusState::Transition as u8 {
             LIFECYCLE_ERROR.store(true, Ordering::Relaxed);
             return;
@@ -407,6 +418,13 @@ impl Drop for HostExecAttempt {
 
 /// Drain immediately before host `execve`; dropping the guard means it returned.
 pub fn begin_host_exec_attempt(next_exec_epoch: u64) -> Result<HostExecAttempt, CensusError> {
+    if STATE.load(Ordering::Acquire) == CensusState::Disabled as u8 {
+        return Ok(HostExecAttempt {
+            active: false,
+            epoch: 0,
+            next_fragment: 0,
+        });
+    }
     expected_next_epoch(next_exec_epoch)?;
     let next_fragment = FRAGMENT_SEQUENCE
         .load(Ordering::Relaxed)
@@ -415,6 +433,7 @@ pub fn begin_host_exec_attempt(next_exec_epoch: u64) -> Result<HostExecAttempt, 
     let epoch = EXEC_EPOCH.load(Ordering::Relaxed);
     begin_transition(AllocationFlushReason::HostSelfReexecAttempt)?;
     Ok(HostExecAttempt {
+        active: true,
         epoch,
         next_fragment,
     })
@@ -422,6 +441,7 @@ pub fn begin_host_exec_attempt(next_exec_epoch: u64) -> Result<HostExecAttempt, 
 
 /// Guard for the result-free in-process translator exec commit.
 pub struct InProcessExecTransition {
+    active: bool,
     next_exec_epoch: u64,
     rearmed: bool,
 }
@@ -429,6 +449,10 @@ pub struct InProcessExecTransition {
 impl InProcessExecTransition {
     /// Reset the outgoing counters and arm the committed successor epoch.
     pub fn rearm_successor(mut self) -> Result<(), CensusError> {
+        if !self.active {
+            self.rearmed = true;
+            return Ok(());
+        }
         if STATE.load(Ordering::Acquire) != CensusState::Transition as u8 {
             return Err(lifecycle_error(
                 "in-process successor did not follow transition",
@@ -445,7 +469,7 @@ impl InProcessExecTransition {
 
 impl Drop for InProcessExecTransition {
     fn drop(&mut self) {
-        if !self.rearmed {
+        if self.active && !self.rearmed {
             LIFECYCLE_ERROR.store(true, Ordering::Relaxed);
         }
     }
@@ -453,9 +477,17 @@ impl Drop for InProcessExecTransition {
 
 /// Drain the outgoing allocation epoch at the in-process exec commit.
 pub fn begin_in_process_exec(next_exec_epoch: u64) -> Result<InProcessExecTransition, CensusError> {
+    if STATE.load(Ordering::Acquire) == CensusState::Disabled as u8 {
+        return Ok(InProcessExecTransition {
+            active: false,
+            next_exec_epoch,
+            rearmed: false,
+        });
+    }
     expected_next_epoch(next_exec_epoch)?;
     begin_transition(AllocationFlushReason::InProcessExec)?;
     Ok(InProcessExecTransition {
+        active: true,
         next_exec_epoch,
         rearmed: false,
     })
@@ -641,10 +673,11 @@ fn rename_noreplace(temporary: &Path, final_path: &Path) -> Result<(), CensusErr
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    TEST_LOCK.lock().expect("allocation census test lock")
+    TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]
@@ -770,6 +803,87 @@ fn init_main_from_environment_with_for_test(
     register_atexit: impl FnOnce() -> i32,
 ) -> Result<bool, CensusError> {
     init_main_from_environment_with(register_atexit)
+}
+
+/// Feature/test-hooks-only state seam for cross-crate lifecycle integration tests.
+#[cfg(any(test, feature = "test-hooks"))]
+#[allow(clippy::expect_used, clippy::panic)]
+pub mod test_support {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum State {
+        Disabled,
+        Armed,
+        ObserverPaused,
+        Transition,
+        Terminal,
+    }
+
+    pub fn lock() -> std::sync::MutexGuard<'static, ()> {
+        test_lock()
+    }
+
+    pub fn configure_output_dir(path: &Path) {
+        let path = std::fs::canonicalize(path).expect("canonical census test output");
+        if let Some(configured) = OUTPUT_DIR.get() {
+            assert_eq!(configured, &path);
+        } else {
+            OUTPUT_DIR
+                .set(path)
+                .expect("configure allocation census test output");
+        }
+        CONFIGURED.store(true, Ordering::Relaxed);
+    }
+
+    pub fn reset_and_arm(epoch: u64, fragment: u64) {
+        STATE.store(CensusState::Disabled as u8, Ordering::Relaxed);
+        reset_counters_and_tls();
+        LIFECYCLE_ERROR.store(false, Ordering::Relaxed);
+        CONFIGURED.store(true, Ordering::Relaxed);
+        EXEC_EPOCH.store(epoch, Ordering::Relaxed);
+        FRAGMENT_SEQUENCE.store(fragment, Ordering::Relaxed);
+        STATE.store(CensusState::Armed as u8, Ordering::Release);
+    }
+
+    pub fn reset_disabled() {
+        STATE.store(CensusState::Disabled as u8, Ordering::Relaxed);
+        reset_counters_and_tls();
+        LIFECYCLE_ERROR.store(false, Ordering::Relaxed);
+        EXEC_EPOCH.store(0, Ordering::Relaxed);
+        FRAGMENT_SEQUENCE.store(0, Ordering::Relaxed);
+    }
+
+    pub fn state() -> State {
+        match CensusState::from_raw(STATE.load(Ordering::Acquire)) {
+            Some(CensusState::Disabled) => State::Disabled,
+            Some(CensusState::Armed) => State::Armed,
+            Some(CensusState::ObserverPaused) => State::ObserverPaused,
+            Some(CensusState::Transition) => State::Transition,
+            Some(CensusState::Terminal) => State::Terminal,
+            None => panic!("invalid allocation census state"),
+        }
+    }
+
+    pub fn identity() -> (u64, u64) {
+        (
+            EXEC_EPOCH.load(Ordering::Relaxed),
+            FRAGMENT_SEQUENCE.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn record(owner: AllocationOwner, bytes: usize) {
+        let _scope = scope(owner);
+        record_success(AllocationOperation::Alloc, bytes);
+    }
+
+    pub fn snapshot() -> [OwnerSnapshot; AllocationOwner::COUNT] {
+        super::snapshot()
+    }
+
+    pub fn lifecycle_error() -> bool {
+        LIFECYCLE_ERROR.load(Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]
@@ -1114,6 +1228,72 @@ mod tests {
     }
 
     #[test]
+    fn fork_child_reset_is_cow_private_and_preserves_the_parent_census() {
+        let _test = test_lock();
+        reset_for_test();
+        set_armed_for_test(9);
+        set_identity_for_test(9, 3);
+        let _owner = scope(AllocationOwner::PublicationMap);
+        record_success_for_test(AllocationOperation::Alloc, 512);
+
+        let mut pipe = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let child = unsafe { libc::fork() };
+        assert!(
+            child >= 0,
+            "fork failed: {}",
+            std::io::Error::last_os_error()
+        );
+        if child == 0 {
+            unsafe { libc::close(pipe[0]) };
+            reset_after_fork_child_first_action();
+            let (epoch, fragment) = identity_for_test();
+            let report = [
+                epoch,
+                fragment,
+                snapshot_for_test()[AllocationOwner::PublicationMap as usize].requested_bytes,
+                current_owner_for_test() as u64,
+            ];
+            let written = unsafe {
+                libc::write(
+                    pipe[1],
+                    report.as_ptr().cast(),
+                    std::mem::size_of_val(&report),
+                )
+            };
+            unsafe {
+                libc::_exit(i32::from(
+                    written != std::mem::size_of_val(&report) as isize,
+                ))
+            }
+        }
+
+        unsafe { libc::close(pipe[1]) };
+        let mut child_report = [u64::MAX; 4];
+        let read = unsafe {
+            libc::read(
+                pipe[0],
+                child_report.as_mut_ptr().cast(),
+                std::mem::size_of_val(&child_report),
+            )
+        };
+        unsafe { libc::close(pipe[0]) };
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+
+        assert_eq!(read, std::mem::size_of_val(&child_report) as isize);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+        assert_eq!(child_report, [0, 0, 0, AllocationOwner::Other as u64]);
+        assert_eq!(identity_for_test(), (9, 3));
+        assert_eq!(current_owner_for_test(), AllocationOwner::PublicationMap);
+        assert_eq!(
+            snapshot_for_test()[AllocationOwner::PublicationMap as usize].requested_bytes,
+            512
+        );
+    }
+
+    #[test]
     fn main_environment_arms_explicit_epoch_and_rejects_malformed_epoch() {
         let _test = test_lock();
         let dir = prepare_output_dir();
@@ -1148,6 +1328,21 @@ mod tests {
         }
         assert!(!init_main_from_environment().unwrap());
         assert_eq!(state_for_test(), CensusState::Disabled);
+    }
+
+    #[test]
+    fn disabled_exec_transitions_are_noops() {
+        let _test = test_lock();
+        reset_for_test();
+
+        drop(begin_host_exec_attempt(1).expect("disabled host exec is a no-op"));
+        begin_in_process_exec(1)
+            .expect("disabled in-process exec is a no-op")
+            .rearm_successor()
+            .expect("disabled successor rearm is a no-op");
+
+        assert_eq!(state_for_test(), CensusState::Disabled);
+        assert!(!lifecycle_error_for_test());
     }
 
     #[test]

@@ -586,6 +586,20 @@ impl PreparedThreadExecHandoff<'_> {
             next,
             next_exec_reset_epoch,
         } = self;
+        #[cfg(feature = "alloc-owner-census")]
+        let allocation_transition = {
+            let next_exec_epoch = thread.budget.next_exec_epoch_after_reset();
+            match crate::alloc_owner_census::begin_in_process_exec(next_exec_epoch) {
+                Ok(transition) => Some(transition),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "failed to begin in-process allocation-owner transition"
+                    );
+                    None
+                }
+            }
+        };
         if let Some(frames) = thread.take_profile_frames() {
             sink(&frames);
         }
@@ -593,6 +607,15 @@ impl PreparedThreadExecHandoff<'_> {
         thread.block_cache.clear();
         thread.exec_reset_epoch = next_exec_reset_epoch;
         thread.start_next_profile_epoch();
+        #[cfg(feature = "alloc-owner-census")]
+        if let Some(transition) = allocation_transition
+            && let Err(error) = transition.rearm_successor()
+        {
+            tracing::warn!(
+                error = %error,
+                "failed to rearm in-process allocation-owner successor"
+            );
+        }
         thread.last_kick = None;
         thread.indirect_cache.clear();
         let (used_bytes, block_count, generation_count) = thread.process.lifecycle_snapshot();
@@ -4795,6 +4818,9 @@ mod tests {
     use std::ptr::NonNull;
     use std::sync::{Arc, Barrier};
 
+    #[cfg(feature = "alloc-owner-census")]
+    use crate::alloc_owner_census::test_support as allocation_census;
+
     const PC: GuestVa = GuestVa(0x1000);
 
     /// The persistent store is default-ON with an exact `=0` rollback hatch.
@@ -4944,6 +4970,61 @@ mod tests {
         fn remap_for_fork_child(&self, _prior: &JitRegion) -> std::io::Result<ForkChildJit> {
             Ok(ForkChildJit::Inherited)
         }
+    }
+
+    #[cfg(feature = "alloc-owner-census")]
+    #[test]
+    fn exec_handoff_disarms_outgoing_allocations_and_rearms_the_successor_epoch() {
+        use crate::alloc_owner_wire::AllocationOwner;
+
+        let _census = allocation_census::lock();
+        let output_dir = std::env::temp_dir().join(format!(
+            "carrick-alloc-owner-census-tests-{}",
+            std::process::id()
+        ));
+        match std::fs::remove_dir_all(&output_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove allocation census test directory: {error}"),
+        }
+        std::fs::create_dir_all(&output_dir).expect("create allocation census test directory");
+        allocation_census::configure_output_dir(&output_dir);
+        allocation_census::reset_and_arm(0, 0);
+        allocation_census::record(AllocationOwner::PublicationMap, 41);
+
+        let process = Arc::new(
+            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator"),
+        );
+        let mut translator = ThreadTranslator::for_process(process, 91);
+        translator.budget =
+            carrick_dsr::profile::ThreadBudget::enabled_for_test(unsafe { libc::getpid() }, 91);
+        let replacement = Arc::new(
+            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT)
+                .expect("replacement translator"),
+        );
+        let mut sink_state = None;
+
+        translator
+            .reset_for_exec_with_sink(replacement, |_| {
+                sink_state = Some(allocation_census::state());
+            })
+            .expect("commit exec handoff");
+
+        assert_eq!(
+            sink_state,
+            Some(allocation_census::State::Transition),
+            "NATIVEPERF serialization must run while allocation counting is disarmed"
+        );
+        assert_eq!(allocation_census::state(), allocation_census::State::Armed);
+        assert_eq!(allocation_census::identity(), (1, 0));
+        assert!(allocation_census::snapshot().iter().all(|owner| {
+            owner.requested_bytes == 0
+                && owner.alloc_calls == 0
+                && owner.zeroed_calls == 0
+                && owner.realloc_calls == 0
+        }));
+        assert!(!allocation_census::lifecycle_error());
+        allocation_census::reset_disabled();
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]

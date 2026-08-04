@@ -1372,11 +1372,18 @@ impl ThreadBudget {
     }
 
     pub fn reset_after_exec(&mut self) {
-        let next_exec_epoch = next_exec_epoch(self.exec_epoch);
+        let next_exec_epoch = self.next_exec_epoch_after_reset();
         self.reset_profile_era(next_exec_epoch);
         if self.enabled {
             PROFILE_EXEC_EPOCH.store(next_exec_epoch, Ordering::Release);
         }
+    }
+
+    /// The exact checked/sentinel epoch that [`Self::reset_after_exec`] will
+    /// install. Diagnostic companions use this before the result-free exec
+    /// commit so their outgoing record and NATIVEPERF advance atomically.
+    pub fn next_exec_epoch_after_reset(&self) -> u64 {
+        next_exec_epoch(self.exec_epoch)
     }
 
     pub fn reset_same_image_profile_era(&mut self) {

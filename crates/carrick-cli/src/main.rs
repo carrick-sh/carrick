@@ -115,6 +115,16 @@ compile_error!(
     "multiple platforms selected: enable exactly one platform-* feature \
      (each pulls a mutually-exclusive host VMM backend)"
 );
+#[cfg(all(feature = "alloc-census", feature = "alloc-owner-census"))]
+compile_error!(
+    "alloc-census and alloc-owner-census install different global allocators; \
+     enable exactly one diagnostic"
+);
+#[cfg(all(
+    feature = "alloc-owner-census",
+    not(all(target_os = "macos", target_arch = "aarch64"))
+))]
+compile_error!("alloc-owner-census is supported only on Darwin/AArch64 native builds");
 
 mod args;
 mod commands;
@@ -168,9 +178,14 @@ use crate::runtime_util::register_dtrace_probes;
 /// plausible-but-false symbols; `fbt::mach_vm_allocate` never fires;
 /// `syscall::mmap` sees only MAP_NORESERVE reservations because libmalloc
 /// sub-allocates a few large regions).
-#[cfg(feature = "alloc-census")]
+#[cfg(all(feature = "alloc-census", not(feature = "alloc-owner-census")))]
 #[global_allocator]
 static ALLOC_CENSUS: dhat::Alloc = dhat::Alloc;
+
+#[cfg(feature = "alloc-owner-census")]
+#[global_allocator]
+static ALLOC_OWNER_CENSUS: carrick_runtime::alloc_owner_census::TaggedSystem =
+    carrick_runtime::alloc_owner_census::TaggedSystem;
 
 /// One output file per process, because a cold `go build` runs ~70 of them.
 /// The profiler must outlive all guest work, so `main` holds it to the end; a
@@ -212,11 +227,21 @@ fn start_alloc_census() {
     }
 }
 
+#[cfg(feature = "alloc-owner-census")]
+fn start_alloc_owner_census() -> anyhow::Result<()> {
+    if carrick_runtime::alloc_owner_census::init_main_from_environment()? {
+        let _ = carrick_runtime::alloc_owner_census::register_atexit_backstop()?;
+    }
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     // FIRST statement: the exec-stamp gauge measures kernel exec + dyld +
     // static initializers as `pre-exec -> main-entry`, so nothing may run
     // before it (env-gated; one getenv when off).
     carrick_runtime::exec_stamps::stamp(carrick_runtime::exec_stamps::ExecStampPhase::MainEntry);
+    #[cfg(feature = "alloc-owner-census")]
+    start_alloc_owner_census()?;
     #[cfg(feature = "alloc-census")]
     start_alloc_census();
     // FIRST, before any dispatch or fork: record this process as the one

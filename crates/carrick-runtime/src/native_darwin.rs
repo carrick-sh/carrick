@@ -3245,6 +3245,8 @@ fn take_native_syscall_service_probe_events() -> Vec<NativeSyscallServiceProbeEv
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeForkChildResumeEvent {
+    #[cfg(feature = "alloc-owner-census")]
+    AllocationOwnerReset,
     ChildTranslatorRebuild,
     ForkPost,
     SyscallCompletion,
@@ -3266,6 +3268,13 @@ fn record_native_fork_child_resume_event(event: NativeForkChildResumeEvent) {
 #[cfg(test)]
 fn take_native_fork_child_resume_events() -> Vec<NativeForkChildResumeEvent> {
     NATIVE_FORK_CHILD_RESUME_EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))
+}
+
+#[cfg(feature = "alloc-owner-census")]
+fn reset_native_fork_child_allocation_owner_first_action() {
+    carrick_dsr_aarch64::alloc_owner_census::reset_after_fork_child_first_action();
+    #[cfg(test)]
+    record_native_fork_child_resume_event(NativeForkChildResumeEvent::AllocationOwnerReset);
 }
 
 /// Repair the child-owned translator and publish the child-side fork boundary.
@@ -3420,6 +3429,12 @@ fn finalize_native_process_exit(
     memory: &SharedNativeMemory,
 ) {
     publish_native_shared_candidates(translator, memory);
+    #[cfg(feature = "alloc-owner-census")]
+    if let Err(error) = carrick_dsr_aarch64::alloc_owner_census::drain_terminal(
+        carrick_dsr_aarch64::alloc_owner_wire::AllocationFlushReason::ProcessExit,
+    ) {
+        tracing::warn!(%error, "failed to export terminal allocation-owner census");
+    }
     maybe_dump_code_snapshot(translator);
     translator.finalize_profile_epoch_at_process_exit();
     // The translation census's only flush used to be a `libc::atexit` hook,
@@ -4304,6 +4319,9 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                                 continue;
                             }
                             publish_native_shared_candidates(&translator, &memory);
+                            #[cfg(feature = "alloc-owner-census")]
+                            let allocation_observer =
+                                carrick_dsr_aarch64::alloc_owner_census::observer_pause();
                             translator.finalize_profile_epoch();
                             // `begin_guest_exec` below ends in `libc::execve`,
                             // which runs no `atexit` handler: without this the
@@ -4311,6 +4329,8 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                             // successor keeps this pid, so the census filename
                             // carries a timestamp discriminator too.
                             dsr::xlat_census::flush(dsr::xlat_census::CensusFlush::HostSelfReexec);
+                            #[cfg(feature = "alloc-owner-census")]
+                            drop(allocation_observer);
                             require_native_syscall_service_transition(
                                 service.terminal_handoff(),
                                 "host self-exec terminal handoff",
@@ -4454,7 +4474,12 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         // outgoing and incoming images' translations merge into
                         // one census file -- and under a fixed PIE base their
                         // VAs alias, making the merge invisible.
+                        #[cfg(feature = "alloc-owner-census")]
+                        let allocation_observer =
+                            carrick_dsr_aarch64::alloc_owner_census::observer_pause();
                         dsr::xlat_census::flush(dsr::xlat_census::CensusFlush::InProcessExec);
+                        #[cfg(feature = "alloc-owner-census")]
+                        drop(allocation_observer);
                         // Exec quiescence has retired every sibling and no
                         // translated guest frame remains live. Clear the sole
                         // surviving thread's cached targets before mapped
@@ -7316,6 +7341,8 @@ fn handle_native_fork(
         });
     }
     if child == 0 {
+        #[cfg(feature = "alloc-owner-census")]
+        reset_native_fork_child_allocation_owner_first_action();
         // CHILD: everything from here to the `Resume` below is the post-fork
         // repair the guest cannot resume without. Nothing measured it before —
         // it is the one span the perf_fork_scale numbers had no name for.
@@ -8522,6 +8549,41 @@ mod tests {
              and guest resume"
         );
         assert_eq!(snapshot.sp, 0x50_0000, "child stack must remain untouched");
+    }
+
+    #[cfg(feature = "alloc-owner-census")]
+    #[test]
+    fn native_fork_child_allocation_reset_precedes_every_resume_repair_event() {
+        take_native_fork_child_resume_events();
+        let process = std::sync::Arc::new(
+            dsr::test_process_translator(16 * 1024).expect("create translator"),
+        );
+        process
+            .activate_translated_range_catalog()
+            .expect("activate catalog");
+        let mut translator = dsr::ThreadTranslator::for_process(process, 73);
+        let mut snapshot = NativeUcontextSnapshot {
+            pc: 0x40_0000,
+            sp: 0x50_0000,
+            ..NativeUcontextSnapshot::default()
+        };
+
+        reset_native_fork_child_allocation_owner_first_action();
+        repair_native_fork_child_before_resume(&mut translator, 74, &mut snapshot, 0x60_0000)
+            .expect("repair fork child");
+        record_native_fork_child_resume_event(NativeForkChildResumeEvent::SyscallCompletion);
+        record_native_fork_child_resume_event(NativeForkChildResumeEvent::GuestResume);
+
+        assert_eq!(
+            take_native_fork_child_resume_events(),
+            vec![
+                NativeForkChildResumeEvent::AllocationOwnerReset,
+                NativeForkChildResumeEvent::ChildTranslatorRebuild,
+                NativeForkChildResumeEvent::ForkPost,
+                NativeForkChildResumeEvent::SyscallCompletion,
+                NativeForkChildResumeEvent::GuestResume,
+            ]
+        );
     }
 
     #[test]
