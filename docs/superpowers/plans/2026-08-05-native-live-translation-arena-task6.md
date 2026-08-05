@@ -11,7 +11,8 @@ view, while every miss or invalid state falls through immediately to the
 unchanged private translator.
 
 **Proven bases:** Task 4 is complete through `1cb7489e`; Task 5 is complete
-through `e6661fe5`; controller docs are at `e2f261da`.
+through `e6661fe5`; Task 6A is independently review-clean through `a7fa2883`.
+Task 6B is the active slice.
 
 ## Preflight corrections
 
@@ -188,4 +189,3 @@ Run full crate/runtime tests, compile-fail tests, clippy/format/diff, and a
 signed correctness smoke with the experiment still runtime-disabled. Then
 complete Task 7 before enabling the compiler policy or running performance
 ABBA. Task 8 owns USDT/DTrace and official measurement.
-
