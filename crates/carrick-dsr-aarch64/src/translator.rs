@@ -971,6 +971,7 @@ pub struct ProcessState {
     pub profiling: bool,
     artifact_image_digest: Option<[u8; 32]>,
     shared_translation: Option<SharedTranslationConfiguration>,
+    live_translation: Option<LiveTranslationConfiguration>,
     shared_unit_segments_consulted: BTreeSet<carrick_guest_mem::GuestVa>,
     shared_recording_segments: BTreeSet<carrick_guest_mem::GuestVa>,
     /// Units this process attached from the store, blocks NOT yet replayed.
@@ -998,6 +999,19 @@ pub struct ProcessState {
 struct SharedTranslationConfiguration {
     image: crate::shared_cache::SharedImageConfig,
     store: Arc<dyn crate::shared_cache::TranslationUnitStore>,
+}
+
+struct LiveTranslationConfiguration {
+    image: crate::shared_cache::SharedImageConfig,
+    unit_digests: BTreeMap<carrick_guest_mem::GuestVa, [u8; 32]>,
+    host_page_size: u64,
+}
+
+fn live_sizing_configuration_with(
+    configuration: Option<&LiveTranslationConfiguration>,
+    sizing_armed: impl FnOnce() -> bool,
+) -> Option<&LiveTranslationConfiguration> {
+    configuration.filter(|_| sizing_armed())
 }
 
 /// One not-yet-replayed block of an attached unit: indices into
@@ -1031,6 +1045,396 @@ const fn translation_source_words_required(
     shared_translation_configured: bool,
 ) -> bool {
     artifact_store_present || shared_translation_configured
+}
+
+/// Temporary evidence policy for the compiler-unit live-arena experiment.
+///
+/// Task 6C1 configures exact identity and exports sizing evidence without
+/// constructing or transporting an arena. Runtime `compiler` activation is
+/// guarded by carrick-runtime until packed-slab ownership lands in Task 6C2.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiveArenaRuntimePolicy {
+    Disabled,
+    Compiler,
+}
+
+/// Current-tip Task 6C compiler unit. This supersedes the pre-Task-6
+/// `7ead8102...b4c` census stem: Task 6 moved the exact key to translator ABI
+/// 8, while the executable digest and `0x10000 + 0x8d5000` segment stayed
+/// invariant. Current-tip sizing must reproduce this complete
+/// `TranslationUnitKey::file_stem()` before any live-runtime experiment.
+const LIVE_ARENA_COMPILER_UNIT_STEM: &str =
+    "a5948df76537f6a44e99e30b712e46ceae1871f91f3fe11e954b421dab7752b5";
+
+pub fn live_arena_runtime_policy_from(
+    value: Option<&std::ffi::OsStr>,
+) -> Result<LiveArenaRuntimePolicy, types::DsrError> {
+    match value {
+        None => Ok(LiveArenaRuntimePolicy::Disabled),
+        Some(value) if value == "0" => Ok(LiveArenaRuntimePolicy::Disabled),
+        Some(value) if value == "compiler" => Ok(LiveArenaRuntimePolicy::Compiler),
+        Some(value) => Err(types::DsrError::CachePolicy(format!(
+            "CARRICK_DSR_LIVE_ARENA must be exactly 0 or compiler, got {:?}",
+            value
+        ))),
+    }
+}
+
+pub fn live_arena_runtime_policy() -> Result<LiveArenaRuntimePolicy, types::DsrError> {
+    live_arena_runtime_policy_from(std::env::var_os("CARRICK_DSR_LIVE_ARENA").as_deref())
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct LiveArenaSizingTotals {
+    prepared_blocks: u64,
+    aligned_code_bytes: u64,
+    hot_bytes: u64,
+    cold_bytes: u64,
+    aligned_hot_bytes: u64,
+    aligned_cold_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LiveArenaPreparedSize {
+    lengths: emit::SharedInitialLengths,
+    aligned_code: u64,
+    aligned_hot: u64,
+    aligned_cold: u64,
+}
+
+/// Exact, unique prepared-output sizing for one process incarnation.
+///
+/// The key is the complete live-domain unit digest plus guest block start.
+/// Repeated translations therefore do not inflate the arena record or byte
+/// requirements. Cross-process unioning remains an offline evidence step.
+struct LiveArenaSizingCensus {
+    host_page_size: u64,
+    totals: LiveArenaSizingTotals,
+    blocks: BTreeMap<([u8; 32], carrick_guest_mem::GuestVa), LiveArenaPreparedSize>,
+}
+
+impl LiveArenaSizingCensus {
+    fn new(host_page_size: u64) -> Result<Self, types::DsrError> {
+        if host_page_size != crate::live_arena::LIVE_ARENA_PAGE_BYTES {
+            return Err(types::DsrError::CachePolicy(format!(
+                "live sizing host page size must match the 16 KiB arena protocol, got {host_page_size}"
+            )));
+        }
+        Ok(Self {
+            host_page_size,
+            totals: LiveArenaSizingTotals::default(),
+            blocks: BTreeMap::new(),
+        })
+    }
+
+    #[cfg(test)]
+    fn with_totals_for_test(host_page_size: u64, totals: LiveArenaSizingTotals) -> Self {
+        Self {
+            host_page_size,
+            totals,
+            blocks: BTreeMap::new(),
+        }
+    }
+
+    #[cfg(test)]
+    const fn totals(&self) -> LiveArenaSizingTotals {
+        self.totals
+    }
+
+    fn record(
+        &mut self,
+        unit_digest: [u8; 32],
+        guest_start: carrick_guest_mem::GuestVa,
+        lengths: emit::SharedInitialLengths,
+    ) -> Result<(), types::DsrError> {
+        let key = (unit_digest, guest_start);
+        if let Some(existing) = self.blocks.get(&key) {
+            if existing.lengths == lengths {
+                return Ok(());
+            }
+            return Err(types::DsrError::CachePolicy(format!(
+                "live sizing exact block changed shape at guest 0x{:x}",
+                guest_start.raw()
+            )));
+        }
+        let checked_align = |value: u64, alignment: u64, section: &str| {
+            let mask = alignment - 1;
+            value
+                .checked_add(mask)
+                .map(|rounded| rounded & !mask)
+                .ok_or_else(|| {
+                    types::DsrError::CachePolicy(format!(
+                        "live sizing {section} alignment overflowed for {value} bytes"
+                    ))
+                })
+        };
+        let aligned_code = checked_align(lengths.code, self.host_page_size, "code")?;
+        let aligned_hot = checked_align(lengths.hot, 8, "HOT")?;
+        let aligned_cold = checked_align(lengths.cold, 8, "COLD")?;
+        let next = LiveArenaSizingTotals {
+            prepared_blocks: self.totals.prepared_blocks.checked_add(1).ok_or_else(|| {
+                types::DsrError::CachePolicy(
+                    "live sizing prepared block count overflowed".to_string(),
+                )
+            })?,
+            aligned_code_bytes: self
+                .totals
+                .aligned_code_bytes
+                .checked_add(aligned_code)
+                .ok_or_else(|| {
+                    types::DsrError::CachePolicy(
+                        "live sizing aligned code byte sum overflowed".to_string(),
+                    )
+                })?,
+            hot_bytes: self
+                .totals
+                .hot_bytes
+                .checked_add(lengths.hot)
+                .ok_or_else(|| {
+                    types::DsrError::CachePolicy("live sizing HOT byte sum overflowed".to_string())
+                })?,
+            cold_bytes: self
+                .totals
+                .cold_bytes
+                .checked_add(lengths.cold)
+                .ok_or_else(|| {
+                    types::DsrError::CachePolicy("live sizing COLD byte sum overflowed".to_string())
+                })?,
+            aligned_hot_bytes: self
+                .totals
+                .aligned_hot_bytes
+                .checked_add(aligned_hot)
+                .ok_or_else(|| {
+                    types::DsrError::CachePolicy(
+                        "live sizing aligned HOT byte sum overflowed".to_string(),
+                    )
+                })?,
+            aligned_cold_bytes: self
+                .totals
+                .aligned_cold_bytes
+                .checked_add(aligned_cold)
+                .ok_or_else(|| {
+                    types::DsrError::CachePolicy(
+                        "live sizing aligned COLD byte sum overflowed".to_string(),
+                    )
+                })?,
+        };
+        self.blocks.insert(
+            key,
+            LiveArenaPreparedSize {
+                lengths,
+                aligned_code,
+                aligned_hot,
+                aligned_cold,
+            },
+        );
+        self.totals = next;
+        Ok(())
+    }
+
+    fn record_prepared(
+        &mut self,
+        unit_digest: [u8; 32],
+        guest_start: carrick_guest_mem::GuestVa,
+        prepared: &emit::PreparedSharedInitial,
+    ) -> Result<(), types::DsrError> {
+        self.record(unit_digest, guest_start, prepared.lengths())
+    }
+
+    fn render(&self, reason: &str) -> String {
+        use std::fmt::Write as _;
+
+        fn digest_hex(digest: [u8; 32]) -> String {
+            use std::fmt::Write as _;
+            let mut rendered = String::with_capacity(64);
+            for byte in digest {
+                let _ = write!(rendered, "{byte:02x}");
+            }
+            rendered
+        }
+
+        let mut rendered = format!(
+            "LIVEARENASIZE1 reason={reason} host_page={}\n",
+            self.host_page_size
+        );
+        for ((unit_digest, guest_start), size) in &self.blocks {
+            let _ = writeln!(
+                rendered,
+                "BLOCK unit={} guest=0x{:x} code={} code_cursor={} hot={} hot_cursor={} cold={} cold_cursor={}",
+                digest_hex(*unit_digest),
+                guest_start.raw(),
+                size.lengths.code,
+                size.aligned_code,
+                size.lengths.hot,
+                size.aligned_hot,
+                size.lengths.cold,
+                size.aligned_cold,
+            );
+        }
+        let _ = writeln!(
+            rendered,
+            "TOTAL prepared={} code_cursor={} hot={} hot_cursor={} cold={} cold_cursor={}",
+            self.totals.prepared_blocks,
+            self.totals.aligned_code_bytes,
+            self.totals.hot_bytes,
+            self.totals.aligned_hot_bytes,
+            self.totals.cold_bytes,
+            self.totals.aligned_cold_bytes,
+        );
+        rendered
+    }
+
+    #[cfg(test)]
+    fn render_for_test(&self, reason: &str) -> String {
+        self.render(reason)
+    }
+}
+
+/// Arena-free, opt-in exporter for sizing the exact compiler live unit. It
+/// prepares Task 5 shared INITIAL outputs but never constructs, looks up, or
+/// publishes a Darwin arena.
+pub mod live_sizing_census {
+    use super::{LiveArenaSizingCensus, types};
+    use crate::emit::{PreparedSharedInitial, SharedInitialLengths};
+    use carrick_guest_mem::GuestVa;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    const ENV: &str = "CARRICK_DSR_LIVE_ARENA_SIZING_DIR";
+    static CENSUS_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    static STATE: OnceLock<Mutex<Option<LiveArenaSizingCensus>>> = OnceLock::new();
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    static BACKSTOP_ARMED: OnceLock<()> = OnceLock::new();
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum SizingFlush {
+        ProcessExit,
+        HostSelfReexec,
+        InProcessExec,
+        AtexitBackstop,
+    }
+
+    impl SizingFlush {
+        const fn token(self) -> &'static str {
+            match self {
+                Self::ProcessExit => "process-exit",
+                Self::HostSelfReexec => "host-self-reexec",
+                Self::InProcessExec => "in-process-exec",
+                Self::AtexitBackstop => "atexit-backstop",
+            }
+        }
+    }
+
+    fn state() -> &'static Mutex<Option<LiveArenaSizingCensus>> {
+        STATE.get_or_init(|| Mutex::new(None))
+    }
+
+    fn census_dir() -> Option<&'static PathBuf> {
+        CENSUS_DIR
+            .get_or_init(|| {
+                std::env::var_os(ENV)
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from)
+            })
+            .as_ref()
+    }
+
+    pub fn armed() -> bool {
+        census_dir().is_some()
+    }
+
+    fn update(
+        host_page_size: u64,
+        update: impl FnOnce(&mut LiveArenaSizingCensus) -> Result<(), types::DsrError>,
+    ) -> Result<(), types::DsrError> {
+        if !armed() {
+            return Ok(());
+        }
+        arm_backstop();
+        let mut guard = state().lock().map_err(|_| {
+            types::DsrError::CachePolicy("live sizing census lock is poisoned".to_string())
+        })?;
+        let census = match guard.as_mut() {
+            Some(census) if census.host_page_size == host_page_size => census,
+            Some(_) => {
+                return Err(types::DsrError::CachePolicy(
+                    "live sizing census host page size changed within an incarnation".to_string(),
+                ));
+            }
+            None => guard.insert(LiveArenaSizingCensus::new(host_page_size)?),
+        };
+        update(census)
+    }
+
+    pub fn record(
+        host_page_size: u64,
+        unit_digest: [u8; 32],
+        guest_start: GuestVa,
+        lengths: SharedInitialLengths,
+    ) -> Result<(), types::DsrError> {
+        update(host_page_size, |census| {
+            census.record(unit_digest, guest_start, lengths)
+        })
+    }
+
+    pub fn record_prepared(
+        host_page_size: u64,
+        unit_digest: [u8; 32],
+        guest_start: GuestVa,
+        prepared: &PreparedSharedInitial,
+    ) -> Result<(), types::DsrError> {
+        update(host_page_size, |census| {
+            census.record_prepared(unit_digest, guest_start, prepared)
+        })
+    }
+
+    pub fn reset_after_fork() {
+        if !armed() {
+            return;
+        }
+        if let Ok(mut guard) = state().lock() {
+            *guard = None;
+        }
+        SEQUENCE.store(0, Ordering::Relaxed);
+    }
+
+    pub fn flush(reason: SizingFlush) {
+        let Some(dir) = census_dir() else {
+            return;
+        };
+        let census = match state().lock() {
+            Ok(mut guard) => guard.take(),
+            Err(_) => None,
+        };
+        let Some(census) = census else {
+            return;
+        };
+        let pid = unsafe { libc::getpid() };
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let file = dir.join(format!("live-size-{pid}-{stamp}-{sequence}.txt"));
+        if let Err(error) = std::fs::create_dir_all(dir)
+            .and_then(|()| std::fs::write(&file, census.render(reason.token())))
+        {
+            tracing::warn!(%error, path = %file.display(), "live arena sizing census export failed");
+        }
+    }
+
+    extern "C" fn dump() {
+        flush(SizingFlush::AtexitBackstop);
+    }
+
+    fn arm_backstop() {
+        BACKSTOP_ARMED.get_or_init(|| {
+            // Explicit exit/exec flushes drain the state first. This covers
+            // only residual `std::process::exit` paths and writes nothing
+            // after an earlier drain.
+            unsafe { libc::atexit(dump) };
+        });
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2290,6 +2694,7 @@ impl ProcessTranslator {
                 profiling: std::env::var_os("CARRICK_DSR_PROFILE").is_some(),
                 artifact_image_digest: None,
                 shared_translation: None,
+                live_translation: None,
                 shared_unit_segments_consulted: BTreeSet::new(),
                 shared_recording_segments: BTreeSet::new(),
                 attached_units: Vec::new(),
@@ -2405,6 +2810,99 @@ impl ProcessTranslator {
         }
         state.shared_translation = Some(SharedTranslationConfiguration { image, store });
         Ok(())
+    }
+
+    /// Install the exact shared-image identity for the live-arena experiment
+    /// without implying that a persistent unit store exists.
+    pub(crate) fn configure_live_image(
+        &self,
+        image: crate::shared_cache::SharedImageConfig,
+        host_page_size: u64,
+    ) -> Result<bool, types::DsrError> {
+        self.configure_live_image_matching(image, host_page_size, LIVE_ARENA_COMPILER_UNIT_STEM)
+    }
+
+    fn configure_live_image_matching(
+        &self,
+        mut image: crate::shared_cache::SharedImageConfig,
+        host_page_size: u64,
+        exact_unit_stem: &str,
+    ) -> Result<bool, types::DsrError> {
+        if image.segments.is_empty() {
+            return Err(types::DsrError::CachePolicy(
+                "live translation image has no executable segments".to_string(),
+            ));
+        }
+        if !host_page_size.is_power_of_two() {
+            return Err(types::DsrError::CachePolicy(format!(
+                "live translation host page size must be a nonzero power of two, got {host_page_size}"
+            )));
+        }
+        let selected = image
+            .segments
+            .iter()
+            .enumerate()
+            .map(|(index, segment)| {
+                let key = image.key_for_segment(segment);
+                key.file_stem()
+                    .map(|stem| (index, key, stem))
+                    .map_err(|error| {
+                        types::DsrError::CachePolicy(format!(
+                            "live translation unit key cannot be encoded: {error}"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .find(|(_, _, stem)| stem == exact_unit_stem);
+        let Some((selected_index, key, _)) = selected else {
+            return Ok(false);
+        };
+        let selected_segment = image.segments.swap_remove(selected_index);
+        let live_digest = key.live_digest().map_err(|error| {
+            types::DsrError::CachePolicy(format!(
+                "live translation unit key cannot be digested: {error}"
+            ))
+        })?;
+        image.segments = vec![selected_segment];
+        let unit_digests = BTreeMap::from([(image.segments[0].guest_start, live_digest)]);
+        let mut state = self.state.write();
+        if state.live_translation.is_some() {
+            return Err(types::DsrError::CachePolicy(
+                "live translation image was already configured".to_string(),
+            ));
+        }
+        state.live_translation = Some(LiveTranslationConfiguration {
+            image,
+            unit_digests,
+            host_page_size,
+        });
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    fn configure_live_image_matching_for_test(
+        &self,
+        image: crate::shared_cache::SharedImageConfig,
+        host_page_size: u64,
+        exact_unit_stem: &str,
+    ) -> Result<bool, types::DsrError> {
+        self.configure_live_image_matching(image, host_page_size, exact_unit_stem)
+    }
+
+    #[cfg(test)]
+    fn live_unit_digests_for_test(&self) -> Vec<[u8; 32]> {
+        self.state
+            .read()
+            .live_translation
+            .as_ref()
+            .map(|configuration| configuration.unit_digests.values().copied().collect())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    fn shared_store_configured_for_test(&self) -> bool {
+        self.state.read().shared_translation.is_some()
     }
 
     pub fn configure_artifact_image_digest(
@@ -2529,6 +3027,7 @@ impl ProcessTranslator {
         // fork children started flushing (they die at `libc::_exit`, so they
         // never used to write a file at all).
         xlat_census::reset_after_fork();
+        live_sizing_census::reset_after_fork();
         recorder.process_repaired();
         state.translated_ranges.replay_after_fork(recorder)?;
         let capacity = u64::try_from(state.cache.capacity_bytes()).unwrap_or(u64::MAX);
@@ -3394,7 +3893,7 @@ impl ProcessState {
             .unwrap_or(0);
             let block_source_words = translation_source_words_required(
                 self.artifact_store.is_some(),
-                self.shared_translation.is_some(),
+                self.shared_translation.is_some() || self.live_translation.is_some(),
             )
             .then(|| {
                 memory
@@ -3493,6 +3992,52 @@ impl ProcessState {
             );
             let emit_started = self.profiling.then(std::time::Instant::now);
             let emitted_result = (|| {
+                if let Some(configuration) = live_sizing_configuration_with(
+                    self.live_translation.as_ref(),
+                    live_sizing_census::armed,
+                ) && generation == types::CodeGeneration::INITIAL
+                    && matches!(
+                        block.terminal_exit(),
+                        block::PlannedExit::Syscall { .. }
+                            | block::PlannedExit::Direct { .. }
+                            | block::PlannedExit::Indirect { .. }
+                            | block::PlannedExit::Continue { .. }
+                    )
+                    && let Some(segment) = configuration.image.segments.iter().find(|segment| {
+                        segment
+                            .guest_start
+                            .raw()
+                            .checked_add(segment.guest_len.get())
+                            .is_some_and(|end| {
+                                block.start.raw() >= segment.guest_start.raw()
+                                    && block.end.raw() <= end
+                            })
+                    })
+                    && let Some(source_words) = block_source_words.clone()
+                {
+                    let key = configuration.image.key_for_segment(segment);
+                    let unit_digest = configuration
+                        .unit_digests
+                        .get(&segment.guest_start)
+                        .copied()
+                        .ok_or_else(|| {
+                            types::DsrError::CachePolicy(
+                                "live sizing segment has no exact unit digest".to_string(),
+                            )
+                        })?;
+                    let prepared = emit::prepare_shared_initial(
+                        &key,
+                        &block,
+                        memory.address_mode().into(),
+                        source_words,
+                    )?;
+                    live_sizing_census::record_prepared(
+                        configuration.host_page_size,
+                        unit_digest,
+                        block.start,
+                        &prepared,
+                    )?;
+                }
                 let portable_segment = self
                     .shared_translation
                     .as_ref()
@@ -4924,11 +5469,14 @@ mod tests {
     // carrick_dsr::probes mirrors (ordinal-identical to the USDT enums
     // by the mirrored-ordinal tests in carrick-dsr).
     use super::{
-        DsrErrorProbeExt as _, ForkChildRepairRecorder, NativeDsrExitProbeExt as _,
-        ProcessTranslator, SensitiveMetadata, ThreadTranslator, TranslatedRangeCatalog,
-        TranslatedRangeRecorder, merge_sensitive_metadata, translation_source_words_required,
+        DsrErrorProbeExt as _, ForkChildRepairRecorder, LiveArenaRuntimePolicy,
+        LiveArenaSizingCensus, LiveArenaSizingTotals, LiveTranslationConfiguration,
+        NativeDsrExitProbeExt as _, ProcessTranslator, SensitiveMetadata, ThreadTranslator,
+        TranslatedRangeCatalog, TranslatedRangeRecorder, live_arena_runtime_policy_from,
+        live_sizing_configuration_with, merge_sensitive_metadata,
+        translation_source_words_required,
     };
-    use crate::types;
+    use crate::{emit, types};
     use carrick_dsr::host::{ForkChildJit, JitRegion, NativeHostJit};
     use carrick_dsr::probes::{
         DsrCacheLifecyclePhase, TranslatedPrivateRange, TranslatedRangeAdd, TranslatedRangeEpoch,
@@ -5718,6 +6266,263 @@ mod tests {
     }
 
     #[test]
+    fn default_translation_path_never_consults_sizing_authority() {
+        use std::cell::Cell;
+
+        let consulted = Cell::new(false);
+        let selected =
+            live_sizing_configuration_with(Option::<&LiveTranslationConfiguration>::None, || {
+                consulted.set(true);
+                true
+            });
+
+        assert!(selected.is_none());
+        assert!(
+            !consulted.get(),
+            "the default hot path must short-circuit before sizing authority"
+        );
+    }
+
+    #[test]
+    fn live_arena_policy_is_exact_and_fails_closed() {
+        use std::ffi::OsStr;
+
+        assert_eq!(
+            live_arena_runtime_policy_from(None).expect("default policy"),
+            LiveArenaRuntimePolicy::Disabled
+        );
+        assert_eq!(
+            live_arena_runtime_policy_from(Some(OsStr::new("0"))).expect("off policy"),
+            LiveArenaRuntimePolicy::Disabled
+        );
+        assert_eq!(
+            live_arena_runtime_policy_from(Some(OsStr::new("compiler"))).expect("compiler policy"),
+            LiveArenaRuntimePolicy::Compiler
+        );
+        for invalid in ["", "1", "Compiler", "compiler ", "all"] {
+            assert!(
+                live_arena_runtime_policy_from(Some(OsStr::new(invalid))).is_err(),
+                "invalid policy {invalid:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn live_sizing_counts_exact_prepared_outputs_and_checked_page_alignment() {
+        let mut census = LiveArenaSizingCensus::new(0x4000).expect("sizing census");
+        let first = emit::SharedInitialLengths {
+            code: 1,
+            hot: 7,
+            cold: 11,
+        };
+        let second = emit::SharedInitialLengths {
+            code: 0x4001,
+            hot: 13,
+            cold: 17,
+        };
+
+        census
+            .record([0x11; 32], GuestVa(0x4000), first)
+            .expect("first prepared output");
+        census
+            .record([0x22; 32], GuestVa(0x8000), second)
+            .expect("second prepared output");
+        // The same exact block can be encountered repeatedly in one process;
+        // sizing is over the unique arena record, not translation frequency.
+        census
+            .record([0x11; 32], GuestVa(0x4000), first)
+            .expect("duplicate exact output");
+        assert!(
+            census
+                .record(
+                    [0x11; 32],
+                    GuestVa(0x4000),
+                    emit::SharedInitialLengths {
+                        code: first.code + 4,
+                        ..first
+                    },
+                )
+                .is_err(),
+            "one exact block cannot have two prepared shapes"
+        );
+
+        assert_eq!(
+            census.totals(),
+            LiveArenaSizingTotals {
+                prepared_blocks: 2,
+                aligned_code_bytes: 0xc000,
+                hot_bytes: 20,
+                cold_bytes: 28,
+                aligned_hot_bytes: 24,
+                aligned_cold_bytes: 40,
+            }
+        );
+    }
+
+    #[test]
+    fn live_sizing_totals_come_from_real_prepared_shared_initial_output() {
+        use crate::block::{BlockPlan, PlannedExit};
+        use crate::emit::EmitAddressMode;
+        use crate::shared_cache::{
+            AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
+            NativePageProfileIdentity, SourceFingerprint, TranslationUnitKey,
+        };
+        use crate::types::CodeGeneration;
+
+        let start = GuestVa(0x4000);
+        let words = [0xd400_0001_u32];
+        let key = TranslationUnitKey::for_segment(
+            ExecutableIdentity::Digest([0x7a; 32]),
+            ImageFileOffset::new(0),
+            ImageFileLen::new(0x4000).expect("file length"),
+            start,
+            GuestCodeLen::new(0x4000).expect("guest length"),
+            SourceFingerprint::from_words(&words),
+            NativePageProfileIdentity::Native16k,
+            AddressModeIdentity::Direct,
+        );
+        let plan = BlockPlan {
+            start,
+            end: GuestVa(start.raw() + 4),
+            generation: CodeGeneration::INITIAL,
+            instructions: Vec::new(),
+            exit: PlannedExit::Syscall {
+                guest: start,
+                resume: GuestVa(start.raw() + 4),
+            },
+            extensions: Vec::new(),
+        };
+        let prepared =
+            emit::prepare_shared_initial(&key, &plan, EmitAddressMode::Direct, words.to_vec())
+                .expect("prepare real shared INITIAL fixture");
+        assert_eq!(
+            prepared.lengths(),
+            emit::SharedInitialLengths {
+                code: 40,
+                hot: 5,
+                cold: 28,
+            },
+            "the known one-syscall fixture has hand-checked prepared lengths"
+        );
+
+        let mut census = LiveArenaSizingCensus::new(0x4000).expect("sizing census");
+        census
+            .record_prepared(
+                key.live_digest().expect("live key digest"),
+                start,
+                &prepared,
+            )
+            .expect("record real prepared output");
+        assert_eq!(
+            census.totals(),
+            LiveArenaSizingTotals {
+                prepared_blocks: 1,
+                aligned_code_bytes: 0x4000,
+                hot_bytes: 5,
+                cold_bytes: 28,
+                aligned_hot_bytes: 8,
+                aligned_cold_bytes: 32,
+            }
+        );
+    }
+
+    #[test]
+    fn live_sizing_rejects_alignment_and_addition_overflow() {
+        assert!(LiveArenaSizingCensus::new(0).is_err());
+        assert!(LiveArenaSizingCensus::new(0x1000).is_err());
+        assert!(LiveArenaSizingCensus::new(0x3000).is_err());
+
+        let mut census = LiveArenaSizingCensus::new(0x4000).expect("sizing census");
+        assert!(
+            census
+                .record(
+                    [0x33; 32],
+                    GuestVa(0x4000),
+                    emit::SharedInitialLengths {
+                        code: u64::MAX,
+                        hot: 0,
+                        cold: 0,
+                    },
+                )
+                .is_err()
+        );
+
+        let mut census = LiveArenaSizingCensus::with_totals_for_test(
+            0x4000,
+            LiveArenaSizingTotals {
+                prepared_blocks: u64::MAX,
+                aligned_code_bytes: 0,
+                hot_bytes: 0,
+                cold_bytes: 0,
+                aligned_hot_bytes: 0,
+                aligned_cold_bytes: 0,
+            },
+        );
+        assert!(
+            census
+                .record(
+                    [0x44; 32],
+                    GuestVa(0x8000),
+                    emit::SharedInitialLengths {
+                        code: 4,
+                        hot: 0,
+                        cold: 0,
+                    },
+                )
+                .is_err()
+        );
+
+        let mut census = LiveArenaSizingCensus::with_totals_for_test(
+            0x4000,
+            LiveArenaSizingTotals {
+                prepared_blocks: 0,
+                aligned_code_bytes: 0,
+                hot_bytes: u64::MAX,
+                cold_bytes: 0,
+                aligned_hot_bytes: 0,
+                aligned_cold_bytes: 0,
+            },
+        );
+        let error = census
+            .record(
+                [0x55; 32],
+                GuestVa(0xc000),
+                emit::SharedInitialLengths {
+                    code: 4,
+                    hot: 1,
+                    cold: 0,
+                },
+            )
+            .expect_err("raw HOT byte addition must be checked");
+        assert!(error.to_string().contains("HOT byte sum overflowed"));
+    }
+
+    #[test]
+    fn live_sizing_export_contains_unique_identities_lengths_and_totals() {
+        let mut census = LiveArenaSizingCensus::new(0x4000).expect("sizing census");
+        census
+            .record(
+                [0xab; 32],
+                GuestVa(0x1234),
+                emit::SharedInitialLengths {
+                    code: 12,
+                    hot: 9,
+                    cold: 17,
+                },
+            )
+            .expect("prepared output");
+
+        let export = census.render_for_test("process-exit");
+        assert!(export.starts_with("LIVEARENASIZE1 reason=process-exit host_page=16384\n"));
+        assert!(export.contains(
+            "BLOCK unit=abababababababababababababababababababababababababababababababab guest=0x1234 code=12 code_cursor=16384 hot=9 hot_cursor=16 cold=17 cold_cursor=24"
+        ));
+        assert!(export.contains(
+            "TOTAL prepared=1 code_cursor=16384 hot=9 hot_cursor=16 cold=17 cold_cursor=24"
+        ));
+    }
+
+    #[test]
     fn warm_process_lookup_does_not_take_the_translation_state_lock() {
         let source = include_str!("translator.rs");
         let body = source
@@ -5746,6 +6551,73 @@ mod tests {
 
         assert!(range.start < range.end);
         assert_eq!(range.end - range.start, 64 * 1024);
+    }
+
+    #[test]
+    fn live_configuration_uses_exact_unit_keys_without_persistent_store() {
+        use crate::shared_cache::{
+            AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
+            NativePageProfileIdentity, SharedExecutableSegment, SharedImageConfig,
+        };
+
+        let image = SharedImageConfig {
+            executable: ExecutableIdentity::Digest([0x5a; 32]),
+            page_profile: NativePageProfileIdentity::Native16k,
+            address_mode: AddressModeIdentity::Direct,
+            segments: vec![SharedExecutableSegment::new(
+                ImageFileOffset::new(0x1200),
+                ImageFileLen::new(8).expect("file length"),
+                GuestVa(0x4000),
+                GuestCodeLen::new(8).expect("guest length"),
+                vec![0xd503_201f, 0xd65f_03c0].into(),
+            )],
+        };
+        let expected = image
+            .key_for_segment(&image.segments[0])
+            .live_digest()
+            .expect("exact live digest");
+        let exact_stem = image
+            .key_for_segment(&image.segments[0])
+            .file_stem()
+            .expect("exact unit stem");
+        let translator =
+            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+
+        translator
+            .configure_live_image_matching_for_test(image, 0x4000, &exact_stem)
+            .expect("live-only exact image configuration");
+
+        assert_eq!(translator.live_unit_digests_for_test(), vec![expected]);
+        assert!(!translator.shared_store_configured_for_test());
+    }
+
+    #[test]
+    fn compiler_live_selector_rejects_every_nonexact_unit_key() {
+        use crate::shared_cache::{
+            AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
+            NativePageProfileIdentity, SharedExecutableSegment, SharedImageConfig,
+        };
+        let image = SharedImageConfig {
+            executable: ExecutableIdentity::Digest([0x6b; 32]),
+            page_profile: NativePageProfileIdentity::Native16k,
+            address_mode: AddressModeIdentity::Direct,
+            segments: vec![SharedExecutableSegment::new(
+                ImageFileOffset::new(0),
+                ImageFileLen::new(4).expect("file length"),
+                GuestVa(0x10000),
+                GuestCodeLen::new(4).expect("guest length"),
+                vec![0xd65f_03c0].into(),
+            )],
+        };
+        let translator =
+            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+
+        assert!(
+            !translator
+                .configure_live_image_matching_for_test(image, 0x4000, "not-the-exact-key")
+                .expect("nonmatching configuration")
+        );
+        assert!(translator.live_unit_digests_for_test().is_empty());
     }
 
     #[test]
