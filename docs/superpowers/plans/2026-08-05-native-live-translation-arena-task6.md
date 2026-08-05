@@ -99,6 +99,15 @@ change and obtain independent review before Task 6B.
 
 ## Task 6B — claim-bound direct-write transaction and process view
 
+Land this as two independently reviewed slices. **6B1** owns the portable
+publication authority: process-view branding, mapped-write permit, exact
+metadata/digest/generation certification, owned READY record, deletion of
+`LiveBlockPublication`, and the sole token-gated READY store. **6B2** owns the
+Darwin authority: `Arc`-backed process view, exact local range resolution,
+private claim-bound cache, safe mapped transaction, owned acquisition, local
+I-cache invalidation, and the different-VA exec-successor proof. The split is a
+review boundary, not permission for a second or temporary READY path.
+
 **Files:**
 
 - Modify `crates/carrick-dsr-aarch64/src/{emit.rs,artifact_spike.rs,live_arena.rs}`
@@ -109,20 +118,31 @@ change and obtain independent review before Task 6B.
 **Implementation:**
 
 - Add `LiveArenaProcessView` owning the concrete `Arc<DarwinLiveArena>` plus
-  validated raw geometry. It alone converts logical record extents into local
+  validated raw geometry. Its native lookup/reservation wrappers keep raw
+  portable claims private. It alone converts logical record extents into local
   code RW/RX and control HOT/COLD ranges and brands capabilities with a private
   process-view identity plus shared nonce.
 - Add non-escaping `LiveArenaTranslationCache<'arena, 'claim>`. Construct it
-  only from `&LiveArenaProcessView` and `&mut LiveReservedPublishClaim`; derive
-  the exact payload-adjusted range internally; privately create the non-owning
-  `TranslationCache`; expose it only through a closure/HRTB. Dropping the guard
-  ends the claim borrow so the claim may then be consumed.
+  only inside the Darwin module from `&LiveArenaProcessView` and `&mut
+  LiveReservedPublishClaim`; derive the exact payload-adjusted range internally
+  and privately create the non-owning `TranslationCache`. Do not expose a
+  public closure/HRTB or `&mut TranslationCache`: safe callback code could
+  `mem::replace` and extract its lifetime-erased addresses. Its sole private
+  operation consumes `PreparedSharedInitial`, calls the emitter internally,
+  verifies exact cache use, returns no address-bearing emitter value, and drops
+  the cache before the claim borrow ends.
 - Copy exact prepared HOT/COLD bytes only through claim-bound slices. Publish
   prepared code once into the exact cache. Require exact cache use, validate
-  mapped code digest and exact metadata decode/consumption, recheck source
-  generation, flush publisher I-cache, and return an unforgeable
-  `LiveArenaWrittenBlock` token. Only `claim.publish(token)` may Release-store
-  READY.
+  the mapped code/HOT/COLD digests against an opaque proof derived from the
+  actual `PreparedSharedInitial` after prebinding, exact-decode/consume both
+  metadata streams, recheck source generation, flush publisher I-cache, and
+  return an unforgeable `LiveArenaWrittenBlock<'view>` token. Because the
+  portable crate owns the
+  READY store and the downstream Darwin crate owns mapped storage, use one
+  documented `unsafe` portable certification method whose contract requires
+  the exact claim-derived mapped slices, same process-view brand, no live
+  mutable aliases, and completed flush. Safe callers have no token constructor.
+  Only `claim.publish(token)` may Release-store READY.
 - Replace borrowed `ValidatedLiveBlock<'a>` retention with an owned,
   offset-only `ValidatedLiveBlockHandle` containing copied immutable
   record/extents/digest plus view identity. The process view revalidates and
@@ -133,11 +153,18 @@ change and obtain independent review before Task 6B.
   the same process view from acquired READY, checks AArch64 reachability, and
   mutates only staged prepared bytes. Published blocks expose no source sites.
 
-**Tests:** completion token cannot be forged; partial/short writes cannot READY;
-cache/claim/view cannot escape or cross; same-object mappings at different VAs
-share records/cursors/bytes; code/HOT/COLD corruption refuses READY; per-process
-I-cache flush occurs; exact W^X and payload boundary hold; real exec successor
-observes creator READY.
+**6B1 tests:** safe caller bytes have no READY route; mapped-write permit and
+token cannot escape their claim/view; a token cannot publish another claim;
+partial/short or corrupted code/HOT/COLD cannot certify; metadata requires
+exact consumption; a generation change refuses completion; a failed attempt
+cannot retry and drops to FAILED; READY owns a copied offset-only record.
+
+**6B2 tests:** the transaction writes only exact reserved ranges; the private
+cache cannot escape or cross threads; distinct process views reject each
+other's capabilities; same-object mappings at different VAs share
+records/cursors/bytes; publisher and consumer each invalidate their own exact
+RX range; consumer re-hashes RX and exact-validates HOT; exact W^X and payload
+boundary hold; the real exec successor observes creator READY and bytes.
 
 ## Task 6C — runtime ownership, transport, exact-key configuration, and sizing
 
