@@ -7,6 +7,8 @@ use crate::shared_cache::{TRANSLATOR_ABI_CURRENT, TranslationUnitKey};
 use carrick_guest_mem::GuestVa;
 use sha2::{Digest, Sha256};
 use std::cell::UnsafeCell;
+use std::fmt;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::{Arc, Barrier};
@@ -17,11 +19,292 @@ pub const LIVE_BLOCK_BUILDING: u32 = 1;
 pub const LIVE_BLOCK_READY: u32 = 2;
 pub const LIVE_BLOCK_FAILED: u32 = 3;
 pub const LIVE_ARENA_RECORDS: usize = 131_072;
+pub const LIVE_ARENA_OBJECT_HEADER_BYTES: usize = 64;
+pub const LIVE_ARENA_CACHE_LINE_BYTES: usize = 64;
+pub const LIVE_ARENA_CONTROL_DIRECTORY_BYTES: usize = 192;
+pub const LIVE_ARENA_CONTROL_READY: u32 = 1;
 const LIVE_ARENA_PROBES: usize = 16;
 const LIVE_ARENA_MASK: usize = LIVE_ARENA_RECORDS - 1;
 const LIVE_ARENA_PAGE_BYTES: u64 = 16 * 1024;
 const LIVE_ARENA_INSTRUCTION_BYTES: u64 = 4;
 const LIVE_ARENA_METADATA_ALIGN: u64 = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LiveArenaCapacities {
+    pub code: u64,
+    pub hot: u64,
+    pub cold: u64,
+}
+
+impl LiveArenaCapacities {
+    pub const fn new(code: u64, hot: u64, cold: u64) -> Self {
+        Self { code, hot, cold }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveArenaLayoutError(String);
+
+impl LiveArenaLayoutError {
+    fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+impl fmt::Display for LiveArenaLayoutError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for LiveArenaLayoutError {}
+
+#[repr(C, align(64))]
+pub struct LiveArenaControlDirectoryV1 {
+    pub initialization_state: AtomicU32,
+    pub schema: u32,
+    pub translator_abi: u32,
+    pub directory_len: u32,
+    pub nonce: [u8; 16],
+    pub code_payload_base: u64,
+    pub code_capacity: u64,
+    pub code_cursor_offset: u64,
+    pub hot_cursor_offset: u64,
+    pub cold_cursor_offset: u64,
+    pub records_offset: u64,
+    pub records_len: u64,
+    pub record_count: u32,
+    pub record_stride: u32,
+    pub hot_base: u64,
+    pub hot_capacity: u64,
+    pub cold_base: u64,
+    pub cold_capacity: u64,
+    pub control_len: u64,
+    pub leaked_extents: AtomicU64,
+    reserved: [u64; 6],
+}
+
+const _: () = assert!(std::mem::align_of::<LiveArenaControlDirectoryV1>() == 64);
+const _: () = assert!(
+    std::mem::size_of::<LiveArenaControlDirectoryV1>() == LIVE_ARENA_CONTROL_DIRECTORY_BYTES
+);
+const _: () = assert!(std::mem::offset_of!(LiveArenaControlDirectoryV1, initialization_state) == 0);
+const _: () = assert!(std::mem::offset_of!(LiveArenaControlDirectoryV1, nonce) == 16);
+const _: () = assert!(std::mem::offset_of!(LiveArenaControlDirectoryV1, code_payload_base) == 32);
+const _: () = assert!(std::mem::offset_of!(LiveArenaControlDirectoryV1, records_offset) == 72);
+const _: () = assert!(std::mem::offset_of!(LiveArenaControlDirectoryV1, hot_base) == 96);
+const _: () = assert!(std::mem::offset_of!(LiveArenaControlDirectoryV1, control_len) == 128);
+const _: () = assert!(std::mem::offset_of!(LiveArenaControlDirectoryV1, leaked_extents) == 136);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LiveArenaControlLayout {
+    capacities: LiveArenaCapacities,
+    host_page: usize,
+    code_payload_base: usize,
+    code_len: usize,
+    directory_offset: usize,
+    code_cursor_offset: usize,
+    hot_cursor_offset: usize,
+    cold_cursor_offset: usize,
+    records_offset: usize,
+    records_len: usize,
+    hot_base: usize,
+    cold_base: usize,
+    control_payload_end: usize,
+    control_len: usize,
+}
+
+impl LiveArenaControlLayout {
+    pub fn new(
+        capacities: LiveArenaCapacities,
+        host_page: usize,
+    ) -> Result<Self, LiveArenaLayoutError> {
+        if host_page == 0 || !host_page.is_power_of_two() {
+            return Err(LiveArenaLayoutError::new(
+                "host page must be a nonzero power of two",
+            ));
+        }
+        if capacities.code == 0 {
+            return Err(LiveArenaLayoutError::new("code capacity must be nonzero"));
+        }
+        let code_capacity = usize::try_from(capacities.code)
+            .map_err(|_| LiveArenaLayoutError::new("code capacity exceeds usize"))?;
+        let hot_capacity = usize::try_from(capacities.hot)
+            .map_err(|_| LiveArenaLayoutError::new("HOT capacity exceeds usize"))?;
+        let cold_capacity = usize::try_from(capacities.cold)
+            .map_err(|_| LiveArenaLayoutError::new("COLD capacity exceeds usize"))?;
+        let code_payload_base = checked_align_up(LIVE_ARENA_OBJECT_HEADER_BYTES, host_page)?;
+        let code_end = code_payload_base
+            .checked_add(code_capacity)
+            .ok_or_else(|| LiveArenaLayoutError::new("code object length overflow"))?;
+        let code_len = checked_align_up(code_end, host_page)?;
+        let directory_offset = LIVE_ARENA_OBJECT_HEADER_BYTES;
+        let directory_end = directory_offset
+            .checked_add(std::mem::size_of::<LiveArenaControlDirectoryV1>())
+            .ok_or_else(|| LiveArenaLayoutError::new("directory end overflow"))?;
+        let code_cursor_offset = checked_align_up(directory_end, LIVE_ARENA_CACHE_LINE_BYTES)?;
+        let hot_cursor_offset = code_cursor_offset
+            .checked_add(LIVE_ARENA_CACHE_LINE_BYTES)
+            .ok_or_else(|| LiveArenaLayoutError::new("HOT cursor offset overflow"))?;
+        let cold_cursor_offset = hot_cursor_offset
+            .checked_add(LIVE_ARENA_CACHE_LINE_BYTES)
+            .ok_or_else(|| LiveArenaLayoutError::new("COLD cursor offset overflow"))?;
+        let records_offset = cold_cursor_offset
+            .checked_add(LIVE_ARENA_CACHE_LINE_BYTES)
+            .ok_or_else(|| LiveArenaLayoutError::new("record offset overflow"))?;
+        let records_len = LIVE_ARENA_RECORDS
+            .checked_mul(std::mem::size_of::<LiveBlockRecordV1>())
+            .ok_or_else(|| LiveArenaLayoutError::new("record table length overflow"))?;
+        let records_end = records_offset
+            .checked_add(records_len)
+            .ok_or_else(|| LiveArenaLayoutError::new("record table end overflow"))?;
+        let hot_base = checked_align_up(records_end, LIVE_ARENA_METADATA_ALIGN as usize)?;
+        let hot_end = hot_base
+            .checked_add(hot_capacity)
+            .ok_or_else(|| LiveArenaLayoutError::new("HOT pool end overflow"))?;
+        let cold_base = checked_align_up(hot_end, LIVE_ARENA_METADATA_ALIGN as usize)?;
+        let control_payload_end = cold_base
+            .checked_add(cold_capacity)
+            .ok_or_else(|| LiveArenaLayoutError::new("COLD pool end overflow"))?;
+        let control_len = checked_align_up(control_payload_end, host_page)?;
+        Ok(Self {
+            capacities,
+            host_page,
+            code_payload_base,
+            code_len,
+            directory_offset,
+            code_cursor_offset,
+            hot_cursor_offset,
+            cold_cursor_offset,
+            records_offset,
+            records_len,
+            hot_base,
+            cold_base,
+            control_payload_end,
+            control_len,
+        })
+    }
+
+    pub const fn capacities(self) -> LiveArenaCapacities {
+        self.capacities
+    }
+    pub const fn host_page(self) -> usize {
+        self.host_page
+    }
+    pub const fn code_payload_base(self) -> usize {
+        self.code_payload_base
+    }
+    pub const fn code_len(self) -> usize {
+        self.code_len
+    }
+    pub const fn directory_offset(self) -> usize {
+        self.directory_offset
+    }
+    pub const fn directory_end(self) -> usize {
+        self.directory_offset + LIVE_ARENA_CONTROL_DIRECTORY_BYTES
+    }
+    pub const fn code_cursor_offset(self) -> usize {
+        self.code_cursor_offset
+    }
+    pub const fn hot_cursor_offset(self) -> usize {
+        self.hot_cursor_offset
+    }
+    pub const fn cold_cursor_offset(self) -> usize {
+        self.cold_cursor_offset
+    }
+    pub const fn records_offset(self) -> usize {
+        self.records_offset
+    }
+    pub const fn records_len(self) -> usize {
+        self.records_len
+    }
+    pub const fn records_end(self) -> usize {
+        self.records_offset + self.records_len
+    }
+    pub const fn hot_base(self) -> usize {
+        self.hot_base
+    }
+    pub const fn cold_base(self) -> usize {
+        self.cold_base
+    }
+    pub const fn control_payload_end(self) -> usize {
+        self.control_payload_end
+    }
+    pub const fn control_len(self) -> usize {
+        self.control_len
+    }
+}
+
+fn checked_align_up(value: usize, alignment: usize) -> Result<usize, LiveArenaLayoutError> {
+    let remainder = value % alignment;
+    value
+        .checked_add((alignment - remainder) % alignment)
+        .ok_or_else(|| LiveArenaLayoutError::new("layout alignment overflow"))
+}
+
+fn pointer_at<T>(base: NonNull<u8>, offset: usize) -> Result<NonNull<T>, LiveArenaLayoutError> {
+    let address = (base.as_ptr() as usize)
+        .checked_add(offset)
+        .ok_or_else(|| LiveArenaLayoutError::new("mapped pointer overflow"))?;
+    if !address.is_multiple_of(std::mem::align_of::<T>()) {
+        return Err(LiveArenaLayoutError::new("mapped pointer is misaligned"));
+    }
+    NonNull::new(address as *mut T)
+        .ok_or_else(|| LiveArenaLayoutError::new("mapped pointer is null"))
+}
+
+fn validate_mapping_geometry(
+    base: NonNull<u8>,
+    mapped_len: usize,
+    layout: LiveArenaControlLayout,
+) -> Result<(), LiveArenaLayoutError> {
+    if !(base.as_ptr() as usize).is_multiple_of(LIVE_ARENA_CACHE_LINE_BYTES) {
+        return Err(LiveArenaLayoutError::new(
+            "control mapping base is not cacheline aligned",
+        ));
+    }
+    if LiveArenaControlLayout::new(layout.capacities, layout.host_page)? != layout {
+        return Err(LiveArenaLayoutError::new("control layout is not canonical"));
+    }
+    if mapped_len != layout.control_len {
+        return Err(LiveArenaLayoutError::new(
+            "control mapping length differs from layout",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_directory(
+    directory: &LiveArenaControlDirectoryV1,
+    layout: LiveArenaControlLayout,
+    nonce: [u8; 16],
+) -> Result<(), LiveArenaLayoutError> {
+    let matches = directory.schema == LIVE_ARENA_SCHEMA_V1
+        && directory.translator_abi == TRANSLATOR_ABI_CURRENT
+        && directory.directory_len == LIVE_ARENA_CONTROL_DIRECTORY_BYTES as u32
+        && directory.nonce == nonce
+        && directory.code_payload_base == layout.code_payload_base as u64
+        && directory.code_capacity == layout.capacities.code
+        && directory.code_cursor_offset == layout.code_cursor_offset as u64
+        && directory.hot_cursor_offset == layout.hot_cursor_offset as u64
+        && directory.cold_cursor_offset == layout.cold_cursor_offset as u64
+        && directory.records_offset == layout.records_offset as u64
+        && directory.records_len == layout.records_len as u64
+        && directory.record_count == LIVE_ARENA_RECORDS as u32
+        && directory.record_stride == std::mem::size_of::<LiveBlockRecordV1>() as u32
+        && directory.hot_base == layout.hot_base as u64
+        && directory.hot_capacity == layout.capacities.hot
+        && directory.cold_base == layout.cold_base as u64
+        && directory.cold_capacity == layout.capacities.cold
+        && directory.control_len == layout.control_len as u64
+        && directory.reserved == [0; 6];
+    if !matches {
+        return Err(LiveArenaLayoutError::new(
+            "control directory does not match canonical layout",
+        ));
+    }
+    Ok(())
+}
 
 #[repr(C, align(64))]
 pub struct LiveBlockRecordV1 {
@@ -177,34 +460,234 @@ pub struct LiveBlockPublication {
     pub code: Vec<u8>,
 }
 
-pub struct LiveTranslationArena {
-    records: Box<[LiveBlockRecordV1]>,
-    code_capacity: u64,
-    hot_capacity: u64,
-    cold_capacity: u64,
-    code_next: AtomicU64,
-    hot_next: AtomicU64,
-    cold_next: AtomicU64,
-    #[cfg(test)]
-    cas_barrier: Option<Arc<Barrier>>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LiveArenaViewBrand {
+    directory: NonNull<LiveArenaControlDirectoryV1>,
+    nonce: [u8; 16],
 }
 
-impl LiveTranslationArena {
-    pub fn new(code_capacity: u64, hot_capacity: u64, cold_capacity: u64) -> Self {
-        let records = (0..LIVE_ARENA_RECORDS)
-            .map(|_| LiveBlockRecordV1::empty())
-            .collect();
-        Self {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LiveArenaCursorSnapshot {
+    pub code: u64,
+    pub hot: u64,
+    pub cold: u64,
+    /// Nonempty extents stranded when a later cursor reservation fails. The
+    /// append-only allocator never reclaims or retries them.
+    pub leaked_extents: u64,
+}
+
+#[derive(Clone, Copy)]
+pub struct LiveTranslationArenaView<'a> {
+    directory: &'a LiveArenaControlDirectoryV1,
+    records: &'a [LiveBlockRecordV1],
+    code_next: &'a AtomicU64,
+    hot_next: &'a AtomicU64,
+    cold_next: &'a AtomicU64,
+    layout: LiveArenaControlLayout,
+    brand: LiveArenaViewBrand,
+    #[cfg(test)]
+    cas_barrier: Option<&'a Barrier>,
+}
+
+// SAFETY: every pointer exposed through the view addresses atomics or a record
+// payload governed by the record's release/acquire state machine. Directory
+// fields are immutable after its initialization-state Release publication.
+unsafe impl Send for LiveTranslationArenaView<'_> {}
+unsafe impl Sync for LiveTranslationArenaView<'_> {}
+
+impl<'a> LiveTranslationArenaView<'a> {
+    /// Discovers capacities only from the fixed directory location, rebuilds
+    /// the canonical layout, then performs full adoption validation.
+    ///
+    /// # Safety
+    ///
+    /// The mapping/lifetime contract is identical to `adopt_in_place`.
+    pub unsafe fn adopt_discovered_in_place(
+        base: NonNull<u8>,
+        mapped_len: usize,
+        code_len: usize,
+        host_page: usize,
+        nonce: [u8; 16],
+    ) -> Result<Self, LiveArenaLayoutError> {
+        if !(base.as_ptr() as usize).is_multiple_of(LIVE_ARENA_CACHE_LINE_BYTES) {
+            return Err(LiveArenaLayoutError::new(
+                "control mapping base is not cacheline aligned",
+            ));
+        }
+        let fixed_end = LIVE_ARENA_OBJECT_HEADER_BYTES
+            .checked_add(std::mem::size_of::<LiveArenaControlDirectoryV1>())
+            .ok_or_else(|| LiveArenaLayoutError::new("fixed directory end overflow"))?;
+        if mapped_len < fixed_end {
+            return Err(LiveArenaLayoutError::new(
+                "control mapping is smaller than directory",
+            ));
+        }
+        let directory_ptr =
+            pointer_at::<LiveArenaControlDirectoryV1>(base, LIVE_ARENA_OBJECT_HEADER_BYTES)?;
+        // SAFETY: only the fixed, alignment-checked directory range is formed;
+        // no attacker-controlled offset has been consumed.
+        let directory = unsafe { directory_ptr.as_ref() };
+        if directory.initialization_state.load(Ordering::Acquire) != LIVE_ARENA_CONTROL_READY {
+            return Err(LiveArenaLayoutError::new(
+                "control directory is not initialized",
+            ));
+        }
+        let layout = LiveArenaControlLayout::new(
+            LiveArenaCapacities::new(
+                directory.code_capacity,
+                directory.hot_capacity,
+                directory.cold_capacity,
+            ),
+            host_page,
+        )?;
+        if layout.code_len != code_len {
+            return Err(LiveArenaLayoutError::new(
+                "code mapping length differs from directory",
+            ));
+        }
+        // SAFETY: the canonical layout derived from fixed fields is validated
+        // in full before typed cursor/table references are formed.
+        unsafe { Self::adopt_in_place(base, mapped_len, layout, nonce) }
+    }
+
+    /// Initializes one exclusively owned control mapping in place.
+    ///
+    /// # Safety
+    ///
+    /// `base..base+mapped_len` must be one live, writable allocation aligned to
+    /// 64 bytes, exclusively owned for initialization, and remain mapped for
+    /// `'a`. No typed reference into it may exist before this call.
+    pub unsafe fn initialize_in_place(
+        base: NonNull<u8>,
+        mapped_len: usize,
+        layout: LiveArenaControlLayout,
+        nonce: [u8; 16],
+    ) -> Result<Self, LiveArenaLayoutError> {
+        validate_mapping_geometry(base, mapped_len, layout)?;
+        let directory_ptr =
+            pointer_at::<LiveArenaControlDirectoryV1>(base, layout.directory_offset)?;
+        let directory = LiveArenaControlDirectoryV1 {
+            initialization_state: AtomicU32::new(0),
+            schema: LIVE_ARENA_SCHEMA_V1,
+            translator_abi: TRANSLATOR_ABI_CURRENT,
+            directory_len: std::mem::size_of::<LiveArenaControlDirectoryV1>() as u32,
+            nonce,
+            code_payload_base: layout.code_payload_base as u64,
+            code_capacity: layout.capacities.code,
+            code_cursor_offset: layout.code_cursor_offset as u64,
+            hot_cursor_offset: layout.hot_cursor_offset as u64,
+            cold_cursor_offset: layout.cold_cursor_offset as u64,
+            records_offset: layout.records_offset as u64,
+            records_len: layout.records_len as u64,
+            record_count: LIVE_ARENA_RECORDS as u32,
+            record_stride: std::mem::size_of::<LiveBlockRecordV1>() as u32,
+            hot_base: layout.hot_base as u64,
+            hot_capacity: layout.capacities.hot,
+            cold_base: layout.cold_base as u64,
+            cold_capacity: layout.capacities.cold,
+            control_len: layout.control_len as u64,
+            leaked_extents: AtomicU64::new(0),
+            reserved: [0; 6],
+        };
+        // SAFETY: the caller grants exclusive uninitialized storage and the
+        // checked pointer is aligned and in bounds for the complete directory.
+        unsafe { directory_ptr.as_ptr().write(directory) };
+        for offset in [
+            layout.code_cursor_offset,
+            layout.hot_cursor_offset,
+            layout.cold_cursor_offset,
+        ] {
+            let cursor = pointer_at::<AtomicU64>(base, offset)?;
+            // SAFETY: each separately aligned cursor cell is disjoint and was
+            // proved in-bounds by the canonical layout.
+            unsafe { cursor.as_ptr().write(AtomicU64::new(0)) };
+        }
+        let records = pointer_at::<LiveBlockRecordV1>(base, layout.records_offset)?;
+        for index in 0..LIVE_ARENA_RECORDS {
+            // SAFETY: the canonical records range contains exactly this many
+            // aligned, disjoint records and remains exclusively initialized.
+            unsafe {
+                records
+                    .as_ptr()
+                    .add(index)
+                    .write(LiveBlockRecordV1::empty())
+            };
+        }
+        // SAFETY: the directory was initialized above and remains mapped.
+        let directory = unsafe { directory_ptr.as_ref() };
+        directory
+            .initialization_state
+            .store(LIVE_ARENA_CONTROL_READY, Ordering::Release);
+        // SAFETY: initialization is complete and the same checked mapping
+        // remains valid for `'a`.
+        unsafe { Self::adopt_in_place(base, mapped_len, layout, nonce) }
+    }
+
+    /// Adopts one initialized control mapping after validating its complete
+    /// canonical geometry before forming record or cursor references.
+    ///
+    /// # Safety
+    ///
+    /// The mapping must remain live for `'a`, originate from
+    /// `initialize_in_place`, and permit concurrent mutation only through the
+    /// protocol atomics and record payload state machine.
+    pub unsafe fn adopt_in_place(
+        base: NonNull<u8>,
+        mapped_len: usize,
+        layout: LiveArenaControlLayout,
+        nonce: [u8; 16],
+    ) -> Result<Self, LiveArenaLayoutError> {
+        validate_mapping_geometry(base, mapped_len, layout)?;
+        let directory_ptr =
+            pointer_at::<LiveArenaControlDirectoryV1>(base, layout.directory_offset)?;
+        // SAFETY: fixed directory geometry was checked before this reference.
+        let directory = unsafe { directory_ptr.as_ref() };
+        if directory.initialization_state.load(Ordering::Acquire) != LIVE_ARENA_CONTROL_READY {
+            return Err(LiveArenaLayoutError::new(
+                "control directory is not initialized",
+            ));
+        }
+        validate_directory(directory, layout, nonce)?;
+        let code_next = pointer_at::<AtomicU64>(base, layout.code_cursor_offset)?;
+        let hot_next = pointer_at::<AtomicU64>(base, layout.hot_cursor_offset)?;
+        let cold_next = pointer_at::<AtomicU64>(base, layout.cold_cursor_offset)?;
+        let records = pointer_at::<LiveBlockRecordV1>(base, layout.records_offset)?;
+        // SAFETY: directory validation proved the canonical table range and
+        // stride before the slice is formed.
+        let records = unsafe { std::slice::from_raw_parts(records.as_ptr(), LIVE_ARENA_RECORDS) };
+        Ok(Self {
+            directory,
             records,
-            code_capacity,
-            hot_capacity,
-            cold_capacity,
-            code_next: AtomicU64::new(0),
-            hot_next: AtomicU64::new(0),
-            cold_next: AtomicU64::new(0),
+            // SAFETY: each checked cursor pointer is aligned, initialized, and
+            // remains mapped for `'a`.
+            code_next: unsafe { code_next.as_ref() },
+            hot_next: unsafe { hot_next.as_ref() },
+            cold_next: unsafe { cold_next.as_ref() },
+            layout,
+            brand: LiveArenaViewBrand {
+                directory: directory_ptr,
+                nonce,
+            },
             #[cfg(test)]
             cas_barrier: None,
+        })
+    }
+
+    pub fn cursor_snapshot(&self) -> LiveArenaCursorSnapshot {
+        LiveArenaCursorSnapshot {
+            code: self.code_next.load(Ordering::Acquire),
+            hot: self.hot_next.load(Ordering::Acquire),
+            cold: self.cold_next.load(Ordering::Acquire),
+            leaked_extents: self.directory.leaked_extents.load(Ordering::Acquire),
         }
+    }
+
+    pub const fn layout(&self) -> LiveArenaControlLayout {
+        self.layout
+    }
+
+    pub fn accepts_claim(&self, claim: &LiveReservedPublishClaim<'_>) -> bool {
+        self.brand == claim.claim.arena.brand
     }
 
     /// Performs at most one acquire load per probe and one CAS only for an
@@ -214,7 +697,7 @@ impl LiveTranslationArena {
         key: &TranslationUnitKey,
         guest_start: GuestVa,
         owner_pid: i32,
-    ) -> LiveLookup<'_> {
+    ) -> LiveLookup<'a> {
         let Ok(unit_key_digest) = key.live_digest() else {
             return LiveLookup::Private(LivePrivateReason::KeyEncoding);
         };
@@ -255,10 +738,11 @@ impl LiveTranslationArena {
                         Ok(_) => {
                             record.owner_pid.store(owner_pid, Ordering::Relaxed);
                             return LiveLookup::Publish(LivePublishClaim {
-                                arena: self,
+                                arena: *self,
                                 record,
                                 unit_key_digest,
                                 guest_start: guest_start.raw(),
+                                armed: true,
                             });
                         }
                         Err(_) => return LiveLookup::Private(LivePrivateReason::CasLost),
@@ -271,8 +755,8 @@ impl LiveTranslationArena {
         LiveLookup::Private(LivePrivateReason::ExhaustedProbes)
     }
 
-    fn validate_ready<'a>(
-        &'a self,
+    fn validate_ready(
+        &self,
         _record: &'a LiveBlockRecordV1,
         payload: &'a LiveBlockPayloadV1,
         expected_key: &[u8; 32],
@@ -312,9 +796,9 @@ impl LiveTranslationArena {
     }
 
     fn extents_in_bounds(&self, extents: LiveBlockExtents) -> bool {
-        extent_in_capacity(extents.code, self.code_capacity)
-            && extent_in_capacity(extents.hot, self.hot_capacity)
-            && extent_in_capacity(extents.cold, self.cold_capacity)
+        extent_in_capacity(extents.code, self.code_capacity())
+            && extent_in_capacity(extents.hot, self.hot_capacity())
+            && extent_in_capacity(extents.cold, self.cold_capacity())
     }
 
     fn reserve(&self, code_len: u64, hot_len: u64, cold_len: u64) -> Option<LiveBlockExtents> {
@@ -322,32 +806,125 @@ impl LiveTranslationArena {
             return None;
         }
         let code = reserve_append(
-            &self.code_next,
-            self.code_capacity,
+            self.code_next,
+            self.code_capacity(),
             code_len,
             LIVE_ARENA_PAGE_BYTES,
         )?;
-        let hot = reserve_append(
-            &self.hot_next,
-            self.hot_capacity,
+        let Some(hot) = reserve_append(
+            self.hot_next,
+            self.hot_capacity(),
             hot_len,
             LIVE_ARENA_METADATA_ALIGN,
-        )?;
-        let cold = reserve_append(
-            &self.cold_next,
-            self.cold_capacity,
+        ) else {
+            self.directory
+                .leaked_extents
+                .fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        let Some(cold) = reserve_append(
+            self.cold_next,
+            self.cold_capacity(),
             cold_len,
             LIVE_ARENA_METADATA_ALIGN,
-        )?;
+        ) else {
+            let leaked = 1 + u64::from(hot.len != 0);
+            self.directory
+                .leaked_extents
+                .fetch_add(leaked, Ordering::Relaxed);
+            return None;
+        };
         Some(LiveBlockExtents { code, hot, cold })
+    }
+
+    fn code_capacity(&self) -> u64 {
+        self.layout.capacities.code
+    }
+    fn hot_capacity(&self) -> u64 {
+        self.layout.capacities.hot
+    }
+    fn cold_capacity(&self) -> u64 {
+        self.layout.capacities.cold
+    }
+}
+
+#[cfg(test)]
+pub struct LiveTranslationArena {
+    storage: Vec<u8>,
+    base: NonNull<u8>,
+    layout: LiveArenaControlLayout,
+    nonce: [u8; 16],
+    cas_barrier: Option<Arc<Barrier>>,
+}
+
+#[cfg(test)]
+// SAFETY: the stable allocation contains only the protocol's atomics and
+// state-machine-protected payload cells; all test access routes through a view.
+unsafe impl Send for LiveTranslationArena {}
+#[cfg(test)]
+unsafe impl Sync for LiveTranslationArena {}
+
+#[cfg(test)]
+impl LiveTranslationArena {
+    pub fn new(code_capacity: u64, hot_capacity: u64, cold_capacity: u64) -> Self {
+        let layout = LiveArenaControlLayout::new(
+            LiveArenaCapacities::new(code_capacity, hot_capacity, cold_capacity),
+            LIVE_ARENA_PAGE_BYTES as usize,
+        )
+        .expect("test arena layout");
+        let mut storage = vec![0_u8; layout.control_len + LIVE_ARENA_CACHE_LINE_BYTES - 1];
+        let unaligned = storage.as_mut_ptr() as usize;
+        let aligned =
+            (unaligned + LIVE_ARENA_CACHE_LINE_BYTES - 1) & !(LIVE_ARENA_CACHE_LINE_BYTES - 1);
+        let base = NonNull::new(aligned as *mut u8).expect("test arena base");
+        let nonce = [0x74; 16];
+        // SAFETY: `storage` owns the complete aligned range and remains stable
+        // inside the returned owner.
+        unsafe {
+            LiveTranslationArenaView::initialize_in_place(base, layout.control_len, layout, nonce)
+        }
+        .expect("initialize test live arena");
+        Self {
+            storage,
+            base,
+            layout,
+            nonce,
+            cas_barrier: None,
+        }
+    }
+
+    fn view(&self) -> LiveTranslationArenaView<'_> {
+        let _keep_storage_alive = &self.storage;
+        // SAFETY: this owner initialized and retains the mapping allocation.
+        let mut view = unsafe {
+            LiveTranslationArenaView::adopt_in_place(
+                self.base,
+                self.layout.control_len,
+                self.layout,
+                self.nonce,
+            )
+        }
+        .expect("adopt test live arena");
+        view.cas_barrier = self.cas_barrier.as_deref();
+        view
+    }
+
+    pub fn lookup(
+        &self,
+        key: &TranslationUnitKey,
+        guest_start: GuestVa,
+        owner_pid: i32,
+    ) -> LiveLookup<'_> {
+        self.view().lookup(key, guest_start, owner_pid)
     }
 }
 
 pub struct LivePublishClaim<'a> {
-    arena: &'a LiveTranslationArena,
+    arena: LiveTranslationArenaView<'a>,
     record: &'a LiveBlockRecordV1,
     unit_key_digest: [u8; 32],
     guest_start: u64,
+    armed: bool,
 }
 
 impl<'a> LivePublishClaim<'a> {
@@ -390,6 +967,9 @@ impl<'a> LivePublishClaim<'a> {
     }
 
     fn publish_failed(&mut self) {
+        if !self.armed {
+            return;
+        }
         let payload = LiveBlockPayloadV1 {
             unit_key_digest: self.unit_key_digest,
             guest_start: self.guest_start,
@@ -401,6 +981,15 @@ impl<'a> LivePublishClaim<'a> {
         self.record
             .state
             .store(LIVE_BLOCK_FAILED, Ordering::Release);
+        self.armed = false;
+    }
+}
+
+impl Drop for LivePublishClaim<'_> {
+    fn drop(&mut self) {
+        if self.armed && self.record.state.load(Ordering::Acquire) == LIVE_BLOCK_BUILDING {
+            self.publish_failed();
+        }
     }
 }
 
@@ -469,6 +1058,7 @@ impl<'a> LiveReservedPublishClaim<'a> {
             .record
             .state
             .store(LIVE_BLOCK_READY, Ordering::Release);
+        self.claim.armed = false;
         if self.claim.record.state.load(Ordering::Acquire) != LIVE_BLOCK_READY {
             return LiveLookup::Private(LivePrivateReason::InvalidRecord);
         }
@@ -630,7 +1220,53 @@ mod tests {
     };
     use carrick_guest_mem::GuestVa;
     use sha2::{Digest, Sha256};
+    use std::ptr::NonNull;
     use std::sync::{Arc, Barrier};
+
+    struct RawControlStorage {
+        bytes: Vec<u8>,
+        base: NonNull<u8>,
+        len: usize,
+    }
+
+    impl RawControlStorage {
+        fn new(len: usize) -> Self {
+            let mut bytes = vec![0_u8; len + 63];
+            let unaligned = bytes.as_mut_ptr() as usize;
+            let aligned = (unaligned + 63) & !63;
+            Self {
+                bytes,
+                base: NonNull::new(aligned as *mut u8).expect("aligned storage base"),
+                len,
+            }
+        }
+
+        fn initialize(
+            &self,
+            layout: LiveArenaControlLayout,
+            nonce: [u8; 16],
+        ) -> LiveTranslationArenaView<'_> {
+            let _keep_allocation_alive = &self.bytes;
+            // SAFETY: this fixture owns `len` writable bytes at a 64-byte-aligned
+            // address for the returned view's complete lifetime.
+            unsafe {
+                LiveTranslationArenaView::initialize_in_place(self.base, self.len, layout, nonce)
+            }
+            .expect("initialize mapped protocol storage")
+        }
+
+        fn adopt(
+            &self,
+            layout: LiveArenaControlLayout,
+            nonce: [u8; 16],
+        ) -> LiveTranslationArenaView<'_> {
+            let _keep_allocation_alive = &self.bytes;
+            // SAFETY: initialization completed through the protocol initializer,
+            // and this allocation remains live and shared for the view lifetime.
+            unsafe { LiveTranslationArenaView::adopt_in_place(self.base, self.len, layout, nonce) }
+                .expect("adopt mapped protocol storage")
+        }
+    }
 
     const PAGE: u64 = 16 * 1024;
 
@@ -670,8 +1306,9 @@ mod tests {
         unit_key_digest: [u8; 32],
         guest_start: u64,
     ) {
-        let record = &mut arena.records[slot & LIVE_ARENA_MASK];
-        *record.payload.get_mut() = LiveBlockPayloadV1 {
+        let view = arena.view();
+        let record = &view.records[slot & LIVE_ARENA_MASK];
+        let payload = LiveBlockPayloadV1 {
             unit_key_digest,
             guest_start,
             source_page: guest_start / PAGE * PAGE,
@@ -684,18 +1321,20 @@ mod tests {
             cold_len: 8,
             code_sha256: [0x5a; 32],
         };
+        unsafe { record.write_building_payload(payload) };
         record.state.store(state, Ordering::Release);
     }
 
     fn malformed_ready_reason(
         mutate: impl FnOnce(&mut LiveBlockPayloadV1),
     ) -> Option<LivePrivateReason> {
-        let mut arena = arena();
+        let arena = arena();
         let key = key();
         let guest_start = key.guest_va_start();
         let digest = key.live_digest().expect("live digest");
         let initial = initial_slot(&digest, guest_start.raw());
-        let record = &mut arena.records[initial];
+        let view = arena.view();
+        let record = &view.records[initial];
         let mut payload = LiveBlockPayloadV1 {
             unit_key_digest: digest,
             guest_start: guest_start.raw(),
@@ -710,7 +1349,7 @@ mod tests {
             code_sha256: [0x5a; 32],
         };
         mutate(&mut payload);
-        *record.payload.get_mut() = payload;
+        unsafe { record.write_building_payload(payload) };
         record.state.store(LIVE_BLOCK_READY, Ordering::Release);
 
         arena.lookup(&key, guest_start, 1234).private_reason()
@@ -950,7 +1589,7 @@ mod tests {
         };
         assert!(std::ptr::eq(
             claim.record,
-            &arena.records[(initial + 1) & LIVE_ARENA_MASK]
+            &arena.view().records[(initial + 1) & LIVE_ARENA_MASK]
         ));
     }
 
@@ -974,7 +1613,7 @@ mod tests {
         };
         assert!(std::ptr::eq(
             claim.record,
-            &arena.records[(initial + 1) & LIVE_ARENA_MASK]
+            &arena.view().records[(initial + 1) & LIVE_ARENA_MASK]
         ));
     }
 
@@ -998,7 +1637,7 @@ mod tests {
             Some(LivePrivateReason::Building)
         );
         assert_eq!(
-            arena.records[(initial + 1) & LIVE_ARENA_MASK]
+            arena.view().records[(initial + 1) & LIVE_ARENA_MASK]
                 .state
                 .load(Ordering::Relaxed),
             LIVE_BLOCK_EMPTY
@@ -1064,10 +1703,30 @@ mod tests {
                 claim.reserve(lengths.0, lengths.1, lengths.2),
                 Err(LivePrivateReason::InvalidRecord)
             ));
-            assert_eq!(arena.code_next.load(Ordering::Relaxed), 0);
-            assert_eq!(arena.hot_next.load(Ordering::Relaxed), 0);
-            assert_eq!(arena.cold_next.load(Ordering::Relaxed), 0);
+            let cursors = arena.view().cursor_snapshot();
+            assert_eq!(cursors.code, 0);
+            assert_eq!(cursors.hot, 0);
+            assert_eq!(cursors.cold, 0);
         }
+    }
+
+    #[test]
+    fn later_cursor_failure_counts_stranded_nonempty_extents() {
+        let arena = LiveTranslationArena::new(PAGE * 2, 8, 0);
+        let key = key();
+        let LiveLookup::Publish(claim) = arena.lookup(&key, key.guest_va_start(), 1234) else {
+            panic!("first lookup must claim the empty record");
+        };
+
+        assert!(matches!(
+            claim.reserve(8, 8, 8),
+            Err(LivePrivateReason::Capacity)
+        ));
+        let cursors = arena.view().cursor_snapshot();
+        assert_eq!(cursors.leaked_extents, 2);
+        assert_eq!(cursors.code, 8);
+        assert_eq!(cursors.hot, 8);
+        assert_eq!(cursors.cold, 0);
     }
 
     #[test]
@@ -1107,7 +1766,7 @@ mod tests {
         let digest = key.live_digest().expect("live digest");
         let initial = initial_slot(&digest, key.guest_va_start().raw());
         assert_eq!(
-            arena.records[(initial + 1) & LIVE_ARENA_MASK]
+            arena.view().records[(initial + 1) & LIVE_ARENA_MASK]
                 .state
                 .load(Ordering::Relaxed),
             LIVE_BLOCK_EMPTY
@@ -1151,5 +1810,87 @@ mod tests {
             }
             panic!("reader did not acquire the READY publication");
         });
+    }
+
+    #[test]
+    fn mapped_views_share_claim_state_and_append_cursors() {
+        let capacities = LiveArenaCapacities::new(PAGE * 4, PAGE, PAGE);
+        let layout =
+            LiveArenaControlLayout::new(capacities, PAGE as usize).expect("checked mapped layout");
+        let nonce = [0x5a; 16];
+        let storage = RawControlStorage::new(layout.control_len());
+        let first = storage.initialize(layout, nonce);
+        let second = storage.adopt(layout, nonce);
+        let first_key = key();
+        let second_guest = GuestVa(first_key.guest_va_start().raw() + PAGE);
+
+        let LiveLookup::Publish(claim) = first.lookup(&first_key, first_key.guest_va_start(), 101)
+        else {
+            panic!("first mapped view must win a claim");
+        };
+        let first_extents = claim.reserve(8, 8, 8).expect("first reservation").extents();
+        let LiveLookup::Publish(claim) = second.lookup(&first_key, second_guest, 202) else {
+            panic!("second mapped view must observe the shared table and next empty slot");
+        };
+        let second_extents = claim
+            .reserve(8, 8, 8)
+            .expect("second reservation")
+            .extents();
+
+        assert!(first_extents.code.end().expect("code end") <= second_extents.code.offset);
+        assert!(first_extents.hot.end().expect("HOT end") <= second_extents.hot.offset);
+        assert!(first_extents.cold.end().expect("COLD end") <= second_extents.cold.offset);
+        assert_eq!(first.cursor_snapshot(), second.cursor_snapshot());
+    }
+
+    #[test]
+    fn record_hot_cold_ranges_fit_exactly() {
+        let capacities = LiveArenaCapacities::new(PAGE * 7, 24, 40);
+        let layout =
+            LiveArenaControlLayout::new(capacities, PAGE as usize).expect("checked mapped layout");
+
+        assert_eq!(layout.directory_offset(), 64);
+        assert_eq!(layout.records_len(), LIVE_ARENA_RECORDS * 192);
+        assert_eq!(layout.records_end(), layout.hot_base());
+        assert_eq!(layout.hot_base() + 24, layout.cold_base());
+        assert_eq!(layout.cold_base() + 40, layout.control_payload_end());
+        assert!(layout.control_payload_end() <= layout.control_len());
+        assert!(layout.control_len().is_multiple_of(PAGE as usize));
+    }
+
+    #[test]
+    fn dropped_publish_claim_release_publishes_failed() {
+        let arena = arena();
+        let key = key();
+        let LiveLookup::Publish(claim) = arena.lookup(&key, key.guest_va_start(), 1234) else {
+            panic!("first lookup must claim the empty record");
+        };
+        drop(claim);
+
+        assert_eq!(
+            arena
+                .lookup(&key, key.guest_va_start(), 9999)
+                .private_reason(),
+            Some(LivePrivateReason::Failed)
+        );
+    }
+
+    #[test]
+    fn cross_view_claim_authority_is_rejected() {
+        let capacities = LiveArenaCapacities::new(PAGE * 4, PAGE, PAGE);
+        let layout =
+            LiveArenaControlLayout::new(capacities, PAGE as usize).expect("checked mapped layout");
+        let first_storage = RawControlStorage::new(layout.control_len());
+        let second_storage = RawControlStorage::new(layout.control_len());
+        let first = first_storage.initialize(layout, [0x11; 16]);
+        let second = second_storage.initialize(layout, [0x22; 16]);
+        let key = key();
+        let LiveLookup::Publish(claim) = first.lookup(&key, key.guest_va_start(), 1234) else {
+            panic!("first view must claim");
+        };
+        let reserved = claim.reserve(8, 8, 8).expect("reserved claim");
+
+        assert!(first.accepts_claim(&reserved));
+        assert!(!second.accepts_claim(&reserved));
     }
 }

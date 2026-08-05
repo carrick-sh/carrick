@@ -7,6 +7,10 @@
 //! nominal-RWX and unmapped before arena construction returns.
 
 use carrick_dsr::host::{ForkChildJit, JitRegion, NativeHostJit};
+use carrick_dsr_aarch64::live_arena::{
+    LIVE_ARENA_OBJECT_HEADER_BYTES, LiveArenaCapacities, LiveArenaControlLayout,
+    LiveTranslationArenaView,
+};
 use mach2::kern_return::{KERN_SUCCESS, kern_return_t};
 use mach2::mach_port::{mach_port_deallocate, mach_port_mod_refs};
 use mach2::memory_object_types::memory_object_size_t;
@@ -27,8 +31,7 @@ use std::ops::Range;
 use std::ptr::NonNull;
 
 pub const LIVE_ARENA_TRANSIT_SCHEMA_V1: u32 = 1;
-pub const LIVE_ARENA_PAYLOAD_OFFSET: usize = 64;
-const LIVE_OBJECT_HEADER_LEN: usize = LIVE_ARENA_PAYLOAD_OFFSET;
+const LIVE_OBJECT_HEADER_LEN: usize = LIVE_ARENA_OBJECT_HEADER_BYTES;
 const LIVE_OBJECT_MAGIC: [u8; 8] = *b"CRKLIVE\0";
 const LIVE_OBJECT_CODE: u32 = 1;
 const LIVE_OBJECT_CONTROL: u32 = 2;
@@ -580,20 +583,43 @@ pub struct DarwinLiveArena {
     code_len: usize,
     control_len: usize,
     nonce: [u8; 16],
+    control_layout: LiveArenaControlLayout,
 }
 
 impl DarwinLiveArena {
-    pub fn new(code_len: usize, control_len: usize) -> io::Result<Self> {
-        validate_arena_len("code", code_len)?;
-        validate_arena_len("control", control_len)?;
+    pub fn new(capacities: LiveArenaCapacities) -> io::Result<Self> {
+        let layout = LiveArenaControlLayout::new(capacities, host_page_size()?)
+            .map_err(|error| invalid_input(error.to_string()))?;
+        let code_len = layout.code_len();
+        let control_len = layout.control_len();
 
         let code_entry = create_code_memory_entry(code_len)?;
         let control_entry = create_control_memory_entry(control_len)?;
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce)
             .map_err(|error| io::Error::other(format!("generate live arena nonce: {error}")))?;
-        let arena = Self::map_entries(code_entry, control_entry, code_len, control_len, nonce)?;
+        let arena = Self::map_entries(
+            code_entry,
+            control_entry,
+            code_len,
+            control_len,
+            nonce,
+            layout,
+        )?;
         arena.write_object_headers()?;
+        // SAFETY: the creator owns the fresh control object exclusively, its
+        // RW mapping covers the canonical layout, and the arena retains that
+        // mapping beyond the temporary typed view.
+        unsafe {
+            LiveTranslationArenaView::initialize_in_place(
+                NonNull::new(arena.control_rw.base() as *mut u8)
+                    .ok_or_else(|| invalid_input("live control mapping is null"))?,
+                arena.control_len,
+                layout,
+                nonce,
+            )
+        }
+        .map_err(|error| invalid_input(error.to_string()))?;
         Ok(arena)
     }
 
@@ -623,7 +649,7 @@ impl DarwinLiveArena {
         let control_entry = registered
             .take(2)
             .ok_or_else(|| io::Error::other("registered live control slot is missing"))?;
-        let arena = Self::map_entries(
+        let arena = Self::map_adopted_entries(
             code_entry,
             control_entry,
             expected.code_len as usize,
@@ -631,6 +657,7 @@ impl DarwinLiveArena {
             expected.nonce,
         )?;
         arena.validate_object_headers(expected)?;
+        arena.validate_control_protocol(expected)?;
 
         let cleared = [
             registered.slots[0]
@@ -649,6 +676,7 @@ impl DarwinLiveArena {
         code_len: usize,
         control_len: usize,
         nonce: [u8; 16],
+        control_layout: LiveArenaControlLayout,
     ) -> io::Result<Self> {
         validate_arena_len("code", code_len)?;
         validate_arena_len("control", control_len)?;
@@ -674,6 +702,64 @@ impl DarwinLiveArena {
             code_len,
             control_len,
             nonce,
+            control_layout,
+        })
+    }
+
+    fn map_adopted_entries(
+        code_entry: MachSendRight,
+        control_entry: MachSendRight,
+        code_len: usize,
+        control_len: usize,
+        nonce: [u8; 16],
+    ) -> io::Result<Self> {
+        validate_arena_len("code", code_len)?;
+        validate_arena_len("control", control_len)?;
+        let code_rw = VmMapping::map_entry(&code_entry, code_len, VM_PROT_READ | VM_PROT_WRITE)?;
+        let code_rx = VmMapping::map_entry(&code_entry, code_len, VM_PROT_READ | VM_PROT_EXECUTE)?;
+        let control_rw =
+            VmMapping::map_entry(&control_entry, control_len, VM_PROT_READ | VM_PROT_WRITE)?;
+        let expected = LiveArenaTransitV1 {
+            schema: LIVE_ARENA_TRANSIT_SCHEMA_V1,
+            code_len: code_len as u64,
+            control_len: control_len as u64,
+            nonce,
+        };
+        validate_object_header(&code_rw, LIVE_OBJECT_CODE, expected)?;
+        validate_object_header(&control_rw, LIVE_OBJECT_CONTROL, expected)?;
+        let base = NonNull::new(control_rw.base() as *mut u8)
+            .ok_or_else(|| invalid_input("live control mapping is null"))?;
+        // SAFETY: both outer headers were validated before fixed-directory
+        // discovery; mappings remain owned by the returned arena.
+        let view = unsafe {
+            LiveTranslationArenaView::adopt_discovered_in_place(
+                base,
+                control_len,
+                code_len,
+                host_page_size()?,
+                nonce,
+            )
+        }
+        .map_err(|error| invalid_input(error.to_string()))?;
+        let control_layout = view.layout();
+        if code_rw.address == code_rx.address
+            || code_rw.address == control_rw.address
+            || code_rx.address == control_rw.address
+        {
+            return Err(io::Error::other(
+                "Mach returned overlapping live arena aliases",
+            ));
+        }
+        Ok(Self {
+            code_entry,
+            control_entry,
+            code_rw,
+            code_rx,
+            control_rw,
+            code_len,
+            control_len,
+            nonce,
+            control_layout,
         })
     }
 
@@ -686,6 +772,60 @@ impl DarwinLiveArena {
     fn validate_object_headers(&self, expected: LiveArenaTransitV1) -> io::Result<()> {
         validate_object_header(&self.code_rw, LIVE_OBJECT_CODE, expected)?;
         validate_object_header(&self.control_rw, LIVE_OBJECT_CONTROL, expected)
+    }
+
+    fn validate_control_protocol(&self, expected: LiveArenaTransitV1) -> io::Result<()> {
+        let base = NonNull::new(self.control_rw.base() as *mut u8)
+            .ok_or_else(|| invalid_input("live control mapping is null"))?;
+        // SAFETY: the outer transport headers and mapping lengths were checked
+        // first. The portable adopter reads only the fixed directory until it
+        // has rebuilt and validated the complete canonical layout.
+        let view = unsafe {
+            LiveTranslationArenaView::adopt_discovered_in_place(
+                base,
+                self.control_len,
+                self.code_len,
+                host_page_size()?,
+                expected.nonce,
+            )
+        }
+        .map_err(|error| invalid_input(error.to_string()))?;
+        if view.layout() != self.control_layout {
+            return Err(io::Error::other(
+                "adopted live control layout changed after validation",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns a portable protocol view dominated by this mapping owner.
+    ///
+    /// ```compile_fail
+    /// use carrick_dsr_aarch64::live_arena::LiveTranslationArenaView;
+    /// use carrick_native_darwin::live_arena::DarwinLiveArena;
+    ///
+    /// fn escape(arena: &DarwinLiveArena) -> LiveTranslationArenaView<'static> {
+    ///     arena.control_view().unwrap()
+    /// }
+    /// ```
+    pub fn control_view(&self) -> io::Result<LiveTranslationArenaView<'_>> {
+        let layout = self.control_layout();
+        let base = NonNull::new(self.control_rw.base() as *mut u8)
+            .ok_or_else(|| invalid_input("live control mapping is null"))?;
+        // SAFETY: this arena owns the validated mapping for the returned view's
+        // lifetime and only protocol atomics/payload cells mutate afterward.
+        unsafe {
+            LiveTranslationArenaView::adopt_in_place(base, self.control_len, layout, self.nonce)
+        }
+        .map_err(|error| invalid_input(error.to_string()))
+    }
+
+    pub fn control_layout(&self) -> LiveArenaControlLayout {
+        self.control_layout
+    }
+
+    pub fn code_payload_base(&self) -> usize {
+        self.control_layout().code_payload_base()
     }
 
     pub fn transit_v1(&self) -> LiveArenaTransitV1 {
@@ -705,22 +845,24 @@ impl DarwinLiveArena {
     }
 
     pub fn jit_region(&self, range: Range<usize>) -> io::Result<BorrowedLiveJitRegion<'_>> {
-        let capacity = checked_range(&range, self.code_len, "JIT subregion")?;
-        if range.start < LIVE_ARENA_PAYLOAD_OFFSET {
-            return Err(invalid_input(
-                "JIT subregion overlaps the live object header",
-            ));
-        }
+        let layout = self.control_layout();
+        let logical_capacity = usize::try_from(layout.capacities().code)
+            .map_err(|_| invalid_input("live code capacity exceeds usize"))?;
+        let capacity = checked_range(&range, logical_capacity, "JIT subregion")?;
+        let actual_start = layout
+            .code_payload_base()
+            .checked_add(range.start)
+            .ok_or_else(|| invalid_input("JIT subregion offset overflowed"))?;
         let write = self
             .code_rw
             .base()
-            .checked_add(range.start)
+            .checked_add(actual_start)
             .and_then(|address| NonNull::new(address as *mut u8))
             .ok_or_else(|| invalid_input("JIT write address overflowed"))?;
         let exec = self
             .code_rx
             .base()
-            .checked_add(range.start)
+            .checked_add(actual_start)
             .and_then(|address| NonNull::new(address as *mut u8))
             .ok_or_else(|| invalid_input("JIT exec address overflowed"))?;
         Ok(BorrowedLiveJitRegion {
@@ -772,11 +914,18 @@ impl DarwinLiveArena {
     }
 
     fn protect_rx(&self, range: Range<usize>, protection: vm_prot_t) -> io::Result<()> {
-        let len = checked_page_range(&range, self.code_len, "RX protection range")?;
+        let layout = self.control_layout();
+        let logical_capacity = usize::try_from(layout.capacities().code)
+            .map_err(|_| invalid_input("live code capacity exceeds usize"))?;
+        let len = checked_page_range(&range, logical_capacity, "RX protection range")?;
+        let actual_start = layout
+            .code_payload_base()
+            .checked_add(range.start)
+            .ok_or_else(|| invalid_input("RX protection offset overflowed"))?;
         let address = self
             .code_rx
             .address
-            .checked_add(range.start as u64)
+            .checked_add(actual_start as u64)
             .ok_or_else(|| invalid_input("RX protection address overflowed"))?;
         check_kr("mach_vm_protect live arena RX alias", unsafe {
             mach_vm_protect(mach_task_self(), address, len as u64, 0, protection)
@@ -1056,9 +1205,10 @@ fn write_pipe_byte(fd: libc::c_int, byte: u8) -> bool {
 mod tests {
     use super::*;
     use carrick_dsr::host::NativeHostJit;
+    use carrick_dsr_aarch64::live_arena::{LiveArenaCapacities, LiveArenaControlDirectoryV1};
     use std::ops::Range;
 
-    const CODE: Range<usize> = LIVE_ARENA_PAYLOAD_OFFSET..LIVE_ARENA_PAYLOAD_OFFSET + 8;
+    const CODE: Range<usize> = 0..8;
 
     fn page() -> usize {
         host_page_size().expect("valid Mach host page size")
@@ -1089,7 +1239,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn writer_and_rx_alias_execute_coherent_code() {
-        let arena = DarwinLiveArena::new(page() * 2, page()).expect("create live arena");
+        let arena = protocol_arena();
         let region = arena.jit_region(CODE).expect("code subregion");
         let jit = LiveArenaHostJit;
 
@@ -1108,16 +1258,15 @@ mod tests {
 
     #[test]
     fn memory_entry_maps_at_unrelated_addresses() {
-        assert!(DarwinLiveArena::new(0, page()).is_err());
-        assert!(DarwinLiveArena::new(page() + 1, page()).is_err());
-        let arena = DarwinLiveArena::new(page() * 2, page()).expect("create live arena");
+        assert!(DarwinLiveArena::new(LiveArenaCapacities::new(0, 0, 0)).is_err());
+        let arena = protocol_arena();
         assert_ne!(arena.code_entry.name, arena.control_entry.name);
         assert_ne!(arena.code_rw.base(), arena.code_rx.base());
         assert_ne!(arena.code_rw.base(), arena.control_rw.base());
         assert_ne!(arena.code_rx.base(), arena.control_rw.base());
         assert_eq!(arena.code_rw.len(), page() * 2);
         assert_eq!(arena.code_rx.len(), page() * 2);
-        assert_eq!(arena.control_rw.len(), page());
+        assert_eq!(arena.control_rw.len(), arena.control_layout().control_len());
         assert_eq!(
             mapping_protections_for_test(arena.code_rw.base()),
             Some((VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE))
@@ -1148,7 +1297,10 @@ mod tests {
         let transit = arena.transit_v1();
         assert_eq!(transit.schema, LIVE_ARENA_TRANSIT_SCHEMA_V1);
         assert_eq!(transit.code_len, (page() * 2) as u64);
-        assert_eq!(transit.control_len, page() as u64);
+        assert_eq!(
+            transit.control_len,
+            arena.control_layout().control_len() as u64
+        );
     }
 
     #[test]
@@ -1183,7 +1335,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn task_local_rx_revoke_does_not_revoke_parent() {
-        let arena = DarwinLiveArena::new(page() * 2, page()).expect("create live arena");
+        let arena = protocol_arena();
         let region = arena.jit_region(CODE).expect("code subregion");
         unsafe {
             std::ptr::copy_nonoverlapping(return_immediate(42).as_ptr(), write_ptr(&region), 8)
@@ -1207,7 +1359,7 @@ mod tests {
             }
             let mut status = 0;
             if arena.revoke_rx(0..page()).is_err()
-                || mapping_protections_for_test(arena.code_rx.base())
+                || mapping_protections_for_test(arena.code_rx.base() + arena.code_payload_base())
                     != Some((VM_PROT_NONE, VM_PROT_READ | VM_PROT_EXECUTE))
             {
                 status = 1;
@@ -1249,11 +1401,12 @@ mod tests {
             if status == 0
                 && (restore != Some(0x5a)
                     || arena.restore_rx_for_test(0..page()).is_err()
-                    || mapping_protections_for_test(arena.code_rx.base())
-                        != Some((
-                            VM_PROT_READ | VM_PROT_EXECUTE,
-                            VM_PROT_READ | VM_PROT_EXECUTE,
-                        )))
+                    || mapping_protections_for_test(
+                        arena.code_rx.base() + arena.code_payload_base(),
+                    ) != Some((
+                        VM_PROT_READ | VM_PROT_EXECUTE,
+                        VM_PROT_READ | VM_PROT_EXECUTE,
+                    )))
             {
                 status = 6;
             }
@@ -1292,7 +1445,7 @@ mod tests {
 
     #[test]
     fn drop_deallocates_aliases_and_send_rights() {
-        let arena = DarwinLiveArena::new(page() * 2, page()).expect("create live arena");
+        let arena = protocol_arena();
         let addresses = [
             arena.code_rw.base(),
             arena.code_rx.base(),
@@ -1332,19 +1485,120 @@ mod tests {
 
     #[test]
     fn subregion_exposes_matching_rw_and_rx_offsets() {
-        let arena = DarwinLiveArena::new(page() * 2, page()).expect("create live arena");
-        let range = page() + 32..page() + 96;
+        let arena = protocol_arena();
+        let range = 32..96;
         let region = arena.jit_region(range.clone()).expect("code subregion");
         assert_eq!(region.capacity(), range.len());
         assert_eq!(
             unsafe { write_ptr(&region) } as usize - arena.code_rw.base(),
-            range.start
+            arena.code_payload_base() + range.start
         );
         assert_eq!(
             unsafe { exec_ptr(&region) } as usize - arena.code_rx.base(),
-            range.start
+            arena.code_payload_base() + range.start
         );
-        assert!(arena.jit_region(page() * 2 - 4..page() * 2 + 4).is_err());
+        let capacity = arena.control_layout().capacities().code as usize;
+        assert!(arena.jit_region(capacity - 4..capacity + 4).is_err());
+    }
+
+    fn protocol_arena() -> DarwinLiveArena {
+        DarwinLiveArena::new(LiveArenaCapacities::new(
+            page() as u64,
+            page() as u64,
+            page() as u64,
+        ))
+        .expect("create mapped protocol arena")
+    }
+
+    fn remap_and_adopt_for_test(
+        source: &DarwinLiveArena,
+        expected: LiveArenaTransitV1,
+    ) -> io::Result<DarwinLiveArena> {
+        let adopted = DarwinLiveArena::map_adopted_entries(
+            source.code_entry.duplicate()?,
+            source.control_entry.duplicate()?,
+            expected.code_len as usize,
+            expected.control_len as usize,
+            expected.nonce,
+        )?;
+        adopted.validate_object_headers(expected)?;
+        adopted.validate_control_protocol(expected)?;
+        Ok(adopted)
+    }
+
+    unsafe fn protocol_directory_mut(
+        arena: &mut DarwinLiveArena,
+    ) -> &mut LiveArenaControlDirectoryV1 {
+        let address = arena
+            .control_rw
+            .base()
+            .checked_add(arena.control_layout().directory_offset())
+            .expect("directory address");
+        // SAFETY: tests hold the only protocol user while deliberately
+        // corrupting the initialized shared directory before adoption.
+        unsafe { &mut *(address as *mut LiveArenaControlDirectoryV1) }
+    }
+
+    #[test]
+    fn object_headers_do_not_overlap_protocol_payloads() {
+        let arena = protocol_arena();
+        let layout = arena.control_layout();
+
+        assert_eq!(layout.directory_offset(), LIVE_OBJECT_HEADER_LEN);
+        assert!(layout.records_offset() >= layout.directory_end());
+        assert!(arena.code_payload_base() >= LIVE_OBJECT_HEADER_LEN);
+        assert!(arena.code_payload_base().is_multiple_of(page()));
+        assert_eq!(
+            &unsafe { std::slice::from_raw_parts(arena.code_rw.base() as *const u8, 8) },
+            &LIVE_OBJECT_MAGIC,
+        );
+        assert_eq!(
+            &unsafe { std::slice::from_raw_parts(arena.control_rw.base() as *const u8, 8) },
+            &LIVE_OBJECT_MAGIC,
+        );
+    }
+
+    #[test]
+    fn logical_zero_code_offset_is_actual_host_page_aligned() {
+        let arena = protocol_arena();
+        let region = arena.jit_region(0..8).expect("logical code offset zero");
+        let write_offset = unsafe { write_ptr(&region) } as usize - arena.code_rw.base();
+        let exec_offset = unsafe { exec_ptr(&region) } as usize - arena.code_rx.base();
+
+        assert_eq!(write_offset, arena.code_payload_base());
+        assert_eq!(exec_offset, arena.code_payload_base());
+        assert!(write_offset.is_multiple_of(page()));
+    }
+
+    #[test]
+    fn adopt_rejects_control_layout_or_translator_abi_mismatch() {
+        let mut arena = protocol_arena();
+        let transit = arena.transit_v1();
+        unsafe { protocol_directory_mut(&mut arena) }.translator_abi =
+            carrick_dsr_aarch64::shared_cache::TRANSLATOR_ABI_CURRENT + 1;
+
+        assert!(remap_and_adopt_for_test(&arena, transit).is_err());
+
+        let mut arena = protocol_arena();
+        let transit = arena.transit_v1();
+        unsafe { protocol_directory_mut(&mut arena) }.control_len -= page() as u64;
+        assert!(remap_and_adopt_for_test(&arena, transit).is_err());
+    }
+
+    #[test]
+    fn adopt_rejects_bad_nonce_stride_alignment_or_overlap() {
+        let corruptions: [fn(&mut LiveArenaControlDirectoryV1); 4] = [
+            |directory| directory.nonce = [0xff; 16],
+            |directory| directory.record_stride += 64,
+            |directory| directory.records_offset += 1,
+            |directory| directory.hot_base = directory.records_offset,
+        ];
+        for corrupt in corruptions {
+            let mut arena = protocol_arena();
+            let transit = arena.transit_v1();
+            corrupt(unsafe { protocol_directory_mut(&mut arena) });
+            assert!(remap_and_adopt_for_test(&arena, transit).is_err());
+        }
     }
 
     fn mapping_protections_for_test(address: usize) -> Option<(vm_prot_t, vm_prot_t)> {
