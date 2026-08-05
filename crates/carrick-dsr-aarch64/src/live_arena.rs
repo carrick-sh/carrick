@@ -687,6 +687,35 @@ mod tests {
         record.state.store(state, Ordering::Release);
     }
 
+    fn malformed_ready_reason(
+        mutate: impl FnOnce(&mut LiveBlockPayloadV1),
+    ) -> Option<LivePrivateReason> {
+        let mut arena = arena();
+        let key = key();
+        let guest_start = key.guest_va_start();
+        let digest = key.live_digest().expect("live digest");
+        let initial = initial_slot(&digest, guest_start.raw());
+        let record = &mut arena.records[initial];
+        let mut payload = LiveBlockPayloadV1 {
+            unit_key_digest: digest,
+            guest_start: guest_start.raw(),
+            source_page: guest_start.raw(),
+            code_offset: 0,
+            code_len: 8,
+            entry_offset: 4,
+            hot_offset: 0,
+            hot_len: 8,
+            cold_offset: 0,
+            cold_len: 8,
+            code_sha256: [0x5a; 32],
+        };
+        mutate(&mut payload);
+        *record.payload.get_mut() = payload;
+        record.state.store(LIVE_BLOCK_READY, Ordering::Release);
+
+        arena.lookup(&key, guest_start, 1234).private_reason()
+    }
+
     fn publish_ready<'a>(
         arena: &'a LiveTranslationArena,
         key: &TranslationUnitKey,
@@ -795,6 +824,23 @@ mod tests {
             claim.reserve(u64::MAX - 3, 8, 8),
             Err(LivePrivateReason::InvalidRecord)
         ));
+    }
+
+    #[test]
+    fn record_rejects_misaligned_or_overflowing_extents() {
+        let misaligned = malformed_ready_reason(|payload| payload.code_offset = 1);
+        let overflowing = malformed_ready_reason(|payload| {
+            payload.code_offset = u64::MAX - (PAGE - 1);
+            payload.code_len = 16 * 1024;
+        });
+
+        assert_eq!(
+            [misaligned, overflowing],
+            [
+                Some(LivePrivateReason::InvalidRecord),
+                Some(LivePrivateReason::InvalidRecord),
+            ]
+        );
     }
 
     #[test]
