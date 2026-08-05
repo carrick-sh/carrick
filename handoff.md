@@ -274,7 +274,7 @@ sets the official absolute scoreboard to 10.1776x without converting that
 scoreboard movement into a causal lock-split claim.
 
 1. **Complete approved `NativeShape` Tasks 6–8 before capture or carry.** Tasks
-   1–5 now provide the typed capture/receipt and authenticated Rust v2 census,
+   1–5 now provide the typed capture/receipt and authenticated Rust v3 census,
    replacing the unauthenticated external Python classifier path. The strict
    determinant-locked pair comparator, freshness/source audit, final gates and
    independent review remain pending, as do all live captures and attribution

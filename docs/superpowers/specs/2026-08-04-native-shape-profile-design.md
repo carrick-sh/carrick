@@ -294,7 +294,7 @@ requires a clean, known census Git HEAD and hashes the executable running the
 census, so later parser fixes or re-analysis remain explicit rather than
 masquerading as the original classifier.
 
-The output schema is `carrick.jit-shape-census.v2`. It contains:
+The output schema is `carrick.jit-shape-census.v3`. It contains:
 
 - capture-receipt, raw-trace, snapshot-manifest, capture-binary, and
   census-binary identities;
@@ -303,18 +303,36 @@ The output schema is `carrick.jit-shape-census.v2`. It contains:
 - own/inherited JIT join coverage;
 - mutually exclusive instruction-family rows;
 - every exact `(family, instruction_word)` row without top-N truncation;
-- exact context rows by direction, slot, and physical register; and
-- a separately labelled exact-inserted overhead floor.
+- exact context rows by direction and complete first/optional-second operands;
+  and
+- a separately labelled lower bound on sampled Carrick-authored/source-exclusive
+  instruction words.
 
 Classification precedence is deterministic. The Rust classifier absorbs the
-active exact AArch64 families currently split across Rust and
-`scripts/perf/shape_classify.py`: 64/32-bit and pair context traffic,
-generation guards, aperture/window operations, bias operations, NZCV traffic,
-x17/x18 materialization, DSR-only x18 addressing, trusted transfers, and then
-coarse guest branch/load-store/arithmetic/SIMD families. Exact DSR families are
-labelled `inserted-exact`; coarse guest families are descriptive and never
-treated as removable Carrick overhead by themselves. Context rows remain
-separate so an aggregate cannot hide multiple source mechanisms.
+active exact AArch64 families once split across Rust and the deleted Python
+classifier: 64/32-bit and pair context traffic, generation guards,
+aperture/window operations, bias operations, NZCV traffic, x17/x18
+materialization, DSR-only x18 addressing, trusted transfers, and then coarse
+guest branch/load-store/arithmetic/SIMD families. Exact encodings are divided
+by evidence semantics: context 64/32/pair through physical x28, window
+UBFM/CBZ through physical x18, x18 materialization, exact x17 trusted branch,
+and x18-based loads/stores are `inserted-exact`; generation-guard LDAR, bias
+ORR, NZCV MSR/MRS, and x17 materialization are `exact-ambiguous` because a
+guest can produce the same instruction words. Coarse guest families are
+`guest-descriptive`. The `inserted_exact_floor` field sums only
+`inserted-exact` rows. It is a lower bound on sampled
+Carrick-authored/source-exclusive instruction words, not an extra-instruction
+count, removable-overhead claim, or projected speedup: an exact word such as
+`br-x17` can still implement required guest semantics. Source audit remains the
+carry gate.
+
+Each context row counts one sampled instruction once. A single load/store has
+one exact operand and no second operand. A pair decodes signed `imm7 * 8`, `Rt`,
+checked first-slot `+ 8`, and `Rt2` into two exact operands on the same row.
+Rows sort by the complete direction/operand key, and the validator reconstructs
+that compound map from every exact word row so changing either operand fails
+closed. The sum of context-row samples therefore remains equal to the union of
+context-family instruction samples without dropping pair semantics.
 
 Once Rust parity tests pass, `scripts/perf/shape_classify.py` is deleted. Old
 historical reports remain immutable and retain their original authority.
@@ -330,7 +348,7 @@ No imported ratio, traced elapsed time, or Docker time enters the census.
 
 ## Paired comparison and carry rule
 
-`jit-shape-compare` consumes two accepted v2 censuses and emits
+`jit-shape-compare` consumes two accepted v3 censuses and emits
 `carrick.jit-shape-comparison.v1`. It requires the same capture source, signed
 binary, D program, image digest, exact target argv, sampling frequency, and
 classifier binary/schema. Run IDs, raw hashes, and snapshot manifests must be
@@ -417,7 +435,7 @@ Implementation is red-first and must cover:
   fixtures, context-row disjointness, and all-CPU arithmetic;
 - deterministic census regeneration and two-run determinant/stability gates;
   and
-- rejection of `SHAPE1`, v1 census input, and the removed external JIT-share
+- rejection of `SHAPE1`, v1/v2 census input, and the removed external JIT-share
   argument.
 
 Before live evidence use, the implementation must pass focused CLI/runtime

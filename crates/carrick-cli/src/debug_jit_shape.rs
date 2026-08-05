@@ -25,11 +25,17 @@ pub(crate) enum Direction {
     Store,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ContextAccess {
-    direction: Direction,
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ContextOperandAccess {
     slot: i64,
     register: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ContextAccess {
+    direction: Direction,
+    first: ContextOperandAccess,
+    second: Option<ContextOperandAccess>,
 }
 
 #[derive(
@@ -38,6 +44,7 @@ struct ContextAccess {
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum EvidenceClass {
     InsertedExact,
+    ExactAmbiguous,
     GuestDescriptive,
 }
 
@@ -47,8 +54,8 @@ struct Classification {
     family: &'static str,
 }
 
-pub(crate) const CENSUS_SCHEMA: &str = "carrick.jit-shape-census.v2";
-pub(crate) const CLASSIFIER_SCHEMA: &str = "carrick.jit-shape-classifier.aarch64.v2";
+pub(crate) const CENSUS_SCHEMA: &str = "carrick.jit-shape-census.v3";
+pub(crate) const CLASSIFIER_SCHEMA: &str = "carrick.jit-shape-classifier.aarch64.v3";
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -106,17 +113,24 @@ pub(crate) struct WordRow {
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ContextRow {
-    pub(crate) direction: Direction,
+pub(crate) struct ContextOperand {
     pub(crate) slot: i64,
     pub(crate) physical_register: u8,
     pub(crate) semantic_label: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ContextRow {
+    pub(crate) direction: Direction,
+    pub(crate) first: ContextOperand,
+    pub(crate) second: Option<ContextOperand>,
     pub(crate) share: CensusShare,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct JitShapeCensusV2 {
+pub(crate) struct JitShapeCensusV3 {
     pub(crate) schema: String,
     pub(crate) capture_receipt_sha256: String,
     pub(crate) raw_trace_sha256: String,
@@ -132,7 +146,7 @@ pub(crate) struct JitShapeCensusV2 {
     pub(crate) contexts: Vec<ContextRow>,
 }
 
-impl JitShapeCensusV2 {
+impl JitShapeCensusV3 {
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         if self.schema != CENSUS_SCHEMA {
             bail!("JIT shape census schema is not {CENSUS_SCHEMA}");
@@ -213,7 +227,7 @@ impl JitShapeCensusV2 {
         }
 
         let mut word_family_counts = BTreeMap::<(EvidenceClass, &str), u64>::new();
-        let mut expected_context_counts = BTreeMap::<(Direction, i64, u8), u64>::new();
+        let mut expected_context_counts = BTreeMap::<ContextAccess, u64>::new();
         let mut previous_word = None;
         for row in &self.words {
             if row.family.is_empty() {
@@ -246,9 +260,7 @@ impl JitShapeCensusV2 {
             let is_context_family = is_context_family(&row.family);
             match (is_context_family, decode_context(row.word)) {
                 (true, Some(access)) => checked_increment(
-                    expected_context_counts
-                        .entry((access.direction, access.slot, access.register))
-                        .or_default(),
+                    expected_context_counts.entry(access).or_default(),
                     row.share.samples,
                     "expected census context total",
                 )?,
@@ -266,21 +278,25 @@ impl JitShapeCensusV2 {
             bail!("census word rows do not exactly reproduce family populations");
         }
 
-        let mut actual_context_counts = BTreeMap::<(Direction, i64, u8), u64>::new();
+        let mut actual_context_counts = BTreeMap::<ContextAccess, u64>::new();
         let mut previous_context = None;
         for row in &self.contexts {
-            let key = (row.direction, row.slot, row.physical_register);
+            let first = validate_context_operand(&row.first, "first")?;
+            let second = row
+                .second
+                .as_ref()
+                .map(|operand| validate_context_operand(operand, "second"))
+                .transpose()?;
+            let key = ContextAccess {
+                direction: row.direction,
+                first,
+                second,
+            };
             if previous_context
                 .as_ref()
                 .is_some_and(|previous| previous >= &key)
             {
                 bail!("census context rows are duplicate or out of order");
-            }
-            if row.physical_register > 31 {
-                bail!("census context physical register exceeds x31");
-            }
-            if row.semantic_label != context_semantic_label(row.slot) {
-                bail!("census context semantic label does not match its slot");
             }
             validate_share(&row.share, populations.jit_user, populations.all_cpu)?;
             if row.share.samples == 0 {
@@ -293,20 +309,20 @@ impl JitShapeCensusV2 {
             bail!("census context rows do not exactly reproduce context instruction evidence");
         }
 
-        let inserted_samples = checked_sum(
+        let source_exclusive_samples = checked_sum(
             family_counts
                 .iter()
                 .filter(|((class, _), _)| *class == EvidenceClass::InsertedExact)
                 .map(|(_, samples)| *samples),
-            "census inserted-exact floor",
+            "census source-exclusive exact floor",
         )?;
         validate_share(
             &self.inserted_exact_floor,
             populations.jit_user,
             populations.all_cpu,
         )?;
-        if self.inserted_exact_floor.samples != inserted_samples {
-            bail!("census inserted-exact floor includes or omits family samples");
+        if self.inserted_exact_floor.samples != source_exclusive_samples {
+            bail!("census source-exclusive exact floor includes or omits family samples");
         }
         Ok(())
     }
@@ -336,6 +352,30 @@ fn validate_sha256(value: &str, label: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_context_operand(
+    operand: &ContextOperand,
+    position: &str,
+) -> anyhow::Result<ContextOperandAccess> {
+    if operand.physical_register > 31 {
+        bail!("census {position} context physical register exceeds x31");
+    }
+    if operand.semantic_label != context_semantic_label(operand.slot) {
+        bail!("census {position} context semantic label does not match its slot");
+    }
+    Ok(ContextOperandAccess {
+        slot: operand.slot,
+        register: operand.physical_register,
+    })
+}
+
+fn context_operand(access: ContextOperandAccess) -> ContextOperand {
+    ContextOperand {
+        slot: access.slot,
+        physical_register: access.register,
+        semantic_label: context_semantic_label(access.slot).to_owned(),
+    }
+}
+
 fn decode_context64(word: u32) -> Option<ContextAccess> {
     let direction = match word & 0xffc0_03e0 {
         0xf940_0380 => Direction::Load,
@@ -344,8 +384,11 @@ fn decode_context64(word: u32) -> Option<ContextAccess> {
     };
     Some(ContextAccess {
         direction,
-        slot: i64::from(((word >> 10) & 0xfff) * 8),
-        register: (word & 0x1f) as u8,
+        first: ContextOperandAccess {
+            slot: i64::from(((word >> 10) & 0xfff) * 8),
+            register: (word & 0x1f) as u8,
+        },
+        second: None,
     })
 }
 
@@ -367,7 +410,8 @@ fn decode_context(word: u32) -> Option<ContextAccess> {
         0xa900_0380 => Direction::Store,
         _ => return None,
     };
-    let slot = if matches!(word & 0xffc0_03e0, 0xa940_0380 | 0xa900_0380) {
+    let is_pair = matches!(word & 0xffc0_03e0, 0xa940_0380 | 0xa900_0380);
+    let slot = if is_pair {
         let immediate = i64::from((word >> 15) & 0x7f);
         let signed = if immediate & 0x40 == 0 {
             immediate
@@ -378,10 +422,22 @@ fn decode_context(word: u32) -> Option<ContextAccess> {
     } else {
         i64::from(((word >> 10) & 0xfff) * 4)
     };
-    Some(ContextAccess {
-        direction,
+    let first = ContextOperandAccess {
         slot,
         register: (word & 0x1f) as u8,
+    };
+    let second = if is_pair {
+        Some(ContextOperandAccess {
+            slot: slot.checked_add(8)?,
+            register: ((word >> 10) & 0x1f) as u8,
+        })
+    } else {
+        None
+    };
+    Some(ContextAccess {
+        direction,
+        first,
+        second,
     })
 }
 
@@ -423,22 +479,22 @@ fn classify(word: u32) -> Classification {
     } else if matches!(word & 0xffc0_03e0, 0xa900_0380 | 0xa940_0380) {
         (EvidenceClass::InsertedExact, "ctx-pair")
     } else if (word & 0xffff_fc00) == 0xc8df_fc00 {
-        (EvidenceClass::InsertedExact, "guard-ldar")
+        (EvidenceClass::ExactAmbiguous, "guard-ldar")
     } else if (word & 0xffc0_001f) == 0xd340_0012 {
         (EvidenceClass::InsertedExact, "window-ubfm-x18")
     } else if (word & 0xff00_001f) == 0xb400_0012 {
         (EvidenceClass::InsertedExact, "window-cbz-x18")
     } else if matches!(word & 0xffff_fc00, 0xb257_0000 | 0xb251_0000) {
-        (EvidenceClass::InsertedExact, "bias-orr")
+        (EvidenceClass::ExactAmbiguous, "bias-orr")
     } else if (word & 0xffff_ffe0) == 0xd51b_4200 {
-        (EvidenceClass::InsertedExact, "nzcv-msr")
+        (EvidenceClass::ExactAmbiguous, "nzcv-msr")
     } else if (word & 0xffff_ffe0) == 0xd53b_4200 {
-        (EvidenceClass::InsertedExact, "nzcv-mrs")
+        (EvidenceClass::ExactAmbiguous, "nzcv-mrs")
     } else if matches!(
         word & 0xff80_001f,
         0x5280_0011 | 0x7280_0011 | 0xd280_0011 | 0xf280_0011
     ) {
-        (EvidenceClass::InsertedExact, "x17-materialize")
+        (EvidenceClass::ExactAmbiguous, "x17-materialize")
     } else if matches!(
         word & 0xff80_001f,
         0x5280_0012 | 0x7280_0012 | 0xd280_0012 | 0xf280_0012
@@ -553,7 +609,7 @@ fn build_authenticated_census(
     receipt_bytes: &[u8],
     snapshot_directory: &Path,
     census_identity: &CaptureIdentity,
-) -> anyhow::Result<JitShapeCensusV2> {
+) -> anyhow::Result<JitShapeCensusV3> {
     census_identity
         .validate()
         .context("validate census source/binary identity")?;
@@ -609,7 +665,7 @@ fn build_authenticated_census(
     let mut inherited_samples = 0_u64;
     let mut family_counts = BTreeMap::<(EvidenceClass, &'static str), u64>::new();
     let mut word_counts = BTreeMap::<(&'static str, u32), (EvidenceClass, u64)>::new();
-    let mut context_counts = BTreeMap::<(Direction, i64, u8), u64>::new();
+    let mut context_counts = BTreeMap::<ContextAccess, u64>::new();
 
     for sample in &raw.pc_samples {
         let resolved = snapshots
@@ -650,9 +706,7 @@ fn build_authenticated_census(
         let is_context_family = is_context_family(classification.family);
         match (is_context_family, decode_context(resolved.word)) {
             (true, Some(access)) => checked_increment(
-                context_counts
-                    .entry((access.direction, access.slot, access.register))
-                    .or_default(),
+                context_counts.entry(access).or_default(),
                 sample.count,
                 "context samples",
             )?,
@@ -691,12 +745,12 @@ fn build_authenticated_census(
         bail!("context rows do not equal the union of context families");
     }
 
-    let inserted_samples = checked_sum(
+    let source_exclusive_samples = checked_sum(
         family_counts
             .iter()
             .filter(|((class, _), _)| *class == EvidenceClass::InsertedExact)
             .map(|(_, samples)| *samples),
-        "inserted-exact floor",
+        "source-exclusive exact floor",
     )?;
     let families = family_counts
         .into_iter()
@@ -717,18 +771,15 @@ fn build_authenticated_census(
         .collect();
     let contexts = context_counts
         .into_iter()
-        .map(
-            |((direction, slot, physical_register), samples)| ContextRow {
-                direction,
-                slot,
-                physical_register,
-                semantic_label: context_semantic_label(slot).to_owned(),
-                share: census_share(samples, raw.jit_user, raw.all_cpu),
-            },
-        )
+        .map(|(access, samples)| ContextRow {
+            direction: access.direction,
+            first: context_operand(access.first),
+            second: access.second.map(context_operand),
+            share: census_share(samples, raw.jit_user, raw.all_cpu),
+        })
         .collect();
 
-    Ok(JitShapeCensusV2 {
+    Ok(JitShapeCensusV3 {
         schema: CENSUS_SCHEMA.to_owned(),
         capture_receipt_sha256: format!("{:x}", Sha256::digest(receipt_bytes)),
         raw_trace_sha256,
@@ -752,7 +803,7 @@ fn build_authenticated_census(
             inherited_samples,
             missing_samples: 0,
         },
-        inserted_exact_floor: census_share(inserted_samples, raw.jit_user, raw.all_cpu),
+        inserted_exact_floor: census_share(source_exclusive_samples, raw.jit_user, raw.all_cpu),
         families,
         words,
         contexts,
@@ -766,38 +817,38 @@ fn checked_sum(values: impl IntoIterator<Item = u64>, label: &str) -> anyhow::Re
     })
 }
 
-fn serialize_census(report: &JitShapeCensusV2) -> anyhow::Result<Vec<u8>> {
+fn serialize_census(report: &JitShapeCensusV3) -> anyhow::Result<Vec<u8>> {
     report.validate()?;
-    let mut bytes = serde_json::to_vec(report).context("serialize JIT shape census v2")?;
+    let mut bytes = serde_json::to_vec(report).context("serialize JIT shape census v3")?;
     bytes.push(b'\n');
     Ok(bytes)
 }
 
-pub(crate) fn parse_census_v2(bytes: &[u8]) -> anyhow::Result<JitShapeCensusV2> {
+pub(crate) fn parse_census_v3(bytes: &[u8]) -> anyhow::Result<JitShapeCensusV3> {
     if bytes.last() != Some(&b'\n') || bytes.iter().filter(|byte| **byte == b'\n').count() != 1 {
         bail!("JIT shape census must be exactly one newline-terminated JSON object");
     }
-    let report: JitShapeCensusV2 =
-        serde_json::from_slice(&bytes[..bytes.len() - 1]).context("parse JIT shape census v2")?;
+    let report: JitShapeCensusV3 =
+        serde_json::from_slice(&bytes[..bytes.len() - 1]).context("parse JIT shape census v3")?;
     report.validate()?;
     if serialize_census(&report)? != bytes {
-        bail!("JIT shape census is not canonical v2 output");
+        bail!("JIT shape census is not canonical v3 output");
     }
     Ok(report)
 }
 
 fn publish_census(
-    report: &JitShapeCensusV2,
+    report: &JitShapeCensusV3,
     output_path: Option<&Path>,
     stdout: &mut impl Write,
 ) -> anyhow::Result<()> {
     let bytes = serialize_census(report)?;
-    parse_census_v2(&bytes).context("self-validate published JIT shape census")?;
+    parse_census_v3(&bytes).context("self-validate published JIT shape census")?;
     let Some(path) = output_path else {
         stdout
             .write_all(&bytes)
-            .context("write JIT shape census v2 to stdout")?;
-        stdout.flush().context("flush JIT shape census v2 stdout")?;
+            .context("write JIT shape census v3 to stdout")?;
+        stdout.flush().context("flush JIT shape census v3 stdout")?;
         return Ok(());
     };
 
@@ -813,15 +864,15 @@ fn publish_census(
         let mut writer = BufWriter::new(temporary.as_file_mut());
         writer
             .write_all(&bytes)
-            .context("write JIT shape census v2 artifact")?;
+            .context("write JIT shape census v3 artifact")?;
         writer
             .flush()
-            .context("flush JIT shape census v2 artifact")?;
+            .context("flush JIT shape census v3 artifact")?;
     }
     temporary
         .as_file()
         .sync_all()
-        .context("sync JIT shape census v2 artifact")?;
+        .context("sync JIT shape census v3 artifact")?;
     temporary.persist_noclobber(path).map_err(|error| {
         if error.error.kind() == std::io::ErrorKind::AlreadyExists {
             anyhow!("JIT shape census output already exists: {}", path.display())
@@ -964,7 +1015,7 @@ mod tests {
             }
         }
 
-        fn build(&self) -> anyhow::Result<JitShapeCensusV2> {
+        fn build(&self) -> anyhow::Result<JitShapeCensusV3> {
             build_authenticated_census(&self.raw, &self.receipt, &self.snapshots, &self.identity)
         }
     }
@@ -1019,6 +1070,110 @@ mod tests {
         bytes
     }
 
+    fn census_fixture_with_words(words: &[u32]) -> CensusFixture {
+        let root = tempfile::tempdir().expect("census fixture root");
+        let snapshots = root.path().join("snapshots");
+        std::fs::create_dir(&snapshots).expect("create census snapshots");
+        write_v4_test_snapshot(&snapshots, "10-1", 10, 0x1000, words);
+        let identity = fixture_census_identity();
+        let authority = fixture_census_authority();
+        let samples = u64::try_from(words.len()).expect("fixture word population fits u64");
+        let pc_rows = words
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                format!(
+                    "NSHAPE2|pc|pid=10|pc={:#x}|count=1",
+                    0x1000_u64 + u64::try_from(index).unwrap() * 4
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let raw = format!(
+            "{}\nNSHAPE2|exit|pid=10|reason=1\nNSHAPE2|section=mode\nNSHAPE2|mode|kind=all|count={samples}\nNSHAPE2|mode|kind=user|count={samples}\nNSHAPE2|mode|kind=kernel|count=0\nNSHAPE2|mode|kind=invalid|count=0\nNSHAPE2|section=region\nNSHAPE2|region|kind=jit|count={samples}\nNSHAPE2|region|kind=non-jit|count=0\nNSHAPE2|section=pc\n{pc_rows}\nNSHAPE2|complete|bounded=0|target_completed=1|target_exit_reason=1|target_pid=10|admitted=1|exited=1|live_at_end=0|probe_errors=0\n",
+            authority.header_record().expect("fixture authority header")
+        )
+        .into_bytes();
+        let manifest = SnapshotSet::load(&snapshots)
+            .expect("load fixture snapshots")
+            .manifest()
+            .clone();
+        let receipt = NativeShapeCaptureReceipt {
+            schema: CAPTURE_SCHEMA.to_owned(),
+            outcome: CaptureOutcome::Accepted,
+            evidence_errors: Vec::new(),
+            authority_sha256: Some(authority.sha256().expect("fixture authority digest")),
+            authority: Some(authority),
+            raw_trace_sha256: Some(format!("{:x}", Sha256::digest(&raw))),
+            snapshot_manifest: Some(manifest),
+            counts: Some(NativeShapeCounts {
+                all_cpu: samples,
+                user_cpu: samples,
+                kernel_cpu: 0,
+                invalid_cpu: 0,
+                jit_user: samples,
+                non_jit_user: 0,
+                pc_rows: samples,
+                pc_samples: samples,
+            }),
+            lifecycle: Some(NativeShapeLifecycle {
+                bounded: false,
+                target_completed: true,
+                target_exit_reason: 1,
+                target_pid: 10,
+                admitted: 1,
+                exited: 1,
+                live_at_end: 0,
+                probe_errors: 0,
+            }),
+            drops: NativeShapeDrops::default(),
+        };
+        CensusFixture {
+            _root: root,
+            raw,
+            receipt: encode_fixture_receipt(&receipt),
+            snapshots,
+            identity,
+        }
+    }
+
+    #[test]
+    fn jit_shape_inserted_floor_excludes_guest_identical_exact_encodings() {
+        let fixture = census_fixture_with_words(&[
+            0xf942_3791, // source-exclusive x28-based context load
+            0xc8df_fe73, // guest-identical LDAR
+            0xb257_0013, // guest-identical ORR immediate
+            0xd51b_4211, // guest-identical MSR NZCV
+            0xd53b_4211, // guest-identical MRS NZCV
+            0xd280_0011, // guest-identical x17 materialization
+            0x1400_0000, // guest descriptive
+        ]);
+        let report = fixture.build().expect("build conservative floor fixture");
+
+        assert_eq!(report.words.len(), 7, "exact rows must remain complete");
+        assert_eq!(
+            report
+                .families
+                .iter()
+                .filter(|row| matches!(
+                    row.family.as_str(),
+                    "guard-ldar" | "bias-orr" | "nzcv-msr" | "nzcv-mrs" | "x17-materialize"
+                ))
+                .map(|row| row.share.samples)
+                .sum::<u64>(),
+            5,
+            "all guest-identical exact families must remain visible",
+        );
+        assert_eq!(
+            report.inserted_exact_floor.samples, 1,
+            "the floor may contain only the source-exclusive context load",
+        );
+        assert_eq!(
+            serde_json::to_string(&EvidenceClass::ExactAmbiguous).unwrap(),
+            "\"exact-ambiguous\"",
+        );
+    }
+
     #[test]
     fn jit_shape_rejects_non_aarch64_census_identity() {
         let mut fixture = CensusFixture::new();
@@ -1030,14 +1185,14 @@ mod tests {
     }
 
     #[test]
-    fn jit_shape_v2_report_has_complete_integer_populations_and_ordered_rows() {
+    fn jit_shape_v3_report_has_complete_integer_populations_and_ordered_rows() {
         let fixture = CensusFixture::new();
-        let report = fixture.build().expect("build authenticated v2 census");
+        let report = fixture.build().expect("build authenticated v3 census");
 
-        assert_eq!(report.schema, "carrick.jit-shape-census.v2");
+        assert_eq!(report.schema, "carrick.jit-shape-census.v3");
         assert_eq!(
             report.classifier_schema,
-            "carrick.jit-shape-classifier.aarch64.v2"
+            "carrick.jit-shape-classifier.aarch64.v3"
         );
         assert_eq!(report.populations.all_cpu, 10);
         assert_eq!(report.populations.jit_user, 4);
@@ -1094,23 +1249,26 @@ mod tests {
                 .map(|row| {
                     (
                         row.direction,
-                        row.slot,
-                        row.physical_register,
+                        row.first.slot,
+                        row.first.physical_register,
+                        row.second
+                            .as_ref()
+                            .map(|operand| (operand.slot, operand.physical_register)),
                         row.share.samples,
                     )
                 })
                 .collect::<Vec<_>>(),
             vec![
-                (Direction::Load, 1128, 17, 1),
-                (Direction::Store, 16, 17, 1),
+                (Direction::Load, 1128, 17, None, 1),
+                (Direction::Store, 16, 17, Some((24, 1)), 1),
             ]
         );
     }
 
     #[test]
-    fn jit_shape_v2_publication_is_one_deterministic_line_and_never_clobbers() {
+    fn jit_shape_v3_publication_is_one_deterministic_line_and_never_clobbers() {
         let fixture = CensusFixture::new();
-        let report = fixture.build().expect("build authenticated v2 census");
+        let report = fixture.build().expect("build authenticated v3 census");
         let mut first = Vec::new();
         let mut second = Vec::new();
         publish_census(&report, None, &mut first).expect("publish first census to stdout sink");
@@ -1139,7 +1297,7 @@ mod tests {
         let mut value: serde_json::Value =
             serde_json::from_slice(&first).expect("parse census JSON");
         value["unknown"] = true.into();
-        assert!(serde_json::from_value::<JitShapeCensusV2>(value).is_err());
+        assert!(serde_json::from_value::<JitShapeCensusV3>(value).is_err());
     }
 
     #[test]
@@ -1335,8 +1493,8 @@ mod tests {
     }
 
     #[test]
-    fn jit_shape_v2_validator_rejects_population_row_and_share_mutations() {
-        type Mutation = fn(&mut JitShapeCensusV2);
+    fn jit_shape_v3_validator_rejects_population_row_and_share_mutations() {
+        type Mutation = fn(&mut JitShapeCensusV3);
         let mutations: &[(&str, Mutation)] = &[
             ("schema", |report| {
                 report.schema = "carrick.jit-shape-census.v1".into()
@@ -1368,8 +1526,15 @@ mod tests {
                 report.contexts.push(report.contexts[0].clone())
             }),
             ("context redistributed", |report| {
-                report.contexts[0].slot = 1120;
-                report.contexts[0].semantic_label = context_semantic_label(1120).to_owned();
+                report.contexts[0].first.slot = 1120;
+                report.contexts[0].first.semantic_label = context_semantic_label(1120).to_owned();
+            }),
+            ("context second operand redistributed", |report| {
+                let second = report.contexts[1]
+                    .second
+                    .as_mut()
+                    .expect("fixture pair context row");
+                second.physical_register = 2;
             }),
             ("inserted floor", |report| {
                 report.inserted_exact_floor.samples += 1
@@ -1384,53 +1549,93 @@ mod tests {
     }
 
     #[test]
-    fn jit_shape_v2_strict_reader_requires_canonical_current_report() {
+    fn jit_shape_v3_strict_reader_requires_canonical_current_report() {
         let fixture = CensusFixture::new();
         let report = fixture.build().expect("valid report fixture");
         let bytes = serialize_census(&report).expect("serialize valid report fixture");
-        assert_eq!(parse_census_v2(&bytes).unwrap(), report);
+        assert_eq!(parse_census_v3(&bytes).unwrap(), report);
 
         let mut noncanonical = bytes.clone();
         noncanonical.insert(noncanonical.len() - 1, b' ');
-        assert!(parse_census_v2(&noncanonical).is_err());
+        assert!(parse_census_v3(&noncanonical).is_err());
 
         let old = b"{\"schema\":\"carrick.jit-shape-census.v1\"}\n";
-        assert!(parse_census_v2(old).is_err());
+        assert!(parse_census_v3(old).is_err());
     }
 
     #[test]
-    fn jit_shape_classifier_freezes_exact_inserted_masks_and_precedence() {
+    fn jit_shape_v3_rejects_prior_census_and_classifier_schemas() {
+        let fixture = CensusFixture::new();
+        let report = fixture.build().expect("valid current report fixture");
+        assert_eq!(report.schema, "carrick.jit-shape-census.v3");
+        assert_eq!(
+            report.classifier_schema,
+            "carrick.jit-shape-classifier.aarch64.v3"
+        );
+        let bytes = serialize_census(&report).expect("serialize current report fixture");
+        assert_eq!(parse_census_v3(&bytes).unwrap(), report);
+
+        for old in [
+            b"{\"schema\":\"carrick.jit-shape-census.v1\"}\n".as_slice(),
+            b"{\"schema\":\"carrick.jit-shape-census.v2\"}\n".as_slice(),
+        ] {
+            assert!(parse_census_v3(old).is_err());
+        }
+
+        let mut old_classifier = report;
+        old_classifier.classifier_schema = "carrick.jit-shape-classifier.aarch64.v2".into();
+        assert!(old_classifier.validate().is_err());
+    }
+
+    #[test]
+    fn jit_shape_classifier_freezes_exact_masks_evidence_and_precedence() {
         let inserted = [
-            (0xf902_3791, "ctx-store64"),
-            (0xf942_3791, "ctx-load64"),
-            (0xb902_3791, "ctx-store32"),
-            (0xb942_3791, "ctx-load32"),
-            (0xa900_0791, "ctx-pair"),
-            (0xa940_0791, "ctx-pair"),
-            (0xc8df_fe73, "guard-ldar"),
-            (0xd340_0012, "window-ubfm-x18"),
-            (0xb400_0012, "window-cbz-x18"),
-            (0xb257_0013, "bias-orr"),
-            (0xb251_0013, "bias-orr"),
-            (0xd51b_4211, "nzcv-msr"),
-            (0xd53b_4211, "nzcv-mrs"),
-            (0x5280_0011, "x17-materialize"),
-            (0x7280_0011, "x17-materialize"),
-            (0xd280_0011, "x17-materialize"),
-            (0xf280_0011, "x17-materialize"),
-            (0x5280_0012, "x18-materialize"),
-            (0x7280_0012, "x18-materialize"),
-            (0xd280_0012, "x18-materialize"),
-            (0xf280_0012, "x18-materialize"),
-            (0xd61f_0220, "br-x17"),
-            (0xf940_0240, "x18-based-ldst"),
-            (0xf900_0240, "x18-based-ldst"),
+            (0xf902_3791, EvidenceClass::InsertedExact, "ctx-store64"),
+            (0xf942_3791, EvidenceClass::InsertedExact, "ctx-load64"),
+            (0xb902_3791, EvidenceClass::InsertedExact, "ctx-store32"),
+            (0xb942_3791, EvidenceClass::InsertedExact, "ctx-load32"),
+            (0xa900_0791, EvidenceClass::InsertedExact, "ctx-pair"),
+            (0xa940_0791, EvidenceClass::InsertedExact, "ctx-pair"),
+            (0xc8df_fe73, EvidenceClass::ExactAmbiguous, "guard-ldar"),
+            (0xd340_0012, EvidenceClass::InsertedExact, "window-ubfm-x18"),
+            (0xb400_0012, EvidenceClass::InsertedExact, "window-cbz-x18"),
+            (0xb257_0013, EvidenceClass::ExactAmbiguous, "bias-orr"),
+            (0xb251_0013, EvidenceClass::ExactAmbiguous, "bias-orr"),
+            (0xd51b_4211, EvidenceClass::ExactAmbiguous, "nzcv-msr"),
+            (0xd53b_4211, EvidenceClass::ExactAmbiguous, "nzcv-mrs"),
+            (
+                0x5280_0011,
+                EvidenceClass::ExactAmbiguous,
+                "x17-materialize",
+            ),
+            (
+                0x7280_0011,
+                EvidenceClass::ExactAmbiguous,
+                "x17-materialize",
+            ),
+            (
+                0xd280_0011,
+                EvidenceClass::ExactAmbiguous,
+                "x17-materialize",
+            ),
+            (
+                0xf280_0011,
+                EvidenceClass::ExactAmbiguous,
+                "x17-materialize",
+            ),
+            (0x5280_0012, EvidenceClass::InsertedExact, "x18-materialize"),
+            (0x7280_0012, EvidenceClass::InsertedExact, "x18-materialize"),
+            (0xd280_0012, EvidenceClass::InsertedExact, "x18-materialize"),
+            (0xf280_0012, EvidenceClass::InsertedExact, "x18-materialize"),
+            (0xd61f_0220, EvidenceClass::InsertedExact, "br-x17"),
+            (0xf940_0240, EvidenceClass::InsertedExact, "x18-based-ldst"),
+            (0xf900_0240, EvidenceClass::InsertedExact, "x18-based-ldst"),
         ];
-        for (word, family) in inserted {
+        for (word, evidence_class, family) in inserted {
             assert_eq!(
                 classify(word),
                 Classification {
-                    evidence_class: EvidenceClass::InsertedExact,
+                    evidence_class,
                     family,
                 },
                 "word {word:#010x}"
@@ -1438,27 +1643,86 @@ mod tests {
         }
 
         let one_bit_neighbors = [
-            (0xf902_3791 ^ (1 << 26), "ctx-store64"),
-            (0xf942_3791 ^ (1 << 26), "ctx-load64"),
-            (0xb902_3791 ^ (1 << 26), "ctx-store32"),
-            (0xb942_3791 ^ (1 << 26), "ctx-load32"),
-            (0xa900_0791 ^ (1 << 26), "ctx-pair"),
-            (0xc8df_fe73 ^ (1 << 10), "guard-ldar"),
-            (0xd340_0012 ^ (1 << 22), "window-ubfm-x18"),
-            (0xb400_0012 ^ (1 << 24), "window-cbz-x18"),
-            (0xb257_0013 ^ (1 << 10), "bias-orr"),
-            (0xd51b_4211 ^ (1 << 5), "nzcv-msr"),
-            (0xd53b_4211 ^ (1 << 5), "nzcv-mrs"),
-            (0xd280_0011 ^ 1, "x17-materialize"),
-            (0xd280_0012 ^ 1, "x18-materialize"),
-            (0xd61f_0220 ^ 1, "br-x17"),
-            (0xf940_0240 ^ (1 << 5), "x18-based-ldst"),
+            (
+                0xf902_3791 ^ (1 << 26),
+                EvidenceClass::InsertedExact,
+                "ctx-store64",
+            ),
+            (
+                0xf942_3791 ^ (1 << 26),
+                EvidenceClass::InsertedExact,
+                "ctx-load64",
+            ),
+            (
+                0xb902_3791 ^ (1 << 26),
+                EvidenceClass::InsertedExact,
+                "ctx-store32",
+            ),
+            (
+                0xb942_3791 ^ (1 << 26),
+                EvidenceClass::InsertedExact,
+                "ctx-load32",
+            ),
+            (
+                0xa900_0791 ^ (1 << 26),
+                EvidenceClass::InsertedExact,
+                "ctx-pair",
+            ),
+            (
+                0xc8df_fe73 ^ (1 << 10),
+                EvidenceClass::ExactAmbiguous,
+                "guard-ldar",
+            ),
+            (
+                0xd340_0012 ^ (1 << 22),
+                EvidenceClass::InsertedExact,
+                "window-ubfm-x18",
+            ),
+            (
+                0xb400_0012 ^ (1 << 24),
+                EvidenceClass::InsertedExact,
+                "window-cbz-x18",
+            ),
+            (
+                0xb257_0013 ^ (1 << 10),
+                EvidenceClass::ExactAmbiguous,
+                "bias-orr",
+            ),
+            (
+                0xd51b_4211 ^ (1 << 5),
+                EvidenceClass::ExactAmbiguous,
+                "nzcv-msr",
+            ),
+            (
+                0xd53b_4211 ^ (1 << 5),
+                EvidenceClass::ExactAmbiguous,
+                "nzcv-mrs",
+            ),
+            (
+                0xd280_0011 ^ 1,
+                EvidenceClass::ExactAmbiguous,
+                "x17-materialize",
+            ),
+            (
+                0xd280_0012 ^ 1,
+                EvidenceClass::InsertedExact,
+                "x18-materialize",
+            ),
+            (0xd61f_0220 ^ 1, EvidenceClass::InsertedExact, "br-x17"),
+            (
+                0xf940_0240 ^ (1 << 5),
+                EvidenceClass::InsertedExact,
+                "x18-based-ldst",
+            ),
         ];
-        for (word, excluded_family) in one_bit_neighbors {
+        for (word, excluded_class, excluded_family) in one_bit_neighbors {
             let observed = classify(word);
             assert!(
-                observed.evidence_class != EvidenceClass::InsertedExact
-                    || observed.family != excluded_family,
+                observed
+                    != Classification {
+                        evidence_class: excluded_class,
+                        family: excluded_family,
+                    },
                 "one-bit neighbor {word:#010x} stayed in {excluded_family}"
             );
         }
@@ -1506,18 +1770,23 @@ mod tests {
     #[test]
     fn jit_shape_context_decoder_covers_64_32_and_pair_rows() {
         let cases = [
-            (0xf942_3791, Direction::Load, 1128_i64, 17),
-            (0xf902_3791, Direction::Store, 1128, 17),
-            (0xb942_3791, Direction::Load, 564, 17),
-            (0xb902_3791, Direction::Store, 564, 17),
-            (0xa941_0791, Direction::Load, 16, 17),
-            (0xa901_0791, Direction::Store, 16, 17),
+            (0xf942_3791, Direction::Load, (1128_i64, 17), None),
+            (0xf902_3791, Direction::Store, (1128, 17), None),
+            (0xb942_3791, Direction::Load, (564, 17), None),
+            (0xb902_3791, Direction::Store, (564, 17), None),
+            (0xa941_0791, Direction::Load, (16, 17), Some((24, 1))),
+            (0xa901_0791, Direction::Store, (16, 17), Some((24, 1))),
+            (0xa97f_8b83, Direction::Load, (-8, 3), Some((0, 2))),
         ];
-        for (word, direction, slot, register) in cases {
+        for (word, direction, first, second) in cases {
             let access = decode_context(word).expect("exact context access");
+            let observed_first = (access.first.slot, access.first.register);
+            let observed_second = access
+                .second
+                .map(|operand| (operand.slot, operand.register));
             assert_eq!(
-                (access.direction, access.slot, access.register),
-                (direction, slot, register),
+                (access.direction, observed_first, observed_second),
+                (direction, first, second),
                 "word {word:#010x}"
             );
         }
@@ -1610,7 +1879,7 @@ mod tests {
         for &(word, count) in &samples {
             let classification = classify(word);
             let prefix = match classification.evidence_class {
-                EvidenceClass::InsertedExact => "dsr",
+                EvidenceClass::InsertedExact | EvidenceClass::ExactAmbiguous => "dsr",
                 EvidenceClass::GuestDescriptive => "guest",
             };
             let family = format!("{prefix}:{}", classification.family);
