@@ -9,8 +9,9 @@ use super::artifact_spike::{
     ArtifactRecord, ArtifactRecording, GatewayKind, MaterializedValue, ProcessValue,
 };
 use super::block::{BlockPlan, PlannedExit};
+use super::live_arena::ReadyLiveCodeOffset;
 use super::types::{CacheOffset, CacheVa, CodeGeneration, DsrError, InstAction};
-use carrick_dsr::cache::{PublishedCode, TranslationCache};
+use carrick_dsr::cache::{LinkSite, PublishedCode, TranslationCache};
 
 const _: () = assert!(carrick_dsr::address::INVALID_BIASED_HOST_ADDRESS_BIT == 1 << 47);
 pub const BIASED_FAST_ADDRESS_BITS: u32 = 41;
@@ -117,6 +118,7 @@ pub struct EmittedBlock {
     /// links may target it because eager link severing (Phase 2a)
     /// invalidates links when their target's page bumps.
     trusted_entry: Option<CacheOffset>,
+    immutable_shared_source: bool,
 }
 
 struct AssembledBlock {
@@ -130,6 +132,7 @@ struct AssembledBlock {
     direct_links: Vec<DirectLink>,
     recovery: Vec<RecoveryEntry>,
     trusted_entry: Option<CacheOffset>,
+    immutable_shared_source: bool,
 }
 
 fn direct_instruction_bytes_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
@@ -146,6 +149,58 @@ fn direct_instruction_bytes_enabled() -> bool {
             std::env::var_os("CARRICK_DSR_DIRECT_BYTES").as_deref(),
         )
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SharedSourceState {
+    Building,
+    Ready,
+}
+
+/// Return the direct `B` word a BUILDING shared source may install before
+/// READY. The target token can only come from an acquired, validated READY
+/// live record; its process-local address is derived from the caller's local
+/// arena mapping and never stored in portable metadata.
+pub(crate) fn shared_initial_direct_link_word(
+    source_state: SharedSourceState,
+    target: Option<ReadyLiveCodeOffset>,
+    arena_rx_base: HostVa,
+    site: LinkSite,
+) -> Result<Option<u32>, DsrError> {
+    if source_state == SharedSourceState::Ready {
+        return Ok(None);
+    }
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    let target_offset = target.entry_offset_in_arena().ok_or_else(|| {
+        DsrError::CachePolicy("shared direct-link target offset overflow".to_string())
+    })?;
+    let target_offset = usize::try_from(target_offset).map_err(|_| {
+        DsrError::CachePolicy("shared direct-link target offset exceeds usize".to_string())
+    })?;
+    let target_raw = arena_rx_base
+        .raw()
+        .checked_add(target_offset)
+        .ok_or_else(|| {
+            DsrError::CachePolicy("shared direct-link target address overflow".to_string())
+        })?;
+    let target = CacheVa::published(HostVa(target_raw));
+
+    let source_raw = site
+        .source
+        .host()
+        .raw()
+        .checked_add(site.slot.get() as usize)
+        .ok_or_else(|| DsrError::CachePolicy("direct-link source overflow".to_string()))?;
+    let displacement = (target.host().raw() as i128) - (source_raw as i128);
+    if displacement % 4 == 0 {
+        let words = displacement / 4;
+        if !(-(1_i128 << 25)..(1_i128 << 25)).contains(&words) {
+            return Ok(None);
+        }
+    }
+    crate::translator::encode_aarch64_direct_branch(site, target).map(Some)
 }
 
 impl AssembledBlock {
@@ -174,6 +229,7 @@ impl AssembledBlock {
             direct_links: self.direct_links,
             recovery: self.recovery,
             trusted_entry: self.trusted_entry,
+            immutable_shared_source: self.immutable_shared_source,
         })
     }
 }
@@ -188,6 +244,13 @@ impl AssembledBlock {
 pub struct GenerationGuard {
     address: u64,
     expected: CodeGeneration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GenerationEntry {
+    Unguarded,
+    PrivateAbsolute(GenerationGuard),
+    SharedInitial,
 }
 
 impl GenerationGuard {
@@ -447,6 +510,7 @@ impl EmittedBlock {
             // Recorded templates carry the native trusted entry (replay
             // validates the baked expected generation before honoring it).
             trusted_entry,
+            immutable_shared_source: false,
         })
     }
 
@@ -473,14 +537,34 @@ impl EmittedBlock {
     }
 
     pub fn direct_links(&self) -> &[DirectLink] {
-        &self.direct_links
+        if self.immutable_shared_source {
+            &[]
+        } else {
+            &self.direct_links
+        }
+    }
+
+    /// Drain the only mutable view of a shared source's link sites while the
+    /// arena record is still BUILDING. After this handoff the sites cannot be
+    /// placed in a later mutable-source index.
+    pub fn take_shared_initial_direct_links(&mut self) -> Vec<DirectLink> {
+        if self.immutable_shared_source {
+            std::mem::take(&mut self.direct_links)
+        } else {
+            Vec::new()
+        }
     }
 
     pub fn recovery(&self) -> &[RecoveryEntry] {
         &self.recovery
     }
 
-    pub fn into_runtime_metadata(self) -> (Vec<PcMapEntry>, Vec<DirectLink>, Vec<RecoveryEntry>) {
+    pub fn into_runtime_metadata(
+        mut self,
+    ) -> (Vec<PcMapEntry>, Vec<DirectLink>, Vec<RecoveryEntry>) {
+        if self.immutable_shared_source {
+            self.direct_links.clear();
+        }
         (self.map.into_entries(), self.direct_links, self.recovery)
     }
 }
@@ -4456,7 +4540,7 @@ pub fn emit_block(
     plan: &BlockPlan,
     mode: EmitAddressMode,
 ) -> Result<EmittedBlock, DsrError> {
-    assemble_block_inner(plan, None, mode, None)?.publish(cache)
+    assemble_block_inner(plan, GenerationEntry::Unguarded, mode, None)?.publish(cache)
 }
 
 pub fn emit_block_direct(
@@ -4472,7 +4556,7 @@ pub fn emit_block_with_generation(
     guard: GenerationGuard,
     mode: EmitAddressMode,
 ) -> Result<EmittedBlock, DsrError> {
-    assemble_block_inner(plan, Some(guard), mode, None)?.publish(cache)
+    assemble_block_inner(plan, GenerationEntry::PrivateAbsolute(guard), mode, None)?.publish(cache)
 }
 
 pub fn emit_block_recording_artifact(
@@ -4501,7 +4585,12 @@ pub fn emit_block_recording_artifact_optional(
     if let EmitAddressMode::Biased { host_bias } = mode {
         recording.bind(ProcessValue::HostBias, host_bias.get())?;
     }
-    let assembled = assemble_block_inner(plan, Some(guard), mode, Some(&mut recording))?;
+    let assembled = assemble_block_inner(
+        plan,
+        GenerationEntry::PrivateAbsolute(guard),
+        mode,
+        Some(&mut recording),
+    )?;
     let artifact = recording
         .finish(
             assembled.instruction_words(),
@@ -4511,6 +4600,39 @@ pub fn emit_block_recording_artifact_optional(
             source_words,
         )
         .ok();
+    let emitted = assembled.publish(cache)?;
+    Ok((emitted, artifact))
+}
+
+/// Assemble one immutable generation-zero block and publish that byte stream
+/// exactly once into the caller-provided cache. The caller owns the cache's
+/// backing reservation; this layer neither emits into the private cache nor
+/// replays a serialized artifact into the destination.
+pub fn emit_block_recording_shared_initial(
+    cache: &mut TranslationCache,
+    plan: &BlockPlan,
+    mode: EmitAddressMode,
+    source_words: Vec<u32>,
+) -> Result<(EmittedBlock, ArtifactRecord), DsrError> {
+    let mut recording = ArtifactRecording::default();
+    if let EmitAddressMode::Biased { host_bias } = mode {
+        recording.bind(ProcessValue::HostBias, host_bias.get())?;
+    }
+    let assembled = assemble_block_inner(
+        plan,
+        GenerationEntry::SharedInitial,
+        mode,
+        Some(&mut recording),
+    )?;
+    // Validate the portable artifact before making executable code visible.
+    // Unlike the private optional-recording path, a shared relocation is a
+    // hard policy error, never silent recording ineligibility.
+    let artifact = recording.finish_shared_initial(
+        assembled.instruction_words(),
+        assembled.map.entries().to_vec(),
+        assembled.recovery.clone(),
+        source_words,
+    )?;
     let emitted = assembled.publish(cache)?;
     Ok((emitted, artifact))
 }
@@ -5367,10 +5489,16 @@ fn emit_exclusive_region(
 )]
 fn assemble_block_inner(
     plan: &BlockPlan,
-    guard: Option<GenerationGuard>,
+    entry: GenerationEntry,
     mode: EmitAddressMode,
     mut recording: Option<&mut ArtifactRecording>,
 ) -> Result<AssembledBlock, DsrError> {
+    if entry == GenerationEntry::SharedInitial && plan.generation != CodeGeneration::INITIAL {
+        return Err(DsrError::CachePolicy(format!(
+            "shared INITIAL emission refuses generation {}",
+            plan.generation.get()
+        )));
+    }
     #[cfg(feature = "alloc-owner-census")]
     let _owner = crate::alloc_owner_census::scope(
         crate::alloc_owner_wire::AllocationOwner::BlockAssemblerTransient,
@@ -5404,8 +5532,48 @@ fn assemble_block_inner(
     // many blocks per gateway entry.
     let mut trusted_entry: Option<CacheOffset> = None;
     let lean_guard = lean_generation_guard_enabled();
+    let shared_initial = entry == GenerationEntry::SharedInitial;
+    let guard = match entry {
+        GenerationEntry::PrivateAbsolute(guard) => Some(guard),
+        GenerationEntry::Unguarded | GenerationEntry::SharedInitial => None,
+    };
     let stale = guard.map(|_| assembler.new_dynamic_label());
-    if !lean_guard {
+    if shared_initial {
+        let offset = current_offset(&assembler)?;
+        if offset.get() != 0 {
+            return Err(DsrError::CachePolicy(format!(
+                "shared INITIAL trusted suffix starts at nonzero offset {}",
+                offset.get()
+            )));
+        }
+        trusted_entry = Some(offset);
+        if let Some(recording) = recording.as_deref_mut() {
+            recording.record_trusted_entry(offset, CodeGeneration::INITIAL.get())?;
+        }
+        emit_word(
+            &mut assembler,
+            &mut entries,
+            plan.start,
+            0xd280_0011, // movz x17, #0 (CodeGeneration::INITIAL)
+        )?;
+        map_next(&assembler, &mut entries, plan.start)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; str x17, [x28, super::gateway::CTX_GENERATION]
+        );
+        map_next(&assembler, &mut entries, plan.start)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; ldr x17, [x28, #1128]
+        );
+        record_recovery_range(
+            &mut recovery,
+            offset,
+            current_offset(&assembler)?,
+            RecoveryAction::RestoreGuestX17,
+        );
+    }
+    if !shared_initial && !lean_guard {
         // x17 is the internal indirect-edge register. Its guest value is saved
         // at every block exit and restored before either the generation guard
         // or the first guest instruction executes.
@@ -5668,7 +5836,7 @@ fn assemble_block_inner(
             );
         }
     }
-    if lean_guard {
+    if !shared_initial && lean_guard {
         // x17 is the internal indirect-edge register, and the guard above
         // spends it. Its guest value is saved at every block exit and is
         // restored here, before the first guest instruction executes.
@@ -6483,6 +6651,7 @@ fn assemble_block_inner(
         map,
         direct_links,
         recovery,
+        immutable_shared_source: shared_initial,
     })
 }
 
@@ -7031,6 +7200,174 @@ mod tests {
         }
     }
 
+    fn shared_initial_direct_plan() -> BlockPlan {
+        BlockPlan {
+            start: GuestVa(0x4000),
+            end: GuestVa(0x4004),
+            generation: CodeGeneration::INITIAL,
+            instructions: Vec::new(),
+            exit: PlannedExit::Direct {
+                guest: GuestVa(0x4000),
+                word: 0x1400_0400,
+                exit: DirectExit {
+                    kind: DirectKind::Branch,
+                    target: GuestVa(0x5000),
+                    resume: GuestVa(0x4004),
+                    condition: None,
+                    register: None,
+                    bit: None,
+                },
+            },
+            extensions: Vec::new(),
+        }
+    }
+
+    fn assemble_shared_initial_for_test(
+        plan: &BlockPlan,
+        recording: Option<&mut ArtifactRecording>,
+    ) -> AssembledBlock {
+        assemble_block_inner(
+            plan,
+            GenerationEntry::SharedInitial,
+            EmitAddressMode::Direct,
+            recording,
+        )
+        .expect("assemble shared INITIAL fixture")
+    }
+
+    mod shared_initial {
+        use super::*;
+
+        #[test]
+        fn shared_initial_entry_is_private_trusted_suffix_without_guard() {
+            let assembled = assemble_shared_initial_for_test(&copy_plan(), None);
+            assert_eq!(assembled.trusted_entry, Some(CacheOffset::published(0)));
+            assert_eq!(
+                &assembled.words[..3],
+                &[
+                    0xD280_0011, // movz x17, #0 (INITIAL)
+                    0xF902_3F91, // str x17, [x28, #CTX_GENERATION]
+                    0xF942_3791, // ldr x17, [x28, #1128]
+                ]
+            );
+        }
+
+        #[test]
+        fn shared_initial_emission_has_no_process_relocations() {
+            let mut recording = ArtifactRecording::default();
+            let assembled = assemble_shared_initial_for_test(&copy_plan(), Some(&mut recording));
+            let record = recording
+                .finish_shared_initial(
+                    assembled.instruction_words(),
+                    assembled.map.entries().to_vec(),
+                    assembled.recovery.clone(),
+                    Vec::new(),
+                )
+                .expect("finish shared INITIAL recording");
+            assert_eq!(record.template.metadata_counts().relocations, 0);
+
+            let mut invalid = ArtifactRecording::default();
+            invalid
+                .record_trusted_entry(CacheOffset::published(0), CodeGeneration::INITIAL.get())
+                .expect("record shared trusted entry");
+            invalid
+                .record_mov_wide(
+                    CacheOffset::published(0),
+                    17,
+                    MaterializedValue::Process(ProcessValue::GenerationAddress, 0x1000),
+                )
+                .expect("record forbidden process relocation");
+            let error = invalid
+                .finish_shared_initial(Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                .expect_err("shared artifact must reject process relocation");
+            assert!(
+                matches!(error, DsrError::CachePolicy(ref message) if message.contains("1 process relocation")),
+                "unexpected shared relocation error: {error:?}"
+            );
+        }
+
+        #[test]
+        fn shared_initial_emission_preserves_generation_publish_and_guest_x17() {
+            let assembled = assemble_shared_initial_for_test(&copy_plan(), None);
+            assert_eq!(
+                &assembled.words[..3],
+                &[0xD280_0011, 0xF902_3F91, 0xF942_3791]
+            );
+            assert!(
+                assembled.recovery[..3]
+                    .iter()
+                    .all(|entry| entry.action == RecoveryAction::RestoreGuestX17)
+            );
+        }
+
+        #[test]
+        fn shared_ready_source_is_never_patchable() {
+            let mut recording = ArtifactRecording::default();
+            let assembled = assemble_shared_initial_for_test(
+                &shared_initial_direct_plan(),
+                Some(&mut recording),
+            );
+            let record = recording
+                .finish_shared_initial(
+                    assembled.instruction_words(),
+                    assembled.map.entries().to_vec(),
+                    assembled.recovery.clone(),
+                    Vec::new(),
+                )
+                .expect("finish shared direct-link recording");
+            assert!(record.template.direct_links().is_empty());
+        }
+
+        #[test]
+        fn building_source_can_bind_only_an_already_ready_shared_target() {
+            let assembled = assemble_shared_initial_for_test(&shared_initial_direct_plan(), None);
+            let link = assembled
+                .direct_links
+                .first()
+                .copied()
+                .expect("direct fixture emits a link");
+            let source = CacheVa::published(HostVa(0x1000_0000));
+            let site = LinkSite {
+                source,
+                slot: link.slot,
+            };
+            let target = CacheVa::published(HostVa(0x1000_1000));
+            assert!(
+                shared_initial_direct_link_word(
+                    SharedSourceState::Building,
+                    None,
+                    source.host(),
+                    site,
+                )
+                .expect("missing target is a stub")
+                .is_none()
+            );
+            assert!(
+                shared_initial_direct_link_word(
+                    SharedSourceState::Ready,
+                    Some(ReadyLiveCodeOffset::for_test(0x1000, 0)),
+                    source.host(),
+                    site,
+                )
+                .expect("READY source is immutable")
+                .is_none()
+            );
+            assert_eq!(
+                shared_initial_direct_link_word(
+                    SharedSourceState::Building,
+                    Some(ReadyLiveCodeOffset::for_test(0x1000, 0)),
+                    source.host(),
+                    site,
+                )
+                .expect("BUILDING source binds READY target"),
+                Some(
+                    crate::translator::encode_aarch64_direct_branch(site, target)
+                        .expect("reachable branch")
+                )
+            );
+        }
+    }
+
     #[cfg(feature = "alloc-owner-census")]
     #[test]
     fn allocation_owner_block_assembly_splits_transient_map_and_recovery_storage() {
@@ -7048,7 +7385,10 @@ mod tests {
 
         let assembled = assemble_block_inner(
             &plan,
-            Some(GenerationGuard::new(&generation, CodeGeneration::INITIAL)),
+            GenerationEntry::PrivateAbsolute(GenerationGuard::new(
+                &generation,
+                CodeGeneration::INITIAL,
+            )),
             EmitAddressMode::Direct,
             None,
         )
@@ -7125,9 +7465,13 @@ mod tests {
     /// deliberately mapped to `plan.start`, the same guest PC the first copied
     /// instruction carries.
     fn guarded_prologue_words(guard: GenerationGuard) -> Vec<u32> {
-        let assembled =
-            assemble_block_inner(&copy_plan(), Some(guard), EmitAddressMode::Direct, None)
-                .expect("assemble guarded block");
+        let assembled = assemble_block_inner(
+            &copy_plan(),
+            GenerationEntry::PrivateAbsolute(guard),
+            EmitAddressMode::Direct,
+            None,
+        )
+        .expect("assemble guarded block");
         let first_guest = assembled
             .words
             .iter()
@@ -7166,8 +7510,13 @@ mod tests {
             },
             extensions: Vec::new(),
         };
-        let assembled = assemble_block_inner(&plan, None, EmitAddressMode::Direct, None)
-            .expect("assemble single-virtual fixture block");
+        let assembled = assemble_block_inner(
+            &plan,
+            GenerationEntry::Unguarded,
+            EmitAddressMode::Direct,
+            None,
+        )
+        .expect("assemble single-virtual fixture block");
         (assembled, plan)
     }
 
@@ -7318,7 +7667,7 @@ mod tests {
         let generation = std::sync::atomic::AtomicU64::new(7);
         let assembled = assemble_block_inner(
             &copy_plan(),
-            Some(GenerationGuard::new(
+            GenerationEntry::PrivateAbsolute(GenerationGuard::new(
                 &generation,
                 CodeGeneration::claimed(7),
             )),
@@ -7356,12 +7705,17 @@ mod tests {
         ] {
             let generation = std::sync::atomic::AtomicU64::new(0);
             let guard = GenerationGuard::new(&generation, CodeGeneration::INITIAL);
-            let native = assemble_block_inner(&plan, Some(guard), EmitAddressMode::Direct, None)
-                .expect("assemble native block");
+            let native = assemble_block_inner(
+                &plan,
+                GenerationEntry::PrivateAbsolute(guard),
+                EmitAddressMode::Direct,
+                None,
+            )
+            .expect("assemble native block");
             let mut recording = ArtifactRecording::default();
             let recorded = assemble_block_inner(
                 &plan,
-                Some(guard),
+                GenerationEntry::PrivateAbsolute(guard),
                 EmitAddressMode::Direct,
                 Some(&mut recording),
             )
@@ -7425,8 +7779,13 @@ mod tests {
             },
             extensions: Vec::new(),
         };
-        let assembled = assemble_block_inner(&plan, None, EmitAddressMode::Direct, None)
-            .expect("assemble adr block");
+        let assembled = assemble_block_inner(
+            &plan,
+            GenerationEntry::Unguarded,
+            EmitAddressMode::Direct,
+            None,
+        )
+        .expect("assemble adr block");
         let expected = [
             0xD292_9013, // movz x19, #0x9480
             0xF2C0_0093, // movk x19, #4, lsl #32
@@ -7521,8 +7880,13 @@ mod tests {
             },
             extensions: Vec::new(),
         };
-        let assembled = assemble_block_inner(&plan, None, EmitAddressMode::Direct, None)
-            .expect("assemble virtual indirect target");
+        let assembled = assemble_block_inner(
+            &plan,
+            GenerationEntry::Unguarded,
+            EmitAddressMode::Direct,
+            None,
+        )
+        .expect("assemble virtual indirect target");
         let words = &assembled.words;
 
         // The virtualized target (guest x19) loads straight into
@@ -7574,8 +7938,13 @@ mod tests {
             },
             extensions: Vec::new(),
         };
-        let assembled = assemble_block_inner(&plan, None, EmitAddressMode::Direct, None)
-            .expect("assemble lean indirect exit");
+        let assembled = assemble_block_inner(
+            &plan,
+            GenerationEntry::Unguarded,
+            EmitAddressMode::Direct,
+            None,
+        )
+        .expect("assemble lean indirect exit");
         let words = &assembled.words;
 
         // Exactly ONE unconditional spill: x15 to slot 1160. No up-front x16
@@ -7687,8 +8056,13 @@ mod tests {
     #[test]
     fn terminal_virtual_condition_never_crosses_darwin_x18() {
         let plan = direct_plan(virtual_test_bit_exit(GuestVa(0x4000), GuestVa(0x5000)));
-        let assembled = assemble_block_inner(&plan, None, EmitAddressMode::Direct, None)
-            .expect("assemble virtual conditional exit");
+        let assembled = assemble_block_inner(
+            &plan,
+            GenerationEntry::Unguarded,
+            EmitAddressMode::Direct,
+            None,
+        )
+        .expect("assemble virtual conditional exit");
         let words = &assembled.words;
         let stable_staging = [
             0xf940_4f91, // ldr x17, [x28, #152] — guest x19
@@ -7745,8 +8119,13 @@ mod tests {
     fn fused_virtual_condition_never_crosses_darwin_x18() {
         let mut plan = fused_two_segment_plan();
         plan.exit = virtual_test_bit_exit(GuestVa(0x4004), GuestVa(0x5000));
-        let assembled = assemble_block_inner(&plan, None, EmitAddressMode::Direct, None)
-            .expect("assemble fused virtual conditional edge");
+        let assembled = assemble_block_inner(
+            &plan,
+            GenerationEntry::Unguarded,
+            EmitAddressMode::Direct,
+            None,
+        )
+        .expect("assemble fused virtual conditional edge");
         let words = &assembled.words;
         let stable_staging = [
             0xf902_3791, // str x17, [x28, #1128] — recovery guest x17
@@ -7956,7 +8335,7 @@ mod tests {
             carrick_dsr::address::NativeHostBias::new(bias, 0x4000).expect("aligned test bias");
         let assembled = assemble_block_inner(
             &biased_memory_plan(memory),
-            None,
+            GenerationEntry::Unguarded,
             EmitAddressMode::Biased { host_bias },
             None,
         )
@@ -7979,8 +8358,13 @@ mod tests {
     fn assemble_biased_emission(plan: &BlockPlan, bias: u64) -> AssembledBlock {
         let host_bias =
             carrick_dsr::address::NativeHostBias::new(bias, 0x4000).expect("aligned test bias");
-        assemble_block_inner(plan, None, EmitAddressMode::Biased { host_bias }, None)
-            .expect("assemble biased memory fixture")
+        assemble_block_inner(
+            plan,
+            GenerationEntry::Unguarded,
+            EmitAddressMode::Biased { host_bias },
+            None,
+        )
+        .expect("assemble biased memory fixture")
     }
 
     fn biased_guest_words(assembled: &AssembledBlock, guest: GuestVa) -> Vec<u32> {
@@ -8739,23 +9123,43 @@ mod tests {
         vec![
             (
                 "branch",
-                assemble_block_inner(&branch, None, EmitAddressMode::Direct, None)
-                    .expect("assemble branch recovery fixture"),
+                assemble_block_inner(
+                    &branch,
+                    GenerationEntry::Unguarded,
+                    EmitAddressMode::Direct,
+                    None,
+                )
+                .expect("assemble branch recovery fixture"),
             ),
             (
                 "call",
-                assemble_block_inner(&call, None, EmitAddressMode::Direct, None)
-                    .expect("assemble call recovery fixture"),
+                assemble_block_inner(
+                    &call,
+                    GenerationEntry::Unguarded,
+                    EmitAddressMode::Direct,
+                    None,
+                )
+                .expect("assemble call recovery fixture"),
             ),
             (
                 "conditional",
-                assemble_block_inner(&conditional, None, EmitAddressMode::Direct, None)
-                    .expect("assemble conditional recovery fixture"),
+                assemble_block_inner(
+                    &conditional,
+                    GenerationEntry::Unguarded,
+                    EmitAddressMode::Direct,
+                    None,
+                )
+                .expect("assemble conditional recovery fixture"),
             ),
             (
                 "continue",
-                assemble_block_inner(&continuation, None, EmitAddressMode::Direct, None)
-                    .expect("assemble continuation recovery fixture"),
+                assemble_block_inner(
+                    &continuation,
+                    GenerationEntry::Unguarded,
+                    EmitAddressMode::Direct,
+                    None,
+                )
+                .expect("assemble continuation recovery fixture"),
             ),
         ]
     }
@@ -8866,8 +9270,13 @@ mod tests {
     #[test]
     fn fused_segment_edge_falls_through_in_two_words_without_saving_guest_x17() {
         let plan = fused_two_segment_plan();
-        let assembled = assemble_block_inner(&plan, None, EmitAddressMode::Direct, None)
-            .expect("assemble fused block");
+        let assembled = assemble_block_inner(
+            &plan,
+            GenerationEntry::Unguarded,
+            EmitAddressMode::Direct,
+            None,
+        )
+        .expect("assemble fused block");
         let words = &assembled.words;
 
         // Anchor on the relocated conditional rather than a fixed index: the
@@ -8941,8 +9350,13 @@ mod tests {
         let generation = std::sync::atomic::AtomicU64::new(CodeGeneration::INITIAL.get());
         let guard = GenerationGuard::new(&generation, CodeGeneration::INITIAL);
         let count_acquires = |plan: &BlockPlan| {
-            let assembled = assemble_block_inner(plan, Some(guard), EmitAddressMode::Direct, None)
-                .expect("assemble guarded block");
+            let assembled = assemble_block_inner(
+                plan,
+                GenerationEntry::PrivateAbsolute(guard),
+                EmitAddressMode::Direct,
+                None,
+            )
+            .expect("assemble guarded block");
             assembled
                 .words
                 .iter()
@@ -8975,9 +9389,14 @@ mod tests {
             word,
             op: bad64::Op::B_NE,
         };
-        let error = assemble_block_inner(&plan, None, EmitAddressMode::Direct, None)
-            .err()
-            .expect("a non-conditional fused edge must be rejected");
+        let error = assemble_block_inner(
+            &plan,
+            GenerationEntry::Unguarded,
+            EmitAddressMode::Direct,
+            None,
+        )
+        .err()
+        .expect("a non-conditional fused edge must be rejected");
         assert!(
             format!("{error:?}").contains("not a direct branch"),
             "unexpected error: {error:?}"

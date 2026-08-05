@@ -164,6 +164,29 @@ pub struct LiveBlockExtents {
     pub cold: LiveReservation,
 }
 
+/// Offset-only authority for an entry whose record has already been acquired
+/// and validated in READY. Keeping the local mapping address out of this type
+/// prevents process pointers from leaking into the arena wire protocol.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReadyLiveCodeOffset {
+    code_offset: u64,
+    entry_offset: u32,
+}
+
+impl ReadyLiveCodeOffset {
+    pub fn entry_offset_in_arena(self) -> Option<u64> {
+        self.code_offset.checked_add(u64::from(self.entry_offset))
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(code_offset: u64, entry_offset: u32) -> Self {
+        Self {
+            code_offset,
+            entry_offset,
+        }
+    }
+}
+
 /// Caller-supplied metadata and bytes for one reserved BUILDING record. The
 /// code bytes are authenticated here before the immutable digest reaches the
 /// wire record; reservation extents come only from the consuming claim.
@@ -537,6 +560,16 @@ impl ValidatedLiveBlock<'_> {
         self.payload.entry_offset
     }
 
+    /// Return offset-only direct-link authority. This method exists only on a
+    /// value produced after acquiring and validating READY, so BUILDING and
+    /// malformed records cannot be mistaken for bindable targets.
+    pub fn ready_code_offset(&self) -> ReadyLiveCodeOffset {
+        ReadyLiveCodeOffset {
+            code_offset: self.extents.code.offset,
+            entry_offset: self.payload.entry_offset,
+        }
+    }
+
     #[cfg(test)]
     fn record_snapshot(&self) -> LiveRecordSnapshot {
         LiveRecordSnapshot {
@@ -747,6 +780,11 @@ mod tests {
         assert_eq!(ready.source_page(), key.guest_va_start().raw());
         assert_eq!(ready.extents(), published.extents());
         assert_eq!(ready.entry_offset(), 4);
+        assert_eq!(
+            ready.ready_code_offset().entry_offset_in_arena(),
+            ready.extents().code.offset.checked_add(4),
+            "READY link authority remains offset-only and names the validated entry"
+        );
     }
 
     #[test]

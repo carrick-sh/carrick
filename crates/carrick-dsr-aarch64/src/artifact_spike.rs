@@ -1211,6 +1211,39 @@ impl ArtifactRecording {
         )?;
         Ok(ArtifactRecord { template, bindings })
     }
+
+    /// Finish metadata for code that will become an immutable shared INITIAL
+    /// block. Shared code cannot carry any process-derived materialization:
+    /// there is no replay step in which a later process could rebind it.
+    /// Direct-link sites are deliberately omitted from the portable record;
+    /// the BUILDING publisher may consume its private copy before READY, but a
+    /// shared source must never re-enter a mutable link index afterward.
+    pub fn finish_shared_initial(
+        self,
+        words: Vec<u32>,
+        map: Vec<PcMapEntry>,
+        recovery: Vec<RecoveryEntry>,
+        source_words: Vec<u32>,
+    ) -> Result<ArtifactRecord, DsrError> {
+        if !self.relocations.is_empty() {
+            return Err(DsrError::CachePolicy(format!(
+                "shared INITIAL artifact retains {} process relocation(s)",
+                self.relocations.len()
+            )));
+        }
+        if self.trusted_entry
+            != Some(TrustedEntryTemplate {
+                offset: 0,
+                expected: 0,
+            })
+        {
+            return Err(DsrError::CachePolicy(
+                "shared INITIAL artifact must expose generation-zero trusted entry at offset zero"
+                    .to_string(),
+            ));
+        }
+        self.finish(words, map, recovery, Vec::new(), source_words)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
