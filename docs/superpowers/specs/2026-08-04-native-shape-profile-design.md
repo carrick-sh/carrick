@@ -388,7 +388,7 @@ The implementation keeps three units with distinct responsibilities:
    program, authority rendering, strict `NSHAPE2` parser, and dedicated receipt.
 2. **Snapshot/join authority:** one reusable Rust module for strict v4 snapshot
    loading, deterministic manifests, fork ancestry, and exact PC resolution.
-3. **Census/comparison:** AArch64 word classification, deterministic v2 report,
+3. **Census/comparison:** AArch64 word classification, deterministic v3 report,
    and paired comparison commands.
 
 The existing `debug_jit_shape.rs` is refactored only enough to establish these
