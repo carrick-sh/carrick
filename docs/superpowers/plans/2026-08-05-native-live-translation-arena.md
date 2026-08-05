@@ -56,6 +56,14 @@
 
 ### Task 2: Add the offset-only live-arena protocol and zero-wait state machine
 
+> Historical completed-slice record for Tasks 2–4: every V1 protocol,
+> `LiveArenaTransitV1`, `NativeGuestExecV1`, `NativeReexecLiveArenaV1`,
+> 131,072 x 192-byte table, and per-block cursor instruction in those tasks
+> describes the first substrate only. Do not execute or retain those V1
+> instructions: the measured Task 6C1 census rejected that allocator, and
+> authoritative Task 6B3 replaces every affected portable, Darwin, runtime,
+> and outer-capsule layer with V2 and deletes the V1 path.
+
 **Files:**
 
 - Add: `crates/carrick-dsr-aarch64/src/live_arena.rs`
@@ -396,7 +404,7 @@
 
 > **Execution split:** the Task 6 preflight proved the portable record/cursor
 > state is process-private and the original monolithic checklist cannot be
-> integrated soundly. Execute authoritative Tasks 6A–6F in
+> integrated soundly. Execute authoritative Tasks 6A–6B3, 6C1–6C2, and 6D–6F in
 > [`2026-08-05-native-live-translation-arena-task6.md`](2026-08-05-native-live-translation-arena-task6.md).
 > The checklist below remains the Task 6 completion rollup.
 
@@ -427,7 +435,7 @@
   cargo test -p carrick-dsr-aarch64 live_block -- --nocapture
   ```
 
-- [ ] Add `live_arena: Option<Arc<LiveArenaProcessView>>`, a shared published index, and a source-page slab catalog to `ProcessState`. Configure them from `NativeMappedMemory::configure_shared_translation` only when `CARRICK_DSR_LIVE_ARENA=compiler` and the exact unit-key policy matches.
+- [ ] Add `live_arena: Option<Arc<LiveArenaProcessView>>`, a shared published index, and a source-page/group hint with descriptor-authoritative chunk enumeration to `ProcessState`. Configure them from `NativeMappedMemory::configure_shared_translation` only when `CARRICK_DSR_LIVE_ARENA=compiler` and the exact unit-key policy matches.
 - [ ] Add a lifetime-bound `LiveArenaTranslationCache<'arena>` in the Darwin
   host crate. Construct it only by joining a checked
   `BorrowedLiveJitRegion<'arena>` with the unique Task-2 reservation
@@ -440,7 +448,7 @@
   ```rust
   pub enum PublishedCodeKind {
       Private,
-      LiveArena { slab: LiveSlabId },
+      LiveArena { group: LiveSourceGroupId, chunk: LiveChunkId },
   }
 
   pub enum PublishedBlockMetadata {
@@ -451,8 +459,8 @@
   ```
 
 - [ ] Extend `private_published_index` with a separate address-sorted live index. `published_block_containing` searches both, and `guest_pc_for_cache` decodes the shared cold stream only on fault/kick.
-- [ ] At the top of the INITIAL-generation miss path, query the exact live record. A READY record validates hash/bounds/key, derives the local RX entry, installs target authority and metadata, and returns `TranslationOutcome::LiveArena` without touching `self.cache`. BUILDING/FAILED/CAS loss continues immediately to the unchanged private path.
-- [ ] A CAS winner plans once, refuses sensitive metadata, reserves extents, emits once into the shared subregion, validates the source generation again, publishes metadata and READY, then installs its own local READY record through the same consumer path. If generation moved or any step fails, mark FAILED and privately translate.
+- [ ] At the top of the INITIAL-generation miss path, perform only the read-only exact READY lookup. A READY record validates hash/bounds/key, derives the local RX entry, installs target authority and metadata, and returns `TranslationOutcome::LiveArena` without touching `self.cache`.
+- [ ] On a read-only miss, plan once and reject regenerated, cross-page, sensitive, exclusive, or unsupported shapes before shared mutation. Then call B3 `claim_eligible`: recheck the same-domain generation, resolve/create the exact source group, recheck generation again, and only then CAS the block. BUILDING/FAILED/CAS loss continues immediately to the unchanged private path. The unique block winner prepares once, reserves exact extents, emits once into the shared subregion, performs every Task 6B generation/metadata/flush proof, publishes READY, then installs its own local record through the same consumer path. Any failure marks only an acquired claim FAILED and privately translates.
 - [ ] The winner first creates `PreparedSharedInitial`, then reserves its exact
   code/HOT/COLD lengths. While it still owns both the unique BUILDING claim and
   the prepared source, it may prebind only a branch-reachable target capability
@@ -495,13 +503,13 @@
 
 - [ ] Add red tests named:
 
-  - `guest_write_revokes_only_matching_source_page_slabs`
+  - `guest_write_revokes_only_matching_source_page_chunks`
   - `mprotect_munmap_and_remap_share_the_revocation_seam`
-  - `instruction_abort_in_revoked_slab_recovers_guest_pc_privately`
-  - `data_abort_in_revoked_slab_is_not_consumed`
+  - `instruction_abort_in_revoked_chunk_recovers_guest_pc_privately`
+  - `data_abort_in_revoked_chunk_is_not_consumed`
   - `instruction_abort_in_foreign_prot_none_range_is_not_consumed`
   - `mismatched_pc_and_far_is_not_consumed`
-  - `fork_child_rebuilds_revoked_slab_catalog_before_guest_entry`
+  - `fork_child_rebuilds_revoked_chunk_catalog_before_guest_entry`
   - `in_process_exec_drops_retired_live_ranges`
 
 - [ ] Run and prove red:
@@ -511,7 +519,7 @@
   RUST_TEST_THREADS=1 cargo test -p carrick-runtime live_revoke -- --nocapture
   ```
 
-- [ ] Add one callback from every `PageGenerationTable::note_guest_code_write` owner into `LiveArenaProcessView::revoke_source_range`. Index guest 16 KiB source pages to all local RX extents containing their shared blocks, deduplicate extents, and call Darwin `mach_vm_protect(PROT_NONE)` once per active extent.
+- [ ] Add one callback from every `PageGenerationTable::note_guest_code_write` owner into `LiveArenaProcessView::revoke_source_range`. For the mutated guest 16 KiB source page, enumerate every ACTIVE descriptor owned by every locally executable exact group, including multiple chunks and multiple unit digests. The descriptor table is authority; any process-local catalog is only a validated hint and cannot omit later expansion. Deduplicate exact 64 KiB local RX chunks and call Darwin `mach_vm_protect(PROT_NONE)` once per active chunk.
 - [ ] Keep revocation task-local. Do not write a shared FAILED/REVOKED state and do not change another process's generation or protection.
 - [ ] Implement the exact classifier:
 
@@ -526,11 +534,11 @@
       if !matches!(ec, 0x20 | 0x21) || pc != far {
           return None;
       }
-      self.revoked_slab_containing(pc)?.recover(pc)
+      self.revoked_chunk_containing(pc)?.recover(pc)
   }
   ```
 
-- [ ] On a classified stale abort, use the lazy live metadata to restore the guest snapshot, set the guest PC, remove the stale live block from process/thread lookup indexes, and run the normal private translation path against the newly observed generation. Do not remap or reactivate the revoked slab.
+- [ ] On a classified stale abort, use the lazy live metadata to restore the guest snapshot, set the guest PC, remove the stale live block from process/thread lookup indexes, and run the normal private translation path against the newly observed generation. Do not remap or reactivate the revoked chunk.
 - [ ] Add live tests that execute from the revoked alias and assert the C signal snapshot retains exact ESR, FAR, and PC. Preserve the current C shim unless the test proves one field is missing.
 - [ ] Run:
 
@@ -570,7 +578,7 @@
 - [ ] Add red serialization tests proving every counter appears once in the `resolver-process` NATIVEPERF frame and round-trips through the parser.
 - [ ] Extend `ResolverStats`, `ResolverStat::ALL`, `ProfileSnapshot`, and serialization with the twelve counters named in the design. Use saturating accounting and process deltas exactly like existing shared-unit counters.
 - [ ] Add typed USDT outcomes for claim win, CAS loss, READY hit, private fallback, validation refusal, and revocation. Add `TraceProfileKind::DsrLiveArena`, its authenticated `scripts/dtrace/dsr-live-arena.d` program, typed parser, and zero-event rejection; do not add a standalone harness.
-- [ ] Add LLDB export structures with stable `repr(C)` headers and magic/version fields. Extend `scripts/carrick_lldb.py` with `xlat-live-arena` to print mappings, READY records, revoked slabs, and cache-PC to guest-PC recovery from a live process or core. It must not import or modify an arena.
+- [ ] Add LLDB export structures with stable `repr(C)` headers and magic/version fields. Extend `scripts/carrick_lldb.py` with `xlat-live-arena` to print mappings, READY records, revoked chunks, and cache-PC to guest-PC recovery from a live process or core. It must not import or modify an arena.
 - [ ] Run:
 
   ```bash
@@ -649,7 +657,7 @@
 
   Record child CPU, workload wall, self CPU, system/user split, READY hits,
   publish wins/losses, BUILDING fallbacks, private translations, code bytes,
-  metadata bytes, and revoked slabs.
+  metadata bytes, and revoked chunks.
 
 - [ ] Compute geometric-mean ratios and confidence intervals. Retain only if child CPU and wall ratios are each at most 0.90 and each confidence interval is below 1.00.
 - [ ] Run the compute, filesystem, startup, 20-exec, and workload-spread sentinels. Reject any sentinel regression above 3% unless repeated attribution proves unrelated noise.
@@ -725,8 +733,8 @@
   authenticated arena rights in slots 1/2, and clears only those typed slots
   after adoption.
 - [x] A consumer maps at an arbitrary address and executes coherent code.
-- [ ] Source mutation revokes only the calling task's matching RX slabs.
-- [ ] Only exact revoked-slab instruction aborts are recovered.
+- [ ] Source mutation revokes only the calling task's matching RX chunks.
+- [ ] Only exact revoked-chunk instruction aborts are recovered.
 - [ ] Sensitive and regenerated blocks remain private.
 - [ ] LLDB works live and from a core; the interface is export-only.
 - [ ] `RUST_TEST_THREADS=1 just ci`, signed smoke, and conformance pass.
