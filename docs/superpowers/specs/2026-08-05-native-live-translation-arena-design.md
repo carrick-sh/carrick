@@ -239,12 +239,32 @@ for that final consuming publication, but
 `BorrowedLiveJitRegion<'arena>` intentionally cannot escape as the by-value
 `JitRegion` retained by `TranslationCache::from_region`: doing that would erase
 the arena lifetime and unique-writer reservation authority. The Darwin
-integration therefore owns a lifetime-bound `LiveArenaTranslationCache<'arena>`
-bridge. Its private constructor joins a checked borrowed RW/RX view with the
-Task-2 reservation capability, its inner cache targets exactly that range, and
-it exposes only a temporary mutable cache borrow to the emitter. The bridge and
-all published address handles remain dominated by the process-level arena
-owner.
+integration therefore owns a lifetime-bound, private
+`LiveArenaTranslationCache<'arena, 'claim>` bridge. Its private constructor
+joins a checked borrowed RW/RX view with the Task-2 reservation capability and
+its inner cache targets exactly that range. It does **not** expose `&mut
+TranslationCache` through a public closure or HRTB: safe callback code could
+use `mem::replace` to extract the lifetime-erased cache. Instead its sole
+private operation consumes `PreparedSharedInitial`, invokes the emitter inside
+the Darwin module, verifies exact cache consumption, and drops the inner cache
+before returning no address-bearing emitter value. The bridge and all
+published address handles remain dominated by the process-level arena owner.
+
+The protocol crate owns the sole READY store while the downstream Darwin crate
+owns the mappings, and Rust has no friend visibility across that dependency
+edge. The narrow cross-crate seam is therefore one documented `unsafe`
+certification method on the reserved portable claim. Its contract requires
+exact claim-derived mapped code/HOT/COLD slices from the same branded process
+view, no live mutable aliases, completed publisher I-cache maintenance, and the
+current INITIAL-generation observation. An opaque proof derived from the real
+`PreparedSharedInitial` after prebinding supplies the expected code/HOT/COLD
+lengths and digests, so valid-looking corruption cannot be re-hashed and
+blessed as a new truth. The portable method compares the mapped bytes to that
+proof, exactly decodes both metadata streams, rechecks generation, and returns
+a private-field, non-cloneable `LiveArenaWrittenBlock<'view>`. Safe raw portable
+claims cannot construct that token. `claim.publish(token)` verifies the
+storage, process-view brand, record identity, and exact extents before the sole
+READY Release store.
 
 Shared emission omits the 44-byte absolute generation guard and enters at the
 existing trusted suffix. The census proves the remaining instructions are
