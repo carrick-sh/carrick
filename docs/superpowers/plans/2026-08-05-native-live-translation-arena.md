@@ -394,6 +394,12 @@
 
 ### Task 6: Integrate READY lookup and direct publication into `ProcessState`
 
+> **Execution split:** the Task 6 preflight proved the portable record/cursor
+> state is process-private and the original monolithic checklist cannot be
+> integrated soundly. Execute authoritative Tasks 6A–6F in
+> [`2026-08-05-native-live-translation-arena-task6.md`](2026-08-05-native-live-translation-arena-task6.md).
+> The checklist below remains the Task 6 completion rollup.
+
 **Files:**
 
 - Modify: `crates/carrick-dsr-aarch64/src/translator.rs`
