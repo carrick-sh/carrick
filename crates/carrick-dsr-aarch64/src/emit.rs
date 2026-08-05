@@ -8,9 +8,10 @@ use sha2::{Digest, Sha256};
 
 use super::artifact_spike::{
     ArtifactRecord, ArtifactRecording, GatewayKind, MaterializedValue, ProcessValue,
-    SharedInitialMetadata,
+    SharedInitialMetadata, validate_shared_initial_hot,
 };
 use super::block::{BlockPlan, PlannedExit};
+use super::shared_cache::TranslationUnitKey;
 use super::types::{CacheOffset, CacheVa, CodeGeneration, DsrError, InstAction};
 use carrick_dsr::cache::{PublishedCode, TranslationCache};
 
@@ -149,6 +150,18 @@ pub struct PreparedSharedInitial {
     assembled: AssembledBlock,
     metadata: SharedInitialMetadata,
     lengths: SharedInitialLengths,
+    live_identity: PreparedLiveIdentity,
+}
+
+struct PreparedLiveIdentity {
+    unit_digest: [u8; 32],
+    guest_start: GuestVa,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LivePrebindOutcome {
+    Bound,
+    OutOfRange,
 }
 
 /// Opaque expected-byte authority derived from one real, post-prebinding
@@ -201,11 +214,126 @@ impl PreparedSharedInitial {
         self.metadata.cold_bytes()
     }
 
+    /// Confirms this prepared block belongs to one address-free live claim.
+    /// The identity itself stays opaque so callers cannot reconstruct or
+    /// transplant prepared authority.
+    #[doc(hidden)]
+    pub fn matches_live_identity(&self, unit_digest: [u8; 32], guest_start: GuestVa) -> bool {
+        self.live_identity.unit_digest == unit_digest
+            && self.live_identity.guest_start == guest_start
+    }
+
     /// Candidate sites exist only while the block is prepared and still
     /// private to its BUILDING publisher. Task 6 will bind them only after it
     /// adds the claim-bound, same-view Darwin target capability.
     pub fn link_candidates(&self) -> &[DirectLink] {
         &self.assembled.direct_links
+    }
+
+    /// Prebinds one still-private direct-link candidate using process-local RX
+    /// addresses. Only the candidate's four-byte patch slot is mutated.
+    ///
+    /// # Safety
+    ///
+    /// `source_rx` must be the exact RX start at which this prepared block will
+    /// be published, and `target_rx` must be an acquired executable entry from
+    /// the same process view. The caller must retain the unique BUILDING claim
+    /// and must not expose this prepared value after publication.
+    #[doc(hidden)]
+    pub unsafe fn prebind_live_direct_link(
+        &mut self,
+        candidate_index: usize,
+        source_rx: HostVa,
+        target_rx: HostVa,
+    ) -> Result<LivePrebindOutcome, DsrError> {
+        let candidate = self
+            .assembled
+            .direct_links
+            .get(candidate_index)
+            .copied()
+            .ok_or_else(|| DsrError::CachePolicy("live prebind candidate is absent".to_string()))?;
+        let slot = usize::try_from(candidate.slot.get())
+            .map_err(|_| DsrError::CachePolicy("live prebind slot exceeds usize".to_string()))?;
+        if !slot.is_multiple_of(4) {
+            return Err(DsrError::CachePolicy(
+                "live prebind slot is not instruction aligned".to_string(),
+            ));
+        }
+        let end = slot
+            .checked_add(4)
+            .filter(|end| *end <= self.assembled.instruction_bytes.len())
+            .ok_or_else(|| {
+                DsrError::CachePolicy("live prebind slot is outside prepared code".to_string())
+            })?;
+        let stub_start = usize::try_from(candidate.stub.start.get()).map_err(|_| {
+            DsrError::CachePolicy("live prebind stub start exceeds usize".to_string())
+        })?;
+        let stub_end = usize::try_from(candidate.stub.end.get()).map_err(|_| {
+            DsrError::CachePolicy("live prebind stub end exceeds usize".to_string())
+        })?;
+        if !stub_start.is_multiple_of(4) || !stub_end.is_multiple_of(4) {
+            return Err(DsrError::CachePolicy(
+                "live prebind stub envelope is not instruction aligned".to_string(),
+            ));
+        }
+        if stub_start >= stub_end
+            || stub_end > self.assembled.instruction_bytes.len()
+            || end > stub_start
+        {
+            return Err(DsrError::CachePolicy(
+                "live prebind stub envelope is outside prepared code".to_string(),
+            ));
+        }
+        let source = source_rx.raw().checked_add(slot).ok_or_else(|| {
+            DsrError::CachePolicy("live prebind source address overflow".to_string())
+        })?;
+        let original_target = source_rx.raw().checked_add(stub_start).ok_or_else(|| {
+            DsrError::CachePolicy("live prebind stub address overflow".to_string())
+        })?;
+        if !source.is_multiple_of(4) || !original_target.is_multiple_of(4) {
+            return Err(DsrError::CachePolicy(
+                "live prebind source geometry is not instruction aligned".to_string(),
+            ));
+        }
+        let original_word = crate::translator::encode_aarch64_direct_branch(
+            carrick_dsr::cache::LinkSite {
+                source: CacheVa::published(source_rx),
+                slot: candidate.slot,
+            },
+            CacheVa::published(HostVa(original_target)),
+        )?;
+        let slot_bytes = &self.assembled.instruction_bytes[slot..end];
+        let current =
+            u32::from_le_bytes([slot_bytes[0], slot_bytes[1], slot_bytes[2], slot_bytes[3]]);
+        if current != original_word {
+            return Err(DsrError::CachePolicy(
+                "live prebind candidate was already mutated".to_string(),
+            ));
+        }
+        if !target_rx.raw().is_multiple_of(4) {
+            return Err(DsrError::CachePolicy(
+                "live prebind target address is not instruction aligned".to_string(),
+            ));
+        }
+        let displacement = (target_rx.raw() as i128) - (source as i128);
+        if displacement % 4 != 0 {
+            return Err(DsrError::CachePolicy(
+                "live prebind displacement is not instruction aligned".to_string(),
+            ));
+        }
+        let words = displacement / 4;
+        if !(-(1_i128 << 25)..(1_i128 << 25)).contains(&words) {
+            return Ok(LivePrebindOutcome::OutOfRange);
+        }
+        let word = crate::translator::encode_aarch64_direct_branch(
+            carrick_dsr::cache::LinkSite {
+                source: CacheVa::published(source_rx),
+                slot: candidate.slot,
+            },
+            CacheVa::published(target_rx),
+        )?;
+        self.assembled.instruction_bytes[slot..end].copy_from_slice(&word.to_le_bytes());
+        Ok(LivePrebindOutcome::Bound)
     }
 
     /// Captures the exact post-prebinding bytes that one mapped publication
@@ -223,6 +351,20 @@ impl PreparedSharedInitial {
         self.assembled.direct_links.clear();
         self.assembled.publish(cache)
     }
+}
+
+/// Validates the complete mapped HOT stream for a shared INITIAL block.
+///
+/// This narrow consumer seam intentionally returns no decoded metadata and no
+/// address-bearing value: a native arena can validate immutable bytes in
+/// place without gaining a second representation of the artifact protocol.
+/// COLD remains unresolved and lazy until fault reconstruction needs it.
+#[doc(hidden)]
+pub fn validate_live_shared_initial_hot(hot: &[u8], code_len: u64) -> Result<(), DsrError> {
+    let code_len = u32::try_from(code_len).map_err(|_| {
+        DsrError::CachePolicy("live shared INITIAL code length exceeds u32".to_string())
+    })?;
+    validate_shared_initial_hot(hot, code_len)
 }
 
 fn direct_instruction_bytes_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
@@ -4625,10 +4767,25 @@ pub fn emit_block_recording_artifact_optional(
 /// already-encoded metadata, so callers can reserve exact arena extents before
 /// consuming it for one publication.
 pub fn prepare_shared_initial(
+    key: &TranslationUnitKey,
     plan: &BlockPlan,
     mode: EmitAddressMode,
     source_words: Vec<u32>,
 ) -> Result<PreparedSharedInitial, DsrError> {
+    let mode_host_bias = match mode {
+        EmitAddressMode::Direct => None,
+        EmitAddressMode::Biased { host_bias } => Some(host_bias.get()),
+    };
+    if mode_host_bias != key.host_bias() {
+        return Err(DsrError::CachePolicy(
+            "shared INITIAL emit mode does not match translation unit key".to_string(),
+        ));
+    }
+    let unit_digest = key.live_digest().map_err(|error| {
+        DsrError::CachePolicy(format!(
+            "shared INITIAL translation unit key cannot be digested: {error}"
+        ))
+    })?;
     let mut recording = ArtifactRecording::default();
     if let EmitAddressMode::Biased { host_bias } = mode {
         recording.bind(ProcessValue::HostBias, host_bias.get())?;
@@ -4660,6 +4817,10 @@ pub fn prepare_shared_initial(
         assembled,
         metadata,
         lengths,
+        live_identity: PreparedLiveIdentity {
+            unit_digest,
+            guest_start: plan.start,
+        },
     })
 }
 
@@ -7247,6 +7408,28 @@ mod tests {
         }
     }
 
+    fn shared_initial_conditional_plan() -> BlockPlan {
+        BlockPlan {
+            start: GuestVa(0x4000),
+            end: GuestVa(0x4004),
+            generation: CodeGeneration::INITIAL,
+            instructions: Vec::new(),
+            exit: PlannedExit::Direct {
+                guest: GuestVa(0x4000),
+                word: 0x5400_8000,
+                exit: DirectExit {
+                    kind: DirectKind::Conditional,
+                    target: GuestVa(0x5000),
+                    resume: GuestVa(0x4004),
+                    condition: Some(bad64::Condition::EQ),
+                    register: None,
+                    bit: None,
+                },
+            },
+            extensions: Vec::new(),
+        }
+    }
+
     fn assemble_shared_initial_for_test(
         plan: &BlockPlan,
         recording: Option<&mut ArtifactRecording>,
@@ -7278,6 +7461,19 @@ mod tests {
                 SourceFingerprint([0x7a; 32]),
                 NativePageProfileIdentity::Native16k,
                 AddressModeIdentity::Direct,
+            )
+        }
+
+        fn biased_live_key(host_bias: carrick_dsr::address::NativeHostBias) -> TranslationUnitKey {
+            TranslationUnitKey::for_segment(
+                ExecutableIdentity::Digest([0x42; 32]),
+                ImageFileOffset::new(0),
+                ImageFileLen::new(16 * 1024).expect("nonzero file length"),
+                GuestVa(0x4000),
+                GuestCodeLen::new(16 * 1024).expect("nonzero guest length"),
+                SourceFingerprint([0x7a; 32]),
+                NativePageProfileIdentity::Native16k,
+                AddressModeIdentity::biased(host_bias),
             )
         }
 
@@ -7316,9 +7512,13 @@ mod tests {
         fn shared_initial_prepare_then_publish_advances_cache_once_by_exact_code_length() {
             let mut cache = crate::test_jit::test_cache(16 * 1024);
             let before = cache.used_bytes();
-            let prepared =
-                prepare_shared_initial(&copy_plan(), EmitAddressMode::Direct, Vec::new())
-                    .expect("prepare shared INITIAL fixture");
+            let prepared = prepare_shared_initial(
+                &live_key(),
+                &copy_plan(),
+                EmitAddressMode::Direct,
+                Vec::new(),
+            )
+            .expect("prepare shared INITIAL fixture");
             assert_eq!(
                 cache.used_bytes(),
                 before,
@@ -7337,9 +7537,13 @@ mod tests {
 
         #[test]
         fn expected_publication_tracks_real_prepared_bytes() {
-            let prepared =
-                prepare_shared_initial(&copy_plan(), EmitAddressMode::Direct, Vec::new())
-                    .expect("prepare shared INITIAL fixture");
+            let prepared = prepare_shared_initial(
+                &live_key(),
+                &copy_plan(),
+                EmitAddressMode::Direct,
+                Vec::new(),
+            )
+            .expect("prepare shared INITIAL fixture");
             let expected = prepared.expected_publication();
             assert!(expected.matches(
                 prepared.code_bytes(),
@@ -7350,6 +7554,23 @@ mod tests {
             let mut corrupt_code = prepared.code_bytes().to_vec();
             corrupt_code[0] ^= 0xff;
             assert!(!expected.matches(&corrupt_code, prepared.hot_bytes(), prepared.cold_bytes(),));
+        }
+
+        #[test]
+        fn live_shared_initial_hot_validator_is_exact_and_cold_independent() {
+            let prepared = prepare_shared_initial(
+                &live_key(),
+                &copy_plan(),
+                EmitAddressMode::Direct,
+                Vec::new(),
+            )
+            .expect("prepare shared INITIAL fixture");
+            let lengths = prepared.lengths();
+            assert!(validate_live_shared_initial_hot(prepared.hot_bytes(), lengths.code,).is_ok());
+
+            let mut trailing = prepared.hot_bytes().to_vec();
+            trailing.push(0);
+            assert!(validate_live_shared_initial_hot(&trailing, lengths.code).is_err());
         }
 
         #[test]
@@ -7433,6 +7654,7 @@ mod tests {
         fn shared_ready_source_is_never_patchable() {
             let mut cache = crate::test_jit::test_cache(16 * 1024);
             let prepared = prepare_shared_initial(
+                &live_key(),
                 &shared_initial_direct_plan(),
                 EmitAddressMode::Direct,
                 Vec::new(),
@@ -7444,11 +7666,165 @@ mod tests {
         }
 
         #[test]
+        fn live_prebind_changes_only_candidate_slot_and_range_failure_is_atomic() {
+            let mut prepared = prepare_shared_initial(
+                &live_key(),
+                &shared_initial_direct_plan(),
+                EmitAddressMode::Direct,
+                Vec::new(),
+            )
+            .expect("prepare shared direct-link block");
+            let before = prepared.code_bytes().to_vec();
+            let link = prepared.link_candidates()[0];
+            let source = HostVa(0x1000_0000);
+            let target = HostVa(0x1000_4000);
+            let expected = crate::translator::encode_aarch64_direct_branch(
+                carrick_dsr::cache::LinkSite {
+                    source: CacheVa::published(source),
+                    slot: link.slot,
+                },
+                CacheVa::published(target),
+            )
+            .expect("reachable direct branch");
+            assert_eq!(
+                unsafe { prepared.prebind_live_direct_link(0, source, target) }
+                    .expect("prebind candidate"),
+                LivePrebindOutcome::Bound,
+            );
+            let slot = link.slot.get() as usize;
+            assert_eq!(
+                &prepared.code_bytes()[slot..slot + 4],
+                &expected.to_le_bytes()
+            );
+            assert_eq!(&prepared.code_bytes()[..slot], &before[..slot]);
+            assert_eq!(&prepared.code_bytes()[slot + 4..], &before[slot + 4..]);
+
+            let mut out_of_range = prepare_shared_initial(
+                &live_key(),
+                &shared_initial_direct_plan(),
+                EmitAddressMode::Direct,
+                Vec::new(),
+            )
+            .expect("prepare second shared direct-link block");
+            let unchanged = out_of_range.code_bytes().to_vec();
+            assert_eq!(
+                unsafe {
+                    out_of_range.prebind_live_direct_link(
+                        0,
+                        source,
+                        HostVa(source.raw() + (1 << 29)),
+                    )
+                }
+                .expect("out-of-range is an unbound outcome"),
+                LivePrebindOutcome::OutOfRange,
+            );
+            assert_eq!(out_of_range.code_bytes(), unchanged);
+        }
+
+        #[test]
+        fn live_prebind_accepts_both_real_conditional_candidate_encodings() {
+            let source = HostVa(0x2000_0000);
+            for kind in [
+                DirectLinkKind::ConditionalFallthrough,
+                DirectLinkKind::ConditionalTaken,
+            ] {
+                let mut prepared = prepare_shared_initial(
+                    &live_key(),
+                    &shared_initial_conditional_plan(),
+                    EmitAddressMode::Direct,
+                    Vec::new(),
+                )
+                .expect("prepare shared conditional direct-link block");
+                let candidate_index = prepared
+                    .link_candidates()
+                    .iter()
+                    .position(|candidate| candidate.kind == kind)
+                    .expect("real conditional candidate");
+                let candidate = prepared.link_candidates()[candidate_index];
+                let before = prepared.code_bytes().to_vec();
+                let target = HostVa(source.raw() + 0x8000 + candidate_index * 0x1000);
+                let expected = crate::translator::encode_aarch64_direct_branch(
+                    carrick_dsr::cache::LinkSite {
+                        source: CacheVa::published(source),
+                        slot: candidate.slot,
+                    },
+                    CacheVa::published(target),
+                )
+                .expect("reachable conditional direct branch");
+
+                assert_eq!(
+                    unsafe { prepared.prebind_live_direct_link(candidate_index, source, target) }
+                        .expect("prebind real conditional candidate"),
+                    LivePrebindOutcome::Bound,
+                    "{kind:?}",
+                );
+                let slot = candidate.slot.get() as usize;
+                assert_eq!(
+                    &prepared.code_bytes()[slot..slot + 4],
+                    &expected.to_le_bytes(),
+                    "{kind:?}",
+                );
+                assert_eq!(&prepared.code_bytes()[..slot], &before[..slot], "{kind:?}",);
+                assert_eq!(
+                    &prepared.code_bytes()[slot + 4..],
+                    &before[slot + 4..],
+                    "{kind:?}",
+                );
+            }
+        }
+
+        #[test]
+        fn live_prebind_accepts_real_fused_conditional_taken_stub() {
+            let mut prepared = prepare_shared_initial(
+                &live_key(),
+                &fused_two_segment_plan(),
+                EmitAddressMode::Direct,
+                Vec::new(),
+            )
+            .expect("prepare fused shared conditional block");
+            let candidate_index = prepared
+                .link_candidates()
+                .iter()
+                .position(|candidate| candidate.kind == DirectLinkKind::ConditionalTaken)
+                .expect("fused deferred taken candidate");
+            assert_eq!(prepared.link_candidates().len(), 1);
+            let candidate = prepared.link_candidates()[candidate_index];
+            let before = prepared.code_bytes().to_vec();
+            let source = HostVa(0x3000_0000);
+            let target = HostVa(0x3000_9000);
+            let expected = crate::translator::encode_aarch64_direct_branch(
+                carrick_dsr::cache::LinkSite {
+                    source: CacheVa::published(source),
+                    slot: candidate.slot,
+                },
+                CacheVa::published(target),
+            )
+            .expect("reachable fused direct branch");
+
+            assert_eq!(
+                unsafe { prepared.prebind_live_direct_link(candidate_index, source, target) }
+                    .expect("prebind fused conditional candidate"),
+                LivePrebindOutcome::Bound,
+            );
+            let slot = candidate.slot.get() as usize;
+            assert_eq!(
+                &prepared.code_bytes()[slot..slot + 4],
+                &expected.to_le_bytes()
+            );
+            assert_eq!(&prepared.code_bytes()[..slot], &before[..slot]);
+            assert_eq!(&prepared.code_bytes()[slot + 4..], &before[slot + 4..]);
+        }
+
+        #[test]
         fn shared_initial_exact_lengths_drive_reservation_before_single_publish() {
             let mut cache = crate::test_jit::test_cache(16 * 1024);
-            let prepared =
-                prepare_shared_initial(&copy_plan(), EmitAddressMode::Direct, Vec::new())
-                    .expect("prepare exact-length fixture");
+            let prepared = prepare_shared_initial(
+                &live_key(),
+                &copy_plan(),
+                EmitAddressMode::Direct,
+                Vec::new(),
+            )
+            .expect("prepare exact-length fixture");
             let lengths = prepared.lengths();
             let arena = LiveTranslationArena::new(64 * 1024, 64 * 1024, 64 * 1024);
             let key = live_key();
@@ -7473,6 +7849,7 @@ mod tests {
             let host_bias = carrick_dsr::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
                 .expect("valid biased fixture");
             let error = prepare_shared_initial(
+                &biased_live_key(host_bias),
                 &biased_exclusive_plan(),
                 EmitAddressMode::Biased { host_bias },
                 Vec::new(),
@@ -7484,6 +7861,24 @@ mod tests {
                 "unexpected biased preparation error: {error:?}"
             );
             assert_eq!(cache.used_bytes(), before);
+        }
+
+        #[test]
+        fn shared_initial_prepare_rejects_emit_mode_key_mismatch() {
+            let host_bias = carrick_dsr::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
+                .expect("valid biased fixture");
+            let error = prepare_shared_initial(
+                &live_key(),
+                &copy_plan(),
+                EmitAddressMode::Biased { host_bias },
+                Vec::new(),
+            )
+            .err()
+            .expect("direct key cannot prepare biased code");
+            assert!(
+                matches!(error, DsrError::CachePolicy(ref message) if message.contains("emit mode")),
+                "unexpected mode/key error: {error:?}",
+            );
         }
     }
 
