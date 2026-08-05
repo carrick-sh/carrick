@@ -85,6 +85,9 @@ pub(crate) fn run_debug(command: DebugCommand) -> anyhow::Result<()> {
                 output.as_deref(),
             )?;
         }
+        DebugCommand::JitShapeCompare { a, b, output } => {
+            crate::debug_jit_shape::run_jit_shape_compare(&a, &b, output.as_deref())?;
+        }
         DebugCommand::DecodeEsr { syndrome } => {
             let stripped = syndrome.trim();
             let value = if let Some(hex) = stripped

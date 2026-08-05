@@ -778,7 +778,7 @@ JitShapeCompare {
 
 Build two valid synthetic v3 censuses and mutate one determinant per test. Require equality of capture Git HEAD, capture executable SHA, D template SHA, image canonical digest reference, exact target argv and argv SHA, sampling frequency, classifier schema, census Git HEAD, and census executable SHA. Require inequality of run IDs, capture-receipt hashes, raw hashes, and snapshot manifests.
 
-Reject identical files, v1/v2 census schemas, a rejected capture embedded in either census, missing rows, duplicate rows, row population mismatches, and a determinant mismatch even when all numerical shares agree.
+Reject identical files, v1/v2 census schemas, missing rows, duplicate rows, row population mismatches, and a determinant mismatch even when all numerical shares agree. A rejected capture is structurally impossible inside v3: the census constructor already requires one strict canonical accepted receipt, and the comparator trusts only independently complete canonical v3 objects rather than adding a forgeable outcome flag or a second receipt interpretation.
 
 Run:
 

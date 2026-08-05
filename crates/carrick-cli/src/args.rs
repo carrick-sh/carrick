@@ -992,6 +992,18 @@ pub(crate) enum DebugCommand {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Compare two independently authenticated native AArch64 JIT-shape
+    /// censuses under one determinant-locked exact-arithmetic contract.
+    JitShapeCompare {
+        /// First complete canonical v3 census.
+        a: PathBuf,
+        /// Second complete canonical v3 census.
+        b: PathBuf,
+        /// Publish the deterministic comparison without overwriting an
+        /// artifact. Omit to write the same bytes to stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Decode an AArch64 ESR_EL1 value into its exception class, IL, ISS
     /// (with DFSC for data aborts) so the operator doesn't have to hand-
     /// parse syndromes during an interactive session.
@@ -1302,6 +1314,59 @@ mod tests {
             ])
             .is_err(),
             "the unauthenticated imported JIT ratio must be unknown"
+        );
+    }
+
+    #[test]
+    fn jit_shape_compare_requires_both_censuses_but_not_output() {
+        let cli = Cli::try_parse_from([
+            "carrick",
+            "debug",
+            "jit-shape-compare",
+            "/tmp/a.census.json",
+            "/tmp/b.census.json",
+        ])
+        .expect("paired comparison arguments should parse without --output");
+        let Commands::Debug {
+            command: DebugCommand::JitShapeCompare { a, b, output },
+        } = cli.command
+        else {
+            panic!("expected jit-shape-compare command");
+        };
+        assert_eq!(a, std::path::Path::new("/tmp/a.census.json"));
+        assert_eq!(b, std::path::Path::new("/tmp/b.census.json"));
+        assert_eq!(output, None);
+
+        assert!(
+            Cli::try_parse_from([
+                "carrick",
+                "debug",
+                "jit-shape-compare",
+                "/tmp/a.census.json",
+            ])
+            .is_err(),
+            "the second independently authenticated census is mandatory",
+        );
+
+        let with_output = Cli::try_parse_from([
+            "carrick",
+            "debug",
+            "jit-shape-compare",
+            "/tmp/a.census.json",
+            "/tmp/b.census.json",
+            "--output",
+            "/tmp/comparison.json",
+        ])
+        .expect("paired comparison should accept --output");
+        let Commands::Debug {
+            command: DebugCommand::JitShapeCompare { output, .. },
+        } = with_output.command
+        else {
+            panic!("expected jit-shape-compare command with output");
+        };
+        assert_eq!(
+            output.as_deref(),
+            Some(std::path::Path::new("/tmp/comparison.json")),
         );
     }
 

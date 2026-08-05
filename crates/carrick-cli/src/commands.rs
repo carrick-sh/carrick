@@ -1374,6 +1374,9 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 &snapshots,
                 output.as_deref(),
             )?,
+            DebugCommand::JitShapeCompare { a, b, output } => {
+                crate::debug_jit_shape::run_jit_shape_compare(&a, &b, output.as_deref())?
+            }
             _ => bail!("debug (guest address-space inspection) is HVF-only on this build"),
         },
         Commands::TraceChild {

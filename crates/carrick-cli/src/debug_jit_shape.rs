@@ -111,7 +111,7 @@ pub(crate) struct WordRow {
     pub(crate) share: CensusShare,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ContextOperand {
     pub(crate) slot: i64,
@@ -144,6 +144,246 @@ pub(crate) struct JitShapeCensusV3 {
     pub(crate) families: Vec<FamilyRow>,
     pub(crate) words: Vec<WordRow>,
     pub(crate) contexts: Vec<ContextRow>,
+}
+
+pub(crate) const COMPARISON_SCHEMA: &str = "carrick.jit-shape-comparison.v1";
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ComparisonDeterminants {
+    pub(crate) a_capture_authority: NativeShapeAuthority,
+    pub(crate) b_capture_authority: NativeShapeAuthority,
+    pub(crate) a_census_identity: CaptureIdentity,
+    pub(crate) b_census_identity: CaptureIdentity,
+    pub(crate) classifier_schema: String,
+    pub(crate) a_capture_receipt_sha256: String,
+    pub(crate) b_capture_receipt_sha256: String,
+    pub(crate) a_raw_trace_sha256: String,
+    pub(crate) b_raw_trace_sha256: String,
+    pub(crate) a_snapshot_manifest_sha256: String,
+    pub(crate) b_snapshot_manifest_sha256: String,
+    pub(crate) a_populations: CensusPopulations,
+    pub(crate) b_populations: CensusPopulations,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub(crate) enum ComparisonKey {
+    Family {
+        evidence_class: EvidenceClass,
+        family: String,
+    },
+    Word {
+        family: String,
+        word: u32,
+        evidence_class: EvidenceClass,
+    },
+    Context {
+        direction: Direction,
+        first: ContextOperand,
+        second: Option<ContextOperand>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ComparisonFraction {
+    pub(crate) numerator: u128,
+    pub(crate) denominator: u128,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ComparisonRow {
+    pub(crate) key: ComparisonKey,
+    pub(crate) a: CensusShare,
+    pub(crate) b: CensusShare,
+    pub(crate) absolute_all_cpu_drift: ComparisonFraction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MechanicalCrossing {
+    pub(crate) key: ComparisonKey,
+    pub(crate) a: CensusShare,
+    pub(crate) b: CensusShare,
+    pub(crate) minimum_all_cpu_share: CensusFraction,
+    pub(crate) absolute_all_cpu_drift: ComparisonFraction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct JitShapeComparisonV1 {
+    pub(crate) schema: String,
+    pub(crate) a_sha256: String,
+    pub(crate) b_sha256: String,
+    pub(crate) determinants: ComparisonDeterminants,
+    pub(crate) family_rows: Vec<ComparisonRow>,
+    pub(crate) word_rows: Vec<ComparisonRow>,
+    pub(crate) context_rows: Vec<ComparisonRow>,
+    pub(crate) mechanical_crossings: Vec<MechanicalCrossing>,
+}
+
+impl ComparisonDeterminants {
+    fn validate(&self) -> anyhow::Result<()> {
+        self.a_capture_authority
+            .sha256()
+            .context("validate comparison capture A authority")?;
+        self.b_capture_authority
+            .sha256()
+            .context("validate comparison capture B authority")?;
+        self.a_census_identity
+            .validate()
+            .context("validate comparison census A identity")?;
+        self.b_census_identity
+            .validate()
+            .context("validate comparison census B identity")?;
+        if self.a_census_identity.host_arch != "aarch64"
+            || self.b_census_identity.host_arch != "aarch64"
+        {
+            bail!("comparison census identities must both be aarch64");
+        }
+
+        let a = &self.a_capture_authority;
+        let b = &self.b_capture_authority;
+        for (same, label) in [
+            (a.schema == b.schema, "capture authority schema"),
+            (a.profile == b.profile, "capture profile"),
+            (a.raw_schema == b.raw_schema, "raw schema"),
+            (a.git_head == b.git_head, "capture git HEAD"),
+            (a.git_dirty == b.git_dirty, "capture git dirty state"),
+            (
+                a.executable_sha256 == b.executable_sha256,
+                "capture executable SHA-256",
+            ),
+            (a.host == b.host, "capture host"),
+            (a.host_arch == b.host_arch, "capture architecture"),
+            (a.os_build == b.os_build, "capture OS build"),
+            (a.image == b.image, "canonical image"),
+            (a.target_argv == b.target_argv, "target argv"),
+            (
+                a.target_argv_sha256 == b.target_argv_sha256,
+                "target argv digest",
+            ),
+            (
+                a.program_template_sha256 == b.program_template_sha256,
+                "D template SHA-256",
+            ),
+            (
+                a.birth_qualification_sha256 == b.birth_qualification_sha256,
+                "birth qualification SHA-256",
+            ),
+            (
+                a.terminal_qualification_sha256 == b.terminal_qualification_sha256,
+                "terminal qualification SHA-256",
+            ),
+            (a.sampling_hz == b.sampling_hz, "sampling frequency"),
+            (
+                self.a_census_identity.git_head == self.b_census_identity.git_head,
+                "census git HEAD",
+            ),
+            (
+                self.a_census_identity.git_dirty == self.b_census_identity.git_dirty,
+                "census git dirty state",
+            ),
+            (
+                self.a_census_identity.executable_sha256
+                    == self.b_census_identity.executable_sha256,
+                "census executable SHA-256",
+            ),
+            (
+                self.a_census_identity.host == self.b_census_identity.host,
+                "census host",
+            ),
+            (
+                self.a_census_identity.host_arch == self.b_census_identity.host_arch,
+                "census architecture",
+            ),
+            (
+                self.a_census_identity.os_build == self.b_census_identity.os_build,
+                "census OS build",
+            ),
+        ] {
+            if !same {
+                bail!("comparison {label} determinant drifted");
+            }
+        }
+        if self.classifier_schema != CLASSIFIER_SCHEMA {
+            bail!("comparison classifier schema is not {CLASSIFIER_SCHEMA}");
+        }
+        require_distinct(&a.run_id, &b.run_id, "run IDs")?;
+        for (value, label) in [
+            (&self.a_capture_receipt_sha256, "capture A receipt SHA-256"),
+            (&self.b_capture_receipt_sha256, "capture B receipt SHA-256"),
+            (&self.a_raw_trace_sha256, "raw trace A SHA-256"),
+            (&self.b_raw_trace_sha256, "raw trace B SHA-256"),
+            (
+                &self.a_snapshot_manifest_sha256,
+                "snapshot manifest A SHA-256",
+            ),
+            (
+                &self.b_snapshot_manifest_sha256,
+                "snapshot manifest B SHA-256",
+            ),
+        ] {
+            validate_sha256(value, label)?;
+        }
+        require_distinct(
+            &self.a_capture_receipt_sha256,
+            &self.b_capture_receipt_sha256,
+            "capture receipt hashes",
+        )?;
+        require_distinct(
+            &self.a_raw_trace_sha256,
+            &self.b_raw_trace_sha256,
+            "raw trace hashes",
+        )?;
+        require_distinct(
+            &self.a_snapshot_manifest_sha256,
+            &self.b_snapshot_manifest_sha256,
+            "snapshot manifest hashes",
+        )?;
+        validate_comparison_population(&self.a_populations, "A")?;
+        validate_comparison_population(&self.b_populations, "B")?;
+        Ok(())
+    }
+}
+
+impl JitShapeComparisonV1 {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        if self.schema != COMPARISON_SCHEMA {
+            bail!("JIT shape comparison schema is not {COMPARISON_SCHEMA}");
+        }
+        validate_sha256(&self.a_sha256, "comparison census A SHA-256")?;
+        validate_sha256(&self.b_sha256, "comparison census B SHA-256")?;
+        require_distinct(&self.a_sha256, &self.b_sha256, "census hashes")?;
+        self.determinants.validate()?;
+
+        validate_comparison_rows(
+            &self.family_rows,
+            ComparisonRowKind::Family,
+            &self.determinants,
+        )?;
+        validate_comparison_rows(&self.word_rows, ComparisonRowKind::Word, &self.determinants)?;
+        validate_comparison_rows(
+            &self.context_rows,
+            ComparisonRowKind::Context,
+            &self.determinants,
+        )?;
+        validate_comparison_populations(self)?;
+
+        let expected_crossings = mechanical_crossings(
+            self.family_rows
+                .iter()
+                .chain(&self.word_rows)
+                .chain(&self.context_rows)
+                .cloned(),
+        )?;
+        if self.mechanical_crossings != expected_crossings {
+            bail!("comparison mechanical crossings are incomplete, incorrect, or out of order");
+        }
+        Ok(())
+    }
 }
 
 impl JitShapeCensusV3 {
@@ -837,18 +1077,535 @@ pub(crate) fn parse_census_v3(bytes: &[u8]) -> anyhow::Result<JitShapeCensusV3> 
     Ok(report)
 }
 
-fn publish_census(
-    report: &JitShapeCensusV3,
+fn require_distinct<T: PartialEq>(a: &T, b: &T, label: &str) -> anyhow::Result<()> {
+    if a == b {
+        bail!("comparison {label} must identify distinct captures");
+    }
+    Ok(())
+}
+
+fn validate_comparison_population(
+    population: &CensusPopulations,
+    label: &str,
+) -> anyhow::Result<()> {
+    let classified_cpu = population
+        .user_cpu
+        .checked_add(population.kernel_cpu)
+        .and_then(|value| value.checked_add(population.invalid_cpu))
+        .with_context(|| format!("comparison census {label} CPU population overflow"))?;
+    if classified_cpu != population.all_cpu
+        || population.invalid_cpu != 0
+        || population.jit_user.checked_add(population.non_jit_user) != Some(population.user_cpu)
+        || population.jit_user == 0
+        || population.pc_rows == 0
+        || population.pc_samples != population.jit_user
+        || population.pc_samples < population.pc_rows
+    {
+        bail!("comparison census {label} populations do not reconcile");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ComparisonRowKind {
+    Family,
+    Word,
+    Context,
+}
+
+fn validate_comparison_key(key: &ComparisonKey, expected: ComparisonRowKind) -> anyhow::Result<()> {
+    match (expected, key) {
+        (
+            ComparisonRowKind::Family,
+            ComparisonKey::Family {
+                evidence_class: _,
+                family,
+            },
+        ) => {
+            if family.is_empty() {
+                bail!("comparison family key is empty");
+            }
+        }
+        (
+            ComparisonRowKind::Word,
+            ComparisonKey::Word {
+                family,
+                word,
+                evidence_class,
+            },
+        ) => {
+            if family.is_empty() {
+                bail!("comparison word family is empty");
+            }
+            let classification = classify(*word);
+            if classification.family != family || classification.evidence_class != *evidence_class {
+                bail!("comparison word key disagrees with the current classifier");
+            }
+        }
+        (
+            ComparisonRowKind::Context,
+            ComparisonKey::Context {
+                direction: _,
+                first,
+                second,
+            },
+        ) => {
+            validate_context_operand(first, "first comparison")?;
+            second
+                .as_ref()
+                .map(|operand| validate_context_operand(operand, "second comparison"))
+                .transpose()?;
+        }
+        _ => bail!("comparison row key kind is in the wrong population"),
+    }
+    Ok(())
+}
+
+fn validate_comparison_rows(
+    rows: &[ComparisonRow],
+    expected: ComparisonRowKind,
+    determinants: &ComparisonDeterminants,
+) -> anyhow::Result<()> {
+    let mut previous = None;
+    for row in rows {
+        validate_comparison_key(&row.key, expected)?;
+        if previous.as_ref().is_some_and(|key| key >= &row.key) {
+            bail!("comparison rows are duplicate or out of order");
+        }
+        validate_share(
+            &row.a,
+            determinants.a_populations.jit_user,
+            determinants.a_populations.all_cpu,
+        )?;
+        validate_share(
+            &row.b,
+            determinants.b_populations.jit_user,
+            determinants.b_populations.all_cpu,
+        )?;
+        if row.a.samples == 0 && row.b.samples == 0 {
+            bail!("comparison full-outer-join row is absent from both inputs");
+        }
+        let drift = absolute_fraction_drift(&row.a.share_of_all_cpu, &row.b.share_of_all_cpu)?;
+        if row.absolute_all_cpu_drift != drift {
+            bail!("comparison row absolute all-CPU drift is not exact");
+        }
+        previous = Some(row.key.clone());
+    }
+    Ok(())
+}
+
+fn checked_map_increment<K: Ord>(
+    map: &mut BTreeMap<K, u64>,
+    key: K,
+    samples: u64,
+    label: &str,
+) -> anyhow::Result<()> {
+    checked_increment(map.entry(key).or_default(), samples, label)
+}
+
+fn validate_comparison_populations(report: &JitShapeComparisonV1) -> anyhow::Result<()> {
+    let mut family_a = BTreeMap::<(EvidenceClass, String), u64>::new();
+    let mut family_b = BTreeMap::<(EvidenceClass, String), u64>::new();
+    for row in &report.family_rows {
+        let ComparisonKey::Family {
+            evidence_class,
+            family,
+        } = &row.key
+        else {
+            bail!("comparison family row lost its family key");
+        };
+        family_a.insert((*evidence_class, family.clone()), row.a.samples);
+        family_b.insert((*evidence_class, family.clone()), row.b.samples);
+    }
+    if checked_sum(family_a.values().copied(), "comparison family A total")?
+        != report.determinants.a_populations.jit_user
+        || checked_sum(family_b.values().copied(), "comparison family B total")?
+            != report.determinants.b_populations.jit_user
+    {
+        bail!("comparison family rows do not reproduce both JIT populations");
+    }
+
+    let mut word_a = BTreeMap::<(EvidenceClass, String), u64>::new();
+    let mut word_b = BTreeMap::<(EvidenceClass, String), u64>::new();
+    let mut expected_context_a = BTreeMap::<ContextAccess, u64>::new();
+    let mut expected_context_b = BTreeMap::<ContextAccess, u64>::new();
+    for row in &report.word_rows {
+        let ComparisonKey::Word {
+            family,
+            word,
+            evidence_class,
+        } = &row.key
+        else {
+            bail!("comparison word row lost its word key");
+        };
+        checked_map_increment(
+            &mut word_a,
+            (*evidence_class, family.clone()),
+            row.a.samples,
+            "comparison word A family total",
+        )?;
+        checked_map_increment(
+            &mut word_b,
+            (*evidence_class, family.clone()),
+            row.b.samples,
+            "comparison word B family total",
+        )?;
+        let decoded = decode_context(*word);
+        match (is_context_family(family), decoded) {
+            (true, Some(access)) => {
+                checked_map_increment(
+                    &mut expected_context_a,
+                    access,
+                    row.a.samples,
+                    "comparison expected context A total",
+                )?;
+                checked_map_increment(
+                    &mut expected_context_b,
+                    access,
+                    row.b.samples,
+                    "comparison expected context B total",
+                )?;
+            }
+            (true, None) => bail!("comparison context word did not decode"),
+            (false, Some(_)) => bail!("comparison non-context word decoded as context traffic"),
+            (false, None) => {}
+        }
+    }
+    if word_a != family_a || word_b != family_b {
+        bail!("comparison word rows do not exactly reproduce family populations");
+    }
+
+    let mut actual_context_a = BTreeMap::<ContextAccess, u64>::new();
+    let mut actual_context_b = BTreeMap::<ContextAccess, u64>::new();
+    for row in &report.context_rows {
+        let ComparisonKey::Context {
+            direction,
+            first,
+            second,
+        } = &row.key
+        else {
+            bail!("comparison context row lost its context key");
+        };
+        let access = ContextAccess {
+            direction: *direction,
+            first: validate_context_operand(first, "first comparison")?,
+            second: second
+                .as_ref()
+                .map(|operand| validate_context_operand(operand, "second comparison"))
+                .transpose()?,
+        };
+        actual_context_a.insert(access, row.a.samples);
+        actual_context_b.insert(access, row.b.samples);
+    }
+    if actual_context_a != expected_context_a || actual_context_b != expected_context_b {
+        bail!("comparison context rows do not reproduce compound word evidence");
+    }
+    Ok(())
+}
+
+fn comparison_determinants(
+    a: &JitShapeCensusV3,
+    b: &JitShapeCensusV3,
+) -> anyhow::Result<ComparisonDeterminants> {
+    let determinants = ComparisonDeterminants {
+        a_capture_authority: a.capture_authority.clone(),
+        b_capture_authority: b.capture_authority.clone(),
+        a_census_identity: a.census_identity.clone(),
+        b_census_identity: b.census_identity.clone(),
+        classifier_schema: a.classifier_schema.clone(),
+        a_capture_receipt_sha256: a.capture_receipt_sha256.clone(),
+        b_capture_receipt_sha256: b.capture_receipt_sha256.clone(),
+        a_raw_trace_sha256: a.raw_trace_sha256.clone(),
+        b_raw_trace_sha256: b.raw_trace_sha256.clone(),
+        a_snapshot_manifest_sha256: a.snapshot_manifest_sha256.clone(),
+        b_snapshot_manifest_sha256: b.snapshot_manifest_sha256.clone(),
+        a_populations: a.populations.clone(),
+        b_populations: b.populations.clone(),
+    };
+    determinants.validate()?;
+    Ok(determinants)
+}
+
+fn zero_share(populations: &CensusPopulations) -> CensusShare {
+    census_share(0, populations.jit_user, populations.all_cpu)
+}
+
+fn absolute_fraction_drift(
+    a: &CensusFraction,
+    b: &CensusFraction,
+) -> anyhow::Result<ComparisonFraction> {
+    if a.denominator == 0 || b.denominator == 0 {
+        bail!("comparison share denominator is zero");
+    }
+    let a_scaled = u128::from(a.numerator)
+        .checked_mul(u128::from(b.denominator))
+        .context("comparison A share cross multiplication overflow")?;
+    let b_scaled = u128::from(b.numerator)
+        .checked_mul(u128::from(a.denominator))
+        .context("comparison B share cross multiplication overflow")?;
+    let denominator = u128::from(a.denominator)
+        .checked_mul(u128::from(b.denominator))
+        .context("comparison drift denominator overflow")?;
+    Ok(ComparisonFraction {
+        numerator: a_scaled.abs_diff(b_scaled),
+        denominator,
+    })
+}
+
+fn share_at_least_ten_percent(share: &CensusFraction) -> anyhow::Result<bool> {
+    let numerator = u128::from(share.numerator)
+        .checked_mul(100)
+        .context("comparison ten-percent numerator overflow")?;
+    let denominator = u128::from(share.denominator)
+        .checked_mul(10)
+        .context("comparison ten-percent denominator overflow")?;
+    Ok(numerator >= denominator)
+}
+
+fn mechanical_crossing_gate(
+    a: &CensusFraction,
+    b: &CensusFraction,
+) -> anyhow::Result<(bool, ComparisonFraction)> {
+    let drift = absolute_fraction_drift(a, b)?;
+    let drift_percent = drift
+        .numerator
+        .checked_mul(100)
+        .context("comparison drift percentage numerator overflow")?;
+    let five_percent = drift
+        .denominator
+        .checked_mul(5)
+        .context("comparison five-percentage-point denominator overflow")?;
+    let crosses = share_at_least_ten_percent(a)?
+        && share_at_least_ten_percent(b)?
+        && drift_percent <= five_percent;
+    Ok((crosses, drift))
+}
+
+fn minimum_fraction(a: &CensusFraction, b: &CensusFraction) -> anyhow::Result<CensusFraction> {
+    if compare_fraction(a, b)?.is_le() {
+        Ok(a.clone())
+    } else {
+        Ok(b.clone())
+    }
+}
+
+fn compare_fraction(a: &CensusFraction, b: &CensusFraction) -> anyhow::Result<std::cmp::Ordering> {
+    let a_scaled = u128::from(a.numerator)
+        .checked_mul(u128::from(b.denominator))
+        .context("comparison fraction A cross multiplication overflow")?;
+    let b_scaled = u128::from(b.numerator)
+        .checked_mul(u128::from(a.denominator))
+        .context("comparison fraction B cross multiplication overflow")?;
+    Ok(a_scaled.cmp(&b_scaled))
+}
+
+fn join_comparison_rows(
+    a: BTreeMap<ComparisonKey, CensusShare>,
+    b: BTreeMap<ComparisonKey, CensusShare>,
+    a_populations: &CensusPopulations,
+    b_populations: &CensusPopulations,
+) -> anyhow::Result<Vec<ComparisonRow>> {
+    let mut keys = a.keys().chain(b.keys()).cloned().collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+    keys.into_iter()
+        .map(|key| {
+            let a_share = a
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| zero_share(a_populations));
+            let b_share = b
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| zero_share(b_populations));
+            let absolute_all_cpu_drift =
+                absolute_fraction_drift(&a_share.share_of_all_cpu, &b_share.share_of_all_cpu)?;
+            Ok(ComparisonRow {
+                key,
+                a: a_share,
+                b: b_share,
+                absolute_all_cpu_drift,
+            })
+        })
+        .collect()
+}
+
+fn comparison_family_map(census: &JitShapeCensusV3) -> BTreeMap<ComparisonKey, CensusShare> {
+    census
+        .families
+        .iter()
+        .map(|row| {
+            (
+                ComparisonKey::Family {
+                    evidence_class: row.evidence_class,
+                    family: row.family.clone(),
+                },
+                row.share.clone(),
+            )
+        })
+        .collect()
+}
+
+fn comparison_word_map(census: &JitShapeCensusV3) -> BTreeMap<ComparisonKey, CensusShare> {
+    census
+        .words
+        .iter()
+        .map(|row| {
+            (
+                ComparisonKey::Word {
+                    family: row.family.clone(),
+                    word: row.word,
+                    evidence_class: row.evidence_class,
+                },
+                row.share.clone(),
+            )
+        })
+        .collect()
+}
+
+fn comparison_context_map(census: &JitShapeCensusV3) -> BTreeMap<ComparisonKey, CensusShare> {
+    census
+        .contexts
+        .iter()
+        .map(|row| {
+            (
+                ComparisonKey::Context {
+                    direction: row.direction,
+                    first: row.first.clone(),
+                    second: row.second.clone(),
+                },
+                row.share.clone(),
+            )
+        })
+        .collect()
+}
+
+fn mechanical_crossings(
+    rows: impl IntoIterator<Item = ComparisonRow>,
+) -> anyhow::Result<Vec<MechanicalCrossing>> {
+    let mut crossings = Vec::new();
+    for row in rows {
+        let (crosses, drift) =
+            mechanical_crossing_gate(&row.a.share_of_all_cpu, &row.b.share_of_all_cpu)?;
+        if crosses {
+            crossings.push(MechanicalCrossing {
+                key: row.key,
+                minimum_all_cpu_share: minimum_fraction(
+                    &row.a.share_of_all_cpu,
+                    &row.b.share_of_all_cpu,
+                )?,
+                a: row.a,
+                b: row.b,
+                absolute_all_cpu_drift: drift,
+            });
+        }
+    }
+    for index in 1..crossings.len() {
+        let mut current = index;
+        while current > 0 {
+            let previous = &crossings[current - 1];
+            let candidate = &crossings[current];
+            let share_order = compare_fraction(
+                &previous.minimum_all_cpu_share,
+                &candidate.minimum_all_cpu_share,
+            )?;
+            let is_ordered =
+                share_order.is_gt() || (share_order.is_eq() && previous.key < candidate.key);
+            if is_ordered {
+                break;
+            }
+            crossings.swap(current - 1, current);
+            current -= 1;
+        }
+    }
+    Ok(crossings)
+}
+
+fn build_comparison_from_bytes(
+    a_bytes: &[u8],
+    b_bytes: &[u8],
+) -> anyhow::Result<JitShapeComparisonV1> {
+    if a_bytes == b_bytes {
+        bail!("JIT shape comparison inputs are byte-identical");
+    }
+    let a = parse_census_v3(a_bytes).context("parse strict canonical census A")?;
+    let b = parse_census_v3(b_bytes).context("parse strict canonical census B")?;
+    let determinants = comparison_determinants(&a, &b)?;
+    let a_sha256 = format!("{:x}", Sha256::digest(a_bytes));
+    let b_sha256 = format!("{:x}", Sha256::digest(b_bytes));
+    require_distinct(&a_sha256, &b_sha256, "census hashes")?;
+    let family_rows = join_comparison_rows(
+        comparison_family_map(&a),
+        comparison_family_map(&b),
+        &a.populations,
+        &b.populations,
+    )?;
+    let word_rows = join_comparison_rows(
+        comparison_word_map(&a),
+        comparison_word_map(&b),
+        &a.populations,
+        &b.populations,
+    )?;
+    let context_rows = join_comparison_rows(
+        comparison_context_map(&a),
+        comparison_context_map(&b),
+        &a.populations,
+        &b.populations,
+    )?;
+    let mechanical_crossings = mechanical_crossings(
+        family_rows
+            .iter()
+            .chain(&word_rows)
+            .chain(&context_rows)
+            .cloned(),
+    )?;
+    let report = JitShapeComparisonV1 {
+        schema: COMPARISON_SCHEMA.to_owned(),
+        a_sha256,
+        b_sha256,
+        determinants,
+        family_rows,
+        word_rows,
+        context_rows,
+        mechanical_crossings,
+    };
+    report.validate()?;
+    Ok(report)
+}
+
+fn serialize_comparison(report: &JitShapeComparisonV1) -> anyhow::Result<Vec<u8>> {
+    report.validate()?;
+    let mut bytes = serde_json::to_vec(report).context("serialize JIT shape comparison v1")?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+pub(crate) fn parse_comparison_v1(bytes: &[u8]) -> anyhow::Result<JitShapeComparisonV1> {
+    if bytes.last() != Some(&b'\n') || bytes.iter().filter(|byte| **byte == b'\n').count() != 1 {
+        bail!("JIT shape comparison must be exactly one newline-terminated JSON object");
+    }
+    let report: JitShapeComparisonV1 = serde_json::from_slice(&bytes[..bytes.len() - 1])
+        .context("parse JIT shape comparison v1")?;
+    report.validate()?;
+    if serialize_comparison(&report)? != bytes {
+        bail!("JIT shape comparison is not canonical v1 output");
+    }
+    Ok(report)
+}
+
+fn publish_noclobber(
+    bytes: &[u8],
     output_path: Option<&Path>,
     stdout: &mut impl Write,
+    artifact: &str,
 ) -> anyhow::Result<()> {
-    let bytes = serialize_census(report)?;
-    parse_census_v3(&bytes).context("self-validate published JIT shape census")?;
     let Some(path) = output_path else {
         stdout
-            .write_all(&bytes)
-            .context("write JIT shape census v3 to stdout")?;
-        stdout.flush().context("flush JIT shape census v3 stdout")?;
+            .write_all(bytes)
+            .with_context(|| format!("write {artifact} to stdout"))?;
+        stdout
+            .flush()
+            .with_context(|| format!("flush {artifact} stdout"))?;
         return Ok(());
     };
 
@@ -857,34 +1614,96 @@ fn publish_census(
         .filter(|value| !value.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
-        .with_context(|| format!("create census output directory {}", parent.display()))?;
+        .with_context(|| format!("create {artifact} output directory {}", parent.display()))?;
     let mut temporary = NamedTempFile::new_in(parent)
-        .with_context(|| format!("create temporary census in {}", parent.display()))?;
+        .with_context(|| format!("create temporary {artifact} in {}", parent.display()))?;
     {
         let mut writer = BufWriter::new(temporary.as_file_mut());
         writer
-            .write_all(&bytes)
-            .context("write JIT shape census v3 artifact")?;
+            .write_all(bytes)
+            .with_context(|| format!("write {artifact} artifact"))?;
         writer
             .flush()
-            .context("flush JIT shape census v3 artifact")?;
+            .with_context(|| format!("flush {artifact} artifact"))?;
     }
     temporary
         .as_file()
         .sync_all()
-        .context("sync JIT shape census v3 artifact")?;
+        .with_context(|| format!("sync {artifact} artifact"))?;
     temporary.persist_noclobber(path).map_err(|error| {
         if error.error.kind() == std::io::ErrorKind::AlreadyExists {
-            anyhow!("JIT shape census output already exists: {}", path.display())
+            anyhow!("{artifact} output already exists: {}", path.display())
         } else {
             anyhow!(
-                "publish JIT shape census {} without clobbering: {}",
+                "publish {artifact} {} without clobbering: {}",
                 path.display(),
                 error.error
             )
         }
     })?;
     Ok(())
+}
+
+fn publish_comparison(
+    report: &JitShapeComparisonV1,
+    output_path: Option<&Path>,
+    stdout: &mut impl Write,
+) -> anyhow::Result<()> {
+    let bytes = serialize_comparison(report)?;
+    parse_comparison_v1(&bytes).context("self-validate published JIT shape comparison")?;
+    publish_noclobber(&bytes, output_path, stdout, "JIT shape comparison v1")
+}
+
+fn publish_census(
+    report: &JitShapeCensusV3,
+    output_path: Option<&Path>,
+    stdout: &mut impl Write,
+) -> anyhow::Result<()> {
+    let bytes = serialize_census(report)?;
+    parse_census_v3(&bytes).context("self-validate published JIT shape census")?;
+    publish_noclobber(&bytes, output_path, stdout, "JIT shape census v3")
+}
+
+pub(crate) fn run_jit_shape_compare(
+    a_path: &Path,
+    b_path: &Path,
+    output_path: Option<&Path>,
+) -> anyhow::Result<()> {
+    let executable = std::env::current_exe().context("resolve running comparison executable")?;
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    run_jit_shape_compare_with_identity_capture(a_path, b_path, output_path, &mut stdout, || {
+        CaptureIdentity::capture(&executable)
+    })
+}
+
+fn run_jit_shape_compare_with_identity_capture(
+    a_path: &Path,
+    b_path: &Path,
+    output_path: Option<&Path>,
+    stdout: &mut impl Write,
+    mut capture_identity: impl FnMut() -> anyhow::Result<CaptureIdentity>,
+) -> anyhow::Result<()> {
+    if a_path == b_path {
+        bail!("JIT shape comparison requires two distinct census files");
+    }
+    let before = capture_identity().context("capture pre-comparison source/binary identity")?;
+    let a_bytes = fs::read(a_path)
+        .with_context(|| format!("read JIT shape census A {}", a_path.display()))?;
+    let b_bytes = fs::read(b_path)
+        .with_context(|| format!("read JIT shape census B {}", b_path.display()))?;
+    let report = build_comparison_from_bytes(&a_bytes, &b_bytes)?;
+    before
+        .require_exact_match(&report.determinants.a_census_identity)
+        .context("comparison executor does not match census A classifier identity")?;
+    before
+        .require_exact_match(&report.determinants.b_census_identity)
+        .context("comparison executor does not match census B classifier identity")?;
+    let after = capture_identity().context("capture post-comparison source/binary identity")?;
+    before
+        .require_exact_match(&after)
+        .context("comparison source/binary identity drift")?;
+    publish_comparison(&report, output_path, stdout)
 }
 
 fn run_jit_shape_census_with_identity_capture(
@@ -1585,6 +2404,541 @@ mod tests {
         let mut old_classifier = report;
         old_classifier.classifier_schema = "carrick.jit-shape-classifier.aarch64.v2".into();
         assert!(old_classifier.validate().is_err());
+    }
+
+    fn comparison_censuses() -> (JitShapeCensusV3, JitShapeCensusV3) {
+        let a = CensusFixture::new()
+            .build()
+            .expect("build comparison census A");
+        let mut b = a.clone();
+        b.capture_authority.run_id = "native-shape-comparison-b".to_owned();
+        b.capture_receipt_sha256 = "6".repeat(64);
+        b.raw_trace_sha256 = "7".repeat(64);
+        b.snapshot_manifest_sha256 = "8".repeat(64);
+        b.validate().expect("comparison census B remains valid");
+        (a, b)
+    }
+
+    fn compare_reports(
+        a: &JitShapeCensusV3,
+        b: &JitShapeCensusV3,
+    ) -> anyhow::Result<JitShapeComparisonV1> {
+        build_comparison_from_bytes(&serialize_census(a)?, &serialize_census(b)?)
+    }
+
+    fn make_comparison_b(report: &mut JitShapeCensusV3) {
+        report.capture_authority.run_id = "native-shape-comparison-b".to_owned();
+        report.capture_receipt_sha256 = "6".repeat(64);
+        report.raw_trace_sha256 = "7".repeat(64);
+        report.snapshot_manifest_sha256 = "8".repeat(64);
+        report
+            .validate()
+            .expect("comparison B remains a valid v3 census");
+    }
+
+    #[test]
+    fn jit_shape_compare_rejects_every_capture_and_census_determinant_drift() {
+        type Mutation = fn(&mut JitShapeCensusV3);
+        let mutations: &[(&str, Mutation)] = &[
+            ("capture git", |report| {
+                report.capture_authority.git_head = "a".repeat(40)
+            }),
+            ("capture executable", |report| {
+                report.capture_authority.executable_sha256 = "a".repeat(64)
+            }),
+            ("capture host", |report| {
+                report.capture_authority.host = "other-capture-host".into()
+            }),
+            ("capture architecture", |report| {
+                report.capture_authority.host_arch = "x86_64".into()
+            }),
+            ("capture OS build", |report| {
+                report.capture_authority.os_build = "26B1".into()
+            }),
+            ("profile", |report| {
+                report.capture_authority.profile = "other".into()
+            }),
+            ("raw schema", |report| {
+                report.capture_authority.raw_schema = "carrick.native-shape.raw.v1".into()
+            }),
+            ("D template", |report| {
+                report.capture_authority.program_template_sha256 = "a".repeat(64)
+            }),
+            ("birth qualification", |report| {
+                report.capture_authority.birth_qualification_sha256 = "a".repeat(64)
+            }),
+            ("terminal qualification", |report| {
+                report.capture_authority.terminal_qualification_sha256 = "a".repeat(64)
+            }),
+            ("canonical image", |report| {
+                let image = "docker.io/library/ubuntu@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+                report.capture_authority.image = image.into();
+                report.capture_authority.target_argv[3] = image.into();
+                report.capture_authority.target_argv_sha256 =
+                    argv_sha256(&report.capture_authority.target_argv).unwrap();
+            }),
+            ("target argv", |report| {
+                report.capture_authority.target_argv[4] = "/bin/false".into();
+                report.capture_authority.target_argv_sha256 =
+                    argv_sha256(&report.capture_authority.target_argv).unwrap();
+            }),
+            ("target argv digest", |report| {
+                report.capture_authority.target_argv_sha256 = "a".repeat(64)
+            }),
+            ("sampling frequency", |report| {
+                report.capture_authority.sampling_hz = 998
+            }),
+            ("classifier schema", |report| {
+                report.classifier_schema = "carrick.jit-shape-classifier.aarch64.v2".into()
+            }),
+            ("census git", |report| {
+                report.census_identity.git_head = "a".repeat(40)
+            }),
+            ("census executable", |report| {
+                report.census_identity.executable_sha256 = "a".repeat(64)
+            }),
+            ("census host", |report| {
+                report.census_identity.host = "other-census-host".into()
+            }),
+            ("census architecture", |report| {
+                report.census_identity.host_arch = "x86_64".into()
+            }),
+            ("census OS build", |report| {
+                report.census_identity.os_build = "26B1".into()
+            }),
+        ];
+
+        let (a, b) = comparison_censuses();
+        compare_reports(&a, &b).expect("matching comparison determinants should pass");
+
+        for (name, mutate) in mutations {
+            let (a, mut b) = comparison_censuses();
+            mutate(&mut b);
+            let error = compare_reports(&a, &b)
+                .expect_err(&format!("{name} determinant drift must be rejected"));
+            assert!(
+                format!("{error:#}").contains(name.split_whitespace().next().unwrap()),
+                "unexpected {name} rejection: {error:#}",
+            );
+        }
+    }
+
+    #[test]
+    fn jit_shape_compare_requires_independent_strict_v3_inputs() {
+        let (a, b) = comparison_censuses();
+        let a_bytes = serialize_census(&a).unwrap();
+        assert!(build_comparison_from_bytes(&a_bytes, &a_bytes).is_err());
+
+        let mut duplicate = b.clone();
+        duplicate.capture_authority.run_id = a.capture_authority.run_id.clone();
+        assert!(compare_reports(&a, &duplicate).is_err());
+
+        let mut duplicate = b.clone();
+        duplicate.capture_receipt_sha256 = a.capture_receipt_sha256.clone();
+        assert!(compare_reports(&a, &duplicate).is_err());
+
+        let mut duplicate = b.clone();
+        duplicate.raw_trace_sha256 = a.raw_trace_sha256.clone();
+        assert!(compare_reports(&a, &duplicate).is_err());
+
+        let mut duplicate = b.clone();
+        duplicate.snapshot_manifest_sha256 = a.snapshot_manifest_sha256.clone();
+        assert!(compare_reports(&a, &duplicate).is_err());
+
+        for old in [
+            b"{\"schema\":\"carrick.jit-shape-census.v1\"}\n".as_slice(),
+            b"{\"schema\":\"carrick.jit-shape-census.v2\"}\n".as_slice(),
+        ] {
+            assert!(build_comparison_from_bytes(old, &serialize_census(&b).unwrap()).is_err());
+        }
+
+        let mut incomplete = b.clone();
+        incomplete.words.pop();
+        let mut incomplete_bytes = serde_json::to_vec(&incomplete).unwrap();
+        incomplete_bytes.push(b'\n');
+        assert!(build_comparison_from_bytes(&a_bytes, &incomplete_bytes).is_err());
+
+        let mut duplicate = b;
+        duplicate.families.push(duplicate.families[0].clone());
+        let mut duplicate_bytes = serde_json::to_vec(&duplicate).unwrap();
+        duplicate_bytes.push(b'\n');
+        assert!(build_comparison_from_bytes(&a_bytes, &duplicate_bytes).is_err());
+    }
+
+    #[test]
+    fn jit_shape_compare_full_outer_joins_family_word_and_compound_context_keys() {
+        let a = census_fixture_with_words(&[0xf942_3791, 0xc8df_fe73, 0x1400_0000])
+            .build()
+            .expect("build outer-join census A");
+        let mut b = census_fixture_with_words(&[0xa901_0791, 0xc8df_fe73, 0x1400_0000])
+            .build()
+            .expect("build outer-join census B");
+        make_comparison_b(&mut b);
+
+        let comparison = compare_reports(&a, &b).expect("build full outer join");
+        assert_eq!(comparison.family_rows.len(), 4);
+        assert_eq!(comparison.word_rows.len(), 4);
+        assert_eq!(comparison.context_rows.len(), 2);
+        assert!(comparison.family_rows.iter().any(|row| {
+            matches!(
+                &row.key,
+                ComparisonKey::Family {
+                    evidence_class: EvidenceClass::ExactAmbiguous,
+                    family,
+                } if family == "guard-ldar"
+            )
+        }));
+
+        let load = comparison
+            .family_rows
+            .iter()
+            .find(|row| {
+                matches!(
+                    &row.key,
+                    ComparisonKey::Family { family, .. } if family == "ctx-load64"
+                )
+            })
+            .expect("A-only context-load family remains visible");
+        assert_eq!(
+            load.a.share_of_all_cpu,
+            CensusFraction {
+                numerator: 1,
+                denominator: 3
+            }
+        );
+        assert_eq!(load.b.samples, 0);
+        assert_eq!(
+            load.b.share_of_jit,
+            CensusFraction {
+                numerator: 0,
+                denominator: 3
+            }
+        );
+        assert_eq!(
+            load.b.share_of_all_cpu,
+            CensusFraction {
+                numerator: 0,
+                denominator: 3
+            }
+        );
+
+        let pair = comparison
+            .context_rows
+            .iter()
+            .find(|row| {
+                matches!(
+                    &row.key,
+                    ComparisonKey::Context {
+                        second: Some(_),
+                        ..
+                    }
+                )
+            })
+            .expect("B-only pair context remains compound");
+        let ComparisonKey::Context { first, second, .. } = &pair.key else {
+            panic!("expected compound context key");
+        };
+        assert_eq!((first.slot, first.physical_register), (16, 17));
+        assert_eq!(
+            second
+                .as_ref()
+                .map(|operand| (operand.slot, operand.physical_register)),
+            Some((24, 1)),
+        );
+        assert_eq!(pair.a.samples, 0);
+        assert_eq!(pair.b.samples, 1);
+    }
+
+    #[test]
+    fn jit_shape_compare_crossing_gate_uses_exact_boundaries_and_fails_on_overflow() {
+        let share = |numerator, denominator| CensusFraction {
+            numerator,
+            denominator,
+        };
+        assert!(
+            !mechanical_crossing_gate(&share(9_999, 100_000), &share(9_999, 100_000),)
+                .unwrap()
+                .0
+        );
+        assert!(
+            mechanical_crossing_gate(&share(10_000, 100_000), &share(10_000, 100_000),)
+                .unwrap()
+                .0
+        );
+        assert!(
+            mechanical_crossing_gate(&share(10_001, 100_000), &share(10_001, 100_000),)
+                .unwrap()
+                .0
+        );
+
+        for (b, expected) in [(14_999, true), (15_000, true), (15_001, false)] {
+            let (crosses, drift) =
+                mechanical_crossing_gate(&share(10_000, 100_000), &share(b, 100_000)).unwrap();
+            assert_eq!(crosses, expected, "wrong exact drift boundary for {b}");
+            assert_eq!(
+                drift,
+                ComparisonFraction {
+                    numerator: u128::from(b - 10_000) * 100_000,
+                    denominator: 10_000_000_000,
+                },
+            );
+        }
+
+        assert!(
+            mechanical_crossing_gate(&share(u64::MAX, u64::MAX), &share(u64::MAX, u64::MAX),)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn jit_shape_compare_sorts_crossings_by_exact_minimum_then_key_and_is_symmetric() {
+        let a_words = [
+            0x1400_0000,
+            0x1400_0000,
+            0x1400_0000,
+            0x1400_0000,
+            0xf942_3791,
+            0xf942_3791,
+            0xf942_3791,
+            0xf940_0240,
+            0xf940_0240,
+            0xd503_201f,
+        ];
+        let b_words = [
+            0x1400_0000,
+            0x1400_0000,
+            0x1400_0000,
+            0x1400_0000,
+            0x1400_0000,
+            0xf942_3791,
+            0xf942_3791,
+            0xf940_0240,
+            0xf940_0240,
+            0xd503_201f,
+        ];
+        let a = census_fixture_with_words(&a_words).build().unwrap();
+        let mut b = census_fixture_with_words(&b_words).build().unwrap();
+        make_comparison_b(&mut b);
+
+        let forward = compare_reports(&a, &b).expect("compare A/B");
+        let reverse = compare_reports(&b, &a).expect("compare B/A");
+        assert!(forward.mechanical_crossings.len() >= 4);
+        for pair in forward.mechanical_crossings.windows(2) {
+            let order = compare_fraction(
+                &pair[0].minimum_all_cpu_share,
+                &pair[1].minimum_all_cpu_share,
+            )
+            .unwrap();
+            assert!(
+                order.is_gt() || (order.is_eq() && pair[0].key < pair[1].key),
+                "crossings are not sorted by descending exact minimum then key",
+            );
+        }
+        assert_eq!(
+            forward
+                .mechanical_crossings
+                .iter()
+                .map(|row| &row.key)
+                .collect::<Vec<_>>(),
+            reverse
+                .mechanical_crossings
+                .iter()
+                .map(|row| &row.key)
+                .collect::<Vec<_>>(),
+        );
+        for (forward, reverse) in forward
+            .mechanical_crossings
+            .iter()
+            .zip(&reverse.mechanical_crossings)
+        {
+            assert_eq!(forward.a, reverse.b);
+            assert_eq!(forward.b, reverse.a);
+            assert_eq!(
+                forward.absolute_all_cpu_drift,
+                reverse.absolute_all_cpu_drift
+            );
+        }
+    }
+
+    #[test]
+    fn jit_shape_compare_v1_is_canonical_strict_and_self_validating() {
+        let (a, b) = comparison_censuses();
+        let report = compare_reports(&a, &b).expect("build strict comparison report");
+        let first = serialize_comparison(&report).expect("serialize comparison once");
+        let second = serialize_comparison(&report).expect("serialize comparison twice");
+        assert_eq!(first, second);
+        assert_eq!(parse_comparison_v1(&first).unwrap(), report);
+        assert_eq!(first.last(), Some(&b'\n'));
+        assert_eq!(first.iter().filter(|byte| **byte == b'\n').count(), 1);
+
+        let wide = ComparisonFraction {
+            numerator: u128::from(u64::MAX) + 1,
+            denominator: u128::from(u64::MAX) + 2,
+        };
+        let encoded = serde_json::to_vec(&wide).expect("serialize u128 exact fraction");
+        assert_eq!(
+            serde_json::from_slice::<ComparisonFraction>(&encoded)
+                .expect("deserialize u128 exact fraction"),
+            wide,
+        );
+
+        let mut unknown: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        unknown["unknown"] = true.into();
+        let mut unknown = serde_json::to_vec(&unknown).unwrap();
+        unknown.push(b'\n');
+        assert!(parse_comparison_v1(&unknown).is_err());
+
+        let mut noncanonical = first.clone();
+        noncanonical.insert(noncanonical.len() - 1, b' ');
+        assert!(parse_comparison_v1(&noncanonical).is_err());
+
+        let mut mutations = Vec::<(&str, JitShapeComparisonV1)>::new();
+        let mut changed = report.clone();
+        changed.schema = "carrick.jit-shape-comparison.v0".into();
+        mutations.push(("schema", changed));
+        let mut changed = report.clone();
+        changed.a_sha256 = "0".into();
+        mutations.push(("input hash", changed));
+        let mut changed = report.clone();
+        changed.determinants.b_raw_trace_sha256 = changed.determinants.a_raw_trace_sha256.clone();
+        mutations.push(("duplicate capture", changed));
+        let mut changed = report.clone();
+        changed.determinants.b_census_identity.host_arch = "x86_64".into();
+        mutations.push(("non-AArch64 census identity", changed));
+        let mut changed = report.clone();
+        changed.family_rows.pop();
+        mutations.push(("missing family", changed));
+        let mut changed = report.clone();
+        changed.word_rows.push(changed.word_rows[0].clone());
+        mutations.push(("duplicate word", changed));
+        let mut changed = report.clone();
+        changed.context_rows.reverse();
+        mutations.push(("context order", changed));
+        let mut changed = report.clone();
+        let pair = changed
+            .context_rows
+            .iter_mut()
+            .find_map(|row| match &mut row.key {
+                ComparisonKey::Context {
+                    second: Some(second),
+                    ..
+                } => Some(second),
+                _ => None,
+            })
+            .expect("comparison fixture contains a pair context");
+        pair.physical_register = 2;
+        mutations.push(("compound context", changed));
+        let mut changed = report.clone();
+        changed.family_rows[0].a.share_of_all_cpu.numerator += 1;
+        mutations.push(("share", changed));
+        let mut changed = report.clone();
+        changed.word_rows[0].absolute_all_cpu_drift.numerator += 1;
+        mutations.push(("drift", changed));
+        let mut changed = report.clone();
+        changed.mechanical_crossings.pop();
+        mutations.push(("crossing", changed));
+        for (name, changed) in mutations {
+            assert!(changed.validate().is_err(), "accepted {name} mutation");
+        }
+    }
+
+    #[test]
+    fn jit_shape_compare_publication_is_no_clobber_and_race_safe() {
+        let (a, b) = comparison_censuses();
+        let report = compare_reports(&a, &b).unwrap();
+        let reversed = compare_reports(&b, &a).unwrap();
+        let expected = serialize_comparison(&report).unwrap();
+        let reversed_expected = serialize_comparison(&reversed).unwrap();
+
+        let mut stdout = Vec::new();
+        publish_comparison(&report, None, &mut stdout).unwrap();
+        assert_eq!(stdout, expected);
+
+        let root = tempfile::tempdir().unwrap();
+        let existing = root.path().join("existing.json");
+        std::fs::write(&existing, b"preserve-me\n").unwrap();
+        let error = publish_comparison(&report, Some(&existing), &mut Vec::new())
+            .expect_err("comparison publication must preserve an existing artifact");
+        assert!(format!("{error:#}").contains("already exists"));
+        assert_eq!(std::fs::read(&existing).unwrap(), b"preserve-me\n");
+
+        let race = std::sync::Arc::new(root.path().join("race.json"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for report in [report, reversed] {
+            let race = std::sync::Arc::clone(&race);
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                publish_comparison(&report, Some(race.as_path()), &mut Vec::new())
+            }));
+        }
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("publisher thread did not panic"))
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        let winner = std::fs::read(race.as_path()).unwrap();
+        assert!(winner == expected || winner == reversed_expected);
+    }
+
+    #[test]
+    fn jit_shape_compare_runner_binds_stable_executor_identity_before_publication() {
+        let (a, b) = comparison_censuses();
+        let root = tempfile::tempdir().unwrap();
+        let a_path = root.path().join("a.json");
+        let b_path = root.path().join("b.json");
+        std::fs::write(&a_path, serialize_census(&a).unwrap()).unwrap();
+        std::fs::write(&b_path, serialize_census(&b).unwrap()).unwrap();
+        let expected = serialize_comparison(&compare_reports(&a, &b).unwrap()).unwrap();
+
+        let mut calls = 0_u8;
+        let mut stdout = Vec::new();
+        run_jit_shape_compare_with_identity_capture(&a_path, &b_path, None, &mut stdout, || {
+            calls += 1;
+            Ok(a.census_identity.clone())
+        })
+        .expect("stable comparator executor should publish");
+        assert_eq!(calls, 2);
+        assert_eq!(stdout, expected);
+
+        let mut mismatch = a.census_identity.clone();
+        mismatch.executable_sha256 = "a".repeat(64);
+        let mut unpublished = Vec::new();
+        assert!(
+            run_jit_shape_compare_with_identity_capture(
+                &a_path,
+                &b_path,
+                None,
+                &mut unpublished,
+                || Ok(mismatch.clone()),
+            )
+            .is_err()
+        );
+        assert!(unpublished.is_empty());
+
+        let mut calls = 0_u8;
+        let mut unpublished = Vec::new();
+        assert!(
+            run_jit_shape_compare_with_identity_capture(
+                &a_path,
+                &b_path,
+                None,
+                &mut unpublished,
+                || {
+                    calls += 1;
+                    let mut identity = a.census_identity.clone();
+                    if calls == 2 {
+                        identity.git_head = "a".repeat(40);
+                    }
+                    Ok(identity)
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(calls, 2);
+        assert!(unpublished.is_empty());
     }
 
     #[test]
