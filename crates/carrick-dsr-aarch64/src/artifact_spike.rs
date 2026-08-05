@@ -45,6 +45,7 @@ const ARTIFACT_RECORD_LENGTH_OFFSET: usize = ARTIFACT_RECORD_MODE_OFFSET + 8;
 const ARTIFACT_RECORD_HEADER: usize = ARTIFACT_RECORD_LENGTH_OFFSET + 8;
 const ARTIFACT_MAX_RECORD: usize = 4 * 1024 * 1024;
 const ARTIFACT_DECODE_LIMIT: usize = ARTIFACT_MAX_RECORD;
+const SHARED_INITIAL_METADATA_LIMIT: usize = 256 * 1024 * 1024;
 const ARTIFACT_COUNTER_OFFSET: usize = 64;
 static ARTIFACT_AUTHORITY: OnceLock<ArtifactAuthority> = OnceLock::new();
 
@@ -1064,6 +1065,26 @@ pub struct ArtifactRecording {
     trusted_entry: Option<TrustedEntryTemplate>,
 }
 
+/// Fully encoded, process-independent metadata for one shared INITIAL block.
+/// This deliberately has no `ArtifactBindings`: process values are permitted
+/// only while validating the recording and are discarded before this value is
+/// constructed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SharedInitialMetadata {
+    hot: Vec<u8>,
+    cold: Vec<u8>,
+}
+
+impl SharedInitialMetadata {
+    pub(crate) fn hot_bytes(&self) -> &[u8] {
+        &self.hot
+    }
+
+    pub(crate) fn cold_bytes(&self) -> &[u8] {
+        &self.cold
+    }
+}
+
 impl ArtifactRecording {
     /// Record the trusted second entry point the emitter placed past the
     /// generation guard. At most one per block.
@@ -1218,13 +1239,13 @@ impl ArtifactRecording {
     /// Direct-link sites are deliberately omitted from the portable record;
     /// the BUILDING publisher may consume its private copy before READY, but a
     /// shared source must never re-enter a mutable link index afterward.
-    pub fn finish_shared_initial(
+    pub(crate) fn finish_shared_initial(
         self,
         words: Vec<u32>,
         map: Vec<PcMapEntry>,
         recovery: Vec<RecoveryEntry>,
         source_words: Vec<u32>,
-    ) -> Result<ArtifactRecord, DsrError> {
+    ) -> Result<SharedInitialMetadata, DsrError> {
         if !self.relocations.is_empty() {
             return Err(DsrError::CachePolicy(format!(
                 "shared INITIAL artifact retains {} process relocation(s)",
@@ -1242,7 +1263,17 @@ impl ArtifactRecording {
                     .to_string(),
             ));
         }
-        self.finish(words, map, recovery, Vec::new(), source_words)
+        let record = self.finish(words, map, recovery, Vec::new(), source_words)?;
+        let template = record.template.into_unit_record_metadata(true)?;
+        let (hot, cold) = template.into_unit_wire_parts();
+        let config = bincode::config::standard().with_limit::<SHARED_INITIAL_METADATA_LIMIT>();
+        let hot = bincode::serde::encode_to_vec(&hot, config).map_err(|error| {
+            DsrError::CachePolicy(format!("encode shared INITIAL hot metadata: {error}"))
+        })?;
+        let cold = bincode::serde::encode_to_vec(&cold, config).map_err(|error| {
+            DsrError::CachePolicy(format!("encode shared INITIAL cold metadata: {error}"))
+        })?;
+        Ok(SharedInitialMetadata { hot, cold })
     }
 }
 
