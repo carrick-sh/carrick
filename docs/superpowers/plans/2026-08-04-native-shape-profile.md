@@ -4,7 +4,7 @@
 
 **Goal:** Build the approved Darwin/AArch64 `native-shape` attribution path so two independent cold-Go-build captures can name, or fail to name, one source-distinct removable emitted-code mechanism that is at least 10% of all sampled CPU in both captures.
 
-**Architecture:** Add a first-class `TraceProfileKind::NativeShape` that renders one authenticated `NSHAPE2` DTrace program, exports retirement snapshots into a fresh owned directory, and publishes a dedicated capture receipt. Extract snapshot loading and PC resolution into one strict Rust authority shared by capture and census. Replace the old `SHAPE1`/external-ratio/Python workflow with deterministic Rust v2 census and pair-comparison commands. Keep capture integrity separate from workload success and keep all traced timing non-authoritative.
+**Architecture:** Add a first-class `TraceProfileKind::NativeShape` that renders one authenticated `NSHAPE2` DTrace program, exports retirement snapshots into a fresh owned directory, and publishes a dedicated capture receipt. Extract snapshot loading and PC resolution into one strict Rust authority shared by capture and census. Replace the old `SHAPE1`/external-ratio/Python workflow with deterministic Rust v3 census and pair-comparison commands. Keep capture integrity separate from workload success and keep all traced timing non-authoritative.
 
 **Tech Stack:** Rust 2024, Clap derive and `ArgMatches::value_source`, serde/serde_json, SHA-256 via `sha2`, `tempfile` atomic publication, Carrick's libdtrace consumer and native launch qualification, DTrace 997 Hz sampling, existing `carrick.code-snapshot.v4` exports, `just` gates.
 
@@ -613,7 +613,7 @@ git commit -m "feat(trace): publish native shape capture receipts"
 
 ---
 
-### Task 5: Replace the v1 Census and Python Classifier with Rust v2
+### Task 5: Replace the v1 Census and Python Classifier with Rust v3
 
 **Files:**
 
@@ -638,7 +638,7 @@ JitShapeCensus {
 },
 ```
 
-Tests must prove `--capture` and `--snapshots` are mandatory, `--output` is optional, `--jit-share-of-total` is unknown, SHAPE1 is rejected, a v1 capture/census is rejected, and omitted output writes deterministic JSON to stdout without a second human format.
+Tests must prove `--capture` and `--snapshots` are mandatory, `--output` is optional, `--jit-share-of-total` is unknown, SHAPE1 is rejected, v1 and v2 census inputs are rejected, a rejected/v1 capture is rejected, and omitted output writes deterministic JSON to stdout without a second human format.
 
 Run:
 
@@ -659,6 +659,7 @@ The result type is:
 #[serde(rename_all = "kebab-case")]
 enum EvidenceClass {
     InsertedExact,
+    ExactAmbiguous,
     GuestDescriptive,
 }
 
@@ -669,18 +670,18 @@ struct Classification {
 }
 ```
 
-Preserve this exact precedence: context 64/32/pair; generation guard; window UBFM/CBZ; bias ORR; NZCV MSR/MRS; x17/x18 materialization; exact x17 trusted branch; x18-based load/store; generic branch register/return; coarse guest branch, load/store, arithmetic, logic, multiply-add, SIMD, other.
+Preserve this exact precedence: context 64/32/pair; generation guard; window UBFM/CBZ; bias ORR; NZCV MSR/MRS; x17/x18 materialization; exact x17 trusted branch; x18-based load/store; generic branch register/return; coarse guest branch, load/store, arithmetic, logic, multiply-add, SIMD, other. `guard-ldar`, `bias-orr`, `nzcv-msr`, `nzcv-mrs`, and `x17-materialize` are exact encodings but also guest-producible, so label them `ExactAmbiguous`. Only context 64/32/pair through physical x28, window UBFM/CBZ through physical x18, `x18-materialize`, exact `br-x17`, and x18-based load/store are `InsertedExact`. Source-exclusive does not imply extra work or removability; for example, exact `br-x17` can still implement required guest branch semantics. Source audit still gates carry.
 
 Add frozen word/expected-family fixtures copied from the Python implementation before deleting it. Run the Rust test and the existing Python script against one existing local fixture if present; compare the complete family/word populations, not top-N text. If no local fixture remains, construct a synthetic trace/snapshot fixture containing every frozen word once and compare both implementations on that fixture.
 
-**Step 3: Define and implement the v2 report**
+**Step 3: Define and implement the v3 report**
 
 Use fixed ordered row vectors:
 
 ```rust
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct JitShapeCensusV2 {
+pub(crate) struct JitShapeCensusV3 {
     pub(crate) schema: String,
     pub(crate) capture_receipt_sha256: String,
     pub(crate) raw_trace_sha256: String,
@@ -697,9 +698,26 @@ pub(crate) struct JitShapeCensusV2 {
 }
 ```
 
-`classifier_schema` is `carrick.jit-shape-classifier.aarch64.v2`. Sort family rows by `(evidence_class, family)`, word rows by `(family, word)`, and context rows by `(direction, slot, physical_register)`. Emit every exact word row. Store samples plus integer numerator/denominator pairs for both JIT and all-CPU shares; serialize display decimals only as derived strings if a human-readable value is needed. Do not hash floating-point values.
+Context rows use the fixed compound shape:
 
-Context decoding reports direction (`load`/`store`), exact context slot, physical register, and sample count. Require context totals to equal the union of context family samples and require every family to be mutually exclusive. `inserted_exact_floor` is the checked sum of only `EvidenceClass::InsertedExact` rows.
+```rust
+pub(crate) struct ContextOperand {
+    pub(crate) slot: i64,
+    pub(crate) physical_register: u8,
+    pub(crate) semantic_label: String,
+}
+
+pub(crate) struct ContextRow {
+    pub(crate) direction: Direction,
+    pub(crate) first: ContextOperand,
+    pub(crate) second: Option<ContextOperand>,
+    pub(crate) share: CensusShare,
+}
+```
+
+`classifier_schema` is `carrick.jit-shape-classifier.aarch64.v3`. Sort family rows by `(evidence_class, family)`, word rows by `(family, word)`, and context rows by the complete `(direction, first, second)` operand key. Emit every exact word row. Store samples plus integer numerator/denominator pairs for both JIT and all-CPU shares; serialize display decimals only as derived strings if a human-readable value is needed. Do not hash floating-point values.
+
+Context decoding reports direction (`load`/`store`) and exact operands. Singles set `second = None`. Pairs decode signed `imm7 * 8`, `Rt`, checked first-slot `+ 8`, and `Rt2` into two operands while the sampled instruction remains counted once. Reconstruct the complete compound context map from exact word rows and require exact equality; context row sample totals still equal the union of context-family instruction samples. Require every family to be mutually exclusive. `inserted_exact_floor` is the checked sum of only source-exclusive `EvidenceClass::InsertedExact` rows and excludes every `ExactAmbiguous` and `GuestDescriptive` row. Despite the retained field name, it is only a lower bound on sampled Carrick-authored/source-exclusive words; it is neither an extra-instruction count, a removable-overhead floor, nor a projected speedup.
 
 **Step 4: Authenticate every input and the census executor**
 
@@ -712,7 +730,7 @@ Context decoding reports direction (`load`/`store`), exact context slot, physica
 5. repeat 100% own/ancestor PC resolution;
 6. recompute all raw and receipt counts;
 7. classify every resolved word exactly once; and
-8. atomically publish deterministic v2 JSON or print the same serialized bytes plus one newline.
+8. atomically publish deterministic v3 JSON or print the same serialized bytes plus one newline.
 
 Substitution tests independently change the receipt, raw trace, snapshot payload, snapshot metadata, manifest, capture authority, and current binary/source identities and require failure before classification.
 
@@ -730,7 +748,7 @@ cargo fmt --all -- --check
 cargo clippy -p carrick-cli --all-targets -- -D warnings
 git diff --check
 git add crates/carrick-cli/src/args.rs crates/carrick-cli/src/debug.rs crates/carrick-cli/src/debug_jit_shape.rs scripts/perf/shape_classify.py
-git commit -m "feat(debug): authenticate native shape census v2"
+git commit -m "fix(debug): preserve native shape evidence semantics"
 ```
 
 The `rg` result may contain only immutable historical evidence and explicit statements that the old path was replaced.
@@ -758,9 +776,9 @@ JitShapeCompare {
 },
 ```
 
-Build two valid synthetic censuses and mutate one determinant per test. Require equality of capture Git HEAD, capture executable SHA, D template SHA, image canonical digest reference, exact target argv and argv SHA, sampling frequency, classifier schema, census Git HEAD, and census executable SHA. Require inequality of run IDs, capture-receipt hashes, raw hashes, and snapshot manifests.
+Build two valid synthetic v3 censuses and mutate one determinant per test. Require equality of capture Git HEAD, capture executable SHA, D template SHA, image canonical digest reference, exact target argv and argv SHA, sampling frequency, classifier schema, census Git HEAD, and census executable SHA. Require inequality of run IDs, capture-receipt hashes, raw hashes, and snapshot manifests.
 
-Reject identical files, v1 schema, a rejected capture embedded in either census, missing rows, duplicate rows, row population mismatches, and a determinant mismatch even when all numerical shares agree.
+Reject identical files, v1/v2 census schemas, a rejected capture embedded in either census, missing rows, duplicate rows, row population mismatches, and a determinant mismatch even when all numerical shares agree.
 
 Run:
 
@@ -789,7 +807,7 @@ pub(crate) struct JitShapeComparisonV1 {
 }
 ```
 
-For every union key, missing means zero samples only after each source census has independently passed its own internal completeness checks. Compare shares by cross multiplication against 10/100 and drift by exact integer arithmetic against 5/100; do not make the gate depend on rounded floats. A mechanical crossing requires both shares at least 10% of all CPU and absolute drift at most five percentage points.
+For every union key, missing means zero samples only after each source v3 census has independently passed its own internal completeness checks. Context keys contain direction and both complete operands, including the optional second pair operand. Compare shares by cross multiplication against 10/100 and drift by exact integer arithmetic against 5/100; do not make the gate depend on rounded floats. A mechanical crossing requires both shares at least 10% of all CPU and absolute drift at most five percentage points.
 
 Sort all rows by their census keys. Sort crossings by descending minimum all-CPU share, then key. Publish one deterministic JSON object atomically or to stdout.
 
@@ -822,7 +840,7 @@ git commit -m "feat(debug): compare native shape captures"
 
 ```bash
 rg -n "copyin\(|SHAPE1|jit-share-of-total|carrick\.jit-shape-census\.v1" scripts/dtrace/native-shape-census.d crates/carrick-cli/src crates/carrick-runtime/src
-rg -n "BUNDLED_NATIVE_SHAPE_D|NativeShape|NSHAPE2|carrick\.native-shape-capture\.v1|carrick\.jit-shape-census\.v2|carrick\.jit-shape-comparison\.v1" crates scripts/dtrace/native-shape-census.d
+rg -n "BUNDLED_NATIVE_SHAPE_D|NativeShape|NSHAPE2|carrick\.native-shape-capture\.v1|carrick\.jit-shape-census\.v3|carrick\.jit-shape-comparison\.v1" crates scripts/dtrace/native-shape-census.d
 git diff --check
 ```
 
