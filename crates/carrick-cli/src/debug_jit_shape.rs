@@ -269,14 +269,6 @@ impl ComparisonDeterminants {
                 a.program_template_sha256 == b.program_template_sha256,
                 "D template SHA-256",
             ),
-            (
-                a.birth_qualification_sha256 == b.birth_qualification_sha256,
-                "birth qualification SHA-256",
-            ),
-            (
-                a.terminal_qualification_sha256 == b.terminal_qualification_sha256,
-                "terminal qualification SHA-256",
-            ),
             (a.sampling_hz == b.sampling_hz, "sampling frequency"),
             (
                 self.a_census_identity.git_head == self.b_census_identity.git_head,
@@ -2464,12 +2456,6 @@ mod tests {
             ("D template", |report| {
                 report.capture_authority.program_template_sha256 = "a".repeat(64)
             }),
-            ("birth qualification", |report| {
-                report.capture_authority.birth_qualification_sha256 = "a".repeat(64)
-            }),
-            ("terminal qualification", |report| {
-                report.capture_authority.terminal_qualification_sha256 = "a".repeat(64)
-            }),
             ("canonical image", |report| {
                 let image = "docker.io/library/ubuntu@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
                 report.capture_authority.image = image.into();
@@ -2519,6 +2505,75 @@ mod tests {
             assert!(
                 format!("{error:#}").contains(name.split_whitespace().next().unwrap()),
                 "unexpected {name} rejection: {error:#}",
+            );
+        }
+    }
+
+    #[test]
+    fn jit_shape_compare_preserves_distinct_per_run_qualification_receipts() {
+        let (a, mut b) = comparison_censuses();
+        let a_birth = a.capture_authority.birth_qualification_sha256.clone();
+        let a_terminal = a.capture_authority.terminal_qualification_sha256.clone();
+        let b_birth = "a".repeat(64);
+        let b_terminal = "b".repeat(64);
+        b.capture_authority.birth_qualification_sha256 = b_birth.clone();
+        b.capture_authority.terminal_qualification_sha256 = b_terminal.clone();
+        b.validate()
+            .expect("distinct per-run qualification receipts remain valid v3 provenance");
+
+        let comparison = compare_reports(&a, &b)
+            .expect("per-run qualification receipt hashes are not pair determinants");
+        assert_eq!(
+            comparison
+                .determinants
+                .a_capture_authority
+                .birth_qualification_sha256,
+            a_birth,
+        );
+        assert_eq!(
+            comparison
+                .determinants
+                .a_capture_authority
+                .terminal_qualification_sha256,
+            a_terminal,
+        );
+        assert_eq!(
+            comparison
+                .determinants
+                .b_capture_authority
+                .birth_qualification_sha256,
+            b_birth,
+        );
+        assert_eq!(
+            comparison
+                .determinants
+                .b_capture_authority
+                .terminal_qualification_sha256,
+            b_terminal,
+        );
+    }
+
+    #[test]
+    fn jit_shape_compare_rejects_invalid_per_run_qualification_receipts() {
+        let invalid_hashes = ["A".repeat(64), "z".repeat(64), "a".repeat(63)];
+
+        for invalid in invalid_hashes {
+            let (a, mut b) = comparison_censuses();
+            b.capture_authority.birth_qualification_sha256 = invalid.clone();
+            let error = compare_reports(&a, &b)
+                .expect_err("invalid birth qualification receipt hash must reject");
+            assert!(
+                format!("{error:#}").contains("birth_qualification_sha256"),
+                "unexpected birth receipt rejection: {error:#}",
+            );
+
+            let (a, mut b) = comparison_censuses();
+            b.capture_authority.terminal_qualification_sha256 = invalid;
+            let error = compare_reports(&a, &b)
+                .expect_err("invalid terminal qualification receipt hash must reject");
+            assert!(
+                format!("{error:#}").contains("terminal_qualification_sha256"),
+                "unexpected terminal receipt rejection: {error:#}",
             );
         }
     }
