@@ -254,6 +254,17 @@ the common `mov x17,#0` row is guest-producible/exact-ambiguous. Decision:
 pre-repair evidence but excluded from the final pair by analyzer identity.
 Traced elapsed times are attribution metadata and change no baseline.
 
+An independent final review approved exact range `96b2b59e..be1c36cf` with no
+Critical or Important findings at **99% confidence**. It independently rebuilt
+all 17 family, 2,387 word, and 24 context full-outer rows plus every share,
+drift, and gate; reproduced the empty crossing set; verified both 622 MiB
+snapshot manifests, accepted receipts, lifecycle/loss closure, frozen signed
+binary, and exact evidence hashes; and independently disassembled and rebound
+the four cited words to the emitter/classifier sources. Focused comparator
+11/11, full JIT-shape 44/44, formatting, diff, strict-JSON, and commit checks
+were green. The intentionally excluded live replay/rebuild is the only stated
+residual risk and does not change the no-carry or official-score decisions.
+
 ## What landed (2026-08-02/03, six waves, all merged with `just ci` green)
 
 **Exec pipeline.** Payload SHA-256 removed from the default artifact digest
