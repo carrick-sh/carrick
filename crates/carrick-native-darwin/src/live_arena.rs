@@ -11,6 +11,7 @@ use mach2::kern_return::{KERN_SUCCESS, kern_return_t};
 use mach2::mach_port::{mach_port_deallocate, mach_port_mod_refs};
 use mach2::memory_object_types::memory_object_size_t;
 use mach2::port::{MACH_PORT_NULL, MACH_PORT_RIGHT_SEND, mach_port_t};
+use mach2::task::{mach_ports_lookup, mach_ports_register};
 use mach2::traps::mach_task_self;
 use mach2::vm::{
     mach_make_memory_entry_64, mach_vm_allocate, mach_vm_deallocate, mach_vm_map, mach_vm_protect,
@@ -26,6 +27,12 @@ use std::ops::Range;
 use std::ptr::NonNull;
 
 pub const LIVE_ARENA_TRANSIT_SCHEMA_V1: u32 = 1;
+pub const LIVE_ARENA_PAYLOAD_OFFSET: usize = 64;
+const LIVE_OBJECT_HEADER_LEN: usize = LIVE_ARENA_PAYLOAD_OFFSET;
+const LIVE_OBJECT_MAGIC: [u8; 8] = *b"CRKLIVE\0";
+const LIVE_OBJECT_CODE: u32 = 1;
+const LIVE_OBJECT_CONTROL: u32 = 2;
+const TASK_PORT_REGISTER_MAX: usize = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LiveArenaTransitV1 {
@@ -40,6 +47,209 @@ pub struct LiveArenaTransitV1 {
 pub struct LiveArenaTransitRights {
     _code: MachSendRight,
     _control: MachSendRight,
+}
+
+struct RegisteredPortVector {
+    slots: [Option<MachSendRight>; TASK_PORT_REGISTER_MAX],
+}
+
+impl RegisteredPortVector {
+    fn lookup() -> io::Result<Self> {
+        let mut raw = std::ptr::null_mut();
+        let mut count = 0;
+        let result = unsafe { mach_ports_lookup(mach_task_self(), &mut raw, &mut count) };
+        let mut allocation = OolPortArray { raw, count };
+        check_kr("mach_ports_lookup live arena", result)?;
+        if count as usize > TASK_PORT_REGISTER_MAX {
+            return Err(io::Error::other(format!(
+                "registered-port vector has {count} entries; maximum is {TASK_PORT_REGISTER_MAX}"
+            )));
+        }
+        if count != 0 && raw.is_null() {
+            return Err(io::Error::other(
+                "mach_ports_lookup returned a null nonempty array",
+            ));
+        }
+        let mut slots = [None, None, None];
+        for (index, slot) in slots.iter_mut().enumerate().take(count as usize) {
+            let name = allocation.take(index);
+            if name != MACH_PORT_NULL {
+                *slot = Some(MachSendRight::from_kernel(
+                    name,
+                    "mach_ports_lookup registered send right",
+                )?);
+            }
+        }
+        drop(allocation);
+        Ok(Self { slots })
+    }
+
+    fn take(&mut self, index: usize) -> Option<MachSendRight> {
+        self.slots[index].take()
+    }
+}
+
+struct OolPortArray {
+    raw: *mut mach_port_t,
+    count: u32,
+}
+
+impl OolPortArray {
+    fn take(&mut self, index: usize) -> mach_port_t {
+        let slot = unsafe { self.raw.add(index) };
+        let name = unsafe { *slot };
+        unsafe { *slot = MACH_PORT_NULL };
+        name
+    }
+}
+
+impl Drop for OolPortArray {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            for index in 0..self.count as usize {
+                let name = unsafe { *self.raw.add(index) };
+                if name != MACH_PORT_NULL {
+                    let _ = unsafe { mach_port_deallocate(mach_task_self(), name) };
+                }
+            }
+            let bytes = u64::from(self.count) * std::mem::size_of::<mach_port_t>() as u64;
+            let _ = unsafe { mach_vm_deallocate(mach_task_self(), self.raw as u64, bytes) };
+        }
+    }
+}
+
+fn register_port_names(names: &[mach_port_t; TASK_PORT_REGISTER_MAX]) -> io::Result<()> {
+    check_kr("mach_ports_register live arena", unsafe {
+        mach_ports_register(
+            mach_task_self(),
+            names.as_ptr().cast_mut(),
+            TASK_PORT_REGISTER_MAX as u32,
+        )
+    })
+}
+
+/// Immutable plan for carrying a live arena through Darwin process creation or
+/// same-task image replacement.
+///
+/// Construction snapshots slot 0 and rejects occupied slots 1 or 2, but does
+/// not modify the current task. The successor vector is installed atomically by
+/// `posix_spawn`: the runtime-owned slot 0 is preserved, and Carrick owns slots
+/// 1 (code) and 2 (control). Consequently, a returned replacement attempt has
+/// no registered-port state to restore.
+pub struct RegisteredPortExecPlan {
+    old: RegisteredPortVector,
+    installed: LiveArenaTransitRights,
+}
+
+impl RegisteredPortExecPlan {
+    pub fn install(arena: &DarwinLiveArena) -> io::Result<Self> {
+        let old = RegisteredPortVector::lookup()?;
+        if old.slots[1].is_some() || old.slots[2].is_some() {
+            return Err(io::Error::other(
+                "Carrick registered-port slots are already occupied",
+            ));
+        }
+        let transit = arena.duplicate_transit_rights()?;
+        Ok(Self {
+            old,
+            installed: transit,
+        })
+    }
+
+    /// Replaces this process image while atomically reinstalling the complete
+    /// registered-port vector as Darwin exec port actions.
+    ///
+    /// # Safety
+    ///
+    /// All C vectors must remain valid and null-terminated for the call.
+    pub unsafe fn replace_process(
+        &self,
+        executable: *const libc::c_char,
+        argv: *const *mut libc::c_char,
+        env: *const *mut libc::c_char,
+    ) -> io::Error {
+        match unsafe { self.spawn_with_flags(executable, argv, env, libc::POSIX_SPAWN_SETEXEC) } {
+            Ok(pid) => io::Error::other(format!("SETEXEC unexpectedly spawned pid {pid}")),
+            Err(error) => error,
+        }
+    }
+
+    /// Spawns a helper with the same three registered-port actions.
+    ///
+    /// # Safety
+    ///
+    /// All C vectors must remain valid and null-terminated for the call.
+    pub unsafe fn spawn_process(
+        &self,
+        executable: *const libc::c_char,
+        argv: *const *mut libc::c_char,
+        env: *const *mut libc::c_char,
+    ) -> io::Result<libc::pid_t> {
+        unsafe { self.spawn_with_flags(executable, argv, env, 0) }
+    }
+
+    unsafe fn spawn_with_flags(
+        &self,
+        executable: *const libc::c_char,
+        argv: *const *mut libc::c_char,
+        env: *const *mut libc::c_char,
+        flags: libc::c_int,
+    ) -> io::Result<libc::pid_t> {
+        let mut attr: libc::posix_spawnattr_t = unsafe { std::mem::zeroed() };
+        let mut replaced_pid = 0;
+        let mut error = unsafe { libc::posix_spawnattr_init(&mut attr) };
+        let initialized = error == 0;
+        if initialized {
+            error = unsafe { libc::posix_spawnattr_setflags(&mut attr, flags as libc::c_short) };
+        }
+        let mut names = [
+            self.old.slots[0]
+                .as_ref()
+                .map_or(MACH_PORT_NULL, |right| right.name),
+            self.installed._code.name,
+            self.installed._control.name,
+        ];
+        if error == 0 {
+            error = unsafe {
+                posix_spawnattr_set_registered_ports_np(
+                    &mut attr,
+                    names.as_mut_ptr(),
+                    names.len() as u32,
+                )
+            };
+        }
+        if error == 0 {
+            error = unsafe {
+                libc::posix_spawn(
+                    &mut replaced_pid,
+                    executable,
+                    std::ptr::null(),
+                    &attr,
+                    argv,
+                    env,
+                )
+            };
+        }
+        if initialized {
+            unsafe { libc::posix_spawnattr_destroy(&mut attr) };
+        }
+        if error == 0 {
+            Ok(replaced_pid)
+        } else {
+            Err(io::Error::from_raw_os_error(error))
+        }
+    }
+}
+
+unsafe extern "C" {
+    /// Darwin private SPI, present since macOS 10.15. Carrick uses it because
+    /// plain `execve` does not reliably retain task-registered memory-entry
+    /// rights, while a registered-port spawn action transfers them atomically.
+    fn posix_spawnattr_set_registered_ports_np(
+        attr: *mut libc::posix_spawnattr_t,
+        ports: *mut mach_port_t,
+        count: u32,
+    ) -> libc::c_int;
 }
 
 struct MachSendRight {
@@ -366,13 +576,6 @@ pub struct DarwinLiveArena {
     control_entry: MachSendRight,
     code_rw: VmMapping,
     code_rx: VmMapping,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the arena owns this mapping for its full lifetime; Task 5 exposes typed control records"
-        )
-    )]
     control_rw: VmMapping,
     code_len: usize,
     control_len: usize,
@@ -386,6 +589,69 @@ impl DarwinLiveArena {
 
         let code_entry = create_code_memory_entry(code_len)?;
         let control_entry = create_control_memory_entry(control_len)?;
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce)
+            .map_err(|error| io::Error::other(format!("generate live arena nonce: {error}")))?;
+        let arena = Self::map_entries(code_entry, control_entry, code_len, control_len, nonce)?;
+        arena.write_object_headers()?;
+        Ok(arena)
+    }
+
+    pub fn adopt_registered(expected: LiveArenaTransitV1) -> io::Result<Self> {
+        Self::adopt_optional_registered(Some(expected))?
+            .ok_or_else(|| io::Error::other("registered live arena was not adopted"))
+    }
+
+    /// Adopts the registered arena exactly when capsule metadata names one.
+    /// Typed registered-port slots without matching metadata are rejected.
+    pub fn adopt_optional_registered(
+        expected: Option<LiveArenaTransitV1>,
+    ) -> io::Result<Option<Self>> {
+        let mut registered = RegisteredPortVector::lookup()?;
+        let Some(expected) = expected else {
+            if registered.slots[1].is_some() || registered.slots[2].is_some() {
+                return Err(io::Error::other(
+                    "registered live arena rights have no capsule metadata",
+                ));
+            }
+            return Ok(None);
+        };
+        validate_transit(expected)?;
+        let code_entry = registered
+            .take(1)
+            .ok_or_else(|| io::Error::other("registered live code slot is missing"))?;
+        let control_entry = registered
+            .take(2)
+            .ok_or_else(|| io::Error::other("registered live control slot is missing"))?;
+        let arena = Self::map_entries(
+            code_entry,
+            control_entry,
+            expected.code_len as usize,
+            expected.control_len as usize,
+            expected.nonce,
+        )?;
+        arena.validate_object_headers(expected)?;
+
+        let cleared = [
+            registered.slots[0]
+                .as_ref()
+                .map_or(MACH_PORT_NULL, |right| right.name),
+            MACH_PORT_NULL,
+            MACH_PORT_NULL,
+        ];
+        register_port_names(&cleared)?;
+        Ok(Some(arena))
+    }
+
+    fn map_entries(
+        code_entry: MachSendRight,
+        control_entry: MachSendRight,
+        code_len: usize,
+        control_len: usize,
+        nonce: [u8; 16],
+    ) -> io::Result<Self> {
+        validate_arena_len("code", code_len)?;
+        validate_arena_len("control", control_len)?;
         let code_rw = VmMapping::map_entry(&code_entry, code_len, VM_PROT_READ | VM_PROT_WRITE)?;
         let code_rx = VmMapping::map_entry(&code_entry, code_len, VM_PROT_READ | VM_PROT_EXECUTE)?;
         let control_rw =
@@ -399,10 +665,6 @@ impl DarwinLiveArena {
                 "Mach returned overlapping live arena aliases",
             ));
         }
-
-        let mut nonce = [0; 16];
-        getrandom::fill(&mut nonce)
-            .map_err(|error| io::Error::other(format!("generate live arena nonce: {error}")))?;
         Ok(Self {
             code_entry,
             control_entry,
@@ -413,6 +675,17 @@ impl DarwinLiveArena {
             control_len,
             nonce,
         })
+    }
+
+    fn write_object_headers(&self) -> io::Result<()> {
+        let transit = self.transit_v1();
+        write_object_header(&self.code_rw, LIVE_OBJECT_CODE, transit)?;
+        write_object_header(&self.control_rw, LIVE_OBJECT_CONTROL, transit)
+    }
+
+    fn validate_object_headers(&self, expected: LiveArenaTransitV1) -> io::Result<()> {
+        validate_object_header(&self.code_rw, LIVE_OBJECT_CODE, expected)?;
+        validate_object_header(&self.control_rw, LIVE_OBJECT_CONTROL, expected)
     }
 
     pub fn transit_v1(&self) -> LiveArenaTransitV1 {
@@ -433,6 +706,11 @@ impl DarwinLiveArena {
 
     pub fn jit_region(&self, range: Range<usize>) -> io::Result<BorrowedLiveJitRegion<'_>> {
         let capacity = checked_range(&range, self.code_len, "JIT subregion")?;
+        if range.start < LIVE_ARENA_PAYLOAD_OFFSET {
+            return Err(invalid_input(
+                "JIT subregion overlaps the live object header",
+            ));
+        }
         let write = self
             .code_rw
             .base()
@@ -451,6 +729,37 @@ impl DarwinLiveArena {
             capacity,
             _arena: PhantomData,
         })
+    }
+
+    /// Raw local mapping ranges for cross-exec transport qualification. The
+    /// addresses are process-local and must never be serialized as arena
+    /// authority or used to construct an owned JIT region.
+    ///
+    /// # Safety
+    ///
+    /// The caller must treat these values only as transient diagnostic ranges
+    /// and must not dereference or retain them beyond this arena's lifetime.
+    pub unsafe fn local_mapping_ranges_for_transport_proof(&self) -> io::Result<[Range<usize>; 3]> {
+        let code_rw_end = self
+            .code_rw
+            .base()
+            .checked_add(self.code_len)
+            .ok_or_else(|| invalid_input("live code RW mapping end overflowed"))?;
+        let code_rx_end = self
+            .code_rx
+            .base()
+            .checked_add(self.code_len)
+            .ok_or_else(|| invalid_input("live code RX mapping end overflowed"))?;
+        let control_end = self
+            .control_rw
+            .base()
+            .checked_add(self.control_len)
+            .ok_or_else(|| invalid_input("live control mapping end overflowed"))?;
+        Ok([
+            self.code_rw.base()..code_rw_end,
+            self.code_rx.base()..code_rx_end,
+            self.control_rw.base()..control_end,
+        ])
     }
 
     pub fn revoke_rx(&self, range: Range<usize>) -> io::Result<()> {
@@ -587,6 +896,75 @@ fn validate_arena_len(label: &str, len: usize) -> io::Result<()> {
     Ok(())
 }
 
+fn validate_transit(transit: LiveArenaTransitV1) -> io::Result<()> {
+    if transit.schema != LIVE_ARENA_TRANSIT_SCHEMA_V1 {
+        return Err(invalid_input(format!(
+            "unsupported live arena schema {}",
+            transit.schema
+        )));
+    }
+    let code_len = usize::try_from(transit.code_len)
+        .map_err(|_| invalid_input("live code length exceeds usize"))?;
+    let control_len = usize::try_from(transit.control_len)
+        .map_err(|_| invalid_input("live control length exceeds usize"))?;
+    validate_arena_len("code", code_len)?;
+    validate_arena_len("control", control_len)
+}
+
+fn object_header(kind: u32, transit: LiveArenaTransitV1) -> [u8; LIVE_OBJECT_HEADER_LEN] {
+    let mut header = [0_u8; LIVE_OBJECT_HEADER_LEN];
+    header[0..8].copy_from_slice(&LIVE_OBJECT_MAGIC);
+    header[8..12].copy_from_slice(&kind.to_le_bytes());
+    header[12..16].copy_from_slice(&transit.schema.to_le_bytes());
+    header[16..24].copy_from_slice(&transit.code_len.to_le_bytes());
+    header[24..32].copy_from_slice(&transit.control_len.to_le_bytes());
+    header[32..48].copy_from_slice(&transit.nonce);
+    header
+}
+
+fn write_object_header(
+    mapping: &VmMapping,
+    kind: u32,
+    transit: LiveArenaTransitV1,
+) -> io::Result<()> {
+    if mapping.len < LIVE_OBJECT_HEADER_LEN as u64 {
+        return Err(invalid_input(
+            "live arena object is smaller than its header",
+        ));
+    }
+    let header = object_header(kind, transit);
+    unsafe {
+        std::ptr::copy_nonoverlapping(header.as_ptr(), mapping.base() as *mut u8, header.len());
+    }
+    Ok(())
+}
+
+fn validate_object_header(
+    mapping: &VmMapping,
+    kind: u32,
+    transit: LiveArenaTransitV1,
+) -> io::Result<()> {
+    if mapping.len < LIVE_OBJECT_HEADER_LEN as u64 {
+        return Err(invalid_input(
+            "live arena object is smaller than its header",
+        ));
+    }
+    let mut observed = [0_u8; LIVE_OBJECT_HEADER_LEN];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            mapping.base() as *const u8,
+            observed.as_mut_ptr(),
+            observed.len(),
+        );
+    }
+    if observed != object_header(kind, transit) {
+        return Err(io::Error::other(format!(
+            "live arena object header does not match {kind} metadata"
+        )));
+    }
+    Ok(())
+}
+
 fn checked_range(range: &Range<usize>, capacity: usize, label: &str) -> io::Result<usize> {
     if range.start >= range.end || range.end > capacity {
         return Err(invalid_input(format!(
@@ -680,7 +1058,7 @@ mod tests {
     use carrick_dsr::host::NativeHostJit;
     use std::ops::Range;
 
-    const CODE: Range<usize> = 0..8;
+    const CODE: Range<usize> = LIVE_ARENA_PAYLOAD_OFFSET..LIVE_ARENA_PAYLOAD_OFFSET + 8;
 
     fn page() -> usize {
         host_page_size().expect("valid Mach host page size")
