@@ -98,20 +98,33 @@ plus a checked length.
 
 The outer 64 bytes of each object remain the authenticated Mach transport
 header, but executable payload does not begin at byte 64. The code payload base
-is `align_up(64, host_page)` so every logical 16 KiB-aligned reservation and
-revoked slab is physically host-page-aligned. `code_offset` is relative to that
+is `align_up(64, host_page)`. Code is packed into permanently owned 64 KiB
+chunks, exactly four Darwin host pages each, so Task 7 can revoke one exact
+chunk without affecting another source group. `code_offset` is relative to the
 payload base and the process view adds the base exactly once.
 
 The control object stores the protocol itself. Immediately after its outer
-header is an immutable, cacheline-aligned `LiveArenaControlDirectoryV1` with an
-atomic initialization state, schema/translator ABI, repeated nonce, cursor and
-record geometry, code payload capacity, and HOT/COLD bases/capacities. Three
-separate cacheline-aligned atomic cursors precede the fixed record table; HOT
-and COLD byte pools follow at checked alignment. The creator initializes every
-atomic and record while private and Release-publishes the directory. An adopter
-Acquire-loads initialization and rejects any nonce, schema, ABI, stride,
-alignment, overlap, or bounds mismatch before constructing a borrowed typed
-view. Production records and cursors are never a Rust-owned `Box`.
+header is an immutable, cacheline-aligned `LiveArenaControlDirectoryV2` with an
+atomic initialization state, schema/translator ABI, repeated nonce, exact
+block/group/chunk geometry, code payload capacity, and HOT/COLD
+bases/capacities. Separate cacheline-aligned `next_chunk`, HOT, and COLD cursors
+precede a 262,144-entry block table, a 4,096-entry source-group table, and 1,024
+chunk descriptors; HOT and COLD byte pools follow at checked alignment. The
+creator initializes every atomic and record while private and Release-publishes
+the directory. An adopter Acquire-loads initialization and rejects any nonce,
+schema, ABI, count, stride, chunk size, alignment, overlap, bounds, or reserved
+bit mismatch before constructing a borrowed typed view. Production records and
+cursors are never a Rust-owned `Box`.
+
+The arena-free cold-build census measured 85,525 exact blocks, 407 source
+groups, 36,341,884 raw code bytes, 684,200 aligned HOT bytes, 24,681,640
+aligned COLD bytes, and a 5,536-byte maximum block. It rejected the original
+one-16-KiB-page-per-block layout, which would consume 1,401,241,600 code bytes.
+The V2 first slice is 1,024 exclusive 64 KiB chunks (64 MiB), 1 MiB HOT, and
+32 MiB COLD. Exact next-fit preflight used 781..785 chunks. A fresh V2 census
+and production-hash simulation must satisfy the predeclared load, refusal,
+headroom, and order-independent packing bounds before runtime ownership is
+enabled.
 
 The arena is an optional accelerator. Private translation remains the complete
 correctness path. A missing arena, a full arena, an incompatible key, an owner
@@ -135,9 +148,10 @@ transit rights after adoption.
 4. restore the original vector if `execve` returns;
 5. deallocate every temporary right on either success or rollback.
 
-The serialized native-exec capsule carries only `LiveArenaTransitV1` geometry,
-nonce, and schema identity. It never serializes Mach port names because names
-are task-local.
+The serialized V2 native-exec capsule carries only `LiveArenaTransitV2`
+geometry, nonce, and schema identity. It never serializes Mach port names
+because names are task-local. There is no V1 reader, alias, or compatibility
+branch.
 
 ### Exact identity
 
@@ -152,7 +166,7 @@ already binds:
 - address mode and host bias;
 - translator ABI.
 
-The live schema adds `LIVE_ARENA_SCHEMA_V1` to the digest domain. The vertical
+The live schema adds `LIVE_ARENA_SCHEMA_V2` to the digest domain. The vertical
 slice accepts only `CodeGeneration::INITIAL`, trusted non-sensitive blocks, and
 the compiler unit selected by an explicit experiment policy. Production
 retention broadens by exact unit identity, never by basename or guest PC alone.
@@ -163,24 +177,18 @@ Both objects begin with fixed-width, little-endian headers. Control records are
 cache-line aligned and contain no Rust enum, pointer, `usize`, or process-local
 address.
 
-```rust
-#[repr(C, align(64))]
-pub struct LiveBlockRecordV1 {
-    pub state: AtomicU32,
-    pub owner_pid: AtomicI32,
-    pub unit_key_digest: [u8; 32],
-    pub guest_start: u64,
-    pub source_page: u64,
-    pub code_offset: u64,
-    pub code_len: u32,
-    pub trusted_offset: u32,
-    pub hot_offset: u64,
-    pub hot_len: u32,
-    pub cold_offset: u64,
-    pub cold_len: u32,
-    pub code_sha256: [u8; 32],
-}
-```
+`LiveBlockRecordV2` is exactly 128 bytes and `repr(C, align(64))`. Its fixed
+offsets are: state `0`, owner PID `4`, unit digest `8`, code SHA-256 `40`, guest
+start `72`, source page `80`, code/HOT/COLD offsets `88/96/104`, and
+code/entry/HOT/COLD lengths `112/116/120/124`. Code is nonempty, four-byte
+aligned, and wholly contained in one 65,536-byte chunk.
+
+A source group is keyed by exact `(unit_live_digest, 16 KiB source_page)` and
+has `EMPTY/BUILDING/ACTIVE/FAILED`, immutable identity, canonical `NO_CHUNK`,
+current-chunk index, and a packed expansion claim. A group publishes ACTIVE
+without allocating code. Each chunk descriptor has `EMPTY/ACTIVE/ABANDONED`,
+one immutable group owner, and one bounded four-byte-aligned cursor. Chunks are
+never reused, reassigned, reclaimed, or shared between groups.
 
 The only shared states are:
 
@@ -191,36 +199,40 @@ pub const LIVE_BLOCK_READY: u32 = 2;
 pub const LIVE_BLOCK_FAILED: u32 = 3;
 ```
 
-Control records form a fixed 131,072-slot open-addressed table. The initial
-slot is the low 17 bits of SHA-256 over `(unit_key_digest, guest_start)` and a
-lookup probes at most 16 consecutive slots. A READY slot with a different key
-continues the bounded probe. An EMPTY slot permits the one CAS below. A
-BUILDING slot immediately falls back because its key is not yet published. A
-FAILED slot contains a release-published key: the same key falls back, while a
-different key may continue probing. Exhausting 16 probes falls back. Bounded
-probing is lookup work, not a publication retry or wait.
+The block table probes at most 16 slots using the V2 domain-separated hash over
+`(unit_digest, guest_start)`. The group table independently probes at most 16
+slots using the V2 domain-separated hash over `(unit_digest, source_page)`.
+Different-key block READY/FAILED and group ACTIVE/FAILED records continue the
+bounded probe after Acquire-validating their published key. BUILDING, same-key
+FAILED, CAS loss, malformed state, or 16-probe exhaustion returns private
+immediately.
 
-The lookup algorithm is deliberately wait-free:
+Lookup is two-phase. `acquire_ready_or_miss` is read-only and runs above decode;
+EMPTY never CASes. Only after the complete decoded INITIAL interval is proven
+supported, non-sensitive, non-exclusive, selected, and wholly inside one 16 KiB
+source page may `claim_eligible` revalidate the same-domain generation
+observation, resolve/create the group, revalidate again, and CAS the block. A
+generation change before group mutation changes no shared state; a later change
+performs no block CAS. Task 6B's reserve-time and pre-write checks still apply.
 
-```rust
-match record.state.load(Ordering::Acquire) {
-    LIVE_BLOCK_READY => validate_and_consume(record),
-    LIVE_BLOCK_EMPTY if claim_with_compare_exchange(record) => publish_once(record),
-    LIVE_BLOCK_EMPTY | LIVE_BLOCK_BUILDING | LIVE_BLOCK_FAILED => PrivateFallback,
-    _ => PrivateFallback,
-}
-```
+The unique block winner prepares exactly once and learns exact lengths before
+allocating code. Invalid or greater-than-64-KiB code falls back before any chunk
+cursor grows. Otherwise it tries the ACTIVE current chunk with at most eight
+CAS attempts. `NO_CHUNK` or full capacity uses one no-wait expansion election;
+the winner reserves its exact bytes in a private descriptor before
+Release-publishing descriptor ACTIVE and then current chunk. Expansion losers
+fail only their block and translate privately. Handled allocation failures
+publish ABANDONED and clear expansion; process death may strand at most one
+chunk/expansion but never permits stealing or reuse.
 
-The winner reserves disjoint append-only code and metadata extents, writes and
-validates them, rechecks source generation, flushes the code range, and obtains
-an unforgeable claim-bound completion token. Only consuming that token may
-write every record field and perform the sole `Release` store of `READY`. A
-consumer's `Acquire` load orders preceding data writes, then that process
-locally invalidates the exact RX range before executing it; release/acquire is
-not an instruction-cache operation. Dropping an armed claim Release-publishes
-FAILED, so owner death strands no waitable state. Consumers never wait, steal,
-or execute BUILDING. Arena exhaustion sets the record to `FAILED` and uses the
-private path.
+HOT/COLD remain checked append-only eight-byte-aligned reservations with at
+most eight CAS attempts. The winner writes and validates every exact extent,
+rechecks generation, flushes the code range, and obtains an unforgeable
+claim-bound completion token. Only consuming that token may perform the sole
+`Release` store of block READY. Consumers Acquire-load group, descriptor,
+current-chunk, and block publication before reading their immutable fields, and
+locally invalidate exact RX before execution. Release/acquire is not an
+instruction-cache operation.
 
 ### Emit once, directly
 
@@ -300,12 +312,13 @@ profiles prove them material; it is not part of this slice.
 After validating a READY record, the consumer constructs process-local
 metadata:
 
-- local entry = local RX base + `code_offset` + `trusted_offset`;
+- local entry = local RX base + `code_offset` + `entry_offset`;
 - a shared `PublishedBlockMetadata::LiveArena` handle for lazy PC-map/recovery
   decode;
 - direct-link target authority that distinguishes immutable shared sources
   from patchable private sources;
-- a source-page to RX-slab index for revocation;
+- a source-page/group hint plus authoritative descriptor-table enumeration for
+  revocation;
 - an address-ordered shared range catalog for recovery, tracing, and core
   inspection.
 
@@ -319,17 +332,19 @@ from shared sources remain stubs.
 `PageGenerationTable` remains the semantic authority. A guest write that
 changes an executable source page still advances its generation. In the same
 task, Carrick additionally calls `mach_vm_protect(PROT_NONE)` for every active
-shared RX slab indexed to that guest page and marks those task-local slab
-descriptors revoked. It does not mutate shared control state and does not
-revoke another process's alias.
+64 KiB RX chunk owned by every locally executable exact group for that guest
+page, including multiple chunks and multiple unit digests, and marks those
+task-local chunks revoked. The shared descriptor table is authority; a local
+catalog may accelerate but cannot omit later cross-process expansion. It does
+not mutate shared control state and does not revoke another process's alias.
 
 A host fault is classified as a stale shared-code trap only when all of these
 are true:
 
 - ESR exception class is instruction abort from lower or current EL (`0x20` or
   `0x21`);
-- PC and FAR both fall inside the same active task-local revoked slab;
-- the slab catalog yields a validated guest PC/recovery record;
+- PC and FAR both fall inside the same active task-local revoked chunk;
+- the revoked-chunk catalog yields a validated guest PC/recovery record;
 - the mapped guest source page has a non-INITIAL current generation.
 
 The handler reconstructs the guest snapshot, resumes at the mapped guest PC,
@@ -370,11 +385,11 @@ NATIVEPERF gains exact per-process counters:
 - `live_arena_metadata_bytes`
 - `live_arena_shared_direct_links`
 - `live_arena_gateway_links`
-- `live_arena_revoked_slabs`
+- `live_arena_revoked_chunks`
 - `live_arena_stale_instruction_aborts`
 
 The export surface is read-only. `carrick_lldb.py` prints arena headers,
-process-local RX/RW ranges, READY records, revoked slabs, and the translated
+process-local RX/RW ranges, READY records, revoked chunks, and the translated
 guest PC for a selected cache PC from either a live process or a core. There is
 no importer and no debugger mutation command.
 
