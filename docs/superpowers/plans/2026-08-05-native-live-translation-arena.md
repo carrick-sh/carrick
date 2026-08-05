@@ -227,7 +227,7 @@
 - Modify: `crates/carrick-runtime/src/native_darwin.rs`
 - Modify: `crates/carrick-native-darwin/src/live_arena.rs`
 
-- [ ] Add red tests named:
+- [x] Add red tests named:
 
   - `registered_port_transaction_preserves_all_three_slots`
   - `failed_exec_restores_original_registered_port_vector`
@@ -235,13 +235,13 @@
   - `fork_exec_successor_maps_arena_at_fresh_addresses`
   - `fork_exec_successor_observes_parent_code_publication`
 
-- [ ] Run and prove red:
+- [x] Run and prove red:
 
   ```bash
   RUST_TEST_THREADS=1 cargo test -p carrick-runtime native_exec_live_arena -- --nocapture
   ```
 
-- [ ] Extend `NativeGuestExecV1` with a required option in the current capsule
+- [x] Extend `NativeGuestExecV1` with a required option in the current capsule
   schema. Do not add a legacy/default decode arm; Carrick self-execs the same
   binary and carries no backward-compatible capsule reader:
 
@@ -257,11 +257,30 @@
   }
   ```
 
-- [ ] Add `RegisteredPortTransaction` in the Darwin host crate. Its constructor calls `mach_ports_lookup`, normalizes to exactly `TASK_PORT_REGISTER_MAX == 3`, retains the complete old vector, duplicates fresh arena rights into the two typed slots, and calls `mach_ports_register` once. Its `Drop` restores the old vector unless `commit_after_exec_adoption()` consumed the transaction.
-- [ ] In `exec_capsule_with`, prepare registered ports only after every fd transaction and capsule validation succeeds, immediately before `invoke_exec`. If `execve` returns, RAII restores both fd flags and the registered-port vector.
-- [ ] In `resume`, call arena adoption after capsule validation and before rebuilding mapped memory or the translator. Validate schema, nonce, object sizes, protections, and both typed slots; then clear the typed registered slots while preserving the third slot and deallocate transit rights.
-- [ ] Make the real lifecycle test fork, register, invoke the existing `__native-exec-resume` path, map at unrelated VAs, execute 42, accept a parent synchronization byte, and execute 43.
-- [ ] Run:
+- [x] Qualify and use Darwin's PID-preserving
+  `posix_spawn(POSIX_SPAWN_SETEXEC)` registered-port action. Plain `execve`
+  is a measured red control: it leaves one arena memory-entry right dead.
+  `RegisteredPortExecPlan` snapshots and retains the existing slot-0 right,
+  requires historical slots 1/2 to be empty, and owns duplicate code/control
+  rights without mutating the old task. XNU atomically installs
+  `[preserved slot 0, code, control]` only in the replacement task; a returned
+  call therefore leaves the old registered vector unchanged.
+- [x] In `exec_capsule_with`, prepare the immutable exec plan only after every
+  fd transaction and capsule validation succeeds, immediately before the
+  replacement call. The ordinary no-arena path remains `execve`.
+- [x] In `resume`, adopt after capsule validation and before rebuilding mapped
+  memory or the translator. Validate schema, nonce, object kinds and sizes,
+  headers, protections, non-overlap, and slots 1/2; clear only slots 1/2 after
+  success while preserving runtime-owned slot 0. Missing current-schema
+  `live_arena` is rejected while explicit `null` remains valid.
+- [x] Make the real lifecycle test create an independent publisher with true
+  `posix_spawn` registered-port actions, independently adopt/map the arena,
+  replace the owner at the same PID through the existing
+  `__native-exec-resume` path, prove fresh VAs, execute 42, publish 43 through
+  the helper's RW alias, execute 43 through the resumed owner's RX alias, and
+  reap all processes cleanly.
+- [x] Run after the lifecycle proof traverses production `resume()` rather than
+  directly adopting from the libtest entry:
 
   ```bash
   RUST_TEST_THREADS=1 cargo test -p carrick-runtime native_exec_live_arena -- --nocapture
@@ -269,7 +288,7 @@
   cargo fmt --all -- --check
   ```
 
-- [ ] Commit:
+- [x] Commit:
 
   ```bash
   git add crates/carrick-native-darwin/src/live_arena.rs \
@@ -288,21 +307,23 @@
 - Modify: `crates/carrick-dsr-aarch64/src/artifact_spike.rs`
 - Modify: `crates/carrick-dsr-aarch64/src/live_arena.rs`
 
-- [ ] Add red structural tests named:
+- [x] Add red structural tests named:
 
   - `shared_initial_entry_is_private_trusted_suffix_without_guard`
   - `shared_initial_emission_has_no_process_relocations`
   - `shared_initial_emission_preserves_generation_publish_and_guest_x17`
   - `shared_ready_source_is_never_patchable`
-  - `building_source_can_bind_only_an_already_ready_shared_target`
+  - `prepared_shared_initial_reports_exact_lengths_before_publication`
+  - `prepared_shared_initial_publishes_once_after_exact_reservation`
+  - `rejected_shared_initial_never_grows_cache`
 
-- [ ] Run and prove red:
+- [x] Run and prove red:
 
   ```bash
   cargo test -p carrick-dsr-aarch64 shared_initial -- --nocapture
   ```
 
-- [ ] Replace the emitter's optional guard with an explicit entry policy:
+- [x] Replace the emitter's optional guard with an explicit entry policy:
 
   ```rust
   enum GenerationEntry {
@@ -313,22 +334,45 @@
   ```
 
   Existing public emit functions keep their current byte output by selecting
-  `PrivateAbsolute` or `Unguarded`. Add:
+  `PrivateAbsolute` or `Unguarded`. Add one type-state path, not a combined
+  convenience API beside it:
 
   ```rust
-  pub fn emit_block_recording_shared_initial(
-      cache: &mut TranslationCache,
+  pub fn prepare_shared_initial(
       plan: &BlockPlan,
       mode: EmitAddressMode,
       source_words: Vec<u32>,
-  ) -> Result<(EmittedBlock, ArtifactRecord), DsrError>;
+  ) -> Result<PreparedSharedInitial, DsrError>;
+
+  impl PreparedSharedInitial {
+      pub fn lengths(&self) -> SharedInitialLengths;
+      pub fn code_bytes(&self) -> &[u8];
+      pub fn hot_bytes(&self) -> &[u8];
+      pub fn cold_bytes(&self) -> &[u8];
+      pub fn link_candidates(&self) -> &[DirectLink];
+      pub fn publish(
+          self,
+          cache: &mut TranslationCache,
+      ) -> Result<EmittedBlock, DsrError>;
+  }
   ```
 
-- [ ] `SharedInitial` begins with the existing trusted suffix: materialize `CodeGeneration::INITIAL` into x17, store it to `CTX_GENERATION`, and reload guest x17. It emits no generation address, no `ldar`, no comparison, and no stale branch. Its entry offset is zero.
-- [ ] Assert the finished artifact record contains zero process relocations. A nonzero relocation count returns `DsrError::CachePolicy` before READY publication.
-- [ ] Assemble once through dynasm and publish the byte stream into the exact reserved arena `JitRegion`; do not publish to the private cache, serialize a second unit, or replay.
-- [ ] Before READY, patch only links whose targets are already READY in the same local arena view and are branch-reachable. Leave every other source word at the existing fall-into-gateway-stub encoding. Remove any shared-source site from the mutable `direct_link_incoming` collection.
-- [ ] Run byte-parity tests proving the private modes are unchanged, then:
+- [x] `SharedInitial` begins with the existing trusted suffix: materialize `CodeGeneration::INITIAL` into x17, store it to `CTX_GENERATION`, and reload guest x17. It emits no generation address, no `ldar`, no comparison, and no stale branch. Its entry offset is zero.
+- [x] Assert the finished shared metadata contains zero process relocations and
+  zero process bindings. A violation returns `DsrError::CachePolicy` during
+  preparation, before any cache cursor growth or executable visibility.
+- [x] Assemble once through dynasm, encode pointer-free HOT/COLD metadata once,
+  and expose exact checked code/HOT/COLD lengths before reservation. Consume
+  the prepared object to publish the byte stream exactly once to the
+  caller-provided `TranslationCache`; do not publish to the private cache,
+  serialize a second code unit, or replay. Task 6 supplies that cache through
+  a lifetime-bound Darwin bridge over the exact reserved arena range; Task 5
+  must not reconstruct an owned `JitRegion` from borrowed pointer tokens.
+- [x] Keep direct-link candidates private to `PreparedSharedInitial`. Remove
+  any public/caller-asserted BUILDING enum and any post-publication source-site
+  drain. Consuming publication returns a block with no mutable shared-source
+  sites; Task 6 owns claim-bound, same-view prebinding before that transition.
+- [x] Run byte-parity tests proving the private modes are unchanged, then:
 
   ```bash
   cargo test -p carrick-dsr-aarch64 emit -- --nocapture
@@ -336,7 +380,8 @@
   cargo fmt --all -- --check
   ```
 
-- [ ] Commit:
+- [x] Commit (implementation `f93e6977`, prepared-publication correction
+  `e6661fe5`):
 
   ```bash
   git add crates/carrick-dsr-aarch64/src/emit.rs \
@@ -354,6 +399,7 @@
 - Modify: `crates/carrick-dsr-aarch64/src/translator.rs`
 - Modify: `crates/carrick-dsr-aarch64/src/gateway.rs`
 - Modify: `crates/carrick-dsr-aarch64/src/mapped_memory.rs`
+- Modify: `crates/carrick-native-darwin/src/live_arena.rs`
 - Modify: `crates/carrick-runtime/src/native_darwin.rs`
 
 - [ ] Add red translator tests named:
@@ -361,11 +407,13 @@
   - `ready_live_block_bypasses_private_translation_and_replay`
   - `building_live_block_translates_privately_without_waiting`
   - `live_publish_winner_emits_once_into_shared_region`
+  - `building_source_can_bind_only_an_already_ready_shared_target`
   - `sensitive_or_regenerated_block_is_always_private`
   - `private_source_may_link_to_shared_target`
   - `shared_source_never_enters_mutable_link_index`
   - `live_block_fault_metadata_decodes_lazily`
   - `live_range_has_process_local_target_authority`
+  - `live_arena_translation_cache_cannot_outlive_arena_or_claim`
 
 - [ ] Run and prove red:
 
@@ -374,6 +422,13 @@
   ```
 
 - [ ] Add `live_arena: Option<Arc<LiveArenaProcessView>>`, a shared published index, and a source-page slab catalog to `ProcessState`. Configure them from `NativeMappedMemory::configure_shared_translation` only when `CARRICK_DSR_LIVE_ARENA=compiler` and the exact unit-key policy matches.
+- [ ] Add a lifetime-bound `LiveArenaTranslationCache<'arena>` in the Darwin
+  host crate. Construct it only by joining a checked
+  `BorrowedLiveJitRegion<'arena>` with the unique Task-2 reservation
+  capability; privately wrap the exact RW/RX aliases in a non-owning
+  `TranslationCache`, expose only a temporary `&mut TranslationCache`, and
+  prove the bridge cannot outlive either arena ownership or the claim. Never
+  expose an owned `JitRegion` or reconstruct one at the Task-6 call site.
 - [ ] Add a publication kind rather than inferring ownership from addresses:
 
   ```rust
@@ -392,6 +447,13 @@
 - [ ] Extend `private_published_index` with a separate address-sorted live index. `published_block_containing` searches both, and `guest_pc_for_cache` decodes the shared cold stream only on fault/kick.
 - [ ] At the top of the INITIAL-generation miss path, query the exact live record. A READY record validates hash/bounds/key, derives the local RX entry, installs target authority and metadata, and returns `TranslationOutcome::LiveArena` without touching `self.cache`. BUILDING/FAILED/CAS loss continues immediately to the unchanged private path.
 - [ ] A CAS winner plans once, refuses sensitive metadata, reserves extents, emits once into the shared subregion, validates the source generation again, publishes metadata and READY, then installs its own local READY record through the same consumer path. If generation moved or any step fails, mark FAILED and privately translate.
+- [ ] The winner first creates `PreparedSharedInitial`, then reserves its exact
+  code/HOT/COLD lengths. While it still owns both the unique BUILDING claim and
+  the prepared source, it may prebind only a branch-reachable target capability
+  constructed by the same `LiveArenaProcessView` from an acquired validated
+  READY record. Missing, cross-view, or unreachable targets retain the gateway
+  stub. Consuming publication makes the source immutable and exposes no site
+  that can enter `direct_link_incoming`.
 - [ ] Teach target authority and indirect-cache publication that a live block is flavor 0 with the arena range's process-local `TargetCacheAuthority`. Private trusted entries remain flavor 1. Private direct links may patch to a shared target; shared source links are immutable stubs.
 - [ ] Ensure `cache_used_bytes` remains the private-cache gauge and add distinct live code/metadata gauges so a READY hit cannot masquerade as private cache growth.
 - [ ] Run:
@@ -653,8 +715,10 @@
 
 - [ ] Every READY record is immutable and acquire/release ordered.
 - [ ] No shared lookup waits, retries, or steals a dead owner's record.
-- [ ] The real fork/self-exec path preserves the complete registered-port vector.
-- [ ] A consumer maps at an arbitrary address and executes coherent code.
+- [x] The real same-PID self-exec path preserves runtime slot 0, transports
+  authenticated arena rights in slots 1/2, and clears only those typed slots
+  after adoption.
+- [x] A consumer maps at an arbitrary address and executes coherent code.
 - [ ] Source mutation revokes only the calling task's matching RX slabs.
 - [ ] Only exact revoked-slab instruction aborts are recovered.
 - [ ] Sensitive and regenerated blocks remain private.
