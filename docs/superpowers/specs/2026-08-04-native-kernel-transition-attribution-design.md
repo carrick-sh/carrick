@@ -71,9 +71,13 @@ Three additional facts constrain the design:
   through `uregs[R_PC]`. Historical raw fault-PC counts were not authoritative
   because dozens of short-lived ASLR process images reused raw address space
   without birth/image/snapshot binding.
-- NativeShape already proves that Carrick can capture lifecycle-complete JIT
-  snapshots and resolve sampled PCs through fork ancestry with 100% coverage.
-  Reimplementing that join would create two answers to the same question.
+- NativeShape already proves that Carrick can authenticate JIT bytes and resolve
+  sampled PCs through PID/fork ancestry with 100% coverage under its closed
+  no-overlap capture contract. Its v4 snapshot envelope is PID-only and is
+  written only at final process exit; it does **not** prove image-generation or
+  runtime-epoch binding. The new profile must reuse its byte/range/classifier
+  primitives without pretending that the older identity is stronger than it
+  is.
 
 The missing observation is therefore not another broad stack profile. It is a
 typed joint census of live kernel location and the user instruction that caused
@@ -85,16 +89,19 @@ the same identity domain.
 ### Goals
 
 - Partition all periodic samples exactly into user, kernel, and invalid
-  populations, then partition kernel samples into named syscall, Mach trap, and
-  non-syscall state with the existing balanced-entry authority.
+  populations, then partition kernel samples into named-syscall and
+  non-syscall state with the existing balanced syscall-entry authority.
 - For every non-syscall kernel sample, retain the exact pair
   `(kernel_pc, pre_transition_user_pc)` under a birth/image/runtime identity.
 - Count every tracked `as_fault` event exactly by the same user-PC identity and
   retain independent exact totals for the other qualified fault outcomes.
 - Resolve every carried user PC to exactly one own/inherited JIT snapshot or
   host image, and every non-syscall kernel PC to exact matching kernel bytes.
-- Reuse one Rust snapshot loader, ancestry resolver, instruction classifier,
-  launch authority, kernel-symbol overlay, and lifecycle validator.
+- Reuse NativeShape's Rust snapshot payload/range decoder and instruction
+  classifier, plus native-wall's launch, birth/image/runtime, host-image,
+  kernel-symbol, and lifecycle authorities. The stronger transition-snapshot
+  envelope and identity resolver are new because neither existing profile has
+  their combined contract.
 - Produce deterministic typed capture, census, and paired-comparison artifacts
   that can independently regenerate every percentage and carry/stop verdict.
 - Name the next source-distinct, non-regrettable >=10%-of-all-CPU opportunity,
@@ -161,6 +168,7 @@ preserving an independent exact amplification counter.
 
 ```text
 carrick trace --profile native-kernel-transition \
+  --transition-provider-receipt <provider.receipt.json> \
   --kernel-debug-image <kernel.release.t8132> \
   --kernel-debug-symbols <kernel.release.t8132.dSYM> \
   --native-kernel-transition-snapshots <snapshot-dir> \
@@ -169,11 +177,10 @@ carrick trace --profile native-kernel-transition \
   run --exec-backend native <digest-pinned-image> <exact-command...>
 ```
 
-The exact option spellings may be normalized in the implementation plan if an
-existing general kernel-debug-image vocabulary is established first. Their
-contract is fixed: the trace command must possess and authenticate the exact
-KDK executable and dSYM used for address normalization before it launches the
-target. Ambient KDK discovery is not accepted evidence authority.
+Those option spellings are contractual. The trace command must possess and
+authenticate the exact KDK executable and dSYM used for address normalization
+before it launches the target. Ambient KDK discovery is not accepted evidence
+authority.
 
 The bundled D program is
 `scripts/dtrace/native-kernel-transition.d`. Its program bytes are hashed into
@@ -186,6 +193,7 @@ interruption/drop receipt already used by the accepted typed profiles. It uses
 The raw wire grammar is `NKTRANS1`. The public JSON schemas are:
 
 - `carrick.native-kernel-transition-authority.v1`;
+- `carrick.native-kernel-transition-provider.v1`;
 - `carrick.native-kernel-transition-capture.v1`;
 - `carrick.native-kernel-transition-census.v1`; and
 - `carrick.native-kernel-transition-comparison.v1`.
@@ -207,13 +215,15 @@ shape and records:
 - D program bytes, SHA-256, profile schema, and sampling frequency;
 - host model, architecture, page size, product version, OS build, Darwin kernel
   version/UUID, and boot-session UUID;
-- KDK kernel executable and dSYM paths, content identities, UUID/build/arch
-  match, and SHA-256 digests;
+- KDK kernel executable and exact dSYM DWARF paths, content identities,
+  UUID/build/compatible-CPU match, and SHA-256 digests (`arm64e` is the expected
+  KDK subtype for this exact `arm64` live kernel UUID);
 - exact image digest, target argv, argv SHA-256, allowed environment, and native
   backend semantics;
 - persistent translation-store normalized-content receipt and workload
   determinant receipt; and
-- birth and terminal launch-qualification receipt hashes.
+- birth and terminal launch-qualification receipt hashes; and
+- the matching transition-provider qualification receipt hash.
 
 Unknown ambient `CARRICK_*` variables fail before launch. Output paths, run ID,
 PIDs, timestamps, and per-capture receipt paths are provenance, not target-argv
@@ -221,25 +231,42 @@ determinants.
 
 ### 6.2 Sampling population
 
-The profile samples at 997 Hz, matching NativeShape's current direct all-CPU
-denominator. Every tick for an admitted live process contributes exactly once
-to one of:
+The profile samples at 997 Hz, matching NativeShape's sampling rate. The traced
+target is admitted in a pending-launch identity before it runs; every child is
+admitted in a pending-fork identity at `proc:::create`. Every tick for that full
+live process tree contributes exactly once to one of:
 
 ```text
 all_cpu = user_cpu + kernel_cpu + invalid_cpu
-kernel_cpu = kernel_named_syscall + kernel_mach_trap + kernel_non_syscall
+kernel_cpu = kernel_named_syscall + kernel_non_syscall
 ```
 
 `invalid_cpu` includes a sample that cannot be assigned a legal user/kernel
 mode or identity. It is never discarded. An accepted capture requires
 `invalid_cpu == 0`.
 
-The existing balanced BSD-syscall and Mach-trap state machine classifies each
-kernel sample at sample time. Every entry must close by return or an explicit
-thread/process terminal transition. Simultaneous syscall and Mach-trap state,
-an unknown function state, or an open nonterminal state rejects the capture.
-This makes `kernel-non-syscall` the same category as the stable native-wall
-population being investigated rather than a new convenient denominator.
+Each sample also retains `phase = pre-ready | ready` from the process image's
+translated-range/catalog state. Existing native-wall CPU sampling begins only
+after `range_ready`; this new profile does not call that subset all CPU. It
+reports both:
+
+- the complete process-tree population above, which is the denominator for the
+  10% carry gate; and
+- a `ready` compatibility subset that must reproduce the prior native-wall
+  category shape before the old ~20% observation is treated as requalified.
+
+Pre-ready work is real product work. It may resolve only to an authenticated
+host image or epoch-zero state; it is never dropped to make transition-PC
+coverage pass.
+
+The existing balanced BSD-syscall state machine classifies each kernel sample
+at sample time. Every entry must close by return or an explicit thread/process
+terminal transition. An unknown function state or open nonterminal state
+rejects the capture. Darwin's `mach_trap` provider is not balanced for blocking
+and continuation traps on this host, so Mach-trap intervals remain inside
+`kernel-non-syscall`, exactly as they do in the stable native-wall population.
+Provider counts may describe that residue separately, but they cannot subtract
+an unbalanced state from the CPU denominator.
 
 For every `kernel-non-syscall` sample, DTrace aggregates:
 
@@ -247,14 +274,24 @@ For every `kernel-non-syscall` sample, DTrace aggregates:
 (process_birth_key,
  image_generation,
  runtime_epoch,
+ phase,
  kernel_pc = arg0,
  pre_transition_user_pc = uregs[R_PC]) -> sample_count
 ```
 
-The profile records named-syscall and Mach-trap counts for reconciliation but
-does not use their transition-PC rows to select this campaign's candidate.
-User samples are counted for the all-CPU denominator; this profile does not
-replace NativeShape's per-user-PC census.
+After pending launch/fork identities are bound, the keyed rows must satisfy:
+
+```text
+kernel_non_syscall = sum(all non-syscall joint rows)
+all_cpu = pre_ready_cpu + ready_cpu
+```
+
+No PC-resolution or phase filter is allowed to change either equality.
+
+The profile records named-syscall counts for reconciliation but does not use
+their transition-PC rows to select this campaign's candidate. User samples are
+counted for the all-CPU denominator; this profile does not replace NativeShape's
+per-user-PC census.
 
 ### 6.3 Exact fault populations
 
@@ -264,21 +301,26 @@ The same D program aggregates exact `vminfo:::as_fault` counts as:
 (process_birth_key,
  image_generation,
  runtime_epoch,
+ phase,
  pre_transition_user_pc = uregs[R_PC]) -> as_fault_count
 ```
 
 `zfod`, `cow_fault`, page-in, protection, and any other explicitly supported
 outcome are independent populations. `zfod` and COW are not subtracted from or
-added to `as_fault` as if the probes partitioned one logical event. This profile
-retains their exact count totals, and may retain a `zfod` PC table only if a
-red-first live fixture proves that its `uregs[R_PC]` contract is identical and
-the added cardinality stays lossless. COW remains count-only because its
-private address argument is not qualified.
+added to `as_fault` as if the probes partitioned one logical event. Version 1
+retains their exact count totals only; it has no `zfod` PC table. COW remains
+count-only because its private address argument is not qualified.
 
-The existing native-fault provider qualification for this exact OS build and
-boot must pass before launch. That qualification authenticates provider
-activity and private argument semantics; the new profile additionally proves
-the documented `uregs[R_PC]` transition-PC join in its own fixture.
+The existing native launch birth/terminal qualifications must pass before
+launch. `carrick debug native-kernel-transition-qualify` then runs the exact
+`bigallocfree` fixture under the bundled program and atomically publishes this
+profile's provider receipt. On the exact OS build, boot, qualification binary,
+D program, probe binary, and arguments it proves that `vminfo:::as_fault` fires
+for the scoped target and that `uregs[R_PC]` resolves to the expected touch
+instruction. A primary capture requires that receipt through
+`--transition-provider-receipt` and rejects any host/boot/program drift. This
+profile uses no private `vminfo` address argument, so it imports no `arg2`
+page-address claim from native-fault.
 
 All tracked fault events reconcile:
 
@@ -298,18 +340,20 @@ The raw identity is the established immutable `ProcessBirthKey`:
 (pid, pr_start_tv.tv_sec, pr_start_tv.tv_usec)
 ```
 
-The initial target publishes birth before samples are accepted. Children are
-admitted only by `proc:::create`, with a parent birth key and fork frontier.
-Successful exec increments `image_generation`; failed exec restores the prior
-image state. Runtime JIT-catalog epochs nest beneath the process image and
-reset/replay according to the existing NativeShape authority.
+The initial target's prebirth samples/events are keyed by one pending launch ID
+and bind to its first checked `host-process-birth`. Children are admitted only
+by `proc:::create`; their prebirth rows use a unique pending fork ID carrying
+the parent birth key and fork frontier. Successful exec increments
+`image_generation`; failed exec restores the prior image state. Runtime
+JIT-catalog epochs nest beneath the process image and reset/replay according to
+the native-wall range authority.
 
-Fork events may precede the child's first runtime announcement. The D program
-uses a typed pending-fork identity and emits the parent snapshot/catalog
-frontier. Offline validation binds pre-announcement child samples and faults to
-the observed child birth and inherited frontier. A child that exits before a
-unique birth/frontier binding can be established rejects the capture; its work
-is not assigned to the parent or dropped.
+Fork events may precede the child's first birth/runtime announcement. The D
+program emits the parent snapshot/catalog frontier under the pending fork ID.
+Offline validation binds pre-announcement child samples and faults to the
+observed child birth and inherited frontier. A launch or child that exits before
+a unique birth/frontier binding can be established rejects the capture; its
+work is not assigned to the parent or dropped.
 
 Epoch zero is explicit. A transition before the first ready JIT epoch may
 resolve to an authenticated host image, but it cannot be retroactively assigned
@@ -333,18 +377,65 @@ failed workload marker also reject it.
 
 ## 7. User transition-PC authority
 
-### 7.1 One shared resolver
+### 7.1 Stronger transition-snapshot envelope
 
-The implementation factors NativeShape's strict snapshot-manifest loader,
-birth/image/epoch model, fork-ancestry join, and PC-range resolver into one
-shared Rust module. NativeShape must continue to regenerate its already
-accepted v3 census byte-for-byte from the same fixtures after the refactor.
+NativeShape's `carrick.code-snapshot.v4` envelope contains only PID, cache base,
+bytes, and block index, and is emitted only at final process exit. It is valid
+for the closed NativeShape captures whose per-PID ranges do not overlap, but it
+cannot distinguish two images or runtime epochs that reuse one PID/address.
+This profile therefore introduces `carrick.transition-code-snapshot.v1` rather
+than silently assigning v4 stronger semantics.
 
-Snapshot files remain immutable per `(pid, process birth, image generation,
-runtime epoch, block)`. The manifest authenticates every file path, length,
-SHA-256, range, generation, ancestry relation, and final block count. A sampled
-or faulting PC joins the snapshot that was live for its event identity, not the
-last snapshot written by a PID.
+Each transition snapshot carries:
+
+```text
+process_birth_key = (pid, start_sec, start_usec)
+image_generation
+runtime_epoch
+fragment_sequence
+reason = host-self-reexec-attempt | in-process-exec | process-exit
+cache_base
+published_code_len
+code_sha256
+ordered_guest_to_cache_blocks
+```
+
+The runtime's current code cache is append-only within one process image. A
+snapshot is a complete immutable published prefix, not a mutable live-memory
+view. The profile requests an export at each possible image-retirement seam:
+
+- immediately before the final host `execve` callback;
+- at the successful in-process-exec commit; and
+- at final process exit.
+
+A host `execve` attempt can fail after its pre-call snapshot. In that case the
+same image remains live, the fragment is nonterminal, and any later fragment
+must contain it as a byte-for-byte/block-for-block prefix. A same-PID
+`exec-success` makes the immediately preceding attempt fragment terminal for
+the outgoing image. An `exec-failure` followed by no later terminal snapshot
+rejects the capture. This uses the existing append-only publication contract
+without deleting or rewriting evidence.
+
+Fork inheritance records the exact parent image/runtime and published block
+frontier. The child's first image may resolve inherited PCs only through that
+latched prefix; later parent publication is not retroactively inherited. Every
+own event resolves against the terminal/superseding snapshot for its exact
+birth/image/runtime key.
+
+The new manifest authenticates every file path, envelope, length, SHA-256,
+range, fragment sequence, prefix relation, generation, ancestry frontier, and
+final block count. Missing exports or prefix/lifecycle contradictions reject
+the receipt. Export failures may remain nonfatal to guest execution, but they
+can never yield an accepted trace.
+
+Implementation shares NativeShape's tested code-payload decoder, exact word
+reader, range checks, manifest hashing primitives, and instruction classifier.
+It does not change or reinterpret the closed NativeShape v4 artifacts, and it
+does not introduce a second runtime translation state: the stronger envelope
+is diagnostic metadata around the same `CodeSnapshot` payload.
+
+A sampled or faulting PC joins the snapshot that owns its event identity, never
+the last snapshot written by a PID or the largest nearby address range.
 
 ### 7.2 Mutually exclusive resolution
 
@@ -403,19 +494,32 @@ lookup rejects the capture.
 
 The offline census then binds that live overlay to the caller-supplied KDK:
 
-1. kernel product/build/architecture/UUID must match the capture authority;
-2. at least two unambiguous exported anchors derive the same KASLR slide;
-3. subtracting that slide must place every sampled PC inside the exact KDK
+1. kernel product/build/compatible CPU type/UUID must match the capture
+   authority; literal `arm64` versus `arm64e` subtype spelling is not an
+   identity mismatch when the kernel UUID is exact;
+2. the live libdtrace kernel-object text range and the KDK Mach-O `__TEXT`
+   virtual address derive one KASLR slide;
+3. at least two unambiguous exported-symbol anchors independently reproduce
+   that same slide;
+4. subtracting that slide must place every sampled PC inside the exact KDK
    executable text range;
-4. the four-byte word at every normalized PC is read from the authenticated KDK
+5. the four-byte word at every normalized PC is read from the authenticated KDK
    Mach-O image; and
-5. the dSYM contributes all public and local symbol ranges that contain or
+6. the dSYM contributes all public and local symbol ranges that contain or
    alias that address, plus DWARF source location when present.
 
-One anchor, inconsistent slides, UUID/build drift, a PC outside text, missing
-bytes, or a KDK/dSYM mismatch rejects the census. The implementation is Rust;
-manual `nm`, `otool`, or `lldb` transcripts may qualify the design but are not
-the published authority.
+A missing live object range, fewer than two anchor cross-checks, inconsistent
+slides, UUID/build drift, a PC outside text, missing bytes, or a KDK/dSYM
+mismatch rejects the census. The implementation is Rust; manual `nm`, `otool`,
+or `lldb` transcripts may qualify the design but are not the published
+authority.
+
+The read-only design check on 2026-08-04 found live `kern.osversion`
+`26A5388g` and kernel UUID `EC2DBF2E-ACDC-31C7-98F7-ECDFC6127685`; both the
+installed `kernel.release.t8132` and its dSYM DWARF file report that exact UUID
+with CPU subtype `arm64e`. This proves the binding is feasible on the current
+host, but the capture still revalidates and records it rather than hardcoding
+the observation.
 
 ### 8.2 Alias-safe report
 
@@ -476,7 +580,9 @@ identity.
 The v1 census contains:
 
 - exact all/user/kernel/invalid CPU populations and direct all-CPU shares;
-- exact kernel named-syscall/Mach-trap/non-syscall populations;
+- exact kernel named-syscall/non-syscall populations;
+- complete and `ready`-compatibility populations with an exact phase
+  reconciliation and native-wall cross-check;
 - every exact joint `(kernel location, transition location)` row without top-N
   truncation;
 - normalized transition-owner rows with exact member rows and disjointness
@@ -493,6 +599,10 @@ Each CPU row reports:
 share_of_non_syscall_kernel = row_cpu_samples / kernel_non_syscall
 share_of_all_cpu = row_cpu_samples / all_cpu
 ```
+
+Those formulas use the complete process-tree populations. The report repeats
+them for the explicitly labelled `ready` compatibility subset, but no carry
+decision uses the smaller denominator.
 
 Each exact fault row reports its event count, share of all tracked `as_fault`,
 and distinct process/image/epoch cardinality. These fault shares are displayed
@@ -585,10 +695,17 @@ mechanism fixture. `CARRICK_TEST_SIZE_MB` and `CARRICK_TEST_ITERS` are set high
 enough to create a large, known anonymous first-touch population. The probe's
 `Vec::resize` touches every page and must end with exactly one `bigalloc=OK`.
 
+The qualification command accepts the exact built probe path and explicit size
+and iteration values, runs it through the same signed Carrick trace path, and
+writes `carrick.native-kernel-transition-provider.v1`. Its receipt is scoped to
+the current boot and cannot be reused after the program, probe, kernel, KDK, or
+D template changes.
+
 Before the profile can measure the primary workload, the fixture must prove:
 
 - natural completion and zero survivors/drops;
-- a distinct child birth/image/runtime identity where applicable;
+- the existing launch parent/fork fixture separately proves a distinct child
+  birth and exact inherited frontier; `bigallocfree` is not required to fork;
 - exact CPU and fault population reconciliation;
 - 100% transition-PC resolution across JIT and host images;
 - correct own/inherited snapshot selection;
@@ -642,7 +759,8 @@ Implementation is red-first and must cover:
 1. profile vocabulary, CLI constraints, sudo reconstruction, D-program hashing,
    clean-source/binary authority, and exact native-target parsing;
 2. D compiler contracts for `uregs[R_PC]`, `arg0`, tracer exclusion,
-   process-tree admission, balanced syscall/Mach state, and natural completion;
+   process-tree admission, balanced syscall state, unbalanced Mach-trap
+   exclusion, and natural completion;
 3. strict `NKTRANS1` ordering, unknown/duplicate/missing/truncated records,
    checked overflow, every arithmetic reconciliation, and zero samples;
 4. each DTrace interruption/drop counter independently rejecting a capture;
@@ -652,7 +770,8 @@ Implementation is red-first and must cover:
    versus inherited ambiguity, and post-exec retired mappings;
 7. zero/noncanonical/misaligned transition PCs and host/JIT/unresolved
    classification precedence;
-8. NativeShape fixture parity after factoring the shared snapshot resolver;
+8. NativeShape fixture parity after factoring only the shared snapshot payload,
+   exact-word, and classifier primitives;
 9. exact JIT word/family/operand classification and source-semantics labels;
 10. KDK UUID/build/arch mismatch, one/inconsistent slide anchors, text-range
     escape, missing instruction bytes, local/public alias sets, and the known
@@ -666,22 +785,26 @@ Implementation is red-first and must cover:
 
 Before primary evidence use, the implementation must pass focused CLI/runtime
 tests, formatting, Clippy with warnings denied, `RUST_TEST_THREADS=1 just ci`, a
-fresh signed build, the applicable native smoke gate, and the live
-`bigallocfree` qualification. The implementation plan may add narrower gates
-but may not weaken these.
+fresh signed build, `just conformance-native smoke --workers 4 --flake-retries
+1`, and the live `bigallocfree` qualification. The implementation plan may add
+narrower gates but may not weaken these.
 
 ## 14. Component boundaries and delivery
 
-The implementation plan should keep four reviewable units:
+The implementation plan should keep five reviewable units:
 
-1. **Shared transition identity:** factor NativeShape snapshot/ancestry/PC
-   resolution behind one Rust module with parity tests and no schema drift.
-2. **Trace authority:** add `NativeKernelTransition`, the durable D program,
+1. **Shared payload primitives:** factor NativeShape's authenticated code bytes,
+   exact-word access, and classifier primitives with fixture parity and no
+   reinterpretation of v4 identity.
+2. **Transition snapshots:** add the full birth/image/runtime envelope,
+   exec/exit fragments, prefix validation, fork frontier, and typed manifest.
+3. **Trace authority:** add `NativeKernelTransition`, the durable D program,
    strict raw parser, capture authority, receipt, and live kernel overlay.
-3. **Offline authority:** add KDK normalization, alias-safe exact-byte records,
+4. **Offline authority:** add KDK normalization, alias-safe exact-byte records,
    census, comparison, and source-group validation in Rust.
-4. **Live evidence:** qualify with `bigallocfree`, take two primary captures,
-   publish the comparison, and durably record `CARRY`, `STOP`, or `INVALID`.
+5. **Live evidence:** qualify with the fork fixture and `bigallocfree`, take two
+   primary captures, publish the comparison, and durably record `CARRY`, `STOP`,
+   or `INVALID`.
 
 No production optimization belongs in those commits. A carried result starts a
 new design. The profile remains a reusable Carrick diagnostic because the same
