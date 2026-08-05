@@ -1,8 +1,10 @@
 //! Darwin mappings for the container-lifetime live translation arena.
 //!
 //! Code and control use distinct Mach memory-entry objects. Code is mapped
-//! through separate permanently-RW and permanently-RX aliases; no mapping is
-//! ever both writable and executable.
+//! through separate permanently-RW and permanently-RX aliases; no returned or
+//! retained live alias is both writable and executable. Darwin requires a
+//! private, empty, constructor-only MAP_JIT bootstrap that is temporarily
+//! nominal-RWX and unmapped before arena construction returns.
 
 use carrick_dsr::host::{ForkChildJit, JitRegion, NativeHostJit};
 use mach2::kern_return::{KERN_SUCCESS, kern_return_t};
@@ -20,7 +22,7 @@ use mach2::vm_region::{VM_REGION_BASIC_INFO_64, vm_region_basic_info_64};
 use mach2::vm_statistics::VM_FLAGS_ANYWHERE;
 use std::io;
 use std::marker::PhantomData;
-use std::ops::{Deref, Range};
+use std::ops::Range;
 use std::ptr::NonNull;
 
 pub const LIVE_ARENA_TRANSIT_SCHEMA_V1: u32 = 1;
@@ -180,9 +182,30 @@ impl Drop for VmMapping {
 /// memory entry that can later produce distinct RW and RX aliases. The map is
 /// nominally RWX, but contains no published code and is always unmapped before
 /// `DarwinLiveArena::new` returns; it never becomes a live arena alias.
-struct MapJitBootstrap {
-    address: NonNull<libc::c_void>,
+struct OwnedMmap {
+    address: *mut libc::c_void,
     len: usize,
+}
+
+impl OwnedMmap {
+    fn from_successful_result(address: *mut libc::c_void, len: usize) -> Self {
+        Self { address, len }
+    }
+
+    fn non_null(&self) -> io::Result<NonNull<libc::c_void>> {
+        NonNull::new(self.address)
+            .ok_or_else(|| io::Error::other("MAP_JIT bootstrap returned null"))
+    }
+}
+
+impl Drop for OwnedMmap {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::munmap(self.address, self.len) };
+    }
+}
+
+struct MapJitBootstrap {
+    mapping: OwnedMmap,
 }
 
 impl MapJitBootstrap {
@@ -200,9 +223,12 @@ impl MapJitBootstrap {
         if mapped == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        let address = NonNull::new(mapped)
-            .ok_or_else(|| io::Error::other("MAP_JIT bootstrap returned null"))?;
-        let bootstrap = Self { address, len };
+        Self::from_owned(OwnedMmap::from_successful_result(mapped, len))
+    }
+
+    fn from_owned(mapping: OwnedMmap) -> io::Result<Self> {
+        let address = mapping.non_null()?;
+        let bootstrap = Self { mapping };
         let page = host_page_size()?;
         if !(address.as_ptr() as usize).is_multiple_of(page) {
             return Err(io::Error::other(
@@ -219,11 +245,9 @@ impl MapJitBootstrap {
         }
         Ok(bootstrap)
     }
-}
 
-impl Drop for MapJitBootstrap {
-    fn drop(&mut self) {
-        let _ = unsafe { libc::munmap(self.address.as_ptr(), self.len) };
+    fn address(&self) -> io::Result<NonNull<libc::c_void>> {
+        self.mapping.non_null()
     }
 }
 
@@ -312,7 +336,7 @@ fn create_code_memory_entry(len: usize) -> io::Result<MachSendRight> {
         mach_make_memory_entry_64(
             mach_task_self(),
             &mut returned,
-            backing.address.as_ptr() as u64,
+            backing.address()?.as_ptr() as u64,
             VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE,
             &mut raw,
             MACH_PORT_NULL,
@@ -422,11 +446,9 @@ impl DarwinLiveArena {
             .and_then(|address| NonNull::new(address as *mut u8))
             .ok_or_else(|| invalid_input("JIT exec address overflowed"))?;
         Ok(BorrowedLiveJitRegion {
-            region: JitRegion {
-                exec_base: exec,
-                write_base: write,
-                capacity,
-            },
+            exec_base: exec,
+            write_base: write,
+            capacity,
             _arena: PhantomData,
         })
     }
@@ -453,16 +475,68 @@ impl DarwinLiveArena {
     }
 }
 
+/// A checked view of matching RW/RX aliases whose lifetime is tied to its
+/// arena. It intentionally cannot produce an owned [`JitRegion`]: reservation
+/// authority and unique writer ranges come from the Task 2 allocation protocol,
+/// while byte writes through the raw pointer remain unsafe.
+///
+/// ```compile_fail
+/// use carrick_dsr::host::JitRegion;
+/// use carrick_native_darwin::live_arena::DarwinLiveArena;
+///
+/// fn escape_owned_region(arena: &DarwinLiveArena) -> JitRegion {
+///     arena
+///         .jit_region(0..8)
+///         .unwrap()
+///         .sub_region(0, 8)
+///         .unwrap()
+/// }
+/// ```
 pub struct BorrowedLiveJitRegion<'a> {
-    region: JitRegion,
+    exec_base: NonNull<u8>,
+    write_base: NonNull<u8>,
+    capacity: usize,
     _arena: PhantomData<&'a DarwinLiveArena>,
 }
 
-impl Deref for BorrowedLiveJitRegion<'_> {
-    type Target = JitRegion;
+impl BorrowedLiveJitRegion<'_> {
+    pub fn exec_base(&self) -> BorrowedLiveJitPointer<'_> {
+        BorrowedLiveJitPointer {
+            pointer: self.exec_base,
+            _region: PhantomData,
+        }
+    }
 
-    fn deref(&self) -> &Self::Target {
-        &self.region
+    pub fn write_base(&self) -> BorrowedLiveJitPointer<'_> {
+        BorrowedLiveJitPointer {
+            pointer: self.write_base,
+            _region: PhantomData,
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
+/// A pointer token whose lifetime is bounded by a checked live-arena region.
+/// It has no safe conversion to a raw pointer or owned [`JitRegion`].
+pub struct BorrowedLiveJitPointer<'a> {
+    pointer: NonNull<u8>,
+    _region: PhantomData<&'a BorrowedLiveJitRegion<'a>>,
+}
+
+impl BorrowedLiveJitPointer<'_> {
+    /// Exposes the checked alias pointer for low-level code emission or entry.
+    ///
+    /// # Safety
+    ///
+    /// The pointer must not be retained beyond this token's lifetime. This
+    /// conversion does not establish exclusive write authority: a caller that
+    /// writes through it must hold the unique range granted by the Task 2
+    /// reservation protocol and obey the alias's current Mach protection.
+    pub unsafe fn as_ptr(&self) -> *mut u8 {
+        self.pointer.as_ptr()
     }
 }
 
@@ -575,9 +649,16 @@ mod tests {
         code
     }
 
-    unsafe fn call_u32(region: &carrick_dsr::host::JitRegion) -> u32 {
-        let entry: unsafe extern "C" fn() -> u32 =
-            unsafe { std::mem::transmute(region.exec_base.as_ptr()) };
+    unsafe fn exec_ptr(region: &BorrowedLiveJitRegion<'_>) -> *mut u8 {
+        unsafe { region.exec_base().as_ptr() }
+    }
+
+    unsafe fn write_ptr(region: &BorrowedLiveJitRegion<'_>) -> *mut u8 {
+        unsafe { region.write_base().as_ptr() }
+    }
+
+    unsafe fn call_u32(region: &BorrowedLiveJitRegion<'_>) -> u32 {
+        let entry: unsafe extern "C" fn() -> u32 = unsafe { std::mem::transmute(exec_ptr(region)) };
         unsafe { entry() }
     }
 
@@ -589,23 +670,15 @@ mod tests {
         let jit = LiveArenaHostJit;
 
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                return_immediate(42).as_ptr(),
-                region.write_base.as_ptr(),
-                8,
-            )
+            std::ptr::copy_nonoverlapping(return_immediate(42).as_ptr(), write_ptr(&region), 8)
         };
-        jit.flush_icache(region.exec_base.as_ptr(), 8);
+        jit.flush_icache(unsafe { exec_ptr(&region) }, 8);
         assert_eq!(unsafe { call_u32(&region) }, 42);
 
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                return_immediate(43).as_ptr(),
-                region.write_base.as_ptr(),
-                8,
-            )
+            std::ptr::copy_nonoverlapping(return_immediate(43).as_ptr(), write_ptr(&region), 8)
         };
-        jit.flush_icache(region.exec_base.as_ptr(), 8);
+        jit.flush_icache(unsafe { exec_ptr(&region) }, 8);
         assert_eq!(unsafe { call_u32(&region) }, 43);
     }
 
@@ -655,19 +728,25 @@ mod tests {
     }
 
     #[test]
+    fn successful_null_mmap_is_owned_before_rejection() {
+        let owned = OwnedMmap::from_successful_result(std::ptr::null_mut(), page());
+        assert!(MapJitBootstrap::from_owned(owned).is_err());
+    }
+
+    #[test]
     #[cfg(target_arch = "aarch64")]
     fn task_local_rx_revoke_does_not_revoke_parent() {
         let arena = DarwinLiveArena::new(page() * 2, page()).expect("create live arena");
         let region = arena.jit_region(CODE).expect("code subregion");
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                return_immediate(42).as_ptr(),
-                region.write_base.as_ptr(),
-                8,
-            )
+            std::ptr::copy_nonoverlapping(return_immediate(42).as_ptr(), write_ptr(&region), 8)
         };
-        LiveArenaHostJit.flush_icache(region.exec_base.as_ptr(), 8);
+        LiveArenaHostJit.flush_icache(unsafe { exec_ptr(&region) }, 8);
 
+        let mut ready_pipe = [-1; 2];
+        let mut restore_pipe = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(ready_pipe.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::pipe(restore_pipe.as_mut_ptr()) }, 0);
         let child = unsafe { libc::fork() };
         assert!(
             child >= 0,
@@ -675,32 +754,98 @@ mod tests {
             std::io::Error::last_os_error()
         );
         if child == 0 {
-            let status = arena
-                .revoke_rx(0..page())
-                .and_then(|()| {
-                    (mapping_protections_for_test(arena.code_rx.base())
-                        == Some((VM_PROT_NONE, VM_PROT_READ | VM_PROT_EXECUTE)))
-                    .then_some(())
-                    .ok_or_else(|| io::Error::other("child RX alias was not revoked"))
-                })
-                .and_then(|()| arena.restore_rx_for_test(0..page()))
-                .and_then(|()| {
-                    (mapping_protections_for_test(arena.code_rx.base())
-                        == Some((
+            unsafe {
+                libc::close(ready_pipe[0]);
+                libc::close(restore_pipe[1]);
+            }
+            let mut status = 0;
+            if arena.revoke_rx(0..page()).is_err()
+                || mapping_protections_for_test(arena.code_rx.base())
+                    != Some((VM_PROT_NONE, VM_PROT_READ | VM_PROT_EXECUTE))
+            {
+                status = 1;
+            }
+
+            if status == 0 {
+                let fault_child = unsafe { libc::fork() };
+                if fault_child < 0 {
+                    status = 2;
+                } else if fault_child == 0 {
+                    unsafe {
+                        libc::signal(libc::SIGBUS, libc::SIG_DFL);
+                        libc::signal(libc::SIGSEGV, libc::SIG_DFL);
+                        let _ = call_u32(&region);
+                        libc::_exit(90);
+                    }
+                } else {
+                    let mut fault_status = 0;
+                    if unsafe { libc::waitpid(fault_child, &mut fault_status, 0) } != fault_child
+                        || !libc::WIFSIGNALED(fault_status)
+                        || libc::WTERMSIG(fault_status) != libc::SIGBUS
+                    {
+                        status = 3;
+                    }
+                }
+            }
+
+            let ready = [0xa5_u8];
+            if status == 0
+                && unsafe { libc::write(ready_pipe[1], ready.as_ptr().cast(), ready.len()) } != 1
+            {
+                status = 4;
+            }
+            let mut restore = [0_u8];
+            if status == 0
+                && unsafe {
+                    libc::read(restore_pipe[0], restore.as_mut_ptr().cast(), restore.len())
+                } != 1
+            {
+                status = 5;
+            }
+            if status == 0
+                && (restore != [0x5a]
+                    || arena.restore_rx_for_test(0..page()).is_err()
+                    || mapping_protections_for_test(arena.code_rx.base())
+                        != Some((
                             VM_PROT_READ | VM_PROT_EXECUTE,
                             VM_PROT_READ | VM_PROT_EXECUTE,
                         )))
-                    .then_some(())
-                    .ok_or_else(|| io::Error::other("child RX alias was not restored"))
-                })
-                .map_or(1, |()| 0);
+            {
+                status = 6;
+            }
+            unsafe {
+                libc::close(ready_pipe[1]);
+                libc::close(restore_pipe[0]);
+            }
             unsafe { libc::_exit(status) };
         }
+
+        unsafe {
+            libc::close(ready_pipe[1]);
+            libc::close(restore_pipe[0]);
+        }
+        let mut ready = [0_u8];
+        let ready_count =
+            unsafe { libc::read(ready_pipe[0], ready.as_mut_ptr().cast(), ready.len()) };
+        let parent_result = unsafe { call_u32(&region) };
+        let restore = [0x5a_u8];
+        let restore_count = if ready_count == 1 {
+            unsafe { libc::write(restore_pipe[1], restore.as_ptr().cast(), restore.len()) }
+        } else {
+            0
+        };
         let mut status = 0;
         assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        unsafe {
+            libc::close(ready_pipe[0]);
+            libc::close(restore_pipe[1]);
+        }
+        assert_eq!(ready_count, 1);
+        assert_eq!(ready, [0xa5]);
+        assert_eq!(parent_result, 42);
+        assert_eq!(restore_count, 1);
         assert!(libc::WIFEXITED(status));
         assert_eq!(libc::WEXITSTATUS(status), 0);
-        assert_eq!(unsafe { call_u32(&region) }, 42);
     }
 
     #[test]
@@ -748,13 +893,13 @@ mod tests {
         let arena = DarwinLiveArena::new(page() * 2, page()).expect("create live arena");
         let range = page() + 32..page() + 96;
         let region = arena.jit_region(range.clone()).expect("code subregion");
-        assert_eq!(region.capacity, range.len());
+        assert_eq!(region.capacity(), range.len());
         assert_eq!(
-            region.write_base.as_ptr() as usize - arena.code_rw.base(),
+            unsafe { write_ptr(&region) } as usize - arena.code_rw.base(),
             range.start
         );
         assert_eq!(
-            region.exec_base.as_ptr() as usize - arena.code_rx.base(),
+            unsafe { exec_ptr(&region) } as usize - arena.code_rx.base(),
             range.start
         );
         assert!(arena.jit_region(page() * 2 - 4..page() * 2 + 4).is_err());
