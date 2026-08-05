@@ -1083,6 +1083,7 @@ pub(crate) fn tier_d_service_execve(
         executable_digest,
         max_traps,
         plan,
+        None,
     ) {
         tracing::warn!(
             %error,
@@ -1474,6 +1475,7 @@ pub(crate) fn resume_guest_from_capsule(
     mut guest: crate::native_exec_capsule::NativeGuestExecV1,
     argv: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
+    _live_arena: Option<carrick_native_darwin::live_arena::DarwinLiveArena>,
 ) -> anyhow::Result<i32> {
     install_native_probe_sink();
     dsr::profile::seed_profile_exec_epoch_after_reexec(guest.profile_exec_epoch);
@@ -4348,6 +4350,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                                 executable_digest,
                                 max_traps,
                                 &plan,
+                                None,
                             ) {
                                 require_native_syscall_service_transition(
                                     service.reopen_after_failed_terminal_handoff(),

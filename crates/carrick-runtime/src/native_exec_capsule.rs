@@ -17,6 +17,15 @@ const MAX_VECTOR_ITEMS: usize = 4096;
 const MAX_ITEM_LEN: usize = 1024 * 1024;
 const MAX_PATH_LEN: usize = 4096;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+type NativeLiveArenaAuthority<'a> = Option<&'a carrick_native_darwin::live_arena::DarwinLiveArena>;
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+type NativeLiveArenaAuthority<'a> = Option<&'a ()>;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+type NativeRegisteredPortExecPlan = carrick_native_darwin::live_arena::RegisteredPortExecPlan;
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+type NativeRegisteredPortExecPlan = ();
+
 /// First schema carried by the native host-self-exec transport.
 ///
 /// Process, filesystem, and descriptor records are added to this typed payload
@@ -49,6 +58,8 @@ pub(crate) struct NativeGuestExecV1 {
     pub(crate) exec_host_fs_fallback: bool,
     pub(crate) max_traps: u64,
     pub(crate) native_page_profile: carrick_spec::NativePageProfileRequest,
+    #[serde(deserialize_with = "deserialize_present_live_arena")]
+    pub(crate) live_arena: Option<NativeReexecLiveArenaV1>,
     #[serde(default)]
     pub(crate) kernel_arena: Option<NativeReexecKernelArenaV1>,
     #[serde(default)]
@@ -73,6 +84,47 @@ pub(crate) struct NativeGuestExecV1 {
     /// catalog remains process-local and is never added to this capsule.
     #[serde(default)]
     pub(crate) profile_exec_epoch: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NativeReexecLiveArenaV1 {
+    pub(crate) schema: u32,
+    pub(crate) code_len: u64,
+    pub(crate) control_len: u64,
+    pub(crate) nonce: [u8; 16],
+}
+
+fn deserialize_present_live_arena<'de, D>(
+    deserializer: D,
+) -> Result<Option<NativeReexecLiveArenaV1>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::deserialize(deserializer)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl From<carrick_native_darwin::live_arena::LiveArenaTransitV1> for NativeReexecLiveArenaV1 {
+    fn from(value: carrick_native_darwin::live_arena::LiveArenaTransitV1) -> Self {
+        Self {
+            schema: value.schema,
+            code_len: value.code_len,
+            control_len: value.control_len,
+            nonce: value.nonce,
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl From<NativeReexecLiveArenaV1> for carrick_native_darwin::live_arena::LiveArenaTransitV1 {
+    fn from(value: NativeReexecLiveArenaV1) -> Self {
+        Self {
+            schema: value.schema,
+            code_len: value.code_len,
+            control_len: value.control_len,
+            nonce: value.nonce,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,6 +304,12 @@ impl NativeExecCapsuleV1 {
 
 impl NativeGuestExecV1 {
     fn validate(&self) -> Result<(), NativeExecCapsuleError> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let live_arena_invalid = self.live_arena.is_some_and(|arena| {
+            arena.schema != 1 || arena.code_len == 0 || arena.control_len == 0
+        });
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let live_arena_invalid = self.live_arena.is_some();
         if self.resolved_path.is_empty()
             || self.resolved_path.len() > MAX_PATH_LEN
             || self.cwd.is_empty()
@@ -259,6 +317,7 @@ impl NativeGuestExecV1 {
             || self.rootfs.root_path.is_empty()
             || self.rootfs.root_path.len() > MAX_PATH_LEN
             || self.max_traps == 0
+            || live_arena_invalid
             || self.kernel_arena.is_some_and(|arena| {
                 arena.host_fd < 0
                     || arena.host_size
@@ -327,7 +386,7 @@ pub(crate) fn begin_pid_probe() -> anyhow::Result<()> {
     let mut nonce = [0_u8; 16];
     getrandom::fill(&mut nonce)
         .map_err(|error| anyhow::anyhow!("generate native exec capsule nonce: {error}"))?;
-    exec_capsule(payload, nonce, None)
+    exec_capsule(payload, nonce, None, None)
 }
 
 // This function's only caller is `native_darwin.rs`, which is itself gated
@@ -348,6 +407,7 @@ pub(crate) fn begin_guest_exec(
     executable_digest: [u8; 32],
     max_traps: usize,
     plan: &crate::page_profile::ExecutionPlan,
+    live_arena: NativeLiveArenaAuthority<'_>,
 ) -> anyhow::Result<()> {
     emit_lifecycle(
         unsafe { libc::getpid() },
@@ -408,6 +468,7 @@ pub(crate) fn begin_guest_exec(
             exec_host_fs_fallback: dispatcher.exec_host_fs_fallback(),
             max_traps: u64::try_from(max_traps)?,
             native_page_profile,
+            live_arena: live_arena.map(|arena| arena.transit_v1().into()),
             kernel_arena: Some(kernel_arena),
             shared_futex_waiters: Some(shared_futex_waiters),
             artifact_spike,
@@ -458,7 +519,7 @@ pub(crate) fn begin_guest_exec(
     let mut nonce = [0_u8; 16];
     getrandom::fill(&mut nonce)
         .map_err(|error| anyhow::anyhow!("generate native exec capsule nonce: {error}"))?;
-    exec_capsule(payload, nonce, prepared_artifact)
+    exec_capsule(payload, nonce, prepared_artifact, live_arena)
 }
 
 // This whole cluster (the failpoint enum, `attach_prepared_image`, and
@@ -621,17 +682,36 @@ fn exec_capsule(
     payload: NativeExecCapsuleV1,
     nonce: [u8; 16],
     prepared_artifact: Option<crate::native_prepared_image::PreparedImageArtifact>,
+    live_arena: NativeLiveArenaAuthority<'_>,
 ) -> anyhow::Result<()> {
-    exec_capsule_with(payload, nonce, prepared_artifact, |request| {
-        unsafe {
-            libc::execve(
-                request.executable.as_ptr(),
-                request.argv.as_ptr(),
-                request.env.as_ptr(),
-            );
-        }
-        std::io::Error::last_os_error()
-    })
+    exec_capsule_with(
+        payload,
+        nonce,
+        prepared_artifact,
+        live_arena,
+        |request, registered_ports| {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            if let Some(registered_ports) = registered_ports {
+                return unsafe {
+                    registered_ports.replace_process(
+                        request.executable.as_ptr(),
+                        request.argv.as_ptr().cast_mut().cast(),
+                        request.env.as_ptr().cast_mut().cast(),
+                    )
+                };
+            }
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            let _ = registered_ports;
+            unsafe {
+                libc::execve(
+                    request.executable.as_ptr(),
+                    request.argv.as_ptr(),
+                    request.env.as_ptr(),
+                );
+            }
+            std::io::Error::last_os_error()
+        },
+    )
 }
 
 struct HostExecRequest<'a> {
@@ -646,11 +726,26 @@ fn exec_capsule_with<F>(
     payload: NativeExecCapsuleV1,
     nonce: [u8; 16],
     prepared_artifact: Option<crate::native_prepared_image::PreparedImageArtifact>,
+    live_arena: NativeLiveArenaAuthority<'_>,
     invoke_exec: F,
 ) -> anyhow::Result<()>
 where
-    F: FnOnce(HostExecRequest<'_>) -> std::io::Error,
+    F: FnOnce(HostExecRequest<'_>, Option<&NativeRegisteredPortExecPlan>) -> std::io::Error,
 {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        let payload_live_arena = payload
+            .guest_exec
+            .as_ref()
+            .and_then(|guest| guest.live_arena);
+        let owned_live_arena =
+            live_arena.map(|arena| NativeReexecLiveArenaV1::from(arena.transit_v1()));
+        if payload_live_arena != owned_live_arena {
+            anyhow::bail!("native live arena capsule metadata has no matching authority owner");
+        }
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let _ = live_arena;
     #[cfg(feature = "alloc-owner-census")]
     let next_allocation_exec_epoch = payload
         .guest_exec
@@ -811,13 +906,22 @@ where
     let _allocation_attempt = next_allocation_exec_epoch
         .map(carrick_dsr_aarch64::alloc_owner_census::begin_host_exec_attempt)
         .transpose()?;
-    let exec_error = invoke_exec(HostExecRequest {
-        executable: &executable_c,
-        argv: &argv_ptrs,
-        env: &env_ptrs,
-        #[cfg(test)]
-        capsule_fd: capsule.as_raw_fd(),
-    });
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let registered_ports = live_arena
+        .map(carrick_native_darwin::live_arena::RegisteredPortExecPlan::install)
+        .transpose()?;
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let registered_ports: Option<NativeRegisteredPortExecPlan> = None;
+    let exec_error = invoke_exec(
+        HostExecRequest {
+            executable: &executable_c,
+            argv: &argv_ptrs,
+            env: &env_ptrs,
+            #[cfg(test)]
+            capsule_fd: capsule.as_raw_fd(),
+        },
+        registered_ports.as_ref(),
+    );
     Err(exec_error.into())
 }
 
@@ -1010,6 +1114,14 @@ pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::Native
             let guest = payload
                 .guest_exec
                 .ok_or_else(|| anyhow::anyhow!("native guest exec capsule has no guest state"))?;
+            let live_arena =
+                carrick_native_darwin::live_arena::DarwinLiveArena::adopt_optional_registered(
+                    guest.live_arena.map(Into::into),
+                )?;
+            #[cfg(test)]
+            if let Some(exit_code) = native_exec_live_arena_resume_hook(live_arena.as_ref())? {
+                return Ok(crate::NativeSelfReexecOutcome::GuestExit(exit_code));
+            }
             if let Some(artifact) = &guest.artifact_spike {
                 crate::native_darwin::adopt_artifact_spike_for_resume(artifact)?;
             }
@@ -1021,8 +1133,12 @@ pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::Native
                 current_pid as i32,
                 crate::probes::DsrCacheLifecyclePhase::HostSelfReexecRestoreBegin,
             );
-            let exit_code =
-                crate::native_darwin::resume_guest_from_capsule(guest, payload.argv, payload.env)?;
+            let exit_code = crate::native_darwin::resume_guest_from_capsule(
+                guest,
+                payload.argv,
+                payload.env,
+                live_arena,
+            )?;
             Ok(crate::NativeSelfReexecOutcome::GuestExit(exit_code))
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -1033,6 +1149,13 @@ pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::Native
             )
         }
     }
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn native_exec_live_arena_resume_hook(
+    arena: Option<&carrick_native_darwin::live_arena::DarwinLiveArena>,
+) -> anyhow::Result<Option<i32>> {
+    tests::native_exec_live_arena::resume_hook(arena)
 }
 
 fn emit_lifecycle(tid: i32, phase: crate::probes::DsrCacheLifecyclePhase) {
@@ -1332,6 +1455,7 @@ mod tests {
                 exec_host_fs_fallback: false,
                 max_traps: 100,
                 native_page_profile: carrick_spec::NativePageProfileRequest::Native16k,
+                live_arena: None,
                 kernel_arena: None,
                 shared_futex_waiters: None,
                 artifact_spike: None,
@@ -1561,6 +1685,21 @@ mod tests {
     }
 
     #[test]
+    fn v1_payload_requires_explicit_live_arena_field() {
+        let payload = sample();
+        let mut value = serde_json::to_value(payload).expect("serialize capsule");
+        value
+            .get_mut("guest_exec")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("guest payload")
+            .remove("live_arena");
+
+        let error = serde_json::from_value::<NativeExecCapsuleV1>(value)
+            .expect_err("missing live arena field must reject V1 capsule");
+        assert!(error.to_string().contains("live_arena"));
+    }
+
+    #[test]
     fn legacy_v1_process_state_defaults_to_unconfined_and_untraced() {
         let payload = sample();
         let mut value = serde_json::to_value(payload).expect("serialize capsule");
@@ -1650,7 +1789,7 @@ mod tests {
             readonly: true,
         }];
 
-        let result = exec_capsule_with(payload, [0x31; 16], None, |_| {
+        let result = exec_capsule_with(payload, [0x31; 16], None, None, |_, _| {
             panic!("invalid bind mount must not reach host exec")
         });
         assert!(result.is_err());
@@ -1744,7 +1883,7 @@ mod tests {
         install_transport_fds(&mut payload, &xsig, &survivor, &close_on_exec);
         let nonce = [0x66; 16];
 
-        let result = exec_capsule_with(payload, nonce, None, |request| {
+        let result = exec_capsule_with(payload, nonce, None, None, |request, _| {
             let decoded =
                 read_capsule_once(request.capsule_fd, nonce).expect("read fallback capsule");
             assert!(
@@ -1794,7 +1933,7 @@ mod tests {
         let mut invoke_state = None;
         let mut matching_epoch_entries = Vec::new();
 
-        let result = exec_capsule_with(payload, [0x67; 16], None, |request| {
+        let result = exec_capsule_with(payload, [0x67; 16], None, None, |request, _| {
             invoke_state = Some(allocation_census::state());
             matching_epoch_entries = request
                 .env
@@ -1853,7 +1992,7 @@ mod tests {
             authority_nonce: nonce,
         });
 
-        let result = exec_capsule_with(payload, [0x44; 16], None, |_| {
+        let result = exec_capsule_with(payload, [0x44; 16], None, None, |_, _| {
             assert_eq!(fd_flags(fd) & libc::FD_CLOEXEC, 0);
             std::io::Error::from_raw_os_error(libc::ENOEXEC)
         });
@@ -1884,7 +2023,7 @@ mod tests {
             translator_abi: carrick_dsr_aarch64::shared_cache::TRANSLATOR_ABI_CURRENT,
         });
 
-        let result = exec_capsule_with(payload, [0x45; 16], None, |_| {
+        let result = exec_capsule_with(payload, [0x45; 16], None, None, |_, _| {
             assert_eq!(fd_flags(fd) & libc::FD_CLOEXEC, 0);
             std::io::Error::from_raw_os_error(libc::ENOEXEC)
         });
@@ -1934,7 +2073,7 @@ mod tests {
         let artifact_identity = host_identity(artifact_fd);
         payload.argv = vec![vec![0; MAX_ITEM_LEN + 1]];
 
-        let result = exec_capsule_with(payload, [0x77; 16], Some(artifact), |_| {
+        let result = exec_capsule_with(payload, [0x77; 16], Some(artifact), None, |_, _| {
             panic!("invalid capsule must not reach host exec")
         });
 
@@ -2011,7 +2150,7 @@ mod tests {
         });
         let mut saw_exec = false;
 
-        let result = exec_capsule_with(payload, [0x33; 16], Some(artifact), |request| {
+        let result = exec_capsule_with(payload, [0x33; 16], Some(artifact), None, |request, _| {
             saw_exec = true;
             assert_eq!(fd_flags(request.capsule_fd), 0);
             assert_eq!(
@@ -2057,7 +2196,7 @@ mod tests {
         install_transport_fds(&mut payload, &xsig, &survivor, &close_on_exec);
         fail_next_artifact_fd_flag_preparation(artifact_fd);
 
-        let result = exec_capsule_with(payload, [0x22; 16], Some(artifact), |_| {
+        let result = exec_capsule_with(payload, [0x22; 16], Some(artifact), None, |_, _| {
             panic!("host exec must not run after artifact flag failure")
         });
 
@@ -2221,5 +2360,890 @@ mod tests {
         let mut payload = sample();
         payload.argv = vec![vec![0; MAX_ITEM_LEN + 1]];
         assert!(write_capsule(file.as_raw_fd(), nonce, &payload).is_err());
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(super) mod native_exec_live_arena {
+        use super::*;
+        use carrick_dsr::host::NativeHostJit;
+        use carrick_native_darwin::live_arena::{
+            DarwinLiveArena, LIVE_ARENA_PAYLOAD_OFFSET, LiveArenaHostJit, LiveArenaTransitV1,
+            RegisteredPortExecPlan,
+        };
+        use mach2::kern_return::KERN_SUCCESS;
+        use mach2::mach_port::{
+            mach_port_allocate, mach_port_deallocate, mach_port_destroy, mach_port_insert_right,
+        };
+        use mach2::message::MACH_MSG_TYPE_MAKE_SEND;
+        use mach2::port::{MACH_PORT_NULL, MACH_PORT_RIGHT_RECEIVE, mach_port_t};
+        use mach2::task::{mach_ports_lookup, mach_ports_register};
+        use mach2::traps::mach_task_self;
+        use mach2::vm::{mach_vm_allocate, mach_vm_deallocate};
+        use mach2::vm_statistics::VM_FLAGS_FIXED;
+
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+
+        use crate::native_exec_capsule::{
+            NativeReexecLiveArenaV1, NativeReexecXsigV1, decode_nonce, encode_nonce,
+        };
+
+        const CHILD_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_CHILD";
+        const CHILD_CAPSULE_FD_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_CAPSULE_FD";
+        const CHILD_NONCE_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_NONCE";
+        const CHILD_PARENT_RANGES_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_PARENT_RANGES";
+        const CHILD_COMMAND_FD_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_COMMAND_FD";
+        const CHILD_RECEIPT_FD_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_RECEIPT_FD";
+        const OWNER_RESUME_STAGE_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_OWNER_RESUME";
+        const OWNER_PID_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_OWNER_PID";
+        const LIVE_TRANSIT_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_TRANSIT";
+        const PUBLISH_COMMAND_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_PUBLISH_COMMAND";
+        const PUBLISH_ACK_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_PUBLISH_ACK";
+        const PUBLISH_PID_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_PUBLISH_PID";
+        const PUBLISHER_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_PUBLISHER";
+        const CHILD_TEST_NAME: &str =
+            "native_exec_capsule::tests::native_exec_live_arena::exec_successor_child";
+        const FRESH_RECEIPT: u8 = 0xf1;
+        static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        static LIFECYCLE_RECEIPT: std::sync::OnceLock<LifecycleReceipt> =
+            std::sync::OnceLock::new();
+
+        #[derive(Clone, Copy)]
+        struct LifecycleReceipt {
+            fresh: bool,
+            first: u8,
+            second: u8,
+            child_status: i32,
+        }
+
+        fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+            TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        struct PortSnapshot(Vec<mach_port_t>);
+
+        impl PortSnapshot {
+            fn lookup() -> Self {
+                let mut raw = std::ptr::null_mut();
+                let mut count = 0;
+                assert_eq!(
+                    unsafe { mach_ports_lookup(mach_task_self(), &mut raw, &mut count) },
+                    KERN_SUCCESS,
+                    "lookup registered ports"
+                );
+                let names = if raw.is_null() {
+                    Vec::new()
+                } else {
+                    unsafe { std::slice::from_raw_parts(raw, count as usize) }.to_vec()
+                };
+                if !raw.is_null() {
+                    assert_eq!(
+                        unsafe {
+                            mach_vm_deallocate(
+                                mach_task_self(),
+                                raw as u64,
+                                u64::from(count) * std::mem::size_of::<mach_port_t>() as u64,
+                            )
+                        },
+                        KERN_SUCCESS,
+                        "deallocate registered-port OOL array"
+                    );
+                }
+                Self(names)
+            }
+
+            fn normalized(&self) -> [mach_port_t; 3] {
+                assert!(self.0.len() <= 3);
+                let mut normalized = [MACH_PORT_NULL; 3];
+                normalized[..self.0.len()].copy_from_slice(&self.0);
+                normalized
+            }
+        }
+
+        impl Drop for PortSnapshot {
+            fn drop(&mut self) {
+                for name in &self.0 {
+                    if *name != MACH_PORT_NULL {
+                        unsafe { mach_port_deallocate(mach_task_self(), *name) };
+                    }
+                }
+            }
+        }
+
+        fn register(names: &[mach_port_t]) {
+            assert!(names.len() <= 3);
+            assert_eq!(
+                unsafe {
+                    mach_ports_register(
+                        mach_task_self(),
+                        names.as_ptr().cast_mut(),
+                        names.len() as u32,
+                    )
+                },
+                KERN_SUCCESS,
+                "register task ports"
+            );
+        }
+
+        struct RegisteredPortsGuard {
+            original: PortSnapshot,
+        }
+
+        impl RegisteredPortsGuard {
+            fn replace(names: &[mach_port_t]) -> Self {
+                let original = PortSnapshot::lookup();
+                register(names);
+                Self { original }
+            }
+        }
+
+        impl Drop for RegisteredPortsGuard {
+            fn drop(&mut self) {
+                register(&self.original.0);
+            }
+        }
+
+        struct TestPort(mach_port_t);
+
+        impl TestPort {
+            fn new() -> Self {
+                let mut name = MACH_PORT_NULL;
+                assert_eq!(
+                    unsafe {
+                        mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &mut name)
+                    },
+                    KERN_SUCCESS,
+                    "allocate test receive right"
+                );
+                assert_eq!(
+                    unsafe {
+                        mach_port_insert_right(
+                            mach_task_self(),
+                            name,
+                            name,
+                            MACH_MSG_TYPE_MAKE_SEND,
+                        )
+                    },
+                    KERN_SUCCESS,
+                    "insert test send right"
+                );
+                Self(name)
+            }
+        }
+
+        impl Drop for TestPort {
+            fn drop(&mut self) {
+                unsafe { mach_port_destroy(mach_task_self(), self.0) };
+            }
+        }
+
+        fn arena() -> DarwinLiveArena {
+            let page = unsafe { mach2::vm_page_size::vm_page_size };
+            DarwinLiveArena::new(page * 2, page).expect("live arena")
+        }
+
+        fn bind_real_xsig(payload: &mut NativeExecCapsuleV1, file: &std::fs::File) {
+            let fd = file.as_raw_fd();
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(flags >= 0);
+            let metadata = file.metadata().expect("xsig metadata");
+            let guest = payload.guest_exec.as_mut().expect("guest");
+            guest.xsig = NativeReexecXsigV1 {
+                host_fd: fd,
+                original_host_fd_flags: flags,
+                host_device: metadata.dev(),
+                host_inode: metadata.ino(),
+                host_size: metadata.len(),
+            };
+        }
+
+        fn return_immediate(value: u16) -> [u8; 8] {
+            let mov_w0 = 0x5280_0000_u32 | (u32::from(value) << 5);
+            let ret = 0xd65f_03c0_u32;
+            let mut code = [0_u8; 8];
+            code[..4].copy_from_slice(&mov_w0.to_le_bytes());
+            code[4..].copy_from_slice(&ret.to_le_bytes());
+            code
+        }
+
+        fn write_code(arena: &DarwinLiveArena, value: u16) {
+            let region = arena
+                .jit_region(LIVE_ARENA_PAYLOAD_OFFSET..LIVE_ARENA_PAYLOAD_OFFSET + 8)
+                .expect("live code region");
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    return_immediate(value).as_ptr(),
+                    region.write_base().as_ptr(),
+                    8,
+                );
+            }
+        }
+
+        fn execute_code(arena: &DarwinLiveArena) -> u32 {
+            let region = arena
+                .jit_region(LIVE_ARENA_PAYLOAD_OFFSET..LIVE_ARENA_PAYLOAD_OFFSET + 8)
+                .expect("live code region");
+            let executable = unsafe { region.exec_base().as_ptr() };
+            LiveArenaHostJit.flush_icache(executable, 8);
+            let entry: unsafe extern "C" fn() -> u32 = unsafe { std::mem::transmute(executable) };
+            unsafe { entry() }
+        }
+
+        fn pipe() -> [libc::c_int; 2] {
+            let mut fds = [-1; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "create pipe");
+            fds
+        }
+
+        fn close_fd(fd: libc::c_int) {
+            assert_eq!(unsafe { libc::close(fd) }, 0, "close fd {fd}");
+        }
+
+        fn write_byte(fd: libc::c_int, byte: u8) -> anyhow::Result<()> {
+            let mut written = 0;
+            while written == 0 {
+                let result = unsafe { libc::write(fd, (&raw const byte).cast(), 1) };
+                if result == 1 {
+                    written = 1;
+                } else if result < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                } else {
+                    anyhow::bail!("write lifecycle byte: {}", std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        }
+
+        fn read_byte(fd: libc::c_int) -> anyhow::Result<u8> {
+            let mut poll_fd = libc::pollfd {
+                fd,
+                events: libc::POLLIN | libc::POLLHUP,
+                revents: 0,
+            };
+            loop {
+                let result = unsafe { libc::poll(&mut poll_fd, 1, 15_000) };
+                if result > 0 {
+                    break;
+                }
+                if result < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                }
+                anyhow::bail!("timed out waiting for live-arena child receipt");
+            }
+            let mut byte = 0;
+            loop {
+                let result = unsafe { libc::read(fd, (&raw mut byte).cast(), 1) };
+                if result == 1 {
+                    return Ok(byte);
+                }
+                if result < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                }
+                if result == 0 {
+                    anyhow::bail!("live-arena child closed its receipt pipe");
+                }
+                anyhow::bail!(
+                    "read live-arena child receipt: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+
+        fn format_ranges(ranges: &[std::ops::Range<usize>; 3]) -> String {
+            ranges
+                .iter()
+                .map(|range| format!("{:x}-{:x}", range.start, range.end))
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+
+        fn parse_ranges(encoded: &str) -> anyhow::Result<[std::ops::Range<usize>; 3]> {
+            let ranges = encoded
+                .split(',')
+                .map(|encoded_range| {
+                    let (start, end) = encoded_range
+                        .split_once('-')
+                        .ok_or_else(|| anyhow::anyhow!("invalid encoded live-arena range"))?;
+                    Ok(usize::from_str_radix(start, 16)?..usize::from_str_radix(end, 16)?)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            ranges
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("live-arena range vector does not have three entries"))
+        }
+
+        struct FixedReservations(Vec<std::ops::Range<usize>>);
+
+        impl FixedReservations {
+            fn reserve(ranges: &[std::ops::Range<usize>; 3]) -> anyhow::Result<Self> {
+                let mut reserved = Vec::new();
+                for range in ranges {
+                    let mut address = range.start as u64;
+                    let result = unsafe {
+                        mach_vm_allocate(
+                            mach_task_self(),
+                            &mut address,
+                            range.len() as u64,
+                            VM_FLAGS_FIXED,
+                        )
+                    };
+                    if result == KERN_SUCCESS {
+                        if address != range.start as u64 {
+                            anyhow::bail!(
+                                "fixed parent live-arena reservation moved from {:#x} to {address:#x}",
+                                range.start
+                            );
+                        }
+                        reserved.push(range.clone());
+                    }
+                    // A fixed allocation failure means the fresh process image
+                    // already occupies part of this exact old range. That is
+                    // equally strong anti-reuse authority: the adopted mapping
+                    // cannot be placed at the parent's old base.
+                }
+                Ok(Self(reserved))
+            }
+        }
+
+        impl Drop for FixedReservations {
+            fn drop(&mut self) {
+                for range in self.0.drain(..) {
+                    unsafe {
+                        mach_vm_deallocate(
+                            mach_task_self(),
+                            range.start as u64,
+                            range.len() as u64,
+                        );
+                    }
+                }
+            }
+        }
+
+        struct ChildGuard(Option<libc::pid_t>);
+
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if let Some(pid) = self.0 {
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                        libc::waitpid(pid, std::ptr::null_mut(), 0);
+                    }
+                }
+            }
+        }
+
+        fn lifecycle_receipt() -> LifecycleReceipt {
+            *LIFECYCLE_RECEIPT.get_or_init(|| run_lifecycle_proof().expect("real lifecycle proof"))
+        }
+
+        fn run_lifecycle_proof() -> anyhow::Result<LifecycleReceipt> {
+            let third = TestPort::new();
+            let _ports = RegisteredPortsGuard::replace(&[third.0, MACH_PORT_NULL, MACH_PORT_NULL]);
+            let arena = arena();
+            write_code(&arena, 42);
+            let parent_ranges = unsafe { arena.local_mapping_ranges_for_transport_proof()? };
+
+            let xsig = tempfile::tempfile()?;
+            xsig.set_len(4096)?;
+            let executable = std::env::current_exe()?;
+            let mut payload = sample();
+            payload.producer_pid = unsafe { libc::getpid() as u32 };
+            payload.host_executable_path = executable.as_os_str().as_bytes().to_vec();
+            payload.guest_exec.as_mut().expect("guest").live_arena =
+                Some(arena.transit_v1().into());
+            bind_real_xsig(&mut payload, &xsig);
+            let mut child_payload = payload.clone();
+            let nonce = [0x9d; 16];
+            let command = pipe();
+            let receipt = pipe();
+            let child_pid = std::cell::Cell::new(None);
+            let ranges_env = format_ranges(&parent_ranges);
+
+            let result = exec_capsule_with(payload, nonce, None, Some(&arena), |request, _| {
+                let argv = [
+                    CString::new(executable.as_os_str().as_bytes()).expect("test executable"),
+                    CString::new("--exact").expect("exact arg"),
+                    CString::new(CHILD_TEST_NAME).expect("child test name"),
+                    CString::new("--nocapture").expect("nocapture arg"),
+                    CString::new("--test-threads=1").expect("test threads arg"),
+                ];
+                let argv_ptrs = argv
+                    .iter()
+                    .map(|entry| entry.as_ptr().cast_mut())
+                    .chain(std::iter::once(std::ptr::null_mut()))
+                    .collect::<Vec<_>>();
+                let mut env = std::env::vars_os()
+                    .filter(|(key, _)| {
+                        !key.as_os_str()
+                            .as_bytes()
+                            .starts_with(b"CARRICK_TEST_NATIVE_LIVE_ARENA_")
+                    })
+                    .map(|(key, value)| {
+                        let mut entry = key.as_os_str().as_bytes().to_vec();
+                        entry.push(b'=');
+                        entry.extend_from_slice(value.as_os_str().as_bytes());
+                        CString::new(entry).expect("environment entry")
+                    })
+                    .collect::<Vec<_>>();
+                for (key, value) in [
+                    (CHILD_ENV, "1".to_owned()),
+                    (CHILD_CAPSULE_FD_ENV, request.capsule_fd.to_string()),
+                    (CHILD_NONCE_ENV, encode_nonce(nonce)),
+                    (CHILD_PARENT_RANGES_ENV, ranges_env.clone()),
+                    (CHILD_COMMAND_FD_ENV, command[0].to_string()),
+                    (CHILD_RECEIPT_FD_ENV, receipt[1].to_string()),
+                ] {
+                    env.push(CString::new(format!("{key}={value}")).expect("child environment"));
+                }
+                let env_ptrs = env
+                    .iter()
+                    .map(|entry| entry.as_ptr().cast_mut())
+                    .chain(std::iter::once(std::ptr::null_mut()))
+                    .collect::<Vec<_>>();
+                for fd in [command[0], receipt[1]] {
+                    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                    assert!(flags >= 0 && flags & libc::FD_CLOEXEC == 0);
+                }
+
+                let pid = unsafe { libc::fork() };
+                assert!(pid >= 0, "fork lifecycle child");
+                if pid == 0 {
+                    unsafe {
+                        libc::close(command[1]);
+                        libc::close(receipt[0]);
+                    }
+                    let mut start = 0_u8;
+                    let read = unsafe { libc::read(command[0], (&raw mut start).cast(), 1) };
+                    if read != 1 || start != 1 {
+                        unsafe { libc::_exit(126) };
+                    }
+                    unsafe {
+                        libc::execve(
+                            request.executable.as_ptr(),
+                            argv_ptrs.as_ptr().cast(),
+                            env_ptrs.as_ptr().cast(),
+                        );
+                        libc::_exit(127);
+                    }
+                }
+
+                child_pid.set(Some(pid));
+                close_fd(command[0]);
+                close_fd(receipt[1]);
+                child_payload.producer_pid = pid as u32;
+                write_capsule(request.capsule_fd, nonce, &child_payload)
+                    .expect("rewrite capsule for fork child PID");
+                write_byte(command[1], 1).expect("release child into exec");
+                std::io::Error::from_raw_os_error(libc::ENOEXEC)
+            });
+            assert!(
+                result.is_err(),
+                "test invoke must model a returned parent exec"
+            );
+            let pid = child_pid
+                .get()
+                .ok_or_else(|| anyhow::anyhow!("no fork child"))?;
+            let mut child_guard = ChildGuard(Some(pid));
+
+            let fresh_byte = read_byte(receipt[0])?;
+            if fresh_byte != FRESH_RECEIPT {
+                let mut remaining = [0_u8; std::mem::size_of::<libc::c_int>() - 1];
+                let result = unsafe {
+                    libc::read(receipt[0], remaining.as_mut_ptr().cast(), remaining.len())
+                };
+                if result == remaining.len() as isize {
+                    let mut encoded = [0_u8; std::mem::size_of::<libc::c_int>()];
+                    encoded[0] = fresh_byte;
+                    encoded[1..].copy_from_slice(&remaining);
+                    let mut status = 0;
+                    let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+                    if waited == pid {
+                        child_guard.0 = None;
+                    }
+                    anyhow::bail!(
+                        "POSIX_SPAWN_SETEXEC returned {}; waitpid={waited} status={status:#x}",
+                        libc::c_int::from_ne_bytes(encoded),
+                    );
+                }
+                anyhow::bail!("successor did not publish fresh-address receipt");
+            }
+            let fresh = true;
+            let first = read_byte(receipt[0])?;
+            write_code(&arena, 43);
+            write_byte(command[1], 2)?;
+            let second = read_byte(receipt[0])?;
+            close_fd(command[1]);
+            close_fd(receipt[0]);
+
+            let mut child_status = 0;
+            if unsafe { libc::waitpid(pid, &mut child_status, 0) } != pid {
+                anyhow::bail!(
+                    "wait for lifecycle child: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            child_guard.0 = None;
+            Ok(LifecycleReceipt {
+                fresh,
+                first,
+                second,
+                child_status,
+            })
+        }
+
+        pub(crate) fn resume_hook(arena: Option<&DarwinLiveArena>) -> anyhow::Result<Option<i32>> {
+            if std::env::var_os(CHILD_ENV).is_none() {
+                return Ok(None);
+            }
+            let arena = arena.ok_or_else(|| anyhow::anyhow!("child did not adopt live arena"))?;
+            let parent_ranges = parse_ranges(&std::env::var(CHILD_PARENT_RANGES_ENV)?)?;
+            let adopted_ranges = unsafe { arena.local_mapping_ranges_for_transport_proof()? };
+            let fresh = adopted_ranges.iter().all(|adopted| {
+                parent_ranges
+                    .iter()
+                    .all(|parent| adopted.end <= parent.start || parent.end <= adopted.start)
+            });
+            let receipt_fd: libc::c_int = std::env::var(CHILD_RECEIPT_FD_ENV)?.parse()?;
+            let command_fd: libc::c_int = std::env::var(CHILD_COMMAND_FD_ENV)?.parse()?;
+            write_byte(receipt_fd, if fresh { FRESH_RECEIPT } else { 0 })?;
+            write_byte(receipt_fd, u8::try_from(execute_code(arena))?)?;
+            if read_byte(command_fd)? != 2 {
+                anyhow::bail!("child received invalid publication synchronization byte");
+            }
+            write_byte(receipt_fd, u8::try_from(execute_code(arena))?)?;
+            Ok(Some(0))
+        }
+
+        fn run_owning_process_lifecycle() -> anyhow::Result<()> {
+            let arena = arena();
+            write_code(&arena, 42);
+            let publish_command = pipe();
+            let publish_ack = pipe();
+            let _clean_ports =
+                RegisteredPortsGuard::replace(&[MACH_PORT_NULL, MACH_PORT_NULL, MACH_PORT_NULL]);
+            let plan = RegisteredPortExecPlan::install(&arena)?;
+
+            let executable = std::env::current_exe()?;
+            let argv = [
+                CString::new(executable.as_os_str().as_bytes())?,
+                CString::new("--exact")?,
+                CString::new(CHILD_TEST_NAME)?,
+                CString::new("--nocapture")?,
+                CString::new("--test-threads=1")?,
+            ];
+            let argv_ptrs = argv
+                .iter()
+                .map(|entry| entry.as_ptr().cast_mut())
+                .chain(std::iter::once(std::ptr::null_mut()))
+                .collect::<Vec<_>>();
+            let publisher_transit = arena.transit_v1();
+            let mut publisher_env = std::env::vars_os()
+                .filter(|(key, _)| {
+                    !key.as_os_str()
+                        .as_bytes()
+                        .starts_with(b"CARRICK_TEST_NATIVE_LIVE_ARENA_")
+                })
+                .map(|(key, value)| {
+                    let mut entry = key.as_os_str().as_bytes().to_vec();
+                    entry.push(b'=');
+                    entry.extend_from_slice(value.as_os_str().as_bytes());
+                    CString::new(entry)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            for (key, value) in [
+                (CHILD_ENV, "1".to_owned()),
+                (PUBLISHER_ENV, "1".to_owned()),
+                (PUBLISH_COMMAND_ENV, publish_command[0].to_string()),
+                (PUBLISH_ACK_ENV, publish_ack[1].to_string()),
+                (
+                    LIVE_TRANSIT_ENV,
+                    format!(
+                        "{}:{}:{}:{}",
+                        publisher_transit.schema,
+                        publisher_transit.code_len,
+                        publisher_transit.control_len,
+                        encode_nonce(publisher_transit.nonce),
+                    ),
+                ),
+            ] {
+                publisher_env.push(CString::new(format!("{key}={value}"))?);
+            }
+            let publisher_env_ptrs = publisher_env
+                .iter()
+                .map(|entry| entry.as_ptr().cast_mut())
+                .chain(std::iter::once(std::ptr::null_mut()))
+                .collect::<Vec<_>>();
+            let publisher_pid = unsafe {
+                plan.spawn_process(
+                    argv[0].as_ptr(),
+                    argv_ptrs.as_ptr(),
+                    publisher_env_ptrs.as_ptr(),
+                )?
+            };
+            assert_eq!(read_byte(publish_ack[0])?, 1);
+            close_fd(publish_command[0]);
+            close_fd(publish_ack[1]);
+            let mut env = std::env::vars_os()
+                .filter(|(key, _)| {
+                    let key = key.as_os_str().as_bytes();
+                    key != OWNER_RESUME_STAGE_ENV.as_bytes()
+                        && key != OWNER_PID_ENV.as_bytes()
+                        && key != LIVE_TRANSIT_ENV.as_bytes()
+                        && key != PUBLISH_COMMAND_ENV.as_bytes()
+                        && key != PUBLISH_ACK_ENV.as_bytes()
+                        && key != PUBLISH_PID_ENV.as_bytes()
+                        && key != CHILD_PARENT_RANGES_ENV.as_bytes()
+                })
+                .map(|(key, value)| {
+                    let mut entry = key.as_os_str().as_bytes().to_vec();
+                    entry.push(b'=');
+                    entry.extend_from_slice(value.as_os_str().as_bytes());
+                    CString::new(entry)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let old_mapping_ranges = unsafe { arena.local_mapping_ranges_for_transport_proof()? };
+            for (key, value) in [
+                (OWNER_RESUME_STAGE_ENV, "after".to_owned()),
+                (OWNER_PID_ENV, unsafe { libc::getpid() }.to_string()),
+                (
+                    LIVE_TRANSIT_ENV,
+                    format!(
+                        "{}:{}:{}:{}",
+                        arena.transit_v1().schema,
+                        arena.transit_v1().code_len,
+                        arena.transit_v1().control_len,
+                        encode_nonce(arena.transit_v1().nonce),
+                    ),
+                ),
+                (PUBLISH_COMMAND_ENV, publish_command[1].to_string()),
+                (PUBLISH_ACK_ENV, publish_ack[0].to_string()),
+                (PUBLISH_PID_ENV, publisher_pid.to_string()),
+                (CHILD_PARENT_RANGES_ENV, format_ranges(&old_mapping_ranges)),
+            ] {
+                env.push(CString::new(format!("{key}={value}"))?);
+            }
+            let env_ptrs = env
+                .iter()
+                .map(|entry| entry.as_ptr().cast_mut())
+                .chain(std::iter::once(std::ptr::null_mut()))
+                .collect::<Vec<_>>();
+            let error = unsafe {
+                plan.replace_process(argv[0].as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr())
+            };
+            anyhow::bail!("owning-process replacement returned {error}")
+        }
+
+        #[test]
+        fn registered_port_transaction_preserves_all_three_slots() {
+            let _serial = test_lock();
+            let startup = PortSnapshot::lookup();
+            let startup = startup.normalized();
+            assert_eq!(startup[1], MACH_PORT_NULL);
+            assert_eq!(startup[2], MACH_PORT_NULL);
+            let third = TestPort::new();
+            let _guard = RegisteredPortsGuard::replace(&[third.0, MACH_PORT_NULL, MACH_PORT_NULL]);
+            let arena = arena();
+            let plan =
+                RegisteredPortExecPlan::install(&arena).expect("prepare registered-port exec plan");
+            let installed = PortSnapshot::lookup();
+            let installed = installed.normalized();
+            assert_eq!(installed[0], third.0);
+            assert_eq!(installed[1], MACH_PORT_NULL);
+            assert_eq!(installed[2], MACH_PORT_NULL);
+            drop(plan);
+            assert_eq!(
+                PortSnapshot::lookup().normalized(),
+                [third.0, MACH_PORT_NULL, MACH_PORT_NULL]
+            );
+        }
+
+        #[test]
+        fn failed_exec_restores_original_registered_port_vector() {
+            let _serial = test_lock();
+            let third = TestPort::new();
+            let _guard = RegisteredPortsGuard::replace(&[third.0, MACH_PORT_NULL, MACH_PORT_NULL]);
+            let arena = arena();
+            let mut payload = sample();
+            payload.producer_pid = unsafe { libc::getpid() as u32 };
+            payload.host_executable_path = std::env::current_exe()
+                .expect("current executable")
+                .as_os_str()
+                .as_bytes()
+                .to_vec();
+            payload.guest_exec.as_mut().expect("guest").live_arena =
+                Some(NativeReexecLiveArenaV1::from(arena.transit_v1()));
+            let xsig = tempfile::tempfile().expect("xsig tempfile");
+            xsig.set_len(4096).expect("size xsig");
+            bind_real_xsig(&mut payload, &xsig);
+            let result = exec_capsule_with(payload, [0x71; 16], None, Some(&arena), |_, _| {
+                std::io::Error::from_raw_os_error(libc::ENOEXEC)
+            });
+            assert!(result.is_err());
+            assert_eq!(
+                PortSnapshot::lookup().normalized(),
+                [third.0, MACH_PORT_NULL, MACH_PORT_NULL]
+            );
+        }
+
+        #[test]
+        fn resume_rejects_missing_swapped_or_extra_arena_rights() {
+            let _serial = test_lock();
+            let expected = arena().transit_v1();
+            assert!(DarwinLiveArena::adopt_registered(expected).is_err());
+
+            let preserved = TestPort::new();
+            let wrong_code = TestPort::new();
+            let wrong_control = TestPort::new();
+            let _guard =
+                RegisteredPortsGuard::replace(&[preserved.0, wrong_control.0, wrong_code.0]);
+            assert!(DarwinLiveArena::adopt_registered(expected).is_err());
+
+            register(&[preserved.0, wrong_code.0, wrong_control.0]);
+            assert!(DarwinLiveArena::adopt_optional_registered(None).is_err());
+
+            register(&[preserved.0, wrong_code.0, MACH_PORT_NULL]);
+            assert!(DarwinLiveArena::adopt_registered(expected).is_err());
+        }
+
+        #[test]
+        fn fork_exec_successor_maps_arena_at_fresh_addresses() {
+            let _serial = test_lock();
+            let receipt = lifecycle_receipt();
+            assert!(
+                receipt.fresh,
+                "all three successor mappings must use fresh VAs"
+            );
+            assert!(libc::WIFEXITED(receipt.child_status));
+            assert_eq!(libc::WEXITSTATUS(receipt.child_status), 0);
+        }
+
+        #[test]
+        fn fork_exec_successor_observes_parent_code_publication() {
+            let _serial = test_lock();
+            let receipt = lifecycle_receipt();
+            assert_eq!(receipt.first, 42);
+            assert_eq!(receipt.second, 43);
+            assert!(libc::WIFEXITED(receipt.child_status));
+            assert_eq!(libc::WEXITSTATUS(receipt.child_status), 0);
+        }
+
+        #[test]
+        #[allow(unreachable_code)]
+        fn exec_successor_child() {
+            if std::env::var_os(CHILD_ENV).is_none() {
+                return;
+            }
+            if std::env::var_os(PUBLISHER_ENV).is_some() {
+                let transit = std::env::var(LIVE_TRANSIT_ENV).expect("publisher transit metadata");
+                let mut fields = transit.split(':');
+                let expected = LiveArenaTransitV1 {
+                    schema: fields
+                        .next()
+                        .expect("schema")
+                        .parse()
+                        .expect("parse schema"),
+                    code_len: fields.next().expect("code").parse().expect("parse code"),
+                    control_len: fields
+                        .next()
+                        .expect("control")
+                        .parse()
+                        .expect("parse control"),
+                    nonce: decode_nonce(fields.next().expect("nonce")).expect("parse nonce"),
+                };
+                let arena = DarwinLiveArena::adopt_registered(expected)
+                    .expect("publisher adopts registered arena");
+                let command: libc::c_int = std::env::var(PUBLISH_COMMAND_ENV)
+                    .expect("publisher command")
+                    .parse()
+                    .expect("parse publisher command");
+                let ack: libc::c_int = std::env::var(PUBLISH_ACK_ENV)
+                    .expect("publisher ack")
+                    .parse()
+                    .expect("parse publisher ack");
+                write_byte(ack, 1).expect("publisher ready");
+                assert_eq!(read_byte(command).expect("publication command"), 43);
+                write_code(&arena, 43);
+                write_byte(ack, 43).expect("publication complete");
+                return;
+            }
+            if std::env::var_os(OWNER_RESUME_STAGE_ENV).is_some() {
+                let old_ranges = parse_ranges(
+                    &std::env::var(CHILD_PARENT_RANGES_ENV).expect("old mapping ranges"),
+                )
+                .expect("parse old mapping ranges");
+                let _reservations =
+                    FixedReservations::reserve(&old_ranges).expect("reserve old mapping ranges");
+                let before_pid: libc::pid_t = std::env::var(OWNER_PID_ENV)
+                    .expect("owner PID")
+                    .parse()
+                    .expect("parse setexec fact PID");
+                assert_eq!(before_pid, unsafe { libc::getpid() });
+                let transit = std::env::var(LIVE_TRANSIT_ENV).expect("live transit metadata");
+                let mut fields = transit.split(':');
+                let expected = LiveArenaTransitV1 {
+                    schema: fields
+                        .next()
+                        .expect("schema")
+                        .parse()
+                        .expect("parse schema"),
+                    code_len: fields
+                        .next()
+                        .expect("code length")
+                        .parse()
+                        .expect("parse code length"),
+                    control_len: fields
+                        .next()
+                        .expect("control length")
+                        .parse()
+                        .expect("parse control length"),
+                    nonce: decode_nonce(fields.next().expect("nonce")).expect("parse nonce"),
+                };
+                assert!(fields.next().is_none());
+                let adopted = DarwinLiveArena::adopt_registered(expected)
+                    .expect("adopt direct same-task SETEXEC arena");
+                assert_eq!(execute_code(&adopted), 42);
+                let receipt_fd: libc::c_int = std::env::var(CHILD_RECEIPT_FD_ENV)
+                    .expect("outer receipt fd")
+                    .parse()
+                    .expect("parse outer receipt fd");
+                write_byte(receipt_fd, FRESH_RECEIPT).expect("fresh receipt");
+                write_byte(receipt_fd, 42).expect("initial code receipt");
+                let publish_command: libc::c_int = std::env::var(PUBLISH_COMMAND_ENV)
+                    .expect("publish command fd")
+                    .parse()
+                    .expect("parse publish command fd");
+                let publish_ack: libc::c_int = std::env::var(PUBLISH_ACK_ENV)
+                    .expect("publish ack fd")
+                    .parse()
+                    .expect("parse publish ack fd");
+                write_byte(publish_command, 43).expect("request code publication");
+                assert_eq!(read_byte(publish_ack).expect("publication ack"), 43);
+                assert_eq!(execute_code(&adopted), 43);
+                write_byte(receipt_fd, 43).expect("published code receipt");
+                let publisher_pid: libc::pid_t = std::env::var(PUBLISH_PID_ENV)
+                    .expect("publisher PID")
+                    .parse()
+                    .expect("parse publisher PID");
+                let mut status = 0;
+                assert_eq!(
+                    unsafe { libc::waitpid(publisher_pid, &mut status, 0) },
+                    publisher_pid
+                );
+                assert!(libc::WIFEXITED(status));
+                assert_eq!(libc::WEXITSTATUS(status), 0);
+                return;
+            }
+            run_owning_process_lifecycle().expect("run owning-process live arena lifecycle");
+            unreachable!("SETEXEC must replace the process image");
+        }
     }
 }
