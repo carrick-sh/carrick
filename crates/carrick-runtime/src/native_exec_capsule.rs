@@ -2362,9 +2362,9 @@ mod tests {
     pub(super) mod native_exec_live_arena {
         use super::*;
         use carrick_dsr::host::NativeHostJit;
+        use carrick_dsr_aarch64::live_arena::LiveArenaCapacities;
         use carrick_native_darwin::live_arena::{
-            DarwinLiveArena, LIVE_ARENA_PAYLOAD_OFFSET, LiveArenaHostJit, LiveArenaTransitV1,
-            RegisteredPortExecPlan,
+            DarwinLiveArena, LiveArenaHostJit, LiveArenaTransitV1, RegisteredPortExecPlan,
         };
         use mach2::kern_return::KERN_SUCCESS;
         use mach2::mach_port::{
@@ -2538,7 +2538,12 @@ mod tests {
 
         fn arena() -> DarwinLiveArena {
             let page = unsafe { mach2::vm_page_size::vm_page_size };
-            DarwinLiveArena::new(page * 2, page).expect("live arena")
+            DarwinLiveArena::new(LiveArenaCapacities::new(
+                page as u64,
+                page as u64,
+                page as u64,
+            ))
+            .expect("live arena")
         }
 
         fn bind_real_xsig(payload: &mut NativeExecCapsuleV1, file: &std::fs::File) {
@@ -2566,9 +2571,7 @@ mod tests {
         }
 
         fn write_code(arena: &DarwinLiveArena, value: u16) {
-            let region = arena
-                .jit_region(LIVE_ARENA_PAYLOAD_OFFSET..LIVE_ARENA_PAYLOAD_OFFSET + 8)
-                .expect("live code region");
+            let region = arena.jit_region(0..8).expect("live code region");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     return_immediate(value).as_ptr(),
@@ -2579,9 +2582,7 @@ mod tests {
         }
 
         fn execute_code(arena: &DarwinLiveArena) -> u32 {
-            let region = arena
-                .jit_region(LIVE_ARENA_PAYLOAD_OFFSET..LIVE_ARENA_PAYLOAD_OFFSET + 8)
-                .expect("live code region");
+            let region = arena.jit_region(0..8).expect("live code region");
             let executable = unsafe { region.exec_base().as_ptr() };
             LiveArenaHostJit.flush_icache(executable, 8);
             let entry: unsafe extern "C" fn() -> u32 = unsafe { std::mem::transmute(executable) };
