@@ -244,6 +244,21 @@ impl TranslationUnitKey {
         self.address_mode.host_bias()
     }
 
+    /// Domain-separated fixed-width identity for the live translation arena.
+    ///
+    /// This deliberately hashes the complete exact key encoding rather than
+    /// deriving from [`Self::file_stem`]: a live arena record must bind every
+    /// existing unit determinant, never a basename or another partial key.
+    pub fn live_digest(&self) -> Result<[u8; 32], serde_json::Error> {
+        let encoded = serde_json::to_vec(self)?;
+        let mut digest = Sha256::new();
+        digest.update(b"carrick-live-arena-v1");
+        digest.update(crate::live_arena::LIVE_ARENA_SCHEMA_V1.to_le_bytes());
+        digest.update(TRANSLATOR_ABI_CURRENT.to_le_bytes());
+        digest.update(encoded);
+        Ok(digest.finalize().into())
+    }
+
     pub fn file_stem(&self) -> Result<String, serde_json::Error> {
         let encoded = serde_json::to_vec(self)?;
         let digest: [u8; 32] = Sha256::digest(encoded).into();
