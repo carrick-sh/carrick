@@ -62,7 +62,7 @@
 - Modify: `crates/carrick-dsr-aarch64/src/lib.rs`
 - Modify: `crates/carrick-dsr-aarch64/src/shared_cache.rs`
 
-- [ ] Add red unit tests in `live_arena.rs` named:
+- [x] Add red unit tests in `live_arena.rs` named:
 
   - `ready_acquire_exposes_complete_record`
   - `building_record_falls_back_without_waiting`
@@ -73,13 +73,13 @@
   - `reservation_cursors_never_overlap_under_concurrency`
   - `ready_record_is_immutable`
 
-- [ ] Run the focused test and prove the new module is missing or the tests fail:
+- [x] Run the focused test and prove the new module is missing or the tests fail:
 
   ```bash
   cargo test -p carrick-dsr-aarch64 live_arena -- --nocapture
   ```
 
-- [ ] Implement the wire types with fixed-width fields and compile-time layout assertions:
+- [x] Implement the wire types with fixed-width fields and compile-time layout assertions:
 
   ```rust
   pub const LIVE_ARENA_SCHEMA_V1: u32 = 1;
@@ -112,17 +112,17 @@
   }
   ```
 
-- [ ] Make `TranslationUnitKey::live_digest()` domain-separate the existing exact key with `b"carrick-live-arena-v1"`, schema, and `TRANSLATOR_ABI_CURRENT`; do not create a basename or partial-key path.
-- [ ] Implement lookup exactly as one acquire load plus, only for `EMPTY`, one `compare_exchange(EMPTY, BUILDING, AcqRel, Acquire)`. A CAS loss returns `Private` without retrying.
-- [ ] Store records in a fixed 131,072-slot open-addressed table. Hash
+- [x] Make `TranslationUnitKey::live_digest()` domain-separate the existing exact key with `b"carrick-live-arena-v1"`, schema, and `TRANSLATOR_ABI_CURRENT`; do not create a basename or partial-key path.
+- [x] Implement lookup exactly as one acquire load plus, only for `EMPTY`, one `compare_exchange(EMPTY, BUILDING, AcqRel, Acquire)`. A CAS loss returns `Private` without retrying.
+- [x] Store records in a fixed 131,072-slot open-addressed table. Hash
   `(unit_key_digest, guest_start)` to the low 17 bits and probe at most 16
   consecutive slots. Continue only past a READY different key or a
   release-published FAILED different key. BUILDING, same-key FAILED, CAS loss,
   or 16 exhausted probes immediately returns `Private`; bounded collision
   probing is never a publication wait/retry.
-- [ ] Implement append-only code/hot/cold reservations with atomic fetch-update and checked page/instruction alignment. Capacity failure stores `FAILED` and returns the private disposition.
-- [ ] Implement publication as field writes, bounds/hash validation, then one `state.store(READY, Release)`. Expose no method capable of modifying a READY record.
-- [ ] Run:
+- [x] Implement append-only code/hot/cold reservations with atomic fetch-update and checked page/instruction alignment. Capacity failure stores `FAILED` and returns the private disposition.
+- [x] Implement publication as field writes, bounds/hash validation, then one `state.store(READY, Release)`. Expose no method capable of modifying a READY record.
+- [x] Run:
 
   ```bash
   cargo test -p carrick-dsr-aarch64 live_arena -- --nocapture
@@ -130,7 +130,7 @@
   cargo fmt --all -- --check
   ```
 
-- [ ] Commit:
+- [x] Commit:
 
   ```bash
   git add crates/carrick-dsr-aarch64/src/lib.rs \
