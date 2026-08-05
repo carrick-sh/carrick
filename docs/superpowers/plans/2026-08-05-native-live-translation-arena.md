@@ -150,7 +150,7 @@
 - Modify: `crates/carrick-native-darwin/src/jit.rs`
 - Modify: `crates/carrick-native-darwin/Cargo.toml`
 
-- [ ] Add red Darwin live tests named:
+- [x] Add red Darwin live tests named:
 
   - `writer_and_rx_alias_execute_coherent_code`
   - `memory_entry_maps_at_unrelated_addresses`
@@ -160,20 +160,20 @@
 
   The coherence test writes `mov w0,#42; ret`, executes 42 through RX, replaces the immediate through RW, calls the existing instruction-cache shim, and executes 43.
 
-- [ ] Run and prove red:
+- [x] Run and prove red:
 
   ```bash
   cargo test -p carrick-native-darwin live_arena -- --nocapture
   ```
 
-- [ ] Add the target production dependency:
+- [x] Add the target production dependency:
 
   ```toml
   [target.'cfg(target_os = "macos")'.dependencies]
   mach2.workspace = true
   ```
 
-- [ ] Implement RAII wrappers with no raw Mach port escaping their owner:
+- [x] Implement RAII wrappers with no raw Mach port escaping their owner:
 
   ```rust
   pub struct DarwinLiveArena {
@@ -195,11 +195,11 @@
   }
   ```
 
-- [ ] Create the code/control objects with `mach_vm_allocate` plus `mach_make_memory_entry_64`. Map separate code RW and RX aliases with `mach_vm_map`, never W+X on one alias. Validate page alignment, requested size, max protection, and returned object size.
-- [ ] Provide `DarwinLiveArena::jit_region(range)` returning a borrowed `JitRegion { exec_base: rx+offset, write_base: rw+offset, capacity }` and a stateless `LiveArenaHostJit` whose write toggles are no-ops and whose flush calls `carrick_native_clear_icache` on the RX address.
-- [ ] Provide `revoke_rx(range)` using `mach_vm_protect(..., PROT_NONE)` and a checked `restore_rx_for_test` only under `cfg(test)`.
-- [ ] Expose fresh code/control send-right duplication for the exec transaction; do not expose receive rights or a global mutable raw port.
-- [ ] Run:
+- [x] Create the control object with `mach_vm_allocate` plus `mach_make_memory_entry_64`. Create the code entry from a private constructor-only nominal-RWX `MAP_JIT` bootstrap, containing no published code and unmapped before the arena escapes: the controlled PROT_NONE/RW/RX/plain-allocation matrix all failed on this host, and only this Darwin-required shape produced an entry that could map both permissions. Map the live code RW and RX aliases separately with `mach_vm_map`; retain no W+X mapping. Validate page alignment, requested size, max protection, and returned object size.
+- [x] Provide `DarwinLiveArena::jit_region(range)` returning a `BorrowedLiveJitRegion` with checked matching RW/RX offsets, lifetime-bound pointer tokens, and no safe conversion to an owned `JitRegion`; a compile-fail test prevents the reviewed lifetime-erasure bug. Provide a stateless `LiveArenaHostJit` whose write toggles are no-ops and whose flush calls `carrick_native_clear_icache` on the RX address.
+- [x] Provide `revoke_rx(range)` using `mach_vm_protect(..., PROT_NONE)` and a checked `restore_rx_for_test` only under `cfg(test)`.
+- [x] Expose fresh code/control send-right duplication for the exec transaction; do not expose receive rights or a global mutable raw port.
+- [x] Run:
 
   ```bash
   cargo test -p carrick-native-darwin live_arena -- --nocapture
@@ -207,7 +207,7 @@
   cargo fmt --all -- --check
   ```
 
-- [ ] Commit:
+- [x] Commit:
 
   ```bash
   git add crates/carrick-native-darwin/Cargo.toml \
