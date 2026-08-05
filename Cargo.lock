@@ -652,6 +652,7 @@ dependencies = [
  "memmap2",
  "serde_json",
  "sha2",
+ "static_assertions",
  "tempfile",
  "tracing",
 ]

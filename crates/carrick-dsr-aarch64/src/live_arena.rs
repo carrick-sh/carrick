@@ -30,7 +30,7 @@ pub const LIVE_ARENA_CONTROL_DIRECTORY_BYTES: usize = 192;
 pub const LIVE_ARENA_CONTROL_READY: u32 = 1;
 const LIVE_ARENA_PROBES: usize = 16;
 const LIVE_ARENA_MASK: usize = LIVE_ARENA_RECORDS - 1;
-const LIVE_ARENA_PAGE_BYTES: u64 = 16 * 1024;
+pub const LIVE_ARENA_PAGE_BYTES: u64 = 16 * 1024;
 const LIVE_ARENA_INSTRUCTION_BYTES: u64 = 4;
 const LIVE_ARENA_METADATA_ALIGN: u64 = 8;
 
@@ -1016,6 +1016,16 @@ impl<'a> LivePublishClaim<'a> {
         self.record.owner_pid.load(Ordering::Relaxed)
     }
 
+    #[doc(hidden)]
+    pub const fn unit_key_digest(&self) -> [u8; 32] {
+        self.unit_key_digest
+    }
+
+    #[doc(hidden)]
+    pub const fn guest_start(&self) -> GuestVa {
+        GuestVa(self.guest_start)
+    }
+
     /// Reserves disjoint append-only ranges. Failure strands this BUILDING
     /// record as FAILED; it never retries or waits for another publisher.
     pub fn reserve(
@@ -1612,6 +1622,7 @@ mod tests {
 
     fn prepared_publication() -> PreparedSharedInitial {
         prepare_shared_initial(
+            &key(),
             &BlockPlan {
                 start: GuestVa(0x4000_0000),
                 end: GuestVa(0x4000_000c),

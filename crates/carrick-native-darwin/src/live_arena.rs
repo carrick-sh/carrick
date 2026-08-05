@@ -6,11 +6,21 @@
 //! private, empty, constructor-only MAP_JIT bootstrap that is temporarily
 //! nominal-RWX and unmapped before arena construction returns.
 
+use carrick_dsr::cache::{PageGenerationDomain, PageGenerationObservation, TranslationCache};
 use carrick_dsr::host::{ForkChildJit, JitRegion, NativeHostJit};
-use carrick_dsr_aarch64::live_arena::{
-    LIVE_ARENA_OBJECT_HEADER_BYTES, LiveArenaCapacities, LiveArenaControlLayout,
-    LiveTranslationArenaView,
+use carrick_dsr_aarch64::emit::{
+    ExpectedLivePublication, LivePrebindOutcome, PreparedSharedInitial,
+    validate_live_shared_initial_hot,
 };
+use carrick_dsr_aarch64::live_arena::{
+    LIVE_ARENA_OBJECT_HEADER_BYTES, LIVE_ARENA_PAGE_BYTES, LiveArenaCapacities,
+    LiveArenaControlLayout, LiveBlockExtents, LiveLookup, LiveMappedWritePermit, LivePrivateReason,
+    LiveProcessViewBrand, LivePublishClaim, LiveReservedPublishClaim, LiveTranslationArenaView,
+    ValidatedLiveBlockRecord,
+};
+use carrick_dsr_aarch64::shared_cache::TranslationUnitKey;
+use carrick_dsr_aarch64::types::CacheOffset;
+use carrick_guest_mem::{GuestVa, HostVa};
 use mach2::kern_return::{KERN_SUCCESS, kern_return_t};
 use mach2::mach_port::{mach_port_deallocate, mach_port_mod_refs};
 use mach2::memory_object_types::memory_object_size_t;
@@ -25,10 +35,13 @@ use mach2::vm_inherit::VM_INHERIT_SHARE;
 use mach2::vm_prot::{VM_PROT_EXECUTE, VM_PROT_NONE, VM_PROT_READ, VM_PROT_WRITE, vm_prot_t};
 use mach2::vm_region::{VM_REGION_BASIC_INFO_64, vm_region_basic_info_64};
 use mach2::vm_statistics::VM_FLAGS_ANYWHERE;
+use sha2::{Digest, Sha256};
 use std::io;
 use std::marker::PhantomData;
 use std::ops::Range;
 use std::ptr::NonNull;
+use std::rc::Rc;
+use std::sync::Arc;
 
 pub const LIVE_ARENA_TRANSIT_SCHEMA_V1: u32 = 1;
 const LIVE_OBJECT_HEADER_LEN: usize = LIVE_ARENA_OBJECT_HEADER_BYTES;
@@ -808,7 +821,7 @@ impl DarwinLiveArena {
     ///     arena.control_view().unwrap()
     /// }
     /// ```
-    pub fn control_view(&self) -> io::Result<LiveTranslationArenaView<'_>> {
+    fn control_view(&self) -> io::Result<LiveTranslationArenaView<'_>> {
         let layout = self.control_layout();
         let base = NonNull::new(self.control_rw.base() as *mut u8)
             .ok_or_else(|| invalid_input("live control mapping is null"))?;
@@ -844,7 +857,8 @@ impl DarwinLiveArena {
         })
     }
 
-    pub fn jit_region(&self, range: Range<usize>) -> io::Result<BorrowedLiveJitRegion<'_>> {
+    #[cfg(test)]
+    fn jit_region(&self, range: Range<usize>) -> io::Result<BorrowedLiveJitRegion<'_>> {
         let layout = self.control_layout();
         let logical_capacity = usize::try_from(layout.capacities().code)
             .map_err(|_| invalid_input("live code capacity exceeds usize"))?;
@@ -933,6 +947,575 @@ impl DarwinLiveArena {
     }
 }
 
+/// Cloneable ownership of one process-local mapping view of a live arena.
+///
+/// The Mach objects may be the same in another process (or another mapping in
+/// this process), but every constructor creates a fresh portable process-view
+/// brand. Shared offsets are therefore reusable while local addresses and
+/// claim authority are not.
+///
+/// ```compile_fail
+/// use carrick_native_darwin::live_arena::DarwinLiveArena;
+///
+/// fn safe_native_api_does_not_expose_raw_portable_claim(arena: &DarwinLiveArena) {
+///     let _raw_portable_view = arena.control_view().unwrap();
+/// }
+/// ```
+#[derive(Clone)]
+pub struct LiveArenaProcessView {
+    inner: Arc<LiveArenaProcessViewInner>,
+}
+
+struct LiveArenaProcessViewInner {
+    arena: Arc<DarwinLiveArena>,
+    process_brand: LiveProcessViewBrand,
+    generation_domain: PageGenerationDomain,
+    layout: LiveArenaControlLayout,
+}
+
+impl LiveArenaProcessView {
+    pub fn new(
+        arena: Arc<DarwinLiveArena>,
+        generation_domain: PageGenerationDomain,
+    ) -> io::Result<Self> {
+        let control = arena.control_view()?;
+        let layout = control.layout();
+        if layout != arena.control_layout() {
+            return Err(io::Error::other(
+                "live arena process view geometry changed after adoption",
+            ));
+        }
+        Ok(Self {
+            inner: Arc::new(LiveArenaProcessViewInner {
+                arena,
+                process_brand: LiveProcessViewBrand::fresh(),
+                generation_domain,
+                layout,
+            }),
+        })
+    }
+
+    pub fn lookup(
+        &self,
+        key: &TranslationUnitKey,
+        guest_start: GuestVa,
+        owner_pid: i32,
+    ) -> DarwinLiveLookup<'_> {
+        let Ok(control) = self.inner.arena.control_view() else {
+            return DarwinLiveLookup::Private(LivePrivateReason::InvalidRecord);
+        };
+        match control.lookup(&self.inner.process_brand, key, guest_start, owner_pid) {
+            LiveLookup::Publish(claim) => {
+                let unit_digest = claim.unit_key_digest();
+                let guest_start = claim.guest_start();
+                DarwinLiveLookup::Publish(DarwinLivePublishClaim {
+                    inner: &self.inner,
+                    claim,
+                    unit_digest,
+                    guest_start,
+                })
+            }
+            LiveLookup::Ready(record) => DarwinLiveLookup::Ready(ValidatedLiveBlockHandle {
+                inner: Arc::clone(&self.inner),
+                record,
+            }),
+            LiveLookup::Private(reason) => DarwinLiveLookup::Private(reason),
+        }
+    }
+
+    pub fn acquire(
+        &self,
+        ready: ValidatedLiveBlockHandle,
+        generation: &PageGenerationObservation,
+    ) -> Result<LiveArenaExecutable, LivePrivateReason> {
+        if !generation.belongs_to(&self.inner.generation_domain)
+            || !Arc::ptr_eq(&self.inner, &ready.inner)
+        {
+            return Err(LivePrivateReason::InvalidRecord);
+        }
+        let control = self
+            .inner
+            .arena
+            .control_view()
+            .map_err(|_| LivePrivateReason::InvalidRecord)?;
+        let record = control
+            .revalidate_ready(&self.inner.process_brand, &ready.record)
+            .ok_or(LivePrivateReason::InvalidRecord)?;
+        if generation.page().raw() != record.source_page()
+            || generation.expected() != carrick_dsr_aarch64::types::CodeGeneration::INITIAL
+            || generation.current() != carrick_dsr_aarch64::types::CodeGeneration::INITIAL
+            || record.entry_offset() != 0
+        {
+            return Err(LivePrivateReason::InvalidRecord);
+        }
+        let extents = record.extents();
+        let code = self
+            .inner
+            .resolve_code(extents.code.offset, extents.code.len)?;
+        let hot = self.inner.resolve_control(
+            self.inner.layout.hot_base(),
+            self.inner.layout.capacities().hot,
+            extents.hot.offset,
+            extents.hot.len,
+        )?;
+        let _cold_geometry = self.inner.resolve_control(
+            self.inner.layout.cold_base(),
+            self.inner.layout.capacities().cold,
+            extents.cold.offset,
+            extents.cold.len,
+        )?;
+        // SAFETY: both immutable ranges were checked against the retained
+        // mapping geometry and READY makes their contents immutable. COLD is
+        // intentionally left unresolved and lazy on this hot acquire path.
+        let code_bytes = unsafe { std::slice::from_raw_parts(code.exec.as_ptr(), code.len) };
+        let hot_bytes = unsafe { std::slice::from_raw_parts(hot.as_ptr(), hot.len) };
+        if <[u8; 32]>::from(Sha256::digest(code_bytes)) != record.code_sha256()
+            || validate_live_shared_initial_hot(hot_bytes, extents.code.len).is_err()
+        {
+            return Err(LivePrivateReason::InvalidRecord);
+        }
+        if generation.current() != carrick_dsr_aarch64::types::CodeGeneration::INITIAL {
+            return Err(LivePrivateReason::InvalidRecord);
+        }
+        record_live_arena_test_event(LiveArenaTestEvent::ConsumerInvalidate {
+            start: code.exec.as_ptr() as usize,
+            len: code.len,
+        });
+        crate::jit::clear_icache(code.exec.as_ptr(), code.len);
+        Ok(LiveArenaExecutable {
+            inner: Arc::clone(&self.inner),
+            record,
+        })
+    }
+}
+
+pub enum DarwinLiveLookup<'view> {
+    Ready(ValidatedLiveBlockHandle),
+    Publish(DarwinLivePublishClaim<'view>),
+    Private(LivePrivateReason),
+}
+
+pub struct ValidatedLiveBlockHandle {
+    inner: Arc<LiveArenaProcessViewInner>,
+    record: ValidatedLiveBlockRecord,
+}
+
+impl ValidatedLiveBlockHandle {
+    pub fn extents(&self) -> LiveBlockExtents {
+        self.record.extents()
+    }
+
+    pub fn code_sha256(&self) -> [u8; 32] {
+        self.record.code_sha256()
+    }
+}
+
+pub struct DarwinLivePublishClaim<'view> {
+    inner: &'view Arc<LiveArenaProcessViewInner>,
+    claim: LivePublishClaim<'view>,
+    unit_digest: [u8; 32],
+    guest_start: GuestVa,
+}
+
+impl<'view> DarwinLivePublishClaim<'view> {
+    pub fn reserve(
+        self,
+        prepared: PreparedSharedInitial,
+        generation: &PageGenerationObservation,
+    ) -> Result<DarwinLiveReservedPublication<'view>, LivePrivateReason> {
+        if !prepared.matches_live_identity(self.unit_digest, self.guest_start) {
+            return Err(LivePrivateReason::InvalidRecord);
+        }
+        let source_page = self.guest_start.raw() / LIVE_ARENA_PAGE_BYTES * LIVE_ARENA_PAGE_BYTES;
+        if !generation.belongs_to(&self.inner.generation_domain)
+            || generation.page().raw() != source_page
+            || generation.expected() != carrick_dsr_aarch64::types::CodeGeneration::INITIAL
+            || generation.current() != carrick_dsr_aarch64::types::CodeGeneration::INITIAL
+        {
+            return Err(LivePrivateReason::InvalidRecord);
+        }
+        let lengths = prepared.lengths();
+        let reserved = self
+            .claim
+            .reserve(lengths.code, lengths.hot, lengths.cold)?;
+        let extents = reserved.extents();
+
+        let code = self
+            .inner
+            .resolve_code(extents.code.offset, extents.code.len)?;
+        let hot = self.inner.resolve_control(
+            self.inner.layout.hot_base(),
+            self.inner.layout.capacities().hot,
+            extents.hot.offset,
+            extents.hot.len,
+        )?;
+        let cold = self.inner.resolve_control(
+            self.inner.layout.cold_base(),
+            self.inner.layout.capacities().cold,
+            extents.cold.offset,
+            extents.cold.len,
+        )?;
+        if code.write == code.exec {
+            return Err(LivePrivateReason::InvalidRecord);
+        }
+        Ok(DarwinLiveReservedPublication {
+            inner: self.inner,
+            guest_start: self.guest_start,
+            reserved,
+            prepared,
+            code,
+            hot,
+            cold,
+            generation: generation.clone(),
+        })
+    }
+}
+
+pub struct DarwinLiveReservedPublication<'view> {
+    inner: &'view Arc<LiveArenaProcessViewInner>,
+    guest_start: GuestVa,
+    reserved: LiveReservedPublishClaim<'view>,
+    prepared: PreparedSharedInitial,
+    code: CheckedCodeRange,
+    hot: CheckedControlRange,
+    cold: CheckedControlRange,
+    generation: PageGenerationObservation,
+}
+
+impl DarwinLiveReservedPublication<'_> {
+    pub fn prebind(
+        &mut self,
+        candidate_index: usize,
+        target: &LiveArenaExecutable,
+    ) -> Result<LivePrebindOutcome, LivePrivateReason> {
+        if !Arc::ptr_eq(self.inner, &target.inner) {
+            return Err(LivePrivateReason::InvalidRecord);
+        }
+        let candidate = self
+            .prepared
+            .link_candidates()
+            .get(candidate_index)
+            .copied()
+            .ok_or(LivePrivateReason::InvalidRecord)?;
+        let source_page = self.guest_start.raw() / LIVE_ARENA_PAGE_BYTES * LIVE_ARENA_PAGE_BYTES;
+        let source_page_end = source_page
+            .checked_add(LIVE_ARENA_PAGE_BYTES)
+            .ok_or(LivePrivateReason::InvalidRecord)?;
+        if candidate.target.raw() != target.record.guest_start()
+            || !(self.guest_start.raw()..source_page_end).contains(&candidate.source.raw())
+        {
+            return Err(LivePrivateReason::InvalidRecord);
+        }
+        let target_extents = target.record.extents();
+        let target_code = self
+            .inner
+            .resolve_code(target_extents.code.offset, target_extents.code.len)?;
+        let target_entry = target_code
+            .exec
+            .as_ptr()
+            .addr()
+            .checked_add(target.record.entry_offset() as usize)
+            .ok_or(LivePrivateReason::InvalidRecord)?;
+        // SAFETY: Arc identity proves the target capability and source
+        // reservation use this exact process view. Both addresses are derived
+        // from checked local RX extents; the emitter rechecks slot geometry and
+        // AArch64 branch reachability before mutating only prepared bytes.
+        unsafe {
+            self.prepared.prebind_live_direct_link(
+                candidate_index,
+                HostVa(self.code.exec.as_ptr().addr()),
+                HostVa(target_entry),
+            )
+        }
+        .map_err(|_| LivePrivateReason::InvalidRecord)
+    }
+
+    pub fn publish(mut self) -> Result<ValidatedLiveBlockHandle, LivePrivateReason> {
+        if !self.generation.belongs_to(&self.inner.generation_domain)
+            || self.generation.expected() != carrick_dsr_aarch64::types::CodeGeneration::INITIAL
+            || self.generation.current() != carrick_dsr_aarch64::types::CodeGeneration::INITIAL
+        {
+            return Err(LivePrivateReason::InvalidRecord);
+        }
+        // SAFETY: the unique claim still owns these exact mapped ranges; the
+        // permit is acquired before any metadata or code byte is written.
+        let mut permit = unsafe { self.reserved.begin_mapped_write() }?;
+        record_live_arena_test_event(LiveArenaTestEvent::PermitBegun);
+        // SAFETY: the process view resolved both aliases and metadata pools
+        // from this exact reservation. The cache borrow is tied to the permit,
+        // process view, and current stack/thread.
+        let cache = unsafe {
+            LiveArenaTranslationCache::new(self.inner, &mut permit, self.code, self.hot, self.cold)
+        };
+        let expected = cache.publish(self.prepared)?;
+
+        // The claim-bound cache and every address-bearing emitted value were
+        // consumed and dropped before certification begins.
+        let code_bytes =
+            unsafe { std::slice::from_raw_parts(self.code.exec.as_ptr(), self.code.len) };
+        let hot_bytes = unsafe { std::slice::from_raw_parts(self.hot.as_ptr(), self.hot.len) };
+        let cold_bytes = unsafe { std::slice::from_raw_parts(self.cold.as_ptr(), self.cold.len) };
+        // SAFETY: the exact mapped code/HOT/COLD ranges, INITIAL observation,
+        // real cache publication, and post-publication digest are established
+        // above. No mutable alias remains live at certification.
+        let written = unsafe {
+            permit.certify_mapped(
+                code_bytes,
+                hot_bytes,
+                cold_bytes,
+                self.generation.page(),
+                0,
+                &self.generation,
+                expected,
+            )
+        }?;
+        let record = self.reserved.publish(written)?;
+        Ok(ValidatedLiveBlockHandle {
+            inner: Arc::clone(self.inner),
+            record,
+        })
+    }
+}
+
+/// Owned READY capability. It retains its process-local mappings and exposes
+/// only shared offset metadata; executable address resolution stays private.
+pub struct LiveArenaExecutable {
+    inner: Arc<LiveArenaProcessViewInner>,
+    record: ValidatedLiveBlockRecord,
+}
+
+impl LiveArenaExecutable {
+    pub fn extents(&self) -> LiveBlockExtents {
+        let _retained_process_view = &self.inner;
+        self.record.extents()
+    }
+
+    pub fn code_sha256(&self) -> [u8; 32] {
+        self.record.code_sha256()
+    }
+
+    /// Address-free receipt for the exact consumer-local RX range invalidated
+    /// before this executable authority was returned.
+    pub fn invalidated_code_extent(&self) -> carrick_dsr_aarch64::live_arena::LiveReservation {
+        self.record.extents().code
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CheckedCodeRange {
+    write: NonNull<u8>,
+    exec: NonNull<u8>,
+    len: usize,
+}
+
+#[derive(Clone, Copy)]
+struct CheckedControlRange {
+    base: NonNull<u8>,
+    len: usize,
+}
+
+impl CheckedControlRange {
+    const fn as_ptr(self) -> *mut u8 {
+        self.base.as_ptr()
+    }
+}
+
+impl LiveArenaProcessViewInner {
+    fn resolve_code(
+        &self,
+        logical_offset: u64,
+        logical_len: u64,
+    ) -> Result<CheckedCodeRange, LivePrivateReason> {
+        let offset =
+            usize::try_from(logical_offset).map_err(|_| LivePrivateReason::InvalidRecord)?;
+        let len = usize::try_from(logical_len).map_err(|_| LivePrivateReason::InvalidRecord)?;
+        let capacity = usize::try_from(self.layout.capacities().code)
+            .map_err(|_| LivePrivateReason::InvalidRecord)?;
+        let end = offset
+            .checked_add(len)
+            .filter(|end| *end <= capacity)
+            .ok_or(LivePrivateReason::InvalidRecord)?;
+        if offset == end {
+            return Err(LivePrivateReason::InvalidRecord);
+        }
+        let actual = self
+            .layout
+            .code_payload_base()
+            .checked_add(offset)
+            .ok_or(LivePrivateReason::InvalidRecord)?;
+        let write = self
+            .arena
+            .code_rw
+            .base()
+            .checked_add(actual)
+            .and_then(|value| NonNull::new(value as *mut u8))
+            .ok_or(LivePrivateReason::InvalidRecord)?;
+        let exec = self
+            .arena
+            .code_rx
+            .base()
+            .checked_add(actual)
+            .and_then(|value| NonNull::new(value as *mut u8))
+            .ok_or(LivePrivateReason::InvalidRecord)?;
+        Ok(CheckedCodeRange { write, exec, len })
+    }
+
+    fn resolve_control(
+        &self,
+        payload_base: usize,
+        payload_capacity: u64,
+        logical_offset: u64,
+        logical_len: u64,
+    ) -> Result<CheckedControlRange, LivePrivateReason> {
+        let offset =
+            usize::try_from(logical_offset).map_err(|_| LivePrivateReason::InvalidRecord)?;
+        let len = usize::try_from(logical_len).map_err(|_| LivePrivateReason::InvalidRecord)?;
+        let capacity =
+            usize::try_from(payload_capacity).map_err(|_| LivePrivateReason::InvalidRecord)?;
+        let logical_end = offset
+            .checked_add(len)
+            .filter(|end| *end <= capacity)
+            .ok_or(LivePrivateReason::InvalidRecord)?;
+        if offset == logical_end {
+            return Err(LivePrivateReason::InvalidRecord);
+        }
+        let actual = payload_base
+            .checked_add(offset)
+            .ok_or(LivePrivateReason::InvalidRecord)?;
+        actual
+            .checked_add(len)
+            .filter(|end| *end <= self.layout.control_len())
+            .ok_or(LivePrivateReason::InvalidRecord)?;
+        let base = self
+            .arena
+            .control_rw
+            .base()
+            .checked_add(actual)
+            .and_then(|value| NonNull::new(value as *mut u8))
+            .ok_or(LivePrivateReason::InvalidRecord)?;
+        Ok(CheckedControlRange { base, len })
+    }
+}
+
+/// A claim-bound cache that cannot leave this stack or cross a thread. Its
+/// only operation consumes one prepared block into the exact mapped extent.
+struct LiveArenaTranslationCache<'borrow, 'claim, 'view> {
+    cache: TranslationCache,
+    _view: &'borrow LiveArenaProcessViewInner,
+    _permit: &'borrow mut LiveMappedWritePermit<'claim, 'view>,
+    code: CheckedCodeRange,
+    hot: CheckedControlRange,
+    cold: CheckedControlRange,
+    _thread: PhantomData<Rc<()>>,
+}
+
+impl<'borrow, 'claim, 'view> LiveArenaTranslationCache<'borrow, 'claim, 'view> {
+    unsafe fn new(
+        view: &'borrow LiveArenaProcessViewInner,
+        permit: &'borrow mut LiveMappedWritePermit<'claim, 'view>,
+        code: CheckedCodeRange,
+        hot: CheckedControlRange,
+        cold: CheckedControlRange,
+    ) -> Self {
+        let region = JitRegion {
+            exec_base: code.exec,
+            write_base: code.write,
+            capacity: code.len,
+        };
+        Self {
+            cache: TranslationCache::from_region(region, &LIVE_ARENA_HOST_JIT),
+            _view: view,
+            _permit: permit,
+            code,
+            hot,
+            cold,
+            _thread: PhantomData,
+        }
+    }
+
+    fn publish(
+        mut self,
+        prepared: PreparedSharedInitial,
+    ) -> Result<ExpectedLivePublication, LivePrivateReason> {
+        let lengths = prepared.lengths();
+        let expected_code =
+            usize::try_from(lengths.code).map_err(|_| LivePrivateReason::InvalidRecord)?;
+        if expected_code != self.code.len
+            || usize::try_from(lengths.hot) != Ok(self.hot.len)
+            || usize::try_from(lengths.cold) != Ok(self.cold.len)
+        {
+            return Err(LivePrivateReason::InvalidRecord);
+        }
+        // This proof is intentionally derived only after the caller's optional
+        // same-view prebinding has completed and immediately before mapped
+        // bytes are committed.
+        let expected = prepared.expected_publication();
+        record_live_arena_test_event(LiveArenaTestEvent::MetadataWrite);
+        // SAFETY: `_permit` is the unique mapped-write authority for these
+        // exact pool-bounded ranges, and all lengths were checked above.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                prepared.hot_bytes().as_ptr(),
+                self.hot.as_ptr(),
+                self.hot.len,
+            );
+            std::ptr::copy_nonoverlapping(
+                prepared.cold_bytes().as_ptr(),
+                self.cold.as_ptr(),
+                self.cold.len,
+            );
+        }
+        let emitted = prepared
+            .publish(&mut self.cache)
+            .map_err(|_| LivePrivateReason::InvalidRecord)?;
+        if emitted.entry().host().raw() != self.code.exec.as_ptr() as usize
+            || emitted.len() != expected_code
+            || emitted.trusted_entry() != Some(CacheOffset::published(0))
+            || self.cache.used_bytes() != expected_code
+            || self.cache.capacity_bytes() != expected_code
+        {
+            return Err(LivePrivateReason::InvalidRecord);
+        }
+        drop(emitted);
+        Ok(expected)
+    }
+}
+
+static LIVE_ARENA_HOST_JIT: LiveArenaHostJit = LiveArenaHostJit;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LiveArenaTestEvent {
+    PermitBegun,
+    MetadataWrite,
+    PublisherFlush { start: usize, len: usize },
+    ConsumerInvalidate { start: usize, len: usize },
+}
+
+#[cfg(test)]
+thread_local! {
+    static LIVE_ARENA_TEST_EVENTS: std::cell::RefCell<Vec<LiveArenaTestEvent>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+#[cfg(test)]
+fn record_live_arena_test_event(event: LiveArenaTestEvent) {
+    LIVE_ARENA_TEST_EVENTS.with(|events| events.borrow_mut().push(event));
+}
+
+#[cfg(not(test))]
+fn record_live_arena_test_event(_event: LiveArenaTestEvent) {}
+
+#[cfg(test)]
+fn clear_live_arena_test_events() {
+    LIVE_ARENA_TEST_EVENTS.with(|events| events.borrow_mut().clear());
+}
+
+#[cfg(test)]
+fn take_live_arena_test_events() -> Vec<LiveArenaTestEvent> {
+    LIVE_ARENA_TEST_EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))
+}
+
 /// A checked view of matching RW/RX aliases whose lifetime is tied to its
 /// arena. It intentionally cannot produce an owned [`JitRegion`]: reservation
 /// authority and unique writer ranges come from the Task 2 allocation protocol,
@@ -950,40 +1533,44 @@ impl DarwinLiveArena {
 ///         .unwrap()
 /// }
 /// ```
-pub struct BorrowedLiveJitRegion<'a> {
+#[cfg(test)]
+struct BorrowedLiveJitRegion<'a> {
     exec_base: NonNull<u8>,
     write_base: NonNull<u8>,
     capacity: usize,
     _arena: PhantomData<&'a DarwinLiveArena>,
 }
 
+#[cfg(test)]
 impl BorrowedLiveJitRegion<'_> {
-    pub fn exec_base(&self) -> BorrowedLiveJitPointer<'_> {
+    fn exec_base(&self) -> BorrowedLiveJitPointer<'_> {
         BorrowedLiveJitPointer {
             pointer: self.exec_base,
             _region: PhantomData,
         }
     }
 
-    pub fn write_base(&self) -> BorrowedLiveJitPointer<'_> {
+    fn write_base(&self) -> BorrowedLiveJitPointer<'_> {
         BorrowedLiveJitPointer {
             pointer: self.write_base,
             _region: PhantomData,
         }
     }
 
-    pub fn capacity(&self) -> usize {
+    fn capacity(&self) -> usize {
         self.capacity
     }
 }
 
 /// A pointer token whose lifetime is bounded by a checked live-arena region.
 /// It has no safe conversion to a raw pointer or owned [`JitRegion`].
-pub struct BorrowedLiveJitPointer<'a> {
+#[cfg(test)]
+struct BorrowedLiveJitPointer<'a> {
     pointer: NonNull<u8>,
     _region: PhantomData<&'a BorrowedLiveJitRegion<'a>>,
 }
 
+#[cfg(test)]
 impl BorrowedLiveJitPointer<'_> {
     /// Exposes the checked alias pointer for low-level code emission or entry.
     ///
@@ -993,7 +1580,7 @@ impl BorrowedLiveJitPointer<'_> {
     /// conversion does not establish exclusive write authority: a caller that
     /// writes through it must hold the unique range granted by the Task 2
     /// reservation protocol and obey the alias's current Mach protection.
-    pub unsafe fn as_ptr(&self) -> *mut u8 {
+    unsafe fn as_ptr(&self) -> *mut u8 {
         self.pointer.as_ptr()
     }
 }
@@ -1018,6 +1605,10 @@ impl NativeHostJit for LiveArenaHostJit {
     fn end_thread_write(&self) {}
 
     fn flush_icache(&self, exec_ptr: *const u8, len: usize) {
+        record_live_arena_test_event(LiveArenaTestEvent::PublisherFlush {
+            start: exec_ptr as usize,
+            len,
+        });
         crate::jit::clear_icache(exec_ptr, len);
     }
 
@@ -1204,11 +1795,48 @@ fn write_pipe_byte(fd: libc::c_int, byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carrick_dsr::cache::PageGenerationTable;
     use carrick_dsr::host::NativeHostJit;
+    use carrick_dsr_aarch64::block::{BlockPlan, PlannedExit, PlannedInst};
+    use carrick_dsr_aarch64::emit::{
+        EmitAddressMode, PreparedSharedInitial, prepare_shared_initial,
+    };
     use carrick_dsr_aarch64::live_arena::{LiveArenaCapacities, LiveArenaControlDirectoryV1};
+    use carrick_dsr_aarch64::shared_cache::{
+        AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
+        NativePageProfileIdentity, SourceFingerprint, TranslationUnitKey,
+    };
+    use carrick_dsr_aarch64::types::{CodeGeneration, DirectExit, DirectKind, InstAction};
+    use carrick_guest_mem::GuestVa;
+    use static_assertions::assert_not_impl_any;
     use std::ops::Range;
+    use std::sync::Arc;
+
+    assert_not_impl_any!(LiveArenaTranslationCache<'static, 'static, 'static>: Send, Sync);
 
     const CODE: Range<usize> = 0..8;
+
+    #[test]
+    fn private_live_cache_cannot_escape_or_cross_thread() {
+        assert!(
+            !std::any::type_name::<LiveArenaTranslationCache<'static, 'static, 'static>>()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn safe_native_api_does_not_expose_raw_portable_claim() {
+        let arena = Arc::new(protocol_arena());
+        let generations = PageGenerationTable::new(page() as u64).expect("generation table");
+        let view = LiveArenaProcessView::new(arena, generations.domain()).expect("process view");
+        let claim = match view.lookup(&live_key(), GuestVa(0x4000_0000), 40) {
+            DarwinLiveLookup::Publish(claim) => claim,
+            DarwinLiveLookup::Ready(_) => panic!("fresh arena unexpectedly READY"),
+            DarwinLiveLookup::Private(reason) => panic!("fresh claim went private: {reason:?}"),
+        };
+        assert!(std::any::type_name_of_val(&claim).contains("DarwinLivePublishClaim"));
+        drop(claim);
+    }
 
     fn page() -> usize {
         host_page_size().expect("valid Mach host page size")
@@ -1502,12 +2130,701 @@ mod tests {
     }
 
     fn protocol_arena() -> DarwinLiveArena {
+        protocol_arena_with_pages(1)
+    }
+
+    fn protocol_arena_with_pages(payload_pages: usize) -> DarwinLiveArena {
         DarwinLiveArena::new(LiveArenaCapacities::new(
-            page() as u64,
-            page() as u64,
-            page() as u64,
+            (page() * payload_pages) as u64,
+            (page() * payload_pages) as u64,
+            (page() * payload_pages) as u64,
         ))
         .expect("create mapped protocol arena")
+    }
+
+    fn live_key() -> TranslationUnitKey {
+        live_key_with_executable(0x42)
+    }
+
+    fn live_key_with_executable(executable_byte: u8) -> TranslationUnitKey {
+        TranslationUnitKey::for_segment(
+            ExecutableIdentity::Digest([executable_byte; 32]),
+            ImageFileOffset::new(0),
+            ImageFileLen::new(page() as u64).expect("nonzero image length"),
+            GuestVa(0x4000_0000),
+            GuestCodeLen::new(page() as u64).expect("nonzero guest length"),
+            SourceFingerprint([0x7a; 32]),
+            NativePageProfileIdentity::Native16k,
+            AddressModeIdentity::Direct,
+        )
+    }
+
+    fn prepared_publication() -> PreparedSharedInitial {
+        prepared_publication_for_key(&live_key())
+    }
+
+    fn prepared_publication_for_key(key: &TranslationUnitKey) -> PreparedSharedInitial {
+        prepare_shared_initial(
+            key,
+            &BlockPlan {
+                start: GuestVa(0x4000_0000),
+                end: GuestVa(0x4000_000c),
+                generation: CodeGeneration::INITIAL,
+                instructions: vec![
+                    PlannedInst {
+                        guest: GuestVa(0x4000_0000),
+                        action: InstAction::Copy(0xd503_201f),
+                    },
+                    PlannedInst {
+                        guest: GuestVa(0x4000_0004),
+                        action: InstAction::Copy(0x9100_0400),
+                    },
+                ],
+                exit: PlannedExit::Syscall {
+                    guest: GuestVa(0x4000_0008),
+                    resume: GuestVa(0x4000_000c),
+                },
+                extensions: Vec::new(),
+            },
+            EmitAddressMode::Direct,
+            Vec::new(),
+        )
+        .expect("prepare real shared INITIAL publication")
+    }
+
+    fn prepared_target() -> PreparedSharedInitial {
+        prepare_shared_initial(
+            &live_key(),
+            &BlockPlan {
+                start: GuestVa(0x4000_1000),
+                end: GuestVa(0x4000_100c),
+                generation: CodeGeneration::INITIAL,
+                instructions: vec![
+                    PlannedInst {
+                        guest: GuestVa(0x4000_1000),
+                        action: InstAction::Copy(0xd503_201f),
+                    },
+                    PlannedInst {
+                        guest: GuestVa(0x4000_1004),
+                        action: InstAction::Copy(0x9100_0400),
+                    },
+                ],
+                exit: PlannedExit::Syscall {
+                    guest: GuestVa(0x4000_1008),
+                    resume: GuestVa(0x4000_100c),
+                },
+                extensions: Vec::new(),
+            },
+            EmitAddressMode::Direct,
+            Vec::new(),
+        )
+        .expect("prepare target shared INITIAL publication")
+    }
+
+    fn prepared_direct_source() -> PreparedSharedInitial {
+        prepare_shared_initial(
+            &live_key(),
+            &BlockPlan {
+                start: GuestVa(0x4000_0000),
+                end: GuestVa(0x4000_0004),
+                generation: CodeGeneration::INITIAL,
+                instructions: Vec::new(),
+                exit: PlannedExit::Direct {
+                    guest: GuestVa(0x4000_0000),
+                    word: 0x1400_0400,
+                    exit: DirectExit {
+                        kind: DirectKind::Branch,
+                        target: GuestVa(0x4000_1000),
+                        resume: GuestVa(0x4000_0004),
+                        condition: None,
+                        register: None,
+                        bit: None,
+                    },
+                },
+                extensions: Vec::new(),
+            },
+            EmitAddressMode::Direct,
+            Vec::new(),
+        )
+        .expect("prepare direct source shared INITIAL publication")
+    }
+
+    #[test]
+    fn claim_rejects_same_length_prepared_block_from_another_guest_start() {
+        let arena = Arc::new(protocol_arena());
+        let generations = PageGenerationTable::new(page() as u64).expect("generation table");
+        let generation = generations
+            .observe(GuestVa(0x4000_0000))
+            .expect("generation");
+        let view = LiveArenaProcessView::new(arena, generations.domain()).expect("process view");
+        let claim = match view.lookup(&live_key(), GuestVa(0x4000_0000), 61) {
+            DarwinLiveLookup::Publish(claim) => claim,
+            DarwinLiveLookup::Ready(_) => panic!("fresh arena unexpectedly READY"),
+            DarwinLiveLookup::Private(reason) => panic!("fresh claim went private: {reason:?}"),
+        };
+        assert!(claim.reserve(prepared_target(), &generation).is_err());
+    }
+
+    #[test]
+    fn claim_rejects_same_start_prepared_block_from_another_unit_digest() {
+        let arena = Arc::new(protocol_arena());
+        let generations = PageGenerationTable::new(page() as u64).expect("generation table");
+        let generation = generations
+            .observe(GuestVa(0x4000_0000))
+            .expect("generation");
+        let view = LiveArenaProcessView::new(arena, generations.domain()).expect("process view");
+        let claim = match view.lookup(&live_key(), GuestVa(0x4000_0000), 62) {
+            DarwinLiveLookup::Publish(claim) => claim,
+            DarwinLiveLookup::Ready(_) => panic!("fresh arena unexpectedly READY"),
+            DarwinLiveLookup::Private(reason) => panic!("fresh claim went private: {reason:?}"),
+        };
+        let other_key = live_key_with_executable(0x43);
+        assert!(
+            claim
+                .reserve(prepared_publication_for_key(&other_key), &generation)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn foreign_initial_generation_cannot_publish_or_acquire() {
+        let arena = Arc::new(protocol_arena());
+        let authoritative = PageGenerationTable::new(page() as u64).expect("authoritative table");
+        let view = LiveArenaProcessView::new(arena, authoritative.domain()).expect("process view");
+        authoritative
+            .note_guest_code_write(GuestVa(0x4000_0000)..GuestVa(0x4000_0004))
+            .expect("advance authoritative generation");
+        let foreign = PageGenerationTable::new(page() as u64).expect("foreign table");
+        let foreign_initial = foreign
+            .observe(GuestVa(0x4000_0000))
+            .expect("foreign INITIAL observation");
+        let claim = match view.lookup(&live_key(), GuestVa(0x4000_0000), 63) {
+            DarwinLiveLookup::Publish(claim) => claim,
+            DarwinLiveLookup::Ready(_) => panic!("fresh arena unexpectedly READY"),
+            DarwinLiveLookup::Private(reason) => panic!("fresh claim went private: {reason:?}"),
+        };
+        assert!(
+            claim
+                .reserve(prepared_publication(), &foreign_initial)
+                .is_err()
+        );
+
+        let arena = Arc::new(protocol_arena());
+        let authoritative = PageGenerationTable::new(page() as u64).expect("authoritative table");
+        let generation = authoritative
+            .observe(GuestVa(0x4000_0000))
+            .expect("authoritative INITIAL observation");
+        let view = LiveArenaProcessView::new(arena, authoritative.domain()).expect("process view");
+        match view.lookup(&live_key(), GuestVa(0x4000_0000), 64) {
+            DarwinLiveLookup::Publish(claim) => {
+                claim
+                    .reserve(prepared_publication(), &generation)
+                    .expect("same-domain INITIAL reserves")
+                    .publish()
+                    .expect("same-domain INITIAL publishes");
+            }
+            DarwinLiveLookup::Ready(_) => panic!("fresh arena unexpectedly READY"),
+            DarwinLiveLookup::Private(reason) => panic!("fresh claim went private: {reason:?}"),
+        }
+        let foreign = PageGenerationTable::new(page() as u64).expect("foreign table");
+        let foreign_initial = foreign
+            .observe(GuestVa(0x4000_0000))
+            .expect("foreign INITIAL observation");
+        let foreign_ready = match view.lookup(&live_key(), GuestVa(0x4000_0000), 65) {
+            DarwinLiveLookup::Ready(ready) => ready,
+            DarwinLiveLookup::Publish(_) => panic!("READY record was claimed again"),
+            DarwinLiveLookup::Private(reason) => panic!("READY lookup went private: {reason:?}"),
+        };
+        assert!(view.acquire(foreign_ready, &foreign_initial).is_err());
+        let same_domain_ready = match view.lookup(&live_key(), GuestVa(0x4000_0000), 66) {
+            DarwinLiveLookup::Ready(ready) => ready,
+            DarwinLiveLookup::Publish(_) => panic!("READY record was claimed again"),
+            DarwinLiveLookup::Private(reason) => panic!("READY lookup went private: {reason:?}"),
+        };
+        assert!(view.acquire(same_domain_ready, &generation).is_ok());
+    }
+
+    #[test]
+    fn same_view_prebinding_mutates_only_still_prepared_source() {
+        let arena = Arc::new(protocol_arena_with_pages(3));
+        let generations = PageGenerationTable::new(page() as u64).expect("generation table");
+        let view = LiveArenaProcessView::new(Arc::clone(&arena), generations.domain())
+            .expect("process view");
+        let generation = generations
+            .observe(GuestVa(0x4000_0000))
+            .expect("generation");
+
+        let target_handle = match view.lookup(&live_key(), GuestVa(0x4000_1000), 54) {
+            DarwinLiveLookup::Publish(claim) => claim
+                .reserve(prepared_target(), &generation)
+                .expect("reserve target")
+                .publish()
+                .expect("publish target"),
+            DarwinLiveLookup::Ready(_) => panic!("fresh target unexpectedly READY"),
+            DarwinLiveLookup::Private(reason) => panic!("target went private: {reason:?}"),
+        };
+        let target_ready = match view.lookup(&live_key(), GuestVa(0x4000_1000), 55) {
+            DarwinLiveLookup::Ready(ready) => ready,
+            DarwinLiveLookup::Publish(_) => panic!("target READY was claimed again"),
+            DarwinLiveLookup::Private(reason) => panic!("target READY went private: {reason:?}"),
+        };
+        let target = view
+            .acquire(target_ready, &generation)
+            .expect("acquire target");
+        assert_eq!(target.extents(), target_handle.extents());
+        let other_view = LiveArenaProcessView::new(Arc::clone(&arena), generations.domain())
+            .expect("distinct process view");
+        let other_ready = match other_view.lookup(&live_key(), GuestVa(0x4000_1000), 57) {
+            DarwinLiveLookup::Ready(ready) => ready,
+            DarwinLiveLookup::Publish(_) => panic!("target READY was claimed again"),
+            DarwinLiveLookup::Private(reason) => panic!("target READY went private: {reason:?}"),
+        };
+        let other_target = other_view
+            .acquire(other_ready, &generation)
+            .expect("acquire target through distinct view");
+
+        let prepared = prepared_direct_source();
+        let link = prepared.link_candidates()[0];
+        let slot = link.slot.get() as usize;
+        let source_handle = match view.lookup(&live_key(), GuestVa(0x4000_0000), 56) {
+            DarwinLiveLookup::Publish(claim) => {
+                let mut reserved = claim
+                    .reserve(prepared, &generation)
+                    .expect("reserve source");
+                assert!(reserved.prebind(0, &other_target).is_err());
+                assert_eq!(
+                    reserved.prebind(0, &target).expect("same-view prebind"),
+                    LivePrebindOutcome::Bound,
+                );
+                reserved.publish().expect("publish source")
+            }
+            DarwinLiveLookup::Ready(_) => panic!("fresh source unexpectedly READY"),
+            DarwinLiveLookup::Private(reason) => panic!("source went private: {reason:?}"),
+        };
+        let source = source_handle.extents().code;
+        let source_word = unsafe {
+            std::ptr::read_unaligned(
+                (arena.code_rx.base() + arena.code_payload_base() + source.offset as usize + slot)
+                    as *const u32,
+            )
+        };
+        let source_rx = arena.code_rx.base() + arena.code_payload_base() + source.offset as usize;
+        let target_extent = target.extents().code;
+        let target_rx =
+            arena.code_rx.base() + arena.code_payload_base() + target_extent.offset as usize;
+        let expected = carrick_dsr_aarch64::translator::encode_aarch64_direct_branch(
+            carrick_dsr::cache::LinkSite {
+                source: carrick_dsr_aarch64::types::CacheVa::published(HostVa(source_rx)),
+                slot: link.slot,
+            },
+            carrick_dsr_aarch64::types::CacheVa::published(HostVa(target_rx)),
+        )
+        .expect("reachable exact live branch");
+        assert_eq!(source_word, expected);
+    }
+
+    #[test]
+    fn claim_transaction_writes_only_exact_reserved_ranges() {
+        let arena = Arc::new(protocol_arena());
+        let before = arena
+            .control_view()
+            .expect("control view")
+            .cursor_snapshot();
+        let generations = PageGenerationTable::new(page() as u64).expect("generation table");
+        let process_view = LiveArenaProcessView::new(Arc::clone(&arena), generations.domain())
+            .expect("validated process view");
+        let prepared = prepared_publication();
+        let expected_lengths = prepared.lengths();
+        let expected_code = prepared.code_bytes().to_vec();
+        let expected_hot = prepared.hot_bytes().to_vec();
+        let expected_cold = prepared.cold_bytes().to_vec();
+        let layout = arena.control_layout();
+        let code_capacity = layout.capacities().code as usize;
+        let hot_capacity = layout.capacities().hot as usize;
+        let cold_capacity = layout.capacities().cold as usize;
+        let code_base = arena.code_rw.base() + layout.code_payload_base();
+        let hot_base = arena.control_rw.base() + layout.hot_base();
+        let cold_base = arena.control_rw.base() + layout.cold_base();
+        let code_before =
+            unsafe { std::slice::from_raw_parts(code_base as *const u8, code_capacity).to_vec() };
+        let hot_before =
+            unsafe { std::slice::from_raw_parts(hot_base as *const u8, hot_capacity).to_vec() };
+        let cold_before =
+            unsafe { std::slice::from_raw_parts(cold_base as *const u8, cold_capacity).to_vec() };
+        let generation = generations
+            .observe(GuestVa(0x4000_0000))
+            .expect("generation");
+
+        let handle = match process_view.lookup(&live_key(), GuestVa(0x4000_0000), 41) {
+            DarwinLiveLookup::Publish(claim) => claim
+                .reserve(prepared, &generation)
+                .expect("reserve exact publication")
+                .publish()
+                .expect("safe exact publication"),
+            DarwinLiveLookup::Ready(_) => panic!("fresh arena unexpectedly READY"),
+            DarwinLiveLookup::Private(reason) => panic!("fresh claim went private: {reason:?}"),
+        };
+
+        let after = arena
+            .control_view()
+            .expect("control view")
+            .cursor_snapshot();
+        assert_eq!(after.code - before.code, expected_lengths.code);
+        assert_eq!(after.hot - before.hot, expected_lengths.hot);
+        assert_eq!(after.cold - before.cold, expected_lengths.cold);
+        assert_eq!(handle.extents().code.len, expected_lengths.code);
+        assert_eq!(handle.extents().hot.len, expected_lengths.hot);
+        assert_eq!(handle.extents().cold.len, expected_lengths.cold);
+        let code_after =
+            unsafe { std::slice::from_raw_parts(code_base as *const u8, code_capacity) };
+        let hot_after = unsafe { std::slice::from_raw_parts(hot_base as *const u8, hot_capacity) };
+        let cold_after =
+            unsafe { std::slice::from_raw_parts(cold_base as *const u8, cold_capacity) };
+        assert_eq!(&code_after[..expected_code.len()], &expected_code);
+        assert_eq!(&hot_after[..expected_hot.len()], &expected_hot);
+        assert_eq!(&cold_after[..expected_cold.len()], &expected_cold);
+        assert_eq!(
+            &code_after[expected_code.len()..],
+            &code_before[expected_code.len()..]
+        );
+        assert_eq!(
+            &hot_after[expected_hot.len()..],
+            &hot_before[expected_hot.len()..]
+        );
+        assert_eq!(
+            &cold_after[expected_cold.len()..],
+            &cold_before[expected_cold.len()..]
+        );
+    }
+
+    #[test]
+    fn consumer_rehashes_rx_and_exact_validates_hot_before_entry() {
+        let arena = Arc::new(protocol_arena());
+        let generations = PageGenerationTable::new(page() as u64).expect("generation table");
+        let process_view = LiveArenaProcessView::new(Arc::clone(&arena), generations.domain())
+            .expect("validated process view");
+        let generation = generations
+            .observe(GuestVa(0x4000_0000))
+            .expect("generation");
+        let published = match process_view.lookup(&live_key(), GuestVa(0x4000_0000), 41) {
+            DarwinLiveLookup::Publish(claim) => claim
+                .reserve(prepared_publication(), &generation)
+                .expect("reserve exact publication")
+                .publish()
+                .expect("safe exact publication"),
+            DarwinLiveLookup::Ready(_) => panic!("fresh arena unexpectedly READY"),
+            DarwinLiveLookup::Private(reason) => panic!("fresh claim went private: {reason:?}"),
+        };
+        let extents = published.extents();
+        let region = arena
+            .jit_region(extents.code.offset as usize..extents.code.end().unwrap() as usize)
+            .expect("published code region");
+        unsafe { *write_ptr(&region) ^= 0x01 };
+
+        let ready = match process_view.lookup(&live_key(), GuestVa(0x4000_0000), 42) {
+            DarwinLiveLookup::Ready(ready) => ready,
+            DarwinLiveLookup::Publish(_) => panic!("READY record was claimed again"),
+            DarwinLiveLookup::Private(reason) => panic!("READY lookup went private: {reason:?}"),
+        };
+        assert!(process_view.acquire(ready, &generation).is_err());
+
+        let arena = Arc::new(protocol_arena());
+        let process_view = LiveArenaProcessView::new(Arc::clone(&arena), generations.domain())
+            .expect("validated process view");
+        let generation = generations
+            .observe(GuestVa(0x4000_0000))
+            .expect("generation");
+        let published = match process_view.lookup(&live_key(), GuestVa(0x4000_0000), 43) {
+            DarwinLiveLookup::Publish(claim) => claim
+                .reserve(prepared_publication(), &generation)
+                .expect("reserve exact publication")
+                .publish()
+                .expect("safe exact publication"),
+            DarwinLiveLookup::Ready(_) => panic!("fresh arena unexpectedly READY"),
+            DarwinLiveLookup::Private(reason) => panic!("fresh claim went private: {reason:?}"),
+        };
+        let hot = published.extents().hot;
+        let hot_address =
+            arena.control_rw.base() + arena.control_layout().hot_base() + hot.offset as usize;
+        unsafe { *(hot_address as *mut u8) ^= 0x01 };
+        let ready = match process_view.lookup(&live_key(), GuestVa(0x4000_0000), 44) {
+            DarwinLiveLookup::Ready(ready) => ready,
+            DarwinLiveLookup::Publish(_) => panic!("READY record was claimed again"),
+            DarwinLiveLookup::Private(reason) => panic!("READY lookup went private: {reason:?}"),
+        };
+        assert!(process_view.acquire(ready, &generation).is_err());
+    }
+
+    #[test]
+    fn consumer_rejects_handle_from_another_process_view() {
+        let arena = Arc::new(protocol_arena());
+        let generations = PageGenerationTable::new(page() as u64).expect("generation table");
+        let first = LiveArenaProcessView::new(Arc::clone(&arena), generations.domain())
+            .expect("first process view");
+        let second = LiveArenaProcessView::new(Arc::clone(&arena), generations.domain())
+            .expect("second process view");
+        let generation = generations
+            .observe(GuestVa(0x4000_0000))
+            .expect("generation");
+        match first.lookup(&live_key(), GuestVa(0x4000_0000), 45) {
+            DarwinLiveLookup::Publish(claim) => {
+                claim
+                    .reserve(prepared_publication(), &generation)
+                    .expect("reserve exact publication")
+                    .publish()
+                    .expect("publish READY");
+            }
+            DarwinLiveLookup::Ready(_) => panic!("fresh arena unexpectedly READY"),
+            DarwinLiveLookup::Private(reason) => panic!("fresh claim went private: {reason:?}"),
+        }
+        let first_ready = match first.lookup(&live_key(), GuestVa(0x4000_0000), 46) {
+            DarwinLiveLookup::Ready(ready) => ready,
+            DarwinLiveLookup::Publish(_) => panic!("READY record was claimed again"),
+            DarwinLiveLookup::Private(reason) => panic!("READY lookup went private: {reason:?}"),
+        };
+        assert!(second.acquire(first_ready, &generation).is_err());
+    }
+
+    #[test]
+    fn consumer_refuses_non_initial_or_wrong_source_generation() {
+        let arena = Arc::new(protocol_arena());
+        let generations = PageGenerationTable::new(page() as u64).expect("generation table");
+        let view = LiveArenaProcessView::new(Arc::clone(&arena), generations.domain())
+            .expect("process view");
+        let generation = generations
+            .observe(GuestVa(0x4000_0000))
+            .expect("generation");
+        match view.lookup(&live_key(), GuestVa(0x4000_0000), 47) {
+            DarwinLiveLookup::Publish(claim) => {
+                claim
+                    .reserve(prepared_publication(), &generation)
+                    .expect("reserve exact publication")
+                    .publish()
+                    .expect("publish READY");
+            }
+            DarwinLiveLookup::Ready(_) => panic!("fresh arena unexpectedly READY"),
+            DarwinLiveLookup::Private(reason) => panic!("fresh claim went private: {reason:?}"),
+        }
+
+        let wrong_page = generations
+            .observe(GuestVa(0x4000_4000))
+            .expect("wrong page");
+        let ready = match view.lookup(&live_key(), GuestVa(0x4000_0000), 48) {
+            DarwinLiveLookup::Ready(ready) => ready,
+            DarwinLiveLookup::Publish(_) => panic!("READY record was claimed again"),
+            DarwinLiveLookup::Private(reason) => panic!("READY lookup went private: {reason:?}"),
+        };
+        assert!(view.acquire(ready, &wrong_page).is_err());
+
+        generations
+            .note_guest_code_write(GuestVa(0x4000_0000)..GuestVa(0x4000_0004))
+            .expect("advance source generation");
+        let ready = match view.lookup(&live_key(), GuestVa(0x4000_0000), 49) {
+            DarwinLiveLookup::Ready(ready) => ready,
+            DarwinLiveLookup::Publish(_) => panic!("READY record was claimed again"),
+            DarwinLiveLookup::Private(reason) => panic!("READY lookup went private: {reason:?}"),
+        };
+        assert!(view.acquire(ready, &generation).is_err());
+    }
+
+    #[test]
+    fn same_arena_distinct_process_views_reject_claim_and_token() {
+        let arena = Arc::new(protocol_arena());
+        let generations = PageGenerationTable::new(page() as u64).expect("generation table");
+        let first = LiveArenaProcessView::new(Arc::clone(&arena), generations.domain())
+            .expect("first process view");
+        let second = LiveArenaProcessView::new(Arc::clone(&arena), generations.domain())
+            .expect("second process view");
+        let claim = match first.lookup(&live_key(), GuestVa(0x4000_0000), 50) {
+            DarwinLiveLookup::Publish(claim) => claim,
+            DarwinLiveLookup::Ready(_) => panic!("fresh arena unexpectedly READY"),
+            DarwinLiveLookup::Private(reason) => panic!("fresh claim went private: {reason:?}"),
+        };
+        let lengths = prepared_publication().lengths();
+        let reserved = claim
+            .claim
+            .reserve(lengths.code, lengths.hot, lengths.cold)
+            .expect("reserve first-view claim");
+        assert!(!reserved.belongs_to_process_view(&second.inner.process_brand));
+        drop(reserved);
+    }
+
+    #[test]
+    fn publisher_flushes_exact_local_rx_range() {
+        clear_live_arena_test_events();
+        let arena = Arc::new(protocol_arena());
+        let generations = PageGenerationTable::new(page() as u64).expect("generation table");
+        let view = LiveArenaProcessView::new(Arc::clone(&arena), generations.domain())
+            .expect("process view");
+        let generation = generations
+            .observe(GuestVa(0x4000_0000))
+            .expect("generation");
+        let published = match view.lookup(&live_key(), GuestVa(0x4000_0000), 51) {
+            DarwinLiveLookup::Publish(claim) => claim
+                .reserve(prepared_publication(), &generation)
+                .expect("reserve exact publication")
+                .publish()
+                .expect("publish READY"),
+            DarwinLiveLookup::Ready(_) => panic!("fresh arena unexpectedly READY"),
+            DarwinLiveLookup::Private(reason) => panic!("fresh claim went private: {reason:?}"),
+        };
+        let code = published.extents().code;
+        let exact_rx_start =
+            arena.code_rx.base() + arena.code_payload_base() + code.offset as usize;
+        assert_eq!(
+            take_live_arena_test_events(),
+            vec![
+                LiveArenaTestEvent::PermitBegun,
+                LiveArenaTestEvent::MetadataWrite,
+                LiveArenaTestEvent::PublisherFlush {
+                    start: exact_rx_start,
+                    len: code.len as usize,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn consumer_flushes_its_own_exact_local_rx_range() {
+        let arena = Arc::new(protocol_arena());
+        let generations = PageGenerationTable::new(page() as u64).expect("generation table");
+        let view = LiveArenaProcessView::new(Arc::clone(&arena), generations.domain())
+            .expect("process view");
+        let generation = generations
+            .observe(GuestVa(0x4000_0000))
+            .expect("generation");
+        let published = match view.lookup(&live_key(), GuestVa(0x4000_0000), 52) {
+            DarwinLiveLookup::Publish(claim) => claim
+                .reserve(prepared_publication(), &generation)
+                .expect("reserve exact publication")
+                .publish()
+                .expect("publish READY"),
+            DarwinLiveLookup::Ready(_) => panic!("fresh arena unexpectedly READY"),
+            DarwinLiveLookup::Private(reason) => panic!("fresh claim went private: {reason:?}"),
+        };
+        let code = published.extents().code;
+        clear_live_arena_test_events();
+        let ready = match view.lookup(&live_key(), GuestVa(0x4000_0000), 53) {
+            DarwinLiveLookup::Ready(ready) => ready,
+            DarwinLiveLookup::Publish(_) => panic!("READY record was claimed again"),
+            DarwinLiveLookup::Private(reason) => panic!("READY lookup went private: {reason:?}"),
+        };
+        let executable = view.acquire(ready, &generation).expect("acquire READY");
+        assert_eq!(executable.extents(), published.extents());
+        let exact_rx_start =
+            arena.code_rx.base() + arena.code_payload_base() + code.offset as usize;
+        assert_eq!(
+            take_live_arena_test_events(),
+            vec![LiveArenaTestEvent::ConsumerInvalidate {
+                start: exact_rx_start,
+                len: code.len as usize,
+            }]
+        );
+    }
+
+    #[test]
+    fn same_objects_at_different_vas_share_records_cursors_and_bytes() {
+        let creator_arena = Arc::new(protocol_arena());
+        let transit = creator_arena.transit_v1();
+        let generations = PageGenerationTable::new(page() as u64).expect("generation table");
+        let creator_view =
+            LiveArenaProcessView::new(Arc::clone(&creator_arena), generations.domain())
+                .expect("creator view");
+        let generation = generations
+            .observe(GuestVa(0x4000_0000))
+            .expect("generation");
+        let creator_handle = match creator_view.lookup(&live_key(), GuestVa(0x4000_0000), 58) {
+            DarwinLiveLookup::Publish(claim) => claim
+                .reserve(prepared_publication(), &generation)
+                .expect("reserve publication")
+                .publish()
+                .expect("publish READY"),
+            DarwinLiveLookup::Ready(_) => panic!("fresh arena unexpectedly READY"),
+            DarwinLiveLookup::Private(reason) => panic!("fresh claim went private: {reason:?}"),
+        };
+        let creator_ranges = unsafe {
+            creator_arena
+                .local_mapping_ranges_for_transport_proof()
+                .expect("creator ranges")
+        };
+        let adopted_arena = Arc::new(
+            remap_and_adopt_for_test(&creator_arena, transit).expect("adopt same Mach objects"),
+        );
+        let adopted_ranges = unsafe {
+            adopted_arena
+                .local_mapping_ranges_for_transport_proof()
+                .expect("adopted ranges")
+        };
+        for (creator, adopted) in creator_ranges.iter().zip(&adopted_ranges) {
+            assert_ne!(creator.start, adopted.start);
+        }
+        assert_eq!(
+            creator_arena
+                .control_view()
+                .expect("creator control")
+                .cursor_snapshot(),
+            adopted_arena
+                .control_view()
+                .expect("adopted control")
+                .cursor_snapshot(),
+        );
+
+        let adopted_view =
+            LiveArenaProcessView::new(Arc::clone(&adopted_arena), generations.domain())
+                .expect("adopted view");
+        let ready = match adopted_view.lookup(&live_key(), GuestVa(0x4000_0000), 59) {
+            DarwinLiveLookup::Ready(ready) => ready,
+            DarwinLiveLookup::Publish(_) => panic!("READY record was claimed again"),
+            DarwinLiveLookup::Private(reason) => panic!("READY lookup went private: {reason:?}"),
+        };
+        clear_live_arena_test_events();
+        let executable = adopted_view
+            .acquire(ready, &generation)
+            .expect("acquire through fresh mapping view");
+        assert_eq!(executable.extents(), creator_handle.extents());
+        let extents = executable.extents();
+        let creator_layout = creator_arena.control_layout();
+        let adopted_layout = adopted_arena.control_layout();
+        let equal_bytes = |left: usize, right: usize, len: u64| unsafe {
+            std::slice::from_raw_parts(left as *const u8, len as usize)
+                == std::slice::from_raw_parts(right as *const u8, len as usize)
+        };
+        assert!(equal_bytes(
+            creator_arena.code_rx.base()
+                + creator_layout.code_payload_base()
+                + extents.code.offset as usize,
+            adopted_arena.code_rx.base()
+                + adopted_layout.code_payload_base()
+                + extents.code.offset as usize,
+            extents.code.len,
+        ));
+        assert!(equal_bytes(
+            creator_arena.control_rw.base()
+                + creator_layout.hot_base()
+                + extents.hot.offset as usize,
+            adopted_arena.control_rw.base()
+                + adopted_layout.hot_base()
+                + extents.hot.offset as usize,
+            extents.hot.len,
+        ));
+        assert!(equal_bytes(
+            creator_arena.control_rw.base()
+                + creator_layout.cold_base()
+                + extents.cold.offset as usize,
+            adopted_arena.control_rw.base()
+                + adopted_layout.cold_base()
+                + extents.cold.offset as usize,
+            extents.cold.len,
+        ));
+        assert_eq!(
+            take_live_arena_test_events(),
+            vec![LiveArenaTestEvent::ConsumerInvalidate {
+                start: adopted_arena.code_rx.base()
+                    + adopted_layout.code_payload_base()
+                    + extents.code.offset as usize,
+                len: extents.code.len as usize,
+            }]
+        );
     }
 
     fn remap_and_adopt_for_test(
@@ -1559,7 +2876,7 @@ mod tests {
     }
 
     #[test]
-    fn logical_zero_code_offset_is_actual_host_page_aligned() {
+    fn logical_code_zero_remains_payload_page_aligned() {
         let arena = protocol_arena();
         let region = arena.jit_region(0..8).expect("logical code offset zero");
         let write_offset = unsafe { write_ptr(&region) } as usize - arena.code_rw.base();
@@ -1568,6 +2885,36 @@ mod tests {
         assert_eq!(write_offset, arena.code_payload_base());
         assert_eq!(exec_offset, arena.code_payload_base());
         assert!(write_offset.is_multiple_of(page()));
+    }
+
+    #[test]
+    fn rw_and_rx_aliases_remain_distinct_during_transaction() {
+        let arena = Arc::new(protocol_arena());
+        let generations = PageGenerationTable::new(page() as u64).expect("generation table");
+        let view = LiveArenaProcessView::new(Arc::clone(&arena), generations.domain())
+            .expect("process view");
+        let generation = generations
+            .observe(GuestVa(0x4000_0000))
+            .expect("generation");
+        let handle = match view.lookup(&live_key(), GuestVa(0x4000_0000), 60) {
+            DarwinLiveLookup::Publish(claim) => claim
+                .reserve(prepared_publication(), &generation)
+                .expect("reserve publication")
+                .publish()
+                .expect("publish READY"),
+            DarwinLiveLookup::Ready(_) => panic!("fresh arena unexpectedly READY"),
+            DarwinLiveLookup::Private(reason) => panic!("fresh claim went private: {reason:?}"),
+        };
+        let code = handle.extents().code;
+        let resolved = view
+            .inner
+            .resolve_code(code.offset, code.len)
+            .expect("resolve exact transaction code");
+        assert_ne!(resolved.write, resolved.exec);
+        assert_eq!(
+            resolved.write.as_ptr() as usize - arena.code_rw.base(),
+            resolved.exec.as_ptr() as usize - arena.code_rx.base(),
+        );
     }
 
     #[test]

@@ -1130,6 +1130,32 @@ pub(crate) fn validate_shared_initial_metadata(
     ))
 }
 
+/// Exact HOT-only validation for a mapped shared-INITIAL consumer. COLD is
+/// deliberately absent: it remains lazy until fault reconstruction needs it.
+pub(crate) fn validate_shared_initial_hot(hot_bytes: &[u8], code_len: u32) -> Result<(), DsrError> {
+    let config = bincode::config::standard().with_limit::<SHARED_INITIAL_METADATA_LIMIT>();
+    let (hot, consumed): (UnitBlockHotWire, usize) =
+        bincode::serde::decode_from_slice(hot_bytes, config).map_err(|error| {
+            DsrError::CachePolicy(format!("decode live shared INITIAL HOT metadata: {error}"))
+        })?;
+    if consumed != hot_bytes.len()
+        || code_len == 0
+        || !code_len.is_multiple_of(4)
+        || !hot.relocations.is_empty()
+        || !hot.direct_links.is_empty()
+        || hot.trusted_entry
+            != Some(TrustedEntryTemplate {
+                offset: 0,
+                expected: 0,
+            })
+    {
+        return Err(DsrError::CachePolicy(
+            "live shared INITIAL HOT metadata is not an exact immutable block shape".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 impl ArtifactRecording {
     /// Record the trusted second entry point the emitter placed past the
     /// generation guard. At most one per block.
