@@ -629,6 +629,52 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
 }
 
 #[cfg(test)]
+const PIPE_EINTR_RETRY_LIMIT: usize = 8;
+
+#[cfg(test)]
+fn retry_one_byte_pipe_io(mut operation: impl FnMut() -> (libc::ssize_t, libc::c_int)) -> bool {
+    let mut interrupted = 0;
+    loop {
+        let (result, errno) = operation();
+        if result == 1 {
+            return true;
+        }
+        if result != -1 || errno != libc::EINTR || interrupted == PIPE_EINTR_RETRY_LIMIT {
+            return false;
+        }
+        interrupted += 1;
+    }
+}
+
+#[cfg(test)]
+fn read_pipe_byte(fd: libc::c_int) -> Option<u8> {
+    let mut byte = 0;
+    retry_one_byte_pipe_io(|| {
+        let result = unsafe { libc::read(fd, (&raw mut byte).cast(), 1) };
+        let errno = if result == -1 {
+            unsafe { *libc::__error() }
+        } else {
+            0
+        };
+        (result, errno)
+    })
+    .then_some(byte)
+}
+
+#[cfg(test)]
+fn write_pipe_byte(fd: libc::c_int, byte: u8) -> bool {
+    retry_one_byte_pipe_io(|| {
+        let result = unsafe { libc::write(fd, (&raw const byte).cast(), 1) };
+        let errno = if result == -1 {
+            unsafe { *libc::__error() }
+        } else {
+            0
+        };
+        (result, errno)
+    })
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use carrick_dsr::host::NativeHostJit;
@@ -734,6 +780,29 @@ mod tests {
     }
 
     #[test]
+    fn one_byte_pipe_io_retries_eintr_with_a_bound() {
+        let mut attempts = 0;
+        assert!(retry_one_byte_pipe_io(|| {
+            attempts += 1;
+            if attempts < 3 {
+                (-1, libc::EINTR)
+            } else {
+                (1, 0)
+            }
+        }));
+        assert_eq!(attempts, 3);
+
+        attempts = 0;
+        assert!(!retry_one_byte_pipe_io(|| {
+            attempts += 1;
+            (-1, libc::EINTR)
+        }));
+        assert_eq!(attempts, PIPE_EINTR_RETRY_LIMIT + 1);
+
+        assert!(!retry_one_byte_pipe_io(|| (0, 0)));
+    }
+
+    #[test]
     #[cfg(target_arch = "aarch64")]
     fn task_local_rx_revoke_does_not_revoke_parent() {
         let arena = DarwinLiveArena::new(page() * 2, page()).expect("create live arena");
@@ -788,22 +857,19 @@ mod tests {
                 }
             }
 
-            let ready = [0xa5_u8];
-            if status == 0
-                && unsafe { libc::write(ready_pipe[1], ready.as_ptr().cast(), ready.len()) } != 1
-            {
+            if status == 0 && !write_pipe_byte(ready_pipe[1], 0xa5) {
                 status = 4;
             }
-            let mut restore = [0_u8];
-            if status == 0
-                && unsafe {
-                    libc::read(restore_pipe[0], restore.as_mut_ptr().cast(), restore.len())
-                } != 1
-            {
+            let restore = if status == 0 {
+                read_pipe_byte(restore_pipe[0])
+            } else {
+                None
+            };
+            if status == 0 && restore.is_none() {
                 status = 5;
             }
             if status == 0
-                && (restore != [0x5a]
+                && (restore != Some(0x5a)
                     || arena.restore_rx_for_test(0..page()).is_err()
                     || mapping_protections_for_test(arena.code_rx.base())
                         != Some((
@@ -824,26 +890,24 @@ mod tests {
             libc::close(ready_pipe[1]);
             libc::close(restore_pipe[0]);
         }
-        let mut ready = [0_u8];
-        let ready_count =
-            unsafe { libc::read(ready_pipe[0], ready.as_mut_ptr().cast(), ready.len()) };
-        let parent_result = unsafe { call_u32(&region) };
-        let restore = [0x5a_u8];
-        let restore_count = if ready_count == 1 {
-            unsafe { libc::write(restore_pipe[1], restore.as_ptr().cast(), restore.len()) }
+        let ready = read_pipe_byte(ready_pipe[0]);
+        let parent_result = if ready == Some(0xa5) {
+            Some(unsafe { call_u32(&region) })
         } else {
-            0
+            None
         };
-        let mut status = 0;
-        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        let restore_delivered = ready.is_some() && write_pipe_byte(restore_pipe[1], 0x5a);
         unsafe {
             libc::close(ready_pipe[0]);
+            // Close before waitpid on success and every delivery failure. If
+            // the child is blocked in read, EOF makes it exit nonzero.
             libc::close(restore_pipe[1]);
         }
-        assert_eq!(ready_count, 1);
-        assert_eq!(ready, [0xa5]);
-        assert_eq!(parent_result, 42);
-        assert_eq!(restore_count, 1);
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert_eq!(ready, Some(0xa5));
+        assert_eq!(parent_result, Some(42));
+        assert!(restore_delivered);
         assert!(libc::WIFEXITED(status));
         assert_eq!(libc::WEXITSTATUS(status), 0);
     }
