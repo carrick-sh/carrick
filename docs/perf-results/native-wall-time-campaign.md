@@ -727,6 +727,85 @@ only to reject negative or absent movement. None is promotion evidence. The
 durable evidence is
 [`native-condvar-reasons.jsonl`](native-condvar-reasons.jsonl).
 
+## Authenticated native-shape attribution (2026-08-04)
+
+The final NativeShape A3/B3 pair is accepted at clean source
+`96b2b59e2c691427d2ad6e22a428e10c44fa15f2` and signed binary SHA-256
+`515f299b40786f98da00779affe11be653ef8f3e9d1cac517b565bebff8058b3`.
+Both arms ran on `Timothys-Air-2.localdomain`, aarch64, Darwin `26A5388g`,
+against the digest-pinned Go image
+`sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6`.
+They used byte-identical target argv SHA-256
+`7d3129d9ab334f45dd5ac246fb26d9f61d1a2d671b7fc5150be101e611c25bcb`,
+the 997 Hz template SHA-256
+`b052c21296ae5c6d2df73efe3020f3f7ce77a2c080d3b6249c573c21c944a63b`,
+and classifier `carrick.jit-shape-classifier.aarch64.v3`. Each workload exited
+naturally with exactly one durable full-line `BUILD_OK`; battery/power state was
+not an acceptance gate.
+
+Launch qualification was independently bound per arm: A3 birth/terminal
+receipt SHA-256 values are
+`ae9214edb4f6a9f45666d401fa0ec5009c2156f3db90bd987d229dc5ce4cf609` /
+`919ee0f898c0402916b6e0fd58bf7e5e3482f2f25dd8bbb7d6b5a05763f24fbc`;
+B3 values are
+`348386a77836aeb0a60ed5ac293372d190537033519e2606580cc0c2967dfa12` /
+`919ee0f898c0402916b6e0fd58bf7e5e3482f2f25dd8bbb7d6b5a05763f24fbc`.
+They are per-run provenance, not stable equality determinants.
+
+| Artifact | A3 SHA-256 | B3 SHA-256 |
+|---|---|---|
+| stdout | `f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7` | same |
+| stderr | `ee9017d39c0cb766a6fe95c13fd7c9d84881a8e6462592231f098ec80ceab7b2` | `3bec02ed5055cbeba3159650d7fc12c2c6b9c6d434c6c8ed5335478973ed5c86` |
+| accepted receipt | `3eb91105a4f7b8863c89ba16e0c96d25a2091920ec09862f7489b33dc2a35e74` | `7b837113de0a882fef4bcdcac053c3973dd90d0dd8b12a9720c9518233602500` |
+| raw trace | `be4b032b18d9b5ef924502e4ca97bb397122e10c2b614564783aa01c1ffa5a20` | `c04c26916ae87738482e078f4fa43a7fff039f1619ca5b58bd90a36da4dd1079` |
+| capture authority | `a51a7f10ee46bd3bab3e31c8f90c4df2746430815092488215fe636aed2c608b` | `a5e6188573022739764022aa862c6ef17e1b0279e37b34dde280ddd8e04e9c03` |
+| snapshot manifest | `9f2673d363c90dbba3e1f3db830aee83084849f4c2a05a78890d4d6658bc467f` | `aebb2e5fcac72ec5cfaf63df105460866f6c049f234b2c88c80906ec6b4feab5` |
+| census and independent census check | `d913ea8ca62ff998a50e5452feeceec6ffd1a10d78ee2e522e98bbe6e3f9b0be` | `1222a59eeeaeac7927350d9c95b00012fc630847c601d6a9ea19942a6670017a` |
+
+The two comparator outputs are byte-identical at SHA-256
+`afa49a045f29873b022ebb36880e885949206b19a3b988cc9fec8f9edf357ef7`;
+the durable copy is
+[`native-go-build-shape-comparison-v1.json`](../../scripts/perf/evidence/native-go-build-shape-comparison-v1.json).
+Independent reconstruction verified both census hashes, stable and per-run
+determinants, every family/word/context outer join, all share/drift numerators,
+and each reconciliation. A3 has 36,966 all-CPU and 12,226 JIT samples; B3 has
+37,317 and 12,302. Every JIT PC resolves, every lifecycle closes, and all
+error/drop/missing/invalid counts are zero.
+
+| Row | A3 samples / all CPU | B3 samples / all CPU | absolute drift |
+|---|---:|---:|---:|
+| inserted exact `ctx-load64` | 3,240 / 36,966 = **8.764810%** | 3,165 / 37,317 = **8.481389%** | 0.283421 pp |
+| inserted exact `ctx-store64` | 1,033 / 36,966 = **2.794459%** | 1,087 / 37,317 = **2.912881%** | 0.118421 pp |
+| exact ambiguous `x17-materialize` | 2,068 / 36,966 = **5.594329%** | 2,061 / 37,317 = **5.522952%** | 0.071377 pp |
+| guest-descriptive `ldst-imm` | 2,292 / 36,966 = **6.200292%** | 2,271 / 37,317 = **6.085698%** | 0.114593 pp |
+| exact inserted floor (`ctx-load64 + ctx-store64`) | 4,273 / 36,966 = **11.559271%** | 4,252 / 37,317 = **11.394271%** | 0.165000 pp |
+
+The comparator reports `mechanical_crossings=[]`. Source and encoding audit
+confirms why the broader exact floor cannot be promoted as one mechanism:
+
+- `0xf9423791` (`ldr x17,[x28,#1128]`, 3.403127% / 3.127261%) and
+  `0xf9023791` (`str x17,[x28,#1128]`, 1.890926% / 1.899938%) use
+  `DsrContext::rewrite_context_scratch`; `emit_virtualized_register` emits
+  them as part of explicit guest-register recovery and commit sequences.
+- `0xf9425793` (`ldr x19,[x28,#1192]`, 2.875615% / 3.017391%) instead reads
+  `DsrContext::host_bias` in the separately sourced biased-memory address
+  lowering. It cannot be grouped with virtual-register recovery merely because
+  both instructions belong to `ctx-load64`.
+- `0xd2800011` (`mov x17,#0`, 5.588919% / 5.514912%) is classified
+  exact-ambiguous because guest code can emit it. Superblock formation already
+  amortizes one entry prologue and guest-x17 context exchange across a fused
+  chain.
+
+Decision: **no-carry at 99% confidence**. No source-distinct removable row is
+at least 10% of all CPU in both arms; grouping unrelated or guest-producible
+rows would manufacture a crossing or weaken register/recovery/address
+semantics. Emitted-shape attribution is closed and work returns to a fresh,
+source- and KDK-address-bound split of Task 12's stable non-syscall Darwin
+kernel population (20.2712% / 19.9012%). A1 remains rejected because its
+console was not durable; A2/B2 remain valid pre-repair evidence but are excluded
+from the final pair by analyzer identity. Traced elapsed time is attribution
+metadata only and does not alter the official **10.1776x** scoreboard.
+
 ## Hypothesis backlog
 
 Status values: `PROPOSED`, `SPIKING`, `RETAIN`, `REJECT`, `DEFER`.
@@ -739,7 +818,7 @@ Status values: `PROPOSED`, `SPIKING`, `RETAIN`, `REJECT`, `DEFER`.
 | H004 | REJECT | Authority caching leaves at least 17.16M bounded direct misses, led by one conditional fall-through edge at 1.47M | signed Variant 1 feasibility exhausts the 64 MiB DSR translation cache before `BUILD_OK` | Compact per-edge mutable binding cells were the bounded proof; the mechanism pair was not run | Rejected at feasibility; no cache increase, sidecar tuning, or Task 16 is authorized |
 | H005 | DEFER | Private futex owns 50.4% of blocked thread-time but only 0.069% of sampled total CPU | 58/84,037 sampled CPU ticks | Revisit only if critical-path evidence shows waking earlier removes runnable work | Filesystem work currently has materially larger measured CPU share |
 | H006 | RETAIN | Exact caller stacks assigned 33.3% of joined opens to `lookup_kind` and another 10.8% to unconditional `read_link` | paired candidate: 46,493 joined host opens / 2,363 guest opens; 19.163 s median. Clean isolated median 19.680 s does not beat `C0` | Keep descriptor-contained lookup-kind and no-follow metadata with cap-std fallback; finish correctness closeout but claim no official `C1` win | Revert only for correctness failure or a future contemporaneous paired regression; isolated baseline drift does not override the 5/5 paired result and explicit retain direction |
-| H008 | SPIKING | Sampled-instruction-shape census: DSR-inserted words are 81.3% of matched JIT-code residency (ctx-slot stores 43.2%, ctx-slot loads 20.4%, x17 materialization 13.9%), the generation guard is 0.1%, and the hot memclr-style guest loop expands 3 words to ~22 per iteration | inserted overhead is ~56% of all user-mode CPU on the 18,321 ms `W0` window | Register-resident biased addressing: stop round-tripping guest `x16`/`x17` and the host bias through context slots on every memory op (per-block dead-register scratch selection, block-resident bias, loop-aware self-link entry) with a mechanism gate on the ctx-slot sample share | Two variants fail the mechanism gate (ctx-slot share does not drop materially) or fail paired wall screens |
+| H008 | REJECT | The authenticated current-tip NativeShape A3/B3 pair reports no mechanical crossing; largest row `ctx-load64` is 8.764810% / 8.481389% of all CPU | exact inserted floor 11.559271% / 11.394271%, but it combines virtual-register recovery and host-bias lowering | Do not group source-distinct context rows; return to broad Task 12 host/kernel attribution | Rejected by the repeated >=10% source-distinct gate; traced timing changes no baseline |
 | H007 | REJECT | Post-wave census at the branch tip: 48,927 joined opens / 549 ms traced; `lookup_kind` collapsed to 4.8% and `read_link` to 1.6%; the remaining walk families are `open_raw_fd` 24.0% and `resolve_following` 20.3% | 242 ms traced ≈ ~1% of the 18,321 ms `W0` window | The remaining families are real but their combined wall ceiling fails the value bar; the H006 terminal-open spike already showed a 24% call cut returns 0.7% wall | Rejected on ceiling 2026-07-28; the teardown-unlink pivot left scope with Decision 13. Next size translated-guest execution by sampled-instruction shape |
 
 The table order is provisional until E005 and E006 exist.
@@ -981,6 +1060,12 @@ Write and validate the executable M1 plan:
       x17 materialization 13.9%, window checks ~3%, generation guard 0.1% —
       and the hot guest zeroing loop runs ~22 emitted words per 3-word
       iteration (`native-dsr-shape-census.jsonl`).
+- [x] Replace that unauthenticated historical census with the typed NativeShape
+      pipeline and admit the determinant-locked A3/B3 pair. The repaired Rust
+      comparator is byte-stable, all populations and exact joins reconcile,
+      and `mechanical_crossings=[]`; record no-carry and return to the stable
+      non-syscall Darwin-kernel bucket from Task 12. Official score remains
+      10.1776x.
 - [x] Design H008 and land its selection prerequisites: the design doc
       (`2026-07-28-h008-register-resident-biased-addressing-design.md`)
       maps the per-entry guard preamble (~9-10 words) and per-memory-op

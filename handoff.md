@@ -1,10 +1,10 @@
 # Native-lane performance: state of play
 
 **Date:** 2026-08-04 · **Branch:** `codex/native-store-default` · **Latest
-decision:** the authenticated typed `NativeShape` design is approved and Tasks
-1–5 replace the unauthenticated Python path with capture/receipt and Rust census
-tooling; Tasks 6–8, live captures, and attribution carry remain pending, and the
-official 10.1776x scoreboard is unchanged ·
+decision:** the authenticated typed `NativeShape` campaign is complete; the
+sole admitted A3/B3 pair has no mechanical crossing and carries no emitted-code
+candidate, so work returns to the broad Task 12 host/kernel split while the
+official 10.1776x scoreboard remains unchanged ·
 **Scope:** Darwin/aarch64 native backend (`--exec-backend native`, the shipped
 default). VMM is explicitly NOT the target: one process per VM against a
 ~127-VM macOS ceiling makes it a dead end for build-shaped workloads.
@@ -219,6 +219,41 @@ excluded, and every remaining specific host syscall is below 6%. These shares
 do not map whole host-syscall populations to guest operations. DTrace remains
 mechanism evidence only, and the official scoreboard remains **10.1776x**.
 
+The authenticated translated-guest follow-up is also complete at clean
+`96b2b59e2c691427d2ad6e22a428e10c44fa15f2`, signed binary SHA-256
+`515f299b40786f98da00779affe11be653ef8f3e9d1cac517b565bebff8058b3`.
+The final A3/B3 cold-build captures used byte-identical target argv SHA-256
+`7d3129d9ab334f45dd5ac246fb26d9f61d1a2d671b7fc5150be101e611c25bcb`,
+the digest-pinned Go image, a 997 Hz DTrace template SHA-256
+`b052c21296ae5c6d2df73efe3020f3f7ce77a2c080d3b6249c573c21c944a63b`,
+and classifier `carrick.jit-shape-classifier.aarch64.v3`. Receipts are
+`3eb91105a4f7b8863c89ba16e0c96d25a2091920ec09862f7489b33dc2a35e74` /
+`7b837113de0a882fef4bcdcac053c3973dd90d0dd8b12a9720c9518233602500`,
+raw traces `be4b032b18d9b5ef924502e4ca97bb397122e10c2b614564783aa01c1ffa5a20` /
+`c04c26916ae87738482e078f4fa43a7fff039f1619ca5b58bd90a36da4dd1079`,
+snapshot manifests
+`9f2673d363c90dbba3e1f3db830aee83084849f4c2a05a78890d4d6658bc467f` /
+`aebb2e5fcac72ec5cfaf63df105460866f6c049f234b2c88c80906ec6b4feab5`,
+and byte-identical census SHA-256 values
+`d913ea8ca62ff998a50e5452feeceec6ffd1a10d78ee2e522e98bbe6e3f9b0be` /
+`1222a59eeeaeac7927350d9c95b00012fc630847c601d6a9ea19942a6670017a`.
+The independently reconstructed comparison SHA-256 is
+`afa49a045f29873b022ebb36880e885949206b19a3b988cc9fec8f9edf357ef7`.
+
+All 12,226 / 12,302 JIT samples resolved, the complete populations were 36,966 /
+37,317 all-CPU samples, and `mechanical_crossings` is empty. The largest family,
+`ctx-load64`, is only **8.764810% / 8.481389%** of all CPU. The broader exact
+inserted floor is **11.559271% / 11.394271%**, but it is exactly the sum of
+`ctx-load64` and `ctx-store64`: source audit binds `ldr/str x17,[x28,#1128]`
+to virtual-register recovery state in `emit_virtualized_register`, while
+`ldr x19,[x28,#1192]` is separately the host-bias load in biased-memory
+lowering. Superblocks already amortize their entry context work. Grouping those
+source-distinct, already-closed mechanisms would manufacture a crossing, and
+the common `mov x17,#0` row is guest-producible/exact-ambiguous. Decision:
+**no-carry at 99% confidence**. A1 remains console-rejected; A2/B2 remain valid
+pre-repair evidence but excluded from the final pair by analyzer identity.
+Traced elapsed times are attribution metadata and change no baseline.
+
 ## What landed (2026-08-02/03, six waves, all merged with `just ci` green)
 
 **Exec pipeline.** Payload SHA-256 removed from the default artifact digest
@@ -273,13 +308,13 @@ user-requested serialized current-default refresh is nevertheless complete and
 sets the official absolute scoreboard to 10.1776x without converting that
 scoreboard movement into a causal lock-split claim.
 
-1. **Complete approved `NativeShape` Tasks 6–8 before capture or carry.** Tasks
-   1–5 now provide the typed capture/receipt and authenticated Rust v3 census,
-   replacing the unauthenticated external Python classifier path. The strict
-   determinant-locked pair comparator, freshness/source audit, final gates and
-   independent review remain pending, as do all live captures and attribution
-   carry. No mechanism or production change is selected, and the official
-   10.1776x scoreboard is unchanged.
+1. **Return to the next broad Task 12 host/kernel opportunity.** Authenticated
+   NativeShape attribution is closed with no selectable >=10% emitted-code
+   mechanism. The next non-regrettable measurement is a source- and
+   KDK-address-bound split of the stable non-syscall Darwin-kernel population
+   (**20.2712% / 19.9012%** of all CPU), excluding profiler/fasttrap families,
+   symbolizer aliases, and already-closed lines before selecting one mechanism.
+   No implementation candidate is authorized yet.
 2. **Keep eager full translation as a deferred future design, not the next
    patch.** Translating a complete eligible image once up front could amortize
    publication and avoid the losing per-process merge path measured here. It
@@ -312,11 +347,11 @@ scoreboard movement into a causal lock-split claim.
 - **High (97%):** the preserved optimistic-discard diagnostics and validator
   remain semantically useful. They are typed, fail closed, passed 165 tests,
   and naturally report zero on the restored serialized path.
-- **Unscored pending attribution:** Tasks 1–5 establish the approved
-  authenticated `NativeShape` capture and Rust census tooling, but no specific
-  implementation candidate is promoted. Tasks 6–8, live captures, and a
-  non-closed source-distinct >=10% opportunity twice remain before carry or a
-  confidence score.
+- **Very high (99%):** the authenticated NativeShape A3/B3 pair is valid and
+  carries no selectable emitted-code mechanism. Receipts, manifests, double
+  censuses, comparison regeneration, full outer joins, exact arithmetic, and
+  source binding all reconcile; no row crosses 10% in both arms, and the only
+  aggregate above 10% combines distinct closed mechanisms.
 - **Very high (99%):** the fresh v5 A/B pair is valid. Both exact receipts,
   every reconciliation and coverage gate, deterministic regeneration, and the
   stable broad analyzer agree.
@@ -324,9 +359,10 @@ scoreboard movement into a causal lock-split claim.
   apparent interrupt alias is excluded, the only qualifying exact syscall is
   the already-closed lock line, and all remaining specific syscalls are below
   6%.
-- **High (90%):** authenticated emitted-shape attribution is the smallest
-  non-regrettable next split, but no implementation confidence is claimed
-  before explicit design approval.
+- **High (90%):** returning to the broad Task 12 host/kernel split is the
+  smallest non-regrettable next step. The non-syscall kernel bucket is stable
+  and large enough to matter, but no implementation confidence is claimed
+  until a source-distinct mechanism survives the repeated >=10% gate.
 - **High (95%):** the official shipped-default result is now 10.1776x. No
   projection or unresolved wall result was substituted for a fresh
   Carrick/Docker run.
