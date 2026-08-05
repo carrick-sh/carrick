@@ -6,7 +6,10 @@
 use crate::shared_cache::{TRANSLATOR_ABI_CURRENT, TranslationUnitKey};
 use carrick_guest_mem::GuestVa;
 use sha2::{Digest, Sha256};
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::{Arc, Barrier};
 
 pub const LIVE_ARENA_SCHEMA_V1: u32 = 1;
 pub const LIVE_BLOCK_EMPTY: u32 = 0;
@@ -24,6 +27,12 @@ const LIVE_ARENA_METADATA_ALIGN: u64 = 8;
 pub struct LiveBlockRecordV1 {
     state: AtomicU32,
     owner_pid: AtomicI32,
+    payload: UnsafeCell<LiveBlockPayloadV1>,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct LiveBlockPayloadV1 {
     unit_key_digest: [u8; 32],
     guest_start: u64,
     source_page: u64,
@@ -37,27 +46,60 @@ pub struct LiveBlockRecordV1 {
     code_sha256: [u8; 32],
 }
 
+// SAFETY: `payload` has one writer: the capability returned by the successful
+// EMPTY -> BUILDING CAS. No lookup reads it in EMPTY or BUILDING. That writer
+// initializes the complete payload before publishing READY or FAILED with a
+// Release store; readers access it only after the corresponding Acquire load.
+// Terminal records are immutable and never return to BUILDING.
+unsafe impl Sync for LiveBlockRecordV1 {}
+
 const _: () = assert!(std::mem::align_of::<LiveBlockRecordV1>() == 64);
 const _: () = assert!(std::mem::size_of::<LiveBlockRecordV1>() == 192);
+const _: () = assert!(std::mem::align_of::<LiveBlockPayloadV1>() == 8);
+const _: () = assert!(std::mem::size_of::<LiveBlockPayloadV1>() == 128);
 const _: () = assert!(std::mem::offset_of!(LiveBlockRecordV1, state) == 0);
 const _: () = assert!(std::mem::offset_of!(LiveBlockRecordV1, owner_pid) == 4);
-const _: () = assert!(std::mem::offset_of!(LiveBlockRecordV1, unit_key_digest) == 8);
-const _: () = assert!(std::mem::offset_of!(LiveBlockRecordV1, guest_start) == 40);
-const _: () = assert!(std::mem::offset_of!(LiveBlockRecordV1, source_page) == 48);
-const _: () = assert!(std::mem::offset_of!(LiveBlockRecordV1, code_offset) == 56);
-const _: () = assert!(std::mem::offset_of!(LiveBlockRecordV1, code_len) == 64);
-const _: () = assert!(std::mem::offset_of!(LiveBlockRecordV1, entry_offset) == 68);
-const _: () = assert!(std::mem::offset_of!(LiveBlockRecordV1, hot_offset) == 72);
-const _: () = assert!(std::mem::offset_of!(LiveBlockRecordV1, hot_len) == 80);
-const _: () = assert!(std::mem::offset_of!(LiveBlockRecordV1, cold_offset) == 88);
-const _: () = assert!(std::mem::offset_of!(LiveBlockRecordV1, cold_len) == 96);
-const _: () = assert!(std::mem::offset_of!(LiveBlockRecordV1, code_sha256) == 100);
+const _: () = assert!(std::mem::offset_of!(LiveBlockRecordV1, payload) == 8);
+const _: () = assert!(std::mem::offset_of!(LiveBlockPayloadV1, unit_key_digest) == 0);
+const _: () = assert!(std::mem::offset_of!(LiveBlockPayloadV1, guest_start) == 32);
+const _: () = assert!(std::mem::offset_of!(LiveBlockPayloadV1, source_page) == 40);
+const _: () = assert!(std::mem::offset_of!(LiveBlockPayloadV1, code_offset) == 48);
+const _: () = assert!(std::mem::offset_of!(LiveBlockPayloadV1, code_len) == 56);
+const _: () = assert!(std::mem::offset_of!(LiveBlockPayloadV1, entry_offset) == 60);
+const _: () = assert!(std::mem::offset_of!(LiveBlockPayloadV1, hot_offset) == 64);
+const _: () = assert!(std::mem::offset_of!(LiveBlockPayloadV1, hot_len) == 72);
+const _: () = assert!(std::mem::offset_of!(LiveBlockPayloadV1, cold_offset) == 80);
+const _: () = assert!(std::mem::offset_of!(LiveBlockPayloadV1, cold_len) == 88);
+const _: () = assert!(std::mem::offset_of!(LiveBlockPayloadV1, code_sha256) == 92);
 
 impl LiveBlockRecordV1 {
     fn empty() -> Self {
         Self {
             state: AtomicU32::new(LIVE_BLOCK_EMPTY),
             owner_pid: AtomicI32::new(0),
+            payload: UnsafeCell::new(LiveBlockPayloadV1::empty()),
+        }
+    }
+
+    /// Returns the immutable terminal payload after the caller has acquired
+    /// READY or FAILED from `state`.
+    unsafe fn terminal_payload(&self) -> &LiveBlockPayloadV1 {
+        // SAFETY: the caller proves terminal-state Acquire ordering. Terminal
+        // payloads are never mutated, as documented by the `Sync` contract.
+        unsafe { &*self.payload.get() }
+    }
+
+    /// Replaces the payload while the caller exclusively owns BUILDING.
+    unsafe fn write_building_payload(&self, payload: LiveBlockPayloadV1) {
+        // SAFETY: the caller proves it owns the unique BUILDING capability, so
+        // no payload reference exists and no other writer can reach this cell.
+        unsafe { self.payload.get().write(payload) };
+    }
+}
+
+impl LiveBlockPayloadV1 {
+    const fn empty() -> Self {
+        Self {
             unit_key_digest: [0; 32],
             guest_start: 0,
             source_page: 0,
@@ -122,15 +164,14 @@ pub struct LiveBlockExtents {
     pub cold: LiveReservation,
 }
 
-/// Caller-supplied bytes and offsets for one still-BUILDING record. The code
-/// bytes are authenticated here before the immutable digest reaches the wire
-/// record; this protocol layer does not own a platform mapping to copy them to.
+/// Caller-supplied metadata and bytes for one reserved BUILDING record. The
+/// code bytes are authenticated here before the immutable digest reaches the
+/// wire record; reservation extents come only from the consuming claim.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LiveBlockPublication {
     pub unit_key_digest: [u8; 32],
     pub translator_abi: u32,
     pub source_page: u64,
-    pub extents: LiveBlockExtents,
     pub entry_offset: u32,
     pub code_sha256: [u8; 32],
     pub code: Vec<u8>,
@@ -144,6 +185,8 @@ pub struct LiveTranslationArena {
     code_next: AtomicU64,
     hot_next: AtomicU64,
     cold_next: AtomicU64,
+    #[cfg(test)]
+    cas_barrier: Option<Arc<Barrier>>,
 }
 
 impl LiveTranslationArena {
@@ -159,6 +202,8 @@ impl LiveTranslationArena {
             code_next: AtomicU64::new(0),
             hot_next: AtomicU64::new(0),
             cold_next: AtomicU64::new(0),
+            #[cfg(test)]
+            cas_barrier: None,
         }
     }
 
@@ -179,36 +224,46 @@ impl LiveTranslationArena {
             let record = &self.records[(initial + probe) & LIVE_ARENA_MASK];
             match record.state.load(Ordering::Acquire) {
                 LIVE_BLOCK_READY => {
-                    if record_matches(record, &unit_key_digest, guest_start.raw()) {
+                    // SAFETY: this branch acquired terminal READY above.
+                    let payload = unsafe { record.terminal_payload() };
+                    if record_matches(payload, &unit_key_digest, guest_start.raw()) {
                         return self
-                            .validate_ready(record, &unit_key_digest, guest_start.raw())
+                            .validate_ready(record, payload, &unit_key_digest, guest_start.raw())
                             .map(LiveLookup::Ready)
                             .unwrap_or(LiveLookup::Private(LivePrivateReason::InvalidRecord));
                     }
                 }
                 LIVE_BLOCK_FAILED => {
-                    if record_matches(record, &unit_key_digest, guest_start.raw()) {
+                    // SAFETY: this branch acquired terminal FAILED above.
+                    let payload = unsafe { record.terminal_payload() };
+                    if record_matches(payload, &unit_key_digest, guest_start.raw()) {
                         return LiveLookup::Private(LivePrivateReason::Failed);
                     }
                 }
                 LIVE_BLOCK_BUILDING => return LiveLookup::Private(LivePrivateReason::Building),
-                LIVE_BLOCK_EMPTY => match record.state.compare_exchange(
-                    LIVE_BLOCK_EMPTY,
-                    LIVE_BLOCK_BUILDING,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => {
-                        record.owner_pid.store(owner_pid, Ordering::Relaxed);
-                        return LiveLookup::Publish(LivePublishClaim {
-                            arena: self,
-                            record,
-                            unit_key_digest,
-                            guest_start: guest_start.raw(),
-                        });
+                LIVE_BLOCK_EMPTY => {
+                    #[cfg(test)]
+                    if let Some(barrier) = &self.cas_barrier {
+                        barrier.wait();
                     }
-                    Err(_) => return LiveLookup::Private(LivePrivateReason::CasLost),
-                },
+                    match record.state.compare_exchange(
+                        LIVE_BLOCK_EMPTY,
+                        LIVE_BLOCK_BUILDING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => {
+                            record.owner_pid.store(owner_pid, Ordering::Relaxed);
+                            return LiveLookup::Publish(LivePublishClaim {
+                                arena: self,
+                                record,
+                                unit_key_digest,
+                                guest_start: guest_start.raw(),
+                            });
+                        }
+                        Err(_) => return LiveLookup::Private(LivePrivateReason::CasLost),
+                    }
+                }
                 _ => return LiveLookup::Private(LivePrivateReason::UnknownState),
             }
         }
@@ -218,36 +273,42 @@ impl LiveTranslationArena {
 
     fn validate_ready<'a>(
         &'a self,
-        record: &'a LiveBlockRecordV1,
+        _record: &'a LiveBlockRecordV1,
+        payload: &'a LiveBlockPayloadV1,
         expected_key: &[u8; 32],
         expected_guest_start: u64,
     ) -> Option<ValidatedLiveBlock<'a>> {
         let extents = LiveBlockExtents {
             code: LiveReservation {
-                offset: record.code_offset,
-                len: u64::from(record.code_len),
+                offset: payload.code_offset,
+                len: u64::from(payload.code_len),
             },
             hot: LiveReservation {
-                offset: record.hot_offset,
-                len: u64::from(record.hot_len),
+                offset: payload.hot_offset,
+                len: u64::from(payload.hot_len),
             },
             cold: LiveReservation {
-                offset: record.cold_offset,
-                len: u64::from(record.cold_len),
+                offset: payload.cold_offset,
+                len: u64::from(payload.cold_len),
             },
         };
-        if !record_matches(record, expected_key, expected_guest_start)
-            || !valid_source_page(record.source_page, expected_guest_start)
+        if !record_matches(payload, expected_key, expected_guest_start)
+            || !valid_source_page(payload.source_page, expected_guest_start)
             || !self.extents_in_bounds(extents)
             || !valid_code_extent(extents.code)
             || !valid_metadata_extent(extents.hot)
             || !valid_metadata_extent(extents.cold)
-            || u64::from(record.entry_offset) >= extents.code.len
-            || !u64::from(record.entry_offset).is_multiple_of(LIVE_ARENA_INSTRUCTION_BYTES)
+            || u64::from(payload.entry_offset) >= extents.code.len
+            || !u64::from(payload.entry_offset).is_multiple_of(LIVE_ARENA_INSTRUCTION_BYTES)
         {
             return None;
         }
-        Some(ValidatedLiveBlock { record, extents })
+        Some(ValidatedLiveBlock {
+            #[cfg(test)]
+            record: _record,
+            payload,
+            extents,
+        })
     }
 
     fn extents_in_bounds(&self, extents: LiveBlockExtents) -> bool {
@@ -297,45 +358,27 @@ impl<'a> LivePublishClaim<'a> {
     /// Reserves disjoint append-only ranges. Failure strands this BUILDING
     /// record as FAILED; it never retries or waits for another publisher.
     pub fn reserve(
-        &mut self,
+        mut self,
         code_len: u64,
         hot_len: u64,
         cold_len: u64,
-    ) -> Result<LiveBlockExtents, LivePrivateReason> {
+    ) -> Result<LiveReservedPublishClaim<'a>, LivePrivateReason> {
         if self.record.state.load(Ordering::Acquire) != LIVE_BLOCK_BUILDING {
             return Err(LivePrivateReason::Failed);
         }
-        self.arena
-            .reserve(code_len, hot_len, cold_len)
-            .ok_or_else(|| {
-                self.publish_failed();
-                LivePrivateReason::Capacity
-            })
-    }
-
-    /// Publishes exactly once. The field writes precede the sole `READY`
-    /// release store, so consumers may read them only after acquiring READY.
-    pub fn publish(mut self, publication: LiveBlockPublication) -> LiveLookup<'a> {
-        if self.record.state.load(Ordering::Acquire) != LIVE_BLOCK_BUILDING {
-            return LiveLookup::Private(LivePrivateReason::Failed);
-        }
-        if !self.valid_publication(&publication) {
+        let Some(wire_lengths) = LiveWireLengths::new(code_len, hot_len, cold_len) else {
             self.publish_failed();
-            return LiveLookup::Private(LivePrivateReason::InvalidRecord);
-        }
-
-        // SAFETY: this claim was created by the only successful EMPTY→BUILDING
-        // CAS. Other lookups read no non-atomic fields while BUILDING, and any
-        // later reader first acquires the READY release store below.
-        unsafe { self.write_publication(&publication) };
-        self.record.state.store(LIVE_BLOCK_READY, Ordering::Release);
-        if self.record.state.load(Ordering::Acquire) != LIVE_BLOCK_READY {
-            return LiveLookup::Private(LivePrivateReason::InvalidRecord);
-        }
-        self.arena
-            .validate_ready(self.record, &self.unit_key_digest, self.guest_start)
-            .map(LiveLookup::Ready)
-            .unwrap_or(LiveLookup::Private(LivePrivateReason::InvalidRecord))
+            return Err(LivePrivateReason::InvalidRecord);
+        };
+        let Some(extents) = self.arena.reserve(code_len, hot_len, cold_len) else {
+            self.publish_failed();
+            return Err(LivePrivateReason::Capacity);
+        };
+        Ok(LiveReservedPublishClaim {
+            claim: self,
+            extents,
+            wire_lengths,
+        })
     }
 
     pub fn fail(mut self) -> LivePrivateReason {
@@ -346,77 +389,144 @@ impl<'a> LivePublishClaim<'a> {
         LivePrivateReason::Failed
     }
 
-    fn valid_publication(&self, publication: &LiveBlockPublication) -> bool {
-        publication.unit_key_digest == self.unit_key_digest
-            && publication.translator_abi == TRANSLATOR_ABI_CURRENT
-            && valid_source_page(publication.source_page, self.guest_start)
-            && self.arena.extents_in_bounds(publication.extents)
-            && valid_code_extent(publication.extents.code)
-            && valid_metadata_extent(publication.extents.hot)
-            && valid_metadata_extent(publication.extents.cold)
-            && u64::from(publication.entry_offset) < publication.extents.code.len
-            && u64::from(publication.entry_offset).is_multiple_of(LIVE_ARENA_INSTRUCTION_BYTES)
-            && publication.code.len() == usize::try_from(publication.extents.code.len).unwrap_or(0)
-            && <[u8; 32]>::from(Sha256::digest(&publication.code)) == publication.code_sha256
-    }
-
     fn publish_failed(&mut self) {
-        // SAFETY: this remains the sole BUILDING owner. FAILED is release-
-        // published so a colliding lookup can safely read the key and decide
-        // whether it may continue its bounded probe.
-        unsafe {
-            let record = self.record as *const LiveBlockRecordV1 as *mut LiveBlockRecordV1;
-            (*record).unit_key_digest = self.unit_key_digest;
-            (*record).guest_start = self.guest_start;
-            (*record).source_page = 0;
-            (*record).code_offset = 0;
-            (*record).code_len = 0;
-            (*record).entry_offset = 0;
-            (*record).hot_offset = 0;
-            (*record).hot_len = 0;
-            (*record).cold_offset = 0;
-            (*record).cold_len = 0;
-            (*record).code_sha256 = [0; 32];
-        }
+        let payload = LiveBlockPayloadV1 {
+            unit_key_digest: self.unit_key_digest,
+            guest_start: self.guest_start,
+            ..LiveBlockPayloadV1::empty()
+        };
+        // SAFETY: this claim is the unique capability created by the successful
+        // EMPTY -> BUILDING CAS, and it has not terminally published before.
+        unsafe { self.record.write_building_payload(payload) };
         self.record
             .state
             .store(LIVE_BLOCK_FAILED, Ordering::Release);
     }
+}
 
-    unsafe fn write_publication(&self, publication: &LiveBlockPublication) {
-        let record = self.record as *const LiveBlockRecordV1 as *mut LiveBlockRecordV1;
-        unsafe {
-            (*record).unit_key_digest = publication.unit_key_digest;
-            (*record).guest_start = self.guest_start;
-            (*record).source_page = publication.source_page;
-            (*record).code_offset = publication.extents.code.offset;
-            (*record).code_len = publication.extents.code.len as u32;
-            (*record).entry_offset = publication.entry_offset;
-            (*record).hot_offset = publication.extents.hot.offset;
-            (*record).hot_len = publication.extents.hot.len as u32;
-            (*record).cold_offset = publication.extents.cold.offset;
-            (*record).cold_len = publication.extents.cold.len as u32;
-            (*record).code_sha256 = publication.code_sha256;
+#[derive(Clone, Copy)]
+struct LiveWireLengths {
+    code: u32,
+    hot: u32,
+    cold: u32,
+}
+
+impl LiveWireLengths {
+    fn new(code_len: u64, hot_len: u64, cold_len: u64) -> Option<Self> {
+        if code_len == 0 || !code_len.is_multiple_of(LIVE_ARENA_INSTRUCTION_BYTES) {
+            return None;
         }
+        Some(Self {
+            code: u32::try_from(code_len).ok()?,
+            hot: u32::try_from(hot_len).ok()?,
+            cold: u32::try_from(cold_len).ok()?,
+        })
+    }
+}
+
+/// A unique BUILDING capability bound to exactly one successful append-only
+/// reservation. Publication has no caller-supplied extent field: consuming
+/// this value is the only way to publish the reservation it owns.
+pub struct LiveReservedPublishClaim<'a> {
+    claim: LivePublishClaim<'a>,
+    extents: LiveBlockExtents,
+    wire_lengths: LiveWireLengths,
+}
+
+impl<'a> LiveReservedPublishClaim<'a> {
+    pub fn extents(&self) -> LiveBlockExtents {
+        self.extents
+    }
+
+    /// Publishes exactly once. The field writes precede the sole `READY`
+    /// release store, so consumers may read them only after acquiring READY.
+    pub fn publish(mut self, publication: LiveBlockPublication) -> LiveLookup<'a> {
+        if self.claim.record.state.load(Ordering::Acquire) != LIVE_BLOCK_BUILDING {
+            return LiveLookup::Private(LivePrivateReason::Failed);
+        }
+        if !self.valid_publication(&publication) {
+            self.claim.publish_failed();
+            return LiveLookup::Private(LivePrivateReason::InvalidRecord);
+        }
+
+        let payload = LiveBlockPayloadV1 {
+            unit_key_digest: publication.unit_key_digest,
+            guest_start: self.claim.guest_start,
+            source_page: publication.source_page,
+            code_offset: self.extents.code.offset,
+            code_len: self.wire_lengths.code,
+            entry_offset: publication.entry_offset,
+            hot_offset: self.extents.hot.offset,
+            hot_len: self.wire_lengths.hot,
+            cold_offset: self.extents.cold.offset,
+            cold_len: self.wire_lengths.cold,
+            code_sha256: publication.code_sha256,
+        };
+        // SAFETY: the inner claim is the unique BUILDING capability. Lookup
+        // does not expose payload references until it acquires READY below.
+        unsafe { self.claim.record.write_building_payload(payload) };
+        self.claim
+            .record
+            .state
+            .store(LIVE_BLOCK_READY, Ordering::Release);
+        if self.claim.record.state.load(Ordering::Acquire) != LIVE_BLOCK_READY {
+            return LiveLookup::Private(LivePrivateReason::InvalidRecord);
+        }
+        // SAFETY: this publisher just acquired the terminal READY state.
+        let payload = unsafe { self.claim.record.terminal_payload() };
+        self.claim
+            .arena
+            .validate_ready(
+                self.claim.record,
+                payload,
+                &self.claim.unit_key_digest,
+                self.claim.guest_start,
+            )
+            .map(LiveLookup::Ready)
+            .unwrap_or(LiveLookup::Private(LivePrivateReason::InvalidRecord))
+    }
+
+    pub fn fail(mut self) -> LivePrivateReason {
+        if self.claim.record.state.load(Ordering::Acquire) != LIVE_BLOCK_BUILDING {
+            return LivePrivateReason::Failed;
+        }
+        self.claim.publish_failed();
+        LivePrivateReason::Failed
+    }
+
+    fn valid_publication(&self, publication: &LiveBlockPublication) -> bool {
+        publication.unit_key_digest == self.claim.unit_key_digest
+            && publication.translator_abi == TRANSLATOR_ABI_CURRENT
+            && valid_source_page(publication.source_page, self.claim.guest_start)
+            && self.claim.arena.extents_in_bounds(self.extents)
+            && valid_code_extent(self.extents.code)
+            && valid_metadata_extent(self.extents.hot)
+            && valid_metadata_extent(self.extents.cold)
+            && u64::from(publication.entry_offset) < self.extents.code.len
+            && u64::from(publication.entry_offset).is_multiple_of(LIVE_ARENA_INSTRUCTION_BYTES)
+            && publication.code.len() == usize::try_from(self.extents.code.len).unwrap_or(0)
+            && <[u8; 32]>::from(Sha256::digest(&publication.code)) == publication.code_sha256
     }
 }
 
 pub struct ValidatedLiveBlock<'a> {
+    #[cfg(test)]
     record: &'a LiveBlockRecordV1,
+    payload: &'a LiveBlockPayloadV1,
     extents: LiveBlockExtents,
 }
 
 impl ValidatedLiveBlock<'_> {
     pub fn unit_key_digest(&self) -> [u8; 32] {
-        self.record.unit_key_digest
+        self.payload.unit_key_digest
     }
 
     pub fn guest_start(&self) -> u64 {
-        self.record.guest_start
+        self.payload.guest_start
     }
 
     pub fn source_page(&self) -> u64 {
-        self.record.source_page
+        self.payload.source_page
     }
 
     pub fn extents(&self) -> LiveBlockExtents {
@@ -424,7 +534,7 @@ impl ValidatedLiveBlock<'_> {
     }
 
     pub fn entry_offset(&self) -> u32 {
-        self.record.entry_offset
+        self.payload.entry_offset
     }
 
     #[cfg(test)]
@@ -432,12 +542,12 @@ impl ValidatedLiveBlock<'_> {
         LiveRecordSnapshot {
             state: self.record.state.load(Ordering::Acquire),
             owner_pid: self.record.owner_pid.load(Ordering::Relaxed),
-            unit_key_digest: self.record.unit_key_digest,
-            guest_start: self.record.guest_start,
-            source_page: self.record.source_page,
+            unit_key_digest: self.payload.unit_key_digest,
+            guest_start: self.payload.guest_start,
+            source_page: self.payload.source_page,
             extents: self.extents,
-            entry_offset: self.record.entry_offset,
-            code_sha256: self.record.code_sha256,
+            entry_offset: self.payload.entry_offset,
+            code_sha256: self.payload.code_sha256,
         }
     }
 }
@@ -464,8 +574,8 @@ fn initial_slot(unit_key_digest: &[u8; 32], guest_start: u64) -> usize {
     (low as usize) & LIVE_ARENA_MASK
 }
 
-fn record_matches(record: &LiveBlockRecordV1, key: &[u8; 32], guest_start: u64) -> bool {
-    record.unit_key_digest == *key && record.guest_start == guest_start
+fn record_matches(payload: &LiveBlockPayloadV1, key: &[u8; 32], guest_start: u64) -> bool {
+    payload.unit_key_digest == *key && payload.guest_start == guest_start
 }
 
 fn valid_source_page(source_page: u64, guest_start: u64) -> bool {
@@ -541,28 +651,51 @@ mod tests {
         LiveTranslationArena::new(PAGE * 32, PAGE * 2, PAGE * 2)
     }
 
-    fn publication(key: &TranslationUnitKey, extents: LiveBlockExtents) -> LiveBlockPublication {
+    fn publication(key: &TranslationUnitKey) -> LiveBlockPublication {
         let code = vec![0x1f, 0x20, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6];
         LiveBlockPublication {
             unit_key_digest: key.live_digest().expect("live digest"),
             translator_abi: TRANSLATOR_ABI_CURRENT,
             source_page: key.guest_va_start().raw(),
-            extents,
             entry_offset: 4,
             code_sha256: Sha256::digest(&code).into(),
             code,
         }
     }
 
+    fn seed_probe_record(
+        arena: &mut LiveTranslationArena,
+        slot: usize,
+        state: u32,
+        unit_key_digest: [u8; 32],
+        guest_start: u64,
+    ) {
+        let record = &mut arena.records[slot & LIVE_ARENA_MASK];
+        *record.payload.get_mut() = LiveBlockPayloadV1 {
+            unit_key_digest,
+            guest_start,
+            source_page: guest_start / PAGE * PAGE,
+            code_offset: 0,
+            code_len: 8,
+            entry_offset: 4,
+            hot_offset: 0,
+            hot_len: 8,
+            cold_offset: 0,
+            cold_len: 8,
+            code_sha256: [0x5a; 32],
+        };
+        record.state.store(state, Ordering::Release);
+    }
+
     fn publish_ready<'a>(
         arena: &'a LiveTranslationArena,
         key: &TranslationUnitKey,
     ) -> ValidatedLiveBlock<'a> {
-        let LiveLookup::Publish(mut claim) = arena.lookup(key, key.guest_va_start(), 1234) else {
+        let LiveLookup::Publish(claim) = arena.lookup(key, key.guest_va_start(), 1234) else {
             panic!("first lookup must claim the empty record");
         };
-        let extents = claim.reserve(8, 8, 8).expect("reserve extents");
-        let LiveLookup::Ready(ready) = claim.publish(publication(key, extents)) else {
+        let reserved = claim.reserve(8, 8, 8).expect("reserve extents");
+        let LiveLookup::Ready(ready) = reserved.publish(publication(key)) else {
             panic!("valid publication must become ready");
         };
         ready
@@ -607,23 +740,13 @@ mod tests {
     fn failed_record_falls_back_without_waiting() {
         let arena = LiveTranslationArena::new(4, PAGE, PAGE);
         let key = key();
-        let LiveLookup::Publish(mut claim) = arena.lookup(&key, key.guest_va_start(), 1234) else {
+        let LiveLookup::Publish(claim) = arena.lookup(&key, key.guest_va_start(), 1234) else {
             panic!("first lookup must claim the empty record");
         };
-        assert_eq!(claim.reserve(8, 8, 8), Err(LivePrivateReason::Capacity));
-        assert_eq!(
-            claim
-                .publish(publication(
-                    &key,
-                    LiveBlockExtents {
-                        code: LiveReservation { offset: 0, len: 8 },
-                        hot: LiveReservation { offset: 0, len: 8 },
-                        cold: LiveReservation { offset: 0, len: 8 },
-                    },
-                ))
-                .private_reason(),
-            Some(LivePrivateReason::Failed)
-        );
+        assert!(matches!(
+            claim.reserve(8, 8, 8),
+            Err(LivePrivateReason::Capacity)
+        ));
 
         assert_eq!(
             arena
@@ -651,77 +774,55 @@ mod tests {
     }
 
     #[test]
-    fn record_rejects_misaligned_or_overflowing_extents() {
+    fn reservation_rejects_misaligned_or_overflowing_lengths() {
         let key = key();
         let invalid_arena = arena();
         let LiveLookup::Publish(claim) = invalid_arena.lookup(&key, key.guest_va_start(), 1234)
         else {
             panic!("first lookup must claim the empty record");
         };
-        let mut invalid = publication(
-            &key,
-            LiveBlockExtents {
-                code: LiveReservation { offset: 1, len: 8 },
-                hot: LiveReservation { offset: 0, len: 8 },
-                cold: LiveReservation { offset: 0, len: 8 },
-            },
-        );
-        invalid.entry_offset = 3;
-        assert_eq!(
-            claim.publish(invalid).private_reason(),
-            Some(LivePrivateReason::InvalidRecord)
-        );
+        assert!(matches!(
+            claim.reserve(6, 8, 8),
+            Err(LivePrivateReason::InvalidRecord)
+        ));
 
         let overflow_arena = arena();
         let LiveLookup::Publish(claim) = overflow_arena.lookup(&key, key.guest_va_start(), 1234)
         else {
             panic!("first lookup must claim the empty record");
         };
-        let overflowing = publication(
-            &key,
-            LiveBlockExtents {
-                code: LiveReservation {
-                    offset: u64::MAX - 3,
-                    len: 8,
-                },
-                hot: LiveReservation { offset: 0, len: 8 },
-                cold: LiveReservation { offset: 0, len: 8 },
-            },
-        );
-        assert_eq!(
-            claim.publish(overflowing).private_reason(),
-            Some(LivePrivateReason::InvalidRecord)
-        );
+        assert!(matches!(
+            claim.reserve(u64::MAX - 3, 8, 8),
+            Err(LivePrivateReason::InvalidRecord)
+        ));
     }
 
     #[test]
     fn record_rejects_wrong_unit_key_or_translator_abi() {
         let key = key();
         let wrong_key_arena = arena();
-        let LiveLookup::Publish(mut claim) =
-            wrong_key_arena.lookup(&key, key.guest_va_start(), 1234)
+        let LiveLookup::Publish(claim) = wrong_key_arena.lookup(&key, key.guest_va_start(), 1234)
         else {
             panic!("first lookup must claim the empty record");
         };
-        let extents = claim.reserve(8, 8, 8).expect("reserve extents");
-        let mut wrong_key = publication(&key, extents);
+        let reserved = claim.reserve(8, 8, 8).expect("reserve extents");
+        let mut wrong_key = publication(&key);
         wrong_key.unit_key_digest = [0xff; 32];
         assert_eq!(
-            claim.publish(wrong_key).private_reason(),
+            reserved.publish(wrong_key).private_reason(),
             Some(LivePrivateReason::InvalidRecord)
         );
 
         let wrong_abi_arena = arena();
-        let LiveLookup::Publish(mut claim) =
-            wrong_abi_arena.lookup(&key, key.guest_va_start(), 1234)
+        let LiveLookup::Publish(claim) = wrong_abi_arena.lookup(&key, key.guest_va_start(), 1234)
         else {
             panic!("first lookup must claim the empty record");
         };
-        let extents = claim.reserve(8, 8, 8).expect("reserve extents");
-        let mut wrong_abi = publication(&key, extents);
+        let reserved = claim.reserve(8, 8, 8).expect("reserve extents");
+        let mut wrong_abi = publication(&key);
         wrong_abi.translator_abi = TRANSLATOR_ABI_CURRENT + 1;
         assert_eq!(
-            claim.publish(wrong_abi).private_reason(),
+            reserved.publish(wrong_abi).private_reason(),
             Some(LivePrivateReason::InvalidRecord)
         );
     }
@@ -739,10 +840,13 @@ mod tests {
             workers.push(std::thread::spawn(move || {
                 let guest = GuestVa(key.guest_va_start().raw() + (index + 1) as u64 * PAGE);
                 start.wait();
-                let LiveLookup::Publish(mut claim) = arena.lookup(&key, guest, index + 1) else {
+                let LiveLookup::Publish(claim) = arena.lookup(&key, guest, index + 1) else {
                     panic!("each distinct record must claim once");
                 };
-                claim.reserve(8, 8, 8).expect("reservation must fit")
+                claim
+                    .reserve(8, 8, 8)
+                    .expect("reservation must fit")
+                    .extents()
             }));
         }
         start.wait();
@@ -778,5 +882,228 @@ mod tests {
             panic!("ready record must stay ready");
         };
         assert_eq!(again.record_snapshot(), first);
+    }
+
+    #[test]
+    fn ready_different_key_continues_to_next_probe() {
+        let mut arena = arena();
+        let key = key();
+        let guest_start = key.guest_va_start();
+        let digest = key.live_digest().expect("live digest");
+        let initial = initial_slot(&digest, guest_start.raw());
+        seed_probe_record(
+            &mut arena,
+            initial,
+            LIVE_BLOCK_READY,
+            [0xa5; 32],
+            guest_start.raw(),
+        );
+
+        let LiveLookup::Publish(claim) = arena.lookup(&key, guest_start, 1234) else {
+            panic!("different-key READY must continue to the next empty probe");
+        };
+        assert!(std::ptr::eq(
+            claim.record,
+            &arena.records[(initial + 1) & LIVE_ARENA_MASK]
+        ));
+    }
+
+    #[test]
+    fn failed_different_key_continues_to_next_probe() {
+        let mut arena = arena();
+        let key = key();
+        let guest_start = key.guest_va_start();
+        let digest = key.live_digest().expect("live digest");
+        let initial = initial_slot(&digest, guest_start.raw());
+        seed_probe_record(
+            &mut arena,
+            initial,
+            LIVE_BLOCK_FAILED,
+            [0xa5; 32],
+            guest_start.raw(),
+        );
+
+        let LiveLookup::Publish(claim) = arena.lookup(&key, guest_start, 1234) else {
+            panic!("different-key FAILED must continue to the next empty probe");
+        };
+        assert!(std::ptr::eq(
+            claim.record,
+            &arena.records[(initial + 1) & LIVE_ARENA_MASK]
+        ));
+    }
+
+    #[test]
+    fn building_different_key_stops_without_probing() {
+        let mut arena = arena();
+        let key = key();
+        let guest_start = key.guest_va_start();
+        let digest = key.live_digest().expect("live digest");
+        let initial = initial_slot(&digest, guest_start.raw());
+        seed_probe_record(
+            &mut arena,
+            initial,
+            LIVE_BLOCK_BUILDING,
+            [0xa5; 32],
+            guest_start.raw(),
+        );
+
+        assert_eq!(
+            arena.lookup(&key, guest_start, 1234).private_reason(),
+            Some(LivePrivateReason::Building)
+        );
+        assert_eq!(
+            arena.records[(initial + 1) & LIVE_ARENA_MASK]
+                .state
+                .load(Ordering::Relaxed),
+            LIVE_BLOCK_EMPTY
+        );
+    }
+
+    #[test]
+    fn sixteen_different_terminal_records_exhaust_probe_budget() {
+        let mut arena = arena();
+        let key = key();
+        let guest_start = key.guest_va_start();
+        let digest = key.live_digest().expect("live digest");
+        let initial = initial_slot(&digest, guest_start.raw());
+        for probe in 0..LIVE_ARENA_PROBES {
+            let mut different_digest = [0u8; 32];
+            different_digest[0..8].copy_from_slice(&(probe as u64 + 1).to_le_bytes());
+            seed_probe_record(
+                &mut arena,
+                initial + probe,
+                if probe % 2 == 0 {
+                    LIVE_BLOCK_READY
+                } else {
+                    LIVE_BLOCK_FAILED
+                },
+                different_digest,
+                guest_start.raw(),
+            );
+        }
+
+        assert_eq!(
+            arena.lookup(&key, guest_start, 1234).private_reason(),
+            Some(LivePrivateReason::ExhaustedProbes)
+        );
+    }
+
+    #[test]
+    fn publication_consumes_the_claims_exact_reservation() {
+        let arena = arena();
+        let key = key();
+        let LiveLookup::Publish(claim) = arena.lookup(&key, key.guest_va_start(), 1234) else {
+            panic!("first lookup must claim the empty record");
+        };
+        let reserved = claim.reserve(8, 8, 8).expect("reserve extents");
+        let extents = reserved.extents();
+
+        let LiveLookup::Ready(ready) = reserved.publish(publication(&key)) else {
+            panic!("publication must consume its bound reservation");
+        };
+        assert_eq!(ready.extents(), extents);
+    }
+
+    #[test]
+    fn unrepresentable_lengths_are_rejected_before_any_cursor_advance() {
+        let oversized = u64::from(u32::MAX) + 1;
+        for lengths in [(oversized, 8, 8), (8, oversized, 8), (8, 8, oversized)] {
+            let arena = LiveTranslationArena::new(oversized + PAGE, oversized + 8, oversized + 8);
+            let key = key();
+            let LiveLookup::Publish(claim) = arena.lookup(&key, key.guest_va_start(), 1234) else {
+                panic!("first lookup must claim the empty record");
+            };
+
+            assert!(matches!(
+                claim.reserve(lengths.0, lengths.1, lengths.2),
+                Err(LivePrivateReason::InvalidRecord)
+            ));
+            assert_eq!(arena.code_next.load(Ordering::Relaxed), 0);
+            assert_eq!(arena.hot_next.load(Ordering::Relaxed), 0);
+            assert_eq!(arena.cold_next.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn cas_loss_stops_at_the_contended_empty_probe() {
+        let mut arena = arena();
+        let key = key();
+        let gate = Arc::new(Barrier::new(2));
+        arena.cas_barrier = Some(Arc::clone(&gate));
+        let arena = Arc::new(arena);
+
+        let outcomes: Vec<_> = (0..2)
+            .map(|owner_pid| {
+                let arena = Arc::clone(&arena);
+                let key = key.clone();
+                std::thread::spawn(move || {
+                    arena
+                        .lookup(&key, key.guest_va_start(), owner_pid)
+                        .private_reason()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|worker| worker.join().expect("worker must not panic"))
+            .collect();
+
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == Some(LivePrivateReason::CasLost))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes.iter().filter(|outcome| outcome.is_none()).count(),
+            1
+        );
+        let digest = key.live_digest().expect("live digest");
+        let initial = initial_slot(&digest, key.guest_va_start().raw());
+        assert_eq!(
+            arena.records[(initial + 1) & LIVE_ARENA_MASK]
+                .state
+                .load(Ordering::Relaxed),
+            LIVE_BLOCK_EMPTY
+        );
+    }
+
+    #[test]
+    fn ready_release_makes_payload_visible_to_another_thread() {
+        let arena = Arc::new(arena());
+        let key = key();
+        let LiveLookup::Publish(claim) = arena.lookup(&key, key.guest_va_start(), 1234) else {
+            panic!("first lookup must claim the empty record");
+        };
+        let reserved = claim.reserve(8, 8, 8).expect("reserve extents");
+        let extents = reserved.extents();
+        let publication = publication(&key);
+        let gate = Barrier::new(2);
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                gate.wait();
+                let LiveLookup::Ready(ready) = reserved.publish(publication) else {
+                    panic!("publisher must release a complete READY record");
+                };
+                assert_eq!(ready.extents(), extents);
+            });
+            gate.wait();
+            for _ in 0..100_000 {
+                if let LiveLookup::Ready(ready) = arena.lookup(&key, key.guest_va_start(), 9999) {
+                    assert_eq!(
+                        ready.unit_key_digest(),
+                        key.live_digest().expect("live digest")
+                    );
+                    assert_eq!(ready.guest_start(), key.guest_va_start().raw());
+                    assert_eq!(ready.source_page(), key.guest_va_start().raw());
+                    assert_eq!(ready.extents(), extents);
+                    assert_eq!(ready.entry_offset(), 4);
+                    return;
+                }
+                std::thread::yield_now();
+            }
+            panic!("reader did not acquire the READY publication");
+        });
     }
 }
