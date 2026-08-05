@@ -678,7 +678,7 @@ where
     A: IntoIterator<Item = String>,
     E: IntoIterator<Item = String>,
 {
-    install_native_probe_sink();
+    enter_configured_native_process()?;
     let Some(geometry) = plan.page_geometry.native_geometry() else {
         return Err(RuntimeError::Unsupported(
             "native Darwin run-elf selected without native page geometry".to_string(),
@@ -707,6 +707,7 @@ where
         env.iter().map(|entry| entry.as_bytes().to_vec()).collect(),
         &canonical_host_executable_path(path),
     );
+    let executable_digest = initial_live_executable_digest(&file)?;
     let relative_relocations = native_relative_relocations(&file, NATIVE_DARWIN_PIE_BASE)?;
     let image = AddressSpace::load_elf_bytes_with_reader_at_pie_base_without_runtime_regions(
         &file,
@@ -735,7 +736,10 @@ where
 
     run_image_in_child(
         image,
-        canonical_host_executable_path(path),
+        NativeInitialExecutableIdentity {
+            resolved_path: canonical_host_executable_path(path),
+            digest: executable_digest,
+        },
         dispatcher,
         max_traps,
         relative_relocations,
@@ -759,7 +763,7 @@ where
     A: IntoIterator<Item = String>,
     E: IntoIterator<Item = String>,
 {
-    install_native_probe_sink();
+    enter_configured_native_process()?;
     let Some(geometry) = plan.page_geometry.native_geometry() else {
         return Err(RuntimeError::Unsupported(
             "native Darwin container launch selected without native page geometry".to_string(),
@@ -798,6 +802,7 @@ where
         env.iter().map(|entry| entry.as_bytes().to_vec()).collect(),
         &resolved,
     );
+    let executable_digest = initial_live_executable_digest(&file)?;
     let relative_relocations = native_relative_relocations(&file, NATIVE_DARWIN_PIE_BASE)?;
     let image = AddressSpace::load_elf_bytes_with_reader_at_pie_base_without_runtime_regions(
         &file,
@@ -818,7 +823,10 @@ where
 
     run_image_in_child(
         image,
-        resolved,
+        NativeInitialExecutableIdentity {
+            resolved_path: resolved,
+            digest: executable_digest,
+        },
         dispatcher,
         max_traps,
         relative_relocations,
@@ -1325,13 +1333,80 @@ enum ExecDigestPolicy {
 
 /// Whether anything will read an executable's content digest this run.
 ///
-/// The three consumers each mint an `ExecutableIdentity`/`TranslationUnitKey`
-/// from it. The persistent translation store is default-on
-/// (`CARRICK_DSR_PERSISTENT_STORE=0` disables); the other two are opt-in.
+/// Each consumer mints an `ExecutableIdentity`/`TranslationUnitKey` from it.
+/// The persistent translation store is default-on
+/// (`CARRICK_DSR_PERSISTENT_STORE=0` disables); the census and experimental
+/// consumers are opt-in.
 fn executable_digest_is_consumed() -> bool {
     carrick_dsr_aarch64::translator::persistent_store_runtime_enabled()
         || carrick_dsr_aarch64::artifact_spike::enabled()
         || carrick_dsr_aarch64::translator::xlat_census::armed()
+        || live_identity_consumes_executable_digest(
+            carrick_dsr_aarch64::translator::live_arena_runtime_policy(),
+            carrick_dsr_aarch64::translator::live_sizing_census::armed(),
+        )
+}
+
+fn live_identity_consumes_executable_digest(
+    policy: Result<
+        carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy,
+        carrick_dsr_aarch64::types::DsrError,
+    >,
+    sizing_armed: bool,
+) -> bool {
+    sizing_armed
+        || matches!(
+            policy,
+            Ok(carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy::Compiler) | Err(_)
+        )
+}
+
+fn initial_live_executable_digest_for(
+    policy: carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy,
+    sizing_armed: bool,
+    file: &[u8],
+) -> Option<[u8; 32]> {
+    (policy == carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy::Compiler || sizing_armed)
+        .then(|| sha2::Sha256::digest(file).into())
+}
+
+fn initial_live_executable_digest(file: &[u8]) -> Result<Option<[u8; 32]>, RuntimeError> {
+    let policy = carrick_dsr_aarch64::translator::live_arena_runtime_policy()
+        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+    Ok(initial_live_executable_digest_for(
+        policy,
+        carrick_dsr_aarch64::translator::live_sizing_census::armed(),
+        file,
+    ))
+}
+
+fn require_live_arena_runtime_ready(
+    policy: carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy,
+) -> Result<(), RuntimeError> {
+    match policy {
+        carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy::Disabled => Ok(()),
+        carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy::Compiler => {
+            Err(RuntimeError::Unsupported(
+                "CARRICK_DSR_LIVE_ARENA=compiler awaits Task 6C2 packed-slab ownership; use CARRICK_DSR_LIVE_ARENA=0 with CARRICK_DSR_LIVE_ARENA_SIZING_DIR for census-only sizing"
+                    .to_string(),
+            ))
+        }
+    }
+}
+
+fn enter_native_process_with_live_policy(
+    policy: carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy,
+    enter: impl FnOnce(),
+) -> Result<(), RuntimeError> {
+    require_live_arena_runtime_ready(policy)?;
+    enter();
+    Ok(())
+}
+
+fn enter_configured_native_process() -> Result<(), RuntimeError> {
+    let policy = carrick_dsr_aarch64::translator::live_arena_runtime_policy()
+        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+    enter_native_process_with_live_policy(policy, install_native_probe_sink)
 }
 
 /// Sentinel meaning "not hashed yet". `begin_guest_exec` fills it in if the
@@ -1477,13 +1552,13 @@ pub(crate) fn resume_guest_from_capsule(
     env: Vec<Vec<u8>>,
     _live_arena: Option<carrick_native_darwin::live_arena::DarwinLiveArena>,
 ) -> anyhow::Result<i32> {
+    enter_configured_native_process()?;
     #[cfg(test)]
     if let Some(exit_code) =
         crate::native_exec_capsule::native_exec_live_arena_resume_hook(_live_arena.as_ref())?
     {
         return Ok(exit_code);
     }
-    install_native_probe_sink();
     dsr::profile::seed_profile_exec_epoch_after_reexec(guest.profile_exec_epoch);
     // Startup attribution across the PID-preserving host self-reexec: the
     // pid's startup window was captured exactly once in the pre-exec image,
@@ -2272,15 +2347,26 @@ fn add_load_bias(load_bias: u64, addend: i64) -> Result<u64, RuntimeError> {
 
 // See `run_static_elf`: macOS-arm-only until M0.8.
 #[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
+struct NativeInitialExecutableIdentity {
+    resolved_path: String,
+    digest: Option<[u8; 32]>,
+}
+
+// See `run_static_elf`: macOS-arm-only until M0.8.
+#[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
 fn run_image_in_child(
     image: AddressSpace,
-    resolved_path: String,
+    executable: NativeInitialExecutableIdentity,
     dispatcher: SyscallDispatcher,
     max_traps: usize,
     relative_relocations: Vec<NativeRelativeRelocation>,
     plan: &ExecutionPlan,
     direct: Option<DirectLaunchCandidate>,
 ) -> Result<RunResult, RuntimeError> {
+    let NativeInitialExecutableIdentity {
+        resolved_path,
+        digest: executable_digest,
+    } = executable;
     let _cache_session =
         carrick_native_darwin::aot_cache::begin_container_cache().map_err(AddressSpaceError::Io)?;
     let stdout_pipe = pipe_pair()?;
@@ -2348,7 +2434,7 @@ fn run_image_in_child(
                 image,
                 relative_relocations,
             },
-            None,
+            executable_digest,
             dispatcher,
             max_traps,
             plan,
@@ -3452,6 +3538,7 @@ fn finalize_native_process_exit(
     // and every fork child end at `libc::_exit`. This is the one seam all of
     // them funnel through.
     dsr::xlat_census::flush(dsr::xlat_census::CensusFlush::ProcessExit);
+    dsr::live_sizing_census::flush(dsr::live_sizing_census::SizingFlush::ProcessExit);
 }
 
 /// Diagnostic-only: when `CARRICK_DSR_CODE_SNAPSHOT_DIR` names a directory,
@@ -4339,6 +4426,9 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                             // successor keeps this pid, so the census filename
                             // carries a timestamp discriminator too.
                             dsr::xlat_census::flush(dsr::xlat_census::CensusFlush::HostSelfReexec);
+                            dsr::live_sizing_census::flush(
+                                dsr::live_sizing_census::SizingFlush::HostSelfReexec,
+                            );
                             #[cfg(feature = "alloc-owner-census")]
                             drop(allocation_observer);
                             require_native_syscall_service_transition(
@@ -4489,6 +4579,9 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         let allocation_observer =
                             carrick_dsr_aarch64::alloc_owner_census::observer_pause();
                         dsr::xlat_census::flush(dsr::xlat_census::CensusFlush::InProcessExec);
+                        dsr::live_sizing_census::flush(
+                            dsr::live_sizing_census::SizingFlush::InProcessExec,
+                        );
                         #[cfg(feature = "alloc-owner-census")]
                         drop(allocation_observer);
                         // Exec quiescence has retired every sibling and no
@@ -7967,6 +8060,220 @@ fn last_io_error(context: &str) -> RuntimeError {
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn live_policy_and_sizing_digest_consumption_truth_table_is_exact() {
+        use carrick_dsr_aarch64::translator::{
+            LiveArenaRuntimePolicy, live_arena_runtime_policy_from,
+        };
+
+        assert!(!live_identity_consumes_executable_digest(
+            Ok(LiveArenaRuntimePolicy::Disabled),
+            false,
+        ));
+        assert!(live_identity_consumes_executable_digest(
+            Ok(LiveArenaRuntimePolicy::Disabled),
+            true,
+        ));
+        assert!(live_identity_consumes_executable_digest(
+            Ok(LiveArenaRuntimePolicy::Compiler),
+            false,
+        ));
+        assert!(live_identity_consumes_executable_digest(
+            live_arena_runtime_policy_from(Some(std::ffi::OsStr::new("invalid"))),
+            false,
+        ));
+    }
+
+    #[test]
+    fn initial_compiler_digest_is_exact_only_for_live_policy_or_sizing() {
+        let bytes = b"initial compiler fixture";
+        let expected: [u8; 32] = sha2::Sha256::digest(bytes).into();
+
+        assert_eq!(
+            initial_live_executable_digest_for(
+                carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy::Disabled,
+                false,
+                bytes,
+            ),
+            None,
+            "default/off must add no initial executable hash"
+        );
+        assert_eq!(
+            initial_live_executable_digest_for(
+                carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy::Compiler,
+                false,
+                bytes,
+            ),
+            Some(expected)
+        );
+        assert_eq!(
+            initial_live_executable_digest_for(
+                carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy::Disabled,
+                true,
+                bytes,
+            ),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn compiler_live_arena_policy_fails_closed_until_packed_slab_ownership_exists() {
+        use std::cell::Cell;
+
+        let installed = Cell::new(0_u32);
+        enter_native_process_with_live_policy(
+            carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy::Disabled,
+            || installed.set(installed.get() + 1),
+        )
+        .expect("disabled live policy enters normally");
+        assert_eq!(installed.get(), 1);
+
+        let error = enter_native_process_with_live_policy(
+            carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy::Compiler,
+            || installed.set(installed.get() + 1),
+        )
+        .expect_err("compiler policy must not silently use the private cache");
+        assert_eq!(installed.get(), 1, "guard must suppress process entry");
+        let message = error.to_string();
+        assert!(message.contains("Task 6C2 packed-slab ownership"));
+        assert!(message.contains("CARRICK_DSR_LIVE_ARENA=0"));
+        assert!(message.contains("CARRICK_DSR_LIVE_ARENA_SIZING_DIR"));
+    }
+
+    fn compiler_guard_guest_fixture() -> crate::native_exec_capsule::NativeGuestExecV1 {
+        use crate::native_exec_capsule::{
+            NativeGuestExecV1, NativeReexecCredentialsV1, NativeReexecProcessStateV1,
+            NativeReexecXsigV1,
+        };
+
+        NativeGuestExecV1 {
+            resolved_path: "/definitely/missing/compiler-capsule".to_owned(),
+            executable_digest: [0; 32],
+            rootfs: crate::fs_backend::HostFsReexecAuthority {
+                root_path: b"/definitely/missing/compiler-rootfs".to_vec(),
+                device: 0,
+                inode: 0,
+                cleanup_on_drop: false,
+            },
+            cwd: "/".to_owned(),
+            stream_stdio: false,
+            exec_host_fs_fallback: false,
+            max_traps: 1,
+            native_page_profile: carrick_spec::NativePageProfileRequest::Native16k,
+            live_arena: None,
+            kernel_arena: None,
+            shared_futex_waiters: None,
+            artifact_spike: None,
+            aot_cache: None,
+            bind_mounts: Vec::new(),
+            fd_table: crate::dispatch::fd_table::NativeReexecFdTableV1 {
+                files: Vec::new(),
+                descriptions: Vec::new(),
+                close_on_exec_host_fds: Vec::new(),
+                closed_stdio: [false; 3],
+            },
+            xsig: NativeReexecXsigV1 {
+                host_fd: -1,
+                original_host_fd_flags: 0,
+                host_device: 0,
+                host_inode: 0,
+                host_size: 0,
+            },
+            process_state: NativeReexecProcessStateV1 {
+                credentials: NativeReexecCredentialsV1 {
+                    ruid: 0,
+                    euid: 0,
+                    suid: 0,
+                    rgid: 0,
+                    egid: 0,
+                    sgid: 0,
+                    fsuid: 0,
+                    fsgid: 0,
+                    umask: 0o022,
+                },
+                supplementary_groups_override: None,
+                ignored_signals: 0,
+                nofile_soft: 1024,
+                rlimit_overrides: Vec::new(),
+                seccomp_policy: carrick_spec::SeccompPolicy::Unconfined,
+                ptrace_traceme: false,
+            },
+            prepared_image: None,
+            profile_startup: None,
+            profile_exec_epoch: 0,
+        }
+    }
+
+    #[test]
+    fn compiler_policy_rejects_real_native_entries_before_later_behavior() {
+        const CHILD_ENV: &str = "CARRICK_TEST_COMPILER_ENTRY_GUARDS_CHILD";
+        const TEST_NAME: &str = "native_darwin::tests::compiler_policy_rejects_real_native_entries_before_later_behavior";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let plan = native16k_test_plan();
+            let errors = [
+                run_static_elf(
+                    Path::new("/definitely/missing/compiler-static"),
+                    SyscallDispatcher::new(),
+                    std::iter::empty::<String>(),
+                    std::iter::empty::<String>(),
+                    1,
+                    None,
+                    &plan,
+                )
+                .expect_err("compiler policy must precede the missing static path")
+                .to_string(),
+                run_elf_from_dispatcher_debug(
+                    "/definitely/missing/compiler-container",
+                    SyscallDispatcher::new(),
+                    std::iter::empty::<String>(),
+                    std::iter::empty::<String>(),
+                    1,
+                    None,
+                    &plan,
+                )
+                .expect_err("compiler policy must precede dispatcher lookup")
+                .to_string(),
+                resume_guest_from_capsule(
+                    compiler_guard_guest_fixture(),
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                )
+                .expect_err("compiler policy must precede invalid capsule authority")
+                .to_string(),
+            ];
+            for message in errors {
+                assert!(
+                    message.contains("Task 6C2 packed-slab ownership"),
+                    "{message}"
+                );
+                assert!(message.contains("CARRICK_DSR_LIVE_ARENA=0"), "{message}");
+                assert!(
+                    message.contains("CARRICK_DSR_LIVE_ARENA_SIZING_DIR"),
+                    "{message}"
+                );
+            }
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg(TEST_NAME)
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .env("CARRICK_DSR_LIVE_ARENA", "compiler")
+            .env_remove("CARRICK_DSR_LIVE_ARENA_SIZING_DIR")
+            .output()
+            .expect("run isolated compiler-policy child");
+        assert!(
+            output.status.success(),
+            "isolated compiler-policy child failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[cfg(feature = "alloc-owner-census")]
     #[test]

@@ -818,6 +818,10 @@ impl NativeMappedMemory {
     ) -> Result<(), NativeMemoryError> {
         let artifact_enabled = crate::artifact_spike::enabled();
         let shared_enabled = crate::translator::persistent_store_runtime_enabled();
+        let live_policy = crate::translator::live_arena_runtime_policy()
+            .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
+        let live_enabled = live_policy == crate::translator::LiveArenaRuntimePolicy::Compiler
+            || crate::translator::live_sizing_census::armed();
         // The translation census needs the SAME segment enumeration and the
         // SAME `TranslationUnitKey`s the shared lane would mint, but it has to
         // be able to describe the hatch-disabled path too (the lane is
@@ -836,14 +840,14 @@ impl NativeMappedMemory {
         // WRONG answer to the exact question this instrument gates. A named
         // abort is the lesser failure. It has not been observed to fire.
         let census_enabled = crate::translator::xlat_census::armed();
-        if !artifact_enabled && !shared_enabled && !census_enabled {
+        if !artifact_enabled && !shared_enabled && !census_enabled && !live_enabled {
             return Ok(());
         }
         #[cfg(feature = "alloc-owner-census")]
         let _owner = crate::alloc_owner_census::scope(
             crate::alloc_owner_wire::AllocationOwner::TranslationSourcePreparation,
         );
-        let translator = (artifact_enabled || shared_enabled)
+        let translator = (artifact_enabled || shared_enabled || live_enabled)
             .then(|| self.dsr_process_translator())
             .transpose()?;
         if artifact_enabled
@@ -853,7 +857,7 @@ impl NativeMappedMemory {
             translator
                 .configure_artifact_image_digest(digest)
                 .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
-            if !shared_enabled && !census_enabled {
+            if !shared_enabled && !census_enabled && !live_enabled {
                 return Ok(());
             }
         }
@@ -874,7 +878,7 @@ impl NativeMappedMemory {
                 merged.push(span);
             }
         }
-        let collect_segments = shared_enabled || census_enabled;
+        let collect_segments = shared_enabled || census_enabled || live_enabled;
         let mut segments = collect_segments.then(|| Vec::with_capacity(merged.len()));
         let mut identity = executable_digest.is_none().then(|| {
             let mut identity = Sha256::new();
@@ -989,6 +993,16 @@ impl NativeMappedMemory {
         // block to a unit key without re-serializing and re-hashing the key on
         // the translate path.
         crate::translator::xlat_census::configure_image(&configuration);
+        if live_enabled {
+            let Some(translator) = translator.as_ref() else {
+                return Err(NativeMemoryError::Unsupported(
+                    "live translation is enabled without a DSR process translator".to_string(),
+                ));
+            };
+            let _selected = translator
+                .configure_live_image(configuration.clone(), self.host_page_size)
+                .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
+        }
         if !shared_enabled {
             return Ok(());
         }
@@ -5068,7 +5082,7 @@ mod tests {
             .expect("translation source preparation function end")
             .0;
         let inactive_return = body
-            .find("if !artifact_enabled && !shared_enabled && !census_enabled")
+            .find("if !artifact_enabled && !shared_enabled && !census_enabled && !live_enabled")
             .expect("inactive fast return");
         let owner = body
             .find("AllocationOwner::TranslationSourcePreparation")
