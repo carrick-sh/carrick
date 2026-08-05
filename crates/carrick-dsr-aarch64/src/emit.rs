@@ -7,11 +7,11 @@ use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, VecAssembler, aarch64::A
 
 use super::artifact_spike::{
     ArtifactRecord, ArtifactRecording, GatewayKind, MaterializedValue, ProcessValue,
+    SharedInitialMetadata,
 };
 use super::block::{BlockPlan, PlannedExit};
-use super::live_arena::ReadyLiveCodeOffset;
 use super::types::{CacheOffset, CacheVa, CodeGeneration, DsrError, InstAction};
-use carrick_dsr::cache::{LinkSite, PublishedCode, TranslationCache};
+use carrick_dsr::cache::{PublishedCode, TranslationCache};
 
 const _: () = assert!(carrick_dsr::address::INVALID_BIASED_HOST_ADDRESS_BIT == 1 << 47);
 pub const BIASED_FAST_ADDRESS_BITS: u32 = 41;
@@ -118,7 +118,6 @@ pub struct EmittedBlock {
     /// links may target it because eager link severing (Phase 2a)
     /// invalidates links when their target's page bumps.
     trusted_entry: Option<CacheOffset>,
-    immutable_shared_source: bool,
 }
 
 struct AssembledBlock {
@@ -132,7 +131,53 @@ struct AssembledBlock {
     direct_links: Vec<DirectLink>,
     recovery: Vec<RecoveryEntry>,
     trusted_entry: Option<CacheOffset>,
-    immutable_shared_source: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SharedInitialLengths {
+    pub code: u64,
+    pub hot: u64,
+    pub cold: u64,
+}
+
+/// One fully validated shared INITIAL emission before any executable bytes
+/// become visible. The caller can reserve exact code/HOT/COLD extents from
+/// these owned byte streams, then consume this value for the single cache
+/// publication.
+pub struct PreparedSharedInitial {
+    assembled: AssembledBlock,
+    metadata: SharedInitialMetadata,
+    lengths: SharedInitialLengths,
+}
+
+impl PreparedSharedInitial {
+    pub const fn lengths(&self) -> SharedInitialLengths {
+        self.lengths
+    }
+
+    pub fn code_bytes(&self) -> &[u8] {
+        &self.assembled.instruction_bytes
+    }
+
+    pub fn hot_bytes(&self) -> &[u8] {
+        self.metadata.hot_bytes()
+    }
+
+    pub fn cold_bytes(&self) -> &[u8] {
+        self.metadata.cold_bytes()
+    }
+
+    /// Candidate sites exist only while the block is prepared and still
+    /// private to its BUILDING publisher. Task 6 will bind them only after it
+    /// adds the claim-bound, same-view Darwin target capability.
+    pub fn link_candidates(&self) -> &[DirectLink] {
+        &self.assembled.direct_links
+    }
+
+    pub fn publish(mut self, cache: &mut TranslationCache) -> Result<EmittedBlock, DsrError> {
+        self.assembled.direct_links.clear();
+        self.assembled.publish(cache)
+    }
 }
 
 fn direct_instruction_bytes_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
@@ -149,58 +194,6 @@ fn direct_instruction_bytes_enabled() -> bool {
             std::env::var_os("CARRICK_DSR_DIRECT_BYTES").as_deref(),
         )
     })
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SharedSourceState {
-    Building,
-    Ready,
-}
-
-/// Return the direct `B` word a BUILDING shared source may install before
-/// READY. The target token can only come from an acquired, validated READY
-/// live record; its process-local address is derived from the caller's local
-/// arena mapping and never stored in portable metadata.
-pub(crate) fn shared_initial_direct_link_word(
-    source_state: SharedSourceState,
-    target: Option<ReadyLiveCodeOffset>,
-    arena_rx_base: HostVa,
-    site: LinkSite,
-) -> Result<Option<u32>, DsrError> {
-    if source_state == SharedSourceState::Ready {
-        return Ok(None);
-    }
-    let Some(target) = target else {
-        return Ok(None);
-    };
-    let target_offset = target.entry_offset_in_arena().ok_or_else(|| {
-        DsrError::CachePolicy("shared direct-link target offset overflow".to_string())
-    })?;
-    let target_offset = usize::try_from(target_offset).map_err(|_| {
-        DsrError::CachePolicy("shared direct-link target offset exceeds usize".to_string())
-    })?;
-    let target_raw = arena_rx_base
-        .raw()
-        .checked_add(target_offset)
-        .ok_or_else(|| {
-            DsrError::CachePolicy("shared direct-link target address overflow".to_string())
-        })?;
-    let target = CacheVa::published(HostVa(target_raw));
-
-    let source_raw = site
-        .source
-        .host()
-        .raw()
-        .checked_add(site.slot.get() as usize)
-        .ok_or_else(|| DsrError::CachePolicy("direct-link source overflow".to_string()))?;
-    let displacement = (target.host().raw() as i128) - (source_raw as i128);
-    if displacement % 4 == 0 {
-        let words = displacement / 4;
-        if !(-(1_i128 << 25)..(1_i128 << 25)).contains(&words) {
-            return Ok(None);
-        }
-    }
-    crate::translator::encode_aarch64_direct_branch(site, target).map(Some)
 }
 
 impl AssembledBlock {
@@ -229,7 +222,6 @@ impl AssembledBlock {
             direct_links: self.direct_links,
             recovery: self.recovery,
             trusted_entry: self.trusted_entry,
-            immutable_shared_source: self.immutable_shared_source,
         })
     }
 }
@@ -510,7 +502,6 @@ impl EmittedBlock {
             // Recorded templates carry the native trusted entry (replay
             // validates the baked expected generation before honoring it).
             trusted_entry,
-            immutable_shared_source: false,
         })
     }
 
@@ -537,34 +528,14 @@ impl EmittedBlock {
     }
 
     pub fn direct_links(&self) -> &[DirectLink] {
-        if self.immutable_shared_source {
-            &[]
-        } else {
-            &self.direct_links
-        }
-    }
-
-    /// Drain the only mutable view of a shared source's link sites while the
-    /// arena record is still BUILDING. After this handoff the sites cannot be
-    /// placed in a later mutable-source index.
-    pub fn take_shared_initial_direct_links(&mut self) -> Vec<DirectLink> {
-        if self.immutable_shared_source {
-            std::mem::take(&mut self.direct_links)
-        } else {
-            Vec::new()
-        }
+        &self.direct_links
     }
 
     pub fn recovery(&self) -> &[RecoveryEntry] {
         &self.recovery
     }
 
-    pub fn into_runtime_metadata(
-        mut self,
-    ) -> (Vec<PcMapEntry>, Vec<DirectLink>, Vec<RecoveryEntry>) {
-        if self.immutable_shared_source {
-            self.direct_links.clear();
-        }
+    pub fn into_runtime_metadata(self) -> (Vec<PcMapEntry>, Vec<DirectLink>, Vec<RecoveryEntry>) {
         (self.map.into_entries(), self.direct_links, self.recovery)
     }
 }
@@ -4604,16 +4575,15 @@ pub fn emit_block_recording_artifact_optional(
     Ok((emitted, artifact))
 }
 
-/// Assemble one immutable generation-zero block and publish that byte stream
-/// exactly once into the caller-provided cache. The caller owns the cache's
-/// backing reservation; this layer neither emits into the private cache nor
-/// replays a serialized artifact into the destination.
-pub fn emit_block_recording_shared_initial(
-    cache: &mut TranslationCache,
+/// Assemble and validate one immutable generation-zero block without making
+/// code visible. The returned object owns the sole dynasm byte stream plus its
+/// already-encoded metadata, so callers can reserve exact arena extents before
+/// consuming it for one publication.
+pub fn prepare_shared_initial(
     plan: &BlockPlan,
     mode: EmitAddressMode,
     source_words: Vec<u32>,
-) -> Result<(EmittedBlock, ArtifactRecord), DsrError> {
+) -> Result<PreparedSharedInitial, DsrError> {
     let mut recording = ArtifactRecording::default();
     if let EmitAddressMode::Biased { host_bias } = mode {
         recording.bind(ProcessValue::HostBias, host_bias.get())?;
@@ -4624,17 +4594,28 @@ pub fn emit_block_recording_shared_initial(
         mode,
         Some(&mut recording),
     )?;
-    // Validate the portable artifact before making executable code visible.
-    // Unlike the private optional-recording path, a shared relocation is a
-    // hard policy error, never silent recording ineligibility.
-    let artifact = recording.finish_shared_initial(
+    let metadata = recording.finish_shared_initial(
         assembled.instruction_words(),
         assembled.map.entries().to_vec(),
         assembled.recovery.clone(),
         source_words,
     )?;
-    let emitted = assembled.publish(cache)?;
-    Ok((emitted, artifact))
+    let lengths = SharedInitialLengths {
+        code: u64::try_from(assembled.instruction_bytes.len()).map_err(|_| {
+            DsrError::CachePolicy("shared INITIAL code length exceeds u64".to_string())
+        })?,
+        hot: u64::try_from(metadata.hot_bytes().len()).map_err(|_| {
+            DsrError::CachePolicy("shared INITIAL hot metadata length exceeds u64".to_string())
+        })?,
+        cold: u64::try_from(metadata.cold_bytes().len()).map_err(|_| {
+            DsrError::CachePolicy("shared INITIAL cold metadata length exceeds u64".to_string())
+        })?,
+    };
+    Ok(PreparedSharedInitial {
+        assembled,
+        metadata,
+        lengths,
+    })
 }
 
 pub fn emit_block_with_generation_direct(
@@ -6651,7 +6632,6 @@ fn assemble_block_inner(
         map,
         direct_links,
         recovery,
-        immutable_shared_source: shared_initial,
     })
 }
 
@@ -7237,6 +7217,78 @@ mod tests {
 
     mod shared_initial {
         use super::*;
+        use crate::live_arena::{LiveLookup, LiveTranslationArena};
+        use crate::shared_cache::{
+            AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
+            NativePageProfileIdentity, SourceFingerprint, TranslationUnitKey,
+        };
+
+        fn live_key() -> TranslationUnitKey {
+            TranslationUnitKey::for_segment(
+                ExecutableIdentity::Digest([0x42; 32]),
+                ImageFileOffset::new(0),
+                ImageFileLen::new(16 * 1024).expect("nonzero file length"),
+                GuestVa(0x4000),
+                GuestCodeLen::new(16 * 1024).expect("nonzero guest length"),
+                SourceFingerprint([0x7a; 32]),
+                NativePageProfileIdentity::Native16k,
+                AddressModeIdentity::Direct,
+            )
+        }
+
+        fn biased_exclusive_plan() -> BlockPlan {
+            let start = GuestVa(0x4000);
+            let words = [
+                0x885f_fc20, // ldaxr w0, [x1]
+                0x6b02_001f, // cmp w0, w2
+                0x5400_0061, // b.ne 0x4014
+                0x8803_fc24, // stlxr w3, w4, [x1]
+                0x35ff_ff83, // cbnz w3, 0x4000
+                0xd400_0001, // svc #0
+            ];
+            crate::block::plan_with_reader(
+                start,
+                CodeGeneration::INITIAL,
+                words.len(),
+                16 * 1024,
+                crate::block::ExclusiveFusionPolicy::BiasedEnabled,
+                |pc| {
+                    let index = usize::try_from((pc.raw() - start.raw()) / 4)
+                        .map_err(|_| DsrError::BlockPolicy("fixture index overflow".to_string()))?;
+                    words
+                        .get(index)
+                        .copied()
+                        .ok_or_else(|| DsrError::MemoryRead {
+                            pc: pc.raw(),
+                            detail: "biased exclusive fixture exhausted".to_string(),
+                        })
+                },
+            )
+            .expect("plan biased exclusive fixture")
+        }
+
+        #[test]
+        fn shared_initial_prepare_then_publish_advances_cache_once_by_exact_code_length() {
+            let mut cache = crate::test_jit::test_cache(16 * 1024);
+            let before = cache.used_bytes();
+            let prepared =
+                prepare_shared_initial(&copy_plan(), EmitAddressMode::Direct, Vec::new())
+                    .expect("prepare shared INITIAL fixture");
+            assert_eq!(
+                cache.used_bytes(),
+                before,
+                "preparation must reveal exact lengths before any cache visibility"
+            );
+            let lengths = prepared.lengths();
+            assert_eq!(lengths.code, prepared.code_bytes().len() as u64);
+            assert_eq!(lengths.hot, prepared.hot_bytes().len() as u64);
+            assert_eq!(lengths.cold, prepared.cold_bytes().len() as u64);
+            let emitted = prepared
+                .publish(&mut cache)
+                .expect("publish prepared block");
+            assert_eq!(emitted.len() as u64, lengths.code);
+            assert_eq!(cache.used_bytes(), before + emitted.len());
+        }
 
         #[test]
         fn shared_initial_entry_is_private_trusted_suffix_without_guard() {
@@ -7256,7 +7308,7 @@ mod tests {
         fn shared_initial_emission_has_no_process_relocations() {
             let mut recording = ArtifactRecording::default();
             let assembled = assemble_shared_initial_for_test(&copy_plan(), Some(&mut recording));
-            let record = recording
+            let metadata = recording
                 .finish_shared_initial(
                     assembled.instruction_words(),
                     assembled.map.entries().to_vec(),
@@ -7264,7 +7316,22 @@ mod tests {
                     Vec::new(),
                 )
                 .expect("finish shared INITIAL recording");
-            assert_eq!(record.template.metadata_counts().relocations, 0);
+            let (hot, consumed): (crate::artifact_spike::UnitBlockHotWire, usize) =
+                bincode::serde::decode_from_slice(
+                    metadata.hot_bytes(),
+                    bincode::config::standard(),
+                )
+                .expect("decode shared hot metadata");
+            assert_eq!(consumed, metadata.hot_bytes().len());
+            assert!(hot.relocations.is_empty());
+            assert!(hot.direct_links.is_empty());
+            let (_cold, consumed): (crate::artifact_spike::UnitBlockColdWire, usize) =
+                bincode::serde::decode_from_slice(
+                    metadata.cold_bytes(),
+                    bincode::config::standard(),
+                )
+                .expect("decode shared cold metadata");
+            assert_eq!(consumed, metadata.cold_bytes().len());
 
             let mut invalid = ArtifactRecording::default();
             invalid
@@ -7302,69 +7369,59 @@ mod tests {
 
         #[test]
         fn shared_ready_source_is_never_patchable() {
-            let mut recording = ArtifactRecording::default();
-            let assembled = assemble_shared_initial_for_test(
+            let mut cache = crate::test_jit::test_cache(16 * 1024);
+            let prepared = prepare_shared_initial(
                 &shared_initial_direct_plan(),
-                Some(&mut recording),
-            );
-            let record = recording
-                .finish_shared_initial(
-                    assembled.instruction_words(),
-                    assembled.map.entries().to_vec(),
-                    assembled.recovery.clone(),
-                    Vec::new(),
-                )
-                .expect("finish shared direct-link recording");
-            assert!(record.template.direct_links().is_empty());
+                EmitAddressMode::Direct,
+                Vec::new(),
+            )
+            .expect("prepare shared direct-link block");
+            assert_eq!(prepared.link_candidates().len(), 1);
+            let emitted = prepared.publish(&mut cache).expect("publish shared block");
+            assert!(emitted.direct_links().is_empty());
         }
 
         #[test]
-        fn building_source_can_bind_only_an_already_ready_shared_target() {
-            let assembled = assemble_shared_initial_for_test(&shared_initial_direct_plan(), None);
-            let link = assembled
-                .direct_links
-                .first()
-                .copied()
-                .expect("direct fixture emits a link");
-            let source = CacheVa::published(HostVa(0x1000_0000));
-            let site = LinkSite {
-                source,
-                slot: link.slot,
+        fn shared_initial_exact_lengths_drive_reservation_before_single_publish() {
+            let mut cache = crate::test_jit::test_cache(16 * 1024);
+            let prepared =
+                prepare_shared_initial(&copy_plan(), EmitAddressMode::Direct, Vec::new())
+                    .expect("prepare exact-length fixture");
+            let lengths = prepared.lengths();
+            let arena = LiveTranslationArena::new(64 * 1024, 64 * 1024, 64 * 1024);
+            let key = live_key();
+            let LiveLookup::Publish(claim) = arena.lookup(&key, key.guest_va_start(), 1234) else {
+                panic!("first lookup must claim an empty live record")
             };
-            let target = CacheVa::published(HostVa(0x1000_1000));
+            let reserved = claim
+                .reserve(lengths.code, lengths.hot, lengths.cold)
+                .expect("reserve exact prepared lengths");
+            assert_eq!(reserved.extents().code.len, lengths.code);
+            assert_eq!(reserved.extents().hot.len, lengths.hot);
+            assert_eq!(reserved.extents().cold.len, lengths.cold);
+            let before = cache.used_bytes();
+            let emitted = prepared.publish(&mut cache).expect("single publication");
+            assert_eq!(cache.used_bytes(), before + emitted.len());
+        }
+
+        #[test]
+        fn relocation_producing_biased_prepare_fails_before_cache_visibility() {
+            let cache = crate::test_jit::test_cache(16 * 1024);
+            let before = cache.used_bytes();
+            let host_bias = carrick_dsr::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
+                .expect("valid biased fixture");
+            let error = prepare_shared_initial(
+                &biased_exclusive_plan(),
+                EmitAddressMode::Biased { host_bias },
+                Vec::new(),
+            )
+            .err()
+            .expect("process relocation must fail preparation");
             assert!(
-                shared_initial_direct_link_word(
-                    SharedSourceState::Building,
-                    None,
-                    source.host(),
-                    site,
-                )
-                .expect("missing target is a stub")
-                .is_none()
+                matches!(error, DsrError::CachePolicy(ref message) if message.contains("process relocation")),
+                "unexpected biased preparation error: {error:?}"
             );
-            assert!(
-                shared_initial_direct_link_word(
-                    SharedSourceState::Ready,
-                    Some(ReadyLiveCodeOffset::for_test(0x1000, 0)),
-                    source.host(),
-                    site,
-                )
-                .expect("READY source is immutable")
-                .is_none()
-            );
-            assert_eq!(
-                shared_initial_direct_link_word(
-                    SharedSourceState::Building,
-                    Some(ReadyLiveCodeOffset::for_test(0x1000, 0)),
-                    source.host(),
-                    site,
-                )
-                .expect("BUILDING source binds READY target"),
-                Some(
-                    crate::translator::encode_aarch64_direct_branch(site, target)
-                        .expect("reachable branch")
-                )
-            );
+            assert_eq!(cache.used_bytes(), before);
         }
     }
 
