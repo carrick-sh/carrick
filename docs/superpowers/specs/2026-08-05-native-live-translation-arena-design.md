@@ -82,6 +82,15 @@ There is one container-lifetime `LiveTranslationArena` with two memory objects:
    consumer;
 2. an append-only metadata/control object, mapped read-write by every process.
 
+Darwin requires the code object's named entry to originate from a nominal
+`MAP_JIT` RWX mapping: controlled tests on this host returned
+`KERN_PROTECTION_FAILURE` for PROT_NONE, RW, RX, and plain
+`mach_vm_allocate` backings, while only RWX `MAP_JIT` produced an entry that
+could later map both RW and RX. Creation therefore uses a private,
+constructor-only RWX `MAP_JIT` bootstrap containing no published code and
+unmaps it before the arena escapes. The live arena itself exposes only the
+separate RW and RX aliases; it never retains a W+X mapping.
+
 The two send rights consume two of Darwin's three registered-port slots. The
 third registered slot is preserved exactly as found and remains reserved. No
 pointer crosses a process boundary. Every shared reference is an integer offset
