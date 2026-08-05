@@ -203,11 +203,27 @@ the record to `FAILED` and uses the private path.
 
 ### Emit once, directly
 
-The winner must assemble exactly once into the shared target. It must not emit
-to the private cache and then copy, reconstruct, merge, serialize, or replay.
-`TranslationCache::from_region` already permits the emitter to target a
-borrowed `JitRegion`; the Darwin arena supplies a per-reservation region whose
-exec base is the local RX alias and write base is the local RW alias.
+The winner must assemble exactly once and publish that prepared byte stream
+exactly once into the shared target. It must not emit to the private cache and
+then copy, reconstruct, merge, serialize, or replay. Preparation validates the
+shared artifact, encodes its pointer-free HOT/COLD metadata once, and exposes
+the exact code/HOT/COLD lengths before consuming the publish claim. The caller
+then reserves exact extents, constructs the claim-bound cache, optionally
+prebinds eligible links while the source is still `Prepared`/`BUILDING`, and
+consumes the prepared object in one cache publication. The published block
+exposes no mutable source sites.
+
+The AArch64 prepared emitter accepts a temporary `&mut TranslationCache` only
+for that final consuming publication, but
+`BorrowedLiveJitRegion<'arena>` intentionally cannot escape as the by-value
+`JitRegion` retained by `TranslationCache::from_region`: doing that would erase
+the arena lifetime and unique-writer reservation authority. The Darwin
+integration therefore owns a lifetime-bound `LiveArenaTranslationCache<'arena>`
+bridge. Its private constructor joins a checked borrowed RW/RX view with the
+Task-2 reservation capability, its inner cache targets exactly that range, and
+it exposes only a temporary mutable cache borrow to the emitter. The bridge and
+all published address handles remain dominated by the process-level arena
+owner.
 
 Shared emission omits the 44-byte absolute generation guard and enters at the
 existing trusted suffix. The census proves the remaining instructions are
