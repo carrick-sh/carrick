@@ -96,6 +96,23 @@ third registered slot is preserved exactly as found and remains reserved. No
 pointer crosses a process boundary. Every shared reference is an integer offset
 plus a checked length.
 
+The outer 64 bytes of each object remain the authenticated Mach transport
+header, but executable payload does not begin at byte 64. The code payload base
+is `align_up(64, host_page)` so every logical 16 KiB-aligned reservation and
+revoked slab is physically host-page-aligned. `code_offset` is relative to that
+payload base and the process view adds the base exactly once.
+
+The control object stores the protocol itself. Immediately after its outer
+header is an immutable, cacheline-aligned `LiveArenaControlDirectoryV1` with an
+atomic initialization state, schema/translator ABI, repeated nonce, cursor and
+record geometry, code payload capacity, and HOT/COLD bases/capacities. Three
+separate cacheline-aligned atomic cursors precede the fixed record table; HOT
+and COLD byte pools follow at checked alignment. The creator initializes every
+atomic and record while private and Release-publishes the directory. An adopter
+Acquire-loads initialization and rejects any nonce, schema, ABI, stride,
+alignment, overlap, or bounds mismatch before constructing a borrowed typed
+view. Production records and cursors are never a Rust-owned `Box`.
+
 The arena is an optional accelerator. Private translation remains the complete
 correctness path. A missing arena, a full arena, an incompatible key, an owner
 death, a torn record, a regenerated page, or any validation failure immediately
@@ -195,11 +212,15 @@ match record.state.load(Ordering::Acquire) {
 ```
 
 The winner reserves disjoint append-only code and metadata extents, writes and
-validates them, flushes the code range, writes every record field, then performs
-the sole `Release` store of `READY`. A consumer's `Acquire` load of `READY`
-orders all preceding bytes. A publisher that dies in `BUILDING` strands only
-that record; consumers never wait, steal, or execute it. Arena exhaustion sets
-the record to `FAILED` and uses the private path.
+validates them, rechecks source generation, flushes the code range, and obtains
+an unforgeable claim-bound completion token. Only consuming that token may
+write every record field and perform the sole `Release` store of `READY`. A
+consumer's `Acquire` load orders preceding data writes, then that process
+locally invalidates the exact RX range before executing it; release/acquire is
+not an instruction-cache operation. Dropping an armed claim Release-publishes
+FAILED, so owner death strands no waitable state. Consumers never wait, steal,
+or execute BUILDING. Arena exhaustion sets the record to `FAILED` and uses the
+private path.
 
 ### Emit once, directly
 
