@@ -1256,15 +1256,20 @@ impl<'claim, 'view> LiveMappedWritePermit<'claim, 'view> {
     ///
     /// # Safety
     ///
+    /// `expected` must come from the same post-prebinding
+    /// [`crate::emit::PreparedSharedInitial`] that the caller has consumed
+    /// exactly once into the exact claim-bound [`carrick_dsr::cache::TranslationCache`].
+    /// That publication must prove the cache-used delta is exactly the claim's
+    /// code length, use exactly its code extent, and perform the real host
+    /// publisher I-cache flush. The caller must then drop the claim-bound cache
+    /// and every emitted address-bearing value before entering certification.
     /// `code`, `hot`, and `cold` must be the complete, disjoint mapped arena
-    /// ranges derived from `self.extents()` by `self.claim.process_view`; no
-    /// mutable alias may remain live. `local_rx` must name the corresponding
-    /// exact executable alias, whose owner outlives `'view`. `flush` must perform
-    /// publisher I-cache maintenance for the exact pointer and length supplied.
-    /// Caller-owned buffers do not satisfy this production contract. Under
-    /// `cfg(test)` only, the module's private fixture uses stable disjoint live
-    /// allocations to model already-resolved ranges and exercise pure
-    /// validation plus the flush call; that fixture is never production mapped
+    /// ranges resolved from `self.extents()` by the same process view, with no
+    /// mutable alias live.
+    /// Caller-owned buffers and a no-op host JIT do not satisfy this production
+    /// contract. Under `cfg(test)` only, the module's private fixture uses
+    /// stable disjoint live allocations to model already-resolved ranges and
+    /// exercise pure portable validation; it is never production mapped
     /// publication authority.
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
@@ -1273,12 +1278,68 @@ impl<'claim, 'view> LiveMappedWritePermit<'claim, 'view> {
         code: &[u8],
         hot: &[u8],
         cold: &[u8],
-        local_rx: NonNull<u8>,
         source_page: GuestVa,
         entry_offset: u32,
         generation: &PageGenerationObservation,
         expected: ExpectedLivePublication,
-        flush: impl FnOnce(*const u8, usize),
+    ) -> Result<LiveArenaWrittenBlock<'view>, LivePrivateReason> {
+        // SAFETY: this forwards the caller's complete certification contract;
+        // the production path has no test mutation hook.
+        unsafe {
+            self.certify_mapped_impl(
+                code,
+                hot,
+                cold,
+                source_page,
+                entry_offset,
+                generation,
+                expected,
+                || {},
+            )
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn certify_mapped_after_metadata_for_test(
+        self,
+        code: &[u8],
+        hot: &[u8],
+        cold: &[u8],
+        source_page: GuestVa,
+        entry_offset: u32,
+        generation: &PageGenerationObservation,
+        expected: ExpectedLivePublication,
+        after_metadata_validation: impl FnOnce(),
+    ) -> Result<LiveArenaWrittenBlock<'view>, LivePrivateReason> {
+        // SAFETY: this test-only entry preserves the portable range/proof
+        // contract and adds only a deterministic event between metadata
+        // validation and the final completion phase.
+        unsafe {
+            self.certify_mapped_impl(
+                code,
+                hot,
+                cold,
+                source_page,
+                entry_offset,
+                generation,
+                expected,
+                after_metadata_validation,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn certify_mapped_impl(
+        self,
+        code: &[u8],
+        hot: &[u8],
+        cold: &[u8],
+        source_page: GuestVa,
+        entry_offset: u32,
+        generation: &PageGenerationObservation,
+        expected: ExpectedLivePublication,
+        after_metadata_validation: impl FnOnce(),
     ) -> Result<LiveArenaWrittenBlock<'view>, LivePrivateReason> {
         let expected_lengths = expected.lengths();
         if usize::try_from(expected_lengths.code) != Ok(code.len())
@@ -1291,7 +1352,6 @@ impl<'claim, 'view> LiveMappedWritePermit<'claim, 'view> {
             || source_page != generation.page()
             || !valid_source_page(source_page.raw(), self.claim.claim.guest_start)
             || generation.expected() != CodeGeneration::INITIAL
-            || generation.current() != CodeGeneration::INITIAL
             || !entry_offset.is_multiple_of(LIVE_ARENA_INSTRUCTION_BYTES as u32)
             || entry_offset >= self.claim.wire_lengths.code
         {
@@ -1299,7 +1359,10 @@ impl<'claim, 'view> LiveMappedWritePermit<'claim, 'view> {
         }
         validate_shared_initial_metadata(hot, cold, self.claim.wire_lengths.code)
             .map_err(|_| LivePrivateReason::InvalidRecord)?;
-        flush(local_rx.as_ptr().cast_const(), code.len());
+        after_metadata_validation();
+        if generation.current() != CodeGeneration::INITIAL {
+            return Err(LivePrivateReason::InvalidRecord);
+        }
         let code_sha256 = expected.code_sha256();
         Ok(LiveArenaWrittenBlock {
             storage_brand: self.claim.claim.arena.brand,
@@ -1605,7 +1668,7 @@ mod tests {
         reserved: &mut LiveReservedPublishClaim<'view>,
         prepared: &PreparedSharedInitial,
     ) -> (LiveArenaWrittenBlock<'view>, MappedPublicationFixture) {
-        let mut mapped = MappedPublicationFixture::from_claim(prepared, reserved.extents());
+        let mapped = MappedPublicationFixture::from_claim(prepared, reserved.extents());
         // SAFETY: this test fixture owns actual disjoint buffers whose lengths
         // resolve the claim's exact extents, and enters the permit once.
         let permit = unsafe { reserved.begin_mapped_write() }.expect("mapped permit");
@@ -1614,20 +1677,18 @@ mod tests {
         let observation = generations
             .observe(key().guest_va_start())
             .expect("INITIAL observation");
-        let local_rx = NonNull::new(mapped.code.as_mut_ptr()).expect("mapped code base");
-        // SAFETY: the fixture establishes the same exact certification
-        // contract used by the production process-view integration seam.
+        // SAFETY: the cfg(test) fixture exception establishes exact stable
+        // ranges for portable validation only; it is not production completion
+        // provenance for a claim-bound cache publication.
         let written = unsafe {
             permit.certify_mapped(
                 &mapped.code,
                 &mapped.hot,
                 &mapped.cold,
-                local_rx,
                 key().guest_va_start(),
                 0,
                 &observation,
                 prepared.expected_publication(),
-                |_, _| {},
             )
         }
         .expect("certify prepared mapped publication");
@@ -2408,7 +2469,7 @@ mod tests {
             let mut reserved = claim
                 .reserve(lengths.code, lengths.hot, lengths.cold)
                 .expect("reserve prepared extents");
-            let mut mapped = MappedPublicationFixture::from_claim(&prepared, reserved.extents());
+            let mapped = MappedPublicationFixture::from_claim(&prepared, reserved.extents());
             // SAFETY: the fixture owns exact disjoint buffers populated from the
             // real prepared publication and uses this permit only once.
             let permit = unsafe { reserved.begin_mapped_write() }.expect("mapped permit");
@@ -2420,7 +2481,6 @@ mod tests {
             let code_len = mapped.code.len() - usize::from(short_stream == 0);
             let hot_len = mapped.hot.len() - usize::from(short_stream == 1);
             let cold_len = mapped.cold.len() - usize::from(short_stream == 2);
-            let local_rx = NonNull::new(mapped.code.as_mut_ptr()).expect("mapped code base");
             // SAFETY: all arguments originate from the fixture's claim-derived
             // buffers; the selected stream is deliberately short, so the seam
             // must reject before treating it as a complete mapped publication.
@@ -2429,12 +2489,10 @@ mod tests {
                     &mapped.code[..code_len],
                     &mapped.hot[..hot_len],
                     &mapped.cold[..cold_len],
-                    local_rx,
                     key.guest_va_start(),
                     0,
                     &observation,
                     expected,
-                    |_, _| {},
                 )
             };
             assert!(matches!(result, Err(LivePrivateReason::InvalidRecord)));
@@ -2469,7 +2527,6 @@ mod tests {
             let observation = generations
                 .observe(key.guest_va_start())
                 .expect("INITIAL observation");
-            let local_rx = NonNull::new(mapped.code.as_mut_ptr()).expect("mapped code base");
             // SAFETY: the fixture establishes the mapping/lifetime contract;
             // content authentication is the behavior under test.
             let result = unsafe {
@@ -2477,12 +2534,10 @@ mod tests {
                     &mapped.code,
                     &mapped.hot,
                     &mapped.cold,
-                    local_rx,
                     key.guest_va_start(),
                     0,
                     &observation,
                     expected,
-                    |_, _| {},
                 )
             };
             assert!(matches!(result, Err(LivePrivateReason::InvalidRecord)));
@@ -2502,7 +2557,7 @@ mod tests {
         let mut reserved = claim
             .reserve(lengths.code, lengths.hot, lengths.cold)
             .expect("reserve prepared extents");
-        let mut mapped = MappedPublicationFixture::from_claim(&prepared, reserved.extents());
+        let mapped = MappedPublicationFixture::from_claim(&prepared, reserved.extents());
         // SAFETY: the fixture owns the exact disjoint ranges populated from
         // the real prepared publication and enters the permit only once.
         let permit = unsafe { reserved.begin_mapped_write() }.expect("mapped permit");
@@ -2514,7 +2569,6 @@ mod tests {
         generations
             .note_guest_code_write(key.guest_va_start()..GuestVa(key.guest_va_start().raw() + 4))
             .expect("advance source generation");
-        let local_rx = NonNull::new(mapped.code.as_mut_ptr()).expect("mapped code base");
         // SAFETY: the fixture establishes the mapping/lifetime contract; the
         // post-observation mutation is the refusal condition under test.
         let result = unsafe {
@@ -2522,12 +2576,10 @@ mod tests {
                 &mapped.code,
                 &mapped.hot,
                 &mapped.cold,
-                local_rx,
                 key.guest_va_start(),
                 0,
                 &observation,
                 expected,
-                |_, _| {},
             )
         };
 
@@ -2535,9 +2587,7 @@ mod tests {
     }
 
     #[test]
-    fn certification_flushes_exact_rx_range() {
-        use std::cell::Cell;
-
+    fn generation_change_after_metadata_validation_refuses_completion() {
         let arena = arena();
         let key = key();
         let prepared = prepared_publication();
@@ -2549,7 +2599,7 @@ mod tests {
         let mut reserved = claim
             .reserve(lengths.code, lengths.hot, lengths.cold)
             .expect("reserve prepared extents");
-        let mut mapped = MappedPublicationFixture::from_claim(&prepared, reserved.extents());
+        let mapped = MappedPublicationFixture::from_claim(&prepared, reserved.extents());
         // SAFETY: the fixture owns the exact disjoint ranges populated from
         // the real prepared publication and enters the permit only once.
         let permit = unsafe { reserved.begin_mapped_write() }.expect("mapped permit");
@@ -2558,31 +2608,29 @@ mod tests {
         let observation = generations
             .observe(key.guest_va_start())
             .expect("INITIAL observation");
-        let local_rx = NonNull::new(mapped.code.as_mut_ptr()).expect("mapped code base");
-        let flushed_pointer = Cell::new(std::ptr::null());
-        let flushed_len = Cell::new(0_usize);
-        // SAFETY: the fixture establishes the complete mapping/lifetime
-        // contract and the callback records the exact requested flush range.
+        // SAFETY: the fixture establishes the mapping/lifetime contract. The
+        // private hook deterministically mutates generation only after exact
+        // metadata validation, which is the race under test.
         let result = unsafe {
-            permit.certify_mapped(
+            permit.certify_mapped_after_metadata_for_test(
                 &mapped.code,
                 &mapped.hot,
                 &mapped.cold,
-                local_rx,
                 key.guest_va_start(),
                 0,
                 &observation,
                 expected,
-                |pointer, len| {
-                    flushed_pointer.set(pointer);
-                    flushed_len.set(len);
+                || {
+                    generations
+                        .note_guest_code_write(
+                            key.guest_va_start()..GuestVa(key.guest_va_start().raw() + 4),
+                        )
+                        .expect("advance source generation after metadata validation");
                 },
             )
         };
 
-        assert!(result.is_ok());
-        assert_eq!(flushed_pointer.get(), local_rx.as_ptr().cast_const());
-        assert_eq!(flushed_len.get(), mapped.code.len());
+        assert!(matches!(result, Err(LivePrivateReason::InvalidRecord)));
     }
 
     #[test]
@@ -2599,7 +2647,7 @@ mod tests {
         let mut first_reserved = first_claim
             .reserve(lengths.code, lengths.hot, lengths.cold)
             .expect("reserve first extents");
-        let mut mapped = MappedPublicationFixture::from_claim(&prepared, first_reserved.extents());
+        let mapped = MappedPublicationFixture::from_claim(&prepared, first_reserved.extents());
         // SAFETY: the fixture establishes the complete mapped contract for the
         // first claim and enters its permit exactly once.
         let permit = unsafe { first_reserved.begin_mapped_write() }.expect("mapped permit");
@@ -2608,19 +2656,16 @@ mod tests {
         let observation = generations
             .observe(key.guest_va_start())
             .expect("INITIAL observation");
-        let local_rx = NonNull::new(mapped.code.as_mut_ptr()).expect("mapped code base");
         // SAFETY: exact bytes and metadata come from the real prepared value.
         let written = unsafe {
             permit.certify_mapped(
                 &mapped.code,
                 &mapped.hot,
                 &mapped.cold,
-                local_rx,
                 key.guest_va_start(),
                 0,
                 &observation,
                 expected,
-                |_, _| {},
             )
         }
         .expect("certify first mapped write");

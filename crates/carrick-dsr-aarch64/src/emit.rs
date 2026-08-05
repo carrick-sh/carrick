@@ -151,8 +151,13 @@ pub struct PreparedSharedInitial {
     lengths: SharedInitialLengths,
 }
 
-/// Opaque expected-byte authority derived from one real prepared shared
-/// publication. It has no caller constructor and is intentionally non-Clone.
+/// Opaque expected-byte authority derived from one real, post-prebinding
+/// prepared shared publication. It has no caller constructor and is
+/// intentionally non-Clone. Its only valid certification use accompanies the
+/// same [`PreparedSharedInitial`] after that value is consumed exactly once
+/// into the exact claim-bound translation cache, with exact cache-used delta
+/// and the real host publisher flush complete. The cache and every emitted
+/// address-bearing value must then be dropped before certification begins.
 pub struct ExpectedLivePublication {
     lengths: SharedInitialLengths,
     code_sha256: [u8; 32],
