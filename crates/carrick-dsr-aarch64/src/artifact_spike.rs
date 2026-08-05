@@ -1085,6 +1085,51 @@ impl SharedInitialMetadata {
     }
 }
 
+/// Exact production validation for one mapped shared-INITIAL metadata pair.
+/// Both streams must decode completely and retain only immutable shared
+/// publication shapes whose offsets fit the logical code extent.
+pub(crate) fn validate_shared_initial_metadata(
+    hot_bytes: &[u8],
+    cold_bytes: &[u8],
+    code_len: u32,
+) -> Result<(), DsrError> {
+    let config = bincode::config::standard().with_limit::<SHARED_INITIAL_METADATA_LIMIT>();
+    let (hot, hot_consumed): (UnitBlockHotWire, usize) =
+        bincode::serde::decode_from_slice(hot_bytes, config).map_err(|error| {
+            DsrError::CachePolicy(format!("decode live shared INITIAL HOT metadata: {error}"))
+        })?;
+    if hot_consumed != hot_bytes.len() {
+        return Err(DsrError::CachePolicy(
+            "live shared INITIAL HOT metadata has trailing bytes".to_string(),
+        ));
+    }
+    let (cold, cold_consumed): (UnitBlockColdWire, usize) =
+        bincode::serde::decode_from_slice(cold_bytes, config).map_err(|error| {
+            DsrError::CachePolicy(format!("decode live shared INITIAL COLD metadata: {error}"))
+        })?;
+    if cold_consumed != cold_bytes.len() {
+        return Err(DsrError::CachePolicy(
+            "live shared INITIAL COLD metadata has trailing bytes".to_string(),
+        ));
+    }
+    if hot.relocations.is_empty()
+        && hot.direct_links.is_empty()
+        && hot.trusted_entry
+            == Some(TrustedEntryTemplate {
+                offset: 0,
+                expected: 0,
+            })
+    {
+        let template = ArtifactTemplate::from_unit_wire_parts(hot, cold);
+        if template.replay_metadata_fits_code_len(code_len) {
+            return Ok(());
+        }
+    }
+    Err(DsrError::CachePolicy(
+        "live shared INITIAL metadata is not an exact immutable block shape".to_string(),
+    ))
+}
+
 impl ArtifactRecording {
     /// Record the trusted second entry point the emitter placed past the
     /// generation guard. At most one per block.
@@ -3099,5 +3144,29 @@ mod tests {
 
         assert!(stored.matches_source(&stored.source_words));
         assert!(!stored.matches_source(&colliding_source));
+    }
+
+    #[test]
+    fn metadata_validation_requires_exact_consumption() {
+        let hot = UnitBlockHotWire {
+            relocations: Vec::new(),
+            trusted_entry: Some(TrustedEntryTemplate {
+                offset: 0,
+                expected: 0,
+            }),
+            direct_links: Vec::new(),
+        };
+        let cold = UnitBlockColdWire {
+            map: Vec::new(),
+            recovery: PortableRecoveryMetadata::default(),
+        };
+        let mut hot_bytes = bincode::serde::encode_to_vec(&hot, bincode::config::standard())
+            .expect("encode valid shared HOT fixture");
+        let cold_bytes = bincode::serde::encode_to_vec(&cold, bincode::config::standard())
+            .expect("encode valid shared COLD fixture");
+        assert!(validate_shared_initial_metadata(&hot_bytes, &cold_bytes, 4).is_ok());
+
+        hot_bytes.push(0);
+        assert!(validate_shared_initial_metadata(&hot_bytes, &cold_bytes, 4).is_err());
     }
 }

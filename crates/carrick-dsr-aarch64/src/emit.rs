@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicU64;
 
 use carrick_guest_mem::{GuestVa, HostVa};
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, VecAssembler, aarch64::Aarch64Relocation};
+use sha2::{Digest, Sha256};
 
 use super::artifact_spike::{
     ArtifactRecord, ArtifactRecording, GatewayKind, MaterializedValue, ProcessValue,
@@ -150,6 +151,34 @@ pub struct PreparedSharedInitial {
     lengths: SharedInitialLengths,
 }
 
+/// Opaque expected-byte authority derived from one real prepared shared
+/// publication. It has no caller constructor and is intentionally non-Clone.
+pub struct ExpectedLivePublication {
+    lengths: SharedInitialLengths,
+    code_sha256: [u8; 32],
+    hot_sha256: [u8; 32],
+    cold_sha256: [u8; 32],
+}
+
+impl ExpectedLivePublication {
+    pub(crate) const fn lengths(&self) -> SharedInitialLengths {
+        self.lengths
+    }
+
+    pub(crate) fn matches(&self, code: &[u8], hot: &[u8], cold: &[u8]) -> bool {
+        usize::try_from(self.lengths.code) == Ok(code.len())
+            && usize::try_from(self.lengths.hot) == Ok(hot.len())
+            && usize::try_from(self.lengths.cold) == Ok(cold.len())
+            && <[u8; 32]>::from(Sha256::digest(code)) == self.code_sha256
+            && <[u8; 32]>::from(Sha256::digest(hot)) == self.hot_sha256
+            && <[u8; 32]>::from(Sha256::digest(cold)) == self.cold_sha256
+    }
+
+    pub(crate) const fn code_sha256(&self) -> [u8; 32] {
+        self.code_sha256
+    }
+}
+
 impl PreparedSharedInitial {
     pub const fn lengths(&self) -> SharedInitialLengths {
         self.lengths
@@ -172,6 +201,17 @@ impl PreparedSharedInitial {
     /// adds the claim-bound, same-view Darwin target capability.
     pub fn link_candidates(&self) -> &[DirectLink] {
         &self.assembled.direct_links
+    }
+
+    /// Captures the exact post-prebinding bytes that one mapped publication
+    /// must later certify. The proof owns only lengths and digests.
+    pub fn expected_publication(&self) -> ExpectedLivePublication {
+        ExpectedLivePublication {
+            lengths: self.lengths,
+            code_sha256: Sha256::digest(self.code_bytes()).into(),
+            hot_sha256: Sha256::digest(self.hot_bytes()).into(),
+            cold_sha256: Sha256::digest(self.cold_bytes()).into(),
+        }
     }
 
     pub fn publish(mut self, cache: &mut TranslationCache) -> Result<EmittedBlock, DsrError> {
@@ -7288,6 +7328,23 @@ mod tests {
                 .expect("publish prepared block");
             assert_eq!(emitted.len() as u64, lengths.code);
             assert_eq!(cache.used_bytes(), before + emitted.len());
+        }
+
+        #[test]
+        fn expected_publication_tracks_real_prepared_bytes() {
+            let prepared =
+                prepare_shared_initial(&copy_plan(), EmitAddressMode::Direct, Vec::new())
+                    .expect("prepare shared INITIAL fixture");
+            let expected = prepared.expected_publication();
+            assert!(expected.matches(
+                prepared.code_bytes(),
+                prepared.hot_bytes(),
+                prepared.cold_bytes(),
+            ));
+
+            let mut corrupt_code = prepared.code_bytes().to_vec();
+            corrupt_code[0] ^= 0xff;
+            assert!(!expected.matches(&corrupt_code, prepared.hot_bytes(), prepared.cold_bytes(),));
         }
 
         #[test]
