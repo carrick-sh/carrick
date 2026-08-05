@@ -350,9 +350,14 @@ No imported ratio, traced elapsed time, or Docker time enters the census.
 
 `jit-shape-compare` consumes two accepted v3 censuses and emits
 `carrick.jit-shape-comparison.v1`. It requires the same capture source, signed
-binary, D program, image digest, exact target argv, sampling frequency, and
-classifier binary/schema. Run IDs, raw hashes, and snapshot manifests must be
-different. It rejects duplicate captures and determinant drift.
+binary, host, OS build, D program, image digest, exact target argv, sampling
+frequency, and classifier binary/schema. Each arm's birth and terminal
+launch-qualification receipt hashes are independently validated provenance.
+They are not cross-arm equality determinants: those receipts authenticate
+per-run PIDs, timestamps, raw
+evidence, and trace report. Run IDs, raw hashes, and snapshot manifests must be
+different. It rejects duplicate captures and drift in the named stable
+determinants.
 
 The measurement commands therefore keep target argv byte-identical across A
 and B; per-capture host run IDs and artifact paths stay outside target argv.

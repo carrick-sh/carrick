@@ -776,7 +776,7 @@ JitShapeCompare {
 },
 ```
 
-Build two valid synthetic v3 censuses and mutate one determinant per test. Require equality of capture Git HEAD, capture executable SHA, D template SHA, image canonical digest reference, exact target argv and argv SHA, sampling frequency, classifier schema, census Git HEAD, and census executable SHA. Require inequality of run IDs, capture-receipt hashes, raw hashes, and snapshot manifests.
+Build two valid synthetic v3 censuses and mutate one determinant per test. Require equality of capture Git HEAD, capture executable SHA, D template SHA, image canonical digest reference, exact target argv and argv SHA, sampling frequency, classifier schema, census Git HEAD, and census executable SHA. Independently validate each arm's birth and terminal launch-qualification receipt hashes, preserve both exact values in the comparison, and do not require those per-run provenance hashes to be equal. Require inequality of run IDs, capture-receipt hashes, raw hashes, and snapshot manifests.
 
 Reject identical files, v1/v2 census schemas, missing rows, duplicate rows, row population mismatches, and a determinant mismatch even when all numerical shares agree. A rejected capture is structurally impossible inside v3: the census constructor already requires one strict canonical accepted receipt, and the comparator trusts only independently complete canonical v3 objects rather than adding a forgeable outcome flag or a second receipt interpretation.
 
@@ -926,7 +926,7 @@ If implementation code did not change, do not create an empty commit. If a live-
 
 **Step 1: Freeze determinants before capture A**
 
-Require a clean tree. Record exact Git HEAD, signed binary SHA-256, Darwin build, hostname, digest-pinned image, exact target argv, D-template SHA-256, launch-qualification hashes, sampling frequency, and classifier schema. Create fresh, separately named `target/perf/native-shape-go-build-v1/a` and `b` artifact roots; neither snapshot directory may preexist.
+Require a clean tree. Record exact Git HEAD, signed binary SHA-256, Darwin build, hostname, digest-pinned image, exact target argv, D-template SHA-256, each arm's independently validated launch-qualification hashes, sampling frequency, and classifier schema. Treat source, binary, host/OS, image, argv, D template, sampling frequency, and classifier as stable equality determinants; launch-qualification receipt hashes are per-run provenance and may differ. Create fresh, separately named `target/perf/native-shape-go-build-v1/a` and `b` artifact roots; neither snapshot directory may preexist.
 
 Use the controller's existing cold-build command with a fixed guest path that is synchronously removed before each run. Keep A and B target argv byte-identical. `CARRICK_RUN_ID` and host artifact paths remain outside target argv.
 
@@ -944,7 +944,7 @@ If A rejects, preserve its artifacts, diagnose the named evidence error, and do 
 
 **Step 3: Run capture B serially**
 
-Repeat Step 2 with B paths and a different nonempty run ID. Do not rebuild, edit source, change command argv, change image, or run Docker between A and B. Reject any determinant drift.
+Repeat Step 2 with B paths and a different nonempty run ID. Do not rebuild, edit source, change command argv, change image, or run Docker between A and B. Reject stable determinant drift. Validate B's birth and terminal launch-qualification receipt hashes independently without requiring them to equal A's per-run receipt hashes.
 
 **Step 4: Compare and independently regenerate**
 
