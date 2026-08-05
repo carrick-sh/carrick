@@ -12,7 +12,8 @@ unchanged private translator.
 
 **Proven bases:** Task 4 is complete through `1cb7489e`; Task 5 is complete
 through `e6661fe5`; Task 6A is independently review-clean through `a7fa2883`.
-Task 6B is the active slice.
+Task 6B1 is independently review-clean through `0bb50612`; Task 6B2 is the
+active slice.
 
 ## Preflight corrections
 
