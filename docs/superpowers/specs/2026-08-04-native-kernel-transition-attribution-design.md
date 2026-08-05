@@ -2,9 +2,9 @@
 
 Date: 2026-08-04
 
-Status: direction approved; this written design is the review checkpoint before
-implementation planning. No implementation is authorized by this document
-alone.
+Status: deferred after feasibility review. This remains a durable diagnostic
+design, but no implementation or implementation planning is currently
+authorized.
 
 ## 1. Decision
 
@@ -27,10 +27,13 @@ an optimization.
 Every transition PC is resolved after capture against the authenticated host
 image catalog or the exact own/inherited JIT snapshot that covered the process
 image when the event occurred. JIT words are decoded by the existing Rust
-NativeShape classifier. Every kernel PC is retained as an address and resolved
-against the live kernel-symbol overlay plus a matching KDK image/dSYM; exact
-instruction bytes and all same-address aliases are preserved so a convenient
-symbolizer name cannot become the diagnosis.
+NativeShape classifier only when the word is immutable. Any code-cache
+unconditional `B` word is conservatively retained as
+`potentially-mutable-b` and cannot be interpreted from final bytes. Every
+kernel PC is retained as an address and resolved against the live kernel-symbol
+overlay plus a matching KDK image/dSYM; exact instruction bytes and all
+same-address aliases are preserved so a convenient symbolizer name cannot
+become the diagnosis.
 
 Two accepted cold-build captures from one frozen signed binary decide the
 result. A source-distinct, non-overlapping mechanism may advance only when it
@@ -41,10 +44,12 @@ without a runtime patch.
 
 ## 2. Why this profile is required
 
-The current cold Go-build authority remains 8,254 Carrick total CPU-seconds
-against 811 Docker CPU-seconds, or 10.1776x. Nothing in this design changes that
-score. The next stable unattributed population is the native-wall
-`kernel-non-syscall` category:
+The current cold Go-build authority remains 8,254 ms of Carrick workload wall
+against 811 ms of Docker workload wall, or 10.1776x. Nothing in this design
+changes that score. Carrick's process-tree CPU was roughly 20.2 s; Docker's
+recorded CPU covers only the host wrapper, so neither the millisecond score nor
+the ratio may be relabeled as CPU time. The next stable unattributed population
+is the native-wall `kernel-non-syscall` category:
 
 - capture A: 20.2712% of all sampled CPU;
 - capture B: 19.9012% of all sampled CPU.
@@ -221,8 +226,8 @@ shape and records:
 - exact image digest, target argv, argv SHA-256, allowed environment, and native
   backend semantics;
 - persistent translation-store normalized-content receipt and workload
-  determinant receipt; and
-- birth and terminal launch-qualification receipt hashes; and
+  determinant receipt;
+- birth and terminal launch-qualification receipt hashes;
 - the matching transition-provider qualification receipt hash.
 
 Unknown ambient `CARRICK_*` variables fail before launch. Output paths, run ID,
@@ -233,8 +238,11 @@ determinants.
 
 The profile samples at 997 Hz, matching NativeShape's sampling rate. The traced
 target is admitted in a pending-launch identity before it runs; every child is
-admitted in a pending-fork identity at `proc:::create`. Every tick for that full
-live process tree contributes exactly once to one of:
+admitted in a pending-fork identity at `proc:::create`. Darwin's provider also
+fires for thread creation, so a process edge requires
+`args[0]->pr_pid != pid`. A same-PID event neither consumes a fork ID nor admits
+a child; treating it as a process edge is a lifecycle violation. Every tick for
+that full live process tree contributes exactly once to one of:
 
 ```text
 all_cpu = user_cpu + kernel_cpu + invalid_cpu
@@ -258,6 +266,22 @@ reports both:
 Pre-ready work is real product work. It may resolve only to an authenticated
 host image or epoch-zero state; it is never dropped to make transition-PC
 coverage pass.
+
+The target CLI currently announces `host-process-birth` before the native
+translator later publishes its host base/catalog. That gap is too late for this
+profile's full-tree denominator. When this profile is enabled, the initial CLI,
+each post-fork child, and each self-reexec entry therefore publish their own
+exact Carrick base and a profile-specific dyld image catalog immediately after
+their birth announcement and before translated-range activation. Unlike the
+existing native-wall catalog, whose intentional path filter excludes
+`/usr/lib/dyld`, this envelope covers every executable range of every loaded
+Mach-O image and records path, UUID, slide, range, file identity, and content
+SHA-256. This is required because pending launch samples can execute in dyld
+before `run_cli` announces birth. The publication helpers keep the ordinary
+disabled-probe path at a branch; the complete walk and hashing occur only for
+this traced profile. Pending pre-ready rows may bind to the later catalog only
+under the same exact birth/image key. A catalog from a descendant, another PID,
+or a later image is never reverse-inferred.
 
 The existing balanced BSD-syscall state machine classifies each kernel sample
 at sample time. Every entry must close by return or an explicit thread/process
@@ -313,14 +337,22 @@ count-only because its private address argument is not qualified.
 
 The existing native launch birth/terminal qualifications must pass before
 launch. `carrick debug native-kernel-transition-qualify` then runs the exact
-`bigallocfree` fixture under the bundled program and atomically publishes this
-profile's provider receipt. On the exact OS build, boot, qualification binary,
-D program, probe binary, and arguments it proves that `vminfo:::as_fault` fires
-for the scoped target and that `uregs[R_PC]` resolves to the expected touch
-instruction. A primary capture requires that receipt through
-`--transition-provider-receipt` and rejects any host/boot/program drift. This
-profile uses no private `vminfo` address argument, so it imports no `arg2`
-page-address claim from native-fault.
+`bigallocfree` fixture under a qualification-only rendering of the bundled D
+template and atomically publishes this profile's provider receipt. That command
+is explicitly exempt from a preexisting transition-provider receipt; otherwise
+qualification would be circular. It authenticates and records the immutable D
+template hash before substitution, the rendered qualification-program hash,
+and the exact OS build, boot, qualification binary, probe binary, and arguments.
+It proves that `vminfo:::as_fault` fires for the scoped target and that
+`uregs[R_PC]` resolves to the expected touch instruction.
+
+A primary capture requires the resulting receipt through
+`--transition-provider-receipt`, authenticates its template hash before
+substituting the receipt into the primary header/program, and records both the
+receipt hash and final rendered-program hash. Any host, boot, template,
+rendering, fixture, or binary drift rejects. This profile uses no private
+`vminfo` address argument, so it imports no `arg2` page-address claim from
+native-fault.
 
 All tracked fault events reconcile:
 
@@ -342,8 +374,8 @@ The raw identity is the established immutable `ProcessBirthKey`:
 
 The initial target's prebirth samples/events are keyed by one pending launch ID
 and bind to its first checked `host-process-birth`. Children are admitted only
-by `proc:::create`; their prebirth rows use a unique pending fork ID carrying
-the parent birth key and fork frontier. Successful exec increments
+by a distinct-PID `proc:::create`; their prebirth rows use a unique pending fork
+ID carrying the parent birth key and fork frontier. Successful exec increments
 `image_generation`; failed exec restores the prior image state. Runtime
 JIT-catalog epochs nest beneath the process image and reset/replay according to
 the native-wall range authority.
@@ -393,40 +425,82 @@ process_birth_key = (pid, start_sec, start_usec)
 image_generation
 runtime_epoch
 fragment_sequence
-reason = host-self-reexec-attempt | in-process-exec | process-exit
+reason = host-self-reexec-attempt | in-process-exec-pre-reset | process-exit
 cache_base
 published_code_len
 code_sha256
 ordered_guest_to_cache_blocks
+ordered_published_extents
 ```
 
-The runtime's current code cache is append-only within one process image. A
-snapshot is a complete immutable published prefix, not a mutable live-memory
-view. The profile requests an export at each possible image-retirement seam:
+`ordered_guest_to_cache_blocks` is the active lookup map at the fragment. The
+append-only `ordered_published_extents` contains every private cache extent ever
+published in the image, including a block later invalidated from the active
+map.
+
+The private code-cache **extent** is bump-allocated and append-only within one
+process image, but its bytes are not all immutable. The only production calls
+to `TranslationCache::patch_code_word` install a direct link or restore that
+slot to the unpatched `b +1` word. Both old and new encodings are AArch64
+unconditional-immediate `B` words (`word & 0xfc00_0000 == 0x1400_0000`).
+
+Version 1 uses that source-proved conservative boundary instead of adding a new
+hot-path observer: every JIT `B` word is `potentially-mutable-b`, even when it
+was actually a fixed guest/Carrick branch, and every non-`B` word is immutable
+under the current two-call-site audit. Final snapshot bytes are event-time
+authority only for the immutable population. A potentially mutable row is
+range-authoritative but gets no event-time word interpretation. The capture
+records the exact audited `patch_code_word` call-site set/source hash; any new
+production call site invalidates this contract and fails the source gate.
+
+This deliberately over-classifies rather than instrumenting every patch or
+copying instructions from DTrace's hot path. It adds zero runtime work to the
+ordinary binary. The conservative `potentially-mutable-b` total is reconciled
+as coverage, not grouped as a source opportunity. If it crosses the mechanical
+threshold while no immutable source candidate carries, the comparison may call
+for a separate mutation-timeline redesign.
+
+The profile requests a snapshot export at each possible image-retirement seam:
 
 - immediately before the final host `execve` callback;
-- at the successful in-process-exec commit; and
+- after `prepare_reset_after_fork_for_exec` validates the in-process replacement
+  but immediately before its point-of-no-return commit clears the outgoing
+  translator cache; and
 - at final process exit.
+
+The in-process export cannot wait for the successful handoff: the current
+replacement path clears published indexes and resets the private cache cursor
+at that point of no return. A later profile-gated
+`in-process-exec-commit` record terminalizes the already-written outgoing
+fragment only after the replacement mapping and process-state handoff complete.
+A pre-PONR failure leaves the fragment nonterminal and the old image live. Any
+post-PONR failure is already fatal to the guest and makes the capture invalid;
+it cannot publish partial replacement authority.
 
 A host `execve` attempt can fail after its pre-call snapshot. In that case the
 same image remains live, the fragment is nonterminal, and any later fragment
-must contain it as a byte-for-byte/block-for-block prefix. A same-PID
-`exec-success` makes the immediately preceding attempt fragment terminal for
-the outgoing image. An `exec-failure` followed by no later terminal snapshot
-rejects the capture. This uses the existing append-only publication contract
-without deleting or rewriting evidence.
+must preserve its published extents and non-`B` bytes as an exact prefix;
+`potentially-mutable-b` words may differ. A same-PID `exec-success` makes the
+immediately preceding attempt fragment terminal for the outgoing image. An
+`exec-failure` followed by no later terminal snapshot rejects the capture. This
+uses the actual extent/mutation contracts without deleting or rewriting
+evidence.
 
-Fork inheritance records the exact parent image/runtime and published block
-frontier. The child's first image may resolve inherited PCs only through that
-latched prefix; later parent publication is not retroactively inherited. Every
-own event resolves against the terminal/superseding snapshot for its exact
-birth/image/runtime key.
+Immediately before a production fork, the profile-gated runtime publishes a
+low-rate frontier containing parent image/runtime, published code length,
+and published-extent count. Fork inheritance latches that frontier without
+copying the code payload. The child's first image may resolve inherited PCs only
+within that prefix; later parent publication is not retroactively inherited.
+Potentially mutable `B` words stay non-authoritative regardless of whether the
+parent or child changed them after the fork. Every own event resolves against
+the terminal/superseding snapshot for its exact birth/image/runtime key.
 
 The new manifest authenticates every file path, envelope, length, SHA-256,
-range, fragment sequence, prefix relation, generation, ancestry frontier, and
-final block count. Missing exports or prefix/lifecycle contradictions reject
-the receipt. Export failures may remain nonfatal to guest execution, but they
-can never yield an accepted trace.
+range, fragment sequence, non-`B` immutable-prefix relation, generation,
+ancestry frontier, source call-site audit, and final block count.
+Missing exports or prefix/lifecycle contradictions reject the receipt. Export
+failures may remain nonfatal to guest execution, but they can never yield an
+accepted trace.
 
 Implementation shares NativeShape's tested code-payload decoder, exact word
 reader, range checks, manifest hashing primitives, and instruction classifier.
@@ -452,14 +526,18 @@ Every pre-transition user PC receives exactly one top-level resolution:
 
 JIT range joins precede Mach-O image ownership because the cache is anonymous
 `MAP_JIT`. Multiple JIT matches, multiple image matches, an own/inherited
-conflict, or an event in a retired mapping rejects the census. Accepted primary
-captures require `unresolved == 0` and `invalid == 0` for both non-syscall CPU
-rows and exact `as_fault` rows.
+conflict, or an event in a retired mapping rejects the census. A resolved JIT
+row additionally receives
+`word_authority = immutable | potentially-mutable-b`. Accepted primary captures
+require `unresolved == 0` and `invalid == 0` for both non-syscall CPU rows and
+exact `as_fault` rows; `potentially-mutable-b` remains a complete explicit
+population but cannot carry an exact-word diagnosis.
 
 ### 7.3 JIT instruction classification
 
-For a JIT PC, the census reads the exact four-byte AArch64 word from the joined
-snapshot and uses NativeShape's Rust classification precedence. It reports:
+For an immutable JIT PC, the census reads the exact four-byte AArch64 word from
+the joined snapshot and uses NativeShape's Rust classification precedence. It
+reports:
 
 - snapshot identity and module-relative instruction offset;
 - exact instruction word and disassembly;
@@ -469,6 +547,11 @@ snapshot and uses NativeShape's Rust classification precedence. It reports:
   `guest-descriptive`); and
 - the emitter/source audit status.
 
+For a `potentially-mutable-b` JIT PC, those event-time
+word/disassembly/family fields are null. The row may report the final diagnostic
+word separately under a non-authoritative label. Potentially mutable rows are
+neither silently dropped nor carried or source-grouped using final bytes.
+
 An `inserted-exact` label is not automatically removable. An exact trusted
 transfer or context access may implement a required guest invariant. Conversely,
 an `exact-ambiguous` or guest-descriptive word cannot select a Carrick patch
@@ -476,11 +559,12 @@ merely because it is frequent. The carry gate in section 11 remains mandatory.
 
 ### 7.4 Host instruction classification
 
-For a Mach-O PC, the census records image UUID, image-relative offset, exact
-instruction bytes, symbol/range when available, and Rust source location only
-when it can be bound to the frozen capture source. ASLR addresses are preserved
-as provenance but normalized offsets are comparison keys. A dylib leaf cannot
-be relabeled as its presumed Carrick caller.
+For a Mach-O PC, the census first authenticates the catalog's path, UUID, file
+identity, and content hash against the capture-side Mach-O receipt, then records
+image-relative offset, exact instruction bytes, symbol/range when available,
+and Rust source location only when it can be bound to the frozen capture source.
+ASLR addresses are preserved as provenance but normalized offsets are comparison
+keys. A dylib leaf cannot be relabeled as its presumed Carrick caller.
 
 ## 8. Kernel-PC authority
 
@@ -488,31 +572,40 @@ be relabeled as its presumed Carrick caller.
 
 After DTrace stops naturally but before the live symbolizer handle is released,
 the existing post-stop callback obtains a sampled-kernel overlay for every
-distinct kernel PC. The requested and resolved address sets and their SHA-256
-digests must reconcile with the raw population. A missing or raw-address-only
-lookup rejects the capture.
+distinct kernel PC. Its resolved and unresolved sets must exactly partition the
+requested raw population, and their counts and SHA-256 digests must reconcile.
+The overlay deliberately has kernel/boot identity and per-address symbol
+results but no object catalog: live libdtrace reports the observed
+`mach_kernel` text size as zero, and Carrick intentionally refuses to publish a
+plausible object-range schema from that state. An unresolved per-PC lookup is
+preserved, not fatal by itself, because the exact KDK resolver below owns final
+address and byte resolution.
 
 The offline census then binds that live overlay to the caller-supplied KDK:
 
 1. kernel product/build/compatible CPU type/UUID must match the capture
    authority; literal `arm64` versus `arm64e` subtype spelling is not an
    identity mismatch when the kernel UUID is exact;
-2. the live libdtrace kernel-object text range and the KDK Mach-O `__TEXT`
-   virtual address derive one KASLR slide;
-3. at least two unambiguous exported-symbol anchors independently reproduce
-   that same slide;
-4. subtracting that slide must place every sampled PC inside the exact KDK
-   executable text range;
+2. each resolved live symbol name is canonicalized only for Darwin's one
+   leading-underscore convention and matched against the KDK/dSYM symbol
+   tables; a name is anchor-eligible only when it denotes one distinct KDK
+   address, with multiple aliases at that same address remaining legal;
+3. at least two eligible anchors with distinct live and KDK symbol starts must
+   independently produce the same KASLR slide, and every other eligible anchor
+   must agree rather than being silently excluded;
+4. subtracting that slide must place every sampled raw PC and resolved live
+   symbol start inside the exact KDK executable text range;
 5. the four-byte word at every normalized PC is read from the authenticated KDK
    Mach-O image; and
 6. the dSYM contributes all public and local symbol ranges that contain or
    alias that address, plus DWARF source location when present.
 
-A missing live object range, fewer than two anchor cross-checks, inconsistent
-slides, UUID/build drift, a PC outside text, missing bytes, or a KDK/dSYM
-mismatch rejects the census. The implementation is Rust; manual `nm`, `otool`,
-or `lldb` transcripts may qualify the design but are not the published
-authority.
+Fewer than two distinct eligible anchors, inconsistent slides, UUID/build
+drift, a PC or resolved symbol start outside text, missing bytes, or a KDK/dSYM
+mismatch rejects the census. A live name that maps to several distinct KDK
+addresses is recorded as ineligible, not chosen heuristically. The
+implementation is Rust; manual `nm`, `otool`, or `lldb` transcripts may qualify
+the design but are not the published authority.
 
 The read-only design check on 2026-08-04 found live `kern.osversion`
 `26A5388g` and kernel UUID `EC2DBF2E-ACDC-31C7-98F7-ECDFC6127685`; both the
@@ -617,7 +710,16 @@ rows and may additionally group only under stable, source-auditable keys:
 - host code: `(image UUID, image-relative offset, exact word)`;
 - kernel code: `(kernel UUID, text-relative offset, exact word)`; and
 - JIT code: exact instruction word plus complete NativeShape family/operand
-  identity and one audited emitter/source mechanism.
+  identity and one audited emitter/source mechanism; this key is valid only for
+  immutable words.
+
+The comparison separately reconciles the coarse
+`potentially_mutable_b_cpu / all_cpu` coverage population in each arm. That
+aggregate has no source identity and can never satisfy `CARRY`. If it meets the
+same 10%/five-percentage-point mechanical gate, no immutable source candidate
+carries, and all other authority checks pass, it produces `REDESIGN` for a
+separate temporal design rather than pretending unrelated branches form one
+mechanism.
 
 No default grouping combines different kernel PCs, different host source
 locations, exact-ambiguous guest occurrences, or several distinct emitter
@@ -662,11 +764,14 @@ following:
 3. no member overlaps another carried or already-closed mechanism;
 4. the observed transition instruction is Carrick-authored/removable rather
    than required guest work or an address-only coincidence;
-5. removing or compacting it preserves guest register, memory, fault, signal,
+5. every JIT member has immutable event-time word authority; a
+   `potentially-mutable-b` member requires a separately approved temporal
+   design;
+6. removing or compacting it preserves guest register, memory, fault, signal,
    fork, exec, publication, and recovery semantics;
-6. the change does not add an ordinary-path tax or a permanent second runtime
+7. the change does not add an ordinary-path tax or a permanent second runtime
    path; and
-7. it remains useful for dynamic/JIT-on-JIT execution even if eager translation
+8. it remains useful for dynamic/JIT-on-JIT execution even if eager translation
    is implemented later.
 
 Exact `as_fault` alignment with the CPU owner strengthens the mechanism finding
@@ -677,8 +782,9 @@ probe or closes that interpretation.
 If a dominant transition row is guest-only load/store/fill work, diffuse across
 unrelated source mechanisms, or removable only by weakening guest-visible
 semantics, the result is `STOP`, not permission to patch around the gate. If no
-source group survives all seven checks, the kernel-transition line closes and
-the campaign moves to the next independently sized bucket.
+source group survives all eight checks and the coarse mutable-`B` population
+does not require `REDESIGN`, the kernel-transition line closes and the campaign
+moves to the next independently sized bucket.
 
 Any carried mechanism receives its own approved design, red-first correctness
 proof, normal-path implementation with an explicit control, traced mechanism
@@ -697,9 +803,10 @@ enough to create a large, known anonymous first-touch population. The probe's
 
 The qualification command accepts the exact built probe path and explicit size
 and iteration values, runs it through the same signed Carrick trace path, and
-writes `carrick.native-kernel-transition-provider.v1`. Its receipt is scoped to
-the current boot and cannot be reused after the program, probe, kernel, KDK, or
-D template changes.
+writes `carrick.native-kernel-transition-provider.v1`. It needs the existing
+birth/terminal receipts but no transition-provider receipt. Its receipt is
+scoped to the current boot and cannot be reused after the qualification
+rendering, program, probe, kernel, KDK, or immutable D template changes.
 
 Before the profile can measure the primary workload, the fixture must prove:
 
@@ -742,6 +849,9 @@ comparison emits exactly one of:
 - `CARRY`: one or more mechanically crossing rows exist, followed by an ordered
   source-audit table that names which single highest-ranked source mechanism may
   receive a separate design;
+- `REDESIGN`: no immutable source candidate carries, but the separately
+  reconciled potentially-mutable-`B` coverage population meets the mechanical
+  gate and requires temporal evidence before source grouping;
 - `STOP`: no mechanically crossing source-distinct removable mechanism exists;
   or
 - `INVALID`: authority, coverage, stability, or reconciliation failed and no
@@ -759,8 +869,9 @@ Implementation is red-first and must cover:
 1. profile vocabulary, CLI constraints, sudo reconstruction, D-program hashing,
    clean-source/binary authority, and exact native-target parsing;
 2. D compiler contracts for `uregs[R_PC]`, `arg0`, tracer exclusion,
-   process-tree admission, balanced syscall state, unbalanced Mach-trap
-   exclusion, and natural completion;
+   distinct-PID process-tree admission, same-PID thread-create rejection,
+   balanced syscall state, unbalanced Mach-trap exclusion, and natural
+   completion;
 3. strict `NKTRANS1` ordering, unknown/duplicate/missing/truncated records,
    checked overflow, every arithmetic reconciliation, and zero samples;
 4. each DTrace interruption/drop counter independently rejecting a capture;
@@ -768,19 +879,25 @@ Implementation is red-first and must cover:
    exec success/failure, epoch zero, runtime replay, and terminal closure;
 6. raw/snapshot/receipt substitution, manifest hash/range/block errors, own
    versus inherited ambiguity, and post-exec retired mappings;
-7. zero/noncanonical/misaligned transition PCs and host/JIT/unresolved
+7. append-only extent versus mutable-word fixtures, a source census proving the
+   only production patch call sites write AArch64 `B`, conservative
+   `potentially-mutable-b` classification, non-`B` immutable-prefix validation,
+   and rejection of final `B` bytes as event-time authority;
+8. zero/noncanonical/misaligned transition PCs and host/JIT/unresolved
    classification precedence;
-8. NativeShape fixture parity after factoring only the shared snapshot payload,
+9. NativeShape fixture parity after factoring only the shared snapshot payload,
    exact-word, and classifier primitives;
-9. exact JIT word/family/operand classification and source-semantics labels;
-10. KDK UUID/build/arch mismatch, one/inconsistent slide anchors, text-range
-    escape, missing instruction bytes, local/public alias sets, and the known
-    deferred-interrupt landing-PC regression;
-11. exact `as_fault` PC totals, independent fault-outcome totals, and rejection
+10. exact immutable JIT word/family/operand classification,
+    `potentially-mutable-b`, and source-semantics labels;
+11. KDK UUID/build/arch mismatch, zero/one/inconsistent slide anchors,
+    ambiguous-name ineligibility, text-range escape, missing instruction bytes,
+    resolved/unresolved overlay partitions, local/public alias sets, and the
+    known deferred-interrupt landing-PC regression;
+12. exact `as_fault` PC totals, independent fault-outcome totals, and rejection
     of any mixed CPU/fault denominator;
-12. deterministic census regeneration, comparison determinant drift, duplicate
+13. deterministic census regeneration, comparison determinant drift, duplicate
     captures, percentage-point stability, and exact 10% boundary cases; and
-13. source-group non-overlap and rejection of groups formed only to cross the
+14. source-group non-overlap and rejection of groups formed only to cross the
     opportunity threshold.
 
 Before primary evidence use, the implementation must pass focused CLI/runtime
@@ -797,14 +914,15 @@ The implementation plan should keep five reviewable units:
    exact-word access, and classifier primitives with fixture parity and no
    reinterpretation of v4 identity.
 2. **Transition snapshots:** add the full birth/image/runtime envelope,
-   exec/exit fragments, prefix validation, fork frontier, and typed manifest.
+   exec/exit fragments, immutable-prefix/mutable-`B` validation, fork frontier,
+   and typed manifest.
 3. **Trace authority:** add `NativeKernelTransition`, the durable D program,
    strict raw parser, capture authority, receipt, and live kernel overlay.
 4. **Offline authority:** add KDK normalization, alias-safe exact-byte records,
    census, comparison, and source-group validation in Rust.
 5. **Live evidence:** qualify with the fork fixture and `bigallocfree`, take two
-   primary captures, publish the comparison, and durably record `CARRY`, `STOP`,
-   or `INVALID`.
+   primary captures, publish the comparison, and durably record `CARRY`,
+   `REDESIGN`, `STOP`, or `INVALID`.
 
 No production optimization belongs in those commits. A carried result starts a
 new design. The profile remains a reusable Carrick diagnostic because the same
@@ -820,8 +938,12 @@ transition-PC question applies after later optimizations and to dynamic code.
   for every non-syscall kernel PC.
 - Stop if snapshot publication or ancestry cannot resolve every candidate row;
   do not assign unresolved PCs to the largest nearby range.
-- Redesign if JIT mappings become mutable/unloaded or address reuse invalidates
-  immutable snapshot semantics.
+- Redesign if JIT mappings gain mutability beyond the audited direct-link `B`
+  slots, become unloaded, or address reuse invalidates snapshot semantics.
+- If the coarse `potentially-mutable-b` coverage population crosses the
+  mechanical gate and no immutable source candidate carries, emit `REDESIGN`
+  and design a bounded mutation timeline; final snapshot bytes are not a
+  shortcut.
 - Escalate a disputed individual mapping, register, or process state to the
   guest process through LLDB/core and the always-on event ring. That evidence
   explains mechanism; it does not replace the complete CPU census.
@@ -838,11 +960,14 @@ such that:
 - every CPU and fault population reconciles exactly;
 - every non-syscall CPU transition PC and exact `as_fault` PC resolves to one
   authenticated host image or own/inherited JIT snapshot;
+- every JIT PC is partitioned into immutable exact-word authority or an explicit
+  `potentially-mutable-b` population with no event-time word claim;
 - every kernel PC binds to exact matching KDK bytes with aliases preserved;
 - the comparison expresses each stable transition owner's direct share of all
   sampled CPU without importing another artifact's ratio; and
 - source audit either authorizes one non-overlapping, non-regrettable >=10%
-  mechanism for a separate design or closes the bucket with no runtime patch.
+  mechanism for a separate design, calls for a separate mutable-`B` temporal
+  redesign, or closes the bucket with no runtime patch.
 
 Neither outcome completes the active performance goal. The campaign continues
 until retained untraced work brings the shipped-default cold build to at most
