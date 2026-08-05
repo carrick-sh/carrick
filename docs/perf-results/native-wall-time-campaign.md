@@ -806,6 +806,17 @@ console was not durable; A2/B2 remain valid pre-repair evidence but are excluded
 from the final pair by analyzer identity. Traced elapsed time is attribution
 metadata only and does not alter the official **10.1776x** scoreboard.
 
+Independent final review approved exact range `96b2b59e..be1c36cf` with no
+Critical or Important findings at **99% confidence**. The reviewer rebuilt all
+17 family, 2,387 word, and 24 context full-outer rows and their exact arithmetic,
+reproduced `mechanical_crossings=[]`, verified both 622 MiB manifests and all
+receipt/lifecycle/loss/hash identities, and independently disassembled and
+source-bound the four cited words. Comparator 11/11, full JIT-shape 44/44,
+formatting, diff, strict-JSON, and commit checks were green. Live replay and a
+binary rebuild were deliberately outside review scope; the already accepted
+typed receipts, frozen binary verification, signed qualification, and complete
+artifact reconstruction bound that residual risk.
+
 ## Hypothesis backlog
 
 Status values: `PROPOSED`, `SPIKING`, `RETAIN`, `REJECT`, `DEFER`.
