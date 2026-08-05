@@ -165,6 +165,15 @@ pub const LIVE_BLOCK_READY: u32 = 2;
 pub const LIVE_BLOCK_FAILED: u32 = 3;
 ```
 
+Control records form a fixed 131,072-slot open-addressed table. The initial
+slot is the low 17 bits of SHA-256 over `(unit_key_digest, guest_start)` and a
+lookup probes at most 16 consecutive slots. A READY slot with a different key
+continues the bounded probe. An EMPTY slot permits the one CAS below. A
+BUILDING slot immediately falls back because its key is not yet published. A
+FAILED slot contains a release-published key: the same key falls back, while a
+different key may continue probing. Exhausting 16 probes falls back. Bounded
+probing is lookup work, not a publication retry or wait.
+
 The lookup algorithm is deliberately wait-free:
 
 ```rust

@@ -114,6 +114,12 @@
 
 - [ ] Make `TranslationUnitKey::live_digest()` domain-separate the existing exact key with `b"carrick-live-arena-v1"`, schema, and `TRANSLATOR_ABI_CURRENT`; do not create a basename or partial-key path.
 - [ ] Implement lookup exactly as one acquire load plus, only for `EMPTY`, one `compare_exchange(EMPTY, BUILDING, AcqRel, Acquire)`. A CAS loss returns `Private` without retrying.
+- [ ] Store records in a fixed 131,072-slot open-addressed table. Hash
+  `(unit_key_digest, guest_start)` to the low 17 bits and probe at most 16
+  consecutive slots. Continue only past a READY different key or a
+  release-published FAILED different key. BUILDING, same-key FAILED, CAS loss,
+  or 16 exhausted probes immediately returns `Private`; bounded collision
+  probing is never a publication wait/retry.
 - [ ] Implement append-only code/hot/cold reservations with atomic fetch-update and checked page/instruction alignment. Capacity failure stores `FAILED` and returns the private disposition.
 - [ ] Implement publication as field writes, bounds/hash validation, then one `state.store(READY, Release)`. Expose no method capable of modifying a READY record.
 - [ ] Run:
