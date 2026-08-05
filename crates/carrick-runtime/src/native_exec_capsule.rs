@@ -1118,10 +1118,6 @@ pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::Native
                 carrick_native_darwin::live_arena::DarwinLiveArena::adopt_optional_registered(
                     guest.live_arena.map(Into::into),
                 )?;
-            #[cfg(test)]
-            if let Some(exit_code) = native_exec_live_arena_resume_hook(live_arena.as_ref())? {
-                return Ok(crate::NativeSelfReexecOutcome::GuestExit(exit_code));
-            }
             if let Some(artifact) = &guest.artifact_spike {
                 crate::native_darwin::adopt_artifact_spike_for_resume(artifact)?;
             }
@@ -1152,7 +1148,7 @@ pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::Native
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
-fn native_exec_live_arena_resume_hook(
+pub(crate) fn native_exec_live_arena_resume_hook(
     arena: Option<&carrick_native_darwin::live_arena::DarwinLiveArena>,
 ) -> anyhow::Result<Option<i32>> {
     tests::native_exec_live_arena::resume_hook(arena)
@@ -2393,7 +2389,6 @@ mod tests {
         const CHILD_CAPSULE_FD_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_CAPSULE_FD";
         const CHILD_NONCE_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_NONCE";
         const CHILD_PARENT_RANGES_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_PARENT_RANGES";
-        const CHILD_COMMAND_FD_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_COMMAND_FD";
         const CHILD_RECEIPT_FD_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_RECEIPT_FD";
         const OWNER_RESUME_STAGE_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_OWNER_RESUME";
         const OWNER_PID_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_OWNER_PID";
@@ -2404,6 +2399,7 @@ mod tests {
         const PUBLISHER_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_PUBLISHER";
         const CHILD_TEST_NAME: &str =
             "native_exec_capsule::tests::native_exec_live_arena::exec_successor_child";
+        const RESUME_RECEIPT: u8 = 0xa1;
         const FRESH_RECEIPT: u8 = 0xf1;
         static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         static LIFECYCLE_RECEIPT: std::sync::OnceLock<LifecycleReceipt> =
@@ -2746,142 +2742,74 @@ mod tests {
         }
 
         fn run_lifecycle_proof() -> anyhow::Result<LifecycleReceipt> {
-            let third = TestPort::new();
-            let _ports = RegisteredPortsGuard::replace(&[third.0, MACH_PORT_NULL, MACH_PORT_NULL]);
-            let arena = arena();
-            write_code(&arena, 42);
-            let parent_ranges = unsafe { arena.local_mapping_ranges_for_transport_proof()? };
-
-            let xsig = tempfile::tempfile()?;
-            xsig.set_len(4096)?;
             let executable = std::env::current_exe()?;
-            let mut payload = sample();
-            payload.producer_pid = unsafe { libc::getpid() as u32 };
-            payload.host_executable_path = executable.as_os_str().as_bytes().to_vec();
-            payload.guest_exec.as_mut().expect("guest").live_arena =
-                Some(arena.transit_v1().into());
-            bind_real_xsig(&mut payload, &xsig);
-            let mut child_payload = payload.clone();
-            let nonce = [0x9d; 16];
-            let command = pipe();
             let receipt = pipe();
-            let child_pid = std::cell::Cell::new(None);
-            let ranges_env = format_ranges(&parent_ranges);
+            let argv = [
+                CString::new(executable.as_os_str().as_bytes())?,
+                CString::new("--exact")?,
+                CString::new(CHILD_TEST_NAME)?,
+                CString::new("--nocapture")?,
+                CString::new("--test-threads=1")?,
+            ];
+            let argv_ptrs = argv
+                .iter()
+                .map(|entry| entry.as_ptr())
+                .chain(std::iter::once(std::ptr::null()))
+                .collect::<Vec<_>>();
+            let mut env = std::env::vars_os()
+                .filter(|(key, _)| {
+                    !key.as_os_str()
+                        .as_bytes()
+                        .starts_with(b"CARRICK_TEST_NATIVE_LIVE_ARENA_")
+                })
+                .map(|(key, value)| {
+                    let mut entry = key.as_os_str().as_bytes().to_vec();
+                    entry.push(b'=');
+                    entry.extend_from_slice(value.as_os_str().as_bytes());
+                    CString::new(entry)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            for (key, value) in [
+                (CHILD_ENV, "1".to_owned()),
+                (CHILD_RECEIPT_FD_ENV, receipt[1].to_string()),
+            ] {
+                env.push(CString::new(format!("{key}={value}"))?);
+            }
+            let env_ptrs = env
+                .iter()
+                .map(|entry| entry.as_ptr())
+                .chain(std::iter::once(std::ptr::null()))
+                .collect::<Vec<_>>();
+            let receipt_flags = unsafe { libc::fcntl(receipt[1], libc::F_GETFD) };
+            assert!(receipt_flags >= 0 && receipt_flags & libc::FD_CLOEXEC == 0);
 
-            let result = exec_capsule_with(payload, nonce, None, Some(&arena), |request, _| {
-                let argv = [
-                    CString::new(executable.as_os_str().as_bytes()).expect("test executable"),
-                    CString::new("--exact").expect("exact arg"),
-                    CString::new(CHILD_TEST_NAME).expect("child test name"),
-                    CString::new("--nocapture").expect("nocapture arg"),
-                    CString::new("--test-threads=1").expect("test threads arg"),
-                ];
-                let argv_ptrs = argv
-                    .iter()
-                    .map(|entry| entry.as_ptr().cast_mut())
-                    .chain(std::iter::once(std::ptr::null_mut()))
-                    .collect::<Vec<_>>();
-                let mut env = std::env::vars_os()
-                    .filter(|(key, _)| {
-                        !key.as_os_str()
-                            .as_bytes()
-                            .starts_with(b"CARRICK_TEST_NATIVE_LIVE_ARENA_")
-                    })
-                    .map(|(key, value)| {
-                        let mut entry = key.as_os_str().as_bytes().to_vec();
-                        entry.push(b'=');
-                        entry.extend_from_slice(value.as_os_str().as_bytes());
-                        CString::new(entry).expect("environment entry")
-                    })
-                    .collect::<Vec<_>>();
-                for (key, value) in [
-                    (CHILD_ENV, "1".to_owned()),
-                    (CHILD_CAPSULE_FD_ENV, request.capsule_fd.to_string()),
-                    (CHILD_NONCE_ENV, encode_nonce(nonce)),
-                    (CHILD_PARENT_RANGES_ENV, ranges_env.clone()),
-                    (CHILD_COMMAND_FD_ENV, command[0].to_string()),
-                    (CHILD_RECEIPT_FD_ENV, receipt[1].to_string()),
-                ] {
-                    env.push(CString::new(format!("{key}={value}")).expect("child environment"));
+            let pid = unsafe { libc::fork() };
+            if pid < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            if pid == 0 {
+                unsafe {
+                    libc::close(receipt[0]);
+                    libc::execve(argv[0].as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr());
+                    libc::_exit(127);
                 }
-                let env_ptrs = env
-                    .iter()
-                    .map(|entry| entry.as_ptr().cast_mut())
-                    .chain(std::iter::once(std::ptr::null_mut()))
-                    .collect::<Vec<_>>();
-                for fd in [command[0], receipt[1]] {
-                    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-                    assert!(flags >= 0 && flags & libc::FD_CLOEXEC == 0);
-                }
-
-                let pid = unsafe { libc::fork() };
-                assert!(pid >= 0, "fork lifecycle child");
-                if pid == 0 {
-                    unsafe {
-                        libc::close(command[1]);
-                        libc::close(receipt[0]);
-                    }
-                    let mut start = 0_u8;
-                    let read = unsafe { libc::read(command[0], (&raw mut start).cast(), 1) };
-                    if read != 1 || start != 1 {
-                        unsafe { libc::_exit(126) };
-                    }
-                    unsafe {
-                        libc::execve(
-                            request.executable.as_ptr(),
-                            argv_ptrs.as_ptr().cast(),
-                            env_ptrs.as_ptr().cast(),
-                        );
-                        libc::_exit(127);
-                    }
-                }
-
-                child_pid.set(Some(pid));
-                close_fd(command[0]);
-                close_fd(receipt[1]);
-                child_payload.producer_pid = pid as u32;
-                write_capsule(request.capsule_fd, nonce, &child_payload)
-                    .expect("rewrite capsule for fork child PID");
-                write_byte(command[1], 1).expect("release child into exec");
-                std::io::Error::from_raw_os_error(libc::ENOEXEC)
-            });
-            assert!(
-                result.is_err(),
-                "test invoke must model a returned parent exec"
-            );
-            let pid = child_pid
-                .get()
-                .ok_or_else(|| anyhow::anyhow!("no fork child"))?;
+            }
+            close_fd(receipt[1]);
             let mut child_guard = ChildGuard(Some(pid));
 
+            let resume_byte = read_byte(receipt[0])?;
+            if resume_byte != RESUME_RECEIPT {
+                anyhow::bail!(
+                    "successor bypassed production resume entry: receipt={resume_byte:#x}"
+                );
+            }
             let fresh_byte = read_byte(receipt[0])?;
             if fresh_byte != FRESH_RECEIPT {
-                let mut remaining = [0_u8; std::mem::size_of::<libc::c_int>() - 1];
-                let result = unsafe {
-                    libc::read(receipt[0], remaining.as_mut_ptr().cast(), remaining.len())
-                };
-                if result == remaining.len() as isize {
-                    let mut encoded = [0_u8; std::mem::size_of::<libc::c_int>()];
-                    encoded[0] = fresh_byte;
-                    encoded[1..].copy_from_slice(&remaining);
-                    let mut status = 0;
-                    let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-                    if waited == pid {
-                        child_guard.0 = None;
-                    }
-                    anyhow::bail!(
-                        "POSIX_SPAWN_SETEXEC returned {}; waitpid={waited} status={status:#x}",
-                        libc::c_int::from_ne_bytes(encoded),
-                    );
-                }
                 anyhow::bail!("successor did not publish fresh-address receipt");
             }
             let fresh = true;
             let first = read_byte(receipt[0])?;
-            write_code(&arena, 43);
-            write_byte(command[1], 2)?;
             let second = read_byte(receipt[0])?;
-            close_fd(command[1]);
             close_fd(receipt[0]);
 
             let mut child_status = 0;
@@ -2913,17 +2841,29 @@ mod tests {
                     .all(|parent| adopted.end <= parent.start || parent.end <= adopted.start)
             });
             let receipt_fd: libc::c_int = std::env::var(CHILD_RECEIPT_FD_ENV)?.parse()?;
-            let command_fd: libc::c_int = std::env::var(CHILD_COMMAND_FD_ENV)?.parse()?;
+            write_byte(receipt_fd, RESUME_RECEIPT)?;
             write_byte(receipt_fd, if fresh { FRESH_RECEIPT } else { 0 })?;
             write_byte(receipt_fd, u8::try_from(execute_code(arena))?)?;
-            if read_byte(command_fd)? != 2 {
-                anyhow::bail!("child received invalid publication synchronization byte");
+            let publish_command: libc::c_int = std::env::var(PUBLISH_COMMAND_ENV)?.parse()?;
+            let publish_ack: libc::c_int = std::env::var(PUBLISH_ACK_ENV)?.parse()?;
+            write_byte(publish_command, 43)?;
+            if read_byte(publish_ack)? != 43 {
+                anyhow::bail!("publisher returned invalid live-arena acknowledgement");
             }
             write_byte(receipt_fd, u8::try_from(execute_code(arena))?)?;
+            let publisher_pid: libc::pid_t = std::env::var(PUBLISH_PID_ENV)?.parse()?;
+            let mut status = 0;
+            if unsafe { libc::waitpid(publisher_pid, &mut status, 0) } != publisher_pid {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+                anyhow::bail!("live-arena publisher exited with status {status:#x}");
+            }
             Ok(Some(0))
         }
 
         fn run_owning_process_lifecycle() -> anyhow::Result<()> {
+            let receipt_fd: libc::c_int = std::env::var(CHILD_RECEIPT_FD_ENV)?.parse()?;
             let arena = arena();
             write_code(&arena, 42);
             let publish_command = pipe();
@@ -2989,57 +2929,77 @@ mod tests {
                     publisher_env_ptrs.as_ptr(),
                 )?
             };
+            let _publisher_guard = ChildGuard(Some(publisher_pid));
             assert_eq!(read_byte(publish_ack[0])?, 1);
             close_fd(publish_command[0]);
             close_fd(publish_ack[1]);
-            let mut env = std::env::vars_os()
-                .filter(|(key, _)| {
-                    let key = key.as_os_str().as_bytes();
-                    key != OWNER_RESUME_STAGE_ENV.as_bytes()
-                        && key != OWNER_PID_ENV.as_bytes()
-                        && key != LIVE_TRANSIT_ENV.as_bytes()
-                        && key != PUBLISH_COMMAND_ENV.as_bytes()
-                        && key != PUBLISH_ACK_ENV.as_bytes()
-                        && key != PUBLISH_PID_ENV.as_bytes()
-                        && key != CHILD_PARENT_RANGES_ENV.as_bytes()
-                })
-                .map(|(key, value)| {
-                    let mut entry = key.as_os_str().as_bytes().to_vec();
-                    entry.push(b'=');
-                    entry.extend_from_slice(value.as_os_str().as_bytes());
-                    CString::new(entry)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
             let old_mapping_ranges = unsafe { arena.local_mapping_ranges_for_transport_proof()? };
-            for (key, value) in [
-                (OWNER_RESUME_STAGE_ENV, "after".to_owned()),
-                (OWNER_PID_ENV, unsafe { libc::getpid() }.to_string()),
-                (
-                    LIVE_TRANSIT_ENV,
-                    format!(
-                        "{}:{}:{}:{}",
-                        arena.transit_v1().schema,
-                        arena.transit_v1().code_len,
-                        arena.transit_v1().control_len,
-                        encode_nonce(arena.transit_v1().nonce),
-                    ),
-                ),
-                (PUBLISH_COMMAND_ENV, publish_command[1].to_string()),
-                (PUBLISH_ACK_ENV, publish_ack[0].to_string()),
-                (PUBLISH_PID_ENV, publisher_pid.to_string()),
-                (CHILD_PARENT_RANGES_ENV, format_ranges(&old_mapping_ranges)),
-            ] {
-                env.push(CString::new(format!("{key}={value}"))?);
-            }
-            let env_ptrs = env
-                .iter()
-                .map(|entry| entry.as_ptr().cast_mut())
-                .chain(std::iter::once(std::ptr::null_mut()))
-                .collect::<Vec<_>>();
-            let error = unsafe {
-                plan.replace_process(argv[0].as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr())
-            };
-            anyhow::bail!("owning-process replacement returned {error}")
+            drop(plan);
+
+            carrick_signal_core::xsig::xsig_init();
+            let mut payload = sample();
+            payload.producer_pid = unsafe { libc::getpid() as u32 };
+            payload.host_executable_path = executable.as_os_str().as_bytes().to_vec();
+            let guest = payload.guest_exec.as_mut().expect("guest payload");
+            guest.live_arena = Some(arena.transit_v1().into());
+            guest.xsig = crate::native_exec_capsule::snapshot_xsig()?;
+            let nonce = [0x9d; 16];
+            exec_capsule_with(
+                payload,
+                nonce,
+                None,
+                Some(&arena),
+                |request, registered_ports| {
+                    let mut env = std::env::vars_os()
+                        .filter(|(key, _)| {
+                            !key.as_os_str()
+                                .as_bytes()
+                                .starts_with(b"CARRICK_TEST_NATIVE_LIVE_ARENA_")
+                        })
+                        .map(|(key, value)| {
+                            let mut entry = key.as_os_str().as_bytes().to_vec();
+                            entry.push(b'=');
+                            entry.extend_from_slice(value.as_os_str().as_bytes());
+                            CString::new(entry).expect("successor environment entry")
+                        })
+                        .collect::<Vec<_>>();
+                    for (key, value) in [
+                        (CHILD_ENV, "1".to_owned()),
+                        (OWNER_RESUME_STAGE_ENV, "1".to_owned()),
+                        (OWNER_PID_ENV, unsafe { libc::getpid() }.to_string()),
+                        (CHILD_CAPSULE_FD_ENV, request.capsule_fd.to_string()),
+                        (CHILD_NONCE_ENV, encode_nonce(nonce)),
+                        (CHILD_RECEIPT_FD_ENV, receipt_fd.to_string()),
+                        (CHILD_PARENT_RANGES_ENV, format_ranges(&old_mapping_ranges)),
+                        (PUBLISH_COMMAND_ENV, publish_command[1].to_string()),
+                        (PUBLISH_ACK_ENV, publish_ack[0].to_string()),
+                        (PUBLISH_PID_ENV, publisher_pid.to_string()),
+                    ] {
+                        env.push(
+                            CString::new(format!("{key}={value}"))
+                                .expect("successor test environment"),
+                        );
+                    }
+                    let env_ptrs = env
+                        .iter()
+                        .map(|entry| entry.as_ptr().cast_mut())
+                        .chain(std::iter::once(std::ptr::null_mut()))
+                        .collect::<Vec<_>>();
+                    for fd in [receipt_fd, publish_command[1], publish_ack[0]] {
+                        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                        assert!(flags >= 0 && flags & libc::FD_CLOEXEC == 0);
+                    }
+                    let registered_ports =
+                        registered_ports.expect("live arena registered-port exec plan");
+                    unsafe {
+                        registered_ports.replace_process(
+                            request.executable.as_ptr(),
+                            argv_ptrs.as_ptr(),
+                            env_ptrs.as_ptr(),
+                        )
+                    }
+                },
+            )
         }
 
         #[test]
@@ -3185,61 +3145,24 @@ mod tests {
                 let before_pid: libc::pid_t = std::env::var(OWNER_PID_ENV)
                     .expect("owner PID")
                     .parse()
-                    .expect("parse setexec fact PID");
+                    .expect("parse owner PID");
                 assert_eq!(before_pid, unsafe { libc::getpid() });
-                let transit = std::env::var(LIVE_TRANSIT_ENV).expect("live transit metadata");
-                let mut fields = transit.split(':');
-                let expected = LiveArenaTransitV1 {
-                    schema: fields
-                        .next()
-                        .expect("schema")
-                        .parse()
-                        .expect("parse schema"),
-                    code_len: fields
-                        .next()
-                        .expect("code length")
-                        .parse()
-                        .expect("parse code length"),
-                    control_len: fields
-                        .next()
-                        .expect("control length")
-                        .parse()
-                        .expect("parse control length"),
-                    nonce: decode_nonce(fields.next().expect("nonce")).expect("parse nonce"),
-                };
-                assert!(fields.next().is_none());
-                let adopted = DarwinLiveArena::adopt_registered(expected)
-                    .expect("adopt direct same-task SETEXEC arena");
-                assert_eq!(execute_code(&adopted), 42);
-                let receipt_fd: libc::c_int = std::env::var(CHILD_RECEIPT_FD_ENV)
-                    .expect("outer receipt fd")
+                let capsule_fd: libc::c_int = std::env::var(CHILD_CAPSULE_FD_ENV)
+                    .expect("successor capsule fd")
                     .parse()
-                    .expect("parse outer receipt fd");
-                write_byte(receipt_fd, FRESH_RECEIPT).expect("fresh receipt");
-                write_byte(receipt_fd, 42).expect("initial code receipt");
-                let publish_command: libc::c_int = std::env::var(PUBLISH_COMMAND_ENV)
-                    .expect("publish command fd")
-                    .parse()
-                    .expect("parse publish command fd");
-                let publish_ack: libc::c_int = std::env::var(PUBLISH_ACK_ENV)
-                    .expect("publish ack fd")
-                    .parse()
-                    .expect("parse publish ack fd");
-                write_byte(publish_command, 43).expect("request code publication");
-                assert_eq!(read_byte(publish_ack).expect("publication ack"), 43);
-                assert_eq!(execute_code(&adopted), 43);
-                write_byte(receipt_fd, 43).expect("published code receipt");
-                let publisher_pid: libc::pid_t = std::env::var(PUBLISH_PID_ENV)
-                    .expect("publisher PID")
-                    .parse()
-                    .expect("parse publisher PID");
-                let mut status = 0;
-                assert_eq!(
-                    unsafe { libc::waitpid(publisher_pid, &mut status, 0) },
-                    publisher_pid
-                );
-                assert!(libc::WIFEXITED(status));
-                assert_eq!(libc::WEXITSTATUS(status), 0);
+                    .expect("parse successor capsule fd");
+                let nonce = std::env::var(CHILD_NONCE_ENV).expect("successor capsule nonce");
+                match crate::native_exec_capsule::resume(capsule_fd, &nonce)
+                    .expect("resume production native exec capsule")
+                {
+                    crate::NativeSelfReexecOutcome::GuestExit(0) => {}
+                    crate::NativeSelfReexecOutcome::GuestExit(code) => {
+                        panic!("live-arena resume returned exit code {code}")
+                    }
+                    crate::NativeSelfReexecOutcome::PidProbe { .. } => {
+                        panic!("live-arena guest capsule resumed as PID probe")
+                    }
+                }
                 return;
             }
             run_owning_process_lifecycle().expect("run owning-process live arena lifecycle");

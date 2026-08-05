@@ -1477,6 +1477,12 @@ pub(crate) fn resume_guest_from_capsule(
     env: Vec<Vec<u8>>,
     _live_arena: Option<carrick_native_darwin::live_arena::DarwinLiveArena>,
 ) -> anyhow::Result<i32> {
+    #[cfg(test)]
+    if let Some(exit_code) =
+        crate::native_exec_capsule::native_exec_live_arena_resume_hook(_live_arena.as_ref())?
+    {
+        return Ok(exit_code);
+    }
     install_native_probe_sink();
     dsr::profile::seed_profile_exec_epoch_after_reexec(guest.profile_exec_epoch);
     // Startup attribution across the PID-preserving host self-reexec: the
