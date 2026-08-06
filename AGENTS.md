@@ -401,11 +401,16 @@ concern — it is half the product.
   boundary. Rank by the **amplification factor
   of a single guest operation**, which is concrete and directly attackable
   where a CPU percentage is not:
-  - guest `open` → was **19.68 host opens** (cap-std path re-walks); the
-    2026-08-02 trusted-dirfd lanes cut the fs-walk workload to roughly one host
-    call per guest stat and took that workload's total wall from ~20x to 3.8x
-    (`docs/perf-results/container-lifecycle-split.jsonl`). Re-measure before
-    quoting a figure here;
+  - guest `open` → was **19.68 host opens** (cap-std path re-walks), now
+    **4.61** run-wide (2.37 inside the open's own service window) — measured at
+    HEAD on the fs-walk fixture, with the full per-op ledger in
+    [`docs/perf-results/2026-08-05-fswalk-amplification-ledger.md`](docs/perf-results/2026-08-05-fswalk-amplification-ledger.md).
+    Whole fixture: 52,805 host syscalls / 24,201 guest = **2.18x**. Still to
+    drive toward 1: guest `openat` **5.91** host calls, `getdents64` **4.01**
+    (of which six per directory are pure `fdopendir`/`closedir` preamble),
+    `newfstatat` **2.86** — note the older "roughly one host call per guest
+    stat" claim is true only of `fstatat64` itself. `close` (0.27) and `fcntl`
+    (0.0009) are already below 1, so sub-1 is reachable;
   - guest `mmap(MAP_PRIVATE, fd)` → a `pread` of the FULL mapping length into
     fresh anon (`dispatch/mem.rs:2517`), instead of a host file-backed mmap;
   - guest `execve` → WAS 4 full ELF materializations + 3 SHA-256 passes; the
