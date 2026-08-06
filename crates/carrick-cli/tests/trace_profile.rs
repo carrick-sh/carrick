@@ -120,6 +120,30 @@ fn native_profile_qualification_scripts_bind_observed_identity_and_scope() {
 
 const DSRPROF2_FIXTURE: &str = include_str!("fixtures/dsrprof2-valid.raw");
 
+/// The DTrace spelling of one USDT probe, DERIVED from the Rust provider
+/// declaration that emits it.
+///
+/// The two spellings differ only by `__` -> `-`, which is mechanical — but a
+/// hardcoded literal in this test would stay green through a rename in
+/// `carrick-observability`, leaving a D script that COMPILES and silently
+/// never fires. Asserting the declaration still exists ties the script to the
+/// probe at test time; Task 9's zero-event rejection is the runtime backstop.
+fn usdt_probe_spelling(rust_declaration: &str) -> String {
+    let provider = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../carrick-observability/src/probes.rs");
+    let source = std::fs::read_to_string(&provider).unwrap();
+    assert!(
+        source.contains(&format!("fn {rust_declaration}(")),
+        "carrick-observability no longer declares the USDT probe {rust_declaration}; \
+         dsr-live-arena.d names its DTrace spelling and would stop firing"
+    );
+    assert!(
+        !rust_declaration.contains('-'),
+        "a Rust provider declaration separates words with `__`, never `-`"
+    );
+    format!("carrick*:::{}", rust_declaration.replace("__", "-"))
+}
+
 fn dsr_live_arena_script_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/dtrace/dsr-live-arena.d")
 }
@@ -177,12 +201,13 @@ fn dsr_live_arena_profile_binds_its_outcomes_and_bounds_the_capture() {
             .count(),
         1
     );
-    for probe in [
-        "carrick*:::dsr-cache-event",
-        "carrick*:::dsr-live-chunk-revoked",
-        "carrick*:::dsr-translate-begin",
+    for declaration in [
+        "dsr__cache__event",
+        "dsr__live__chunk__revoked",
+        "dsr__translate__begin",
     ] {
-        assert!(script.contains(probe), "missing probe {probe}");
+        let probe = usdt_probe_spelling(declaration);
+        assert!(script.contains(&probe), "missing probe {probe}");
     }
     // The live outcome kinds start at 13; 7..12 belong to `dsr-indirect.d`'s
     // direct-binding vocabulary and must not be swept in here.

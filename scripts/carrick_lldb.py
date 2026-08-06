@@ -379,9 +379,12 @@ def _static_load_addr(target, fullname: str) -> Optional[int]:
 
     Rust mangles statics with a trailing `::h<hash>`, so the demangled symbol is
     `carrick_runtime::event_ring::RING::h0382...`; we match by name COMPONENTS
-    (module + base both present) rather than by exact string."""
-    module_name = fullname.split("::")[-2]  # "event_ring"
-    base = fullname.split("::")[-1]  # "RING" / "IDX"
+    (module + base both present) rather than by exact string.
+
+    Keyed on the caller's own module name, so this serves any carrick static
+    (`event_ring::RING`, `live_arena_export::LIVE_ARENA_EXPORT`, ...)."""
+    module_name = fullname.split("::")[-2]  # e.g. "event_ring"
+    base = fullname.split("::")[-1]  # e.g. "RING" / "LIVE_ARENA_EXPORT"
 
     var_list = target.FindGlobalVariables(base, 50)
     for i in range(var_list.GetSize()):
@@ -470,6 +473,10 @@ def cmd_eventring(debugger, command, exe_ctx, result, internal_dict):
 # This reader is strictly EXPORT-ONLY: it never writes process memory, never
 # constructs or attaches an arena, and there is no import path. A debugger
 # cannot repair, publish into, or revoke an arena through it.
+#
+# TEARING: the export's fields are independent relaxed stores with the total
+# bumped last, so on a LIVE attach the newest record can be caught mid-write
+# and read back as a mix of two. A core is exact (the process is stopped).
 
 _XLAT_MAGIC = int.from_bytes(b"CRKXLAT1", "little")
 _XLAT_VERSION = 1
@@ -579,6 +586,14 @@ def cmd_xlat_live_arena(debugger, command, exe_ctx, result, internal_dict):
         f"  READY records:   total={ready_total} showing={ready_shown} (ring of {ready_slots})",
         f"  revoked chunks:  total={revoked_total} showing={revoked_shown} (ring of {revoked_slots})",
     ]
+    # Always stated rather than detected: distinguishing a core from a live
+    # attach through SBProcess is unreliable, and a caveat that is sometimes
+    # silent is worse than one that is always printed.
+    out.append(
+        "  NOTE: on a LIVE attach the newest record may be TORN — the fields are "
+        "independent relaxed stores and the total is bumped last. A core is "
+        "stopped, so it reads exactly."
+    )
 
     def ready_at(index: int) -> dict:
         off = (index % ready_slots) * ready_stride

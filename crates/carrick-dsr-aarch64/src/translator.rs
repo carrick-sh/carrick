@@ -1009,6 +1009,15 @@ impl Drop for ProcessTranslator {
 /// It is strictly EXPORT-ONLY. Nothing in carrick reads these records back,
 /// no arena state is derived from them, and there is no importer: the export
 /// cannot make a translation decision or repair an arena.
+///
+/// **A record can TEAR on a live attach.** The fields are independent
+/// `Relaxed` stores and the `*_total` cursor is bumped last, so a debugger
+/// reading a running process can catch the newest slot mid-write and see a
+/// mix of two records. There is deliberately no seqlock: this is a debug
+/// export whose primary consumer is a CORE (where the process is stopped and
+/// the read is exact), and a version counter on the write path would put
+/// ordering work on the live install path to protect a diagnostic. The reader
+/// (`carrick xlat-live-arena`) states the limitation instead.
 pub mod live_arena_export {
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -5001,7 +5010,11 @@ impl ProcessState {
         // One counted revocation per chunk PROTECTED, including an idempotent
         // re-assertion over an already-revoked chunk: the number a reader
         // wants is mutation PRESSURE on shared code, not the distinct chunk
-        // set. Saturating like every other live counter.
+        // set. Accounting is `ResolverStats::add`'s: `checked_add` that
+        // POISONS the record with `CounterOverflow` on wrap, not saturation —
+        // an overflowed counter must be an error, not a plausible number.
+        // (Only the debugger export's `*_total` saturates; it is a ring
+        // cursor, not evidence.)
         self.stats.add_usize(ResolverStat::LiveRevokedChunks, count);
         for chunk in revoked {
             // The revocation outcome is process-scoped — this seam runs on the
