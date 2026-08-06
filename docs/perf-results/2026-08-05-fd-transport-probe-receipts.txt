@@ -1,0 +1,88 @@
+== host ==
+ProductName:		macOS
+ProductVersion:		27.0
+BuildVersion:		26A5388g
+Darwin Timothys-MacBook-Air-2.local 27.0.0 Darwin Kernel Version 27.0.0: Tue Jul 14 21:40:50 PDT 2026; root:xnu-13432.0.94.501.4~1/RELEASE_ARM64_T8132 arm64
+== probe binary signing state ==
+Identifier=fd_transport_probes-2230cbbc818e2f6e
+CodeDirectory v=20400 size=4573 flags=0x20002(adhoc,linker-signed) hashes=139+0 location=embedded
+Signature=adhoc
+TeamIdentifier=not set
+== p1 ==
+P1-successor fstat: ok size=65536 mode=0o600
+P1-successor bytes: ok (256 bytes match)
+P1 successor: exit=0 (exit=0 means re-mapped and validated)
+exitstatus=0
+== p2-shm ==
+P2-shm create: ok fd=3
+P2-shm mmap_rw: ok base=0x104478000
+P2-shm rw region: cur=rw- max=rw-
+P2-shm mmap_rx: ok base=0x104488000
+P2-shm route_b_mprotect_rx: FAIL errno=13 (Permission denied)
+P2-shm rx region: cur=r-- max=rw-
+P2-shm exec_child: signal=10
+P2-shm exec_appended_same_page: signal=10
+P2-shm exec_overwritten: signal=10
+P2-shm revoke_prot_none: ok
+P2-shm exec_revoked: signal=10
+P2-shm restore_rx: FAIL errno=13 (Permission denied)
+P2-shm map_jit_fd_refusal: errno=22 (Invalid argument)
+exitstatus=0
+== p2-file ==
+P2-file create: ok fd=3
+P2-file mmap_rw: ok base=0x1044cc000
+P2-file rw region: cur=rw- max=rwx
+P2-file mmap_rx: FAIL errno=1 (Operation not permitted)
+P2-file route_b_mprotect_rx: ok base=0x1044dc000
+P2-file route_b region: cur=r-x max=rwx
+P2-file rx region: cur=r-x max=rwx
+P2-file exec_child: exit=42
+P2-file exec_inprocess: value=42
+P2-file exec_appended_same_page: exit=43
+P2-file exec_overwritten: exit=44
+P2-file revoke_prot_none: ok
+P2-file exec_revoked: signal=10
+P2-file restore_rx: ok
+P2-file exec_restored: exit=44
+P2-file map_jit_fd_refusal: errno=22 (Invalid argument)
+exitstatus=0
+== p4-shm ==
+P4-successor attach: ok rw=0x102cac000 rx=0x102cbc000 ns=1875
+P4-successor exec_creator_code: signal=10
+P4-shm successor: FAIL status=Ok("exit=24") watch=Err("timeout waiting for successor MAPPED")
+exitstatus=0
+== p4-file ==
+P4-successor attach: ok rw=0x105338000 rx=0x105348000 ns=10791
+P4-successor exec_creator_code: exit=42
+P4-successor post_exec_write: ok (observed creator GEN=2 after exec)
+P4-successor exec_post_exec_code: exit=43
+P4-file successor: exit=0 (exit=0 means full lifecycle verified)
+P4-file successor_attach_ns: 10791
+P4-file successor_first_exec: 42
+exitstatus=0
+== p-timing-shm ==
+P-timing-shm attach_ns_samples: [8625, 6125, 6375, 7875, 5875, 5500, 7583, 6708]
+exitstatus=0
+== p-timing-file ==
+P-timing-file attach_ns_samples: [13375, 10417, 10584, 9000, 10000, 7750, 10041, 8000]
+exitstatus=0
+== p5-shm ==
+P5-shm make_entry_rx: FAIL kern_return=2
+exitstatus=0
+== p5-file ==
+P5-file make_entry_rx: FAIL kern_return=2
+exitstatus=0
+== p6-clamp ==
+P6-file unclamped_rwx_possible: refused errno=13 (Permission denied)
+P6-file clamp_rw_max_rw: ok
+P6-file clamp_rx_max_rx: ok
+P6-file rw region: cur=rw- max=rw-
+P6-file rx region: cur=r-x max=r-x
+P6-file escalate_rw_to_rwx: refused errno=13 (Permission denied)
+P6-file escalate_rx_to_rw: refused errno=13 (Permission denied)
+P6-file exec_clamped: exit=42
+P6-file revoke_clamped: ok
+P6-file exec_revoked: signal=10
+P6-file restore_clamped: ok
+P6-file exec_restored: exit=42
+exitstatus=0
