@@ -802,6 +802,18 @@ def nativeperf_frames_v8(pid=10, tid=11, era=12, exec_epoch=0):
     return lines
 
 
+def nativeperf_frames_v9(pid=10, tid=11, era=12, exec_epoch=0):
+    lines = nativeperf_frames_v8(pid=pid, tid=tid, era=era, exec_epoch=exec_epoch)
+    index = next(
+        i for i, line in enumerate(lines) if "|frame=resolver-thread|" in line
+    )
+    lines[index] += (
+        "|resolve_direct_back_same_page=5|resolve_direct_forward=4|"
+        "resolve_direct_back_cross_page=2"
+    )
+    return lines
+
+
 def nativeperf_frames_v3_with_exclusive(
     pid=10, tid=11, era=12, exec_epoch=0, *, executions=1, unique_sites=1
 ):
@@ -1031,6 +1043,41 @@ class NativePerfV2Tests(unittest.TestCase):
         decoded = budget.parse_result_row(encoded)
         self.assertEqual(decoded.profile, profile)
         self.assertEqual(decoded.profile.version, 7)
+
+    def test_v9_parses_and_round_trips_the_resolve_direct_split(self):
+        profile = budget.parse_nativeperf(nativeperf_frames_v9())
+        budget.validate_profile(profile)
+        self.assertEqual(profile.version, 9)
+        self.assertEqual(len(profile.threads[0].frames), 24)
+        self.assertEqual(
+            profile.threads[0].value("resolver-thread", "resolve_direct_back_same_page"),
+            5,
+        )
+        self.assertEqual(
+            profile.threads[0].value("resolver-thread", "resolve_direct_forward"), 4
+        )
+        self.assertEqual(
+            profile.threads[0].value(
+                "resolver-thread", "resolve_direct_back_cross_page"
+            ),
+            2,
+        )
+        # The v8 byte fields ride along untouched.
+        self.assertEqual(
+            profile.threads[0].value("live-bytes", "live_links_prebound"), 8
+        )
+
+        encoded = budget.run_record_json(
+            budget.RunRecord.synthetic(profile=profile, schedule_label="on-1")
+        )
+        decoded = budget.parse_result_row(encoded)
+        self.assertEqual(decoded.profile, profile)
+        self.assertEqual(decoded.profile.version, 9)
+
+    def test_v8_record_still_reads_as_v8_after_v9(self):
+        profile = budget.parse_nativeperf(nativeperf_frames_v8())
+        budget.validate_profile(profile)
+        self.assertEqual(profile.version, 8)
 
     def test_v8_parses_and_round_trips_the_prebind_counters(self):
         profile = budget.parse_nativeperf(nativeperf_frames_v8())

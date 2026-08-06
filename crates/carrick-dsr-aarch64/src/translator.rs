@@ -1475,6 +1475,24 @@ const LIVE_MINIMUM_BLOCK_BYTES: u64 = 4;
 /// resolves through the gateway, which is correct and merely slower. It is a
 /// named outcome rather than a bare `Ok(())` because "patched" and "too far to
 /// patch" are the two answers a link-reach counter has to tell apart.
+/// Target class of one `ResolveDirect` round trip — the residue split that
+/// sizes how much of the remaining gateway traffic the winner-window
+/// prebind can never bind (see `ResolverStats::resolve_direct_back_same_page`
+/// for the exact reading of each class).
+const fn resolve_direct_target_class(
+    source: carrick_guest_mem::GuestVa,
+    target: carrick_guest_mem::GuestVa,
+) -> ResolverStat {
+    const PAGE_MASK: u64 = LIVE_SOURCE_PAGE_BYTES - 1;
+    if target.raw() > source.raw() {
+        ResolverStat::ResolveDirectForward
+    } else if (target.raw() & !PAGE_MASK) == (source.raw() & !PAGE_MASK) {
+        ResolverStat::ResolveDirectBackSamePage
+    } else {
+        ResolverStat::ResolveDirectBackCrossPage
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DirectLinkPatch {
     Patched,
@@ -2134,6 +2152,16 @@ pub struct ResolverStats {
     pub resolve_src_shared_tgt_private: u64,
     pub resolve_src_private_tgt_shared: u64,
     pub resolve_src_private_tgt_private: u64,
+    /// `ResolveDirect` round trips split by TARGET class, thread-scoped like
+    /// `direct_resolver_exits`. `back_same_page` (target <= source on the
+    /// same 16 KiB source page) is the upper bound on SELF-referential-site
+    /// traversals — a live block never leaves its source page (B3
+    /// CrossPage), so every self-loop back-edge lands here, along with
+    /// backward branches to earlier same-page blocks. `forward` is
+    /// target > source; the remainder is a backward cross-page branch.
+    pub resolve_direct_back_same_page: u64,
+    pub resolve_direct_forward: u64,
+    pub resolve_direct_back_cross_page: u64,
     pub live_index_hits: u64,
     pub live_ready_hits: u64,
     pub live_ready_misses: u64,
@@ -2209,6 +2237,9 @@ pub enum ResolverStat {
     ResolveSrcSharedTgtPrivate,
     ResolveSrcPrivateTgtShared,
     ResolveSrcPrivateTgtPrivate,
+    ResolveDirectBackSamePage,
+    ResolveDirectForward,
+    ResolveDirectBackCrossPage,
     // Container-lifetime LIVE arena lane. Process-scoped like the Shared*
     // family above: incremented on `ProcessState::stats`, so they MUST flow
     // through `checked_delta` / `reported_stats`.
@@ -2234,7 +2265,7 @@ pub enum ResolverStat {
 }
 
 impl ResolverStat {
-    const ALL: [Self; 49] = [
+    const ALL: [Self; 52] = [
         Self::ResolverExits,
         Self::OneEntryHits,
         Self::Translations,
@@ -2268,6 +2299,9 @@ impl ResolverStat {
         Self::ResolveSrcSharedTgtPrivate,
         Self::ResolveSrcPrivateTgtShared,
         Self::ResolveSrcPrivateTgtPrivate,
+        Self::ResolveDirectBackSamePage,
+        Self::ResolveDirectForward,
+        Self::ResolveDirectBackCrossPage,
         Self::LiveIndexHits,
         Self::LiveReadyHits,
         Self::LiveReadyMisses,
@@ -2321,6 +2355,9 @@ impl ResolverStat {
             Self::ResolveSrcSharedTgtPrivate => "resolve_src_shared_tgt_private",
             Self::ResolveSrcPrivateTgtShared => "resolve_src_private_tgt_shared",
             Self::ResolveSrcPrivateTgtPrivate => "resolve_src_private_tgt_private",
+            Self::ResolveDirectBackSamePage => "resolve_direct_back_same_page",
+            Self::ResolveDirectForward => "resolve_direct_forward",
+            Self::ResolveDirectBackCrossPage => "resolve_direct_back_cross_page",
             Self::LiveIndexHits => "live_index_hits",
             Self::LiveReadyHits => "live_ready_hits",
             Self::LiveReadyMisses => "live_ready_misses",
@@ -2377,6 +2414,9 @@ impl ResolverStats {
             ResolverStat::ResolveSrcSharedTgtPrivate => self.resolve_src_shared_tgt_private,
             ResolverStat::ResolveSrcPrivateTgtShared => self.resolve_src_private_tgt_shared,
             ResolverStat::ResolveSrcPrivateTgtPrivate => self.resolve_src_private_tgt_private,
+            ResolverStat::ResolveDirectBackSamePage => self.resolve_direct_back_same_page,
+            ResolverStat::ResolveDirectForward => self.resolve_direct_forward,
+            ResolverStat::ResolveDirectBackCrossPage => self.resolve_direct_back_cross_page,
             ResolverStat::LiveIndexHits => self.live_index_hits,
             ResolverStat::LiveReadyHits => self.live_ready_hits,
             ResolverStat::LiveReadyMisses => self.live_ready_misses,
@@ -2441,6 +2481,9 @@ impl ResolverStats {
             ResolverStat::ResolveSrcPrivateTgtPrivate => {
                 self.resolve_src_private_tgt_private = value
             }
+            ResolverStat::ResolveDirectBackSamePage => self.resolve_direct_back_same_page = value,
+            ResolverStat::ResolveDirectForward => self.resolve_direct_forward = value,
+            ResolverStat::ResolveDirectBackCrossPage => self.resolve_direct_back_cross_page = value,
             ResolverStat::LiveIndexHits => self.live_index_hits = value,
             ResolverStat::LiveReadyHits => self.live_ready_hits = value,
             ResolverStat::LiveReadyMisses => self.live_ready_misses = value,
@@ -3006,6 +3049,9 @@ impl ThreadTranslator {
             resolve_src_shared_tgt_private: self.stats.resolve_src_shared_tgt_private,
             resolve_src_private_tgt_shared: self.stats.resolve_src_private_tgt_shared,
             resolve_src_private_tgt_private: self.stats.resolve_src_private_tgt_private,
+            resolve_direct_back_same_page: self.stats.resolve_direct_back_same_page,
+            resolve_direct_forward: self.stats.resolve_direct_forward,
+            resolve_direct_back_cross_page: self.stats.resolve_direct_back_cross_page,
             shared_unit_lookups: process.stats.shared_unit_lookups,
             shared_unit_hits: process.stats.shared_unit_hits,
             shared_unit_loads: process.stats.shared_unit_loads,
@@ -3092,6 +3138,9 @@ impl ThreadTranslator {
             resolve_src_shared_tgt_private: self.stats.resolve_src_shared_tgt_private,
             resolve_src_private_tgt_shared: self.stats.resolve_src_private_tgt_shared,
             resolve_src_private_tgt_private: self.stats.resolve_src_private_tgt_private,
+            resolve_direct_back_same_page: self.stats.resolve_direct_back_same_page,
+            resolve_direct_forward: self.stats.resolve_direct_forward,
+            resolve_direct_back_cross_page: self.stats.resolve_direct_back_cross_page,
             shared_unit_lookups: delta.shared_unit_lookups,
             shared_unit_hits: delta.shared_unit_hits,
             shared_unit_loads: delta.shared_unit_loads,
@@ -3200,6 +3249,9 @@ impl ThreadTranslator {
             resolve_src_shared_tgt_private: stats.resolve_src_shared_tgt_private,
             resolve_src_private_tgt_shared: stats.resolve_src_private_tgt_shared,
             resolve_src_private_tgt_private: stats.resolve_src_private_tgt_private,
+            resolve_direct_back_same_page: stats.resolve_direct_back_same_page,
+            resolve_direct_forward: stats.resolve_direct_forward,
+            resolve_direct_back_cross_page: stats.resolve_direct_back_cross_page,
             shared_unit_lookups: 0,
             shared_unit_hits: 0,
             shared_unit_loads: 0,
@@ -6543,6 +6595,9 @@ impl ThreadTranslator {
             resolve_src_shared_tgt_private: self.stats.resolve_src_shared_tgt_private,
             resolve_src_private_tgt_shared: self.stats.resolve_src_private_tgt_shared,
             resolve_src_private_tgt_private: self.stats.resolve_src_private_tgt_private,
+            resolve_direct_back_same_page: self.stats.resolve_direct_back_same_page,
+            resolve_direct_forward: self.stats.resolve_direct_forward,
+            resolve_direct_back_cross_page: self.stats.resolve_direct_back_cross_page,
             // Process-scoped, like the `shared_*` family directly above.
             live_index_hits: process.live_index_hits,
             live_ready_hits: process.live_ready_hits,
@@ -7057,6 +7112,8 @@ impl ThreadTranslator {
                 }
                 types::NativeDsrExit::ResolveDirect { source, target, .. } => {
                     self.stats.add(ResolverStat::DirectResolverExits, 1);
+                    self.stats
+                        .add(resolve_direct_target_class(source, target), 1);
                     // Installed unit blocks are indistinguishable from native
                     // translations, so every resolve edge is private->private.
                     let (source_shared, target_shared) = (false, false);
@@ -12106,6 +12163,41 @@ mod tests {
                 )
             );
         }
+    }
+
+    /// The residue split's classifier: every `ResolveDirect` round trip
+    /// lands in exactly one of the three target classes, with the 16 KiB
+    /// source-page boundary exact — the `back_same_page` class is the upper
+    /// bound on self-referential-site traversals the winner-window prebind
+    /// can never bind.
+    #[test]
+    fn resolve_direct_target_classes_split_the_residue_exactly() {
+        use crate::translator::{ResolverStat, resolve_direct_target_class};
+        use carrick_guest_mem::GuestVa;
+        // The self-loop shape: backward (or self) on the same source page.
+        assert_eq!(
+            resolve_direct_target_class(GuestVa(0x4000_0040), GuestVa(0x4000_0000)),
+            ResolverStat::ResolveDirectBackSamePage,
+        );
+        assert_eq!(
+            resolve_direct_target_class(GuestVa(0x4000_0000), GuestVa(0x4000_0000)),
+            ResolverStat::ResolveDirectBackSamePage,
+        );
+        // Last word of a page branching back across the page boundary: one
+        // instruction apart, but a DIFFERENT 16 KiB source page.
+        assert_eq!(
+            resolve_direct_target_class(GuestVa(0x4000_4000), GuestVa(0x4000_3ffc)),
+            ResolverStat::ResolveDirectBackCrossPage,
+        );
+        // Forward is forward at any distance, same page or not.
+        assert_eq!(
+            resolve_direct_target_class(GuestVa(0x4000_0000), GuestVa(0x4000_0004)),
+            ResolverStat::ResolveDirectForward,
+        );
+        assert_eq!(
+            resolve_direct_target_class(GuestVa(0x4000_0000), GuestVa(0x5000_0000)),
+            ResolverStat::ResolveDirectForward,
+        );
     }
 
     #[test]

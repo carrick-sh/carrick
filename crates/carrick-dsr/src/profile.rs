@@ -913,6 +913,14 @@ pub struct ProfileSnapshot {
     pub resolve_src_shared_tgt_private: u64,
     pub resolve_src_private_tgt_shared: u64,
     pub resolve_src_private_tgt_private: u64,
+    /// `ResolveDirect` round trips split by TARGET class, thread-scoped like
+    /// `direct_resolver_exits` and published on the `resolver-thread` frame.
+    /// `back_same_page` (target <= source, same 16 KiB source page) is the
+    /// upper bound on self-referential-site traversals; `forward` is
+    /// target > source; the remainder is a backward cross-page branch.
+    pub resolve_direct_back_same_page: u64,
+    pub resolve_direct_forward: u64,
+    pub resolve_direct_back_cross_page: u64,
     /// DISTINCT private -> shared edges seen by this thread.
     pub resolve_private_to_shared_distinct_edges: u64,
     /// Control for the above: distinct private -> private edges.
@@ -1094,13 +1102,16 @@ impl CompleteThreadRecord {
         let mut thread = self.frame_header("resolver-thread");
         let _ = write!(
             thread,
-            "|translate_phase_nested_ns={}|resolver_exits={}|one_entry_hits={}|gateway_entries={}|syscall_exits={}|direct_resolver_exits={}",
+            "|translate_phase_nested_ns={}|resolver_exits={}|one_entry_hits={}|gateway_entries={}|syscall_exits={}|direct_resolver_exits={}|resolve_direct_back_same_page={}|resolve_direct_forward={}|resolve_direct_back_cross_page={}",
             resolver.nested_translation_ns,
             resolver.resolver_exits,
             resolver.one_entry_hits,
             resolver.gateway_entries,
             resolver.syscall_exits,
             resolver.direct_resolver_exits,
+            resolver.resolve_direct_back_same_page,
+            resolver.resolve_direct_forward,
+            resolver.resolve_direct_back_cross_page,
         );
         frames.push(thread);
         let mut process = self.frame_header("resolver-process");
@@ -1829,6 +1840,51 @@ mod tests {
         }
     }
 
+    /// The resolve-direct residue split rides the `resolver-thread` frame —
+    /// beside `direct_resolver_exits`, whose thread scope it shares —
+    /// exactly once, exact values.
+    #[test]
+    fn the_resolve_direct_split_rides_the_resolver_thread_frame() {
+        let budget = ThreadBudget::enabled_for_test(41, 42);
+        let record = budget.complete_record().expect("empty record");
+        let frames = record
+            .to_protocol_frames_with_resolver(
+                crate::profile::ProfileSnapshot {
+                    resolve_direct_back_same_page: 11,
+                    resolve_direct_forward: 7,
+                    resolve_direct_back_cross_page: 3,
+                    ..Default::default()
+                },
+                FlushGauges::default(),
+            )
+            .expect("bounded frames");
+        for field in [
+            "resolve_direct_back_same_page",
+            "resolve_direct_forward",
+            "resolve_direct_back_cross_page",
+        ] {
+            let marker = format!("|{field}=");
+            assert_eq!(
+                frames
+                    .iter()
+                    .filter(|frame| frame.contains(&marker))
+                    .count(),
+                1,
+                "{field} must be published exactly once per record"
+            );
+        }
+        let thread = frames
+            .iter()
+            .find(|frame| frame.contains("|frame=resolver-thread|"))
+            .expect("resolver-thread frame");
+        assert!(
+            thread.contains(
+                "|resolve_direct_back_same_page=11|resolve_direct_forward=7|resolve_direct_back_cross_page=3"
+            ),
+            "the thread frame must round-trip the exact split: {thread}"
+        );
+    }
+
     /// The prebind triple rides the `live-bytes` frame — beside the two
     /// private→live link counters it complements — exactly once, exact
     /// values.
@@ -2061,6 +2117,9 @@ mod tests {
                     direct_binding_cas_losses: u64::MAX,
                     direct_binding_stale_winner_clears: u64::MAX,
                     direct_binding_publication_retries: u64::MAX,
+                    resolve_direct_back_same_page: u64::MAX,
+                    resolve_direct_forward: u64::MAX,
+                    resolve_direct_back_cross_page: u64::MAX,
                     resolve_src_shared_tgt_shared: u64::MAX,
                     resolve_src_shared_tgt_private: u64::MAX,
                     resolve_src_private_tgt_shared: u64::MAX,

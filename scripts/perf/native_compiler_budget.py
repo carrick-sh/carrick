@@ -280,6 +280,22 @@ FRAME_FIELDS_V8 = {
     },
 }
 REQUIRED_FRAMES_V8 = frozenset(FRAME_FIELDS_V8)
+# NATIVEPERF v9 extends `resolver-thread` with the resolve-direct residue
+# split by TARGET class: back-same-page (the upper bound on
+# self-referential-site traversals — a live block never leaves its 16 KiB
+# source page), forward, and backward cross-page. Thread-scoped like
+# `direct_resolver_exits`, which they partition. Additive only, so a v8
+# record still reads exactly as v8.
+FRAME_FIELDS_V9 = {
+    **{frame: set(fields) for frame, fields in FRAME_FIELDS_V8.items()},
+    "resolver-thread": set(FRAME_FIELDS_V8["resolver-thread"])
+    | {
+        "resolve_direct_back_same_page",
+        "resolve_direct_forward",
+        "resolve_direct_back_cross_page",
+    },
+}
+REQUIRED_FRAMES_V9 = frozenset(FRAME_FIELDS_V9)
 # The supervisor record (`NATIVEPERF1|supervisor|...`) is a v2-era, per-PROFILE
 # (not per-thread-group) record: the top-level `carrick run` process's own
 # getrusage(RUSAGE_SELF)/getrusage(RUSAGE_CHILDREN) CPU. It is a top-level
@@ -1016,6 +1032,7 @@ def _frame_contract(frame: str, extras: set[str]) -> tuple[int | None, set[str]]
     fields_v6 = FRAME_FIELDS_V6.get(frame)
     fields_v7 = FRAME_FIELDS_V7.get(frame)
     fields_v8 = FRAME_FIELDS_V8.get(frame)
+    fields_v9 = FRAME_FIELDS_V9.get(frame)
     if (
         fields_v1 is None
         and fields_v2 is None
@@ -1025,6 +1042,7 @@ def _frame_contract(frame: str, extras: set[str]) -> tuple[int | None, set[str]]
         and fields_v6 is None
         and fields_v7 is None
         and fields_v8 is None
+        and fields_v9 is None
     ):
         raise BudgetError(f"unknown profile frame: {frame}")
     if fields_v1 is not None and extras == fields_v1:
@@ -1062,6 +1080,9 @@ def _frame_contract(frame: str, extras: set[str]) -> tuple[int | None, set[str]]
         # Same rule one version on: only frames v8 EXTENDED reach here (an
         # unchanged frame already matched its introducing version above).
         return 8, fields_v8
+    if fields_v9 is not None and extras == fields_v9:
+        # Same rule again: only frames v9 EXTENDED reach here.
+        return 9, fields_v9
     allowed = (
         (fields_v1 or set())
         | (fields_v2 or set())
@@ -1071,6 +1092,7 @@ def _frame_contract(frame: str, extras: set[str]) -> tuple[int | None, set[str]]
         | (fields_v6 or set())
         | (fields_v7 or set())
         | (fields_v8 or set())
+        | (fields_v9 or set())
     )
     unknown = extras - allowed
     if unknown:
@@ -1084,6 +1106,7 @@ def _frame_contract(frame: str, extras: set[str]) -> tuple[int | None, set[str]]
         or fields_v6
         or fields_v7
         or fields_v8
+        or fields_v9
     )
     assert expected is not None
     missing = expected - extras
@@ -1155,7 +1178,9 @@ def parse_nativeperf(lines: Iterable[str]) -> ProfileRun:
     for (pid, tid, era), frames in sorted(groups.items()):
         key = (pid, tid, era)
         versions = group_versions.get(key, set())
-        if versions == {2, 3, 4, 5, 6, 7, 8}:
+        if versions == {2, 3, 4, 5, 6, 7, 8, 9}:
+            version = 9
+        elif versions == {2, 3, 4, 5, 6, 7, 8}:
             version = 8
         elif versions == {2, 3, 4, 5, 6, 7}:
             version = 7
@@ -1184,6 +1209,7 @@ def parse_nativeperf(lines: Iterable[str]) -> ProfileRun:
             6: REQUIRED_FRAMES_V6,
             7: REQUIRED_FRAMES_V7,
             8: REQUIRED_FRAMES_V8,
+            9: REQUIRED_FRAMES_V9,
         }[version]
         missing = required - set(frames)
         if missing:
@@ -2782,9 +2808,12 @@ def _parse_profile_json(value: object) -> ProfileRun | None:
             version = 3
             fields_by_frame = FRAME_FIELDS_V3
         elif frames == sorted(REQUIRED_FRAMES_V7):
-            # v8 extends `live-bytes` with FIELDS, not frames, so the frame
-            # set alone cannot split v7 from v8 — same rule as v4/v5 below.
-            if "live-bytes.live_links_prebound" in values:
+            # v8 and v9 extend frames with FIELDS, not new frames, so the
+            # frame set alone cannot split them — same rule as v4/v5 below.
+            if "resolver-thread.resolve_direct_forward" in values:
+                version = 9
+                fields_by_frame = FRAME_FIELDS_V9
+            elif "live-bytes.live_links_prebound" in values:
                 version = 8
                 fields_by_frame = FRAME_FIELDS_V8
             else:
