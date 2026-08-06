@@ -1423,7 +1423,7 @@ enum NativeLiveArenaEntry {
 /// 6T1/6T2 replaced it with inherited descriptors, and
 /// `carrick-native-darwin`'s
 /// `a_fork_child_inherits_arena_mappings_and_its_fd_transport` plus this
-/// crate's `forked_child_setexec_successor_acquires_creator_ready_record_and_bytes`
+/// crate's `forked_child_exec_successor_acquires_creator_ready_record_and_bytes`
 /// prove the crossing end to end.
 ///
 /// What is NOT yet landed is this entry point: the reopened Task 6C2 slice

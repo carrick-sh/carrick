@@ -124,8 +124,22 @@ fn create_backing_object(label: &str, len: usize) -> io::Result<OwnedFd> {
     }
     // SAFETY: `open` returned a fresh descriptor this scope now owns.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // Every failure below leaves an UNLINKED object: the descriptor closes on
+    // drop and the filesystem reclaims the extents, so nothing survives.
+    // Failing to unlink at all is the one case that leaves a path behind, and
+    // it fails the whole creation rather than proceeding with a named object —
+    // a linked backing file is exactly the stale state `O_EXCL` exists to
+    // prevent, and the process would otherwise leak a `temp_dir()` entry it can
+    // no longer name. The path is reported so an operator can find it.
     if unsafe { libc::unlink(cpath.as_ptr()) } != 0 {
-        return Err(backing_error(label, "unlink", io::Error::last_os_error()));
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "live arena {label} backing unlink: {error} (leaving {} on disk)",
+                path.display()
+            ),
+        ));
     }
     let size = libc::off_t::try_from(len)
         .map_err(|_| invalid_input(format!("{label} arena length exceeds off_t")))?;
@@ -517,6 +531,16 @@ impl DarwinLiveArena {
             control_len,
             authority.transit.nonce,
         )?;
+        // The LOAD-BEARING protocol validation already ran inside
+        // `map_adopted_objects`: it checks both outer object headers BEFORE any
+        // typed reference exists, then rebuilds and validates the complete
+        // canonical layout with `adopt_discovered_in_place`
+        // (nonce/schema/translator-ABI/count/stride/alignment/overlap/bounds).
+        // The second pass below adds one thing the first cannot: it re-reads
+        // the mapped directory and requires the SAME geometry back, so a
+        // directory mutated between the two reads — the shared object is
+        // writable by every holder — cannot leave this arena resolving offsets
+        // against a layout that no longer describes it.
         arena.validate_object_headers(authority.transit)?;
         arena.validate_control_protocol(authority.transit)?;
         // Both-or-neither: the transport descriptors are released only once
