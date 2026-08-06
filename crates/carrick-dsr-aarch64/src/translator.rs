@@ -3130,14 +3130,18 @@ impl ProcessTranslator {
                 "live translation authority was already installed".to_string(),
             ));
         }
+        // A semantic comparison between two typed host intervals, not between
+        // raw casts: "does the installed record describe the same executable
+        // region this view exposes".
         match self.live_target_authority.get() {
-            Some(existing) if existing.host_range() == (start as u64..end as u64) => {}
+            Some(existing) if existing.host_range() == payload.host_range() => {}
             Some(existing) => {
+                let installed = existing.host_range();
                 return Err(types::DsrError::CachePolicy(format!(
                     "live translation RX payload 0x{start:x}..0x{end:x} disagrees with this \
                      process's installed target authority 0x{:x}..0x{:x}",
-                    existing.host_range().start,
-                    existing.host_range().end,
+                    installed.start.raw(),
+                    installed.end.raw(),
                 )));
             }
             None => {}
@@ -8419,7 +8423,7 @@ mod tests {
                 .expect("the live target authority is installed");
             assert_eq!(
                 record.host_range(),
-                payload.start().raw() as u64..payload.end().raw() as u64,
+                payload.host_range(),
                 "the target authority describes the process view's RX payload exactly"
             );
             assert!(record.owns(live), "and it owns the installed entry");
