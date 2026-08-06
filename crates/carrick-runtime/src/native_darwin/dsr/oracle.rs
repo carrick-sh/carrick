@@ -5926,6 +5926,106 @@ fn dsr_second_kick_before_signal_exit_keeps_the_first_cache_exit() {
     assert_eq!(context.snapshot.pc, cache_pc as u64);
 }
 
+/// A phase-zero kick landing OUTSIDE the installed cache range but inside a
+/// catalogued executable region is authoritative translated code.
+///
+/// This is the live-arena classification the executable-range catalog exists
+/// for: a live block executes from the arena's RX payload, which is a
+/// different mapping from the private JIT cache the context's
+/// `cache_start`/`cache_end` may currently describe (the gateway installs the
+/// entry's own region, and a flavor-1 indirect hop deliberately does not
+/// switch it). Without the catalog the same PC classifies as a
+/// non-authoritative HOST PC, and the kick resumes the guest at the block
+/// entry instead of capturing the interrupted state.
+#[test]
+fn dsr_kick_inside_a_catalogued_region_outside_the_installed_range_is_authoritative() {
+    unsafe extern "C" {
+        fn carrick_native_dsr_test_apply_kick_transition(
+            context: *mut libc::c_void,
+            interrupted_pc: usize,
+        ) -> u32;
+    }
+
+    const AT_ENTRY: u32 = 3;
+    const CAPTURE: u32 = 4;
+    let guest = GuestVa(0x1c_3c0);
+    let private_start = 0x10_7000_0000_usize;
+    let private_end = private_start + 64 * 1024 * 1024;
+    // A second executable region, disjoint from the installed cache range —
+    // the shape of the live arena's RX payload.
+    let live_start = 0x20_7000_0000_usize;
+    let live_end = live_start + 4 * 1024 * 1024;
+    let live_pc = live_start + 0x1_0000;
+
+    let fresh_context = || {
+        let mut snapshot = seeded_snapshot(0x20_0000);
+        snapshot.pc = guest.raw();
+        let mut context = super::gateway::DsrContext::new(
+            snapshot,
+            super::types::CacheVa::published(HostVa(private_start)),
+            NativeDsrExit::Syscall { resume: guest },
+            std::ptr::null(),
+            CodeGeneration::INITIAL,
+            private_start,
+            private_end,
+            crate::native_darwin::address::NativeAddressMode::Direct,
+        );
+        context.entry_in_progress = 0;
+        context
+    };
+
+    // Without the region catalogued, the interrupted PC is not authoritative.
+    let mut uncatalogued = fresh_context();
+    let classified = unsafe {
+        carrick_native_dsr_test_apply_kick_transition(
+            (&mut uncatalogued as *mut super::gateway::DsrContext).cast(),
+            live_pc,
+        )
+    };
+    assert_eq!(
+        classified, AT_ENTRY,
+        "an uncatalogued PC outside the installed range is a host PC"
+    );
+    assert_eq!(uncatalogued.exit_status, 8);
+    assert_eq!(uncatalogued.exit_target, guest.raw());
+
+    // Registering the region — what `install_live_authority` does for the RX
+    // payload — makes the same PC authoritative translated code.
+    let mut catalog = super::gateway::ExecutableRangeCatalog::new(private_start, private_end)
+        .expect("build the process executable range catalog");
+    catalog
+        .prepend(live_start, live_end)
+        .expect("register the second executable region");
+    let mut catalogued = fresh_context();
+    catalogued.executable_range_catalog = catalog.authority().as_ptr();
+    let classified = unsafe {
+        carrick_native_dsr_test_apply_kick_transition(
+            (&mut catalogued as *mut super::gateway::DsrContext).cast(),
+            live_pc,
+        )
+    };
+    assert_eq!(
+        classified, CAPTURE,
+        "a catalogued PC outside the installed range IS translated code"
+    );
+    assert_eq!(catalogued.exit_status, 5);
+    assert_eq!(catalogued.exit_target, live_pc as u64);
+    assert_eq!(catalogued.snapshot.pc, live_pc as u64);
+
+    // A PC in neither region stays a host PC with the catalog installed.
+    let mut host = fresh_context();
+    host.executable_range_catalog = catalog.authority().as_ptr();
+    let classified = unsafe {
+        carrick_native_dsr_test_apply_kick_transition(
+            (&mut host as *mut super::gateway::DsrContext).cast(),
+            0x1_0000,
+        )
+    };
+    assert_eq!(classified, AT_ENTRY);
+    assert_eq!(host.exit_status, 8);
+    assert_eq!(host.exit_target, guest.raw());
+}
+
 #[test]
 fn dsr_host_window_kick_is_deferred_to_next_gateway_entry() {
     let _signal_oracle = install_signal_handlers_for_oracle();
@@ -6100,18 +6200,28 @@ fn dsr_phase_zero_host_kick_keeps_original_guest_snapshot() {
         std::ptr::null(),
     );
 
+    // The production entry also publishes the process's executable-range
+    // catalog. Populate it with the emitted block's own range so this test
+    // proves the gateway PC still classifies as a HOST PC even when a
+    // catalogued executable region exists.
+    let catalog = super::gateway::ExecutableRangeCatalog::new(
+        emitted.entry().host().raw(),
+        emitted.entry().host().raw() + emitted.len(),
+    )
+    .expect("build the process executable range catalog");
+
     unsafe { carrick_native_dsr_test_phase_zero_host_kick_once() };
     // Exercise the exact production gateway arm. Installed persistent-store
     // blocks replay into the private JIT, so `ThreadTranslator::enter_prepared`
-    // enters through this trusted-private helper rather than the generic
-    // range-bearing arm.
-    super::gateway::enter_translated_with_trusted_private_cache(
+    // enters through this executable-authority helper with the private record.
+    super::gateway::enter_translated_with_executable_authority(
         emitted.entry(),
         &mut snapshot,
         &mut exit,
         &indirect,
         &private_authority,
         crate::native_darwin::address::NativeAddressMode::Direct,
+        catalog.authority(),
     )
     .expect("classify phase-zero host kick");
 
