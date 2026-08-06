@@ -1443,19 +1443,33 @@ const LIVE_ARENA_RESUMED_WITHOUT_TRANSPORT: &str = "CARRICK_DSR_LIVE_ARENA=compi
 /// `a_fork_child_inherits_arena_mappings_and_its_fd_transport` plus this
 /// crate's `forked_child_exec_successor_acquires_creator_ready_record_and_bytes`
 /// prove the crossing end to end, which is what lets this gate open.
+///
+/// Both axes are enumerated with NO wildcard, deliberately. A gate whose
+/// admissions are a catch-all admits by default, so a new
+/// [`NativeLiveArenaEntry`] variant — or a `Resume` widened past a boolean —
+/// would silently enter the runtime carrying an unclassified arena. Written
+/// out, the same addition is a non-exhaustive-match build failure that forces
+/// whoever adds the variant to say whether it may enter. That is the same
+/// reason `unreachable_patterns` is workspace-`deny`ed: this file does not get
+/// to fail open.
 fn require_live_arena_runtime_ready(
     policy: carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy,
     entry: NativeLiveArenaEntry,
 ) -> Result<(), RuntimeError> {
     use carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy as Policy;
     match (policy, entry) {
+        // The two disagreements between policy and transport.
         (Policy::Disabled, NativeLiveArenaEntry::Resume { transported: true }) => Err(
             RuntimeError::Unsupported(LIVE_ARENA_TRANSPORTED_WITHOUT_POLICY.to_string()),
         ),
         (Policy::Compiler, NativeLiveArenaEntry::Resume { transported: false }) => Err(
             RuntimeError::Unsupported(LIVE_ARENA_RESUMED_WITHOUT_TRANSPORT.to_string()),
         ),
-        (Policy::Disabled, _) | (Policy::Compiler, _) => Ok(()),
+        // The four admissions, one arm each.
+        (Policy::Disabled, NativeLiveArenaEntry::Launch) => Ok(()),
+        (Policy::Disabled, NativeLiveArenaEntry::Resume { transported: false }) => Ok(()),
+        (Policy::Compiler, NativeLiveArenaEntry::Launch) => Ok(()),
+        (Policy::Compiler, NativeLiveArenaEntry::Resume { transported: true }) => Ok(()),
     }
 }
 
