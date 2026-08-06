@@ -30,9 +30,11 @@ use carrick_dsr_aarch64::emit::{
 };
 use carrick_dsr_aarch64::live_arena::{
     LIVE_ARENA_OBJECT_HEADER_BYTES, LIVE_SOURCE_PAGE_BYTES, LiveArenaCapacities,
-    LiveArenaControlLayout, LiveBlockExtents, LiveLookup, LiveMappedWritePermit, LivePrivateReason,
-    LiveProcessViewBrand, LivePublishClaim, LiveReadyLookup, LiveReservedPublishClaim,
-    LiveTranslationArenaView, ValidatedLiveBlockRecord,
+    LiveArenaControlLayout, LiveBlockAuthority, LiveBlockExtents, LiveLookup,
+    LiveMappedWritePermit, LiveOwnedChunkIdentity, LivePrivateReason, LiveProcessViewBrand,
+    LivePublishClaim, LivePublishOutcome, LiveReadyLookup, LiveReadyOutcome,
+    LiveReservedPublishClaim, LiveTranslationArenaView, LiveTranslationAuthority,
+    ValidatedLiveBlockRecord,
 };
 use carrick_dsr_aarch64::shared_cache::TranslationUnitKey;
 use carrick_dsr_aarch64::types::CacheOffset;
@@ -1234,6 +1236,144 @@ impl LiveArenaExecutable {
     /// before this executable authority was returned.
     pub fn invalidated_code_extent(&self) -> carrick_dsr_aarch64::live_arena::LiveReservation {
         self.record.extents().code
+    }
+}
+
+/// The installed-block half of the translator seam.
+///
+/// Resolution stays inside this module: the trait hands the translator one
+/// entry address and the COLD bytes, never the mapping geometry that produced
+/// them. A stable process-local TARGET authority over this RX payload (gateway
+/// entry, indirect-cache publication, the executable range catalog) is Task
+/// 6E's; nothing here registers one.
+impl LiveBlockAuthority for LiveArenaExecutable {
+    fn entry(&self) -> HostVa {
+        let extents = self.record.extents();
+        // The acquire path already proved this exact range resolves and that
+        // `entry_offset` is zero and inside the code extent, so a resolution
+        // failure here is unreachable; a null entry is what the translator's
+        // own install check refuses.
+        match self
+            .inner
+            .resolve_code(extents.code.offset, extents.code.len)
+        {
+            Ok(code) => HostVa(
+                code.exec
+                    .as_ptr()
+                    .addr()
+                    .saturating_add(self.record.entry_offset() as usize),
+            ),
+            Err(_) => HostVa(0),
+        }
+    }
+
+    fn code_len(&self) -> usize {
+        usize::try_from(self.record.extents().code.len).unwrap_or(0)
+    }
+
+    fn guest_start(&self) -> GuestVa {
+        GuestVa(self.record.guest_start())
+    }
+
+    fn source_page(&self) -> GuestVa {
+        GuestVa(self.record.source_page())
+    }
+
+    fn group_slot(&self) -> u32 {
+        self.record.group_slot()
+    }
+
+    fn chunk_index(&self) -> u32 {
+        self.record.chunk_index()
+    }
+
+    fn cold_metadata(&self) -> Result<&[u8], LivePrivateReason> {
+        let extents = self.record.extents();
+        let cold = self.inner.resolve_control(
+            self.inner.layout.cold_base(),
+            self.inner.layout.capacities().cold,
+            extents.cold.offset,
+            extents.cold.len,
+        )?;
+        // SAFETY: the range was checked against this view's retained mapping
+        // geometry, and a READY block's COLD extent is append-only reserved and
+        // immutable after publication. The slice borrows `self`, which retains
+        // the process view and therefore the control mapping.
+        Ok(unsafe { std::slice::from_raw_parts(cold.as_ptr(), cold.len) })
+    }
+}
+
+/// The translator-facing authority: one live arena, one process view.
+///
+/// Both paths end in the SAME READY consumer (`acquire`), so a winner's own
+/// block is validated and I-cache-invalidated exactly as another process's
+/// would be. Neither path touches the caller's private translation cache.
+impl LiveTranslationAuthority for LiveArenaProcessView {
+    fn acquire_ready(
+        &self,
+        key: &TranslationUnitKey,
+        guest_start: GuestVa,
+        generation: &PageGenerationObservation,
+    ) -> LiveReadyOutcome {
+        match self.acquire_ready_or_miss(key, guest_start) {
+            DarwinLiveReadyLookup::Ready(ready) => match self.acquire(ready, generation) {
+                Ok(executable) => LiveReadyOutcome::Installed(Box::new(executable)),
+                Err(reason) => LiveReadyOutcome::Private(reason),
+            },
+            DarwinLiveReadyLookup::Miss => LiveReadyOutcome::Miss,
+            DarwinLiveReadyLookup::Private(reason) => LiveReadyOutcome::Private(reason),
+        }
+    }
+
+    fn publish_winner(
+        &self,
+        key: &TranslationUnitKey,
+        guest_start: GuestVa,
+        block_end: GuestVa,
+        generation: &PageGenerationObservation,
+        owner_pid: i32,
+        prepare: &mut dyn FnMut() -> Result<
+            PreparedSharedInitial,
+            carrick_dsr_aarch64::types::DsrError,
+        >,
+    ) -> LivePublishOutcome {
+        let claim = match self.claim_eligible(key, guest_start, block_end, generation, owner_pid) {
+            DarwinLiveLookup::Publish(claim) => claim,
+            // Another publisher won the same key between the READY lookup and
+            // this claim: consume its record rather than translating twice.
+            DarwinLiveLookup::Ready(ready) => {
+                return match self.acquire(ready, generation) {
+                    Ok(executable) => LivePublishOutcome::Installed(Box::new(executable)),
+                    Err(reason) => LivePublishOutcome::Private(reason),
+                };
+            }
+            DarwinLiveLookup::Private(reason) => return LivePublishOutcome::Private(reason),
+        };
+        let prepared = match prepare() {
+            Ok(prepared) => prepared,
+            // Dropping the unique claim RAII-publishes FAILED, so no other
+            // process waits on a preparation that will never complete.
+            Err(error) => return LivePublishOutcome::PrepareRefused(error),
+        };
+        let reserved = match claim.reserve(prepared) {
+            Ok(reserved) => reserved,
+            Err(reason) => return LivePublishOutcome::Private(reason),
+        };
+        let published = match reserved.publish() {
+            Ok(published) => published,
+            Err(reason) => return LivePublishOutcome::Private(reason),
+        };
+        match self.acquire(published, generation) {
+            Ok(executable) => LivePublishOutcome::Installed(Box::new(executable)),
+            Err(reason) => LivePublishOutcome::Private(reason),
+        }
+    }
+
+    fn active_chunks_for_source_page(&self, source_page: GuestVa) -> Vec<LiveOwnedChunkIdentity> {
+        let Ok(control) = self.inner.arena.control_view() else {
+            return Vec::new();
+        };
+        control.active_chunks_for_source_page(source_page.raw())
     }
 }
 
@@ -3451,5 +3591,231 @@ mod tests {
     /// size)` identity — closed, or reused by something else.
     fn fd_no_longer_refers_to_for_test(fd: RawFd, identity: (u64, u64, u64)) -> bool {
         !fd_identity(fd, "probe").is_ok_and(|observed| observed == identity)
+    }
+    /// Task 6D: the translator seam over the real mapped arena.
+    ///
+    /// The winner publishes exactly once and installs through the SAME READY
+    /// consumer a foreign view uses, so "my own block" and "someone else's
+    /// block" are one code path with one validation.
+    #[test]
+    fn a_winner_publication_serves_a_second_process_view_from_ready() {
+        let arena = Arc::new(protocol_arena());
+        let key = live_key();
+        let start = GuestVa(0x4000_0000);
+        let end = GuestVa(0x4000_000c);
+
+        // The publisher's view: its own generation domain and process brand.
+        let publisher_generations =
+            PageGenerationTable::new(page() as u64).expect("publisher generations");
+        let publisher =
+            LiveArenaProcessView::new(Arc::clone(&arena), publisher_generations.domain())
+                .expect("publisher view");
+        let publisher_generation = publisher_generations.observe(start).expect("generation");
+        let mut prepares = 0_usize;
+        let published = publisher.publish_winner(
+            &key,
+            start,
+            end,
+            &publisher_generation,
+            unsafe { libc::getpid() },
+            &mut || {
+                prepares += 1;
+                Ok(prepared_publication_for_span(&key, start, end))
+            },
+        );
+        let LivePublishOutcome::Installed(publisher_block) = published else {
+            panic!("the unique winner must install its own block");
+        };
+        assert_eq!(prepares, 1, "the winner prepares exactly once");
+
+        // A SECOND view of the same arena — a different process's shape:
+        // different brand, different generation domain, no claim of its own.
+        let consumer_generations =
+            PageGenerationTable::new(page() as u64).expect("consumer generations");
+        let consumer = LiveArenaProcessView::new(Arc::clone(&arena), consumer_generations.domain())
+            .expect("consumer view");
+        let consumer_generation = consumer_generations.observe(start).expect("generation");
+        let LiveReadyOutcome::Installed(consumer_block) =
+            consumer.acquire_ready(&key, start, &consumer_generation)
+        else {
+            panic!("the creator's READY record must serve a second view");
+        };
+
+        assert_eq!(consumer_block.entry(), publisher_block.entry());
+        assert_eq!(consumer_block.code_len(), publisher_block.code_len());
+        assert_eq!(consumer_block.guest_start(), start);
+        assert_eq!(consumer_block.chunk_index(), publisher_block.chunk_index());
+        assert_eq!(consumer_block.group_slot(), publisher_block.group_slot());
+        assert_eq!(
+            consumer_block.cold_metadata().expect("mapped COLD extent"),
+            prepared_publication_for_span(&key, start, end).cold_bytes(),
+            "the mapped COLD stream is the publisher's exact prepared bytes"
+        );
+        // The private-fallback counter is the arena's own honesty gauge: a
+        // clean publish-then-consume must not touch it.
+        assert_eq!(
+            arena
+                .control_view()
+                .expect("control view")
+                .cursor_snapshot()
+                .private_fallbacks,
+            0
+        );
+    }
+
+    /// A live block already installed in the parent stays resolvable in a
+    /// `fork(2)` child through the INHERITED process view, and the child also
+    /// sees a record the parent publishes AFTER the fork.
+    ///
+    /// Both halves follow from the substrate rather than from a rebuild: the
+    /// arena is a SHARED file mapping inherited at the same addresses, and the
+    /// view's brand plus its generation domain are plain `Arc` identities the
+    /// child receives as an exact copy, so `Arc::ptr_eq` still holds inside
+    /// the child. Nothing in the child re-validates or re-registers anything.
+    #[test]
+    fn a_fork_child_resolves_ready_blocks_through_its_inherited_view() {
+        let arena = Arc::new(protocol_arena());
+        let key = live_key();
+        let generations = PageGenerationTable::new(page() as u64).expect("generations");
+        let view = LiveArenaProcessView::new(Arc::clone(&arena), generations.domain())
+            .expect("process view");
+        let before_fork = GuestVa(0x4000_0000);
+        let after_fork = GuestVa(0x4000_1000);
+
+        let generation = generations.observe(before_fork).expect("generation");
+        let LivePublishOutcome::Installed(parent_block) = view.publish_winner(
+            &key,
+            before_fork,
+            GuestVa(before_fork.raw() + 0xc),
+            &generation,
+            unsafe { libc::getpid() },
+            &mut || {
+                Ok(prepared_publication_for_span(
+                    &key,
+                    before_fork,
+                    GuestVa(before_fork.raw() + 0xc),
+                ))
+            },
+        ) else {
+            panic!("the parent must publish its pre-fork block");
+        };
+        let parent_entry = parent_block.entry();
+
+        let mut to_child = [0; 2];
+        let mut to_parent = [0; 2];
+        assert_eq!(unsafe { libc::pipe(to_child.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::pipe(to_parent.as_mut_ptr()) }, 0);
+
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
+        if child == 0 {
+            let mut status = 0;
+            // The pre-fork record resolves through the INHERITED view, at the
+            // inherited address, with no re-adoption.
+            match view.acquire_ready(&key, before_fork, &generation) {
+                LiveReadyOutcome::Installed(block) => {
+                    if block.entry() != parent_entry {
+                        status = 1; // resolved somewhere else
+                    }
+                    if block.cold_metadata().is_err() {
+                        status = 2; // COLD unresolvable in the child
+                    }
+                }
+                _ => status = 3, // the inherited view lost the creator record
+            }
+            // Wait for the parent's POST-fork publication, then observe it.
+            if status == 0 && read_pipe_byte(to_child[0]) != Some(1) {
+                status = 4;
+            }
+            let post_fork_generation = generations.observe(after_fork).expect("generation");
+            if status == 0
+                && !matches!(
+                    view.acquire_ready(&key, after_fork, &post_fork_generation),
+                    LiveReadyOutcome::Installed(_)
+                )
+            {
+                status = 5; // a post-fork parent publication is not visible
+            }
+            let _ = write_pipe_byte(to_parent[1], 1);
+            unsafe { libc::_exit(status) };
+        }
+
+        let post_fork_generation = generations.observe(after_fork).expect("generation");
+        assert!(matches!(
+            view.publish_winner(
+                &key,
+                after_fork,
+                GuestVa(after_fork.raw() + 0xc),
+                &post_fork_generation,
+                unsafe { libc::getpid() },
+                &mut || Ok(prepared_publication_for_span(
+                    &key,
+                    after_fork,
+                    GuestVa(after_fork.raw() + 0xc)
+                )),
+            ),
+            LivePublishOutcome::Installed(_)
+        ));
+        assert!(write_pipe_byte(to_child[1], 1));
+        assert_eq!(read_pipe_byte(to_parent[0]), Some(1));
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "1=resolved another address, 2=COLD unresolvable, 3=inherited view \
+             lost the creator record, 4=handshake failed, 5=post-fork parent \
+             publication invisible"
+        );
+        for fd in to_child.into_iter().chain(to_parent) {
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    /// The source-page hint's authority: ACTIVE chunk descriptors, reached
+    /// through the translator seam rather than through group hash placement.
+    #[test]
+    fn the_authority_enumerates_active_chunks_for_a_source_page() {
+        let arena = Arc::new(protocol_arena());
+        let key = live_key();
+        let start = GuestVa(0x4000_0000);
+        let end = GuestVa(0x4000_000c);
+        let generations = PageGenerationTable::new(page() as u64).expect("generations");
+        let view = LiveArenaProcessView::new(Arc::clone(&arena), generations.domain())
+            .expect("process view");
+        let source_page = GuestVa(start.raw() / LIVE_SOURCE_PAGE_BYTES * LIVE_SOURCE_PAGE_BYTES);
+
+        assert!(
+            view.active_chunks_for_source_page(source_page).is_empty(),
+            "a fresh arena owns no chunk for any source page"
+        );
+
+        let generation = generations.observe(start).expect("generation");
+        assert!(matches!(
+            view.publish_winner(
+                &key,
+                start,
+                end,
+                &generation,
+                unsafe { libc::getpid() },
+                &mut || Ok(prepared_publication_for_span(&key, start, end)),
+            ),
+            LivePublishOutcome::Installed(_)
+        ));
+
+        let owned = view.active_chunks_for_source_page(source_page);
+        assert_eq!(owned.len(), 1, "one group allocated one chunk: {owned:?}");
+        assert_eq!(owned[0].source_page, source_page.raw());
+        assert_eq!(
+            owned[0].unit_key_digest,
+            key.live_digest().expect("live digest")
+        );
+        assert!(
+            view.active_chunks_for_source_page(GuestVa(source_page.raw() + LIVE_SOURCE_PAGE_BYTES))
+                .is_empty(),
+            "enumeration is exact per source page"
+        );
     }
 }

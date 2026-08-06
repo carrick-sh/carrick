@@ -1130,6 +1130,26 @@ pub(crate) fn validate_shared_initial_metadata(
     ))
 }
 
+/// Decode ONE mapped shared-INITIAL COLD stream.
+///
+/// This is the lazy half of the live consumer contract: a live block leaves
+/// its pc map and recovery metadata undecoded in the arena's mapped COLD pool
+/// until a guest fault interrogates it, exactly as a unit-replayed block
+/// leaves them undecoded in its unit's cold stream.
+pub(crate) fn decode_shared_initial_cold(cold_bytes: &[u8]) -> Result<UnitBlockColdWire, DsrError> {
+    let config = bincode::config::standard().with_limit::<SHARED_INITIAL_METADATA_LIMIT>();
+    let (cold, consumed): (UnitBlockColdWire, usize) =
+        bincode::serde::decode_from_slice(cold_bytes, config).map_err(|error| {
+            DsrError::CachePolicy(format!("decode live shared INITIAL COLD metadata: {error}"))
+        })?;
+    if consumed != cold_bytes.len() {
+        return Err(DsrError::CachePolicy(
+            "live shared INITIAL COLD metadata has trailing bytes".to_string(),
+        ));
+    }
+    Ok(cold)
+}
+
 /// Exact HOT-only validation for a mapped shared-INITIAL consumer. COLD is
 /// deliberately absent: it remains lazy until fault reconstruction needs it.
 pub(crate) fn validate_shared_initial_hot(hot_bytes: &[u8], code_len: u32) -> Result<(), DsrError> {
