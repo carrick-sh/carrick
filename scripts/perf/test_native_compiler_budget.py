@@ -784,6 +784,14 @@ def nativeperf_frames_v6(pid=10, tid=11, era=12, exec_epoch=0):
     ]
 
 
+def nativeperf_frames_v7(pid=10, tid=11, era=12, exec_epoch=0):
+    prefix = f"NATIVEPERF1|thread|complete=1|pid={pid}|tid={tid}|era={era}|frame="
+    lines = nativeperf_frames_v6(pid=pid, tid=tid, era=era, exec_epoch=exec_epoch)
+    return lines + [
+        prefix + "live-revoke|live_revoked_chunks=9|live_stale_instruction_aborts=2",
+    ]
+
+
 def nativeperf_frames_v3_with_exclusive(
     pid=10, tid=11, era=12, exec_epoch=0, *, executions=1, unique_sites=1
 ):
@@ -990,6 +998,35 @@ class NativePerfTests(unittest.TestCase):
 
 
 class NativePerfV2Tests(unittest.TestCase):
+    def test_v7_parses_and_round_trips_the_live_revocation_frame(self):
+        profile = budget.parse_nativeperf(nativeperf_frames_v7())
+        budget.validate_profile(profile)
+        self.assertEqual(profile.version, 7)
+        self.assertEqual(len(profile.threads[0].frames), 24)
+        self.assertEqual(
+            profile.threads[0].value("live-revoke", "live_revoked_chunks"), 9
+        )
+        self.assertEqual(
+            profile.threads[0].value("live-revoke", "live_stale_instruction_aborts"), 2
+        )
+        # Revocation is its own frame: the live-lane serve/publish frame must
+        # not have absorbed it, or a reader would double-count on the delta.
+        for field in ("live_revoked_chunks", "live_stale_instruction_aborts"):
+            self.assertNotIn(field, budget.FRAME_FIELDS_V7["live-lane"])
+            self.assertNotIn(field, budget.FRAME_FIELDS_V7["live-bytes"])
+
+        encoded = budget.run_record_json(
+            budget.RunRecord.synthetic(profile=profile, schedule_label="on-1")
+        )
+        decoded = budget.parse_result_row(encoded)
+        self.assertEqual(decoded.profile, profile)
+        self.assertEqual(decoded.profile.version, 7)
+
+    def test_v6_record_still_reads_as_v6_after_v7(self):
+        profile = budget.parse_nativeperf(nativeperf_frames_v6())
+        budget.validate_profile(profile)
+        self.assertEqual(profile.version, 6)
+
     def test_v6_parses_and_round_trips_the_live_lane_frames(self):
         profile = budget.parse_nativeperf(nativeperf_frames_v6())
         budget.validate_profile(profile)

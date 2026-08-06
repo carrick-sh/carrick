@@ -250,6 +250,20 @@ FRAME_FIELDS_V6 = {
     "live-fallback-c": set(LIVE_FALLBACK_CLASSES[12:]),
 }
 REQUIRED_FRAMES_V6 = frozenset(FRAME_FIELDS_V6)
+# NATIVEPERF v7 adds the live lane's REVOCATION pair: chunks this process
+# protected PROT_NONE after a source-page mutation, and the stale instruction
+# aborts the exact classifier recovered privately. They are their own frame
+# because they are the only live counters produced outside the translate path
+# (the guest-write seam and the fault classifier). Additive only, so a v6
+# record still reads exactly as v6.
+FRAME_FIELDS_V7 = {
+    **{frame: set(fields) for frame, fields in FRAME_FIELDS_V6.items()},
+    "live-revoke": {
+        "live_revoked_chunks",
+        "live_stale_instruction_aborts",
+    },
+}
+REQUIRED_FRAMES_V7 = frozenset(FRAME_FIELDS_V7)
 # The supervisor record (`NATIVEPERF1|supervisor|...`) is a v2-era, per-PROFILE
 # (not per-thread-group) record: the top-level `carrick run` process's own
 # getrusage(RUSAGE_SELF)/getrusage(RUSAGE_CHILDREN) CPU. It is a top-level
@@ -984,6 +998,7 @@ def _frame_contract(frame: str, extras: set[str]) -> tuple[int | None, set[str]]
     fields_v4 = FRAME_FIELDS_V4.get(frame)
     fields_v5 = FRAME_FIELDS_V5.get(frame)
     fields_v6 = FRAME_FIELDS_V6.get(frame)
+    fields_v7 = FRAME_FIELDS_V7.get(frame)
     if (
         fields_v1 is None
         and fields_v2 is None
@@ -991,6 +1006,7 @@ def _frame_contract(frame: str, extras: set[str]) -> tuple[int | None, set[str]]
         and fields_v4 is None
         and fields_v5 is None
         and fields_v6 is None
+        and fields_v7 is None
     ):
         raise BudgetError(f"unknown profile frame: {frame}")
     if fields_v1 is not None and extras == fields_v1:
@@ -1018,7 +1034,12 @@ def _frame_contract(frame: str, extras: set[str]) -> tuple[int | None, set[str]]
     if fields_v6 is not None and extras == fields_v6:
         # Only the frames v6 INTRODUCED reach here: every frame v5 also
         # carries is answered by the cascade above with its own version.
+        if fields_v6 == fields_v7 and frame not in FRAME_FIELDS_V6:
+            return 7, fields_v7
         return 6, fields_v6
+    if fields_v7 is not None and extras == fields_v7:
+        # Same rule one version on: only frames v7 INTRODUCED reach here.
+        return 7, fields_v7
     allowed = (
         (fields_v1 or set())
         | (fields_v2 or set())
@@ -1026,11 +1047,14 @@ def _frame_contract(frame: str, extras: set[str]) -> tuple[int | None, set[str]]
         | (fields_v4 or set())
         | (fields_v5 or set())
         | (fields_v6 or set())
+        | (fields_v7 or set())
     )
     unknown = extras - allowed
     if unknown:
         raise BudgetError(f"unknown field(s) in {frame}: {', '.join(sorted(unknown))}")
-    expected = fields_v1 or fields_v2 or fields_v3 or fields_v4 or fields_v5 or fields_v6
+    expected = (
+        fields_v1 or fields_v2 or fields_v3 or fields_v4 or fields_v5 or fields_v6 or fields_v7
+    )
     assert expected is not None
     missing = expected - extras
     if not missing:
@@ -1101,7 +1125,9 @@ def parse_nativeperf(lines: Iterable[str]) -> ProfileRun:
     for (pid, tid, era), frames in sorted(groups.items()):
         key = (pid, tid, era)
         versions = group_versions.get(key, set())
-        if versions == {2, 3, 4, 5, 6}:
+        if versions == {2, 3, 4, 5, 6, 7}:
+            version = 7
+        elif versions == {2, 3, 4, 5, 6}:
             version = 6
         elif versions == {2, 3, 4, 5}:
             version = 5
@@ -1124,6 +1150,7 @@ def parse_nativeperf(lines: Iterable[str]) -> ProfileRun:
             4: REQUIRED_FRAMES_V4,
             5: REQUIRED_FRAMES_V5,
             6: REQUIRED_FRAMES_V6,
+            7: REQUIRED_FRAMES_V7,
         }[version]
         missing = required - set(frames)
         if missing:
@@ -2721,6 +2748,9 @@ def _parse_profile_json(value: object) -> ProfileRun | None:
         elif frames == sorted(REQUIRED_FRAMES_V3):
             version = 3
             fields_by_frame = FRAME_FIELDS_V3
+        elif frames == sorted(REQUIRED_FRAMES_V7):
+            version = 7
+            fields_by_frame = FRAME_FIELDS_V7
         elif frames == sorted(REQUIRED_FRAMES_V6):
             version = 6
             fields_by_frame = FRAME_FIELDS_V6

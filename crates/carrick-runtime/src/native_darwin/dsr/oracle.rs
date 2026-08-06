@@ -6714,6 +6714,19 @@ mod live_revoke {
             snapshot.x[17], baseline_x17,
             "not one stale instruction executed"
         );
+        // Task 8: the recovery is COUNTED. A shape that classified but could
+        // not be recovered never reaches the counter (it falls through to the
+        // unchanged fault path), so this is exactly "stale shared code caught
+        // and re-translated privately" — the number that says whether
+        // sharing is being thrown away faster than it is being earned.
+        assert_eq!(
+            lane.fixture
+                .translator
+                .profile_snapshot()
+                .live_stale_instruction_aborts,
+            1,
+            "the classified-and-recovered stale abort must be counted"
+        );
 
         // The normal path now translates PRIVATELY at the new generation and
         // the guest makes progress.

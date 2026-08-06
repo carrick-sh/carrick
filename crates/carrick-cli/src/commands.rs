@@ -463,20 +463,31 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             dynamic_dirty_drops,
             other_drops,
             interrupted,
+            program,
         } => {
-            validate_v2_path(
-                &input,
-                crate::trace_profile::ProfileCaptureStatus {
-                    principal_drops,
-                    aggregation_drops,
-                    dynamic_drops,
-                    dynamic_rinse_drops,
-                    dynamic_dirty_drops,
-                    other_drops,
-                    interrupted,
-                },
-            )?;
-            println!("DSRPROF2_VALID");
+            let capture_status = crate::trace_profile::ProfileCaptureStatus {
+                principal_drops,
+                aggregation_drops,
+                dynamic_drops,
+                dynamic_rinse_drops,
+                dynamic_dirty_drops,
+                other_drops,
+                interrupted,
+            };
+            // The harness dispatches on the stream's own first record, so one
+            // fixture validator covers both fail-closed parsers rather than
+            // growing a second near-identical subcommand.
+            if crate::trace_profile::path_is_dsr_live_arena(&input)? {
+                crate::trace_profile::validate_dsr_live_arena_path(
+                    &input,
+                    capture_status,
+                    program.as_deref(),
+                )?;
+                println!("DSRLIVE1_VALID");
+            } else {
+                validate_v2_path(&input, capture_status)?;
+                println!("DSRPROF2_VALID");
+            }
         }
         Commands::NativeExecPidProbe => {
             carrick_runtime::native_self_reexec_pid_probe()?;
@@ -1545,6 +1556,24 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         bail!("--script and --profile cannot be used together")
                     }
                 };
+                // The live-arena profile ships as a TEMPLATE: its BEGIN block
+                // carries a header placeholder that is replaced here with a
+                // printf naming the program's own SHA-256, so the raw stream
+                // authenticates the exact D program that produced it. Running
+                // the unrendered template would emit a stream with no header,
+                // which the parser refuses.
+                let (script_template, live_arena_program_sha256) = match (profile, script_template)
+                {
+                    (
+                        Some(crate::trace_profile::TraceProfileKind::DsrLiveArena),
+                        Some(template),
+                    ) => {
+                        let rendered =
+                            crate::trace_profile::render_dsr_live_arena_program(&template)?;
+                        (Some(rendered.program), Some(rendered.program_sha256))
+                    }
+                    (_, other) => (other, None),
+                };
                 let internal_trace = if profile.is_some() && trace_out.is_none() {
                     Some(tempfile::NamedTempFile::new().context("create temporary DSR trace")?)
                 } else {
@@ -1609,7 +1638,8 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                             }
                             crate::trace_profile::TraceProfileKind::Dsr
                             | crate::trace_profile::TraceProfileKind::DsrFork
-                            | crate::trace_profile::TraceProfileKind::DsrIndirect => {
+                            | crate::trace_profile::TraceProfileKind::DsrIndirect
+                            | crate::trace_profile::TraceProfileKind::DsrLiveArena => {
                                 unreachable!("non-native profile requested native qualification")
                             }
                         }
@@ -1748,6 +1778,12 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                                 ProfileSummary::from_path(raw_path, capture_status)?
                             };
                             summary.require_profile(requested_profile)?;
+                            // An authenticated profile's stream must name the
+                            // exact D program this run rendered, or it is not
+                            // evidence about this program.
+                            if let Some(expected) = live_arena_program_sha256.as_deref() {
+                                summary.require_program_sha256(expected)?;
+                            }
                             if let Some(overlay) = sampled_kernel_overlay {
                                 summary.attach_sampled_kernel_overlay(overlay)?;
                             }
@@ -1769,6 +1805,9 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         }
                         let mut summary = ProfileSummary::from_path(raw_path, capture_status)?;
                         summary.require_profile(requested_profile)?;
+                        if let Some(expected) = live_arena_program_sha256.as_deref() {
+                            summary.require_program_sha256(expected)?;
+                        }
                         summary.set_provenance(capture_provenance(&me, &command)?);
                         eprintln!("{}", summary.render_human());
                         if let Some(summary_path) = summary_jsonl.as_deref() {
@@ -2747,6 +2786,7 @@ mod tests {
             TraceProfileKind::Dsr,
             TraceProfileKind::DsrIndirect,
             TraceProfileKind::DsrFork,
+            TraceProfileKind::DsrLiveArena,
         ] {
             assert!(!uses_live_kernel_symbols(profile));
             assert!(!uses_native_launch_qualification(profile));

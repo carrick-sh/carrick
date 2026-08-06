@@ -120,6 +120,156 @@ fn native_profile_qualification_scripts_bind_observed_identity_and_scope() {
 
 const DSRPROF2_FIXTURE: &str = include_str!("fixtures/dsrprof2-valid.raw");
 
+fn dsr_live_arena_script_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/dtrace/dsr-live-arena.d")
+}
+
+/// The digest the shipped template authenticates with. Recomputed here from
+/// the file on disk, so a stream fixture that hardcoded a stale digest fails.
+fn dsr_live_arena_program_sha256() -> String {
+    use sha2::{Digest, Sha256};
+    let template = std::fs::read(dsr_live_arena_script_path()).unwrap();
+    format!("{:x}", Sha256::digest(&template))
+}
+
+fn dsr_live_arena_stream(header: Option<&str>, outcomes: &[(u32, u64)], attempts: u64) -> String {
+    let mut lines = Vec::new();
+    if let Some(header) = header {
+        lines.push(header.to_owned());
+    }
+    for (kind, value) in outcomes {
+        lines.push(format!(
+            "DSRPROF1|count|phase=live-outcome|pid=4242|kind={kind}|value={value}"
+        ));
+    }
+    lines.push(format!(
+        "DSRPROF1|count|phase=translation-attempts|pid=4242|value={attempts}"
+    ));
+    lines
+        .push("DSRPROF1|complete|profile=dsr-live-arena|bounded=0|target_exit_reason=1".to_owned());
+    lines.join("\n")
+}
+
+fn validate_dsr_live_arena(contents: &str, with_program: bool) -> assert_cmd::assert::Assert {
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut file, contents.as_bytes()).unwrap();
+    let mut command = cli();
+    command
+        .arg("__native-profile-validate")
+        .arg("--input")
+        .arg(file.path());
+    if with_program {
+        command.arg("--program").arg(dsr_live_arena_script_path());
+    }
+    command.assert()
+}
+
+#[test]
+fn dsr_live_arena_profile_binds_its_outcomes_and_bounds_the_capture() {
+    let script = std::fs::read_to_string(dsr_live_arena_script_path()).unwrap();
+
+    // Exactly one header slot: a second would let a rendered program carry
+    // two digests, which is no authentication at all.
+    assert_eq!(script.matches("/*%CARRICK_LIVE_ARENA_HEADER%*/").count(), 1);
+    assert_eq!(
+        script
+            .matches("DSRPROF1|complete|profile=dsr-live-arena|bounded=%d|target_exit_reason=%d")
+            .count(),
+        1
+    );
+    for probe in [
+        "carrick*:::dsr-cache-event",
+        "carrick*:::dsr-live-chunk-revoked",
+        "carrick*:::dsr-translate-begin",
+    ] {
+        assert!(script.contains(probe), "missing probe {probe}");
+    }
+    // The live outcome kinds start at 13; 7..12 belong to `dsr-indirect.d`'s
+    // direct-binding vocabulary and must not be swept in here.
+    assert!(script.contains("arg1 >= 13"));
+    // The header names `execname` to explain why it is wrong; a PREDICATE on
+    // it would silently track nothing once the host self-re-exec renames the
+    // process mid-run, so screening must key on pid/progeny.
+    assert!(!script.contains("execname =="));
+    assert!(!script.contains("execname !="));
+    assert!(script.contains("progenyof($target)"));
+    assert!(script.contains("pid == $target"));
+    assert!(script.contains("target_exit_reason = arg0"));
+    assert!(script.contains("bounded = 1;"));
+    // Every outcome kind is pre-declared, so a kind that never fires still
+    // reports a row and the parser can tell "zero" from "absent".
+    for kind in 13..=18 {
+        assert!(
+            script.contains(&format!("@outcome[$target, {kind}] = sum(0);")),
+            "outcome kind {kind} is not pre-declared"
+        );
+    }
+}
+
+#[test]
+fn dsr_live_arena_accepts_an_authenticated_capture_with_outcomes() {
+    let header = format!(
+        "DSRLIVE1|header|profile=dsr-live-arena|program_sha256={}",
+        dsr_live_arena_program_sha256()
+    );
+    let stream = dsr_live_arena_stream(Some(&header), &[(13, 57212), (16, 4)], 30208);
+    validate_dsr_live_arena(&stream, true)
+        .success()
+        .stdout(contains("DSRLIVE1_VALID"));
+}
+
+#[test]
+fn dsr_live_arena_rejects_a_zero_event_capture() {
+    let header = format!(
+        "DSRLIVE1|header|profile=dsr-live-arena|program_sha256={}",
+        dsr_live_arena_program_sha256()
+    );
+    let stream = dsr_live_arena_stream(
+        Some(&header),
+        &[(13, 0), (14, 0), (15, 0), (16, 0), (17, 0), (18, 0)],
+        30208,
+    );
+    validate_dsr_live_arena(&stream, true)
+        .failure()
+        .stderr(contains("zero live-arena outcome events"));
+}
+
+#[test]
+fn dsr_live_arena_rejects_an_unauthenticated_or_foreign_capture() {
+    let header = format!(
+        "DSRLIVE1|header|profile=dsr-live-arena|program_sha256={}",
+        dsr_live_arena_program_sha256()
+    );
+
+    // No header at all.
+    validate_dsr_live_arena(&dsr_live_arena_stream(None, &[(13, 7)], 9), true)
+        .failure()
+        .stderr(contains("no authenticated DSRLIVE1 header"));
+
+    // A header naming a different D program.
+    let foreign = format!(
+        "DSRLIVE1|header|profile=dsr-live-arena|program_sha256={}",
+        "a".repeat(64)
+    );
+    validate_dsr_live_arena(&dsr_live_arena_stream(Some(&foreign), &[(13, 7)], 9), true)
+        .failure()
+        .stderr(contains("was produced by D program"));
+
+    // Two headers.
+    let doubled = format!(
+        "{header}\n{}",
+        dsr_live_arena_stream(Some(&header), &[(13, 7)], 9)
+    );
+    validate_dsr_live_arena(&doubled, true)
+        .failure()
+        .stderr(contains("duplicate dsr-live-arena header"));
+
+    // Outcomes but no translation denominator.
+    validate_dsr_live_arena(&dsr_live_arena_stream(Some(&header), &[(13, 7)], 0), true)
+        .failure()
+        .stderr(contains("no translation attempts"));
+}
+
 fn validate_dsrprof2_fixture(contents: &str, extra_args: &[&str]) -> assert_cmd::assert::Assert {
     let mut file = tempfile::NamedTempFile::new().unwrap();
     std::io::Write::write_all(&mut file, contents.as_bytes()).unwrap();

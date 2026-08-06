@@ -994,6 +994,283 @@ impl Drop for ProcessTranslator {
     }
 }
 
+/// Export-only live-arena state for a debugger.
+///
+/// Written to a process-global `static` so `scripts/carrick_lldb.py`'s
+/// `xlat-live-arena` can read a LIVE process or a CORE with nothing pre-armed
+/// — the same always-on principle as `carrick_runtime::event_ring`, and the
+/// reason a wedged or crashed compiler child is still inspectable.
+///
+/// The contract with the debugger is the BYTE LAYOUT, not a Rust type:
+/// `repr(C)`, fixed-width little-endian scalars, an explicit magic and
+/// version, and self-describing slot counts and record strides so a reader
+/// that finds an unexpected version refuses instead of decoding garbage.
+///
+/// It is strictly EXPORT-ONLY. Nothing in carrick reads these records back,
+/// no arena state is derived from them, and there is no importer: the export
+/// cannot make a translation decision or repair an arena.
+pub mod live_arena_export {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+    /// `CRKXLAT1`, little-endian. A debugger validates this before decoding.
+    pub const MAGIC: u64 = u64::from_le_bytes(*b"CRKXLAT1");
+    pub const VERSION: u32 = 1;
+    /// Both tables are RINGS of the most recent entries: a compiler process
+    /// installs tens of thousands of live blocks, so a bounded prefix would
+    /// describe only its first moments. `*_total` carries the true count, so
+    /// a reader always knows how many entries it is NOT seeing.
+    pub const READY_SLOTS: usize = 512;
+    pub const REVOKED_SLOTS: usize = 128;
+
+    /// One installed live block. 48 bytes, no implicit padding.
+    #[repr(C)]
+    pub struct ReadyRecord {
+        pub guest_start: AtomicU64,
+        pub cache_entry: AtomicU64,
+        pub code_len: AtomicU64,
+        pub source_page: AtomicU64,
+        pub generation: AtomicU64,
+        pub chunk_index: AtomicU32,
+        pub reserved: AtomicU32,
+    }
+
+    impl ReadyRecord {
+        /// A `const fn` rather than an associated `const`: a named constant
+        /// with interior mutability is copied at every use site, which is
+        /// exactly the bug clippy's `declare_interior_mutable_const` names.
+        const fn empty() -> Self {
+            Self {
+                guest_start: AtomicU64::new(0),
+                cache_entry: AtomicU64::new(0),
+                code_len: AtomicU64::new(0),
+                source_page: AtomicU64::new(0),
+                generation: AtomicU64::new(0),
+                chunk_index: AtomicU32::new(0),
+                reserved: AtomicU32::new(0),
+            }
+        }
+    }
+
+    /// One task-local RX chunk revoked `PROT_NONE`. 32 bytes, no padding.
+    #[repr(C)]
+    pub struct RevokedRecord {
+        pub source_page: AtomicU64,
+        pub rx_start: AtomicU64,
+        pub rx_len: AtomicU64,
+        pub chunk_index: AtomicU32,
+        pub reserved: AtomicU32,
+    }
+
+    impl RevokedRecord {
+        const fn empty() -> Self {
+            Self {
+                source_page: AtomicU64::new(0),
+                rx_start: AtomicU64::new(0),
+                rx_len: AtomicU64::new(0),
+                chunk_index: AtomicU32::new(0),
+                reserved: AtomicU32::new(0),
+            }
+        }
+    }
+
+    /// 64-byte header, then the two rings. Field order and offsets are ABI.
+    #[repr(C)]
+    pub struct Export {
+        pub magic: AtomicU64,
+        pub version: AtomicU32,
+        pub ready_slots: AtomicU32,
+        pub revoked_slots: AtomicU32,
+        pub ready_record_bytes: AtomicU32,
+        pub revoked_record_bytes: AtomicU32,
+        pub reserved: AtomicU32,
+        pub rx_start: AtomicU64,
+        pub rx_end: AtomicU64,
+        pub ready_total: AtomicU64,
+        pub revoked_total: AtomicU64,
+        pub ready: [ReadyRecord; READY_SLOTS],
+        pub revoked: [RevokedRecord; REVOKED_SLOTS],
+    }
+
+    impl Export {
+        /// A fully initialized empty export. `LIVE_ARENA_EXPORT` uses it so
+        /// the static lives in `.data` already valid: a core taken before any
+        /// live block exists decodes as EMPTY rather than as corrupt.
+        pub const fn empty() -> Self {
+            Self {
+                magic: AtomicU64::new(MAGIC),
+                version: AtomicU32::new(VERSION),
+                ready_slots: AtomicU32::new(READY_SLOTS as u32),
+                revoked_slots: AtomicU32::new(REVOKED_SLOTS as u32),
+                ready_record_bytes: AtomicU32::new(size_of::<ReadyRecord>() as u32),
+                revoked_record_bytes: AtomicU32::new(size_of::<RevokedRecord>() as u32),
+                reserved: AtomicU32::new(0),
+                rx_start: AtomicU64::new(0),
+                rx_end: AtomicU64::new(0),
+                ready_total: AtomicU64::new(0),
+                revoked_total: AtomicU64::new(0),
+                ready: [const { ReadyRecord::empty() }; READY_SLOTS],
+                revoked: [const { RevokedRecord::empty() }; REVOKED_SLOTS],
+            }
+        }
+
+        /// Publish this process's live RX payload extent, once per image.
+        pub fn note_rx_payload(&self, start: usize, end: usize) {
+            self.rx_start.store(start as u64, Ordering::Relaxed);
+            self.rx_end.store(end as u64, Ordering::Relaxed);
+        }
+
+        /// Record one installed live block in the READY ring.
+        pub fn note_ready(
+            &self,
+            guest_start: u64,
+            cache_entry: u64,
+            code_len: u64,
+            source_page: u64,
+            generation: u64,
+            chunk_index: u32,
+        ) {
+            let total = self.ready_total.load(Ordering::Relaxed);
+            let slot = &self.ready[(total as usize) % READY_SLOTS];
+            slot.guest_start.store(guest_start, Ordering::Relaxed);
+            slot.cache_entry.store(cache_entry, Ordering::Relaxed);
+            slot.code_len.store(code_len, Ordering::Relaxed);
+            slot.source_page.store(source_page, Ordering::Relaxed);
+            slot.generation.store(generation, Ordering::Relaxed);
+            slot.chunk_index.store(chunk_index, Ordering::Relaxed);
+            self.ready_total
+                .store(total.saturating_add(1), Ordering::Relaxed);
+        }
+
+        /// Record one revoked RX chunk in the revoked ring.
+        pub fn note_revoked(&self, source_page: u64, rx_start: u64, rx_len: u64, chunk_index: u32) {
+            let total = self.revoked_total.load(Ordering::Relaxed);
+            let slot = &self.revoked[(total as usize) % REVOKED_SLOTS];
+            slot.source_page.store(source_page, Ordering::Relaxed);
+            slot.rx_start.store(rx_start, Ordering::Relaxed);
+            slot.rx_len.store(rx_len, Ordering::Relaxed);
+            slot.chunk_index.store(chunk_index, Ordering::Relaxed);
+            self.revoked_total
+                .store(total.saturating_add(1), Ordering::Relaxed);
+        }
+    }
+
+    /// The process-global export a debugger reads.
+    pub static LIVE_ARENA_EXPORT: Export = Export::empty();
+
+    /// The layout the debugger decodes. A change here is a `VERSION` bump.
+    const _: () = {
+        assert!(size_of::<ReadyRecord>() == 48);
+        assert!(size_of::<RevokedRecord>() == 32);
+        assert!(std::mem::offset_of!(Export, ready) == 64);
+    };
+
+    pub fn note_rx_payload(start: usize, end: usize) {
+        LIVE_ARENA_EXPORT.note_rx_payload(start, end);
+    }
+
+    pub fn note_ready(
+        guest_start: u64,
+        cache_entry: u64,
+        code_len: u64,
+        source_page: u64,
+        generation: u64,
+        chunk_index: u32,
+    ) {
+        LIVE_ARENA_EXPORT.note_ready(
+            guest_start,
+            cache_entry,
+            code_len,
+            source_page,
+            generation,
+            chunk_index,
+        );
+    }
+
+    pub fn note_revoked(source_page: u64, rx_start: u64, rx_len: u64, chunk_index: u32) {
+        LIVE_ARENA_EXPORT.note_revoked(source_page, rx_start, rx_len, chunk_index);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The debugger decodes BYTES, so the header's self-description must
+        /// equal the layout the Rust types actually have. If these ever
+        /// disagree, `carrick_lldb.py` reads the wrong strides and prints
+        /// plausible garbage instead of refusing.
+        #[test]
+        fn the_export_header_describes_its_own_layout() {
+            let export = Box::new(Export::empty());
+            assert_eq!(export.magic.load(Ordering::Relaxed), MAGIC);
+            assert_eq!(
+                export.magic.load(Ordering::Relaxed).to_le_bytes(),
+                *b"CRKXLAT1"
+            );
+            assert_eq!(export.version.load(Ordering::Relaxed), VERSION);
+            assert_eq!(
+                export.ready_slots.load(Ordering::Relaxed) as usize,
+                READY_SLOTS
+            );
+            assert_eq!(
+                export.revoked_slots.load(Ordering::Relaxed) as usize,
+                REVOKED_SLOTS
+            );
+            assert_eq!(
+                export.ready_record_bytes.load(Ordering::Relaxed) as usize,
+                size_of::<ReadyRecord>()
+            );
+            assert_eq!(
+                export.revoked_record_bytes.load(Ordering::Relaxed) as usize,
+                size_of::<RevokedRecord>()
+            );
+            assert_eq!(std::mem::offset_of!(Export, ready), 64);
+            assert_eq!(
+                std::mem::offset_of!(Export, revoked),
+                64 + READY_SLOTS * size_of::<ReadyRecord>()
+            );
+        }
+
+        /// Both tables are RINGS: a compiler process installs far more live
+        /// blocks than the export retains, so a reader must see the MOST
+        /// RECENT entries plus a true total, never a stale prefix that
+        /// silently claims to be everything.
+        #[test]
+        fn the_rings_retain_the_most_recent_entries_and_the_true_total() {
+            let export = Box::new(Export::empty());
+            let writes = READY_SLOTS + 3;
+            for index in 0..writes {
+                export.note_ready(index as u64, 0x1000 + index as u64, 4, 0x4000, 1, 7);
+            }
+            assert_eq!(export.ready_total.load(Ordering::Relaxed), writes as u64);
+            let newest = &export.ready[(writes - 1) % READY_SLOTS];
+            assert_eq!(
+                newest.guest_start.load(Ordering::Relaxed),
+                (writes - 1) as u64
+            );
+            assert_eq!(
+                export.ready[0].guest_start.load(Ordering::Relaxed),
+                READY_SLOTS as u64,
+                "slot 0 must hold the WRAPPED write, not the first one"
+            );
+
+            export.note_revoked(0x4000, 0x9000, 0x1_0000, 3);
+            assert_eq!(export.revoked_total.load(Ordering::Relaxed), 1);
+            assert_eq!(export.revoked[0].rx_start.load(Ordering::Relaxed), 0x9000);
+            assert_eq!(export.revoked[0].rx_len.load(Ordering::Relaxed), 0x1_0000);
+            assert_eq!(export.revoked[0].chunk_index.load(Ordering::Relaxed), 3);
+        }
+
+        #[test]
+        fn an_untouched_export_decodes_as_empty_not_corrupt() {
+            let export = Box::new(Export::empty());
+            assert_eq!(export.ready_total.load(Ordering::Relaxed), 0);
+            assert_eq!(export.revoked_total.load(Ordering::Relaxed), 0);
+            assert_eq!(export.rx_start.load(Ordering::Relaxed), 0);
+            assert_eq!(export.rx_end.load(Ordering::Relaxed), 0);
+        }
+    }
+}
+
 pub struct ProcessState {
     pub cache: cache::TranslationCache,
     published_blocks: Arc<PublishedBlockIndex>,
@@ -1859,6 +2136,13 @@ pub struct ResolverStats {
     pub live_cold_bytes: u64,
     pub live_links_patched: u64,
     pub live_links_out_of_reach: u64,
+    /// Task 7's revocation seam. `live_revoked_chunks` counts exact 64 KiB
+    /// local RX chunks this process protected `PROT_NONE` after a mutation of
+    /// their source page; `live_stale_instruction_aborts` counts the
+    /// instruction aborts inside one of those chunks that the exact
+    /// classifier consumed and recovered into a private translation.
+    pub live_revoked_chunks: u64,
+    pub live_stale_instruction_aborts: u64,
     /// One counter per named live-lane fallback, indexed by
     /// [`profile::LiveLaneFallbackClass`]. An array rather than seventeen
     /// scalars for the same reason `exclusive_fusion_sites` is one: the
@@ -1921,10 +2205,15 @@ pub enum ResolverStat {
     LiveColdBytes,
     LiveLinksPatched,
     LiveLinksOutOfReach,
+    // Produced OUTSIDE the translate path: the guest-write revocation seam
+    // and the stale-abort classifier. Process-scoped like the rest of the
+    // Live* family.
+    LiveRevokedChunks,
+    LiveStaleInstructionAborts,
 }
 
 impl ResolverStat {
-    const ALL: [Self; 44] = [
+    const ALL: [Self; 46] = [
         Self::ResolverExits,
         Self::OneEntryHits,
         Self::Translations,
@@ -1969,6 +2258,8 @@ impl ResolverStat {
         Self::LiveColdBytes,
         Self::LiveLinksPatched,
         Self::LiveLinksOutOfReach,
+        Self::LiveRevokedChunks,
+        Self::LiveStaleInstructionAborts,
     ];
 
     const fn name(self) -> &'static str {
@@ -2017,6 +2308,8 @@ impl ResolverStat {
             Self::LiveColdBytes => "live_cold_bytes",
             Self::LiveLinksPatched => "live_links_patched",
             Self::LiveLinksOutOfReach => "live_links_out_of_reach",
+            Self::LiveRevokedChunks => "live_revoked_chunks",
+            Self::LiveStaleInstructionAborts => "live_stale_instruction_aborts",
         }
     }
 }
@@ -2068,6 +2361,8 @@ impl ResolverStats {
             ResolverStat::LiveColdBytes => self.live_cold_bytes,
             ResolverStat::LiveLinksPatched => self.live_links_patched,
             ResolverStat::LiveLinksOutOfReach => self.live_links_out_of_reach,
+            ResolverStat::LiveRevokedChunks => self.live_revoked_chunks,
+            ResolverStat::LiveStaleInstructionAborts => self.live_stale_instruction_aborts,
         }
     }
 
@@ -2127,6 +2422,8 @@ impl ResolverStats {
             ResolverStat::LiveColdBytes => self.live_cold_bytes = value,
             ResolverStat::LiveLinksPatched => self.live_links_patched = value,
             ResolverStat::LiveLinksOutOfReach => self.live_links_out_of_reach = value,
+            ResolverStat::LiveRevokedChunks => self.live_revoked_chunks = value,
+            ResolverStat::LiveStaleInstructionAborts => self.live_stale_instruction_aborts = value,
         }
     }
 
@@ -2203,6 +2500,43 @@ impl ResolverStats {
                 ))?;
         }
         Ok(delta)
+    }
+}
+
+/// The one mapping from a counted live-lane fallback class to the USDT
+/// OUTCOME that names it. Exhaustive with no wildcard, so a new class is a
+/// compile error here rather than a silently unreported outcome, and the
+/// probe vocabulary can never disagree with the counter vocabulary — they are
+/// derived from the same enum.
+///
+/// `Unconfigured` maps to `None` deliberately: it is EVERY authoritative
+/// INITIAL miss on the shipped default, so firing there would add a probe
+/// call to the default translate path.
+const fn live_fallback_probe_kind(
+    class: profile::LiveLaneFallbackClass,
+) -> Option<probes::DsrCacheEventKind> {
+    use profile::LiveLaneFallbackClass as Class;
+    match class {
+        Class::Unconfigured => None,
+        Class::ArenaCasLost => Some(probes::DsrCacheEventKind::LiveCasLoss),
+        // A record was found and this process REFUSED it. These three imply a
+        // different fix from the rest (a corrupt or unreadable publication,
+        // not an ineligible block), which is why they are their own outcome.
+        Class::UnresolvedEntry | Class::ArenaInvalidRecord | Class::ArenaUnknownState => {
+            Some(probes::DsrCacheEventKind::LiveValidationRefusal)
+        }
+        Class::Regenerated
+        | Class::OutsideSegment
+        | Class::CrossPage
+        | Class::UnsupportedShape
+        | Class::SourceWordsUnavailable
+        | Class::PrepareRefused
+        | Class::ArenaBuilding
+        | Class::ArenaFailed
+        | Class::ArenaCapacity
+        | Class::ArenaExhaustedProbes
+        | Class::ArenaKeyEncoding
+        | Class::ArenaWriteAttempted => Some(probes::DsrCacheEventKind::LivePrivateFallback),
     }
 }
 
@@ -2660,6 +2994,8 @@ impl ThreadTranslator {
             live_cold_bytes: process.stats.live_cold_bytes,
             live_links_patched: process.stats.live_links_patched,
             live_links_out_of_reach: process.stats.live_links_out_of_reach,
+            live_revoked_chunks: process.stats.live_revoked_chunks,
+            live_stale_instruction_aborts: process.stats.live_stale_instruction_aborts,
             live_fallbacks: process.stats.live_fallbacks,
         }
     }
@@ -2741,6 +3077,8 @@ impl ThreadTranslator {
             live_cold_bytes: delta.live_cold_bytes,
             live_links_patched: delta.live_links_patched,
             live_links_out_of_reach: delta.live_links_out_of_reach,
+            live_revoked_chunks: delta.live_revoked_chunks,
+            live_stale_instruction_aborts: delta.live_stale_instruction_aborts,
             live_fallbacks: delta.live_fallbacks,
         })
     }
@@ -2846,6 +3184,8 @@ impl ThreadTranslator {
             live_cold_bytes: 0,
             live_links_patched: 0,
             live_links_out_of_reach: 0,
+            live_revoked_chunks: 0,
+            live_stale_instruction_aborts: 0,
             live_fallbacks: [0; profile::LiveLaneFallbackClass::COUNT],
         })
     }
@@ -3379,6 +3719,10 @@ impl ProcessTranslator {
             None => {}
         }
         let prepared = state.executable_ranges.prepare_prepend(start, end)?;
+        // Export-only: publish the RX extent a debugger needs to tell an
+        // arena cache PC from a private one. Written after every refusal
+        // above, so a rejected install never leaves a range behind.
+        live_arena_export::note_rx_payload(start, end);
         // Infallible from here: the record is install-once and the catalog
         // node is already allocated.
         let _ = self
@@ -4307,6 +4651,37 @@ impl ProcessState {
         LiveConsultation::Private(fallback)
     }
 
+    /// Fire the USDT OUTCOME that names one live-lane fallback.
+    ///
+    /// Separate from `live_fallback` (which counts) because the counter is
+    /// process-scoped and the probe is thread-attributed: only `translate`
+    /// holds the `tid`, so the probe fires where the consultation's verdict
+    /// is consumed. Policy-off costs one `Option` check: with no live
+    /// authority installed there is nothing to report and this returns before
+    /// touching the class mapping at all.
+    fn fire_live_fallback_outcome(
+        &self,
+        tid: i32,
+        fallback: LiveFallback,
+        guest: carrick_guest_mem::GuestVa,
+        generation: types::CodeGeneration,
+    ) {
+        if self.live_authority.is_none() {
+            return;
+        }
+        let Some(kind) = live_fallback_probe_kind(profile::LiveLaneFallbackClass::from(fallback))
+        else {
+            return;
+        };
+        probes::dsr_cache_event(
+            tid,
+            kind,
+            guest.raw(),
+            generation.get(),
+            u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
+        );
+    }
+
     /// The read-only exact READY lookup performed at the top of an
     /// authoritative INITIAL miss.
     ///
@@ -4504,6 +4879,15 @@ impl ProcessState {
         self.stats
             .add(ResolverStat::LiveColdBytes, extents.cold.len);
         let source_page = authority.source_page();
+        // Export-only debugger record for this exact installed block.
+        live_arena_export::note_ready(
+            key.0.raw(),
+            host_entry.raw() as u64,
+            len as u64,
+            source_page.raw(),
+            key.1.get(),
+            authority.chunk_index(),
+        );
         self.note_live_source_page(source_page, authority.group_slot(), authority.chunk_index());
         let entry = types::CacheVa::published(host_entry);
         let authority: Arc<dyn crate::live_arena::LiveBlockAuthority> = Arc::from(authority);
@@ -4614,7 +4998,31 @@ impl ProcessState {
         }
         let revoked = authority.revoke_source_range(range, &hints)?;
         let count = revoked.len();
+        // One counted revocation per chunk PROTECTED, including an idempotent
+        // re-assertion over an already-revoked chunk: the number a reader
+        // wants is mutation PRESSURE on shared code, not the distinct chunk
+        // set. Saturating like every other live counter.
+        self.stats.add_usize(ResolverStat::LiveRevokedChunks, count);
         for chunk in revoked {
+            // The revocation outcome is process-scoped — this seam runs on the
+            // guest memory-mutation path, which has no guest thread in scope —
+            // so it rides its own typed probe rather than borrowing
+            // `dsr-cache-event`'s `tid`/`generation`/`used_bytes` domains.
+            live_arena_export::note_revoked(
+                chunk.source_page.raw(),
+                chunk.rx_start.raw() as u64,
+                chunk.rx_len as u64,
+                chunk.chunk_index,
+            );
+            if let Some(rx_end) = chunk.rx_start.raw().checked_add(chunk.rx_len)
+                && let Ok(event) = probes::DsrLiveChunkRevocation::revoked(
+                    chunk.source_page,
+                    chunk.chunk_index,
+                    chunk.rx_start..carrick_guest_mem::HostVa(rx_end),
+                )
+            {
+                probes::dsr_live_chunk_revoked(event);
+            }
             match self
                 .revoked_live_chunks
                 .binary_search_by(|seen| seen.rx_start.raw().cmp(&chunk.rx_start.raw()))
@@ -4871,6 +5279,9 @@ impl ProcessState {
         // authoritative INITIAL miss: above decode, above the persistent unit
         // store, and above any private-cache mutation.
         let live_ready = self.live_ready_consultation(guest, generation, &observation);
+        if let LiveConsultation::Private(fallback) = live_ready {
+            self.fire_live_fallback_outcome(tid, fallback, guest, generation);
+        }
         if let LiveConsultation::Installed(entry) = live_ready {
             self.drain_pending_links_to_live(key, entry)?;
             probes::dsr_cache_event(
@@ -5133,8 +5544,8 @@ impl ProcessState {
             // block: a named private fallback above (BUILDING, FAILED, a
             // corrupt record, an unconfigured lane) is immediate and never
             // retried here.
-            if live_ready == LiveConsultation::Miss
-                && let LiveConsultation::Installed(entry) = self.live_winner_publication(
+            let publication = (live_ready == LiveConsultation::Miss).then(|| {
+                self.live_winner_publication(
                     &block,
                     guest,
                     generation,
@@ -5142,7 +5553,11 @@ impl ProcessState {
                     memory.address_mode().into(),
                     block_source_words.as_ref(),
                 )
-            {
+            });
+            if let Some(LiveConsultation::Private(fallback)) = publication {
+                self.fire_live_fallback_outcome(tid, fallback, guest, generation);
+            }
+            if let Some(LiveConsultation::Installed(entry)) = publication {
                 self.drain_pending_links_to_live(key, entry)?;
                 probes::dsr_cache_event(
                     tid,
@@ -6062,6 +6477,8 @@ impl ThreadTranslator {
             live_cold_bytes: process.live_cold_bytes,
             live_links_patched: process.live_links_patched,
             live_links_out_of_reach: process.live_links_out_of_reach,
+            live_revoked_chunks: process.live_revoked_chunks,
+            live_stale_instruction_aborts: process.live_stale_instruction_aborts,
             live_fallbacks: process.live_fallbacks,
         }
     }
@@ -6524,6 +6941,20 @@ impl ThreadTranslator {
             );
             state.live_blocks.remove(&stale.block_key);
             state.published_blocks.remove(stale.block_key);
+            // Counted where the recovery actually completes, under the write
+            // lock this arm already takes: a classified-but-unrecovered shape
+            // never reaches here (it falls through to the unchanged fault
+            // path), so this counter is exactly "stale shared code that was
+            // caught and re-translated privately".
+            state.stats.add(ResolverStat::LiveStaleInstructionAborts, 1);
+            let used_bytes = u64::try_from(state.cache.used_bytes()).unwrap_or(u64::MAX);
+            probes::dsr_cache_event(
+                self.tid,
+                probes::DsrCacheEventKind::LiveStaleAbortRecovered,
+                stale.guest_pc.raw(),
+                stale.block_key.1.get(),
+                used_bytes,
+            );
         }
         Ok(ThreadExit::Kick)
     }
@@ -9627,6 +10058,54 @@ mod tests {
                 }
             }
 
+            /// Task 8: revocation is the only place the MUTATION cost of
+            /// sharing becomes visible, and it is produced outside the
+            /// translate path — so it needs its own counter and its own
+            /// export record, not an inference from the serve counters.
+            #[test]
+            fn revoking_a_page_counts_its_chunks_and_exports_them() {
+                let lane = Lane::new(FakeReady::Hit, FakeWinner::Publish);
+                let page = SEGMENT_START;
+                let covering = lane.install_ready(GuestVa(page));
+                let chunk = planned_chunk(&lane, 5, page, covering);
+                lane.authority.plan_revocation(page, vec![chunk]);
+
+                assert_eq!(
+                    lane.stats().live_revoked_chunks,
+                    0,
+                    "no mutation has happened yet"
+                );
+                let before = crate::translator::live_arena_export::LIVE_ARENA_EXPORT
+                    .revoked_total
+                    .load(std::sync::atomic::Ordering::Relaxed);
+
+                let revoked = lane
+                    .translator
+                    .revoke_live_source_range(GuestVa(page)..GuestVa(page + 4))
+                    .expect("revocation must succeed");
+
+                assert_eq!(revoked, 1);
+                assert_eq!(
+                    lane.stats().live_revoked_chunks,
+                    1,
+                    "one counted revocation per chunk actually protected"
+                );
+                // A second mutation of the same page re-asserts PROT_NONE on
+                // the same chunk. That IS another revocation: the counter is
+                // mutation PRESSURE on shared code, not a distinct-chunk set.
+                lane.translator
+                    .revoke_live_source_range(GuestVa(page)..GuestVa(page + 4))
+                    .expect("re-revocation must succeed");
+                assert_eq!(lane.stats().live_revoked_chunks, 2);
+                assert!(
+                    crate::translator::live_arena_export::LIVE_ARENA_EXPORT
+                        .revoked_total
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        >= before + 2,
+                    "each revocation must also reach the debugger export"
+                );
+            }
+
             #[test]
             fn guest_write_revokes_only_matching_source_page_chunks() {
                 let lane = Lane::new(FakeReady::Hit, FakeWinner::Publish);
@@ -10027,6 +10506,52 @@ mod tests {
                 indexes,
                 (0..profile::LiveLaneFallbackClass::COUNT).collect::<Vec<_>>(),
                 "two reasons must never share one counter"
+            );
+        }
+
+        /// The COUNTER vocabulary and the USDT OUTCOME vocabulary must be one
+        /// vocabulary: the probe kind is derived from the counted class by an
+        /// exhaustive match, so there is no way to count a fallback under one
+        /// name and report it to a trace under another.
+        #[test]
+        fn every_counted_fallback_class_has_exactly_one_probe_outcome() {
+            use carrick_dsr::probes::DsrCacheEventKind as Kind;
+            use profile::LiveLaneFallbackClass as Class;
+
+            let mut silent = Vec::new();
+            let mut cas_loss = Vec::new();
+            let mut refusal = Vec::new();
+            let mut fallback = Vec::new();
+            for class in Class::ALL {
+                match super::super::live_fallback_probe_kind(class) {
+                    None => silent.push(class),
+                    Some(Kind::LiveCasLoss) => cas_loss.push(class),
+                    Some(Kind::LiveValidationRefusal) => refusal.push(class),
+                    Some(Kind::LivePrivateFallback) => fallback.push(class),
+                    Some(other) => panic!("{class:?} maps to a non-live outcome {other:?}"),
+                }
+            }
+
+            // Exactly ONE class is deliberately silent: the policy-off
+            // `Unconfigured` fallback, which is every authoritative miss on
+            // the shipped default. Any other silent class would be an outcome
+            // a trace can never see.
+            assert_eq!(silent, vec![Class::Unconfigured]);
+            assert_eq!(cas_loss, vec![Class::ArenaCasLost]);
+            assert_eq!(
+                refusal,
+                vec![
+                    Class::UnresolvedEntry,
+                    Class::ArenaInvalidRecord,
+                    Class::ArenaUnknownState
+                ],
+                "a record found and REFUSED is its own outcome: it implies a \
+                 different fix from an ineligible block"
+            );
+            assert_eq!(
+                silent.len() + cas_loss.len() + refusal.len() + fallback.len(),
+                Class::COUNT,
+                "the four outcomes must PARTITION the counted classes"
             );
         }
 

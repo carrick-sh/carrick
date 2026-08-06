@@ -956,6 +956,16 @@ pub struct ProfileSnapshot {
     /// because the arena is outside the ±128 MiB AArch64 branch reach.
     pub live_links_patched: u64,
     pub live_links_out_of_reach: u64,
+    /// Task 7's revocation seam, counted. `live_revoked_chunks` is exact
+    /// 64 KiB local RX chunks this process protected `PROT_NONE` because a
+    /// guest write, `mprotect`, `munmap`, or remap changed their source page;
+    /// `live_stale_instruction_aborts` is instruction aborts inside one of
+    /// those chunks that the exact classifier consumed and recovered
+    /// privately. The pair is the only place the mutation cost of sharing is
+    /// visible: a workload with many revocations is one where publication is
+    /// being thrown away.
+    pub live_revoked_chunks: u64,
+    pub live_stale_instruction_aborts: u64,
     pub live_fallbacks: [u64; LiveLaneFallbackClass::COUNT],
 }
 
@@ -1188,6 +1198,18 @@ impl CompleteThreadRecord {
             resolver.live_links_out_of_reach,
         );
         frames.push(live_bytes);
+        // Revocation is its own frame rather than two more fields on
+        // `live-lane`: it is the only live counter pair produced OUTSIDE the
+        // translate path (the guest-write seam and the fault classifier), and
+        // a reader that wants "was publication thrown away" wants exactly
+        // these two together.
+        let mut live_revoke = self.frame_header("live-revoke");
+        let _ = write!(
+            live_revoke,
+            "|live_revoked_chunks={}|live_stale_instruction_aborts={}",
+            resolver.live_revoked_chunks, resolver.live_stale_instruction_aborts,
+        );
+        frames.push(live_revoke);
         // Seventeen named fallback classes do not fit one PIPE_BUF-atomic
         // frame at u64::MAX, so they are split exactly like the fusion
         // classes are. The order within each frame is `ALL`'s order.
@@ -1731,7 +1753,7 @@ mod tests {
                 },
             )
             .expect("bounded frames");
-        assert_eq!(frames.len(), 23);
+        assert_eq!(frames.len(), 24);
         assert!(frames[0].contains("|frame=core|"));
         assert!(frames[0].contains("|thread_cpu_ns=5"));
         let process = frames
@@ -1739,6 +1761,60 @@ mod tests {
             .find(|frame| frame.contains("|frame=process|"))
             .expect("process frame");
         assert!(process.contains("|startup_wall_ns=9|startup_cpu_ns=3|process_cpu_ns=8"));
+    }
+
+    /// Every live counter must appear EXACTLY once across the record. A
+    /// counter emitted twice is double-counted the moment a reader sums the
+    /// per-thread frames into a process total, and a counter emitted zero
+    /// times is a metric nobody can run — the failure 6F existed to remove.
+    #[test]
+    fn the_live_revocation_counters_appear_once_and_round_trip() {
+        let budget = ThreadBudget::enabled_for_test(41, 42);
+        let record = budget.complete_record().expect("empty record");
+        let frames = record
+            .to_protocol_frames_with_resolver(
+                crate::profile::ProfileSnapshot {
+                    live_revoked_chunks: 9,
+                    live_stale_instruction_aborts: 2,
+                    ..Default::default()
+                },
+                FlushGauges {
+                    thread_cpu_ns: 5,
+                    startup_wall_ns: 9,
+                    startup_cpu_ns: 3,
+                    process_cpu_ns: 8,
+                },
+            )
+            .expect("bounded frames");
+        for field in ["live_revoked_chunks", "live_stale_instruction_aborts"] {
+            let marker = format!("|{field}=");
+            assert_eq!(
+                frames
+                    .iter()
+                    .filter(|frame| frame.contains(&marker))
+                    .count(),
+                1,
+                "{field} must be published exactly once per record"
+            );
+        }
+        let revoke = frames
+            .iter()
+            .find(|frame| frame.contains("|frame=live-revoke|"))
+            .expect("live-revoke frame");
+        assert!(
+            revoke.contains("|live_revoked_chunks=9|live_stale_instruction_aborts=2"),
+            "the revocation frame must round-trip its exact values: {revoke}"
+        );
+        // The revocation pair is deliberately NOT folded into the serve /
+        // publish frame or the byte frame: those are translate-path counters.
+        for other in ["live-lane", "live-bytes"] {
+            let frame = frames
+                .iter()
+                .find(|frame| frame.contains(&format!("|frame={other}|")))
+                .expect("live frame");
+            assert!(!frame.contains("live_revoked_chunks"));
+            assert!(!frame.contains("live_stale_instruction_aborts"));
+        }
     }
 
     #[test]
@@ -1973,12 +2049,14 @@ mod tests {
                     live_cold_bytes: u64::MAX,
                     live_links_patched: u64::MAX,
                     live_links_out_of_reach: u64::MAX,
+                    live_revoked_chunks: u64::MAX,
+                    live_stale_instruction_aborts: u64::MAX,
                     live_fallbacks: [u64::MAX; LiveLaneFallbackClass::COUNT],
                 },
                 gauges,
             )
             .expect("bounded frames");
-        assert_eq!(frames.len(), 23);
+        assert_eq!(frames.len(), 24);
         for frame in frames {
             let transport_len = frame.len().checked_add(1).expect("newline length");
             assert!(
