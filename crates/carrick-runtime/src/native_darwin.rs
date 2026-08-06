@@ -4957,66 +4957,21 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     }
                 }
             }
-            DispatchOutcome::MapHostAlias {
-                transaction,
-                va,
-                ipa: _,
-                len,
-                payload,
-                file,
-                prot_none,
-                ..
-            } => {
-                let file = file.map(|(fd, offset, prot)| (fd.into_owned_fd(), offset, prot));
-                let retval = match transaction.claim() {
-                    None => {
-                        drop(file);
-                        crate::linux_abi::LINUX_ENOMEM.guest_retval()
-                    }
-                    Some(install) => {
-                        let mut mapped_memory = memory.write();
-                        if mapped_memory
-                            .map_host_alias(
-                                va.raw(),
-                                len,
-                                &payload,
-                                file.map(|(fd, offset, prot)| (fd.into_raw_fd(), offset, prot)),
-                                prot_none,
-                            )
-                            .is_err()
-                        {
-                            std::process::abort();
-                        }
-                        if let Some((bus_start, bus_len)) = install.bus_fault_range() {
-                            let Ok(bus_len) = usize::try_from(bus_len) else {
-                                std::process::abort();
-                            };
-                            if mapped_memory.protect_range(bus_start, bus_len, 0).is_err() {
-                                std::process::abort();
-                            }
-                            mapped_memory.set_no_access(bus_start, bus_len, true);
-                        }
-                        if dispatcher.commit_host_alias_install(install).is_err() {
-                            std::process::abort();
-                        }
-                        drop(mapped_memory);
-                        va.raw() as i64
-                    }
-                };
-                snapshot = complete_dsr_syscall(
-                    &dispatcher,
-                    &memory,
-                    snapshot,
-                    thread_runtime.tid(),
-                    request.number.raw(),
-                    retval,
-                    resume,
-                    &mut translator,
-                )?;
-                require_native_syscall_service_transition(
-                    service.end(NativeSyscallServiceOutcome::Resume),
-                    "mapped alias resume end",
-                )?;
+            DispatchOutcome::MapHostAlias { .. } => {
+                // Consumed inside `dispatch_native_syscall_inner` under the
+                // dispatch's own exclusive memory guard (`install_native_
+                // host_alias`). Installing here instead — after that guard
+                // dropped — is the 2026-08-06 policy-ON go-build deadlock:
+                // the alias phase outlives the guard and this arm's
+                // `memory.write()` parks behind the sibling mapping syscall
+                // already parked in `begin_dispatch` holding the guard. Fail
+                // closed rather than re-open that window; dropping the
+                // outcome aborts the transaction and closes its fd.
+                return Err(RuntimeError::Unsupported(
+                    "MapHostAlias escaped native dispatch: alias installs must be \
+                     consumed under the dispatch-held exclusive memory guard"
+                        .to_string(),
+                ));
             }
             DispatchOutcome::SignalThread {
                 tid: target,
@@ -6114,18 +6069,27 @@ fn measure_native_blocked<const PROFILE: bool, T>(
 ///
 ///   `munlock`/`munlockall` were also audited and do NOT reach a mutator
 ///   (their bookkeeping lives in the separate `sysv`/`mem` `Mutex`, not
-///   `NativeMappedMemory`) -- correctly `false`. `shmat`/`shmget`/`shmctl`
-///   were audited too: `shmat` only touches a separate `Mutex` and returns
-///   `DispatchOutcome::MapHostAlias`, whose actual mapping mutation happens
-///   OUTSIDE `dispatch_threaded` in a caller that already takes its own
-///   `.write()` (native_darwin.rs `MapHostAlias` arm) -- also `false`.
+///   `NativeMappedMemory`) -- correctly `false`. `shmget`/`shmctl` were
+///   audited too: they only touch the sysv `Mutex` -- `false`.
+/// - `shmat`: `true` NOT because its handler touches `cx.memory` (it does
+///   not) but because it publishes a `DispatchOutcome::MapHostAlias`, and
+///   every alias publisher must dispatch under the EXCLUSIVE guard so
+///   `dispatch_native_syscall_inner` can consume the install under that same
+///   held guard. A publisher under the shared guard defers its install past
+///   the guard's release; the alias phase then outlives the guard, the
+///   install re-acquires `.write()` while sibling mapping syscalls park in
+///   `begin_dispatch` holding theirs, and the two wait on each other -- the
+///   2026-08-06 policy-ON go-build deadlock. `HostAliasDispatchGuard::
+///   publish` fail-closes that shape (see `host_alias_publishers_are_
+///   classified_mapping_mutators`).
 ///
 /// See `mapping_mutator_numbers_match_linux_abi_names` (native_darwin.rs
 /// tests) for the per-number cross-check against `crate::linux_abi`.
 fn native_syscall_mutates_mappings(nr: u64) -> bool {
     matches!(
         nr,
-        197   // shmdt
+        196   // shmat (MapHostAlias publisher; see doc above)
+            | 197 // shmdt
             | 214 // brk
             | 215 // munmap
             | 216 // mremap
@@ -6138,6 +6102,55 @@ fn native_syscall_mutates_mappings(nr: u64) -> bool {
             | 281 // execveat
             | 284 // mlock2
     )
+}
+
+/// Which `:3440` dispatch guard the current thread holds across
+/// `dispatch_threaded`, recorded so [`crate::dispatch`]'s
+/// `HostAliasDispatchGuard::publish` can refuse the one publisher shape that
+/// recreates the 2026-08-06 policy-ON go-build deadlock: publishing a
+/// deferred `MapHostAlias` install from under the SHARED guard. Such an
+/// install must run after the guard drops, re-acquiring the exclusive guard
+/// while it still owns the alias phase — and any sibling mapping syscall
+/// that won the guard in between then parks in `begin_dispatch` holding the
+/// very lock the install needs (the hold-and-wait cycle in the three
+/// task-9 lldb wedges). Exclusive-guard publishers are safe because
+/// `dispatch_native_syscall_inner` consumes their install under the same
+/// held guard; `None` (VMM lane, runtime-side actors, tests) publishers
+/// hold no native memory guard at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NativeDispatchGuardClass {
+    Shared,
+    Exclusive,
+}
+
+thread_local! {
+    static NATIVE_DISPATCH_GUARD_CLASS: std::cell::Cell<Option<NativeDispatchGuardClass>> =
+        const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn native_dispatch_guard_class() -> Option<NativeDispatchGuardClass> {
+    NATIVE_DISPATCH_GUARD_CLASS.with(std::cell::Cell::get)
+}
+
+/// RAII marker for the `:3440` dispatch site: records which guard class the
+/// dispatch below runs under, restoring the previous class on drop (dispatch
+/// does not re-enter itself, but a scope that restores is one less invariant
+/// to argue about).
+pub(crate) struct NativeDispatchGuardClassScope {
+    previous: Option<NativeDispatchGuardClass>,
+}
+
+impl NativeDispatchGuardClassScope {
+    pub(crate) fn enter(class: NativeDispatchGuardClass) -> Self {
+        let previous = NATIVE_DISPATCH_GUARD_CLASS.with(|cell| cell.replace(Some(class)));
+        Self { previous }
+    }
+}
+
+impl Drop for NativeDispatchGuardClassScope {
+    fn drop(&mut self) {
+        NATIVE_DISPATCH_GUARD_CLASS.with(|cell| cell.set(self.previous));
+    }
 }
 
 /// One end of [`NativeDispatchMemory`]'s held guard: starts `Read`, and
@@ -6411,6 +6424,81 @@ impl GuestMemory for NativeDispatchMemory<'_> {
     }
 }
 
+/// The fields of a `DispatchOutcome::MapHostAlias` the darwin native lane
+/// installs, moved out of the outcome so the install can be handed to
+/// [`install_native_host_alias`] as one value.
+struct NativeHostAliasInstall {
+    transaction: crate::dispatch::HostAliasTransaction,
+    va: crate::dispatch::GuestVa,
+    len: u64,
+    payload: Vec<u8>,
+    file: Option<(crate::dispatch::HostAliasOwnedFd, libc::off_t, libc::c_int)>,
+    prot_none: bool,
+}
+
+/// Install a published `MapHostAlias` transaction under the dispatch's own
+/// exclusive memory guard, returning the guest retval.
+///
+/// This MUST be called with the same exclusive guard the publishing dispatch
+/// held (`dispatch_native_syscall_inner`'s `:3440` write arm): claim → host
+/// map → protection → metadata commit all complete before that guard drops,
+/// so the alias phase never survives into a window where another thread can
+/// hold the memory lock — the hold-and-wait cycle behind the 2026-08-06
+/// policy-ON go-build deadlock. Map/protect/commit failures abort: a backend
+/// `Err` does not prove the mapping mutation never began, and process
+/// teardown is the only sound rollback (same contract as the VMM lane's
+/// `runtime.rs` alias arm).
+fn install_native_host_alias(
+    dispatcher: &SyscallDispatcher,
+    mapped_memory: &mut NativeMappedMemory,
+    install: NativeHostAliasInstall,
+) -> i64 {
+    let NativeHostAliasInstall {
+        transaction,
+        va,
+        len,
+        payload,
+        file,
+        prot_none,
+    } = install;
+    let file = file.map(|(fd, offset, prot)| (fd.into_owned_fd(), offset, prot));
+    match transaction.claim() {
+        None => {
+            // No backend mutation started; dropping `file` closes the owned
+            // dup and this pre-install claim failure is recoverable.
+            drop(file);
+            crate::linux_abi::LINUX_ENOMEM.guest_retval()
+        }
+        Some(install) => {
+            if mapped_memory
+                .map_host_alias(
+                    va.raw(),
+                    len,
+                    &payload,
+                    file.map(|(fd, offset, prot)| (fd.into_raw_fd(), offset, prot)),
+                    prot_none,
+                )
+                .is_err()
+            {
+                std::process::abort();
+            }
+            if let Some((bus_start, bus_len)) = install.bus_fault_range() {
+                let Ok(bus_len) = usize::try_from(bus_len) else {
+                    std::process::abort();
+                };
+                if mapped_memory.protect_range(bus_start, bus_len, 0).is_err() {
+                    std::process::abort();
+                }
+                mapped_memory.set_no_access(bus_start, bus_len, true);
+            }
+            if dispatcher.commit_host_alias_install(install).is_err() {
+                std::process::abort();
+            }
+            va.raw() as i64
+        }
+    }
+}
+
 fn dispatch_native_syscall_inner<const PROFILE: bool>(
     dispatcher: &SyscallDispatcher,
     request: SyscallRequest,
@@ -6432,16 +6520,59 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
             // whose `write_bytes_raw` still escalates to a real write guard
             // for the rare guest-controlled write-exec-page case.
             if native_syscall_mutates_mappings(request.number.raw()) {
+                let _guard_class =
+                    NativeDispatchGuardClassScope::enter(NativeDispatchGuardClass::Exclusive);
                 let mut memory = memory.write();
-                dispatcher.dispatch_threaded(
+                let outcome = dispatcher.dispatch_threaded(
                     request,
                     &mut *memory,
                     reporter,
                     thread_runtime.tid(),
                     &thread_runtime.registry,
                     &thread_runtime.futex,
-                )?
+                )?;
+                // Consume a `MapHostAlias` install under the SAME exclusive
+                // guard this dispatch already holds. Deferring it to the run
+                // loop is the 2026-08-06 policy-ON go-build deadlock: the
+                // alias phase stays Pending after this guard drops, the NEXT
+                // mapping syscall wins the guard and parks in
+                // `begin_dispatch` holding it, and the deferred install then
+                // parks on `memory.write()` — hold-and-wait both ways (three
+                // identical task-9 lldb wedges). Installing here restores the
+                // phase machine's invariant: a non-Idle Pending/Installing
+                // phase always belongs to a thread already holding the
+                // exclusive guard, so no phase-waiter can hold any memory
+                // guard and the cycle cannot form.
+                match outcome {
+                    DispatchOutcome::MapHostAlias {
+                        transaction,
+                        va,
+                        ipa: _,
+                        len,
+                        payload,
+                        file,
+                        prot_none,
+                        ..
+                    } => {
+                        let value = install_native_host_alias(
+                            dispatcher,
+                            &mut memory,
+                            NativeHostAliasInstall {
+                                transaction,
+                                va,
+                                len,
+                                payload,
+                                file,
+                                prot_none,
+                            },
+                        );
+                        DispatchOutcome::Returned { value }
+                    }
+                    other => other,
+                }
             } else {
+                let _guard_class =
+                    NativeDispatchGuardClassScope::enter(NativeDispatchGuardClass::Shared);
                 let mut memory = NativeDispatchMemory::new_read(memory);
                 dispatcher.dispatch_threaded(
                     request,
@@ -9994,15 +10125,32 @@ mod tests {
     #[test]
     fn non_mutator_mm_and_ipc_syscalls_stay_read_classified() {
         // munlock/munlockall: audited, bookkeeping lives in a separate
-        // Mutex, never touch NativeMappedMemory. shmget/shmctl/shmat:
-        // audited, shmat only touches a separate Mutex and defers its
-        // actual mapping mutation to a MapHostAlias arm outside
-        // dispatch_threaded (which takes its own .write()). mincore: read-only
-        // by nature.
-        for nr in [194u64, 195, 196, 229, 231, 232] {
+        // Mutex, never touch NativeMappedMemory. shmget/shmctl: audited,
+        // they only touch the sysv Mutex. mincore: read-only by nature.
+        for nr in [194u64, 195, 229, 231, 232] {
             assert!(
                 !native_syscall_mutates_mappings(nr),
                 "nr {nr} should not be classified as a mapping mutator"
+            );
+        }
+    }
+
+    #[test]
+    fn host_alias_publishers_are_classified_mapping_mutators() {
+        // Every handler that can publish a `MapHostAlias` transaction (mmap in
+        // dispatch/mem.rs, shmat in dispatch/sysv.rs) MUST dispatch under the
+        // exclusive `:3440` guard: the install is consumed inside
+        // `dispatch_native_syscall_inner` under that same guard, so a non-Idle
+        // Pending/Installing alias phase always belongs to a thread that
+        // already holds the exclusive guard. A publisher dispatched under the
+        // SHARED guard would defer its install past the guard's release and
+        // re-open the hold-and-wait cycle behind the 2026-08-06 policy-ON
+        // go-build deadlock (alias phase held vs `memory.write()` at the old
+        // run-loop install site).
+        for (nr, name) in [(222u64, "mmap"), (196u64, "shmat")] {
+            assert!(
+                native_syscall_mutates_mappings(nr),
+                "nr {nr} ({name}) publishes MapHostAlias and must take the write guard"
             );
         }
     }
@@ -10014,6 +10162,7 @@ mod tests {
         // syscall-table renumbering can't silently desync the classifier
         // from what it thinks it's matching.
         let expected: &[(u64, &str)] = &[
+            (196, "shmat"),
             (197, "shmdt"),
             (214, "brk"),
             (215, "munmap"),
