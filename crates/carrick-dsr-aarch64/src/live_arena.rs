@@ -2537,9 +2537,36 @@ pub enum LiveReadyOutcome {
     Private(LivePrivateReason),
 }
 
+/// Per-publication tally of the winner's same-view direct-link prebinding.
+///
+/// One entry per `DirectLink` candidate in the prepared block, classified
+/// exactly once: `bound` (branch word written into the still-staged source,
+/// target already READY and in AArch64 branch range), `unbound_by_state`
+/// (target not an acquirable READY record in this view — absent, BUILDING,
+/// FAILED, torn, regenerated, foreign-domain, or any acquire/prebind
+/// refusal), or `unbound_by_reach` (the emitter's ±128 MiB displacement
+/// check refused; structurally zero while the code payload is 64 MiB, kept
+/// because the reach check is the load-bearing guard if geometry grows).
+/// Unbound candidates keep the emitter's gateway stub permanently; a refusal
+/// never fails the publication and never leaves a partial write.
+///
+/// The tally describes a PUBLISHED block only: a publication that fails
+/// after prebinding dies with its staged bytes and reports nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LivePrebindTally {
+    pub bound: u64,
+    pub unbound_by_state: u64,
+    pub unbound_by_reach: u64,
+}
+
 /// Outcome of the unique-winner publication path.
 pub enum LivePublishOutcome {
-    Installed(Box<dyn LiveBlockAuthority>),
+    Installed {
+        authority: Box<dyn LiveBlockAuthority>,
+        /// The winner's prebind tally; zero for a race lost to another
+        /// publisher (an adoption prepares nothing and binds nothing).
+        prebound: LivePrebindTally,
+    },
     /// A named immediate fallback to the private translator. BUILDING, FAILED,
     /// a lost block CAS, corruption, and capacity all arrive here.
     Private(LivePrivateReason),
@@ -2569,6 +2596,22 @@ pub trait LiveTranslationAuthority: Send + Sync {
     /// only by the unique block winner, exactly once, and its output is
     /// published through the Task 6B transaction and installed through the
     /// SAME READY consumer as [`Self::acquire_ready`].
+    ///
+    /// Between reservation and publication the winner prebinds every
+    /// `DirectLink` candidate whose target is already an acquirable READY
+    /// record in the same view and within AArch64 branch range — the one
+    /// window the design permits writing what will become immutable shared
+    /// code, and it mutates only the still-staged private bytes.
+    /// `observe_target_page` supplies the authoritative generation
+    /// observation for a candidate TARGET's page (the caller's `generation`
+    /// argument observes the SOURCE page only); `None` refuses that
+    /// candidate fail-closed. Refusals of any kind leave the candidate on
+    /// its gateway stub and are reported in the outcome's
+    /// [`LivePrebindTally`] — they never fail the publication.
+    // Eight arguments: the B3 claim identity (four), the owner, and the two
+    // winner callbacks. Bundling them into a context struct would only move
+    // the same eight names one level down.
+    #[allow(clippy::too_many_arguments)]
     fn publish_winner(
         &self,
         key: &TranslationUnitKey,
@@ -2577,6 +2620,7 @@ pub trait LiveTranslationAuthority: Send + Sync {
         generation: &PageGenerationObservation,
         owner_pid: i32,
         prepare: &mut dyn FnMut() -> Result<PreparedSharedInitial, crate::types::DsrError>,
+        observe_target_page: &mut dyn FnMut(GuestVa) -> Option<PageGenerationObservation>,
     ) -> LivePublishOutcome;
 
     /// Descriptor-authoritative chunk enumeration for one 16 KiB source page.

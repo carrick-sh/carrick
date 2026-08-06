@@ -57,9 +57,25 @@ fn biased_translator_fixture_with(
     words: &[u32],
     guest_code: GuestVa,
 ) -> BiasedTranslatorFixture {
+    biased_translator_fixture_sized(bias, 16 * 1024, data_len, words, guest_code)
+}
+
+/// The general shape: `code_len` bytes of guest code (whole 16 KiB pages) so
+/// a fixture can place blocks on DISTINCT source pages — the live-arena
+/// prebind tests need a target whose page can be mutated without touching
+/// the source's page.
+fn biased_translator_fixture_sized(
+    bias: u64,
+    code_len: u64,
+    data_len: u64,
+    words: &[u32],
+    guest_code: GuestVa,
+) -> BiasedTranslatorFixture {
     const PAGE_SIZE: u64 = 16 * 1024;
     assert_eq!(data_len % PAGE_SIZE, 0, "fixture data length is page-sized");
-    let mapping_len = usize::try_from(PAGE_SIZE + data_len).expect("fixture mapping length");
+    assert_eq!(code_len % PAGE_SIZE, 0, "fixture code length is page-sized");
+    assert!(code_len >= PAGE_SIZE, "fixture code region is nonempty");
+    let mapping_len = usize::try_from(code_len + data_len).expect("fixture mapping length");
     let host_bias = crate::native_darwin::address::NativeHostBias::new(bias, PAGE_SIZE)
         .expect("construct live biased host bias");
     let mapping = crate::native_darwin::address::OwnedHostMapping::map_exact(
@@ -80,8 +96,8 @@ fn biased_translator_fixture_with(
             code.len(),
         );
     }
-    let guest_data = GuestVa(guest_code.raw() + PAGE_SIZE);
-    let data_host = HostVa(mapping.range().start.raw() + PAGE_SIZE as usize);
+    let guest_data = GuestVa(guest_code.raw() + code_len);
+    let data_host = HostVa(mapping.range().start.raw() + code_len as usize);
     let process =
         Arc::new(super::test_process_translator(64 * 1024).expect("create live translator"));
     let memory = super::super::NativeMappedMemory {
@@ -90,7 +106,7 @@ fn biased_translator_fixture_with(
         regions: vec![
             super::super::NativeMappedRegion {
                 start: guest_code.raw(),
-                end: guest_code.raw() + PAGE_SIZE,
+                end: guest_code.raw() + code_len,
                 host_protects: false,
                 shared_futex: false,
                 guest_writable: false,
@@ -6833,6 +6849,354 @@ mod live_revoke {
             0,
             "the child must rebuild the catalog and recover the stale abort \
              (see the numbered child statuses)"
+        );
+    }
+}
+
+/// Winner-publication direct-link prebinding over the REAL fd-backed live
+/// arena, through the production translator, gateway, and C signal shim —
+/// `live_revoke`'s prebind twin. The three histories: a bound link executes
+/// source→target in ONE gateway entry; an unready target keeps the gateway
+/// stub permanently; a stale DIRECT arrival at a revoked target classifies
+/// and recovers exactly like a stale gateway arrival.
+mod live_prebind {
+    use super::super::super::NativeUcontextSnapshot;
+    use super::super::{PreparedEntry, PublicationAuthority, ThreadExit};
+    use carrick_dsr_aarch64::live_arena::LiveArenaCapacities;
+    use carrick_dsr_aarch64::shared_cache::{
+        AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
+        NativePageProfileIdentity, SharedExecutableSegment, SharedImageConfig,
+    };
+    use carrick_guest_mem::GuestVa;
+    use carrick_native_darwin::live_arena::{DarwinLiveArena, LiveArenaProcessView};
+    use std::sync::Arc;
+
+    const SOURCE_PAGE_BYTES: u64 = 16 * 1024;
+
+    struct LiveLaneFixture {
+        fixture: super::BiasedTranslatorFixture,
+        _arena: Arc<DarwinLiveArena>,
+    }
+
+    /// `live_revoke::live_lane_fixture`, generalized to caller-supplied words
+    /// over a whole-page `code_len` so a SOURCE block and its branch TARGET
+    /// can sit on distinct 16 KiB source pages.
+    fn live_lane_fixture_words(
+        guest_code: GuestVa,
+        words: &[u32],
+        code_len: u64,
+    ) -> LiveLaneFixture {
+        assert_eq!(guest_code.raw() % SOURCE_PAGE_BYTES, 0);
+        assert_eq!(code_len % SOURCE_PAGE_BYTES, 0);
+        assert_eq!(words.len() as u64 * 4, code_len, "words fill the region");
+        let fixture = super::biased_translator_fixture_sized(
+            0x80_0000_0000,
+            code_len,
+            16 * 1024,
+            words,
+            guest_code,
+        );
+        fixture
+            .translator
+            .process
+            .activate_translated_range_catalog()
+            .expect("activate the translated-range catalog");
+        let image = SharedImageConfig {
+            executable: ExecutableIdentity::Digest([0x61; 32]),
+            page_profile: NativePageProfileIdentity::Native16k,
+            address_mode: AddressModeIdentity::biased(fixture.host_bias),
+            segments: vec![SharedExecutableSegment::new(
+                ImageFileOffset::new(0),
+                ImageFileLen::new(code_len).expect("file length"),
+                guest_code,
+                GuestCodeLen::new(code_len).expect("guest length"),
+                words.to_vec().into(),
+            )],
+        };
+        let stem = image
+            .key_for_segment(&image.segments[0])
+            .file_stem()
+            .expect("exact unit stem");
+        assert!(
+            fixture
+                .translator
+                .process
+                .configure_live_image_matching_for_test(image, SOURCE_PAGE_BYTES, &stem)
+                .expect("configure the live image"),
+            "the fixture image must select its own exact unit key"
+        );
+        let arena = Arc::new(
+            DarwinLiveArena::new(LiveArenaCapacities::V2).expect("create the fd-backed arena"),
+        );
+        let view =
+            LiveArenaProcessView::new(Arc::clone(&arena), fixture.memory.dsr_generations.domain())
+                .expect("process view over the arena");
+        fixture
+            .translator
+            .process
+            .install_live_authority(Arc::new(view))
+            .expect("install the live authority");
+        LiveLaneFixture {
+            fixture,
+            _arena: arena,
+        }
+    }
+
+    fn run_block(
+        lane: &mut LiveLaneFixture,
+        snapshot: &mut NativeUcontextSnapshot,
+    ) -> (PreparedEntry, ThreadExit) {
+        let prepared = lane
+            .fixture
+            .translator
+            .prepare_entry::<false>(&lane.fixture.memory, snapshot)
+            .expect("prepare the live entry");
+        let prepared_exit = lane
+            .fixture
+            .translator
+            .enter_prepared::<false>(prepared, snapshot)
+            .expect("enter the prepared entry");
+        let exit = lane
+            .fixture
+            .translator
+            .finish_exit(&lane.fixture.memory, snapshot, prepared, prepared_exit)
+            .expect("finish the prepared entry");
+        (prepared, exit)
+    }
+
+    /// Source page layout used by all three tests: block A at +0 is one
+    /// unconditional guest branch; block B (`add x17, x17, #1` then `svc #0`)
+    /// sits `b_offset_words` words later — same page or a later page.
+    fn branch_words(total_words: usize, b_offset_words: usize) -> Vec<u32> {
+        let mut words = vec![0_u32; total_words];
+        words[0] = 0x1400_0000 | u32::try_from(b_offset_words).expect("branch reach");
+        words[b_offset_words] = 0x9100_0631;
+        words[b_offset_words + 1] = 0xd400_0001;
+        words
+    }
+
+    /// The mechanism this task exists to land: a live block published while
+    /// its DIRECT target is already READY branches STRAIGHT into the target's
+    /// arena code — one gateway entry executes source AND target to the
+    /// target's syscall exit, with no `ResolveDirect` round trip — and the
+    /// binding is counted.
+    #[test]
+    fn a_prebound_link_executes_source_to_target_in_one_gateway_entry() {
+        let _signal_oracle = super::install_signal_handlers_for_oracle();
+        let guest_code = GuestVa(0x20_0920_0000);
+        let words = branch_words(4096, 16);
+        let mut lane = live_lane_fixture_words(guest_code, &words, SOURCE_PAGE_BYTES);
+        let target = GuestVa(guest_code.raw() + 16 * 4);
+
+        let mut stack = vec![0_u8; 16 * 1024];
+        let mut snapshot = super::seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+        let baseline_x17 = snapshot.x[17];
+
+        // The TARGET first: B publishes READY and executes from the arena.
+        snapshot.pc = target.raw();
+        let (prepared_b, exit) = run_block(&mut lane, &mut snapshot);
+        assert_eq!(
+            prepared_b.executable_authority(),
+            PublicationAuthority::Live
+        );
+        assert!(matches!(exit, ThreadExit::Syscall { .. }));
+        assert_eq!(snapshot.x[17], baseline_x17.wrapping_add(1));
+
+        // The SOURCE second: its winner publication finds B READY and binds
+        // the branch into the still-staged bytes. ONE gateway entry then
+        // executes A's branch and B's body to B's syscall exit — a
+        // `ResolveDirect` round trip would surface here as
+        // `ThreadExit::Continue` with the target PC instead.
+        snapshot.pc = guest_code.raw();
+        snapshot.x[17] = baseline_x17;
+        let (prepared_a, exit) = run_block(&mut lane, &mut snapshot);
+        assert_eq!(
+            prepared_a.executable_authority(),
+            PublicationAuthority::Live
+        );
+        assert!(
+            matches!(exit, ThreadExit::Syscall { .. }),
+            "a prebound source must reach its target's syscall exit in ONE \
+             gateway entry, not a ResolveDirect round trip: {exit:?}"
+        );
+        assert_eq!(
+            snapshot.x[17],
+            baseline_x17.wrapping_add(1),
+            "the target's body executed through the prebound branch"
+        );
+        let stats = lane.fixture.translator.profile_snapshot();
+        assert_eq!(stats.live_links_prebound, 1, "the binding is counted");
+        assert_eq!(stats.live_links_prebind_unbound_state, 0);
+        assert_eq!(stats.live_links_prebind_unbound_reach, 0);
+    }
+
+    /// The designed sacrifice, counted: a source published BEFORE its target
+    /// keeps the emitter's gateway stub permanently — later publication of
+    /// the target never patches the immutable READY source.
+    #[test]
+    fn an_unready_target_keeps_the_gateway_stub_permanently() {
+        let _signal_oracle = super::install_signal_handlers_for_oracle();
+        let guest_code = GuestVa(0x20_0924_0000);
+        let words = branch_words(4096, 16);
+        let mut lane = live_lane_fixture_words(guest_code, &words, SOURCE_PAGE_BYTES);
+        let target = GuestVa(guest_code.raw() + 16 * 4);
+
+        let mut stack = vec![0_u8; 16 * 1024];
+        let mut snapshot = super::seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+        let baseline_x17 = snapshot.x[17];
+
+        // The SOURCE first: B is not READY, so the candidate is refused by
+        // state and the branch falls into the gateway stub.
+        snapshot.pc = guest_code.raw();
+        let (_, exit) = run_block(&mut lane, &mut snapshot);
+        assert!(
+            matches!(exit, ThreadExit::Continue),
+            "an unbound direct exit is gateway-served (ResolveDirect resolved \
+             the target and continued): {exit:?}"
+        );
+        assert_eq!(
+            snapshot.pc,
+            target.raw(),
+            "the resolver continues at the target"
+        );
+        let stats = lane.fixture.translator.profile_snapshot();
+        assert_eq!(stats.live_links_prebound, 0);
+        assert_eq!(
+            stats.live_links_prebind_unbound_state, 1,
+            "the refusal is counted by name"
+        );
+
+        // B is now READY (the resolve above published it). Re-entering A must
+        // STILL take the gateway round trip: READY code is immutable, so the
+        // stub is permanent by design.
+        snapshot.pc = guest_code.raw();
+        snapshot.x[17] = baseline_x17;
+        let (_, exit) = run_block(&mut lane, &mut snapshot);
+        assert!(
+            matches!(exit, ThreadExit::Continue),
+            "later publication of the target must not patch an older READY \
+             source: {exit:?}"
+        );
+        assert_eq!(
+            snapshot.x[17], baseline_x17,
+            "the target body has not executed yet in this traversal"
+        );
+    }
+
+    /// Obligation 6's verification: revoking the TARGET's chunk faults the
+    /// prebound jump at the target's entry, and the classifier consumes a
+    /// stale DIRECT arrival exactly as it consumes a stale gateway arrival —
+    /// same predicates, same exact recovery, zero stale instructions.
+    ///
+    /// Cross-page on purpose: the target's 16 KiB source page is mutated
+    /// while the source's page (and therefore the source's own chunk) stays
+    /// valid, so the arrival really is the DIRECT branch, not a fault at the
+    /// source's own revoked entry.
+    #[test]
+    fn a_stale_direct_arrival_at_a_revoked_target_recovers_like_a_gateway_arrival() {
+        let _signal_oracle = super::install_signal_handlers_for_oracle();
+        let guest_code = GuestVa(0x20_0928_0000);
+        let page_words = (SOURCE_PAGE_BYTES / 4) as usize;
+        let words = branch_words(2 * page_words, page_words);
+        let mut lane = live_lane_fixture_words(guest_code, &words, 2 * SOURCE_PAGE_BYTES);
+        let target = GuestVa(guest_code.raw() + SOURCE_PAGE_BYTES);
+
+        let mut stack = vec![0_u8; 16 * 1024];
+        let mut snapshot = super::seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+        let baseline_x17 = snapshot.x[17];
+
+        // Target READY and installed; source prebound to it across the page
+        // boundary; one entry executes both.
+        snapshot.pc = target.raw();
+        let (prepared_b, exit) = run_block(&mut lane, &mut snapshot);
+        assert_eq!(
+            prepared_b.executable_authority(),
+            PublicationAuthority::Live
+        );
+        assert!(matches!(exit, ThreadExit::Syscall { .. }));
+        let target_entry = prepared_b.entry.host().raw() as u64;
+        snapshot.pc = guest_code.raw();
+        snapshot.x[17] = baseline_x17;
+        let (prepared_a, exit) = run_block(&mut lane, &mut snapshot);
+        assert!(matches!(exit, ThreadExit::Syscall { .. }));
+        assert_eq!(
+            lane.fixture
+                .translator
+                .profile_snapshot()
+                .live_links_prebound,
+            1,
+            "the cross-page candidate bound"
+        );
+
+        // The guest mutates the TARGET's page only: the production seam
+        // revokes B's chunk task-locally while A's page and chunk stay valid.
+        lane.fixture
+            .memory
+            .note_dsr_code_mutation(target.raw(), 4)
+            .expect("note the guest code write");
+
+        // Re-entering the still-valid SOURCE takes the prebound branch into
+        // the revoked chunk: an instruction abort AT THE TARGET'S ENTRY with
+        // PC == FAR — the identical shape a stale gateway arrival produces —
+        // classified and recovered exactly.
+        snapshot.pc = guest_code.raw();
+        snapshot.x[17] = baseline_x17;
+        let prepared_exit = lane
+            .fixture
+            .translator
+            .enter_prepared::<false>(prepared_a, &mut snapshot)
+            .expect("enter the prebound source");
+        let exit = lane
+            .fixture
+            .translator
+            .finish_exit(
+                &lane.fixture.memory,
+                &mut snapshot,
+                prepared_a,
+                prepared_exit,
+            )
+            .expect("finish the prebound source");
+        assert!(
+            matches!(exit, ThreadExit::Kick),
+            "a classified stale DIRECT arrival resumes through the normal \
+             translation path: {exit:?}"
+        );
+        assert_eq!(
+            snapshot.pc,
+            target.raw(),
+            "recovery restores the TARGET's exact guest PC (the entry is an \
+             always-exact boundary)"
+        );
+        // The classifier's own predicate, not a byte-exact ESR: EC is an
+        // instruction abort (0x20 from lower EL) and PC == FAR. The IFSC
+        // differs from `live_revoke`'s measured 0x06 (this arrival observed a
+        // level-3 translation fault, 0x07 — the PROT_NONE split lands at a
+        // different table level for this chunk), and the classifier is
+        // IFSC-agnostic by design.
+        assert_eq!(
+            (snapshot.esr >> 26) & 0x3f,
+            0x20,
+            "esr=0x{:x}",
+            snapshot.esr
+        );
+        // (PC == FAR at classification time is what ADMITTED this recovery —
+        // the classifier returns None otherwise — so the Kick above already
+        // proves it; snapshot.pc has since been rewritten to the guest PC.)
+        assert_eq!(
+            snapshot.far, target_entry,
+            "the fault is at the revoked target's entry, not the source"
+        );
+        assert_eq!(
+            snapshot.x[17], baseline_x17,
+            "not one stale instruction executed"
+        );
+        assert_eq!(
+            lane.fixture
+                .translator
+                .profile_snapshot()
+                .live_stale_instruction_aborts,
+            1,
+            "the recovery is counted exactly like a gateway arrival's"
         );
     }
 }

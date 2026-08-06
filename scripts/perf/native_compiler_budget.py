@@ -264,6 +264,22 @@ FRAME_FIELDS_V7 = {
     },
 }
 REQUIRED_FRAMES_V7 = frozenset(FRAME_FIELDS_V7)
+# NATIVEPERF v8 extends `live-bytes` with the winner-publication prebind
+# triple: shared→shared direct links bound into the still-staged source at
+# publication, plus the two named refusal classes (target not an acquirable
+# READY record; the emitter's AArch64 ±128 MiB reach check). They ride the
+# byte frame beside the two private→live link counters they complement.
+# Additive only, so a v7 record still reads exactly as v7.
+FRAME_FIELDS_V8 = {
+    **{frame: set(fields) for frame, fields in FRAME_FIELDS_V7.items()},
+    "live-bytes": set(FRAME_FIELDS_V7["live-bytes"])
+    | {
+        "live_links_prebound",
+        "live_links_prebind_unbound_state",
+        "live_links_prebind_unbound_reach",
+    },
+}
+REQUIRED_FRAMES_V8 = frozenset(FRAME_FIELDS_V8)
 # The supervisor record (`NATIVEPERF1|supervisor|...`) is a v2-era, per-PROFILE
 # (not per-thread-group) record: the top-level `carrick run` process's own
 # getrusage(RUSAGE_SELF)/getrusage(RUSAGE_CHILDREN) CPU. It is a top-level
@@ -999,6 +1015,7 @@ def _frame_contract(frame: str, extras: set[str]) -> tuple[int | None, set[str]]
     fields_v5 = FRAME_FIELDS_V5.get(frame)
     fields_v6 = FRAME_FIELDS_V6.get(frame)
     fields_v7 = FRAME_FIELDS_V7.get(frame)
+    fields_v8 = FRAME_FIELDS_V8.get(frame)
     if (
         fields_v1 is None
         and fields_v2 is None
@@ -1007,6 +1024,7 @@ def _frame_contract(frame: str, extras: set[str]) -> tuple[int | None, set[str]]
         and fields_v5 is None
         and fields_v6 is None
         and fields_v7 is None
+        and fields_v8 is None
     ):
         raise BudgetError(f"unknown profile frame: {frame}")
     if fields_v1 is not None and extras == fields_v1:
@@ -1040,6 +1058,10 @@ def _frame_contract(frame: str, extras: set[str]) -> tuple[int | None, set[str]]
     if fields_v7 is not None and extras == fields_v7:
         # Same rule one version on: only frames v7 INTRODUCED reach here.
         return 7, fields_v7
+    if fields_v8 is not None and extras == fields_v8:
+        # Same rule one version on: only frames v8 EXTENDED reach here (an
+        # unchanged frame already matched its introducing version above).
+        return 8, fields_v8
     allowed = (
         (fields_v1 or set())
         | (fields_v2 or set())
@@ -1048,12 +1070,20 @@ def _frame_contract(frame: str, extras: set[str]) -> tuple[int | None, set[str]]
         | (fields_v5 or set())
         | (fields_v6 or set())
         | (fields_v7 or set())
+        | (fields_v8 or set())
     )
     unknown = extras - allowed
     if unknown:
         raise BudgetError(f"unknown field(s) in {frame}: {', '.join(sorted(unknown))}")
     expected = (
-        fields_v1 or fields_v2 or fields_v3 or fields_v4 or fields_v5 or fields_v6 or fields_v7
+        fields_v1
+        or fields_v2
+        or fields_v3
+        or fields_v4
+        or fields_v5
+        or fields_v6
+        or fields_v7
+        or fields_v8
     )
     assert expected is not None
     missing = expected - extras
@@ -1125,7 +1155,9 @@ def parse_nativeperf(lines: Iterable[str]) -> ProfileRun:
     for (pid, tid, era), frames in sorted(groups.items()):
         key = (pid, tid, era)
         versions = group_versions.get(key, set())
-        if versions == {2, 3, 4, 5, 6, 7}:
+        if versions == {2, 3, 4, 5, 6, 7, 8}:
+            version = 8
+        elif versions == {2, 3, 4, 5, 6, 7}:
             version = 7
         elif versions == {2, 3, 4, 5, 6}:
             version = 6
@@ -1151,6 +1183,7 @@ def parse_nativeperf(lines: Iterable[str]) -> ProfileRun:
             5: REQUIRED_FRAMES_V5,
             6: REQUIRED_FRAMES_V6,
             7: REQUIRED_FRAMES_V7,
+            8: REQUIRED_FRAMES_V8,
         }[version]
         missing = required - set(frames)
         if missing:
@@ -2749,8 +2782,14 @@ def _parse_profile_json(value: object) -> ProfileRun | None:
             version = 3
             fields_by_frame = FRAME_FIELDS_V3
         elif frames == sorted(REQUIRED_FRAMES_V7):
-            version = 7
-            fields_by_frame = FRAME_FIELDS_V7
+            # v8 extends `live-bytes` with FIELDS, not frames, so the frame
+            # set alone cannot split v7 from v8 — same rule as v4/v5 below.
+            if "live-bytes.live_links_prebound" in values:
+                version = 8
+                fields_by_frame = FRAME_FIELDS_V8
+            else:
+                version = 7
+                fields_by_frame = FRAME_FIELDS_V7
         elif frames == sorted(REQUIRED_FRAMES_V6):
             version = 6
             fields_by_frame = FRAME_FIELDS_V6

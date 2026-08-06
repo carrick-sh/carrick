@@ -2145,6 +2145,15 @@ pub struct ResolverStats {
     pub live_cold_bytes: u64,
     pub live_links_patched: u64,
     pub live_links_out_of_reach: u64,
+    /// Winner-publication direct-link prebinding (the realized
+    /// `live_arena_shared_direct_links` design counter): shared→shared
+    /// branches bound into the still-staged source, and the two named
+    /// refusal classes that leave a candidate on its gateway stub.
+    /// `unbound_by_reach` is structurally zero while the code payload is
+    /// 64 MiB (< ±128 MiB); it guards a future geometry change.
+    pub live_links_prebound: u64,
+    pub live_links_prebind_unbound_state: u64,
+    pub live_links_prebind_unbound_reach: u64,
     /// Task 7's revocation seam. `live_revoked_chunks` counts exact 64 KiB
     /// local RX chunks this process protected `PROT_NONE` after a mutation of
     /// their source page; `live_stale_instruction_aborts` counts the
@@ -2214,6 +2223,9 @@ pub enum ResolverStat {
     LiveColdBytes,
     LiveLinksPatched,
     LiveLinksOutOfReach,
+    LiveLinksPrebound,
+    LiveLinksPrebindUnboundState,
+    LiveLinksPrebindUnboundReach,
     // Produced OUTSIDE the translate path: the guest-write revocation seam
     // and the stale-abort classifier. Process-scoped like the rest of the
     // Live* family.
@@ -2222,7 +2234,7 @@ pub enum ResolverStat {
 }
 
 impl ResolverStat {
-    const ALL: [Self; 46] = [
+    const ALL: [Self; 49] = [
         Self::ResolverExits,
         Self::OneEntryHits,
         Self::Translations,
@@ -2267,6 +2279,9 @@ impl ResolverStat {
         Self::LiveColdBytes,
         Self::LiveLinksPatched,
         Self::LiveLinksOutOfReach,
+        Self::LiveLinksPrebound,
+        Self::LiveLinksPrebindUnboundState,
+        Self::LiveLinksPrebindUnboundReach,
         Self::LiveRevokedChunks,
         Self::LiveStaleInstructionAborts,
     ];
@@ -2317,6 +2332,9 @@ impl ResolverStat {
             Self::LiveColdBytes => "live_cold_bytes",
             Self::LiveLinksPatched => "live_links_patched",
             Self::LiveLinksOutOfReach => "live_links_out_of_reach",
+            Self::LiveLinksPrebound => "live_links_prebound",
+            Self::LiveLinksPrebindUnboundState => "live_links_prebind_unbound_state",
+            Self::LiveLinksPrebindUnboundReach => "live_links_prebind_unbound_reach",
             Self::LiveRevokedChunks => "live_revoked_chunks",
             Self::LiveStaleInstructionAborts => "live_stale_instruction_aborts",
         }
@@ -2370,6 +2388,9 @@ impl ResolverStats {
             ResolverStat::LiveColdBytes => self.live_cold_bytes,
             ResolverStat::LiveLinksPatched => self.live_links_patched,
             ResolverStat::LiveLinksOutOfReach => self.live_links_out_of_reach,
+            ResolverStat::LiveLinksPrebound => self.live_links_prebound,
+            ResolverStat::LiveLinksPrebindUnboundState => self.live_links_prebind_unbound_state,
+            ResolverStat::LiveLinksPrebindUnboundReach => self.live_links_prebind_unbound_reach,
             ResolverStat::LiveRevokedChunks => self.live_revoked_chunks,
             ResolverStat::LiveStaleInstructionAborts => self.live_stale_instruction_aborts,
         }
@@ -2431,6 +2452,13 @@ impl ResolverStats {
             ResolverStat::LiveColdBytes => self.live_cold_bytes = value,
             ResolverStat::LiveLinksPatched => self.live_links_patched = value,
             ResolverStat::LiveLinksOutOfReach => self.live_links_out_of_reach = value,
+            ResolverStat::LiveLinksPrebound => self.live_links_prebound = value,
+            ResolverStat::LiveLinksPrebindUnboundState => {
+                self.live_links_prebind_unbound_state = value
+            }
+            ResolverStat::LiveLinksPrebindUnboundReach => {
+                self.live_links_prebind_unbound_reach = value
+            }
             ResolverStat::LiveRevokedChunks => self.live_revoked_chunks = value,
             ResolverStat::LiveStaleInstructionAborts => self.live_stale_instruction_aborts = value,
         }
@@ -3003,6 +3031,9 @@ impl ThreadTranslator {
             live_cold_bytes: process.stats.live_cold_bytes,
             live_links_patched: process.stats.live_links_patched,
             live_links_out_of_reach: process.stats.live_links_out_of_reach,
+            live_links_prebound: process.stats.live_links_prebound,
+            live_links_prebind_unbound_state: process.stats.live_links_prebind_unbound_state,
+            live_links_prebind_unbound_reach: process.stats.live_links_prebind_unbound_reach,
             live_revoked_chunks: process.stats.live_revoked_chunks,
             live_stale_instruction_aborts: process.stats.live_stale_instruction_aborts,
             live_fallbacks: process.stats.live_fallbacks,
@@ -3086,6 +3117,9 @@ impl ThreadTranslator {
             live_cold_bytes: delta.live_cold_bytes,
             live_links_patched: delta.live_links_patched,
             live_links_out_of_reach: delta.live_links_out_of_reach,
+            live_links_prebound: delta.live_links_prebound,
+            live_links_prebind_unbound_state: delta.live_links_prebind_unbound_state,
+            live_links_prebind_unbound_reach: delta.live_links_prebind_unbound_reach,
             live_revoked_chunks: delta.live_revoked_chunks,
             live_stale_instruction_aborts: delta.live_stale_instruction_aborts,
             live_fallbacks: delta.live_fallbacks,
@@ -3193,6 +3227,9 @@ impl ThreadTranslator {
             live_cold_bytes: 0,
             live_links_patched: 0,
             live_links_out_of_reach: 0,
+            live_links_prebound: 0,
+            live_links_prebind_unbound_state: 0,
+            live_links_prebind_unbound_reach: 0,
             live_revoked_chunks: 0,
             live_stale_instruction_aborts: 0,
             live_fallbacks: [0; profile::LiveLaneFallbackClass::COUNT],
@@ -4756,6 +4793,7 @@ impl ProcessState {
     /// The plan is rejected here — named — before any arena state is touched;
     /// `claim_eligible` then owns the two-phase generation/group/CAS protocol,
     /// and only the block winner's `prepare` runs.
+    #[allow(clippy::too_many_arguments)]
     fn live_winner_publication(
         &mut self,
         block: &block::BlockPlan,
@@ -4764,6 +4802,9 @@ impl ProcessState {
         observation: &cache::PageGenerationObservation,
         address_mode: emit::EmitAddressMode,
         source_words: Option<&Vec<u32>>,
+        observe_target_page: &mut dyn FnMut(
+            carrick_guest_mem::GuestVa,
+        ) -> Option<cache::PageGenerationObservation>,
     ) -> LiveConsultation {
         if generation != types::CodeGeneration::INITIAL || observation.current() != generation {
             return self.live_fallback(LiveFallback::Regenerated);
@@ -4822,10 +4863,14 @@ impl ProcessState {
                 observation,
                 std::process::id() as i32,
                 &mut prepare,
+                observe_target_page,
             )
         };
         match outcome {
-            crate::live_arena::LivePublishOutcome::Installed(authority) => {
+            crate::live_arena::LivePublishOutcome::Installed {
+                authority,
+                prebound,
+            } => {
                 match self.install_live_block(
                     (guest, generation),
                     observation,
@@ -4840,6 +4885,20 @@ impl ProcessState {
                                 ResolverStat::LivePublishAdoptions
                             },
                             1,
+                        );
+                        // The winner's prebind tally, counted where the
+                        // publication is installed. An adoption's tally is
+                        // zero by construction, so adding unconditionally
+                        // cannot misattribute.
+                        self.stats
+                            .add(ResolverStat::LiveLinksPrebound, prebound.bound);
+                        self.stats.add(
+                            ResolverStat::LiveLinksPrebindUnboundState,
+                            prebound.unbound_by_state,
+                        );
+                        self.stats.add(
+                            ResolverStat::LiveLinksPrebindUnboundReach,
+                            prebound.unbound_by_reach,
                         );
                         LiveConsultation::Installed(entry)
                     }
@@ -5565,6 +5624,12 @@ impl ProcessState {
                     &observation,
                     memory.address_mode().into(),
                     block_source_words.as_ref(),
+                    // A prebind candidate's TARGET may live on any page of
+                    // the unit; its observation comes from the same
+                    // authoritative table as the source's. A refusal here is
+                    // fail-closed to "leave the gateway stub" inside the
+                    // authority, never an error.
+                    &mut |target| memory.dsr_generation_observation(target).ok(),
                 )
             });
             if let Some(LiveConsultation::Private(fallback)) = publication {
@@ -6490,6 +6555,9 @@ impl ThreadTranslator {
             live_cold_bytes: process.live_cold_bytes,
             live_links_patched: process.live_links_patched,
             live_links_out_of_reach: process.live_links_out_of_reach,
+            live_links_prebound: process.live_links_prebound,
+            live_links_prebind_unbound_state: process.live_links_prebind_unbound_state,
+            live_links_prebind_unbound_reach: process.live_links_prebind_unbound_reach,
             live_revoked_chunks: process.live_revoked_chunks,
             live_stale_instruction_aborts: process.live_stale_instruction_aborts,
             live_fallbacks: process.live_fallbacks,
@@ -8491,9 +8559,9 @@ mod tests {
         use crate::block::{BlockPlan, PlannedExit};
         use crate::emit::{EmitAddressMode, PreparedSharedInitial};
         use crate::live_arena::{
-            LiveBlockAuthority, LiveBlockExtents, LiveOwnedChunkIdentity, LivePrivateReason,
-            LivePublishOutcome, LiveReadyOutcome, LiveReservation, LiveRxPayload,
-            LiveTranslationAuthority,
+            LiveBlockAuthority, LiveBlockExtents, LiveOwnedChunkIdentity, LivePrebindTally,
+            LivePrivateReason, LivePublishOutcome, LiveReadyOutcome, LiveReservation,
+            LiveRxPayload, LiveTranslationAuthority,
         };
         use crate::shared_cache::{
             AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
@@ -8719,6 +8787,10 @@ mod tests {
             arena: Arc<FakeLiveArena>,
             ready: Mutex<FakeReady>,
             winner: FakeWinner,
+            /// The tally a `FakeWinner::Publish` outcome reports, so the
+            /// stats plumbing from `LivePublishOutcome::Installed` into
+            /// `ResolverStats` is observable without a real arena.
+            prebind_tally: LivePrebindTally,
             prepares: AtomicUsize,
             ready_lookups: AtomicUsize,
             enumerations: AtomicUsize,
@@ -8739,6 +8811,21 @@ mod tests {
                 Self::sharing(&FakeLiveArena::new(), ready, winner)
             }
 
+            /// A publishing authority whose winner outcome carries the given
+            /// prebind tally, so the tally→counters plumbing is observable
+            /// without a real arena.
+            fn with_prebind_tally(
+                ready: FakeReady,
+                winner: FakeWinner,
+                prebind_tally: LivePrebindTally,
+            ) -> Arc<Self> {
+                let mut authority = Self::sharing(&FakeLiveArena::new(), ready, winner);
+                Arc::get_mut(&mut authority)
+                    .expect("freshly constructed authority is unshared")
+                    .prebind_tally = prebind_tally;
+                authority
+            }
+
             /// A second view of the SAME RX payload — the in-process exec
             /// shape, where the replacement image installs a fresh process
             /// view over the arena it inherited.
@@ -8751,6 +8838,7 @@ mod tests {
                     arena: Arc::clone(arena),
                     ready: Mutex::new(ready),
                     winner,
+                    prebind_tally: LivePrebindTally::default(),
                     prepares: AtomicUsize::new(0),
                     ready_lookups: AtomicUsize::new(0),
                     enumerations: AtomicUsize::new(0),
@@ -8893,15 +8981,19 @@ mod tests {
                 _generation: &PageGenerationObservation,
                 _owner_pid: i32,
                 prepare: &mut dyn FnMut() -> Result<PreparedSharedInitial, types::DsrError>,
+                _observe_target_page: &mut dyn FnMut(GuestVa) -> Option<PageGenerationObservation>,
             ) -> LivePublishOutcome {
                 match self.winner {
                     FakeWinner::Private(reason) => LivePublishOutcome::Private(reason),
                     // A racing winner reached READY first: no `prepare` runs.
                     FakeWinner::RacedToReady => {
                         let prepared = prepared_block(guest_start);
-                        LivePublishOutcome::Installed(Box::new(SharedFakeBlock(
-                            self.block(&prepared, guest_start),
-                        )))
+                        LivePublishOutcome::Installed {
+                            authority: Box::new(SharedFakeBlock(
+                                self.block(&prepared, guest_start),
+                            )),
+                            prebound: LivePrebindTally::default(),
+                        }
                     }
                     FakeWinner::PrepareRefused => {
                         self.prepares.fetch_add(1, Ordering::Relaxed);
@@ -8912,9 +9004,12 @@ mod tests {
                     FakeWinner::Publish => {
                         self.prepares.fetch_add(1, Ordering::Relaxed);
                         match prepare() {
-                            Ok(prepared) => LivePublishOutcome::Installed(Box::new(
-                                SharedFakeBlock(self.block(&prepared, guest_start)),
-                            )),
+                            Ok(prepared) => LivePublishOutcome::Installed {
+                                authority: Box::new(SharedFakeBlock(
+                                    self.block(&prepared, guest_start),
+                                )),
+                                prebound: self.prebind_tally,
+                            },
                             Err(error) => LivePublishOutcome::PrepareRefused(error),
                         }
                     }
@@ -8991,6 +9086,7 @@ mod tests {
                 _generation: &PageGenerationObservation,
                 _owner_pid: i32,
                 _prepare: &mut dyn FnMut() -> Result<PreparedSharedInitial, types::DsrError>,
+                _observe_target_page: &mut dyn FnMut(GuestVa) -> Option<PageGenerationObservation>,
             ) -> LivePublishOutcome {
                 LivePublishOutcome::Private(LivePrivateReason::InvalidRecord)
             }
@@ -9221,6 +9317,7 @@ mod tests {
                     &observation,
                     EmitAddressMode::Direct,
                     Some(&vec![SYSCALL_WORD]),
+                    &mut |_| None,
                 )
             });
 
@@ -9252,6 +9349,7 @@ mod tests {
                     &observation,
                     EmitAddressMode::Direct,
                     Some(&vec![SYSCALL_WORD]),
+                    &mut |_| None,
                 )
             });
 
@@ -9346,6 +9444,7 @@ mod tests {
                         &observation,
                         EmitAddressMode::Direct,
                         Some(&vec![SYSCALL_WORD]),
+                        &mut |_| None,
                     )),
                     LiveConsultation::Private(LiveFallback::Arena(reason)),
                     "{reason:?} must reach the translator unrenamed"
@@ -9391,6 +9490,7 @@ mod tests {
                         &observation,
                         EmitAddressMode::Direct,
                         Some(&vec![SYSCALL_WORD]),
+                        &mut |_| None,
                     )),
                     LiveConsultation::Private(LiveFallback::UnsupportedShape)
                 );
@@ -9409,6 +9509,7 @@ mod tests {
                     &observation,
                     EmitAddressMode::Direct,
                     Some(&vec![SYSCALL_WORD]),
+                    &mut |_| None,
                 )),
                 LiveConsultation::Private(LiveFallback::CrossPage)
             );
@@ -9422,6 +9523,7 @@ mod tests {
                     &observation,
                     EmitAddressMode::Direct,
                     None,
+                    &mut |_| None,
                 )),
                 LiveConsultation::Private(LiveFallback::SourceWordsUnavailable)
             );
@@ -9448,6 +9550,7 @@ mod tests {
                     &observation,
                     EmitAddressMode::Direct,
                     Some(&vec![SYSCALL_WORD]),
+                    &mut |_| None,
                 )),
                 LiveConsultation::Private(LiveFallback::PrepareRefused)
             );
@@ -10728,6 +10831,7 @@ mod tests {
                         &observation,
                         EmitAddressMode::Direct,
                         words.as_ref(),
+                        &mut |_| None,
                     )
                 });
                 assert_eq!(observed(&lane), vec![(class, 1)], "{what}");
@@ -10744,6 +10848,7 @@ mod tests {
                     &observation,
                     EmitAddressMode::Direct,
                     Some(&vec![SYSCALL_WORD]),
+                    &mut |_| None,
                 )
             });
             assert_eq!(
@@ -10778,6 +10883,7 @@ mod tests {
                     &observation,
                     EmitAddressMode::Direct,
                     Some(&vec![SYSCALL_WORD]),
+                    &mut |_| None,
                 )
             });
             assert!(matches!(published, LiveConsultation::Installed(_)));
@@ -10829,6 +10935,7 @@ mod tests {
                     &observation,
                     EmitAddressMode::Direct,
                     Some(&vec![SYSCALL_WORD]),
+                    &mut |_| None,
                 )
             });
             assert!(matches!(published, LiveConsultation::Installed(_)));
@@ -10844,6 +10951,46 @@ mod tests {
                 lane.authority.prepares.load(Ordering::Relaxed),
                 0,
                 "and the fixture agrees no preparation ran"
+            );
+        }
+
+        /// The winner's `LivePrebindTally` lands in the three named counters
+        /// exactly once, at the install site — the wire between the Darwin
+        /// authority's outcome and `ResolverStats`.
+        #[test]
+        fn a_winning_publication_reports_its_prebind_tally_into_the_counters() {
+            let lane = Lane::with_authority(FakeAuthority::with_prebind_tally(
+                FakeReady::Miss,
+                FakeWinner::Publish,
+                LivePrebindTally {
+                    bound: 2,
+                    unbound_by_state: 3,
+                    unbound_by_reach: 1,
+                },
+            ));
+            let guest = GuestVa(SEGMENT_START);
+            let observation = lane.observe(guest);
+            let published = lane.with_state(|state| {
+                state.live_winner_publication(
+                    &syscall_plan(guest),
+                    guest,
+                    types::CodeGeneration::INITIAL,
+                    &observation,
+                    EmitAddressMode::Direct,
+                    Some(&vec![SYSCALL_WORD]),
+                    &mut |_| None,
+                )
+            });
+            assert!(matches!(published, LiveConsultation::Installed(_)));
+            let stats = lane.stats();
+            assert_eq!(
+                (
+                    stats.live_links_prebound,
+                    stats.live_links_prebind_unbound_state,
+                    stats.live_links_prebind_unbound_reach,
+                ),
+                (2, 3, 1),
+                "the winner's tally lands in the three named counters"
             );
         }
 
