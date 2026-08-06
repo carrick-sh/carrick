@@ -401,16 +401,23 @@ concern — it is half the product.
   boundary. Rank by the **amplification factor
   of a single guest operation**, which is concrete and directly attackable
   where a CPU percentage is not:
-  - guest `open` → was **19.68 host opens** (cap-std path re-walks), now
-    **4.61** run-wide (2.37 inside the open's own service window) — measured at
-    HEAD on the fs-walk fixture, with the full per-op ledger in
+  - guest `open` → **19.68 host opens** in-service-window on the **cold
+    go-build** (2026-07-28, `native-fs-amplification.jsonl` record 8); on the
+    **fs-walk** fixture at HEAD the same in-window figure is **2.37** (4.61
+    counting every host `openat` in the run). Those are DIFFERENT WORKLOADS —
+    pair like with like and do not read a ratio between them as progress; the
+    go-build's open lane at HEAD is simply unmeasured. Full per-op ledger:
     [`docs/perf-results/2026-08-05-fswalk-amplification-ledger.md`](docs/perf-results/2026-08-05-fswalk-amplification-ledger.md).
-    Whole fixture: 52,805 host syscalls / 24,201 guest = **2.18x**. Still to
-    drive toward 1: guest `openat` **5.91** host calls, `getdents64` **4.01**
-    (of which six per directory are pure `fdopendir`/`closedir` preamble),
-    `newfstatat` **2.86** — note the older "roughly one host call per guest
-    stat" claim is true only of `fstatat64` itself. `close` (0.27) and `fcntl`
-    (0.0009) are already below 1, so sub-1 is reachable;
+    On fs-walk: whole fixture **2.05x** host per guest syscall (49,623/24,201,
+    excluding 3,182 probable-tracer `kdebug_trace*`), 1.71x inside service
+    windows. Still to drive toward 1: guest `openat` **5.91** host calls,
+    `getdents64` **4.01** (of which six per directory are pure
+    `fdopendir`/`closedir` preamble), `newfstatat` **2.86** — note the older
+    "roughly one host call per guest stat" claim is true only of `fstatat64`
+    itself. `close` (0.27) and `fcntl` (0.0009) are already below 1, so sub-1
+    is reachable. **Open regression:** `carrick-only` `fstatat64` on this
+    fixture went 32 (2026-08-02) → 5,802 (HEAD) with every guest-joined column
+    flat — bisect that before starting a new fs lever;
   - guest `mmap(MAP_PRIVATE, fd)` → a `pread` of the FULL mapping length into
     fresh anon (`dispatch/mem.rs:2517`), instead of a host file-backed mmap;
   - guest `execve` → WAS 4 full ELF materializations + 3 SHA-256 passes; the
