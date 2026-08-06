@@ -4845,7 +4845,6 @@ impl ProcessState {
     /// The plan is rejected here — named — before any arena state is touched;
     /// `claim_eligible` then owns the two-phase generation/group/CAS protocol,
     /// and only the block winner's `prepare` runs.
-    #[allow(clippy::too_many_arguments)]
     fn live_winner_publication(
         &mut self,
         block: &block::BlockPlan,
@@ -4854,9 +4853,6 @@ impl ProcessState {
         observation: &cache::PageGenerationObservation,
         address_mode: emit::EmitAddressMode,
         source_words: Option<&Vec<u32>>,
-        observe_target_page: &mut dyn FnMut(
-            carrick_guest_mem::GuestVa,
-        ) -> Option<cache::PageGenerationObservation>,
     ) -> LiveConsultation {
         if generation != types::CodeGeneration::INITIAL || observation.current() != generation {
             return self.live_fallback(LiveFallback::Regenerated);
@@ -4915,7 +4911,6 @@ impl ProcessState {
                 observation,
                 std::process::id() as i32,
                 &mut prepare,
-                observe_target_page,
             )
         };
         match outcome {
@@ -5676,12 +5671,6 @@ impl ProcessState {
                     &observation,
                     memory.address_mode().into(),
                     block_source_words.as_ref(),
-                    // A prebind candidate's TARGET may live on any page of
-                    // the unit; its observation comes from the same
-                    // authoritative table as the source's. A refusal here is
-                    // fail-closed to "leave the gateway stub" inside the
-                    // authority, never an error.
-                    &mut |target| memory.dsr_generation_observation(target).ok(),
                 )
             });
             if let Some(LiveConsultation::Private(fallback)) = publication {
@@ -9038,7 +9027,6 @@ mod tests {
                 _generation: &PageGenerationObservation,
                 _owner_pid: i32,
                 prepare: &mut dyn FnMut() -> Result<PreparedSharedInitial, types::DsrError>,
-                _observe_target_page: &mut dyn FnMut(GuestVa) -> Option<PageGenerationObservation>,
             ) -> LivePublishOutcome {
                 match self.winner {
                     FakeWinner::Private(reason) => LivePublishOutcome::Private(reason),
@@ -9143,7 +9131,6 @@ mod tests {
                 _generation: &PageGenerationObservation,
                 _owner_pid: i32,
                 _prepare: &mut dyn FnMut() -> Result<PreparedSharedInitial, types::DsrError>,
-                _observe_target_page: &mut dyn FnMut(GuestVa) -> Option<PageGenerationObservation>,
             ) -> LivePublishOutcome {
                 LivePublishOutcome::Private(LivePrivateReason::InvalidRecord)
             }
@@ -9374,7 +9361,6 @@ mod tests {
                     &observation,
                     EmitAddressMode::Direct,
                     Some(&vec![SYSCALL_WORD]),
-                    &mut |_| None,
                 )
             });
 
@@ -9406,7 +9392,6 @@ mod tests {
                     &observation,
                     EmitAddressMode::Direct,
                     Some(&vec![SYSCALL_WORD]),
-                    &mut |_| None,
                 )
             });
 
@@ -9501,7 +9486,6 @@ mod tests {
                         &observation,
                         EmitAddressMode::Direct,
                         Some(&vec![SYSCALL_WORD]),
-                        &mut |_| None,
                     )),
                     LiveConsultation::Private(LiveFallback::Arena(reason)),
                     "{reason:?} must reach the translator unrenamed"
@@ -9547,7 +9531,6 @@ mod tests {
                         &observation,
                         EmitAddressMode::Direct,
                         Some(&vec![SYSCALL_WORD]),
-                        &mut |_| None,
                     )),
                     LiveConsultation::Private(LiveFallback::UnsupportedShape)
                 );
@@ -9566,7 +9549,6 @@ mod tests {
                     &observation,
                     EmitAddressMode::Direct,
                     Some(&vec![SYSCALL_WORD]),
-                    &mut |_| None,
                 )),
                 LiveConsultation::Private(LiveFallback::CrossPage)
             );
@@ -9580,7 +9562,6 @@ mod tests {
                     &observation,
                     EmitAddressMode::Direct,
                     None,
-                    &mut |_| None,
                 )),
                 LiveConsultation::Private(LiveFallback::SourceWordsUnavailable)
             );
@@ -9607,7 +9588,6 @@ mod tests {
                     &observation,
                     EmitAddressMode::Direct,
                     Some(&vec![SYSCALL_WORD]),
-                    &mut |_| None,
                 )),
                 LiveConsultation::Private(LiveFallback::PrepareRefused)
             );
@@ -10888,7 +10868,6 @@ mod tests {
                         &observation,
                         EmitAddressMode::Direct,
                         words.as_ref(),
-                        &mut |_| None,
                     )
                 });
                 assert_eq!(observed(&lane), vec![(class, 1)], "{what}");
@@ -10905,7 +10884,6 @@ mod tests {
                     &observation,
                     EmitAddressMode::Direct,
                     Some(&vec![SYSCALL_WORD]),
-                    &mut |_| None,
                 )
             });
             assert_eq!(
@@ -10940,7 +10918,6 @@ mod tests {
                     &observation,
                     EmitAddressMode::Direct,
                     Some(&vec![SYSCALL_WORD]),
-                    &mut |_| None,
                 )
             });
             assert!(matches!(published, LiveConsultation::Installed(_)));
@@ -10992,7 +10969,6 @@ mod tests {
                     &observation,
                     EmitAddressMode::Direct,
                     Some(&vec![SYSCALL_WORD]),
-                    &mut |_| None,
                 )
             });
             assert!(matches!(published, LiveConsultation::Installed(_)));
@@ -11035,7 +11011,6 @@ mod tests {
                     &observation,
                     EmitAddressMode::Direct,
                     Some(&vec![SYSCALL_WORD]),
-                    &mut |_| None,
                 )
             });
             assert!(matches!(published, LiveConsultation::Installed(_)));
