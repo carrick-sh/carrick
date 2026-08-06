@@ -240,8 +240,25 @@ names the wrong lock. The receipts:
   as is the lock-free `published_blocks` index. Only a miss through BOTH takes
   `ProcessState` write. `one_entry_hits` is 2,829,406,956 — **1.94 per gateway
   exit** — so the per-thread cache serves essentially everything.
-- `ProcessState` write is therefore taken on the order of
-  **773,139 times** (128,895 translations + 644,244 installs), not per exit.
+- `ProcessState` write is therefore taken **1,246,783 times**, not per exit —
+  and that number is measured, not inferred: `ProcessState::translate`
+  increments `cache_lookups` unconditionally on entry
+  (`translator.rs:5262-5263`), so it counts one per acquisition through that
+  path. It reconciles exactly against the five branches that each hold the
+  lock for the full call:
+
+  | branch | C1ON | C1OFF |
+  |---|---|---|
+  | `cache_lookup_hits` (`blocks.get` hit) | 896 | 23,691 |
+  | `live_index_hits` | 22,688 | 0 |
+  | `shared_unit_hits` | 450,060 | 450,191 |
+  | `live_blocks_installed` | 644,244 | 0 |
+  | `translations` | 128,895 | 767,960 |
+  | **sum = `cache_lookups`** | **1,246,783** | **1,241,842** |
+
+  (Corrected 2026-08-06: an earlier revision of this section used
+  128,895 + 644,244 = 773,139, omitting the three HIT branches, which put the
+  denominator **38.0% too low**.)
 - But `ThreadTranslator::translate_read_mostly` opens with
   `memory.dsr_generation_observation(guest)` (`translator.rs:6239`), which is
   `PageGenerationTable::observe` (`carrick-dsr/src/cache.rs:179-195`) — and
@@ -249,8 +266,18 @@ names the wrong lock. The receipts:
   under `DsrSynchronizationKind::GenerationTableWrite`.
 
 So the per-exit exclusive lock is **`GenerationTableWrite`, acquired
-1,459,213,262 times against `ProcessState`'s ~773,139 — a ratio of 1,887:1** —
-and it is taken *before* the lockless fast path can help. That is consistent
+1,459,213,262 times against `ProcessState`'s 1,246,783 — a ratio of
+~1,170:1** — and it is taken *before* the lockless fast path can help. That
+ratio is an **upper bound**: the mutation seam (`translator.rs:3541`,
+`:3551`) also takes the `ProcessState` write lock on every guest code
+mutation, and `cache_lookups` does not count it, so the true separation is
+somewhat narrower still.
+
+The contrast between arms is itself informative: under policy OFF the same
+counters give 1,846,656 exits against 1,241,842 `ProcessState` entries —
+**1.5:1**, i.e. nearly every exit reaches the write path. Under ON it is
+1,170:1. The per-thread cache is not newly effective; there are simply three
+orders of magnitude more exits for it to absorb. That is consistent
 with `PageGenerationTable::observe` being the hottest named symbol on the run
 (14.2%), with its hottest line being `cache.rs:181`, the acquisition itself.
 
@@ -258,7 +285,7 @@ with `PageGenerationTable::observe` being the hottest named symbol on the run
 records leaf user PCs without stacks, so `lock_exclusive_slow`'s 6.28% cannot
 be split between its two possible callers by this capture alone. Attributing
 the bulk of it to `ProcessState` instead would require each `ProcessState`
-acquisition to be ~1,900x more expensive than each `GenerationTableWrite` one.
+acquisition to be ~1,170x more expensive than each `GenerationTableWrite` one.
 **What would settle it:** a capture keyed on the existing
 `DsrSynchronizationKind` USDT (the probe is already emitted at both sites via
 `probes::acquire_with_synchronization_reason`), which no profile currently
@@ -282,7 +309,7 @@ fifth is real but downstream.
 | 1 | `active_chunks_for_source_page` — 1,024-descriptor linear scan per covered 16 KiB page under the ProcessState write lock, on every code-mutation event | Every `live_arena` symbol together is **0.02%** of on-CPU user samples (0.016% raw). `live_revoked_chunks = 0` and `live_stale_instruction_aborts = 0` across all 454 thread records — the revocation path found nothing to revoke in the entire build, and `note_live_source_page`'s scan is guarded (`translator.rs:4932-4937`) to first-install per (page, chunk) | **REFUTED as a leading term.** The O(pages×chunks) shape is real and worth fixing on principle, but it is not in this workload's excess | high |
 | 2 | Per-install / winner publication (SHA-256 + I-cache + memcpy) | 80,048 publication wins, 9 adoptions. `sha2::compress256` is **0.10%** of on-CPU user samples under ON — against **2.23%** under OFF, where it is the single hottest carrick symbol | **REFUTED.** SHA-256 is 30x *less* prominent with the arena on | high |
 | 3 | READY-hit validation: per-acquire SHA-256 over mapped RX + HOT validation + I-cache invalidate | 564,187 READY hits + 644,244 installs, same 0.10% `sha2` share | **REFUTED** | high |
-| 4 | ProcessState `RwLock` serialization | 14.9% of on-CPU user in `parking_lot` slow paths; 8.1% of all CPU in `psynch_*`; 0.86% of off-CPU | **The ~15% is REAL — but it is NOT `ProcessState`.** The per-exit exclusive lock is `GenerationTableWrite` inside `PageGenerationTable::observe`, 1,459,213,262 acquisitions against `ProcessState`'s ~773,139 (§5). Downstream of the round trips on that reading | medium-high; the leaf-PC sampler cannot split `lock_exclusive_slow` between callers |
+| 4 | ProcessState `RwLock` serialization | 14.9% of on-CPU user in `parking_lot` slow paths; 8.1% of all CPU in `psynch_*`; 0.86% of off-CPU | **The ~15% is REAL — but it is NOT `ProcessState`.** The per-exit exclusive lock is `GenerationTableWrite` inside `PageGenerationTable::observe`, 1,459,213,262 acquisitions against `ProcessState`'s 1,246,783 (§5, ~1,170:1). Downstream of the round trips on that reading | medium-high; the leaf-PC sampler cannot split `lock_exclusive_slow` between callers |
 | 5 | B3 arena CAS/cursor protocol under concurrent publishers | `lfb_arena_cas_lost = 6` for the whole build; `lfb_arena_exhausted_probes`, `_capacity`, `_invalid_record`, `_failed` all **0** | **REFUTED.** The lock-free protocol is not contending | high |
 
 The reviews looked at the arena's *maintenance* paths. The cost is in what
