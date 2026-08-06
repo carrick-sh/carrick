@@ -141,6 +141,13 @@ on-CPU **user** samples spent in translated guest code:
 The absolute amount of guest execution is **unchanged** (it is the same
 build). Only the non-guest work grew — by a factor of seventy.
 
+Two independent instruments agree on how much real guest execution there
+is, which is what makes the "unchanged" claim safe: policy OFF's
+`translated-run` phase timer says **7.44 CPU-s** and its JIT on-CPU samples
+at 499 Hz say **9.13 CPU-s**; policy ON's JIT samples say **6.41 CPU-s**
+against a `translated-run` phase timer of 133.59 CPU-s. Guest work is a
+constant ~7–9 CPU-s in both arms.
+
 ---
 
 ## 5. The cost ledger
@@ -156,7 +163,7 @@ bracket. Same-instrument shares only.
 | 1 | **`prepare-index`** — resolver entry bookkeeping per round trip. Hottest named symbol on the whole run: `carrick_dsr::cache::PageGenerationTable::observe` at **10.2%** of on-CPU user samples (three call sites, `cache.rs:181/186/196`) | 638.1 | **39.3%** | 437 | NATIVEPERF phases + `W1ON` symbols | high |
 | 2 | **`translate`** — the per-exit resolver lookup (a cache hit 99.99% of the time: 1.459e9 lookups, 128,895 actual translations) | 327.1 | **20.1%** | 235 | NATIVEPERF phases | high |
 | 3 | **`finish-exit`** — exit reconciliation per round trip | 319.4 | **19.7%** | 219 | NATIVEPERF phases | high |
-| 4 | **`translated-run`** — the phase bracket around guest execution. Of its 133.6 s ON, the `W1ON` JIT sample share says only ≈**0.5 s is real guest execution**; the rest is bracket | 126.2 | **7.8%** | 92 | NATIVEPERF + `W1ON` JIT share | medium |
+| 4 | **`translated-run`** — the phase bracket around guest execution. Of its 133.6 s ON, only ≈**6.4 s is real guest execution** (`W1ON`'s JIT samples at 499 Hz); **95.2% of the phase is bracket** | 126.2 | **7.8%** | 92 | NATIVEPERF + `W1ON` JIT share | medium |
 | 5 | `loop-quiesce` | 11.7 | 0.7% | 8 | NATIVEPERF phases | high |
 | 6 | `syscall-dispatch` (guest syscalls only rose 2.8x: 88,174 → 248,620) | 2.8 | 0.2% | 3 | NATIVEPERF phases | high |
 | 7 | **residual / unattributed** — ON thread CPU outside every loop phase: process startup, fs and dispatch work off the loop, fork/exec, counter emission | 199.9 | **12.3%** | — | subtraction | low (bound, not decomposed) |
