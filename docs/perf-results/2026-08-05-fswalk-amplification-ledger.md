@@ -2,10 +2,12 @@
 
 **Date:** 2026-08-05
 **Scope:** first Move-3 amplification-ledger entry of the category-collapse
-strategy. Re-measures host-ops-per-guest-op on the fs-walk fixture at HEAD and
-retires the stale pre-trusted-lane figures (AGENTS.md's "19.68 host opens per
-guest open"; the 45,005-host-call attribution pointer in
-`container-lifecycle-split.jsonl`).
+strategy. Measures host-ops-per-guest-op on the fs-walk fixture at HEAD, and
+corrects two figures that were being quoted without their denominators:
+AGENTS.md's "19.68 host opens per guest open" (a *go-build* service-window
+number, not an fs-walk one — see below) and the 45,005-host-call attribution
+pointer in `container-lifecycle-split.jsonl` (fs-class-filtered, so not
+comparable to an unfiltered total).
 **Lane:** shipped default — Darwin/AArch64 native DSR (`--exec-backend native`).
 
 The table below is the format every subsequent ledger entry reuses:
@@ -83,17 +85,35 @@ syscall **counts**, which power state does not move.
 - **Perturbation.** Two probes fire on every host syscall the tracked tree
   issues. Wall time from this run is therefore **not** a performance number and
   none is quoted from it; only same-instrument counts and ratios are citable.
+  Separately, 3,182 host calls in the capture are probably the instrument's
+  own — see "Where the 45k went".
+- **Single capture; no variance is reported and none should be quoted from
+  this entry.** These are syscall counts on a deterministic fixture, and they
+  reproduce the 2026-08-02 census to within 2 guest calls, which is why one run
+  is treated as sufficient for the count columns. Any claim that needs a
+  distribution — in particular any before/after comparison of a lever — needs
+  its own repeated sampling.
 
 ## Whole-fixture ratios
 
-| quantity | value |
-|---|---:|
-| guest Linux syscalls | 24,201 |
-| host macOS syscalls | 52,805 |
-| **host syscalls per guest syscall (whole fixture)** | **2.1819x** |
-| host syscalls issued while servicing a guest syscall | 41,314 |
-| host syscalls per guest syscall (service windows only) | 1.7071x |
-| host syscalls outside any guest service window (`carrick-only`) | 11,491 (21.8%) |
+3,182 of the captured host syscalls (1,606 `kdebug_trace64` + 1,576
+`kdebug_trace_string`) are probable instrumentation, not workload — see the
+caveat under "Where the 45k went". They are all `carrick-only`. The primary
+figures below therefore **exclude** them; the with-tracer variant is kept only
+so the raw receipt reconciles.
+
+| quantity | primary (tracer-free) | with-tracer variant |
+|---|---:|---:|
+| guest Linux syscalls | 24,201 | 24,201 |
+| host macOS syscalls | 49,623 | 52,805 |
+| **host syscalls per guest syscall (whole fixture)** | **2.0505x** | 2.1819x |
+| host syscalls issued while servicing a guest syscall | 41,314 | 41,314 |
+| host syscalls per guest syscall (service windows only) | **1.7071x** | 1.7071x |
+| host syscalls outside any guest service window (`carrick-only`) | 8,309 (16.7%) | 11,491 (21.8%) |
+
+The two service-window rows are identical because every `kdebug_trace*` call
+landed in `carrick-only`: no per-op amplification cell in this document is
+affected by the exclusion.
 
 `carrick-only` is real cost but it is not amplification of any guest op, so it
 is never folded into a per-op ratio.
@@ -117,13 +137,18 @@ its count.
 | `mmap` | 51 | 198 | 3.8824x | `mprotect` (142) |
 | `exit_group` | 3 | 1,622 | 540.67x | `close` (1,585) |
 | `execve` | 2 | 357 | 178.50x | `openat`/`fcntl` (64 each) |
-| — `carrick-only` (not amplification) | — | 11,491 | n/a | `fstatat64` (5,802) |
+| other guest ops — 28 of them, 11 with any host call | 105 | 588 | 5.6000x | `openat` (87) |
+| — `carrick-only`, workload (not amplification) | — | 8,309 | n/a | `fstatat64` (5,802) |
+| — `carrick-only`, probable tracer (`kdebug_trace*`) | — | 3,182 | n/a | `kdebug_trace64` (1,606) |
+
+The table is complete: the guest column sums to 24,201 and the host column to
+52,805, both matching the independently aggregated totals.
 
 Two rows are **ratios over a tiny denominator** and must not be read as
 per-call cost: `exit_group` (3 calls) is process teardown closing 1,585 host
 fds in one go, and `execve` (2 calls) is the loader. They are listed because
-their absolute host-call counts are material (3.1% and 0.7% of the run), not
-because 540x is a meaningful per-op figure.
+their absolute host-call counts are material (3.3% and 0.7% of the tracer-free
+run), not because 540x is a meaningful per-op figure.
 
 The `mmap` row is small in absolute terms (198 host calls) but its dominant
 host call is worth recording: 51 guest `mmap`s produce **142 host `mprotect`s**.
@@ -133,26 +158,47 @@ Darwin port manages its heap with *zero* `mprotect`, using
 on Darwin `mprotect` is the expensive primitive. This lane is re-issuing a
 Linux mechanism rather than lowering the guest's intent.
 
-### The direct replacement for "19.68 host opens per guest open"
+### The open lane, and what 19.68 actually was
 
-| reading | value |
-|---|---:|
-| host `openat` issued inside guest `openat` service windows ÷ guest `openat` | **2.3668** |
-| all host `openat` in the run (7,695) ÷ guest `openat` (1,671) | **4.6050** |
+AGENTS.md's 19.68 has a precise provenance, and it is not this workload.
+`docs/perf-results/native-fs-amplification.jsonl` record 8
+(`contained-metadata-retention`, `git_sha 564dd281`, run id
+`native-fs-contained-metadata-a-20260728`) and
+`native-wall-time-campaign.md:113,831` record it as
+`host_openat_from_guest_openat 46,493 ÷ guest_openat 2,363 = 19.6754` — a
+**service-window (contained)** figure, captured on the **cold-`GOCACHE`
+go-build** (candidate median wall 19,163 ms), not on fs-walk. That same run's
+whole-run analog was `host_openat_total 83,290 ÷ 2,363 = 35.25`.
 
-The second is the like-for-like successor to the 19.68 figure, which was itself
-a whole-run joined-opens-over-guest-opens number. Either way the open lane has
-collapsed by roughly 4-8x since that figure was recorded.
+So the definitions pair like this, and the *workloads do not*:
+
+| reading | old (2026-07-28, cold go-build) | new (2026-08-05, fs-walk) |
+|---|---:|---:|
+| service-window: host `openat` inside guest `openat` windows ÷ guest `openat` | **19.6754** | **2.3668** |
+| whole-run: all host `openat` ÷ guest `openat` | 35.25 | 4.6050 |
+
+**No improvement multiple is claimed from this pair.** The service-window row
+is the like-for-like comparison of *definitions*, but the two cells describe
+different workloads — a Go build's loader- and cache-heavy open pattern versus
+a directory walk — so their ratio measures the workload difference at least as
+much as any change in carrick. The honest statement is the absolute one: **on
+the fs-walk fixture at HEAD a guest `openat` costs 2.37 host `openat` inside
+its own service window, and 4.61 counting every host `openat` in the run.**
+Restating 19.68 for the go-build at HEAD is a separate measurement this entry
+did not make.
 
 ### The finding this capture adds
 
 The 2026-08-02 census filtered host syscalls to an fs allow-list, so it could
 not see this: **guest `getdents64` pays a six-call directory-stream preamble,
 once per directory.** Exactly 1,560 each of `dup`, `fcntl_nocancel`, `fstat64`,
-`fstatfs64`, `lseek`, and `close_nocancel` are attributed to `getdents64` —
-1,560 being the directory count (3,123 guest `getdents64` ÷ 2 calls per
-directory: one data, one EOF). That is **9,360 host syscalls, 17.7% of every
-host syscall in the run**, spent on stream setup and teardown rather than on
+`fstatfs64`, `lseek`, and `close_nocancel` are attributed to `getdents64`. The
+walk issues 3,123 guest `getdents64`, i.e. **just over two per directory** —
+`find` reads a directory then reads again to see EOF, and 3,123 ÷ 1,560 =
+2.0019, the three extra calls being directories whose entries did not fit in
+one buffer. The preamble fires once per *directory*, not once per call. That is
+**9,360 host syscalls, 18.9% of the tracer-free run (17.7% with the tracer
+calls included)**, spent on stream setup and teardown rather than on
 enumeration; the enumeration itself is only 3,150 `getdirentries64`.
 
 The signature is the macOS `fdopendir(3)`/`closedir(3)` sequence that cap-std's
@@ -168,24 +214,61 @@ Enumerating from the already-open dirfd — `getdirentries64(2)` directly, or
 `getattrlistbulk(2)` per fs endgame Lever A — removes six host calls per
 directory without changing any guest-visible result.
 
-### Where the 45k went
+### Where the 45k went — and a movement that looks like a regression
 
-`fswalk-amp6.raw` (pre-trusted-lane) attributed **45,005 host calls to
-`carrick-only`**, dominated by 38,225 `unlinkat` of scratch teardown. At HEAD
-that bucket is **11,491** and `unlinkat` is *absent* (4 `unlink` total): the
-deferred-teardown work holds. The largest remaining `carrick-only` item is
-5,802 `fstatat64` (11.0% of all host syscalls) issued outside any guest service
-window — the biggest single unattributed block in the run, and the natural
-subject of the next ledger entry.
+**Compare filtered to filtered.** The 45,005 figure is the *fs-class-filtered*
+`carrick-only` bucket from `fswalk-amp6.raw`; this run's 11,491 is
+*unfiltered*, so the two are not comparable. Reading the same filtered
+`section=host-by-guest` join out of all three receipts:
 
-One caveat on that bucket, stated rather than buried: 1,606 `kdebug_trace64` +
-1,576 `kdebug_trace_string` (3,182 calls, 6.0% of the run) also land in
-`carrick-only`. carrick makes no direct `kdebug`/`os_signpost` calls, and
-`kdebug_typefilter` appears alongside them, so these are most likely
-instrumentation-induced rather than workload cost. They are excluded from every
-amplification cell by construction (they are `carrick-only`), and they should
-not be banked as a lever until re-measured with an instrument that does not
-enable kdebug.
+| receipt | date | `carrick-only`, fs-class filtered |
+|---|---|---:|
+| `target/perf/fswalk-amp6.raw` | pre-trusted-lane | 45,005 |
+| `target/perf/fswalk-amp7.raw` | 2026-08-02 | 561 |
+| this capture | 2026-08-05 | **6,467** |
+
+The deferred-teardown work holds: `unlinkat` dominated amp6 at 38,225 and is
+*absent* at HEAD (8 host `unlink` in the whole run, 4 of them `carrick-only`).
+Separately, unfiltered `carrick-only` at HEAD is 11,491, or **8,309 excluding
+the probable-tracer `kdebug_trace*` calls**.
+
+**But 561 → 6,467 is a movement to explain, not a standing block.** Both
+figures are the same filtered join, on the same fixture, three days apart, and
+essentially the entire delta is one host call:
+
+| filtered join | amp7 (2026-08-02) | HEAD (2026-08-05) |
+|---|---:|---:|
+| `carrick-only` → `fstatat64` | **32** | **5,802** |
+| `carrick-only` → `getdirentries64` | 1 | 74 |
+| joined to guest `newfstatat` | 13,495 | 13,495 |
+| joined to guest `getdents64` | 3,153 | 3,153 |
+| joined to guest `openat` | 7,376 | 7,396 |
+| joined to guest `close` | 1,672 | 1,673 |
+
+Every column attributed to a guest op is stable to within 0.3%, while
+`carrick-only` `fstatat64` moved by +5,770 — 11.6% of the tracer-free run
+(11.0% with-tracer) appearing outside any guest service window where three days
+ago there were 32. That shape (one bucket moving, all others frozen) reads as a **regression
+introduced since 2026-08-02**, not as a long-standing unattributed block, and
+it should be treated as one until shown otherwise.
+
+**Recommended next action: bisect this movement first**, over the commits
+between `fswalk-amp7.raw`'s capture and `fad9ae0d`, using the same instrument
+and fixture so the filtered `carrick-only` → `fstatat64` cell is the bisect
+signal. That is deliberately out of this entry's scope — this entry measures,
+it does not attribute a cause — but it outranks any new amplification work,
+because 5,770 host stats is larger than every per-op lever named below.
+
+One caveat on the same bucket, stated rather than buried: 1,606
+`kdebug_trace64` + 1,576 `kdebug_trace_string` (3,182 calls, 6.4% of the
+tracer-free run) also land in `carrick-only`. carrick makes no direct
+`kdebug`/`os_signpost` calls, and `kdebug_typefilter` appears alongside them,
+so these are most likely instrumentation-induced rather than workload cost.
+They are excluded from the primary whole-fixture ratios and from every
+amplification cell, and they should not be banked as a lever until re-measured
+with an instrument that does not enable kdebug. They are *not* the explanation
+for the `fstatat64` movement above — that is a different host call, and the
+old instrument counted `fstatat64` too.
 
 ## Wall context (cited, not re-measured)
 
@@ -195,11 +278,14 @@ Docker = 18.9286x**. That denominator is in-guest only — it excludes container
 create and teardown by construction. No wall number is taken from the traced
 run above.
 
-Reconciling the two: at 2.18 host syscalls per guest syscall the fs lane is no
-longer *amplification*-bound in the way the 19.68 figure implied. The in-guest
-gap is now dominated by the per-host-syscall cost on APFS plus the residual
-per-op multiples above (`openat` 5.91x, `getdents64` 4.01x, `newfstatat`
-2.86x), not by carrick issuing an order of magnitude more calls than it needs.
+Reconciling the two: at **2.05** host syscalls per guest syscall (1.71 inside
+service windows) this workload is not gross-amplification-bound. The in-guest
+gap is dominated by the per-host-syscall cost on APFS plus the residual per-op
+multiples above (`openat` 5.91x, `getdents64` 4.01x, `newfstatat` 2.86x) — and
+by the unexplained 5,770-call `carrick-only` `fstatat64` movement, which alone
+is 11.6% of the tracer-free run. Note this says nothing about the go-build lane,
+where the 19.68 figure was taken; that lane's open amplification at HEAD is
+unmeasured.
 
 Note also that AGENTS.md's claim of "roughly one host call per guest stat"
 is precise only about `fstatat64` (1.015 host stats per guest stat). A guest
@@ -209,6 +295,14 @@ mode-xattr work around the stat, which is where the remaining stat-lane lever
 is.
 
 ## Next lever
+
+**Ahead of any lever: bisect the `carrick-only` `fstatat64` movement**
+(32 → 5,802 between 2026-08-02 and `fad9ae0d`, same fixture, same filtered
+join). It is larger than every lever below and is probably a regression, so
+fixing it may be free where the levers are not. Procedure and receipts are in
+"Where the 45k went" above.
+
+The standing lever, once that is settled:
 
 **fs endgame Lever B — serve reads from the shared read-only cache tree and
 copy up on write** (`docs/superpowers/specs/2026-08-02-fs-walk-endgame-design.md`
