@@ -1,10 +1,26 @@
 //! Darwin mappings for the container-lifetime live translation arena.
 //!
-//! Code and control use distinct Mach memory-entry objects. Code is mapped
-//! through separate permanently-RW and permanently-RX aliases; no returned or
-//! retained live alias is both writable and executable. Darwin requires a
-//! private, empty, constructor-only MAP_JIT bootstrap that is temporarily
-//! nominal-RWX and unmapped before arena construction returns.
+//! Code and control use distinct unlinked regular files — the `kernel_arena`
+//! idiom, and the only backing this host lets carrick both share across
+//! `fork(2)`+`execve` and map executable. Code is mapped through separate
+//! permanently-RW and permanently-RX aliases; no returned or retained live
+//! alias is both writable and executable, and each alias's MAXIMUM protection
+//! is clamped with `mach_vm_protect(set_maximum)` so no holder can escalate
+//! one afterwards.
+//!
+//! The RX alias is built `mmap(PROT_READ)` + `mprotect(PROT_READ|PROT_EXEC)`:
+//! Darwin's AMFI refuses `mmap(PROT_EXEC)` of an unsigned file outright
+//! (EPERM), but the `mprotect` route is open to an ad-hoc, non-hardened
+//! process — the same signing state `jit.rs` documents for `MAP_JIT`. Every
+//! step is qualified live on this host in
+//! `docs/perf-results/2026-08-05-fd-transport-probe-receipts.txt`; the design
+//! is `docs/superpowers/specs/2026-08-05-live-arena-fd-transport-design.md`.
+//!
+//! Transport is fd inheritance: the fds ARE the capability, so a guest
+//! `fork(2)` child can carry the arena through its own host self-exec. No
+//! Mach name exists anywhere in this module's transport, which is why an
+//! `Arc<DarwinLiveArena>` unwinding in a fork child is purely process-local
+//! (`munmap` + `close`).
 
 use carrick_dsr::cache::{PageGenerationDomain, PageGenerationObservation, TranslationCache};
 use carrick_dsr::host::{ForkChildJit, JitRegion, NativeHostJit};
@@ -22,35 +38,31 @@ use carrick_dsr_aarch64::shared_cache::TranslationUnitKey;
 use carrick_dsr_aarch64::types::CacheOffset;
 use carrick_guest_mem::{GuestVa, HostVa};
 use mach2::kern_return::{KERN_SUCCESS, kern_return_t};
-use mach2::mach_port::{mach_port_deallocate, mach_port_mod_refs};
-use mach2::memory_object_types::memory_object_size_t;
-use mach2::port::{
-    MACH_PORT_NULL, MACH_PORT_RIGHT_SEND, mach_port_right_t, mach_port_t, mach_port_urefs_t,
-};
-use mach2::task::{mach_ports_lookup, mach_ports_register};
+use mach2::mach_port::mach_port_deallocate;
+use mach2::port::MACH_PORT_NULL;
 use mach2::traps::mach_task_self;
-use mach2::vm::{
-    mach_make_memory_entry_64, mach_vm_allocate, mach_vm_deallocate, mach_vm_map, mach_vm_protect,
-    mach_vm_region,
-};
-use mach2::vm_inherit::VM_INHERIT_SHARE;
+use mach2::vm::{mach_vm_protect, mach_vm_region};
 use mach2::vm_prot::{VM_PROT_EXECUTE, VM_PROT_NONE, VM_PROT_READ, VM_PROT_WRITE, vm_prot_t};
 use mach2::vm_region::{VM_REGION_BASIC_INFO_64, vm_region_basic_info_64};
-use mach2::vm_statistics::VM_FLAGS_ANYWHERE;
 use sha2::{Digest, Sha256};
+use std::ffi::CString;
 use std::io;
 use std::marker::PhantomData;
 use std::ops::Range;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const LIVE_ARENA_TRANSIT_SCHEMA_V2: u32 = 2;
 const LIVE_OBJECT_HEADER_LEN: usize = LIVE_ARENA_OBJECT_HEADER_BYTES;
 const LIVE_OBJECT_MAGIC: [u8; 8] = *b"CRKLIVE\0";
 const LIVE_OBJECT_CODE: u32 = 1;
 const LIVE_OBJECT_CONTROL: u32 = 2;
-const TASK_PORT_REGISTER_MAX: usize = 3;
+
+static LIVE_ARENA_FILE_SERIAL: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LiveArenaTransitV2 {
@@ -60,265 +72,185 @@ pub struct LiveArenaTransitV2 {
     pub nonce: [u8; 16],
 }
 
-/// Opaque, independently-owned send-right references for one exec handoff.
-/// Raw Mach names remain private to this module.
-pub struct LiveArenaTransitRights {
-    _code: MachSendRight,
-    _control: MachSendRight,
+/// One backing object's inherited-descriptor authority for a host self-exec.
+///
+/// The fd IS the capability: `fork(2)` and `execve` both carry it, and nothing
+/// else in the successor can name this object. `original_host_fd_flags` plus
+/// the `fstat` triple are what make adoption *authenticated* rather than
+/// merely inherited — the exact `KernelArenaReexecAuthority` shape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LiveArenaObjectAuthority {
+    pub host_fd: RawFd,
+    pub original_host_fd_flags: libc::c_int,
+    pub host_device: u64,
+    pub host_inode: u64,
+    pub host_size: u64,
 }
 
-struct RegisteredPortVector {
-    slots: [Option<MachSendRight>; TASK_PORT_REGISTER_MAX],
+/// The complete cross-exec authority for one live arena: the unchanged V2
+/// transit record (schema/lengths/nonce) plus both objects' fd authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LiveArenaReexecAuthority {
+    pub transit: LiveArenaTransitV2,
+    pub code: LiveArenaObjectAuthority,
+    pub control: LiveArenaObjectAuthority,
 }
 
-impl RegisteredPortVector {
-    fn lookup() -> io::Result<Self> {
-        let mut raw = std::ptr::null_mut();
-        let mut count = 0;
-        let result = unsafe { mach_ports_lookup(mach_task_self(), &mut raw, &mut count) };
-        let mut allocation = OolPortArray { raw, count };
-        check_kr("mach_ports_lookup live arena", result)?;
-        if count as usize > TASK_PORT_REGISTER_MAX {
-            return Err(io::Error::other(format!(
-                "registered-port vector has {count} entries; maximum is {TASK_PORT_REGISTER_MAX}"
-            )));
-        }
-        if count != 0 && raw.is_null() {
-            return Err(io::Error::other(
-                "mach_ports_lookup returned a null nonempty array",
-            ));
-        }
-        let mut slots = [None, None, None];
-        for (index, slot) in slots.iter_mut().enumerate().take(count as usize) {
-            let name = allocation.take(index);
-            if name != MACH_PORT_NULL {
-                *slot = Some(MachSendRight::from_kernel(
-                    name,
-                    "mach_ports_lookup registered send right",
-                )?);
-            }
-        }
-        drop(allocation);
-        Ok(Self { slots })
-    }
-
-    fn take(&mut self, index: usize) -> Option<MachSendRight> {
-        self.slots[index].take()
-    }
-}
-
-struct OolPortArray {
-    raw: *mut mach_port_t,
-    count: u32,
-}
-
-impl OolPortArray {
-    fn take(&mut self, index: usize) -> mach_port_t {
-        let slot = unsafe { self.raw.add(index) };
-        let name = unsafe { *slot };
-        unsafe { *slot = MACH_PORT_NULL };
-        name
-    }
-}
-
-impl Drop for OolPortArray {
-    fn drop(&mut self) {
-        if !self.raw.is_null() {
-            for index in 0..self.count as usize {
-                let name = unsafe { *self.raw.add(index) };
-                if name != MACH_PORT_NULL {
-                    let _ = unsafe { mach_port_deallocate(mach_task_self(), name) };
-                }
-            }
-            let bytes = u64::from(self.count) * std::mem::size_of::<mach_port_t>() as u64;
-            let _ = unsafe { mach_vm_deallocate(mach_task_self(), self.raw as u64, bytes) };
-        }
-    }
-}
-
-fn register_port_names(names: &[mach_port_t; TASK_PORT_REGISTER_MAX]) -> io::Result<()> {
-    check_kr("mach_ports_register live arena", unsafe {
-        mach_ports_register(
-            mach_task_self(),
-            names.as_ptr().cast_mut(),
-            TASK_PORT_REGISTER_MAX as u32,
+/// Create one unlinked regular file of exactly `len` bytes.
+///
+/// The `KernelArena::create` convention: a pid+serial name in `temp_dir()`,
+/// `O_EXCL` so no stale object is ever adopted by accident, unlinked
+/// immediately so the fd is the only handle and the filesystem reclaims the
+/// extents at last close. `O_CLOEXEC` makes the steady state close-on-exec —
+/// the capsule's `HostFdFlagTransaction` clears it for exactly the deliberate
+/// self-exec window and restores it if the exec returns.
+fn create_backing_object(label: &str, len: usize) -> io::Result<OwnedFd> {
+    let serial = LIVE_ARENA_FILE_SERIAL.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "carrick-live-arena-{}-{serial}-{label}",
+        std::process::id()
+    ));
+    let cpath = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| invalid_input("live arena backing path contains NUL"))?;
+    let raw = unsafe {
+        libc::open(
+            cpath.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+            0o600,
         )
+    };
+    if raw < 0 {
+        return Err(backing_error(label, "open", io::Error::last_os_error()));
+    }
+    // SAFETY: `open` returned a fresh descriptor this scope now owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    if unsafe { libc::unlink(cpath.as_ptr()) } != 0 {
+        return Err(backing_error(label, "unlink", io::Error::last_os_error()));
+    }
+    let size = libc::off_t::try_from(len)
+        .map_err(|_| invalid_input(format!("{label} arena length exceeds off_t")))?;
+    if unsafe { libc::ftruncate(fd.as_raw_fd(), size) } != 0 {
+        return Err(backing_error(
+            label,
+            "ftruncate",
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(fd)
+}
+
+fn backing_error(label: &str, operation: &str, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("live arena {label} backing {operation}: {error}"),
+    )
+}
+
+fn object_authority(fd: &OwnedFd, label: &str) -> io::Result<LiveArenaObjectAuthority> {
+    let raw = fd.as_raw_fd();
+    let flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(backing_error(label, "F_GETFD", io::Error::last_os_error()));
+    }
+    let identity = fd_identity(raw, label)?;
+    Ok(LiveArenaObjectAuthority {
+        host_fd: raw,
+        original_host_fd_flags: flags,
+        host_device: identity.0,
+        host_inode: identity.1,
+        host_size: identity.2,
     })
 }
 
-/// Immutable plan for carrying a live arena through Darwin process creation or
-/// same-task image replacement.
+/// `(device, inode, size)` for one descriptor.
+fn fd_identity(fd: RawFd, label: &str) -> io::Result<(u64, u64, u64)> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return Err(backing_error(label, "fstat", io::Error::last_os_error()));
+    }
+    // SAFETY: `fstat` succeeded, so the buffer is initialized.
+    let stat = unsafe { stat.assume_init() };
+    let size = u64::try_from(stat.st_size)
+        .map_err(|_| invalid_input(format!("live arena {label} object has a negative size")))?;
+    // `st_dev` is i32 on Darwin and u64 elsewhere; the widening cast is an
+    // identity here and load-bearing on the other hosts this shape came from.
+    #[allow(clippy::unnecessary_cast)]
+    Ok((stat.st_dev as u64, stat.st_ino, size))
+}
+
+/// Re-own one inherited transport descriptor, authenticated before it is used.
 ///
-/// Construction snapshots slot 0 and rejects occupied slots 1 or 2, but does
-/// not modify the current task. The successor vector is installed atomically by
-/// `posix_spawn`: the runtime-owned slot 0 is preserved, and Carrick owns slots
-/// 1 (code) and 2 (control). Consequently, a returned replacement attempt has
-/// no registered-port state to restore.
-pub struct RegisteredPortExecPlan {
-    old: RegisteredPortVector,
-    installed: LiveArenaTransitRights,
+/// Order is load-bearing and each step has its own named refusal: the fd must
+/// be plausible, its size must equal the length the V2 transit record claims,
+/// its flags must be exactly the creator's minus `FD_CLOEXEC` (proving this is
+/// the deliberate capsule transit and nothing tampered in between), and its
+/// `fstat` identity must match the creator's snapshot. Only then is it
+/// duplicated into a close-on-exec descriptor this process owns.
+///
+/// The transport descriptor itself is NOT closed here: it is released by
+/// [`DarwinLiveArena::adopt_reexec`] once the whole arena has authenticated,
+/// so a refusal never leaves one object consumed and the other not.
+fn adopt_transport_object(
+    label: &str,
+    authority: LiveArenaObjectAuthority,
+    expected_len: u64,
+) -> io::Result<OwnedFd> {
+    if authority.host_fd < 0 {
+        return Err(invalid_input(format!(
+            "live arena {label} transport descriptor {} is not a descriptor",
+            authority.host_fd
+        )));
+    }
+    if authority.host_size != expected_len {
+        return Err(invalid_input(format!(
+            "live arena {label} transport size {} does not match transit length {expected_len}",
+            authority.host_size
+        )));
+    }
+    let flags = unsafe { libc::fcntl(authority.host_fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(backing_error(label, "F_GETFD", io::Error::last_os_error()));
+    }
+    if flags != authority.original_host_fd_flags & !libc::FD_CLOEXEC {
+        return Err(invalid_input(format!(
+            "live arena {label} transport fd flags changed: observed={flags} expected={}",
+            authority.original_host_fd_flags & !libc::FD_CLOEXEC
+        )));
+    }
+    let identity = fd_identity(authority.host_fd, label)?;
+    if identity
+        != (
+            authority.host_device,
+            authority.host_inode,
+            authority.host_size,
+        )
+    {
+        return Err(invalid_input(format!(
+            "live arena {label} transport fd identity changed: observed={identity:?} expected={:?}",
+            (
+                authority.host_device,
+                authority.host_inode,
+                authority.host_size
+            )
+        )));
+    }
+    let owned = unsafe { libc::fcntl(authority.host_fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if owned < 0 {
+        return Err(backing_error(
+            label,
+            "F_DUPFD_CLOEXEC",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `F_DUPFD_CLOEXEC` returned a fresh descriptor this scope owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(owned) })
 }
 
-impl RegisteredPortExecPlan {
-    pub fn install(arena: &DarwinLiveArena) -> io::Result<Self> {
-        let old = RegisteredPortVector::lookup()?;
-        if old.slots[1].is_some() || old.slots[2].is_some() {
-            return Err(io::Error::other(
-                "Carrick registered-port slots are already occupied",
-            ));
-        }
-        let transit = arena.duplicate_transit_rights()?;
-        Ok(Self {
-            old,
-            installed: transit,
-        })
-    }
-
-    /// Replaces this process image while atomically reinstalling the complete
-    /// registered-port vector as Darwin exec port actions.
-    ///
-    /// # Safety
-    ///
-    /// All C vectors must remain valid and null-terminated for the call.
-    pub unsafe fn replace_process(
-        &self,
-        executable: *const libc::c_char,
-        argv: *const *mut libc::c_char,
-        env: *const *mut libc::c_char,
-    ) -> io::Error {
-        match unsafe { self.spawn_with_flags(executable, argv, env, libc::POSIX_SPAWN_SETEXEC) } {
-            Ok(pid) => io::Error::other(format!("SETEXEC unexpectedly spawned pid {pid}")),
-            Err(error) => error,
-        }
-    }
-
-    /// Spawns a helper with the same three registered-port actions.
-    ///
-    /// # Safety
-    ///
-    /// All C vectors must remain valid and null-terminated for the call.
-    pub unsafe fn spawn_process(
-        &self,
-        executable: *const libc::c_char,
-        argv: *const *mut libc::c_char,
-        env: *const *mut libc::c_char,
-    ) -> io::Result<libc::pid_t> {
-        unsafe { self.spawn_with_flags(executable, argv, env, 0) }
-    }
-
-    unsafe fn spawn_with_flags(
-        &self,
-        executable: *const libc::c_char,
-        argv: *const *mut libc::c_char,
-        env: *const *mut libc::c_char,
-        flags: libc::c_int,
-    ) -> io::Result<libc::pid_t> {
-        let mut attr: libc::posix_spawnattr_t = unsafe { std::mem::zeroed() };
-        let mut replaced_pid = 0;
-        let mut error = unsafe { libc::posix_spawnattr_init(&mut attr) };
-        let initialized = error == 0;
-        if initialized {
-            error = unsafe { libc::posix_spawnattr_setflags(&mut attr, flags as libc::c_short) };
-        }
-        let mut names = [
-            self.old.slots[0]
-                .as_ref()
-                .map_or(MACH_PORT_NULL, |right| right.name),
-            self.installed._code.name,
-            self.installed._control.name,
-        ];
-        if error == 0 {
-            error = unsafe {
-                posix_spawnattr_set_registered_ports_np(
-                    &mut attr,
-                    names.as_mut_ptr(),
-                    names.len() as u32,
-                )
-            };
-        }
-        if error == 0 {
-            error = unsafe {
-                libc::posix_spawn(
-                    &mut replaced_pid,
-                    executable,
-                    std::ptr::null(),
-                    &attr,
-                    argv,
-                    env,
-                )
-            };
-        }
-        if initialized {
-            unsafe { libc::posix_spawnattr_destroy(&mut attr) };
-        }
-        if error == 0 {
-            Ok(replaced_pid)
-        } else {
-            Err(io::Error::from_raw_os_error(error))
-        }
-    }
-}
-
-unsafe extern "C" {
-    /// Darwin private SPI, present since macOS 10.15. Carrick uses it because
-    /// plain `execve` does not reliably retain task-registered memory-entry
-    /// rights, while a registered-port spawn action transfers them atomically.
-    fn posix_spawnattr_set_registered_ports_np(
-        attr: *mut libc::posix_spawnattr_t,
-        ports: *mut mach_port_t,
-        count: u32,
-    ) -> libc::c_int;
-
-    /// Mach `mach_port_get_refs`. The `mach2` bindings this crate uses do not
-    /// export it, so it is declared here with the module's other Mach calls
-    /// (the AGENTS.md "use `libc`" rule's Mach/hypervisor-binding exception).
-    fn mach_port_get_refs(
-        task: mach_port_t,
-        name: mach_port_t,
-        right: mach_port_right_t,
-        refs: *mut mach_port_urefs_t,
-    ) -> kern_return_t;
-}
-
-fn send_right_user_refs(name: mach_port_t) -> io::Result<u32> {
-    let mut refs: mach_port_urefs_t = 0;
-    check_kr("mach_port_get_refs live arena send right", unsafe {
-        mach_port_get_refs(mach_task_self(), name, MACH_PORT_RIGHT_SEND, &mut refs)
-    })?;
-    Ok(refs)
-}
-
-struct MachSendRight {
-    name: mach_port_t,
-}
-
-impl MachSendRight {
-    fn from_kernel(name: mach_port_t, operation: &'static str) -> io::Result<Self> {
-        if name == MACH_PORT_NULL {
-            return Err(io::Error::other(format!(
-                "{operation}: returned a null send right"
-            )));
-        }
-        Ok(Self { name })
-    }
-
-    fn duplicate(&self) -> io::Result<Self> {
-        check_kr("mach_port_mod_refs duplicate send right", unsafe {
-            mach_port_mod_refs(mach_task_self(), self.name, MACH_PORT_RIGHT_SEND, 1)
-        })?;
-        Ok(Self { name: self.name })
-    }
-
-    #[cfg(test)]
-    fn name_for_test(&self) -> mach_port_t {
-        self.name
-    }
-}
-
-impl Drop for MachSendRight {
-    fn drop(&mut self) {
-        let _ = unsafe { mach_port_deallocate(mach_task_self(), self.name) };
-    }
+/// Release one transport descriptor once its duplicate is the retained handle.
+/// This is what keeps the resumed process's fd space free of the transport
+/// numbers the capsule named.
+fn release_transport_object(authority: LiveArenaObjectAuthority) {
+    unsafe { libc::close(authority.host_fd) };
 }
 
 struct VmMapping {
@@ -327,43 +259,62 @@ struct VmMapping {
 }
 
 impl VmMapping {
-    fn allocate(len: usize) -> io::Result<Self> {
-        let len = u64::try_from(len).map_err(|_| invalid_input("mapping length exceeds u64"))?;
-        let mut address = 0;
-        check_kr("mach_vm_allocate live arena backing", unsafe {
-            mach_vm_allocate(mach_task_self(), &mut address, len, VM_FLAGS_ANYWHERE)
-        })?;
-        let mapping = Self { address, len };
-        mapping.validate_address_and_size()?;
-        Ok(mapping)
-    }
-
-    fn map_entry(entry: &MachSendRight, len: usize, protection: vm_prot_t) -> io::Result<Self> {
-        if protection & VM_PROT_WRITE != 0 && protection & VM_PROT_EXECUTE != 0 {
+    /// Map one alias of a backing object at `current` protection, with its
+    /// MAXIMUM protection clamped to `maximum`, and refuse anything else.
+    ///
+    /// The RX alias cannot be requested directly: Darwin refuses
+    /// `mmap(PROT_EXEC)` of an unsigned file with `EPERM`, so an executable
+    /// alias is mapped `PROT_READ` and raised with `mprotect`. It is never
+    /// writable at any point, so no W|X window exists even transiently.
+    ///
+    /// The clamp is what makes [`validate_protections`]'s equality check hold
+    /// verbatim on this backing (a fresh file mapping's max is `rwx`), and it
+    /// is what forecloses a later escalation of either alias by any holder.
+    ///
+    /// [`validate_protections`]: VmMapping::validate_protections
+    fn map_shared_file(
+        fd: RawFd,
+        len: usize,
+        current: vm_prot_t,
+        maximum: vm_prot_t,
+    ) -> io::Result<Self> {
+        for protection in [current, maximum] {
+            if protection & VM_PROT_WRITE != 0 && protection & VM_PROT_EXECUTE != 0 {
+                return Err(invalid_input(
+                    "live arena mapping may not be writable and executable",
+                ));
+            }
+        }
+        if current & !maximum != 0 {
             return Err(invalid_input(
-                "live arena mapping may not be writable and executable",
+                "live arena mapping current protection exceeds its maximum",
             ));
         }
-        let len = u64::try_from(len).map_err(|_| invalid_input("mapping length exceeds u64"))?;
-        let mut address = 0;
-        check_kr("mach_vm_map live arena alias", unsafe {
-            mach_vm_map(
-                mach_task_self(),
-                &mut address,
-                len,
-                0,
-                VM_FLAGS_ANYWHERE,
-                entry.name,
-                0,
-                0,
-                protection,
-                protection,
-                VM_INHERIT_SHARE,
-            )
+        let mapped_len =
+            u64::try_from(len).map_err(|_| invalid_input("mapping length exceeds u64"))?;
+        let executable = current & VM_PROT_EXECUTE != 0;
+        let initial = if executable {
+            libc::PROT_READ
+        } else {
+            posix_protection(current)
+        };
+        let address =
+            unsafe { libc::mmap(std::ptr::null_mut(), len, initial, libc::MAP_SHARED, fd, 0) };
+        if address == libc::MAP_FAILED {
+            return Err(mapping_error("mmap", io::Error::last_os_error()));
+        }
+        let mapping = Self {
+            address: address as u64,
+            len: mapped_len,
+        };
+        if executable && unsafe { libc::mprotect(address, len, posix_protection(current)) } != 0 {
+            return Err(mapping_error("mprotect", io::Error::last_os_error()));
+        }
+        check_kr("mach_vm_protect live arena alias maximum", unsafe {
+            mach_vm_protect(mach_task_self(), mapping.address, mapped_len, 1, maximum)
         })?;
-        let mapping = Self { address, len };
         mapping.validate_address_and_size()?;
-        mapping.validate_protections(protection, protection)?;
+        mapping.validate_protections(current, maximum)?;
         Ok(mapping)
     }
 
@@ -371,7 +322,7 @@ impl VmMapping {
         let page = host_page_size()?;
         if self.address == 0 || !self.address.is_multiple_of(page as u64) || self.len == 0 {
             return Err(io::Error::other(format!(
-                "Mach returned invalid mapping address/size: address=0x{:x} size={}",
+                "invalid live arena mapping address/size: address=0x{:x} size={}",
                 self.address, self.len
             )));
         }
@@ -386,13 +337,20 @@ impl VmMapping {
             .ok_or_else(|| io::Error::other("Mach mapping end overflowed"))?;
         if region.address > self.address || region_end < mapping_end {
             return Err(io::Error::other(format!(
-                "Mach mapping does not cover requested size: requested address=0x{:x} size={} returned region address=0x{:x} size={}",
+                "live arena mapping does not cover requested size: requested address=0x{:x} size={} returned region address=0x{:x} size={}",
                 self.address, self.len, region.address, region.len
             )));
         }
         Ok(())
     }
 
+    /// The mandatory fail-closed guard against a silently-downgraded alias.
+    ///
+    /// This is not defensive decoration: on POSIX shared memory this host's
+    /// kernel accepts `mmap(PROT_READ|PROT_EXEC)` and then silently strips
+    /// EXEC (probe P2-shm), which would leave the arena serving unexecutable
+    /// "code". Equality — current AND maximum exactly as requested — is what
+    /// turns that shape into a named refusal instead of a SIGBUS later.
     fn validate_protections(
         &self,
         expected_current: vm_prot_t,
@@ -401,8 +359,8 @@ impl VmMapping {
         let region = query_region(self.address)?;
         if region.current != expected_current || region.maximum != expected_max {
             return Err(io::Error::other(format!(
-                "Mach mapping protections differ: current={} max={} expected_current={} expected_max={}",
-                region.current, region.maximum, expected_current, expected_max
+                "live arena mapping protections differ: current={} max={} expected_current={expected_current} expected_max={expected_max}",
+                region.current, region.maximum
             )));
         }
         Ok(())
@@ -420,81 +378,33 @@ impl VmMapping {
 
 impl Drop for VmMapping {
     fn drop(&mut self) {
-        let _ = unsafe { mach_vm_deallocate(mach_task_self(), self.address, self.len) };
+        // Address-space-local, exactly like `close` is fd-table-local: a fork
+        // child unwinding an inherited arena unmaps only its own mappings.
+        let _ = unsafe { libc::munmap(self.address as *mut libc::c_void, self.len as usize) };
     }
 }
 
-/// Constructor-only MAP_JIT bootstrap required by Darwin to mint a single
-/// memory entry that can later produce distinct RW and RX aliases. The map is
-/// nominally RWX, but contains no published code and is always unmapped before
-/// `DarwinLiveArena::new` returns; it never becomes a live arena alias.
-struct OwnedMmap {
-    address: *mut libc::c_void,
-    len: usize,
+/// Mach and POSIX protection bits coincide on Darwin; convert explicitly
+/// rather than casting so the two domains stay distinguishable at the call.
+fn posix_protection(protection: vm_prot_t) -> libc::c_int {
+    let mut posix = 0;
+    if protection & VM_PROT_READ != 0 {
+        posix |= libc::PROT_READ;
+    }
+    if protection & VM_PROT_WRITE != 0 {
+        posix |= libc::PROT_WRITE;
+    }
+    if protection & VM_PROT_EXECUTE != 0 {
+        posix |= libc::PROT_EXEC;
+    }
+    posix
 }
 
-impl OwnedMmap {
-    fn from_successful_result(address: *mut libc::c_void, len: usize) -> Self {
-        Self { address, len }
-    }
-
-    fn non_null(&self) -> io::Result<NonNull<libc::c_void>> {
-        NonNull::new(self.address)
-            .ok_or_else(|| io::Error::other("MAP_JIT bootstrap returned null"))
-    }
-}
-
-impl Drop for OwnedMmap {
-    fn drop(&mut self) {
-        let _ = unsafe { libc::munmap(self.address, self.len) };
-    }
-}
-
-struct MapJitBootstrap {
-    mapping: OwnedMmap,
-}
-
-impl MapJitBootstrap {
-    fn new(len: usize) -> io::Result<Self> {
-        let mapped = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT,
-                -1,
-                0,
-            )
-        };
-        if mapped == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-        Self::from_owned(OwnedMmap::from_successful_result(mapped, len))
-    }
-
-    fn from_owned(mapping: OwnedMmap) -> io::Result<Self> {
-        let address = mapping.non_null()?;
-        let bootstrap = Self { mapping };
-        let page = host_page_size()?;
-        if !(address.as_ptr() as usize).is_multiple_of(page) {
-            return Err(io::Error::other(
-                "MAP_JIT bootstrap is not host-page aligned",
-            ));
-        }
-        let region = query_region(address.as_ptr() as u64)?;
-        let all = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE;
-        if region.current != all || region.maximum != all {
-            return Err(io::Error::other(format!(
-                "MAP_JIT bootstrap protections differ: current={} max={} expected={all}",
-                region.current, region.maximum
-            )));
-        }
-        Ok(bootstrap)
-    }
-
-    fn address(&self) -> io::Result<NonNull<libc::c_void>> {
-        self.mapping.non_null()
-    }
+fn mapping_error(operation: &str, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("live arena alias {operation}: {error}"),
+    )
 }
 
 struct RegionInfo {
@@ -533,83 +443,9 @@ fn query_region(address: u64) -> io::Result<RegionInfo> {
     })
 }
 
-fn create_control_memory_entry(len: usize) -> io::Result<MachSendRight> {
-    let backing = VmMapping::allocate(len)?;
-    let backing_region = query_region(backing.address)?;
-    let permission = VM_PROT_READ | VM_PROT_WRITE;
-    if backing_region.current != permission || backing_region.maximum & permission != permission {
-        return Err(io::Error::other(format!(
-            "Mach backing protections cannot create requested object: current={} max={} requested={permission}",
-            backing_region.current, backing_region.maximum
-        )));
-    }
-
-    let requested = u64::try_from(len).map_err(|_| invalid_input("entry length exceeds u64"))?;
-    let mut returned: memory_object_size_t = requested;
-    let mut raw = MACH_PORT_NULL;
-    let result = unsafe {
-        mach_make_memory_entry_64(
-            mach_task_self(),
-            &mut returned,
-            backing.address,
-            permission,
-            &mut raw,
-            MACH_PORT_NULL,
-        )
-    };
-    if result != KERN_SUCCESS {
-        if raw != MACH_PORT_NULL {
-            let _ = unsafe { mach_port_deallocate(mach_task_self(), raw) };
-        }
-        return Err(mach_error("mach_make_memory_entry_64 live arena", result));
-    }
-    let entry = MachSendRight::from_kernel(raw, "mach_make_memory_entry_64 live arena")?;
-    if returned != requested {
-        return Err(io::Error::other(format!(
-            "Mach memory entry size redirected: requested={requested} returned={returned}"
-        )));
-    }
-    drop(backing);
-    Ok(entry)
-}
-
-fn create_code_memory_entry(len: usize) -> io::Result<MachSendRight> {
-    let backing = MapJitBootstrap::new(len)?;
-    let requested = u64::try_from(len).map_err(|_| invalid_input("entry length exceeds u64"))?;
-    let mut returned: memory_object_size_t = requested;
-    let mut raw = MACH_PORT_NULL;
-    let result = unsafe {
-        mach_make_memory_entry_64(
-            mach_task_self(),
-            &mut returned,
-            backing.address()?.as_ptr() as u64,
-            VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE,
-            &mut raw,
-            MACH_PORT_NULL,
-        )
-    };
-    if result != KERN_SUCCESS {
-        if raw != MACH_PORT_NULL {
-            let _ = unsafe { mach_port_deallocate(mach_task_self(), raw) };
-        }
-        return Err(mach_error(
-            "mach_make_memory_entry_64 live code arena",
-            result,
-        ));
-    }
-    let entry = MachSendRight::from_kernel(raw, "mach_make_memory_entry_64 live code arena")?;
-    if returned != requested {
-        return Err(io::Error::other(format!(
-            "Mach code memory entry size redirected: requested={requested} returned={returned}"
-        )));
-    }
-    drop(backing);
-    Ok(entry)
-}
-
 pub struct DarwinLiveArena {
-    code_entry: MachSendRight,
-    control_entry: MachSendRight,
+    code_object: OwnedFd,
+    control_object: OwnedFd,
     code_rw: VmMapping,
     code_rx: VmMapping,
     control_rw: VmMapping,
@@ -625,15 +461,17 @@ impl DarwinLiveArena {
             .map_err(|error| invalid_input(error.to_string()))?;
         let code_len = layout.code_len();
         let control_len = layout.control_len();
+        validate_arena_len("code", code_len)?;
+        validate_arena_len("control", control_len)?;
 
-        let code_entry = create_code_memory_entry(code_len)?;
-        let control_entry = create_control_memory_entry(control_len)?;
+        let code_object = create_backing_object("code", code_len)?;
+        let control_object = create_backing_object("control", control_len)?;
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce)
             .map_err(|error| io::Error::other(format!("generate live arena nonce: {error}")))?;
-        let arena = Self::map_entries(
-            code_entry,
-            control_entry,
+        let arena = Self::map_objects(
+            code_object,
+            control_object,
             code_len,
             control_len,
             nonce,
@@ -656,56 +494,41 @@ impl DarwinLiveArena {
         Ok(arena)
     }
 
-    pub fn adopt_registered(expected: LiveArenaTransitV2) -> io::Result<Self> {
-        Self::adopt_optional_registered(Some(expected))?
-            .ok_or_else(|| io::Error::other("registered live arena was not adopted"))
-    }
-
-    /// Adopts the registered arena exactly when capsule metadata names one.
-    /// Typed registered-port slots without matching metadata are rejected.
-    pub fn adopt_optional_registered(
-        expected: Option<LiveArenaTransitV2>,
-    ) -> io::Result<Option<Self>> {
-        let mut registered = RegisteredPortVector::lookup()?;
-        let Some(expected) = expected else {
-            if registered.slots[1].is_some() || registered.slots[2].is_some() {
-                return Err(io::Error::other(
-                    "registered live arena rights have no capsule metadata",
-                ));
-            }
-            return Ok(None);
-        };
-        validate_transit(expected)?;
-        let code_entry = registered
-            .take(1)
-            .ok_or_else(|| io::Error::other("registered live code slot is missing"))?;
-        let control_entry = registered
-            .take(2)
-            .ok_or_else(|| io::Error::other("registered live control slot is missing"))?;
-        let arena = Self::map_adopted_entries(
-            code_entry,
-            control_entry,
-            expected.code_len as usize,
-            expected.control_len as usize,
-            expected.nonce,
+    /// Adopt the arena a host self-exec transported as two inherited
+    /// descriptors.
+    ///
+    /// Authentication is layered and every layer keeps its own named refusal:
+    /// per-fd flags and `fstat` identity (this object, deliberately handed
+    /// over) per descriptor, then the outer object headers, then the
+    /// unchanged V2 directory nonce/schema/ABI/geometry validation. A wrong,
+    /// recycled, or tampered descriptor fails one of them.
+    pub fn adopt_reexec(authority: LiveArenaReexecAuthority) -> io::Result<Self> {
+        validate_transit(authority.transit)?;
+        let code_len = authority.transit.code_len as usize;
+        let control_len = authority.transit.control_len as usize;
+        let code_object =
+            adopt_transport_object("code", authority.code, authority.transit.code_len)?;
+        let control_object =
+            adopt_transport_object("control", authority.control, authority.transit.control_len)?;
+        let arena = Self::map_adopted_objects(
+            code_object,
+            control_object,
+            code_len,
+            control_len,
+            authority.transit.nonce,
         )?;
-        arena.validate_object_headers(expected)?;
-        arena.validate_control_protocol(expected)?;
-
-        let cleared = [
-            registered.slots[0]
-                .as_ref()
-                .map_or(MACH_PORT_NULL, |right| right.name),
-            MACH_PORT_NULL,
-            MACH_PORT_NULL,
-        ];
-        register_port_names(&cleared)?;
-        Ok(Some(arena))
+        arena.validate_object_headers(authority.transit)?;
+        arena.validate_control_protocol(authority.transit)?;
+        // Both-or-neither: the transport descriptors are released only once
+        // the complete arena has authenticated.
+        release_transport_object(authority.code);
+        release_transport_object(authority.control);
+        Ok(arena)
     }
 
-    fn map_entries(
-        code_entry: MachSendRight,
-        control_entry: MachSendRight,
+    fn map_objects(
+        code_object: OwnedFd,
+        control_object: OwnedFd,
         code_len: usize,
         control_len: usize,
         nonce: [u8; 16],
@@ -713,22 +536,34 @@ impl DarwinLiveArena {
     ) -> io::Result<Self> {
         validate_arena_len("code", code_len)?;
         validate_arena_len("control", control_len)?;
-        let code_rw = VmMapping::map_entry(&code_entry, code_len, VM_PROT_READ | VM_PROT_WRITE)?;
-        let code_rx = VmMapping::map_entry(&code_entry, code_len, VM_PROT_READ | VM_PROT_EXECUTE)?;
-        let control_rw =
-            VmMapping::map_entry(&control_entry, control_len, VM_PROT_READ | VM_PROT_WRITE)?;
+        let code_rw = VmMapping::map_shared_file(
+            code_object.as_raw_fd(),
+            code_len,
+            VM_PROT_READ | VM_PROT_WRITE,
+            VM_PROT_READ | VM_PROT_WRITE,
+        )?;
+        let code_rx = VmMapping::map_shared_file(
+            code_object.as_raw_fd(),
+            code_len,
+            VM_PROT_READ | VM_PROT_EXECUTE,
+            VM_PROT_READ | VM_PROT_EXECUTE,
+        )?;
+        let control_rw = VmMapping::map_shared_file(
+            control_object.as_raw_fd(),
+            control_len,
+            VM_PROT_READ | VM_PROT_WRITE,
+            VM_PROT_READ | VM_PROT_WRITE,
+        )?;
 
         if code_rw.address == code_rx.address
             || code_rw.address == control_rw.address
             || code_rx.address == control_rw.address
         {
-            return Err(io::Error::other(
-                "Mach returned overlapping live arena aliases",
-            ));
+            return Err(io::Error::other("overlapping live arena aliases"));
         }
         Ok(Self {
-            code_entry,
-            control_entry,
+            code_object,
+            control_object,
             code_rw,
             code_rx,
             control_rw,
@@ -739,61 +574,76 @@ impl DarwinLiveArena {
         })
     }
 
-    fn map_adopted_entries(
-        code_entry: MachSendRight,
-        control_entry: MachSendRight,
+    fn map_adopted_objects(
+        code_object: OwnedFd,
+        control_object: OwnedFd,
         code_len: usize,
         control_len: usize,
         nonce: [u8; 16],
     ) -> io::Result<Self> {
-        validate_arena_len("code", code_len)?;
-        validate_arena_len("control", control_len)?;
-        let code_rw = VmMapping::map_entry(&code_entry, code_len, VM_PROT_READ | VM_PROT_WRITE)?;
-        let code_rx = VmMapping::map_entry(&code_entry, code_len, VM_PROT_READ | VM_PROT_EXECUTE)?;
-        let control_rw =
-            VmMapping::map_entry(&control_entry, control_len, VM_PROT_READ | VM_PROT_WRITE)?;
         let expected = LiveArenaTransitV2 {
             schema: LIVE_ARENA_TRANSIT_SCHEMA_V2,
             code_len: code_len as u64,
             control_len: control_len as u64,
             nonce,
         };
-        validate_object_header(&code_rw, LIVE_OBJECT_CODE, expected)?;
-        validate_object_header(&control_rw, LIVE_OBJECT_CONTROL, expected)?;
-        let base = NonNull::new(control_rw.base() as *mut u8)
-            .ok_or_else(|| invalid_input("live control mapping is null"))?;
-        // SAFETY: both outer headers were validated before fixed-directory
-        // discovery; mappings remain owned by the returned arena.
-        let view = unsafe {
-            LiveTranslationArenaView::adopt_discovered_in_place(
-                base,
-                control_len,
+        let arena = {
+            validate_arena_len("code", code_len)?;
+            validate_arena_len("control", control_len)?;
+            let code_rw = VmMapping::map_shared_file(
+                code_object.as_raw_fd(),
                 code_len,
-                host_page_size()?,
+                VM_PROT_READ | VM_PROT_WRITE,
+                VM_PROT_READ | VM_PROT_WRITE,
+            )?;
+            let code_rx = VmMapping::map_shared_file(
+                code_object.as_raw_fd(),
+                code_len,
+                VM_PROT_READ | VM_PROT_EXECUTE,
+                VM_PROT_READ | VM_PROT_EXECUTE,
+            )?;
+            let control_rw = VmMapping::map_shared_file(
+                control_object.as_raw_fd(),
+                control_len,
+                VM_PROT_READ | VM_PROT_WRITE,
+                VM_PROT_READ | VM_PROT_WRITE,
+            )?;
+            validate_object_header(&code_rw, LIVE_OBJECT_CODE, expected)?;
+            validate_object_header(&control_rw, LIVE_OBJECT_CONTROL, expected)?;
+            let base = NonNull::new(control_rw.base() as *mut u8)
+                .ok_or_else(|| invalid_input("live control mapping is null"))?;
+            // SAFETY: both outer headers were validated before fixed-directory
+            // discovery; mappings remain owned by the returned arena.
+            let view = unsafe {
+                LiveTranslationArenaView::adopt_discovered_in_place(
+                    base,
+                    control_len,
+                    code_len,
+                    host_page_size()?,
+                    nonce,
+                )
+            }
+            .map_err(|error| invalid_input(error.to_string()))?;
+            let control_layout = view.layout();
+            if code_rw.address == code_rx.address
+                || code_rw.address == control_rw.address
+                || code_rx.address == control_rw.address
+            {
+                return Err(io::Error::other("overlapping live arena aliases"));
+            }
+            Self {
+                code_object,
+                control_object,
+                code_rw,
+                code_rx,
+                control_rw,
+                code_len,
+                control_len,
                 nonce,
-            )
-        }
-        .map_err(|error| invalid_input(error.to_string()))?;
-        let control_layout = view.layout();
-        if code_rw.address == code_rx.address
-            || code_rw.address == control_rw.address
-            || code_rx.address == control_rw.address
-        {
-            return Err(io::Error::other(
-                "Mach returned overlapping live arena aliases",
-            ));
-        }
-        Ok(Self {
-            code_entry,
-            control_entry,
-            code_rw,
-            code_rx,
-            control_rw,
-            code_len,
-            control_len,
-            nonce,
-            control_layout,
-        })
+                control_layout,
+            }
+        };
+        Ok(arena)
     }
 
     fn write_object_headers(&self) -> io::Result<()> {
@@ -870,26 +720,19 @@ impl DarwinLiveArena {
         }
     }
 
-    pub fn duplicate_transit_rights(&self) -> io::Result<LiveArenaTransitRights> {
-        Ok(LiveArenaTransitRights {
-            _code: self.code_entry.duplicate()?,
-            _control: self.control_entry.duplicate()?,
-        })
-    }
-
-    /// This task's send-right user reference counts for the two transport
-    /// objects, as `[code, control]`.
+    /// This process's complete cross-exec authority for the arena.
     ///
-    /// The leak instrument for a failed exec: every
-    /// [`RegisteredPortExecPlan::install`] duplicates both rights and so bumps
-    /// both counts by one, and a returned (failed) replacement attempt must
-    /// return them to the value observed before the attempt. Raw Mach names
-    /// stay private; only the counts cross the module boundary.
-    pub fn transit_send_right_user_refs(&self) -> io::Result<[u32; 2]> {
-        Ok([
-            send_right_user_refs(self.code_entry.name)?,
-            send_right_user_refs(self.control_entry.name)?,
-        ])
+    /// Buildable by ANY holder of the arena — including a guest `fork(2)`
+    /// child, which is the whole point: the descriptors are inherited, so
+    /// there is no per-child capability-minting step that a fresh IPC space
+    /// could invalidate. Both descriptors stay owned here; the capsule only
+    /// carries their numbers, flags, and identity.
+    pub fn reexec_authority(&self) -> io::Result<LiveArenaReexecAuthority> {
+        Ok(LiveArenaReexecAuthority {
+            transit: self.transit_v2(),
+            code: object_authority(&self.code_object, "code")?,
+            control: object_authority(&self.control_object, "control")?,
+        })
     }
 
     #[cfg(test)]
@@ -1957,10 +1800,19 @@ mod tests {
     }
 
     #[test]
-    fn memory_entry_maps_at_unrelated_addresses() {
+    fn fd_objects_map_at_unrelated_addresses() {
         assert!(DarwinLiveArena::new(LiveArenaCapacities::new(0, 0, 0)).is_err());
         let arena = protocol_arena();
-        assert_ne!(arena.code_entry.name, arena.control_entry.name);
+        let code = fd_identity(arena.code_object.as_raw_fd(), "code").expect("code identity");
+        let control =
+            fd_identity(arena.control_object.as_raw_fd(), "control").expect("control identity");
+        assert_ne!(
+            (code.0, code.1),
+            (control.0, control.1),
+            "code and control must be distinct backing objects"
+        );
+        assert_eq!(code.2, arena.control_layout().code_len() as u64);
+        assert_eq!(control.2, arena.control_layout().control_len() as u64);
         assert_ne!(arena.code_rw.base(), arena.code_rx.base());
         assert_ne!(arena.code_rw.base(), arena.control_rw.base());
         assert_ne!(arena.code_rx.base(), arena.control_rw.base());
@@ -2003,33 +1855,244 @@ mod tests {
         );
     }
 
+    /// The dual-alias write/execute/republish cycle on fd backing, in the
+    /// production types: probe receipts P2-file `exec_child`,
+    /// `exec_appended_same_page`, and `exec_overwritten`.
+    ///
+    /// Appending to an ALREADY-EXECUTED page and overwriting live code both
+    /// matter for the arena's steady state — a chunk is filled block by block
+    /// long after its first block has been entered — and neither needs a
+    /// remap, only the publisher's I-cache flush.
     #[test]
-    fn successful_null_mmap_is_owned_before_rejection() {
-        let owned = OwnedMmap::from_successful_result(std::ptr::null_mut(), page());
-        assert!(MapJitBootstrap::from_owned(owned).is_err());
+    #[cfg(target_arch = "aarch64")]
+    fn fd_arena_dual_aliases_execute_published_code() {
+        let arena = protocol_arena();
+        let jit = LiveArenaHostJit;
+        let first = arena.jit_region(0..8).expect("first code subregion");
+        unsafe {
+            std::ptr::copy_nonoverlapping(return_immediate(42).as_ptr(), write_ptr(&first), 8)
+        };
+        jit.flush_icache(unsafe { exec_ptr(&first) }, 8);
+        assert_eq!(unsafe { call_u32(&first) }, 42);
+
+        // Append a second function to the same, already-executed page.
+        let appended = arena.jit_region(128..136).expect("appended code subregion");
+        unsafe {
+            std::ptr::copy_nonoverlapping(return_immediate(43).as_ptr(), write_ptr(&appended), 8)
+        };
+        jit.flush_icache(unsafe { exec_ptr(&appended) }, 8);
+        assert_eq!(unsafe { call_u32(&appended) }, 43);
+        assert_eq!(
+            unsafe { call_u32(&first) },
+            42,
+            "the first block still runs"
+        );
+
+        // Overwrite the first function through the RW alias.
+        unsafe {
+            std::ptr::copy_nonoverlapping(return_immediate(44).as_ptr(), write_ptr(&first), 8)
+        };
+        jit.flush_icache(unsafe { exec_ptr(&first) }, 8);
+        assert_eq!(unsafe { call_u32(&first) }, 44);
     }
 
+    /// Both aliases must read back `current == max == requested`, and neither
+    /// may be escalatable afterwards.
+    ///
+    /// A fresh file mapping's maximum protection is `rwx` on this host, so
+    /// without the `mach_vm_protect(set_maximum)` clamp any holder could
+    /// `mprotect` the RW alias executable or the RX alias writable. The clamp
+    /// is also what makes the equality check above hold verbatim — the check
+    /// that turns a silently-downgraded alias into a named refusal.
     #[test]
-    fn one_byte_pipe_io_retries_eintr_with_a_bound() {
-        let mut attempts = 0;
-        assert!(retry_one_byte_pipe_io(|| {
-            attempts += 1;
-            if attempts < 3 {
-                (-1, libc::EINTR)
-            } else {
-                (1, 0)
-            }
-        }));
-        assert_eq!(attempts, 3);
+    fn fd_arena_alias_protections_are_clamped_and_validated() {
+        let arena = protocol_arena();
+        for (address, expected) in [
+            (arena.code_rw.base(), VM_PROT_READ | VM_PROT_WRITE),
+            (arena.code_rx.base(), VM_PROT_READ | VM_PROT_EXECUTE),
+            (arena.control_rw.base(), VM_PROT_READ | VM_PROT_WRITE),
+        ] {
+            assert_eq!(
+                mapping_protections_for_test(address),
+                Some((expected, expected)),
+                "every alias must read back current == max == requested"
+            );
+        }
+        let page = page();
+        for (address, escalation) in [
+            (
+                arena.code_rw.base(),
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+            ),
+            (arena.code_rx.base(), libc::PROT_READ | libc::PROT_WRITE),
+            (
+                arena.control_rw.base(),
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+            ),
+        ] {
+            let refused =
+                unsafe { libc::mprotect(address as *mut libc::c_void, page, escalation) } != 0;
+            assert!(
+                refused,
+                "the clamped maximum must refuse escalating 0x{address:x} to {escalation:#x}"
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EACCES)
+            );
+        }
+        // A rejected escalation must not have disturbed the live protections.
+        assert_eq!(
+            mapping_protections_for_test(arena.code_rx.base()),
+            Some((
+                VM_PROT_READ | VM_PROT_EXECUTE,
+                VM_PROT_READ | VM_PROT_EXECUTE
+            ))
+        );
+    }
 
-        attempts = 0;
-        assert!(!retry_one_byte_pipe_io(|| {
-            attempts += 1;
-            (-1, libc::EINTR)
-        }));
-        assert_eq!(attempts, PIPE_EINTR_RETRY_LIMIT + 1);
+    /// A transport-shaped authority over fresh DUPLICATES of the arena's
+    /// descriptors, prepared exactly as the capsule prepares them (close-on-exec
+    /// cleared for the exec window).
+    ///
+    /// Adoption consumes the duplicates, so the creator's own descriptors are
+    /// untouched — the same separation a real successor gets by inheriting one
+    /// fd-table entry while the creator keeps its own in another process.
+    fn transport_authority_for_test(arena: &DarwinLiveArena) -> LiveArenaReexecAuthority {
+        let mut authority = arena.reexec_authority().expect("creator authority");
+        for object in [&mut authority.code, &mut authority.control] {
+            let transport = unsafe { libc::fcntl(object.host_fd, libc::F_DUPFD, 0) };
+            assert!(transport >= 0, "duplicate transport descriptor");
+            assert_eq!(
+                unsafe {
+                    libc::fcntl(
+                        transport,
+                        libc::F_SETFD,
+                        object.original_host_fd_flags & !libc::FD_CLOEXEC,
+                    )
+                },
+                0
+            );
+            object.host_fd = transport;
+        }
+        authority
+    }
 
-        assert!(!retry_one_byte_pipe_io(|| (0, 0)));
+    #[allow(clippy::panic)]
+    fn expect_adoption_refusal(result: io::Result<DarwinLiveArena>, expectation: &str) -> String {
+        match result {
+            Ok(_) => panic!("{expectation}"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    fn close_transport_for_test(authority: &LiveArenaReexecAuthority) {
+        for object in [&authority.code, &authority.control] {
+            unsafe { libc::close(object.host_fd) };
+        }
+    }
+
+    /// Adoption is authenticated, not merely inherited. Each drift shape has
+    /// its own named refusal, and a refusal consumes nothing.
+    #[test]
+    fn fd_arena_adoption_rejects_identity_or_flag_drift() {
+        let arena = protocol_arena();
+        let creator = arena.reexec_authority().expect("creator authority");
+        // The steady state of a backing descriptor is close-on-exec: an exec
+        // that is not the deliberate capsule transit leaks nothing.
+        assert_eq!(
+            creator.code.original_host_fd_flags & libc::FD_CLOEXEC,
+            libc::FD_CLOEXEC
+        );
+        assert_eq!(
+            creator.control.original_host_fd_flags & libc::FD_CLOEXEC,
+            libc::FD_CLOEXEC
+        );
+
+        // Wrong descriptor: it names a different object than the snapshot.
+        let stranger = create_backing_object("stranger", creator.code.host_size as usize)
+            .expect("stranger backing object");
+        assert_eq!(
+            unsafe { libc::fcntl(stranger.as_raw_fd(), libc::F_SETFD, 0) },
+            0
+        );
+        let mut wrong_fd = transport_authority_for_test(&arena);
+        let displaced = std::mem::replace(&mut wrong_fd.code.host_fd, stranger.as_raw_fd());
+        let error = expect_adoption_refusal(
+            DarwinLiveArena::adopt_reexec(wrong_fd),
+            "a descriptor naming another object must be refused",
+        );
+        assert!(error.contains("identity changed"), "{error}");
+        wrong_fd.code.host_fd = displaced;
+        close_transport_for_test(&wrong_fd);
+
+        // Changed flags: close-on-exec still set means this descriptor was
+        // never prepared for the capsule transit.
+        let changed_flags = transport_authority_for_test(&arena);
+        assert_eq!(
+            unsafe {
+                libc::fcntl(
+                    changed_flags.control.host_fd,
+                    libc::F_SETFD,
+                    libc::FD_CLOEXEC,
+                )
+            },
+            0
+        );
+        let error = expect_adoption_refusal(
+            DarwinLiveArena::adopt_reexec(changed_flags),
+            "un-prepared descriptor flags must be refused",
+        );
+        assert!(error.contains("fd flags changed"), "{error}");
+        close_transport_for_test(&changed_flags);
+
+        // Wrong size: the claimed object size and the transit length disagree.
+        let mut wrong_size = transport_authority_for_test(&arena);
+        wrong_size.control.host_size -= page() as u64;
+        let error = expect_adoption_refusal(
+            DarwinLiveArena::adopt_reexec(wrong_size),
+            "a size disagreeing with the transit length must be refused",
+        );
+        assert!(error.contains("does not match transit length"), "{error}");
+        close_transport_for_test(&wrong_size);
+
+        // Wrong nonce: genuine descriptors that name another arena.
+        let mut wrong_nonce = transport_authority_for_test(&arena);
+        wrong_nonce.transit.nonce = [0xff; 16];
+        let error = expect_adoption_refusal(
+            DarwinLiveArena::adopt_reexec(wrong_nonce),
+            "a foreign nonce must be refused",
+        );
+        assert!(error.contains("object header"), "{error}");
+        close_transport_for_test(&wrong_nonce);
+
+        // The exact authority still adopts, and every refusal above left the
+        // creator's own arena and descriptors intact.
+        let good = transport_authority_for_test(&arena);
+        let adopted = DarwinLiveArena::adopt_reexec(good).expect("the exact authority adopts");
+        assert_eq!(adopted.transit_v2(), creator.transit);
+        // The adopter re-owns through `F_DUPFD_CLOEXEC`, so its steady state
+        // is close-on-exec again, and it releases the transport numbers: an
+        // exec that is not the next deliberate capsule transit leaks nothing.
+        let adopted_authority = adopted.reexec_authority().expect("adopted authority");
+        for object in [adopted_authority.code, adopted_authority.control] {
+            assert_eq!(
+                object.original_host_fd_flags & libc::FD_CLOEXEC,
+                libc::FD_CLOEXEC
+            );
+        }
+        for object in [good.code, good.control] {
+            assert_ne!(object.host_fd, adopted_authority.code.host_fd);
+            assert_ne!(object.host_fd, adopted_authority.control.host_fd);
+            assert!(
+                unsafe { libc::fcntl(object.host_fd, libc::F_GETFD) } < 0,
+                "the transport descriptor must be released after adoption"
+            );
+        }
+        assert_eq!(
+            arena.reexec_authority().expect("creator authority").transit,
+            creator.transit
+        );
     }
 
     #[test]
@@ -2144,7 +2207,7 @@ mod tests {
     }
 
     #[test]
-    fn drop_deallocates_aliases_and_send_rights() {
+    fn drop_unmaps_aliases_and_closes_backing_objects() {
         let arena = protocol_arena();
         let addresses = [
             arena.code_rw.base(),
@@ -2154,32 +2217,35 @@ mod tests {
         let object_ids = addresses.map(|address| {
             mapping_object_id_for_test(address).expect("live alias has Mach object identity")
         });
-        assert_eq!(object_ids[0], object_ids[1]);
+        assert_eq!(
+            object_ids[0], object_ids[1],
+            "both code aliases must map the same backing object"
+        );
         assert_ne!(object_ids[0], object_ids[2]);
-        let first = arena
-            .duplicate_transit_rights()
-            .expect("first fresh send rights");
-        let second = arena
-            .duplicate_transit_rights()
-            .expect("second fresh send rights");
-        let port_names = [
-            second._code.name_for_test(),
-            second._control.name_for_test(),
+        let backing = [
+            (
+                arena.code_object.as_raw_fd(),
+                fd_identity(arena.code_object.as_raw_fd(), "code").expect("code identity"),
+            ),
+            (
+                arena.control_object.as_raw_fd(),
+                fd_identity(arena.control_object.as_raw_fd(), "control").expect("control identity"),
+            ),
         ];
-        drop(first);
-        assert!(port_names.into_iter().all(send_right_exists_for_test));
-        drop(second);
         drop(arena);
 
         for (address, old_object_id) in addresses.into_iter().zip(object_ids) {
             assert_ne!(
                 mapping_object_id_for_test(address),
                 Some(old_object_id),
-                "the dropped alias's original Mach object must no longer occupy its VA"
+                "the dropped alias's original object must no longer occupy its VA"
             );
         }
-        for name in port_names {
-            assert!(!send_right_exists_for_test(name));
+        for (fd, identity) in backing {
+            assert!(
+                fd_no_longer_refers_to_for_test(fd, identity),
+                "the dropped arena must have closed its backing descriptor"
+            );
         }
     }
 
@@ -2201,48 +2267,25 @@ mod tests {
         assert!(arena.jit_region(capacity - 4..capacity + 4).is_err());
     }
 
-    /// EMPIRICAL BOUNDARY (Task 6C2): which halves of the arena a `fork(2)`
-    /// child inherits — and, decisively, which it does NOT.
+    /// EMPIRICAL BOUNDARY (Task 6T1): the 6C2 blocker test, inverted.
     ///
-    /// The three mappings are `VM_INHERIT_SHARE`, so a fork child reads and
-    /// writes the SAME bytes as its parent (`task_local_rx_revoke_does_not_
-    /// revoke_parent` proves the sharing is live, not a copy).
+    /// 6C2 measured that a guest `fork(2)` child inherits the arena's
+    /// `VM_INHERIT_SHARE` bytes but NOT the Mach rights that carried it, so it
+    /// could not transport the arena through its own host self-exec — and a
+    /// guest `fork`+`execve` is how essentially every real workload creates a
+    /// process, which made the container-lifetime arena reach none of them.
     ///
-    /// Mach port rights are a different name space, and `fork(2)` gives the
-    /// child a fresh IPC space. NEITHER transport carries:
-    ///
-    /// - the arena's own memory-entry send rights are absent, so
-    ///   `duplicate_transit_rights` and therefore `RegisteredPortExecPlan::
-    ///   install` fail with `KERN_INVALID_NAME`;
-    /// - the task-registered slots are not inherited either, so a child cannot
-    ///   recover them with `adopt_registered` even when the parent registered
-    ///   them before forking.
-    ///
-    /// Consequence, and the reason this test exists: a forked guest child
-    /// CANNOT transport this arena through its own host self-exec. The
-    /// different-VA successor proof
-    /// (`fork_exec_successor_maps_arena_at_fresh_addresses`) execs from the
-    /// arena's CREATOR and so never crosses this boundary. Any design that
-    /// wants container-lifetime sharing across a guest `fork`+`execve` needs a
-    /// transport that survives `fork(2)` — an inherited descriptor, as the
-    /// kernel arena, xsig ring, and AOT cache all use — not a Mach send right.
+    /// On fd backing there is no per-child capability to mint: the descriptors
+    /// are inherited, so the child holds the bytes AND can build the exact
+    /// authority its own capsule will carry. This test is the durable record
+    /// that the campaign-critical crossing is open.
     #[test]
-    fn a_fork_child_inherits_arena_mappings_but_neither_mach_transport() {
+    fn a_fork_child_inherits_arena_mappings_and_its_fd_transport() {
         let arena = protocol_arena();
-        let transit = arena.transit_v2();
+        let parent_authority = arena.reexec_authority().expect("parent authority");
         let control = arena.control_rw.base() as *mut u8;
         // A byte only the parent could have written, read back by the child.
         unsafe { control.add(LIVE_OBJECT_HEADER_LEN).write_volatile(0x6c) };
-
-        // Register the rights BEFORE forking: the strongest form of the second
-        // question, since the child would then only have to look them up.
-        let rights = arena
-            .duplicate_transit_rights()
-            .expect("parent duplicates its own rights");
-        let old = RegisteredPortVector::lookup().expect("registered ports");
-        let inherited_slot = old.slots[0].as_ref().map_or(MACH_PORT_NULL, |r| r.name);
-        register_port_names(&[inherited_slot, rights._code.name, rights._control.name])
-            .expect("register the arena rights");
 
         let child = unsafe { libc::fork() };
         assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
@@ -2251,40 +2294,122 @@ mod tests {
             if unsafe { control.add(LIVE_OBJECT_HEADER_LEN).read_volatile() } != 0x6c {
                 status = 1; // mapping not inherited
             }
-            if status == 0 && arena.duplicate_transit_rights().is_ok() {
-                status = 2; // send rights unexpectedly survived fork
+            match arena.reexec_authority() {
+                Ok(child_authority) => {
+                    if status == 0 && child_authority != parent_authority {
+                        status = 2; // the inherited authority is not the same object
+                    }
+                }
+                Err(_) if status == 0 => status = 3, // no transport buildable at all
+                Err(_) => {}
             }
-            if status == 0 && RegisteredPortExecPlan::install(&arena).is_ok() {
-                status = 3; // an exec plan unexpectedly buildable in a fork child
+            // The child writes through its inherited RW alias; the parent must
+            // observe it, proving the sharing is live in both directions.
+            unsafe { control.add(LIVE_OBJECT_HEADER_LEN + 1).write_volatile(0xc6) };
+            unsafe { libc::_exit(status) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "1=mapping not inherited, 2=inherited authority names another object, \
+             3=the child cannot build its exec transport"
+        );
+        assert_eq!(
+            unsafe { control.add(LIVE_OBJECT_HEADER_LEN + 1).read_volatile() },
+            0xc6,
+            "the parent must observe the child's write"
+        );
+        // The child's exit disturbed nothing the parent owns.
+        assert_eq!(
+            arena.reexec_authority().expect("parent authority"),
+            parent_authority
+        );
+    }
+
+    /// Teardown is address-space-local and fd-table-local, by construction.
+    ///
+    /// This is the durable pin for the hazard the fd design DISSOLVED rather
+    /// than fixed: the retired `MachSendRight::drop` unconditionally called
+    /// `mach_port_deallocate` in whatever task ran it, so an inherited
+    /// `Arc<DarwinLiveArena>` unwinding in a fork child would have dropped a
+    /// ref on a parent-space name inside the child's own IPC space. `munmap`
+    /// and `close` have no such cross-process reach, and no Mach name exists
+    /// in this transport to deallocate.
+    #[test]
+    fn fd_arena_teardown_in_fork_child_is_local() {
+        let arena = Arc::new(protocol_arena());
+        let control = arena.control_rw.base() as *mut u8;
+        unsafe { control.add(LIVE_OBJECT_HEADER_LEN).write_volatile(0x7d) };
+        let addresses = [
+            arena.code_rw.base(),
+            arena.code_rx.base(),
+            arena.control_rw.base(),
+        ];
+        let object_ids = addresses.map(|address| {
+            mapping_object_id_for_test(address).expect("live alias has object identity")
+        });
+        let backing = [
+            (
+                arena.code_object.as_raw_fd(),
+                fd_identity(arena.code_object.as_raw_fd(), "code").expect("code identity"),
+            ),
+            (
+                arena.control_object.as_raw_fd(),
+                fd_identity(arena.control_object.as_raw_fd(), "control").expect("control identity"),
+            ),
+        ];
+
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
+        if child == 0 {
+            // The child holds the only `Arc` in its own address space, so
+            // this unwinds the whole arena here.
+            drop(arena);
+            let mut status = 0;
+            for (address, old_object_id) in addresses.into_iter().zip(object_ids) {
+                if mapping_object_id_for_test(address) == Some(old_object_id) {
+                    status = 1; // the child did not unmap its own alias
+                }
             }
-            if status == 0 && DarwinLiveArena::adopt_registered(transit).is_ok() {
-                status = 4; // registered slots unexpectedly survived fork
+            for (fd, identity) in backing {
+                if !fd_no_longer_refers_to_for_test(fd, identity) {
+                    status = 2; // the child did not close its own descriptor
+                }
             }
             unsafe { libc::_exit(status) };
         }
         let mut status = 0;
         assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
-        register_port_names(&[inherited_slot, MACH_PORT_NULL, MACH_PORT_NULL])
-            .expect("restore the registered-port vector");
-        drop(old);
         assert!(libc::WIFEXITED(status));
         assert_eq!(
             libc::WEXITSTATUS(status),
             0,
-            "1=mapping not inherited, 2=send rights survived fork, \
-             3=exec plan buildable in a fork child, 4=registered slots survived fork"
+            "1=child kept its mappings, 2=child kept its descriptors"
         );
-        // None of the child's failures disturbed the creator's own authority.
-        assert!(arena.duplicate_transit_rights().is_ok());
+
+        // Everything the parent owns survived the child's complete teardown.
+        for (address, old_object_id) in addresses.into_iter().zip(object_ids) {
+            assert_eq!(
+                mapping_object_id_for_test(address),
+                Some(old_object_id),
+                "a fork child's unwind must not disturb the parent's mappings"
+            );
+        }
+        for (fd, identity) in backing {
+            assert!(
+                !fd_no_longer_refers_to_for_test(fd, identity),
+                "a fork child's unwind must not disturb the parent's descriptors"
+            );
+        }
         assert_eq!(
-            RegisteredPortVector::lookup()
-                .expect("restored vector")
-                .slots[1..]
-                .iter()
-                .filter(|slot| slot.is_some())
-                .count(),
-            0
+            unsafe { control.add(LIVE_OBJECT_HEADER_LEN).read_volatile() },
+            0x7d,
+            "the backing object outlives every non-final holder"
         );
+        assert!(arena.reexec_authority().is_ok());
     }
 
     fn protocol_arena() -> DarwinLiveArena {
@@ -3137,20 +3262,22 @@ mod tests {
         );
     }
 
+    /// Adopt the SAME backing objects again, through the production
+    /// authenticated path, from fresh duplicates of this arena's descriptors.
+    ///
+    /// This is the in-process stand-in for a successor's inherited fds: the
+    /// 6B2 different-VA proof obligations re-run unchanged on fd backing.
     fn remap_and_adopt_for_test(
         source: &DarwinLiveArena,
         expected: LiveArenaTransitV2,
     ) -> io::Result<DarwinLiveArena> {
-        let adopted = DarwinLiveArena::map_adopted_entries(
-            source.code_entry.duplicate()?,
-            source.control_entry.duplicate()?,
-            expected.code_len as usize,
-            expected.control_len as usize,
-            expected.nonce,
-        )?;
-        adopted.validate_object_headers(expected)?;
-        adopted.validate_control_protocol(expected)?;
-        Ok(adopted)
+        let mut authority = transport_authority_for_test(source);
+        authority.transit = expected;
+        let adopted = DarwinLiveArena::adopt_reexec(authority);
+        if adopted.is_err() {
+            close_transport_for_test(&authority);
+        }
+        adopted
     }
 
     unsafe fn protocol_directory_mut(
@@ -3296,13 +3423,9 @@ mod tests {
         }
     }
 
-    fn send_right_exists_for_test(name: mach_port_t) -> bool {
-        const MACH_PORT_TYPE_SEND: u32 = 1 << 16;
-        unsafe extern "C" {
-            fn mach_port_type(task: mach_port_t, name: mach_port_t, port_type: *mut u32) -> i32;
-        }
-        let mut port_type = 0;
-        (unsafe { mach_port_type(mach_task_self(), name, &mut port_type) == KERN_SUCCESS })
-            && port_type & MACH_PORT_TYPE_SEND != 0
+    /// Whether `fd` no longer names the object with this `(device, inode,
+    /// size)` identity — closed, or reused by something else.
+    fn fd_no_longer_refers_to_for_test(fd: RawFd, identity: (u64, u64, u64)) -> bool {
+        !fd_identity(fd, "probe").is_ok_and(|observed| observed == identity)
     }
 }

@@ -1410,28 +1410,29 @@ enum NativeLiveArenaEntry {
     /// creates the arena itself, before the direct/DSR tier split.
     Launch,
     /// A host self-exec resume. The arena must arrive through the capsule's
-    /// registered-port transport; `transported` is whether one did.
+    /// inherited-descriptor transport; `transported` is whether one did.
     Resume { transported: bool },
 }
 
-/// The exact, honest reason the compiler policy still cannot be enabled.
+/// The exact, honest reason the compiler policy is still refused here.
 ///
-/// The V2 substrate transports the arena as Mach memory-entry send rights,
-/// carried across `POSIX_SPAWN_SETEXEC` as registered-port spawn actions. That
-/// works for an exec issued by the arena's CREATOR — the different-VA successor
-/// proof exercises exactly that. It does NOT work for the native lane's
-/// ordinary case: a guest `fork(2)` gives the child a fresh Mach IPC space, so
-/// the child holds the arena's MAPPINGS but neither its send rights nor the
-/// registered slots, and its own host self-exec cannot carry the arena onward.
-/// Proven, both halves, by `carrick-native-darwin`'s
-/// `a_fork_child_inherits_arena_mappings_but_neither_mach_transport`.
+/// Task 6C2 measured that the arena's ORIGINAL Mach transport does not survive
+/// `fork(2)`: a forked guest child held the arena's mappings but neither its
+/// send rights nor the registered slots, so every forked-then-exec'd guest
+/// process failed its `execve` with EIO. That transport is now retired. Tasks
+/// 6T1/6T2 replaced it with inherited descriptors, and
+/// `carrick-native-darwin`'s
+/// `a_fork_child_inherits_arena_mappings_and_its_fd_transport` plus this
+/// crate's `forked_child_setexec_successor_acquires_creator_ready_record_and_bytes`
+/// prove the crossing end to end.
 ///
-/// Enabling the policy anyway makes every forked-then-exec'd guest process fail
-/// its `execve` with EIO (observed: `/bin/sh -c 'id'` under `ubuntu:24.04`),
-/// which is a correctness regression, not a missing optimization. The arena
-/// needs a transport that survives `fork(2)` — an inherited descriptor, the way
-/// the kernel arena, xsig ring, and AOT cache all do it — before this opens.
-const LIVE_ARENA_COMPILER_BLOCKED: &str = "CARRICK_DSR_LIVE_ARENA=compiler cannot be enabled yet: the live arena's Mach transport does not survive fork(2), so a forked guest child holds the arena's mappings but cannot carry it through its own host self-exec (see carrick-native-darwin live_arena::tests::a_fork_child_inherits_arena_mappings_but_neither_mach_transport); a fork-crossing transport must land first. Use CARRICK_DSR_LIVE_ARENA=0 with CARRICK_DSR_LIVE_ARENA_SIZING_DIR for census-only sizing";
+/// What is NOT yet landed is this entry point: the reopened Task 6C2 slice
+/// replaces the refusal below with the real create/adopt calls and owns the
+/// signed three-arm smoke that must show a policy-on run behaviorally
+/// identical to an arena-absent one. Until that lands the gate stays
+/// fail-closed, because a half-wired entry is exactly the shape that regressed
+/// the guest last time.
+const LIVE_ARENA_COMPILER_BLOCKED: &str = "CARRICK_DSR_LIVE_ARENA=compiler cannot be enabled yet: the retired Mach transport does not survive fork(2) (Task 6C2), and while the fd-backed replacement now crosses that boundary (Tasks 6T1/6T2), wiring it into this runtime entry is the reopened Task 6C2 slice and has not landed. Use CARRICK_DSR_LIVE_ARENA=0 with CARRICK_DSR_LIVE_ARENA_SIZING_DIR for census-only sizing";
 
 fn require_live_arena_runtime_ready(
     policy: carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy,
@@ -1497,7 +1498,7 @@ fn adopt_owned_live_arena(
         )),
         (Policy::Compiler, Some(arena)) => Ok(Some(Arc::new(arena))),
         (Policy::Compiler, None) => Err(RuntimeError::Unsupported(
-            "CARRICK_DSR_LIVE_ARENA=compiler resumed a native host self-exec with no transported live arena; the exec producer must carry its arena through the registered-port plan"
+            "CARRICK_DSR_LIVE_ARENA=compiler resumed a native host self-exec with no transported live arena; the exec producer must carry its arena's two inherited descriptors in the capsule"
                 .to_string(),
         )),
     }
