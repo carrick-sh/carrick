@@ -2464,8 +2464,19 @@ pub trait LiveBlockAuthority: Send + Sync {
     /// Process-local RX entry address of the installed block.
     fn entry(&self) -> HostVa;
 
-    /// Exact published code length in bytes.
-    fn code_len(&self) -> usize;
+    /// The block's exact published extents in this arena's three pools.
+    ///
+    /// Offsets, never process-local addresses. This is the ONE authority for
+    /// how many bytes a live block occupies, so the length the translator
+    /// installs and the bytes it counts cannot disagree.
+    fn extents(&self) -> LiveBlockExtents;
+
+    /// Exact published code length in bytes — the code extent's own length.
+    /// Never overridden: a second source for the same number is exactly how
+    /// an installed length and a counted length drift apart.
+    fn code_len(&self) -> usize {
+        usize::try_from(self.extents().code.len).unwrap_or(0)
+    }
 
     fn guest_start(&self) -> GuestVa;
 

@@ -735,6 +735,13 @@ dsr_ordinal_enum! {
 
 dsr_ordinal_enum! {
     /// Low-cardinality DSR translation-cache event.
+    ///
+    /// `LiveReadyHit` / `LiveWinnerPublish` are the container-lifetime LIVE
+    /// arena's OWN kinds: a block served from the shared arena, and a block
+    /// this process won the race to publish into it. They are deliberately
+    /// distinct from `BlockHit` / `BlockPublish`, which mean the PRIVATE
+    /// per-process bump cache — one kind for both made a live serve
+    /// indistinguishable from a private cache hit in every trace.
     pub enum DsrCacheEventKind {
         BlockHit = 1,
         BlockMiss = 2,
@@ -748,6 +755,8 @@ dsr_ordinal_enum! {
         DirectBindingClear = 10,
         DirectBindingValidationFailure = 11,
         DirectBindingUnitLoaded = 12,
+        LiveReadyHit = 13,
+        LiveWinnerPublish = 14,
     }
 }
 
@@ -1274,6 +1283,8 @@ mod dsr_probe_abi {
         assert_eq!(DsrCacheEventKind::DirectBindingClear.raw(), 10);
         assert_eq!(DsrCacheEventKind::DirectBindingValidationFailure.raw(), 11);
         assert_eq!(DsrCacheEventKind::DirectBindingUnitLoaded.raw(), 12);
+        assert_eq!(DsrCacheEventKind::LiveReadyHit.raw(), 13);
+        assert_eq!(DsrCacheEventKind::LiveWinnerPublish.raw(), 14);
         assert_unique(&DsrCacheEventKind::ALL.map(DsrCacheEventKind::raw));
 
         assert_eq!(DsrCacheRole::Common.raw(), 0);

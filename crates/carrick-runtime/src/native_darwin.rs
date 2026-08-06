@@ -2098,6 +2098,8 @@ fn native_dsr_cache_event_kind(
         Seam::DirectBindingClear => Usdt::DirectBindingClear,
         Seam::DirectBindingValidationFailure => Usdt::DirectBindingValidationFailure,
         Seam::DirectBindingUnitLoaded => Usdt::DirectBindingUnitLoaded,
+        Seam::LiveReadyHit => Usdt::LiveReadyHit,
+        Seam::LiveWinnerPublish => Usdt::LiveWinnerPublish,
     }
 }
 

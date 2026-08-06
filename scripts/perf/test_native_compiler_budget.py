@@ -759,6 +759,31 @@ def nativeperf_frames_v5(pid=10, tid=11, era=12, exec_epoch=0):
     return lines
 
 
+def nativeperf_frames_v6(pid=10, tid=11, era=12, exec_epoch=0):
+    prefix = f"NATIVEPERF1|thread|complete=1|pid={pid}|tid={tid}|era={era}|frame="
+    lines = nativeperf_frames_v5(pid=pid, tid=tid, era=era, exec_epoch=exec_epoch)
+    return lines + [
+        prefix
+        + "live-lane|live_index_hits=4|live_ready_hits=3|live_ready_misses=2|"
+        "live_publish_wins=1|live_publish_adoptions=5|live_blocks_installed=4",
+        prefix
+        + "live-bytes|live_code_bytes=512|live_hot_bytes=64|live_cold_bytes=128|"
+        "live_links_patched=6|live_links_out_of_reach=7",
+        prefix
+        + "live-fallback-a|lfb_unconfigured=11|lfb_regenerated=0|"
+        "lfb_outside_segment=0|lfb_cross_page=0|lfb_unsupported_shape=0|"
+        "lfb_source_words_unavailable=0",
+        prefix
+        + "live-fallback-b|lfb_prepare_refused=0|lfb_unresolved_entry=0|"
+        "lfb_arena_building=2|lfb_arena_failed=0|lfb_arena_cas_lost=0|"
+        "lfb_arena_invalid_record=0",
+        prefix
+        + "live-fallback-c|lfb_arena_capacity=0|lfb_arena_exhausted_probes=0|"
+        "lfb_arena_key_encoding=0|lfb_arena_write_attempted=0|"
+        "lfb_arena_unknown_state=0",
+    ]
+
+
 def nativeperf_frames_v3_with_exclusive(
     pid=10, tid=11, era=12, exec_epoch=0, *, executions=1, unique_sites=1
 ):
@@ -965,6 +990,34 @@ class NativePerfTests(unittest.TestCase):
 
 
 class NativePerfV2Tests(unittest.TestCase):
+    def test_v6_parses_and_round_trips_the_live_lane_frames(self):
+        profile = budget.parse_nativeperf(nativeperf_frames_v6())
+        budget.validate_profile(profile)
+        self.assertEqual(profile.version, 6)
+        self.assertEqual(len(profile.threads[0].frames), 23)
+        self.assertEqual(
+            profile.threads[0].value("live-lane", "live_ready_hits"), 3
+        )
+        self.assertEqual(
+            profile.threads[0].value("live-bytes", "live_code_bytes"), 512
+        )
+        self.assertEqual(
+            profile.threads[0].value("live-fallback-b", "lfb_arena_building"), 2
+        )
+        # The private bump-cache gauge is a SEPARATE frame and must not have
+        # absorbed any live byte.
+        self.assertNotIn(
+            "live_code_bytes",
+            budget.FRAME_FIELDS_V6["cache-gauge"],
+        )
+
+        encoded = budget.run_record_json(
+            budget.RunRecord.synthetic(profile=profile, schedule_label="on-1")
+        )
+        decoded = budget.parse_result_row(encoded)
+        self.assertEqual(decoded.profile, profile)
+        self.assertEqual(decoded.profile.version, 6)
+
     def test_v5_parses_and_round_trips_the_lazy_attach_counter(self):
         profile = budget.parse_nativeperf(nativeperf_frames_v5())
         budget.validate_profile(profile)

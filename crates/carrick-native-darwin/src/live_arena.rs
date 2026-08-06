@@ -1251,11 +1251,6 @@ pub struct LiveArenaExecutable {
 }
 
 impl LiveArenaExecutable {
-    pub fn extents(&self) -> LiveBlockExtents {
-        let _retained_process_view = &self.inner;
-        self.record.extents()
-    }
-
     pub fn code_sha256(&self) -> [u8; 32] {
         self.record.code_sha256()
     }
@@ -1295,8 +1290,12 @@ impl LiveBlockAuthority for LiveArenaExecutable {
         }
     }
 
-    fn code_len(&self) -> usize {
-        usize::try_from(self.record.extents().code.len).unwrap_or(0)
+    fn extents(&self) -> LiveBlockExtents {
+        // The extents describe ranges inside the mappings this executable
+        // retains; reading them through `&self` is what keeps that retention
+        // on the borrow.
+        let _retained_process_view = &self.inner;
+        self.record.extents()
     }
 
     fn guest_start(&self) -> GuestVa {

@@ -941,8 +941,9 @@ mod tests {
         let frames = thread.take_profile_frames().expect("attribution frames");
 
         // `resolver-metadata` keeps the low-frequency mechanism evidence in a
-        // separate PIPE_BUF-bounded frame from the sharing counters.
-        assert_eq!(frames.len(), 18);
+        // separate PIPE_BUF-bounded frame from the sharing counters, and the
+        // live lane keeps its five (lane, bytes, three fallback-class frames).
+        assert_eq!(frames.len(), 23);
         assert!(frames.iter().any(|frame| frame.contains("|frame=process|")));
         assert!(
             frames
@@ -1484,8 +1485,8 @@ mod tests {
             let sibling_frames = frames_for_tid(&captured, SIBLING_TID);
             assert_eq!(
                 sibling_frames.len(),
-                18,
-                "the drain must emit the sibling's complete 18-frame record exactly once; \
+                23,
+                "the drain must emit the sibling's complete 23-frame record exactly once; \
                  captured stderr: {captured:?}"
             );
             for frame in [
@@ -1506,6 +1507,11 @@ mod tests {
                 "resolve-class",
                 "direct-binding-gauge",
                 "cache-gauge",
+                "live-lane",
+                "live-bytes",
+                "live-fallback-a",
+                "live-fallback-b",
+                "live-fallback-c",
                 "process",
             ] {
                 let marker = format!("|frame={frame}|");
@@ -1600,7 +1606,7 @@ mod tests {
             let frames = frames_for_tid(&captured, SELF_FLUSHED_TID);
             assert_eq!(
                 frames.len(),
-                18,
+                23,
                 "a self-flushed thread's record must appear exactly once (its own \
                  self-flush), never a second time from the leader's drain; captured: {captured:?}"
             );
