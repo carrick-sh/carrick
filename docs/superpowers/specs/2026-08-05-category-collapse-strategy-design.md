@@ -182,13 +182,19 @@ Known entries with evidence already in hand:
   9.74 µs vs 6.42 µs per fault and 15x involuntary context switches under
   in-process parallelism
   ([`2026-08-01 audit §4`](../../perf-results/2026-08-01-native-wall-audit-and-fault-cost.md));
-- **the fs-walk contradiction**: the current spread measures fs-walk at
-  **18.9286x** while the 2026-08-02 trusted-dirfd result claimed ~3.8x
-  ([`container-lifecycle-split.jsonl`](../../perf-results/container-lifecycle-split.jsonl)).
-  `CARRICK_FS_TRUSTED_LANE` defaults ON in the code
-  (`crates/carrick-runtime/src/dispatch/fs.rs:866`), so either the lane is not
-  firing on the default path or the fixtures diverged. An unexplained 5x
-  discrepancy on a shape go build exercises heavily; cheap to attribute.
+- **the fs-walk in-guest amplification**: the current spread measures the
+  in-guest fs-walk window at **18.9286x** (265 ms / 14 ms). The 2026-08-02
+  trusted-dirfd result of ~3.8x was **total wall** (container lifecycle
+  included; lifecycle reached 2.7x), while the in-guest window was 18.5x
+  then and is 18.9x now
+  ([`container-lifecycle-split.jsonl`](../../perf-results/container-lifecycle-split.jsonl),
+  records `fs-walk-lifecycle-vs-in-guest`, `total-wall-drained-baseline`) —
+  a denominator difference, not a regression. The in-guest fs term was never
+  fixed; the named redesign is fs endgame Lever B (serve reads from the
+  shared cache tree as a read-only lower layer, copy-up on write — roadmap
+  Phase 4). First ledger entry: re-measure host-ops-per-guest-op on the
+  `find /usr/local/go -type f` fixture at HEAD (AGENTS.md's 19.68
+  hosts-opens-per-guest-open figure is flagged stale by AGENTS.md itself).
 
 ## 4. Arithmetic to 3x (all *derived/estimated*)
 
@@ -204,7 +210,7 @@ there.
 
 1. **Wave 0 (now, non-regrettable, no interference with arena tasks):**
    Docker-side CPU-split measurement + the category-budget table; the fs-walk
-   attribution. Both are pure measurement.
+   in-guest amplification-ledger entry (Task 4 of the Wave-0 plan). Both are pure measurement.
 2. **Wave 1 (in flight):** live arena Tasks 6C2 → 6D/6E/6F → 7, runtime-on
    evidence, ABBA, scoreboard refresh — exactly as the handoff sequences it.
 3. **Wave 2 (gated on Wave 1 runtime-on ABBA):** the AOT codegen campaign,
