@@ -2021,17 +2021,22 @@ impl HostAliasDispatchGuard {
         // in `begin_dispatch` holding theirs — the hold-and-wait cycle behind
         // the 2026-08-06 policy-ON go-build wedge. Classify the syscall in
         // `native_syscall_mutates_mappings` instead so the install is consumed
-        // in-dispatch under the exclusive guard.
+        // in-dispatch under the exclusive guard. ABORT, do not panic: the
+        // native lane's guest threads run with no panic backstop, so an
+        // unwind here would tear through guest state (same fail-closed
+        // contract as `install_native_host_alias`'s abort arms).
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        assert!(
-            !matches!(
-                crate::native_darwin::native_dispatch_guard_class(),
-                Some(crate::native_darwin::NativeDispatchGuardClass::Shared)
-            ),
-            "host-alias publish under a SHARED native dispatch guard: the deferred \
-             install would re-open the alias-phase/memory-lock deadlock cycle; \
-             classify the syscall in native_syscall_mutates_mappings"
-        );
+        if matches!(
+            crate::native_darwin::native_dispatch_guard_class(),
+            Some(crate::native_darwin::NativeDispatchGuardClass::Shared)
+        ) {
+            eprintln!(
+                "host-alias publish under a SHARED native dispatch guard: the deferred \
+                 install would re-open the alias-phase/memory-lock deadlock cycle; \
+                 classify the syscall in native_syscall_mutates_mappings"
+            );
+            std::process::abort();
+        }
         let raw = self
             .transactions
             .next_id
@@ -8075,23 +8080,37 @@ mod overlay_dispatch_tests {
     /// guard while it still owns the phase, and any sibling mapping syscall
     /// that won the guard in between parks in `begin_dispatch` holding the
     /// very lock the install needs — the 2026-08-06 policy-ON go-build
-    /// deadlock cycle. `publish` must refuse the shape outright.
+    /// deadlock cycle. `publish` must refuse the shape by ABORTING, not by
+    /// panicking: the native lane's guest threads have no panic backstop, so
+    /// an unwind would tear through guest state (same contract as the abort
+    /// arms of `install_native_host_alias` and the id-overflow path above).
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    fn host_alias_publish_under_shared_native_guard_fails_closed() {
-        let dispatcher = SyscallDispatcher::new();
-        let guard = dispatcher.begin_host_alias_dispatch();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    fn host_alias_publish_under_shared_native_guard_aborts() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let no_core = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };
+            let dispatcher = SyscallDispatcher::new();
+            let guard = dispatcher.begin_host_alias_dispatch();
             let _class = crate::native_darwin::NativeDispatchGuardClassScope::enter(
                 crate::native_darwin::NativeDispatchGuardClass::Shared,
             );
-            guard.publish(host_alias_test_commit())
-        }));
+            let _ = guard.publish(host_alias_test_commit());
+            unsafe { libc::_exit(0) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
         assert!(
-            result.is_err(),
-            "publish under a SHARED native dispatch guard must fail closed: \
-             its deferred install re-opens the alias/memory deadlock cycle"
+            libc::WIFSIGNALED(status),
+            "publish under a SHARED native dispatch guard must ABORT (fail \
+             closed without unwinding); child status was 0x{status:x}"
         );
+        assert_eq!(libc::WTERMSIG(status), libc::SIGABRT);
     }
 
     /// The exclusive-guard publisher is the sound shape: its install is

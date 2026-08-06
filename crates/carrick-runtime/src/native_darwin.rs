@@ -6117,6 +6117,14 @@ fn native_syscall_mutates_mappings(nr: u64) -> bool {
 /// `dispatch_native_syscall_inner` consumes their install under the same
 /// held guard; `None` (VMM lane, runtime-side actors, tests) publishers
 /// hold no native memory guard at all.
+///
+/// The marker deliberately stays `Shared` even after
+/// [`NativeDispatchMemory::ensure_write`] escalates a read-arm dispatch to a
+/// real write guard: an escalated-shared publisher would be rejected despite
+/// momentarily holding the exclusive guard. That direction fails SAFE — the
+/// consume-in-dispatch seam only exists on the pre-classified exclusive arm,
+/// so an escalated publisher's install would still be deferred past its
+/// guard, which is exactly the deadlock shape being refused.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum NativeDispatchGuardClass {
     Shared,
