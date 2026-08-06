@@ -53,6 +53,22 @@ dtrace:::BEGIN
 	root_pid = (pid_t)0;
 	target_exit_reason = 0;
 	timed_out = 0;
+
+	/*
+	 * Capture bound, in seconds of wall time after dtrace:::BEGIN.
+	 *
+	 * The shipped default keeps the historical 180 s ceiling, so the
+	 * unrendered template is still a legal, self-contained D program. The
+	 * comment below is the single substitution slot `--profile-bound-seconds`
+	 * fills with a second assignment that overrides this one; the completion
+	 * record then reports whichever value was actually in force. A bound
+	 * expressed as a variable rather than as a `tick-180s` probe name is what
+	 * lets a ~380 s policy-ON workload be captured WITHOUT editing (and so
+	 * re-hashing) the program the authority names.
+	 */
+	bound_limit_s = (uint64_t)180;
+	bound_elapsed_s = (uint64_t)0;
+	/* CARRICK_DSRPROF2_BOUND */
 	identity_violations = 0;
 	lifecycle_violations = 0;
 	range_violations = 0;
@@ -585,7 +601,19 @@ proc:::exit
 	exit(0);
 }
 
-tick-180s
+/*
+ * Bound accumulation and the bound itself are two clauses on one probe so the
+ * granularity (10 s) is independent of the ceiling. DTrace runs same-probe
+ * clauses in program order, so the guard below always reads the tick it is
+ * paired with.
+ */
+tick-10s
+{
+	bound_elapsed_s += (uint64_t)10;
+}
+
+tick-10s
+/bound_elapsed_s >= bound_limit_s/
 {
 	timed_out = 1;
 	exit(0);
@@ -606,11 +634,11 @@ dtrace:::END
 	printa("DSRSTACK2|begin|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|kind=offcpu-%s|total_ns=%@d\n%kDSRSTACK2|end\n",
 	    @off_stack_ns);
 	printa("DSRPROF2|wall-state|kind=%s|count=%@d\n", @wall_state);
-	printf("DSRPROF2|complete|profile=native-wall|bounded=%d|timed_out=%d|identity_violations=%d|lifecycle_violations=%d|range_violations=%d|kernel_violations=%d|offcpu_violations=%d|probe_errors=%d|target_exit_reason=%d|live_at_end=%d|elapsed_ns=%d\n",
+	printf("DSRPROF2|complete|profile=native-wall|bounded=%d|timed_out=%d|identity_violations=%d|lifecycle_violations=%d|range_violations=%d|kernel_violations=%d|offcpu_violations=%d|probe_errors=%d|target_exit_reason=%d|live_at_end=%d|elapsed_ns=%d|bound_limit_s=%d\n",
 	    timed_out || identity_violations != 0 || lifecycle_violations != 0 ||
 	    range_violations != 0 || kernel_violations != 0 ||
 	    offcpu_violations != 0 || probe_errors != 0, timed_out, identity_violations,
 	    lifecycle_violations, range_violations, kernel_violations,
 	    offcpu_violations, probe_errors, target_exit_reason, live_pids,
-	    (stopped != 0 ? stopped : timestamp) - started);
+	    (stopped != 0 ? stopped : timestamp) - started, bound_limit_s);
 }

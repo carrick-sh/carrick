@@ -1411,6 +1411,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             script,
             profile,
             summary_jsonl,
+            profile_bound_seconds,
             native_shape_snapshots,
             trace_out,
             command,
@@ -1509,6 +1510,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         script: script.as_deref(),
                         profile,
                         summary_jsonl: summary_jsonl.as_deref(),
+                        profile_bound_seconds,
                         trace_out: trace_out.as_deref(),
                         native_shape_snapshots: native_shape_snapshots.as_deref(),
                         uid: unsafe { libc::getuid() },
@@ -1648,6 +1650,22 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     };
                 #[cfg(target_os = "freebsd")]
                 let script_src = script_template;
+                // Applied AFTER the launch-qualification rendering on purpose:
+                // the authority names the immutable bundled TEMPLATE's digest,
+                // so the bound must not be inside the hashed text. The program
+                // reports whichever bound it ran with in its own completion
+                // record, which is what keeps the stream self-describing.
+                let script_src = match profile_bound_seconds {
+                    Some(seconds) => {
+                        let template = script_src.as_deref().ok_or_else(|| {
+                            anyhow::anyhow!("--profile-bound-seconds has no D program to bound")
+                        })?;
+                        Some(crate::trace_profile::render_profile_capture_bound(
+                            template, seconds,
+                        )?)
+                    }
+                    None => script_src,
+                };
                 #[cfg(target_os = "macos")]
                 if let Some(qualification) = native_profile_qualification.as_ref() {
                     eprintln!(

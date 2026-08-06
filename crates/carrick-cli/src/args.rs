@@ -804,6 +804,15 @@ pub(crate) enum Commands {
         /// Atomically publish the parsed profile as versioned JSONL.
         #[arg(long, value_name = "FILE", requires = "profile")]
         summary_jsonl: Option<std::path::PathBuf>,
+        /// Override the profile's capture bound, in seconds (multiple of 10).
+        /// The `native-wall` profile otherwise stops at its shipped 180 s
+        /// ceiling, which cannot hold a workload that runs for minutes.
+        #[arg(
+            long = "profile-bound-seconds",
+            value_name = "SECONDS",
+            requires = "profile"
+        )]
+        profile_bound_seconds: Option<u64>,
         /// Fresh directory for native-shape retirement snapshots.
         #[arg(
             long = "native-shape-snapshots",

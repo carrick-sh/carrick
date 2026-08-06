@@ -18,7 +18,7 @@ const JSON_SCHEMA: &str = "carrick.dsr-profile.v1";
 const V2_PROTOCOL_PREFIX: &str = "DSRPROF2";
 const V2_STACK_PREFIX: &str = "DSRSTACK2";
 const V2_ERROR_PREFIX: &str = "DSRERROR2";
-const V2_RAW_SCHEMA: &str = "carrick.dsrprof.raw.v5";
+const V2_RAW_SCHEMA: &str = "carrick.dsrprof.raw.v6";
 const NO_KERNEL_FUNCTION: &str = "none";
 const TARGET_KERNEL_SYSCALL_STACK: &str = "psynch_cvwait";
 const NATIVE_FAULT_RAW_SCHEMA: &str = "carrick.native-fault.raw.v3";
@@ -226,6 +226,56 @@ pub(crate) fn render_dsr_live_arena_program(template: &str) -> Result<RenderedDs
         program: template.replacen(DSR_LIVE_ARENA_HEADER_PLACEHOLDER, &action, 1),
         program_sha256,
     })
+}
+
+/// The single capture-bound slot the native-wall D template reserves.
+///
+/// A D comment for the same reason the live-arena header placeholder is one:
+/// the unrendered template stays a legal program (running it applies the
+/// shipped default bound), and requiring exactly one occurrence means a second
+/// substitution cannot quietly install a different ceiling.
+pub(crate) const DSRPROF2_BOUND_PLACEHOLDER: &str = "/* CARRICK_DSRPROF2_BOUND */";
+
+/// The largest bound a capture may request, in seconds (six hours).
+///
+/// Not a policy preference: `bound_limit_s` is a `uint64_t` of seconds
+/// accumulated in 10 s steps, and an unbounded ceiling turns a wedged guest
+/// into an unattended trace that fills a disk. Six hours is far past any
+/// workload this profile is aimed at.
+pub(crate) const NATIVE_WALL_MAX_BOUND_SECONDS: u64 = 6 * 60 * 60;
+
+/// Override a profile template's capture bound.
+///
+/// The historical bound was the literal probe name `tick-180s`, which made a
+/// longer capture impossible without editing the program — and editing it
+/// changes the digest the launch authority names, so the edited program could
+/// not authenticate its own stream. Substituting a bound VARIABLE keeps the
+/// template (and therefore the authority) fixed while letting one capture
+/// declare a longer window; the D program reports the value it ran with in its
+/// completion record, so the stream stays self-describing.
+///
+/// `seconds` must be a positive multiple of the 10 s accumulation granularity;
+/// anything else would silently round and make the reported bound a lie.
+pub(crate) fn render_profile_capture_bound(template: &str, seconds: u64) -> Result<String> {
+    if seconds == 0 {
+        bail!("profile capture bound must be positive");
+    }
+    if !seconds.is_multiple_of(10) {
+        bail!(
+            "profile capture bound must be a multiple of the 10 s accumulation granularity, got {seconds}"
+        );
+    }
+    if seconds > NATIVE_WALL_MAX_BOUND_SECONDS {
+        bail!(
+            "profile capture bound {seconds}s exceeds the {NATIVE_WALL_MAX_BOUND_SECONDS}s ceiling"
+        );
+    }
+    let slots = template.match_indices(DSRPROF2_BOUND_PLACEHOLDER).count();
+    if slots != 1 {
+        bail!("profile template must contain exactly one capture-bound placeholder, found {slots}");
+    }
+    let action = format!("bound_limit_s = (uint64_t){seconds};");
+    Ok(template.replacen(DSRPROF2_BOUND_PLACEHOLDER, &action, 1))
 }
 
 /// The authenticated header one live-arena capture carries.
@@ -1969,6 +2019,7 @@ impl V2Validator {
 
     fn completion(&mut self, record: &V2Record) -> Result<()> {
         record.exact_fields(&[
+            "bound_limit_s",
             "bounded",
             "elapsed_ns",
             "identity_violations",
@@ -1997,6 +2048,13 @@ impl V2Validator {
         let timed_out = record.decimal_u64("timed_out")?;
         if timed_out > 1 {
             bail!("DSRPROF2 completion timed_out field must be 0 or 1");
+        }
+        // The bound the capture actually ran with. Reported so a timeout names
+        // the ceiling it hit instead of leaving the reader to guess which
+        // window was in force.
+        let bound_limit_s = record.decimal_u64("bound_limit_s")?;
+        if bound_limit_s == 0 {
+            bail!("DSRPROF2 completion bound_limit_s must be positive");
         }
         let probe_errors = record.decimal_u64("probe_errors")?;
         if probe_errors != self.dtrace_errors {
@@ -2032,7 +2090,10 @@ impl V2Validator {
             );
         }
         if timed_out != 0 {
-            bail!("gating DSRPROF2 capture timed out");
+            bail!(
+                "gating DSRPROF2 capture timed out at its {bound_limit_s}s bound \
+                 (raise it with --profile-bound-seconds)"
+            );
         }
         if let Some((name, count)) = violations.into_iter().find(|(_, count)| *count != 0) {
             bail!("gating DSRPROF2 capture reports {name}={count}");
@@ -4429,13 +4490,117 @@ mod tests {
     #[test]
     fn dsrprof2_rejects_replaced_raw_schema_v4() {
         let raw = include_str!("../tests/fixtures/dsrprof2-valid.raw").replacen(
-            "raw_schema=carrick.dsrprof.raw.v5",
+            "raw_schema=carrick.dsrprof.raw.v6",
             concat!("raw_schema=carrick.dsrprof.raw.", "v4"),
             1,
         );
         let error = ProfileSummary::from_lines(raw.lines(), ProfileCaptureStatus::default())
             .expect_err("raw v4 must not survive the schema replacement");
         assert!(format!("{error:#}").contains("unknown DSRPROF2 raw schema"));
+    }
+
+    /// A stream from the pre-bound program is not readable as a bounded one:
+    /// the bound has to come from the capture, never from a reader's default.
+    #[test]
+    fn dsrprof2_completion_without_a_declared_bound_is_refused() {
+        let raw = include_str!("../tests/fixtures/dsrprof2-valid.raw").replacen(
+            "|bound_limit_s=180",
+            "",
+            1,
+        );
+        let error = ProfileSummary::from_lines(raw.lines(), ProfileCaptureStatus::default())
+            .expect_err("a completion with no declared bound must fail closed");
+        assert!(
+            format!("{error:#}").contains("bound_limit_s"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn dsrprof2_completion_rejects_a_zero_bound() {
+        let raw = include_str!("../tests/fixtures/dsrprof2-valid.raw").replacen(
+            "|bound_limit_s=180",
+            "|bound_limit_s=0",
+            1,
+        );
+        let error = ProfileSummary::from_lines(raw.lines(), ProfileCaptureStatus::default())
+            .expect_err("a zero bound must fail closed");
+        assert!(
+            format!("{error:#}").contains("bound_limit_s must be positive"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    /// The timeout diagnostic is the whole reason the bound is in the stream:
+    /// Task 9 lost a policy-ON capture to `capture timed out` with no way to
+    /// tell from the stream which ceiling had been hit.
+    #[test]
+    fn dsrprof2_timeout_names_the_bound_that_was_in_force() {
+        let raw = include_str!("../tests/fixtures/dsrprof2-valid.raw")
+            .replacen("|bounded=0|timed_out=0", "|bounded=1|timed_out=1", 1)
+            .replacen("|bound_limit_s=180", "|bound_limit_s=900", 1);
+        let error = ProfileSummary::from_lines(raw.lines(), ProfileCaptureStatus::default())
+            .expect_err("a timed-out capture must gate");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("timed out at its 900s bound"),
+            "unexpected error: {rendered}"
+        );
+    }
+
+    #[test]
+    fn capture_bound_substitutes_exactly_one_slot() {
+        let template =
+            "BEGIN\n{\n\tbound_limit_s = (uint64_t)180;\n\t/* CARRICK_DSRPROF2_BOUND */\n}\n";
+        let rendered = render_profile_capture_bound(template, 900).expect("render");
+        assert!(rendered.contains("bound_limit_s = (uint64_t)900;"));
+        assert!(!rendered.contains(DSRPROF2_BOUND_PLACEHOLDER));
+        // The shipped default stays as the first assignment; the substituted
+        // one overrides it, so both are present and order decides.
+        assert!(rendered.contains("bound_limit_s = (uint64_t)180;"));
+    }
+
+    #[test]
+    fn capture_bound_refuses_a_template_without_exactly_one_slot() {
+        for template in [
+            "BEGIN\n{\n}\n",
+            "BEGIN\n{\n\t/* CARRICK_DSRPROF2_BOUND */\n\t/* CARRICK_DSRPROF2_BOUND */\n}\n",
+        ] {
+            let error = render_profile_capture_bound(template, 900)
+                .expect_err("only an exact single slot may be substituted");
+            assert!(
+                format!("{error:#}").contains("exactly one capture-bound placeholder"),
+                "unexpected error: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_bound_refuses_values_the_program_cannot_honour() {
+        let template = "/* CARRICK_DSRPROF2_BOUND */";
+        assert!(
+            format!(
+                "{:#}",
+                render_profile_capture_bound(template, 0).expect_err("zero")
+            )
+            .contains("must be positive")
+        );
+        // 185 s would silently become 190 s at the 10 s accumulation step.
+        assert!(
+            format!(
+                "{:#}",
+                render_profile_capture_bound(template, 185).expect_err("non-multiple")
+            )
+            .contains("multiple of the 10 s accumulation granularity")
+        );
+        assert!(
+            format!(
+                "{:#}",
+                render_profile_capture_bound(template, NATIVE_WALL_MAX_BOUND_SECONDS + 10)
+                    .expect_err("over ceiling")
+            )
+            .contains("exceeds the")
+        );
     }
 
     #[test]
@@ -4737,7 +4902,7 @@ mod tests {
             ],
         )
         .expect("valid launch authority");
-        let header = "DSRPROF2|header|profile=native-wall|raw_schema=carrick.dsrprof.raw.v5|os_build=26A123|program_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|birth_qualification_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|terminal_qualification_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc|wall_hz=197|cpu_hz=499";
+        let header = "DSRPROF2|header|profile=native-wall|raw_schema=carrick.dsrprof.raw.v6|os_build=26A123|program_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|birth_qualification_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|terminal_qualification_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc|wall_hz=197|cpu_hz=499";
 
         let mut validator = V2Validator::with_authority(authority.clone());
         validator

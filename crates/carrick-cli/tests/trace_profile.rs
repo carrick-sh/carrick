@@ -659,7 +659,7 @@ fn native_wall_profile_emits_categorized_completion_contract() {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/dtrace/native-wall.d");
     let script = std::fs::read_to_string(path).unwrap();
-    let completion = "DSRPROF2|complete|profile=native-wall|bounded=%d|timed_out=%d|identity_violations=%d|lifecycle_violations=%d|range_violations=%d|kernel_violations=%d|offcpu_violations=%d|probe_errors=%d|target_exit_reason=%d|live_at_end=%d|elapsed_ns=%d";
+    let completion = "DSRPROF2|complete|profile=native-wall|bounded=%d|timed_out=%d|identity_violations=%d|lifecycle_violations=%d|range_violations=%d|kernel_violations=%d|offcpu_violations=%d|probe_errors=%d|target_exit_reason=%d|live_at_end=%d|elapsed_ns=%d|bound_limit_s=%d";
 
     assert_eq!(script.matches(completion).count(), 1);
     assert!(
@@ -759,6 +759,45 @@ fn native_wall_profile_emits_categorized_completion_contract() {
     assert!(
         script.contains("|unit_id=%u|start=%#x|end=%#x"),
         "64-bit translated unit identities must use unsigned DTrace serialization"
+    );
+}
+
+#[test]
+fn native_wall_capture_bound_is_a_substitutable_declared_parameter() {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/dtrace/native-wall.d");
+    let script = std::fs::read_to_string(path).unwrap();
+
+    // The bound must be a named variable with exactly one substitution slot,
+    // not a `tick-180s` probe-name literal: a 380 s policy-ON workload has to
+    // be capturable without editing (and so re-hashing) the D program.
+    assert_eq!(
+        script.matches("/* CARRICK_DSRPROF2_BOUND */").count(),
+        1,
+        "the capture bound needs exactly one substitution slot"
+    );
+    assert!(
+        script
+            .lines()
+            .all(|line| !line.starts_with("tick-") || !line.ends_with('s') || line == "tick-10s"),
+        "the bound must not be frozen into a probe name; only the 10 s \
+         accumulation tick may name a seconds interval"
+    );
+    assert!(
+        script.contains("bound_limit_s = (uint64_t)180;"),
+        "the unrendered template must stay a legal D program with the shipped default"
+    );
+    assert!(
+        script.split("\n\n").any(
+            |clause| clause.contains("/bound_elapsed_s >= bound_limit_s/")
+                && clause.contains("timed_out = 1;")
+                && clause.contains("exit(0);")
+        ),
+        "the timeout exit must be guarded by the accumulated elapsed bound"
+    );
+    assert!(
+        script.contains("|bound_limit_s=%d"),
+        "the stream must self-describe the bound that was in force"
     );
 }
 

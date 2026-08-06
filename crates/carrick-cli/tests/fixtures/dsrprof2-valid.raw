@@ -1,4 +1,4 @@
-DSRPROF2|header|profile=native-wall|raw_schema=carrick.dsrprof.raw.v5|os_build=26A123|program_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|birth_qualification_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|terminal_qualification_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc|wall_hz=197|cpu_hz=499
+DSRPROF2|header|profile=native-wall|raw_schema=carrick.dsrprof.raw.v6|os_build=26A123|program_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|birth_qualification_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|terminal_qualification_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc|wall_hz=197|cpu_hz=499
 DSRPROF2|target-birth|pid=100|start_sec=10|start_usec=20|image=1|epoch=0
 DSRPROF2|range-reset|pid=100|start_sec=10|start_usec=20|image=1|epoch=0
 DSRPROF2|range-private|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|sequence=1|start=0x1000|end=0x2000
@@ -63,4 +63,4 @@ DSRSTACK2|begin|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|kind=offcpu-r
 DSRSTACK2|end
 DSRPROF2|wall-state|kind=on-cpu|count=10
 DSRPROF2|wall-state|kind=all-sleeping|count=1
-DSRPROF2|complete|profile=native-wall|bounded=0|timed_out=0|identity_violations=0|lifecycle_violations=0|range_violations=0|kernel_violations=0|offcpu_violations=0|probe_errors=0|target_exit_reason=1|live_at_end=0|elapsed_ns=60000000
+DSRPROF2|complete|profile=native-wall|bounded=0|timed_out=0|identity_violations=0|lifecycle_violations=0|range_violations=0|kernel_violations=0|offcpu_violations=0|probe_errors=0|target_exit_reason=1|live_at_end=0|elapsed_ns=60000000|bound_limit_s=180
