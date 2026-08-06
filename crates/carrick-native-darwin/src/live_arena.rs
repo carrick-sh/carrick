@@ -24,7 +24,9 @@ use carrick_guest_mem::{GuestVa, HostVa};
 use mach2::kern_return::{KERN_SUCCESS, kern_return_t};
 use mach2::mach_port::{mach_port_deallocate, mach_port_mod_refs};
 use mach2::memory_object_types::memory_object_size_t;
-use mach2::port::{MACH_PORT_NULL, MACH_PORT_RIGHT_SEND, mach_port_t};
+use mach2::port::{
+    MACH_PORT_NULL, MACH_PORT_RIGHT_SEND, mach_port_right_t, mach_port_t, mach_port_urefs_t,
+};
 use mach2::task::{mach_ports_lookup, mach_ports_register};
 use mach2::traps::mach_task_self;
 use mach2::vm::{
@@ -266,6 +268,24 @@ unsafe extern "C" {
         ports: *mut mach_port_t,
         count: u32,
     ) -> libc::c_int;
+
+    /// Mach `mach_port_get_refs`. The `mach2` bindings this crate uses do not
+    /// export it, so it is declared here with the module's other Mach calls
+    /// (the AGENTS.md "use `libc`" rule's Mach/hypervisor-binding exception).
+    fn mach_port_get_refs(
+        task: mach_port_t,
+        name: mach_port_t,
+        right: mach_port_right_t,
+        refs: *mut mach_port_urefs_t,
+    ) -> kern_return_t;
+}
+
+fn send_right_user_refs(name: mach_port_t) -> io::Result<u32> {
+    let mut refs: mach_port_urefs_t = 0;
+    check_kr("mach_port_get_refs live arena send right", unsafe {
+        mach_port_get_refs(mach_task_self(), name, MACH_PORT_RIGHT_SEND, &mut refs)
+    })?;
+    Ok(refs)
 }
 
 struct MachSendRight {
@@ -855,6 +875,21 @@ impl DarwinLiveArena {
             _code: self.code_entry.duplicate()?,
             _control: self.control_entry.duplicate()?,
         })
+    }
+
+    /// This task's send-right user reference counts for the two transport
+    /// objects, as `[code, control]`.
+    ///
+    /// The leak instrument for a failed exec: every
+    /// [`RegisteredPortExecPlan::install`] duplicates both rights and so bumps
+    /// both counts by one, and a returned (failed) replacement attempt must
+    /// return them to the value observed before the attempt. Raw Mach names
+    /// stay private; only the counts cross the module boundary.
+    pub fn transit_send_right_user_refs(&self) -> io::Result<[u32; 2]> {
+        Ok([
+            send_right_user_refs(self.code_entry.name)?,
+            send_right_user_refs(self.control_entry.name)?,
+        ])
     }
 
     #[cfg(test)]
@@ -2164,6 +2199,92 @@ mod tests {
         );
         let capacity = arena.control_layout().capacities().code as usize;
         assert!(arena.jit_region(capacity - 4..capacity + 4).is_err());
+    }
+
+    /// EMPIRICAL BOUNDARY (Task 6C2): which halves of the arena a `fork(2)`
+    /// child inherits — and, decisively, which it does NOT.
+    ///
+    /// The three mappings are `VM_INHERIT_SHARE`, so a fork child reads and
+    /// writes the SAME bytes as its parent (`task_local_rx_revoke_does_not_
+    /// revoke_parent` proves the sharing is live, not a copy).
+    ///
+    /// Mach port rights are a different name space, and `fork(2)` gives the
+    /// child a fresh IPC space. NEITHER transport carries:
+    ///
+    /// - the arena's own memory-entry send rights are absent, so
+    ///   `duplicate_transit_rights` and therefore `RegisteredPortExecPlan::
+    ///   install` fail with `KERN_INVALID_NAME`;
+    /// - the task-registered slots are not inherited either, so a child cannot
+    ///   recover them with `adopt_registered` even when the parent registered
+    ///   them before forking.
+    ///
+    /// Consequence, and the reason this test exists: a forked guest child
+    /// CANNOT transport this arena through its own host self-exec. The
+    /// different-VA successor proof
+    /// (`fork_exec_successor_maps_arena_at_fresh_addresses`) execs from the
+    /// arena's CREATOR and so never crosses this boundary. Any design that
+    /// wants container-lifetime sharing across a guest `fork`+`execve` needs a
+    /// transport that survives `fork(2)` — an inherited descriptor, as the
+    /// kernel arena, xsig ring, and AOT cache all use — not a Mach send right.
+    #[test]
+    fn a_fork_child_inherits_arena_mappings_but_neither_mach_transport() {
+        let arena = protocol_arena();
+        let transit = arena.transit_v2();
+        let control = arena.control_rw.base() as *mut u8;
+        // A byte only the parent could have written, read back by the child.
+        unsafe { control.add(LIVE_OBJECT_HEADER_LEN).write_volatile(0x6c) };
+
+        // Register the rights BEFORE forking: the strongest form of the second
+        // question, since the child would then only have to look them up.
+        let rights = arena
+            .duplicate_transit_rights()
+            .expect("parent duplicates its own rights");
+        let old = RegisteredPortVector::lookup().expect("registered ports");
+        let inherited_slot = old.slots[0].as_ref().map_or(MACH_PORT_NULL, |r| r.name);
+        register_port_names(&[inherited_slot, rights._code.name, rights._control.name])
+            .expect("register the arena rights");
+
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
+        if child == 0 {
+            let mut status = 0;
+            if unsafe { control.add(LIVE_OBJECT_HEADER_LEN).read_volatile() } != 0x6c {
+                status = 1; // mapping not inherited
+            }
+            if status == 0 && arena.duplicate_transit_rights().is_ok() {
+                status = 2; // send rights unexpectedly survived fork
+            }
+            if status == 0 && RegisteredPortExecPlan::install(&arena).is_ok() {
+                status = 3; // an exec plan unexpectedly buildable in a fork child
+            }
+            if status == 0 && DarwinLiveArena::adopt_registered(transit).is_ok() {
+                status = 4; // registered slots unexpectedly survived fork
+            }
+            unsafe { libc::_exit(status) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        register_port_names(&[inherited_slot, MACH_PORT_NULL, MACH_PORT_NULL])
+            .expect("restore the registered-port vector");
+        drop(old);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "1=mapping not inherited, 2=send rights survived fork, \
+             3=exec plan buildable in a fork child, 4=registered slots survived fork"
+        );
+        // None of the child's failures disturbed the creator's own authority.
+        assert!(arena.duplicate_transit_rights().is_ok());
+        assert_eq!(
+            RegisteredPortVector::lookup()
+                .expect("restored vector")
+                .slots[1..]
+                .iter()
+                .filter(|slot| slot.is_some())
+                .count(),
+            0
+        );
     }
 
     fn protocol_arena() -> DarwinLiveArena {
