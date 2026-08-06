@@ -237,6 +237,100 @@ impl From<ExclusiveFusionDisposition> for ExclusiveFusionClass {
     }
 }
 
+/// Why one live-arena consultation fell back to the private translator.
+///
+/// The counting vocabulary for `carrick_dsr_aarch64::translator::LiveFallback`,
+/// with the arena's own named refusals EXPANDED rather than collapsed: "the
+/// record is still BUILDING" and "the record failed validation" imply opposite
+/// fixes, so folding them into one `arena` bucket would make a mis-attributed
+/// fallback invisible — the exact defect Task 6F exists to remove.
+///
+/// The producer's mapping is an exhaustive match with no wildcard, so a new
+/// fallback reason is a compile error here rather than a silent reuse of a
+/// neighbouring class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum LiveLaneFallbackClass {
+    Unconfigured,
+    Regenerated,
+    OutsideSegment,
+    CrossPage,
+    UnsupportedShape,
+    SourceWordsUnavailable,
+    PrepareRefused,
+    UnresolvedEntry,
+    ArenaBuilding,
+    ArenaFailed,
+    ArenaCasLost,
+    ArenaInvalidRecord,
+    ArenaCapacity,
+    ArenaExhaustedProbes,
+    ArenaKeyEncoding,
+    ArenaWriteAttempted,
+    ArenaUnknownState,
+}
+
+impl LiveLaneFallbackClass {
+    pub const ALL: [Self; 17] = [
+        Self::Unconfigured,
+        Self::Regenerated,
+        Self::OutsideSegment,
+        Self::CrossPage,
+        Self::UnsupportedShape,
+        Self::SourceWordsUnavailable,
+        Self::PrepareRefused,
+        Self::UnresolvedEntry,
+        Self::ArenaBuilding,
+        Self::ArenaFailed,
+        Self::ArenaCasLost,
+        Self::ArenaInvalidRecord,
+        Self::ArenaCapacity,
+        Self::ArenaExhaustedProbes,
+        Self::ArenaKeyEncoding,
+        Self::ArenaWriteAttempted,
+        Self::ArenaUnknownState,
+    ];
+    pub const COUNT: usize = Self::ALL.len();
+
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub const fn field_name(self) -> &'static str {
+        match self {
+            Self::Unconfigured => "unconfigured",
+            Self::Regenerated => "regenerated",
+            Self::OutsideSegment => "outside_segment",
+            Self::CrossPage => "cross_page",
+            Self::UnsupportedShape => "unsupported_shape",
+            Self::SourceWordsUnavailable => "source_words_unavailable",
+            Self::PrepareRefused => "prepare_refused",
+            Self::UnresolvedEntry => "unresolved_entry",
+            Self::ArenaBuilding => "arena_building",
+            Self::ArenaFailed => "arena_failed",
+            Self::ArenaCasLost => "arena_cas_lost",
+            Self::ArenaInvalidRecord => "arena_invalid_record",
+            Self::ArenaCapacity => "arena_capacity",
+            Self::ArenaExhaustedProbes => "arena_exhausted_probes",
+            Self::ArenaKeyEncoding => "arena_key_encoding",
+            Self::ArenaWriteAttempted => "arena_write_attempted",
+            Self::ArenaUnknownState => "arena_unknown_state",
+        }
+    }
+}
+
+/// `ALL` is the ordinal order, so `index()` is a valid slot in every
+/// `[u64; COUNT]` counter array and the wire's three-frame split is a split of
+/// that same order. A reordered or short `ALL` is a build failure, not a
+/// silently mis-attributed counter.
+const _: () = {
+    let mut index = 0;
+    while index < LiveLaneFallbackClass::COUNT {
+        assert!(LiveLaneFallbackClass::ALL[index].index() == index);
+        index += 1;
+    }
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
 pub enum Phase {
@@ -834,6 +928,35 @@ pub struct ProfileSnapshot {
     pub direct_binding_stale_winner_clears: u64,
     pub direct_binding_publication_retries: u64,
     pub exclusive_fusion_sites: [u64; ExclusiveFusionClass::COUNT],
+    /// Container-lifetime LIVE arena lane. Process-scoped like the
+    /// `shared_*` counters above and published as the same claimed delta, so
+    /// summing them across a process's thread records recovers the process
+    /// total exactly once.
+    ///
+    /// `live_index_hits` is a repeat serve out of this process's own live
+    /// index; `live_ready_hits` is a FRESH acquisition of another publisher's
+    /// READY record; `live_publish_wins` is a block this process prepared
+    /// itself; `live_publish_adoptions` is a race this process lost and was
+    /// nevertheless served from the winner's record without preparing.
+    pub live_index_hits: u64,
+    pub live_ready_hits: u64,
+    pub live_ready_misses: u64,
+    pub live_publish_wins: u64,
+    pub live_publish_adoptions: u64,
+    pub live_blocks_installed: u64,
+    /// Exact published extents of every live block this process installed.
+    /// These are deliberately NOT folded into `cache_used_bytes`: that gauge
+    /// is the PRIVATE bump cache's occupancy, and live code executes from the
+    /// arena mapping instead.
+    pub live_code_bytes: u64,
+    pub live_hot_bytes: u64,
+    pub live_cold_bytes: u64,
+    /// Private direct-link sites waiting on a key a live installation
+    /// published: patched to the arena entry, or left at the fall-into-stub
+    /// because the arena is outside the ±128 MiB AArch64 branch reach.
+    pub live_links_patched: u64,
+    pub live_links_out_of_reach: u64,
+    pub live_fallbacks: [u64; LiveLaneFallbackClass::COUNT],
 }
 
 #[derive(Clone, Debug)]
@@ -1040,6 +1163,50 @@ impl CompleteThreadRecord {
             resolver.cache_used_bytes, resolver.cache_capacity_bytes
         );
         frames.push(cache);
+        let mut live = self.frame_header("live-lane");
+        let _ = write!(
+            live,
+            "|live_index_hits={}|live_ready_hits={}|live_ready_misses={}|live_publish_wins={}|live_publish_adoptions={}|live_blocks_installed={}",
+            resolver.live_index_hits,
+            resolver.live_ready_hits,
+            resolver.live_ready_misses,
+            resolver.live_publish_wins,
+            resolver.live_publish_adoptions,
+            resolver.live_blocks_installed,
+        );
+        frames.push(live);
+        // The live extents are their own frame, never folded into
+        // `cache-gauge`: that frame is the private bump cache's occupancy.
+        let mut live_bytes = self.frame_header("live-bytes");
+        let _ = write!(
+            live_bytes,
+            "|live_code_bytes={}|live_hot_bytes={}|live_cold_bytes={}|live_links_patched={}|live_links_out_of_reach={}",
+            resolver.live_code_bytes,
+            resolver.live_hot_bytes,
+            resolver.live_cold_bytes,
+            resolver.live_links_patched,
+            resolver.live_links_out_of_reach,
+        );
+        frames.push(live_bytes);
+        // Seventeen named fallback classes do not fit one PIPE_BUF-atomic
+        // frame at u64::MAX, so they are split exactly like the fusion
+        // classes are. The order within each frame is `ALL`'s order.
+        for (name, classes) in [
+            ("live-fallback-a", &LiveLaneFallbackClass::ALL[..6]),
+            ("live-fallback-b", &LiveLaneFallbackClass::ALL[6..12]),
+            ("live-fallback-c", &LiveLaneFallbackClass::ALL[12..]),
+        ] {
+            let mut frame = self.frame_header(name);
+            for &class in classes {
+                let _ = write!(
+                    frame,
+                    "|lfb_{}={}",
+                    class.field_name(),
+                    resolver.live_fallbacks[class.index()]
+                );
+            }
+            frames.push(frame);
+        }
         // Process attribution gauges: the once-claimed startup window repeats
         // identically on every thread group of this pid; process_cpu_ns is a
         // point-in-time gauge at THIS thread's flush (like cache-gauge, never
@@ -1564,7 +1731,7 @@ mod tests {
                 },
             )
             .expect("bounded frames");
-        assert_eq!(frames.len(), 18);
+        assert_eq!(frames.len(), 23);
         assert!(frames[0].contains("|frame=core|"));
         assert!(frames[0].contains("|thread_cpu_ns=5"));
         let process = frames
@@ -1795,11 +1962,23 @@ mod tests {
                     cache_used_bytes: usize::MAX,
                     cache_capacity_bytes: usize::MAX,
                     exclusive_fusion_sites: [u64::MAX; ExclusiveFusionClass::COUNT],
+                    live_index_hits: u64::MAX,
+                    live_ready_hits: u64::MAX,
+                    live_ready_misses: u64::MAX,
+                    live_publish_wins: u64::MAX,
+                    live_publish_adoptions: u64::MAX,
+                    live_blocks_installed: u64::MAX,
+                    live_code_bytes: u64::MAX,
+                    live_hot_bytes: u64::MAX,
+                    live_cold_bytes: u64::MAX,
+                    live_links_patched: u64::MAX,
+                    live_links_out_of_reach: u64::MAX,
+                    live_fallbacks: [u64::MAX; LiveLaneFallbackClass::COUNT],
                 },
                 gauges,
             )
             .expect("bounded frames");
-        assert_eq!(frames.len(), 18);
+        assert_eq!(frames.len(), 23);
         for frame in frames {
             let transport_len = frame.len().checked_add(1).expect("newline length");
             assert!(

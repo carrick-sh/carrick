@@ -48,6 +48,11 @@ const RECOGNIZED_THREAD_FRAMES: &[&str] = &[
     "resolve-class",
     "direct-binding-gauge",
     "cache-gauge",
+    "live-lane",
+    "live-bytes",
+    "live-fallback-a",
+    "live-fallback-b",
+    "live-fallback-c",
     "process",
 ];
 

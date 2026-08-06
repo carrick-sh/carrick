@@ -2435,7 +2435,7 @@ mod tests {
             EmitAddressMode, PreparedSharedInitial, prepare_shared_initial,
         };
         use carrick_dsr_aarch64::live_arena::{
-            LiveArenaCapacities, LiveBlockExtents, LiveReservation,
+            LiveArenaCapacities, LiveBlockAuthority as _, LiveBlockExtents, LiveReservation,
         };
         use carrick_dsr_aarch64::shared_cache::{
             AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,

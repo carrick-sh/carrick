@@ -450,6 +450,10 @@ dsr_ordinal_enum! {
 dsr_ordinal_enum! {
     /// Low-cardinality DSR translation-cache event. Mirrors
     /// `carrick_observability::probes::DsrCacheEventKind` exactly.
+    ///
+    /// `LiveReadyHit` / `LiveWinnerPublish` name the container-lifetime LIVE
+    /// arena's own serves and publications; `BlockHit` / `BlockPublish` mean
+    /// the PRIVATE bump cache.
     pub enum DsrCacheEventKind {
         BlockHit = 1,
         BlockMiss = 2,
@@ -463,6 +467,8 @@ dsr_ordinal_enum! {
         DirectBindingClear = 10,
         DirectBindingValidationFailure = 11,
         DirectBindingUnitLoaded = 12,
+        LiveReadyHit = 13,
+        LiveWinnerPublish = 14,
     }
 }
 
@@ -1106,6 +1112,8 @@ mod tests {
         assert_eq!(DsrCacheEventKind::DirectBindingClear.raw(), 10);
         assert_eq!(DsrCacheEventKind::DirectBindingValidationFailure.raw(), 11);
         assert_eq!(DsrCacheEventKind::DirectBindingUnitLoaded.raw(), 12);
+        assert_eq!(DsrCacheEventKind::LiveReadyHit.raw(), 13);
+        assert_eq!(DsrCacheEventKind::LiveWinnerPublish.raw(), 14);
         for (index, subphase) in DsrTranslationSubphase::ALL.iter().enumerate() {
             assert_eq!(subphase.raw() as usize, index + 1);
         }

@@ -1150,6 +1150,18 @@ const LIVE_SOURCE_PAGE_BYTES: u64 = crate::live_arena::LIVE_SOURCE_PAGE_BYTES;
 /// the arena (the exact decoded interval is not known until the plan exists).
 const LIVE_MINIMUM_BLOCK_BYTES: u64 = 4;
 
+/// What one direct-link patch attempt did.
+///
+/// `OutOfReach` is a SUCCESS: the site keeps its unpatched fall-into-stub and
+/// resolves through the gateway, which is correct and merely slower. It is a
+/// named outcome rather than a bare `Ok(())` because "patched" and "too far to
+/// patch" are the two answers a link-reach counter has to tell apart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectLinkPatch {
+    Patched,
+    OutOfReach,
+}
+
 /// What one live-arena consultation produced.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LiveConsultation {
@@ -1803,6 +1815,23 @@ pub struct ResolverStats {
     pub resolve_src_shared_tgt_private: u64,
     pub resolve_src_private_tgt_shared: u64,
     pub resolve_src_private_tgt_private: u64,
+    pub live_index_hits: u64,
+    pub live_ready_hits: u64,
+    pub live_ready_misses: u64,
+    pub live_publish_wins: u64,
+    pub live_publish_adoptions: u64,
+    pub live_blocks_installed: u64,
+    pub live_code_bytes: u64,
+    pub live_hot_bytes: u64,
+    pub live_cold_bytes: u64,
+    pub live_links_patched: u64,
+    pub live_links_out_of_reach: u64,
+    /// One counter per named live-lane fallback, indexed by
+    /// [`profile::LiveLaneFallbackClass`]. An array rather than seventeen
+    /// scalars for the same reason `exclusive_fusion_sites` is one: the
+    /// producer's mapping is a single exhaustive match, so a new fallback
+    /// reason cannot quietly land in a neighbouring counter.
+    live_fallbacks: [u64; profile::LiveLaneFallbackClass::COUNT],
     invalid: Option<profile::ProfileError>,
 }
 
@@ -1845,10 +1874,24 @@ pub enum ResolverStat {
     ResolveSrcSharedTgtPrivate,
     ResolveSrcPrivateTgtShared,
     ResolveSrcPrivateTgtPrivate,
+    // Container-lifetime LIVE arena lane. Process-scoped like the Shared*
+    // family above: incremented on `ProcessState::stats`, so they MUST flow
+    // through `checked_delta` / `reported_stats`.
+    LiveIndexHits,
+    LiveReadyHits,
+    LiveReadyMisses,
+    LivePublishWins,
+    LivePublishAdoptions,
+    LiveBlocksInstalled,
+    LiveCodeBytes,
+    LiveHotBytes,
+    LiveColdBytes,
+    LiveLinksPatched,
+    LiveLinksOutOfReach,
 }
 
 impl ResolverStat {
-    const ALL: [Self; 33] = [
+    const ALL: [Self; 44] = [
         Self::ResolverExits,
         Self::OneEntryHits,
         Self::Translations,
@@ -1882,6 +1925,17 @@ impl ResolverStat {
         Self::ResolveSrcSharedTgtPrivate,
         Self::ResolveSrcPrivateTgtShared,
         Self::ResolveSrcPrivateTgtPrivate,
+        Self::LiveIndexHits,
+        Self::LiveReadyHits,
+        Self::LiveReadyMisses,
+        Self::LivePublishWins,
+        Self::LivePublishAdoptions,
+        Self::LiveBlocksInstalled,
+        Self::LiveCodeBytes,
+        Self::LiveHotBytes,
+        Self::LiveColdBytes,
+        Self::LiveLinksPatched,
+        Self::LiveLinksOutOfReach,
     ];
 
     const fn name(self) -> &'static str {
@@ -1919,6 +1973,17 @@ impl ResolverStat {
             Self::ResolveSrcSharedTgtPrivate => "resolve_src_shared_tgt_private",
             Self::ResolveSrcPrivateTgtShared => "resolve_src_private_tgt_shared",
             Self::ResolveSrcPrivateTgtPrivate => "resolve_src_private_tgt_private",
+            Self::LiveIndexHits => "live_index_hits",
+            Self::LiveReadyHits => "live_ready_hits",
+            Self::LiveReadyMisses => "live_ready_misses",
+            Self::LivePublishWins => "live_publish_wins",
+            Self::LivePublishAdoptions => "live_publish_adoptions",
+            Self::LiveBlocksInstalled => "live_blocks_installed",
+            Self::LiveCodeBytes => "live_code_bytes",
+            Self::LiveHotBytes => "live_hot_bytes",
+            Self::LiveColdBytes => "live_cold_bytes",
+            Self::LiveLinksPatched => "live_links_patched",
+            Self::LiveLinksOutOfReach => "live_links_out_of_reach",
         }
     }
 }
@@ -1959,6 +2024,17 @@ impl ResolverStats {
             ResolverStat::ResolveSrcSharedTgtPrivate => self.resolve_src_shared_tgt_private,
             ResolverStat::ResolveSrcPrivateTgtShared => self.resolve_src_private_tgt_shared,
             ResolverStat::ResolveSrcPrivateTgtPrivate => self.resolve_src_private_tgt_private,
+            ResolverStat::LiveIndexHits => self.live_index_hits,
+            ResolverStat::LiveReadyHits => self.live_ready_hits,
+            ResolverStat::LiveReadyMisses => self.live_ready_misses,
+            ResolverStat::LivePublishWins => self.live_publish_wins,
+            ResolverStat::LivePublishAdoptions => self.live_publish_adoptions,
+            ResolverStat::LiveBlocksInstalled => self.live_blocks_installed,
+            ResolverStat::LiveCodeBytes => self.live_code_bytes,
+            ResolverStat::LiveHotBytes => self.live_hot_bytes,
+            ResolverStat::LiveColdBytes => self.live_cold_bytes,
+            ResolverStat::LiveLinksPatched => self.live_links_patched,
+            ResolverStat::LiveLinksOutOfReach => self.live_links_out_of_reach,
         }
     }
 
@@ -2007,6 +2083,17 @@ impl ResolverStats {
             ResolverStat::ResolveSrcPrivateTgtPrivate => {
                 self.resolve_src_private_tgt_private = value
             }
+            ResolverStat::LiveIndexHits => self.live_index_hits = value,
+            ResolverStat::LiveReadyHits => self.live_ready_hits = value,
+            ResolverStat::LiveReadyMisses => self.live_ready_misses = value,
+            ResolverStat::LivePublishWins => self.live_publish_wins = value,
+            ResolverStat::LivePublishAdoptions => self.live_publish_adoptions = value,
+            ResolverStat::LiveBlocksInstalled => self.live_blocks_installed = value,
+            ResolverStat::LiveCodeBytes => self.live_code_bytes = value,
+            ResolverStat::LiveHotBytes => self.live_hot_bytes = value,
+            ResolverStat::LiveColdBytes => self.live_cold_bytes = value,
+            ResolverStat::LiveLinksPatched => self.live_links_patched = value,
+            ResolverStat::LiveLinksOutOfReach => self.live_links_out_of_reach = value,
         }
     }
 
@@ -2044,6 +2131,25 @@ impl ResolverStats {
         }
     }
 
+    /// Count one named live-lane fallback. The class is derived by an
+    /// exhaustive match on the producer's own reason, so this is the only
+    /// place a fallback can be attributed and no reason can go uncounted.
+    fn add_live_fallback(&mut self, fallback: LiveFallback) {
+        if self.invalid.is_some() {
+            return;
+        }
+        let class = profile::LiveLaneFallbackClass::from(fallback);
+        let slot = &mut self.live_fallbacks[class.index()];
+        match slot.checked_add(1) {
+            Some(total) => *slot = total,
+            None => {
+                self.invalid = Some(profile::ProfileError::CounterOverflow(
+                    "live_lane_fallbacks",
+                ));
+            }
+        }
+    }
+
     fn checked_delta(self, prior: Self) -> Result<Self, profile::ProfileError> {
         if let Some(error) = self.invalid.or(prior.invalid) {
             return Err(error);
@@ -2056,7 +2162,44 @@ impl ResolverStats {
                 .ok_or(profile::ProfileError::CounterUnderflow(stat.name()))?;
             delta.set(stat, value);
         }
+        for class in profile::LiveLaneFallbackClass::ALL {
+            delta.live_fallbacks[class.index()] = self.live_fallbacks[class.index()]
+                .checked_sub(prior.live_fallbacks[class.index()])
+                .ok_or(profile::ProfileError::CounterUnderflow(
+                    "live_lane_fallbacks",
+                ))?;
+        }
         Ok(delta)
+    }
+}
+
+impl From<LiveFallback> for profile::LiveLaneFallbackClass {
+    /// The one mapping from a produced fallback reason to its counter, with
+    /// no wildcard on either enum: a new `LiveFallback` variant or a new
+    /// `LivePrivateReason` is a compile error here, not a silent merge into
+    /// whichever class happens to sit next to it.
+    fn from(fallback: LiveFallback) -> Self {
+        match fallback {
+            LiveFallback::Unconfigured => Self::Unconfigured,
+            LiveFallback::Regenerated => Self::Regenerated,
+            LiveFallback::OutsideSegment => Self::OutsideSegment,
+            LiveFallback::CrossPage => Self::CrossPage,
+            LiveFallback::UnsupportedShape => Self::UnsupportedShape,
+            LiveFallback::SourceWordsUnavailable => Self::SourceWordsUnavailable,
+            LiveFallback::PrepareRefused => Self::PrepareRefused,
+            LiveFallback::UnresolvedEntry => Self::UnresolvedEntry,
+            LiveFallback::Arena(reason) => match reason {
+                crate::live_arena::LivePrivateReason::Building => Self::ArenaBuilding,
+                crate::live_arena::LivePrivateReason::Failed => Self::ArenaFailed,
+                crate::live_arena::LivePrivateReason::CasLost => Self::ArenaCasLost,
+                crate::live_arena::LivePrivateReason::InvalidRecord => Self::ArenaInvalidRecord,
+                crate::live_arena::LivePrivateReason::Capacity => Self::ArenaCapacity,
+                crate::live_arena::LivePrivateReason::ExhaustedProbes => Self::ArenaExhaustedProbes,
+                crate::live_arena::LivePrivateReason::KeyEncoding => Self::ArenaKeyEncoding,
+                crate::live_arena::LivePrivateReason::WriteAttempted => Self::ArenaWriteAttempted,
+                crate::live_arena::LivePrivateReason::UnknownState => Self::ArenaUnknownState,
+            },
+        }
     }
 }
 
@@ -2473,6 +2616,18 @@ impl ThreadTranslator {
             shared_guest_range_derivations: process.stats.shared_guest_range_derivations,
             shared_direct_edge_group_builds: process.stats.shared_direct_edge_group_builds,
             exclusive_fusion_sites: process.exclusive_fusion_site_counts(),
+            live_index_hits: process.stats.live_index_hits,
+            live_ready_hits: process.stats.live_ready_hits,
+            live_ready_misses: process.stats.live_ready_misses,
+            live_publish_wins: process.stats.live_publish_wins,
+            live_publish_adoptions: process.stats.live_publish_adoptions,
+            live_blocks_installed: process.stats.live_blocks_installed,
+            live_code_bytes: process.stats.live_code_bytes,
+            live_hot_bytes: process.stats.live_hot_bytes,
+            live_cold_bytes: process.stats.live_cold_bytes,
+            live_links_patched: process.stats.live_links_patched,
+            live_links_out_of_reach: process.stats.live_links_out_of_reach,
+            live_fallbacks: process.stats.live_fallbacks,
         }
     }
 
@@ -2542,6 +2697,18 @@ impl ThreadTranslator {
             shared_guest_range_derivations: delta.shared_guest_range_derivations,
             shared_direct_edge_group_builds: delta.shared_direct_edge_group_builds,
             exclusive_fusion_sites: process.exclusive_fusion_site_counts(),
+            live_index_hits: delta.live_index_hits,
+            live_ready_hits: delta.live_ready_hits,
+            live_ready_misses: delta.live_ready_misses,
+            live_publish_wins: delta.live_publish_wins,
+            live_publish_adoptions: delta.live_publish_adoptions,
+            live_blocks_installed: delta.live_blocks_installed,
+            live_code_bytes: delta.live_code_bytes,
+            live_hot_bytes: delta.live_hot_bytes,
+            live_cold_bytes: delta.live_cold_bytes,
+            live_links_patched: delta.live_links_patched,
+            live_links_out_of_reach: delta.live_links_out_of_reach,
+            live_fallbacks: delta.live_fallbacks,
         })
     }
 
@@ -2633,6 +2800,20 @@ impl ThreadTranslator {
             shared_guest_range_derivations: 0,
             shared_direct_edge_group_builds: 0,
             exclusive_fusion_sites: process_state.exclusive_fusion_site_counts(),
+            // Process-wide deltas, like the blocks above: owned by the
+            // draining thread's own record, so structurally zero here.
+            live_index_hits: 0,
+            live_ready_hits: 0,
+            live_ready_misses: 0,
+            live_publish_wins: 0,
+            live_publish_adoptions: 0,
+            live_blocks_installed: 0,
+            live_code_bytes: 0,
+            live_hot_bytes: 0,
+            live_cold_bytes: 0,
+            live_links_patched: 0,
+            live_links_out_of_reach: 0,
+            live_fallbacks: [0; profile::LiveLaneFallbackClass::COUNT],
         })
     }
 
@@ -3994,8 +4175,21 @@ impl ProcessState {
             // lets a private source patch into the arena instead of waiting
             // in `pending` for a private translation that will never come.
             match self.direct_link_target(target_key) {
-                Some((_authority, target)) => {
-                    self.patch_direct_link_if_reachable(site, target, link.target)?
+                Some((authority, target)) => {
+                    let patch = self.patch_direct_link_if_reachable(site, target, link.target)?;
+                    // Only a LIVE target is the live lane's business; a
+                    // private-to-private patch is the ordinary case the
+                    // private counters already describe.
+                    match authority {
+                        PublicationAuthority::Live => {
+                            let stat = match patch {
+                                DirectLinkPatch::Patched => ResolverStat::LiveLinksPatched,
+                                DirectLinkPatch::OutOfReach => ResolverStat::LiveLinksOutOfReach,
+                            };
+                            self.stats.add(stat, 1);
+                        }
+                        PublicationAuthority::Private => {}
+                    }
                 }
                 None => {
                     self.pending.entry(target_key).or_default().push(site);
@@ -4005,7 +4199,9 @@ impl ProcessState {
         if let Some(sites) = self.pending.remove(&key) {
             let entry = self.trusted_target(key, entry);
             for site in sites {
-                self.patch_direct_link_if_reachable(site, entry, key.0)?;
+                // A PRIVATE publication draining its own pending sites; the
+                // live link counters deliberately do not move here.
+                let _ = self.patch_direct_link_if_reachable(site, entry, key.0)?;
             }
         }
         // Publish to the independently synchronized read index only after all
@@ -4045,6 +4241,16 @@ impl ProcessState {
         })
     }
 
+    /// Name one live-lane fallback AND count it, in one place.
+    ///
+    /// Every `LiveConsultation::Private` in this module is produced here, so
+    /// the counter cannot drift from the reason the translator actually
+    /// returned: there is no second way to build the value.
+    fn live_fallback(&mut self, fallback: LiveFallback) -> LiveConsultation {
+        self.stats.add_live_fallback(fallback);
+        LiveConsultation::Private(fallback)
+    }
+
     /// The read-only exact READY lookup performed at the top of an
     /// authoritative INITIAL miss.
     ///
@@ -4059,39 +4265,47 @@ impl ProcessState {
         observation: &cache::PageGenerationObservation,
     ) -> LiveConsultation {
         if generation != types::CodeGeneration::INITIAL {
-            return LiveConsultation::Private(LiveFallback::Regenerated);
+            return self.live_fallback(LiveFallback::Regenerated);
         }
         let key = (guest, generation);
         // An already-installed live block is served from this process's own
         // live index rather than re-validating the shared record (which would
-        // re-hash the mapped code on every entry).
+        // re-hash the mapped code on every entry). Counted apart from a fresh
+        // READY acquisition: the two say different things about sharing.
         if let Some(entry) = self.live_blocks.get(&key).copied() {
+            self.stats.add(ResolverStat::LiveIndexHits, 1);
             return LiveConsultation::Installed(entry);
         }
         let lane = match self.live_lane() {
             Ok(lane) => lane,
-            Err(reason) => return LiveConsultation::Private(reason),
+            Err(reason) => return self.live_fallback(reason),
         };
         let Some(block_end) = guest
             .raw()
             .checked_add(LIVE_MINIMUM_BLOCK_BYTES)
             .map(carrick_guest_mem::GuestVa)
         else {
-            return LiveConsultation::Private(LiveFallback::OutsideSegment);
+            return self.live_fallback(LiveFallback::OutsideSegment);
         };
         if !lane.key.contains_guest_interval(guest, block_end) {
-            return LiveConsultation::Private(LiveFallback::OutsideSegment);
+            return self.live_fallback(LiveFallback::OutsideSegment);
         }
         match lane.authority.acquire_ready(&lane.key, guest, observation) {
             crate::live_arena::LiveReadyOutcome::Installed(authority) => {
                 match self.install_live_block(key, observation, lane.host_bias, authority) {
-                    Ok(entry) => LiveConsultation::Installed(entry),
-                    Err(reason) => LiveConsultation::Private(reason),
+                    Ok(entry) => {
+                        self.stats.add(ResolverStat::LiveReadyHits, 1);
+                        LiveConsultation::Installed(entry)
+                    }
+                    Err(reason) => self.live_fallback(reason),
                 }
             }
-            crate::live_arena::LiveReadyOutcome::Miss => LiveConsultation::Miss,
+            crate::live_arena::LiveReadyOutcome::Miss => {
+                self.stats.add(ResolverStat::LiveReadyMisses, 1);
+                LiveConsultation::Miss
+            }
             crate::live_arena::LiveReadyOutcome::Private(reason) => {
-                LiveConsultation::Private(LiveFallback::Arena(reason))
+                self.live_fallback(LiveFallback::Arena(reason))
             }
         }
     }
@@ -4112,7 +4326,7 @@ impl ProcessState {
         source_words: Option<&Vec<u32>>,
     ) -> LiveConsultation {
         if generation != types::CodeGeneration::INITIAL || observation.current() != generation {
-            return LiveConsultation::Private(LiveFallback::Regenerated);
+            return self.live_fallback(LiveFallback::Regenerated);
         }
         // Only a supported, non-sensitive, non-exclusive INITIAL plan may
         // enter `claim_eligible`. `ExclusiveRegion` and `Unsupported` own their
@@ -4125,41 +4339,51 @@ impl ProcessState {
                 | block::PlannedExit::Indirect { .. }
                 | block::PlannedExit::Continue { .. }
         ) {
-            return LiveConsultation::Private(LiveFallback::UnsupportedShape);
+            return self.live_fallback(LiveFallback::UnsupportedShape);
         }
         // The record is keyed by the block's own start, and the translation is
         // installed under `guest`; a plan that starts elsewhere would publish
         // one identity and install another.
         if block.start != guest {
-            return LiveConsultation::Private(LiveFallback::UnsupportedShape);
+            return self.live_fallback(LiveFallback::UnsupportedShape);
         }
         let source_page = guest.raw() / LIVE_SOURCE_PAGE_BYTES * LIVE_SOURCE_PAGE_BYTES;
         let Some(source_page_end) = source_page.checked_add(LIVE_SOURCE_PAGE_BYTES) else {
-            return LiveConsultation::Private(LiveFallback::CrossPage);
+            return self.live_fallback(LiveFallback::CrossPage);
         };
         if block.end.raw() <= block.start.raw() || block.end.raw() > source_page_end {
-            return LiveConsultation::Private(LiveFallback::CrossPage);
+            return self.live_fallback(LiveFallback::CrossPage);
         }
         let Some(source_words) = source_words else {
-            return LiveConsultation::Private(LiveFallback::SourceWordsUnavailable);
+            return self.live_fallback(LiveFallback::SourceWordsUnavailable);
         };
         let lane = match self.live_lane() {
             Ok(lane) => lane,
-            Err(reason) => return LiveConsultation::Private(reason),
+            Err(reason) => return self.live_fallback(reason),
         };
         if !lane.key.contains_guest_interval(block.start, block.end) {
-            return LiveConsultation::Private(LiveFallback::OutsideSegment);
+            return self.live_fallback(LiveFallback::OutsideSegment);
         }
-        let mut prepare =
-            || emit::prepare_shared_initial(&lane.key, block, address_mode, source_words.clone());
-        let outcome = lane.authority.publish_winner(
-            &lane.key,
-            block.start,
-            block.end,
-            observation,
-            std::process::id() as i32,
-            &mut prepare,
-        );
+        // A WIN is a block this process prepared; an ADOPTION is a race it
+        // lost and was still served from the winner's READY record without
+        // preparing. The protocol cannot report which happened -- both are
+        // `Installed` -- but the caller owns the closure, so observing whether
+        // it ran is exact and costs nothing on either path.
+        let mut prepared_here = false;
+        let outcome = {
+            let mut prepare = || {
+                prepared_here = true;
+                emit::prepare_shared_initial(&lane.key, block, address_mode, source_words.clone())
+            };
+            lane.authority.publish_winner(
+                &lane.key,
+                block.start,
+                block.end,
+                observation,
+                std::process::id() as i32,
+                &mut prepare,
+            )
+        };
         match outcome {
             crate::live_arena::LivePublishOutcome::Installed(authority) => {
                 match self.install_live_block(
@@ -4168,15 +4392,25 @@ impl ProcessState {
                     lane.host_bias,
                     authority,
                 ) {
-                    Ok(entry) => LiveConsultation::Installed(entry),
-                    Err(reason) => LiveConsultation::Private(reason),
+                    Ok(entry) => {
+                        self.stats.add(
+                            if prepared_here {
+                                ResolverStat::LivePublishWins
+                            } else {
+                                ResolverStat::LivePublishAdoptions
+                            },
+                            1,
+                        );
+                        LiveConsultation::Installed(entry)
+                    }
+                    Err(reason) => self.live_fallback(reason),
                 }
             }
             crate::live_arena::LivePublishOutcome::Private(reason) => {
-                LiveConsultation::Private(LiveFallback::Arena(reason))
+                self.live_fallback(LiveFallback::Arena(reason))
             }
             crate::live_arena::LivePublishOutcome::PrepareRefused(_) => {
-                LiveConsultation::Private(LiveFallback::PrepareRefused)
+                self.live_fallback(LiveFallback::PrepareRefused)
             }
         }
     }
@@ -4197,10 +4431,22 @@ impl ProcessState {
         authority: Box<dyn crate::live_arena::LiveBlockAuthority>,
     ) -> Result<types::CacheVa, LiveFallback> {
         let host_entry = authority.entry();
+        let extents = authority.extents();
         let len = authority.code_len();
         if host_entry.raw() == 0 || len == 0 || authority.guest_start().raw() != key.0.raw() {
             return Err(LiveFallback::UnresolvedEntry);
         }
+        // The block's exact published extents, counted where the block is
+        // installed so both consultation paths are covered by one site. These
+        // are NEVER added to `cache.used_bytes()`: live code executes from the
+        // arena mapping, and folding it into the private gauge would make the
+        // private cache look like it grew when it did not.
+        self.stats.add(ResolverStat::LiveBlocksInstalled, 1);
+        self.stats
+            .add(ResolverStat::LiveCodeBytes, extents.code.len);
+        self.stats.add(ResolverStat::LiveHotBytes, extents.hot.len);
+        self.stats
+            .add(ResolverStat::LiveColdBytes, extents.cold.len);
         let source_page = authority.source_page();
         self.note_live_source_page(source_page, authority.group_slot(), authority.chunk_index());
         let entry = types::CacheVa::published(host_entry);
@@ -4359,7 +4605,10 @@ impl ProcessState {
             self.drain_pending_links_to_live(key, entry)?;
             probes::dsr_cache_event(
                 tid,
-                probes::DsrCacheEventKind::BlockHit,
+                // The live lane's OWN event kind. Reusing `BlockHit` here made
+                // a live serve indistinguishable from a private cache hit in
+                // every trace.
+                probes::DsrCacheEventKind::LiveReadyHit,
                 guest.raw(),
                 generation.get(),
                 u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
@@ -4627,7 +4876,9 @@ impl ProcessState {
                 self.drain_pending_links_to_live(key, entry)?;
                 probes::dsr_cache_event(
                     tid,
-                    probes::DsrCacheEventKind::BlockPublish,
+                    // Not `BlockPublish`: that means a PRIVATE emission into
+                    // this process's bump cache.
+                    probes::DsrCacheEventKind::LiveWinnerPublish,
                     guest.raw(),
                     generation.get(),
                     u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
@@ -5013,7 +5264,15 @@ impl ProcessState {
             return Ok(());
         };
         for site in sites {
-            self.patch_direct_link_if_reachable(site, entry, key.0)?;
+            // The private cache and the arena are independent mappings, so
+            // whether a private source can even reach a live target is a real
+            // and previously unmeasured question (6E seam 2). Count both
+            // answers; neither changes what the code does.
+            let stat = match self.patch_direct_link_if_reachable(site, entry, key.0)? {
+                DirectLinkPatch::Patched => ResolverStat::LiveLinksPatched,
+                DirectLinkPatch::OutOfReach => ResolverStat::LiveLinksOutOfReach,
+            };
+            self.stats.add(stat, 1);
         }
         Ok(())
     }
@@ -5023,7 +5282,7 @@ impl ProcessState {
         site: cache::LinkSite,
         target: types::CacheVa,
         target_guest: carrick_guest_mem::GuestVa,
-    ) -> Result<(), types::DsrError> {
+    ) -> Result<DirectLinkPatch, types::DsrError> {
         match encode_aarch64_direct_branch(site, target) {
             Ok(word) => {
                 self.cache.patch_code_word(site, word)?;
@@ -5031,12 +5290,12 @@ impl ProcessState {
                     .entry(target_guest.raw() & !0xfff)
                     .or_default()
                     .push(site);
-                Ok(())
+                Ok(DirectLinkPatch::Patched)
             }
             Err(types::DsrError::CachePolicy(reason))
                 if reason.contains("outside AArch64 B range") =>
             {
-                Ok(())
+                Ok(DirectLinkPatch::OutOfReach)
             }
             Err(error) => Err(error),
         }
@@ -5513,6 +5772,19 @@ impl ThreadTranslator {
             resolve_src_shared_tgt_private: self.stats.resolve_src_shared_tgt_private,
             resolve_src_private_tgt_shared: self.stats.resolve_src_private_tgt_shared,
             resolve_src_private_tgt_private: self.stats.resolve_src_private_tgt_private,
+            // Process-scoped, like the `shared_*` family directly above.
+            live_index_hits: process.live_index_hits,
+            live_ready_hits: process.live_ready_hits,
+            live_ready_misses: process.live_ready_misses,
+            live_publish_wins: process.live_publish_wins,
+            live_publish_adoptions: process.live_publish_adoptions,
+            live_blocks_installed: process.live_blocks_installed,
+            live_code_bytes: process.live_code_bytes,
+            live_hot_bytes: process.live_hot_bytes,
+            live_cold_bytes: process.live_cold_bytes,
+            live_links_patched: process.live_links_patched,
+            live_links_out_of_reach: process.live_links_out_of_reach,
+            live_fallbacks: process.live_fallbacks,
         }
     }
 
@@ -7421,8 +7693,9 @@ mod tests {
         use crate::block::{BlockPlan, PlannedExit};
         use crate::emit::{EmitAddressMode, PreparedSharedInitial};
         use crate::live_arena::{
-            LiveBlockAuthority, LiveOwnedChunkIdentity, LivePrivateReason, LivePublishOutcome,
-            LiveReadyOutcome, LiveRxPayload, LiveTranslationAuthority,
+            LiveBlockAuthority, LiveBlockExtents, LiveOwnedChunkIdentity, LivePrivateReason,
+            LivePublishOutcome, LiveReadyOutcome, LiveReservation, LiveRxPayload,
+            LiveTranslationAuthority,
         };
         use crate::shared_cache::{
             AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
@@ -7430,6 +7703,7 @@ mod tests {
             TranslationUnitKey,
         };
         use carrick_dsr::cache::{PageGenerationObservation, PageGenerationTable};
+        use carrick_dsr::profile;
         use carrick_guest_mem::{GuestVa, HostVa};
         use std::sync::Arc;
         use std::sync::Mutex;
@@ -7539,6 +7813,7 @@ mod tests {
             arena: Arc<FakeLiveArena>,
             offset: usize,
             len: usize,
+            hot_len: usize,
             cold: Vec<u8>,
             guest_start: GuestVa,
             source_page: GuestVa,
@@ -7559,6 +7834,7 @@ mod tests {
                     arena: Arc::clone(arena),
                     offset,
                     len,
+                    hot_len: prepared.hot_bytes().len(),
                     cold: prepared.cold_bytes().to_vec(),
                     guest_start,
                     source_page: GuestVa(guest_start.raw() & !(16 * 1024 - 1)),
@@ -7573,8 +7849,25 @@ mod tests {
             fn entry(&self) -> HostVa {
                 HostVa(self.arena.base() + self.offset)
             }
-            fn code_len(&self) -> usize {
-                self.len
+            /// The block's real prepared extents, at this fixture's own
+            /// offsets: `code_len()` is the trait's default over the code
+            /// extent, so the installed length and the counted bytes come
+            /// from one number here exactly as they do in the real arena.
+            fn extents(&self) -> LiveBlockExtents {
+                LiveBlockExtents {
+                    code: LiveReservation {
+                        offset: self.offset as u64,
+                        len: self.len as u64,
+                    },
+                    hot: LiveReservation {
+                        offset: 0,
+                        len: self.hot_len as u64,
+                    },
+                    cold: LiveReservation {
+                        offset: 0,
+                        len: self.cold.len() as u64,
+                    },
+                }
             }
             fn guest_start(&self) -> GuestVa {
                 self.guest_start
@@ -7600,6 +7893,11 @@ mod tests {
         enum FakeReady {
             Miss,
             Hit,
+            /// A READY record whose acquired block resolves no usable
+            /// process-local entry: the install-time refusal
+            /// (`LiveFallback::UnresolvedEntry`) that no scripted arm could
+            /// otherwise reach.
+            HitUnresolvable,
             Private(LivePrivateReason),
         }
 
@@ -7682,8 +7980,36 @@ mod tests {
             fn entry(&self) -> HostVa {
                 self.0.entry()
             }
-            fn code_len(&self) -> usize {
-                self.0.code_len()
+            fn extents(&self) -> LiveBlockExtents {
+                self.0.extents()
+            }
+            fn guest_start(&self) -> GuestVa {
+                self.0.guest_start()
+            }
+            fn source_page(&self) -> GuestVa {
+                self.0.source_page()
+            }
+            fn group_slot(&self) -> u32 {
+                self.0.group_slot()
+            }
+            fn chunk_index(&self) -> u32 {
+                self.0.chunk_index()
+            }
+            fn cold_metadata(&self) -> Result<&[u8], LivePrivateReason> {
+                self.0.cold_metadata()
+            }
+        }
+
+        /// A block whose entry resolves to zero: the shape
+        /// `install_live_block` refuses by name.
+        struct UnresolvableFakeBlock(Arc<FakeLiveBlock>);
+
+        impl LiveBlockAuthority for UnresolvableFakeBlock {
+            fn entry(&self) -> HostVa {
+                HostVa(0)
+            }
+            fn extents(&self) -> LiveBlockExtents {
+                self.0.extents()
             }
             fn guest_start(&self) -> GuestVa {
                 self.0.guest_start()
@@ -7713,6 +8039,11 @@ mod tests {
                 match *self.ready.lock().expect("ready script") {
                     FakeReady::Miss => LiveReadyOutcome::Miss,
                     FakeReady::Private(reason) => LiveReadyOutcome::Private(reason),
+                    FakeReady::HitUnresolvable => {
+                        let prepared = prepared_block(guest_start);
+                        let block = self.block(&prepared, guest_start);
+                        LiveReadyOutcome::Installed(Box::new(UnresolvableFakeBlock(block)))
+                    }
                     FakeReady::Hit => {
                         let prepared = prepared_block(guest_start);
                         LiveReadyOutcome::Installed(Box::new(SharedFakeBlock(
@@ -7889,6 +8220,23 @@ mod tests {
                     LiveConsultation::Installed(entry) => entry,
                     other => panic!("the fixture's READY hit must install: {other:?}"),
                 }
+            }
+
+            /// This process's live-lane counters, read straight off the
+            /// process state the production paths increment.
+            fn stats(&self) -> super::super::ResolverStats {
+                self.translator.state.read().stats
+            }
+
+            /// The fallback-class counters as `(class, count)` for every
+            /// class that moved — the shape an assertion can name.
+            fn fallbacks(&self) -> Vec<(profile::LiveLaneFallbackClass, u64)> {
+                let stats = self.stats();
+                profile::LiveLaneFallbackClass::ALL
+                    .into_iter()
+                    .filter(|class| stats.live_fallbacks[class.index()] != 0)
+                    .map(|class| (class, stats.live_fallbacks[class.index()]))
+                    .collect()
             }
 
             fn private_cache_entry(&self) -> types::CacheVa {
@@ -8814,6 +9162,453 @@ mod tests {
                     .executable_range_catalog()
                     .contains(live.host().raw()),
                 "and the payload is catalogued again"
+            );
+        }
+
+        /// Task 6F: the live lane's typed counters.
+        ///
+        /// Every one of these asserts on the counters the PRODUCTION paths
+        /// increment, read straight off `ProcessState::stats` — there is no
+        /// test-only counting seam, so a counter that stops being incremented
+        /// fails here.
+        #[test]
+        fn every_live_fallback_reason_maps_to_its_own_counter_class() {
+            let arena_reasons = [
+                LivePrivateReason::Building,
+                LivePrivateReason::Failed,
+                LivePrivateReason::CasLost,
+                LivePrivateReason::InvalidRecord,
+                LivePrivateReason::Capacity,
+                LivePrivateReason::ExhaustedProbes,
+                LivePrivateReason::KeyEncoding,
+                LivePrivateReason::WriteAttempted,
+                LivePrivateReason::UnknownState,
+            ];
+            let every_reason: Vec<LiveFallback> = [
+                LiveFallback::Unconfigured,
+                LiveFallback::Regenerated,
+                LiveFallback::OutsideSegment,
+                LiveFallback::CrossPage,
+                LiveFallback::UnsupportedShape,
+                LiveFallback::SourceWordsUnavailable,
+                LiveFallback::PrepareRefused,
+                LiveFallback::UnresolvedEntry,
+            ]
+            .into_iter()
+            .chain(arena_reasons.into_iter().map(LiveFallback::Arena))
+            .collect();
+
+            let classes: Vec<profile::LiveLaneFallbackClass> = every_reason
+                .iter()
+                .map(|reason| profile::LiveLaneFallbackClass::from(*reason))
+                .collect();
+
+            // Total AND injective: the arena's nine refusals keep their own
+            // names instead of collapsing into one `arena` bucket, which is
+            // exactly what makes a mis-attributed fallback visible.
+            assert_eq!(
+                classes.len(),
+                profile::LiveLaneFallbackClass::COUNT,
+                "every named reason has a class and every class has a reason"
+            );
+            let mut indexes: Vec<usize> = classes.iter().map(|class| class.index()).collect();
+            indexes.sort_unstable();
+            indexes.dedup();
+            assert_eq!(
+                indexes,
+                (0..profile::LiveLaneFallbackClass::COUNT).collect::<Vec<_>>(),
+                "two reasons must never share one counter"
+            );
+        }
+
+        #[test]
+        fn each_named_fallback_increments_exactly_its_own_counter() {
+            let observed =
+                |lane: &Lane| -> Vec<(profile::LiveLaneFallbackClass, u64)> { lane.fallbacks() };
+
+            // 1. The policy-off default: no authority, no configured image.
+            let unconfigured = Lane::unconfigured();
+            let guest = GuestVa(SEGMENT_START);
+            let observation = unconfigured.observe(guest);
+            unconfigured.with_state(|state| {
+                state.live_ready_consultation(guest, types::CodeGeneration::INITIAL, &observation)
+            });
+            assert_eq!(
+                observed(&unconfigured),
+                vec![(profile::LiveLaneFallbackClass::Unconfigured, 1)]
+            );
+
+            // 2. A regenerated page.
+            let lane = Lane::new(FakeReady::Hit, FakeWinner::Publish);
+            let regenerated = types::CodeGeneration::INITIAL
+                .next()
+                .expect("a second generation");
+            lane.with_state(|state| {
+                state.live_ready_consultation(guest, regenerated, &lane.observe(guest))
+            });
+            assert_eq!(
+                observed(&lane),
+                vec![(profile::LiveLaneFallbackClass::Regenerated, 1)]
+            );
+
+            // 3. A block no configured live segment contains.
+            let lane = Lane::new(FakeReady::Hit, FakeWinner::Publish);
+            let outside = GuestVa(SEGMENT_START + SEGMENT_LEN + 0x1000);
+            let outside_observation = lane.observe(outside);
+            lane.with_state(|state| {
+                state.live_ready_consultation(
+                    outside,
+                    types::CodeGeneration::INITIAL,
+                    &outside_observation,
+                )
+            });
+            assert_eq!(
+                observed(&lane),
+                vec![(profile::LiveLaneFallbackClass::OutsideSegment, 1)]
+            );
+
+            // 4. An installed block that resolves no process-local entry.
+            let lane = Lane::new(FakeReady::HitUnresolvable, FakeWinner::Publish);
+            let observation = lane.observe(guest);
+            lane.with_state(|state| {
+                state.live_ready_consultation(guest, types::CodeGeneration::INITIAL, &observation)
+            });
+            assert_eq!(
+                observed(&lane),
+                vec![(profile::LiveLaneFallbackClass::UnresolvedEntry, 1)]
+            );
+
+            // 5. Every one of the arena's own named refusals, unrenamed.
+            for (reason, class) in [
+                (
+                    LivePrivateReason::Building,
+                    profile::LiveLaneFallbackClass::ArenaBuilding,
+                ),
+                (
+                    LivePrivateReason::Failed,
+                    profile::LiveLaneFallbackClass::ArenaFailed,
+                ),
+                (
+                    LivePrivateReason::CasLost,
+                    profile::LiveLaneFallbackClass::ArenaCasLost,
+                ),
+                (
+                    LivePrivateReason::InvalidRecord,
+                    profile::LiveLaneFallbackClass::ArenaInvalidRecord,
+                ),
+                (
+                    LivePrivateReason::Capacity,
+                    profile::LiveLaneFallbackClass::ArenaCapacity,
+                ),
+                (
+                    LivePrivateReason::ExhaustedProbes,
+                    profile::LiveLaneFallbackClass::ArenaExhaustedProbes,
+                ),
+                (
+                    LivePrivateReason::KeyEncoding,
+                    profile::LiveLaneFallbackClass::ArenaKeyEncoding,
+                ),
+                (
+                    LivePrivateReason::WriteAttempted,
+                    profile::LiveLaneFallbackClass::ArenaWriteAttempted,
+                ),
+                (
+                    LivePrivateReason::UnknownState,
+                    profile::LiveLaneFallbackClass::ArenaUnknownState,
+                ),
+            ] {
+                let lane = Lane::new(FakeReady::Private(reason), FakeWinner::Publish);
+                let observation = lane.observe(guest);
+                lane.with_state(|state| {
+                    state.live_ready_consultation(
+                        guest,
+                        types::CodeGeneration::INITIAL,
+                        &observation,
+                    )
+                });
+                assert_eq!(
+                    observed(&lane),
+                    vec![(class, 1)],
+                    "the arena's {reason:?} must reach its own counter"
+                );
+            }
+
+            // 6. The winner path's own plan screens, each on a fresh lane so
+            // the asserted counter is the only one that moved.
+            let winner_cases: Vec<(
+                &str,
+                BlockPlan,
+                Option<Vec<u32>>,
+                profile::LiveLaneFallbackClass,
+            )> = vec![
+                (
+                    "a terminal exit a shared block cannot republish",
+                    BlockPlan {
+                        exit: PlannedExit::Unsupported {
+                            guest,
+                            word: 0,
+                            op: bad64::Op::UDF,
+                        },
+                        ..syscall_plan(guest)
+                    },
+                    Some(vec![SYSCALL_WORD]),
+                    profile::LiveLaneFallbackClass::UnsupportedShape,
+                ),
+                (
+                    "a decoded interval that leaves its source page",
+                    BlockPlan {
+                        end: GuestVa(guest.raw() + 16 * 1024 + 4),
+                        ..syscall_plan(guest)
+                    },
+                    Some(vec![SYSCALL_WORD]),
+                    profile::LiveLaneFallbackClass::CrossPage,
+                ),
+                (
+                    "a block whose exact source words are unavailable",
+                    syscall_plan(guest),
+                    None,
+                    profile::LiveLaneFallbackClass::SourceWordsUnavailable,
+                ),
+            ];
+            for (what, plan, words, class) in winner_cases {
+                let lane = Lane::new(FakeReady::Miss, FakeWinner::Publish);
+                let observation = lane.observe(guest);
+                lane.with_state(|state| {
+                    state.live_winner_publication(
+                        &plan,
+                        guest,
+                        types::CodeGeneration::INITIAL,
+                        &observation,
+                        EmitAddressMode::Direct,
+                        words.as_ref(),
+                    )
+                });
+                assert_eq!(observed(&lane), vec![(class, 1)], "{what}");
+            }
+
+            // 7. The unique winner's own preparation refusing.
+            let lane = Lane::new(FakeReady::Miss, FakeWinner::PrepareRefused);
+            let observation = lane.observe(guest);
+            lane.with_state(|state| {
+                state.live_winner_publication(
+                    &syscall_plan(guest),
+                    guest,
+                    types::CodeGeneration::INITIAL,
+                    &observation,
+                    EmitAddressMode::Direct,
+                    Some(&vec![SYSCALL_WORD]),
+                )
+            });
+            assert_eq!(
+                observed(&lane),
+                vec![(profile::LiveLaneFallbackClass::PrepareRefused, 1)]
+            );
+        }
+
+        #[test]
+        fn a_ready_hit_a_publish_win_and_a_fallback_are_separable_in_one_runs_counters() {
+            let lane = Lane::new(FakeReady::Hit, FakeWinner::Publish);
+            let served = GuestVa(SEGMENT_START);
+            let raced = GuestVa(SEGMENT_START + 0x40);
+
+            // A fresh READY acquisition, then a repeat serve of the same key.
+            let first = lane.install_ready(served);
+            let second = lane.install_ready(served);
+            assert_eq!(first, second);
+
+            // A miss on a second key, then this process winning its race.
+            *lane.authority.ready.lock().expect("ready script") = FakeReady::Miss;
+            let observation = lane.observe(raced);
+            let miss = lane.with_state(|state| {
+                state.live_ready_consultation(raced, types::CodeGeneration::INITIAL, &observation)
+            });
+            assert_eq!(miss, LiveConsultation::Miss);
+            let published = lane.with_state(|state| {
+                state.live_winner_publication(
+                    &syscall_plan(raced),
+                    raced,
+                    types::CodeGeneration::INITIAL,
+                    &observation,
+                    EmitAddressMode::Direct,
+                    Some(&vec![SYSCALL_WORD]),
+                )
+            });
+            assert!(matches!(published, LiveConsultation::Installed(_)));
+
+            // And one immediate private fallback.
+            *lane.authority.ready.lock().expect("ready script") =
+                FakeReady::Private(LivePrivateReason::Building);
+            let building = GuestVa(SEGMENT_START + 0x80);
+            let building_observation = lane.observe(building);
+            lane.with_state(|state| {
+                state.live_ready_consultation(
+                    building,
+                    types::CodeGeneration::INITIAL,
+                    &building_observation,
+                )
+            });
+
+            let stats = lane.stats();
+            assert_eq!(
+                (
+                    stats.live_ready_hits,
+                    stats.live_index_hits,
+                    stats.live_ready_misses,
+                    stats.live_publish_wins,
+                    stats.live_publish_adoptions,
+                    stats.live_blocks_installed,
+                ),
+                (1, 1, 1, 1, 0, 2),
+                "a fresh READY acquisition, a repeat index serve, a miss and a \
+                 winning publication are four different things"
+            );
+            assert_eq!(
+                lane.fallbacks(),
+                vec![(profile::LiveLaneFallbackClass::ArenaBuilding, 1)]
+            );
+        }
+
+        #[test]
+        fn a_publication_served_without_preparing_counts_as_an_adoption_not_a_win() {
+            let lane = Lane::new(FakeReady::Miss, FakeWinner::RacedToReady);
+            let guest = GuestVa(SEGMENT_START);
+            let observation = lane.observe(guest);
+
+            let published = lane.with_state(|state| {
+                state.live_winner_publication(
+                    &syscall_plan(guest),
+                    guest,
+                    types::CodeGeneration::INITIAL,
+                    &observation,
+                    EmitAddressMode::Direct,
+                    Some(&vec![SYSCALL_WORD]),
+                )
+            });
+            assert!(matches!(published, LiveConsultation::Installed(_)));
+
+            let stats = lane.stats();
+            assert_eq!(
+                (stats.live_publish_wins, stats.live_publish_adoptions),
+                (0, 1),
+                "a race this process lost and was still served from is an \
+                 ADOPTION: it prepared nothing"
+            );
+            assert_eq!(
+                lane.authority.prepares.load(Ordering::Relaxed),
+                0,
+                "and the fixture agrees no preparation ran"
+            );
+        }
+
+        #[test]
+        fn the_live_byte_counters_are_the_published_blocks_exact_extents() {
+            let lane = Lane::new(FakeReady::Hit, FakeWinner::Publish);
+            let guest = GuestVa(SEGMENT_START);
+            lane.install_ready(guest);
+
+            let block = lane.authority.last_installed();
+            let extents = block.extents();
+            let prepared = prepared_block(guest);
+            let stats = lane.stats();
+            assert_eq!(
+                (
+                    stats.live_blocks_installed,
+                    stats.live_code_bytes,
+                    stats.live_hot_bytes,
+                    stats.live_cold_bytes,
+                ),
+                (1, extents.code.len, extents.hot.len, extents.cold.len,),
+                "the counted bytes are the installed block's own extents"
+            );
+            assert_eq!(
+                (
+                    stats.live_code_bytes,
+                    stats.live_hot_bytes,
+                    stats.live_cold_bytes
+                ),
+                (
+                    prepared.code_bytes().len() as u64,
+                    prepared.hot_bytes().len() as u64,
+                    prepared.cold_bytes().len() as u64,
+                ),
+                "and those extents are the real prepared block's sizes"
+            );
+        }
+
+        #[test]
+        fn the_private_cache_gauge_never_absorbs_a_live_byte() {
+            let lane = Lane::new(FakeReady::Hit, FakeWinner::Publish);
+            let guest = GuestVa(SEGMENT_START);
+            let before = lane.with_state(|state| state.cache.used_bytes());
+
+            lane.install_ready(guest);
+
+            let after = lane.with_state(|state| state.cache.used_bytes());
+            let stats = lane.stats();
+            assert!(
+                stats.live_code_bytes > 0,
+                "the fixture installed a nonempty live block"
+            );
+            assert_eq!(
+                before, after,
+                "`cache_used_bytes` is the PRIVATE bump cache's occupancy; a \
+                 live block executes from the arena and must never move it"
+            );
+
+            // And the same must hold of the EXPORTED gauge, which is where a
+            // "just add the live bytes in" mistake would actually be made.
+            let thread = ThreadTranslator::for_process(Arc::clone(&lane.translator), 11);
+            let snapshot = thread.profile_snapshot();
+            assert_eq!(
+                snapshot.cache_used_bytes, after,
+                "the exported private gauge must not have absorbed the live bytes"
+            );
+            assert_eq!(
+                snapshot.live_code_bytes, stats.live_code_bytes,
+                "the live bytes are exported as their OWN counters"
+            );
+        }
+
+        #[test]
+        fn a_live_installation_counts_the_private_links_it_patched() {
+            let lane = Lane::new(FakeReady::Hit, FakeWinner::Publish);
+            let guest = GuestVa(SEGMENT_START);
+            let key = (guest, types::CodeGeneration::INITIAL);
+            let site = cache::LinkSite {
+                source: lane.private_cache_entry(),
+                slot: types::CacheOffset::published(0),
+            };
+            lane.with_state(|state| {
+                state.pending.entry(key).or_default().push(site);
+            });
+
+            let live = lane.install_ready(guest);
+            lane.with_state(|state| {
+                state
+                    .drain_pending_links_to_live(key, live)
+                    .expect("drain the private sites waiting on this key")
+            });
+
+            let stats = lane.stats();
+            assert_eq!(
+                stats.live_links_patched + stats.live_links_out_of_reach,
+                1,
+                "every drained site is counted exactly once, patched or not"
+            );
+            // Which of the two fires depends on the ±128 MiB reach between
+            // this process's private cache and the arena — the real and
+            // previously unmeasured question these two counters exist to
+            // answer — so the test pins the accounting, not the distance.
+            let recorded = lane.with_state(|state| {
+                state
+                    .direct_link_incoming
+                    .values()
+                    .map(|sites| sites.len() as u64)
+                    .sum::<u64>()
+            });
+            assert_eq!(
+                recorded, stats.live_links_patched,
+                "a site counted as patched is a site recorded for severing"
             );
         }
     }
