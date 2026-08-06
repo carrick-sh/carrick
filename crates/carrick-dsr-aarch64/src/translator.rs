@@ -7906,8 +7906,22 @@ mod tests {
             );
         }
 
+        /// A live install registers its page dependency, so a guest code write
+        /// makes `translate`'s invalidation loop name the block stale.
+        ///
+        /// Scope, deliberately: this proves the REGISTRATION, not the removal.
+        /// The removal itself lives in `ProcessState::translate`, which needs a
+        /// mapped image these process-state-level tests do not build; what it
+        /// does with a stale key (`blocks`/`live_blocks`/`published_blocks`
+        /// removal) is asserted structurally below instead of driven.
+        ///
+        /// The parity that matters and is easy to misread: a stale block is
+        /// removed from the LOOKUP indexes only. It stays in `published` and in
+        /// its address index — exactly as a stale PRIVATE block does — because
+        /// those exist for fault reconstruction over code that may still be
+        /// executing, and are cleared wholesale by `clear_published` at exec.
         #[test]
-        fn a_regenerated_page_drops_its_live_block_from_every_index() {
+        fn a_live_block_registers_its_page_dependency_for_invalidation() {
             let lane = Lane::new(FakeReady::Hit, FakeWinner::Publish);
             let guest = GuestVa(SEGMENT_START);
             let observation = lane.observe(guest);
@@ -7927,7 +7941,9 @@ mod tests {
                 "the live block registered its page dependency"
             );
 
+            // The removals `translate`'s loop performs for each stale key.
             lane.with_state(|state| {
+                state.blocks.remove(&key);
                 state.live_blocks.remove(&key);
                 state.published_blocks.remove(key);
                 assert!(state.live_blocks.is_empty());
@@ -7937,6 +7953,18 @@ mod tests {
                         .get(guest, types::CodeGeneration::INITIAL)
                         .is_none()
                 );
+                // Parity with a stale private block: the fault-reconstruction
+                // list and its address index deliberately retain the entry.
+                assert_eq!(state.published.len(), 1);
+                assert_eq!(state.live_published_index.len(), 1);
+            });
+
+            // `clear_published` is what actually empties them, at exec.
+            lane.with_state(|state| {
+                state.clear_published();
+                assert!(state.published.is_empty());
+                assert!(state.live_published_index.is_empty());
+                assert!(state.live_source_pages.is_empty());
             });
         }
 

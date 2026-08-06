@@ -4830,6 +4830,35 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                             })?;
                         {
                             let memory = memory.read();
+                            // SEAM (Task 6E / Task 7) — the IN-PROCESS exec path
+                            // has no live-lane wiring, unlike the host
+                            // self-re-exec path, whose successor re-enters
+                            // `run_image_in_current_process` and installs a fresh
+                            // `LiveArenaProcessView` over its adopted arena.
+                            // Under `CARRICK_DSR_LIVE_ARENA=compiler` this
+                            // `configure_shared_translation` reaches
+                            // `configure_live_image`, and BOTH translator
+                            // branches of `replace_image` are wrong in a
+                            // different, currently-benign way:
+                            //
+                            // * inherited translator (`NATIVE_FORKED_GUEST_CHILD`,
+                            //   `mapped_memory.rs` `replace_image`): the exec
+                            //   reset clears `shared_translation` but NOT
+                            //   `live_translation` or `live_authority`
+                            //   (`translator.rs` `commit_inner`), so the
+                            //   already-configured guard fires and this call
+                            //   fails AFTER old-image retirement — fatal, but
+                            //   fail-closed, never a mistranslation;
+                            // * fresh translator: the new `ProcessTranslator`
+                            //   has no authority installed, so the live lane
+                            //   goes silently inert for the replacement image.
+                            //
+                            // Neither is reachable by default (the policy is
+                            // opt-in and pre-Task-7 correctness evidence is
+                            // forbidden), so 6D names it rather than rewiring
+                            // it: the exec-time live-lane reset and re-install
+                            // belong with 6E's publication-kind/target-authority
+                            // work and Task 7's revocation.
                             memory
                                 .configure_shared_translation(
                                     &image,

@@ -272,6 +272,17 @@ publication. Live targets are flavor 0; private trusted targets remain flavor
 incoming/pending indexes. Register the live RX payload in the executable range
 catalog and keep ownership dominated by the process view.
 
+**2026-08-06 (added by Task 6D):** also own the IN-PROCESS exec path's live
+lane, which 6D wired only for host self-re-exec. `native_darwin.rs`'s
+in-process `execve` re-runs `configure_shared_translation` while the exec reset
+(`translator.rs` `commit_inner`) clears `shared_translation` but not
+`live_translation`/`live_authority`, so under the compiler policy the
+inherited-translator branch fails closed on the already-configured guard after
+old-image retirement, and the fresh-translator branch leaves the lane inert.
+Clear the live configuration and authority in the exec reset and re-install a
+process view for the replacement image, alongside the executable-range-catalog
+registration above.
+
 ## Task 6F — metrics and pre-Task-7 gates
 
 Add typed resolver counters and every manual mapping for READY hits, publish
