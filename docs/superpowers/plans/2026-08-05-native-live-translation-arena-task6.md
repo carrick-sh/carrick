@@ -282,3 +282,123 @@ Run full crate/runtime tests, compile-fail tests, clippy/format/diff, and a
 signed correctness smoke with the experiment still runtime-disabled. Then
 complete Task 7 before enabling the compiler policy or running performance
 ABBA. Task 8 owns USDT/DTrace and official measurement.
+
+## Amendment 2026-08-05 — fd-backed transport (supersedes the Mach transit)
+
+Task 6C2 proved the Mach memory-entry transport does not survive `fork(2)`
+(`task-6c2-report.md` §1): a forked guest child inherits the arena bytes but
+no Mach rights, so `CARRICK_DSR_LIVE_ARENA=compiler` failed every
+forked-then-exec'd guest `execve` with EIO. The probe-backed replacement
+design is `docs/superpowers/specs/2026-08-05-live-arena-fd-transport-design.md`:
+two unlinked regular files (the `kernel_arena` idiom), RW alias plus an RX
+alias built by `mmap(PROT_READ)` + `mprotect(R|X)` with per-alias
+`set_maximum` clamps, transported as inherited fds through the existing
+`HostFdFlagTransaction`. The full fork + SETEXEC lifecycle, dual-alias W^X,
+coherence, revocation, and 8.6–17.6 µs attach are all probe-proven on this
+host.
+
+**Superseding scope — exactly the transit/adoption mechanics.** In Task 6A's
+historical record and Task 6B2's Darwin authority, every mention of memory
+entries, transit send rights, registered ports, `mach_ports_register`
+vectors, and the three-slot constraint is replaced by fd transport. The V2
+wire, directory, records, cursors, claim/token authority, publisher/consumer
+I-cache rules, B3 geometry and census thresholds, and the 6B2 exec-successor
+*proof obligations* (different-VA adoption, creator READY observation) are
+NOT superseded — they re-run unchanged on the new transport. Tasks 6D, 6E,
+6F, and 7 keep their numbering, scope, and gates.
+
+### Task 6T1 — substrate swap: fd-backed objects and aliases
+
+**Files:** modify `crates/carrick-native-darwin/src/live_arena.rs`.
+
+Replace memory-entry creation with unlinked-file backing
+(`std::env::temp_dir()`, `O_EXCL`, unlink, single `ftruncate`); build aliases
+map→mprotect→clamp→validate; delete `MachSendRight`, `MapJitBootstrap`,
+`VmMapping::map_entry`, both `create_*_memory_entry` functions,
+`RegisteredPortVector`, `OolPortArray`, `register_port_names`,
+`RegisteredPortExecPlan`, `LiveArenaTransitRights`,
+`duplicate_transit_rights`, `transit_send_right_user_refs`, and the
+`posix_spawnattr_set_registered_ports_np`/`mach_port_get_refs` SPI
+declarations. The transit type gains both fd numbers, original fd flags, and
+per-fd fstat identity; `LiveArenaTransitV2` (schema/lengths/nonce) is
+unchanged. Keep `validate_protections` equality checking as the mandatory
+guard against the probed silent-EXEC-strip failure shape.
+
+**Red-first tests:**
+
+- `fd_arena_dual_aliases_execute_published_code` (write via RW, consumer
+  invalidate, execute via RX; append to an executed page; overwrite)
+- `fd_arena_alias_protections_are_clamped_and_validated` (regions read
+  `cur==max` at `rw-`/`r-x`; escalation refused)
+- `fd_arena_adoption_rejects_identity_or_flag_drift` (wrong fd, changed
+  flags, wrong size, wrong nonce — each named)
+- `a_fork_child_inherits_arena_mappings_and_its_fd_transport` — the 6C2
+  blocker test inverted: the child holds bytes AND can prepare the exec
+  transport
+- `fd_arena_teardown_in_fork_child_is_local` — child unwinds its `Arc`;
+  parent mappings/fd still live (dissolves the 6C2 §8(a) hazard)
+
+**Gates:** `cargo test -p carrick-native-darwin`,
+`cargo test -p carrick-dsr-aarch64` (must be untouched-green), clippy
+`-D warnings`, fmt, lint-domains, doc. No runtime-on evidence.
+
+### Task 6T2 — capsule transport swap
+
+**Files:** modify `crates/carrick-runtime/src/native_exec_capsule.rs`,
+`crates/carrick-runtime/src/native_darwin.rs`,
+`crates/carrick-runtime/src/direct_runner.rs` (call-site types only).
+
+`NativeReexecLiveArenaV2` gains code/control fd numbers, original flags, and
+fstat identity; both self-exec call paths add the two arena fds to
+`prepared_host_fds` instead of installing a `RegisteredPortExecPlan`; resume
+adopts from the inherited fds (validate flags → fstat identity →
+`F_DUPFD_CLOEXEC` → map → V2 validation → close transport fds). Delete
+`failed_setexec_leaves_the_registered_port_vector_unchanged` and
+`failed_setexec_releases_the_duplicated_send_rights` with their subject;
+extend the surviving `failed_setexec_restores_the_prepared_fd_flags` to
+cover the two arena fds.
+
+**Red-first tests:**
+
+- `fork_exec_successor_maps_arena_from_inherited_fds_at_fresh_addresses`
+- `forked_child_setexec_successor_acquires_creator_ready_record_and_bytes` —
+  THE boundary 6C2 proved was never crossed: creator publishes READY, a
+  guest-shaped `fork(2)` child SETEXEC-execs, the successor validates and
+  executes the creator's bytes and observes a post-exec creator write
+- `failed_setexec_restores_the_prepared_arena_fd_flags`
+
+**Gates:** serialized capsule family, `RUST_TEST_THREADS=1 cargo test -p
+carrick-runtime --lib`, clippy, fmt, lint-domains, doc, `just
+test-integration`.
+
+### Task 6C2 (reopened) — completion on the fd substrate
+
+The mechanism-agnostic ownership plumbing from `e58c59b3` (creation point,
+`Arc` retention, both `begin_guest_exec` forwardings,
+`NativeLiveArenaEntry`) is reused as-is. Replace the
+`LIVE_ARENA_COMPILER_BLOCKED` refusal for `Launch`/`Resume` with real
+create/adopt; rewrite the two blocked-truth tests
+(`launch_creates_one_owned_v2_arena_only_under_compiler_policy`,
+`resume_adopts_the_transported_arena_exactly_once`) back to their ownership
+assertions.
+
+**Red-first evidence:** the signed smoke that caught the blocker is the red —
+today `CARRICK_DSR_LIVE_ARENA=compiler carrick run --exec-backend native
+ubuntu:24.04 /bin/sh -c 'echo hi; id -u; uname -m'` refuses with EXIT=125.
+Green requires EXIT=0 with output identical to the policy-off arm (the
+original hard constraint 2), plus the policy-off and sizing-lane arms
+unchanged.
+
+**Gates:** everything in 6T2's list, `just build` (codesigned), the
+three-arm signed smoke with `CARRICK_RUN_ID` stamping and `kill.sh` reaping.
+Runtime-on compiler *performance* evidence remains forbidden until Task 7
+(preflight correction 6 stands; opening the policy for correctness smoke is
+this slice's exit criterion, not a perf run).
+
+### Unchanged
+
+Tasks 6D, 6E, 6F, and 7 are not renumbered and not rescoped; they now sit on
+the fd substrate. The Task 7 revocation slice must re-prove its
+instruction-abort classification predicates on the fd backing (the design
+doc's fault-shape receipt: revoked-page execution presents as SIGBUS on this
+host).
