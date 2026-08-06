@@ -1547,7 +1547,7 @@ fn load_native_execve_image(
 }
 
 pub(crate) fn resume_guest_from_capsule(
-    mut guest: crate::native_exec_capsule::NativeGuestExecV1,
+    mut guest: crate::native_exec_capsule::NativeGuestExecV2,
     argv: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
     _live_arena: Option<carrick_native_darwin::live_arena::DarwinLiveArena>,
@@ -8141,13 +8141,13 @@ mod tests {
         assert!(message.contains("CARRICK_DSR_LIVE_ARENA_SIZING_DIR"));
     }
 
-    fn compiler_guard_guest_fixture() -> crate::native_exec_capsule::NativeGuestExecV1 {
+    fn compiler_guard_guest_fixture() -> crate::native_exec_capsule::NativeGuestExecV2 {
         use crate::native_exec_capsule::{
-            NativeGuestExecV1, NativeReexecCredentialsV1, NativeReexecProcessStateV1,
+            NativeGuestExecV2, NativeReexecCredentialsV1, NativeReexecProcessStateV1,
             NativeReexecXsigV1,
         };
 
-        NativeGuestExecV1 {
+        NativeGuestExecV2 {
             resolved_path: "/definitely/missing/compiler-capsule".to_owned(),
             executable_digest: [0; 32],
             rootfs: crate::fs_backend::HostFsReexecAuthority {
