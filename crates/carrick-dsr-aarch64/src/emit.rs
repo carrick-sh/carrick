@@ -156,6 +156,7 @@ pub struct PreparedSharedInitial {
 struct PreparedLiveIdentity {
     unit_digest: [u8; 32],
     guest_start: GuestVa,
+    guest_end: GuestVa,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -218,9 +219,15 @@ impl PreparedSharedInitial {
     /// The identity itself stays opaque so callers cannot reconstruct or
     /// transplant prepared authority.
     #[doc(hidden)]
-    pub fn matches_live_identity(&self, unit_digest: [u8; 32], guest_start: GuestVa) -> bool {
+    pub fn matches_live_identity(
+        &self,
+        unit_digest: [u8; 32],
+        guest_start: GuestVa,
+        guest_end: GuestVa,
+    ) -> bool {
         self.live_identity.unit_digest == unit_digest
             && self.live_identity.guest_start == guest_start
+            && self.live_identity.guest_end == guest_end
     }
 
     /// Candidate sites exist only while the block is prepared and still
@@ -4820,6 +4827,7 @@ pub fn prepare_shared_initial(
         live_identity: PreparedLiveIdentity {
             unit_digest,
             guest_start: plan.start,
+            guest_end: plan.end,
         },
     })
 }
@@ -7828,7 +7836,8 @@ mod tests {
             let lengths = prepared.lengths();
             let arena = LiveTranslationArena::new(64 * 1024, 64 * 1024, 64 * 1024);
             let key = live_key();
-            let LiveLookup::Publish(claim) = arena.lookup(&key, key.guest_va_start(), 1234) else {
+            let LiveLookup::Publish(claim) = arena.claim_eligible(&key, key.guest_va_start(), 1234)
+            else {
                 panic!("first lookup must claim an empty live record")
             };
             let reserved = claim

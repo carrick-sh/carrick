@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 const CAPSULE_MAGIC: [u8; 8] = *b"CRKNEXE\0";
 const CONSUMED_MAGIC: [u8; 8] = [0; 8];
-const CAPSULE_VERSION: u16 = 1;
+const CAPSULE_VERSION: u16 = 2;
 const HEADER_LEN: usize = 68;
 const MAX_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
 const MAX_VECTOR_ITEMS: usize = 4096;
@@ -26,30 +26,30 @@ type NativeRegisteredPortExecPlan = carrick_native_darwin::live_arena::Registere
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 type NativeRegisteredPortExecPlan = ();
 
-/// First schema carried by the native host-self-exec transport.
+/// Second schema carried by the native host-self-exec transport.
 ///
 /// Process, filesystem, and descriptor records are added to this typed payload
 /// as their snapshot APIs land. These launch fields are sufficient to prove the
 /// transport and PID-preserving host exec without making the framing generic or
 /// exposing an untyped byte-bag at its trust boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct NativeExecCapsuleV1 {
+pub(crate) struct NativeExecCapsuleV2 {
     pub(crate) producer_pid: u32,
-    pub(crate) purpose: NativeExecCapsulePurposeV1,
+    pub(crate) purpose: NativeExecCapsulePurposeV2,
     pub(crate) host_executable_path: Vec<u8>,
     pub(crate) argv: Vec<Vec<u8>>,
     pub(crate) env: Vec<Vec<u8>>,
-    pub(crate) guest_exec: Option<NativeGuestExecV1>,
+    pub(crate) guest_exec: Option<NativeGuestExecV2>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum NativeExecCapsulePurposeV1 {
+pub(crate) enum NativeExecCapsulePurposeV2 {
     PidProbe,
     GuestExec,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct NativeGuestExecV1 {
+pub(crate) struct NativeGuestExecV2 {
     pub(crate) resolved_path: String,
     pub(crate) executable_digest: [u8; 32],
     pub(crate) rootfs: crate::fs_backend::HostFsReexecAuthority,
@@ -59,7 +59,7 @@ pub(crate) struct NativeGuestExecV1 {
     pub(crate) max_traps: u64,
     pub(crate) native_page_profile: carrick_spec::NativePageProfileRequest,
     #[serde(deserialize_with = "deserialize_present_live_arena")]
-    pub(crate) live_arena: Option<NativeReexecLiveArenaV1>,
+    pub(crate) live_arena: Option<NativeReexecLiveArenaV2>,
     #[serde(default)]
     pub(crate) kernel_arena: Option<NativeReexecKernelArenaV1>,
     #[serde(default)]
@@ -87,7 +87,7 @@ pub(crate) struct NativeGuestExecV1 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct NativeReexecLiveArenaV1 {
+pub(crate) struct NativeReexecLiveArenaV2 {
     pub(crate) schema: u32,
     pub(crate) code_len: u64,
     pub(crate) control_len: u64,
@@ -96,7 +96,7 @@ pub(crate) struct NativeReexecLiveArenaV1 {
 
 fn deserialize_present_live_arena<'de, D>(
     deserializer: D,
-) -> Result<Option<NativeReexecLiveArenaV1>, D::Error>
+) -> Result<Option<NativeReexecLiveArenaV2>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -104,8 +104,8 @@ where
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl From<carrick_native_darwin::live_arena::LiveArenaTransitV1> for NativeReexecLiveArenaV1 {
-    fn from(value: carrick_native_darwin::live_arena::LiveArenaTransitV1) -> Self {
+impl From<carrick_native_darwin::live_arena::LiveArenaTransitV2> for NativeReexecLiveArenaV2 {
+    fn from(value: carrick_native_darwin::live_arena::LiveArenaTransitV2) -> Self {
         Self {
             schema: value.schema,
             code_len: value.code_len,
@@ -116,8 +116,8 @@ impl From<carrick_native_darwin::live_arena::LiveArenaTransitV1> for NativeReexe
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl From<NativeReexecLiveArenaV1> for carrick_native_darwin::live_arena::LiveArenaTransitV1 {
-    fn from(value: NativeReexecLiveArenaV1) -> Self {
+impl From<NativeReexecLiveArenaV2> for carrick_native_darwin::live_arena::LiveArenaTransitV2 {
+    fn from(value: NativeReexecLiveArenaV2) -> Self {
         Self {
             schema: value.schema,
             code_len: value.code_len,
@@ -206,9 +206,9 @@ impl From<&NativeReexecAotCacheV1>
 }
 
 // The artifact-spike authority itself moved to `carrick-dsr-aarch64`, which
-// speaks the plain `ArtifactSpikeReexecConfig` carrier; the V1 capsule
-// schema stays here (it is the serialized re-exec wire format). These two
-// mappings are the ONLY place the pairing is spelled out.
+// speaks the plain `ArtifactSpikeReexecConfig` carrier; the nested V1
+// artifact-spike schema stays here inside the V2 capsule. These two mappings
+// are the ONLY place the pairing is spelled out.
 impl From<carrick_dsr_aarch64::artifact_spike::ArtifactSpikeReexecConfig>
     for NativeReexecArtifactSpikeV1
 {
@@ -262,7 +262,7 @@ pub(crate) struct NativeReexecProcessStateV1 {
 }
 
 fn native_reexec_unconfined_seccomp_policy() -> carrick_spec::SeccompPolicy {
-    // Prior V1 capsules did not carry launch policy. Preserve their historical
+    // The nested process-state V1 schema predates launch policy. Preserve its
     // decode meaning instead of silently enabling the container default.
     carrick_spec::SeccompPolicy::Unconfined
 }
@@ -286,7 +286,7 @@ pub(crate) struct NativeReexecRlimitV1 {
     pub(crate) maximum: u64,
 }
 
-impl NativeExecCapsuleV1 {
+impl NativeExecCapsuleV2 {
     fn validate(&self) -> Result<(), NativeExecCapsuleError> {
         if self.host_executable_path.is_empty() || self.host_executable_path.len() > MAX_PATH_LEN {
             return Err(NativeExecCapsuleError::InvalidField("host_executable_path"));
@@ -294,19 +294,19 @@ impl NativeExecCapsuleV1 {
         validate_byte_vector("argv", &self.argv)?;
         validate_byte_vector("env", &self.env)?;
         match (self.purpose, &self.guest_exec) {
-            (NativeExecCapsulePurposeV1::PidProbe, None) => {}
-            (NativeExecCapsulePurposeV1::GuestExec, Some(guest)) => guest.validate()?,
+            (NativeExecCapsulePurposeV2::PidProbe, None) => {}
+            (NativeExecCapsulePurposeV2::GuestExec, Some(guest)) => guest.validate()?,
             _ => return Err(NativeExecCapsuleError::InvalidField("purpose")),
         }
         Ok(())
     }
 }
 
-impl NativeGuestExecV1 {
+impl NativeGuestExecV2 {
     fn validate(&self) -> Result<(), NativeExecCapsuleError> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let live_arena_invalid = self.live_arena.is_some_and(|arena| {
-            arena.schema != 1 || arena.code_len == 0 || arena.control_len == 0
+            arena.schema != 2 || arena.code_len == 0 || arena.control_len == 0
         });
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         let live_arena_invalid = self.live_arena.is_some();
@@ -375,9 +375,9 @@ pub(crate) fn begin_pid_probe() -> anyhow::Result<()> {
     let executable = std::env::current_exe()?;
     let executable_bytes = executable.as_os_str().as_bytes().to_vec();
     let producer_pid = unsafe { libc::getpid() as u32 };
-    let payload = NativeExecCapsuleV1 {
+    let payload = NativeExecCapsuleV2 {
         producer_pid,
-        purpose: NativeExecCapsulePurposeV1::PidProbe,
+        purpose: NativeExecCapsulePurposeV2::PidProbe,
         host_executable_path: executable_bytes,
         argv: Vec::new(),
         env: Vec::new(),
@@ -453,13 +453,13 @@ pub(crate) fn begin_guest_exec(
     })?;
     let artifact_spike = crate::native_darwin::artifact_spike_authority_snapshot_if_enabled()?;
     let aot_cache = crate::native_darwin::aot_cache_authority_snapshot()?;
-    let mut payload = NativeExecCapsuleV1 {
+    let mut payload = NativeExecCapsuleV2 {
         producer_pid: unsafe { libc::getpid() as u32 },
-        purpose: NativeExecCapsulePurposeV1::GuestExec,
+        purpose: NativeExecCapsulePurposeV2::GuestExec,
         host_executable_path: executable.as_os_str().as_bytes().to_vec(),
         argv,
         env,
-        guest_exec: Some(NativeGuestExecV1 {
+        guest_exec: Some(NativeGuestExecV2 {
             resolved_path,
             executable_digest,
             rootfs,
@@ -468,7 +468,7 @@ pub(crate) fn begin_guest_exec(
             exec_host_fs_fallback: dispatcher.exec_host_fs_fallback(),
             max_traps: u64::try_from(max_traps)?,
             native_page_profile,
-            live_arena: live_arena.map(|arena| arena.transit_v1().into()),
+            live_arena: live_arena.map(|arena| arena.transit_v2().into()),
             kernel_arena: Some(kernel_arena),
             shared_futex_waiters: Some(shared_futex_waiters),
             artifact_spike,
@@ -541,7 +541,7 @@ enum PreparedImageFailpoint {
 
 #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 fn attach_prepared_image(
-    payload: &mut NativeExecCapsuleV1,
+    payload: &mut NativeExecCapsuleV2,
     image: &crate::memory::AddressSpace,
     relative_relocations: &[crate::native_prepared_image::NativeRelativeRelocation],
     exec_backing: Option<crate::native_prepared_image::PreparedExecutableBacking>,
@@ -559,7 +559,7 @@ fn attach_prepared_image(
 
 #[cfg(test)]
 fn attach_prepared_image_with_failpoint(
-    payload: &mut NativeExecCapsuleV1,
+    payload: &mut NativeExecCapsuleV2,
     image: &crate::memory::AddressSpace,
     relative_relocations: &[crate::native_prepared_image::NativeRelativeRelocation],
     host_page_size: u64,
@@ -577,7 +577,7 @@ fn attach_prepared_image_with_failpoint(
 
 #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 fn attach_prepared_image_inner(
-    payload: &mut NativeExecCapsuleV1,
+    payload: &mut NativeExecCapsuleV2,
     image: &crate::memory::AddressSpace,
     relative_relocations: &[crate::native_prepared_image::NativeRelativeRelocation],
     exec_backing: Option<crate::native_prepared_image::PreparedExecutableBacking>,
@@ -679,7 +679,7 @@ fn attach_prepared_image_inner(
 }
 
 fn exec_capsule(
-    payload: NativeExecCapsuleV1,
+    payload: NativeExecCapsuleV2,
     nonce: [u8; 16],
     prepared_artifact: Option<crate::native_prepared_image::PreparedImageArtifact>,
     live_arena: NativeLiveArenaAuthority<'_>,
@@ -723,7 +723,7 @@ struct HostExecRequest<'a> {
 }
 
 fn exec_capsule_with<F>(
-    payload: NativeExecCapsuleV1,
+    payload: NativeExecCapsuleV2,
     nonce: [u8; 16],
     prepared_artifact: Option<crate::native_prepared_image::PreparedImageArtifact>,
     live_arena: NativeLiveArenaAuthority<'_>,
@@ -739,7 +739,7 @@ where
             .as_ref()
             .and_then(|guest| guest.live_arena);
         let owned_live_arena =
-            live_arena.map(|arena| NativeReexecLiveArenaV1::from(arena.transit_v1()));
+            live_arena.map(|arena| NativeReexecLiveArenaV2::from(arena.transit_v2()));
         if payload_live_arena != owned_live_arena {
             anyhow::bail!("native live arena capsule metadata has no matching authority owner");
         }
@@ -1099,7 +1099,7 @@ pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::Native
         crate::probes::DsrCacheLifecyclePhase::HostSelfReexecCapsuleEnd,
     );
     match payload.purpose {
-        NativeExecCapsulePurposeV1::PidProbe => Ok(crate::NativeSelfReexecOutcome::PidProbe {
+        NativeExecCapsulePurposeV2::PidProbe => Ok(crate::NativeSelfReexecOutcome::PidProbe {
             before: payload.producer_pid,
             after: current_pid,
         }),
@@ -1110,7 +1110,7 @@ pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::Native
         // calls are gated the same way rather than left as newly-dead
         // cross-references off that lane.
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        NativeExecCapsulePurposeV1::GuestExec => {
+        NativeExecCapsulePurposeV2::GuestExec => {
             let guest = payload
                 .guest_exec
                 .ok_or_else(|| anyhow::anyhow!("native guest exec capsule has no guest state"))?;
@@ -1148,7 +1148,7 @@ pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::Native
             Ok(crate::NativeSelfReexecOutcome::GuestExit(exit_code))
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        NativeExecCapsulePurposeV1::GuestExec => {
+        NativeExecCapsulePurposeV2::GuestExec => {
             anyhow::bail!(
                 "native guest-exec self-reexec resume is only wired on macOS/aarch64 \
                  (the only lane that ever produces a GuestExec-purpose capsule)"
@@ -1294,7 +1294,7 @@ pub(crate) enum NativeExecCapsuleError {
 pub(crate) fn write_capsule(
     fd: RawFd,
     nonce: [u8; 16],
-    payload: &NativeExecCapsuleV1,
+    payload: &NativeExecCapsuleV2,
 ) -> Result<(), NativeExecCapsuleError> {
     payload.validate()?;
     let encoded = serde_json::to_vec(payload)?;
@@ -1324,7 +1324,7 @@ pub(crate) fn write_capsule(
 pub(crate) fn read_capsule_once(
     fd: RawFd,
     expected_nonce: [u8; 16],
-) -> Result<NativeExecCapsuleV1, NativeExecCapsuleError> {
+) -> Result<NativeExecCapsuleV2, NativeExecCapsuleError> {
     let file = duplicate_regular_file(fd)?;
     let mut header = [0_u8; HEADER_LEN];
     read_exact_at(&file, &mut header, 0)?;
@@ -1362,7 +1362,7 @@ pub(crate) fn read_capsule_once(
     if header[20..52] != Sha256::digest(&encoded)[..] {
         return Err(NativeExecCapsuleError::ChecksumMismatch);
     }
-    let payload: NativeExecCapsuleV1 = serde_json::from_slice(&encoded)?;
+    let payload: NativeExecCapsuleV2 = serde_json::from_slice(&encoded)?;
     payload.validate()?;
 
     // Invalidate only after the complete payload has passed framing, checksum,
@@ -1423,8 +1423,8 @@ mod tests {
     use std::os::unix::fs::FileExt;
 
     use super::{
-        HEADER_LEN, MAX_ITEM_LEN, NativeExecCapsulePurposeV1, NativeExecCapsuleV1,
-        NativeGuestExecV1, PreparedImageFailpoint, attach_prepared_image,
+        HEADER_LEN, MAX_ITEM_LEN, NativeExecCapsulePurposeV2, NativeExecCapsuleV2,
+        NativeGuestExecV2, PreparedImageFailpoint, attach_prepared_image,
         attach_prepared_image_with_failpoint, exec_capsule_with,
         fail_next_artifact_fd_flag_preparation, fd_no_longer_refers_to, read_capsule_once,
         set_native_exec_capsule_lifecycle_capture, take_last_preexec_validation_artifact,
@@ -1447,14 +1447,14 @@ mod tests {
         unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 == HOST_PAGE_SIZE }
     }
 
-    fn sample() -> NativeExecCapsuleV1 {
-        NativeExecCapsuleV1 {
+    fn sample() -> NativeExecCapsuleV2 {
+        NativeExecCapsuleV2 {
             producer_pid: 42,
-            purpose: NativeExecCapsulePurposeV1::GuestExec,
+            purpose: NativeExecCapsulePurposeV2::GuestExec,
             host_executable_path: b"/bin/probe".to_vec(),
             argv: vec![b"probe".to_vec(), b"stage2".to_vec()],
             env: vec![b"A=B".to_vec()],
-            guest_exec: Some(NativeGuestExecV1 {
+            guest_exec: Some(NativeGuestExecV2 {
                 resolved_path: "/bin/probe".to_owned(),
                 executable_digest: [0x11; 32],
                 rootfs: crate::fs_backend::HostFsReexecAuthority {
@@ -1578,7 +1578,7 @@ mod tests {
     }
 
     fn install_transport_fds(
-        payload: &mut NativeExecCapsuleV1,
+        payload: &mut NativeExecCapsuleV2,
         xsig: &std::fs::File,
         survivor: &std::fs::File,
         close_on_exec: &std::fs::File,
@@ -1677,7 +1677,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v1_payload_without_bind_mounts_defaults_to_empty() {
+    fn missing_bind_mounts_uses_the_nested_schema_default() {
         let payload = sample();
         let mut value = serde_json::to_value(payload).expect("serialize capsule");
         value
@@ -1686,8 +1686,8 @@ mod tests {
             .expect("guest payload")
             .remove("bind_mounts");
 
-        let decoded: NativeExecCapsuleV1 =
-            serde_json::from_value(value).expect("decode prior V1 payload");
+        let decoded: NativeExecCapsuleV2 =
+            serde_json::from_value(value).expect("decode nested bind-mount default");
         assert!(
             decoded
                 .guest_exec
@@ -1698,7 +1698,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_payload_requires_explicit_live_arena_field() {
+    fn v2_payload_requires_explicit_live_arena_field() {
         let payload = sample();
         let mut value = serde_json::to_value(payload).expect("serialize capsule");
         value
@@ -1707,13 +1707,13 @@ mod tests {
             .expect("guest payload")
             .remove("live_arena");
 
-        let error = serde_json::from_value::<NativeExecCapsuleV1>(value)
-            .expect_err("missing live arena field must reject V1 capsule");
+        let error = serde_json::from_value::<NativeExecCapsuleV2>(value)
+            .expect_err("missing live arena field must reject V2 capsule");
         assert!(error.to_string().contains("live_arena"));
     }
 
     #[test]
-    fn legacy_v1_process_state_defaults_to_unconfined_and_untraced() {
+    fn nested_v1_process_state_defaults_to_unconfined_and_untraced() {
         let payload = sample();
         let mut value = serde_json::to_value(payload).expect("serialize capsule");
         let process_state = value
@@ -1724,8 +1724,8 @@ mod tests {
         process_state.remove("seccomp_policy");
         process_state.remove("ptrace_traceme");
 
-        let decoded: NativeExecCapsuleV1 =
-            serde_json::from_value(value).expect("decode prior V1 payload");
+        let decoded: NativeExecCapsuleV2 =
+            serde_json::from_value(value).expect("decode nested process-state defaults");
         let process_state = decoded.guest_exec.expect("guest payload").process_state;
         assert_eq!(
             process_state.seccomp_policy,
@@ -1735,7 +1735,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v1_payload_without_shared_authorities_keeps_legacy_attach_path() {
+    fn missing_optional_shared_authorities_keeps_unshared_attach_path() {
         let payload = sample();
         let mut value = serde_json::to_value(payload).expect("serialize capsule");
         let guest = value
@@ -1745,15 +1745,15 @@ mod tests {
         guest.remove("kernel_arena");
         guest.remove("shared_futex_waiters");
 
-        let decoded: NativeExecCapsuleV1 =
-            serde_json::from_value(value).expect("decode prior V1 payload");
+        let decoded: NativeExecCapsuleV2 =
+            serde_json::from_value(value).expect("decode optional shared-authority defaults");
         let guest = decoded.guest_exec.expect("guest payload");
         assert!(guest.kernel_arena.is_none());
         assert!(guest.shared_futex_waiters.is_none());
     }
 
     #[test]
-    fn legacy_v1_payload_without_profile_startup_defaults_to_none() {
+    fn missing_profile_startup_defaults_to_none() {
         let payload = sample();
         let mut value = serde_json::to_value(payload).expect("serialize capsule");
         value
@@ -1762,14 +1762,14 @@ mod tests {
             .expect("guest payload")
             .remove("profile_startup");
 
-        let decoded: NativeExecCapsuleV1 =
-            serde_json::from_value(value).expect("decode prior V1 payload");
+        let decoded: NativeExecCapsuleV2 =
+            serde_json::from_value(value).expect("decode profile-startup default");
         let guest = decoded.guest_exec.expect("guest payload");
         assert!(guest.profile_startup.is_none());
     }
 
     #[test]
-    fn legacy_v1_payload_without_profile_exec_epoch_defaults_to_zero() {
+    fn missing_profile_exec_epoch_defaults_to_zero() {
         let payload = sample();
         let mut value = serde_json::to_value(payload).expect("serialize capsule");
         value
@@ -1778,8 +1778,8 @@ mod tests {
             .expect("guest payload")
             .remove("profile_exec_epoch");
 
-        let decoded: NativeExecCapsuleV1 =
-            serde_json::from_value(value).expect("decode prior V1 payload");
+        let decoded: NativeExecCapsuleV2 =
+            serde_json::from_value(value).expect("decode profile-epoch default");
         assert_eq!(
             decoded
                 .guest_exec
@@ -1810,9 +1810,9 @@ mod tests {
 
     #[test]
     fn pid_probe_capsule_remains_valid_without_guest_mount_state() {
-        let payload = NativeExecCapsuleV1 {
+        let payload = NativeExecCapsuleV2 {
             producer_pid: 42,
-            purpose: NativeExecCapsulePurposeV1::PidProbe,
+            purpose: NativeExecCapsulePurposeV2::PidProbe,
             host_executable_path: b"/bin/probe".to_vec(),
             argv: Vec::new(),
             env: Vec::new(),
@@ -2358,7 +2358,7 @@ mod tests {
         let file = tempfile::tempfile().expect("temporary capsule");
         let nonce = [0x5a; 16];
         write_capsule(file.as_raw_fd(), nonce, &sample()).expect("write capsule");
-        file.write_at(&2_u16.to_le_bytes(), 8)
+        file.write_at(&1_u16.to_le_bytes(), 8)
             .expect("replace version");
         assert!(read_capsule_once(file.as_raw_fd(), nonce).is_err());
 
@@ -2393,7 +2393,8 @@ mod tests {
         use carrick_dsr_aarch64::types::{CodeGeneration, InstAction};
         use carrick_guest_mem::GuestVa;
         use carrick_native_darwin::live_arena::{
-            DarwinLiveArena, DarwinLiveLookup, LiveArenaProcessView, RegisteredPortExecPlan,
+            DarwinLiveArena, DarwinLiveLookup, DarwinLiveReadyLookup, LiveArenaProcessView,
+            RegisteredPortExecPlan,
         };
         use mach2::kern_return::KERN_SUCCESS;
         use mach2::mach_port::{
@@ -2412,7 +2413,7 @@ mod tests {
         use std::sync::Arc;
 
         use crate::native_exec_capsule::{
-            NativeReexecLiveArenaV1, NativeReexecXsigV1, encode_nonce,
+            NativeReexecLiveArenaV2, NativeReexecXsigV1, encode_nonce,
         };
 
         const CHILD_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_CHILD";
@@ -2567,16 +2568,10 @@ mod tests {
         }
 
         fn arena() -> DarwinLiveArena {
-            let page = unsafe { mach2::vm_page_size::vm_page_size };
-            DarwinLiveArena::new(LiveArenaCapacities::new(
-                page as u64,
-                page as u64,
-                page as u64,
-            ))
-            .expect("live arena")
+            DarwinLiveArena::new(LiveArenaCapacities::V2).expect("live arena")
         }
 
-        fn bind_real_xsig(payload: &mut NativeExecCapsuleV1, file: &std::fs::File) {
+        fn bind_real_xsig(payload: &mut NativeExecCapsuleV2, file: &std::fs::File) {
             let fd = file.as_raw_fd();
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
             assert!(flags >= 0);
@@ -2950,16 +2945,15 @@ mod tests {
             let generations = PageGenerationTable::new(16 * 1024)?;
             let view = LiveArenaProcessView::new(Arc::clone(&arena), generations.domain())?;
             let generation = generations.observe(GuestVa(0x4000_0000))?;
-            let ready =
-                match view.lookup(&live_key(), GuestVa(0x4000_0000), unsafe { libc::getpid() }) {
-                    DarwinLiveLookup::Ready(ready) => ready,
-                    DarwinLiveLookup::Publish(_) => {
-                        anyhow::bail!("successor did not observe creator READY record")
-                    }
-                    DarwinLiveLookup::Private(reason) => {
-                        anyhow::bail!("successor READY lookup went private: {reason:?}")
-                    }
-                };
+            let ready = match view.acquire_ready_or_miss(&live_key(), GuestVa(0x4000_0000)) {
+                DarwinLiveReadyLookup::Ready(ready) => ready,
+                DarwinLiveReadyLookup::Miss => {
+                    anyhow::bail!("successor did not observe creator READY record")
+                }
+                DarwinLiveReadyLookup::Private(reason) => {
+                    anyhow::bail!("successor READY lookup went private: {reason:?}")
+                }
+            };
             let executable = view
                 .acquire(ready, &generation)
                 .map_err(|reason| anyhow::anyhow!("successor acquire failed: {reason:?}"))?;
@@ -2999,20 +2993,25 @@ mod tests {
             let generations = PageGenerationTable::new(16 * 1024)?;
             let view = LiveArenaProcessView::new(Arc::clone(&arena), generations.domain())?;
             let generation = generations.observe(GuestVa(0x4000_0000))?;
-            let handle =
-                match view.lookup(&live_key(), GuestVa(0x4000_0000), unsafe { libc::getpid() }) {
-                    DarwinLiveLookup::Publish(claim) => claim
-                        .reserve(prepared_publication(), &generation)
-                        .map_err(|reason| anyhow::anyhow!("owner reserve failed: {reason:?}"))?
-                        .publish()
-                        .map_err(|reason| anyhow::anyhow!("owner publish failed: {reason:?}"))?,
-                    DarwinLiveLookup::Ready(_) => {
-                        anyhow::bail!("fresh owner arena unexpectedly READY")
-                    }
-                    DarwinLiveLookup::Private(reason) => {
-                        anyhow::bail!("owner lookup went private: {reason:?}")
-                    }
-                };
+            let handle = match view.claim_eligible(
+                &live_key(),
+                GuestVa(0x4000_0000),
+                GuestVa(0x4000_000c),
+                &generation,
+                unsafe { libc::getpid() },
+            ) {
+                DarwinLiveLookup::Publish(claim) => claim
+                    .reserve(prepared_publication())
+                    .map_err(|reason| anyhow::anyhow!("owner reserve failed: {reason:?}"))?
+                    .publish()
+                    .map_err(|reason| anyhow::anyhow!("owner publish failed: {reason:?}"))?,
+                DarwinLiveLookup::Ready(_) => {
+                    anyhow::bail!("fresh owner arena unexpectedly READY")
+                }
+                DarwinLiveLookup::Private(reason) => {
+                    anyhow::bail!("owner lookup went private: {reason:?}")
+                }
+            };
             write_byte(receipt_fd, OWNER_READY_RECEIPT)?;
             write_exact(
                 receipt_fd,
@@ -3043,7 +3042,7 @@ mod tests {
             payload.producer_pid = unsafe { libc::getpid() as u32 };
             payload.host_executable_path = executable.as_os_str().as_bytes().to_vec();
             let guest = payload.guest_exec.as_mut().expect("guest payload");
-            guest.live_arena = Some(arena.transit_v1().into());
+            guest.live_arena = Some(arena.transit_v2().into());
             guest.xsig = crate::native_exec_capsule::snapshot_xsig()?;
             let nonce = [0x9d; 16];
             exec_capsule_with(
@@ -3137,7 +3136,7 @@ mod tests {
                 .as_bytes()
                 .to_vec();
             payload.guest_exec.as_mut().expect("guest").live_arena =
-                Some(NativeReexecLiveArenaV1::from(arena.transit_v1()));
+                Some(NativeReexecLiveArenaV2::from(arena.transit_v2()));
             let xsig = tempfile::tempfile().expect("xsig tempfile");
             xsig.set_len(4096).expect("size xsig");
             bind_real_xsig(&mut payload, &xsig);
@@ -3154,7 +3153,7 @@ mod tests {
         #[test]
         fn resume_rejects_missing_swapped_or_extra_arena_rights() {
             let _serial = test_lock();
-            let expected = arena().transit_v1();
+            let expected = arena().transit_v2();
             assert!(DarwinLiveArena::adopt_registered(expected).is_err());
 
             let preserved = TestPort::new();

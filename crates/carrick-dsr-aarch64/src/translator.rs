@@ -1115,7 +1115,7 @@ struct LiveArenaSizingCensus {
 
 impl LiveArenaSizingCensus {
     fn new(host_page_size: u64) -> Result<Self, types::DsrError> {
-        if host_page_size != crate::live_arena::LIVE_ARENA_PAGE_BYTES {
+        if host_page_size != crate::live_arena::LIVE_SOURCE_PAGE_BYTES {
             return Err(types::DsrError::CachePolicy(format!(
                 "live sizing host page size must match the 16 KiB arena protocol, got {host_page_size}"
             )));
