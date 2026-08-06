@@ -373,20 +373,40 @@ runtime candidate is removed; the design and negative evidence remain.
 
 ## Observability and Debugging
 
-NATIVEPERF gains exact per-process counters:
+NATIVEPERF gains exact per-process counters.
 
-- `live_arena_ready_hits`
-- `live_arena_publish_wins`
-- `live_arena_publish_losses`
-- `live_arena_private_fallbacks`
-- `live_arena_building_fallbacks`
-- `live_arena_validation_refusals`
-- `live_arena_code_bytes`
-- `live_arena_metadata_bytes`
-- `live_arena_shared_direct_links`
-- `live_arena_gateway_links`
-- `live_arena_revoked_chunks`
-- `live_arena_stale_instruction_aborts`
+**2026-08-06 — RECONCILED WITH THE LANDED NAMES.** None of the
+`live_arena_*` names below exist in code: Task 6F (`028d3508`) built this
+surface first and its names are the ones in `ResolverStats` /
+`ProfileSnapshot` / the NATIVEPERF frames, so they win under the
+no-two-answers rule. This list is kept as the DESIGN INTENT with each entry
+mapped to what shipped; do not reintroduce a `live_arena_*` spelling.
+
+| Design name | Landed name (frame) | Status |
+|---|---|---|
+| `live_arena_ready_hits` | `live_ready_hits`, plus `live_index_hits` for a repeat serve out of this process's own index (`live-lane`) | landed, split finer |
+| `live_arena_publish_wins` | `live_publish_wins` (`live-lane`) | landed |
+| `live_arena_publish_losses` | `live_publish_adoptions` (race lost, still served) + `live_fallbacks[arena_cas_lost]` (race lost, fell back) | landed, split finer |
+| `live_arena_private_fallbacks` | `live_fallbacks[17]`, summed (`live-fallback-a/b/c`) | landed, expanded to 17 named classes |
+| `live_arena_building_fallbacks` | `live_fallbacks[arena_building]` | landed |
+| `live_arena_validation_refusals` | `live_fallbacks[{arena_invalid_record, arena_unknown_state, unresolved_entry}]` | landed |
+| `live_arena_code_bytes` | `live_code_bytes` (`live-bytes`) | landed |
+| `live_arena_metadata_bytes` | `live_hot_bytes` + `live_cold_bytes` (`live-bytes`) | landed, split by stream |
+| `live_arena_shared_direct_links` | — | **UNBUILT — see below** |
+| `live_arena_gateway_links` | `live_links_out_of_reach` (`live-bytes`) | landed |
+| `live_arena_revoked_chunks` | `live_revoked_chunks` (`live-revoke`) | landed in Task 8 |
+| `live_arena_stale_instruction_aborts` | `live_stale_instruction_aborts` (`live-revoke`) | landed in Task 8 |
+
+`live_arena_shared_direct_links` — a link bound between two SHARED blocks —
+**has no producer and therefore no counter.** Its only source is
+`DarwinLiveReservedPublication::prebind`, which the 6E seam left uncalled, so
+the counter would read zero on every path forever and teach a reader that
+shared-to-shared linking was measured and found absent when it was never
+attempted. What IS counted is the private→live link traffic that exists:
+`live_links_patched` and `live_links_out_of_reach`. The gap is tracked as 6F
+seam 1 (`.superpowers/sdd/2026-08-05-native-live-translation-arena-task6/task-6f-report.md`
+§6.1) and restated in Task 8's report §1a; when the prebind call site lands,
+its counter belongs beside those two.
 
 The export surface is read-only. `carrick_lldb.py` prints arena headers,
 process-local RX/RW ranges, READY records, revoked chunks, and the translated
