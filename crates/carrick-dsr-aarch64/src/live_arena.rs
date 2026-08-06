@@ -8,7 +8,7 @@ use crate::emit::{ExpectedLivePublication, PreparedSharedInitial};
 use crate::shared_cache::{TRANSLATOR_ABI_CURRENT, TranslationUnitKey};
 use carrick_dsr::cache::{PageGenerationDomain, PageGenerationObservation};
 use carrick_dsr::ids::CodeGeneration;
-use carrick_guest_mem::GuestVa;
+use carrick_guest_mem::{GuestVa, HostVa};
 use sha2::{Digest, Sha256};
 use std::cell::UnsafeCell;
 use std::fmt;
@@ -2409,6 +2409,102 @@ struct LiveRecordSnapshot {
     extents: LiveBlockExtents,
     entry_offset: u32,
     code_sha256: [u8; 32],
+}
+
+/// Owned, process-local authority over ONE installed live block.
+///
+/// Retaining it retains the mappings the block executes from. It exposes the
+/// process-local RX entry, the block's descriptor-authoritative ownership, and
+/// its exact immutable mapped COLD stream — never a claim, a mutable
+/// capability, or the shared record itself. The translator holds this behind a
+/// trait object so the portable layer never names a host mapping type.
+///
+/// Target authority over the RX payload (gateway entry, indirect publication)
+/// is deliberately NOT here: Task 6E owns it.
+pub trait LiveBlockAuthority: Send + Sync {
+    /// Process-local RX entry address of the installed block.
+    fn entry(&self) -> HostVa;
+
+    /// Exact published code length in bytes.
+    fn code_len(&self) -> usize;
+
+    fn guest_start(&self) -> GuestVa;
+
+    fn source_page(&self) -> GuestVa;
+
+    /// The ACTIVE source group that owns this block's chunk.
+    fn group_slot(&self) -> u32;
+
+    /// The ACTIVE chunk containing this block's code.
+    fn chunk_index(&self) -> u32;
+
+    /// The block's exact immutable mapped COLD extent, resolved ON DEMAND.
+    ///
+    /// The READY consumer deliberately leaves COLD unresolved, so a block that
+    /// never faults never touches its metadata pages. Fault reconstruction is
+    /// the only caller.
+    fn cold_metadata(&self) -> Result<&[u8], LivePrivateReason>;
+}
+
+/// Outcome of the read-only exact READY consultation performed at the top of
+/// an authoritative INITIAL miss.
+///
+/// A `Ready` hit is already validated (mapped code hash, exact HOT shape,
+/// current generation, W^X) and locally I-cache-invalidated by the consumer.
+pub enum LiveReadyOutcome {
+    Installed(Box<dyn LiveBlockAuthority>),
+    /// No record exists for this exact key; the caller owns the miss path.
+    Miss,
+    /// A named immediate fallback to the private translator.
+    Private(LivePrivateReason),
+}
+
+/// Outcome of the unique-winner publication path.
+pub enum LivePublishOutcome {
+    Installed(Box<dyn LiveBlockAuthority>),
+    /// A named immediate fallback to the private translator. BUILDING, FAILED,
+    /// a lost block CAS, corruption, and capacity all arrive here.
+    Private(LivePrivateReason),
+    /// The unique winner's own preparation refused; its BUILDING record has
+    /// already been failed by dropping the claim.
+    PrepareRefused(crate::types::DsrError),
+}
+
+/// One process's authority over the live translation arena.
+///
+/// The portable translator consults this seam; the Darwin process view
+/// implements it. Every method is read-mostly with respect to the caller: none
+/// of them may touch the caller's private translation cache or its mutable
+/// link indexes.
+pub trait LiveTranslationAuthority: Send + Sync {
+    /// The read-only exact READY lookup. It never claims an EMPTY block,
+    /// creates a source group, or allocates a chunk.
+    fn acquire_ready(
+        &self,
+        key: &TranslationUnitKey,
+        guest_start: GuestVa,
+        generation: &PageGenerationObservation,
+    ) -> LiveReadyOutcome;
+
+    /// The B3 `claim_eligible` winner path: first generation check, group
+    /// resolution, second generation check, block CAS. `prepare` is invoked
+    /// only by the unique block winner, exactly once, and its output is
+    /// published through the Task 6B transaction and installed through the
+    /// SAME READY consumer as [`Self::acquire_ready`].
+    fn publish_winner(
+        &self,
+        key: &TranslationUnitKey,
+        guest_start: GuestVa,
+        block_end: GuestVa,
+        generation: &PageGenerationObservation,
+        owner_pid: i32,
+        prepare: &mut dyn FnMut() -> Result<PreparedSharedInitial, crate::types::DsrError>,
+    ) -> LivePublishOutcome;
+
+    /// Descriptor-authoritative chunk enumeration for one 16 KiB source page.
+    /// Group hash placement is deliberately not the authority for this reverse
+    /// lookup; ACTIVE descriptors are.
+    fn active_chunks_for_source_page(&self, source_page: GuestVa) -> Vec<LiveOwnedChunkIdentity>;
 }
 
 fn initial_slot(unit_key_digest: &[u8; 32], guest_start: u64) -> usize {
