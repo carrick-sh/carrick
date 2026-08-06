@@ -1414,42 +1414,48 @@ enum NativeLiveArenaEntry {
     Resume { transported: bool },
 }
 
-/// The exact, honest reason the compiler policy is still refused here.
+/// A capsule delivered an arena to a process whose policy says none exists.
+/// Producer and consumer disagree about the process's shape, so the resume
+/// fails closed rather than dropping a live arena on the floor.
+const LIVE_ARENA_TRANSPORTED_WITHOUT_POLICY: &str =
+    "native host self-exec transported a live arena without CARRICK_DSR_LIVE_ARENA=compiler";
+
+/// The inverse disagreement. Under `compiler` EVERY guest process owns an
+/// arena — created at launch, adopted on resume — so a producer that reached
+/// `execve` carrying none lost the process's live translations instead of
+/// merely skipping an optimization.
+const LIVE_ARENA_RESUMED_WITHOUT_TRANSPORT: &str = "CARRICK_DSR_LIVE_ARENA=compiler resumed a native host self-exec with no transported live arena; the exec producer must carry its arena's two inherited descriptors in the capsule";
+
+/// Whether this process may enter the native runtime under `policy`, given how
+/// it came by an arena.
 ///
-/// Task 6C2 measured that the arena's ORIGINAL Mach transport does not survive
-/// `fork(2)`: a forked guest child held the arena's mappings but neither its
-/// send rights nor the registered slots, so every forked-then-exec'd guest
-/// process failed its `execve` with EIO. That transport is now retired. Tasks
-/// 6T1/6T2 replaced it with inherited descriptors, and
+/// The matrix is total, and its only refusals are the two shapes where the
+/// policy and the transport disagree; every agreeing shape enters.
+///
+/// Task 6C2 originally refused EVERY `Compiler` entry here, because the
+/// arena's first transport could not cross `fork(2)`: a forked guest child
+/// held the arena's `VM_INHERIT_SHARE` mappings but neither the Mach send
+/// rights nor the task-registered slots that carried them, so every
+/// forked-then-exec'd guest process failed its `execve` with EIO. That
+/// transport is retired. Tasks 6T1/6T2 rebuilt it on inherited descriptors —
+/// the fds ARE the capability, and `fork(2)` duplicates them — and
 /// `carrick-native-darwin`'s
 /// `a_fork_child_inherits_arena_mappings_and_its_fd_transport` plus this
 /// crate's `forked_child_exec_successor_acquires_creator_ready_record_and_bytes`
-/// prove the crossing end to end.
-///
-/// What is NOT yet landed is this entry point: the reopened Task 6C2 slice
-/// replaces the refusal below with the real create/adopt calls and owns the
-/// signed three-arm smoke that must show a policy-on run behaviorally
-/// identical to an arena-absent one. Until that lands the gate stays
-/// fail-closed, because a half-wired entry is exactly the shape that regressed
-/// the guest last time.
-const LIVE_ARENA_COMPILER_BLOCKED: &str = "CARRICK_DSR_LIVE_ARENA=compiler cannot be enabled yet: the retired Mach transport does not survive fork(2) (Task 6C2), and while the fd-backed replacement now crosses that boundary (Tasks 6T1/6T2), wiring it into this runtime entry is the reopened Task 6C2 slice and has not landed. Use CARRICK_DSR_LIVE_ARENA=0 with CARRICK_DSR_LIVE_ARENA_SIZING_DIR for census-only sizing";
-
+/// prove the crossing end to end, which is what lets this gate open.
 fn require_live_arena_runtime_ready(
     policy: carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy,
     entry: NativeLiveArenaEntry,
 ) -> Result<(), RuntimeError> {
     use carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy as Policy;
     match (policy, entry) {
-        (Policy::Disabled, NativeLiveArenaEntry::Resume { transported: true }) => {
-            Err(RuntimeError::Unsupported(
-                "native host self-exec transported a live arena without CARRICK_DSR_LIVE_ARENA=compiler"
-                    .to_string(),
-            ))
-        }
-        (Policy::Disabled, _) => Ok(()),
-        (Policy::Compiler, _) => Err(RuntimeError::Unsupported(
-            LIVE_ARENA_COMPILER_BLOCKED.to_string(),
-        )),
+        (Policy::Disabled, NativeLiveArenaEntry::Resume { transported: true }) => Err(
+            RuntimeError::Unsupported(LIVE_ARENA_TRANSPORTED_WITHOUT_POLICY.to_string()),
+        ),
+        (Policy::Compiler, NativeLiveArenaEntry::Resume { transported: false }) => Err(
+            RuntimeError::Unsupported(LIVE_ARENA_RESUMED_WITHOUT_TRANSPORT.to_string()),
+        ),
+        (Policy::Disabled, _) | (Policy::Compiler, _) => Ok(()),
     }
 }
 
@@ -1483,8 +1489,10 @@ fn create_owned_live_arena(
 /// Adopt the arena a host self-exec transported, into the resumed process's
 /// single owner.
 ///
-/// Pairing only: the caller runs [`require_live_arena_runtime_ready`] first, so
-/// this is where policy and capsule metadata must agree, not a second gate.
+/// The caller runs [`require_live_arena_runtime_ready`] first, which already
+/// refused both disagreement shapes; the same two arms here keep the
+/// constructor total and fail-closed on its own terms, over the real
+/// `Option<DarwinLiveArena>` rather than the entry's boolean summary of it.
 fn adopt_owned_live_arena(
     policy: carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy,
     transported: Option<carrick_native_darwin::live_arena::DarwinLiveArena>,
@@ -1493,13 +1501,11 @@ fn adopt_owned_live_arena(
     match (policy, transported) {
         (Policy::Disabled, None) => Ok(None),
         (Policy::Disabled, Some(_)) => Err(RuntimeError::Unsupported(
-            "native host self-exec transported a live arena without CARRICK_DSR_LIVE_ARENA=compiler"
-                .to_string(),
+            LIVE_ARENA_TRANSPORTED_WITHOUT_POLICY.to_string(),
         )),
         (Policy::Compiler, Some(arena)) => Ok(Some(Arc::new(arena))),
         (Policy::Compiler, None) => Err(RuntimeError::Unsupported(
-            "CARRICK_DSR_LIVE_ARENA=compiler resumed a native host self-exec with no transported live arena; the exec producer must carry its arena's two inherited descriptors in the capsule"
-                .to_string(),
+            LIVE_ARENA_RESUMED_WITHOUT_TRANSPORT.to_string(),
         )),
     }
 }
@@ -2534,9 +2540,11 @@ fn run_image_in_child(
         // The ONE creation point for this guest process's live translation
         // arena, before the tier split so BOTH tiers retain the same owner.
         // The parent (the launching CLI) never touches it: the arena belongs to
-        // the guest process, which is this child. Its Mach aliases are mapped
-        // `VM_INHERIT_SHARE`, so a later guest `fork(2)` child sees the same
-        // objects at the same addresses without any post-fork repair.
+        // the guest process, which is this child. Both aliases are `MAP_SHARED`
+        // over the backing descriptors, so a later guest `fork(2)` child sees
+        // the same objects at the same addresses AND inherits the two fds that
+        // carry them onward through its own host self-exec — no post-fork
+        // repair, and no capability the child lacks.
         let live_arena = match create_owned_live_arena(live_policy) {
             Ok(live_arena) => live_arena,
             Err(err) => {
@@ -8281,51 +8289,37 @@ mod tests {
         );
     }
 
-    /// The readiness gate's exact truth table.
+    /// The readiness gate's exact truth table, over the whole 2x3 matrix.
     ///
-    /// Every `Compiler` entry is refused while the arena's Mach transport
-    /// cannot cross `fork(2)` — see [`LIVE_ARENA_COMPILER_BLOCKED`]. The gate
-    /// is what keeps a policy-on run behaviorally identical to an arena-absent
-    /// one instead of failing every forked-then-exec'd guest process with EIO.
+    /// Four shapes enter — including every `Compiler` shape whose transport
+    /// agrees with its policy, which is what the fd substrate opened. The two
+    /// that do not are the disagreements, in both directions: an arena
+    /// arriving with the policy off, and a `compiler` resume that carried
+    /// none.
     #[test]
     fn live_arena_entry_authority_matrix_is_exact() {
         use carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy as Policy;
         use std::cell::Cell;
 
         let entered = Cell::new(0_u32);
-        for entry in [
-            NativeLiveArenaEntry::Launch,
-            NativeLiveArenaEntry::Resume { transported: false },
+        for (policy, entry) in [
+            (Policy::Disabled, NativeLiveArenaEntry::Launch),
+            (
+                Policy::Disabled,
+                NativeLiveArenaEntry::Resume { transported: false },
+            ),
+            (Policy::Compiler, NativeLiveArenaEntry::Launch),
+            (
+                Policy::Compiler,
+                NativeLiveArenaEntry::Resume { transported: true },
+            ),
         ] {
             let before = entered.get();
-            enter_native_process_with_live_policy(Policy::Disabled, entry, || {
-                entered.set(entered.get() + 1)
-            })
-            .unwrap_or_else(|error| panic!("the default path must enter: {entry:?}: {error}"));
-            assert_eq!(entered.get(), before + 1, "{entry:?} must enter");
+            enter_native_process_with_live_policy(policy, entry, || entered.set(entered.get() + 1))
+                .unwrap_or_else(|error| panic!("{policy:?}/{entry:?} must enter: {error}"));
+            assert_eq!(entered.get(), before + 1, "{policy:?}/{entry:?} must enter");
         }
-
-        for entry in [
-            NativeLiveArenaEntry::Launch,
-            NativeLiveArenaEntry::Resume { transported: true },
-            NativeLiveArenaEntry::Resume { transported: false },
-        ] {
-            let blocked = enter_native_process_with_live_policy(Policy::Compiler, entry, || {
-                entered.set(entered.get() + 1)
-            })
-            .expect_err("the compiler policy is not runnable yet");
-            let message = blocked.to_string();
-            assert!(
-                message.contains("does not survive fork(2)"),
-                "the refusal must name the real blocker: {message}"
-            );
-            assert!(message.contains("CARRICK_DSR_LIVE_ARENA=0"), "{message}");
-            assert!(
-                message.contains("CARRICK_DSR_LIVE_ARENA_SIZING_DIR"),
-                "{message}"
-            );
-        }
-        assert_eq!(entered.get(), 2, "the guard must suppress process entry");
+        assert_eq!(entered.get(), 4, "every agreeing shape enters exactly once");
 
         let unexpected = enter_native_process_with_live_policy(
             Policy::Disabled,
@@ -8333,12 +8327,30 @@ mod tests {
             || entered.set(entered.get() + 1),
         )
         .expect_err("an arena arriving with the policy off must fail closed");
-        assert_eq!(entered.get(), 2, "the guard must suppress process entry");
         assert!(
             unexpected
                 .to_string()
-                .contains("without CARRICK_DSR_LIVE_ARENA=compiler"),
-            "{unexpected}"
+                .contains(LIVE_ARENA_TRANSPORTED_WITHOUT_POLICY),
+            "the refusal must name the disagreement: {unexpected}"
+        );
+
+        let missing = enter_native_process_with_live_policy(
+            Policy::Compiler,
+            NativeLiveArenaEntry::Resume { transported: false },
+            || entered.set(entered.get() + 1),
+        )
+        .expect_err("a compiler resume that carried no arena must fail closed");
+        assert!(
+            missing
+                .to_string()
+                .contains(LIVE_ARENA_RESUMED_WITHOUT_TRANSPORT),
+            "the refusal must name the missing transport: {missing}"
+        );
+
+        assert_eq!(
+            entered.get(),
+            4,
+            "a refused shape must not have entered the process"
         );
     }
 
@@ -8565,58 +8577,73 @@ mod tests {
         }
     }
 
-    /// Every real native process entry refuses the compiler policy before any
-    /// guest behavior, and names the fork-transport blocker when it does.
+    /// Both real native LAUNCH entries now admit the compiler policy — each
+    /// runs past the readiness gate and fails only for its own reason (a
+    /// missing executable) — while a real RESUME that carried no arena still
+    /// fails closed with the named transport reason.
+    ///
+    /// This is the entry-level half of opening the gate: the previous truth
+    /// was that all three refused with the fork-transport blocker, and the
+    /// negative assertion below is what would catch a re-closure.
     ///
     /// Runs in an isolated child because `CARRICK_DSR_LIVE_ARENA` is read
     /// through process-wide `OnceLock`s.
     #[test]
-    fn compiler_policy_refuses_every_real_native_entry_with_the_fork_transport_reason() {
+    fn compiler_policy_admits_real_native_launches_and_refuses_an_untransported_resume() {
         const CHILD_ENV: &str = "CARRICK_TEST_COMPILER_ENTRY_GUARDS_CHILD";
-        const TEST_NAME: &str = "native_darwin::tests::compiler_policy_refuses_every_real_native_entry_with_the_fork_transport_reason";
+        const TEST_NAME: &str = "native_darwin::tests::compiler_policy_admits_real_native_launches_and_refuses_an_untransported_resume";
 
         if std::env::var_os(CHILD_ENV).is_some() {
             let plan = native16k_test_plan();
-            let errors = [
-                run_static_elf(
-                    Path::new("/definitely/missing/compiler-static"),
-                    SyscallDispatcher::new(),
-                    std::iter::empty::<String>(),
-                    std::iter::empty::<String>(),
-                    1,
-                    None,
-                    &plan,
-                )
-                .expect_err("compiler policy must precede the missing static path")
-                .to_string(),
-                run_elf_from_dispatcher_debug(
-                    "/definitely/missing/compiler-container",
-                    SyscallDispatcher::new(),
-                    std::iter::empty::<String>(),
-                    std::iter::empty::<String>(),
-                    1,
-                    None,
-                    &plan,
-                )
-                .expect_err("compiler policy must precede dispatcher lookup")
-                .to_string(),
-                resume_guest_from_capsule(
-                    compiler_guard_guest_fixture(),
-                    Vec::new(),
-                    Vec::new(),
-                    None,
-                )
-                .expect_err("compiler policy must precede invalid capsule authority")
-                .to_string(),
-            ];
-            for message in errors {
-                assert!(message.contains("does not survive fork(2)"), "{message}");
-                assert!(message.contains("CARRICK_DSR_LIVE_ARENA=0"), "{message}");
+            let static_launch = run_static_elf(
+                Path::new("/definitely/missing/compiler-static"),
+                SyscallDispatcher::new(),
+                std::iter::empty::<String>(),
+                std::iter::empty::<String>(),
+                1,
+                None,
+                &plan,
+            )
+            .expect_err("the missing static path must still fail")
+            .to_string();
+            let container_launch = run_elf_from_dispatcher_debug(
+                "/definitely/missing/compiler-container",
+                SyscallDispatcher::new(),
+                std::iter::empty::<String>(),
+                std::iter::empty::<String>(),
+                1,
+                None,
+                &plan,
+            )
+            .expect_err("the missing container entrypoint must still fail")
+            .to_string();
+            let untransported_resume = resume_guest_from_capsule(
+                compiler_guard_guest_fixture(),
+                Vec::new(),
+                Vec::new(),
+                None,
+            )
+            .expect_err("a compiler resume with no transported arena must fail closed")
+            .to_string();
+
+            for message in [&static_launch, &container_launch] {
                 assert!(
-                    message.contains("CARRICK_DSR_LIVE_ARENA_SIZING_DIR"),
-                    "{message}"
+                    !message.contains("CARRICK_DSR_LIVE_ARENA"),
+                    "a launch must no longer be refused for the live-arena policy: {message}"
                 );
             }
+            assert!(
+                static_launch.contains("No such file or directory"),
+                "the static launch must reach its own missing-file failure: {static_launch}"
+            );
+            assert!(
+                container_launch.contains("/definitely/missing/compiler-container"),
+                "the container launch must reach its own entrypoint lookup: {container_launch}"
+            );
+            assert!(
+                untransported_resume.contains(LIVE_ARENA_RESUMED_WITHOUT_TRANSPORT),
+                "{untransported_resume}"
+            );
             return;
         }
 
