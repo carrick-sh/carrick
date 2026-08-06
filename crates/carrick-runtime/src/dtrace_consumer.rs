@@ -89,6 +89,10 @@ pub const BUNDLED_GUEST_STACK_D: &str = include_str!("../../../scripts/dtrace/gu
 pub const BUNDLED_DSR_PROFILE_D: &str = include_str!("../../../scripts/dtrace/dsr-profile.d");
 pub const BUNDLED_DSR_INDIRECT_D: &str = include_str!("../../../scripts/dtrace/dsr-indirect.d");
 pub const BUNDLED_DSR_FORK_D: &str = include_str!("../../../scripts/dtrace/dsr-fork.d");
+/// Live-arena outcome profile TEMPLATE. It carries a header PLACEHOLDER the
+/// CLI replaces with an authenticated `program_sha256` printf, so the raw
+/// stream names the exact program that produced it; it is not run as-is.
+pub const BUNDLED_DSR_LIVE_ARENA_D: &str = include_str!("../../../scripts/dtrace/dsr-live-arena.d");
 pub const BUNDLED_NATIVE_WALL_D: &str = include_str!("../../../scripts/dtrace/native-wall.d");
 pub const BUNDLED_NATIVE_SHAPE_D: &str =
     include_str!("../../../scripts/dtrace/native-shape-census.d");

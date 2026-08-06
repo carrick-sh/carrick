@@ -2100,6 +2100,10 @@ fn native_dsr_cache_event_kind(
         Seam::DirectBindingUnitLoaded => Usdt::DirectBindingUnitLoaded,
         Seam::LiveReadyHit => Usdt::LiveReadyHit,
         Seam::LiveWinnerPublish => Usdt::LiveWinnerPublish,
+        Seam::LiveCasLoss => Usdt::LiveCasLoss,
+        Seam::LivePrivateFallback => Usdt::LivePrivateFallback,
+        Seam::LiveValidationRefusal => Usdt::LiveValidationRefusal,
+        Seam::LiveStaleAbortRecovered => Usdt::LiveStaleAbortRecovered,
     }
 }
 
@@ -2388,6 +2392,20 @@ impl carrick_dsr::probes::DsrProbeSink for NativeDsrProbeForwarder {
 
     fn dsr_cache_bounds(&self, base: u64, end: u64) {
         crate::probes::dsr_cache_bounds(base, end);
+    }
+
+    fn dsr_live_chunk_revoked(&self, event: carrick_dsr::probes::DsrLiveChunkRevocation) {
+        // Re-validated on the USDT side rather than transported raw: the
+        // observability type has the same private-field constructor, so a
+        // torn extent cannot cross the seam.
+        let Ok(event) = crate::probes::DsrLiveChunkRevocation::revoked(
+            event.source_page(),
+            event.chunk_index(),
+            event.rx().clone(),
+        ) else {
+            return;
+        };
+        crate::probes::dsr_live_chunk_revoked(event);
     }
 }
 
