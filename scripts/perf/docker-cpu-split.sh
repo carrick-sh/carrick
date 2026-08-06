@@ -15,6 +15,7 @@ N=${1:-5}
 OUT_DIR=target/perf/docker-cpu-split
 OUT_JSONL=$OUT_DIR/docker-cpu-split.jsonl
 mkdir -p "$OUT_DIR"
+: > "$OUT_JSONL"
 
 # Fixtures MUST stay byte-identical to workload-spread.sh so this split can
 # be joined to the spread scoreboard. Assert, don't trust.
@@ -31,6 +32,8 @@ for name in $ORDER; do
     exit 2
   }
 done
+
+! pgrep -f 'carrick run' >/dev/null || { print -u2 "error: carrick guest live during docker-only measurement"; exit 3; }
 
 print -r -- "$(python3 -c "
 import json

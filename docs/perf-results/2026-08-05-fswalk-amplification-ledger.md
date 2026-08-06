@@ -290,9 +290,9 @@ unmeasured.
 Note also that AGENTS.md's claim of "roughly one host call per guest stat"
 is precise only about `fstatat64` (1.015 host stats per guest stat). A guest
 stat costs **2.86 host calls** in total, the remainder being `openat` (3,497),
-`close` (1,853), `fcntl` (1,624) and `flistxattr` (1,564) — the resolution and
-mode-xattr work around the stat, which is where the remaining stat-lane lever
-is.
+`close` (1,853), `fcntl` (1,624) and `flistxattr` (1,564) (the largest four of
+8,811) — the resolution and mode-xattr work around the stat, which is where
+the remaining stat-lane lever is.
 
 ## Next lever
 

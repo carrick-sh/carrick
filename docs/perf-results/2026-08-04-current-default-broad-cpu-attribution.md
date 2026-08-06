@@ -191,3 +191,51 @@ Carry one measurement, not one assumed solution:
 Eager whole-image translation remains explicitly deferred. It may eventually
 amortize a complete eligible image, but incremental augmentation is still
 required for JIT-on-JIT and dynamically generated code.
+
+## 2026-08-05 addendum: accepted Task 12 v5 refresh (supersedes the split above for current-default citations)
+
+**Appended 2026-08-05.** This section records the accepted Task 12 v5 refresh
+of the broad CPU-attribution split, as narrated in `handoff.md` (around line
+327). It supersedes the "Broad result" and "Kernel split" tables above for
+**current-default citation purposes only** — the sections above are left
+unchanged as the historical record of the earlier capture they measured.
+
+**Provenance, carried verbatim from `handoff.md`.** Task 12 finally accepted
+two fresh natural v5 captures at clean `8214c136`, runtime/CLI source
+`6fa105d2`, and frozen signed binary SHA-256
+`74a1c9be5325402bcf8d3c96e85d6551a5c7378dc067671dee2b5f64927418fd`. A/B
+receipts are
+`f33f58965cad00bf60c2bbec8bfbb1a56c09057219852382b09385242fe17349` /
+`1e3a349e72f2087c9db3a4166cca134dcf5bf06b18860035ff59e92b7a91d13c`. Every
+drop, lifecycle, cleanup, contamination, kernel PC/stack, off-CPU duration,
+symbolization, and >=99% coverage gate passed. Regenerated analysis matches
+the wrapper artifact at SHA-256
+`8dadf9dd2c93a19ecf10e71fc29f443c9553ae1a465b8378cdcb45fcc001f02e`; broad
+attribution is
+`6aac67d71e571bf6f5b1eec9fbf8b9c4bfed3a3fa8e1a9275b4d93b618bccc18`.
+
+**Category split (all-CPU share, A / B).**
+
+| category | A share | B share |
+|---|---:|---:|
+| Darwin kernel (total) | 48.0232% | 48.7901% |
+| — named-syscall | 27.7520% | 28.8889% |
+| — non-syscall | 20.2712% | 19.9012% |
+| translated guest | 25.8818% | 25.3278% |
+| Darwin userspace | 10.0290% | 9.9863% |
+| other Carrick | 8.3174% | 8.5377% |
+| translation | 6.0589% | 5.9643% |
+
+Carry no new family: exact host `psynch_cvwait` is 11.1172% / 11.5775%, but it
+is the already-attributed closed lock line; the apparent larger
+`ml_set_interrupts_enabled_with_debug` family is a rejected symbolizer alias,
+profiler/fasttrap and closed lines remain excluded, and every remaining
+specific host syscall is below 6%. These shares do not map whole host-syscall
+populations to guest operations. DTrace remains mechanism evidence only, and
+the official scoreboard remains **10.1776x**.
+
+This section supersedes the older capture recorded above (run ids
+`dsr-20260804T092759.961Z-49650` / `dsr-20260804T093221.530Z-50365`, kernel
+50.6261%/50.8335%, translated guest 22.8261%/22.7193%) for current-default
+citation purposes; the "Broad result" and "Kernel split" sections above are
+left unaltered.
