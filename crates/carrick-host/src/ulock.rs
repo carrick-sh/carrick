@@ -800,16 +800,37 @@ mod imp {
             }
         }
 
+        /// `(st_dev, st_ino)` of an open descriptor, or `None` when the slot is
+        /// closed. Identity — not the descriptor NUMBER — is what survives a
+        /// parallel test harness: the instant a number is freed, any other
+        /// thread of this test binary may be handed the same number for an
+        /// unrelated file.
+        fn fd_identity(fd: i32) -> Option<(libc::dev_t, libc::ino_t)> {
+            let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe { libc::fstat(fd, st.as_mut_ptr()) } != 0 {
+                return None;
+            }
+            let st = unsafe { st.assume_init() };
+            Some((st.st_dev, st.st_ino))
+        }
+
         #[test]
         fn failed_waiter_adoption_closes_the_transport_fd() {
             let source = create_waiter_table().expect("source waiter table");
             let (mut authority, transport) = transport_authority(&source);
+            let handed_over = fd_identity(transport).expect("transport fd is open before adoption");
             authority.size = authority.size.wrapping_add(1);
             assert!(adopt_waiter_table_from_reexec(authority).is_err());
-            assert_eq!(unsafe { libc::fcntl(transport, libc::F_GETFD) }, -1);
-            assert_eq!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::EBADF)
+            // The contract is that the failed adoption RELINQUISHED the waiter
+            // table it was handed. Asserting `EBADF` on the raw number would
+            // also demand that nothing else in the process reopened that slot,
+            // which no caller promises and a concurrent test can violate; so
+            // assert the property that actually matters: the number no longer
+            // names the transport.
+            assert_ne!(
+                fd_identity(transport),
+                Some(handed_over),
+                "a failed adoption must not leave the transport waiter table open"
             );
         }
     }
