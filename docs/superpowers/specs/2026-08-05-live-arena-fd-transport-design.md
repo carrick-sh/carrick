@@ -27,9 +27,10 @@ Every hard constraint is satisfied with no trade-off, so per the decision rule
 this design commits rather than reporting BLOCKED:
 
 - **(a) one shared object, zero-copy attach** — same records/cursors/bytes
-  observed cross-process and cross-exec; successor attach measured 8.6–17.6 µs
-  end-to-end, and 10.1–16.6 µs at full V2 geometry (64 MiB code + 68 MiB
-  control), ~60x under the <1 ms campaign gate;
+  observed cross-process and cross-exec; successor attach measured 10.8 µs
+  end-to-end, and 7.8–13.4 µs at full V2 geometry (64 MiB code + 68 MiB
+  control) per the committed receipts; ≥60x headroom under the <1 ms campaign
+  gate held in every observed run of the suite this session;
 - **(b) W^X** — RW alias for the claim-bound writer, RX alias for consumers,
   never W|X; on this backing the kernel itself refuses a simultaneous W|X
   mapping (measured), which is *stronger* than the Mach-entry design;
@@ -46,9 +47,18 @@ this design commits rather than reporting BLOCKED:
 ## Probe receipts
 
 House rule: every Darwin capability claim below was probed on this host before
-being designed against. Probe crate (uncommitted, scratchpad):
+being designed against. **The receipts of record are committed at
+[`docs/perf-results/2026-08-05-fd-transport-probe-receipts.txt`](../../perf-results/2026-08-05-fd-transport-probe-receipts.txt)**
+— one complete run of the final suite; every figure quoted in this document is
+taken from that file exactly. Probe crate (uncommitted, session scratchpad):
 `/private/tmp/claude-501/-Volumes-CaseSensitive-carrick/19d86d41-81ac-493e-9794-a6f874d6e07e/scratchpad/fd-transport-probes/`
-(`src/main.rs`, driver `run-probes.sh`, raw output `receipts.txt`).
+(`src/main.rs`, driver `run-probes.sh`).
+
+Probe numbering follows the design-round brief. The brief's **P3** (the
+regular-file variant of P2) ran as the `P2-file` arm of the dual-map probe —
+one probe body parameterized over backing — so there is no separately numbered
+P3 row; **P6** (the max-protection clamp) is an addition beyond the brief's
+minimum set.
 
 Host: macOS 27.0 (build 26A5388g), Darwin 27.0.0 xnu-13432.0.94.501.4~1
 RELEASE_ARM64_T8132. Probe binary signing state matches the carrick native
@@ -62,9 +72,9 @@ entitlements — a plain `cargo build` product.
 | P2-file | same with a regular `O_RDWR` file (unlinked temp) | **PASS via route B** — direct `mmap(R\|X)` → `EPERM` (the AMFI refusal `aot_cache.rs` recorded), but `mmap(PROT_READ)` + `mprotect(R\|X)` → `cur=r-x max=rwx`; executes 42 in-child and in-process |
 | P2-file coherence | write through RW alias → RX alias, `sys_icache_invalidate` on RX | **PASS** — append to an already-executed page → 43; overwrite executed code → 44; no remap needed |
 | P2-file revocation | `mprotect(PROT_NONE)` the RX alias page, then restore R\|X | **PASS** — revoked exec faults (SIGBUS, signal 10), restore → 44. Task-7 revoke/restore mechanics work on fd backing |
-| P4-shm | full lifecycle on shm | FAIL at first execution (SIGBUS), consistent with P2-shm; attach itself worked (2.1 µs) |
-| P4-file | full lifecycle: creator writes code → `fork(2)` child clears CLOEXEC → SETEXEC self-exec → successor maps RW+RX from the inherited fd | **PASS end-to-end** (`exit=0`) — attach 8,584 ns; executed creator's pre-fork code (42); observed creator's post-exec control write (GEN 1→2); executed code the creator published *after* the exec (43). Ongoing shared coherence, not a snapshot |
-| P-timing | attach at V2 geometry, 64 MiB code (RW+RX) + 68 MiB control (RW) + 8 KiB validation read, 8 samples | shm 8.2–11.8 µs; file 10.1–16.6 µs. Gate is <1 ms/process |
+| P4-shm | full lifecycle on shm | FAIL at first execution (SIGBUS), consistent with P2-shm; attach itself worked (1,875 ns) |
+| P4-file | full lifecycle: creator writes code → `fork(2)` child clears CLOEXEC → SETEXEC self-exec → successor maps RW+RX from the inherited fd | **PASS end-to-end** (`exit=0`) — attach 10,791 ns; executed creator's pre-fork code (42); observed creator's post-exec control write (GEN 1→2); executed code the creator published *after* the exec (43). Ongoing shared coherence, not a snapshot |
+| P-timing | attach at V2 geometry, 64 MiB code (RW+RX) + 68 MiB control (RW) + 8 KiB validation read, 8 samples | shm 5,500–8,625 ns; file 7,750–13,375 ns. Gate is <1 ms/process |
 | P5 | `mach_make_memory_entry_64(VM_PROT_READ\|EXECUTE)` over an fd-backed RW mapping (local-aliasing fallback) | **FAIL** — `KERN_PROTECTION_FAILURE` (kr=2) for both shm and file. Consistent with the substrate design's prior finding that only `MAP_JIT` backings mint RX-capable entries. Not needed |
 | P6 | `mach_vm_protect(set_maximum)` clamp: RW alias max→`rw-`, RX alias max→`r-x` | **PASS** — regions read back exactly clamped; `mprotect` escalation of either alias refused `EACCES`; exec, revoke, and restore all still work inside the clamped max |
 | P6 honesty | can an *unclamped* mapper reach W\|X? `mprotect(RWX)` on a fresh `max=rwx` file mapping | **refused `EACCES`** — the kernel denies simultaneous W\|X on this backing outright; there is no route to a W\|X mapping of the arena, clamped or not |
@@ -123,10 +133,54 @@ existing two-object split and the exact V2 wire:
   64 MiB code capacity);
 - the arena owner retains both `OwnedFd`s for the process lifetime.
 
+**fd budget:** the arena costs **+2 permanently open host fds in every guest
+process** that holds it (creator, every fork child, every SETEXEC successor).
+That is the same per-subsystem cost `kernel_arena`, `shared_futex_waiters`,
+`xsig`, and `aot_cache` each already pay, and it is charged against the *host*
+process rlimit, not the guest's emulated fd table. Against typical Darwin
+limits (256 default soft `RLIMIT_NOFILE`, `kern.maxfilesperproc` hard
+ceiling — carrick does not raise its own host NOFILE) two fds are noise, but
+they are a real standing cost and belong in any future fd-budget audit
+alongside the existing internal-fd peers.
+
 shm is refuted (P2-shm: EXEC silently stripped, `EACCES` on every escalation
 route). The Mach local-aliasing hybrid (P5) is refuted
 (`KERN_PROTECTION_FAILURE`). MAP_JIT cannot be fd-backed (`EINVAL`). The
 regular file is the only mechanism that passed, and it passed everything.
+
+## Guest fd-space isolation — a requirement, not an implication
+
+**Requirement: the two arena fds are internal host fds. They must never be
+observable, reachable, or manipulable from guest-visible fd space.** A guest
+`close(2)`, `dup2(2)`/`dup3(2)` onto an arbitrary number, fcntl, or a walk of
+`/proc/self/fd` must behave exactly as if the arena fds did not exist — the
+same guarantee the capsule's four existing internal fds already carry.
+
+Enforcement points, named:
+
+- **Guest fd table membership:** the arena fds are never registered in the
+  guest `fd_table`. Guest descriptor operations resolve through carrick's
+  guest-fd translation, which only reaches host fds the table names, so guest
+  close/dup/fcntl/`/proc/self/fd` cannot address them. This is the mechanism —
+  identical for `kernel_arena`, `shared_futex_waiters`, `artifact_spike`,
+  `aot_cache`, and `xsig` — not a convention.
+- **Steady state is `FD_CLOEXEC` set:** the backing fds are created/held
+  CLOEXEC (adoption re-owns via `F_DUPFD_CLOEXEC`, the `kernel_arena`
+  precedent), so any exec that is *not* the deliberate capsule transit leaks
+  nothing.
+- **The only CLOEXEC clear is the capsule transit:** `exec_capsule_with`'s
+  `HostFdFlagTransaction` (`native_exec_capsule.rs`, the internal-fd
+  preparation block where the five peers are prepared today) clears CLOEXEC
+  for exactly the spawn window and restores the original flags if the exec
+  returns — guarded by the surviving
+  `failed_setexec_restores_the_prepared_fd_flags` test. The same block is
+  where the capsule *forces* CLOEXEC ON for the guest table's
+  `close_on_exec_host_fds`, which is the precedent boundary this requirement
+  reuses: internal fds cross only the self-exec, guest-table fds obey guest
+  CLOEXEC semantics, and the two sets never mix.
+
+A 6T2 red-first test must pin the membership half (an arena-holding guest
+process's fd table contains no arena fd), not just the flags half.
 
 ## Mapping and aliasing lifecycle
 
@@ -162,6 +216,16 @@ existing `HostFdFlagTransaction` (`prepared_host_fds`) exactly as
 clear `FD_CLOEXEC` for the spawn, restore the original flags if `execve`
 returns. There is no per-child right-minting step at all — the fd *is*
 inherited capability. P4-file proves this crossing end-to-end.
+
+**The transport is conditional on the arena existing.** The two arena fds are
+prepared into the capsule only when the live policy is on AND creation
+succeeded — i.e. exactly when the process holds an `OwnedNativeLiveArena` and
+the capsule payload names a `NativeReexecLiveArenaV2`. The arena-absent
+self-exec path (policy off, or the eventual default-on fallback after a
+creation failure) prepares nothing, serializes nothing, and is byte-for-byte
+the path that ships today; the existing payload/owner consistency check
+(capsule live-arena metadata must match the owner, both-or-neither) extends
+to the fd fields.
 
 **SETEXEC successor (adoption):**
 
@@ -295,9 +359,9 @@ is dissolved by construction, not fixed by discipline; a
   proof did; the BSD-visible signal is SIGBUS here. If the Mach exception
   shape differs in a way the classifier predicates cannot express, Task 7
   must re-derive them on this backing before any gate opening.
-- **Attach-cost growth**: 10–17 µs today includes only an 8 KiB validation
-  read; if adoption validation grows page-touching work, re-measure against
-  the <1 ms gate.
+- **Attach-cost growth**: 7.8–13.4 µs today (committed receipts) includes
+  only an 8 KiB validation read; if adoption validation grows page-touching
+  work, re-measure against the <1 ms gate.
 
 ## Implementation surface (pointer, not a plan)
 

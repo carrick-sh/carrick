@@ -294,18 +294,24 @@ two unlinked regular files (the `kernel_arena` idiom), RW alias plus an RX
 alias built by `mmap(PROT_READ)` + `mprotect(R|X)` with per-alias
 `set_maximum` clamps, transported as inherited fds through the existing
 `HostFdFlagTransaction`. The full fork + SETEXEC lifecycle, dual-alias W^X,
-coherence, revocation, and 8.6–17.6 µs attach are all probe-proven on this
-host.
+coherence, revocation, and a 10.8 µs successor attach (7.8–13.4 µs at full V2
+geometry) are all probe-proven on this host; the receipts of record are
+committed at `docs/perf-results/2026-08-05-fd-transport-probe-receipts.txt`.
 
 **Superseding scope — exactly the transit/adoption mechanics.** In Task 6A's
 historical record and Task 6B2's Darwin authority, every mention of memory
 entries, transit send rights, registered ports, `mach_ports_register`
-vectors, and the three-slot constraint is replaced by fd transport. The V2
-wire, directory, records, cursors, claim/token authority, publisher/consumer
-I-cache rules, B3 geometry and census thresholds, and the 6B2 exec-successor
-*proof obligations* (different-VA adoption, creator READY observation) are
-NOT superseded — they re-run unchanged on the new transport. Tasks 6D, 6E,
-6F, and 7 keep their numbering, scope, and gates.
+vectors, and the three-slot constraint is replaced by fd transport. The same
+applies to the *naming* in preflight corrections 1–2: "the Mach control
+object" reads as "the shared control object" and "the 64-byte Mach object
+header" as "the 64-byte object header" — the substance of both corrections
+(borrowed production views, `align_up(64, host_page)` payload base) is
+unchanged and still binding. The V2 wire, directory, records, cursors,
+claim/token authority, publisher/consumer I-cache rules, B3 geometry and
+census thresholds, and the 6B2 exec-successor *proof obligations*
+(different-VA adoption, creator READY observation) are NOT superseded — they
+re-run unchanged on the new transport. Tasks 6D, 6E, 6F, and 7 keep their
+numbering, scope, and gates.
 
 ### Task 6T1 — substrate swap: fd-backed objects and aliases
 
@@ -352,11 +358,25 @@ guard against the probed silent-EXEC-strip failure shape.
 fstat identity; both self-exec call paths add the two arena fds to
 `prepared_host_fds` instead of installing a `RegisteredPortExecPlan`; resume
 adopts from the inherited fds (validate flags → fstat identity →
-`F_DUPFD_CLOEXEC` → map → V2 validation → close transport fds). Delete
+`F_DUPFD_CLOEXEC` → map → V2 validation → close transport fds). The two
+arena fds enter `prepared_host_fds` **only when the process holds an owned
+arena and the capsule payload names one** (the existing both-or-neither
+payload/owner consistency check extends to the fd fields); the arena-absent
+self-exec path is byte-for-byte unchanged. Delete
 `failed_setexec_leaves_the_registered_port_vector_unchanged` and
 `failed_setexec_releases_the_duplicated_send_rights` with their subject;
 extend the surviving `failed_setexec_restores_the_prepared_fd_flags` to
 cover the two arena fds.
+
+**Resolution of the 6C2 §8(b) keep-as-kernel-evidence note:** that note kept
+`failed_setexec_leaves_the_registered_port_vector_unchanged` as evidence of
+*kernel* behavior for the registered-port vector. This amendment deletes it
+anyway, deliberately: its subject (the registered-port transport) dies with
+no compatibility path, and under the no-backward-compat rule a test whose
+mechanism no longer exists in the tree is exactly the second answer future
+readers must not have to reconcile. The kernel fact it recorded survives in
+the 6C2 report itself, which is the durable home for evidence about a
+retired mechanism.
 
 **Red-first tests:**
 
@@ -366,6 +386,10 @@ cover the two arena fds.
   guest-shaped `fork(2)` child SETEXEC-execs, the successor validates and
   executes the creator's bytes and observes a post-exec creator write
 - `failed_setexec_restores_the_prepared_arena_fd_flags`
+- `arena_fds_never_enter_the_guest_fd_table` — the guest-fd-space isolation
+  requirement's membership half (design doc "Guest fd-space isolation"): an
+  arena-holding guest process's `fd_table` names no arena fd, and the fds'
+  steady state is CLOEXEC outside the capsule transit window
 
 **Gates:** serialized capsule family, `RUST_TEST_THREADS=1 cargo test -p
 carrick-runtime --lib`, clippy, fmt, lint-domains, doc, `just
