@@ -1069,9 +1069,9 @@ impl LiveArenaProcessView {
     }
 
     /// Task 7: revoke every ACTIVE chunk owned for the 16 KiB source pages
-    /// overlapping `range`, unioned with the caller's validated per-page
-    /// `(source_page, chunk_index)` hints, one `mach_vm_protect(PROT_NONE)`
-    /// per deduplicated exact 64 KiB local RX chunk.
+    /// overlapping `range`, unioned with the caller's validated
+    /// `LiveSourceChunkHint`s, one `mach_vm_protect(PROT_NONE)` per
+    /// deduplicated exact 64 KiB local RX chunk.
     ///
     /// The DESCRIPTOR TABLE is the enumeration authority (re-scanned here so a
     /// later cross-process expansion the local hint never saw is still
@@ -1082,7 +1082,7 @@ impl LiveArenaProcessView {
     pub fn revoke_source_range(
         &self,
         range: std::ops::Range<GuestVa>,
-        hint_chunks: &[(u64, u32)],
+        hint_chunks: &[carrick_dsr_aarch64::live_arena::LiveSourceChunkHint],
     ) -> io::Result<Vec<carrick_dsr_aarch64::live_arena::LiveRevokedChunk>> {
         use carrick_dsr_aarch64::live_arena::{
             LIVE_ARENA_CHUNK_BYTES, LIVE_SOURCE_PAGE_BYTES, LiveRevokedChunk,
@@ -1092,13 +1092,13 @@ impl LiveArenaProcessView {
         }
         let control = self.inner.arena.control_view()?;
         // Descriptor-authoritative enumeration first; hints may only add.
-        let mut owned = std::collections::BTreeMap::<u32, u64>::new();
+        let mut owned = std::collections::BTreeMap::<u32, GuestVa>::new();
         let page_mask = LIVE_SOURCE_PAGE_BYTES - 1;
         let mut page = range.start.raw() & !page_mask;
         let last = range.end.raw().saturating_sub(1) & !page_mask;
         loop {
             for identity in control.active_chunks_for_source_page(page) {
-                owned.entry(identity.chunk_index).or_insert(page);
+                owned.entry(identity.chunk_index).or_insert(GuestVa(page));
             }
             if page == last {
                 break;
@@ -1107,8 +1107,8 @@ impl LiveArenaProcessView {
                 invalid_input("live revocation source range overflowed a page step")
             })?;
         }
-        for (hint_page, chunk) in hint_chunks {
-            owned.entry(*chunk).or_insert(*hint_page);
+        for hint in hint_chunks {
+            owned.entry(hint.chunk_index).or_insert(hint.source_page);
         }
         if owned.is_empty() {
             return Ok(Vec::new());
@@ -1490,7 +1490,7 @@ impl LiveTranslationAuthority for LiveArenaProcessView {
     fn revoke_source_range(
         &self,
         range: std::ops::Range<GuestVa>,
-        hint_chunks: &[(u64, u32)],
+        hint_chunks: &[carrick_dsr_aarch64::live_arena::LiveSourceChunkHint],
     ) -> Result<
         Vec<carrick_dsr_aarch64::live_arena::LiveRevokedChunk>,
         carrick_dsr_aarch64::types::DsrError,

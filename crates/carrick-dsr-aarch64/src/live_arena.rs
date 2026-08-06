@@ -767,9 +767,21 @@ pub struct LiveRevokedChunk {
     pub chunk_index: u32,
     /// The 16 KiB guest source page whose mutation revoked this chunk. Fork
     /// children rebuild their catalog per page from this attribution.
-    pub source_page: u64,
+    pub source_page: GuestVa,
     pub rx_start: HostVa,
     pub rx_len: usize,
+}
+
+/// One process-local validated hint for revocation: an ACTIVE chunk this
+/// process installed from, attributed to its 16 KiB source page.
+///
+/// Typed rather than a bare `(u64, u32)` pair: the page is a guest address
+/// and the chunk index is an arena ordinal — two domains that must not blur
+/// at the `LiveTranslationAuthority` boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LiveSourceChunkHint {
+    pub source_page: GuestVa,
+    pub chunk_index: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -2583,8 +2595,8 @@ pub trait LiveTranslationAuthority: Send + Sync {
     fn rx_payload(&self) -> Option<LiveRxPayload>;
 
     /// Revoke every ACTIVE chunk owned by any exact source group whose 16 KiB
-    /// source page overlaps `range`, plus the caller's validated per-page
-    /// `(source_page, chunk_index)` hints (Task 7).
+    /// source page overlaps `range`, plus the caller's validated
+    /// [`LiveSourceChunkHint`]s (Task 7).
     ///
     /// The DESCRIPTOR TABLE is the enumeration authority — the hints are a
     /// process-local accelerator that cannot omit a later cross-process
@@ -2599,7 +2611,7 @@ pub trait LiveTranslationAuthority: Send + Sync {
     fn revoke_source_range(
         &self,
         range: std::ops::Range<GuestVa>,
-        hint_chunks: &[(u64, u32)],
+        hint_chunks: &[LiveSourceChunkHint],
     ) -> Result<Vec<LiveRevokedChunk>, crate::types::DsrError>;
 }
 

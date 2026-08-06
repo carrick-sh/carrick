@@ -4597,7 +4597,10 @@ impl ProcessState {
                 .get(&carrick_guest_mem::GuestVa(page))
             {
                 for chunk in &hint.chunks {
-                    hints.push((page, *chunk));
+                    hints.push(crate::live_arena::LiveSourceChunkHint {
+                        source_page: carrick_guest_mem::GuestVa(page),
+                        chunk_index: *chunk,
+                    });
                 }
             }
             if page == last {
@@ -4623,9 +4626,16 @@ impl ProcessState {
         }
         // The revoked pages' live blocks leave the LOOKUP indexes now, so no
         // pre-bump racing observation can be served a block whose chunk is
-        // PROT_NONE. The ADDRESS index (`live_published_index`/`published`)
-        // deliberately survives: it is the fault-recovery index the stale
-        // classifier maps a revoked cache PC back to a guest PC with.
+        // PROT_NONE. Removal is keyed by block START, which COVERS every
+        // affected live block: B3's CrossPage refusal means a live block
+        // never leaves its own 16 KiB source page, so a block whose start
+        // lies outside the mutated pages has no bytes inside them. (And even
+        // a hypothetical miss would be safe, not stale: its chunk is
+        // PROT_NONE, so any entry faults into the exact classifier and
+        // recovery evicts the block on first fault.) The ADDRESS index
+        // (`live_published_index`/`published`) deliberately survives: it is
+        // the fault-recovery index the stale classifier maps a revoked cache
+        // PC back to a guest PC with.
         let end_exclusive = last.saturating_add(LIVE_SOURCE_PAGE_BYTES);
         let stale: Vec<PublishedBlockKey> = self
             .live_blocks
@@ -4664,24 +4674,31 @@ impl ProcessState {
             // read-only and still exact.
             return Ok(());
         };
-        let mut pages: BTreeMap<u64, Vec<(u64, u32)>> = BTreeMap::new();
+        let mut pages: BTreeMap<
+            carrick_guest_mem::GuestVa,
+            Vec<crate::live_arena::LiveSourceChunkHint>,
+        > = BTreeMap::new();
         for chunk in &self.revoked_live_chunks {
-            pages
-                .entry(chunk.source_page)
-                .or_default()
-                .push((chunk.source_page, chunk.chunk_index));
+            pages.entry(chunk.source_page).or_default().push(
+                crate::live_arena::LiveSourceChunkHint {
+                    source_page: chunk.source_page,
+                    chunk_index: chunk.chunk_index,
+                },
+            );
         }
         let mut rebuilt: Vec<crate::live_arena::LiveRevokedChunk> = Vec::new();
         for (page, hints) in pages {
-            let end = page.checked_add(LIVE_SOURCE_PAGE_BYTES).ok_or_else(|| {
-                types::DsrError::CachePolicy(
-                    "revoked source page overflowed its page end".to_string(),
-                )
-            })?;
-            for chunk in authority.revoke_source_range(
-                carrick_guest_mem::GuestVa(page)..carrick_guest_mem::GuestVa(end),
-                &hints,
-            )? {
+            let end = page
+                .raw()
+                .checked_add(LIVE_SOURCE_PAGE_BYTES)
+                .ok_or_else(|| {
+                    types::DsrError::CachePolicy(
+                        "revoked source page overflowed its page end".to_string(),
+                    )
+                })?;
+            for chunk in
+                authority.revoke_source_range(page..carrick_guest_mem::GuestVa(end), &hints)?
+            {
                 match rebuilt
                     .binary_search_by(|seen| seen.rx_start.raw().cmp(&chunk.rx_start.raw()))
                 {
@@ -8248,8 +8265,11 @@ mod tests {
         }
 
         /// One observed `revoke_source_range` call: the mutated range and
-        /// the caller's `(source_page, chunk_index)` hints.
-        type RecordedRevocation = (std::ops::Range<GuestVa>, Vec<(u64, u32)>);
+        /// the caller's typed hints.
+        type RecordedRevocation = (
+            std::ops::Range<GuestVa>,
+            Vec<crate::live_arena::LiveSourceChunkHint>,
+        );
 
         struct FakeAuthority {
             arena: Arc<FakeLiveArena>,
@@ -8265,8 +8285,9 @@ mod tests {
             /// Scripted revocation outcomes: per 16 KiB source page, the
             /// local RX chunks a revocation of that page protects. Tests set
             /// this to cover the entries they installed.
-            revoke_plan:
-                Mutex<std::collections::BTreeMap<u64, Vec<crate::live_arena::LiveRevokedChunk>>>,
+            revoke_plan: Mutex<
+                std::collections::BTreeMap<GuestVa, Vec<crate::live_arena::LiveRevokedChunk>>,
+            >,
         }
 
         impl FakeAuthority {
@@ -8304,7 +8325,7 @@ mod tests {
                 self.revoke_plan
                     .lock()
                     .expect("revoke plan")
-                    .insert(source_page, chunks);
+                    .insert(GuestVa(source_page), chunks);
             }
 
             fn recorded_revocations(&self) -> Vec<RecordedRevocation> {
@@ -8476,7 +8497,7 @@ mod tests {
             fn revoke_source_range(
                 &self,
                 range: std::ops::Range<GuestVa>,
-                hint_chunks: &[(u64, u32)],
+                hint_chunks: &[crate::live_arena::LiveSourceChunkHint],
             ) -> Result<Vec<crate::live_arena::LiveRevokedChunk>, types::DsrError> {
                 self.revocations
                     .lock()
@@ -8488,7 +8509,7 @@ mod tests {
                 let mut page = range.start.raw() & !(PAGE - 1);
                 let last = range.end.raw().saturating_sub(1) & !(PAGE - 1);
                 while page <= last {
-                    if let Some(chunks) = plan.get(&page) {
+                    if let Some(chunks) = plan.get(&GuestVa(page)) {
                         for chunk in chunks {
                             if !revoked
                                 .iter()
@@ -8544,7 +8565,7 @@ mod tests {
             fn revoke_source_range(
                 &self,
                 _range: std::ops::Range<GuestVa>,
-                _hint_chunks: &[(u64, u32)],
+                _hint_chunks: &[crate::live_arena::LiveSourceChunkHint],
             ) -> Result<Vec<crate::live_arena::LiveRevokedChunk>, types::DsrError> {
                 Ok(Vec::new())
             }
@@ -9600,7 +9621,7 @@ mod tests {
                 let _ = lane;
                 LiveRevokedChunk {
                     chunk_index,
-                    source_page,
+                    source_page: GuestVa(source_page),
                     rx_start: HostVa(covering.host().raw() & !0x3ff),
                     rx_len: 0x400,
                 }
@@ -9643,7 +9664,7 @@ mod tests {
                 );
                 let chunk_two = LiveRevokedChunk {
                     chunk_index: 9,
-                    source_page: page_a,
+                    source_page: GuestVa(page_a),
                     rx_start: HostVa(chunk_one.rx_start.raw() + chunk_one.rx_len),
                     rx_len: chunk_one.rx_len,
                 };
@@ -9674,12 +9695,18 @@ mod tests {
                 // install-time hint recorded the block's own chunk plus the
                 // descriptor enumeration's.
                 assert!(
-                    calls[0].1.iter().any(|(page, _)| *page == page_a),
+                    calls[0]
+                        .1
+                        .iter()
+                        .any(|hint| hint.source_page == GuestVa(page_a)),
                     "hints carry the mutated page: {:?}",
                     calls[0].1
                 );
                 assert!(
-                    calls[0].1.iter().all(|(page, _)| *page == page_a),
+                    calls[0]
+                        .1
+                        .iter()
+                        .all(|hint| hint.source_page == GuestVa(page_a)),
                     "hints must not leak other pages: {:?}",
                     calls[0].1
                 );
