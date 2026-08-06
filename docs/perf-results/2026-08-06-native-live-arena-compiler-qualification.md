@@ -269,3 +269,55 @@ wedges rather than measurements, and no confidence interval computed over that
 is meaningful. The order is: settle §4.3 (does the live arena introduce the
 lock cycle or expose it), fix it, re-qualify with these same gates, and only
 then measure.
+
+---
+
+## 9. ADDENDUM (2026-08-06, post-fix): host contamination — which of this doc's numbers are loaded, and what supersedes them
+
+Discovered after this document was written: **8 orphaned `yes` load
+generators** — leaked by this task's own fd-leak-fix load experiment (§ the
+carrick-host interference sweep), cleanup never ran, reparented to PID 1 —
+saturated 8 cores for **~4h49m**, covering every timed run and wedge
+reproduction above. They were found and killed only after the deadlock-fix
+task's first regression gauntlet was already running.
+
+Contaminated (measured under the leaked load, do not quote):
+
+- **All policy-ON wall times** here (the 379–382 s "healthy" band, the ~24x
+  workload-window attribution in §6, and by extension Task 7's ~38x).
+- **The wedge rates** (3/4 at this tip, 1/3 at Task 7's tip, "4 of 7" in the
+  headline): these are LOADED rates. The only pre-contamination quiet
+  observations are Task 7's 0/3; **the quiet-host wedge rate of the pre-fix
+  binary is UNKNOWN.**
+- The §7 eight-worker `conformance-native smoke` load artifacts (the
+  REGRESSION/TIMEOUT pair that vanished on serialized re-run) — the "load"
+  in that load-coupling included the leak.
+
+Still valid:
+
+- **The deadlock topology and root cause.** The three lldb wedge attaches
+  (§4.3) are structural evidence — load widens race windows, it does not
+  fabricate hold-and-wait cycles. The cycle was root-caused and fixed in
+  `8d5b3a19` (`fix(native): install host aliases under the dispatch memory
+  guard`; abort-semantics follow-up `bcd2062e`).
+- The static gates, the policy-OFF conformance results, and the arena's
+  READY/private sharing counts (§5) — counter ratios, not timings.
+
+Superseded by (deadlock-fix task, fixed binary `00e9e493…24d943`, receipts
+`target/perf/task9/series-{a,b}.log`):
+
+- **Series A (power):** 8/8 policy-ON cold go builds clean under a
+  DELIBERATE 8x `yes` load — the condition reproducing this doc's wedge
+  environment, where the pre-fix binary wedged 3 of 4. Walls 377–414 s.
+- **Series B (first uncontaminated policy-ON numbers):** quiet host,
+  per-run settled preflight receipts. Policy-ON 335–442 s wall (median
+  ~365 s), policy-OFF 9–11 s — **~36x**, single-run-class mechanism
+  evidence. Note the loaded→quiet delta: ON barely moves (~394 s loaded
+  mean vs ~370 s quiet mean, ~6–10%) while OFF halves (20 s loaded → 10 s
+  quiet); the old loaded-vs-loaded ~19–24x reading UNDERSTATED the
+  overhead, and policy-ON's insensitivity to CPU contention is the
+  signature of lock-serialized execution (see the deadlock task report §7,
+  `.superpowers/sdd/2026-08-05-native-live-translation-arena-task6/task-deadlock-report.md`).
+
+Task 10 consequence: the retention ABBA is unblocked by the fix, but its
+baseline expectations must come from Series B, not from any number above.
