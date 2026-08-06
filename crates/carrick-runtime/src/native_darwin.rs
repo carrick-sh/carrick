@@ -1524,6 +1524,35 @@ fn adopt_owned_live_arena(
     }
 }
 
+/// Give this process's DSR translator its live-arena authority.
+///
+/// One `LiveArenaProcessView` per process image: it brands every capability
+/// with a process-private identity plus this process's generation domain, so a
+/// record acquired through it can never be resolved against another mapping.
+/// A guest `fork(2)` child inherits both the view and its mappings by copy —
+/// the arena is a SHARED file mapping at the same addresses — so the child's
+/// installed live blocks and indexes stay coherent without a rebuild; an
+/// `execve` successor re-enters here and installs a fresh view over the arena
+/// it adopted from the inherited fds.
+fn install_live_translation_authority(
+    memory: &NativeMappedMemory,
+    arena: &Arc<carrick_native_darwin::live_arena::DarwinLiveArena>,
+) -> Result<(), RuntimeError> {
+    let translator = memory
+        .dsr_process_translator()
+        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+    let view = carrick_native_darwin::live_arena::LiveArenaProcessView::new(
+        Arc::clone(arena),
+        memory.dsr_generations.domain(),
+    )
+    .map_err(|error| {
+        RuntimeError::Unsupported(format!("live translation arena process view: {error}"))
+    })?;
+    translator
+        .install_live_authority(Arc::new(view))
+        .map_err(|error| RuntimeError::Unsupported(error.to_string()))
+}
+
 fn enter_native_process_with_live_policy(
     policy: carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy,
     entry: NativeLiveArenaEntry,
@@ -2682,6 +2711,13 @@ fn run_image_in_current_process(
             Arc::new(carrick_native_darwin::aot_cache::ActiveContainerUnitStore),
         )
         .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+    // The live lane's ONE wiring point: the process's arena owner (created at
+    // launch, adopted from inherited fds on resume) becomes this process's
+    // translation authority. Without an owner — the policy-off default — the
+    // translator's live paths stay inert and its behavior is unchanged.
+    if let Some(arena) = live_arena.as_ref() {
+        install_live_translation_authority(&memory, arena)?;
+    }
     let memory = Arc::new(NativeMemoryHandle::new(memory));
     let _ = crate::ulock::preinit_waiter_table();
     // PID-namespace launch placement (container path only; `run-elf` never
