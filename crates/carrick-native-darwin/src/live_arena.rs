@@ -1068,68 +1068,6 @@ impl LiveArenaProcessView {
         })
     }
 
-    /// Winner-window direct-link prebinding: for every `DirectLink`
-    /// candidate in the reserved (still-staged, still-BUILDING) publication,
-    /// bind the branch when its target is already an acquirable READY record
-    /// in this same view and within AArch64 branch range. Every refusal —
-    /// absent/BUILDING/FAILED/torn target, regenerated or unobservable
-    /// target page, acquire or prebind rejection — leaves that candidate on
-    /// its gateway stub and is counted; nothing here can fail the
-    /// publication or leave a partial write (the emitter mutates the staged
-    /// slot only after every check passes).
-    ///
-    /// The target capability comes from the SAME `acquire` consumer the
-    /// gateway path uses, so a prebound target has been READY-validated
-    /// (code SHA, HOT shape, INITIAL generation in this domain) and locally
-    /// I-cache-invalidated before its address is encoded. A self-referential
-    /// candidate (the block being published) is BUILDING by definition and
-    /// stays gateway-bound, counted `unbound_by_state`.
-    fn prebind_ready_targets(
-        &self,
-        key: &TranslationUnitKey,
-        reserved: &mut DarwinLiveReservedPublication<'_>,
-        observe_target_page: &mut dyn FnMut(GuestVa) -> Option<PageGenerationObservation>,
-    ) -> LivePrebindTally {
-        let mut tally = LivePrebindTally::default();
-        let candidates: Vec<(usize, GuestVa)> = reserved
-            .prepared
-            .link_candidates()
-            .iter()
-            .enumerate()
-            .map(|(index, candidate)| (index, candidate.target))
-            .collect();
-        for (index, target_va) in candidates {
-            let ready = match self.acquire_ready_or_miss(key, target_va) {
-                DarwinLiveReadyLookup::Ready(ready) => ready,
-                DarwinLiveReadyLookup::Miss | DarwinLiveReadyLookup::Private(_) => {
-                    tally.unbound_by_state += 1;
-                    continue;
-                }
-            };
-            // The caller's observation covers the SOURCE page; a candidate
-            // target may live on any page of the unit, so its own page is
-            // observed through the authoritative table before `acquire`
-            // enforces INITIAL on it.
-            let Some(target_generation) = observe_target_page(target_va) else {
-                tally.unbound_by_state += 1;
-                continue;
-            };
-            let target = match self.acquire(ready, &target_generation) {
-                Ok(target) => target,
-                Err(_) => {
-                    tally.unbound_by_state += 1;
-                    continue;
-                }
-            };
-            match reserved.prebind(index, &target) {
-                Ok(LivePrebindOutcome::Bound) => tally.bound += 1,
-                Ok(LivePrebindOutcome::OutOfRange) => tally.unbound_by_reach += 1,
-                Err(_) => tally.unbound_by_state += 1,
-            }
-        }
-        tally
-    }
-
     /// Task 7: revoke every ACTIVE chunk owned for the 16 KiB source pages
     /// overlapping `range`, unioned with the caller's validated
     /// `LiveSourceChunkHint`s, one `mach_vm_protect(PROT_NONE)` per
@@ -1494,7 +1432,6 @@ impl LiveTranslationAuthority for LiveArenaProcessView {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn publish_winner(
         &self,
         key: &TranslationUnitKey,
@@ -1506,7 +1443,6 @@ impl LiveTranslationAuthority for LiveArenaProcessView {
             PreparedSharedInitial,
             carrick_dsr_aarch64::types::DsrError,
         >,
-        observe_target_page: &mut dyn FnMut(GuestVa) -> Option<PageGenerationObservation>,
     ) -> LivePublishOutcome {
         let claim = match self.claim_eligible(key, guest_start, block_end, generation, owner_pid) {
             DarwinLiveLookup::Publish(claim) => claim,
@@ -1529,11 +1465,19 @@ impl LiveTranslationAuthority for LiveArenaProcessView {
             // process waits on a preparation that will never complete.
             Err(error) => return LivePublishOutcome::PrepareRefused(error),
         };
-        let mut reserved = match claim.reserve(prepared) {
+        let reserved = match claim.reserve(prepared) {
             Ok(reserved) => reserved,
             Err(reason) => return LivePublishOutcome::Private(reason),
         };
-        let prebound = self.prebind_ready_targets(key, &mut reserved, observe_target_page);
+        // The winner-window binding loop that once ran here (bind candidates
+        // whose targets were already READY) is REMOVED as measured-worse:
+        // a ~24% static / ~20% dynamic ceiling with no wall movement, plus
+        // the never-installed-target crash class (any asynchronous signal
+        // inside prebound-target code a consumer never installed was a hard
+        // guest error). See the design doc's "Immutable direct links" note
+        // and the task-prebind report §8–9. The tally vocabulary stays so
+        // the zero reads as a measured answer, not an unmeasured gap.
+        let prebound = LivePrebindTally::default();
         let published = match reserved.publish() {
             Ok(published) => published,
             Err(reason) => return LivePublishOutcome::Private(reason),
@@ -3993,7 +3937,6 @@ mod tests {
                 prepares += 1;
                 Ok(prepared_publication_for_span(&key, start, end))
             },
-            &mut |_| None,
         );
         let LivePublishOutcome::Installed {
             authority: publisher_block,
@@ -4094,7 +4037,6 @@ mod tests {
                         GuestVa(start.raw() + 0xc),
                     ))
                 },
-                &mut |_| None,
             )
             else {
                 panic!("the unique winner must install its own block");
@@ -4151,7 +4093,6 @@ mod tests {
                     GuestVa(before_fork.raw() + 0xc),
                 ))
             },
-            &mut |_| None,
         )
         else {
             panic!("the parent must publish its pre-fork block");
@@ -4210,7 +4151,6 @@ mod tests {
                     after_fork,
                     GuestVa(after_fork.raw() + 0xc)
                 )),
-                &mut |_| None,
             ),
             LivePublishOutcome::Installed { .. }
         ));
@@ -4232,12 +4172,15 @@ mod tests {
         }
     }
 
-    /// The production prebind call site: a winner publication binds a
-    /// candidate whose target is already READY in the same view, and refuses
-    /// — by state, counted, publication unharmed — a candidate whose target
-    /// was never published. The tally arrives on the `Installed` outcome.
+    /// The NEGATIVE result, pinned at the seam (task-prebind report §8–9):
+    /// a winner publication does NOT bind a candidate even when its target
+    /// is already READY in the same view. The binding loop was measured
+    /// worse (~24% static / ~20% dynamic ceiling, no wall movement, plus
+    /// the never-installed-target crash class) and was removed; the kept
+    /// tally vocabulary reads zero, and the published bytes retain the
+    /// emitter's fall-into-stub branch word.
     #[test]
-    fn a_winner_publication_prebinds_ready_targets_and_counts_refusals() {
+    fn a_winner_publication_never_binds_and_reports_a_zero_tally() {
         let arena = Arc::new(protocol_arena());
         let key = live_key();
         let generations = PageGenerationTable::new(page() as u64).expect("generation table");
@@ -4246,10 +4189,9 @@ mod tests {
         let generation = generations
             .observe(GuestVa(0x4000_0000))
             .expect("generation");
-        let mut observe = |pc: GuestVa| generations.observe(pc).ok();
 
-        // The target publishes READY first; a syscall block has no
-        // candidates, so its own tally is exactly zero.
+        // The target publishes READY first — the exact shape the removed
+        // loop used to bind.
         let LivePublishOutcome::Installed { prebound, .. } = view.publish_winner(
             &key,
             GuestVa(0x4000_1000),
@@ -4257,13 +4199,15 @@ mod tests {
             &generation,
             unsafe { libc::getpid() },
             &mut || Ok(prepared_target()),
-            &mut observe,
         ) else {
             panic!("the target winner must install its own block");
         };
         assert_eq!(prebound, LivePrebindTally::default());
 
-        // The source's winner publication finds the READY target and binds.
+        let expected_source = prepared_direct_source();
+        let link = expected_source.link_candidates()[0];
+        let slot = link.slot.get() as usize;
+        let stub_start = link.stub.start.get() as usize;
         let LivePublishOutcome::Installed {
             authority: source,
             prebound,
@@ -4274,47 +4218,34 @@ mod tests {
             &generation,
             unsafe { libc::getpid() },
             &mut || Ok(prepared_direct_source()),
-            &mut observe,
         )
         else {
             panic!("the source winner must install its own block");
         };
         assert_eq!(
             prebound,
-            LivePrebindTally {
-                bound: 1,
-                unbound_by_state: 0,
-                unbound_by_reach: 0,
-            }
+            LivePrebindTally::default(),
+            "no candidate binds; the kept vocabulary reads zero"
         );
-        drop(source);
 
-        // A source whose target was NEVER published refuses by state and
-        // still publishes — the candidate stays on its gateway stub.
-        let absent_start = GuestVa(0x4000_2000);
-        let LivePublishOutcome::Installed { prebound, .. } = view.publish_winner(
-            &key,
-            absent_start,
-            GuestVa(absent_start.raw() + 4),
-            &generation,
-            unsafe { libc::getpid() },
-            &mut || {
-                Ok(prepared_direct_source_to(
-                    absent_start,
-                    GuestVa(0x4000_3000),
-                ))
+        // Byte-level proof the loop is gone: the published slot still holds
+        // the emitter's fall-into-stub branch, not a direct branch to the
+        // READY target.
+        let source_extent = source.extents().code;
+        let source_rx =
+            arena.code_rx.base() + arena.code_payload_base() + source_extent.offset as usize;
+        let published_word = unsafe { std::ptr::read_unaligned((source_rx + slot) as *const u32) };
+        let stub_word = carrick_dsr_aarch64::translator::encode_aarch64_direct_branch(
+            carrick_dsr::cache::LinkSite {
+                source: carrick_dsr_aarch64::types::CacheVa::published(HostVa(source_rx)),
+                slot: link.slot,
             },
-            &mut observe,
-        ) else {
-            panic!("an unbindable candidate must not fail the publication");
-        };
+            carrick_dsr_aarch64::types::CacheVa::published(HostVa(source_rx + stub_start)),
+        )
+        .expect("stub branch encodes");
         assert_eq!(
-            prebound,
-            LivePrebindTally {
-                bound: 0,
-                unbound_by_state: 1,
-                unbound_by_reach: 0,
-            }
+            published_word, stub_word,
+            "the published slot retains the fall-into-stub branch"
         );
     }
 
@@ -4345,7 +4276,6 @@ mod tests {
                 &generation,
                 unsafe { libc::getpid() },
                 &mut || Ok(prepared_publication_for_span(&key, start, end)),
-                &mut |_| None,
             ),
             LivePublishOutcome::Installed { .. }
         ));

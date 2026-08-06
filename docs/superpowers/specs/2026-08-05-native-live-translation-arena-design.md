@@ -307,6 +307,34 @@ first slice, but avoids executable-byte races. A future immutable page-level
 finalization or side-table branch scheme can recover the missed links if
 profiles prove them material; it is not part of this slice.
 
+**2026-08-06 — MEASURED AND REMOVED.** The winner-window binding loop was
+built, measured on the cold go build, and deleted the same day as
+measured-worse (task-prebind report §8–9,
+`.superpowers/sdd/2026-08-05-native-live-translation-arena-task6/task-prebind-report.md`):
+
+- the bind-at-publication ceiling is ~24% of DirectLink candidates static
+  and ~20% of dynamic gateway round trips (1.459e9 → 1.170e9), with NO
+  wall movement (≈43x vs the pre-fix ≈40–49x spread);
+- the residue is FORWARD-dominated: 68.4% of resolve-direct traversals
+  target code translated after their source, 24.8% are same-page
+  back-edges (the self-loop upper bound), 6.8% backward cross-page —
+  measured by the kept `resolve_direct_*` split, so no publication-window
+  binding (READY-target or self) can reach the bulk of it;
+- binding introduced a crash class: a prebound branch carries execution
+  into target code the CONSUMING process never installed, and any
+  asynchronous signal/kick/fault inside that window fails
+  `guest_pc_for_cache` closed into a hard guest error (~1 in 5 policy-ON
+  go builds). Removing the loop removes the only way a thread's PC enters
+  live code its process did not install.
+
+`DarwinLiveReservedPublication::prebind` and its staged-bytes contract
+remain in the tree (unit-tested, uncalled) as the mechanism a future
+page-level finalization would build on; the prebind tally counters remain
+live and read zero-bound — a measured answer, not an unmeasured gap. Any
+revival must first solve never-installed-PC recovery (resolving a live RX
+PC through the shared record table's COLD metadata) before binding a
+single cross-block link.
+
 ### Process-local catalog
 
 After validating a READY record, the consumer constructs process-local
@@ -392,7 +420,7 @@ mapped to what shipped; do not reintroduce a `live_arena_*` spelling.
 | `live_arena_validation_refusals` | `live_fallbacks[{arena_invalid_record, arena_unknown_state, unresolved_entry}]` | landed |
 | `live_arena_code_bytes` | `live_code_bytes` (`live-bytes`) | landed |
 | `live_arena_metadata_bytes` | `live_hot_bytes` + `live_cold_bytes` (`live-bytes`) | landed, split by stream |
-| `live_arena_shared_direct_links` | `live_links_prebound` + refusal split `live_links_prebind_unbound_state` / `live_links_prebind_unbound_reach` (`live-bytes`) | landed with the prebind call site (2026-08-06) |
+| `live_arena_shared_direct_links` | `live_links_prebound` + refusal split `live_links_prebind_unbound_state` / `live_links_prebind_unbound_reach` (`live-bytes`) | counters LIVE, producer REMOVED — reads zero-bound since the binding loop was deleted as measured-worse (2026-08-06, see "Immutable direct links") |
 | `live_arena_gateway_links` | `live_links_out_of_reach` (`live-bytes`) | landed |
 | `live_arena_revoked_chunks` | `live_revoked_chunks` (`live-revoke`) | landed in Task 8 |
 | `live_arena_stale_instruction_aborts` | `live_stale_instruction_aborts` (`live-revoke`) | landed in Task 8 |

@@ -6975,13 +6975,16 @@ mod live_prebind {
         words
     }
 
-    /// The mechanism this task exists to land: a live block published while
-    /// its DIRECT target is already READY branches STRAIGHT into the target's
-    /// arena code — one gateway entry executes source AND target to the
-    /// target's syscall exit, with no `ResolveDirect` round trip — and the
-    /// binding is counted.
+    /// The NEGATIVE result, pinned (task-prebind report §8–9): winner
+    /// publication does NOT bind a direct link even when its target is
+    /// already READY. The binding loop was measured worse — a ~24% static /
+    /// ~20% dynamic ceiling with no wall movement, plus a crash class
+    /// (never-installed live code × any asynchronous signal) — and was
+    /// removed under the delete-measured-worse rule. Every traversal of a
+    /// live direct site is gateway-served, and the prebind counters read
+    /// zero-bound: the honest state.
     #[test]
-    fn a_prebound_link_executes_source_to_target_in_one_gateway_entry() {
+    fn a_ready_target_is_not_bound_at_publication() {
         let _signal_oracle = super::install_signal_handlers_for_oracle();
         let guest_code = GuestVa(0x20_0920_0000);
         let words = branch_words(4096, 16);
@@ -7002,11 +7005,10 @@ mod live_prebind {
         assert!(matches!(exit, ThreadExit::Syscall { .. }));
         assert_eq!(snapshot.x[17], baseline_x17.wrapping_add(1));
 
-        // The SOURCE second: its winner publication finds B READY and binds
-        // the branch into the still-staged bytes. ONE gateway entry then
-        // executes A's branch and B's body to B's syscall exit — a
-        // `ResolveDirect` round trip would surface here as
-        // `ThreadExit::Continue` with the target PC instead.
+        // The SOURCE second, with its target READY the whole time: the
+        // publication must NOT bind. The entry stops at the gateway stub —
+        // a `ResolveDirect` round trip that continues at the target —
+        // rather than running through to the target's syscall exit.
         snapshot.pc = guest_code.raw();
         snapshot.x[17] = baseline_x17;
         let (prepared_a, exit) = run_block(&mut lane, &mut snapshot);
@@ -7015,85 +7017,48 @@ mod live_prebind {
             PublicationAuthority::Live
         );
         assert!(
-            matches!(exit, ThreadExit::Syscall { .. }),
-            "a prebound source must reach its target's syscall exit in ONE \
-             gateway entry, not a ResolveDirect round trip: {exit:?}"
-        );
-        assert_eq!(
-            snapshot.x[17],
-            baseline_x17.wrapping_add(1),
-            "the target's body executed through the prebound branch"
-        );
-        let stats = lane.fixture.translator.profile_snapshot();
-        assert_eq!(stats.live_links_prebound, 1, "the binding is counted");
-        assert_eq!(stats.live_links_prebind_unbound_state, 0);
-        assert_eq!(stats.live_links_prebind_unbound_reach, 0);
-    }
-
-    /// The designed sacrifice, counted: a source published BEFORE its target
-    /// keeps the emitter's gateway stub permanently — later publication of
-    /// the target never patches the immutable READY source.
-    #[test]
-    fn an_unready_target_keeps_the_gateway_stub_permanently() {
-        let _signal_oracle = super::install_signal_handlers_for_oracle();
-        let guest_code = GuestVa(0x20_0924_0000);
-        let words = branch_words(4096, 16);
-        let mut lane = live_lane_fixture_words(guest_code, &words, SOURCE_PAGE_BYTES);
-        let target = GuestVa(guest_code.raw() + 16 * 4);
-
-        let mut stack = vec![0_u8; 16 * 1024];
-        let mut snapshot = super::seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
-        let baseline_x17 = snapshot.x[17];
-
-        // The SOURCE first: B is not READY, so the candidate is refused by
-        // state and the branch falls into the gateway stub.
-        snapshot.pc = guest_code.raw();
-        let (_, exit) = run_block(&mut lane, &mut snapshot);
-        assert!(
             matches!(exit, ThreadExit::Continue),
-            "an unbound direct exit is gateway-served (ResolveDirect resolved \
-             the target and continued): {exit:?}"
+            "a live direct site is gateway-served even with a READY target: {exit:?}"
         );
         assert_eq!(
             snapshot.pc,
             target.raw(),
             "the resolver continues at the target"
         );
-        let stats = lane.fixture.translator.profile_snapshot();
-        assert_eq!(stats.live_links_prebound, 0);
         assert_eq!(
-            stats.live_links_prebind_unbound_state, 1,
-            "the refusal is counted by name"
+            snapshot.x[17], baseline_x17,
+            "the target body did not execute in the source's entry"
+        );
+        let stats = lane.fixture.translator.profile_snapshot();
+        assert_eq!(
+            (
+                stats.live_links_prebound,
+                stats.live_links_prebind_unbound_state,
+                stats.live_links_prebind_unbound_reach,
+            ),
+            (0, 0, 0),
+            "the kept vocabulary reads zero-bound with the loop removed"
         );
 
-        // B is now READY (the resolve above published it). Re-entering A must
-        // STILL take the gateway round trip: READY code is immutable, so the
-        // stub is permanent by design.
+        // And permanently: a later traversal still takes the round trip.
         snapshot.pc = guest_code.raw();
         snapshot.x[17] = baseline_x17;
         let (_, exit) = run_block(&mut lane, &mut snapshot);
         assert!(
             matches!(exit, ThreadExit::Continue),
-            "later publication of the target must not patch an older READY \
-             source: {exit:?}"
-        );
-        assert_eq!(
-            snapshot.x[17], baseline_x17,
-            "the target body has not executed yet in this traversal"
+            "READY code is immutable, so the stub is permanent: {exit:?}"
         );
     }
 
-    /// Obligation 6's verification: revoking the TARGET's chunk faults the
-    /// prebound jump at the target's entry, and the classifier consumes a
-    /// stale DIRECT arrival exactly as it consumes a stale gateway arrival —
-    /// same predicates, same exact recovery, zero stale instructions.
-    ///
-    /// Cross-page on purpose: the target's 16 KiB source page is mutated
-    /// while the source's page (and therefore the source's own chunk) stays
-    /// valid, so the arrival really is the DIRECT branch, not a fault at the
-    /// source's own revoked entry.
+    /// The still-true revocation properties the removed binding tests used
+    /// to ride on, retargeted (per the controller ruling): revocation is
+    /// exact per 16 KiB source page — mutating the TARGET's page revokes its
+    /// chunk while a source on ANOTHER page stays executable — and a stale
+    /// gateway arrival at the revoked target's entry classifies and recovers
+    /// exactly (the entry is an always-exact boundary), with zero stale
+    /// instructions executed.
     #[test]
-    fn a_stale_direct_arrival_at_a_revoked_target_recovers_like_a_gateway_arrival() {
+    fn revoking_the_targets_page_leaves_the_source_executable_and_recovers_its_entry() {
         let _signal_oracle = super::install_signal_handlers_for_oracle();
         let guest_code = GuestVa(0x20_0928_0000);
         let page_words = (SOURCE_PAGE_BYTES / 4) as usize;
@@ -7105,8 +7070,7 @@ mod live_prebind {
         let mut snapshot = super::seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
         let baseline_x17 = snapshot.x[17];
 
-        // Target READY and installed; source prebound to it across the page
-        // boundary; one entry executes both.
+        // Both blocks live-published and installed, on distinct source pages.
         snapshot.pc = target.raw();
         let (prepared_b, exit) = run_block(&mut lane, &mut snapshot);
         assert_eq!(
@@ -7117,74 +7081,79 @@ mod live_prebind {
         let target_entry = prepared_b.entry.host().raw() as u64;
         snapshot.pc = guest_code.raw();
         snapshot.x[17] = baseline_x17;
-        let (prepared_a, exit) = run_block(&mut lane, &mut snapshot);
-        assert!(matches!(exit, ThreadExit::Syscall { .. }));
-        assert_eq!(
-            lane.fixture
-                .translator
-                .profile_snapshot()
-                .live_links_prebound,
-            1,
-            "the cross-page candidate bound"
-        );
+        let (_, exit) = run_block(&mut lane, &mut snapshot);
+        assert!(matches!(exit, ThreadExit::Continue));
 
-        // The guest mutates the TARGET's page only: the production seam
-        // revokes B's chunk task-locally while A's page and chunk stay valid.
+        // The guest mutates the TARGET's page only.
         lane.fixture
             .memory
             .note_dsr_code_mutation(target.raw(), 4)
             .expect("note the guest code write");
+        assert!(
+            !lane
+                .fixture
+                .translator
+                .process
+                .revoked_live_chunks_for_test()
+                .is_empty(),
+            "the mutated page's chunk enters the revoked catalog"
+        );
 
-        // Re-entering the still-valid SOURCE takes the prebound branch into
-        // the revoked chunk: an instruction abort AT THE TARGET'S ENTRY with
-        // PC == FAR — the identical shape a stale gateway arrival produces —
-        // classified and recovered exactly.
+        // The SOURCE's page was untouched: its live block still serves and
+        // executes, and the resolver re-translates the target privately at
+        // the new generation instead of faulting.
         snapshot.pc = guest_code.raw();
+        snapshot.x[17] = baseline_x17;
+        let (prepared_a, exit) = run_block(&mut lane, &mut snapshot);
+        assert_eq!(
+            prepared_a.executable_authority(),
+            PublicationAuthority::Live,
+            "revocation is exact per source page: the source stays live"
+        );
+        assert!(
+            matches!(exit, ThreadExit::Continue),
+            "the gateway serves the regenerated target privately: {exit:?}"
+        );
+
+        // A thread still holding the revoked target entry re-enters it: the
+        // fetch aborts at the ENTRY with PC == FAR, and the classifier
+        // recovers the exact guest PC through the entry-boundary arm.
+        snapshot.pc = target.raw();
         snapshot.x[17] = baseline_x17;
         let prepared_exit = lane
             .fixture
             .translator
-            .enter_prepared::<false>(prepared_a, &mut snapshot)
-            .expect("enter the prebound source");
+            .enter_prepared::<false>(prepared_b, &mut snapshot)
+            .expect("enter the revoked target entry");
         let exit = lane
             .fixture
             .translator
             .finish_exit(
                 &lane.fixture.memory,
                 &mut snapshot,
-                prepared_a,
+                prepared_b,
                 prepared_exit,
             )
-            .expect("finish the prebound source");
+            .expect("finish the revoked target entry");
         assert!(
             matches!(exit, ThreadExit::Kick),
-            "a classified stale DIRECT arrival resumes through the normal \
-             translation path: {exit:?}"
+            "a classified stale abort resumes through the normal translation \
+             path: {exit:?}"
         );
         assert_eq!(
             snapshot.pc,
             target.raw(),
-            "recovery restores the TARGET's exact guest PC (the entry is an \
-             always-exact boundary)"
+            "recovery restores the exact guest PC"
         );
-        // The classifier's own predicate, not a byte-exact ESR: EC is an
-        // instruction abort (0x20 from lower EL) and PC == FAR. The IFSC
-        // differs from `live_revoke`'s measured 0x06 (this arrival observed a
-        // level-3 translation fault, 0x07 — the PROT_NONE split lands at a
-        // different table level for this chunk), and the classifier is
-        // IFSC-agnostic by design.
         assert_eq!(
             (snapshot.esr >> 26) & 0x3f,
             0x20,
             "esr=0x{:x}",
             snapshot.esr
         );
-        // (PC == FAR at classification time is what ADMITTED this recovery —
-        // the classifier returns None otherwise — so the Kick above already
-        // proves it; snapshot.pc has since been rewritten to the guest PC.)
         assert_eq!(
             snapshot.far, target_entry,
-            "the fault is at the revoked target's entry, not the source"
+            "the fault is at the revoked target entry"
         );
         assert_eq!(
             snapshot.x[17], baseline_x17,
@@ -7196,7 +7165,7 @@ mod live_prebind {
                 .profile_snapshot()
                 .live_stale_instruction_aborts,
             1,
-            "the recovery is counted exactly like a gateway arrival's"
+            "the recovery is counted"
         );
     }
 }

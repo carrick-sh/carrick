@@ -2597,21 +2597,11 @@ pub trait LiveTranslationAuthority: Send + Sync {
     /// published through the Task 6B transaction and installed through the
     /// SAME READY consumer as [`Self::acquire_ready`].
     ///
-    /// Between reservation and publication the winner prebinds every
-    /// `DirectLink` candidate whose target is already an acquirable READY
-    /// record in the same view and within AArch64 branch range — the one
-    /// window the design permits writing what will become immutable shared
-    /// code, and it mutates only the still-staged private bytes.
-    /// `observe_target_page` supplies the authoritative generation
-    /// observation for a candidate TARGET's page (the caller's `generation`
-    /// argument observes the SOURCE page only); `None` refuses that
-    /// candidate fail-closed. Refusals of any kind leave the candidate on
-    /// its gateway stub and are reported in the outcome's
-    /// [`LivePrebindTally`] — they never fail the publication.
-    // Eight arguments: the B3 claim identity (four), the owner, and the two
-    // winner callbacks. Bundling them into a context struct would only move
-    // the same eight names one level down.
-    #[allow(clippy::too_many_arguments)]
+    /// The winner does NOT bind direct-link candidates, even to READY
+    /// targets: the 2026-08-06 winner-window binding loop was removed as
+    /// measured-worse (see the design doc's "Immutable direct links" note),
+    /// so the outcome's [`LivePrebindTally`] is zero on every path — a
+    /// measured answer the counters keep visible.
     fn publish_winner(
         &self,
         key: &TranslationUnitKey,
@@ -2620,7 +2610,6 @@ pub trait LiveTranslationAuthority: Send + Sync {
         generation: &PageGenerationObservation,
         owner_pid: i32,
         prepare: &mut dyn FnMut() -> Result<PreparedSharedInitial, crate::types::DsrError>,
-        observe_target_page: &mut dyn FnMut(GuestVa) -> Option<PageGenerationObservation>,
     ) -> LivePublishOutcome;
 
     /// Descriptor-authoritative chunk enumeration for one 16 KiB source page.
