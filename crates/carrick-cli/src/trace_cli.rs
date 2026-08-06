@@ -51,6 +51,11 @@ use crate::trace_profile::TraceProfileKind;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub(crate) struct TraceSudoInvocation<'a> {
     pub(crate) executable: &'a Path,
+    /// The global `--store`. It is a ROOT-level argument, not a `trace` one, so
+    /// it has to be re-emitted before the subcommand or the traced guest
+    /// silently resolves images against a different store than the caller
+    /// named -- the same silent-drop class as the capture bound.
+    pub(crate) store: Option<&'a Path>,
     pub(crate) flowindent: bool,
     pub(crate) script: Option<&'a Path>,
     pub(crate) profile: Option<TraceProfileKind>,
@@ -67,10 +72,12 @@ pub(crate) struct TraceSudoInvocation<'a> {
 
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub(crate) fn trace_sudo_argv(invocation: &TraceSudoInvocation<'_>) -> Vec<OsString> {
-    let mut argv = vec![
-        invocation.executable.as_os_str().to_owned(),
-        OsString::from("trace"),
-    ];
+    let mut argv = vec![invocation.executable.as_os_str().to_owned()];
+    if let Some(store) = invocation.store {
+        argv.push(OsString::from("--store"));
+        argv.push(store.as_os_str().to_owned());
+    }
+    argv.push(OsString::from("trace"));
     if invocation.flowindent {
         argv.push(OsString::from("--flowindent"));
     }
@@ -188,8 +195,27 @@ fn trace_child_identity_record(euid: u32, egid: u32, groups: &[u32]) -> String {
     format!("TRACECHILD1|euid={euid}|egid={egid}|groups={groups}")
 }
 
+/// Rebuild the `__trace-child` argv.
+///
+/// Extracted so it is testable: `exec_trace_child` itself drops privileges
+/// before dispatching. Re-parsing the trailing command ALONE loses the
+/// root-level `--store`, so the traced guest would resolve images against the
+/// default store while the operator believes the capture is bound to theirs.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn trace_child_argv(store: Option<&Path>, command: &[String]) -> Vec<String> {
+    let mut argv = Vec::with_capacity(command.len() + 3);
+    argv.push("carrick".to_owned());
+    if let Some(store) = store {
+        argv.push("--store".to_owned());
+        argv.push(store.to_string_lossy().into_owned());
+    }
+    argv.extend(command.iter().cloned());
+    argv
+}
+
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub(crate) fn exec_trace_child(
+    store: Option<&Path>,
     trace_uid: u32,
     trace_gid: u32,
     trace_groups: &[u32],
@@ -224,10 +250,7 @@ pub(crate) fn exec_trace_child(
     )
     .context("trace child failed to publish its post-drop identity")?;
 
-    let mut argv = Vec::with_capacity(command.len() + 1);
-    argv.push("carrick".to_owned());
-    argv.extend(command.iter().cloned());
-    crate::commands::run_cli(Cli::parse_from(argv))
+    crate::commands::run_cli(Cli::parse_from(trace_child_argv(store, command)))
 }
 
 #[cfg(all(test, any(target_os = "macos", target_os = "freebsd")))]
@@ -248,6 +271,7 @@ mod tests {
         let command = ["run-elf".to_owned(), "/tmp/probe".to_owned()];
         let argv = trace_sudo_argv(&TraceSudoInvocation {
             executable: Path::new("/tmp/carrick"),
+            store: None,
             flowindent: false,
             script: None,
             profile: Some(TraceProfileKind::DsrIndirect),
@@ -301,6 +325,7 @@ mod tests {
         let command = ["run-elf".to_owned(), "/tmp/probe".to_owned()];
         let argv = trace_sudo_argv(&TraceSudoInvocation {
             executable: Path::new("/tmp/carrick"),
+            store: None,
             flowindent: false,
             script: None,
             profile: Some(TraceProfileKind::NativeWall),
@@ -340,11 +365,57 @@ mod tests {
         );
     }
 
+    /// The global `--store` is a ROOT argument that both trace hops rebuild
+    /// their argv without. Dropping it does not fail -- the guest quietly
+    /// resolves images against the DEFAULT store -- so it is exactly the
+    /// silent-drop class as the capture bound, and needs the same pinning.
+    #[test]
+    fn global_store_survives_both_trace_argv_reconstructions() {
+        let command = ["run".to_owned(), "img".to_owned()];
+        let argv = trace_sudo_argv(&TraceSudoInvocation {
+            executable: Path::new("/tmp/carrick"),
+            store: Some(Path::new("/tmp/store")),
+            flowindent: false,
+            script: None,
+            profile: Some(TraceProfileKind::NativeWall),
+            summary_jsonl: None,
+            profile_bound_seconds: None,
+            trace_out: None,
+            native_shape_snapshots: None,
+            uid: 501,
+            gid: 20,
+            groups: &[],
+            forwarded_env: &[],
+            command: &command,
+        });
+        let strings: Vec<_> = argv
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        // Root-level, so it must precede the subcommand.
+        assert_eq!(
+            &strings[..4],
+            &["/tmp/carrick", "--store", "/tmp/store", "trace"]
+        );
+
+        // Second hop: the `__trace-child` rebuild re-parses the trailing
+        // command, which carries no root argument of its own.
+        assert_eq!(
+            trace_child_argv(Some(Path::new("/tmp/store")), &command),
+            vec!["carrick", "--store", "/tmp/store", "run", "img"]
+        );
+        assert_eq!(
+            trace_child_argv(None, &command),
+            vec!["carrick", "run", "img"]
+        );
+    }
+
     #[test]
     fn native_fault_profile_survives_sudo_argv_reconstruction() {
         let command = ["run-elf".to_owned(), "/tmp/fault-probe".to_owned()];
         let argv = trace_sudo_argv(&TraceSudoInvocation {
             executable: Path::new("/tmp/carrick"),
+            store: None,
             flowindent: false,
             script: None,
             profile: Some(TraceProfileKind::NativeFault),
@@ -391,6 +462,7 @@ mod tests {
         let command = ["run".to_owned(), "/bin/true".to_owned()];
         let argv = trace_sudo_argv(&TraceSudoInvocation {
             executable: Path::new("/tmp/carrick"),
+            store: None,
             flowindent: false,
             script: None,
             profile: Some(TraceProfileKind::NativeShape),
