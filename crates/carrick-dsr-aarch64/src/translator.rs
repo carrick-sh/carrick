@@ -1052,6 +1052,14 @@ pub struct ProcessState {
     /// install keeps that enumeration off the translate path once a page's
     /// chunks are known.
     live_source_pages: BTreeMap<carrick_guest_mem::GuestVa, LiveSourcePageHint>,
+    /// Exact 64 KiB local RX chunks this process revoked `PROT_NONE`
+    /// (Task 7), ascending by `rx_start` so the stale-abort classifier is a
+    /// binary search. Entries are TASK-LOCAL bookkeeping over this view's own
+    /// alias; they carry no shared-arena state. Cleared by the in-process
+    /// exec reset (retired live ranges are dropped with the rest of the
+    /// image's live bookkeeping) and rebuilt from the retained records by the
+    /// fork-child repair before guest entry.
+    revoked_live_chunks: Vec<crate::live_arena::LiveRevokedChunk>,
     shared_unit_segments_consulted: BTreeSet<carrick_guest_mem::GuestVa>,
     shared_recording_segments: BTreeSet<carrick_guest_mem::GuestVa>,
     /// Units this process attached from the store, blocks NOT yet replayed.
@@ -1132,6 +1140,31 @@ pub enum LiveFallback {
     /// The arena's own named refusal (BUILDING, FAILED, CAS loss, corruption,
     /// capacity, exhausted probes, key encoding, unknown state).
     Arena(crate::live_arena::LivePrivateReason),
+}
+
+/// Exact recovery for one classified stale live instruction abort (Task 7).
+///
+/// Everything recovery needs, resolved from the LAZY live metadata while the
+/// classifier still holds the state read guard: the exact guest PC (and any
+/// mid-lowering rewrite action) for the faulting cache PC, plus the block's
+/// published key so the stale block can be removed from the lookup indexes.
+#[derive(Clone, Copy, Debug)]
+struct LiveStaleRecovery {
+    guest_pc: carrick_guest_mem::GuestVa,
+    recovery: Option<emit::RecoveryAction>,
+    block_key: PublishedBlockKey,
+}
+
+/// One revoked chunk found by the classifier's binary search, still borrowing
+/// the state so `recover` resolves through the SAME retained address index.
+struct RevokedChunkView<'state> {
+    state: &'state ProcessState,
+}
+
+impl RevokedChunkView<'_> {
+    fn recover(&self, pc: u64) -> Option<LiveStaleRecovery> {
+        self.state.recover_stale_live(pc)
+    }
 }
 
 /// The live lane's configured identity, resolved once per consultation so the
@@ -3094,6 +3127,7 @@ impl ProcessTranslator {
                 live_blocks: BTreeMap::new(),
                 live_published_index: Vec::new(),
                 live_source_pages: BTreeMap::new(),
+                revoked_live_chunks: Vec::new(),
                 shared_unit_segments_consulted: BTreeSet::new(),
                 shared_recording_segments: BTreeSet::new(),
                 attached_units: Vec::new(),
@@ -3156,6 +3190,23 @@ impl ProcessTranslator {
         range: std::ops::Range<carrick_guest_mem::GuestVa>,
     ) -> Result<usize, types::DsrError> {
         self.state.write().sever_direct_links_in(range)
+    }
+
+    /// Task 7 revocation seam; see `ProcessState::revoke_live_source_range`
+    /// (private). Called from `note_dsr_code_mutation` after the generation
+    /// bump, before the caller's source mutation proceeds.
+    pub fn revoke_live_source_range(
+        &self,
+        range: std::ops::Range<carrick_guest_mem::GuestVa>,
+    ) -> Result<usize, types::DsrError> {
+        self.state.write().revoke_live_source_range(range)
+    }
+
+    /// This process's revoked-chunk catalog, for lifecycle assertions.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn revoked_live_chunks_for_test(&self) -> Vec<crate::live_arena::LiveRevokedChunk> {
+        self.state.read().revoked_live_chunks.clone()
     }
 
     pub fn cache_host_range(&self) -> std::ops::Range<u64> {
@@ -3401,8 +3452,9 @@ impl ProcessTranslator {
         self.executable_range_catalog
     }
 
-    #[cfg(test)]
-    fn configure_live_image_matching_for_test(
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn configure_live_image_matching_for_test(
         &self,
         image: crate::shared_cache::SharedImageConfig,
         host_page_size: u64,
@@ -3532,6 +3584,10 @@ impl ProcessTranslator {
         let mut state = self.state.write();
         let direct_binding_stats = crate::direct_binding::ForkBindingClearStats::default();
         state.cache.after_fork_child();
+        // Task 7: the revoked-chunk catalog is rebuilt (and PROT_NONE
+        // re-asserted in this task) BEFORE any guest entry can fault into an
+        // inherited stale chunk.
+        state.rebuild_revoked_live_catalog_after_fork()?;
         state.stats = ResolverStats::default();
         state.reported_stats = ResolverStats::default();
         // The recording claim is the PARENT's: the store's builder election
@@ -4505,6 +4561,203 @@ impl ProcessState {
         }
     }
 
+    /// Task 7 revocation seam: called from every `note_guest_code_write`
+    /// owner (via `note_dsr_code_mutation`) AFTER the generation bump and
+    /// BEFORE the caller's source mutation proceeds.
+    ///
+    /// Enumerates every ACTIVE descriptor for the mutated 16 KiB source
+    /// pages through the live authority (the descriptor table is authority;
+    /// `live_source_pages` is only a validated hint that may ADD chunks),
+    /// protects each deduplicated exact 64 KiB local RX chunk `PROT_NONE`
+    /// once, records the revoked catalog for the stale-abort classifier, and
+    /// removes the pages' stale live blocks from the process lookup indexes.
+    /// Errors are fail-closed for the caller's mutation.
+    fn revoke_live_source_range(
+        &mut self,
+        range: std::ops::Range<carrick_guest_mem::GuestVa>,
+    ) -> Result<usize, types::DsrError> {
+        if range.start.raw() >= range.end.raw() {
+            return Ok(0);
+        }
+        let Some(authority) = self.live_authority.as_ref() else {
+            // No live authority (the shipped default): no shared chunk can be
+            // executable in this process, so there is nothing to revoke.
+            return Ok(0);
+        };
+        let page_mask = LIVE_SOURCE_PAGE_BYTES - 1;
+        let first = range.start.raw() & !page_mask;
+        let last = range.end.raw().saturating_sub(1) & !page_mask;
+        // The process-local hints for the covered pages. They may only ADD
+        // chunks: the authority re-enumerates ACTIVE descriptors itself.
+        let mut hints = Vec::new();
+        let mut page = first;
+        loop {
+            if let Some(hint) = self
+                .live_source_pages
+                .get(&carrick_guest_mem::GuestVa(page))
+            {
+                for chunk in &hint.chunks {
+                    hints.push((page, *chunk));
+                }
+            }
+            if page == last {
+                break;
+            }
+            page = page.checked_add(LIVE_SOURCE_PAGE_BYTES).ok_or_else(|| {
+                types::DsrError::CachePolicy(
+                    "live revocation range overflowed a source page step".to_string(),
+                )
+            })?;
+        }
+        let revoked = authority.revoke_source_range(range, &hints)?;
+        let count = revoked.len();
+        for chunk in revoked {
+            match self
+                .revoked_live_chunks
+                .binary_search_by(|seen| seen.rx_start.raw().cmp(&chunk.rx_start.raw()))
+            {
+                // A re-revocation of an already-revoked chunk is idempotent.
+                Ok(at) => self.revoked_live_chunks[at] = chunk,
+                Err(at) => self.revoked_live_chunks.insert(at, chunk),
+            }
+        }
+        // The revoked pages' live blocks leave the LOOKUP indexes now, so no
+        // pre-bump racing observation can be served a block whose chunk is
+        // PROT_NONE. The ADDRESS index (`live_published_index`/`published`)
+        // deliberately survives: it is the fault-recovery index the stale
+        // classifier maps a revoked cache PC back to a guest PC with.
+        let end_exclusive = last.saturating_add(LIVE_SOURCE_PAGE_BYTES);
+        let stale: Vec<PublishedBlockKey> = self
+            .live_blocks
+            .range(
+                (
+                    carrick_guest_mem::GuestVa(first),
+                    types::CodeGeneration::INITIAL,
+                )..,
+            )
+            .map(|(key, _)| *key)
+            .take_while(|key| key.0.raw() < end_exclusive)
+            .collect();
+        for key in stale {
+            self.live_blocks.remove(&key);
+            self.published_blocks.remove(key);
+        }
+        Ok(count)
+    }
+
+    /// Task 7, the fork leg: rebuild the revoked-chunk catalog in a fork
+    /// child BEFORE guest entry.
+    ///
+    /// The child inherited the parent's catalog and PROT_NONE protections by
+    /// copy, but the catalog is bookkeeping over a task-local protection —
+    /// so the child re-derives it through the SAME revocation seam, which
+    /// also re-asserts `PROT_NONE` in the child's own task (idempotent) so
+    /// the guarantee never rests on fork protection-inheritance subtleties.
+    fn rebuild_revoked_live_catalog_after_fork(&mut self) -> Result<(), types::DsrError> {
+        if self.revoked_live_chunks.is_empty() {
+            return Ok(());
+        }
+        let Some(authority) = self.live_authority.as_ref() else {
+            // A catalog can only have been filled through an authority; if
+            // the authority is gone the retained records cannot serve
+            // recovery either way. Keep them: classification against them is
+            // read-only and still exact.
+            return Ok(());
+        };
+        let mut pages: BTreeMap<u64, Vec<(u64, u32)>> = BTreeMap::new();
+        for chunk in &self.revoked_live_chunks {
+            pages
+                .entry(chunk.source_page)
+                .or_default()
+                .push((chunk.source_page, chunk.chunk_index));
+        }
+        let mut rebuilt: Vec<crate::live_arena::LiveRevokedChunk> = Vec::new();
+        for (page, hints) in pages {
+            let end = page.checked_add(LIVE_SOURCE_PAGE_BYTES).ok_or_else(|| {
+                types::DsrError::CachePolicy(
+                    "revoked source page overflowed its page end".to_string(),
+                )
+            })?;
+            for chunk in authority.revoke_source_range(
+                carrick_guest_mem::GuestVa(page)..carrick_guest_mem::GuestVa(end),
+                &hints,
+            )? {
+                match rebuilt
+                    .binary_search_by(|seen| seen.rx_start.raw().cmp(&chunk.rx_start.raw()))
+                {
+                    Ok(at) => rebuilt[at] = chunk,
+                    Err(at) => rebuilt.insert(at, chunk),
+                }
+            }
+        }
+        self.revoked_live_chunks = rebuilt;
+        Ok(())
+    }
+
+    /// Task 7 classifier: consume ONLY the measured stale shape — an
+    /// instruction abort (`EC 0x20|0x21`, measured `0x20` with IFSC 0x06 on
+    /// this host's fd backing, arriving as SIGBUS) whose `pc == far` lies in
+    /// a chunk THIS process revoked — and map it to exact recovery. Every
+    /// other shape returns `None` and falls through to the existing fault
+    /// path unchanged.
+    ///
+    /// Read-only against the descriptor-derived local catalog and the
+    /// retained published address index; it takes no lock the faulted thread
+    /// could already hold (it runs in the thread's ordinary run-loop context,
+    /// after the C handler has already returned through the gateway exit).
+    fn stale_live_instruction_abort(
+        &self,
+        esr: u64,
+        pc: u64,
+        far: u64,
+    ) -> Option<LiveStaleRecovery> {
+        let ec = (esr >> 26) & 0x3f;
+        if !matches!(ec, 0x20 | 0x21) || pc != far {
+            return None;
+        }
+        self.revoked_chunk_containing(pc)?.recover(pc)
+    }
+
+    /// The revoked chunk containing `pc`, as a view that can attempt exact
+    /// recovery. One binary search over the ascending-by-`rx_start` catalog.
+    fn revoked_chunk_containing(&self, pc: u64) -> Option<RevokedChunkView<'_>> {
+        let pc = usize::try_from(pc).ok()?;
+        let at = self
+            .revoked_live_chunks
+            .partition_point(|chunk| chunk.rx_start.raw() <= pc);
+        let chunk = self.revoked_live_chunks.get(at.checked_sub(1)?)?;
+        (pc < chunk.rx_start.raw().checked_add(chunk.rx_len)?)
+            .then_some(RevokedChunkView { state: self })
+    }
+
+    /// Exact recovery for a PC inside a revoked chunk, or `None` (fail-closed
+    /// to the normal fault path) when the PC cannot be recovered EXACTLY.
+    fn recover_stale_live(&self, pc: u64) -> Option<LiveStaleRecovery> {
+        let cache_pc = usize::try_from(pc).ok()?;
+        let block = self.published_block_containing(cache_pc)?;
+        // Only a LIVE block may recover through this path: a private block in
+        // a revoked address range cannot exist (the catalogs cover disjoint
+        // mappings), so anything else is fail-closed.
+        let PublishedBlockMetadata::Live { authority, .. } = &block.metadata else {
+            return None;
+        };
+        let block_key = (authority.guest_start(), block._generation.expected());
+        let entry = block.entry.host().raw() as u64;
+        let (guest_pc, recovery) = match self.guest_pc_for_cache(carrick_guest_mem::GuestVa(pc)) {
+            Ok(found) => found,
+            // The block ENTRY is always an exact boundary — no guest
+            // instruction has partially executed there — even when the
+            // emitted map's first entry is not at offset zero.
+            Err(_) if pc == entry => (authority.guest_start(), None),
+            Err(_) => return None,
+        };
+        Some(LiveStaleRecovery {
+            guest_pc,
+            recovery,
+            block_key,
+        })
+    }
+
     /// Whether `entry` addresses a block THIS process installed from the live
     /// arena. Two binary searches over the live address index, never a scan.
     ///
@@ -5365,6 +5618,14 @@ impl ProcessState {
         self.live_published_index.clear();
         self.live_blocks.clear();
         self.live_source_pages.clear();
+        // Task 7: an in-process exec retires the outgoing image's revoked
+        // ranges with the rest of its live bookkeeping. The successor image
+        // starts with an empty catalog over the SAME inherited arena — and
+        // the retired `live_target_authority` OnceLock, though never cleared,
+        // stays unreachable: with `published`/`live_published_index` emptied
+        // here no address can resolve to a retired live block, and with this
+        // catalog emptied no retired range can classify a stale abort.
+        self.revoked_live_chunks.clear();
     }
 
     /// The published block whose emitted extent contains `cache_pc`, if any.
@@ -6195,6 +6456,61 @@ impl ThreadTranslator {
         self.finish_exit_profiled::<false>(memory, snapshot, prepared, exit)
     }
 
+    /// Task 7 recovery for one CLASSIFIED stale live instruction abort.
+    ///
+    /// Restores the guest snapshot from the lazy live metadata (any
+    /// mid-lowering rewrite action plus the exact resume PC), removes the
+    /// stale block from the process and thread lookup state, and resumes
+    /// through `ThreadExit::Kick` so the runtime re-enters the NORMAL private
+    /// translation path against the newly observed generation. The revoked
+    /// chunk is never remapped or reactivated.
+    #[allow(clippy::too_many_arguments)]
+    fn recover_stale_live_abort(
+        &mut self,
+        snapshot: &mut NativeUcontextSnapshot,
+        stale: LiveStaleRecovery,
+        rewrite_scratch: u64,
+        rewrite_context_scratch: u64,
+        generation_pstate_scratch: u64,
+        indirect_x15_scratch: u64,
+        indirect_x30_scratch: u64,
+        physical_reserved: u64,
+    ) -> Result<ThreadExit, types::DsrError> {
+        if let Some(recovery) = stale.recovery {
+            recover_rewrite_state(
+                snapshot,
+                recovery,
+                rewrite_scratch,
+                rewrite_context_scratch,
+                generation_pstate_scratch,
+                indirect_x15_scratch,
+                indirect_x30_scratch,
+                physical_reserved,
+            )?;
+        }
+        snapshot.pc = recovery_resume_pc(stale.guest_pc, stale.recovery)?;
+        // Thread lookup state must stop serving the revoked chunk: the
+        // per-thread block memo and the inline indirect target cache could
+        // otherwise branch straight back into PROT_NONE code on every
+        // traversal. Recovery is rare, so a full clear (both already exist
+        // for the exec handoff) is proportionate and refills on demand.
+        self.block_cache.clear();
+        self.indirect_cache.clear();
+        // Process lookup indexes: idempotent — revocation already removed
+        // the mutated page's blocks in the revoking process, but a fork
+        // child classifying against an inherited catalog scrubs its own copy
+        // here.
+        {
+            let mut state = probes::acquire_with_synchronization_reason(
+                probes::DsrSynchronizationKind::ProcessStateWrite,
+                || self.process.state.write(),
+            );
+            state.live_blocks.remove(&stale.block_key);
+            state.published_blocks.remove(stale.block_key);
+        }
+        Ok(ThreadExit::Kick)
+    }
+
     pub fn finish_exit_profiled<const PROFILE: bool>(
         &mut self,
         memory: &NativeMappedMemory,
@@ -6414,6 +6730,27 @@ impl ThreadTranslator {
                 gateway_phase,
                 biased_guest_fault_address,
             } => {
+                // Task 7: consume ONLY the measured stale shape — an
+                // instruction abort with pc == far inside a chunk THIS
+                // process revoked — and recover it exactly. Every other
+                // shape falls through to the unchanged fault path below.
+                let stale = self.process.state.read().stale_live_instruction_abort(
+                    snapshot.esr,
+                    snapshot.pc,
+                    snapshot.far,
+                );
+                if let Some(stale) = stale {
+                    return self.recover_stale_live_abort(
+                        snapshot,
+                        stale,
+                        rewrite_scratch,
+                        rewrite_context_scratch,
+                        generation_pstate_scratch,
+                        indirect_x15_scratch,
+                        indirect_x30_scratch,
+                        physical_reserved,
+                    );
+                }
                 let (guest_pc, recovery) = self.guest_pc_for_cache(guest_pc).map_err(|error| {
                     types::DsrError::CachePolicy(format!(
                         "{error}; trapped signal={signal} code={code} address=0x{:x} \
@@ -7910,6 +8247,10 @@ mod tests {
             PrepareRefused,
         }
 
+        /// One observed `revoke_source_range` call: the mutated range and
+        /// the caller's `(source_page, chunk_index)` hints.
+        type RecordedRevocation = (std::ops::Range<GuestVa>, Vec<(u64, u32)>);
+
         struct FakeAuthority {
             arena: Arc<FakeLiveArena>,
             ready: Mutex<FakeReady>,
@@ -7918,6 +8259,14 @@ mod tests {
             ready_lookups: AtomicUsize,
             enumerations: AtomicUsize,
             installed: Mutex<Vec<Arc<FakeLiveBlock>>>,
+            /// Task 7: every `revoke_source_range` call this authority saw,
+            /// with the caller's hint chunks — the seam's observation point.
+            revocations: Mutex<Vec<RecordedRevocation>>,
+            /// Scripted revocation outcomes: per 16 KiB source page, the
+            /// local RX chunks a revocation of that page protects. Tests set
+            /// this to cover the entries they installed.
+            revoke_plan:
+                Mutex<std::collections::BTreeMap<u64, Vec<crate::live_arena::LiveRevokedChunk>>>,
         }
 
         impl FakeAuthority {
@@ -7941,7 +8290,25 @@ mod tests {
                     ready_lookups: AtomicUsize::new(0),
                     enumerations: AtomicUsize::new(0),
                     installed: Mutex::new(Vec::new()),
+                    revocations: Mutex::new(Vec::new()),
+                    revoke_plan: Mutex::new(std::collections::BTreeMap::new()),
                 })
+            }
+
+            /// Script the chunks a revocation of `source_page` protects.
+            fn plan_revocation(
+                &self,
+                source_page: u64,
+                chunks: Vec<crate::live_arena::LiveRevokedChunk>,
+            ) {
+                self.revoke_plan
+                    .lock()
+                    .expect("revoke plan")
+                    .insert(source_page, chunks);
+            }
+
+            fn recorded_revocations(&self) -> Vec<RecordedRevocation> {
+                self.revocations.lock().expect("revocations").clone()
             }
 
             fn block(
@@ -8105,6 +8472,36 @@ mod tests {
             fn rx_payload(&self) -> Option<LiveRxPayload> {
                 Some(self.arena.payload())
             }
+
+            fn revoke_source_range(
+                &self,
+                range: std::ops::Range<GuestVa>,
+                hint_chunks: &[(u64, u32)],
+            ) -> Result<Vec<crate::live_arena::LiveRevokedChunk>, types::DsrError> {
+                self.revocations
+                    .lock()
+                    .expect("revocations")
+                    .push((range.clone(), hint_chunks.to_vec()));
+                let plan = self.revoke_plan.lock().expect("revoke plan");
+                let mut revoked: Vec<crate::live_arena::LiveRevokedChunk> = Vec::new();
+                const PAGE: u64 = 16 * 1024;
+                let mut page = range.start.raw() & !(PAGE - 1);
+                let last = range.end.raw().saturating_sub(1) & !(PAGE - 1);
+                while page <= last {
+                    if let Some(chunks) = plan.get(&page) {
+                        for chunk in chunks {
+                            if !revoked
+                                .iter()
+                                .any(|seen| seen.chunk_index == chunk.chunk_index)
+                            {
+                                revoked.push(*chunk);
+                            }
+                        }
+                    }
+                    page += PAGE;
+                }
+                Ok(revoked)
+            }
         }
 
         /// A view whose RX payload cannot be resolved: the named refusal that
@@ -8142,6 +8539,14 @@ mod tests {
 
             fn rx_payload(&self) -> Option<LiveRxPayload> {
                 None
+            }
+
+            fn revoke_source_range(
+                &self,
+                _range: std::ops::Range<GuestVa>,
+                _hint_chunks: &[(u64, u32)],
+            ) -> Result<Vec<crate::live_arena::LiveRevokedChunk>, types::DsrError> {
+                Ok(Vec::new())
             }
         }
 
@@ -9163,6 +9568,383 @@ mod tests {
                     .contains(live.host().raw()),
                 "and the payload is catalogued again"
             );
+        }
+
+        /// Task 7: revocation of mutated source pages and the exact
+        /// stale-instruction-abort classifier. Shared INITIAL code omits its
+        /// per-block generation guard, so these tests pin the ONLY two
+        /// defenses: a guest write revokes the matching RX chunks through the
+        /// one seam, and only the measured stale abort shape
+        /// (EC 0x20|0x21, pc == far, pc in a revoked chunk) is ever consumed.
+        mod live_revoke {
+            use super::*;
+            use crate::live_arena::LiveRevokedChunk;
+
+            /// The measured fd-backed revoked-chunk abort ESR on this host
+            /// (see `live_revoke_abort_shape_probe_records_signal_esr_far_pc`
+            /// in carrick-native-darwin): EC 0x20 (instruction abort, lower
+            /// EL), IFSC 0x06, delivered as SIGBUS with FAR == PC.
+            const MEASURED_STALE_ESR: u64 = 0x8200_0006;
+            /// A data abort from EL0 (EC 0x24) with the same IFSC bits.
+            const DATA_ABORT_ESR: u64 = 0x9000_0006;
+
+            /// Install one live block per page and script the authority's
+            /// revocation plan to cover each installed entry with one exact
+            /// chunk.
+            fn planned_chunk(
+                lane: &Lane,
+                chunk_index: u32,
+                source_page: u64,
+                covering: types::CacheVa,
+            ) -> LiveRevokedChunk {
+                let _ = lane;
+                LiveRevokedChunk {
+                    chunk_index,
+                    source_page,
+                    rx_start: HostVa(covering.host().raw() & !0x3ff),
+                    rx_len: 0x400,
+                }
+            }
+
+            #[test]
+            fn guest_write_revokes_only_matching_source_page_chunks() {
+                let lane = Lane::new(FakeReady::Hit, FakeWinner::Publish);
+                let page_a = SEGMENT_START;
+                let page_b = SEGMENT_START + 16 * 1024;
+                let first = lane.install_ready(GuestVa(page_a));
+                let second = lane.install_ready(GuestVa(page_a + 0x100));
+                // A live block on ANOTHER page, installed through the same
+                // production bookkeeping (segment gating bypassed: this test
+                // owns index hygiene, not eligibility).
+                let observation_b = lane.observe(GuestVa(page_b));
+                let prepared = prepared_block(GuestVa(page_b));
+                let block_b = lane.authority.block(&prepared, GuestVa(page_b));
+                lane.with_state(|state| {
+                    state
+                        .install_live_block(
+                            (GuestVa(page_b), types::CodeGeneration::INITIAL),
+                            &observation_b,
+                            None,
+                            Box::new(SharedFakeBlock(block_b)),
+                        )
+                        .expect("install the other page's live block")
+                });
+
+                // Multiple chunks (and, in the real arena, multiple unit
+                // digests) for the mutated page; one chunk for the other page
+                // that must NOT be revoked. Chunk ranges are DISJOINT like
+                // the real arena's: the second models another exact digest's
+                // chunk for the same page.
+                let chunk_one = planned_chunk(&lane, 3, page_a, first);
+                assert!(
+                    (chunk_one.rx_start.raw()..chunk_one.rx_start.raw() + chunk_one.rx_len)
+                        .contains(&second.host().raw()),
+                    "fixture: both installed entries share the first chunk"
+                );
+                let chunk_two = LiveRevokedChunk {
+                    chunk_index: 9,
+                    source_page: page_a,
+                    rx_start: HostVa(chunk_one.rx_start.raw() + chunk_one.rx_len),
+                    rx_len: chunk_one.rx_len,
+                };
+                lane.authority
+                    .plan_revocation(page_a, vec![chunk_one, chunk_two]);
+                lane.authority
+                    .plan_revocation(page_b, vec![planned_chunk(&lane, 21, page_b, first)]);
+
+                let revoked = lane
+                    .translator
+                    .revoke_live_source_range(GuestVa(page_a)..GuestVa(page_a + 4))
+                    .expect("revocation must succeed");
+                assert_eq!(revoked, 2, "both of the mutated page's chunks");
+
+                let calls = lane.authority.recorded_revocations();
+                assert_eq!(calls.len(), 1, "one callback per mutation note");
+                assert!(
+                    calls[0].0.start.raw() <= page_a && calls[0].0.end.raw() > page_a,
+                    "the callback names the mutated range: {:?}",
+                    calls[0].0
+                );
+                assert!(
+                    calls[0].0.end.raw() <= page_b,
+                    "the callback must not cover the untouched page: {:?}",
+                    calls[0].0
+                );
+                // The process-local hint travels as validated hints, and the
+                // install-time hint recorded the block's own chunk plus the
+                // descriptor enumeration's.
+                assert!(
+                    calls[0].1.iter().any(|(page, _)| *page == page_a),
+                    "hints carry the mutated page: {:?}",
+                    calls[0].1
+                );
+                assert!(
+                    calls[0].1.iter().all(|(page, _)| *page == page_a),
+                    "hints must not leak other pages: {:?}",
+                    calls[0].1
+                );
+
+                let catalog = lane.translator.revoked_live_chunks_for_test();
+                assert_eq!(
+                    catalog,
+                    vec![chunk_one, chunk_two],
+                    "the catalog holds exactly the mutated page's chunks, \
+                     ascending by rx_start"
+                );
+
+                lane.with_state(|state| {
+                    assert!(
+                        !state
+                            .live_blocks
+                            .contains_key(&(GuestVa(page_a), types::CodeGeneration::INITIAL)),
+                        "the mutated page's block leaves the live lookup index"
+                    );
+                    assert!(
+                        !state.live_blocks.contains_key(&(
+                            GuestVa(page_a + 0x100),
+                            types::CodeGeneration::INITIAL
+                        )),
+                    );
+                    assert!(
+                        state
+                            .live_blocks
+                            .contains_key(&(GuestVa(page_b), types::CodeGeneration::INITIAL)),
+                        "the untouched page's block survives"
+                    );
+                    assert!(
+                        state
+                            .published_blocks
+                            .get(GuestVa(page_a), types::CodeGeneration::INITIAL)
+                            .is_none(),
+                        "the read-side mirror stops serving the revoked block"
+                    );
+                    assert!(
+                        state
+                            .published_blocks
+                            .get(GuestVa(page_b), types::CodeGeneration::INITIAL)
+                            .is_some(),
+                    );
+                    assert!(
+                        !state.live_published_index.is_empty(),
+                        "the ADDRESS index is retained: it is the fault-recovery \
+                         index, not a lookup index"
+                    );
+                });
+            }
+
+            /// One lane with an installed live block whose entry the scripted
+            /// revocation covers — the classifier fixture every consumption
+            /// test starts from.
+            fn revoked_lane() -> (Lane, types::CacheVa) {
+                let lane = Lane::new(FakeReady::Hit, FakeWinner::Publish);
+                let guest = GuestVa(SEGMENT_START);
+                let entry = lane.install_ready(guest);
+                lane.authority.plan_revocation(
+                    SEGMENT_START,
+                    vec![planned_chunk(&lane, 3, SEGMENT_START, entry)],
+                );
+                lane.translator
+                    .revoke_live_source_range(GuestVa(SEGMENT_START)..GuestVa(SEGMENT_START + 4))
+                    .expect("revocation must succeed");
+                (lane, entry)
+            }
+
+            /// Positive control shared by the negative tests: the EXACT
+            /// measured shape at the revoked entry IS consumed, with the
+            /// block's guest PC recovered. A stubbed classifier fails here,
+            /// so none of the negative pins can pass vacuously.
+            fn assert_consumes_measured_shape(lane: &Lane, entry: types::CacheVa) {
+                let pc = entry.host().raw() as u64;
+                lane.with_state(|state| {
+                    let recovery = state
+                        .stale_live_instruction_abort(MEASURED_STALE_ESR, pc, pc)
+                        .expect("the measured stale shape must be consumed");
+                    assert_eq!(recovery.guest_pc, GuestVa(SEGMENT_START));
+                });
+            }
+
+            #[test]
+            fn data_abort_in_revoked_chunk_is_not_consumed() {
+                let (lane, entry) = revoked_lane();
+                assert_consumes_measured_shape(&lane, entry);
+                let pc = entry.host().raw() as u64;
+                lane.with_state(|state| {
+                    assert!(
+                        state
+                            .stale_live_instruction_abort(DATA_ABORT_ESR, pc, pc)
+                            .is_none(),
+                        "a data abort is not the stale shape even inside a \
+                         revoked chunk"
+                    );
+                });
+            }
+
+            #[test]
+            fn instruction_abort_in_foreign_prot_none_range_is_not_consumed() {
+                let (lane, entry) = revoked_lane();
+                assert_consumes_measured_shape(&lane, entry);
+                let foreign = (entry.host().raw() as u64) + 0x10_0000;
+                lane.with_state(|state| {
+                    assert!(
+                        state
+                            .stale_live_instruction_abort(MEASURED_STALE_ESR, foreign, foreign)
+                            .is_none(),
+                        "an instruction abort outside every revoked chunk \
+                         falls through to the normal fault path"
+                    );
+                });
+            }
+
+            #[test]
+            fn mismatched_pc_and_far_is_not_consumed() {
+                let (lane, entry) = revoked_lane();
+                assert_consumes_measured_shape(&lane, entry);
+                let pc = entry.host().raw() as u64;
+                lane.with_state(|state| {
+                    assert!(
+                        state
+                            .stale_live_instruction_abort(MEASURED_STALE_ESR, pc, pc + 8)
+                            .is_none(),
+                        "pc != far is not the exact stale shape"
+                    );
+                });
+            }
+
+            #[test]
+            fn in_process_exec_drops_retired_live_ranges() {
+                let (lane, entry) = revoked_lane();
+                assert!(
+                    !lane.translator.revoked_live_chunks_for_test().is_empty(),
+                    "the fixture must revoke before the exec reset"
+                );
+
+                let mut thread = ThreadTranslator::for_process(Arc::clone(&lane.translator), 6);
+                let mut token = thread
+                    .prepare_direct_binding_exec_reset()
+                    .expect("mint the retiring translator's exec authority");
+                lane.translator
+                    .reset_after_fork_for_exec(&thread, &mut token)
+                    .expect("commit the exec reset");
+
+                assert!(
+                    lane.translator.revoked_live_chunks_for_test().is_empty(),
+                    "an in-process exec drops the retired revoked ranges"
+                );
+                let pc = entry.host().raw() as u64;
+                lane.with_state(|state| {
+                    assert!(
+                        state
+                            .stale_live_instruction_abort(MEASURED_STALE_ESR, pc, pc)
+                            .is_none(),
+                        "no retired range may classify after the reset"
+                    );
+                });
+            }
+
+            /// mprotect, munmap and remap all reach the ONE revocation seam
+            /// (`note_dsr_code_mutation` -> `revoke_live_source_range`), so
+            /// no executable-lifecycle event can mutate a source page while a
+            /// stale shared chunk stays executable.
+            #[test]
+            fn mprotect_munmap_and_remap_share_the_revocation_seam() {
+                use carrick_guest_mem::GuestMemory as _;
+                const PAGE: usize = 16 * 1024;
+
+                let process = Arc::new(
+                    ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT)
+                        .expect("process translator"),
+                );
+                let authority = FakeAuthority::new(FakeReady::Miss, FakeWinner::Publish);
+                process
+                    .install_live_authority(Arc::clone(&authority) as Arc<_>)
+                    .expect("install the recording authority");
+
+                let mapped = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        2 * PAGE,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_ANON | libc::MAP_PRIVATE,
+                        -1,
+                        0,
+                    )
+                };
+                assert_ne!(mapped, libc::MAP_FAILED, "map the seam fixture");
+                let base = mapped as u64;
+                let mut memory = crate::mapped_memory::NativeMappedMemory {
+                    address_mode: carrick_dsr::address::NativeAddressMode::Direct,
+                    owned_host_ranges: Arc::new(vec![
+                        HostVa(mapped as usize)..HostVa(mapped as usize + 2 * PAGE),
+                    ]),
+                    regions: vec![crate::mapped_memory::NativeMappedRegion {
+                        start: base,
+                        end: base + 2 * PAGE as u64,
+                        host_protects: true,
+                        shared_futex: false,
+                        guest_writable: false,
+                        default_prot: carrick_abi::LINUX_PROT_READ | carrick_abi::LINUX_PROT_EXEC,
+                        shared_key_base: 0,
+                        shared_key_offset: 0,
+                    }],
+                    protections: carrick_guest_mem::protections::MemoryProtections::default(),
+                    native_prot_ranges: crate::prot_ranges::NativeProtRanges::default(),
+                    native_write_exec_writable_pages: std::collections::BTreeSet::new(),
+                    linux4k_page_protections: std::collections::BTreeMap::new(),
+                    exclusive_sequences: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
+                    host_access_lifts: parking_lot::Mutex::new(std::collections::HashMap::new()),
+                    host_page_size: PAGE as u64,
+                    linux_page_size: PAGE as u64,
+                    dsr_generations: cache::PageGenerationTable::new(PAGE as u64)
+                        .expect("generation table"),
+                    dsr_translator: Some(Arc::clone(&process)),
+                };
+
+                // Leg 1 — mprotect: dropping exec from an executable page.
+                memory
+                    .protect_range(base, PAGE, carrick_abi::LINUX_PROT_READ)
+                    .expect("mprotect leg");
+                assert_eq!(
+                    authority.recorded_revocations().len(),
+                    1,
+                    "mprotect reaches the revocation seam"
+                );
+
+                // Restoring exec is itself a code-visibility transition and
+                // notes again — count it so the remap delta below is exact.
+                memory
+                    .protect_range(
+                        base,
+                        PAGE,
+                        carrick_abi::LINUX_PROT_READ | carrick_abi::LINUX_PROT_EXEC,
+                    )
+                    .expect("restore exec");
+                let after_restore = authority.recorded_revocations().len();
+
+                // Leg 2 — remap: a fresh mapping replacing executable code.
+                memory
+                    .map_host_alias(base, PAGE as u64, &[], None, false)
+                    .expect("remap leg");
+                assert_eq!(
+                    authority.recorded_revocations().len(),
+                    after_restore + 1,
+                    "a remap over executable code reaches the same seam"
+                );
+
+                // Leg 3 — munmap: the second executable page unmaps.
+                let before_unmap = authority.recorded_revocations().len();
+                memory
+                    .unmap_range(base + PAGE as u64, PAGE)
+                    .expect("munmap leg");
+                assert_eq!(
+                    authority.recorded_revocations().len(),
+                    before_unmap + 1,
+                    "munmap reaches the same seam"
+                );
+
+                unsafe {
+                    libc::munmap(mapped, 2 * PAGE);
+                }
+            }
         }
 
         /// Task 6F: the live lane's typed counters.

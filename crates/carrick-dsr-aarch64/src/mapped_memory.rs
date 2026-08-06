@@ -1035,6 +1035,17 @@ impl NativeMappedMemory {
             .dsr_generations
             .note_guest_code_write(range.clone())
             .map_err(|error| MemoryError::HostMap(error.to_string()))?;
+        // Task 7: revoke the mutated pages' shared live chunks BEFORE the
+        // caller's source mutation proceeds. Shared INITIAL code omits its
+        // per-block generation guard, so `mach_vm_protect(PROT_NONE)` on the
+        // exact chunks is the ONLY thing standing between a stale shared
+        // translation and post-mutation execution. Fail-closed: an error here
+        // fails the mutation rather than letting stale code stay executable.
+        if let Some(translator) = self.dsr_translator.as_ref() {
+            translator
+                .revoke_live_source_range(range.clone())
+                .map_err(|error| MemoryError::HostMap(format!("live revocation: {error}")))?;
+        }
         // Sever incoming private direct links into the bumped pages AFTER
         // the bump, so a racing entry through a not-yet-severed link lands in
         // a block whose guard (or, once trusted entries exist, whose one-body
@@ -3507,6 +3518,13 @@ impl NativeMappedMemory {
         let (page_start, page_len) = self
             .host_page_range(address, end)
             .map_err(RepointPrivateError::clean)?;
+        // A repoint that replaces executable bytes is a code mutation and
+        // shares the ONE revocation seam (Task 7): generation bump plus live
+        // chunk revocation, BEFORE the replacement mapping goes live.
+        if self.range_may_execute(page_start, page_len) {
+            self.note_dsr_code_mutation(page_start, page_len)
+                .map_err(RepointPrivateError::clean)?;
+        }
         let (host_start, flags) = self
             .fixed_mapping_target(
                 page_start,
@@ -3605,6 +3623,19 @@ impl NativeMappedMemory {
             host_map_len,
             "native alias replaced host range",
         )?;
+        // A fresh mapping REPLACING executable code is a code mutation: it
+        // shares the ONE revocation seam (Task 7) — generation bump plus live
+        // chunk revocation — BEFORE the replacement mapping goes live, so a
+        // stale shared translation of the old bytes can never execute past
+        // this point.
+        if self.range_may_execute(guest_map_start, host_map_len_usize) {
+            self.note_dsr_code_mutation(guest_map_start, host_map_len_usize)
+                .map_err(|error| {
+                    NativeMemoryError::Unsupported(format!(
+                        "native alias code-mutation note: {error}"
+                    ))
+                })?;
+        }
 
         let (mmap_prot, final_prot, flags, fd, offset, direct_file) = match file.as_ref() {
             Some((fd, offset, prot)) if page_delta == 0 => (
