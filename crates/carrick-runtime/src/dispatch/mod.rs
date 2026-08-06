@@ -2014,6 +2014,24 @@ pub(crate) struct HostAliasDispatchGuard {
 
 impl HostAliasDispatchGuard {
     pub(crate) fn publish(mut self, commit: HostAliasCommit) -> HostAliasTransaction {
+        // A publisher running under the SHARED native `:3440` dispatch guard
+        // defers its install past that guard's release: the alias phase then
+        // outlives the publisher's memory guard and the install must
+        // re-acquire the exclusive guard while sibling mapping syscalls park
+        // in `begin_dispatch` holding theirs — the hold-and-wait cycle behind
+        // the 2026-08-06 policy-ON go-build wedge. Classify the syscall in
+        // `native_syscall_mutates_mappings` instead so the install is consumed
+        // in-dispatch under the exclusive guard.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        assert!(
+            !matches!(
+                crate::native_darwin::native_dispatch_guard_class(),
+                Some(crate::native_darwin::NativeDispatchGuardClass::Shared)
+            ),
+            "host-alias publish under a SHARED native dispatch guard: the deferred \
+             install would re-open the alias-phase/memory-lock deadlock cycle; \
+             classify the syscall in native_syscall_mutates_mappings"
+        );
         let raw = self
             .transactions
             .next_id
@@ -2063,9 +2081,19 @@ pub struct SyscallDispatcher {
     mem: Mutex<mem::MemState>,
     /// Serializes mapping syscalls across the dispatcher/runtime split. A
     /// `MapHostAlias` remains `Pending` until its runtime consumer claims it,
-    /// then `Installing` until exact metadata commit or abort. Later mapping
-    /// operations wait without holding a subsystem lock, so no sibling can race
-    /// a host `MAP_FIXED` install or have its unrelated state erased by rollback.
+    /// then `Installing` until exact metadata commit or abort, so no sibling
+    /// can race a host `MAP_FIXED` install or have its unrelated state erased
+    /// by rollback.
+    ///
+    /// Deadlock invariant (the 2026-08-06 policy-ON go-build wedge): a
+    /// `Pending`/`Installing` phase must never await a lock a `begin_dispatch`
+    /// waiter can hold. On the darwin native lane, handlers wait here while
+    /// holding the `:3440` dispatch guard on the guest-memory `RwLock`, so the
+    /// install must complete under the PUBLISHER's own exclusive guard
+    /// (`install_native_host_alias` inside `dispatch_native_syscall_inner`) —
+    /// never deferred past its release. `HostAliasDispatchGuard::publish`
+    /// fail-closes the one shape that breaks this (publishing from under a
+    /// SHARED dispatch guard).
     host_alias_transactions: Arc<HostAliasTransactions>,
     /// Owned process subsystem state (executable path, personality,
     /// dumpable flag, task comm name). See [`proc::ProcState`].
@@ -8023,6 +8051,63 @@ mod overlay_dispatch_tests {
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
         assert!(libc::WIFSIGNALED(status), "child status was 0x{status:x}");
         assert_eq!(libc::WTERMSIG(status), libc::SIGABRT);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn host_alias_test_commit() -> HostAliasCommit {
+        HostAliasCommit::mmap(mem::HostAliasMmapCommit {
+            start: crate::memory::LINUX_HIGH_VA_THRESHOLD,
+            len: LINUX_PAGE_SIZE,
+            prot: LinuxProtFlags::READ,
+            sharing: ProcMapSharing::Private,
+            path: String::new(),
+            locked: None,
+            resident: false,
+            bus_fault: None,
+            write_sealed_shared: false,
+            writable_memfd: None,
+        })
+    }
+
+    /// A publisher dispatched under the SHARED `:3440` guard defers its
+    /// install past that guard's release: the alias phase then outlives the
+    /// publisher's memory guard, the install must re-acquire the exclusive
+    /// guard while it still owns the phase, and any sibling mapping syscall
+    /// that won the guard in between parks in `begin_dispatch` holding the
+    /// very lock the install needs — the 2026-08-06 policy-ON go-build
+    /// deadlock cycle. `publish` must refuse the shape outright.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn host_alias_publish_under_shared_native_guard_fails_closed() {
+        let dispatcher = SyscallDispatcher::new();
+        let guard = dispatcher.begin_host_alias_dispatch();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _class = crate::native_darwin::NativeDispatchGuardClassScope::enter(
+                crate::native_darwin::NativeDispatchGuardClass::Shared,
+            );
+            guard.publish(host_alias_test_commit())
+        }));
+        assert!(
+            result.is_err(),
+            "publish under a SHARED native dispatch guard must fail closed: \
+             its deferred install re-opens the alias/memory deadlock cycle"
+        );
+    }
+
+    /// The exclusive-guard publisher is the sound shape: its install is
+    /// consumed by `dispatch_native_syscall_inner` under the same held guard,
+    /// so the alias phase never outlives the publisher's exclusive guard.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn host_alias_publish_under_exclusive_native_guard_is_allowed() {
+        let dispatcher = SyscallDispatcher::new();
+        let guard = dispatcher.begin_host_alias_dispatch();
+        let _class = crate::native_darwin::NativeDispatchGuardClassScope::enter(
+            crate::native_darwin::NativeDispatchGuardClass::Exclusive,
+        );
+        let transaction = guard.publish(host_alias_test_commit());
+        drop(transaction); // aborts the pending phase back to Idle
+        drop(dispatcher.begin_host_alias_dispatch()); // Idle again: no wedge
     }
 
     #[test]
