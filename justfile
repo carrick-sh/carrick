@@ -195,6 +195,14 @@ test-integration:
     if [ "{{os()}}" = "macos" ]; then
         cargo test -p carrick-runtime --test integration
         cargo test -p carrick-runtime --test syscall_process
+        # `carrick-cli`'s trace_profile suite: the D-program contracts and the
+        # DSRPROF1/DSRPROF2 stream parsers. It ran in NO gate until 2026-08-06
+        # -- `just test`'s `--lib --bins` reaches carrick-cli's in-file tests
+        # but never its `tests/` directory, and this recipe listed only the
+        # runtime/engine/image suites. Same house trap the `--bins` comment in
+        # `test` describes. It needs no HVF, guest, or Docker: every case
+        # parses fixtures or asserts on argument validation.
+        cargo test -p carrick-cli --test trace_profile
         cargo test -p carrick-engine
         cargo test -p carrick-image
         exit 0
@@ -206,6 +214,7 @@ test-integration:
     # not because of feature wiring.)
     cargo test -p carrick-runtime {{_platform_features}} --test integration
     cargo test -p carrick-runtime {{_platform_features}} --test syscall_process
+    cargo test -p carrick-cli {{_platform_features}} --test trace_profile
     cargo test -p carrick-engine {{_platform_features}}
     cargo test -p carrick-image
 

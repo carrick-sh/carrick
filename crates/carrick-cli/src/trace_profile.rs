@@ -600,6 +600,9 @@ struct V2Validator {
     cpu_user_summary: BTreeMap<(RawProcessImageKey, u64), u64>,
     cpu_kernel_summary: BTreeMap<(RawProcessImageKey, String, String, u64), u64>,
     cpu_samples: u64,
+    /// The bound the completion record declared, retained so
+    /// `require_capture_bound` can check it against what was requested.
+    capture_bound_s: Option<u64>,
     dtrace_errors: u64,
     transition_events_seen: bool,
     terminal_qualifications: BTreeSet<(String, String, String)>,
@@ -2056,6 +2059,7 @@ impl V2Validator {
         if bound_limit_s == 0 {
             bail!("DSRPROF2 completion bound_limit_s must be positive");
         }
+        self.capture_bound_s = Some(bound_limit_s);
         let probe_errors = record.decimal_u64("probe_errors")?;
         if probe_errors != self.dtrace_errors {
             bail!(
@@ -2998,6 +3002,7 @@ fn build_v2_profile_summary(
     if !validator.complete {
         bail!("cannot summarize an incomplete DSRPROF2 stream");
     }
+    let capture_bound_s = validator.capture_bound_s;
     let instances = validator.presentation_instances()?;
     let instance_for = |key: RawProcessImageKey| {
         instances
@@ -3376,6 +3381,7 @@ fn build_v2_profile_summary(
         metrics,
         provenance: ProfileProvenance::default(),
         program_sha256: None,
+        capture_bound_s,
     })
 }
 
@@ -3567,6 +3573,9 @@ pub(crate) struct ProfileSummary {
     /// any. `require_program_sha256` is what turns it from a recorded string
     /// into an authority check.
     program_sha256: Option<String>,
+    /// The capture bound the D program reported running with, if the stream
+    /// declares one. `require_capture_bound` is what turns it into a check.
+    capture_bound_s: Option<u64>,
 }
 
 impl ProfileSummary {
@@ -3628,6 +3637,7 @@ impl ProfileSummary {
         let mut open_stack = None::<StackTraceRecord>;
         let mut completion = None;
         let mut live_arena_header = None::<DsrLiveArenaHeader>;
+        let mut capture_bound_s = None::<u64>;
 
         for (index, raw_line) in lines.iter().enumerate() {
             let line = raw_line.trim();
@@ -3708,6 +3718,9 @@ impl ProfileSummary {
                 // a successful profile completion. Default old DSRPROF1 streams
                 // to CLD_EXITED so checked-in pre-field evidence remains readable.
                 let target_exit_reason = record.optional_u64("target_exit_reason")?.unwrap_or(1);
+                // Optional: only the bounded native-wall program declares it,
+                // and pre-bound checked-in evidence has no such field.
+                capture_bound_s = record.optional_u64("bound_limit_s")?;
                 completion = Some((profile, bounded, target_exit_reason));
                 continue;
             }
@@ -3983,7 +3996,29 @@ impl ProfileSummary {
             metrics,
             provenance: ProfileProvenance::default(),
             program_sha256: live_arena_header.map(|header| header.program_sha256),
+            capture_bound_s,
         })
+    }
+
+    /// Bind a capture to the bound the OPERATOR asked for.
+    ///
+    /// The reason this exists is the defect the first live smoke of
+    /// `--profile-bound-seconds` exposed: the flag was dropped in an argv
+    /// rebuild and the capture ran to a DIFFERENT ceiling than requested,
+    /// while every artifact still looked healthy. Recording the bound is
+    /// bookkeeping; THIS is the check, and it fails closed.
+    pub(crate) fn require_capture_bound(&self, expected: u64) -> Result<()> {
+        let observed = self.capture_bound_s.ok_or_else(|| {
+            anyhow!(
+                "profile {:?} stream declares no capture bound, so the requested \
+                 {expected}s bound cannot be confirmed",
+                self.profile
+            )
+        })?;
+        if observed != expected {
+            bail!("capture ran with a {observed}s bound, not the requested {expected}s");
+        }
+        Ok(())
     }
 
     /// Bind an authenticated stream to the exact D program the caller ran.
@@ -4545,6 +4580,41 @@ mod tests {
         assert!(
             rendered.contains("timed out at its 900s bound"),
             "unexpected error: {rendered}"
+        );
+    }
+
+    /// The check that would have caught the argv-drop defect: a capture that
+    /// ran to the shipped default while the operator asked for something else
+    /// must be REJECTED, not summarized.
+    #[test]
+    fn capture_bound_must_match_the_requested_window() {
+        let raw = include_str!("../tests/fixtures/dsrprof2-valid.raw");
+        let summary = ProfileSummary::from_lines(raw.lines(), ProfileCaptureStatus::default())
+            .expect("valid fixture");
+        summary
+            .require_capture_bound(180)
+            .expect("the fixture declares a 180s bound");
+        let error = summary
+            .require_capture_bound(900)
+            .expect_err("a 180s capture is not evidence about a 900s window");
+        assert!(
+            format!("{error:#}").contains("ran with a 180s bound, not the requested 900s"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    /// A stream from the pre-bound program cannot be confirmed either way.
+    #[test]
+    fn capture_bound_check_fails_closed_without_a_declared_bound() {
+        let summary =
+            ProfileSummary::from_lines(raw_native_wall_lines(), ProfileCaptureStatus::default())
+                .expect("legacy DSRPROF1 stream still parses");
+        let error = summary
+            .require_capture_bound(900)
+            .expect_err("an undeclared bound must not be assumed to match");
+        assert!(
+            format!("{error:#}").contains("declares no capture bound"),
+            "unexpected error: {error:#}"
         );
     }
 

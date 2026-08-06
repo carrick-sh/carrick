@@ -384,6 +384,10 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
     // stable PID-incarnation key before any command-specific fork or exec.
     carrick_runtime::probes::host_process_birth_current();
     let Cli { store, command } = cli;
+    // Kept alongside the opened store: the trace hops rebuild argv and must
+    // re-emit the ROOT-level flag verbatim, which needs the path, not the
+    // opened `ImageStore`.
+    let store_path = store.clone();
     let store = store
         .map(ImageStore::new)
         .unwrap_or_else(ImageStore::default_for_user);
@@ -1398,7 +1402,13 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
         } => {
             #[cfg(any(target_os = "macos", target_os = "freebsd"))]
             {
-                crate::trace_cli::exec_trace_child(trace_uid, trace_gid, &trace_groups, &command)?;
+                crate::trace_cli::exec_trace_child(
+                    store_path.as_deref(),
+                    trace_uid,
+                    trace_gid,
+                    &trace_groups,
+                    &command,
+                )?;
             }
             #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
             {
@@ -1506,6 +1516,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     }
                     let forwarded = trace_sudo_argv(&TraceSudoInvocation {
                         executable: &me,
+                        store: store_path.as_deref(),
                         flowindent,
                         script: script.as_deref(),
                         profile,
@@ -1802,6 +1813,12 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                             if let Some(expected) = live_arena_program_sha256.as_deref() {
                                 summary.require_program_sha256(expected)?;
                             }
+                            // A capture that silently ran to a different
+                            // ceiling than requested is not evidence about the
+                            // window the operator asked for.
+                            if let Some(expected) = profile_bound_seconds {
+                                summary.require_capture_bound(expected)?;
+                            }
                             if let Some(overlay) = sampled_kernel_overlay {
                                 summary.attach_sampled_kernel_overlay(overlay)?;
                             }
@@ -1825,6 +1842,9 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         summary.require_profile(requested_profile)?;
                         if let Some(expected) = live_arena_program_sha256.as_deref() {
                             summary.require_program_sha256(expected)?;
+                        }
+                        if let Some(expected) = profile_bound_seconds {
+                            summary.require_capture_bound(expected)?;
                         }
                         summary.set_provenance(capture_provenance(&me, &command)?);
                         eprintln!("{}", summary.render_human());
