@@ -368,6 +368,14 @@ self-exec path is byte-for-byte unchanged. Delete
 extend the surviving `failed_setexec_restores_the_prepared_fd_flags` to
 cover the two arena fds.
 
+**2026-08-05 mechanism note (post-implementation):** the
+`POSIX_SPAWN_SETEXEC` spawn path itself dies with the registered ports. Its
+`posix_spawnattr_t` carried only the SETEXEC flag and the registered-port
+vector, and the arena-absent self-exec already used plain `execve`, so with
+no ports to install there is nothing for a spawn to carry. `execve` is now
+the ONE self-exec mechanism, which is why this section's test names below
+say `exec`, not `setexec`.
+
 **Resolution of the 6C2 §8(b) keep-as-kernel-evidence note:** that note kept
 `failed_setexec_leaves_the_registered_port_vector_unchanged` as evidence of
 *kernel* behavior for the registered-port vector. This amendment deletes it
@@ -381,11 +389,11 @@ retired mechanism.
 **Red-first tests:**
 
 - `fork_exec_successor_maps_arena_from_inherited_fds_at_fresh_addresses`
-- `forked_child_setexec_successor_acquires_creator_ready_record_and_bytes` —
+- `forked_child_exec_successor_acquires_creator_ready_record_and_bytes` —
   THE boundary 6C2 proved was never crossed: creator publishes READY, a
-  guest-shaped `fork(2)` child SETEXEC-execs, the successor validates and
+  guest-shaped `fork(2)` child host-self-execs, the successor validates and
   executes the creator's bytes and observes a post-exec creator write
-- `failed_setexec_restores_the_prepared_arena_fd_flags`
+- `failed_exec_restores_the_prepared_arena_fd_flags`
 - `arena_fds_never_enter_the_guest_fd_table` — the guest-fd-space isolation
   requirement's membership half (design doc "Guest fd-space isolation"): an
   arena-holding guest process's `fd_table` names no arena fd, and the fds'

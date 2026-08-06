@@ -3292,7 +3292,7 @@ mod tests {
         }
 
         #[test]
-        fn failed_setexec_restores_the_prepared_arena_fd_flags() {
+        fn failed_exec_restores_the_prepared_arena_fd_flags() {
             let _serial = test_lock();
             let arena = arena();
             let receipts = attempt_failed_exec(&arena, None);
@@ -3411,7 +3411,7 @@ mod tests {
         /// executable code the creator produced AFTER that exec — ongoing
         /// shared coherence, not a snapshot.
         #[test]
-        fn forked_child_setexec_successor_acquires_creator_ready_record_and_bytes() {
+        fn forked_child_exec_successor_acquires_creator_ready_record_and_bytes() {
             let _serial = test_lock();
             let receipt = lifecycle_receipt();
             assert!(
