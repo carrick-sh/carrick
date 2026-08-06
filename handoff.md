@@ -15,6 +15,13 @@ This section supersedes the older **What's next** and **Branch state at
 handoff** sections below. Those sections remain as campaign history, not live
 instructions.
 
+Campaign strategy authority is now
+[`docs/superpowers/specs/2026-08-05-category-collapse-strategy-design.md`](docs/superpowers/specs/2026-08-05-category-collapse-strategy-design.md)
+(category budgets over the sequential ≥10% mechanism gate; live arena
+accounted as the whole translation category; AOT-priced codegen after
+runtime-on; kernel amplification ledger). The task sequencing below is
+unchanged by it.
+
 ### Current truth
 
 - The official shipped-default cold-build result is still **10.1776x**:

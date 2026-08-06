@@ -1,7 +1,10 @@
 # Getting carrick correct and fast: the plan
 
-**Status:** roadmap. Supersedes ad-hoc ranking with a phased plan whose every
-number is measured, not estimated — except where explicitly marked.
+**Status:** superseded 2026-08-05 for ranking and phase ordering by
+[`2026-08-05-category-collapse-strategy-design.md`](2026-08-05-category-collapse-strategy-design.md).
+The §5 appendix (rejected alternatives, DSR fallback playbook) and the tier-D
+phase status records below remain authoritative; the workload-shape framing in
+§0 stands.
 
 ## 0. Where we actually are
 
