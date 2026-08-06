@@ -6508,3 +6508,318 @@ fn dsr_signal_fault_preserves_destination_in_expanded_literal_load() {
     .expect("recover literal scratch");
     assert_eq!(snapshot.x, original.x);
 }
+
+/// Task 7: revocation and exact stale-abort recovery over the REAL fd-backed
+/// live arena, through the production translator, gateway, and C signal shim.
+mod live_revoke {
+    use super::super::super::NativeUcontextSnapshot;
+    use super::super::{PreparedEntry, PublicationAuthority, ThreadExit};
+    use carrick_dsr_aarch64::live_arena::LiveArenaCapacities;
+    use carrick_dsr_aarch64::shared_cache::{
+        AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
+        NativePageProfileIdentity, SharedExecutableSegment, SharedImageConfig,
+    };
+    use carrick_guest_mem::GuestVa;
+    use carrick_native_darwin::live_arena::{DarwinLiveArena, LiveArenaProcessView};
+    use std::sync::Arc;
+
+    const SOURCE_PAGE_BYTES: u64 = 16 * 1024;
+    /// The measured fd-backed revoked-chunk abort shape on this host (see
+    /// `live_revoke_abort_shape_probe_records_signal_esr_far_pc` in
+    /// carrick-native-darwin): SIGBUS with ESR 0x8200_0006 (EC 0x20,
+    /// instruction abort from lower EL, IFSC 0x06) and FAR == PC.
+    const MEASURED_STALE_ESR: u64 = 0x8200_0006;
+
+    /// One `add x17, x17, #1` then `svc #0`: an executed-effect witness plus
+    /// the smallest exit shape B3 accepts for a shared INITIAL publication.
+    const LIVE_WORDS: [u32; 2] = [0x9100_0631, 0xd400_0001];
+
+    struct LiveLaneFixture {
+        fixture: super::BiasedTranslatorFixture,
+        _arena: Arc<DarwinLiveArena>,
+    }
+
+    /// A REAL live lane over the production fixture: fd-backed arena, process
+    /// view branded with the fixture's generation domain, exact live image
+    /// configured, authority installed.
+    fn live_lane_fixture(guest_code: GuestVa) -> LiveLaneFixture {
+        assert_eq!(guest_code.raw() % SOURCE_PAGE_BYTES, 0);
+        let fixture = super::biased_translator_fixture(&LIVE_WORDS, guest_code);
+        // Production activates the translated-range catalog at backend entry;
+        // the fork-child repair refuses to replay a dormant one.
+        fixture
+            .translator
+            .process
+            .activate_translated_range_catalog()
+            .expect("activate the translated-range catalog");
+        let mut source_words = vec![0_u32; (SOURCE_PAGE_BYTES / 4) as usize];
+        source_words[..LIVE_WORDS.len()].copy_from_slice(&LIVE_WORDS);
+        let image = SharedImageConfig {
+            executable: ExecutableIdentity::Digest([0x59; 32]),
+            page_profile: NativePageProfileIdentity::Native16k,
+            address_mode: AddressModeIdentity::biased(fixture.host_bias),
+            segments: vec![SharedExecutableSegment::new(
+                ImageFileOffset::new(0),
+                ImageFileLen::new(SOURCE_PAGE_BYTES).expect("file length"),
+                guest_code,
+                GuestCodeLen::new(SOURCE_PAGE_BYTES).expect("guest length"),
+                source_words.into(),
+            )],
+        };
+        let stem = image
+            .key_for_segment(&image.segments[0])
+            .file_stem()
+            .expect("exact unit stem");
+        assert!(
+            fixture
+                .translator
+                .process
+                .configure_live_image_matching_for_test(image, SOURCE_PAGE_BYTES, &stem)
+                .expect("configure the live image"),
+            "the fixture image must select its own exact unit key"
+        );
+        let arena = Arc::new(
+            DarwinLiveArena::new(LiveArenaCapacities::V2).expect("create the fd-backed arena"),
+        );
+        let view =
+            LiveArenaProcessView::new(Arc::clone(&arena), fixture.memory.dsr_generations.domain())
+                .expect("process view over the arena");
+        fixture
+            .translator
+            .process
+            .install_live_authority(Arc::new(view))
+            .expect("install the live authority");
+        LiveLaneFixture {
+            fixture,
+            _arena: arena,
+        }
+    }
+
+    /// Drive one full guest entry at `guest` and return the prepared entry
+    /// and the finished exit.
+    fn run_block(
+        lane: &mut LiveLaneFixture,
+        snapshot: &mut NativeUcontextSnapshot,
+    ) -> (PreparedEntry, ThreadExit) {
+        let prepared = lane
+            .fixture
+            .translator
+            .prepare_entry::<false>(&lane.fixture.memory, snapshot)
+            .expect("prepare the live entry");
+        let prepared_exit = lane
+            .fixture
+            .translator
+            .enter_prepared::<false>(prepared, snapshot)
+            .expect("enter the prepared entry");
+        let exit = lane
+            .fixture
+            .translator
+            .finish_exit(&lane.fixture.memory, snapshot, prepared, prepared_exit)
+            .expect("finish the prepared entry");
+        (prepared, exit)
+    }
+
+    /// The first history: a real guest write after READY publication must
+    /// revoke the shared chunk, and a thread re-entering the revoked code
+    /// must be recovered EXACTLY — guest PC restored from the lazy live
+    /// metadata, the C snapshot retaining the measured ESR/FAR/PC — and then
+    /// re-translate privately at the new generation.
+    #[test]
+    fn instruction_abort_in_revoked_chunk_recovers_guest_pc_privately() {
+        let _signal_oracle = super::install_signal_handlers_for_oracle();
+        let guest_code = GuestVa(0x20_0910_0000);
+        let mut lane = live_lane_fixture(guest_code);
+
+        let mut stack = vec![0_u8; 16 * 1024];
+        let mut snapshot = super::seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+        snapshot.pc = guest_code.raw();
+        let baseline_x17 = snapshot.x[17];
+
+        // The first end-to-end live publication: the winner prepares, emits
+        // into the shared subregion, publishes READY, installs, and EXECUTES
+        // from the arena's RX alias.
+        let (prepared_live, exit) = run_block(&mut lane, &mut snapshot);
+        assert_eq!(
+            prepared_live.executable_authority(),
+            PublicationAuthority::Live,
+            "the block must execute from the live arena, not the private cache"
+        );
+        assert!(
+            matches!(exit, ThreadExit::Syscall { .. }),
+            "the live block runs to its syscall exit: {exit:?}"
+        );
+        assert_eq!(
+            snapshot.x[17],
+            baseline_x17.wrapping_add(1),
+            "the arena copy executed"
+        );
+        let live_entry = prepared_live.entry.host().raw() as u64;
+
+        // The guest mutates its code page AFTER the pre-READY recheck: the
+        // production seam must revoke the matching chunk task-locally.
+        lane.fixture
+            .memory
+            .note_dsr_code_mutation(guest_code.raw(), 4)
+            .expect("note the guest code write");
+        assert!(
+            !lane
+                .fixture
+                .translator
+                .process
+                .revoked_live_chunks_for_test()
+                .is_empty(),
+            "the mutated page's chunk enters the revoked catalog"
+        );
+
+        // A thread still holding the revoked entry re-enters it: the fetch
+        // aborts with the measured shape, the classifier consumes EXACTLY
+        // that shape, and recovery restores the guest PC without executing a
+        // single stale instruction.
+        snapshot.pc = guest_code.raw();
+        snapshot.x[17] = baseline_x17;
+        let prepared_exit = lane
+            .fixture
+            .translator
+            .enter_prepared::<false>(prepared_live, &mut snapshot)
+            .expect("enter the revoked entry");
+        let exit = lane
+            .fixture
+            .translator
+            .finish_exit(
+                &lane.fixture.memory,
+                &mut snapshot,
+                prepared_live,
+                prepared_exit,
+            )
+            .expect("finish the revoked entry");
+        assert!(
+            matches!(exit, ThreadExit::Kick),
+            "a classified stale abort resumes through the normal translation \
+             path, got {exit:?}"
+        );
+        assert_eq!(
+            snapshot.pc,
+            guest_code.raw(),
+            "recovery restores the exact guest PC"
+        );
+        assert_eq!(
+            snapshot.esr, MEASURED_STALE_ESR,
+            "the C snapshot retains the exact measured ESR"
+        );
+        assert_eq!(
+            snapshot.far, live_entry,
+            "the C snapshot retains the exact FAR (== the revoked entry)"
+        );
+        assert_eq!(
+            snapshot.x[17], baseline_x17,
+            "not one stale instruction executed"
+        );
+
+        // The normal path now translates PRIVATELY at the new generation and
+        // the guest makes progress.
+        let (prepared_private, exit) = run_block(&mut lane, &mut snapshot);
+        assert_eq!(
+            prepared_private.executable_authority(),
+            PublicationAuthority::Private,
+            "the re-translation is private: the revoked chunk is never \
+             remapped or reactivated"
+        );
+        assert!(matches!(exit, ThreadExit::Syscall { .. }));
+        assert_eq!(
+            snapshot.x[17],
+            baseline_x17.wrapping_add(1),
+            "the private re-translation executes the guest instruction"
+        );
+    }
+
+    /// The fork leg of the lifecycle discipline: a fork child inherits both
+    /// the revoked protections and the catalog; the fork-child repair must
+    /// rebuild the catalog before guest entry so a stale abort in the CHILD
+    /// classifies and recovers exactly as in the parent.
+    #[test]
+    fn fork_child_rebuilds_revoked_chunk_catalog_before_guest_entry() {
+        let _signal_oracle = super::install_signal_handlers_for_oracle();
+        let guest_code = GuestVa(0x20_0914_0000);
+        let mut lane = live_lane_fixture(guest_code);
+
+        let mut stack = vec![0_u8; 16 * 1024];
+        let mut snapshot = super::seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+        snapshot.pc = guest_code.raw();
+        let baseline_x17 = snapshot.x[17];
+
+        let (prepared_live, exit) = run_block(&mut lane, &mut snapshot);
+        assert_eq!(
+            prepared_live.executable_authority(),
+            PublicationAuthority::Live
+        );
+        assert!(matches!(exit, ThreadExit::Syscall { .. }));
+        lane.fixture
+            .memory
+            .note_dsr_code_mutation(guest_code.raw(), 4)
+            .expect("note the guest code write");
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let status = (|| -> i32 {
+                if unsafe { super::super::super::carrick_native_install_dsr_signal_handlers() } != 0
+                {
+                    return 10;
+                }
+                // The production fork-child repair, BEFORE any guest entry.
+                if let Err(error) = lane.fixture.translator.after_fork_child(7) {
+                    eprintln!("fork-child repair failed: {error}");
+                    return 11;
+                }
+                if lane
+                    .fixture
+                    .translator
+                    .process
+                    .revoked_live_chunks_for_test()
+                    .is_empty()
+                {
+                    return 12;
+                }
+                // A stale entry in the child must recover exactly, not
+                // execute stale code and not die.
+                snapshot.pc = guest_code.raw();
+                snapshot.x[17] = baseline_x17;
+                let Ok(prepared_exit) = lane
+                    .fixture
+                    .translator
+                    .enter_prepared::<false>(prepared_live, &mut snapshot)
+                else {
+                    return 13;
+                };
+                let Ok(exit) = lane.fixture.translator.finish_exit(
+                    &lane.fixture.memory,
+                    &mut snapshot,
+                    prepared_live,
+                    prepared_exit,
+                ) else {
+                    return 14;
+                };
+                if !matches!(exit, ThreadExit::Kick) {
+                    return 15;
+                }
+                if snapshot.pc != guest_code.raw() {
+                    return 16;
+                }
+                if snapshot.x[17] != baseline_x17 {
+                    return 17;
+                }
+                0
+            })();
+            unsafe { libc::_exit(status) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "the child must rebuild the catalog and recover the stale abort \
+             (see the numbered child statuses)"
+        );
+    }
+}

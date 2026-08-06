@@ -756,6 +756,22 @@ pub struct LiveOwnedChunkIdentity {
     pub source_page: u64,
 }
 
+/// One exact 64 KiB local RX chunk a revocation protected `PROT_NONE`.
+///
+/// `rx_start`/`rx_len` are PROCESS-LOCAL addresses of this view's executable
+/// alias — the interval the stale-abort classifier searches — and are never
+/// shared state: revocation is task-local by contract (Task 7), so another
+/// process's identical chunk keeps its own protection and its own catalog.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LiveRevokedChunk {
+    pub chunk_index: u32,
+    /// The 16 KiB guest source page whose mutation revoked this chunk. Fork
+    /// children rebuild their catalog per page from this attribution.
+    pub source_page: u64,
+    pub rx_start: HostVa,
+    pub rx_len: usize,
+}
+
 #[derive(Clone, Copy)]
 pub struct LiveTranslationArenaView<'a> {
     directory: &'a LiveArenaControlDirectoryV2,
@@ -2565,6 +2581,26 @@ pub trait LiveTranslationAuthority: Send + Sync {
     /// `None` is a named refusal — a view whose payload cannot be resolved
     /// never becomes an authority.
     fn rx_payload(&self) -> Option<LiveRxPayload>;
+
+    /// Revoke every ACTIVE chunk owned by any exact source group whose 16 KiB
+    /// source page overlaps `range`, plus the caller's validated per-page
+    /// `(source_page, chunk_index)` hints (Task 7).
+    ///
+    /// The DESCRIPTOR TABLE is the enumeration authority — the hints are a
+    /// process-local accelerator that cannot omit a later cross-process
+    /// expansion, so the implementation must re-enumerate ACTIVE descriptors
+    /// rather than trust the hints alone. Chunks are deduplicated and each
+    /// exact 64 KiB local RX chunk is protected `PROT_NONE` exactly once,
+    /// TASK-LOCAL: no shared FAILED/REVOKED state is written and no other
+    /// process's generation or protection changes.
+    ///
+    /// An error is fail-closed for the CALLER'S mutation: a source write must
+    /// not proceed while a stale chunk may still execute.
+    fn revoke_source_range(
+        &self,
+        range: std::ops::Range<GuestVa>,
+        hint_chunks: &[(u64, u32)],
+    ) -> Result<Vec<LiveRevokedChunk>, crate::types::DsrError>;
 }
 
 fn initial_slot(unit_key_digest: &[u8; 32], guest_start: u64) -> usize {

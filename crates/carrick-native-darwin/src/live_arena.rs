@@ -1067,6 +1067,86 @@ impl LiveArenaProcessView {
             record,
         })
     }
+
+    /// Task 7: revoke every ACTIVE chunk owned for the 16 KiB source pages
+    /// overlapping `range`, unioned with the caller's validated per-page
+    /// `(source_page, chunk_index)` hints, one `mach_vm_protect(PROT_NONE)`
+    /// per deduplicated exact 64 KiB local RX chunk.
+    ///
+    /// The DESCRIPTOR TABLE is the enumeration authority (re-scanned here so a
+    /// later cross-process expansion the local hint never saw is still
+    /// revoked); the hints only ADD chunks this process installed from, in
+    /// case a descriptor left ACTIVE state after installation. TASK-LOCAL by
+    /// construction: `revoke_rx` protects this task's own RX alias and writes
+    /// no shared state, so other processes keep executing their own copies.
+    pub fn revoke_source_range(
+        &self,
+        range: std::ops::Range<GuestVa>,
+        hint_chunks: &[(u64, u32)],
+    ) -> io::Result<Vec<carrick_dsr_aarch64::live_arena::LiveRevokedChunk>> {
+        use carrick_dsr_aarch64::live_arena::{
+            LIVE_ARENA_CHUNK_BYTES, LIVE_SOURCE_PAGE_BYTES, LiveRevokedChunk,
+        };
+        if range.start.raw() >= range.end.raw() {
+            return Ok(Vec::new());
+        }
+        let control = self.inner.arena.control_view()?;
+        // Descriptor-authoritative enumeration first; hints may only add.
+        let mut owned = std::collections::BTreeMap::<u32, u64>::new();
+        let page_mask = LIVE_SOURCE_PAGE_BYTES - 1;
+        let mut page = range.start.raw() & !page_mask;
+        let last = range.end.raw().saturating_sub(1) & !page_mask;
+        loop {
+            for identity in control.active_chunks_for_source_page(page) {
+                owned.entry(identity.chunk_index).or_insert(page);
+            }
+            if page == last {
+                break;
+            }
+            page = page.checked_add(LIVE_SOURCE_PAGE_BYTES).ok_or_else(|| {
+                invalid_input("live revocation source range overflowed a page step")
+            })?;
+        }
+        for (hint_page, chunk) in hint_chunks {
+            owned.entry(*chunk).or_insert(*hint_page);
+        }
+        if owned.is_empty() {
+            return Ok(Vec::new());
+        }
+        let payload = self.inner.arena.rx_payload_range().ok_or_else(|| {
+            invalid_input("live revocation requires a resolvable RX payload range")
+        })?;
+        let chunk_bytes = usize::try_from(LIVE_ARENA_CHUNK_BYTES)
+            .map_err(|_| invalid_input("live chunk size exceeds usize"))?;
+        let mut revoked = Vec::with_capacity(owned.len());
+        for (chunk_index, source_page) in owned {
+            let offset = (chunk_index as usize)
+                .checked_mul(chunk_bytes)
+                .ok_or_else(|| invalid_input("live chunk offset overflowed"))?;
+            let end = offset
+                .checked_add(chunk_bytes)
+                .filter(|end| {
+                    payload
+                        .start
+                        .checked_add(*end)
+                        .is_some_and(|abs| abs <= payload.end)
+                })
+                .ok_or_else(|| {
+                    invalid_input(format!(
+                        "live chunk {chunk_index} lies outside the RX payload"
+                    ))
+                })?;
+            // One protection call per deduplicated exact chunk, task-local.
+            self.inner.arena.revoke_rx(offset..end)?;
+            revoked.push(LiveRevokedChunk {
+                chunk_index,
+                source_page,
+                rx_start: HostVa(payload.start + offset),
+                rx_len: chunk_bytes,
+            });
+        }
+        Ok(revoked)
+    }
 }
 
 pub enum DarwinLiveLookup<'view> {
@@ -1405,6 +1485,21 @@ impl LiveTranslationAuthority for LiveArenaProcessView {
 
     fn rx_payload(&self) -> Option<LiveRxPayload> {
         Self::rx_payload(self)
+    }
+
+    fn revoke_source_range(
+        &self,
+        range: std::ops::Range<GuestVa>,
+        hint_chunks: &[(u64, u32)],
+    ) -> Result<
+        Vec<carrick_dsr_aarch64::live_arena::LiveRevokedChunk>,
+        carrick_dsr_aarch64::types::DsrError,
+    > {
+        Self::revoke_source_range(self, range, hint_chunks).map_err(|error| {
+            carrick_dsr_aarch64::types::DsrError::CachePolicy(format!(
+                "live source revocation failed: {error}"
+            ))
+        })
     }
 }
 
@@ -2399,6 +2494,174 @@ mod tests {
         assert!(restore_delivered);
         assert!(libc::WIFEXITED(status));
         assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    /// Task 7 abort-shape probe (plan §Task 7, brief "the one requirement the
+    /// plan predates"): MEASURE what a revoked fd-backed RX chunk delivers on
+    /// THIS host before any classifier consumes it. The child executes from
+    /// the revoked alias under a raw `SA_SIGINFO` handler and reports the
+    /// exact `(signal, si_code, esr, far, pc)` the kernel put in the
+    /// `ucontext`; the assertions pin the classifier's inputs:
+    ///
+    /// Measured 2026-08-06 on Darwin 27.0.0 / Apple Silicon (fd-backed
+    /// `mach_vm_protect(PROT_NONE)` chunk):
+    ///   signal = SIGBUS (10), si_code = 1 (Darwin `BUS_ADRALN` value),
+    ///   esr = 0x82000006 -> EC 0x20 (instruction abort from lower EL),
+    ///   IFSC 0x06 (translation fault: Darwin lowers the PROT_NONE entry
+    ///   rather than leaving a permission-faulting translation),
+    ///   FAR == PC == the revoked entry address.
+    /// The classifier therefore consumes EC 0x20|0x21 with pc == far, exactly
+    /// the plan's constants — re-proven on fd backing rather than assumed.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn live_revoke_abort_shape_probe_records_signal_esr_far_pc() {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct MeasuredAbort {
+            signal: i32,
+            si_code: i32,
+            esr: u64,
+            far: u64,
+            pc: u64,
+            entry: u64,
+        }
+
+        static mut MEASURED: MeasuredAbort = MeasuredAbort {
+            signal: 0,
+            si_code: 0,
+            esr: 0,
+            far: 0,
+            pc: 0,
+            entry: 0,
+        };
+        static mut PROBE_JMP: std::mem::MaybeUninit<[u64; 64]> = std::mem::MaybeUninit::uninit();
+
+        unsafe extern "C" {
+            fn sigsetjmp(env: *mut u64, savemask: libc::c_int) -> libc::c_int;
+            fn siglongjmp(env: *mut u64, value: libc::c_int) -> !;
+        }
+
+        unsafe extern "C" fn capture(
+            signal: libc::c_int,
+            info: *mut libc::siginfo_t,
+            uap: *mut libc::c_void,
+        ) {
+            unsafe {
+                let uc = uap.cast::<libc::ucontext_t>();
+                let mc = (*uc).uc_mcontext;
+                MEASURED = MeasuredAbort {
+                    signal,
+                    si_code: if info.is_null() { 0 } else { (*info).si_code },
+                    esr: u64::from((*mc).__es.__esr),
+                    far: (*mc).__es.__far,
+                    pc: (*mc).__ss.__pc,
+                    entry: MEASURED.entry,
+                };
+                siglongjmp(std::ptr::addr_of_mut!(PROBE_JMP).cast::<u64>(), 1);
+            }
+        }
+
+        let arena = protocol_arena();
+        let region = arena.jit_region(CODE).expect("code subregion");
+        unsafe {
+            std::ptr::copy_nonoverlapping(return_immediate(42).as_ptr(), write_ptr(&region), 8)
+        };
+        LiveArenaHostJit.flush_icache(unsafe { exec_ptr(&region) }, 8);
+        assert_eq!(
+            unsafe { call_u32(&region) },
+            42,
+            "the chunk must execute BEFORE revocation or the probe measures nothing"
+        );
+
+        let mut report_pipe = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(report_pipe.as_mut_ptr()) }, 0);
+        let child = unsafe { libc::fork() };
+        assert!(
+            child >= 0,
+            "fork failed: {}",
+            std::io::Error::last_os_error()
+        );
+        if child == 0 {
+            unsafe {
+                libc::close(report_pipe[0]);
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = capture as *const () as usize;
+                action.sa_flags = libc::SA_SIGINFO;
+                libc::sigfillset(&mut action.sa_mask);
+                if libc::sigaction(libc::SIGBUS, &action, std::ptr::null_mut()) != 0
+                    || libc::sigaction(libc::SIGSEGV, &action, std::ptr::null_mut()) != 0
+                {
+                    libc::_exit(10);
+                }
+                if arena.revoke_rx(0..page()).is_err() {
+                    libc::_exit(11);
+                }
+                let entry = exec_ptr(&region) as u64;
+                MEASURED.entry = entry;
+                if sigsetjmp(std::ptr::addr_of_mut!(PROBE_JMP).cast::<u64>(), 1) == 0 {
+                    let _ = call_u32(&region);
+                    // Executing a PROT_NONE chunk must abort; falling through
+                    // means the revocation did not take.
+                    libc::_exit(12);
+                }
+                let measured = MEASURED;
+                let bytes = std::slice::from_raw_parts(
+                    std::ptr::addr_of!(measured).cast::<u8>(),
+                    std::mem::size_of::<MeasuredAbort>(),
+                );
+                let written = libc::write(report_pipe[1], bytes.as_ptr().cast(), bytes.len());
+                libc::_exit(if written == bytes.len() as isize {
+                    0
+                } else {
+                    13
+                });
+            }
+        }
+
+        unsafe { libc::close(report_pipe[1]) };
+        let mut measured = std::mem::MaybeUninit::<MeasuredAbort>::uninit();
+        let mut filled = 0_usize;
+        while filled < std::mem::size_of::<MeasuredAbort>() {
+            let read = unsafe {
+                libc::read(
+                    report_pipe[0],
+                    measured.as_mut_ptr().cast::<u8>().add(filled).cast(),
+                    std::mem::size_of::<MeasuredAbort>() - filled,
+                )
+            };
+            assert!(read > 0, "probe child closed the report pipe early");
+            filled += read as usize;
+        }
+        unsafe { libc::close(report_pipe[0]) };
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+        let measured = unsafe { measured.assume_init() };
+
+        let ec = (measured.esr >> 26) & 0x3f;
+        println!(
+            "MEASURED ABORT SHAPE (fd-backed revoked RX chunk): signal={} si_code={} \
+             esr=0x{:x} (ec=0x{:x}) far=0x{:x} pc=0x{:x} entry=0x{:x}",
+            measured.signal,
+            measured.si_code,
+            measured.esr,
+            ec,
+            measured.far,
+            measured.pc,
+            measured.entry,
+        );
+        // The fd-transport probes measured SIGBUS; record and pin it.
+        assert_eq!(measured.signal, libc::SIGBUS, "measured signal");
+        // The classifier's exact predicates, pinned to the measured shape:
+        // an instruction abort (EC 0x20 from EL0; 0x21 would be same-EL) whose
+        // FAR and PC are BOTH the revoked entry address.
+        assert!(
+            matches!(ec, 0x20 | 0x21),
+            "measured EC 0x{ec:x} is not an instruction abort"
+        );
+        assert_eq!(measured.pc, measured.entry, "PC must be the revoked entry");
+        assert_eq!(measured.far, measured.pc, "FAR must equal PC");
     }
 
     #[test]
