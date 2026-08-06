@@ -137,11 +137,13 @@ existing two-object split and the exact V2 wire:
 process** that holds it (creator, every fork child, every SETEXEC successor).
 That is the same per-subsystem cost `kernel_arena`, `shared_futex_waiters`,
 `xsig`, and `aot_cache` each already pay, and it is charged against the *host*
-process rlimit, not the guest's emulated fd table. Against typical Darwin
-limits (256 default soft `RLIMIT_NOFILE`, `kern.maxfilesperproc` hard
-ceiling — carrick does not raise its own host NOFILE) two fds are noise, but
-they are a real standing cost and belong in any future fd-budget audit
-alongside the existing internal-fd peers.
+process `RLIMIT_NOFILE`, not the guest's emulated fd table. Carrick raises its
+own host soft NOFILE toward 65,536 at startup
+(`crates/carrick-cli/src/main.rs`, the `RLIMIT_NOFILE` block — best-effort,
+capped at `rlim_max`), and that raised soft limit is inherited by every
+fork/exec descendant including the self-exec successors, so two fds are
+negligible against it. They are still a real standing cost and belong in any
+future fd-budget audit alongside the existing internal-fd peers.
 
 shm is refuted (P2-shm: EXEC silently stripped, `EACCES` on every escalation
 route). The Mach local-aliasing hybrid (P5) is refuted
