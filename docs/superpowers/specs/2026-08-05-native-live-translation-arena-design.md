@@ -392,21 +392,21 @@ mapped to what shipped; do not reintroduce a `live_arena_*` spelling.
 | `live_arena_validation_refusals` | `live_fallbacks[{arena_invalid_record, arena_unknown_state, unresolved_entry}]` | landed |
 | `live_arena_code_bytes` | `live_code_bytes` (`live-bytes`) | landed |
 | `live_arena_metadata_bytes` | `live_hot_bytes` + `live_cold_bytes` (`live-bytes`) | landed, split by stream |
-| `live_arena_shared_direct_links` | — | **UNBUILT — see below** |
+| `live_arena_shared_direct_links` | `live_links_prebound` + refusal split `live_links_prebind_unbound_state` / `live_links_prebind_unbound_reach` (`live-bytes`) | landed with the prebind call site (2026-08-06) |
 | `live_arena_gateway_links` | `live_links_out_of_reach` (`live-bytes`) | landed |
 | `live_arena_revoked_chunks` | `live_revoked_chunks` (`live-revoke`) | landed in Task 8 |
 | `live_arena_stale_instruction_aborts` | `live_stale_instruction_aborts` (`live-revoke`) | landed in Task 8 |
 
 `live_arena_shared_direct_links` — a link bound between two SHARED blocks —
-**has no producer and therefore no counter.** Its only source is
-`DarwinLiveReservedPublication::prebind`, which the 6E seam left uncalled, so
-the counter would read zero on every path forever and teach a reader that
-shared-to-shared linking was measured and found absent when it was never
-attempted. What IS counted is the private→live link traffic that exists:
-`live_links_patched` and `live_links_out_of_reach`. The gap is tracked as 6F
-seam 1 (`.superpowers/sdd/2026-08-05-native-live-translation-arena-task6/task-6f-report.md`
-§6.1) and restated in Task 8's report §1a; when the prebind call site lands,
-its counter belongs beside those two.
+**landed 2026-08-06** when the winner-publication prebind call site was wired
+(`LiveArenaProcessView::publish_winner` → `prebind_ready_targets`, between
+`claim.reserve` and `reserved.publish`, mutating only staged bytes). It
+counts as the triple beside the private→live pair in the `live-bytes` frame:
+`live_links_prebound` (bound at publication), `live_links_prebind_unbound_state`
+(target not an acquirable READY record — the forward-edge sacrifice this
+design accepts), and `live_links_prebind_unbound_reach` (the emitter's
+±128 MiB refusal; structurally zero while the code payload is 64 MiB). The
+6F-seam-1 / Task 8 §1a gap is closed.
 
 The export surface is read-only. `carrick_lldb.py` prints arena headers,
 process-local RX/RW ranges, READY records, revoked chunks, and the translated

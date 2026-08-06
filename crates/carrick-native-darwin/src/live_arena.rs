@@ -31,8 +31,8 @@ use carrick_dsr_aarch64::emit::{
 use carrick_dsr_aarch64::live_arena::{
     LIVE_ARENA_OBJECT_HEADER_BYTES, LIVE_SOURCE_PAGE_BYTES, LiveArenaCapacities,
     LiveArenaControlLayout, LiveBlockAuthority, LiveBlockExtents, LiveLookup,
-    LiveMappedWritePermit, LiveOwnedChunkIdentity, LivePrivateReason, LiveProcessViewBrand,
-    LivePublishClaim, LivePublishOutcome, LiveReadyLookup, LiveReadyOutcome,
+    LiveMappedWritePermit, LiveOwnedChunkIdentity, LivePrebindTally, LivePrivateReason,
+    LiveProcessViewBrand, LivePublishClaim, LivePublishOutcome, LiveReadyLookup, LiveReadyOutcome,
     LiveReservedPublishClaim, LiveRxPayload, LiveTranslationArenaView, LiveTranslationAuthority,
     ValidatedLiveBlockRecord,
 };
@@ -1068,6 +1068,68 @@ impl LiveArenaProcessView {
         })
     }
 
+    /// Winner-window direct-link prebinding: for every `DirectLink`
+    /// candidate in the reserved (still-staged, still-BUILDING) publication,
+    /// bind the branch when its target is already an acquirable READY record
+    /// in this same view and within AArch64 branch range. Every refusal —
+    /// absent/BUILDING/FAILED/torn target, regenerated or unobservable
+    /// target page, acquire or prebind rejection — leaves that candidate on
+    /// its gateway stub and is counted; nothing here can fail the
+    /// publication or leave a partial write (the emitter mutates the staged
+    /// slot only after every check passes).
+    ///
+    /// The target capability comes from the SAME `acquire` consumer the
+    /// gateway path uses, so a prebound target has been READY-validated
+    /// (code SHA, HOT shape, INITIAL generation in this domain) and locally
+    /// I-cache-invalidated before its address is encoded. A self-referential
+    /// candidate (the block being published) is BUILDING by definition and
+    /// stays gateway-bound, counted `unbound_by_state`.
+    fn prebind_ready_targets(
+        &self,
+        key: &TranslationUnitKey,
+        reserved: &mut DarwinLiveReservedPublication<'_>,
+        observe_target_page: &mut dyn FnMut(GuestVa) -> Option<PageGenerationObservation>,
+    ) -> LivePrebindTally {
+        let mut tally = LivePrebindTally::default();
+        let candidates: Vec<(usize, GuestVa)> = reserved
+            .prepared
+            .link_candidates()
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| (index, candidate.target))
+            .collect();
+        for (index, target_va) in candidates {
+            let ready = match self.acquire_ready_or_miss(key, target_va) {
+                DarwinLiveReadyLookup::Ready(ready) => ready,
+                DarwinLiveReadyLookup::Miss | DarwinLiveReadyLookup::Private(_) => {
+                    tally.unbound_by_state += 1;
+                    continue;
+                }
+            };
+            // The caller's observation covers the SOURCE page; a candidate
+            // target may live on any page of the unit, so its own page is
+            // observed through the authoritative table before `acquire`
+            // enforces INITIAL on it.
+            let Some(target_generation) = observe_target_page(target_va) else {
+                tally.unbound_by_state += 1;
+                continue;
+            };
+            let target = match self.acquire(ready, &target_generation) {
+                Ok(target) => target,
+                Err(_) => {
+                    tally.unbound_by_state += 1;
+                    continue;
+                }
+            };
+            match reserved.prebind(index, &target) {
+                Ok(LivePrebindOutcome::Bound) => tally.bound += 1,
+                Ok(LivePrebindOutcome::OutOfRange) => tally.unbound_by_reach += 1,
+                Err(_) => tally.unbound_by_state += 1,
+            }
+        }
+        tally
+    }
+
     /// Task 7: revoke every ACTIVE chunk owned for the 16 KiB source pages
     /// overlapping `range`, unioned with the caller's validated
     /// `LiveSourceChunkHint`s, one `mach_vm_protect(PROT_NONE)` per
@@ -1432,6 +1494,7 @@ impl LiveTranslationAuthority for LiveArenaProcessView {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn publish_winner(
         &self,
         key: &TranslationUnitKey,
@@ -1443,6 +1506,7 @@ impl LiveTranslationAuthority for LiveArenaProcessView {
             PreparedSharedInitial,
             carrick_dsr_aarch64::types::DsrError,
         >,
+        observe_target_page: &mut dyn FnMut(GuestVa) -> Option<PageGenerationObservation>,
     ) -> LivePublishOutcome {
         let claim = match self.claim_eligible(key, guest_start, block_end, generation, owner_pid) {
             DarwinLiveLookup::Publish(claim) => claim,
@@ -1450,7 +1514,10 @@ impl LiveTranslationAuthority for LiveArenaProcessView {
             // this claim: consume its record rather than translating twice.
             DarwinLiveLookup::Ready(ready) => {
                 return match self.acquire(ready, generation) {
-                    Ok(executable) => LivePublishOutcome::Installed(Box::new(executable)),
+                    Ok(executable) => LivePublishOutcome::Installed {
+                        authority: Box::new(executable),
+                        prebound: LivePrebindTally::default(),
+                    },
                     Err(reason) => LivePublishOutcome::Private(reason),
                 };
             }
@@ -1462,16 +1529,20 @@ impl LiveTranslationAuthority for LiveArenaProcessView {
             // process waits on a preparation that will never complete.
             Err(error) => return LivePublishOutcome::PrepareRefused(error),
         };
-        let reserved = match claim.reserve(prepared) {
+        let mut reserved = match claim.reserve(prepared) {
             Ok(reserved) => reserved,
             Err(reason) => return LivePublishOutcome::Private(reason),
         };
+        let prebound = self.prebind_ready_targets(key, &mut reserved, observe_target_page);
         let published = match reserved.publish() {
             Ok(published) => published,
             Err(reason) => return LivePublishOutcome::Private(reason),
         };
         match self.acquire(published, generation) {
-            Ok(executable) => LivePublishOutcome::Installed(Box::new(executable)),
+            Ok(executable) => LivePublishOutcome::Installed {
+                authority: Box::new(executable),
+                prebound,
+            },
             Err(reason) => LivePublishOutcome::Private(reason),
         }
     }
@@ -2981,20 +3052,26 @@ mod tests {
     }
 
     fn prepared_direct_source() -> PreparedSharedInitial {
+        prepared_direct_source_to(GuestVa(0x4000_0000), GuestVa(0x4000_1000))
+    }
+
+    fn prepared_direct_source_to(start: GuestVa, target: GuestVa) -> PreparedSharedInitial {
+        let imm26 = u32::try_from((target.raw().wrapping_sub(start.raw())) / 4)
+            .expect("fixture branch displacement");
         prepare_shared_initial(
             &live_key(),
             &BlockPlan {
-                start: GuestVa(0x4000_0000),
-                end: GuestVa(0x4000_0004),
+                start,
+                end: GuestVa(start.raw() + 4),
                 generation: CodeGeneration::INITIAL,
                 instructions: Vec::new(),
                 exit: PlannedExit::Direct {
-                    guest: GuestVa(0x4000_0000),
-                    word: 0x1400_0400,
+                    guest: start,
+                    word: 0x1400_0000 | (imm26 & 0x03ff_ffff),
                     exit: DirectExit {
                         kind: DirectKind::Branch,
-                        target: GuestVa(0x4000_1000),
-                        resume: GuestVa(0x4000_0004),
+                        target,
+                        resume: GuestVa(start.raw() + 4),
                         condition: None,
                         register: None,
                         bit: None,
@@ -3916,8 +3993,13 @@ mod tests {
                 prepares += 1;
                 Ok(prepared_publication_for_span(&key, start, end))
             },
+            &mut |_| None,
         );
-        let LivePublishOutcome::Installed(publisher_block) = published else {
+        let LivePublishOutcome::Installed {
+            authority: publisher_block,
+            ..
+        } = published
+        else {
             panic!("the unique winner must install its own block");
         };
         assert_eq!(prepares, 1, "the winner prepares exactly once");
@@ -3997,7 +4079,9 @@ mod tests {
         for index in 0..3_u64 {
             let start = GuestVa(0x4000_0000 + index * 0x1000);
             let generation = generations.observe(start).expect("generation");
-            let LivePublishOutcome::Installed(block) = view.publish_winner(
+            let LivePublishOutcome::Installed {
+                authority: block, ..
+            } = view.publish_winner(
                 &key,
                 start,
                 GuestVa(start.raw() + 0xc),
@@ -4010,7 +4094,9 @@ mod tests {
                         GuestVa(start.raw() + 0xc),
                     ))
                 },
-            ) else {
+                &mut |_| None,
+            )
+            else {
                 panic!("the unique winner must install its own block");
             };
             let entry = block.entry().raw();
@@ -4049,7 +4135,10 @@ mod tests {
         let after_fork = GuestVa(0x4000_1000);
 
         let generation = generations.observe(before_fork).expect("generation");
-        let LivePublishOutcome::Installed(parent_block) = view.publish_winner(
+        let LivePublishOutcome::Installed {
+            authority: parent_block,
+            ..
+        } = view.publish_winner(
             &key,
             before_fork,
             GuestVa(before_fork.raw() + 0xc),
@@ -4062,7 +4151,9 @@ mod tests {
                     GuestVa(before_fork.raw() + 0xc),
                 ))
             },
-        ) else {
+            &mut |_| None,
+        )
+        else {
             panic!("the parent must publish its pre-fork block");
         };
         let parent_entry = parent_block.entry();
@@ -4119,8 +4210,9 @@ mod tests {
                     after_fork,
                     GuestVa(after_fork.raw() + 0xc)
                 )),
+                &mut |_| None,
             ),
-            LivePublishOutcome::Installed(_)
+            LivePublishOutcome::Installed { .. }
         ));
         assert!(write_pipe_byte(to_child[1], 1));
         assert_eq!(read_pipe_byte(to_parent[0]), Some(1));
@@ -4138,6 +4230,92 @@ mod tests {
         for fd in to_child.into_iter().chain(to_parent) {
             unsafe { libc::close(fd) };
         }
+    }
+
+    /// The production prebind call site: a winner publication binds a
+    /// candidate whose target is already READY in the same view, and refuses
+    /// — by state, counted, publication unharmed — a candidate whose target
+    /// was never published. The tally arrives on the `Installed` outcome.
+    #[test]
+    fn a_winner_publication_prebinds_ready_targets_and_counts_refusals() {
+        let arena = Arc::new(protocol_arena());
+        let key = live_key();
+        let generations = PageGenerationTable::new(page() as u64).expect("generation table");
+        let view = LiveArenaProcessView::new(Arc::clone(&arena), generations.domain())
+            .expect("process view");
+        let generation = generations
+            .observe(GuestVa(0x4000_0000))
+            .expect("generation");
+        let mut observe = |pc: GuestVa| generations.observe(pc).ok();
+
+        // The target publishes READY first; a syscall block has no
+        // candidates, so its own tally is exactly zero.
+        let LivePublishOutcome::Installed { prebound, .. } = view.publish_winner(
+            &key,
+            GuestVa(0x4000_1000),
+            GuestVa(0x4000_100c),
+            &generation,
+            unsafe { libc::getpid() },
+            &mut || Ok(prepared_target()),
+            &mut observe,
+        ) else {
+            panic!("the target winner must install its own block");
+        };
+        assert_eq!(prebound, LivePrebindTally::default());
+
+        // The source's winner publication finds the READY target and binds.
+        let LivePublishOutcome::Installed {
+            authority: source,
+            prebound,
+        } = view.publish_winner(
+            &key,
+            GuestVa(0x4000_0000),
+            GuestVa(0x4000_0004),
+            &generation,
+            unsafe { libc::getpid() },
+            &mut || Ok(prepared_direct_source()),
+            &mut observe,
+        )
+        else {
+            panic!("the source winner must install its own block");
+        };
+        assert_eq!(
+            prebound,
+            LivePrebindTally {
+                bound: 1,
+                unbound_by_state: 0,
+                unbound_by_reach: 0,
+            }
+        );
+        drop(source);
+
+        // A source whose target was NEVER published refuses by state and
+        // still publishes — the candidate stays on its gateway stub.
+        let absent_start = GuestVa(0x4000_2000);
+        let LivePublishOutcome::Installed { prebound, .. } = view.publish_winner(
+            &key,
+            absent_start,
+            GuestVa(absent_start.raw() + 4),
+            &generation,
+            unsafe { libc::getpid() },
+            &mut || {
+                Ok(prepared_direct_source_to(
+                    absent_start,
+                    GuestVa(0x4000_3000),
+                ))
+            },
+            &mut observe,
+        ) else {
+            panic!("an unbindable candidate must not fail the publication");
+        };
+        assert_eq!(
+            prebound,
+            LivePrebindTally {
+                bound: 0,
+                unbound_by_state: 1,
+                unbound_by_reach: 0,
+            }
+        );
     }
 
     /// The source-page hint's authority: ACTIVE chunk descriptors, reached
@@ -4167,8 +4345,9 @@ mod tests {
                 &generation,
                 unsafe { libc::getpid() },
                 &mut || Ok(prepared_publication_for_span(&key, start, end)),
+                &mut |_| None,
             ),
-            LivePublishOutcome::Installed(_)
+            LivePublishOutcome::Installed { .. }
         ));
 
         let owned = view.active_chunks_for_source_page(source_page);

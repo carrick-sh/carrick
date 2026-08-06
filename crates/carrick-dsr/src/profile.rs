@@ -956,6 +956,15 @@ pub struct ProfileSnapshot {
     /// because the arena is outside the ±128 MiB AArch64 branch reach.
     pub live_links_patched: u64,
     pub live_links_out_of_reach: u64,
+    /// Winner-publication prebinding of shared→shared direct links (the
+    /// realized `live_arena_shared_direct_links` design counter): bound into
+    /// the still-staged source at publication, refused because the target
+    /// was not an acquirable READY record (`unbound_state`), or refused by
+    /// the emitter's AArch64 reach check (`unbound_reach` — structurally
+    /// zero while the code payload is 64 MiB).
+    pub live_links_prebound: u64,
+    pub live_links_prebind_unbound_state: u64,
+    pub live_links_prebind_unbound_reach: u64,
     /// Task 7's revocation seam, counted. `live_revoked_chunks` is exact
     /// 64 KiB local RX chunks this process protected `PROT_NONE` because a
     /// guest write, `mprotect`, `munmap`, or remap changed their source page;
@@ -1190,12 +1199,15 @@ impl CompleteThreadRecord {
         let mut live_bytes = self.frame_header("live-bytes");
         let _ = write!(
             live_bytes,
-            "|live_code_bytes={}|live_hot_bytes={}|live_cold_bytes={}|live_links_patched={}|live_links_out_of_reach={}",
+            "|live_code_bytes={}|live_hot_bytes={}|live_cold_bytes={}|live_links_patched={}|live_links_out_of_reach={}|live_links_prebound={}|live_links_prebind_unbound_state={}|live_links_prebind_unbound_reach={}",
             resolver.live_code_bytes,
             resolver.live_hot_bytes,
             resolver.live_cold_bytes,
             resolver.live_links_patched,
             resolver.live_links_out_of_reach,
+            resolver.live_links_prebound,
+            resolver.live_links_prebind_unbound_state,
+            resolver.live_links_prebind_unbound_reach,
         );
         frames.push(live_bytes);
         // Revocation is its own frame rather than two more fields on
@@ -1817,6 +1829,56 @@ mod tests {
         }
     }
 
+    /// The prebind triple rides the `live-bytes` frame — beside the two
+    /// private→live link counters it complements — exactly once, exact
+    /// values.
+    #[test]
+    fn the_prebind_counters_ride_the_live_bytes_frame_and_round_trip() {
+        let budget = ThreadBudget::enabled_for_test(41, 42);
+        let record = budget.complete_record().expect("empty record");
+        let frames = record
+            .to_protocol_frames_with_resolver(
+                crate::profile::ProfileSnapshot {
+                    live_links_prebound: 7,
+                    live_links_prebind_unbound_state: 5,
+                    live_links_prebind_unbound_reach: 1,
+                    ..Default::default()
+                },
+                FlushGauges {
+                    thread_cpu_ns: 5,
+                    startup_wall_ns: 9,
+                    startup_cpu_ns: 3,
+                    process_cpu_ns: 8,
+                },
+            )
+            .expect("bounded frames");
+        for field in [
+            "live_links_prebound",
+            "live_links_prebind_unbound_state",
+            "live_links_prebind_unbound_reach",
+        ] {
+            let marker = format!("|{field}=");
+            assert_eq!(
+                frames
+                    .iter()
+                    .filter(|frame| frame.contains(&marker))
+                    .count(),
+                1,
+                "{field} must be published exactly once per record"
+            );
+        }
+        let bytes = frames
+            .iter()
+            .find(|frame| frame.contains("|frame=live-bytes|"))
+            .expect("live-bytes frame");
+        assert!(
+            bytes.contains(
+                "|live_links_prebound=7|live_links_prebind_unbound_state=5|live_links_prebind_unbound_reach=1"
+            ),
+            "the byte frame must round-trip the exact prebind values: {bytes}"
+        );
+    }
+
     #[test]
     fn exclusive_fusion_frames_reconcile_and_fit_pipe_buf() {
         let mut budget = ThreadBudget::enabled_for_test(41, 42);
@@ -2049,6 +2111,9 @@ mod tests {
                     live_cold_bytes: u64::MAX,
                     live_links_patched: u64::MAX,
                     live_links_out_of_reach: u64::MAX,
+                    live_links_prebound: u64::MAX,
+                    live_links_prebind_unbound_state: u64::MAX,
+                    live_links_prebind_unbound_reach: u64::MAX,
                     live_revoked_chunks: u64::MAX,
                     live_stale_instruction_aborts: u64::MAX,
                     live_fallbacks: [u64::MAX; LiveLaneFallbackClass::COUNT],

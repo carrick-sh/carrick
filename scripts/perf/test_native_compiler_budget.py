@@ -792,6 +792,16 @@ def nativeperf_frames_v7(pid=10, tid=11, era=12, exec_epoch=0):
     ]
 
 
+def nativeperf_frames_v8(pid=10, tid=11, era=12, exec_epoch=0):
+    lines = nativeperf_frames_v7(pid=pid, tid=tid, era=era, exec_epoch=exec_epoch)
+    index = next(i for i, line in enumerate(lines) if "|frame=live-bytes|" in line)
+    lines[index] += (
+        "|live_links_prebound=8|live_links_prebind_unbound_state=3|"
+        "live_links_prebind_unbound_reach=1"
+    )
+    return lines
+
+
 def nativeperf_frames_v3_with_exclusive(
     pid=10, tid=11, era=12, exec_epoch=0, *, executions=1, unique_sites=1
 ):
@@ -1021,6 +1031,39 @@ class NativePerfV2Tests(unittest.TestCase):
         decoded = budget.parse_result_row(encoded)
         self.assertEqual(decoded.profile, profile)
         self.assertEqual(decoded.profile.version, 7)
+
+    def test_v8_parses_and_round_trips_the_prebind_counters(self):
+        profile = budget.parse_nativeperf(nativeperf_frames_v8())
+        budget.validate_profile(profile)
+        self.assertEqual(profile.version, 8)
+        self.assertEqual(len(profile.threads[0].frames), 24)
+        self.assertEqual(
+            profile.threads[0].value("live-bytes", "live_links_prebound"), 8
+        )
+        self.assertEqual(
+            profile.threads[0].value("live-bytes", "live_links_prebind_unbound_state"),
+            3,
+        )
+        self.assertEqual(
+            profile.threads[0].value("live-bytes", "live_links_prebind_unbound_reach"),
+            1,
+        )
+        # The v7 byte fields are untouched by the v8 extension.
+        self.assertEqual(
+            profile.threads[0].value("live-bytes", "live_links_patched"), 6
+        )
+
+        encoded = budget.run_record_json(
+            budget.RunRecord.synthetic(profile=profile, schedule_label="on-1")
+        )
+        decoded = budget.parse_result_row(encoded)
+        self.assertEqual(decoded.profile, profile)
+        self.assertEqual(decoded.profile.version, 8)
+
+    def test_v7_record_still_reads_as_v7_after_v8(self):
+        profile = budget.parse_nativeperf(nativeperf_frames_v7())
+        budget.validate_profile(profile)
+        self.assertEqual(profile.version, 7)
 
     def test_v6_record_still_reads_as_v6_after_v7(self):
         profile = budget.parse_nativeperf(nativeperf_frames_v6())
