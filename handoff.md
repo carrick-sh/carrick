@@ -1,13 +1,123 @@
 # Native-lane performance: state of play
 
-**Date:** 2026-08-04 · **Branch:** `codex/native-store-default` · **Latest
-decision:** the authenticated typed `NativeShape` campaign is complete; the
-sole admitted A3/B3 pair has no mechanical crossing and carries no emitted-code
-candidate, so work returns to the broad Task 12 host/kernel split while the
-official 10.1776x scoreboard remains unchanged ·
+**Date:** 2026-08-05 · **Integration target:** local `main` · **Latest
+decision:** the source-group V2 live-translation arena substrate is complete at
+`dc8ad47a`, independently review-clean, and still runtime-disabled. The next
+session starts at Task 6C2 ownership/exec transport; runtime-on correctness,
+DTrace, and ABBA remain forbidden until Tasks 6D/6E/7 close ·
 **Scope:** Darwin/aarch64 native backend (`--exec-backend native`, the shipped
 default). VMM is explicitly NOT the target: one process per VM against a
 ~127-VM macOS ceiling makes it a dead end for build-shaped workloads.
+
+## 2026-08-05 wrap-up — read this first
+
+This section supersedes the older **What's next** and **Branch state at
+handoff** sections below. Those sections remain as campaign history, not live
+instructions.
+
+### Current truth
+
+- The official shipped-default cold-build result is still **10.1776x**:
+  Carrick 8,254 ms / Docker 811 ms. No runtime-on live-arena measurement has
+  run, so this session claims **no performance improvement**.
+- Task 6B3 is committed as `dc8ad47a` (`feat(dsr): pack live code by source
+  page`). It replaces the rejected page-per-block V1 layout; there is no
+  compatibility path.
+- The V2 protocol uses 262,144 128-byte block records, 4,096 source-group
+  records, and 1,024 permanently owned 64 KiB chunks over 64 MiB code, 1 MiB
+  HOT, and 32 MiB COLD. A group is exact `(unit live digest, 16 KiB source
+  page)` and owns its chunks exclusively.
+- READY lookup is read-only. Eligible claim authority binds the same-domain
+  INITIAL observation and exact decoded `[start,end)` span; a different
+  same-page or cross-page prepared span fails before allocation and terminalizes
+  the one-attempt claim. Publication retains the existing exact mapped-byte,
+  digest, metadata, generation, W^X, and publisher/consumer I-cache authority.
+- Darwin and the outer exec capsule are V2-only. The real
+  `POSIX_SPAWN_SETEXEC` successor maps the same objects at fresh VAs, observes
+  the creator's packed READY record and exact code/HOT/COLD bytes, and locally
+  invalidates the exact RX extent.
+- Runtime ownership and translation routing remain deliberately disabled.
+  `resume_guest_from_capsule` still discards the transported arena pending C2;
+  this is the next implementation seam, not dead code to remove casually.
+
+### Capacity and provenance authority
+
+The conservative checked fixture contains 85,525 exact blocks across 407
+source groups. It records 36,341,884 code bytes, 684,200 aligned HOT bytes,
+24,681,640 aligned COLD bytes, a 5,536-byte maximum block, ideal 781 chunks,
+and an order-independent Next-Fit upper bound of 794 chunks. Encounter order,
+guest-sorted order, and 100 deterministic production-hash shuffles produce
+zero block refusals, zero group refusals, and 781–784 chunks.
+
+- Capacity fixture:
+  `crates/carrick-dsr-aarch64/tests/fixtures/live-arena-v2-capacity.bin`
+  (1,197,990 bytes; SHA-256
+  `576ee809efd4091abbd9b85c7aa2a729ad0d81cfc31940abbe3852454cb01368`).
+- Durable capture-source patch:
+  `crates/carrick-dsr-aarch64/tests/fixtures/live-arena-v2-capture-source.patch`
+  (974 bytes; SHA-256
+  `6df147f2a49a2af862e190ff49f5a606f387e94964656918bbd09a0d94587564`).
+- The fixture authenticates the base source, capture-source patch, signed
+  binary, OCI image, raw manifests, and every exact compiler
+  `TranslationUnitKey` determinant. The test reconstructs captured stem
+  `a5948df7…`, recomputes production V2 live digest `17aecdd6…`, and uses only
+  that recomputed digest for the capacity simulation.
+- Full commands, hashes, RED/GREEN receipts, limitations, and the three review
+  fix rounds are in
+  `.superpowers/sdd/2026-08-05-native-live-translation-arena/task-6b3-report.md`;
+  controller recovery state is in the sibling `progress.md`.
+
+### Accepted gates and review
+
+Before `dc8ad47a`, the exact reviewed tree passed:
+
+- portable 311/311 plus 3/3 doctests;
+- Darwin 90/90 plus 2/2 doctests;
+- serialized capsule family 33/33, including the real SETEXEC successor;
+- serialized runtime library 1,180 passed / 0 failed / 5 ignored;
+- scoped all-target Clippy with warnings denied, format, matrix, diff check,
+  and affected-V1 search.
+
+The cumulative independent review initially found two Important issues: an
+unsealed prepared span and incomplete source-to-binary provenance. Three
+bounded RED/GREEN fix rounds sealed the span, reconstructed the exact production
+key/digest, and checked in the durable capture-source patch. Final verdict:
+**0 Critical / 0 Important / 0 Minor, APPROVED**.
+
+### Exact next steps
+
+1. **Task 6C2 — owner and exec transport.** Include `direct_runner.rs` and an
+   explicit `DirectExecServices` owner; do not use a process-global. Create the
+   arena once in `run_image_in_child` for `pid == 0` before the direct/DSR
+   split, adopt it once into `Arc`, retain it through resumed direct, DSR, and
+   clone-thread paths, and transport it on both self-exec paths. SETEXEC
+   failure tests must prove the registered vector is unchanged, duplicate send
+   rights are released, and FD flags are restored.
+2. **Tasks 6D/6E/6F — real translation path.** Add READY lookup, unique winner
+   publication, lazy metadata/indexes, target authority/gateway routing, and
+   typed metrics. Every miss, BUILDING state, collision, corruption, or
+   capacity refusal immediately uses the unchanged private translator.
+3. **Task 7 — revocation and stale-instruction recovery.** Runtime-on compiler
+   evidence is forbidden until exact source-page/group/chunk enumeration,
+   revocation, and stale-instruction abort recovery are complete.
+4. **Only then:** signed correctness smoke, DTrace/USDT mechanism proof, and a
+   controlled host-environment ABBA. Retain the arena only if correctness and
+   the real cold-build result both hold; then refresh compute, 20-exec,
+   cold-build, and workload-spread scoreboards.
+
+### Confidence at handoff
+
+- **98%:** B3's protocol/capacity/exec-adoption substrate is sound within its
+  runtime-disabled scope.
+- **82%:** C2 ownership and transport can be completed without another
+  architecture replacement; the real successor proof already exercises the
+  hardest mapping boundary.
+- **70%:** the completed live-arena path will produce at least a 10% cold-build
+  improvement once fully routed and revocation-safe. This remains a projection,
+  not evidence.
+- **45%:** the overall campaign reaches the <=3x goal. That confidence moves
+  only after runtime-on mechanism and ABBA evidence; B3 alone cannot establish
+  it.
 
 ## The goal
 
