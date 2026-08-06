@@ -104,14 +104,18 @@ match.
 
 ## Caveats
 
-- **`times` granularity is finer than assumed, not coarser.** The brief
-  flagged `times` as "centisecond-scale"; this image's `sh` actually reports
-  microsecond-resolution fractional seconds (`0m0.100000s`). The harness's
-  regex (`[0-9.]+`) accepts any fractional precision, so this did not require
-  a fix, but the `fs-walk`/`exec-20` user/sys medians of `0.000` are genuinely
-  at or below single-digit-millisecond CPU consumption for those fixtures in
-  this image, not an artifact of a coarse clock rounding non-zero usage down
-  to zero.
+- **`times` printed precision is microsecond, but the underlying clock is
+  centisecond-quantized.** The brief flagged `times` as "centisecond-scale";
+  this image's `sh` prints microsecond-resolution fractional seconds
+  (`0m0.100000s`), and the harness's regex (`[0-9.]+`) accepts any fractional
+  precision, so no format fix was needed. But all 20 observed user/sys values
+  across every workload and sample (the per-sample tables above) quantize to
+  exact `0.01` s multiples — the clock behind the string is centisecond-
+  quantized regardless of what the format can represent. The `fs-walk`/
+  `exec-20` user/sys medians of `0.000` therefore only bound those fixtures'
+  CPU consumption below the clock's ~10 ms quantum, not below 1 ms; this is
+  not evidence that CPU usage is genuinely at or below single-digit-
+  millisecond scale.
 - **The in-container wall window matches the spread harness's bracket
   exactly** — same `date +%s%N` pre/post markers around the byte-identical
   fixture command, so `wall_ms` here is directly comparable to the Docker

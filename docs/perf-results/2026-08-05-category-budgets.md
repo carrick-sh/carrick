@@ -39,9 +39,9 @@ already-measured inputs, with derived figures marked as such.
 | translation | 6.0589% | 5.9643% | **6.0116%** |
 
 Midpoint = (A+B)/2, per the task brief's instruction to use the midpoint of
-each A/B pair. Named-syscall + non-syscall midpoints sum to 48.40650%, which
-matches the kernel-total midpoint (48.40665%) to within rounding — the split
-is internally consistent.
+each A/B pair. Named-syscall + non-syscall midpoints sum to 48.40665%,
+exactly matching the kernel-total midpoint (48.40665%) — the split is
+internally consistent.
 
 **Source note (read this before citing the shares elsewhere).** The brief
 names [`2026-08-04-current-default-broad-cpu-attribution.md`](2026-08-04-current-default-broad-cpu-attribution.md)

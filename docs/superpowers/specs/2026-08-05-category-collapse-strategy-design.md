@@ -44,6 +44,11 @@ utilization (utilization measured at
 ≈ 5.3 CPU-s — **≈ 2.6x Docker's entire build**. Reaching 3x means finishing at
 ≈ 6.1 CPU-s: every category above must shrink several-fold simultaneously.
 
+> **Superseded 2026-08-05:** the measured Docker denominator (`cpu_total_s`
+> 2.160 s) and the resulting 3x-target CPU budget (6.480 CPU-s) now live in
+> [`2026-08-05-category-budgets.md`](../../perf-results/2026-08-05-category-budgets.md),
+> superseding the derived estimate above.
+
 ## 2. Diagnosis: the ≥10% single-mechanism policy has exhausted its search space
 
 The policy — attribute until one source-distinct mechanism clears ≥10% of CPU
@@ -205,6 +210,11 @@ translation-linked). Landing zone ≈ 6.5–8 CPU-s ≈ **3.2–3.9x** if all th
 moves hit their upper halves. 3x is reachable, tight, and requires all three
 categories — which is exactly why a mechanism-at-a-time strategy could not get
 there.
+
+> **Superseded 2026-08-05:** the measured category-budget arithmetic (Docker
+> `cpu_total_s` 2.160 s, 3x target 6.480 CPU-s) now lives in
+> [`2026-08-05-category-budgets.md`](../../perf-results/2026-08-05-category-budgets.md),
+> superseding the derived arithmetic above.
 
 ## 5. Sequencing
 
