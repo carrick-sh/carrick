@@ -972,6 +972,27 @@ pub struct ProcessState {
     artifact_image_digest: Option<[u8; 32]>,
     shared_translation: Option<SharedTranslationConfiguration>,
     live_translation: Option<LiveTranslationConfiguration>,
+    /// This process's authority over the container-lifetime live arena.
+    /// `None` (the default) is what makes every live path below inert: the
+    /// compiler policy is what installs one.
+    live_authority: Option<Arc<dyn crate::live_arena::LiveTranslationAuthority>>,
+    /// Live blocks installed by THIS process, keyed exactly like `blocks`.
+    ///
+    /// Deliberately a SEPARATE index: `blocks` is the private publication
+    /// authority that `publish_emitted_with_metadata` patches direct links
+    /// against, and a live block is never a private link target until Task 6E
+    /// carries publication kind into that decision.
+    live_blocks: BTreeMap<PublishedBlockKey, types::CacheVa>,
+    /// `published` indices ascending by LIVE RX entry address — the live half
+    /// of the address index `published_block_containing` searches. Live code
+    /// lives in the arena mapping, not the private bump cache, so it needs its
+    /// own ordered index; the two are disjoint by construction.
+    live_published_index: Vec<PublishedIndexEntry>,
+    /// Descriptor-authoritative ownership hint per 16 KiB source page. Task 7
+    /// revocation enumerates chunks per source page; recording the hint at
+    /// install keeps that enumeration off the translate path once a page's
+    /// chunks are known.
+    live_source_pages: BTreeMap<carrick_guest_mem::GuestVa, LiveSourcePageHint>,
     shared_unit_segments_consulted: BTreeSet<carrick_guest_mem::GuestVa>,
     shared_recording_segments: BTreeSet<carrick_guest_mem::GuestVa>,
     /// Units this process attached from the store, blocks NOT yet replayed.
@@ -1005,6 +1026,81 @@ struct LiveTranslationConfiguration {
     image: crate::shared_cache::SharedImageConfig,
     unit_digests: BTreeMap<carrick_guest_mem::GuestVa, [u8; 32]>,
     host_page_size: u64,
+    /// The ONE exact live unit key, resolved once at configuration.
+    ///
+    /// `key_for_segment` re-derives the segment source fingerprint, so
+    /// rebuilding it per translation miss would put a whole-segment hash on
+    /// the miss path. The configured image holds exactly one segment.
+    key: Arc<crate::shared_cache::TranslationUnitKey>,
+    /// The image's host bias, the only process binding a shared INITIAL
+    /// recovery action may carry. Copied here so fault-time COLD rebinding
+    /// never has to reach back into the configuration.
+    host_bias: Option<u64>,
+}
+
+/// One source page's descriptor-authoritative live ownership.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct LiveSourcePageHint {
+    /// ACTIVE groups observed owning chunks for this page.
+    groups: BTreeSet<u32>,
+    /// ACTIVE chunk indices observed for this page.
+    chunks: BTreeSet<u32>,
+}
+
+/// Why one live-arena consultation fell back to the private translator.
+///
+/// Every ineligibility is NAMED: a live publication is never best-effort, and
+/// "the arena was never consulted" and "the arena refused" imply opposite
+/// fixes. Task 6F turns these into typed resolver counters.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiveFallback {
+    /// No live authority, or no configured live image (the default).
+    Unconfigured,
+    /// The page is not at its INITIAL generation.
+    Regenerated,
+    /// No configured live segment contains the block.
+    OutsideSegment,
+    /// The decoded interval leaves its 16 KiB source page.
+    CrossPage,
+    /// The terminal exit is sensitive, exclusive, or unsupported.
+    UnsupportedShape,
+    /// The block's exact source words are unavailable.
+    SourceWordsUnavailable,
+    /// The unique winner's own preparation refused.
+    PrepareRefused,
+    /// The installed block resolved no usable process-local entry.
+    UnresolvedEntry,
+    /// The arena's own named refusal (BUILDING, FAILED, CAS loss, corruption,
+    /// capacity, exhausted probes, key encoding, unknown state).
+    Arena(crate::live_arena::LivePrivateReason),
+}
+
+/// The live lane's configured identity, resolved once per consultation so the
+/// borrow of `ProcessState` ends before installation mutates it.
+struct LiveLaneContext {
+    authority: Arc<dyn crate::live_arena::LiveTranslationAuthority>,
+    key: Arc<crate::shared_cache::TranslationUnitKey>,
+    host_bias: Option<u64>,
+}
+
+/// The 16 KiB source page a live source group is keyed on.
+const LIVE_SOURCE_PAGE_BYTES: u64 = crate::live_arena::LIVE_SOURCE_PAGE_BYTES;
+
+/// One AArch64 instruction: the shortest interval a block can occupy, used to
+/// screen a READY lookup against the configured live segment before consulting
+/// the arena (the exact decoded interval is not known until the plan exists).
+const LIVE_MINIMUM_BLOCK_BYTES: u64 = 4;
+
+/// What one live-arena consultation produced.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LiveConsultation {
+    /// A validated live block this process may execute now.
+    Installed(types::CacheVa),
+    /// No shared record exists for this exact key yet; the caller may plan and
+    /// attempt the unique-winner path.
+    Miss,
+    /// An IMMEDIATE private fallback with its named reason.
+    Private(LiveFallback),
 }
 
 fn live_sizing_configuration_with(
@@ -1470,6 +1566,9 @@ pub enum TranslationOutcome {
     SharedUnit,
     ArtifactReplay,
     Translated,
+    /// Served from the container-lifetime live arena: either another
+    /// process's READY record or this process's own winning publication.
+    LiveArena,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1507,6 +1606,15 @@ pub enum PublishedBlockMetadata {
         block: u32,
         bindings: artifact_spike::ArtifactBindings,
     },
+    /// Installed from the live arena: the pc map and recovery metadata stay
+    /// UNDECODED in the arena's mapped COLD pool until a guest fault
+    /// interrogates them, exactly as a unit-replayed block leaves them in its
+    /// unit. A shared INITIAL emission carries no process relocation, so
+    /// `host_bias` is the only binding its recovery actions can require.
+    Live {
+        authority: Arc<dyn crate::live_arena::LiveBlockAuthority>,
+        host_bias: Option<u64>,
+    },
 }
 
 impl PublishedBlockMetadata {
@@ -1543,6 +1651,30 @@ impl PublishedBlockMetadata {
                     .collect::<Result<Vec<_>, types::DsrError>>()?;
                 Ok((cold.map, recovery))
             }
+            Self::Live {
+                authority,
+                host_bias,
+            } => {
+                let cold = artifact_spike::decode_shared_initial_cold(
+                    authority.cold_metadata().map_err(|reason| {
+                        types::DsrError::CachePolicy(format!(
+                            "live COLD metadata refused at materialize: {reason:?}"
+                        ))
+                    })?,
+                )?;
+                let recovery = cold
+                    .recovery
+                    .into_entries()?
+                    .into_iter()
+                    .map(|entry| {
+                        Ok(emit::RecoveryEntry {
+                            cache: entry.cache(),
+                            action: entry.rebind_with_host_bias(*host_bias)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, types::DsrError>>()?;
+                Ok((cold.map, recovery))
+            }
         }
     }
 }
@@ -1553,6 +1685,21 @@ impl PublishedBlockMetadata {
 struct PublishedIndexEntry {
     start: carrick_guest_mem::HostVa,
     block: usize,
+}
+
+/// Keep one address-ordered published index ordered as blocks append.
+///
+/// Shared by the private and live indexes: both are append-mostly (a bump
+/// cache, an append-only arena chunk), so the common case is a push and only a
+/// rollover pays for the binary search.
+fn insert_published_index(index: &mut Vec<PublishedIndexEntry>, entry: PublishedIndexEntry) {
+    let at = match index.last() {
+        Some(last) if last.start > entry.start => {
+            index.partition_point(|indexed| indexed.start <= entry.start)
+        }
+        _ => index.len(),
+    };
+    index.insert(at, entry);
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2695,6 +2842,10 @@ impl ProcessTranslator {
                 artifact_image_digest: None,
                 shared_translation: None,
                 live_translation: None,
+                live_authority: None,
+                live_blocks: BTreeMap::new(),
+                live_published_index: Vec::new(),
+                live_source_pages: BTreeMap::new(),
                 shared_unit_segments_consulted: BTreeSet::new(),
                 shared_recording_segments: BTreeSet::new(),
                 attached_units: Vec::new(),
@@ -2866,6 +3017,7 @@ impl ProcessTranslator {
         })?;
         image.segments = vec![selected_segment];
         let unit_digests = BTreeMap::from([(image.segments[0].guest_start, live_digest)]);
+        let host_bias = key.host_bias();
         let mut state = self.state.write();
         if state.live_translation.is_some() {
             return Err(types::DsrError::CachePolicy(
@@ -2876,8 +3028,29 @@ impl ProcessTranslator {
             image,
             unit_digests,
             host_page_size,
+            key: Arc::new(key),
+            host_bias,
         });
         Ok(true)
+    }
+
+    /// Install this process's live-arena authority.
+    ///
+    /// The runtime calls it once, after the arena owner exists and the live
+    /// image is configured; without it every live path is inert, which is what
+    /// keeps the default (policy-off) translator byte-identical.
+    pub fn install_live_authority(
+        &self,
+        authority: Arc<dyn crate::live_arena::LiveTranslationAuthority>,
+    ) -> Result<(), types::DsrError> {
+        let mut state = self.state.write();
+        if state.live_authority.is_some() {
+            return Err(types::DsrError::CachePolicy(
+                "live translation authority was already installed".to_string(),
+            ));
+        }
+        state.live_authority = Some(authority);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -3686,6 +3859,262 @@ impl ProcessState {
         })
     }
 
+    /// The live lane's configured identity, or the named reason there is none.
+    fn live_lane(&self) -> Result<LiveLaneContext, LiveFallback> {
+        let authority = self
+            .live_authority
+            .as_ref()
+            .ok_or(LiveFallback::Unconfigured)?;
+        let configuration = self
+            .live_translation
+            .as_ref()
+            .ok_or(LiveFallback::Unconfigured)?;
+        Ok(LiveLaneContext {
+            authority: Arc::clone(authority),
+            key: Arc::clone(&configuration.key),
+            host_bias: configuration.host_bias,
+        })
+    }
+
+    /// The read-only exact READY lookup performed at the top of an
+    /// authoritative INITIAL miss.
+    ///
+    /// A hit validates actual mapped code/HOT/current generation inside the
+    /// consumer and installs WITHOUT touching the private cache. Every other
+    /// outcome is either a `Miss` (the caller may plan and race for the block)
+    /// or a named immediate private fallback.
+    fn live_ready_consultation(
+        &mut self,
+        guest: carrick_guest_mem::GuestVa,
+        generation: types::CodeGeneration,
+        observation: &cache::PageGenerationObservation,
+    ) -> LiveConsultation {
+        if generation != types::CodeGeneration::INITIAL {
+            return LiveConsultation::Private(LiveFallback::Regenerated);
+        }
+        let key = (guest, generation);
+        // An already-installed live block is served from this process's own
+        // live index rather than re-validating the shared record (which would
+        // re-hash the mapped code on every entry).
+        if let Some(entry) = self.live_blocks.get(&key).copied() {
+            return LiveConsultation::Installed(entry);
+        }
+        let lane = match self.live_lane() {
+            Ok(lane) => lane,
+            Err(reason) => return LiveConsultation::Private(reason),
+        };
+        let Some(block_end) = guest
+            .raw()
+            .checked_add(LIVE_MINIMUM_BLOCK_BYTES)
+            .map(carrick_guest_mem::GuestVa)
+        else {
+            return LiveConsultation::Private(LiveFallback::OutsideSegment);
+        };
+        if !lane.key.contains_guest_interval(guest, block_end) {
+            return LiveConsultation::Private(LiveFallback::OutsideSegment);
+        }
+        match lane.authority.acquire_ready(&lane.key, guest, observation) {
+            crate::live_arena::LiveReadyOutcome::Installed(authority) => {
+                match self.install_live_block(key, observation, lane.host_bias, authority) {
+                    Ok(entry) => LiveConsultation::Installed(entry),
+                    Err(reason) => LiveConsultation::Private(reason),
+                }
+            }
+            crate::live_arena::LiveReadyOutcome::Miss => LiveConsultation::Miss,
+            crate::live_arena::LiveReadyOutcome::Private(reason) => {
+                LiveConsultation::Private(LiveFallback::Arena(reason))
+            }
+        }
+    }
+
+    /// The unique-winner path, entered ONLY after the plan exists and only for
+    /// a shape B3 accepts.
+    ///
+    /// The plan is rejected here — named — before any arena state is touched;
+    /// `claim_eligible` then owns the two-phase generation/group/CAS protocol,
+    /// and only the block winner's `prepare` runs.
+    fn live_winner_publication(
+        &mut self,
+        block: &block::BlockPlan,
+        guest: carrick_guest_mem::GuestVa,
+        generation: types::CodeGeneration,
+        observation: &cache::PageGenerationObservation,
+        address_mode: emit::EmitAddressMode,
+        source_words: Option<&Vec<u32>>,
+    ) -> LiveConsultation {
+        if generation != types::CodeGeneration::INITIAL || observation.current() != generation {
+            return LiveConsultation::Private(LiveFallback::Regenerated);
+        }
+        // Only a supported, non-sensitive, non-exclusive INITIAL plan may
+        // enter `claim_eligible`. `ExclusiveRegion` and `Unsupported` own their
+        // whole block; `Sensitive` carries plan-derived metadata a shared block
+        // cannot republish.
+        if !matches!(
+            block.terminal_exit(),
+            block::PlannedExit::Syscall { .. }
+                | block::PlannedExit::Direct { .. }
+                | block::PlannedExit::Indirect { .. }
+                | block::PlannedExit::Continue { .. }
+        ) {
+            return LiveConsultation::Private(LiveFallback::UnsupportedShape);
+        }
+        // The record is keyed by the block's own start, and the translation is
+        // installed under `guest`; a plan that starts elsewhere would publish
+        // one identity and install another.
+        if block.start != guest {
+            return LiveConsultation::Private(LiveFallback::UnsupportedShape);
+        }
+        let source_page = guest.raw() / LIVE_SOURCE_PAGE_BYTES * LIVE_SOURCE_PAGE_BYTES;
+        let Some(source_page_end) = source_page.checked_add(LIVE_SOURCE_PAGE_BYTES) else {
+            return LiveConsultation::Private(LiveFallback::CrossPage);
+        };
+        if block.end.raw() <= block.start.raw() || block.end.raw() > source_page_end {
+            return LiveConsultation::Private(LiveFallback::CrossPage);
+        }
+        let Some(source_words) = source_words else {
+            return LiveConsultation::Private(LiveFallback::SourceWordsUnavailable);
+        };
+        let lane = match self.live_lane() {
+            Ok(lane) => lane,
+            Err(reason) => return LiveConsultation::Private(reason),
+        };
+        if !lane.key.contains_guest_interval(block.start, block.end) {
+            return LiveConsultation::Private(LiveFallback::OutsideSegment);
+        }
+        let mut prepare =
+            || emit::prepare_shared_initial(&lane.key, block, address_mode, source_words.clone());
+        let outcome = lane.authority.publish_winner(
+            &lane.key,
+            block.start,
+            block.end,
+            observation,
+            std::process::id() as i32,
+            &mut prepare,
+        );
+        match outcome {
+            crate::live_arena::LivePublishOutcome::Installed(authority) => {
+                match self.install_live_block(
+                    (guest, generation),
+                    observation,
+                    lane.host_bias,
+                    authority,
+                ) {
+                    Ok(entry) => LiveConsultation::Installed(entry),
+                    Err(reason) => LiveConsultation::Private(reason),
+                }
+            }
+            crate::live_arena::LivePublishOutcome::Private(reason) => {
+                LiveConsultation::Private(LiveFallback::Arena(reason))
+            }
+            crate::live_arena::LivePublishOutcome::PrepareRefused(_) => {
+                LiveConsultation::Private(LiveFallback::PrepareRefused)
+            }
+        }
+    }
+
+    /// Install one acquired live block into this process's bookkeeping.
+    ///
+    /// It deliberately shares only what is common with a private publication —
+    /// the published list, an ordered address index, the page dependency, and
+    /// the read-side lookup mirror. It never inserts into `blocks`,
+    /// `trusted_entries`, `pending`, or `direct_link_incoming`, and it never
+    /// touches the private cache: a live block is not a private link target
+    /// and is never a mutable-index source (Task 6E owns both decisions).
+    fn install_live_block(
+        &mut self,
+        key: PublishedBlockKey,
+        observation: &cache::PageGenerationObservation,
+        host_bias: Option<u64>,
+        authority: Box<dyn crate::live_arena::LiveBlockAuthority>,
+    ) -> Result<types::CacheVa, LiveFallback> {
+        let host_entry = authority.entry();
+        let len = authority.code_len();
+        if host_entry.raw() == 0 || len == 0 || authority.guest_start().raw() != key.0.raw() {
+            return Err(LiveFallback::UnresolvedEntry);
+        }
+        let source_page = authority.source_page();
+        self.note_live_source_page(source_page, authority.group_slot(), authority.chunk_index());
+        let entry = types::CacheVa::published(host_entry);
+        let authority: Arc<dyn crate::live_arena::LiveBlockAuthority> = Arc::from(authority);
+        self.push_published_live(PublishedBlock {
+            entry,
+            len,
+            metadata: PublishedBlockMetadata::Live {
+                authority,
+                host_bias,
+            },
+            _generation: observation.clone(),
+        });
+        self.live_blocks.insert(key, entry);
+        self.dependencies.record(observation.page(), key.0, key.1);
+        self.published_blocks.insert(
+            key,
+            PublishedBlockLookup {
+                entry,
+                trusted_entry: None,
+            },
+        );
+        Ok(entry)
+    }
+
+    /// Refresh the descriptor-authoritative source-page/group hint.
+    ///
+    /// The block's own chunk is recorded unconditionally; the full ACTIVE
+    /// descriptor enumeration runs only when this page reveals a chunk the
+    /// hint did not already carry, which keeps a per-descriptor scan off the
+    /// steady-state install path.
+    fn note_live_source_page(
+        &mut self,
+        source_page: carrick_guest_mem::GuestVa,
+        group_slot: u32,
+        chunk_index: u32,
+    ) {
+        let known = self
+            .live_source_pages
+            .get(&source_page)
+            .is_some_and(|hint| hint.chunks.contains(&chunk_index));
+        if known {
+            return;
+        }
+        let enumerated = self
+            .live_authority
+            .as_ref()
+            .map(|authority| authority.active_chunks_for_source_page(source_page))
+            .unwrap_or_default();
+        let hint = self.live_source_pages.entry(source_page).or_default();
+        hint.groups.insert(group_slot);
+        hint.chunks.insert(chunk_index);
+        for owned in enumerated {
+            hint.groups.insert(owned.group_slot);
+            hint.chunks.insert(owned.chunk_index);
+        }
+    }
+
+    /// Whether `entry` addresses a block THIS process installed from the live
+    /// arena. Two binary searches over the live address index, never a scan.
+    fn owns_live_entry(&self, entry: types::CacheVa) -> bool {
+        let cache_pc = entry.host().raw();
+        let index = &self.live_published_index;
+        let at = index.partition_point(|indexed| indexed.start.raw() <= cache_pc);
+        at.checked_sub(1)
+            .and_then(|at| index.get(at))
+            .and_then(|indexed| self.published.get(indexed.block))
+            .is_some_and(|block| {
+                let start = block.entry.host().raw();
+                start
+                    .checked_add(block.len)
+                    .is_some_and(|end| (start..end).contains(&cache_pc))
+            })
+    }
+
+    #[cfg(test)]
+    fn live_source_page_hint(
+        &self,
+        source_page: carrick_guest_mem::GuestVa,
+    ) -> Option<&LiveSourcePageHint> {
+        self.live_source_pages.get(&source_page)
+    }
+
     #[doc(hidden)]
     pub fn translate(
         &mut self,
@@ -3707,6 +4136,7 @@ impl ProcessState {
         }
         for stale in stale_blocks {
             self.blocks.remove(&stale);
+            self.live_blocks.remove(&stale);
             self.published_blocks.remove(stale);
             probes::dsr_cache_event(
                 tid,
@@ -3742,6 +4172,26 @@ impl ProcessState {
                 entry,
                 generation,
                 outcome: TranslationOutcome::BlockIndexHit,
+                emitted_bytes: 0,
+                cache_used_bytes: u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
+            });
+        }
+        // The read-only exact READY lookup sits at the TOP of the
+        // authoritative INITIAL miss: above decode, above the persistent unit
+        // store, and above any private-cache mutation.
+        let live_ready = self.live_ready_consultation(guest, generation, &observation);
+        if let LiveConsultation::Installed(entry) = live_ready {
+            probes::dsr_cache_event(
+                tid,
+                probes::DsrCacheEventKind::BlockHit,
+                guest.raw(),
+                generation.get(),
+                u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
+            );
+            return Ok(TranslationResult {
+                entry,
+                generation,
+                outcome: TranslationOutcome::LiveArena,
                 emitted_bytes: 0,
                 cache_used_bytes: u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
             });
@@ -3983,6 +4433,36 @@ impl ProcessState {
                 generation.get(),
             );
             plan_result?;
+
+            // The plan exists exactly once. Only a READY MISS may race for the
+            // block: a named private fallback above (BUILDING, FAILED, a
+            // corrupt record, an unconfigured lane) is immediate and never
+            // retried here.
+            if live_ready == LiveConsultation::Miss
+                && let LiveConsultation::Installed(entry) = self.live_winner_publication(
+                    &block,
+                    guest,
+                    generation,
+                    &observation,
+                    memory.address_mode().into(),
+                    block_source_words.as_ref(),
+                )
+            {
+                probes::dsr_cache_event(
+                    tid,
+                    probes::DsrCacheEventKind::BlockPublish,
+                    guest.raw(),
+                    generation.get(),
+                    u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
+                );
+                return Ok(TranslationResult {
+                    entry,
+                    generation,
+                    outcome: TranslationOutcome::LiveArena,
+                    emitted_bytes: 0,
+                    cache_used_bytes: u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
+                });
+            }
 
             probes::dsr_translate_subphase_begin(
                 tid,
@@ -4370,14 +4850,20 @@ impl ProcessState {
         // (`reset_after_fork_for_exec`) clears `published` with it, so a
         // block appends. Installed unit blocks replay into this same cache
         // and come through here like every native translation.
-        let index = &mut self.private_published_index;
-        let at = match index.last() {
-            Some(last) if last.start > entry.start => {
-                index.partition_point(|indexed| indexed.start <= entry.start)
-            }
-            _ => index.len(),
+        insert_published_index(&mut self.private_published_index, entry);
+        self.published.push(block);
+    }
+
+    /// Record one LIVE block: the same `published` list and the same ordered
+    /// address index shape, over the arena's RX payload instead of the private
+    /// cache. Deliberately NOT `push_published`: the two address indexes cover
+    /// disjoint mappings and each must stay internally ordered.
+    fn push_published_live(&mut self, block: PublishedBlock) {
+        let entry = PublishedIndexEntry {
+            start: block.entry.host(),
+            block: self.published.len(),
         };
-        index.insert(at, entry);
+        insert_published_index(&mut self.live_published_index, entry);
         self.published.push(block);
     }
 
@@ -4385,6 +4871,9 @@ impl ProcessState {
         self.published_blocks.clear();
         self.published.clear();
         self.private_published_index.clear();
+        self.live_published_index.clear();
+        self.live_blocks.clear();
+        self.live_source_pages.clear();
     }
 
     /// The published block whose emitted extent contains `cache_pc`, if any.
@@ -4400,8 +4889,12 @@ impl ProcessState {
     /// Resolves through `get` rather than indexing: an index that ever fell
     /// out of step with `published` must degrade into this function's existing
     /// "outside published DSR blocks" diagnostic, not panic a guest fault.
+    ///
+    /// The live index is the second search: live blocks execute from the arena
+    /// mapping, which is disjoint from the private cache, and the arena's
+    /// append-only chunk allocator keeps live extents disjoint from each other.
     fn published_block_containing(&self, cache_pc: usize) -> Option<&PublishedBlock> {
-        [&self.private_published_index]
+        [&self.private_published_index, &self.live_published_index]
             .into_iter()
             .find_map(|index| {
                 let at = index.partition_point(|indexed| indexed.start.raw() <= cache_pc);
@@ -4468,6 +4961,29 @@ impl ProcessState {
                         .find(|entry| entry.cache() == offset)
                         .map(|entry| entry.action().rebind(bindings))
                         .transpose()?;
+                    (guest, action)
+                }
+                // A live-arena block: same lazy contract as a unit block, but
+                // the undecoded COLD stream lives in the arena's mapped
+                // metadata pool. Resolving it is what makes the extent's first
+                // touch a FAULT-time cost rather than an install-time one.
+                PublishedBlockMetadata::Live {
+                    authority,
+                    host_bias,
+                } => {
+                    let cold_bytes = authority.cold_metadata().map_err(|reason| {
+                        types::DsrError::CachePolicy(format!(
+                            "live COLD metadata refused at fault for cache PC \
+                             0x{cache_pc:x}: {reason:?}"
+                        ))
+                    })?;
+                    let cold = artifact_spike::decode_shared_initial_cold(cold_bytes)?;
+                    let guest = cold
+                        .map
+                        .iter()
+                        .find(|entry| entry.cache == offset)
+                        .map(|entry| entry.guest);
+                    let action = cold.recovery.rebind_for_cache(offset, *host_bias)?;
                     (guest, action)
                 }
             };
@@ -4690,6 +5206,17 @@ impl ThreadTranslator {
                 );
                 return Ok(());
             }
+        }
+        // A LIVE target has no process-local target authority until Task 6E
+        // installs one, and emitted code must never receive a cached entry
+        // whose owner it cannot check. Skipping publication is correct and
+        // merely slower — the next indirect branch misses the cache and
+        // re-enters this resolver, which resolves the same live block. Every
+        // other unowned entry keeps failing closed below.
+        if !self.process.private_target_authority.owns(translated.entry)
+            && self.process.state.read().owns_live_entry(translated.entry)
+        {
+            return Ok(());
         }
         let authority =
             self.target_cache_authority(target, translated.generation, translated.entry)?;
@@ -5036,7 +5563,12 @@ impl ThreadTranslator {
             })?;
             let outcome = match translated.outcome {
                 TranslationOutcome::BlockIndexHit => probes::DsrPrepareOutcome::BlockIndexHit,
-                TranslationOutcome::SharedUnit => probes::DsrPrepareOutcome::BlockIndexHit,
+                // A live block was not translated by this entry: it was either
+                // already published by someone (an index hit in the shared
+                // sense) or won and published without a private emission.
+                TranslationOutcome::SharedUnit | TranslationOutcome::LiveArena => {
+                    probes::DsrPrepareOutcome::BlockIndexHit
+                }
                 TranslationOutcome::ArtifactReplay | TranslationOutcome::Translated => {
                     probes::DsrPrepareOutcome::Translated
                 }
@@ -6618,6 +7150,823 @@ mod tests {
                 .expect("nonmatching configuration")
         );
         assert!(translator.live_unit_digests_for_test().is_empty());
+    }
+
+    /// Task 6D: the translator side of the live arena — the READY lookup at
+    /// the top of an authoritative INITIAL miss, the unique-winner
+    /// publication, every named fallback, and the bookkeeping that must stay
+    /// OUT of the private publication path.
+    ///
+    /// The arena protocol itself (claim lifecycle, the 6B transaction, the
+    /// READY consumer's hash/HOT/generation/W^X validation) is proven against
+    /// real mapped objects in `carrick-native-darwin`. What these tests own is
+    /// the wiring: which paths are consulted, in what order, what a fallback
+    /// is named, and what an installed live block may and may not touch.
+    mod live_arena_wiring {
+        use super::super::{
+            LiveConsultation, LiveFallback, ProcessState, ProcessTranslator,
+            PublishedBlockMetadata, TranslationOutcome, emit, types,
+        };
+        use super::TEST_HOST_JIT;
+        use crate::block::{BlockPlan, PlannedExit};
+        use crate::emit::{EmitAddressMode, PreparedSharedInitial};
+        use crate::live_arena::{
+            LiveBlockAuthority, LiveOwnedChunkIdentity, LivePrivateReason, LivePublishOutcome,
+            LiveReadyOutcome, LiveTranslationAuthority,
+        };
+        use crate::shared_cache::{
+            AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
+            NativePageProfileIdentity, SharedExecutableSegment, SharedImageConfig,
+            TranslationUnitKey,
+        };
+        use carrick_dsr::cache::{PageGenerationObservation, PageGenerationTable};
+        use carrick_guest_mem::{GuestVa, HostVa};
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const SEGMENT_START: u64 = 0x4000;
+        const SEGMENT_LEN: u64 = 0x4000;
+        /// One `svc #0`: the smallest plan shape B3 accepts.
+        const SYSCALL_WORD: u32 = 0xd400_0001;
+
+        fn live_image() -> SharedImageConfig {
+            SharedImageConfig {
+                executable: ExecutableIdentity::Digest([0x6d; 32]),
+                page_profile: NativePageProfileIdentity::Native16k,
+                address_mode: AddressModeIdentity::Direct,
+                segments: vec![SharedExecutableSegment::new(
+                    ImageFileOffset::new(0),
+                    ImageFileLen::new(SEGMENT_LEN).expect("file length"),
+                    GuestVa(SEGMENT_START),
+                    GuestCodeLen::new(SEGMENT_LEN).expect("guest length"),
+                    vec![SYSCALL_WORD].into(),
+                )],
+            }
+        }
+
+        fn live_key() -> TranslationUnitKey {
+            let image = live_image();
+            image.key_for_segment(&image.segments[0])
+        }
+
+        fn syscall_plan(start: GuestVa) -> BlockPlan {
+            BlockPlan {
+                start,
+                end: GuestVa(start.raw() + 4),
+                generation: types::CodeGeneration::INITIAL,
+                instructions: Vec::new(),
+                exit: PlannedExit::Syscall {
+                    guest: start,
+                    resume: GuestVa(start.raw() + 4),
+                },
+                extensions: Vec::new(),
+            }
+        }
+
+        fn prepared_block(start: GuestVa) -> PreparedSharedInitial {
+            emit::prepare_shared_initial(
+                &live_key(),
+                &syscall_plan(start),
+                EmitAddressMode::Direct,
+                vec![SYSCALL_WORD],
+            )
+            .expect("prepare a real shared INITIAL block")
+        }
+
+        /// One installed live block, modelled with process-local buffers.
+        ///
+        /// The bytes are this fixture's own — the point of these tests is the
+        /// translator's bookkeeping over an ALREADY-VALIDATED block, not the
+        /// mapped-arena protocol — but the COLD stream is real prepared
+        /// output, so the lazy decode under test is the production decode.
+        struct FakeLiveBlock {
+            code: Box<[u8]>,
+            cold: Vec<u8>,
+            guest_start: GuestVa,
+            source_page: GuestVa,
+            group_slot: u32,
+            chunk_index: u32,
+            cold_reads: AtomicUsize,
+        }
+
+        impl FakeLiveBlock {
+            fn from_prepared(prepared: &PreparedSharedInitial, guest_start: GuestVa) -> Self {
+                Self {
+                    code: prepared.code_bytes().to_vec().into_boxed_slice(),
+                    cold: prepared.cold_bytes().to_vec(),
+                    guest_start,
+                    source_page: GuestVa(guest_start.raw() & !(16 * 1024 - 1)),
+                    group_slot: 7,
+                    chunk_index: 3,
+                    cold_reads: AtomicUsize::new(0),
+                }
+            }
+        }
+
+        impl LiveBlockAuthority for FakeLiveBlock {
+            fn entry(&self) -> HostVa {
+                HostVa(self.code.as_ptr() as usize)
+            }
+            fn code_len(&self) -> usize {
+                self.code.len()
+            }
+            fn guest_start(&self) -> GuestVa {
+                self.guest_start
+            }
+            fn source_page(&self) -> GuestVa {
+                self.source_page
+            }
+            fn group_slot(&self) -> u32 {
+                self.group_slot
+            }
+            fn chunk_index(&self) -> u32 {
+                self.chunk_index
+            }
+            fn cold_metadata(&self) -> Result<&[u8], LivePrivateReason> {
+                self.cold_reads.fetch_add(1, Ordering::Relaxed);
+                Ok(&self.cold)
+            }
+        }
+
+        /// What the fake authority answers with. One scripted outcome per
+        /// path keeps each fallback test a single named arm.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum FakeReady {
+            Miss,
+            Hit,
+            Private(LivePrivateReason),
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum FakeWinner {
+            Publish,
+            /// A racing publisher already reached READY.
+            RacedToReady,
+            Private(LivePrivateReason),
+            PrepareRefused,
+        }
+
+        struct FakeAuthority {
+            ready: Mutex<FakeReady>,
+            winner: FakeWinner,
+            prepares: AtomicUsize,
+            ready_lookups: AtomicUsize,
+            enumerations: AtomicUsize,
+            installed: Mutex<Vec<Arc<FakeLiveBlock>>>,
+        }
+
+        impl FakeAuthority {
+            fn new(ready: FakeReady, winner: FakeWinner) -> Arc<Self> {
+                Arc::new(Self {
+                    ready: Mutex::new(ready),
+                    winner,
+                    prepares: AtomicUsize::new(0),
+                    ready_lookups: AtomicUsize::new(0),
+                    enumerations: AtomicUsize::new(0),
+                    installed: Mutex::new(Vec::new()),
+                })
+            }
+
+            fn block(
+                &self,
+                prepared: &PreparedSharedInitial,
+                guest_start: GuestVa,
+            ) -> Arc<FakeLiveBlock> {
+                let block = Arc::new(FakeLiveBlock::from_prepared(prepared, guest_start));
+                self.installed
+                    .lock()
+                    .expect("installed")
+                    .push(Arc::clone(&block));
+                block
+            }
+
+            fn last_installed(&self) -> Arc<FakeLiveBlock> {
+                Arc::clone(
+                    self.installed
+                        .lock()
+                        .expect("installed")
+                        .last()
+                        .expect("one installed block"),
+                )
+            }
+        }
+
+        /// `Box<dyn LiveBlockAuthority>` over a shared fixture handle, so a
+        /// test can still read the fixture's counters after installation.
+        struct SharedFakeBlock(Arc<FakeLiveBlock>);
+
+        impl LiveBlockAuthority for SharedFakeBlock {
+            fn entry(&self) -> HostVa {
+                self.0.entry()
+            }
+            fn code_len(&self) -> usize {
+                self.0.code_len()
+            }
+            fn guest_start(&self) -> GuestVa {
+                self.0.guest_start()
+            }
+            fn source_page(&self) -> GuestVa {
+                self.0.source_page()
+            }
+            fn group_slot(&self) -> u32 {
+                self.0.group_slot()
+            }
+            fn chunk_index(&self) -> u32 {
+                self.0.chunk_index()
+            }
+            fn cold_metadata(&self) -> Result<&[u8], LivePrivateReason> {
+                self.0.cold_metadata()
+            }
+        }
+
+        impl LiveTranslationAuthority for FakeAuthority {
+            fn acquire_ready(
+                &self,
+                _key: &TranslationUnitKey,
+                guest_start: GuestVa,
+                _generation: &PageGenerationObservation,
+            ) -> LiveReadyOutcome {
+                self.ready_lookups.fetch_add(1, Ordering::Relaxed);
+                match *self.ready.lock().expect("ready script") {
+                    FakeReady::Miss => LiveReadyOutcome::Miss,
+                    FakeReady::Private(reason) => LiveReadyOutcome::Private(reason),
+                    FakeReady::Hit => {
+                        let prepared = prepared_block(guest_start);
+                        LiveReadyOutcome::Installed(Box::new(SharedFakeBlock(
+                            self.block(&prepared, guest_start),
+                        )))
+                    }
+                }
+            }
+
+            fn publish_winner(
+                &self,
+                _key: &TranslationUnitKey,
+                guest_start: GuestVa,
+                _block_end: GuestVa,
+                _generation: &PageGenerationObservation,
+                _owner_pid: i32,
+                prepare: &mut dyn FnMut() -> Result<PreparedSharedInitial, types::DsrError>,
+            ) -> LivePublishOutcome {
+                match self.winner {
+                    FakeWinner::Private(reason) => LivePublishOutcome::Private(reason),
+                    // A racing winner reached READY first: no `prepare` runs.
+                    FakeWinner::RacedToReady => {
+                        let prepared = prepared_block(guest_start);
+                        LivePublishOutcome::Installed(Box::new(SharedFakeBlock(
+                            self.block(&prepared, guest_start),
+                        )))
+                    }
+                    FakeWinner::PrepareRefused => {
+                        self.prepares.fetch_add(1, Ordering::Relaxed);
+                        LivePublishOutcome::PrepareRefused(types::DsrError::CachePolicy(
+                            "test preparation refused".to_string(),
+                        ))
+                    }
+                    FakeWinner::Publish => {
+                        self.prepares.fetch_add(1, Ordering::Relaxed);
+                        match prepare() {
+                            Ok(prepared) => LivePublishOutcome::Installed(Box::new(
+                                SharedFakeBlock(self.block(&prepared, guest_start)),
+                            )),
+                            Err(error) => LivePublishOutcome::PrepareRefused(error),
+                        }
+                    }
+                }
+            }
+
+            fn active_chunks_for_source_page(
+                &self,
+                source_page: GuestVa,
+            ) -> Vec<LiveOwnedChunkIdentity> {
+                self.enumerations.fetch_add(1, Ordering::Relaxed);
+                vec![LiveOwnedChunkIdentity {
+                    group_slot: 7,
+                    chunk_index: 11,
+                    unit_key_digest: [0; 32],
+                    source_page: source_page.raw(),
+                }]
+            }
+        }
+
+        struct Lane {
+            translator: ProcessTranslator,
+            generations: PageGenerationTable,
+            authority: Arc<FakeAuthority>,
+        }
+
+        impl Lane {
+            fn new(ready: FakeReady, winner: FakeWinner) -> Self {
+                let authority = FakeAuthority::new(ready, winner);
+                let translator = ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT)
+                    .expect("process translator");
+                assert!(
+                    translator
+                        .configure_live_image_matching_for_test(
+                            live_image(),
+                            0x4000,
+                            &live_key().file_stem().expect("exact unit stem"),
+                        )
+                        .expect("configure the live image"),
+                    "the fixture image must select its own exact unit key"
+                );
+                translator
+                    .install_live_authority(Arc::clone(&authority) as Arc<_>)
+                    .expect("install the live authority");
+                Self {
+                    translator,
+                    generations: PageGenerationTable::new(0x4000).expect("generation table"),
+                    authority,
+                }
+            }
+
+            /// Same lane without a live authority: the policy-off default.
+            fn unconfigured() -> Self {
+                let authority = FakeAuthority::new(FakeReady::Miss, FakeWinner::Publish);
+                Self {
+                    translator: ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT)
+                        .expect("process translator"),
+                    generations: PageGenerationTable::new(0x4000).expect("generation table"),
+                    authority,
+                }
+            }
+
+            fn observe(&self, guest: GuestVa) -> PageGenerationObservation {
+                self.generations.observe(guest).expect("observation")
+            }
+
+            fn with_state<R>(&self, body: impl FnOnce(&mut ProcessState) -> R) -> R {
+                body(&mut self.translator.state.write())
+            }
+        }
+
+        fn assert_private_indexes_untouched(state: &ProcessState) {
+            assert_eq!(
+                state.cache.used_bytes(),
+                0,
+                "a live install must never emit into the private cache"
+            );
+            assert!(
+                state.blocks.is_empty(),
+                "`blocks` is the PRIVATE publication authority"
+            );
+            assert!(
+                state.pending.is_empty(),
+                "a live block never waits in `pending`"
+            );
+            assert!(
+                state.direct_link_incoming.is_empty(),
+                "a live block is never a mutable incoming-link target"
+            );
+            assert!(
+                state.trusted_entries.is_empty(),
+                "a live block publishes no private trusted entry"
+            );
+            assert!(
+                state.private_published_index.is_empty(),
+                "a live block belongs to the LIVE address index"
+            );
+        }
+
+        #[test]
+        fn ready_hit_installs_without_mutating_the_private_cache() {
+            let lane = Lane::new(FakeReady::Hit, FakeWinner::Publish);
+            let guest = GuestVa(SEGMENT_START);
+            let observation = lane.observe(guest);
+
+            let consultation = lane.with_state(|state| {
+                state.live_ready_consultation(guest, types::CodeGeneration::INITIAL, &observation)
+            });
+
+            let LiveConsultation::Installed(entry) = consultation else {
+                panic!("a READY hit must install: {consultation:?}");
+            };
+            lane.with_state(|state| {
+                assert_private_indexes_untouched(state);
+                assert_eq!(
+                    state.live_blocks.len(),
+                    1,
+                    "the installed block is the live index's"
+                );
+                assert_eq!(state.live_published_index.len(), 1);
+                assert!(state.owns_live_entry(entry));
+                assert_eq!(
+                    state
+                        .published_blocks
+                        .get(guest, types::CodeGeneration::INITIAL),
+                    Some(super::super::PublishedBlockLookup {
+                        entry,
+                        trusted_entry: None,
+                    }),
+                    "the read-side mirror serves the live entry with no trusted entry"
+                );
+            });
+        }
+
+        #[test]
+        fn a_second_ready_lookup_is_served_from_the_live_index() {
+            let lane = Lane::new(FakeReady::Hit, FakeWinner::Publish);
+            let guest = GuestVa(SEGMENT_START);
+            let observation = lane.observe(guest);
+
+            let first = lane.with_state(|state| {
+                state.live_ready_consultation(guest, types::CodeGeneration::INITIAL, &observation)
+            });
+            let second = lane.with_state(|state| {
+                state.live_ready_consultation(guest, types::CodeGeneration::INITIAL, &observation)
+            });
+
+            assert_eq!(first, second, "the same entry is served twice");
+            assert_eq!(
+                lane.authority.ready_lookups.load(Ordering::Relaxed),
+                1,
+                "an installed live block is not re-validated on every entry"
+            );
+            lane.with_state(|state| assert_eq!(state.live_published_index.len(), 1));
+        }
+
+        #[test]
+        fn miss_then_winner_publication_installs_the_prepared_block() {
+            let lane = Lane::new(FakeReady::Miss, FakeWinner::Publish);
+            let guest = GuestVa(SEGMENT_START);
+            let observation = lane.observe(guest);
+
+            let ready = lane.with_state(|state| {
+                state.live_ready_consultation(guest, types::CodeGeneration::INITIAL, &observation)
+            });
+            assert_eq!(ready, LiveConsultation::Miss);
+
+            let published = lane.with_state(|state| {
+                state.live_winner_publication(
+                    &syscall_plan(guest),
+                    guest,
+                    types::CodeGeneration::INITIAL,
+                    &observation,
+                    EmitAddressMode::Direct,
+                    Some(&vec![SYSCALL_WORD]),
+                )
+            });
+
+            let LiveConsultation::Installed(entry) = published else {
+                panic!("the unique winner must install its own block: {published:?}");
+            };
+            assert_eq!(
+                lane.authority.prepares.load(Ordering::Relaxed),
+                1,
+                "the winner prepares exactly once"
+            );
+            lane.with_state(|state| {
+                assert_private_indexes_untouched(state);
+                assert!(state.owns_live_entry(entry));
+            });
+        }
+
+        #[test]
+        fn a_race_lost_to_a_ready_publisher_installs_without_preparing() {
+            let lane = Lane::new(FakeReady::Miss, FakeWinner::RacedToReady);
+            let guest = GuestVa(SEGMENT_START);
+            let observation = lane.observe(guest);
+
+            let published = lane.with_state(|state| {
+                state.live_winner_publication(
+                    &syscall_plan(guest),
+                    guest,
+                    types::CodeGeneration::INITIAL,
+                    &observation,
+                    EmitAddressMode::Direct,
+                    Some(&vec![SYSCALL_WORD]),
+                )
+            });
+
+            assert!(matches!(published, LiveConsultation::Installed(_)));
+            assert_eq!(
+                lane.authority.prepares.load(Ordering::Relaxed),
+                0,
+                "consuming another publisher's record must not translate twice"
+            );
+        }
+
+        #[test]
+        fn every_ineligibility_falls_back_immediately_with_its_own_name() {
+            let guest = GuestVa(SEGMENT_START);
+
+            // The policy-off default: no authority is installed at all.
+            let unconfigured = Lane::unconfigured();
+            let observation = unconfigured.observe(guest);
+            assert_eq!(
+                unconfigured.with_state(|state| state.live_ready_consultation(
+                    guest,
+                    types::CodeGeneration::INITIAL,
+                    &observation
+                )),
+                LiveConsultation::Private(LiveFallback::Unconfigured)
+            );
+
+            // Regenerated: no INITIAL-keyed record can serve this page.
+            let lane = Lane::new(FakeReady::Hit, FakeWinner::Publish);
+            let observation = lane.observe(guest);
+            assert_eq!(
+                lane.with_state(|state| state.live_ready_consultation(
+                    guest,
+                    types::CodeGeneration::claimed(2),
+                    &observation
+                )),
+                LiveConsultation::Private(LiveFallback::Regenerated)
+            );
+
+            // Outside the ONE configured live segment.
+            let outside = GuestVa(SEGMENT_START + SEGMENT_LEN);
+            let outside_observation = lane.observe(outside);
+            assert_eq!(
+                lane.with_state(|state| state.live_ready_consultation(
+                    outside,
+                    types::CodeGeneration::INITIAL,
+                    &outside_observation
+                )),
+                LiveConsultation::Private(LiveFallback::OutsideSegment)
+            );
+
+            // Every arena refusal keeps its own name through the seam.
+            for reason in [
+                LivePrivateReason::Building,
+                LivePrivateReason::Failed,
+                LivePrivateReason::CasLost,
+                LivePrivateReason::InvalidRecord,
+                LivePrivateReason::Capacity,
+                LivePrivateReason::ExhaustedProbes,
+                LivePrivateReason::KeyEncoding,
+                LivePrivateReason::UnknownState,
+            ] {
+                let refusing = Lane::new(FakeReady::Private(reason), FakeWinner::Publish);
+                let observation = refusing.observe(guest);
+                assert_eq!(
+                    refusing.with_state(|state| state.live_ready_consultation(
+                        guest,
+                        types::CodeGeneration::INITIAL,
+                        &observation
+                    )),
+                    LiveConsultation::Private(LiveFallback::Arena(reason)),
+                    "{reason:?} must reach the translator unrenamed"
+                );
+                refusing.with_state(|state| assert_private_indexes_untouched(state));
+            }
+
+            // BUILDING, a lost block CAS, corruption, and capacity are the
+            // WINNER path's own refusals and are equally immediate.
+            for reason in [
+                LivePrivateReason::Building,
+                LivePrivateReason::CasLost,
+                LivePrivateReason::Capacity,
+                LivePrivateReason::InvalidRecord,
+            ] {
+                let refusing = Lane::new(FakeReady::Miss, FakeWinner::Private(reason));
+                let observation = refusing.observe(guest);
+                assert_eq!(
+                    refusing.with_state(|state| state.live_winner_publication(
+                        &syscall_plan(guest),
+                        guest,
+                        types::CodeGeneration::INITIAL,
+                        &observation,
+                        EmitAddressMode::Direct,
+                        Some(&vec![SYSCALL_WORD]),
+                    )),
+                    LiveConsultation::Private(LiveFallback::Arena(reason)),
+                    "{reason:?} must reach the translator unrenamed"
+                );
+                refusing.with_state(|state| assert_private_indexes_untouched(state));
+            }
+        }
+
+        #[test]
+        fn the_winner_path_rejects_every_ineligible_plan_shape() {
+            let guest = GuestVa(SEGMENT_START);
+            let lane = Lane::new(FakeReady::Miss, FakeWinner::Publish);
+            let observation = lane.observe(guest);
+
+            // Sensitive, exclusive, and unsupported terminal exits own their
+            // whole block and are never shared INITIAL code.
+            for exit in [
+                PlannedExit::Sensitive {
+                    guest,
+                    word: SYSCALL_WORD,
+                    exit: types::SensitiveExit {
+                        kind: types::SensitiveKind::ReadTpidr,
+                        register: None,
+                        resume: GuestVa(guest.raw() + 4),
+                    },
+                    fusion: None,
+                },
+                PlannedExit::Unsupported {
+                    guest,
+                    word: 0,
+                    op: bad64::Op::UDF,
+                },
+            ] {
+                let plan = BlockPlan {
+                    exit,
+                    ..syscall_plan(guest)
+                };
+                assert_eq!(
+                    lane.with_state(|state| state.live_winner_publication(
+                        &plan,
+                        guest,
+                        types::CodeGeneration::INITIAL,
+                        &observation,
+                        EmitAddressMode::Direct,
+                        Some(&vec![SYSCALL_WORD]),
+                    )),
+                    LiveConsultation::Private(LiveFallback::UnsupportedShape)
+                );
+            }
+
+            // A decoded interval that leaves its 16 KiB source page.
+            let crossing = BlockPlan {
+                end: GuestVa(SEGMENT_START + 16 * 1024 + 4),
+                ..syscall_plan(guest)
+            };
+            assert_eq!(
+                lane.with_state(|state| state.live_winner_publication(
+                    &crossing,
+                    guest,
+                    types::CodeGeneration::INITIAL,
+                    &observation,
+                    EmitAddressMode::Direct,
+                    Some(&vec![SYSCALL_WORD]),
+                )),
+                LiveConsultation::Private(LiveFallback::CrossPage)
+            );
+
+            // No exact source words: nothing can be prepared.
+            assert_eq!(
+                lane.with_state(|state| state.live_winner_publication(
+                    &syscall_plan(guest),
+                    guest,
+                    types::CodeGeneration::INITIAL,
+                    &observation,
+                    EmitAddressMode::Direct,
+                    None,
+                )),
+                LiveConsultation::Private(LiveFallback::SourceWordsUnavailable)
+            );
+
+            assert_eq!(
+                lane.authority.prepares.load(Ordering::Relaxed),
+                0,
+                "an ineligible plan must never reach the claim protocol"
+            );
+            lane.with_state(|state| assert_private_indexes_untouched(state));
+        }
+
+        #[test]
+        fn a_refused_preparation_falls_back_privately() {
+            let lane = Lane::new(FakeReady::Miss, FakeWinner::PrepareRefused);
+            let guest = GuestVa(SEGMENT_START);
+            let observation = lane.observe(guest);
+
+            assert_eq!(
+                lane.with_state(|state| state.live_winner_publication(
+                    &syscall_plan(guest),
+                    guest,
+                    types::CodeGeneration::INITIAL,
+                    &observation,
+                    EmitAddressMode::Direct,
+                    Some(&vec![SYSCALL_WORD]),
+                )),
+                LiveConsultation::Private(LiveFallback::PrepareRefused)
+            );
+            lane.with_state(|state| assert_private_indexes_untouched(state));
+        }
+
+        #[test]
+        fn cold_metadata_decodes_only_when_a_fault_interrogates_it() {
+            let lane = Lane::new(FakeReady::Hit, FakeWinner::Publish);
+            let guest = GuestVa(SEGMENT_START);
+            let observation = lane.observe(guest);
+
+            let LiveConsultation::Installed(entry) = lane.with_state(|state| {
+                state.live_ready_consultation(guest, types::CodeGeneration::INITIAL, &observation)
+            }) else {
+                panic!("the fixture installs a READY block");
+            };
+            let block = lane.authority.last_installed();
+            assert_eq!(
+                block.cold_reads.load(Ordering::Relaxed),
+                0,
+                "installing must not touch the block's COLD extent"
+            );
+
+            // The prepared block's own pc map names its first cache offset;
+            // reconstructing that PC is the only thing that decodes COLD.
+            let (map, _recovery) = lane.with_state(|state| {
+                state.published[0]
+                    .metadata
+                    .materialize()
+                    .expect("decode the live COLD stream")
+            });
+            let first = map.first().copied().expect("a nonempty live pc map");
+            let reads_after_materialize = block.cold_reads.load(Ordering::Relaxed);
+            assert!(reads_after_materialize >= 1);
+
+            let cache_pc = GuestVa(entry.host().raw() as u64 + u64::from(first.cache.get()));
+            let (resolved, _action) = lane
+                .with_state(|state| state.guest_pc_for_cache(cache_pc))
+                .expect("a live cache PC resolves through the live address index");
+            assert_eq!(resolved, first.guest);
+            assert!(
+                block.cold_reads.load(Ordering::Relaxed) > reads_after_materialize,
+                "fault reconstruction decodes the mapped COLD stream on demand"
+            );
+        }
+
+        #[test]
+        fn the_source_page_hint_is_descriptor_authoritative_and_enumerated_once() {
+            let lane = Lane::new(FakeReady::Hit, FakeWinner::Publish);
+            let guest = GuestVa(SEGMENT_START);
+            let observation = lane.observe(guest);
+
+            lane.with_state(|state| {
+                state.live_ready_consultation(guest, types::CodeGeneration::INITIAL, &observation)
+            });
+
+            let page = GuestVa(SEGMENT_START & !(16 * 1024 - 1));
+            lane.with_state(|state| {
+                let hint = state.live_source_page_hint(page).expect("a page hint");
+                assert!(
+                    hint.chunks.contains(&3) && hint.chunks.contains(&11),
+                    "the hint carries the block's own chunk AND every ACTIVE \
+                     descriptor the enumeration found: {hint:?}"
+                );
+                assert!(hint.groups.contains(&7));
+            });
+            assert_eq!(
+                lane.authority.enumerations.load(Ordering::Relaxed),
+                1,
+                "one enumeration per newly observed chunk, not per install"
+            );
+        }
+
+        #[test]
+        fn a_regenerated_page_drops_its_live_block_from_every_index() {
+            let lane = Lane::new(FakeReady::Hit, FakeWinner::Publish);
+            let guest = GuestVa(SEGMENT_START);
+            let observation = lane.observe(guest);
+            lane.with_state(|state| {
+                state.live_ready_consultation(guest, types::CodeGeneration::INITIAL, &observation)
+            });
+
+            let key = (guest, types::CodeGeneration::INITIAL);
+            let stale = lane.with_state(|state| {
+                state
+                    .dependencies
+                    .invalidate_page(observation.page(), types::CodeGeneration::claimed(2))
+            });
+            assert_eq!(
+                stale,
+                vec![key],
+                "the live block registered its page dependency"
+            );
+
+            lane.with_state(|state| {
+                state.live_blocks.remove(&key);
+                state.published_blocks.remove(key);
+                assert!(state.live_blocks.is_empty());
+                assert!(
+                    state
+                        .published_blocks
+                        .get(guest, types::CodeGeneration::INITIAL)
+                        .is_none()
+                );
+            });
+        }
+
+        #[test]
+        fn a_live_translation_result_is_named_live() {
+            assert_ne!(
+                TranslationOutcome::LiveArena,
+                TranslationOutcome::Translated
+            );
+            assert_ne!(
+                TranslationOutcome::LiveArena,
+                TranslationOutcome::SharedUnit
+            );
+        }
+
+        #[test]
+        fn an_installed_live_block_carries_the_live_publication_kind() {
+            let lane = Lane::new(FakeReady::Hit, FakeWinner::Publish);
+            let guest = GuestVa(SEGMENT_START);
+            let observation = lane.observe(guest);
+            lane.with_state(|state| {
+                state.live_ready_consultation(guest, types::CodeGeneration::INITIAL, &observation)
+            });
+            lane.with_state(|state| {
+                assert!(matches!(
+                    state.published[0].metadata,
+                    PublishedBlockMetadata::Live { .. }
+                ));
+            });
+        }
     }
 
     #[test]
