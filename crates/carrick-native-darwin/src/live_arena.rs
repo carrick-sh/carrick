@@ -33,7 +33,7 @@ use carrick_dsr_aarch64::live_arena::{
     LiveArenaControlLayout, LiveBlockAuthority, LiveBlockExtents, LiveLookup,
     LiveMappedWritePermit, LiveOwnedChunkIdentity, LivePrivateReason, LiveProcessViewBrand,
     LivePublishClaim, LivePublishOutcome, LiveReadyLookup, LiveReadyOutcome,
-    LiveReservedPublishClaim, LiveTranslationArenaView, LiveTranslationAuthority,
+    LiveReservedPublishClaim, LiveRxPayload, LiveTranslationArenaView, LiveTranslationAuthority,
     ValidatedLiveBlockRecord,
 };
 use carrick_dsr_aarch64::shared_cache::TranslationUnitKey;
@@ -822,6 +822,26 @@ impl DarwinLiveArena {
         ])
     }
 
+    /// This process's RX payload interval: the executable alias of the code
+    /// payload, which is where every acquired block's entry lies.
+    ///
+    /// Every `resolve_code` result is `code_rx.base() + code_payload_base() +
+    /// offset` for an `offset` the caller already bounded by the logical code
+    /// capacity, so this interval contains every entry this arena can ever
+    /// hand out and nothing else. `None` when the interval overflows or the
+    /// logical capacity does not fit a host pointer — a named refusal, not a
+    /// silently empty range.
+    pub fn rx_payload_range(&self) -> Option<Range<usize>> {
+        let capacity = usize::try_from(self.control_layout.capacities().code).ok()?;
+        let start = self
+            .code_rx
+            .base()
+            .checked_add(self.control_layout.code_payload_base())?;
+        let end = start.checked_add(capacity)?;
+        (start < end && end <= self.code_rx.base().checked_add(self.code_len)?)
+            .then_some(start..end)
+    }
+
     pub fn revoke_rx(&self, range: Range<usize>) -> io::Result<()> {
         self.protect_rx(range, VM_PROT_NONE)
     }
@@ -897,6 +917,14 @@ impl LiveArenaProcessView {
                 layout,
             }),
         })
+    }
+
+    /// This view's stable RX payload — the arena's executable alias — as the
+    /// portable typed interval the translator mints its target authority and
+    /// its executable-range catalog node from.
+    pub fn rx_payload(&self) -> Option<LiveRxPayload> {
+        let range = self.inner.arena.rx_payload_range()?;
+        LiveRxPayload::new(HostVa(range.start), HostVa(range.end))
     }
 
     pub fn acquire_ready_or_miss(
@@ -1374,6 +1402,10 @@ impl LiveTranslationAuthority for LiveArenaProcessView {
             return Vec::new();
         };
         control.active_chunks_for_source_page(source_page.raw())
+    }
+
+    fn rx_payload(&self) -> Option<LiveRxPayload> {
+        Self::rx_payload(self)
     }
 }
 
@@ -3661,6 +3693,78 @@ mod tests {
                 .private_fallbacks,
             0
         );
+    }
+
+    /// The process view's RX payload is ONE interval covering every entry it
+    /// can hand out, and it is the executable alias — never the writable one.
+    ///
+    /// This is what the translator mints its single stable target authority
+    /// and its executable-range catalog node from, so it has to be an exact
+    /// property of the mapping, not an approximation: a payload that missed a
+    /// published entry would classify live code as a non-authoritative host PC
+    /// at fault/kick time, and one that included the RW alias would hand
+    /// emitted code a writable address as an executable target.
+    #[test]
+    fn a_process_view_publishes_one_rx_payload_covering_every_entry_it_installs() {
+        let arena = Arc::new(protocol_arena());
+        let key = live_key();
+        let generations = PageGenerationTable::new(page() as u64).expect("generations");
+        let view = LiveArenaProcessView::new(Arc::clone(&arena), generations.domain())
+            .expect("process view");
+        let payload = view.rx_payload().expect("a mapped view has an RX payload");
+
+        // SAFETY: the ranges are used only as transient diagnostic intervals.
+        let [code_rw, code_rx, control] =
+            unsafe { arena.local_mapping_ranges_for_transport_proof() }
+                .expect("local mapping ranges");
+        assert!(
+            code_rx.contains(&payload.start().raw()) && payload.end().raw() <= code_rx.end,
+            "the payload lies inside the EXECUTABLE alias"
+        );
+        assert!(
+            !code_rw.contains(&payload.start().raw()) && !control.contains(&payload.start().raw()),
+            "and never inside the writable aliases"
+        );
+        assert_eq!(
+            payload.start().raw(),
+            code_rx.start + arena.code_payload_base(),
+            "the payload begins at the host-page-aligned code payload base"
+        );
+
+        // Every block this view installs lands inside that one interval.
+        for index in 0..3_u64 {
+            let start = GuestVa(0x4000_0000 + index * 0x1000);
+            let generation = generations.observe(start).expect("generation");
+            let LivePublishOutcome::Installed(block) = view.publish_winner(
+                &key,
+                start,
+                GuestVa(start.raw() + 0xc),
+                &generation,
+                unsafe { libc::getpid() },
+                &mut || {
+                    Ok(prepared_publication_for_span(
+                        &key,
+                        start,
+                        GuestVa(start.raw() + 0xc),
+                    ))
+                },
+            ) else {
+                panic!("the unique winner must install its own block");
+            };
+            let entry = block.entry().raw();
+            assert!(
+                (payload.start().raw()..payload.end().raw()).contains(&entry),
+                "installed entry 0x{entry:x} is outside the published RX payload"
+            );
+            assert!(
+                entry + block.code_len() <= payload.end().raw(),
+                "and so is its whole extent"
+            );
+        }
+
+        // The payload is a property of the MAPPING, so it does not move as
+        // blocks are published; emitted code may cache one authority record.
+        assert_eq!(view.rx_payload(), Some(payload));
     }
 
     /// A live block already installed in the parent stays resolvable in a

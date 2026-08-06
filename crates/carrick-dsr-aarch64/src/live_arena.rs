@@ -708,6 +708,38 @@ pub struct LiveArenaCursorSnapshot {
     pub private_fallbacks: u64,
 }
 
+/// One process view's executable payload: the RX-alias interval every block it
+/// installs branches into.
+///
+/// This is the ONE local address range the portable layer accepts from a
+/// process view, and it exists so the translator can mint exactly one stable
+/// target authority (indirect-cache flavor 0, gateway entry) and one
+/// executable-range catalog node over it. It is deliberately NOT a pair of
+/// bare integers: an empty or inverted payload can never be constructed, so
+/// no consumer has to re-check the direction of an interval that would
+/// silently own nothing (or everything).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LiveRxPayload {
+    start: HostVa,
+    end: HostVa,
+}
+
+impl LiveRxPayload {
+    /// `None` when the interval is empty or inverted — the named refusal a
+    /// caller turns into "this authority exposes no RX payload".
+    pub fn new(start: HostVa, end: HostVa) -> Option<Self> {
+        (start.raw() < end.raw()).then_some(Self { start, end })
+    }
+
+    pub const fn start(self) -> HostVa {
+        self.start
+    }
+
+    pub const fn end(self) -> HostVa {
+        self.end
+    }
+}
+
 /// Descriptor-authoritative ownership discovered from one ACTIVE chunk.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LiveOwnedChunkIdentity {
@@ -2505,6 +2537,16 @@ pub trait LiveTranslationAuthority: Send + Sync {
     /// Group hash placement is deliberately not the authority for this reverse
     /// lookup; ACTIVE descriptors are.
     fn active_chunks_for_source_page(&self, source_page: GuestVa) -> Vec<LiveOwnedChunkIdentity>;
+
+    /// This process view's RX payload: the one interval every block it
+    /// installs executes from.
+    ///
+    /// It is the view's own mapping geometry, resolved once, so the translator
+    /// can give the view a single stable target authority and one
+    /// executable-range catalog node instead of one per installed block.
+    /// `None` is a named refusal — a view whose payload cannot be resolved
+    /// never becomes an authority.
+    fn rx_payload(&self) -> Option<LiveRxPayload>;
 }
 
 fn initial_slot(unit_key_digest: &[u8; 32], guest_start: u64) -> usize {

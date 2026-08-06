@@ -1531,9 +1531,19 @@ fn adopt_owned_live_arena(
 /// record acquired through it can never be resolved against another mapping.
 /// A guest `fork(2)` child inherits both the view and its mappings by copy —
 /// the arena is a SHARED file mapping at the same addresses — so the child's
-/// installed live blocks and indexes stay coherent without a rebuild; an
-/// `execve` successor re-enters here and installs a fresh view over the arena
-/// it adopted from the inherited fds.
+/// installed live blocks and indexes stay coherent without a rebuild.
+///
+/// Both `execve` shapes re-enter this function for their replacement image:
+/// the host self-re-exec successor re-enters `run_image_in_current_process`
+/// with a fresh translator over the arena it adopted from the inherited fds,
+/// and the in-process path calls it right after the replacement image's
+/// `configure_shared_translation`, once the exec reset has retired the
+/// outgoing image's live configuration, authority and catalog node.
+///
+/// Installing also mints this process's ONE stable target authority over the
+/// view's RX payload and registers that payload in the executable-range
+/// catalog, so a fault or asynchronous kick inside live code classifies as
+/// authoritative translated code rather than a host PC.
 fn install_live_translation_authority(
     memory: &NativeMappedMemory,
     arena: &Arc<carrick_native_darwin::live_arena::DarwinLiveArena>,
@@ -4830,35 +4840,6 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                             })?;
                         {
                             let memory = memory.read();
-                            // SEAM (Task 6E / Task 7) — the IN-PROCESS exec path
-                            // has no live-lane wiring, unlike the host
-                            // self-re-exec path, whose successor re-enters
-                            // `run_image_in_current_process` and installs a fresh
-                            // `LiveArenaProcessView` over its adopted arena.
-                            // Under `CARRICK_DSR_LIVE_ARENA=compiler` this
-                            // `configure_shared_translation` reaches
-                            // `configure_live_image`, and BOTH translator
-                            // branches of `replace_image` are wrong in a
-                            // different, currently-benign way:
-                            //
-                            // * inherited translator (`NATIVE_FORKED_GUEST_CHILD`,
-                            //   `mapped_memory.rs` `replace_image`): the exec
-                            //   reset clears `shared_translation` but NOT
-                            //   `live_translation` or `live_authority`
-                            //   (`translator.rs` `commit_inner`), so the
-                            //   already-configured guard fires and this call
-                            //   fails AFTER old-image retirement — fatal, but
-                            //   fail-closed, never a mistranslation;
-                            // * fresh translator: the new `ProcessTranslator`
-                            //   has no authority installed, so the live lane
-                            //   goes silently inert for the replacement image.
-                            //
-                            // Neither is reachable by default (the policy is
-                            // opt-in and pre-Task-7 correctness evidence is
-                            // forbidden), so 6D names it rather than rewiring
-                            // it: the exec-time live-lane reset and re-install
-                            // belong with 6E's publication-kind/target-authority
-                            // work and Task 7's revocation.
                             memory
                                 .configure_shared_translation(
                                     &image,
@@ -4874,6 +4855,26 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                                     ),
                                 )
                                 .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                            // The IN-PROCESS exec live lane, the counterpart of
+                            // the boot/self-re-exec wiring in
+                            // `run_image_in_current_process`. `replace_image`
+                            // has just run the exec reset, which clears
+                            // `live_translation`/`live_authority` and drops the
+                            // RX payload's executable-range catalog node, so the
+                            // `configure_shared_translation` above configured
+                            // the REPLACEMENT image's live unit key and this
+                            // call installs a fresh process view over the same
+                            // inherited arena. Both `replace_image` translator
+                            // branches land here: the inherited translator
+                            // (`NATIVE_FORKED_GUEST_CHILD`) re-installs onto its
+                            // reset state, and a freshly constructed one
+                            // installs for the first time.
+                            //
+                            // Without an arena owner — the policy-off default —
+                            // this is not reached and the lane stays inert.
+                            if let Some(arena) = live_arena.as_ref() {
+                                install_live_translation_authority(&memory, arena)?;
+                            }
                         }
                         // Publish process-visible exec state only after the
                         // complete replacement mapping, vvar, relocations, and

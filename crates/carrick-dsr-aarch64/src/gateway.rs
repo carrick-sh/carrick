@@ -197,6 +197,12 @@ impl ExecutableRangeCatalog {
         self.header.as_ref()
     }
 
+    /// This catalog's stable header authority, safe to copy out of whatever
+    /// lock owns the catalog and hand to every gateway entry.
+    pub fn authority(&self) -> ExecutableRangeCatalogAuthority {
+        ExecutableRangeCatalogAuthority(self.header_ptr())
+    }
+
     pub fn head_ptr(&self) -> *mut ExecutableRangeCatalogNode {
         self.header.head.load(Ordering::Acquire)
     }
@@ -218,6 +224,38 @@ impl ExecutableRangeCatalog {
 
     pub fn shared_node_count(&self) -> usize {
         self.shared.len()
+    }
+}
+
+/// One process's stable executable-range catalog header.
+///
+/// The header is a heap `Box` the process's [`ExecutableRangeCatalog`] owns for
+/// its whole life: `prepend`, `reset_head_to_private` and `drop_shared_nodes`
+/// only store into its atomic `head`, never reallocate it. Copying the pointer
+/// out from under whatever lock owns the catalog is therefore stable, which is
+/// what keeps the gateway entry — the hottest path there is — off the
+/// process-state lock while still publishing the catalog the signal handler
+/// needs to classify an interrupted PC.
+#[derive(Clone, Copy)]
+pub struct ExecutableRangeCatalogAuthority(*const ExecutableRangeCatalogHeader);
+
+// SAFETY: the pointee is a pinned header whose only mutable field is an
+// `AtomicPtr` the C signal handler reads with acquire ordering. Holders of an
+// authority also retain the catalog (it lives in the process translator they
+// reach it through), so the header outlives every copy.
+unsafe impl Send for ExecutableRangeCatalogAuthority {}
+// SAFETY: see `Send`.
+unsafe impl Sync for ExecutableRangeCatalogAuthority {}
+
+impl ExecutableRangeCatalogAuthority {
+    pub const fn as_ptr(self) -> *const ExecutableRangeCatalogHeader {
+        self.0
+    }
+
+    pub fn contains(self, pc: usize) -> bool {
+        // SAFETY: the authority's constructor pins the header and holders
+        // retain the catalog that owns it.
+        unsafe { executable_range_catalog_contains(self.0, pc) }
     }
 }
 
@@ -320,6 +358,16 @@ impl TargetCacheAuthority {
     pub fn owns(&self, entry: CacheVa) -> bool {
         let address = entry.host().raw() as u64;
         (self.cache_start..self.cache_end).contains(&address)
+    }
+
+    /// The exact host interval this authority installs into the context.
+    ///
+    /// Two authorities describing the SAME interval are interchangeable, which
+    /// is what lets a process re-install its live target authority across an
+    /// in-process exec without minting a second record for emitted code to
+    /// point at.
+    pub const fn host_range(&self) -> std::ops::Range<u64> {
+        self.cache_start..self.cache_end
     }
 }
 
@@ -878,13 +926,30 @@ mod native_gateway {
         )
     }
 
-    pub fn enter_translated_with_trusted_private_cache(
+    /// Enter translated code under the EXACT executable authority that owns
+    /// `entry`, publishing this process's executable-range catalog alongside
+    /// it.
+    ///
+    /// The authority is the caller's explicit publication decision (private
+    /// JIT cache or live-arena RX payload), not an assumption: it installs the
+    /// context's `cache_start`/`cache_end`, which is the fast half of the
+    /// signal handler's phase-zero classification. The catalog is the other
+    /// half — it covers every executable mapping the process owns, so a kick
+    /// that lands in code the currently installed authority does not describe
+    /// (a private→live direct link, a flavor-1 hop that deliberately skips the
+    /// authority switch) still classifies as authoritative translated code.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one gateway entry pins entry, authority, cache and catalog together"
+    )]
+    pub fn enter_translated_with_executable_authority(
         entry: CacheVa,
         snapshot: &mut NativeUcontextSnapshot,
         exit: &mut NativeDsrExit,
         indirect_cache: &IndirectTargetCache,
-        private_authority: &TargetCacheAuthority,
+        authority: &TargetCacheAuthority,
         address_mode: carrick_dsr::address::NativeAddressMode,
+        executable_range_catalog: ExecutableRangeCatalogAuthority,
     ) -> Result<(), DsrError> {
         enter_translated_raw(
             entry,
@@ -892,11 +957,11 @@ mod native_gateway {
             exit,
             indirect_cache.as_ptr(),
             CodeGeneration::INITIAL,
-            private_authority.cache_start as usize,
-            private_authority.cache_end as usize,
+            authority.cache_start as usize,
+            authority.cache_end as usize,
             address_mode,
             std::ptr::null(),
-            std::ptr::null(),
+            executable_range_catalog.as_ptr(),
             false,
         )
     }
@@ -1082,13 +1147,18 @@ mod native_gateway {
         Err(DsrError::Gateway(GATEWAY_UNAVAILABLE.to_string()))
     }
 
-    pub fn enter_translated_with_trusted_private_cache(
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "matches the live executable-authority gateway entry signature"
+    )]
+    pub fn enter_translated_with_executable_authority(
         _entry: CacheVa,
         _snapshot: &mut NativeUcontextSnapshot,
         _exit: &mut NativeDsrExit,
         _indirect_cache: &IndirectTargetCache,
-        _private_authority: &TargetCacheAuthority,
+        _authority: &TargetCacheAuthority,
         _address_mode: carrick_dsr::address::NativeAddressMode,
+        _executable_range_catalog: ExecutableRangeCatalogAuthority,
     ) -> Result<(), DsrError> {
         Err(DsrError::Gateway(GATEWAY_UNAVAILABLE.to_string()))
     }

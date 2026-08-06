@@ -378,6 +378,17 @@ impl PreparedDirectBindingExecReset<'_, '_, '_> {
         state.unsupported.clear();
         state.dependencies = cache::PageBlockDependencies::default();
         state.shared_translation = None;
+        // The replacement image is a different executable with different
+        // segments, so the outgoing image's live unit key and this process's
+        // authority over the arena for it are both retired here. Without the
+        // reset, `configure_live_image` would trip its already-configured
+        // guard AFTER old-image retirement (fatal) and the replacement image
+        // could never install a view. `clear_published` above already emptied
+        // the live indexes, and `executable_ranges` dropped the RX payload's
+        // catalog node; `install_live_authority` re-registers both for the
+        // replacement image over the SAME inherited arena.
+        state.live_translation = None;
+        state.live_authority = None;
         state.shared_unit_segments_consulted.clear();
         state.shared_recording_segments.clear();
         state.shared_candidates.clear();
@@ -415,6 +426,20 @@ pub struct PreparedEntry {
     pub entry: types::CacheVa,
     pub generation: types::CodeGeneration,
     address_mode: carrick_dsr::address::NativeAddressMode,
+    /// The executable region that owns `entry`, resolved when the entry was
+    /// prepared. The gateway installs THIS region's cache range, so a live
+    /// block is entered under the live-arena authority and a private block
+    /// under the private one — never one under the other's range.
+    authority: PublicationAuthority,
+}
+
+impl PreparedEntry {
+    /// Test/diagnostic view of the executable region this entry was prepared
+    /// against.
+    #[doc(hidden)]
+    pub const fn executable_authority(&self) -> PublicationAuthority {
+        self.authority
+    }
 }
 
 pub struct PreparedExit {
@@ -720,11 +745,45 @@ pub struct CodeSnapshot {
     pub blocks: Vec<(u64, u64)>,
 }
 
+/// Which of this process's executable regions owns a translated entry.
+///
+/// ENUMERATED, never inferred by a wildcard: every consumer (`target cache
+/// authority`, gateway entry, direct-link resolution) matches exhaustively, so
+/// a third executable region cannot be added without a compile error at each
+/// decision point that would otherwise silently treat it as private.
+///
+/// A replayed shared UNIT block is `Private`: it replays into the private bump
+/// cache and executes from it, exactly like a native translation. Only the
+/// live arena's RX payload is a second executable region.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublicationAuthority {
+    /// The process's private bump-allocated JIT cache.
+    Private,
+    /// This process view's live-arena RX payload.
+    Live,
+}
+
 pub struct ProcessTranslator {
     // `pub` for the runtime's still-resident test suites (see ThreadTranslator).
     pub state: RwLock<ProcessState>,
     published_blocks: Arc<PublishedBlockIndex>,
     private_target_authority: Box<gateway::TargetCacheAuthority>,
+    /// The ONE stable target authority over this process view's live-arena RX
+    /// payload, minted by `install_live_authority`.
+    ///
+    /// Boxed and install-once so emitted code may hold its address: a
+    /// flavor-0 indirect-cache entry stores the record's pointer, and the
+    /// emitted slow path dereferences it to validate and install the target's
+    /// cache range. A `OnceLock` rather than a lock-protected slot because
+    /// every read is on the resolver/gateway path and the record never
+    /// changes: an in-process exec re-installs the SAME arena mapping, and
+    /// `install_live_authority` refuses a payload that disagrees.
+    live_target_authority: std::sync::OnceLock<Box<gateway::TargetCacheAuthority>>,
+    /// The process's executable-range catalog header, copied out of
+    /// `ProcessState` once at construction. Stable for the translator's life
+    /// (see `gateway::ExecutableRangeCatalogAuthority`), which keeps the
+    /// gateway entry off the process-state lock.
+    executable_range_catalog: gateway::ExecutableRangeCatalogAuthority,
     private_jit_epoch: Arc<crate::direct_binding::PrivateJitEpoch>,
     exec_reset_identity: Arc<DirectBindingExecProcessIdentity>,
 }
@@ -2812,12 +2871,20 @@ impl ProcessTranslator {
                 ..carrick_guest_mem::HostVa(cache_range.end),
         )?;
         let published_blocks = Arc::new(PublishedBlockIndex::new());
+        let executable_ranges =
+            gateway::ExecutableRangeCatalog::new(cache_range.start, cache_range.end)?;
+        // The header is a heap `Box` the catalog owns; moving the catalog into
+        // `ProcessState` below does not move it, so this authority stays valid
+        // for the translator's whole life.
+        let executable_range_catalog = executable_ranges.authority();
         let translator = Self {
             private_target_authority: Box::new(gateway::TargetCacheAuthority::new(
                 cache_range.start,
                 cache_range.end,
                 std::ptr::null(),
             )),
+            live_target_authority: std::sync::OnceLock::new(),
+            executable_range_catalog,
             private_jit_epoch: crate::direct_binding::PrivateJitEpoch::process_owner(),
             exec_reset_identity: Arc::new(DirectBindingExecProcessIdentity),
             published_blocks: Arc::clone(&published_blocks),
@@ -2852,10 +2919,7 @@ impl ProcessTranslator {
                 attached_unit_blocks: BTreeMap::new(),
                 shared_candidates: BTreeMap::new(),
                 shared_publish_attempted: false,
-                executable_ranges: gateway::ExecutableRangeCatalog::new(
-                    cache_range.start,
-                    cache_range.end,
-                )?,
+                executable_ranges,
                 superblock_segments: block::superblock_segment_limit(),
             }),
         };
@@ -3034,23 +3098,122 @@ impl ProcessTranslator {
         Ok(true)
     }
 
-    /// Install this process's live-arena authority.
+    /// Install this process's live-arena authority, its ONE stable target
+    /// authority over the view's RX payload, and that payload's
+    /// executable-range catalog node.
     ///
-    /// The runtime calls it once, after the arena owner exists and the live
-    /// image is configured; without it every live path is inert, which is what
-    /// keeps the default (policy-off) translator byte-identical.
+    /// The runtime calls it once per process image, after the arena owner
+    /// exists and the live image is configured; without it every live path is
+    /// inert, which is what keeps the default (policy-off) translator
+    /// byte-identical. An in-process `execve` clears the authority and its
+    /// catalog node in the exec reset and calls this again for the replacement
+    /// image — over the SAME inherited arena, which is why a second install
+    /// must present the same RX payload and is refused by name if it does not.
+    ///
+    /// Ordering is fail-closed: every refusal happens before any mutation, and
+    /// the catalog node is prepared (allocated, reserved) before the head that
+    /// publishes it to the signal handler moves.
     pub fn install_live_authority(
         &self,
         authority: Arc<dyn crate::live_arena::LiveTranslationAuthority>,
     ) -> Result<(), types::DsrError> {
+        let payload = authority.rx_payload().ok_or_else(|| {
+            types::DsrError::CachePolicy(
+                "live translation authority exposes no RX payload range".to_string(),
+            )
+        })?;
+        let start = payload.start().raw();
+        let end = payload.end().raw();
         let mut state = self.state.write();
         if state.live_authority.is_some() {
             return Err(types::DsrError::CachePolicy(
                 "live translation authority was already installed".to_string(),
             ));
         }
+        match self.live_target_authority.get() {
+            Some(existing) if existing.host_range() == (start as u64..end as u64) => {}
+            Some(existing) => {
+                return Err(types::DsrError::CachePolicy(format!(
+                    "live translation RX payload 0x{start:x}..0x{end:x} disagrees with this \
+                     process's installed target authority 0x{:x}..0x{:x}",
+                    existing.host_range().start,
+                    existing.host_range().end,
+                )));
+            }
+            None => {}
+        }
+        let prepared = state.executable_ranges.prepare_prepend(start, end)?;
+        // Infallible from here: the record is install-once and the catalog
+        // node is already allocated.
+        let _ = self
+            .live_target_authority
+            .set(Box::new(gateway::TargetCacheAuthority::new(
+                start,
+                end,
+                // A shared INITIAL block carries no generation guard, so there
+                // is no per-page binding table for emitted code to consult.
+                std::ptr::null(),
+            )));
+        state.executable_ranges.commit_prepend(prepared);
         state.live_authority = Some(authority);
         Ok(())
+    }
+
+    /// The stable target-authority record for one executable region, or the
+    /// named refusal that this process has no such region.
+    ///
+    /// The match is exhaustive on purpose (see [`PublicationAuthority`]).
+    fn executable_authority(
+        &self,
+        authority: PublicationAuthority,
+    ) -> Result<&gateway::TargetCacheAuthority, types::DsrError> {
+        match authority {
+            PublicationAuthority::Private => Ok(self.private_target_authority.as_ref()),
+            PublicationAuthority::Live => self
+                .live_target_authority
+                .get()
+                .map(Box::as_ref)
+                .ok_or_else(|| {
+                    types::DsrError::CachePolicy(
+                        "live executable authority was requested before it was installed"
+                            .to_string(),
+                    )
+                }),
+        }
+    }
+
+    /// Which executable region owns `entry`, or the named refusal that none
+    /// does.
+    ///
+    /// Two range compares against the private cache and, when a live authority
+    /// is installed, two more against the RX payload — no lock, because both
+    /// records are stable for the translator's life. An entry belonging to
+    /// neither region can never reach emitted code: this is the fail-closed
+    /// point every publication and every gateway entry passes through.
+    pub(crate) fn publication_authority(
+        &self,
+        entry: types::CacheVa,
+    ) -> Result<PublicationAuthority, types::DsrError> {
+        if self.private_target_authority.owns(entry) {
+            return Ok(PublicationAuthority::Private);
+        }
+        if self
+            .live_target_authority
+            .get()
+            .is_some_and(|live| live.owns(entry))
+        {
+            return Ok(PublicationAuthority::Live);
+        }
+        Err(types::DsrError::CachePolicy(format!(
+            "translated target 0x{:x} has no executable authority",
+            entry.host().raw()
+        )))
+    }
+
+    /// This process's executable-range catalog, as the gateway entry and the
+    /// signal handler consume it.
+    pub(crate) fn executable_range_catalog(&self) -> gateway::ExecutableRangeCatalogAuthority {
+        self.executable_range_catalog
     }
 
     #[cfg(test)]
@@ -3822,10 +3985,12 @@ impl ProcessState {
             };
             // Installed unit blocks come through `publish_emitted` exactly
             // like native translations, so every target is patched directly
-            // at its trusted entry — no binding-table trampolines.
-            match self.blocks.get(&target_key).copied() {
-                Some(target) => {
-                    let target = self.trusted_target(target_key, target);
+            // at its trusted entry — no binding-table trampolines. A LIVE
+            // target resolves here too (`direct_link_target`), which is what
+            // lets a private source patch into the arena instead of waiting
+            // in `pending` for a private translation that will never come.
+            match self.direct_link_target(target_key) {
+                Some((_authority, target)) => {
                     self.patch_direct_link_if_reachable(site, target, link.target)?
                 }
                 None => {
@@ -4092,6 +4257,12 @@ impl ProcessState {
 
     /// Whether `entry` addresses a block THIS process installed from the live
     /// arena. Two binary searches over the live address index, never a scan.
+    ///
+    /// The publication path no longer needs this — `PublicationAuthority`
+    /// answers "which region owns this address" from the stable RX payload
+    /// without a lock — but it remains the per-BLOCK check the address index
+    /// supports, which is what the install tests assert on.
+    #[cfg(test)]
     fn owns_live_entry(&self, entry: types::CacheVa) -> bool {
         let cache_pc = entry.host().raw();
         let index = &self.live_published_index;
@@ -4181,6 +4352,7 @@ impl ProcessState {
         // store, and above any private-cache mutation.
         let live_ready = self.live_ready_consultation(guest, generation, &observation);
         if let LiveConsultation::Installed(entry) = live_ready {
+            self.drain_pending_links_to_live(key, entry)?;
             probes::dsr_cache_event(
                 tid,
                 probes::DsrCacheEventKind::BlockHit,
@@ -4448,6 +4620,7 @@ impl ProcessState {
                     block_source_words.as_ref(),
                 )
             {
+                self.drain_pending_links_to_live(key, entry)?;
                 probes::dsr_cache_event(
                     tid,
                     probes::DsrCacheEventKind::BlockPublish,
@@ -4784,6 +4957,61 @@ impl ProcessState {
             )),
             None => entry,
         }
+    }
+
+    /// Where a PRIVATE direct link should branch for `key`, and which
+    /// executable region owns that address. `None` means no translation
+    /// exists yet, so the site waits in `pending`.
+    ///
+    /// The two publication indexes are consulted in publication-authority
+    /// order and never merged:
+    ///
+    /// * `blocks` — the private publication authority. The link targets the
+    ///   block's trusted entry when it has one, its guarded entry otherwise.
+    /// * `live_blocks` — this process view's live arena. A shared INITIAL
+    ///   block publishes no trusted entry, so the link targets its entry.
+    ///   This is the "private sources may patch to live targets" direction;
+    ///   the reverse never happens, because a live block's own links are
+    ///   emitted into immutable arena code that this process never patches.
+    fn direct_link_target(
+        &self,
+        key: PublishedBlockKey,
+    ) -> Option<(PublicationAuthority, types::CacheVa)> {
+        if let Some(entry) = self.blocks.get(&key).copied() {
+            return Some((
+                PublicationAuthority::Private,
+                self.trusted_target(key, entry),
+            ));
+        }
+        self.live_blocks
+            .get(&key)
+            .copied()
+            .map(|entry| (PublicationAuthority::Live, entry))
+    }
+
+    /// Patch every PRIVATE direct-link site waiting on `key` to the live block
+    /// now installed for it.
+    ///
+    /// The mirror of `publish_emitted_with_metadata`'s pending drain: a
+    /// private source that linked to this guest target before any translation
+    /// existed waits in `pending`, and a live installation IS a publication of
+    /// that target. Without this the site would wait forever — the private
+    /// translator may never publish that key at all — so every traversal would
+    /// keep paying a gateway round trip and the entry would never be reclaimed.
+    ///
+    /// Idempotent: a repeat lookup finds no pending sites for the key.
+    fn drain_pending_links_to_live(
+        &mut self,
+        key: PublishedBlockKey,
+        entry: types::CacheVa,
+    ) -> Result<(), types::DsrError> {
+        let Some(sites) = self.pending.remove(&key) else {
+            return Ok(());
+        };
+        for site in sites {
+            self.patch_direct_link_if_reachable(site, entry, key.0)?;
+        }
+        Ok(())
     }
 
     fn patch_direct_link_if_reachable(
@@ -5146,32 +5374,24 @@ impl ThreadTranslator {
         self.process.state.read().guest_pc_for_cache(cache_pc)
     }
 
-    fn target_cache_authority(
-        &self,
-        guest: carrick_guest_mem::GuestVa,
-        generation: types::CodeGeneration,
-        entry: types::CacheVa,
-    ) -> Result<*const gateway::TargetCacheAuthority, types::DsrError> {
-        let _ = (guest, generation);
-        if self.process.private_target_authority.owns(entry) {
-            return Ok(self.process.private_target_authority.as_ref() as *const _);
-        }
-        Err(types::DsrError::CachePolicy(format!(
-            "translated target 0x{:x} has no executable authority",
-            entry.host().raw()
-        )))
-    }
-
-    /// Publish `target` into the per-thread indirect target cache, choosing
-    /// the entry FLAVOR (see `gateway::IndirectTargetCacheEntry`):
+    /// Publish `target` into the per-thread indirect target cache, carrying
+    /// the resolved publication kind into the entry FLAVOR (see
+    /// `gateway::IndirectTargetCacheEntry`):
     ///
     /// - a PRIVATE-cache target with a trusted entry publishes flavor 1 —
     ///   the trusted-entry code address plus the target page's generation
     ///   atomic, so the emitted hot path validates staleness inline and
     ///   lands past the guard;
-    /// - everything else (shared-unit targets, blocks without a trusted
-    ///   entry) keeps flavor 0: the guarded entry plus a
-    ///   `TargetCacheAuthority` the emitted slow path installs.
+    /// - everything else — a LIVE-arena target, a shared-unit target, a
+    ///   private block without a trusted entry — publishes flavor 0: the
+    ///   guarded entry plus the owning region's stable `TargetCacheAuthority`,
+    ///   which the emitted slow path re-validates the entry against and then
+    ///   installs before branching.
+    ///
+    /// A live target is therefore published like any other cross-region
+    /// target, and the fail-safe the pre-6E skip provided is preserved by
+    /// construction: `publication_authority` refuses an entry no region owns,
+    /// so an unowned entry still never reaches the cache.
     ///
     /// Callable only after `translate()` returned — publication into the
     /// independently synchronized block index happens before that call
@@ -5182,7 +5402,8 @@ impl ThreadTranslator {
         target: carrick_guest_mem::GuestVa,
         translated: &TranslationResult,
     ) -> Result<(), types::DsrError> {
-        if self.process.private_target_authority.owns(translated.entry) {
+        let authority = self.process.publication_authority(translated.entry)?;
+        if authority == PublicationAuthority::Private {
             let trusted = self
                 .process
                 .published_blocks
@@ -5207,21 +5428,9 @@ impl ThreadTranslator {
                 return Ok(());
             }
         }
-        // A LIVE target has no process-local target authority until Task 6E
-        // installs one, and emitted code must never receive a cached entry
-        // whose owner it cannot check. Skipping publication is correct and
-        // merely slower — the next indirect branch misses the cache and
-        // re-enters this resolver, which resolves the same live block. Every
-        // other unowned entry keeps failing closed below.
-        if !self.process.private_target_authority.owns(translated.entry)
-            && self.process.state.read().owns_live_entry(translated.entry)
-        {
-            return Ok(());
-        }
-        let authority =
-            self.target_cache_authority(target, translated.generation, translated.entry)?;
+        let record = self.process.executable_authority(authority)? as *const _;
         self.indirect_cache
-            .publish(target, translated.generation, translated.entry, authority);
+            .publish(target, translated.generation, translated.entry, record);
         Ok(())
     }
 
@@ -5594,6 +5803,23 @@ impl ThreadTranslator {
             entry,
             generation,
             address_mode: memory.address_mode(),
+            // Fail-closed: an entry no executable region owns never becomes a
+            // prepared entry, so it can never be branched to.
+            authority: match self.process.publication_authority(entry) {
+                Ok(authority) => authority,
+                Err(error) => {
+                    if PROFILE {
+                        probes::dsr_prepare_end(
+                            self.tid,
+                            guest.raw(),
+                            entry.host().raw() as u64,
+                            generation.get(),
+                            probes::DsrPrepareOutcome::Failed,
+                        );
+                    }
+                    return Err(error);
+                }
+            },
         };
         if PROFILE {
             probes::dsr_prepare_end(
@@ -5634,16 +5860,34 @@ impl ThreadTranslator {
                 prepared.generation.get(),
             );
         }
-        // Installed unit blocks replay into the private cache with trusted
-        // entries, so every prepared entry takes the trusted private-cache
-        // arm — the shared cache-range/binding-table gateway arms are gone.
-        let gateway_result = gateway::enter_translated_with_trusted_private_cache(
+        // Installed unit blocks replay into the private cache, so a prepared
+        // entry is private unless the live arena owns it; either way the
+        // gateway installs the EXACT owning region's range, and the process
+        // catalog covers both so a kick inside either one classifies as
+        // authoritative translated code.
+        let authority = match self.process.executable_authority(prepared.authority) {
+            Ok(authority) => authority,
+            Err(error) => {
+                if PROFILE {
+                    probes::dsr_run_end(
+                        self.tid,
+                        probes::DsrExitKind::Unsupported,
+                        guest_pc,
+                        0,
+                        i32::try_from(error.probe_outcome().raw()).unwrap_or(i32::MAX),
+                    );
+                }
+                return Err(error);
+            }
+        };
+        let gateway_result = gateway::enter_translated_with_executable_authority(
             prepared.entry,
             snapshot,
             &mut exit,
             &self.indirect_cache,
-            self.process.private_target_authority.as_ref(),
+            authority,
             prepared.address_mode,
+            self.process.executable_range_catalog(),
         );
         if let Err(error) = gateway_result {
             if PROFILE {
@@ -6127,6 +6371,7 @@ mod tests {
             )),
             generation: types::CodeGeneration::INITIAL,
             address_mode: memory.address_mode(),
+            authority: super::PublicationAuthority::Private,
         };
         let exit = super::PreparedExit {
             exit: types::NativeDsrExit::ResolveDirect { source, target },
@@ -7164,15 +7409,16 @@ mod tests {
     /// is named, and what an installed live block may and may not touch.
     mod live_arena_wiring {
         use super::super::{
-            LiveConsultation, LiveFallback, ProcessState, ProcessTranslator,
-            PublishedBlockMetadata, TranslationOutcome, emit, types,
+            LiveConsultation, LiveFallback, ProcessState, ProcessTranslator, PublicationAuthority,
+            PublishedBlockLookup, PublishedBlockMetadata, ThreadTranslator, TranslationOutcome,
+            TranslationResult, cache, emit, types,
         };
         use super::TEST_HOST_JIT;
         use crate::block::{BlockPlan, PlannedExit};
         use crate::emit::{EmitAddressMode, PreparedSharedInitial};
         use crate::live_arena::{
             LiveBlockAuthority, LiveOwnedChunkIdentity, LivePrivateReason, LivePublishOutcome,
-            LiveReadyOutcome, LiveTranslationAuthority,
+            LiveReadyOutcome, LiveRxPayload, LiveTranslationAuthority,
         };
         use crate::shared_cache::{
             AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
@@ -7234,14 +7480,61 @@ mod tests {
             .expect("prepare a real shared INITIAL block")
         }
 
-        /// One installed live block, modelled with process-local buffers.
+        /// One contiguous stand-in for the arena's RX payload.
         ///
-        /// The bytes are this fixture's own — the point of these tests is the
-        /// translator's bookkeeping over an ALREADY-VALIDATED block, not the
-        /// mapped-arena protocol — but the COLD stream is real prepared
+        /// Blocks are bump-allocated out of it exactly as the arena's chunk
+        /// allocator appends them, so every installed entry lies inside ONE
+        /// interval — which is what the process view's target authority and
+        /// its executable-range catalog node describe. A `Box<[u8]>` per block
+        /// would scatter entries across unrelated heap allocations and could
+        /// not model a single RX payload at all.
+        struct FakeLiveArena {
+            bytes: Box<[u8]>,
+            next: AtomicUsize,
+        }
+
+        impl FakeLiveArena {
+            const CAPACITY: usize = 64 * 1024;
+
+            fn new() -> Arc<Self> {
+                Arc::new(Self {
+                    bytes: vec![0_u8; Self::CAPACITY].into_boxed_slice(),
+                    next: AtomicUsize::new(0),
+                })
+            }
+
+            fn base(&self) -> usize {
+                self.bytes.as_ptr() as usize
+            }
+
+            fn payload(&self) -> LiveRxPayload {
+                LiveRxPayload::new(HostVa(self.base()), HostVa(self.base() + Self::CAPACITY))
+                    .expect("a nonempty fake RX payload")
+            }
+
+            /// Reserve `len` bytes, 4-aligned and strictly ascending, like the
+            /// arena's append-only code cursor.
+            fn reserve(&self, len: usize) -> usize {
+                let aligned = len.next_multiple_of(4);
+                let offset = self.next.fetch_add(aligned, Ordering::Relaxed);
+                assert!(
+                    offset + aligned <= Self::CAPACITY,
+                    "fake live arena exhausted"
+                );
+                offset
+            }
+        }
+
+        /// One installed live block, carved out of the fixture's RX payload.
+        ///
+        /// The code bytes are this fixture's own — the point of these tests is
+        /// the translator's bookkeeping over an ALREADY-VALIDATED block, not
+        /// the mapped-arena protocol — but the COLD stream is real prepared
         /// output, so the lazy decode under test is the production decode.
         struct FakeLiveBlock {
-            code: Box<[u8]>,
+            arena: Arc<FakeLiveArena>,
+            offset: usize,
+            len: usize,
             cold: Vec<u8>,
             guest_start: GuestVa,
             source_page: GuestVa,
@@ -7251,9 +7544,17 @@ mod tests {
         }
 
         impl FakeLiveBlock {
-            fn from_prepared(prepared: &PreparedSharedInitial, guest_start: GuestVa) -> Self {
+            fn from_prepared(
+                arena: &Arc<FakeLiveArena>,
+                prepared: &PreparedSharedInitial,
+                guest_start: GuestVa,
+            ) -> Self {
+                let len = prepared.code_bytes().len();
+                let offset = arena.reserve(len);
                 Self {
-                    code: prepared.code_bytes().to_vec().into_boxed_slice(),
+                    arena: Arc::clone(arena),
+                    offset,
+                    len,
                     cold: prepared.cold_bytes().to_vec(),
                     guest_start,
                     source_page: GuestVa(guest_start.raw() & !(16 * 1024 - 1)),
@@ -7266,10 +7567,10 @@ mod tests {
 
         impl LiveBlockAuthority for FakeLiveBlock {
             fn entry(&self) -> HostVa {
-                HostVa(self.code.as_ptr() as usize)
+                HostVa(self.arena.base() + self.offset)
             }
             fn code_len(&self) -> usize {
-                self.code.len()
+                self.len
             }
             fn guest_start(&self) -> GuestVa {
                 self.guest_start
@@ -7308,6 +7609,7 @@ mod tests {
         }
 
         struct FakeAuthority {
+            arena: Arc<FakeLiveArena>,
             ready: Mutex<FakeReady>,
             winner: FakeWinner,
             prepares: AtomicUsize,
@@ -7318,7 +7620,19 @@ mod tests {
 
         impl FakeAuthority {
             fn new(ready: FakeReady, winner: FakeWinner) -> Arc<Self> {
+                Self::sharing(&FakeLiveArena::new(), ready, winner)
+            }
+
+            /// A second view of the SAME RX payload — the in-process exec
+            /// shape, where the replacement image installs a fresh process
+            /// view over the arena it inherited.
+            fn sharing(
+                arena: &Arc<FakeLiveArena>,
+                ready: FakeReady,
+                winner: FakeWinner,
+            ) -> Arc<Self> {
                 Arc::new(Self {
+                    arena: Arc::clone(arena),
                     ready: Mutex::new(ready),
                     winner,
                     prepares: AtomicUsize::new(0),
@@ -7333,7 +7647,11 @@ mod tests {
                 prepared: &PreparedSharedInitial,
                 guest_start: GuestVa,
             ) -> Arc<FakeLiveBlock> {
-                let block = Arc::new(FakeLiveBlock::from_prepared(prepared, guest_start));
+                let block = Arc::new(FakeLiveBlock::from_prepared(
+                    &self.arena,
+                    prepared,
+                    guest_start,
+                ));
                 self.installed
                     .lock()
                     .expect("installed")
@@ -7448,29 +7766,67 @@ mod tests {
                     source_page: source_page.raw(),
                 }]
             }
+
+            fn rx_payload(&self) -> Option<LiveRxPayload> {
+                Some(self.arena.payload())
+            }
+        }
+
+        /// A view whose RX payload cannot be resolved: the named refusal that
+        /// keeps a payload-less authority from ever being installed.
+        struct PayloadlessAuthority;
+
+        impl LiveTranslationAuthority for PayloadlessAuthority {
+            fn acquire_ready(
+                &self,
+                _key: &TranslationUnitKey,
+                _guest_start: GuestVa,
+                _generation: &PageGenerationObservation,
+            ) -> LiveReadyOutcome {
+                LiveReadyOutcome::Miss
+            }
+
+            fn publish_winner(
+                &self,
+                _key: &TranslationUnitKey,
+                _guest_start: GuestVa,
+                _block_end: GuestVa,
+                _generation: &PageGenerationObservation,
+                _owner_pid: i32,
+                _prepare: &mut dyn FnMut() -> Result<PreparedSharedInitial, types::DsrError>,
+            ) -> LivePublishOutcome {
+                LivePublishOutcome::Private(LivePrivateReason::InvalidRecord)
+            }
+
+            fn active_chunks_for_source_page(
+                &self,
+                _source_page: GuestVa,
+            ) -> Vec<LiveOwnedChunkIdentity> {
+                Vec::new()
+            }
+
+            fn rx_payload(&self) -> Option<LiveRxPayload> {
+                None
+            }
         }
 
         struct Lane {
-            translator: ProcessTranslator,
+            translator: Arc<ProcessTranslator>,
             generations: PageGenerationTable,
             authority: Arc<FakeAuthority>,
         }
 
         impl Lane {
             fn new(ready: FakeReady, winner: FakeWinner) -> Self {
-                let authority = FakeAuthority::new(ready, winner);
-                let translator = ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT)
-                    .expect("process translator");
-                assert!(
-                    translator
-                        .configure_live_image_matching_for_test(
-                            live_image(),
-                            0x4000,
-                            &live_key().file_stem().expect("exact unit stem"),
-                        )
-                        .expect("configure the live image"),
-                    "the fixture image must select its own exact unit key"
+                Self::with_authority(FakeAuthority::new(ready, winner))
+            }
+
+            fn with_authority(authority: Arc<FakeAuthority>) -> Self {
+                let translator = Arc::new(
+                    ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT)
+                        .expect("process translator"),
                 );
+                Self::configure(&translator);
                 translator
                     .install_live_authority(Arc::clone(&authority) as Arc<_>)
                     .expect("install the live authority");
@@ -7481,12 +7837,27 @@ mod tests {
                 }
             }
 
+            fn configure(translator: &ProcessTranslator) {
+                assert!(
+                    translator
+                        .configure_live_image_matching_for_test(
+                            live_image(),
+                            0x4000,
+                            &live_key().file_stem().expect("exact unit stem"),
+                        )
+                        .expect("configure the live image"),
+                    "the fixture image must select its own exact unit key"
+                );
+            }
+
             /// Same lane without a live authority: the policy-off default.
             fn unconfigured() -> Self {
                 let authority = FakeAuthority::new(FakeReady::Miss, FakeWinner::Publish);
                 Self {
-                    translator: ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT)
-                        .expect("process translator"),
+                    translator: Arc::new(
+                        ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT)
+                            .expect("process translator"),
+                    ),
                     generations: PageGenerationTable::new(0x4000).expect("generation table"),
                     authority,
                 }
@@ -7498,6 +7869,29 @@ mod tests {
 
             fn with_state<R>(&self, body: impl FnOnce(&mut ProcessState) -> R) -> R {
                 body(&mut self.translator.state.write())
+            }
+
+            /// Install one live block through the production READY path and
+            /// return its process-local RX entry.
+            fn install_ready(&self, guest: GuestVa) -> types::CacheVa {
+                let observation = self.observe(guest);
+                match self.with_state(|state| {
+                    state.live_ready_consultation(
+                        guest,
+                        types::CodeGeneration::INITIAL,
+                        &observation,
+                    )
+                }) {
+                    LiveConsultation::Installed(entry) => entry,
+                    other => panic!("the fixture's READY hit must install: {other:?}"),
+                }
+            }
+
+            fn private_cache_entry(&self) -> types::CacheVa {
+                types::CacheVa::published(HostVa(
+                    usize::try_from(self.translator.cache_host_range().start)
+                        .expect("cache address fits usize"),
+                ))
             }
         }
 
@@ -7994,6 +8388,429 @@ mod tests {
                     PublishedBlockMetadata::Live { .. }
                 ));
             });
+        }
+
+        // ---------------------------------------------------------------
+        // Task 6E — target authority, gateway routing, catalog ownership
+        // ---------------------------------------------------------------
+
+        #[test]
+        fn a_live_entry_resolves_to_the_process_views_stable_target_authority() {
+            let lane = Lane::new(FakeReady::Hit, FakeWinner::Publish);
+            let live = lane.install_ready(GuestVa(SEGMENT_START));
+            let payload = lane.authority.arena.payload();
+
+            assert_eq!(
+                lane.translator
+                    .publication_authority(live)
+                    .expect("a live entry has an executable authority"),
+                PublicationAuthority::Live,
+            );
+            assert_eq!(
+                lane.translator
+                    .publication_authority(lane.private_cache_entry())
+                    .expect("a private cache entry has an executable authority"),
+                PublicationAuthority::Private,
+            );
+
+            let record = lane
+                .translator
+                .executable_authority(PublicationAuthority::Live)
+                .expect("the live target authority is installed");
+            assert_eq!(
+                record.host_range(),
+                payload.start().raw() as u64..payload.end().raw() as u64,
+                "the target authority describes the process view's RX payload exactly"
+            );
+            assert!(record.owns(live), "and it owns the installed entry");
+            // ONE record for the whole payload, not one per block: the address
+            // emitted code caches must not change per installed block.
+            let second = lane.install_ready(GuestVa(SEGMENT_START + 4));
+            assert_ne!(live, second);
+            assert!(std::ptr::eq(
+                record,
+                lane.translator
+                    .executable_authority(PublicationAuthority::Live)
+                    .expect("the live target authority is still installed"),
+            ));
+        }
+
+        #[test]
+        fn an_entry_no_executable_region_owns_fails_closed_by_name() {
+            let lane = Lane::new(FakeReady::Hit, FakeWinner::Publish);
+            lane.install_ready(GuestVa(SEGMENT_START));
+            // A host address in neither the private cache nor the RX payload.
+            let stray = types::CacheVa::published(HostVa(0x10));
+
+            let error = lane
+                .translator
+                .publication_authority(stray)
+                .expect_err("an unowned entry must never resolve an authority");
+
+            assert!(
+                error.to_string().contains("has no executable authority"),
+                "{error}"
+            );
+        }
+
+        #[test]
+        fn the_executable_range_catalog_registers_the_live_rx_payload() {
+            let unconfigured = Lane::unconfigured();
+            let private_pc = usize::try_from(unconfigured.translator.cache_host_range().start)
+                .expect("cache address fits usize");
+            assert!(
+                unconfigured
+                    .translator
+                    .executable_range_catalog()
+                    .contains(private_pc),
+                "the private cache is catalogued with or without a live authority"
+            );
+
+            let lane = Lane::new(FakeReady::Hit, FakeWinner::Publish);
+            let live = lane.install_ready(GuestVa(SEGMENT_START));
+            let payload = lane.authority.arena.payload();
+            let catalog = lane.translator.executable_range_catalog();
+
+            assert!(
+                catalog.contains(live.host().raw()),
+                "a live RX PC must classify as authoritative translated code"
+            );
+            assert!(catalog.contains(payload.start().raw()));
+            assert!(!catalog.contains(payload.end().raw()));
+            assert!(
+                catalog.contains(
+                    usize::try_from(lane.translator.cache_host_range().start)
+                        .expect("cache address fits usize")
+                ),
+                "registering the live payload must not displace the private range"
+            );
+            assert!(!catalog.contains(0x10));
+        }
+
+        #[test]
+        fn installing_a_live_authority_refuses_an_absent_or_disagreeing_rx_payload() {
+            let translator = Arc::new(
+                ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT)
+                    .expect("process translator"),
+            );
+            Lane::configure(&translator);
+
+            let error = translator
+                .install_live_authority(Arc::new(PayloadlessAuthority) as Arc<_>)
+                .expect_err("a view without an RX payload can never be an authority");
+            assert!(
+                error.to_string().contains("exposes no RX payload range"),
+                "{error}"
+            );
+            assert!(
+                translator
+                    .executable_authority(PublicationAuthority::Live)
+                    .is_err(),
+                "a refused install mints no target authority"
+            );
+
+            let first = FakeAuthority::new(FakeReady::Hit, FakeWinner::Publish);
+            translator
+                .install_live_authority(Arc::clone(&first) as Arc<_>)
+                .expect("install the live authority");
+            // The exec reset retires the authority; a replacement image
+            // re-installs over the SAME inherited arena.
+            translator.state.write().live_authority = None;
+
+            let elsewhere = FakeAuthority::new(FakeReady::Hit, FakeWinner::Publish);
+            let error = translator
+                .install_live_authority(Arc::clone(&elsewhere) as Arc<_>)
+                .expect_err("a different RX payload must not silently replace the record");
+            assert!(
+                error
+                    .to_string()
+                    .contains("disagrees with this process's installed target authority"),
+                "{error}"
+            );
+
+            let same_arena =
+                FakeAuthority::sharing(&first.arena, FakeReady::Hit, FakeWinner::Publish);
+            translator
+                .install_live_authority(Arc::clone(&same_arena) as Arc<_>)
+                .expect("the same RX payload re-installs");
+        }
+
+        #[test]
+        fn a_private_direct_link_resolves_a_live_target_instead_of_waiting_in_pending() {
+            let lane = Lane::new(FakeReady::Hit, FakeWinner::Publish);
+            let guest = GuestVa(SEGMENT_START);
+            let key = (guest, types::CodeGeneration::INITIAL);
+            let live = lane.install_ready(guest);
+            // Resolved BEFORE the write guard below: `cache_host_range` takes
+            // its own read guard and the lock is not reentrant.
+            let private = lane.private_cache_entry();
+
+            lane.with_state(|state| {
+                assert_eq!(
+                    state.direct_link_target(key),
+                    Some((PublicationAuthority::Live, live)),
+                    "a live-only key resolves to the arena entry"
+                );
+                assert_eq!(
+                    state.direct_link_target((GuestVa(SEGMENT_START + 0x40), key.1)),
+                    None,
+                    "an untranslated key still waits in `pending`"
+                );
+                // The private publication authority keeps precedence and keeps
+                // targeting its trusted entry.
+                state.blocks.insert(key, private);
+                state
+                    .trusted_entries
+                    .insert(key, types::CacheOffset::published(8));
+                assert_eq!(
+                    state.direct_link_target(key),
+                    Some((
+                        PublicationAuthority::Private,
+                        types::CacheVa::published(HostVa(private.host().raw() + 8)),
+                    )),
+                );
+            });
+        }
+
+        #[test]
+        fn a_live_installation_drains_the_private_links_pending_on_its_key() {
+            let lane = Lane::new(FakeReady::Hit, FakeWinner::Publish);
+            let guest = GuestVa(SEGMENT_START);
+            let key = (guest, types::CodeGeneration::INITIAL);
+            let site = cache::LinkSite {
+                source: lane.private_cache_entry(),
+                slot: types::CacheOffset::published(0),
+            };
+            lane.with_state(|state| {
+                state.pending.entry(key).or_default().push(site);
+            });
+
+            let live = lane.install_ready(guest);
+            lane.with_state(|state| {
+                state
+                    .drain_pending_links_to_live(key, live)
+                    .expect("drain the private sites waiting on this key")
+            });
+
+            lane.with_state(|state| {
+                assert!(
+                    !state.pending.contains_key(&key),
+                    "a live installation IS a publication of that key"
+                );
+                // Whether the branch encodes depends on the ±128 MiB reach
+                // between the private cache and the arena, but a recorded
+                // incoming site is always a PRIVATE source: a live block's own
+                // code is immutable arena bytes this process never patches.
+                for sites in state.direct_link_incoming.values() {
+                    for recorded in sites {
+                        assert_eq!(
+                            lane.translator
+                                .publication_authority(recorded.source)
+                                .expect("a recorded link source has an authority"),
+                            PublicationAuthority::Private,
+                            "a LIVE source must never enter the mutable link indexes"
+                        );
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn an_indirect_publication_carries_the_resolved_kind_into_the_entry_flavor() {
+            let lane = Lane::new(FakeReady::Hit, FakeWinner::Publish);
+            let memory =
+                crate::mapped_memory::NativeMappedMemory::shared_install_test_fixture(4096);
+            let generation = types::CodeGeneration::INITIAL;
+            let live_guest = GuestVa(SEGMENT_START);
+            let live = lane.install_ready(live_guest);
+            let private_entry = lane.private_cache_entry();
+            let live_record = lane
+                .translator
+                .executable_authority(PublicationAuthority::Live)
+                .expect("the live target authority is installed")
+                as *const _ as u64;
+            let private_record = lane
+                .translator
+                .executable_authority(PublicationAuthority::Private)
+                .expect("the private target authority always exists")
+                as *const _ as u64;
+            let mut thread = ThreadTranslator::for_process(Arc::clone(&lane.translator), 11);
+            let resolved = |entry: types::CacheVa, outcome: TranslationOutcome| TranslationResult {
+                entry,
+                generation,
+                outcome,
+                emitted_bytes: 0,
+                cache_used_bytes: 0,
+            };
+
+            // A LIVE target is FLAVOR 0: the guarded entry plus the process
+            // view's stable target authority, which the emitted slow path
+            // re-validates the entry against and installs. Pre-6E this
+            // publication was SKIPPED.
+            thread
+                .publish_indirect_target(
+                    &memory,
+                    live_guest,
+                    &resolved(live, TranslationOutcome::LiveArena),
+                )
+                .expect("publish a live target");
+            assert_eq!(
+                thread.indirect_cache_entry_for_test(live_guest),
+                Some((live.host().raw() as u64, live_record, 0)),
+                "a live target publishes flavor 0 against the LIVE authority"
+            );
+
+            // A PRIVATE target with a trusted entry stays FLAVOR 1.
+            let trusted_guest = GuestVa(SEGMENT_START + 0x100);
+            lane.translator.published_blocks.insert(
+                (trusted_guest, generation),
+                PublishedBlockLookup {
+                    entry: private_entry,
+                    trusted_entry: Some(types::CacheOffset::published(8)),
+                },
+            );
+            thread
+                .publish_indirect_target(
+                    &memory,
+                    trusted_guest,
+                    &resolved(private_entry, TranslationOutcome::Translated),
+                )
+                .expect("publish a private trusted target");
+            let (tagged, generation_atomic, trusted_code) = thread
+                .indirect_cache_entry_for_test(trusted_guest)
+                .expect("a published private trusted way");
+            assert_eq!(tagged, (generation.get() << 1) | 1, "flavor 1 tag");
+            assert_ne!(generation_atomic, 0, "flavor 1 carries the page generation");
+            assert_eq!(trusted_code, private_entry.host().raw() as u64 + 8);
+
+            // A PRIVATE target WITHOUT one is flavor 0 against the private
+            // authority — the same shape as a live target, different record.
+            let plain_guest = GuestVa(SEGMENT_START + 0x200);
+            thread
+                .publish_indirect_target(
+                    &memory,
+                    plain_guest,
+                    &resolved(private_entry, TranslationOutcome::Translated),
+                )
+                .expect("publish a private guarded target");
+            assert_eq!(
+                thread.indirect_cache_entry_for_test(plain_guest),
+                Some((private_entry.host().raw() as u64, private_record, 0)),
+            );
+            assert_ne!(
+                live_record, private_record,
+                "the two regions publish DIFFERENT authority records"
+            );
+
+            // And the fail-safe the pre-6E skip provided survives: an entry no
+            // region owns never reaches emitted code.
+            let stray_guest = GuestVa(SEGMENT_START + 0x300);
+            let error = thread
+                .publish_indirect_target(
+                    &memory,
+                    stray_guest,
+                    &resolved(
+                        types::CacheVa::published(HostVa(0x10)),
+                        TranslationOutcome::Translated,
+                    ),
+                )
+                .expect_err("an unowned entry must never be cached");
+            assert!(
+                error.to_string().contains("has no executable authority"),
+                "{error}"
+            );
+            assert_eq!(thread.indirect_cache_entry_for_test(stray_guest), None);
+        }
+
+        #[test]
+        fn a_prepared_entry_carries_the_executable_authority_that_owns_it() {
+            let lane = Lane::new(FakeReady::Hit, FakeWinner::Publish);
+            let memory =
+                crate::mapped_memory::NativeMappedMemory::shared_install_test_fixture(4096);
+            let guest = GuestVa(SEGMENT_START);
+            // The live install must be observed through the SAME generation
+            // table `prepare_entry` reads, so the published lookup mirror is
+            // keyed on the generation the prepare re-derives.
+            let observation = memory
+                .dsr_generation_observation(guest)
+                .expect("fixture observation");
+            let live = match lane.with_state(|state| {
+                state.live_ready_consultation(guest, types::CodeGeneration::INITIAL, &observation)
+            }) {
+                LiveConsultation::Installed(entry) => entry,
+                other => panic!("the fixture's READY hit must install: {other:?}"),
+            };
+            let mut thread = ThreadTranslator::for_process(Arc::clone(&lane.translator), 12);
+
+            let prepared = thread
+                .prepare_entry::<false>(
+                    &memory,
+                    &super::super::NativeUcontextSnapshot {
+                        pc: guest.raw(),
+                        ..Default::default()
+                    },
+                )
+                .expect("a live block resolves through the published lookup mirror");
+
+            assert_eq!(prepared.entry, live);
+            assert_eq!(
+                prepared.executable_authority(),
+                PublicationAuthority::Live,
+                "the gateway must enter a live block under the LIVE cache range, \
+                 not the private one"
+            );
+        }
+
+        #[test]
+        fn an_exec_reset_retires_the_live_configuration_authority_and_catalog_node() {
+            let lane = Lane::new(FakeReady::Hit, FakeWinner::Publish);
+            let live = lane.install_ready(GuestVa(SEGMENT_START));
+            assert!(
+                lane.translator
+                    .executable_range_catalog()
+                    .contains(live.host().raw())
+            );
+
+            let mut thread = ThreadTranslator::for_process(Arc::clone(&lane.translator), 6);
+            let mut token = thread
+                .prepare_direct_binding_exec_reset()
+                .expect("mint the retiring translator's exec authority");
+            lane.translator
+                .reset_after_fork_for_exec(&thread, &mut token)
+                .expect("commit the exec reset");
+
+            lane.with_state(|state| {
+                assert!(
+                    state.live_translation.is_none(),
+                    "the outgoing image's live unit key is retired"
+                );
+                assert!(
+                    state.live_authority.is_none(),
+                    "and so is this process's authority over the arena for it"
+                );
+                assert!(state.live_blocks.is_empty());
+                assert!(state.live_published_index.is_empty());
+            });
+            assert!(
+                !lane
+                    .translator
+                    .executable_range_catalog()
+                    .contains(live.host().raw()),
+                "the RX payload's catalog node is dropped with the authority"
+            );
+
+            // The replacement image re-configures and re-installs over the
+            // same inherited arena, and the lane comes back.
+            Lane::configure(&lane.translator);
+            lane.translator
+                .install_live_authority(Arc::clone(&lane.authority) as Arc<_>)
+                .expect("re-install for the replacement image");
+            assert!(
+                lane.translator
+                    .executable_range_catalog()
+                    .contains(live.host().raw()),
+                "and the payload is catalogued again"
+            );
         }
     }
 
