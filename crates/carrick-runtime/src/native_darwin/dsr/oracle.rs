@@ -6235,6 +6235,111 @@ fn dsr_phase_zero_host_kick_keeps_original_guest_snapshot() {
     assert_eq!(snapshot.pc, expected.pc);
 }
 
+/// The catalog a gateway entry is HANDED reaches the signal handler that
+/// consults it.
+///
+/// `enter_translated_raw` copies the caller's
+/// `ExecutableRangeCatalogAuthority` into `DsrContext::executable_range_catalog`,
+/// and that single assignment is the whole reason a live-arena PC classifies
+/// as authoritative translated code. Nothing else observes it: the C-level
+/// classifier test builds its own context, so reverting the assignment to
+/// `null()` reinstates the pre-6E defect with every other suite green.
+///
+/// The observation point is this test. The phase-zero kick's interrupted PC is
+/// inside libc's signal-mask/raise path — a host PC that is deliberately NOT a
+/// statically known address — so the instrument is a catalog spanning the
+/// address space while the installed AUTHORITY stays narrow (the emitted block
+/// alone). The classifier then answers differently depending only on whether
+/// the pointer arrived:
+///
+/// * assignment live  → the interrupted PC is catalogued → CAPTURE, a `Kick`
+///   carrying that PC;
+/// * assignment `null()` → phase zero plus a PC outside the installed range and
+///   no catalog → `KickAtEntry`, the guest resumed at the block entry.
+///
+/// The narrow-catalog, production-shaped case is
+/// `dsr_phase_zero_host_kick_keeps_original_guest_snapshot` above: a
+/// catalogued region that does NOT cover the interrupted PC still yields
+/// `KickAtEntry`, so this pair separates "the catalog arrived" from "the
+/// catalog said yes".
+#[test]
+fn dsr_gateway_entry_publishes_its_executable_range_catalog_to_the_signal_handler() {
+    unsafe extern "C" {
+        fn carrick_native_dsr_test_phase_zero_host_kick_once();
+    }
+
+    let _signal_oracle = install_signal_handlers_for_oracle();
+    let guest = GuestVa(0x1c_3a0);
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate catalog-publication cache");
+    let emitted = emit_block_direct(
+        &mut cache,
+        &BlockPlan {
+            start: guest,
+            end: GuestVa(guest.raw() + 4),
+            generation: CodeGeneration::INITIAL,
+            instructions: Vec::new(),
+            exit: PlannedExit::Syscall {
+                guest,
+                resume: GuestVa(guest.raw() + 4),
+            },
+            extensions: Vec::new(),
+        },
+    )
+    .expect("emit catalog-publication block");
+    let indirect = IndirectTargetCache::new();
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.pc = guest.raw();
+    // Deliberately narrow: the installed authority owns the emitted block and
+    // nothing else, so the interrupted PC can only be reached through the
+    // catalog.
+    let narrow_authority = super::gateway::TargetCacheAuthority::new(
+        emitted.entry().host().raw(),
+        emitted.entry().host().raw() + emitted.len(),
+        std::ptr::null(),
+    );
+    let covering_catalog = super::gateway::ExecutableRangeCatalog::new(1, usize::MAX)
+        .expect("build the covering executable range catalog");
+    let mut exit = NativeDsrExit::Syscall {
+        resume: GuestVa(guest.raw() + 4),
+    };
+
+    unsafe { carrick_native_dsr_test_phase_zero_host_kick_once() };
+    super::gateway::enter_translated_with_executable_authority(
+        emitted.entry(),
+        &mut snapshot,
+        &mut exit,
+        &indirect,
+        &narrow_authority,
+        crate::native_darwin::address::NativeAddressMode::Direct,
+        covering_catalog.authority(),
+    )
+    .expect("classify the phase-zero kick against the published catalog");
+
+    let NativeDsrExit::Kick { resume, .. } = exit else {
+        panic!(
+            "a catalogued interrupted PC must CAPTURE, not resume at entry — the gateway \
+             entry did not publish its catalog into the context: {exit:?}"
+        );
+    };
+    assert_ne!(
+        resume.raw(),
+        guest.raw(),
+        "capture reports the interrupted PC, not the guest entry"
+    );
+    assert!(
+        !narrow_authority.owns(super::types::CacheVa::published(HostVa(
+            usize::try_from(resume.raw()).expect("interrupted PC fits usize")
+        ))),
+        "the interrupted PC is outside the installed authority, so only the \
+         catalog can have made it authoritative"
+    );
+}
+
 #[test]
 fn dsr_signal_fault_recovers_scratch_in_expanded_x18_load() {
     let _signal_oracle = install_signal_handlers_for_oracle();

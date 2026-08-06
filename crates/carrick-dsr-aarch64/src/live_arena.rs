@@ -738,6 +738,13 @@ impl LiveRxPayload {
     pub const fn end(self) -> HostVa {
         self.end
     }
+
+    /// The payload as a typed host interval, so "does this authority describe
+    /// the same executable region" is a comparison between two
+    /// `Range<HostVa>`s rather than between raw casts.
+    pub fn host_range(self) -> std::ops::Range<HostVa> {
+        self.start..self.end
+    }
 }
 
 /// Descriptor-authoritative ownership discovered from one ACTIVE chunk.

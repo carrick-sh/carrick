@@ -360,14 +360,18 @@ impl TargetCacheAuthority {
         (self.cache_start..self.cache_end).contains(&address)
     }
 
-    /// The exact host interval this authority installs into the context.
+    /// The exact host interval this authority installs into the context, in
+    /// the catalog's own `HostVa` vocabulary rather than as bare integers.
     ///
     /// Two authorities describing the SAME interval are interchangeable, which
     /// is what lets a process re-install its live target authority across an
     /// in-process exec without minting a second record for emitted code to
-    /// point at.
-    pub const fn host_range(&self) -> std::ops::Range<u64> {
-        self.cache_start..self.cache_end
+    /// point at. That comparison is a semantic one — "is this the same
+    /// executable region" — so it is made between typed ranges; the `u64`
+    /// fields below are the `#[repr(C)]` wire the emitted slow path loads.
+    pub fn host_range(&self) -> std::ops::Range<carrick_guest_mem::HostVa> {
+        carrick_guest_mem::HostVa(self.cache_start as usize)
+            ..carrick_guest_mem::HostVa(self.cache_end as usize)
     }
 }
 
