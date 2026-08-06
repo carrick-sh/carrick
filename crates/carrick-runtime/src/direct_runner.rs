@@ -481,6 +481,16 @@ pub struct DirectRunner {
 pub(crate) struct DirectExecServices {
     pub(crate) plan: crate::page_profile::ExecutionPlan,
     pub(crate) max_traps: usize,
+    /// This guest process's live translation arena, created once by
+    /// `run_image_in_child` (or adopted once from the capsule on a resumed
+    /// process) and retained here for the tier-D lane. `None` unless
+    /// `CARRICK_DSR_LIVE_ARENA=compiler`.
+    ///
+    /// It is an explicit owner, not a process-global: the runner holds it, the
+    /// runner's guest threads share it by borrow, and the execve service hands
+    /// it to the capsule so the successor maps the same Mach objects. Nothing
+    /// LOOKS UP a translation in it yet — that is Task 6D.
+    pub(crate) live_arena: crate::native_darwin::OwnedNativeLiveArena,
 }
 
 impl Drop for DirectRunner {
@@ -1517,6 +1527,7 @@ impl DirectRunner {
                         env,
                         &exec.plan,
                         exec.max_traps,
+                        exec.live_arena.as_ref(),
                     ));
                 }
                 // `rt_sigreturn(2)`: pop the frame, chain-deliver, re-enter

@@ -1159,7 +1159,7 @@ pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::Native
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn native_exec_live_arena_resume_hook(
-    arena: Option<&carrick_native_darwin::live_arena::DarwinLiveArena>,
+    arena: Option<&std::sync::Arc<carrick_native_darwin::live_arena::DarwinLiveArena>>,
 ) -> anyhow::Result<Option<i32>> {
     tests::native_exec_live_arena::resume_hook(arena)
 }
@@ -2928,7 +2928,9 @@ mod tests {
             })
         }
 
-        pub(crate) fn resume_hook(_arena: Option<&DarwinLiveArena>) -> anyhow::Result<Option<i32>> {
+        pub(crate) fn resume_hook(
+            _arena: Option<&Arc<DarwinLiveArena>>,
+        ) -> anyhow::Result<Option<i32>> {
             Ok(None)
         }
 
@@ -3147,6 +3149,151 @@ mod tests {
             assert_eq!(
                 PortSnapshot::lookup().normalized(),
                 [third.0, MACH_PORT_NULL, MACH_PORT_NULL]
+            );
+        }
+
+        fn fd_flags(fd: RawFd) -> i32 {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(flags >= 0, "read fd {fd} flags: {}", errno_text());
+            flags
+        }
+
+        fn errno_text() -> String {
+            std::io::Error::last_os_error().to_string()
+        }
+
+        /// Everything a returned (failed) `POSIX_SPAWN_SETEXEC` attempt must be
+        /// judged on, sampled before, inside, and after the attempt.
+        struct FailedSetexecReceipts {
+            ports_after: [mach_port_t; 3],
+            send_right_refs_before: [u32; 2],
+            send_right_refs_during: [u32; 2],
+            send_right_refs_after: [u32; 2],
+            xsig_flags_before: i32,
+            xsig_flags_during: i32,
+            xsig_flags_after: i32,
+            error: String,
+        }
+
+        /// Drive ONE real `POSIX_SPAWN_SETEXEC` through the production capsule
+        /// path and make it fail in the kernel.
+        ///
+        /// The executable path does not exist, so `posix_spawn` returns ENOENT
+        /// and this process image survives. This is deliberately not the
+        /// injected-error shape used by
+        /// `failed_exec_restores_original_registered_port_vector`: that closure
+        /// never calls `posix_spawn` at all, so it cannot say what the kernel
+        /// leaves behind on the real replacement path Task 6C2 puts every
+        /// compiler-policy self-exec onto.
+        fn attempt_failed_setexec(arena: &DarwinLiveArena) -> FailedSetexecReceipts {
+            let mut payload = sample();
+            payload.producer_pid = unsafe { libc::getpid() as u32 };
+            payload.host_executable_path =
+                b"/definitely/missing/carrick-live-arena-setexec".to_vec();
+            payload.guest_exec.as_mut().expect("guest").live_arena =
+                Some(NativeReexecLiveArenaV2::from(arena.transit_v2()));
+            let xsig = tempfile::tempfile().expect("xsig tempfile");
+            xsig.set_len(4096).expect("size xsig");
+            bind_real_xsig(&mut payload, &xsig);
+            let xsig_fd = xsig.as_raw_fd();
+
+            let send_right_refs_before = arena
+                .transit_send_right_user_refs()
+                .expect("send-right refs before the attempt");
+            let xsig_flags_before = fd_flags(xsig_fd);
+            let during = std::cell::RefCell::new(None);
+            let error =
+                exec_capsule_with(payload, [0x5e; 16], None, Some(arena), |request, plan| {
+                    let plan = plan.expect("live arena registered-port exec plan");
+                    *during.borrow_mut() = Some((
+                        arena
+                            .transit_send_right_user_refs()
+                            .expect("send-right refs during the attempt"),
+                        fd_flags(xsig_fd),
+                    ));
+                    // SAFETY: `request`'s three C vectors are valid and
+                    // null-terminated for this call.
+                    unsafe {
+                        plan.replace_process(
+                            request.executable.as_ptr(),
+                            request.argv.as_ptr().cast_mut().cast(),
+                            request.env.as_ptr().cast_mut().cast(),
+                        )
+                    }
+                })
+                .expect_err("SETEXEC of a missing executable must fail");
+            let (send_right_refs_during, xsig_flags_during) =
+                during.into_inner().expect("exec attempt ran");
+            FailedSetexecReceipts {
+                ports_after: PortSnapshot::lookup().normalized(),
+                send_right_refs_before,
+                send_right_refs_during,
+                send_right_refs_after: arena
+                    .transit_send_right_user_refs()
+                    .expect("send-right refs after the attempt"),
+                xsig_flags_before,
+                xsig_flags_during,
+                xsig_flags_after: fd_flags(xsig_fd),
+                error: error.to_string(),
+            }
+        }
+
+        #[test]
+        fn failed_setexec_leaves_the_registered_port_vector_unchanged() {
+            let _serial = test_lock();
+            let third = TestPort::new();
+            let _guard = RegisteredPortsGuard::replace(&[third.0, MACH_PORT_NULL, MACH_PORT_NULL]);
+            let arena = arena();
+            let receipts = attempt_failed_setexec(&arena);
+            assert_eq!(
+                receipts.ports_after,
+                [third.0, MACH_PORT_NULL, MACH_PORT_NULL],
+                "a returned SETEXEC must not publish Carrick's arena slots into \
+                 this task's registered-port vector ({})",
+                receipts.error
+            );
+        }
+
+        #[test]
+        fn failed_setexec_releases_the_duplicated_send_rights() {
+            let _serial = test_lock();
+            let third = TestPort::new();
+            let _guard = RegisteredPortsGuard::replace(&[third.0, MACH_PORT_NULL, MACH_PORT_NULL]);
+            let arena = arena();
+            let receipts = attempt_failed_setexec(&arena);
+            assert_eq!(
+                receipts.send_right_refs_during,
+                receipts.send_right_refs_before.map(|refs| refs + 1),
+                "the exec plan must hold exactly one duplicate of each transport right"
+            );
+            assert_eq!(
+                receipts.send_right_refs_after, receipts.send_right_refs_before,
+                "a returned SETEXEC must release both duplicated send rights ({})",
+                receipts.error
+            );
+        }
+
+        #[test]
+        fn failed_setexec_restores_the_prepared_fd_flags() {
+            let _serial = test_lock();
+            let third = TestPort::new();
+            let _guard = RegisteredPortsGuard::replace(&[third.0, MACH_PORT_NULL, MACH_PORT_NULL]);
+            let arena = arena();
+            let receipts = attempt_failed_setexec(&arena);
+            assert_eq!(
+                receipts.xsig_flags_before & libc::FD_CLOEXEC,
+                libc::FD_CLOEXEC,
+                "the transported fd must start close-on-exec, or this proves nothing"
+            );
+            assert_eq!(
+                receipts.xsig_flags_during & libc::FD_CLOEXEC,
+                0,
+                "the plan must clear close-on-exec for transit"
+            );
+            assert_eq!(
+                receipts.xsig_flags_after, receipts.xsig_flags_before,
+                "a returned SETEXEC must restore every fd flag it installed ({})",
+                receipts.error
             );
         }
 
