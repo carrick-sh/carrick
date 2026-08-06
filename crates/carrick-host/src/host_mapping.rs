@@ -254,27 +254,54 @@ mod tests {
         );
     }
 
-    /// Count the process's currently-open file descriptors by probing the fd
-    /// table directly with `fcntl(F_GETFD)`. Portable across macOS and Linux (no
-    /// `/proc` dependency) and — unlike a lowest-free-fd sample — detects a leak
-    /// at ANY descriptor number, not just contiguous low slots. The scan ceiling
-    /// is bounded by `RLIMIT_NOFILE` (clamped) so it terminates even if the soft
-    /// limit is large.
+    /// The `(st_dev, st_ino)` identity of an open descriptor, or `None` if the
+    /// slot is closed (or cannot be stat'd).
     #[cfg(unix)]
-    fn open_fd_count() -> usize {
+    fn fd_identity(fd: libc::c_int) -> Option<(libc::dev_t, libc::ino_t)> {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(fd, st.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        let st = unsafe { st.assume_init() };
+        Some((st.st_dev, st.st_ino))
+    }
+
+    /// Count the descriptors in this process that reference exactly the file
+    /// `target` identifies, by scanning the whole fd table and comparing
+    /// `(st_dev, st_ino)`.
+    ///
+    /// Scoping the count to ONE file's identity — rather than sampling the
+    /// process-wide open-fd total — is what makes this measurement valid inside
+    /// a parallel test harness. `MMAP_TEST_LOCK` serialises the mapping tests
+    /// against each other, but it does not stop the ~70 other `carrick-host`
+    /// unit tests from opening descriptors on other threads of the same test
+    /// binary (`internal_fd`'s dup/relocate cases and `ulock`'s re-exec
+    /// transport cases both leave descriptors open by design). A process-wide
+    /// before/after delta therefore measured THEIR descriptors as well as this
+    /// test's, and reported an unrelated concurrent open as a `map_shared_file`
+    /// leak. Descriptors on this test's own private, uniquely-named backing
+    /// file can only come from this test.
+    ///
+    /// Portable across macOS/Linux/FreeBSD/NetBSD (no `/proc` dependency), and
+    /// — unlike a lowest-free-fd sample — it detects a leak at ANY descriptor
+    /// number, not just contiguous low slots. The scan ceiling is bounded by
+    /// `RLIMIT_NOFILE` (clamped) so it terminates even if the soft limit is
+    /// large.
+    #[cfg(unix)]
+    fn fds_referencing(target: (libc::dev_t, libc::ino_t)) -> usize {
         let mut rl = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
         };
         let ceiling = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } == 0 {
             // Clamp: the soft limit can be huge (or RLIM_INFINITY); 4096 is far
-            // above anything this single-threaded test opens, and bounds the scan.
+            // above anything this test opens, and bounds the scan.
             (rl.rlim_cur as usize).min(4096)
         } else {
             4096
         };
         (0..ceiling)
-            .filter(|&fd| unsafe { libc::fcntl(fd as libc::c_int, libc::F_GETFD) } != -1)
+            .filter(|&fd| fd_identity(fd as libc::c_int) == Some(target))
             .count()
     }
 
@@ -290,16 +317,17 @@ mod tests {
     /// refactor that drops it) leaks one host fd per guest mmap of a /dev/shm
     /// semaphore, climbing unbounded in a long-lived guest until per-cycle time
     /// degrades and the forkserver test module blows its 300 s budget.
+    ///
+    /// The leak is counted by `(st_dev, st_ino)` identity against this test's
+    /// own backing file, not by a process-wide open-fd delta — see
+    /// [`fds_referencing`] for why the process-wide form was not a valid
+    /// measurement inside a parallel test binary.
     #[cfg(unix)]
     #[test]
     fn map_shared_file_does_not_leak_host_fds_across_cycles() {
         let _serialize = MMAP_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Other host tests can lazily initialize the shared kernel arena, which
-        // opens one fd. Do it before the fd-count baseline so this leak test
-        // measures only map_shared_file cycles.
-        crate::guest_cpu::init_child_table();
         // A real backing file (mmap of an anonymous/closed fd is not portable);
         // 16 KiB so it is a single HVF granule.
         let len = 16 * 1024usize;
@@ -320,9 +348,15 @@ mod tests {
             .expect("path has no interior NUL");
 
         // Warm one cycle first so any one-time lazy allocations (page-cache
-        // structures, etc.) are already paid before we sample the baseline.
+        // structures, etc.) are already paid before the measured cycles.
         let warm_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR) };
         assert!(warm_fd >= 0, "open backing file");
+        let backing = fd_identity(warm_fd).expect("fstat backing file");
+        assert_eq!(
+            fds_referencing(backing),
+            1,
+            "only this test's own open descriptor may reference its private backing file"
+        );
         {
             let dup = unsafe { libc::dup(warm_fd) };
             assert!(dup >= 0, "dup");
@@ -341,8 +375,13 @@ mod tests {
         }
         unsafe { libc::close(warm_fd) };
 
-        // Baseline open-fd count after warm-up.
-        let base = open_fd_count();
+        // Baseline: with every descriptor this test opened now closed, nothing
+        // in the process may still reference the backing file.
+        let base = fds_referencing(backing);
+        assert_eq!(
+            base, 0,
+            "the warm-up cycle left a descriptor open on the backing file"
+        );
 
         // N map→close-dup→drop cycles. Each mirrors what the per-engine
         // `map_host_alias` does with the dispatcher's dup'd fd.
@@ -361,15 +400,16 @@ mod tests {
             drop(m);
         }
 
-        let after = open_fd_count();
+        let after = fds_referencing(backing);
         let _ = std::fs::remove_file(&path);
 
-        assert!(
-            after <= base,
-            "open-fd count grew across {N} map_shared_file cycles \
-             ({base} -> {after}): the alias-window MAP_SHARED file path is \
-             leaking host fds (an engine's map_host_alias likely forgot to \
-             close the dispatcher's dup'd fd)"
+        assert_eq!(
+            after, 0,
+            "{after} descriptor(s) still reference the backing file after {N} \
+             map_shared_file cycles that closed every fd they opened: the \
+             alias-window MAP_SHARED file path is leaking host fds (an \
+             engine's map_host_alias likely forgot to close the dispatcher's \
+             dup'd fd, or map_shared_file retained a descriptor of its own)"
         );
     }
 
