@@ -55,6 +55,7 @@ pub(crate) struct TraceSudoInvocation<'a> {
     pub(crate) script: Option<&'a Path>,
     pub(crate) profile: Option<TraceProfileKind>,
     pub(crate) summary_jsonl: Option<&'a Path>,
+    pub(crate) profile_bound_seconds: Option<u64>,
     pub(crate) trace_out: Option<&'a Path>,
     pub(crate) native_shape_snapshots: Option<&'a Path>,
     pub(crate) uid: u32,
@@ -84,6 +85,10 @@ pub(crate) fn trace_sudo_argv(invocation: &TraceSudoInvocation<'_>) -> Vec<OsStr
     if let Some(path) = invocation.summary_jsonl {
         argv.push(OsString::from("--summary-jsonl"));
         argv.push(path.as_os_str().to_owned());
+    }
+    if let Some(seconds) = invocation.profile_bound_seconds {
+        argv.push(OsString::from("--profile-bound-seconds"));
+        argv.push(OsString::from(seconds.to_string()));
     }
     if let Some(path) = invocation.trace_out {
         argv.push(OsString::from("--trace-out"));
@@ -247,6 +252,7 @@ mod tests {
             script: None,
             profile: Some(TraceProfileKind::DsrIndirect),
             summary_jsonl: Some(Path::new("/tmp/summary.jsonl")),
+            profile_bound_seconds: None,
             trace_out: Some(Path::new("/tmp/raw.trace")),
             native_shape_snapshots: None,
             uid: 501,
@@ -285,6 +291,55 @@ mod tests {
         );
     }
 
+    /// `carrick trace` auto-sudos by REBUILDING its argv field by field, so a
+    /// flag added to the parser but not here is silently dropped and the
+    /// capture runs with a different bound than the operator asked for --
+    /// which is exactly how the first live smoke of this parameter reported
+    /// `bound_limit_s=180` after being told 20.
+    #[test]
+    fn profile_capture_bound_survives_sudo_argv_reconstruction() {
+        let command = ["run-elf".to_owned(), "/tmp/probe".to_owned()];
+        let argv = trace_sudo_argv(&TraceSudoInvocation {
+            executable: Path::new("/tmp/carrick"),
+            flowindent: false,
+            script: None,
+            profile: Some(TraceProfileKind::NativeWall),
+            summary_jsonl: None,
+            profile_bound_seconds: Some(900),
+            trace_out: Some(Path::new("/tmp/raw.trace")),
+            native_shape_snapshots: None,
+            uid: 501,
+            gid: 20,
+            groups: &[],
+            forwarded_env: &[],
+            command: &command,
+        });
+        let strings: Vec<_> = argv
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            strings,
+            [
+                "/tmp/carrick",
+                "trace",
+                "--profile",
+                "native-wall",
+                "--profile-bound-seconds",
+                "900",
+                "--trace-out",
+                "/tmp/raw.trace",
+                "--trace-uid",
+                "501",
+                "--trace-gid",
+                "20",
+                "--",
+                "run-elf",
+                "/tmp/probe",
+            ]
+        );
+    }
+
     #[test]
     fn native_fault_profile_survives_sudo_argv_reconstruction() {
         let command = ["run-elf".to_owned(), "/tmp/fault-probe".to_owned()];
@@ -294,6 +349,7 @@ mod tests {
             script: None,
             profile: Some(TraceProfileKind::NativeFault),
             summary_jsonl: None,
+            profile_bound_seconds: None,
             trace_out: Some(Path::new("/tmp/native-fault.raw")),
             native_shape_snapshots: None,
             uid: 501,
@@ -339,6 +395,7 @@ mod tests {
             script: None,
             profile: Some(TraceProfileKind::NativeShape),
             summary_jsonl: Some(Path::new("/tmp/native-shape.jsonl")),
+            profile_bound_seconds: None,
             trace_out: Some(Path::new("/tmp/native-shape.raw")),
             native_shape_snapshots: Some(Path::new("/tmp/native-shape.snapshots")),
             uid: 501,
