@@ -624,6 +624,31 @@ pub trait GuestMemory {
         Ok(())
     }
 
+    /// Replace `[address, address+len)` with a host `MAP_PRIVATE|MAP_FIXED`
+    /// FILE mapping of `host_fd` at `offset`, so a guest
+    /// `mmap(MAP_PRIVATE, fd)` demand-pages from the host's buffer cache
+    /// instead of being eagerly materialized (full-length zeroed buffer +
+    /// `pread` + copy — three whole-length amplifications per guest call;
+    /// Move-3 E1). Returns `Ok(true)` when the backing was replaced: the
+    /// mapping is installed host-RW and the caller then publishes protection,
+    /// sharing and the beyond-EOF `BUS_ADRERR` tail exactly as it would after
+    /// an eager load. `Ok(false)` means this backend (or this range) cannot
+    /// take the lowering and the caller MUST fall back to the eager snapshot —
+    /// the default for every backend without an identity host mapping it owns
+    /// (VMM stage-2 backings must never be `MAP_FIXED`-replaced under a live
+    /// `hv_vm_map`). Failure is deliberately non-fatal: the snapshot path is
+    /// always a correct fallback, so an unexpected host `mmap` error degrades
+    /// to the old cost, never to a guest-visible error.
+    fn map_private_file_backed(
+        &mut self,
+        _address: u64,
+        _len: usize,
+        _host_fd: std::os::fd::BorrowedFd<'_>,
+        _offset: u64,
+    ) -> Result<bool, MemoryError> {
+        Ok(false)
+    }
+
     /// Optional live residency vector for a backend whose guest pages are
     /// directly queryable at host level. One byte per guest page, with bit 0
     /// matching Linux `mincore(2)`. Translation/page-table backends return
