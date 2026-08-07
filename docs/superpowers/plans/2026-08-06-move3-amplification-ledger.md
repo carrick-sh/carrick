@@ -560,6 +560,22 @@ the E0 capture, partitioned against E1's `mmap`-window faults. This entry is
 *measurement-first by necessity* — it cannot be ranked until E0 confirms the
 host-other zfod share at HEAD (§2/E0).
 
+> **Measured 2026-08-07 (Task 6) — the in-window/host-other partition is
+> CLOSED.** The NFAULT2 fault-event × memory-intent join (typed as the
+> `carrick.native-fault-attribution.v4` `memory_fault_partition` section)
+> shows the 553k in-`mmap`-window zfod is **99.4% carrick's whole-range
+> anonymous-reuse scrub writing the ops' own biased host backing** — 98% of
+> it serving 66 hint-less 128 MiB `PROT_NONE` reserves per build whose
+> content is provably zero already (`mmap_dirty_high` is raised on
+> ALLOCATION, not writability; the free-region arm returns `reused=true`
+> unconditionally; the scrub covers the full request before the `PROT_NONE`
+> branch). In-window allocation churn (this entry's mechanism) is only
+> **0.54%** — E2 stays an out-of-window program against the 63.3%
+> host-other mass, and the in-window successor is the kernel-side
+> `MAP_FIXED|MAP_ANON` replacement (designed, NOT implemented — gates listed).
+> Partition, mechanism chain, and ceiling:
+> [`2026-08-07-build-lane-fault-partition.md`](../../perf-results/2026-08-07-build-lane-fault-partition.md).
+
 ### E3 — guest decommit intent → `zero_backing` memset instead of `MADV_FREE_REUSABLE`
 
 *Estimated* **0.3–1.0 CPU-s** of the kernel gap (plus userspace memset). The
