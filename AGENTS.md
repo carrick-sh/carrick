@@ -401,13 +401,16 @@ concern — it is half the product.
   boundary. Rank by the **amplification factor
   of a single guest operation**, which is concrete and directly attackable
   where a CPU percentage is not:
-  - guest `open` → **19.68 host opens** in-service-window on the **cold
-    go-build** (2026-07-28, `native-fs-amplification.jsonl` record 8); on the
-    **fs-walk** fixture at HEAD the same in-window figure is **2.37** (4.61
+  - guest `open` → **8.69 host opens** in-service-window on the **cold
+    go-build** at HEAD (was 19.68 on 2026-07-28, before the trusted-dirfd
+    lanes; total `openat`-window amplification 27.6x counting the
+    resolution/mode tail, ~105 µs host kernel CPU per guest open). On the
+    **fs-walk** fixture the same in-window figure is **2.37** (4.61
     counting every host `openat` in the run). Those are DIFFERENT WORKLOADS —
-    pair like with like and do not read a ratio between them as progress; the
-    go-build's open lane at HEAD is simply unmeasured. Full per-op ledger:
-    [`docs/perf-results/2026-08-05-fswalk-amplification-ledger.md`](docs/perf-results/2026-08-05-fswalk-amplification-ledger.md).
+    pair like with like and do not read a ratio between them as progress.
+    Full per-op ledgers:
+    [`docs/perf-results/2026-08-06-build-lane-amplification-ledger.md`](docs/perf-results/2026-08-06-build-lane-amplification-ledger.md) (build),
+    [`docs/perf-results/2026-08-05-fswalk-amplification-ledger.md`](docs/perf-results/2026-08-05-fswalk-amplification-ledger.md) (fs-walk);
     On fs-walk: whole fixture **2.05x** host per guest syscall (49,623/24,201,
     excluding 3,182 probable-tracer `kdebug_trace*`), 1.71x inside service
     windows. Still to drive toward 1: guest `openat` **5.91** host calls,
@@ -431,11 +434,18 @@ concern — it is half the product.
     (Two prior claims here were stale and are corrected: `MAP_FIXED|
     MAP_ANONYMOUS` is already a single host mmap on the identity backend, and
     `map_prepared_for_plan` was live, not `dead_code`.)
-  Drive each toward 1. **Do NOT assume carrick's own copies cause the fault
-  term** — the committed census refutes it: JIT first-touch is 2.08% of zfod and
-  inserted code 1.48%, so faults are dominated by the GUEST's own anonymous
-  memory. The lever there is making each guest page cheaper on Darwin, not
-  making carrick copy less.
+  Drive each toward 1. **The fault term is dominated by CARRICK'S OWN host
+  allocations, not the guest's memory.** The birth-keyed page census puts
+  host-other at 63.2%/62.7% of sampled zfod (2026-08-03,
+  [`docs/perf-results/2026-08-03-current-native-fault-ownership.md`](docs/perf-results/2026-08-03-current-native-fault-ownership.md)),
+  re-confirmed at HEAD (63.26%/63.30%, the 2026-08-06 build-lane ledger —
+  which also places 36% of all zfod inside guest `mmap` service windows, the
+  eager `MAP_PRIVATE` materialization path). The narrow 2026-07-29 claims
+  survive (JIT first-touch 2.08% of zfod, inserted code 1.48%); that census's
+  guest-dominates conclusion does NOT — it was superseded by the 2026-08-01
+  audit and has been twice re-confirmed since. The levers are
+  allocation-side — buffer reuse / `MADV_FREE_REUSABLE` for the repeated
+  ≥128 KiB buffers, file-backed guest `mmap` — as well as per-page cost.
 - **Use Go's runtime as a DUAL-PORT ORACLE for "what should this lower to on
   Darwin?"** Go implements the same allocator abstractions (`sysAlloc`,
   `sysReserve`, `sysMap`, `sysUnused`, `sysUsed`, `sysFault`, `sysFree`)
