@@ -191,7 +191,8 @@ Closure receipt: the guest column sums to 94,782 and the host column —
 the independently aggregated totals (all ten currency pairs equal; asserted
 by the analyzer, republished in `closure`).
 
-**The largest single count lever in the ledger is unexplained: ~1,108 host
+**The largest single count lever in the ledger (unexplained as captured;
+root-caused and fixed the next day — see the box below): ~1,108 host
 `close` per guest `execve`.** 74,253 of `execve`'s 85,038 in-window host
 calls (87.3%) are `close` — **7.4% of every host syscall in the run** — and
 the per-exec constant is stable to a tenth of a call across arms
@@ -200,6 +201,19 @@ the per-exec constant is stable to a tenth of a call across arms
 not supervision bleed. Nothing in the entry roster currently points at this;
 it is the named open question for Task 5/6 (deliberately not investigated in
 this entry — E0 measures, it does not attribute causes).
+
+> **RESOLVED 2026-08-07** — the `--fs host` stat cache allocated one host
+> parent dirfd per cached LEAF, so a cold build held **1,138 open dirfds over
+> 44 distinct directories** (759 of them the same `go/src/runtime`); the
+> cache's clear-on-fork (`fs_backend.rs:2479`) then closed all of them one at a
+> time in every fork child, and a `go build` fork child's first stat is the
+> `check_exec_target` of the `execve` it was forked to perform, which is why
+> the whole sweep landed in this window. Anchors are now interned per
+> directory (weakly, so lifetimes are unchanged): **1,108.3 → 80.7 closes per
+> exec** on the same fixture and instrument (74,253 → 5,404), and the resident
+> dirfd population 1,138 → 49. Diagnosis, receipts and classification:
+> [`task-close-diagnosis-report.md`](../superpowers/sdd/2026-08-06-move3-amplification-ledger/task-close-diagnosis-report.md).
+> The measured columns above are the pre-fix reading and are left as captured.
 
 Three rows are ratios over tiny denominators and must not be read as
 per-call price: `execve` (67 — the loader/exec chain), `waitid`/`wait4`
@@ -456,7 +470,7 @@ restated; ranks are by what this capture can defend. E1/E2 remain overlapping
 | 1 | **E1** guest `mmap(MAP_PRIVATE, fd)` eager materialization | 553,526 zfod (36.0% of all) inside 6,110 guest-`mmap` windows; mmap syscall CPU itself trivial (47 ms) | confirmed #1 |
 | 2 | **E2** carrick ≥128 KiB allocation churn | host-other zfod **63.26/63.30%** at HEAD (§7); carrick-only zfod 896k (58.3%) | confirmed #2; STOP re-open stands on live numbers |
 | 3 | **E5 promoted** — the build-lane fs family | 174,749 host calls, ~0.64 s ≈ **40% of guest-attributed kernel CPU**; open lane 19.68 → **8.69**; `mkdirat` 78x, `unlinkat` 63x; `carrick-only` `fstatat64` 9,041 echoes the open fs-walk regression chip | **up from 5th**; was "unmeasured", now the largest guest-attributed family |
-| 4 | **process/container lifecycle** (absorbs E7 + the fork cost + the seed) | `clone` 1.13 ms/op (68 host `fork`s ≈ 5.6 ms each = 0.38 s); `execve` 3.63 ms/op in-window and **~1,108 host `close` per exec** (§4 — the ledger's largest count lever, unexplained); `waitid`/`wait4` 107k host calls; `carrick-only` `clonefileat` 21 calls ≈ **0.31 s** | new named family; E7's "record, don't campaign" holds for the exec chain's fixed wall, but the fork row, the per-exec close storm and the per-run `clonefileat` seed are campaignable |
+| 4 | **process/container lifecycle** (absorbs E7 + the fork cost + the seed) | `clone` 1.13 ms/op (68 host `fork`s ≈ 5.6 ms each = 0.38 s); `execve` 3.63 ms/op in-window and **~1,108 host `close` per exec** (§4 — the ledger's largest count lever; **root-caused and fixed 2026-08-07**, now 80.7/exec); `waitid`/`wait4` 107k host calls; `carrick-only` `clonefileat` 21 calls ≈ **0.31 s** | new named family; E7's "record, don't campaign" holds for the exec chain's fixed wall, but the fork row, the per-exec close storm and the per-run `clonefileat` seed are campaignable |
 | 5 | **E6** `carrick-only` park/wake | `psynch_*` ≈ 258k calls, **~0.38 s = 13–14%** of measured kernel CPU; `swtch_pri` 462–505k | up slightly; bigger same-instrument share than the sampling estimate suggested |
 | 6 | **E4** alias-gate / dispatch-guard scope | not measurable by this instrument; `swtch_pri` storm is consistent with contention but attributes nothing | unchanged: re-derive (Task 8) |
 | 7 | **E3** decommit intent → `MADV_FREE_REUSABLE` | guest `madvise` count is **415–528 per build**, in-window host CPU ≈ 0.1–0.2 ms — noise. The kernel-side case for E3 on this lane is refuted; only the userspace memset share (invisible to AMP1) could still argue for it | **demoted from 3rd**; plan's "should be non-trivial" is falsified by measurement |
