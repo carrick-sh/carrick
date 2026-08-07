@@ -2262,6 +2262,47 @@ fn add_load_bias(load_bias: u64, addend: i64) -> Result<u64, RuntimeError> {
     }
 }
 
+/// Refuse the deleted live-translation-arena knobs by name.
+///
+/// `CARRICK_DSR_LIVE_ARENA` (the compiler-slice policy, `=0` escape hatch
+/// included) and `CARRICK_DSR_LIVE_ARENA_SIZING_DIR` (the sizing census)
+/// belonged to the live translation arena, which was measured worse on both
+/// target shapes and removed in `1cb06de6` (`revert(native): remove the live
+/// translation arena runtime`; evidence:
+/// `docs/perf-results/2026-08-06-live-arena-36x-attribution.md`). Per the
+/// opt-out rule, a removed mechanism's knob must hard-error naming its
+/// removal rather than be silently ignored: an environment that still sets
+/// it believes it is steering a lane that no longer exists, and every
+/// measurement taken under that belief would be mislabeled.
+#[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
+fn refuse_removed_live_arena_knobs_from(
+    policy: Option<&std::ffi::OsStr>,
+    sizing_dir: Option<&std::ffi::OsStr>,
+) -> Result<(), RuntimeError> {
+    let named = if policy.is_some() {
+        "CARRICK_DSR_LIVE_ARENA"
+    } else if sizing_dir.is_some() {
+        "CARRICK_DSR_LIVE_ARENA_SIZING_DIR"
+    } else {
+        return Ok(());
+    };
+    Err(RuntimeError::Unsupported(format!(
+        "{named} is set, but the live translation arena was removed in 1cb06de6 \
+         (revert(native): remove the live translation arena runtime): it measured \
+         ~36x slower on the cold go build and ~16% slower on the 20-exec micro \
+         (docs/perf-results/2026-08-06-live-arena-36x-attribution.md). Unset it; \
+         the persistent unit store is the shipped translation-sharing mechanism."
+    )))
+}
+
+#[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
+fn refuse_removed_live_arena_knobs() -> Result<(), RuntimeError> {
+    refuse_removed_live_arena_knobs_from(
+        std::env::var_os("CARRICK_DSR_LIVE_ARENA").as_deref(),
+        std::env::var_os("CARRICK_DSR_LIVE_ARENA_SIZING_DIR").as_deref(),
+    )
+}
+
 // See `run_static_elf`: macOS-arm-only until M0.8.
 #[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
 fn run_image_in_child(
@@ -2273,6 +2314,7 @@ fn run_image_in_child(
     plan: &ExecutionPlan,
     direct: Option<DirectLaunchCandidate>,
 ) -> Result<RunResult, RuntimeError> {
+    refuse_removed_live_arena_knobs()?;
     let _cache_session =
         carrick_native_darwin::aot_cache::begin_container_cache().map_err(AddressSpaceError::Io)?;
     let stdout_pipe = pipe_pair()?;
@@ -9334,6 +9376,40 @@ mod tests {
             assert!(
                 !native_syscall_mutates_mappings(nr),
                 "nr {nr} should not be classified as a mapping mutator"
+            );
+        }
+    }
+
+    #[test]
+    fn removed_live_arena_knobs_hard_error_by_name() {
+        // The opt-out rule: a deleted mechanism's knob refuses loudly with
+        // the removal commit, never silently no-ops. Pure-fn form so the
+        // test needs no process-global env mutation; the signed-binary smoke
+        // covers the env-reading wrapper end to end.
+        use std::ffi::OsStr;
+        assert!(refuse_removed_live_arena_knobs_from(None, None).is_ok());
+        for (policy, sizing) in [
+            (Some(OsStr::new("compiler")), None),
+            (Some(OsStr::new("0")), None),
+            (Some(OsStr::new("")), None),
+            (None, Some(OsStr::new("/tmp/census"))),
+        ] {
+            let error = refuse_removed_live_arena_knobs_from(policy, sizing)
+                .expect_err("a set live-arena knob must refuse");
+            let message = error.to_string();
+            assert!(
+                message.contains("1cb06de6")
+                    && message.contains("live translation arena was removed"),
+                "refusal must name the removal commit: {message}"
+            );
+            let named = if policy.is_some() {
+                "CARRICK_DSR_LIVE_ARENA"
+            } else {
+                "CARRICK_DSR_LIVE_ARENA_SIZING_DIR"
+            };
+            assert!(
+                message.contains(named),
+                "refusal must name the offending knob {named}: {message}"
             );
         }
     }
