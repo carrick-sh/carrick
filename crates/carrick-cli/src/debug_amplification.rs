@@ -26,6 +26,34 @@
 //!   and again on every parse of a published ledger. That is the whole point
 //!   of moving this census under `--profile`.
 //!
+//! **What closure CANNOT see, stated because it is the instrument's sharpest
+//! remaining edge.** Closure sums across ALL slots, so it is blind to
+//! MISATTRIBUTION: move a `(guest_op, host_call)` row from a guest slot into
+//! `carrick-only` and every sum is unchanged, every closure pair still holds,
+//! and the guest op's amplification simply falls. That is not a hypothetical
+//! shape — it is exactly what a libdtrace DYNAMIC drop produces when the
+//! `service_slot[pid, tid]` entry is lost, and its symptom is an amplification
+//! that IMPROVED. The only detector is the consumer-side drop counters, which
+//! are not in the stream (the D header's fact 10) and are enforced by
+//! `carrick trace` at CAPTURE time, where a nonzero counter makes the command
+//! exit non-zero.
+//!
+//! **The consequence is operational and belongs in every reading of a ledger:
+//! a raw file left behind by a FAILED capture can launder a lower amplification
+//! past every check in this file.** The capture command must be run to a
+//! successful exit; `authority.consumer_drop_enforcement` records where that
+//! check lives rather than implying this analyzer re-ran it. Closing it in-band
+//! is a stated Task-3 obligation in the Move-3 plan: a default-on
+//! `AMP1|consumer-drops|…` record written at capture time, so an archived raw
+//! carries its own drop verdict.
+//!
+//! **The instrument sub-bucket is `kdebug_trace*` and nothing else.** That is
+//! libdtrace's buffer traffic, which is the dominant term, but the in-process
+//! consumer also opens and pumps the dtrace device: those `ioctl` and `read`
+//! calls stay charged to carrick in `carrick_only`, unseparated. A reading that
+//! quotes `carrick_only.excluding_probable_instrument` as "carrick's own
+//! supervision cost" is therefore quoting an upper bound.
+//!
 //! **Two deliberate departures from the plan's schema sketch, both toward
 //! exactness.** Ratios are exact integer [`LedgerFraction`]s (`host_calls` over
 //! `guest_count`), never floats, following the `debug_jit_shape` census's
@@ -64,6 +92,12 @@ pub(crate) const LEDGER_SCHEMA: &str = "carrick.amplification-ledger.v1";
 /// never has a guest service window open), where this list splits them into a
 /// named sub-bucket so the instrument's cost is identifiable instead of hidden
 /// inside carrick's own supervision traffic.
+///
+/// This is buffer traffic ONLY. The in-process consumer also opens and pumps
+/// the dtrace device, and those `ioctl`/`read` calls are indistinguishable by
+/// name from carrick's own, so they stay charged to `carrick-only`. Anything
+/// quoting the remainder as carrick's supervision cost is quoting an upper
+/// bound; naming a wider set here would need a way to tell the two apart.
 const PROBABLE_INSTRUMENT_CALLS: [&str; 3] =
     ["kdebug_trace", "kdebug_trace64", "kdebug_trace_string"];
 
@@ -124,11 +158,23 @@ impl LedgerFraction {
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GuestOp {
-    pub(crate) canonical_nr: CanonicalNr,
-    pub(crate) name: String,
+    // PRIVATE, like `HostCall`/`MachTrap`: public fields would let a struct
+    // literal elsewhere in the crate assemble a number/name pair that the
+    // table never agreed to. Deserialization can still build one, which is why
+    // `validate` re-resolves every row on parse.
+    canonical_nr: CanonicalNr,
+    name: String,
 }
 
 impl GuestOp {
+    fn canonical_nr(&self) -> CanonicalNr {
+        self.canonical_nr
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
     fn resolve(canonical_nr: CanonicalNr) -> Result<Self> {
         let entry = lookup_aarch64(canonical_nr.raw()).ok_or_else(|| {
             anyhow!(
@@ -289,6 +335,15 @@ pub(crate) struct LedgerAuthority {
     /// stream, so `carrick trace --profile native-amplification` refuses the
     /// capture on any nonzero counter and this ledger records that rather than
     /// implying it re-checked them offline.
+    ///
+    /// **Read this as a caveat, not a receipt.** A dynamic drop that loses a
+    /// `service_slot` entry moves host work from a guest op into `carrick-only`
+    /// WITHOUT changing any sum, so closure holds and the guest op's
+    /// amplification falls — a raw file from a failed capture can launder a
+    /// lower amplification past every check here. Until the Task-3 in-band
+    /// `AMP1|consumer-drops|…` record lands, "the capture command exited zero"
+    /// is a required part of a ledger's provenance and is not carried by the
+    /// artifact.
     pub(crate) consumer_drop_enforcement: String,
     pub(crate) terminal_calls: Vec<TerminalCall>,
 }
@@ -446,6 +501,10 @@ pub(crate) struct LedgerClosure {
     pub(crate) host_syscall_returns: ClosureCheck,
     pub(crate) host_syscall_cpu_ns: ClosureCheck,
     pub(crate) mach_traps: ClosureCheck,
+    /// Unlike the other nine, the two `*_returns` checks are re-derived from
+    /// the stream at BUILD time only: the ledger publishes no per-call return
+    /// roster to re-sum, so on parse they are checked for self-consistency and
+    /// against `totals`, not recomputed.
     pub(crate) mach_trap_returns: ClosureCheck,
     pub(crate) mach_trap_cpu_ns: ClosureCheck,
     pub(crate) as_faults: ClosureCheck,
@@ -604,11 +663,27 @@ impl SlotJoin {
     /// accumulated at RETURN under the slot captured at ENTRY, so a CPU or
     /// max-ns key with no matching entry key, or a max that exceeds the whole
     /// sum for the same key, means the two clauses disagreed.
+    ///
+    /// The `max_ns` roster gets an EXACT key-set equality rather than a subset
+    /// check, because `@host_cpu_by_slot` and `@host_cpu_max_by_slot` are
+    /// written unconditionally in the same clause on the same key: their key
+    /// sets are identical by construction. That equality is the only closure
+    /// `max_ns` has — unlike every other quantity it has no independent
+    /// ungrouped total in the stream — so a truncated max roster (a lost row in
+    /// the END flush) would otherwise zero `dominant_host_call.max_ns` in
+    /// silence.
     fn validate_keys(&self, label: &str) -> Result<()> {
         for name in self.host_call_cpu_ns.keys() {
             if !self.host_calls.contains_key(name) {
                 bail!(
                     "AMP1 records host CPU for {}'s {:?} with no matching syscall entry",
+                    label,
+                    name.as_str()
+                );
+            }
+            if !self.host_call_max_ns.contains_key(name) {
+                bail!(
+                    "AMP1 records a host CPU sum for {}'s {:?} with no matching maximum; the two aggregations are written in one clause and their key sets cannot differ",
                     label,
                     name.as_str()
                 );
@@ -742,7 +817,7 @@ pub(crate) fn build_ledger(
         if *guest_count == 0 {
             bail!(
                 "AMP1 counts zero service-window entries for guest op {}; the row's amplification denominator would be zero",
-                guest_op.name
+                guest_op.name()
             );
         }
         let join = joins.get(slot).unwrap_or(&empty);
@@ -755,7 +830,7 @@ pub(crate) fn build_ledger(
                 bail!(
                     "AMP1 attributes the instrument's own {:?} to guest op {}; per-op ratios cannot be corrected for the tracer's cost after the join",
                     name.as_str(),
-                    guest_op.name
+                    guest_op.name()
                 );
             }
         }
@@ -876,6 +951,7 @@ pub(crate) fn build_ledger(
         budget,
     };
     ledger.validate()?;
+    ledger.require_bundled_program()?;
     Ok(ledger)
 }
 
@@ -1104,12 +1180,42 @@ fn build_budget(
 }
 
 impl AmplificationLedgerV1 {
+    /// The program digest must name the CURRENTLY BUNDLED `AMP1` program.
+    ///
+    /// Deliberately NOT part of [`AmplificationLedgerV1::validate`], and the
+    /// distinction is what keeps published ledgers readable. `validate` runs on
+    /// every parse; the bundled digest changes on every edit of
+    /// `native-amplification.d`. Folding this into `validate` would make every
+    /// previously published ledger unparseable the moment the D program is
+    /// touched — including by the Task-3 in-band drop record this plan now
+    /// requires — silently destroying the archive this instrument exists to
+    /// build.
+    ///
+    /// So: BUILDING a ledger from a fresh capture requires the bundled digest
+    /// (this is where "a `--script` capture cannot produce a ledger" is
+    /// enforced, backing up the reader's own header check), READING one back
+    /// requires only that the recorded digest is well formed, and refusing to
+    /// COMPARE two ledgers whose digests differ is `amplification-compare`'s
+    /// job. A ledger always names the program that produced it, so a version
+    /// crossing stays detectable without being retroactive.
+    fn require_bundled_program(&self) -> Result<()> {
+        let expected = amp1_program_sha256();
+        if self.authority.program_sha256 != expected {
+            bail!(
+                "amplification ledger names program digest {} rather than the bundled native-amplification program ({expected}); a --script capture cannot produce a ledger",
+                self.authority.program_sha256
+            );
+        }
+        Ok(())
+    }
+
     /// Everything a published ledger must still be true about ITSELF.
     ///
     /// Run on build and again on every parse, so a hand-edited artifact is
-    /// refused rather than compared. The three load-bearing properties are all
-    /// here: the closure equalities, the authenticated program digest, and the
-    /// instrument's separation from every per-op ratio.
+    /// refused rather than compared: the closure equalities, the well-formed
+    /// authority, and the instrument's separation from every per-op ratio.
+    /// The one check that is deliberately NOT here is the bundled program
+    /// digest — see [`AmplificationLedgerV1::require_bundled_program`].
     pub(crate) fn validate(&self) -> Result<()> {
         if self.schema != LEDGER_SCHEMA {
             bail!("amplification ledger schema is not {LEDGER_SCHEMA}");
@@ -1130,14 +1236,14 @@ impl AmplificationLedgerV1 {
         let mut previous: Option<CanonicalNr> = None;
         for row in &self.ledger {
             row.guest_op.validate()?;
-            if previous.is_some_and(|previous| previous >= row.guest_op.canonical_nr) {
+            if previous.is_some_and(|previous| previous >= row.guest_op.canonical_nr()) {
                 bail!("amplification ledger rows are duplicate or not ordered by canonical number");
             }
-            previous = Some(row.guest_op.canonical_nr);
+            previous = Some(row.guest_op.canonical_nr());
             if row.guest_count == 0 {
                 bail!(
                     "amplification ledger row {} has a zero guest denominator",
-                    row.guest_op.name
+                    row.guest_op.name()
                 );
             }
             row.host_call_amplification.require(
@@ -1156,7 +1262,7 @@ impl AmplificationLedgerV1 {
                     bail!(
                         "amplification ledger charges the instrument's own {:?} to guest op {}",
                         dominant.name.as_str(),
-                        row.guest_op.name
+                        row.guest_op.name()
                     );
                 }
                 if dominant.count > row.host_calls
@@ -1165,13 +1271,13 @@ impl AmplificationLedgerV1 {
                 {
                     bail!(
                         "amplification ledger dominant host call for {} exceeds its own row",
-                        row.guest_op.name
+                        row.guest_op.name()
                     );
                 }
             } else if row.host_calls != 0 {
                 bail!(
                     "amplification ledger row {} names no dominant host call despite {} host calls",
-                    row.guest_op.name,
+                    row.guest_op.name(),
                     row.host_calls
                 );
             }
@@ -1268,13 +1374,6 @@ impl AmplificationLedgerV1 {
         let authority = &self.authority;
         if authority.raw_schema != AMPLIFICATION_RAW_SCHEMA {
             bail!("amplification ledger raw schema is not {AMPLIFICATION_RAW_SCHEMA}");
-        }
-        let expected = amp1_program_sha256();
-        if authority.program_sha256 != expected {
-            bail!(
-                "amplification ledger names program digest {} rather than the bundled native-amplification program ({expected}); a --script capture cannot produce a ledger",
-                authority.program_sha256
-            );
         }
         for (value, label) in [
             (&authority.program_sha256, "program digest"),
@@ -1626,7 +1725,7 @@ mod tests {
         ledger
             .ledger
             .iter()
-            .find(|row| row.guest_op.name == name)
+            .find(|row| row.guest_op.name() == name)
             .unwrap_or_else(|| panic!("ledger has no {name} row"))
     }
 
@@ -1640,7 +1739,7 @@ mod tests {
             ledger
                 .ledger
                 .iter()
-                .map(|row| (row.guest_op.canonical_nr.raw(), row.guest_op.name.as_str()))
+                .map(|row| (row.guest_op.canonical_nr().raw(), row.guest_op.name()))
                 .collect::<Vec<_>>(),
             vec![(56, "openat"), (222, "mmap")]
         );
@@ -1868,13 +1967,150 @@ mod tests {
         let foreign = FIXTURE.replace("@PROGRAM_SHA256@", &"3".repeat(64));
         assert!(error(ledger_from(&foreign)).contains("does not name the bundled"));
 
-        // Nor can a published ledger be re-pointed at another program.
+        // Building one from a capture requires the CURRENTLY bundled program ...
         let mut ledger = ledger();
         ledger.authority.program_sha256 = "4".repeat(64);
         assert!(
-            format!("{:#}", ledger.validate().unwrap_err())
+            format!("{:#}", ledger.require_bundled_program().unwrap_err())
                 .contains("--script capture cannot produce a ledger")
         );
+    }
+
+    #[test]
+    fn a_ledger_from_an_older_program_still_parses() {
+        // ... but READING one back must not, or every previously published
+        // ledger becomes unparseable the moment `native-amplification.d` is
+        // edited -- including by the Task-3 in-band drop record -- destroying
+        // the archive this instrument exists to build. The recorded digest is
+        // what makes a version crossing detectable; refusing it retroactively
+        // is `amplification-compare`'s job, not the parser's.
+        let mut ledger = ledger();
+        ledger.authority.program_sha256 = "5".repeat(64);
+        let bytes = serialize_ledger(&ledger).expect("an older program's ledger still serializes");
+        let parsed = parse_ledger_v1(&bytes).expect("an older program's ledger still parses");
+        assert_eq!(parsed.authority.program_sha256, "5".repeat(64));
+        assert!(parsed.require_bundled_program().is_err());
+
+        // A malformed digest is still refused on parse: the FORM is structural.
+        let mut malformed = ledger.clone();
+        malformed.authority.program_sha256 = "not-a-digest".to_owned();
+        assert!(
+            format!("{:#}", malformed.validate().unwrap_err())
+                .contains("not a 64-character SHA-256 digest")
+        );
+    }
+
+    #[test]
+    fn amplification_ledger_refuses_a_declared_join_that_never_armed() {
+        // The shape a reviewer constructed to walk through closure: a join that
+        // never armed prints its section markers, no rows at all, and a legal
+        // zero total -- because ZDEFS silences a provider that matches nothing
+        // and the D BEGIN seeds every total `sum(0)`. Per-op closure then holds
+        // at 0 == 0 and the ledger quietly loses exactly the mass that join
+        // exists to catch, which reads as LOWER amplification.
+        let unarmed_mach = stream()
+            .lines()
+            .filter(|line| !line.contains("|trap="))
+            .map(|line| {
+                line.replace(
+                    "|metric=mach-trap-entry-total|count=5",
+                    "|metric=mach-trap-entry-total|count=0",
+                )
+                .replace(
+                    "|metric=mach-trap-return-total|count=5",
+                    "|metric=mach-trap-return-total|count=0",
+                )
+                .replace(
+                    "|metric=mach-trap-cpu-ns|count=4000",
+                    "|metric=mach-trap-cpu-ns|count=0",
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let message = error(ledger_from(&unarmed_mach));
+        assert!(
+            message.contains("mach-trap-entry-total") && message.contains("never armed"),
+            "an unarmed mach join must be named, got {message}"
+        );
+
+        // Every seeded total, one at a time -- including the two CPU totals,
+        // whose zero is `vtimestamp` failing to advance rather than a missing
+        // provider (the D header's own unqualified question about
+        // `mach_trap:::`).
+        for (rows, metric, zeroed) in [
+            (
+                "|host=",
+                "host-syscall-entry-total|count=20",
+                "host-syscall-entry-total|count=0",
+            ),
+            (
+                "|host=",
+                "host-syscall-return-total|count=20",
+                "host-syscall-return-total|count=0",
+            ),
+            (
+                "|cpu_ns=",
+                "host-syscall-cpu-ns|count=18500",
+                "host-syscall-cpu-ns|count=0",
+            ),
+            (
+                "|trap=",
+                "mach-trap-return-total|count=5",
+                "mach-trap-return-total|count=0",
+            ),
+        ] {
+            let unarmed = stream()
+                .lines()
+                .filter(|line| !line.contains(rows))
+                .map(|line| line.replace(metric, zeroed))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let message = error(ledger_from(&unarmed));
+            assert!(
+                message.contains("never armed") || message.contains("closure failed"),
+                "zeroing {metric} must be a named refusal, got {message}"
+            );
+        }
+
+        // The fault join is three independent probe descriptions, so ZDEFS can
+        // silence one of them on its own.
+        for (kind, total) in [
+            ("as_fault", "AMP1|kind=as_fault|count=4"),
+            ("zfod", "AMP1|kind=zfod|count=18"),
+            ("cow_fault", "AMP1|kind=cow_fault|count=2"),
+        ] {
+            let unarmed = stream()
+                .lines()
+                .filter(|line| {
+                    !(line.contains("|kind=")
+                        && line.contains("guest_slot=")
+                        && line.contains(&format!("kind={kind}")))
+                })
+                .map(|line| {
+                    if line == total {
+                        format!("AMP1|kind={kind}|count=0")
+                    } else {
+                        line.to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let message = error(ledger_from(&unarmed));
+            assert!(
+                message.contains(kind) && message.contains("never armed"),
+                "an unarmed {kind} probe must be named, got {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn amplification_ledger_refuses_a_truncated_maximum_roster() {
+        // `max_ns` is the one quantity with no independent ungrouped total, so
+        // its only closure is that its key set equals the CPU sum's -- the two
+        // aggregations are written in one clause on one key. Without that, a
+        // lost row in the END flush silently zeroes `dominant_host_call.max_ns`.
+        let truncated = stream().replacen("AMP1|guest_slot=58|host=openat|max_ns=1200\n", "", 1);
+        assert!(error(ledger_from(&truncated)).contains("no matching maximum"));
     }
 
     #[test]
