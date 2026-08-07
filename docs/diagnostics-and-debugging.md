@@ -139,6 +139,24 @@ The driver for a paired arm is
 [`scripts/perf/amplification-capture.sh`](../scripts/perf/amplification-capture.sh)
 (stamps `CARRICK_RUN_ID`, reaps with `scripts/sudo/kill.sh`).
 
+### The native fault partition (`native-fault` + offline re-parse)
+
+`carrick trace --profile native-fault --summary-jsonl <out>` publishes, beside
+the birth-keyed ownership census, the **`memory_fault_partition`** section
+(schema `carrick.native-fault-attribution.v4`): every `during-operation` zfod
+classified by (guest memory-op sub-shape × fault locus), where
+`own-biased-backing` — the op's own range reached through the per-process
+host bias — is the whole-range scrub's signature. Rows close exactly against
+`memory_census.active_memory_faults`.
+`carrick debug native-fault-partition <raw> [--output <jsonl>]` re-analyzes an
+**archived** raw offline so corroborating a published partition is one command
+against the receipt: it trusts the raw's own capture-time-authenticated
+header, refuses by digest any raw whose `program_sha256` is not the bundled
+`native-fault-attribution.d`, and cannot re-check consumer-side drops (the
+capture's zero exit remains that authority). Measured baseline and the
+partition it exists to gate:
+[`perf-results/2026-08-07-build-lane-fault-partition.md`](perf-results/2026-08-07-build-lane-fault-partition.md).
+
 ### Profiling a running FreeBSD native-x86 process
 
 Launch-time `carrick trace --profile dsr` owns its target and may use Carrick
