@@ -1427,6 +1427,29 @@ pub struct HostFsBackend {
     /// eviction. Validated regression-free across the full conformance matrix.
     /// See docs/fs-host-capstd-amplification.md.
     stat_cache: parking_lot::Mutex<std::collections::HashMap<PathBuf, StatCacheEntry>>,
+    /// Interned CONTAINED parent directory fds for [`Self::stat_cache`], keyed
+    /// by the cache-relative parent path and held WEAKLY.
+    ///
+    /// Every cached leaf used to open its OWN parent dirfd, so N cached
+    /// children of one directory pinned N identical host dirfds. On the cold
+    /// `go build` lane that was 1,138 open dirfds across just 44 distinct
+    /// directories — 759 of them the same `go/src/runtime` — and the
+    /// clear-on-fork in [`Self::stat_cache_get_or_fill`] then closed all 1,138
+    /// one at a time in EVERY fork child, because a fork child's first stat is
+    /// the `check_exec_target` of the `execve` it was forked to perform. That
+    /// was 74,253 host `close(2)` on the build, 7.4% of every host syscall it
+    /// made and the largest count lever in the 2026-08-06 amplification ledger.
+    ///
+    /// Weak, not strong, so this changes only how many host fds back N cached
+    /// leaves — never how long any of them lives: an anchor still dies with the
+    /// last `stat_cache` entry that trusts it, and a dead `Weak` simply misses
+    /// and re-opens. Reuse is therefore only ever of an fd some live cached
+    /// entry is ALREADY using as its anchor (exactly what the revalidation hit
+    /// path at the top of `stat_cache_get_or_fill` does), so the staleness
+    /// exposure is the hit path's and not a wider one.
+    parent_fds: parking_lot::Mutex<
+        std::collections::HashMap<PathBuf, std::sync::Weak<std::os::fd::OwnedFd>>,
+    >,
     /// The pid that owns the current `stat_cache` contents. carrick COW-forks for
     /// guest `clone`/`fork` (and for the default private-PID-namespace guest
     /// init), so a child inherits the map + dup'd parent fds. On the first cache
@@ -1859,6 +1882,7 @@ impl HostFsBackend {
             root_prefix,
             fast_fs,
             stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            parent_fds: parking_lot::Mutex::new(std::collections::HashMap::new()),
             cache_pid: std::sync::atomic::AtomicU32::new(0),
             use_stat_cache: stat_cache_enabled(),
             overlay_mount: None,
@@ -1907,6 +1931,7 @@ impl HostFsBackend {
             root_prefix,
             fast_fs,
             stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            parent_fds: parking_lot::Mutex::new(std::collections::HashMap::new()),
             cache_pid: std::sync::atomic::AtomicU32::new(0),
             use_stat_cache: stat_cache_enabled(),
             overlay_mount: None,
@@ -1991,6 +2016,7 @@ impl HostFsBackend {
             root_prefix,
             fast_fs: fast_fs_enabled(),
             stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            parent_fds: parking_lot::Mutex::new(std::collections::HashMap::new()),
             cache_pid: std::sync::atomic::AtomicU32::new(0),
             use_stat_cache: stat_cache_enabled(),
             overlay_mount: None,
@@ -2478,6 +2504,11 @@ impl HostFsBackend {
             let mut map = self.stat_cache.lock();
             if self.cache_pid.load(Relaxed) != me {
                 map.clear();
+                // LOCK ORDER `stat_cache` -> `parent_fds`; this is the only
+                // site that holds both, and `parent_fds` is never taken first.
+                // Dropping the anchors above already killed every `Weak`, so
+                // keeping them would only make a later fill upgrade-and-miss.
+                self.parent_fds.lock().clear();
                 self.cache_pid.store(me, Relaxed);
             }
             map.get(rel)
@@ -2523,28 +2554,54 @@ impl HostFsBackend {
         let root_prefix = self.root_prefix.as_deref()?;
         let dir_fd = self.dir.as_raw_fd();
         let parent = rel.parent().unwrap_or_else(|| Path::new(""));
-        let parent_fd: OwnedFd = if parent.as_os_str().is_empty() {
-            // Leaf directly under the sandbox root — dup the root dir fd so the
-            // cache owns an independent lifetime. The root is contained by def.
-            let raw = unsafe { libc::dup(dir_fd) };
-            if raw < 0 {
-                return None;
-            }
-            unsafe { OwnedFd::from_raw_fd(raw) }
+        // Reuse this directory's existing anchor when one is still alive. The
+        // sibling leaves of one directory are the overwhelming case (a package
+        // dir, a `bin/`), and opening a private dirfd for each of them is what
+        // put 1,138 host dirfds on 44 directories — see `parent_fds`.
+        let interned = self
+            .parent_fds
+            .lock()
+            .get(parent)
+            .and_then(std::sync::Weak::upgrade);
+        let parent_fd: std::sync::Arc<OwnedFd> = if let Some(anchor) = interned {
+            anchor
         } else {
-            let parent_c = std::ffi::CString::new(parent.as_os_str().as_bytes()).ok()?;
-            let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NONBLOCK;
-            let raw = unsafe { libc::openat(dir_fd, parent_c.as_ptr(), flags, 0) };
-            if raw < 0 {
-                return None; // ENOTDIR / ENOENT / … → not cacheable
+            let opened: OwnedFd = if parent.as_os_str().is_empty() {
+                // Leaf directly under the sandbox root — dup the root dir fd so
+                // the cache owns an independent lifetime. The root is contained
+                // by definition.
+                let raw = unsafe { libc::dup(dir_fd) };
+                if raw < 0 {
+                    return None;
+                }
+                unsafe { OwnedFd::from_raw_fd(raw) }
+            } else {
+                let parent_c = std::ffi::CString::new(parent.as_os_str().as_bytes()).ok()?;
+                let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NONBLOCK;
+                let raw = unsafe { libc::openat(dir_fd, parent_c.as_ptr(), flags, 0) };
+                if raw < 0 {
+                    return None; // ENOTDIR / ENOENT / … → not cacheable
+                }
+                let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+                // The parent's real path must be under the sandbox root (an
+                // intermediate symlink the kernel followed out is rejected
+                // here). Only a PROVEN fd is ever published for reuse.
+                if !fd_contained_under(fd.as_raw_fd(), root_prefix) {
+                    return None;
+                }
+                fd
+            };
+            let anchor = std::sync::Arc::new(opened);
+            let mut parents = self.parent_fds.lock();
+            // Bounded like `stat_cache` itself, and by dropping only entries
+            // whose anchor is already gone: a live anchor is never unpublished,
+            // so the invariant "one live host dirfd per directory" holds even
+            // at the cap.
+            if parents.len() >= 4096 {
+                parents.retain(|_, weak| weak.strong_count() > 0);
             }
-            let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-            // The parent's real path must be under the sandbox root (an
-            // intermediate symlink the kernel followed out is rejected here).
-            if !fd_contained_under(fd.as_raw_fd(), root_prefix) {
-                return None;
-            }
-            fd
+            parents.insert(parent.to_path_buf(), std::sync::Arc::downgrade(&anchor));
+            anchor
         };
 
         // lstat the leaf relative to the contained parent — a single component
@@ -2612,7 +2669,7 @@ impl HostFsBackend {
         map.insert(
             rel.to_path_buf(),
             StatCacheEntry {
-                parent_fd: std::sync::Arc::new(parent_fd),
+                parent_fd,
                 ino: st.st_ino,
                 ctime: (st.st_ctime, carrick_portable::stat_ctime_nsec(&st)),
                 mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(&st)),
@@ -6223,6 +6280,54 @@ mod tests {
 
         assert_ne!(flags, -1);
         assert_ne!(flags & libc::O_NONBLOCK, 0);
+    }
+
+    /// One cached directory must be anchored by exactly ONE host dirfd, however
+    /// many of its children are cached.
+    ///
+    /// Every cached leaf used to open its OWN parent dirfd, so N cached
+    /// children of one directory pinned N identical host dirfds. On the cold
+    /// `go build` lane that meant 1,138 open dirfds across just 44 distinct
+    /// directories (759 of them the same `go/src/runtime`), and the
+    /// clear-on-fork in `stat_cache_get_or_fill` then closed all 1,138 one at a
+    /// time in every fork child — 74,253 host `close(2)` on the build, 7.4% of
+    /// every host syscall it made and the largest count lever in the
+    /// 2026-08-06 amplification ledger.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stat_cache_anchors_one_parent_dirfd_per_directory() {
+        use std::os::fd::AsRawFd;
+
+        let scratch_root = tempfile::TempDir::new().unwrap();
+        let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+        assert!(
+            b.stat_cache_active(),
+            "the --fs host stat cache must be live for this assertion to mean anything"
+        );
+        b.dir.create_dir("pkg").unwrap();
+        for index in 0..24 {
+            b.dir.write(format!("pkg/f{index}"), b"x").unwrap();
+        }
+
+        for index in 0..24 {
+            assert!(
+                b.stat_cache_lookup(&format!("/pkg/f{index}")).is_some(),
+                "leaf {index} must be served by the stat cache"
+            );
+        }
+
+        let map = b.stat_cache.lock();
+        assert_eq!(map.len(), 24, "every leaf must be cached");
+        let anchors: std::collections::HashSet<i32> = map
+            .values()
+            .map(|entry| entry.parent_fd.as_raw_fd())
+            .collect();
+        assert_eq!(
+            anchors.len(),
+            1,
+            "24 cached leaves under one directory must share ONE host dirfd, got {}",
+            anchors.len()
+        );
     }
 
     #[cfg(target_os = "macos")]
