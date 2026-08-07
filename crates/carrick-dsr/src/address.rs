@@ -494,6 +494,35 @@ fn map_inaccessible_span(
     }
 }
 
+/// Measurement escape hatch (ablation-ladder rung 2, docs/superpowers/specs/
+/// 2026-08-07-ablation-ladder-design.md): `CARRICK_NATIVE_FORCE_BIASED=1`
+/// skips the direct (identity) fast path so an image whose regions all sit
+/// above the hard page-zero end — i.e. one that would take
+/// `NativeAddressMode::Direct` — selects a biased-aperture layout instead.
+///
+/// Both modes are CORRECT (biased is the canonical ET_EXEC lane's mode); the
+/// knob exists so the biased aperture's whole cost family (anon scrub,
+/// aperture gate, alias windows, host-alias transactions) can be measured
+/// head-to-head on a PIE guest that is otherwise direct-addressed. Exact
+/// spelling `1` only; any other value (or unset) leaves selection unchanged.
+fn force_biased_layout() -> bool {
+    force_biased_layout_from(std::env::var_os("CARRICK_NATIVE_FORCE_BIASED").as_deref())
+}
+
+fn force_biased_layout_from(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+/// The direct-eligibility decision `select` applies: identity (direct)
+/// addressing requires every image region to clear the hard page-zero end,
+/// and the force-biased measurement knob vetoes it outright.
+fn selects_direct_layout(region_starts: impl IntoIterator<Item = u64>, force_biased: bool) -> bool {
+    !force_biased
+        && region_starts
+            .into_iter()
+            .all(|start| start >= NATIVE_DARWIN_HARD_PAGEZERO_END)
+}
+
 fn checked_guest_range(start: u64, length: u64) -> Result<Range<GuestVa>, NativeAddressError> {
     let end = start
         .checked_add(length)
@@ -545,11 +574,10 @@ impl NativeLayout {
         host_page_size: u64,
         reusable_owned_ranges: &[Range<HostVa>],
     ) -> Result<Self, NativeAddressError> {
-        if image
-            .regions()
-            .iter()
-            .all(|region| region.start >= NATIVE_DARWIN_HARD_PAGEZERO_END)
-        {
+        if selects_direct_layout(
+            image.regions().iter().map(|region| region.start),
+            force_biased_layout(),
+        ) {
             let candidate = CandidateLayout::for_image(
                 image,
                 layout,
@@ -968,6 +996,44 @@ mod tests {
             HostVa(start)..HostVa(start + TEST_PAGE_SIZE),
             HostVa(start + TEST_PAGE_SIZE)..HostVa(start + 2 * TEST_PAGE_SIZE),
         ]
+    }
+
+    #[test]
+    fn direct_layout_selection_requires_pagezero_clearance_and_no_forced_bias() {
+        use super::{NATIVE_DARWIN_HARD_PAGEZERO_END, selects_direct_layout};
+        // A PIE-shaped image (every region above the hard page-zero end) is
+        // direct-eligible on the default path.
+        assert!(selects_direct_layout(
+            [
+                NATIVE_DARWIN_HARD_PAGEZERO_END,
+                0x4_0000_0000,
+                0x7_0000_0000
+            ],
+            false
+        ));
+        // One low region (an ET_EXEC image linked at 0x400000) forces bias.
+        assert!(!selects_direct_layout([0x400000, 0x4_0000_0000], false));
+        // The rung-2 measurement knob vetoes the direct fast path even for a
+        // fully direct-eligible image.
+        assert!(!selects_direct_layout(
+            [NATIVE_DARWIN_HARD_PAGEZERO_END, 0x4_0000_0000],
+            true
+        ));
+        // An empty region set is vacuously direct-eligible (matches the
+        // pre-knob `Iterator::all` behavior).
+        assert!(selects_direct_layout([], false));
+    }
+
+    #[test]
+    fn force_biased_layout_accepts_only_the_exact_opt_in_spelling() {
+        use super::force_biased_layout_from;
+        use std::ffi::OsStr;
+        assert!(force_biased_layout_from(Some(OsStr::new("1"))));
+        assert!(!force_biased_layout_from(None));
+        assert!(!force_biased_layout_from(Some(OsStr::new("0"))));
+        assert!(!force_biased_layout_from(Some(OsStr::new(""))));
+        assert!(!force_biased_layout_from(Some(OsStr::new("true"))));
+        assert!(!force_biased_layout_from(Some(OsStr::new("1 "))));
     }
 
     #[test]
