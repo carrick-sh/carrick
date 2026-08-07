@@ -2846,53 +2846,72 @@ mod tests {
         let mut noncanonical = first.clone();
         noncanonical.insert(noncanonical.len() - 1, b' ');
         assert!(parse_comparison_v1(&noncanonical).is_err());
+    }
 
-        let mut mutations = Vec::<(&str, JitShapeComparisonV1)>::new();
-        let mut changed = report.clone();
-        changed.schema = "carrick.jit-shape-comparison.v0".into();
-        mutations.push(("schema", changed));
-        let mut changed = report.clone();
-        changed.a_sha256 = "0".into();
-        mutations.push(("input hash", changed));
-        let mut changed = report.clone();
-        changed.determinants.b_raw_trace_sha256 = changed.determinants.a_raw_trace_sha256.clone();
-        mutations.push(("duplicate capture", changed));
-        let mut changed = report.clone();
-        changed.determinants.b_census_identity.host_arch = "x86_64".into();
-        mutations.push(("non-AArch64 census identity", changed));
-        let mut changed = report.clone();
-        changed.family_rows.pop();
-        mutations.push(("missing family", changed));
-        let mut changed = report.clone();
-        changed.word_rows.push(changed.word_rows[0].clone());
-        mutations.push(("duplicate word", changed));
-        let mut changed = report.clone();
-        changed.context_rows.reverse();
-        mutations.push(("context order", changed));
-        let mut changed = report.clone();
-        let pair = changed
-            .context_rows
-            .iter_mut()
-            .find_map(|row| match &mut row.key {
-                ComparisonKey::Context {
-                    second: Some(second),
-                    ..
-                } => Some(second),
-                _ => None,
-            })
-            .expect("comparison fixture contains a pair context");
-        pair.physical_register = 2;
-        mutations.push(("compound context", changed));
-        let mut changed = report.clone();
-        changed.family_rows[0].a.share_of_all_cpu.numerator += 1;
-        mutations.push(("share", changed));
-        let mut changed = report.clone();
-        changed.word_rows[0].absolute_all_cpu_drift.numerator += 1;
-        mutations.push(("drift", changed));
-        let mut changed = report.clone();
-        changed.mechanical_crossings.pop();
-        mutations.push(("crossing", changed));
-        for (name, changed) in mutations {
+    /// Every hand-edit a published comparison must refuse.
+    ///
+    /// Split from the canonical-serialization test above rather than sharing
+    /// its body: a debug build gives each `let mut changed = report.clone()` a
+    /// live 1.5 KB slot for the rest of the function, and libtest's ~2 MiB
+    /// per-test thread stack left the combined function with only a few KB of
+    /// headroom -- so an unrelated change elsewhere in the crate could (and
+    /// did) tip it into a stack overflow. Mutating and validating ONE report at
+    /// a time keeps the frame bounded; the assertions are unchanged.
+    #[test]
+    fn jit_shape_comparison_v1_refuses_every_hand_edit() {
+        let (a, b) = comparison_censuses();
+        let report = compare_reports(&a, &b).expect("build strict comparison report");
+        type Edit = fn(&mut JitShapeComparisonV1);
+        let mutations: &[(&str, Edit)] = &[
+            ("schema", |changed| {
+                changed.schema = "carrick.jit-shape-comparison.v0".into();
+            }),
+            ("input hash", |changed| {
+                changed.a_sha256 = "0".into();
+            }),
+            ("duplicate capture", |changed| {
+                changed.determinants.b_raw_trace_sha256 =
+                    changed.determinants.a_raw_trace_sha256.clone();
+            }),
+            ("non-AArch64 census identity", |changed| {
+                changed.determinants.b_census_identity.host_arch = "x86_64".into();
+            }),
+            ("missing family", |changed| {
+                changed.family_rows.pop();
+            }),
+            ("duplicate word", |changed| {
+                changed.word_rows.push(changed.word_rows[0].clone());
+            }),
+            ("context order", |changed| {
+                changed.context_rows.reverse();
+            }),
+            ("compound context", |changed| {
+                let pair = changed
+                    .context_rows
+                    .iter_mut()
+                    .find_map(|row| match &mut row.key {
+                        ComparisonKey::Context {
+                            second: Some(second),
+                            ..
+                        } => Some(second),
+                        _ => None,
+                    })
+                    .expect("comparison fixture contains a pair context");
+                pair.physical_register = 2;
+            }),
+            ("share", |changed| {
+                changed.family_rows[0].a.share_of_all_cpu.numerator += 1;
+            }),
+            ("drift", |changed| {
+                changed.word_rows[0].absolute_all_cpu_drift.numerator += 1;
+            }),
+            ("crossing", |changed| {
+                changed.mechanical_crossings.pop();
+            }),
+        ];
+        for (name, mutate) in mutations {
+            let mut changed = report.clone();
+            mutate(&mut changed);
             assert!(changed.validate().is_err(), "accepted {name} mutation");
         }
     }
