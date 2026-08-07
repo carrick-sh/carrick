@@ -31,6 +31,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use carrick_runtime::linux_abi::CanonicalNr;
 use sha2::{Digest, Sha256};
 
 use crate::trace_profile::{AMPLIFICATION_RAW_SCHEMA, ProfileCaptureStatus};
@@ -111,8 +112,11 @@ pub(crate) enum GuestSlot {
     /// cost, but NOT amplification of any guest op — it must never enter a
     /// per-op ratio, which is why it is a distinct variant and not a number.
     CarrickOnly,
-    /// A canonical AArch64 Linux syscall number.
-    Guest(u64),
+    /// A canonical AArch64 Linux syscall number. Typed on decode rather than
+    /// downstream: the analyzer keys ordered maps on this and resolves it
+    /// through `carrick_abi::syscall`, and a bare `u64` crossing that boundary
+    /// is the shape AGENTS.md's typed-domain rule exists to stop.
+    Guest(CanonicalNr),
 }
 
 impl GuestSlot {
@@ -122,7 +126,7 @@ impl GuestSlot {
                 "AMP1 guest_slot 0 is unreachable by construction (1 is carrick-only, a guest op is nr+2); the stream's slot encoding drifted"
             ),
             1 => Ok(Self::CarrickOnly),
-            other => Ok(Self::Guest(other - 2)),
+            other => Ok(Self::Guest(CanonicalNr(other - 2))),
         }
     }
 }
@@ -130,73 +134,37 @@ impl GuestSlot {
 /// One admissible AMP1 capture.
 ///
 /// Every field is exactly what the stream carried; nothing here is derived.
-/// The capture path reads a few of them for its acceptance receipt; the rest
-/// carry `#[allow(dead_code)]` INDIVIDUALLY, so the attribute names exactly
-/// what the typed ledger analyzer still has to consume and a genuinely dead
-/// field added later is not hidden by a struct-wide allow.
+/// Task 1 shipped this type with per-field `#[allow(dead_code)]` naming what
+/// the typed ledger analyzer still had to consume; `debug_amplification.rs`
+/// now consumes every one of them, so the attributes are gone and a field that
+/// goes dead in future is a build warning again.
 #[derive(Clone, Debug)]
 pub(crate) struct Amp1Capture {
-    /// Consumed by the typed ledger analyzer.
-    #[allow(dead_code)]
     pub(crate) os_build: String,
-    /// Consumed by the typed ledger analyzer.
-    #[allow(dead_code)]
     pub(crate) program_sha256: String,
-    /// Consumed by the typed ledger analyzer.
-    #[allow(dead_code)]
     pub(crate) birth_qualification_sha256: String,
-    /// Consumed by the typed ledger analyzer.
-    #[allow(dead_code)]
     pub(crate) terminal_qualification_sha256: String,
     pub(crate) joins: String,
-    /// Consumed by the typed ledger analyzer.
-    #[allow(dead_code)]
     pub(crate) terminal_calls: BTreeSet<(String, String, String)>,
     pub(crate) totals: BTreeMap<String, u64>,
     pub(crate) fault_totals: BTreeMap<String, u64>,
-    /// Consumed by the typed ledger analyzer.
-    #[allow(dead_code)]
     pub(crate) guest_syscalls: BTreeMap<GuestSlot, u64>,
-    /// Consumed by the typed ledger analyzer.
-    #[allow(dead_code)]
     pub(crate) host_syscalls: BTreeMap<(GuestSlot, String), u64>,
-    /// Consumed by the typed ledger analyzer.
-    #[allow(dead_code)]
     pub(crate) host_syscall_cpu_ns: BTreeMap<(GuestSlot, String), u64>,
-    /// Consumed by the typed ledger analyzer.
-    #[allow(dead_code)]
     pub(crate) host_syscall_max_ns: BTreeMap<(GuestSlot, String), u64>,
-    /// Consumed by the typed ledger analyzer.
-    #[allow(dead_code)]
     pub(crate) host_syscall_returns: BTreeMap<String, u64>,
-    /// Consumed by the typed ledger analyzer.
-    #[allow(dead_code)]
     pub(crate) mach_traps: BTreeMap<(GuestSlot, String), u64>,
-    /// Consumed by the typed ledger analyzer.
-    #[allow(dead_code)]
     pub(crate) mach_trap_cpu_ns: BTreeMap<(GuestSlot, String), u64>,
-    /// Consumed by the typed ledger analyzer.
-    #[allow(dead_code)]
     pub(crate) mach_trap_returns: BTreeMap<String, u64>,
-    /// Consumed by the typed ledger analyzer.
-    #[allow(dead_code)]
     pub(crate) faults: BTreeMap<(GuestSlot, String), u64>,
     /// Expected service-window control flow, reported and never refused.
-    #[allow(dead_code)]
     pub(crate) window_events: BTreeMap<String, u64>,
-    /// Consumed by the typed ledger analyzer.
-    #[allow(dead_code)]
     pub(crate) drops: BTreeMap<String, u64>,
-    /// Consumed by the typed ledger analyzer.
-    #[allow(dead_code)]
     pub(crate) bound_limit_s: u64,
-    /// Consumed by the typed ledger analyzer.
-    #[allow(dead_code)]
     pub(crate) target_exit_reason: i64,
     /// Traced elapsed nanoseconds. DIAGNOSTIC METADATA ONLY: four probe
     /// families in one program perturb wall by an expected 2–4x, so counts and
     /// same-instrument ratios are citable and wall never is.
-    #[allow(dead_code)]
     pub(crate) elapsed_ns: u64,
 }
 
@@ -212,6 +180,26 @@ pub(crate) fn is_amp1_stream(contents: &str) -> bool {
         .map(str::trim)
         .find(|line| !line.is_empty())
         .is_some_and(|line| line.starts_with("AMP1|header|"))
+}
+
+/// Re-validate a stream that is being read back from disk, LONG after the
+/// capture that produced it.
+///
+/// The distinction from [`validate_amp1_path`] is the one thing a caller must
+/// not get wrong, so it is a separate name rather than a defaulted argument.
+/// libdtrace's principal / aggregation / dynamic / rinse / dirty drop counters
+/// are not readable from D and are not in the stream (see the D header's fact
+/// 10): they exist only in the live `DTraceRunReport`, which is why
+/// `carrick trace --profile native-amplification` enforces them AT CAPTURE and
+/// exits non-zero on any nonzero counter. Passing a zeroed
+/// [`ProfileCaptureStatus`] here is therefore not an assertion that libdtrace
+/// dropped nothing — it is the neutral element for counters this file cannot
+/// carry, and the analyzer records where the check lives instead of implying it
+/// re-ran it. Everything the STREAM owns — truncation, the program digest, the
+/// program's own drop counters, the required sections, the guest denominator —
+/// is re-checked here in full.
+pub(crate) fn validate_archived_amp1_path(path: &Path) -> Result<Amp1Capture> {
+    validate_amp1_path(path, ProfileCaptureStatus::default())
 }
 
 pub(crate) fn validate_amp1_path(
@@ -747,8 +735,14 @@ mod tests {
         assert_eq!(GuestSlot::decode(1).unwrap(), GuestSlot::CarrickOnly);
         // Canonical number 0 (`io_setup`) round-trips, which is the whole
         // reason the encoding is biased by two rather than by one.
-        assert_eq!(GuestSlot::decode(2).unwrap(), GuestSlot::Guest(0));
-        assert_eq!(GuestSlot::decode(58).unwrap(), GuestSlot::Guest(56));
+        assert_eq!(
+            GuestSlot::decode(2).unwrap(),
+            GuestSlot::Guest(CanonicalNr(0))
+        );
+        assert_eq!(
+            GuestSlot::decode(58).unwrap(),
+            GuestSlot::Guest(CanonicalNr(56))
+        );
         assert!(
             format!("{:#}", GuestSlot::decode(0).unwrap_err()).contains("slot encoding drifted")
         );
@@ -806,7 +800,10 @@ mod tests {
         assert_eq!(capture.os_build, "27A5295i");
         assert_eq!(capture.joins, DECLARED_JOINS);
         assert_eq!(capture.terminal_calls.len(), 2);
-        assert_eq!(capture.guest_syscalls[&GuestSlot::Guest(56)], 4);
+        assert_eq!(
+            capture.guest_syscalls[&GuestSlot::Guest(CanonicalNr(56))],
+            4
+        );
         assert_eq!(
             capture.host_syscalls[&(GuestSlot::CarrickOnly, "kdebug_trace64".to_owned())],
             5

@@ -2749,7 +2749,15 @@ pub const LINUX_FD_CLOEXEC: u64 = 1;
 /// Distinct from [`NativeNr`]: the two were adjacent bare u64 fields, so a
 /// constructor swap compiled clean and mis-routed dispatch/seccomp — the same
 /// silent class as the historical x86 uname(63)-as-read(63) collision.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
+///
+/// `Ord` is derived so a canonical number can key an ordered map WITHOUT being
+/// unwrapped to a bare `u64` first — the amplification ledger orders its rows by
+/// guest op, and re-raw-ing the number to sort it is exactly the boundary
+/// crossing this type exists to prevent. The ordering is the table's own: the
+/// aarch64 table is kept sorted by number.
+#[derive(
+    Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, serde::Serialize, serde::Deserialize,
+)]
 pub struct CanonicalNr(pub u64);
 
 impl CanonicalNr {

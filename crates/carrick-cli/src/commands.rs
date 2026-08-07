@@ -1376,6 +1376,12 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     qualification_share_of_total,
                 },
             )?,
+            // Parses one authenticated text stream, so it is available wherever
+            // the binary is even though only a Darwin/AArch64 host can capture
+            // one.
+            DebugCommand::AmplificationLedger { trace, output } => {
+                crate::debug_amplification::run_amplification_ledger(&trace, output.as_deref())?
+            }
             DebugCommand::ExecStampCensus { input, workload_ns } => {
                 crate::debug_exec_stamps::run_exec_stamp_census(&input, workload_ns)?
             }

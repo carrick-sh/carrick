@@ -197,7 +197,6 @@ dtrace:::BEGIN
 	bound_limit_s = (uint64_t)600;
 	timed_out = 0;
 	target_exit_reason = 0;
-	probe_errors = 0;
 
 	/* Fix retained dynamic-array values at their intended widths. */
 	tracked[(pid_t)0] = 0;

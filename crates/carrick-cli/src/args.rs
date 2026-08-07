@@ -974,6 +974,22 @@ pub(crate) enum DebugCommand {
         #[arg(long = "qualification-share-of-total", default_value_t = 0.10)]
         qualification_share_of_total: f64,
     },
+    /// Turn one authenticated `AMP1` capture into the typed Darwin kernel
+    /// amplification ledger: host calls, host kernel CPU-ns, mach traps and
+    /// faults per guest operation, with `carrick-only` kept out of every ratio
+    /// and libdtrace's own `kdebug_trace*` subtracted into its own sub-bucket.
+    /// Per-op sums must equal the capture's independent totals or the command
+    /// fails by name — a partial census never yields a plausible ledger.
+    AmplificationLedger {
+        /// Complete `AMP1` stream from `carrick trace --profile
+        /// native-amplification --trace-out`. A `--script` capture cannot
+        /// authenticate itself and is refused.
+        trace: PathBuf,
+        /// Publish the deterministic ledger without overwriting an artifact.
+        /// Omit to write the same bytes to stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Parse a complete `CARRICK_EXEC_STAMPS` v2 export, validate every
     /// fork/exec/exit/reap relationship, and print CPU/wall attribution JSON.
     ExecStampCensus {

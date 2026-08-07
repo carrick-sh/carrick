@@ -139,6 +139,7 @@ mod debug;
 // The census modules only parse text files the native lane wrote, so — like
 // `debug_layout` and unlike `debug` — they are declared on every platform.
 mod debug_alloc_owner;
+mod debug_amplification;
 mod debug_census;
 mod debug_exec_stamps;
 mod debug_jit_shape;
