@@ -236,6 +236,15 @@ pub(crate) fn is_amp1_stream(contents: &str) -> bool {
 /// consumer's drop handler. Writing them into the stream is what makes an
 /// archived raw carry its own drop verdict instead of leaving it in a live
 /// `DTraceRunReport` that nobody can consult again.
+///
+/// **Scope, stated so nobody over-reads it: the in-band record defends against
+/// accidental reuse of a dropped capture, not against a forged raw.** It is
+/// plain text with no signature over it, so a hand-appended
+/// `…|principal=0|…` line would be accepted exactly as a genuine one is. That
+/// is the right trade — the failure this closes is the ACCIDENTAL one the plan
+/// named, where a raw left behind by a failed capture is picked up later and
+/// read as clean — but it means a ledger's real drop evidence is **the
+/// capture command's own zero exit**, not the archived line alone.
 pub(crate) fn consumer_drops_record(status: ProfileCaptureStatus) -> String {
     format!(
         "{AMP1_PREFIX}|consumer-drops|principal={}|aggregation={}|dynamic={}|dynamic_rinse={}|dynamic_dirty={}|other={}|interrupted={}",

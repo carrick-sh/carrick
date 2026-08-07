@@ -129,6 +129,11 @@ Three properties are worth knowing before reading a number:
   so the consumer-side counters are written in-band and any nonzero one, or a
   missing record, refuses the capture. `CARRICK_AMP1_CONSUMER_DROPS=0` skips
   writing the record for bisection only; the resulting stream is refused.
+  Note the scope: the in-band record defends against accidental reuse of a
+  dropped capture, not against a forged raw — it carries no signature, so a
+  hand-appended `…|principal=0|…` line would be accepted. A ledger's real drop
+  evidence is the capture command's own zero-drop exit, not the archived line
+  alone.
 
 The driver for a paired arm is
 [`scripts/perf/amplification-capture.sh`](../scripts/perf/amplification-capture.sh)

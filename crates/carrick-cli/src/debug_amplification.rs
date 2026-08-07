@@ -1934,6 +1934,14 @@ fn lock_determinants(
     a: &AmplificationLedgerV1,
     b: &AmplificationLedgerV1,
 ) -> Result<ComparisonDeterminants> {
+    // The first two are UNREACHABLE from `build_comparison`, and are kept as
+    // structural guards rather than as behaviour anyone can test: both inputs
+    // arrive through `parse_ledger_v1`, whose `validate` already refuses a
+    // ledger whose `schema` is not `LEDGER_SCHEMA` or whose `raw_schema` is not
+    // `AMPLIFICATION_RAW_SCHEMA`, so two parsed ledgers cannot disagree on
+    // either. Do not add a red test for them — there is no stream that reaches
+    // here with a crossing, and a test that cannot fail is worse than none.
+    // Every determinant BELOW this pair is reachable and has one.
     require_same(&a.schema, &b.schema, "ledger schema")?;
     require_same(
         &a.authority.raw_schema,
@@ -3016,6 +3024,69 @@ mod tests {
             format!("{:#}", compare(&baseline, &other_ops).unwrap_err())
                 .contains("guest operation set")
         );
+    }
+
+    /// A strict SUPERSET is the case a row-wise comparator is most likely to
+    /// get quietly wrong, so it gets its own test rather than riding on the
+    /// disjoint-set case above.
+    ///
+    /// The refusal is by construction — `lock_determinants` compares the two
+    /// op vectors in full BEFORE `compare_rows` zips them — but "by
+    /// construction" is exactly the claim that decays: a later editor who moves
+    /// the check after the zip, or replaces the equality with a containment
+    /// test, would silently INTERSECT the two censuses. That reads as a clean
+    /// comparison of the rows they share while dropping the operation one arm
+    /// measured and the other did not, which on this instrument is how a lever
+    /// that removed a guest op entirely would look like a no-op.
+    #[test]
+    fn amplification_comparison_refuses_a_strict_superset_rather_than_intersecting() {
+        let baseline = ledger();
+        // Guest op 64 (`write`) gains a service-window entry and no host work,
+        // so B stays internally closed while measuring one operation MORE than
+        // A: a strict superset, not a disjoint set.
+        let superset = ledger_from(
+            &stream()
+                .replacen(
+                    "AMP1|guest_slot=224|count=2",
+                    "AMP1|guest_slot=224|count=2\nAMP1|guest_slot=66|count=1",
+                    1,
+                )
+                .replacen(
+                    "AMP1|metric=guest-syscall-total|count=6",
+                    "AMP1|metric=guest-syscall-total|count=7",
+                    1,
+                ),
+        )
+        .expect("a census whose op set strictly contains the baseline's");
+
+        let baseline_ops: Vec<&str> = baseline
+            .ledger
+            .iter()
+            .map(|row| row.guest_op.name())
+            .collect();
+        let superset_ops: Vec<&str> = superset
+            .ledger
+            .iter()
+            .map(|row| row.guest_op.name())
+            .collect();
+        assert!(
+            superset_ops.len() == baseline_ops.len() + 1
+                && baseline_ops.iter().all(|op| superset_ops.contains(op)),
+            "the fixture must be a STRICT superset: {baseline_ops:?} vs {superset_ops:?}"
+        );
+
+        // Refused in both directions: neither the extra row nor the missing one
+        // may be quietly dropped to make the two sides line up.
+        for (a, b) in [(&baseline, &superset), (&superset, &baseline)] {
+            let message = format!(
+                "{:#}",
+                compare(a, b).expect_err("a superset op set must be refused, not intersected")
+            );
+            assert!(
+                message.contains("guest operation set") && message.contains("write"),
+                "unnamed superset refusal: {message}"
+            );
+        }
     }
 
     #[test]

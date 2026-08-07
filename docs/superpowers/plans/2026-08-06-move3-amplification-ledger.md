@@ -795,9 +795,18 @@ image digest.
   zero and the drop section present** (§1d), closure exact, **every declared
   join's totals non-zero** (§1d: an unarmed join is silent under `ZDEFS` and
   closes at `0 == 0`), `carrick-only` decomposed, instrument calls named and
-  excluded. Because the in-band consumer-drop record is Task 3's, the capture
-  command's **zero exit status** is itself a gate condition here: a raw file left
-  behind by a failed capture passes every offline check.
+  excluded. Task 3's in-band `AMP1|consumer-drops|…` record LANDED, so an
+  archived raw now carries its own drop verdict and a raw from a failed capture
+  no longer passes the offline checks. **The capture command's zero exit status
+  remains a gate condition anyway**, and the reason is a scope limit worth
+  stating where it will be read: the in-band record defends against accidental
+  reuse of a dropped capture, not against a forged raw — it is plain text with
+  no signature over it, so a hand-appended `…|principal=0|…` line would be
+  accepted. Task 4's evidence is the capture's own zero-drop exit, not the
+  archived line alone.
+  The capture must also be **digest-pinned** (`image@sha256:…`) with an explicit
+  command-line `--exec-backend native`: Task 3 made the AMP1 header name its
+  fixture, and both are launch-time refusals now.
   Single capture is acceptable for **counts** on a deterministic fixture (the fs
   entry's precedent, reproducing a prior census to within 2 guest calls);
   **CPU-ns needs n ≥ 3** and its variance reported, because unlike counts it is
