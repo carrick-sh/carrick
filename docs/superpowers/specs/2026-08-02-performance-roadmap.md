@@ -6,6 +6,15 @@ The §5 appendix (rejected alternatives, DSR fallback playbook) and the tier-D
 phase status records below remain authoritative; the workload-shape framing in
 §0 stands.
 
+> **2026-08-06:** the live-translation-arena line (the category-collapse
+> spec's Move 1, the container-lifetime shared-translation successor to the
+> §0 store history) is **closed negative**: policy-ON lost the cold go build
+> ~36x and the 20-exec micro ~16%, the cause is structural (immutable shared
+> code cannot be direct-linked; publication-window binding refuted), and the
+> runtime was deleted in `1cb06de6`. The persistent unit store remains the
+> shipped translation-sharing mechanism. Add the arena to the §5 rejected
+> list in spirit: any successor must price the gateway round-trip tax first.
+
 ## 0. Where we actually are
 
 Measured 2026-08-02, all in-guest wall with container lifecycle excluded,

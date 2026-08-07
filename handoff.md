@@ -1,19 +1,126 @@
 # Native-lane performance: state of play
 
-**Date:** 2026-08-05 · **Integration target:** local `main` · **Latest
-decision:** the source-group V2 live-translation arena substrate is complete at
-`dc8ad47a`, independently review-clean, and still runtime-disabled. The next
-session starts at Task 6C2 ownership/exec transport; runtime-on correctness,
-DTrace, and ABBA remain forbidden until Tasks 6D/6E/7 close ·
+**Date:** 2026-08-06 · **Integration target:** local `main` · **Latest
+decision:** the live-translation-arena campaign is **closed negative**. The
+complete runtime (Tasks 2-9) was deleted in `1cb06de6` per the plan's Task-10
+failure arm; the shipped default is unchanged and reprofiled below ·
 **Scope:** Darwin/aarch64 native backend (`--exec-backend native`, the shipped
 default). VMM is explicitly NOT the target: one process per VM against a
 ~127-VM macOS ceiling makes it a dead end for build-shaped workloads.
 
-## 2026-08-05 wrap-up — read this first
+## 2026-08-06 wrap-up — read this first
 
-This section supersedes the older **What's next** and **Branch state at
-handoff** sections below. Those sections remain as campaign history, not live
-instructions.
+This section supersedes the 2026-08-05 wrap-up below and the older **What's
+next** / **Branch state at handoff** sections. All of those remain as campaign
+history, not live instructions.
+
+### The campaign conclusion, measured results first
+
+The live translation arena was built to completion (Tasks 2-9 all landed,
+independently review-clean: protocol, Darwin substrate, fd transport, READY
+lookup and winner publication, target authority, typed metrics, revocation,
+counters and diagnostics), qualified correct end to end — and then lost the
+measurements it existed for:
+
+- **Cold go build, quiet box:** policy-ON ~**36x** policy-OFF wall (8 ON runs
+  364-368 s vs 3 OFF runs 9-11 s; ~43x at the prebind tip within a 38-48x
+  spread). Attribution: live blocks are never direct-linked, so the build
+  takes **790.2x more gateway round trips = 87.7%** of the 1,625 s excess
+  CPU. The sharing itself worked — 98%+ READY hit rate, 6x fewer private
+  translations — the cost is structural: READY-immutable shared code cannot
+  be link-patched.
+  ([`2026-08-06-live-arena-36x-attribution.md`](docs/perf-results/2026-08-06-live-arena-36x-attribution.md))
+- **Publication-window prebind, implemented and refuted** (`e9b12836` →
+  reverted `9922cb26`): 23.7% of candidate links bind, round trips fall
+  19.8%, wall unchanged. The residue split (`c1600799`) shows the remainder
+  is 68.4% forward edges — unreachable by ANY publication-window binding
+  under the READY-immutability contract. This is the design's load-bearing
+  refutation, not an implementation miss.
+- **20-exec micro, the arena's friendliest shape:** policy-ON ~**16% slower**
+  (OFF 1,373.5 ms vs ON 1,593.9 ms, 3+3 ABBA). The persistent unit store
+  already absorbs the startup translation set (translations only -20%
+  despite ~1.4k READY hits), so the arena's original prize was already
+  banked and the round-trip tax lands immediately.
+
+Verdict: the arena loses on both measured shapes, the cause is structural,
+and the prize was pre-claimed. Deleted per the house rule in `1cb06de6`
+(`revert(native): remove the live translation arena runtime`);
+`CARRICK_DSR_LIVE_ARENA` now hard-errors by name (`7318f583`).
+
+### What survives the delete
+
+- **The hold-and-wait deadlock fix** (`8d5b3a19` + `bcd2062e`): alias installs
+  consumed under the dispatch-held exclusive memory guard. The bug predates
+  the arena (`d2c54e5c`) and is guest-reachable on the shipped default; the
+  residual same-class read-arm escalation audit is chip `task_ca1e49ea`.
+- **The 6E executable-range-catalog publication** through
+  `enter_translated_with_executable_authority` (sole node = the private cache
+  range; equivalence-preserving and slightly cheaper than the null-pointer
+  arm), defended by the oracle test pair.
+- **Trace instrument improvements** (`08531c73` + `d774a3ff`): DSRPROF2
+  capture bounds with fail-closed verification, sudo `--store` forwarding,
+  and the carrick-cli `trace_profile` suite now genuinely gated in
+  `just test-integration`.
+- **Host test fixes** (`0fcaade7` fd-leak scoping, `b5d0ff2b` ulock race).
+- **All design docs and evidence ledgers** — the two arena design docs and
+  the plan carry dated CLOSED banners; the category-collapse spec's Move-1
+  §6 invalidation condition is annotated FIRED, Move 2 re-costed against the
+  persistent store, Move 3 promoted.
+
+### The new official scoreboard
+
+The post-delete serialized five-sample Carrick-then-Docker refresh
+([`2026-08-06-post-arena-default-refresh.md`](docs/perf-results/2026-08-06-post-arena-default-refresh.md)):
+
+| metric | Carrick | Docker | ratio |
+|---|---:|---:|---:|
+| cold `go build` workload wall | 8,676 ms | 799 ms | **10.8586x** |
+| cold `go build` process elapsed | 9,448 ms | 964 ms | **9.8008x** |
+
+Prior official: 8,254 ms / 811 ms = 10.1776x (2026-08-04). Carrick is
++5.11% wall and the ratio +6.69% against that run; the 3-arm byte-identical
+smoke pins the delete itself as computation-neutral on the default arm, so
+the drift is tip drift (~40 commits including the deadlock fix and the 6E
+catalog publication) plus host state, and this single run cannot decompose
+them — re-attribute on a quiet box before pricing any redesign against it.
+At the new Docker denominator: 8x needs 26.33% wall removal, 5x needs
+53.95%, 3x needs 72.37%, the 2x product bar needs 81.58%.
+
+### Confidence after the campaign (projections, clearly labeled)
+
+The remaining levers are Move 3 (kernel amplification ledger, now front of
+the queue), the re-costed Move-2 codegen passes (the compute lane already
+went 10.9x → 3.8x under the steady-state codegen campaign), the fs-walk
+lanes (~20x → 3.8x on that shape), and the ~8.5 ms/exec Darwin exec floor.
+The translation category's 15-25% arena claim is dead; whatever the
+persistent store has not already taken from that category is not coming from
+sharing.
+
+- **8x cold build (~26% wall removal): ~75%.** Multiple named, partially
+  proven levers each plausibly worth several percent; no structural blocker.
+- **5x (~54% removal): ~45%.** Needs the kernel bucket to move, not just
+  user-side codegen; the amplification ledger has named entries but few
+  landed wins at this scale.
+- **3x (~72% removal): ~25%,** down from the 45% carried while the arena
+  was still projected to deliver its category. The category-collapse
+  arithmetic reached 3.2-3.9x only with all three moves hitting their upper
+  halves, and Move 1 is now dead.
+- **2x product bar (~82% removal): ~10%.** Requires essentially every
+  remaining bucket to approach its floor simultaneously.
+
+### Exact next steps
+
+1. **Move 3 first:** the Darwin kernel amplification ledger — instrument,
+   then entries in ledger order (guest `open`, `mmap(MAP_PRIVATE, fd)`
+   pread-materialization, exec's remaining full executable read).
+2. **Move 2 re-costed:** liveness-gated borrow save/restore priced against
+   the persistent store's replay economics, gated on the compute micro then
+   a build ABBA.
+3. Keep the two-gate discipline: any candidate that wins its mechanism must
+   still win its ABBA before it ships (the augmentation, optimistic-decode,
+   and now arena precedents).
+
+## 2026-08-05 wrap-up (campaign history — superseded above)
 
 Campaign strategy authority is now
 [`docs/superpowers/specs/2026-08-05-category-collapse-strategy-design.md`](docs/superpowers/specs/2026-08-05-category-collapse-strategy-design.md)

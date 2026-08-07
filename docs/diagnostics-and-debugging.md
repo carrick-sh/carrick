@@ -67,24 +67,15 @@ written as root: `cat`/`grep` it without sudo, `rm` may need sudo.
 ### Built-in DSR profiles
 
 For performance attribution on the Darwin-native dynamic syscall rewriter, use
-`--profile dsr`, `--profile dsr-indirect`, `--profile dsr-fork`, or
-`--profile dsr-live-arena` with
+`--profile dsr`, `--profile dsr-indirect`, or `--profile dsr-fork` with
 `--summary-jsonl FILE`. The broad profile measures prepare/run/resolve/translate
 and dispatcher phases, the indirect profile attributes resolver misses by
 guest source and target, and the fork profile measures child repair and exec
-lifecycle intervals. The live-arena profile records the container-lifetime
-shared translation arena's named outcomes (READY hit, winner publish, CAS loss,
-private fallback, validation refusal, stale-abort recovery) and the chunk
-revocations that throw published code away. It is an AUTHENTICATED program: the
-shipped `scripts/dtrace/dsr-live-arena.d` is a template whose BEGIN block
-carries a header placeholder, which the CLI replaces with the program's own
-SHA-256 before running it, and the parser refuses a stream that names a
-different program. It also refuses a ZERO-EVENT capture — the live lane is
-default-off, so a silent capture almost always means the run never set
-`CARRICK_DSR_LIVE_ARENA=compiler`, and reporting that as a clean empty summary
-would hide the mistake. DSR is the sole Darwin-native instruction-execution path,
-so native trace commands require no separate code-mode selection. `--profile`
-conflicts with a custom `--script`;
+lifecycle intervals. (A fourth profile, `dsr-live-arena`, existed only for the
+2026-08-05..06 live-translation-arena campaign and was deleted with that
+mechanism in `1cb06de6`.) DSR is the sole Darwin-native instruction-execution
+path, so native trace commands require no separate code-mode selection.
+`--profile` conflicts with a custom `--script`;
 `--summary-jsonl` requires a profile. Use a separate `--trace-out` path when the
 raw `DSRPROF1` stream should be retained.
 
@@ -318,22 +309,13 @@ ring that ends at `LISTEN` and no `FORK`). `kq`/`hfd` values ≥ 16384 are
 relocated carrick-internal fds (an epoll instance's kqueue, eventfd/pidfd/wake-
 pipe backings): a guest blocking on one is parked on an internal object.
 
-The plugin (`scripts/carrick_lldb.py`) registers a `carrick` command with these
-subcommands: **`eventring`** and **`xlat-live-arena [<cache-pc>]`** (both need
-only a target + process/core), and the guest-mapping helpers **`where`**,
-**`mappings`**, **`gva <addr>`**, **`decode-esr <hex>`**, **`info`**,
-**`load-state <path>`**.
-
-`xlat-live-arena` decodes the always-on live translation arena export
-(`carrick_dsr_aarch64::translator::live_arena_export::LIVE_ARENA_EXPORT`): the
-process's live RX payload extent, the most recent installed READY records
-(guest start, cache entry, length, source page, generation, chunk), and the RX
-chunks this task revoked `PROT_NONE`. Passing a cache PC attributes it to the
-retained READY record that covers it and flags it when it falls inside a revoked
-chunk. Both tables are RINGS with true totals, so a reader always knows how many
-entries it is not seeing. The interface is EXPORT-ONLY: it reads memory, never
-writes it, and there is no importer — a debugger cannot publish into, repair, or
-revoke an arena through it.
+The plugin (`scripts/carrick_lldb.py`) registers a `carrick` command with the
+**`eventring`** subcommand (needs only a target + process/core) and the
+guest-mapping helpers **`where`**, **`mappings`**, **`gva <addr>`**,
+**`decode-esr <hex>`**, **`info`**, **`load-state <path>`**. (An
+`xlat-live-arena` subcommand existed only for the 2026-08-05..06
+live-translation-arena campaign and was deleted with that mechanism in
+`1cb06de6`.)
 
 > [!WARNING]
 > Cores must be `--style modified-memory` (or `full`), never `stack`. The ring is

@@ -106,6 +106,21 @@ compiler pass, one shared mapping) is judged as one candidate.
 
 ### Move 1 — finish the live arena; account it as a memory-system fix
 
+> **2026-08-06 — §6 invalidation condition FIRED, Move 1 closed negative.**
+> "The arena's runtime-on ABBA lands under ~10%" understated it: the arena
+> did not land under the gate, it lost outright — cold go build policy-ON
+> ~36x policy-OFF wall (790.2x more gateway round trips because READY-
+> immutable shared code cannot be direct-linked; prebind refuted at
+> `c1600799`/`9922cb26`), and the 20-exec micro ~16% slower because the
+> persistent unit store already absorbs the startup translation set. The
+> runtime was deleted in `1cb06de6`. Consequences per §6: **Move 3 promotes
+> to the front**, and **Move 2 must be re-costed against the persistent unit
+> store** (translate-once/attach-many economics now mean "priced by the
+> store's replay-into-private-JIT path", not by an arena that executes
+> shared code in place — the amortization argument survives only where
+> replay cost, not execution cost, dominates). Move 3 is unaffected. The
+> table and expectation accounting below are retained as history.
+
 The in-flight work and its sequencing are unchanged: Tasks 6C2 → 6D/6E/6F → 7
 per [`handoff.md`](../../../handoff.md); runtime-on correctness, DTrace, and
 ABBA evidence remain forbidden until Tasks 6D/6E/7 close.
@@ -134,6 +149,14 @@ in the handoff):
 - cold-build ABBA and the serialized shipped-default refresh both hold.
 
 ### Move 2 — AOT-quality translation, priced by the arena (the new bet)
+
+> **2026-08-06:** "priced by the arena" no longer holds — the arena is
+> deleted (see the Move-1 banner). Re-cost every pass below against the
+> persistent unit store's translate-once/replay-many economics before
+> starting it: store replay is per-process but cheap, so passes whose cost
+> is per-translation (liveness analysis, fallback playbook) largely keep
+> their amortization argument, while anything that assumed shared in-place
+> execution does not.
 
 Every codegen decision to date has been priced under JIT economics: 8.4 µs per
 block × 1.7 M blocks, paid by every process, so expensive passes were never
