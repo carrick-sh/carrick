@@ -368,6 +368,12 @@ impl Runtime {
                     Err(e) if is_entrypoint_not_executable(&e) => {
                         return Ok(entrypoint_not_executable_result());
                     }
+                    // A configuration-time refusal (a removed env knob) is
+                    // not an execution failure — pass it through unwrapped
+                    // so it surfaces labeled as what it is.
+                    Err(e @ RuntimeError::Configuration(_)) => {
+                        return Err(e);
+                    }
                     Err(e) => {
                         return Err(RuntimeError::FsBackend(anyhow::anyhow!(
                             "failed to run ELF from dispatcher: {}",
@@ -481,6 +487,12 @@ impl Runtime {
                     }
                     Err(e) if is_entrypoint_not_executable(&e) => {
                         return Ok(entrypoint_not_executable_result());
+                    }
+                    // A configuration-time refusal (a removed env knob) is
+                    // not an execution failure — pass it through unwrapped
+                    // so it surfaces labeled as what it is.
+                    Err(e @ RuntimeError::Configuration(_)) => {
+                        return Err(e);
                     }
                     Err(e) => {
                         return Err(RuntimeError::FsBackend(anyhow::anyhow!(

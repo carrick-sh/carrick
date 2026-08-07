@@ -37,6 +37,14 @@ pub enum RuntimeError {
     /// The HVF loops never construct this.
     #[error("unsupported in this backend: {0}")]
     Unsupported(String),
+    /// A run refused at configuration time — an environment knob that no
+    /// longer exists (e.g. the removed `CARRICK_DSR_LIVE_ARENA`), before any
+    /// guest work starts. Deliberately passed through UNWRAPPED by the
+    /// backend arms in `execute.rs`: surfacing it as "filesystem backend
+    /// error: failed to run ELF from dispatcher: …" mislabels an env-policy
+    /// refusal as an execution failure, and the label is the message.
+    #[error("configuration refused: {0}")]
+    Configuration(String),
 }
 
 /// The runtime-side edge of the native memory error seam: the native
