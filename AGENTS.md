@@ -439,13 +439,22 @@ concern — it is half the product.
   host-other at 63.2%/62.7% of sampled zfod (2026-08-03,
   [`docs/perf-results/2026-08-03-current-native-fault-ownership.md`](docs/perf-results/2026-08-03-current-native-fault-ownership.md)),
   re-confirmed at HEAD (63.26%/63.30%, the 2026-08-06 build-lane ledger —
-  which also places 36% of all zfod inside guest `mmap` service windows, the
-  eager `MAP_PRIVATE` materialization path). The narrow 2026-07-29 claims
+  which also places 36% of all zfod inside guest `mmap` service windows).
+  That in-window mass is 99.4% carrick's own **whole-range anonymous-reuse
+  scrub** memsetting the ops' biased host backing — 98% of it serving
+  hint-less `PROT_NONE` reserves that are provably zero already; it is NOT
+  the guest touching its memory and NOT the (long-refuted) eager
+  `MAP_PRIVATE` file materialization, whose build population is 18 calls /
+  3.8 MiB
+  ([`docs/perf-results/2026-08-07-build-lane-fault-partition.md`](docs/perf-results/2026-08-07-build-lane-fault-partition.md)).
+  The narrow 2026-07-29 claims
   survive (JIT first-touch 2.08% of zfod, inserted code 1.48%); that census's
   guest-dominates conclusion does NOT — it was superseded by the 2026-08-01
   audit and has been twice re-confirmed since. The levers are
   allocation-side — buffer reuse / `MADV_FREE_REUSABLE` for the repeated
-  ≥128 KiB buffers, file-backed guest `mmap` — as well as per-page cost.
+  ≥128 KiB buffers — plus the designed kernel-side `MAP_FIXED|MAP_ANON`
+  anonymous-reuse replacement for the scrub (the x86 identity backend's
+  existing template), as well as per-page cost.
 - **Use Go's runtime as a DUAL-PORT ORACLE for "what should this lower to on
   Darwin?"** Go implements the same allocator abstractions (`sysAlloc`,
   `sysReserve`, `sysMap`, `sysUnused`, `sysUsed`, `sysFault`, `sysFree`)
