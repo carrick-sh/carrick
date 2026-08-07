@@ -19,6 +19,11 @@ default = []
 # feature: cargo's feature unification turns the hooks on for runtime test
 # builds while production builds never see them.
 test-hooks = []
+# Ablation-ladder measurement builds (src/ablation.rs): compiles in the
+# CARRICK_ABLATE_* knobs, which delete subsystems' work to measure ceilings.
+# NEVER a default anywhere; an ablated binary is incorrect by construction.
+# See docs/superpowers/specs/2026-08-07-ablation-ladder-design.md.
+ablation = []
 
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }

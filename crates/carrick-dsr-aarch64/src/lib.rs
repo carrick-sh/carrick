@@ -18,6 +18,18 @@
 //! Darwin JIT, the assembled gateway, or the C trap shim, none of which link
 //! from this crate before the host-seam slice (M0.6) lands.
 
+#[cfg(feature = "ablation")]
+pub mod ablation {
+    //! This lane's ablation knobs (measurement builds only; see
+    //! `carrick_dsr::ablation`).
+
+    /// Rung 3: `CARRICK_ABLATE_ZEROING=1` makes `zero_backing` /
+    /// `zero_anonymous_reuse` claim success without doing anything, deleting
+    /// the zeroed-anon guarantee to ceiling its residual cost. Guest
+    /// correctness is forfeit by design.
+    pub static ZEROING: carrick_dsr::ablation::Ablation =
+        carrick_dsr::ablation::Ablation::new("CARRICK_ABLATE_ZEROING");
+}
 #[cfg(feature = "alloc-owner-census")]
 pub mod alloc_owner_census;
 pub mod alloc_owner_wire;

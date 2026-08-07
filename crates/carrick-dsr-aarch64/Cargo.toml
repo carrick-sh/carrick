@@ -18,6 +18,10 @@ alloc-owner-census = []
 # crate with the feature also lights up the shared hook state (see the note
 # in carrick-dsr/Cargo.toml).
 test-hooks = ["carrick-dsr/test-hooks"]
+# Ablation-ladder measurement builds: the rung-3 zeroing knob
+# (CARRICK_ABLATE_ZEROING, mapped_memory.rs). Never a default; see
+# carrick-dsr/Cargo.toml.
+ablation = ["carrick-dsr/ablation"]
 
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }

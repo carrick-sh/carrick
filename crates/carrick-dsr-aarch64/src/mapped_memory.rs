@@ -4203,6 +4203,13 @@ impl GuestMemory for NativeMappedMemory {
     ///     `write_exec_page_bytes` for the W^X metadata update that a raw
     ///     `memset` cannot perform.
     fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        // Ablation-ladder rung 3 (measurement builds only): claim success
+        // without zeroing. INCORRECT BY CONSTRUCTION — deletes the zeroed
+        // memory guarantee to ceiling its residual cost.
+        #[cfg(feature = "ablation")]
+        if crate::ablation::ZEROING.enabled() {
+            return Ok(());
+        }
         if len == 0 {
             return Ok(());
         }
@@ -4248,6 +4255,13 @@ impl GuestMemory for NativeMappedMemory {
         len: usize,
         sharing: MappingSharing,
     ) -> Result<(), MemoryError> {
+        // Ablation-ladder rung 3 (measurement builds only): neither remap nor
+        // memset — the reused range keeps its stale contents. INCORRECT BY
+        // CONSTRUCTION; see `zero_backing` above.
+        #[cfg(feature = "ablation")]
+        if crate::ablation::ZEROING.enabled() {
+            return Ok(());
+        }
         if zero_anonymous_remap_enabled() && self.replace_anonymous_reuse(address, len, sharing)? {
             return Ok(());
         }
