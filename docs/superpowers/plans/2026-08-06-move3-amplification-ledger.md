@@ -701,17 +701,20 @@ large, not dominant; no single-host-call concentration). Measured order:
 |---|---|---|---|
 | 1 | E1 `mmap(MAP_PRIVATE, fd)` eager materialization | 36.0% of all zfod inside guest `mmap` windows (553k, ≈ the ownership census's guest-owned mass — the destination-arena first touch) | confirmed |
 | 2 | E2 carrick ≥128 KiB allocation churn | host-other 63.3% confirmed; owner portfolio at HEAD: `publication-recovery` 52.1%, `publication-map` 14.1%, `block-assembler-transient` 10.6% of 30.2 GB requested | confirmed |
-| 3 | E5 **promoted** — build-lane fs family | 172.7k host calls ≈ 0.64 s ≈ **40% of guest-attributed kernel CPU**; open lane 19.68 → **8.69**; `mkdirat` 78x, `unlinkat` 63x | up from 5th |
+| 3 | E5 **promoted** — build-lane fs family | 174.7k host calls ≈ 0.64 s ≈ **40% of guest-attributed kernel CPU**; open lane 19.68 → **8.69**; `mkdirat` 78x, `unlinkat` 63x | up from 5th |
 | 4 | process/container lifecycle (absorbs E7) | 68 host `fork`s ≈ 5.6 ms each; `execve` 3.63 ms/op; `carrick-only` `clonefileat` 21 calls ≈ 0.31 s | new named family |
 | 5 | E6 park/wake | `psynch_*` ≈ 0.38 s = 13–14% of measured kernel CPU (same-instrument) | up slightly |
 | 6 | E4 alias-gate scope | unmeasured by AMP1; `swtch_pri` 462–505k/run recorded as context | unchanged: re-derive |
 | 7 | E3 decommit intent | guest `madvise` only **415–528/run**, window CPU ≈ noise — kernel-side case refuted on this lane; only the userspace memset share (invisible to AMP1) remains | **demoted from 3rd** |
 
 Also measured: whole-fixture host-per-guest **10.7x** (fs-walk was 2.05x);
-`rt_sigaction` 9.2x = 10.2% of ALL host syscalls (count problem, ~547 ns each);
-the legacy fs census is **unusable on the build lane** (truncated at 300 s,
-≥35x perturbation, starved fork child — AMP1's zero-copyin design is why the
-ledger instrument completes at 2.5–2.7x).
+**~1,108 host `close` per guest `execve`** (74,253 calls = 7.4% of ALL host
+syscalls, per-exec constant stable to 0.1 across arms — the largest single
+count lever in the ledger, source unexplained, named open question for
+Task 5/6); `rt_sigaction` 9.2x = 10.2% of ALL host syscalls (count problem,
+~547 ns each); the legacy fs census is **unusable on the build lane**
+(truncated at 300 s, ≥35x perturbation, starved fork child — AMP1's
+zero-copyin design is why the ledger instrument completes at 2.5–2.7x).
 
 ---
 
