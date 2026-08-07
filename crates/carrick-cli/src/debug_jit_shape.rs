@@ -2918,6 +2918,25 @@ mod tests {
 
     #[test]
     fn jit_shape_compare_publication_is_no_clobber_and_race_safe() {
+        // This body builds two censuses and two comparison reports in one
+        // frame, which `0fed371b`'s measurement puts within ~1% of libtest's
+        // ~2.1 MiB per-test stack — an unrelated addition anywhere in
+        // carrick-cli flips it into a fatal overflow (it did, twice). Until
+        // the underlying >1 MiB debug-build frames in the census builder and
+        // parser are reduced (chip: "Fix jit-shape tests' >1MiB stack
+        // frames"), run the body on a thread with an explicit, declared
+        // stack so the test asserts publication semantics rather than the
+        // frame margin.
+        std::thread::Builder::new()
+            .name("jit-shape-publication-test".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(jit_shape_compare_publication_body)
+            .expect("spawn bounded-stack test thread")
+            .join()
+            .expect("bounded-stack test body must not panic");
+    }
+
+    fn jit_shape_compare_publication_body() {
         let (a, b) = comparison_censuses();
         let report = compare_reports(&a, &b).unwrap();
         let reversed = compare_reports(&b, &a).unwrap();
