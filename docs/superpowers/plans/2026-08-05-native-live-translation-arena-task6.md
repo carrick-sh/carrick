@@ -1,8 +1,20 @@
 # Native live translation arena — Task 6 substrate and integration plan
 
-> **Status:** authoritative Task 6 execution split. This refines Task 6 in
-> `2026-08-05-native-live-translation-arena.md`; it does not narrow the
-> performance goal or permit runtime-on evidence before Task 7.
+> **CLOSED 2026-08-06 — negative, folded into the plan's Task-10 failure
+> arm.** This document was the authoritative Task 6 execution split of
+> `2026-08-05-native-live-translation-arena.md`. The runtime it specified
+> (Tasks 6A-6F) was completed and independently review-clean, but the plan's
+> Task-10 gate found it measured worse on both target shapes — cold go build
+> ~36x wall policy-ON, the 20-exec micro ~16% slower — because live blocks
+> can never be direct-linked under the READY-immutability contract and the
+> persistent unit store had already banked the startup prize this split
+> targeted. The runtime was deleted in `1cb06de6`
+> (`revert(native): remove the live translation arena runtime`). Evidence:
+> [`2026-08-06-live-arena-36x-attribution.md`](../../perf-results/2026-08-06-live-arena-36x-attribution.md).
+> Superseded by the 2026-08-06 wrap-up in
+> [`handoff.md`](../../../handoff.md). Historical content below is kept for
+> record; it does not narrow the performance goal or permit runtime-on
+> evidence before Task 7, since neither ever happened.
 
 **Goal:** make the completed portable protocol, Darwin Mach objects, exec
 transport, and prepared shared emitter one real cross-process READY path. Every
