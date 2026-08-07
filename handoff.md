@@ -30,6 +30,14 @@ measurements it existed for:
   translations — the cost is structural: READY-immutable shared code cannot
   be link-patched.
   ([`2026-08-06-live-arena-36x-attribution.md`](docs/perf-results/2026-08-06-live-arena-36x-attribution.md))
+  — note the join: the 1,625 s excess-CPU denominator comes from the
+  attribution doc's own traced capture pair (`C1ON`/`C1OFF`), whose matching
+  wall anchor (`A1ON`/`A2ON` 405/429 s vs `A1OFF`/`A2OFF` 8-9 s) reads
+  **49.3x**, not the ~36x quoted above from the untraced Series-B quiet-box
+  walls (364-368 s). Both figures are the same mechanism — the excess is
+  790.2x more gateway round trips — measured at different instrument loads;
+  tracing itself inflates the ON arm's wall further than it inflates OFF's,
+  so the traced multiple runs higher than the untraced one.
 - **Publication-window prebind, implemented and refuted** (`e9b12836` →
   reverted `9922cb26`): 23.7% of candidate links bind, round trips fall
   19.8%, wall unchanged. The residue split (`c1600799`) shows the remainder
@@ -53,6 +61,10 @@ and the prize was pre-claimed. Deleted per the house rule in `1cb06de6`
   consumed under the dispatch-held exclusive memory guard. The bug predates
   the arena (`d2c54e5c`) and is guest-reachable on the shipped default; the
   residual same-class read-arm escalation audit is chip `task_ca1e49ea`.
+- **Unrelated pre-existing native16k test-isolation gap:** filtered runs of
+  the native16k suite fail cases that pass when the full suite runs
+  unfiltered; tracked as chip `task_d230c035`, not caused by or blocking the
+  arena delete.
 - **The 6E executable-range-catalog publication** through
   `enter_translated_with_executable_authority` (sole node = the private cache
   range; equivalence-preserving and slightly cheaper than the null-pointer
