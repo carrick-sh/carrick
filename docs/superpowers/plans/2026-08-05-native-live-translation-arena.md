@@ -1,5 +1,21 @@
 # Native Live Translation Arena Implementation Plan
 
+> **CLOSED 2026-08-06 — Task 10 failure arm executed.** Tasks 2-9 landed and
+> were review-clean, but the Task-10 gate was a foregone conclusion: policy-ON
+> lost the cold go build by ~36x wall and the 20-exec micro by ~16%, the
+> structural cause (immutable shared code cannot be link-patched; forward-
+> dominated residue unreachable by publication-window binding) was empirically
+> pinned at `c1600799`/`9922cb26`, and the original exec-startup prize was
+> already delivered by the persistent unit store. The runtime was deleted in
+> `1cb06de6` (`revert(native): remove the live translation arena runtime`);
+> the deadlock fix (`8d5b3a19`+`bcd2062e`), the 6E catalog publication, the
+> trace-instrument improvements (`08531c73`+`d774a3ff`), and the host test
+> fixes survive. Evidence:
+> [`2026-08-06-live-arena-36x-attribution.md`](../../perf-results/2026-08-06-live-arena-36x-attribution.md),
+> [`2026-08-06-native-live-arena-compiler-qualification.md`](../../perf-results/2026-08-06-native-live-arena-compiler-qualification.md),
+> and the campaign ledger
+> `.superpowers/sdd/2026-08-05-native-live-translation-arena-task6/progress.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make compiler translations emitted by one Darwin/AArch64 native process directly executable by later fork/exec siblings, with zero waiting and a retained cold-`go build` child-CPU and wall-time improvement of at least 10%.

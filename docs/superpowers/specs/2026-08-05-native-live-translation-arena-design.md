@@ -1,7 +1,27 @@
 # Native Live Translation Arena Design
 
+> **CLOSED 2026-08-06 — superseded by negative result.** The runtime built
+> from this design was measured worse on both target shapes and deleted in
+> `1cb06de6` (`revert(native): remove the live translation arena runtime`),
+> per the plan's Task-10 failure arm. Cold go build: policy-ON ~36x
+> policy-OFF wall; attribution: live blocks cannot be direct-linked under
+> the READY-immutability contract, costing 790.2x more gateway round trips
+> = 87.7% of the excess CPU
+> ([`2026-08-06-live-arena-36x-attribution.md`](../../perf-results/2026-08-06-live-arena-36x-attribution.md)).
+> The publication-window prebind fix was implemented and refuted
+> (`e9b12836`..`9922cb26`: 23.7% of links bindable, wall unchanged; residue
+> 68.4% forward edges unreachable by any publication-window binding). The
+> 20-exec micro — the startup shape this design targeted — ran ~16% SLOWER
+> policy-ON because the persistent unit store already banks that prize.
+> Correctness evidence
+> ([`2026-08-06-native-live-arena-compiler-qualification.md`](../../perf-results/2026-08-06-native-live-arena-compiler-qualification.md))
+> stands: the mechanism worked; the economics did not. Revival precondition:
+> a design whose shared code admits direct linking (or removes the gateway
+> round-trip tax some other way) — see the residue-split numbers before
+> re-proposing.
+
 **Date:** 2026-08-05
-**Status:** Approved for a compiler-unit vertical slice
+**Status:** CLOSED 2026-08-06 (was: Approved for a compiler-unit vertical slice)
 **Backend:** Darwin/AArch64 native (DSR) only
 **Controller:** `handoff.md` and `2026-08-02-performance-roadmap.md`
 

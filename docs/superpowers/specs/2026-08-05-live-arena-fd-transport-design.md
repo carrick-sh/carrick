@@ -1,7 +1,19 @@
 # Live arena fd-backed transport design
 
+> **CLOSED 2026-08-06 — superseded by negative result.** The transport this
+> design specifies worked (the fd-backed arena crossed fork and the real
+> execve boundary, three-arm smoke byte-identical), but the arena it carried
+> was measured worse on both target shapes and deleted in `1cb06de6`
+> (`revert(native): remove the live translation arena runtime`); see the
+> CLOSED banner on
+> [`2026-08-05-native-live-translation-arena-design.md`](2026-08-05-native-live-translation-arena-design.md)
+> for the numbers. The probe results below (unlinked-file RX aliasing, shm
+> EXEC stripping, AMFI limits, clamp/fork composition) remain valid Darwin
+> facts independent of the arena and are worth consulting before any future
+> shared-executable-memory design.
+
 **Date:** 2026-08-05
-**Status:** Probe-backed design, approved direction after the Task 6C2 blocker
+**Status:** CLOSED 2026-08-06 (was: Probe-backed design, approved direction after the Task 6C2 blocker)
 **Backend:** Darwin/AArch64 native (DSR) only
 **Supersedes:** the "Proven Darwin Mechanism" section and the Mach-transit
 paragraphs of "Authority and lifetime" in
