@@ -644,6 +644,149 @@ fn amp1_rejects_corrupt_amplification_records() {
     }
 }
 
+fn amplification_ledger(
+    stream: &str,
+    extra_args: &[&std::ffi::OsStr],
+) -> (assert_cmd::assert::Assert, tempfile::TempDir) {
+    let directory = tempfile::tempdir().unwrap();
+    let raw = directory.path().join("amp1.raw");
+    std::fs::write(&raw, stream).unwrap();
+    let mut command = cli();
+    command
+        .args(["debug", "amplification-ledger"])
+        .arg(&raw)
+        .args(extra_args);
+    (command.assert(), directory)
+}
+
+/// The end-to-end contract as an operator meets it: one authenticated stream in,
+/// one canonical ledger out. The arithmetic itself is pinned by the in-file
+/// `debug_amplification` tests; what this suite adds is that the subcommand is
+/// actually reachable and that its refusals reach the exit status.
+#[test]
+fn amplification_ledger_publishes_a_canonical_ledger_from_an_authenticated_capture() {
+    let (assert, _directory) = amplification_ledger(&amp1_stream(), &[]);
+    let output = assert.success().get_output().stdout.clone();
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.ends_with('\n') && text.matches('\n').count() == 1);
+    let ledger: serde_json::Value = serde_json::from_str(text.trim_end()).unwrap();
+    assert_eq!(ledger["schema"], "carrick.amplification-ledger.v1");
+    // The guest ops are named from `carrick_abi::syscall`, not from the stream:
+    // AMP1 carries canonical NUMBERS and copies no strings.
+    assert_eq!(ledger["ledger"][0]["guest_op"]["name"], "openat");
+    assert_eq!(ledger["ledger"][1]["guest_op"]["name"], "mmap");
+    assert_eq!(
+        ledger["ledger"][0]["host_call_amplification"]["numerator"],
+        10
+    );
+    assert_eq!(
+        ledger["ledger"][0]["host_call_amplification"]["denominator"],
+        4
+    );
+    // `carrick-only` has no amplification cell to fill; that is a property of
+    // the type, asserted here as the shape an operator actually receives.
+    assert!(
+        ledger["carrick_only"]
+            .get("host_call_amplification")
+            .is_none()
+    );
+    assert_eq!(
+        ledger["carrick_only"]["probable_instrument"]["host_calls"],
+        5
+    );
+    assert_eq!(ledger["budget"]["probable_instrument_cpu_ns"], 500);
+}
+
+#[test]
+fn amplification_ledger_refuses_a_capture_that_is_not_evidence() {
+    // A `--script` capture cannot authenticate its own stream, so it can never
+    // become a ledger -- the whole point of moving this census under --profile.
+    let (assert, _foreign) = amplification_ledger(
+        &AMP1_FIXTURE.replace(
+            "@PROGRAM_SHA256@",
+            "3333333333333333333333333333333333333333333333333333333333333333",
+        ),
+        &[],
+    );
+    assert
+        .failure()
+        .stderr(contains("does not name the bundled"));
+
+    // A silently dropped event makes every ratio SMALLER, which reads as lower
+    // amplification and would be banked as good news.
+    let (assert, _dropped) = amplification_ledger(
+        &amp1_stream().replacen(
+            "AMP1|drop|source=dtrace-error|count=0",
+            "AMP1|drop|source=dtrace-error|count=7",
+            1,
+        ),
+        &[],
+    );
+    assert.failure().stderr(contains("dtrace-error"));
+
+    // A per-op sum that no longer meets the capture's own independent total.
+    let (assert, _skewed) = amplification_ledger(
+        &amp1_stream().replacen(
+            "AMP1|metric=host-syscall-entry-total|count=20",
+            "AMP1|metric=host-syscall-entry-total|count=26",
+            1,
+        ),
+        &[],
+    );
+    assert
+        .failure()
+        .stderr(contains("closure failed").and(contains("host syscalls")));
+}
+
+#[test]
+fn amplification_ledger_publishes_deterministically_and_never_clobbers() {
+    let directory = tempfile::tempdir().unwrap();
+    let raw = directory.path().join("amp1.raw");
+    std::fs::write(&raw, amp1_stream()).unwrap();
+    let published = directory.path().join("ledger.json");
+
+    cli()
+        .args(["debug", "amplification-ledger"])
+        .arg(&raw)
+        .arg("--output")
+        .arg(&published)
+        .assert()
+        .success();
+    let first = std::fs::read(&published).unwrap();
+
+    // A published artifact is never silently replaced.
+    cli()
+        .args(["debug", "amplification-ledger"])
+        .arg(&raw)
+        .arg("--output")
+        .arg(&published)
+        .assert()
+        .failure()
+        .stderr(contains("already exists"));
+    assert_eq!(std::fs::read(&published).unwrap(), first);
+
+    // Byte-identical on a re-run of the SAME command. Provenance is part of the
+    // artifact by design -- the invocation and its `CARRICK_RUN_ID` are what let
+    // a later reader tie a ledger to the capture that produced it -- so the
+    // determinism claim is about a fixed invocation, which is exactly what a
+    // capture driver replays.
+    let ledger_of = || {
+        String::from_utf8(
+            cli()
+                .args(["debug", "amplification-ledger"])
+                .arg(&raw)
+                .env("CARRICK_RUN_ID", "amp-determinism")
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone(),
+        )
+        .unwrap()
+    };
+    assert_eq!(ledger_of(), ledger_of());
+}
+
 /// The AMP1 header is a durable artifact and names the idioms it refuses, so a
 /// negative contract has to be asserted against the CODE, not the prose. D uses
 /// only block comments.
