@@ -1272,6 +1272,13 @@ impl<A: ExecutableMutationAuthority> GuestMemory for IdentityGuestMemory<A> {
     /// mapping's physical sharing. A reused `MAP_SHARED` hole must remain a real
     /// host `MAP_SHARED` object so writes after `fork` stay visible in both
     /// processes; `zero_backing` historically remapped every hole MAP_PRIVATE.
+    // OPEN QUESTION (chip d0d65c55, 2026-08-07): for `Shared`, the replacement
+    // below maps a *fresh* MAP_SHARED|MAP_ANON object, which does not re-attach
+    // any already-forked peer of the original mapping — the opposite of what
+    // the doc comment above claims. The aarch64 lane refuses to replace Shared
+    // ranges for exactly this reason (see docs/perf-results/2026-08-07-anon-reuse-remap.md
+    // §1); whether this x86 path is reachable with a live forked peer, and
+    // whether it needs the same refusal, is unresolved.
     fn zero_anonymous_reuse(
         &mut self,
         address: u64,
