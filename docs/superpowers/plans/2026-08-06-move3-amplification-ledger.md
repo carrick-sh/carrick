@@ -1,10 +1,9 @@
 # Move 3 — the Darwin kernel amplification ledger
 
-**Status:** scoped draft, controller-accepted 2026-08-06; its own review
-happens when Move-3 execution begins. This document is the committed home of
-the E0 fault-ownership contradiction (the 2026-08-01 audit's
-66.7%-carrick-heap zfod vs AGENTS.md's guest-dominates claim), whose
-settlement is Move 3's first deliverable.
+**Status:** reviewed, execution authority (2026-08-06). This document is the
+committed home of the E0 fault-ownership question — which review established is
+a **staleness ordering, not a live disagreement** (§2/E0) — whose confirmation
+at HEAD is Move 3's first deliverable.
 **Scope:** Darwin/aarch64 native backend (`--exec-backend native`, the shipped
 default), cold `go build` as the canonical workload.
 **Instantiates:** Move 3 of
@@ -23,15 +22,41 @@ carries the measurement that would confirm it.
 
 ## 0. The number this plan is ranked against
 
-| | CPU-s |
-|---|---:|
-| Darwin kernel today (48.4067% midpoint × 20.168 s) | **9.763** |
-| — named-syscall (28.3205%) | 5.712 |
-| — non-syscall: faults, VM (20.0862%) | 4.051 |
-| Kernel budget at the 3x target | **2.800** |
-| **Gap Move 3 must close** | **6.963 (−71.3%)** |
+**The denominator moved on 2026-08-06 and this table uses the new one.**
+[`2026-08-06-post-arena-default-refresh.md`](../../perf-results/2026-08-06-post-arena-default-refresh.md)
+(`:20`) supersedes the 20.168 s median that category-budgets §2 used: median
+Carrick CPU is now **21.391 s (+6.06%)** and the official ratio **10.8586x**
+(was 10.1776x), measured at the exact tip that deleted the arena (`1cb06de6` +
+`7318f583`).
 
-Source: category-budgets §2 and §4e. A third, independent confirmation of the
+**Drift flag, per that document's own honesty note:** the +6.06% is *not*
+attributed to the delete — the 3-arm smoke proved byte-identical default-arm
+guest output across the delete, and the refresh names ~40 commits of tip drift
+plus host state (11-day uptime, ambient load ≈2.2) as unseparated terms. Per the
+single-variable rule that run cannot decompose them. So the row below is the
+current **timing authority**, not a causal statement, and if the +5% persists on
+a quieter box it needs its own controlled attribution before anything is priced
+against it.
+
+| | share | CPU-s @ 21.391 s |
+|---|---:|---:|
+| Darwin kernel today (48.4067% midpoint) | 48.4067% | **10.354** |
+| — named-syscall | 28.3205% | 6.058 |
+| — non-syscall: faults, VM | 20.0862% | 4.297 |
+| translated guest | 25.6048% | 5.477 |
+| Darwin userspace | 10.0077% | 2.141 |
+| other Carrick host code | 8.4276% | 1.803 |
+| translation | 6.0116% | 1.286 |
+| Kernel budget at the 3x target (Docker-denominated, unchanged) | — | **2.800** |
+| **Gap Move 3 must close** | — | **7.554 (−73.0%)** |
+
+The **budget** row is unchanged because it is Docker-denominated
+(3 × `cpu_total_s` 2.160 = 6.480 target, kernel residual rounded down to 2.800;
+category-budgets §4e). Only the carrick-side numerator moved, so the gap widened
+from 6.963 to **7.554 CPU-s**. Every *estimated* band in §2 was derived before
+this refresh and is left unscaled — treat them as pre-drift lower bounds.
+
+Source for the shares: category-budgets §2 and §4e. A third, independent confirmation of the
 shares landed the same week and is used below wherever a finer split is needed:
 `target/perf/attr36/W1OFF-attr.json` (schema `carrick.native-wall-attribution.v1`,
 binary `95491fb7…`, source `08531c73`, run `attr36W1OFF74592`), the policy-OFF —
@@ -58,7 +83,7 @@ untraced anchor), so its shares are citable and its wall is not.
 
 Two more default-lane denominators, from the same round's `C1OFF` counters:
 **88,174 guest syscalls** and **1,846,656 gateway exits** on one cold build.
-88,174 guest syscalls against 5.712 CPU-s of named-syscall kernel is 64.8 µs per
+88,174 guest syscalls against 6.058 CPU-s of named-syscall kernel is 68.7 µs per
 guest syscall *if every host syscall were attributable to one* — which it plainly
 is not. That arithmetic is the whole argument for this instrument: **nobody knows
 how the build lane's kernel CPU divides between guest-op service and carrick's
@@ -102,7 +127,7 @@ They are:
    A ledger that cannot say "this guest op costs X host CPU-ns" cannot be ranked
    against a CPU-second budget at all.
 2. **Syscalls only — the non-syscall kernel half is invisible.** 20.09% of all
-   CPU / **4.051 CPU-s** is kernel non-syscall (faults, VM). No syscall-entry
+   CPU / **4.297 CPU-s** is kernel non-syscall (faults, VM). No syscall-entry
    join can see a page fault. A ledger built on syscall spans alone addresses at
    most 58% of the kernel budget.
 3. **Mach traps are not syscalls.** The 2026-08-01 audit's central finding is
@@ -166,13 +191,29 @@ offline.
 
 **New: `TraceProfileKind::NativeAmplification`** in `trace_profile.rs` —
 `as_str()` `"native-amplification"`, `bundled_script()` →
-`BUNDLED_NATIVE_AMPLIFICATION_D`, `parse_protocol()`, `requires_runtime_profile()
-== true` (the USDT service probes need the runtime's profile arm), raw schema
+`BUNDLED_NATIVE_AMPLIFICATION_D`, `parse_protocol()`, **`requires_runtime_profile()
+== false`**, raw schema
 `carrick.amplification.raw.v1`, header carrying `program_sha256` +
 `birth_qualification_sha256` + the declared bound. Plus a
 `BUNDLED_NATIVE_AMPLIFICATION_D` const in `dtrace_consumer.rs` and the contract
 assertions that file already keeps for the other bundled programs (pragma
 values, exactly-one `copyinstr(arg0)`, the bound literal present).
+
+> **`requires_runtime_profile()` is FALSE, and this is a correctness point, not
+> a convenience.** `native_syscall_service_entry` is an **unconditional** USDT
+> (`crates/carrick-observability/src/probes.rs:2282` — an `#[inline(always)]`
+> wrapper straight onto `carrick_usdt::native__syscall__service__entry!`,
+> opened by `NativeSyscallServiceSpan::open` at
+> `crates/carrick-runtime/src/native_darwin.rs:3168`). It fires whether or not
+> `CARRICK_DSR_PROFILE` is set, so the ledger needs nothing from the runtime
+> profile arm. Requiring it would be an active **measurement confound**: the arm
+> is `profiling: std::env::var_os("CARRICK_DSR_PROFILE").is_some()`
+> (`crates/carrick-dsr-aarch64/src/translator.rs:2303`) and it does real work —
+> the 36x round measured its phase clock at **3.0% of policy-OFF user samples**
+> (28.3% policy-ON), i.e. the ledger would be charging carrick host CPU that
+> only exists because the ledger asked for it. `TraceProfileKind::NativeFault`
+> is already `false` for exactly this probe class
+> (`trace_profile.rs:2129-2134`); follow it.
 
 **New: `crates/carrick-cli/src/debug_amplification.rs`** +
 `DebugCommand::AmplificationLedger { trace, capture, --output }` — the typed
@@ -254,16 +295,35 @@ the schema (`totals.wall_is_not_authority: true`):
   instruments** and their numbers must not be mixed. Make it a header field
   (`joins=syscall,mach,fault`) that `amplification-compare` refuses to cross.
 
+**DTrace drop counters are required closure inputs, not diagnostics.** This is
+the one failure mode `section=truncated` does *not* cover: that marker fires
+only on the declared tick bound. **DTrace drops silently** — principal buffer,
+aggregation, dynamic, dynamic-rinse and dynamic-dirty drops each just make
+counts smaller with no in-band signal, which on this instrument would read as a
+*lower* amplification and be banked as good news. The risk here is higher than
+for any existing profile: **no script in the tree combines
+`syscall:::` + `mach_trap:::` + `vminfo:::` + `vtimestamp`**, so the aggregation
+key-space and dynamic-variable pressure are unqualified. Therefore:
+
+- the D program declares explicit `aggsize` / `dynvarsize` / `bufsize` headroom
+  above the fs census's 32m/64m/16m, and the header records the values it ran
+  with (they are a determinant `amplification-compare` refuses to cross);
+- `dtrace:::END` emits every drop counter as a named section;
+- the analyzer treats **any nonzero drop as a named rejection**, exactly as the
+  fault-ownership captures did ("Every DTrace drop counter … was zero" is stated
+  as an acceptance condition there, and this instrument adopts it);
+- a missing drop section is itself a rejection — absent is not zero.
+
 ---
 
 ## 2. The entry roster, ranked
 
-Ranked by *estimated* CPU-s against the **6.963 CPU-s** kernel gap. Every band
-is an estimate derived from committed measurements of adjacent quantities; none
-is a measurement of the entry itself. That is the honest state — and it is why
-E0 comes first.
+Ranked by *estimated* CPU-s against the **7.554 CPU-s** kernel gap (§0). Every
+band is an estimate derived from committed measurements of adjacent quantities,
+taken **before** the 2026-08-06 denominator refresh; none is a measurement of the
+entry itself. That is the honest state — and it is why E0 comes first.
 
-### E0 (prerequisite, not an entry) — the baseline build-lane ledger, and one contradiction it must settle
+### E0 (prerequisite, not an entry) — the baseline build-lane ledger, and the fault-ownership record it must confirm
 
 The fs ledger measured the **fs-walk** fixture. Every per-op figure in it is
 that fixture's. The build lane's amplification at HEAD is **unmeasured**:
@@ -272,25 +332,53 @@ service-window figure at `564dd281`, flagged stale by AGENTS.md itself, and the
 fs entry explicitly declines to restate it ("Restating 19.68 for the go-build at
 HEAD is a separate measurement this entry did not make").
 
-**The contradiction.** Two committed documents disagree about who owns the
-1.88 M faults on the cold build:
+#### The fault-ownership record is a STALENESS ORDERING, not a live disagreement
 
-| source | claim |
-|---|---|
-| `2026-08-01-native-wall-audit-and-fault-cost.md` (bucket histogram vs measured bias, "closes the accounting to ~99.5%") | carrick's own Rust heap ≥128 KiB, libmalloc large zone: **1,254,000 zfod = 66.7% (~20.5 GB)**; guest mmap arena (`zero_backing`) 561,394 = 29.9%; remainder 3.4% |
-| AGENTS.md ("Do NOT assume carrick's own copies cause the fault term — the committed census refutes it") | JIT first-touch 2.08% of zfod, inserted code 1.48%, "**faults are dominated by the GUEST's own anonymous memory.** The lever there is making each guest page cheaper on Darwin, not making carrick copy less" |
+An earlier revision of this plan framed this as a standing contradiction between
+the 2026-08-01 audit and AGENTS.md. **That framing was wrong**, and the document
+that settles it —
+[`2026-08-03-current-native-fault-ownership.md`](../../perf-results/2026-08-03-current-native-fault-ownership.md)
+— was uncited. Ordered by date, the record is monotone:
 
-These are reconcilable only if "carrick's own copies" is read narrowly as the
-JIT/inserted-code slices and the 66.7% large-zone heap is read as something
-else — but as written they point at opposite levers for **4.051 CPU-s**. E1 and
-E2 below both depend on which is right. **Settling this is the first ledger
-deliverable**, and the tooling to settle it already exists and is unwired: the
-new `AMP1` fault join gives faults per guest op; `carrick debug
-alloc-owner-census` gives the allocation-owner portfolio; `native_fault_directional.py`
-gives the directional page census. Nobody has joined all three at HEAD.
+| date | source | claim |
+|---|---|---|
+| 2026-07-29 | [`2026-07-29-native-cpu-budget-evidence.md`](../../perf-results/2026-07-29-native-cpu-budget-evidence.md) `:123`, `:188` | "Emitted JIT code is NOT the driver: … 2.08% of the zfod faults"; "**the mass is guest anonymous memory plus the fork model**" |
+| 2026-08-01 | [`2026-08-01-native-wall-audit-and-fault-cost.md`](../../perf-results/2026-08-01-native-wall-audit-and-fault-cost.md) | bucket histogram vs measured bias, closing to ~99.5%: carrick's own Rust heap ≥128 KiB (libmalloc large zone) **1,254,000 zfod = 66.7% (~20.5 GB)**; guest mmap arena (`zero_backing`) 561,394 = 29.9% |
+| 2026-08-03 | `2026-08-03-current-native-fault-ownership.md` | two **source-identical** `native-fault` captures: **host-other share of sampled `zfod` = 63.2115% / 62.7395%** (repeat factors 1.00638 / 1.00146); "ordinary Carrick host allocations, not guest-owned mappings, dominate current-default zero-fill faults" |
 
-Deliverable: `docs/perf-results/2026-08-XX-build-lane-amplification-ledger.md`,
-same table format the fs entry defined, **which produces the real ranking below**.
+So 08-01 and 08-03 **corroborate each other independently** (66.7% by histogram,
+63.2%/62.7% by authenticated birth-keyed page census), and AGENTS.md's
+guest-dominates bullet traces to the **oldest** of the three. The documentary
+record reads: **07-29 superseded by 08-01 + 08-03.** There is nothing to
+adjudicate.
+
+**E0's job is therefore CONFIRMATION at HEAD, not adjudication.** It is still
+required, because both surviving censuses predate the arena add-and-delete churn
+(`0e35a2d3` / `08531c73` era vs the current `1cb06de6`+`7318f583` tip, ~40
+commits of drift plus the `8d5b3a19` alias-install fix and the 6E catalog
+publication), and §0's +6.06% CPU drift is itself unattributed. A 63%-host-other
+finding that no longer reproduces would change E1/E2's ranking completely.
+
+**Explicit E0 deliverables (both required):**
+
+1. `docs/perf-results/2026-08-XX-build-lane-amplification-ledger.md`, same table
+   format the fs entry defined, **which produces the real ranking below** —
+   including the host-other zfod share at HEAD, stated against the 63.2%/62.7%
+   pair so it is a confirmation or a named regression, never a fresh number
+   floating free.
+2. **Fix AGENTS.md's stale bullet.** The "Do NOT assume carrick's own copies
+   cause the fault term — the committed census refutes it … faults are dominated
+   by the GUEST's own anonymous memory" bullet cites the 07-29 reading and has
+   been superseded twice. Rewrite it to state the current record (host-other
+   dominates; JIT first-touch 2.08% and inserted code 1.48% remain true and are
+   the *narrow* claim that survives) with the 08-03 citation. This is a
+   documentation correction with a measurement behind it, and it is part of E0,
+   not a follow-up.
+
+The tooling to do all of this exists and is unwired: the new `AMP1` fault join
+gives faults per guest op; `carrick debug alloc-owner-census` gives the
+allocation-owner portfolio; `native_fault_directional.py` gives the directional
+page census. Nobody has joined all three at HEAD.
 
 ### E1 — guest `mmap(MAP_PRIVATE, fd)`: eager full-length materialization
 
@@ -300,7 +388,8 @@ strategy's one-line description.
 
 The strategy names it as "full-length `pread` into fresh anon instead of a host
 file-backed mmap". The code (`crates/carrick-runtime/src/dispatch/mem.rs`,
-`snapshot_private_mmap_file` at `:898`, `snapshot_private_host_file` at `:739`,
+**line numbers re-cited at HEAD**: `PrivateMmapSnapshot` at `:734`,
+`snapshot_private_host_file` at `:739`, `snapshot_private_mmap_file` at `:902`,
 the `HostFile` arm at `:2508-2525`) is **three** amplifications per guest op, not
 one:
 
@@ -324,18 +413,21 @@ touches, from the unified buffer cache, with no copy at all. Amplification targe
 
 **Evidence the fix is buildable, not speculative.** The mechanism already exists
 in-tree on the exec path: `map_prepared_region_extent`
-(`crates/carrick-dsr-aarch64/src/mapped_memory.rs:4364`) does
+(`crates/carrick-dsr-aarch64/src/mapped_memory.rs:4601` — **re-cited at HEAD**;
+the audit's `:4364` is stale) does
 `MAP_PRIVATE|MAP_FIXED` **file** mmaps — 709 per build, ~6 per exec, one per
 `PT_LOAD` — against a guest-image zfod count of 11 (audit, "Both levers are
 real"). Guest image pages are already file-backed and COW; guest `mmap` is not.
 The correction in that same section is load-bearing and must be respected:
-`map_prepared_for_plan` is a **test-only helper**, the live path is
+`map_prepared_for_plan` (**`:1115` at HEAD**, not the audit's `:1018`) is a
+**test-only helper**, the live path is
 `map_prepared_region_extent`, and image mapping is **DONE — do not re-implement
 it.** This entry is the *general* `mmap` path only.
 
 Supporting shares: `libsystem_platform` 4.6546% (861 samples) and
-`libsystem_malloc` 3.6436% (674) of W1OFF — 8.30% of all CPU ≈ **1.67 CPU-s** in
-the copy/allocate userspace pair, which is where (1) and (3) land.
+`libsystem_malloc` 3.6436% (674) of W1OFF — 8.2982% of all CPU ≈ **1.775 CPU-s**
+at the refreshed 21.391 s denominator (1.67 at the superseded 20.168 s) in the
+copy/allocate userspace pair, which is where (1) and (3) land.
 
 **Confirming measurement:** the E0 capture's `mmap` row — guest `mmap` count,
 host CPU-ns, and **fault count inside the mmap service window**. The fs fixture's
@@ -345,7 +437,7 @@ arm (per the opt-out rule) and an `amplification-compare` of the two censuses,
 with the `mmap` row's `host_cpu_ns_per_guest_op` and `faults.zfod` as the signal.
 
 **Honest constraint:** the guarantee is immovable. A `MAP_PRIVATE` file mapping
-must observe map-time EOF semantics (the `PrivateMmapSnapshot` doc at `:729`:
+must observe map-time EOF semantics (the `PrivateMmapSnapshot` doc at `:729-733`:
 bytes through the last partially backed page snapshotted, EOF remainder
 zero-filled, pages wholly beyond published as `BUS_ADRERR`) and carrick's private
 mapping is deliberately detached from the vnode so a later external truncate is
@@ -365,10 +457,39 @@ initialized per-process) ~7.4% projection" to the live arena as "the largest
 *identified* chunk of the kernel non-syscall bucket". **The arena is deleted, so
 that cost is now unowned** and falls to Move 3 as a memory-intent entry. Its
 larger context is the audit's 1,254,000 large-zone zfod (~20.5 GB, 66.7% of all
-faults). At the audit's own untraced per-fault cost (1.81 µs at GOMAXPROCS=1,
-3.84 µs at 10) that band is 2.27–4.82 CPU-s — which exceeds the entire
-non-syscall bucket at the high end, so the low end is the defensible one and the
-partition against E1 is required before either is banked.
+faults), corroborated by the 08-03 census's 63.2115% / 62.7395% host-other zfod
+share (§2/E0). At the audit's own untraced per-fault cost (1.81 µs at
+GOMAXPROCS=1, 3.84 µs at 10) that band is 2.27–4.82 CPU-s — which exceeds the
+entire non-syscall bucket at the high end, so the low end is the defensible one
+and the partition against E1 is required before either is banked.
+
+#### This entry RE-OPENS a committed STOP, deliberately and under named authority
+
+`2026-08-03-current-native-fault-ownership.md` carries an explicit decision on
+exactly this territory: **"STOP — the named translation-publication memory
+mechanism does not clear the 10% total-CPU gate in either accepted binding"**,
+with the opportunity projection at **7.411% / 7.425%** of total cold-build CPU
+and the sentence **"No production memory change is authorized."** Task 6 must not
+be read as ignoring that decision, so the re-opening is stated here with its
+authority:
+
+- The STOP was issued **under the ≥10% single-mechanism policy**, and it names
+  that policy as its sole reason for stopping — the measurement itself was
+  accepted ("Keep the exact export and Rust censuses"), only the *opportunity
+  gate* failed.
+- The category-collapse spec **supersedes that policy**. Spec §3 Move 0: the
+  ≥10% gate "remains an attribution filter but **stops being a veto**", because
+  it "systematically no-carries architectural families that are individually
+  <10% while summing to the gap". Category-budgets §5 restates it: a family of
+  source-distinct mechanisms individually below 10% but addressable by **one**
+  mechanism "is judged as a single candidate against its combined share".
+- 7.4% of the refreshed 21.391 s is **~1.58 CPU-s** against a 7.554 CPU-s gap —
+  21% of the whole kernel ask from one binding. Under the superseded policy that
+  was a no-carry; under the current one it is a ranked candidate.
+- **What is unchanged:** the ABBA retention discipline. Re-opening the *ranking*
+  does not pre-authorize a production memory change; Task 6 still has to win its
+  ABBA, and the 08-03 document's projection was explicitly "deliberately
+  favorable", so treat 7.4% as a ceiling on that binding, not a forecast.
 
 **Intent lowering (Go dual-port oracle).** Repeatedly allocating and freeing
 ≥128 KiB buffers on Darwin returns the pages to the kernel each time and takes a
@@ -381,8 +502,8 @@ VM entry and its pages survive between uses.
 **Confirming measurement:** `carrick debug alloc-owner-census` (already built,
 strict NATIVEPERF join, named failures for epoch mismatch) run at HEAD against
 the E0 capture, partitioned against E1's `mmap`-window faults. This entry is
-*measurement-first by necessity* — it cannot be ranked until E0 settles §2/E0's
-contradiction.
+*measurement-first by necessity* — it cannot be ranked until E0 confirms the
+host-other zfod share at HEAD (§2/E0).
 
 ### E3 — guest decommit intent → `zero_backing` memset instead of `MADV_FREE_REUSABLE`
 
@@ -393,10 +514,15 @@ diff of the three.
 `dispatch/mem.rs:3655` — guest `MADV_DONTNEED` on a writable private mapping
 lowers to `cx.memory.zero_backing(address, length)`. Post-`CARRICK_DSR_ZERO_FAST`
 (default ON, `=0` hatch — the opt-out rule correctly applied) that is **one
-protection lift + one `memset` of the whole range**, and the doc comment at
-`mapped_memory.rs:3982-4004` records what it replaced: host `mprotect`
-236,464 → 6,665 on a cold build, a 97.2% cut, against **8** guest `mprotect`
-calls. The same `zero_backing` serves the `MAP_FIXED`/munmap-reuse scrub.
+protection lift + one `memset` of the whole range**. Two doc comments record what
+it replaced, **both re-cited at HEAD**: the gate
+`zero_backing_single_lift_enabled` at `mapped_memory.rs:385-400` carries the
+result (host `mprotect` **236,464 → 6,665**, 97.2%, the figure at `:391`), and
+`zero_backing` itself at `:3982-4033` carries the mechanism (98% of those calls
+at exactly `ZERO_CHUNK`'s 64 KiB, against **8** guest `mprotect` calls, i.e. a
+~29,500x amplification that was entirely carrick's own; the 236,464 figure
+restated at `:3986`). The same `zero_backing` serves the `MAP_FIXED`/munmap-reuse
+scrub.
 
 What remains is still the wrong primitive. After the memset the pages are
 **resident and dirty**; the guest's next touch re-dirties them. Darwin's
@@ -479,8 +605,20 @@ Not amplification of any guest op, and it must never enter a per-op ratio — bu
 it is a first-class ledger row because the count is enormous and the CPU-ns is
 exactly what the instrument newly supplies. `syscall-amplification.d`'s recorded
 context: on a 90 s go build, 2,902,383 host syscalls of which `psynch_cvwait`
-866,678 + `psynch_cvsignal` 861,759 = **60%**. The on-CPU share bounds it low —
-W1OFF puts `psynch_*` at 2.6% of all CPU ≈ **0.52 CPU-s** — so it is ranked
+866,678 + `psynch_cvsignal` 861,759 = **60%**.
+
+> **Scoping caveat on that 60%.** `syscall-amplification.d` scopes on
+> `execname == "carrick"` (its header argues the case for an already-running,
+> ecosystem-wide workload), which is the **opposite idiom** to this instrument's
+> `tracked[]`-from-`$target` scoping and the one AGENTS.md records as having
+> made 54% of a profile the profiler. Treat the 60% strictly as **count context
+> for why this row exists**, never as a figure the ledger inherits: the ledger's
+> own `carrick_only.by_host_call` numbers replace it, and the two must not be
+> compared.
+
+The on-CPU share bounds it low —
+W1OFF puts `psynch_*` at 2.6% of all CPU ≈ **0.56 CPU-s** at the refreshed
+denominator — so it is ranked
 below E1–E3 on evidence, not dismissed. The 36x round also notes 265.8 s of
 off-CPU `runnable_ns` on the OFF arm, almost all idle waiters, so the off-CPU
 side is not a hidden reservoir either.
@@ -496,21 +634,23 @@ remains. Record the row; do not campaign on it.
 
 ### Roster summary
 
-| # | entry | *est.* CPU-s vs the 6.963 gap | confirming measurement |
+| # | entry | *est.* CPU-s vs the 7.554 gap | confirming measurement |
 |---|---|---:|---|
-| E0 | baseline build-lane ledger + fault-ownership contradiction | — (produces the ranking) | the `AMP1` capture itself |
+| E0 | baseline build-lane ledger + HEAD confirmation of host-other zfod + the AGENTS.md fix | — (produces the ranking) | the `AMP1` capture itself |
 | E1 | guest `mmap(MAP_PRIVATE, fd)` eager materialization | **1.5–3.0** | `mmap` row: host CPU-ns + in-window zfod |
-| E2 | carrick ≥128 KiB allocation churn → zfod (Move-1 orphan) | **0.8–2.3** (overlaps E1; E1+E2 = 2.0–4.0) | `alloc-owner-census` × fault join |
+| E2 | carrick ≥128 KiB allocation churn → zfod (Move-1 orphan; re-opens the 08-03 STOP) | **0.8–2.3** (overlaps E1; E1+E2 = 2.0–4.0) | `alloc-owner-census` × fault join |
 | E3 | decommit intent → `MADV_FREE_REUSABLE` | **0.3–1.0** | `madvise` row + `mach_vm_region` residency |
 | E4 | `HostAliasTransactions` / exclusive dispatch guard scope | unknown — **re-derive** | arm-B/arm-C topology sweep at HEAD |
 | E5 | build-lane fs term (Lever B) | unknown; blocked on the `fstatat64` bisect | fs ledger rerun on the build fixture |
-| E6 | `carrick-only` park/wake | ~0.5 | `carrick_only.by_host_call` CPU-ns |
+| E6 | `carrick-only` park/wake | ~0.56 | `carrick_only.by_host_call` CPU-ns |
 | E7 | exec chain | ~0.5, mostly irreducible | already measured |
 
-Even the optimistic reading (E1+E2 at 4.0, E3 at 1.0, E6 at 0.5) reaches 5.5 of
-6.963. **Move 3 does not close its own gap from the named entries alone** — which
-is precisely why the spec specifies a *standing ledger of the top ~20 guest
-operations*, and why E0 is the deliverable that matters most.
+Bands are pre-drift (derived against the superseded 20.168 s denominator) and are
+deliberately **not** rescaled — see §0. Even the optimistic reading (E1+E2 at 4.0,
+E3 at 1.0, E6 at 0.56) reaches ~5.6 of **7.554**, and the refresh widened the gap
+rather than narrowing it. **Move 3 does not close its own gap from the named
+entries alone** — which is precisely why the spec specifies a *standing ledger of
+the top ~20 guest operations*, and why E0 is the deliverable that matters most.
 
 ---
 
@@ -545,12 +685,17 @@ Add `scripts/dtrace/native-amplification.d` and wire
 
 Typed analyzer + `carrick.amplification-ledger.v1`.
 
-- **Red first:** (a) a census whose per-op host sums ≠ the independent total
-  fails with a named closure error; (b) a `carrick-only` row cannot be
-  constructed with an amplification field (compile-time — the struct has none);
-  (c) `probable_instrument` (`kdebug_trace*`) is subtracted into its own
-  sub-bucket and the primary ratios exclude it; (d) round-trip determinism —
-  serialize → parse → serialize is byte-identical.
+- **Red first** (each must fail on the pre-change tree for the right reason):
+  (a) a census whose per-op host sums ≠ the independent total fails with a named
+  closure error; (b) `probable_instrument` (`kdebug_trace*`) is subtracted into
+  its own sub-bucket and the primary ratios exclude it; (c) a nonzero DTrace drop
+  counter — and a *missing* drop section — are each a named rejection (§1d);
+  (d) round-trip determinism: serialize → parse → serialize is byte-identical.
+- **Type guarantee, not a red test:** a `carrick-only` row cannot carry an
+  amplification field because the struct has none. That is true by construction,
+  so there is no pre-change tree on which a test of it fails — asserting it as
+  "red-first" would be theatre. State it as an invariant of the schema and let
+  the compiler hold it.
 - **Typed domains:** guest-op names are not bare strings across the boundary —
   reuse `CanonicalNr` / the `carrick-abi` syscall table to resolve names, so a
   guest op that is not in the table is a named error rather than a silent row.
@@ -576,11 +721,16 @@ image digest.
 - Capture with all three joins; then a syscall-only capture for the ratio the fs
   entry can be compared against.
 - Run `carrick debug alloc-owner-census` on the same run and join.
-- **Deliverable:** `docs/perf-results/2026-08-XX-build-lane-amplification-ledger.md`
-  in the fs entry's table format, plus an explicit **verdict on the §2/E0
-  contradiction** (large-zone heap vs guest anonymous memory), which the ledger
-  either resolves or names as still-open with the exact next measurement.
-- **Gate:** completeness — no `section=truncated`, closure exact, guest-syscall
+- **Deliverable 1:** `docs/perf-results/2026-08-XX-build-lane-amplification-ledger.md`
+  in the fs entry's table format, including the **host-other zfod share at HEAD
+  stated against the 08-03 pair (63.2115% / 62.7395%)** — a confirmation or a
+  named regression, never a free-floating new number.
+- **Deliverable 2:** the **AGENTS.md correction** (§2/E0) — rewrite the stale
+  "faults are dominated by the GUEST's own anonymous memory" bullet, which cites
+  the superseded 2026-07-29 reading, to state the 08-01 + 08-03 record. Part of
+  this task, not a follow-up.
+- **Gate:** completeness — no `section=truncated`, **every DTrace drop counter
+  zero and the drop section present** (§1d), closure exact, guest-syscall
   total non-zero, `carrick-only` decomposed, instrument calls named and excluded.
   Single capture is acceptable for **counts** on a deterministic fixture (the fs
   entry's precedent, reproducing a prior census to within 2 guest calls);
@@ -603,23 +753,49 @@ image digest.
   shared-aperture conflict); everything else keeps the snapshot path.
 - **Default ON**, hatch `CARRICK_MMAP_FILE_BACKED=0` (opt-out rule).
 - **Gates, in order:** the probe green vs Docker → `just ci` → `just
-  conformance-probes` → `amplification-compare` on the `mmap` row → cold-build
+  conformance-probes` **as a DELTA gate, not a pass/fail gate** (see below) →
+  `amplification-compare` on the `mmap` row → cold-build
   ABBA. Retained only on an ABBA win; if it wins its mechanism and loses its
   ABBA, that is the spec's §6 second invalidation condition and the coupling is
   in the memory system — stop and report, do not park it behind a flag.
 
+> **`just conformance-probes` is RED at HEAD and its failure set is not
+> deterministic**, so "gate on green" would be unsatisfiable and "gate on the
+> set" would produce false regressions.
+> [`2026-08-06-native-live-arena-compiler-qualification.md`](../../perf-results/2026-08-06-native-live-arena-compiler-qualification.md)
+> `:243-256` records it: one-worker (authoritative) runs give `arm64:musl:`
+> `{accounting, aliassize, clone3args, mmapcluster, recursionguard}` at
+> `53f5ee60`, the same five **plus `reparenttoinit`** at `b5d0ff2b`, and an
+> **eight-worker** run of the tip gave a different set again (`forksigwalk`,
+> `msgoverflow`, `pidnsinitreap`). Three of the stable five are already recorded
+> as pre-existing native-lane gaps, and the gate is not part of `just ci`.
+> **Amended gate:** pin the baseline failure set with a **one-worker** run on the
+> pre-change signed binary, re-run one-worker on the candidate, and gate on the
+> **delta** — any probe that is newly red is a regression; any probe already in
+> the pinned set is not. Never sample at eight workers for this comparison, and
+> never treat a single-sample set difference as evidence.
+
 ### Task 6 — E2: partition the large-zone fault mass, then reuse
 
-Sequenced strictly after Task 4's verdict.
+Sequenced strictly after Task 4's confirmation.
 
-- If the fault mass is carrick's own large-zone heap: identify the top allocation
+- **Open the brief by restating the re-opened STOP** (§2/E2): the 08-03 document
+  says "No production memory change is authorized" *under the ≥10% policy*; the
+  category-collapse spec §3 Move 0 and category-budgets §5 supersede that policy
+  and make this a ranked candidate. Cite both. A reviewer must be able to see the
+  decision was re-opened deliberately, not overlooked.
+- If HEAD confirms carrick's own large-zone heap dominates (the expected result,
+  63.2%/62.7% at 08-03): identify the top allocation
   owners from `alloc-owner-census`, and apply reuse / `MADV_FREE_REUSABLE`+`REUSE`
   to the repeated ≥128 KiB allocations, one owner at a time, each with its own
   ABBA.
-- If it is the guest's anonymous memory: the entry becomes "make each guest page
-  cheaper on Darwin" and is re-scoped against E3, not pursued as an allocation
-  fix. **Say which, from the measurement.**
-- **Gates:** `just ci`; ledger `faults.zfod` movement; cold-build ABBA.
+- If HEAD instead shows guest anonymous memory dominating — i.e. the 08-01/08-03
+  finding does **not** reproduce after the arena churn — that is a named
+  regression in the record, not a return to the 07-29 reading. Report it as such,
+  re-scope the entry to "make each guest page cheaper on Darwin" against E3, and
+  do not pursue an allocation fix. **Say which, from the measurement.**
+- **Gates:** `just ci`; ledger `faults.zfod` movement; cold-build ABBA. The
+  ABBA discipline is explicitly *not* relaxed by the re-opening.
 
 ### Task 7 — E3: decommit intent lowering
 
@@ -656,14 +832,16 @@ threads, processes and core class at once and is not a clean variable.
   wrong for this lane and the lever is per-call cost, not amplification.
 - **E1 wins its mechanism and loses its ABBA.** Spec §6, second condition: the
   coupling is in the memory system. Stop the entry line and report.
-- **The fault-ownership contradiction resolves toward AGENTS.md** (guest
-  anonymous memory dominates). Then E2 collapses into E3 and the roster's top
-  band drops by roughly 1 CPU-s.
+- **The 08-01/08-03 host-other zfod finding does not reproduce at HEAD.** Then
+  E2 collapses into E3 and the roster's top band drops by roughly 1 CPU-s — and
+  the non-reproduction is itself a named regression to attribute against the
+  ~40 commits of post-arena drift, not a quiet re-ranking.
+- **§0's +6.06% CPU drift turns out to be a real regression rather than host
+  state.** Then the gap is not 7.554 and the first work is attribution, not
+  amplification.
 
 ## 5. Explicit non-goals
 
-- No changes to `handoff.md` or to the category-collapse spec — another agent
-  owns those.
 - No kernel-stack-family ranking, ever (§1b, fifth gap).
 - No second parser, second scoping idiom, or second authority mechanism: the
   ledger extends `carrick trace` / `carrick debug`, per the Rust-first rule.
