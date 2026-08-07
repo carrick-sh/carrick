@@ -443,9 +443,9 @@ concern — it is half the product.
   That in-window mass is 99.4% carrick's own **whole-range anonymous-reuse
   scrub** memsetting the ops' biased host backing — 98% of it serving
   hint-less `PROT_NONE` reserves that are provably zero already; it is NOT
-  the guest touching its memory and NOT the (long-refuted) eager
-  `MAP_PRIVATE` file materialization, whose build population is 18 calls /
-  3.8 MiB
+  the guest touching its memory and NOT the eager `MAP_PRIVATE` file
+  materialization (refuted 2026-08-06 by Task 5's population census: 18
+  calls / 3.8 MiB per build)
   ([`docs/perf-results/2026-08-07-build-lane-fault-partition.md`](docs/perf-results/2026-08-07-build-lane-fault-partition.md)).
   The narrow 2026-07-29 claims
   survive (JIT first-touch 2.08% of zfod, inserted code 1.48%); that census's
