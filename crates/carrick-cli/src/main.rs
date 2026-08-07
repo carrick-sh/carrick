@@ -126,6 +126,10 @@ compile_error!(
 ))]
 compile_error!("alloc-owner-census is supported only on Darwin/AArch64 native builds");
 
+// The AMP1 reader only parses a text stream and hashes the bundled D program,
+// so — like the census modules below — it is declared on every platform even
+// though only a libdtrace host can produce the stream.
+mod amplification_profile;
 mod args;
 mod commands;
 // `debug` (guest address-space snapshot for the lldb plugin) reads the macOS-only

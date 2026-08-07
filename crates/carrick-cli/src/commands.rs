@@ -147,7 +147,8 @@ fn uses_live_kernel_symbols(profile: crate::trace_profile::TraceProfileKind) -> 
 fn uses_native_launch_qualification(profile: crate::trace_profile::TraceProfileKind) -> bool {
     matches!(
         profile,
-        crate::trace_profile::TraceProfileKind::NativeFault
+        crate::trace_profile::TraceProfileKind::NativeAmplification
+            | crate::trace_profile::TraceProfileKind::NativeFault
             | crate::trace_profile::TraceProfileKind::NativeShape
             | crate::trace_profile::TraceProfileKind::NativeWall
     )
@@ -468,19 +469,30 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             other_drops,
             interrupted,
         } => {
-            validate_v2_path(
-                &input,
-                crate::trace_profile::ProfileCaptureStatus {
-                    principal_drops,
-                    aggregation_drops,
-                    dynamic_drops,
-                    dynamic_rinse_drops,
-                    dynamic_dirty_drops,
-                    other_drops,
-                    interrupted,
-                },
-            )?;
-            println!("DSRPROF2_VALID");
+            let capture_status = crate::trace_profile::ProfileCaptureStatus {
+                principal_drops,
+                aggregation_drops,
+                dynamic_drops,
+                dynamic_rinse_drops,
+                dynamic_dirty_drops,
+                other_drops,
+                interrupted,
+            };
+            // One harness, dispatched on the stream's own protocol. A stream
+            // that names neither protocol falls through to the DSRPROF2 reader
+            // and is refused there by name.
+            let contents = std::fs::read_to_string(&input)
+                .with_context(|| format!("read profile stream {}", input.display()))?;
+            if crate::amplification_profile::is_amp1_stream(&contents) {
+                crate::amplification_profile::validate_amp1_lines(
+                    contents.lines(),
+                    capture_status,
+                )?;
+                println!("AMP1_VALID");
+            } else {
+                validate_v2_path(&input, capture_status)?;
+                println!("DSRPROF2_VALID");
+            }
         }
         Commands::NativeExecPidProbe => {
             carrick_runtime::native_self_reexec_pid_probe()?;
@@ -1586,6 +1598,13 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                             anyhow::anyhow!("native launch qualification has no profile")
                         })?;
                         match requested {
+                            crate::trace_profile::TraceProfileKind::NativeAmplification => {
+                                let rendered = qualification
+                                    .render_native_amplification_profile_program(
+                                        profile_template,
+                                    )?;
+                                (Some(rendered.program), Some(rendered.authority), None)
+                            }
                             crate::trace_profile::TraceProfileKind::NativeFault => {
                                 let rendered = qualification
                                     .render_native_fault_profile_program(profile_template)?;
@@ -1641,8 +1660,13 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         let template = script_src.as_deref().ok_or_else(|| {
                             anyhow::anyhow!("--profile-bound-seconds has no D program to bound")
                         })?;
+                        let bounded_profile = profile.ok_or_else(|| {
+                            anyhow::anyhow!("--profile-bound-seconds has no profile to bound")
+                        })?;
                         Some(crate::trace_profile::render_profile_capture_bound(
-                            template, seconds,
+                            bounded_profile,
+                            template,
+                            seconds,
                         )?)
                     }
                     None => script_src,
@@ -1744,7 +1768,49 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     let capture_status = report.into();
                     #[cfg(target_os = "macos")]
                     {
-                        if requested_profile == crate::trace_profile::TraceProfileKind::NativeFault
+                        if requested_profile
+                            == crate::trace_profile::TraceProfileKind::NativeAmplification
+                        {
+                            // Admissibility only. The typed ledger, its closure
+                            // arithmetic and its JSON schema are
+                            // `carrick debug amplification-ledger`'s: refusing
+                            // `--summary-jsonl` here keeps one writer for the
+                            // artifact instead of two that can disagree.
+                            if summary_jsonl.is_some() {
+                                bail!(
+                                    "the amplification ledger is written by `carrick debug amplification-ledger` from the raw stream; capture it with --trace-out"
+                                );
+                            }
+                            let capture = crate::amplification_profile::validate_amp1_path(
+                                raw_path,
+                                capture_status,
+                            )?;
+                            eprintln!(
+                                "carrick trace: AMP1 capture accepted (guest syscalls={}, host syscalls={}, mach traps={}, zfod={}, joins={})",
+                                capture
+                                    .totals
+                                    .get("guest-syscall-total")
+                                    .copied()
+                                    .unwrap_or_default(),
+                                capture
+                                    .totals
+                                    .get("host-syscall-entry-total")
+                                    .copied()
+                                    .unwrap_or_default(),
+                                capture
+                                    .totals
+                                    .get("mach-trap-entry-total")
+                                    .copied()
+                                    .unwrap_or_default(),
+                                capture
+                                    .fault_totals
+                                    .get("zfod")
+                                    .copied()
+                                    .unwrap_or_default(),
+                                capture.joins,
+                            );
+                        } else if requested_profile
+                            == crate::trace_profile::TraceProfileKind::NativeFault
                         {
                             let authority = native_profile_authority.clone().ok_or_else(|| {
                                 anyhow::anyhow!("NFAULT2 stream has no launch authority")
@@ -1801,6 +1867,15 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         if requested_profile == crate::trace_profile::TraceProfileKind::NativeShape
                         {
                             bail!("native-shape requires a Darwin/AArch64 host");
+                        }
+                        if requested_profile
+                            == crate::trace_profile::TraceProfileKind::NativeAmplification
+                        {
+                            // The AMP1 header is substituted from the Darwin
+                            // launch-qualification receipts, which is a macOS
+                            // path; an unauthenticated stream would be refused
+                            // by the reader anyway, so refuse it up front.
+                            bail!("native-amplification requires a Darwin/AArch64 host");
                         }
                         let mut summary = ProfileSummary::from_path(raw_path, capture_status)?;
                         summary.require_profile(requested_profile)?;

@@ -406,6 +406,319 @@ fn dsrprof2_rejects_corrupt_lifecycle_fixtures() {
     validate_dsrprof2_fixture(DSRPROF2_FIXTURE, &["--principal-drops", "1"]).failure();
 }
 
+/// The AMP1 fixture carries `@PROGRAM_SHA256@` rather than a literal digest.
+/// The header must name the digest of the *bundled template*, which changes
+/// every time the D program is edited, so a literal would make the fixture
+/// silently stale — and "stale fixture" and "rejected stream" would become
+/// indistinguishable, which is the exact failure this profile exists to avoid.
+const AMP1_FIXTURE: &str = include_str!("fixtures/amp1-valid.raw");
+const AMP1_PROGRAM: &str = include_str!("../../../scripts/dtrace/native-amplification.d");
+
+fn amp1_program_sha256() -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(AMP1_PROGRAM.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn amp1_stream() -> String {
+    AMP1_FIXTURE.replace("@PROGRAM_SHA256@", &amp1_program_sha256())
+}
+
+fn validate_amp1(contents: &str, extra_args: &[&str]) -> assert_cmd::assert::Assert {
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut file, contents.as_bytes()).unwrap();
+    let mut command = cli();
+    command
+        .arg("__native-profile-validate")
+        .arg("--input")
+        .arg(file.path())
+        .args(extra_args);
+    command.assert()
+}
+
+#[test]
+fn amp1_accepts_a_complete_amplification_capture() {
+    validate_amp1(&amp1_stream(), &[])
+        .success()
+        .stdout(contains("AMP1_VALID"));
+}
+
+#[test]
+fn amp1_rejects_a_wrong_backend_capture() {
+    // `native-syscall-service-*` never fires under the VMM backend, so every
+    // host call lands in `carrick-only` and the guest denominator is zero. That
+    // is a named error, never a summary of an empty ledger.
+    let wrong_backend = amp1_stream()
+        .replacen(
+            "AMP1|metric=guest-syscall-total|count=6",
+            "AMP1|metric=guest-syscall-total|count=0",
+            1,
+        )
+        .replacen("AMP1|guest_slot=58|count=4\n", "", 1)
+        .replacen("AMP1|guest_slot=224|count=2\n", "", 1);
+
+    validate_amp1(&wrong_backend, &[])
+        .failure()
+        .stderr(contains("wrong-backend"));
+}
+
+#[test]
+fn amp1_rejects_a_truncated_capture() {
+    let truncated = amp1_stream().replacen(
+        "AMP1|section=totals",
+        "AMP1|section=truncated|reason=bound-limit|elapsed_s=600|bound_limit_s=600\nAMP1|section=totals",
+        1,
+    );
+
+    validate_amp1(&truncated, &[])
+        .failure()
+        .stderr(contains("truncated"));
+}
+
+#[test]
+fn amp1_rejects_a_program_digest_mismatch() {
+    // A `--script` capture, or an edited program, cannot authenticate its own
+    // stream: the header must name the bundled template's digest.
+    let foreign = AMP1_FIXTURE.replace(
+        "@PROGRAM_SHA256@",
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    );
+
+    validate_amp1(&foreign, &[])
+        .failure()
+        .stderr(contains("does not name the bundled"));
+}
+
+#[test]
+fn amp1_rejects_nonzero_drop_counters_from_either_source() {
+    // In-band: the counters this program owns.
+    for (source, line) in [
+        ("dtrace-error", "AMP1|drop|source=dtrace-error|count=0"),
+        (
+            "service-window-reentry",
+            "AMP1|drop|source=service-window-reentry|count=0",
+        ),
+        (
+            "service-end-unmatched",
+            "AMP1|drop|source=service-end-unmatched|count=0",
+        ),
+    ] {
+        let dropped = amp1_stream().replacen(line, &line.replace("count=0", "count=3"), 1);
+        validate_amp1(&dropped, &[])
+            .failure()
+            .stderr(contains(source));
+    }
+
+    // Consumer-side: libdtrace's own drop counters are not readable from D, so
+    // they arrive through the run report and are enforced here.
+    for flag in [
+        "--principal-drops",
+        "--aggregation-drops",
+        "--dynamic-drops",
+        "--dynamic-rinse-drops",
+        "--dynamic-dirty-drops",
+        "--other-drops",
+    ] {
+        validate_amp1(&amp1_stream(), &[flag, "1"])
+            .failure()
+            .stderr(contains("drop"));
+    }
+}
+
+#[test]
+fn amp1_rejects_a_missing_drop_section() {
+    // Absent is not zero: a section that printed nothing must never be read as
+    // a section that printed a zero.
+    let without_drops = amp1_stream()
+        .lines()
+        .filter(|line| !line.starts_with("AMP1|drop") && *line != "AMP1|section=drops")
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    validate_amp1(&without_drops, &[])
+        .failure()
+        .stderr(contains("drops"));
+}
+
+#[test]
+fn amp1_rejects_corrupt_amplification_records() {
+    for corrupt in [
+        // `guest_slot=0` is unreachable by construction (1 is carrick-only and
+        // a guest op is `nr + 2`), so it means the encoding drifted.
+        amp1_stream().replacen("AMP1|guest_slot=58|count=4", "AMP1|guest_slot=0|count=4", 1),
+        // A stream that never reached its END clause.
+        amp1_stream().replacen("AMP1|complete|profile=native-amplification", "", 1),
+        // A required section that never printed.
+        amp1_stream().replacen("AMP1|section=faults\n", "", 1),
+        // A required total that never printed.
+        amp1_stream().replacen("AMP1|metric=mach-trap-cpu-ns|count=4000\n", "", 1),
+        // Wrong profile in the header.
+        amp1_stream().replacen(
+            "profile=native-amplification|raw_schema",
+            "profile=native-fault|raw_schema",
+            1,
+        ),
+        // Wrong raw schema.
+        amp1_stream().replacen(
+            "raw_schema=carrick.amplification.raw.v1",
+            "raw_schema=carrick.amplification.raw.v2",
+            1,
+        ),
+        // The declared buffer sizes must match the pragmas the bundled program
+        // actually ran with; they are determinants, not decoration.
+        amp1_stream().replacen("aggsize=64m", "aggsize=32m", 1),
+        // An unknown record kind.
+        amp1_stream().replacen(
+            "AMP1|section=drops",
+            "AMP1|section=drops\nAMP1|surprise|value=1",
+            1,
+        ),
+        // A duplicated aggregation row.
+        amp1_stream().replacen(
+            "AMP1|guest_slot=58|host=openat|count=7",
+            "AMP1|guest_slot=58|host=openat|count=7\nAMP1|guest_slot=58|host=openat|count=7",
+            1,
+        ),
+        // No header at all.
+        amp1_stream().lines().skip(1).collect::<Vec<_>>().join("\n"),
+    ] {
+        validate_amp1(&corrupt, &[]).failure();
+    }
+}
+
+/// The AMP1 header is a durable artifact and names the idioms it refuses, so a
+/// negative contract has to be asserted against the CODE, not the prose. D uses
+/// only block comments.
+fn strip_d_comments(source: &str) -> String {
+    let mut code = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(open) = rest.find("/*") {
+        code.push_str(&rest[..open]);
+        let after = &rest[open + 2..];
+        match after.find("*/") {
+            Some(close) => rest = &after[close + 2..],
+            None => return code,
+        }
+    }
+    code.push_str(rest);
+    code
+}
+
+#[test]
+fn native_amplification_program_scopes_bounds_and_sections_are_pinned() {
+    let script = AMP1_PROGRAM;
+    let code = strip_d_comments(script);
+    let code = code.as_str();
+
+    // Scoping: `tracked[]` from `$target` + `proc:::create`, never `execname`.
+    assert!(code.contains("tracked[$target] = 1;"));
+    assert!(code.contains("tracked[args[0]->pr_pid] = 1;"));
+    assert!(
+        !code.contains("execname"),
+        "carrick trace runs libdtrace in-process inside a `carrick` binary; an \
+         execname screen counts the tracer's own syscalls as the guest's"
+    );
+
+    // Four probe families, one program.
+    for probe in [
+        "carrick*:::native-syscall-service-entry",
+        "carrick*:::native-syscall-service-end",
+        "syscall:::entry",
+        "syscall:::return",
+        "mach_trap:::entry",
+        "mach_trap:::return",
+        "vminfo:::as_fault",
+        "vminfo:::zfod",
+        "vminfo:::cow_fault",
+    ] {
+        assert!(code.contains(probe), "missing probe {probe}");
+    }
+
+    // Guest ops cross the boundary as canonical NUMBERS, never as copied
+    // strings: the number is the typed domain the reader resolves.
+    assert!(
+        !code.contains("copyin"),
+        "the guest-op name is arg1 and the number is arg0; AMP1 keys on the \
+         number so no per-guest-syscall copyin exists"
+    );
+    assert!(code.contains("service_slot[pid, tid] = (uint64_t)arg0 + (uint64_t)2;"));
+
+    // No kernel-stack ranking, ever.
+    assert!(!code.contains("ustack("));
+    assert!(!code.contains("stack("));
+
+    // Every required section marker is an unconditional printf, and every
+    // required total is seeded so an empty aggregation still prints a zero.
+    for section in [
+        "AMP1|section=terminal-calls",
+        "AMP1|section=totals",
+        "AMP1|section=fault-totals",
+        "AMP1|section=guest-syscalls",
+        "AMP1|section=host-syscalls",
+        "AMP1|section=host-syscall-cpu",
+        "AMP1|section=host-syscall-returns",
+        "AMP1|section=mach-traps",
+        "AMP1|section=mach-trap-cpu",
+        "AMP1|section=mach-trap-returns",
+        "AMP1|section=faults",
+        "AMP1|section=drops",
+    ] {
+        assert_eq!(
+            code.matches(section).count(),
+            1,
+            "section marker {section} must be printed exactly once"
+        );
+    }
+    for seed in [
+        "@guest_total = sum(0);",
+        "@host_entry_total = sum(0);",
+        "@host_return_total = sum(0);",
+        "@host_cpu_total = sum(0);",
+        "@mach_entry_total = sum(0);",
+        "@mach_return_total = sum(0);",
+        "@mach_cpu_total = sum(0);",
+        "@fault_total[\"as_fault\"] = sum(0);",
+        "@fault_total[\"zfod\"] = sum(0);",
+        "@fault_total[\"cow_fault\"] = sum(0);",
+        "@drop_service_reentry = sum(0);",
+        "@drop_service_unmatched = sum(0);",
+    ] {
+        assert!(
+            code.contains(seed),
+            "printa on an empty aggregation prints nothing; missing seed {seed}"
+        );
+    }
+
+    // Nonzero retirement sentinels: assigning 0 deallocates the entry onto
+    // DTrace's dirty list.
+    assert!(code.contains("service_slot[pid, tid] = (uint64_t)1;"));
+    assert!(code.contains("self->amp_cpu = (uint64_t)1;"));
+    assert!(code.contains("self->amp_mach_cpu = (uint64_t)1;"));
+    assert!(!code.contains("self->amp_cpu = 0;"));
+
+    // Host CPU-ns is `vtimestamp`, never `timestamp`: a blocked call must not
+    // masquerade as kernel work.
+    assert!(code.contains("self->amp_cpu = vtimestamp + (uint64_t)1;"));
+    assert!(code.contains("self->amp_mach_cpu = vtimestamp + (uint64_t)1;"));
+
+    // The truncation marker and the declared, substitutable bound.
+    assert!(code.contains("AMP1|section=truncated|reason=bound-limit"));
+    assert_eq!(script.matches("/* CARRICK_AMP1_BOUND */").count(), 1);
+    assert!(
+        code.contains("bound_limit_s = (uint64_t)600;"),
+        "the unrendered template must stay a legal D program with its default"
+    );
+    assert_eq!(script.matches("/* CARRICK_AMP1_HEADER */").count(), 1);
+    assert_eq!(script.matches("/* CARRICK_AMP1_TERMINALS */").count(), 1);
+    assert!(
+        code.lines()
+            .all(|line| !line.starts_with("tick-") || line == "tick-10s"),
+        "the bound must not be frozen into a probe name"
+    );
+}
+
 #[test]
 fn trace_profile_argument_relationships_are_enforced() {
     cli()
