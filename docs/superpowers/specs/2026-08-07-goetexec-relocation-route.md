@@ -31,6 +31,17 @@ measured VIABLE) is the only live route for the arm64 ET_EXEC canonical
 lane.** This relocation route would have dominated it where applicable; it
 does not apply.
 
+> **Update, same day:** the metadata-free counter-proposal — value-range
+> scanning the 63% `.rodata` gap (treat any 8-aligned word whose value lies
+> in the PT_LOAD span as a pointer, with the unmapped-low-4-GiB SIGSEGV
+> net behind it) — was measured against the same two-base ground truth on
+> seven binaries and is **also UNSOUND**: perfect recall (0 false
+> negatives), but 9,150 false positives on `cmd/compile` alone
+> (`ssa.opcodeTable`, `uint64pow10`, type-descriptor scalars — all silent,
+> non-faulting corruptions the net cannot catch). See
+> [`2026-08-07-goetexec-value-range-scan-verdict.md`](2026-08-07-goetexec-value-range-scan-verdict.md).
+> Route C is closed from both directions.
+
 ---
 
 ## 1. Scope and the exact binaries measured
