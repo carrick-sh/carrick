@@ -2286,7 +2286,7 @@ fn refuse_removed_live_arena_knobs_from(
     } else {
         return Ok(());
     };
-    Err(RuntimeError::Unsupported(format!(
+    Err(RuntimeError::Configuration(format!(
         "{named} is set, but the live translation arena was removed in 1cb06de6 \
          (revert(native): remove the live translation arena runtime): it measured \
          ~36x slower on the cold go build and ~16% slower on the 20-exec micro \
@@ -9397,6 +9397,11 @@ mod tests {
             let error = refuse_removed_live_arena_knobs_from(policy, sizing)
                 .expect_err("a set live-arena knob must refuse");
             let message = error.to_string();
+            assert!(
+                message.starts_with("configuration refused:"),
+                "the refusal must surface labeled as a configuration refusal, \
+                 not wrapped as an execution failure: {message}"
+            );
             assert!(
                 message.contains("1cb06de6")
                     && message.contains("live translation arena was removed"),
