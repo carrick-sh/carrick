@@ -215,6 +215,13 @@ RUNGS: dict[str, dict[str, object]] = {
                 },
             ),
         ),
+        # Each arm gets a fresh CARRICK_DSR_STORE_DIR for the phase: consuming
+        # a persistent store populated under superblock-ON from a
+        # superblock-OFF run dies with "DSR cache policy error: shared block
+        # ... lost sensitive metadata identity" (observed live, 2026-08-07).
+        # A fresh per-arm store sidesteps the defect and keeps the arms
+        # store-warm after their warmup sample.
+        "fresh_store_per_arm": True,
         "ablation": False,
         "tier_census": False,
     },
@@ -471,13 +478,18 @@ def main() -> int:
             + "\n  ".join(reasons)
         )
 
-    arms = list(rung["arms"])  # type: ignore[arg-type]
+    arms = [(name, dict(overlay)) for name, overlay in rung["arms"]]  # type: ignore[union-attr]
     if args.engine == "docker":
         # The Docker phase is a single reference arm; overlays are Carrick-only.
         arms = [("docker", {})]
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    if args.engine == "carrick" and rung.get("fresh_store_per_arm"):
+        for name, overlay in arms:
+            store_dir = OUTPUT_DIR / f"store-rung{args.rung}-{stamp}-{name}"
+            store_dir.mkdir(parents=True, exist_ok=True)
+            overlay["CARRICK_DSR_STORE_DIR"] = str(store_dir)
     base = (
         pathlib.Path(args.output)
         if args.output
