@@ -216,6 +216,7 @@ extern "C" fn chew(_data: *const c_void, _arg: *mut c_void) -> c_int {
     DTRACE_CONSUME_THIS
 }
 
+// OPEN QUESTION (chip b294eb82, 2026-08-07): the DTRACEACT_EXIT branch below discards the exit status entirely, which is why `carrick trace -s` can exit 0 on a self-truncated capture — see docs/perf-results/2026-08-06-build-lane-amplification-ledger.md §8.
 extern "C" fn chewrec(_data: *const c_void, rec: *const c_void, _arg: *mut c_void) -> c_int {
     // NULL rec marks the end of this probe's records — advance to the next.
     if rec.is_null() {
