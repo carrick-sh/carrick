@@ -56,6 +56,16 @@ category-budgets §4e). Only the carrick-side numerator moved, so the gap widene
 from 6.963 to **7.555 CPU-s**. Every *estimated* band in §2 was derived before
 this refresh and is left unscaled — treat them as pre-drift lower bounds.
 
+> **Denominator moved again, 2026-08-07 (campaign close, after this plan was
+> written).** [`2026-08-07-post-move3-default-refresh.md`](../../perf-results/2026-08-07-post-move3-default-refresh.md)
+> re-measured median Carrick CPU at **19.795 s** (was 21.391 s here) after
+> folding in the campaign's shipped changes (chiefly the anon-reuse remap,
+> `52342762`). At 19.795 s the same 48.4067% kernel share gives **9.582
+> CPU-s** and the gap against the unchanged 2.800 CPU-s budget is
+> **6.782 CPU-s** (was 7.555). Every figure below this line that cites 7.555
+> is the pre-refresh number and is left as captured, not rewritten; read it
+> against 6.782 going forward.
+
 Source for the shares: category-budgets §2 and §4e. A third, independent confirmation of the
 shares landed the same week and is used below wherever a finer split is needed:
 `target/perf/attr36/W1OFF-attr.json` (schema `carrick.native-wall-attribution.v1`,
@@ -575,6 +585,20 @@ host-other zfod share at HEAD (§2/E0).
 > `MAP_FIXED|MAP_ANON` replacement (designed, NOT implemented — gates listed).
 > Partition, mechanism chain, and ceiling:
 > [`2026-08-07-build-lane-fault-partition.md`](../../perf-results/2026-08-07-build-lane-fault-partition.md).
+>
+> **Shipped 2026-08-07 (Task 7) — the in-window successor is DONE, not just
+> designed.** `52342762` (`feat(dsr): replace the anon-reuse memset with a
+> kernel-side remap`) landed exactly the `MAP_FIXED|MAP_ANON` replacement
+> named above: default ON, hatch `CARRICK_DSR_ZERO_REMAP=0`. The mechanism
+> proof collapses the (b) slice from 550,100 to 33/24 own-biased-backing
+> zfod; the retention ABBA measured **−0.660 CPU-s [−0.750, −0.570]
+> (−3.24%)**, folded into the post-Move-3 official scoreboard
+> (10.8586x → 10.1806x, median Carrick CPU 21.391 s → 19.795 s). E2-proper
+> (the out-of-window 63.3% host-other allocation-churn mass) is untouched
+> by this change and remains open for a future session. Evidence:
+> [`2026-08-07-anon-reuse-remap.md`](../../perf-results/2026-08-07-anon-reuse-remap.md);
+> §3's Task 7 section below records what actually shipped instead of the
+> prescription it was written against.
 
 ### E3 — guest decommit intent → `zero_backing` memset instead of `MADV_FREE_REUSABLE`
 
@@ -936,6 +960,39 @@ Sequenced strictly after Task 4's confirmation.
   ABBA discipline is explicitly *not* relaxed by the re-opening.
 
 ### Task 7 — E3: decommit intent lowering
+
+> **Superseded 2026-08-07 — Task 7 shipped a different, higher-priority
+> successor instead of the prescription below.** By the time Task 7 ran,
+> Task 6's fault partition (§2/E2 above) had already identified the
+> in-`mmap`-window whole-range scrub — not guest `MADV_DONTNEED` decommit —
+> as 99.4% of the in-window zfod mass, and had named its own successor
+> design (the kernel-side `MAP_FIXED|MAP_ANON` anonymous-reuse replacement).
+> Task 7 built and shipped **that** successor instead (`52342762`, hatch
+> `CARRICK_DSR_ZERO_REMAP=0`, ABBA-retained at −0.660 CPU-s
+> [−0.750, −0.570]) — see
+> [`2026-08-07-anon-reuse-remap.md`](../../perf-results/2026-08-07-anon-reuse-remap.md).
+> **The prescription below was never executed:** `CARRICK_DECOMMIT_REUSABLE`
+> does not exist anywhere in the tree, and no `MADV_DONTNEED` → `MADV_FREE_REUSABLE`
+> lowering was built. E3's own status, from the 2026-08-06 ledger's §11
+> measurement (not this task): **refuted on this lane's kernel-CPU term** —
+> guest `madvise` count is 415–528/build, in-window host CPU ≈ noise. Only
+> the userspace memset share, invisible to the AMP1 instrument, remains a
+> theoretical case, and it was never measured. A future session picking
+> this up should read E3 as: kernel-CPU case closed-negative, userspace
+> case open and un-campaigned — not as an unstarted task.
+>
+> **E4 and E5, status for a future session (same closure, since neither got
+> its own task write-up here):** **E4** (`HostAliasTransactions` gate scope,
+> nominally Task 8 below) was never re-derived — still "unchanged: re-derive"
+> per the 2026-08-06 ledger §11, `swtch_pri` context only, no code change
+> authorized, no arm-B/arm-C topology sweep taken at HEAD. **E5** (the
+> build-lane fs family) also remains unmeasured on its own question — the
+> closed 68,849-host-`close`-per-exec fix
+> ([`2026-08-07-exec-close-diagnosis.md`](../../perf-results/2026-08-07-exec-close-diagnosis.md))
+> is a *different* entry (the process/container-lifecycle family, ledger
+> rank 4: stat-cache dirfd interning), not E5's own blocker (the
+> `carrick-only` `fstatat64` 32→5,802 bisect) — E5 itself was neither
+> bisected nor pursued this campaign.
 
 - **Red first:** a probe asserting `MADV_DONTNEED` on a private anon range reads
   back zero **and** that host residency fell, read via `mach_vm_region` (macOS

@@ -157,6 +157,22 @@ capture's zero exit remains that authority). Measured baseline and the
 partition it exists to gate:
 [`perf-results/2026-08-07-build-lane-fault-partition.md`](perf-results/2026-08-07-build-lane-fault-partition.md).
 
+### Host `close(2)` attribution inside a guest `execve` window (bare script)
+
+[`scripts/dtrace/native-exec-close-attribution.d`](../scripts/dtrace/native-exec-close-attribution.d)
+brackets every host `close` between a guest `execve`'s service-entry and the
+matching host `execve`, and stack-samples the caller (symbolize offline
+against the process's own `vmmap` __TEXT base — ~70 self-re-exec'd guest
+processes carry independent ASLR slides, so `carrick*:::host-image-base`
+or a concurrent `vmmap` poll is required). It cracked the `--fs host`
+stat-cache dirfd storm (74,253 → 5,404 closes per exec-heavy build):
+[`perf-results/2026-08-07-exec-close-diagnosis.md`](perf-results/2026-08-07-exec-close-diagnosis.md).
+Run it with `-s`, not `--profile`: per AGENTS.md's "Rust first" rule a new
+`.d` program should arrive as a `TraceProfileKind` with a typed analyzer,
+and this one has not been promoted yet. It stays a bare, committed script
+(full three-part durable-artifact header, smoke-tested) until someone does
+that promotion — recorded here rather than left silently unreferenced.
+
 ### Profiling a running FreeBSD native-x86 process
 
 Launch-time `carrick trace --profile dsr` owns its target and may use Carrick

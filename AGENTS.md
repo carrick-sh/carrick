@@ -351,11 +351,15 @@ elegance, generality or effort saved second. Overhead is not a "later"
 concern — it is half the product.
 
 - **The overhead bar is WITHIN 2x of native-arm64 Docker** on the same workload.
-  That is the number to rank against. As of 2026-08-01 the native lane is
-  **~14.5x** on the cold go-build, so reaching the bar means removing roughly
-  93% of all non-guest CPU — every overhead bucket, not one of them. Rank work
-  by whether it can plausibly be a multiple, and be honest that a 3-15%
-  improvement does not move a 14.5x ratio. Evidence:
+  That is the number to rank against. As of 2026-08-01 the native lane was
+  **~14.5x** on the cold go-build; **as of 2026-08-07** (the Move-3 campaign's
+  closing refresh, after the anon-reuse-remap and stat-cache-interning fixes)
+  the official shipped-default ratio is **10.1806x**
+  ([`docs/perf-results/2026-08-07-post-move3-default-refresh.md`](docs/perf-results/2026-08-07-post-move3-default-refresh.md)),
+  so reaching the 2x bar still means removing **80.36%** of current Carrick
+  wall — every overhead bucket, not one of them. Rank work by whether it can
+  plausibly be a multiple, and be honest that a 3-15% improvement does not
+  move a double-digit ratio. Original evidence:
   [`docs/perf-results/2026-08-01-native-wall-audit-and-fault-cost.md`](docs/perf-results/2026-08-01-native-wall-audit-and-fault-cost.md).
 - **The build-lane CPU split, with the correction that supersedes it.** An
   earlier reading of the budget put carrick's own host userspace at 36.9% of CPU
@@ -421,8 +425,14 @@ concern — it is half the product.
     is reachable. **Open regression:** `carrick-only` `fstatat64` on this
     fixture went 32 (2026-08-02) → 5,802 (HEAD) with every guest-joined column
     flat — bisect that before starting a new fs lever;
-  - guest `mmap(MAP_PRIVATE, fd)` → a `pread` of the FULL mapping length into
-    fresh anon (`dispatch/mem.rs:2517`), instead of a host file-backed mmap;
+  - guest `mmap(MAP_PRIVATE, fd)` → **lowered 2026-08-07** to a host
+    `MAP_PRIVATE|MAP_FIXED` file mmap (was a `pread` of the FULL mapping
+    length into fresh anon at `dispatch/mem.rs:2517`), default ON, hatch
+    `CARRICK_MMAP_FILE_BACKED=0` (the sibling of `CARRICK_DSR_ZERO_REMAP`
+    below). Fixes a real Linux divergence (private beyond-EOF SIGBUS), but
+    its build-lane population is only 18 calls / 3.8 MiB/build — not the
+    kernel-CPU lever this bullet originally named; see the fault-term
+    correction below;
   - guest `execve` → WAS 4 full ELF materializations + 3 SHA-256 passes; the
     2026-08-02 exec lanes removed the payload hashing (metadata-only
     `ArtifactDigestCoverage`, hatch `CARRICK_EXEC_FAST=0`) and map eligible
