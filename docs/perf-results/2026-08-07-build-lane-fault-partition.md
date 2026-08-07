@@ -65,14 +65,30 @@ This entry partitions the mass into the four candidate owners the brief names:
   `capture.log`, `head-partition-summary.txt`). Counts are the claim; the
   fault instrument's perturbation is VERY HIGH and no wall from any traced
   run is citable.
-- Corroborating offline join: the **existing Task-4 receipts unchanged**
+- Corroborating offline re-parse: the **existing Task-4 receipts unchanged**
   (`target/perf/task4-e0/nfault-{a,b}.raw`, captured at the `623ea52b` tip,
   binary `2913209a…`, same image/fixture, both rc 0, zero drop/violation
-  counters — the same pair E0's §7 ownership verdict rests on), joined by
-  `target/perf/task6-e2/offline-join-e0arms.txt`. Two binaries two days
-  apart, one partition.
+  counters — the same pair E0's §7 ownership verdict rests on), re-analyzed
+  by `carrick debug native-fault-partition` (§3 instrument note). Two
+  binaries two days apart, one partition.
+- Re-parse receipts (all produced by the typed subcommand, binary
+  `aa33e7df…`):
+
+  | file | SHA-256 |
+  |---|---|
+  | `task6-e2/offline-join-e0arms.txt` | `ecd911b79d8777d4bba67abc5e5e478b9aa4abb23c31d0c173a21f0c58de874a` |
+  | `task6-e2/offline-join-headarms.txt` | `0e0ef65a7f40b964d06554213e25615638fca39556193aeda02b42e6f56d8f32` |
+  | `task6-e2/e0-a.reparse.summary.jsonl` | `152dc0d3e043607b8ae41c03edbe3baddd79b2dcbf9d2f6357cfb3eb3869e0aa` |
+  | `task6-e2/e0-b.reparse.summary.jsonl` | `a6cb2184687c05d02efb6add2ab44175c5d3b2612c76cfc22f73ef734d03b522` |
+  | `task6-e2/head-a.reparse.summary.jsonl` | `f171f2f3df2f65704721086df27e961e0ff304d1a4f24d4b660f2eb62f67a411` |
+  | `task6-e2/head-b.reparse.summary.jsonl` | `f389bf004cb318a3807326adb5367301350a737c49e486228c6b56db7ed80207` |
+
 - Gate: `just ci` exit 0 at the parser change
-  (`target/perf/task6-e2/just-ci-2.log`).
+  (`target/perf/task6-e2/just-ci-2.log`) and at the offline-subcommand change
+  (`just-ci-4.log`; the intervening `just-ci-3.log` run failed on the known
+  jit-shape >1 MiB test-frame margin — the `0fed371b`-predicted recurrence,
+  bounded in this change set and chip-filed for the family fix — not on
+  anything this entry measures).
 
 ## 3. The partition
 
@@ -97,25 +113,50 @@ candidates imported from the runtime's `carrick_dsr::address::BIAS_CANDIDATES`
 re-export, not hand-copied). Every future native-fault capture now publishes
 this partition, which is the successor's red-first gate.
 
-E0-tip arms (offline join over the committed Task-4 raws; both arms, agreeing
-to 0.01%):
+**Offline corroboration is one command, not a re-implementation.**
+`carrick debug native-fault-partition <raw> [--output <jsonl>]` re-analyzes an
+ARCHIVED raw: it trusts exactly the raw's own capture-time-authenticated
+header, refuses by digest any raw whose `program_sha256` is not the bundled
+`native-fault-attribution.d` (the `amplification-ledger` rule — this parser
+interprets records that program defines), and emits the same v4 summary the
+capture would have (test-pinned byte-equality against the capture-time parse).
+Stated scope limit: libdtrace's consumer-side drop counters are not
+re-checkable offline (the NFAULT2 stream has no in-band drop record), so the
+capture command's zero exit remains the drop authority — the offline path
+corroborates published partitions; it does not admit failed captures. The
+E0-tip numbers below are this command's output over the committed Task-4 raws
+(`target/perf/task6-e2/offline-join-e0arms.txt`, regenerated; the first
+edition of that receipt came from an ad-hoc script, which is precisely the
+gap this subcommand closes).
 
-| slice | owner | arm A | arm B | share of in-window |
+Slice definitions, exhaustive so each column sums to its total exactly:
+**(b)** = every `own-biased-backing` row (all mmap sub-shapes plus the 2–6
+in-window `madvise-dontneed` scrubs); **(c)** = every `carrick-host` row;
+**(d)** = every `other-high` row (the file-private residue plus 1–2
+`MAP_FIXED`-commit stragglers). The totals below are ALL in-op zfod (every
+guest memory op, not just mmap), which is what the analyzer's closure
+assertion covers.
+
+E0-tip arms (re-parsed from the committed Task-4 raws with
+`carrick debug native-fault-partition`; both arms, agreeing to 0.01%):
+
+| slice | owner | arm A | arm B | share of in-op |
 |---|---|---:|---:|---:|
-| **(b) whole-range scrub, op's own biased backing** | carrick `zero_anonymous_reuse` | **550,100** | **550,086** | **99.41%** |
+| **(b) whole-range scrub, op's own biased backing** | carrick `zero_anonymous_reuse` | **550,103** | **550,092** | **99.40%** |
 | — of which: 66 hint-less **128 MiB `PROT_NONE` reserves** | | 540,475 | 540,472 | 97.7% |
 | — `MAP_FIXED` commits (Go `sysMap`) | | 5,787 | 5,782 | 1.0% |
-| — plain anon + smaller reserves | | ~3,840 | ~3,830 | 0.7% |
-| (c) carrick host heap (< every bias candidate) | libmalloc during service | 2,999 | 2,987 | 0.54% |
-| (d) file-path residue (pre-E1 eager materialization + loader) | | 244 | 242 | 0.04% |
+| — plain anon, smaller reserves, madvise scrubs | | 3,841 | 3,838 | 0.7% |
+| (c) carrick host heap (< every bias candidate) | libmalloc during service | 3,070 | 3,061 | 0.55% |
+| (d) other-high (file-private residue) | | 244 | 242 | 0.04% |
 | (a) guest natural first touch in-window | — | 0 by construction | 0 | 0% |
-| **total in-mmap-window zfod** | | **553,343** | **553,315** | 100% |
+| **total in-op zfod** | | **553,417** | **553,395** | 100% |
 
-(Full bucket listing, including the 74/80 non-mmap in-op faults that close the
-export total exactly: `target/perf/task6-e2/offline-join-e0arms.txt`.)
+(Full bucket listing: `target/perf/task6-e2/offline-join-e0arms.txt`,
+regenerated by the typed subcommand — see the instrument note.)
 
 Fresh HEAD typed arms (schema v4 summaries, post-E1 binary `e0c8997e…`; every
-row closure-asserted against `active_memory_faults`, 553,595 / 553,351):
+row closure-asserted against `active_memory_faults`, 553,595 / 553,351, and
+each column below sums to exactly that total):
 
 | slice | HEAD arm a | HEAD arm b | share |
 |---|---:|---:|---:|
@@ -123,19 +164,20 @@ row closure-asserted against `active_memory_faults`, 553,595 / 553,351):
 | — `mmap-anon-reserve / own-biased-backing` alone | 544,014 | 543,802 | 98.27% |
 | — `mmap-anon-fixed-commit / own-biased-backing` | 6,015 | 6,014 | 1.09% |
 | (c) carrick-host in-window (all shapes) | 3,041 | 3,029 | 0.55% |
-| (d) `mmap-file-private / other-high` | 221 | 220 | 0.04% |
+| (d) other-high (file-private 221/220 + fixed-commit strays 2/1) | 223 | 221 | 0.04% |
 
-The four arms — two binaries, two days apart, offline join vs typed v4 — agree
-on every headline row to 0.05%. The HEAD ownership census in the same
-summaries reads host-other zfod 62.997% / 63.185% (scaled 963,520 / 967,040),
-consistent with E0's confirmation pair.
+The four arms — two binaries, two days apart, two independent classifier
+implementations — agree on every headline row to 0.05%. The HEAD ownership
+census in the same summaries reads host-other zfod 62.997% / 63.185% (scaled
+963,520 / 967,040), consistent with E0's confirmation pair.
 
 **Slice (a) sits outside the window by construction** (guest code does not run
-inside its own syscall's service window). Its measured size *today*: the
-ownership census's guest-owned scaled estimate (~563k) minus the in-window
-guest-biased mass (~550k) leaves **~10–13k guest natural first-touch zfod per
-build** — the scrub pre-faults nearly every guest page before the guest can
-touch it.
+inside its own syscall's service window). Its measured size *today*, from the
+committed HEAD summaries: guest-owned scaled estimate minus the in-window
+own-biased mass = 565,952 − 550,331 = **15,621** (arm a) and 563,456 −
+550,101 = **13,355** (arm b) — **~13–16k guest natural first-touch zfod per
+build**, sampling-scaled. The scrub pre-faults nearly every guest page before
+the guest can touch it.
 
 ## 4. The mechanism, code-cited
 
@@ -169,9 +211,24 @@ arm A):
    (slice c).
 6. 66 such ops per build (one per guest process, Go startup) × ~8,192 fresh
    pages = **540k zfod ≈ 8.3 GB of zero-fill first touch, for memory that is
-   provably zero already** (never touched, half of it never even allocated
-   before — the stale test is a single boolean on the start address, and the
-   scrub length is the full request).
+   provably zero already.**
+
+**The "provably zero" claim rests on the fault outcome itself, not on the
+bookkeeping argument.** Every exported fault event in these raws is
+`outcome=zfod` — a zero-fill fault means the faulting page had **no backing at
+the moment the scrub wrote it**, so Darwin was already going to deliver a zero
+page and the scrubbed byte read zero mechanically. That is stronger than, and
+independent of, the `mmap_dirty_high` chain above: the high-water argument
+only explains why the scrub *fired* (the `reused` flag over-approximates
+dirtiness — it is raised by allocation, and the free-region arm at
+`dispatch/mem.rs:1466` returns `reused=true` unconditionally). The
+over-approximation is not itself a bug to delete: that same free-region arm
+also reclaims **genuinely dirty** holes, and the scrub-site comment at
+`dispatch/mem.rs:2350-2358` records the real corruption it prevents (a CPython
+`multiprocessing.Pool` built on a freed 16 MiB buffer's stale bytes →
+SIGSEGV). The waste is the eager whole-range **touch**, not the guarantee —
+which is exactly why the successor must replace the primitive rather than
+weaken the trigger (§7).
 
 Why the record misread this twice:
 
@@ -197,12 +254,12 @@ One story, three instruments, no silent gaps:
 |---|---:|---|
 | in-window zfod (AMP1, E0 arm A) | 553,526 | `carrick trace --profile native-amplification` |
 | in-window zfod (AMP1, e1on, post-E1) | 552,996 | task-5 receipts |
-| in-op zfod (NFAULT2, arms A/B) | 553,417 / 553,395 | this entry's join |
-| — scrub own-backing (b) | 550,100 / 550,086 | v4 partition |
-| — carrick heap in-window (c) | 2,999 / 2,987 | v4 partition |
-| guest-owned sampled zfod, scaled | ~563k (36.74%) | birth-keyed ownership census |
-| host-other sampled zfod | 63.26%/63.30% (≈970k) | ownership census (E0 §7, CONFIRMED) |
-| unexported (outside ops, non-arena-window) | 982,254 | NFAULT2 census |
+| in-op zfod (E0 A/B; HEAD a/b) | 553,417 / 553,395; 553,595 / 553,351 | `carrick debug native-fault-partition` / v4 summaries |
+| — scrub own-backing (b) | 550,103 / 550,092; 550,331 / 550,101 | v4 partition |
+| — carrick heap in-window (c) | 3,070 / 3,061; 3,041 / 3,029 | v4 partition |
+| guest-owned sampled zfod, scaled | E0 arms 563,520 / 563,200; HEAD arms 565,952 / 563,456 | birth-keyed ownership census |
+| host-other sampled zfod | 63.26%/63.30% at E0; 62.997%/63.185% at HEAD | ownership census (E0 §7, CONFIRMED) |
+| unexported (outside ops, non-arena-window) | E0 arms 982,254 / 981,522; HEAD arms 983,326 / 979,362 | NFAULT2 census (`memory_census.unexported_zfod` per summary) |
 
 - The **host-other 63.3%** mass is untouched by this entry: it remains
   carrick's own allocation churn (owner portfolio at HEAD:
@@ -268,7 +325,11 @@ intact. The aarch64 lowering is the same call at `host_address(guest_va)`
 5. **Do not** implement the alternative (a writability-epoch dirty tracker
    that skips provably-clean scrubs) first: it is more state, misses
    dirty-reuse, and only helps the case the replacement already makes free.
-   Reconsider it only if the replacement's ABBA is a wash.
+   Reconsider it only if the replacement's ABBA is a wash. And never weaken
+   the *trigger*: `reused` over-approximating dirtiness is what protects the
+   genuinely dirty free-region reuse the `dispatch/mem.rs:2350-2358` comment
+   records (the CPython Pool corruption) — the replacement keeps that
+   guarantee by construction, a skip heuristic must prove it.
 
 **Honest ceiling.** Removes up to ~553k zfod/build (36% of all zfod), minus
 resurfaced guest natural touches for pages the guest actually uses:
