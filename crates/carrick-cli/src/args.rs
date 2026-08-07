@@ -1019,6 +1019,22 @@ pub(crate) enum DebugCommand {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Re-analyze an ARCHIVED `NFAULT2` native-fault capture offline: print
+    /// the bias-aware `memory_fault_partition` table and optionally publish
+    /// the full `carrick.native-fault-attribution.v4` summary record.
+    /// Corroborating a published partition is one command against the
+    /// archived raw. The raw's header `program_sha256` must name the bundled
+    /// `native-fault-attribution.d` or the command refuses by digest; the
+    /// capture command's own zero exit remains the drop authority (the
+    /// stream carries no in-band consumer-drop record).
+    NativeFaultPartition {
+        /// Complete `NFAULT2` stream from `carrick trace --profile
+        /// native-fault -o`.
+        raw: PathBuf,
+        /// Publish the full summary JSONL without overwriting an artifact.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Parse a complete `CARRICK_EXEC_STAMPS` v2 export, validate every
     /// fork/exec/exit/reap relationship, and print CPU/wall attribution JSON.
     ExecStampCensus {

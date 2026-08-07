@@ -995,11 +995,117 @@ impl NativeFaultValidator {
     }
 }
 
+/// The four header identities a parse binds into the summary. Sourced from
+/// the launch authority on the capture path, and from the raw's own
+/// authenticated header on the archived re-parse path.
+struct HeaderIdentity {
+    os_build: String,
+    program_sha256: String,
+    birth_qualification_sha256: String,
+    terminal_qualification_sha256: String,
+}
+
 impl NativeFaultSummary {
     pub(crate) fn from_path(
         path: &Path,
         capture: ProfileCaptureStatus,
         authority: V2ProfileAuthority,
+    ) -> Result<Self> {
+        let expected_header = authority.header_record()?;
+        let identity = HeaderIdentity {
+            os_build: authority.os_build().to_owned(),
+            program_sha256: authority.program_sha256().to_owned(),
+            birth_qualification_sha256: authority.birth_qualification_sha256().to_owned(),
+            terminal_qualification_sha256: authority.terminal_qualification_sha256().to_owned(),
+        };
+        Self::parse_stream(path, capture, expected_header, identity)
+    }
+
+    /// Re-analyze an ARCHIVED `NFAULT2` raw with no live launch authority.
+    ///
+    /// The raw's own first record is the authenticated header the capture-time
+    /// validator byte-compared against the launch authority; this path trusts
+    /// exactly that line, and only after requiring its `program_sha256` to
+    /// equal the digest of the CURRENTLY BUNDLED `native-fault-attribution.d`
+    /// (the `amplification-ledger` rule): a raw from an edited or older
+    /// program is refused by name, because this parser interprets the records
+    /// that program defines. The birth/terminal qualification digests and
+    /// `os_build` are carried from the header — they were validated at launch.
+    ///
+    /// Scope limit, stated where it will be read: libdtrace's consumer-side
+    /// drop counters are not re-checkable offline (the NFAULT2 stream has no
+    /// in-band drop record), so the capture command's zero exit remains the
+    /// drop authority. This path exists so a PUBLISHED partition can be
+    /// corroborated from its archived receipts with one command, not so a
+    /// failed capture can be laundered into evidence.
+    pub(crate) fn from_archived_path(path: &Path) -> Result<Self> {
+        let reader = BufReader::new(
+            File::open(path)
+                .with_context(|| format!("open native-fault stream {}", path.display()))?,
+        );
+        let mut header_line = None;
+        for (index, line) in reader.lines().enumerate() {
+            let line = line.with_context(|| format!("read native-fault line {}", index + 1))?;
+            if line.is_empty() {
+                continue;
+            }
+            header_line = Some((line, index + 1));
+            break;
+        }
+        let Some((line, line_number)) = header_line else {
+            bail!("archived native-fault stream {} is empty", path.display());
+        };
+        let record = RawRecord::parse(&line, line_number)?;
+        if record.kind != "header" {
+            bail!(
+                "archived native-fault stream {} does not begin with its header record",
+                path.display()
+            );
+        }
+        record.require_fields(
+            &[
+                "profile",
+                "raw_schema",
+                "os_build",
+                "program_sha256",
+                "birth_qualification_sha256",
+                "terminal_qualification_sha256",
+                "page_sample_modulus",
+            ],
+            line_number,
+        )?;
+        if record.text("profile")? != "native-fault" {
+            bail!(
+                "archived stream names profile {:?}, not native-fault",
+                record.text("profile")?
+            );
+        }
+        let bundled = format!(
+            "{:x}",
+            Sha256::digest(carrick_runtime::dtrace_consumer::BUNDLED_NATIVE_FAULT_D)
+        );
+        let program_sha256 = record.text("program_sha256")?.to_owned();
+        if program_sha256 != bundled {
+            bail!(
+                "archived native-fault stream names program digest {program_sha256} rather than \
+                 the bundled native-fault-attribution.d ({bundled}); re-parse it with the carrick \
+                 revision that captured it"
+            );
+        }
+        let identity = HeaderIdentity {
+            os_build: record.text("os_build")?.to_owned(),
+            program_sha256,
+            birth_qualification_sha256: record.text("birth_qualification_sha256")?.to_owned(),
+            terminal_qualification_sha256: record.text("terminal_qualification_sha256")?.to_owned(),
+        };
+        Self::parse_stream(path, ProfileCaptureStatus::default(), line, identity)
+    }
+
+    fn parse_stream(
+        path: &Path,
+        capture: ProfileCaptureStatus,
+        expected_header: String,
+        identity: HeaderIdentity,
     ) -> Result<Self> {
         require_lossless_capture(capture)?;
         let raw = fs::read(path)
@@ -1009,7 +1115,6 @@ impl NativeFaultSummary {
             File::open(path)
                 .with_context(|| format!("open native-fault stream {}", path.display()))?,
         );
-        let expected_header = authority.header_record()?;
         let mut validator = NativeFaultValidator::default();
         for (index, line) in reader.lines().enumerate() {
             let line_number = index + 1;
@@ -1301,13 +1406,13 @@ impl NativeFaultSummary {
                 kind => bail!("line {line_number}: unknown NFAULT2 record kind {kind:?}"),
             }
         }
-        Self::finish(validator, capture, authority, expected_header, raw_sha256)
+        Self::finish(validator, capture, identity, expected_header, raw_sha256)
     }
 
     fn finish(
         mut validator: NativeFaultValidator,
         capture: ProfileCaptureStatus,
-        authority: V2ProfileAuthority,
+        identity: HeaderIdentity,
         authority_header: String,
         raw_sha256: String,
     ) -> Result<Self> {
@@ -1481,10 +1586,10 @@ impl NativeFaultSummary {
             perturbation: "high; traced elapsed time is diagnostic only",
             raw_sha256,
             authority_header,
-            os_build: authority.os_build().to_owned(),
-            program_sha256: authority.program_sha256().to_owned(),
-            birth_qualification_sha256: authority.birth_qualification_sha256().to_owned(),
-            terminal_qualification_sha256: authority.terminal_qualification_sha256().to_owned(),
+            os_build: identity.os_build,
+            program_sha256: identity.program_sha256,
+            birth_qualification_sha256: identity.birth_qualification_sha256,
+            terminal_qualification_sha256: identity.terminal_qualification_sha256,
             page_sample_modulus: PAGE_SAMPLE_MODULUS,
             capture,
             completion,
@@ -1596,6 +1701,34 @@ impl NativeFaultSummary {
             .iter()
             .find(|row| row.outcome == outcome)
             .map(|row| row.count)
+    }
+
+    /// Deterministic human table of the v4 partition, one line per row plus
+    /// the closure line — the corroboration receipt `carrick debug
+    /// native-fault-partition` prints for an archived raw.
+    pub(crate) fn render_partition_table(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "native-fault-partition raw_sha256={} program_sha256={}\n",
+            self.raw_sha256, self.program_sha256
+        ));
+        let mut total = 0u64;
+        for row in &self.memory_fault_partition {
+            total = total.saturating_add(row.exact_zfod);
+            out.push_str(&format!(
+                "  {:<26} {:<20} {:>9}  {:>8.4}%\n",
+                row.operation_shape,
+                row.fault_locus,
+                row.exact_zfod,
+                row.share_of_active_memory_faults * 100.0
+            ));
+        }
+        out.push_str(&format!(
+            "  closure: partition_total={total} active_memory_faults={} exact_zfod={}\n",
+            self.memory_census.active_memory_faults,
+            self.exact_total("zfod").unwrap_or(0)
+        ));
+        out
     }
 
     fn ownership_bucket(
@@ -2569,6 +2702,30 @@ fn summarize_memory_intent(
     Ok((memory_operations, memory_faults, memory_fault_partition))
 }
 
+/// `carrick debug native-fault-partition` — re-analyze an ARCHIVED `NFAULT2`
+/// raw and publish the full `carrick.native-fault-attribution.v4` summary
+/// (partition included), so corroborating a published partition is one
+/// command against the archived receipt instead of a re-implementation of
+/// the classifier. Authentication and scope limits:
+/// [`NativeFaultSummary::from_archived_path`].
+pub(crate) fn run_native_fault_partition(raw: &Path, output: Option<&Path>) -> Result<()> {
+    let executable =
+        std::env::current_exe().context("resolve running native-fault-partition executable")?;
+    let command: Vec<String> = std::env::args().collect();
+    let mut summary = NativeFaultSummary::from_archived_path(raw)
+        .with_context(|| format!("admit archived native-fault capture {}", raw.display()))?;
+    summary.set_provenance(crate::trace_profile::capture_provenance(
+        &executable,
+        &command,
+    )?);
+    eprintln!("{}", summary.render_human());
+    print!("{}", summary.render_partition_table());
+    if let Some(path) = output {
+        summary.write_atomic(path, None)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2810,6 +2967,81 @@ mod tests {
         // At-or-above the lowest candidate but outside the own range.
         let rows = case("0x8100000000", "3");
         assert_eq!(rows[0]["fault_locus"], "other-high");
+    }
+
+    /// The offline corroboration path: an archived raw re-parses to the SAME
+    /// summary the capture-time parse produced (partition included), and a
+    /// raw naming any other program digest is refused by name — the parser
+    /// interprets records the bundled D program defines, so a `--script` or
+    /// older-revision capture cannot be laundered through the offline path.
+    #[test]
+    fn reparses_an_archived_raw_and_refuses_a_foreign_program_digest() {
+        let bundled = format!(
+            "{:x}",
+            Sha256::digest(carrick_runtime::dtrace_consumer::BUNDLED_NATIVE_FAULT_D)
+        );
+        let archived_raw = fixture().replace(PROGRAM_SHA256, &bundled);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("archived.trace");
+        fs::write(&path, &archived_raw).expect("write archived raw");
+
+        let archived =
+            NativeFaultSummary::from_archived_path(&path).expect("archived raw re-parses");
+        let live_authority = V2ProfileAuthority::new_for_profile(
+            TraceProfileKind::NativeFault,
+            "26A5388g",
+            &bundled,
+            BIRTH_SHA256,
+            TERMINAL_SHA256,
+            [
+                ("syscall".to_owned(), "exit".to_owned(), "thread".to_owned()),
+                (
+                    "syscall".to_owned(),
+                    "exit_group".to_owned(),
+                    "process".to_owned(),
+                ),
+            ],
+            None,
+            None,
+        )
+        .expect("live authority");
+        let live =
+            NativeFaultSummary::from_path(&path, ProfileCaptureStatus::default(), live_authority)
+                .expect("capture-time parse");
+        assert_eq!(
+            serde_json::to_value(&archived).expect("serialize archived"),
+            serde_json::to_value(&live).expect("serialize live"),
+            "offline re-parse must reproduce the capture-time summary byte-for-byte"
+        );
+        assert!(
+            archived.render_partition_table().contains("closure:"),
+            "partition table must publish its closure line"
+        );
+
+        // A raw naming any other program digest is a named refusal.
+        let foreign_path = directory.path().join("foreign.trace");
+        fs::write(&foreign_path, fixture()).expect("write foreign raw");
+        let error = NativeFaultSummary::from_archived_path(&foreign_path)
+            .expect_err("foreign program digest must refuse");
+        assert!(
+            format!("{error:#}").contains("rather than the bundled"),
+            "expected bundled-digest refusal, got {error:#}"
+        );
+
+        // A stream that does not lead with its header is refused before any
+        // record is interpreted.
+        let headless_path = directory.path().join("headless.trace");
+        fs::write(
+            &headless_path,
+            "NFAULT2|birth|pid=9|start_sec=90|start_usec=9\n",
+        )
+        .expect("write headless raw");
+        let error = NativeFaultSummary::from_archived_path(&headless_path)
+            .expect_err("headless raw must refuse");
+        assert!(
+            format!("{error:#}").contains("does not begin with its header"),
+            "expected header-first refusal, got {error:#}"
+        );
     }
 
     #[test]
