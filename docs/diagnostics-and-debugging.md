@@ -87,6 +87,53 @@ measurements. The supported commands, schema, measured overhead, current long
 poles, and interruption behavior are recorded in the
 [native DSR profile report](native-dsr-dtrace-profile.md).
 
+### The Darwin kernel amplification ledger (`native-amplification`)
+
+`carrick trace --profile native-amplification` answers "how much Darwin kernel
+work does ONE Linux guest operation cost", in the four currencies a
+CPU-second budget can be ranked against: host syscall count, host syscall
+**CPU-ns** (`vtimestamp`, so a blocked call is not counted as kernel work),
+mach traps (libmalloc's large zone reaches the kernel through
+`mach_vm_allocate`, which every `syscall:::`-only census misses), and
+`vminfo:::` faults. All four join on the same guest-op service window, so the
+output is per-guest-op and never a kernel-stack family ranking.
+
+```sh
+carrick trace --profile native-amplification --preflight-quiet-host \
+  -o target/perf/amp1/baseline.raw \
+  -- run --exec-backend native <image>@sha256:… /bin/sh -c '<workload>'
+carrick debug amplification-ledger target/perf/amp1/baseline.raw \
+  --output target/perf/amp1/baseline.ledger.json
+carrick debug amplification-compare baseline.ledger.json candidate.ledger.json
+```
+
+| command | what it owns |
+|---|---|
+| `carrick trace --profile native-amplification` | the capture. Refuses a non-native or tag-pinned target at launch, and writes libdtrace's own consumer-side drop counters into the stream as an `AMP1\|consumer-drops\|…` record. |
+| `carrick trace --preflight-quiet-host` | settles the one-minute load average, then **aborts** if a `yes` load generator or a stray `carrick:` guest is still running; the receipt (settle time, settled load) goes into the stream header. |
+| `carrick debug amplification-ledger <raw>` | the typed `carrick.amplification-ledger.v1` artifact: per-guest-op host calls, host CPU-ns and faults, with exact-integer ratios, asserted closure against the capture's independent totals, `carrick-only` as a bucket that *cannot* carry a ratio, and libdtrace's own `kdebug_trace*` subtracted into a named sub-bucket. |
+| `carrick debug amplification-compare <a> <b>` | the determinant-locked A/B. Refuses to cross a program digest, `joins=` set, declared buffer headroom, OS build, image digest, fixture argv digest, or guest-op set; identical ledgers report exact zeros. |
+
+Three properties are worth knowing before reading a number:
+
+- **Wall is never authority.** Four probe families in one program perturb the
+  traced run an expected 2–4x. Counts and same-instrument ratios are citable;
+  the elapsed time in the completion record is diagnostic metadata, and the
+  comparator publishes no wall difference at all.
+- **A `--script` capture cannot produce a ledger.** The header must name the
+  digest of the bundled `scripts/dtrace/native-amplification.d`.
+- **Drops are refusals, and absent is not zero.** DTrace drops silently, and on
+  this instrument a dropped event reads as *lower* amplification. A lost
+  `service_slot` entry moves host work from a guest op into `carrick-only`
+  without breaking a single closure sum — an amplification that *improved* —
+  so the consumer-side counters are written in-band and any nonzero one, or a
+  missing record, refuses the capture. `CARRICK_AMP1_CONSUMER_DROPS=0` skips
+  writing the record for bisection only; the resulting stream is refused.
+
+The driver for a paired arm is
+[`scripts/perf/amplification-capture.sh`](../scripts/perf/amplification-capture.sh)
+(stamps `CARRICK_RUN_ID`, reaps with `scripts/sudo/kill.sh`).
+
 ### Profiling a running FreeBSD native-x86 process
 
 Launch-time `carrick trace --profile dsr` owns its target and may use Carrick

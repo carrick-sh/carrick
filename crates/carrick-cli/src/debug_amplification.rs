@@ -26,26 +26,21 @@
 //!   and again on every parse of a published ledger. That is the whole point
 //!   of moving this census under `--profile`.
 //!
-//! **What closure CANNOT see, stated because it is the instrument's sharpest
-//! remaining edge.** Closure sums across ALL slots, so it is blind to
-//! MISATTRIBUTION: move a `(guest_op, host_call)` row from a guest slot into
-//! `carrick-only` and every sum is unchanged, every closure pair still holds,
-//! and the guest op's amplification simply falls. That is not a hypothetical
-//! shape — it is exactly what a libdtrace DYNAMIC drop produces when the
-//! `service_slot[pid, tid]` entry is lost, and its symptom is an amplification
-//! that IMPROVED. The only detector is the consumer-side drop counters, which
-//! are not in the stream (the D header's fact 10) and are enforced by
-//! `carrick trace` at CAPTURE time, where a nonzero counter makes the command
-//! exit non-zero.
-//!
-//! **The consequence is operational and belongs in every reading of a ledger:
-//! a raw file left behind by a FAILED capture can launder a lower amplification
-//! past every check in this file.** The capture command must be run to a
-//! successful exit; `authority.consumer_drop_enforcement` records where that
-//! check lives rather than implying this analyzer re-ran it. Closing it in-band
-//! is a stated Task-3 obligation in the Move-3 plan: a default-on
-//! `AMP1|consumer-drops|…` record written at capture time, so an archived raw
-//! carries its own drop verdict.
+//! **What closure CANNOT see, and what closes it.** Closure sums across ALL
+//! slots, so it is blind to MISATTRIBUTION: move a `(guest_op, host_call)` row
+//! from a guest slot into `carrick-only` and every sum is unchanged, every
+//! closure pair still holds, and the guest op's amplification simply falls.
+//! That is not a hypothetical shape — it is exactly what a libdtrace DYNAMIC
+//! drop produces when the `service_slot[pid, tid]` entry is lost, and its
+//! symptom is an amplification that IMPROVED. The only detector is the
+//! consumer-side drop counters, which are not readable from D (the D header's
+//! fact 10). They used to exist only in the live `DTraceRunReport`, which meant
+//! a raw file left behind by a FAILED capture could launder a lower
+//! amplification past every offline check; `carrick trace` now writes them into
+//! the stream as an `AMP1|consumer-drops|…` record, so an archived raw carries
+//! its own drop verdict and this analyzer refuses it here as well as at
+//! capture. `authority.consumer_drops` is that verdict, published with the
+//! ledger.
 //!
 //! **The instrument sub-bucket is `kdebug_trace*` and nothing else.** That is
 //! libdtrace's buffer traffic, which is the dominant term, but the in-process
@@ -75,11 +70,14 @@ use anyhow::{Context, Result, anyhow, bail};
 use carrick_runtime::linux_abi::CanonicalNr;
 use carrick_runtime::syscall::lookup_aarch64;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 use crate::amplification_profile::{
-    Amp1Capture, GuestSlot, amp1_program_sha256, validate_archived_amp1_path,
+    Amp1Capture, CONSUMER_DROP_COUNTERS, GuestSlot, amp1_program_sha256,
+    validate_archived_amp1_path,
 };
+use crate::quiet_host::QuietHostReceipt;
 use crate::trace_profile::{AMPLIFICATION_RAW_SCHEMA, ProfileProvenance, capture_provenance};
 
 pub(crate) const LEDGER_SCHEMA: &str = "carrick.amplification-ledger.v1";
@@ -322,7 +320,20 @@ pub(crate) struct LedgerAuthority {
     pub(crate) program_sha256: String,
     pub(crate) raw_schema: String,
     pub(crate) joins: String,
+    /// The `aggsize` / `dynvarsize` / `bufsize` the capture declared. Recorded
+    /// rather than merely checked, because a ledger that cannot say what
+    /// headroom it ran at cannot be refused a comparison against one that ran
+    /// at another.
+    pub(crate) declared_buffers: BTreeMap<String, String>,
     pub(crate) os_build: String,
+    /// The canonical, digest-pinned image, and the digest of the traced `run`
+    /// argv: together, the fixture this ledger is about.
+    pub(crate) image: String,
+    pub(crate) target_argv_sha256: String,
+    /// The quiet-host preflight receipt, when the capture demanded one. `None`
+    /// means the capture never asked — which is exactly what a reader needs to
+    /// know before quoting its CPU-ns.
+    pub(crate) preflight: Option<QuietHostReceipt>,
     pub(crate) birth_qualification_sha256: String,
     pub(crate) terminal_qualification_sha256: String,
     pub(crate) bound_limit_s: u64,
@@ -330,25 +341,25 @@ pub(crate) struct LedgerAuthority {
     pub(crate) target_exit_reason: i64,
     /// The counters the D PROGRAM owns, every one of which must be zero.
     pub(crate) program_drops: BTreeMap<String, u64>,
-    /// Where libdtrace's own principal/aggregation/dynamic/rinse/dirty drop
-    /// counters were enforced. They are not readable from D and are not in the
-    /// stream, so `carrick trace --profile native-amplification` refuses the
-    /// capture on any nonzero counter and this ledger records that rather than
-    /// implying it re-checked them offline.
+    /// libdtrace's own principal / aggregation / dynamic / rinse / dirty
+    /// counters plus its interrupted flag — the ones that are NOT readable from
+    /// D and used to exist only in the live run report.
     ///
-    /// **Read this as a caveat, not a receipt.** A dynamic drop that loses a
-    /// `service_slot` entry moves host work from a guest op into `carrick-only`
-    /// WITHOUT changing any sum, so closure holds and the guest op's
-    /// amplification falls — a raw file from a failed capture can launder a
-    /// lower amplification past every check here. Until the Task-3 in-band
-    /// `AMP1|consumer-drops|…` record lands, "the capture command exited zero"
-    /// is a required part of a ledger's provenance and is not carried by the
-    /// artifact.
+    /// They are here because they are the sole detector of the one corruption
+    /// closure cannot see: a dynamic drop that loses a `service_slot` entry
+    /// moves host work from a guest op into `carrick-only` WITHOUT changing any
+    /// sum, so every closure pair still holds and the guest op's amplification
+    /// simply FALLS. `carrick trace` writes them into the stream as an
+    /// `AMP1|consumer-drops|…` record after libdtrace finishes, so an archived
+    /// raw carries its own drop verdict and a raw left behind by a FAILED
+    /// capture can no longer launder a lower amplification past an offline
+    /// analyzer.
+    pub(crate) consumer_drops: BTreeMap<String, u64>,
     pub(crate) consumer_drop_enforcement: String,
     pub(crate) terminal_calls: Vec<TerminalCall>,
 }
 
-const CONSUMER_DROP_ENFORCEMENT: &str = "capture-time-run-report";
+const CONSUMER_DROP_ENFORCEMENT: &str = "in-band-consumer-drops-record";
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -926,7 +937,12 @@ pub(crate) fn build_ledger(
             program_sha256: capture.program_sha256.clone(),
             raw_schema: AMPLIFICATION_RAW_SCHEMA.to_owned(),
             joins: capture.joins.clone(),
+            declared_buffers: capture.declared_buffers.clone(),
             os_build: capture.os_build.clone(),
+            image: capture.image.clone(),
+            target_argv_sha256: capture.target_argv_sha256.clone(),
+            preflight: capture.preflight.clone(),
+            consumer_drops: capture.consumer_drops.clone(),
             birth_qualification_sha256: capture.birth_qualification_sha256.clone(),
             terminal_qualification_sha256: capture.terminal_qualification_sha256.clone(),
             bound_limit_s: capture.bound_limit_s,
@@ -1409,6 +1425,43 @@ impl AmplificationLedgerV1 {
                 );
             }
         }
+        // The in-band consumer counters, carried through from the capture and
+        // re-checked here so a hand-edited artifact is refused rather than
+        // read: this is the only detector of a drop whose symptom is an
+        // amplification that improved.
+        for counter in CONSUMER_DROP_COUNTERS {
+            match authority.consumer_drops.get(counter).copied() {
+                None => bail!(
+                    "amplification ledger is missing libdtrace's {counter:?} counter; absent is not zero"
+                ),
+                Some(0) => {}
+                Some(count) => bail!(
+                    "amplification ledger carries {count} libdtrace {counter} drops; a consumer-side drop moves host work out of the guest op that caused it and reads as LOWER amplification"
+                ),
+            }
+        }
+        if authority.consumer_drops.len() != CONSUMER_DROP_COUNTERS.len() {
+            bail!(
+                "amplification ledger names libdtrace counters outside {CONSUMER_DROP_COUNTERS:?}"
+            );
+        }
+        if !authority.image.contains("@sha256:") {
+            bail!(
+                "amplification ledger names image {:?}, which is not digest-pinned",
+                authority.image
+            );
+        }
+        validate_sha256(&authority.target_argv_sha256, "target argv digest")?;
+        if authority.declared_buffers.is_empty() {
+            bail!(
+                "amplification ledger records no declared buffer headroom; a capture taken at different `aggsize`/`dynvarsize`/`bufsize` is a different instrument"
+            );
+        }
+        if let Some(preflight) = &authority.preflight {
+            preflight
+                .validate()
+                .context("validate the ledger's quiet-host preflight receipt")?;
+        }
         for scope in ["thread", "process"] {
             if !authority
                 .terminal_calls
@@ -1600,13 +1653,22 @@ fn publish_ledger(
 ) -> Result<()> {
     let bytes = serialize_ledger(ledger)?;
     parse_ledger_v1(&bytes).context("self-validate the published amplification ledger")?;
+    publish_noclobber(&bytes, output_path, stdout, "amplification ledger")
+}
+
+fn publish_noclobber(
+    bytes: &[u8],
+    output_path: Option<&Path>,
+    stdout: &mut impl Write,
+    artifact: &str,
+) -> Result<()> {
     let Some(path) = output_path else {
         stdout
-            .write_all(&bytes)
-            .context("write amplification ledger to stdout")?;
+            .write_all(bytes)
+            .with_context(|| format!("write {artifact} to stdout"))?;
         stdout
             .flush()
-            .context("flush amplification ledger stdout")?;
+            .with_context(|| format!("flush {artifact} stdout"))?;
         return Ok(());
     };
 
@@ -1614,40 +1676,29 @@ fn publish_ledger(
         .parent()
         .filter(|value| !value.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).with_context(|| {
-        format!(
-            "create amplification ledger output directory {}",
-            parent.display()
-        )
-    })?;
-    let mut temporary = NamedTempFile::new_in(parent).with_context(|| {
-        format!(
-            "create temporary amplification ledger in {}",
-            parent.display()
-        )
-    })?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create {artifact} output directory {}", parent.display()))?;
+    let mut temporary = NamedTempFile::new_in(parent)
+        .with_context(|| format!("create temporary {artifact} in {}", parent.display()))?;
     {
         let mut writer = BufWriter::new(temporary.as_file_mut());
         writer
-            .write_all(&bytes)
-            .context("write amplification ledger artifact")?;
+            .write_all(bytes)
+            .with_context(|| format!("write {artifact} artifact"))?;
         writer
             .flush()
-            .context("flush amplification ledger artifact")?;
+            .with_context(|| format!("flush {artifact} artifact"))?;
     }
     temporary
         .as_file()
         .sync_all()
-        .context("sync amplification ledger artifact")?;
+        .with_context(|| format!("sync {artifact} artifact"))?;
     temporary.persist_noclobber(path).map_err(|error| {
         if error.error.kind() == std::io::ErrorKind::AlreadyExists {
-            anyhow!(
-                "amplification ledger output already exists: {}",
-                path.display()
-            )
+            anyhow!("{artifact} output already exists: {}", path.display())
         } else {
             anyhow!(
-                "publish amplification ledger {} without clobbering: {}",
+                "publish {artifact} {} without clobbering: {}",
                 path.display(),
                 error.error
             )
@@ -1678,20 +1729,617 @@ fn run_amplification_ledger_with_provenance(
     publish_ledger(&ledger, output, stdout)
 }
 
+// ---------------------------------------------------------------------------
+// `carrick debug amplification-compare` — the determinant-locked A/B.
+// ---------------------------------------------------------------------------
+
+/// The comparison artifact's schema.
+///
+/// A separate schema from the ledger's, deliberately: a comparison is not a
+/// census and must never be mistaken for one by a reader looking for absolute
+/// numbers.
+pub(crate) const COMPARISON_SCHEMA: &str = "carrick.amplification-comparison.v1";
+
+/// An exact signed difference, kept as its two sides plus the arithmetic.
+///
+/// `i128` because both sides are `u64` and the difference is signed; publishing
+/// the operands next to the result is what lets a reader check the subtraction
+/// without the original ledgers.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CountDelta {
+    pub(crate) a: u64,
+    pub(crate) b: u64,
+    pub(crate) delta: i128,
+}
+
+impl CountDelta {
+    fn new(a: u64, b: u64) -> Self {
+        Self {
+            a,
+            b,
+            delta: i128::from(b) - i128::from(a),
+        }
+    }
+
+    fn require(&self) -> Result<()> {
+        if self.delta != i128::from(self.b) - i128::from(self.a) {
+            bail!("amplification comparison delta is not the difference of its own operands");
+        }
+        Ok(())
+    }
+}
+
+/// An exact signed difference of two ratios, `b/d − a/c`, as one fraction.
+///
+/// Never a float. The ledger's headline quantities are ratios that get compared
+/// across captures, and a rounded quotient would make "did this lever move the
+/// `mmap` row" a question about the host's floating-point unit. This mirrors
+/// `debug_jit_shape`'s `ComparisonFraction`.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SignedFraction {
+    pub(crate) numerator: i128,
+    pub(crate) denominator: u128,
+}
+
+fn fraction_delta(a: &LedgerFraction, b: &LedgerFraction) -> Result<SignedFraction> {
+    if a.denominator == 0 || b.denominator == 0 {
+        bail!("amplification comparison ratio has a zero denominator");
+    }
+    let a_scaled = i128::from(a.numerator)
+        .checked_mul(i128::from(b.denominator))
+        .context("amplification comparison A ratio cross multiplication overflow")?;
+    let b_scaled = i128::from(b.numerator)
+        .checked_mul(i128::from(a.denominator))
+        .context("amplification comparison B ratio cross multiplication overflow")?;
+    let denominator = u128::from(a.denominator)
+        .checked_mul(u128::from(b.denominator))
+        .context("amplification comparison ratio denominator overflow")?;
+    Ok(SignedFraction {
+        numerator: b_scaled - a_scaled,
+        denominator,
+    })
+}
+
+/// Everything two ledgers must agree on before a difference between them means
+/// anything.
+///
+/// Published as ONE copy of each field, because they are equal by
+/// construction — a drifted determinant is a refusal, not a row.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ComparisonDeterminants {
+    pub(crate) ledger_schema: String,
+    pub(crate) raw_schema: String,
+    /// The D program that produced BOTH captures. Refusing to cross a version
+    /// is the comparator's job — the ledger parser deliberately does not do it,
+    /// or editing `native-amplification.d` would make every published ledger
+    /// unparseable and destroy the archive.
+    pub(crate) program_sha256: String,
+    pub(crate) joins: String,
+    pub(crate) declared_buffers: BTreeMap<String, String>,
+    pub(crate) os_build: String,
+    pub(crate) image: String,
+    pub(crate) target_argv_sha256: String,
+    /// The guest operations both censuses measured, in canonical order.
+    pub(crate) guest_ops: Vec<GuestOp>,
+    /// Whether both captures demanded a quiet host. The VALUES differ per run
+    /// and are reported below; what is locked is that a preflighted arm is not
+    /// differenced against an unverified one.
+    pub(crate) quiet_host_preflighted: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ComparisonSides<T> {
+    pub(crate) a: T,
+    pub(crate) b: T,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TotalsComparison {
+    pub(crate) guest_syscalls: CountDelta,
+    pub(crate) host_syscalls: CountDelta,
+    pub(crate) host_syscall_cpu_ns: CountDelta,
+    pub(crate) mach_traps: CountDelta,
+    pub(crate) mach_trap_cpu_ns: CountDelta,
+    pub(crate) as_faults: CountDelta,
+    pub(crate) zfods: CountDelta,
+    pub(crate) cow_faults: CountDelta,
+}
+
+/// `carrick-only` differences its own bucket and NEVER acquires a ratio here
+/// either: the struct has no amplification field for the same reason
+/// [`CarrickOnly`] has none.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CarrickOnlyComparison {
+    pub(crate) host_calls: CountDelta,
+    pub(crate) host_cpu_ns: CountDelta,
+    pub(crate) mach_traps: CountDelta,
+    pub(crate) mach_trap_cpu_ns: CountDelta,
+    pub(crate) zfods: CountDelta,
+    /// The instrument's own `kdebug_trace*` cost on each side, differenced so a
+    /// reader can see whether the two captures paid the same tracing tax.
+    pub(crate) probable_instrument_cpu_ns: CountDelta,
+    pub(crate) excluding_probable_instrument_cpu_ns: CountDelta,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BudgetComparison {
+    pub(crate) guest_attributed_cpu_ns: CountDelta,
+    pub(crate) carrick_only_cpu_ns: CountDelta,
+    pub(crate) measured_kernel_cpu_ns: CountDelta,
+    pub(crate) guest_attributed_share: ComparisonSides<LedgerFraction>,
+    pub(crate) guest_attributed_share_delta: SignedFraction,
+}
+
+/// One guest operation, on both sides, with the two ratios the whole instrument
+/// exists to move.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GuestOpComparison {
+    pub(crate) guest_op: GuestOp,
+    pub(crate) guest_count_delta: i128,
+    pub(crate) host_calls_delta: i128,
+    pub(crate) host_cpu_ns_delta: i128,
+    pub(crate) mach_traps_delta: i128,
+    pub(crate) zfods_delta: i128,
+    pub(crate) guest_count: ComparisonSides<u64>,
+    pub(crate) host_calls: ComparisonSides<u64>,
+    pub(crate) host_cpu_ns: ComparisonSides<u64>,
+    pub(crate) host_call_amplification: ComparisonSides<LedgerFraction>,
+    /// The number every entry drives toward 1, differenced exactly.
+    pub(crate) host_call_amplification_delta: SignedFraction,
+    pub(crate) host_cpu_ns_per_guest_op: ComparisonSides<LedgerFraction>,
+    /// The number the kernel budget is ranked on, differenced exactly.
+    pub(crate) host_cpu_ns_per_guest_op_delta: SignedFraction,
+    pub(crate) dominant_host_call: ComparisonSides<Option<DominantHostCall>>,
+}
+
+/// A determinant-locked A/B of two amplification ledgers.
+///
+/// **Wall never appears here.** Four probe families perturb the traced run
+/// 2–4x, so a wall difference between two captures is a difference between two
+/// perturbations. Counts, CPU-ns and same-instrument ratios are the citable
+/// quantities and are the only ones differenced.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AmplificationComparisonV1 {
+    pub(crate) schema: String,
+    pub(crate) a_sha256: String,
+    pub(crate) b_sha256: String,
+    pub(crate) determinants: ComparisonDeterminants,
+    pub(crate) provenance: ComparisonSides<LedgerProvenance>,
+    pub(crate) preflight: ComparisonSides<Option<QuietHostReceipt>>,
+    pub(crate) totals: TotalsComparison,
+    pub(crate) carrick_only: CarrickOnlyComparison,
+    pub(crate) budget: BudgetComparison,
+    pub(crate) ledger_rows: Vec<GuestOpComparison>,
+}
+
+fn require_same<T: PartialEq + std::fmt::Debug>(a: &T, b: &T, label: &str) -> Result<()> {
+    if a != b {
+        bail!(
+            "amplification comparison refuses a {label} crossing: A is {a:?} and B is {b:?}. Two captures that disagree on this were never measuring the same thing, so their difference is not a result"
+        );
+    }
+    Ok(())
+}
+
+fn lock_determinants(
+    a: &AmplificationLedgerV1,
+    b: &AmplificationLedgerV1,
+) -> Result<ComparisonDeterminants> {
+    require_same(&a.schema, &b.schema, "ledger schema")?;
+    require_same(
+        &a.authority.raw_schema,
+        &b.authority.raw_schema,
+        "raw schema",
+    )?;
+    require_same(
+        &a.authority.program_sha256,
+        &b.authority.program_sha256,
+        "program digest",
+    )?;
+    require_same(&a.authority.joins, &b.authority.joins, "joins")?;
+    require_same(
+        &a.authority.declared_buffers,
+        &b.authority.declared_buffers,
+        "declared buffer headroom",
+    )?;
+    require_same(&a.authority.os_build, &b.authority.os_build, "os build")?;
+    require_same(&a.authority.image, &b.authority.image, "image")?;
+    require_same(
+        &a.authority.target_argv_sha256,
+        &b.authority.target_argv_sha256,
+        "target argv digest",
+    )?;
+    require_same(
+        &a.authority.preflight.is_some(),
+        &b.authority.preflight.is_some(),
+        "quiet-host preflight",
+    )?;
+
+    let guest_ops: Vec<GuestOp> = a.ledger.iter().map(|row| row.guest_op.clone()).collect();
+    let other: Vec<GuestOp> = b.ledger.iter().map(|row| row.guest_op.clone()).collect();
+    if guest_ops != other {
+        bail!(
+            "amplification comparison refuses a guest operation set crossing: A measured {:?} and B measured {:?}. A row-wise difference needs both sides to have the same rows",
+            guest_ops.iter().map(GuestOp::name).collect::<Vec<_>>(),
+            other.iter().map(GuestOp::name).collect::<Vec<_>>()
+        );
+    }
+
+    Ok(ComparisonDeterminants {
+        ledger_schema: a.schema.clone(),
+        raw_schema: a.authority.raw_schema.clone(),
+        program_sha256: a.authority.program_sha256.clone(),
+        joins: a.authority.joins.clone(),
+        declared_buffers: a.authority.declared_buffers.clone(),
+        os_build: a.authority.os_build.clone(),
+        image: a.authority.image.clone(),
+        target_argv_sha256: a.authority.target_argv_sha256.clone(),
+        guest_ops,
+        quiet_host_preflighted: a.authority.preflight.is_some(),
+    })
+}
+
+fn compare_rows(
+    a: &AmplificationLedgerV1,
+    b: &AmplificationLedgerV1,
+) -> Result<Vec<GuestOpComparison>> {
+    a.ledger
+        .iter()
+        .zip(&b.ledger)
+        .map(|(left, right)| {
+            Ok(GuestOpComparison {
+                guest_op: left.guest_op.clone(),
+                guest_count_delta: i128::from(right.guest_count) - i128::from(left.guest_count),
+                host_calls_delta: i128::from(right.host_calls) - i128::from(left.host_calls),
+                host_cpu_ns_delta: i128::from(right.host_cpu_ns) - i128::from(left.host_cpu_ns),
+                mach_traps_delta: i128::from(right.mach_traps) - i128::from(left.mach_traps),
+                zfods_delta: i128::from(right.faults.zfod) - i128::from(left.faults.zfod),
+                guest_count: ComparisonSides {
+                    a: left.guest_count,
+                    b: right.guest_count,
+                },
+                host_calls: ComparisonSides {
+                    a: left.host_calls,
+                    b: right.host_calls,
+                },
+                host_cpu_ns: ComparisonSides {
+                    a: left.host_cpu_ns,
+                    b: right.host_cpu_ns,
+                },
+                host_call_amplification_delta: fraction_delta(
+                    &left.host_call_amplification,
+                    &right.host_call_amplification,
+                )?,
+                host_call_amplification: ComparisonSides {
+                    a: left.host_call_amplification.clone(),
+                    b: right.host_call_amplification.clone(),
+                },
+                host_cpu_ns_per_guest_op_delta: fraction_delta(
+                    &left.host_cpu_ns_per_guest_op,
+                    &right.host_cpu_ns_per_guest_op,
+                )?,
+                host_cpu_ns_per_guest_op: ComparisonSides {
+                    a: left.host_cpu_ns_per_guest_op.clone(),
+                    b: right.host_cpu_ns_per_guest_op.clone(),
+                },
+                dominant_host_call: ComparisonSides {
+                    a: left.dominant_host_call.clone(),
+                    b: right.dominant_host_call.clone(),
+                },
+            })
+        })
+        .collect()
+}
+
+fn build_comparison(a_bytes: &[u8], b_bytes: &[u8]) -> Result<AmplificationComparisonV1> {
+    let a = parse_ledger_v1(a_bytes).context("parse amplification ledger A")?;
+    let b = parse_ledger_v1(b_bytes).context("parse amplification ledger B")?;
+    let determinants = lock_determinants(&a, &b)?;
+    let report = AmplificationComparisonV1 {
+        schema: COMPARISON_SCHEMA.to_owned(),
+        a_sha256: format!("{:x}", Sha256::digest(a_bytes)),
+        b_sha256: format!("{:x}", Sha256::digest(b_bytes)),
+        determinants,
+        provenance: ComparisonSides {
+            a: a.provenance.clone(),
+            b: b.provenance.clone(),
+        },
+        preflight: ComparisonSides {
+            a: a.authority.preflight.clone(),
+            b: b.authority.preflight.clone(),
+        },
+        totals: TotalsComparison {
+            guest_syscalls: CountDelta::new(a.totals.guest_syscalls, b.totals.guest_syscalls),
+            host_syscalls: CountDelta::new(a.totals.host_syscalls, b.totals.host_syscalls),
+            host_syscall_cpu_ns: CountDelta::new(
+                a.totals.host_syscall_cpu_ns,
+                b.totals.host_syscall_cpu_ns,
+            ),
+            mach_traps: CountDelta::new(a.totals.mach_traps, b.totals.mach_traps),
+            mach_trap_cpu_ns: CountDelta::new(a.totals.mach_trap_cpu_ns, b.totals.mach_trap_cpu_ns),
+            as_faults: CountDelta::new(a.totals.faults.as_fault, b.totals.faults.as_fault),
+            zfods: CountDelta::new(a.totals.faults.zfod, b.totals.faults.zfod),
+            cow_faults: CountDelta::new(a.totals.faults.cow_fault, b.totals.faults.cow_fault),
+        },
+        carrick_only: CarrickOnlyComparison {
+            host_calls: CountDelta::new(a.carrick_only.host_calls, b.carrick_only.host_calls),
+            host_cpu_ns: CountDelta::new(a.carrick_only.host_cpu_ns, b.carrick_only.host_cpu_ns),
+            mach_traps: CountDelta::new(a.carrick_only.mach_traps, b.carrick_only.mach_traps),
+            mach_trap_cpu_ns: CountDelta::new(
+                a.carrick_only.mach_trap_cpu_ns,
+                b.carrick_only.mach_trap_cpu_ns,
+            ),
+            zfods: CountDelta::new(a.carrick_only.faults.zfod, b.carrick_only.faults.zfod),
+            probable_instrument_cpu_ns: CountDelta::new(
+                a.carrick_only.probable_instrument.host_cpu_ns,
+                b.carrick_only.probable_instrument.host_cpu_ns,
+            ),
+            excluding_probable_instrument_cpu_ns: CountDelta::new(
+                a.carrick_only.excluding_probable_instrument.host_cpu_ns,
+                b.carrick_only.excluding_probable_instrument.host_cpu_ns,
+            ),
+        },
+        budget: BudgetComparison {
+            guest_attributed_cpu_ns: CountDelta::new(
+                a.budget.guest_attributed_cpu_ns,
+                b.budget.guest_attributed_cpu_ns,
+            ),
+            carrick_only_cpu_ns: CountDelta::new(
+                a.budget.carrick_only_cpu_ns,
+                b.budget.carrick_only_cpu_ns,
+            ),
+            measured_kernel_cpu_ns: CountDelta::new(
+                a.budget.measured_kernel_cpu_ns,
+                b.budget.measured_kernel_cpu_ns,
+            ),
+            guest_attributed_share_delta: fraction_delta(
+                &a.budget.guest_attributed_share,
+                &b.budget.guest_attributed_share,
+            )?,
+            guest_attributed_share: ComparisonSides {
+                a: a.budget.guest_attributed_share.clone(),
+                b: b.budget.guest_attributed_share.clone(),
+            },
+        },
+        ledger_rows: compare_rows(&a, &b)?,
+    };
+    report.validate()?;
+    Ok(report)
+}
+
+impl AmplificationComparisonV1 {
+    /// Re-derive every published difference from its own operands.
+    ///
+    /// Run on build and again on every parse, so a hand-edited comparison is
+    /// refused rather than read. The determinants are re-validated too: they
+    /// are the claim that the difference means anything.
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.schema != COMPARISON_SCHEMA {
+            bail!("amplification comparison schema is not {COMPARISON_SCHEMA}");
+        }
+        for (digest, label) in [(&self.a_sha256, "A"), (&self.b_sha256, "B")] {
+            validate_sha256(digest, &format!("comparison {label} ledger digest"))?;
+        }
+        if self.determinants.ledger_schema != LEDGER_SCHEMA {
+            bail!("amplification comparison compares artifacts that are not {LEDGER_SCHEMA}");
+        }
+        if self.determinants.raw_schema != AMPLIFICATION_RAW_SCHEMA {
+            bail!("amplification comparison raw schema is not {AMPLIFICATION_RAW_SCHEMA}");
+        }
+        validate_sha256(
+            &self.determinants.program_sha256,
+            "comparison program digest",
+        )?;
+        validate_sha256(
+            &self.determinants.target_argv_sha256,
+            "comparison target argv digest",
+        )?;
+        if !self.determinants.image.contains("@sha256:") {
+            bail!("amplification comparison names an image that is not digest-pinned");
+        }
+        if self.determinants.declared_buffers.is_empty() {
+            bail!("amplification comparison records no declared buffer headroom");
+        }
+        match (
+            self.determinants.quiet_host_preflighted,
+            &self.preflight.a,
+            &self.preflight.b,
+        ) {
+            (true, Some(a), Some(b)) => {
+                a.validate()?;
+                b.validate()?;
+            }
+            (false, None, None) => {}
+            _ => bail!(
+                "amplification comparison disagrees with itself about whether both captures were preflighted"
+            ),
+        }
+
+        if self.determinants.guest_ops.len() != self.ledger_rows.len() {
+            bail!("amplification comparison rows do not cover its own guest operation set");
+        }
+        let mut previous: Option<CanonicalNr> = None;
+        for (guest_op, row) in self.determinants.guest_ops.iter().zip(&self.ledger_rows) {
+            guest_op.validate()?;
+            if guest_op != &row.guest_op {
+                bail!("amplification comparison row does not name its own guest operation");
+            }
+            if previous.is_some_and(|previous| previous >= row.guest_op.canonical_nr()) {
+                bail!(
+                    "amplification comparison rows are duplicate or not ordered by canonical number"
+                );
+            }
+            previous = Some(row.guest_op.canonical_nr());
+            row.validate()?;
+        }
+
+        for delta in [
+            &self.totals.guest_syscalls,
+            &self.totals.host_syscalls,
+            &self.totals.host_syscall_cpu_ns,
+            &self.totals.mach_traps,
+            &self.totals.mach_trap_cpu_ns,
+            &self.totals.as_faults,
+            &self.totals.zfods,
+            &self.totals.cow_faults,
+            &self.carrick_only.host_calls,
+            &self.carrick_only.host_cpu_ns,
+            &self.carrick_only.mach_traps,
+            &self.carrick_only.mach_trap_cpu_ns,
+            &self.carrick_only.zfods,
+            &self.carrick_only.probable_instrument_cpu_ns,
+            &self.carrick_only.excluding_probable_instrument_cpu_ns,
+            &self.budget.guest_attributed_cpu_ns,
+            &self.budget.carrick_only_cpu_ns,
+            &self.budget.measured_kernel_cpu_ns,
+        ] {
+            delta.require()?;
+        }
+        require_equal_fraction_delta(
+            &self.budget.guest_attributed_share,
+            &self.budget.guest_attributed_share_delta,
+            "guest attributed share",
+        )
+    }
+}
+
+fn require_equal_fraction_delta(
+    sides: &ComparisonSides<LedgerFraction>,
+    published: &SignedFraction,
+    label: &str,
+) -> Result<()> {
+    if fraction_delta(&sides.a, &sides.b)? != *published {
+        bail!("amplification comparison {label} delta is not the difference of its own operands");
+    }
+    Ok(())
+}
+
+impl GuestOpComparison {
+    fn validate(&self) -> Result<()> {
+        for (sides, delta, label) in [
+            (&self.guest_count, self.guest_count_delta, "guest count"),
+            (&self.host_calls, self.host_calls_delta, "host calls"),
+            (&self.host_cpu_ns, self.host_cpu_ns_delta, "host CPU-ns"),
+        ] {
+            if delta != i128::from(sides.b) - i128::from(sides.a) {
+                bail!(
+                    "amplification comparison {} {label} delta is not the difference of its own operands",
+                    self.guest_op.name()
+                );
+            }
+        }
+        if self.guest_count.a == 0 || self.guest_count.b == 0 {
+            bail!(
+                "amplification comparison row {} has a zero amplification denominator",
+                self.guest_op.name()
+            );
+        }
+        self.host_call_amplification.a.require(
+            self.host_calls.a,
+            self.guest_count.a,
+            "A host calls",
+        )?;
+        self.host_call_amplification.b.require(
+            self.host_calls.b,
+            self.guest_count.b,
+            "B host calls",
+        )?;
+        self.host_cpu_ns_per_guest_op.a.require(
+            self.host_cpu_ns.a,
+            self.guest_count.a,
+            "A host CPU",
+        )?;
+        self.host_cpu_ns_per_guest_op.b.require(
+            self.host_cpu_ns.b,
+            self.guest_count.b,
+            "B host CPU",
+        )?;
+        require_equal_fraction_delta(
+            &self.host_call_amplification,
+            &self.host_call_amplification_delta,
+            "host call amplification",
+        )?;
+        require_equal_fraction_delta(
+            &self.host_cpu_ns_per_guest_op,
+            &self.host_cpu_ns_per_guest_op_delta,
+            "host CPU per guest op",
+        )
+    }
+}
+
+fn serialize_comparison(report: &AmplificationComparisonV1) -> Result<Vec<u8>> {
+    report.validate()?;
+    let mut bytes = serde_json::to_vec(report).context("serialize amplification comparison v1")?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+pub(crate) fn parse_comparison_v1(bytes: &[u8]) -> Result<AmplificationComparisonV1> {
+    if bytes.last() != Some(&b'\n') || bytes.iter().filter(|byte| **byte == b'\n').count() != 1 {
+        bail!("an amplification comparison is exactly one newline-terminated JSON object");
+    }
+    let report: AmplificationComparisonV1 = serde_json::from_slice(&bytes[..bytes.len() - 1])
+        .context("parse amplification comparison v1")?;
+    report.validate()?;
+    if serialize_comparison(&report)? != bytes {
+        bail!("amplification comparison is not canonical v1 output");
+    }
+    Ok(report)
+}
+
+pub(crate) fn run_amplification_compare(
+    a_path: &Path,
+    b_path: &Path,
+    output: Option<&Path>,
+) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    run_amplification_compare_to(a_path, b_path, output, &mut stdout)
+}
+
+fn run_amplification_compare_to(
+    a_path: &Path,
+    b_path: &Path,
+    output: Option<&Path>,
+    stdout: &mut impl Write,
+) -> Result<()> {
+    // Identical inputs are NOT refused, unlike `jit-shape-compare`'s: a
+    // ledger differenced against itself must report exact zeros, and that is
+    // the cheapest available check that the arithmetic is exact.
+    let a_bytes = fs::read(a_path)
+        .with_context(|| format!("read amplification ledger A {}", a_path.display()))?;
+    let b_bytes = fs::read(b_path)
+        .with_context(|| format!("read amplification ledger B {}", b_path.display()))?;
+    let report = build_comparison(&a_bytes, &b_bytes)?;
+    let bytes = serialize_comparison(&report)?;
+    parse_comparison_v1(&bytes).context("self-validate the published amplification comparison")?;
+    publish_noclobber(&bytes, output, stdout, "amplification comparison")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// The reader's own fixture, so the analyzer and the admissibility half
     /// cannot drift onto different notions of a valid stream. Its header
-    /// carries `@PROGRAM_SHA256@` rather than a literal digest: the digest is
-    /// the bundled D program's and changes whenever the program is edited, so a
-    /// literal would make "stale fixture" indistinguishable from "rejected
-    /// stream".
-    const FIXTURE: &str = include_str!("../tests/fixtures/amp1-valid.raw");
+    /// carries placeholders rather than literals: the program digest is the
+    /// bundled D program's and changes whenever the program is edited, and the
+    /// image and argv digests come from the same parser the capture path uses,
+    /// so a literal would make "stale fixture" indistinguishable from
+    /// "rejected stream".
+    use crate::amplification_profile::fixture_stream;
 
     fn stream() -> String {
-        FIXTURE.replace("@PROGRAM_SHA256@", &amp1_program_sha256())
+        fixture_stream()
     }
 
     fn provenance() -> LedgerProvenance {
@@ -1964,7 +2612,7 @@ mod tests {
     fn amplification_ledger_refuses_an_unauthenticated_program() {
         // A `--script` capture, or an edited D program, cannot authenticate its
         // own stream, so it cannot become a ledger.
-        let foreign = FIXTURE.replace("@PROGRAM_SHA256@", &"3".repeat(64));
+        let foreign = stream().replace(&amp1_program_sha256(), &"3".repeat(64));
         assert!(error(ledger_from(&foreign)).contains("does not name the bundled"));
 
         // Building one from a capture requires the CURRENTLY bundled program ...
@@ -2173,6 +2821,263 @@ mod tests {
             run_amplification_ledger_with_provenance(&raw, Some(&output), &mut Vec::new(), || {
                 Ok(provenance())
             })
+            .expect_err("a second publish must not overwrite an artifact");
+        assert!(format!("{error:#}").contains("already exists"));
+    }
+    // -----------------------------------------------------------------------
+    // `amplification-compare`
+    // -----------------------------------------------------------------------
+
+    /// The candidate arm: one more host `close` inside the `openat` window, and
+    /// the capture's own independent totals moved to match. Everything else --
+    /// image, argv, program, joins, buffers, os build, guest-op set -- is held,
+    /// which is what makes the difference mean something.
+    fn candidate_stream() -> String {
+        stream()
+            .replacen(
+                "AMP1|guest_slot=58|host=close|count=3",
+                "AMP1|guest_slot=58|host=close|count=4",
+                1,
+            )
+            .replacen("AMP1|host=close|count=3", "AMP1|host=close|count=4", 1)
+            .replacen(
+                "AMP1|metric=host-syscall-entry-total|count=20",
+                "AMP1|metric=host-syscall-entry-total|count=21",
+                1,
+            )
+            .replacen(
+                "AMP1|metric=host-syscall-return-total|count=20",
+                "AMP1|metric=host-syscall-return-total|count=21",
+                1,
+            )
+    }
+
+    fn compare(
+        a: &AmplificationLedgerV1,
+        b: &AmplificationLedgerV1,
+    ) -> Result<AmplificationComparisonV1> {
+        build_comparison(&serialize_ledger(a)?, &serialize_ledger(b)?)
+    }
+
+    fn comparison_row<'a>(
+        report: &'a AmplificationComparisonV1,
+        name: &str,
+    ) -> &'a GuestOpComparison {
+        report
+            .ledger_rows
+            .iter()
+            .find(|row| row.guest_op.name() == name)
+            .unwrap_or_else(|| panic!("comparison has no {name} row"))
+    }
+
+    #[test]
+    fn amplification_comparison_differences_two_ledgers_in_exact_integers() {
+        let baseline = ledger();
+        let candidate = ledger_from(&candidate_stream()).expect("candidate ledger");
+        let report = compare(&baseline, &candidate).expect("compare two comparable ledgers");
+
+        assert_eq!(report.schema, COMPARISON_SCHEMA);
+        assert_eq!(report.totals.host_syscalls.delta, 1);
+        assert_eq!(report.totals.host_syscall_cpu_ns.delta, 0);
+
+        let openat = comparison_row(&report, "openat");
+        assert_eq!(openat.host_calls_delta, 1);
+        // 11/4 - 10/4, kept as the arithmetic that produced it rather than as
+        // 0.25: a rounded quotient would make "did this lever move the row" a
+        // question about the host's floating-point unit.
+        assert_eq!(
+            openat.host_call_amplification_delta,
+            SignedFraction {
+                numerator: 4,
+                denominator: 16
+            }
+        );
+        assert_eq!(openat.host_cpu_ns_per_guest_op_delta.numerator, 0);
+        assert_eq!(openat.host_calls, ComparisonSides { a: 10, b: 11 });
+
+        // An untouched row is exactly zero, not approximately zero.
+        let mmap = comparison_row(&report, "mmap");
+        for delta in [
+            mmap.host_calls_delta,
+            mmap.host_cpu_ns_delta,
+            mmap.mach_traps_delta,
+            mmap.zfods_delta,
+        ] {
+            assert_eq!(delta, 0);
+        }
+        assert_eq!(mmap.host_call_amplification_delta.numerator, 0);
+
+        // Reversing the arms negates every difference and nothing else.
+        let reversed = compare(&candidate, &baseline).expect("compare in reverse");
+        assert_eq!(reversed.totals.host_syscalls.delta, -1);
+        assert_eq!(
+            comparison_row(&reversed, "openat")
+                .host_call_amplification_delta
+                .numerator,
+            -4
+        );
+        assert_eq!(reversed.determinants, report.determinants);
+    }
+
+    /// A ledger differenced against itself is the cheapest available check that
+    /// the arithmetic is exact, so identical inputs are ACCEPTED here (unlike
+    /// `jit-shape-compare`, which refuses them) and must report zeros.
+    #[test]
+    fn amplification_comparison_of_identical_ledgers_is_exactly_zero() {
+        let ledger = ledger();
+        let report = compare(&ledger, &ledger).expect("a ledger differences against itself");
+        assert_eq!(report.a_sha256, report.b_sha256);
+        for row in &report.ledger_rows {
+            assert_eq!(row.host_calls_delta, 0);
+            assert_eq!(row.host_cpu_ns_delta, 0);
+            assert_eq!(row.host_call_amplification_delta.numerator, 0);
+            assert_eq!(row.host_cpu_ns_per_guest_op_delta.numerator, 0);
+        }
+        assert_eq!(report.totals.zfods.delta, 0);
+        assert_eq!(report.carrick_only.host_cpu_ns.delta, 0);
+        assert_eq!(report.budget.measured_kernel_cpu_ns.delta, 0);
+        assert_eq!(report.budget.guest_attributed_share_delta.numerator, 0);
+    }
+
+    /// A comparator that will cross a determinant is worse than none: it
+    /// produces a plausible delta between two numbers that were never
+    /// comparable. `program_sha256` is on this list deliberately -- the ledger
+    /// PARSER does not check it, because folding it in would make every
+    /// published ledger unparseable the moment `native-amplification.d` is
+    /// edited, so refusing to cross a version is this command's job.
+    #[test]
+    fn amplification_comparison_refuses_every_determinant_crossing() {
+        let baseline = ledger();
+        for (mutate, needle) in [
+            (
+                Box::new(|ledger: &mut AmplificationLedgerV1| {
+                    ledger.authority.program_sha256 = "9".repeat(64);
+                }) as Box<dyn Fn(&mut AmplificationLedgerV1)>,
+                "program digest",
+            ),
+            (
+                Box::new(|ledger: &mut AmplificationLedgerV1| {
+                    ledger.authority.joins = "syscall,mach".to_owned();
+                }),
+                "joins",
+            ),
+            (
+                Box::new(|ledger: &mut AmplificationLedgerV1| {
+                    ledger
+                        .authority
+                        .declared_buffers
+                        .insert("aggsize".to_owned(), "32m".to_owned());
+                }),
+                "declared buffer headroom",
+            ),
+            (
+                Box::new(|ledger: &mut AmplificationLedgerV1| {
+                    ledger.authority.os_build = "27A5295j".to_owned();
+                }),
+                "os build",
+            ),
+            (
+                Box::new(|ledger: &mut AmplificationLedgerV1| {
+                    ledger.authority.image =
+                        format!("docker.io/library/debian@sha256:{}", "bb".repeat(32));
+                }),
+                "image",
+            ),
+            (
+                Box::new(|ledger: &mut AmplificationLedgerV1| {
+                    ledger.authority.target_argv_sha256 = "8".repeat(64);
+                }),
+                "target argv digest",
+            ),
+            (
+                Box::new(|ledger: &mut AmplificationLedgerV1| {
+                    ledger.authority.preflight = Some(
+                        crate::quiet_host::QuietHostReceipt::from_header_fields(5, 900).unwrap(),
+                    );
+                }),
+                "quiet-host preflight",
+            ),
+        ] {
+            let mut candidate = baseline.clone();
+            mutate(&mut candidate);
+            let message = format!(
+                "{:#}",
+                compare(&baseline, &candidate).expect_err("a crossed determinant must be refused")
+            );
+            assert!(message.contains(needle), "unnamed refusal: {message}");
+        }
+
+        // The guest-op SET is a determinant too: two censuses that measured
+        // different operations have no row-wise difference to report. Slot 66
+        // is canonical 64, a different real syscall, so closure still holds.
+        let other_ops = ledger_from(&stream().replace("guest_slot=224", "guest_slot=66"))
+            .expect("a census of other guest ops");
+        assert!(
+            format!("{:#}", compare(&baseline, &other_ops).unwrap_err())
+                .contains("guest operation set")
+        );
+    }
+
+    #[test]
+    fn amplification_comparison_is_canonical_and_self_validating() {
+        let report = compare(&ledger(), &ledger_from(&candidate_stream()).unwrap()).unwrap();
+        let first = serialize_comparison(&report).expect("serialize");
+        let parsed = parse_comparison_v1(&first).expect("parse the comparison back");
+        assert_eq!(parsed, report);
+        assert_eq!(serialize_comparison(&parsed).expect("re-serialize"), first);
+
+        let mut pretty = serde_json::to_vec_pretty(&report).expect("pretty");
+        pretty.push(b'\n');
+        assert!(parse_comparison_v1(&pretty).is_err());
+
+        // A hand-edited difference is refused rather than read: the operands
+        // are published next to the result precisely so the subtraction can be
+        // re-derived without the original ledgers.
+        let mut forged = report.clone();
+        forged.totals.host_syscalls.delta += 5;
+        assert!(
+            format!("{:#}", forged.validate().unwrap_err())
+                .contains("not the difference of its own operands")
+        );
+
+        let mut forged = report.clone();
+        forged.ledger_rows[0]
+            .host_call_amplification_delta
+            .numerator += 1;
+        assert!(
+            format!("{:#}", forged.validate().unwrap_err())
+                .contains("not the difference of its own operands")
+        );
+    }
+
+    #[test]
+    fn amplification_comparison_publishes_without_clobbering() {
+        let directory = tempfile::tempdir().expect("output directory");
+        let a = directory.path().join("a.json");
+        let b = directory.path().join("b.json");
+        std::fs::write(&a, serialize_ledger(&ledger()).unwrap()).unwrap();
+        std::fs::write(
+            &b,
+            serialize_ledger(&ledger_from(&candidate_stream()).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let output = directory.path().join("nested").join("comparison.json");
+
+        let mut sink = Vec::new();
+        run_amplification_compare_to(&a, &b, Some(&output), &mut sink)
+            .expect("publish the comparison");
+        assert!(sink.is_empty());
+        let published = std::fs::read(&output).expect("read the published comparison");
+        assert_eq!(
+            parse_comparison_v1(&published)
+                .expect("parse")
+                .totals
+                .host_syscalls
+                .delta,
+            1
+        );
+
+        let error = run_amplification_compare_to(&a, &b, Some(&output), &mut Vec::new())
             .expect_err("a second publish must not overwrite an artifact");
         assert!(format!("{error:#}").contains("already exists"));
     }

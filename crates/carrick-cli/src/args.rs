@@ -815,6 +815,18 @@ pub(crate) enum Commands {
             requires = "profile"
         )]
         native_shape_snapshots: Option<std::path::PathBuf>,
+        /// Refuse to capture on a host that is not quiet, and record what it
+        /// settled to in the stream header.
+        ///
+        /// Waits for the one-minute load average to settle, then aborts if a
+        /// `yes` load generator or a stray `carrick:` guest is still running.
+        /// A contended host produces a CPU-ns figure that reads exactly like a
+        /// real one, which is why this refuses rather than warns. Only
+        /// `native-amplification` has a header field for the receipt today, so
+        /// the flag is refused on other profiles rather than silently doing
+        /// nothing.
+        #[arg(long = "preflight-quiet-host", requires = "profile")]
+        preflight_quiet_host: bool,
         /// Write DTrace events + aggregations to this file instead of stdout.
         /// Essential when tracing an interactive (`-t`) guest: without it the
         /// probe output intermixes with the guest's own terminal stream. The
@@ -987,6 +999,23 @@ pub(crate) enum DebugCommand {
         trace: PathBuf,
         /// Publish the deterministic ledger without overwriting an artifact.
         /// Omit to write the same bytes to stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Difference two amplification ledgers under one determinant-locked
+    /// exact-arithmetic contract: per-guest-op host-call and host-CPU-ns
+    /// ratios, the `carrick-only` bucket, and the kernel-CPU decomposition.
+    /// Refuses to cross a program digest, a `joins=` set, the declared buffer
+    /// headroom, an OS build, an image digest, a fixture argv, or a guest-op
+    /// set — two captures that disagree on any of those were never measuring
+    /// the same thing. Identical ledgers report exact zeros.
+    AmplificationCompare {
+        /// Baseline `carrick.amplification-ledger.v1` artifact.
+        a: PathBuf,
+        /// Candidate `carrick.amplification-ledger.v1` artifact.
+        b: PathBuf,
+        /// Publish the deterministic comparison without overwriting an
+        /// artifact. Omit to write the same bytes to stdout.
         #[arg(long)]
         output: Option<PathBuf>,
     },
@@ -1241,6 +1270,77 @@ mod tests {
         assert_eq!(
             native_shape_snapshots.as_deref(),
             Some(std::path::Path::new("/tmp/native-shape.snapshots"))
+        );
+    }
+
+    /// The quiet-host preflight is the Rust-first half of the capture driver:
+    /// its whole value is that a DIRTY host aborts before producing a number,
+    /// so it has to be reachable from the command that takes the measurement,
+    /// and it is meaningless without a profile whose header can carry its
+    /// receipt.
+    #[test]
+    fn preflight_quiet_host_is_a_profile_scoped_trace_flag() {
+        let cli = Cli::try_parse_from([
+            "carrick",
+            "trace",
+            "--profile",
+            "native-amplification",
+            "--preflight-quiet-host",
+            "--trace-out",
+            "/tmp/amp1.raw",
+            "--",
+            "run",
+            "--exec-backend",
+            "native",
+            "docker.io/library/ubuntu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "/bin/true",
+        ])
+        .expect("the amplification capture must be able to demand a quiet host");
+        let Commands::Trace {
+            preflight_quiet_host,
+            ..
+        } = cli.command
+        else {
+            panic!("expected trace command");
+        };
+        assert!(preflight_quiet_host);
+
+        assert!(
+            Cli::try_parse_from(["carrick", "trace", "--preflight-quiet-host", "--", "run"])
+                .is_err(),
+            "a preflight receipt with no profile header to live in is a silent no-op"
+        );
+    }
+
+    #[test]
+    fn amplification_compare_requires_both_ledgers_but_not_output() {
+        let cli = Cli::try_parse_from([
+            "carrick",
+            "debug",
+            "amplification-compare",
+            "/tmp/a.ledger.json",
+            "/tmp/b.ledger.json",
+        ])
+        .expect("paired amplification comparison should parse without --output");
+        let Commands::Debug {
+            command: DebugCommand::AmplificationCompare { a, b, output },
+        } = cli.command
+        else {
+            panic!("expected amplification-compare command");
+        };
+        assert_eq!(a, std::path::Path::new("/tmp/a.ledger.json"));
+        assert_eq!(b, std::path::Path::new("/tmp/b.ledger.json"));
+        assert_eq!(output, None);
+
+        assert!(
+            Cli::try_parse_from([
+                "carrick",
+                "debug",
+                "amplification-compare",
+                "/tmp/a.ledger.json",
+            ])
+            .is_err(),
+            "the second ledger is mandatory",
         );
     }
 

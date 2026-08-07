@@ -1,4 +1,4 @@
-AMP1|header|profile=native-amplification|raw_schema=carrick.amplification.raw.v1|os_build=27A5295i|program_sha256=@PROGRAM_SHA256@|birth_qualification_sha256=1111111111111111111111111111111111111111111111111111111111111111|terminal_qualification_sha256=2222222222222222222222222222222222222222222222222222222222222222|joins=syscall,mach,fault|aggsize=64m|dynvarsize=256m|bufsize=32m
+AMP1|header|profile=native-amplification|raw_schema=carrick.amplification.raw.v1|os_build=27A5295i|program_sha256=@PROGRAM_SHA256@|birth_qualification_sha256=1111111111111111111111111111111111111111111111111111111111111111|terminal_qualification_sha256=2222222222222222222222222222222222222222222222222222222222222222|joins=syscall,mach,fault|aggsize=64m|dynvarsize=256m|bufsize=32m|image=@IMAGE@|target_argv_sha256=@TARGET_ARGV_SHA256@
 AMP1|section=terminal-calls
 AMP1|terminal-call|provider=syscall|function=exit|scope=process
 AMP1|terminal-call|provider=syscall|function=bsdthread_terminate|scope=thread
@@ -65,3 +65,4 @@ AMP1|drop|source=dtrace-error|count=0
 AMP1|drop|source=service-window-reentry|count=0
 AMP1|drop|source=service-end-unmatched|count=0
 AMP1|complete|profile=native-amplification|timed_out=0|target_exit_reason=1|bound_limit_s=600|elapsed_ns=123456789
+AMP1|consumer-drops|principal=0|aggregation=0|dynamic=0|dynamic_rinse=0|dynamic_dirty=0|other=0|interrupted=0

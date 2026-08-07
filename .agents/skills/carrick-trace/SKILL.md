@@ -194,6 +194,36 @@ the default per-syscall stream + aggregation (`carrick trace -- …`), and a
 guest AArch64 frame-pointer stack walker via `carrick trace --stack` (needs a
 frame-pointer guest — Ubuntu 24.04, NOT raw-asm fixtures or stock Debian).
 
+### "How much Darwin kernel work does one guest op cost?" — the amplification ledger
+
+For that question do **not** write a script; the bundled `AMP1` profile already
+joins host syscalls, host syscall CPU-ns, **mach traps** (libmalloc's large zone
+reaches the kernel via `mach_vm_allocate`, invisible to any `syscall:::`-only
+census) and `vminfo:::` faults to the guest-op service window:
+
+```sh
+carrick trace --profile native-amplification --preflight-quiet-host \
+  -o target/perf/amp1/baseline.raw \
+  -- run --exec-backend native <image>@sha256:… /bin/sh -c '<workload>'
+carrick debug amplification-ledger target/perf/amp1/baseline.raw --output baseline.ledger.json
+carrick debug amplification-compare baseline.ledger.json candidate.ledger.json
+```
+
+- `--preflight-quiet-host` settles the load average and then **aborts** on a
+  `yes` load generator or a stray `carrick:` guest, recording what it settled
+  to in the stream header. A dirty host must not produce a number.
+- The target must be `--exec-backend native` and **digest-pinned** — both are
+  refused at launch, not after the run.
+- `amplification-ledger` asserts closure against the capture's own independent
+  totals and keeps `carrick-only` out of every ratio; `amplification-compare`
+  refuses to cross a program digest, `joins=` set, buffer headroom, OS build,
+  image, fixture argv or guest-op set, and reports exact integer deltas.
+- **Wall is never authority here** (2–4x perturbation), and any DTrace drop —
+  including libdtrace's own counters, which the capture writes in-band as
+  `AMP1|consumer-drops|…` — refuses the capture, because a dropped event reads
+  as *lower* amplification.
+- Paired arms: [`scripts/perf/amplification-capture.sh`](../../../scripts/perf/amplification-capture.sh).
+
 Minimal targeted-script skeleton:
 
 ```d

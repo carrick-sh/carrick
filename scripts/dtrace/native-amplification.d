@@ -105,11 +105,19 @@
  *      dynamic-rinse, dynamic-dirty -- are NOT readable from D. They arrive
  *      through libdtrace's drop handler
  *      (`crates/carrick-runtime/src/dtrace_consumer.rs:120-124,187-207`), which
- *      carrick already captures into `DTraceRunReport`. `section=drops` below
- *      therefore carries the counters this PROGRAM owns; the consumer-side
- *      counters are enforced by the Rust reader, which rejects any nonzero.
- *      Both halves are required: drops are silent, and on this instrument a
- *      silent drop reads as LOWER amplification and would be banked as good news.
+ *      carrick captures into `DTraceRunReport`. `section=drops` below therefore
+ *      carries only the counters this PROGRAM owns. The consumer-side counters
+ *      are appended to this stream by `carrick trace` itself, after libdtrace
+ *      finishes, as a single `AMP1|consumer-drops|...` record outside every
+ *      section -- deliberately outside, because this program did not print it
+ *      and no section marker should vouch for it. The reader requires the
+ *      record and refuses any nonzero counter.
+ *      Both halves are required, and the consumer half is the sharper one:
+ *      drops are SILENT, a lost `service_slot[pid, tid]` entry moves host work
+ *      from a guest op into `carrick-only` WITHOUT breaking any closure sum, so
+ *      its symptom is an amplification that IMPROVED. Before the record
+ *      existed, a raw file left behind by a failed capture read as clean
+ *      offline forever.
  *
  * COMPILE-QUALIFIED WITHOUT A CAPTURE. `dtrace -e -s <this file>` fails at the
  * first clause with "args[ ] may not be referenced because probe description
@@ -493,9 +501,10 @@ dtrace:::END
 
 	/*
 	 * Program-owned integrity counters. The libdtrace drop counters are not
-	 * readable from D (fact 10); the Rust reader enforces those separately
-	 * and rejects any nonzero. A MISSING drop section is itself a rejection
-	 * -- absent is not zero.
+	 * readable from D (fact 10); `carrick trace` appends them to this stream
+	 * as an `AMP1|consumer-drops|...` record once libdtrace has finished, and
+	 * the reader requires both. A MISSING section or record is itself a
+	 * rejection -- absent is not zero.
 	 */
 	printf("AMP1|section=drops\n");
 	printa("AMP1|drop|source=dtrace-error|count=%@d\n", @probe_errors);

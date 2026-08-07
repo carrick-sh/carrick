@@ -422,8 +422,20 @@ fn amp1_program_sha256() -> String {
         .collect()
 }
 
+/// The fixture's traced target, as the header carries it. The in-file
+/// `amplification_profile` tests derive these from `NativeShapeTarget::parse`,
+/// which is what pins the capture path's rendering; out here they are the two
+/// determinants a comparison must refuse to cross, so they are named constants
+/// this suite can drift on purpose.
+const AMP1_IMAGE: &str = "docker.io/library/ubuntu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const AMP1_TARGET_ARGV_SHA256: &str =
+    "3333333333333333333333333333333333333333333333333333333333333333";
+
 fn amp1_stream() -> String {
-    AMP1_FIXTURE.replace("@PROGRAM_SHA256@", &amp1_program_sha256())
+    AMP1_FIXTURE
+        .replace("@PROGRAM_SHA256@", &amp1_program_sha256())
+        .replace("@IMAGE@", AMP1_IMAGE)
+        .replace("@TARGET_ARGV_SHA256@", AMP1_TARGET_ARGV_SHA256)
 }
 
 fn validate_amp1(contents: &str, extra_args: &[&str]) -> assert_cmd::assert::Assert {
@@ -747,9 +759,9 @@ fn amplification_ledger_refuses_a_capture_that_is_not_evidence() {
     // A `--script` capture cannot authenticate its own stream, so it can never
     // become a ledger -- the whole point of moving this census under --profile.
     let (assert, _foreign) = amplification_ledger(
-        &AMP1_FIXTURE.replace(
-            "@PROGRAM_SHA256@",
-            "3333333333333333333333333333333333333333333333333333333333333333",
+        &amp1_stream().replace(
+            &amp1_program_sha256(),
+            "5555555555555555555555555555555555555555555555555555555555555555",
         ),
         &[],
     );
@@ -781,6 +793,194 @@ fn amplification_ledger_refuses_a_capture_that_is_not_evidence() {
     assert
         .failure()
         .stderr(contains("closure failed").and(contains("host syscalls")));
+}
+
+/// The laundering hole this record closes, stated so the test is not read as a
+/// formality: libdtrace's consumer-side drop counters are NOT readable from D
+/// and used to live only in the live `DTraceRunReport`, so a raw file left
+/// behind by a FAILED capture read as clean offline. And a dynamic drop that
+/// loses a `service_slot[pid, tid]` entry moves a `(guest_op, host_call)` row
+/// into `carrick-only` WITHOUT changing a single closure sum — its symptom is
+/// an amplification that IMPROVED. The in-band record is that corruption's only
+/// detector, so the reader requires it (absent is not zero) and refuses every
+/// nonzero counter by name.
+#[test]
+fn amplification_ledger_requires_the_in_band_consumer_drop_record() {
+    let without = amp1_stream()
+        .lines()
+        .filter(|line| !line.starts_with("AMP1|consumer-drops|"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (assert, _directory) = amplification_ledger(&format!("{without}\n"), &[]);
+    assert.failure().stderr(contains("consumer-drops"));
+
+    for counter in [
+        "principal",
+        "aggregation",
+        "dynamic",
+        "dynamic_rinse",
+        "dynamic_dirty",
+        "other",
+        "interrupted",
+    ] {
+        let dropped = amp1_stream().replacen(&format!("|{counter}=0"), &format!("|{counter}=3"), 1);
+        assert_ne!(
+            dropped,
+            amp1_stream(),
+            "the fixture must carry a {counter} consumer-drop counter to corrupt"
+        );
+        let (assert, _directory) = amplification_ledger(&dropped, &[]);
+        assert
+            .failure()
+            .stderr(contains("libdtrace").and(contains(counter)));
+    }
+}
+
+fn published_ledger(stream: &str, directory: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let raw = directory.join(format!("{name}.raw"));
+    std::fs::write(&raw, stream).unwrap();
+    let ledger = directory.join(format!("{name}.ledger.json"));
+    cli()
+        .args(["debug", "amplification-ledger"])
+        .arg(&raw)
+        .arg("--output")
+        .arg(&ledger)
+        .assert()
+        .success();
+    ledger
+}
+
+fn compare_ledgers(a: &std::path::Path, b: &std::path::Path) -> assert_cmd::assert::Assert {
+    cli()
+        .args(["debug", "amplification-compare"])
+        .arg(a)
+        .arg(b)
+        .assert()
+}
+
+/// Two censuses of the same capture must difference to EXACT zeros, and the
+/// arithmetic is integer: a float delta would make "did this lever move the
+/// mmap row" a platform question.
+#[test]
+fn amplification_compare_reports_exact_zeros_for_identical_censuses() {
+    let directory = tempfile::tempdir().unwrap();
+    let a = published_ledger(&amp1_stream(), directory.path(), "a");
+    let b = published_ledger(&amp1_stream(), directory.path(), "b");
+
+    let output = compare_ledgers(&a, &b)
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.ends_with('\n') && text.matches('\n').count() == 1);
+    let report: serde_json::Value = serde_json::from_str(text.trim_end()).unwrap();
+    assert_eq!(report["schema"], "carrick.amplification-comparison.v1");
+
+    for row in report["ledger_rows"].as_array().unwrap() {
+        for delta in [
+            "guest_count_delta",
+            "host_calls_delta",
+            "host_cpu_ns_delta",
+            "mach_traps_delta",
+        ] {
+            assert_eq!(row[delta], 0, "{} {delta}", row["guest_op"]["name"]);
+        }
+        for fraction in [
+            "host_call_amplification_delta",
+            "host_cpu_ns_per_guest_op_delta",
+        ] {
+            assert_eq!(row[fraction]["numerator"], 0, "{fraction}");
+        }
+    }
+    assert_eq!(report["totals"]["host_syscalls"]["delta"], 0);
+    assert_eq!(report["totals"]["host_syscall_cpu_ns"]["delta"], 0);
+    assert_eq!(report["carrick_only"]["host_cpu_ns"]["delta"], 0);
+}
+
+/// A comparator that will cross an instrument version, a fixture, or a host
+/// build is worse than no comparator: it produces a plausible delta between two
+/// numbers that were never comparable. `program_sha256` is on this list because
+/// Task 2 deliberately moved the bundled-digest check OUT of the ledger parser —
+/// folding it in would make every published ledger unparseable the moment
+/// `native-amplification.d` is edited, destroying the archive.
+#[test]
+fn amplification_compare_refuses_every_capture_determinant_drift() {
+    let directory = tempfile::tempdir().unwrap();
+    let baseline = published_ledger(&amp1_stream(), directory.path(), "baseline");
+    let baseline_text = std::fs::read_to_string(&baseline).unwrap();
+
+    for (index, (needle, replacement, message)) in [
+        (
+            "\"program_sha256\":\"",
+            format!("\"program_sha256\":\"{}", "7".repeat(64)),
+            "program",
+        ),
+        (
+            "\"joins\":\"syscall,mach,fault\"",
+            "\"joins\":\"syscall,mach\"".to_owned(),
+            "joins",
+        ),
+        (
+            "\"aggsize\":\"64m\"",
+            "\"aggsize\":\"32m\"".to_owned(),
+            "buffer",
+        ),
+        (
+            "\"os_build\":\"27A5295i\"",
+            "\"os_build\":\"27A5295j\"".to_owned(),
+            "os build",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let drifted = if needle == "\"program_sha256\":\"" {
+            // Replace only the digest that follows the key, leaving the
+            // birth/terminal receipts alone.
+            let at = baseline_text.find(needle).unwrap();
+            let mut text = baseline_text.clone();
+            text.replace_range(at..at + needle.len() + 64, &replacement);
+            text
+        } else {
+            assert!(
+                baseline_text.contains(needle),
+                "the ledger must carry {needle} as a determinant"
+            );
+            baseline_text.replacen(needle, &replacement, 1)
+        };
+        let candidate = directory.path().join(format!("drift-{index}.json"));
+        std::fs::write(&candidate, drifted).unwrap();
+        compare_ledgers(&baseline, &candidate)
+            .failure()
+            .stderr(contains(message));
+    }
+
+    // The guest-op SET is a determinant too: two censuses that measured
+    // different operations have no row-wise difference to report. Slot 66 is
+    // canonical 64, a different real syscall, so closure still holds.
+    let other_ops = published_ledger(
+        &amp1_stream().replace("guest_slot=224", "guest_slot=66"),
+        directory.path(),
+        "other-ops",
+    );
+    compare_ledgers(&baseline, &other_ops)
+        .failure()
+        .stderr(contains("guest operation"));
+
+    // And the fixture: a ledger of a different image or a different guest
+    // command is not a before/after of anything.
+    let other_fixture = published_ledger(
+        &amp1_stream().replace(
+            "target_argv_sha256=3333333333333333333333333333333333333333333333333333333333333333",
+            "target_argv_sha256=4444444444444444444444444444444444444444444444444444444444444444",
+        ),
+        directory.path(),
+        "other-fixture",
+    );
+    compare_ledgers(&baseline, &other_fixture)
+        .failure()
+        .stderr(contains("target"));
 }
 
 #[test]
@@ -893,6 +1093,16 @@ fn native_amplification_program_scopes_bounds_and_sections_are_pinned() {
          number so no per-guest-syscall copyin exists"
     );
     assert!(code.contains("service_slot[pid, tid] = (uint64_t)arg0 + (uint64_t)2;"));
+
+    // The consumer-side drop counters are NOT readable from D (header fact
+    // 10), so this program must not appear to own them: `carrick trace`
+    // appends the `AMP1|consumer-drops|...` record after libdtrace finishes,
+    // and a D `printf` of the same record would be a fabricated verdict.
+    assert!(
+        !code.contains("consumer-drops"),
+        "libdtrace's own drop counters cannot be read from D; the record is \
+         written by the capture command, not printed by the program"
+    );
 
     // No kernel-stack ranking, ever.
     assert!(!code.contains("ustack("));
