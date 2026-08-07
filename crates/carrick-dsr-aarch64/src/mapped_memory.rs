@@ -2429,8 +2429,10 @@ impl NativeMappedMemory {
     ///   * host-page misalignment of address or length — the kernel rounds a
     ///     `MAP_FIXED` length up to page granularity, which would discard
     ///     bytes past the requested range that the memset leaves intact;
-    ///   * a range not contained in one mapped region, or outside owned
-    ///     host ranges (`fixed_mapping_target` confinement);
+    ///   * a range not contained in one mapped region, or — on the Biased
+    ///     production mode — outside owned host ranges
+    ///     (`fixed_mapping_target` confinement; Direct mode has no
+    ///     owned-range gate and relies on `region_contains` alone);
     ///   * a range that MAY EXECUTE or holds a lifted write-exec page:
     ///     replacing executable bytes must go through the write path's W^X +
     ///     translation-invalidation metadata, which a whole-object
@@ -6236,6 +6238,167 @@ mod tests {
         assert_eq!(
             memory.native_host_prot_for_page(base + 2 * HOST_PAGE as u64),
             libc::PROT_NONE
+        );
+
+        drop(memory);
+        assert_eq!(unsafe { libc::munmap(raw, reservation) }, 0);
+    }
+
+    /// The POST-map failure branch: the replacement has already landed (the
+    /// bytes are zero), so a protection re-establishment failure must
+    /// PROPAGATE — the dispatcher answers ENOMEM, exactly the memset path's
+    /// restore-failure contract — never report an untouched-fallback state
+    /// it no longer has. This is the after-address-space-commitment errno
+    /// class the campaign's `ca96024a` correction is about; the recorded
+    /// (bookkept) protection stays authoritative either way, so the checked
+    /// access paths keep restoring the range toward it.
+    #[test]
+    fn anonymous_reuse_replacement_post_map_protect_failure_propagates() {
+        const HOST_PAGE: usize = 16 * 1024;
+        let (raw, reservation, base, len, mut memory) = anonymous_reuse_fixture(8, 0x5a);
+        memory
+            .protect_range(base + 2 * HOST_PAGE as u64, 2 * HOST_PAGE, 0)
+            .expect("stage-1 invalidate the reclaimed subrange");
+
+        let result = memory.replace_anonymous_reuse_with(
+            base,
+            len,
+            MappingSharing::Private,
+            native_map_fixed_anon,
+            |host, _, _| {
+                Err(MemoryError::HostMap(format!(
+                    "injected restore failure at 0x{:x}",
+                    host.raw()
+                )))
+            },
+        );
+        assert!(
+            matches!(result, Err(MemoryError::HostMap(_))),
+            "a post-map restore failure must propagate, not fall back: {result:?}"
+        );
+
+        let bytes = memory
+            .read_bytes_raw(base, len)
+            .expect("read the replaced range");
+        assert!(
+            bytes.iter().all(|byte| *byte == 0),
+            "the replacement landed before the restore failed"
+        );
+        assert_eq!(
+            memory.native_host_prot_for_page(base + 2 * HOST_PAGE as u64),
+            libc::PROT_NONE,
+            "the recorded protection stays authoritative across the failure"
+        );
+
+        drop(memory);
+        assert_eq!(unsafe { libc::munmap(raw, reservation) }, 0);
+    }
+
+    /// Production runs this lane BIASED (`host = guest_va + bias`); the
+    /// Direct-mode receipts above exercise no translation and no owned-range
+    /// confinement (`fixed_mapping_flags` only gates Biased mode). Build a
+    /// biased fixture over a real mapping and assert (1) the map and restore
+    /// arms receive the TRANSLATED host addresses, (2) the zero/protection
+    /// contracts hold through the biased read path, and (3) shrinking the
+    /// owned host ranges makes `fixed_mapping_target` refuse
+    /// (`FixedOutsideOwned`) without the map arm ever running.
+    #[test]
+    fn anonymous_reuse_replacement_translates_biased_targets_and_confines_to_owned() {
+        const HOST_PAGE: usize = 16 * 1024;
+        const PAGES: usize = 4;
+        let len = PAGES * HOST_PAGE;
+        let reservation = len + HOST_PAGE;
+        let raw = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                reservation,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(raw, libc::MAP_FAILED, "map biased fixture");
+        let raw_start = raw as usize;
+        let host_start = (raw_start + (HOST_PAGE - 1)) & !(HOST_PAGE - 1);
+        assert!(host_start + len <= raw_start + reservation);
+        unsafe { std::ptr::write_bytes(host_start as *mut u8, 0x5a, len) };
+
+        let bias = HOST_PAGE as u64;
+        let guest_base = host_start as u64 - bias;
+        let mut memory = direct_test_memory(host_start, len, HOST_PAGE as u64);
+        memory.address_mode = NativeAddressMode::Biased {
+            host_bias: carrick_dsr::address::NativeHostBias::new(bias, HOST_PAGE as u64)
+                .expect("page-aligned nonzero bias"),
+        };
+        memory.regions[0].start = guest_base;
+        memory.regions[0].end = guest_base + len as u64;
+
+        memory
+            .protect_range(guest_base + HOST_PAGE as u64, HOST_PAGE, 0)
+            .expect("stage-1 invalidate one biased page");
+
+        let mut map_calls: Vec<(usize, usize, libc::c_int)> = Vec::new();
+        let mut prot_calls: Vec<(usize, usize, libc::c_int)> = Vec::new();
+        let replaced = memory
+            .replace_anonymous_reuse_with(
+                guest_base,
+                len,
+                MappingSharing::Private,
+                |host, map_len, flags| {
+                    map_calls.push((host.raw(), map_len, flags));
+                    native_map_fixed_anon(host, map_len, flags)
+                },
+                |host, prot_len, prot| {
+                    prot_calls.push((host.raw(), prot_len, prot));
+                    native_host_mprotect(host, prot_len, prot)
+                },
+            )
+            .expect("eligible biased private reuse must replace");
+        assert!(replaced);
+        assert_eq!(
+            map_calls,
+            vec![(
+                host_start,
+                len,
+                libc::MAP_FIXED | libc::MAP_ANON | libc::MAP_NORESERVE | libc::MAP_PRIVATE,
+            )],
+            "the map arm receives the bias-translated host base"
+        );
+        assert_eq!(
+            prot_calls,
+            vec![(host_start + HOST_PAGE, HOST_PAGE, libc::PROT_NONE)],
+            "the restore arm receives the bias-translated host page"
+        );
+        let bytes = memory
+            .read_bytes_raw(guest_base, len)
+            .expect("read the replaced biased range");
+        assert!(bytes.iter().all(|byte| *byte == 0));
+        assert_eq!(
+            memory.native_host_prot_for_page(guest_base + HOST_PAGE as u64),
+            libc::PROT_NONE
+        );
+
+        // (3) Confinement: with no owned host ranges, `fixed_mapping_target`
+        // refuses (`FixedOutsideOwned`) before the map arm can run.
+        memory.owned_host_ranges = Arc::new(Vec::new());
+        let mut mapped = false;
+        let replaced = memory
+            .replace_anonymous_reuse_with(
+                guest_base,
+                len,
+                MappingSharing::Private,
+                |_, _, _| {
+                    mapped = true;
+                    Ok(())
+                },
+                |_, _, _| Ok(()),
+            )
+            .expect("owned-range confinement is a refusal, not an error");
+        assert!(!replaced, "outside owned host ranges must refuse");
+        assert!(
+            !mapped,
+            "the confinement refusal must not touch the mapping"
         );
 
         drop(memory);
