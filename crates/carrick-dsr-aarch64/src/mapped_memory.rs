@@ -398,6 +398,29 @@ fn zero_backing_single_lift_enabled() -> bool {
     })
 }
 
+/// Does `zero_anonymous_reuse` REPLACE an eligible reused private anonymous
+/// range with fresh kernel zero pages (`mmap MAP_FIXED|MAP_ANON`) instead of
+/// memsetting the old backing end to end?
+///
+/// **DEFAULT ON.** `CARRICK_DSR_ZERO_REMAP=0` is the exact escape hatch
+/// (named after `CARRICK_DSR_ZERO_FAST` above, which stays the memset arm's
+/// own single-lift knob), and it exists so a paired screen's two arms come
+/// from ONE binary. The memset it replaces is the build lane's largest single
+/// fault source: 99.4% of in-mmap-window zfod — ~550k faults ≈ 8.3 GB of
+/// zero-fill first touch per cold `go build`, 98% of it serving hint-less
+/// 128 MiB `PROT_NONE` reserves whose pages provably had no backing at all
+/// (`docs/perf-results/2026-08-07-build-lane-fault-partition.md` §3–§4). The
+/// replacement keeps the immovable zeroed-anon guarantee — the kernel
+/// delivers zero pages on the fresh mapping — while touching nothing
+/// (fault-partition §7; the x86 identity backend's `zero_anonymous_reuse` is
+/// the shipped template).
+fn zero_anonymous_remap_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("CARRICK_DSR_ZERO_REMAP").as_deref() != Some(std::ffi::OsStr::new("0"))
+    })
+}
+
 pub struct HostLiftRestoreGuard<'a> {
     memory: &'a NativeMappedMemory,
     changed: &'a [(u64, libc::c_int)],
@@ -2381,6 +2404,182 @@ impl NativeMappedMemory {
         self.restore_temporary_host_access(&changed, address, len)
     }
 
+    /// Move-3 Task 7 (fault-partition §7): re-establish zero-filled anonymous
+    /// backing for a reused PRIVATE range by REPLACING it kernel-side with a
+    /// fresh `MAP_FIXED|MAP_ANON` mapping — zero touches, zero zfod at scrub
+    /// time — instead of memsetting ~8.3 GB of already-zero backing per cold
+    /// `go build`. `Ok(true)` means the range now reads zero and every
+    /// recorded non-RW host protection has been re-applied. Each `Ok(false)`
+    /// names an ineligibility and sends the caller back to the
+    /// always-correct memset (`zero_backing`), leaving the range's bytes and
+    /// protections untouched:
+    ///   * `MappingSharing::Shared`: the shared-aperture arm's backing is a
+    ///     boot-mapped `MAP_SHARED` object physically coherent across forked
+    ///     peers; the memset writes THROUGH it, a fresh anon object would
+    ///     silently sever it (fault-partition §7.3);
+    ///   * an old backing that may itself be shared: any overlapping region
+    ///     carrying a `shared_futex`/file-key contract (region entries are
+    ///     never pruned, so a munmapped-then-reused shared alias still names
+    ///     its contract here), or protection metadata claiming mutable
+    ///     shared backing over any byte (`range_mutable_shared_backing` is
+    ///     deliberately permission-independent for the same reason);
+    ///   * linux4k subpages: Darwin replaces whole 16 KiB host pages, so a
+    ///     4 KiB-logical replacement would detach live neighbour subpages
+    ///     (`remap_private`'s refusal);
+    ///   * host-page misalignment of address or length — the kernel rounds a
+    ///     `MAP_FIXED` length up to page granularity, which would discard
+    ///     bytes past the requested range that the memset leaves intact;
+    ///   * a range not contained in one mapped region, or outside owned
+    ///     host ranges (`fixed_mapping_target` confinement);
+    ///   * a range that MAY EXECUTE or holds a lifted write-exec page:
+    ///     replacing executable bytes must go through the write path's W^X +
+    ///     translation-invalidation metadata, which a whole-object
+    ///     replacement bypasses;
+    ///   * an active temporary host-access lift overlapping the range: the
+    ///     lift's restore contract records the OLD mapping's protection and
+    ///     must not be re-pointed at a fresh object. Unreachable while the
+    ///     dispatcher holds the exclusive mapping-mutation borrow (lifts
+    ///     live only inside read-guard copy windows), so this is refused,
+    ///     not assumed;
+    ///   * any host `mmap` failure: a failed `MAP_FIXED` replacement leaves
+    ///     the prior mapping, bytes, and metadata intact, so the memset
+    ///     fallback proceeds exactly as if this path had never run.
+    pub fn replace_anonymous_reuse(
+        &mut self,
+        address: u64,
+        len: usize,
+        sharing: MappingSharing,
+    ) -> Result<bool, MemoryError> {
+        self.replace_anonymous_reuse_with(
+            address,
+            len,
+            sharing,
+            native_map_fixed_anon,
+            native_host_mprotect,
+        )
+    }
+
+    /// Injectable form of [`Self::replace_anonymous_reuse`] (the same spy
+    /// seam as `protect_native16k_range_with`): `map_fixed_anon` performs the
+    /// whole-range `MAP_FIXED` anonymous replacement, `set_host_prot` the
+    /// post-replacement protection re-establishment.
+    pub fn replace_anonymous_reuse_with<M, F>(
+        &mut self,
+        address: u64,
+        len: usize,
+        sharing: MappingSharing,
+        mut map_fixed_anon: M,
+        mut set_host_prot: F,
+    ) -> Result<bool, MemoryError>
+    where
+        M: FnMut(carrick_guest_mem::HostVa, usize, libc::c_int) -> Result<(), MemoryError>,
+        F: FnMut(carrick_guest_mem::HostVa, usize, libc::c_int) -> Result<(), MemoryError>,
+    {
+        if len == 0
+            || matches!(sharing, MappingSharing::Shared)
+            || self.uses_linux4k_subpages()
+            || !address.is_multiple_of(self.host_page_size)
+            || !(len as u64).is_multiple_of(self.host_page_size)
+        {
+            return Ok(false);
+        }
+        let Some(end) = address.checked_add(len as u64) else {
+            return Ok(false);
+        };
+        if !self.region_contains(address, len) || self.range_may_execute(address, len) {
+            return Ok(false);
+        }
+        if self.regions.iter().any(|region| {
+            region.start < end
+                && address < region.end
+                && (region.shared_futex || region.shared_key_base != 0)
+        }) || self.protections.range_mutable_shared_backing(address, len)
+        {
+            return Ok(false);
+        }
+        if self
+            .native_write_exec_writable_pages
+            .range(address..end)
+            .next()
+            .is_some()
+            || self
+                .host_access_lifts
+                .lock()
+                .keys()
+                .any(|&page| page >= address && page < end)
+        {
+            return Ok(false);
+        }
+        let Ok((host_start, flags)) = self.fixed_mapping_target(
+            address,
+            len,
+            libc::MAP_ANON | MAP_NORESERVE | libc::MAP_PRIVATE,
+        ) else {
+            return Ok(false);
+        };
+        // Capture the restore plan BEFORE replacing: the fresh mapping comes
+        // back host-RW, and the memset path's contract is that recorded host
+        // protection state is exactly preserved — a stage-1-invalidated
+        // (host `PROT_NONE`) reclaimed range must not become readable, and
+        // callers do not all re-protect. Same per-page derivation as
+        // `prepare_temporary_host_access` phase 1, coalesced into runs like
+        // its phase 2 (the dominant reuse shapes coalesce to zero or one
+        // run, so this stays O(runs) in `mprotect` calls).
+        let host_page_len =
+            usize::try_from(self.host_page_size).map_err(|_| MemoryError::OutOfBounds {
+                address,
+                length: len,
+            })?;
+        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        let mut restore: Vec<(u64, usize, libc::c_int)> = Vec::new();
+        for (overlap_start, overlap_end) in self.host_protected_overlaps(address, len) {
+            let (page_start, page_len) = self.host_page_range(overlap_start, overlap_end)?;
+            let page_end = page_start.saturating_add(page_len as u64);
+            let mut page = page_start;
+            while page < page_end {
+                let prot = self.native_host_prot_for_page(page);
+                if prot != rw {
+                    match restore.last_mut() {
+                        Some((run_start, run_len, run_prot))
+                            if *run_prot == prot
+                                && run_start.saturating_add(*run_len as u64) == page =>
+                        {
+                            *run_len += host_page_len;
+                        }
+                        _ => restore.push((page, host_page_len, prot)),
+                    }
+                }
+                page = page.saturating_add(self.host_page_size);
+            }
+        }
+        // MAP_FIXED atomically replaces the old private anon backing with
+        // fresh zero-filled RW pages; a failed replacement leaves the old
+        // mapping, its bytes, and all metadata untouched (the production arm
+        // tears down a misplaced result), so the memset fallback proceeds as
+        // if this path had never run.
+        if map_fixed_anon(host_start, len, flags).is_err() {
+            return Ok(false);
+        }
+        // The bytes changed (to zero) without the write path: perform the
+        // same exclusive-monitor invalidation every raw guest-RAM write
+        // performs. May-execute ranges were excluded above, so no DSR
+        // code-mutation note is due.
+        self.invalidate_exclusive_range(address, len);
+        // Re-establish the recorded protections. A failure here propagates
+        // exactly as a memset-path `restore_temporary_host_access` failure
+        // does (the dispatcher answers ENOMEM); the guest-visible protection
+        // registry is untouched either way, so syscall-boundary EFAULT gates
+        // remain correct.
+        for &(run_start, run_len, prot) in &restore {
+            set_host_prot(
+                self.host_address(carrick_guest_mem::GuestVa(run_start))?,
+                run_len,
+                prot,
+            )?;
+        }
+        Ok(true)
+    }
+
     /// The exclusive-monitor bump plus the conditional DSR code-mutation note
     /// that every `write_bytes_raw` path performs before touching guest RAM,
     /// regardless of whether the write also hits a native16k write-exec page.
@@ -4032,6 +4231,27 @@ impl GuestMemory for NativeMappedMemory {
         Ok(())
     }
 
+    /// Kernel-side anonymous-reuse replacement (fault-partition §7, the x86
+    /// identity backend's shipped lowering brought to this lane): an eligible
+    /// reused PRIVATE anon range is scrubbed by replacing its backing with
+    /// fresh kernel zero pages — preserving the immovable zeroed-anon
+    /// guarantee with zero touches — instead of memsetting the old backing
+    /// end to end (99.4% of the build lane's in-mmap-window zfod). Every
+    /// ineligible or failed replacement, and `CARRICK_DSR_ZERO_REMAP=0`,
+    /// keeps the always-correct memset; see
+    /// [`Self::replace_anonymous_reuse`] for the named refusal list.
+    fn zero_anonymous_reuse(
+        &mut self,
+        address: u64,
+        len: usize,
+        sharing: MappingSharing,
+    ) -> Result<(), MemoryError> {
+        if zero_anonymous_remap_enabled() && self.replace_anonymous_reuse(address, len, sharing)? {
+            return Ok(());
+        }
+        self.zero_backing(address, len)
+    }
+
     fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
         if !self.region_contains(address, length) {
             return Err(MemoryError::OutOfBounds { address, length });
@@ -4378,6 +4598,40 @@ pub fn native16k_host_prot(prot: u64) -> libc::c_int {
         host_prot = (host_prot & !libc::PROT_EXEC) | libc::PROT_READ;
     }
     host_prot
+}
+
+/// Applies one whole-range `MAP_FIXED` anonymous replacement mapping
+/// (host-RW; the caller re-establishes recorded protections). Production map
+/// arm of the injectable [`NativeMappedMemory::replace_anonymous_reuse_with`];
+/// tests substitute recording or failing spies. `MAP_FIXED` cannot relocate;
+/// a misplaced result is torn down anyway (abort on a failed teardown,
+/// mirroring `map_host_alias`) so a broken host cannot leak an unowned
+/// mapping, and a failed replacement leaves the prior mapping intact.
+pub fn native_map_fixed_anon(
+    host_start: carrick_guest_mem::HostVa,
+    len: usize,
+    flags: libc::c_int,
+) -> Result<(), MemoryError> {
+    let ptr = host_start.raw() as *mut libc::c_void;
+    let mapped = unsafe { libc::mmap(ptr, len, libc::PROT_READ | libc::PROT_WRITE, flags, -1, 0) };
+    if mapped == libc::MAP_FAILED {
+        return Err(MemoryError::HostMap(format!(
+            "native anonymous reuse replacement at 0x{:x} for {len} bytes failed: {}",
+            host_start.raw(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    if mapped != ptr {
+        if unsafe { libc::munmap(mapped, len) } != 0 {
+            std::process::abort();
+        }
+        return Err(MemoryError::HostMap(format!(
+            "native anonymous reuse replacement requested 0x{:x} but returned 0x{:x}",
+            host_start.raw(),
+            mapped as usize
+        )));
+    }
+    Ok(())
 }
 
 /// Applies one host `mprotect` over a contiguous run of host pages. This is
@@ -5582,5 +5836,409 @@ mod tests {
 
         drop(memory);
         assert_eq!(unsafe { libc::munmap(raw, RESERVATION) }, 0);
+    }
+
+    /// Fixture for the kernel-side anonymous-reuse replacement receipts: an
+    /// arena-shaped direct-mode memory over `pages` real host pages, every
+    /// byte dirtied to `fill` so a scrub's effect (or a refusal's inaction)
+    /// is byte-observable. Returns `(raw, reservation, base, len, memory)`;
+    /// the caller munmaps `raw..raw+reservation`.
+    fn anonymous_reuse_fixture(
+        pages: usize,
+        fill: u8,
+    ) -> (*mut libc::c_void, usize, u64, usize, NativeMappedMemory) {
+        const HOST_PAGE: usize = 16 * 1024;
+        let len = pages * HOST_PAGE;
+        let reservation = len + HOST_PAGE;
+        let raw = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                reservation,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(raw, libc::MAP_FAILED, "map anonymous-reuse fixture");
+        let raw_start = raw as usize;
+        let host_start = (raw_start + (HOST_PAGE - 1)) & !(HOST_PAGE - 1);
+        assert!(host_start + len <= raw_start + reservation);
+        unsafe { std::ptr::write_bytes(host_start as *mut u8, fill, len) };
+        let memory = direct_test_memory(host_start, len, HOST_PAGE as u64);
+        (raw, reservation, host_start as u64, len, memory)
+    }
+
+    /// Move-3 Task 7 (fault-partition §7) red-first receipt: the immovable
+    /// zeroed-anon guarantee under the REPLACEMENT mechanism. A dirty reused
+    /// range must read back zero, the recorded (stage-1-invalidated)
+    /// PROT_NONE protection of a reclaimed subrange must survive the
+    /// replacement (the fresh mapping comes back RW; callers do not all
+    /// re-protect), and an armed exclusive reservation must observe the
+    /// scrub exactly as it observes the memset.
+    #[test]
+    fn anonymous_reuse_replacement_rezeroes_and_preserves_recorded_protection() {
+        const HOST_PAGE: usize = 16 * 1024;
+        let (raw, reservation, base, len, mut memory) = anonymous_reuse_fixture(8, 0x5a);
+
+        // Stage-1-invalidate pages [2,4) the way a munmap-reclaimed hole is
+        // recorded: PROT_NONE in the bookkeeping AND on the host page.
+        memory
+            .protect_range(base + 2 * HOST_PAGE as u64, 2 * HOST_PAGE, 0)
+            .expect("stage-1 invalidate the reclaimed subrange");
+        // An armed exclusive reservation on page 0 must observe the scrub.
+        memory
+            .exclusive_sequences
+            .lock()
+            .insert(base, NativeExclusivePageState::default());
+
+        assert!(
+            memory
+                .replace_anonymous_reuse(base, len, MappingSharing::Private)
+                .expect("eligible private reuse must replace"),
+            "an aligned single-region private anon range is replacement-eligible"
+        );
+
+        let bytes = memory
+            .read_bytes_raw(base, len)
+            .expect("read the replaced range");
+        assert!(
+            bytes.iter().all(|byte| *byte == 0),
+            "a reused range must read zero after the scrub"
+        );
+        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        assert_eq!(memory.native_host_prot_for_page(base), rw);
+        assert_eq!(
+            memory.native_host_prot_for_page(base + 2 * HOST_PAGE as u64),
+            libc::PROT_NONE,
+            "a stage-1-invalidated reclaimed page must not become readable"
+        );
+        assert_eq!(
+            memory.native_host_prot_for_page(base + 3 * HOST_PAGE as u64),
+            libc::PROT_NONE
+        );
+        assert_ne!(
+            memory
+                .exclusive_sequences
+                .lock()
+                .get(&base)
+                .expect("page-0 exclusive state")
+                .sequence
+                .0,
+            NativeExclusiveSequence::INITIAL.0,
+            "the replacement must invalidate armed exclusive reservations"
+        );
+        assert!(!memory.protections.range_mutable_shared_backing(base, len));
+
+        drop(memory);
+        assert_eq!(unsafe { libc::munmap(raw, reservation) }, 0);
+    }
+
+    /// The replacement is ONE kernel-side map plus exactly the recorded
+    /// non-RW protection runs, coalesced — no per-chunk lift/restore
+    /// `mprotect` pairs and no byte writes. Asserted through the injectable
+    /// map/protect arms (the same spy pattern `protect_native16k_range_with`
+    /// tests use).
+    #[test]
+    fn anonymous_reuse_replacement_restores_only_non_rw_protection_runs() {
+        const HOST_PAGE: usize = 16 * 1024;
+        let (raw, reservation, base, len, mut memory) = anonymous_reuse_fixture(8, 0x5a);
+        memory
+            .protect_range(base + 2 * HOST_PAGE as u64, 2 * HOST_PAGE, 0)
+            .expect("record a PROT_NONE run");
+        memory
+            .protect_range(
+                base + 5 * HOST_PAGE as u64,
+                HOST_PAGE,
+                carrick_abi::LINUX_PROT_READ,
+            )
+            .expect("record a read-only page");
+
+        let mut map_calls: Vec<(usize, usize, libc::c_int)> = Vec::new();
+        let mut prot_calls: Vec<(usize, usize, libc::c_int)> = Vec::new();
+        let replaced = memory
+            .replace_anonymous_reuse_with(
+                base,
+                len,
+                MappingSharing::Private,
+                |host, map_len, flags| {
+                    map_calls.push((host.raw(), map_len, flags));
+                    native_map_fixed_anon(host, map_len, flags)
+                },
+                |host, prot_len, prot| {
+                    prot_calls.push((host.raw(), prot_len, prot));
+                    native_host_mprotect(host, prot_len, prot)
+                },
+            )
+            .expect("eligible private reuse must replace");
+        assert!(replaced);
+        assert_eq!(
+            map_calls,
+            vec![(
+                usize::try_from(base).expect("direct-mode base"),
+                len,
+                libc::MAP_FIXED | libc::MAP_ANON | libc::MAP_NORESERVE | libc::MAP_PRIVATE,
+            )],
+            "one whole-range MAP_FIXED anonymous replacement"
+        );
+        assert_eq!(
+            prot_calls,
+            vec![
+                (
+                    usize::try_from(base).expect("direct-mode base") + 2 * HOST_PAGE,
+                    2 * HOST_PAGE,
+                    libc::PROT_NONE,
+                ),
+                (
+                    usize::try_from(base).expect("direct-mode base") + 5 * HOST_PAGE,
+                    HOST_PAGE,
+                    libc::PROT_READ,
+                ),
+            ],
+            "exactly the recorded non-RW runs are re-established, coalesced"
+        );
+
+        drop(memory);
+        assert_eq!(unsafe { libc::munmap(raw, reservation) }, 0);
+    }
+
+    /// The severing rule and the other named refusals: every shape whose old
+    /// backing may be shared with a forked peer (the shared-aperture arm's
+    /// `MappingSharing::Shared`, a region carrying a `shared_futex`/file-key
+    /// contract, a permission-independent `mutable_shared_backing` claim), a
+    /// misaligned range, a may-execute range, a lifted write-exec page, and
+    /// an active temporary host-access lift are refused WITHOUT touching the
+    /// mapping — and the trait entry then falls back to the memset, which
+    /// still delivers the zeroed-anon guarantee.
+    #[test]
+    fn anonymous_reuse_replacement_refuses_shared_aliased_exec_and_lifted_shapes() {
+        const HOST_PAGE: usize = 16 * 1024;
+        let (raw, reservation, base, len, mut memory) = anonymous_reuse_fixture(8, 0x5a);
+        let rw = libc::PROT_READ | libc::PROT_WRITE;
+
+        fn assert_refused(
+            memory: &mut NativeMappedMemory,
+            address: u64,
+            len: usize,
+            sharing: MappingSharing,
+            why: &str,
+        ) {
+            let mut mapped = false;
+            let replaced = memory
+                .replace_anonymous_reuse_with(
+                    address,
+                    len,
+                    sharing,
+                    |_, _, _| {
+                        mapped = true;
+                        Ok(())
+                    },
+                    |_, _, _| Ok(()),
+                )
+                .unwrap_or_else(|error| panic!("{why}: {error:?}"));
+            assert!(!replaced, "must refuse: {why}");
+            assert!(!mapped, "a refusal must not touch the mapping: {why}");
+        }
+
+        assert_refused(
+            &mut memory,
+            base,
+            len,
+            MappingSharing::Shared,
+            "MAP_SHARED reuse severs forked peers",
+        );
+        assert_refused(
+            &mut memory,
+            base + 8,
+            len - 16,
+            MappingSharing::Private,
+            "misaligned address",
+        );
+        assert_refused(
+            &mut memory,
+            base,
+            len - 8,
+            MappingSharing::Private,
+            "misaligned length",
+        );
+
+        memory.regions.push(NativeMappedRegion {
+            start: base + 6 * HOST_PAGE as u64,
+            end: base + 7 * HOST_PAGE as u64,
+            host_protects: true,
+            shared_futex: true,
+            guest_writable: true,
+            default_prot: carrick_abi::LINUX_PROT_READ | carrick_abi::LINUX_PROT_WRITE,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+        });
+        assert_refused(
+            &mut memory,
+            base,
+            len,
+            MappingSharing::Private,
+            "an overlapping shared-futex region names a shared old backing",
+        );
+        memory.regions.pop();
+
+        memory.protections.set_mapping_sharing(
+            base + 4 * HOST_PAGE as u64,
+            HOST_PAGE,
+            MappingSharing::Shared,
+        );
+        assert_refused(
+            &mut memory,
+            base,
+            len,
+            MappingSharing::Private,
+            "mutable_shared_backing metadata is permission-independent",
+        );
+        memory.protections.set_mapping_sharing(
+            base + 4 * HOST_PAGE as u64,
+            HOST_PAGE,
+            MappingSharing::Private,
+        );
+
+        memory
+            .protect_range(
+                base,
+                HOST_PAGE,
+                carrick_abi::LINUX_PROT_READ | carrick_abi::LINUX_PROT_EXEC,
+            )
+            .expect("record an executable page");
+        assert_refused(
+            &mut memory,
+            base,
+            len,
+            MappingSharing::Private,
+            "a may-execute range needs the write path's W^X metadata",
+        );
+        memory
+            .protect_range(
+                base,
+                HOST_PAGE,
+                carrick_abi::LINUX_PROT_READ | carrick_abi::LINUX_PROT_WRITE,
+            )
+            .expect("restore the executable page");
+
+        memory
+            .native_write_exec_writable_pages
+            .insert(base + HOST_PAGE as u64);
+        assert_refused(
+            &mut memory,
+            base,
+            len,
+            MappingSharing::Private,
+            "a lifted write-exec page must keep the write path",
+        );
+        memory
+            .native_write_exec_writable_pages
+            .remove(&(base + HOST_PAGE as u64));
+
+        memory.host_access_lifts.lock().insert(
+            base + HOST_PAGE as u64,
+            HostLift {
+                refcount: 1,
+                original_prot: rw,
+                lifted_prot: rw,
+            },
+        );
+        assert_refused(
+            &mut memory,
+            base,
+            len,
+            MappingSharing::Private,
+            "an active host-access lift's restore contract binds the OLD mapping",
+        );
+        memory
+            .host_access_lifts
+            .lock()
+            .remove(&(base + HOST_PAGE as u64));
+
+        let bytes = memory
+            .read_bytes_raw(base, len)
+            .expect("read the refused range");
+        assert!(
+            bytes.iter().all(|byte| *byte == 0x5a),
+            "refusals must leave every byte untouched"
+        );
+
+        // The trait entry falls back to the (always-correct) memset on a
+        // refused shape and still delivers the zeroed-anon guarantee.
+        memory
+            .zero_anonymous_reuse(base, len, MappingSharing::Shared)
+            .expect("refused shape falls back to the memset scrub");
+        let bytes = memory
+            .read_bytes_raw(base, len)
+            .expect("read the memset-scrubbed range");
+        assert!(
+            bytes.iter().all(|byte| *byte == 0),
+            "the fallback must still zero the reused range"
+        );
+
+        drop(memory);
+        assert_eq!(unsafe { libc::munmap(raw, reservation) }, 0);
+    }
+
+    /// Failure atomicity: a failed replacement map must leave the address
+    /// space exactly as the memset path would have found it — old bytes and
+    /// recorded protections intact, no restore mprotects issued — so the
+    /// fallback memset then produces the identical end state.
+    #[test]
+    fn anonymous_reuse_replacement_map_failure_leaves_memset_path_state() {
+        const HOST_PAGE: usize = 16 * 1024;
+        let (raw, reservation, base, len, mut memory) = anonymous_reuse_fixture(8, 0x5a);
+        memory
+            .protect_range(base + 2 * HOST_PAGE as u64, 2 * HOST_PAGE, 0)
+            .expect("stage-1 invalidate the reclaimed subrange");
+
+        let mut prot_calls = 0usize;
+        let replaced = memory
+            .replace_anonymous_reuse_with(
+                base,
+                len,
+                MappingSharing::Private,
+                |host, _, _| {
+                    Err(MemoryError::HostMap(format!(
+                        "injected replacement failure at 0x{:x}",
+                        host.raw()
+                    )))
+                },
+                |_, _, _| {
+                    prot_calls += 1;
+                    Ok(())
+                },
+            )
+            .expect("a failed replacement is a fallback, not an error");
+        assert!(!replaced, "a failed map must send the caller to the memset");
+        assert_eq!(prot_calls, 0, "no restore may run after a failed map");
+
+        let bytes = memory
+            .read_bytes_raw(base, len)
+            .expect("read the untouched range");
+        assert!(
+            bytes.iter().all(|byte| *byte == 0x5a),
+            "a failed replacement must leave the old bytes for the memset"
+        );
+        assert_eq!(
+            memory.native_host_prot_for_page(base + 2 * HOST_PAGE as u64),
+            libc::PROT_NONE,
+            "recorded protections must survive the failed replacement"
+        );
+
+        memory
+            .zero_backing(base, len)
+            .expect("the memset fallback still scrubs");
+        let bytes = memory
+            .read_bytes_raw(base, len)
+            .expect("read the memset-scrubbed range");
+        assert!(bytes.iter().all(|byte| *byte == 0));
+        assert_eq!(
+            memory.native_host_prot_for_page(base + 2 * HOST_PAGE as u64),
+            libc::PROT_NONE
+        );
+
+        drop(memory);
+        assert_eq!(unsafe { libc::munmap(raw, reservation) }, 0);
     }
 }
