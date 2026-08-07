@@ -232,19 +232,6 @@ impl TranslationUnitKey {
         self.guest_va_start
     }
 
-    pub fn contains_guest_interval(&self, start: GuestVa, end: GuestVa) -> bool {
-        let Some(segment_end) = self
-            .guest_va_start
-            .raw()
-            .checked_add(self.guest_va_len.get())
-        else {
-            return false;
-        };
-        start.raw() < end.raw()
-            && start.raw() >= self.guest_va_start.raw()
-            && end.raw() <= segment_end
-    }
-
     pub const fn source_fingerprint(&self) -> SourceFingerprint {
         self.source_fingerprint
     }
@@ -255,21 +242,6 @@ impl TranslationUnitKey {
 
     pub const fn host_bias(&self) -> Option<u64> {
         self.address_mode.host_bias()
-    }
-
-    /// Domain-separated fixed-width identity for the live translation arena.
-    ///
-    /// This deliberately hashes the complete exact key encoding rather than
-    /// deriving from [`Self::file_stem`]: a live arena record must bind every
-    /// existing unit determinant, never a basename or another partial key.
-    pub fn live_digest(&self) -> Result<[u8; 32], serde_json::Error> {
-        let encoded = serde_json::to_vec(self)?;
-        let mut digest = Sha256::new();
-        digest.update(b"carrick-live-arena-v2");
-        digest.update(crate::live_arena::LIVE_ARENA_SCHEMA_V2.to_le_bytes());
-        digest.update(TRANSLATOR_ABI_CURRENT.to_le_bytes());
-        digest.update(encoded);
-        Ok(digest.finalize().into())
     }
 
     pub fn file_stem(&self) -> Result<String, serde_json::Error> {

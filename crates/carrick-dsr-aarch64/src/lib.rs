@@ -30,7 +30,6 @@ pub mod emit;
 pub mod emulate;
 pub mod esr;
 pub mod gateway;
-pub mod live_arena;
 pub mod mapped_memory;
 pub mod prot_ranges;
 // The prepared-image schema moved to `carrick-dsr` (the platform-neutral

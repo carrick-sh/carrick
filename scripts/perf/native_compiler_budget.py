@@ -203,100 +203,17 @@ FRAME_FIELDS_V5 = {
     | {"shared_blocks_attached"},
 }
 REQUIRED_FRAMES_V5 = frozenset(FRAME_FIELDS_V5)
-# NATIVEPERF v6 adds the container-lifetime LIVE arena lane: its own serve /
-# publication counters, its own byte extents (deliberately NOT folded into
-# `cache-gauge`, which is the PRIVATE bump cache's occupancy), and one counter
-# per named fallback class, split across three PIPE_BUF-atomic frames exactly
-# like the fusion classes. No pre-existing frame changed, so a v5 record stays
-# readable as v5.
-LIVE_FALLBACK_CLASSES = (
-    "lfb_unconfigured",
-    "lfb_regenerated",
-    "lfb_outside_segment",
-    "lfb_cross_page",
-    "lfb_unsupported_shape",
-    "lfb_source_words_unavailable",
-    "lfb_prepare_refused",
-    "lfb_unresolved_entry",
-    "lfb_arena_building",
-    "lfb_arena_failed",
-    "lfb_arena_cas_lost",
-    "lfb_arena_invalid_record",
-    "lfb_arena_capacity",
-    "lfb_arena_exhausted_probes",
-    "lfb_arena_key_encoding",
-    "lfb_arena_write_attempted",
-    "lfb_arena_unknown_state",
-)
-FRAME_FIELDS_V6 = {
-    **{frame: set(fields) for frame, fields in FRAME_FIELDS_V5.items()},
-    "live-lane": {
-        "live_index_hits",
-        "live_ready_hits",
-        "live_ready_misses",
-        "live_publish_wins",
-        "live_publish_adoptions",
-        "live_blocks_installed",
-    },
-    "live-bytes": {
-        "live_code_bytes",
-        "live_hot_bytes",
-        "live_cold_bytes",
-        "live_links_patched",
-        "live_links_out_of_reach",
-    },
-    "live-fallback-a": set(LIVE_FALLBACK_CLASSES[:6]),
-    "live-fallback-b": set(LIVE_FALLBACK_CLASSES[6:12]),
-    "live-fallback-c": set(LIVE_FALLBACK_CLASSES[12:]),
-}
-REQUIRED_FRAMES_V6 = frozenset(FRAME_FIELDS_V6)
-# NATIVEPERF v7 adds the live lane's REVOCATION pair: chunks this process
-# protected PROT_NONE after a source-page mutation, and the stale instruction
-# aborts the exact classifier recovered privately. They are their own frame
-# because they are the only live counters produced outside the translate path
-# (the guest-write seam and the fault classifier). Additive only, so a v6
-# record still reads exactly as v6.
-FRAME_FIELDS_V7 = {
-    **{frame: set(fields) for frame, fields in FRAME_FIELDS_V6.items()},
-    "live-revoke": {
-        "live_revoked_chunks",
-        "live_stale_instruction_aborts",
-    },
-}
-REQUIRED_FRAMES_V7 = frozenset(FRAME_FIELDS_V7)
-# NATIVEPERF v8 extends `live-bytes` with the winner-publication prebind
-# triple: shared→shared direct links bound into the still-staged source at
-# publication, plus the two named refusal classes (target not an acquirable
-# READY record; the emitter's AArch64 ±128 MiB reach check). They ride the
-# byte frame beside the two private→live link counters they complement.
-# Additive only, so a v7 record still reads exactly as v7.
-FRAME_FIELDS_V8 = {
-    **{frame: set(fields) for frame, fields in FRAME_FIELDS_V7.items()},
-    "live-bytes": set(FRAME_FIELDS_V7["live-bytes"])
-    | {
-        "live_links_prebound",
-        "live_links_prebind_unbound_state",
-        "live_links_prebind_unbound_reach",
-    },
-}
-REQUIRED_FRAMES_V8 = frozenset(FRAME_FIELDS_V8)
-# NATIVEPERF v9 extends `resolver-thread` with the resolve-direct residue
-# split by TARGET class: back-same-page (the upper bound on
-# self-referential-site traversals — a live block never leaves its 16 KiB
-# source page), forward, and backward cross-page. Thread-scoped like
-# `direct_resolver_exits`, which they partition. Additive only, so a v8
-# record still reads exactly as v8.
-FRAME_FIELDS_V9 = {
-    **{frame: set(fields) for frame, fields in FRAME_FIELDS_V8.items()},
-    "resolver-thread": set(FRAME_FIELDS_V8["resolver-thread"])
-    | {
-        "resolve_direct_back_same_page",
-        "resolve_direct_forward",
-        "resolve_direct_back_cross_page",
-    },
-}
-REQUIRED_FRAMES_V9 = frozenset(FRAME_FIELDS_V9)
-# The supervisor record (`NATIVEPERF1|supervisor|...`) is a v2-era, per-PROFILE
+# NATIVEPERF v6-v9 existed only for the 2026-08-05..06 live-translation-arena
+# campaign (v6 live-lane/live-bytes/live-fallback frames, v7 live-revoke, v8
+# prebind counters on live-bytes, v9 resolve-direct residue split). The arena
+# was measured worse on both target shapes and DELETED with its runtime
+# (`revert(native): remove the live translation arena runtime`, 2026-08-06;
+# evidence: docs/perf-results/2026-08-06-live-arena-36x-attribution.md and
+# the 20-exec micro in the task-10 delete report). The producer contract is v5
+# again, and this parser fails closed in both directions: a stream carrying a
+# live frame is rejected as unknown, and archived v6-v9 captures are read only
+# by the analyzer that shipped beside them (git history), never reinterpreted
+# here.
 # (not per-thread-group) record: the top-level `carrick run` process's own
 # getrusage(RUSAGE_SELF)/getrusage(RUSAGE_CHILDREN) CPU. It is a top-level
 # protocol "kind" (like "thread"/"invalid"), not a "frame" within a thread
@@ -1018,9 +935,9 @@ def _protocol_fields(line: str) -> tuple[str, dict[str, str]]:
 
 
 def _frame_contract(frame: str, extras: set[str]) -> tuple[int | None, set[str]]:
-    """Match one frame's field set against the v1-v6 contracts.
+    """Match one frame's field set against the v1-v5 contracts.
 
-    Returns (version, field set): version 1 through 6 for contract-splitting
+    Returns (version, field set): version 1 through 5 for contract-splitting
     frames, and None for version-neutral frames.
     Raises the same unknown/missing diagnostics as the historical v1 parser.
     """
@@ -1029,20 +946,12 @@ def _frame_contract(frame: str, extras: set[str]) -> tuple[int | None, set[str]]
     fields_v3 = FRAME_FIELDS_V3.get(frame)
     fields_v4 = FRAME_FIELDS_V4.get(frame)
     fields_v5 = FRAME_FIELDS_V5.get(frame)
-    fields_v6 = FRAME_FIELDS_V6.get(frame)
-    fields_v7 = FRAME_FIELDS_V7.get(frame)
-    fields_v8 = FRAME_FIELDS_V8.get(frame)
-    fields_v9 = FRAME_FIELDS_V9.get(frame)
     if (
         fields_v1 is None
         and fields_v2 is None
         and fields_v3 is None
         and fields_v4 is None
         and fields_v5 is None
-        and fields_v6 is None
-        and fields_v7 is None
-        and fields_v8 is None
-        and fields_v9 is None
     ):
         raise BudgetError(f"unknown profile frame: {frame}")
     if fields_v1 is not None and extras == fields_v1:
@@ -1067,47 +976,17 @@ def _frame_contract(frame: str, extras: set[str]) -> tuple[int | None, set[str]]
                 return 3, fields_v5
             return 4, fields_v5
         return 5, fields_v5
-    if fields_v6 is not None and extras == fields_v6:
-        # Only the frames v6 INTRODUCED reach here: every frame v5 also
-        # carries is answered by the cascade above with its own version.
-        if fields_v6 == fields_v7 and frame not in FRAME_FIELDS_V6:
-            return 7, fields_v7
-        return 6, fields_v6
-    if fields_v7 is not None and extras == fields_v7:
-        # Same rule one version on: only frames v7 INTRODUCED reach here.
-        return 7, fields_v7
-    if fields_v8 is not None and extras == fields_v8:
-        # Same rule one version on: only frames v8 EXTENDED reach here (an
-        # unchanged frame already matched its introducing version above).
-        return 8, fields_v8
-    if fields_v9 is not None and extras == fields_v9:
-        # Same rule again: only frames v9 EXTENDED reach here.
-        return 9, fields_v9
     allowed = (
         (fields_v1 or set())
         | (fields_v2 or set())
         | (fields_v3 or set())
         | (fields_v4 or set())
         | (fields_v5 or set())
-        | (fields_v6 or set())
-        | (fields_v7 or set())
-        | (fields_v8 or set())
-        | (fields_v9 or set())
     )
     unknown = extras - allowed
     if unknown:
         raise BudgetError(f"unknown field(s) in {frame}: {', '.join(sorted(unknown))}")
-    expected = (
-        fields_v1
-        or fields_v2
-        or fields_v3
-        or fields_v4
-        or fields_v5
-        or fields_v6
-        or fields_v7
-        or fields_v8
-        or fields_v9
-    )
+    expected = fields_v1 or fields_v2 or fields_v3 or fields_v4 or fields_v5
     assert expected is not None
     missing = expected - extras
     if not missing:
@@ -1178,15 +1057,7 @@ def parse_nativeperf(lines: Iterable[str]) -> ProfileRun:
     for (pid, tid, era), frames in sorted(groups.items()):
         key = (pid, tid, era)
         versions = group_versions.get(key, set())
-        if versions == {2, 3, 4, 5, 6, 7, 8, 9}:
-            version = 9
-        elif versions == {2, 3, 4, 5, 6, 7, 8}:
-            version = 8
-        elif versions == {2, 3, 4, 5, 6, 7}:
-            version = 7
-        elif versions == {2, 3, 4, 5, 6}:
-            version = 6
-        elif versions == {2, 3, 4, 5}:
+        if versions == {2, 3, 4, 5}:
             version = 5
         elif versions == {2, 3, 4}:
             version = 4
@@ -1206,10 +1077,6 @@ def parse_nativeperf(lines: Iterable[str]) -> ProfileRun:
             3: REQUIRED_FRAMES_V3,
             4: REQUIRED_FRAMES_V4,
             5: REQUIRED_FRAMES_V5,
-            6: REQUIRED_FRAMES_V6,
-            7: REQUIRED_FRAMES_V7,
-            8: REQUIRED_FRAMES_V8,
-            9: REQUIRED_FRAMES_V9,
         }[version]
         missing = required - set(frames)
         if missing:
@@ -2807,21 +2674,6 @@ def _parse_profile_json(value: object) -> ProfileRun | None:
         elif frames == sorted(REQUIRED_FRAMES_V3):
             version = 3
             fields_by_frame = FRAME_FIELDS_V3
-        elif frames == sorted(REQUIRED_FRAMES_V7):
-            # v8 and v9 extend frames with FIELDS, not new frames, so the
-            # frame set alone cannot split them — same rule as v4/v5 below.
-            if "resolver-thread.resolve_direct_forward" in values:
-                version = 9
-                fields_by_frame = FRAME_FIELDS_V9
-            elif "live-bytes.live_links_prebound" in values:
-                version = 8
-                fields_by_frame = FRAME_FIELDS_V8
-            else:
-                version = 7
-                fields_by_frame = FRAME_FIELDS_V7
-        elif frames == sorted(REQUIRED_FRAMES_V6):
-            version = 6
-            fields_by_frame = FRAME_FIELDS_V6
         elif frames == sorted(REQUIRED_FRAMES_V5):
             if "resolver-shared.shared_blocks_attached" in values:
                 version = 5

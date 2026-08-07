@@ -18,7 +18,6 @@ Commands
     carrick info                         # show the active state's summary
     carrick mappings                     # list guest mappings + perms
     carrick decode-esr <hex>             # ARMv8 ESR_EL1 decoder
-    carrick xlat-live-arena [<cache-pc>] # live translation arena export
     carrick gva <addr>                   # resolve guest VA to region/segment
     carrick where                        # one-line situational dump
 
@@ -379,12 +378,9 @@ def _static_load_addr(target, fullname: str) -> Optional[int]:
 
     Rust mangles statics with a trailing `::h<hash>`, so the demangled symbol is
     `carrick_runtime::event_ring::RING::h0382...`; we match by name COMPONENTS
-    (module + base both present) rather than by exact string.
-
-    Keyed on the caller's own module name, so this serves any carrick static
-    (`event_ring::RING`, `live_arena_export::LIVE_ARENA_EXPORT`, ...)."""
-    module_name = fullname.split("::")[-2]  # e.g. "event_ring"
-    base = fullname.split("::")[-1]  # e.g. "RING" / "LIVE_ARENA_EXPORT"
+    (module + base both present) rather than by exact string."""
+    module_name = fullname.split("::")[-2]  # "event_ring"
+    base = fullname.split("::")[-1]  # "RING" / "IDX"
 
     var_list = target.FindGlobalVariables(base, 50)
     for i in range(var_list.GetSize()):
@@ -399,7 +395,7 @@ def _static_load_addr(target, fullname: str) -> Optional[int]:
     for module in target.modules:
         for sym in module:
             name = sym.GetName() or ""
-            if module_name not in name:
+            if "event_ring" not in name:
                 continue
             parts = name.split("::")
             if module_name in parts and base in parts:
@@ -462,229 +458,6 @@ def cmd_eventring(debugger, command, exe_ctx, result, internal_dict):
     result.AppendMessage("\n".join(out))
 
 
-# ----- live translation arena export (EXPORT-ONLY) ------------------------
-#
-# Decodes `carrick_dsr_aarch64::translator::live_arena_export::LIVE_ARENA_EXPORT`
-# from a LIVE process or a CORE. The contract is the BYTE LAYOUT declared in
-# that Rust module (repr(C), little-endian, magic + version + self-describing
-# slot counts and record strides), not a Rust type — so a core taken from any
-# run decodes with nothing pre-armed.
-#
-# This reader is strictly EXPORT-ONLY: it never writes process memory, never
-# constructs or attaches an arena, and there is no import path. A debugger
-# cannot repair, publish into, or revoke an arena through it.
-#
-# TEARING: the export's fields are independent relaxed stores with the total
-# bumped last, so on a LIVE attach the newest record can be caught mid-write
-# and read back as a mix of two. A core is exact (the process is stopped).
-
-_XLAT_MAGIC = int.from_bytes(b"CRKXLAT1", "little")
-_XLAT_VERSION = 1
-_XLAT_HEADER_BYTES = 64
-_XLAT_READY_BYTES = 48
-_XLAT_REVOKED_BYTES = 32
-
-
-def _u64(raw: bytes, off: int) -> int:
-    return int.from_bytes(raw[off:off + 8], "little")
-
-
-def _u32(raw: bytes, off: int) -> int:
-    return int.from_bytes(raw[off:off + 4], "little")
-
-
-def cmd_xlat_live_arena(debugger, command, exe_ctx, result, internal_dict):
-    """carrick xlat-live-arena [<cache-pc>] — live arena export (live or core)"""
-    args = shlex.split(command)
-    if len(args) > 1:
-        result.SetError("usage: carrick xlat-live-arena [<cache-pc>]")
-        return
-    wanted = None
-    if args:
-        try:
-            wanted = _parse_int(args[0])
-        except ValueError as exc:
-            result.SetError(f"can't parse {args[0]!r}: {exc}")
-            return
-
-    target = exe_ctx.GetTarget() or debugger.GetSelectedTarget()
-    if not target or not target.IsValid():
-        result.SetError("no target; `lldb <binary>` (attach) or `lldb -c <core> <binary>`")
-        return
-    process = exe_ctx.GetProcess() or target.GetProcess()
-    if not process or not process.IsValid():
-        result.SetError(
-            "no process/core loaded. Attach to a live carrick (`lldb -p <pid>`) "
-            "or load a core (`lldb -c <core> target/release/carrick`)."
-        )
-        return
-    addr = _static_load_addr(
-        target,
-        "carrick_dsr_aarch64::translator::live_arena_export::LIVE_ARENA_EXPORT",
-    )
-    if addr is None:
-        result.SetError(
-            "LIVE_ARENA_EXPORT symbol not found — the binary must retain symbols "
-            "(release keeps them unless explicitly stripped)."
-        )
-        return
-    err = lldb.SBError()
-    header = process.ReadMemory(addr, _XLAT_HEADER_BYTES, err)
-    if not err.Success():
-        result.SetError(f"read export header @ {_fmt_hex(addr)} failed: {err.GetCString()}")
-        return
-    magic = _u64(header, 0)
-    if magic != _XLAT_MAGIC:
-        result.SetError(
-            f"live arena export magic {magic:#x} is not CRKXLAT1 — wrong symbol or "
-            "a binary from a different build"
-        )
-        return
-    version = _u32(header, 8)
-    if version != _XLAT_VERSION:
-        result.SetError(
-            f"live arena export version {version} is not {_XLAT_VERSION}; this plugin "
-            "would decode the wrong layout"
-        )
-        return
-    ready_slots = _u32(header, 12)
-    revoked_slots = _u32(header, 16)
-    ready_stride = _u32(header, 20)
-    revoked_stride = _u32(header, 24)
-    if ready_stride != _XLAT_READY_BYTES or revoked_stride != _XLAT_REVOKED_BYTES:
-        result.SetError(
-            f"live arena export record strides ({ready_stride}, {revoked_stride}) do not "
-            f"match this plugin's ({_XLAT_READY_BYTES}, {_XLAT_REVOKED_BYTES})"
-        )
-        return
-    rx_start = _u64(header, 32)
-    rx_end = _u64(header, 40)
-    ready_total = _u64(header, 48)
-    revoked_total = _u64(header, 56)
-
-    ready_base = addr + _XLAT_HEADER_BYTES
-    revoked_base = ready_base + ready_slots * ready_stride
-    ready_shown = min(ready_total, ready_slots)
-    revoked_shown = min(revoked_total, revoked_slots)
-    raw_ready = b""
-    raw_revoked = b""
-    if ready_slots:
-        raw_ready = process.ReadMemory(ready_base, ready_slots * ready_stride, err)
-        if not err.Success():
-            result.SetError(f"read READY ring failed: {err.GetCString()}")
-            return
-    if revoked_slots:
-        raw_revoked = process.ReadMemory(revoked_base, revoked_slots * revoked_stride, err)
-        if not err.Success():
-            result.SetError(f"read revoked ring failed: {err.GetCString()}")
-            return
-
-    out = [
-        f"# carrick live translation arena export  pid={process.GetProcessID()}",
-        f"  rx payload:      {_fmt_hex(rx_start)} .. {_fmt_hex(rx_end)}"
-        + ("  (none installed)" if rx_end == 0 else ""),
-        f"  READY records:   total={ready_total} showing={ready_shown} (ring of {ready_slots})",
-        f"  revoked chunks:  total={revoked_total} showing={revoked_shown} (ring of {revoked_slots})",
-    ]
-    # Always stated rather than detected: distinguishing a core from a live
-    # attach through SBProcess is unreliable, and a caveat that is sometimes
-    # silent is worse than one that is always printed.
-    out.append(
-        "  NOTE: on a LIVE attach the newest record may be TORN — the fields are "
-        "independent relaxed stores and the total is bumped last. A core is "
-        "stopped, so it reads exactly."
-    )
-
-    def ready_at(index: int) -> dict:
-        off = (index % ready_slots) * ready_stride
-        return {
-            "guest_start": _u64(raw_ready, off),
-            "cache_entry": _u64(raw_ready, off + 8),
-            "code_len": _u64(raw_ready, off + 16),
-            "source_page": _u64(raw_ready, off + 24),
-            "generation": _u64(raw_ready, off + 32),
-            "chunk_index": _u32(raw_ready, off + 40),
-        }
-
-    records = [ready_at(ready_total - ready_shown + k) for k in range(ready_shown)]
-
-    out.append("")
-    out.append("  READY (guest_start -> cache entry, len, source page, generation, chunk)")
-    for record in records:
-        out.append(
-            f"    {_fmt_hex(record['guest_start']):>14} -> {_fmt_hex(record['cache_entry']):<14} "
-            f"{record['code_len']:>6}B  page={_fmt_hex(record['source_page'])} "
-            f"gen={record['generation']} chunk={record['chunk_index']}"
-        )
-    if not records:
-        out.append("    (none)")
-
-    out.append("")
-    out.append("  REVOKED (source page -> local RX range, chunk)")
-    revoked = []
-    for k in range(revoked_shown):
-        off = ((revoked_total - revoked_shown + k) % revoked_slots) * revoked_stride
-        entry = {
-            "source_page": _u64(raw_revoked, off),
-            "rx_start": _u64(raw_revoked, off + 8),
-            "rx_len": _u64(raw_revoked, off + 16),
-            "chunk_index": _u32(raw_revoked, off + 24),
-        }
-        revoked.append(entry)
-        out.append(
-            f"    page={_fmt_hex(entry['source_page'])} -> "
-            f"{_fmt_hex(entry['rx_start'])} .. {_fmt_hex(entry['rx_start'] + entry['rx_len'])} "
-            f"chunk={entry['chunk_index']}"
-        )
-    if not revoked:
-        out.append("    (none)")
-
-    if wanted is not None:
-        out.append("")
-        out.append(f"  cache PC {_fmt_hex(wanted)}:")
-        if rx_end and not (rx_start <= wanted < rx_end):
-            out.append("    NOT inside this process's live RX payload (private cache PC?)")
-        hit = next(
-            (
-                record
-                for record in records
-                if record["cache_entry"] <= wanted < record["cache_entry"] + record["code_len"]
-            ),
-            None,
-        )
-        if hit is None:
-            out.append(
-                "    no retained READY record covers it — either it is older than the "
-                f"ring's {ready_slots} entries, or it is not live-arena code"
-            )
-        else:
-            offset = wanted - hit["cache_entry"]
-            out.append(
-                f"    block guest_start={_fmt_hex(hit['guest_start'])} "
-                f"entry={_fmt_hex(hit['cache_entry'])} offset={_fmt_hex(offset)}"
-            )
-            out.append(
-                "    guest PC is at or after the block start; the EXACT guest PC for a "
-                "mid-block offset lives in the arena's COLD recovery metadata, which "
-                "this export deliberately does not copy."
-            )
-        stale = next(
-            (
-                entry
-                for entry in revoked
-                if entry["rx_start"] <= wanted < entry["rx_start"] + entry["rx_len"]
-            ),
-            None,
-        )
-        if stale is not None:
-            out.append(
-                f"    inside REVOKED chunk {stale['chunk_index']} "
-                f"(source page {_fmt_hex(stale['source_page'])}) — executing here traps"
-            )
-
-    result.AppendMessage("\n".join(out))
-
-
 # ----- the top-level `carrick` multiplex command --------------------------
 
 _SUBCOMMANDS = {
@@ -695,7 +468,6 @@ _SUBCOMMANDS = {
     "gva": cmd_gva,
     "where": cmd_where,
     "eventring": cmd_eventring,
-    "xlat-live-arena": cmd_xlat_live_arena,
 }
 
 

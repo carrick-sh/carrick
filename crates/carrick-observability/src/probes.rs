@@ -37,7 +37,7 @@
 use std::num::NonZeroU64;
 use std::ops::Range;
 
-use carrick_guest_mem::{GuestVa, HostVa};
+use carrick_guest_mem::HostVa;
 
 /// Failure returned by `register_dtrace_probes`.
 ///
@@ -735,22 +735,6 @@ dsr_ordinal_enum! {
 
 dsr_ordinal_enum! {
     /// Low-cardinality DSR translation-cache event.
-    ///
-    /// `LiveReadyHit` / `LiveWinnerPublish` are the container-lifetime LIVE
-    /// arena's OWN kinds: a block served from the shared arena, and a block
-    /// this process won the race to publish into it. They are deliberately
-    /// distinct from `BlockHit` / `BlockPublish`, which mean the PRIVATE
-    /// per-process bump cache — one kind for both made a live serve
-    /// indistinguishable from a private cache hit in every trace.
-    ///
-    /// `LiveCasLoss` is a lost block claim; `LiveValidationRefusal` is a
-    /// record this process found and REFUSED (torn, unresolvable, or an
-    /// unknown state); `LivePrivateFallback` is every other named reason the
-    /// lane declined; `LiveStaleAbortRecovered` is an instruction abort in a
-    /// revoked chunk that the exact classifier recovered privately. There is
-    /// deliberately NO kind for the policy-off `Unconfigured` fallback: that
-    /// is every authoritative miss on the shipped default, so a probe there
-    /// would put a new call on the default translate path.
     pub enum DsrCacheEventKind {
         BlockHit = 1,
         BlockMiss = 2,
@@ -764,66 +748,6 @@ dsr_ordinal_enum! {
         DirectBindingClear = 10,
         DirectBindingValidationFailure = 11,
         DirectBindingUnitLoaded = 12,
-        LiveReadyHit = 13,
-        LiveWinnerPublish = 14,
-        LiveCasLoss = 15,
-        LivePrivateFallback = 16,
-        LiveValidationRefusal = 17,
-        LiveStaleAbortRecovered = 18,
-    }
-}
-
-/// One exact 64 KiB live-arena RX chunk this task protected `PROT_NONE`
-/// because a guest write, `mprotect`, `munmap`, or remap changed its source
-/// page (Task 7's revocation seam).
-///
-/// It deliberately carries NO thread identity: revocation runs on the memory
-/// mutation seam, which has no guest thread in scope, and a fabricated `tid`
-/// would put a sentinel into a real domain. The fields are private and
-/// construction validates the extent, so a caller cannot publish an empty or
-/// inverted revocation.
-///
-/// ```compile_fail
-/// use carrick_observability::probes::DsrLiveChunkRevocation;
-/// use carrick_guest_mem::{GuestVa, HostVa};
-///
-/// let _ = DsrLiveChunkRevocation {
-///     source_page: GuestVa(0x1000),
-///     chunk_index: 0,
-///     rx: HostVa(0x2000)..HostVa(0x3000),
-/// };
-/// ```
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DsrLiveChunkRevocation {
-    source_page: GuestVa,
-    chunk_index: u32,
-    rx: Range<HostVa>,
-}
-
-impl DsrLiveChunkRevocation {
-    pub fn revoked(
-        source_page: GuestVa,
-        chunk_index: u32,
-        rx: Range<HostVa>,
-    ) -> Result<Self, TranslatedRangeError> {
-        validate_translated_range(&rx)?;
-        Ok(Self {
-            source_page,
-            chunk_index,
-            rx,
-        })
-    }
-
-    pub const fn source_page(&self) -> GuestVa {
-        self.source_page
-    }
-
-    pub const fn chunk_index(&self) -> u32 {
-        self.chunk_index
-    }
-
-    pub const fn rx(&self) -> &Range<HostVa> {
-        &self.rx
     }
 }
 
@@ -1350,12 +1274,6 @@ mod dsr_probe_abi {
         assert_eq!(DsrCacheEventKind::DirectBindingClear.raw(), 10);
         assert_eq!(DsrCacheEventKind::DirectBindingValidationFailure.raw(), 11);
         assert_eq!(DsrCacheEventKind::DirectBindingUnitLoaded.raw(), 12);
-        assert_eq!(DsrCacheEventKind::LiveReadyHit.raw(), 13);
-        assert_eq!(DsrCacheEventKind::LiveWinnerPublish.raw(), 14);
-        assert_eq!(DsrCacheEventKind::LiveCasLoss.raw(), 15);
-        assert_eq!(DsrCacheEventKind::LivePrivateFallback.raw(), 16);
-        assert_eq!(DsrCacheEventKind::LiveValidationRefusal.raw(), 17);
-        assert_eq!(DsrCacheEventKind::LiveStaleAbortRecovered.raw(), 18);
         assert_unique(&DsrCacheEventKind::ALL.map(DsrCacheEventKind::raw));
 
         assert_eq!(DsrCacheRole::Common.raw(), 0);
@@ -1954,9 +1872,6 @@ mod real {
         /// Translation-cache activity and fork/exec lifecycle boundaries.
         fn dsr__cache__event(_: i32, _: u32, _: u64, _: u64, _: u64) {}
         fn dsr__cache__capacity(_: u32, _: u64) {}
-        /// One live-arena RX chunk revoked PROT_NONE by this task. Process
-        /// scoped: the mutation seam has no guest thread, so there is no tid.
-        fn dsr__live__chunk__revoked(_: u64, _: u32, _: u64, _: u64) {}
         fn dsr__cache__bounds(_: u64, _: u64) {}
         fn host__translated__range__reset(_: u64) {}
         fn host__translated__private__range(_: u64, _: u64, _: u64, _: u64) {}
@@ -2524,16 +2439,6 @@ mod real {
     #[inline(always)]
     pub fn dsr_cache_capacity(role: super::DsrCacheRole, capacity_bytes: u64) {
         carrick_usdt::dsr__cache__capacity!(|| (role.raw(), capacity_bytes));
-    }
-
-    #[inline(always)]
-    pub fn dsr_live_chunk_revoked(event: super::DsrLiveChunkRevocation) {
-        carrick_usdt::dsr__live__chunk__revoked!(|| (
-            event.source_page().raw(),
-            event.chunk_index(),
-            event.rx().start.raw() as u64,
-            event.rx().end.raw() as u64,
-        ));
     }
 
     #[inline(always)]
@@ -4136,7 +4041,6 @@ mod stub {
     stub!(dsr_resolve_end(tid: i32, kind: super::DsrResolveKind, source_pc: u64, target_pc: u64, outcome: super::DsrOperationOutcome));
     stub!(dsr_cache_event(tid: i32, kind: super::DsrCacheEventKind, guest_pc: u64, generation: u64, used_bytes: u64));
     stub!(dsr_cache_capacity(role: super::DsrCacheRole, capacity_bytes: u64));
-    stub!(dsr_live_chunk_revoked(event: super::DsrLiveChunkRevocation));
     stub!(dsr_cache_bounds(base: u64, end: u64));
     stub!(host_process_birth(event: super::HostProcessBirth));
     stub!(host_process_birth_current());

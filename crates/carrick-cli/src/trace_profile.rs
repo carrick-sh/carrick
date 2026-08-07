@@ -187,53 +187,11 @@ fn validate_sha256(value: &str, field: &str) -> Result<()> {
     Ok(())
 }
 
-/// The single header slot the live-arena D template reserves.
-///
-/// A D comment, so the raw template stays a legal (if unauthenticated) D
-/// program; exactly one occurrence is required, which is what makes the
-/// rendered header unforgeable by a second substitution.
-pub(crate) const DSR_LIVE_ARENA_HEADER_PLACEHOLDER: &str = "/*%CARRICK_LIVE_ARENA_HEADER%*/";
-
-/// Stream prefix for the live-arena profile's authenticated header line.
-const DSR_LIVE_ARENA_PREFIX: &str = "DSRLIVE1";
-
-pub(crate) struct RenderedDsrLiveArenaProgram {
-    pub(crate) program: String,
-    pub(crate) program_sha256: String,
-}
-
-/// Bind one live-arena D template to its own SHA-256.
-///
-/// The house rule is that a `.d` program is an AUTHENTICATED input, not a
-/// script someone runs by hand: the digest is computed here, over the
-/// template, and emitted by the program's own BEGIN block, so a stream can
-/// always be traced back to the exact program text that produced it and a
-/// hand-edited script cannot masquerade as the shipped one.
-pub(crate) fn render_dsr_live_arena_program(template: &str) -> Result<RenderedDsrLiveArenaProgram> {
-    let slots = template
-        .match_indices(DSR_LIVE_ARENA_HEADER_PLACEHOLDER)
-        .count();
-    if slots != 1 {
-        bail!(
-            "dsr-live-arena D template must contain exactly one header placeholder, found {slots}"
-        );
-    }
-    let program_sha256 = format!("{:x}", Sha256::digest(template.as_bytes()));
-    let action = format!(
-        "printf(\"{DSR_LIVE_ARENA_PREFIX}|header|profile=dsr-live-arena|program_sha256={program_sha256}\\n\");"
-    );
-    Ok(RenderedDsrLiveArenaProgram {
-        program: template.replacen(DSR_LIVE_ARENA_HEADER_PLACEHOLDER, &action, 1),
-        program_sha256,
-    })
-}
-
 /// The single capture-bound slot the native-wall D template reserves.
 ///
-/// A D comment for the same reason the live-arena header placeholder is one:
-/// the unrendered template stays a legal program (running it applies the
-/// shipped default bound), and requiring exactly one occurrence means a second
-/// substitution cannot quietly install a different ceiling.
+/// A D comment, so the unrendered template stays a legal program (running it
+/// applies the shipped default bound), and requiring exactly one occurrence
+/// means a second substitution cannot quietly install a different ceiling.
 pub(crate) const DSRPROF2_BOUND_PLACEHOLDER: &str = "/* CARRICK_DSRPROF2_BOUND */";
 
 /// The largest bound a capture may request, in seconds (six hours).
@@ -276,87 +234,6 @@ pub(crate) fn render_profile_capture_bound(template: &str, seconds: u64) -> Resu
     }
     let action = format!("bound_limit_s = (uint64_t){seconds};");
     Ok(template.replacen(DSRPROF2_BOUND_PLACEHOLDER, &action, 1))
-}
-
-/// The authenticated header one live-arena capture carries.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct DsrLiveArenaHeader {
-    program_sha256: String,
-}
-
-impl DsrLiveArenaHeader {
-    fn parse(line: &str) -> Result<Self> {
-        let mut parts = line.split('|');
-        if parts.next() != Some(DSR_LIVE_ARENA_PREFIX) || parts.next() != Some("header") {
-            bail!("invalid dsr-live-arena header");
-        }
-        let mut fields = BTreeMap::new();
-        for raw_field in parts {
-            let (key, value) = raw_field
-                .split_once('=')
-                .ok_or_else(|| anyhow!("dsr-live-arena header field lacks '=': {raw_field:?}"))?;
-            if key.is_empty() || value.is_empty() {
-                bail!("dsr-live-arena header field has an empty key or value");
-            }
-            match fields.entry(key.to_owned()) {
-                Entry::Vacant(slot) => {
-                    slot.insert(value.to_owned());
-                }
-                Entry::Occupied(_) => bail!("duplicate dsr-live-arena header field {key:?}"),
-            }
-        }
-        if fields
-            .keys()
-            .map(String::as_str)
-            .ne(["profile", "program_sha256"])
-        {
-            bail!("dsr-live-arena header must carry exactly profile and program_sha256");
-        }
-        if fields.get("profile").map(String::as_str) != Some("dsr-live-arena") {
-            bail!("dsr-live-arena header names another profile");
-        }
-        let program_sha256 = fields
-            .get("program_sha256")
-            .cloned()
-            .ok_or_else(|| anyhow!("dsr-live-arena header has no program_sha256"))?;
-        validate_sha256(&program_sha256, "dsr-live-arena header program_sha256")?;
-        Ok(Self { program_sha256 })
-    }
-}
-
-/// ZERO-EVENT REJECTION. A capture that recorded no live-arena outcome is an
-/// ERROR, never an empty summary: the live lane is default-off, so the
-/// overwhelmingly likely cause of a silent capture is that the run never had
-/// the arena enabled — exactly the failure a "clean" empty report would hide.
-fn validate_dsr_live_arena_metrics(
-    grouped: &BTreeMap<ProfileScope, MetricBuilder>,
-    header: Option<&DsrLiveArenaHeader>,
-) -> Result<()> {
-    if header.is_none() {
-        bail!("dsr-live-arena stream has no authenticated DSRLIVE1 header");
-    }
-    let outcomes = grouped
-        .iter()
-        .filter(|(scope, _)| scope.phase.as_deref() == Some("live-outcome"))
-        .fold(0_u64, |total, (_, builder)| {
-            total.saturating_add(builder.count.unwrap_or(0))
-        });
-    if outcomes == 0 {
-        bail!(
-            "dsr-live-arena capture recorded zero live-arena outcome events; the lane was \
-             never enabled (CARRICK_DSR_LIVE_ARENA=compiler) or the probes never armed"
-        );
-    }
-    let attempts = grouped
-        .iter()
-        .filter(|(scope, _)| scope.phase.as_deref() == Some("translation-attempts"))
-        .fold(0_u64, |total, (_, builder)| {
-            total.saturating_add(builder.count.unwrap_or(0))
-        });
-    if attempts == 0 {
-        bail!("dsr-live-arena capture recorded no translation attempts to attribute against");
-    }
-    Ok(())
 }
 
 fn validate_percent_token(value: &str, field: &str) -> Result<()> {
@@ -569,7 +446,6 @@ impl V2ProfileAuthority {
             TraceProfileKind::Dsr
             | TraceProfileKind::DsrFork
             | TraceProfileKind::DsrIndirect
-            | TraceProfileKind::DsrLiveArena
             | TraceProfileKind::NativeShape => {
                 unreachable!("non-native profile cannot construct V2ProfileAuthority")
             }
@@ -634,42 +510,6 @@ pub(crate) fn validate_v2_path(path: &Path, capture_status: ProfileCaptureStatus
     let contents = fs::read_to_string(path)
         .with_context(|| format!("read DSRPROF2 stream {}", path.display()))?;
     validate_v2_lines(contents.lines(), capture_status)
-}
-
-/// Whether this stream claims to be a live-arena capture, decided by the
-/// stream itself rather than by a caller-supplied flag.
-///
-/// It deliberately also matches a stream whose COMPLETION names the profile
-/// but which carries no header: that is the forged/unauthenticated case, and
-/// routing it here is what lets the live-arena parser reject it by name
-/// instead of some other parser rejecting it for the wrong reason.
-pub(crate) fn path_is_dsr_live_arena(path: &Path) -> Result<bool> {
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("read profile stream header {}", path.display()))?;
-    Ok(contents.lines().map(str::trim).any(|line| {
-        line.starts_with("DSRLIVE1|header|")
-            || (line.starts_with("DSRPROF1|complete|") && line.contains("|profile=dsr-live-arena|"))
-    }))
-}
-
-/// Parse one live-arena stream fail-closed, and — when the D program that
-/// produced it is supplied — bind it to that program's exact digest.
-pub(crate) fn validate_dsr_live_arena_path(
-    path: &Path,
-    capture_status: ProfileCaptureStatus,
-    program: Option<&Path>,
-) -> Result<()> {
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("read dsr-live-arena stream {}", path.display()))?;
-    let summary = ProfileSummary::from_lines(contents.lines(), capture_status)?;
-    summary.require_profile(TraceProfileKind::DsrLiveArena)?;
-    if let Some(program) = program {
-        let template = fs::read_to_string(program)
-            .with_context(|| format!("read dsr-live-arena D program {}", program.display()))?;
-        let rendered = render_dsr_live_arena_program(&template)?;
-        summary.require_program_sha256(&rendered.program_sha256)?;
-    }
-    Ok(())
 }
 
 pub(crate) fn path_has_v2_header(path: &Path) -> Result<bool> {
@@ -2269,7 +2109,6 @@ pub(crate) enum TraceProfileKind {
     Dsr,
     DsrIndirect,
     DsrFork,
-    DsrLiveArena,
     NativeFault,
     NativeShape,
     NativeWall,
@@ -2281,7 +2120,6 @@ impl TraceProfileKind {
             Self::Dsr => "dsr",
             Self::DsrIndirect => "dsr-indirect",
             Self::DsrFork => "dsr-fork",
-            Self::DsrLiveArena => "dsr-live-arena",
             Self::NativeFault => "native-fault",
             Self::NativeShape => "native-shape",
             Self::NativeWall => "native-wall",
@@ -2291,7 +2129,7 @@ impl TraceProfileKind {
     pub(crate) const fn requires_runtime_profile(self) -> bool {
         matches!(
             self,
-            Self::Dsr | Self::DsrFork | Self::DsrLiveArena | Self::NativeShape | Self::NativeWall
+            Self::Dsr | Self::DsrFork | Self::NativeShape | Self::NativeWall
         )
     }
 
@@ -2301,7 +2139,6 @@ impl TraceProfileKind {
             Self::Dsr => carrick_runtime::dtrace_consumer::BUNDLED_DSR_PROFILE_D,
             Self::DsrIndirect => carrick_runtime::dtrace_consumer::BUNDLED_DSR_INDIRECT_D,
             Self::DsrFork => carrick_runtime::dtrace_consumer::BUNDLED_DSR_FORK_D,
-            Self::DsrLiveArena => carrick_runtime::dtrace_consumer::BUNDLED_DSR_LIVE_ARENA_D,
             Self::NativeFault => carrick_runtime::dtrace_consumer::BUNDLED_NATIVE_FAULT_D,
             Self::NativeShape => carrick_runtime::dtrace_consumer::BUNDLED_NATIVE_SHAPE_D,
             Self::NativeWall => carrick_runtime::dtrace_consumer::BUNDLED_NATIVE_WALL_D,
@@ -2313,7 +2150,6 @@ impl TraceProfileKind {
             "dsr" => Ok(Self::Dsr),
             "dsr-indirect" => Ok(Self::DsrIndirect),
             "dsr-fork" => Ok(Self::DsrFork),
-            "dsr-live-arena" => Ok(Self::DsrLiveArena),
             "native-fault" => Ok(Self::NativeFault),
             "native-shape" => Ok(Self::NativeShape),
             "native-wall" => Ok(Self::NativeWall),
@@ -3380,7 +3216,6 @@ fn build_v2_profile_summary(
         },
         metrics,
         provenance: ProfileProvenance::default(),
-        program_sha256: None,
         capture_bound_s,
     })
 }
@@ -3569,10 +3404,6 @@ pub(crate) struct ProfileSummary {
     completion: CompletionState,
     metrics: Vec<ProfileOutputMetric>,
     provenance: ProfileProvenance,
-    /// The `program_sha256` an authenticated live-arena stream carried, if
-    /// any. `require_program_sha256` is what turns it from a recorded string
-    /// into an authority check.
-    program_sha256: Option<String>,
     /// The capture bound the D program reported running with, if the stream
     /// declares one. `require_capture_bound` is what turns it into a check.
     capture_bound_s: Option<u64>,
@@ -3636,7 +3467,6 @@ impl ProfileSummary {
         let mut image_catalogs = BTreeMap::<u64, Vec<HostImageRangeRecord>>::new();
         let mut open_stack = None::<StackTraceRecord>;
         let mut completion = None;
-        let mut live_arena_header = None::<DsrLiveArenaHeader>;
         let mut capture_bound_s = None::<u64>;
 
         for (index, raw_line) in lines.iter().enumerate() {
@@ -3680,16 +3510,6 @@ impl ProfileSummary {
             }
             if line == "NWSTACK1|end" {
                 bail!("native-wall stack end without begin at line {}", index + 1);
-            }
-            if line.starts_with("DSRLIVE1|") {
-                if live_arena_header.is_some() {
-                    bail!("duplicate dsr-live-arena header at line {}", index + 1);
-                }
-                live_arena_header = Some(
-                    DsrLiveArenaHeader::parse(line)
-                        .with_context(|| format!("invalid header at line {}", index + 1))?,
-                );
-                continue;
             }
             if line.starts_with("NWIMAGES1|") {
                 let catalog = HostImageCatalogRecord::parse(line)
@@ -3807,11 +3627,6 @@ impl ProfileSummary {
         }
         if profile == TraceProfileKind::NativeWall {
             validate_native_wall_metrics(&grouped, &stack_traces)?;
-        }
-        if profile == TraceProfileKind::DsrLiveArena {
-            validate_dsr_live_arena_metrics(&grouped, live_arena_header.as_ref())?;
-        } else if live_arena_header.is_some() {
-            bail!("a DSRLIVE1 header is valid only for the dsr-live-arena profile");
         }
         for (scope, builder) in &grouped {
             let exact_fields = [
@@ -3995,7 +3810,6 @@ impl ProfileSummary {
             completion,
             metrics,
             provenance: ProfileProvenance::default(),
-            program_sha256: live_arena_header.map(|header| header.program_sha256),
             capture_bound_s,
         })
     }
@@ -4017,26 +3831,6 @@ impl ProfileSummary {
         })?;
         if observed != expected {
             bail!("capture ran with a {observed}s bound, not the requested {expected}s");
-        }
-        Ok(())
-    }
-
-    /// Bind an authenticated stream to the exact D program the caller ran.
-    ///
-    /// Recording the digest is bookkeeping; THIS is the authority check, and
-    /// it fails closed — a stream with no header, or one naming a different
-    /// program, is rejected rather than summarized.
-    pub(crate) fn require_program_sha256(&self, expected: &str) -> Result<()> {
-        let observed = self.program_sha256.as_deref().ok_or_else(|| {
-            anyhow!(
-                "profile {:?} stream carries no authenticated program digest",
-                self.profile
-            )
-        })?;
-        if observed != expected {
-            bail!(
-                "profile stream was produced by D program {observed}, not the expected {expected}"
-            );
         }
         Ok(())
     }

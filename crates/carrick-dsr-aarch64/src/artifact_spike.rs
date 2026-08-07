@@ -45,7 +45,6 @@ const ARTIFACT_RECORD_LENGTH_OFFSET: usize = ARTIFACT_RECORD_MODE_OFFSET + 8;
 const ARTIFACT_RECORD_HEADER: usize = ARTIFACT_RECORD_LENGTH_OFFSET + 8;
 const ARTIFACT_MAX_RECORD: usize = 4 * 1024 * 1024;
 const ARTIFACT_DECODE_LIMIT: usize = ARTIFACT_MAX_RECORD;
-const SHARED_INITIAL_METADATA_LIMIT: usize = 256 * 1024 * 1024;
 const ARTIFACT_COUNTER_OFFSET: usize = 64;
 static ARTIFACT_AUTHORITY: OnceLock<ArtifactAuthority> = OnceLock::new();
 
@@ -1065,117 +1064,6 @@ pub struct ArtifactRecording {
     trusted_entry: Option<TrustedEntryTemplate>,
 }
 
-/// Fully encoded, process-independent metadata for one shared INITIAL block.
-/// This deliberately has no `ArtifactBindings`: process values are permitted
-/// only while validating the recording and are discarded before this value is
-/// constructed.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SharedInitialMetadata {
-    hot: Vec<u8>,
-    cold: Vec<u8>,
-}
-
-impl SharedInitialMetadata {
-    pub(crate) fn hot_bytes(&self) -> &[u8] {
-        &self.hot
-    }
-
-    pub(crate) fn cold_bytes(&self) -> &[u8] {
-        &self.cold
-    }
-}
-
-/// Exact production validation for one mapped shared-INITIAL metadata pair.
-/// Both streams must decode completely and retain only immutable shared
-/// publication shapes whose offsets fit the logical code extent.
-pub(crate) fn validate_shared_initial_metadata(
-    hot_bytes: &[u8],
-    cold_bytes: &[u8],
-    code_len: u32,
-) -> Result<(), DsrError> {
-    let config = bincode::config::standard().with_limit::<SHARED_INITIAL_METADATA_LIMIT>();
-    let (hot, hot_consumed): (UnitBlockHotWire, usize) =
-        bincode::serde::decode_from_slice(hot_bytes, config).map_err(|error| {
-            DsrError::CachePolicy(format!("decode live shared INITIAL HOT metadata: {error}"))
-        })?;
-    if hot_consumed != hot_bytes.len() {
-        return Err(DsrError::CachePolicy(
-            "live shared INITIAL HOT metadata has trailing bytes".to_string(),
-        ));
-    }
-    let (cold, cold_consumed): (UnitBlockColdWire, usize) =
-        bincode::serde::decode_from_slice(cold_bytes, config).map_err(|error| {
-            DsrError::CachePolicy(format!("decode live shared INITIAL COLD metadata: {error}"))
-        })?;
-    if cold_consumed != cold_bytes.len() {
-        return Err(DsrError::CachePolicy(
-            "live shared INITIAL COLD metadata has trailing bytes".to_string(),
-        ));
-    }
-    if hot.relocations.is_empty()
-        && hot.direct_links.is_empty()
-        && hot.trusted_entry
-            == Some(TrustedEntryTemplate {
-                offset: 0,
-                expected: 0,
-            })
-    {
-        let template = ArtifactTemplate::from_unit_wire_parts(hot, cold);
-        if template.replay_metadata_fits_code_len(code_len) {
-            return Ok(());
-        }
-    }
-    Err(DsrError::CachePolicy(
-        "live shared INITIAL metadata is not an exact immutable block shape".to_string(),
-    ))
-}
-
-/// Decode ONE mapped shared-INITIAL COLD stream.
-///
-/// This is the lazy half of the live consumer contract: a live block leaves
-/// its pc map and recovery metadata undecoded in the arena's mapped COLD pool
-/// until a guest fault interrogates it, exactly as a unit-replayed block
-/// leaves them undecoded in its unit's cold stream.
-pub(crate) fn decode_shared_initial_cold(cold_bytes: &[u8]) -> Result<UnitBlockColdWire, DsrError> {
-    let config = bincode::config::standard().with_limit::<SHARED_INITIAL_METADATA_LIMIT>();
-    let (cold, consumed): (UnitBlockColdWire, usize) =
-        bincode::serde::decode_from_slice(cold_bytes, config).map_err(|error| {
-            DsrError::CachePolicy(format!("decode live shared INITIAL COLD metadata: {error}"))
-        })?;
-    if consumed != cold_bytes.len() {
-        return Err(DsrError::CachePolicy(
-            "live shared INITIAL COLD metadata has trailing bytes".to_string(),
-        ));
-    }
-    Ok(cold)
-}
-
-/// Exact HOT-only validation for a mapped shared-INITIAL consumer. COLD is
-/// deliberately absent: it remains lazy until fault reconstruction needs it.
-pub(crate) fn validate_shared_initial_hot(hot_bytes: &[u8], code_len: u32) -> Result<(), DsrError> {
-    let config = bincode::config::standard().with_limit::<SHARED_INITIAL_METADATA_LIMIT>();
-    let (hot, consumed): (UnitBlockHotWire, usize) =
-        bincode::serde::decode_from_slice(hot_bytes, config).map_err(|error| {
-            DsrError::CachePolicy(format!("decode live shared INITIAL HOT metadata: {error}"))
-        })?;
-    if consumed != hot_bytes.len()
-        || code_len == 0
-        || !code_len.is_multiple_of(4)
-        || !hot.relocations.is_empty()
-        || !hot.direct_links.is_empty()
-        || hot.trusted_entry
-            != Some(TrustedEntryTemplate {
-                offset: 0,
-                expected: 0,
-            })
-    {
-        return Err(DsrError::CachePolicy(
-            "live shared INITIAL HOT metadata is not an exact immutable block shape".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 impl ArtifactRecording {
     /// Record the trusted second entry point the emitter placed past the
     /// generation guard. At most one per block.
@@ -1322,49 +1210,6 @@ impl ArtifactRecording {
             &bindings,
         )?;
         Ok(ArtifactRecord { template, bindings })
-    }
-
-    /// Finish metadata for code that will become an immutable shared INITIAL
-    /// block. Shared code cannot carry any process-derived materialization:
-    /// there is no replay step in which a later process could rebind it.
-    /// Direct-link sites are deliberately omitted from the portable record;
-    /// the BUILDING publisher may consume its private copy before READY, but a
-    /// shared source must never re-enter a mutable link index afterward.
-    pub(crate) fn finish_shared_initial(
-        self,
-        words: Vec<u32>,
-        map: Vec<PcMapEntry>,
-        recovery: Vec<RecoveryEntry>,
-        source_words: Vec<u32>,
-    ) -> Result<SharedInitialMetadata, DsrError> {
-        if !self.relocations.is_empty() {
-            return Err(DsrError::CachePolicy(format!(
-                "shared INITIAL artifact retains {} process relocation(s)",
-                self.relocations.len()
-            )));
-        }
-        if self.trusted_entry
-            != Some(TrustedEntryTemplate {
-                offset: 0,
-                expected: 0,
-            })
-        {
-            return Err(DsrError::CachePolicy(
-                "shared INITIAL artifact must expose generation-zero trusted entry at offset zero"
-                    .to_string(),
-            ));
-        }
-        let record = self.finish(words, map, recovery, Vec::new(), source_words)?;
-        let template = record.template.into_unit_record_metadata(true)?;
-        let (hot, cold) = template.into_unit_wire_parts();
-        let config = bincode::config::standard().with_limit::<SHARED_INITIAL_METADATA_LIMIT>();
-        let hot = bincode::serde::encode_to_vec(&hot, config).map_err(|error| {
-            DsrError::CachePolicy(format!("encode shared INITIAL hot metadata: {error}"))
-        })?;
-        let cold = bincode::serde::encode_to_vec(&cold, config).map_err(|error| {
-            DsrError::CachePolicy(format!("encode shared INITIAL cold metadata: {error}"))
-        })?;
-        Ok(SharedInitialMetadata { hot, cold })
     }
 }
 
@@ -3190,29 +3035,5 @@ mod tests {
 
         assert!(stored.matches_source(&stored.source_words));
         assert!(!stored.matches_source(&colliding_source));
-    }
-
-    #[test]
-    fn metadata_validation_requires_exact_consumption() {
-        let hot = UnitBlockHotWire {
-            relocations: Vec::new(),
-            trusted_entry: Some(TrustedEntryTemplate {
-                offset: 0,
-                expected: 0,
-            }),
-            direct_links: Vec::new(),
-        };
-        let cold = UnitBlockColdWire {
-            map: Vec::new(),
-            recovery: PortableRecoveryMetadata::default(),
-        };
-        let mut hot_bytes = bincode::serde::encode_to_vec(&hot, bincode::config::standard())
-            .expect("encode valid shared HOT fixture");
-        let cold_bytes = bincode::serde::encode_to_vec(&cold, bincode::config::standard())
-            .expect("encode valid shared COLD fixture");
-        assert!(validate_shared_initial_metadata(&hot_bytes, &cold_bytes, 4).is_ok());
-
-        hot_bytes.push(0);
-        assert!(validate_shared_initial_metadata(&hot_bytes, &cold_bytes, 4).is_err());
     }
 }

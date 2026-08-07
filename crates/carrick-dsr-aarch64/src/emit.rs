@@ -4,14 +4,11 @@ use std::sync::atomic::AtomicU64;
 
 use carrick_guest_mem::{GuestVa, HostVa};
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, VecAssembler, aarch64::Aarch64Relocation};
-use sha2::{Digest, Sha256};
 
 use super::artifact_spike::{
     ArtifactRecord, ArtifactRecording, GatewayKind, MaterializedValue, ProcessValue,
-    SharedInitialMetadata, validate_shared_initial_hot,
 };
 use super::block::{BlockPlan, PlannedExit};
-use super::shared_cache::TranslationUnitKey;
 use super::types::{CacheOffset, CacheVa, CodeGeneration, DsrError, InstAction};
 use carrick_dsr::cache::{PublishedCode, TranslationCache};
 
@@ -135,245 +132,6 @@ struct AssembledBlock {
     trusted_entry: Option<CacheOffset>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SharedInitialLengths {
-    pub code: u64,
-    pub hot: u64,
-    pub cold: u64,
-}
-
-/// One fully validated shared INITIAL emission before any executable bytes
-/// become visible. The caller can reserve exact code/HOT/COLD extents from
-/// these owned byte streams, then consume this value for the single cache
-/// publication.
-pub struct PreparedSharedInitial {
-    assembled: AssembledBlock,
-    metadata: SharedInitialMetadata,
-    lengths: SharedInitialLengths,
-    live_identity: PreparedLiveIdentity,
-}
-
-struct PreparedLiveIdentity {
-    unit_digest: [u8; 32],
-    guest_start: GuestVa,
-    guest_end: GuestVa,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LivePrebindOutcome {
-    Bound,
-    OutOfRange,
-}
-
-/// Opaque expected-byte authority derived from one real, post-prebinding
-/// prepared shared publication. It has no caller constructor and is
-/// intentionally non-Clone. Its only valid certification use accompanies the
-/// same [`PreparedSharedInitial`] after that value is consumed exactly once
-/// into the exact claim-bound translation cache, with exact cache-used delta
-/// and the real host publisher flush complete. The cache and every emitted
-/// address-bearing value must then be dropped before certification begins.
-pub struct ExpectedLivePublication {
-    lengths: SharedInitialLengths,
-    code_sha256: [u8; 32],
-    hot_sha256: [u8; 32],
-    cold_sha256: [u8; 32],
-}
-
-impl ExpectedLivePublication {
-    pub(crate) const fn lengths(&self) -> SharedInitialLengths {
-        self.lengths
-    }
-
-    pub(crate) fn matches(&self, code: &[u8], hot: &[u8], cold: &[u8]) -> bool {
-        usize::try_from(self.lengths.code) == Ok(code.len())
-            && usize::try_from(self.lengths.hot) == Ok(hot.len())
-            && usize::try_from(self.lengths.cold) == Ok(cold.len())
-            && <[u8; 32]>::from(Sha256::digest(code)) == self.code_sha256
-            && <[u8; 32]>::from(Sha256::digest(hot)) == self.hot_sha256
-            && <[u8; 32]>::from(Sha256::digest(cold)) == self.cold_sha256
-    }
-
-    pub(crate) const fn code_sha256(&self) -> [u8; 32] {
-        self.code_sha256
-    }
-}
-
-impl PreparedSharedInitial {
-    pub const fn lengths(&self) -> SharedInitialLengths {
-        self.lengths
-    }
-
-    pub fn code_bytes(&self) -> &[u8] {
-        &self.assembled.instruction_bytes
-    }
-
-    pub fn hot_bytes(&self) -> &[u8] {
-        self.metadata.hot_bytes()
-    }
-
-    pub fn cold_bytes(&self) -> &[u8] {
-        self.metadata.cold_bytes()
-    }
-
-    /// Confirms this prepared block belongs to one address-free live claim.
-    /// The identity itself stays opaque so callers cannot reconstruct or
-    /// transplant prepared authority.
-    #[doc(hidden)]
-    pub fn matches_live_identity(
-        &self,
-        unit_digest: [u8; 32],
-        guest_start: GuestVa,
-        guest_end: GuestVa,
-    ) -> bool {
-        self.live_identity.unit_digest == unit_digest
-            && self.live_identity.guest_start == guest_start
-            && self.live_identity.guest_end == guest_end
-    }
-
-    /// Candidate sites exist only while the block is prepared and still
-    /// private to its BUILDING publisher. Task 6 will bind them only after it
-    /// adds the claim-bound, same-view Darwin target capability.
-    pub fn link_candidates(&self) -> &[DirectLink] {
-        &self.assembled.direct_links
-    }
-
-    /// Prebinds one still-private direct-link candidate using process-local RX
-    /// addresses. Only the candidate's four-byte patch slot is mutated.
-    ///
-    /// # Safety
-    ///
-    /// `source_rx` must be the exact RX start at which this prepared block will
-    /// be published, and `target_rx` must be an acquired executable entry from
-    /// the same process view. The caller must retain the unique BUILDING claim
-    /// and must not expose this prepared value after publication.
-    #[doc(hidden)]
-    pub unsafe fn prebind_live_direct_link(
-        &mut self,
-        candidate_index: usize,
-        source_rx: HostVa,
-        target_rx: HostVa,
-    ) -> Result<LivePrebindOutcome, DsrError> {
-        let candidate = self
-            .assembled
-            .direct_links
-            .get(candidate_index)
-            .copied()
-            .ok_or_else(|| DsrError::CachePolicy("live prebind candidate is absent".to_string()))?;
-        let slot = usize::try_from(candidate.slot.get())
-            .map_err(|_| DsrError::CachePolicy("live prebind slot exceeds usize".to_string()))?;
-        if !slot.is_multiple_of(4) {
-            return Err(DsrError::CachePolicy(
-                "live prebind slot is not instruction aligned".to_string(),
-            ));
-        }
-        let end = slot
-            .checked_add(4)
-            .filter(|end| *end <= self.assembled.instruction_bytes.len())
-            .ok_or_else(|| {
-                DsrError::CachePolicy("live prebind slot is outside prepared code".to_string())
-            })?;
-        let stub_start = usize::try_from(candidate.stub.start.get()).map_err(|_| {
-            DsrError::CachePolicy("live prebind stub start exceeds usize".to_string())
-        })?;
-        let stub_end = usize::try_from(candidate.stub.end.get()).map_err(|_| {
-            DsrError::CachePolicy("live prebind stub end exceeds usize".to_string())
-        })?;
-        if !stub_start.is_multiple_of(4) || !stub_end.is_multiple_of(4) {
-            return Err(DsrError::CachePolicy(
-                "live prebind stub envelope is not instruction aligned".to_string(),
-            ));
-        }
-        if stub_start >= stub_end
-            || stub_end > self.assembled.instruction_bytes.len()
-            || end > stub_start
-        {
-            return Err(DsrError::CachePolicy(
-                "live prebind stub envelope is outside prepared code".to_string(),
-            ));
-        }
-        let source = source_rx.raw().checked_add(slot).ok_or_else(|| {
-            DsrError::CachePolicy("live prebind source address overflow".to_string())
-        })?;
-        let original_target = source_rx.raw().checked_add(stub_start).ok_or_else(|| {
-            DsrError::CachePolicy("live prebind stub address overflow".to_string())
-        })?;
-        if !source.is_multiple_of(4) || !original_target.is_multiple_of(4) {
-            return Err(DsrError::CachePolicy(
-                "live prebind source geometry is not instruction aligned".to_string(),
-            ));
-        }
-        let original_word = crate::translator::encode_aarch64_direct_branch(
-            carrick_dsr::cache::LinkSite {
-                source: CacheVa::published(source_rx),
-                slot: candidate.slot,
-            },
-            CacheVa::published(HostVa(original_target)),
-        )?;
-        let slot_bytes = &self.assembled.instruction_bytes[slot..end];
-        let current =
-            u32::from_le_bytes([slot_bytes[0], slot_bytes[1], slot_bytes[2], slot_bytes[3]]);
-        if current != original_word {
-            return Err(DsrError::CachePolicy(
-                "live prebind candidate was already mutated".to_string(),
-            ));
-        }
-        if !target_rx.raw().is_multiple_of(4) {
-            return Err(DsrError::CachePolicy(
-                "live prebind target address is not instruction aligned".to_string(),
-            ));
-        }
-        let displacement = (target_rx.raw() as i128) - (source as i128);
-        if displacement % 4 != 0 {
-            return Err(DsrError::CachePolicy(
-                "live prebind displacement is not instruction aligned".to_string(),
-            ));
-        }
-        let words = displacement / 4;
-        if !(-(1_i128 << 25)..(1_i128 << 25)).contains(&words) {
-            return Ok(LivePrebindOutcome::OutOfRange);
-        }
-        let word = crate::translator::encode_aarch64_direct_branch(
-            carrick_dsr::cache::LinkSite {
-                source: CacheVa::published(source_rx),
-                slot: candidate.slot,
-            },
-            CacheVa::published(target_rx),
-        )?;
-        self.assembled.instruction_bytes[slot..end].copy_from_slice(&word.to_le_bytes());
-        Ok(LivePrebindOutcome::Bound)
-    }
-
-    /// Captures the exact post-prebinding bytes that one mapped publication
-    /// must later certify. The proof owns only lengths and digests.
-    pub fn expected_publication(&self) -> ExpectedLivePublication {
-        ExpectedLivePublication {
-            lengths: self.lengths,
-            code_sha256: Sha256::digest(self.code_bytes()).into(),
-            hot_sha256: Sha256::digest(self.hot_bytes()).into(),
-            cold_sha256: Sha256::digest(self.cold_bytes()).into(),
-        }
-    }
-
-    pub fn publish(mut self, cache: &mut TranslationCache) -> Result<EmittedBlock, DsrError> {
-        self.assembled.direct_links.clear();
-        self.assembled.publish(cache)
-    }
-}
-
-/// Validates the complete mapped HOT stream for a shared INITIAL block.
-///
-/// This narrow consumer seam intentionally returns no decoded metadata and no
-/// address-bearing value: a native arena can validate immutable bytes in
-/// place without gaining a second representation of the artifact protocol.
-/// COLD remains unresolved and lazy until fault reconstruction needs it.
-#[doc(hidden)]
-pub fn validate_live_shared_initial_hot(hot: &[u8], code_len: u64) -> Result<(), DsrError> {
-    let code_len = u32::try_from(code_len).map_err(|_| {
-        DsrError::CachePolicy("live shared INITIAL code length exceeds u32".to_string())
-    })?;
-    validate_shared_initial_hot(hot, code_len)
-}
-
 fn direct_instruction_bytes_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("0"))
 }
@@ -430,13 +188,6 @@ impl AssembledBlock {
 pub struct GenerationGuard {
     address: u64,
     expected: CodeGeneration,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GenerationEntry {
-    Unguarded,
-    PrivateAbsolute(GenerationGuard),
-    SharedInitial,
 }
 
 impl GenerationGuard {
@@ -4705,7 +4456,7 @@ pub fn emit_block(
     plan: &BlockPlan,
     mode: EmitAddressMode,
 ) -> Result<EmittedBlock, DsrError> {
-    assemble_block_inner(plan, GenerationEntry::Unguarded, mode, None)?.publish(cache)
+    assemble_block_inner(plan, None, mode, None)?.publish(cache)
 }
 
 pub fn emit_block_direct(
@@ -4721,7 +4472,7 @@ pub fn emit_block_with_generation(
     guard: GenerationGuard,
     mode: EmitAddressMode,
 ) -> Result<EmittedBlock, DsrError> {
-    assemble_block_inner(plan, GenerationEntry::PrivateAbsolute(guard), mode, None)?.publish(cache)
+    assemble_block_inner(plan, Some(guard), mode, None)?.publish(cache)
 }
 
 pub fn emit_block_recording_artifact(
@@ -4750,12 +4501,7 @@ pub fn emit_block_recording_artifact_optional(
     if let EmitAddressMode::Biased { host_bias } = mode {
         recording.bind(ProcessValue::HostBias, host_bias.get())?;
     }
-    let assembled = assemble_block_inner(
-        plan,
-        GenerationEntry::PrivateAbsolute(guard),
-        mode,
-        Some(&mut recording),
-    )?;
+    let assembled = assemble_block_inner(plan, Some(guard), mode, Some(&mut recording))?;
     let artifact = recording
         .finish(
             assembled.instruction_words(),
@@ -4767,69 +4513,6 @@ pub fn emit_block_recording_artifact_optional(
         .ok();
     let emitted = assembled.publish(cache)?;
     Ok((emitted, artifact))
-}
-
-/// Assemble and validate one immutable generation-zero block without making
-/// code visible. The returned object owns the sole dynasm byte stream plus its
-/// already-encoded metadata, so callers can reserve exact arena extents before
-/// consuming it for one publication.
-pub fn prepare_shared_initial(
-    key: &TranslationUnitKey,
-    plan: &BlockPlan,
-    mode: EmitAddressMode,
-    source_words: Vec<u32>,
-) -> Result<PreparedSharedInitial, DsrError> {
-    let mode_host_bias = match mode {
-        EmitAddressMode::Direct => None,
-        EmitAddressMode::Biased { host_bias } => Some(host_bias.get()),
-    };
-    if mode_host_bias != key.host_bias() {
-        return Err(DsrError::CachePolicy(
-            "shared INITIAL emit mode does not match translation unit key".to_string(),
-        ));
-    }
-    let unit_digest = key.live_digest().map_err(|error| {
-        DsrError::CachePolicy(format!(
-            "shared INITIAL translation unit key cannot be digested: {error}"
-        ))
-    })?;
-    let mut recording = ArtifactRecording::default();
-    if let EmitAddressMode::Biased { host_bias } = mode {
-        recording.bind(ProcessValue::HostBias, host_bias.get())?;
-    }
-    let assembled = assemble_block_inner(
-        plan,
-        GenerationEntry::SharedInitial,
-        mode,
-        Some(&mut recording),
-    )?;
-    let metadata = recording.finish_shared_initial(
-        assembled.instruction_words(),
-        assembled.map.entries().to_vec(),
-        assembled.recovery.clone(),
-        source_words,
-    )?;
-    let lengths = SharedInitialLengths {
-        code: u64::try_from(assembled.instruction_bytes.len()).map_err(|_| {
-            DsrError::CachePolicy("shared INITIAL code length exceeds u64".to_string())
-        })?,
-        hot: u64::try_from(metadata.hot_bytes().len()).map_err(|_| {
-            DsrError::CachePolicy("shared INITIAL hot metadata length exceeds u64".to_string())
-        })?,
-        cold: u64::try_from(metadata.cold_bytes().len()).map_err(|_| {
-            DsrError::CachePolicy("shared INITIAL cold metadata length exceeds u64".to_string())
-        })?,
-    };
-    Ok(PreparedSharedInitial {
-        assembled,
-        metadata,
-        lengths,
-        live_identity: PreparedLiveIdentity {
-            unit_digest,
-            guest_start: plan.start,
-            guest_end: plan.end,
-        },
-    })
 }
 
 pub fn emit_block_with_generation_direct(
@@ -5684,16 +5367,10 @@ fn emit_exclusive_region(
 )]
 fn assemble_block_inner(
     plan: &BlockPlan,
-    entry: GenerationEntry,
+    guard: Option<GenerationGuard>,
     mode: EmitAddressMode,
     mut recording: Option<&mut ArtifactRecording>,
 ) -> Result<AssembledBlock, DsrError> {
-    if entry == GenerationEntry::SharedInitial && plan.generation != CodeGeneration::INITIAL {
-        return Err(DsrError::CachePolicy(format!(
-            "shared INITIAL emission refuses generation {}",
-            plan.generation.get()
-        )));
-    }
     #[cfg(feature = "alloc-owner-census")]
     let _owner = crate::alloc_owner_census::scope(
         crate::alloc_owner_wire::AllocationOwner::BlockAssemblerTransient,
@@ -5727,48 +5404,8 @@ fn assemble_block_inner(
     // many blocks per gateway entry.
     let mut trusted_entry: Option<CacheOffset> = None;
     let lean_guard = lean_generation_guard_enabled();
-    let shared_initial = entry == GenerationEntry::SharedInitial;
-    let guard = match entry {
-        GenerationEntry::PrivateAbsolute(guard) => Some(guard),
-        GenerationEntry::Unguarded | GenerationEntry::SharedInitial => None,
-    };
     let stale = guard.map(|_| assembler.new_dynamic_label());
-    if shared_initial {
-        let offset = current_offset(&assembler)?;
-        if offset.get() != 0 {
-            return Err(DsrError::CachePolicy(format!(
-                "shared INITIAL trusted suffix starts at nonzero offset {}",
-                offset.get()
-            )));
-        }
-        trusted_entry = Some(offset);
-        if let Some(recording) = recording.as_deref_mut() {
-            recording.record_trusted_entry(offset, CodeGeneration::INITIAL.get())?;
-        }
-        emit_word(
-            &mut assembler,
-            &mut entries,
-            plan.start,
-            0xd280_0011, // movz x17, #0 (CodeGeneration::INITIAL)
-        )?;
-        map_next(&assembler, &mut entries, plan.start)?;
-        dynasmrt::dynasm!(assembler
-            ; .arch aarch64
-            ; str x17, [x28, super::gateway::CTX_GENERATION]
-        );
-        map_next(&assembler, &mut entries, plan.start)?;
-        dynasmrt::dynasm!(assembler
-            ; .arch aarch64
-            ; ldr x17, [x28, #1128]
-        );
-        record_recovery_range(
-            &mut recovery,
-            offset,
-            current_offset(&assembler)?,
-            RecoveryAction::RestoreGuestX17,
-        );
-    }
-    if !shared_initial && !lean_guard {
+    if !lean_guard {
         // x17 is the internal indirect-edge register. Its guest value is saved
         // at every block exit and restored before either the generation guard
         // or the first guest instruction executes.
@@ -6031,7 +5668,7 @@ fn assemble_block_inner(
             );
         }
     }
-    if !shared_initial && lean_guard {
+    if lean_guard {
         // x17 is the internal indirect-edge register, and the guard above
         // spends it. Its guest value is saved at every block exit and is
         // restored here, before the first guest instruction executes.
@@ -7394,503 +7031,6 @@ mod tests {
         }
     }
 
-    fn shared_initial_direct_plan() -> BlockPlan {
-        BlockPlan {
-            start: GuestVa(0x4000),
-            end: GuestVa(0x4004),
-            generation: CodeGeneration::INITIAL,
-            instructions: Vec::new(),
-            exit: PlannedExit::Direct {
-                guest: GuestVa(0x4000),
-                word: 0x1400_0400,
-                exit: DirectExit {
-                    kind: DirectKind::Branch,
-                    target: GuestVa(0x5000),
-                    resume: GuestVa(0x4004),
-                    condition: None,
-                    register: None,
-                    bit: None,
-                },
-            },
-            extensions: Vec::new(),
-        }
-    }
-
-    fn shared_initial_conditional_plan() -> BlockPlan {
-        BlockPlan {
-            start: GuestVa(0x4000),
-            end: GuestVa(0x4004),
-            generation: CodeGeneration::INITIAL,
-            instructions: Vec::new(),
-            exit: PlannedExit::Direct {
-                guest: GuestVa(0x4000),
-                word: 0x5400_8000,
-                exit: DirectExit {
-                    kind: DirectKind::Conditional,
-                    target: GuestVa(0x5000),
-                    resume: GuestVa(0x4004),
-                    condition: Some(bad64::Condition::EQ),
-                    register: None,
-                    bit: None,
-                },
-            },
-            extensions: Vec::new(),
-        }
-    }
-
-    fn assemble_shared_initial_for_test(
-        plan: &BlockPlan,
-        recording: Option<&mut ArtifactRecording>,
-    ) -> AssembledBlock {
-        assemble_block_inner(
-            plan,
-            GenerationEntry::SharedInitial,
-            EmitAddressMode::Direct,
-            recording,
-        )
-        .expect("assemble shared INITIAL fixture")
-    }
-
-    mod shared_initial {
-        use super::*;
-        use crate::live_arena::{LiveLookup, LiveTranslationArena};
-        use crate::shared_cache::{
-            AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
-            NativePageProfileIdentity, SourceFingerprint, TranslationUnitKey,
-        };
-
-        fn live_key() -> TranslationUnitKey {
-            TranslationUnitKey::for_segment(
-                ExecutableIdentity::Digest([0x42; 32]),
-                ImageFileOffset::new(0),
-                ImageFileLen::new(16 * 1024).expect("nonzero file length"),
-                GuestVa(0x4000),
-                GuestCodeLen::new(16 * 1024).expect("nonzero guest length"),
-                SourceFingerprint([0x7a; 32]),
-                NativePageProfileIdentity::Native16k,
-                AddressModeIdentity::Direct,
-            )
-        }
-
-        fn biased_live_key(host_bias: carrick_dsr::address::NativeHostBias) -> TranslationUnitKey {
-            TranslationUnitKey::for_segment(
-                ExecutableIdentity::Digest([0x42; 32]),
-                ImageFileOffset::new(0),
-                ImageFileLen::new(16 * 1024).expect("nonzero file length"),
-                GuestVa(0x4000),
-                GuestCodeLen::new(16 * 1024).expect("nonzero guest length"),
-                SourceFingerprint([0x7a; 32]),
-                NativePageProfileIdentity::Native16k,
-                AddressModeIdentity::biased(host_bias),
-            )
-        }
-
-        fn biased_exclusive_plan() -> BlockPlan {
-            let start = GuestVa(0x4000);
-            let words = [
-                0x885f_fc20, // ldaxr w0, [x1]
-                0x6b02_001f, // cmp w0, w2
-                0x5400_0061, // b.ne 0x4014
-                0x8803_fc24, // stlxr w3, w4, [x1]
-                0x35ff_ff83, // cbnz w3, 0x4000
-                0xd400_0001, // svc #0
-            ];
-            crate::block::plan_with_reader(
-                start,
-                CodeGeneration::INITIAL,
-                words.len(),
-                16 * 1024,
-                crate::block::ExclusiveFusionPolicy::BiasedEnabled,
-                |pc| {
-                    let index = usize::try_from((pc.raw() - start.raw()) / 4)
-                        .map_err(|_| DsrError::BlockPolicy("fixture index overflow".to_string()))?;
-                    words
-                        .get(index)
-                        .copied()
-                        .ok_or_else(|| DsrError::MemoryRead {
-                            pc: pc.raw(),
-                            detail: "biased exclusive fixture exhausted".to_string(),
-                        })
-                },
-            )
-            .expect("plan biased exclusive fixture")
-        }
-
-        #[test]
-        fn shared_initial_prepare_then_publish_advances_cache_once_by_exact_code_length() {
-            let mut cache = crate::test_jit::test_cache(16 * 1024);
-            let before = cache.used_bytes();
-            let prepared = prepare_shared_initial(
-                &live_key(),
-                &copy_plan(),
-                EmitAddressMode::Direct,
-                Vec::new(),
-            )
-            .expect("prepare shared INITIAL fixture");
-            assert_eq!(
-                cache.used_bytes(),
-                before,
-                "preparation must reveal exact lengths before any cache visibility"
-            );
-            let lengths = prepared.lengths();
-            assert_eq!(lengths.code, prepared.code_bytes().len() as u64);
-            assert_eq!(lengths.hot, prepared.hot_bytes().len() as u64);
-            assert_eq!(lengths.cold, prepared.cold_bytes().len() as u64);
-            let emitted = prepared
-                .publish(&mut cache)
-                .expect("publish prepared block");
-            assert_eq!(emitted.len() as u64, lengths.code);
-            assert_eq!(cache.used_bytes(), before + emitted.len());
-        }
-
-        #[test]
-        fn expected_publication_tracks_real_prepared_bytes() {
-            let prepared = prepare_shared_initial(
-                &live_key(),
-                &copy_plan(),
-                EmitAddressMode::Direct,
-                Vec::new(),
-            )
-            .expect("prepare shared INITIAL fixture");
-            let expected = prepared.expected_publication();
-            assert!(expected.matches(
-                prepared.code_bytes(),
-                prepared.hot_bytes(),
-                prepared.cold_bytes(),
-            ));
-
-            let mut corrupt_code = prepared.code_bytes().to_vec();
-            corrupt_code[0] ^= 0xff;
-            assert!(!expected.matches(&corrupt_code, prepared.hot_bytes(), prepared.cold_bytes(),));
-        }
-
-        #[test]
-        fn live_shared_initial_hot_validator_is_exact_and_cold_independent() {
-            let prepared = prepare_shared_initial(
-                &live_key(),
-                &copy_plan(),
-                EmitAddressMode::Direct,
-                Vec::new(),
-            )
-            .expect("prepare shared INITIAL fixture");
-            let lengths = prepared.lengths();
-            assert!(validate_live_shared_initial_hot(prepared.hot_bytes(), lengths.code,).is_ok());
-
-            let mut trailing = prepared.hot_bytes().to_vec();
-            trailing.push(0);
-            assert!(validate_live_shared_initial_hot(&trailing, lengths.code).is_err());
-        }
-
-        #[test]
-        fn shared_initial_entry_is_private_trusted_suffix_without_guard() {
-            let assembled = assemble_shared_initial_for_test(&copy_plan(), None);
-            assert_eq!(assembled.trusted_entry, Some(CacheOffset::published(0)));
-            assert_eq!(
-                &assembled.words[..3],
-                &[
-                    0xD280_0011, // movz x17, #0 (INITIAL)
-                    0xF902_3F91, // str x17, [x28, #CTX_GENERATION]
-                    0xF942_3791, // ldr x17, [x28, #1128]
-                ]
-            );
-        }
-
-        #[test]
-        fn shared_initial_emission_has_no_process_relocations() {
-            let mut recording = ArtifactRecording::default();
-            let assembled = assemble_shared_initial_for_test(&copy_plan(), Some(&mut recording));
-            let metadata = recording
-                .finish_shared_initial(
-                    assembled.instruction_words(),
-                    assembled.map.entries().to_vec(),
-                    assembled.recovery.clone(),
-                    Vec::new(),
-                )
-                .expect("finish shared INITIAL recording");
-            let (hot, consumed): (crate::artifact_spike::UnitBlockHotWire, usize) =
-                bincode::serde::decode_from_slice(
-                    metadata.hot_bytes(),
-                    bincode::config::standard(),
-                )
-                .expect("decode shared hot metadata");
-            assert_eq!(consumed, metadata.hot_bytes().len());
-            assert!(hot.relocations.is_empty());
-            assert!(hot.direct_links.is_empty());
-            let (_cold, consumed): (crate::artifact_spike::UnitBlockColdWire, usize) =
-                bincode::serde::decode_from_slice(
-                    metadata.cold_bytes(),
-                    bincode::config::standard(),
-                )
-                .expect("decode shared cold metadata");
-            assert_eq!(consumed, metadata.cold_bytes().len());
-
-            let mut invalid = ArtifactRecording::default();
-            invalid
-                .record_trusted_entry(CacheOffset::published(0), CodeGeneration::INITIAL.get())
-                .expect("record shared trusted entry");
-            invalid
-                .record_mov_wide(
-                    CacheOffset::published(0),
-                    17,
-                    MaterializedValue::Process(ProcessValue::GenerationAddress, 0x1000),
-                )
-                .expect("record forbidden process relocation");
-            let error = invalid
-                .finish_shared_initial(Vec::new(), Vec::new(), Vec::new(), Vec::new())
-                .expect_err("shared artifact must reject process relocation");
-            assert!(
-                matches!(error, DsrError::CachePolicy(ref message) if message.contains("1 process relocation")),
-                "unexpected shared relocation error: {error:?}"
-            );
-        }
-
-        #[test]
-        fn shared_initial_emission_preserves_generation_publish_and_guest_x17() {
-            let assembled = assemble_shared_initial_for_test(&copy_plan(), None);
-            assert_eq!(
-                &assembled.words[..3],
-                &[0xD280_0011, 0xF902_3F91, 0xF942_3791]
-            );
-            assert!(
-                assembled.recovery[..3]
-                    .iter()
-                    .all(|entry| entry.action == RecoveryAction::RestoreGuestX17)
-            );
-        }
-
-        #[test]
-        fn shared_ready_source_is_never_patchable() {
-            let mut cache = crate::test_jit::test_cache(16 * 1024);
-            let prepared = prepare_shared_initial(
-                &live_key(),
-                &shared_initial_direct_plan(),
-                EmitAddressMode::Direct,
-                Vec::new(),
-            )
-            .expect("prepare shared direct-link block");
-            assert_eq!(prepared.link_candidates().len(), 1);
-            let emitted = prepared.publish(&mut cache).expect("publish shared block");
-            assert!(emitted.direct_links().is_empty());
-        }
-
-        #[test]
-        fn live_prebind_changes_only_candidate_slot_and_range_failure_is_atomic() {
-            let mut prepared = prepare_shared_initial(
-                &live_key(),
-                &shared_initial_direct_plan(),
-                EmitAddressMode::Direct,
-                Vec::new(),
-            )
-            .expect("prepare shared direct-link block");
-            let before = prepared.code_bytes().to_vec();
-            let link = prepared.link_candidates()[0];
-            let source = HostVa(0x1000_0000);
-            let target = HostVa(0x1000_4000);
-            let expected = crate::translator::encode_aarch64_direct_branch(
-                carrick_dsr::cache::LinkSite {
-                    source: CacheVa::published(source),
-                    slot: link.slot,
-                },
-                CacheVa::published(target),
-            )
-            .expect("reachable direct branch");
-            assert_eq!(
-                unsafe { prepared.prebind_live_direct_link(0, source, target) }
-                    .expect("prebind candidate"),
-                LivePrebindOutcome::Bound,
-            );
-            let slot = link.slot.get() as usize;
-            assert_eq!(
-                &prepared.code_bytes()[slot..slot + 4],
-                &expected.to_le_bytes()
-            );
-            assert_eq!(&prepared.code_bytes()[..slot], &before[..slot]);
-            assert_eq!(&prepared.code_bytes()[slot + 4..], &before[slot + 4..]);
-
-            let mut out_of_range = prepare_shared_initial(
-                &live_key(),
-                &shared_initial_direct_plan(),
-                EmitAddressMode::Direct,
-                Vec::new(),
-            )
-            .expect("prepare second shared direct-link block");
-            let unchanged = out_of_range.code_bytes().to_vec();
-            assert_eq!(
-                unsafe {
-                    out_of_range.prebind_live_direct_link(
-                        0,
-                        source,
-                        HostVa(source.raw() + (1 << 29)),
-                    )
-                }
-                .expect("out-of-range is an unbound outcome"),
-                LivePrebindOutcome::OutOfRange,
-            );
-            assert_eq!(out_of_range.code_bytes(), unchanged);
-        }
-
-        #[test]
-        fn live_prebind_accepts_both_real_conditional_candidate_encodings() {
-            let source = HostVa(0x2000_0000);
-            for kind in [
-                DirectLinkKind::ConditionalFallthrough,
-                DirectLinkKind::ConditionalTaken,
-            ] {
-                let mut prepared = prepare_shared_initial(
-                    &live_key(),
-                    &shared_initial_conditional_plan(),
-                    EmitAddressMode::Direct,
-                    Vec::new(),
-                )
-                .expect("prepare shared conditional direct-link block");
-                let candidate_index = prepared
-                    .link_candidates()
-                    .iter()
-                    .position(|candidate| candidate.kind == kind)
-                    .expect("real conditional candidate");
-                let candidate = prepared.link_candidates()[candidate_index];
-                let before = prepared.code_bytes().to_vec();
-                let target = HostVa(source.raw() + 0x8000 + candidate_index * 0x1000);
-                let expected = crate::translator::encode_aarch64_direct_branch(
-                    carrick_dsr::cache::LinkSite {
-                        source: CacheVa::published(source),
-                        slot: candidate.slot,
-                    },
-                    CacheVa::published(target),
-                )
-                .expect("reachable conditional direct branch");
-
-                assert_eq!(
-                    unsafe { prepared.prebind_live_direct_link(candidate_index, source, target) }
-                        .expect("prebind real conditional candidate"),
-                    LivePrebindOutcome::Bound,
-                    "{kind:?}",
-                );
-                let slot = candidate.slot.get() as usize;
-                assert_eq!(
-                    &prepared.code_bytes()[slot..slot + 4],
-                    &expected.to_le_bytes(),
-                    "{kind:?}",
-                );
-                assert_eq!(&prepared.code_bytes()[..slot], &before[..slot], "{kind:?}",);
-                assert_eq!(
-                    &prepared.code_bytes()[slot + 4..],
-                    &before[slot + 4..],
-                    "{kind:?}",
-                );
-            }
-        }
-
-        #[test]
-        fn live_prebind_accepts_real_fused_conditional_taken_stub() {
-            let mut prepared = prepare_shared_initial(
-                &live_key(),
-                &fused_two_segment_plan(),
-                EmitAddressMode::Direct,
-                Vec::new(),
-            )
-            .expect("prepare fused shared conditional block");
-            let candidate_index = prepared
-                .link_candidates()
-                .iter()
-                .position(|candidate| candidate.kind == DirectLinkKind::ConditionalTaken)
-                .expect("fused deferred taken candidate");
-            assert_eq!(prepared.link_candidates().len(), 1);
-            let candidate = prepared.link_candidates()[candidate_index];
-            let before = prepared.code_bytes().to_vec();
-            let source = HostVa(0x3000_0000);
-            let target = HostVa(0x3000_9000);
-            let expected = crate::translator::encode_aarch64_direct_branch(
-                carrick_dsr::cache::LinkSite {
-                    source: CacheVa::published(source),
-                    slot: candidate.slot,
-                },
-                CacheVa::published(target),
-            )
-            .expect("reachable fused direct branch");
-
-            assert_eq!(
-                unsafe { prepared.prebind_live_direct_link(candidate_index, source, target) }
-                    .expect("prebind fused conditional candidate"),
-                LivePrebindOutcome::Bound,
-            );
-            let slot = candidate.slot.get() as usize;
-            assert_eq!(
-                &prepared.code_bytes()[slot..slot + 4],
-                &expected.to_le_bytes()
-            );
-            assert_eq!(&prepared.code_bytes()[..slot], &before[..slot]);
-            assert_eq!(&prepared.code_bytes()[slot + 4..], &before[slot + 4..]);
-        }
-
-        #[test]
-        fn shared_initial_exact_lengths_drive_reservation_before_single_publish() {
-            let mut cache = crate::test_jit::test_cache(16 * 1024);
-            let prepared = prepare_shared_initial(
-                &live_key(),
-                &copy_plan(),
-                EmitAddressMode::Direct,
-                Vec::new(),
-            )
-            .expect("prepare exact-length fixture");
-            let lengths = prepared.lengths();
-            let arena = LiveTranslationArena::new(64 * 1024, 64 * 1024, 64 * 1024);
-            let key = live_key();
-            let LiveLookup::Publish(claim) = arena.claim_eligible(&key, key.guest_va_start(), 1234)
-            else {
-                panic!("first lookup must claim an empty live record")
-            };
-            let reserved = claim
-                .reserve(lengths.code, lengths.hot, lengths.cold)
-                .expect("reserve exact prepared lengths");
-            assert_eq!(reserved.extents().code.len, lengths.code);
-            assert_eq!(reserved.extents().hot.len, lengths.hot);
-            assert_eq!(reserved.extents().cold.len, lengths.cold);
-            let before = cache.used_bytes();
-            let emitted = prepared.publish(&mut cache).expect("single publication");
-            assert_eq!(cache.used_bytes(), before + emitted.len());
-        }
-
-        #[test]
-        fn relocation_producing_biased_prepare_fails_before_cache_visibility() {
-            let cache = crate::test_jit::test_cache(16 * 1024);
-            let before = cache.used_bytes();
-            let host_bias = carrick_dsr::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
-                .expect("valid biased fixture");
-            let error = prepare_shared_initial(
-                &biased_live_key(host_bias),
-                &biased_exclusive_plan(),
-                EmitAddressMode::Biased { host_bias },
-                Vec::new(),
-            )
-            .err()
-            .expect("process relocation must fail preparation");
-            assert!(
-                matches!(error, DsrError::CachePolicy(ref message) if message.contains("process relocation")),
-                "unexpected biased preparation error: {error:?}"
-            );
-            assert_eq!(cache.used_bytes(), before);
-        }
-
-        #[test]
-        fn shared_initial_prepare_rejects_emit_mode_key_mismatch() {
-            let host_bias = carrick_dsr::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
-                .expect("valid biased fixture");
-            let error = prepare_shared_initial(
-                &live_key(),
-                &copy_plan(),
-                EmitAddressMode::Biased { host_bias },
-                Vec::new(),
-            )
-            .err()
-            .expect("direct key cannot prepare biased code");
-            assert!(
-                matches!(error, DsrError::CachePolicy(ref message) if message.contains("emit mode")),
-                "unexpected mode/key error: {error:?}",
-            );
-        }
-    }
-
     #[cfg(feature = "alloc-owner-census")]
     #[test]
     fn allocation_owner_block_assembly_splits_transient_map_and_recovery_storage() {
@@ -7908,10 +7048,7 @@ mod tests {
 
         let assembled = assemble_block_inner(
             &plan,
-            GenerationEntry::PrivateAbsolute(GenerationGuard::new(
-                &generation,
-                CodeGeneration::INITIAL,
-            )),
+            Some(GenerationGuard::new(&generation, CodeGeneration::INITIAL)),
             EmitAddressMode::Direct,
             None,
         )
@@ -7988,13 +7125,9 @@ mod tests {
     /// deliberately mapped to `plan.start`, the same guest PC the first copied
     /// instruction carries.
     fn guarded_prologue_words(guard: GenerationGuard) -> Vec<u32> {
-        let assembled = assemble_block_inner(
-            &copy_plan(),
-            GenerationEntry::PrivateAbsolute(guard),
-            EmitAddressMode::Direct,
-            None,
-        )
-        .expect("assemble guarded block");
+        let assembled =
+            assemble_block_inner(&copy_plan(), Some(guard), EmitAddressMode::Direct, None)
+                .expect("assemble guarded block");
         let first_guest = assembled
             .words
             .iter()
@@ -8033,13 +7166,8 @@ mod tests {
             },
             extensions: Vec::new(),
         };
-        let assembled = assemble_block_inner(
-            &plan,
-            GenerationEntry::Unguarded,
-            EmitAddressMode::Direct,
-            None,
-        )
-        .expect("assemble single-virtual fixture block");
+        let assembled = assemble_block_inner(&plan, None, EmitAddressMode::Direct, None)
+            .expect("assemble single-virtual fixture block");
         (assembled, plan)
     }
 
@@ -8190,7 +7318,7 @@ mod tests {
         let generation = std::sync::atomic::AtomicU64::new(7);
         let assembled = assemble_block_inner(
             &copy_plan(),
-            GenerationEntry::PrivateAbsolute(GenerationGuard::new(
+            Some(GenerationGuard::new(
                 &generation,
                 CodeGeneration::claimed(7),
             )),
@@ -8228,17 +7356,12 @@ mod tests {
         ] {
             let generation = std::sync::atomic::AtomicU64::new(0);
             let guard = GenerationGuard::new(&generation, CodeGeneration::INITIAL);
-            let native = assemble_block_inner(
-                &plan,
-                GenerationEntry::PrivateAbsolute(guard),
-                EmitAddressMode::Direct,
-                None,
-            )
-            .expect("assemble native block");
+            let native = assemble_block_inner(&plan, Some(guard), EmitAddressMode::Direct, None)
+                .expect("assemble native block");
             let mut recording = ArtifactRecording::default();
             let recorded = assemble_block_inner(
                 &plan,
-                GenerationEntry::PrivateAbsolute(guard),
+                Some(guard),
                 EmitAddressMode::Direct,
                 Some(&mut recording),
             )
@@ -8302,13 +7425,8 @@ mod tests {
             },
             extensions: Vec::new(),
         };
-        let assembled = assemble_block_inner(
-            &plan,
-            GenerationEntry::Unguarded,
-            EmitAddressMode::Direct,
-            None,
-        )
-        .expect("assemble adr block");
+        let assembled = assemble_block_inner(&plan, None, EmitAddressMode::Direct, None)
+            .expect("assemble adr block");
         let expected = [
             0xD292_9013, // movz x19, #0x9480
             0xF2C0_0093, // movk x19, #4, lsl #32
@@ -8403,13 +7521,8 @@ mod tests {
             },
             extensions: Vec::new(),
         };
-        let assembled = assemble_block_inner(
-            &plan,
-            GenerationEntry::Unguarded,
-            EmitAddressMode::Direct,
-            None,
-        )
-        .expect("assemble virtual indirect target");
+        let assembled = assemble_block_inner(&plan, None, EmitAddressMode::Direct, None)
+            .expect("assemble virtual indirect target");
         let words = &assembled.words;
 
         // The virtualized target (guest x19) loads straight into
@@ -8461,13 +7574,8 @@ mod tests {
             },
             extensions: Vec::new(),
         };
-        let assembled = assemble_block_inner(
-            &plan,
-            GenerationEntry::Unguarded,
-            EmitAddressMode::Direct,
-            None,
-        )
-        .expect("assemble lean indirect exit");
+        let assembled = assemble_block_inner(&plan, None, EmitAddressMode::Direct, None)
+            .expect("assemble lean indirect exit");
         let words = &assembled.words;
 
         // Exactly ONE unconditional spill: x15 to slot 1160. No up-front x16
@@ -8579,13 +7687,8 @@ mod tests {
     #[test]
     fn terminal_virtual_condition_never_crosses_darwin_x18() {
         let plan = direct_plan(virtual_test_bit_exit(GuestVa(0x4000), GuestVa(0x5000)));
-        let assembled = assemble_block_inner(
-            &plan,
-            GenerationEntry::Unguarded,
-            EmitAddressMode::Direct,
-            None,
-        )
-        .expect("assemble virtual conditional exit");
+        let assembled = assemble_block_inner(&plan, None, EmitAddressMode::Direct, None)
+            .expect("assemble virtual conditional exit");
         let words = &assembled.words;
         let stable_staging = [
             0xf940_4f91, // ldr x17, [x28, #152] — guest x19
@@ -8642,13 +7745,8 @@ mod tests {
     fn fused_virtual_condition_never_crosses_darwin_x18() {
         let mut plan = fused_two_segment_plan();
         plan.exit = virtual_test_bit_exit(GuestVa(0x4004), GuestVa(0x5000));
-        let assembled = assemble_block_inner(
-            &plan,
-            GenerationEntry::Unguarded,
-            EmitAddressMode::Direct,
-            None,
-        )
-        .expect("assemble fused virtual conditional edge");
+        let assembled = assemble_block_inner(&plan, None, EmitAddressMode::Direct, None)
+            .expect("assemble fused virtual conditional edge");
         let words = &assembled.words;
         let stable_staging = [
             0xf902_3791, // str x17, [x28, #1128] — recovery guest x17
@@ -8858,7 +7956,7 @@ mod tests {
             carrick_dsr::address::NativeHostBias::new(bias, 0x4000).expect("aligned test bias");
         let assembled = assemble_block_inner(
             &biased_memory_plan(memory),
-            GenerationEntry::Unguarded,
+            None,
             EmitAddressMode::Biased { host_bias },
             None,
         )
@@ -8881,13 +7979,8 @@ mod tests {
     fn assemble_biased_emission(plan: &BlockPlan, bias: u64) -> AssembledBlock {
         let host_bias =
             carrick_dsr::address::NativeHostBias::new(bias, 0x4000).expect("aligned test bias");
-        assemble_block_inner(
-            plan,
-            GenerationEntry::Unguarded,
-            EmitAddressMode::Biased { host_bias },
-            None,
-        )
-        .expect("assemble biased memory fixture")
+        assemble_block_inner(plan, None, EmitAddressMode::Biased { host_bias }, None)
+            .expect("assemble biased memory fixture")
     }
 
     fn biased_guest_words(assembled: &AssembledBlock, guest: GuestVa) -> Vec<u32> {
@@ -9646,43 +8739,23 @@ mod tests {
         vec![
             (
                 "branch",
-                assemble_block_inner(
-                    &branch,
-                    GenerationEntry::Unguarded,
-                    EmitAddressMode::Direct,
-                    None,
-                )
-                .expect("assemble branch recovery fixture"),
+                assemble_block_inner(&branch, None, EmitAddressMode::Direct, None)
+                    .expect("assemble branch recovery fixture"),
             ),
             (
                 "call",
-                assemble_block_inner(
-                    &call,
-                    GenerationEntry::Unguarded,
-                    EmitAddressMode::Direct,
-                    None,
-                )
-                .expect("assemble call recovery fixture"),
+                assemble_block_inner(&call, None, EmitAddressMode::Direct, None)
+                    .expect("assemble call recovery fixture"),
             ),
             (
                 "conditional",
-                assemble_block_inner(
-                    &conditional,
-                    GenerationEntry::Unguarded,
-                    EmitAddressMode::Direct,
-                    None,
-                )
-                .expect("assemble conditional recovery fixture"),
+                assemble_block_inner(&conditional, None, EmitAddressMode::Direct, None)
+                    .expect("assemble conditional recovery fixture"),
             ),
             (
                 "continue",
-                assemble_block_inner(
-                    &continuation,
-                    GenerationEntry::Unguarded,
-                    EmitAddressMode::Direct,
-                    None,
-                )
-                .expect("assemble continuation recovery fixture"),
+                assemble_block_inner(&continuation, None, EmitAddressMode::Direct, None)
+                    .expect("assemble continuation recovery fixture"),
             ),
         ]
     }
@@ -9793,13 +8866,8 @@ mod tests {
     #[test]
     fn fused_segment_edge_falls_through_in_two_words_without_saving_guest_x17() {
         let plan = fused_two_segment_plan();
-        let assembled = assemble_block_inner(
-            &plan,
-            GenerationEntry::Unguarded,
-            EmitAddressMode::Direct,
-            None,
-        )
-        .expect("assemble fused block");
+        let assembled = assemble_block_inner(&plan, None, EmitAddressMode::Direct, None)
+            .expect("assemble fused block");
         let words = &assembled.words;
 
         // Anchor on the relocated conditional rather than a fixed index: the
@@ -9873,13 +8941,8 @@ mod tests {
         let generation = std::sync::atomic::AtomicU64::new(CodeGeneration::INITIAL.get());
         let guard = GenerationGuard::new(&generation, CodeGeneration::INITIAL);
         let count_acquires = |plan: &BlockPlan| {
-            let assembled = assemble_block_inner(
-                plan,
-                GenerationEntry::PrivateAbsolute(guard),
-                EmitAddressMode::Direct,
-                None,
-            )
-            .expect("assemble guarded block");
+            let assembled = assemble_block_inner(plan, Some(guard), EmitAddressMode::Direct, None)
+                .expect("assemble guarded block");
             assembled
                 .words
                 .iter()
@@ -9912,14 +8975,9 @@ mod tests {
             word,
             op: bad64::Op::B_NE,
         };
-        let error = assemble_block_inner(
-            &plan,
-            GenerationEntry::Unguarded,
-            EmitAddressMode::Direct,
-            None,
-        )
-        .err()
-        .expect("a non-conditional fused edge must be rejected");
+        let error = assemble_block_inner(&plan, None, EmitAddressMode::Direct, None)
+            .err()
+            .expect("a non-conditional fused edge must be rejected");
         assert!(
             format!("{error:?}").contains("not a direct branch"),
             "unexpected error: {error:?}"

@@ -54,21 +54,13 @@ pub struct PageGenerationTable {
     page_size: u64,
     next: AtomicU64,
     pages: RwLock<BTreeMap<GuestVa, Arc<AtomicU64>>>,
-    domain: PageGenerationDomain,
 }
-
-/// Opaque identity of one authoritative generation-table domain.
-#[derive(Clone)]
-pub struct PageGenerationDomain(Arc<PageGenerationDomainIdentity>);
-
-struct PageGenerationDomainIdentity;
 
 #[derive(Clone)]
 pub struct PageGenerationObservation {
     page: GuestVa,
     expected: CodeGeneration,
     current: Arc<AtomicU64>,
-    domain: PageGenerationDomain,
 }
 
 impl PageGenerationObservation {
@@ -87,10 +79,6 @@ impl PageGenerationObservation {
     pub fn current_atomic(&self) -> &AtomicU64 {
         &self.current
     }
-
-    pub fn belongs_to(&self, domain: &PageGenerationDomain) -> bool {
-        Arc::ptr_eq(&self.domain.0, &domain.0)
-    }
 }
 
 impl PageGenerationTable {
@@ -104,12 +92,7 @@ impl PageGenerationTable {
             page_size,
             next: AtomicU64::new(CodeGeneration::INITIAL.get()),
             pages: RwLock::new(BTreeMap::new()),
-            domain: PageGenerationDomain(Arc::new(PageGenerationDomainIdentity)),
         })
-    }
-
-    pub fn domain(&self) -> PageGenerationDomain {
-        self.domain.clone()
     }
 
     pub fn note_guest_code_write(
@@ -191,7 +174,6 @@ impl PageGenerationTable {
             page,
             expected,
             current,
-            domain: self.domain.clone(),
         })
     }
 
@@ -215,7 +197,6 @@ impl PageGenerationTable {
             page_size: self.page_size,
             next: AtomicU64::new(self.next.load(Ordering::Acquire)),
             pages: RwLock::new(pages),
-            domain: PageGenerationDomain(Arc::new(PageGenerationDomainIdentity)),
         }
     }
 }
@@ -1213,24 +1194,6 @@ mod generation_tests {
             .expect("note write");
         assert_eq!(observation.current(), changed);
         assert_ne!(observation.current(), observation.expected());
-    }
-
-    #[test]
-    fn generation_observation_is_bound_to_one_table_domain() {
-        let table = PageGenerationTable::new(PAGE_SIZE).expect("generation table");
-        let observation = table.observe(PAGE).expect("observe page");
-        assert!(observation.belongs_to(&table.domain()));
-
-        let foreign = PageGenerationTable::new(PAGE_SIZE).expect("foreign table");
-        assert!(!observation.belongs_to(&foreign.domain()));
-
-        let fork = table.fork_view();
-        assert!(!observation.belongs_to(&fork.domain()));
-        assert!(
-            fork.observe(PAGE)
-                .expect("fork observation")
-                .belongs_to(&fork.domain())
-        );
     }
 
     #[test]

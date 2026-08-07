@@ -818,10 +818,6 @@ impl NativeMappedMemory {
     ) -> Result<(), NativeMemoryError> {
         let artifact_enabled = crate::artifact_spike::enabled();
         let shared_enabled = crate::translator::persistent_store_runtime_enabled();
-        let live_policy = crate::translator::live_arena_runtime_policy()
-            .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
-        let live_enabled = live_policy == crate::translator::LiveArenaRuntimePolicy::Compiler
-            || crate::translator::live_sizing_census::armed();
         // The translation census needs the SAME segment enumeration and the
         // SAME `TranslationUnitKey`s the shared lane would mint, but it has to
         // be able to describe the hatch-disabled path too (the lane is
@@ -840,14 +836,14 @@ impl NativeMappedMemory {
         // WRONG answer to the exact question this instrument gates. A named
         // abort is the lesser failure. It has not been observed to fire.
         let census_enabled = crate::translator::xlat_census::armed();
-        if !artifact_enabled && !shared_enabled && !census_enabled && !live_enabled {
+        if !artifact_enabled && !shared_enabled && !census_enabled {
             return Ok(());
         }
         #[cfg(feature = "alloc-owner-census")]
         let _owner = crate::alloc_owner_census::scope(
             crate::alloc_owner_wire::AllocationOwner::TranslationSourcePreparation,
         );
-        let translator = (artifact_enabled || shared_enabled || live_enabled)
+        let translator = (artifact_enabled || shared_enabled)
             .then(|| self.dsr_process_translator())
             .transpose()?;
         if artifact_enabled
@@ -857,7 +853,7 @@ impl NativeMappedMemory {
             translator
                 .configure_artifact_image_digest(digest)
                 .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
-            if !shared_enabled && !census_enabled && !live_enabled {
+            if !shared_enabled && !census_enabled {
                 return Ok(());
             }
         }
@@ -878,7 +874,7 @@ impl NativeMappedMemory {
                 merged.push(span);
             }
         }
-        let collect_segments = shared_enabled || census_enabled || live_enabled;
+        let collect_segments = shared_enabled || census_enabled;
         let mut segments = collect_segments.then(|| Vec::with_capacity(merged.len()));
         let mut identity = executable_digest.is_none().then(|| {
             let mut identity = Sha256::new();
@@ -993,16 +989,6 @@ impl NativeMappedMemory {
         // block to a unit key without re-serializing and re-hashing the key on
         // the translate path.
         crate::translator::xlat_census::configure_image(&configuration);
-        if live_enabled {
-            let Some(translator) = translator.as_ref() else {
-                return Err(NativeMemoryError::Unsupported(
-                    "live translation is enabled without a DSR process translator".to_string(),
-                ));
-            };
-            let _selected = translator
-                .configure_live_image(configuration.clone(), self.host_page_size)
-                .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
-        }
         if !shared_enabled {
             return Ok(());
         }
@@ -1035,17 +1021,6 @@ impl NativeMappedMemory {
             .dsr_generations
             .note_guest_code_write(range.clone())
             .map_err(|error| MemoryError::HostMap(error.to_string()))?;
-        // Task 7: revoke the mutated pages' shared live chunks BEFORE the
-        // caller's source mutation proceeds. Shared INITIAL code omits its
-        // per-block generation guard, so `mach_vm_protect(PROT_NONE)` on the
-        // exact chunks is the ONLY thing standing between a stale shared
-        // translation and post-mutation execution. Fail-closed: an error here
-        // fails the mutation rather than letting stale code stay executable.
-        if let Some(translator) = self.dsr_translator.as_ref() {
-            translator
-                .revoke_live_source_range(range.clone())
-                .map_err(|error| MemoryError::HostMap(format!("live revocation: {error}")))?;
-        }
         // Sever incoming private direct links into the bumped pages AFTER
         // the bump, so a racing entry through a not-yet-severed link lands in
         // a block whose guard (or, once trusted entries exist, whose one-body
@@ -3518,13 +3493,6 @@ impl NativeMappedMemory {
         let (page_start, page_len) = self
             .host_page_range(address, end)
             .map_err(RepointPrivateError::clean)?;
-        // A repoint that replaces executable bytes is a code mutation and
-        // shares the ONE revocation seam (Task 7): generation bump plus live
-        // chunk revocation, BEFORE the replacement mapping goes live.
-        if self.range_may_execute(page_start, page_len) {
-            self.note_dsr_code_mutation(page_start, page_len)
-                .map_err(RepointPrivateError::clean)?;
-        }
         let (host_start, flags) = self
             .fixed_mapping_target(
                 page_start,
@@ -3623,19 +3591,6 @@ impl NativeMappedMemory {
             host_map_len,
             "native alias replaced host range",
         )?;
-        // A fresh mapping REPLACING executable code is a code mutation: it
-        // shares the ONE revocation seam (Task 7) — generation bump plus live
-        // chunk revocation — BEFORE the replacement mapping goes live, so a
-        // stale shared translation of the old bytes can never execute past
-        // this point.
-        if self.range_may_execute(guest_map_start, host_map_len_usize) {
-            self.note_dsr_code_mutation(guest_map_start, host_map_len_usize)
-                .map_err(|error| {
-                    NativeMemoryError::Unsupported(format!(
-                        "native alias code-mutation note: {error}"
-                    ))
-                })?;
-        }
 
         let (mmap_prot, final_prot, flags, fd, offset, direct_file) = match file.as_ref() {
             Some((fd, offset, prot)) if page_delta == 0 => (
@@ -5113,7 +5068,7 @@ mod tests {
             .expect("translation source preparation function end")
             .0;
         let inactive_return = body
-            .find("if !artifact_enabled && !shared_enabled && !census_enabled && !live_enabled")
+            .find("if !artifact_enabled && !shared_enabled && !census_enabled")
             .expect("inactive fast return");
         let owner = body
             .find("AllocationOwner::TranslationSourcePreparation")

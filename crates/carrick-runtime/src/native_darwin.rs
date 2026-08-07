@@ -678,7 +678,7 @@ where
     A: IntoIterator<Item = String>,
     E: IntoIterator<Item = String>,
 {
-    enter_configured_native_process(NativeLiveArenaEntry::Launch)?;
+    install_native_probe_sink();
     let Some(geometry) = plan.page_geometry.native_geometry() else {
         return Err(RuntimeError::Unsupported(
             "native Darwin run-elf selected without native page geometry".to_string(),
@@ -707,7 +707,6 @@ where
         env.iter().map(|entry| entry.as_bytes().to_vec()).collect(),
         &canonical_host_executable_path(path),
     );
-    let executable_digest = initial_live_executable_digest(&file)?;
     let relative_relocations = native_relative_relocations(&file, NATIVE_DARWIN_PIE_BASE)?;
     let image = AddressSpace::load_elf_bytes_with_reader_at_pie_base_without_runtime_regions(
         &file,
@@ -736,10 +735,7 @@ where
 
     run_image_in_child(
         image,
-        NativeInitialExecutableIdentity {
-            resolved_path: canonical_host_executable_path(path),
-            digest: executable_digest,
-        },
+        canonical_host_executable_path(path),
         dispatcher,
         max_traps,
         relative_relocations,
@@ -763,7 +759,7 @@ where
     A: IntoIterator<Item = String>,
     E: IntoIterator<Item = String>,
 {
-    enter_configured_native_process(NativeLiveArenaEntry::Launch)?;
+    install_native_probe_sink();
     let Some(geometry) = plan.page_geometry.native_geometry() else {
         return Err(RuntimeError::Unsupported(
             "native Darwin container launch selected without native page geometry".to_string(),
@@ -802,7 +798,6 @@ where
         env.iter().map(|entry| entry.as_bytes().to_vec()).collect(),
         &resolved,
     );
-    let executable_digest = initial_live_executable_digest(&file)?;
     let relative_relocations = native_relative_relocations(&file, NATIVE_DARWIN_PIE_BASE)?;
     let image = AddressSpace::load_elf_bytes_with_reader_at_pie_base_without_runtime_regions(
         &file,
@@ -823,10 +818,7 @@ where
 
     run_image_in_child(
         image,
-        NativeInitialExecutableIdentity {
-            resolved_path: resolved,
-            digest: executable_digest,
-        },
+        resolved,
         dispatcher,
         max_traps,
         relative_relocations,
@@ -948,14 +940,12 @@ enum DirectLaunchFlow {
 /// the tier T fallback. Once the guest has entered, there is no fallback —
 /// its side effects are real — so a mid-run leave the runner cannot service
 /// surfaces as a NAMED error, never a silent partial run.
-#[allow(clippy::too_many_arguments)]
 fn run_direct_in_current_process(
     candidate: DirectLaunchCandidate,
     resolved: &str,
     dispatcher: SyscallDispatcher,
     max_traps: usize,
     plan: &ExecutionPlan,
-    live_arena: OwnedNativeLiveArena,
 ) -> Result<DirectLaunchFlow, RuntimeError> {
     use crate::direct_runner as dr;
     let group = match carrick_native_darwin::direct::DirectLoadGroup::load_with_interpreter(
@@ -1013,10 +1003,6 @@ fn run_direct_in_current_process(
     runner.enable_exec_services(dr::DirectExecServices {
         plan: plan.clone(),
         max_traps,
-        // The tier-D lane's retention point for this process's arena: the
-        // runner outlives every guest thread it spawns, and its execve service
-        // is the tier-D half of the exec transport.
-        live_arena,
     });
     let entry = group.entry_pc();
     let sp = stack.sp();
@@ -1054,7 +1040,6 @@ fn run_direct_in_current_process(
 /// (`resume_guest_from_capsule`). Returns the guest retval to resume with on
 /// any pre-commit failure; on success the host `execve` replaces this
 /// process inside `begin_guest_exec` and this function never returns.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn tier_d_service_execve(
     dispatcher: &SyscallDispatcher,
     path: String,
@@ -1062,7 +1047,6 @@ pub(crate) fn tier_d_service_execve(
     env: Vec<Vec<u8>>,
     plan: &ExecutionPlan,
     max_traps: usize,
-    live_arena: Option<&Arc<carrick_native_darwin::live_arena::DarwinLiveArena>>,
 ) -> i64 {
     crate::probes::execve_argv(&path, &argv);
     let capsule_env = env.clone();
@@ -1099,7 +1083,6 @@ pub(crate) fn tier_d_service_execve(
         executable_digest,
         max_traps,
         plan,
-        live_arena.map(Arc::as_ref),
     ) {
         tracing::warn!(
             %error,
@@ -1341,242 +1324,13 @@ enum ExecDigestPolicy {
 
 /// Whether anything will read an executable's content digest this run.
 ///
-/// Each consumer mints an `ExecutableIdentity`/`TranslationUnitKey` from it.
-/// The persistent translation store is default-on
-/// (`CARRICK_DSR_PERSISTENT_STORE=0` disables); the census and experimental
-/// consumers are opt-in.
+/// The three consumers each mint an `ExecutableIdentity`/`TranslationUnitKey`
+/// from it. The persistent translation store is default-on
+/// (`CARRICK_DSR_PERSISTENT_STORE=0` disables); the other two are opt-in.
 fn executable_digest_is_consumed() -> bool {
     carrick_dsr_aarch64::translator::persistent_store_runtime_enabled()
         || carrick_dsr_aarch64::artifact_spike::enabled()
         || carrick_dsr_aarch64::translator::xlat_census::armed()
-        || live_identity_consumes_executable_digest(
-            carrick_dsr_aarch64::translator::live_arena_runtime_policy(),
-            carrick_dsr_aarch64::translator::live_sizing_census::armed(),
-        )
-}
-
-fn live_identity_consumes_executable_digest(
-    policy: Result<
-        carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy,
-        carrick_dsr_aarch64::types::DsrError,
-    >,
-    sizing_armed: bool,
-) -> bool {
-    sizing_armed
-        || matches!(
-            policy,
-            Ok(carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy::Compiler) | Err(_)
-        )
-}
-
-fn initial_live_executable_digest_for(
-    policy: carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy,
-    sizing_armed: bool,
-    file: &[u8],
-) -> Option<[u8; 32]> {
-    (policy == carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy::Compiler || sizing_armed)
-        .then(|| sha2::Sha256::digest(file).into())
-}
-
-fn initial_live_executable_digest(file: &[u8]) -> Result<Option<[u8; 32]>, RuntimeError> {
-    let policy = carrick_dsr_aarch64::translator::live_arena_runtime_policy()
-        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
-    Ok(initial_live_executable_digest_for(
-        policy,
-        carrick_dsr_aarch64::translator::live_sizing_census::armed(),
-        file,
-    ))
-}
-
-/// One process's owned live translation arena, or `None` when the compiler
-/// policy is off.
-///
-/// `Arc` because the SAME arena is retained by every lane inside one guest
-/// process — the direct runner's exec services, the DSR run loop, and every
-/// `clone(CLONE_THREAD)` sibling — and by the exec producer that transports it.
-/// There is exactly one adoption into `Arc` per process (creation at launch, or
-/// capsule adoption on resume); nothing here is a process-global.
-pub(crate) type OwnedNativeLiveArena =
-    Option<Arc<carrick_native_darwin::live_arena::DarwinLiveArena>>;
-
-/// How a native process entry comes by its live arena.
-///
-/// Task 6C2 delivers creation, ownership, and exec transport ONLY. Nothing
-/// looks a translation up in the arena or publishes one into it yet — that is
-/// Task 6D.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NativeLiveArenaEntry {
-    /// A container / `run-elf` launch. `run_image_in_child`'s guest process
-    /// creates the arena itself, before the direct/DSR tier split.
-    Launch,
-    /// A host self-exec resume. The arena must arrive through the capsule's
-    /// inherited-descriptor transport; `transported` is whether one did.
-    Resume { transported: bool },
-}
-
-/// A capsule delivered an arena to a process whose policy says none exists.
-/// Producer and consumer disagree about the process's shape, so the resume
-/// fails closed rather than dropping a live arena on the floor.
-const LIVE_ARENA_TRANSPORTED_WITHOUT_POLICY: &str =
-    "native host self-exec transported a live arena without CARRICK_DSR_LIVE_ARENA=compiler";
-
-/// The inverse disagreement. Under `compiler` EVERY guest process owns an
-/// arena — created at launch, adopted on resume — so a producer that reached
-/// `execve` carrying none lost the process's live translations instead of
-/// merely skipping an optimization.
-const LIVE_ARENA_RESUMED_WITHOUT_TRANSPORT: &str = "CARRICK_DSR_LIVE_ARENA=compiler resumed a native host self-exec with no transported live arena; the exec producer must carry its arena's two inherited descriptors in the capsule";
-
-/// Whether this process may enter the native runtime under `policy`, given how
-/// it came by an arena.
-///
-/// The matrix is total, and its only refusals are the two shapes where the
-/// policy and the transport disagree; every agreeing shape enters.
-///
-/// Task 6C2 originally refused EVERY `Compiler` entry here, because the
-/// arena's first transport could not cross `fork(2)`: a forked guest child
-/// held the arena's `VM_INHERIT_SHARE` mappings but neither the Mach send
-/// rights nor the task-registered slots that carried them, so every
-/// forked-then-exec'd guest process failed its `execve` with EIO. That
-/// transport is retired. Tasks 6T1/6T2 rebuilt it on inherited descriptors —
-/// the fds ARE the capability, and `fork(2)` duplicates them — and
-/// `carrick-native-darwin`'s
-/// `a_fork_child_inherits_arena_mappings_and_its_fd_transport` plus this
-/// crate's `forked_child_exec_successor_acquires_creator_ready_record_and_bytes`
-/// prove the crossing end to end, which is what lets this gate open.
-///
-/// Both axes are enumerated with NO wildcard, deliberately. A gate whose
-/// admissions are a catch-all admits by default, so a new
-/// [`NativeLiveArenaEntry`] variant — or a `Resume` widened past a boolean —
-/// would silently enter the runtime carrying an unclassified arena. Written
-/// out, the same addition is a non-exhaustive-match build failure that forces
-/// whoever adds the variant to say whether it may enter. That is the same
-/// reason `unreachable_patterns` is workspace-`deny`ed: this file does not get
-/// to fail open.
-fn require_live_arena_runtime_ready(
-    policy: carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy,
-    entry: NativeLiveArenaEntry,
-) -> Result<(), RuntimeError> {
-    use carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy as Policy;
-    match (policy, entry) {
-        // The two disagreements between policy and transport.
-        (Policy::Disabled, NativeLiveArenaEntry::Resume { transported: true }) => Err(
-            RuntimeError::Unsupported(LIVE_ARENA_TRANSPORTED_WITHOUT_POLICY.to_string()),
-        ),
-        (Policy::Compiler, NativeLiveArenaEntry::Resume { transported: false }) => Err(
-            RuntimeError::Unsupported(LIVE_ARENA_RESUMED_WITHOUT_TRANSPORT.to_string()),
-        ),
-        // The four admissions, one arm each.
-        (Policy::Disabled, NativeLiveArenaEntry::Launch) => Ok(()),
-        (Policy::Disabled, NativeLiveArenaEntry::Resume { transported: false }) => Ok(()),
-        (Policy::Compiler, NativeLiveArenaEntry::Launch) => Ok(()),
-        (Policy::Compiler, NativeLiveArenaEntry::Resume { transported: true }) => Ok(()),
-    }
-}
-
-/// Create this guest process's arena. Called exactly once per launched guest
-/// process, in `run_image_in_child`'s fork child before the tier split.
-///
-/// [`LiveArenaCapacities::V2`] is the only accepted geometry — the portable
-/// layout constructor rejects every other capacity set, and V2 is what Task
-/// 6B3's fresh census and capacity simulation accepted.
-///
-/// [`LiveArenaCapacities::V2`]: carrick_dsr_aarch64::live_arena::LiveArenaCapacities::V2
-fn create_owned_live_arena(
-    policy: carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy,
-) -> Result<OwnedNativeLiveArena, RuntimeError> {
-    match policy {
-        carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy::Disabled => Ok(None),
-        carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy::Compiler => {
-            let arena = carrick_native_darwin::live_arena::DarwinLiveArena::new(
-                carrick_dsr_aarch64::live_arena::LiveArenaCapacities::V2,
-            )
-            .map_err(|error| {
-                RuntimeError::Unsupported(format!(
-                    "create the native live translation arena: {error}"
-                ))
-            })?;
-            Ok(Some(Arc::new(arena)))
-        }
-    }
-}
-
-/// Adopt the arena a host self-exec transported, into the resumed process's
-/// single owner.
-///
-/// The caller runs [`require_live_arena_runtime_ready`] first, which already
-/// refused both disagreement shapes; the same two arms here keep the
-/// constructor total and fail-closed on its own terms, over the real
-/// `Option<DarwinLiveArena>` rather than the entry's boolean summary of it.
-fn adopt_owned_live_arena(
-    policy: carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy,
-    transported: Option<carrick_native_darwin::live_arena::DarwinLiveArena>,
-) -> Result<OwnedNativeLiveArena, RuntimeError> {
-    use carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy as Policy;
-    match (policy, transported) {
-        (Policy::Disabled, None) => Ok(None),
-        (Policy::Disabled, Some(_)) => Err(RuntimeError::Unsupported(
-            LIVE_ARENA_TRANSPORTED_WITHOUT_POLICY.to_string(),
-        )),
-        (Policy::Compiler, Some(arena)) => Ok(Some(Arc::new(arena))),
-        (Policy::Compiler, None) => Err(RuntimeError::Unsupported(
-            LIVE_ARENA_RESUMED_WITHOUT_TRANSPORT.to_string(),
-        )),
-    }
-}
-
-/// Give this process's DSR translator its live-arena authority.
-///
-/// One `LiveArenaProcessView` per process image: it brands every capability
-/// with a process-private identity plus this process's generation domain, so a
-/// record acquired through it can never be resolved against another mapping.
-/// A guest `fork(2)` child inherits both the view and its mappings by copy —
-/// the arena is a SHARED file mapping at the same addresses — so the child's
-/// installed live blocks and indexes stay coherent without a rebuild.
-///
-/// Both `execve` shapes re-enter this function for their replacement image:
-/// the host self-re-exec successor re-enters `run_image_in_current_process`
-/// with a fresh translator over the arena it adopted from the inherited fds,
-/// and the in-process path calls it right after the replacement image's
-/// `configure_shared_translation`, once the exec reset has retired the
-/// outgoing image's live configuration, authority and catalog node.
-///
-/// Installing also mints this process's ONE stable target authority over the
-/// view's RX payload and registers that payload in the executable-range
-/// catalog, so a fault or asynchronous kick inside live code classifies as
-/// authoritative translated code rather than a host PC.
-fn install_live_translation_authority(
-    memory: &NativeMappedMemory,
-    arena: &Arc<carrick_native_darwin::live_arena::DarwinLiveArena>,
-) -> Result<(), RuntimeError> {
-    let translator = memory
-        .dsr_process_translator()
-        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
-    let view = carrick_native_darwin::live_arena::LiveArenaProcessView::new(
-        Arc::clone(arena),
-        memory.dsr_generations.domain(),
-    )
-    .map_err(|error| {
-        RuntimeError::Unsupported(format!("live translation arena process view: {error}"))
-    })?;
-    translator
-        .install_live_authority(Arc::new(view))
-        .map_err(|error| RuntimeError::Unsupported(error.to_string()))
-}
-
-fn enter_native_process_with_live_policy(
-    policy: carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy,
-    entry: NativeLiveArenaEntry,
-    enter: impl FnOnce(),
-) -> Result<(), RuntimeError> {
-    require_live_arena_runtime_ready(policy, entry)?;
-    enter();
-    Ok(())
-}
-
-fn enter_configured_native_process(entry: NativeLiveArenaEntry) -> Result<(), RuntimeError> {
-    let policy = carrick_dsr_aarch64::translator::live_arena_runtime_policy()
-        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
-    enter_native_process_with_live_policy(policy, entry, install_native_probe_sink)
 }
 
 /// Sentinel meaning "not hashed yet". `begin_guest_exec` fills it in if the
@@ -1717,31 +1471,11 @@ fn load_native_execve_image(
 }
 
 pub(crate) fn resume_guest_from_capsule(
-    mut guest: crate::native_exec_capsule::NativeGuestExecV2,
+    mut guest: crate::native_exec_capsule::NativeGuestExecV1,
     argv: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
-    transported_live_arena: Option<carrick_native_darwin::live_arena::DarwinLiveArena>,
 ) -> anyhow::Result<i32> {
-    let live_policy = carrick_dsr_aarch64::translator::live_arena_runtime_policy()
-        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
-    enter_native_process_with_live_policy(
-        live_policy,
-        NativeLiveArenaEntry::Resume {
-            transported: transported_live_arena.is_some(),
-        },
-        install_native_probe_sink,
-    )?;
-    // The ONE adoption into `Arc` for this resumed process. Every lane below —
-    // the tier-D runner's exec services, the DSR run loop, and each of its
-    // clone-thread siblings — retains a clone of this owner, and the next host
-    // self-exec transports it onward.
-    let live_arena = adopt_owned_live_arena(live_policy, transported_live_arena)?;
-    #[cfg(test)]
-    if let Some(exit_code) =
-        crate::native_exec_capsule::native_exec_live_arena_resume_hook(live_arena.as_ref())?
-    {
-        return Ok(exit_code);
-    }
+    install_native_probe_sink();
     dsr::profile::seed_profile_exec_epoch_after_reexec(guest.profile_exec_epoch);
     // Startup attribution across the PID-preserving host self-reexec: the
     // pid's startup window was captured exactly once in the pre-exec image,
@@ -1859,7 +1593,6 @@ pub(crate) fn resume_guest_from_capsule(
                     dispatcher,
                     max_traps,
                     &plan,
-                    live_arena.clone(),
                 )
                 .map_err(anyhow::Error::from)?
                 {
@@ -1925,7 +1658,6 @@ pub(crate) fn resume_guest_from_capsule(
         &plan,
         NativeCurrentProcessEntry::SelfReexecRestore,
         guest_image,
-        live_arena,
     )
     .map_err(anyhow::Error::from)
 }
@@ -2098,12 +1830,6 @@ fn native_dsr_cache_event_kind(
         Seam::DirectBindingClear => Usdt::DirectBindingClear,
         Seam::DirectBindingValidationFailure => Usdt::DirectBindingValidationFailure,
         Seam::DirectBindingUnitLoaded => Usdt::DirectBindingUnitLoaded,
-        Seam::LiveReadyHit => Usdt::LiveReadyHit,
-        Seam::LiveWinnerPublish => Usdt::LiveWinnerPublish,
-        Seam::LiveCasLoss => Usdt::LiveCasLoss,
-        Seam::LivePrivateFallback => Usdt::LivePrivateFallback,
-        Seam::LiveValidationRefusal => Usdt::LiveValidationRefusal,
-        Seam::LiveStaleAbortRecovered => Usdt::LiveStaleAbortRecovered,
     }
 }
 
@@ -2393,20 +2119,6 @@ impl carrick_dsr::probes::DsrProbeSink for NativeDsrProbeForwarder {
     fn dsr_cache_bounds(&self, base: u64, end: u64) {
         crate::probes::dsr_cache_bounds(base, end);
     }
-
-    fn dsr_live_chunk_revoked(&self, event: carrick_dsr::probes::DsrLiveChunkRevocation) {
-        // Re-validated on the USDT side rather than transported raw: the
-        // observability type has the same private-field constructor, so a
-        // torn extent cannot cross the seam.
-        let Ok(event) = crate::probes::DsrLiveChunkRevocation::revoked(
-            event.source_page(),
-            event.chunk_index(),
-            event.rx().clone(),
-        ) else {
-            return;
-        };
-        crate::probes::dsr_live_chunk_revoked(event);
-    }
 }
 
 /// Install the USDT forwarder as `carrick_dsr::probes`' process-wide sink.
@@ -2552,31 +2264,15 @@ fn add_load_bias(load_bias: u64, addend: i64) -> Result<u64, RuntimeError> {
 
 // See `run_static_elf`: macOS-arm-only until M0.8.
 #[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
-struct NativeInitialExecutableIdentity {
-    resolved_path: String,
-    digest: Option<[u8; 32]>,
-}
-
-// See `run_static_elf`: macOS-arm-only until M0.8.
-#[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
 fn run_image_in_child(
     image: AddressSpace,
-    executable: NativeInitialExecutableIdentity,
+    resolved_path: String,
     dispatcher: SyscallDispatcher,
     max_traps: usize,
     relative_relocations: Vec<NativeRelativeRelocation>,
     plan: &ExecutionPlan,
     direct: Option<DirectLaunchCandidate>,
 ) -> Result<RunResult, RuntimeError> {
-    let NativeInitialExecutableIdentity {
-        resolved_path,
-        digest: executable_digest,
-    } = executable;
-    // Read the policy in the PARENT: an unparsable spelling must fail the
-    // launch with a named error rather than in a fork child whose only reporting
-    // channel is a stderr pipe.
-    let live_policy = carrick_dsr_aarch64::translator::live_arena_runtime_policy()
-        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
     let _cache_session =
         carrick_native_darwin::aot_cache::begin_container_cache().map_err(AddressSpaceError::Io)?;
     let stdout_pipe = pipe_pair()?;
@@ -2610,21 +2306,6 @@ fn run_image_in_child(
         // child, and its rusage clock restarted at fork, so the window must
         // anchor after the fork (env-gated; profile-off reads no clocks).
         dsr::profile::mark_native_process_runtime_entry();
-        // The ONE creation point for this guest process's live translation
-        // arena, before the tier split so BOTH tiers retain the same owner.
-        // The parent (the launching CLI) never touches it: the arena belongs to
-        // the guest process, which is this child. Both aliases are `MAP_SHARED`
-        // over the backing descriptors, so a later guest `fork(2)` child sees
-        // the same objects at the same addresses AND inherits the two fds that
-        // carry them onward through its own host self-exec — no post-fork
-        // repair, and no capability the child lacks.
-        let live_arena = match create_owned_live_arena(live_policy) {
-            Ok(live_arena) => live_arena,
-            Err(err) => {
-                child_write_stderr(format!("native live arena child error: {err}\n").as_bytes());
-                unsafe { libc::_exit(125) };
-            }
-        };
         // Tier decision (Phase 2): an eligible image runs DIRECTLY, through
         // the same dispatcher; a refusal at LOAD time (before any guest
         // instruction) falls back to the DSR tier below with the dispatcher
@@ -2638,7 +2319,6 @@ fn run_image_in_child(
                 dispatcher,
                 max_traps,
                 plan,
-                live_arena.clone(),
             ) {
                 Ok(DirectLaunchFlow::Completed(code)) => unsafe { libc::_exit(code) },
                 Ok(DirectLaunchFlow::Refused {
@@ -2660,13 +2340,12 @@ fn run_image_in_child(
                 image,
                 relative_relocations,
             },
-            executable_digest,
+            None,
             dispatcher,
             max_traps,
             plan,
             NativeCurrentProcessEntry::Initial,
             guest_image,
-            live_arena,
         ) {
             Ok(code) => unsafe { libc::_exit(code) },
             Err(err) => {
@@ -2702,7 +2381,6 @@ fn run_image_in_child(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_image_in_current_process(
     source: NativeImageSource,
     executable_digest: Option<[u8; 32]>,
@@ -2711,7 +2389,6 @@ fn run_image_in_current_process(
     plan: &ExecutionPlan,
     process_entry: NativeCurrentProcessEntry,
     guest_image: NativeGuestImageCompatibility,
-    live_arena: OwnedNativeLiveArena,
 ) -> Result<i32, RuntimeError> {
     // Collect dyld-owned host identity before the guest mapping or self-reexec
     // restore can cross its fatal-only boundary. The Initial handoff owns this
@@ -2741,13 +2418,6 @@ fn run_image_in_current_process(
             Arc::new(carrick_native_darwin::aot_cache::ActiveContainerUnitStore),
         )
         .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
-    // The live lane's ONE wiring point: the process's arena owner (created at
-    // launch, adopted from inherited fds on resume) becomes this process's
-    // translation authority. Without an owner — the policy-off default — the
-    // translator's live paths stay inert and its behavior is unchanged.
-    if let Some(arena) = live_arena.as_ref() {
-        install_live_translation_authority(&memory, arena)?;
-    }
     let memory = Arc::new(NativeMemoryHandle::new(memory));
     let _ = crate::ulock::preinit_waiter_table();
     // PID-namespace launch placement (container path only; `run-elf` never
@@ -2797,7 +2467,6 @@ fn run_image_in_current_process(
         reporter,
         max_traps,
         plan,
-        live_arena,
         &mut thread_runtime,
         NativeThreadStart::Initial {
             entry,
@@ -3775,7 +3444,6 @@ fn finalize_native_process_exit(
     // and every fork child end at `libc::_exit`. This is the one seam all of
     // them funnel through.
     dsr::xlat_census::flush(dsr::xlat_census::CensusFlush::ProcessExit);
-    dsr::live_sizing_census::flush(dsr::live_sizing_census::SizingFlush::ProcessExit);
 }
 
 /// Diagnostic-only: when `CARRICK_DSR_CODE_SNAPSHOT_DIR` names a directory,
@@ -3830,14 +3498,12 @@ fn maybe_dump_code_snapshot(translator: &dsr::ThreadTranslator) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_native_thread_loop(
     dispatcher: Arc<SyscallDispatcher>,
     memory: SharedNativeMemory,
     reporter: Arc<CompatReporter>,
     max_traps: usize,
     plan: Arc<ExecutionPlan>,
-    live_arena: OwnedNativeLiveArena,
     thread_runtime: &mut NativeThreadRuntime,
     start: NativeThreadStart,
 ) -> Result<NativeThreadLoopOutcome, RuntimeError> {
@@ -3847,7 +3513,6 @@ fn run_native_thread_loop(
         reporter,
         max_traps,
         plan,
-        live_arena,
         thread_runtime,
         start,
     )
@@ -3894,14 +3559,12 @@ fn enter_dsr_prepared<const PROFILE: bool>(
         .map_err(|error| RuntimeError::Unsupported(error.to_string()))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_native_dsr_thread_loop(
     dispatcher: Arc<SyscallDispatcher>,
     memory: SharedNativeMemory,
     reporter: Arc<CompatReporter>,
     max_traps: usize,
     plan: Arc<ExecutionPlan>,
-    live_arena: OwnedNativeLiveArena,
     thread_runtime: &mut NativeThreadRuntime,
     start: NativeThreadStart,
 ) -> Result<NativeThreadLoopOutcome, RuntimeError> {
@@ -3912,7 +3575,6 @@ fn run_native_dsr_thread_loop(
             reporter,
             max_traps,
             plan,
-            live_arena,
             thread_runtime,
             start,
         )
@@ -3923,21 +3585,18 @@ fn run_native_dsr_thread_loop(
             reporter,
             max_traps,
             plan,
-            live_arena,
             thread_runtime,
             start,
         )
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
     dispatcher: Arc<SyscallDispatcher>,
     memory: SharedNativeMemory,
     reporter: Arc<CompatReporter>,
     max_traps: usize,
     plan: Arc<ExecutionPlan>,
-    live_arena: OwnedNativeLiveArena,
     thread_runtime: &mut NativeThreadRuntime,
     start: NativeThreadStart,
 ) -> Result<NativeThreadLoopOutcome, RuntimeError> {
@@ -4451,7 +4110,6 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     &memory,
                     &reporter,
                     &plan,
-                    &live_arena,
                     max_traps,
                     NativeCloneThreadRequest {
                         context: snapshot,
@@ -4673,9 +4331,6 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                             // successor keeps this pid, so the census filename
                             // carries a timestamp discriminator too.
                             dsr::xlat_census::flush(dsr::xlat_census::CensusFlush::HostSelfReexec);
-                            dsr::live_sizing_census::flush(
-                                dsr::live_sizing_census::SizingFlush::HostSelfReexec,
-                            );
                             #[cfg(feature = "alloc-owner-census")]
                             drop(allocation_observer);
                             require_native_syscall_service_transition(
@@ -4693,7 +4348,6 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                                 executable_digest,
                                 max_traps,
                                 &plan,
-                                live_arena.as_deref(),
                             ) {
                                 require_native_syscall_service_transition(
                                     service.reopen_after_failed_terminal_handoff(),
@@ -4826,9 +4480,6 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         let allocation_observer =
                             carrick_dsr_aarch64::alloc_owner_census::observer_pause();
                         dsr::xlat_census::flush(dsr::xlat_census::CensusFlush::InProcessExec);
-                        dsr::live_sizing_census::flush(
-                            dsr::live_sizing_census::SizingFlush::InProcessExec,
-                        );
                         #[cfg(feature = "alloc-owner-census")]
                         drop(allocation_observer);
                         // Exec quiescence has retired every sibling and no
@@ -4875,26 +4526,6 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                                     ),
                                 )
                                 .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
-                            // The IN-PROCESS exec live lane, the counterpart of
-                            // the boot/self-re-exec wiring in
-                            // `run_image_in_current_process`. `replace_image`
-                            // has just run the exec reset, which clears
-                            // `live_translation`/`live_authority` and drops the
-                            // RX payload's executable-range catalog node, so the
-                            // `configure_shared_translation` above configured
-                            // the REPLACEMENT image's live unit key and this
-                            // call installs a fresh process view over the same
-                            // inherited arena. Both `replace_image` translator
-                            // branches land here: the inherited translator
-                            // (`NATIVE_FORKED_GUEST_CHILD`) re-installs onto its
-                            // reset state, and a freshly constructed one
-                            // installs for the first time.
-                            //
-                            // Without an arena owner — the policy-off default —
-                            // this is not reached and the lane stays inert.
-                            if let Some(arena) = live_arena.as_ref() {
-                                install_live_translation_authority(&memory, arena)?;
-                            }
                         }
                         // Publish process-visible exec state only after the
                         // complete replacement mapping, vvar, relocations, and
@@ -5508,7 +5139,6 @@ impl NativeThreadRuntime {
         memory: &SharedNativeMemory,
         reporter: &Arc<CompatReporter>,
         plan: &Arc<ExecutionPlan>,
-        live_arena: &OwnedNativeLiveArena,
         max_traps: usize,
         request: NativeCloneThreadRequest,
     ) -> Result<crate::thread::ThreadId, RuntimeError> {
@@ -5535,9 +5165,6 @@ impl NativeThreadRuntime {
         let child_memory = Arc::clone(memory);
         let child_reporter = Arc::clone(reporter);
         let child_plan = Arc::clone(plan);
-        // The sibling shares this process's ONE arena; its own execve is a
-        // self-exec that must transport the same objects.
-        let child_live_arena = live_arena.clone();
         let mut child_runtime = self.sibling(tid);
         let service_number = request.service_number;
         let service_name = request.service_name;
@@ -5577,7 +5204,6 @@ impl NativeThreadRuntime {
                         child_reporter,
                         max_traps,
                         child_plan,
-                        child_live_arena,
                         &mut child_runtime,
                         NativeThreadStart::Detached {
                             context: Box::new(context),
@@ -8471,437 +8097,6 @@ fn last_io_error(context: &str) -> RuntimeError {
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
-
-    #[test]
-    fn live_policy_and_sizing_digest_consumption_truth_table_is_exact() {
-        use carrick_dsr_aarch64::translator::{
-            LiveArenaRuntimePolicy, live_arena_runtime_policy_from,
-        };
-
-        assert!(!live_identity_consumes_executable_digest(
-            Ok(LiveArenaRuntimePolicy::Disabled),
-            false,
-        ));
-        assert!(live_identity_consumes_executable_digest(
-            Ok(LiveArenaRuntimePolicy::Disabled),
-            true,
-        ));
-        assert!(live_identity_consumes_executable_digest(
-            Ok(LiveArenaRuntimePolicy::Compiler),
-            false,
-        ));
-        assert!(live_identity_consumes_executable_digest(
-            live_arena_runtime_policy_from(Some(std::ffi::OsStr::new("invalid"))),
-            false,
-        ));
-    }
-
-    #[test]
-    fn initial_compiler_digest_is_exact_only_for_live_policy_or_sizing() {
-        let bytes = b"initial compiler fixture";
-        let expected: [u8; 32] = sha2::Sha256::digest(bytes).into();
-
-        assert_eq!(
-            initial_live_executable_digest_for(
-                carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy::Disabled,
-                false,
-                bytes,
-            ),
-            None,
-            "default/off must add no initial executable hash"
-        );
-        assert_eq!(
-            initial_live_executable_digest_for(
-                carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy::Compiler,
-                false,
-                bytes,
-            ),
-            Some(expected)
-        );
-        assert_eq!(
-            initial_live_executable_digest_for(
-                carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy::Disabled,
-                true,
-                bytes,
-            ),
-            Some(expected)
-        );
-    }
-
-    /// The readiness gate's exact truth table, over the whole 2x3 matrix.
-    ///
-    /// Four shapes enter — including every `Compiler` shape whose transport
-    /// agrees with its policy, which is what the fd substrate opened. The two
-    /// that do not are the disagreements, in both directions: an arena
-    /// arriving with the policy off, and a `compiler` resume that carried
-    /// none.
-    #[test]
-    fn live_arena_entry_authority_matrix_is_exact() {
-        use carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy as Policy;
-        use std::cell::Cell;
-
-        let entered = Cell::new(0_u32);
-        for (policy, entry) in [
-            (Policy::Disabled, NativeLiveArenaEntry::Launch),
-            (
-                Policy::Disabled,
-                NativeLiveArenaEntry::Resume { transported: false },
-            ),
-            (Policy::Compiler, NativeLiveArenaEntry::Launch),
-            (
-                Policy::Compiler,
-                NativeLiveArenaEntry::Resume { transported: true },
-            ),
-        ] {
-            let before = entered.get();
-            enter_native_process_with_live_policy(policy, entry, || entered.set(entered.get() + 1))
-                .unwrap_or_else(|error| panic!("{policy:?}/{entry:?} must enter: {error}"));
-            assert_eq!(entered.get(), before + 1, "{policy:?}/{entry:?} must enter");
-        }
-        assert_eq!(entered.get(), 4, "every agreeing shape enters exactly once");
-
-        let unexpected = enter_native_process_with_live_policy(
-            Policy::Disabled,
-            NativeLiveArenaEntry::Resume { transported: true },
-            || entered.set(entered.get() + 1),
-        )
-        .expect_err("an arena arriving with the policy off must fail closed");
-        assert!(
-            unexpected
-                .to_string()
-                .contains(LIVE_ARENA_TRANSPORTED_WITHOUT_POLICY),
-            "the refusal must name the disagreement: {unexpected}"
-        );
-
-        let missing = enter_native_process_with_live_policy(
-            Policy::Compiler,
-            NativeLiveArenaEntry::Resume { transported: false },
-            || entered.set(entered.get() + 1),
-        )
-        .expect_err("a compiler resume that carried no arena must fail closed");
-        assert!(
-            missing
-                .to_string()
-                .contains(LIVE_ARENA_RESUMED_WITHOUT_TRANSPORT),
-            "the refusal must name the missing transport: {missing}"
-        );
-
-        assert_eq!(
-            entered.get(),
-            4,
-            "a refused shape must not have entered the process"
-        );
-    }
-
-    #[test]
-    fn launch_creates_one_owned_v2_arena_only_under_compiler_policy() {
-        use carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy as Policy;
-
-        assert!(
-            create_owned_live_arena(Policy::Disabled)
-                .expect("disabled policy creates nothing")
-                .is_none(),
-            "the default path must not allocate an arena"
-        );
-
-        let owner = create_owned_live_arena(Policy::Compiler)
-            .expect("compiler policy creates the arena")
-            .expect("compiler policy owns an arena");
-        assert_eq!(
-            Arc::strong_count(&owner),
-            1,
-            "creation must adopt into Arc exactly once"
-        );
-        let transit = owner.transit_v2();
-        assert_eq!(
-            transit.schema,
-            carrick_native_darwin::live_arena::LIVE_ARENA_TRANSIT_SCHEMA_V2
-        );
-        let layout = owner.control_layout();
-        assert_eq!(
-            layout.capacities(),
-            carrick_dsr_aarch64::live_arena::LiveArenaCapacities::V2,
-            "only B3's accepted V2 capacities may be used"
-        );
-        assert_eq!(transit.code_len, layout.code_len() as u64);
-        assert_eq!(transit.control_len, layout.control_len() as u64);
-    }
-
-    #[test]
-    fn resume_adopts_the_transported_arena_exactly_once() {
-        use carrick_dsr_aarch64::translator::LiveArenaRuntimePolicy as Policy;
-
-        assert!(
-            adopt_owned_live_arena(Policy::Disabled, None)
-                .expect("disabled policy adopts nothing")
-                .is_none()
-        );
-
-        let arena = carrick_native_darwin::live_arena::DarwinLiveArena::new(
-            carrick_dsr_aarch64::live_arena::LiveArenaCapacities::V2,
-        )
-        .expect("transported arena");
-        let transit = arena.transit_v2();
-        let adopted = adopt_owned_live_arena(Policy::Compiler, Some(arena))
-            .expect("compiler policy adopts the transported arena")
-            .expect("compiler policy owns the transported arena");
-        assert_eq!(
-            Arc::strong_count(&adopted),
-            1,
-            "adoption must move into Arc exactly once"
-        );
-        assert_eq!(
-            adopted.transit_v2(),
-            transit,
-            "adoption must retain the transported identity"
-        );
-
-        let missing = match adopt_owned_live_arena(Policy::Compiler, None) {
-            Ok(_) => panic!("a compiler-policy resume without the arena must fail closed"),
-            Err(error) => error,
-        };
-        assert!(missing.to_string().contains("transported"), "{missing}");
-
-        let unexpected = match adopt_owned_live_arena(
-            Policy::Disabled,
-            Some(
-                carrick_native_darwin::live_arena::DarwinLiveArena::new(
-                    carrick_dsr_aarch64::live_arena::LiveArenaCapacities::V2,
-                )
-                .expect("unexpected arena"),
-            ),
-        ) {
-            Ok(_) => panic!("an arena arriving with the policy off must fail closed"),
-            Err(error) => error,
-        };
-        assert!(
-            unexpected
-                .to_string()
-                .contains("without CARRICK_DSR_LIVE_ARENA=compiler"),
-            "{unexpected}"
-        );
-    }
-
-    /// The owner must survive being shared by the clone-thread paths: the DSR
-    /// loop hands `Arc` clones to spawned siblings and the direct runner is
-    /// borrowed across host threads, so a non-`Send`/non-`Sync` owner would
-    /// force a second, per-thread arena.
-    #[test]
-    fn the_live_arena_owner_crosses_the_clone_thread_boundary() {
-        fn assert_shareable<T: Send + Sync>() {}
-        assert_shareable::<OwnedNativeLiveArena>();
-        assert_shareable::<crate::direct_runner::DirectExecServices>();
-    }
-
-    /// Structural gate for the ONE creation point: the launch child must own
-    /// the arena before it can hand it to either tier.
-    #[test]
-    fn the_launch_child_creates_the_arena_before_the_tier_split() {
-        let source = include_str!("native_darwin.rs");
-        let launch = source
-            .split_once("fn run_image_in_child(")
-            .expect("native launch function")
-            .1
-            .split_once("fn run_image_in_current_process(")
-            .expect("native launch function end")
-            .0;
-        let child = launch
-            .split_once("if pid == 0 {")
-            .expect("native launch child arm")
-            .1;
-        let creation = child
-            .find("create_owned_live_arena(")
-            .expect("the launch child creates the process arena");
-        let tier_split = child
-            .find("if let Some(candidate) = direct {")
-            .expect("the launch child's direct/DSR tier split");
-        assert!(
-            creation < tier_split,
-            "the arena must be created once, before the direct/DSR split, so both \
-             tiers retain the same owner"
-        );
-        assert_eq!(
-            child.matches("create_owned_live_arena(").count(),
-            1,
-            "the launch child must create exactly one arena"
-        );
-    }
-
-    /// Structural gate for transport: neither `begin_guest_exec` call site may
-    /// hard-code "no arena" — both must forward the process's owner.
-    #[test]
-    fn both_self_exec_paths_transport_the_owned_arena() {
-        let source = include_str!("native_darwin.rs");
-        // Built at runtime so this test's own source text is not a match.
-        let needle = format!("{}::begin_guest_exec(", "crate::native_exec_capsule");
-        let sites = source
-            .match_indices(needle.as_str())
-            .map(|(index, _)| {
-                source[index..]
-                    .split_once(") {")
-                    .expect("begin_guest_exec argument list")
-                    .0
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(sites.len(), 2, "the tier-D and DSR self-exec call sites");
-        for site in sites {
-            assert!(
-                site.contains("live_arena"),
-                "a self-exec call site does not forward the process arena:\n{site}"
-            );
-        }
-    }
-
-    fn compiler_guard_guest_fixture() -> crate::native_exec_capsule::NativeGuestExecV2 {
-        use crate::native_exec_capsule::{
-            NativeGuestExecV2, NativeReexecCredentialsV1, NativeReexecProcessStateV1,
-            NativeReexecXsigV1,
-        };
-
-        NativeGuestExecV2 {
-            resolved_path: "/definitely/missing/compiler-capsule".to_owned(),
-            executable_digest: [0; 32],
-            rootfs: crate::fs_backend::HostFsReexecAuthority {
-                root_path: b"/definitely/missing/compiler-rootfs".to_vec(),
-                device: 0,
-                inode: 0,
-                cleanup_on_drop: false,
-            },
-            cwd: "/".to_owned(),
-            stream_stdio: false,
-            exec_host_fs_fallback: false,
-            max_traps: 1,
-            native_page_profile: carrick_spec::NativePageProfileRequest::Native16k,
-            live_arena: None,
-            kernel_arena: None,
-            shared_futex_waiters: None,
-            artifact_spike: None,
-            aot_cache: None,
-            bind_mounts: Vec::new(),
-            fd_table: crate::dispatch::fd_table::NativeReexecFdTableV1 {
-                files: Vec::new(),
-                descriptions: Vec::new(),
-                close_on_exec_host_fds: Vec::new(),
-                closed_stdio: [false; 3],
-            },
-            xsig: NativeReexecXsigV1 {
-                host_fd: -1,
-                original_host_fd_flags: 0,
-                host_device: 0,
-                host_inode: 0,
-                host_size: 0,
-            },
-            process_state: NativeReexecProcessStateV1 {
-                credentials: NativeReexecCredentialsV1 {
-                    ruid: 0,
-                    euid: 0,
-                    suid: 0,
-                    rgid: 0,
-                    egid: 0,
-                    sgid: 0,
-                    fsuid: 0,
-                    fsgid: 0,
-                    umask: 0o022,
-                },
-                supplementary_groups_override: None,
-                ignored_signals: 0,
-                nofile_soft: 1024,
-                rlimit_overrides: Vec::new(),
-                seccomp_policy: carrick_spec::SeccompPolicy::Unconfined,
-                ptrace_traceme: false,
-            },
-            prepared_image: None,
-            profile_startup: None,
-            profile_exec_epoch: 0,
-        }
-    }
-
-    /// Both real native LAUNCH entries now admit the compiler policy — each
-    /// runs past the readiness gate and fails only for its own reason (a
-    /// missing executable) — while a real RESUME that carried no arena still
-    /// fails closed with the named transport reason.
-    ///
-    /// This is the entry-level half of opening the gate: the previous truth
-    /// was that all three refused with the fork-transport blocker, and the
-    /// negative assertion below is what would catch a re-closure.
-    ///
-    /// Runs in an isolated child because `CARRICK_DSR_LIVE_ARENA` is read
-    /// through process-wide `OnceLock`s.
-    #[test]
-    fn compiler_policy_admits_real_native_launches_and_refuses_an_untransported_resume() {
-        const CHILD_ENV: &str = "CARRICK_TEST_COMPILER_ENTRY_GUARDS_CHILD";
-        const TEST_NAME: &str = "native_darwin::tests::compiler_policy_admits_real_native_launches_and_refuses_an_untransported_resume";
-
-        if std::env::var_os(CHILD_ENV).is_some() {
-            let plan = native16k_test_plan();
-            let static_launch = run_static_elf(
-                Path::new("/definitely/missing/compiler-static"),
-                SyscallDispatcher::new(),
-                std::iter::empty::<String>(),
-                std::iter::empty::<String>(),
-                1,
-                None,
-                &plan,
-            )
-            .expect_err("the missing static path must still fail")
-            .to_string();
-            let container_launch = run_elf_from_dispatcher_debug(
-                "/definitely/missing/compiler-container",
-                SyscallDispatcher::new(),
-                std::iter::empty::<String>(),
-                std::iter::empty::<String>(),
-                1,
-                None,
-                &plan,
-            )
-            .expect_err("the missing container entrypoint must still fail")
-            .to_string();
-            let untransported_resume = resume_guest_from_capsule(
-                compiler_guard_guest_fixture(),
-                Vec::new(),
-                Vec::new(),
-                None,
-            )
-            .expect_err("a compiler resume with no transported arena must fail closed")
-            .to_string();
-
-            for message in [&static_launch, &container_launch] {
-                assert!(
-                    !message.contains("CARRICK_DSR_LIVE_ARENA"),
-                    "a launch must no longer be refused for the live-arena policy: {message}"
-                );
-            }
-            assert!(
-                static_launch.contains("No such file or directory"),
-                "the static launch must reach its own missing-file failure: {static_launch}"
-            );
-            assert!(
-                container_launch.contains("/definitely/missing/compiler-container"),
-                "the container launch must reach its own entrypoint lookup: {container_launch}"
-            );
-            assert!(
-                untransported_resume.contains(LIVE_ARENA_RESUMED_WITHOUT_TRANSPORT),
-                "{untransported_resume}"
-            );
-            return;
-        }
-
-        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
-            .arg("--exact")
-            .arg(TEST_NAME)
-            .arg("--nocapture")
-            .env(CHILD_ENV, "1")
-            .env("CARRICK_DSR_LIVE_ARENA", "compiler")
-            .env_remove("CARRICK_DSR_LIVE_ARENA_SIZING_DIR")
-            .output()
-            .expect("run isolated compiler-policy child");
-        assert!(
-            output.status.success(),
-            "isolated compiler-policy child failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
 
     #[cfg(feature = "alloc-owner-census")]
     #[test]
