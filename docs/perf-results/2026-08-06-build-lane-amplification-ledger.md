@@ -147,37 +147,59 @@ fs-walk entry measured 2.05x whole-fixture host-per-guest; the build lane is
 
 Per-op, arm A counts, CPU-ns/op as mean ± sd across the three arms. "zfod
 in-window" counts `vminfo:::zfod` events that fired while that guest op's
-service window was open on the faulting thread.
+service window was open on the faulting thread. **The two "dominant" columns
+answer different questions:** "by CPU" is the analyzer's `dominant_host_call`
+(ranked by CPU-ns — where the kernel time went); "by count" is the largest
+host-call count in the window (recomputed from the raw's
+`section=host-syscalls`) — where the calls went. They frequently disagree, and
+both rankings matter (the budget is CPU-denominated; count levers are how
+amplification reaches 1).
 
-| guest op | guest count | host calls | amplification | host CPU-ns/op (n=3) | mach traps | zfod in-window | dominant host call |
-|---|---:|---:|---:|---:|---:|---:|---|
-| `clone` | 364 | 9,958 | 27.36x | 1,126,549 ± 30,710 | 2,928 | 332 | `fork` (68) |
-| `openat` | 3,265 | 90,239 | 27.64x | 105,542 ± 1,161 | 28 | 539 | `openat` (28,378) |
-| `execve` | 67 | 85,038 | 1,269.22x | 3,627,767 ± 18,051 | 2,041 | 83,487 | `read` (471) |
-| `newfstatat` | 3,960 | 48,034 | 12.13x | 39,665 ± 187 | 20 | 101 | `openat` (16,470) |
-| `mkdirat` | 282 | 21,987 | 77.97x | 284,410 ± 2,051 | 7 | 0 | `openat` (7,607) |
-| `epoll_pwait` | 1,882 | 14,155 | 7.52x | 34,847 ± 271 | 182 | 142 | `poll` (5,054) |
-| `mmap` | 6,110 | 5,653 | 0.93x | 7,537 ± 142 | 878 | **553,526** | `mprotect` (4,417) |
-| `unlinkat` | 156 | 9,888 | 63.38x | 241,213 ± 9,754 | 1 | 789 | `openat` (2,794) |
-| `nanosleep` | 16,277 | 34,434 | 2.12x | 2,100 ± 15 | 428 | 82 | `kevent` (16,212) |
-| `write` | 4,785 | 4,815 | 1.01x | 6,679 ± 127 | 12 | 480 | `write` (4,761) |
-| `futex` | 7,546 | 16,093 | 2.13x | 3,722 ± 117 | 125 | 183 | `psynch_cvwait` (5,703) |
-| `waitid` | 72 | 99,779 | 1,385.82x | 229,260 ± 17,024 | 198 | 58 | `kevent` (24,541) |
-| `read` | 6,110 | 6,539 | 1.07x | 2,524 ± 61 | 67 | 131 | `read` (6,116) |
-| `wait4` | 71 | 7,541 | 106.21x | 203,511 ± 3,680 | 0 | 13 | `sysctl` (822) |
-| `close` | 3,050 | 7,554 | 2.48x | 3,613 ± 85 | 74 | 68 | `close` (5,165) |
-| `fstat` | 331 | 1,324 | 4.00x | 28,584 ± 168 | 0 | 63 | `fgetxattr` (993) |
-| `utimensat` | 162 | 2,595 | 16.02x | 55,246 ± 762 | 0 | 1 | `openat` (487) |
-| `tgkill` | 2,033 | 3,885 | 1.91x | 2,999 ± 83 | 38 | 65 | `__pthread_kill` (1,894) |
-| `rt_sigaction` | 11,115 | 102,320 | 9.21x | 547 ± 8 | 0 | 36 | `sigaction` (57,860) |
-| `chdir` | 58 | 682 | 11.76x | 62,369 ± 595 | 0 | 1 | `openat` (150) |
-| other guest ops — 47 of them | 27,086 | 8,746 | — | — | — | — | — |
-| — `carrick-only`, workload (never a ratio) | — | 426,411 | n/a | — | 480,596 mach | 896,271 | `psynch_cvwait` (129,178) |
-| — `carrick-only`, probable instrument | — | 106,597 | n/a | — | — | — | `kdebug_trace64` (53,801) |
+| guest op | guest count | host calls | amplification | host CPU-ns/op (n=3) | mach traps | zfod in-window | dominant by CPU | dominant by count |
+|---|---:|---:|---:|---:|---:|---:|---|---|
+| `clone` | 364 | 9,958 | 27.36x | 1,126,549 ± 30,710 | 2,928 | 332 | `fork` (68) | `fcntl` (3,531) |
+| `openat` | 3,265 | 90,239 | 27.64x | 105,542 ± 1,161 | 28 | 539 | `openat` (28,378) | `openat` (28,378) |
+| `execve` | 67 | 85,038 | 1,269.22x | 3,627,767 ± 18,051 | 2,041 | 83,487 | `read` (471) | **`close` (74,253)** |
+| `newfstatat` | 3,960 | 48,034 | 12.13x | 39,665 ± 187 | 20 | 101 | `openat` (16,470) | `openat` (16,470) |
+| `mkdirat` | 282 | 21,987 | 77.97x | 284,410 ± 2,051 | 7 | 0 | `openat` (7,607) | `openat` (7,607) |
+| `epoll_pwait` | 1,882 | 14,155 | 7.52x | 34,847 ± 271 | 182 | 142 | `poll` (5,054) | `poll` (5,054) |
+| `mmap` | 6,110 | 5,653 | 0.93x | 7,537 ± 142 | 878 | **553,526** | `mprotect` (4,417) | `mprotect` (4,417) |
+| `unlinkat` | 156 | 9,888 | 63.38x | 241,213 ± 9,754 | 1 | 789 | `openat` (2,794) | `openat` (2,794) |
+| `nanosleep` | 16,277 | 34,434 | 2.12x | 2,100 ± 15 | 428 | 82 | `kevent` (16,212) | `waitid` (16,826) |
+| `write` | 4,785 | 4,815 | 1.01x | 6,679 ± 127 | 12 | 480 | `write` (4,761) | `write` (4,761) |
+| `futex` | 7,546 | 16,093 | 2.13x | 3,722 ± 117 | 125 | 183 | `psynch_cvwait` (5,703) | `psynch_cvwait` (5,703) |
+| `waitid` | 72 | 99,779 | 1,385.82x | 229,260 ± 17,024 | 198 | 58 | `kevent` (24,541) | `waitid` (73,900) |
+| `read` | 6,110 | 6,539 | 1.07x | 2,524 ± 61 | 67 | 131 | `read` (6,116) | `read` (6,116) |
+| `wait4` | 71 | 7,541 | 106.21x | 203,511 ± 3,680 | 0 | 13 | `sysctl` (822) | `proc_info` (4,482) |
+| `close` | 3,050 | 7,554 | 2.48x | 3,613 ± 85 | 74 | 68 | `close` (5,165) | `close` (5,165) |
+| `fstat` | 331 | 1,324 | 4.00x | 28,584 ± 168 | 0 | 63 | `fgetxattr` (993) | `fgetxattr` (993) |
+| `utimensat` | 162 | 2,595 | 16.02x | 55,246 ± 762 | 0 | 1 | `openat` (487) | `fcntl` (649) |
+| `tgkill` | 2,033 | 3,885 | 1.91x | 2,999 ± 83 | 38 | 65 | `__pthread_kill` (1,894) | `write` (1,902) |
+| `rt_sigaction` | 11,115 | 102,320 | 9.21x | 547 ± 8 | 0 | 36 | `sigaction` (57,860) | `sigaction` (57,860) |
+| `chdir` | 58 | 682 | 11.76x | 62,369 ± 595 | 0 | 1 | `openat` (150) | `close` (150) |
+| other guest ops — 47 of them | 27,086 | 8,746 | — | — | — | — | — | — |
+| — `carrick-only`, workload excl. instrument (never a ratio) | — | 319,814 | n/a | — | 480,596 mach¹ | 896,271¹ | `clonefileat` (21) | `psynch_cvwait` (129,178) |
+| — `carrick-only`, probable instrument | — | 106,597 | n/a | — | —¹ | —¹ | `kdebug_trace_string` | `kdebug_trace64` (53,801) |
 
-Closure receipt: the guest column sums to 94,782 and the host column to
-1,007,670, both equal to the independently aggregated totals (all ten currency
-pairs equal; asserted by the analyzer, republished in `closure`).
+¹ The instrument sub-bucket decomposes host calls and CPU only; the mach and
+fault columns on the workload row are the **whole** `carrick-only` bucket
+(the ledger's `carrick_only.host_calls` = 426,411 is the containing bucket:
+319,814 workload + 106,597 instrument).
+
+Closure receipt: the guest column sums to 94,782 and the host column —
+581,259 guest-attributed + 319,814 + 106,597 — to 1,007,670, both equal to
+the independently aggregated totals (all ten currency pairs equal; asserted
+by the analyzer, republished in `closure`).
+
+**The largest single count lever in the ledger is unexplained: ~1,108 host
+`close` per guest `execve`.** 74,253 of `execve`'s 85,038 in-window host
+calls (87.3%) are `close` — **7.4% of every host syscall in the run** — and
+the per-exec constant is stable to a tenth of a call across arms
+(1,108.3 / 1,109.1 / 1,109.2 per 67/68/68 execs). Host `execve` itself is
+1:1 with guest `execve` in every arm, so the window is genuine exec service,
+not supervision bleed. Nothing in the entry roster currently points at this;
+it is the named open question for Task 5/6 (deliberately not investigated in
+this entry — E0 measures, it does not attribute causes).
 
 Three rows are ratios over tiny denominators and must not be read as
 per-call price: `execve` (67 — the loader/exec chain), `waitid`/`wait4`
@@ -201,9 +223,9 @@ Mean CPU-ms over the three arms (counts from arm A):
 | `psynch_cvsignal` | 128,881 | 98.5 ± 3.2 | park/wake |
 | `close` | 3,578 | 77.7 ± 0.5 | teardown |
 | `fstatat64` | 9,041 | 29.4 ± 27.5 | see below |
-| `stat64` | 2,092 | 13.8 | image/setup stats |
-| `open` | 834 | 14.2 | setup |
-| `mmap` | 2,073 | 10.9 | host allocator/setup |
+| `open` | 834 | 14.05 ± 0.24 | setup |
+| `mmap` | 2,073 | 11.27 ± 0.35 | host allocator/setup |
+| `stat64` | 2,092 | 7.07 ± 5.81 | image/setup stats — same CPU instability as `fstatat64` (13.78/3.68/3.75 across arms; count stable) |
 | mach `swtch_pri` | 461,714 | 21.5 | **yield storm** — 95% of all mach traps in the run |
 
 Park/wake (`psynch_cvwait` + `psynch_cvsignal` ≈ 258k calls, **~0.38 s**) is
@@ -241,9 +263,16 @@ resolution/mode tail — `close`, `fstatat64`, `fcntl`, `fgetxattr` — around
 it), costing ~105 µs of host kernel CPU per guest open, 0.34 s per build.
 
 The whole fs family (`openat` + `newfstatat` + `mkdirat` + `unlinkat` +
-`utimensat` + `chdir` + `fstat`) is **172,749 host calls ≈ 0.64 s traced
+`utimensat` + `chdir` + `fstat`) is **174,749 host calls ≈ 0.64 s traced
 kernel CPU ≈ 40% of all guest-attributed kernel CPU** — the largest
 guest-attributed family on the build lane (§11, E5 promoted).
+
+**Denominator shift, recorded so the 19.68 → 8.69 pair is read correctly:**
+the guest `openat` count moved 2,363 (2026-07-28 capture) → 3,265 here
+(+38%). Same definition, same lane, but the guest-side open population
+itself changed across five weeks of drift, so the pair is a temporal
+before/after of the lane, not a causal measurement of the trusted-dirfd
+change alone.
 
 ## 7. Fault placement and the fault-ownership verdict at HEAD
 
@@ -374,9 +403,13 @@ ownership census's guest-owned zfod scaled estimate (~563k) matches the AMP1
 in-`mmap`-window count (~554k) and the 08-01 audit's `zero_backing` bucket
 (561k): the guest-owned fault mass IS the E1 destination-arena first touch,
 made by carrick's own copy loop inside the `mmap` service window. The
-host-other 63.3% is the allocation churn portfolio above, faulting mostly
-outside guest windows (`carrick-only` 58.3% temporal). Ownership and temporal
-cuts agree to within ~2 pp on both sides.
+host-other 63.3% is the allocation churn portfolio above. **The pairing that
+makes the two cuts agree is explicit:** host-other ↔ `carrick-only` **plus
+the `execve` windows** (the loader materializes images into carrick-owned
+buffers), 58.3% + 5.4% = 63.7% temporal vs 63.3% ownership; guest-owned ↔
+the `mmap` windows plus the guest-op residue, 36.3% vs 36.7%. The naive
+pairing (host-other ↔ `carrick-only` alone) misses by 5 pp; pooled, both
+sides agree to ~0.4 pp.
 
 ## 10. Qualify-at-first-arming — the Task-1 §6 list, answered
 
@@ -422,8 +455,8 @@ restated; ranks are by what this capture can defend. E1/E2 remain overlapping
 |---|---|---|---|
 | 1 | **E1** guest `mmap(MAP_PRIVATE, fd)` eager materialization | 553,526 zfod (36.0% of all) inside 6,110 guest-`mmap` windows; mmap syscall CPU itself trivial (47 ms) | confirmed #1 |
 | 2 | **E2** carrick ≥128 KiB allocation churn | host-other zfod **63.26/63.30%** at HEAD (§7); carrick-only zfod 896k (58.3%) | confirmed #2; STOP re-open stands on live numbers |
-| 3 | **E5 promoted** — the build-lane fs family | 172,749 host calls, ~0.64 s ≈ **40% of guest-attributed kernel CPU**; open lane 19.68 → **8.69**; `mkdirat` 78x, `unlinkat` 63x; `carrick-only` `fstatat64` 9,041 echoes the open fs-walk regression chip | **up from 5th**; was "unmeasured", now the largest guest-attributed family |
-| 4 | **process/container lifecycle** (absorbs E7 + the fork cost + the seed) | `clone` 1.13 ms/op (68 host `fork`s ≈ 5.6 ms each = 0.38 s); `execve` 3.63 ms/op in-window; `waitid`/`wait4` 107k host calls; `carrick-only` `clonefileat` 21 calls ≈ **0.31 s** | new named family; E7's "record, don't campaign" holds for the exec chain, but the fork row and the per-run `clonefileat` seed are campaignable |
+| 3 | **E5 promoted** — the build-lane fs family | 174,749 host calls, ~0.64 s ≈ **40% of guest-attributed kernel CPU**; open lane 19.68 → **8.69**; `mkdirat` 78x, `unlinkat` 63x; `carrick-only` `fstatat64` 9,041 echoes the open fs-walk regression chip | **up from 5th**; was "unmeasured", now the largest guest-attributed family |
+| 4 | **process/container lifecycle** (absorbs E7 + the fork cost + the seed) | `clone` 1.13 ms/op (68 host `fork`s ≈ 5.6 ms each = 0.38 s); `execve` 3.63 ms/op in-window and **~1,108 host `close` per exec** (§4 — the ledger's largest count lever, unexplained); `waitid`/`wait4` 107k host calls; `carrick-only` `clonefileat` 21 calls ≈ **0.31 s** | new named family; E7's "record, don't campaign" holds for the exec chain's fixed wall, but the fork row, the per-exec close storm and the per-run `clonefileat` seed are campaignable |
 | 5 | **E6** `carrick-only` park/wake | `psynch_*` ≈ 258k calls, **~0.38 s = 13–14%** of measured kernel CPU; `swtch_pri` 462–505k | up slightly; bigger same-instrument share than the sampling estimate suggested |
 | 6 | **E4** alias-gate / dispatch-guard scope | not measurable by this instrument; `swtch_pri` storm is consistent with contention but attributes nothing | unchanged: re-derive (Task 8) |
 | 7 | **E3** decommit intent → `MADV_FREE_REUSABLE` | guest `madvise` count is **415–528 per build**, in-window host CPU ≈ 0.1–0.2 ms — noise. The kernel-side case for E3 on this lane is refuted; only the userspace memset share (invisible to AMP1) could still argue for it | **demoted from 3rd**; plan's "should be non-trivial" is falsified by measurement |
