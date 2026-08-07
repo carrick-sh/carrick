@@ -18,22 +18,27 @@ passed without `--allow-busy`. It supersedes the 2026-08-06 official
 ## What this run folds in
 
 The prior official was measured at `7318f583` (binary `bbc63c51…`),
-BEFORE the Move-3 execution wave. This tip (`e4ee4a7e`) adds, wall-relevant:
+BEFORE the Move-3 execution wave. This tip (`e4ee4a7e`) adds, with each
+change's evidence status stated:
 
 - **the kernel-side anonymous-reuse replacement** (`52342762`, evidence
   [`2026-08-07-anon-reuse-remap.md`](2026-08-07-anon-reuse-remap.md)):
   ~518k faults/build removed, ABBA-attributed −0.660 CPU-s
-  [−0.750, −0.570] and −363 ms wall on its own controlled screen;
+  [−0.750, −0.570] and −363 ms wall on its own controlled screen —
+  **the only controlled win in the window**;
 - **the stat-cache dirfd interning** (`dce3266a`, plus its
-  rename-unpublish correctness fix `85ec0f4c`): the amplification ledger
-  credits it with 68,849 host syscalls removed per build; it had never
-  been wall-measured until this refresh;
+  rename-unpublish correctness fix `85ec0f4c`): 68,849 host syscalls
+  removed per build, count-verified by the amplification ledger — but
+  its CPU/wall effect is **not resolvable at this scale** (see the
+  anchor bound below);
 - **E1's host file-backed private file mmaps** (`f2a42bc3`, atomicity
   correction `ca96024a`): mechanism-verified earlier; its own AMP/ABBA
   showed no resolved wall movement (population 3.8 MiB/build).
 
 The rest of the window is instruments and docs (the AMP1/NFAULT2 ledger
-and partition tooling, this campaign's evidence entries).
+and partition tooling, this campaign's evidence entries), plus one
+runtime error-label change (`9d893149`, the removed-knob refusal's
+message — not perf-relevant).
 
 ## Delta vs the prior official, stated honestly
 
@@ -45,16 +50,32 @@ Carrick workload wall −501 ms (−5.77%), Docker +4 ms (+0.50%), ratio
 CPU / +5.11% wall drift over 2026-08-04 that it could not decompose (tip
 drift vs host state under ambient load ≈2.2 with a concurrent agent).
 Today's run un-does that drift and more. Two same-box anchors from this
-task's ABBA (yesterday, quiet host) bracket it: the ABBA **control**
-(pre-remap code at the Move-3 tip) ran 20.350 s CPU — within 0.9% of the
-2026-08-04 official's 20.168 s — and the ABBA **candidate** ran
-19.690 s — within 0.6% of today's official 19.795 s. This SUGGESTS
-(same-box consistency, not a controlled decomposition) that the
-2026-08-06 +6% was predominantly host-state of that run window, not
-code, and that today's official is the 2026-08-04 baseline plus the
-remap's controlled −0.66 CPU-s. The stat-cache interning's syscall
-removal is folded in but not separately resolved at this scale; no
-further unattributed drift remains open against this scoreboard.
+task's ABBA — run in this same session 29 minutes before the refresh
+(13:51Z vs 14:20Z), at 1-minute loads 2.5–3.6 vs the refresh's 5.51, so
+the official scoreboard is the BUSIER of the two measurements — bracket
+it: the ABBA **control** (the Move-3 tip minus only the remap) ran
+20.350 s CPU, within 0.9% of the 2026-08-04 official's 20.168 s, and the
+ABBA **candidate** ran 19.690 s, within 0.6% of today's official
+19.795 s. This SUGGESTS (same-box consistency, not a controlled
+decomposition) that the 2026-08-06 +6% was predominantly host-state of
+that run window, not code.
+
+Two limits on that closure, stated plainly:
+
+- **The arithmetic does not close to zero.** 20.168 − 0.660 = 19.508,
+  and today's median is 19.795 — a **+0.287 s (+1.5%) residual** above
+  "the 2026-08-04 baseline plus the remap". That residual is
+  unattributed (candidates: the non-remap window changes' net effect,
+  and run-to-run host state at these load levels); it sits within the
+  same-box anchor scatter (±0.9%/±0.6%) plus sample noise, so it is
+  SUGGESTED to be mostly host/sampling, not established.
+- **The anchors do not discriminate the other fold-ins.** The ABBA
+  control already CONTAINS `dce3266a` (stat-cache interning) and
+  `f2a42bc3` (E1); "control ≈ 2026-08-04 official" is therefore equally
+  the statement that those two changes together moved CPU by **≤ +0.9%
+  on this box — no resolvable win**. Their syscall/mechanism claims are
+  count-verified; their wall/CPU contribution is not resolved, and the
+  remap remains the only controlled win in the window.
 
 ## Bars at the current Docker denominator (803 ms)
 
@@ -85,9 +106,12 @@ SHA-256
 - performance overlay: shipped default, every control key unset;
 - harness preflight: passed without `--allow-busy` (no named busy
   reasons); the recorded 1-minute load average at start (5.51) is the
-  tail of the signed rebuild finishing moments earlier — Carrick sample 4
-  (8,767 ms workload, 21.873 s CPU) is the visible casualty and the
-  medians are robust to it;
+  tail of the signed rebuild finishing ~8 s earlier. Carrick sample 4
+  (8,767 ms workload, 21.873 s CPU) is an **unattributed outlier** — the
+  ordering contradicts a rebuild-tail explanation (samples 1–2, closest
+  to the rebuild, were the two FASTEST; sample 4 started ~36 s after
+  it). The medians are robust to it, and excluding it entirely gives
+  10.100x, so keeping it is the conservative choice;
 - result: 5/5 `BUILD_OK` in each phase, zero nonzero exits, timeouts,
   capture errors, or cleanup failures; the two phases ran serialized,
   every Carrick sample before any Docker sample, never overlapping.
@@ -116,8 +140,9 @@ engines.
 
 The shipped default is back under the 2026-08-04 line: roughly 8.2 s
 absolute and **10.18x** native-arm64 Docker on this host today, with the
-remap's controlled −0.66 CPU-s now visible in the official scoreboard
-and the 2026-08-06 drift closed as host-state. The 2x product bar still
+remap's controlled −0.66 CPU-s now visible in the official scoreboard,
+the 2026-08-06 drift suggested closed as host-state, and a +0.287 s
+(+1.5%) residual left explicitly open. The 2x product bar still
 requires removing 80.36% of current Carrick wall; the next territory
 remains the out-of-window ~63% host-other allocation churn (E2-proper)
 that Move 3's ledger sequenced.

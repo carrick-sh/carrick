@@ -80,6 +80,16 @@ then green with the change:
   protections exactly as the memset path finds them, zero restore calls
   (the `2026-08-07-e1-atomicity-scope-correction.md` discipline).
 
+Review coverage added post-retention (`c9f27d9c`): the POST-map
+`set_host_prot` failure branch (the replacement has landed, so the error
+must propagate — asserted as the `MemoryError` propagating through the
+spy seam with the bookkept protection intact; the **ENOMEM half of that
+contract is the mmap dispatch site's existing error arm and is asserted
+in prose, not exercised by a test**), and Biased-mode coverage
+(bias-translated map/restore targets, `FixedOutsideOwned` owned-range
+confinement refusal) so the receipts exercise the shipped address mode,
+not only Direct.
+
 ## 3. Gates, in the ladder's order (receipts under `target/perf/task7-anonzero/`)
 
 1. **`just ci`** exit 0 at the implementation commit (`just-ci-1.log`,
@@ -170,17 +180,24 @@ agree).
 12 × `go version` per sample under `carrick run` (each iteration a guest
 fork + execve whose Go startup performs the hint-less reserves, so the
 scrub fires per child on both arms), in-guest wall stamps excluding
-container assembly, interleaved on1 off1 off2 on2 off3 on3 on4 off4,
-n=4/arm, one binary, untraced (`t7forkexec-arm.sh`,
-`forkexec-*.out/.err`):
+container assembly, interleaved on off off on off on on off, n=4/arm,
+one binary per run, untraced (`t7forkexec-arm.sh`). Two runs are on
+record: the first run's receipts carried only the wall stamp (arm
+identity rested on the tag name alone), so the micro was re-run with
+provenanced receipts — each rerun `forkexec-*.out` records the binary
+SHA-256, the exact env overrides (the hatch value), the run id, load
+average, and source commit:
 
-| arm | wall ms (samples) | median |
-|---|---|---:|
-| remap ON (default) | 764, 836, 832, 822 | **827** |
-| memset OFF (`=0`) | 933, 854, 1048, 935 | 934 |
+| run | arm | wall ms (samples) | median |
+|---|---|---|---:|
+| 1 (`forkexec-on*/off*`, binary `914b6881…`) | remap ON | 764, 836, 832, 822 | **827** |
+| 1 | memset OFF (`=0`) | 933, 854, 1048, 935 | 934 |
+| 2 provenanced (`forkexec-onr*/offr*`, binary `61f0bbb3…`, tip `4e4de62f`) | remap ON | 771, 854, 852, 859 | **853** |
+| 2 provenanced | memset OFF (`=0`) | 978, 965, 908, 943 | 954 |
 
-The remap arm wins the fork-exec shape too (−11.4% median; max ON 836 <
-min OFF 854): the per-child memset removal outweighs the replacement's
+The remap arm wins the fork-exec shape in both runs (−11.4% / −10.6%
+median; run 2's max ON 859 < min OFF 908; run 1's max ON 836 < min OFF
+854): the per-child memset removal outweighs the replacement's
 VM-entry cost here. Scoped-workload caveat: this samples short-lived
 remap-heavy children; a lane dominated by LONG-LIVED remap-heavy parents
 that fork continuously would accumulate more entries per address space
