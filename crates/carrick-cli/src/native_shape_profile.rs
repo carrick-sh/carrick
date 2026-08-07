@@ -26,6 +26,18 @@ const AUTHORITY_SCHEMA: &str = "carrick.native-shape-authority.v1";
 const PROFILE: &str = "native-shape";
 const NORMAL_TARGET_EXIT_REASON: i32 = 1;
 
+/// A digest-pinned native `run` target, parsed from a profile's own trailing
+/// argv.
+///
+/// **Shared by two profiles, which is why every message names its caller.**
+/// `native-shape` introduced it; the `AMP1` amplification ledger reuses it
+/// verbatim rather than growing a second target parser, because it needs the
+/// same three guarantees: an explicit command-line `--exec-backend native`
+/// (under the VMM backend `native-syscall-service-*` never fires, so the whole
+/// census would be `carrick-only`), a digest-pinned image, and a stable argv
+/// digest — the two determinants a before/after comparison must refuse to
+/// cross. The type keeps its original name for git-blame continuity; the
+/// `label` argument is what keeps its errors truthful for both callers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NativeShapeTarget {
     pub(crate) image: String,
@@ -35,9 +47,9 @@ pub(crate) struct NativeShapeTarget {
 }
 
 impl NativeShapeTarget {
-    pub(crate) fn parse(command: &[String]) -> Result<Self> {
+    pub(crate) fn parse(label: &str, command: &[String]) -> Result<Self> {
         if command.is_empty() {
-            bail!("native-shape target command is empty");
+            bail!("{label} target command is empty");
         }
 
         let mut argv = Vec::<OsString>::with_capacity(command.len() + 1);
@@ -45,18 +57,19 @@ impl NativeShapeTarget {
         argv.extend(command.iter().map(OsString::from));
         let matches = Cli::command()
             .try_get_matches_from(argv)
-            .context("parse native-shape target command")?;
+            .with_context(|| format!("parse {label} target command"))?;
         let Some((subcommand, run_matches)) = matches.subcommand() else {
-            bail!("native-shape target must be a run subcommand");
+            bail!("{label} target must be a run subcommand");
         };
         if subcommand != "run" {
-            bail!("native-shape target must be a run subcommand");
+            bail!("{label} target must be a run subcommand");
         }
         if run_matches.value_source("exec_backend") != Some(ValueSource::CommandLine) {
-            bail!("native-shape target requires explicit command-line --exec-backend native");
+            bail!("{label} target requires explicit command-line --exec-backend native");
         }
 
-        let parsed = Cli::from_arg_matches(&matches).context("decode native-shape target")?;
+        let parsed =
+            Cli::from_arg_matches(&matches).with_context(|| format!("decode {label} target"))?;
         let Commands::Run {
             image,
             exec_backend,
@@ -64,22 +77,24 @@ impl NativeShapeTarget {
             ..
         } = parsed.command
         else {
-            bail!("native-shape target must be a run subcommand");
+            bail!("{label} target must be a run subcommand");
         };
         if exec_backend != ExecBackendRequest::Native {
-            bail!("native-shape target requires explicit command-line --exec-backend native");
+            bail!("{label} target requires explicit command-line --exec-backend native");
         }
         if target_command.is_empty() {
-            bail!("native-shape run target command is empty");
+            bail!("{label} run target command is empty");
         }
 
         if let Some((_, digest)) = image.rsplit_once('@') {
-            validate_image_digest(digest).context("validate native-shape image digest")?;
+            validate_image_digest(digest)
+                .with_context(|| format!("validate {label} image digest"))?;
         }
-        let reference = ImageReference::parse(&image).context("parse native-shape image")?;
+        let reference =
+            ImageReference::parse(&image).with_context(|| format!("parse {label} image"))?;
         let image_digest = reference
             .digest()
-            .context("native-shape image must be digest-pinned")?
+            .with_context(|| format!("{label} image must be digest-pinned"))?
             .to_owned();
         validate_image_digest(&image_digest)?;
         let target = Self {
@@ -94,12 +109,12 @@ impl NativeShapeTarget {
 
     fn validate(&self) -> Result<()> {
         validate_image_digest(&self.image_digest)?;
-        let image = ImageReference::parse(&self.image).context("validate native-shape image")?;
+        let image = ImageReference::parse(&self.image).context("validate native run image")?;
         if image.canonical() != self.image || image.digest() != Some(self.image_digest.as_str()) {
-            bail!("native-shape image identity is not canonical and digest-consistent");
+            bail!("native run image identity is not canonical and digest-consistent");
         }
         if self.argv.is_empty() || self.argv_sha256 != argv_sha256(&self.argv)? {
-            bail!("native-shape target argv identity is inconsistent");
+            bail!("native run target argv identity is inconsistent");
         }
         Ok(())
     }
@@ -528,7 +543,7 @@ impl NativeShapeAuthority {
         if self.host_arch != "aarch64" {
             bail!("native-shape authority host_arch must be aarch64");
         }
-        let target = NativeShapeTarget::parse(&self.target_argv)
+        let target = NativeShapeTarget::parse("native-shape", &self.target_argv)
             .context("native-shape authority target argv is invalid")?;
         if self.target_argv_sha256 != target.argv_sha256 {
             bail!("authority target_argv_sha256 does not match target_argv");
@@ -2455,7 +2470,7 @@ mod tests {
             "docker.io/library/ubuntu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             "/bin/true".to_owned(),
         ];
-        let accepted = NativeShapeTarget::parse(&accepted_argv).unwrap();
+        let accepted = NativeShapeTarget::parse("native-shape", &accepted_argv).unwrap();
         assert_eq!(
             accepted.image,
             "docker.io/library/ubuntu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -2473,7 +2488,7 @@ mod tests {
             "/bin/true".to_owned(),
         ];
         assert!(
-            NativeShapeTarget::parse(&defaulted)
+            NativeShapeTarget::parse("native-shape", &defaulted)
                 .unwrap_err()
                 .to_string()
                 .contains("explicit")
@@ -2516,7 +2531,7 @@ mod tests {
             Vec::new(),
         ] {
             assert!(
-                NativeShapeTarget::parse(&argv).is_err(),
+                NativeShapeTarget::parse("native-shape", &argv).is_err(),
                 "accepted {argv:?}"
             );
         }

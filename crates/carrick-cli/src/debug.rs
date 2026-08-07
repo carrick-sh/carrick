@@ -72,6 +72,9 @@ pub(crate) fn run_debug(command: DebugCommand) -> anyhow::Result<()> {
         DebugCommand::AmplificationLedger { trace, output } => {
             crate::debug_amplification::run_amplification_ledger(&trace, output.as_deref())?;
         }
+        DebugCommand::AmplificationCompare { a, b, output } => {
+            crate::debug_amplification::run_amplification_compare(&a, &b, output.as_deref())?;
+        }
         DebugCommand::ExecStampCensus { input, workload_ns } => {
             crate::debug_exec_stamps::run_exec_stamp_census(&input, workload_ns)?;
         }

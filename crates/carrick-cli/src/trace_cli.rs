@@ -63,6 +63,10 @@ pub(crate) struct TraceSudoInvocation<'a> {
     pub(crate) profile_bound_seconds: Option<u64>,
     pub(crate) trace_out: Option<&'a Path>,
     pub(crate) native_shape_snapshots: Option<&'a Path>,
+    /// The quiet-host preflight. Same silent-drop class as the capture bound
+    /// and the global `--store`: dropping it does not fail, it just measures a
+    /// host nobody screened.
+    pub(crate) preflight_quiet_host: bool,
     pub(crate) uid: u32,
     pub(crate) gid: u32,
     pub(crate) groups: &'a [u32],
@@ -104,6 +108,9 @@ pub(crate) fn trace_sudo_argv(invocation: &TraceSudoInvocation<'_>) -> Vec<OsStr
     if let Some(path) = invocation.native_shape_snapshots {
         argv.push(OsString::from("--native-shape-snapshots"));
         argv.push(path.as_os_str().to_owned());
+    }
+    if invocation.preflight_quiet_host {
+        argv.push(OsString::from("--preflight-quiet-host"));
     }
     argv.push(OsString::from("--trace-uid"));
     argv.push(OsString::from(invocation.uid.to_string()));
@@ -279,6 +286,7 @@ mod tests {
             profile_bound_seconds: None,
             trace_out: Some(Path::new("/tmp/raw.trace")),
             native_shape_snapshots: None,
+            preflight_quiet_host: false,
             uid: 501,
             gid: 20,
             groups: &[20, 12],
@@ -320,6 +328,10 @@ mod tests {
     /// capture runs with a different bound than the operator asked for --
     /// which is exactly how the first live smoke of this parameter reported
     /// `bound_limit_s=180` after being told 20.
+    ///
+    /// `--preflight-quiet-host` is pinned here for the same reason: dropping it
+    /// across the sudo hop does not fail, it silently measures a host nobody
+    /// screened and publishes a header with no receipt in it.
     #[test]
     fn profile_capture_bound_survives_sudo_argv_reconstruction() {
         let command = ["run-elf".to_owned(), "/tmp/probe".to_owned()];
@@ -333,6 +345,7 @@ mod tests {
             profile_bound_seconds: Some(900),
             trace_out: Some(Path::new("/tmp/raw.trace")),
             native_shape_snapshots: None,
+            preflight_quiet_host: true,
             uid: 501,
             gid: 20,
             groups: &[],
@@ -354,6 +367,7 @@ mod tests {
                 "900",
                 "--trace-out",
                 "/tmp/raw.trace",
+                "--preflight-quiet-host",
                 "--trace-uid",
                 "501",
                 "--trace-gid",
@@ -382,6 +396,7 @@ mod tests {
             profile_bound_seconds: None,
             trace_out: None,
             native_shape_snapshots: None,
+            preflight_quiet_host: false,
             uid: 501,
             gid: 20,
             groups: &[],
@@ -423,6 +438,7 @@ mod tests {
             profile_bound_seconds: None,
             trace_out: Some(Path::new("/tmp/native-fault.raw")),
             native_shape_snapshots: None,
+            preflight_quiet_host: false,
             uid: 501,
             gid: 20,
             groups: &[],
@@ -469,6 +485,7 @@ mod tests {
             summary_jsonl: Some(Path::new("/tmp/native-shape.jsonl")),
             profile_bound_seconds: None,
             trace_out: Some(Path::new("/tmp/native-shape.raw")),
+            preflight_quiet_host: false,
             native_shape_snapshots: Some(Path::new("/tmp/native-shape.snapshots")),
             uid: 501,
             gid: 20,

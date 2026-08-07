@@ -1382,6 +1382,9 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             DebugCommand::AmplificationLedger { trace, output } => {
                 crate::debug_amplification::run_amplification_ledger(&trace, output.as_deref())?
             }
+            DebugCommand::AmplificationCompare { a, b, output } => {
+                crate::debug_amplification::run_amplification_compare(&a, &b, output.as_deref())?
+            }
             DebugCommand::ExecStampCensus { input, workload_ns } => {
                 crate::debug_exec_stamps::run_exec_stamp_census(&input, workload_ns)?
             }
@@ -1430,6 +1433,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             summary_jsonl,
             profile_bound_seconds,
             native_shape_snapshots,
+            preflight_quiet_host,
             trace_out,
             command,
             forward_env,
@@ -1456,11 +1460,21 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     native_shape_snapshots.as_deref(),
                     &current_directory,
                 )?;
+                // A receipt with nowhere to live would be a silent no-op, and
+                // this whole flag exists so that a quiet host is a RECORDED
+                // fact rather than an operator's memory of one.
+                if preflight_quiet_host
+                    && profile != Some(crate::trace_profile::TraceProfileKind::NativeAmplification)
+                {
+                    bail!(
+                        "--preflight-quiet-host is carried in the `native-amplification` stream header; no other profile header has a field for the receipt"
+                    );
+                }
                 #[cfg(target_os = "macos")]
                 let (native_shape_target, native_shape_run_id) =
                     if profile == Some(crate::trace_profile::TraceProfileKind::NativeShape) {
                         validate_native_shape_host(std::env::consts::OS, std::env::consts::ARCH)?;
-                        let target = NativeShapeTarget::parse(&command)?;
+                        let target = NativeShapeTarget::parse("native-shape", &command)?;
                         let run_id = establish_native_shape_run_id()?;
                         let snapshot_directory =
                             native_shape_snapshots.as_deref().ok_or_else(|| {
@@ -1531,6 +1545,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         profile_bound_seconds,
                         trace_out: trace_out.as_deref(),
                         native_shape_snapshots: native_shape_snapshots.as_deref(),
+                        preflight_quiet_host,
                         uid: unsafe { libc::getuid() },
                         gid: unsafe { libc::getgid() },
                         groups: &groups,
@@ -1584,6 +1599,34 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 let output_path = trace_out
                     .as_deref()
                     .or_else(|| internal_trace.as_ref().map(tempfile::NamedTempFile::path));
+                // The amplification ledger's fixture identity, parsed at
+                // LAUNCH. Two silent failures become fast ones: a VMM-backend
+                // target, whose `native-syscall-service-*` probes never fire
+                // and would surface as a wrong-backend refusal only after a
+                // whole build, and a tag-pinned image, which no comparison can
+                // hold fixed.
+                #[cfg(target_os = "macos")]
+                let amplification_target = if profile
+                    == Some(crate::trace_profile::TraceProfileKind::NativeAmplification)
+                {
+                    Some(NativeShapeTarget::parse("native-amplification", &command)?)
+                } else {
+                    None
+                };
+                // Settle and refuse BEFORE the launch qualification, which is
+                // itself a timed run: a dirty host must abort rather than
+                // produce a number.
+                #[cfg(target_os = "macos")]
+                let quiet_host_receipt = if preflight_quiet_host {
+                    let receipt = crate::quiet_host::preflight_quiet_host()?;
+                    eprintln!(
+                        "carrick trace: quiet-host preflight accepted (settled in {}s, one-minute load {} milli)",
+                        receipt.settle_s, receipt.loadavg1_milli
+                    );
+                    Some(receipt)
+                } else {
+                    None
+                };
                 #[cfg(target_os = "macos")]
                 let native_profile_qualification =
                     if profile.is_some_and(uses_native_launch_qualification) {
@@ -1605,9 +1648,16 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         })?;
                         match requested {
                             crate::trace_profile::TraceProfileKind::NativeAmplification => {
+                                let target = amplification_target.clone().ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "native-amplification target identity is absent"
+                                    )
+                                })?;
                                 let rendered = qualification
                                     .render_native_amplification_profile_program(
                                         profile_template,
+                                        target,
+                                        quiet_host_receipt.clone(),
                                     )?;
                                 (Some(rendered.program), Some(rendered.authority), None)
                             }
@@ -1787,6 +1837,15 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                                     "the amplification ledger is written by `carrick debug amplification-ledger` from the raw stream; capture it with --trace-out"
                                 );
                             }
+                            // Written BEFORE validation and whatever the
+                            // counters say: a capture that lost events must
+                            // leave behind a raw file that names its own loss,
+                            // or the same file reads as clean the next time
+                            // anyone runs the analyzer over it.
+                            crate::amplification_profile::write_consumer_drops_record(
+                                raw_path,
+                                capture_status,
+                            )?;
                             let capture = crate::amplification_profile::validate_amp1_path(
                                 raw_path,
                                 capture_status,
@@ -1907,6 +1966,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     profile,
                     summary_jsonl,
                     native_shape_snapshots,
+                    preflight_quiet_host,
                     trace_out,
                     command,
                     forward_env,

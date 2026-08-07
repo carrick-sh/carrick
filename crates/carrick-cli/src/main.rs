@@ -159,6 +159,9 @@ mod native_shape_profile;
 // `TraceProfileKind` argument vocabulary.
 #[cfg_attr(not(any(target_os = "macos", target_os = "freebsd")), allow(dead_code))]
 mod perf_stats;
+// The quiet-host preflight's RECEIPT is read back by the amplification reader
+// on every platform; only the sampling half is Darwin-capture-only.
+mod quiet_host;
 mod runtime_util;
 mod serve;
 mod supervisor_perf;

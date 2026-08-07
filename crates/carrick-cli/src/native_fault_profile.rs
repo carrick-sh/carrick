@@ -982,7 +982,7 @@ impl NativeFaultSummary {
             File::open(path)
                 .with_context(|| format!("open native-fault stream {}", path.display()))?,
         );
-        let expected_header = authority.header_record();
+        let expected_header = authority.header_record()?;
         let mut validator = NativeFaultValidator::default();
         for (index, line) in reader.lines().enumerate() {
             let line_number = index + 1;
@@ -2433,6 +2433,8 @@ mod tests {
                     "process".to_owned(),
                 ),
             ],
+            None,
+            None,
         )
         .expect("fixture authority")
     }
@@ -2474,7 +2476,7 @@ mod tests {
 \nNFAULT2|memory-count|kind=intent-entries|count=1\
 \nNFAULT2|memory-count|kind=intent-returns|count=1\
 \nNFAULT2|complete|profile=native-fault|bounded=0|timed_out=0|target_exit=1|target_exit_reason=1|identity_violations=0|lifecycle_violations=0|catalog_violations=0|probe_errors=0|live_at_end=0|pending_forks=0|elapsed_ns=9000000\n",
-            authority().header_record()
+            authority().header_record().unwrap()
         )
     }
 
@@ -2615,7 +2617,10 @@ mod tests {
     #[test]
     fn rejects_duplicate_header_and_completion() {
         let raw = fixture();
-        assert_rejected(format!("{}\n{raw}", authority().header_record()), "header");
+        assert_rejected(
+            format!("{}\n{raw}", authority().header_record().unwrap()),
+            "header",
+        );
         let completion = raw
             .lines()
             .find(|line| line.starts_with("NFAULT2|complete|"))

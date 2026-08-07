@@ -352,6 +352,20 @@ pub(crate) struct V2ProfileAuthority {
     birth_qualification_sha256: String,
     terminal_qualification_sha256: String,
     terminal_qualifications: BTreeSet<(String, String, String)>,
+    /// The digest-pinned native run target, REQUIRED for `native-amplification`
+    /// and rejected for the other two.
+    ///
+    /// The amplification ledger is the only profile here whose whole purpose is
+    /// A/B comparison, so its capture has to name the fixture it measured or a
+    /// comparator can only pretend to refuse a fixture crossing. Parsing it at
+    /// LAUNCH (rather than recording it afterwards) also turns two silent
+    /// failures into fast ones: a VMM-backend target, whose
+    /// `native-syscall-service-*` probes never fire and would produce a
+    /// wrong-backend refusal only after a full build, and a tag-pinned image,
+    /// which cannot be compared across runs at all.
+    amplification_target: Option<crate::native_shape_profile::NativeShapeTarget>,
+    /// The quiet-host preflight receipt, when the capture demanded one.
+    preflight: Option<crate::quiet_host::QuietHostReceipt>,
 }
 
 impl V2ProfileAuthority {
@@ -370,9 +384,12 @@ impl V2ProfileAuthority {
             birth_qualification_sha256,
             terminal_qualification_sha256,
             terminal_qualifications,
+            None,
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_for_profile(
         profile: TraceProfileKind,
         os_build: &str,
@@ -380,6 +397,8 @@ impl V2ProfileAuthority {
         birth_qualification_sha256: &str,
         terminal_qualification_sha256: &str,
         terminal_qualifications: impl IntoIterator<Item = (String, String, String)>,
+        amplification_target: Option<crate::native_shape_profile::NativeShapeTarget>,
+        preflight: Option<crate::quiet_host::QuietHostReceipt>,
     ) -> Result<Self> {
         if !matches!(
             profile,
@@ -388,6 +407,23 @@ impl V2ProfileAuthority {
                 | TraceProfileKind::NativeWall
         ) {
             bail!("profile {:?} does not use native launch authority", profile);
+        }
+        match (profile, amplification_target.as_ref()) {
+            (TraceProfileKind::NativeAmplification, None) => bail!(
+                "the amplification ledger's launch authority requires a digest-pinned native run target; without it a comparison cannot refuse to cross a fixture"
+            ),
+            (TraceProfileKind::NativeAmplification, Some(_)) => {}
+            (_, Some(_)) => bail!(
+                "profile {:?} does not carry a run target in its header",
+                profile
+            ),
+            (_, None) => {}
+        }
+        if preflight.is_some() && profile != TraceProfileKind::NativeAmplification {
+            bail!(
+                "profile {:?} has no header field for a quiet-host preflight receipt",
+                profile
+            );
         }
         validate_percent_token(os_build, "authority os_build")?;
         for (value, field) in [
@@ -428,6 +464,8 @@ impl V2ProfileAuthority {
             birth_qualification_sha256: birth_qualification_sha256.to_owned(),
             terminal_qualification_sha256: terminal_qualification_sha256.to_owned(),
             terminal_qualifications: terminals,
+            amplification_target,
+            preflight,
         })
     }
 
@@ -447,8 +485,15 @@ impl V2ProfileAuthority {
         &self.terminal_qualification_sha256
     }
 
-    pub(crate) fn header_record(&self) -> String {
-        match self.profile {
+    /// The header record the capture prints as its first line.
+    ///
+    /// `Result`, not `String`, because the AMP1 arm renders fields that only
+    /// exist when the authority carries a run target. The constructor already
+    /// refuses that combination, so the failure is unreachable — and stating it
+    /// as an error rather than an `unwrap` is what keeps it unreachable under
+    /// the workspace's no-panic gate.
+    pub(crate) fn header_record(&self) -> Result<String> {
+        Ok(match self.profile {
             TraceProfileKind::NativeWall => format!(
                 "DSRPROF2|header|profile=native-wall|raw_schema={V2_RAW_SCHEMA}|os_build={}|program_sha256={}|birth_qualification_sha256={}|terminal_qualification_sha256={}|wall_hz=197|cpu_hz=499",
                 self.os_build,
@@ -466,22 +511,61 @@ impl V2ProfileAuthority {
             // The declared buffer sizes travel in the header because they are
             // capture determinants: a ledger taken at different aggregation or
             // dynamic-variable headroom is a different instrument, and the
-            // comparator refuses to cross them. Same for `joins=`.
-            TraceProfileKind::NativeAmplification => format!(
-                "AMP1|header|profile=native-amplification|raw_schema={AMPLIFICATION_RAW_SCHEMA}|os_build={}|program_sha256={}|birth_qualification_sha256={}|terminal_qualification_sha256={}|joins=syscall,mach,fault|aggsize=64m|dynvarsize=256m|bufsize=32m",
-                self.os_build,
-                self.program_sha256(),
-                self.birth_qualification_sha256,
-                self.terminal_qualification_sha256,
-            ),
+            // comparator refuses to cross them. Same for `joins=`, the image
+            // digest and the target argv digest — and the quiet-host receipt,
+            // which is the only field here that describes the machine rather
+            // than the instrument.
+            TraceProfileKind::NativeAmplification => {
+                let Some(target) = self.amplification_target.as_ref() else {
+                    bail!(
+                        "the amplification header names a run target the authority does not carry"
+                    );
+                };
+                validate_header_token(&target.image, "authority image")?;
+                validate_sha256(&target.argv_sha256, "authority target_argv_sha256")?;
+                format!(
+                    "AMP1|header|profile=native-amplification|raw_schema={AMPLIFICATION_RAW_SCHEMA}|os_build={}|program_sha256={}|birth_qualification_sha256={}|terminal_qualification_sha256={}|joins=syscall,mach,fault|aggsize=64m|dynvarsize=256m|bufsize=32m|image={}|target_argv_sha256={}{}",
+                    self.os_build,
+                    self.program_sha256(),
+                    self.birth_qualification_sha256,
+                    self.terminal_qualification_sha256,
+                    target.image,
+                    target.argv_sha256,
+                    self.preflight
+                        .as_ref()
+                        .map(crate::quiet_host::QuietHostReceipt::header_fields)
+                        .unwrap_or_default(),
+                )
+            }
             TraceProfileKind::Dsr
             | TraceProfileKind::DsrFork
             | TraceProfileKind::DsrIndirect
             | TraceProfileKind::NativeShape => {
-                unreachable!("non-native profile cannot construct V2ProfileAuthority")
+                bail!("non-native profile cannot construct V2ProfileAuthority")
             }
-        }
+        })
     }
+}
+
+/// A header field value that will be printed from a D `printf` and split on
+/// `|` by every reader.
+///
+/// Looser than [`validate_percent_token`], which rejects `/` and `@` and so
+/// cannot carry an image reference, and tighter than "any string": a `%` would
+/// be a format directive in the D program the header is substituted into, a
+/// `"` or `\` would end or escape the string literal, and a `|` or whitespace
+/// would silently split the record into fields nobody declared.
+fn validate_header_token(value: &str, field: &str) -> Result<()> {
+    if value.is_empty() {
+        bail!("{field} token must not be empty");
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'|' | b'%' | b'"' | b'\\'))
+    {
+        bail!("{field} contains a byte that cannot survive a D printf or a `|`-delimited record");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default)]

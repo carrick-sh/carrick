@@ -23,8 +23,9 @@
 //!   reads as *lower* amplification and would be banked as good news. Both
 //!   halves are enforced: the program-owned counters in `section=drops`, and
 //!   libdtrace's own counters (principal / aggregation / dynamic / rinse /
-//!   dirty), which are not readable from D and arrive through the run report. A
-//!   MISSING drop section is itself a refusal — absent is not zero.
+//!   dirty), which are not readable from D and are therefore written INTO the
+//!   stream by the capture command as an `AMP1|consumer-drops|…` record. A
+//!   MISSING record of either kind is itself a refusal — absent is not zero.
 //!
 //! Deliberately **not** here, and left for the typed ledger analyzer that
 //! consumes this type: cross-section closure arithmetic (per-op sums against
@@ -34,12 +35,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use carrick_runtime::linux_abi::CanonicalNr;
 use sha2::{Digest, Sha256};
 
+use crate::quiet_host::QuietHostReceipt;
 use crate::trace_profile::{AMPLIFICATION_RAW_SCHEMA, ProfileCaptureStatus};
 
 const AMP1_PREFIX: &str = "AMP1";
@@ -104,6 +107,30 @@ const REQUIRED_DROP_SOURCES: [&str; 3] = [
     "service-end-unmatched",
 ];
 
+/// libdtrace's own consumer-side counters, in the fixed order the in-band
+/// record writes them.
+///
+/// `interrupted` is carried alongside the five drop counters and refused the
+/// same way: an interrupted consumer stopped reading a buffer that was still
+/// filling, which is a drop by another name.
+pub(crate) const CONSUMER_DROP_COUNTERS: [&str; 7] = [
+    "principal",
+    "aggregation",
+    "dynamic",
+    "dynamic_rinse",
+    "dynamic_dirty",
+    "other",
+    "interrupted",
+];
+
+/// The bisection hatch for the in-band record, per the opt-out rule.
+///
+/// **Setting it to `0` does not produce a usable capture** — the reader refuses
+/// a stream with no record, because absent is not zero. That is deliberate: the
+/// hatch exists to bisect whether writing the record itself perturbed a
+/// capture, never to obtain a ledger without one.
+const CONSUMER_DROPS_HATCH: &str = "CARRICK_AMP1_CONSUMER_DROPS";
+
 /// A guest-op key as it appears on the wire.
 ///
 /// The D program cannot name a Linux syscall, so it emits an ENCODED slot and
@@ -151,6 +178,20 @@ pub(crate) struct Amp1Capture {
     pub(crate) birth_qualification_sha256: String,
     pub(crate) terminal_qualification_sha256: String,
     pub(crate) joins: String,
+    /// The declared `aggsize` / `dynvarsize` / `bufsize`, carried rather than
+    /// merely checked: a capture taken at different headroom is a different
+    /// instrument, and a ledger that does not record the headroom cannot be
+    /// refused a comparison against one that ran at another.
+    pub(crate) declared_buffers: BTreeMap<String, String>,
+    /// The canonical, digest-pinned image the capture ran.
+    pub(crate) image: String,
+    /// SHA-256 of the traced `run` argv — the fixture identity.
+    pub(crate) target_argv_sha256: String,
+    /// The quiet-host preflight receipt, when the capture demanded one.
+    pub(crate) preflight: Option<QuietHostReceipt>,
+    /// libdtrace's consumer-side counters, written into the stream by the
+    /// capture command. Every one is zero on an admissible capture.
+    pub(crate) consumer_drops: BTreeMap<String, u64>,
     pub(crate) terminal_calls: BTreeSet<(String, String, String)>,
     pub(crate) totals: BTreeMap<String, u64>,
     pub(crate) fault_totals: BTreeMap<String, u64>,
@@ -188,22 +229,63 @@ pub(crate) fn is_amp1_stream(contents: &str) -> bool {
         .is_some_and(|line| line.starts_with("AMP1|header|"))
 }
 
+/// Render the in-band consumer-drop record.
+///
+/// libdtrace's principal / aggregation / dynamic / rinse / dirty counters are
+/// **not readable from D** (the D header's fact 10) — they arrive through the
+/// consumer's drop handler. Writing them into the stream is what makes an
+/// archived raw carry its own drop verdict instead of leaving it in a live
+/// `DTraceRunReport` that nobody can consult again.
+pub(crate) fn consumer_drops_record(status: ProfileCaptureStatus) -> String {
+    format!(
+        "{AMP1_PREFIX}|consumer-drops|principal={}|aggregation={}|dynamic={}|dynamic_rinse={}|dynamic_dirty={}|other={}|interrupted={}",
+        status.principal_drops,
+        status.aggregation_drops,
+        status.dynamic_drops,
+        status.dynamic_rinse_drops,
+        status.dynamic_dirty_drops,
+        status.other_drops,
+        u64::from(status.interrupted),
+    )
+}
+
+/// Append the consumer-drop record to a finished capture.
+///
+/// Called BEFORE the stream is validated and regardless of what the counters
+/// say, which is the whole point: a capture that lost events leaves behind a
+/// raw file that names its own loss, so the same file cannot later be read as
+/// clean by an offline analyzer. The `=0` hatch skips the write for bisection
+/// and produces a stream the reader then refuses.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn write_consumer_drops_record(path: &Path, status: ProfileCaptureStatus) -> Result<()> {
+    if std::env::var(CONSUMER_DROPS_HATCH).as_deref() == Ok("0") {
+        eprintln!(
+            "carrick trace: {CONSUMER_DROPS_HATCH}=0 — the in-band consumer-drop record is being SKIPPED, so this capture cannot become a ledger"
+        );
+        return Ok(());
+    }
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open AMP1 stream {} to record drops", path.display()))?;
+    writeln!(file, "{}", consumer_drops_record(status))
+        .with_context(|| format!("record consumer drops into {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync AMP1 stream {}", path.display()))
+}
+
 /// Re-validate a stream that is being read back from disk, LONG after the
 /// capture that produced it.
 ///
 /// The distinction from [`validate_amp1_path`] is the one thing a caller must
 /// not get wrong, so it is a separate name rather than a defaulted argument.
-/// libdtrace's principal / aggregation / dynamic / rinse / dirty drop counters
-/// are not readable from D and are not in the stream (see the D header's fact
-/// 10): they exist only in the live `DTraceRunReport`, which is why
-/// `carrick trace --profile native-amplification` enforces them AT CAPTURE and
-/// exits non-zero on any nonzero counter. Passing a zeroed
-/// [`ProfileCaptureStatus`] here is therefore not an assertion that libdtrace
-/// dropped nothing — it is the neutral element for counters this file cannot
-/// carry, and the analyzer records where the check lives instead of implying it
-/// re-ran it. Everything the STREAM owns — truncation, the program digest, the
-/// program's own drop counters, the required sections, the guest denominator —
-/// is re-checked here in full.
+/// The [`ProfileCaptureStatus`] argument is the LIVE run report, which exists
+/// only inside the capturing process; passing a zeroed one here is not an
+/// assertion that libdtrace dropped nothing. That assertion now lives in the
+/// stream itself, as the `AMP1|consumer-drops|…` record every capture writes,
+/// and it is enforced identically on both paths. Everything else the stream
+/// owns — truncation, the program digest, the program's own drop counters, the
+/// required sections, the guest denominator — is re-checked here in full.
 pub(crate) fn validate_archived_amp1_path(path: &Path) -> Result<Amp1Capture> {
     validate_amp1_path(path, ProfileCaptureStatus::default())
 }
@@ -309,6 +391,7 @@ struct Amp1Reader {
     faults: BTreeMap<(GuestSlot, String), u64>,
     window_events: BTreeMap<String, u64>,
     drops: BTreeMap<String, u64>,
+    consumer_drops: Option<BTreeMap<String, u64>>,
 }
 
 struct HeaderRecord {
@@ -317,6 +400,10 @@ struct HeaderRecord {
     birth_qualification_sha256: String,
     terminal_qualification_sha256: String,
     joins: String,
+    declared_buffers: BTreeMap<String, String>,
+    image: String,
+    target_argv_sha256: String,
+    preflight: Option<QuietHostReceipt>,
 }
 
 struct CompleteRecord {
@@ -367,9 +454,35 @@ impl Amp1Reader {
             "terminal-call" => self.absorb_terminal_call(body),
             "window" => self.absorb_window_event(body),
             "drop" => self.absorb_drop(body),
+            "consumer-drops" => self.absorb_consumer_drops(body),
             "complete" => self.absorb_complete(body),
             _ => self.absorb_row(kind, body),
         }
+    }
+
+    /// The one record the D program cannot produce.
+    ///
+    /// It is written by the capture command after libdtrace finishes, so it
+    /// sits outside every section — deliberately, because it is not part of the
+    /// census the program printed and pretending otherwise would let a section
+    /// marker vouch for it.
+    fn absorb_consumer_drops(&mut self, body: &[&str]) -> Result<()> {
+        if self.consumer_drops.is_some() {
+            bail!("AMP1 stream carries a second consumer-drop record");
+        }
+        let fields = Fields::parse(body)?;
+        if fields.shape() != CONSUMER_DROP_COUNTERS {
+            bail!(
+                "AMP1 consumer-drop record declares counters {:?}, not {CONSUMER_DROP_COUNTERS:?}",
+                fields.shape()
+            );
+        }
+        let mut counters = BTreeMap::new();
+        for counter in CONSUMER_DROP_COUNTERS {
+            counters.insert(counter.to_owned(), fields.require_u64(counter)?);
+        }
+        self.consumer_drops = Some(counters);
+        Ok(())
     }
 
     fn absorb_section(&mut self, name: &str, body: &[&str]) -> Result<()> {
@@ -582,6 +695,7 @@ impl Amp1Reader {
         }
         // The buffer headroom is a capture determinant, so the header's copy
         // must agree with the pragmas the bundled program actually ran with.
+        let mut declared_buffers = BTreeMap::new();
         for (field, pragma) in DECLARED_BUFFERS {
             let declared = fields.require(field)?;
             let value = pragma
@@ -594,7 +708,51 @@ impl Amp1Reader {
             if !BUNDLED_NATIVE_AMPLIFICATION_D.contains(&format!("#pragma D option {pragma}")) {
                 bail!("the bundled AMP1 program no longer declares `{pragma}`");
             }
+            declared_buffers.insert(field.to_owned(), declared.to_owned());
         }
+        // The fixture identity. Digest-pinned by construction on the capture
+        // side (`NativeShapeTarget::parse`), re-checked here because a stream
+        // read back from an archive is data, not a promise.
+        let image = fields.require("image")?;
+        if !image.contains("@sha256:") {
+            bail!(
+                "AMP1 header names image {image:?}, which is not digest-pinned; two captures of a moving tag are not a before/after of anything"
+            );
+        }
+        let target_argv_sha256 = fields.require("target_argv_sha256")?;
+        if target_argv_sha256.len() != 64
+            || !target_argv_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            bail!(
+                "AMP1 header target argv digest {target_argv_sha256:?} is not a lowercase SHA-256"
+            );
+        }
+        // The quiet-host receipt is optional -- a capture may decline the
+        // preflight -- but it is all-or-nothing: a `preflight=` marker without
+        // its readings, or readings without the marker, is a corrupt receipt
+        // rather than a partial one.
+        let preflight = match fields.entries.iter().any(|(name, _)| *name == "preflight") {
+            true => {
+                let mode = fields.require("preflight")?;
+                if mode != "quiet-host" {
+                    bail!("AMP1 header declares an unknown preflight {mode:?}");
+                }
+                Some(QuietHostReceipt::from_header_fields(
+                    fields.require_u64("preflight_settle_s")?,
+                    fields.require_u64("preflight_loadavg1_milli")?,
+                )?)
+            }
+            false => {
+                for field in ["preflight_settle_s", "preflight_loadavg1_milli"] {
+                    if fields.entries.iter().any(|(name, _)| *name == field) {
+                        bail!("AMP1 header carries {field} without a preflight declaration");
+                    }
+                }
+                None
+            }
+        };
         self.header = Some(HeaderRecord {
             os_build: fields.require("os_build")?.to_owned(),
             program_sha256: program_sha256.to_owned(),
@@ -603,6 +761,10 @@ impl Amp1Reader {
                 .require("terminal_qualification_sha256")?
                 .to_owned(),
             joins: joins.to_owned(),
+            declared_buffers,
+            image: image.to_owned(),
+            target_argv_sha256: target_argv_sha256.to_owned(),
+            preflight,
         });
         Ok(())
     }
@@ -671,9 +833,29 @@ impl Amp1Reader {
                 ),
             }
         }
-        // libdtrace's own drop counters are not readable from D, so the run
-        // report is the only place they can be enforced.
+        // libdtrace's own drop counters are not readable from D, so the capture
+        // command writes them into the stream. Both the live report (first-hand
+        // at capture time, zeroed on an archived read) and the in-band record
+        // are enforced; the record is what makes an ARCHIVED raw carry its own
+        // verdict, and it is the sole detector of the one corruption closure
+        // cannot see -- a lost `service_slot` entry moves host work into
+        // `carrick-only` without changing a single sum, so its symptom is an
+        // amplification that IMPROVED.
         require_no_consumer_drops(capture_status)?;
+        let Some(consumer_drops) = self.consumer_drops.take() else {
+            bail!(
+                "AMP1 stream carries no `{AMP1_PREFIX}|consumer-drops|` record; absent is not zero. libdtrace's counters are not readable from D, so a raw left behind by a FAILED capture would otherwise read as clean -- and a dropped `service_slot` entry lowers a guest op's amplification without breaking closure. Re-capture with `carrick trace --profile {AMP1_PROFILE}`."
+            );
+        };
+        for counter in CONSUMER_DROP_COUNTERS {
+            match consumer_drops.get(counter).copied() {
+                None => bail!("AMP1 consumer-drop record is missing counter {counter:?}"),
+                Some(0) => {}
+                Some(count) => bail!(
+                    "AMP1 capture lost events to libdtrace: {counter}={count}. A consumer-side drop moves host work out of the guest op that caused it, which reads as LOWER amplification and must never be banked"
+                ),
+            }
+        }
 
         let guest_total = self.totals.get("guest-syscall-total").copied().unwrap_or(0);
         if guest_total == 0 {
@@ -727,6 +909,11 @@ impl Amp1Reader {
             birth_qualification_sha256: header.birth_qualification_sha256,
             terminal_qualification_sha256: header.terminal_qualification_sha256,
             joins: header.joins,
+            declared_buffers: header.declared_buffers,
+            image: header.image,
+            target_argv_sha256: header.target_argv_sha256,
+            preflight: header.preflight,
+            consumer_drops,
             terminal_calls: self.terminal_calls,
             totals: self.totals,
             fault_totals: self.fault_totals,
@@ -771,6 +958,37 @@ fn require_no_consumer_drops(status: ProfileCaptureStatus) -> Result<()> {
     Ok(())
 }
 
+/// The fixture's traced target. A real `carrick run` argv, parsed by the same
+/// code the capture path uses, so the image and argv digests in every fixture
+/// are COMPUTED rather than asserted — a literal would let the fixture drift
+/// away from what a capture actually renders without any test noticing.
+#[cfg(test)]
+pub(crate) fn fixture_target() -> crate::native_shape_profile::NativeShapeTarget {
+    crate::native_shape_profile::NativeShapeTarget::parse(
+        "native-amplification",
+        &[
+            "run".to_owned(),
+            "--exec-backend".to_owned(),
+            "native".to_owned(),
+            format!("docker.io/library/ubuntu@sha256:{}", "aa".repeat(32)),
+            "/bin/true".to_owned(),
+        ],
+    )
+    .expect("fixture amplification target")
+}
+
+/// The reader's fixture with every placeholder filled. Shared with the ledger
+/// analyzer's tests so the two halves cannot drift onto different notions of a
+/// valid stream.
+#[cfg(test)]
+pub(crate) fn fixture_stream() -> String {
+    let target = fixture_target();
+    include_str!("../tests/fixtures/amp1-valid.raw")
+        .replace("@PROGRAM_SHA256@", &amp1_program_sha256())
+        .replace("@IMAGE@", &target.image)
+        .replace("@TARGET_ARGV_SHA256@", &target.argv_sha256)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -803,13 +1021,10 @@ mod tests {
         );
     }
 
-    /// The fixture is the reader's, but the header the CAPTURE path renders is
-    /// the authority's. Nothing else in the tree closes that loop without a
-    /// live dtrace run, and a header/reader mismatch would otherwise surface
-    /// only on the first armed capture.
-    #[test]
-    fn the_capture_paths_own_header_is_accepted_by_this_reader() {
-        let authority = crate::trace_profile::V2ProfileAuthority::new_for_profile(
+    fn fixture_authority(
+        preflight: Option<QuietHostReceipt>,
+    ) -> crate::trace_profile::V2ProfileAuthority {
+        crate::trace_profile::V2ProfileAuthority::new_for_profile(
             crate::trace_profile::TraceProfileKind::NativeAmplification,
             "27A5295i",
             &amp1_program_sha256(),
@@ -827,23 +1042,36 @@ mod tests {
                     "thread".to_owned(),
                 ),
             ],
+            Some(fixture_target()),
+            preflight,
         )
-        .expect("native-amplification launch authority");
+        .expect("native-amplification launch authority")
+    }
 
-        let fixture = include_str!("../tests/fixtures/amp1-valid.raw")
-            .replace("@PROGRAM_SHA256@", &amp1_program_sha256());
+    /// The fixture is the reader's, but the header the CAPTURE path renders is
+    /// the authority's. Nothing else in the tree closes that loop without a
+    /// live dtrace run, and a header/reader mismatch would otherwise surface
+    /// only on the first armed capture.
+    #[test]
+    fn the_capture_paths_own_header_is_accepted_by_this_reader() {
+        let authority = fixture_authority(None);
+        let fixture = fixture_stream();
         let fixture_header = fixture.lines().next().expect("fixture header");
-        let rendered = authority.header_record();
+        let rendered = authority
+            .header_record()
+            .expect("render the amplification header");
         assert_eq!(
             rendered, fixture_header,
             "the rendered capture header and the reader's fixture must be the same record"
         );
 
-        let stream = fixture.replacen(fixture_header, &rendered, 1);
-        let capture = validate_amp1_lines(stream.lines(), ProfileCaptureStatus::default())
+        let capture = validate_amp1_lines(fixture.lines(), ProfileCaptureStatus::default())
             .expect("the capture path's own header must authenticate");
         assert_eq!(capture.os_build, "27A5295i");
         assert_eq!(capture.joins, DECLARED_JOINS);
+        assert_eq!(capture.image, fixture_target().image);
+        assert_eq!(capture.target_argv_sha256, fixture_target().argv_sha256);
+        assert_eq!(capture.preflight, None);
         assert_eq!(capture.terminal_calls.len(), 2);
         assert_eq!(
             capture.guest_syscalls[&GuestSlot::Guest(CanonicalNr(56))],
@@ -852,6 +1080,110 @@ mod tests {
         assert_eq!(
             capture.host_syscalls[&(GuestSlot::CarrickOnly, "kdebug_trace64".to_owned())],
             5
+        );
+    }
+
+    /// The quiet-host receipt is optional, and when present it survives the
+    /// same round trip: rendered by the capture, read back by the analyzer.
+    #[test]
+    fn a_quiet_host_receipt_round_trips_through_the_header() {
+        let receipt = QuietHostReceipt::from_header_fields(25, 610).expect("receipt");
+        let rendered = fixture_authority(Some(receipt.clone()))
+            .header_record()
+            .expect("render the amplification header with a preflight receipt");
+        let fixture = fixture_stream();
+        let fixture_header = fixture.lines().next().expect("fixture header");
+        assert_eq!(
+            rendered,
+            format!("{fixture_header}{}", receipt.header_fields())
+        );
+
+        let stream = fixture.replacen(fixture_header, &rendered, 1);
+        let capture = validate_amp1_lines(stream.lines(), ProfileCaptureStatus::default())
+            .expect("a preflighted capture must authenticate");
+        assert_eq!(capture.preflight, Some(receipt));
+
+        // Half a receipt is a corrupt one, not a partial one.
+        let orphaned = stream.replacen("|preflight=quiet-host", "", 1);
+        assert!(
+            format!(
+                "{:#}",
+                validate_amp1_lines(orphaned.lines(), ProfileCaptureStatus::default()).unwrap_err()
+            )
+            .contains("without a preflight declaration")
+        );
+    }
+
+    /// The in-band record is the sole detector of a corruption whose symptom is
+    /// an IMPROVEMENT, so both of its failure modes are refusals: a nonzero
+    /// counter, and no record at all.
+    #[test]
+    fn the_consumer_drop_record_is_required_and_must_be_zero() {
+        let fixture = fixture_stream();
+        let record = fixture
+            .lines()
+            .find(|line| line.starts_with("AMP1|consumer-drops|"))
+            .expect("the fixture carries an in-band consumer-drop record")
+            .to_owned();
+        assert_eq!(
+            record,
+            consumer_drops_record(ProfileCaptureStatus::default())
+        );
+
+        let without = fixture.replacen(&format!("{record}\n"), "", 1);
+        let message = format!(
+            "{:#}",
+            validate_amp1_lines(without.lines(), ProfileCaptureStatus::default())
+                .expect_err("absent is not zero")
+        );
+        assert!(message.contains("consumer-drops"), "{message}");
+
+        for counter in CONSUMER_DROP_COUNTERS {
+            let dropped = fixture.replacen(&format!("|{counter}=0"), &format!("|{counter}=9"), 1);
+            let message = format!(
+                "{:#}",
+                validate_amp1_lines(dropped.lines(), ProfileCaptureStatus::default())
+                    .expect_err("a nonzero consumer counter is a refusal")
+            );
+            assert!(
+                message.contains(counter) && message.contains("LOWER amplification"),
+                "unnamed {counter} refusal: {message}"
+            );
+        }
+
+        // A second record would let a clean one shadow a dirty one.
+        let doubled = fixture.replacen(&record, &format!("{record}\n{record}"), 1);
+        assert!(
+            format!(
+                "{:#}",
+                validate_amp1_lines(doubled.lines(), ProfileCaptureStatus::default()).unwrap_err()
+            )
+            .contains("second consumer-drop record")
+        );
+    }
+
+    /// A capture of a moving tag cannot be compared with anything, so the
+    /// fixture identity is refused at read time and not merely at launch.
+    #[test]
+    fn the_header_must_name_a_digest_pinned_image_and_an_argv_digest() {
+        let fixture = fixture_stream();
+        let tagged = fixture.replacen(&fixture_target().image, "localhost:5005/go:1.24", 1);
+        assert!(
+            format!(
+                "{:#}",
+                validate_amp1_lines(tagged.lines(), ProfileCaptureStatus::default()).unwrap_err()
+            )
+            .contains("digest-pinned")
+        );
+
+        let malformed = fixture.replacen(&fixture_target().argv_sha256, "not-a-digest", 1);
+        assert!(
+            format!(
+                "{:#}",
+                validate_amp1_lines(malformed.lines(), ProfileCaptureStatus::default())
+                    .unwrap_err()
+            )
+            .contains("target argv digest")
         );
     }
 

@@ -147,6 +147,8 @@ impl NativeProfileQualification {
         &self,
         profile: crate::trace_profile::TraceProfileKind,
         profile_program: &str,
+        amplification_target: Option<crate::native_shape_profile::NativeShapeTarget>,
+        preflight: Option<crate::quiet_host::QuietHostReceipt>,
     ) -> Result<crate::trace_profile::V2ProfileAuthority> {
         crate::trace_profile::V2ProfileAuthority::new_for_profile(
             profile,
@@ -161,6 +163,8 @@ impl NativeProfileQualification {
                     terminal.scope.as_str().to_owned(),
                 )
             }),
+            amplification_target,
+            preflight,
         )
     }
 
@@ -203,6 +207,8 @@ impl NativeProfileQualification {
     pub(crate) fn render_native_amplification_profile_program(
         &self,
         profile_template: &str,
+        target: crate::native_shape_profile::NativeShapeTarget,
+        preflight: Option<crate::quiet_host::QuietHostReceipt>,
     ) -> Result<RenderedNativeProfileProgram> {
         for (placeholder, label) in [
             (AMP1_HEADER_PLACEHOLDER, "header"),
@@ -220,8 +226,10 @@ impl NativeProfileQualification {
         let authority = self.profile_authority(
             crate::trace_profile::TraceProfileKind::NativeAmplification,
             profile_template,
+            Some(target),
+            preflight,
         )?;
-        let header_action = format!("printf(\"{}\\n\");", authority.header_record());
+        let header_action = format!("printf(\"{}\\n\");", authority.header_record()?);
         let terminal_actions = self
             .terminals
             .iter()
@@ -324,8 +332,8 @@ impl NativeProfileQualification {
         }
         // The authority names the immutable bundled template. Hashing the
         // receipt-substituted program would make the header self-referential.
-        let authority = self.profile_authority(profile, profile_template)?;
-        let header_action = format!("printf(\"{}\\n\");", authority.header_record());
+        let authority = self.profile_authority(profile, profile_template, None, None)?;
+        let header_action = format!("printf(\"{}\\n\");", authority.header_record()?);
         let terminal_actions = self
             .terminals
             .iter()
@@ -1015,8 +1023,8 @@ mod tests {
         assert_eq!(first_rendered.authority.program_sha256(), TEMPLATE_SHA256);
         assert_eq!(second_rendered.authority.program_sha256(), TEMPLATE_SHA256);
         assert_ne!(
-            first_rendered.authority.header_record(),
-            second_rendered.authority.header_record()
+            first_rendered.authority.header_record().unwrap(),
+            second_rendered.authority.header_record().unwrap()
         );
         assert_eq!(
             first_rendered.program,
@@ -1028,7 +1036,7 @@ mod tests {
                     "\tterminal_scope[\"syscall\", \"exit\"] = 2;\n",
                     "}}\n",
                 ),
-                first_rendered.authority.header_record()
+                first_rendered.authority.header_record().unwrap()
             )
         );
 
@@ -1123,7 +1131,8 @@ mod tests {
             "docker.io/library/ubuntu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             "/bin/true".to_owned(),
         ];
-        let target = crate::native_shape_profile::NativeShapeTarget::parse(&argv).unwrap();
+        let target =
+            crate::native_shape_profile::NativeShapeTarget::parse("native-shape", &argv).unwrap();
         let authority = crate::native_shape_profile::NativeShapeAuthority::new(
             &identity,
             &target,
