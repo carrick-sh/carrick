@@ -2692,44 +2692,53 @@ impl SyscallDispatcher {
             // Move-3 E1, phase 2: replace the arena backing with the host file
             // mapping now that every fallible pre-step has passed. On backend
             // refusal (alignment, ownership, may-execute, linux4k, host mmap
-            // failure) fall back to the eager materialization HERE —
-            // `snapshot_private_mmap_file` is the same load the aperture path
-            // uses. The fallback deliberately does NOT adopt the snapshot's
-            // private BUS offset: the legacy arena contract stays untouched on
-            // every ineligible shape (the VMM lanes share this path), and only
-            // a LOWERED mapping publishes the beyond-EOF BUS_ADRERR tail.
+            // failure) — or an unstattable fd — fall back to the legacy eager
+            // materialization INLINE, bit-compatible with the pre-E1 arena
+            // path: a zeroed buffer plus a best-effort `pread` whose failure
+            // leaves zeros. The fallback must not introduce ANY new errno
+            // here: by this point the address/scrub steps have already run, so
+            // a fresh failure would break mmap's failure atomicity exactly
+            // where the eager path never failed (it read best-effort and
+            // succeeded). It also keeps the legacy arena contract — no
+            // private BUS tail on ineligible shapes (the VMM lanes share this
+            // path); only a LOWERED mapping publishes beyond-EOF BUS_ADRERR.
             let mut bytes = bytes;
             let mut lowered_file_backed = false;
             if lowering_candidate {
-                if let Some(open_file) = this.open_file(fd.0) {
-                    let open = open_file.description.read();
-                    if let OpenDescription::HostFile { host_fd, .. } = &*open
-                        && let Some(file_len) = host_fd_file_len(host_fd.raw())
-                    {
-                        // SAFETY: the description read guard (`open`) keeps
-                        // the owning `HostFdRef` alive across the borrow.
-                        let borrowed =
-                            unsafe { std::os::fd::BorrowedFd::borrow_raw(host_fd.raw()) };
-                        if matches!(
-                            memory.map_private_file_backed(
-                                address,
-                                length_usize,
-                                borrowed,
-                                offset
-                            ),
-                            Ok(true)
-                        ) {
-                            lowered_file_backed = true;
-                            bus_fault_offset =
-                                shared_file_bus_offset(file_len, offset, length, page_size);
-                        }
+                let Some(open_file) = this.open_file(fd.0) else {
+                    // The description vanished mid-dispatch; the eager path's
+                    // own EBADF position for the same state.
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                };
+                let open = open_file.description.read();
+                let OpenDescription::HostFile { host_fd, .. } = &*open else {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                };
+                if let Some(file_len) = host_fd_file_len(host_fd.raw()) {
+                    // SAFETY: the description read guard (`open`) keeps the
+                    // owning `HostFdRef` alive across the borrow.
+                    let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(host_fd.raw()) };
+                    if matches!(
+                        memory.map_private_file_backed(address, length_usize, borrowed, offset),
+                        Ok(true)
+                    ) {
+                        lowered_file_backed = true;
+                        bus_fault_offset =
+                            shared_file_bus_offset(file_len, offset, length, page_size);
                     }
                 }
                 if !lowered_file_backed {
-                    match this.snapshot_private_mmap_file(fd, offset, length_usize) {
-                        Ok(snapshot) => bytes = snapshot.bytes,
-                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                    }
+                    let mut fallback = vec![0; length_usize];
+                    let n = unsafe {
+                        libc::pread(
+                            host_fd.raw(),
+                            fallback.as_mut_ptr() as *mut _,
+                            length_usize,
+                            offset as libc::off_t,
+                        )
+                    };
+                    let _ = n;
+                    bytes = fallback;
                 }
             }
             // Stamp file content through the unchecked path: this is carrick
@@ -5425,6 +5434,78 @@ mod tests {
     }
 
     #[test]
+    fn mmap_private_hostfile_refusal_with_unstattable_fd_keeps_legacy_success() {
+        const SYS_MMAP: u64 = 222;
+        const PAGE_SIZE: u64 = 16 * 1024;
+
+        let dispatcher = native16k_dispatcher();
+        // A HostFile description whose backing host fd is already closed:
+        // fstat and pread both fail. The pre-E1 eager path SUCCEEDED here
+        // (best-effort pread, errors left the zeroed buffer), and mmap
+        // failure atomicity demands the candidate path not invent a new
+        // errno AFTER the address/scrub steps have run — so a refused
+        // candidate must reproduce the legacy zero-filled success exactly.
+        let dead = unsafe { libc::dup(0) };
+        assert!(dead >= 0);
+        assert_eq!(unsafe { libc::close(dead) }, 0);
+        dispatcher.io.open_files.write().insert(
+            34,
+            OpenFile::new(
+                std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::HostFile {
+                    base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
+                    host_fd: HostFdRef::new(dead),
+                    metadata: RootFsMetadata {
+                        path: std::path::PathBuf::from("/host-private-map-dead"),
+                        kind: RootFsEntryKind::File,
+                        mode: 0o644,
+                        size: 0,
+                    },
+                    writable: false,
+                })),
+                0,
+            ),
+        );
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1340));
+        let reporter = CompatReporter::default();
+        let mut memory =
+            FileBackedLoweringMemory::new(LINUX_MMAP_BASE, 4 * PAGE_SIZE as usize, false);
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    PAGE_SIZE,
+                    LINUX_PROT_READ,
+                    crate::linux_abi::LINUX_MAP_PRIVATE,
+                    34,
+                    0,
+                ]),
+            ),
+        );
+        let DispatchOutcome::Returned { value } = outcome else {
+            panic!("legacy contract: unreadable backing still maps zero-filled, got {outcome:?}");
+        };
+        let address = value as u64;
+        assert_eq!(
+            memory
+                .inner
+                .read_bytes_raw(address, 32)
+                .expect("mapped range readable"),
+            vec![0u8; 32],
+            "unreadable backing must surface as zeros, the pre-E1 contract"
+        );
+        assert!(
+            !dispatcher.mmap_fault_is_sigbus(address),
+            "no BUS tail may be published without a known file length"
+        );
+    }
+
+    #[test]
     fn mmap_shared_or_exec_private_is_never_offered_the_lowering() {
         const SYS_MMAP: u64 = 222;
         const PAGE_SIZE: u64 = 16 * 1024;
@@ -5468,6 +5549,67 @@ mod tests {
             memory.offers.borrow().is_empty(),
             "shared and exec-prot mappings must keep the snapshot path: {:?}",
             memory.offers.borrow()
+        );
+    }
+
+    /// Pin the Darwin primitive the E1 lowering's detachment claim rests on:
+    /// a `MAP_PRIVATE` file mapping keeps BOTH a COW'd (written) page and a
+    /// never-touched page readable, with map-time content, across a later
+    /// `ftruncate` of the backing file. Linux diverges on the untouched page
+    /// (SIGBUS), so the `mmapprivfile` conformance probe deliberately cannot
+    /// pin this clause — it is host behaviour and lives here. The faulting-
+    /// risk reads run in a forked child so a regression reports as a failed
+    /// assertion, not a dead test harness (`just test` runs this crate
+    /// single-threaded, the house fork-in-test precondition).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn darwin_private_file_mapping_detaches_from_truncate() {
+        use std::os::fd::AsRawFd;
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let file = tempfile::tempfile().expect("backing file");
+        let fd = file.as_raw_fd();
+        let content = vec![0xabu8; 2 * page];
+        assert_eq!(
+            unsafe { libc::pwrite(fd, content.as_ptr().cast(), content.len(), 0) },
+            content.len() as isize
+        );
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            let exit = unsafe {
+                let p = libc::mmap(
+                    core::ptr::null_mut(),
+                    2 * page,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE,
+                    fd,
+                    0,
+                );
+                if p == libc::MAP_FAILED {
+                    10
+                } else {
+                    let p = p.cast::<u8>();
+                    *p = 0x55; // COW page 0
+                    if libc::ftruncate(fd, 1) != 0 {
+                        11
+                    } else if *p != 0x55 {
+                        12 // written page must survive truncate
+                    } else if *p.add(page) != 0xab {
+                        13 // untouched page must stay readable with map-time content
+                    } else {
+                        0
+                    }
+                }
+            };
+            unsafe { libc::_exit(exit) };
+        }
+        assert!(child > 0, "fork failed");
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "Darwin private-file truncate detachment regressed: the E1 \
+             file-backed lowering relies on it (status {status:#x}); if this \
+             ever fires, the lowering must re-snapshot or be gated off"
         );
     }
 
