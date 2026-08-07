@@ -276,6 +276,12 @@ pub use carrick_dsr_aarch64::translator::xlat_census;
 #[cfg(feature = "alloc-owner-census")]
 pub use carrick_dsr_aarch64::alloc_owner_census;
 pub use carrick_dsr_aarch64::alloc_owner_wire;
+// The biased-lowering host-bias candidate set. The native-fault partition in
+// the CLI classifies fault pages against `guest_va + bias`, and the bias is
+// selected per process at boot from exactly this list — re-exported (the
+// `xlat_census` precedent) so the parser reads the runtime's authority instead
+// of duplicating four load-bearing constants.
+pub use carrick_dsr::address::BIAS_CANDIDATES as NATIVE_HOST_BIAS_CANDIDATES;
 // The guest-virtual address domain the census records are keyed on. Exported
 // beside `xlat_census` so an out-of-crate aggregator keys its sets on the typed
 // address instead of degrading them to `u64` at the crate boundary.

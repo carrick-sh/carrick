@@ -11,9 +11,19 @@ use tempfile::NamedTempFile;
 
 use crate::trace_profile::{ProfileCaptureStatus, ProfileProvenance, V2ProfileAuthority};
 
-const JSON_SCHEMA: &str = "carrick.native-fault-attribution.v3";
+const JSON_SCHEMA: &str = "carrick.native-fault-attribution.v4";
 const PAGE_SIZE: u64 = 16_384;
 const PAGE_SAMPLE_MODULUS: u64 = 64;
+
+/// Host-bias candidates for the native biased lowering, re-exported from the
+/// runtime (`carrick_dsr::address::BIAS_CANDIDATES`). Every guest page's host
+/// backing sits at `guest_va + bias` for the per-process boot-selected bias,
+/// so a `during-operation` fault on the operation's own range fires at
+/// `retval + bias`, never at the guest VA itself. Candidates are >= 256 GiB
+/// apart, so a mapping shorter than the minimum candidate gap matches at most
+/// one candidate; longer spans are classified into an explicit ambiguity
+/// bucket rather than guessed.
+const NATIVE_HOST_BIAS_CANDIDATES: [u64; 4] = carrick_runtime::NATIVE_HOST_BIAS_CANDIDATES;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 struct BirthKey {
@@ -242,6 +252,22 @@ pub(crate) struct NativeMemoryFaultBucket {
     share_of_all_zfod: f64,
 }
 
+/// Bias-aware partition of the `during-operation` zfod mass: which memory the
+/// service path itself first-touched while the guest operation was open on the
+/// faulting thread. `own-biased-backing` is the operation's own guest range
+/// reached through the per-process host bias (the whole-range scrub's
+/// signature); `carrick-host` is below every bias candidate (carrick's own
+/// heap, images, JIT); `other-high` is at-or-above the lowest candidate but
+/// outside the operation's own biased range. Rows close exactly against
+/// `memory_census.active_memory_faults`.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct NativeMemoryFaultPartitionRow {
+    operation_shape: String,
+    fault_locus: &'static str,
+    exact_zfod: u64,
+    share_of_active_memory_faults: f64,
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 struct NativeFaultProvenance {
     run_id: String,
@@ -276,6 +302,7 @@ pub(crate) struct NativeFaultSummary {
     memory_census: NativeMemoryCensus,
     memory_operations: Vec<NativeMemoryOperationBucket>,
     memory_faults: Vec<NativeMemoryFaultBucket>,
+    memory_fault_partition: Vec<NativeMemoryFaultPartitionRow>,
     pub(crate) excluded_processes: u64,
     provenance: NativeFaultProvenance,
 }
@@ -1361,7 +1388,7 @@ impl NativeFaultSummary {
             active_memory_faults: validator.active_memory_faults,
             guest_arena_faults: validator.guest_arena_faults,
         };
-        let (memory_operations, memory_faults) = summarize_memory_intent(
+        let (memory_operations, memory_faults, memory_fault_partition) = summarize_memory_intent(
             &validator.memory_intent_records,
             &validator.memory_fault_events,
             total_zfod,
@@ -1482,6 +1509,7 @@ impl NativeFaultSummary {
             memory_census,
             memory_operations,
             memory_faults,
+            memory_fault_partition,
             excluded_processes,
             provenance: NativeFaultProvenance::default(),
         })
@@ -1504,8 +1532,18 @@ impl NativeFaultSummary {
             .ownership_bucket("zfod", "guest-owned")
             .map(|bucket| bucket.sample_share * 100.0)
             .unwrap_or(0.0);
+        let partition = self
+            .memory_fault_partition
+            .first()
+            .map(|row| {
+                format!(
+                    ", top_partition={}/{}={}",
+                    row.operation_shape, row.fault_locus, row.exact_zfod
+                )
+            })
+            .unwrap_or_default();
         format!(
-            "native-fault: exact_zfod={zfod}, sampled_guest_owned_zfod={guest:.2}%, excluded_processes={}, natural=true, gating_eligible=false",
+            "native-fault: exact_zfod={zfod}, sampled_guest_owned_zfod={guest:.2}%{partition}, excluded_processes={}, natural=true, gating_eligible=false",
             self.excluded_processes
         )
     }
@@ -2119,6 +2157,84 @@ fn memory_operation_shape(intent: &MemoryIntentRecord) -> Result<String> {
     })
 }
 
+/// Partition sub-shape for one memory intent. For guest `mmap` the anonymous
+/// arm splits by what the service path can do to it: `anon-reserve`
+/// (`PROT_NONE` — Go `sysReserve`), `anon-fixed-commit` (`MAP_FIXED` over a
+/// reserve — Go `sysMap`), `anon-plain`; file mmaps keep the provenance
+/// spelling. Non-mmap intents keep their operation shape.
+fn memory_partition_shape(intent: &MemoryIntentRecord) -> Result<String> {
+    if intent.number != 222 {
+        let operation = memory_operation_name(intent.number)?;
+        let shape = memory_operation_shape(intent)?;
+        return Ok(format!("{operation}-{shape}"));
+    }
+    if intent.args[3] & 0x20 == 0 {
+        return Ok(format!("mmap-{}", mmap_provenance(intent.args[3])));
+    }
+    Ok(if intent.args[2] == 0 {
+        "mmap-anon-reserve".to_owned()
+    } else if intent.args[3] & 0x10 != 0 {
+        "mmap-anon-fixed-commit".to_owned()
+    } else {
+        "mmap-anon-plain".to_owned()
+    })
+}
+
+/// Classify one `during-operation` fault page against the operation's own
+/// range seen through each host-bias candidate. See
+/// [`NativeMemoryFaultPartitionRow`] for the locus vocabulary.
+fn memory_partition_locus(page: u64, intent: &MemoryIntentRecord) -> Result<&'static str> {
+    // A failed or zero-returning mmap owns no range (carrick's arena path
+    // answers an unplaceable hinted reserve with address 0); its in-window
+    // faults classify by address class alone.
+    let start = if intent.number == 222 {
+        (intent.errno == 0 && intent.retval > 0).then_some(intent.retval as u64)
+    } else {
+        Some(intent.args[0])
+    };
+    let lowest_bias = NATIVE_HOST_BIAS_CANDIDATES
+        .iter()
+        .copied()
+        .min()
+        .ok_or_else(|| anyhow!("empty host-bias candidate list"))?;
+    let minimum_gap = {
+        let mut sorted = NATIVE_HOST_BIAS_CANDIDATES;
+        sorted.sort_unstable();
+        sorted
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .min()
+            .ok_or_else(|| anyhow!("single host-bias candidate cannot bound ambiguity"))?
+    };
+    let bounds = match start {
+        Some(start) => host_page_bounds(start, intent.args[1])?,
+        None => None,
+    };
+    if let Some((range_start, range_end)) = bounds {
+        if range_end - range_start >= minimum_gap {
+            // A span at least as long as the candidate gap could match two
+            // biases at once; refuse to guess.
+            return Ok("ambiguous-bias-span");
+        }
+        for bias in NATIVE_HOST_BIAS_CANDIDATES {
+            let Some(biased_start) = range_start.checked_add(bias) else {
+                continue;
+            };
+            let Some(biased_end) = range_end.checked_add(bias) else {
+                continue;
+            };
+            if page >= biased_start && page < biased_end {
+                return Ok("own-biased-backing");
+            }
+        }
+    }
+    Ok(if page < lowest_bias {
+        "carrick-host"
+    } else {
+        "other-high"
+    })
+}
+
 fn host_page_bounds(start: u64, len: u64) -> Result<Option<(u64, u64)>> {
     if len == 0 {
         return Ok(None);
@@ -2142,6 +2258,7 @@ fn summarize_memory_intent(
 ) -> Result<(
     Vec<NativeMemoryOperationBucket>,
     Vec<NativeMemoryFaultBucket>,
+    Vec<NativeMemoryFaultPartitionRow>,
 )> {
     let mut operation_counts = BTreeMap::<(&'static str, String), (u64, u64)>::new();
     let mut intent_by_sequence = BTreeMap::<(BirthKey, u64), &MemoryIntentRecord>::new();
@@ -2176,6 +2293,8 @@ fn summarize_memory_intent(
         Ok(())
     };
 
+    let mut partition_counts = BTreeMap::<(String, &'static str), u64>::new();
+    let mut partition_total = 0u64;
     for fault in faults
         .iter()
         .filter(|fault| fault.scope == MemoryFaultScope::ActiveMemory)
@@ -2205,6 +2324,17 @@ fn summarize_memory_intent(
             format!("{operation}-{shape}"),
             provenance,
         )?;
+        let partition_shape = memory_partition_shape(intent)?;
+        let locus = memory_partition_locus(fault.page, intent)?;
+        let cell = partition_counts
+            .entry((partition_shape, locus))
+            .or_default();
+        *cell = cell
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("memory fault partition overflow"))?;
+        partition_total = partition_total
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("memory fault partition total overflow"))?;
     }
 
     let mut intents_by_image = BTreeMap::<ImageKey, Vec<&MemoryIntentRecord>>::new();
@@ -2402,7 +2532,41 @@ fn summarize_memory_intent(
             .then_with(|| left.semantic_sequence.cmp(&right.semantic_sequence))
             .then_with(|| left.mapping_provenance.cmp(&right.mapping_provenance))
     });
-    Ok((memory_operations, memory_faults))
+    let active_memory_faults = u64::try_from(
+        faults
+            .iter()
+            .filter(|fault| fault.scope == MemoryFaultScope::ActiveMemory)
+            .count(),
+    )?;
+    if partition_total != active_memory_faults {
+        bail!(
+            "memory fault partition total {partition_total} does not close against \
+             {active_memory_faults} active-memory faults"
+        );
+    }
+    let mut memory_fault_partition = partition_counts
+        .into_iter()
+        .map(
+            |((operation_shape, fault_locus), exact_zfod)| NativeMemoryFaultPartitionRow {
+                operation_shape,
+                fault_locus,
+                exact_zfod,
+                share_of_active_memory_faults: if active_memory_faults == 0 {
+                    0.0
+                } else {
+                    exact_zfod as f64 / active_memory_faults as f64
+                },
+            },
+        )
+        .collect::<Vec<_>>();
+    memory_fault_partition.sort_by(|left, right| {
+        right
+            .exact_zfod
+            .cmp(&left.exact_zfod)
+            .then_with(|| left.operation_shape.cmp(&right.operation_shape))
+            .then_with(|| left.fault_locus.cmp(right.fault_locus))
+    });
+    Ok((memory_operations, memory_faults, memory_fault_partition))
 }
 
 #[cfg(test)]
@@ -2502,7 +2666,7 @@ mod tests {
     #[test]
     fn accepts_parent_catalog_target_image_zero_fork_inheritance_and_host_other() {
         let summary = parse(&fixture()).expect("valid fixture");
-        assert_eq!(summary.schema, "carrick.native-fault-attribution.v3");
+        assert_eq!(summary.schema, "carrick.native-fault-attribution.v4");
         assert!(!summary.gating_eligible);
         assert_eq!(summary.exact_total("zfod"), Some(16));
         assert_eq!(summary.excluded_processes, 1);
@@ -2588,6 +2752,64 @@ mod tests {
             active.replace("timestamp_ns=150", "timestamp_ns=250"),
             "outside its memory intent",
         );
+    }
+
+    /// The v4 partition: a during-operation fault on the operation's own
+    /// range fires at `retval + bias` (the biased host backing), never at the
+    /// guest VA — the whole-range scrub's signature — while a fault below
+    /// every bias candidate is carrick's own host memory. The partition must
+    /// close exactly against `memory_census.active_memory_faults`.
+    #[test]
+    fn partitions_active_mmap_faults_by_bias_locus_and_shape() {
+        let fault =
+            "timestamp_ns=250|page=0x10000|active_number=0|active_sequence=0|scope=guest-arena";
+        let case = |page: &str, arg2: &str| {
+            let raw = fixture()
+                .replace(
+                    fault,
+                    &format!(
+                        "timestamp_ns=150|page={page}|active_number=222|active_sequence=1|scope=active-memory"
+                    ),
+                )
+                .replace("arg2=3|arg3=34", &format!("arg2={arg2}|arg3=34"));
+            let summary = parse(&raw).expect("partition fixture parses");
+            let json = serde_json::to_value(&summary).expect("serialize partition summary");
+            let rows = json["memory_fault_partition"]
+                .as_array()
+                .expect("partition rows")
+                .clone();
+            let total: u64 = rows
+                .iter()
+                .map(|row| row["exact_zfod"].as_u64().expect("count"))
+                .sum();
+            assert_eq!(
+                total, json["memory_census"]["active_memory_faults"],
+                "partition must close against active-memory faults"
+            );
+            rows
+        };
+
+        // retval=0x10000 len=16384 → own biased range for candidate 0 is
+        // [0x8000010000, 0x8000018000); PROT_NONE (arg2=0) makes the shape
+        // the reserve arm the scrub storm rides on.
+        let rows = case("0x8000010000", "0");
+        assert_eq!(rows[0]["operation_shape"], "mmap-anon-reserve");
+        assert_eq!(rows[0]["fault_locus"], "own-biased-backing");
+        assert_eq!(rows[0]["exact_zfod"], 1);
+
+        // The same own-range fault under the SECOND bias candidate must also
+        // classify as own backing (the bias is boot-selected per process).
+        let rows = case("0xc000010000", "0");
+        assert_eq!(rows[0]["fault_locus"], "own-biased-backing");
+
+        // A fault below every candidate is carrick's own host memory.
+        let rows = case("0x30000", "3");
+        assert_eq!(rows[0]["operation_shape"], "mmap-anon-plain");
+        assert_eq!(rows[0]["fault_locus"], "carrick-host");
+
+        // At-or-above the lowest candidate but outside the own range.
+        let rows = case("0x8100000000", "3");
+        assert_eq!(rows[0]["fault_locus"], "other-high");
     }
 
     #[test]
@@ -2815,7 +3037,7 @@ mod tests {
         let contents = fs::read_to_string(path).expect("read report");
         assert_eq!(contents.lines().count(), 1);
         let json: serde_json::Value = serde_json::from_str(contents.trim()).expect("parse report");
-        assert_eq!(json["schema"], "carrick.native-fault-attribution.v3");
+        assert_eq!(json["schema"], "carrick.native-fault-attribution.v4");
         assert_eq!(json["provenance"]["run_id"], "fault-run");
         assert_eq!(json["provenance"]["git_dirty"], false);
         assert_eq!(json["gating_eligible"], false);
