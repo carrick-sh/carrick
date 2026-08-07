@@ -40,7 +40,7 @@ against it.
 
 | | share | CPU-s @ 21.391 s |
 |---|---:|---:|
-| Darwin kernel today (48.4067% midpoint) | 48.4067% | **10.354** |
+| Darwin kernel today (48.4067% midpoint) | 48.4067% | **10.355** |
 | — named-syscall | 28.3205% | 6.058 |
 | — non-syscall: faults, VM | 20.0862% | 4.297 |
 | translated guest | 25.6048% | 5.477 |
@@ -48,12 +48,12 @@ against it.
 | other Carrick host code | 8.4276% | 1.803 |
 | translation | 6.0116% | 1.286 |
 | Kernel budget at the 3x target (Docker-denominated, unchanged) | — | **2.800** |
-| **Gap Move 3 must close** | — | **7.554 (−73.0%)** |
+| **Gap Move 3 must close** | — | **7.555 (−73.0%)** |
 
 The **budget** row is unchanged because it is Docker-denominated
 (3 × `cpu_total_s` 2.160 = 6.480 target, kernel residual rounded down to 2.800;
 category-budgets §4e). Only the carrick-side numerator moved, so the gap widened
-from 6.963 to **7.554 CPU-s**. Every *estimated* band in §2 was derived before
+from 6.963 to **7.555 CPU-s**. Every *estimated* band in §2 was derived before
 this refresh and is left unscaled — treat them as pre-drift lower bounds.
 
 Source for the shares: category-budgets §2 and §4e. A third, independent confirmation of the
@@ -318,7 +318,7 @@ key-space and dynamic-variable pressure are unqualified. Therefore:
 
 ## 2. The entry roster, ranked
 
-Ranked by *estimated* CPU-s against the **7.554 CPU-s** kernel gap (§0). Every
+Ranked by *estimated* CPU-s against the **7.555 CPU-s** kernel gap (§0). Every
 band is an estimate derived from committed measurements of adjacent quantities,
 taken **before** the 2026-08-06 denominator refresh; none is a measurement of the
 entry itself. That is the honest state — and it is why E0 comes first.
@@ -483,7 +483,7 @@ authority:
   <10% while summing to the gap". Category-budgets §5 restates it: a family of
   source-distinct mechanisms individually below 10% but addressable by **one**
   mechanism "is judged as a single candidate against its combined share".
-- 7.4% of the refreshed 21.391 s is **~1.58 CPU-s** against a 7.554 CPU-s gap —
+- 7.4% of the refreshed 21.391 s is **~1.58 CPU-s** against a 7.555 CPU-s gap —
   21% of the whole kernel ask from one binding. Under the superseded policy that
   was a no-carry; under the current one it is a ranked candidate.
 - **What is unchanged:** the ABBA retention discipline. Re-opening the *ranking*
@@ -634,7 +634,7 @@ remains. Record the row; do not campaign on it.
 
 ### Roster summary
 
-| # | entry | *est.* CPU-s vs the 7.554 gap | confirming measurement |
+| # | entry | *est.* CPU-s vs the 7.555 gap | confirming measurement |
 |---|---|---:|---|
 | E0 | baseline build-lane ledger + HEAD confirmation of host-other zfod + the AGENTS.md fix | — (produces the ranking) | the `AMP1` capture itself |
 | E1 | guest `mmap(MAP_PRIVATE, fd)` eager materialization | **1.5–3.0** | `mmap` row: host CPU-ns + in-window zfod |
@@ -647,7 +647,7 @@ remains. Record the row; do not campaign on it.
 
 Bands are pre-drift (derived against the superseded 20.168 s denominator) and are
 deliberately **not** rescaled — see §0. Even the optimistic reading (E1+E2 at 4.0,
-E3 at 1.0, E6 at 0.56) reaches ~5.6 of **7.554**, and the refresh widened the gap
+E3 at 1.0, E6 at 0.56) reaches ~5.6 of **7.555**, and the refresh widened the gap
 rather than narrowing it. **Move 3 does not close its own gap from the named
 entries alone** — which is precisely why the spec specifies a *standing ledger of
 the top ~20 guest operations*, and why E0 is the deliverable that matters most.
@@ -837,7 +837,7 @@ threads, processes and core class at once and is not a clean variable.
   the non-reproduction is itself a named regression to attribute against the
   ~40 commits of post-arena drift, not a quiet re-ranking.
 - **§0's +6.06% CPU drift turns out to be a real regression rather than host
-  state.** Then the gap is not 7.554 and the first work is attribution, not
+  state.** Then the gap is not 7.555 and the first work is attribution, not
   amplification.
 
 ## 5. Explicit non-goals
