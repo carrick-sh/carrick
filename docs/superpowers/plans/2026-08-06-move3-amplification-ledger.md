@@ -472,6 +472,25 @@ build lane's is unknown. Red-first shape: a `CARRICK_MMAP_FILE_BACKED=0` control
 arm (per the opt-out rule) and an `amplification-compare` of the two censuses,
 with the `mmap` row's `host_cpu_ns_per_guest_op` and `faults.zfod` as the signal.
 
+> **Measured 2026-08-07 (Task 5) — the E1 ranking is CLOSED-MISATTRIBUTED.**
+> The lowering LANDED (`f2a42bc3`, default ON, hatch
+> `CARRICK_MMAP_FILE_BACKED=0`) behind the red-first `mmapprivfile` probe
+> (`9cb3330b`), and it FIXES a real divergence the probe caught: the arena
+> path zero-filled private beyond-EOF pages where Linux delivers SIGBUS. But
+> the guest-mmap population census on the canonical fixture
+> (`CARRICK_NATIVE_TRACE_SYSCALLS`, receipts in `target/perf/task5-e1/`)
+> shows 5,977 of 6,118 guest mmaps are ANONYMOUS and file-backed
+> MAP_PRIVATE is **18 calls / 3.8 MiB per build** — so E0 §7's working
+> hypothesis ("the guest-owned fault mass is mostly E1's destination-copy
+> touches") is refuted: 3.8 MiB cannot own 553k × 16 KiB ≈ 8.6 GB of
+> in-window zfod. Measured movement: mmap-row in-window zfod 561,588 (`=0`)
+> → 552,996 (ON), −1.5%; ABBA wash (22.430 ± 0.734 vs 22.110 ± 0.512 CPU-s,
+> n=4 interleaved). The in-window mass belongs to the ANONYMOUS service
+> path — the reuse/FIXED whole-range memset scrub (`zero_anonymous_reuse` →
+> aarch64 memset; the x86 identity backend already replaces the mapping
+> kernel-side) — chip filed as the successor entry. E1 is retained on
+> correctness, not CPU; do not re-rank it as a kernel lever on this lane.
+
 **Honest constraint:** the guarantee is immovable. A `MAP_PRIVATE` file mapping
 must observe map-time EOF semantics (the `PrivateMmapSnapshot` doc at `:729-733`:
 bytes through the last partially backed page snapshotted, EOF remainder
