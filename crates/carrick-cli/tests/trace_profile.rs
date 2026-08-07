@@ -584,6 +584,51 @@ fn amp1_requires_a_qualified_terminal_roster_in_both_scopes() {
 }
 
 #[test]
+fn amp1_rejects_a_declared_join_that_never_armed() {
+    // `dtrace_consumer` compiles with `DTRACE_C_ZDEFS`, so a probe description
+    // that matches NOTHING is silent rather than an error, and the D BEGIN
+    // seeds every total `sum(0)` so a printed zero stays distinguishable from a
+    // section that printed nothing. Together those make an unarmed join look
+    // exactly like an armed one that saw no events: section markers present,
+    // rows absent, totals a legal zero — and per-op closure then holds at
+    // 0 == 0 while the ledger loses the entire mass that join exists to catch.
+    let unarmed_mach = amp1_stream()
+        .lines()
+        .filter(|line| !line.contains("|trap="))
+        .map(|line| {
+            line.replace(
+                "mach-trap-entry-total|count=5",
+                "mach-trap-entry-total|count=0",
+            )
+            .replace(
+                "mach-trap-return-total|count=5",
+                "mach-trap-return-total|count=0",
+            )
+            .replace("mach-trap-cpu-ns|count=4000", "mach-trap-cpu-ns|count=0")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    validate_amp1(&unarmed_mach, &[])
+        .failure()
+        .stderr(contains("mach-trap-entry-total").and(contains("never armed")));
+
+    // The fault join is three independent probe descriptions in one clause, so
+    // ZDEFS can silence any one of them on its own.
+    let unarmed_cow = amp1_stream()
+        .lines()
+        .filter(|line| !line.contains("|kind=cow_fault"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace(
+            "AMP1|section=fault-totals",
+            "AMP1|section=fault-totals\nAMP1|kind=cow_fault|count=0",
+        );
+    validate_amp1(&unarmed_cow, &[])
+        .failure()
+        .stderr(contains("cow_fault").and(contains("never armed")));
+}
+
+#[test]
 fn amp1_rejects_a_missing_drop_section() {
     // Absent is not zero: a section that printed nothing must never be read as
     // a section that printed a zero.

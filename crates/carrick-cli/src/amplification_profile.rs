@@ -3,12 +3,18 @@
 //!
 //! This is the fail-closed half of the instrument: it decides whether a capture
 //! is admissible evidence at all, before anything computes a ratio from it. The
-//! four named refusals it owns are the ones a plausible-looking summary would
+//! five named refusals it owns are the ones a plausible-looking summary would
 //! otherwise hide:
 //!
 //! * **wrong backend** — `carrick*:::native-syscall-service-*` never fires under
 //!   the VMM backend, so every host call lands in `carrick-only` and the guest
 //!   denominator is zero. That is an error, not an empty ledger.
+//! * **a declared join that never armed** — `DTRACE_C_ZDEFS` makes a probe
+//!   description matching nothing SILENT, and the D program seeds every total
+//!   `sum(0)`, so an unarmed join prints its section markers, no rows, and a
+//!   legal zero. Per-op closure then holds at `0 == 0` and the ledger loses
+//!   exactly the mass that join exists to catch. Every seeded total must
+//!   therefore be nonzero; see `finish`.
 //! * **truncated** — the declared capture bound fired mid-census.
 //! * **unauthenticated program** — the header must name the digest of the
 //!   BUNDLED template, so a `--script` capture or an edited program cannot
@@ -674,6 +680,45 @@ impl Amp1Reader {
             bail!(
                 "AMP1 capture recorded no guest syscalls (wrong-backend): `native-syscall-service-*` never fires under the VMM backend, so every host call would land in `carrick-only`. Re-run with `--exec-backend native`."
             );
+        }
+        // EVERY seeded total must be nonzero, and the reason is the seed's own
+        // reason turned around. `dtrace_consumer` compiles with
+        // `DTRACE_C_ZDEFS`, so a probe description matching NOTHING is silent
+        // rather than an error, and the BEGIN clause seeds every total `sum(0)`
+        // so that "printed zero" stays distinguishable from "printed nothing".
+        // Those two facts together make a declared join that NEVER ARMED
+        // indistinguishable, downstream, from one that armed and observed
+        // nothing -- the section markers print, the rows are absent, the total
+        // is a legal 0, and per-op closure holds trivially at 0 == 0. What the
+        // ledger then reports is a budget denominator missing exactly the mass
+        // that join exists to catch, which reads as LOWER amplification.
+        //
+        // On this instrument, against a real guest, none of these can be zero:
+        // the entry/return pairs are every host syscall and mach trap in a
+        // ~70-process tree, the CPU totals are those pairs' `vtimestamp`
+        // deltas (a zero mach CPU total is the D header's own unqualified
+        // "does vtimestamp advance across mach_trap:::" question answering NO),
+        // and the fault kinds are ~2M events. So zero means never armed.
+        //
+        // If some future workload can legitimately produce zero for one of
+        // these, the remedy is to drop that join from the header's `joins=`
+        // set -- making the omission a determinant the comparator refuses to
+        // cross -- NOT to soften this into a silent pass.
+        for metric in REQUIRED_METRICS {
+            if self.totals.get(metric).copied().unwrap_or(0) == 0 {
+                bail!(
+                    "AMP1 metric {metric:?} is zero for a capture declaring joins={:?}; under ZDEFS a provider that matches nothing is SILENT and every total is seeded, so a zero total on a declared join means the join never armed, not that it saw no events",
+                    header.joins
+                );
+            }
+        }
+        for kind in FAULT_KINDS {
+            if self.fault_totals.get(kind).copied().unwrap_or(0) == 0 {
+                bail!(
+                    "AMP1 fault kind {kind:?} is zero for a capture declaring joins={:?}; the fault join is three separate probe descriptions and ZDEFS silences each one independently, so a zero kind means that probe never armed",
+                    header.joins
+                );
+            }
         }
 
         Ok(Amp1Capture {

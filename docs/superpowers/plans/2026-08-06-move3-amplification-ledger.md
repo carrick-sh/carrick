@@ -326,6 +326,30 @@ key-space and dynamic-variable pressure are unqualified. Therefore:
   as an acceptance condition there, and this instrument adopts it);
 - a missing drop section is itself a rejection — absent is not zero.
 
+**A declared join that never armed is the SAME class of silence, and closure
+cannot see it either.** `dtrace_consumer` compiles with `DTRACE_C_ZDEFS`, so a
+probe description matching nothing is silent rather than an error; the D program
+seeds every total `sum(0)` precisely so "printed zero" stays distinguishable
+from "printed nothing". Together those make an unarmed join indistinguishable
+downstream from an armed one that saw no events — section markers present, rows
+absent, a legal zero total — and per-op closure then holds trivially at
+`0 == 0` while the ledger loses exactly the mass that join exists to catch.
+**Every seeded total must therefore be non-zero**, including both `vtimestamp`
+CPU totals (a zero mach-trap CPU total is the D header's own unqualified "does
+`vtimestamp` advance across `mach_trap:::`" question answering *no*) and each
+fault kind separately, since the fault clause is three independent probe
+descriptions. If some workload can legitimately produce zero for one of them,
+the remedy is to drop that join from the header's `joins=` set — making the
+omission a determinant the comparator refuses to cross — not to soften the check.
+
+**And closure is blind to MISATTRIBUTION**, which is the sharpest remaining edge:
+sums are taken across all slots, so moving a row from a guest slot into
+`carrick-only` changes nothing that closure checks and simply lowers that guest
+op's amplification. That is the shape a dynamic drop produces when a
+`service_slot` entry is lost, its symptom is an *improvement*, and the
+consumer-side counters are its only detector — see Task 3's required in-band
+`AMP1|consumer-drops|…` record.
+
 ---
 
 ## 2. The entry roster, ranked
@@ -717,13 +741,38 @@ Typed analyzer + `carrick.amplification-ledger.v1`.
 ### Task 3 — `amplification-compare` + `--preflight-quiet-host` (instrument, part 3)
 
 - **Red first:** comparing two censuses that differ in image digest, fixture,
-  `joins=` set, or schema fails with a named determinant error; comparing two
-  identical censuses reports exact zeros.
+  `joins=` set, `program_sha256`, the declared buffer sizes, or schema fails with
+  a named determinant error; comparing two identical censuses reports exact
+  zeros. `program_sha256` is on that list because Task 2 deliberately moved the
+  bundled-digest check OUT of the ledger parser: folding it in would make every
+  previously published ledger unparseable the moment `native-amplification.d`
+  is edited (including by the in-band record below), destroying the archive.
+  A ledger always names the program that produced it; **refusing to cross a
+  version is the comparator's job, not the parser's.**
+- **REQUIRED, default-on: an in-band `AMP1|consumer-drops|…` record.** Task 2's
+  review established that this is not a nicety. Closure sums across all slots,
+  so it is blind to MISATTRIBUTION: moving a `(guest_op, host_call)` row from a
+  guest slot into `carrick-only` leaves every sum and every closure pair
+  unchanged and simply lowers that guest op's amplification. A reviewer
+  constructed exactly that from the committed fixture — `openat` fell from 10/4
+  to 7/4, exit 0, ledger published. It is also precisely the shape a libdtrace
+  **dynamic drop** produces when the `service_slot[pid, tid]` entry is lost.
+  The consumer-side drop counters are therefore the SOLE detector for a
+  corruption whose symptom is an *improvement*, they are not readable from D
+  (D header fact 10), and today they exist only in the live `DTraceRunReport`,
+  so an archived raw from a FAILED capture can launder a lower amplification
+  past every offline check. Task 3 must have `carrick trace` write those
+  counters into the stream as an `AMP1|consumer-drops|…` record after libdtrace
+  finishes, with the reader requiring the record (absent is not zero) and
+  refusing any nonzero counter — **default-on, `=0` hatch only for bisection**,
+  per the opt-out rule. Until it lands, "the capture command exited zero" is an
+  unrecorded part of every ledger's provenance.
 - `carrick trace --preflight-quiet-host` writes its receipt into the header and
   exits non-zero on a dirty host; a fixture test asserts the refusal path.
 - Write the ≤60-line `scripts/perf/amplification-capture.sh` arm driver.
-- **Gate:** `just ci`. Docs row in `diagnostics-and-debugging.md` + the
-  `carrick-trace` skill.
+- **Gate:** `just ci`. Docs rows in `diagnostics-and-debugging.md` + the
+  `carrick-trace` skill for **both** new commands — `amplification-ledger`
+  (Task 2) and `amplification-compare` — not just the comparator.
 
 ### Task 4 — E0: the baseline build-lane ledger (**needs an exclusive quiet host**)
 
@@ -743,8 +792,12 @@ image digest.
   the superseded 2026-07-29 reading, to state the 08-01 + 08-03 record. Part of
   this task, not a follow-up.
 - **Gate:** completeness — no `section=truncated`, **every DTrace drop counter
-  zero and the drop section present** (§1d), closure exact, guest-syscall
-  total non-zero, `carrick-only` decomposed, instrument calls named and excluded.
+  zero and the drop section present** (§1d), closure exact, **every declared
+  join's totals non-zero** (§1d: an unarmed join is silent under `ZDEFS` and
+  closes at `0 == 0`), `carrick-only` decomposed, instrument calls named and
+  excluded. Because the in-band consumer-drop record is Task 3's, the capture
+  command's **zero exit status** is itself a gate condition here: a raw file left
+  behind by a failed capture passes every offline check.
   Single capture is acceptable for **counts** on a deterministic fixture (the fs
   entry's precedent, reproducing a prior census to within 2 guest calls);
   **CPU-ns needs n ≥ 3** and its variance reported, because unlike counts it is
