@@ -30,10 +30,6 @@ mod darwin {
         fn carrick_native_clear_icache(start: *mut libc::c_void, len: usize);
     }
 
-    pub(crate) fn clear_icache(exec_ptr: *const u8, len: usize) {
-        unsafe { carrick_native_clear_icache(exec_ptr as *mut libc::c_void, len) };
-    }
-
     impl NativeHostJit for DarwinHostJit {
         fn supported(&self) -> Result<(), &'static str> {
             if unsafe { libc::pthread_jit_write_protect_supported_np() } == 0 {
@@ -80,7 +76,7 @@ mod darwin {
         }
 
         fn flush_icache(&self, exec_ptr: *const u8, len: usize) {
-            clear_icache(exec_ptr, len);
+            unsafe { carrick_native_clear_icache(exec_ptr as *mut libc::c_void, len) };
         }
 
         fn remap_for_fork_child(&self, _prior: &JitRegion) -> std::io::Result<ForkChildJit> {
@@ -105,12 +101,7 @@ mod darwin {
 }
 
 #[cfg(target_arch = "aarch64")]
-pub(crate) use darwin::clear_icache;
-#[cfg(target_arch = "aarch64")]
 pub use darwin::{DarwinHostJit, active_host_jit};
-
-#[cfg(not(target_arch = "aarch64"))]
-pub(crate) fn clear_icache(_exec_ptr: *const u8, _len: usize) {}
 
 /// Fail-closed placeholder for a macOS host that isn't Apple Silicon: the
 /// capability probe rejects, so `TranslationCache::new` returns a typed cache

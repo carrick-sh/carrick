@@ -18,7 +18,7 @@ use std::num::NonZeroU64;
 use std::ops::Range;
 use std::sync::OnceLock;
 
-use carrick_guest_mem::{GuestVa, HostVa};
+use carrick_guest_mem::HostVa;
 
 macro_rules! dsr_ordinal_enum {
     (
@@ -450,19 +450,6 @@ dsr_ordinal_enum! {
 dsr_ordinal_enum! {
     /// Low-cardinality DSR translation-cache event. Mirrors
     /// `carrick_observability::probes::DsrCacheEventKind` exactly.
-    ///
-    /// `LiveReadyHit` / `LiveWinnerPublish` name the container-lifetime LIVE
-    /// arena's own serves and publications; `BlockHit` / `BlockPublish` mean
-    /// the PRIVATE bump cache.
-    ///
-    /// `LiveCasLoss` is a lost block claim; `LiveValidationRefusal` is a
-    /// record this process found and REFUSED (torn, unresolvable, or an
-    /// unknown state); `LivePrivateFallback` is every other named reason the
-    /// lane declined; `LiveStaleAbortRecovered` is an instruction abort in a
-    /// revoked chunk that the exact classifier recovered privately. There is
-    /// deliberately NO kind for the policy-off `Unconfigured` fallback: that
-    /// is every authoritative miss on the shipped default, so a probe there
-    /// would put a new call on the default translate path.
     pub enum DsrCacheEventKind {
         BlockHit = 1,
         BlockMiss = 2,
@@ -476,66 +463,6 @@ dsr_ordinal_enum! {
         DirectBindingClear = 10,
         DirectBindingValidationFailure = 11,
         DirectBindingUnitLoaded = 12,
-        LiveReadyHit = 13,
-        LiveWinnerPublish = 14,
-        LiveCasLoss = 15,
-        LivePrivateFallback = 16,
-        LiveValidationRefusal = 17,
-        LiveStaleAbortRecovered = 18,
-    }
-}
-
-/// One exact 64 KiB live-arena RX chunk this task protected `PROT_NONE`
-/// because a guest write, `mprotect`, `munmap`, or remap changed its source
-/// page (Task 7's revocation seam).
-///
-/// It deliberately carries NO thread identity: revocation runs on the memory
-/// mutation seam, which has no guest thread in scope, and a fabricated `tid`
-/// would put a sentinel into a real domain. The fields are private and
-/// construction validates the extent, so a caller cannot publish an empty or
-/// inverted revocation.
-///
-/// ```compile_fail
-/// use carrick_dsr::probes::DsrLiveChunkRevocation;
-/// use carrick_guest_mem::{GuestVa, HostVa};
-///
-/// let _ = DsrLiveChunkRevocation {
-///     source_page: GuestVa(0x1000),
-///     chunk_index: 0,
-///     rx: HostVa(0x2000)..HostVa(0x3000),
-/// };
-/// ```
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DsrLiveChunkRevocation {
-    source_page: GuestVa,
-    chunk_index: u32,
-    rx: Range<HostVa>,
-}
-
-impl DsrLiveChunkRevocation {
-    pub fn revoked(
-        source_page: GuestVa,
-        chunk_index: u32,
-        rx: Range<HostVa>,
-    ) -> Result<Self, TranslatedRangeError> {
-        validate_translated_range(&rx)?;
-        Ok(Self {
-            source_page,
-            chunk_index,
-            rx,
-        })
-    }
-
-    pub const fn source_page(&self) -> GuestVa {
-        self.source_page
-    }
-
-    pub const fn chunk_index(&self) -> u32 {
-        self.chunk_index
-    }
-
-    pub const fn rx(&self) -> &Range<HostVa> {
-        &self.rx
     }
 }
 
@@ -670,9 +597,6 @@ pub trait DsrProbeSink: Send + Sync {
     );
 
     fn dsr_cache_capacity(&self, role: DsrCacheRole, capacity_bytes: u64);
-
-    /// One live-arena RX chunk revoked `PROT_NONE` by this task.
-    fn dsr_live_chunk_revoked(&self, event: DsrLiveChunkRevocation);
 
     /// Host-VA bounds of this process's JIT code cache, fired once at
     /// creation. This exists so a `dtrace` script can tell a JIT program
@@ -934,15 +858,6 @@ pub fn dsr_cache_bounds(base: u64, end: u64) {
     }
 }
 
-/// Fire the `dsr__live__chunk__revoked` probe through the installed sink;
-/// no-op when no sink is installed.
-#[inline(always)]
-pub fn dsr_live_chunk_revoked(event: DsrLiveChunkRevocation) {
-    if let Some(sink) = SINK.get() {
-        sink.dsr_live_chunk_revoked(event);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -957,7 +872,6 @@ mod tests {
         lifecycle: AtomicU64,
         detail: AtomicU64,
         synchronization: AtomicU64,
-        live_chunk_revoked: AtomicU64,
     }
 
     impl DsrProbeSink for CountingSink {
@@ -1082,10 +996,6 @@ mod tests {
 
         fn dsr_cache_bounds(&self, _base: u64, _end: u64) {}
 
-        fn dsr_live_chunk_revoked(&self, _event: DsrLiveChunkRevocation) {
-            self.live_chunk_revoked.fetch_add(1, Ordering::Relaxed);
-        }
-
         fn dsr_synchronization_begin(&self, _kind: DsrSynchronizationKind) {
             self.synchronization.fetch_add(1, Ordering::Relaxed);
         }
@@ -1107,7 +1017,6 @@ mod tests {
             lifecycle: AtomicU64::new(0),
             detail: AtomicU64::new(0),
             synchronization: AtomicU64::new(0),
-            live_chunk_revoked: AtomicU64::new(0),
         };
         static SECOND: CountingSink = CountingSink {
             translated_reset: AtomicU64::new(0),
@@ -1116,7 +1025,6 @@ mod tests {
             lifecycle: AtomicU64::new(0),
             detail: AtomicU64::new(0),
             synchronization: AtomicU64::new(0),
-            live_chunk_revoked: AtomicU64::new(0),
         };
 
         // No sink installed: helpers must be a silent no-op.
@@ -1198,12 +1106,6 @@ mod tests {
         assert_eq!(DsrCacheEventKind::DirectBindingClear.raw(), 10);
         assert_eq!(DsrCacheEventKind::DirectBindingValidationFailure.raw(), 11);
         assert_eq!(DsrCacheEventKind::DirectBindingUnitLoaded.raw(), 12);
-        assert_eq!(DsrCacheEventKind::LiveReadyHit.raw(), 13);
-        assert_eq!(DsrCacheEventKind::LiveWinnerPublish.raw(), 14);
-        assert_eq!(DsrCacheEventKind::LiveCasLoss.raw(), 15);
-        assert_eq!(DsrCacheEventKind::LivePrivateFallback.raw(), 16);
-        assert_eq!(DsrCacheEventKind::LiveValidationRefusal.raw(), 17);
-        assert_eq!(DsrCacheEventKind::LiveStaleAbortRecovered.raw(), 18);
         for (index, subphase) in DsrTranslationSubphase::ALL.iter().enumerate() {
             assert_eq!(subphase.raw() as usize, index + 1);
         }

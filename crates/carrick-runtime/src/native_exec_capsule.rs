@@ -10,42 +10,37 @@ use sha2::{Digest, Sha256};
 
 const CAPSULE_MAGIC: [u8; 8] = *b"CRKNEXE\0";
 const CONSUMED_MAGIC: [u8; 8] = [0; 8];
-const CAPSULE_VERSION: u16 = 2;
+const CAPSULE_VERSION: u16 = 1;
 const HEADER_LEN: usize = 68;
 const MAX_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
 const MAX_VECTOR_ITEMS: usize = 4096;
 const MAX_ITEM_LEN: usize = 1024 * 1024;
 const MAX_PATH_LEN: usize = 4096;
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-type NativeLiveArenaAuthority<'a> = Option<&'a carrick_native_darwin::live_arena::DarwinLiveArena>;
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-type NativeLiveArenaAuthority<'a> = Option<&'a ()>;
-
-/// Second schema carried by the native host-self-exec transport.
+/// First schema carried by the native host-self-exec transport.
 ///
 /// Process, filesystem, and descriptor records are added to this typed payload
 /// as their snapshot APIs land. These launch fields are sufficient to prove the
 /// transport and PID-preserving host exec without making the framing generic or
 /// exposing an untyped byte-bag at its trust boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct NativeExecCapsuleV2 {
+pub(crate) struct NativeExecCapsuleV1 {
     pub(crate) producer_pid: u32,
-    pub(crate) purpose: NativeExecCapsulePurposeV2,
+    pub(crate) purpose: NativeExecCapsulePurposeV1,
     pub(crate) host_executable_path: Vec<u8>,
     pub(crate) argv: Vec<Vec<u8>>,
     pub(crate) env: Vec<Vec<u8>>,
-    pub(crate) guest_exec: Option<NativeGuestExecV2>,
+    pub(crate) guest_exec: Option<NativeGuestExecV1>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum NativeExecCapsulePurposeV2 {
+pub(crate) enum NativeExecCapsulePurposeV1 {
     PidProbe,
     GuestExec,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct NativeGuestExecV2 {
+pub(crate) struct NativeGuestExecV1 {
     pub(crate) resolved_path: String,
     pub(crate) executable_digest: [u8; 32],
     pub(crate) rootfs: crate::fs_backend::HostFsReexecAuthority,
@@ -54,8 +49,6 @@ pub(crate) struct NativeGuestExecV2 {
     pub(crate) exec_host_fs_fallback: bool,
     pub(crate) max_traps: u64,
     pub(crate) native_page_profile: carrick_spec::NativePageProfileRequest,
-    #[serde(deserialize_with = "deserialize_present_live_arena")]
-    pub(crate) live_arena: Option<NativeReexecLiveArenaV2>,
     #[serde(default)]
     pub(crate) kernel_arena: Option<NativeReexecKernelArenaV1>,
     #[serde(default)]
@@ -80,101 +73,6 @@ pub(crate) struct NativeGuestExecV2 {
     /// catalog remains process-local and is never added to this capsule.
     #[serde(default)]
     pub(crate) profile_exec_epoch: u64,
-}
-
-/// The live arena's cross-exec record: the unchanged V2 transit identity
-/// (schema, lengths, nonce) plus the inherited-descriptor authority for both
-/// backing objects.
-///
-/// The descriptors are the transport — there is nothing else to carry — so a
-/// guest `fork(2)` child can produce this record for its own self-exec exactly
-/// as the arena's creator can.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct NativeReexecLiveArenaV2 {
-    pub(crate) schema: u32,
-    pub(crate) code_len: u64,
-    pub(crate) control_len: u64,
-    pub(crate) nonce: [u8; 16],
-    pub(crate) code: NativeReexecLiveArenaObjectV1,
-    pub(crate) control: NativeReexecLiveArenaObjectV1,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct NativeReexecLiveArenaObjectV1 {
-    pub(crate) host_fd: i32,
-    pub(crate) original_host_fd_flags: i32,
-    pub(crate) host_device: u64,
-    pub(crate) host_inode: u64,
-    pub(crate) host_size: u64,
-}
-
-fn deserialize_present_live_arena<'de, D>(
-    deserializer: D,
-) -> Result<Option<NativeReexecLiveArenaV2>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Option::deserialize(deserializer)
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl From<carrick_native_darwin::live_arena::LiveArenaObjectAuthority>
-    for NativeReexecLiveArenaObjectV1
-{
-    fn from(value: carrick_native_darwin::live_arena::LiveArenaObjectAuthority) -> Self {
-        Self {
-            host_fd: value.host_fd,
-            original_host_fd_flags: value.original_host_fd_flags,
-            host_device: value.host_device,
-            host_inode: value.host_inode,
-            host_size: value.host_size,
-        }
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl From<NativeReexecLiveArenaObjectV1>
-    for carrick_native_darwin::live_arena::LiveArenaObjectAuthority
-{
-    fn from(value: NativeReexecLiveArenaObjectV1) -> Self {
-        Self {
-            host_fd: value.host_fd,
-            original_host_fd_flags: value.original_host_fd_flags,
-            host_device: value.host_device,
-            host_inode: value.host_inode,
-            host_size: value.host_size,
-        }
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl From<carrick_native_darwin::live_arena::LiveArenaReexecAuthority> for NativeReexecLiveArenaV2 {
-    fn from(value: carrick_native_darwin::live_arena::LiveArenaReexecAuthority) -> Self {
-        Self {
-            schema: value.transit.schema,
-            code_len: value.transit.code_len,
-            control_len: value.transit.control_len,
-            nonce: value.transit.nonce,
-            code: value.code.into(),
-            control: value.control.into(),
-        }
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl From<NativeReexecLiveArenaV2> for carrick_native_darwin::live_arena::LiveArenaReexecAuthority {
-    fn from(value: NativeReexecLiveArenaV2) -> Self {
-        Self {
-            transit: carrick_native_darwin::live_arena::LiveArenaTransitV2 {
-                schema: value.schema,
-                code_len: value.code_len,
-                control_len: value.control_len,
-                nonce: value.nonce,
-            },
-            code: value.code.into(),
-            control: value.control.into(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,9 +154,9 @@ impl From<&NativeReexecAotCacheV1>
 }
 
 // The artifact-spike authority itself moved to `carrick-dsr-aarch64`, which
-// speaks the plain `ArtifactSpikeReexecConfig` carrier; the nested V1
-// artifact-spike schema stays here inside the V2 capsule. These two mappings
-// are the ONLY place the pairing is spelled out.
+// speaks the plain `ArtifactSpikeReexecConfig` carrier; the V1 capsule
+// schema stays here (it is the serialized re-exec wire format). These two
+// mappings are the ONLY place the pairing is spelled out.
 impl From<carrick_dsr_aarch64::artifact_spike::ArtifactSpikeReexecConfig>
     for NativeReexecArtifactSpikeV1
 {
@@ -312,7 +210,7 @@ pub(crate) struct NativeReexecProcessStateV1 {
 }
 
 fn native_reexec_unconfined_seccomp_policy() -> carrick_spec::SeccompPolicy {
-    // The nested process-state V1 schema predates launch policy. Preserve its
+    // Prior V1 capsules did not carry launch policy. Preserve their historical
     // decode meaning instead of silently enabling the container default.
     carrick_spec::SeccompPolicy::Unconfined
 }
@@ -336,7 +234,7 @@ pub(crate) struct NativeReexecRlimitV1 {
     pub(crate) maximum: u64,
 }
 
-impl NativeExecCapsuleV2 {
+impl NativeExecCapsuleV1 {
     fn validate(&self) -> Result<(), NativeExecCapsuleError> {
         if self.host_executable_path.is_empty() || self.host_executable_path.len() > MAX_PATH_LEN {
             return Err(NativeExecCapsuleError::InvalidField("host_executable_path"));
@@ -344,29 +242,16 @@ impl NativeExecCapsuleV2 {
         validate_byte_vector("argv", &self.argv)?;
         validate_byte_vector("env", &self.env)?;
         match (self.purpose, &self.guest_exec) {
-            (NativeExecCapsulePurposeV2::PidProbe, None) => {}
-            (NativeExecCapsulePurposeV2::GuestExec, Some(guest)) => guest.validate()?,
+            (NativeExecCapsulePurposeV1::PidProbe, None) => {}
+            (NativeExecCapsulePurposeV1::GuestExec, Some(guest)) => guest.validate()?,
             _ => return Err(NativeExecCapsuleError::InvalidField("purpose")),
         }
         Ok(())
     }
 }
 
-impl NativeGuestExecV2 {
+impl NativeGuestExecV1 {
     fn validate(&self) -> Result<(), NativeExecCapsuleError> {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        let live_arena_invalid = self.live_arena.is_some_and(|arena| {
-            arena.schema != 2
-                || arena.code_len == 0
-                || arena.control_len == 0
-                || arena.code.host_fd < 0
-                || arena.control.host_fd < 0
-                || arena.code.host_fd == arena.control.host_fd
-                || arena.code.host_size != arena.code_len
-                || arena.control.host_size != arena.control_len
-        });
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        let live_arena_invalid = self.live_arena.is_some();
         if self.resolved_path.is_empty()
             || self.resolved_path.len() > MAX_PATH_LEN
             || self.cwd.is_empty()
@@ -374,7 +259,6 @@ impl NativeGuestExecV2 {
             || self.rootfs.root_path.is_empty()
             || self.rootfs.root_path.len() > MAX_PATH_LEN
             || self.max_traps == 0
-            || live_arena_invalid
             || self.kernel_arena.is_some_and(|arena| {
                 arena.host_fd < 0
                     || arena.host_size
@@ -432,9 +316,9 @@ pub(crate) fn begin_pid_probe() -> anyhow::Result<()> {
     let executable = std::env::current_exe()?;
     let executable_bytes = executable.as_os_str().as_bytes().to_vec();
     let producer_pid = unsafe { libc::getpid() as u32 };
-    let payload = NativeExecCapsuleV2 {
+    let payload = NativeExecCapsuleV1 {
         producer_pid,
-        purpose: NativeExecCapsulePurposeV2::PidProbe,
+        purpose: NativeExecCapsulePurposeV1::PidProbe,
         host_executable_path: executable_bytes,
         argv: Vec::new(),
         env: Vec::new(),
@@ -443,7 +327,7 @@ pub(crate) fn begin_pid_probe() -> anyhow::Result<()> {
     let mut nonce = [0_u8; 16];
     getrandom::fill(&mut nonce)
         .map_err(|error| anyhow::anyhow!("generate native exec capsule nonce: {error}"))?;
-    exec_capsule(payload, nonce, None, None)
+    exec_capsule(payload, nonce, None)
 }
 
 // This function's only caller is `native_darwin.rs`, which is itself gated
@@ -464,7 +348,6 @@ pub(crate) fn begin_guest_exec(
     executable_digest: [u8; 32],
     max_traps: usize,
     plan: &crate::page_profile::ExecutionPlan,
-    live_arena: NativeLiveArenaAuthority<'_>,
 ) -> anyhow::Result<()> {
     emit_lifecycle(
         unsafe { libc::getpid() },
@@ -510,13 +393,13 @@ pub(crate) fn begin_guest_exec(
     })?;
     let artifact_spike = crate::native_darwin::artifact_spike_authority_snapshot_if_enabled()?;
     let aot_cache = crate::native_darwin::aot_cache_authority_snapshot()?;
-    let mut payload = NativeExecCapsuleV2 {
+    let mut payload = NativeExecCapsuleV1 {
         producer_pid: unsafe { libc::getpid() as u32 },
-        purpose: NativeExecCapsulePurposeV2::GuestExec,
+        purpose: NativeExecCapsulePurposeV1::GuestExec,
         host_executable_path: executable.as_os_str().as_bytes().to_vec(),
         argv,
         env,
-        guest_exec: Some(NativeGuestExecV2 {
+        guest_exec: Some(NativeGuestExecV1 {
             resolved_path,
             executable_digest,
             rootfs,
@@ -525,10 +408,6 @@ pub(crate) fn begin_guest_exec(
             exec_host_fs_fallback: dispatcher.exec_host_fs_fallback(),
             max_traps: u64::try_from(max_traps)?,
             native_page_profile,
-            live_arena: live_arena
-                .map(|arena| arena.reexec_authority())
-                .transpose()?
-                .map(Into::into),
             kernel_arena: Some(kernel_arena),
             shared_futex_waiters: Some(shared_futex_waiters),
             artifact_spike,
@@ -579,7 +458,7 @@ pub(crate) fn begin_guest_exec(
     let mut nonce = [0_u8; 16];
     getrandom::fill(&mut nonce)
         .map_err(|error| anyhow::anyhow!("generate native exec capsule nonce: {error}"))?;
-    exec_capsule(payload, nonce, prepared_artifact, live_arena)
+    exec_capsule(payload, nonce, prepared_artifact)
 }
 
 // This whole cluster (the failpoint enum, `attach_prepared_image`, and
@@ -601,7 +480,7 @@ enum PreparedImageFailpoint {
 
 #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 fn attach_prepared_image(
-    payload: &mut NativeExecCapsuleV2,
+    payload: &mut NativeExecCapsuleV1,
     image: &crate::memory::AddressSpace,
     relative_relocations: &[crate::native_prepared_image::NativeRelativeRelocation],
     exec_backing: Option<crate::native_prepared_image::PreparedExecutableBacking>,
@@ -619,7 +498,7 @@ fn attach_prepared_image(
 
 #[cfg(test)]
 fn attach_prepared_image_with_failpoint(
-    payload: &mut NativeExecCapsuleV2,
+    payload: &mut NativeExecCapsuleV1,
     image: &crate::memory::AddressSpace,
     relative_relocations: &[crate::native_prepared_image::NativeRelativeRelocation],
     host_page_size: u64,
@@ -637,7 +516,7 @@ fn attach_prepared_image_with_failpoint(
 
 #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 fn attach_prepared_image_inner(
-    payload: &mut NativeExecCapsuleV2,
+    payload: &mut NativeExecCapsuleV1,
     image: &crate::memory::AddressSpace,
     relative_relocations: &[crate::native_prepared_image::NativeRelativeRelocation],
     exec_backing: Option<crate::native_prepared_image::PreparedExecutableBacking>,
@@ -739,12 +618,11 @@ fn attach_prepared_image_inner(
 }
 
 fn exec_capsule(
-    payload: NativeExecCapsuleV2,
+    payload: NativeExecCapsuleV1,
     nonce: [u8; 16],
     prepared_artifact: Option<crate::native_prepared_image::PreparedImageArtifact>,
-    live_arena: NativeLiveArenaAuthority<'_>,
 ) -> anyhow::Result<()> {
-    exec_capsule_with(payload, nonce, prepared_artifact, live_arena, |request| {
+    exec_capsule_with(payload, nonce, prepared_artifact, |request| {
         unsafe {
             libc::execve(
                 request.executable.as_ptr(),
@@ -765,31 +643,14 @@ struct HostExecRequest<'a> {
 }
 
 fn exec_capsule_with<F>(
-    payload: NativeExecCapsuleV2,
+    payload: NativeExecCapsuleV1,
     nonce: [u8; 16],
     prepared_artifact: Option<crate::native_prepared_image::PreparedImageArtifact>,
-    live_arena: NativeLiveArenaAuthority<'_>,
     invoke_exec: F,
 ) -> anyhow::Result<()>
 where
     F: FnOnce(HostExecRequest<'_>) -> std::io::Error,
 {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        let payload_live_arena = payload
-            .guest_exec
-            .as_ref()
-            .and_then(|guest| guest.live_arena);
-        let owned_live_arena = live_arena
-            .map(|arena| arena.reexec_authority())
-            .transpose()?
-            .map(NativeReexecLiveArenaV2::from);
-        if payload_live_arena != owned_live_arena {
-            anyhow::bail!("native live arena capsule metadata has no matching authority owner");
-        }
-    }
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    let _ = live_arena;
     #[cfg(feature = "alloc-owner-census")]
     let next_allocation_exec_epoch = payload
         .guest_exec
@@ -876,20 +737,6 @@ where
 
     let mut prepared_host_fds = HostFdFlagTransaction::default();
     if let Some(guest) = &payload.guest_exec {
-        // The live arena's two backing descriptors. They enter the transit
-        // window only when this process holds an owned arena AND the payload
-        // names one — the both-or-neither check above is what proves that, so
-        // the arena-absent self-exec path prepares nothing here and is
-        // byte-for-byte the path that ships today.
-        if let Some(arena) = guest.live_arena {
-            for object in [arena.code, arena.control] {
-                prepared_host_fds.prepare(
-                    object.host_fd,
-                    object.original_host_fd_flags,
-                    object.original_host_fd_flags & !libc::FD_CLOEXEC,
-                )?;
-            }
-        }
         if let Some(arena) = guest.kernel_arena {
             prepared_host_fds.prepare(
                 arena.host_fd,
@@ -1148,7 +995,7 @@ pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::Native
         crate::probes::DsrCacheLifecyclePhase::HostSelfReexecCapsuleEnd,
     );
     match payload.purpose {
-        NativeExecCapsulePurposeV2::PidProbe => Ok(crate::NativeSelfReexecOutcome::PidProbe {
+        NativeExecCapsulePurposeV1::PidProbe => Ok(crate::NativeSelfReexecOutcome::PidProbe {
             before: payload.producer_pid,
             after: current_pid,
         }),
@@ -1159,26 +1006,10 @@ pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::Native
         // calls are gated the same way rather than left as newly-dead
         // cross-references off that lane.
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        NativeExecCapsulePurposeV2::GuestExec => {
+        NativeExecCapsulePurposeV1::GuestExec => {
             let guest = payload
                 .guest_exec
                 .ok_or_else(|| anyhow::anyhow!("native guest exec capsule has no guest state"))?;
-            let live_arena = guest
-                .live_arena
-                .map(|arena| {
-                    carrick_native_darwin::live_arena::DarwinLiveArena::adopt_reexec(arena.into())
-                })
-                .transpose()?;
-            #[cfg(test)]
-            let mut live_arena = live_arena;
-            #[cfg(test)]
-            if std::env::var_os("CARRICK_TEST_NATIVE_LIVE_ARENA_OWNER_RESUME").is_some() {
-                let arena = live_arena
-                    .take()
-                    .ok_or_else(|| anyhow::anyhow!("child did not adopt live arena"))?;
-                let exit_code = native_exec_live_arena_owned_resume_hook(arena)?;
-                return Ok(crate::NativeSelfReexecOutcome::GuestExit(exit_code));
-            }
             if let Some(artifact) = &guest.artifact_spike {
                 crate::native_darwin::adopt_artifact_spike_for_resume(artifact)?;
             }
@@ -1190,36 +1021,18 @@ pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::Native
                 current_pid as i32,
                 crate::probes::DsrCacheLifecyclePhase::HostSelfReexecRestoreBegin,
             );
-            let exit_code = crate::native_darwin::resume_guest_from_capsule(
-                guest,
-                payload.argv,
-                payload.env,
-                live_arena,
-            )?;
+            let exit_code =
+                crate::native_darwin::resume_guest_from_capsule(guest, payload.argv, payload.env)?;
             Ok(crate::NativeSelfReexecOutcome::GuestExit(exit_code))
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        NativeExecCapsulePurposeV2::GuestExec => {
+        NativeExecCapsulePurposeV1::GuestExec => {
             anyhow::bail!(
                 "native guest-exec self-reexec resume is only wired on macOS/aarch64 \
                  (the only lane that ever produces a GuestExec-purpose capsule)"
             )
         }
     }
-}
-
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn native_exec_live_arena_resume_hook(
-    arena: Option<&std::sync::Arc<carrick_native_darwin::live_arena::DarwinLiveArena>>,
-) -> anyhow::Result<Option<i32>> {
-    tests::native_exec_live_arena::resume_hook(arena)
-}
-
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
-fn native_exec_live_arena_owned_resume_hook(
-    arena: carrick_native_darwin::live_arena::DarwinLiveArena,
-) -> anyhow::Result<i32> {
-    tests::native_exec_live_arena::resume_owned_hook(arena)
 }
 
 fn emit_lifecycle(tid: i32, phase: crate::probes::DsrCacheLifecyclePhase) {
@@ -1345,7 +1158,7 @@ pub(crate) enum NativeExecCapsuleError {
 pub(crate) fn write_capsule(
     fd: RawFd,
     nonce: [u8; 16],
-    payload: &NativeExecCapsuleV2,
+    payload: &NativeExecCapsuleV1,
 ) -> Result<(), NativeExecCapsuleError> {
     payload.validate()?;
     let encoded = serde_json::to_vec(payload)?;
@@ -1375,7 +1188,7 @@ pub(crate) fn write_capsule(
 pub(crate) fn read_capsule_once(
     fd: RawFd,
     expected_nonce: [u8; 16],
-) -> Result<NativeExecCapsuleV2, NativeExecCapsuleError> {
+) -> Result<NativeExecCapsuleV1, NativeExecCapsuleError> {
     let file = duplicate_regular_file(fd)?;
     let mut header = [0_u8; HEADER_LEN];
     read_exact_at(&file, &mut header, 0)?;
@@ -1413,7 +1226,7 @@ pub(crate) fn read_capsule_once(
     if header[20..52] != Sha256::digest(&encoded)[..] {
         return Err(NativeExecCapsuleError::ChecksumMismatch);
     }
-    let payload: NativeExecCapsuleV2 = serde_json::from_slice(&encoded)?;
+    let payload: NativeExecCapsuleV1 = serde_json::from_slice(&encoded)?;
     payload.validate()?;
 
     // Invalidate only after the complete payload has passed framing, checksum,
@@ -1474,8 +1287,8 @@ mod tests {
     use std::os::unix::fs::FileExt;
 
     use super::{
-        HEADER_LEN, MAX_ITEM_LEN, NativeExecCapsulePurposeV2, NativeExecCapsuleV2,
-        NativeGuestExecV2, PreparedImageFailpoint, attach_prepared_image,
+        HEADER_LEN, MAX_ITEM_LEN, NativeExecCapsulePurposeV1, NativeExecCapsuleV1,
+        NativeGuestExecV1, PreparedImageFailpoint, attach_prepared_image,
         attach_prepared_image_with_failpoint, exec_capsule_with,
         fail_next_artifact_fd_flag_preparation, fd_no_longer_refers_to, read_capsule_once,
         set_native_exec_capsule_lifecycle_capture, take_last_preexec_validation_artifact,
@@ -1498,14 +1311,14 @@ mod tests {
         unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 == HOST_PAGE_SIZE }
     }
 
-    fn sample() -> NativeExecCapsuleV2 {
-        NativeExecCapsuleV2 {
+    fn sample() -> NativeExecCapsuleV1 {
+        NativeExecCapsuleV1 {
             producer_pid: 42,
-            purpose: NativeExecCapsulePurposeV2::GuestExec,
+            purpose: NativeExecCapsulePurposeV1::GuestExec,
             host_executable_path: b"/bin/probe".to_vec(),
             argv: vec![b"probe".to_vec(), b"stage2".to_vec()],
             env: vec![b"A=B".to_vec()],
-            guest_exec: Some(NativeGuestExecV2 {
+            guest_exec: Some(NativeGuestExecV1 {
                 resolved_path: "/bin/probe".to_owned(),
                 executable_digest: [0x11; 32],
                 rootfs: crate::fs_backend::HostFsReexecAuthority {
@@ -1519,7 +1332,6 @@ mod tests {
                 exec_host_fs_fallback: false,
                 max_traps: 100,
                 native_page_profile: carrick_spec::NativePageProfileRequest::Native16k,
-                live_arena: None,
                 kernel_arena: None,
                 shared_futex_waiters: None,
                 artifact_spike: None,
@@ -1629,7 +1441,7 @@ mod tests {
     }
 
     fn install_transport_fds(
-        payload: &mut NativeExecCapsuleV2,
+        payload: &mut NativeExecCapsuleV1,
         xsig: &std::fs::File,
         survivor: &std::fs::File,
         close_on_exec: &std::fs::File,
@@ -1728,7 +1540,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_bind_mounts_uses_the_nested_schema_default() {
+    fn legacy_v1_payload_without_bind_mounts_defaults_to_empty() {
         let payload = sample();
         let mut value = serde_json::to_value(payload).expect("serialize capsule");
         value
@@ -1737,8 +1549,8 @@ mod tests {
             .expect("guest payload")
             .remove("bind_mounts");
 
-        let decoded: NativeExecCapsuleV2 =
-            serde_json::from_value(value).expect("decode nested bind-mount default");
+        let decoded: NativeExecCapsuleV1 =
+            serde_json::from_value(value).expect("decode prior V1 payload");
         assert!(
             decoded
                 .guest_exec
@@ -1749,22 +1561,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_payload_requires_explicit_live_arena_field() {
-        let payload = sample();
-        let mut value = serde_json::to_value(payload).expect("serialize capsule");
-        value
-            .get_mut("guest_exec")
-            .and_then(serde_json::Value::as_object_mut)
-            .expect("guest payload")
-            .remove("live_arena");
-
-        let error = serde_json::from_value::<NativeExecCapsuleV2>(value)
-            .expect_err("missing live arena field must reject V2 capsule");
-        assert!(error.to_string().contains("live_arena"));
-    }
-
-    #[test]
-    fn nested_v1_process_state_defaults_to_unconfined_and_untraced() {
+    fn legacy_v1_process_state_defaults_to_unconfined_and_untraced() {
         let payload = sample();
         let mut value = serde_json::to_value(payload).expect("serialize capsule");
         let process_state = value
@@ -1775,8 +1572,8 @@ mod tests {
         process_state.remove("seccomp_policy");
         process_state.remove("ptrace_traceme");
 
-        let decoded: NativeExecCapsuleV2 =
-            serde_json::from_value(value).expect("decode nested process-state defaults");
+        let decoded: NativeExecCapsuleV1 =
+            serde_json::from_value(value).expect("decode prior V1 payload");
         let process_state = decoded.guest_exec.expect("guest payload").process_state;
         assert_eq!(
             process_state.seccomp_policy,
@@ -1786,7 +1583,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_optional_shared_authorities_keeps_unshared_attach_path() {
+    fn legacy_v1_payload_without_shared_authorities_keeps_legacy_attach_path() {
         let payload = sample();
         let mut value = serde_json::to_value(payload).expect("serialize capsule");
         let guest = value
@@ -1796,15 +1593,15 @@ mod tests {
         guest.remove("kernel_arena");
         guest.remove("shared_futex_waiters");
 
-        let decoded: NativeExecCapsuleV2 =
-            serde_json::from_value(value).expect("decode optional shared-authority defaults");
+        let decoded: NativeExecCapsuleV1 =
+            serde_json::from_value(value).expect("decode prior V1 payload");
         let guest = decoded.guest_exec.expect("guest payload");
         assert!(guest.kernel_arena.is_none());
         assert!(guest.shared_futex_waiters.is_none());
     }
 
     #[test]
-    fn missing_profile_startup_defaults_to_none() {
+    fn legacy_v1_payload_without_profile_startup_defaults_to_none() {
         let payload = sample();
         let mut value = serde_json::to_value(payload).expect("serialize capsule");
         value
@@ -1813,14 +1610,14 @@ mod tests {
             .expect("guest payload")
             .remove("profile_startup");
 
-        let decoded: NativeExecCapsuleV2 =
-            serde_json::from_value(value).expect("decode profile-startup default");
+        let decoded: NativeExecCapsuleV1 =
+            serde_json::from_value(value).expect("decode prior V1 payload");
         let guest = decoded.guest_exec.expect("guest payload");
         assert!(guest.profile_startup.is_none());
     }
 
     #[test]
-    fn missing_profile_exec_epoch_defaults_to_zero() {
+    fn legacy_v1_payload_without_profile_exec_epoch_defaults_to_zero() {
         let payload = sample();
         let mut value = serde_json::to_value(payload).expect("serialize capsule");
         value
@@ -1829,8 +1626,8 @@ mod tests {
             .expect("guest payload")
             .remove("profile_exec_epoch");
 
-        let decoded: NativeExecCapsuleV2 =
-            serde_json::from_value(value).expect("decode profile-epoch default");
+        let decoded: NativeExecCapsuleV1 =
+            serde_json::from_value(value).expect("decode prior V1 payload");
         assert_eq!(
             decoded
                 .guest_exec
@@ -1853,7 +1650,7 @@ mod tests {
             readonly: true,
         }];
 
-        let result = exec_capsule_with(payload, [0x31; 16], None, None, |_| {
+        let result = exec_capsule_with(payload, [0x31; 16], None, |_| {
             panic!("invalid bind mount must not reach host exec")
         });
         assert!(result.is_err());
@@ -1861,9 +1658,9 @@ mod tests {
 
     #[test]
     fn pid_probe_capsule_remains_valid_without_guest_mount_state() {
-        let payload = NativeExecCapsuleV2 {
+        let payload = NativeExecCapsuleV1 {
             producer_pid: 42,
-            purpose: NativeExecCapsulePurposeV2::PidProbe,
+            purpose: NativeExecCapsulePurposeV1::PidProbe,
             host_executable_path: b"/bin/probe".to_vec(),
             argv: Vec::new(),
             env: Vec::new(),
@@ -1947,7 +1744,7 @@ mod tests {
         install_transport_fds(&mut payload, &xsig, &survivor, &close_on_exec);
         let nonce = [0x66; 16];
 
-        let result = exec_capsule_with(payload, nonce, None, None, |request| {
+        let result = exec_capsule_with(payload, nonce, None, |request| {
             let decoded =
                 read_capsule_once(request.capsule_fd, nonce).expect("read fallback capsule");
             assert!(
@@ -1997,7 +1794,7 @@ mod tests {
         let mut invoke_state = None;
         let mut matching_epoch_entries = Vec::new();
 
-        let result = exec_capsule_with(payload, [0x67; 16], None, None, |request| {
+        let result = exec_capsule_with(payload, [0x67; 16], None, |request| {
             invoke_state = Some(allocation_census::state());
             matching_epoch_entries = request
                 .env
@@ -2056,7 +1853,7 @@ mod tests {
             authority_nonce: nonce,
         });
 
-        let result = exec_capsule_with(payload, [0x44; 16], None, None, |_| {
+        let result = exec_capsule_with(payload, [0x44; 16], None, |_| {
             assert_eq!(fd_flags(fd) & libc::FD_CLOEXEC, 0);
             std::io::Error::from_raw_os_error(libc::ENOEXEC)
         });
@@ -2087,7 +1884,7 @@ mod tests {
             translator_abi: carrick_dsr_aarch64::shared_cache::TRANSLATOR_ABI_CURRENT,
         });
 
-        let result = exec_capsule_with(payload, [0x45; 16], None, None, |_| {
+        let result = exec_capsule_with(payload, [0x45; 16], None, |_| {
             assert_eq!(fd_flags(fd) & libc::FD_CLOEXEC, 0);
             std::io::Error::from_raw_os_error(libc::ENOEXEC)
         });
@@ -2137,7 +1934,7 @@ mod tests {
         let artifact_identity = host_identity(artifact_fd);
         payload.argv = vec![vec![0; MAX_ITEM_LEN + 1]];
 
-        let result = exec_capsule_with(payload, [0x77; 16], Some(artifact), None, |_| {
+        let result = exec_capsule_with(payload, [0x77; 16], Some(artifact), |_| {
             panic!("invalid capsule must not reach host exec")
         });
 
@@ -2214,7 +2011,7 @@ mod tests {
         });
         let mut saw_exec = false;
 
-        let result = exec_capsule_with(payload, [0x33; 16], Some(artifact), None, |request| {
+        let result = exec_capsule_with(payload, [0x33; 16], Some(artifact), |request| {
             saw_exec = true;
             assert_eq!(fd_flags(request.capsule_fd), 0);
             assert_eq!(
@@ -2260,7 +2057,7 @@ mod tests {
         install_transport_fds(&mut payload, &xsig, &survivor, &close_on_exec);
         fail_next_artifact_fd_flag_preparation(artifact_fd);
 
-        let result = exec_capsule_with(payload, [0x22; 16], Some(artifact), None, |_| {
+        let result = exec_capsule_with(payload, [0x22; 16], Some(artifact), |_| {
             panic!("host exec must not run after artifact flag failure")
         });
 
@@ -2409,7 +2206,7 @@ mod tests {
         let file = tempfile::tempfile().expect("temporary capsule");
         let nonce = [0x5a; 16];
         write_capsule(file.as_raw_fd(), nonce, &sample()).expect("write capsule");
-        file.write_at(&1_u16.to_le_bytes(), 8)
+        file.write_at(&2_u16.to_le_bytes(), 8)
             .expect("replace version");
         assert!(read_capsule_once(file.as_raw_fd(), nonce).is_err());
 
@@ -2424,1061 +2221,5 @@ mod tests {
         let mut payload = sample();
         payload.argv = vec![vec![0; MAX_ITEM_LEN + 1]];
         assert!(write_capsule(file.as_raw_fd(), nonce, &payload).is_err());
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub(super) mod native_exec_live_arena {
-        use super::*;
-        use carrick_dsr::cache::PageGenerationTable;
-        use carrick_dsr_aarch64::block::{BlockPlan, PlannedExit, PlannedInst};
-        use carrick_dsr_aarch64::emit::{
-            EmitAddressMode, PreparedSharedInitial, prepare_shared_initial,
-        };
-        use carrick_dsr_aarch64::live_arena::{
-            LiveArenaCapacities, LiveBlockAuthority as _, LiveBlockExtents, LiveReservation,
-        };
-        use carrick_dsr_aarch64::shared_cache::{
-            AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
-            NativePageProfileIdentity, SourceFingerprint, TranslationUnitKey,
-        };
-        use carrick_dsr_aarch64::types::{CodeGeneration, InstAction};
-        use carrick_guest_mem::GuestVa;
-        use carrick_native_darwin::live_arena::{
-            DarwinLiveArena, DarwinLiveLookup, DarwinLiveReadyLookup, LiveArenaProcessView,
-        };
-        use mach2::kern_return::KERN_SUCCESS;
-        use mach2::traps::mach_task_self;
-        use mach2::vm::{mach_vm_allocate, mach_vm_deallocate};
-        use mach2::vm_statistics::VM_FLAGS_FIXED;
-
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::fs::MetadataExt;
-        use std::sync::Arc;
-
-        use crate::native_exec_capsule::{
-            NativeReexecLiveArenaV2, NativeReexecXsigV1, encode_nonce,
-        };
-
-        const CHILD_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_CHILD";
-        const CHILD_CAPSULE_FD_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_CAPSULE_FD";
-        const CHILD_NONCE_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_NONCE";
-        const CHILD_PARENT_RANGES_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_PARENT_RANGES";
-        const CHILD_RECEIPT_FD_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_RECEIPT_FD";
-        const CHILD_ATTACHED_FD_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_ATTACHED_FD";
-        const CHILD_REPUBLISHED_FD_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_REPUBLISHED_FD";
-        const OWNER_RESUME_STAGE_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_OWNER_RESUME";
-        const OWNER_PID_ENV: &str = "CARRICK_TEST_NATIVE_LIVE_ARENA_OWNER_PID";
-        const CHILD_TEST_NAME: &str =
-            "native_exec_capsule::tests::native_exec_live_arena::exec_successor_child";
-        const OWNER_READY_RECEIPT: u8 = 0xb1;
-        const RESUME_RECEIPT: u8 = 0xa1;
-        const FRESH_RECEIPT: u8 = 0xf1;
-        const BYTES_RECEIPT: u8 = 0xb2;
-        const POST_EXEC_READY_RECEIPT: u8 = 0xb3;
-        const ATTACHED_SIGNAL: u8 = 0x5a;
-        const REPUBLISHED_SIGNAL: u8 = 0xa5;
-        const READY_WIRE_LEN: usize = 80;
-        const INVALIDATE_WIRE_LEN: usize = 16;
-        /// What the creator's pre-fork stub returns, and what the successor's
-        /// post-exec stub returns. Real AArch64 (`movz w0, #N; ret`).
-        const FIRST_STUB_VALUE: u16 = 42;
-        const SECOND_STUB_VALUE: u16 = 43;
-        static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        static LIFECYCLE_RECEIPT: std::sync::OnceLock<LifecycleReceipt> =
-            std::sync::OnceLock::new();
-
-        unsafe extern "C" {
-            fn sys_icache_invalidate(start: *mut libc::c_void, len: usize);
-        }
-
-        #[derive(Clone, Copy)]
-        struct LifecycleReceipt {
-            fresh: bool,
-            records_match: bool,
-            bytes_match: bool,
-            invalidate_match: bool,
-            first_stub: u32,
-            post_exec_ready: bool,
-            post_exec_stub: u32,
-            child_status: i32,
-        }
-
-        fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-            TEST_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-        }
-
-        fn arena() -> DarwinLiveArena {
-            DarwinLiveArena::new(LiveArenaCapacities::V2).expect("live arena")
-        }
-
-        fn bind_real_xsig(payload: &mut NativeExecCapsuleV2, file: &std::fs::File) {
-            let fd = file.as_raw_fd();
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-            assert!(flags >= 0);
-            let metadata = file.metadata().expect("xsig metadata");
-            let guest = payload.guest_exec.as_mut().expect("guest");
-            guest.xsig = NativeReexecXsigV1 {
-                host_fd: fd,
-                original_host_fd_flags: flags,
-                host_device: metadata.dev(),
-                host_inode: metadata.ino(),
-                host_size: metadata.len(),
-            };
-        }
-
-        fn live_key() -> TranslationUnitKey {
-            TranslationUnitKey::for_segment(
-                ExecutableIdentity::Digest([0x42; 32]),
-                ImageFileOffset::new(0),
-                ImageFileLen::new(16 * 1024).expect("nonzero image length"),
-                GuestVa(0x4000_0000),
-                GuestCodeLen::new(16 * 1024).expect("nonzero guest length"),
-                SourceFingerprint([0x7a; 32]),
-                NativePageProfileIdentity::Native16k,
-                AddressModeIdentity::Direct,
-            )
-        }
-
-        fn prepared_publication() -> PreparedSharedInitial {
-            prepared_publication_at(GuestVa(0x4000_0000))
-        }
-
-        /// One real prepared INITIAL block starting at `start`, three
-        /// instructions wide. Both publications the lifecycle proof makes come
-        /// from here, so the successor can rebuild the exact expected bytes.
-        fn prepared_publication_at(start: GuestVa) -> PreparedSharedInitial {
-            prepare_shared_initial(
-                &live_key(),
-                &BlockPlan {
-                    start,
-                    end: GuestVa(start.raw() + 0xc),
-                    generation: CodeGeneration::INITIAL,
-                    instructions: vec![
-                        PlannedInst {
-                            guest: start,
-                            action: InstAction::Copy(0xd503_201f),
-                        },
-                        PlannedInst {
-                            guest: GuestVa(start.raw() + 4),
-                            action: InstAction::Copy(0x9100_0400),
-                        },
-                    ],
-                    exit: PlannedExit::Syscall {
-                        guest: GuestVa(start.raw() + 8),
-                        resume: GuestVa(start.raw() + 0xc),
-                    },
-                    extensions: Vec::new(),
-                },
-                EmitAddressMode::Direct,
-                Vec::new(),
-            )
-            .expect("prepare real shared INITIAL publication")
-        }
-
-        /// `movz w0, #value; ret` — a directly callable AArch64 stub.
-        fn return_immediate(value: u16) -> [u8; 8] {
-            let mov_w0 = 0x5280_0000_u32 | (u32::from(value) << 5);
-            let ret = 0xd65f_03c0_u32;
-            let mut code = [0_u8; 8];
-            code[..4].copy_from_slice(&mov_w0.to_le_bytes());
-            code[4..].copy_from_slice(&ret.to_le_bytes());
-            code
-        }
-
-        /// Offsets, inside the code payload, of the two directly-executable
-        /// stubs the lifecycle proof uses.
-        ///
-        /// The V2 protocol's own publications are real translated blocks that
-        /// end in a gateway exit and cannot be called standalone, so the
-        /// EXECUTION half of the proof uses hand-written stubs placed in the
-        /// payload's LAST 64 KiB chunk — an extent the chunk cursor allocates
-        /// only after 1,023 other chunks, i.e. never in this proof. They ride
-        /// the same object, the same aliases, and the same coherence rules as
-        /// published code.
-        fn stub_offsets(arena: &DarwinLiveArena) -> (usize, usize) {
-            let capacity = arena.control_layout().capacities().code as usize;
-            let first = capacity - 64 * 1024;
-            (first, first + 128)
-        }
-
-        fn ready_wire(extents: LiveBlockExtents, code_sha256: [u8; 32]) -> [u8; READY_WIRE_LEN] {
-            let mut wire = [0_u8; READY_WIRE_LEN];
-            let values = [
-                extents.code.offset,
-                extents.code.len,
-                extents.hot.offset,
-                extents.hot.len,
-                extents.cold.offset,
-                extents.cold.len,
-            ];
-            for (index, value) in values.into_iter().enumerate() {
-                wire[index * 8..index * 8 + 8].copy_from_slice(&value.to_le_bytes());
-            }
-            wire[48..].copy_from_slice(&code_sha256);
-            wire
-        }
-
-        fn invalidate_wire(extent: LiveReservation) -> [u8; INVALIDATE_WIRE_LEN] {
-            let mut wire = [0_u8; INVALIDATE_WIRE_LEN];
-            wire[..8].copy_from_slice(&extent.offset.to_le_bytes());
-            wire[8..].copy_from_slice(&extent.len.to_le_bytes());
-            wire
-        }
-
-        fn pipe() -> [libc::c_int; 2] {
-            let mut fds = [-1; 2];
-            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "create pipe");
-            fds
-        }
-
-        fn close_fd(fd: libc::c_int) {
-            assert_eq!(unsafe { libc::close(fd) }, 0, "close fd {fd}");
-        }
-
-        fn write_byte(fd: libc::c_int, byte: u8) -> anyhow::Result<()> {
-            let mut written = 0;
-            while written == 0 {
-                let result = unsafe { libc::write(fd, (&raw const byte).cast(), 1) };
-                if result == 1 {
-                    written = 1;
-                } else if result < 0
-                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-                {
-                    continue;
-                } else {
-                    anyhow::bail!("write lifecycle byte: {}", std::io::Error::last_os_error());
-                }
-            }
-            Ok(())
-        }
-
-        fn read_byte(fd: libc::c_int) -> anyhow::Result<u8> {
-            let mut poll_fd = libc::pollfd {
-                fd,
-                events: libc::POLLIN | libc::POLLHUP,
-                revents: 0,
-            };
-            loop {
-                let result = unsafe { libc::poll(&mut poll_fd, 1, 15_000) };
-                if result > 0 {
-                    break;
-                }
-                if result < 0
-                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-                {
-                    continue;
-                }
-                anyhow::bail!("timed out waiting for live-arena child receipt");
-            }
-            let mut byte = 0;
-            loop {
-                let result = unsafe { libc::read(fd, (&raw mut byte).cast(), 1) };
-                if result == 1 {
-                    return Ok(byte);
-                }
-                if result < 0
-                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-                {
-                    continue;
-                }
-                if result == 0 {
-                    anyhow::bail!("live-arena child closed its receipt pipe");
-                }
-                anyhow::bail!(
-                    "read live-arena child receipt: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-        }
-
-        fn write_exact(fd: libc::c_int, bytes: &[u8]) -> anyhow::Result<()> {
-            let mut written = 0;
-            while written < bytes.len() {
-                let result = unsafe {
-                    libc::write(fd, bytes[written..].as_ptr().cast(), bytes.len() - written)
-                };
-                if result > 0 {
-                    written += result as usize;
-                } else if result < 0
-                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-                {
-                    continue;
-                } else {
-                    anyhow::bail!(
-                        "write fixed live-arena receipt: {}",
-                        std::io::Error::last_os_error()
-                    );
-                }
-            }
-            Ok(())
-        }
-
-        fn read_exact<const N: usize>(fd: libc::c_int) -> anyhow::Result<[u8; N]> {
-            let mut bytes = [0_u8; N];
-            for byte in &mut bytes {
-                *byte = read_byte(fd)?;
-            }
-            Ok(bytes)
-        }
-
-        fn format_ranges(ranges: &[std::ops::Range<usize>; 3]) -> String {
-            ranges
-                .iter()
-                .map(|range| format!("{:x}-{:x}", range.start, range.end))
-                .collect::<Vec<_>>()
-                .join(",")
-        }
-
-        fn parse_ranges(encoded: &str) -> anyhow::Result<[std::ops::Range<usize>; 3]> {
-            let ranges = encoded
-                .split(',')
-                .map(|encoded_range| {
-                    let (start, end) = encoded_range
-                        .split_once('-')
-                        .ok_or_else(|| anyhow::anyhow!("invalid encoded live-arena range"))?;
-                    Ok(usize::from_str_radix(start, 16)?..usize::from_str_radix(end, 16)?)
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            ranges
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("live-arena range vector does not have three entries"))
-        }
-
-        struct FixedReservations(Vec<std::ops::Range<usize>>);
-
-        impl FixedReservations {
-            fn reserve(ranges: &[std::ops::Range<usize>; 3]) -> anyhow::Result<Self> {
-                let mut reserved = Vec::new();
-                for range in ranges {
-                    let mut address = range.start as u64;
-                    let result = unsafe {
-                        mach_vm_allocate(
-                            mach_task_self(),
-                            &mut address,
-                            range.len() as u64,
-                            VM_FLAGS_FIXED,
-                        )
-                    };
-                    if result == KERN_SUCCESS {
-                        if address != range.start as u64 {
-                            anyhow::bail!(
-                                "fixed parent live-arena reservation moved from {:#x} to {address:#x}",
-                                range.start
-                            );
-                        }
-                        reserved.push(range.clone());
-                    }
-                    // A fixed allocation failure means the fresh process image
-                    // already occupies part of this exact old range. That is
-                    // equally strong anti-reuse authority: the adopted mapping
-                    // cannot be placed at the parent's old base.
-                }
-                Ok(Self(reserved))
-            }
-        }
-
-        impl Drop for FixedReservations {
-            fn drop(&mut self) {
-                for range in self.0.drain(..) {
-                    unsafe {
-                        mach_vm_deallocate(
-                            mach_task_self(),
-                            range.start as u64,
-                            range.len() as u64,
-                        );
-                    }
-                }
-            }
-        }
-
-        struct ChildGuard(Option<libc::pid_t>);
-
-        impl Drop for ChildGuard {
-            fn drop(&mut self) {
-                if let Some(pid) = self.0 {
-                    unsafe {
-                        libc::kill(pid, libc::SIGKILL);
-                        libc::waitpid(pid, std::ptr::null_mut(), 0);
-                    }
-                }
-            }
-        }
-
-        fn lifecycle_receipt() -> LifecycleReceipt {
-            *LIFECYCLE_RECEIPT.get_or_init(|| run_lifecycle_proof().expect("real lifecycle proof"))
-        }
-
-        fn run_lifecycle_proof() -> anyhow::Result<LifecycleReceipt> {
-            let executable = std::env::current_exe()?;
-            let receipt = pipe();
-            let argv = [
-                CString::new(executable.as_os_str().as_bytes())?,
-                CString::new("--exact")?,
-                CString::new(CHILD_TEST_NAME)?,
-                CString::new("--nocapture")?,
-                CString::new("--test-threads=1")?,
-            ];
-            let argv_ptrs = argv
-                .iter()
-                .map(|entry| entry.as_ptr())
-                .chain(std::iter::once(std::ptr::null()))
-                .collect::<Vec<_>>();
-            let mut env = std::env::vars_os()
-                .filter(|(key, _)| {
-                    !key.as_os_str()
-                        .as_bytes()
-                        .starts_with(b"CARRICK_TEST_NATIVE_LIVE_ARENA_")
-                })
-                .map(|(key, value)| {
-                    let mut entry = key.as_os_str().as_bytes().to_vec();
-                    entry.push(b'=');
-                    entry.extend_from_slice(value.as_os_str().as_bytes());
-                    CString::new(entry)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            for (key, value) in [
-                (CHILD_ENV, "1".to_owned()),
-                (CHILD_RECEIPT_FD_ENV, receipt[1].to_string()),
-            ] {
-                env.push(CString::new(format!("{key}={value}"))?);
-            }
-            let env_ptrs = env
-                .iter()
-                .map(|entry| entry.as_ptr())
-                .chain(std::iter::once(std::ptr::null()))
-                .collect::<Vec<_>>();
-            let receipt_flags = unsafe { libc::fcntl(receipt[1], libc::F_GETFD) };
-            assert!(receipt_flags >= 0 && receipt_flags & libc::FD_CLOEXEC == 0);
-
-            let pid = unsafe { libc::fork() };
-            if pid < 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            if pid == 0 {
-                unsafe {
-                    libc::close(receipt[0]);
-                    libc::execve(argv[0].as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr());
-                    libc::_exit(127);
-                }
-            }
-            close_fd(receipt[1]);
-            let mut child_guard = ChildGuard(Some(pid));
-
-            if read_byte(receipt[0])? != OWNER_READY_RECEIPT {
-                anyhow::bail!("creator did not publish owner READY receipt");
-            }
-            let owner_ready = read_exact::<READY_WIRE_LEN>(receipt[0])?;
-            let resume_byte = read_byte(receipt[0])?;
-            if resume_byte != RESUME_RECEIPT {
-                anyhow::bail!(
-                    "successor bypassed production resume entry: receipt={resume_byte:#x}"
-                );
-            }
-            let fresh_byte = read_byte(receipt[0])?;
-            if fresh_byte != FRESH_RECEIPT {
-                anyhow::bail!("successor did not publish fresh-address receipt");
-            }
-            let fresh = true;
-            let successor_ready = read_exact::<READY_WIRE_LEN>(receipt[0])?;
-            let bytes_match = read_byte(receipt[0])? == BYTES_RECEIPT;
-            let successor_invalidate = read_exact::<INVALIDATE_WIRE_LEN>(receipt[0])?;
-            let first_stub = u32::from(read_byte(receipt[0])?);
-            let post_exec_ready = read_byte(receipt[0])? == POST_EXEC_READY_RECEIPT;
-            let post_exec_stub = u32::from(read_byte(receipt[0])?);
-            close_fd(receipt[0]);
-
-            let mut child_status = 0;
-            if unsafe { libc::waitpid(pid, &mut child_status, 0) } != pid {
-                anyhow::bail!(
-                    "wait for lifecycle child: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-            child_guard.0 = None;
-            Ok(LifecycleReceipt {
-                fresh,
-                records_match: owner_ready == successor_ready,
-                bytes_match,
-                invalidate_match: owner_ready[..16] == successor_invalidate,
-                first_stub,
-                post_exec_ready,
-                post_exec_stub,
-                child_status,
-            })
-        }
-
-        pub(crate) fn resume_hook(
-            _arena: Option<&Arc<DarwinLiveArena>>,
-        ) -> anyhow::Result<Option<i32>> {
-            Ok(None)
-        }
-
-        /// The successor, running after the forked child's host self-exec with
-        /// nothing but two inherited descriptors and the capsule.
-        pub(crate) fn resume_owned_hook(arena: DarwinLiveArena) -> anyhow::Result<i32> {
-            let arena = Arc::new(arena);
-            let parent_ranges = parse_ranges(&std::env::var(CHILD_PARENT_RANGES_ENV)?)?;
-            let adopted_ranges = unsafe { arena.local_mapping_ranges_for_transport_proof()? };
-            let fresh = adopted_ranges.iter().all(|adopted| {
-                parent_ranges
-                    .iter()
-                    .all(|parent| adopted.end <= parent.start || parent.end <= adopted.start)
-            });
-            let receipt_fd: libc::c_int = std::env::var(CHILD_RECEIPT_FD_ENV)?.parse()?;
-            let attached_fd: libc::c_int = std::env::var(CHILD_ATTACHED_FD_ENV)?.parse()?;
-            let republished_fd: libc::c_int = std::env::var(CHILD_REPUBLISHED_FD_ENV)?.parse()?;
-            let generations = PageGenerationTable::new(16 * 1024)?;
-            let view = LiveArenaProcessView::new(Arc::clone(&arena), generations.domain())?;
-            let generation = generations.observe(GuestVa(0x4000_0000))?;
-            let ready = match view.acquire_ready_or_miss(&live_key(), GuestVa(0x4000_0000)) {
-                DarwinLiveReadyLookup::Ready(ready) => ready,
-                DarwinLiveReadyLookup::Miss => {
-                    anyhow::bail!("successor did not observe creator READY record")
-                }
-                DarwinLiveReadyLookup::Private(reason) => {
-                    anyhow::bail!("successor READY lookup went private: {reason:?}")
-                }
-            };
-            let executable = view
-                .acquire(ready, &generation)
-                .map_err(|reason| anyhow::anyhow!("successor acquire failed: {reason:?}"))?;
-            let extents = executable.extents();
-            let expected = prepared_publication();
-            let layout = arena.control_layout();
-            let mapped_eq = |address: usize, expected: &[u8]| unsafe {
-                std::slice::from_raw_parts(address as *const u8, expected.len()) == expected
-            };
-            let bytes_match = mapped_eq(
-                adopted_ranges[1].start + layout.code_payload_base() + extents.code.offset as usize,
-                expected.code_bytes(),
-            ) && mapped_eq(
-                adopted_ranges[2].start + layout.hot_base() + extents.hot.offset as usize,
-                expected.hot_bytes(),
-            ) && mapped_eq(
-                adopted_ranges[2].start + layout.cold_base() + extents.cold.offset as usize,
-                expected.cold_bytes(),
-            );
-            write_byte(receipt_fd, RESUME_RECEIPT)?;
-            write_byte(receipt_fd, if fresh { FRESH_RECEIPT } else { 0 })?;
-            write_exact(
-                receipt_fd,
-                &ready_wire(executable.extents(), executable.code_sha256()),
-            )?;
-            write_byte(receipt_fd, if bytes_match { BYTES_RECEIPT } else { 0 })?;
-            write_exact(
-                receipt_fd,
-                &invalidate_wire(executable.invalidated_code_extent()),
-            )?;
-
-            // Execute code the CREATOR wrote before the fork, through this
-            // successor's own fresh RX alias, after invalidating exactly that
-            // range (the consumer-side I-cache rule).
-            let (first_stub, second_stub) = stub_offsets(&arena);
-            let exec_base = adopted_ranges[1].start + layout.code_payload_base();
-            let first_value = unsafe { call_stub(exec_base + first_stub) };
-            write_byte(receipt_fd, first_value as u8)?;
-
-            // Tell the creator we are attached and running; it then publishes
-            // a SECOND block and a second stub, both after our exec.
-            write_byte(attached_fd, ATTACHED_SIGNAL)?;
-            if read_byte(republished_fd)? != REPUBLISHED_SIGNAL {
-                anyhow::bail!("creator did not signal its post-exec publication");
-            }
-
-            let post_exec_generation = generations.observe(GuestVa(0x4000_1000))?;
-            let post_exec_ready =
-                match view.acquire_ready_or_miss(&live_key(), GuestVa(0x4000_1000)) {
-                    DarwinLiveReadyLookup::Ready(ready) => view
-                        .acquire(ready, &post_exec_generation)
-                        .map(|executable| {
-                            mapped_eq(
-                                adopted_ranges[1].start
-                                    + layout.code_payload_base()
-                                    + executable.extents().code.offset as usize,
-                                prepared_publication_at(GuestVa(0x4000_1000)).code_bytes(),
-                            )
-                        })
-                        .unwrap_or(false),
-                    DarwinLiveReadyLookup::Miss | DarwinLiveReadyLookup::Private(_) => false,
-                };
-            write_byte(
-                receipt_fd,
-                if post_exec_ready {
-                    POST_EXEC_READY_RECEIPT
-                } else {
-                    0
-                },
-            )?;
-            let second_value = unsafe { call_stub(exec_base + second_stub) };
-            write_byte(receipt_fd, second_value as u8)?;
-            Ok(0)
-        }
-
-        /// Invalidate and enter one stub through this process's RX alias.
-        ///
-        /// # Safety
-        ///
-        /// `address` must be an executable alias address holding a complete
-        /// `return_immediate` stub written through the matching RW alias.
-        unsafe fn call_stub(address: usize) -> u32 {
-            unsafe {
-                sys_icache_invalidate(address as *mut libc::c_void, 8);
-                let entry: extern "C" fn() -> u32 = std::mem::transmute(address);
-                entry()
-            }
-        }
-
-        /// The creator: publish, hand the arena to a guest-shaped `fork(2)`
-        /// child for its own host self-exec, then keep writing while the
-        /// successor runs.
-        fn run_owning_process_lifecycle() -> anyhow::Result<()> {
-            let receipt_fd: libc::c_int = std::env::var(CHILD_RECEIPT_FD_ENV)?.parse()?;
-            let arena = Arc::new(arena());
-            let generations = PageGenerationTable::new(16 * 1024)?;
-            let view = LiveArenaProcessView::new(Arc::clone(&arena), generations.domain())?;
-            let generation = generations.observe(GuestVa(0x4000_0000))?;
-            let handle = match view.claim_eligible(
-                &live_key(),
-                GuestVa(0x4000_0000),
-                GuestVa(0x4000_000c),
-                &generation,
-                unsafe { libc::getpid() },
-            ) {
-                DarwinLiveLookup::Publish(claim) => claim
-                    .reserve(prepared_publication())
-                    .map_err(|reason| anyhow::anyhow!("owner reserve failed: {reason:?}"))?
-                    .publish()
-                    .map_err(|reason| anyhow::anyhow!("owner publish failed: {reason:?}"))?,
-                DarwinLiveLookup::Ready(_) => {
-                    anyhow::bail!("fresh owner arena unexpectedly READY")
-                }
-                DarwinLiveLookup::Private(reason) => {
-                    anyhow::bail!("owner lookup went private: {reason:?}")
-                }
-            };
-            let ranges = unsafe { arena.local_mapping_ranges_for_transport_proof()? };
-            let (first_stub, second_stub) = stub_offsets(&arena);
-            let write_base = ranges[0].start + arena.control_layout().code_payload_base();
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    return_immediate(FIRST_STUB_VALUE).as_ptr(),
-                    (write_base + first_stub) as *mut u8,
-                    8,
-                );
-            }
-            write_byte(receipt_fd, OWNER_READY_RECEIPT)?;
-            write_exact(
-                receipt_fd,
-                &ready_wire(handle.extents(), handle.code_sha256()),
-            )?;
-
-            let attached = pipe();
-            let republished = pipe();
-            let executable = std::env::current_exe()?;
-
-            // THE boundary Task 6C2 proved was never crossed: the host
-            // self-exec is issued by a guest-shaped `fork(2)` CHILD of the
-            // arena's creator. The creator stays alive and keeps writing, so
-            // the successor observes ongoing sharing rather than a snapshot.
-            let forked = unsafe { libc::fork() };
-            if forked < 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            if forked > 0 {
-                if read_byte(attached[0])? != ATTACHED_SIGNAL {
-                    anyhow::bail!("successor never signalled that it attached");
-                }
-                // A second REAL publication, made entirely after the exec.
-                let post_exec_generation = generations.observe(GuestVa(0x4000_1000))?;
-                match view.claim_eligible(
-                    &live_key(),
-                    GuestVa(0x4000_1000),
-                    GuestVa(0x4000_100c),
-                    &post_exec_generation,
-                    unsafe { libc::getpid() },
-                ) {
-                    DarwinLiveLookup::Publish(claim) => claim
-                        .reserve(prepared_publication_at(GuestVa(0x4000_1000)))
-                        .map_err(|reason| anyhow::anyhow!("post-exec reserve failed: {reason:?}"))?
-                        .publish()
-                        .map_err(|reason| {
-                            anyhow::anyhow!("post-exec publish failed: {reason:?}")
-                        })?,
-                    DarwinLiveLookup::Ready(_) => {
-                        anyhow::bail!("post-exec block unexpectedly READY")
-                    }
-                    DarwinLiveLookup::Private(reason) => {
-                        anyhow::bail!("post-exec lookup went private: {reason:?}")
-                    }
-                };
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        return_immediate(SECOND_STUB_VALUE).as_ptr(),
-                        (write_base + second_stub) as *mut u8,
-                        8,
-                    );
-                }
-                write_byte(republished[1], REPUBLISHED_SIGNAL)?;
-
-                let mut status = 0;
-                if unsafe { libc::waitpid(forked, &mut status, 0) } != forked {
-                    anyhow::bail!(
-                        "wait for forked exec child: {}",
-                        std::io::Error::last_os_error()
-                    );
-                }
-                if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
-                    anyhow::bail!("forked exec child failed: status={status:#x}");
-                }
-                std::process::exit(0);
-            }
-
-            let argv = [
-                CString::new(executable.as_os_str().as_bytes())?,
-                CString::new("--exact")?,
-                CString::new(CHILD_TEST_NAME)?,
-                CString::new("--nocapture")?,
-                CString::new("--test-threads=1")?,
-            ];
-            let argv_ptrs = argv
-                .iter()
-                .map(|entry| entry.as_ptr())
-                .chain(std::iter::once(std::ptr::null()))
-                .collect::<Vec<_>>();
-
-            carrick_signal_core::xsig::xsig_init();
-            let mut payload = sample();
-            payload.producer_pid = unsafe { libc::getpid() as u32 };
-            payload.host_executable_path = executable.as_os_str().as_bytes().to_vec();
-            let guest = payload.guest_exec.as_mut().expect("guest payload");
-            guest.live_arena = Some(arena.reexec_authority()?.into());
-            guest.xsig = crate::native_exec_capsule::snapshot_xsig()?;
-            let nonce = [0x9d; 16];
-            exec_capsule_with(payload, nonce, None, Some(&arena), |request| {
-                let mut env = std::env::vars_os()
-                    .filter(|(key, _)| {
-                        !key.as_os_str()
-                            .as_bytes()
-                            .starts_with(b"CARRICK_TEST_NATIVE_LIVE_ARENA_")
-                    })
-                    .map(|(key, value)| {
-                        let mut entry = key.as_os_str().as_bytes().to_vec();
-                        entry.push(b'=');
-                        entry.extend_from_slice(value.as_os_str().as_bytes());
-                        CString::new(entry).expect("successor environment entry")
-                    })
-                    .collect::<Vec<_>>();
-                for (key, value) in [
-                    (CHILD_ENV, "1".to_owned()),
-                    (OWNER_RESUME_STAGE_ENV, "1".to_owned()),
-                    (OWNER_PID_ENV, unsafe { libc::getpid() }.to_string()),
-                    (CHILD_CAPSULE_FD_ENV, request.capsule_fd.to_string()),
-                    (CHILD_NONCE_ENV, encode_nonce(nonce)),
-                    (CHILD_RECEIPT_FD_ENV, receipt_fd.to_string()),
-                    (CHILD_ATTACHED_FD_ENV, attached[1].to_string()),
-                    (CHILD_REPUBLISHED_FD_ENV, republished[0].to_string()),
-                    (CHILD_PARENT_RANGES_ENV, format_ranges(&ranges)),
-                ] {
-                    env.push(
-                        CString::new(format!("{key}={value}")).expect("successor test environment"),
-                    );
-                }
-                let env_ptrs = env
-                    .iter()
-                    .map(|entry| entry.as_ptr())
-                    .chain(std::iter::once(std::ptr::null()))
-                    .collect::<Vec<_>>();
-                let flags = unsafe { libc::fcntl(receipt_fd, libc::F_GETFD) };
-                assert!(flags >= 0 && flags & libc::FD_CLOEXEC == 0);
-                unsafe {
-                    libc::execve(
-                        request.executable.as_ptr(),
-                        argv_ptrs.as_ptr(),
-                        env_ptrs.as_ptr(),
-                    );
-                }
-                std::io::Error::last_os_error()
-            })
-        }
-
-        fn fd_flags(fd: RawFd) -> i32 {
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-            assert!(flags >= 0, "read fd {fd} flags: {}", errno_text());
-            flags
-        }
-
-        fn errno_text() -> String {
-            std::io::Error::last_os_error().to_string()
-        }
-
-        /// Everything a returned (failed) host self-exec must be judged on,
-        /// sampled before, inside, and after the attempt.
-        struct FailedExecReceipts {
-            arena_flags_before: [i32; 2],
-            arena_flags_during: [i32; 2],
-            arena_flags_after: [i32; 2],
-            xsig_flags_before: i32,
-            xsig_flags_during: i32,
-            xsig_flags_after: i32,
-            guest_cloexec_flags_during: Option<i32>,
-            error: String,
-        }
-
-        /// Drive ONE real host self-exec through the production capsule path
-        /// and make it fail in the kernel.
-        ///
-        /// The executable path does not exist, so `execve` returns ENOENT and
-        /// this process image survives — a real kernel failure on the exact
-        /// path every arena-carrying self-exec takes, not an injected-closure
-        /// shape that never reaches the kernel at all.
-        fn attempt_failed_exec(
-            arena: &DarwinLiveArena,
-            guest_table_fd: Option<RawFd>,
-        ) -> FailedExecReceipts {
-            let mut payload = sample();
-            payload.producer_pid = unsafe { libc::getpid() as u32 };
-            payload.host_executable_path = b"/definitely/missing/carrick-live-arena-exec".to_vec();
-            let authority = arena.reexec_authority().expect("arena authority");
-            payload.guest_exec.as_mut().expect("guest").live_arena =
-                Some(NativeReexecLiveArenaV2::from(authority));
-            let xsig = tempfile::tempfile().expect("xsig tempfile");
-            xsig.set_len(4096).expect("size xsig");
-            bind_real_xsig(&mut payload, &xsig);
-            let xsig_fd = xsig.as_raw_fd();
-            if let Some(fd) = guest_table_fd {
-                payload
-                    .guest_exec
-                    .as_mut()
-                    .expect("guest")
-                    .fd_table
-                    .close_on_exec_host_fds = vec![fd];
-            }
-
-            let arena_fds = [authority.code.host_fd, authority.control.host_fd];
-            let arena_flags_before = arena_fds.map(fd_flags);
-            let xsig_flags_before = fd_flags(xsig_fd);
-            let during = std::cell::RefCell::new(None);
-            let error = exec_capsule_with(payload, [0x5e; 16], None, Some(arena), |request| {
-                *during.borrow_mut() = Some((
-                    arena_fds.map(fd_flags),
-                    fd_flags(xsig_fd),
-                    guest_table_fd.map(fd_flags),
-                ));
-                unsafe {
-                    libc::execve(
-                        request.executable.as_ptr(),
-                        request.argv.as_ptr(),
-                        request.env.as_ptr(),
-                    );
-                }
-                std::io::Error::last_os_error()
-            })
-            .expect_err("a host self-exec of a missing executable must fail");
-            let (arena_flags_during, xsig_flags_during, guest_cloexec_flags_during) =
-                during.into_inner().expect("exec attempt ran");
-            FailedExecReceipts {
-                arena_flags_before,
-                arena_flags_during,
-                arena_flags_after: arena_fds.map(fd_flags),
-                xsig_flags_before,
-                xsig_flags_during,
-                xsig_flags_after: fd_flags(xsig_fd),
-                guest_cloexec_flags_during,
-                error: error.to_string(),
-            }
-        }
-
-        #[test]
-        fn failed_exec_restores_the_prepared_arena_fd_flags() {
-            let _serial = test_lock();
-            let arena = arena();
-            let receipts = attempt_failed_exec(&arena, None);
-            for flags in receipts.arena_flags_before {
-                assert_eq!(
-                    flags & libc::FD_CLOEXEC,
-                    libc::FD_CLOEXEC,
-                    "an arena descriptor's steady state must be close-on-exec, \
-                     or this proves nothing"
-                );
-            }
-            for flags in receipts.arena_flags_during {
-                assert_eq!(
-                    flags & libc::FD_CLOEXEC,
-                    0,
-                    "the capsule must clear close-on-exec on both arena descriptors for transit"
-                );
-            }
-            assert_eq!(
-                receipts.arena_flags_after, receipts.arena_flags_before,
-                "a returned exec must restore both arena descriptors' flags ({})",
-                receipts.error
-            );
-            assert_eq!(
-                receipts.xsig_flags_before & libc::FD_CLOEXEC,
-                libc::FD_CLOEXEC
-            );
-            assert_eq!(receipts.xsig_flags_during & libc::FD_CLOEXEC, 0);
-            assert_eq!(
-                receipts.xsig_flags_after, receipts.xsig_flags_before,
-                "a returned exec must restore every fd flag it installed ({})",
-                receipts.error
-            );
-        }
-
-        /// Guest fd-space isolation, membership half.
-        ///
-        /// The arena's descriptors are INTERNAL host fds: they are never
-        /// registered in the guest `fd_table`, so no guest `close`, `dup2`,
-        /// `fcntl`, or `/proc/self/fd` walk can address them. This test pins
-        /// that membership and the opposite-polarity flag rules that keep the
-        /// two sets from ever mixing: internal fds have close-on-exec CLEARED
-        /// for exactly the capsule transit, while a guest-table fd marked
-        /// close-on-exec has it FORCED ON across the same window.
-        #[test]
-        fn arena_fds_never_enter_the_guest_fd_table() {
-            let _serial = test_lock();
-            let arena = arena();
-            let authority = arena.reexec_authority().expect("arena authority");
-            let guest_file = tempfile::tempfile().expect("guest table tempfile");
-            let guest_fd = guest_file.as_raw_fd();
-            assert_eq!(unsafe { libc::fcntl(guest_fd, libc::F_SETFD, 0) }, 0);
-
-            let receipts = attempt_failed_exec(&arena, Some(guest_fd));
-            let arena_fds = [authority.code.host_fd, authority.control.host_fd];
-
-            // Membership: the capsule's guest fd table names neither arena fd.
-            let payload_table = sample()
-                .guest_exec
-                .expect("guest")
-                .fd_table
-                .survivor_host_fds();
-            for (fd, _) in payload_table {
-                assert!(!arena_fds.contains(&fd));
-            }
-            assert!(
-                !arena_fds.contains(&guest_fd),
-                "the guest table's own descriptor must not be an arena descriptor"
-            );
-
-            // Opposite polarity across the same transit window.
-            for flags in receipts.arena_flags_during {
-                assert_eq!(
-                    flags & libc::FD_CLOEXEC,
-                    0,
-                    "an internal arena descriptor crosses exactly the capsule transit"
-                );
-            }
-            assert_eq!(
-                receipts
-                    .guest_cloexec_flags_during
-                    .map(|flags| flags & libc::FD_CLOEXEC),
-                Some(libc::FD_CLOEXEC),
-                "a guest-table close-on-exec descriptor must be FORCED close-on-exec \
-                 across the same window ({})",
-                receipts.error
-            );
-            assert_eq!(
-                fd_flags(guest_fd) & libc::FD_CLOEXEC,
-                0,
-                "the guest descriptor's original flags must be restored"
-            );
-            for flags in receipts.arena_flags_after {
-                assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
-            }
-        }
-
-        #[test]
-        fn fork_exec_successor_maps_arena_from_inherited_fds_at_fresh_addresses() {
-            let _serial = test_lock();
-            let receipt = lifecycle_receipt();
-            assert!(
-                receipt.fresh,
-                "all three successor mappings must use fresh VAs"
-            );
-            assert!(libc::WIFEXITED(receipt.child_status));
-            assert_eq!(libc::WEXITSTATUS(receipt.child_status), 0);
-        }
-
-        /// THE boundary Task 6C2 proved was never crossed.
-        ///
-        /// The arena's creator publishes READY; a guest-shaped `fork(2)` child
-        /// carries the arena through its OWN host self-exec on nothing but two
-        /// inherited descriptors; the successor validates and executes the
-        /// creator's bytes, and then observes both a real V2 publication and
-        /// executable code the creator produced AFTER that exec — ongoing
-        /// shared coherence, not a snapshot.
-        #[test]
-        fn forked_child_exec_successor_acquires_creator_ready_record_and_bytes() {
-            let _serial = test_lock();
-            let receipt = lifecycle_receipt();
-            assert!(
-                receipt.records_match,
-                "READY extents or full SHA-256 changed"
-            );
-            assert!(receipt.bytes_match, "mapped code/HOT/COLD bytes changed");
-            assert!(
-                receipt.invalidate_match,
-                "successor invalidated a range other than the READY code extent"
-            );
-            assert_eq!(
-                receipt.first_stub,
-                u32::from(FIRST_STUB_VALUE),
-                "the successor must execute the creator's pre-fork code"
-            );
-            assert!(
-                receipt.post_exec_ready,
-                "the successor must observe a V2 publication the creator made after the exec"
-            );
-            assert_eq!(
-                receipt.post_exec_stub,
-                u32::from(SECOND_STUB_VALUE),
-                "the successor must execute code the creator published after the exec"
-            );
-            assert!(libc::WIFEXITED(receipt.child_status));
-            assert_eq!(libc::WEXITSTATUS(receipt.child_status), 0);
-        }
-
-        #[test]
-        #[allow(unreachable_code)]
-        fn exec_successor_child() {
-            if std::env::var_os(CHILD_ENV).is_none() {
-                return;
-            }
-            if std::env::var_os(OWNER_RESUME_STAGE_ENV).is_some() {
-                let old_ranges = parse_ranges(
-                    &std::env::var(CHILD_PARENT_RANGES_ENV).expect("old mapping ranges"),
-                )
-                .expect("parse old mapping ranges");
-                let _reservations =
-                    FixedReservations::reserve(&old_ranges).expect("reserve old mapping ranges");
-                let before_pid: libc::pid_t = std::env::var(OWNER_PID_ENV)
-                    .expect("owner PID")
-                    .parse()
-                    .expect("parse owner PID");
-                assert_eq!(before_pid, unsafe { libc::getpid() });
-                let capsule_fd: libc::c_int = std::env::var(CHILD_CAPSULE_FD_ENV)
-                    .expect("successor capsule fd")
-                    .parse()
-                    .expect("parse successor capsule fd");
-                let nonce = std::env::var(CHILD_NONCE_ENV).expect("successor capsule nonce");
-                match crate::native_exec_capsule::resume(capsule_fd, &nonce)
-                    .expect("resume production native exec capsule")
-                {
-                    crate::NativeSelfReexecOutcome::GuestExit(0) => {}
-                    crate::NativeSelfReexecOutcome::GuestExit(code) => {
-                        panic!("live-arena resume returned exit code {code}")
-                    }
-                    crate::NativeSelfReexecOutcome::PidProbe { .. } => {
-                        panic!("live-arena guest capsule resumed as PID probe")
-                    }
-                }
-                return;
-            }
-            run_owning_process_lifecycle().expect("run owning-process live arena lifecycle");
-            unreachable!("the host self-exec must replace the process image");
-        }
     }
 }

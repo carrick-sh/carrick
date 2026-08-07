@@ -159,11 +159,6 @@ pub(crate) enum Commands {
         other_drops: u64,
         #[arg(long, default_value_t = false)]
         interrupted: bool,
-        /// D program the stream claims to come from. Required for an
-        /// authenticated (DSRLIVE1) stream: the validator renders it, takes
-        /// its SHA-256, and refuses a stream produced by anything else.
-        #[arg(long)]
-        program: Option<PathBuf>,
     },
     /// Internal transport-only diagnostic for the native host self-reexec path.
     #[command(name = "__native-exec-pid-probe", hide = true)]

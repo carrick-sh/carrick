@@ -359,20 +359,6 @@ impl TargetCacheAuthority {
         let address = entry.host().raw() as u64;
         (self.cache_start..self.cache_end).contains(&address)
     }
-
-    /// The exact host interval this authority installs into the context, in
-    /// the catalog's own `HostVa` vocabulary rather than as bare integers.
-    ///
-    /// Two authorities describing the SAME interval are interchangeable, which
-    /// is what lets a process re-install its live target authority across an
-    /// in-process exec without minting a second record for emitted code to
-    /// point at. That comparison is a semantic one — "is this the same
-    /// executable region" — so it is made between typed ranges; the `u64`
-    /// fields below are the `#[repr(C)]` wire the emitted slow path loads.
-    pub fn host_range(&self) -> std::ops::Range<carrick_guest_mem::HostVa> {
-        carrick_guest_mem::HostVa(self.cache_start as usize)
-            ..carrick_guest_mem::HostVa(self.cache_end as usize)
-    }
 }
 
 #[repr(C, align(64))]
@@ -934,14 +920,15 @@ mod native_gateway {
     /// `entry`, publishing this process's executable-range catalog alongside
     /// it.
     ///
-    /// The authority is the caller's explicit publication decision (private
-    /// JIT cache or live-arena RX payload), not an assumption: it installs the
-    /// context's `cache_start`/`cache_end`, which is the fast half of the
-    /// signal handler's phase-zero classification. The catalog is the other
-    /// half — it covers every executable mapping the process owns, so a kick
-    /// that lands in code the currently installed authority does not describe
-    /// (a private→live direct link, a flavor-1 hop that deliberately skips the
-    /// authority switch) still classifies as authoritative translated code.
+    /// The authority is the caller's explicit publication decision, not an
+    /// assumption: it installs the context's `cache_start`/`cache_end`, which
+    /// is the fast half of the signal handler's phase-zero classification. The
+    /// catalog is the other half — it covers every executable mapping the
+    /// process owns, so a kick that lands in code the currently installed
+    /// authority does not describe still classifies as authoritative
+    /// translated code. (Today the sole catalog node IS the private cache
+    /// range, so the two halves agree; the catalog is what keeps that
+    /// classification correct if a second executable region ever exists.)
     #[allow(
         clippy::too_many_arguments,
         reason = "one gateway entry pins entry, authority, cache and catalog together"
@@ -1153,7 +1140,7 @@ mod native_gateway {
 
     #[allow(
         clippy::too_many_arguments,
-        reason = "matches the live executable-authority gateway entry signature"
+        reason = "matches the real executable-authority gateway entry signature"
     )]
     pub fn enter_translated_with_executable_authority(
         _entry: CacheVa,

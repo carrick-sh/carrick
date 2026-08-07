@@ -237,100 +237,6 @@ impl From<ExclusiveFusionDisposition> for ExclusiveFusionClass {
     }
 }
 
-/// Why one live-arena consultation fell back to the private translator.
-///
-/// The counting vocabulary for `carrick_dsr_aarch64::translator::LiveFallback`,
-/// with the arena's own named refusals EXPANDED rather than collapsed: "the
-/// record is still BUILDING" and "the record failed validation" imply opposite
-/// fixes, so folding them into one `arena` bucket would make a mis-attributed
-/// fallback invisible — the exact defect Task 6F exists to remove.
-///
-/// The producer's mapping is an exhaustive match with no wildcard, so a new
-/// fallback reason is a compile error here rather than a silent reuse of a
-/// neighbouring class.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(usize)]
-pub enum LiveLaneFallbackClass {
-    Unconfigured,
-    Regenerated,
-    OutsideSegment,
-    CrossPage,
-    UnsupportedShape,
-    SourceWordsUnavailable,
-    PrepareRefused,
-    UnresolvedEntry,
-    ArenaBuilding,
-    ArenaFailed,
-    ArenaCasLost,
-    ArenaInvalidRecord,
-    ArenaCapacity,
-    ArenaExhaustedProbes,
-    ArenaKeyEncoding,
-    ArenaWriteAttempted,
-    ArenaUnknownState,
-}
-
-impl LiveLaneFallbackClass {
-    pub const ALL: [Self; 17] = [
-        Self::Unconfigured,
-        Self::Regenerated,
-        Self::OutsideSegment,
-        Self::CrossPage,
-        Self::UnsupportedShape,
-        Self::SourceWordsUnavailable,
-        Self::PrepareRefused,
-        Self::UnresolvedEntry,
-        Self::ArenaBuilding,
-        Self::ArenaFailed,
-        Self::ArenaCasLost,
-        Self::ArenaInvalidRecord,
-        Self::ArenaCapacity,
-        Self::ArenaExhaustedProbes,
-        Self::ArenaKeyEncoding,
-        Self::ArenaWriteAttempted,
-        Self::ArenaUnknownState,
-    ];
-    pub const COUNT: usize = Self::ALL.len();
-
-    pub const fn index(self) -> usize {
-        self as usize
-    }
-
-    pub const fn field_name(self) -> &'static str {
-        match self {
-            Self::Unconfigured => "unconfigured",
-            Self::Regenerated => "regenerated",
-            Self::OutsideSegment => "outside_segment",
-            Self::CrossPage => "cross_page",
-            Self::UnsupportedShape => "unsupported_shape",
-            Self::SourceWordsUnavailable => "source_words_unavailable",
-            Self::PrepareRefused => "prepare_refused",
-            Self::UnresolvedEntry => "unresolved_entry",
-            Self::ArenaBuilding => "arena_building",
-            Self::ArenaFailed => "arena_failed",
-            Self::ArenaCasLost => "arena_cas_lost",
-            Self::ArenaInvalidRecord => "arena_invalid_record",
-            Self::ArenaCapacity => "arena_capacity",
-            Self::ArenaExhaustedProbes => "arena_exhausted_probes",
-            Self::ArenaKeyEncoding => "arena_key_encoding",
-            Self::ArenaWriteAttempted => "arena_write_attempted",
-            Self::ArenaUnknownState => "arena_unknown_state",
-        }
-    }
-}
-
-/// `ALL` is the ordinal order, so `index()` is a valid slot in every
-/// `[u64; COUNT]` counter array and the wire's three-frame split is a split of
-/// that same order. A reordered or short `ALL` is a build failure, not a
-/// silently mis-attributed counter.
-const _: () = {
-    let mut index = 0;
-    while index < LiveLaneFallbackClass::COUNT {
-        assert!(LiveLaneFallbackClass::ALL[index].index() == index);
-        index += 1;
-    }
-};
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
 pub enum Phase {
@@ -913,14 +819,6 @@ pub struct ProfileSnapshot {
     pub resolve_src_shared_tgt_private: u64,
     pub resolve_src_private_tgt_shared: u64,
     pub resolve_src_private_tgt_private: u64,
-    /// `ResolveDirect` round trips split by TARGET class, thread-scoped like
-    /// `direct_resolver_exits` and published on the `resolver-thread` frame.
-    /// `back_same_page` (target <= source, same 16 KiB source page) is the
-    /// upper bound on self-referential-site traversals; `forward` is
-    /// target > source; the remainder is a backward cross-page branch.
-    pub resolve_direct_back_same_page: u64,
-    pub resolve_direct_forward: u64,
-    pub resolve_direct_back_cross_page: u64,
     /// DISTINCT private -> shared edges seen by this thread.
     pub resolve_private_to_shared_distinct_edges: u64,
     /// Control for the above: distinct private -> private edges.
@@ -936,54 +834,6 @@ pub struct ProfileSnapshot {
     pub direct_binding_stale_winner_clears: u64,
     pub direct_binding_publication_retries: u64,
     pub exclusive_fusion_sites: [u64; ExclusiveFusionClass::COUNT],
-    /// Container-lifetime LIVE arena lane. Process-scoped like the
-    /// `shared_*` counters above and published as the same claimed delta, so
-    /// summing them across a process's thread records recovers the process
-    /// total exactly once.
-    ///
-    /// `live_index_hits` is a repeat serve out of this process's own live
-    /// index; `live_ready_hits` is a FRESH acquisition of another publisher's
-    /// READY record; `live_publish_wins` is a block this process prepared
-    /// itself; `live_publish_adoptions` is a race this process lost and was
-    /// nevertheless served from the winner's record without preparing.
-    pub live_index_hits: u64,
-    pub live_ready_hits: u64,
-    pub live_ready_misses: u64,
-    pub live_publish_wins: u64,
-    pub live_publish_adoptions: u64,
-    pub live_blocks_installed: u64,
-    /// Exact published extents of every live block this process installed.
-    /// These are deliberately NOT folded into `cache_used_bytes`: that gauge
-    /// is the PRIVATE bump cache's occupancy, and live code executes from the
-    /// arena mapping instead.
-    pub live_code_bytes: u64,
-    pub live_hot_bytes: u64,
-    pub live_cold_bytes: u64,
-    /// Private direct-link sites waiting on a key a live installation
-    /// published: patched to the arena entry, or left at the fall-into-stub
-    /// because the arena is outside the ±128 MiB AArch64 branch reach.
-    pub live_links_patched: u64,
-    pub live_links_out_of_reach: u64,
-    /// Winner-publication prebinding of shared→shared direct links (the
-    /// realized `live_arena_shared_direct_links` design counter): bound into
-    /// the still-staged source at publication, refused because the target
-    /// was not an acquirable READY record (`unbound_state`), or refused by
-    /// the emitter's AArch64 reach check (`unbound_reach` — structurally
-    /// zero while the code payload is 64 MiB).
-    pub live_links_prebound: u64,
-    pub live_links_prebind_unbound_state: u64,
-    pub live_links_prebind_unbound_reach: u64,
-    /// Task 7's revocation seam, counted. `live_revoked_chunks` is exact
-    /// 64 KiB local RX chunks this process protected `PROT_NONE` because a
-    /// guest write, `mprotect`, `munmap`, or remap changed their source page;
-    /// `live_stale_instruction_aborts` is instruction aborts inside one of
-    /// those chunks that the exact classifier consumed and recovered
-    /// privately. The pair is the only place the mutation cost of sharing is
-    /// visible: a workload with many revocations is one where publication is
-    /// being thrown away.
-    pub live_revoked_chunks: u64,
-    pub live_stale_instruction_aborts: u64,
-    pub live_fallbacks: [u64; LiveLaneFallbackClass::COUNT],
 }
 
 #[derive(Clone, Debug)]
@@ -1102,16 +952,13 @@ impl CompleteThreadRecord {
         let mut thread = self.frame_header("resolver-thread");
         let _ = write!(
             thread,
-            "|translate_phase_nested_ns={}|resolver_exits={}|one_entry_hits={}|gateway_entries={}|syscall_exits={}|direct_resolver_exits={}|resolve_direct_back_same_page={}|resolve_direct_forward={}|resolve_direct_back_cross_page={}",
+            "|translate_phase_nested_ns={}|resolver_exits={}|one_entry_hits={}|gateway_entries={}|syscall_exits={}|direct_resolver_exits={}",
             resolver.nested_translation_ns,
             resolver.resolver_exits,
             resolver.one_entry_hits,
             resolver.gateway_entries,
             resolver.syscall_exits,
             resolver.direct_resolver_exits,
-            resolver.resolve_direct_back_same_page,
-            resolver.resolve_direct_forward,
-            resolver.resolve_direct_back_cross_page,
         );
         frames.push(thread);
         let mut process = self.frame_header("resolver-process");
@@ -1193,65 +1040,6 @@ impl CompleteThreadRecord {
             resolver.cache_used_bytes, resolver.cache_capacity_bytes
         );
         frames.push(cache);
-        let mut live = self.frame_header("live-lane");
-        let _ = write!(
-            live,
-            "|live_index_hits={}|live_ready_hits={}|live_ready_misses={}|live_publish_wins={}|live_publish_adoptions={}|live_blocks_installed={}",
-            resolver.live_index_hits,
-            resolver.live_ready_hits,
-            resolver.live_ready_misses,
-            resolver.live_publish_wins,
-            resolver.live_publish_adoptions,
-            resolver.live_blocks_installed,
-        );
-        frames.push(live);
-        // The live extents are their own frame, never folded into
-        // `cache-gauge`: that frame is the private bump cache's occupancy.
-        let mut live_bytes = self.frame_header("live-bytes");
-        let _ = write!(
-            live_bytes,
-            "|live_code_bytes={}|live_hot_bytes={}|live_cold_bytes={}|live_links_patched={}|live_links_out_of_reach={}|live_links_prebound={}|live_links_prebind_unbound_state={}|live_links_prebind_unbound_reach={}",
-            resolver.live_code_bytes,
-            resolver.live_hot_bytes,
-            resolver.live_cold_bytes,
-            resolver.live_links_patched,
-            resolver.live_links_out_of_reach,
-            resolver.live_links_prebound,
-            resolver.live_links_prebind_unbound_state,
-            resolver.live_links_prebind_unbound_reach,
-        );
-        frames.push(live_bytes);
-        // Revocation is its own frame rather than two more fields on
-        // `live-lane`: it is the only live counter pair produced OUTSIDE the
-        // translate path (the guest-write seam and the fault classifier), and
-        // a reader that wants "was publication thrown away" wants exactly
-        // these two together.
-        let mut live_revoke = self.frame_header("live-revoke");
-        let _ = write!(
-            live_revoke,
-            "|live_revoked_chunks={}|live_stale_instruction_aborts={}",
-            resolver.live_revoked_chunks, resolver.live_stale_instruction_aborts,
-        );
-        frames.push(live_revoke);
-        // Seventeen named fallback classes do not fit one PIPE_BUF-atomic
-        // frame at u64::MAX, so they are split exactly like the fusion
-        // classes are. The order within each frame is `ALL`'s order.
-        for (name, classes) in [
-            ("live-fallback-a", &LiveLaneFallbackClass::ALL[..6]),
-            ("live-fallback-b", &LiveLaneFallbackClass::ALL[6..12]),
-            ("live-fallback-c", &LiveLaneFallbackClass::ALL[12..]),
-        ] {
-            let mut frame = self.frame_header(name);
-            for &class in classes {
-                let _ = write!(
-                    frame,
-                    "|lfb_{}={}",
-                    class.field_name(),
-                    resolver.live_fallbacks[class.index()]
-                );
-            }
-            frames.push(frame);
-        }
         // Process attribution gauges: the once-claimed startup window repeats
         // identically on every thread group of this pid; process_cpu_ns is a
         // point-in-time gauge at THIS thread's flush (like cache-gauge, never
@@ -1776,7 +1564,7 @@ mod tests {
                 },
             )
             .expect("bounded frames");
-        assert_eq!(frames.len(), 24);
+        assert_eq!(frames.len(), 18);
         assert!(frames[0].contains("|frame=core|"));
         assert!(frames[0].contains("|thread_cpu_ns=5"));
         let process = frames
@@ -1784,155 +1572,6 @@ mod tests {
             .find(|frame| frame.contains("|frame=process|"))
             .expect("process frame");
         assert!(process.contains("|startup_wall_ns=9|startup_cpu_ns=3|process_cpu_ns=8"));
-    }
-
-    /// Every live counter must appear EXACTLY once across the record. A
-    /// counter emitted twice is double-counted the moment a reader sums the
-    /// per-thread frames into a process total, and a counter emitted zero
-    /// times is a metric nobody can run — the failure 6F existed to remove.
-    #[test]
-    fn the_live_revocation_counters_appear_once_and_round_trip() {
-        let budget = ThreadBudget::enabled_for_test(41, 42);
-        let record = budget.complete_record().expect("empty record");
-        let frames = record
-            .to_protocol_frames_with_resolver(
-                crate::profile::ProfileSnapshot {
-                    live_revoked_chunks: 9,
-                    live_stale_instruction_aborts: 2,
-                    ..Default::default()
-                },
-                FlushGauges {
-                    thread_cpu_ns: 5,
-                    startup_wall_ns: 9,
-                    startup_cpu_ns: 3,
-                    process_cpu_ns: 8,
-                },
-            )
-            .expect("bounded frames");
-        for field in ["live_revoked_chunks", "live_stale_instruction_aborts"] {
-            let marker = format!("|{field}=");
-            assert_eq!(
-                frames
-                    .iter()
-                    .filter(|frame| frame.contains(&marker))
-                    .count(),
-                1,
-                "{field} must be published exactly once per record"
-            );
-        }
-        let revoke = frames
-            .iter()
-            .find(|frame| frame.contains("|frame=live-revoke|"))
-            .expect("live-revoke frame");
-        assert!(
-            revoke.contains("|live_revoked_chunks=9|live_stale_instruction_aborts=2"),
-            "the revocation frame must round-trip its exact values: {revoke}"
-        );
-        // The revocation pair is deliberately NOT folded into the serve /
-        // publish frame or the byte frame: those are translate-path counters.
-        for other in ["live-lane", "live-bytes"] {
-            let frame = frames
-                .iter()
-                .find(|frame| frame.contains(&format!("|frame={other}|")))
-                .expect("live frame");
-            assert!(!frame.contains("live_revoked_chunks"));
-            assert!(!frame.contains("live_stale_instruction_aborts"));
-        }
-    }
-
-    /// The resolve-direct residue split rides the `resolver-thread` frame —
-    /// beside `direct_resolver_exits`, whose thread scope it shares —
-    /// exactly once, exact values.
-    #[test]
-    fn the_resolve_direct_split_rides_the_resolver_thread_frame() {
-        let budget = ThreadBudget::enabled_for_test(41, 42);
-        let record = budget.complete_record().expect("empty record");
-        let frames = record
-            .to_protocol_frames_with_resolver(
-                crate::profile::ProfileSnapshot {
-                    resolve_direct_back_same_page: 11,
-                    resolve_direct_forward: 7,
-                    resolve_direct_back_cross_page: 3,
-                    ..Default::default()
-                },
-                FlushGauges::default(),
-            )
-            .expect("bounded frames");
-        for field in [
-            "resolve_direct_back_same_page",
-            "resolve_direct_forward",
-            "resolve_direct_back_cross_page",
-        ] {
-            let marker = format!("|{field}=");
-            assert_eq!(
-                frames
-                    .iter()
-                    .filter(|frame| frame.contains(&marker))
-                    .count(),
-                1,
-                "{field} must be published exactly once per record"
-            );
-        }
-        let thread = frames
-            .iter()
-            .find(|frame| frame.contains("|frame=resolver-thread|"))
-            .expect("resolver-thread frame");
-        assert!(
-            thread.contains(
-                "|resolve_direct_back_same_page=11|resolve_direct_forward=7|resolve_direct_back_cross_page=3"
-            ),
-            "the thread frame must round-trip the exact split: {thread}"
-        );
-    }
-
-    /// The prebind triple rides the `live-bytes` frame — beside the two
-    /// private→live link counters it complements — exactly once, exact
-    /// values.
-    #[test]
-    fn the_prebind_counters_ride_the_live_bytes_frame_and_round_trip() {
-        let budget = ThreadBudget::enabled_for_test(41, 42);
-        let record = budget.complete_record().expect("empty record");
-        let frames = record
-            .to_protocol_frames_with_resolver(
-                crate::profile::ProfileSnapshot {
-                    live_links_prebound: 7,
-                    live_links_prebind_unbound_state: 5,
-                    live_links_prebind_unbound_reach: 1,
-                    ..Default::default()
-                },
-                FlushGauges {
-                    thread_cpu_ns: 5,
-                    startup_wall_ns: 9,
-                    startup_cpu_ns: 3,
-                    process_cpu_ns: 8,
-                },
-            )
-            .expect("bounded frames");
-        for field in [
-            "live_links_prebound",
-            "live_links_prebind_unbound_state",
-            "live_links_prebind_unbound_reach",
-        ] {
-            let marker = format!("|{field}=");
-            assert_eq!(
-                frames
-                    .iter()
-                    .filter(|frame| frame.contains(&marker))
-                    .count(),
-                1,
-                "{field} must be published exactly once per record"
-            );
-        }
-        let bytes = frames
-            .iter()
-            .find(|frame| frame.contains("|frame=live-bytes|"))
-            .expect("live-bytes frame");
-        assert!(
-            bytes.contains(
-                "|live_links_prebound=7|live_links_prebind_unbound_state=5|live_links_prebind_unbound_reach=1"
-            ),
-            "the byte frame must round-trip the exact prebind values: {bytes}"
-        );
     }
 
     #[test]
@@ -2117,9 +1756,6 @@ mod tests {
                     direct_binding_cas_losses: u64::MAX,
                     direct_binding_stale_winner_clears: u64::MAX,
                     direct_binding_publication_retries: u64::MAX,
-                    resolve_direct_back_same_page: u64::MAX,
-                    resolve_direct_forward: u64::MAX,
-                    resolve_direct_back_cross_page: u64::MAX,
                     resolve_src_shared_tgt_shared: u64::MAX,
                     resolve_src_shared_tgt_private: u64::MAX,
                     resolve_src_private_tgt_shared: u64::MAX,
@@ -2159,28 +1795,11 @@ mod tests {
                     cache_used_bytes: usize::MAX,
                     cache_capacity_bytes: usize::MAX,
                     exclusive_fusion_sites: [u64::MAX; ExclusiveFusionClass::COUNT],
-                    live_index_hits: u64::MAX,
-                    live_ready_hits: u64::MAX,
-                    live_ready_misses: u64::MAX,
-                    live_publish_wins: u64::MAX,
-                    live_publish_adoptions: u64::MAX,
-                    live_blocks_installed: u64::MAX,
-                    live_code_bytes: u64::MAX,
-                    live_hot_bytes: u64::MAX,
-                    live_cold_bytes: u64::MAX,
-                    live_links_patched: u64::MAX,
-                    live_links_out_of_reach: u64::MAX,
-                    live_links_prebound: u64::MAX,
-                    live_links_prebind_unbound_state: u64::MAX,
-                    live_links_prebind_unbound_reach: u64::MAX,
-                    live_revoked_chunks: u64::MAX,
-                    live_stale_instruction_aborts: u64::MAX,
-                    live_fallbacks: [u64::MAX; LiveLaneFallbackClass::COUNT],
                 },
                 gauges,
             )
             .expect("bounded frames");
-        assert_eq!(frames.len(), 24);
+        assert_eq!(frames.len(), 18);
         for frame in frames {
             let transport_len = frame.len().checked_add(1).expect("newline length");
             assert!(

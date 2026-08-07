@@ -26,7 +26,6 @@ pub mod aot_cache;
 #[cfg(target_arch = "aarch64")]
 pub mod direct;
 pub mod jit;
-pub mod live_arena;
 
 #[cfg(target_arch = "aarch64")]
 pub use jit::DarwinHostJit;

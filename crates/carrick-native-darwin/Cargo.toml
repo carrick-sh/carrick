@@ -15,7 +15,6 @@ workspace = true
 bincode.workspace = true
 carrick-dsr = { path = "../carrick-dsr" }
 carrick-dsr-aarch64 = { path = "../carrick-dsr-aarch64" }
-carrick-guest-mem = { path = "../carrick-guest-mem" }
 # Tier D's eligibility scan decodes guest text to find the 0.03% of words that
 # cannot execute on Darwin (x18, tpidr_el0). Same decoder the translator uses.
 bad64.workspace = true
@@ -31,7 +30,7 @@ tracing.workspace = true
 cc = "1"
 
 [dev-dependencies]
-static_assertions = "1"
+carrick-guest-mem = { path = "../carrick-guest-mem" }
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(target_os = "macos")'.dev-dependencies]
 mach2.workspace = true
