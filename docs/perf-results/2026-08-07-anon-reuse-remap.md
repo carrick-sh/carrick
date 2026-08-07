@@ -30,9 +30,8 @@ exclusive-monitor invalidation.
 
 Every ineligible shape keeps the always-correct memset, each with a named
 refusal (`replace_anonymous_reuse`'s doc): `MappingSharing::Shared` (the
-shared-aperture arm's boot-mapped `MAP_SHARED` object stays write-through —
-a fresh anon object would sever forked peers, §7.3), any overlapping
-`shared_futex`/file-key region or permission-independent
+shared-aperture arm's boot-mapped `MAP_SHARED` object stays write-through),
+any overlapping `shared_futex`/file-key region or permission-independent
 `mutable_shared_backing` claim (a munmapped-then-reused shared alias),
 linux4k subpages, host-page misalignment, multi-region ranges, may-execute
 ranges and lifted write-exec pages, active host-access lifts, and any host
@@ -40,6 +39,26 @@ mmap failure (`MAP_FIXED` failure leaves the prior mapping intact, so the
 fallback proceeds as if the path had never run). The `madvise-dontneed` and
 brk scrubs route through `zero_backing` directly and are unchanged (2–33
 in-window events per build).
+
+**Deliberate deviation from the design sketch (§7.3), stronger than
+specified:** §7.3 sketched mapping `MappingSharing::Shared` as a fresh
+`MAP_SHARED` replacement through the typed seam. A fresh
+`MAP_SHARED|MAP_ANON` mapping is a NEW shared object — it would sever
+already-forked peers of the boot-mapped aperture object where the memset
+writes through to them — so the shipped override REFUSES Shared entirely
+and keeps the write-through scrub. Consequently §7.4's red-first item
+"fork-visibility of a replaced shared range" is **retired, not silently
+swapped**: no shared range is ever replaced, and the receipt for that rule
+is the refusal test.
+
+**Named trade: VM-map entry proliferation.** Each replacement carves a
+fresh anon VM object out of the arena's entry — ~5.5k replacements per
+build (the AMP1 mmap row's host-call scale) — and this same file's
+`reset_biased_aperture_to_guards` documents a ~16.4k-entry re-insertion
+cost paid by every post-execve fork, so entry count is a real cost axis on
+fork/exec-heavy shapes. The go build's own fork/exec traffic is inside the
+ABBA (§5), so the net is measured for this workload; §5a samples a
+fork-exec-dominated micro directly.
 
 ## 2. Red-first receipts
 
@@ -69,10 +88,11 @@ then green with the change:
    `probes-candidate-oneworker-2.log`, `CARRICK_PROBE_WORKERS=1`): gating
    arm64:musl failure set = {accounting, aliassize, clone3args,
    execfromthread, mmapcluster, recursionguard} — a strict subset of the
-   pinned baseline set; **nothing entered**. `execpermitchurn` is absent
-   this sample; it is the documented 1–2/8 load-probabilistic fork-churn
-   wedge (pre-existing, chip filed by Task 5) and its absence is flake
-   variance, not a claim this change fixed it.
+   pinned baseline set; **nothing entered**. `execpermitchurn` **ran and
+   PASSED this sample** (`PASS arm64:musl:execpermitchurn`, log line 84);
+   it is the documented 1–2/8 load-probabilistic fork-churn wedge
+   (pre-existing, chip filed by Task 5), so one pass is flake variance,
+   not a claim this change fixed it.
 3. **`just conformance-quick`**: `OK: no regressions`
    (`conformance-quick.log`; VMM lane per the recipe's note).
 4. **Mechanism proof** (§4) and **ABBA** (§5) below.
@@ -80,8 +100,12 @@ then green with the change:
 ## 4. The mechanism proof: the (b) slice collapses
 
 Three `carrick trace --profile native-fault` arms on the candidate binary
-`914b6881…` (all rc 0, `BUILD_OK`, zero run-id survivors after
-`scripts/sudo/kill.sh`; `capture.log`), re-analyzed offline with
+`914b6881…` (all three captures rc 0, `BUILD_OK`, zero run-id survivors
+after `scripts/sudo/kill.sh`; `capture.log`). One retry is on the record:
+the first arm-a invocation exited 1 **before any run started** — the
+driver passed `--profile-bound-seconds`, which the native-fault profile
+does not accept ("profile native-fault does not declare a capture bound");
+the flag was dropped and arm a rerun ~20 s later. Re-analyzed offline with
 `carrick debug native-fault-partition` — the partition instrument built for
 exactly this gate. Offline analysis sections are byte-equal to the
 capture-time summaries (only the offline command's own `provenance` block
@@ -132,11 +156,35 @@ re-parse binary**, a determinism cross-check — with the
 | elapsed_ms | 9,212 | 8,850 | −363 (−3.94%) | [−681, −44] |
 
 Every candidate sample beats every control sample (max candidate 19.760 <
-min control 20.285). The win is at the **bottom edge of the partition
-doc's 0.66–2.09 CPU-s ceiling band** — consistent with the audit's lower
-per-fault figure holding on a quiet host — and the sys-CPU term carries
-73% of it, as a fault-mass removal should. **Retention condition met; no
-§6 stop condition** (mechanism and ABBA agree).
+min control 20.285). The point estimate (−0.660) touches the **bottom
+edge of the partition doc's 0.66–2.09 CPU-s ceiling band**, and the
+interval's upper bound (−0.570) lies BELOW the band's lower edge — half
+the interval falls outside the pre-registered band, consistent with the
+audit's lower per-fault figure (and only it) holding on a quiet host.
+The sys-CPU term carries 73% of the win, as a fault-mass removal should.
+**Retention condition met; no §6 stop condition** (mechanism and ABBA
+agree).
+
+## 5a. Fork-exec shape sample (the entry-proliferation trade, §1)
+
+12 × `go version` per sample under `carrick run` (each iteration a guest
+fork + execve whose Go startup performs the hint-less reserves, so the
+scrub fires per child on both arms), in-guest wall stamps excluding
+container assembly, interleaved on1 off1 off2 on2 off3 on3 on4 off4,
+n=4/arm, one binary, untraced (`t7forkexec-arm.sh`,
+`forkexec-*.out/.err`):
+
+| arm | wall ms (samples) | median |
+|---|---|---:|
+| remap ON (default) | 764, 836, 832, 822 | **827** |
+| memset OFF (`=0`) | 933, 854, 1048, 935 | 934 |
+
+The remap arm wins the fork-exec shape too (−11.4% median; max ON 836 <
+min OFF 854): the per-child memset removal outweighs the replacement's
+VM-entry cost here. Scoped-workload caveat: this samples short-lived
+remap-heavy children; a lane dominated by LONG-LIVED remap-heavy parents
+that fork continuously would accumulate more entries per address space
+and should re-measure before assuming the sign.
 
 ## 6. Honest notes
 
