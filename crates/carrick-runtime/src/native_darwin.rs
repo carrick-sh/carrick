@@ -4339,7 +4339,19 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         executable_digest,
                         exec_backing,
                     )) => {
-                        if NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire) {
+                        let forked_child_self_reexec =
+                            NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire);
+                        // Ablation-ladder rung 4 (measurement builds only):
+                        // route a forked child's execve down the root
+                        // process's in-process replacement path, deleting the
+                        // capsule build/serialize/host-self-reexec chain to
+                        // ceiling its total cost. INCORRECT BY CONSTRUCTION —
+                        // the in-process path does not validate a forked
+                        // child's inherited state.
+                        #[cfg(feature = "ablation")]
+                        let forked_child_self_reexec =
+                            forked_child_self_reexec && !crate::ablation::EXEC_CHAIN.enabled();
+                        if forked_child_self_reexec {
                             if let Err(reason) = dispatcher.validate_native_reexec_fd_state() {
                                 tracing::warn!(
                                     %reason,

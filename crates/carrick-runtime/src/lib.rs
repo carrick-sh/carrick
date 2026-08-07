@@ -110,6 +110,20 @@ pub mod apfs {
         carrick_spec::FsBackendKind::Host
     }
 }
+#[cfg(feature = "ablation")]
+pub mod ablation {
+    //! The runtime's ablation knobs (measurement builds only; see
+    //! `carrick_dsr::ablation`).
+
+    /// Rung 4: `CARRICK_ABLATE_EXEC_CHAIN=1` makes a forked guest child's
+    /// execve take the root process's in-process replacement path instead of
+    /// the capsule build/serialize/host-self-reexec chain. The in-process
+    /// path is NOT sound for forked children (inherited fd/thread/shared
+    /// state is unvalidated) — breakage is expected and is itself the
+    /// measurement result.
+    pub static EXEC_CHAIN: carrick_dsr::ablation::Ablation =
+        carrick_dsr::ablation::Ablation::new("CARRICK_ABLATE_EXEC_CHAIN");
+}
 pub mod binfmt;
 pub mod container;
 pub mod cred_ipc;

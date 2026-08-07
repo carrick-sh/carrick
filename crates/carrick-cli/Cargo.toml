@@ -28,6 +28,11 @@ default        = ["syscall-shim", "platform-macos"]
 # binary much slower, so it is a measurement build, never a shipping one.
 alloc-census   = ["dep:dhat"]
 alloc-owner-census = ["carrick-runtime/alloc-owner-census"]
+# Ablation-ladder measurement builds (CARRICK_ABLATE_* knobs; forwarded to
+# carrick-runtime). Never a default: an ablated binary is incorrect by
+# construction and must never ship — see
+# docs/superpowers/specs/2026-08-07-ablation-ladder-design.md.
+ablation       = ["carrick-runtime/ablation"]
 syscall-shim   = ["carrick-runtime/syscall-shim"]
 # Exactly one platform-* is active at a time; `default` keeps macOS building
 # exactly as today. `platform-linux` links NO HVF.

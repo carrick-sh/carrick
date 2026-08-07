@@ -29,6 +29,12 @@ workspace = true
 [features]
 default = ["platform-macos"]
 alloc-owner-census = ["carrick-dsr-aarch64/alloc-owner-census"]
+# Ablation-ladder measurement builds: the rung-4 exec-chain knob
+# (CARRICK_ABLATE_EXEC_CHAIN, native_darwin.rs) plus the rung-3 zeroing knob
+# forwarded to the aarch64 lane. Never a default; an ablated binary is
+# incorrect by construction. See carrick-dsr/Cargo.toml and
+# docs/superpowers/specs/2026-08-07-ablation-ladder-design.md.
+ablation = ["carrick-dsr/ablation", "carrick-dsr-aarch64/ablation"]
 # Guest-side syscall shim (docs/syscall-shim-design.md). NO default here on
 # purpose: the binary (carrick-cli) is the single control point. carrick-cli's
 # default enables it for normal builds; dependents that use carrick-runtime as a

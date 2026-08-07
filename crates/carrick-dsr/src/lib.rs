@@ -28,6 +28,8 @@
 //! while it is in flight the runtime re-exports these modules under their old
 //! paths so call sites are unchanged.
 
+#[cfg(feature = "ablation")]
+pub mod ablation;
 pub mod address;
 pub mod cache;
 pub mod fault;
