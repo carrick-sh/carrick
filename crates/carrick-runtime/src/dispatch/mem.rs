@@ -726,6 +726,15 @@ fn host_fd_file_len(fd: i32) -> Option<u64> {
     }
 }
 
+/// Move-3 E1 opt-out hatch: the file-backed `MAP_PRIVATE` lowering is ON by
+/// default; `CARRICK_MMAP_FILE_BACKED=0` restores the eager snapshot path for
+/// bisection. Read per call (a handful of guest mmaps per millisecond at
+/// worst; `getenv` is allocation- and syscall-free) so tests and forked guests
+/// observe the current environment rather than a process-cached copy.
+fn mmap_file_backed_lowering_enabled() -> bool {
+    std::env::var_os("CARRICK_MMAP_FILE_BACKED").is_none_or(|value| value != *"0")
+}
+
 /// Eager MAP_PRIVATE materialization plus its map-time Linux EOF contract.
 /// Bytes through the last partially backed page are snapshotted and its EOF
 /// remainder stays zero-filled; pages wholly beyond that boundary are published
@@ -2448,7 +2457,52 @@ impl SyscallDispatcher {
             // backing description is recorded so F_ADD_SEALS F_SEAL_WRITE can
             // EBUSY while it is mapped.
             let mut writable_memfd_desc: Option<OpenDescriptionRef> = None;
-            let bytes = if map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
+            // Move-3 E1: an eligible MAP_PRIVATE file mmap lowers to ONE host
+            // file-backed `MAP_PRIVATE|MAP_FIXED` mapping (demand-paged from
+            // the unified buffer cache) instead of the eager full-length
+            // `vec![0]` + `pread` + arena-copy materialization, whose three
+            // whole-length passes put 36% of the cold build's zero-fill
+            // faults inside guest mmap service windows
+            // (docs/perf-results/2026-08-06-build-lane-amplification-ledger.md §7).
+            // Eligibility is narrow and explicit; every other shape keeps the
+            // snapshot path below, each exclusion for a named reason:
+            //   * Private only (a Shared mapping's stores must reach the file);
+            //   * no GROWSDOWN (stack-shaped file maps stay on the audited path);
+            //   * no PROT_EXEC request (executable content must flow through
+            //     the write path's W^X/translation-invalidation metadata);
+            //   * `OpenDescription::HostFile` only (in-memory VFS contents
+            //     have no host object to map; chardevs keep their zero-fill);
+            //   * a non-alias VA (alias IPAs publish via `MapHostAlias`, whose
+            //     payload transaction owns the backing);
+            //   * the backend's own refusals (identity host ownership,
+            //     host-page alignment, linux4k subpage sharing, may-execute).
+            // The beyond-EOF tail is then published as BUS_ADRERR through the
+            // same bus machinery the Shared path uses — which the eager arena
+            // path never did for private maps (it zero-filled instead; Linux
+            // faults). Probe `mmapprivfile`'s beyond_eof_page clause is the
+            // conformance receipt for that correction.
+            // Opt-out hatch for bisection: CARRICK_MMAP_FILE_BACKED=0.
+            //
+            // Two phases: the CANDIDATE check here (so no snapshot buffer is
+            // materialized for a mapping about to demand-page), and the actual
+            // backend replacement in the general path below — strictly AFTER
+            // `prepare_mmap_locked_range`, the last fallible pre-step, so a
+            // failed mmap still leaves a MAP_FIXED target's prior mapping
+            // intact (Linux's failure atomicity; the eager path gets this for
+            // free by building its buffer before touching backing).
+            let mut lowering_candidate = false;
+            if map_sharing == MmapSharing::Private
+                && !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+                && !map_flags.contains(LinuxMmapFlags::GROWSDOWN)
+                && !prot_flags.contains(LinuxProtFlags::EXEC)
+                && !mmap_address_uses_alias(address, length, layout)
+                && mmap_file_backed_lowering_enabled()
+                && let Some(open_file) = this.open_file(fd.0)
+            {
+                lowering_candidate =
+                    matches!(&*open_file.description.read(), OpenDescription::HostFile { .. });
+            }
+            let bytes = if map_flags.contains(LinuxMmapFlags::ANONYMOUS) || lowering_candidate {
                 Vec::new()
             } else {
                 let mut bytes = vec![0; length_usize];
@@ -2635,6 +2689,49 @@ impl SyscallDispatcher {
             }
 
             let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
+            // Move-3 E1, phase 2: replace the arena backing with the host file
+            // mapping now that every fallible pre-step has passed. On backend
+            // refusal (alignment, ownership, may-execute, linux4k, host mmap
+            // failure) fall back to the eager materialization HERE —
+            // `snapshot_private_mmap_file` is the same load the aperture path
+            // uses. The fallback deliberately does NOT adopt the snapshot's
+            // private BUS offset: the legacy arena contract stays untouched on
+            // every ineligible shape (the VMM lanes share this path), and only
+            // a LOWERED mapping publishes the beyond-EOF BUS_ADRERR tail.
+            let mut bytes = bytes;
+            let mut lowered_file_backed = false;
+            if lowering_candidate {
+                if let Some(open_file) = this.open_file(fd.0) {
+                    let open = open_file.description.read();
+                    if let OpenDescription::HostFile { host_fd, .. } = &*open
+                        && let Some(file_len) = host_fd_file_len(host_fd.raw())
+                    {
+                        // SAFETY: the description read guard (`open`) keeps
+                        // the owning `HostFdRef` alive across the borrow.
+                        let borrowed =
+                            unsafe { std::os::fd::BorrowedFd::borrow_raw(host_fd.raw()) };
+                        if matches!(
+                            memory.map_private_file_backed(
+                                address,
+                                length_usize,
+                                borrowed,
+                                offset
+                            ),
+                            Ok(true)
+                        ) {
+                            lowered_file_backed = true;
+                            bus_fault_offset =
+                                shared_file_bus_offset(file_len, offset, length, page_size);
+                        }
+                    }
+                }
+                if !lowered_file_backed {
+                    match this.snapshot_private_mmap_file(fd, offset, length_usize) {
+                        Ok(snapshot) => bytes = snapshot.bytes,
+                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    }
+                }
+            }
             // Stamp file content through the unchecked path: this is carrick
             // loading the mapping, not a guest write. The dynamic loader often
             // reserves a whole DSO as PROT_NONE before MAP_FIXED segment loads;
@@ -5140,6 +5237,285 @@ mod tests {
                 "{source} partial-page tail must be zero-filled"
             );
         }
+    }
+
+    /// Mock backend for the Move-3 E1 lowering: records every
+    /// `map_private_file_backed` offer and answers with a configured verdict,
+    /// so the dispatch-side eligibility and fallback are testable without a
+    /// real identity host mapping.
+    struct FileBackedLoweringMemory {
+        inner: CountingMmapMemory,
+        accept: bool,
+        offers: std::cell::RefCell<Vec<(u64, usize, u64)>>,
+    }
+
+    impl FileBackedLoweringMemory {
+        fn new(base: u64, len: usize, accept: bool) -> Self {
+            Self {
+                inner: CountingMmapMemory::new(base, len),
+                accept,
+                offers: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl GuestMemory for FileBackedLoweringMemory {
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            self.inner.read_bytes_raw(address, length)
+        }
+
+        fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+            self.inner.write_bytes_raw(address, bytes)
+        }
+
+        fn protect_range(
+            &mut self,
+            address: u64,
+            len: usize,
+            prot: u64,
+        ) -> Result<(), MemoryError> {
+            self.inner.protect_range(address, len, prot)
+        }
+
+        fn map_private_file_backed(
+            &mut self,
+            address: u64,
+            len: usize,
+            _host_fd: std::os::fd::BorrowedFd<'_>,
+            offset: u64,
+        ) -> Result<bool, MemoryError> {
+            self.offers.borrow_mut().push((address, len, offset));
+            Ok(self.accept)
+        }
+    }
+
+    /// Install a HostFile-backed guest fd whose backing file holds `payload`,
+    /// returning the guest fd number.
+    fn install_host_file_fd(dispatcher: &SyscallDispatcher, fd: i32, payload: &[u8]) {
+        use std::os::fd::{AsRawFd, IntoRawFd};
+        let host_file = tempfile::tempfile().expect("temporary host private-map source");
+        assert_eq!(
+            unsafe {
+                libc::pwrite(
+                    host_file.as_raw_fd(),
+                    payload.as_ptr().cast(),
+                    payload.len(),
+                    0,
+                )
+            },
+            payload.len() as isize
+        );
+        dispatcher.io.open_files.write().insert(
+            fd,
+            OpenFile::new(
+                std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::HostFile {
+                    base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
+                    host_fd: HostFdRef::new(host_file.into_raw_fd()),
+                    metadata: RootFsMetadata {
+                        path: std::path::PathBuf::from("/host-private-map"),
+                        kind: RootFsEntryKind::File,
+                        mode: 0o644,
+                        size: payload.len(),
+                    },
+                    writable: false,
+                })),
+                0,
+            ),
+        );
+    }
+
+    #[test]
+    fn mmap_private_hostfile_lowers_file_backed_and_publishes_bus_tail() {
+        const SYS_MMAP: u64 = 222;
+        const PAGE_SIZE: u64 = 16 * 1024;
+        const LENGTH: u64 = 3 * PAGE_SIZE;
+
+        let dispatcher = native16k_dispatcher();
+        // File backs one full page plus 3 bytes: page 1 is the partially
+        // backed page (zero tail), page 2 is wholly beyond EOF -> BUS.
+        install_host_file_fd(&dispatcher, 30, &vec![0x7d; PAGE_SIZE as usize + 3]);
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1300));
+        let reporter = CompatReporter::default();
+        let mut memory =
+            FileBackedLoweringMemory::new(LINUX_MMAP_BASE, 4 * PAGE_SIZE as usize, true);
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    LENGTH,
+                    LINUX_PROT_READ,
+                    crate::linux_abi::LINUX_MAP_PRIVATE,
+                    30,
+                    0,
+                ]),
+            ),
+        );
+        let DispatchOutcome::Returned { value } = outcome else {
+            panic!("private host-file mmap must succeed, got {outcome:?}");
+        };
+        let address = value as u64;
+        assert_eq!(
+            memory.offers.borrow().as_slice(),
+            &[(address, LENGTH as usize, 0)],
+            "the backend must be offered exactly the mapped range"
+        );
+        assert_eq!(
+            memory.inner.write_calls.get(),
+            0,
+            "a lowered mapping must not be eagerly materialized"
+        );
+        // Map-time EOF contract: the wholly-beyond page is BUS, the partially
+        // backed page is not.
+        assert!(dispatcher.mmap_fault_is_sigbus(address + 2 * PAGE_SIZE));
+        assert!(!dispatcher.mmap_fault_is_sigbus(address + PAGE_SIZE));
+    }
+
+    #[test]
+    fn mmap_private_hostfile_backend_refusal_falls_back_to_snapshot() {
+        const SYS_MMAP: u64 = 222;
+        const PAGE_SIZE: u64 = 16 * 1024;
+        const LENGTH: u64 = 2 * PAGE_SIZE;
+
+        let dispatcher = native16k_dispatcher();
+        install_host_file_fd(&dispatcher, 31, &[0x51u8; 64]);
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1310));
+        let reporter = CompatReporter::default();
+        let mut memory =
+            FileBackedLoweringMemory::new(LINUX_MMAP_BASE, 4 * PAGE_SIZE as usize, false);
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    LENGTH,
+                    LINUX_PROT_READ,
+                    crate::linux_abi::LINUX_MAP_PRIVATE,
+                    31,
+                    0,
+                ]),
+            ),
+        );
+        let DispatchOutcome::Returned { value } = outcome else {
+            panic!("refused lowering must fall back, got {outcome:?}");
+        };
+        let address = value as u64;
+        assert_eq!(memory.offers.borrow().len(), 1, "the backend was offered");
+        assert!(
+            memory.inner.write_calls.get() > 0,
+            "the fallback must eagerly materialize the snapshot"
+        );
+        assert_eq!(
+            memory.inner.read_bytes_raw(address, 64).expect("content"),
+            vec![0x51u8; 64],
+            "fallback content must be the file bytes"
+        );
+        // Legacy arena contract on the fallback: no private BUS tail.
+        assert!(!dispatcher.mmap_fault_is_sigbus(address + PAGE_SIZE));
+    }
+
+    #[test]
+    fn mmap_shared_or_exec_private_is_never_offered_the_lowering() {
+        const SYS_MMAP: u64 = 222;
+        const PAGE_SIZE: u64 = 16 * 1024;
+
+        let dispatcher = native16k_dispatcher();
+        install_host_file_fd(&dispatcher, 32, &[0x11u8; 32]);
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1320));
+        let reporter = CompatReporter::default();
+        let mut memory =
+            FileBackedLoweringMemory::new(LINUX_MMAP_BASE, 4 * PAGE_SIZE as usize, true);
+        for flags_prot in [
+            (crate::linux_abi::LINUX_MAP_SHARED, LINUX_PROT_READ),
+            (
+                crate::linux_abi::LINUX_MAP_PRIVATE,
+                LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_EXEC,
+            ),
+        ] {
+            let outcome = threaded_memory_call(
+                &dispatcher,
+                &mut memory,
+                &registry,
+                &reporter,
+                SyscallRequest::new(
+                    SYS_MMAP,
+                    SyscallArgs([0, PAGE_SIZE, flags_prot.1, flags_prot.0, 32, 0]),
+                ),
+            );
+            // A MAP_SHARED file mapping legitimately publishes via the alias
+            // transaction; the exec-prot private control returns in place.
+            // Either way it must never be OFFERED the lowering.
+            assert!(
+                matches!(
+                    outcome,
+                    DispatchOutcome::Returned { .. } | DispatchOutcome::MapHostAlias { .. }
+                ),
+                "control mapping must still succeed, got {outcome:?}"
+            );
+        }
+        assert!(
+            memory.offers.borrow().is_empty(),
+            "shared and exec-prot mappings must keep the snapshot path: {:?}",
+            memory.offers.borrow()
+        );
+    }
+
+    #[test]
+    fn mmap_private_hostfile_hatch_zero_keeps_snapshot_path() {
+        const SYS_MMAP: u64 = 222;
+        const PAGE_SIZE: u64 = 16 * 1024;
+
+        let dispatcher = native16k_dispatcher();
+        install_host_file_fd(&dispatcher, 33, &[0x22u8; 16]);
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1330));
+        let reporter = CompatReporter::default();
+        let mut memory =
+            FileBackedLoweringMemory::new(LINUX_MMAP_BASE, 4 * PAGE_SIZE as usize, true);
+        // SAFETY: `just test` runs carrick-runtime single-threaded
+        // (RUST_TEST_THREADS=1), the house pattern for env-hatch tests.
+        unsafe { std::env::set_var("CARRICK_MMAP_FILE_BACKED", "0") };
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    PAGE_SIZE,
+                    LINUX_PROT_READ,
+                    crate::linux_abi::LINUX_MAP_PRIVATE,
+                    33,
+                    0,
+                ]),
+            ),
+        );
+        unsafe { std::env::remove_var("CARRICK_MMAP_FILE_BACKED") };
+        assert!(
+            matches!(outcome, DispatchOutcome::Returned { .. }),
+            "hatched mapping must still succeed, got {outcome:?}"
+        );
+        assert!(
+            memory.offers.borrow().is_empty(),
+            "CARRICK_MMAP_FILE_BACKED=0 must keep the snapshot path"
+        );
+        assert!(
+            memory.inner.write_calls.get() > 0,
+            "the hatched path must eagerly materialize"
+        );
     }
 
     #[test]

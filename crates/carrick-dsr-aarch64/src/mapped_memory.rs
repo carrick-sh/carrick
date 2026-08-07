@@ -6,7 +6,7 @@
 //! `NativeMemoryConfig`) that lets hot-path readers avoid its `RwLock`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -4217,6 +4217,88 @@ impl GuestMemory for NativeMappedMemory {
         content: &[u8],
     ) -> Result<(), RepointPrivateError> {
         self.remap_private(va, len, content)
+    }
+
+    /// Move-3 E1: replace an owned arena range with a host
+    /// `MAP_PRIVATE|MAP_FIXED` FILE mapping so a guest `mmap(MAP_PRIVATE, fd)`
+    /// demand-pages from the unified buffer cache — the same mechanism
+    /// `map_prepared_region_extent` already uses for exec-image regions —
+    /// instead of the dispatcher's eager full-length materialization. Each
+    /// `Ok(false)` names an ineligibility and sends the caller back to the
+    /// (always-correct) eager snapshot:
+    ///   * linux4k subpages: Darwin maps whole 16 KiB host pages, so replacing
+    ///     one 4 KiB logical page would detach its still-live neighbours (the
+    ///     same refusal `remap_private` documents);
+    ///   * host-page misalignment of address, length, or file offset;
+    ///   * a range outside this process's owned regions (`region_contains`,
+    ///     re-checked by `fixed_mapping_flags` ownership confinement);
+    ///   * a range that MAY EXECUTE: replacing executable bytes must go
+    ///     through the write path's W^X + translation-invalidation metadata,
+    ///     which a whole-object replacement bypasses;
+    ///   * any host `mmap` failure (degrades to the snapshot cost, never to a
+    ///     guest-visible error).
+    fn map_private_file_backed(
+        &mut self,
+        address: u64,
+        len: usize,
+        host_fd: BorrowedFd<'_>,
+        offset: u64,
+    ) -> Result<bool, MemoryError> {
+        if len == 0 || self.uses_linux4k_subpages() {
+            return Ok(false);
+        }
+        if !address.is_multiple_of(self.host_page_size)
+            || !(len as u64).is_multiple_of(self.host_page_size)
+            || !offset.is_multiple_of(self.host_page_size)
+        {
+            return Ok(false);
+        }
+        if !self.region_contains(address, len) {
+            return Ok(false);
+        }
+        if self.range_may_execute(address, len) {
+            return Ok(false);
+        }
+        let Ok(file_offset) = libc::off_t::try_from(offset) else {
+            return Ok(false);
+        };
+        let Ok((host_start, flags)) = self.fixed_mapping_target(address, len, libc::MAP_PRIVATE)
+        else {
+            return Ok(false);
+        };
+        let ptr = host_start.raw() as *mut libc::c_void;
+        // Host-RW initially: the dispatcher publishes the guest protection via
+        // `protect_range` (and the beyond-EOF BUS tail via its bus machinery)
+        // immediately after, exactly as it does after an eager load.
+        // SAFETY: `fixed_mapping_flags` confined the MAP_FIXED replacement to
+        // this process's owned guest ranges, and the dispatcher holds the
+        // exclusive mapping-mutation guard for the whole mmap dispatch.
+        let mapped = unsafe {
+            libc::mmap(
+                ptr,
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                flags,
+                host_fd.as_raw_fd(),
+                file_offset,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            return Ok(false);
+        }
+        if mapped != ptr {
+            // MAP_FIXED cannot relocate; defend against it anyway so a broken
+            // host cannot leak an unowned mapping.
+            unsafe { libc::munmap(mapped, len) };
+            return Ok(false);
+        }
+        // Physical replacement is complete: retire any shared classification so
+        // an unflagged futex on this range is not given a cross-process key
+        // (the same publication `remap_private` performs). The dispatcher
+        // republishes the full protection tuple after this returns.
+        self.protections
+            .set_mapping_sharing(address, len, MappingSharing::Private);
+        Ok(true)
     }
 
     /// Host pointer for a contiguous, host-readable guest range (zero-copy
