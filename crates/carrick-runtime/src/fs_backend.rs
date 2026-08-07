@@ -1447,6 +1447,29 @@ pub struct HostFsBackend {
     /// entry is ALREADY using as its anchor (exactly what the revalidation hit
     /// path at the top of `stat_cache_get_or_fill` does), so the staleness
     /// exposure is the hit path's and not a wider one.
+    ///
+    /// That equivalence holds ONLY because every clear of `stat_cache` also
+    /// unpublishes here — [`Self::drop_stat_cache_after_rename`] for the
+    /// rename/exchange sites and the pid check in
+    /// [`Self::stat_cache_get_or_fill`] for fork. A clear that dropped the
+    /// entries but left the `Weak`s would be worse than no interning at all:
+    /// the fill path publishes before it does its unlocked `fstatat`/`openat`
+    /// work, so an in-flight fill keeps its anchor alive across the clear, and
+    /// a surviving `Weak` would then serve that stale anchor to every
+    /// subsequent fill under the path instead of stranding one entry.
+    ///
+    /// Dead `Weak`s are pruned ONLY by the `len() >= 4096` retain on insert
+    /// below — the clears above drop whole maps, and ordinary eviction
+    /// (`stat_cache.remove`) leaves a dead key behind. That is bounded by the
+    /// number of distinct parent directories ever stat'd (44 on a cold
+    /// `go build`) and each dead key is one `PathBuf`, so it is a memory
+    /// footnote, not a leak — but it is why a lookup must always treat
+    /// `upgrade()` returning `None` as a normal miss.
+    ///
+    /// Benign race: two threads filling different leaves of one directory can
+    /// both miss and both open an anchor; the later `insert` unpublishes the
+    /// earlier. Both are valid, contained and independently owned, so the only
+    /// effect is a transient second fd on that directory.
     parent_fds: parking_lot::Mutex<
         std::collections::HashMap<PathBuf, std::sync::Weak<std::os::fd::OwnedFd>>,
     >,
@@ -2469,6 +2492,27 @@ impl HostFsBackend {
         None
     }
 
+    /// Drop the whole stat cache AND every interned parent anchor after an
+    /// in-process rename/exchange. Both halves are required.
+    ///
+    /// Clearing `stat_cache` alone is NOT sufficient once anchors are interned.
+    /// The fill path publishes an anchor's `Weak` into `parent_fds` and then
+    /// does its `fstatat`/`openat`/xattr work UNLOCKED before inserting the
+    /// entry, and nothing serializes a rename against a stat. A rename landing
+    /// in that window used to strand exactly ONE entry (the in-flight fill's
+    /// own); with a live `Weak` still published it would instead hand the
+    /// moved-directory anchor to EVERY later fill under that path, until the
+    /// next fork or rename. Unpublishing here restores the pre-intern exposure:
+    /// at most the one in-flight entry, never a reusable anchor.
+    ///
+    /// LOCK ORDER `stat_cache` -> `parent_fds`, matching
+    /// [`Self::stat_cache_get_or_fill`]; `parent_fds` is never taken first.
+    fn drop_stat_cache_after_rename(&self) {
+        let mut map = self.stat_cache.lock();
+        map.clear();
+        self.parent_fds.lock().clear();
+    }
+
     /// The stat cache may be consulted: enabled (default ON) and the `--fs host`
     /// fast path is live. Cross-process coherence is handled inside `stat_cache_get_or_fill`
     /// (clear-on-fork + per-hit revalidation), not by gating on a pid. See
@@ -2596,7 +2640,8 @@ impl HostFsBackend {
             // Bounded like `stat_cache` itself, and by dropping only entries
             // whose anchor is already gone: a live anchor is never unpublished,
             // so the invariant "one live host dirfd per directory" holds even
-            // at the cap.
+            // at the cap. This is also the ONLY place dead keys are reaped —
+            // see the `parent_fds` field doc.
             if parents.len() >= 4096 {
                 parents.retain(|_, weak| weak.strong_count() > 0);
             }
@@ -4502,7 +4547,7 @@ impl FsBackend for HostFsBackend {
         // ino/ctime are unchanged). Renames are rare relative to stats — drop
         // the whole cache. No-op when the cache is disabled/empty.
         if self.use_stat_cache {
-            self.stat_cache.lock().clear();
+            self.drop_stat_cache_after_rename();
         }
         Ok(true)
     }
@@ -4587,7 +4632,7 @@ impl FsBackend for HostFsBackend {
             }
         }
         if self.use_stat_cache {
-            self.stat_cache.lock().clear();
+            self.drop_stat_cache_after_rename();
         }
         Ok(true)
     }
@@ -6328,6 +6373,113 @@ mod tests {
             "24 cached leaves under one directory must share ONE host dirfd, got {}",
             anchors.len()
         );
+    }
+
+    /// The intern map must hold anchors WEAKLY: dropping the cache entries must
+    /// drop the anchor, and the next fill must open a fresh one rather than
+    /// resurrect the old. A strong intern map passes the duplication assertion
+    /// above but fails here — it would keep the anchor alive past its last
+    /// entry, which is what widens the replaced-directory staleness window
+    /// beyond the revalidation hit path's.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stat_cache_parent_anchor_dies_with_its_last_entry() {
+        use std::os::fd::AsRawFd;
+
+        let scratch_root = tempfile::TempDir::new().unwrap();
+        let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+        assert!(b.stat_cache_active());
+        b.dir.create_dir("pkg").unwrap();
+        b.dir.write("pkg/a", b"x").unwrap();
+        b.dir.write("pkg/b", b"x").unwrap();
+        assert!(b.stat_cache_lookup("/pkg/a").is_some());
+        assert!(b.stat_cache_lookup("/pkg/b").is_some());
+
+        let first_anchor = b
+            .stat_cache
+            .lock()
+            .get(Path::new("pkg/a"))
+            .expect("leaf a cached")
+            .parent_fd
+            .as_raw_fd();
+
+        // Evict every entry under the directory; nothing else holds the anchor.
+        b.stat_cache.lock().clear();
+        let published = b.parent_fds.lock().get(Path::new("pkg")).cloned();
+        let published = published.expect("the anchor's key is still published");
+        assert!(
+            published.upgrade().is_none(),
+            "a Weak anchor must NOT survive its last stat_cache entry; a strong \
+             intern map would keep it alive here"
+        );
+
+        // The dead Weak must read as a plain MISS, not poison the path: the
+        // re-fill has to succeed and republish a live anchor.
+        //
+        // Deliberately NOT asserted by comparing raw fd numbers before and
+        // after: the kernel is free to hand the fresh open the number the
+        // dropped anchor just released, so that comparison fails at random.
+        // `upgrade()` returning None above already proves nothing was
+        // resurrected -- there was no live anchor left to resurrect.
+        let _ = first_anchor;
+        assert!(b.stat_cache_lookup("/pkg/a").is_some());
+        assert!(
+            b.parent_fds
+                .lock()
+                .get(Path::new("pkg"))
+                .and_then(std::sync::Weak::upgrade)
+                .is_some(),
+            "the re-fill must republish a live anchor for the directory"
+        );
+    }
+
+    /// A rename must leave no UPGRADEABLE anchor for the moved directory.
+    ///
+    /// `rename_overlay_entry` clears `stat_cache` because a cached dirfd
+    /// silently follows the inode — the one case per-hit revalidation cannot
+    /// detect. Clearing `stat_cache` alone is not enough once anchors are
+    /// interned: the fill path publishes the `Weak` and then works unlocked
+    /// before inserting its entry, and nothing serializes a rename against a
+    /// stat, so an in-flight fill keeps its anchor alive across the clear. With
+    /// the `Weak` still published that stale anchor would be served to every
+    /// later fill under the path instead of stranding the one in-flight entry.
+    /// The live `Arc` below stands in for that in-flight fill deterministically.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rename_leaves_no_upgradeable_parent_anchor() {
+        let scratch_root = tempfile::TempDir::new().unwrap();
+        let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+        assert!(b.stat_cache_active());
+        b.dir.create_dir("pkg").unwrap();
+        b.dir.write("pkg/a", b"x").unwrap();
+        assert!(b.stat_cache_lookup("/pkg/a").is_some());
+
+        // Stand in for a fill that has published its anchor but not yet
+        // inserted its entry: the Arc is alive, so the clear cannot kill it.
+        // ONE lock acquisition: `parking_lot::Mutex` is not reentrant, and a
+        // second `b.stat_cache.lock()` inside an `.or_else` on the same
+        // expression deadlocks against the first guard, which lives to the end
+        // of the statement. (It did; the test hung for 12 minutes.)
+        let inflight = {
+            let map = b.stat_cache.lock();
+            map.get(Path::new("pkg/a"))
+                .map(|entry| entry.parent_fd.clone())
+                .expect("an anchor must be live before the rename")
+        };
+
+        assert!(b.rename_overlay_entry("/pkg", "/moved").unwrap());
+
+        let upgradeable = b
+            .parent_fds
+            .lock()
+            .get(Path::new("pkg"))
+            .and_then(std::sync::Weak::upgrade);
+        assert!(
+            upgradeable.is_none(),
+            "a rename must leave no upgradeable anchor for the OLD parent path; \
+             a later fill would otherwise resolve under the moved directory"
+        );
+        drop(inflight);
     }
 
     #[cfg(target_os = "macos")]
