@@ -34,8 +34,8 @@ file-private mmap population is 18 calls / 3.8 MiB, which cannot own
 anonymous *commit* population (570 `MAP_FIXED` commits ≈ 701.5 MiB + 716 plain
 ≈ 2,313.7 MiB ≈ 188k pages) at **≤ ~34%** of the mass, leaving ~365k faults
 unattributed, and required this closure before any successor is coded
-([`task-5-report.md`](../superpowers/sdd/2026-08-06-move3-amplification-ledger/task-5-report.md)
-§4).
+(review finding, provenance promoted into Appendix A below — the session's
+own report is a gitignored SDD artifact and is not a valid citation target).
 
 This entry partitions the mass into the four candidate owners the brief names:
 (a) the guest's own first touch, (b) carrick's whole-range zero-fill scrub,
@@ -290,7 +290,24 @@ population is dominated by reserves, which changes the fix's shape (the
 `MAP_FIXED`-commit scrub is only 1% of the mass — a commit-side-only fix would
 be near-worthless).
 
-## 7. The successor: kernel-side anonymous-reuse replacement (design; NOT implemented)
+## 7. The successor: kernel-side anonymous-reuse replacement (design — **SHIPPED 2026-08-07, see the note below**)
+
+> **SHIPPED 2026-08-07 (Task 7).** This section is left as the original
+> design write-up (it was accurate at the time this entry was authored), but
+> the header's "design; NOT implemented" is now stale: `52342762`
+> (`feat(dsr): replace the anon-reuse memset with a kernel-side remap`)
+> built and landed exactly this replacement, default ON, hatch
+> `CARRICK_DSR_ZERO_REMAP=0`, retained on an ABBA win (−0.660 CPU-s
+> [−0.750, −0.570]). Full evidence:
+> [`2026-08-07-anon-reuse-remap.md`](2026-08-07-anon-reuse-remap.md). One
+> deliberate deviation from §7.3 below, stronger than specified: the shipped
+> override **refuses** `MappingSharing::Shared` entirely rather than mapping
+> it fresh `MAP_SHARED` — a fresh shared object would sever already-forked
+> peers of the boot-mapped aperture object, which the sketch below did not
+> account for — and keeps the write-through memset for that shape. §7.4's
+> red-first item "fork-visibility of a replaced shared range" is therefore
+> **retired, not silently swapped**: no shared range is ever replaced, and
+> the receipt for that rule is the refusal test.
 
 **Template:** the x86 identity backend already does this —
 `carrick-dsr/src/identity_memory.rs:1275` (`zero_anonymous_reuse`) replaces the
@@ -313,7 +330,13 @@ intact. The aarch64 lowering is the same call at `host_address(guest_va)`
    readable. This, plus the `host_access_lifts` interplay, is why this is not
    a small change.
 3. **Sharing:** `MappingSharing::Shared` maps `MAP_SHARED` (the typed seam's
-   whole point); the shared-aperture arm keeps its own path.
+   whole point); the shared-aperture arm keeps its own path. **Superseded by
+   the shipped deviation above** — the landed code refuses `Shared` instead.
+   Known nit for the next toucher: the shipped aarch64 refusal
+   (`crates/carrick-dsr-aarch64/src/mapped_memory.rs:2419`, off-limits to
+   this doc's own edits) cites "§7.3" as its authority for refusing Shared,
+   but this §7.3 sketch, read literally, says the opposite (map it). The
+   comment should cite the shipped-deviation note above, not this sketch.
 4. **Gates, in order (all standing):** red-first probe (reused range reads
    back zero; prior protection preserved; fork-visibility of a replaced
    shared range) → `just ci` → one-worker conformance-probe delta → the
@@ -346,6 +369,17 @@ attribution filter, not a veto, per §0. Even the top of this band does not
 close Move 3's 7.555 CPU-s gap — the out-of-window 63.3% host-other mass
 (E2-proper) remains the larger, separate territory.
 
+> **Denominator moved 2026-08-07, after this entry.** The 7.555 CPU-s gap
+> above is computed at the 2026-08-06 median Carrick CPU of 21.391 s (plan
+> §0). The campaign's closing refresh re-measured median Carrick CPU at
+> **19.795 s**
+> ([`2026-08-07-post-move3-default-refresh.md`](2026-08-07-post-move3-default-refresh.md)),
+> which moves the same 48.4067% kernel share to **9.582 CPU-s** and the gap
+> against the unchanged 2.800 CPU-s budget to **6.782 CPU-s** (was 7.555).
+> The 7.555 figure above is left as captured — it was this entry's own
+> arithmetic input at the time, not a re-derivation — and is not silently
+> rewritten; read it against 6.782 going forward.
+
 ## 8. Record corrections landed with this entry
 
 - AGENTS.md's fault bullet: the parenthetical attributing the 36% in-window
@@ -357,3 +391,28 @@ close Move 3's 7.555 CPU-s gap — the out-of-window 63.3% host-other mass
   export windows are dead under the biased address mode (476 hits) and should
   be re-pointed at the biased ranges or dropped — a D-program change, so it
   re-qualifies `program_sha256` and is deliberately not folded in here.
+
+## Appendix A: the E1-review sizing bound (provenance promoted 2026-08-07)
+
+§1 above cites a review finding — "at ≤ ~34% of the mass, leaving ~365k
+faults unattributed" — whose only prior record was the session's Task-5 SDD
+report, an untracked file (`.superpowers/sdd/.gitignore` is `*`). The
+load-bearing content, promoted here verbatim in substance so the citation
+resolves to committed material:
+
+> Sizing bound the successor must respect (review finding, carried): the
+> anon commit population is 570 `MAP_FIXED` commits (701.5 MiB) + 716 plain
+> (2,313.7 MiB) ≈ 3.0 GiB ≈ 188k 16-KiB pages — at most ~34% of the 553k
+> in-window zfod even if every committed byte were scrub-touched fresh. The
+> scrub hypothesis therefore cannot own the whole window either; the
+> fault-mass closure (where in the mmap window do the other ~365k fire?) is
+> a REQUIRED first step of the successor entry, and the 36% figure must not
+> be inherited as its opportunity size.
+
+This entry (§3, §4) is that required closure: the fault-event ×
+memory-intent join in §3 shows the population is not, in fact, dominated by
+the *commit* shapes this bound was computed over — it is 98% hint-less
+`PROT_NONE` *reserves* (§4), a population the ≤34% arithmetic excluded
+entirely. The bound was correct arithmetic on the wrong population, which
+is exactly why it does not need to be defended further here; it is recorded
+only so the §1 citation has a committed home.

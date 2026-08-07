@@ -212,7 +212,9 @@ this entry — E0 measures, it does not attribute causes).
 > directory (weakly, so lifetimes are unchanged): **1,108.3 → 80.7 closes per
 > exec** on the same fixture and instrument (74,253 → 5,404), and the resident
 > dirfd population 1,138 → 49. Diagnosis, receipts and classification:
-> [`task-close-diagnosis-report.md`](../superpowers/sdd/2026-08-06-move3-amplification-ledger/task-close-diagnosis-report.md).
+> [`2026-08-07-exec-close-diagnosis.md`](2026-08-07-exec-close-diagnosis.md)
+> (promoted 2026-08-07 from the session's gitignored SDD report so the
+> record is committed).
 > The measured columns above are the pre-fix reading and are left as captured.
 
 Three rows are ratios over tiny denominators and must not be read as
@@ -425,6 +427,23 @@ the `mmap` windows plus the guest-op residue, 36.3% vs 36.7%. The naive
 pairing (host-other ↔ `carrick-only` alone) misses by 5 pp; pooled, both
 sides agree to ~0.4 pp.
 
+> **CORRECTED 2026-08-07.** The sentence above — "the guest-owned fault mass
+> IS the E1 destination-arena first touch, made by carrick's own copy loop
+> inside the `mmap` service window" — is refuted, twice over. Task 5's
+> guest-mmap population census found file-backed `MAP_PRIVATE` (the only
+> shape E1's eager `pread`+copy touches) at **18 calls / 3.8 MiB per
+> build**, far too small to own 553k × 16 KiB ≈ 8.6 GB of in-window
+> zero-fill. Task 6's fault-event × memory-intent join then named the real
+> owner: **99.4% of the in-window mass is carrick's own whole-range
+> `zero_anonymous_reuse` scrub** touching the op's own biased backing, 98%
+> of it on hint-less 128 MiB `PROT_NONE` reserves that are already zero —
+> "doubly refuted", in that entry's own words. §11's E1 "confirmed #1"
+> ranking below carries the same correction (see its note). Left as
+> captured here — it was this entry's own stated working hypothesis, not a
+> measurement — and is annotated rather than rewritten. Receipts:
+> [`2026-08-07-build-lane-fault-partition.md`](2026-08-07-build-lane-fault-partition.md)
+> §§4, 6.
+
 ## 10. Qualify-at-first-arming — the Task-1 §6 list, answered
 
 1. **`vtimestamp` advances across `mach_trap:::entry`/`return`: YES.** Mach
@@ -475,6 +494,19 @@ restated; ranks are by what this capture can defend. E1/E2 remain overlapping
 | 6 | **E4** alias-gate / dispatch-guard scope | not measurable by this instrument; `swtch_pri` storm is consistent with contention but attributes nothing | unchanged: re-derive (Task 8) |
 | 7 | **E3** decommit intent → `MADV_FREE_REUSABLE` | guest `madvise` count is **415–528 per build**, in-window host CPU ≈ 0.1–0.2 ms — noise. The kernel-side case for E3 on this lane is refuted; only the userspace memset share (invisible to AMP1) could still argue for it | **demoted from 3rd**; plan's "should be non-trivial" is falsified by measurement |
 
+> **CORRECTED 2026-08-07** — rank 1's "confirmed #1" verdict rested on this
+> entry's §9 hypothesis (see that section's correction) and does not
+> survive Task 5/6: E1's actual build-lane population is 18 calls / 3.8 MiB,
+> and the 553,526-zfod mass this row cites is now attributed 99.4% to
+> carrick's own `zero_anonymous_reuse` scrub, not E1's materialization
+> path. E1 is retained for correctness (a real private-mmap SIGBUS
+> divergence) but is not a kernel-CPU lever on this lane. The re-ranked
+> #1 is the scrub replacement Task 7 shipped (`52342762`, ABBA
+> −0.660 CPU-s [−0.750, −0.570]); see
+> [`2026-08-07-build-lane-fault-partition.md`](2026-08-07-build-lane-fault-partition.md)
+> and
+> [`2026-08-07-anon-reuse-remap.md`](2026-08-07-anon-reuse-remap.md).
+
 Neither §4 invalidation condition fired: `carrick-only` does not dominate
 (42.2%, with named instrument-adjacent and one-off-seed components inside it),
 and no single host call concentrates the kernel CPU.
@@ -487,7 +519,14 @@ only by the audit's 1.81–3.84 µs/fault range), and blocked time (by design �
 
 ## 12. Wall context (cited, not re-measured)
 
-Official shipped-default ratio: **10.8586x**
+Official shipped-default ratio **as of 2026-08-06**: **10.8586x**
 (`2026-08-06-post-arena-default-refresh.md`, median carrick CPU 21.391 s).
 Nothing in this entry re-measures it; the untraced anchor above is a
 single-run sanity wall, not a ratio input.
+
+> **Superseded 2026-08-07.** The campaign's closing refresh re-measured the
+> official scoreboard at **10.1806x** (median carrick CPU **19.795 s**),
+> folding in the Move-3 changes this ledger's entries authorized —
+> [`2026-08-07-post-move3-default-refresh.md`](2026-08-07-post-move3-default-refresh.md).
+> The 10.8586x figure above is left as captured (it was this entry's own
+> wall-context citation at the time), not rewritten.

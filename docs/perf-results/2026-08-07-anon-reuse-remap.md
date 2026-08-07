@@ -218,6 +218,13 @@ and should re-measure before assuming the sign.
   Move 3's 7.555 CPU-s gap. The out-of-window ~63% host-other mass
   (E2-proper: `publication-recovery` et al.) remains the larger, separate
   territory, unchanged by this entry.
+- **Denominator moved 2026-08-07, after this entry's own ABBA.** The
+  7.555 CPU-s figure above is the pre-refresh gap (21.391 s median, plan
+  §0). This entry's own remap is exactly one of the changes the campaign's
+  closing refresh folds in; at the resulting **19.795 s** median
+  ([`2026-08-07-post-move3-default-refresh.md`](2026-08-07-post-move3-default-refresh.md))
+  the same 48.4067% kernel share gives 9.582 CPU-s and a **6.782 CPU-s**
+  gap. The 7.555 figure is left as captured, not rewritten.
 - `conformance-quick` gates the VMM lane (the recipe's own note); native
   runtime validation here is the three traced full builds, the AMP1 arms,
   and the 16 untraced ABBA builds, all `BUILD_OK`.
