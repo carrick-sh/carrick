@@ -528,6 +528,62 @@ fn amp1_rejects_nonzero_drop_counters_from_either_source() {
 }
 
 #[test]
+fn amp1_accepts_the_inherited_service_ends_every_threaded_guest_produces() {
+    // `NativeSyscallServiceSpan::inherited_open` fires NO entry probe — the
+    // parent already fired it — but the spawned child thread fires `-end` on a
+    // NEW host tid, and the fork child fires one from a new pid. That is
+    // EXPECTED control flow on every `clone(CLONE_THREAD)` and every fork, so
+    // it is its own class and must never be a refusal: treating it as an
+    // unmatched end refuses a ledger on any real build.
+    let threaded = amp1_stream().replacen(
+        "AMP1|window|class=inherited-end|count=3",
+        "AMP1|window|class=inherited-end|count=8291",
+        1,
+    );
+    validate_amp1(&threaded, &[])
+        .success()
+        .stdout(contains("AMP1_VALID"));
+
+    // The discriminator still catches a genuine double close: an `-end` on a
+    // thread whose window already closed is a pairing corruption.
+    let double_close = amp1_stream().replacen(
+        "AMP1|drop|source=service-end-unmatched|count=0",
+        "AMP1|drop|source=service-end-unmatched|count=1",
+        1,
+    );
+    validate_amp1(&double_close, &[])
+        .failure()
+        .stderr(contains("service-end-unmatched"));
+
+    // ... and the section itself is required, for the same reason every other
+    // section is: absent is not zero.
+    let without = amp1_stream()
+        .lines()
+        .filter(|line| !line.starts_with("AMP1|window|") && *line != "AMP1|section=window-events")
+        .collect::<Vec<_>>()
+        .join("\n");
+    validate_amp1(&without, &[])
+        .failure()
+        .stderr(contains("window-events"));
+}
+
+#[test]
+fn amp1_requires_a_qualified_terminal_roster_in_both_scopes() {
+    // The launch authority refuses to exist unless the qualification observed
+    // both a thread- and a process-terminating call, so an empty or half roster
+    // means the substitution never happened — an unrendered template.
+    for dropped in [
+        "AMP1|terminal-call|provider=syscall|function=exit|scope=process\n",
+        "AMP1|terminal-call|provider=syscall|function=bsdthread_terminate|scope=thread\n",
+    ] {
+        let partial = amp1_stream().replacen(dropped, "", 1);
+        validate_amp1(&partial, &[])
+            .failure()
+            .stderr(contains("terminal"));
+    }
+}
+
+#[test]
 fn amp1_rejects_a_missing_drop_section() {
     // Absent is not zero: a section that printed nothing must never be read as
     // a section that printed a zero.
@@ -632,6 +688,11 @@ fn native_amplification_program_scopes_bounds_and_sections_are_pinned() {
         "vminfo:::as_fault",
         "vminfo:::zfod",
         "vminfo:::cow_fault",
+        // The service window is NOT a balanced pair: a terminal handoff emits
+        // no `-end` at all, so the slot has to retire on the two events every
+        // handoff site is followed by.
+        "proc:::exec-success",
+        "proc:::lwp-exit",
     ] {
         assert!(code.contains(probe), "missing probe {probe}");
     }
@@ -663,6 +724,7 @@ fn native_amplification_program_scopes_bounds_and_sections_are_pinned() {
         "AMP1|section=mach-trap-cpu",
         "AMP1|section=mach-trap-returns",
         "AMP1|section=faults",
+        "AMP1|section=window-events",
         "AMP1|section=drops",
     ] {
         assert_eq!(
@@ -684,10 +746,55 @@ fn native_amplification_program_scopes_bounds_and_sections_are_pinned() {
         "@fault_total[\"cow_fault\"] = sum(0);",
         "@drop_service_reentry = sum(0);",
         "@drop_service_unmatched = sum(0);",
+        "@window_inherited_end = sum(0);",
+        "@probe_errors = sum(0);",
     ] {
         assert!(
             code.contains(seed),
             "printa on an empty aggregation prints nothing; missing seed {seed}"
+        );
+    }
+
+    // An unsynchronized D global would let a lost read-modify-write at the
+    // 0/nonzero boundary make a corrupted stream read as clean — fail-OPEN in
+    // the counter whose entire job is to fail closed.
+    assert!(!code.contains("probe_errors++"));
+    assert!(code.contains("@probe_errors = sum(1);"));
+
+    // Inherited spans close from a child tid/pid that never opened a window, so
+    // the never-seen (0) and idle (1) sentinels must stay distinguishable —
+    // that is the whole discriminator between expected control flow and a
+    // genuine double close, and both reads must precede the single write in one
+    // clause.
+    // Comment stripping leaves blank runs, so clauses are trimmed before the
+    // boundary check.
+    let clause_at = |probe: &str| {
+        code.split("\n\n")
+            .map(str::trim_start)
+            .find(|clause| clause.starts_with(probe))
+            .map(str::to_owned)
+    };
+    let end_clause =
+        clause_at("carrick*:::native-syscall-service-end").expect("service-end clause");
+    assert!(end_clause.contains(
+        "@window_inherited_end =\n\t    sum(service_slot[pid, tid] == (uint64_t)0 ? 1 : 0);"
+    ));
+    assert!(end_clause.contains(
+        "@drop_service_unmatched =\n\t    sum(service_slot[pid, tid] == (uint64_t)1 ? 1 : 0);"
+    ));
+    assert_eq!(
+        code.matches("carrick*:::native-syscall-service-end")
+            .count(),
+        1,
+        "a second clause on this probe would observe the first clause's mutation"
+    );
+    for retirement in ["proc:::exec-success", "proc:::lwp-exit"] {
+        let clause =
+            clause_at(retirement).unwrap_or_else(|| panic!("missing {retirement} slot retirement"));
+        assert!(
+            clause.contains("service_slot[pid, tid] = (uint64_t)0;"),
+            "{retirement} must retire the slot to NEVER-SEEN so a reused tid's \
+             inherited end is not read as a double close"
         );
     }
 

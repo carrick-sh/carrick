@@ -57,7 +57,7 @@ const DECLARED_BUFFERS: [(&str, &str); 3] = [
     ("bufsize", "bufsize=32m"),
 ];
 
-const REQUIRED_SECTIONS: [&str; 12] = [
+const REQUIRED_SECTIONS: [&str; 13] = [
     "terminal-calls",
     "totals",
     "fault-totals",
@@ -69,8 +69,15 @@ const REQUIRED_SECTIONS: [&str; 12] = [
     "mach-trap-cpu",
     "mach-trap-returns",
     "faults",
+    "window-events",
     "drops",
 ];
+
+/// Service-window control flow that is expected rather than lossy. These are
+/// reported, never refused: `inherited-end` is one per guest
+/// `clone(CLONE_THREAD)` and per fork, because the child closes a span whose
+/// entry probe fired on the parent's (pid, tid).
+const REQUIRED_WINDOW_CLASSES: [&str; 1] = ["inherited-end"];
 
 const REQUIRED_METRICS: [&str; 7] = [
     "guest-syscall-total",
@@ -124,34 +131,72 @@ impl GuestSlot {
 ///
 /// Every field is exactly what the stream carried; nothing here is derived.
 /// The capture path reads a few of them for its acceptance receipt; the rest
-/// are the typed ledger analyzer's input, which is why the whole surface is
-/// parsed and validated here rather than left for a second reader to re-derive.
-#[allow(dead_code)]
+/// carry `#[allow(dead_code)]` INDIVIDUALLY, so the attribute names exactly
+/// what the typed ledger analyzer still has to consume and a genuinely dead
+/// field added later is not hidden by a struct-wide allow.
 #[derive(Clone, Debug)]
 pub(crate) struct Amp1Capture {
+    /// Consumed by the typed ledger analyzer.
+    #[allow(dead_code)]
     pub(crate) os_build: String,
+    /// Consumed by the typed ledger analyzer.
+    #[allow(dead_code)]
     pub(crate) program_sha256: String,
+    /// Consumed by the typed ledger analyzer.
+    #[allow(dead_code)]
     pub(crate) birth_qualification_sha256: String,
+    /// Consumed by the typed ledger analyzer.
+    #[allow(dead_code)]
     pub(crate) terminal_qualification_sha256: String,
     pub(crate) joins: String,
+    /// Consumed by the typed ledger analyzer.
+    #[allow(dead_code)]
     pub(crate) terminal_calls: BTreeSet<(String, String, String)>,
     pub(crate) totals: BTreeMap<String, u64>,
     pub(crate) fault_totals: BTreeMap<String, u64>,
+    /// Consumed by the typed ledger analyzer.
+    #[allow(dead_code)]
     pub(crate) guest_syscalls: BTreeMap<GuestSlot, u64>,
+    /// Consumed by the typed ledger analyzer.
+    #[allow(dead_code)]
     pub(crate) host_syscalls: BTreeMap<(GuestSlot, String), u64>,
+    /// Consumed by the typed ledger analyzer.
+    #[allow(dead_code)]
     pub(crate) host_syscall_cpu_ns: BTreeMap<(GuestSlot, String), u64>,
+    /// Consumed by the typed ledger analyzer.
+    #[allow(dead_code)]
     pub(crate) host_syscall_max_ns: BTreeMap<(GuestSlot, String), u64>,
+    /// Consumed by the typed ledger analyzer.
+    #[allow(dead_code)]
     pub(crate) host_syscall_returns: BTreeMap<String, u64>,
+    /// Consumed by the typed ledger analyzer.
+    #[allow(dead_code)]
     pub(crate) mach_traps: BTreeMap<(GuestSlot, String), u64>,
+    /// Consumed by the typed ledger analyzer.
+    #[allow(dead_code)]
     pub(crate) mach_trap_cpu_ns: BTreeMap<(GuestSlot, String), u64>,
+    /// Consumed by the typed ledger analyzer.
+    #[allow(dead_code)]
     pub(crate) mach_trap_returns: BTreeMap<String, u64>,
+    /// Consumed by the typed ledger analyzer.
+    #[allow(dead_code)]
     pub(crate) faults: BTreeMap<(GuestSlot, String), u64>,
+    /// Expected service-window control flow, reported and never refused.
+    #[allow(dead_code)]
+    pub(crate) window_events: BTreeMap<String, u64>,
+    /// Consumed by the typed ledger analyzer.
+    #[allow(dead_code)]
     pub(crate) drops: BTreeMap<String, u64>,
+    /// Consumed by the typed ledger analyzer.
+    #[allow(dead_code)]
     pub(crate) bound_limit_s: u64,
+    /// Consumed by the typed ledger analyzer.
+    #[allow(dead_code)]
     pub(crate) target_exit_reason: i64,
     /// Traced elapsed nanoseconds. DIAGNOSTIC METADATA ONLY: four probe
     /// families in one program perturb wall by an expected 2–4x, so counts and
     /// same-instrument ratios are citable and wall never is.
+    #[allow(dead_code)]
     pub(crate) elapsed_ns: u64,
 }
 
@@ -268,6 +313,7 @@ struct Amp1Reader {
     mach_trap_cpu_ns: BTreeMap<(GuestSlot, String), u64>,
     mach_trap_returns: BTreeMap<String, u64>,
     faults: BTreeMap<(GuestSlot, String), u64>,
+    window_events: BTreeMap<String, u64>,
     drops: BTreeMap<String, u64>,
 }
 
@@ -282,7 +328,6 @@ struct HeaderRecord {
 struct CompleteRecord {
     timed_out: u64,
     target_exit_reason: i64,
-    probe_errors: u64,
     bound_limit_s: u64,
     elapsed_ns: u64,
 }
@@ -326,6 +371,7 @@ impl Amp1Reader {
         }
         match *kind {
             "terminal-call" => self.absorb_terminal_call(body),
+            "window" => self.absorb_window_event(body),
             "drop" => self.absorb_drop(body),
             "complete" => self.absorb_complete(body),
             _ => self.absorb_row(kind, body),
@@ -373,6 +419,20 @@ impl Amp1Reader {
         Ok(())
     }
 
+    fn absorb_window_event(&mut self, body: &[&str]) -> Result<()> {
+        self.require_section("window-events")?;
+        let fields = Fields::parse(body)?;
+        let class = fields.require("class")?;
+        if !REQUIRED_WINDOW_CLASSES.contains(&class) {
+            bail!("AMP1 stream declares an unknown window-event class {class:?}");
+        }
+        insert_unique(
+            &mut self.window_events,
+            class.to_owned(),
+            fields.require_u64("count")?,
+        )
+    }
+
     fn absorb_drop(&mut self, body: &[&str]) -> Result<()> {
         self.require_section("drops")?;
         let fields = Fields::parse(body)?;
@@ -399,7 +459,6 @@ impl Amp1Reader {
         self.complete = Some(CompleteRecord {
             timed_out: fields.require_u64("timed_out")?,
             target_exit_reason: fields.require_i64("target_exit_reason")?,
-            probe_errors: fields.require_u64("probe_errors")?,
             bound_limit_s: fields.require_u64("bound_limit_s")?,
             elapsed_ns: fields.require_u64("elapsed_ns")?,
         });
@@ -579,12 +638,6 @@ impl Amp1Reader {
                 complete.bound_limit_s
             );
         }
-        if complete.probe_errors != 0 {
-            bail!(
-                "AMP1 capture recorded {} D action faults; the exact stream is not authoritative",
-                complete.probe_errors
-            );
-        }
         for metric in REQUIRED_METRICS {
             if !self.totals.contains_key(metric) {
                 bail!("AMP1 totals section is missing required metric {metric:?}");
@@ -593,6 +646,24 @@ impl Amp1Reader {
         for kind in FAULT_KINDS {
             if !self.fault_totals.contains_key(kind) {
                 bail!("AMP1 fault totals are missing required kind {kind:?}");
+            }
+        }
+        for class in REQUIRED_WINDOW_CLASSES {
+            if !self.window_events.contains_key(class) {
+                bail!("AMP1 window-events section is missing class {class:?}; absent is not zero");
+            }
+        }
+        // The launch authority refuses to exist unless the qualification
+        // observed both a thread- and a process-terminating call, so a roster
+        // missing either scope means the substitution never happened -- an
+        // unrendered template rather than a capture.
+        for scope in ["thread", "process"] {
+            if !self
+                .terminal_calls
+                .iter()
+                .any(|(_, _, observed)| observed == scope)
+            {
+                bail!("AMP1 terminal-call roster qualifies no {scope}-terminating call");
             }
         }
         for source in REQUIRED_DROP_SOURCES {
@@ -635,6 +706,7 @@ impl Amp1Reader {
             mach_trap_cpu_ns: self.mach_trap_cpu_ns,
             mach_trap_returns: self.mach_trap_returns,
             faults: self.faults,
+            window_events: self.window_events,
             drops: self.drops,
             bound_limit_s: complete.bound_limit_s,
             target_exit_reason: complete.target_exit_reason,
