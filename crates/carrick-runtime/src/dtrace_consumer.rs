@@ -94,6 +94,12 @@ pub const BUNDLED_NATIVE_SHAPE_D: &str =
     include_str!("../../../scripts/dtrace/native-shape-census.d");
 pub const BUNDLED_NATIVE_FAULT_D: &str =
     include_str!("../../../scripts/dtrace/native-fault-attribution.d");
+/// The AMP1 kernel amplification ledger (`scripts/dtrace/native-amplification.d`).
+/// Four probe families — host syscalls, mach traps, faults, and the guest-op
+/// service window — joined in one program, which is why its drop accounting is
+/// a required section rather than a diagnostic.
+pub const BUNDLED_NATIVE_AMPLIFICATION_D: &str =
+    include_str!("../../../scripts/dtrace/native-amplification.d");
 pub const BUNDLED_NATIVE_BIRTH_QUALIFY_D: &str =
     include_str!("../../../scripts/dtrace/native-birth-qualify.d");
 pub const BUNDLED_NATIVE_TERMINAL_QUALIFY_D: &str =
@@ -821,11 +827,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     use super::invoke_post_stop;
     use super::{
-        BUNDLED_NATIVE_SHAPE_D, BUNDLED_NATIVE_WALL_D, DTRACE_CONSUME_NEXT, DTRACE_CONSUME_THIS,
-        DTRACEACT_EXIT, DTRACEDROP_AGGREGATION, DTRACEDROP_DYNAMIC, DTRACEDROP_DYNDIRTY,
-        DTRACEDROP_DYNRINSE, DTRACEDROP_PRINCIPAL, DTraceError, DTraceObservation,
-        DTraceObservedFailure, DTraceRunReport, DtraceRecDesc, TRACE_CHILD_COMMAND,
-        TraceDropCredentials, TraceOptions, chewrec, join_ids, record_drop,
+        BUNDLED_NATIVE_AMPLIFICATION_D, BUNDLED_NATIVE_SHAPE_D, BUNDLED_NATIVE_WALL_D,
+        DTRACE_CONSUME_NEXT, DTRACE_CONSUME_THIS, DTRACEACT_EXIT, DTRACEDROP_AGGREGATION,
+        DTRACEDROP_DYNAMIC, DTRACEDROP_DYNDIRTY, DTRACEDROP_DYNRINSE, DTRACEDROP_PRINCIPAL,
+        DTraceError, DTraceObservation, DTraceObservedFailure, DTraceRunReport, DtraceRecDesc,
+        TRACE_CHILD_COMMAND, TraceDropCredentials, TraceOptions, chewrec, join_ids, record_drop,
         run_child_under_dtrace_observed, trace_exec_argv,
     };
     use std::ffi::CString;
@@ -1080,6 +1086,93 @@ mod tests {
         assert!(source.contains("|target_pid=%d|admitted="));
         assert!(source.contains("%@d|exited=%@d|live_at_end=%@d|probe_errors=%@d"));
         assert_eq!(source.matches("NSHAPE2|complete").count(), 1);
+    }
+
+    #[test]
+    fn native_amplification_declares_buffer_headroom_over_the_fs_census() {
+        // `native-fs-amplification.d` ran two probe families at 32m/64m/16m.
+        // AMP1 runs four in one program, so every buffer is declared strictly
+        // above that, and the header carries the sizing argument. These values
+        // are determinants: the header repeats them and the comparator refuses
+        // to cross a capture that ran with different ones.
+        for pragma in [
+            "#pragma D option quiet",
+            "#pragma D option aggsize=64m",
+            "#pragma D option dynvarsize=256m",
+            "#pragma D option bufsize=32m",
+            "#pragma D option strsize=256",
+        ] {
+            assert!(
+                BUNDLED_NATIVE_AMPLIFICATION_D.contains(pragma),
+                "missing {pragma}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_amplification_capture_bound_is_a_substitutable_declared_parameter() {
+        assert_eq!(
+            BUNDLED_NATIVE_AMPLIFICATION_D
+                .matches("/* CARRICK_AMP1_BOUND */")
+                .count(),
+            1,
+            "the capture bound needs exactly one substitution slot"
+        );
+        assert!(
+            BUNDLED_NATIVE_AMPLIFICATION_D.contains("bound_limit_s = (uint64_t)600;"),
+            "the unrendered template must stay a legal D program with the shipped default"
+        );
+        assert!(
+            BUNDLED_NATIVE_AMPLIFICATION_D.contains("|bound_limit_s=%d"),
+            "the stream must self-describe the bound that was in force"
+        );
+        assert!(
+            BUNDLED_NATIVE_AMPLIFICATION_D
+                .lines()
+                .all(|line| !line.starts_with("tick-") || line == "tick-10s"),
+            "the bound must not be frozen into a probe name"
+        );
+    }
+
+    #[test]
+    fn native_amplification_substitutes_one_header_and_one_terminal_roster() {
+        for placeholder in ["/* CARRICK_AMP1_HEADER */", "/* CARRICK_AMP1_TERMINALS */"] {
+            assert_eq!(
+                BUNDLED_NATIVE_AMPLIFICATION_D.matches(placeholder).count(),
+                1,
+                "{placeholder} must have exactly one substitution slot"
+            );
+        }
+    }
+
+    #[test]
+    fn native_amplification_emits_its_drop_section_unconditionally() {
+        // DTrace drops silently, and on this instrument a silent drop reads as
+        // LOWER amplification. The program-owned counters are a required
+        // section; libdtrace's own counters are not readable from D and are
+        // enforced by the reader against `DTraceRunReport`.
+        assert_eq!(
+            BUNDLED_NATIVE_AMPLIFICATION_D
+                .matches("AMP1|section=drops")
+                .count(),
+            1
+        );
+        for source in [
+            "AMP1|drop|source=dtrace-error|count=%d",
+            "AMP1|drop|source=service-window-reentry|count=%@d",
+            "AMP1|drop|source=service-end-unmatched|count=%@d",
+        ] {
+            assert!(
+                BUNDLED_NATIVE_AMPLIFICATION_D.contains(source),
+                "missing drop counter {source}"
+            );
+        }
+        assert_eq!(
+            BUNDLED_NATIVE_AMPLIFICATION_D
+                .matches("AMP1|complete|profile=native-amplification")
+                .count(),
+            1
+        );
     }
 
     #[test]

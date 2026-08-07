@@ -13,6 +13,8 @@ const NFAULT2_HEADER_PLACEHOLDER: &str = "/* CARRICK_NFAULT2_HEADER */";
 const NFAULT2_TERMINALS_PLACEHOLDER: &str = "/* CARRICK_NFAULT2_TERMINALS */";
 const NSHAPE2_HEADER_PLACEHOLDER: &str = "/* CARRICK_NSHAPE2_HEADER */";
 const NSHAPE2_TERMINALS_PLACEHOLDER: &str = "/* CARRICK_NSHAPE2_TERMINALS */";
+const AMP1_HEADER_PLACEHOLDER: &str = "/* CARRICK_AMP1_HEADER */";
+const AMP1_TERMINALS_PLACEHOLDER: &str = "/* CARRICK_AMP1_TERMINALS */";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -186,6 +188,57 @@ impl NativeProfileQualification {
             NFAULT2_HEADER_PLACEHOLDER,
             NFAULT2_TERMINALS_PLACEHOLDER,
         )
+    }
+
+    /// Render the AMP1 amplification ledger.
+    ///
+    /// Unlike the other native profiles, the qualified terminal roster is
+    /// PRINTED rather than installed as a lookup table. A per-host-call
+    /// `terminal_scope[provider, function]` read would add a string-keyed
+    /// associative lookup to ~2.9M events in a program whose declared risk is
+    /// exactly that kind of dynamic-variable pressure. The roster's job here is
+    /// to let the reader explain host calls whose entry count exceeds their
+    /// return count, which is an offline question.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn render_native_amplification_profile_program(
+        &self,
+        profile_template: &str,
+    ) -> Result<RenderedNativeProfileProgram> {
+        for (placeholder, label) in [
+            (AMP1_HEADER_PLACEHOLDER, "header"),
+            (AMP1_TERMINALS_PLACEHOLDER, "terminal"),
+        ] {
+            let count = profile_template.match_indices(placeholder).count();
+            if count != 1 {
+                bail!(
+                    "native-amplification profile template must contain exactly one {label} placeholder, found {count}"
+                );
+            }
+        }
+        // The authority names the immutable bundled template; hashing the
+        // receipt-substituted program would make the header self-referential.
+        let authority = self.profile_authority(
+            crate::trace_profile::TraceProfileKind::NativeAmplification,
+            profile_template,
+        )?;
+        let header_action = format!("printf(\"{}\\n\");", authority.header_record());
+        let terminal_actions = self
+            .terminals
+            .iter()
+            .map(|terminal| {
+                format!(
+                    "printf(\"AMP1|terminal-call|provider={}|function={}|scope={}\\n\");",
+                    terminal.provider,
+                    terminal.function,
+                    terminal.scope.as_str()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\t");
+        let program = profile_template
+            .replacen(AMP1_HEADER_PLACEHOLDER, &header_action, 1)
+            .replacen(AMP1_TERMINALS_PLACEHOLDER, &terminal_actions, 1);
+        Ok(RenderedNativeProfileProgram { program, authority })
     }
 
     #[cfg(target_os = "macos")]

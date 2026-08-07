@@ -22,6 +22,7 @@ const V2_RAW_SCHEMA: &str = "carrick.dsrprof.raw.v6";
 const NO_KERNEL_FUNCTION: &str = "none";
 const TARGET_KERNEL_SYSCALL_STACK: &str = "psynch_cvwait";
 const NATIVE_FAULT_RAW_SCHEMA: &str = "carrick.native-fault.raw.v3";
+pub(crate) const AMPLIFICATION_RAW_SCHEMA: &str = "carrick.amplification.raw.v1";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ProcessBirthKey {
@@ -194,6 +195,9 @@ fn validate_sha256(value: &str, field: &str) -> Result<()> {
 /// means a second substitution cannot quietly install a different ceiling.
 pub(crate) const DSRPROF2_BOUND_PLACEHOLDER: &str = "/* CARRICK_DSRPROF2_BOUND */";
 
+/// The same slot, in the AMP1 amplification template.
+pub(crate) const AMP1_BOUND_PLACEHOLDER: &str = "/* CARRICK_AMP1_BOUND */";
+
 /// The largest bound a capture may request, in seconds (six hours).
 ///
 /// Not a policy preference: `bound_limit_s` is a `uint64_t` of seconds
@@ -214,7 +218,21 @@ pub(crate) const NATIVE_WALL_MAX_BOUND_SECONDS: u64 = 6 * 60 * 60;
 ///
 /// `seconds` must be a positive multiple of the 10 s accumulation granularity;
 /// anything else would silently round and make the reported bound a lie.
-pub(crate) fn render_profile_capture_bound(template: &str, seconds: u64) -> Result<String> {
+///
+/// The slot's spelling is per profile, so the caller names which profile it is
+/// bounding rather than letting a template that never declared a bound fail
+/// with a placeholder-count error that reads like corruption.
+pub(crate) fn render_profile_capture_bound(
+    profile: TraceProfileKind,
+    template: &str,
+    seconds: u64,
+) -> Result<String> {
+    let Some(placeholder) = profile.capture_bound_placeholder() else {
+        bail!(
+            "profile {} does not declare a capture bound",
+            profile.as_str()
+        );
+    };
     if seconds == 0 {
         bail!("profile capture bound must be positive");
     }
@@ -228,12 +246,12 @@ pub(crate) fn render_profile_capture_bound(template: &str, seconds: u64) -> Resu
             "profile capture bound {seconds}s exceeds the {NATIVE_WALL_MAX_BOUND_SECONDS}s ceiling"
         );
     }
-    let slots = template.match_indices(DSRPROF2_BOUND_PLACEHOLDER).count();
+    let slots = template.match_indices(placeholder).count();
     if slots != 1 {
         bail!("profile template must contain exactly one capture-bound placeholder, found {slots}");
     }
     let action = format!("bound_limit_s = (uint64_t){seconds};");
-    Ok(template.replacen(DSRPROF2_BOUND_PLACEHOLDER, &action, 1))
+    Ok(template.replacen(placeholder, &action, 1))
 }
 
 fn validate_percent_token(value: &str, field: &str) -> Result<()> {
@@ -365,7 +383,9 @@ impl V2ProfileAuthority {
     ) -> Result<Self> {
         if !matches!(
             profile,
-            TraceProfileKind::NativeFault | TraceProfileKind::NativeWall
+            TraceProfileKind::NativeAmplification
+                | TraceProfileKind::NativeFault
+                | TraceProfileKind::NativeWall
         ) {
             bail!("profile {:?} does not use native launch authority", profile);
         }
@@ -438,6 +458,17 @@ impl V2ProfileAuthority {
             ),
             TraceProfileKind::NativeFault => format!(
                 "NFAULT2|header|profile=native-fault|raw_schema={NATIVE_FAULT_RAW_SCHEMA}|os_build={}|program_sha256={}|birth_qualification_sha256={}|terminal_qualification_sha256={}|page_sample_modulus=64",
+                self.os_build,
+                self.program_sha256(),
+                self.birth_qualification_sha256,
+                self.terminal_qualification_sha256,
+            ),
+            // The declared buffer sizes travel in the header because they are
+            // capture determinants: a ledger taken at different aggregation or
+            // dynamic-variable headroom is a different instrument, and the
+            // comparator refuses to cross them. Same for `joins=`.
+            TraceProfileKind::NativeAmplification => format!(
+                "AMP1|header|profile=native-amplification|raw_schema={AMPLIFICATION_RAW_SCHEMA}|os_build={}|program_sha256={}|birth_qualification_sha256={}|terminal_qualification_sha256={}|joins=syscall,mach,fault|aggsize=64m|dynvarsize=256m|bufsize=32m",
                 self.os_build,
                 self.program_sha256(),
                 self.birth_qualification_sha256,
@@ -2109,6 +2140,7 @@ pub(crate) enum TraceProfileKind {
     Dsr,
     DsrIndirect,
     DsrFork,
+    NativeAmplification,
     NativeFault,
     NativeShape,
     NativeWall,
@@ -2120,17 +2152,45 @@ impl TraceProfileKind {
             Self::Dsr => "dsr",
             Self::DsrIndirect => "dsr-indirect",
             Self::DsrFork => "dsr-fork",
+            Self::NativeAmplification => "native-amplification",
             Self::NativeFault => "native-fault",
             Self::NativeShape => "native-shape",
             Self::NativeWall => "native-wall",
         }
     }
 
+    /// Whether the capture must set `CARRICK_DSR_PROFILE`.
+    ///
+    /// `NativeAmplification` is deliberately **false**, and that is a
+    /// correctness point rather than a convenience.
+    /// `carrick*:::native-syscall-service-entry`/`-end` are UNCONDITIONAL
+    /// USDTs — `NativeSyscallServiceSpan::open` calls the probe wrapper with no
+    /// environment gate — so the amplification ledger needs nothing from the
+    /// runtime profile arm. Requiring it would be an active measurement
+    /// confound: the arm does real work (the 36x round measured its phase clock
+    /// at 3.0% of policy-OFF user samples against 28.3% policy-ON), so the
+    /// ledger would charge guest operations for host CPU that exists only
+    /// because the ledger asked for it. `NativeFault` is already false for the
+    /// same probe class.
     pub(crate) const fn requires_runtime_profile(self) -> bool {
         matches!(
             self,
             Self::Dsr | Self::DsrFork | Self::NativeShape | Self::NativeWall
         )
+    }
+
+    /// The single capture-bound substitution slot this profile's template
+    /// reserves, if it declares one at all.
+    pub(crate) const fn capture_bound_placeholder(self) -> Option<&'static str> {
+        match self {
+            Self::NativeWall => Some(DSRPROF2_BOUND_PLACEHOLDER),
+            Self::NativeAmplification => Some(AMP1_BOUND_PLACEHOLDER),
+            Self::Dsr
+            | Self::DsrIndirect
+            | Self::DsrFork
+            | Self::NativeFault
+            | Self::NativeShape => None,
+        }
     }
 
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
@@ -2139,6 +2199,9 @@ impl TraceProfileKind {
             Self::Dsr => carrick_runtime::dtrace_consumer::BUNDLED_DSR_PROFILE_D,
             Self::DsrIndirect => carrick_runtime::dtrace_consumer::BUNDLED_DSR_INDIRECT_D,
             Self::DsrFork => carrick_runtime::dtrace_consumer::BUNDLED_DSR_FORK_D,
+            Self::NativeAmplification => {
+                carrick_runtime::dtrace_consumer::BUNDLED_NATIVE_AMPLIFICATION_D
+            }
             Self::NativeFault => carrick_runtime::dtrace_consumer::BUNDLED_NATIVE_FAULT_D,
             Self::NativeShape => carrick_runtime::dtrace_consumer::BUNDLED_NATIVE_SHAPE_D,
             Self::NativeWall => carrick_runtime::dtrace_consumer::BUNDLED_NATIVE_WALL_D,
@@ -2150,6 +2213,7 @@ impl TraceProfileKind {
             "dsr" => Ok(Self::Dsr),
             "dsr-indirect" => Ok(Self::DsrIndirect),
             "dsr-fork" => Ok(Self::DsrFork),
+            "native-amplification" => Ok(Self::NativeAmplification),
             "native-fault" => Ok(Self::NativeFault),
             "native-shape" => Ok(Self::NativeShape),
             "native-wall" => Ok(Self::NativeWall),
@@ -4416,7 +4480,8 @@ mod tests {
     fn capture_bound_substitutes_exactly_one_slot() {
         let template =
             "BEGIN\n{\n\tbound_limit_s = (uint64_t)180;\n\t/* CARRICK_DSRPROF2_BOUND */\n}\n";
-        let rendered = render_profile_capture_bound(template, 900).expect("render");
+        let rendered = render_profile_capture_bound(TraceProfileKind::NativeWall, template, 900)
+            .expect("render");
         assert!(rendered.contains("bound_limit_s = (uint64_t)900;"));
         assert!(!rendered.contains(DSRPROF2_BOUND_PLACEHOLDER));
         // The shipped default stays as the first assignment; the substituted
@@ -4425,12 +4490,36 @@ mod tests {
     }
 
     #[test]
+    fn capture_bound_is_substituted_per_profile_slot() {
+        // AMP1 declares its own slot spelling, so a shared placeholder constant
+        // would silently bound the wrong template.
+        let rendered = render_profile_capture_bound(
+            TraceProfileKind::NativeAmplification,
+            crate::amplification_profile::BUNDLED_NATIVE_AMPLIFICATION_D,
+            1800,
+        )
+        .expect("render");
+        assert!(rendered.contains("bound_limit_s = (uint64_t)1800;"));
+        assert!(!rendered.contains(AMP1_BOUND_PLACEHOLDER));
+        assert!(rendered.contains("bound_limit_s = (uint64_t)600;"));
+
+        // A profile that declares no bound is refused by name, not by a
+        // placeholder count that reads like a corrupt template.
+        let error = render_profile_capture_bound(TraceProfileKind::Dsr, "BEGIN\n{\n}\n", 900)
+            .expect_err("dsr declares no capture bound");
+        assert!(
+            format!("{error:#}").contains("does not declare a capture bound"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
     fn capture_bound_refuses_a_template_without_exactly_one_slot() {
         for template in [
             "BEGIN\n{\n}\n",
             "BEGIN\n{\n\t/* CARRICK_DSRPROF2_BOUND */\n\t/* CARRICK_DSRPROF2_BOUND */\n}\n",
         ] {
-            let error = render_profile_capture_bound(template, 900)
+            let error = render_profile_capture_bound(TraceProfileKind::NativeWall, template, 900)
                 .expect_err("only an exact single slot may be substituted");
             assert!(
                 format!("{error:#}").contains("exactly one capture-bound placeholder"),
@@ -4445,7 +4534,8 @@ mod tests {
         assert!(
             format!(
                 "{:#}",
-                render_profile_capture_bound(template, 0).expect_err("zero")
+                render_profile_capture_bound(TraceProfileKind::NativeWall, template, 0)
+                    .expect_err("zero")
             )
             .contains("must be positive")
         );
@@ -4453,15 +4543,20 @@ mod tests {
         assert!(
             format!(
                 "{:#}",
-                render_profile_capture_bound(template, 185).expect_err("non-multiple")
+                render_profile_capture_bound(TraceProfileKind::NativeWall, template, 185)
+                    .expect_err("non-multiple")
             )
             .contains("multiple of the 10 s accumulation granularity")
         );
         assert!(
             format!(
                 "{:#}",
-                render_profile_capture_bound(template, NATIVE_WALL_MAX_BOUND_SECONDS + 10)
-                    .expect_err("over ceiling")
+                render_profile_capture_bound(
+                    TraceProfileKind::NativeWall,
+                    template,
+                    NATIVE_WALL_MAX_BOUND_SECONDS + 10
+                )
+                .expect_err("over ceiling")
             )
             .contains("exceeds the")
         );
