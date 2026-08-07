@@ -57,6 +57,22 @@
  *      land in `carrick-only`. A guest-syscall total of 0 is a named
  *      `wrong-backend` error, not an empty result (`native-fs-amplification.d`
  *      header (b)).
+ *   3a. THE SERVICE WINDOW IS NOT A BALANCED entry/end PAIR, and assuming it is
+ *      refuses every real build. Two shipped asymmetries:
+ *        - INHERITED SPANS. `NativeSyscallServiceSpan::inherited_open`
+ *          (`native_darwin.rs:3181`) fires NO entry probe -- the parent already
+ *          fired one for that guest op -- yet the clone child closes it from a
+ *          NEW tid (`:5240`) and the fork child from a NEW pid (`:4275`). So an
+ *          `-end` whose (pid, tid) has never been seen is EXPECTED, not a drop.
+ *          Synthesizing an entry there would double-count `@guest_total`.
+ *        - TERMINAL HANDOFF. `terminal_handoff()` (`:3214`) abandons the span
+ *          WITHOUT an `-end`, because the handoff may still fail and reopen
+ *          (`reopen_after_failed_terminal_handoff`). All six sites end in
+ *          process death or a successful exec, so `proc:::exec-success` and
+ *          `proc:::lwp-exit` are where the slot retires; post-terminal host
+ *          work is `carrick-only`.
+ *      The never-seen (0) versus idle (1) sentinel is what keeps a genuine
+ *      double close distinguishable from both.
  *   4. Scope is the `tracked[]` table seeded from `$target` and grown through
  *      `proc:::create`, NEVER `execname`: `carrick trace` runs libdtrace
  *      IN-PROCESS inside a `carrick` binary, and AGENTS.md records a profile
@@ -118,7 +134,18 @@
  *     go-build: the sizes below are ARGUED from key-space, not measured;
  *   - the real perturbation multiple (the 2-4x in (c) is an estimate);
  *   - whether any host call shows entries without returns outside the qualified
- *     terminal roster printed in `section=terminal-calls`.
+ *     terminal roster printed in `section=terminal-calls`;
+ *   - whether `section=window-events`' `inherited-end` count tracks the guest's
+ *     actual `clone(CLONE_THREAD)` + `fork` count. It should be close to it; a
+ *     large excess means a handoff path was missed, and ZERO on a threaded
+ *     build means the inherited close is not reaching the probe at all;
+ *   - whether a fork child's `-end` is ever observed BEFORE the parent's
+ *     `proc:::create` admits it to `tracked[]`. If it is, those closes are
+ *     silently dropped rather than counted (no false rejection either way);
+ *   - whether Darwin's `tid` survives `execve`. Exec quiesces every sibling
+ *     first, so at most ONE slot can be stranded, and only if the tid changes;
+ *     `proc:::lwp-exit` retiring to never-seen is what bounds the tid-reuse
+ *     case, and it is unqualified.
  *
  * (c) PERTURBATION: YES, AND MORE THAN ANY EXISTING PROFILE
  * --------------------------------------------------------
@@ -193,6 +220,14 @@ dtrace:::BEGIN
 	@fault_total["cow_fault"] = sum(0);
 	@drop_service_reentry = sum(0);
 	@drop_service_unmatched = sum(0);
+	@window_inherited_end = sum(0);
+	/*
+	 * An aggregation, not a plain global increment. `dtrace:::ERROR` fires on
+	 * any CPU and D globals are unsynchronized, so a lost read-modify-write at
+	 * the 0->1 boundary would make a corrupted stream read as clean --
+	 * fail-OPEN, in the one counter whose whole job is to fail closed.
+	 */
+	@probe_errors = sum(0);
 
 	tracked[$target] = 1;
 
@@ -210,7 +245,7 @@ dtrace:::BEGIN
 /* A D action fault makes the exact stream non-authoritative. */
 dtrace:::ERROR
 {
-	probe_errors++;
+	@probe_errors = sum(1);
 }
 
 proc:::create
@@ -247,12 +282,72 @@ carrick*:::native-syscall-service-entry
 	@guest_total = sum(1);
 }
 
+/*
+ * Closing a window has THREE outcomes, and conflating them is what would make
+ * this instrument refuse every real build. One clause, so the reads all happen
+ * before the single write (a second clause on the same probe would observe the
+ * first clause's mutation in its own predicate).
+ *
+ *   slot >  1  a window this thread opened, closing normally.
+ *   slot == 0  this (pid, tid) has NEVER opened a window and its first event is
+ *              an `-end`. That is exactly the inherited span:
+ *              `NativeSyscallServiceSpan::inherited_open` fires no entry probe
+ *              on purpose -- the PARENT fired it -- and the spawned child
+ *              thread (`native_darwin.rs:5240`) and the fork child
+ *              (`:4275`) then close it on their own tid/pid. EXPECTED on every
+ *              `clone(CLONE_THREAD)` and every fork, so it gets its own class
+ *              and is never a drop. Firing a synthetic entry there instead
+ *              would double-count `@guest_total`, i.e. corrupt the denominator
+ *              every amplification ratio divides by.
+ *   slot == 1  a window on this thread already closed and another `-end`
+ *              arrived. THAT is a pairing corruption, and the never-seen-vs-idle
+ *              sentinel is what keeps it distinguishable from the line above.
+ */
 carrick*:::native-syscall-service-end
 /tracked[pid]/
 {
+	@window_inherited_end =
+	    sum(service_slot[pid, tid] == (uint64_t)0 ? 1 : 0);
 	@drop_service_unmatched =
-	    sum(service_slot[pid, tid] > (uint64_t)1 ? 0 : 1);
+	    sum(service_slot[pid, tid] == (uint64_t)1 ? 1 : 0);
 	service_slot[pid, tid] = (uint64_t)1;
+}
+
+/*
+ * A TERMINAL HANDOFF emits no `-end` at all: `terminal_handoff()`
+ * (`native_darwin.rs:3214`) moves the span to a state `Drop` deliberately does
+ * not close, because the handoff can still FAIL and reopen
+ * (`reopen_after_failed_terminal_handoff`), and an `-end` followed by a resume
+ * would be a lie. Every one of the six handoff sites is followed by either
+ * process death or a successful exec -- process exit (`:4055`), last-thread
+ * (`:4091`), fork retirement (`:4283`), host self-exec (`:4379`), exec
+ * retirement (`:4503`), signal death (`:4671`) -- so retiring the slot on those
+ * two events covers all of them.
+ *
+ * Without this the abandoned slot keeps naming the guest op that handed off:
+ * the successor image's entire startup would be charged to the guest's
+ * `execve`, and that image's first guest syscall would count as a
+ * `service-window-reentry`. Post-terminal host work is `carrick-only` -- image
+ * setup, which is what that bucket has always meant.
+ */
+proc:::exec-success
+/tracked[pid]/
+{
+	service_slot[pid, tid] = (uint64_t)0;
+}
+
+/*
+ * Thread death retires the slot to NEVER-SEEN, not to idle, and here the
+ * deallocation that zero performs is the POINT rather than the hazard: it is
+ * once per thread, not on a hot path, and a later thread reusing this tid must
+ * look like a fresh thread. Retiring to 1 instead would make a reused tid's
+ * INHERITED end read as a double close -- a false rejection, which is the worse
+ * failure of the two.
+ */
+proc:::lwp-exit
+/tracked[pid]/
+{
+	service_slot[pid, tid] = (uint64_t)0;
 }
 
 /*
@@ -390,19 +485,36 @@ dtrace:::END
 	printa("AMP1|guest_slot=%u|kind=%s|count=%@d\n", @fault_by_slot);
 
 	/*
+	 * Expected service-window control flow that is NOT a drop. Reported
+	 * because a build with zero inherited ends is a single-threaded one,
+	 * which is itself worth knowing when a ledger looks unusually clean.
+	 */
+	printf("AMP1|section=window-events\n");
+	printa("AMP1|window|class=inherited-end|count=%@d\n", @window_inherited_end);
+
+	/*
 	 * Program-owned integrity counters. The libdtrace drop counters are not
 	 * readable from D (fact 10); the Rust reader enforces those separately
 	 * and rejects any nonzero. A MISSING drop section is itself a rejection
 	 * -- absent is not zero.
 	 */
 	printf("AMP1|section=drops\n");
-	printf("AMP1|drop|source=dtrace-error|count=%d\n", probe_errors);
+	printa("AMP1|drop|source=dtrace-error|count=%@d\n", @probe_errors);
 	printa("AMP1|drop|source=service-window-reentry|count=%@d\n",
 	    @drop_service_reentry);
 	printa("AMP1|drop|source=service-end-unmatched|count=%@d\n",
 	    @drop_service_unmatched);
 
-	printf("AMP1|complete|profile=native-amplification|timed_out=%d|target_exit_reason=%d|probe_errors=%d|bound_limit_s=%d|elapsed_ns=%d\n",
-	    timed_out, target_exit_reason, probe_errors, bound_limit_s,
+	/*
+	 * `timed_out`, `target_exit_reason` and `bound_limit_s` stay plain
+	 * globals: each is written from exactly one clause that fires at most
+	 * once, or from `tick-10s`, which DTrace fires on a single CPU once per
+	 * interval, so no two firings overlap and the read-modify-write cannot
+	 * race. `probe_errors` was the one counter that could -- `dtrace:::ERROR`
+	 * fires on any CPU -- and it is an aggregation above, reported in the
+	 * drop section only, so there is exactly one spelling of it.
+	 */
+	printf("AMP1|complete|profile=native-amplification|timed_out=%d|target_exit_reason=%d|bound_limit_s=%d|elapsed_ns=%d\n",
+	    timed_out, target_exit_reason, bound_limit_s,
 	    timestamp - started);
 }

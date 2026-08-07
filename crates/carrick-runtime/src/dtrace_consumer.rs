@@ -1157,8 +1157,12 @@ mod tests {
                 .count(),
             1
         );
+        // Every counter is an AGGREGATION (`%@d`). A plain D global would let a
+        // lost read-modify-write at the 0/nonzero boundary make a corrupted
+        // stream read as clean, which is fail-OPEN in exactly the counters
+        // whose job is to fail closed.
         for source in [
-            "AMP1|drop|source=dtrace-error|count=%d",
+            "AMP1|drop|source=dtrace-error|count=%@d",
             "AMP1|drop|source=service-window-reentry|count=%@d",
             "AMP1|drop|source=service-end-unmatched|count=%@d",
         ] {
@@ -1167,12 +1171,41 @@ mod tests {
                 "missing drop counter {source}"
             );
         }
+        assert!(!BUNDLED_NATIVE_AMPLIFICATION_D.contains("probe_errors++"));
         assert_eq!(
             BUNDLED_NATIVE_AMPLIFICATION_D
                 .matches("AMP1|complete|profile=native-amplification")
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn native_amplification_separates_inherited_window_closes_from_drops() {
+        // A clone/fork child closes a span whose entry probe fired on the
+        // PARENT's (pid, tid). Counting that as an unmatched end would refuse a
+        // ledger on every threaded build, so it is its own class in its own
+        // section — reported, never a drop.
+        assert!(
+            BUNDLED_NATIVE_AMPLIFICATION_D.contains("AMP1|window|class=inherited-end|count=%@d")
+        );
+        assert_eq!(
+            BUNDLED_NATIVE_AMPLIFICATION_D
+                .matches("AMP1|section=window-events")
+                .count(),
+            1
+        );
+        // A terminal handoff emits no `-end` at all, so the slot retires on the
+        // two events every handoff site is followed by.
+        for probe in ["proc:::exec-success", "proc:::lwp-exit"] {
+            assert_eq!(
+                BUNDLED_NATIVE_AMPLIFICATION_D
+                    .matches(&format!("\n{probe}\n"))
+                    .count(),
+                1,
+                "missing {probe} service-slot retirement"
+            );
+        }
     }
 
     #[test]

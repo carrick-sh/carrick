@@ -197,7 +197,19 @@ offline.
 `birth_qualification_sha256` + the declared bound. Plus a
 `BUNDLED_NATIVE_AMPLIFICATION_D` const in `dtrace_consumer.rs` and the contract
 assertions that file already keeps for the other bundled programs (pragma
-values, exactly-one `copyinstr(arg0)`, the bound literal present).
+values, **zero** `copyinstr`, the bound literal present).
+
+> **Corrected 2026-08-06 (implementation).** This line, and Task 1's copy of it,
+> originally read "exactly-one `copyinstr(arg0)`" — carried over from
+> `native-wall`'s host-catalog contract. It is wrong for this probe:
+> `native_syscall_service_entry(number: u64, name: &str)`
+> (`crates/carrick-observability/src/probes.rs:2282`) puts the **number** in
+> arg0 and the name POINTER in arg1, so `copyinstr(arg0)` would be a wild
+> copyin. AMP1 keys on the number and contains no `copyin` at all: that is what
+> lets Task 2 resolve guest ops through `CanonicalNr` / the `carrick-abi` table
+> with a named error for an unknown op, and it keeps ~88k copyins and a string
+> key-space out of the one program whose declared risk is unqualified
+> aggregation/dynamic-variable pressure.
 
 > **`requires_runtime_profile()` is FALSE, and this is a correctness point, not
 > a convenience.** `native_syscall_service_entry` is an **unconditional** USDT
@@ -673,8 +685,9 @@ Add `scripts/dtrace/native-amplification.d` and wire
   bundled template's digest is rejected. Fixtures live beside
   `crates/carrick-cli/tests/fixtures/dsrprof2-valid.raw`.
 - **Also asserted:** the `dtrace_consumer.rs` contract tests for the new bundled
-  const (pragmas, exactly-one `copyinstr(arg0)`, the `/* CARRICK_AMP1_BOUND */`
-  slot present, the bound literal legal unrendered).
+  const (pragmas, **zero** `copyinstr` — see the correction in §1c, the guest op
+  crosses as a canonical NUMBER — the `/* CARRICK_AMP1_BOUND */` slot present,
+  the bound literal legal unrendered).
 - **Gate:** `just ci`. Tests must land in `crates/carrick-cli/tests/trace_profile.rs`
   (gated by `just test-integration` since 2026-08-06) or in-file `mod tests`
   (gated by `just test`'s `--bins`). **Do not** put them anywhere else in
