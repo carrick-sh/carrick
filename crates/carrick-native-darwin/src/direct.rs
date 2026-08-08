@@ -1220,8 +1220,9 @@ fn word_could_name_x18(word: u32) -> bool {
 /// Is this decoder failure independently proven architecturally unallocated?
 ///
 /// The Arm Architecture Reference Manual's main A64 encoding table reserves
-/// top-level `op0` bits 28:25=`0b0000`. Its "Advanced SIMD shift by immediate"
-/// encoding fixes bit 31=`0`, bits 28:23=`0b011110`, and bit 10=`1`, with
+/// bit 31=`0` with top-level `op0` bits 28:25=`0b0000`; bit 31=`1` selects SME
+/// instead. Its "Advanced SIMD shift by immediate" encoding fixes bit 31=`0`,
+/// bits 28:23=`0b011110`, and bit 10=`1`, with
 /// nonzero `immh` bits 22:19; opcode bit 15=`0` plus bit 11=`1` selects an
 /// unallocated subspace. Separately, its "Load/store register (register
 /// offset)" encoding fixes bits 11:10 to `0b10`; the family selector is bits
@@ -1229,7 +1230,7 @@ fn word_could_name_x18(word: u32) -> bool {
 /// 11:10 inside that exact family is unallocated. Such words cannot access
 /// x18: executing one raises an undefined-instruction exception.
 fn word_is_proven_unallocated(word: u32) -> bool {
-    const RESERVED_MAJOR_OP0_MASK: u32 = 0x1e00_0000;
+    const RESERVED_MAJOR_OP0_MASK: u32 = 0x9e00_0000;
     const SIMD_SHIFT_IMMEDIATE_MASK: u32 = 0x9f80_0400;
     const SIMD_SHIFT_IMMEDIATE: u32 = 0x0f00_0400;
     const SIMD_SHIFT_IMMH_MASK: u32 = 0x0078_0000;
@@ -3524,6 +3525,15 @@ mod tests {
         assert!(
             instruction_names_x18(&allocated),
             "the allocated neighbor must stay on the decoded-x18 path"
+        );
+        assert!(
+            !word_is_proven_unallocated(0x8080_0012),
+            "bit 31 selects SME rather than the reserved top-level group"
+        );
+        let allocated_sme = bad64::decode(0x8080_0012, 0).expect("allocated SME neighbor");
+        assert!(
+            !instruction_names_x18(&allocated_sme),
+            "the SME vector operand is not guest GPR x18"
         );
         assert!(
             !word_is_proven_unallocated(0xffff_fff2),
