@@ -1217,6 +1217,22 @@ fn word_could_name_x18(word: u32) -> bool {
         || ((word >> 16) & 0x1f) == X18
 }
 
+/// Is this decoder failure independently proven architecturally unallocated?
+///
+/// The Arm Architecture Reference Manual's "Load/store register (register
+/// offset)" encoding fixes bits 11:10 to `0b10`. The family selector is
+/// bits 29:27=`0b111`, bits 25:24=`0b00`, and bit 21=`1`; any other value in
+/// bits 11:10 inside that exact family is unallocated. Such a word cannot
+/// access x18: executing it raises an undefined-instruction exception.
+fn word_is_proven_unallocated(word: u32) -> bool {
+    const FAMILY_MASK: u32 = 0x3b20_0000;
+    const FAMILY: u32 = 0x3820_0000;
+    const FIXED_11_10_MASK: u32 = 0x0000_0c00;
+    const FIXED_11_10: u32 = 0x0000_0800;
+
+    (word & FAMILY_MASK) == FAMILY && (word & FIXED_11_10_MASK) != FIXED_11_10
+}
+
 /// Does a decoded instruction reference x18/w18 as an operand?
 fn instruction_names_x18(insn: &bad64::Instruction) -> bool {
     instruction_regs(insn).contains(&18)
@@ -1360,6 +1376,7 @@ fn scan_executable_words(code: &[u8], vaddr0: u64) -> Result<usize, DirectInelig
                     }
                 }
             }
+            Err(_) if word_is_proven_unallocated(word) => {}
             Err(_) if word_could_name_x18(word) => {
                 return Err(DirectIneligible::UndecodableText { vaddr: site, word });
             }
@@ -3445,6 +3462,29 @@ mod tests {
     }
 
     #[test]
+    fn scan_accepts_proven_unallocated_load_store_word_with_x18_bits() {
+        let unallocated = 0x3876_4d52;
+        let elf = elf_with_code(&[unallocated, movz(8, 93, 0), SVC_0]);
+        assert!(
+            matches!(scan_eligibility(&elf).expect("scan runs"), Ok(1)),
+            "a source-proven unallocated encoding cannot access x18"
+        );
+    }
+
+    #[test]
+    fn unallocated_load_store_register_offset_proof_is_mask_exact() {
+        assert!(word_is_proven_unallocated(0x3876_4d52));
+        assert!(
+            !word_is_proven_unallocated(0x3876_4952),
+            "ldrb w18, [x10, w22, uxtw] is allocated and must take the veneer path"
+        );
+        assert!(
+            !word_is_proven_unallocated(0xffff_fff2),
+            "unrelated undecodable words remain fail-closed"
+        );
+    }
+
+    #[test]
     fn scan_counts_syscall_sites_on_a_clean_image() {
         let elf = fixture_elf();
         assert!(
@@ -4305,6 +4345,21 @@ mod tests {
                 Err(DirectIneligible::UndecodableText { .. })
             ),
             "a suspicious undecodable word refuses the whole window"
+        );
+    }
+
+    #[test]
+    fn exec_window_accepts_proven_unallocated_load_store_word_with_x18_bits() {
+        let file = elf_with_code(&[0x3876_4d52, movz(8, 93, 0), SVC_0]);
+        let group = DirectLoadGroup::load(&fixture_elf(), record_only)
+            .expect("load main")
+            .expect("eligible");
+        assert!(
+            group
+                .map_exec_file_window(&file, 0, 0x2000)
+                .expect("scan runs")
+                .is_ok(),
+            "the same proof applies at the runtime executable-window boundary"
         );
     }
 
