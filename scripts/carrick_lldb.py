@@ -20,6 +20,7 @@ Commands
     carrick decode-esr <hex>             # ARMv8 ESR_EL1 decoder
     carrick gva <addr>                   # resolve guest VA to region/segment
     carrick where                        # one-line situational dump
+    carrick mach-exceptions              # correlate DSR Mach exception ports
 
 The plugin caches the state file path between calls so you only have to
 `load-state` once per session. Run `carrick info` to confirm it stuck.
@@ -31,6 +32,7 @@ import json
 import os
 import re
 import shlex
+import ctypes
 from typing import Any, Optional
 
 import lldb
@@ -364,6 +366,8 @@ _EVENTRING_KINDS = {
         "NSREJECT",
         lambda a, b, c: f"pathhash={a & 0xffffffff:#010x} reasonhash={b & 0xffffffff:#010x} pid={c}",
     ),
+    21: ("EFDWRITE", lambda a, b, c: f"hfd={a} before={b & 0xffffffff} after={c & 0xffffffff}"),
+    22: ("EFDREAD", lambda a, b, c: f"hfd={a} before={b & 0xffffffff} after={c & 0xffffffff}"),
 }
 
 
@@ -406,7 +410,7 @@ def _static_load_addr(target, fullname: str) -> Optional[int]:
 
 
 def cmd_eventring(debugger, command, exe_ctx, result, internal_dict):
-    """carrick eventring — decode the in-memory event ring (live or core)"""
+    """carrick eventring [COUNT|START:COUNT] — decode the event ring."""
     target = exe_ctx.GetTarget() or debugger.GetSelectedTarget()
     if not target or not target.IsValid():
         result.SetError("no target; `lldb <binary>` (attach) or `lldb -c <core> <binary>`")
@@ -432,15 +436,40 @@ def cmd_eventring(debugger, command, exe_ctx, result, internal_dict):
         result.SetError(f"read IDX @ {_fmt_hex(idx_addr)} failed: {err.GetCString()}")
         return
     total = int.from_bytes(raw_idx, "little")
-    count = min(total, _EVENTRING_N)
-    start = total - count
+    requested = _EVENTRING_N
+    requested_start = None
+    argument = command.strip()
+    if argument:
+        try:
+            if ":" in argument:
+                start_text, count_text = argument.split(":", 1)
+                requested_start = int(start_text, 10)
+                requested = int(count_text, 10)
+            else:
+                requested = int(argument, 10)
+        except ValueError:
+            result.SetError("usage: carrick eventring [positive-count|start:positive-count]")
+            return
+        if requested <= 0 or requested_start is not None and requested_start < 0:
+            result.SetError("eventring count must be positive")
+            return
+    oldest = max(0, total - _EVENTRING_N)
+    if requested_start is None:
+        count = min(total, _EVENTRING_N, requested)
+        start = total - count
+    else:
+        start = max(requested_start, oldest)
+        count = min(requested, max(0, total - start))
     # Bulk-read the whole ring once (128 KiB) so a core read is one round-trip.
     raw_ring = process.ReadMemory(ring_addr, _EVENTRING_N * 16, err)
     if not err.Success():
         result.SetError(f"read RING @ {_fmt_hex(ring_addr)} failed: {err.GetCString()}")
         return
     pid = process.GetProcessID()
-    out = [f"# carrick event ring  pid={pid}  total={total}  showing={count}"]
+    out = [
+        f"# carrick event ring  pid={pid}  total={total}  "
+        f"showing={count}  start={start}  oldest={oldest}"
+    ]
     for k in range(count):
         gi = start + k
         off = (gi % _EVENTRING_N) * 16
@@ -458,6 +487,402 @@ def cmd_eventring(debugger, command, exe_ctx, result, internal_dict):
     result.AppendMessage("\n".join(out))
 
 
+# ----- native DSR Mach exception registrations ----------------------------
+
+def _c_global_load_addr(target, name: str) -> Optional[int]:
+    """Return the load address of a C global, including file-local statics."""
+    variables = target.FindGlobalVariables(name, 50)
+    for i in range(variables.GetSize()):
+        variable = variables.GetValueAtIndex(i)
+        if variable.GetName() != name:
+            continue
+        addr = variable.GetLoadAddress()
+        if addr != lldb.LLDB_INVALID_ADDRESS:
+            return addr
+    for module in target.modules:
+        for symbol in module:
+            if symbol.GetName() != name:
+                continue
+            addr = symbol.GetStartAddress().GetLoadAddress(target)
+            if addr != lldb.LLDB_INVALID_ADDRESS:
+                return addr
+    return None
+
+
+def _registration_field(value, name: str, signed: bool = False) -> int:
+    field = value.GetChildMemberWithName(name)
+    if not field or not field.IsValid():
+        raise RuntimeError(f"registration field `{name}` is unavailable")
+    return field.GetValueAsSigned() if signed else field.GetValueAsUnsigned()
+
+
+def cmd_mach_exceptions(debugger, command, exe_ctx, result, internal_dict):
+    """carrick mach-exceptions — inspect native DSR exception-port routing.
+
+    This is a live-process diagnostic. It reads Carrick's registration list
+    without running the inferior, then uses the debugger process's privileged
+    task port to ask XNU which receive rights are members of Carrick's port
+    set. The kernel query is observational but requires a sudo/root LLDB attach.
+    """
+    if command.strip():
+        result.SetError("usage: carrick mach-exceptions")
+        return
+    target = exe_ctx.GetTarget() or debugger.GetSelectedTarget()
+    process = exe_ctx.GetProcess() or (target.GetProcess() if target else None)
+    if not target or not target.IsValid() or not process or not process.IsValid():
+        result.SetError("no live carrick process is attached")
+        return
+
+    set_addr = _c_global_load_addr(
+        target, "carrick_native_direct_exception_port_set"
+    )
+    registrations_addr = _c_global_load_addr(
+        target, "carrick_native_direct_exception_registrations"
+    )
+    if set_addr is None or registrations_addr is None:
+        result.SetError(
+            "native DSR Mach exception globals are unavailable; use an unstripped "
+            "Carrick binary built with debug information"
+        )
+        return
+
+    err = lldb.SBError()
+    port_set = process.ReadUnsignedFromMemory(set_addr, 4, err)
+    if not err.Success():
+        result.SetError(
+            f"read port set @ {_fmt_hex(set_addr)} failed: {err.GetCString()}"
+        )
+        return
+    head = process.ReadPointerFromMemory(registrations_addr, err)
+    if not err.Success():
+        result.SetError(
+            f"read registrations @ {_fmt_hex(registrations_addr)} failed: "
+            f"{err.GetCString()}"
+        )
+        return
+
+    registration_type = target.FindFirstType(
+        "carrick_native_direct_exception_registration"
+    )
+    if not registration_type or not registration_type.IsValid():
+        result.SetError("native DSR Mach exception registration type is unavailable")
+        return
+    slots_type = target.FindFirstType("carrick_native_direct_slots")
+    if not slots_type or not slots_type.IsValid():
+        result.SetError("native DSR direct-slot type is unavailable")
+        return
+
+    registrations = []
+    address = head
+    seen = set()
+    while address and address not in seen and len(registrations) < 64:
+        seen.add(address)
+        value = target.CreateValueFromAddress(
+            "registration", target.ResolveLoadAddress(address), registration_type
+        )
+        if not value or not value.IsValid():
+            result.SetError(f"cannot decode registration @ {_fmt_hex(address)}")
+            return
+        try:
+            slots_address = _registration_field(value, "slots")
+            slots = target.CreateValueFromAddress(
+                "slots", target.ResolveLoadAddress(slots_address), slots_type
+            )
+            telemetry = slots.GetChildMemberWithName("exception_telemetry")
+            if not telemetry or not telemetry.IsValid():
+                raise RuntimeError("direct-slot exception telemetry is unavailable")
+            registration = {
+                "address": address,
+                "next": _registration_field(value, "next"),
+                "slots": slots_address,
+                "exception_port": _registration_field(value, "exception_port"),
+                "thread_port": _registration_field(value, "thread_port"),
+                "fault_pc": _registration_field(value, "fault_pc"),
+                "fault_address": _registration_field(value, "fault_address"),
+                "recovery_pending": _registration_field(
+                    value, "recovery_pending", signed=True
+                ),
+                "exception_entries": _registration_field(
+                    telemetry, "exception_entries"
+                ),
+                "recovery_services": _registration_field(
+                    telemetry, "recovery_services"
+                ),
+                "bad_access_entries": _registration_field(
+                    telemetry, "bad_access_entries"
+                ),
+                "breakpoint_entries": _registration_field(
+                    telemetry, "breakpoint_entries"
+                ),
+                "execute_switches": _registration_field(
+                    telemetry, "execute_switches"
+                ),
+                "write_switches": _registration_field(
+                    telemetry, "write_switches"
+                ),
+                "failures": _registration_field(telemetry, "failures"),
+                "last_status": _registration_field(telemetry, "last_status"),
+            }
+        except RuntimeError as exc:
+            result.SetError(str(exc))
+            return
+        registrations.append(registration)
+        address = registration["next"]
+    if address:
+        result.SetError("registration list is cyclic or exceeds 64 entries")
+        return
+
+    # These are public libSystem/Mach calls made by the debugger process, not
+    # by the stopped inferior. mach_port_get_set_status's first argument is a
+    # task port, so `port_set` is interpreted in Carrick's IPC namespace.
+    libsystem = ctypes.CDLL(None)
+    mach_task_self = ctypes.c_uint.in_dll(libsystem, "mach_task_self_").value
+    task_for_pid = libsystem.task_for_pid
+    task_for_pid.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.POINTER(ctypes.c_uint)]
+    task_for_pid.restype = ctypes.c_int
+    get_set_status = libsystem.mach_port_get_set_status
+    get_set_status.argtypes = [
+        ctypes.c_uint,
+        ctypes.c_uint,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_uint)),
+        ctypes.POINTER(ctypes.c_uint),
+    ]
+    get_set_status.restype = ctypes.c_int
+    extract_right = libsystem.mach_port_extract_right
+    extract_right.argtypes = [
+        ctypes.c_uint,
+        ctypes.c_uint,
+        ctypes.c_uint,
+        ctypes.POINTER(ctypes.c_uint),
+        ctypes.POINTER(ctypes.c_uint),
+    ]
+    extract_right.restype = ctypes.c_int
+    get_exception_ports = libsystem.thread_get_exception_ports
+    get_exception_ports.argtypes = [
+        ctypes.c_uint,
+        ctypes.c_uint,
+        ctypes.POINTER(ctypes.c_uint),
+        ctypes.POINTER(ctypes.c_uint),
+        ctypes.POINTER(ctypes.c_uint),
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    get_exception_ports.restype = ctypes.c_int
+    thread_info = libsystem.thread_info
+    thread_info.argtypes = [
+        ctypes.c_uint,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_uint),
+    ]
+    thread_info.restype = ctypes.c_int
+    get_port_attributes = libsystem.mach_port_get_attributes
+    get_port_attributes.argtypes = [
+        ctypes.c_uint,
+        ctypes.c_uint,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_uint),
+        ctypes.POINTER(ctypes.c_uint),
+    ]
+    get_port_attributes.restype = ctypes.c_int
+
+    task = ctypes.c_uint(0)
+    kr = task_for_pid(mach_task_self, process.GetProcessID(), ctypes.byref(task))
+    if kr != 0:
+        result.SetError(
+            f"task_for_pid({process.GetProcessID()}) failed: {_fmt_hex(kr)}; "
+            "attach from sudo/root LLDB"
+        )
+        return
+
+    members_ptr = ctypes.POINTER(ctypes.c_uint)()
+    member_count = ctypes.c_uint(0)
+    try:
+        kr = get_set_status(
+            task.value, port_set, ctypes.byref(members_ptr), ctypes.byref(member_count)
+        )
+        if kr != 0:
+            result.SetError(
+                f"mach_port_get_set_status(set={_fmt_hex(port_set)}) failed: "
+                f"{_fmt_hex(kr)}"
+            )
+            return
+        members = {members_ptr[i] for i in range(member_count.value)}
+
+        # Port names are task-local. Extract one send right for both the
+        # registered exception receive right and registered thread right into
+        # LLDB's task. thread_get_exception_ports then returns handler send
+        # rights in that same namespace, where identical kernel ports coalesce
+        # to the same name and can be compared directly.
+        copy_send = 19  # MACH_MSG_TYPE_COPY_SEND
+        exception_mask = (1 << 1) | (1 << 2) | (1 << 6)
+        bindings = []
+        mach_port_deallocate = libsystem.mach_port_deallocate
+        mach_port_deallocate.argtypes = [ctypes.c_uint, ctypes.c_uint]
+        mach_port_deallocate.restype = ctypes.c_int
+        for registration in registrations:
+            receive_status = (ctypes.c_uint * 10)()
+            receive_status_count = ctypes.c_uint(10)
+            status_kr = get_port_attributes(
+                task.value,
+                registration["exception_port"],
+                2,  # MACH_PORT_RECEIVE_STATUS
+                receive_status,
+                ctypes.byref(receive_status_count),
+            )
+            exception_right = ctypes.c_uint(0)
+            exception_type = ctypes.c_uint(0)
+            thread_right = ctypes.c_uint(0)
+            thread_type = ctypes.c_uint(0)
+            exception_kr = extract_right(
+                task.value,
+                registration["exception_port"],
+                copy_send,
+                ctypes.byref(exception_right),
+                ctypes.byref(exception_type),
+            )
+            thread_kr = extract_right(
+                task.value,
+                registration["thread_port"],
+                copy_send,
+                ctypes.byref(thread_right),
+                ctypes.byref(thread_type),
+            )
+            query_kr = -1
+            matched_mask = 0
+            masks = (ctypes.c_uint * 32)()
+            handlers = (ctypes.c_uint * 32)()
+            behaviors = (ctypes.c_int * 32)()
+            flavors = (ctypes.c_int * 32)()
+            count = ctypes.c_uint(32)
+            thread_id = 0
+            run_state = 0
+            suspend_count = 0
+            if exception_kr == 0 and thread_kr == 0:
+                identifier_words = (ctypes.c_int * 6)()
+                identifier_count = ctypes.c_uint(6)
+                identifier_kr = thread_info(
+                    thread_right.value,
+                    4,  # THREAD_IDENTIFIER_INFO
+                    identifier_words,
+                    ctypes.byref(identifier_count),
+                )
+                if identifier_kr == 0:
+                    identifier_bytes = bytes(identifier_words)
+                    thread_id = int.from_bytes(identifier_bytes[0:8], "little")
+                basic_words = (ctypes.c_int * 10)()
+                basic_count = ctypes.c_uint(10)
+                basic_kr = thread_info(
+                    thread_right.value,
+                    3,  # THREAD_BASIC_INFO
+                    basic_words,
+                    ctypes.byref(basic_count),
+                )
+                if basic_kr == 0:
+                    run_state = basic_words[6]
+                    suspend_count = basic_words[8]
+                query_kr = get_exception_ports(
+                    thread_right.value,
+                    exception_mask,
+                    masks,
+                    ctypes.byref(count),
+                    handlers,
+                    behaviors,
+                    flavors,
+                )
+                if query_kr == 0:
+                    for i in range(count.value):
+                        if handlers[i] == exception_right.value:
+                            matched_mask |= masks[i] & exception_mask
+            bindings.append(
+                {
+                    "status_kr": status_kr,
+                    "pset_count": receive_status[0] if status_kr == 0 else 0,
+                    "sequence": receive_status[1] if status_kr == 0 else 0,
+                    "queue_limit": receive_status[3] if status_kr == 0 else 0,
+                    "message_count": receive_status[4] if status_kr == 0 else 0,
+                    "exception_kr": exception_kr,
+                    "thread_kr": thread_kr,
+                    "query_kr": query_kr,
+                    "matched_mask": matched_mask,
+                    "thread_id": thread_id,
+                    "run_state": run_state,
+                    "suspend_count": suspend_count,
+                }
+            )
+            if query_kr == 0:
+                for i in range(count.value):
+                    if handlers[i]:
+                        mach_port_deallocate(mach_task_self, handlers[i])
+            if thread_right.value:
+                mach_port_deallocate(mach_task_self, thread_right.value)
+            if exception_right.value:
+                mach_port_deallocate(mach_task_self, exception_right.value)
+    finally:
+        if bool(members_ptr):
+            vm_deallocate = libsystem.vm_deallocate
+            vm_deallocate.argtypes = [ctypes.c_uint, ctypes.c_uint64, ctypes.c_uint64]
+            vm_deallocate.restype = ctypes.c_int
+            vm_deallocate(
+                mach_task_self,
+                ctypes.cast(members_ptr, ctypes.c_void_p).value,
+                member_count.value * ctypes.sizeof(ctypes.c_uint),
+            )
+        mach_port_deallocate(mach_task_self, task.value)
+
+    lines = [
+        f"# native DSR Mach exceptions pid={process.GetProcessID()} "
+        f"set={_fmt_hex(port_set)} members={len(members)} "
+        f"registrations={len(registrations)}"
+    ]
+    for index, registration in enumerate(registrations):
+        exception_port = registration["exception_port"]
+        member = "member" if exception_port in members else "MISSING"
+        binding = bindings[index]
+        if (
+            binding["exception_kr"] == 0
+            and binding["thread_kr"] == 0
+            and binding["query_kr"] == 0
+        ):
+            bound = (
+                "bound"
+                if binding["matched_mask"] == exception_mask
+                else f"BIND-MISSING({_fmt_hex(binding['matched_mask'])})"
+            )
+        else:
+            bound = (
+                f"BIND-ERROR(e={_fmt_hex(binding['exception_kr'])},"
+                f"t={_fmt_hex(binding['thread_kr'])},"
+                f"q={_fmt_hex(binding['query_kr'])})"
+            )
+        lines.append(
+            f"{index:2} reg={_fmt_hex(registration['address'])} "
+            f"slots={_fmt_hex(registration['slots'])} "
+            f"eport={_fmt_hex(exception_port)} {member:7} "
+            f"tport={_fmt_hex(registration['thread_port'])} "
+            f"tid={_fmt_hex(binding['thread_id'])} "
+            f"run={binding['run_state']} suspend={binding['suspend_count']} "
+            f"{bound} "
+            f"queue={binding['message_count']}/{binding['queue_limit']} "
+            f"seq={binding['sequence']} psets={binding['pset_count']} "
+            f"pending={registration['recovery_pending']} "
+            f"fault_pc={_fmt_hex(registration['fault_pc'])} "
+            f"fault_addr={_fmt_hex(registration['fault_address'])} "
+            f"entries={registration['exception_entries']} "
+            f"services={registration['recovery_services']} "
+            f"bad_access={registration['bad_access_entries']} "
+            f"brk={registration['breakpoint_entries']} "
+            f"x={registration['execute_switches']} "
+            f"w={registration['write_switches']} "
+            f"fail={registration['failures']} "
+            f"status={registration['last_status']}"
+        )
+    extra = sorted(members - {r["exception_port"] for r in registrations})
+    if extra:
+        lines.append("unregistered members: " + ", ".join(map(_fmt_hex, extra)))
+    result.AppendMessage("\n".join(lines))
+
+
 # ----- the top-level `carrick` multiplex command --------------------------
 
 _SUBCOMMANDS = {
@@ -468,6 +893,7 @@ _SUBCOMMANDS = {
     "gva": cmd_gva,
     "where": cmd_where,
     "eventring": cmd_eventring,
+    "mach-exceptions": cmd_mach_exceptions,
 }
 
 
