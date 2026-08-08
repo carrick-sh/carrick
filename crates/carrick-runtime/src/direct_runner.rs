@@ -1394,6 +1394,58 @@ impl DirectRunner {
         }
     }
 
+    /// Run a blocking pipe write continuation after dispatch has released all
+    /// subsystem locks. The owned continuation carries its partial offset, so
+    /// a readiness wake resumes the INNER write loop rather than re-dispatching
+    /// the original syscall and replaying its already-written prefix.
+    fn service_blocking_host_write(
+        &self,
+        syscall: u64,
+        mut write: crate::dispatch::BlockingHostWrite,
+    ) -> ServiceVerdict {
+        let outcome = loop {
+            match crate::dispatch::drive_blocking_host_write(&mut write) {
+                crate::dispatch::BlockingHostWriteStep::Done(outcome) => break outcome,
+                crate::dispatch::BlockingHostWriteStep::Wait => {
+                    match self.wait_on_fds(
+                        write.tid(),
+                        &[crate::io_wait::WaitFd::raw(write.host_fd(), libc::POLLOUT)],
+                        None,
+                        carrick_abi::WaitSigMask::NONE,
+                        FdWaitKind::Kqueue,
+                    ) {
+                        TierDWait::Ready => continue,
+                        // No deadline was supplied, but preserve the shared
+                        // driver's defensive partial-progress result if a
+                        // waiter nevertheless reports a timeout.
+                        TierDWait::TimedOut => {
+                            break DispatchOutcome::Returned {
+                                value: write.offset() as i64,
+                            };
+                        }
+                        TierDWait::Interrupted => {
+                            break crate::vcpu_loop::partial_write_interrupt_outcome(&write);
+                        }
+                        TierDWait::Leave => return ServiceVerdict::Leave,
+                    }
+                }
+            }
+        };
+        let outcome =
+            crate::vcpu_loop::raise_sigpipe_for_blocking_write(&self.dispatcher, &write, outcome);
+        match outcome {
+            DispatchOutcome::Returned { value } => ServiceVerdict::Resume(value),
+            DispatchOutcome::Errno { errno } => ServiceVerdict::Resume(errno.guest_retval()),
+            other => {
+                self.end_process(DirectRunOutcome::Unsupported {
+                    syscall,
+                    outcome: format!("blocking host-write driver returned {other:?}"),
+                });
+                ServiceVerdict::Leave
+            }
+        }
+    }
+
     /// Service one syscall from a tier-D island: dispatch, then run the
     /// signal-delivery boundary — every completed syscall is a delivery
     /// point, exactly the DSR loop's `complete_dsr_syscall` contract.
@@ -1777,6 +1829,9 @@ impl DirectRunner {
                 }
                 Ok(DispatchOutcome::BlockingRecordLock(lock)) => {
                     return self.service_blocking_record_lock(number, &lock);
+                }
+                Ok(DispatchOutcome::BlockingHostWrite(write)) => {
+                    return self.service_blocking_host_write(number, write);
                 }
                 Ok(other) => {
                     self.end_process(DirectRunOutcome::Unsupported {
@@ -3131,6 +3186,55 @@ pub unsafe fn with_runner<R>(
 mod tests {
     use super::*;
     use carrick_native_darwin::direct::DirectLoadGroup;
+
+    #[test]
+    fn blocking_host_write_waits_and_returns_through_the_tier_d_boundary() {
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let flags = unsafe { libc::fcntl(fds[1], libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+
+        let bytes = vec![0x5a; 4 * 1024 * 1024 + 1];
+        let expected = bytes.len();
+        let write = crate::dispatch::BlockingHostWrite::for_tests(
+            fds[1],
+            bytes,
+            0,
+            ThreadId::main_from_host_pid(),
+            true,
+        )
+        .expect("pin write fd");
+        assert_eq!(unsafe { libc::close(fds[1]) }, 0);
+
+        let read_fd = fds[0];
+        let reader = std::thread::spawn(move || {
+            // Hold the reader back until the first nonblocking write has
+            // filled the pipe and the continuation has observed EAGAIN.
+            // This makes the POLLOUT park a deterministic part of the test,
+            // rather than a scheduler-dependent possibility.
+            std::thread::sleep(Duration::from_millis(10));
+            let mut total = 0usize;
+            let mut buf = [0u8; 64 * 1024];
+            while total < expected {
+                let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
+                assert!(n > 0, "pipe closed after {total}/{expected} bytes");
+                total += n as usize;
+            }
+            assert_eq!(unsafe { libc::close(read_fd) }, 0);
+            total
+        });
+
+        let runner = DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
+        assert!(matches!(
+            runner.service_blocking_host_write(64, write),
+            ServiceVerdict::Resume(value) if value == expected as i64
+        ));
+        assert_eq!(reader.join().expect("reader thread"), expected);
+    }
 
     #[test]
     fn blocking_record_lock_returns_through_the_tier_d_boundary() {

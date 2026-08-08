@@ -1037,6 +1037,17 @@ impl BlockingHostWrite {
     pub(crate) fn sigpipe_on_epipe(&self) -> bool {
         self.sigpipe_on_epipe
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        host_fd: i32,
+        bytes: Vec<u8>,
+        offset: usize,
+        tid: crate::thread::ThreadId,
+        sigpipe_on_epipe: bool,
+    ) -> Result<Self, LinuxErrno> {
+        Self::from_vec(host_fd, bytes, offset, tid, sigpipe_on_epipe)
+    }
 }
 
 impl std::fmt::Debug for BlockingHostWrite {
