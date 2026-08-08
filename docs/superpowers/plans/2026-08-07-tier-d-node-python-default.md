@@ -611,7 +611,7 @@ mutation, `0x69206272`, sets bit 27 and is allocated `stgp x18, x24,
 [x19, #-1024]`; both bad64 0.12 and GNU AArch64 binutils 2.45 decode it. That
 neighbor must stay outside the proof and on the existing x18 path.
 
-- [ ] **Step 1: Add deterministic red boundary and mask tests**
+- [x] **Step 1: Add deterministic red boundary and mask tests**
 
 Add load-time and executable-window tests using `0x61206272`, parallel to the
 Wave-1 corpus regressions. Add classifier assertions that:
@@ -624,7 +624,7 @@ assert!(instruction_names_x18(&allocated));
 assert!(!word_is_proven_unallocated(0xffff_fff2));
 ```
 
-- [ ] **Step 2: Run the new tests and verify red**
+- [x] **Step 2: Run the new tests and verify red**
 
 ```bash
 cargo test -p carrick-native-darwin reserved_major -- --nocapture
@@ -633,7 +633,7 @@ cargo test -p carrick-native-darwin reserved_major -- --nocapture
 Expected: the boundary tests refuse `0x61206272` and the classifier assertion
 is false before implementation.
 
-- [ ] **Step 3: Extend the source-bound classifier minimally**
+- [x] **Step 3: Extend the source-bound classifier minimally**
 
 Add the current Arm top-level reserved group before the existing load/store
 register-offset proof:
@@ -648,7 +648,7 @@ if word & RESERVED_MAJOR_OP0_MASK == 0 {
 Do not accept other decoder failures, inspect ASCII, consume mapping symbols,
 or alter `patch_executable_words`.
 
-- [ ] **Step 4: Run focused and full scanner gates**
+- [x] **Step 4: Run focused and full scanner gates**
 
 ```bash
 cargo test -p carrick-native-darwin reserved_major -- --nocapture
@@ -663,14 +663,14 @@ just clippy
 Expected: both real boundary fixtures pass; the allocated STGP neighbor is not
 classified unallocated; the unrelated suspicious word still refuses.
 
-- [ ] **Step 5: Commit the code boundary**
+- [x] **Step 5: Commit the code boundary**
 
 ```bash
 git add crates/carrick-native-darwin/src/direct.rs
 git commit -m "fix(native): admit reserved A64 major-group words"
 ```
 
-- [ ] **Step 6: Build signed and recensus all eight campaign suites**
+- [x] **Step 6: Build signed and recensus all eight campaign suites**
 
 ```bash
 just build
@@ -695,7 +695,7 @@ Acceptance: no `0x61206272`, `0x38764d52`, or `BlockingRecordLock` leave;
 `cpython-fcntl` stays 8/8 MATCH. An overall nonzero exit is acceptable only for
 a newly exposed named blocker with nonempty census evidence.
 
-- [ ] **Step 7: Record the exact next blocker and commit evidence**
+- [x] **Step 7: Record the exact next blocker and commit evidence**
 
 Append source/binary/image provenance, verdicts, and the next named lifecycle
 event to the evidence and handoff. Do not interpret an Empty row or a Node
@@ -706,3 +706,90 @@ git add handoff.md docs/perf-results/2026-08-07-tier-d-node-python-baseline.md \
   docs/superpowers/plans/2026-08-07-tier-d-node-python-default.md
 git commit -m "docs(native): record Tier D reserved-major recensus"
 ```
+
+---
+
+### Task 7: Admit the measured unallocated Advanced SIMD shift opcode
+
+**Wave:** 2
+
+**Files:**
+
+- Modify: `crates/carrick-native-darwin/src/direct.rs`
+- Test: `crates/carrick-native-darwin/src/direct.rs`
+- Modify after live proof:
+  `docs/perf-results/2026-08-07-tier-d-node-python-baseline.md`
+- Modify after live proof: `handoff.md`
+
+**Exact red workload and images:** the same four workload/image pairs as Task
+6. Signed source `01f60b29` advances Node to virtual address `0x1c4a798` and
+CPython's libcrypto executable window to file offset `0x2ce8dc`; both refuse
+raw word `0x6f406f72`. The word is the final raw-x18 decoder failure in the
+shared OpenSSL banner.
+
+**Semantic reference:** Arm ARM DDI0487's "Advanced SIMD shift by immediate"
+encoding fixes bit 31=`0`, bits 28:23=`0b011110`, bit 10=`1`, and requires
+`immh` bits 22:19 to be nonzero. Inside that class, the opcode subspace with
+bit 15=`0` and bit 11=`1` is architecturally unallocated. The measured word is
+in that exact subspace. Clearing bit 11 gives allocated `0x6f406772`,
+`sqshlu v18.2d, v27.2d, #0`; clearing bit 10 gives allocated `0x6f406b72`, an
+Advanced SIMD element multiply-long instruction. Both controls name vector
+register 18, not guest GPR x18, and must remain outside the proof.
+
+- [ ] **Step 1: Add deterministic red boundary and mask tests**
+
+Add load-time and executable-window tests using `0x6f406f72`. Add a classifier
+test which proves the measured word accepted, both one-bit allocated controls
+rejected, both controls decoded by `bad64`, and `0xfffffff2` still rejected.
+
+- [ ] **Step 2: Run the new tests and verify red**
+
+```bash
+cargo test -p carrick-native-darwin advanced_simd_shift -- --nocapture
+```
+
+Expected: both boundaries refuse the measured word and the classifier
+assertion is false before implementation.
+
+- [ ] **Step 3: Extend the source-bound classifier minimally**
+
+Add the Arm class after the top-level reserved-major proof and before the
+existing load/store proof:
+
+```rust
+const SIMD_SHIFT_IMMEDIATE_MASK: u32 = 0x9f80_0400;
+const SIMD_SHIFT_IMMEDIATE: u32 = 0x0f00_0400;
+const SIMD_SHIFT_IMMH_MASK: u32 = 0x0078_0000;
+const SIMD_SHIFT_UNALLOCATED_OPCODE_MASK: u32 = 0x0000_8800;
+const SIMD_SHIFT_UNALLOCATED_OPCODE: u32 = 0x0000_0800;
+
+if (word & SIMD_SHIFT_IMMEDIATE_MASK) == SIMD_SHIFT_IMMEDIATE
+    && (word & SIMD_SHIFT_IMMH_MASK) != 0
+    && (word & SIMD_SHIFT_UNALLOCATED_OPCODE_MASK)
+        == SIMD_SHIFT_UNALLOCATED_OPCODE
+{
+    return true;
+}
+```
+
+Do not accept a specific ASCII word, infer code/data, or alter the patcher.
+
+- [ ] **Step 4: Run focused and full scanner gates**
+
+```bash
+cargo test -p carrick-native-darwin advanced_simd_shift -- --nocapture
+cargo test -p carrick-native-darwin proven_unallocated -- --nocapture
+cargo test -p carrick-native-darwin reserved_major -- --nocapture
+cargo test -p carrick-native-darwin \
+  scan_refuses_undecodable_text_only_when_it_could_name_x18 -- --nocapture
+cargo test -p carrick-native-darwin --lib
+just fmt-check
+just clippy
+```
+
+- [ ] **Step 5: Commit, build signed, and recensus the eight suites**
+
+Commit only `direct.rs`, build through `just build`, verify codesign and
+SHA-256, then run the Task-6 eight-suite command with run ID and artifact stem
+`tierd-wave2-simd-shift`. Acceptance requires all three prior scanner words
+and `BlockingRecordLock` to remain absent. The new census selects Task 8.
