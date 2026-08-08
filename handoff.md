@@ -171,6 +171,31 @@ decodes as `ld1q z0h.q[w12], p4/z, [x24, x18, lsl #4]` and must remain on the
 decoded-x18 path. Add red tests at both scanner boundaries, implement only the
 exact SME2 SMLAL form, rebuild signed, and recensus the same eight suites.
 
+### Wave-2 allocated-SME2 recensus and live next action
+
+This section supersedes the scanner action immediately above. Task 10 is
+complete on source `49c80f89`; the codesign-verified release binary SHA-256 is
+`5e9e8823a5838f7676ad429dced4c23562dcd3dad1f46d2f5a8514587e008f1d`.
+The eight-suite census contains no scanner refusal: Node and CPython both
+record direct entry. The scanner campaign is closed unless a future census
+measures a new refusal.
+
+The first actionable Python boundary is `cpython-subprocess` at
+`ContextManagerTests.test_broken_pipe_cleanup`: syscall 64 returns the typed
+continuation `BlockingHostWrite { host_fd: 17, bytes_len: 4194305, offset:
+65536, tid: ThreadId(29781), sigpipe_on_epipe: true }`. Task 11 in the plan
+adapts the shared native driver's existing partial-write/POLLOUT/SIGPIPE
+semantics into `DirectRunner`; add a red draining-pipe test, implement the
+adapter after dispatcher locks are released, and rerun the focused suite.
+
+Do not conflate the other measured blockers with Task 11. `cpython-threading`
+reaches 139 passed tests before the known syscall-220 multithreaded-fork leave
+(with `test_3_join_in_forked_from_thread` already failing). Both Node smoke
+targets enter Tier D and then report rc 139, with no typed leave. After the
+write adapter, the serial recensus selects between the Python fork and Node
+debugger tracks. Node must be diagnosed with LLDB/core plus the always-on event
+ring; no further scanner family is authorized by an unclassified SIGSEGV.
+
 **Date:** 2026-08-06 · **Integration target:** local `main` · **Latest
 decision:** the live-translation-arena campaign is **closed negative**. The
 complete runtime (Tasks 2-9) was deleted in `1cb06de6` per the plan's Task-10

@@ -972,20 +972,20 @@ constrained to W8-W11; no field can name GPR x18. Toggling bit 29 produces
 allocated `0xe1d21300`, `ld1q z0h.q[w12], p4/z, [x24, x18, lsl #4]`; it must
 remain outside the proof and on the decoded-x18 path.
 
-- [ ] **Step 1: Separate unallocated proof from x18-free decoder failures**
+- [x] **Step 1: Separate unallocated proof from x18-free decoder failures**
 
 Add `word_is_proven_x18_free_decoder_failure(word)`, initially delegating only
 to `word_is_proven_unallocated`, and make the scanner use it. Existing tests
 must remain green.
 
-- [ ] **Step 2: Add deterministic red boundary and family tests**
+- [x] **Step 2: Add deterministic red boundary and family tests**
 
 Add load-time and executable-window tests for `0xc1d21300`. Assert that it is
 not classified unallocated but is classified x18-free; assert that the one-bit
 LD1Q control is not x18-free, decodes successfully, and names x18. Run the
 `allocated_sme2` filter and confirm red before extending the new classifier.
 
-- [ ] **Step 3: Implement the exact allocated-family proof**
+- [x] **Step 3: Implement the exact allocated-family proof**
 
 ```rust
 const SME2_SMLAL_TWO_VECTOR_MASK: u32 = 0xfff0_9038;
@@ -996,13 +996,102 @@ Return true only when that exact comparison matches, after the unallocated
 delegate. Do not label the word unallocated, admit other SME2 encodings, or
 infer data from the object symbol.
 
-- [ ] **Step 4: Run focused and full scanner gates**
+- [x] **Step 4: Run focused and full scanner gates**
 
 Run `allocated_sme2`, every prior family filter, the suspicious-word refusal,
 the full crate, `just fmt-check`, and `just clippy`.
 
-- [ ] **Step 5: Commit, build signed, and recensus the eight suites**
+- [x] **Step 5: Commit, build signed, and recensus the eight suites**
 
 Commit only `direct.rs`, build through `just build`, verify codesign and
 SHA-256, then run the serial eight-suite gate with run ID and artifact stem
 `tierd-wave2-allocated-sme2`. The census selects Task 11.
+
+---
+
+### Task 11: Service Tier D blocking host writes
+
+**Wave:** 2
+
+**Files:**
+
+- Modify: `crates/carrick-runtime/src/direct_runner.rs`
+- Test: `crates/carrick-runtime/src/direct_runner.rs`
+- Modify only if a test-only constructor is required:
+  `crates/carrick-runtime/src/dispatch/mod.rs`
+- Modify after live proof:
+  `docs/perf-results/2026-08-07-tier-d-node-python-baseline.md`
+- Modify after live proof: `handoff.md`
+
+**Exact red workload and image:** `cpython-subprocess` in
+`localhost:5050/cpython-test:3.12.13`, manifest digest
+`sha256:4af881c7d613f2b1e4b507a686387f8c804c1f259c3dfd06576ad534b193c286`.
+Signed source `49c80f89` enters Tier D and reaches
+`test.test_subprocess.ContextManagerTests.test_broken_pipe_cleanup`, then
+leaves at syscall 64 with:
+
+```text
+BlockingHostWrite { host_fd: 17, bytes_len: 4194305, offset: 65536,
+                    tid: ThreadId(29781), sigpipe_on_epipe: true }
+```
+
+This is a typed dispatcher continuation, not an unsupported Linux operation.
+The shared Darwin native driver already owns the semantic reference: preserve
+partial-write offset across `POLLOUT` parks; do not re-dispatch the original
+write; return partial progress on interruption; convert a zero-progress
+interrupt to `EINTR`; and use `raise_sigpipe_for_blocking_write` so an `EPIPE`
+publishes guest `SIGPIPE` before the ordinary Tier-D signal boundary.
+
+- [ ] **Step 1: Add a deterministic red driver test**
+
+Build a nonblocking host pipe and a `BlockingHostWrite` larger than its
+capacity, with a sibling reader that drains the pipe. Call a new
+`service_blocking_host_write` helper and assert the full byte count returns
+through `ServiceVerdict::Resume`. Confirm the focused test is red before the
+helper and outcome arm exist. Any constructor added solely for this fixture
+must be `#[cfg(test)]` and crate-visible; do not broaden the production API.
+
+- [ ] **Step 2: Implement the shared-driver adapter**
+
+After `dispatch_threaded` returns the owned `BlockingHostWrite` and releases
+all dispatcher locks, loop on `drive_blocking_host_write`. On `Wait`, park the
+calling Tier-D host pthread through `wait_on_fds` with a raw `POLLOUT` fd,
+`WaitSigMask::NONE`, and the existing kqueue waiter. Preserve the continuation
+and its offset across every park. On completion, run
+`raise_sigpipe_for_blocking_write`, then translate only `Returned`/`Errno` to
+the ordinary Tier-D boundary; fail closed on any other outcome.
+
+- [ ] **Step 3: Prove the unit and focused live gate green**
+
+```bash
+RUST_TEST_THREADS=1 cargo test -p carrick-runtime \
+  blocking_host_write_waits_and_returns_through_the_tier_d_boundary \
+  -- --nocapture
+just build
+CARRICK_RUN_ID=tierd-blocking-host-write-green \
+CARRICK_NATIVE_DIRECT=1 \
+CARRICK_TIER_CENSUS=target/conformance/tierd-blocking-host-write-green.census.log \
+just conformance-native smoke --workers 1 --suite cpython-subprocess \
+  --jsonl target/conformance/tierd-blocking-host-write-green.jsonl
+```
+
+Expected: no `BlockingHostWrite` leave. If another typed boundary appears,
+record it exactly; do not pre-implement it.
+
+- [ ] **Step 4: Run focused regression gates and commit**
+
+Run the complete `carrick-runtime` library tests serialized, `just fmt-check`,
+and `just clippy`. Commit only the runtime adapter and its test support as:
+
+```bash
+git commit -m "fix(native): service Tier D blocking host writes"
+```
+
+- [ ] **Step 5: Recensus and select Task 12**
+
+Rebuild signed, verify codesign and SHA-256, and rerun the serial eight-suite
+gate with artifact stem `tierd-wave2-blocking-host-write`. Node's current
+post-entry SIGSEGV and CPython threading's current multithreaded-fork leave are
+separate observed blockers: the recensus decides their order. Diagnose Node
+with LLDB/core plus the always-on event ring; do not admit another scanner
+family unless a new scanner refusal is actually measured.
