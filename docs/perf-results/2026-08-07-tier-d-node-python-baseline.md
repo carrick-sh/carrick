@@ -462,3 +462,60 @@ x18. The one-bit control `0xe1d21300` is allocated
 `ld1q z0h.q[w12], p4/z, [x24, x18, lsl #4]` and must remain outside the proof.
 Task 10 therefore adds a separately named x18-free decoder-failure proof; it
 must not broaden or mislabel `word_is_proven_unallocated`.
+
+## 2026-08-07 signed allocated-SME2 recensus
+
+Task 10 landed as source `49c80f8917bc4d01beab563049088820cb3109c6`.
+The codesign-verified release binary SHA-256 was:
+
+```text
+5e9e8823a5838f7676ad429dced4c23562dcd3dad1f46d2f5a8514587e008f1d
+```
+
+The serial eight-suite run used census
+`target/conformance/tierd-wave2-allocated-sme2.census.log` and results
+`target/conformance/tierd-wave2-allocated-sme2.jsonl`. It contains no scanner
+refusal: both Node and CPython main processes now record `direct-enter`.
+
+| gate | Task-10 result | diagnostic elapsed |
+|---|---|---:|
+| `node-app-smoke` | REGRESSION, Node rc 139 after direct entry | 10,792 / 402 ms = 26.85x |
+| `node-v8-smoke` | REGRESSION, Node rc 139 after direct entry | 12,405 / 403 ms = 30.78x |
+| `cpython-fcntl` | MATCH 8/8, direct | 7,386 / 603 ms = 12.25x |
+| `cpython-glob` | MATCH 15/15, direct | 3,652 / 611 ms = 5.98x |
+| `cpython-json` | MATCH 173/173, direct | 19,714 / 19,472 ms = 1.01x |
+| `cpython-math` | MATCH 76/76, direct | 3,243 / 1,231 ms = 2.63x |
+| `cpython-subprocess` | CRASH at first active test, 0/278 | invalid performance row |
+| `cpython-threading` | CRASH after 139 pass, 1 fail, 1 skip | invalid performance row |
+
+These are conformance-wrapper diagnostics, not canonical performance results.
+In particular, the failed Node rows and incomplete Python rows cannot enter the
+product scoreboard.
+
+### Scanner closed; first real workload blockers
+
+`cpython-subprocess` reaches
+`ContextManagerTests.test_broken_pipe_cleanup`, after successfully executing
+`/usr/bin/uname` and `/usr/bin/true` children, then leaves at syscall 64 with:
+
+```text
+BlockingHostWrite { host_fd: 17, bytes_len: 4194305, offset: 65536,
+                    tid: ThreadId(29781), sigpipe_on_epipe: true }
+```
+
+The shared native driver already services this typed continuation without
+re-dispatching its written prefix. Task 11 adds the same adapter to the Tier-D
+runner, preserving partial progress, interrupt semantics, and SIGPIPE
+publication.
+
+`cpython-threading` reaches the fork-from-thread portion of the suite. One
+exec child exits 134, `test_3_join_in_forked_from_thread` fails, and both an
+exec child and the main process later leave at syscall 220 with
+`multithreaded fork on tier D (no sibling quiesce)`. This remains the next
+structural Python boundary; Task 11 does not alter fork semantics.
+
+Both Node suites now enter Tier D and their Node main process exits by signal
+139 without a scanner refusal or typed Tier-D leave. The outer smoke wrappers
+report only `rc=139`; the Node fault therefore requires a reproducible core or
+live LLDB capture and event-ring inspection before any fix. Another scanner
+exception is not authorized by this result.
