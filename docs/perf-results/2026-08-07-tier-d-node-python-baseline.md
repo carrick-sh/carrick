@@ -263,3 +263,59 @@ Closure checks:
 
 Wave 1 is therefore complete, not the product goal. Wave 2 begins with the
 source-bound top-level reserved A64 encoding group in Task 6 of the plan.
+
+## 2026-08-07 signed reserved-major recensus
+
+Task 6 landed as source `01f60b2982c8e217eed5b5f1d17e47d80d064a8d`.
+`just build` produced a codesign-verified release binary with SHA-256:
+
+```text
+2773d1070f3e41e0154488dd72523a5d03f2e56451fa4bffc8a0f9f2094f3ea1
+```
+
+The serial eight-suite run used the exact Task-6 command, census
+`target/conformance/tierd-wave2-reserved-major.census.log`, and results
+`target/conformance/tierd-wave2-reserved-major.jsonl`. It retained every
+Wave-1 closure: neither prior raw word appears, `cpython-fcntl` remains 8/8
+MATCH, and there is no `BlockingRecordLock` leave.
+
+| gate | Task-6 result | diagnostic elapsed |
+|---|---|---:|
+| `node-app-smoke` | MATCH, Node main still scan-refused | 7,740 / 402 ms = 19.25x |
+| `node-v8-smoke` | MATCH, Node main still scan-refused | 9,685 / 403 ms = 24.03x |
+| `cpython-fcntl` | MATCH 8/8, direct | 7,621 / 603 ms = 12.64x |
+| `cpython-glob` | MATCH 15/15, direct | 3,636 / 611 ms = 5.95x |
+| `cpython-json` | MATCH 173/173, direct | 20,533 / 19,472 ms = 1.05x |
+| `cpython-math` | MATCH 76/76, direct | 3,222 / 1,231 ms = 2.62x |
+| `cpython-subprocess` | Empty vs 278/278 | invalid performance row |
+| `cpython-threading` | Empty vs 193/193 | invalid performance row |
+
+The Node MATCH rows still run the refused Node main through Tier T, and the
+two Empty CPython rows did not execute their tests. None is a product
+performance result.
+
+### Next exact scanner boundary
+
+All four scanner-blocked paths now name `0x6f406f72` in the same OpenSSL
+`Keccak-1600` banner:
+
+- Node load-time scan: virtual address `0x1c4a798`;
+- CPython syscall 222 `mmap(PROT_EXEC, fd)` window scan: file offset
+  `0x2ce8dc` in libcrypto.
+
+The reserved-major word `0x61206272` is absent. An audit of every 32-bit word
+in the banner found this is the final word for which `bad64` rejects the word
+while the conservative raw-field test can name x18.
+
+The Arm encoding tree places `0x6f406f72` in "Advanced SIMD shift by
+immediate": bit 31=`0`, bits 28:23=`0b011110`, bit 10=`1`, and nonzero `immh`
+bits 22:19. Within that class its opcode has bit 15=`0`, bit 11=`1`, the
+architecturally unallocated opcode subspace. Two one-bit falsification
+controls are allocated:
+
+- clear bit 11: `0x6f406772`, `sqshlu v18.2d, v27.2d, #0`;
+- clear bit 10: `0x6f406b72`, an Advanced SIMD element multiply-long
+  instruction.
+
+Task 7 binds the exact class and unallocated opcode masks plus both allocated
+neighbors. It remains an architectural proof, not a banner-word whitelist.

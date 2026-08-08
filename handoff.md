@@ -80,6 +80,34 @@ scanner boundaries, implement only that mask, rebuild signed, and recensus the
 same eight suites. The resulting census—not an expected Node JIT or Python
 fork story—selects the following task.
 
+### Wave-2 reserved-major recensus and live next action
+
+This section supersedes the two scanner-action sections immediately above.
+Task 6 is complete on `01f60b29`; the codesign-verified binary SHA-256 is
+`2773d1070f3e41e0154488dd72523a5d03f2e56451fa4bffc8a0f9f2094f3ea1`.
+The eight-suite signed census contains neither prior raw word nor
+`BlockingRecordLock`, and `cpython-fcntl` remains 8/8 MATCH.
+
+The measured next boundary is shared again:
+
+- Node load-time scan refuses `0x6f406f72` at `0x1c4a798`;
+- CPython's syscall-222 libcrypto executable-window scan refuses the same word
+  at file offset `0x2ce8dc`;
+- Node main therefore still falls back to Tier T;
+- `cpython-subprocess` and `cpython-threading` remain Empty, so their elapsed
+  ratios remain invalid.
+
+This is the final raw-x18 decoder failure in the shared OpenSSL banner. The
+Arm encoding tree identifies it as the unallocated opcode subspace of
+"Advanced SIMD shift by immediate": fixed class bits, nonzero `immh`, opcode
+bit 15=`0`, and opcode bit 11=`1`. Task 7 in the implementation plan carries
+the exact masks. Its one-bit allocated controls are `0x6f406772` (`SQSHLU`)
+and `0x6f406b72` (Advanced SIMD element multiply-long). Add red tests at both
+scanner boundaries, implement only that source-bound proof, then rebuild
+signed and recensus the same eight suites. Do not treat the expected end of
+this banner as proof that Node or process/thread CPython will then be green;
+the live census selects Task 8.
+
 **Date:** 2026-08-06 · **Integration target:** local `main` · **Latest
 decision:** the live-translation-arena campaign is **closed negative**. The
 complete runtime (Tasks 2-9) was deleted in `1cb06de6` per the plan's Task-10
