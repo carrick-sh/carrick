@@ -605,8 +605,9 @@ file offset `0x2ce8b0`; both name raw word `0x61206272`.
 the guest's control flow, so neither tries to decode inline data after a
 `ret`. Tier D scans the whole executable section before direct entry and must
 therefore distinguish architecturally unallocated words independently. The
-Arm ARM DDI0487 "A64 instruction set encoding" main table reserves top-level
-`op0` bits 28:25=`0b0000`. `0x61206272` is in exactly that group. A one-bit
+Arm ARM DDI0487 "A64 instruction set encoding" main table reserves bit 31=`0`
+with top-level `op0` bits 28:25=`0b0000`. `0x61206272` is in exactly that
+group. Bit 31=`1` selects SME and must remain outside the proof. A one-bit
 mutation, `0x69206272`, sets bit 27 and is allocated `stgp x18, x24,
 [x19, #-1024]`; both bad64 0.12 and GNU AArch64 binutils 2.45 decode it. That
 neighbor must stay outside the proof and on the existing x18 path.
@@ -621,6 +622,8 @@ assert!(word_is_proven_unallocated(0x6120_6272));
 assert!(!word_is_proven_unallocated(0x6920_6272));
 let allocated = bad64::decode(0x6920_6272, 0).expect("allocated STGP neighbor");
 assert!(instruction_names_x18(&allocated));
+assert!(!word_is_proven_unallocated(0x8080_0012));
+bad64::decode(0x8080_0012, 0).expect("allocated SME control");
 assert!(!word_is_proven_unallocated(0xffff_fff2));
 ```
 
@@ -639,7 +642,7 @@ Add the current Arm top-level reserved group before the existing load/store
 register-offset proof:
 
 ```rust
-const RESERVED_MAJOR_OP0_MASK: u32 = 0x1e00_0000;
+const RESERVED_MAJOR_OP0_MASK: u32 = 0x9e00_0000;
 if word & RESERVED_MAJOR_OP0_MASK == 0 {
     return true;
 }
@@ -736,13 +739,13 @@ in that exact subspace. Clearing bit 11 gives allocated `0x6f406772`,
 Advanced SIMD element multiply-long instruction. Both controls name vector
 register 18, not guest GPR x18, and must remain outside the proof.
 
-- [ ] **Step 1: Add deterministic red boundary and mask tests**
+- [x] **Step 1: Add deterministic red boundary and mask tests**
 
 Add load-time and executable-window tests using `0x6f406f72`. Add a classifier
 test which proves the measured word accepted, both one-bit allocated controls
 rejected, both controls decoded by `bad64`, and `0xfffffff2` still rejected.
 
-- [ ] **Step 2: Run the new tests and verify red**
+- [x] **Step 2: Run the new tests and verify red**
 
 ```bash
 cargo test -p carrick-native-darwin advanced_simd_shift -- --nocapture
@@ -751,7 +754,7 @@ cargo test -p carrick-native-darwin advanced_simd_shift -- --nocapture
 Expected: both boundaries refuse the measured word and the classifier
 assertion is false before implementation.
 
-- [ ] **Step 3: Extend the source-bound classifier minimally**
+- [x] **Step 3: Extend the source-bound classifier minimally**
 
 Add the Arm class after the top-level reserved-major proof and before the
 existing load/store proof:
@@ -774,7 +777,7 @@ if (word & SIMD_SHIFT_IMMEDIATE_MASK) == SIMD_SHIFT_IMMEDIATE
 
 Do not accept a specific ASCII word, infer code/data, or alter the patcher.
 
-- [ ] **Step 4: Run focused and full scanner gates**
+- [x] **Step 4: Run focused and full scanner gates**
 
 ```bash
 cargo test -p carrick-native-darwin advanced_simd_shift -- --nocapture
@@ -787,9 +790,92 @@ just fmt-check
 just clippy
 ```
 
-- [ ] **Step 5: Commit, build signed, and recensus the eight suites**
+- [x] **Step 5: Commit, build signed, and recensus the eight suites**
 
 Commit only `direct.rs`, build through `just build`, verify codesign and
 SHA-256, then run the Task-6 eight-suite command with run ID and artifact stem
 `tierd-wave2-simd-shift`. Acceptance requires all three prior scanner words
 and `BlockingRecordLock` to remain absent. The new census selects Task 8.
+
+The post-census source audit also added a red allocated-SME control and
+narrowed the Task-6 mask from `0x1e00_0000` to `0x9e00_0000` in `7501cfa0`.
+This correctness correction must be present in every Task-8 build.
+
+---
+
+### Task 8: Admit the measured unallocated SIMD unprivileged-load/store class
+
+**Wave:** 2
+
+**Files:**
+
+- Modify: `crates/carrick-native-darwin/src/direct.rs`
+- Test: `crates/carrick-native-darwin/src/direct.rs`
+- Modify after live proof:
+  `docs/perf-results/2026-08-07-tier-d-node-python-baseline.md`
+- Modify after live proof: `handoff.md`
+
+**Exact red workload and images:** the Task-7 signed census advances both Node
+images to virtual address `0x1c53e64` and both CPython process/thread runs to
+libcrypto file offset `0x2e4be4`; all refuse `0xbcc3cad1`. In the unstripped
+Node executable this is byte `0x64` of the 272-byte local object
+`_vpsm4_ex_consts` at `0x1c53e00`. The stripped libcrypto contains the same
+272 bytes at `0x2e4b80`; both ranges have SHA-256
+`ab0963561f345b19c2db922b349d5960763ef10175c5ab391061006b46424cb0`.
+
+**Semantic reference:** Arm ARM DDI0487 "Load/store register (unprivileged)"
+fixes bits 29:27=`0b111`, bits 25:24=`0b00`, and bits 11:10=`0b10`. Its `V`
+bit 26 is fixed to zero because this class has only general-register forms;
+`V=1` is architecturally unallocated for every `size`, `opc`, immediate, base,
+and target field. The measured word has `V=1`; raw bits 14:10 resemble x18
+only because they are immediate/addressing bits in this class. Clearing bit 29
+gives allocated `0x9cc3cad1`, `ldr q17, <literal>`, which must remain outside
+the proof.
+
+- [ ] **Step 1: Add deterministic red boundary and mask tests**
+
+Add load-time and executable-window tests using `0xbcc3cad1`. Add classifier
+assertions that the measured word is proven, the one-bit allocated control is
+not proven and decodes successfully, the SME control remains excluded, and
+`0xfffffff2` still fails closed.
+
+- [ ] **Step 2: Run the new tests and verify red**
+
+```bash
+cargo test -p carrick-native-darwin simd_unprivileged -- --nocapture
+```
+
+Expected: both boundaries refuse the measured word and the classifier
+assertion is false before implementation.
+
+- [ ] **Step 3: Extend the source-bound classifier minimally**
+
+```rust
+const SIMD_UNPRIVILEGED_MASK: u32 = 0x3f00_0c00;
+const SIMD_UNPRIVILEGED_UNALLOCATED: u32 = 0x3c00_0800;
+
+if (word & SIMD_UNPRIVILEGED_MASK) == SIMD_UNPRIVILEGED_UNALLOCATED {
+    return true;
+}
+```
+
+Do not admit other SIMD/FP load-store shapes, consume the Node object symbol,
+or infer data from byte entropy.
+
+- [ ] **Step 4: Run focused and full scanner gates**
+
+```bash
+cargo test -p carrick-native-darwin simd_unprivileged -- --nocapture
+cargo test -p carrick-native-darwin reserved_major -- --nocapture
+cargo test -p carrick-native-darwin advanced_simd_shift -- --nocapture
+cargo test -p carrick-native-darwin proven_unallocated -- --nocapture
+cargo test -p carrick-native-darwin --lib
+just fmt-check
+just clippy
+```
+
+- [ ] **Step 5: Commit, build signed, and recensus the eight suites**
+
+Commit only `direct.rs`, build through `just build`, verify codesign and
+SHA-256, then run the same serial eight-suite gate with run ID and artifact
+stem `tierd-wave2-simd-unprivileged`. The signed census selects Task 9.

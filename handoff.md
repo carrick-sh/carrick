@@ -72,8 +72,9 @@ two Empty CPython suites and both Node main scans stop only on the measured
 `0x61206272`. Full serialized `just ci` passed.
 
 The live next action is Task 6 in the implementation plan. Arm's A64 main
-encoding table reserves top-level `op0` bits 28:25=`0000`, which covers
-`0x61206272`. The one-bit neighbor `0x69206272` is allocated
+encoding table reserves bit 31=`0` with top-level `op0` bits 28:25=`0000`,
+which covers `0x61206272`; bit 31=`1` instead selects SME. The one-bit neighbor
+`0x69206272` is allocated
 `stgp x18, x24, [x19, #-1024]` and is the falsification control: it must remain
 outside the proof and take the existing decoded-x18 path. Add red tests at both
 scanner boundaries, implement only that mask, rebuild signed, and recensus the
@@ -107,6 +108,31 @@ scanner boundaries, implement only that source-bound proof, then rebuild
 signed and recensus the same eight suites. Do not treat the expected end of
 this banner as proof that Node or process/thread CPython will then be green;
 the live census selects Task 8.
+
+### Wave-2 SIMD-shift recensus and live next action
+
+This section supersedes the scanner action immediately above. Task 7 is
+complete on signed source `d2eb3998`, binary SHA-256
+`d1b02b06825ce76bb290ec6de227ea88967ec70dd3c49bf28dd7a6ca66f7a612`.
+The old banner refusal is gone; `cpython-fcntl` stays 8/8 MATCH; the earlier
+scanner words and record-lock leave remain absent.
+
+The next shared word is `0xbcc3cad1`: Node refuses it at `0x1c53e64`, and
+CPython's libcrypto window refuses it at `0x2e4be4`. Node's symbols identify
+the 272-byte object `_vpsm4_ex_consts`; stripped libcrypto carries the same
+272 bytes, with matching SHA-256
+`ab0963561f345b19c2db922b349d5960763ef10175c5ab391061006b46424cb0`.
+
+Task 8 carries the source-bound proof. The Arm unprivileged load/store class
+fixes bits 29:27=`111`, bits 25:24=`00`, and bits 11:10=`10`; `V=1` is wholly
+unallocated because this class has no SIMD/FP forms. The one-bit allocated
+control is `0x9cc3cad1` (`ldr q17, <literal>`). Add red tests at both scanner
+boundaries, implement only the exact class mask, rebuild signed, and recensus.
+
+Before that implementation, retain correctness commit `7501cfa0`: it narrows
+the Task-6 reserved-major mask to include bit 31. Bit 31=`1`, bits
+28:25=`0000` select SME, not the reserved group; allocated `0x80800012`
+(`fmops`) is now the falsification control. Do not restore the broader mask.
 
 **Date:** 2026-08-06 · **Integration target:** local `main` · **Latest
 decision:** the live-translation-arena campaign is **closed negative**. The
