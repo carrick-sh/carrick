@@ -519,3 +519,45 @@ Both Node suites now enter Tier D and their Node main process exits by signal
 report only `rc=139`; the Node fault therefore requires a reproducible core or
 live LLDB capture and event-ring inspection before any fix. Another scanner
 exception is not authorized by this result.
+
+## 2026-08-07 signed blocking-host-write recensus
+
+Task 11 landed as source `3a4b8da4fad54d46cf4161ae3aabe33a7dfb2b7f`.
+The codesign-verified release binary SHA-256 was:
+
+```text
+e57f2ddf09efa203f0bc2d73a8a8f5390108fe61b1600480cc4d83ee92391fcc
+```
+
+The serial eight-suite run used census
+`target/conformance/tierd-wave2-blocking-host-write.census.log` and results
+`target/conformance/tierd-wave2-blocking-host-write.jsonl`.
+
+| gate | Task-11 result | diagnostic elapsed |
+|---|---|---:|
+| `node-app-smoke` | REGRESSION, Node rc 139 after direct entry | 8,934 / 402 ms = 22.22x |
+| `node-v8-smoke` | REGRESSION, Node rc 139 after direct entry | 12,584 / 403 ms = 31.23x |
+| `cpython-fcntl` | MATCH 8/8, direct | 7,407 / 603 ms = 12.28x |
+| `cpython-glob` | MATCH 15/15, direct | 3,659 / 611 ms = 5.99x |
+| `cpython-json` | MATCH 173/173, direct | 19,713 / 19,472 ms = 1.01x |
+| `cpython-math` | MATCH 76/76, direct | 3,252 / 1,231 ms = 2.64x |
+| `cpython-subprocess` | CRASH after 112 pass, 2 fail, 7 skip | invalid performance row |
+| `cpython-threading` | CRASH after 139 pass, 1 fail, 1 skip | invalid performance row |
+
+The focused red/green proof is stronger than absence alone:
+`test_broken_pipe_cleanup`, the exact test that previously stopped on
+`BlockingHostWrite`, now passes. `cpython-subprocess` advances from zero
+completed tests to 112 passes. Its new terminal event is the same syscall-220
+`multithreaded fork on tier D (no sibling quiesce)` boundary as
+`cpython-threading`; no `BlockingHostWrite` event remains. The deterministic
+4 MiB+ draining-pipe test passed, all 1,190 runnable serialized
+`carrick-runtime` library tests passed (five ignored), and formatting plus
+workspace clippy were green before the narrow code commit.
+
+Both Node wrappers still report rc 139 after their Node main process records
+direct entry, with no `direct-exit`, scanner refusal, or typed leave. Task 12
+therefore selects the Node debugger track: reduce the image wrapper to the
+exact Node argv, capture the real guest process under LLDB, read the always-on
+event ring, and bind the fault PC/registers to one mechanism before changing
+code. Python's now-shared multithreaded-fork boundary remains measured and
+queued; it is not being treated as fixed or as a performance result.

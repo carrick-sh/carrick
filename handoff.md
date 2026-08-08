@@ -196,6 +196,32 @@ write adapter, the serial recensus selects between the Python fork and Node
 debugger tracks. Node must be diagnosed with LLDB/core plus the always-on event
 ring; no further scanner family is authorized by an unclassified SIGSEGV.
 
+### Wave-2 blocking-host-write recensus and live next action
+
+This section supersedes the action immediately above. Task 11 is complete on
+source `3a4b8da4`, signed binary SHA-256
+`e57f2ddf09efa203f0bc2d73a8a8f5390108fe61b1600480cc4d83ee92391fcc`.
+The exact `test_broken_pipe_cleanup` red case now passes and
+`cpython-subprocess` advances from zero completed tests to 112 passes before
+joining `cpython-threading` at the same named syscall-220 multithreaded-fork
+boundary. No `BlockingHostWrite` event remains. The deterministic partial-
+write/POLLOUT fixture, all 1,190 runnable serialized runtime library tests,
+formatting, and workspace clippy passed.
+
+Task 12 in the plan is the live action. Both Node wrappers still report rc 139
+after `/opt/nodejs-conformance/bin/node24` records Tier-D direct entry, with no
+scanner refusal, `direct-exit`, or typed leave. First inspect the image in a
+Docker-only phase and reduce each wrapper to its exact Node argv. Then attach
+LLDB to the Node guest process (not the orchestrator), capture the natural
+`EXC_BAD_ACCESS`, all-thread registers/backtraces, memory regions, a core or
+transcript, and the always-on event ring. Bind the fault PC and operands to one
+mechanism before writing a regression or changing runtime code. Do not add a
+new scanner exception from rc 139 alone.
+
+Python multithreaded fork remains a real queued correctness blocker, now
+shared by both process-heavy suites. Conformance wrapper timings remain
+diagnostics only; no failed or incomplete row enters the <=2x product goal.
+
 **Date:** 2026-08-06 · **Integration target:** local `main` · **Latest
 decision:** the live-translation-arena campaign is **closed negative**. The
 complete runtime (Tasks 2-9) was deleted in `1cb06de6` per the plan's Task-10
