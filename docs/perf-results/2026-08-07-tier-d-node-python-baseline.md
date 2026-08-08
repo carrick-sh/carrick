@@ -2,7 +2,8 @@
 
 **Date:** 2026-08-07
 
-**Status:** pre-fix Wave-1 authority
+**Status:** living campaign authority; Python correctness closed, Node dynamic
+RWX open, clean product performance open
 
 **Backend:** Darwin/AArch64 native DSR, forced Tier D, native16k
 
@@ -561,3 +562,65 @@ exact Node argv, capture the real guest process under LLDB, read the always-on
 event ring, and bind the fault PC/registers to one mechanism before changing
 code. Python's now-shared multithreaded-fork boundary remains measured and
 queued; it is not being treated as fixed or as a performance result.
+
+## 2026-08-07 signed Python lifecycle closeout
+
+The complete Tier-D Python process/thread lifecycle landed as source
+`a8b98318f7c2162630fb2d7ca37177ca2292fbe0`. `just build` produced a
+codesign-verified release binary with SHA-256:
+
+```text
+05ebff444f5dd57fda9c88ecd692e43d4226014cad322ca9c7bbecf118c6a340
+```
+
+The implementation adds the missing semantics rather than weakening a gate:
+
+- process-creating fork quiesces every live Tier-D sibling at a lock-safe
+  syscall/wait boundary, holds the shared pause mutex across `fork(2)`, and
+  repairs the child copy before guest execution resumes;
+- process teardown wakes both futex and `ThreadWaiter` parks, while internal
+  fork-quiesce wakes preserve the guest's original sleep deadline;
+- default fatal signals retain `WIFSIGNALED` wait status instead of becoming a
+  normal `128 + signal` exit;
+- the live Tier-D thread registry is published to `/proc/self/task` consumers
+  and replaced after fork, so CPython sees the correct surviving main thread.
+
+The canonical serial gate was:
+
+```sh
+CARRICK_RUN_ID=tierd-python-canonical-green \
+CARRICK_NATIVE_DIRECT=1 \
+CARRICK_TIER_CENSUS=/Volumes/CaseSensitive/carrick/target/conformance/tierd-python-canonical-green.census.log \
+just conformance-native smoke --workers 1 \
+  --suite cpython-subprocess --suite cpython-threading \
+  --jsonl target/conformance/tierd-python-canonical-green.jsonl
+```
+
+Docker results came from the committed native-arm64 oracle cache; Carrick and
+Docker did not overlap. Both suites are exact matches with no new or known
+diffs:
+
+| gate | shipped-default Tier-D result | diagnostic elapsed |
+|---|---|---:|
+| `cpython-subprocess` | MATCH 278/278 (42 matching skips) | 112,919 / 20,895 ms = **5.40x** |
+| `cpython-threading` | MATCH 193/193 (2 matching skips) | 27,900 / 13,682 ms = **2.04x** |
+
+These results close the measured Python correctness boundary: 471/471 active
+tests match the oracle. The elapsed ratios remain conformance-wrapper
+diagnostics, not the clean canonical product scoreboard. They nevertheless
+make the next selection unambiguous: threading is at the edge of the 2x bar,
+while subprocess still needs mechanism attribution and a material reduction.
+
+Focused red/green evidence also covered the two previously misreported fatal
+signal cases (`test_run_abort`, `test_terminate`) and all four CPython
+fork-from-foreign/non-main-thread cases. The deterministic runtime regression
+parks a live sibling in a 60-second guest sleep, forks and reaps a process
+child, then proves `exit_group` wakes and retires the sibling promptly. The
+post-change `RUST_TEST_THREADS=1 just ci` gate passed in full, including 1,191
+serialized `carrick-runtime` library tests (five ignored) and every integration,
+lint, documentation, dependency-policy, and support-matrix gate.
+
+Python is therefore correct for the named Tier-D suites but is not performance
+complete. Node remains correctness-incomplete at the later dynamic
+`mprotect(PROT_READ|PROT_WRITE|PROT_EXEC)` transition; the static x18 faults
+are already closed, and no blanket RWX exemption is authorized.
