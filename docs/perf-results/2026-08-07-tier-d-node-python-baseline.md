@@ -374,3 +374,46 @@ allocated SME falsification control (`0x80800012`, `fmops`) and narrows the
 mask from `0x1e000000` to `0x9e000000`: only bit 31=`0` plus bits
 28:25=`0b0000` is the reserved major group. The Task-7 measured paths did not
 reach that later word, but every subsequent build must carry this correction.
+
+## 2026-08-07 signed SIMD-unprivileged recensus
+
+Task 8 landed as source `379d25544ff55188811296a4ac743f938365f233`.
+The codesign-verified release binary SHA-256 was:
+
+```text
+5fc847f82b270a420ed003a5ac2955cdb55fda787cf8ed0857375100b964fff7
+```
+
+The serial eight-suite run used census
+`target/conformance/tierd-wave2-simd-unprivileged.census.log` and results
+`target/conformance/tierd-wave2-simd-unprivileged.jsonl`. It contains none of
+the four prior scanner words or the record-lock leave.
+
+| gate | Task-8 result | diagnostic elapsed |
+|---|---|---:|
+| `node-app-smoke` | MATCH, Node main still scan-refused | 7,925 / 402 ms = 19.71x |
+| `node-v8-smoke` | MATCH, Node main still scan-refused | 9,900 / 403 ms = 24.57x |
+| `cpython-fcntl` | MATCH 8/8, direct | 7,195 / 603 ms = 11.93x |
+| `cpython-glob` | MATCH 15/15, direct | 3,668 / 611 ms = 6.00x |
+| `cpython-json` | MATCH 173/173, direct | 19,916 / 19,472 ms = 1.02x |
+| `cpython-math` | MATCH 76/76, direct | 3,224 / 1,231 ms = 2.62x |
+| `cpython-subprocess` | Empty vs 278/278 | invalid performance row |
+| `cpython-threading` | Empty vs 193/193 | invalid performance row |
+
+Node still falls back to Tier T and the two Empty rows still did not execute
+their Python tests. The table remains diagnostic, not a product scoreboard.
+
+### Next exact scanner boundary
+
+The shared next refusal is `0x02783a40`:
+
+- Node load-time scan: virtual address `0x1c53ec8`;
+- CPython syscall 222 executable-window scan: libcrypto file offset
+  `0x2e4c48`.
+
+It is byte `0xc8` of the same byte-identical `_vpsm4_ex_consts` range. Arm's
+root A64 table marks top-level `op1` values satisfying
+`(bits28:25 & 0b1101) == 0b0001` unallocated. The measured word has
+`op1=0b0001`. Toggling bit 27 gives allocated `0x0a783a40`,
+`bic w0, w18, w24, lsr #14`; that one-bit control must remain on the decoded
+x18 refusal path. Task 9 binds only this root-table mask.

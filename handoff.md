@@ -134,6 +134,23 @@ the Task-6 reserved-major mask to include bit 31. Bit 31=`1`, bits
 28:25=`0000` select SME, not the reserved group; allocated `0x80800012`
 (`fmops`) is now the falsification control. Do not restore the broader mask.
 
+### Wave-2 SIMD-unprivileged recensus and live next action
+
+This section supersedes the scanner action immediately above. Task 8 is
+complete on signed source `379d2554`, binary SHA-256
+`5fc847f82b270a420ed003a5ac2955cdb55fda787cf8ed0857375100b964fff7`.
+All earlier scanner words and `BlockingRecordLock` remain absent;
+`cpython-fcntl` stays 8/8 MATCH.
+
+Node and CPython now share `0x02783a40` as the first refusal, at Node virtual
+address `0x1c53ec8` and libcrypto file offset `0x2e4c48`. It is byte `0xc8` of
+the byte-identical `_vpsm4_ex_consts` range. Arm's root A64 encoding table
+marks `(op1 & 0b1101) == 0b0001` unallocated for `op1` bits 28:25. Task 9
+carries the exact `0x1a000000/0x02000000` mask/value pair. One-bit control
+`0x0a783a40` decodes as `bic w0, w18, w24, lsr #14` and must remain on the
+decoded-x18 path. Add red tests at both scanner boundaries, implement only
+that root-table proof, rebuild signed, and recensus the same eight suites.
+
 **Date:** 2026-08-06 · **Integration target:** local `main` · **Latest
 decision:** the live-translation-arena campaign is **closed negative**. The
 complete runtime (Tasks 2-9) was deleted in `1cb06de6` per the plan's Task-10
