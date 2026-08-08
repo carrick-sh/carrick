@@ -1221,11 +1221,13 @@ fn word_could_name_x18(word: u32) -> bool {
 ///
 /// The Arm Architecture Reference Manual's main A64 encoding table reserves
 /// bit 31=`0` with top-level `op0` bits 28:25=`0b0000`; bit 31=`1` selects SME
-/// instead. Its "Advanced SIMD shift by immediate" encoding fixes bit 31=`0`,
-/// bits 28:23=`0b011110`, and bit 10=`1`, with
-/// nonzero `immh` bits 22:19; opcode bit 15=`0` plus bit 11=`1` selects an
-/// unallocated subspace. Its "Load/store register (unprivileged)" encoding
-/// fixes bits 29:27=`0b111`, bits 25:24=`0b00`, and bits 11:10=`0b10`; `V` bit
+/// instead. The same root table marks top-level bits 28:25 matching
+/// `(op1 & 0b1101) == 0b0001` unallocated. Its "Advanced SIMD shift by
+/// immediate" encoding fixes bit 31=`0`, bits 28:23=`0b011110`, and bit
+/// 10=`1`, with nonzero `immh` bits 22:19; opcode bit 15=`0` plus bit 11=`1`
+/// selects an unallocated subspace. Its "Load/store register (unprivileged)"
+/// encoding fixes bits 29:27=`0b111`, bits 25:24=`0b00`, and bits
+/// 11:10=`0b10`; `V` bit
 /// 26=`1` is unallocated because the class has no SIMD/FP forms. Separately,
 /// its "Load/store register (register offset)" encoding fixes bits 11:10 to
 /// `0b10`; the family selector is bits 29:27=`0b111`, bits 25:24=`0b00`, and
@@ -1234,6 +1236,8 @@ fn word_could_name_x18(word: u32) -> bool {
 /// undefined-instruction exception.
 fn word_is_proven_unallocated(word: u32) -> bool {
     const RESERVED_MAJOR_OP0_MASK: u32 = 0x9e00_0000;
+    const TOP_LEVEL_UNALLOCATED_OP1_MASK: u32 = 0x1a00_0000;
+    const TOP_LEVEL_UNALLOCATED_OP1: u32 = 0x0200_0000;
     const SIMD_SHIFT_IMMEDIATE_MASK: u32 = 0x9f80_0400;
     const SIMD_SHIFT_IMMEDIATE: u32 = 0x0f00_0400;
     const SIMD_SHIFT_IMMH_MASK: u32 = 0x0078_0000;
@@ -1247,6 +1251,9 @@ fn word_is_proven_unallocated(word: u32) -> bool {
     const FIXED_11_10: u32 = 0x0000_0800;
 
     if word & RESERVED_MAJOR_OP0_MASK == 0 {
+        return true;
+    }
+    if (word & TOP_LEVEL_UNALLOCATED_OP1_MASK) == TOP_LEVEL_UNALLOCATED_OP1 {
         return true;
     }
     if (word & SIMD_SHIFT_IMMEDIATE_MASK) == SIMD_SHIFT_IMMEDIATE
@@ -3612,6 +3619,38 @@ mod tests {
     }
 
     #[test]
+    fn scan_accepts_proven_top_level_unallocated_op1_word_with_x18_bits() {
+        let top_level_unallocated = 0x0278_3a40;
+        let elf = elf_with_code(&[top_level_unallocated, movz(8, 93, 0), SVC_0]);
+        assert!(
+            matches!(scan_eligibility(&elf).expect("scan runs"), Ok(1)),
+            "a top-level source-proven unallocated word cannot access x18"
+        );
+    }
+
+    #[test]
+    fn top_level_unallocated_op1_proof_is_mask_exact() {
+        assert!(word_is_proven_unallocated(0x0278_3a40));
+        assert!(
+            !word_is_proven_unallocated(0x0a78_3a40),
+            "the one-bit BIC neighbor is allocated"
+        );
+        let allocated = bad64::decode(0x0a78_3a40, 0).expect("allocated BIC neighbor");
+        assert!(
+            instruction_names_x18(&allocated),
+            "the allocated neighbor must remain on the decoded-x18 path"
+        );
+        assert!(
+            !word_is_proven_unallocated(0x8080_0012),
+            "the allocated SME major group remains outside every proof"
+        );
+        assert!(
+            !word_is_proven_unallocated(0xffff_fff2),
+            "unrelated undecodable words remain fail-closed"
+        );
+    }
+
+    #[test]
     fn scan_counts_syscall_sites_on_a_clean_image() {
         let elf = fixture_elf();
         assert!(
@@ -4532,6 +4571,21 @@ mod tests {
                 .expect("scan runs")
                 .is_ok(),
             "the SIMD unprivileged proof applies at the executable-window boundary"
+        );
+    }
+
+    #[test]
+    fn exec_window_accepts_proven_top_level_unallocated_op1_word_with_x18_bits() {
+        let file = elf_with_code(&[0x0278_3a40, movz(8, 93, 0), SVC_0]);
+        let group = DirectLoadGroup::load(&fixture_elf(), record_only)
+            .expect("load main")
+            .expect("eligible");
+        assert!(
+            group
+                .map_exec_file_window(&file, 0, 0x2000)
+                .expect("scan runs")
+                .is_ok(),
+            "the top-level unallocated proof applies at the executable-window boundary"
         );
     }
 
