@@ -95,8 +95,9 @@ use sha2::Digest;
 
 #[cfg(test)]
 const SVC_0: u32 = 0xd400_0001;
-const NATIVE_CTR_EL0: u64 = 0x8444_4004;
-const NATIVE_DCZID_EL0: u64 = 0x4;
+use carrick_native_darwin::direct::{
+    LINUX_CTR_EL0 as NATIVE_CTR_EL0, LINUX_DCZID_EL0 as NATIVE_DCZID_EL0,
+};
 const NATIVE_DARWIN_PIE_BASE: u64 = 0x4_0000_0000;
 // NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE and NATIVE_DARWIN_HARD_PAGEZERO_END
 // moved to `carrick_dsr::address` with the address-layout machinery. The
@@ -366,11 +367,18 @@ fn kick_all_native_guest_threads() {
 }
 
 /// Complete a native asynchronous-interrupt publication. Pending state MUST be
-/// durable before this function runs: the futex generation closes the
-/// predicate-to-park registration window, then the host kick pulls threads out
-/// of translated guest code. Reversing that order can lose both one-shot edges.
+/// durable before this function runs: the futex generation and registered
+/// host-waiter pipes close their respective predicate-to-park windows, then the
+/// host kick pulls threads out of translated guest code. Reversing that order
+/// can lose any of these one-shot edges.
 fn wake_all_native_guest_threads_after_interrupt_publication() {
     crate::thread::notify_current_futex_signal_pending();
+    // Tier D can be parked inside a host kqueue/poll syscall rather than in
+    // translated guest code. Its ThreadWaiter was registered before the final
+    // pending-state check, so an unread pipe byte is the event-driven wake and
+    // no periodic service slice is required. This is also needed by narrow
+    // runner tests, which intentionally have no NativeThreadRuntime kicker.
+    crate::host_signal::wake_all_waiters();
     kick_all_native_guest_threads();
 }
 
@@ -948,7 +956,7 @@ fn run_direct_in_current_process(
     plan: &ExecutionPlan,
 ) -> Result<DirectLaunchFlow, RuntimeError> {
     use crate::direct_runner as dr;
-    let group = match carrick_native_darwin::direct::DirectLoadGroup::load_with_interpreter(
+    let mut group = match carrick_native_darwin::direct::DirectLoadGroup::load_with_interpreter(
         &candidate.elf,
         |path| {
             dispatcher
@@ -971,7 +979,20 @@ fn run_direct_in_current_process(
             });
         }
     };
-    let stack = match dr::DirectStack::build(
+    // A Mach exception reply does not preserve physical x18 even when the
+    // task's ordinary syscall-return policy does. Dynamic MAP_JIT execution
+    // necessarily crosses that reply while switching write/execute mode, so
+    // returning directly to V8 can zero a live Linux GPR (observed as a
+    // generated-code byte store through x18 to address 0x18). Keep static ELF
+    // text on the physical-x18 direct path, but create every dynamic range as
+    // an immutable source for the byte-preserving DSR shadow cache.
+    if let Err(error) = group.enable_dynamic_shadow() {
+        return Ok(DirectLaunchFlow::Refused {
+            dispatcher: Box::new(dispatcher),
+            reason: format!("tier D dynamic shadow policy: {error}"),
+        });
+    }
+    let mut stack = match dr::DirectStack::build(
         &candidate.elf,
         group.main().bias(),
         group.interpreter().map(|interp| interp.bias()),
@@ -986,7 +1007,7 @@ fn run_direct_in_current_process(
             });
         }
     };
-    native_tier_census("direct-enter", resolved, "");
+    let mut active_resolved = resolved.to_owned();
     // Process-wide runtime services every native tier needs, mirroring the
     // DSR boot in `run_image_in_current_process` (minus the translator, the
     // vCPU-kick machinery, and the /proc image publication — the last is a
@@ -1004,51 +1025,204 @@ fn run_direct_in_current_process(
         plan: plan.clone(),
         max_traps,
     });
-    let entry = group.entry_pc();
-    let sp = stack.sp();
-    // SAFETY: patched images built with `island_handler`; the guest leaves
-    // through the handler (guest-leave contract).
-    let (entered, _slots) =
-        unsafe { dr::with_runner(&runner, &group, || group.enter_on_stack(entry, sp)) }
-            .map_err(|error| RuntimeError::Unsupported(format!("tier D thread slots: {error}")))?;
-    entered.map_err(|error| RuntimeError::Unsupported(format!("tier D enter: {error}")))?;
-    match runner.outcome() {
-        Some(dr::DirectRunOutcome::Exited { code }) => {
-            native_tier_census("direct-exit", resolved, &code.to_string());
-            Ok(DirectLaunchFlow::Completed(code))
+    loop {
+        native_tier_census("direct-enter", &active_resolved, "");
+        // Tier D bypasses the translated lane's image-publication handoff,
+        // but stack-attribution consumers still need Carrick's ASLR base for
+        // each image entered in this process. The wrapper evaluates its dyld
+        // closure only when this USDT probe is enabled.
+        crate::probes::host_image_base();
+        let entry = group.entry_pc();
+        let sp = stack.sp();
+        // SAFETY: patched images built with `island_handler`; the guest
+        // leaves through the handler (guest-leave contract).
+        let (entered, slots) =
+            unsafe { dr::with_runner(&runner, &group, || group.enter_on_stack(entry, sp)) }
+                .map_err(|error| {
+                    RuntimeError::Unsupported(format!("tier D thread slots: {error}"))
+                })?;
+        entered.map_err(|error| RuntimeError::Unsupported(format!("tier D enter: {error}")))?;
+        let mach = slots.exception_telemetry;
+        native_tier_census(
+            "direct-mach",
+            &active_resolved,
+            &format!(
+                "installs={} rebinds={} exceptions={} bad-access={} breakpoints={} \
+                 services={} exec-switches={} write-switches={} failures={} \
+                 last-exception={} last-status={} bad-instruction={} sysregs={}",
+                mach.installs,
+                mach.fork_rebinds,
+                mach.exception_entries,
+                mach.bad_access_entries,
+                mach.breakpoint_entries,
+                mach.recovery_services,
+                mach.execute_switches,
+                mach.write_switches,
+                mach.failures,
+                mach.last_exception,
+                mach.last_status,
+                mach.bad_instruction_entries,
+                mach.sysreg_emulations,
+            ),
+        );
+        match runner.outcome() {
+            Some(dr::DirectRunOutcome::Exited { code }) => {
+                native_tier_census("direct-exit", &active_resolved, &code.to_string());
+                return Ok(DirectLaunchFlow::Completed(code));
+            }
+            Some(dr::DirectRunOutcome::Signaled { signum }) => {
+                native_tier_census("direct-signal", &active_resolved, &signum.to_string());
+                runner.dispatcher().cleanup_sysv_ipc_on_process_exit();
+                crate::exec_helpers::forked_child_die_by_signal(
+                    signum,
+                    runner.dispatcher().stdout(),
+                    runner.dispatcher().stderr(),
+                )
+            }
+            Some(dr::DirectRunOutcome::ExecReplacement) => {
+                let Some(replacement) = runner.take_exec_replacement() else {
+                    return Err(RuntimeError::Unsupported(
+                        "tier D exec leave had no prepared replacement".to_string(),
+                    ));
+                };
+                let next_resolved = replacement.resolved.clone();
+                let proc_argv: Vec<String> = replacement
+                    .argv
+                    .iter()
+                    .map(|value| String::from_utf8_lossy(value).into_owned())
+                    .collect();
+                let process_title = proc_argv.join(" ");
+                let proc_env = replacement.env.clone();
+
+                // Nothing fallible remains after this point. Retire every
+                // RAII-owned part of the old image first; the runner then
+                // retires ordinary identity mappings/brk and closes the
+                // private vfork completion fd only after process-visible exec
+                // state has been reset.
+                drop(slots);
+                drop(stack);
+                drop(group);
+                runner.dispatcher().reset_memory_state_on_execve();
+                runner.dispatcher().reset_signal_handlers_on_execve();
+                runner.dispatcher().set_executable_identity(
+                    next_resolved.clone(),
+                    proc_argv,
+                    proc_env,
+                );
+                runner.dispatcher().close_cloexec_fds();
+                crate::namespace::pid::mark_self_execed();
+                crate::dispatch::set_host_process_name(process_title.as_bytes());
+                runner.commit_in_process_exec();
+                native_tier_census("direct-exec-commit", &next_resolved, "in-process");
+
+                group = replacement.group;
+                stack = replacement.stack;
+                active_resolved = next_resolved;
+            }
+            Some(dr::DirectRunOutcome::Unsupported { syscall, outcome }) => {
+                native_tier_census(
+                    "direct-leave",
+                    &active_resolved,
+                    &format!("syscall={syscall} {outcome}"),
+                );
+                return Err(RuntimeError::Unsupported(format!(
+                    "tier D leave at syscall {syscall}: {outcome} (the guest already ran; \
+                     no tier T fallback exists mid-run)"
+                )));
+            }
+            None => {
+                return Err(RuntimeError::Unsupported(
+                    "tier D guest left without an outcome".to_string(),
+                ));
+            }
         }
-        Some(dr::DirectRunOutcome::Signaled { signum }) => {
-            native_tier_census("direct-signal", resolved, &signum.to_string());
-            runner.dispatcher().cleanup_sysv_ipc_on_process_exit();
-            crate::exec_helpers::forked_child_die_by_signal(
-                signum,
-                runner.dispatcher().stdout(),
-                runner.dispatcher().stderr(),
-            )
-        }
-        Some(dr::DirectRunOutcome::Unsupported { syscall, outcome }) => {
-            native_tier_census(
-                "direct-leave",
-                resolved,
-                &format!("syscall={syscall} {outcome}"),
-            );
-            Err(RuntimeError::Unsupported(format!(
-                "tier D leave at syscall {syscall}: {outcome} (the guest already ran; \
-                 no tier T fallback exists mid-run)"
-            )))
-        }
-        None => Err(RuntimeError::Unsupported(
-            "tier D guest left without an outcome".to_string(),
-        )),
     }
 }
 
-/// Service a tier-D guest's `execve(2)` through the EXISTING host
-/// self-re-exec capsule — the same transport the DSR forked-child exec uses;
-/// the resumed process tier-decides anew for the new image
-/// (`resume_guest_from_capsule`). Returns the guest retval to resume with on
-/// any pre-commit failure; on success the host `execve` replaces this
-/// process inside `begin_guest_exec` and this function never returns.
+pub(crate) enum TierDExecFlow {
+    Resume(i64),
+    Replace(Box<crate::direct_runner::DirectExecReplacement>),
+}
+
+/// Prepare an eligible Tier-D replacement completely before disturbing the
+/// outgoing guest. A refusal is not an exec error: it tells the caller to use
+/// the existing capsule, whose post-reexec tier decision can fall back to DSR.
+fn prepare_tier_d_exec_replacement(
+    dispatcher: &SyscallDispatcher,
+    path: &str,
+    argv: Vec<Vec<u8>>,
+    env: Vec<Vec<u8>>,
+) -> Result<Option<crate::direct_runner::DirectExecReplacement>, crate::linux_abi::LinuxErrno> {
+    use crate::direct_runner as dr;
+
+    let argv = if argv.is_empty() {
+        vec![path.as_bytes().to_vec()]
+    } else {
+        argv
+    };
+    let absolute = dispatcher.resolve_exec_path(path);
+    dispatcher.check_exec_target(&absolute)?;
+    let (resolved, argv) = crate::exec_helpers::resolve_shebang(dispatcher, absolute, argv)?;
+    let host_fallback = dispatcher.exec_host_fs_fallback();
+    let read = |candidate: &str| {
+        dispatcher.read_exec_file(candidate).or_else(|| {
+            host_fallback
+                .then(|| std::fs::read(candidate).ok())
+                .flatten()
+        })
+    };
+    let file = read(&resolved).ok_or(crate::linux_abi::LINUX_ENOENT)?;
+    let group = match carrick_native_darwin::direct::DirectLoadGroup::load_with_interpreter(
+        &file,
+        |interpreter| {
+            read(interpreter).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, interpreter.to_owned())
+            })
+        },
+        dr::island_handler(),
+    ) {
+        Ok(Ok(group)) => group,
+        Ok(Err(reason)) => {
+            native_tier_census("exec-direct-refused", &resolved, &reason.to_string());
+            return Ok(None);
+        }
+        Err(error) => {
+            native_tier_census("exec-direct-load-error", &resolved, &error.to_string());
+            return Ok(None);
+        }
+    };
+    if let Err(error) = group.enable_dynamic_shadow() {
+        native_tier_census("exec-direct-shadow-error", &resolved, &error.to_string());
+        return Ok(None);
+    }
+    let stack = match dr::DirectStack::build(
+        &file,
+        group.main().bias(),
+        group.interpreter().map(|interpreter| interpreter.bias()),
+        &argv,
+        &env,
+    ) {
+        Ok(stack) => stack,
+        Err(error) => {
+            native_tier_census("exec-direct-stack-error", &resolved, &error.to_string());
+            return Ok(None);
+        }
+    };
+    native_tier_census("scan-direct", &resolved, "exec-in-process");
+    Ok(Some(dr::DirectExecReplacement {
+        group,
+        stack,
+        resolved,
+        argv,
+        env,
+    }))
+}
+
+/// Service a tier-D guest's `execve(2)`. Eligible Tier-D replacements are
+/// fully prepared and handed to the outer driver for an in-process commit;
+/// ineligible images retain the existing host self-reexec capsule so the new
+/// process can tier-decide into DSR. Pre-commit errors resume the old guest
+/// with their Linux errno exactly as execve requires.
 pub(crate) fn tier_d_service_execve(
     dispatcher: &SyscallDispatcher,
     path: String,
@@ -1056,8 +1230,13 @@ pub(crate) fn tier_d_service_execve(
     env: Vec<Vec<u8>>,
     plan: &ExecutionPlan,
     max_traps: usize,
-) -> i64 {
+) -> TierDExecFlow {
     crate::probes::execve_argv(&path, &argv);
+    match prepare_tier_d_exec_replacement(dispatcher, &path, argv.clone(), env.clone()) {
+        Ok(Some(replacement)) => return TierDExecFlow::Replace(Box::new(replacement)),
+        Ok(None) => {}
+        Err(errno) => return TierDExecFlow::Resume(errno.guest_retval()),
+    }
     let capsule_env = env.clone();
     let loaded = load_native_execve_image(
         dispatcher,
@@ -1065,13 +1244,13 @@ pub(crate) fn tier_d_service_execve(
         argv,
         env,
         plan,
-        ExecDigestPolicy::DeferredUnlessConsumed,
+        ExecDigestPolicy::DeferredUntilNeeded,
         ExecFileBackingPolicy::Compute,
     );
     let (image, relative_relocations, resolved, resolved_argv, executable_digest, exec_backing) =
         match loaded {
             Ok(loaded) => loaded,
-            Err(errno) => return errno.guest_retval(),
+            Err(errno) => return TierDExecFlow::Resume(errno.guest_retval()),
         };
     if let Err(reason) = dispatcher.validate_native_reexec_fd_state() {
         tracing::warn!(
@@ -1079,7 +1258,7 @@ pub(crate) fn tier_d_service_execve(
             descriptors = ?dispatcher.native_reexec_fd_state_summary(),
             "tier D execve rejected unsupported fd state"
         );
-        return crate::linux_abi::LINUX_EOPNOTSUPP.guest_retval();
+        return TierDExecFlow::Resume(crate::linux_abi::LINUX_EOPNOTSUPP.guest_retval());
     }
     if let Err(error) = crate::native_exec_capsule::begin_guest_exec(
         dispatcher,
@@ -1098,12 +1277,12 @@ pub(crate) fn tier_d_service_execve(
             path = resolved,
             "tier D execve host self-reexec preparation failed"
         );
-        return crate::linux_abi::LINUX_EIO.guest_retval();
+        return TierDExecFlow::Resume(crate::linux_abi::LINUX_EIO.guest_retval());
     }
     // `begin_guest_exec` ends in `libc::execve`; reaching here means the
     // exec unexpectedly returned without an error.
     tracing::warn!(path = resolved, "tier D execve unexpectedly returned");
-    crate::linux_abi::LINUX_EIO.guest_retval()
+    TierDExecFlow::Resume(crate::linux_abi::LINUX_EIO.guest_retval())
 }
 
 type LoadedNativeExecveImage = (
@@ -1324,27 +1503,20 @@ enum ExecDigestPolicy {
     /// Hash now. The self-reexec CHILD reloading through the legacy path must,
     /// because its whole job is to compare the digest with the parent's.
     Required,
-    /// Hash only if a consumer is armed. The PARENT does not yet know whether
-    /// the guard will run: it runs only when no prepared image is attached, and
-    /// that is decided later, in `begin_guest_exec`. Deferring keeps the guard
-    /// at full strength on the path that uses it and off the path that does not.
-    DeferredUnlessConsumed,
-}
-
-/// Whether anything will read an executable's content digest this run.
-///
-/// The three consumers each mint an `ExecutableIdentity`/`TranslationUnitKey`
-/// from it. The persistent translation store is default-on
-/// (`CARRICK_DSR_PERSISTENT_STORE=0` disables); the other two are opt-in.
-fn executable_digest_is_consumed() -> bool {
-    carrick_dsr_aarch64::translator::persistent_store_runtime_enabled()
-        || carrick_dsr_aarch64::artifact_spike::enabled()
-        || carrick_dsr_aarch64::translator::xlat_census::armed()
+    /// Defer the whole-file hash. The PARENT does not yet know whether the
+    /// legacy guard will run: it runs only when no prepared image is attached,
+    /// and that is decided later, in `begin_guest_exec`. DSR consumers can
+    /// derive their identity from the mapped executable spans instead.
+    DeferredUntilNeeded,
 }
 
 /// Sentinel meaning "not hashed yet". `begin_guest_exec` fills it in if the
 /// prepared-image attach declines and the guard will therefore run.
 pub(crate) const DEFERRED_EXEC_DIGEST: [u8; 32] = [0_u8; 32];
+
+fn translation_digest_for_loaded_exec(executable_digest: [u8; 32]) -> Option<[u8; 32]> {
+    (executable_digest != DEFERRED_EXEC_DIGEST).then_some(executable_digest)
+}
 
 /// Hash a guest executable by path, for the deferred case.
 ///
@@ -1410,12 +1582,11 @@ fn load_native_execve_image(
             .or_else(|| host_read(&resolved))
             .ok_or(crate::linux_abi::LINUX_ENOENT)?,
     };
-    let executable_digest: [u8; 32] =
-        if digest_policy == ExecDigestPolicy::Required || executable_digest_is_consumed() {
-            sha2::Sha256::digest(&file).into()
-        } else {
-            DEFERRED_EXEC_DIGEST
-        };
+    let executable_digest: [u8; 32] = if digest_policy == ExecDigestPolicy::Required {
+        sha2::Sha256::digest(&file).into()
+    } else {
+        DEFERRED_EXEC_DIGEST
+    };
     let relative_relocations = native_relative_relocations(&file, NATIVE_DARWIN_PIE_BASE)
         .map_err(|_| crate::linux_abi::LINUX_ENOEXEC)?;
     let image = AddressSpace::load_elf_bytes_with_reader_at_pie_base_without_runtime_regions(
@@ -1533,7 +1704,16 @@ pub(crate) fn resume_guest_from_capsule(
         carrick_spec::ExecBackendRequest::Native,
         guest.native_page_profile,
     )?;
-    let mut dispatcher = SyscallDispatcher::new();
+    let lower_rootfs = guest
+        .lower_rootfs
+        .as_ref()
+        .map(crate::rootfs::RootFs::from_immutable_host_authority)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("restore immutable native rootfs lower: {error}"))?;
+    let mut dispatcher = match lower_rootfs {
+        Some(rootfs) => SyscallDispatcher::with_rootfs(rootfs),
+        None => SyscallDispatcher::new(),
+    };
     dispatcher.set_page_geometry(plan.page_geometry);
     dispatcher.set_execution_backend(plan.backend);
     dispatcher.set_memory_layout(native_memory_layout());
@@ -1569,9 +1749,9 @@ pub(crate) fn resume_guest_from_capsule(
         match carrick_native_darwin::direct::scan_eligibility_as_interpreted(&file) {
             Ok(Ok(_)) => {
                 native_tier_census("scan-direct", &guest.resolved_path, "exec-resume");
-                // Digest-guard parity with the legacy resume path: when a
-                // consumer armed a real digest, verify the re-read bytes
-                // are the executable the pre-exec image loaded.
+                // Digest-guard parity with the legacy resume path: when the
+                // parent had to materialize a real digest, verify the re-read
+                // bytes are the executable the pre-exec image loaded.
                 if guest.executable_digest != DEFERRED_EXEC_DIGEST {
                     let digest: [u8; 32] = sha2::Sha256::digest(&file).into();
                     if digest != guest.executable_digest {
@@ -1661,7 +1841,7 @@ pub(crate) fn resume_guest_from_capsule(
     );
     run_image_in_current_process(
         source,
-        Some(executable_digest),
+        translation_digest_for_loaded_exec(executable_digest),
         dispatcher,
         max_traps,
         &plan,
@@ -2380,7 +2560,9 @@ fn run_image_in_child(
                     dispatcher = *returned;
                 }
                 Err(err) => {
-                    child_write_stderr(format!("native tier D child error: {err}\n").as_bytes());
+                    let detail = err.to_string();
+                    crate::probes::native_tierd_unsupported(u64::MAX, &detail);
+                    child_write_stderr(format!("native tier D child error: {detail}\n").as_bytes());
                     unsafe { libc::_exit(125) };
                 }
             }
@@ -3166,14 +3348,14 @@ enum NativeSyscallServiceState {
     Closed,
 }
 
-struct NativeSyscallServiceSpan {
+pub(crate) struct NativeSyscallServiceSpan {
     number: u64,
     name: &'static str,
     state: NativeSyscallServiceState,
 }
 
 impl NativeSyscallServiceSpan {
-    fn open(number: u64, name: &'static str) -> Self {
+    pub(crate) fn open(number: u64, name: &'static str) -> Self {
         crate::probes::native_syscall_service_entry(number, name);
         #[cfg(test)]
         record_native_syscall_service_probe_event(NativeSyscallServiceProbeEvent::Entry {
@@ -3205,7 +3387,7 @@ impl NativeSyscallServiceSpan {
         true
     }
 
-    fn end(&mut self, outcome: NativeSyscallServiceOutcome) -> bool {
+    pub(crate) fn end(&mut self, outcome: NativeSyscallServiceOutcome) -> bool {
         if self.state != NativeSyscallServiceState::Open {
             return false;
         }
@@ -3265,7 +3447,7 @@ impl Drop for NativeSyscallServiceSpan {
 
 #[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum NativeSyscallServiceProbeEvent {
+pub(crate) enum NativeSyscallServiceProbeEvent {
     Entry {
         number: u64,
         name: &'static str,
@@ -3291,7 +3473,7 @@ fn record_native_syscall_service_probe_event(event: NativeSyscallServiceProbeEve
 }
 
 #[cfg(test)]
-fn take_native_syscall_service_probe_events() -> Vec<NativeSyscallServiceProbeEvent> {
+pub(crate) fn take_native_syscall_service_probe_events() -> Vec<NativeSyscallServiceProbeEvent> {
     NATIVE_SYSCALL_SERVICE_PROBE_EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))
 }
 
@@ -4330,7 +4512,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     argv,
                     env,
                     &plan,
-                    ExecDigestPolicy::DeferredUnlessConsumed,
+                    ExecDigestPolicy::DeferredUntilNeeded,
                     // Only the forked-child self-reexec transport maps regions
                     // from the executable fd; the in-process replacement below
                     // maps materialized bytes.
@@ -4583,7 +4765,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                                                 .to_string(),
                                         )
                                     })?,
-                                    Some(executable_digest),
+                                    translation_digest_for_loaded_exec(executable_digest),
                                     Arc::new(
                                         carrick_native_darwin::aot_cache::ActiveContainerUnitStore,
                                     ),
@@ -16522,6 +16704,40 @@ mod tests {
         .expect("load native resume fixture")
     }
 
+    #[test]
+    fn deferred_exec_load_skips_full_file_digest_with_persistent_store_enabled() {
+        fork_test(|| {
+            // Isolate the process-global store switch and force the production
+            // default explicitly: this test must catch reintroducing an eager
+            // whole-file hash merely because the downstream DSR store exists.
+            unsafe { std::env::set_var("CARRICK_DSR_PERSISTENT_STORE", "1") };
+            let temp = tempfile::tempdir().expect("create deferred-digest tempdir");
+            let path = native_prepared_resume_source(temp.path(), 0xd65f_03c0);
+            let dispatcher = SyscallDispatcher::new();
+            let plan = native16k_test_plan();
+            let loaded = load_native_execve_image(
+                &dispatcher,
+                path.to_str().expect("UTF-8 deferred-digest path"),
+                vec![path.as_os_str().as_encoded_bytes().to_vec()],
+                Vec::new(),
+                &plan,
+                ExecDigestPolicy::DeferredUntilNeeded,
+                ExecFileBackingPolicy::Skip,
+            )
+            .expect("load deferred-digest fixture");
+
+            assert_eq!(loaded.4, DEFERRED_EXEC_DIGEST);
+        });
+    }
+
+    #[test]
+    fn deferred_exec_digest_lets_dsr_derive_mapped_identity() {
+        assert_eq!(
+            translation_digest_for_loaded_exec(DEFERRED_EXEC_DIGEST),
+            None
+        );
+    }
+
     fn native_prepared_resume_record(
         image: &AddressSpace,
         relocations: &[NativeRelativeRelocation],
@@ -16873,5 +17089,92 @@ mod tests {
             "guest executable changed across native host self-reexec"
         );
         assert_eq!(loader_calls.get(), 1);
+    }
+
+    #[test]
+    fn tier_d_exec_replaces_the_guest_image_without_replacing_the_host_process() {
+        use crate::fs_backend::FsBackend as _;
+
+        let tier_d_elf = |words: &[u32]| {
+            let mut elf = dsr_test_elf(words);
+            // Tier D's eligibility authority is SHF_EXECINSTR sections, not
+            // merely an executable PT_LOAD. Add a null + .text table to the
+            // compact DSR fixture without changing its load shape.
+            let shoff = elf.len();
+            let mut sections = vec![0_u8; 2 * 64];
+            let text = 64;
+            write_u32(&mut sections, text + 0x04, 1); // SHT_PROGBITS
+            write_u64(&mut sections, text + 0x08, 0x6); // ALLOC|EXECINSTR
+            write_u64(&mut sections, text + 0x10, 0); // vaddr
+            write_u64(&mut sections, text + 0x18, 0x1000); // file offset
+            write_u64(
+                &mut sections,
+                text + 0x20,
+                std::mem::size_of_val(words) as u64,
+            );
+            elf.extend_from_slice(&sections);
+            write_u64(&mut elf, 0x28, shoff as u64);
+            write_u16(&mut elf, 0x3a, 64);
+            write_u16(&mut elf, 0x3c, 2);
+            elf
+        };
+
+        // argv[0] is `/bin/target`; use the initial stack's argv vector as
+        // execve(path, argv, NULL), then exit 99 if exec incorrectly returns.
+        let source = tier_d_elf(&[
+            0xf940_07e0, // ldr x0, [sp, #8] -- argv[0]
+            0x9100_23e1, // add x1, sp, #8 -- argv
+            0xd280_0002, // mov x2, #0 -- envp
+            0xd280_1ba8, // mov x8, #221 -- execve
+            SVC_0,
+            0xd280_0bc8, // mov x8, #94 -- exit_group with exec errno
+            SVC_0,
+        ]);
+        let target = tier_d_elf(&[
+            0xd280_0540, // mov x0, #42
+            0xd280_0bc8, // mov x8, #94 -- exit_group
+            SVC_0,
+        ]);
+
+        let scratch = tempfile::tempdir().expect("scratch rootfs");
+        let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
+            .expect("open scratch rootfs");
+        let backend = crate::fs_backend::HostFsBackend::from_existing_dir(dir);
+        backend.make_dir("/bin").expect("create /bin");
+        backend
+            .set_file_contents("/bin/target", target)
+            .expect("install target ELF");
+        backend
+            .set_mode("/bin/target", 0o755)
+            .expect("make target executable");
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(backend));
+        let candidate = DirectLaunchCandidate {
+            elf: source,
+            argv: vec![b"/bin/target".to_vec()],
+            env: Vec::new(),
+        };
+        let host_pid = std::process::id();
+
+        let flow = run_direct_in_current_process(
+            candidate,
+            "/bin/source",
+            dispatcher,
+            usize::MAX,
+            &native16k_test_plan(),
+        )
+        .expect("run Tier-D exec chain");
+
+        assert_eq!(
+            std::process::id(),
+            host_pid,
+            "host process must survive exec"
+        );
+        match flow {
+            DirectLaunchFlow::Completed(code) => assert_eq!(code, 42),
+            DirectLaunchFlow::Refused { reason, .. } => {
+                panic!("initial Tier-D image was refused: {reason}")
+            }
+        }
     }
 }

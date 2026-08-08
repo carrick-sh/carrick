@@ -44,6 +44,10 @@ pub(crate) struct NativeGuestExecV1 {
     pub(crate) resolved_path: String,
     pub(crate) executable_digest: [u8; 32],
     pub(crate) rootfs: crate::fs_backend::HostFsReexecAuthority,
+    /// Optional immutable image-cache lower paired with the writable `rootfs`
+    /// upper. Absent in historical V1 payloads and in fully materialized roots.
+    #[serde(default)]
+    pub(crate) lower_rootfs: Option<crate::rootfs::ImmutableHostRootAuthority>,
     pub(crate) cwd: String,
     pub(crate) stream_stdio: bool,
     pub(crate) exec_host_fs_fallback: bool,
@@ -258,6 +262,10 @@ impl NativeGuestExecV1 {
             || self.cwd.len() > MAX_PATH_LEN
             || self.rootfs.root_path.is_empty()
             || self.rootfs.root_path.len() > MAX_PATH_LEN
+            || self
+                .lower_rootfs
+                .as_ref()
+                .is_some_and(|authority| !authority.capsule_shape_is_valid(MAX_PATH_LEN))
             || self.max_traps == 0
             || self.kernel_arena.is_some_and(|arena| {
                 arena.host_fd < 0
@@ -367,6 +375,7 @@ pub(crate) fn begin_guest_exec(
     let rootfs = dispatcher
         .native_fs_reexec_authority()
         .map_err(|error| anyhow::anyhow!("native guest exec rootfs is ineligible: {error:?}"))?;
+    let lower_rootfs = dispatcher.native_lower_rootfs_reexec_authority();
     let fd_table = dispatcher
         .snapshot_native_reexec_fd_table()
         .map_err(|error| anyhow::anyhow!("native guest exec fd table is ineligible: {error}"))?;
@@ -403,6 +412,7 @@ pub(crate) fn begin_guest_exec(
             resolved_path,
             executable_digest,
             rootfs,
+            lower_rootfs,
             cwd: dispatcher.cwd(),
             stream_stdio: dispatcher.stream_stdio_enabled(),
             exec_host_fs_fallback: dispatcher.exec_host_fs_fallback(),
@@ -444,8 +454,9 @@ pub(crate) fn begin_guest_exec(
     //
     // This does NOT weaken the guard: on the legacy path both sides now compute
     // a real digest, exactly as before. `ExecDigestPolicy::Required` covers the
-    // child, and an armed consumer (shared translation, artifact spike, census)
-    // still forces the eager hash because those mint an identity from it.
+    // child. When a prepared image reaches DSR with the deferred marker, shared
+    // translation, artifact spike, and census derive the identity from the
+    // mapped executable spans instead of walking the full source file.
     if let Some(guest) = payload.guest_exec.as_mut()
         && guest.prepared_image.is_none()
         && guest.executable_digest == crate::native_darwin::DEFERRED_EXEC_DIGEST
@@ -1326,7 +1337,9 @@ mod tests {
                     device: 1,
                     inode: 2,
                     cleanup_on_drop: false,
+                    sparse_upper_fast_miss: false,
                 },
+                lower_rootfs: None,
                 cwd: "/".to_owned(),
                 stream_stdio: true,
                 exec_host_fs_fallback: false,
@@ -1539,25 +1552,93 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn immutable_lower_authority_round_trips_and_rejects_path_replacement() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let lower_path = parent.path().join("lower");
+        std::fs::create_dir_all(lower_path.join("bin")).unwrap();
+        std::fs::write(lower_path.join("bin/probe"), b"lower-exec").unwrap();
+        let rootfs = crate::rootfs::RootFs::from_immutable_host_dir(&lower_path).unwrap();
+        let authority = rootfs
+            .immutable_host_authority()
+            .expect("host lower authority");
+
+        let mut payload = sample();
+        payload
+            .guest_exec
+            .as_mut()
+            .expect("guest payload")
+            .lower_rootfs = Some(authority);
+        let capsule = tempfile::tempfile().unwrap();
+        let nonce = [0x2a; 16];
+        write_capsule(capsule.as_raw_fd(), nonce, &payload).unwrap();
+        let decoded = read_capsule_once(capsule.as_raw_fd(), nonce).unwrap();
+        let decoded_authority = decoded
+            .guest_exec
+            .expect("guest payload")
+            .lower_rootfs
+            .expect("lower authority");
+        let restored =
+            crate::rootfs::RootFs::from_immutable_host_authority(&decoded_authority).unwrap();
+        assert_eq!(restored.read("/bin/probe").unwrap(), b"lower-exec");
+
+        let original = parent.path().join("original");
+        std::fs::rename(&lower_path, &original).unwrap();
+        std::fs::create_dir(&lower_path).unwrap();
+        assert!(
+            crate::rootfs::RootFs::from_immutable_host_authority(&decoded_authority).is_err(),
+            "same path with a substituted inode must not reopen"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn immutable_lower_authority_rejects_cleanup_ownership() {
+        let lower = tempfile::TempDir::new().unwrap();
+        let rootfs = crate::rootfs::RootFs::from_immutable_host_dir(lower.path()).unwrap();
+        let mut authority = rootfs.immutable_host_authority().unwrap();
+        authority.set_cleanup_on_drop_for_test(true);
+        let mut payload = sample();
+        payload
+            .guest_exec
+            .as_mut()
+            .expect("guest payload")
+            .lower_rootfs = Some(authority);
+        let capsule = tempfile::tempfile().unwrap();
+        assert!(
+            write_capsule(capsule.as_raw_fd(), [0x2b; 16], &payload).is_err(),
+            "an immutable lower must never acquire cleanup ownership"
+        );
+    }
+
     #[test]
     fn legacy_v1_payload_without_bind_mounts_defaults_to_empty() {
         let payload = sample();
         let mut value = serde_json::to_value(payload).expect("serialize capsule");
         value
             .get_mut("guest_exec")
+            .and_then(|guest| guest.get_mut("rootfs"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("rootfs authority")
+            .remove("sparse_upper_fast_miss");
+        value
+            .get_mut("guest_exec")
             .and_then(serde_json::Value::as_object_mut)
             .expect("guest payload")
             .remove("bind_mounts");
+        value
+            .get_mut("guest_exec")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("guest payload")
+            .remove("lower_rootfs");
 
         let decoded: NativeExecCapsuleV1 =
             serde_json::from_value(value).expect("decode prior V1 payload");
-        assert!(
-            decoded
-                .guest_exec
-                .expect("guest payload")
-                .bind_mounts
-                .is_empty()
-        );
+        let guest = decoded.guest_exec.expect("guest payload");
+        assert!(guest.bind_mounts.is_empty());
+        assert!(guest.lower_rootfs.is_none());
+        assert!(!guest.rootfs.sparse_upper_fast_miss);
     }
 
     #[test]

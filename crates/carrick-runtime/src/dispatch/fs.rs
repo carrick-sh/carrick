@@ -1465,6 +1465,14 @@ impl SyscallDispatcher {
         if path.is_empty() {
             return Ok(DispatchOutcome::errno(LINUX_ENOENT));
         }
+        // Cached-lower absolute read lane: glibc/Node issue their loader,
+        // locale, and package reads as absolute AT_FDCWD opens. When the fresh
+        // sparse upper proves it cannot affect that path, open the immutable
+        // lower file directly instead of paying resolve_at_path's repeated
+        // intermediate layered lstat walks.
+        if let Some(outcome) = self.try_immutable_lower_absolute_open(dirfd, path, flags) {
+            return Ok(outcome);
+        }
         // `--fs host` trusted-dirfd fast lane: a single-component,
         // non-creating openat through a trusted directory fd is served
         // DIRECTLY against the host dirfd — the fs-walk hot loop — skipping
@@ -2185,7 +2193,7 @@ impl SyscallDispatcher {
     /// The guest directory path + trusted host dirfd behind guest fd `dirfd`,
     /// when its open description is a trusted Directory. `None` for AT_FDCWD,
     /// negative fds, and every untrusted description.
-    pub(super) fn trusted_dir_of(&self, dirfd: u64) -> Option<(String, HostFdRef)> {
+    pub(super) fn trusted_dir_of(&self, dirfd: u64) -> Option<(String, TrustedHostDir)> {
         let fd = dirfd as i32;
         if fd < 0 {
             return None; // AT_FDCWD and friends
@@ -2197,7 +2205,7 @@ impl SyscallDispatcher {
                 path,
                 trusted_host_dir: Some(trusted),
                 ..
-            } => Some((path.clone(), trusted.fd.clone())),
+            } => Some((path.clone(), trusted.clone())),
             _ => None,
         }
     }
@@ -2221,6 +2229,80 @@ impl SyscallDispatcher {
         Some(full)
     }
 
+    /// Direct absolute read from an upper-absent immutable cached lower.
+    /// Every shape whose Linux semantics need the full resolver (relative
+    /// dirfds, final-component nofollow, creates/writes, directories, mounts,
+    /// chroot, DAC/inotify) fails closed to the historical path.
+    fn try_immutable_lower_absolute_open(
+        &self,
+        dirfd: u64,
+        path: &str,
+        flags: u64,
+    ) -> Option<DispatchOutcome> {
+        use std::os::fd::IntoRawFd as _;
+
+        if !trusted_fs_lane_enabled()
+            || dirfd != LINUX_AT_FDCWD
+            || !path.starts_with('/')
+            || self.cred_snapshot().euid != 0
+            || !self.fs.inotify_registry.is_empty()
+        {
+            return None;
+        }
+        let open_flags = LinuxOpenFlags::from_bits_retain(flags);
+        if flags & LINUX_O_ACCMODE != LINUX_O_RDONLY
+            || open_flags.intersects(
+                LinuxOpenFlags::CREAT
+                    | LinuxOpenFlags::TRUNC
+                    | LinuxOpenFlags::EXCL
+                    | LinuxOpenFlags::TMPFILE
+                    | LinuxOpenFlags::PATH
+                    | LinuxOpenFlags::DIRECTORY
+                    | LinuxOpenFlags::NOFOLLOW,
+            )
+        {
+            return None;
+        }
+        if self
+            .io
+            .chroot_root
+            .read()
+            .as_deref()
+            .is_some_and(|root| root != "/")
+            || path.starts_with("/proc")
+            || path.starts_with("/sys")
+            || path.starts_with("/dev")
+            || self.fs.vfs_mounts.resolve(path).is_some()
+        {
+            return None;
+        }
+        let (file, metadata) = match self.fs.rootfs_vfs.open_immutable_lower_readonly(path) {
+            crate::fs_backend::ImmutableHostFileOpen::Served { file, metadata } => (file, metadata),
+            crate::fs_backend::ImmutableHostFileOpen::Missing => {
+                return Some(DispatchOutcome::errno(LINUX_ENOENT));
+            }
+            crate::fs_backend::ImmutableHostFileOpen::Fallback => return None,
+        };
+        let raw = file.into_raw_fd();
+        crate::dispatch::net::set_host_nonblocking(raw);
+        crate::probes::path_open(path, metadata.size as u64, 0);
+        let description = OpenDescription::HostFile {
+            host_fd: HostFdRef::new(raw),
+            metadata,
+            base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
+            writable: false,
+        };
+        let open_file = OpenFile {
+            description: Arc::new(RwLock::new(description)),
+            fd_flags: linux_fd_flags_from_open_flags(flags),
+        };
+        let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
+            return Some(DispatchOutcome::errno(linux_errno::EMFILE));
+        };
+        self.record_fd_open_path(fd, path.to_owned());
+        Some(DispatchOutcome::Returned { value: fd as i64 })
+    }
+
     /// `--fs host` trusted directory open — the lane SEED. A plain read-only
     /// directory open outside every mount is served by ONE contained
     /// `openat(O_DIRECTORY)` with a byte-exact containment proof
@@ -2242,9 +2324,9 @@ impl SyscallDispatcher {
         if !trusted_fs_lane_enabled() {
             return None;
         }
-        // The layered rootfs union and inotify hooks must keep today's path;
-        // chroot rebases absolute resolution, so keep the lane out of it.
-        if self.fs.rootfs_vfs.rootfs.is_some() || !self.fs.inotify_registry.is_empty() {
+        // Inotify hooks must keep today's path; chroot rebases absolute
+        // resolution, so keep the lane out of it.
+        if !self.fs.inotify_registry.is_empty() {
             return None;
         }
         if self
@@ -2262,7 +2344,24 @@ impl SyscallDispatcher {
         if self.fs.vfs_mounts.resolve(path).is_some() {
             return None;
         }
-        let host_fd = self.fs.rootfs_vfs.overlay.open_trusted_dir_fd(path)?;
+        let trusted = if let Some(rootfs) = self.fs.rootfs_vfs.rootfs.as_ref() {
+            // A lower anchor is exact only while the sparse upper contributes
+            // nothing at this directory. Sample the fork-shared structural
+            // generation around both proofs so a concurrent mutation makes
+            // the anchor stale before it can serve a child.
+            let generation = crate::fs_resolve_cache::current_generation();
+            if !self.fs.rootfs_vfs.overlay.fast_nofollow_absent(path) {
+                return None;
+            }
+            let host_fd = rootfs.open_trusted_dir_fd(path)?;
+            if crate::fs_resolve_cache::current_generation() != generation {
+                return None;
+            }
+            TrustedHostDir::immutable_lower(HostFdRef::new(host_fd.into_raw_fd()), generation)
+        } else {
+            let host_fd = self.fs.rootfs_vfs.overlay.open_trusted_dir_fd(path)?;
+            TrustedHostDir::new(HostFdRef::new(host_fd.into_raw_fd()))
+        };
         crate::probes::path_open(path, 0, 0);
         let metadata = RootFsMetadata {
             path: Path::new(path).to_path_buf(),
@@ -2278,7 +2377,7 @@ impl SyscallDispatcher {
             entries: Vec::new(),
             offset: 0,
             base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
-            trusted_host_dir: Some(TrustedHostDir::new(HostFdRef::new(host_fd.into_raw_fd()))),
+            trusted_host_dir: Some(trusted),
         };
         let open_file = OpenFile {
             description: Arc::new(RwLock::new(description)),
@@ -2318,7 +2417,11 @@ impl SyscallDispatcher {
             return None;
         }
         let name = Self::trusted_lane_component(path)?;
-        let (dir_path, host_dir) = self.trusted_dir_of(dirfd)?;
+        let (dir_path, trusted_dir) = self.trusted_dir_of(dirfd)?;
+        if !trusted_dir.namespace_is_current() {
+            return None;
+        }
+        let host_dir = &trusted_dir.fd;
         let full = self.trusted_child_path(&dir_path, name)?;
         // inotify watches need the slow path's IN_OPEN bookkeeping; a
         // non-root euid needs its DAC checks (root — the overwhelming
@@ -2420,7 +2523,13 @@ impl SyscallDispatcher {
                 base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
                 // Single-component + O_NOFOLLOW under a trusted dir preserves
                 // the byte-exact anchor: the served dir is itself trusted.
-                trusted_host_dir: Some(TrustedHostDir::new(HostFdRef::new(fd.into_raw_fd()))),
+                trusted_host_dir: Some(match trusted_dir.immutable_lower_generation {
+                    Some(generation) => TrustedHostDir::immutable_lower(
+                        HostFdRef::new(fd.into_raw_fd()),
+                        generation,
+                    ),
+                    None => TrustedHostDir::new(HostFdRef::new(fd.into_raw_fd())),
+                }),
             };
             let open_file = OpenFile {
                 description: Arc::new(RwLock::new(description)),
@@ -2521,11 +2630,20 @@ impl SyscallDispatcher {
         // already-open fd when metadata xattrs may exist anywhere).
         if path == "." {
             let (dir_path, host_dir) = self.trusted_dir_of(dirfd)?;
+            if !host_dir.namespace_is_current() {
+                return None;
+            }
+            if host_dir.immutable_lower_generation.is_some() {
+                // The layered immutable-rootfs stat intentionally synthesizes
+                // stable guest inode/time fields. A raw fstat of the cache
+                // directory would expose unrelated APFS identity instead.
+                return None;
+            }
             if self.cred_snapshot().euid != 0 {
                 return None;
             }
             let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            if unsafe { libc::fstat(host_dir.raw(), &mut st) } != 0 {
+            if unsafe { libc::fstat(host_dir.fd.raw(), &mut st) } != 0 {
                 return None;
             }
             if st.st_mode as u32 & libc::S_IFMT as u32 != libc::S_IFDIR as u32 {
@@ -2535,7 +2653,7 @@ impl SyscallDispatcher {
             {
                 (None, None, None, false)
             } else {
-                crate::fs_backend::fd_carrick_meta(host_dir.raw())
+                crate::fs_backend::fd_carrick_meta(host_dir.fd.raw())
             };
             let on_disk_mode = st.st_mode as u32 & 0o7777;
             let real = crate::fs_backend::RealStat {
@@ -2560,6 +2678,12 @@ impl SyscallDispatcher {
         }
         let name = Self::trusted_lane_component(path)?;
         let (dir_path, host_dir) = self.trusted_dir_of(dirfd)?;
+        if !host_dir.namespace_is_current() {
+            return None;
+        }
+        if host_dir.immutable_lower_generation.is_some() {
+            return None;
+        }
         let full = self.trusted_child_path(&dir_path, name)?;
         // A non-root euid needs the ancestor search-permission checks.
         if self.cred_snapshot().euid != 0 {
@@ -2569,7 +2693,7 @@ impl SyscallDispatcher {
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         if unsafe {
             libc::fstatat(
-                host_dir.raw(),
+                host_dir.fd.raw(),
                 name_c.as_ptr(),
                 &mut st,
                 libc::AT_SYMLINK_NOFOLLOW,
@@ -2605,7 +2729,8 @@ impl SyscallDispatcher {
                 #[cfg(not(target_os = "macos"))]
                 const O_EVTONLY: libc::c_int = libc::O_RDONLY;
                 let leaf_flags = O_EVTONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
-                let raw = unsafe { libc::openat(host_dir.raw(), name_c.as_ptr(), leaf_flags, 0) };
+                let raw =
+                    unsafe { libc::openat(host_dir.fd.raw(), name_c.as_ptr(), leaf_flags, 0) };
                 if raw < 0 {
                     return None;
                 }
@@ -12526,6 +12651,32 @@ mod tests {
         (scratch, dispatcher)
     }
 
+    /// Cached-lower form of the walk fixture: the immutable image tree is a
+    /// real host directory and the writable host overlay starts sparse.
+    #[cfg(target_os = "macos")]
+    fn trusted_lower_lane_fixture() -> (tempfile::TempDir, tempfile::TempDir, SyscallDispatcher) {
+        let lower = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(lower.path().join("walk/sub")).unwrap();
+        std::fs::write(lower.path().join("walk/file.txt"), b"lower file").unwrap();
+        std::fs::write(lower.path().join("walk/sub/deep.txt"), b"deep").unwrap();
+        std::os::unix::fs::symlink("file.txt", lower.path().join("walk/link")).unwrap();
+        let lower_metadata = crate::fs_backend::HostFsBackend::attach(lower.path()).unwrap();
+        lower_metadata.set_mode("/walk/file.txt", 0o4711).unwrap();
+        lower_metadata.set_owner("/walk/file.txt", 7, 9).unwrap();
+        drop(lower_metadata);
+
+        let rootfs = RootFs::from_immutable_host_dir(lower.path()).unwrap();
+        let upper_dir =
+            cap_std::fs::Dir::open_ambient_dir(upper.path(), cap_std::ambient_authority()).unwrap();
+        let mut overlay = crate::fs_backend::HostFsBackend::from_existing_dir(upper_dir);
+        overlay.enable_sparse_upper_fast_miss();
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(overlay));
+        dispatcher.set_rootfs_layer(rootfs);
+        (lower, upper, dispatcher)
+    }
+
     #[cfg(target_os = "macos")]
     fn lane_syscall(
         dispatcher: &mut SyscallDispatcher,
@@ -12674,6 +12825,149 @@ mod tests {
                 LINUX_O_DIRECTORY
             ),
             -i64::from(LINUX_ENOTDIR.get())
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn trusted_immutable_lower_serves_walk_recursively_while_upper_is_unchanged() {
+        let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+
+        let root = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            "/walk",
+            LINUX_O_DIRECTORY,
+        );
+        assert!(root >= 0, "open lower /walk: {root}");
+        assert!(
+            lane_dir_is_trusted(&dispatcher, root),
+            "an upper-absent immutable-lower directory must seed the trusted lane"
+        );
+
+        let sub = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            root as u64,
+            "sub",
+            LINUX_O_DIRECTORY,
+        );
+        assert!(sub >= 0, "open lower sub: {sub}");
+        assert!(
+            lane_dir_is_trusted(&dispatcher, sub),
+            "unchanged sparse-upper state must propagate lower trust"
+        );
+
+        let file = lane_openat(&mut dispatcher, &mut memory, sub as u64, "deep.txt", 0);
+        assert!(file >= 0, "open lower deep.txt: {file}");
+        let n = lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            63,
+            [file as u64, 0x9000, 64, 0, 0, 0],
+        );
+        assert_eq!(n, 4);
+        assert_eq!(memory.read_bytes(0x9000, 4).unwrap(), b"deep");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn trusted_immutable_lower_falls_back_after_an_upper_shadow() {
+        let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+        let root = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            "/walk",
+            LINUX_O_DIRECTORY,
+        );
+        assert!(root >= 0 && lane_dir_is_trusted(&dispatcher, root));
+
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .set_file_contents("/walk/file.txt", b"upper file".to_vec())
+            .unwrap();
+
+        let file = lane_openat(&mut dispatcher, &mut memory, root as u64, "file.txt", 0);
+        assert!(file >= 0, "open upper shadow through lower dirfd: {file}");
+        let n = lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            63,
+            [file as u64, 0x9000, 64, 0, 0, 0],
+        );
+        assert_eq!(n, 10);
+        assert_eq!(
+            memory.read_bytes(0x9000, 10).unwrap(),
+            b"upper file",
+            "a stale lower anchor must not bypass the writable shadow"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn trusted_immutable_lower_stat_preserves_layered_guest_identity() {
+        let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+        let root = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            "/walk",
+            LINUX_O_DIRECTORY,
+        );
+        assert!(root >= 0 && lane_dir_is_trusted(&dispatcher, root));
+
+        let fast = dispatcher
+            .path_stat_record(root as u64, "file.txt", LINUX_AT_SYMLINK_NOFOLLOW)
+            .unwrap();
+        let slow = dispatcher
+            .path_stat_record(LINUX_AT_FDCWD, "/walk/file.txt", LINUX_AT_SYMLINK_NOFOLLOW)
+            .unwrap();
+        assert_eq!(fast, slow, "trusted lower stat must equal layered stat");
+        assert_eq!(fast.mode & 0o7777, 0o4711);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn absolute_readonly_open_can_install_an_upper_absent_lower_file_directly() {
+        let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
+        let outcome = dispatcher
+            .try_immutable_lower_absolute_open(LINUX_AT_FDCWD, "/walk/file.txt", LINUX_O_RDONLY)
+            .expect("eligible absolute lower open should take the direct lane");
+        let DispatchOutcome::Returned { value: fd } = outcome else {
+            panic!("unexpected direct-open outcome: {outcome:?}");
+        };
+
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+        let n = lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            63,
+            [fd as u64, 0x9000, 64, 0, 0, 0],
+        );
+        assert_eq!(n, 10);
+        assert_eq!(memory.read_bytes(0x9000, 10).unwrap(), b"lower file");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn absolute_lower_fast_open_refuses_nofollow_symlink_semantics() {
+        let (_lower, _upper, dispatcher) = trusted_lower_lane_fixture();
+        assert!(
+            dispatcher
+                .try_immutable_lower_absolute_open(
+                    LINUX_AT_FDCWD,
+                    "/walk/link",
+                    LINUX_O_RDONLY | LinuxOpenFlags::NOFOLLOW.bits(),
+                )
+                .is_none(),
+            "O_NOFOLLOW must reach the layered lstat path and return ELOOP"
         );
     }
 

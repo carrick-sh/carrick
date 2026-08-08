@@ -62,6 +62,9 @@ impl SyscallDispatcher {
         }
         let name = Self::trusted_lane_component(path)?;
         let (dir_path, host_dir) = self.trusted_dir_of(dirfd)?;
+        if !host_dir.namespace_is_current() {
+            return None;
+        }
         self.trusted_child_path(&dir_path, name)?;
         // access(2) checks the REAL ids; mirror `fast_root_f_ok_absolute`.
         if self.cred_snapshot().ruid != 0 {
@@ -71,7 +74,7 @@ impl SyscallDispatcher {
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         if unsafe {
             libc::fstatat(
-                host_dir.raw(),
+                host_dir.fd.raw(),
                 name_c.as_ptr(),
                 &mut st,
                 libc::AT_SYMLINK_NOFOLLOW,

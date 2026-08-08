@@ -1,5 +1,6 @@
 #!/bin/sh
-# Build the release binary AND re-sign it with the hypervisor entitlement.
+# Build the release binary, stamp Carrick's qualified Darwin ABI contract, and
+# re-sign it with the hypervisor entitlement.
 # `cargo build --release` strips the codesignature on macOS; an unsigned binary
 # fails every guest run with HV_DENIED (0xfae94007). Always build via this so
 # the binary is never left unsigned.
@@ -58,21 +59,21 @@ if [ ! -x "$built" ]; then
     echo "build-signed: expected binary not found at $built" >&2
     exit 1
 fi
-if [ "$built" != "$signed" ]; then
-    # Shared CARGO_TARGET_DIR: materialise ATOMICALLY — sign a temp copy, then
-    # rename(2) it into place. `cp -f` rewrites the dest inode in place, so a
-    # concurrent guest exec() of ./target/release/carrick during the copy would
-    # otherwise open a truncated Mach-O (ETXTBSY/SIGBUS). rename is atomic on the
-    # same fs, so an exec sees the whole old or whole new binary, never a torn one.
-    mkdir -p target/release
-    tmp="$signed.tmp.$$"
-    trap 'rm -f "$tmp"' EXIT
-    cp -f "$built" "$tmp"
-    codesign --force --sign - --entitlements "$entitlements" "$tmp"
-    mv -f "$tmp" "$signed"
-else
-    # Unset CARGO_TARGET_DIR (common case): sign in place. codesign itself writes
-    # via a temp + rename, so the in-place case is already atomic.
-    codesign --force --sign - --entitlements "$entitlements" "$signed"
-fi
+# XNU's arm64 exception-return policy preserves physical x18 for binaries
+# linked against the pre-macOS-13 ABI. Tier D proves that behavior again at
+# runtime before using x18; if Apple changes it, Carrick refuses dynamic code
+# rather than trusting this metadata. The private custom-x18 entitlement is
+# intentionally NOT used: ad-hoc signed binaries carrying it are killed by
+# AMFI on current macOS.
+#
+# Always materialise ATOMICALLY — vtool requires distinct input/output paths,
+# and rename(2) means a concurrent exec sees the complete old or new binary.
+mkdir -p target/release
+raw="$signed.raw.$$"
+tmp="$signed.tmp.$$"
+trap 'rm -f "$raw" "$tmp"' EXIT
+cp -f "$built" "$raw"
+/usr/bin/vtool -set-build-version macos 11.0 12.0 -replace -output "$tmp" "$raw"
+codesign --force --sign - --entitlements "$entitlements" "$tmp"
+mv -f "$tmp" "$signed"
 echo "built + signed: $signed (from $built, entitlements=$entitlements)"

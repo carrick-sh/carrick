@@ -93,6 +93,10 @@ use flate2::read::GzDecoder;
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::fs_backend::{
+    FsBackend, HostFsBackend, HostFsReexecAuthority, ImmutableHostFileOpen, RealStat,
+};
+
 const WHITEOUT_PREFIX: &str = ".wh.";
 const OPAQUE_WHITEOUT: &str = ".wh..wh..opq";
 
@@ -102,12 +106,54 @@ pub enum LayerSource {
     TarGz(Vec<u8>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RootFs {
     files: HashMap<PathBuf, FileEntry>,
     directories: HashSet<PathBuf>,
     symlinks: HashMap<PathBuf, SymlinkEntry>,
+    /// Optional immutable on-disk lower. Skipped from the historical summary
+    /// serialization: native reexec carries the explicit identity-checked
+    /// authority below, never a lossy serialized `RootFs` snapshot.
+    #[serde(skip)]
+    immutable_host: Option<ImmutableHostRoot>,
 }
+
+#[derive(Debug, Clone)]
+struct ImmutableHostRoot {
+    backend: Arc<HostFsBackend>,
+    authority: ImmutableHostRootAuthority,
+}
+
+/// Exact authority for reopening a shared immutable host lower after native
+/// PID-preserving self-reexec. Unlike the writable upper authority, cleanup is
+/// forbidden: no process that merely consumes a cache entry may delete it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ImmutableHostRootAuthority(HostFsReexecAuthority);
+
+impl ImmutableHostRootAuthority {
+    pub(crate) fn capsule_shape_is_valid(&self, max_path_len: usize) -> bool {
+        !self.0.cleanup_on_drop
+            && !self.0.root_path.is_empty()
+            && self.0.root_path.len() <= max_path_len
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_cleanup_on_drop_for_test(&mut self, cleanup: bool) {
+        self.0.cleanup_on_drop = cleanup;
+    }
+}
+
+impl PartialEq for RootFs {
+    fn eq(&self, other: &Self) -> bool {
+        self.files == other.files
+            && self.directories == other.directories
+            && self.symlinks == other.symlinks
+            && self.immutable_host.as_ref().map(|host| &host.authority)
+                == other.immutable_host.as_ref().map(|host| &host.authority)
+    }
+}
+
+impl Eq for RootFs {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FileEntry {
@@ -395,6 +441,7 @@ impl RootFs {
             files: HashMap::new(),
             directories: HashSet::from([PathBuf::new()]),
             symlinks: HashMap::new(),
+            immutable_host: None,
         };
 
         for layer in layers {
@@ -416,7 +463,85 @@ impl RootFs {
         Self::from_layers(layers)
     }
 
+    /// Bind an already-published cache directory as the immutable lower.
+    /// Reads are capability-rooted through [`HostFsBackend`], while this type
+    /// deliberately exposes no mutation methods for the lower.
+    pub(crate) fn from_immutable_host_dir(path: &Path) -> Result<Self, RootFsError> {
+        let backend = HostFsBackend::attach(path)?;
+        let authority = backend.native_reexec_authority()?;
+        if authority.cleanup_on_drop {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "immutable host lower unexpectedly owns cleanup",
+            )
+            .into());
+        }
+        Ok(Self {
+            files: HashMap::new(),
+            directories: HashSet::new(),
+            symlinks: HashMap::new(),
+            immutable_host: Some(ImmutableHostRoot {
+                backend: Arc::new(backend),
+                authority: ImmutableHostRootAuthority(authority),
+            }),
+        })
+    }
+
+    pub(crate) fn immutable_host_authority(&self) -> Option<ImmutableHostRootAuthority> {
+        self.immutable_host
+            .as_ref()
+            .map(|host| host.authority.clone())
+    }
+
+    pub(crate) fn from_immutable_host_authority(
+        authority: &ImmutableHostRootAuthority,
+    ) -> Result<Self, RootFsError> {
+        if authority.0.cleanup_on_drop {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "immutable host lower authority requested cleanup",
+            )
+            .into());
+        }
+        let backend = HostFsBackend::attach_for_reexec(&authority.0)?;
+        Ok(Self {
+            files: HashMap::new(),
+            directories: HashSet::new(),
+            symlinks: HashMap::new(),
+            immutable_host: Some(ImmutableHostRoot {
+                backend: Arc::new(backend),
+                authority: authority.clone(),
+            }),
+        })
+    }
+
     pub fn summary(&self) -> RootFsSummary {
+        if let Some(host) = self.immutable_host.as_ref() {
+            let mut summary = RootFsSummary {
+                file_count: 0,
+                directory_count: 1,
+                symlink_count: 0,
+            };
+            let mut pending = vec![String::from("/")];
+            while let Some(dir) = pending.pop() {
+                for (name, kind, _) in host.backend.child_names(&dir) {
+                    let path = if dir == "/" {
+                        format!("/{name}")
+                    } else {
+                        format!("{dir}/{name}")
+                    };
+                    match kind {
+                        RootFsEntryKind::Directory => {
+                            summary.directory_count += 1;
+                            pending.push(path);
+                        }
+                        RootFsEntryKind::Symlink => summary.symlink_count += 1,
+                        _ => summary.file_count += 1,
+                    }
+                }
+            }
+            return summary;
+        }
         RootFsSummary {
             file_count: self.files.len(),
             directory_count: self.directories.len(),
@@ -493,10 +618,23 @@ impl RootFs {
     }
 
     pub fn read(&self, path: impl AsRef<Path>) -> Result<Vec<u8>, RootFsError> {
+        if let Some(host) = self.immutable_host.as_ref() {
+            return host
+                .backend
+                .file_contents(path.as_ref().to_string_lossy().as_ref())
+                .ok_or_else(|| RootFsError::NotFound(display_rootfs_path(path.as_ref())));
+        }
         Ok(self.read_shared(path)?.as_ref().to_vec())
     }
 
     pub fn read_shared(&self, path: impl AsRef<Path>) -> Result<Arc<[u8]>, RootFsError> {
+        if let Some(host) = self.immutable_host.as_ref() {
+            return host
+                .backend
+                .file_contents(path.as_ref().to_string_lossy().as_ref())
+                .map(Arc::from)
+                .ok_or_else(|| RootFsError::NotFound(display_rootfs_path(path.as_ref())));
+        }
         let path = normalize_rootfs_path(path.as_ref())?;
         let path = self.resolve_symlink(&path, 0)?;
         self.files
@@ -505,11 +643,65 @@ impl RootFs {
             .ok_or_else(|| RootFsError::NotFound(display_rootfs_path(&path)))
     }
 
+    /// Read at most `max` leading bytes without materializing the whole host
+    /// file when this root is backed by an immutable cache directory.
+    pub fn read_head(&self, path: impl AsRef<Path>, max: usize) -> Result<Vec<u8>, RootFsError> {
+        if let Some(host) = self.immutable_host.as_ref() {
+            return host
+                .backend
+                .file_head(path.as_ref().to_string_lossy().as_ref(), max)
+                .ok_or_else(|| RootFsError::NotFound(display_rootfs_path(path.as_ref())));
+        }
+        let mut bytes = self.read(path)?;
+        bytes.truncate(max);
+        Ok(bytes)
+    }
+
+    pub fn open_file_readonly(&self, path: impl AsRef<Path>) -> Option<std::fs::File> {
+        self.immutable_host
+            .as_ref()?
+            .backend
+            .open_file_readonly(path.as_ref().to_string_lossy().as_ref())
+    }
+
+    /// Open or authoritatively miss a regular file in the immutable host root.
+    /// On Darwin this reaches the contained fd-centric backend lane instead of
+    /// separately walking the path for metadata and the readable fd.
+    pub(crate) fn open_immutable_file_readonly(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> ImmutableHostFileOpen {
+        let Some(host) = self.immutable_host.as_ref() else {
+            return ImmutableHostFileOpen::Fallback;
+        };
+        host.backend
+            .open_immutable_file_readonly(path.as_ref().to_string_lossy().as_ref())
+    }
+
+    /// Open a byte-exact directory anchor in the immutable host lower.
+    /// Callers must separately prove that the writable overlay cannot affect
+    /// the path and invalidate that proof on every structural generation.
+    pub(crate) fn open_trusted_dir_fd(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Option<std::os::fd::OwnedFd> {
+        self.immutable_host
+            .as_ref()?
+            .backend
+            .open_trusted_dir_fd(path.as_ref().to_string_lossy().as_ref())
+    }
+
     pub fn read_to_string(&self, path: impl AsRef<Path>) -> Result<String, RootFsError> {
         Ok(String::from_utf8(self.read(path)?)?)
     }
 
     pub fn read_link(&self, path: impl AsRef<Path>) -> Result<String, RootFsError> {
+        if let Some(host) = self.immutable_host.as_ref() {
+            return host
+                .backend
+                .read_link(path.as_ref().to_string_lossy().as_ref())
+                .ok_or_else(|| RootFsError::NotFound(display_rootfs_path(path.as_ref())));
+        }
         let path = normalize_rootfs_path(path.as_ref())?;
         self.symlinks
             .get(&path)
@@ -518,6 +710,25 @@ impl RootFs {
     }
 
     pub fn list_dir(&self, path: impl AsRef<Path>) -> Result<Vec<String>, RootFsError> {
+        if let Some(host) = self.immutable_host.as_ref() {
+            let path_text = path.as_ref().to_string_lossy();
+            if !matches!(
+                host.backend.real_stat(path_text.as_ref(), true),
+                Some(RealStat {
+                    kind: RootFsEntryKind::Directory,
+                    ..
+                })
+            ) {
+                return Err(RootFsError::NotFound(display_rootfs_path(path.as_ref())));
+            }
+            let names = host
+                .backend
+                .child_names(path_text.as_ref())
+                .into_iter()
+                .map(|(name, _, _)| name)
+                .collect::<BTreeSet<_>>();
+            return Ok(names.into_iter().collect());
+        }
         let dir = normalize_rootfs_path(path.as_ref())?;
         if !self.directories.contains(&dir) {
             return Err(RootFsError::NotFound(display_rootfs_path(&dir)));
@@ -535,12 +746,18 @@ impl RootFs {
     }
 
     pub fn metadata(&self, path: impl AsRef<Path>) -> Result<RootFsMetadata, RootFsError> {
+        if let Some(host) = self.immutable_host.as_ref() {
+            return host_metadata(host, path.as_ref(), true);
+        }
         let path = normalize_rootfs_path(path.as_ref())?;
         let path = self.resolve_symlink(&path, 0)?;
         self.metadata_for_normalized(&path)
     }
 
     pub fn symlink_metadata(&self, path: impl AsRef<Path>) -> Result<RootFsMetadata, RootFsError> {
+        if let Some(host) = self.immutable_host.as_ref() {
+            return host_metadata(host, path.as_ref(), false);
+        }
         let path = normalize_rootfs_path(path.as_ref())?;
         self.metadata_for_normalized(&path)
     }
@@ -549,6 +766,48 @@ impl RootFs {
         &self,
         path: impl AsRef<Path>,
     ) -> Result<Vec<RootFsDirEntry>, RootFsError> {
+        if let Some(host) = self.immutable_host.as_ref() {
+            let dir = normalize_rootfs_path(path.as_ref())?;
+            let dir_text = display_rootfs_path(&dir);
+            if !matches!(
+                host.backend.real_stat(&dir_text, true),
+                Some(RealStat {
+                    kind: RootFsEntryKind::Directory,
+                    ..
+                })
+            ) {
+                return Err(RootFsError::NotFound(dir_text));
+            }
+            return host
+                .backend
+                .child_names(&display_rootfs_path(&dir))
+                .into_iter()
+                .map(|(name, kind, known_size)| {
+                    let child = dir.join(&name);
+                    let child_text = display_rootfs_path(&child);
+                    let stat = host.backend.real_stat(&child_text, false);
+                    Ok(RootFsDirEntry {
+                        name,
+                        metadata: RootFsMetadata {
+                            path: child,
+                            kind: stat.map(|value| value.kind).unwrap_or(kind),
+                            mode: stat.map(|value| value.mode).unwrap_or(
+                                if kind == RootFsEntryKind::Directory {
+                                    0o755
+                                } else {
+                                    0o644
+                                },
+                            ),
+                            size: stat
+                                .and_then(|value| usize::try_from(value.size).ok())
+                                .or_else(|| known_size.and_then(|size| usize::try_from(size).ok()))
+                                .unwrap_or(0),
+                        },
+                        ino: stat.map(|value| value.ino).unwrap_or(0),
+                    })
+                })
+                .collect();
+        }
         let dir = normalize_rootfs_path(path.as_ref())?;
         if !self.directories.contains(&dir) {
             return Err(RootFsError::NotFound(display_rootfs_path(&dir)));
@@ -569,6 +828,12 @@ impl RootFs {
     }
 
     pub fn contains(&self, path: impl AsRef<Path>) -> Result<bool, RootFsError> {
+        if let Some(host) = self.immutable_host.as_ref() {
+            return Ok(host
+                .backend
+                .real_stat(path.as_ref().to_string_lossy().as_ref(), false)
+                .is_some());
+        }
         let path = normalize_rootfs_path(path.as_ref())?;
         Ok(self.files.contains_key(&path)
             || self.directories.contains(&path)
@@ -780,6 +1045,25 @@ impl RootFs {
 
         Err(RootFsError::NotFound(display_rootfs_path(path)))
     }
+}
+
+fn host_metadata(
+    host: &ImmutableHostRoot,
+    path: &Path,
+    follow: bool,
+) -> Result<RootFsMetadata, RootFsError> {
+    let normalized = normalize_rootfs_path(path)?;
+    let display = display_rootfs_path(&normalized);
+    let stat = host
+        .backend
+        .real_stat(&display, follow)
+        .ok_or_else(|| RootFsError::NotFound(display.clone()))?;
+    Ok(RootFsMetadata {
+        path: normalized,
+        kind: stat.kind,
+        mode: stat.mode,
+        size: usize::try_from(stat.size).unwrap_or(usize::MAX),
+    })
 }
 
 impl LayerSource {

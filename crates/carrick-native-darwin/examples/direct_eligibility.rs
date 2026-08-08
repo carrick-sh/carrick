@@ -54,6 +54,9 @@ fn main() {
                     DirectIneligible::IslandOutOfRange { .. } => "island-range",
                     DirectIneligible::HostTsdLayoutUnproven { .. } => "host-tsd",
                     DirectIneligible::HostRuntimeStubUnavailable { .. } => "host-stub",
+                    DirectIneligible::DynamicPublicationHookUnsupported { .. } => {
+                        "dynamic-publication"
+                    }
                 };
                 println!("{name:<24} tier T    [{bucket}] {reason}");
             }

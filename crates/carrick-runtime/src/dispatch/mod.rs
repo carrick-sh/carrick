@@ -2693,6 +2693,14 @@ impl SyscallDispatcher {
         self.fs.rootfs_vfs.set_overlay(backend)
     }
 
+    /// Install an immutable lower beneath the current writable backend. Used
+    /// by Darwin's cached-rootfs setup, which constructs the network-aware
+    /// dispatcher before the layer cache is acquired.
+    pub fn set_rootfs_layer(&mut self, rootfs: RootFs) {
+        self.fs.rootfs_vfs.rootfs = Some(rootfs);
+        self.exec_host_fs_fallback = false;
+    }
+
     /// Drop the immutable in-memory rootfs layer. Valid ONLY once the
     /// overlay backend holds the complete materialised filesystem (i.e.
     /// after `HostFsBackend::seed_from_rootfs` for `--fs host`): from then
@@ -2796,6 +2804,16 @@ impl SyscallDispatcher {
         self.fs.rootfs_vfs.overlay.native_reexec_authority()
     }
 
+    pub(crate) fn native_lower_rootfs_reexec_authority(
+        &self,
+    ) -> Option<crate::rootfs::ImmutableHostRootAuthority> {
+        self.fs
+            .rootfs_vfs
+            .rootfs
+            .as_ref()
+            .and_then(RootFs::immutable_host_authority)
+    }
+
     // Native self-reexec's production callers (`native_darwin.rs` and
     // `native_exec_capsule.rs`'s `begin_guest_exec`) are lane-gated to
     // macOS/aarch64; this crate's own portable round-trip tests
@@ -2839,8 +2857,15 @@ impl SyscallDispatcher {
     /// alone would miss). Returns None if the path isn't a readable
     /// file in either layer.
     pub fn read_exec_file(&self, path: &str) -> Option<Vec<u8>> {
-        if let Some(bytes) = self.fs.rootfs_vfs.overlay.file_contents(path) {
-            return Some(bytes);
+        match self.fs.rootfs_vfs.overlay.lookup_kind(path) {
+            Some(crate::fs_backend::OverlayEntryKind::File) => {
+                // An owned upper entry shadows the lower even when it is not a
+                // readable regular file (broken symlink/FIFO/etc.).
+                return self.fs.rootfs_vfs.overlay.file_contents(path);
+            }
+            Some(crate::fs_backend::OverlayEntryKind::Dir)
+            | Some(crate::fs_backend::OverlayEntryKind::Deleted) => return None,
+            None => {}
         }
         if let Some(bytes) = self
             .fs
@@ -2868,17 +2893,22 @@ impl SyscallDispatcher {
     /// multi-MB tool binary per probe (twice per exec, before the loader's
     /// own read) on the cold `go build`.
     pub fn read_exec_file_head(&self, path: &str, max: usize) -> Option<Vec<u8>> {
-        if let Some(bytes) = self.fs.rootfs_vfs.overlay.file_head(path, max) {
-            return Some(bytes);
+        match self.fs.rootfs_vfs.overlay.lookup_kind(path) {
+            Some(crate::fs_backend::OverlayEntryKind::File) => {
+                return self.fs.rootfs_vfs.overlay.file_head(path, max);
+            }
+            Some(crate::fs_backend::OverlayEntryKind::Dir)
+            | Some(crate::fs_backend::OverlayEntryKind::Deleted) => return None,
+            None => {}
         }
-        if let Some(shared) = self
+        if let Some(bytes) = self
             .fs
             .rootfs_vfs
             .rootfs
             .as_ref()
-            .and_then(|r| r.read_shared(path).ok())
+            .and_then(|r| r.read_head(path, max).ok())
         {
-            return Some(shared[..shared.len().min(max)].to_vec());
+            return Some(bytes);
         }
         self.fs
             .vfs_mounts
@@ -2898,7 +2928,19 @@ impl SyscallDispatcher {
     /// overlay is consulted FIRST in `read_exec_file` too, so when both this
     /// and the layered read answer, they answer from the same inode.
     pub fn open_exec_host_file(&self, path: &str) -> Option<std::fs::File> {
-        self.fs.rootfs_vfs.overlay.open_file_readonly(path)
+        match self.fs.rootfs_vfs.overlay.lookup_kind(path) {
+            Some(crate::fs_backend::OverlayEntryKind::File) => {
+                self.fs.rootfs_vfs.overlay.open_file_readonly(path)
+            }
+            Some(crate::fs_backend::OverlayEntryKind::Dir)
+            | Some(crate::fs_backend::OverlayEntryKind::Deleted) => None,
+            None => self
+                .fs
+                .rootfs_vfs
+                .rootfs
+                .as_ref()
+                .and_then(|rootfs| rootfs.open_file_readonly(path)),
+        }
     }
 
     /// Dup the HOST descriptor behind an ordinary host-backed guest file fd.
@@ -2922,6 +2964,33 @@ impl SyscallDispatcher {
             }
             _ => None,
         }
+    }
+
+    /// Failure-only description of a guest fd for Tier-D diagnostics.
+    ///
+    /// Keep this off the success path: shared-file mmap is latency-sensitive,
+    /// while a Tier-D refusal needs enough evidence to distinguish a missing fd
+    /// from an in-memory rootfs file or a synthetic descriptor.
+    pub(crate) fn describe_fd_for_diagnostic(&self, fd: i32) -> String {
+        let recorded_path = self.io.fd_open_paths.read().get(&fd).cloned();
+        let Some(open_file) = self.open_file(fd) else {
+            return format!("missing path={recorded_path:?}");
+        };
+        let open = open_file.description.read();
+        let detail = match &*open {
+            OpenDescription::HostFile { .. } => "host-file".to_string(),
+            OpenDescription::File { path, .. } => {
+                format!("memory-file embedded_path={path:?}")
+            }
+            OpenDescription::SyntheticFile { path, .. } => {
+                format!("synthetic-file embedded_path={path:?}")
+            }
+            OpenDescription::Directory { path, .. } => {
+                format!("directory embedded_path={path:?}")
+            }
+            _ => "non-regular".to_string(),
+        };
+        format!("{detail} recorded_path={recorded_path:?}")
     }
 
     pub fn stdout(&self) -> Vec<u8> {
@@ -5786,6 +5855,12 @@ fn read_eventfd(
                 errno: LINUX_EFAULT,
             };
         }
+        crate::event_ring::rec(
+            crate::event_ring::EFDREAD,
+            state.read_fd.as_ref().map_or(-1, |fd| fd.raw()),
+            current as u32 as i32,
+            (current - taken) as u32 as i32,
+        );
         // Keep the host readiness pipe in sync (drains it when the counter
         // hits 0, so the read end stops being readable; EFD_SEMAPHORE keeps it
         // readable while the counter is still > 0).
@@ -5837,6 +5912,12 @@ fn write_eventfd(this: &SyscallDispatcher, bytes: &[u8], state: &EventFdState) -
         {
             continue; // raced another writer/reader — re-derive
         }
+        crate::event_ring::rec(
+            crate::event_ring::EFDWRITE,
+            state.read_fd.as_ref().map_or(-1, |fd| fd.raw()),
+            current as u32 as i32,
+            next as u32 as i32,
+        );
         // Mirror readiness onto the host pipe so the epoll instance kqueue sees
         // it natively (level-triggered, can't be lost) — the robust path for
         // Go's netpollBreak — and so a sibling PROCESS parked on the pipe wakes.
@@ -7543,6 +7624,29 @@ mod overlay_dispatch_tests {
     }
 
     #[test]
+    fn eventfd_write_records_the_host_readiness_transition() {
+        const EVENTFD_WRITE_EVENT: u8 = 21;
+        let dispatcher = SyscallDispatcher::new();
+        let state = EventFdState::new(0x0102_0304);
+        let host_read_fd = state.read_fd.as_ref().expect("readiness pipe").raw();
+        let increment = LinuxEventfdValue { value: 7 };
+
+        assert!(matches!(
+            write_eventfd(&dispatcher, increment.as_bytes(), &state),
+            DispatchOutcome::Returned { value: 8 }
+        ));
+        assert!(
+            crate::event_ring::contains_event(
+                EVENTFD_WRITE_EVENT,
+                host_read_fd,
+                0x0102_0304,
+                0x0102_030b,
+            ),
+            "the always-on ring must bind an eventfd write to its host readiness fd"
+        );
+    }
+
+    #[test]
     fn fd_install_helpers_reserve_single_and_pair_slots_atomically() {
         let dispatcher = SyscallDispatcher::new();
 
@@ -7964,6 +8068,87 @@ mod overlay_dispatch_tests {
             builder.finish().unwrap();
         }
         RootFs::from_layers(std::iter::once(LayerSource::Tar(buf))).unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn dispatcher_with_host_lower(
+        lower: &std::path::Path,
+        upper: &std::path::Path,
+    ) -> SyscallDispatcher {
+        let rootfs = RootFs::from_immutable_host_dir(lower).unwrap();
+        let upper_dir =
+            cap_std::fs::Dir::open_ambient_dir(upper, cap_std::ambient_authority()).unwrap();
+        let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+        dispatcher.set_fs_backend(Box::new(
+            crate::fs_backend::HostFsBackend::from_existing_dir(upper_dir),
+        ));
+        dispatcher
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exec_helpers_use_bounded_reads_and_host_files_from_immutable_lower() {
+        use std::io::Read as _;
+
+        let lower = tempfile::TempDir::new().unwrap();
+        let upper = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(lower.path().join("bin")).unwrap();
+        let mut payload = b"#!/bin/sh\n".to_vec();
+        payload.resize(2 * 1024 * 1024, b'x');
+        std::fs::write(lower.path().join("bin/tool"), &payload).unwrap();
+
+        let dispatcher = dispatcher_with_host_lower(lower.path(), upper.path());
+        assert_eq!(
+            dispatcher.read_exec_file_head("/bin/tool", 4).as_deref(),
+            Some(&b"#!/b"[..])
+        );
+        let mut file = dispatcher
+            .open_exec_host_file("/bin/tool")
+            .expect("lower executable should remain file-backed");
+        let mut head = [0_u8; 4];
+        file.read_exact(&mut head).unwrap();
+        assert_eq!(&head, b"#!/b");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exec_helpers_never_resurrect_a_shadowed_or_tombstoned_lower() {
+        use std::io::Read as _;
+
+        let lower = tempfile::TempDir::new().unwrap();
+        let upper = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(lower.path().join("bin")).unwrap();
+        std::fs::write(lower.path().join("bin/tool"), b"lower").unwrap();
+        let dispatcher = dispatcher_with_host_lower(lower.path(), upper.path());
+
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .set_file_contents("/bin/tool", b"upper".to_vec())
+            .unwrap();
+        assert_eq!(
+            dispatcher.read_exec_file("/bin/tool").as_deref(),
+            Some(&b"upper"[..])
+        );
+        let mut upper_file = dispatcher.open_exec_host_file("/bin/tool").unwrap();
+        let mut bytes = Vec::new();
+        upper_file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"upper");
+
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .mark_deleted("/bin/tool")
+            .unwrap();
+        assert!(dispatcher.read_exec_file("/bin/tool").is_none());
+        assert!(dispatcher.read_exec_file_head("/bin/tool", 4).is_none());
+        assert!(dispatcher.open_exec_host_file("/bin/tool").is_none());
+        assert_eq!(
+            std::fs::read(lower.path().join("bin/tool")).unwrap(),
+            b"lower"
+        );
     }
 
     struct Harness {

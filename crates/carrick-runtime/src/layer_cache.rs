@@ -34,6 +34,33 @@ const CACHE_DIR: &str = ".carrick-layer-cache";
 /// otherwise keep serving trees materialized by an older, buggy extractor.
 const CACHE_FORMAT_VERSION: &[u8] = b"v2-hardlink-replacement";
 
+/// Acquire the published, digest-keyed extraction for `layer_paths` without
+/// creating or populating a per-run scratch directory.
+///
+/// The returned directory is shared across runs and is an IMMUTABLE lower
+/// authority. Callers must never expose mutation through it. `scratch_root` is
+/// explicit so the cache stays on the configured volume alongside the sparse
+/// writable uppers that consume it.
+pub(crate) fn acquire_immutable_entry(
+    layer_paths: &[PathBuf],
+    scratch_root: &Path,
+) -> std::io::Result<Option<PathBuf>> {
+    if layer_paths.is_empty() {
+        return Ok(None);
+    }
+    let cache_root = scratch_root.join(CACHE_DIR);
+    let entry = cache_root.join(stack_key(layer_paths)?);
+
+    if !published_cache_entry(&entry) && !build_cache_entry(layer_paths, &cache_root, &entry)? {
+        return Ok(None);
+    }
+    Ok(published_cache_entry(&entry).then_some(entry))
+}
+
+fn published_cache_entry(entry: &Path) -> bool {
+    std::fs::symlink_metadata(entry).is_ok_and(|metadata| metadata.file_type().is_dir())
+}
+
 /// Try to seed `scratch` (an existing, empty per-run dir) from the clonefile
 /// cache for `layer_paths`. Returns `Ok(true)` when the scratch was populated
 /// via the cache, `Ok(false)` when the cache is unusable and the caller should
@@ -53,15 +80,12 @@ pub fn try_seed_scratch(layer_paths: &[PathBuf], scratch: &Path) -> std::io::Res
             cache_has_mode_xattrs: false,
         });
     };
-    let cache_root = scratch_root.join(CACHE_DIR);
-    let entry = cache_root.join(stack_key(layer_paths)?);
-
-    if !entry.exists() && !build_cache_entry(layer_paths, &cache_root, &entry)? {
+    let Some(entry) = acquire_immutable_entry(layer_paths, scratch_root)? else {
         return Ok(SeedOutcome {
             cloned: false,
             cache_has_mode_xattrs: false,
         });
-    }
+    };
     let cloned = clone_children_into(&entry, scratch)?;
     Ok(SeedOutcome {
         cloned,
@@ -111,11 +135,9 @@ pub fn overlay_seed_scratch(
     let Some(scratch_root) = scratch.parent() else {
         return Ok(None);
     };
-    let cache_root = scratch_root.join(CACHE_DIR);
-    let entry = cache_root.join(stack_key(layer_paths)?);
-    if !entry.exists() && !build_cache_entry(layer_paths, &cache_root, &entry)? {
+    let Some(entry) = acquire_immutable_entry(layer_paths, scratch_root)? else {
         return Ok(None);
-    }
+    };
     let upper = scratch.join("upper");
     let work = scratch.join("work");
     let merged = scratch.join("merged");
@@ -697,6 +719,76 @@ fn remove_path(p: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_layer(path: &Path, guest_path: &str, contents: &[u8]) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut builder = tar::Builder::new(file);
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(contents.len() as u64);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, guest_path, contents)
+            .unwrap();
+        builder.finish().unwrap();
+    }
+
+    #[test]
+    fn immutable_entry_is_reused_without_populating_a_scratch() {
+        let temp = tempfile::tempdir().unwrap();
+        let sources = temp.path().join("layers");
+        std::fs::create_dir(&sources).unwrap();
+        let layer = sources.join("sha256-reused-layer");
+        write_layer(&layer, "etc/carrick-release", b"immutable\n");
+
+        let first = acquire_immutable_entry(std::slice::from_ref(&layer), temp.path())
+            .unwrap()
+            .expect("valid layer stack must publish an immutable entry");
+        let second = acquire_immutable_entry(&[layer], temp.path())
+            .unwrap()
+            .expect("published entry must be reusable");
+
+        assert_eq!(first, second);
+        assert_eq!(first.parent(), Some(temp.path().join(CACHE_DIR).as_path()));
+        assert_eq!(
+            std::fs::read(first.join("etc/carrick-release")).unwrap(),
+            b"immutable\n"
+        );
+        assert!(
+            std::fs::read_dir(temp.path()).unwrap().all(|entry| {
+                let name = entry.unwrap().file_name();
+                name == CACHE_DIR || name == "layers"
+            }),
+            "acquiring a lower must not allocate or populate a per-run scratch"
+        );
+    }
+
+    #[test]
+    fn immutable_entry_keys_changed_stacks_and_ignores_incomplete_builds() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_root = temp.path().join(CACHE_DIR);
+        let incomplete = cache_root.join(".building-orphan");
+        std::fs::create_dir_all(&incomplete).unwrap();
+        std::fs::write(incomplete.join("poison"), b"not-published").unwrap();
+
+        let first_layer = temp.path().join("sha256-first-layer");
+        let second_layer = temp.path().join("sha256-second-layer");
+        write_layer(&first_layer, "payload", b"one");
+        write_layer(&second_layer, "payload", b"two-two");
+
+        let first = acquire_immutable_entry(&[first_layer], temp.path())
+            .unwrap()
+            .expect("first stack");
+        let second = acquire_immutable_entry(&[second_layer], temp.path())
+            .unwrap()
+            .expect("changed stack");
+
+        assert_ne!(first, second, "changed stacks need distinct authorities");
+        assert_ne!(first, incomplete);
+        assert_ne!(second, incomplete);
+        assert_eq!(std::fs::read(first.join("payload")).unwrap(), b"one");
+        assert_eq!(std::fs::read(second.join("payload")).unwrap(), b"two-two");
+    }
 
     #[test]
     fn stack_key_is_stable_and_order_sensitive() {
