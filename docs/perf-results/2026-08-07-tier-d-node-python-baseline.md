@@ -217,3 +217,49 @@ is supporting diagnosis, not yet sufficient authority for code: Wave 2 must
 bind an Arm-encoding family mask, valid-neighbor mutations, and both real
 corpus regressions before allowing the word through the scanner. A banner-word
 whitelist remains forbidden.
+
+## Wave-1 closeout
+
+Wave 1 closed on source `2fcf390624ea4742e539d76a68918ba56f494774`.
+The codesign-verified release binary SHA-256 was:
+
+```text
+a10ff9dec776a22c4eace2f9080d85280580f81a618f987122bca510506e3639
+```
+
+The final eight-suite command was the Task-5 command in the implementation
+plan, with census
+`target/conformance/tierd-wave1-final.census.log` and results
+`target/conformance/tierd-wave1-final.jsonl`.
+
+| gate | Wave-1 final result | diagnostic elapsed |
+|---|---|---:|
+| `node-app-smoke` | MATCH, Node main refused only on new `0x61206272` | 8,486 / 402 ms = 21.11x |
+| `node-v8-smoke` | MATCH, Node main refused only on new `0x61206272` | 9,459 / 403 ms = 23.47x |
+| `cpython-fcntl` | **MATCH 8/8**, direct, no record-lock leave | 7,411 / 603 ms = 12.29x |
+| `cpython-glob` | MATCH 15/15, direct | 3,648 / 611 ms = 5.97x |
+| `cpython-json` | MATCH 173/173, direct | 20,766 / 19,472 ms = 1.07x |
+| `cpython-math` | MATCH 76/76, direct | 3,207 / 1,231 ms = 2.61x |
+| `cpython-subprocess` | Empty vs 278/278, only new `0x61206272` | invalid performance row |
+| `cpython-threading` | Empty vs 193/193, only new `0x61206272` | invalid performance row |
+
+The record-lock implementation was separately accepted at 8/8 MATCH with
+3,743 / 603 ms = 6.21x wrapper elapsed. The Wave-1 final value above is a
+single later diagnostic sample and shows the expected host-noise spread; it is
+not a canonical performance regression. No controlled scoreboard comparison
+has yet been run.
+
+Closure checks:
+
+- no `0x38764d52` refusal in the final census;
+- no `BlockingRecordLock` leave in the final census;
+- every workload produced tier events;
+- the only two red verdicts were the already recorded `0x61206272` scanner
+  boundary;
+- `RUST_TEST_THREADS=1 just ci` passed in full at `2fcf3906`;
+- the exact Wave-1 range contained only the baseline, encoding proof,
+  recensus, and record-lock commits; unrelated `proposed-plan.md` stayed
+  untouched.
+
+Wave 1 is therefore complete, not the product goal. Wave 2 begins with the
+source-bound top-level reserved A64 encoding group in Task 6 of the plan.

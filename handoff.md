@@ -61,9 +61,24 @@ the isolated word undefined, but Wave 2 still requires an Arm-manual-bound
 family proof plus valid-neighbor mutations before the scanner may accept it.
 Do not convert corpus provenance into a word whitelist.
 
-Immediate order: finish the already-scoped record-lock adapter, run its signed
-CPython gate, close Wave 1, then execute the source-bound `0x61206272` Wave-2
-scanner task and recensus again.
+### Wave-1 closeout and live next action
+
+Wave 1 is complete on `2fcf3906` (signed binary SHA-256
+`a10ff9dec776a22c4eace2f9080d85280580f81a618f987122bca510506e3639`).
+The record-lock adapter is real-gate green: `cpython-fcntl` moved from a 4/4
+crash to 8/8 MATCH, and the final combined census contains neither
+`BlockingRecordLock` nor `0x38764d52`. Six of eight focused suites MATCH; the
+two Empty CPython suites and both Node main scans stop only on the measured
+`0x61206272`. Full serialized `just ci` passed.
+
+The live next action is Task 6 in the implementation plan. Arm's A64 main
+encoding table reserves top-level `op0` bits 28:25=`0000`, which covers
+`0x61206272`. The one-bit neighbor `0x69206272` is allocated
+`stgp x18, x24, [x19, #-1024]` and is the falsification control: it must remain
+outside the proof and take the existing decoded-x18 path. Add red tests at both
+scanner boundaries, implement only that mask, rebuild signed, and recensus the
+same eight suites. The resulting census—not an expected Node JIT or Python
+fork story—selects the following task.
 
 **Date:** 2026-08-06 · **Integration target:** local `main` · **Latest
 decision:** the live-translation-arena campaign is **closed negative**. The
