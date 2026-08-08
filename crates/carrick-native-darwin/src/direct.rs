@@ -798,6 +798,13 @@ const fn stp_pre_sp(rt1: u32, rt2: u32) -> u32 {
 const fn ldp_post_sp(rt1: u32, rt2: u32) -> u32 {
     0xa8c0_0000 | ((2_u32 & 0x7f) << 15) | (rt2 << 10) | (31 << 5) | rt1
 }
+/// `add sp, sp, #16` / `sub sp, sp, #16`.
+///
+/// The x18 veneer uses these only around an instruction that READS SP without
+/// modifying it. Its scratch pair remains saved at `[guest_sp - 16]`, but the
+/// rewritten guest instruction observes the architecturally correct SP.
+const ADD_SP_16: u32 = 0x9100_43ff;
+const SUB_SP_16: u32 = 0xd100_43ff;
 
 /// GPR ordinal for an X- or W-form register, or `None` for anything else.
 fn reg_index(reg: bad64::Reg) -> Option<(u32, bool)> {
@@ -836,6 +843,49 @@ fn instruction_regs(insn: &bad64::Instruction) -> Vec<u32> {
         .flat_map(operand_regs)
         .filter_map(|reg| reg_index(reg).map(|(index, _)| index))
         .collect()
+}
+
+fn reg_is_sp(reg: bad64::Reg) -> bool {
+    matches!(reg, bad64::Reg::SP | bad64::Reg::WSP)
+}
+
+fn operand_names_sp(operand: &bad64::Operand) -> bool {
+    operand_regs(operand).into_iter().any(reg_is_sp)
+}
+
+fn instruction_names_sp(insn: &bad64::Instruction) -> bool {
+    insn.operands().iter().any(operand_names_sp)
+}
+
+/// Can the generic veneer briefly restore the guest SP around this x18-using
+/// instruction and then re-borrow its 16-byte scratch pair?
+///
+/// A destination SP or a pre/post-indexed SP address changes SP, so the
+/// veneer's following `sub sp, sp, #16` would be wrong. A register-indexed SP
+/// address can also name the scratch pair itself. Fail those shapes closed.
+/// Plain SP reads and non-negative fixed-offset loads/stores are safe: the
+/// instruction sees the original SP and cannot touch the saved pair below it.
+fn x18_sp_use_is_veneer_safe(insn: &bad64::Instruction) -> bool {
+    use bad64::{Imm, Operand as O};
+
+    if !instruction_names_sp(insn) {
+        return true;
+    }
+    if insn.operands().first().is_some_and(operand_names_sp) {
+        return false;
+    }
+    insn.operands().iter().all(|operand| match operand {
+        O::MemPreIdx { reg, .. } | O::MemPostIdxImm { reg, .. } | O::MemPostIdxReg([reg, _])
+            if reg_is_sp(*reg) =>
+        {
+            false
+        }
+        O::MemExt { regs, .. } if reg_is_sp(regs[0]) => false,
+        O::MemOffset { reg, offset, .. } if reg_is_sp(*reg) => {
+            matches!(offset, Imm::Unsigned(_) | Imm::Signed(0..))
+        }
+        _ => true,
+    })
 }
 
 /// Rewrite `word` so every x18 operand names `scratch` instead, or `None` if
@@ -1095,12 +1145,24 @@ fn x18_pc_address_veneer(value: u64, tsd: TsdSlot) -> Vec<u32> {
 /// x18, the stand-in still holds the value that was loaded, so storing it back
 /// is a no-op; that removes the need to classify reads from writes, which is
 /// where a shape-by-shape implementation would accumulate mistakes.
-fn x18_veneer(rewritten: u32, value_reg: u32, addr_reg: u32, tsd: TsdSlot) -> Vec<u32> {
-    let mut w = Vec::with_capacity(12);
+fn x18_veneer(
+    rewritten: u32,
+    value_reg: u32,
+    addr_reg: u32,
+    tsd: TsdSlot,
+    restore_guest_sp: bool,
+) -> Vec<u32> {
+    let mut w = Vec::with_capacity(14);
     w.push(stp_pre_sp(value_reg, addr_reg));
     w.extend_from_slice(&tsd_resolve(addr_reg, tsd));
     w.push(ldr_imm(value_reg, addr_reg, DirectThreadSlots::X18_OFF));
+    if restore_guest_sp {
+        w.push(ADD_SP_16);
+    }
     w.push(rewritten);
+    if restore_guest_sp {
+        w.push(SUB_SP_16);
+    }
     w.push(str_imm(value_reg, addr_reg, DirectThreadSlots::X18_OFF));
     w.push(ldp_post_sp(value_reg, addr_reg));
     w
@@ -1291,9 +1353,10 @@ fn instruction_names_x18(insn: &bad64::Instruction) -> bool {
 /// Can this x18-using instruction be veneered? Both halves must succeed: two
 /// free registers, and a substitution that verifies.
 fn x18_is_veneerable(insn: &bad64::Instruction, word: u32) -> bool {
-    pick_scratch_pair(insn)
-        .and_then(|(value, _)| substitute_x18(word, value))
-        .is_some()
+    x18_sp_use_is_veneer_safe(insn)
+        && pick_scratch_pair(insn)
+            .and_then(|(value, _)| substitute_x18(word, value))
+            .is_some()
 }
 
 /// Decide whether an image can run on tier D, WITHOUT mapping anything.
@@ -1763,7 +1826,16 @@ impl DirectImage {
                 };
                 let site_host = (site_vaddr - lo) as usize;
                 let veneer_cursor = arena.cursor;
-                let words = x18_veneer(rewritten, value_reg, addr_reg, tsd);
+                if !x18_sp_use_is_veneer_safe(&insn) {
+                    return Ok(Err(DirectIneligible::X18Access { vaddr: site_vaddr }));
+                }
+                let words = x18_veneer(
+                    rewritten,
+                    value_reg,
+                    addr_reg,
+                    tsd,
+                    instruction_names_sp(&insn),
+                );
                 let bytes = words.len() * 4;
                 if veneer_cursor + bytes + 4 > arena.len {
                     return Err(io::Error::other("veneer budget exhausted"));
@@ -3933,6 +4005,41 @@ mod tests {
         assert_eq!(slots.guest_x18, 9, "and the slot holds the final value");
     }
 
+    /// Node's generated static initializer materializes large stack offsets
+    /// with `mov x18, #offset; add xN, sp, x18`. The generic x18 veneer saves
+    /// two scratch registers below SP; the rewritten instruction must still
+    /// observe the guest's ORIGINAL SP, not that temporary save frame.
+    #[test]
+    fn x18_veneer_preserves_sp_for_the_rewritten_instruction() {
+        const CHECK_NR: u64 = 0x0ffa;
+        let code: Vec<u32> = vec![
+            mov_reg(20, 30),
+            movz(18, 32, 0),
+            0x8b32_63e0, // add x0, sp, x18
+            mov_from_sp(1),
+            movz(8, CHECK_NR as u32, 0),
+            SVC_0,
+            mov_reg(30, 20),
+            0xd65f_03c0,
+        ];
+        let elf = elf_with_code(&code);
+        let group = DirectLoadGroup::load(&elf, record_only)
+            .expect("load")
+            .expect("eligible");
+        seen_clear();
+        let entry = group.main().entry();
+        enter_with_slots(&group, entry);
+
+        let seen = seen_snapshot();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, CHECK_NR);
+        assert_eq!(
+            seen[0].1[0] - seen[0].1[1],
+            32,
+            "the rewritten add must use the unshifted guest SP"
+        );
+    }
+
     #[test]
     fn scan_accepts_veneerable_x18_and_still_refuses_the_rest() {
         let veneerable = vec![0x9100_0652, movz(8, 93, 0), SVC_0];
@@ -3940,6 +4047,23 @@ mod tests {
         assert!(
             matches!(scan_eligibility(&elf).expect("scan runs"), Ok(1)),
             "a veneerable x18 instruction no longer disqualifies"
+        );
+    }
+
+    #[test]
+    fn scan_refuses_an_x18_instruction_that_changes_sp() {
+        let code = vec![
+            0x8b32_63ff, // add sp, sp, x18
+            movz(8, 93, 0),
+            SVC_0,
+        ];
+        let elf = elf_with_code(&code);
+        assert!(
+            matches!(
+                scan_eligibility(&elf).expect("scan runs"),
+                Err(DirectIneligible::X18Access { .. })
+            ),
+            "the generic veneer cannot re-borrow its scratch pair after guest SP changes"
         );
     }
 
