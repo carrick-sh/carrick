@@ -423,11 +423,12 @@ impl ThreadWaiter {
     /// by it does not interrupt the wait (it stays pending for delivery after
     /// the syscall, per the persistent mask). `SigBlockMask::NONE` = no extra
     /// blocking.
-    pub fn wait(
+    fn wait_inner(
         &self,
         fds: &[WaitFd],
         timeout: Option<Duration>,
         block_mask: carrick_abi::SigBlockMask,
+        wake_on_signal_pipe: bool,
     ) -> WaitResult {
         let fd0 = fds.first().map_or(-1, WaitFd::fd);
         let events0 = fds.first().map_or(0, |fd| i32::from(fd.events()));
@@ -476,7 +477,7 @@ impl ThreadWaiter {
             if !self.has_dead_wake_pipe()
                 && let Some(kq) = self.kq.as_ref()
             {
-                result = self.wait_kqueue(kq, wait_fds, timeout, block_mask, false);
+                result = self.wait_kqueue(kq, wait_fds, timeout, block_mask, wake_on_signal_pipe);
                 crate::probes::io_wait_end(
                     self.tid.raw(),
                     wait_result_code(result),
@@ -500,6 +501,15 @@ impl ThreadWaiter {
         result
     }
 
+    pub fn wait(
+        &self,
+        fds: &[WaitFd],
+        timeout: Option<Duration>,
+        block_mask: carrick_abi::SigBlockMask,
+    ) -> WaitResult {
+        self.wait_inner(fds, timeout, block_mask, false)
+    }
+
     pub fn wait_with_dispatch_pending<F>(
         &self,
         fds: &[WaitFd],
@@ -513,7 +523,16 @@ impl ThreadWaiter {
         if should_interrupt() {
             return WaitResult::Interrupted;
         }
-        self.wait(fds, timeout, block_mask)
+        // Dispatcher-owned state (process teardown, synthetic pending
+        // signals) is not visible to `ThreadWaiter::should_interrupt`.
+        // Let a registered wake-pipe edge return from the kqueue loop, then
+        // close the publish-to-park race by rechecking the caller predicate.
+        let result = self.wait_inner(fds, timeout, block_mask, true);
+        if matches!(result, WaitResult::Ready | WaitResult::Interrupted) && should_interrupt() {
+            WaitResult::Interrupted
+        } else {
+            result
+        }
     }
 
     /// Wait for a child stop/continue notification that cannot use
