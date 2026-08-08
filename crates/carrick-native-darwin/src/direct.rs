@@ -1224,11 +1224,14 @@ fn word_could_name_x18(word: u32) -> bool {
 /// instead. Its "Advanced SIMD shift by immediate" encoding fixes bit 31=`0`,
 /// bits 28:23=`0b011110`, and bit 10=`1`, with
 /// nonzero `immh` bits 22:19; opcode bit 15=`0` plus bit 11=`1` selects an
-/// unallocated subspace. Separately, its "Load/store register (register
-/// offset)" encoding fixes bits 11:10 to `0b10`; the family selector is bits
-/// 29:27=`0b111`, bits 25:24=`0b00`, and bit 21=`1`, so any other value in bits
-/// 11:10 inside that exact family is unallocated. Such words cannot access
-/// x18: executing one raises an undefined-instruction exception.
+/// unallocated subspace. Its "Load/store register (unprivileged)" encoding
+/// fixes bits 29:27=`0b111`, bits 25:24=`0b00`, and bits 11:10=`0b10`; `V` bit
+/// 26=`1` is unallocated because the class has no SIMD/FP forms. Separately,
+/// its "Load/store register (register offset)" encoding fixes bits 11:10 to
+/// `0b10`; the family selector is bits 29:27=`0b111`, bits 25:24=`0b00`, and
+/// bit 21=`1`, so any other value in bits 11:10 inside that exact family is
+/// unallocated. Such words cannot access x18: executing one raises an
+/// undefined-instruction exception.
 fn word_is_proven_unallocated(word: u32) -> bool {
     const RESERVED_MAJOR_OP0_MASK: u32 = 0x9e00_0000;
     const SIMD_SHIFT_IMMEDIATE_MASK: u32 = 0x9f80_0400;
@@ -1236,6 +1239,8 @@ fn word_is_proven_unallocated(word: u32) -> bool {
     const SIMD_SHIFT_IMMH_MASK: u32 = 0x0078_0000;
     const SIMD_SHIFT_UNALLOCATED_OPCODE_MASK: u32 = 0x0000_8800;
     const SIMD_SHIFT_UNALLOCATED_OPCODE: u32 = 0x0000_0800;
+    const SIMD_UNPRIVILEGED_MASK: u32 = 0x3f00_0c00;
+    const SIMD_UNPRIVILEGED_UNALLOCATED: u32 = 0x3c00_0800;
     const FAMILY_MASK: u32 = 0x3b20_0000;
     const FAMILY: u32 = 0x3820_0000;
     const FIXED_11_10_MASK: u32 = 0x0000_0c00;
@@ -1248,6 +1253,9 @@ fn word_is_proven_unallocated(word: u32) -> bool {
         && (word & SIMD_SHIFT_IMMH_MASK) != 0
         && (word & SIMD_SHIFT_UNALLOCATED_OPCODE_MASK) == SIMD_SHIFT_UNALLOCATED_OPCODE
     {
+        return true;
+    }
+    if (word & SIMD_UNPRIVILEGED_MASK) == SIMD_UNPRIVILEGED_UNALLOCATED {
         return true;
     }
     (word & FAMILY_MASK) == FAMILY && (word & FIXED_11_10_MASK) != FIXED_11_10
@@ -3572,6 +3580,38 @@ mod tests {
     }
 
     #[test]
+    fn scan_accepts_proven_unallocated_simd_unprivileged_word_with_x18_bits() {
+        let unallocated_simd_unprivileged = 0xbcc3_cad1;
+        let elf = elf_with_code(&[unallocated_simd_unprivileged, movz(8, 93, 0), SVC_0]);
+        assert!(
+            matches!(scan_eligibility(&elf).expect("scan runs"), Ok(1)),
+            "the unprivileged load/store class has no SIMD/FP form"
+        );
+    }
+
+    #[test]
+    fn simd_unprivileged_unallocated_proof_is_mask_exact() {
+        assert!(word_is_proven_unallocated(0xbcc3_cad1));
+        assert!(
+            !word_is_proven_unallocated(0x9cc3_cad1),
+            "the one-bit LDR Q literal neighbor is allocated"
+        );
+        let allocated = bad64::decode(0x9cc3_cad1, 0).expect("allocated LDR Q neighbor");
+        assert!(
+            !instruction_names_x18(&allocated),
+            "the allocated neighbor names vector Q17, not guest GPR x18"
+        );
+        assert!(
+            !word_is_proven_unallocated(0x8080_0012),
+            "the allocated SME major group remains outside every proof"
+        );
+        assert!(
+            !word_is_proven_unallocated(0xffff_fff2),
+            "unrelated undecodable words remain fail-closed"
+        );
+    }
+
+    #[test]
     fn scan_counts_syscall_sites_on_a_clean_image() {
         let elf = fixture_elf();
         assert!(
@@ -4477,6 +4517,21 @@ mod tests {
                 .expect("scan runs")
                 .is_ok(),
             "the SIMD unallocated-opcode proof applies at the executable-window boundary"
+        );
+    }
+
+    #[test]
+    fn exec_window_accepts_proven_unallocated_simd_unprivileged_word_with_x18_bits() {
+        let file = elf_with_code(&[0xbcc3_cad1, movz(8, 93, 0), SVC_0]);
+        let group = DirectLoadGroup::load(&fixture_elf(), record_only)
+            .expect("load main")
+            .expect("eligible");
+        assert!(
+            group
+                .map_exec_file_window(&file, 0, 0x2000)
+                .expect("scan runs")
+                .is_ok(),
+            "the SIMD unprivileged proof applies at the executable-window boundary"
         );
     }
 
