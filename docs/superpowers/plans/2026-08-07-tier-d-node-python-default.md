@@ -832,14 +832,14 @@ only because they are immediate/addressing bits in this class. Clearing bit 29
 gives allocated `0x9cc3cad1`, `ldr q17, <literal>`, which must remain outside
 the proof.
 
-- [ ] **Step 1: Add deterministic red boundary and mask tests**
+- [x] **Step 1: Add deterministic red boundary and mask tests**
 
 Add load-time and executable-window tests using `0xbcc3cad1`. Add classifier
 assertions that the measured word is proven, the one-bit allocated control is
 not proven and decodes successfully, the SME control remains excluded, and
 `0xfffffff2` still fails closed.
 
-- [ ] **Step 2: Run the new tests and verify red**
+- [x] **Step 2: Run the new tests and verify red**
 
 ```bash
 cargo test -p carrick-native-darwin simd_unprivileged -- --nocapture
@@ -848,7 +848,7 @@ cargo test -p carrick-native-darwin simd_unprivileged -- --nocapture
 Expected: both boundaries refuse the measured word and the classifier
 assertion is false before implementation.
 
-- [ ] **Step 3: Extend the source-bound classifier minimally**
+- [x] **Step 3: Extend the source-bound classifier minimally**
 
 ```rust
 const SIMD_UNPRIVILEGED_MASK: u32 = 0x3f00_0c00;
@@ -862,7 +862,7 @@ if (word & SIMD_UNPRIVILEGED_MASK) == SIMD_UNPRIVILEGED_UNALLOCATED {
 Do not admit other SIMD/FP load-store shapes, consume the Node object symbol,
 or infer data from byte entropy.
 
-- [ ] **Step 4: Run focused and full scanner gates**
+- [x] **Step 4: Run focused and full scanner gates**
 
 ```bash
 cargo test -p carrick-native-darwin simd_unprivileged -- --nocapture
@@ -874,8 +874,72 @@ just fmt-check
 just clippy
 ```
 
-- [ ] **Step 5: Commit, build signed, and recensus the eight suites**
+- [x] **Step 5: Commit, build signed, and recensus the eight suites**
 
 Commit only `direct.rs`, build through `just build`, verify codesign and
 SHA-256, then run the same serial eight-suite gate with run ID and artifact
 stem `tierd-wave2-simd-unprivileged`. The signed census selects Task 9.
+
+---
+
+### Task 9: Admit the measured top-level unallocated A64 op1 group
+
+**Wave:** 2
+
+**Files:**
+
+- Modify: `crates/carrick-native-darwin/src/direct.rs`
+- Test: `crates/carrick-native-darwin/src/direct.rs`
+- Modify after live proof:
+  `docs/perf-results/2026-08-07-tier-d-node-python-baseline.md`
+- Modify after live proof: `handoff.md`
+
+**Exact red workload and images:** signed source `379d2554` advances Node to
+virtual address `0x1c53ec8` and CPython's libcrypto executable window to file
+offset `0x2e4c48`; all four paths refuse `0x02783a40`. This is byte `0xc8` of
+the same byte-identical `_vpsm4_ex_consts` range recorded in Task 8.
+
+**Semantic reference:** Arm ARM DDI0487's root A64 encoding table marks the
+top-level `op1` patterns satisfying `(op1 & 0b1101) == 0b0001` unallocated,
+where `op1` is bits 28:25. The exact mask/value pair is
+`0x1a000000/0x02000000`; bit 31 and bit 26 are not selectors for this rule.
+The measured word has `op1=0b0001`. Toggling bit 27 produces the allocated
+one-bit control `0x0a783a40`, `bic w0, w18, w24, lsr #14`; it must stay outside
+the proof and take the existing decoded-x18 path.
+
+- [ ] **Step 1: Add deterministic red boundary and mask tests**
+
+Add load-time and executable-window tests using `0x02783a40`. Add classifier
+assertions for the measured word, the allocated BIC control and its decoded
+x18 operand, the allocated SME control, and `0xfffffff2`.
+
+- [ ] **Step 2: Run the new tests and verify red**
+
+```bash
+cargo test -p carrick-native-darwin top_level_unallocated_op1 -- --nocapture
+```
+
+- [ ] **Step 3: Extend the source-bound classifier minimally**
+
+```rust
+const TOP_LEVEL_UNALLOCATED_OP1_MASK: u32 = 0x1a00_0000;
+const TOP_LEVEL_UNALLOCATED_OP1: u32 = 0x0200_0000;
+
+if (word & TOP_LEVEL_UNALLOCATED_OP1_MASK) == TOP_LEVEL_UNALLOCATED_OP1 {
+    return true;
+}
+```
+
+Keep the corrected Task-6 bit-31 mask and all existing allocated controls.
+
+- [ ] **Step 4: Run focused and full scanner gates**
+
+Run the new filter plus `reserved_major`, `simd_unprivileged`,
+`advanced_simd_shift`, `proven_unallocated`, the full crate, `just fmt-check`,
+and `just clippy`.
+
+- [ ] **Step 5: Commit, build signed, and recensus the eight suites**
+
+Commit only `direct.rs`, build through `just build`, verify codesign and
+SHA-256, then run the serial eight-suite gate with run ID and artifact stem
+`tierd-wave2-top-level-op1`. The census selects Task 10.
