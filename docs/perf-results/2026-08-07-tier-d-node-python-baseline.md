@@ -134,3 +134,86 @@ Governing design:
 [`2026-08-07-tier-d-node-python-default-design.md`](../superpowers/specs/2026-08-07-tier-d-node-python-default-design.md).
 Execution plan:
 [`2026-08-07-tier-d-node-python-default.md`](../superpowers/plans/2026-08-07-tier-d-node-python-default.md).
+
+## 2026-08-07 signed encoding recensus
+
+The first scanner change landed as `75cb2b15cc3275b99cf56b36e7f875597bc3527e`.
+`just build` produced a codesign-verified release binary with SHA-256:
+
+```text
+4c1505a7cef8e2ac6fa058b551c7ee9f31ed792468e907e5455277c02fbc7881
+```
+
+The Tier-D marker was present in the linked product. The recensus used the same
+images and serial method as the baseline, with an absolute census path:
+
+```sh
+CARRICK_RUN_ID=tierd-wave1-encoding-fast \
+CARRICK_NATIVE_DIRECT=1 \
+CARRICK_TIER_CENSUS=/Volumes/CaseSensitive/carrick/target/conformance/tierd-wave1-encoding-census.log \
+just conformance-native smoke --workers 1 \
+  --suite node-app-smoke \
+  --suite node-v8-smoke \
+  --suite cpython-fcntl \
+  --suite cpython-glob \
+  --suite cpython-json \
+  --suite cpython-math \
+  --jsonl target/conformance/tierd-wave1-encoding-fast.jsonl
+
+CARRICK_RUN_ID=tierd-wave1-encoding-process \
+CARRICK_NATIVE_DIRECT=1 \
+CARRICK_TIER_CENSUS=/Volumes/CaseSensitive/carrick/target/conformance/tierd-wave1-encoding-census.log \
+just conformance-native smoke --workers 1 \
+  --suite cpython-subprocess \
+  --suite cpython-threading \
+  --jsonl target/conformance/tierd-wave1-encoding-process.jsonl
+```
+
+### What closed
+
+There is no remaining `0x38764d52` scan refusal. The family-mask proof is live
+at both scanner boundaries:
+
+- Node advanced from `0x38764d52` at `0x1c44b84` to a later word at
+  `0x1c4a76c`.
+- CPython's libcrypto executable-window scan advanced from `0x38764d52` at
+  `0x281478` to a later word at `0x2ce8b0`.
+- `cpython-fcntl` still enters directly and reaches the independently known
+  `BlockingRecordLock`; this is the expected Task-4 red state.
+- `cpython-glob`, `cpython-json`, and `cpython-math` remained MATCH under
+  direct execution.
+
+The wrapper results were:
+
+| gate | result | diagnostic elapsed |
+|---|---|---:|
+| `node-app-smoke` | MATCH, Node main still scan-refused | 13,676 / 402 ms = 34.02x |
+| `node-v8-smoke` | MATCH, Node main still scan-refused | 9,480 / 403 ms = 23.52x |
+| `cpython-fcntl` | CARRICK_CRASH 4/4 vs 8/8, `BlockingRecordLock` | 6,789 / 603 ms = 11.26x |
+| `cpython-glob` | MATCH 15/15 | 3,857 / 611 ms = 6.31x |
+| `cpython-json` | MATCH 173/173 | 20,540 / 19,472 ms = 1.05x |
+| `cpython-math` | MATCH 76/76 | 3,229 / 1,231 ms = 2.62x |
+| `cpython-subprocess` | Empty vs 278/278 | invalid performance row |
+| `cpython-threading` | Empty vs 193/193 | invalid performance row |
+
+These are still harness diagnostics, not the canonical product scoreboard.
+
+### The next shared scanner word
+
+All four formerly blocked Node/CPython paths now stop on `0x61206272`:
+
+- Node main: virtual address `0x1c4a76c`;
+- libcrypto executable file window: offset `0x2ce8b0`.
+
+Both locations are the ASCII bytes `rb a` within the same OpenSSL banner:
+`Keccak-1600 absorb and squeeze for ARMv8, CRYPTOGAMS by
+<appro@openssl.org>`. In the unstripped Node executable the preceding function
+returns at `0x1c4a758`, mapping symbol `$d` starts at `0x1c4a75c`, and `$x`
+resumes at `0x1c4a7c0`. The stripped libcrypto has no static symbol table, but
+the same banner starts at file offset `0x2ce8a0` after its `ret` at `0x2ce89c`.
+
+GNU AArch64 binutils 2.45 also decodes the isolated raw word as undefined. That
+is supporting diagnosis, not yet sufficient authority for code: Wave 2 must
+bind an Arm-encoding family mask, valid-neighbor mutations, and both real
+corpus regressions before allowing the word through the scanner. A banner-word
+whitelist remains forbidden.
