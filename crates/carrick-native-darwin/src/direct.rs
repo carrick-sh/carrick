@@ -1268,6 +1268,21 @@ fn word_is_proven_unallocated(word: u32) -> bool {
     (word & FAMILY_MASK) == FAMILY && (word & FIXED_11_10_MASK) != FIXED_11_10
 }
 
+/// Is a decoder failure independently proven unable to access guest GPR x18?
+///
+/// Most such words are architecturally unallocated. Allocated encodings whose
+/// decoder/formatter support is incomplete require a separate exact-family
+/// proof here; they must never be mislabeled as unallocated.
+fn word_is_proven_x18_free_decoder_failure(word: u32) -> bool {
+    // Arm's allocated SME2 SMLAL ZA,Z,Z[index] two-vector form. bad64 0.12
+    // recognizes it but lacks formatter operands. Its only GPR is the ZA row
+    // selector constrained to W8-W11; the other registers are ZA/Z.
+    const SME2_SMLAL_TWO_VECTOR_MASK: u32 = 0xfff0_9038;
+    const SME2_SMLAL_TWO_VECTOR: u32 = 0xc1d0_1000;
+
+    word_is_proven_unallocated(word) || (word & SME2_SMLAL_TWO_VECTOR_MASK) == SME2_SMLAL_TWO_VECTOR
+}
+
 /// Does a decoded instruction reference x18/w18 as an operand?
 fn instruction_names_x18(insn: &bad64::Instruction) -> bool {
     instruction_regs(insn).contains(&18)
@@ -1411,7 +1426,7 @@ fn scan_executable_words(code: &[u8], vaddr0: u64) -> Result<usize, DirectInelig
                     }
                 }
             }
-            Err(_) if word_is_proven_unallocated(word) => {}
+            Err(_) if word_is_proven_x18_free_decoder_failure(word) => {}
             Err(_) if word_could_name_x18(word) => {
                 return Err(DirectIneligible::UndecodableText { vaddr: site, word });
             }
@@ -3651,6 +3666,38 @@ mod tests {
     }
 
     #[test]
+    fn scan_accepts_proven_x18_free_allocated_sme2_formatter_gap() {
+        let allocated_sme2 = 0xc1d2_1300;
+        let elf = elf_with_code(&[allocated_sme2, movz(8, 93, 0), SVC_0]);
+        assert!(
+            matches!(scan_eligibility(&elf).expect("scan runs"), Ok(1)),
+            "the exact SME2 form cannot name x18 despite the formatter gap"
+        );
+    }
+
+    #[test]
+    fn allocated_sme2_x18_free_proof_is_mask_exact() {
+        assert!(
+            !word_is_proven_unallocated(0xc1d2_1300),
+            "the SME2 SMLAL form is allocated and must not be mislabeled"
+        );
+        assert!(word_is_proven_x18_free_decoder_failure(0xc1d2_1300));
+        assert!(
+            !word_is_proven_x18_free_decoder_failure(0xe1d2_1300),
+            "the one-bit LD1Q neighbor can name x18"
+        );
+        let allocated = bad64::decode(0xe1d2_1300, 0).expect("allocated LD1Q neighbor");
+        assert!(
+            instruction_names_x18(&allocated),
+            "the allocated neighbor must remain on the decoded-x18 path"
+        );
+        assert!(
+            !word_is_proven_x18_free_decoder_failure(0xffff_fff2),
+            "unrelated decoder failures remain fail-closed"
+        );
+    }
+
+    #[test]
     fn scan_counts_syscall_sites_on_a_clean_image() {
         let elf = fixture_elf();
         assert!(
@@ -4586,6 +4633,21 @@ mod tests {
                 .expect("scan runs")
                 .is_ok(),
             "the top-level unallocated proof applies at the executable-window boundary"
+        );
+    }
+
+    #[test]
+    fn exec_window_accepts_proven_x18_free_allocated_sme2_formatter_gap() {
+        let file = elf_with_code(&[0xc1d2_1300, movz(8, 93, 0), SVC_0]);
+        let group = DirectLoadGroup::load(&fixture_elf(), record_only)
+            .expect("load main")
+            .expect("eligible");
+        assert!(
+            group
+                .map_exec_file_window(&file, 0, 0x2000)
+                .expect("scan runs")
+                .is_ok(),
+            "the exact x18-free SME2 form applies at the executable-window boundary"
         );
     }
 
