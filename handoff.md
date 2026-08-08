@@ -39,6 +39,32 @@ design's expected ladder—selects Wave 2. Conformance elapsed ratios remain
 diagnostic only; the canonical direct Node and CPython workload scoreboards
 must be measured before any <=2x claim or default flip.
 
+### Current signed recensus
+
+The first encoding fix is committed as `75cb2b15`. Signed binary SHA-256
+`4c1505a7cef8e2ac6fa058b551c7ee9f31ed792468e907e5455277c02fbc7881`
+proves that `0x38764d52` no longer refuses either scanner boundary. It also
+exposed the next shared word rather than making Node or process/thread Python
+green:
+
+- Node main refuses `0x61206272` at `0x1c4a76c`;
+- CPython's libcrypto executable window refuses the same word at file offset
+  `0x2ce8b0`;
+- `cpython-fcntl` still enters Tier D and leaves on `BlockingRecordLock`;
+- `cpython-subprocess` and `cpython-threading` remain Empty, so their apparent
+  sub-1 elapsed ratios are invalid.
+
+The two word locations are the same OpenSSL `Keccak-1600 absorb and squeeze`
+banner. Node's mapping symbols prove `$d` at `0x1c4a75c` through `$x` at
+`0x1c4a7c0`; stripped libcrypto has no symbols. GNU AArch64 binutils 2.45 calls
+the isolated word undefined, but Wave 2 still requires an Arm-manual-bound
+family proof plus valid-neighbor mutations before the scanner may accept it.
+Do not convert corpus provenance into a word whitelist.
+
+Immediate order: finish the already-scoped record-lock adapter, run its signed
+CPython gate, close Wave 1, then execute the source-bound `0x61206272` Wave-2
+scanner task and recensus again.
+
 **Date:** 2026-08-06 · **Integration target:** local `main` · **Latest
 decision:** the live-translation-arena campaign is **closed negative**. The
 complete runtime (Tasks 2-9) was deleted in `1cb06de6` per the plan's Task-10
