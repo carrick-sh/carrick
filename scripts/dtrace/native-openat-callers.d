@@ -6,14 +6,18 @@
 #pragma D option strsize=16k
 
 /*
- * Attribute Darwin openat calls made while Carrick services Linux/AArch64
- * openat (guest syscall 56) to exact host user stacks.
+ * Attribute Darwin openat calls made while Carrick's translated or direct
+ * native lane services Linux/AArch64 openat (guest syscall 56) to exact host
+ * user stacks.
  *
  * Unlike an arbitrary native-DSR profile sample, syscall entry/return happens
  * after Carrick has restored its host stack. The resulting ustack is therefore
  * authoritative for the Carrick caller. Every aggregation key also carries
  * the contemporaneous Carrick image base so short-lived, self-reexec'd guest
- * processes can be symbolicated offline after they exit.
+ * processes can be symbolicated offline after they exit. Tier D publishes
+ * that shared `host-image-base` ABI immediately before its first guest entry;
+ * a capture with host openat events but only base=0 is an instrumentation
+ * error, not symbolication evidence.
  */
 
 dtrace:::BEGIN

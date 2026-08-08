@@ -2,6 +2,7 @@
 #pragma D option bufsize=32m
 #pragma D option aggsize=16m
 #pragma D option dynvarsize=16m
+#pragma D option defaultargs
 
 /*
  * Where does WALL time go across a whole Carrick process tree?
@@ -41,7 +42,31 @@ dtrace:::BEGIN
 {
     printf("offcpu-attribution: target=%d\n", $target);
     start = timestamp;
+    secs = 0;
+    limit = $1 != 0 ? $1 : 45;
+    timed_out = 0;
+    probe_errors = 0;
     track[$target] = 1;
+}
+
+/* A custom `carrick trace --script` deliberately outlives its launch child.
+ * The in-script ceiling is therefore load-bearing: without it a completed
+ * workload leaves the root DTrace consumer alive forever. */
+tick-1s
+{
+    secs++;
+}
+
+tick-1s
+/secs >= limit/
+{
+    timed_out = 1;
+    exit(0);
+}
+
+dtrace:::ERROR
+{
+    probe_errors++;
 }
 
 /* A guest fork makes a NEW host process; follow it into the tracked set. */
@@ -112,6 +137,8 @@ sched:::wakeup
 
 dtrace:::END
 {
+    printf("offcpu-attribution: complete timed_out=%d probe_errors=%d limit_s=%d\n",
+        timed_out, probe_errors, limit);
     printf("\n=== wall ns traced: %d ===\n", timestamp - start);
 
     printf("\n=== off-CPU ns TOTAL ===\n");
