@@ -1369,6 +1369,31 @@ impl DirectRunner {
         ServiceVerdict::Resume(addr as i64)
     }
 
+    /// Run the blocking half of `F_SETLKW`/`F_OFD_SETLKW` after dispatch has
+    /// returned its owned outcome and released every subsystem lock.
+    ///
+    /// Tier-D guest threads are independent host pthreads, so blocking this
+    /// calling pthread leaves a sibling able to release the conflicting lock.
+    /// `EINTR` returns through the ordinary syscall boundary below, where the
+    /// existing signal/restart policy applies.
+    fn service_blocking_record_lock(
+        &self,
+        syscall: u64,
+        lock: &crate::dispatch::BlockingRecordLock,
+    ) -> ServiceVerdict {
+        match crate::dispatch::drive_blocking_record_lock(lock) {
+            DispatchOutcome::Returned { value } => ServiceVerdict::Resume(value),
+            DispatchOutcome::Errno { errno } => ServiceVerdict::Resume(errno.guest_retval()),
+            other => {
+                self.end_process(DirectRunOutcome::Unsupported {
+                    syscall,
+                    outcome: format!("blocking record-lock driver returned {other:?}"),
+                });
+                ServiceVerdict::Leave
+            }
+        }
+    }
+
     /// Service one syscall from a tier-D island: dispatch, then run the
     /// signal-delivery boundary — every completed syscall is a delivery
     /// point, exactly the DSR loop's `complete_dsr_syscall` contract.
@@ -1749,6 +1774,9 @@ impl DirectRunner {
                         }
                         TierDWait::Leave => return ServiceVerdict::Leave,
                     }
+                }
+                Ok(DispatchOutcome::BlockingRecordLock(lock)) => {
+                    return self.service_blocking_record_lock(number, &lock);
                 }
                 Ok(other) => {
                     self.end_process(DirectRunOutcome::Unsupported {
@@ -3103,6 +3131,28 @@ pub unsafe fn with_runner<R>(
 mod tests {
     use super::*;
     use carrick_native_darwin::direct::DirectLoadGroup;
+
+    #[test]
+    fn blocking_record_lock_returns_through_the_tier_d_boundary() {
+        use std::os::fd::AsRawFd as _;
+
+        let file = tempfile::tempfile().expect("temp file");
+        let lock = crate::dispatch::BlockingRecordLock::new(
+            file.as_raw_fd(),
+            libc::F_SETLKW,
+            0,
+            0,
+            libc::F_WRLCK,
+            libc::SEEK_SET as i16,
+        )
+        .expect("pin lock fd");
+        let runner = DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
+
+        assert!(matches!(
+            runner.service_blocking_record_lock(25, &lock),
+            ServiceVerdict::Resume(0)
+        ));
+    }
 
     /// The STRETCH gate: real CPython 3.12 running `print(1)` end to end on
     /// tier D. `python3.12` is a real, PIE, dynamically linked interpreter
