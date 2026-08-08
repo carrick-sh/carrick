@@ -151,6 +151,26 @@ carries the exact `0x1a000000/0x02000000` mask/value pair. One-bit control
 decoded-x18 path. Add red tests at both scanner boundaries, implement only
 that root-table proof, rebuild signed, and recensus the same eight suites.
 
+### Wave-2 top-level-op1 recensus and live next action
+
+This section supersedes the scanner action immediately above. Task 9 is
+complete on signed source `44cc69d4`, binary SHA-256
+`33c3b18e8f86fa049324e7f340b1c4481bd3a26461eca8a1cfe11c148c5434d6`.
+Every prior scanner word and `BlockingRecordLock` remains absent.
+
+The next shared refusal is `0xc1d21300`, at Node `0x1c53ee0` and libcrypto
+`0x2e4c60`. It is not unallocated: LLDB proves the generated decoder reaches
+the allocated SME2 `SMLAL ZA, Z, Z[index]` two-vector form, exact mask/value
+`0xfff09038/0xc1d01000`. `bad64` returns `ErrorOperands` only because its
+formatter lacks this encoding's operands. The ZA row selector is limited to
+W8-W11 and every other register is ZA/Z, so the form cannot name GPR x18.
+
+Task 10 must add a separately named x18-free decoder-failure classifier rather
+than broadening `word_is_proven_unallocated`. One-bit control `0xe1d21300`
+decodes as `ld1q z0h.q[w12], p4/z, [x24, x18, lsl #4]` and must remain on the
+decoded-x18 path. Add red tests at both scanner boundaries, implement only the
+exact SME2 SMLAL form, rebuild signed, and recensus the same eight suites.
+
 **Date:** 2026-08-06 · **Integration target:** local `main` · **Latest
 decision:** the live-translation-arena campaign is **closed negative**. The
 complete runtime (Tasks 2-9) was deleted in `1cb06de6` per the plan's Task-10
