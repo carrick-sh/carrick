@@ -1,5 +1,44 @@
 # Native-lane performance: state of play
 
+## 2026-08-07 Tier D Node/CPython campaign — read this first
+
+This section is the live controller. It supersedes the 2026-08-06 instruction
+to return to broad Move-3/Task-12 work; the older material below remains
+campaign history.
+
+The active product goal is to finish Tier D on the shipped-default
+Darwin/AArch64 native backend, make the canonical Node and CPython workloads
+correct, and reduce their clean end-to-end overhead versus native-arm64 Docker
+to **no more than 2.0x**, with **1.0x** the stretch outcome. The goal stays open
+until both the correctness and overhead gates are measured on the same signed
+tip.
+
+Authority:
+
+- design:
+  [`2026-08-07-tier-d-node-python-default-design.md`](docs/superpowers/specs/2026-08-07-tier-d-node-python-default-design.md);
+- Wave-1 implementation plan:
+  [`2026-08-07-tier-d-node-python-default.md`](docs/superpowers/plans/2026-08-07-tier-d-node-python-default.md);
+- immutable pre-fix evidence:
+  [`2026-08-07-tier-d-node-python-baseline.md`](docs/perf-results/2026-08-07-tier-d-node-python-baseline.md).
+
+The signed `3e88dd8a` baseline proves two current Wave-1 blockers:
+
+1. Node main and CPython's stripped libcrypto both contain raw word
+   `0x38764d52`. It is an independently provable unallocated encoding in the
+   AArch64 load/store register-offset family, but the present scanner refuses
+   it because its raw fields resemble x18. Fix this with the family encoding
+   proof, not a word whitelist or a general decoder-failure exemption.
+2. `cpython-fcntl` enters Tier D and then leaves on the typed
+   `BlockingRecordLock` outcome. Service it on the calling host pthread through
+   the shared native DSR driver, after dispatch locks are released.
+
+Execution is evidence-led: red tests, minimal scanner fix, signed recensus,
+record-lock adapter, then the combined eight-suite gate. The recensus—not the
+design's expected ladder—selects Wave 2. Conformance elapsed ratios remain
+diagnostic only; the canonical direct Node and CPython workload scoreboards
+must be measured before any <=2x claim or default flip.
+
 **Date:** 2026-08-06 · **Integration target:** local `main` · **Latest
 decision:** the live-translation-arena campaign is **closed negative**. The
 complete runtime (Tasks 2-9) was deleted in `1cb06de6` per the plan's Task-10
