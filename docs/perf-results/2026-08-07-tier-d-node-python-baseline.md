@@ -319,3 +319,58 @@ controls are allocated:
 
 Task 7 binds the exact class and unallocated opcode masks plus both allocated
 neighbors. It remains an architectural proof, not a banner-word whitelist.
+
+## 2026-08-07 signed SIMD-shift recensus
+
+Task 7 landed as source `d2eb3998474738151e3f6a8bd96189778bbca50c`.
+`just build` produced a codesign-verified release binary with SHA-256:
+
+```text
+d1b02b06825ce76bb290ec6de227ea88967ec70dd3c49bf28dd7a6ca66f7a612
+```
+
+The serial eight-suite run used census
+`target/conformance/tierd-wave2-simd-shift.census.log` and results
+`target/conformance/tierd-wave2-simd-shift.jsonl`. The previous banner word is
+absent, as are `0x61206272`, `0x38764d52`, and `BlockingRecordLock`.
+
+| gate | Task-7 result | diagnostic elapsed |
+|---|---|---:|
+| `node-app-smoke` | MATCH, Node main still scan-refused | 7,653 / 402 ms = 19.04x |
+| `node-v8-smoke` | MATCH, Node main still scan-refused | 9,686 / 403 ms = 24.03x |
+| `cpython-fcntl` | MATCH 8/8, direct | 7,377 / 603 ms = 12.23x |
+| `cpython-glob` | MATCH 15/15, direct | 3,641 / 611 ms = 5.96x |
+| `cpython-json` | MATCH 173/173, direct | 20,360 / 19,472 ms = 1.05x |
+| `cpython-math` | MATCH 76/76, direct | 3,245 / 1,231 ms = 2.64x |
+| `cpython-subprocess` | Empty vs 278/278 | invalid performance row |
+| `cpython-threading` | Empty vs 193/193 | invalid performance row |
+
+The Node rows still fall back to Tier T and the Empty Python rows still did
+not execute their tests. These elapsed values remain diagnostics only.
+
+### Next exact scanner boundary and reserved-mask correction
+
+All four blocked paths now refuse `0xbcc3cad1`:
+
+- Node load-time scan: virtual address `0x1c53e64`;
+- CPython syscall 222 executable-window scan: libcrypto file offset
+  `0x2e4be4`.
+
+The unstripped Node executable identifies the enclosing range as the 272-byte
+local object `_vpsm4_ex_consts` at `0x1c53e00`. Stripped libcrypto contains a
+byte-identical range at `0x2e4b80`; both range hashes are
+`ab0963561f345b19c2db922b349d5960763ef10175c5ab391061006b46424cb0`.
+
+Arm's "Load/store register (unprivileged)" class fixes bits 29:27=`0b111`,
+bits 25:24=`0b00`, and bits 11:10=`0b10`. The class has no SIMD/FP forms, so
+`V` bit 26=`1` is unallocated for the entire class. That is the measured word;
+its raw bits 14:10 resemble x18 only because they are not a register operand
+in this encoding. One-bit control `0x9cc3cad1` is allocated `ldr q17,
+<literal>` and lies outside the proof.
+
+The constant-range audit also found a later SME-shaped word and exposed that
+Task 6 had omitted bit 31 from its top-level mask. Source `7501cfa0` adds an
+allocated SME falsification control (`0x80800012`, `fmops`) and narrows the
+mask from `0x1e000000` to `0x9e000000`: only bit 31=`0` plus bits
+28:25=`0b0000` is the reserved major group. The Task-7 measured paths did not
+reach that later word, but every subsequent build must carry this correction.
