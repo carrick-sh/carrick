@@ -312,6 +312,13 @@ pub enum DirectRunOutcome {
     Exited {
         code: i32,
     },
+    /// The Linux process was terminated by the default action for this guest
+    /// signal. Kept distinct from `Exited { 128 + signum }`: the shipped
+    /// driver must make its host child die by the mapped host signal so a
+    /// guest parent observes `WIFSIGNALED`, not a normal shell-style exit.
+    Signaled {
+        signum: i32,
+    },
     /// The dispatcher produced an outcome tier D does not implement yet
     /// (fd waits, fork, execve, signal delivery). Named rather than
     /// approximated: the guest LEAVES through the island's leave leg with its
@@ -454,7 +461,7 @@ pub struct DirectRunner {
     /// solely so a FORK CHILD can replace it with a fresh registry keyed to
     /// its own pid (`ThreadRegistry`'s main tid is immutable by design);
     /// every other access is a read.
-    registry: RwLock<crate::thread::ThreadRegistry>,
+    registry: RwLock<Arc<crate::thread::ThreadRegistry>>,
     /// Private-futex parking for this guest, shared with the dispatcher's
     /// futex handler so waits and wakes meet in one table. `Arc` so it can be
     /// published as the PROCESS-current table
@@ -501,6 +508,15 @@ impl Drop for DirectRunner {
 impl DirectRunner {
     pub fn new(dispatcher: SyscallDispatcher, memory: IdentityMemory) -> Self {
         let futex = Arc::new(crate::thread::FutexTable::new());
+        let registry = Arc::new(crate::thread::ThreadRegistry::new(
+            ThreadId::main_from_host_pid(),
+        ));
+        // `/proc/self/task`, per-tid `/proc` state, and async thread-directed
+        // routing resolve through the process-current registry because those
+        // paths do not carry a syscall context. Tier D owns a real MT
+        // registry too; failing to publish it made CPython count one task
+        // before fork and suppress its required multithreaded-fork warning.
+        crate::thread::set_current_registry(Arc::clone(&registry));
         // Publish the table process-wide so timer fallback threads
         // (`deliver_native_process_signal` → notify_current_futex_signal_
         // pending) wake tier-D futex parks, and register the native
@@ -518,9 +534,7 @@ impl DirectRunner {
             syscalls: AtomicU64::new(0),
             brk: Mutex::new(None),
             anon_rw: Mutex::new(Vec::new()),
-            registry: RwLock::new(crate::thread::ThreadRegistry::new(
-                ThreadId::main_from_host_pid(),
-            )),
+            registry: RwLock::new(registry),
             futex,
             threads: Mutex::new(Vec::new()),
             exec: None,
@@ -578,6 +592,12 @@ impl DirectRunner {
         drop(slot);
         self.exiting.store(true, Ordering::SeqCst);
         self.futex.notify_signal_pending();
+        // Futex parking and fd/sleep parking are independent. Every tier-D
+        // host thread owns a registered `ThreadWaiter`; broadcast after the
+        // durable `exiting` store so dispatcher-aware waits recheck it and
+        // retire promptly instead of joining behind an arbitrarily long
+        // guest nanosleep/select timeout.
+        crate::host_signal::wake_all_waiters();
     }
 
     /// One thread's `exit(2)` bookkeeping — Linux's CLEARTID contract (write
@@ -614,6 +634,19 @@ impl DirectRunner {
             for handle in handles {
                 let _ = handle.join();
             }
+        }
+    }
+
+    /// Cooperate with a sibling's process-creating fork at a lock-safe
+    /// syscall boundary.
+    ///
+    /// Tier D has no vCPU to release: the guest is already parked in an
+    /// island handler and callers reach this only without temporary
+    /// dispatcher/runner guards. The shared barrier still supplies the
+    /// across-fork mutex and child-reset contract used by every native tier.
+    fn park_for_fork_quiesce(&self) {
+        if crate::fork_quiesce::is_quiescing() {
+            crate::fork_quiesce::barrier().park_if_quiescing();
         }
     }
 
@@ -1460,7 +1493,22 @@ impl DirectRunner {
     /// signal-delivery boundary — every completed syscall is a delivery
     /// point, exactly the DSR loop's `complete_dsr_syscall` contract.
     fn service(&self, ctx: &mut GuestContext) -> ServiceVerdict {
-        match self.service_syscall(ctx) {
+        // A child tid is registered before its host thread starts. If a fork
+        // begins in that interval, the new thread must contribute to the
+        // forker's live-count drain before its first guest instruction.
+        self.park_for_fork_quiesce();
+        if self.exiting.load(Ordering::SeqCst) {
+            return ServiceVerdict::Leave;
+        }
+        let verdict = self.service_syscall(ctx);
+        // The flag can rise while dispatch is in flight. Park on every
+        // outcome, including ThreadExit: the forker may already have counted
+        // this tid, so disappearing without a pause would strand the drain.
+        self.park_for_fork_quiesce();
+        if self.exiting.load(Ordering::SeqCst) && matches!(verdict, ServiceVerdict::Resume(_)) {
+            return ServiceVerdict::Leave;
+        }
+        match verdict {
             ServiceVerdict::Resume(value) => self.deliver_pending_at_boundary(ctx, value),
             leave => leave,
         }
@@ -1518,6 +1566,10 @@ impl DirectRunner {
         // The signal-wait (`WaitOnSignals`) overall deadline, same contract.
         let mut signal_wait_deadline: Option<Instant> = None;
         loop {
+            self.park_for_fork_quiesce();
+            if self.exiting.load(Ordering::SeqCst) {
+                return ServiceVerdict::Leave;
+            }
             let outcome = self.dispatcher.dispatch_threaded(
                 request,
                 &mut memory,
@@ -1691,9 +1743,11 @@ impl DirectRunner {
                 // FUTEX_WAIT whose value check passed under the dispatcher
                 // lock: park on the shared table (the dispatcher's wake side
                 // uses the same one). A deliverable pending signal breaks
-                // the park with EINTR so the boundary delivers its handler.
+                // the park with EINTR so the boundary delivers its handler;
+                // a fork quiesce breaks it only long enough to park at the
+                // barrier, then re-dispatches invisibly.
                 Ok(DispatchOutcome::FutexWait { wait, timeout }) => {
-                    return match self
+                    match self
                         .futex
                         .wait_prepared_for_thread(wait, timeout, tid, &|| {
                             self.exiting.load(Ordering::SeqCst)
@@ -1701,19 +1755,37 @@ impl DirectRunner {
                                     tid,
                                     carrick_abi::WaitSigMask::NONE,
                                 )
+                                || crate::fork_quiesce::is_quiescing()
+                                || crate::fork_quiesce::exec_replacing_other_thread(tid)
                         }) {
-                        crate::thread::FutexWaitOutcome::Woken => ServiceVerdict::Resume(0),
+                        crate::thread::FutexWaitOutcome::Woken => {
+                            return ServiceVerdict::Resume(0);
+                        }
                         crate::thread::FutexWaitOutcome::TimedOut => {
-                            ServiceVerdict::Resume(crate::linux_abi::LINUX_ETIMEDOUT.guest_retval())
+                            return ServiceVerdict::Resume(
+                                crate::linux_abi::LINUX_ETIMEDOUT.guest_retval(),
+                            );
                         }
                         crate::thread::FutexWaitOutcome::Interrupted => {
                             if self.exiting.load(Ordering::SeqCst) {
-                                ServiceVerdict::Leave
-                            } else {
-                                ServiceVerdict::Resume(crate::linux_abi::LINUX_EINTR.guest_retval())
+                                return ServiceVerdict::Leave;
                             }
+                            let real_signal = self.deliverable_wait_signal_pending(
+                                tid,
+                                carrick_abi::WaitSigMask::NONE,
+                            );
+                            if !real_signal
+                                && !crate::fork_quiesce::exec_replacing_other_thread(tid)
+                                && crate::fork_quiesce::is_quiescing()
+                            {
+                                self.park_for_fork_quiesce();
+                                continue;
+                            }
+                            return ServiceVerdict::Resume(
+                                crate::linux_abi::LINUX_EINTR.guest_retval(),
+                            );
                         }
-                    };
+                    }
                 }
                 // Blocking fd waits: park on the per-thread waiter, then
                 // RE-DISPATCH on readiness (the handler then finds the ready
@@ -1974,6 +2046,14 @@ impl DirectRunner {
                     }
                 };
                 let _thread_ctx = install_thread_context(runner, group, tid);
+                // `register_child` preceded the host spawn. A sibling fork
+                // may therefore already include this tid in its drain.
+                runner.park_for_fork_quiesce();
+                if runner.exiting.load(Ordering::SeqCst) {
+                    runner.finish_thread_bookkeeping(tid, 0);
+                    drop(guard);
+                    return;
+                }
                 // SAFETY: the parked context was seeded from the parent's
                 // state at a patched svc site of this group, and the guest
                 // leaves through the handler.
@@ -2010,8 +2090,8 @@ impl DirectRunner {
     /// the parent with the child's guest-visible pid. The pre/post-fork
     /// bookkeeping mirrors the DSR lane's `handle_native_fork` — ns-pid
     /// allocation, the guest-cpu child record, the shared dispatcher
-    /// fork-child reset, the child-exit watch — minus the sibling quiesce
-    /// (MT fork fails closed here). vfork is serviced as CoW + true parent
+    /// fork-child reset, the child-exit watch, and the shared sibling
+    /// quiesce. vfork is serviced as CoW + true parent
     /// suspension; see the vfork block below for the one documented
     /// divergence (no CLONE_VM memory sharing).
     fn service_fork(
@@ -2033,12 +2113,30 @@ impl DirectRunner {
         if request.clone_parent {
             return unsupported("CLONE_PARENT fork on tier D");
         }
-        if read_lock(&self.registry).live_count() > 1 {
-            // A multithreaded fork needs the sibling quiesce the DSR lane
-            // has and tier D does not (forking with a sibling mid-mutation
-            // hands the child poisoned locks). Fail closed, named.
-            return unsupported("multithreaded fork on tier D (no sibling quiesce)");
+        let barrier = crate::fork_quiesce::barrier();
+        if !barrier.try_begin_fork() {
+            return eagain();
         }
+        let live_at_fork = read_lock(&self.registry).live_count();
+        let mut quiesced = false;
+        if live_at_fork > 1 {
+            barrier.set_quiescing();
+            // Futex waits wake immediately; fd/signal waits use the shared
+            // waiter's 50 ms lost-edge backstop and surface is_quiescing().
+            self.futex.notify_signal_pending();
+            if !barrier.wait_quiesced(live_at_fork - 1, Duration::from_secs(10)) {
+                barrier.end_quiesce();
+                barrier.end_fork();
+                return eagain();
+            }
+            quiesced = true;
+        }
+        let end_fork_state = || {
+            if quiesced {
+                barrier.end_quiesce();
+            }
+            barrier.end_fork();
+        };
         crate::probes::fork_pre(ctx.pc, 0, 0);
         // vfork/CLONE_VFORK: the child gets the same CoW copy an ordinary
         // fork gets — tier D's identity mappings are MAP_PRIVATE, so the
@@ -2058,6 +2156,7 @@ impl DirectRunner {
             let mut fds = [0 as libc::c_int; 2];
             // SAFETY: plain pipe(2) into a local array.
             if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+                end_fork_state();
                 return eagain();
             }
             // SAFETY: just-created fd; set the WRITE end close-on-exec so
@@ -2089,6 +2188,7 @@ impl DirectRunner {
             0,
         ) else {
             close_pipe(vfork_pipe);
+            end_fork_state();
             return eagain();
         };
         // Pin the fork-shared signal-static mutexes an auxiliary thread (the
@@ -2096,16 +2196,26 @@ impl DirectRunner {
         // does — a fork landing inside such a window hands the child a lock
         // held by a thread that does not exist there.
         let fork_signal_locks = crate::host_signal::hold_signal_locks_for_fork();
-        // SAFETY: single guest thread (checked above); the guest is parked in
-        // this handler, so its state is fully in `ctx` and host memory.
+        // Exclude the barrier's park-window mutex across fork. Every sibling
+        // is parked with no runner/dispatcher lock held, and the forking
+        // thread owns this mutex in both CoW copies, so the child can reset it.
+        let paused_across_fork = quiesced.then(|| barrier.lock_paused_across_fork());
+        // SAFETY: every guest sibling is parked; this thread's guest state is
+        // fully in `ctx` and host memory.
         let child = unsafe { libc::fork() };
         drop(fork_signal_locks);
+        drop(paused_across_fork);
         if child < 0 {
             crate::guest_cpu::abort_prepared_child_record();
             close_pipe(vfork_pipe);
+            end_fork_state();
             return eagain();
         }
         if child == 0 {
+            end_fork_state();
+            if quiesced {
+                barrier.reset_paused_for_child();
+            }
             // CHILD: repair inherited runtime state before the guest resumes.
             if let Some((read_fd, _write_fd)) = vfork_pipe {
                 // Keep the CLOEXEC write end: closing it (via exec or exit)
@@ -2154,6 +2264,8 @@ impl DirectRunner {
             crate::probes::fork_post(0, ctx.pc, 0);
             return ServiceVerdict::Resume(0);
         }
+        // PARENT: release siblings before a possible vfork suspension.
+        end_fork_state();
         // PARENT. For vfork, SUSPEND until the child execs or exits (EOF on
         // the pipe): the guest contract, and the same order as the DSR
         // lane's vfork wait (suspend first, publish after). Single guest
@@ -2217,7 +2329,9 @@ impl DirectRunner {
     /// the address-space copy.
     fn reset_after_fork_child(&self) -> ThreadId {
         let tid = ThreadId::main_from_host_pid();
-        *write_lock(&self.registry) = crate::thread::ThreadRegistry::new(tid);
+        let registry = Arc::new(crate::thread::ThreadRegistry::new(tid));
+        *write_lock(&self.registry) = Arc::clone(&registry);
+        crate::thread::set_current_registry(registry);
         for handle in std::mem::take(&mut *lock(&self.threads)) {
             // The copied JoinHandle names a PARENT thread; joining or
             // detaching it here would target a pthread that does not exist
@@ -2396,6 +2510,11 @@ impl DirectRunner {
                     if let Some(interrupt) = self.classify_wait_interrupt(tid, sig_mask) {
                         return interrupt;
                     }
+                    // A fork quiesce is an internal stop-the-world edge, not
+                    // a guest-visible EINTR and not completion of the sleep.
+                    // Park here, at the same lock-safe wait boundary, then
+                    // continue against the ORIGINAL deadline after release.
+                    self.park_for_fork_quiesce();
                     // Spurious: re-park for the remaining time.
                 }
                 crate::io_wait::WaitResult::Errno(_) => return TierDWait::TimedOut,
@@ -2606,20 +2725,14 @@ impl DirectRunner {
         ServiceVerdict::Leave
     }
 
-    /// A signal whose action is termination kills the whole thread-group,
-    /// exactly as the DSR lane: a forked guest child dies BY the host signal
-    /// (its guest parent observes WIFSIGNALED), the main guest process ends
-    /// with the shell convention `128 + signum`.
+    /// A signal whose action is termination kills the whole thread-group.
+    ///
+    /// Record the guest signal exactly; do not turn it into a normal
+    /// `128 + signum` exit. The shipped driver re-raises the corresponding
+    /// host signal only AFTER [`with_runner`] has joined every guest sibling,
+    /// preserving both Linux wait status and orderly tier-D teardown.
     fn terminate_by_guest_signal(&self, signum: i32) {
-        if self.forked_guest_child() || self.dispatcher.is_forked_guest_process() {
-            self.dispatcher.cleanup_sysv_ipc_on_process_exit();
-            crate::exec_helpers::forked_child_die_by_signal(
-                signum,
-                self.dispatcher.stdout(),
-                self.dispatcher.stderr(),
-            );
-        }
-        self.end_process(DirectRunOutcome::Exited { code: 128 + signum });
+        self.end_process(DirectRunOutcome::Signaled { signum });
     }
 
     /// [`Self::terminate_by_guest_signal`] as an island verdict.
@@ -4493,13 +4606,160 @@ __attribute__((naked)) void _start(void) {
         );
     }
 
+    /// The multithreaded-fork boundary: a live guest sibling loops through
+    /// syscall boundaries while the main guest thread creates a PROCESS
+    /// child. The forker must quiesce that sibling, fork with the shared
+    /// runtime locks in a coherent state, reset the child copy, and release
+    /// the parent sibling. Both process sides then exit and the parent reaps
+    /// the child; `exit_group` retires the still-live sibling before
+    /// [`with_runner`] joins it.
+    ///
+    /// Red against the pre-quiesce runner: syscall 220 left named as
+    /// `multithreaded fork on tier D (no sibling quiesce)`.
+    #[test]
+    fn multithreaded_fork_quiesces_the_live_guest_sibling() {
+        const NR_MMAP: u32 = 222;
+        const NR_CLONE: u32 = 220;
+        const NR_NANOSLEEP: u32 = 101;
+        const NR_WAIT4: u32 = 260;
+        const NR_EXIT_GROUP: u32 = 94;
+        // CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD
+        // |CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID.
+        const THREAD_FLAGS: u32 =
+            0x100 | 0x200 | 0x400 | 0x800 | 0x1_0000 | 0x0020_0000 | 0x0100_0000;
+        let elf = elf_with_code(&[
+            //  0: reserve the sibling's 128 KiB stack.
+            movz(0, 0, 0),
+            movz(1, 0x2, 16),
+            movz(2, 3, 0),
+            movz(3, 0x22, 0),
+            movz(4, 0, 0),
+            movz(5, 0, 0),
+            movz(8, NR_MMAP, 0),
+            SVC_0,
+            movz(9, 0x2, 16),
+            add_reg(9, 0, 9),
+            str_pre_sp(31), // ctid word
+            mov_from_sp(4),
+            str_pre_sp(31), // sibling-started word
+            mov_from_sp(20),
+            movz(0, THREAD_FLAGS & 0xffff, 0),
+            movk(0, THREAD_FLAGS >> 16, 16),
+            mov_reg(1, 9),
+            movz(2, 0, 0),
+            movz(3, 0, 0),
+            movz(8, NR_CLONE, 0),
+            SVC_0,
+            cbz_rel(0, (51 - 21) * 4), // sibling -> long sleep
+            // Wait until the sibling has executed guest code, so the fork
+            // cannot win solely against the pre-entry startup check.
+            ldr_reg_imm(9, 20, 0),
+            cbz_rel(9, -4),
+            // 24: process-creating clone(SIGCHLD), stack = NULL.
+            movz(0, 17, 0),
+            movz(1, 0, 0),
+            movz(2, 0, 0),
+            movz(3, 0, 0),
+            movz(4, 0, 0),
+            movz(8, NR_CLONE, 0),
+            SVC_0,
+            cbz_rel(0, (61 - 31) * 4), // process child -> exit 23
+            mov_reg(19, 0),            // parent: preserve child pid
+            str_pre_sp(31),            // wait status word
+            mov_reg(0, 19),
+            mov_from_sp(1),
+            movz(2, 0, 0),
+            movz(3, 0, 0),
+            movz(8, NR_WAIT4, 0),
+            SVC_0,
+            // Give the released sibling 100 ms to enter its 60-second host
+            // wait. The later exit_group must wake it; otherwise the test
+            // blocks for roughly a minute in join_guest_threads.
+            str_pre_sp(31),
+            movz(9, 0xe100, 0),
+            movk(9, 0x05f5, 16), // 100,000,000 ns
+            str_sp(9, 8),
+            mov_from_sp(0),
+            movz(1, 0, 0),
+            movz(8, NR_NANOSLEEP, 0),
+            SVC_0,
+            movz(0, 5, 0),
+            movz(8, NR_EXIT_GROUP, 0),
+            SVC_0,
+            // 51: sibling publishes that it ran, then blocks in a 60-second
+            // nanosleep. Fork quiesce must
+            // wake+park it without completing the guest sleep; the parent's
+            // later exit_group must wake it again and retire it promptly.
+            movz(9, 1, 0),
+            str_reg_imm(9, 20, 0),
+            movz(9, 60, 0),
+            str_pre_sp(9),
+            str_sp(31, 8),
+            mov_from_sp(0),
+            movz(1, 0, 0),
+            movz(8, NR_NANOSLEEP, 0),
+            SVC_0,
+            b_rel((53 - 60) * 4),
+            // 61: only the forking thread exists in the process child.
+            movz(0, 23, 0),
+            movz(8, NR_EXIT_GROUP, 0),
+            SVC_0,
+        ]);
+        let group = DirectLoadGroup::load(&elf, island_handler())
+            .expect("load")
+            .expect("eligible");
+        let stack = DirectStack::build(
+            &elf,
+            group.main().bias(),
+            None,
+            &[b"mt-fork-fixture".to_vec()],
+            &[],
+        )
+        .expect("stack");
+        let runner = DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
+        let host_pid_before = unsafe { libc::getpid() };
+        // SAFETY: patched image built with `island_handler`; every surviving
+        // guest thread leaves through exit_group.
+        unsafe {
+            with_runner(&runner, &group, || {
+                group.enter_on_stack(group.main().entry(), stack.sp())
+            })
+        }
+        .expect("with_runner")
+        .0
+        .expect("enter");
+        if unsafe { libc::getpid() } != host_pid_before {
+            let code = match runner.outcome() {
+                Some(DirectRunOutcome::Exited { code }) => code,
+                _ => 111,
+            };
+            unsafe { libc::_exit(code) };
+        }
+        assert_eq!(
+            runner.outcome(),
+            Some(DirectRunOutcome::Exited { code: 5 }),
+            "the parent resumed, reaped its process child, and retired the sibling"
+        );
+    }
+
     /// `ldr xt, [sp, #imm]`
     const fn ldr_sp_imm(rt: u32, byte_offset: u32) -> u32 {
         0xf940_0000 | ((byte_offset / 8) << 10) | (31 << 5) | rt
     }
+    /// `ldr xt, [xn, #imm]` / `str xt, [xn, #imm]`.
+    const fn ldr_reg_imm(rt: u32, rn: u32, byte_offset: u32) -> u32 {
+        0xf940_0000 | ((byte_offset / 8) << 10) | (rn << 5) | rt
+    }
+    const fn str_reg_imm(rt: u32, rn: u32, byte_offset: u32) -> u32 {
+        0xf900_0000 | ((byte_offset / 8) << 10) | (rn << 5) | rt
+    }
     /// `add xd, xn, #imm` (rn = 31 reads SP)
     const fn add_imm(rd: u32, rn: u32, imm12: u32) -> u32 {
         0x9100_0000 | (imm12 << 10) | (rn << 5) | rd
+    }
+    /// `add xd, xn, xm`.
+    const fn add_reg(rd: u32, rn: u32, rm: u32) -> u32 {
+        0x8b00_0000 | (rm << 16) | (rn << 5) | rd
     }
     /// `add xd, xn, xm, lsl #3`
     const fn add_lsl3(rd: u32, rn: u32, rm: u32) -> u32 {
@@ -4512,6 +4772,14 @@ __attribute__((naked)) void _start(void) {
     /// `cbnz xt, <pc + offset>`
     const fn cbnz_rel(rt: u32, offset: i32) -> u32 {
         0xb500_0000 | (((offset as u32 >> 2) & 0x7ffff) << 5) | rt
+    }
+    /// `cbz xt, <pc + offset>`.
+    const fn cbz_rel(rt: u32, offset: i32) -> u32 {
+        0xb400_0000 | (((offset as u32 >> 2) & 0x7ffff) << 5) | rt
+    }
+    /// `b <pc + offset>`.
+    const fn b_rel(offset: i32) -> u32 {
+        0x1400_0000 | ((offset as u32 >> 2) & 0x03ff_ffff)
     }
     /// `cmp xn, #imm` (SUBS XZR)
     const fn cmp_imm(rn: u32, imm12: u32) -> u32 {
@@ -4932,8 +5200,9 @@ __attribute__((naked)) void _start(void) {
     }
 
     /// A self-directed fatal signal with NO handler takes the default
-    /// action: the whole run ends `128 + signum`, and nothing after the
-    /// kill executes.
+    /// action: the whole run records a signal death, and nothing after the
+    /// kill executes. The shipped driver turns this into a real host signal
+    /// death after all guest siblings have retired.
     ///
     /// Red against the pre-delivery runner: the signal was dropped and the
     /// poison write ran.
@@ -4951,7 +5220,7 @@ __attribute__((naked)) void _start(void) {
         let runner = run_signal_fixture(&asm.assemble(), SyscallDispatcher::new());
         assert_eq!(
             runner.outcome(),
-            Some(DirectRunOutcome::Exited { code: 138 }),
+            Some(DirectRunOutcome::Signaled { signum: 10 }),
             "SIGUSR1's default action terminated the run (stdout: {:?})",
             String::from_utf8_lossy(&runner.dispatcher().stdout()),
         );

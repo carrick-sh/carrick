@@ -1017,6 +1017,15 @@ fn run_direct_in_current_process(
             native_tier_census("direct-exit", resolved, &code.to_string());
             Ok(DirectLaunchFlow::Completed(code))
         }
+        Some(dr::DirectRunOutcome::Signaled { signum }) => {
+            native_tier_census("direct-signal", resolved, &signum.to_string());
+            runner.dispatcher().cleanup_sysv_ipc_on_process_exit();
+            crate::exec_helpers::forked_child_die_by_signal(
+                signum,
+                runner.dispatcher().stdout(),
+                runner.dispatcher().stderr(),
+            )
+        }
         Some(dr::DirectRunOutcome::Unsupported { syscall, outcome }) => {
             native_tier_census(
                 "direct-leave",
