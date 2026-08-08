@@ -805,6 +805,10 @@ const fn ldp_post_sp(rt1: u32, rt2: u32) -> u32 {
 /// rewritten guest instruction observes the architecturally correct SP.
 const ADD_SP_16: u32 = 0x9100_43ff;
 const SUB_SP_16: u32 = 0xd100_43ff;
+/// `ldp xt1, xt2, [xn, #byte_offset]` (64-bit, signed scaled imm7).
+const fn ldp_imm(rt1: u32, rt2: u32, rn: u32, byte_offset: u32) -> u32 {
+    0xa940_0000 | ((byte_offset / 8) << 15) | (rt2 << 10) | (rn << 5) | rt1
+}
 
 /// GPR ordinal for an X- or W-form register, or `None` for anything else.
 fn reg_index(reg: bad64::Reg) -> Option<(u32, bool)> {
@@ -886,6 +890,28 @@ fn x18_sp_use_is_veneer_safe(insn: &bad64::Instruction) -> bool {
         }
         _ => true,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum X18SpPair {
+    StorePre { other: u32 },
+    LoadPost { other: u32 },
+}
+
+/// OpenSSL saves/restores the platform-register pair as
+/// `stp xN,x18,[sp,#-16]!` / `ldp xN,x18,[sp],#16`. The generic veneer cannot
+/// borrow SP around an instruction that itself changes SP, but this exact
+/// architectural pair has a register-preserving split lowering.
+fn x18_sp_pair(word: u32) -> Option<X18SpPair> {
+    let other = word & 0x1f;
+    if other == 18 || other > 30 {
+        return None;
+    }
+    match word & 0xffff_ffe0 {
+        0xa9bf_4be0 => Some(X18SpPair::StorePre { other }),
+        0xa8c1_4be0 => Some(X18SpPair::LoadPost { other }),
+        _ => None,
+    }
 }
 
 /// Rewrite `word` so every x18 operand names `scratch` instead, or `None` if
@@ -1165,6 +1191,37 @@ fn x18_veneer(
     }
     w.push(str_imm(value_reg, addr_reg, DirectThreadSlots::X18_OFF));
     w.push(ldp_post_sp(value_reg, addr_reg));
+    w
+}
+
+fn x18_sp_pair_veneer(pair: X18SpPair, tsd: TsdSlot) -> Vec<u32> {
+    let mut w = Vec::with_capacity(14);
+    match pair {
+        X18SpPair::StorePre { other } => {
+            // The first store performs the guest's SP writeback and preserves
+            // `other` in its final stack slot, freeing that register to reach
+            // the per-thread x18 slot. Restore it from the just-written pair.
+            w.push(str_pre_sp(other));
+            w.extend_from_slice(&tsd_resolve(other, tsd));
+            w.push(ldr_imm(other, other, DirectThreadSlots::X18_OFF));
+            w.push(str_imm(other, 31, 8));
+            w.push(ldr_imm(other, 31, 0));
+        }
+        X18SpPair::LoadPost { other } => {
+            // Borrow two unused registers BELOW the source pair. Read the
+            // guest pair at +16 without writeback, publish x18 to its slot,
+            // restore the borrowed registers/SP, then perform the guest's
+            // post-index update explicitly.
+            let value = if other == 0 { 1 } else { 0 };
+            let addr = if other == 0 || other == 1 { 2 } else { 1 };
+            w.push(stp_pre_sp(value, addr));
+            w.extend_from_slice(&tsd_resolve(addr, tsd));
+            w.push(ldp_imm(other, value, 31, 16));
+            w.push(str_imm(value, addr, DirectThreadSlots::X18_OFF));
+            w.push(ldp_post_sp(value, addr));
+            w.push(ADD_SP_16);
+        }
+    }
     w
 }
 
@@ -1477,6 +1534,7 @@ fn scan_executable_words(code: &[u8], vaddr0: u64) -> Result<usize, DirectInelig
                     let veneerable = if cond_branch_on_x18(word)
                         || test_bit_branch_on_x18(word)
                         || pc_relative_address_to_x18(word)
+                        || x18_sp_pair(word).is_some()
                     {
                         true
                     } else if instruction_is_pc_relative(&insn) {
@@ -1782,6 +1840,35 @@ impl DirectImage {
                 let value = pc_relative_address_value(word, site_vaddr + bias);
                 let veneer_cursor = arena.cursor;
                 let words = x18_pc_address_veneer(value, tsd);
+                let bytes = words.len() * 4;
+                if veneer_cursor + bytes + 4 > arena.len {
+                    return Err(io::Error::other("veneer budget exhausted"));
+                }
+                for (i, w) in words.iter().enumerate() {
+                    arena.write_word(veneer_cursor + i * 4, *w);
+                }
+                let return_delta = (text_runtime(site_host) + 4) as i64
+                    - arena.runtime(veneer_cursor + bytes) as i64;
+                let entry_delta =
+                    arena.runtime(veneer_cursor) as i64 - text_runtime(site_host) as i64;
+                if !b_in_range(return_delta) || !b_in_range(entry_delta) {
+                    return Ok(Err(DirectIneligible::IslandOutOfRange {
+                        vaddr: site_vaddr,
+                    }));
+                }
+                arena.write_word(veneer_cursor + bytes, b_rel(return_delta));
+                self.write_word(site_host, b_rel(entry_delta));
+                arena.cursor = (veneer_cursor + bytes + 4).next_multiple_of(4);
+                self.x18_sites += 1;
+                continue;
+            }
+            // Pre/post-indexed stack pairs containing x18 need a dedicated
+            // split lowering: the generic veneer itself borrows SP and cannot
+            // execute an instruction that also updates SP.
+            if let Some(pair) = x18_sp_pair(word) {
+                let site_host = (site_vaddr - lo) as usize;
+                let veneer_cursor = arena.cursor;
+                let words = x18_sp_pair_veneer(pair, tsd);
                 let bytes = words.len() * 4;
                 if veneer_cursor + bytes + 4 > arena.len {
                     return Err(io::Error::other("veneer budget exhausted"));
@@ -4038,6 +4125,46 @@ mod tests {
             32,
             "the rewritten add must use the unshifted guest SP"
         );
+    }
+
+    /// OpenSSL's AArch64 assembly saves/restores x18 in an ordinary paired
+    /// stack frame. Tier D must virtualize the x18 half while preserving the
+    /// pre/post-indexed SP update and the adjacent register's value.
+    #[test]
+    fn x18_sp_pair_veneers_preserve_stack_semantics() {
+        const CHECK_NR: u64 = 0x0ff9;
+        let code: Vec<u32> = vec![
+            mov_reg(20, 30),
+            mov_from_sp(21),
+            movz(17, 0x1111, 0),
+            movz(18, 0x2222, 0),
+            0xa9bf_4bf1, // stp x17, x18, [sp, #-16]!
+            movz(17, 0, 0),
+            movz(18, 0, 0),
+            0xa8c1_4bf1, // ldp x17, x18, [sp], #16
+            mov_reg(0, 17),
+            mov_reg(1, 18),
+            mov_from_sp(2),
+            mov_reg(3, 21),
+            movz(8, CHECK_NR as u32, 0),
+            SVC_0,
+            mov_reg(30, 20),
+            0xd65f_03c0,
+        ];
+        let elf = elf_with_code(&code);
+        let group = DirectLoadGroup::load(&elf, record_only)
+            .expect("load")
+            .expect("eligible");
+        seen_clear();
+        let entry = group.main().entry();
+        enter_with_slots(&group, entry);
+
+        let seen = seen_snapshot();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, CHECK_NR);
+        assert_eq!(seen[0].1[0], 0x1111, "the adjacent x17 round-tripped");
+        assert_eq!(seen[0].1[1], 0x2222, "guest x18 round-tripped");
+        assert_eq!(seen[0].1[2], seen[0].1[3], "SP balanced after the pair");
     }
 
     #[test]
