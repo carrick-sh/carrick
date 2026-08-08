@@ -907,19 +907,19 @@ The measured word has `op1=0b0001`. Toggling bit 27 produces the allocated
 one-bit control `0x0a783a40`, `bic w0, w18, w24, lsr #14`; it must stay outside
 the proof and take the existing decoded-x18 path.
 
-- [ ] **Step 1: Add deterministic red boundary and mask tests**
+- [x] **Step 1: Add deterministic red boundary and mask tests**
 
 Add load-time and executable-window tests using `0x02783a40`. Add classifier
 assertions for the measured word, the allocated BIC control and its decoded
 x18 operand, the allocated SME control, and `0xfffffff2`.
 
-- [ ] **Step 2: Run the new tests and verify red**
+- [x] **Step 2: Run the new tests and verify red**
 
 ```bash
 cargo test -p carrick-native-darwin top_level_unallocated_op1 -- --nocapture
 ```
 
-- [ ] **Step 3: Extend the source-bound classifier minimally**
+- [x] **Step 3: Extend the source-bound classifier minimally**
 
 ```rust
 const TOP_LEVEL_UNALLOCATED_OP1_MASK: u32 = 0x1a00_0000;
@@ -932,14 +932,77 @@ if (word & TOP_LEVEL_UNALLOCATED_OP1_MASK) == TOP_LEVEL_UNALLOCATED_OP1 {
 
 Keep the corrected Task-6 bit-31 mask and all existing allocated controls.
 
-- [ ] **Step 4: Run focused and full scanner gates**
+- [x] **Step 4: Run focused and full scanner gates**
 
 Run the new filter plus `reserved_major`, `simd_unprivileged`,
 `advanced_simd_shift`, `proven_unallocated`, the full crate, `just fmt-check`,
 and `just clippy`.
 
-- [ ] **Step 5: Commit, build signed, and recensus the eight suites**
+- [x] **Step 5: Commit, build signed, and recensus the eight suites**
 
 Commit only `direct.rs`, build through `just build`, verify codesign and
 SHA-256, then run the serial eight-suite gate with run ID and artifact stem
 `tierd-wave2-top-level-op1`. The census selects Task 10.
+
+---
+
+### Task 10: Admit the measured x18-free allocated SME2 SMLAL shape
+
+**Wave:** 2
+
+**Files:**
+
+- Modify: `crates/carrick-native-darwin/src/direct.rs`
+- Test: `crates/carrick-native-darwin/src/direct.rs`
+- Modify after live proof:
+  `docs/perf-results/2026-08-07-tier-d-node-python-baseline.md`
+- Modify after live proof: `handoff.md`
+
+**Exact red workload and images:** signed source `44cc69d4` advances Node to
+virtual address `0x1c53ee0` and CPython's libcrypto executable window to file
+offset `0x2e4c60`; all refuse `0xc1d21300`, byte `0xe0` of the same constant
+object.
+
+**Semantic reference:** this word is not unallocated. The Arm XML-derived
+decoder recognizes the allocated SME2 `SMLAL ZA, Z, Z[index]` two-vector
+encoding with exact mask/value `0xfff09038/0xc1d01000`. `bad64` returns
+`ErrorOperands` only because its formatter lacks operand construction for this
+new encoding. The operands are ZA, Zm, Zn, immediates, and `Rv`, which is
+constrained to W8-W11; no field can name GPR x18. Toggling bit 29 produces
+allocated `0xe1d21300`, `ld1q z0h.q[w12], p4/z, [x24, x18, lsl #4]`; it must
+remain outside the proof and on the decoded-x18 path.
+
+- [ ] **Step 1: Separate unallocated proof from x18-free decoder failures**
+
+Add `word_is_proven_x18_free_decoder_failure(word)`, initially delegating only
+to `word_is_proven_unallocated`, and make the scanner use it. Existing tests
+must remain green.
+
+- [ ] **Step 2: Add deterministic red boundary and family tests**
+
+Add load-time and executable-window tests for `0xc1d21300`. Assert that it is
+not classified unallocated but is classified x18-free; assert that the one-bit
+LD1Q control is not x18-free, decodes successfully, and names x18. Run the
+`allocated_sme2` filter and confirm red before extending the new classifier.
+
+- [ ] **Step 3: Implement the exact allocated-family proof**
+
+```rust
+const SME2_SMLAL_TWO_VECTOR_MASK: u32 = 0xfff0_9038;
+const SME2_SMLAL_TWO_VECTOR: u32 = 0xc1d0_1000;
+```
+
+Return true only when that exact comparison matches, after the unallocated
+delegate. Do not label the word unallocated, admit other SME2 encodings, or
+infer data from the object symbol.
+
+- [ ] **Step 4: Run focused and full scanner gates**
+
+Run `allocated_sme2`, every prior family filter, the suspicious-word refusal,
+the full crate, `just fmt-check`, and `just clippy`.
+
+- [ ] **Step 5: Commit, build signed, and recensus the eight suites**
+
+Commit only `direct.rs`, build through `just build`, verify codesign and
+SHA-256, then run the serial eight-suite gate with run ID and artifact stem
+`tierd-wave2-allocated-sme2`. The census selects Task 11.

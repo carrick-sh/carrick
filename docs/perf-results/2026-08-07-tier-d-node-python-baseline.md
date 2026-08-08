@@ -417,3 +417,48 @@ root A64 table marks top-level `op1` values satisfying
 `op1=0b0001`. Toggling bit 27 gives allocated `0x0a783a40`,
 `bic w0, w18, w24, lsr #14`; that one-bit control must remain on the decoded
 x18 refusal path. Task 9 binds only this root-table mask.
+
+## 2026-08-07 signed top-level-op1 recensus
+
+Task 9 landed as source `44cc69d44f0611ce76231ca975d77da37b503e79`.
+The codesign-verified release binary SHA-256 was:
+
+```text
+33c3b18e8f86fa049324e7f340b1c4481bd3a26461eca8a1cfe11c148c5434d6
+```
+
+The serial eight-suite run used census
+`target/conformance/tierd-wave2-top-level-op1.census.log` and results
+`target/conformance/tierd-wave2-top-level-op1.jsonl`. It retained every prior
+scanner and record-lock closure.
+
+| gate | Task-9 result | diagnostic elapsed |
+|---|---|---:|
+| `node-app-smoke` | MATCH, Node main still scan-refused | 9,781 / 402 ms = 24.33x |
+| `node-v8-smoke` | MATCH, Node main still scan-refused | 10,119 / 403 ms = 25.11x |
+| `cpython-fcntl` | MATCH 8/8, direct | 7,812 / 603 ms = 12.96x |
+| `cpython-glob` | MATCH 15/15, direct | 3,863 / 611 ms = 6.32x |
+| `cpython-json` | MATCH 173/173, direct | 20,765 / 19,472 ms = 1.07x |
+| `cpython-math` | MATCH 76/76, direct | 3,461 / 1,231 ms = 2.81x |
+| `cpython-subprocess` | Empty vs 278/278 | invalid performance row |
+| `cpython-threading` | Empty vs 193/193 | invalid performance row |
+
+The Node rows remain Tier-T fallback diagnostics and the Empty Python rows
+remain invalid for performance.
+
+### Next boundary is allocated, x18-free SME2
+
+All four paths now refuse `0xc1d21300` at Node `0x1c53ee0` and libcrypto
+`0x2e4c60`, byte `0xe0` of `_vpsm4_ex_consts`. LLDB at the generated decoder
+proves it reaches `decode_iclass_mortlach_multi2_mla_long_idx`, then the Arm
+XML encoding `SMLAL ZA, Z, Z[index]` two-vector form. The word matches exact
+mask/value `0xfff09038/0xc1d01000`.
+
+This word is allocated. `bad64` returns `ErrorOperands` because its operand
+formatter has no case for the new encoding, not because Arm reserves it. Its
+only general-register operand is the ZA row selector constrained to W8-W11;
+the remaining operands are ZA/Z registers and immediates. It cannot name GPR
+x18. The one-bit control `0xe1d21300` is allocated
+`ld1q z0h.q[w12], p4/z, [x24, x18, lsl #4]` and must remain outside the proof.
+Task 10 therefore adds a separately named x18-free decoder-failure proof; it
+must not broaden or mislabel `word_is_proven_unallocated`.
