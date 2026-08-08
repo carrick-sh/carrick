@@ -1042,7 +1042,7 @@ write; return partial progress on interruption; convert a zero-progress
 interrupt to `EINTR`; and use `raise_sigpipe_for_blocking_write` so an `EPIPE`
 publishes guest `SIGPIPE` before the ordinary Tier-D signal boundary.
 
-- [ ] **Step 1: Add a deterministic red driver test**
+- [x] **Step 1: Add a deterministic red driver test**
 
 Build a nonblocking host pipe and a `BlockingHostWrite` larger than its
 capacity, with a sibling reader that drains the pipe. Call a new
@@ -1051,7 +1051,7 @@ through `ServiceVerdict::Resume`. Confirm the focused test is red before the
 helper and outcome arm exist. Any constructor added solely for this fixture
 must be `#[cfg(test)]` and crate-visible; do not broaden the production API.
 
-- [ ] **Step 2: Implement the shared-driver adapter**
+- [x] **Step 2: Implement the shared-driver adapter**
 
 After `dispatch_threaded` returns the owned `BlockingHostWrite` and releases
 all dispatcher locks, loop on `drive_blocking_host_write`. On `Wait`, park the
@@ -1061,7 +1061,7 @@ and its offset across every park. On completion, run
 `raise_sigpipe_for_blocking_write`, then translate only `Returned`/`Errno` to
 the ordinary Tier-D boundary; fail closed on any other outcome.
 
-- [ ] **Step 3: Prove the unit and focused live gate green**
+- [x] **Step 3: Prove the unit and focused live gate green**
 
 ```bash
 RUST_TEST_THREADS=1 cargo test -p carrick-runtime \
@@ -1078,7 +1078,7 @@ just conformance-native smoke --workers 1 --suite cpython-subprocess \
 Expected: no `BlockingHostWrite` leave. If another typed boundary appears,
 record it exactly; do not pre-implement it.
 
-- [ ] **Step 4: Run focused regression gates and commit**
+- [x] **Step 4: Run focused regression gates and commit**
 
 Run the complete `carrick-runtime` library tests serialized, `just fmt-check`,
 and `just clippy`. Commit only the runtime adapter and its test support as:
@@ -1087,7 +1087,7 @@ and `just clippy`. Commit only the runtime adapter and its test support as:
 git commit -m "fix(native): service Tier D blocking host writes"
 ```
 
-- [ ] **Step 5: Recensus and select Task 12**
+- [x] **Step 5: Recensus and select Task 12**
 
 Rebuild signed, verify codesign and SHA-256, and rerun the serial eight-suite
 gate with artifact stem `tierd-wave2-blocking-host-write`. Node's current
@@ -1095,3 +1095,85 @@ post-entry SIGSEGV and CPython threading's current multithreaded-fork leave are
 separate observed blockers: the recensus decides their order. Diagnose Node
 with LLDB/core plus the always-on event ring; do not admit another scanner
 family unless a new scanner refusal is actually measured.
+
+---
+
+### Task 12: Attribute Node's post-entry SIGSEGV
+
+**Wave:** 2
+
+**Files:**
+
+- Inspect: the exact in-image `nodejs-conformance` wrapper and selected smoke
+  script;
+- Inspect: `crates/carrick-runtime/src/direct_runner.rs` and
+  `crates/carrick-native-darwin/src/direct.rs` only after the fault PC is
+  known;
+- Preserve: an LLDB command transcript/core receipt plus the always-on event
+  ring under `target/conformance/`;
+- Modify only after attribution: the source file owning the proven mechanism,
+  with a deterministic regression test;
+- Modify after proof:
+  `docs/perf-results/2026-08-07-tier-d-node-python-baseline.md` and
+  `handoff.md`.
+
+**Exact red workload and image:** `node-app-smoke` and `node-v8-smoke` in
+`localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0`, manifest digest
+`sha256:50d22d4ee6776c57f6ad06ecc82e8219a9e5026e327aebab5847e17f61d46cbd`.
+Signed source `3a4b8da4` records `scan-direct` and `direct-enter` for
+`/opt/nodejs-conformance/bin/node24`, then the outer wrappers report rc 139.
+There is no scanner refusal, typed Tier-D leave, or Node `direct-exit` event.
+
+- [ ] **Step 1: Reduce the wrapper to an exact Node argv**
+
+In a Docker-only phase, inspect the image's runner and smoke scripts. Record
+the exact Node binary, argv, cwd, environment, input files, and timeout. Then
+run that target directly under Carrick with a unique run ID and census. The
+reproducer is accepted only if it records Tier-D direct entry and the same
+signal-139 end; do not debug the outer shell wrapper as though it were Node.
+
+- [ ] **Step 2: Capture the guest process at the real fault**
+
+Use LLDB on the directly executing Node guest process, not the Carrick
+orchestrator parent. Let the debugger stop naturally on `EXC_BAD_ACCESS`; do
+not kill a fasttrap consumer or infer from an empty trace. Save:
+
+- all-thread backtraces and registers, including PC/LR/SP/x8/x18;
+- the Mach exception address and memory-region permissions at PC and fault VA;
+- the always-on event ring from `scripts/carrick_lldb.py` while attached or
+  from a saved core;
+- source commit, signed binary SHA-256, exact argv hash, PID, and core/transcript
+  hashes.
+
+If the wrapper's fork/exec topology prevents debugger inheritance, pause the
+reduced Node child at direct entry, attach by PID, and resume. A core or live
+stop with the guest's actual register file is required; wrapper rc 139 alone is
+not diagnosis.
+
+- [ ] **Step 3: Bind the fault to one mechanism**
+
+Classify the PC as guest text, a patched syscall island, ld.so/libc/Node shared
+text, or Carrick host text. Disassemble the exact instruction and inspect its
+memory operands. For an island/context fault, validate the live context offset
+instead of assuming one; for a signal fault, bind pending/frame state; for an
+x18 fault, prove where the guest value was lost or clobbered. Compare one
+focused control (Tier T or the pre-entry-fix binary as appropriate) only after
+the failing mechanism is observable. Write the diagnosis into this task before
+authorizing implementation.
+
+- [ ] **Step 4: Add a red regression and implement the minimal fix**
+
+The regression must exercise the attributed instruction/state transition and
+fail against `3a4b8da4`. Implement one correctness-preserving mechanism; do not
+add another scanner exception, blanket signal workaround, or Node-specific
+word/path whitelist. Run focused unit tests plus `just fmt-check` and
+`just clippy`, then commit narrowly.
+
+- [ ] **Step 5: Prove both Node gates, then recensus all eight suites**
+
+Build and sign the exact tip. Require both Node smoke targets to match the
+cached native-arm64 Docker oracle and to record direct exit rather than Tier-T
+fallback. Rerun the serial eight-suite census. The already-measured Python
+multithreaded-fork boundary remains the next Python task unless the new census
+proves otherwise. Conformance elapsed ratios remain diagnostics; canonical
+Node/Python scoreboards come only after correctness closure.
