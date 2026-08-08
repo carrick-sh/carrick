@@ -73,6 +73,11 @@ pub const DSRFAULT_LR: u8 = 19;
 /// `ECONNREFUSED` and say nothing, so this ring entry is the only per-occurrence
 /// record of a cross-instance mis-publication.
 pub const NSREJECT: u8 = 20;
+/// Eventfd counter transition after a successful guest write. `a` is the host
+/// readiness-pipe read fd; `b` and `c` are the low 32 bits before and after.
+pub const EFDWRITE: u8 = 21;
+/// Eventfd counter transition after a successful guest read/copyout.
+pub const EFDREAD: u8 = 22;
 
 #[cfg(feature = "event-ring-dump")]
 fn dir() -> Option<&'static str> {
@@ -98,6 +103,18 @@ pub fn rec(kind: u8, a: i32, b: i32, c: i32) {
     RING[i].hi.store(hi, Ordering::Relaxed);
     #[cfg(feature = "event-ring-dump")]
     maybe_start_watchdog();
+}
+
+#[cfg(test)]
+pub(crate) fn contains_event(kind: u8, a: i32, b: i32, c: i32) -> bool {
+    RING.iter().any(|slot| {
+        let lo = slot.lo.load(Ordering::Relaxed);
+        let hi = slot.hi.load(Ordering::Relaxed);
+        (hi >> 32) as u8 == kind
+            && (lo & 0xffff_ffff) as u32 as i32 == a
+            && (lo >> 32) as u32 as i32 == b
+            && (hi & 0xffff_ffff) as u32 as i32 == c
+    })
 }
 
 #[inline]
@@ -221,6 +238,8 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
             (a as u32 as u64) | ((b as u32 as u64) << 32)
         ),
         NSREJECT => format!("NSREJECT pathhash={a:#010x} reasonhash={b:#010x} pid={c}"),
+        EFDWRITE => format!("EFDWRITE hfd={a} before={} after={}", b as u32, c as u32),
+        EFDREAD => format!("EFDREAD  hfd={a} before={} after={}", b as u32, c as u32),
         _ => String::new(),
     }
 }

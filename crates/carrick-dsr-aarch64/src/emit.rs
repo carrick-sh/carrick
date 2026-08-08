@@ -198,6 +198,23 @@ impl GenerationGuard {
         }
     }
 
+    /// Bind a guard to an externally owned atomic generation cell.
+    ///
+    /// This is the FFI companion to [`Self::new`]: host exception transports
+    /// may own their generation catalog in C while emitted AArch64 still
+    /// consumes it with the same acquire load. The emitter never dereferences
+    /// the address in Rust; it materializes it into the block and the block's
+    /// entry guard performs `ldar`.
+    ///
+    /// # Safety
+    ///
+    /// `address` must name a naturally aligned, live 64-bit atomic for every
+    /// possible execution of the emitted block. Its producer must publish
+    /// generation changes with release-or-stronger ordering.
+    pub const unsafe fn from_atomic_address(address: u64, expected: CodeGeneration) -> Self {
+        Self { address, expected }
+    }
+
     pub const fn expected(self) -> CodeGeneration {
         self.expected
     }

@@ -1842,6 +1842,16 @@ mod real {
         fn native__syscall__service__entry(_: u64, _: &str) {}
         fn native__syscall__service__branch(_: u32) {}
         fn native__syscall__service__end(_: u64, _: &str, _: u32) {}
+        /// Low-rate Tier-D Mach-exception lifecycle. Args: phase, host pid,
+        /// and four phase-specific scalars. This never fires on ordinary
+        /// guest execution or syscall service.
+        fn native__tierd__exception(_: u32, _: u32, _: u64, _: u64, _: u64, _: u64) {}
+        /// First terminal Tier-D unsupported/error outcome for one process.
+        /// Args: host pid, Linux syscall number, and the owned diagnostic
+        /// detail. `u64::MAX` is the driver-error sentinel for a failure outside
+        /// syscall service. This names otherwise-silent fork-child `_exit(125)`
+        /// failures.
+        fn native__tierd__unsupported(_: u32, _: u64, _: &str) {}
         /// HVF syscall-transport attribution. `transport`: 0=legacy, 1=mailbox;
         /// `phase`: 0=request decode, 1=ordinary return publication. The final
         /// three counters are actual HVF register/sysreg API operations in that
@@ -2295,6 +2305,16 @@ mod real {
         outcome: super::NativeSyscallServiceOutcome,
     ) {
         carrick_usdt::native__syscall__service__end!(|| (number, name, outcome.raw()));
+    }
+
+    #[inline(always)]
+    pub fn native_tierd_exception(phase: u32, a: u64, b: u64, c: u64, d: u64) {
+        carrick_usdt::native__tierd__exception!(|| { (phase, std::process::id(), a, b, c, d) });
+    }
+
+    #[inline(always)]
+    pub fn native_tierd_unsupported(syscall: u64, detail: &str) {
+        carrick_usdt::native__tierd__unsupported!(|| { (std::process::id(), syscall, detail) });
     }
 
     #[inline(always)]
@@ -2783,20 +2803,27 @@ mod real {
         path.wire.as_ptr()
     }
 
-    #[cfg(target_os = "macos")]
-    fn publish_host_image_base_snapshot(snapshot: HostImageBase) {
-        let path_wire = nul_terminated_wire(snapshot.path);
-        let path = path_wire.as_ptr();
-        carrick_usdt::host__image__base!(|| (snapshot.pid, snapshot.base, snapshot.slide, path));
-        std::hint::black_box(&path_wire);
-    }
-
     /// Collect and publish this process's carrick image base immediately.
     /// Native exec handoff uses [`prepare_host_image_publication`] instead so
     /// allocation happens before its fatal-only boundary.
     pub fn host_image_base() {
         #[cfg(target_os = "macos")]
-        publish_host_image_base_snapshot(host_image_base_snapshot());
+        carrick_usdt::host__image__base!(|| {
+            // Keep every query INSIDE the probe closure: `usdt` invokes it
+            // only when this probe is enabled, so Tier D can publish once per
+            // process without adding dyld queries or a path allocation to an
+            // untraced launch. Image zero and its name are dyld-owned for the
+            // lifetime of the process; the consumer copies the path while the
+            // probe fires, so the raw pointer cannot outlive its owner.
+            // SAFETY: image zero exists in every Mach-O process. The header is
+            // observed only as an integer and the name only as a probe arg.
+            (
+                std::process::id(),
+                mach2::dyld::_dyld_get_image_header(0) as usize as u64,
+                mach2::dyld::_dyld_get_image_vmaddr_slide(0) as i64,
+                mach2::dyld::_dyld_get_image_name(0).cast::<u8>(),
+            )
+        });
         // Not macOS: dyld is the mechanism above, and only the Darwin native
         // lane self-reexecs its guest processes. Announcing a base we have not
         // actually queried would be worse than announcing none -- a consumer
@@ -4027,6 +4054,8 @@ mod stub {
     stub!(native_syscall_service_entry(number: u64, name: &str));
     stub!(native_syscall_service_branch(kind: super::NativeSyscallBranchKind));
     stub!(native_syscall_service_end(number: u64, name: &str, outcome: super::NativeSyscallServiceOutcome));
+    stub!(native_tierd_exception(phase: u32, a: u64, b: u64, c: u64, d: u64));
+    stub!(native_tierd_unsupported(syscall: u64, detail: &str));
     stub!(hvf_syscall_transport(transport: u32, phase: u32, register_reads: u32, sysreg_reads: u32, register_writes: u32));
     stub!(dsr_prepare_end(tid: i32, guest_pc: u64, cache_pc: u64, generation: u64, outcome: super::DsrPrepareOutcome));
     stub!(dsr_run_begin(tid: i32, guest_pc: u64, cache_pc: u64, generation: u64));

@@ -9,9 +9,11 @@
 //! to handle that 0.03%. This module handles it by patching instead.
 //!
 //! M1 scope, deliberately narrow: load an ELF's executable segments into a
-//! `MAP_JIT` region, rewrite every `svc #0` to branch to a per-site island,
-//! and execute. Syscalls reach a Rust handler with the guest's registers in a
-//! context block.
+//! private mapping, rewrite every `svc #0` to branch to a per-site island,
+//! publish the finished bytes read+execute, and execute. Syscalls reach a Rust
+//! handler with the guest's registers in a context block. `MAP_JIT` is kept
+//! for genuinely dynamic guest code; prepatched images do not need its
+//! region-global per-thread permission toggle.
 //!
 //! # Why per-site islands
 //!
@@ -137,6 +139,45 @@ impl GuestContext {
 
 // ---------------------------------------------------------------- encodings
 
+/// Linux/aarch64 architectural values Carrick exposes to EL0. Keep these in
+/// this shared native-Darwin crate so translated DSR and Tier D cannot drift.
+pub const LINUX_CTR_EL0: u64 = 0x8444_4004;
+pub const LINUX_DCZID_EL0: u64 = 0x4;
+
+fn direct_linux_sysreg_value(instruction: u32) -> Option<u64> {
+    match instruction & !0x1f {
+        0xd53b_0020 => Some(LINUX_CTR_EL0),
+        0xd53b_00e0 => Some(LINUX_DCZID_EL0),
+        _ => None,
+    }
+}
+
+/// No-allocation decoder used by the Mach exception server. Returning zero
+/// means "not a Tier-D architectural register" and preserves Darwin's normal
+/// EXC_BAD_INSTRUCTION handling. The destination register is encoded in the
+/// low five instruction bits and is applied by the C state-reply layer.
+///
+/// # Safety
+///
+/// When non-null, `value` must point to a writable `u64` that remains live for
+/// this synchronous call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn carrick_native_direct_emulate_sysreg(
+    instruction: u32,
+    value: *mut u64,
+) -> libc::c_int {
+    let Some(result) = direct_linux_sysreg_value(instruction) else {
+        return 0;
+    };
+    if value.is_null() {
+        return 0;
+    }
+    // SAFETY: the Mach server passes a live stack scalar for the duration of
+    // this synchronous call; the exported contract requires that pointer.
+    unsafe { *value = result };
+    1
+}
+
 const fn str_imm(rt: u32, rn: u32, byte_offset: u32) -> u32 {
     0xf900_0000 | ((byte_offset / 8) << 10) | (rn << 5) | rt
 }
@@ -184,8 +225,20 @@ fn cbnz(rt: u32, offset: i64) -> u32 {
     let imm19 = ((offset >> 2) as u32) & 0x0007_ffff;
     0xb500_0000 | (imm19 << 5) | rt
 }
+/// `cbz xt, <pc + offset>`; `offset` must be 4-byte aligned, within ±1 MiB.
+fn cbz(rt: u32, offset: i64) -> u32 {
+    let imm19 = ((offset >> 2) as u32) & 0x0007_ffff;
+    0xb400_0000 | (imm19 << 5) | rt
+}
 /// `ret` (through x30).
 const RET: u32 = 0xd65f_03c0;
+/// Private undefined instructions used only by the dynamic far-veneer
+/// fallback. `BRK` is debugger-policy-sensitive on PAC-capable XNU; UDF takes
+/// the ordinary bad-instruction path in traced and untraced tasks. The Mach
+/// exception catalog binds each patched site and veneer-return PC to the live
+/// MAP_JIT mapping generation before redirecting either edge.
+const UDF_DYNAMIC_ENTRY: u32 = 0x0000_b452; // udf #0xb452
+const UDF_DYNAMIC_RETURN: u32 = 0x0000_b453; // udf #0xb453
 /// `ldr qt, [xn, #byte_offset]` (128-bit SIMD&FP load, unsigned scaled
 /// imm12 — the offset must be a multiple of 16 to encode; the ADDRESS may be
 /// 8-aligned, unaligned SIMD loads do not fault on this configuration).
@@ -234,6 +287,65 @@ fn mov_imm64(rd: u32, value: u64) -> [u32; 4] {
 
 /// `svc #0`.
 pub const SVC_0: u32 = 0xd400_0001;
+
+/// Whether Tier D may expose Linux x18 as Darwin's physical platform register.
+///
+/// It may not. A live SDK12/XNU probe proves preservation across the one
+/// ordinary syscall it executes, but that is weaker than Linux's architectural
+/// requirement. Canonical Node repeatedly set x18, executed only pure guest
+/// calls, and later observed zero at `HashSeed::InitializeRoots`; Mach replies,
+/// signals, and fork children independently violate the same assumption. A
+/// mechanism that is correct only for sampled kernel round trips is not a
+/// valid shipped ABI. Keep the C probe for diagnostics, but route every Tier-D
+/// workload through the byte-exact virtual-x18 veneers.
+pub fn physical_x18_supported() -> bool {
+    false
+}
+
+/// Switch the current Darwin thread to the custom-x18 userspace ABI before
+/// entering guest code. XNU's task policy and this per-thread libSystem mode
+/// are separate requirements; the runtime probe above proves the former and
+/// this call establishes the latter.
+pub fn enter_guest_x18_abi() -> io::Result<()> {
+    // SAFETY: this only changes the calling thread's libSystem x18 convention.
+    let rc = unsafe { carrick_native_direct_enter_guest_x18_abi() };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Restore the normal Darwin userspace x18 ABI before running host services.
+pub fn enter_host_x18_abi() {
+    // SAFETY: this only restores the calling thread's libSystem convention.
+    unsafe { carrick_native_direct_enter_host_x18_abi() };
+}
+
+/// Bracket every outer guest-entry interval. Nested syscall/publication
+/// callbacks temporarily enter host mode themselves; the final host restore
+/// is intentionally idempotent.
+struct GuestX18AbiGuard {
+    active: bool,
+}
+
+impl GuestX18AbiGuard {
+    fn enter() -> io::Result<Self> {
+        let active = physical_x18_supported();
+        if active {
+            enter_guest_x18_abi()?;
+        }
+        Ok(Self { active })
+    }
+}
+
+impl Drop for GuestX18AbiGuard {
+    fn drop(&mut self) {
+        if self.active {
+            enter_host_x18_abi();
+        }
+    }
+}
 
 /// Emit one syscall island. Returns the words plus the index of the RESUME
 /// BRANCH slot, which the caller fills with a constant `b` back to `site+4`
@@ -510,6 +622,52 @@ pub struct DirectThreadSlots {
     /// Extra machine state the RUNNER arms for the next parked re-entry —
     /// see [`ParkedResumeExtras`]. Written only by the runner.
     pub resume_extras: ParkedResumeExtras,
+    /// A synchronous host fault captured while this thread was executing
+    /// direct guest code. The Mach recovery path is the sole writer; Rust
+    /// consumes it only after the handler has restored the host stack.
+    pub fault: DirectFault,
+    /// Low-frequency lifecycle evidence for the Mach exception path. These
+    /// counters move only when a thread installs/rebinds its exception port
+    /// or crosses a dynamic-code protection exception; ordinary guest
+    /// execution and syscall boundaries do not touch them.
+    pub exception_telemetry: DirectExceptionTelemetry,
+}
+
+/// Signal-safe handoff from Darwin's ucontext handler to the parked Tier-D
+/// run loop. Appended to [`DirectThreadSlots`] so every offset baked into
+/// existing islands and veneers remains unchanged.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DirectFault {
+    /// Zero means no fault; the C handler publishes this LAST.
+    pub pending: u64,
+    pub signal: i32,
+    pub code: i32,
+    pub address: u64,
+    pub esr: u64,
+    pub far: u64,
+}
+
+/// Per-thread evidence that distinguishes a missing Mach exception channel
+/// from a failed first reply or an escaped private recovery breakpoint.
+/// Appended after every emitted-code-visible slot so adding observability
+/// cannot move an existing island or veneer offset.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DirectExceptionTelemetry {
+    pub installs: u64,
+    pub fork_rebinds: u64,
+    pub exception_entries: u64,
+    pub bad_access_entries: u64,
+    pub breakpoint_entries: u64,
+    pub recovery_services: u64,
+    pub execute_switches: u64,
+    pub write_switches: u64,
+    pub failures: u64,
+    pub last_exception: u64,
+    pub last_status: u64,
+    pub bad_instruction_entries: u64,
+    pub sysreg_emulations: u64,
 }
 
 /// Machine state beyond the GPR file, in two per-thread instances with one
@@ -587,7 +745,22 @@ impl DirectThreadSlots {
             _fp_align: 0,
             parked_fp: ParkedResumeExtras::default(),
             resume_extras: ParkedResumeExtras::default(),
+            fault: DirectFault::default(),
+            exception_telemetry: DirectExceptionTelemetry::default(),
         }
+    }
+
+    /// Consume the current thread's captured synchronous fault while the
+    /// guest is parked. Signal publication and consumption occur on the same
+    /// host thread with signal return between them, so no cross-thread atomic
+    /// protocol is required; `pending` is still written last by C.
+    pub fn take_fault(&mut self) -> Option<DirectFault> {
+        if self.fault.pending == 0 {
+            return None;
+        }
+        let fault = self.fault;
+        self.fault = DirectFault::default();
+        Some(fault)
     }
 }
 
@@ -618,6 +791,16 @@ const _: () = assert!(
     DirectThreadSlots::PARKED_FP_PSTATE_OFF.is_multiple_of(8)
         && DirectThreadSlots::PARKED_FP_FPCR_OFF <= 32760
 );
+const _: () = assert!(std::mem::size_of::<GuestContext>() == 296);
+const _: () = assert!(std::mem::size_of::<ParkedResumeExtras>() == 560);
+const _: () = assert!(std::mem::offset_of!(DirectThreadSlots, guest_tls) == 296);
+const _: () = assert!(std::mem::offset_of!(DirectThreadSlots, guest_x18) == 304);
+const _: () = assert!(std::mem::offset_of!(DirectThreadSlots, parked_fp) == 320);
+const _: () = assert!(std::mem::offset_of!(DirectThreadSlots, resume_extras) == 880);
+const _: () = assert!(std::mem::offset_of!(DirectThreadSlots, fault) == 1440);
+const _: () = assert!(std::mem::offset_of!(DirectThreadSlots, exception_telemetry) == 1480);
+const _: () = assert!(std::mem::size_of::<DirectExceptionTelemetry>() == 104);
+const _: () = assert!(std::mem::size_of::<DirectThreadSlots>() == 1584);
 
 /// RAII installation of one thread's [`DirectThreadSlots`] into the process
 /// TSD slot: while this guard lives, veneers and islands executing on THIS
@@ -679,8 +862,12 @@ impl InstalledThreadSlots {
     /// guard, e.g. for post-run assertions).
     pub fn into_slots(self) -> Box<DirectThreadSlots> {
         let this = std::mem::ManuallyDrop::new(self);
-        // SAFETY: clearing this thread's own slot.
-        unsafe { libc::pthread_setspecific(this.key, std::ptr::null()) };
+        // SAFETY: the guest is parked; remove its thread exception port before
+        // clearing the slots pointer the recovery path names.
+        unsafe {
+            carrick_native_direct_exception_uninstall_current();
+            libc::pthread_setspecific(this.key, std::ptr::null());
+        }
         // SAFETY: re-owning the allocation `install` leaked.
         unsafe { Box::from_raw(this.slots) }
     }
@@ -691,6 +878,7 @@ impl Drop for InstalledThreadSlots {
         // SAFETY: clearing this thread's own slot, then re-owning the
         // allocation `install` leaked.
         unsafe {
+            carrick_native_direct_exception_uninstall_current();
             libc::pthread_setspecific(self.key, std::ptr::null());
             drop(Box::from_raw(self.slots));
         }
@@ -705,6 +893,24 @@ pub fn current_thread_slots_ptr() -> *mut DirectThreadSlots {
         Ok(tsd) => unsafe { libc::pthread_getspecific(tsd.key()) }.cast(),
         Err(_) => std::ptr::null_mut(),
     }
+}
+
+/// Arm the current Tier-D thread's Mach exception port on demand. The C side
+/// is idempotent for the same installed slots, so an entry after the first
+/// requirement performs no allocation or port mutation.
+fn ensure_current_thread_exception_handler() -> io::Result<()> {
+    let slots = current_thread_slots_ptr();
+    if slots.is_null() {
+        return Err(io::Error::other(
+            "cannot install tier-D Mach exceptions without thread slots",
+        ));
+    }
+    // SAFETY: `slots` is the current thread's live TSD-owned allocation. The
+    // C registration is confined to this thread and is removed by its guard.
+    if unsafe { carrick_native_direct_exception_install(slots.cast()) }.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Emit the three-word chain that resolves the current thread's
@@ -752,7 +958,7 @@ enum TpidrAccess {
 /// A WRITE has to preserve its source register, so it borrows one 16-byte
 /// guest stack slot exactly as the syscall island does — using x0, or x1 when
 /// the source *is* x0.
-fn tpidr_veneer(access: TpidrAccess, tsd: TsdSlot) -> Vec<u32> {
+fn tpidr_veneer(access: TpidrAccess, tsd: TsdSlot, physical_x18: bool) -> Vec<u32> {
     const TLS: u32 = DirectThreadSlots::TLS_OFF;
     const X18: u32 = DirectThreadSlots::X18_OFF;
     let mut w = Vec::with_capacity(16);
@@ -761,14 +967,14 @@ fn tpidr_veneer(access: TpidrAccess, tsd: TsdSlot) -> Vec<u32> {
         // guest's TLS into the physical platform register would hand it to
         // Darwin to overwrite. Guest x18 lives in its own slot, so this is a
         // slot-to-slot move and touches neither special register.
-        TpidrAccess::Read { reg: 18 } => {
+        TpidrAccess::Read { reg: 18 } if !physical_x18 => {
             w.push(stp_pre_sp(0, 1));
             w.extend_from_slice(&tsd_resolve(0, tsd));
             w.push(ldr_imm(1, 0, TLS));
             w.push(str_imm(1, 0, X18));
             w.push(ldp_post_sp(0, 1));
         }
-        TpidrAccess::Write { reg: 18 } => {
+        TpidrAccess::Write { reg: 18 } if !physical_x18 => {
             w.push(stp_pre_sp(0, 1));
             w.extend_from_slice(&tsd_resolve(0, tsd));
             w.push(ldr_imm(1, 0, X18));
@@ -1159,6 +1365,18 @@ fn x18_pc_address_veneer(value: u64, tsd: TsdSlot) -> Vec<u32> {
     w
 }
 
+/// Replace a Darwin-trapping Linux architectural-register read with its
+/// Carrick constant. The instruction writes only `Rt`, so a normal GPR needs
+/// just a constant materialization; virtual x18 uses the same slot-preserving
+/// lowering as ADR/ADRP, and XZR discards the value exactly as the MRS did.
+fn linux_sysreg_veneer(word: u32, value: u64, tsd: TsdSlot, physical_x18: bool) -> Vec<u32> {
+    match word & 0x1f {
+        18 if !physical_x18 => x18_pc_address_veneer(value, tsd),
+        31 => Vec::new(),
+        rt => mov_imm64(rt, value).to_vec(),
+    }
+}
+
 /// Emit a veneer that runs one x18-using instruction against a memory slot.
 ///
 /// Darwin rewrites the platform register at every trap return, so a guest x18
@@ -1280,6 +1498,12 @@ pub enum DirectIneligible {
     /// fail-closed edge when the kernel places the island arena too far from
     /// the guest's fixed text address.
     IslandOutOfRange { vaddr: u64 },
+    /// A defined `__clear_cache` entry did not have the qualified AArch64
+    /// indirect-call shape (`bti c; b target`). Tier D cannot observe exact
+    /// JIT publication ranges through an unknown entry implementation, so a
+    /// dynamic-code-capable image is refused instead of patching arbitrary
+    /// text or silently falling back to whole-page inference.
+    DynamicPublicationHookUnsupported { vaddr: u64, first: u32, second: u32 },
     /// This HOST failed the per-thread addressing proof: the veneers reach
     /// per-thread slots through `(TPIDRRO_EL0 & !7) + key*8`, and
     /// [`thread_slots_tsd`] could not verify that chain against
@@ -1313,6 +1537,14 @@ impl std::fmt::Display for DirectIneligible {
             Self::IslandOutOfRange { vaddr } => {
                 write!(f, "island for site {vaddr:#x} out of ±128 MiB branch range")
             }
+            Self::DynamicPublicationHookUnsupported {
+                vaddr,
+                first,
+                second,
+            } => write!(
+                f,
+                "__clear_cache at {vaddr:#x} has unsupported entry words {first:#010x}, {second:#010x}"
+            ),
             Self::HostTsdLayoutUnproven { reason } => {
                 write!(f, "host TSD layout unproven for per-thread slots: {reason}")
             }
@@ -1347,12 +1579,144 @@ fn word_could_name_x18(word: u32) -> bool {
 /// selects an unallocated subspace. Its "Load/store register (unprivileged)"
 /// encoding fixes bits 29:27=`0b111`, bits 25:24=`0b00`, and bits
 /// 11:10=`0b10`; `V` bit
-/// 26=`1` is unallocated because the class has no SIMD/FP forms. Separately,
+/// 26=`1` is unallocated because the class has no SIMD/FP forms. The SVE
+/// "Partition Break" class fixes bits 31:24=`0x25`, bits 21:20=`0b01`, and
+/// bits 15:14=`0b01`; within it, `op1` is bits 19:16 and every value other
+/// than `x000` is unallocated. Its predicated integer min/max/difference
+/// class fixes bits 31:24=`0x04`, bits 21:19=`0b001`, and bits 15:13=`0`;
+/// `opc` bits 18:17 allocate `00`/`01`/`10`, leaving `11` unallocated. The
+/// top-level Loads and Stores table also marks
+/// `op0=0?00`, `op1=0`, and an `op2` prefix of `10?0` unallocated. Its SVE
+/// "Bitwise Shift - Unpredicated" wide-element class fixes bits 31:24=`0x04`,
+/// bit 21=`1`, bits 15:13=`100`, and bit 12=`0`; opcode bits 11:10 allocate
+/// ASR=`00`, LSR=`01`, and LSL=`11`, leaving `10` unallocated. Its SVE
+/// "Integer Wide Immediate - Predicated" class fixes bits 31:24=`0x05` and
+/// bits 21:20=`0b01`; bits 15:14 select zeroing integer copy (`00`), merging
+/// integer copy (`01`), or floating-point copy (`11`), leaving `10`
+/// unallocated. Its ADD/SUB shifted-register class fixes bits 28:24=`01011`
+/// and bit 21=`0`; for a 32-bit operation (`sf=0`), `imm6<5>=1` is
+/// unallocated because it would encode a shift of 32..63. Separately,
 /// its "Load/store register (register offset)" encoding fixes bits 11:10 to
 /// `0b10`; the family selector is bits 29:27=`0b111`, bits 25:24=`0b00`, and
 /// bit 21=`1`, so any other value in bits 11:10 inside that exact family is
-/// unallocated. Such words cannot access x18: executing one raises an
-/// undefined-instruction exception.
+/// unallocated. The 32-bit logical shifted-register class also rejects
+/// `imm6<5>=1`, exactly like the ADD/SUB class, because it would encode a
+/// shift of 32..63. In the top-level Loads and Stores table, `op0=x100`,
+/// `op1=0`, `op2=1xx1...` is unallocated. Finally, SVE UXTH rejects
+/// destination sizes `0x` because they are no wider than its halfword source.
+/// Such words cannot access x18: executing one raises an undefined-instruction
+/// exception.
+fn word_is_unallocated_sve_partition_break(word: u32) -> bool {
+    const FAMILY_MASK: u32 = 0xff30_c000;
+    const FAMILY: u32 = 0x2510_4000;
+    const OP1_LOW_THREE_MASK: u32 = 0x0007_0000;
+
+    (word & FAMILY_MASK) == FAMILY && (word & OP1_LOW_THREE_MASK) != 0
+}
+
+fn word_is_unallocated_sve_pred_minmaxdiff(word: u32) -> bool {
+    // SVE integer min/max/difference (predicated) fixes bits 31:24=0x04,
+    // bits 21:19=001, and bits 15:13=000. Its opc bits 18:17 allocate
+    // SMAX/UMAX=00, SMIN/UMIN=01, and SABD/UABD=10; 11 is unallocated.
+    // Bits 9:5 are Zm, not a GPR, which is why a value of 18 there must not
+    // be mistaken for guest x18 after the decoder rejects the opcode.
+    const MASK: u32 = 0xff3e_e000;
+    const UNALLOCATED: u32 = 0x040e_0000;
+
+    (word & MASK) == UNALLOCATED
+}
+
+fn word_is_unallocated_load_store_root(word: u32) -> bool {
+    // bits 31:28 = op0=0?00; bit 27=1 and bit 25=0 select Loads and Stores;
+    // bit 26 = op1=0; bits 24:21 are the op2 prefix 10?0.
+    const MASK: u32 = 0xbfa0_0000;
+    const UNALLOCATED: u32 = 0x0900_0000;
+
+    (word & MASK) == UNALLOCATED
+}
+
+fn word_is_unallocated_sve_vector_shift_lu(word: u32) -> bool {
+    // SVE Bitwise Shift - Predicated fixes bits 31:24=00000100. Within it,
+    // bits 21:19=010 select the vector-shift form and bits 15:13=100 are
+    // fixed. Its R,L,U opcode admits ASR=000, LSR=001, LSL=011 and the
+    // reverse forms 100,101,111; L=1,U=0 (x10) is unallocated for either R.
+    const MASK: u32 = 0xff3b_e000;
+    const UNALLOCATED_LU: u32 = 0x0412_8000;
+
+    (word & MASK) == UNALLOCATED_LU
+}
+
+fn word_is_unallocated_sve_unpred_wide_shift(word: u32) -> bool {
+    // SVE Bitwise Shift - Unpredicated fixes bits 31:24=0x04, bit 21=1,
+    // bits 15:13=100, and bit 12=0. In its wide-element form, opc bits
+    // 11:10 allocate ASR=00, LSR=01, and LSL=11; opc=10 is unallocated.
+    // Bits 20:16 and 9:0 name SVE vectors, not guest GPRs.
+    const MASK: u32 = 0xff20_fc00;
+    const UNALLOCATED: u32 = 0x0420_8800;
+
+    (word & MASK) == UNALLOCATED
+}
+
+fn word_is_unallocated_sve_wide_immediate(word: u32) -> bool {
+    // SVE Integer Wide Immediate - Predicated fixes bits 31:24=00000101 and
+    // bits 21:20=01. Bits 15:14 select CPY /Z=00, CPY /M=01, or FCPY=11;
+    // selector 10 has no allocated instruction.
+    const MASK: u32 = 0xff30_c000;
+    const UNALLOCATED: u32 = 0x0510_8000;
+
+    (word & MASK) == UNALLOCATED
+}
+
+fn word_is_unallocated_add_sub_shifted_32(word: u32) -> bool {
+    // ADD/SUB shifted register fixes bits 28:24=01011 and bit 21=0. With
+    // sf=0 the operation is 32-bit, so imm6<5> (bit 15) must be zero.
+    const MASK: u32 = 0x9f20_8000;
+    const UNALLOCATED: u32 = 0x0b00_8000;
+
+    (word & MASK) == UNALLOCATED
+}
+
+fn word_is_unallocated_logical_shifted_32(word: u32) -> bool {
+    // Logical shifted register fixes bits 28:24=01010. With sf=0 the
+    // operation is 32-bit, so imm6<5> (bit 15) must be zero.
+    const MASK: u32 = 0x9f00_8000;
+    const UNALLOCATED: u32 = 0x0a00_8000;
+
+    (word & MASK) == UNALLOCATED
+}
+
+fn word_is_unallocated_load_store_x100(word: u32) -> bool {
+    // The top-level Loads and Stores table marks op0=x100 (bits 31:28),
+    // op1=0 (bit 26), and op2=1xx1... (bits 24:21) unallocated. Bits 27 and
+    // 25 are the fixed Loads and Stores major-class selector.
+    const MASK: u32 = 0x7f20_0000;
+    const UNALLOCATED: u32 = 0x4920_0000;
+
+    (word & MASK) == UNALLOCATED
+}
+
+fn word_is_unallocated_sve_uxth_small_dest(word: u32) -> bool {
+    // SVE UXTH (predicated) fixes bits 31:24=0x04, bit 21=0, bit 19=0,
+    // opc=011, and bits 15:13=101. Its decode rejects size=0x because the
+    // destination element would be no wider than the 16-bit source.
+    const MASK: u32 = 0xffaf_e000;
+    const UNALLOCATED: u32 = 0x0403_a000;
+
+    (word & MASK) == UNALLOCATED
+}
+
+fn word_is_unallocated_advanced_simd_parent_partition(word: u32) -> bool {
+    // Data Processing -- Scalar Floating-Point and Advanced SIMD fixes
+    // bits 27:25=111.  Its parent decoder marks op0=0xx0 (bits 31:28),
+    // op1=0x (bits 24:23), op2=x0xx (bits 22:19), and
+    // op3=xxx1xxxx0 (bits 18:10) unallocated.  The individually fixed bits
+    // are therefore 31=0, 28=0, 27:25=111, 24=0, 21=0, 15=1, and 10=0.
+    const MASK: u32 = 0x9f20_8400;
+    const UNALLOCATED: u32 = 0x0e00_8000;
+
+    (word & MASK) == UNALLOCATED
+}
+
 fn word_is_proven_unallocated(word: u32) -> bool {
     const RESERVED_MAJOR_OP0_MASK: u32 = 0x9e00_0000;
     const TOP_LEVEL_UNALLOCATED_OP1_MASK: u32 = 0x1a00_0000;
@@ -1370,6 +1734,39 @@ fn word_is_proven_unallocated(word: u32) -> bool {
     const FIXED_11_10: u32 = 0x0000_0800;
 
     if word & RESERVED_MAJOR_OP0_MASK == 0 {
+        return true;
+    }
+    if word_is_unallocated_sve_partition_break(word) {
+        return true;
+    }
+    if word_is_unallocated_sve_pred_minmaxdiff(word) {
+        return true;
+    }
+    if word_is_unallocated_load_store_root(word) {
+        return true;
+    }
+    if word_is_unallocated_sve_vector_shift_lu(word) {
+        return true;
+    }
+    if word_is_unallocated_sve_unpred_wide_shift(word) {
+        return true;
+    }
+    if word_is_unallocated_sve_wide_immediate(word) {
+        return true;
+    }
+    if word_is_unallocated_add_sub_shifted_32(word) {
+        return true;
+    }
+    if word_is_unallocated_logical_shifted_32(word) {
+        return true;
+    }
+    if word_is_unallocated_load_store_x100(word) {
+        return true;
+    }
+    if word_is_unallocated_sve_uxth_small_dest(word) {
+        return true;
+    }
+    if word_is_unallocated_advanced_simd_parent_partition(word) {
         return true;
     }
     if (word & TOP_LEVEL_UNALLOCATED_OP1_MASK) == TOP_LEVEL_UNALLOCATED_OP1 {
@@ -1399,12 +1796,97 @@ fn word_is_proven_x18_free_decoder_failure(word: u32) -> bool {
     const SME2_SMLAL_TWO_VECTOR_MASK: u32 = 0xfff0_9038;
     const SME2_SMLAL_TWO_VECTOR: u32 = 0xc1d0_1000;
 
-    word_is_proven_unallocated(word) || (word & SME2_SMLAL_TWO_VECTOR_MASK) == SME2_SMLAL_TWO_VECTOR
+    // FEAT_LRCPC3 LDAPUR (SIMD&FP). bad64 0.12 identifies these encodings but
+    // its operand formatter has no cases for the B/H/S/D/Q forms and returns
+    // ErrorOperands. Rt is a SIMD register; the only GPR field is the base Rn
+    // at bits 9:5. In particular, bits 14:10 are immediate data, not Rt2.
+    const LDAPUR_FPSIMD_MASK: u32 = 0x3f60_0c00;
+    const LDAPUR_FPSIMD: u32 = 0x1d40_0800;
+    let ldapur_fpsimd_without_x18_base =
+        (word & LDAPUR_FPSIMD_MASK) == LDAPUR_FPSIMD && ((word >> 5) & 0x1f) != 18;
+
+    word_is_proven_unallocated(word)
+        || (word & SME2_SMLAL_TWO_VECTOR_MASK) == SME2_SMLAL_TWO_VECTOR
+        || ldapur_fpsimd_without_x18_base
+}
+
+/// Is this specific decoder failure itself an architectural proof that the
+/// word cannot read or write a GPR? The spec-generated decoder distinguishes
+/// an allocated-but-unsupported/unmatched instruction from an encoding the
+/// current A64 architecture marks UNALLOCATED. Only the latter is accepted:
+/// executing it raises an undefined-instruction exception, so a matching
+/// five-bit field cannot denote guest x18. Manual family proofs above remain
+/// for formatter gaps whose decode status is not `Unallocated`.
+fn decoder_failure_proves_x18_free(word: u32, error: &bad64::DecodeError) -> bool {
+    matches!(
+        error,
+        bad64::DecodeError::Reserved(_)
+            | bad64::DecodeError::Unallocated(_)
+            | bad64::DecodeError::Undefined(_)
+    ) || word_is_proven_x18_free_decoder_failure(word)
+}
+
+fn dynamic_word_requires_patch(word: u32, site: u64) -> bool {
+    word == SVC_0
+        || direct_linux_sysreg_value(word).is_some()
+        || tpidr_access(word).is_some()
+        || (!physical_x18_supported()
+            && word_could_name_x18(word)
+            && bad64::decode(word, site)
+                .is_ok_and(|instruction| instruction_names_x18(&instruction)))
+}
+
+fn dynamic_patch_arena_len(code: &[u8]) -> Result<usize, String> {
+    const BYTES_PER_PATCH_SITE: usize = 1024;
+    const MAX_DYNAMIC_ARENA: usize = 64 * 1024 * 1024;
+    let patch_sites = code
+        .chunks_exact(4)
+        .enumerate()
+        .filter(|(index, chunk)| {
+            let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            dynamic_word_requires_patch(word, (*index * 4) as u64)
+        })
+        .count();
+    let required = patch_sites
+        .checked_mul(BYTES_PER_PATCH_SITE)
+        .map(|bytes| bytes.max(HOST_PAGE))
+        .and_then(|bytes| bytes.checked_add(HOST_PAGE - 1))
+        .map(|bytes| bytes / HOST_PAGE * HOST_PAGE)
+        .filter(|bytes| *bytes <= MAX_DYNAMIC_ARENA)
+        .ok_or_else(|| "dynamic patch-site arena budget exceeds 64 MiB".to_string())?;
+    Ok(required)
 }
 
 /// Does a decoded instruction reference x18/w18 as an operand?
 fn instruction_names_x18(insn: &bad64::Instruction) -> bool {
-    instruction_regs(insn).contains(&18)
+    insn.operands().iter().any(operand_names_x18_noalloc)
+}
+
+#[cfg(test)]
+mod test_decodes {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static ENABLED: Cell<bool> = const { Cell::new(false) };
+        static DECODES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn note() {
+        ENABLED.with(|enabled| {
+            if enabled.get() {
+                DECODES.with(|count| count.set(count.get() + 1));
+            }
+        });
+    }
+
+    pub(super) fn count<T>(work: impl FnOnce() -> T) -> (T, usize) {
+        DECODES.with(|count| count.set(0));
+        ENABLED.with(|enabled| enabled.set(true));
+        let result = work();
+        ENABLED.with(|enabled| enabled.set(false));
+        let count = DECODES.with(Cell::get);
+        (result, count)
+    }
 }
 
 /// Can this x18-using instruction be veneered? Both halves must succeed: two
@@ -1503,6 +1985,7 @@ fn scan_eligibility_inner(
 /// refusals.
 fn scan_executable_words(code: &[u8], vaddr0: u64) -> Result<usize, DirectIneligible> {
     let mut svc_sites = 0_usize;
+    let physical_x18 = physical_x18_supported();
     for (index, chunk) in code.chunks_exact(4).enumerate() {
         let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         let site = vaddr0 + (index * 4) as u64;
@@ -1510,6 +1993,22 @@ fn scan_executable_words(code: &[u8], vaddr0: u64) -> Result<usize, DirectInelig
             svc_sites += 1;
             continue;
         }
+        // The raw A64 fields are an over-approximation: if none can name
+        // x18, the word cannot depend on Carrick's virtual platform register.
+        // Handle the other virtual-state family first, then avoid bad64's
+        // full decomposition (including its per-word struct bzero) for the
+        // overwhelmingly common ordinary word.
+        if tpidr_access(word).is_some() {
+            continue;
+        }
+        if physical_x18 {
+            continue;
+        }
+        if !word_could_name_x18(word) {
+            continue;
+        }
+        #[cfg(test)]
+        test_decodes::note();
         match bad64::decode(word, site) {
             Ok(insn) => {
                 // `tpidr_el0` is veneered, not refused (see `tpidr_veneer`).
@@ -1547,7 +2046,7 @@ fn scan_executable_words(code: &[u8], vaddr0: u64) -> Result<usize, DirectInelig
                     }
                 }
             }
-            Err(_) if word_is_proven_x18_free_decoder_failure(word) => {}
+            Err(error) if decoder_failure_proves_x18_free(word, &error) => {}
             Err(_) if word_could_name_x18(word) => {
                 return Err(DirectIneligible::UndecodableText { vaddr: site, word });
             }
@@ -1555,6 +2054,110 @@ fn scan_executable_words(code: &[u8], vaddr0: u64) -> Result<usize, DirectInelig
         }
     }
     Ok(svc_sites)
+}
+
+/// Does this dynamic interval need Tier-D virtual-state patching? Syscall
+/// sites are counted separately by [`scan_executable_words`]; this diagnostic
+/// pass names x18/TLS words that the shared patcher must veneer.
+#[cfg(test)]
+fn dynamic_page_names_virtual_state(code: &[u8], vaddr0: u64) -> Result<bool, String> {
+    for (index, chunk) in code.chunks_exact(4).enumerate() {
+        let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let site = vaddr0 + (index * 4) as u64;
+        if tpidr_access(word).is_some() {
+            return Err(format!(
+                "dynamic word {word:#010x} at {site:#x} accesses tpidr_el0"
+            ));
+        }
+        if word == SVC_0 {
+            continue;
+        }
+        if !word_could_name_x18(word) {
+            continue;
+        }
+        match bad64::decode(word, site) {
+            Ok(insn) if instruction_names_x18(&insn) => {
+                return Err(format!("dynamic word {word:#010x} at {site:#x} names x18"));
+            }
+            Err(error) if decoder_failure_proves_x18_free(word, &error) => {}
+            Err(_) if word_could_name_x18(word) => {
+                return Err(format!(
+                    "undecodable dynamic word {word:#010x} at {:#x} may name x18",
+                    site
+                ));
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+    Ok(false)
+}
+
+fn operand_names_x18_noalloc(operand: &bad64::Operand) -> bool {
+    use bad64::Operand as O;
+    let is_x18 = |reg| reg_index(reg).is_some_and(|(index, _)| index == 18);
+    match operand {
+        O::Reg { reg, .. } | O::QualReg { reg, .. } | O::ShiftReg { reg, .. } => is_x18(*reg),
+        O::MemReg(reg)
+        | O::MemOffset { reg, .. }
+        | O::MemPreIdx { reg, .. }
+        | O::MemPostIdxImm { reg, .. } => is_x18(*reg),
+        O::MemPostIdxReg(regs) | O::MemExt { regs, .. } => regs.iter().copied().any(is_x18),
+        O::MultiReg { regs, .. } => regs.iter().flatten().copied().any(is_x18),
+        _ => false,
+    }
+}
+
+/// Allocation-free, lock-free verifier called from the direct SIGBUS/SIGSEGV
+/// transport before it enables execution for one freshly written MAP_JIT
+/// page. `bad64::decode` is a no_std fixed-buffer decoder; this wrapper uses
+/// no formatting, collections, locks, or panicking input operations.
+///
+/// Returns 0 only when every word can execute unchanged on Darwin. A page
+/// containing `svc`, `tpidr_el0`, x18, or an undecodable word that might name
+/// x18 is refused before the handler changes it to execute mode.
+///
+/// # Safety
+///
+/// `start..start + len` must be one live readable mapping for the duration of
+/// this call. `len` must not exceed that mapping.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn carrick_native_direct_dynamic_page_safe(
+    start: *const u8,
+    len: usize,
+) -> libc::c_int {
+    if start.is_null() || !len.is_multiple_of(4) {
+        return 0;
+    }
+    let physical_x18 = physical_x18_supported();
+    for offset in (0..len).step_by(4) {
+        // SAFETY: the signal transport supplies one live, readable MAP_JIT
+        // host page and `offset + 4 <= len` by construction.
+        let word = unsafe { std::ptr::read_unaligned(start.add(offset).cast::<u32>()) };
+        if word == SVC_0 || tpidr_access(word).is_some() {
+            return 0;
+        }
+        if physical_x18 {
+            // Linux CTR_EL0/DCZID_EL0 reads remain byte-for-byte intact and
+            // are emulated by the already-required Mach exception handler.
+            continue;
+        }
+        if direct_linux_sysreg_value(word).is_some() {
+            return 0;
+        }
+        if !word_could_name_x18(word) {
+            continue;
+        }
+        match bad64::decode(word, start as u64 + offset as u64) {
+            Ok(insn) if insn.operands().iter().any(operand_names_x18_noalloc) => return 0,
+            Err(error)
+                if !decoder_failure_proves_x18_free(word, &error) && word_could_name_x18(word) =>
+            {
+                return 0;
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+    1
 }
 
 /// Where islands and veneers are WRITTEN, addressed by runtime address so a
@@ -1624,6 +2227,23 @@ fn next_exec_hint(len: usize) -> u64 {
     EXEC_HINT_CURSOR.fetch_add(step, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Keep future load-group hints above a guest mapping that occupied the same
+/// sparse address neighborhood.
+///
+/// A guest JIT can request a 6-TiB mapping that begins after the current
+/// cursor and extends across its next hint. Darwin may then place an incoming
+/// non-fixed exec mapping into a PROT_NONE tail of that outgoing reservation;
+/// the outgoing owner's later exec teardown would unmap the incoming pages.
+/// Advancing the monotonic cursor when a guest mapping is created preserves
+/// pre-commit isolation: the incoming group never aliases memory still owned
+/// by the outgoing image.
+pub fn reserve_exec_hints_past(mapping_end: u64) {
+    let floor = mapping_end
+        .next_multiple_of(HOST_PAGE as u64)
+        .saturating_add(HOST_PAGE as u64);
+    EXEC_HINT_CURSOR.fetch_max(floor, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// One loaded, patched, directly-executable guest mapping.
 ///
 /// An image never stands alone: it is a member of a [`DirectLoadGroup`],
@@ -1633,6 +2253,10 @@ fn next_exec_hint(len: usize) -> u64 {
 pub struct DirectImage {
     base: *mut u8,
     len: usize,
+    /// True for loaded images/windows. A short-lived dynamic-code patch view
+    /// borrows an existing MAP_JIT mapping and sets this false so the shared
+    /// patch pipeline cannot unmap guest-owned text when that view drops.
+    owns_base: bool,
     entry: u64,
     /// `mapped base - min(p_vaddr)`: what to ADD to an image-relative vaddr.
     /// Equals `base` whenever the lowest `PT_LOAD` begins at vaddr 0, which
@@ -1645,9 +2269,19 @@ pub struct DirectImage {
     /// a fixed address that cannot hold appended islands (a `MAP_FIXED` exec
     /// window). `None` when islands live in the text mapping itself.
     island_mapping: Option<(*mut u8, usize)>,
+    /// A dynamic publication must make immutable islands executable before
+    /// any live text branch targets them. Borrowed patch views record branch
+    /// writes here; ordinary image patching writes text immediately.
+    deferred_text_writes: Option<Vec<(usize, u32)>>,
+    /// Separate nearby MAP_JIT storage for runtime parked-entry stubs. Static
+    /// image text is a plain immutable R+X mapping and must never be reopened
+    /// for writes. Runtime windows leave this absent and use the external
+    /// fail-closed placement path.
+    runtime_stub_arena: Option<RuntimeStubArena>,
 }
 
-// SAFETY: the mapping is owned solely by this value and unmapped in `Drop`.
+// SAFETY: owning images release their mappings in Drop; a non-owning dynamic
+// patch view never escapes the host thread that constructs and consumes it.
 unsafe impl Send for DirectImage {}
 
 impl DirectImage {
@@ -1679,6 +2313,10 @@ impl DirectImage {
     /// Byte length of the mapping, for inspection.
     pub fn mapped_len(&self) -> usize {
         self.len
+    }
+
+    fn reserve_runtime_stub(&self) -> Option<RuntimeStubLease<'_>> {
+        self.runtime_stub_arena.as_ref()?.reserve()
     }
 
     fn copy_and_patch(
@@ -1728,6 +2366,34 @@ impl DirectImage {
                 Err(reason) => return Ok(Err(reason)),
             }
         }
+        if let Some(symbol) = dynamic_function_symbol(elf, b"__clear_cache")? {
+            let site_host = symbol
+                .vaddr
+                .checked_sub(lo)
+                .and_then(|offset| usize::try_from(offset).ok())
+                .ok_or_else(|| io::Error::other("__clear_cache precedes the load span"))?;
+            match self.patch_dynamic_publication_hook(symbol, site_host, &mut arena, tsd)? {
+                Ok(()) => {}
+                Err(reason) => return Ok(Err(reason)),
+            }
+        }
+        // `self.len` initially includes the scan's worst-case island budget
+        // (one veneer for every executable instruction). Real images need a
+        // tiny fraction of it: Node's ~100 MiB load span otherwise retained a
+        // second ~99 MiB of empty address space, making every genuinely-near
+        // runtime arena look more than ±128 MiB away. Return the unused suffix
+        // before publishing the image and make `len` describe only bytes that
+        // can actually execute or back a PT_LOAD.
+        let used_len = arena.cursor.next_multiple_of(HOST_PAGE);
+        if used_len < self.len {
+            let unused_len = self.len - used_len;
+            // SAFETY: no emitted island reaches this suffix; `arena.cursor` is
+            // the initialized high-water mark and both bounds are page aligned.
+            if unsafe { libc::munmap(self.base.add(used_len).cast(), unused_len) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            self.len = used_len;
+        }
         Ok(Ok(()))
     }
 
@@ -1752,17 +2418,48 @@ impl DirectImage {
         arena: &mut IslandArena,
         tsd: TsdSlot,
     ) -> Result<Result<(), DirectIneligible>, io::Error> {
+        let physical_x18 = physical_x18_supported();
         // Runtime address of a text byte offset. The text mapping is always
         // `self.base`; the arena may or may not be the same mapping.
-        let text_runtime = |site_host: usize| self.base as u64 + site_host as u64;
+        let text_base = self.base as u64;
+        let text_runtime = |site_host: usize| text_base + site_host as u64;
         for (index, chunk) in code.chunks_exact(4).enumerate() {
             let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             let site_vaddr = vaddr0 + (index * 4) as u64;
+            // CTR_EL0/DCZID_EL0 are Carrick architectural constants. Patch
+            // them before the generic x18 path so static images never need a
+            // Mach EXC_BAD_INSTRUCTION transport merely because an MRS exists
+            // somewhere in a scanned executable section.
+            if let Some(value) = direct_linux_sysreg_value(word) {
+                let site_host = (site_vaddr - lo) as usize;
+                let veneer_cursor = arena.cursor;
+                let words = linux_sysreg_veneer(word, value, tsd, physical_x18);
+                let bytes = words.len() * 4;
+                if veneer_cursor + bytes + 4 > arena.len {
+                    return Err(io::Error::other("sysreg veneer budget exhausted"));
+                }
+                for (i, w) in words.iter().enumerate() {
+                    arena.write_word(veneer_cursor + i * 4, *w);
+                }
+                let return_delta = (text_runtime(site_host) + 4) as i64
+                    - arena.runtime(veneer_cursor + bytes) as i64;
+                let entry_delta =
+                    arena.runtime(veneer_cursor) as i64 - text_runtime(site_host) as i64;
+                if !b_in_range(return_delta) || !b_in_range(entry_delta) {
+                    return Ok(Err(DirectIneligible::IslandOutOfRange {
+                        vaddr: site_vaddr,
+                    }));
+                }
+                arena.write_word(veneer_cursor + bytes, b_rel(return_delta));
+                self.write_word(site_host, b_rel(entry_delta));
+                arena.cursor = (veneer_cursor + bytes + 4).next_multiple_of(4);
+                continue;
+            }
             // `tpidr_el0` accesses are veneered in the same pass.
             if let Some(access) = tpidr_access(word) {
                 let site_host = (site_vaddr - lo) as usize;
                 let veneer_cursor = arena.cursor;
-                let words = tpidr_veneer(access, tsd);
+                let words = tpidr_veneer(access, tsd, physical_x18);
                 let bytes = words.len() * 4;
                 if veneer_cursor + bytes + 4 > arena.len {
                     return Err(io::Error::other("veneer budget exhausted"));
@@ -1788,7 +2485,7 @@ impl DirectImage {
             // Conditional branches ON x18 (cbz/cbnz/tbz/tbnz) get the
             // dedicated branch veneer: the condition tests the slot, and
             // both edges leave through patch-time-constant branches.
-            if cond_branch_on_x18(word) || test_bit_branch_on_x18(word) {
+            if !physical_x18 && (cond_branch_on_x18(word) || test_bit_branch_on_x18(word)) {
                 let site_host = (site_vaddr - lo) as usize;
                 let branch_offset = if cond_branch_on_x18(word) {
                     cond_branch_offset(word)
@@ -1835,7 +2532,7 @@ impl DirectImage {
             }
             // adr/adrp INTO x18: the computed address is a patch-time
             // constant for this site, materialized into the slot.
-            if pc_relative_address_to_x18(word) {
+            if !physical_x18 && pc_relative_address_to_x18(word) {
                 let site_host = (site_vaddr - lo) as usize;
                 let value = pc_relative_address_value(word, site_vaddr + bias);
                 let veneer_cursor = arena.cursor;
@@ -1865,7 +2562,7 @@ impl DirectImage {
             // Pre/post-indexed stack pairs containing x18 need a dedicated
             // split lowering: the generic veneer itself borrows SP and cannot
             // execute an instruction that also updates SP.
-            if let Some(pair) = x18_sp_pair(word) {
+            if !physical_x18 && let Some(pair) = x18_sp_pair(word) {
                 let site_host = (site_vaddr - lo) as usize;
                 let veneer_cursor = arena.cursor;
                 let words = x18_sp_pair_veneer(pair, tsd);
@@ -1892,7 +2589,9 @@ impl DirectImage {
                 continue;
             }
             // x18 uses are veneered in the same pass.
-            if word != SVC_0
+            if !physical_x18
+                && word != SVC_0
+                && word_could_name_x18(word)
                 && let Ok(insn) = bad64::decode(word, site_vaddr)
                 && instruction_names_x18(&insn)
             {
@@ -1977,7 +2676,112 @@ impl DirectImage {
         Ok(Ok(()))
     }
 
-    fn write_word(&self, byte_offset: usize, word: u32) {
+    /// Redirect a qualified AArch64 `__clear_cache` definition through one
+    /// nearby island. The function's `bti c` landing pad stays at the public
+    /// symbol address; only its following direct branch is replaced. The
+    /// island preserves the two cache-range arguments and the link/frame
+    /// pair around Carrick's host publication hook, then takes a constant
+    /// branch to the definition's original cache-maintenance body. A named
+    /// synchronous patch refusal leaves directly through the host landing
+    /// point instead of returning unsafe published bytes to the guest.
+    fn patch_dynamic_publication_hook(
+        &mut self,
+        symbol: DynamicFunctionSymbol,
+        site_host: usize,
+        arena: &mut IslandArena,
+        tsd: TsdSlot,
+    ) -> Result<Result<(), DirectIneligible>, io::Error> {
+        const BTI_C: u32 = 0xd503_245f;
+        const B_MASK: u32 = 0xfc00_0000;
+        const B_OPCODE: u32 = 0x1400_0000;
+
+        if symbol.size < 8 || site_host.checked_add(8).is_none_or(|end| end > self.len) {
+            return Err(io::Error::other(
+                "__clear_cache entry is outside its mapped image",
+            ));
+        }
+        // SAFETY: the symbol/file mapping checks above cover both words.
+        let first = unsafe { std::ptr::read_unaligned(self.base.add(site_host).cast::<u32>()) };
+        // SAFETY: as above, for the second word.
+        let second =
+            unsafe { std::ptr::read_unaligned(self.base.add(site_host + 4).cast::<u32>()) };
+        if first != BTI_C || second & B_MASK != B_OPCODE {
+            return Ok(Err(DirectIneligible::DynamicPublicationHookUnsupported {
+                vaddr: symbol.vaddr,
+                first,
+                second,
+            }));
+        }
+
+        let branch_site = self.base as u64 + site_host as u64 + 4;
+        let imm26 = ((second & 0x03ff_ffff) << 6) as i32 >> 6;
+        let original_target = branch_site.wrapping_add_signed((imm26 as i64) * 4);
+        if !(self.base as u64..self.base as u64 + self.len as u64).contains(&original_target) {
+            return Ok(Err(DirectIneligible::DynamicPublicationHookUnsupported {
+                vaddr: symbol.vaddr,
+                first,
+                second,
+            }));
+        }
+
+        let island_cursor = arena.cursor;
+        let mut words = Vec::with_capacity(24);
+        words.push(stp_pre_sp(0, 1));
+        words.push(stp_pre_sp(29, 30));
+        // The callback switches to Darwin's host x18 ABI before entering
+        // Rust/libSystem. Preserve the guest's physical x18 across that host
+        // interval just as the syscall island preserves the full context.
+        words.push(str_pre_sp(18));
+        words.extend_from_slice(&mov_imm64(
+            16,
+            dispatch_dynamic_publication as *const () as u64,
+        ));
+        words.push(blr(16));
+        words.push(ldr_post_sp(18));
+        let failure_branch = words.len();
+        words.push(0); // cbz x0, failure leave
+        words.push(ldp_post_sp(29, 30));
+        words.push(ldp_post_sp(0, 1));
+        let original_target_branch = words.len();
+        words.push(0);
+        let failure_leg = words.len();
+        words[failure_branch] = cbz(0, ((failure_leg - failure_branch) * 4) as i64);
+        // The runtime callback already recorded the named terminal outcome.
+        // Abandon the guest function frame and return through `enter`'s host
+        // landing discipline; no unsafe dynamic instruction can execute.
+        words.extend_from_slice(&tsd_resolve(0, tsd));
+        words.push(ldr_imm(1, 0, GuestContext::HOST_SP));
+        words.push(mov_to_sp(1));
+        words.push(ldr_imm(30, 0, GuestContext::HOST_LR));
+        words.push(RET);
+        let bytes = words.len() * 4;
+        if island_cursor + bytes > arena.len {
+            return Err(io::Error::other(
+                "dynamic publication island budget exhausted",
+            ));
+        }
+        let entry_delta = arena.runtime(island_cursor) as i64 - branch_site as i64;
+        let return_branch_runtime = arena.runtime(island_cursor + original_target_branch * 4);
+        let target_delta = original_target as i64 - return_branch_runtime as i64;
+        if !b_in_range(entry_delta) || !b_in_range(target_delta) {
+            return Ok(Err(DirectIneligible::IslandOutOfRange {
+                vaddr: symbol.vaddr + 4,
+            }));
+        }
+        words[original_target_branch] = b_rel(target_delta);
+        for (index, word) in words.iter().copied().enumerate() {
+            arena.write_word(island_cursor + index * 4, word);
+        }
+        self.write_word(site_host + 4, b_rel(entry_delta));
+        arena.cursor = (island_cursor + bytes).next_multiple_of(4);
+        Ok(Ok(()))
+    }
+
+    fn write_word(&mut self, byte_offset: usize, word: u32) {
+        if let Some(writes) = self.deferred_text_writes.as_mut() {
+            writes.push((byte_offset, word));
+            return;
+        }
         // SAFETY: callers bound `byte_offset + 4` by `self.len`.
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -1986,6 +2790,10 @@ impl DirectImage {
                 4,
             );
         }
+    }
+
+    fn take_deferred_text_writes(&mut self) -> Vec<(usize, u32)> {
+        self.deferred_text_writes.take().unwrap_or_default()
     }
 
     /// Move every WRITABLE `PT_LOAD` out of the `MAP_JIT` region.
@@ -2072,11 +2880,89 @@ impl DirectImage {
 /// Apple Silicon's host page size, which is the granularity of the
 /// writable-segment replacement and the island tail's alignment.
 const HOST_PAGE: usize = 16 * 1024;
+const RUNTIME_STUB_SLOT_CAPACITY: usize = 512;
+const RUNTIME_STUB_ARENA_LEN: usize = 4 * 1024 * 1024;
+
+fn farthest_range_endpoint_distance(
+    first: u64,
+    first_len: usize,
+    second: u64,
+    second_len: usize,
+) -> u64 {
+    let first_end = first.saturating_add(first_len as u64);
+    let second_end = second.saturating_add(second_len as u64);
+    first.abs_diff(second_end).max(first_end.abs_diff(second))
+}
+
+/// Per-image runtime resume storage. MAP_JIT's permission is per-thread, so a
+/// host thread may rewrite its leased slot while other threads continue to
+/// execute different immutable slots in this same mapping. A slot is returned
+/// only after `DirectLoadGroup::enter` has left guest code, making reuse safe.
+struct RuntimeStubArena {
+    base: *mut u8,
+    len: usize,
+    cursor: std::sync::atomic::AtomicUsize,
+    free: std::sync::Mutex<Vec<usize>>,
+}
+
+impl RuntimeStubArena {
+    fn reserve(&self) -> Option<RuntimeStubLease<'_>> {
+        if let Some(offset) = lock(&self.free).pop() {
+            return Some(RuntimeStubLease {
+                arena: self,
+                offset,
+            });
+        }
+        let previous = self
+            .cursor
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |current| {
+                    let start = current.next_multiple_of(16);
+                    let end = start.checked_add(RUNTIME_STUB_SLOT_CAPACITY)?;
+                    (end <= self.len).then_some(end)
+                },
+            )
+            .ok()?;
+        Some(RuntimeStubLease {
+            arena: self,
+            offset: previous.next_multiple_of(16),
+        })
+    }
+}
+
+impl Drop for RuntimeStubArena {
+    fn drop(&mut self) {
+        // SAFETY: this arena uniquely owns the separate MAP_JIT mapping.
+        unsafe { libc::munmap(self.base.cast(), self.len) };
+    }
+}
+
+struct RuntimeStubLease<'a> {
+    arena: &'a RuntimeStubArena,
+    offset: usize,
+}
+
+impl RuntimeStubLease<'_> {
+    fn base(&self) -> *mut u8 {
+        // SAFETY: `reserve` bounded this complete slot by the arena length.
+        unsafe { self.arena.base.add(self.offset) }
+    }
+}
+
+impl Drop for RuntimeStubLease<'_> {
+    fn drop(&mut self) {
+        lock(&self.arena.free).push(self.offset);
+    }
+}
 
 impl Drop for DirectImage {
     fn drop(&mut self) {
-        // SAFETY: this value owns the mapping.
-        unsafe { libc::munmap(self.base.cast(), self.len) };
+        if self.owns_base {
+            // SAFETY: an owning image uniquely owns this mapping.
+            unsafe { libc::munmap(self.base.cast(), self.len) };
+        }
         if let Some((ptr, len)) = self.island_mapping {
             // SAFETY: this value also owns its separate island arena.
             unsafe { libc::munmap(ptr.cast(), len) };
@@ -2117,8 +3003,179 @@ pub struct DirectLoadGroup {
     /// never bless unpatched bytes just because they sit inside a window's
     /// original extent.
     replaced: std::sync::Mutex<Vec<(u64, u64)>>,
+    /// Anonymous Linux RWX ranges lowered to Darwin MAP_JIT. The mapping is
+    /// process-global, while its write/execute permission is per-thread; a
+    /// synchronous fault parks the thread and this catalog decides which
+    /// mode transition is sound.
+    dynamic_exec: std::sync::Mutex<Vec<DynamicExecRange>>,
+    /// Lazily allocated byte-preserving translator for ranges switched to
+    /// shadow mode. Ordinary no-fork Tier-D processes pay no cache mapping or
+    /// translator construction cost.
+    dynamic_shadow: std::sync::Mutex<Option<DynamicShadow>>,
+    /// Test/fork-child policy: every subsequently created dynamic range starts
+    /// as a non-executable shadow source instead of direct MAP_JIT text.
+    force_dynamic_shadow: std::sync::atomic::AtomicBool,
+    /// Immutable, site-near veneer mappings backing patched dynamic
+    /// publications. Never recycle one while the group lives: another guest
+    /// thread can still be retiring through an old veneer while a JIT writer
+    /// republishes the site. The bounded publication journal and per-plan
+    /// arena cap make exhaustion a named refusal instead of unbounded text
+    /// corruption; group teardown releases every mapping.
+    dynamic_islands: std::sync::Mutex<Vec<DynamicIslandMapping>>,
+    /// Sticky process/group requirement. Static Linux-only sysregs, dynamic
+    /// MAP_JIT, and guest multithreading each make per-thread Mach delivery
+    /// necessary; a plain single-threaded Python process leaves this false.
+    mach_exceptions_required: std::sync::atomic::AtomicBool,
     /// The group's `rt_sigreturn` trampoline (see [`SigreturnTrampoline`]).
     sigreturn: SigreturnTrampoline,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DynamicExecRange {
+    base: u64,
+    end: u64,
+}
+
+/// Byte-preserving execution state for dynamic Tier-D mappings that cannot
+/// safely return from XNU straight into guest code (notably a fork child,
+/// whose task no longer carries the exec-qualified preserve-x18 policy).
+///
+/// This deliberately reuses the existing AArch64 DSR planner, emitter and
+/// gateway. The source mapping remains the guest's readable bytes; only the
+/// separately owned translation cache is executable.
+struct DynamicShadow {
+    cache: carrick_dsr::cache::TranslationCache,
+    blocks: std::collections::BTreeMap<(u64, u64, u64), carrick_dsr_aarch64::types::CacheVa>,
+}
+
+impl DynamicShadow {
+    const CACHE_CAPACITY: usize = 64 * 1024 * 1024;
+
+    fn new() -> Result<Self, String> {
+        let cache = carrick_dsr::cache::TranslationCache::new(
+            Self::CACHE_CAPACITY,
+            crate::jit::active_host_jit(),
+        )
+        .map_err(|error| format!("allocate Tier-D dynamic shadow cache: {error}"))?;
+        Ok(Self {
+            cache,
+            blocks: std::collections::BTreeMap::new(),
+        })
+    }
+
+    fn translate(
+        &mut self,
+        range: DynamicExecRange,
+        pc: u64,
+    ) -> Result<carrick_dsr_aarch64::types::CacheVa, String> {
+        let mut expected = 0_u64;
+        // SAFETY: the C catalog owns this stable process-lifetime atomic cell;
+        // a non-null result proves `pc` belongs to the current shadow mapping.
+        let generation_address =
+            unsafe { carrick_native_direct_shadow_generation(pc, &mut expected) } as u64;
+        if generation_address == 0 {
+            return Err(format!(
+                "dynamic shadow PC {pc:#x} has no live generation authority"
+            ));
+        }
+        let key = (pc, generation_address, expected);
+        if let Some(entry) = self.blocks.get(&key).copied() {
+            return Ok(entry);
+        }
+        let generation = carrick_dsr_aarch64::types::CodeGeneration::claimed(expected);
+        let plan = carrick_dsr_aarch64::block::plan_with_reader(
+            carrick_guest_mem::GuestVa(pc),
+            generation,
+            256,
+            HOST_PAGE as u64,
+            carrick_dsr_aarch64::block::ExclusiveFusionPolicy::Direct,
+            |address| {
+                let address = address.raw();
+                let end = address.checked_add(4).ok_or_else(|| {
+                    carrick_dsr_aarch64::types::DsrError::MemoryRead {
+                        pc: address,
+                        detail: "instruction address overflow".to_string(),
+                    }
+                })?;
+                if address < range.base || end > range.end {
+                    return Err(carrick_dsr_aarch64::types::DsrError::MemoryRead {
+                        pc: address,
+                        detail: format!(
+                            "outside dynamic shadow range {:#x}..{:#x}",
+                            range.base, range.end
+                        ),
+                    });
+                }
+                // SAFETY: the live-range ownership lock is held by the caller,
+                // shadow mode keeps the source readable, and the bounds check
+                // above covers this complete instruction word.
+                Ok(unsafe { std::ptr::read_unaligned(address as usize as *const u32) })
+            },
+        )
+        .map_err(|error| format!("plan dynamic shadow block at {pc:#x}: {error}"))?;
+        // SAFETY: `generation_address` is the stable C atomic proven above;
+        // its producer advances with acq_rel before admitting guest writes.
+        let guard = unsafe {
+            carrick_dsr_aarch64::emit::GenerationGuard::from_atomic_address(
+                generation_address,
+                generation,
+            )
+        };
+        let emitted = carrick_dsr_aarch64::emit::emit_block_with_generation_direct(
+            &mut self.cache,
+            &plan,
+            guard,
+        )
+        .map_err(|error| format!("emit dynamic shadow block at {pc:#x}: {error}"))?;
+        let entry = emitted.entry();
+        self.blocks.insert(key, entry);
+        Ok(entry)
+    }
+
+    fn after_fork_child(&mut self) {
+        self.cache.after_fork_child();
+    }
+}
+
+struct DynamicIslandMapping {
+    base: *mut u8,
+    len: usize,
+}
+
+// SAFETY: the mapping is immutable R+X after construction and is released
+// only when its owning load group is no longer executing guest threads.
+unsafe impl Send for DynamicIslandMapping {}
+
+impl Drop for DynamicIslandMapping {
+    fn drop(&mut self) {
+        // SAFETY: this value uniquely owns the immutable island mapping.
+        unsafe { libc::munmap(self.base.cast(), self.len) };
+    }
+}
+
+struct DynamicPatchPlan {
+    arena: DynamicIslandMapping,
+    text_base: *mut u8,
+    text_writes: Vec<(usize, u32)>,
+    exception_routes: Vec<DynamicExceptionRoute>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DynamicExceptionRoute {
+    site: u64,
+    entry: u64,
+    return_pc: u64,
+    resume_pc: u64,
+}
+
+/// Exact host-side control arm for the performance experiment. Each Carrick
+/// process reads it once; `1` recreates the old eager registration semantics,
+/// while unset/any other value uses the shipped lazy policy.
+fn eager_mach_exception_control() -> bool {
+    static EAGER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EAGER.get_or_init(|| {
+        std::env::var_os("CARRICK_TIER_D_EAGER_MACH").as_deref() == Some(std::ffi::OsStr::new("1"))
+    })
 }
 
 /// The kernel-vDSO-shaped `rt_sigreturn` trampoline every tier-D group
@@ -2290,6 +3347,11 @@ impl DirectLoadGroup {
             interpreter: None,
             windows: std::sync::Mutex::new(Vec::new()),
             replaced: std::sync::Mutex::new(Vec::new()),
+            dynamic_exec: std::sync::Mutex::new(Vec::new()),
+            dynamic_shadow: std::sync::Mutex::new(None),
+            force_dynamic_shadow: std::sync::atomic::AtomicBool::new(false),
+            dynamic_islands: std::sync::Mutex::new(Vec::new()),
+            mach_exceptions_required: std::sync::atomic::AtomicBool::new(false),
             sigreturn,
         })
     }
@@ -2328,47 +3390,64 @@ impl DirectLoadGroup {
         let island_budget = 64 * 1024 + segments.iter().map(|s| s.2).sum::<usize>();
         let len = ((hi - lo) as usize + island_budget).next_multiple_of(16 * 1024);
 
-        // SAFETY: sparse-hinted address (the kernel relocates freely — see
-        // EXEC_HINT_CURSOR), MAP_JIT as probed to be the only way to obtain
-        // writable-then-executable pages under Darwin's W^X policy.
-        let base = unsafe {
-            libc::mmap(
-                next_exec_hint(len) as usize as *mut libc::c_void,
-                len,
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT,
-                -1,
-                0,
-            )
-        };
-        if base == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-        let base = base.cast::<u8>();
+        // A non-fixed Darwin mmap is only HOST-page aligned. ELF requires the
+        // load bias to retain every PT_LOAD's p_align congruence; Node's arm64
+        // PIE requires 64 KiB. An occupied sparse hint once relocated its
+        // replacement image to +32 KiB, after which ld.so rounded the bias
+        // down and read an unmapped ELF header. Overmap and trim so relocation
+        // cannot weaken the ELF alignment contract.
+        let alignment = max_load_alignment(elf)?;
+        let alignment_size = usize::try_from(alignment)
+            .map_err(|_| io::Error::other("PT_LOAD alignment exceeds host usize"))?;
+        let hint_span = len
+            .checked_add(alignment_size)
+            .ok_or_else(|| io::Error::other("aligned image mapping length overflow"))?;
+        let base = map_aligned_image(next_exec_hint(hint_span), len, lo, alignment)?;
         let bias = base as u64 - lo;
         let mut image = DirectImage {
             base,
             len,
+            owns_base: true,
             entry: read_u64(elf, 0x18)? + bias,
             bias,
             svc_sites: 0,
             tpidr_sites: 0,
             x18_sites: 0,
             island_mapping: None,
+            deferred_text_writes: None,
+            runtime_stub_arena: None,
         };
         // Patching happens with the region writable and no guest thread able
         // to enter it, so there is no cross-modifying-code hazard.
-        jit_write_protect(false);
         let result = image.copy_and_patch(elf, lo, bias, self.tsd);
-        jit_write_protect(true);
-        // SAFETY: the region was just written; publish it to the i-cache.
-        unsafe { sys_icache_invalidate(base.cast(), len) };
+        let result = match result {
+            Ok(Ok(())) => {
+                // SAFETY: publish the completed image R+X before replacing
+                // its writable PT_LOADs with ordinary RW pages below.
+                let rc = unsafe {
+                    libc::mprotect(base.cast(), image.len, libc::PROT_READ | libc::PROT_EXEC)
+                };
+                if rc != 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    // SAFETY: the region was just written and made executable.
+                    unsafe { sys_icache_invalidate(base.cast(), image.len) };
+                    Ok(Ok(()))
+                }
+            }
+            other => other,
+        };
         let result = match result {
             Ok(Ok(())) => image.replace_writable_segments(elf, lo).map(Ok),
             other => other,
         };
         match result {
             Ok(Ok(())) => {
+                image.runtime_stub_arena = Self::place_runtime_stub_arena_near(
+                    image.base as u64,
+                    image.len,
+                    RUNTIME_STUB_ARENA_LEN,
+                );
                 self.images.push(image);
                 Ok(Ok(self.images.len() - 1))
             }
@@ -2420,17 +3499,16 @@ impl DirectLoadGroup {
         let window_len = len.next_multiple_of(HOST_PAGE);
         let island_budget = 64 * 1024 + ranges.iter().map(|(_, size)| size).sum::<usize>();
         let total = (window_len + island_budget).next_multiple_of(HOST_PAGE);
-        // SAFETY: sparse-hinted address (EXEC_HINT_CURSOR; the kernel
-        // relocates freely); MAP_JIT is the only way to obtain
-        // writable-then-executable pages under Darwin's W^X policy. A file
-        // mmap without MAP_FIXED is free to land anywhere, so any placement
-        // IS a correct mmap result.
+        // SAFETY: sparse-hinted private mapping (EXEC_HINT_CURSOR; the kernel
+        // relocates freely). It is unreachable while populated and patched,
+        // then published R+X below. A file mmap without MAP_FIXED is free to
+        // land anywhere, so any placement IS a correct mmap result.
         let base = unsafe {
             libc::mmap(
                 next_exec_hint(total) as usize as *mut libc::c_void,
                 total,
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
                 -1,
                 0,
             )
@@ -2442,20 +3520,20 @@ impl DirectLoadGroup {
         let mut image = DirectImage {
             base,
             len: total,
+            owns_base: true,
             entry: base as u64,
             bias: base as u64,
             svc_sites: 0,
             tpidr_sites: 0,
             x18_sites: 0,
             island_mapping: None,
+            deferred_text_writes: None,
+            runtime_stub_arena: None,
         };
-        // Copy and patch with the region writable and no guest thread able
-        // to enter it — this thread is typically still ARMED for execution
-        // from the load-time patching, so even the plain byte copy must sit
-        // inside the write-enabled window (armed threads cannot write ANY
-        // MAP_JIT page). The base publish below is the only route a guest
-        // has to the window, and it happens after the i-cache invalidate.
-        jit_write_protect(false);
+        // Copy and patch with the region writable and no guest thread able to
+        // enter it. The base publish below is the only route a guest has to
+        // the window, and it happens after the R+X transition and i-cache
+        // invalidate.
         // The window's file bytes; anything past EOF stays zero, which is
         // mmap(2)'s own beyond-EOF semantic.
         let offset_usize = offset as usize;
@@ -2479,7 +3557,6 @@ impl DirectLoadGroup {
         for (range_offset, range_len) in &ranges {
             let end = (range_offset + range_len).min(file.len());
             let Some(code) = file.get(*range_offset..end) else {
-                jit_write_protect(true);
                 return Err(io::Error::other("executable section outside the file"));
             };
             // Runtime-address domain: `vaddr0` is where the range's first
@@ -2500,14 +3577,34 @@ impl DirectLoadGroup {
                     break;
                 }
                 Err(error) => {
-                    jit_write_protect(true);
                     return Err(error);
                 }
             }
         }
-        jit_write_protect(true);
-        // SAFETY: the region was just written; publish it to the i-cache.
-        unsafe { sys_icache_invalidate(image.base.cast(), total) };
+        if patched.is_ok()
+            && let Some(symbol) = dynamic_function_symbol(file, b"__clear_cache")?
+            && let Some(relative) = (symbol.file_offset as u64).checked_sub(offset)
+            && relative.checked_add(8).is_some_and(|end| end <= len as u64)
+        {
+            let site_host = usize::try_from(relative)
+                .map_err(|_| io::Error::other("__clear_cache window offset exceeds usize"))?;
+            if let Err(reason) =
+                image.patch_dynamic_publication_hook(symbol, site_host, &mut arena, self.tsd)?
+            {
+                patched = Err(reason);
+            }
+        }
+        if patched.is_ok() {
+            // SAFETY: publish the complete mapping R+X in one transition.
+            let rc = unsafe {
+                libc::mprotect(image.base.cast(), total, libc::PROT_READ | libc::PROT_EXEC)
+            };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: the region was just written and made executable.
+            unsafe { sys_icache_invalidate(image.base.cast(), total) };
+        }
         match patched {
             Ok(()) => {
                 let mapped = image.base as u64;
@@ -2593,12 +3690,15 @@ impl DirectLoadGroup {
         let mut image = DirectImage {
             base: text,
             len: window_len,
+            owns_base: true,
             entry: addr,
             bias: addr,
             svc_sites: 0,
             tpidr_sites: 0,
             x18_sites: 0,
             island_mapping: Some((arena_ptr, arena_len)),
+            deferred_text_writes: None,
+            runtime_stub_arena: None,
         };
         // Copy the window's file bytes; past EOF stays zero (mmap semantic).
         let offset_usize = offset as usize;
@@ -2636,6 +3736,19 @@ impl DirectLoadGroup {
                     break;
                 }
                 Err(error) => return Err(error),
+            }
+        }
+        if patched.is_ok()
+            && let Some(symbol) = dynamic_function_symbol(file, b"__clear_cache")?
+            && let Some(relative) = (symbol.file_offset as u64).checked_sub(offset)
+            && relative.checked_add(8).is_some_and(|end| end <= len as u64)
+        {
+            let site_host = usize::try_from(relative)
+                .map_err(|_| io::Error::other("__clear_cache window offset exceeds usize"))?;
+            if let Err(reason) =
+                image.patch_dynamic_publication_hook(symbol, site_host, &mut arena, self.tsd)?
+            {
+                patched = Err(reason);
             }
         }
         if let Err(reason) = patched {
@@ -2689,9 +3802,56 @@ impl DirectLoadGroup {
     /// no free slot exists within range — a real but rare condition, never a
     /// mis-encoded branch.
     fn place_island_arena_near(text: u64, window_len: usize, arena_len: usize) -> Option<*mut u8> {
-        let reach =
-            |arena: u64| -> u64 { arena.abs_diff(text) + window_len as u64 + arena_len as u64 };
+        Self::place_arena_near(
+            text,
+            window_len,
+            arena_len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+        )
+    }
+
+    /// Reserve one reusable MAP_JIT arena while the image is loaded, before
+    /// guest threads can fragment its branch-reachable neighbourhood. This is
+    /// deliberately a separate mapping: static ELF text remains permanently
+    /// immutable, while MAP_JIT lets each re-entering host thread publish its
+    /// own leased stub without revoking execute permission from other threads.
+    fn place_runtime_stub_arena_near(
+        text: u64,
+        window_len: usize,
+        arena_len: usize,
+    ) -> Option<RuntimeStubArena> {
+        let base = Self::place_arena_near(
+            text,
+            window_len,
+            arena_len,
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT,
+        )?;
+        Some(RuntimeStubArena {
+            base,
+            len: arena_len,
+            cursor: std::sync::atomic::AtomicUsize::new(0),
+            free: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn place_arena_near(
+        text: u64,
+        window_len: usize,
+        arena_len: usize,
+        prot: libc::c_int,
+        flags: libc::c_int,
+    ) -> Option<*mut u8> {
         let arena_u = arena_len as u64;
+        // Maximum distance between any instruction in the text interval and
+        // any branch slot in the arena interval. Comparing opposite endpoints
+        // is sufficient for two one-dimensional ranges. The former formula
+        // added `window_len` after already measuring from `text`, double
+        // counting large images and rejecting Node's valid nearby slot.
+        let reach = |arena: u64| -> u64 {
+            farthest_range_endpoint_distance(text, window_len, arena, arena_len)
+        };
         // Candidate slots: alternating above (past the text) and below, at
         // increasing arena-sized offsets, all staying inside ±128 MiB.
         let mut candidates: Vec<u64> = Vec::new();
@@ -2713,15 +3873,15 @@ impl DirectLoadGroup {
             }
         }
         for hint in candidates {
-            // SAFETY: hinted plain anonymous mapping. WITHOUT MAP_FIXED the
-            // kernel may relocate, so a result not exactly at the hint means
-            // the slot was occupied — released and skipped, never clobbered.
+            // SAFETY: hinted anonymous mapping. WITHOUT MAP_FIXED the kernel
+            // may relocate, so a result not exactly at the hint means the slot
+            // was occupied — released and skipped, never clobbered.
             let p = unsafe {
                 libc::mmap(
                     hint as usize as *mut libc::c_void,
                     arena_len,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    prot,
+                    flags,
                     -1,
                     0,
                 )
@@ -2827,6 +3987,26 @@ impl DirectLoadGroup {
         InstalledThreadSlots::install(self.new_thread_slots())
     }
 
+    /// Make Mach delivery sticky for every subsequent entry in this group.
+    /// The clone path calls this while the parent is parked, before exposing a
+    /// second guest thread; that closes the race where a sibling could create
+    /// or execute dynamic code before the other thread had an exception port.
+    pub fn require_mach_exception_handler(&self) {
+        self.mach_exceptions_required
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn ensure_mach_exception_handler_for_entry(&self) -> io::Result<()> {
+        if self
+            .mach_exceptions_required
+            .load(std::sync::atomic::Ordering::Acquire)
+            || eager_mach_exception_control()
+        {
+            ensure_current_thread_exception_handler()?;
+        }
+        Ok(())
+    }
+
     /// Arm THIS thread to execute the group's `MAP_JIT` pages.
     ///
     /// `pthread_jit_write_protect_np` is PER-THREAD on Apple Silicon: a thread
@@ -2841,6 +4021,936 @@ impl DirectLoadGroup {
     /// caller remember.
     pub fn arm_current_thread(&self) {
         jit_write_protect(true);
+    }
+
+    /// Replace a proven-zero anonymous `PROT_NONE` reservation with MAP_JIT
+    /// at the SAME guest address and leave this thread in EXECUTE mode. This
+    /// is Linux's persistent-RWX JIT contract lowered onto Darwin W^X:
+    /// ordinary guest text is plain R+X, so it keeps executing, while the
+    /// first store into the dynamic mapping faults through the Mach channel
+    /// and marks the whole range conservatively dirty before enabling writes.
+    /// A later branch faults back to execute mode and publishes that page.
+    pub fn map_dynamic_exec(&self, addr: u64, len: u64) -> io::Result<()> {
+        let len = usize::try_from(len)
+            .ok()
+            .filter(|len| *len != 0 && len.is_multiple_of(HOST_PAGE))
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+        if !(addr as usize).is_multiple_of(HOST_PAGE) {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        // Publish the requirement before the mapping: every later guest entry
+        // must have a handler before it can observe this process-global range.
+        // The current syscall thread is already parked in host code, so arm it
+        // before changing the address space. The bit stays sticky on failure;
+        // an extra handler is safe, while forgetting a live range is not.
+        self.require_mach_exception_handler();
+        self.ensure_mach_exception_handler_for_entry()?;
+        // No prepatched guest text lives in MAP_JIT, so write mode cannot
+        // disable the instruction that performs the guest's code writes.
+        jit_write_protect(false);
+        // SAFETY: the caller proved this exact range is an untouched private
+        // anonymous PROT_NONE reservation owned by the guest.
+        if unsafe { libc::munmap(addr as usize as *mut libc::c_void, len) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let shadow = self
+            .force_dynamic_shadow
+            .load(std::sync::atomic::Ordering::Acquire);
+        // The ordinary fast path needs MAP_JIT and its kernel-chosen exact
+        // hint. A process already committed to shadow execution instead maps
+        // a plain readable source at the exact guest VA: it must never execute
+        // directly, and Mach protection faults provide its write epochs.
+        let mapped = unsafe {
+            libc::mmap(
+                addr as usize as *mut libc::c_void,
+                len,
+                if shadow {
+                    libc::PROT_READ
+                } else {
+                    libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC
+                },
+                libc::MAP_PRIVATE
+                    | libc::MAP_ANON
+                    | if shadow {
+                        libc::MAP_FIXED
+                    } else {
+                        libc::MAP_JIT
+                    },
+                -1,
+                0,
+            )
+        };
+        if mapped == libc::MAP_FAILED || mapped as u64 != addr {
+            let error = if mapped == libc::MAP_FAILED {
+                io::Error::last_os_error()
+            } else {
+                // SAFETY: discard the kernel-relocated mapping.
+                unsafe { libc::munmap(mapped, len) };
+                io::Error::other(format!(
+                    "dynamic mapping relocated fixed guest range {addr:#x} to {:#x}",
+                    mapped as u64
+                ))
+            };
+            // SAFETY: restore the exact, known-zero reservation semantics.
+            unsafe {
+                libc::mmap(
+                    addr as usize as *mut libc::c_void,
+                    len,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+                    -1,
+                    0,
+                )
+            };
+            return Err(error);
+        }
+        // Publish the range to the lock-free C signal catalog only after the
+        // exact-address mapping exists. A handler can then classify faults
+        // without touching Rust locks or allocating.
+        if unsafe { carrick_native_direct_register_range(addr, addr + len as u64) } != 0 {
+            let error = io::Error::last_os_error();
+            // SAFETY: discard the unpublishable MAP_JIT mapping and restore
+            // the caller's proven-zero reservation.
+            unsafe {
+                libc::munmap(mapped, len);
+                libc::mmap(
+                    addr as usize as *mut libc::c_void,
+                    len,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+                    -1,
+                    0,
+                );
+            }
+            return Err(error);
+        }
+        if shadow
+            // SAFETY: the range was just registered under this exact mapping
+            // generation and no guest can observe it until this syscall
+            // returns.
+            && unsafe { carrick_native_direct_enable_shadow(addr, addr + len as u64) } != 0
+        {
+            let error = io::Error::last_os_error();
+            // SAFETY: revoke catalog authority before discarding the mapping,
+            // then restore the caller's original blank reservation.
+            unsafe {
+                carrick_native_direct_forget_range(addr, addr + len as u64);
+                libc::munmap(mapped, len);
+                libc::mmap(
+                    addr as usize as *mut libc::c_void,
+                    len,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+                    -1,
+                    0,
+                );
+            }
+            return Err(error);
+        }
+        lock(&self.dynamic_exec).push(DynamicExecRange {
+            base: addr,
+            end: addr + len as u64,
+        });
+        // Start in execute mode so the first guest store is observable. Once
+        // write mode is enabled, MAP_JIT's per-thread switch makes every page
+        // writable; the C catalog therefore treats that first fault as proof
+        // the entire range may be dirty.
+        jit_write_protect(true);
+        Ok(())
+    }
+
+    /// Force every existing and future dynamic mapping through byte-preserving
+    /// shadow execution. This is the fork-child transition; it is also public
+    /// so the narrow mechanism test can prove the route without forking.
+    pub fn enable_dynamic_shadow(&self) -> io::Result<()> {
+        self.force_dynamic_shadow
+            .store(true, std::sync::atomic::Ordering::Release);
+        let ranges = lock(&self.dynamic_exec);
+        for range in ranges.iter().copied() {
+            // SAFETY: `dynamic_exec` owns this complete current mapping and
+            // excludes concurrent unmap/reuse until the protection transition
+            // and catalog publication both complete.
+            if unsafe { carrick_native_direct_enable_shadow(range.base, range.end) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        if let Some(shadow) = lock(&self.dynamic_shadow).as_mut() {
+            shadow.after_fork_child();
+        }
+        Ok(())
+    }
+
+    /// Whether `pc` belongs to a dynamic source mapping currently routed via
+    /// the DSR shadow cache.
+    pub fn dynamic_exec_is_shadowed(&self, pc: u64) -> bool {
+        // SAFETY: copied scalar query of the lock-free range catalog.
+        unsafe { carrick_native_direct_range_shadowed(pc) == 1 }
+    }
+
+    /// Whether one complete range belongs to a dynamic MAP_JIT mapping.
+    pub fn covers_dynamic_exec(&self, addr: u64, len: u64) -> bool {
+        let Some(end) = addr.checked_add(len) else {
+            return false;
+        };
+        lock(&self.dynamic_exec)
+            .iter()
+            .any(|range| range.base <= addr && end <= range.end)
+    }
+
+    /// True only while the lock-free Mach-exception catalog can prove no
+    /// guest write/execute transition has dirtied this MAP_JIT mapping.
+    /// False also means "not found", so callers must establish coverage via
+    /// [`Self::covers_dynamic_exec`] first.
+    pub fn dynamic_exec_is_pristine(&self, addr: u64, len: u64) -> bool {
+        let Some(end) = addr.checked_add(len) else {
+            return false;
+        };
+        self.covers_dynamic_exec(addr, len)
+            // SAFETY: copied scalar query of the process-global lock-free
+            // range catalog; it never dereferences guest memory.
+            && unsafe { carrick_native_direct_range_is_pristine(addr, end) == 1 }
+    }
+
+    /// Apply Linux private-anon discard semantics only when the range may
+    /// contain guest-written bytes. Returns true when Carrick had to zero and
+    /// republish the range, false when the Mach-fault catalog proved the
+    /// mapping was still its original zero-fill allocation.
+    ///
+    /// The catalog is the authority: Tier D creates dynamic MAP_JIT ranges in
+    /// execute mode, so the first guest store must fault through the Mach
+    /// handler before any byte can change. Until that transition is recorded,
+    /// `MADV_DONTNEED` has no contents work to perform.
+    pub fn discard_dynamic_exec_contents(&self, addr: u64, len: u64) -> io::Result<bool> {
+        if !self.covers_dynamic_exec(addr, len) {
+            return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+        }
+        if self.dynamic_exec_is_pristine(addr, len) {
+            return Ok(false);
+        }
+        self.zero_dynamic_exec(addr, len)?;
+        Ok(true)
+    }
+
+    /// Apply Linux private-anon `MADV_DONTNEED` contents semantics to a
+    /// dynamic MAP_JIT subrange. XNU rejects its kernel-side `MADV_ZERO` for
+    /// JIT entries, but Carrick is executing ordinary Mach-O host text at a
+    /// syscall boundary: this thread can enter MAP_JIT write mode, zero the
+    /// exact guest range, publish the instruction-cache change, and return to
+    /// execute mode. Other MAP_JIT bytes are untouched.
+    pub fn zero_dynamic_exec(&self, addr: u64, len: u64) -> io::Result<()> {
+        if !self.covers_dynamic_exec(addr, len) {
+            return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+        }
+        let len = usize::try_from(len)
+            .ok()
+            .filter(|len| *len != 0 && len.is_multiple_of(HOST_PAGE))
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+        // This runs on the guest syscall thread. Carrick's Rust/Mach-O text is
+        // outside MAP_JIT, so it remains executable while the per-thread JIT
+        // permission switch makes the guest pages writable.
+        jit_write_protect(false);
+        // SAFETY: coverage above proves this is a live owned MAP_JIT range and
+        // write mode is enabled on the current thread.
+        unsafe {
+            std::ptr::write_bytes(addr as usize as *mut u8, 0, len);
+            sys_icache_invalidate(addr as usize as *mut libc::c_void, len);
+        }
+        // Resume guest static code in the conservative execute mode. A later
+        // guest store is observed by the Mach handler and re-enables writes.
+        jit_write_protect(true);
+        Ok(())
+    }
+
+    /// Forget dynamic-exec provenance overlapped by an unmap/replacement.
+    pub fn forget_dynamic_exec(&self, addr: u64, len: u64) {
+        let end = addr.saturating_add(len);
+        let mut ranges = lock(&self.dynamic_exec);
+        // SAFETY: lock-free catalog deletion; overlap removes the whole
+        // dynamic entry. Hold the Rust ownership lock across this revocation:
+        // an execute-fault verifier holds the same lock through its final text
+        // patch, so the caller cannot unmap/reuse the range between the final
+        // catalog check and that commit.
+        unsafe { carrick_native_direct_forget_range(addr, end) };
+        ranges.retain(|range| range.end <= addr || end <= range.base);
+    }
+
+    /// Record and synchronously patch one exact guest instruction-cache
+    /// publication while its publishing thread still has MAP_JIT write
+    /// permission. The patched branches are therefore complete before
+    /// `__clear_cache` returns and another already-executable guest thread
+    /// can observe the newly published code.
+    ///
+    /// The caller's original cache-maintenance body runs after this method,
+    /// so this method publishes immutable islands but deliberately does not
+    /// invalidate the live text interval itself.
+    pub fn publish_dynamic_code(&self, start: u64, end: u64) -> Result<(), String> {
+        let ranges = lock(&self.dynamic_exec);
+        let _range = ranges
+            .iter()
+            .copied()
+            .find(|range| range.base <= start && start < end && end <= range.end)
+            .ok_or_else(|| {
+                format!("dynamic publication {start:#x}..{end:#x} is outside a live MAP_JIT range")
+            })?;
+        if !start.is_multiple_of(4) || !end.is_multiple_of(4) {
+            return Err(format!(
+                "dynamic publication {start:#x}..{end:#x} is not instruction aligned"
+            ));
+        }
+        // SAFETY: the ownership lock above proves the exact interval belongs
+        // to this live mapping generation. This is the sole runtime
+        // publication path, serialized with unmap and sibling publishers.
+        if unsafe { carrick_native_direct_publish_dynamic_code(start, end) } != 1 {
+            return Err(format!(
+                "dynamic publication journal rejected {start:#x}..{end:#x}: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        if self.dynamic_exec_is_shadowed(start) {
+            // The journal above advances the mapping generation consumed by
+            // the byte-preserving DSR cache.  Shadow sources deliberately
+            // retain the guest's exact bytes: the next execute fault enters
+            // translated code, so neither physical x18 nor an in-place
+            // lowering pass is required here.  Keep this before the
+            // test-only direct-patching seam so release and test builds take
+            // the same product route when shadow policy is active.
+            return Ok(());
+        }
+        let len = usize::try_from(end - start)
+            .map_err(|_| format!("dynamic publication {start:#x}..{end:#x} exceeds usize"))?;
+        if physical_x18_supported() {
+            // Dynamic code is guest data as well as executable text (V8
+            // reads generated instructions while retaining maps). Never
+            // install a branch/UDF marker into it. Physical x18 removes the
+            // common lowering need; Linux sysregs trap to the Mach emulator.
+            // SVC and TPIDR still need a shadow-code design, so refuse them
+            // by exact instruction before execution instead of corrupting
+            // the guest-visible bytes.
+            for offset in (0..len).step_by(4) {
+                // SAFETY: the live-range lock and exact publication proof
+                // above cover every word in this interval.
+                let word = unsafe {
+                    std::ptr::read_unaligned(
+                        (start as usize as *const u8).add(offset).cast::<u32>(),
+                    )
+                };
+                let site = start + offset as u64;
+                if word == SVC_0 {
+                    return Err(format!(
+                        "dynamic svc at {site:#x} requires byte-preserving shadow execution"
+                    ));
+                }
+                if tpidr_access(word).is_some() {
+                    return Err(format!(
+                        "dynamic tpidr_el0 access at {site:#x} requires byte-preserving shadow execution"
+                    ));
+                }
+            }
+            return Ok(());
+        }
+        #[cfg(not(test))]
+        return Err(
+            "host does not preserve physical x18; unsafe in-place dynamic text lowering is disabled"
+                .to_string(),
+        );
+
+        #[cfg(test)]
+        {
+            // The allocation-free C proof is the publication hot path. Ordinary
+            // V8 code returns here without a Vec, decoder, arena, or Rust patch
+            // plan; only Linux virtual-state words take the slower exact patch.
+            if unsafe { carrick_native_direct_dynamic_page_safe(start as *const u8, len) } == 1 {
+                return Ok(());
+            }
+            self.patch_current_dynamic_publication(_range, start, Some((start, end)))?;
+            Ok(())
+        }
+    }
+
+    /// Patch the newest exact publication containing `pc`, returning its
+    /// interval. The caller holds `dynamic_exec` across this method, which
+    /// serializes unmap/reuse and synchronous publication commits.
+    fn patch_current_dynamic_publication(
+        &self,
+        range: DynamicExecRange,
+        pc: u64,
+        expected: Option<(u64, u64)>,
+    ) -> Result<(u64, usize), String> {
+        let mut published_start = 0;
+        let mut published_end = 0;
+        let mut published_sequence = 0;
+        let mut mapping_generation = 0;
+        let mut write_epoch = 0;
+        // SAFETY: copied-scalar query of the lock-free publication journal.
+        // The returned interval is validated against the live mapping
+        // generation before this function dereferences it.
+        let publication = unsafe {
+            carrick_native_direct_publication_for_pc(
+                pc,
+                &mut published_start,
+                &mut published_end,
+                &mut published_sequence,
+                &mut mapping_generation,
+                &mut write_epoch,
+            )
+        };
+        if publication < 0 {
+            return Err(format!(
+                "dynamic publication journal overflow before PC {pc:#x}"
+            ));
+        }
+        if publication == 0 {
+            return Err(format!(
+                "dynamic PC {pc:#x} has no current exact cache publication"
+            ));
+        }
+        if expected.is_some_and(|interval| interval != (published_start, published_end)) {
+            return Err(format!(
+                "dynamic publication authority changed from expected {expected:?} to {published_start:#x}..{published_end:#x}"
+            ));
+        }
+        let published_len = published_end
+            .checked_sub(published_start)
+            .and_then(|len| usize::try_from(len).ok())
+            .filter(|len| *len != 0 && len.is_multiple_of(4))
+            .ok_or_else(|| {
+                format!("invalid dynamic publication {published_start:#x}..{published_end:#x}")
+            })?;
+        if published_start < range.base || published_end > range.end {
+            return Err(format!(
+                "dynamic publication {published_start:#x}..{published_end:#x} escaped mapping {:#x}..{:#x}",
+                range.base, range.end
+            ));
+        }
+        // The exact published range is readable while this host thread is
+        // parked in MAP_JIT write mode. Never interpret unrelated bytes from
+        // the surrounding 16 KiB Darwin allocation page.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(published_start as *const u8, published_len) };
+        let original = bytes.to_vec();
+        scan_executable_words(&original, published_start).map_err(|reason| reason.to_string())?;
+        let needs_patch = original.chunks_exact(4).enumerate().any(|(index, chunk)| {
+            let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            dynamic_word_requires_patch(word, published_start + (index * 4) as u64)
+        });
+        let patch_plan = needs_patch
+            .then(|| self.build_dynamic_patch_plan(range, published_start, &original))
+            .transpose()?;
+        // SAFETY: revalidate both mapping identity and write boundary after
+        // reading bytes and constructing any immutable island plan.
+        if unsafe {
+            carrick_native_direct_publication_still_current(
+                pc,
+                published_start,
+                published_end,
+                published_sequence,
+                mapping_generation,
+                write_epoch,
+                i32::from(expected.is_none()),
+            )
+        } != 1
+        {
+            return Err(format!(
+                "dynamic publication changed while verifying PC {pc:#x}"
+            ));
+        }
+        if let Some(plan) = patch_plan {
+            self.commit_dynamic_patch(plan)?;
+        }
+        Ok((published_start, published_len))
+    }
+
+    fn build_dynamic_patch_plan(
+        &self,
+        range: DynamicExecRange,
+        published_start: u64,
+        code: &[u8],
+    ) -> Result<DynamicPatchPlan, String> {
+        let mapping_len = range
+            .end
+            .checked_sub(range.base)
+            .and_then(|len| usize::try_from(len).ok())
+            .ok_or_else(|| {
+                format!(
+                    "dynamic mapping {:#x}..{:#x} exceeds usize",
+                    range.base, range.end
+                )
+            })?;
+        // V8 publications can be large while containing only one virtual
+        // state word. Size by actual patch sites, not total bytes: a one-page
+        // arena fits crowded code-cage holes that the old 32x+64KiB estimate
+        // probabilistically missed. The patcher still bounds every write and
+        // fails closed if a future veneer exceeds the per-site allowance.
+        let arena_len = dynamic_patch_arena_len(code)?;
+        let Some(arena_base) =
+            Self::place_island_arena_near(published_start, code.len(), arena_len)
+        else {
+            return self.build_dynamic_exception_patch_plan(range, published_start, code);
+        };
+        let arena = DynamicIslandMapping {
+            base: arena_base,
+            len: arena_len,
+        };
+        let mut borrowed_text = DirectImage {
+            base: range.base as usize as *mut u8,
+            len: mapping_len,
+            owns_base: false,
+            entry: published_start,
+            bias: 0,
+            svc_sites: 0,
+            tpidr_sites: 0,
+            x18_sites: 0,
+            island_mapping: None,
+            deferred_text_writes: Some(Vec::new()),
+            runtime_stub_arena: None,
+        };
+        let mut patch_arena = IslandArena {
+            ptr: arena_base,
+            base_addr: arena_base as u64,
+            len: arena_len,
+            cursor: 0,
+        };
+        match borrowed_text
+            .patch_executable_words(
+                code,
+                published_start,
+                range.base,
+                0,
+                &mut patch_arena,
+                self.tsd,
+            )
+            .map_err(|error| error.to_string())?
+        {
+            Ok(()) => {}
+            Err(reason) => return Err(reason.to_string()),
+        }
+        let text_writes = borrowed_text.take_deferred_text_writes();
+        if text_writes.is_empty() {
+            return Err(format!(
+                "dynamic publication at {published_start:#x} requested patching but produced no text branches"
+            ));
+        }
+        let published_end = published_start + code.len() as u64;
+        if text_writes.iter().any(|(offset, _)| {
+            let site = range.base.saturating_add(*offset as u64);
+            site < published_start || site.saturating_add(4) > published_end
+        }) {
+            return Err(format!(
+                "dynamic patch escaped exact publication {published_start:#x}..{published_end:#x}"
+            ));
+        }
+        // Make every target immutable/executable before the live text branch
+        // can name it. The text writes remain deferred until after the caller's
+        // final publication-generation/write-epoch check.
+        if unsafe {
+            libc::mprotect(
+                arena_base.cast(),
+                arena_len,
+                libc::PROT_READ | libc::PROT_EXEC,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        // SAFETY: the arena was just written and is now executable.
+        unsafe { sys_icache_invalidate(arena_base.cast(), patch_arena.cursor) };
+        Ok(DynamicPatchPlan {
+            arena,
+            text_base: range.base as usize as *mut u8,
+            text_writes,
+            exception_routes: Vec::new(),
+        })
+    }
+
+    /// Build the branch-range-independent fallback: the published site is a
+    /// private UDF, the Mach exception reply redirects its untouched register
+    /// state to an ordinary veneer anywhere in the address space, and the
+    /// veneer's terminal UDF redirects back to the architectural successor.
+    /// This costs two Mach exceptions when the site executes, but preserves
+    /// correctness when a guest code cage leaves no free page within `b`'s
+    /// ±128 MiB reach.
+    fn build_dynamic_exception_patch_plan(
+        &self,
+        range: DynamicExecRange,
+        published_start: u64,
+        code: &[u8],
+    ) -> Result<DynamicPatchPlan, String> {
+        let arena_len = dynamic_patch_arena_len(code)?;
+        // SAFETY: fresh kernel-placed mapping. No branch reaches it, so the
+        // Mach state redirect makes its address independent of the text.
+        let arena_base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                arena_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if arena_base == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        let arena_base = arena_base.cast::<u8>();
+        let arena = DynamicIslandMapping {
+            base: arena_base,
+            len: arena_len,
+        };
+        let mut cursor = 0_usize;
+        let mut text_writes = Vec::new();
+        let mut exception_routes = Vec::new();
+
+        let mut emit =
+            |site: u64, mut words: Vec<u32>, returns: &[(usize, u64)]| -> Result<(), String> {
+                let bytes = words.len() * 4;
+                if cursor.checked_add(bytes).is_none_or(|end| end > arena_len) {
+                    return Err("dynamic exception veneer budget exhausted".to_string());
+                }
+                let entry = arena_base as u64 + cursor as u64;
+                for (slot, _) in returns {
+                    let Some(word) = words.get_mut(*slot) else {
+                        return Err("dynamic exception return slot escaped veneer".to_string());
+                    };
+                    *word = UDF_DYNAMIC_RETURN;
+                }
+                for (index, word) in words.iter().copied().enumerate() {
+                    // SAFETY: the bound above covers every emitted word.
+                    unsafe {
+                        std::ptr::write_unaligned(arena_base.add(cursor + index * 4).cast(), word)
+                    };
+                }
+                for (slot, resume_pc) in returns {
+                    exception_routes.push(DynamicExceptionRoute {
+                        site,
+                        entry,
+                        return_pc: entry + (*slot * 4) as u64,
+                        resume_pc: *resume_pc,
+                    });
+                }
+                let offset = site
+                    .checked_sub(range.base)
+                    .and_then(|offset| usize::try_from(offset).ok())
+                    .ok_or_else(|| "dynamic exception site escaped mapping".to_string())?;
+                text_writes.push((offset, UDF_DYNAMIC_ENTRY));
+                cursor = (cursor + bytes).next_multiple_of(4);
+                Ok(())
+            };
+
+        for (index, chunk) in code.chunks_exact(4).enumerate() {
+            let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let site = published_start + (index * 4) as u64;
+            if let Some(value) = direct_linux_sysreg_value(word) {
+                let mut words =
+                    linux_sysreg_veneer(word, value, self.tsd, physical_x18_supported());
+                let slot = words.len();
+                words.push(0);
+                emit(site, words, &[(slot, site + 4)])?;
+                continue;
+            }
+            if let Some(access) = tpidr_access(word) {
+                let mut words = tpidr_veneer(access, self.tsd, physical_x18_supported());
+                let slot = words.len();
+                words.push(0);
+                emit(site, words, &[(slot, site + 4)])?;
+                continue;
+            }
+            if cond_branch_on_x18(word) || test_bit_branch_on_x18(word) {
+                let branch_offset = if cond_branch_on_x18(word) {
+                    cond_branch_offset(word)
+                } else {
+                    test_bit_branch_offset(word)
+                };
+                let target = site.wrapping_add_signed(branch_offset);
+                if target < range.base || target >= range.end {
+                    return Err(DirectIneligible::X18Access { vaddr: site }.to_string());
+                }
+                let (words, taken_slot, fallthrough_slot) = x18_branch_veneer(word, self.tsd);
+                emit(
+                    site,
+                    words,
+                    &[(taken_slot, target), (fallthrough_slot, site + 4)],
+                )?;
+                continue;
+            }
+            if pc_relative_address_to_x18(word) {
+                let mut words =
+                    x18_pc_address_veneer(pc_relative_address_value(word, site), self.tsd);
+                let slot = words.len();
+                words.push(0);
+                emit(site, words, &[(slot, site + 4)])?;
+                continue;
+            }
+            if let Some(pair) = x18_sp_pair(word) {
+                let mut words = x18_sp_pair_veneer(pair, self.tsd);
+                let slot = words.len();
+                words.push(0);
+                emit(site, words, &[(slot, site + 4)])?;
+                continue;
+            }
+            if word != SVC_0
+                && word_could_name_x18(word)
+                && let Ok(instruction) = bad64::decode(word, site)
+                && instruction_names_x18(&instruction)
+            {
+                if instruction_is_pc_relative(&instruction)
+                    || !x18_sp_use_is_veneer_safe(&instruction)
+                {
+                    return Err(DirectIneligible::X18Access { vaddr: site }.to_string());
+                }
+                let Some((value_reg, addr_reg)) = pick_scratch_pair(&instruction) else {
+                    return Err(DirectIneligible::X18Access { vaddr: site }.to_string());
+                };
+                let Some(rewritten) = substitute_x18(word, value_reg) else {
+                    return Err(DirectIneligible::X18Access { vaddr: site }.to_string());
+                };
+                let mut words = x18_veneer(
+                    rewritten,
+                    value_reg,
+                    addr_reg,
+                    self.tsd,
+                    instruction_names_sp(&instruction),
+                );
+                let slot = words.len();
+                words.push(0);
+                emit(site, words, &[(slot, site + 4)])?;
+                continue;
+            }
+            if word == SVC_0 {
+                let (mut words, resume_slot) = island(self.tsd, site + 4);
+                words[resume_slot] = 0;
+                emit(site, words, &[(resume_slot, site + 4)])?;
+            }
+        }
+        if text_writes.is_empty() || exception_routes.is_empty() {
+            return Err(format!(
+                "dynamic publication at {published_start:#x} requested exception patching but produced no routes"
+            ));
+        }
+        // SAFETY: all veneer words are complete and no text names the arena
+        // yet. Publish it immutable before registering routes and UDF sites.
+        if unsafe {
+            libc::mprotect(
+                arena_base.cast(),
+                arena_len,
+                libc::PROT_READ | libc::PROT_EXEC,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        // SAFETY: the exact initialized prefix was just written.
+        unsafe { sys_icache_invalidate(arena_base.cast(), cursor) };
+        Ok(DynamicPatchPlan {
+            arena,
+            text_base: range.base as usize as *mut u8,
+            text_writes,
+            exception_routes,
+        })
+    }
+
+    fn commit_dynamic_patch(&self, plan: DynamicPatchPlan) -> Result<(), String> {
+        const MAX_DYNAMIC_ARENAS: usize = 4096;
+        let DynamicPatchPlan {
+            arena,
+            text_base,
+            text_writes,
+            exception_routes,
+        } = plan;
+        let mut islands = lock(&self.dynamic_islands);
+        if islands.len() >= MAX_DYNAMIC_ARENAS {
+            return Err(format!(
+                "dynamic island retention limit {MAX_DYNAMIC_ARENAS} exhausted"
+            ));
+        }
+        for route in &exception_routes {
+            // SAFETY: copied scalar registration. The C catalog binds the
+            // route to the site's current MAP_JIT mapping generation before
+            // any private UDF is written into live text.
+            if unsafe {
+                carrick_native_direct_register_exception_route(
+                    route.site,
+                    route.entry,
+                    route.return_pc,
+                    route.resume_pc,
+                )
+            } != 1
+            {
+                return Err(format!(
+                    "dynamic exception-route catalog rejected site {:#x}: {}",
+                    route.site,
+                    io::Error::last_os_error()
+                ));
+            }
+        }
+        // Establish ownership first. No fallible operation follows before the
+        // live branches are committed, so an unwind cannot leave text naming
+        // an unmapped arena.
+        islands.push(arena);
+        for (offset, word) in text_writes {
+            // SAFETY: build_dynamic_patch_plan validated every deferred site
+            // inside the live exact publication, and the caller holds the
+            // dynamic mapping ownership lock against concurrent unmap/reuse.
+            unsafe { std::ptr::write_unaligned(text_base.add(offset).cast::<u32>(), word) };
+        }
+        Ok(())
+    }
+
+    /// Resolve one captured direct fault into a per-thread MAP_JIT mode
+    /// transition. Returns true when the unchanged parked PC should retry.
+    pub fn prepare_dynamic_fault(
+        &self,
+        fault: DirectFault,
+        ctx: &GuestContext,
+    ) -> Result<bool, String> {
+        let ranges = lock(&self.dynamic_exec);
+        let executing = ranges
+            .iter()
+            .copied()
+            .find(|range| range.base <= ctx.pc && ctx.pc < range.end);
+        let writing = ranges
+            .iter()
+            .any(|range| range.base <= fault.address && fault.address < range.end);
+        if let Some(executing_range) = executing {
+            let (published_start, published_len) =
+                self.patch_current_dynamic_publication(executing_range, ctx.pc, None)?;
+            // SAFETY: publish only the exact current interval whose execution
+            // faulted (including any committed branch replacements), then
+            // resume it in per-thread execute mode.
+            unsafe {
+                sys_icache_invalidate(published_start as usize as *mut libc::c_void, published_len)
+            };
+            jit_write_protect(true);
+            return Ok(true);
+        }
+        if writing {
+            // Advance the race-detection epoch before enabling writes. Exact
+            // publications for unchanged code remain authoritative, but a
+            // verifier already reading bytes must observe the epoch change.
+            if unsafe { carrick_native_direct_begin_dynamic_write(fault.address) } != 1 {
+                return Err(format!(
+                    "dynamic write address {:#x} left the live MAP_JIT catalog",
+                    fault.address
+                ));
+            }
+            // Retry the exact faulting store with the full ucontext restored.
+            jit_write_protect(false);
+            return Ok(true);
+        }
+        Err(format!(
+            "unclassified direct signal {} code={} pc={:#x} addr={:#x} esr={:#x} far={:#x}",
+            fault.signal, fault.code, ctx.pc, fault.address, fault.esr, fault.far
+        ))
+    }
+
+    /// Execute from a parked shadow-mapping PC through the shared AArch64 DSR
+    /// engine until control returns to ordinary Tier-D static text.
+    ///
+    /// The first milestone intentionally accepts only control-flow exits. A
+    /// syscall/sensitive/fault exit is named and refused; wiring those through
+    /// the existing runner service is the next step after byte integrity is
+    /// proven by the product-shaped dynamic-return fixture.
+    pub fn execute_dynamic_shadow(&self, slots: &mut DirectThreadSlots) -> Result<(), String> {
+        let ranges = lock(&self.dynamic_exec);
+        let mut snapshot = carrick_dsr_aarch64::snapshot::NativeUcontextSnapshot {
+            x: slots.context.x,
+            sp: slots.context.sp,
+            pc: slots.context.pc,
+            pstate: slots.parked_fp.pstate,
+            v: slots.parked_fp.v,
+            fpsr: slots.parked_fp.fpsr as u32,
+            fpcr: slots.parked_fp.fpcr as u32,
+            ..carrick_dsr_aarch64::snapshot::NativeUcontextSnapshot::default()
+        };
+        let mut shadow = lock(&self.dynamic_shadow);
+        if shadow.is_none() {
+            *shadow = Some(DynamicShadow::new()?);
+        }
+        let shadow = shadow
+            .as_mut()
+            .ok_or_else(|| "Tier-D dynamic shadow cache disappeared".to_string())?;
+
+        for _ in 0..1_000_000_u32 {
+            let range = ranges
+                .iter()
+                .copied()
+                .find(|range| range.base <= snapshot.pc && snapshot.pc < range.end);
+            let Some(range) = range else {
+                slots.context.x = snapshot.x;
+                slots.context.sp = snapshot.sp;
+                slots.context.pc = snapshot.pc;
+                slots.resume_extras = ParkedResumeExtras {
+                    restore: 1,
+                    pstate: snapshot.pstate,
+                    fpsr: u64::from(snapshot.fpsr),
+                    fpcr: u64::from(snapshot.fpcr),
+                    _pad: [0; 2],
+                    v: snapshot.v,
+                };
+                return Ok(());
+            };
+            if !self.dynamic_exec_is_shadowed(snapshot.pc) {
+                return Err(format!(
+                    "dynamic shadow PC {:#x} is no longer shadow-authorized",
+                    snapshot.pc
+                ));
+            }
+            let entry = shadow.translate(range, snapshot.pc)?;
+            let mut exit = carrick_dsr_aarch64::types::NativeDsrExit::Syscall {
+                resume: carrick_guest_mem::GuestVa(snapshot.pc),
+            };
+            carrick_dsr_aarch64::gateway::enter_translated(entry, &mut snapshot, &mut exit)
+                .map_err(|error| {
+                    format!("enter dynamic shadow block at {:#x}: {error}", snapshot.pc)
+                })?;
+            match exit {
+                carrick_dsr_aarch64::types::NativeDsrExit::ResolveDirect { target, .. }
+                | carrick_dsr_aarch64::types::NativeDsrExit::ResolveIndirect { target, .. } => {
+                    snapshot.pc = target.raw()
+                }
+                carrick_dsr_aarch64::types::NativeDsrExit::StaleGeneration { guest_pc, .. } => {
+                    snapshot.pc = guest_pc.raw()
+                }
+                carrick_dsr_aarch64::types::NativeDsrExit::Syscall { resume } => {
+                    return Err(format!(
+                        "dynamic shadow syscall at {:#x} requires runner dispatch (resume {:#x})",
+                        snapshot.pc,
+                        resume.raw()
+                    ));
+                }
+                carrick_dsr_aarch64::types::NativeDsrExit::Sensitive { guest_pc, .. } => {
+                    return Err(format!(
+                        "dynamic shadow sensitive instruction at {:#x} requires runner emulation",
+                        guest_pc.raw()
+                    ));
+                }
+                carrick_dsr_aarch64::types::NativeDsrExit::Fault {
+                    guest_pc,
+                    signal,
+                    address,
+                    ..
+                } => {
+                    return Err(format!(
+                        "dynamic shadow fault signal {signal} at {:#x} address {:#x}",
+                        guest_pc.raw(),
+                        address.raw()
+                    ));
+                }
+                carrick_dsr_aarch64::types::NativeDsrExit::Kick { resume, .. }
+                | carrick_dsr_aarch64::types::NativeDsrExit::KickAtEntry { resume } => {
+                    return Err(format!(
+                        "dynamic shadow kick at {:#x} requires runner signal delivery",
+                        resume.raw()
+                    ));
+                }
+                carrick_dsr_aarch64::types::NativeDsrExit::Unsupported { guest_pc, word, op } => {
+                    return Err(format!(
+                        "dynamic shadow unsupported {op:?} word {word:#010x} at {:#x}",
+                        guest_pc.raw()
+                    ));
+                }
+            }
+        }
+        Err("dynamic shadow exceeded 1000000 control-flow exits".to_string())
     }
 
     /// The current thread's installed context, or a NAMED refusal — entering
@@ -2870,39 +4980,15 @@ impl DirectLoadGroup {
     /// entry of [`Self::enter_parked`]).
     pub unsafe fn enter(&self, pc: u64) -> io::Result<()> {
         let ctx = self.current_context_for_enter()?;
+        self.ensure_mach_exception_handler_for_entry()?;
         self.arm_current_thread();
+        let _x18_abi = GuestX18AbiGuard::enter()?;
         // Enter through asm that declares the guest clobbers every
         // callee-saved register, NOT as a plain `extern "C"` call.
-        //
-        // A C call promises x19-x28 and d8-d15 survive it. No guest promises
-        // anything of the sort - it owns every register, and a fixture as small
-        // as `mov x20, x30` destroys one. Calling the guest as if it were a C
-        // function let the compiler keep live values in those registers across
-        // the call, and the guest silently corrupted them.
-        //
-        // That was invisible on the main thread, where nothing important
-        // happened to live in x20, and fatal on a spawned one, where the
-        // thread's own machinery does: the corruption surfaced far away as
-        // `malloc: pointer being freed was not allocated` on a static address,
-        // and whether it fired at all depended on heap layout. Declaring the
-        // clobbers makes the compiler preserve them, which is exactly what a
-        // gateway does.
-        //
-        // x18 is Darwin's platform register and cannot be named as a clobber;
-        // the kernel rewrites it at every trap return anyway, and tier D
-        // veneers guest x18 to a memory slot rather than keeping it live.
         // SAFETY: `pc` is inside the patched, i-cache-invalidated mapping.
         unsafe {
             std::arch::asm!(
-                // x19 and x29 cannot be named as clobbers - LLVM reserves both
-                // - so preserve them by hand around the guest.
                 "stp x19, x29, [sp, #-16]!",
-                // Capture the HOST stack discipline for the island leave leg:
-                // SP as it stands at guest entry, and the same landing point
-                // `blr` itself hands the guest in x30. The leave leg restores
-                // this SP and `ret`s to this LR, so a handler-requested leave
-                // is indistinguishable, to the code below, from a balanced
-                // fixture `ret`.
                 "mov x9, sp",
                 "str x9, [x1, #{host_sp}]",
                 "adr x9, 2f",
@@ -2949,28 +5035,20 @@ impl DirectLoadGroup {
     /// survivable here — it would land in Rust still on the guest stack.
     pub unsafe fn enter_on_stack(&self, pc: u64, sp: u64) -> io::Result<()> {
         let ctx = self.current_context_for_enter()?;
+        self.ensure_mach_exception_handler_for_entry()?;
         self.arm_current_thread();
-        // Same gateway shape as `enter` (see the clobber discussion there);
-        // the differences are the SP switch after the host capture and the
-        // register scrub before the branch.
-        // SAFETY: `pc` is inside a patched, i-cache-invalidated mapping.
+        let _x18_abi = GuestX18AbiGuard::enter()?;
+        // SAFETY: as [`Self::enter`], with SP switched only after the host
+        // landing discipline has been captured.
         unsafe {
             std::arch::asm!(
-                // x19 and x29 cannot be named as clobbers - LLVM reserves both
-                // - so preserve them by hand around the guest.
                 "stp x19, x29, [sp, #-16]!",
-                // Capture the HOST stack discipline for the island leave leg
-                // BEFORE switching to the guest stack.
                 "mov x9, sp",
                 "str x9, [x0, #{host_sp}]",
                 "adr x9, 2f",
                 "str x9, [x0, #{host_lr}]",
-                // The branch target moves to x9 so every argument register
-                // can be scrubbed; then the guest gets its own stack.
                 "mov x9, x2",
                 "mov sp, x1",
-                // Zero what a fresh Linux process would see zeroed. x0 is the
-                // one that MATTERS (rtld_fini); the rest are hygiene.
                 "mov x0, xzr", "mov x1, xzr", "mov x2, xzr", "mov x3, xzr",
                 "mov x4, xzr", "mov x5, xzr", "mov x6, xzr", "mov x7, xzr",
                 "mov x8, xzr", "mov x10, xzr", "mov x11, xzr", "mov x12, xzr",
@@ -3020,32 +5098,154 @@ impl DirectLoadGroup {
         // SAFETY: `current_context_for_enter` proved the slots pointer; the
         // guest is not running on this thread yet, so the read is stable.
         let pc = unsafe { (*(ctx as usize as *const GuestContext)).pc };
-        let stub = ParkedEntryStub::build(ctx, pc)?;
+        if let Some(image) = self.images.iter().find(|image| {
+            let start = image.base();
+            start
+                .checked_add(image.len as u64)
+                .is_some_and(|end| start <= pc && pc < end)
+        }) && let Some(stub) = ParkedEntryStub::build_in_image(ctx, pc, image)
+        {
+            let stub = stub?;
+            // SAFETY: caller contract; the stub is patched, published and
+            // i-cache-invalidated by `build_in_image`.
+            return unsafe { self.enter(stub.entry()) };
+        }
+        let (mapping_base, mapping_len) = self.executable_mapping_span(pc).unwrap_or((pc, 0));
+        let stub = ParkedEntryStub::build(ctx, pc, mapping_base, mapping_len)?;
         // SAFETY: caller contract; the stub is patched, published and
         // i-cache-invalidated by `build`.
         unsafe { self.enter(stub.entry()) }
     }
+
+    /// Complete owned mapping that contains `pc`, including its island tail.
+    /// Parked-entry placement must start outside this span: probing from `pc`
+    /// itself performs one rejected mmap per occupied host page (Node's main
+    /// image is over 100 MiB), turning thread creation into seconds of VM-map
+    /// churn and making success depend on where the call site sits.
+    fn executable_mapping_span(&self, pc: u64) -> Option<(u64, usize)> {
+        let contains = |image: &DirectImage| {
+            let start = image.base();
+            let end = start.checked_add(image.len as u64)?;
+            (start <= pc && pc < end).then_some((start, image.len))
+        };
+        if let Some(span) = self.images.iter().find_map(contains) {
+            return Some(span);
+        }
+        if let Some(span) = lock(&self.windows).iter().find_map(contains) {
+            return Some(span);
+        }
+        lock(&self.dynamic_exec).iter().find_map(|range| {
+            if !(range.base <= pc && pc < range.end) {
+                return None;
+            }
+            let len = usize::try_from(range.end - range.base).ok()?;
+            Some((range.base, len))
+        })
+    }
+}
+
+impl Drop for DirectLoadGroup {
+    fn drop(&mut self) {
+        // Invalidate the C-side mapping generations before Rust drops the
+        // immutable far veneers they authorize. Explicit guest munmap paths
+        // already remove their entries from `dynamic_exec`, so this covers
+        // only live ranges retired with the whole load group.
+        for range in lock(&self.dynamic_exec).drain(..) {
+            // SAFETY: copied scalar catalog revocation; no guest thread may
+            // execute this group once its owner begins dropping it.
+            unsafe { carrick_native_direct_forget_range(range.base, range.end) };
+        }
+    }
 }
 
 /// The runtime-emitted resume stub behind [`DirectLoadGroup::enter_parked`]:
-/// one page of plain memory holding `materialize ctx; restore SP, x30..x0;
-/// b resume_pc`. Placed near the resume pc (the final leg is a constant `b`,
-/// the same fail-closed placement problem as a `MAP_FIXED` window's island
-/// arena), made R+X before use, unmapped on drop — by which time the guest
-/// has long left it (the stub is only ever executed once, at entry).
-struct ParkedEntryStub {
+/// `materialize ctx; restore SP, x30..x0; b resume_pc`.
+///
+/// Load-time images reserve a separate nearby MAP_JIT arena and lease one
+/// immutable slot per active entry: no per-entry VM-map search and no static
+/// text mutation. Plain runtime windows retain the external one-page
+/// fail-closed fallback; that mapping is released after the guest leaves it.
+struct ParkedEntryStub<'a> {
     base: *mut u8,
     len: usize,
+    owns_mapping: bool,
+    _lease: Option<RuntimeStubLease<'a>>,
 }
 
-impl ParkedEntryStub {
-    fn build(ctx: u64, pc: u64) -> io::Result<Self> {
+impl<'a> ParkedEntryStub<'a> {
+    fn build_in_image(ctx: u64, pc: u64, image: &'a DirectImage) -> Option<io::Result<Self>> {
+        let lease = image.reserve_runtime_stub()?;
+        Some(Self::publish_in_image(ctx, pc, lease))
+    }
+
+    fn publish_in_image(ctx: u64, pc: u64, lease: RuntimeStubLease<'a>) -> io::Result<Self> {
+        let base = lease.base();
+        let w = Self::words(ctx, pc, base)?;
+        let byte_len = w.len() * std::mem::size_of::<u32>();
+        if byte_len > RUNTIME_STUB_SLOT_CAPACITY {
+            return Err(io::Error::other(format!(
+                "parked-entry stub requires {byte_len} bytes, reserved {}",
+                RUNTIME_STUB_SLOT_CAPACITY
+            )));
+        }
+        // MAP_JIT write protection is per-thread. This thread may populate
+        // its fresh disjoint slot while other guest threads continue to
+        // execute already-published image text.
+        jit_write_protect(false);
+        // SAFETY: the lease covers `RUNTIME_STUB_SLOT_CAPACITY` disjoint bytes
+        // in the image's separate MAP_JIT runtime arena.
+        unsafe {
+            std::ptr::copy_nonoverlapping(w.as_ptr().cast::<u8>(), base, byte_len);
+            sys_icache_invalidate(base.cast(), byte_len);
+        }
+        jit_write_protect(true);
+        Ok(Self {
+            base,
+            len: byte_len,
+            owns_mapping: false,
+            _lease: Some(lease),
+        })
+    }
+
+    fn build(ctx: u64, pc: u64, mapping_base: u64, mapping_len: usize) -> io::Result<Self> {
         let len = HOST_PAGE;
-        let Some(base) = DirectLoadGroup::place_island_arena_near(pc, 0, len) else {
+        let Some(base) = DirectLoadGroup::place_island_arena_near(mapping_base, mapping_len, len)
+        else {
             return Err(io::Error::other(format!(
                 "no parked-entry stub slot within b-range of resume pc {pc:#x}"
             )));
         };
+        let w = match Self::words(ctx, pc, base) {
+            Ok(words) => words,
+            Err(error) => {
+                // SAFETY: undo the placement this constructor claimed.
+                unsafe { libc::munmap(base.cast(), len) };
+                return Err(error);
+            }
+        };
+        // SAFETY: writing the stub into the fresh RW page just mapped.
+        unsafe {
+            std::ptr::copy_nonoverlapping(w.as_ptr().cast::<u8>(), base, w.len() * 4);
+        }
+        // SAFETY: flipping the plain page R+X (allowed under ad-hoc signing —
+        // the MAP_FIXED window pipeline's probed precedent), then publishing.
+        unsafe {
+            if libc::mprotect(base.cast(), len, libc::PROT_READ | libc::PROT_EXEC) != 0 {
+                let error = io::Error::last_os_error();
+                libc::munmap(base.cast(), len);
+                return Err(error);
+            }
+            sys_icache_invalidate(base.cast(), len);
+        }
+        Ok(Self {
+            base,
+            len,
+            owns_mapping: true,
+            _lease: None,
+        })
+    }
+
+    fn words(ctx: u64, pc: u64, base: *mut u8) -> io::Result<Vec<u32>> {
         // The context IS the slots (offset 0 by `repr(C)` contract), so the
         // parked-resume extras flag is readable through it. The guest is
         // parked on THIS thread, so the read (and the clear below) is stable.
@@ -3085,28 +5285,12 @@ impl ParkedEntryStub {
         let branch_at = base as u64 + (w.len() * 4) as u64;
         let delta = pc as i64 - branch_at as i64;
         if !b_in_range(delta) {
-            // SAFETY: undo the placement this constructor claimed.
-            unsafe { libc::munmap(base.cast(), len) };
             return Err(io::Error::other(format!(
                 "parked-entry stub landed out of b-range of resume pc {pc:#x}"
             )));
         }
         w.push(b_rel(delta));
-        // SAFETY: writing the stub into the fresh RW page just mapped.
-        unsafe {
-            std::ptr::copy_nonoverlapping(w.as_ptr().cast::<u8>(), base, w.len() * 4);
-        }
-        // SAFETY: flipping the plain page R+X (allowed under ad-hoc signing —
-        // the MAP_FIXED window pipeline's probed precedent), then publishing.
-        unsafe {
-            if libc::mprotect(base.cast(), len, libc::PROT_READ | libc::PROT_EXEC) != 0 {
-                let error = io::Error::last_os_error();
-                libc::munmap(base.cast(), len);
-                return Err(error);
-            }
-            sys_icache_invalidate(base.cast(), len);
-        }
-        Ok(Self { base, len })
+        Ok(w)
     }
 
     fn entry(&self) -> u64 {
@@ -3114,10 +5298,13 @@ impl ParkedEntryStub {
     }
 }
 
-impl Drop for ParkedEntryStub {
+impl Drop for ParkedEntryStub<'_> {
     fn drop(&mut self) {
-        // SAFETY: this value owns the mapping.
-        unsafe { libc::munmap(self.base.cast(), self.len) };
+        if self.owns_mapping {
+            // SAFETY: the external fallback value owns this mapping. A leased
+            // MAP_JIT slot is returned after this drop body instead.
+            unsafe { libc::munmap(self.base.cast(), self.len) };
+        }
     }
 }
 
@@ -3130,11 +5317,154 @@ fn read_u16(b: &[u8], o: usize) -> Result<u64, io::Error> {
         .ok_or_else(|| io::Error::other("short ELF header"))
 }
 
+fn read_u32(b: &[u8], o: usize) -> Result<u64, io::Error> {
+    b.get(o..o + 4)
+        .and_then(|s| s.try_into().ok())
+        .map(|a: [u8; 4]| u32::from_le_bytes(a) as u64)
+        .ok_or_else(|| io::Error::other("short ELF header"))
+}
+
 fn read_u64(b: &[u8], o: usize) -> Result<u64, io::Error> {
     b.get(o..o + 8)
         .and_then(|s| s.try_into().ok())
         .map(|a: [u8; 8]| u64::from_le_bytes(a))
         .ok_or_else(|| io::Error::other("short ELF header"))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DynamicFunctionSymbol {
+    vaddr: u64,
+    file_offset: usize,
+    size: u64,
+}
+
+/// Resolve one DEFINED ELF64 dynamic function by its unversioned symbol
+/// name. The symbol version is carried by `.gnu.version*`, not by `st_name`,
+/// so a lookup for `__clear_cache` matches the real
+/// `__clear_cache@@GCC_3.0` definition without encoding a libgcc version.
+///
+/// This parser deliberately consumes only the standard section-link
+/// contract: `SHT_DYNSYM.sh_link` selects its string table and `st_shndx`
+/// selects the section that maps `st_value` back to a file offset. Undefined
+/// imports and malformed/out-of-file definitions are not hook candidates.
+fn dynamic_function_symbol(
+    elf: &[u8],
+    name: &[u8],
+) -> Result<Option<DynamicFunctionSymbol>, io::Error> {
+    const SHT_DYNSYM: u64 = 11;
+    const STT_FUNC: u8 = 2;
+    const SHN_UNDEF: usize = 0;
+    const ELF64_SYM_SIZE: usize = 24;
+
+    let shoff = read_u64(elf, 0x28)? as usize;
+    let shentsize = read_u16(elf, 0x3a)? as usize;
+    let shnum = read_u16(elf, 0x3c)? as usize;
+    if shoff == 0 || shnum == 0 {
+        return Ok(None);
+    }
+    if shentsize < 64 {
+        return Err(io::Error::other(
+            "ELF64 section headers are shorter than 64 bytes",
+        ));
+    }
+    let section = |index: usize| -> Result<usize, io::Error> {
+        if index >= shnum {
+            return Err(io::Error::other("ELF section index is out of range"));
+        }
+        let offset = shoff
+            .checked_add(index.saturating_mul(shentsize))
+            .ok_or_else(|| io::Error::other("ELF section offset overflow"))?;
+        if offset.checked_add(64).is_none_or(|end| end > elf.len()) {
+            return Err(io::Error::other("truncated ELF section header"));
+        }
+        Ok(offset)
+    };
+
+    for dynsym_index in 0..shnum {
+        let dynsym_sh = section(dynsym_index)?;
+        if read_u32(elf, dynsym_sh + 4)? != SHT_DYNSYM {
+            continue;
+        }
+        let sym_offset = read_u64(elf, dynsym_sh + 0x18)? as usize;
+        let sym_size = read_u64(elf, dynsym_sh + 0x20)? as usize;
+        let strtab_index = read_u32(elf, dynsym_sh + 0x28)? as usize;
+        let sym_entsize = read_u64(elf, dynsym_sh + 0x38)? as usize;
+        if sym_entsize < ELF64_SYM_SIZE || !sym_size.is_multiple_of(sym_entsize) {
+            return Err(io::Error::other("malformed ELF dynamic symbol table"));
+        }
+        let sym_end = sym_offset
+            .checked_add(sym_size)
+            .filter(|end| *end <= elf.len())
+            .ok_or_else(|| io::Error::other("ELF dynamic symbol table is outside the file"))?;
+
+        let strtab_sh = section(strtab_index)?;
+        let strtab_offset = read_u64(elf, strtab_sh + 0x18)? as usize;
+        let strtab_size = read_u64(elf, strtab_sh + 0x20)? as usize;
+        let strtab_end = strtab_offset
+            .checked_add(strtab_size)
+            .filter(|end| *end <= elf.len())
+            .ok_or_else(|| io::Error::other("ELF dynamic string table is outside the file"))?;
+        let strtab = &elf[strtab_offset..strtab_end];
+
+        for sym in (sym_offset..sym_end).step_by(sym_entsize) {
+            let info = *elf
+                .get(sym + 4)
+                .ok_or_else(|| io::Error::other("truncated ELF dynamic symbol"))?;
+            if info & 0x0f != STT_FUNC {
+                continue;
+            }
+            let shndx = read_u16(elf, sym + 6)? as usize;
+            if shndx == SHN_UNDEF {
+                continue;
+            }
+            let name_offset = read_u32(elf, sym)? as usize;
+            let Some(name_tail) = strtab.get(name_offset..) else {
+                return Err(io::Error::other(
+                    "ELF dynamic symbol name is outside its string table",
+                ));
+            };
+            let Some(name_end) = name_tail.iter().position(|byte| *byte == 0) else {
+                return Err(io::Error::other(
+                    "ELF dynamic symbol name is not NUL-terminated",
+                ));
+            };
+            if &name_tail[..name_end] != name {
+                continue;
+            }
+
+            let symbol_vaddr = read_u64(elf, sym + 8)?;
+            let symbol_size = read_u64(elf, sym + 16)?;
+            let defining_sh = section(shndx)?;
+            let section_vaddr = read_u64(elf, defining_sh + 0x10)?;
+            let section_offset = read_u64(elf, defining_sh + 0x18)? as usize;
+            let section_size = read_u64(elf, defining_sh + 0x20)?;
+            let relative = symbol_vaddr
+                .checked_sub(section_vaddr)
+                .filter(|relative| *relative < section_size)
+                .ok_or_else(|| io::Error::other("ELF dynamic function is outside its section"))?;
+            if symbol_size != 0
+                && relative
+                    .checked_add(symbol_size)
+                    .is_none_or(|end| end > section_size)
+            {
+                return Err(io::Error::other(
+                    "ELF dynamic function extends past its section",
+                ));
+            }
+            let file_offset = section_offset
+                .checked_add(usize::try_from(relative).map_err(|_| {
+                    io::Error::other("ELF dynamic function offset exceeds host usize")
+                })?)
+                .filter(|offset| *offset < elf.len())
+                .ok_or_else(|| io::Error::other("ELF dynamic function is outside the file"))?;
+            return Ok(Some(DynamicFunctionSymbol {
+                vaddr: symbol_vaddr,
+                file_offset,
+                size: symbol_size,
+            }));
+        }
+    }
+    Ok(None)
 }
 
 /// `(file_offset, filesz, memsz, vaddr)` for every PT_LOAD.
@@ -3334,7 +5664,169 @@ fn load_span(elf: &[u8]) -> Result<(u64, u64), io::Error> {
     Ok((lo, hi))
 }
 
+/// Strictest PT_LOAD alignment required of this image's load bias.
+///
+/// ELF permits p_align 0/1 to mean no additional constraint. Any larger
+/// value must be a power of two, and p_vaddr/p_offset must be congruent at
+/// that boundary. Host-page alignment is a separate mmap constraint: folding
+/// it into the ELF load-bias constraint is wrong for images whose PT_LOADs
+/// declare no extra alignment.
+fn max_load_alignment(elf: &[u8]) -> Result<u64, io::Error> {
+    let phoff = read_u64(elf, 0x20)? as usize;
+    let phentsize = read_u16(elf, 0x36)? as usize;
+    let phnum = read_u16(elf, 0x38)? as usize;
+    let mut maximum = 1_u64;
+    let mut found = false;
+    for i in 0..phnum {
+        let ph = phoff + i * phentsize;
+        if read_u16(elf, ph)? != 1 {
+            continue;
+        }
+        found = true;
+        let alignment = read_u64(elf, ph + 0x30)?;
+        if alignment <= 1 {
+            continue;
+        }
+        if !alignment.is_power_of_two() {
+            return Err(io::Error::other("PT_LOAD alignment is not a power of two"));
+        }
+        let offset = read_u64(elf, ph + 0x08)?;
+        let vaddr = read_u64(elf, ph + 0x10)?;
+        if offset % alignment != vaddr % alignment {
+            return Err(io::Error::other(
+                "PT_LOAD file offset and virtual address are not alignment-congruent",
+            ));
+        }
+        maximum = maximum.max(alignment);
+    }
+    if !found {
+        return Err(io::Error::other("no PT_LOAD"));
+    }
+    Ok(maximum)
+}
+
+/// Map one image at a load-bias alignment stricter than Darwin's host page.
+///
+/// `base` represents guest `lo`, hence `(base - lo) % alignment == 0` is the
+/// ELF invariant. The raw allocation carries one full alignment of slack, so
+/// an aligned subrange of `len` bytes always fits even when the kernel ignores
+/// or relocates the hint. Prefix and suffix are host-page multiples and are
+/// immediately returned to the kernel.
+fn map_aligned_image(hint: u64, len: usize, lo: u64, alignment: u64) -> io::Result<*mut u8> {
+    if len == 0 || !len.is_multiple_of(HOST_PAGE) {
+        return Err(io::Error::other(
+            "image mapping length is not host-page aligned",
+        ));
+    }
+    if !alignment.is_power_of_two() {
+        return Err(io::Error::other(
+            "image mapping alignment is not a power of two",
+        ));
+    }
+    // Every retained mmap boundary must be host-page aligned as well as
+    // satisfying `(base - lo) % alignment == 0`. With power-of-two
+    // alignments these constraints are compatible exactly when `lo` is a
+    // multiple of the smaller boundary.
+    if !lo.is_multiple_of(alignment.min(HOST_PAGE as u64)) {
+        return Err(io::Error::other(
+            "ELF load span is incompatible with the Darwin host page",
+        ));
+    }
+    let slack = usize::try_from(alignment.max(HOST_PAGE as u64))
+        .map_err(|_| io::Error::other("image mapping alignment exceeds host usize"))?;
+    let allocation_len = len
+        .checked_add(slack)
+        .ok_or_else(|| io::Error::other("aligned image allocation length overflow"))?;
+    // SAFETY: fresh private anonymous mapping. It is unreachable by guest
+    // code until the caller finishes copying, patching, and publishing it.
+    let raw = unsafe {
+        libc::mmap(
+            hint as usize as *mut libc::c_void,
+            allocation_len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        )
+    };
+    if raw == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    let raw_address = raw as usize as u64;
+    let remainder = raw_address.wrapping_sub(lo) % alignment;
+    let prefix = if remainder == 0 {
+        0
+    } else {
+        alignment - remainder
+    } as usize;
+    let base = raw_address
+        .checked_add(prefix as u64)
+        .ok_or_else(|| io::Error::other("aligned image base overflow"))?;
+    let suffix = allocation_len - prefix - len;
+
+    // SAFETY: both pieces lie inside the raw mapping and all boundaries are
+    // host-page aligned by construction.
+    unsafe {
+        if prefix != 0 && libc::munmap(raw, prefix) != 0 {
+            let error = io::Error::last_os_error();
+            libc::munmap(raw, allocation_len);
+            return Err(error);
+        }
+        if suffix != 0 && libc::munmap((base as usize + len) as *mut libc::c_void, suffix) != 0 {
+            let error = io::Error::last_os_error();
+            libc::munmap(base as usize as *mut libc::c_void, len + suffix);
+            return Err(error);
+        }
+    }
+    Ok(base as usize as *mut u8)
+}
+
 // ------------------------------------------------------------- Darwin glue
+
+/// Process-wide callback used by the patched `__clear_cache` definition.
+/// The runtime installs one implementation whose per-thread state identifies
+/// the active load group; the native-Darwin crate's standalone tests keep the
+/// allocation-free journal-only default.
+pub type DynamicPublicationHandler = extern "C" fn(u64, u64) -> libc::c_int;
+
+static DYNAMIC_PUBLICATION_HANDLER: std::sync::atomic::AtomicPtr<()> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Install the runtime's synchronous dynamic-code publication handler.
+/// Reinstalling the identical function is idempotent; a different handler in
+/// the same process is refused so two runners cannot silently change the ABI
+/// under already-patched images.
+pub fn install_dynamic_publication_handler(handler: DynamicPublicationHandler) -> io::Result<()> {
+    let pointer = handler as *const () as *mut ();
+    match DYNAMIC_PUBLICATION_HANDLER.compare_exchange(
+        std::ptr::null_mut(),
+        pointer,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+    ) {
+        Ok(_) => Ok(()),
+        Err(existing) if existing == pointer => Ok(()),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "a different Tier-D dynamic publication handler is already installed",
+        )),
+    }
+}
+
+/// Stable emitted-code target: dispatch to the runtime callback when one is
+/// installed, otherwise retain the standalone journal-only behavior.
+extern "C" fn dispatch_dynamic_publication(start: u64, end: u64) -> libc::c_int {
+    let pointer = DYNAMIC_PUBLICATION_HANDLER.load(std::sync::atomic::Ordering::Acquire);
+    if pointer.is_null() {
+        // SAFETY: the standalone path is the original lock-free publication
+        // hook and validates the exact interval against its C mapping catalog.
+        return unsafe { carrick_native_direct_publish_dynamic_code(start, end) };
+    }
+    // SAFETY: only `install_dynamic_publication_handler` writes this atomic,
+    // and it stores exactly this function-pointer type for process lifetime.
+    let handler: DynamicPublicationHandler = unsafe { std::mem::transmute(pointer) };
+    handler(start, end)
+}
 
 fn jit_write_protect(enable: bool) {
     // SAFETY: pthread's own W^X toggle for MAP_JIT regions on this thread.
@@ -3344,11 +5836,170 @@ fn jit_write_protect(enable: bool) {
 unsafe extern "C" {
     fn pthread_jit_write_protect_np(enabled: libc::c_int);
     fn sys_icache_invalidate(start: *mut libc::c_void, len: usize);
+    fn carrick_native_direct_enter_guest_x18_abi() -> libc::c_int;
+    fn carrick_native_direct_enter_host_x18_abi();
+    fn carrick_native_direct_exception_install(slots: *mut libc::c_void) -> *mut libc::c_void;
+    fn carrick_native_direct_exception_uninstall_current();
+    fn carrick_native_direct_exception_after_fork_child() -> libc::c_int;
+    #[cfg(test)]
+    fn carrick_native_direct_exception_server_limit() -> u32;
+    #[cfg(test)]
+    fn carrick_native_direct_exception_subsystem_max() -> u32;
+    #[cfg(test)]
+    fn carrick_native_direct_exception_request_max() -> u32;
+    #[cfg(test)]
+    fn carrick_native_direct_is_recovery_breakpoint(
+        instruction: u32,
+        recovery_pending: libc::c_int,
+    ) -> libc::c_int;
+    fn carrick_native_direct_register_range(start: u64, end: u64) -> libc::c_int;
+    fn carrick_native_direct_forget_range(start: u64, end: u64);
+    fn carrick_native_direct_range_is_pristine(start: u64, end: u64) -> libc::c_int;
+    fn carrick_native_direct_enable_shadow(start: u64, end: u64) -> libc::c_int;
+    fn carrick_native_direct_range_shadowed(address: u64) -> libc::c_int;
+    fn carrick_native_direct_shadow_generation(pc: u64, expected: *mut u64) -> *const u64;
+    fn carrick_native_direct_publish_dynamic_code(start: u64, end: u64) -> libc::c_int;
+    fn carrick_native_direct_publication_for_pc(
+        pc: u64,
+        published_start: *mut u64,
+        published_end: *mut u64,
+        published_sequence: *mut u64,
+        mapping_generation: *mut u64,
+        write_epoch: *mut u64,
+    ) -> libc::c_int;
+    fn carrick_native_direct_publication_still_current(
+        pc: u64,
+        published_start: u64,
+        published_end: u64,
+        published_sequence: u64,
+        mapping_generation: u64,
+        write_epoch: u64,
+        require_write_epoch: libc::c_int,
+    ) -> libc::c_int;
+    fn carrick_native_direct_begin_dynamic_write(address: u64) -> libc::c_int;
+    fn carrick_native_direct_register_exception_route(
+        site: u64,
+        entry: u64,
+        return_pc: u64,
+        resume_pc: u64,
+    ) -> libc::c_int;
+}
+
+/// C-callable bridge from the Mach server/trampoline to Carrick's USDT
+/// provider. All payloads are copied scalars, so a child that dies immediately
+/// after the probe still leaves durable attribution in the DTrace consumer.
+#[unsafe(no_mangle)]
+pub extern "C" fn carrick_native_direct_exception_probe(
+    phase: u32,
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+) {
+    carrick_observability::probes::native_tierd_exception(phase, a, b, c, d);
+}
+
+/// Rebuild the current Tier-D thread's Mach exception receive right and
+/// server after `fork(2)`. Darwin preserves the calling thread but not the
+/// process's other pthreads, so the inherited exception-server thread no
+/// longer exists in the child.
+pub fn exception_handler_after_fork_child() -> io::Result<()> {
+    // SAFETY: called only in the host-fork child before guest execution
+    // resumes; the C side reuses this thread's still-live slots pointer.
+    if unsafe { carrick_native_direct_exception_after_fork_child() } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_allocations;
+
+    #[test]
+    fn mach_exception_server_covers_generated_mig_message_contract() {
+        // SAFETY: both functions return immutable scalar configuration from
+        // the linked MIG server and perform no process mutation.
+        let (server_limit, subsystem_max, request_max) = unsafe {
+            (
+                carrick_native_direct_exception_server_limit(),
+                carrick_native_direct_exception_subsystem_max(),
+                carrick_native_direct_exception_request_max(),
+            )
+        };
+        assert!(
+            subsystem_max > 4096,
+            "the generated arm64 Mach-exception union must exercise the old literal limit"
+        );
+        assert!(
+            server_limit >= subsystem_max,
+            "mach_msg_server receive limit {server_limit} is smaller than MIG subsystem max {subsystem_max}"
+        );
+        assert!(
+            server_limit >= request_max,
+            "mach_msg_server receive limit {server_limit} is smaller than MIG request union {request_max}"
+        );
+    }
+
+    #[test]
+    fn mach_recovery_accepts_only_carricks_private_breakpoint() {
+        const BRK_CARRICK_RECOVERY: u32 = 0xd438_8e20; // brk #0xc471
+        const BRK_UNRELATED: u32 = 0xd420_0000; // brk #0
+
+        // SAFETY: pure scalar classifier; it does not inspect process state.
+        unsafe {
+            assert_eq!(
+                carrick_native_direct_is_recovery_breakpoint(BRK_CARRICK_RECOVERY, 1),
+                1
+            );
+            assert_eq!(
+                carrick_native_direct_is_recovery_breakpoint(BRK_CARRICK_RECOVERY, 0),
+                0
+            );
+            assert_eq!(
+                carrick_native_direct_is_recovery_breakpoint(BRK_UNRELATED, 1),
+                0,
+                "a debugger or DTrace breakpoint must not complete Carrick recovery"
+            );
+        }
+    }
+
+    #[test]
+    fn whole_image_scan_does_not_allocate_for_non_x18_words() {
+        // `add x0, x0, x1`: a common decoded word with three ordinary GPR
+        // operands. The expected scan result is literal and independent of
+        // the operand walker under test.
+        let code = 0x8b01_0000_u32.to_le_bytes().repeat(2_048);
+        let (scan, allocations) =
+            test_allocations::count_current_thread(|| scan_executable_words(&code, 0x4000));
+
+        assert_eq!(scan, Ok(0));
+        assert_eq!(
+            allocations, 0,
+            "ordinary words must not allocate while Tier D asks whether they name x18"
+        );
+    }
+
+    #[test]
+    fn whole_image_scan_does_not_decode_words_without_virtual_state_fields() {
+        // `add x0, x0, x1` has no raw register field equal to x18. Tier D can
+        // prove that it is independent of virtual x18 without decomposing it.
+        let code = 0x8b01_0000_u32.to_le_bytes().repeat(2_048);
+        let (scan, decodes) = test_decodes::count(|| scan_executable_words(&code, 0x4000));
+
+        assert_eq!(scan, Ok(0));
+        assert_eq!(
+            decodes, 0,
+            "ordinary words must bypass the full A64 decoder during the Tier-D scan"
+        );
+
+        let x18_word = 0x8b12_0000_u32.to_le_bytes(); // add x0, x0, x18
+        let (scan, decodes) = test_decodes::count(|| scan_executable_words(&x18_word, 0x4000));
+        assert_eq!(scan, Ok(0), "the veneerable x18 control remains eligible");
+        assert_eq!(decodes, 1, "a possible x18 word must still be decoded");
+    }
 
     /// Build a tiny static PIE that writes "ok\n" and exits 42.
     ///
@@ -3396,6 +6047,1130 @@ mod tests {
         elf[0x3a..0x3c].copy_from_slice(&64_u16.to_le_bytes()); // e_shentsize
         elf[0x3c..0x3e].copy_from_slice(&2_u16.to_le_bytes()); // e_shnum
         elf
+    }
+
+    /// Add a minimal `.dynstr`/`.dynsym` pair that defines one function at
+    /// the fixture's entry. The literal ELF fields keep symbol discovery
+    /// independent of the production parser under test.
+    fn elf_with_dynamic_function(code: &[u32], name: &[u8], size: u64) -> Vec<u8> {
+        let mut elf = elf_with_code(code);
+        let old_shoff = read_u64(&elf, 0x28).expect("fixture section offset") as usize;
+        elf.truncate(old_shoff);
+
+        let mut dynstr = vec![0_u8];
+        dynstr.extend_from_slice(name);
+        dynstr.push(0);
+        let dynstr_offset = elf.len();
+        elf.extend_from_slice(&dynstr);
+        let dynsym_offset = elf.len().next_multiple_of(8);
+        elf.resize(dynsym_offset, 0);
+        let mut dynsym = vec![0_u8; 48]; // null symbol + one Elf64_Sym
+        let symbol = 24;
+        dynsym[symbol..symbol + 4].copy_from_slice(&1_u32.to_le_bytes()); // st_name
+        dynsym[symbol + 4] = 0x12; // STB_GLOBAL | STT_FUNC
+        dynsym[symbol + 6..symbol + 8].copy_from_slice(&1_u16.to_le_bytes()); // .text
+        dynsym[symbol + 8..symbol + 16].copy_from_slice(&0x1000_u64.to_le_bytes());
+        dynsym[symbol + 16..symbol + 24].copy_from_slice(&size.to_le_bytes());
+        elf.extend_from_slice(&dynsym);
+
+        let shoff = elf.len().next_multiple_of(8);
+        elf.resize(shoff, 0);
+        let mut shdrs = vec![0_u8; 64 * 4];
+        let text = 64;
+        let dynstr_sh = 128;
+        let dynsym_sh = 192;
+        let code_size = code.len() as u64 * 4;
+        shdrs[text + 0x04..text + 0x08].copy_from_slice(&1_u32.to_le_bytes());
+        shdrs[text + 0x08..text + 0x10].copy_from_slice(&0x6_u64.to_le_bytes());
+        shdrs[text + 0x10..text + 0x18].copy_from_slice(&0x1000_u64.to_le_bytes());
+        shdrs[text + 0x18..text + 0x20].copy_from_slice(&0x1000_u64.to_le_bytes());
+        shdrs[text + 0x20..text + 0x28].copy_from_slice(&code_size.to_le_bytes());
+        shdrs[text + 0x30..text + 0x38].copy_from_slice(&4_u64.to_le_bytes());
+
+        shdrs[dynstr_sh + 0x04..dynstr_sh + 0x08].copy_from_slice(&3_u32.to_le_bytes());
+        shdrs[dynstr_sh + 0x18..dynstr_sh + 0x20]
+            .copy_from_slice(&(dynstr_offset as u64).to_le_bytes());
+        shdrs[dynstr_sh + 0x20..dynstr_sh + 0x28]
+            .copy_from_slice(&(dynstr.len() as u64).to_le_bytes());
+        shdrs[dynstr_sh + 0x30..dynstr_sh + 0x38].copy_from_slice(&1_u64.to_le_bytes());
+
+        shdrs[dynsym_sh + 0x04..dynsym_sh + 0x08].copy_from_slice(&11_u32.to_le_bytes());
+        shdrs[dynsym_sh + 0x18..dynsym_sh + 0x20]
+            .copy_from_slice(&(dynsym_offset as u64).to_le_bytes());
+        shdrs[dynsym_sh + 0x20..dynsym_sh + 0x28]
+            .copy_from_slice(&(dynsym.len() as u64).to_le_bytes());
+        shdrs[dynsym_sh + 0x28..dynsym_sh + 0x2c].copy_from_slice(&2_u32.to_le_bytes());
+        shdrs[dynsym_sh + 0x2c..dynsym_sh + 0x30].copy_from_slice(&1_u32.to_le_bytes());
+        shdrs[dynsym_sh + 0x30..dynsym_sh + 0x38].copy_from_slice(&8_u64.to_le_bytes());
+        shdrs[dynsym_sh + 0x38..dynsym_sh + 0x40].copy_from_slice(&24_u64.to_le_bytes());
+        elf.extend_from_slice(&shdrs);
+        elf[0x28..0x30].copy_from_slice(&(shoff as u64).to_le_bytes());
+        elf[0x3c..0x3e].copy_from_slice(&4_u16.to_le_bytes());
+        elf
+    }
+
+    #[test]
+    fn dynamic_function_symbol_resolves_defined_clear_cache_entry() {
+        const BTI_C: u32 = 0xd503_245f;
+        let elf = elf_with_dynamic_function(&[BTI_C, b_rel(4), RET], b"__clear_cache", 8);
+
+        assert_eq!(
+            dynamic_function_symbol(&elf, b"__clear_cache").expect("parse fixture"),
+            Some(DynamicFunctionSymbol {
+                vaddr: 0x1000,
+                file_offset: 0x1000,
+                size: 8,
+            })
+        );
+    }
+
+    #[test]
+    fn defined_clear_cache_keeps_bti_and_redirects_its_direct_branch() {
+        const BTI_C: u32 = 0xd503_245f;
+        let original_branch = b_rel(4);
+        let elf = elf_with_dynamic_function(&[BTI_C, original_branch, RET], b"__clear_cache", 8);
+        let group = DirectLoadGroup::load(&elf, record_only)
+            .expect("load")
+            .expect("eligible");
+        let entry = group.main().entry();
+        // SAFETY: the image owns a live executable mapping containing the
+        // fixture's three words at its entry.
+        let words = unsafe { std::slice::from_raw_parts(entry as *const u32, 3) };
+        assert_eq!(
+            words[0], BTI_C,
+            "the indirect-call landing pad is ABI state"
+        );
+        assert_ne!(
+            words[1], original_branch,
+            "the direct tail branch must pass through the publication hook"
+        );
+        let imm26 = ((words[1] & 0x03ff_ffff) << 6) as i32 >> 6;
+        let target = (entry + 4).wrapping_add_signed((imm26 as i64) * 4);
+        assert!(
+            (group.main().base()..group.main().base() + group.main().mapped_len() as u64)
+                .contains(&target),
+            "the hook target must stay in the image's range-checked island arena"
+        );
+    }
+
+    /// Darwin guarantees only host-page alignment for a non-fixed anonymous
+    /// mmap.  A PIE may require a stricter PT_LOAD alignment: Node's arm64
+    /// binary uses 64 KiB, and ld.so rounds its load bias to that boundary.
+    /// Exercise an explicitly 32 KiB-misaligned hint so this does not pass by
+    /// accident merely because the production sparse cursor starts aligned.
+    #[test]
+    fn image_mapping_honors_strict_pt_load_alignment_after_hint_relocation() {
+        let len = 2 * HOST_PAGE;
+        let alignment = 64 * 1024_u64;
+        let reservation = len + 2 * alignment as usize;
+        let cursor = next_exec_hint(reservation).next_multiple_of(alignment);
+        let hint = cursor + 2 * HOST_PAGE as u64;
+
+        let mapped =
+            map_aligned_image(hint, len, 0, alignment).expect("map image at its PT_LOAD alignment");
+        assert_eq!(
+            mapped as u64 % alignment,
+            0,
+            "load bias must retain the ELF PT_LOAD alignment"
+        );
+        // SAFETY: this test owns exactly the trimmed mapping returned above.
+        unsafe { libc::munmap(mapped.cast(), len) };
+    }
+
+    #[test]
+    fn load_time_image_releases_unused_worst_case_island_budget() {
+        let elf = elf_with_code(&[RET]);
+        let group = DirectLoadGroup::load(&elf, record_only)
+            .expect("load")
+            .expect("eligible");
+
+        assert_eq!(
+            group.main().mapped_len(),
+            HOST_PAGE,
+            "the retained image ends at its page-rounded emitted high-water mark"
+        );
+    }
+
+    #[test]
+    fn guest_mapping_moves_future_exec_hints_past_its_owned_span() {
+        let before = EXEC_HINT_CURSOR.load(std::sync::atomic::Ordering::Relaxed);
+        let occupied_end = before + 2 * 1024 * 1024;
+        reserve_exec_hints_past(occupied_end);
+        let hint = next_exec_hint(HOST_PAGE);
+
+        assert!(
+            hint >= occupied_end.next_multiple_of(HOST_PAGE as u64) + HOST_PAGE as u64,
+            "an incoming image hint must not alias the outgoing guest mapping"
+        );
+    }
+
+    #[test]
+    fn pristine_dynamic_exec_discard_skips_zero_and_icache_publication() {
+        let elf = elf_with_code(&[RET]);
+        let group = DirectLoadGroup::load(&elf, record_only)
+            .expect("load")
+            .expect("eligible");
+        let _slots = group
+            .install_thread_slots()
+            .expect("install slots for the Mach fault catalog");
+        // SAFETY: reserve one page that `map_dynamic_exec` immediately
+        // replaces at the same address with its owned MAP_JIT mapping.
+        let reservation = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                HOST_PAGE,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(reservation, libc::MAP_FAILED, "reserve dynamic page");
+        let address = reservation as u64;
+        group
+            .map_dynamic_exec(address, HOST_PAGE as u64)
+            .expect("promote pristine reservation to MAP_JIT");
+
+        let zeroed = group
+            .discard_dynamic_exec_contents(address, HOST_PAGE as u64)
+            .expect("discard pristine dynamic page");
+
+        group.forget_dynamic_exec(address, HOST_PAGE as u64);
+        // SAFETY: the range is no longer present in either ownership catalog.
+        assert_eq!(unsafe { libc::munmap(reservation, HOST_PAGE) }, 0);
+        assert!(
+            !zeroed,
+            "an untouched zero-fill MAP_JIT range needs neither memset nor i-cache publication"
+        );
+    }
+
+    #[test]
+    fn runtime_stub_arena_recycles_only_released_slots() {
+        let len = RUNTIME_STUB_SLOT_CAPACITY * 2;
+        // SAFETY: private test-owned mapping released by RuntimeStubArena.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED, "allocate runtime-stub fixture");
+        let arena = RuntimeStubArena {
+            base: base.cast(),
+            len,
+            cursor: std::sync::atomic::AtomicUsize::new(0),
+            free: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let first = arena.reserve().expect("first runtime-stub slot");
+        let first_base = first.base();
+        let second = arena.reserve().expect("second runtime-stub slot");
+        assert_ne!(first_base, second.base(), "active leases must be disjoint");
+        assert!(
+            arena.reserve().is_none(),
+            "a full arena must fail closed rather than alias an active slot"
+        );
+
+        drop(first);
+        let recycled = arena.reserve().expect("released runtime-stub slot");
+        assert_eq!(
+            recycled.base(),
+            first_base,
+            "only a released slot may be reused"
+        );
+    }
+
+    #[test]
+    fn nearby_arena_reach_counts_large_image_once() {
+        let text = 0x600_0000_0000_u64;
+        let image_len = 100 * 1024 * 1024;
+        let arena = text + image_len as u64;
+
+        let distance =
+            farthest_range_endpoint_distance(text, image_len, arena, RUNTIME_STUB_ARENA_LEN);
+
+        assert_eq!(
+            distance,
+            (image_len + RUNTIME_STUB_ARENA_LEN) as u64,
+            "an adjacent arena must count the image span exactly once"
+        );
+        assert!(
+            distance < B_RANGE as u64,
+            "Node-sized image plus runtime arena is branch-reachable"
+        );
+    }
+
+    /// The fork child inherits V8's already-populated MAP_JIT code cage, but
+    /// Darwin refuses every in-place protection change on that original
+    /// mapping.  The shadow transition must replace only the child's mapping
+    /// through a Mach memory entry, preserve the guest-visible bytes exactly,
+    /// and leave the replacement readable but non-executable for DSR.
+    #[test]
+    fn existing_map_jit_transitions_to_byte_preserving_shadow() {
+        let elf = elf_with_code(&[RET]);
+        let group = DirectLoadGroup::load(&elf, record_only)
+            .expect("load")
+            .expect("eligible");
+        let _slots = group
+            .install_thread_slots()
+            .expect("install slots for the Mach fault catalog");
+        // SAFETY: reserve one page that `map_dynamic_exec` immediately
+        // replaces at the same address with its owned MAP_JIT mapping.
+        let reservation = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                HOST_PAGE,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(reservation, libc::MAP_FAILED, "reserve dynamic page");
+        let address = reservation as u64;
+        group
+            .map_dynamic_exec(address, HOST_PAGE as u64)
+            .expect("promote reservation to MAP_JIT");
+
+        let expected = [movz(0, 42, 0), RET];
+        jit_write_protect(false);
+        // SAFETY: this thread owns the complete live mapping in MAP_JIT write
+        // mode; the source words are copied back below before it is released.
+        unsafe {
+            std::ptr::copy_nonoverlapping(expected.as_ptr(), address as *mut u32, expected.len())
+        };
+        jit_write_protect(true);
+
+        // SAFETY: the test is single-threaded except for Carrick's idle Mach
+        // server, and no runtime lock is held. The child exits with `_exit`
+        // after inspecting only its CoW address-space copy.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork MAP_JIT shadow-transition child");
+        if child == 0 {
+            let transitioned =
+                group.enable_dynamic_shadow().is_ok() && group.dynamic_exec_is_shadowed(address);
+            // SAFETY: a shadow source mapping is deliberately readable and
+            // the child still owns this exact live range.
+            let bytes_match = unsafe {
+                std::slice::from_raw_parts(address as *const u32, expected.len()) == expected
+            };
+            // SAFETY: never unwind a Rust test harness through the post-fork
+            // child; the parent owns all ordinary cleanup and assertions.
+            unsafe { libc::_exit(i32::from(!(transitioned && bytes_match))) };
+        }
+        let mut status = 0;
+        // SAFETY: `child` is the live direct child created above.
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status), "shadow child status {status:#x}");
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "child remap must preserve the generated bytes"
+        );
+        assert!(
+            !group.dynamic_exec_is_shadowed(address),
+            "the parent must retain its direct MAP_JIT fast path"
+        );
+
+        jit_write_protect(false);
+        group.forget_dynamic_exec(address, HOST_PAGE as u64);
+        // SAFETY: the range is no longer present in either ownership catalog.
+        assert_eq!(unsafe { libc::munmap(reservation, HOST_PAGE) }, 0);
+        jit_write_protect(true);
+    }
+
+    /// A Darwin host page is an allocation/protection unit, not an
+    /// executable-code unit. V8 places generated code and unrelated payload
+    /// in different Linux-sized subranges of the same 16 KiB page. An execute
+    /// fault at the generated function must not decode the unrelated payload
+    /// as though every four bytes in the host page were an instruction.
+    #[test]
+    fn dynamic_execute_fault_does_not_scan_unrelated_same_page_bytes() {
+        let elf = elf_with_code(&[RET]);
+        let group = DirectLoadGroup::load(&elf, record_only)
+            .expect("load")
+            .expect("eligible");
+        let _slots = group
+            .install_thread_slots()
+            .expect("install slots for the Mach fault catalog");
+        // SAFETY: reserve one page that `map_dynamic_exec` immediately
+        // replaces at the same address with its owned MAP_JIT mapping.
+        let reservation = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                HOST_PAGE,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(reservation, libc::MAP_FAILED, "reserve dynamic page");
+        let address = reservation as u64;
+        group
+            .map_dynamic_exec(address, HOST_PAGE as u64)
+            .expect("promote reservation to MAP_JIT");
+
+        // The test thread owns this mapping. Enter write mode and put a safe
+        // one-instruction function at the faulting PC, while a word that
+        // genuinely names x18 remains non-code in another 4 KiB subrange.
+        jit_write_protect(false);
+        // SAFETY: write mode is enabled and both words lie in the live page.
+        unsafe {
+            std::ptr::write_unaligned(address as *mut u32, RET);
+            std::ptr::write_unaligned((address + 0x1000) as *mut u32, mov_reg(0, 18));
+        }
+        // SAFETY: the guest's cache-publication adapter names exactly the
+        // generated function, not the unrelated payload later in the same
+        // Darwin allocation page.
+        assert_eq!(
+            unsafe { carrick_native_direct_publish_dynamic_code(address, address + 4) },
+            1,
+            "publish the exact generated-code interval"
+        );
+        let context = GuestContext {
+            pc: address,
+            ..GuestContext::default()
+        };
+        let result = group.prepare_dynamic_fault(
+            DirectFault {
+                pending: 1,
+                signal: libc::SIGBUS,
+                code: libc::BUS_ADRERR,
+                address,
+                esr: 0,
+                far: address,
+            },
+            &context,
+        );
+
+        // Restore writable mode before releasing the MAP_JIT mapping.
+        jit_write_protect(false);
+        group.forget_dynamic_exec(address, HOST_PAGE as u64);
+        // SAFETY: the range is no longer present in either ownership catalog.
+        assert_eq!(unsafe { libc::munmap(reservation, HOST_PAGE) }, 0);
+        jit_write_protect(true);
+        assert_eq!(
+            result,
+            Ok(true),
+            "only the exact published executable range may be verified"
+        );
+    }
+
+    #[test]
+    fn dynamic_x18_publication_is_veneered_and_executes_against_the_thread_slot() {
+        let elf = elf_with_code(&[RET]);
+        let group = DirectLoadGroup::load(&elf, record_only)
+            .expect("load")
+            .expect("eligible");
+        let mut slots = group
+            .install_thread_slots()
+            .expect("install slots for dynamic x18 execution");
+        slots.slots_mut().guest_x18 = 0x1818_1818_1818_1818;
+        let mut observed = 0_u64;
+
+        // SAFETY: reserve one page that map_dynamic_exec immediately replaces
+        // at the same address with its owned MAP_JIT mapping.
+        let reservation = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                HOST_PAGE,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(reservation, libc::MAP_FAILED, "reserve dynamic page");
+        let address = reservation as u64;
+        group
+            .map_dynamic_exec(address, HOST_PAGE as u64)
+            .expect("promote reservation to MAP_JIT");
+
+        let mut code = mov_imm64(0, std::ptr::from_mut(&mut observed) as u64).to_vec();
+        let x18_site = code.len();
+        code.push(str_imm(18, 0, 0));
+        code.push(RET);
+        jit_write_protect(false);
+        // SAFETY: this thread owns the live mapping in write mode.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                code.as_ptr().cast::<u8>(),
+                address as usize as *mut u8,
+                code.len() * 4,
+            );
+        }
+        assert_eq!(
+            unsafe {
+                carrick_native_direct_publish_dynamic_code(
+                    address,
+                    address + (code.len() * 4) as u64,
+                )
+            },
+            1
+        );
+        let context = GuestContext {
+            pc: address,
+            ..GuestContext::default()
+        };
+        let prepared = group.prepare_dynamic_fault(
+            DirectFault {
+                pending: 1,
+                signal: libc::SIGBUS,
+                code: libc::BUS_ADRERR,
+                address,
+                esr: 0,
+                far: address,
+            },
+            &context,
+        );
+
+        assert_eq!(prepared, Ok(true), "dynamic x18 must become a veneer");
+        // SAFETY: prepare_dynamic_fault published the text and its immutable
+        // island before enabling execute mode.
+        unsafe { group.enter(address) }.expect("execute patched dynamic function");
+        assert_eq!(
+            observed, 0x1818_1818_1818_1818,
+            "the dynamic instruction must read virtual guest x18"
+        );
+        let patched = unsafe {
+            std::ptr::read_unaligned((address + (x18_site * 4) as u64) as usize as *const u32)
+        };
+        assert_eq!(
+            patched & 0xfc00_0000,
+            0x1400_0000,
+            "site branches to veneer"
+        );
+
+        jit_write_protect(false);
+        group.forget_dynamic_exec(address, HOST_PAGE as u64);
+        // SAFETY: the range is no longer present in either ownership catalog.
+        assert_eq!(unsafe { libc::munmap(reservation, HOST_PAGE) }, 0);
+        jit_write_protect(true);
+    }
+
+    #[test]
+    fn dynamic_x18_is_patched_synchronously_at_publication() {
+        let elf = elf_with_code(&[RET]);
+        let group = DirectLoadGroup::load(&elf, record_only)
+            .expect("load")
+            .expect("eligible");
+        let mut slots = group
+            .install_thread_slots()
+            .expect("install slots for the dynamic publication hook");
+        // SAFETY: reserve one page that `map_dynamic_exec` immediately
+        // replaces at the same address with its owned MAP_JIT mapping.
+        let reservation = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                HOST_PAGE,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(reservation, libc::MAP_FAILED, "reserve dynamic page");
+        let address = reservation as u64;
+        group
+            .map_dynamic_exec(address, HOST_PAGE as u64)
+            .expect("promote reservation to MAP_JIT");
+        let output = Box::into_raw(Box::new(0_u64));
+        let code = [
+            movz(0, (output as u64 & 0xffff) as u32, 0),
+            movk(0, ((output as u64 >> 16) & 0xffff) as u32, 16),
+            movk(0, ((output as u64 >> 32) & 0xffff) as u32, 32),
+            movk(0, ((output as u64 >> 48) & 0xffff) as u32, 48),
+            0xf900_0012, // str x18, [x0]
+            RET,
+        ];
+        jit_write_protect(false);
+        // SAFETY: the test owns this live MAP_JIT mapping in write mode.
+        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), address as *mut u32, code.len()) };
+        group
+            .publish_dynamic_code(address, address + (code.len() * 4) as u64)
+            .expect("publication must synchronously install the x18 veneer");
+        assert_ne!(
+            unsafe { std::ptr::read_unaligned((address + 16) as *const u32) },
+            code[4],
+            "the publication hook returns only after replacing the live x18 word"
+        );
+        // SAFETY: this is the cache-maintenance body that follows Carrick's
+        // publication hook in the real `__clear_cache` definition.
+        unsafe {
+            sys_icache_invalidate(
+                address as usize as *mut libc::c_void,
+                code.len() * std::mem::size_of::<u32>(),
+            )
+        };
+        jit_write_protect(true);
+        slots.slots_mut().guest_x18 = 0x8877_6655_4433_2211;
+        // SAFETY: the publication method completed text/island patching and
+        // the test has returned this thread to MAP_JIT execute mode.
+        unsafe { group.enter(address) }.expect("run synchronously patched dynamic code");
+        assert_eq!(unsafe { *output }, 0x8877_6655_4433_2211);
+
+        group.forget_dynamic_exec(address, HOST_PAGE as u64);
+        // SAFETY: the range is no longer present in either ownership catalog.
+        assert_eq!(unsafe { libc::munmap(reservation, HOST_PAGE) }, 0);
+        // SAFETY: reclaim the test-only output allocation.
+        drop(unsafe { Box::from_raw(output) });
+        jit_write_protect(true);
+    }
+
+    #[test]
+    fn dynamic_arena_budget_tracks_patch_sites_not_publication_bytes() {
+        let mut code = vec![0xd503_201f_u32; HOST_PAGE / 4]; // nop
+        let midpoint = code.len() / 2;
+        code[midpoint] = 0xf900_0012; // str x18, [x0]
+        let bytes = code
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dynamic_patch_arena_len(&bytes).expect("one-site arena budget"),
+            HOST_PAGE,
+            "one virtual-state site needs one host page, not 32x the publication"
+        );
+    }
+
+    #[test]
+    fn dynamic_far_x18_veneer_round_trips_through_mach_exceptions() {
+        let elf = elf_with_code(&[RET]);
+        let group = DirectLoadGroup::load(&elf, record_only)
+            .expect("load")
+            .expect("eligible");
+        let mut slots = group
+            .install_thread_slots()
+            .expect("install slots for Mach redirects");
+        let reservation = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                HOST_PAGE,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(reservation, libc::MAP_FAILED, "reserve dynamic page");
+        let address = reservation as u64;
+        group
+            .map_dynamic_exec(address, HOST_PAGE as u64)
+            .expect("promote reservation to MAP_JIT");
+        let output = Box::into_raw(Box::new(0_u64));
+        let code = [
+            movz(0, (output as u64 & 0xffff) as u32, 0),
+            movk(0, ((output as u64 >> 16) & 0xffff) as u32, 16),
+            movk(0, ((output as u64 >> 32) & 0xffff) as u32, 32),
+            movk(0, ((output as u64 >> 48) & 0xffff) as u32, 48),
+            0xf900_0012, // str x18, [x0]
+            RET,
+        ];
+        jit_write_protect(false);
+        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), address as *mut u32, code.len()) };
+        assert_eq!(
+            unsafe {
+                carrick_native_direct_publish_dynamic_code(
+                    address,
+                    address + (code.len() * 4) as u64,
+                )
+            },
+            1
+        );
+        let range = lock(&group.dynamic_exec)[0];
+        let bytes = unsafe { std::slice::from_raw_parts(address as *const u8, code.len() * 4) };
+        let plan = group
+            .build_dynamic_exception_patch_plan(range, address, bytes)
+            .expect("build branch-range-independent plan");
+        assert!(!plan.exception_routes.is_empty());
+        group
+            .commit_dynamic_patch(plan)
+            .expect("register Mach routes before patching text");
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned((address + 16) as *const u32) },
+            UDF_DYNAMIC_ENTRY
+        );
+        unsafe {
+            sys_icache_invalidate(
+                address as usize as *mut libc::c_void,
+                code.len() * std::mem::size_of::<u32>(),
+            )
+        };
+        jit_write_protect(true);
+        slots.slots_mut().guest_x18 = 0x1234_5678_9abc_def0;
+        unsafe { group.enter(address) }.expect("Mach entry/return redirects execute veneer");
+        assert_eq!(unsafe { *output }, 0x1234_5678_9abc_def0);
+        assert!(
+            slots.slots().exception_telemetry.bad_instruction_entries >= 2,
+            "one entry and one return UDF were serviced"
+        );
+
+        group.forget_dynamic_exec(address, HOST_PAGE as u64);
+        assert_eq!(unsafe { libc::munmap(reservation, HOST_PAGE) }, 0);
+        drop(unsafe { Box::from_raw(output) });
+        jit_write_protect(true);
+    }
+
+    #[test]
+    fn dynamic_far_route_uses_the_newest_publication_for_a_reused_site() {
+        let elf = elf_with_code(&[RET]);
+        let group = DirectLoadGroup::load(&elf, record_only)
+            .expect("load")
+            .expect("eligible");
+        let mut slots = group
+            .install_thread_slots()
+            .expect("install slots for Mach redirects");
+        let reservation = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                HOST_PAGE,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(reservation, libc::MAP_FAILED, "reserve dynamic page");
+        let address = reservation as u64;
+        group
+            .map_dynamic_exec(address, HOST_PAGE as u64)
+            .expect("promote reservation to MAP_JIT");
+        let output = Box::into_raw(Box::new([0_u64; 2]));
+        let prefix = [
+            movz(0, (output as u64 & 0xffff) as u32, 0),
+            movk(0, ((output as u64 >> 16) & 0xffff) as u32, 16),
+            movk(0, ((output as u64 >> 32) & 0xffff) as u32, 32),
+            movk(0, ((output as u64 >> 48) & 0xffff) as u32, 48),
+        ];
+
+        for store_offset in [0, 8] {
+            let code = [
+                prefix[0],
+                prefix[1],
+                prefix[2],
+                prefix[3],
+                str_imm(18, 0, store_offset),
+                RET,
+            ];
+            jit_write_protect(false);
+            unsafe {
+                std::ptr::copy_nonoverlapping(code.as_ptr(), address as *mut u32, code.len())
+            };
+            assert_eq!(
+                unsafe {
+                    carrick_native_direct_publish_dynamic_code(
+                        address,
+                        address + (code.len() * 4) as u64,
+                    )
+                },
+                1
+            );
+            let range = lock(&group.dynamic_exec)[0];
+            let bytes = unsafe { std::slice::from_raw_parts(address as *const u8, code.len() * 4) };
+            let plan = group
+                .build_dynamic_exception_patch_plan(range, address, bytes)
+                .expect("build branch-range-independent plan");
+            group
+                .commit_dynamic_patch(plan)
+                .expect("register the publication's Mach routes");
+        }
+
+        unsafe {
+            sys_icache_invalidate(
+                address as usize as *mut libc::c_void,
+                6 * std::mem::size_of::<u32>(),
+            )
+        };
+        jit_write_protect(true);
+        slots.slots_mut().guest_x18 = 0x1234_5678_9abc_def0;
+        unsafe { group.enter(address) }.expect("execute the newest publication");
+        assert_eq!(
+            unsafe { (*output)[0] },
+            0,
+            "the stale first route must not run"
+        );
+        assert_eq!(unsafe { (*output)[1] }, 0x1234_5678_9abc_def0);
+
+        group.forget_dynamic_exec(address, HOST_PAGE as u64);
+        assert_eq!(unsafe { libc::munmap(reservation, HOST_PAGE) }, 0);
+        drop(unsafe { Box::from_raw(output) });
+        jit_write_protect(true);
+    }
+
+    #[test]
+    fn dynamic_publication_survives_an_unrelated_write_transition() {
+        let elf = elf_with_code(&[RET]);
+        let group = DirectLoadGroup::load(&elf, record_only)
+            .expect("load")
+            .expect("eligible");
+        let _slots = group
+            .install_thread_slots()
+            .expect("install slots for the Mach fault catalog");
+        // SAFETY: reserve one page that `map_dynamic_exec` immediately
+        // replaces at the same address with its owned MAP_JIT mapping.
+        let reservation = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                HOST_PAGE,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(reservation, libc::MAP_FAILED, "reserve dynamic page");
+        let address = reservation as u64;
+        group
+            .map_dynamic_exec(address, HOST_PAGE as u64)
+            .expect("promote reservation to MAP_JIT");
+
+        jit_write_protect(false);
+        // SAFETY: the test owns this live MAP_JIT mapping in write mode.
+        unsafe { std::ptr::write_unaligned(address as *mut u32, RET) };
+        assert_eq!(
+            unsafe { carrick_native_direct_publish_dynamic_code(address, address + 4) },
+            1
+        );
+        let execute_context = GuestContext {
+            pc: address,
+            ..GuestContext::default()
+        };
+        assert_eq!(
+            group.prepare_dynamic_fault(
+                DirectFault {
+                    pending: 1,
+                    signal: libc::SIGBUS,
+                    code: libc::BUS_ADRERR,
+                    address,
+                    esr: 0,
+                    far: address,
+                },
+                &execute_context,
+            ),
+            Ok(true)
+        );
+
+        let write_context = GuestContext {
+            pc: group.entry_pc(),
+            ..GuestContext::default()
+        };
+        assert_eq!(
+            group.prepare_dynamic_fault(
+                DirectFault {
+                    pending: 1,
+                    signal: libc::SIGBUS,
+                    code: libc::BUS_ADRERR,
+                    address,
+                    esr: 0,
+                    far: address,
+                },
+                &write_context,
+            ),
+            Ok(true),
+            "the write transition starts a new race-detection epoch"
+        );
+        // SAFETY: write mode is active. This unrelated payload is outside the
+        // published function and must not revoke that function's authority.
+        unsafe {
+            std::ptr::write_unaligned((address + 0x1000) as *mut u32, mov_reg(0, 18));
+        }
+        let retry = group.prepare_dynamic_fault(
+            DirectFault {
+                pending: 1,
+                signal: libc::SIGBUS,
+                code: libc::BUS_ADRERR,
+                address,
+                esr: 0,
+                far: address,
+            },
+            &execute_context,
+        );
+
+        jit_write_protect(false);
+        group.forget_dynamic_exec(address, HOST_PAGE as u64);
+        // SAFETY: the range is no longer present in either ownership catalog.
+        assert_eq!(unsafe { libc::munmap(reservation, HOST_PAGE) }, 0);
+        jit_write_protect(true);
+        assert_eq!(
+            retry,
+            Ok(true),
+            "an unrelated mapping write cannot revoke unchanged published code"
+        );
+    }
+
+    #[test]
+    fn synchronous_publication_revalidation_ignores_unrelated_write_epoch() {
+        let elf = elf_with_code(&[RET]);
+        let group = DirectLoadGroup::load(&elf, record_only)
+            .expect("load")
+            .expect("eligible");
+        let _slots = group
+            .install_thread_slots()
+            .expect("install slots for the Mach fault catalog");
+        let reservation = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                HOST_PAGE,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(reservation, libc::MAP_FAILED, "reserve dynamic page");
+        let address = reservation as u64;
+        group
+            .map_dynamic_exec(address, HOST_PAGE as u64)
+            .expect("promote reservation to MAP_JIT");
+
+        jit_write_protect(false);
+        unsafe { std::ptr::write_unaligned(address as *mut u32, RET) };
+        assert_eq!(
+            unsafe { carrick_native_direct_publish_dynamic_code(address, address + 4) },
+            1
+        );
+        let mut published_start = 0;
+        let mut published_end = 0;
+        let mut published_sequence = 0;
+        let mut mapping_generation = 0;
+        let mut write_epoch = 0;
+        assert_eq!(
+            unsafe {
+                carrick_native_direct_publication_for_pc(
+                    address,
+                    &mut published_start,
+                    &mut published_end,
+                    &mut published_sequence,
+                    &mut mapping_generation,
+                    &mut write_epoch,
+                )
+            },
+            1
+        );
+        assert_eq!(
+            unsafe { carrick_native_direct_begin_dynamic_write(address + 0x1000) },
+            1,
+            "a sibling writer advances the mapping-wide diagnostic epoch"
+        );
+        assert_eq!(
+            unsafe {
+                carrick_native_direct_publication_still_current(
+                    address,
+                    published_start,
+                    published_end,
+                    published_sequence,
+                    mapping_generation,
+                    write_epoch,
+                    1,
+                )
+            },
+            0,
+            "execute-fault verification must still detect a concurrent writer"
+        );
+        assert_eq!(
+            unsafe {
+                carrick_native_direct_publication_still_current(
+                    address,
+                    published_start,
+                    published_end,
+                    published_sequence,
+                    mapping_generation,
+                    write_epoch,
+                    0,
+                )
+            },
+            1,
+            "the synchronous exact publication remains authoritative"
+        );
+
+        group.forget_dynamic_exec(address, HOST_PAGE as u64);
+        assert_eq!(unsafe { libc::munmap(reservation, HOST_PAGE) }, 0);
+        jit_write_protect(true);
+    }
+
+    #[test]
+    fn dynamic_publication_rechecks_modified_bytes_without_republication() {
+        let elf = elf_with_code(&[RET]);
+        let group = DirectLoadGroup::load(&elf, record_only)
+            .expect("load")
+            .expect("eligible");
+        let _slots = group
+            .install_thread_slots()
+            .expect("install slots for the Mach fault catalog");
+        // SAFETY: reserve one page that `map_dynamic_exec` immediately
+        // replaces at the same address with its owned MAP_JIT mapping.
+        let reservation = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                HOST_PAGE,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(reservation, libc::MAP_FAILED, "reserve dynamic page");
+        let address = reservation as u64;
+        group
+            .map_dynamic_exec(address, HOST_PAGE as u64)
+            .expect("promote reservation to MAP_JIT");
+        jit_write_protect(false);
+        // SAFETY: the test owns this live MAP_JIT mapping in write mode.
+        unsafe { std::ptr::write_unaligned(address as *mut u32, RET) };
+        assert_eq!(
+            unsafe { carrick_native_direct_publish_dynamic_code(address, address + 4) },
+            1
+        );
+        let execute_context = GuestContext {
+            pc: address,
+            ..GuestContext::default()
+        };
+        assert_eq!(
+            group.prepare_dynamic_fault(
+                DirectFault {
+                    pending: 1,
+                    signal: libc::SIGBUS,
+                    code: libc::BUS_ADRERR,
+                    address,
+                    esr: 0,
+                    far: address,
+                },
+                &execute_context,
+            ),
+            Ok(true)
+        );
+        let write_context = GuestContext {
+            pc: group.entry_pc(),
+            ..GuestContext::default()
+        };
+        assert_eq!(
+            group.prepare_dynamic_fault(
+                DirectFault {
+                    pending: 1,
+                    signal: libc::SIGBUS,
+                    code: libc::BUS_ADRERR,
+                    address,
+                    esr: 0,
+                    far: address,
+                },
+                &write_context,
+            ),
+            Ok(true)
+        );
+        // SAFETY: write mode is active; replace the published instruction
+        // without issuing another cache publication. The old exact interval
+        // still scopes verification, but its current bytes must be rejected.
+        // A plain x18 register operation is now safely veneerable, so use the
+        // canonical unhandled PC-relative x18 shape instead: `ldr x18, pc+8`.
+        unsafe { std::ptr::write_unaligned(address as *mut u32, 0x5800_0052) };
+        let unsafe_code = group
+            .prepare_dynamic_fault(
+                DirectFault {
+                    pending: 1,
+                    signal: libc::SIGBUS,
+                    code: libc::BUS_ADRERR,
+                    address,
+                    esr: 0,
+                    far: address,
+                },
+                &execute_context,
+            )
+            .expect_err("current unsafe bytes must not inherit old approval");
+
+        group.forget_dynamic_exec(address, HOST_PAGE as u64);
+        // SAFETY: the range is no longer present in either ownership catalog.
+        assert_eq!(unsafe { libc::munmap(reservation, HOST_PAGE) }, 0);
+        jit_write_protect(true);
+        assert!(
+            unsafe_code.contains("x18 access"),
+            "named current-byte refusal: {unsafe_code}"
+        );
+    }
+
+    #[test]
+    fn dynamic_publication_does_not_survive_same_address_remap() {
+        let elf = elf_with_code(&[RET]);
+        let group = DirectLoadGroup::load(&elf, record_only)
+            .expect("load")
+            .expect("eligible");
+        let _slots = group
+            .install_thread_slots()
+            .expect("install slots for the Mach fault catalog");
+        // SAFETY: reserve one page that `map_dynamic_exec` immediately
+        // replaces at the same address with its owned MAP_JIT mapping.
+        let reservation = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                HOST_PAGE,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(reservation, libc::MAP_FAILED, "reserve dynamic page");
+        let address = reservation as u64;
+        group
+            .map_dynamic_exec(address, HOST_PAGE as u64)
+            .expect("promote first reservation to MAP_JIT");
+        jit_write_protect(false);
+        // SAFETY: the test owns this live MAP_JIT mapping in write mode.
+        unsafe { std::ptr::write_unaligned(address as *mut u32, RET) };
+        assert_eq!(
+            unsafe { carrick_native_direct_publish_dynamic_code(address, address + 4) },
+            1
+        );
+        group.forget_dynamic_exec(address, HOST_PAGE as u64);
+        // SAFETY: remove the first mapping, then restore the exact pristine
+        // reservation contract required by `map_dynamic_exec`.
+        assert_eq!(unsafe { libc::munmap(reservation, HOST_PAGE) }, 0);
+        let replacement = unsafe {
+            libc::mmap(
+                address as usize as *mut libc::c_void,
+                HOST_PAGE,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+                -1,
+                0,
+            )
+        };
+        assert_eq!(replacement as u64, address, "replace at the same address");
+        group
+            .map_dynamic_exec(address, HOST_PAGE as u64)
+            .expect("promote replacement reservation to MAP_JIT");
+
+        let context = GuestContext {
+            pc: address,
+            ..GuestContext::default()
+        };
+        let stale = group
+            .prepare_dynamic_fault(
+                DirectFault {
+                    pending: 1,
+                    signal: libc::SIGBUS,
+                    code: libc::BUS_ADRERR,
+                    address,
+                    esr: 0,
+                    far: address,
+                },
+                &context,
+            )
+            .expect_err("old mapping publication must not survive address reuse");
+
+        jit_write_protect(false);
+        group.forget_dynamic_exec(address, HOST_PAGE as u64);
+        // SAFETY: the replacement is no longer cataloged.
+        assert_eq!(unsafe { libc::munmap(replacement, HOST_PAGE) }, 0);
+        jit_write_protect(true);
+        assert!(
+            stale.contains("no current exact cache publication"),
+            "named remap-publication refusal: {stale}"
+        );
     }
 
     /// The M1 demo guest: write "ok\n" to fd 1, then exit 42.
@@ -3446,6 +7221,138 @@ mod tests {
         // driven through this helper return via a balanced `ret`.
         unsafe { group.enter(entry) }.expect("enter");
         guard.into_slots()
+    }
+
+    /// A plain patched image has no operation that can reach the Mach
+    /// exception server. Restoring unconditional exception installation in
+    /// [`InstalledThreadSlots::install`] must make this fail: that regression
+    /// recreates one server/port lifecycle per short-lived Python process.
+    #[test]
+    fn plain_tier_d_entry_does_not_install_mach_exception_transport() {
+        let elf = elf_with_code(&[RET]);
+        let group = DirectLoadGroup::load(&elf, record_only)
+            .expect("load")
+            .expect("eligible");
+        let guard = group.install_thread_slots().expect("install thread slots");
+        // SAFETY: the fixture is a patched image and returns with SP balanced.
+        unsafe { group.enter(group.main().entry()) }.expect("enter");
+        assert_eq!(
+            guard.slots().exception_telemetry.installs,
+            0,
+            "plain Tier D must not allocate an unused Mach exception transport"
+        );
+    }
+
+    /// Static Linux-visible architectural reads are constants and belong in
+    /// the ordinary Tier-D patch pipeline. Restoring exception-based service
+    /// makes this fail by incrementing both counters, and recreates eager Mach
+    /// setup for Python images whose scanned-but-unreached text contains MRS.
+    #[test]
+    fn linux_sysreg_site_is_patched_without_mach_transport() {
+        const CHECK_NR: u64 = 0x0fef;
+        let elf = elf_with_code(&[
+            mov_reg(20, 30),
+            0xd53b_0020, // mrs x0, CTR_EL0
+            mov_reg(1, 0),
+            0xd53b_00e2, // mrs x2, DCZID_EL0
+            movz(8, CHECK_NR as u32, 0),
+            SVC_0,
+            mov_reg(30, 20),
+            RET,
+        ]);
+        let group = DirectLoadGroup::load(&elf, record_only)
+            .expect("load")
+            .expect("eligible");
+        seen_clear();
+        let slots = enter_with_slots(&group, group.main().entry());
+        let seen = seen_snapshot();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, CHECK_NR);
+        assert_eq!(seen[0].1[0], LINUX_CTR_EL0);
+        assert_eq!(seen[0].1[1], LINUX_CTR_EL0);
+        assert_eq!(seen[0].1[2], LINUX_DCZID_EL0);
+        assert_eq!(slots.exception_telemetry.installs, 0);
+        assert_eq!(slots.exception_telemetry.sysreg_emulations, 0);
+    }
+
+    #[test]
+    fn linux_sysreg_patch_writes_virtual_x18_not_darwin_x18() {
+        const CHECK_NR: u64 = 0x0fee;
+        let elf = elf_with_code(&[
+            mov_reg(20, 30),
+            0xd53b_0032, // mrs x18, CTR_EL0
+            mov_reg(0, 18),
+            movz(8, CHECK_NR as u32, 0),
+            SVC_0,
+            mov_reg(30, 20),
+            RET,
+        ]);
+        let group = DirectLoadGroup::load(&elf, record_only)
+            .expect("load")
+            .expect("eligible");
+        seen_clear();
+        let slots = enter_with_slots(&group, group.main().entry());
+        let seen = seen_snapshot();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, CHECK_NR);
+        assert_eq!(seen[0].1[0], LINUX_CTR_EL0);
+        assert_eq!(slots.guest_x18, LINUX_CTR_EL0);
+        assert_eq!(slots.exception_telemetry.installs, 0);
+    }
+
+    /// A fork child whose guest thread never needed Mach exceptions inherits
+    /// no per-thread registration. Treating that normal lazy state as EINVAL
+    /// would make process-heavy Python fail immediately after the first fork.
+    #[test]
+    fn after_fork_without_exception_registration_is_a_noop() {
+        exception_handler_after_fork_child()
+            .expect("no inherited exception registration needs no rebind");
+    }
+
+    /// Exercise the real exception request/reply path, not only the scalar
+    /// handler helpers. The first host-thread store into an execute-mode
+    /// MAP_JIT page must take EXC_BAD_ACCESS, run Carrick's recovery
+    /// trampoline, take the private recovery BRK, and retry in write mode.
+    #[test]
+    fn mach_exception_server_round_trips_a_dynamic_write_fault() {
+        let elf = elf_with_code(&[RET]);
+        let group = DirectLoadGroup::load(&elf, record_only)
+            .expect("load")
+            .expect("eligible");
+        let guard = group.install_thread_slots().expect("install thread slots");
+        // Seed the parked host stack used by the exception-recovery trampoline.
+        // SAFETY: the fixture is patched and returns with SP balanced.
+        unsafe { group.enter(group.main().entry()) }.expect("enter");
+
+        // SAFETY: create the proven-zero, inaccessible reservation required by
+        // `map_dynamic_exec`; the group replaces and owns it on success.
+        let reserved = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                HOST_PAGE,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(reserved, libc::MAP_FAILED, "reserve dynamic page");
+        group
+            .map_dynamic_exec(reserved as u64, HOST_PAGE as u64)
+            .expect("replace reservation with MAP_JIT");
+
+        // The page starts in per-thread execute mode. This store therefore
+        // cannot complete unless the Mach server decodes and replies to both
+        // the protection fault and Carrick's recovery breakpoint.
+        unsafe { (reserved as *mut u32).write_volatile(0xd65f_03c0) };
+        jit_write_protect(true);
+
+        let telemetry = guard.slots().exception_telemetry;
+        assert_eq!(telemetry.bad_access_entries, 1);
+        assert_eq!(telemetry.breakpoint_entries, 1);
+        assert_eq!(telemetry.recovery_services, 1);
+        assert_eq!(telemetry.write_switches, 1);
+        assert_eq!(telemetry.failures, 0);
     }
 
     #[test]
@@ -3658,8 +7565,11 @@ mod tests {
             "an undecodable word that cannot name x18 is not a disqualifier"
         );
 
-        // Same shape, but with register field Rd = 18: cannot be ruled out.
-        let suspicious = vec![0xffff_fff2, movz(8, 93, 0), SVC_0];
+        // This word reaches an allocated decoder leaf whose operands the
+        // decoder cannot model (`ErrorOperands`), and a standard register
+        // field reads 18. Unlike an explicitly Unallocated encoding, it
+        // cannot be ruled out and must remain fail-closed.
+        let suspicious = vec![0x1d09_4aa6, movz(8, 93, 0), SVC_0];
         let elf = elf_with_code(&suspicious);
         assert!(
             matches!(
@@ -3803,6 +7713,308 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_scan_reports_the_exact_allocated_x18_word() {
+        let word = mov_reg(0, 18);
+        let bytes = word.to_le_bytes();
+        assert_eq!(
+            dynamic_page_names_virtual_state(&bytes, 0x6000_0000),
+            Err("dynamic word 0xaa1203e0 at 0x60000000 names x18".to_string())
+        );
+    }
+
+    #[test]
+    fn dynamic_scan_reports_the_exact_tpidr_word() {
+        let word = mrs_tpidr_el0_word(9);
+        let bytes = word.to_le_bytes();
+        assert_eq!(
+            dynamic_page_names_virtual_state(&bytes, 0x6000_1000),
+            Err("dynamic word 0xd53bd049 at 0x60001000 accesses tpidr_el0".to_string())
+        );
+    }
+
+    #[test]
+    fn dynamic_scan_accepts_source_proven_unallocated_embedded_data() {
+        for embedded_word in [
+            // SVE Partition Break with op1 != x000.
+            0x259d_4ad1_u32,
+            // Top-level load/store op0=0x00, op1=0, op2=10x0... .
+            0x4908_4831_u32,
+            // Top-level reserved major group; bits 14:10 happen to read 18.
+            0x4000_4be1_u32,
+            // SVE vector shift with L=1,U=0, an unallocated opcode pair;
+            // bits 14:10 happen to read 1 and 18 appears in another raw field.
+            0x04d2_84c9_u32,
+            // SVE predicated integer min/max/difference with opc=11. The
+            // allocated 00/01/10 neighbors name vector Z18 in bits 9:5;
+            // opc=11 is unallocated and therefore cannot access guest x18.
+            0x044e_0249_u32,
+            // Parent Advanced-SIMD table: op0=0xx0, op1=0x, op2=x0xx,
+            // op3=xxx1xxxx0 is unallocated; Rn happens to read 18.
+            0x0e06_d259_u32,
+            // SVE predicated wide-immediate selector 10 is unallocated;
+            // Rn-shaped bits happen to read 18.
+            0x05d3_aa51_u32,
+            // Tier-D Node/V8 dynamic pages observed these decoder failures.
+            // Each carries raw field 18 in embedded data; architecture-table
+            // proofs for the exact unallocated families are required before
+            // the execute transition may accept them.
+            0x4a90_d651_u32,
+            0x4970_d651_u32,
+            0x0413_aa51_u32,
+            0x0432_88b1_u32,
+            // 32-bit ADD/SUB shifted register with imm6<5>=1: a shift of
+            // 32..63 is unallocated; Rn happens to read 18.
+            0x0b9e_d259_u32,
+        ] {
+            let embedded_data = embedded_word.to_le_bytes();
+            // SAFETY: `embedded_data` is a live, aligned-enough readable
+            // buffer and the verifier only performs one unaligned read.
+            let safe = unsafe {
+                carrick_native_direct_dynamic_page_safe(embedded_data.as_ptr(), embedded_data.len())
+            };
+            assert_eq!(
+                safe, 1,
+                "architecturally unallocated data {embedded_word:#010x} cannot access x18"
+            );
+            assert_eq!(
+                dynamic_page_names_virtual_state(&embedded_data, 0x6000_0000),
+                Ok(false),
+                "the parked Rust verifier must share the signal-safe proof"
+            );
+        }
+    }
+
+    #[test]
+    fn sve_partition_break_unallocated_proof_is_mask_exact() {
+        assert!(word_is_unallocated_sve_partition_break(0x259d_4ad1));
+        assert!(word_is_proven_unallocated(0x259d_4ad1));
+        assert!(
+            !word_is_unallocated_sve_partition_break(0x2598_4ad1),
+            "op1=1000 is an allocated-or-separately-classified neighbor"
+        );
+        assert!(
+            !word_is_unallocated_sve_partition_break(0x249d_4ad1),
+            "leaving the exact SVE Partition Break family must fail the proof"
+        );
+    }
+
+    #[test]
+    fn sve_pred_minmaxdiff_unallocated_proof_is_mask_exact() {
+        assert!(word_is_unallocated_sve_pred_minmaxdiff(0x044e_0249));
+        assert!(word_is_proven_unallocated(0x044e_0249));
+        assert!(
+            word_is_unallocated_sve_pred_minmaxdiff(0x044f_0249),
+            "the U bit does not allocate opc=11"
+        );
+        for (word, description) in [
+            (0x0448_0249, "allocated SMAX neighbor"),
+            (0x044a_0249, "allocated SMIN neighbor"),
+            (0x044c_0249, "allocated SABD neighbor"),
+        ] {
+            assert!(
+                !word_is_unallocated_sve_pred_minmaxdiff(word),
+                "{description}"
+            );
+            let allocated = bad64::decode(word, 0).unwrap_or_else(|_| panic!("{description}"));
+            assert!(
+                !instruction_names_x18(&allocated),
+                "the neighbor names vector Z18, not guest GPR x18: {description}"
+            );
+        }
+        assert!(
+            !word_is_unallocated_sve_pred_minmaxdiff(0x054e_0249),
+            "leaving the exact SVE class must fail the proof"
+        );
+    }
+
+    #[test]
+    fn load_store_root_unallocated_proof_is_mask_exact() {
+        assert!(word_is_unallocated_load_store_root(0x4908_4831));
+        assert!(word_is_proven_unallocated(0x4908_4831));
+        assert!(
+            !word_is_unallocated_load_store_root(0x0820_7c82),
+            "the allocated CASP encoding must remain outside the proof"
+        );
+        let allocated = bad64::decode(0x0820_7c82, 0).expect("allocated CASP neighbor");
+        assert!(
+            !instruction_names_x18(&allocated),
+            "the CASP control proves this mask does not swallow its GPR fields"
+        );
+        assert!(
+            !word_is_unallocated_load_store_root(0xffff_fff2),
+            "unrelated decoder failures remain fail-closed"
+        );
+    }
+
+    #[test]
+    fn sve_vector_shift_unallocated_lu_proof_is_mask_exact() {
+        assert!(
+            word_is_proven_unallocated(0x04d2_84c9),
+            "SVE vector shift L=1,U=0 is architecturally unallocated"
+        );
+        assert!(
+            word_is_proven_unallocated(0x04d6_84c9),
+            "R does not allocate the L=1,U=0 opcode pair"
+        );
+        for (word, description) in [
+            (0x04d0_84c9, "allocated ASR vector neighbor"),
+            (0x04d1_84c9, "allocated LSR vector neighbor"),
+            (0x04d3_84c9, "allocated LSL vector neighbor"),
+        ] {
+            assert!(!word_is_proven_unallocated(word), "{description}");
+            bad64::decode(word, 0).unwrap_or_else(|_| panic!("{description}"));
+        }
+        assert!(
+            !word_is_proven_unallocated(0xffff_fff2),
+            "unrelated decoder failures remain fail-closed"
+        );
+    }
+
+    #[test]
+    fn sve_unpred_wide_shift_unallocated_opcode_proof_is_mask_exact() {
+        for (word, description) in [
+            (0x0432_80b1, "allocated ASR wide-element neighbor"),
+            (0x0432_84b1, "allocated LSR wide-element neighbor"),
+            (0x0432_8cb1, "allocated LSL wide-element neighbor"),
+        ] {
+            assert!(
+                !word_is_unallocated_sve_unpred_wide_shift(word),
+                "{description}"
+            );
+            assert!(!word_is_proven_unallocated(word), "{description}");
+            bad64::decode(word, 0).unwrap_or_else(|_| panic!("{description}"));
+        }
+        assert!(
+            word_is_unallocated_sve_unpred_wide_shift(0x0432_88b1),
+            "the exact helper must recognize the source-proven class"
+        );
+        assert!(
+            word_is_proven_unallocated(0x0432_88b1),
+            "SVE unpredicated wide-element shift opcode 10 is architecturally unallocated"
+        );
+    }
+
+    #[test]
+    fn sve_wide_immediate_unallocated_selector_proof_is_mask_exact() {
+        assert!(word_is_unallocated_sve_wide_immediate(0x05d3_aa51));
+        assert!(word_is_proven_unallocated(0x05d3_aa51));
+        for (word, description) in [
+            (0x05d3_2a51, "allocated CPY /Z neighbor"),
+            (0x05d3_6a51, "allocated CPY /M neighbor"),
+            (0x05d3_ca51, "allocated FCPY neighbor"),
+        ] {
+            assert!(
+                !word_is_unallocated_sve_wide_immediate(word),
+                "{description}"
+            );
+            assert!(!word_is_proven_unallocated(word), "{description}");
+        }
+        assert!(
+            !word_is_unallocated_sve_wide_immediate(0x04d3_aa51),
+            "leaving the exact SVE wide-immediate family must fail the proof"
+        );
+    }
+
+    #[test]
+    fn add_sub_shifted_32_unallocated_shift_proof_is_mask_exact() {
+        assert!(word_is_unallocated_add_sub_shifted_32(0x0b9e_d259));
+        assert!(word_is_proven_unallocated(0x0b9e_d259));
+        for (word, description) in [
+            (0x0b9e_5259, "allocated 32-bit shifted-register neighbor"),
+            (0x8b9e_d259, "allocated 64-bit shifted-register neighbor"),
+        ] {
+            assert!(
+                !word_is_unallocated_add_sub_shifted_32(word),
+                "{description}"
+            );
+            assert!(!word_is_proven_unallocated(word), "{description}");
+            bad64::decode(word, 0).unwrap_or_else(|_| panic!("{description}"));
+        }
+        assert!(
+            !word_is_proven_unallocated(0xffff_fff2),
+            "unrelated decoder failures remain fail-closed"
+        );
+    }
+
+    #[test]
+    fn logical_shifted_32_unallocated_shift_proof_is_mask_exact() {
+        assert!(word_is_unallocated_logical_shifted_32(0x4a90_d651));
+        assert!(word_is_proven_unallocated(0x4a90_d651));
+        for (word, description) in [
+            (0x4a90_5651, "allocated 32-bit EOR neighbor"),
+            (0xca90_d651, "allocated 64-bit EOR neighbor"),
+        ] {
+            assert!(
+                !word_is_unallocated_logical_shifted_32(word),
+                "{description}"
+            );
+            assert!(!word_is_proven_unallocated(word), "{description}");
+            let allocated = bad64::decode(word, 0).unwrap_or_else(|_| panic!("{description}"));
+            assert!(
+                instruction_names_x18(&allocated),
+                "the allocated neighbor names guest x18: {description}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_store_x100_unallocated_proof_is_mask_exact() {
+        assert!(word_is_unallocated_load_store_x100(0x4970_d651));
+        assert!(word_is_proven_unallocated(0x4970_d651));
+
+        let allocated_word = 0x6970_d651;
+        assert!(
+            !word_is_unallocated_load_store_x100(allocated_word),
+            "the one-bit LDPSW neighbor must remain allocated"
+        );
+        assert!(!word_is_proven_unallocated(allocated_word));
+        let allocated = bad64::decode(allocated_word, 0).expect("allocated LDPSW neighbor");
+        assert!(
+            instruction_names_x18(&allocated),
+            "the allocated neighbor uses guest x18 as its base"
+        );
+    }
+
+    #[test]
+    fn sve_uxth_small_destination_proof_is_mask_exact() {
+        for word in [0x0413_aa51, 0x0453_aa51, 0x0403_aa51] {
+            assert!(word_is_unallocated_sve_uxth_small_dest(word));
+            assert!(word_is_proven_unallocated(word));
+        }
+
+        let allocated_word = 0x0493_aa51;
+        assert!(
+            !word_is_unallocated_sve_uxth_small_dest(allocated_word),
+            "size=10 allocates UXTH with a 32-bit destination element"
+        );
+        assert!(!word_is_proven_unallocated(allocated_word));
+        let allocated = bad64::decode(allocated_word, 0).expect("allocated UXTH neighbor");
+        assert!(
+            !instruction_names_x18(&allocated),
+            "Z18 is a vector operand, not guest GPR x18"
+        );
+    }
+
+    #[test]
+    fn advanced_simd_parent_unallocated_partition_proof_is_mask_exact() {
+        assert!(
+            word_is_proven_unallocated(0x0e06_d259),
+            "the parent Advanced-SIMD partition is architecturally unallocated"
+        );
+        for (word, description) in [
+            (0x0e26_0259, "allocated SADDL three-different neighbor"),
+            (0x0e06_5259, "allocated TBL table-lookup neighbor"),
+        ] {
+            assert!(!word_is_proven_unallocated(word), "{description}");
+            bad64::decode(word, 0).unwrap_or_else(|_| panic!("{description}"));
+        }
+        assert!(
+            !word_is_proven_unallocated(0xffff_fff2),
+            "unrelated decoder failures remain fail-closed"
+        );
+    }
+
+    #[test]
     fn top_level_unallocated_op1_proof_is_mask_exact() {
         assert!(word_is_proven_unallocated(0x0278_3a40));
         assert!(
@@ -3853,6 +8065,53 @@ mod tests {
         assert!(
             !word_is_proven_x18_free_decoder_failure(0xffff_fff2),
             "unrelated decoder failures remain fail-closed"
+        );
+    }
+
+    #[test]
+    fn spec_unallocated_dynamic_words_cannot_name_x18() {
+        // Both words occurred inside exact V8 __clear_cache publications.
+        // Their bits 14:10 happen to equal 18, but the spec-generated A64
+        // decoder classifies the complete words as architecturally
+        // unallocated, not as allocated instructions with unknown operands.
+        for word in [0x0eb0_4911, 0x0570_4831] {
+            let error = bad64::decode(word, 0).expect_err("word is unallocated");
+            assert!(
+                matches!(error, bad64::DecodeError::Unallocated(_)),
+                "exact decode status for {word:#010x}: {error:?}"
+            );
+            assert!(decoder_failure_proves_x18_free(word, &error));
+        }
+        let undefined = bad64::decode(0x0580_4be1, 0).expect_err("word is undefined");
+        assert!(matches!(undefined, bad64::DecodeError::Undefined(_)));
+        assert!(decoder_failure_proves_x18_free(0x0580_4be1, &undefined));
+        let unmatched = bad64::DecodeError::Unmatched(0);
+        assert!(
+            !decoder_failure_proves_x18_free(0xffff_fff2, &unmatched),
+            "an allocated/unknown decoder gap must remain fail-closed"
+        );
+    }
+
+    #[test]
+    fn ldapur_fpsimd_formatter_gap_only_names_rn_as_a_gpr() {
+        // V8 emitted this allocated FEAT_LRCPC3 instruction inside an exact
+        // cache publication. bad64 identifies LDAPUR_H_LDAPSTL_SIMD but does
+        // not yet format its operands, so the generic raw-field screen sees
+        // the otherwise-unused Rt2 position as x18.
+        let x17_base = 0x5d45_ca31;
+        let error = bad64::decode(x17_base, 0).expect_err("formatter gap");
+        assert!(matches!(error, bad64::DecodeError::ErrorOperands(_)));
+        assert!(
+            decoder_failure_proves_x18_free(x17_base, &error),
+            "LDAPUR H17, [x17, #92] cannot name x18"
+        );
+
+        let x18_base = (x17_base & !(0x1f << 5)) | (18 << 5);
+        let error = bad64::decode(x18_base, 0).expect_err("formatter gap");
+        assert!(matches!(error, bad64::DecodeError::ErrorOperands(_)));
+        assert!(
+            !decoder_failure_proves_x18_free(x18_base, &error),
+            "the same allocated family with Rn=x18 must remain fail-closed"
         );
     }
 
@@ -4797,7 +9056,7 @@ mod tests {
     /// named — never a best-effort mapping.
     #[test]
     fn exec_window_scan_fails_closed_on_a_word_that_could_name_x18() {
-        let file = elf_with_code(&[0xffff_fff2, movz(8, 93, 0), SVC_0]);
+        let file = elf_with_code(&[0x1d09_4aa6, movz(8, 93, 0), SVC_0]);
         let group = DirectLoadGroup::load(&fixture_elf(), record_only)
             .expect("load main")
             .expect("eligible");

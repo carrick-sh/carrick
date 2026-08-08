@@ -89,6 +89,51 @@ fn detached_stable_scratch() -> Option<PathBuf> {
     Some(scratch)
 }
 
+#[derive(Debug)]
+enum HostRootLayout {
+    /// Historical path: the writable host root contains the complete image.
+    Materialized,
+    /// Sparse writable upper paired with the shared immutable cache lower.
+    CachedLower(RootFs),
+}
+
+fn prepare_host_root(
+    host: &mut HostFsBackend,
+    layer_paths: &[PathBuf],
+    existing_overlay: bool,
+    use_cached_lower: bool,
+    cache_root: &std::path::Path,
+) -> std::io::Result<HostRootLayout> {
+    if use_cached_lower
+        && let Some(entry) = crate::layer_cache::acquire_immutable_entry(layer_paths, cache_root)?
+    {
+        if !existing_overlay {
+            host.enable_sparse_upper_fast_miss();
+        }
+        return RootFs::from_immutable_host_dir(&entry)
+            .map(HostRootLayout::CachedLower)
+            .map_err(|error| std::io::Error::other(error.to_string()));
+    }
+    if !existing_overlay {
+        host.extract_layers(layer_paths)?;
+    }
+    Ok(HostRootLayout::Materialized)
+}
+
+fn cached_lower_enabled(execution_plan: &crate::page_profile::ExecutionPlan) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        execution_plan.backend == crate::page_profile::ExecutionBackend::Native
+            && std::env::var_os("CARRICK_FS_CACHED_LOWER").as_deref()
+                != Some(std::ffi::OsStr::new("0"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = execution_plan;
+        false
+    }
+}
+
 /// For an `amd64` (Rosetta-translated) container, expose the host's Rosetta
 /// runtime files inside the guest VFS at the same paths. Rosetta opens these at
 /// startup to load its support libraries and (optionally) its AOT translation
@@ -253,19 +298,34 @@ impl Runtime {
                     .map(|p| PathBuf::from(p.as_std_path()))
                     .collect();
 
-                // `exec` reuses the container's overlay, which already holds the
-                // extracted rootfs — re-extracting would clobber the container's
-                // runtime writes. Only a fresh run extracts.
-                if exec_overlay.is_none() {
-                    host.extract_layers(&layer_paths).map_err(|e| {
-                        RuntimeError::FsBackend(anyhow::anyhow!(
-                            "failed to stream OCI layers: {}",
-                            e
-                        ))
-                    })?;
-                }
+                // Darwin native runs bind the once-extracted digest-keyed cache
+                // directly as an immutable lower and leave this run's host root
+                // sparse. The exact `=0` hatch keeps the previous full-root
+                // extraction/clone path. `exec` never re-extracts its attached
+                // upper; with the cached layout it reacquires the same lower
+                // from the image's ordered layer stack.
+                let cache_root = crate::fs_backend::default_scratch_root().map_err(|error| {
+                    RuntimeError::FsBackend(anyhow::anyhow!(
+                        "failed to locate rootfs cache directory: {error}"
+                    ))
+                })?;
+                let root_layout = prepare_host_root(
+                    &mut host,
+                    &layer_paths,
+                    exec_overlay.is_some(),
+                    cached_lower_enabled(&execution_plan),
+                    &cache_root,
+                )
+                .map_err(|error| {
+                    RuntimeError::FsBackend(anyhow::anyhow!(
+                        "failed to prepare OCI rootfs: {error}"
+                    ))
+                })?;
 
                 let mut dispatcher = SyscallDispatcher::with_network(runtime_network.clone());
+                if let HostRootLayout::CachedLower(rootfs) = root_layout {
+                    dispatcher.set_rootfs_layer(rootfs);
+                }
                 dispatcher.set_page_geometry(execution_plan.page_geometry);
                 dispatcher.set_execution_backend(execution_plan.backend);
                 let guest_hostname = effective_guest_hostname(spec);
@@ -290,7 +350,7 @@ impl Runtime {
                 })?;
                 seed_guest_baseline(
                     &mut host,
-                    None,
+                    dispatcher.rootfs(),
                     &spec.network,
                     &hosts_entries,
                     &spec.extra_hosts,
@@ -753,7 +813,7 @@ fn setup_interactive_stdio(
 mod exit_code_tests {
     use super::{Runtime, is_entrypoint_not_executable, is_entrypoint_not_found};
     use crate::elf::ElfInspectError;
-    use crate::fs_backend::{FsBackend, MemoryBackend};
+    use crate::fs_backend::{FsBackend, HostFsBackend, MemoryBackend};
     use crate::memory::AddressSpaceError;
     use crate::runtime::RuntimeError;
     use camino::Utf8PathBuf;
@@ -795,6 +855,92 @@ mod exit_code_tests {
             gid: 0,
             seccomp_policy: carrick_spec::SeccompPolicy::ContainerDefault,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_host_root_test_layer(path: &std::path::Path) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut tar = tar::Builder::new(file);
+        let mut dir = tar::Header::new_gnu();
+        dir.set_entry_type(tar::EntryType::Directory);
+        dir.set_mode(0o755);
+        dir.set_size(0);
+        dir.set_cksum();
+        tar.append_data(&mut dir, "etc/", std::io::empty()).unwrap();
+        let body = b"cached-lower\n";
+        let mut file = tar::Header::new_gnu();
+        file.set_mode(0o644);
+        file.set_size(body.len() as u64);
+        file.set_cksum();
+        tar.append_data(&mut file, "etc/motd", &body[..]).unwrap();
+        tar.finish().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cached_lower_setup_leaves_the_per_run_upper_sparse() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let upper_root = temp.path().join("uppers");
+        let cache_root = temp.path().join("cache-root");
+        std::fs::create_dir(&upper_root).unwrap();
+        std::fs::create_dir(&cache_root).unwrap();
+        let layer = temp.path().join("sha256-layer");
+        write_host_root_test_layer(&layer);
+        let mut host = HostFsBackend::new_in(&upper_root).unwrap();
+
+        let layout =
+            super::prepare_host_root(&mut host, &[layer], false, true, &cache_root).unwrap();
+        let super::HostRootLayout::CachedLower(rootfs) = layout else {
+            panic!("default setup should select an immutable cached lower");
+        };
+        assert_eq!(rootfs.read("/etc/motd").unwrap(), b"cached-lower\n");
+        assert!(
+            host.file_contents("/etc/motd").is_none(),
+            "the per-run upper must not contain a cloned image namespace"
+        );
+        assert!(
+            host.fast_nofollow_absent("/etc/motd"),
+            "a newly-created sparse upper must authorize the one-lookup miss path"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cached_lower_existing_overlay_stays_conservative() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let upper_root = temp.path().join("uppers");
+        let cache_root = temp.path().join("cache-root");
+        std::fs::create_dir(&upper_root).unwrap();
+        std::fs::create_dir(&cache_root).unwrap();
+        let layer = temp.path().join("sha256-layer");
+        write_host_root_test_layer(&layer);
+        let mut host = HostFsBackend::new_in(&upper_root).unwrap();
+
+        let layout =
+            super::prepare_host_root(&mut host, &[layer], true, true, &cache_root).unwrap();
+        assert!(matches!(layout, super::HostRootLayout::CachedLower(_)));
+        assert!(
+            !host.fast_nofollow_absent("/etc/motd"),
+            "an attached or previously-used upper must never infer sparse authority"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cached_lower_hatch_preserves_materialized_root_setup() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let upper_root = temp.path().join("uppers");
+        let cache_root = temp.path().join("cache-root");
+        std::fs::create_dir(&upper_root).unwrap();
+        std::fs::create_dir(&cache_root).unwrap();
+        let layer = temp.path().join("sha256-layer");
+        write_host_root_test_layer(&layer);
+        let mut host = HostFsBackend::new_in(&upper_root).unwrap();
+
+        let layout =
+            super::prepare_host_root(&mut host, &[layer], false, false, &cache_root).unwrap();
+        assert!(matches!(layout, super::HostRootLayout::Materialized));
+        assert_eq!(host.file_contents("/etc/motd").unwrap(), b"cached-lower\n");
     }
 
     #[test]

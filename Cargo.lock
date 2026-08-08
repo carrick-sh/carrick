@@ -645,6 +645,7 @@ dependencies = [
  "carrick-dsr",
  "carrick-dsr-aarch64",
  "carrick-guest-mem",
+ "carrick-observability",
  "cc",
  "getrandom 0.3.4",
  "libc",

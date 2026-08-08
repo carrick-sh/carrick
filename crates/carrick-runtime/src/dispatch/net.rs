@@ -2102,9 +2102,9 @@ impl SyscallDispatcher {
         }
         DispatchOutcome::WaitOnPollFds {
             // Synthetic netlink sockets have no host fd to poll. A negative
-            // pollfd is ignored by poll(2), but keeps WaitOnPollFds in its
-            // internal "ready to re-sample" mode instead of completing the guest
-            // syscall with a timeout value.
+            // pollfd is ignored by poll(2); enqueue_netlink_message publishes
+            // queue state before waking the registered dispatcher-aware waiter,
+            // which then re-samples this queue without a periodic timer.
             fds: WaitFds::raw_one(-1, 0),
             timeout: None,
             on_timeout: 0,
@@ -2127,6 +2127,10 @@ impl SyscallDispatcher {
         recv_queue.extend(bytes);
         drop(open);
         self.notify_inmem_epoll();
+        // A thread may be blocked in recvfrom() directly rather than through
+        // an epoll instance. The queue mutation above is durable; wake the
+        // dispatcher-aware private waiter so it re-samples the synthetic fd.
+        crate::host_signal::wake_all_waiters();
         Ok(())
     }
 

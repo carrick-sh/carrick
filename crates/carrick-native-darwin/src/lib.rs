@@ -31,6 +31,67 @@ pub mod jit;
 pub use jit::DarwinHostJit;
 pub use jit::active_host_jit;
 
+#[cfg(test)]
+pub(crate) mod test_allocations {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    pub(crate) struct CountingSystem;
+
+    std::thread_local! {
+        static ENABLED: Cell<bool> = const { Cell::new(false) };
+        static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn record_allocation() {
+        ENABLED.with(|enabled| {
+            if enabled.get() {
+                ALLOCATIONS.with(|count| count.set(count.get() + 1));
+            }
+        });
+    }
+
+    unsafe impl GlobalAlloc for CountingSystem {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            record_allocation();
+            // SAFETY: this allocator is a counting wrapper over System and
+            // forwards the caller's unchanged layout.
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            record_allocation();
+            // SAFETY: same forwarding contract as `alloc`.
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: `ptr` came from this wrapper's System allocation with
+            // the same layout.
+            unsafe { System.dealloc(ptr, layout) };
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            record_allocation();
+            // SAFETY: `ptr` and `layout` came from System; `new_size` is the
+            // caller's requested replacement extent.
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static TEST_ALLOCATOR: CountingSystem = CountingSystem;
+
+    pub(crate) fn count_current_thread<T>(work: impl FnOnce() -> T) -> (T, usize) {
+        ALLOCATIONS.with(|count| count.set(0));
+        ENABLED.with(|enabled| enabled.set(true));
+        let result = work();
+        ENABLED.with(|enabled| enabled.set(false));
+        let count = ALLOCATIONS.with(Cell::get);
+        (result, count)
+    }
+}
+
 /// The Darwin half of a native lane (`carrick_dsr::lane::NativeHost`):
 /// hands the lane wiring this crate's JIT authority.
 pub struct DarwinHost;

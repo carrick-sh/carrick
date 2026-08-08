@@ -49,7 +49,7 @@ use carrick_guest_mem::{GuestMemory, MemoryError};
 use carrick_hal::{Reg, RegAccess, SysReg, SyscallTrap, TrapError};
 use carrick_native_darwin::direct::{
     DirectLoadGroup, DirectThreadSlots, GuestContext, InstalledThreadSlots,
-    current_thread_slots_ptr,
+    current_thread_slots_ptr, install_dynamic_publication_handler,
 };
 
 use crate::compat::{CompatEvent, CompatReporter, SyscallArgs};
@@ -76,6 +76,17 @@ fn read_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
 fn write_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
     lock.write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Exact control arm for the Tier-D pristine-discard optimization. Default
+/// on; `0` restores the prior unconditional zero + i-cache publication for a
+/// same-binary performance comparison.
+fn pristine_dynamic_exec_discard_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("CARRICK_TIER_D_PRISTINE_DISCARD").as_deref()
+            != Some(std::ffi::OsStr::new("0"))
+    })
 }
 
 /// Apple Silicon's host page size. On the identity tier this IS the guest's
@@ -319,6 +330,10 @@ pub enum DirectRunOutcome {
     Signaled {
         signum: i32,
     },
+    /// A fully prepared eligible Tier-D image is waiting outside the guest
+    /// boundary. The driver drops the outgoing group/stack, commits exec
+    /// process state, then enters this replacement without a host execve.
+    ExecReplacement,
     /// The dispatcher produced an outcome tier D does not implement yet
     /// (fd waits, fork, execve, signal delivery). Named rather than
     /// approximated: the guest LEAVES through the island's leave leg with its
@@ -398,6 +413,39 @@ struct AnonRwRange {
     end: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityMadviseRange {
+    PlainAnonRw,
+    PlainAnonNone,
+    PlainAnonMixed,
+    DynamicExec,
+}
+
+/// Whether `[lo, hi)` is completely covered by the union of the supplied
+/// private-anonymous provenance spans. Protection splits may make adjacent
+/// pieces separate entries; overlap and adjacency both close the cursor.
+fn anon_range_union_covers(rw: &[AnonRwRange], none: &[AnonRwRange], lo: u64, hi: u64) -> bool {
+    if lo >= hi {
+        return false;
+    }
+    let mut spans: Vec<_> = rw.iter().chain(none).copied().collect();
+    spans.sort_unstable_by_key(|span| span.base);
+    let mut cursor = lo;
+    for span in spans {
+        if span.end <= cursor || hi <= span.base {
+            continue;
+        }
+        if cursor < span.base {
+            return false;
+        }
+        cursor = cursor.max(span.end);
+        if hi <= cursor {
+            return true;
+        }
+    }
+    false
+}
+
 /// Remove `[lo, hi)` from the tracked ranges, splitting an entry that
 /// straddles it.
 fn subtract_anon_range(table: &mut Vec<AnonRwRange>, lo: u64, hi: u64) {
@@ -440,7 +488,7 @@ pub struct DirectRunner {
     dispatcher: SyscallDispatcher,
     /// One process-lifetime reporter, matching the shared dispatcher path.
     /// Identity-memory syscalls bypass `dispatch_threaded`, so the runner
-    /// brackets those five calls itself; otherwise Tier-D mmap/mprotect work
+    /// brackets those six calls itself; otherwise Tier-D mmap/mprotect work
     /// is invisible to the standard syscall probes and counters.
     reporter: CompatReporter,
     memory: IdentityMemory,
@@ -456,6 +504,18 @@ pub struct DirectRunner {
     /// Plain anonymous private RW mappings this runner created — the only
     /// ranges `mremap` is provably safe to service (see [`AnonRwRange`]).
     anon_rw: Mutex<Vec<AnonRwRange>>,
+    /// Untouched private anonymous PROT_NONE reservations. A Linux RWX
+    /// promotion is lowered to MAP_JIT only inside this provenance class:
+    /// replacing it preserves bytes because every page is provably zero and
+    /// inaccessible since creation.
+    anon_none: Mutex<Vec<AnonRwRange>>,
+    /// Every ordinary host mapping created on behalf of this identity guest,
+    /// independent of its current protection/provenance.  A real host
+    /// `execve` used to retire these implicitly; an in-process exec must own
+    /// the complete catalog so it can unmap the outgoing address space before
+    /// entering the replacement image.  Load-group images/windows and the
+    /// initial stack have their own RAII owners and are deliberately absent.
+    owned_mappings: Mutex<Vec<AnonRwRange>>,
     /// One guest thread = one host thread; tids come from here (main tid =
     /// host pid, exactly the native lane's convention). Behind an `RwLock`
     /// solely so a FORK CHILD can replace it with a fresh registry keyed to
@@ -480,6 +540,12 @@ pub struct DirectRunner {
     /// that executable is the carrick CLI — a test binary would re-enter its
     /// own harness — so without services an execve LEAVES named, as before.
     exec: Option<DirectExecServices>,
+    /// Fully prepared incoming image for an `ExecReplacement` outcome.
+    exec_replacement: Mutex<Option<DirectExecReplacement>>,
+    /// Child-side write end of the private vfork completion pipe.  Host
+    /// execve formerly closed this through FD_CLOEXEC; in-process exec closes
+    /// it explicitly at the commit point so the parent cannot resume early.
+    vfork_completion_fd: Mutex<Option<i32>>,
     /// True in a host process created by THIS runner servicing a guest
     /// `fork(2)`: the run loop above `with_runner` must `_exit` with the
     /// child's outcome instead of continuing the caller's control flow
@@ -496,11 +562,24 @@ pub(crate) struct DirectExecServices {
     pub(crate) max_traps: usize,
 }
 
+/// A replacement Tier-D image whose complete fallible preparation happened
+/// while the outgoing guest was still intact.  Once stored on the runner,
+/// leaving the syscall island is the exec point of no return; the driver can
+/// commit without parsing, allocating, or scanning any new executable bytes.
+pub(crate) struct DirectExecReplacement {
+    pub(crate) group: DirectLoadGroup,
+    pub(crate) stack: DirectStack,
+    pub(crate) resolved: String,
+    pub(crate) argv: Vec<Vec<u8>>,
+    pub(crate) env: Vec<Vec<u8>>,
+}
+
 impl Drop for DirectRunner {
     fn drop(&mut self) {
-        if let Some(brk) = lock(&self.brk).as_ref() {
-            // SAFETY: this runner owns the reservation.
-            unsafe { libc::munmap(brk.base as usize as *mut libc::c_void, IdentityBrk::RESERVE) };
+        self.retire_identity_memory();
+        if let Some(fd) = lock(&self.vfork_completion_fd).take() {
+            // SAFETY: the runner owns this raw child-side pipe fd.
+            unsafe { libc::close(fd) };
         }
     }
 }
@@ -534,11 +613,77 @@ impl DirectRunner {
             syscalls: AtomicU64::new(0),
             brk: Mutex::new(None),
             anon_rw: Mutex::new(Vec::new()),
+            anon_none: Mutex::new(Vec::new()),
+            owned_mappings: Mutex::new(Vec::new()),
             registry: RwLock::new(registry),
             futex,
             threads: Mutex::new(Vec::new()),
             exec: None,
+            exec_replacement: Mutex::new(None),
+            vfork_completion_fd: Mutex::new(None),
             forked_child: AtomicBool::new(false),
+        }
+    }
+
+    /// Record one ordinary guest mapping. MAP_FIXED replacement first
+    /// subtracts the target from the catalog so the owned spans stay
+    /// non-overlapping and exec teardown never reaches outside guest memory.
+    fn record_owned_mapping(&self, base: u64, length: u64) {
+        let end = base.saturating_add(length.next_multiple_of(HOST_PAGE_SIZE));
+        carrick_native_darwin::direct::reserve_exec_hints_past(end);
+        let mut mappings = lock(&self.owned_mappings);
+        subtract_anon_range(&mut mappings, base, end);
+        mappings.push(AnonRwRange { base, end });
+    }
+
+    fn forget_owned_mapping(&self, base: u64, length: u64) {
+        let end = base.saturating_add(length.next_multiple_of(HOST_PAGE_SIZE));
+        subtract_anon_range(&mut lock(&self.owned_mappings), base, end);
+    }
+
+    /// Retire all identity-memory state owned by the outgoing guest.  The
+    /// caller separately drops its `DirectLoadGroup` and `DirectStack`, whose
+    /// mappings are not part of this catalog.
+    fn retire_identity_memory(&self) {
+        for mapping in std::mem::take(&mut *lock(&self.owned_mappings)) {
+            // SAFETY: the catalog contains only successful guest mmap results.
+            unsafe {
+                libc::munmap(
+                    mapping.base as usize as *mut libc::c_void,
+                    (mapping.end - mapping.base) as usize,
+                );
+            }
+        }
+        if let Some(brk) = lock(&self.brk).take() {
+            // SAFETY: this runner owns the reservation.
+            unsafe { libc::munmap(brk.base as usize as *mut libc::c_void, IdentityBrk::RESERVE) };
+        }
+        lock(&self.anon_rw).clear();
+        lock(&self.anon_none).clear();
+    }
+
+    /// Remember the child-side vfork completion fd until exec commits (or
+    /// process exit/drop closes it).
+    fn hold_vfork_completion_fd(&self, fd: i32) {
+        let prior = lock(&self.vfork_completion_fd).replace(fd);
+        debug_assert!(prior.is_none(), "one live vfork completion per process");
+        if let Some(prior) = prior {
+            // SAFETY: defensive leak avoidance for a violated invariant.
+            unsafe { libc::close(prior) };
+        }
+    }
+
+    /// Commit the runner-owned half of an in-process exec replacement after
+    /// the new group and stack have been prepared and the old group/stack
+    /// have been dropped.  Closing the vfork completion fd is intentionally
+    /// last: that close publishes successful exec to the suspended parent.
+    pub(crate) fn commit_in_process_exec(&self) {
+        self.retire_identity_memory();
+        *lock(&self.outcome) = None;
+        self.exiting.store(false, Ordering::SeqCst);
+        if let Some(fd) = lock(&self.vfork_completion_fd).take() {
+            // SAFETY: the runner owns this child-side raw fd.
+            unsafe { libc::close(fd) };
         }
     }
 
@@ -549,6 +694,10 @@ impl DirectRunner {
 
     pub fn outcome(&self) -> Option<DirectRunOutcome> {
         lock(&self.outcome).clone()
+    }
+
+    pub(crate) fn take_exec_replacement(&self) -> Option<DirectExecReplacement> {
+        lock(&self.exec_replacement).take()
     }
     pub fn syscalls(&self) -> u64 {
         self.syscalls.load(Ordering::Relaxed)
@@ -564,6 +713,65 @@ impl DirectRunner {
     /// harness must check this explicitly or the child re-runs the harness.
     pub fn forked_guest_child(&self) -> bool {
         self.forked_child.load(Ordering::Acquire)
+    }
+
+    /// A guest process fork can originate on a guest clone-thread, hence on
+    /// a Rust-spawned host pthread rather than the host process's primordial
+    /// thread. In that child the closure below is the only surviving guest
+    /// thread. Returning from it would merely `pthread_exit`: process helper
+    /// threads (notably the Mach exception server) would keep the child and
+    /// all inherited pipe fds alive forever. Complete the Linux process-exit
+    /// handoff explicitly instead.
+    fn terminate_forked_child_from_guest_thread(&self) {
+        if !self.forked_guest_child() {
+            return;
+        }
+        // The forking guest thread can retire before another guest thread in
+        // the child (CPython's join-on-shutdown case). No process outcome then
+        // exists yet; that sibling must keep running and will perform this
+        // handoff when it becomes the last/terminal thread.
+        let Some(outcome) = self.outcome() else {
+            return;
+        };
+        self.dispatcher.cleanup_sysv_ipc_on_process_exit();
+        match outcome {
+            DirectRunOutcome::Exited { code } => {
+                crate::native_darwin::native_tier_census("fork-child-exit", "", &code.to_string());
+                crate::exec_helpers::forked_child_exit(
+                    code,
+                    self.dispatcher.stdout(),
+                    self.dispatcher.stderr(),
+                )
+            }
+            DirectRunOutcome::Signaled { signum } => {
+                crate::native_darwin::native_tier_census(
+                    "fork-child-signal",
+                    "",
+                    &signum.to_string(),
+                );
+                crate::exec_helpers::forked_child_die_by_signal(
+                    signum,
+                    self.dispatcher.stdout(),
+                    self.dispatcher.stderr(),
+                )
+            }
+            // The outer direct driver owns the replacement commit. Returning
+            // from this guest thread lets `with_runner` join it and hand the
+            // prepared image to that driver; it is not a process exit.
+            DirectRunOutcome::ExecReplacement => {}
+            DirectRunOutcome::Unsupported { syscall, outcome } => {
+                crate::native_darwin::native_tier_census(
+                    "fork-child-unsupported",
+                    "",
+                    &format!("syscall={syscall} {outcome}"),
+                );
+                crate::exec_helpers::forked_child_exit(
+                    125,
+                    self.dispatcher.stdout(),
+                    self.dispatcher.stderr(),
+                )
+            }
+        }
     }
 
     /// The registry key of the guest thread running on THIS host thread
@@ -587,6 +795,21 @@ impl DirectRunner {
     fn end_process(&self, outcome: DirectRunOutcome) {
         let mut slot = lock(&self.outcome);
         if slot.is_none() {
+            if let DirectRunOutcome::Unsupported { syscall, outcome } = &outcome {
+                crate::probes::native_tierd_unsupported(*syscall, outcome);
+                // A non-main guest thread can be the first to hit the
+                // fail-closed boundary. Its thread-retirement path exits the
+                // host process with 125 before the outer driver regains
+                // control, so the driver's `direct-leave` census below never
+                // runs. Persist the same terminal fact here while the exact
+                // first-wins outcome is still known; this remains zero-cost
+                // unless the caller explicitly sets CARRICK_TIER_CENSUS.
+                crate::native_darwin::native_tier_census(
+                    "direct-unsupported",
+                    "",
+                    &format!("syscall={syscall} {outcome}"),
+                );
+            }
             *slot = Some(outcome);
         }
         drop(slot);
@@ -755,12 +978,14 @@ impl DirectRunner {
                 Some(if mapped == libc::MAP_FAILED {
                     host_errno_verdict()
                 } else {
+                    self.record_owned_mapping(mapped as u64, a1);
                     // A MAP_FIXED anon punch into a tier-D mapping (ld.so's
                     // bss tail over a window) voids patched coverage there.
                     if flags.contains(LinuxMmapFlags::FIXED)
                         && let Some(group) = active_group()
                     {
                         group.note_plain_replacement(mapped as u64, a1);
+                        group.forget_dynamic_exec(mapped as u64, a1);
                     }
                     // Track plain anonymous PRIVATE RW creations — the only
                     // ranges mremap can later be proven safe on. A FIXED
@@ -768,6 +993,8 @@ impl DirectRunner {
                     let end = (mapped as u64).saturating_add(a1.next_multiple_of(HOST_PAGE_SIZE));
                     let mut table = lock(&self.anon_rw);
                     subtract_anon_range(&mut table, mapped as u64, end);
+                    let mut none = lock(&self.anon_none);
+                    subtract_anon_range(&mut none, mapped as u64, end);
                     if !flags.contains(LinuxMmapFlags::SHARED)
                         && host_prot(prot) == (libc::PROT_READ | libc::PROT_WRITE)
                     {
@@ -775,8 +1002,16 @@ impl DirectRunner {
                             base: mapped as u64,
                             end,
                         });
+                    } else if !flags.contains(LinuxMmapFlags::SHARED)
+                        && host_prot(prot) == libc::PROT_NONE
+                    {
+                        none.push(AnonRwRange {
+                            base: mapped as u64,
+                            end,
+                        });
                     }
                     drop(table);
+                    drop(none);
                     ServiceVerdict::Resume(mapped as i64)
                 })
             }
@@ -786,12 +1021,19 @@ impl DirectRunner {
                 // whatever lands there later must not inherit coverage.
                 if let Some(group) = active_group() {
                     group.note_plain_replacement(a0, a1);
+                    group.forget_dynamic_exec(a0, a1);
                 }
                 // SAFETY: as above; the guest unmaps within its own space.
                 let rc = unsafe { libc::munmap(a0 as usize as *mut libc::c_void, a1 as usize) };
                 Some(if rc == 0 {
+                    self.forget_owned_mapping(a0, a1);
                     subtract_anon_range(
                         &mut lock(&self.anon_rw),
+                        a0,
+                        a0.saturating_add(a1.next_multiple_of(HOST_PAGE_SIZE)),
+                    );
+                    subtract_anon_range(
+                        &mut lock(&self.anon_none),
                         a0,
                         a0.saturating_add(a1.next_multiple_of(HOST_PAGE_SIZE)),
                     );
@@ -813,6 +1055,31 @@ impl DirectRunner {
                     if active_group().is_some_and(|group| group.covers_patched_executable(a0, a1)) {
                         return Some(ServiceVerdict::Resume(0));
                     }
+                    let end = a0.saturating_add(a1.next_multiple_of(HOST_PAGE_SIZE));
+                    let untouched_none = lock(&self.anon_none)
+                        .iter()
+                        .any(|range| range.base <= a0 && end <= range.end);
+                    if untouched_none
+                        && prot.contains(LinuxProtFlags::READ)
+                        && prot.contains(LinuxProtFlags::WRITE)
+                        && let Some(group) = active_group()
+                    {
+                        return Some(match group.map_dynamic_exec(a0, end - a0) {
+                            Ok(()) => {
+                                subtract_anon_range(&mut lock(&self.anon_none), a0, end);
+                                ServiceVerdict::Resume(0)
+                            }
+                            Err(error) => {
+                                self.end_process(DirectRunOutcome::Unsupported {
+                                    syscall: number,
+                                    outcome: format!(
+                                        "dynamic MAP_JIT publication failed for {a0:#x}..{end:#x}: {error}"
+                                    ),
+                                });
+                                ServiceVerdict::Leave
+                            }
+                        });
+                    }
                     return unsupported(
                         self,
                         &format!(
@@ -822,6 +1089,15 @@ impl DirectRunner {
                     );
                 }
                 let target = host_prot(prot);
+                let end = a0.saturating_add(a1.next_multiple_of(HOST_PAGE_SIZE));
+                // A pristine private-anon reservation promoted to ordinary
+                // RW stays provably private anonymous. Preserve that
+                // provenance across the protection split (Node worker stacks
+                // have exactly this guard+RW shape).
+                let promoted_from_none = target == (libc::PROT_READ | libc::PROT_WRITE)
+                    && lock(&self.anon_none)
+                        .iter()
+                        .any(|range| range.base <= a0 && end <= range.end);
                 // SAFETY: as above.
                 let rc = unsafe {
                     libc::mprotect(a0 as usize as *mut libc::c_void, a1 as usize, target)
@@ -855,11 +1131,11 @@ impl DirectRunner {
                 // mremap purposes: the proof "plain anonymous RW" no longer
                 // holds there.
                 if target != (libc::PROT_READ | libc::PROT_WRITE) {
-                    subtract_anon_range(
-                        &mut lock(&self.anon_rw),
-                        a0,
-                        a0.saturating_add(a1.next_multiple_of(HOST_PAGE_SIZE)),
-                    );
+                    subtract_anon_range(&mut lock(&self.anon_rw), a0, end);
+                }
+                subtract_anon_range(&mut lock(&self.anon_none), a0, end);
+                if promoted_from_none {
+                    lock(&self.anon_rw).push(AnonRwRange { base: a0, end });
                 }
                 Some(ServiceVerdict::Resume(0))
             }
@@ -867,7 +1143,264 @@ impl DirectRunner {
             214 => Some(self.service_identity_brk(a0)),
             // mremap(old, old_size, new_size, flags, new_addr)
             216 => Some(self.service_identity_mremap(a0, a1, a2, a3)),
+            // madvise(addr, len, advice)
+            233 => Some(self.service_identity_madvise(a0, a1, a2)),
             _ => None,
+        }
+    }
+
+    /// Linux `madvise(2)` over host-identity mappings, with provenance-specific
+    /// Darwin lowerings. The arena dispatcher's VMA ledger cannot see these
+    /// mappings, so sending them there false-ENOMEMs valid ranges (V8 aborts
+    /// on exactly that result).
+    ///
+    /// The two destructive hints deliberately do not share one host advice:
+    /// ordinary private-anon `MADV_DONTNEED` uses XNU `MADV_ZERO` (which zeroes
+    /// resident pages and drops compressed pages without faulting holes in),
+    /// followed by best-effort `MADV_FREE`. XNU refuses `MADV_ZERO` on JIT
+    /// entries, so dynamic MAP_JIT pages are zeroed explicitly while the guest
+    /// syscall thread is in JIT write mode, then returned to execute mode and
+    /// offered to XNU with V8's own reusable-memory hint.
+    fn service_identity_madvise(&self, address: u64, length: u64, advice: u64) -> ServiceVerdict {
+        use carrick_abi::{
+            LINUX_MADV_COLLAPSE, LINUX_MADV_DOFORK, LINUX_MADV_DONTFORK, LINUX_MADV_DONTNEED,
+            LINUX_MADV_FREE, LINUX_MADV_HUGEPAGE, LINUX_MADV_NOHUGEPAGE, LINUX_MADV_NORMAL,
+            LINUX_MADV_RANDOM, LINUX_MADV_SEQUENTIAL, LINUX_MADV_WILLNEED,
+        };
+
+        let einval =
+            || ServiceVerdict::Resume(crate::host_to_linux_errno(libc::EINVAL).guest_retval());
+        let enomem =
+            || ServiceVerdict::Resume(crate::host_to_linux_errno(libc::ENOMEM).guest_retval());
+        if !address.is_multiple_of(HOST_PAGE_SIZE)
+            || !matches!(
+                advice,
+                LINUX_MADV_NORMAL
+                    | LINUX_MADV_RANDOM
+                    | LINUX_MADV_SEQUENTIAL
+                    | LINUX_MADV_WILLNEED
+                    | LINUX_MADV_DONTNEED
+                    | LINUX_MADV_FREE
+                    | LINUX_MADV_DONTFORK
+                    | LINUX_MADV_DOFORK
+                    | LINUX_MADV_HUGEPAGE
+                    | LINUX_MADV_NOHUGEPAGE
+                    | LINUX_MADV_COLLAPSE
+            )
+        {
+            return einval();
+        }
+        if length == 0 {
+            return ServiceVerdict::Resume(0);
+        }
+        let Some(raw_end) = address.checked_add(length) else {
+            return enomem();
+        };
+        let Some(end) = raw_end
+            .checked_add(HOST_PAGE_SIZE - 1)
+            .map(|value| value & !(HOST_PAGE_SIZE - 1))
+        else {
+            return enomem();
+        };
+        let Ok(host_len) = usize::try_from(end - address) else {
+            return enomem();
+        };
+
+        let rw_ranges = lock(&self.anon_rw).clone();
+        let none_ranges = lock(&self.anon_none).clone();
+        let plain_rw = rw_ranges
+            .iter()
+            .any(|range| range.base <= address && end <= range.end);
+        let plain_none = !plain_rw
+            && none_ranges
+                .iter()
+                .any(|range| range.base <= address && end <= range.end);
+        let plain_mixed = !plain_rw
+            && !plain_none
+            && anon_range_union_covers(&rw_ranges, &none_ranges, address, end);
+        let dynamic = !plain_rw
+            && !plain_none
+            && !plain_mixed
+            && active_group()
+                .is_some_and(|group| group.covers_dynamic_exec(address, end - address));
+        let range = if plain_rw {
+            IdentityMadviseRange::PlainAnonRw
+        } else if plain_none {
+            IdentityMadviseRange::PlainAnonNone
+        } else if plain_mixed {
+            IdentityMadviseRange::PlainAnonMixed
+        } else if dynamic {
+            IdentityMadviseRange::DynamicExec
+        } else {
+            self.end_process(DirectRunOutcome::Unsupported {
+                syscall: 233,
+                outcome: format!(
+                    "madvise outside a proven Tier-D anonymous mapping \
+                     (addr={address:#x} len={length:#x} advice={advice})"
+                ),
+            });
+            return ServiceVerdict::Leave;
+        };
+
+        let host_madvise = |host_advice: libc::c_int| {
+            // SAFETY: provenance above proves the complete host range is a
+            // live mapping owned by this identity guest.
+            unsafe { libc::madvise(address as usize as *mut libc::c_void, host_len, host_advice) }
+        };
+        let zero_plain_rw = |start: u64, finish: u64| -> Result<(), libc::c_int> {
+            let len = usize::try_from(finish - start).map_err(|_| libc::ENOMEM)?;
+            // SAFETY: the caller intersects only the snapshotted, proven
+            // private-anonymous RW spans.
+            let zero_rc =
+                unsafe { libc::madvise(start as usize as *mut libc::c_void, len, libc::MADV_ZERO) };
+            if zero_rc != 0 {
+                // XNU rejects MADV_ZERO on a COW entry (e.g. after fork).
+                // Replace only this proven RW segment at its exact address.
+                let mapped = unsafe {
+                    libc::mmap(
+                        start as usize as *mut libc::c_void,
+                        len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+                        -1,
+                        0,
+                    )
+                };
+                if mapped == libc::MAP_FAILED || mapped as u64 != start {
+                    return Err(std::io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(libc::EIO));
+                }
+            }
+            // Reclamation is advisory; zeroing above is the semantic.
+            let _ =
+                unsafe { libc::madvise(start as usize as *mut libc::c_void, len, libc::MADV_FREE) };
+            Ok(())
+        };
+        match advice {
+            LINUX_MADV_NORMAL | LINUX_MADV_RANDOM | LINUX_MADV_SEQUENTIAL => {
+                if host_madvise(advice as libc::c_int) == 0 {
+                    ServiceVerdict::Resume(0)
+                } else {
+                    host_errno_verdict()
+                }
+            }
+            // Advisory only. XNU's WILLNEED can fault pages and rejects some
+            // PROT_NONE shapes that Linux accepts; accepting the hint without
+            // eager population preserves its non-binding contract.
+            LINUX_MADV_WILLNEED
+            | LINUX_MADV_HUGEPAGE
+            | LINUX_MADV_NOHUGEPAGE
+            | LINUX_MADV_COLLAPSE => ServiceVerdict::Resume(0),
+            LINUX_MADV_DONTFORK | LINUX_MADV_DOFORK => {
+                const VM_INHERIT_COPY: libc::c_int = 1;
+                const VM_INHERIT_NONE: libc::c_int = 2;
+                unsafe extern "C" {
+                    fn minherit(
+                        addr: *mut libc::c_void,
+                        len: libc::size_t,
+                        inherit: libc::c_int,
+                    ) -> libc::c_int;
+                }
+                let inherit = if advice == LINUX_MADV_DONTFORK {
+                    VM_INHERIT_NONE
+                } else {
+                    VM_INHERIT_COPY
+                };
+                // SAFETY: complete proven host mapping; minherit changes only
+                // the mapping's fork inheritance.
+                if unsafe { minherit(address as usize as *mut libc::c_void, host_len, inherit) }
+                    == 0
+                {
+                    ServiceVerdict::Resume(0)
+                } else {
+                    host_errno_verdict()
+                }
+            }
+            LINUX_MADV_FREE => {
+                if range == IdentityMadviseRange::PlainAnonNone {
+                    return ServiceVerdict::Resume(0);
+                }
+                if range == IdentityMadviseRange::PlainAnonMixed {
+                    for span in &rw_ranges {
+                        let lo = address.max(span.base);
+                        let hi = end.min(span.end);
+                        if lo < hi
+                            && unsafe {
+                                libc::madvise(
+                                    lo as usize as *mut libc::c_void,
+                                    (hi - lo) as usize,
+                                    libc::MADV_FREE,
+                                )
+                            } != 0
+                        {
+                            return host_errno_verdict();
+                        }
+                    }
+                    return ServiceVerdict::Resume(0);
+                }
+                if host_madvise(libc::MADV_FREE) == 0 {
+                    ServiceVerdict::Resume(0)
+                } else {
+                    host_errno_verdict()
+                }
+            }
+            LINUX_MADV_DONTNEED => match range {
+                // Fresh inaccessible anonymous pages are already the exact
+                // zero-fill state Linux requires; touching them would only
+                // manufacture work.
+                IdentityMadviseRange::PlainAnonNone => ServiceVerdict::Resume(0),
+                IdentityMadviseRange::PlainAnonRw => {
+                    if let Err(errno) = zero_plain_rw(address, end) {
+                        return ServiceVerdict::Resume(
+                            crate::host_to_linux_errno(errno).guest_retval(),
+                        );
+                    }
+                    ServiceVerdict::Resume(0)
+                }
+                IdentityMadviseRange::PlainAnonMixed => {
+                    for span in &rw_ranges {
+                        let lo = address.max(span.base);
+                        let hi = end.min(span.end);
+                        if lo < hi
+                            && let Err(errno) = zero_plain_rw(lo, hi)
+                        {
+                            return ServiceVerdict::Resume(
+                                crate::host_to_linux_errno(errno).guest_retval(),
+                            );
+                        }
+                    }
+                    ServiceVerdict::Resume(0)
+                }
+                IdentityMadviseRange::DynamicExec => {
+                    let Some(group) = active_group() else {
+                        return enomem();
+                    };
+                    let discard = if pristine_dynamic_exec_discard_enabled() {
+                        group
+                            .discard_dynamic_exec_contents(address, end - address)
+                            .map(|_| ())
+                    } else {
+                        group.zero_dynamic_exec(address, end - address)
+                    };
+                    if let Err(error) = discard {
+                        return ServiceVerdict::Resume(
+                            crate::host_to_linux_errno(error.raw_os_error().unwrap_or(libc::EIO))
+                                .guest_retval(),
+                        );
+                    }
+                    // Contents are already Linux-exact. Reusable/DONTNEED is
+                    // now only a best-effort host reclamation hint, so a host
+                    // refusal cannot make this successful guest operation
+                    // incorrect.
+                    let rc = host_madvise(libc::MADV_FREE_REUSABLE);
+                    if rc != 0 {
+                        let _ = host_madvise(libc::MADV_DONTNEED);
+                    }
+                    ServiceVerdict::Resume(0)
+                }
+            },
+            _ => unreachable!("supported advice matched above"),
         }
     }
 
@@ -935,6 +1468,7 @@ impl DirectRunner {
             if rc != 0 {
                 return host_errno_verdict();
             }
+            self.forget_owned_mapping(old_addr + new_len, old_len - new_len);
             subtract_anon_range(&mut table, old_addr + new_len, old_end);
             return ServiceVerdict::Resume(old_addr as i64);
         }
@@ -956,6 +1490,7 @@ impl DirectRunner {
             )
         };
         if grown != libc::MAP_FAILED && grown as u64 == old_end {
+            self.record_owned_mapping(old_addr, new_len);
             subtract_anon_range(
                 &mut table,
                 old_addr,
@@ -1001,6 +1536,8 @@ impl DirectRunner {
             );
             libc::munmap(old_addr as usize as *mut libc::c_void, old_len as usize);
         }
+        self.forget_owned_mapping(old_addr, old_len);
+        self.record_owned_mapping(moved as u64, new_len);
         subtract_anon_range(&mut table, old_addr, old_end);
         table.push(AnonRwRange {
             base: moved as u64,
@@ -1091,9 +1628,14 @@ impl DirectRunner {
             return ServiceVerdict::Resume(crate::host_to_linux_errno(libc::EINVAL).guest_retval());
         };
         let Some(host_fd) = self.dispatcher.dup_host_file_fd(fd as i32) else {
+            let fd_description = self.dispatcher.describe_fd_for_diagnostic(fd as i32);
             self.end_process(DirectRunOutcome::Unsupported {
                 syscall: 222,
-                outcome: "MAP_SHARED mmap of a non-host-file fd on tier D".to_string(),
+                outcome: format!(
+                    "MAP_SHARED mmap of a non-host-file fd on tier D: fd={fd} \
+                     ({fd_description}), addr={addr:#x}, len={len:#x}, prot={prot:?}, \
+                     flags={flags:?}, offset={offset:#x}"
+                ),
             });
             return ServiceVerdict::Leave;
         };
@@ -1123,6 +1665,7 @@ impl DirectRunner {
         if mapped == libc::MAP_FAILED {
             return host_errno_verdict();
         }
+        self.record_owned_mapping(mapped as u64, len);
         if flags.contains(carrick_abi::LinuxMmapFlags::FIXED) {
             if let Some(group) = active_group() {
                 group.note_plain_replacement(mapped as u64, len);
@@ -1178,6 +1721,7 @@ impl DirectRunner {
         if mapped == libc::MAP_FAILED {
             return host_errno_verdict();
         }
+        self.record_owned_mapping(mapped as u64, len);
         if flags.contains(carrick_abi::LinuxMmapFlags::FIXED)
             && let Some(group) = active_group()
         {
@@ -1500,14 +2044,36 @@ impl DirectRunner {
         if self.exiting.load(Ordering::SeqCst) {
             return ServiceVerdict::Leave;
         }
-        let verdict = self.service_syscall(ctx);
+        let number = ctx.syscall_nr();
+        let name = crate::syscall::lookup_aarch64(number).map_or("unknown", |syscall| syscall.name);
+        let mut service = crate::native_darwin::NativeSyscallServiceSpan::open(number, name);
+        let verdict = self.service_syscall(ctx, number, name);
         // The flag can rise while dispatch is in flight. Park on every
         // outcome, including ThreadExit: the forker may already have counted
         // this tid, so disappearing without a pause would strand the drain.
         self.park_for_fork_quiesce();
-        if self.exiting.load(Ordering::SeqCst) && matches!(verdict, ServiceVerdict::Resume(_)) {
-            return ServiceVerdict::Leave;
-        }
+        let verdict = if self.exiting.load(Ordering::SeqCst)
+            && matches!(verdict, ServiceVerdict::Resume(_))
+        {
+            ServiceVerdict::Leave
+        } else {
+            verdict
+        };
+        let service_outcome = match verdict {
+            ServiceVerdict::Resume(_) => crate::probes::NativeSyscallServiceOutcome::Resume,
+            // `exit`/`exit_group` complete by retiring a thread or the whole
+            // group. `rt_sigreturn` likewise does not return to the syscall
+            // site, but it DOES resume the guest at the restored context.
+            ServiceVerdict::Leave if matches!(number, 93 | 94) => {
+                crate::probes::NativeSyscallServiceOutcome::ThreadExit
+            }
+            ServiceVerdict::Leave if number == 139 => {
+                crate::probes::NativeSyscallServiceOutcome::Resume
+            }
+            ServiceVerdict::Leave => crate::probes::NativeSyscallServiceOutcome::Aborted,
+        };
+        let closed = service.end(service_outcome);
+        debug_assert!(closed, "tier-D syscall service span closed exactly once");
         match verdict {
             ServiceVerdict::Resume(value) => self.deliver_pending_at_boundary(ctx, value),
             leave => leave,
@@ -1523,11 +2089,14 @@ impl DirectRunner {
     /// an interruption is classified — process exit retires the thread, and
     /// a deliverable pending signal completes the syscall with `EINTR` so
     /// the boundary delivers its handler (or restarts, per `SA_RESTART`).
-    fn service_syscall(&self, ctx: &mut GuestContext) -> ServiceVerdict {
+    fn service_syscall(
+        &self,
+        ctx: &mut GuestContext,
+        number: u64,
+        name: &'static str,
+    ) -> ServiceVerdict {
         self.syscalls.fetch_add(1, Ordering::Relaxed);
-        let number = ctx.syscall_nr();
-        let identity_memory = matches!(number, 214 | 215 | 216 | 222 | 226);
-        let name = crate::syscall::lookup_aarch64(number).map_or("unknown", |syscall| syscall.name);
+        let identity_memory = matches!(number, 214 | 215 | 216 | 222 | 226 | 233);
         if identity_memory {
             self.reporter.record(CompatEvent::SyscallEntry {
                 number,
@@ -1668,14 +2237,34 @@ impl DirectRunner {
                         });
                         return ServiceVerdict::Leave;
                     }
-                    return ServiceVerdict::Resume(crate::native_darwin::tier_d_service_execve(
+                    return match crate::native_darwin::tier_d_service_execve(
                         &self.dispatcher,
                         path,
                         argv,
                         env,
                         &exec.plan,
                         exec.max_traps,
-                    ));
+                    ) {
+                        crate::native_darwin::TierDExecFlow::Resume(value) => {
+                            ServiceVerdict::Resume(value)
+                        }
+                        crate::native_darwin::TierDExecFlow::Replace(replacement) => {
+                            let mut slot = lock(&self.exec_replacement);
+                            if slot.is_some() {
+                                drop(slot);
+                                self.end_process(DirectRunOutcome::Unsupported {
+                                    syscall: number,
+                                    outcome: "second prepared Tier-D exec replacement".to_string(),
+                                });
+                                ServiceVerdict::Leave
+                            } else {
+                                *slot = Some(*replacement);
+                                drop(slot);
+                                self.end_process(DirectRunOutcome::ExecReplacement);
+                                ServiceVerdict::Leave
+                            }
+                        }
+                    };
                 }
                 // `rt_sigreturn(2)`: pop the frame, chain-deliver, re-enter
                 // at the RESTORED pc (constant resume branches cannot).
@@ -2011,6 +2600,12 @@ impl DirectRunner {
             let _ = memory.write_bytes_raw(child_tid_addr, &tid_bytes);
         }
 
+        // A process with two guest threads must have Mach delivery on both
+        // before either can publish or execute a process-global MAP_JIT range.
+        // The parent is parked in this clone handler now; make the requirement
+        // sticky before spawning, so the child and the parent's next entry
+        // both arm their ports without a cross-thread race.
+        group.require_mach_exception_handler();
         let runner_ptr = SendPtr(std::ptr::from_ref(self));
         let group_ptr = SendGroupPtr(std::ptr::from_ref(group));
         let spawned = std::thread::Builder::new()
@@ -2066,6 +2661,7 @@ impl DirectRunner {
                     unsafe { reenter_until_final(runner, group) };
                 }
                 drop(guard);
+                runner.terminate_forked_child_from_guest_thread();
             });
         match spawned {
             Ok(handle) => {
@@ -2110,6 +2706,15 @@ impl DirectRunner {
             });
             ServiceVerdict::Leave
         };
+        // XNU applies the pre-macOS-13 preserve-x18 compatibility policy at
+        // exec signature processing, but a Darwin fork/vfork child does not
+        // inherit it (qualified against current XNU and a live syscall probe).
+        // Record the parent's proven policy now. The child uses it below to
+        // replace inherited dynamic MAP_JIT mappings with byte-preserving DSR
+        // shadow sources before any guest instruction resumes; the parent
+        // retains the low-overhead physical-x18 direct path.
+        let fork_child_needs_dynamic_shadow =
+            carrick_native_darwin::direct::physical_x18_supported();
         if request.clone_parent {
             return unsupported("CLONE_PARENT fork on tier D");
         }
@@ -2121,9 +2726,12 @@ impl DirectRunner {
         let mut quiesced = false;
         if live_at_fork > 1 {
             barrier.set_quiescing();
-            // Futex waits wake immediately; fd/signal waits use the shared
-            // waiter's 50 ms lost-edge backstop and surface is_quiescing().
+            // Publish quiesce before waking both independent park classes.
+            // Futex waiters observe the shared generation; fd/sleep/signal
+            // waiters observe their private pipe. Registration precedes each
+            // wait's final is_quiescing() check, so no periodic retry is needed.
             self.futex.notify_signal_pending();
+            crate::host_signal::wake_all_waiters();
             if !barrier.wait_quiesced(live_at_fork - 1, Duration::from_secs(10)) {
                 barrier.end_quiesce();
                 barrier.end_fork();
@@ -2217,13 +2825,32 @@ impl DirectRunner {
                 barrier.reset_paused_for_child();
             }
             // CHILD: repair inherited runtime state before the guest resumes.
-            if let Some((read_fd, _write_fd)) = vfork_pipe {
+            if let Some((read_fd, write_fd)) = vfork_pipe {
                 // Keep the CLOEXEC write end: closing it (via exec or exit)
                 // IS the vfork-completion signal. Drop the read end.
                 // SAFETY: the child's own inherited fd.
                 unsafe {
                     libc::close(read_fd);
                 }
+                self.hold_vfork_completion_fd(write_fd);
+            }
+            if fork_child_needs_dynamic_shadow {
+                let Some(group) = active_group() else {
+                    return unsupported(
+                        "fork child has no tier-D load group for dynamic shadow transition",
+                    );
+                };
+                if let Err(error) = group.enable_dynamic_shadow() {
+                    return unsupported(&format!(
+                        "fork child could not preserve dynamic text through the tier-D shadow transition: {error}"
+                    ));
+                }
+            }
+            if let Err(error) = carrick_native_darwin::direct::exception_handler_after_fork_child()
+            {
+                return unsupported(&format!(
+                    "fork child could not rebind tier-D Mach exception server: {error}"
+                ));
             }
             NATIVE_FORKED_GUEST_CHILD.store(true, Ordering::Release);
             self.forked_child.store(true, Ordering::Release);
@@ -2499,13 +3126,27 @@ impl DirectRunner {
             if now >= deadline {
                 return TierDWait::TimedOut;
             }
+            // The waiter is registered before the final `exiting` predicate
+            // check, and end_process stores `exiting` before broadcasting to
+            // its private pipe. An unread byte survives the check-to-park race,
+            // so park once against the real guest deadline.
+            let park_for = deadline - now;
             let result = with_thread_waiter(tid, |waiter| {
-                waiter.wait_with_dispatch_pending(&[], Some(deadline - now), block_mask, || {
+                waiter.wait_with_dispatch_pending(&[], Some(park_for), block_mask, || {
                     self.wait_should_interrupt(tid, sig_mask)
                 })
             });
             match result {
-                crate::io_wait::WaitResult::TimedOut => return TierDWait::TimedOut,
+                crate::io_wait::WaitResult::TimedOut => {
+                    if let Some(interrupt) = self.classify_wait_interrupt(tid, sig_mask) {
+                        return interrupt;
+                    }
+                    if Instant::now() >= deadline {
+                        return TierDWait::TimedOut;
+                    }
+                    // A timeout is the guest deadline; rounding can leave a
+                    // sub-tick remainder, so the loop verifies the clock.
+                }
                 crate::io_wait::WaitResult::Ready | crate::io_wait::WaitResult::Interrupted => {
                     if let Some(interrupt) = self.classify_wait_interrupt(tid, sig_mask) {
                         return interrupt;
@@ -2524,9 +3165,8 @@ impl DirectRunner {
 
     /// Park until a signal in `wait_set` is pending (`WaitOnSignals` —
     /// `rt_sigtimedwait`/`rt_sigsuspend`/`pause`), the DSR lane's
-    /// `wait_native_signals` shape: slice-bounded parks with the pending
-    /// classification re-run on every wake (the slices are also the delivery
-    /// backstop for publications that raced the park).
+    /// `wait_native_signals` shape: park on the registered wake channel and
+    /// re-run pending classification on each real publication.
     fn wait_on_signals(
         &self,
         tid: ThreadId,
@@ -2541,16 +3181,21 @@ impl DirectRunner {
                 // The caller's Interrupted arm re-checks `exiting` and leaves.
                 return NativeSignalWaitResult::Interrupted;
             }
-            let Some(slice) = crate::vcpu_loop::signal_wait_slice(deadline, timeout) else {
+            // Establish the per-syscall deadline using the shared semantics,
+            // then park for the FULL remaining guest interval. Tier D has a
+            // durable pending bit plus a registered pipe, so the shared VMM
+            // lane's historical 50 ms service slice is unnecessary here.
+            let Some(_) = crate::vcpu_loop::signal_wait_slice(deadline, timeout) else {
                 return NativeSignalWaitResult::TimedOut;
             };
+            let park_timeout = crate::vcpu_loop::signal_wait_remaining(*deadline, timeout);
             if let Some(result) =
                 native_signal_wait_pending(&self.dispatcher, tid, wait_set, block_mask)
             {
                 return result;
             }
             let result = with_thread_waiter(tid, |waiter| {
-                waiter.wait_with_dispatch_pending(&[], Some(slice), block_mask, || {
+                waiter.wait_with_dispatch_pending(&[], park_timeout, block_mask, || {
                     self.exiting.load(Ordering::SeqCst)
                         || native_signal_wait_pending(&self.dispatcher, tid, wait_set, block_mask)
                             .is_some()
@@ -3153,6 +3798,33 @@ fn take_deferred_boundary_delivery() -> Option<DeferredBoundaryDelivery> {
 /// this thread's own delivery path from a genuine guest state of `group`.
 unsafe fn reenter_until_final(runner: &DirectRunner, group: &DirectLoadGroup) {
     loop {
+        let slots = current_thread_slots_ptr();
+        let dynamic_reenter = if slots.is_null() {
+            false
+        } else {
+            // SAFETY: this thread's own installed slots; a captured fault
+            // returned to the host landing point before this read.
+            let slots = unsafe { &mut *slots };
+            if let Some(fault) = slots.take_fault() {
+                let prepared = if group.dynamic_exec_is_shadowed(slots.context.pc) {
+                    group.execute_dynamic_shadow(slots).map(|()| true)
+                } else {
+                    group.prepare_dynamic_fault(fault, &slots.context)
+                };
+                match prepared {
+                    Ok(reenter) => reenter,
+                    Err(reason) => {
+                        runner.end_process(DirectRunOutcome::Unsupported {
+                            syscall: 0,
+                            outcome: format!("direct dynamic-code fault: {reason}"),
+                        });
+                        return;
+                    }
+                }
+            } else {
+                false
+            }
+        };
         if let Some(deferred) = take_deferred_boundary_delivery() {
             let slots = current_thread_slots_ptr();
             if slots.is_null() {
@@ -3168,7 +3840,7 @@ unsafe fn reenter_until_final(runner: &DirectRunner, group: &DirectLoadGroup) {
             if !runner.deliver_parked_boundary(ctx, group, deferred) {
                 return;
             }
-        } else if !take_reenter() {
+        } else if !dynamic_reenter && !take_reenter() {
             return;
         }
         // SAFETY: caller contract.
@@ -3279,17 +3951,75 @@ extern "C" fn dispatch_from_island(ctx: *mut GuestContext) {
     if runner.is_null() || ctx.is_null() {
         return;
     }
+    let physical_x18 = carrick_native_darwin::direct::physical_x18_supported();
+    if physical_x18 {
+        carrick_native_darwin::direct::enter_host_x18_abi();
+    }
     // SAFETY: `install_thread_context` installs this runner for exactly the
     // window in which the guest can call back, and the island owns `ctx` for
     // this call.
     let (runner, ctx) = unsafe { (&*runner, &mut *ctx) };
     match runner.service(ctx) {
-        ServiceVerdict::Resume(value) => ctx.set_return(value),
+        ServiceVerdict::Resume(value) => {
+            if physical_x18 && let Err(error) = carrick_native_darwin::direct::enter_guest_x18_abi()
+            {
+                runner.end_process(DirectRunOutcome::Unsupported {
+                    syscall: ctx.syscall_nr(),
+                    outcome: format!("cannot restore tier-D physical x18 ABI: {error}"),
+                });
+                ctx.request_leave();
+                return;
+            }
+            ctx.set_return(value);
+        }
         // The guest's own state at the syscall stays parked in the context —
         // no fabricated return value — and the island's leave leg returns
         // control to `enter`'s caller (guest-leave contract).
         ServiceVerdict::Leave => ctx.request_leave(),
     }
+}
+
+/// Synchronous `__clear_cache` publication bridge. The patched definition
+/// calls this while the publishing guest thread is still in MAP_JIT write
+/// mode, before its original cache-maintenance body runs. Patch every Linux
+/// virtual-state word now so an already-executable sibling can never observe
+/// unlowered x18/TLS/syscall code after the guest publishes it.
+extern "C" fn publish_dynamic_from_guest(start: u64, end: u64) -> libc::c_int {
+    let runner = ACTIVE.with(std::cell::Cell::get);
+    let Some(group) = active_group() else {
+        return 0;
+    };
+    if runner.is_null() {
+        return 0;
+    }
+    let physical_x18 = carrick_native_darwin::direct::physical_x18_supported();
+    if physical_x18 {
+        carrick_native_darwin::direct::enter_host_x18_abi();
+    }
+    let result = match group.publish_dynamic_code(start, end) {
+        Ok(()) => 1,
+        Err(reason) => {
+            // SAFETY: `install_thread_context` keeps the runner live for the
+            // exact window in which the guest can reach this callback.
+            let runner = unsafe { &*runner };
+            runner.end_process(DirectRunOutcome::Unsupported {
+                syscall: 0,
+                outcome: format!("direct dynamic-code publication: {reason}"),
+            });
+            0
+        }
+    };
+    if physical_x18 && let Err(error) = carrick_native_darwin::direct::enter_guest_x18_abi() {
+        // SAFETY: as above; failure is terminal and the patched clear-cache
+        // hook will take its named leave leg instead of resuming guest code.
+        let runner = unsafe { &*runner };
+        runner.end_process(DirectRunOutcome::Unsupported {
+            syscall: 0,
+            outcome: format!("cannot restore tier-D physical x18 ABI: {error}"),
+        });
+        return 0;
+    }
+    result
 }
 
 /// Build a tier-D image with this so its syscalls reach the real dispatcher.
@@ -3311,6 +4041,7 @@ pub unsafe fn with_runner<R>(
     group: &DirectLoadGroup,
     body: impl FnOnce() -> R,
 ) -> std::io::Result<(R, Box<DirectThreadSlots>)> {
+    install_dynamic_publication_handler(publish_dynamic_from_guest)?;
     let slots = group.install_thread_slots()?;
     let context = install_thread_context(runner, group, runner.main_tid());
     let result = body();
@@ -3328,6 +4059,146 @@ pub unsafe fn with_runner<R>(
 mod tests {
     use super::*;
     use carrick_native_darwin::direct::DirectLoadGroup;
+
+    #[test]
+    fn tier_d_syscall_service_emits_the_native_service_window() {
+        use crate::native_darwin::{
+            NativeSyscallServiceProbeEvent, take_native_syscall_service_probe_events,
+        };
+
+        take_native_syscall_service_probe_events();
+        let runner = DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
+        let mut ctx = GuestContext::default();
+        ctx.x[8] = 172; // getpid
+
+        assert!(matches!(runner.service(&mut ctx), ServiceVerdict::Resume(value) if value > 0));
+        assert!(matches!(
+            take_native_syscall_service_probe_events().as_slice(),
+            [
+                NativeSyscallServiceProbeEvent::Entry {
+                    number: 172,
+                    name: "getpid"
+                },
+                NativeSyscallServiceProbeEvent::End {
+                    number: 172,
+                    name: "getpid",
+                    outcome: crate::probes::NativeSyscallServiceOutcome::Resume
+                }
+            ]
+        ));
+
+        let runner = DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
+        let mut ctx = GuestContext::default();
+        ctx.x[0] = 7;
+        ctx.x[8] = 94; // exit_group
+
+        assert!(matches!(runner.service(&mut ctx), ServiceVerdict::Leave));
+        assert!(matches!(
+            take_native_syscall_service_probe_events().as_slice(),
+            [
+                NativeSyscallServiceProbeEvent::Entry {
+                    number: 94,
+                    name: "exit_group"
+                },
+                NativeSyscallServiceProbeEvent::End {
+                    number: 94,
+                    name: "exit_group",
+                    outcome: crate::probes::NativeSyscallServiceOutcome::ThreadExit
+                }
+            ]
+        ));
+    }
+
+    /// A host `execve` used to provide two hidden pieces of the Tier-D exec
+    /// contract for free: it retired every mapping owned by the outgoing
+    /// guest, and FD_CLOEXEC closed the private pipe that releases a vfork
+    /// parent.  The in-process replacement must do both explicitly before
+    /// any instruction from the new image can run.
+    #[test]
+    fn in_process_exec_commit_retires_identity_memory_and_releases_vfork() {
+        let runner = DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
+
+        let mut pipe = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        runner.hold_vfork_completion_fd(pipe[1]);
+
+        let mut mmap = GuestContext::default();
+        mmap.x[0] = 0;
+        mmap.x[1] = HOST_PAGE_SIZE;
+        mmap.x[2] = 3; // PROT_READ | PROT_WRITE
+        mmap.x[3] = 0x22; // MAP_PRIVATE | MAP_ANONYMOUS
+        mmap.x[4] = u64::MAX;
+        mmap.x[8] = 222; // mmap
+        let mapped = match runner
+            .service_identity_memory(&mmap)
+            .expect("mmap is an identity-memory syscall")
+        {
+            ServiceVerdict::Resume(value) if value > 0 => value as u64,
+            _ => panic!("anonymous mmap did not return a mapping"),
+        };
+        assert_eq!(
+            unsafe {
+                libc::mprotect(
+                    mapped as usize as *mut libc::c_void,
+                    HOST_PAGE_SIZE as usize,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                )
+            },
+            0,
+            "the outgoing guest mapping must exist before exec commit"
+        );
+
+        runner.commit_in_process_exec();
+
+        assert_eq!(
+            unsafe {
+                libc::mprotect(
+                    mapped as usize as *mut libc::c_void,
+                    HOST_PAGE_SIZE as usize,
+                    libc::PROT_NONE,
+                )
+            },
+            -1,
+            "exec commit must retire the outgoing guest mapping"
+        );
+        let mut byte = 0_u8;
+        assert_eq!(
+            unsafe { libc::read(pipe[0], std::ptr::from_mut(&mut byte).cast(), 1) },
+            0,
+            "closing the child completion fd must release the vfork parent"
+        );
+        unsafe { libc::close(pipe[0]) };
+    }
+
+    #[test]
+    fn sleeping_guest_wakes_promptly_on_durable_process_exit_publication() {
+        let runner = Arc::new(DirectRunner::new(
+            SyscallDispatcher::new(),
+            IdentityMemory::new(0, u64::MAX),
+        ));
+        let tid = runner.main_tid();
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+        let child_runner = Arc::clone(&runner);
+        let sleeper = std::thread::spawn(move || {
+            parked_tx.send(()).expect("announce wait entry");
+            child_runner.wait_on_sleep(tid, Instant::now() + Duration::from_secs(2))
+        });
+        parked_rx.recv().expect("sleeper reached wait path");
+        std::thread::sleep(Duration::from_millis(100));
+
+        // end_process is the publication protocol: first store the durable
+        // terminal bit, then wake every registered private waiter pipe. The
+        // sleeper must not inherit the guest's remaining two-second deadline.
+        let start = Instant::now();
+        runner.end_process(DirectRunOutcome::Exited { code: 0 });
+        let result = sleeper.join().expect("join sleeper");
+
+        assert!(matches!(result, TierDWait::Leave));
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "process-exit publication must wake a sleeping guest promptly"
+        );
+    }
 
     #[test]
     fn blocking_host_write_waits_and_returns_through_the_tier_d_boundary() {
@@ -3633,6 +4504,378 @@ mod tests {
             runner.dispatcher().stdout(),
             b"hi\n",
             "the guest's own write(2) reached the real dispatcher"
+        );
+    }
+
+    /// Linux/aarch64 exposes CTR_EL0 to EL0, but XNU traps the same MRS as
+    /// EXC_BAD_INSTRUCTION. Tier D must answer that rare architectural query
+    /// without translating the surrounding static code. The canonical value
+    /// deliberately matches the translated native lane.
+    #[test]
+    fn direct_mach_exception_emulates_linux_ctr_el0() {
+        const NR_EXIT_GROUP: u32 = 94;
+        const MRS_CTR_EL0_X0: u32 = 0xd53b_0020;
+        let elf = elf_with_code(&[MRS_CTR_EL0_X0, movz(8, NR_EXIT_GROUP, 0), SVC_0]);
+        let group = DirectLoadGroup::load(&elf, island_handler())
+            .expect("load")
+            .expect("eligible");
+        let runner = DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
+        let entry = group.main().entry();
+        // SAFETY: the image is patched and the Mach handler owns the trapped
+        // instruction's exact state transition before exit_group leaves.
+        unsafe { with_runner(&runner, &group, || group.enter(entry)) }
+            .expect("with_runner")
+            .0
+            .expect("enter");
+
+        assert_eq!(
+            runner.outcome(),
+            Some(DirectRunOutcome::Exited {
+                code: carrick_native_darwin::direct::LINUX_CTR_EL0 as i32,
+            }),
+            "CTR_EL0 was synthesized with the Linux-shaped native value"
+        );
+    }
+
+    /// V8's Linux arm64 code-cage shape in its smallest executable form:
+    /// reserve anonymous `PROT_NONE`, promote it to persistent RWX, write
+    /// machine code, and call it without a second mprotect boundary. Tier D
+    /// must lower that Linux RWX contract through Darwin's per-thread
+    /// `MAP_JIT` write/execute modes: static guest text remains executable
+    /// while the code page is writable, the first branch faults into the
+    /// scan+patch publication boundary, and the dynamic function returns 42.
+    ///
+    /// This is red against the old fail-closed mprotect arm, which stops at
+    /// syscall 226 with "outside a patched tier-D mapping".
+    #[test]
+    fn anonymous_rwx_code_is_published_through_dynamic_wx() {
+        const NR_MMAP: u32 = 222;
+        const NR_MPROTECT: u32 = 226;
+        const NR_MADVISE: u32 = 233;
+        const NR_EXIT_GROUP: u32 = 94;
+        const MADV_DONTNEED: u32 = 4;
+        const MAP_PRIVATE_ANON: u32 = 0x22;
+        const HOST_PAGE: u32 = 16 * 1024;
+        const STR_W9_X21: u32 = 0xb900_02a9;
+        const STR_W9_X21_4: u32 = 0xb900_06a9;
+        const BLR_X21: u32 = 0xd63f_02a0;
+        const DYNAMIC_RET: u32 = 0xd65f_03c0;
+        let dynamic_return_42 = movz(0, 42, 0);
+        let expected_dynamic_bytes = u64::from(dynamic_return_42) | (u64::from(DYNAMIC_RET) << 32);
+        let elf = elf_with_code(&[
+            movz(0, 0, 0),
+            movz(1, HOST_PAGE, 0),
+            movz(2, 0, 0), // PROT_NONE
+            movz(3, MAP_PRIVATE_ANON, 0),
+            movz(4, 0xffff, 0),
+            movk(4, 0xffff, 16),
+            movk(4, 0xffff, 32),
+            movk(4, 0xffff, 48), // fd = -1
+            movz(5, 0, 0),
+            movz(8, NR_MMAP, 0),
+            SVC_0,
+            mov_reg(21, 0), // dynamic page
+            mov_reg(0, 21),
+            movz(1, HOST_PAGE, 0),
+            movz(2, 7, 0), // PROT_READ|WRITE|EXEC
+            movz(8, NR_MPROTECT, 0),
+            SVC_0,
+            // V8 creates its code cage in exactly this order: promote the
+            // pristine reservation to persistent RWX, discard the untouched
+            // pages, then publish generated code. The discard must see the
+            // Tier-D mapping even though it bypasses the arena dispatcher.
+            mov_reg(0, 21),
+            movz(1, HOST_PAGE, 0),
+            movz(2, MADV_DONTNEED, 0),
+            movz(8, NR_MADVISE, 0),
+            SVC_0,
+            cbz_rel(0, (24 - 20) * 4), // success -> publish the code
+            movz(0, 77, 0),            // named discard failure
+            movz(8, NR_EXIT_GROUP, 0),
+            SVC_0,
+            // The first store faults while the shadow source is read-only.
+            // XNU zeroes physical x18 on a direct Mach exception reply, so
+            // hold a sentinel across that exact boundary and fail distinctly
+            // unless Carrick parks and restores the complete guest state.
+            movz(18, 0x1818, 0),
+            movz(9, dynamic_return_42 & 0xffff, 0),
+            movk(9, dynamic_return_42 >> 16, 16),
+            STR_W9_X21,
+            movz(10, 0x1818, 0),
+            cmp_reg(18, 10),
+            b_eq_rel(4 * 4),
+            movz(0, 78, 0), // shadow write reply lost physical x18
+            movz(8, NR_EXIT_GROUP, 0),
+            SVC_0,
+            movz(9, DYNAMIC_RET & 0xffff, 0),
+            movk(9, DYNAMIC_RET >> 16, 16),
+            STR_W9_X21_4,
+            BLR_X21,
+            // V8 legitimately reads generated instructions as data. The
+            // shadow route must execute from a separate cache while leaving
+            // this exact eight-byte source value untouched.
+            ldr_reg_imm(10, 21, 0),
+            movz(11, (expected_dynamic_bytes & 0xffff) as u32, 0),
+            movk(11, ((expected_dynamic_bytes >> 16) & 0xffff) as u32, 16),
+            movk(11, ((expected_dynamic_bytes >> 32) & 0xffff) as u32, 32),
+            movk(11, ((expected_dynamic_bytes >> 48) & 0xffff) as u32, 48),
+            cmp_reg(10, 11),
+            b_eq_rel(4 * 4),
+            movz(0, 79, 0), // source bytes changed
+            movz(8, NR_EXIT_GROUP, 0),
+            SVC_0,
+            movz(8, NR_EXIT_GROUP, 0),
+            SVC_0,
+        ]);
+        let group = DirectLoadGroup::load(&elf, island_handler())
+            .expect("load")
+            .expect("eligible");
+        group
+            .enable_dynamic_shadow()
+            .expect("force byte-preserving dynamic shadow route");
+        let stack = DirectStack::build(
+            &elf,
+            group.main().bias(),
+            None,
+            &[b"dynamic-wx-fixture".to_vec()],
+            &[],
+        )
+        .expect("guest stack");
+        let runner = DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
+        let entry = group.main().entry();
+        let sp = stack.sp();
+        // SAFETY: the static image is patched and the dynamic target is
+        // published by the runner before it is re-entered; the dedicated
+        // product-shaped guest stack keeps signal recovery's host frame
+        // disjoint from guest and island-handler frames.
+        unsafe { with_runner(&runner, &group, || group.enter_on_stack(entry, sp)) }
+            .expect("with_runner")
+            .0
+            .expect("enter");
+
+        assert_eq!(
+            runner.outcome(),
+            Some(DirectRunOutcome::Exited { code: 42 }),
+            "dynamic code survived the V8-shaped discard and returned its value"
+        );
+    }
+
+    /// A later V8 discard is not necessarily over a pristine code cage: the
+    /// guest may already have published bytes in the MAP_JIT mapping. Linux
+    /// still requires DONTNEED to make the discarded private-anon pages read
+    /// as zero. Prove both the zero and the ability to publish fresh code
+    /// afterward.
+    #[test]
+    fn dirty_dynamic_code_discard_zeroes_then_republishes() {
+        const NR_MMAP: u32 = 222;
+        const NR_MPROTECT: u32 = 226;
+        const NR_MADVISE: u32 = 233;
+        const NR_EXIT_GROUP: u32 = 94;
+        const MADV_DONTNEED: u32 = 4;
+        const MAP_PRIVATE_ANON: u32 = 0x22;
+        const HOST_PAGE: u32 = 16 * 1024;
+        const STR_W9_X21: u32 = 0xb900_02a9;
+        const STR_W9_X21_4: u32 = 0xb900_06a9;
+        const BLR_X21: u32 = 0xd63f_02a0;
+        const DYNAMIC_RET: u32 = 0xd65f_03c0;
+        let old_return = movz(0, 99, 0);
+        let new_return = movz(0, 42, 0);
+        let elf = elf_with_code(&[
+            movz(0, 0, 0),
+            movz(1, HOST_PAGE, 0),
+            movz(2, 0, 0),
+            movz(3, MAP_PRIVATE_ANON, 0),
+            movz(4, 0xffff, 0),
+            movk(4, 0xffff, 16),
+            movk(4, 0xffff, 32),
+            movk(4, 0xffff, 48),
+            movz(5, 0, 0),
+            movz(8, NR_MMAP, 0),
+            SVC_0,
+            mov_reg(21, 0),
+            mov_reg(0, 21),
+            movz(1, HOST_PAGE, 0),
+            movz(2, 7, 0),
+            movz(8, NR_MPROTECT, 0),
+            SVC_0,
+            movz(9, old_return & 0xffff, 0),
+            movk(9, old_return >> 16, 16),
+            STR_W9_X21,
+            movz(9, DYNAMIC_RET & 0xffff, 0),
+            movk(9, DYNAMIC_RET >> 16, 16),
+            STR_W9_X21_4,
+            mov_reg(0, 21),
+            movz(1, HOST_PAGE, 0),
+            movz(2, MADV_DONTNEED, 0),
+            movz(8, NR_MADVISE, 0),
+            SVC_0,
+            cbz_rel(0, (32 - 28) * 4),
+            movz(0, 77, 0),
+            movz(8, NR_EXIT_GROUP, 0),
+            SVC_0,
+            ldr_reg_imm(0, 21, 0),
+            cbz_rel(0, (37 - 33) * 4),
+            movz(0, 78, 0),
+            movz(8, NR_EXIT_GROUP, 0),
+            SVC_0,
+            movz(9, new_return & 0xffff, 0),
+            movk(9, new_return >> 16, 16),
+            STR_W9_X21,
+            movz(9, DYNAMIC_RET & 0xffff, 0),
+            movk(9, DYNAMIC_RET >> 16, 16),
+            STR_W9_X21_4,
+            BLR_X21,
+            movz(8, NR_EXIT_GROUP, 0),
+            SVC_0,
+        ]);
+        let group = DirectLoadGroup::load(&elf, island_handler())
+            .expect("load")
+            .expect("eligible");
+        group
+            .enable_dynamic_shadow()
+            .expect("use the shipped byte-preserving dynamic-code policy");
+        let stack = DirectStack::build(
+            &elf,
+            group.main().bias(),
+            None,
+            &[b"dirty-discard-fixture".to_vec()],
+            &[],
+        )
+        .expect("guest stack");
+        let runner = DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
+        let entry = group.main().entry();
+        let sp = stack.sp();
+        // SAFETY: static code is patched; the dynamic page is published only
+        // through the MAP_JIT transition protocol under test.
+        unsafe { with_runner(&runner, &group, || group.enter_on_stack(entry, sp)) }
+            .expect("with_runner")
+            .0
+            .expect("enter");
+
+        assert_eq!(
+            runner.outcome(),
+            Some(DirectRunOutcome::Exited { code: 42 }),
+            "dirty code was zero-discarded and fresh code republished"
+        );
+    }
+
+    /// Linux `MADV_DONTNEED` on private anonymous memory discards the old
+    /// contents: a later read observes zero-fill. Tier D owns the live host
+    /// mapping, so the arena dispatcher's VMA ledger cannot validate or zero
+    /// it. This fixture is red against that split (madvise returns ENOMEM and
+    /// the old 0x5a remains) and pins both range visibility and contents.
+    #[test]
+    fn identity_madvise_dontneed_zeroes_private_anonymous_memory() {
+        const NR_MMAP: u32 = 222;
+        const NR_MADVISE: u32 = 233;
+        const NR_EXIT_GROUP: u32 = 94;
+        const MADV_DONTNEED: u32 = 4;
+        const MAP_PRIVATE_ANON: u32 = 0x22;
+        const HOST_PAGE: u32 = 16 * 1024;
+        let elf = elf_with_code(&[
+            movz(0, 0, 0),
+            movz(1, HOST_PAGE, 0),
+            movz(2, 3, 0), // PROT_READ|WRITE
+            movz(3, MAP_PRIVATE_ANON, 0),
+            movz(4, 0xffff, 0),
+            movk(4, 0xffff, 16),
+            movk(4, 0xffff, 32),
+            movk(4, 0xffff, 48), // fd = -1
+            movz(5, 0, 0),       // offset
+            movz(8, NR_MMAP, 0),
+            SVC_0,
+            mov_reg(21, 0),
+            movz(9, 0x5a, 0),
+            str_reg_imm(9, 21, 0),
+            mov_reg(0, 21),
+            movz(1, HOST_PAGE, 0),
+            movz(2, MADV_DONTNEED, 0),
+            movz(8, NR_MADVISE, 0),
+            SVC_0,
+            ldr_reg_imm(0, 21, 0), // zero on success; 0x5a on the old path
+            movz(8, NR_EXIT_GROUP, 0),
+            SVC_0,
+        ]);
+        let group = DirectLoadGroup::load(&elf, island_handler())
+            .expect("load")
+            .expect("eligible");
+        let runner = DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
+        let entry = group.main().entry();
+        // SAFETY: patched image built with `island_handler`; exit_group leaves
+        // through the direct handler.
+        unsafe { with_runner(&runner, &group, || group.enter(entry)) }
+            .expect("with_runner")
+            .0
+            .expect("enter");
+
+        assert_eq!(
+            runner.outcome(),
+            Some(DirectRunOutcome::Exited { code: 0 }),
+            "MADV_DONTNEED replaced the private-anon contents with zero-fill"
+        );
+    }
+
+    /// Node's worker-stack teardown discards one range spanning an untouched
+    /// PROT_NONE guard prefix and an interior promoted to RW. Both pieces are
+    /// one private-anon mapping; Linux accepts the cross-protection madvise,
+    /// leaves the guard inaccessible, and zeroes the writable contents.
+    #[test]
+    fn identity_madvise_spans_none_guard_and_promoted_rw_stack() {
+        const NR_MMAP: u32 = 222;
+        const NR_MPROTECT: u32 = 226;
+        const NR_MADVISE: u32 = 233;
+        const NR_EXIT_GROUP: u32 = 94;
+        const MADV_DONTNEED: u32 = 4;
+        const MAP_PRIVATE_ANON_STACK: u32 = 0x2_0022;
+        const HOST_PAGE: u32 = 16 * 1024;
+        let elf = elf_with_code(&[
+            movz(0, 0, 0),
+            movz(1, HOST_PAGE * 2, 0),
+            movz(2, 0, 0),
+            movz(3, MAP_PRIVATE_ANON_STACK & 0xffff, 0),
+            movk(3, MAP_PRIVATE_ANON_STACK >> 16, 16),
+            movz(4, 0xffff, 0),
+            movk(4, 0xffff, 16),
+            movk(4, 0xffff, 32),
+            movk(4, 0xffff, 48),
+            movz(5, 0, 0),
+            movz(8, NR_MMAP, 0),
+            SVC_0,
+            mov_reg(21, 0),
+            movz(22, HOST_PAGE, 0),
+            add_reg(22, 21, 22),
+            mov_reg(0, 22),
+            movz(1, HOST_PAGE, 0),
+            movz(2, 3, 0),
+            movz(8, NR_MPROTECT, 0),
+            SVC_0,
+            movz(9, 0x5a, 0),
+            str_reg_imm(9, 22, 0),
+            mov_reg(0, 21),
+            movz(1, HOST_PAGE * 2, 0),
+            movz(2, MADV_DONTNEED, 0),
+            movz(8, NR_MADVISE, 0),
+            SVC_0,
+            ldr_reg_imm(0, 22, 0),
+            movz(8, NR_EXIT_GROUP, 0),
+            SVC_0,
+        ]);
+        let group = DirectLoadGroup::load(&elf, island_handler())
+            .expect("load")
+            .expect("eligible");
+        let runner = DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
+        let entry = group.main().entry();
+        // SAFETY: patched image built with the Tier-D handler; every host
+        // range touched is created by this fixture's identity mmap.
+        unsafe { with_runner(&runner, &group, || group.enter(entry)) }
+            .expect("with_runner")
+            .0
+            .expect("enter");
+
+        assert_eq!(
+            runner.outcome(),
+            Some(DirectRunOutcome::Exited { code: 0 }),
+            "the RW stack contents were discarded across its PROT_NONE guard"
         );
     }
 
@@ -4784,6 +6027,10 @@ __attribute__((naked)) void _start(void) {
     /// `cmp xn, #imm` (SUBS XZR)
     const fn cmp_imm(rn: u32, imm12: u32) -> u32 {
         0xf100_0000 | (imm12 << 10) | (rn << 5) | 31
+    }
+    /// `cmp xn, xm` (SUBS XZR, Xn, Xm).
+    const fn cmp_reg(rn: u32, rm: u32) -> u32 {
+        0xeb00_001f | (rm << 16) | (rn << 5)
     }
     /// `b.eq <pc + offset>`
     const fn b_eq_rel(offset: i32) -> u32 {

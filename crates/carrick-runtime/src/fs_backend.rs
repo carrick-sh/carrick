@@ -73,6 +73,10 @@ pub struct HostFsReexecAuthority {
     pub device: u64,
     pub inode: u64,
     pub cleanup_on_drop: bool,
+    /// This root was created as the sparse writable upper of an immutable
+    /// cached lower. Historical/materialized authorities default false.
+    #[serde(default)]
+    pub sparse_upper_fast_miss: bool,
 }
 
 /// Real on-disk stat values for a path, read straight from the backing
@@ -212,6 +216,13 @@ pub trait FsBackend: Send + Sync {
     /// backends may need real lstat/readlink behavior.
     fn fast_nofollow_metadata(&self, _path: &str) -> Option<RootFsMetadata> {
         None
+    }
+
+    /// Prove that `path` is absent from a sparse writable upper without a
+    /// cap-std component walk. `false` means "unknown", never "present".
+    /// The default is conservative for every non-host backend.
+    fn fast_nofollow_absent(&self, _path: &str) -> bool {
+        false
     }
 
     /// `True` iff `path` is currently tombstoned.
@@ -1411,6 +1422,11 @@ pub struct HostFsBackend {
     /// vCPUs exited mid-quiesce — is fixed (runtime.rs recomputes it live), so
     /// the win (test_glob 140s→48s) is on by default.
     fast_fs: bool,
+    /// This backend is a freshly-created sparse upper paired with an immutable
+    /// lower, so an ENOENT proved while the upper has never contained a symlink
+    /// is authoritative. Explicitly carried through native self-reexec; never
+    /// inferred from an arbitrary attached directory.
+    sparse_upper_fast_miss: bool,
     /// Dir-fd-anchored stat cache. Default ON (`CARRICK_FS_STATCACHE=0` opts out).
     /// Maps a leaf path → a cached `RealStat` + the leaf's identity snapshot
     /// (ino/ctime/mtime/size) + an `OwnedFd` of its CONTAINED parent dir. A
@@ -1537,6 +1553,17 @@ pub struct HostFsBackend {
     /// BEFORE the first xattr write.
     meta_xattr_seen: std::sync::atomic::AtomicBool,
     meta_xattr_absent_gen: std::sync::atomic::AtomicU64,
+    /// Sticky cache of the durable host-upper whiteout marker. The marker and
+    /// adjacent sidecars make sparse-upper deletions visible across real host
+    /// forks and native self-reexecs; the shared fs generation makes an
+    /// absent reading safe to cache in each process.
+    whiteout_seen: std::sync::atomic::AtomicBool,
+    whiteout_absent_gen: std::sync::atomic::AtomicU64,
+    /// Durable upper-symlink marker cache. Any symlink permanently disables
+    /// authoritative sparse-upper misses because an intermediate link needs
+    /// the layered resolver's Linux-rooted semantics.
+    symlink_seen: std::sync::atomic::AtomicBool,
+    symlink_absent_gen: std::sync::atomic::AtomicU64,
 }
 
 /// A cached `RealStat` plus the snapshot needed to revalidate it cheaply. The
@@ -1693,10 +1720,28 @@ enum FastGuestOpen {
     /// `open_fifo_nonblock` handling — NEVER to the cap-std slow path, whose
     /// blocking `open(2)` of a writer-less FIFO would wedge the dispatcher.
     Fifo,
+    /// The kernel reported ENOENT before any fd existed. Immutable-lower
+    /// callers may turn this into an authoritative guest miss only after
+    /// proving that the nearest existing ancestor is a contained directory;
+    /// ordinary mutable-backend callers retain their exact fallback.
+    Missing,
     /// Anything else (miss, escape, alias, exotic type, error): run the exact
     /// cap-std slow path. A fast-path failure proves nothing about the guest
     /// view — e.g. an intermediate ABSOLUTE symlink resolves against the host
     /// root here but under the guest root on the slow path.
+    Fallback,
+}
+
+/// Result of an immutable host lower's read-only regular-file fast path.
+/// `Missing` is stronger than an `Option::None`: the backend has proved the
+/// failed path lies below a contained existing directory and crosses no
+/// symlink whose Linux-rooted semantics require the layered resolver.
+pub(crate) enum ImmutableHostFileOpen {
+    Served {
+        file: std::fs::File,
+        metadata: RootFsMetadata,
+    },
+    Missing,
     Fallback,
 }
 
@@ -1793,7 +1838,10 @@ fn defer_remove_tree(path: PathBuf) {
 }
 
 /// `posix_spawn("/bin/rm", ["-rf", target])`, detached: no `waitpid`, so the
-/// child is reparented to init as this process exits.
+/// child is reparented to init as this process exits.  The reaper gets its own
+/// process group: the conformance harness intentionally `killpg`s the completed
+/// carrick invocation to catch escaped guest children, and teardown must survive
+/// that scoped cleanup long enough to finish.
 fn spawn_detached_reaper(target: &Path) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let program = std::ffi::CString::new("/bin/rm").map_err(std::io::Error::other)?;
@@ -1836,6 +1884,26 @@ fn spawn_detached_reaper(target: &Path) -> std::io::Result<()> {
             rc = add;
         }
     }
+    let mut attrs = std::mem::MaybeUninit::<libc::posix_spawnattr_t>::uninit();
+    let attr_init = unsafe { libc::posix_spawnattr_init(attrs.as_mut_ptr()) };
+    if attr_init != 0 {
+        unsafe {
+            libc::posix_spawn_file_actions_destroy(&mut actions);
+        }
+        return Err(std::io::Error::from_raw_os_error(attr_init));
+    }
+    let mut attrs = unsafe { attrs.assume_init() };
+    if rc == 0 {
+        // A pgroup value of zero makes the spawned child the leader of a new
+        // process group (setpgid(child, child)).  It remains in our session but
+        // is outside the carrick run's scoped killpg target.
+        rc = unsafe { libc::posix_spawnattr_setpgroup(&mut attrs, 0) };
+    }
+    if rc == 0 {
+        rc = unsafe {
+            libc::posix_spawnattr_setflags(&mut attrs, libc::POSIX_SPAWN_SETPGROUP as libc::c_short)
+        };
+    }
     let mut pid: libc::pid_t = 0;
     if rc == 0 {
         // SAFETY: `argv` is NUL-terminated with live CStrings; `actions`
@@ -1845,7 +1913,7 @@ fn spawn_detached_reaper(target: &Path) -> std::io::Result<()> {
                 &mut pid,
                 program.as_ptr(),
                 &actions,
-                std::ptr::null(),
+                &attrs,
                 argv.as_ptr() as *const *mut libc::c_char,
                 std::ptr::null(),
             )
@@ -1853,6 +1921,7 @@ fn spawn_detached_reaper(target: &Path) -> std::io::Result<()> {
     }
     // SAFETY: initialized above, not used after this point.
     unsafe {
+        libc::posix_spawnattr_destroy(&mut attrs);
         libc::posix_spawn_file_actions_destroy(&mut actions);
     }
     if rc != 0 {
@@ -1904,6 +1973,7 @@ impl HostFsBackend {
             owner_pid: unsafe { libc::getpid() as u32 },
             root_prefix,
             fast_fs,
+            sparse_upper_fast_miss: false,
             stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             parent_fds: parking_lot::Mutex::new(std::collections::HashMap::new()),
             cache_pid: std::sync::atomic::AtomicU32::new(0),
@@ -1917,7 +1987,18 @@ impl HostFsBackend {
             marker_absent_gen: std::sync::atomic::AtomicU64::new(0),
             meta_xattr_seen: std::sync::atomic::AtomicBool::new(false),
             meta_xattr_absent_gen: std::sync::atomic::AtomicU64::new(0),
+            whiteout_seen: std::sync::atomic::AtomicBool::new(false),
+            whiteout_absent_gen: std::sync::atomic::AtomicU64::new(0),
+            symlink_seen: std::sync::atomic::AtomicBool::new(false),
+            symlink_absent_gen: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Authorize the fail-closed sparse-upper miss proof. Callers may do this
+    /// only for a newly-created writable upper that is paired with an
+    /// immutable lower; arbitrary attached/materialized roots stay disabled.
+    pub(crate) fn enable_sparse_upper_fast_miss(&mut self) {
+        self.sparse_upper_fast_miss = true;
     }
 
     /// Walk a `RootFs` and write every file/dir/symlink into the
@@ -1953,6 +2034,7 @@ impl HostFsBackend {
             owner_pid: unsafe { libc::getpid() as u32 },
             root_prefix,
             fast_fs,
+            sparse_upper_fast_miss: false,
             stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             parent_fds: parking_lot::Mutex::new(std::collections::HashMap::new()),
             cache_pid: std::sync::atomic::AtomicU32::new(0),
@@ -1966,6 +2048,10 @@ impl HostFsBackend {
             marker_absent_gen: std::sync::atomic::AtomicU64::new(0),
             meta_xattr_seen: std::sync::atomic::AtomicBool::new(false),
             meta_xattr_absent_gen: std::sync::atomic::AtomicU64::new(0),
+            whiteout_seen: std::sync::atomic::AtomicBool::new(false),
+            whiteout_absent_gen: std::sync::atomic::AtomicU64::new(0),
+            symlink_seen: std::sync::atomic::AtomicBool::new(false),
+            symlink_absent_gen: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -2007,6 +2093,7 @@ impl HostFsBackend {
                 current_pid,
                 self._scratch.is_some() || self._attached_cleanup_path.is_some(),
             ),
+            sparse_upper_fast_miss: self.sparse_upper_fast_miss,
         })
     }
 
@@ -2038,6 +2125,7 @@ impl HostFsBackend {
             owner_pid: unsafe { libc::getpid() as u32 },
             root_prefix,
             fast_fs: fast_fs_enabled(),
+            sparse_upper_fast_miss: authority.sparse_upper_fast_miss,
             stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             parent_fds: parking_lot::Mutex::new(std::collections::HashMap::new()),
             cache_pid: std::sync::atomic::AtomicU32::new(0),
@@ -2051,6 +2139,10 @@ impl HostFsBackend {
             marker_absent_gen: std::sync::atomic::AtomicU64::new(0),
             meta_xattr_seen: std::sync::atomic::AtomicBool::new(false),
             meta_xattr_absent_gen: std::sync::atomic::AtomicU64::new(0),
+            whiteout_seen: std::sync::atomic::AtomicBool::new(false),
+            whiteout_absent_gen: std::sync::atomic::AtomicU64::new(0),
+            symlink_seen: std::sync::atomic::AtomicBool::new(false),
+            symlink_absent_gen: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -2226,7 +2318,6 @@ impl HostFsBackend {
         // containment check rejects it, and that probe must never acquire a
         // controlling terminal.
         let base = libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NOCTTY;
-        let eloop = || std::io::Error::last_os_error().raw_os_error() == Some(libc::ELOOP);
         // RW-first even for a read-only request, mirroring the slow path's
         // rw_opts preference: HVF rejects hv_vm_map of a MAP_SHARED file VMA
         // whose backing fd caps max-protection at read, so a guest O_RDONLY
@@ -2237,7 +2328,8 @@ impl HostFsBackend {
         // (EISDIR) and genuinely host-read-only files.
         let mut raw = unsafe { libc::openat(dir_fd, rel_c.as_ptr(), libc::O_RDWR | base, 0) };
         if raw < 0 {
-            if eloop() {
+            let error = std::io::Error::last_os_error().raw_os_error();
+            if error == Some(libc::ELOOP) {
                 return FastGuestOpen::SymlinkLeaf;
             }
             if write {
@@ -2245,12 +2337,15 @@ impl HostFsBackend {
                 // cap-std path produce the exact error/None it does today.
                 return FastGuestOpen::Fallback;
             }
+            if error == Some(libc::ENOENT) {
+                return FastGuestOpen::Missing;
+            }
             raw = unsafe { libc::openat(dir_fd, rel_c.as_ptr(), libc::O_RDONLY | base, 0) };
             if raw < 0 {
-                return if eloop() {
-                    FastGuestOpen::SymlinkLeaf
-                } else {
-                    FastGuestOpen::Fallback
+                return match std::io::Error::last_os_error().raw_os_error() {
+                    Some(libc::ELOOP) => FastGuestOpen::SymlinkLeaf,
+                    Some(libc::ENOENT) => FastGuestOpen::Missing,
+                    _ => FastGuestOpen::Fallback,
                 };
             }
         }
@@ -2298,6 +2393,123 @@ impl HostFsBackend {
             libc::fcntl(raw, libc::F_SETFL, 0);
         }
         FastGuestOpen::Served { fd, stat: st, kind }
+    }
+
+    /// Prove that an ENOENT from `fast_open_for_guest` is a real miss in this
+    /// immutable tree. Walk upward only across ENOENT ancestors until an
+    /// existing directory can be opened and containment-checked. Encountering
+    /// a symlink leaf (ELOOP), non-directory, escape, Unicode alias, or any
+    /// unexpected host error fails closed to the layered resolver.
+    #[cfg(target_os = "macos")]
+    fn missing_below_contained_ancestor(&self, rel: &Path) -> bool {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let Some(root_prefix) = self.root_prefix.as_deref() else {
+            return false;
+        };
+        let mut candidate = rel.parent();
+        loop {
+            let Some(parent) = candidate else {
+                return true;
+            };
+            if parent.as_os_str().is_empty() {
+                // `self.dir` is the already-open immutable root authority.
+                return true;
+            }
+            let Ok(parent_c) = std::ffi::CString::new(parent.as_os_str().as_bytes()) else {
+                return false;
+            };
+            const O_EVTONLY: libc::c_int = 0x8000;
+            let raw = unsafe {
+                libc::openat(
+                    self.dir.as_raw_fd(),
+                    parent_c.as_ptr(),
+                    O_EVTONLY
+                        | libc::O_NONBLOCK
+                        | libc::O_CLOEXEC
+                        | libc::O_NOFOLLOW
+                        | libc::O_NOCTTY,
+                    0,
+                )
+            };
+            if raw < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+                    candidate = parent.parent();
+                    continue;
+                }
+                return false;
+            }
+            // SAFETY: `raw` is a freshly-opened owned descriptor.
+            let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+            let mut stat: libc::stat = unsafe { core::mem::zeroed() };
+            if unsafe { libc::fstat(raw, &mut stat) } != 0
+                || stat.st_mode as u32 & libc::S_IFMT as u32 != libc::S_IFDIR as u32
+                || !fd_contained_under(raw, root_prefix)
+                || !self.name_matches_on_disk(parent)
+            {
+                return false;
+            }
+            drop(fd);
+            return true;
+        }
+    }
+
+    /// Immutable-lower sibling of `open_raw_fd_with_metadata`: successful
+    /// files and authoritative contained misses are typed separately from the
+    /// semantic fallback cases.
+    pub(crate) fn open_immutable_file_readonly(&self, path: &str) -> ImmutableHostFileOpen {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd as _;
+
+            let Some(normalized) = normalize(path) else {
+                return ImmutableHostFileOpen::Fallback;
+            };
+            let Some(rel) = Self::rel_path(&normalized) else {
+                return ImmutableHostFileOpen::Fallback;
+            };
+            match self.fast_open_for_guest(rel, false) {
+                FastGuestOpen::Served {
+                    fd,
+                    stat,
+                    kind: RootFsEntryKind::File,
+                } => {
+                    let (override_mode, _uid, _gid, is_socket) = fd_carrick_meta(fd.as_raw_fd());
+                    if is_socket {
+                        return ImmutableHostFileOpen::Fallback;
+                    }
+                    let on_disk_mode = stat.st_mode as u32 & 0o7777;
+                    let mode = override_mode.unwrap_or(if on_disk_mode == 0 {
+                        0o644
+                    } else {
+                        on_disk_mode
+                    });
+                    ImmutableHostFileOpen::Served {
+                        file: std::fs::File::from(fd),
+                        metadata: RootFsMetadata {
+                            path: normalized,
+                            kind: RootFsEntryKind::File,
+                            mode,
+                            size: stat.st_size as usize,
+                        },
+                    }
+                }
+                FastGuestOpen::Missing if self.missing_below_contained_ancestor(rel) => {
+                    ImmutableHostFileOpen::Missing
+                }
+                FastGuestOpen::Served { .. }
+                | FastGuestOpen::SymlinkLeaf
+                | FastGuestOpen::Fifo
+                | FastGuestOpen::Missing
+                | FastGuestOpen::Fallback => ImmutableHostFileOpen::Fallback,
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = path;
+            ImmutableHostFileOpen::Fallback
+        }
     }
 
     /// A plain `O_RDONLY` fd on the sandbox root itself, for root-directory
@@ -2373,6 +2585,152 @@ impl HostFsBackend {
     /// can stream a directory while a marker node is observable in it.
     fn stamp_marker_node_marker(&self) {
         self.stamp_root_marker(CARRICK_HAS_MARKER_NODES_XATTR, &self.marker_seen);
+    }
+
+    fn may_have_whiteouts(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.whiteout_seen.load(Relaxed) {
+            return true;
+        }
+        let now = crate::fs_resolve_cache::current_generation();
+        if self.whiteout_absent_gen.load(Relaxed) == now {
+            return false;
+        }
+        match self.root_marker_xattr(CARRICK_HAS_WHITEOUTS_XATTR) {
+            RootMarker::Present => {
+                self.whiteout_seen.store(true, Relaxed);
+                true
+            }
+            RootMarker::Absent => {
+                self.whiteout_absent_gen.store(now, Relaxed);
+                false
+            }
+            // Fail closed: checking for a sidecar is safe on a filesystem that
+            // cannot carry the root xattr; incorrectly skipping one is not.
+            RootMarker::Unknown => true,
+        }
+    }
+
+    fn may_have_upper_symlinks(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.symlink_seen.load(Relaxed) {
+            return true;
+        }
+        let now = crate::fs_resolve_cache::current_generation();
+        if self.symlink_absent_gen.load(Relaxed) == now {
+            return false;
+        }
+        match self.root_marker_xattr(CARRICK_HAS_SYMLINKS_XATTR) {
+            RootMarker::Present => {
+                self.symlink_seen.store(true, Relaxed);
+                true
+            }
+            RootMarker::Absent => {
+                self.symlink_absent_gen.store(now, Relaxed);
+                false
+            }
+            RootMarker::Unknown => true,
+        }
+    }
+
+    /// One kernel lookup proves an entry absent from a sparse upper. The proof
+    /// is valid only while the upper has never contained a symlink: otherwise
+    /// an intermediate absolute/relative link requires Carrick's Linux-rooted
+    /// layered resolver rather than Darwin's host-rooted path walk.
+    #[cfg(target_os = "macos")]
+    fn sparse_upper_nofollow_absent(&self, path: &str) -> bool {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        if !self.sparse_upper_fast_miss || !self.fast_fs {
+            return false;
+        }
+        let generation = crate::fs_resolve_cache::current_generation();
+        // Whiteouts can hide an entire lower directory, so checking only the
+        // queried leaf cannot prove the layered path. Keep the fast miss
+        // armed only while the sparse upper has never published any
+        // whiteout; workloads without lower deletions retain the one-call
+        // proof, and the first deletion fails closed globally.
+        if self.may_have_upper_symlinks() || self.may_have_whiteouts() {
+            return false;
+        }
+        let Some(normalized) = normalize(path) else {
+            return false;
+        };
+        let Some(rel) = Self::rel_path(&normalized) else {
+            return false;
+        };
+        let Ok(path) = std::ffi::CString::new(rel.as_os_str().as_bytes()) else {
+            return false;
+        };
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let rc = unsafe {
+            libc::fstatat(
+                self.dir.as_raw_fd(),
+                path.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        rc < 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT)
+            // A symlink creator stamps its durable marker and bumps BEFORE
+            // publishing the link. Any concurrent structural change therefore
+            // invalidates the proof instead of racing it into a false miss.
+            && crate::fs_resolve_cache::current_generation() == generation
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn sparse_upper_nofollow_absent(&self, _path: &str) -> bool {
+        false
+    }
+
+    fn is_whiteouted_normalized(&self, normalized: &Path) -> bool {
+        use std::os::unix::ffi::OsStrExt as _;
+        if !self.may_have_whiteouts() {
+            return false;
+        }
+        let Some(marker) = host_whiteout_sidecar_rel(normalized) else {
+            return false;
+        };
+        let Some(leaf) = normalized.file_name() else {
+            return false;
+        };
+        let Ok((dir, at_marker)) = self.at(&marker) else {
+            return false;
+        };
+        dir.read(&at_marker)
+            .is_ok_and(|stored| stored == leaf.as_bytes())
+    }
+
+    fn clear_whiteout_normalized(&self, normalized: &Path) {
+        let Some(marker) = host_whiteout_sidecar_rel(normalized) else {
+            return;
+        };
+        if let Ok((dir, at_marker)) = self.at(&marker) {
+            let _ = dir.remove_file(&at_marker);
+        }
+    }
+
+    fn write_whiteout_normalized(&self, normalized: &Path) -> Result<(), BackendError> {
+        use std::os::unix::ffi::OsStrExt as _;
+        let marker = host_whiteout_sidecar_rel(normalized).ok_or(BackendError::Invalid)?;
+        let leaf = normalized.file_name().ok_or(BackendError::Invalid)?;
+        self.stamp_root_marker(CARRICK_HAS_WHITEOUTS_XATTR, &self.whiteout_seen);
+        let (dir, at_marker) = self.at(&marker).map_err(|_| BackendError::Io)?;
+        if let Some(parent) = at_marker.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            dir.create_dir_all(parent).map_err(|_| BackendError::Io)?;
+        }
+        let _ = dir.remove_file(&at_marker);
+        dir.write(&at_marker, leaf.as_bytes())
+            .map_err(|_| BackendError::Io)?;
+        // This is the deletion's cross-process linearization point: the
+        // sidecar is durable before every forked process's cached-absent
+        // generation becomes stale.
+        crate::fs_resolve_cache::bump_generation();
+        Ok(())
     }
 
     /// The cap-std slow path of [`FsBackend::open_raw_fd`]: manual leaf
@@ -3052,6 +3410,15 @@ const CARRICK_HAS_MARKER_NODES_XATTR: &[u8] = b"user.carrick.has_marker_nodes\0"
 /// per-entry xattr probe entirely. Device/socket marker nodes stamp their own
 /// mode xattrs but are covered by [`CARRICK_HAS_MARKER_NODES_XATTR`].
 const CARRICK_HAS_META_XATTRS_XATTR: &[u8] = b"user.carrick.has_meta_xattrs\0";
+/// Durable root marker asserting that adjacent sparse-upper whiteout sidecars
+/// may exist. Stamped before the first sidecar and never removed; absence may
+/// be cached against the shared filesystem generation.
+const CARRICK_HAS_WHITEOUTS_XATTR: &[u8] = b"user.carrick.has_whiteouts\0";
+/// Durable root marker asserting that the sparse upper may contain a symlink.
+/// Stamped and generation-published before the first link itself is visible,
+/// so an absent marker is a fail-closed prerequisite for the one-lookup sparse
+/// upper miss path.
+const CARRICK_HAS_SYMLINKS_XATTR: &[u8] = b"user.carrick.has_symlinks\0";
 
 /// The errno that means "xattr not present" (as opposed to "this filesystem
 /// cannot do xattrs", which must fail CLOSED — see `root_fifo_marker`).
@@ -3520,6 +3887,10 @@ fn path_set_u32_xattr(dir: &cap_std::fs::Dir, rel: &Path, name: &[u8], val: u32)
 /// cap-std `Dir` as the link itself. macOS keeps the XATTR_NOFOLLOW path above.
 const LINK_OWNER_SIDECAR_PREFIX: &str = ".carrick-lnkown.";
 const LINK_XATTR_SIDECAR_PREFIX: &str = ".carrick-lnkxattr.";
+/// Adjacent sparse-upper whiteout. The suffix is SHA-256 of the host-encoded
+/// leaf, keeping the internal name below `NAME_MAX`; the marker body stores the
+/// exact leaf so directory merging can recover it and reject corruption.
+const HOST_WHITEOUT_SIDECAR_PREFIX: &str = ".carrick-whiteout.";
 
 /// True iff `name` is one of carrick's internal per-symlink sidecar files.
 /// Directory enumeration must hide these regardless of backend: they are
@@ -3527,10 +3898,24 @@ const LINK_XATTR_SIDECAR_PREFIX: &str = ".carrick-lnkxattr.";
 pub(crate) fn is_internal_sidecar_name(name: &str) -> bool {
     name.starts_with(LINK_OWNER_SIDECAR_PREFIX)
         || name.starts_with(LINK_XATTR_SIDECAR_PREFIX)
+        || name.starts_with(HOST_WHITEOUT_SIDECAR_PREFIX)
         // The layer cache's clean-metadata marker rides into the per-run
         // scratch with the COW clone; it is carrick bookkeeping, never a
         // guest-visible entry.
         || name == crate::layer_cache::CLEAN_META_MARKER
+}
+
+fn host_whiteout_sidecar_rel(normalized: &Path) -> Option<PathBuf> {
+    use sha2::{Digest as _, Sha256};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let leaf = normalized.file_name()?;
+    let digest = Sha256::digest(leaf.as_bytes());
+    let marker = format!("{HOST_WHITEOUT_SIDECAR_PREFIX}{digest:x}");
+    Some(match normalized.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(marker),
+        _ => PathBuf::from(marker),
+    })
 }
 
 /// Map a carrick xattr name (`b"user.carrick.uid\0"`) to its short sidecar key
@@ -3709,6 +4094,9 @@ impl FsBackend for HostFsBackend {
 
     fn lookup(&self, path: &str) -> Option<OverlayEntry> {
         let normalized = normalize(path)?;
+        if self.is_whiteouted_normalized(&normalized) {
+            return Some(OverlayEntry::Deleted);
+        }
         if normalized.as_os_str().is_empty() {
             // The sandbox root is always a directory.
             return Some(OverlayEntry::Dir);
@@ -3772,6 +4160,9 @@ impl FsBackend for HostFsBackend {
 
     fn lookup_kind(&self, path: &str) -> Option<OverlayEntryKind> {
         let normalized = normalize(path)?;
+        if self.is_whiteouted_normalized(&normalized) {
+            return Some(OverlayEntryKind::Deleted);
+        }
         if normalized.as_os_str().is_empty() {
             return Some(OverlayEntryKind::Dir);
         }
@@ -3794,6 +4185,9 @@ impl FsBackend for HostFsBackend {
                 RootFsEntryKind::File => Some(OverlayEntryKind::File),
                 _ => None,
             };
+        }
+        if self.sparse_upper_nofollow_absent(path) {
+            return None;
         }
         let (dir, at_rel) = self.at(rel).ok()?;
         let meta = dir.symlink_metadata(&at_rel).ok()?;
@@ -3845,8 +4239,15 @@ impl FsBackend for HostFsBackend {
         }
     }
 
+    fn fast_nofollow_absent(&self, path: &str) -> bool {
+        self.sparse_upper_nofollow_absent(path)
+    }
+
     fn metadata(&self, path: &str) -> Option<RootFsMetadata> {
         let normalized = normalize(path)?;
+        if self.is_whiteouted_normalized(&normalized) {
+            return None;
+        }
         // The sandbox root ("/") is always a directory. rel_path refuses
         // to yield a relative path for it, so report it directly — once
         // the rootfs layer is dropped (--fs host) this is the only source
@@ -3868,6 +4269,9 @@ impl FsBackend for HostFsBackend {
         #[cfg(target_os = "macos")]
         if let Some(metadata) = self.fast_metadata_contained(&normalized, rel) {
             return Some(metadata);
+        }
+        if self.sparse_upper_nofollow_absent(path) {
+            return None;
         }
         let (dir, at_rel) = self.at(rel).ok()?;
         let meta = dir.symlink_metadata(&at_rel).ok()?;
@@ -3955,6 +4359,11 @@ impl FsBackend for HostFsBackend {
         &self,
         path: &str,
     ) -> (Option<OverlayEntryKind>, Option<RootFsMetadata>) {
+        if let Some(normalized) = normalize(path)
+            && self.is_whiteouted_normalized(&normalized)
+        {
+            return (Some(OverlayEntryKind::Deleted), None);
+        }
         // The layered `Vfs::lookup` needs BOTH the overlay kind and the
         // backend metadata; answered separately (`lookup_kind` then
         // `metadata`) each ran its own contained open — two kernel walks for
@@ -4094,6 +4503,10 @@ impl FsBackend for HostFsBackend {
     }
 
     fn file_contents(&self, path: &str) -> Option<Vec<u8>> {
+        let typed = normalize(path)?;
+        if self.is_whiteouted_normalized(&typed) {
+            return None;
+        }
         // Follow symlinks by hand so an absolute target resolves under the
         // guest root (cap-std won't traverse it). See `resolve_following`.
         let normalized = self.resolve_following(path)?;
@@ -4106,6 +4519,10 @@ impl FsBackend for HostFsBackend {
     }
 
     fn file_head(&self, path: &str, max: usize) -> Option<Vec<u8>> {
+        let typed = normalize(path)?;
+        if self.is_whiteouted_normalized(&typed) {
+            return None;
+        }
         // Bounded sibling of `file_contents`: same resolution, but reads at
         // most `max` bytes. The execve path probes existence and the `#!`
         // head this way, so a 20 MB `go` tool no longer costs a full read
@@ -4121,6 +4538,10 @@ impl FsBackend for HostFsBackend {
     }
 
     fn open_file_readonly(&self, path: &str) -> Option<std::fs::File> {
+        let typed = normalize(path)?;
+        if self.is_whiteouted_normalized(&typed) {
+            return None;
+        }
         // Same contained resolution as `file_contents`/`file_head`; the fd is
         // handed to the execve image mapper, so only REGULAR files qualify.
         let normalized = self.resolve_following(path)?;
@@ -4148,6 +4569,7 @@ impl FsBackend for HostFsBackend {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(_) => return Err(BackendError::Io),
         }
+        self.clear_whiteout_normalized(&normalized);
         Ok(())
     }
 
@@ -4164,6 +4586,7 @@ impl FsBackend for HostFsBackend {
         opts.create(true).write(true).truncate(false);
         dir.open_with(&at_rel, &opts)
             .map_err(|_| BackendError::Io)?;
+        self.clear_whiteout_normalized(&normalized);
         Ok(())
     }
 
@@ -4320,6 +4743,12 @@ impl FsBackend for HostFsBackend {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
         let (dir, at_rel) = self.at(rel).map_err(|_| BackendError::Io)?;
+        // Materialising a lower-only path into the sparse upper changes which
+        // backing object the layered namespace must serve, even though the
+        // guest-visible pathname already existed. Invalidate inherited lower
+        // dirfd anchors only for that first copy-up; content rewrites of an
+        // existing upper file remain non-structural and keep caches hot.
+        let creates_upper_shadow = dir.symlink_metadata(&at_rel).is_err();
         if let Some(parent) = at_rel.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -4333,7 +4762,21 @@ impl FsBackend for HostFsBackend {
         file.seek(SeekFrom::Start(0))
             .map_err(|_| BackendError::Io)?;
         file.write_all(&contents).map_err(|_| BackendError::Io)?;
+        self.clear_whiteout_normalized(&normalized);
+        if creates_upper_shadow {
+            crate::fs_resolve_cache::bump_generation();
+        }
         Ok(())
+    }
+
+    fn create_file_from_rootfs(
+        &self,
+        path: &str,
+        contents: Arc<[u8]>,
+        mode: u32,
+    ) -> Result<(), BackendError> {
+        self.set_file_contents(path, contents.as_ref().to_vec())?;
+        self.set_mode(path, mode)
     }
 
     fn write_file_range(
@@ -4426,7 +4869,7 @@ impl FsBackend for HostFsBackend {
             let _ = dir.remove_file(&at_rel);
             let _ = dir.remove_dir(&at_rel);
         }
-        Ok(())
+        self.write_whiteout_normalized(&normalized)
     }
 
     fn child_names(&self, dir: &str) -> Vec<(String, RootFsEntryKind, Option<u64>)> {
@@ -4488,10 +4931,51 @@ impl FsBackend for HostFsBackend {
     }
 
     fn deleted_child_names(&self, dir: &str) -> Vec<String> {
-        let _ = dir;
-        // Host backend is disk-authoritative: deletions are real unlinks,
-        // so there are no tombstoned children to surface.
-        Vec::new()
+        use std::os::unix::ffi::OsStringExt as _;
+        if !self.may_have_whiteouts() {
+            return Vec::new();
+        }
+        let Some(normalized) = normalize(dir) else {
+            return Vec::new();
+        };
+        let read = match Self::rel_path(&normalized) {
+            Some(rel) => match self.at(rel) {
+                Ok((dir, at_rel)) => dir.read_dir(&at_rel),
+                Err(error) => Err(error),
+            },
+            None => self.dir.entries(),
+        };
+        let Ok(read) = read else {
+            return Vec::new();
+        };
+        let mut deleted = Vec::new();
+        for entry in read.flatten() {
+            let marker_name = entry.file_name().to_string_lossy().into_owned();
+            if !marker_name.starts_with(HOST_WHITEOUT_SIDECAR_PREFIX) {
+                continue;
+            }
+            let marker_path = if normalized.as_os_str().is_empty() {
+                PathBuf::from(&marker_name)
+            } else {
+                normalized.join(&marker_name)
+            };
+            let Ok((marker_dir, at_marker)) = self.at(&marker_path) else {
+                continue;
+            };
+            let Ok(leaf) = marker_dir.read(&at_marker) else {
+                continue;
+            };
+            let leaf_path = PathBuf::from(std::ffi::OsString::from_vec(leaf));
+            if leaf_path.components().count() == 1
+                && matches!(leaf_path.components().next(), Some(Component::Normal(_)))
+                && host_whiteout_sidecar_rel(&normalized.join(&leaf_path))
+                    .and_then(|path| path.file_name().map(ToOwned::to_owned))
+                    .is_some_and(|expected| expected == entry.file_name())
+            {
+                deleted.push(leaf_path.to_string_lossy().into_owned());
+            }
+        }
+        deleted
     }
 
     fn rename_overlay_entry(&self, from: &str, to: &str) -> Result<bool, BackendError> {
@@ -4663,7 +5147,7 @@ impl FsBackend for HostFsBackend {
                 FastGuestOpen::Fifo => {
                     return self.open_fifo_nonblock(path, if write { 2 } else { 0 });
                 }
-                FastGuestOpen::SymlinkLeaf | FastGuestOpen::Fallback => {}
+                FastGuestOpen::SymlinkLeaf | FastGuestOpen::Missing | FastGuestOpen::Fallback => {}
             }
         }
         self.open_raw_fd_capstd(path, write, create, trunc)
@@ -4716,7 +5200,7 @@ impl FsBackend for HostFsBackend {
                 // metadata + `open_raw_fd` sequence (whose own Fifo route
                 // stays non-blocking).
                 FastGuestOpen::Fifo => return None,
-                FastGuestOpen::SymlinkLeaf | FastGuestOpen::Fallback => {}
+                FastGuestOpen::SymlinkLeaf | FastGuestOpen::Missing | FastGuestOpen::Fallback => {}
             }
         }
         let fd = self.open_raw_fd_capstd(path, write, create, trunc)?;
@@ -4943,6 +5427,11 @@ impl FsBackend for HostFsBackend {
                 .create_dir_all(parent)
                 .map_err(|_| BackendError::Io)?;
         }
+        // Publish the conservative truth BEFORE the symlink itself. The
+        // generation edge invalidates every process's cached marker absence;
+        // a failed creation merely leaves the fast miss path safely disarmed.
+        self.stamp_root_marker(CARRICK_HAS_SYMLINKS_XATTR, &self.symlink_seen);
+        crate::fs_resolve_cache::bump_generation();
         // symlink_contents stores `target` verbatim (it may be absolute or
         // dangling), which is the Linux symlinkat(2) semantic.
         self.dir
@@ -5213,6 +5702,9 @@ impl FsBackend for HostFsBackend {
     fn read_link(&self, path: &str) -> Option<String> {
         let normalized = normalize(path)?;
         let rel = Self::rel_path(&normalized)?;
+        if self.sparse_upper_nofollow_absent(path) {
+            return None;
+        }
         let (dir, at_rel) = self.at(rel).ok()?;
         let target = dir.read_link_contents(&at_rel).ok()?;
         // The stored target is already in the host's canonical (escape-encoded
@@ -5792,7 +6284,7 @@ impl FsBackend for HostFsBackend {
     }
 }
 
-fn default_scratch_root() -> std::io::Result<PathBuf> {
+pub(crate) fn default_scratch_root() -> std::io::Result<PathBuf> {
     // Prefer the dedicated carrick APFS volume (case-sensitive, isolated,
     // throw-away-able via `carrick volume delete`) when it exists. The
     // user lays it down once via `carrick volume create`; without it we
@@ -6182,6 +6674,88 @@ mod tests {
 
     // -- HostFsBackend ------------------------------------------------
 
+    /// A successful detached spawn must actually remove the tree, not merely
+    /// report that `posix_spawn(3)` created a child which then exits before
+    /// invoking `rm`.  If this breaks, every normal run leaves a full OCI
+    /// scratch behind and the next `HostFsBackend::new` pays for it
+    /// synchronously in `sweep_orphans`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn detached_reaper_removes_nonempty_tree() {
+        let parent = tempfile::TempDir::new().expect("reaper test parent");
+        let victim = parent.path().join("victim");
+        std::fs::create_dir(&victim).expect("create victim");
+        std::fs::write(victim.join("file"), b"payload").expect("seed victim");
+
+        spawn_detached_reaper(&victim).expect("spawn detached reaper");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while victim.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !victim.exists(),
+            "spawned reaper exited without removing its target"
+        );
+    }
+
+    /// The conformance harness kills the completed carrick invocation's
+    /// process group to reap escaped guest children.  A teardown worker that
+    /// inherits that group is killed too, leaving the full scratch tree for
+    /// the next run's synchronous orphan sweep.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn detached_reaper_survives_creator_process_group_cleanup() {
+        use std::os::unix::process::CommandExt as _;
+
+        const HELPER_TARGET_ENV: &str = "CARRICK_TEST_REAPER_TARGET";
+        if let Some(victim) = std::env::var_os(HELPER_TARGET_ENV) {
+            spawn_detached_reaper(std::path::Path::new(&victim))
+                .expect("helper spawns detached reaper");
+            return;
+        }
+
+        let parent = tempfile::TempDir::new().expect("reaper test parent");
+        let victim = parent.path().join("victim");
+        std::fs::create_dir(&victim).expect("create victim");
+        for index in 0..4_096 {
+            std::fs::write(victim.join(format!("file-{index}")), b"payload").expect("seed victim");
+        }
+
+        let mut helper =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"));
+        helper
+            .arg("fs_backend::tests::detached_reaper_survives_creator_process_group_cleanup")
+            .arg("--exact")
+            .env(HELPER_TARGET_ENV, &victim)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+        let helper = helper.spawn().expect("spawn reaper helper");
+        let helper_pid = helper.id() as i32;
+        let status = helper
+            .wait_with_output()
+            .expect("wait for reaper helper")
+            .status;
+        assert!(status.success(), "reaper helper failed: {status}");
+
+        // This is the canonical harness cleanup operation.  The creator is
+        // already gone; any descendant that remained in its group is killed.
+        unsafe {
+            libc::kill(-helper_pid, libc::SIGKILL);
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while victim.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !victim.exists(),
+            "reaper inherited the creator's process group and was killed by canonical cleanup"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     fn host_backend() -> (HostFsBackend, tempfile::TempDir) {
         let scratch = tempfile::TempDir::new().unwrap();
@@ -6213,6 +6787,28 @@ mod tests {
         assert!(b.open_trusted_dir_fd("/alias/sub").is_none());
         assert!(b.open_trusted_dir_fd("/plain").is_none());
         assert!(b.open_trusted_dir_fd("/missing").is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sparse_upper_fast_absence_disarms_before_a_symlink_is_visible() {
+        let (mut b, _scratch) = host_backend();
+        b.enable_sparse_upper_fast_miss();
+
+        assert!(b.fast_nofollow_absent("/missing"));
+        b.make_dir("/target").unwrap();
+        b.create_file("/target/file").unwrap();
+        b.symlink("target", "/alias").unwrap();
+
+        assert!(
+            !b.fast_nofollow_absent("/alias/file"),
+            "a durable symlink marker must disarm authoritative upper misses"
+        );
+        assert_eq!(
+            b.lookup_kind("/alias/file"),
+            Some(OverlayEntryKind::File),
+            "the conservative fallback must still follow the upper symlink"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -6261,6 +6857,19 @@ mod tests {
             resumed.file_contents("/handoff"),
             Some(b"same-root".to_vec())
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_backend_reexec_authority_preserves_sparse_upper_fast_miss() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut backend = HostFsBackend::attach(scratch.path()).unwrap();
+        backend.enable_sparse_upper_fast_miss();
+        let authority = backend.native_reexec_authority().unwrap();
+        assert!(authority.sparse_upper_fast_miss);
+
+        let resumed = HostFsBackend::attach_for_reexec(&authority).unwrap();
+        assert!(resumed.fast_nofollow_absent("/lower-only"));
     }
 
     #[cfg(target_os = "macos")]

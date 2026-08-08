@@ -836,6 +836,12 @@ impl std::fmt::Debug for PidfdWatch {
 #[derive(Debug, Clone)]
 pub(super) struct TrustedHostDir {
     pub(super) fd: HostFdRef,
+    /// Structural-generation stamp for a directory anchored in the immutable
+    /// cached lower. `None` means the fd belongs to the historical
+    /// materialized host root, which is itself the merged namespace. A lower
+    /// fd is usable directly only while the sparse upper's shared generation
+    /// still matches this stamp.
+    pub(super) immutable_lower_generation: Option<u64>,
     /// True once `entries` has been materialized from this fd (one streamed
     /// readdir batch, no per-child stat). Cleared by an `lseek(0, SEEK_SET)`
     /// rewind so the next `getdents64` takes a FRESH snapshot (matching
@@ -847,8 +853,22 @@ impl TrustedHostDir {
     pub(super) fn new(fd: HostFdRef) -> Self {
         Self {
             fd,
+            immutable_lower_generation: None,
             entries_loaded: false,
         }
+    }
+
+    pub(super) fn immutable_lower(fd: HostFdRef, generation: u64) -> Self {
+        Self {
+            fd,
+            immutable_lower_generation: Some(generation),
+            entries_loaded: false,
+        }
+    }
+
+    pub(super) fn namespace_is_current(&self) -> bool {
+        self.immutable_lower_generation
+            .is_none_or(|generation| crate::fs_resolve_cache::current_generation() == generation)
     }
 }
 

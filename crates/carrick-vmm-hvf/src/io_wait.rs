@@ -302,6 +302,7 @@ impl ThreadWaiter {
         let kq = Kqueue::new_internal();
         let process_pipe_read = crate::host_signal::pending_pipe_read_fd();
         let thread_wake = crate::host_signal::register_thread_waiter(tid.raw());
+        let mut wake_pipe_dead = process_pipe_read < 0 && thread_wake.is_none();
         if let Some(kq) = kq.as_ref() {
             let mut changes = Vec::with_capacity(2);
             if process_pipe_read >= 0 {
@@ -317,14 +318,19 @@ impl ThreadWaiter {
                 changes.push(wake_pipe_read_kevent(thread_wake.read_fd()));
             }
             if !changes.is_empty() {
-                let _ = kq.apply(&changes);
+                if kq.apply(&changes).is_err() {
+                    // A kqueue without its wake filters must never enter an
+                    // unbounded healthy-path park. Mark it degraded so waits
+                    // use poll's bounded correctness fallback instead.
+                    wake_pipe_dead = true;
+                }
             }
         }
         Self {
             kq,
             process_pipe_read,
             thread_wake,
-            wake_pipe_dead: AtomicBool::new(false),
+            wake_pipe_dead: AtomicBool::new(wake_pipe_dead),
             tid,
             deferred_full_init: false,
         }
@@ -489,7 +495,7 @@ impl ThreadWaiter {
                 return result;
             }
         }
-        result = self.fallback_poll(wait_fds, timeout, block_mask);
+        result = self.fallback_poll(wait_fds, timeout, block_mask, wake_on_signal_pipe);
         crate::probes::io_wait_end(
             self.tid.raw(),
             wait_result_code(result),
@@ -536,8 +542,10 @@ impl ThreadWaiter {
     }
 
     /// Wait for a child stop/continue notification that cannot use
-    /// `EVFILT_PROC`/`NOTE_EXIT`. A signal-pipe edge prompts immediate
-    /// re-dispatch; the 50 ms timeout is a lost-edge backstop.
+    /// `EVFILT_PROC`/`NOTE_EXIT`. The pre-check runs after this waiter has
+    /// registered its private wake pipe; a publisher records durable state
+    /// before writing that pipe, so the pipe's level readability closes the
+    /// check-to-park race without a periodic timer.
     pub fn wait_proc_state_with_dispatch_pending<F>(
         &self,
         block_mask: carrick_abi::SigBlockMask,
@@ -549,14 +557,13 @@ impl ThreadWaiter {
         if should_interrupt() {
             return WaitResult::Interrupted;
         }
-        let timeout = Some(Duration::from_millis(50));
         let result;
         #[cfg(target_os = "macos")]
         {
             if !self.has_dead_wake_pipe()
                 && let Some(kq) = self.kq.as_ref()
             {
-                result = self.wait_kqueue(kq, &[], timeout, block_mask, true);
+                result = self.wait_kqueue(kq, &[], None, block_mask, true);
                 return if result == WaitResult::Ready && should_interrupt() {
                     WaitResult::Interrupted
                 } else {
@@ -564,7 +571,10 @@ impl ThreadWaiter {
                 };
             }
         }
-        result = self.fallback_poll(&[], timeout, block_mask);
+        // Degraded path only: without a live kqueue+wake channel there is no
+        // event source for non-terminal child state, so retain a bounded
+        // correctness poll instead of pretending an unbounded park is safe.
+        result = self.fallback_poll(&[], Some(Duration::from_millis(50)), block_mask, true);
         if result == WaitResult::Ready && should_interrupt() {
             WaitResult::Interrupted
         } else {
@@ -580,6 +590,16 @@ impl ThreadWaiter {
         fds: &[WaitFd],
         timeout: Option<Duration>,
         block_mask: carrick_abi::SigBlockMask,
+    ) -> WaitResult {
+        self.wait_poll_inner(fds, timeout, block_mask, false)
+    }
+
+    fn wait_poll_inner(
+        &self,
+        fds: &[WaitFd],
+        timeout: Option<Duration>,
+        block_mask: carrick_abi::SigBlockMask,
+        wake_on_signal_pipe: bool,
     ) -> WaitResult {
         let fd0 = fds.first().map_or(-1, WaitFd::fd);
         let events0 = fds.first().map_or(0, |fd| i32::from(fd.events()));
@@ -619,7 +639,12 @@ impl ThreadWaiter {
                 return WaitResult::Errno(errno);
             }
         };
-        let result = self.poll_with_signal(pinned_fds.as_wait_fds(), timeout, block_mask);
+        let result = self.poll_with_signal(
+            pinned_fds.as_wait_fds(),
+            timeout,
+            block_mask,
+            wake_on_signal_pipe,
+        );
         crate::probes::io_wait_end(
             self.tid.raw(),
             wait_result_code(result),
@@ -644,7 +669,12 @@ impl ThreadWaiter {
         if should_interrupt() {
             return WaitResult::Interrupted;
         }
-        self.wait_poll(fds, timeout, block_mask)
+        let result = self.wait_poll_inner(fds, timeout, block_mask, true);
+        if matches!(result, WaitResult::Ready | WaitResult::Interrupted) && should_interrupt() {
+            WaitResult::Interrupted
+        } else {
+            result
+        }
     }
 
     /// Block until process `pid` exits, any child exits for `pid <= 0`, a signal
@@ -721,7 +751,12 @@ impl ThreadWaiter {
         if should_interrupt() {
             return WaitResult::Interrupted;
         }
-        self.wait_proc_exit(pid, block_mask)
+        let result = self.wait_proc_exit(pid, block_mask);
+        if matches!(result, WaitResult::Ready | WaitResult::Interrupted) && should_interrupt() {
+            WaitResult::Interrupted
+        } else {
+            result
+        }
     }
 
     /// Park in `kevent()` on the long-lived per-thread kqueue until `pid` exits,
@@ -739,15 +774,29 @@ impl ThreadWaiter {
         let cap = (1 + self.signal_pipe_count()).max(1);
         let mut events_out: Vec<Kevent> = vec![Kevent::empty(); cap];
         let result = loop {
-            // Bound the wait even when a signal pipe exists. A freshly forked
-            // child can race signal-pump/self-pipe reinitialisation; the kqueue
-            // event is still the fast path, but this retry guarantees a pending
-            // guest signal is observed instead of losing the wake edge forever.
-            let ts = Some(libc::timespec {
+            // Install the NOTE_EXIT watch non-blocking, then peek child state
+            // once more. That closes the only edge race: an exit before the
+            // registration is visible to waitid(WNOWAIT), while an exit after
+            // registration fires the knote. Healthy subsequent waits need no
+            // timer. Only a missing/dead signal wake channel retains a bounded
+            // degraded slice so non-child interrupts remain observable.
+            let registering = !changes.is_empty();
+            let zero = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            let degraded = libc::timespec {
                 tv_sec: 0,
                 tv_nsec: 50_000_000,
-            });
-            let n = match kq.wait(&changes, &mut events_out, ts.as_ref()) {
+            };
+            let ts = if registering {
+                Some(&zero)
+            } else if self.signal_pipe_count() == 0 {
+                Some(&degraded)
+            } else {
+                None
+            };
+            let n = match kq.wait(&changes, &mut events_out, ts) {
                 Ok(n) => n,
                 Err(e) => {
                     if self.should_interrupt(block_mask) {
@@ -758,7 +807,6 @@ impl ThreadWaiter {
                     // cannot be cured by retrying the same kqueue, so report it
                     // dead and let the caller poll rather than spin.
                     if e == libc::EINTR {
-                        changes.clear();
                         continue;
                     }
                     return ProcExitWait::KqueueDead;
@@ -819,6 +867,13 @@ impl ThreadWaiter {
             if self.should_interrupt(block_mask) {
                 break WaitResult::Interrupted;
             }
+            if process_pipe_woke || thread_pipe_woke {
+                // Dispatcher-owned durable state (tier-D process teardown,
+                // synthetic child state) shares these waiter wakes but is not
+                // part of should_interrupt(). Return once so its caller can
+                // recheck that state without a polling timer.
+                break WaitResult::Ready;
+            }
         };
         // Drop the one-shot proc watch if it didn't fire (interrupted wait), so
         // it can't accumulate on the long-lived kqueue. ENOENT is fine.
@@ -875,18 +930,29 @@ impl ThreadWaiter {
                 // 50 ms polling loop.
                 return ProcExitWait::Done(WaitResult::Ready);
             }
-            let ts = Some(libc::timespec {
+            let registering = !changes.is_empty();
+            let zero = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            let degraded = libc::timespec {
                 tv_sec: 0,
                 tv_nsec: 50_000_000,
-            });
-            let n = match kq.wait(&changes, &mut events_out, ts.as_ref()) {
+            };
+            let ts = if registering {
+                Some(&zero)
+            } else if self.signal_pipe_count() == 0 {
+                Some(&degraded)
+            } else {
+                None
+            };
+            let n = match kq.wait(&changes, &mut events_out, ts) {
                 Ok(n) => n,
                 Err(e) => {
                     if self.should_interrupt(block_mask) {
                         break WaitResult::Interrupted;
                     }
                     if e == libc::EINTR {
-                        changes.clear();
                         continue;
                     }
                     return ProcExitWait::KqueueDead;
@@ -920,6 +986,9 @@ impl ThreadWaiter {
             }
             if self.should_interrupt(block_mask) {
                 break WaitResult::Interrupted;
+            }
+            if process_pipe_woke || thread_pipe_woke {
+                break WaitResult::Ready;
             }
         };
         let zero = libc::timespec {
@@ -955,7 +1024,7 @@ impl ThreadWaiter {
             // then re-poll. The empty fd list means poll_with_signal returns only
             // Interrupted (pending signal) or TimedOut (slice elapsed).
             if let WaitResult::Interrupted =
-                self.poll_with_signal(&[], Some(Duration::from_millis(50)), block_mask)
+                self.poll_with_signal(&[], Some(Duration::from_millis(50)), block_mask, true)
             {
                 return WaitResult::Interrupted;
             }
@@ -1004,17 +1073,13 @@ impl ThreadWaiter {
         let cap = (changes.len() + self.signal_pipe_count()).max(1);
         let mut events_out: Vec<Kevent> = vec![Kevent::empty(); cap];
 
-        // Cap every kevent slice at 50 ms so a pending guest signal (poked onto
-        // the self-pipe) is observed within one slice even when the kqueue wake
-        // edge is lost — a freshly forked child can race signal-pump/self-pipe
-        // reinitialisation and never see the wake (this is the same lost-wake
-        // race the wait4 path must guard against; ppoll(0,0,NULL,...), which musl uses for pause() on
-        // aarch64, needs the same retry). The finite-timeout arm gets the SAME
-        // backstop: without it a `select([pipe],…,10s)` in a forked child sleeps
-        // the full 10 s instead of waking on a mid-wait SIGALRM. Total wait stays
-        // bounded by the real deadline — the `now >= dl` check below caps it; only
-        // the internal slicing changes, the timeout semantics are unchanged.
-        const SLICE_NS: i64 = 50_000_000;
+        // Healthy waits are purely event driven. Both wake filters are installed
+        // when the waiter is created, before the caller's final durable-state
+        // check. A publication then stores state before writing a non-blocking
+        // pipe; unread bytes remain level-readable if the write lands between
+        // that check and this kevent call. Therefore the real guest deadline (or
+        // an unbounded wait) is safe here and a periodic timer is neither needed
+        // nor semantically free.
         let result = loop {
             let ts = match deadline {
                 Some(dl) => {
@@ -1022,13 +1087,9 @@ impl ThreadWaiter {
                     if now >= dl {
                         break WaitResult::TimedOut;
                     }
-                    let remaining = duration_to_timespec(dl - now);
-                    Some(clamp_timespec_to_slice(remaining, SLICE_NS))
+                    Some(duration_to_timespec(dl - now))
                 }
-                None => Some(libc::timespec {
-                    tv_sec: 0,
-                    tv_nsec: SLICE_NS,
-                }),
+                None => None,
             };
             let n = kq.wait(&changes, &mut events_out, ts.as_ref());
             changes.clear(); // registrations persist; only re-add once.
@@ -1047,7 +1108,7 @@ impl ThreadWaiter {
                     if e == libc::EINTR {
                         continue;
                     }
-                    return self.fallback_poll(fds, timeout, block_mask);
+                    return self.fallback_poll(fds, timeout, block_mask, wake_on_signal_pipe);
                 }
             };
             let mut fd_ready = false;
@@ -1083,17 +1144,26 @@ impl ThreadWaiter {
             }
             if process_pipe_dead {
                 self.clear_fd_registrations(kq, fds);
-                return self.fallback_poll(fds, remaining_timeout(deadline), block_mask);
+                return self.fallback_poll(
+                    fds,
+                    remaining_timeout(deadline),
+                    block_mask,
+                    wake_on_signal_pipe,
+                );
             }
             if thread_pipe_dead {
                 self.clear_fd_registrations(kq, fds);
-                return self.fallback_poll(fds, remaining_timeout(deadline), block_mask);
+                return self.fallback_poll(
+                    fds,
+                    remaining_timeout(deadline),
+                    block_mask,
+                    wake_on_signal_pipe,
+                );
             }
             if self.should_interrupt(block_mask) {
                 break WaitResult::Interrupted;
             }
-            // Spurious wake or fallback slice elapsed — re-park (the deadline
-            // is re-checked at the top of the loop).
+            // Spurious wake — re-park against the original guest deadline.
         };
 
         self.clear_fd_registrations(kq, fds);
@@ -1123,16 +1193,17 @@ impl ThreadWaiter {
         let _ = kq.wait(&deletes, &mut [], Some(&zero));
     }
 
-    /// Bounded poll loop used when kqueue is unavailable (non-macOS stubs, or a
-    /// `kqueue()` failure). 50ms signal-recheck slices, matching the pre-kqueue
-    /// behaviour. fd-readiness still wakes promptly (poll blocks until ready).
+    /// Poll fallback used when kqueue is unavailable. With a live wake pipe it
+    /// is event driven just like the kqueue path; only a dead/missing wake
+    /// channel uses bounded correctness slices.
     fn fallback_poll(
         &self,
         fds: &[(i32, i16)],
         timeout: Option<Duration>,
         block_mask: carrick_abi::SigBlockMask,
+        wake_on_signal_pipe: bool,
     ) -> WaitResult {
-        self.poll_with_signal(fds, timeout, block_mask)
+        self.poll_with_signal(fds, timeout, block_mask, wake_on_signal_pipe)
     }
 
     fn poll_with_signal(
@@ -1140,8 +1211,9 @@ impl ThreadWaiter {
         fds: &[(i32, i16)],
         timeout: Option<Duration>,
         block_mask: carrick_abi::SigBlockMask,
+        wake_on_signal_pipe: bool,
     ) -> WaitResult {
-        const SLICE_MS: i32 = 50;
+        const DEGRADED_SLICE_MS: i32 = 50;
         let deadline = timeout.map(|d| Instant::now() + d);
         let mut pollfds: Vec<libc::pollfd> = fds
             .iter()
@@ -1176,6 +1248,7 @@ impl ThreadWaiter {
         } else {
             None
         };
+        let mut reliable_wake = process_signal_index.is_some() || thread_signal_index.is_some();
         loop {
             if self.should_interrupt(block_mask) {
                 return WaitResult::Interrupted;
@@ -1183,48 +1256,48 @@ impl ThreadWaiter {
             for pfd in &mut pollfds {
                 pfd.revents = 0;
             }
-            let slice_ms = match deadline {
+            let timeout_ms = match deadline {
                 Some(dl) => {
                     let now = Instant::now();
                     if now >= dl {
                         return WaitResult::TimedOut;
                     }
-                    // CEIL the remaining to whole ms (poll's resolution) before
-                    // capping at SLICE_MS. Flooring (`as_millis`) makes the FINAL
-                    // slice SHORTER than the real remaining (a sub-ms remainder is
-                    // dropped), so `poll` returns 0 BEFORE the deadline; the
-                    // `n == 0` arm below then mistakes the slice boundary for an
-                    // epoll-backend re-sample point and returns `Ready` instead of
-                    // `TimedOut`. That is a spurious early-Ready for any short guest
-                    // poll, and the flaky `short_finite_poll_wait_observes_deadline`
-                    // under load. Ceil guarantees the last slice reaches the
-                    // deadline; long waits still cap at SLICE_MS and get the
-                    // backstop re-sample.
-                    (dl - now)
+                    let remaining_ms = (dl - now)
                         .as_nanos()
                         .div_ceil(1_000_000)
-                        .min(SLICE_MS as u128) as i32
+                        .min(i32::MAX as u128) as i32;
+                    if reliable_wake {
+                        remaining_ms
+                    } else {
+                        remaining_ms.min(DEGRADED_SLICE_MS)
+                    }
                 }
-                None => SLICE_MS,
+                None if reliable_wake => -1,
+                None => DEGRADED_SLICE_MS,
             };
             let n = unsafe {
                 libc::poll(
                     pollfds.as_mut_ptr(),
                     pollfds.len() as libc::nfds_t,
-                    slice_ms,
+                    timeout_ms,
                 )
             };
             if n > 0 {
                 if pollfds[..fds.len()].iter().any(|pfd| pfd.revents != 0) {
                     return WaitResult::Ready;
                 }
-                if process_signal_index
+                let process_pipe_woke = process_signal_index
                     .and_then(|index| pollfds.get(index))
-                    .is_some_and(|pfd| pfd.revents != 0)
+                    .is_some_and(|pfd| pfd.revents != 0);
+                let thread_pipe_woke = thread_signal_index
+                    .and_then(|index| pollfds.get(index))
+                    .is_some_and(|pfd| pfd.revents != 0);
+                if process_pipe_woke
                     && crate::host_signal::drain_fd(self.process_pipe_read)
                         == crate::host_signal::DrainResult::Dead
                 {
                     self.mark_dead_wake_pipe();
+                    reliable_wake = false;
                     if let Some(index) = process_signal_index
                         && let Some(pfd) = pollfds.get_mut(index)
                     {
@@ -1238,13 +1311,12 @@ impl ThreadWaiter {
                         pfd.events = 0;
                     }
                 }
-                if thread_signal_index
-                    .and_then(|index| pollfds.get(index))
-                    .is_some_and(|pfd| pfd.revents != 0)
+                if thread_pipe_woke
                     && let Some(thread_wake) = self.thread_wake.as_ref()
                     && thread_wake.drain() == crate::host_signal::DrainResult::Dead
                 {
                     self.mark_dead_wake_pipe();
+                    reliable_wake = false;
                     if let Some(index) = process_signal_index
                         && let Some(pfd) = pollfds.get_mut(index)
                     {
@@ -1261,21 +1333,17 @@ impl ThreadWaiter {
                 if self.should_interrupt(block_mask) {
                     return WaitResult::Interrupted;
                 }
+                if wake_on_signal_pipe && (process_pipe_woke || thread_pipe_woke) {
+                    return WaitResult::Ready;
+                }
             } else if n == 0 {
                 if deadline.is_some_and(|dl| Instant::now() >= dl) {
                     return WaitResult::TimedOut;
                 }
-                if fds.is_empty() {
-                    continue;
-                }
-                // This is an internal retry point, not a guest-visible timeout:
-                // `WaitOnPollFds` is used for pollable readiness backends such as
-                // an epoll instance's kqueue fd. If the backend loses or spends a
-                // single wake edge while the watched fd remains ready, a long
-                // poll would otherwise sleep until the full guest deadline. Return
-                // Ready so the runtime re-dispatches the syscall and re-samples
-                // level readiness under the normal epoll latch.
-                return WaitResult::Ready;
+                // Only the degraded path has an internal timeout. Recheck
+                // durable state and re-park; a healthy wait never reaches this
+                // arm before the actual guest deadline.
+                continue;
             } else if n < 0 {
                 let errno = std::io::Error::last_os_error().raw_os_error();
                 if errno == Some(libc::EINTR) && self.should_interrupt(block_mask) {
@@ -1308,27 +1376,6 @@ fn duration_to_timespec(d: Duration) -> libc::timespec {
     libc::timespec {
         tv_sec: d.as_secs() as libc::time_t,
         tv_nsec: d.subsec_nanos() as libc::c_long,
-    }
-}
-
-/// Cap a kevent timeout at `slice_ns` (sub-second) nanoseconds. A wait longer
-/// than the slice is shortened to the slice so the wait loop re-checks for a
-/// pending signal (and re-drains the self-pipe) at least every `slice_ns`; the
-/// caller's deadline check still bounds the TOTAL wait, so only the internal
-/// slicing changes, never the timeout semantics.
-#[cfg(target_os = "macos")]
-fn clamp_timespec_to_slice(ts: libc::timespec, slice_ns: i64) -> libc::timespec {
-    let slice_sec = (slice_ns / 1_000_000_000) as libc::time_t;
-    let slice_subsec = (slice_ns % 1_000_000_000) as libc::c_long;
-    let longer_than_slice =
-        ts.tv_sec > slice_sec || (ts.tv_sec == slice_sec && ts.tv_nsec > slice_subsec);
-    if longer_than_slice {
-        libc::timespec {
-            tv_sec: slice_sec,
-            tv_nsec: slice_subsec,
-        }
-    } else {
-        ts
     }
 }
 
@@ -1388,7 +1435,7 @@ mod tests {
     }
 
     #[test]
-    fn unbounded_poll_wait_retries_after_backstop_slice() {
+    fn unbounded_poll_wait_has_no_periodic_redispatch() {
         // Serialize with the host_signal/pump tests (shared process-global signal
         // pump) + reset on entry; otherwise a concurrent pump test makes the wait
         // return `Interrupted` instead of `Ready`. See
@@ -1414,19 +1461,57 @@ mod tests {
             }
         });
 
-        // Generous budget: the wait returns at the ~50 ms backstop slice, but
-        // thread scheduling under a loaded CI host can delay the channel recv well
-        // past a few slices. This only asserts the wait RETURNS (doesn't block
-        // forever); 5 s is plenty of margin without re-introducing load-flakiness.
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "an idle unbounded wait must not re-dispatch on an internal timer"
+        );
+        assert_eq!(unsafe { libc::write(write_fd, b"x".as_ptr().cast(), 1) }, 1);
         let result = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("unbounded poll wait should return to let the dispatcher re-sample");
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the real fd-ready edge must wake the poll wait promptly");
         assert_eq!(result, super::WaitResult::Ready);
         assert_eq!(unsafe { libc::close(write_fd) }, 0);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn long_finite_poll_wait_retries_before_deadline() {
+    fn unbounded_kqueue_wait_has_no_periodic_redispatch() {
+        let _g = crate::host_signal::PUMP_STATE_TEST_LOCK.lock();
+        crate::host_signal::reset_after_supervisor_fork();
+        let mut fds = [-1, -1];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let waiter = super::ThreadWaiter::new(carrick_hal::ThreadId::synthetic_for_tests(8));
+            let result = waiter.wait(
+                &[super::WaitFd::raw(read_fd, libc::POLLIN)],
+                None,
+                carrick_abi::SigBlockMask::NONE,
+            );
+            let _ = tx.send(result);
+            unsafe { libc::close(read_fd) };
+        });
+
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "an idle kqueue wait must not re-dispatch on an internal timer"
+        );
+        assert_eq!(unsafe { libc::write(write_fd, b"x".as_ptr().cast(), 1) }, 1);
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(2))
+                .expect("the real kqueue fd event must wake promptly"),
+            super::WaitResult::Ready
+        );
+        assert_eq!(unsafe { libc::close(write_fd) }, 0);
+    }
+
+    #[test]
+    fn long_finite_poll_wait_has_no_early_redispatch() {
         // Serialize with the host_signal/pump tests (shared process-global signal
         // pump) + reset on entry; otherwise a concurrent pump test makes the wait
         // return `Interrupted` instead of `Ready`. See
@@ -1452,12 +1537,15 @@ mod tests {
             }
         });
 
-        // Generous budget (see `unbounded_poll_wait_retries_after_backstop_slice`):
-        // asserts the long finite wait RETURNS at the ~50 ms backstop, robust to
-        // scheduling delay under host load. The 60 s guest deadline is never hit.
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "a finite wait must not re-dispatch before its deadline without an event"
+        );
+        assert_eq!(unsafe { libc::write(write_fd, b"x".as_ptr().cast(), 1) }, 1);
         let result = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("long finite poll wait should retry before the guest deadline");
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the real fd-ready edge must wake before the guest deadline");
         assert_eq!(result, super::WaitResult::Ready);
         assert_eq!(unsafe { libc::close(write_fd) }, 0);
     }
@@ -1488,17 +1576,38 @@ mod tests {
     }
 
     #[test]
-    fn proc_state_wait_redispatches_after_bounded_backstop() {
+    fn proc_state_wait_has_no_periodic_redispatch_and_wakes_on_publication() {
         let _g = crate::host_signal::PUMP_STATE_TEST_LOCK.lock();
         crate::host_signal::reset_after_supervisor_fork();
-        let waiter = super::ThreadWaiter::new(carrick_hal::ThreadId::synthetic_for_tests(7));
-        let started = std::time::Instant::now();
+        let published = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_published = std::sync::Arc::clone(&published);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let waiter = super::ThreadWaiter::new(carrick_hal::ThreadId::synthetic_for_tests(7));
+            started_tx.send(()).expect("announce registered waiter");
+            let result = waiter
+                .wait_proc_state_with_dispatch_pending(carrick_abi::SigBlockMask::NONE, || {
+                    thread_published.load(std::sync::atomic::Ordering::SeqCst)
+                });
+            result_tx.send(result).expect("publish wait result");
+        });
+        started_rx.recv().expect("waiter registered");
+        assert!(
+            result_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "a child-state wait must not wake on an internal timer"
+        );
 
-        let result =
-            waiter.wait_proc_state_with_dispatch_pending(carrick_abi::SigBlockMask::NONE, || false);
-
-        assert_eq!(result, super::WaitResult::TimedOut);
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        published.store(true, std::sync::atomic::Ordering::SeqCst);
+        crate::host_signal::wake_all_waiters();
+        assert_eq!(
+            result_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("durable publication plus waiter wake must be prompt"),
+            super::WaitResult::Interrupted
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -1766,50 +1875,6 @@ mod tests {
             !watchable.contains(&(child as u32)),
             "a fully reaped host pid must not keep wait4(-1) parked"
         );
-    }
-
-    /// The finite-timeout arm of `wait_kqueue` must cap each kevent slice at the
-    /// 50 ms backstop so a forked child's lost self-pipe wake is noticed within a
-    /// slice instead of sleeping the whole timeout. `clamp_timespec_to_slice`
-    /// shortens a long remaining timeout to one slice but leaves a short one
-    /// alone (the total wait stays bounded by the caller's deadline check).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn clamp_timespec_caps_long_waits_at_slice() {
-        const SLICE_NS: i64 = 50_000_000;
-        // A 10 s remaining wait (the select(pipe, 10s) repro) is capped to 50 ms.
-        let ten_s = libc::timespec {
-            tv_sec: 10,
-            tv_nsec: 0,
-        };
-        let capped = super::clamp_timespec_to_slice(ten_s, SLICE_NS);
-        assert_eq!(capped.tv_sec, 0);
-        assert_eq!(capped.tv_nsec, SLICE_NS);
-
-        // Just over a slice → capped to a slice.
-        let over = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: SLICE_NS as libc::c_long + 1,
-        };
-        let capped = super::clamp_timespec_to_slice(over, SLICE_NS);
-        assert_eq!(capped.tv_nsec, SLICE_NS);
-
-        // A remaining wait shorter than a slice is left untouched (last slice).
-        let short = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 10_000_000,
-        };
-        let kept = super::clamp_timespec_to_slice(short, SLICE_NS);
-        assert_eq!(kept.tv_sec, 0);
-        assert_eq!(kept.tv_nsec, 10_000_000);
-
-        // Exactly one slice is the boundary — not "longer than", so kept as-is.
-        let exact = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: SLICE_NS as libc::c_long,
-        };
-        let kept = super::clamp_timespec_to_slice(exact, SLICE_NS);
-        assert_eq!(kept.tv_nsec, SLICE_NS);
     }
 
     /// A wake pipe whose write end is closed (EOF) must not re-fire its
