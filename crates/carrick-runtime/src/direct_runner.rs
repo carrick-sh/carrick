@@ -52,6 +52,7 @@ use carrick_native_darwin::direct::{
     current_thread_slots_ptr,
 };
 
+use crate::compat::{CompatEvent, CompatReporter, SyscallArgs};
 use crate::dispatch::{DispatchOutcome, SyscallDispatcher, SyscallRequest};
 use crate::thread::ThreadId;
 
@@ -430,6 +431,11 @@ fn subtract_anon_range(table: &mut Vec<AnonRwRange>, lo: u64, hi: u64) {
 /// and `FutexTable`, and all runner state is behind atomics/mutexes.
 pub struct DirectRunner {
     dispatcher: SyscallDispatcher,
+    /// One process-lifetime reporter, matching the shared dispatcher path.
+    /// Identity-memory syscalls bypass `dispatch_threaded`, so the runner
+    /// brackets those five calls itself; otherwise Tier-D mmap/mprotect work
+    /// is invisible to the standard syscall probes and counters.
+    reporter: CompatReporter,
     memory: IdentityMemory,
     /// The PROCESS outcome, first-wins: `exit_group`, a named unsupported
     /// leave, or (when the last thread leaves via `exit(2)`) that thread's
@@ -505,6 +511,7 @@ impl DirectRunner {
         crate::native_darwin::ensure_native_timer_delivery();
         Self {
             dispatcher,
+            reporter: CompatReporter::default(),
             memory,
             outcome: Mutex::new(None),
             exiting: AtomicBool::new(false),
@@ -775,7 +782,10 @@ impl DirectRunner {
                     }
                     return unsupported(
                         self,
-                        "mprotect(PROT_EXEC) outside a patched tier-D mapping",
+                        &format!(
+                            "mprotect(PROT_EXEC) outside a patched tier-D mapping \
+                             (addr={a0:#x} len={a1:#x} prot={a2:#x})"
+                        ),
                     );
                 }
                 let target = host_prot(prot);
@@ -1468,7 +1478,27 @@ impl DirectRunner {
     fn service_syscall(&self, ctx: &mut GuestContext) -> ServiceVerdict {
         self.syscalls.fetch_add(1, Ordering::Relaxed);
         let number = ctx.syscall_nr();
+        let identity_memory = matches!(number, 214 | 215 | 216 | 222 | 226);
+        let name = crate::syscall::lookup_aarch64(number).map_or("unknown", |syscall| syscall.name);
+        if identity_memory {
+            self.reporter.record(CompatEvent::SyscallEntry {
+                number,
+                name: std::borrow::Cow::Borrowed(name),
+                args: SyscallArgs(ctx.args()),
+            });
+        }
         if let Some(verdict) = self.service_identity_memory(ctx) {
+            if let ServiceVerdict::Resume(value) = verdict {
+                let errno = i32::try_from(-value)
+                    .ok()
+                    .filter(|errno| (1..=4095).contains(errno));
+                self.reporter.record(CompatEvent::SyscallReturn {
+                    number,
+                    name: std::borrow::Cow::Borrowed(name),
+                    retval: value,
+                    errno,
+                });
+            }
             return verdict;
         }
         let request = SyscallRequest::from_raw(carrick_hal::RawSyscall {
@@ -1479,7 +1509,6 @@ impl DirectRunner {
             guest_abi: LinuxGuestAbi::Aarch64,
             native_number: NativeNr(number),
         });
-        let reporter = crate::compat::CompatReporter::default();
         let tid = self.current_tid();
         let mut memory = self.memory;
         // One deadline per syscall INSTANCE: re-dispatches after a Ready wake
@@ -1492,7 +1521,7 @@ impl DirectRunner {
             let outcome = self.dispatcher.dispatch_threaded(
                 request,
                 &mut memory,
-                &reporter,
+                &self.reporter,
                 tid,
                 &read_lock(&self.registry),
                 &self.futex,
