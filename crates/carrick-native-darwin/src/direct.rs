@@ -1220,19 +1220,33 @@ fn word_could_name_x18(word: u32) -> bool {
 /// Is this decoder failure independently proven architecturally unallocated?
 ///
 /// The Arm Architecture Reference Manual's main A64 encoding table reserves
-/// top-level `op0` bits 28:25=`0b0000`. Separately, its "Load/store register
-/// (register offset)" encoding fixes bits 11:10 to `0b10`; the family selector
-/// is bits 29:27=`0b111`, bits 25:24=`0b00`, and bit 21=`1`, so any other value
-/// in bits 11:10 inside that exact family is unallocated. Such words cannot
-/// access x18: executing one raises an undefined-instruction exception.
+/// top-level `op0` bits 28:25=`0b0000`. Its "Advanced SIMD shift by immediate"
+/// encoding fixes bit 31=`0`, bits 28:23=`0b011110`, and bit 10=`1`, with
+/// nonzero `immh` bits 22:19; opcode bit 15=`0` plus bit 11=`1` selects an
+/// unallocated subspace. Separately, its "Load/store register (register
+/// offset)" encoding fixes bits 11:10 to `0b10`; the family selector is bits
+/// 29:27=`0b111`, bits 25:24=`0b00`, and bit 21=`1`, so any other value in bits
+/// 11:10 inside that exact family is unallocated. Such words cannot access
+/// x18: executing one raises an undefined-instruction exception.
 fn word_is_proven_unallocated(word: u32) -> bool {
     const RESERVED_MAJOR_OP0_MASK: u32 = 0x1e00_0000;
+    const SIMD_SHIFT_IMMEDIATE_MASK: u32 = 0x9f80_0400;
+    const SIMD_SHIFT_IMMEDIATE: u32 = 0x0f00_0400;
+    const SIMD_SHIFT_IMMH_MASK: u32 = 0x0078_0000;
+    const SIMD_SHIFT_UNALLOCATED_OPCODE_MASK: u32 = 0x0000_8800;
+    const SIMD_SHIFT_UNALLOCATED_OPCODE: u32 = 0x0000_0800;
     const FAMILY_MASK: u32 = 0x3b20_0000;
     const FAMILY: u32 = 0x3820_0000;
     const FIXED_11_10_MASK: u32 = 0x0000_0c00;
     const FIXED_11_10: u32 = 0x0000_0800;
 
     if word & RESERVED_MAJOR_OP0_MASK == 0 {
+        return true;
+    }
+    if (word & SIMD_SHIFT_IMMEDIATE_MASK) == SIMD_SHIFT_IMMEDIATE
+        && (word & SIMD_SHIFT_IMMH_MASK) != 0
+        && (word & SIMD_SHIFT_UNALLOCATED_OPCODE_MASK) == SIMD_SHIFT_UNALLOCATED_OPCODE
+    {
         return true;
     }
     (word & FAMILY_MASK) == FAMILY && (word & FIXED_11_10_MASK) != FIXED_11_10
@@ -3518,6 +3532,36 @@ mod tests {
     }
 
     #[test]
+    fn scan_accepts_proven_unallocated_advanced_simd_shift_word_with_x18_bits() {
+        let unallocated_shift = 0x6f40_6f72;
+        let elf = elf_with_code(&[unallocated_shift, movz(8, 93, 0), SVC_0]);
+        assert!(
+            matches!(scan_eligibility(&elf).expect("scan runs"), Ok(1)),
+            "a source-proven unallocated SIMD shift opcode cannot access x18"
+        );
+    }
+
+    #[test]
+    fn advanced_simd_shift_unallocated_opcode_proof_is_mask_exact() {
+        assert!(word_is_proven_unallocated(0x6f40_6f72));
+        for (word, description) in [
+            (0x6f40_6772, "allocated SQSHLU neighbor"),
+            (0x6f40_6b72, "allocated element multiply-long neighbor"),
+        ] {
+            assert!(!word_is_proven_unallocated(word), "{description}");
+            let allocated = bad64::decode(word, 0).unwrap_or_else(|_| panic!("{description}"));
+            assert!(
+                !instruction_names_x18(&allocated),
+                "vector register 18 is not guest GPR x18: {description}"
+            );
+        }
+        assert!(
+            !word_is_proven_unallocated(0xffff_fff2),
+            "unrelated undecodable words remain fail-closed"
+        );
+    }
+
+    #[test]
     fn scan_counts_syscall_sites_on_a_clean_image() {
         let elf = fixture_elf();
         assert!(
@@ -4408,6 +4452,21 @@ mod tests {
                 .expect("scan runs")
                 .is_ok(),
             "the reserved-major proof applies at the executable-window boundary"
+        );
+    }
+
+    #[test]
+    fn exec_window_accepts_proven_unallocated_advanced_simd_shift_word_with_x18_bits() {
+        let file = elf_with_code(&[0x6f40_6f72, movz(8, 93, 0), SVC_0]);
+        let group = DirectLoadGroup::load(&fixture_elf(), record_only)
+            .expect("load main")
+            .expect("eligible");
+        assert!(
+            group
+                .map_exec_file_window(&file, 0, 0x2000)
+                .expect("scan runs")
+                .is_ok(),
+            "the SIMD unallocated-opcode proof applies at the executable-window boundary"
         );
     }
 
