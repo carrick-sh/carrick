@@ -176,6 +176,89 @@ impl PageTableManager {
         }
     }
 
+    /// Relocate this complete stage-1 table image to `new_base` while
+    /// preserving every leaf translation. Only table descriptors at levels
+    /// L0-L2 contain addresses within the table backing; block/page leaves keep
+    /// naming the same guest IPA and are intentionally left untouched.
+    ///
+    /// The caller must copy the returned image into its new backing before
+    /// publishing the new TTBR. Rebased table descriptors are marked dirty so
+    /// an already-copied backing can alternatively be fixed with
+    /// [`Self::sync_to_host`] before publication.
+    pub fn rebase(&mut self, new_base: u64) -> Result<(), PageTableError> {
+        if !new_base.is_multiple_of(PT_PAGE) {
+            return Err(PageTableError::BadAddress);
+        }
+        let Some(last_byte) = new_base.checked_add(self.bytes.len() as u64 - 1) else {
+            return Err(PageTableError::BadAddress);
+        };
+        if last_byte & !(PA_MASK_TABLE | (PT_PAGE - 1)) != 0 {
+            return Err(PageTableError::BadAddress);
+        }
+
+        let old_base = self.base;
+        let mut pending = vec![(0usize, 0usize)];
+        let mut visited = vec![false; self.bytes.len().div_ceil(PT_PAGE as usize)];
+        let mut pointers = Vec::new();
+        while let Some((table_off, level)) = pending.pop() {
+            if level > 3
+                || table_off % PT_PAGE as usize != 0
+                || table_off + PT_PAGE as usize > self.bytes.len()
+            {
+                return Err(PageTableError::BadAddress);
+            }
+            let page = table_off / PT_PAGE as usize;
+            if visited[page] {
+                continue;
+            }
+            visited[page] = true;
+            if level == 3 {
+                continue;
+            }
+            for index in 0..512usize {
+                let entry_off = table_off + index * 8;
+                let descriptor = self.read_desc(entry_off);
+                if descriptor & VALID == 0 || descriptor & TYPE_BITS != TYPE_TABLE_OR_PAGE {
+                    continue;
+                }
+                let child_pa = descriptor & PA_MASK_TABLE;
+                let child_off = child_pa
+                    .checked_sub(old_base)
+                    .and_then(|offset| usize::try_from(offset).ok())
+                    .filter(|offset| {
+                        offset.is_multiple_of(PT_PAGE as usize)
+                            && offset + PT_PAGE as usize <= self.bytes.len()
+                    })
+                    .ok_or(PageTableError::BadAddress)?;
+                pointers.push((entry_off, descriptor, child_off));
+                pending.push((child_off, level + 1));
+            }
+        }
+
+        let mut rebased_free = Vec::with_capacity(self.free_tables.len());
+        for &table_pa in &self.free_tables {
+            let offset = table_pa
+                .checked_sub(old_base)
+                .filter(|offset| {
+                    offset.is_multiple_of(PT_PAGE) && *offset + PT_PAGE <= self.bytes.len() as u64
+                })
+                .ok_or(PageTableError::BadAddress)?;
+            rebased_free.push(new_base + offset);
+        }
+
+        self.dirty.clear();
+        for (entry_off, descriptor, child_off) in pointers {
+            let child_pa = new_base + child_off as u64;
+            self.write_table_desc(
+                entry_off,
+                (descriptor & !PA_MASK_TABLE) | (child_pa & PA_MASK_TABLE),
+            );
+        }
+        self.base = new_base;
+        self.free_tables = rebased_free;
+        Ok(())
+    }
+
     /// Tell the manager whether sibling vCPUs are live (set per-edit from the
     /// process-wide live-vCPU count). Gates coalescing.
     pub fn set_multi_vcpu(&mut self, multi: bool) {
@@ -902,8 +985,9 @@ impl PageTableManager {
 mod tests {
     use super::*;
     use crate::memory::{
-        LINUX_ALIAS_IPA_BASE, LINUX_HIGH_VA_THRESHOLD, LINUX_MMAP_BASE, LINUX_PAGE_TABLES_BASE,
-        LINUX_PRIVATE_OVERLAY_BASE, LINUX_SHARED_FILE_BASE, stage1_identity_page_tables,
+        LINUX_ALIAS_IPA_BASE, LINUX_HEAP_BASE, LINUX_HIGH_VA_THRESHOLD, LINUX_MMAP_BASE,
+        LINUX_PAGE_TABLES_BASE, LINUX_PRIVATE_OVERLAY_BASE, LINUX_SHARED_FILE_BASE,
+        stage1_identity_page_tables,
     };
 
     fn manager() -> PageTableManager {
@@ -1362,6 +1446,44 @@ mod tests {
         let bytes = mgr.into_bytes();
         let mut mgr2 = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE);
         assert!(!mgr2.is_valid(va), "edit survived round-trip through bytes");
+    }
+
+    #[test]
+    fn rebase_moves_every_table_pointer_without_changing_leaf_translations() {
+        let mut mgr = manager();
+        let invalid_va = LINUX_MMAP_BASE + 0x10_0000;
+        let alias_va = LINUX_HIGH_VA_THRESHOLD + 0x20_0000;
+        let alias_ipa = LINUX_ALIAS_IPA_BASE + 0x40_0000;
+        mgr.set_prot_none(invalid_va, 0x1000).expect("split");
+        mgr.map_aliased(alias_va, alias_ipa, 0x3000, false)
+            .expect("alias");
+        let identity_va = LINUX_HEAP_BASE + 0x1234;
+        let before_identity = mgr.translate(identity_va);
+        let before_alias = mgr.translate(alias_va + 0x234);
+        let old_base = mgr.base;
+        let new_base = 0xa0_0000_0000;
+
+        mgr.rebase(new_base).expect("rebase cloned tables");
+
+        assert_eq!(mgr.base, new_base);
+        assert_eq!(mgr.translate(identity_va), before_identity);
+        assert_eq!(mgr.translate(alias_va + 0x234), before_alias);
+        assert!(!mgr.is_valid(invalid_va));
+        assert!(mgr.dirty.iter().any(|(_, is_pointer)| *is_pointer));
+        for level in 0..3 {
+            for descriptor in walk_descriptors(&mgr.bytes, new_base, alias_va)
+                .into_iter()
+                .take(level + 1)
+            {
+                if descriptor & VALID != 0 && descriptor & TYPE_BITS == TYPE_TABLE_OR_PAGE {
+                    let pa = descriptor & PA_MASK_TABLE;
+                    assert!(
+                        (new_base..new_base + mgr.bytes.len() as u64).contains(&pa),
+                        "level {level} table pointer 0x{pa:x} stayed under old base 0x{old_base:x}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

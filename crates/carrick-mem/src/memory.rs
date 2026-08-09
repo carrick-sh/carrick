@@ -447,6 +447,20 @@ pub const LINUX_SHARED_FILE_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 pub const LINUX_PRIVATE_OVERLAY_BASE: u64 = 0x98_0000_0000; // 608 GiB
 pub const LINUX_PRIVATE_OVERLAY_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB, mirrors shared
 
+/// Stage-2 IPA window reserved for private address-space banks when multiple
+/// Linux processes share one HVF VM. It is deliberately inside the boot
+/// identity-map ceiling so stage-2 can address it, but every hvpatch process
+/// invalidates this VA range in stage-1 before its first entry. Child-private
+/// pages may therefore live here without becoming reachable through the boot
+/// identity mapping of any process.
+pub const LINUX_PROCESS_BANK_BASE: u64 = 0xA0_0000_0000; // 640 GiB
+pub const LINUX_PROCESS_BANK_SIZE: u64 = 0x40_0000_0000; // 256 GiB
+pub const LINUX_PROCESS_BANK_END: u64 = LINUX_PROCESS_BANK_BASE + LINUX_PROCESS_BANK_SIZE;
+
+const _: () =
+    assert!(LINUX_PRIVATE_OVERLAY_BASE + LINUX_PRIVATE_OVERLAY_SIZE <= LINUX_PROCESS_BANK_BASE);
+const _: () = assert!(LINUX_PROCESS_BANK_END <= 1_u64 << 40);
+
 /// True if `[va, va+len)` lies entirely within the boot-mapped shared aperture
 /// window. Used by `mmap` to detect a MAP_FIXED|MAP_PRIVATE that overlaps a
 /// shared region (which must get genuinely-private backing, not write through).
