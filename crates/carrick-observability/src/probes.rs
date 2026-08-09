@@ -1741,9 +1741,10 @@ mod hvpatch_guest_probe_abi {
         let source = include_str!("probes.rs");
         for declaration in [
             "fn hvpatch__syscall__service__begin(_: i32, _: i32, _: u32, _: u64) {}",
+            "fn hvpatch__syscall__args(_: u64, _: u64, _: u64, _: u64, _: u64) {}",
             "fn hvpatch__syscall__service(_: i32, _: i32, _: u32, _: u64, _: u64) {}",
             "fn hvpatch__syscall__service__clear(_: i32, _: i32, _: u32, _: u64) {}",
-            "stub!(hvpatch_syscall_service_begin(event: super::HvpatchSyscallService) -> Option<std::time::Instant> => None);",
+            "stub!(hvpatch_syscall_service_begin(event: super::HvpatchSyscallService, args: [u64; 6]) -> Option<std::time::Instant> => None);",
             "stub!(hvpatch_syscall_service(event: super::HvpatchSyscallService));",
             "stub!(hvpatch_syscall_service_clear(event: super::HvpatchSyscallService));",
         ] {
@@ -1752,6 +1753,20 @@ mod hvpatch_guest_probe_abi {
                 "missing hvpatch syscall-service ABI declaration {declaration}"
             );
         }
+        let wrapper = source
+            .split_once("pub fn hvpatch_syscall_service_begin(")
+            .expect("real hvpatch service-begin wrapper")
+            .1;
+        let begin = wrapper
+            .find("carrick_usdt::hvpatch__syscall__service__begin!")
+            .expect("identity-bearing begin probe");
+        let args = wrapper
+            .find("carrick_usdt::hvpatch__syscall__args!")
+            .expect("raw-argument companion probe");
+        assert!(
+            begin < args,
+            "the typed identity begin must fire before its raw-argument companion"
+        );
     }
 
     #[test]
@@ -3532,6 +3547,11 @@ mod real {
         /// Completed Linux syscall service. Args: Linux guest PID, Linux guest
         /// TID, ASID, Linux syscall number, and monotonic duration nanoseconds.
         fn hvpatch__syscall__service__begin(_: i32, _: i32, _: u32, _: u64) {}
+        /// Raw Linux syscall arguments paired with the immediately preceding
+        /// enabled service-begin event on the same host thread. Args: Linux
+        /// syscall number, then guest arg0..arg3. The typed begin supplies guest
+        /// PID/TID/ASID; five scalars keep this companion reliable on macOS.
+        fn hvpatch__syscall__args(_: u64, _: u64, _: u64, _: u64, _: u64) {}
         fn hvpatch__syscall__service(_: i32, _: i32, _: u32, _: u64, _: u64) {}
         /// Distinct post-completion retirement marker. Keeping this separate
         /// lets DTrace consumers read and then clear thread-local join state
@@ -4430,12 +4450,25 @@ mod real {
     #[inline(never)]
     pub fn hvpatch_syscall_service_begin(
         event: super::HvpatchSyscallService,
+        args: [u64; 6],
     ) -> Option<std::time::Instant> {
         let mut started = None;
         carrick_usdt::hvpatch__syscall__service__begin!(|| {
             started = Some(std::time::Instant::now());
             (event.pid(), event.tid(), event.asid(), event.number())
         });
+        // Publish raw args only when the identity-bearing begin probe fired.
+        // This guarantees that a consumer can join the companion on the same
+        // host thread without ever receiving an identity-free args record.
+        if started.is_some() {
+            carrick_usdt::hvpatch__syscall__args!(|| (
+                event.number(),
+                args[0],
+                args[1],
+                args[2],
+                args[3]
+            ));
+        }
         started
     }
 
@@ -6001,7 +6034,7 @@ mod stub {
     stub!(hvpatch_guest_lifecycle(event: super::HvpatchGuestLifecycle));
     stub!(hvpatch_guest_fault(event: super::HvpatchGuestFault));
     stub!(hvpatch_guest_address_space(event: super::HvpatchGuestAddressSpace));
-    stub!(hvpatch_syscall_service_begin(event: super::HvpatchSyscallService) -> Option<std::time::Instant> => None);
+    stub!(hvpatch_syscall_service_begin(event: super::HvpatchSyscallService, args: [u64; 6]) -> Option<std::time::Instant> => None);
     stub!(hvpatch_syscall_service(event: super::HvpatchSyscallService));
     stub!(hvpatch_syscall_service_clear(event: super::HvpatchSyscallService));
     stub!(hvpatch_fork_snapshot_begin(child_pid: i32, forking_tid: i32));
