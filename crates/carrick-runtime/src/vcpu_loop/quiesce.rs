@@ -994,13 +994,28 @@ where
             child_pid,
         );
         fork_stage_started = Instant::now();
+        let Some(child_binding) = child_process.mm_binding() else {
+            if let Some(fd) = installed_pidfd {
+                let _ = kernel
+                    .dispatcher
+                    .remove_installed_hvpatch_child_pidfd(fd, child_pid);
+            }
+            let _ = child_process.discard_unstarted_child();
+            if quiesced {
+                process_barrier.end_quiesce();
+            }
+            process_barrier.end_fork();
+            return Err(RuntimeError::Configuration(
+                "hvpatch child mm backend disappeared".to_owned(),
+            ));
+        };
         let spec = match engine.build_process_spec(
             carrick_hal::GuestEntryRegs {
                 return_value: 0,
                 stack: (request.child_stack != 0).then_some(request.child_stack),
                 tls: None,
             },
-            child_record.ttbr0(),
+            child_binding.ttbr0.raw(),
             bank.base(),
             bank.size(),
             child_tid,
