@@ -47,7 +47,7 @@
 #![allow(clippy::unwrap_used)]
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
 // No-op USDT probe stubs. The real probes live in carrick-vmm-hvf's probes module;
@@ -84,6 +84,147 @@ pub fn is_quiescing() -> bool {
 pub fn topology_lock() -> &'static Mutex<()> {
     static L: OnceLock<Mutex<()>> = OnceLock::new();
     L.get_or_init(|| Mutex::new(()))
+}
+
+/// RAII topology-lock guard that emits a typed release event on every exit
+/// path. The wrapped mutex guard preserves the existing serialization
+/// contract; the additional fields are observability-only.
+pub struct TopologyLockGuard {
+    _guard: MutexGuard<'static, ()>,
+    operation: carrick_observability::probes::HvpatchTopologyOperation,
+    guest_pid: i32,
+    guest_tid: i32,
+    acquired_at: Instant,
+}
+
+fn topology_elapsed_ns(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+fn emit_topology_lock(
+    operation: carrick_observability::probes::HvpatchTopologyOperation,
+    phase: carrick_observability::probes::HvpatchTopologyPhase,
+    guest_pid: i32,
+    guest_tid: i32,
+    elapsed_ns: u64,
+) {
+    carrick_observability::probes::hvpatch_topology_lock(
+        carrick_observability::probes::HvpatchTopologyLock::new(
+            operation, phase, guest_pid, guest_tid, elapsed_ns,
+        ),
+    );
+}
+
+impl Drop for TopologyLockGuard {
+    fn drop(&mut self) {
+        emit_topology_lock(
+            self.operation,
+            carrick_observability::probes::HvpatchTopologyPhase::Released,
+            self.guest_pid,
+            self.guest_tid,
+            topology_elapsed_ns(self.acquired_at),
+        );
+    }
+}
+
+/// Acquire the process-wide topology mutex and emit request/wait/release
+/// records carrying the Linux guest identity responsible for the mutation.
+pub fn acquire_topology_lock(
+    operation: carrick_observability::probes::HvpatchTopologyOperation,
+    guest_pid: i32,
+    guest_tid: i32,
+) -> TopologyLockGuard {
+    let requested_at = Instant::now();
+    emit_topology_lock(
+        operation,
+        carrick_observability::probes::HvpatchTopologyPhase::Requested,
+        guest_pid,
+        guest_tid,
+        0,
+    );
+    let guard = topology_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    emit_topology_lock(
+        operation,
+        carrick_observability::probes::HvpatchTopologyPhase::Acquired,
+        guest_pid,
+        guest_tid,
+        topology_elapsed_ns(requested_at),
+    );
+    TopologyLockGuard {
+        _guard: guard,
+        operation,
+        guest_pid,
+        guest_tid,
+        acquired_at: Instant::now(),
+    }
+}
+
+/// Try the process-wide topology mutex without blocking. A contended attempt
+/// emits `TryMiss` and returns `None`; a successful attempt returns the same
+/// release-reporting guard as [`acquire_topology_lock`].
+pub fn try_acquire_topology_lock(
+    operation: carrick_observability::probes::HvpatchTopologyOperation,
+    guest_pid: i32,
+    guest_tid: i32,
+) -> Option<TopologyLockGuard> {
+    let requested_at = Instant::now();
+    emit_topology_lock(
+        operation,
+        carrick_observability::probes::HvpatchTopologyPhase::Requested,
+        guest_pid,
+        guest_tid,
+        0,
+    );
+    let guard = match topology_lock().try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            emit_topology_lock(
+                operation,
+                carrick_observability::probes::HvpatchTopologyPhase::TryMiss,
+                guest_pid,
+                guest_tid,
+                topology_elapsed_ns(requested_at),
+            );
+            return None;
+        }
+    };
+    emit_topology_lock(
+        operation,
+        carrick_observability::probes::HvpatchTopologyPhase::Acquired,
+        guest_pid,
+        guest_tid,
+        topology_elapsed_ns(requested_at),
+    );
+    Some(TopologyLockGuard {
+        _guard: guard,
+        operation,
+        guest_pid,
+        guest_tid,
+        acquired_at: Instant::now(),
+    })
+}
+
+#[cfg(test)]
+mod topology_probe_tests {
+    use super::*;
+    use carrick_observability::probes::HvpatchTopologyOperation;
+
+    #[test]
+    fn typed_topology_guard_serializes_blocking_and_try_acquisitions() {
+        let guard = acquire_topology_lock(HvpatchTopologyOperation::InProcessFork, 41, 42);
+        assert!(
+            try_acquire_topology_lock(HvpatchTopologyOperation::VmRelease, 41, 43).is_none(),
+            "try acquisition must report contention while a typed guard is live"
+        );
+        drop(guard);
+        assert!(
+            try_acquire_topology_lock(HvpatchTopologyOperation::VmRelease, 41, 43).is_some(),
+            "typed guard drop must release the shared topology mutex"
+        );
+    }
 }
 
 fn exec_owner() -> &'static AtomicI32 {

@@ -241,9 +241,14 @@ where
                     // HVF recreates the vCPU: do it under the topology lock so
                     // vcpu_create can't race a concurrent fork's hv_vm_destroy/
                     // create, then re-register the fresh vCPU's kick handle.
-                    let _topo = crate::fork_quiesce::topology_lock()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                    let _topo = crate::fork_quiesce::acquire_topology_lock(
+                        carrick_observability::probes::HvpatchTopologyOperation::VcpuRebind,
+                        kernel
+                            .hvpatch_process
+                            .as_ref()
+                            .map_or(0, crate::hvpatch::ProcessContext::pid),
+                        self.this_tid.raw(),
+                    );
                     engine
                         .rebind_to_slot(new.slot, &st)
                         .map_err(RuntimeError::Trap)?;
@@ -557,9 +562,14 @@ where
                 // acquire their first lease only after a blocking wait.
                 // Build the vCPU + register it in the kicker UNDER the topology
                 // lock, so this is atomic w.r.t. a fork's VM teardown.
-                let topo = crate::fork_quiesce::topology_lock()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let topo = crate::fork_quiesce::acquire_topology_lock(
+                    carrick_observability::probes::HvpatchTopologyOperation::SiblingMaterialize,
+                    child_kernel
+                        .hvpatch_process
+                        .as_ref()
+                        .map_or(0, crate::hvpatch::ProcessContext::pid),
+                    tid.raw(),
+                );
                 if child_kernel.process_exiting() || !child_registry.is_live(tid) {
                     // Exit-cleanup gate (see handle_thread_exit): taken BEFORE
                     // dropping the topology lock so a fork can never land
@@ -851,9 +861,14 @@ where
         // the flag and exits — the wait stays BOUNDED (5s) against pathology
         // either way. (Non-linux scaffolding (bhyve): inert always-0
         // VCPU_LIVE → no wait, unchanged until it implements the contract.)
-        let topology = crate::fork_quiesce::topology_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let topology = crate::fork_quiesce::acquire_topology_lock(
+            carrick_observability::probes::HvpatchTopologyOperation::ExecSiblingGate,
+            kernel
+                .hvpatch_process
+                .as_ref()
+                .map_or(0, crate::hvpatch::ProcessContext::pid),
+            self.this_tid.raw(),
+        );
 
         if kernel.hvpatch_process.is_some() {
             // In one shared VM, exec replaces only THIS Linux process's thread
