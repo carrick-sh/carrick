@@ -5,12 +5,18 @@
 
 pub mod address;
 pub mod clone_plan;
+pub mod core;
 pub mod ids;
 pub mod objects;
+pub mod operations;
 pub mod registry;
 
 pub use address::{Asid, Stage1Root, Stage1RootError, Ttbr0};
 pub use clone_plan::{CloneObjectMode, ClonePlan, ClonePlanError, CloneTaskMode};
+pub use core::{
+    Kernel, KernelContext, KernelError, Registry, RegistryInvariantError, RootBootstrap,
+    TaskRevision,
+};
 pub use ids::{
     FileDescriptionId, FileTableId, FsContextId, LinuxTid, MmId, ObjectIdError, ObjectIdRegistry,
     ProcessGroupId, SessionId, SighandId, TaskId, TaskSerial, ThreadSerial,
@@ -21,7 +27,10 @@ pub use objects::{
     TaskRef, TaskRusage, TaskShared, TaskSharedCloneError, Thread, ThreadKey, ThreadRef,
     ThreadResources, Zombie,
 };
+pub use operations::{
+    KernelFailpoint, KernelOperationError, TaskOperationReservation, WaitMode, WaitOutcome,
+};
 pub use registry::{
-    IdError, IdRegistry, ProcessGroupClaim, SessionClaim, TaskClaim, TaskReservation, ThreadClaim,
-    ThreadReservation,
+    IdError, IdRegistry, IdRegistryCounts, ProcessGroupClaim, SessionClaim, TaskClaim,
+    TaskReservation, ThreadClaim, ThreadReservation,
 };

@@ -51,6 +51,12 @@ impl IdRegistry {
             .map(TaskReservation)
     }
 
+    /// Claim the leader thread role on an already-reserved task/TGID number.
+    pub fn claim_task_leader_thread(&self, task: TaskId) -> Result<ThreadClaim, IdError> {
+        self.claim_related(task.raw(), ClaimKind::Thread)
+            .map(ThreadClaim)
+    }
+
     /// Keep a process-group number alive independently of its leader task.
     pub fn claim_process_group(&self, group: ProcessGroupId) -> Result<ProcessGroupClaim, IdError> {
         self.claim_related(group.raw(), ClaimKind::ProcessGroup)
@@ -65,6 +71,21 @@ impl IdRegistry {
 
     pub fn is_reserved_number(&self, raw: i32) -> bool {
         self.state.lock().claims.contains_key(&raw)
+    }
+
+    pub fn counts(&self) -> IdRegistryCounts {
+        let state = self.state.lock();
+        state
+            .claims
+            .values()
+            .fold(IdRegistryCounts::default(), |mut counts, claim| {
+                counts.reserved_numbers += 1;
+                counts.task_claims += claim.tasks as usize;
+                counts.thread_claims += claim.threads as usize;
+                counts.process_group_claims += claim.process_groups as usize;
+                counts.session_claims += claim.sessions as usize;
+                counts
+            })
     }
 
     fn reserve_next(&self, kind: ClaimKind) -> Result<ReservationToken, IdError> {
@@ -345,6 +366,15 @@ macro_rules! claim_role {
 
 claim_role!(ProcessGroupClaim);
 claim_role!(SessionClaim);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IdRegistryCounts {
+    pub reserved_numbers: usize,
+    pub task_claims: usize,
+    pub thread_claims: usize,
+    pub process_group_claims: usize,
+    pub session_claims: usize,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum IdError {
