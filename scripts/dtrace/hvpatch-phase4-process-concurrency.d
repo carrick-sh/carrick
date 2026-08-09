@@ -20,6 +20,7 @@
 
 dtrace:::BEGIN
 {
+    started = timestamp;
     tracked[$target] = 1;
     live = 1;
     peak = 1;
@@ -72,7 +73,7 @@ dtrace:::ERROR
 }
 
 profile:::tick-1sec
-/timestamp - machtimestamp > 90 * 1000000000/
+/timestamp - started > 90 * 1000000000/
 {
     bounded = 1;
     exit(0);

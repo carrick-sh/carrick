@@ -15,6 +15,7 @@
 
 dtrace:::BEGIN
 {
+    started = timestamp;
     creates = 0;
     destroys = 0;
     create_attempts = 0;
@@ -45,7 +46,7 @@ proc:::exit
 }
 
 profile:::tick-1sec
-/timestamp - machtimestamp > 90 * 1000000000/
+/timestamp - started > 90 * 1000000000/
 {
     bounded = 1;
     exit(0);
