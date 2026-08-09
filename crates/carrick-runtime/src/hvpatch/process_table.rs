@@ -7,7 +7,8 @@ use std::sync::{Arc, Weak};
 
 use parking_lot::{Condvar, Mutex};
 
-use super::asid::{Asid, AsidAllocator, AsidError, RetiredAsid};
+use super::asid::{AsidAllocator, AsidError, RetiredAsid};
+use crate::kernel::{Asid, Stage1Root, Stage1RootError, Ttbr0};
 
 const PROCESS_BANK_SIZE: u64 = 40 * 1024 * 1024 * 1024;
 const PROCESS_BANK_COUNT: u8 =
@@ -65,8 +66,8 @@ pub(crate) struct GuestProcess {
     pgid: GuestPid,
     sid: GuestPid,
     asid: Asid,
-    stage1_root: u64,
-    ttbr0: u64,
+    stage1_root: Stage1Root,
+    ttbr0: Ttbr0,
     bank: Option<ProcessBank>,
 }
 
@@ -92,11 +93,11 @@ impl GuestProcess {
     }
 
     pub(crate) fn stage1_root(self) -> u64 {
-        self.stage1_root
+        self.stage1_root.gpa().raw()
     }
 
     pub(crate) fn ttbr0(self) -> u64 {
-        self.ttbr0
+        self.ttbr0.raw()
     }
 
     pub(crate) fn bank(self) -> Option<ProcessBank> {
@@ -145,6 +146,8 @@ pub(crate) enum ProcessTableError {
     AsidExhausted,
     #[error(transparent)]
     Asid(AsidError),
+    #[error(transparent)]
+    Stage1Root(#[from] Stage1RootError),
     #[error("all hvpatch process address-space banks are live or awaiting teardown")]
     BankExhausted,
     #[error("hvpatch process-group/session operation is not permitted")]
@@ -206,6 +209,7 @@ impl ProcessTable {
         mut asids: AsidAllocator,
     ) -> Result<Self, ProcessTableError> {
         let asid = asids.allocate()?;
+        let stage1_root = Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa(stage1_root))?;
         let root = GuestProcess {
             pid: root_pid,
             parent: None,
@@ -213,7 +217,7 @@ impl ProcessTable {
             sid: root_pid,
             asid,
             stage1_root,
-            ttbr0: asid.ttbr0(stage1_root)?,
+            ttbr0: Ttbr0::for_aarch64(asid, stage1_root),
             bank: None,
         };
         let next_pid = root_pid.raw().checked_add(1).unwrap_or(1);
@@ -283,6 +287,14 @@ impl ProcessTable {
             .free_banks
             .pop_first()
             .ok_or(ProcessTableError::BankExhausted)?;
+        let child_stage1_root =
+            match Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa(bank.base())) {
+                Ok(root) => root,
+                Err(error) => {
+                    inner.free_banks.insert(bank);
+                    return Err(error.into());
+                }
+            };
         let asid = match inner.asids.allocate() {
             Ok(asid) => asid,
             Err(error) => {
@@ -290,7 +302,6 @@ impl ProcessTable {
                 return Err(error.into());
             }
         };
-        let child_stage1_root = bank.base();
         let process = GuestProcess {
             pid,
             parent: Some(parent),
@@ -298,7 +309,7 @@ impl ProcessTable {
             sid: inner.processes[&parent].sid,
             asid,
             stage1_root: child_stage1_root,
-            ttbr0: asid.ttbr0(child_stage1_root)?,
+            ttbr0: Ttbr0::for_aarch64(asid, child_stage1_root),
             bank: Some(bank),
         };
         inner.processes.insert(pid, process);
@@ -398,8 +409,9 @@ impl ProcessTable {
             .processes
             .get_mut(&pid)
             .ok_or(ProcessTableError::UnknownProcess(pid))?;
+        let new_stage1_root = Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa(new_stage1_root))?;
         process.stage1_root = new_stage1_root;
-        process.ttbr0 = process.asid.ttbr0(new_stage1_root)?;
+        process.ttbr0 = Ttbr0::for_aarch64(process.asid, new_stage1_root);
         Ok(*process)
     }
 

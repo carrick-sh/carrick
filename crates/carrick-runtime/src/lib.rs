@@ -526,6 +526,10 @@ pub mod overlay;
 pub mod pathcodec;
 pub mod run_state;
 
+/// Typed object identities and reservation contracts for the backend-neutral
+/// kernel model.
+pub mod kernel;
+
 // Cross-platform run-loop result/error + kernel-half state. Single home for
 // `RunResult` / `RuntimeError` / `KernelState` / `Kernel` / `VcpuLoopOutcome`,
 // shared by the generic threaded `vcpu_loop` on BOTH backends — the HVF setup
