@@ -117,8 +117,27 @@ one amortized final SVC completion exit; there were no exits during compute.
 - The pre-change isolated-worktree baseline `just test` passed, including
   1,230 runtime tests with 5 ignored and 0 failed.
 
-The full `just ci` phase gate is recorded separately after this evidence commit
-so its result is bound to the complete Phase 0 tree.
+The full `just ci` result below was captured after the probe and evidence
+commits, so it is bound to the complete Phase 0 implementation tree.
+
+## Phase boundary checkpoint
+
+Phase 0 is **complete with GO**.
+
+- Probe implementation: `ac37baf0` (`probe(hvpatch): qualify phase zero assumptions`).
+- Evidence publication: `0b208397` (`docs(perf): record hvpatch phase zero go decision`).
+- Gated tree: `0b208397161acd3bdfc1cf0d575e731c2b783592`, clean before the gate.
+- Gate: `just ci` — PASS on 2026-08-08. Formatting, workspace clippy,
+  typed-domain lint, dependency policy, support-matrix drift, compile/check/doc,
+  serialized host tests, and integration suites all completed without failure.
+- Correctness/conformance scope: mechanism probes and existing host gates only;
+  no hvpatch conformance lane exists yet, and no Docker oracle was run.
+- Measured decision: cross-page BL and compute are exit-free; compute is 1.053x
+  host-native at the paired median; `TPIDR_EL0` is also exit-free and remains
+  unpatched.
+- Next decision: proceed to Phase 1 minimal product wiring, preserving the
+  correction above. The first product-path performance proof remains the
+  20-exec `compile -V` fixture; Phase 0 does not project its result.
 
 ## Phase 1 constraints carried forward
 
