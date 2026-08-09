@@ -36,6 +36,14 @@ pub enum WaitOutcome {
     NoChild,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskIdentity {
+    pub task_id: TaskId,
+    pub parent: Option<TaskId>,
+    pub process_group: ProcessGroupId,
+    pub session: SessionId,
+}
+
 /// Typed permission to prepare work against one exact task topology revision.
 #[derive(Debug)]
 pub struct TaskOperationReservation {
@@ -366,6 +374,20 @@ impl PreparedThreadClone {
 }
 
 impl Kernel {
+    pub fn task_identity(&self, task_id: TaskId) -> Result<TaskIdentity, KernelOperationError> {
+        let state = self.registry().state.read();
+        let record = state
+            .tasks
+            .get(&task_id)
+            .ok_or(KernelOperationError::UnknownTask(task_id))?;
+        Ok(TaskIdentity {
+            task_id,
+            parent: record.task.parent().map(|parent| parent.id),
+            process_group: record.task.process_group(),
+            session: record.task.session(),
+        })
+    }
+
     pub fn task_is_live(&self, task_id: TaskId) -> bool {
         self.registry().state.read().tasks.contains_key(&task_id)
     }
@@ -1269,6 +1291,17 @@ mod tests {
 
         assert_eq!(kernel.registry().task_count(), 2);
         assert_eq!(child.task.parent(), Some(root.task.key()));
+        assert_eq!(
+            kernel
+                .task_identity(child.task.key().id)
+                .expect("child identity"),
+            TaskIdentity {
+                task_id: child.task.key().id,
+                parent: Some(root.task.key().id),
+                process_group: root.task.process_group(),
+                session: root.task.session(),
+            }
+        );
         assert!(!Arc::ptr_eq(&root.shared.mm(), &child.shared.mm()));
         assert_ne!(root.shared.mm().id(), child.shared.mm().id());
         assert!(!Arc::ptr_eq(

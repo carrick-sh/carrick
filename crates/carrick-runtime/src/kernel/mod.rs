@@ -36,7 +36,7 @@ pub use objects::{
 };
 pub use operations::{
     ForkReservation, KernelFailpoint, KernelOperationError, PreparedFork, PreparedThreadClone,
-    TaskOperationReservation, ThreadCloneReservation, WaitMode, WaitOutcome,
+    TaskIdentity, TaskOperationReservation, ThreadCloneReservation, WaitMode, WaitOutcome,
 };
 pub use registry::{
     IdError, IdRegistry, IdRegistryCounts, ProcessGroupClaim, SessionClaim, TaskClaim,
