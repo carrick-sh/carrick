@@ -552,6 +552,12 @@ pub mod debug_state;
 #[cfg(feature = "platform-macos")]
 pub mod exec_stamps;
 pub mod execute;
+#[cfg(all(
+    feature = "platform-macos",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+pub(crate) mod hvpatch;
 pub mod pty_relay;
 pub mod rootfs;
 #[cfg(feature = "platform-macos")]

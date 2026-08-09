@@ -9,7 +9,7 @@ use crate::network::NetworkHostsEntry;
 use crate::rootfs::RootFs;
 #[cfg(feature = "fs-memory")]
 use crate::runtime::run_rootfs_elf_with_hvf_args_and_dispatcher_debug;
-use crate::runtime::{RunResult, RuntimeError, run_elf_from_dispatcher_debug};
+use crate::runtime::{RunResult, RuntimeError, run_elf_from_dispatcher_with_backend_debug};
 use crate::vfs::BindVfs;
 use anyhow::{Context, Result};
 use carrick_spec::{FsBackendKind, NetworkNamespaceSpec, PidMode, Platform, RunSpec};
@@ -411,13 +411,14 @@ impl Runtime {
                             &execution_plan,
                         )
                     } else {
-                        run_elf_from_dispatcher_debug(
+                        run_elf_from_dispatcher_with_backend_debug(
                             &spec.executable,
                             dispatcher,
                             spec.argv.clone(),
                             env,
                             spec.max_traps,
                             debug_path.as_ref(),
+                            execution_plan.backend,
                         )
                     };
                 match run_result {

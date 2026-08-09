@@ -752,6 +752,14 @@ impl MemoryRegion {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+
+    /// Mutable access to a region's already-sized host backing.
+    ///
+    /// Callers may rewrite bytes but cannot resize the region, preserving the
+    /// `start..end`/backing-length invariant enforced by `AddressSpace`.
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
 }
 
 #[derive(Debug, Error)]
@@ -1237,6 +1245,56 @@ impl AddressSpace {
 
     pub fn regions(&self) -> &[MemoryRegion] {
         &self.regions
+    }
+
+    /// Mutable access to one existing region's fixed-size backing for pre-map
+    /// transforms. Bounds, ordering, and permissions stay encapsulated.
+    pub fn region_bytes_mut(&mut self, index: usize) -> Option<&mut [u8]> {
+        self.regions.get_mut(index).map(MemoryRegion::bytes_mut)
+    }
+
+    /// Append one fully-backed region while preserving all loaded-image
+    /// metadata (stack, auxv, runtime entry points, and read-only spans).
+    pub fn with_region_bytes(
+        self,
+        start: u64,
+        perms: SegmentPerms,
+        shared: bool,
+        bytes: Vec<u8>,
+    ) -> Result<Self, AddressSpaceError> {
+        let size =
+            u64::try_from(bytes.len()).map_err(|_| AddressSpaceError::RegionTooLarge(u64::MAX))?;
+        let end = start
+            .checked_add(size)
+            .ok_or(AddressSpaceError::RegionOverflow { start, size })?;
+        let region = MemoryRegion {
+            start,
+            end,
+            perms,
+            shared,
+            bytes,
+        };
+
+        let AddressSpace {
+            entry,
+            regions,
+            initial_stack_pointer,
+            el0_trampoline_entry,
+            el1_vectors_base,
+            stage1_page_tables_base,
+            linux_auxv,
+            linux_auxv_image,
+            ro_spans,
+        } = self;
+        let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
+        image.initial_stack_pointer = initial_stack_pointer;
+        image.el0_trampoline_entry = el0_trampoline_entry;
+        image.el1_vectors_base = el1_vectors_base;
+        image.stage1_page_tables_base = stage1_page_tables_base;
+        image.linux_auxv = linux_auxv;
+        image.linux_auxv_image = linux_auxv_image;
+        image.ro_spans = ro_spans;
+        Ok(image)
     }
 
     /// Page-granular read-only spans of the loaded ELF images (non-writable

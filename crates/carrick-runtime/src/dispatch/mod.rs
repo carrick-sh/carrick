@@ -2574,7 +2574,8 @@ impl SyscallDispatcher {
 
     pub(crate) fn set_execution_backend(&mut self, backend: crate::page_profile::ExecutionBackend) {
         self.async_signal_wake_owner = match backend {
-            crate::page_profile::ExecutionBackend::Vmm => AsyncSignalWakeOwner::SignalPump,
+            crate::page_profile::ExecutionBackend::Vmm
+            | crate::page_profile::ExecutionBackend::HvPatch => AsyncSignalWakeOwner::SignalPump,
             crate::page_profile::ExecutionBackend::Native => AsyncSignalWakeOwner::NativeDirect,
         };
     }

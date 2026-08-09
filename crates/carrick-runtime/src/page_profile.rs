@@ -24,6 +24,9 @@ pub use carrick_dsr::page_geometry::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExecutionBackend {
     Vmm,
+    /// HVF execution with static text patched to enter in-guest syscall
+    /// islands. This lane is intentionally limited to macOS/AArch64.
+    HvPatch,
     /// The native (DSR) backend. Host-neutral by design — which (host OS,
     /// host ISA) lanes actually exist is the capability table's business in
     /// `resolve_execution_plan_for_request_for_host`, not this enum's.
@@ -107,6 +110,26 @@ fn resolve_execution_plan_for_request_for_host(
             },
             diagnostics: Vec::new(),
         }),
+        ExecBackendRequest::HvPatch => {
+            if host_caps.host_os != HostOs::Macos
+                || host_caps.host_isa != Platform::Aarch64
+                || platform != Platform::Aarch64
+            {
+                return Err(RuntimeError::Unsupported(format!(
+                    "hvpatch requires macOS/AArch64 host and AArch64 guest; got host={:?}/{:?} guest={platform:?}",
+                    host_caps.host_os, host_caps.host_isa
+                )));
+            }
+            Ok(ExecutionPlan {
+                backend: ExecutionBackend::HvPatch,
+                page_geometry: PageGeometry {
+                    host_page_size: DEFAULT_LINUX_PAGE_SIZE,
+                    linux_page_size: DEFAULT_LINUX_PAGE_SIZE,
+                    native_profile: None,
+                },
+                diagnostics: Vec::new(),
+            })
+        }
         ExecBackendRequest::Native => {
             // Same-ISA is a lane-independent requirement of the native
             // model: guest ISA == host ISA, always (cross-ISA stays VMM /
@@ -292,6 +315,45 @@ mod tests {
         );
         assert_eq!(plan.page_geometry.native_profile, None);
         assert_eq!(plan.page_geometry.native_geometry(), None);
+    }
+
+    #[test]
+    fn hvpatch_request_uses_linux_geometry_on_macos_aarch64() {
+        let plan = resolve_execution_plan_for_host(
+            &spec(ExecBackendRequest::HvPatch, NativePageProfileRequest::Auto),
+            caps(HostOs::Macos, Platform::Aarch64),
+            DARWIN_NATIVE_PAGE_SIZE,
+        )
+        .expect("macOS/AArch64 hvpatch plan");
+
+        assert_eq!(plan.backend, ExecutionBackend::HvPatch);
+        assert_eq!(plan.page_geometry.host_page_size, DEFAULT_LINUX_PAGE_SIZE);
+        assert_eq!(plan.page_geometry.linux_page_size, DEFAULT_LINUX_PAGE_SIZE);
+        assert_eq!(plan.page_geometry.native_profile, None);
+    }
+
+    #[test]
+    fn hvpatch_request_rejects_non_hvf_hosts_and_cross_isa_guests() {
+        for (host_os, host_isa, guest) in [
+            (HostOs::Linux, Platform::Aarch64, Platform::Aarch64),
+            (HostOs::Macos, Platform::Amd64, Platform::Amd64),
+            (HostOs::Macos, Platform::Aarch64, Platform::Amd64),
+        ] {
+            let error = resolve_execution_plan_for_host(
+                &spec_with_platform(
+                    guest,
+                    ExecBackendRequest::HvPatch,
+                    NativePageProfileRequest::Auto,
+                ),
+                caps(host_os, host_isa),
+                DARWIN_NATIVE_PAGE_SIZE,
+            )
+            .expect_err("hvpatch must be scoped to macOS/AArch64 host and guest");
+            assert!(
+                error.to_string().contains("hvpatch requires macOS/AArch64"),
+                "unexpected hvpatch capability error: {error}"
+            );
+        }
     }
 
     #[test]
