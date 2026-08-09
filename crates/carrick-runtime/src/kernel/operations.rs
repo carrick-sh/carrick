@@ -237,6 +237,7 @@ impl PreparedFork {
                     revision: TaskRevision::INITIAL,
                     task_claim,
                     thread_claims: std::collections::BTreeMap::from([(leader_tid, leader_claim)]),
+                    dead_leader: None,
                     diagnostic_name,
                 },
             );
@@ -457,6 +458,83 @@ impl Kernel {
         self.reserve_thread_clone(parent, plan, failpoint)?
             .prepare(registry_id)?
             .commit()
+    }
+
+    /// Retire one non-final thread from the authoritative task graph. The TID
+    /// claim drains only after every captured context releases its thread Arc.
+    pub fn exit_thread(
+        self: &Arc<Self>,
+        context: &KernelContext,
+        failpoint: Option<KernelFailpoint>,
+    ) -> Result<TaskRevision, KernelOperationError> {
+        self.sweep_retired_threads();
+        if !Arc::ptr_eq(self, &context.kernel) {
+            return Err(KernelOperationError::ForeignContext);
+        }
+        check_failpoint(failpoint, KernelFailpoint::AfterReserve)?;
+        check_failpoint(failpoint, KernelFailpoint::AfterObjects)?;
+        check_failpoint(failpoint, KernelFailpoint::AfterBackendPrepare)?;
+
+        let mut state = self.registry().state.write();
+        ensure_task_unreserved(&state, context.task.key().id)?;
+        let record = state
+            .tasks
+            .get(&context.task.key().id)
+            .ok_or(KernelOperationError::ParentExited)?;
+        if record.task.key() != context.task.key() {
+            return Err(KernelOperationError::ParentExited);
+        }
+        if record.revision != context.revision {
+            return Err(KernelOperationError::StaleContext);
+        }
+        if context.task.live_thread_count() <= 1 {
+            return Err(KernelOperationError::LastThreadRequiresTaskExit(
+                context.thread.key().tid,
+            ));
+        }
+        let tid = context.thread.key().tid;
+        if context
+            .task
+            .thread(tid)
+            .is_none_or(|thread| thread.key() != context.thread.key())
+            || !record.thread_claims.contains_key(&tid)
+        {
+            return Err(KernelOperationError::UnknownThread(tid));
+        }
+        let next = next_revision(record.revision)?;
+        state
+            .retired_threads
+            .try_reserve_exact(1)
+            .map_err(|_| KernelOperationError::RetiredThreadCapacity(1))?;
+        check_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
+
+        let thread = context
+            .task
+            .retire_thread(context.thread.key())
+            .ok_or(KernelOperationError::UnknownThread(tid))?;
+        let record = state
+            .tasks
+            .get_mut(&context.task.key().id)
+            .ok_or(KernelOperationError::ParentExited)?;
+        let claim = record
+            .thread_claims
+            .remove(&tid)
+            .ok_or(KernelOperationError::UnknownThread(tid))?;
+        record.revision = next;
+        if tid == LinuxTid::for_task_leader(context.task.key().id) {
+            record.dead_leader = Some(super::core::RetiredThreadRecord {
+                thread: Arc::downgrade(&thread),
+                _claim: claim,
+            });
+        } else {
+            state
+                .retired_threads
+                .push(super::core::RetiredThreadRecord {
+                    thread: Arc::downgrade(&thread),
+                    _claim: claim,
+                });
+        }
+        Ok(next)
     }
 
     /// Test registry-locked association publication without invoking the exec
@@ -745,11 +823,12 @@ impl Kernel {
 
         let mut state = self.registry().state.write();
         ensure_task_unreserved(&state, task_id)?;
-        let Some((exiting_task, retired_thread_count)) = state
-            .tasks
-            .get(&task_id)
-            .map(|record| (Arc::clone(&record.task), record.thread_claims.len()))
-        else {
+        let Some((exiting_task, retired_thread_count)) = state.tasks.get(&task_id).map(|record| {
+            (
+                Arc::clone(&record.task),
+                record.thread_claims.len() + usize::from(record.dead_leader.is_some()),
+            )
+        }) else {
             return Err(KernelOperationError::UnknownTask(task_id));
         };
         let task_key = exiting_task.key();
@@ -788,6 +867,7 @@ impl Kernel {
             revision: _,
             task_claim,
             thread_claims,
+            dead_leader,
             diagnostic_name,
         } = record;
         let zombie = Zombie::from_task(&task, status, rusage, diagnostic_name);
@@ -800,6 +880,9 @@ impl Kernel {
                         _claim: claim,
                     });
             }
+        }
+        if let Some(dead_leader) = dead_leader {
+            state.retired_threads.push(dead_leader);
         }
 
         for child_key in children {
@@ -993,6 +1076,8 @@ pub enum KernelOperationError {
     TaskBusy(TaskId),
     #[error("kernel thread {0:?} is not live")]
     UnknownThread(LinuxTid),
+    #[error("final thread {0:?} must retire through task exit")]
+    LastThreadRequiresTaskExit(LinuxTid),
     #[error("kernel task {0:?} is already exiting")]
     AlreadyExiting(TaskId),
     #[error("process group {0:?} does not exist")]
@@ -1214,6 +1299,121 @@ mod tests {
         assert_eq!(child.thread.key().tid, tid);
         assert_eq!(child.thread.registry_id(), registry_id);
         assert!(root.task.thread(tid).is_some());
+    }
+
+    #[test]
+    fn thread_exit_unpublishes_before_draining_its_tid_claim() {
+        let (kernel, root) = bootstrap(195);
+        let root_counts = kernel.ids().counts();
+        let plan = ClonePlan::from_flags(
+            LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+        )
+        .expect("thread plan");
+        let child = kernel
+            .clone_thread(&root, plan, ThreadId::synthetic_for_tests(9_195), None)
+            .expect("thread clone");
+        let tid = child.thread.key().tid;
+        let live_counts = kernel.ids().counts();
+
+        kernel.exit_thread(&child, None).expect("thread exit");
+        assert!(root.task.thread(tid).is_none());
+        assert!(kernel.context(root.task.key().id, tid).is_err());
+        assert_eq!(kernel.sweep_retired_threads(), 0);
+        assert_eq!(kernel.ids().counts(), live_counts);
+
+        drop(child);
+        assert_eq!(kernel.sweep_retired_threads(), 1);
+        assert_eq!(kernel.ids().counts(), root_counts);
+        let refreshed = kernel
+            .context(root.task.key().id, root.thread.key().tid)
+            .expect("refresh root");
+        assert!(matches!(
+            kernel.exit_thread(&refreshed, None),
+            Err(KernelOperationError::LastThreadRequiresTaskExit(id)) if id == root.thread.key().tid
+        ));
+    }
+
+    #[test]
+    fn dead_leader_claim_survives_task_exit_and_zombie_reap_until_context_drain() {
+        let (kernel, root) = bootstrap(196);
+        let child = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(9_196),
+                "child".to_string(),
+                None,
+            )
+            .expect("child task");
+        let child_id = child.task.key().id;
+        let sibling = kernel
+            .clone_thread(
+                &child,
+                ClonePlan::from_flags(
+                    LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+                )
+                .expect("thread plan"),
+                ThreadId::synthetic_for_tests(9_197),
+                None,
+            )
+            .expect("child sibling");
+        let dead_leader = kernel
+            .context(child_id, LinuxTid::for_task_leader(child_id))
+            .expect("current child leader");
+        kernel
+            .exit_thread(&dead_leader, None)
+            .expect("leader thread exit");
+        kernel
+            .exit_task(
+                child_id,
+                LinuxWaitStatus::from_wait_encoding(0),
+                TaskRusage::default(),
+                None,
+            )
+            .expect("task exit");
+
+        drop(child);
+        drop(sibling);
+        assert_eq!(kernel.sweep_retired_threads(), 0);
+        assert_eq!(kernel.registry().retired_thread_count(), 2);
+        assert!(matches!(
+            kernel.wait_child(root.task.key().id, Some(child_id), WaitMode::Consume),
+            Ok(WaitOutcome::Exited(_))
+        ));
+        assert_eq!(kernel.ids().counts().thread_claims, 3);
+
+        drop(dead_leader);
+        assert_eq!(kernel.sweep_retired_threads(), 2);
+        assert_eq!(kernel.ids().counts().thread_claims, 1);
+    }
+
+    #[test]
+    fn every_thread_exit_failpoint_preserves_the_live_thread() {
+        for point in [
+            KernelFailpoint::AfterReserve,
+            KernelFailpoint::AfterObjects,
+            KernelFailpoint::AfterBackendPrepare,
+            KernelFailpoint::BeforePublish,
+        ] {
+            let (kernel, root) = bootstrap(197);
+            let plan = ClonePlan::from_flags(
+                LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+            )
+            .expect("thread plan");
+            let child = kernel
+                .clone_thread(&root, plan, ThreadId::synthetic_for_tests(9_197), None)
+                .expect("thread clone");
+            let tid = child.thread.key().tid;
+            let counts = kernel.ids().counts();
+
+            assert!(matches!(
+                kernel.exit_thread(&child, Some(point)),
+                Err(KernelOperationError::Injected(injected)) if injected == point
+            ));
+            assert!(child.task.thread(tid).is_some());
+            assert_eq!(kernel.ids().counts(), counts);
+            assert!(kernel.validate_invariants().is_ok());
+        }
     }
 
     #[test]

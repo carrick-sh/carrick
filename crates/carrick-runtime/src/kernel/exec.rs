@@ -216,10 +216,14 @@ impl Kernel {
             if prepared.thread_set.task_key() != prepared.task {
                 return Err(ExecError::WrongTask);
             }
-            if !record.thread_claims.contains_key(&leader_tid) {
+            let active_leader = record.thread_claims.contains_key(&leader_tid);
+            if !active_leader && record.dead_leader.is_none() {
                 return Err(ExecError::LeaderClaimMissing);
             }
-            let retired_count = record.thread_claims.len().saturating_sub(1);
+            let retired_count = record
+                .thread_claims
+                .len()
+                .saturating_sub(usize::from(active_leader));
             let revision = record.revision.next().ok_or(ExecError::RevisionExhausted)?;
             let task = Arc::clone(&record.task);
             state
@@ -266,6 +270,9 @@ impl Kernel {
                     _claim: claim,
                 });
             }
+        }
+        if let Some(dead_leader) = record.dead_leader.take() {
+            record.thread_claims.insert(leader_tid, dead_leader._claim);
         }
         record.revision = revision;
         reservations.remove(&prepared.task.id);
@@ -556,6 +563,50 @@ mod tests {
                 .bind_runner()
                 .expect("replacement owns gate"),
         );
+    }
+
+    #[test]
+    fn surviving_nonleader_exec_reconstitutes_a_retired_leader_claim() {
+        let (kernel, leader) = bootstrap(650);
+        let sibling = kernel
+            .clone_thread(
+                &leader,
+                ClonePlan::from_flags(
+                    LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+                )
+                .expect("thread plan"),
+                ThreadId::synthetic_for_tests(651),
+                None,
+            )
+            .expect("sibling");
+        let task_id = leader.task.key().id;
+        let leader_tid = LinuxTid::for_task_leader(task_id);
+        let current_leader = kernel.context(task_id, leader_tid).expect("current leader");
+        kernel
+            .exit_thread(&current_leader, None)
+            .expect("leader thread exit");
+        assert!(kernel.context(task_id, leader_tid).is_err());
+
+        let current_sibling = kernel
+            .context(task_id, sibling.thread.key().tid)
+            .expect("current sibling");
+        let mut runner = current_sibling
+            .thread
+            .bind_runner()
+            .expect("bind surviving runner");
+        let prepared = kernel
+            .prepare_exec(&current_sibling, None)
+            .expect("prepare exec after leader exit");
+        let committed = kernel
+            .commit_exec(prepared, None)
+            .expect("commit exec after leader exit");
+        runner
+            .adopt_thread(&committed.thread)
+            .expect("adopt replacement");
+
+        assert_eq!(committed.thread.key().tid, leader_tid);
+        assert!(kernel.context(task_id, leader_tid).is_ok());
+        assert!(kernel.validate_invariants().is_ok());
     }
 
     #[test]
