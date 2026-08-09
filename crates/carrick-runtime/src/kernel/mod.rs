@@ -35,8 +35,8 @@ pub use objects::{
     ThreadSignalState, Zombie,
 };
 pub use operations::{
-    ForkReservation, KernelFailpoint, KernelOperationError, PreparedFork, TaskOperationReservation,
-    WaitMode, WaitOutcome,
+    ForkReservation, KernelFailpoint, KernelOperationError, PreparedFork, PreparedThreadClone,
+    TaskOperationReservation, ThreadCloneReservation, WaitMode, WaitOutcome,
 };
 pub use registry::{
     IdError, IdRegistry, IdRegistryCounts, ProcessGroupClaim, SessionClaim, TaskClaim,
