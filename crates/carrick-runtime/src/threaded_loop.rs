@@ -113,7 +113,7 @@ pub trait HostBackend: Send + Sync + 'static {
 /// rebuild), `spawn_clone_thread` (sibling vCPUs), and the private/shared futex
 /// paths all flow through the shared loop.
 pub fn run_threaded_loop<E, H>(
-    engine: E,
+    mut engine: E,
     dispatcher: SyscallDispatcher,
     host: H,
     max_traps: usize,
@@ -197,11 +197,16 @@ where
     // vCPU + nudge the futex; HVF supplies its kqueue-pump wake.
     let signal_arrival: Arc<dyn carrick_hal::SignalArrival> =
         host_for_factory.make_signal_arrival(&kicker, &platform_futex);
+    let hvpatch_process = crate::hvpatch::initialize_root_process(&mut engine, &dispatcher)?;
     let kernel = Arc::new(KernelState::new(
         dispatcher,
         fork_coordinator,
         signal_arrival,
+        hvpatch_process,
     ));
+    debug_assert!(kernel.hvpatch_process.as_ref().is_none_or(|process| {
+        process.pid() == std::process::id() as i32 && process.live_process_count() == 1
+    }));
     // Track spawned sibling threads so the process doesn't tear down while a
     // worker is mid-flight; joined after the main thread finishes.
     let threads: Arc<parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>> =

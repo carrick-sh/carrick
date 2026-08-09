@@ -5,14 +5,63 @@ use std::path::{Path, PathBuf};
 use crate::dispatch::SyscallDispatcher;
 use crate::memory::{AddressSpace, AddressSpaceError};
 use crate::runtime::{RunResult, RuntimeError};
+use carrick_hal::{SysReg, ThreadedEngine};
 use carrick_mem::elf::SegmentPerms;
 use info_page::{INFO_PAGE_BASE, InfoPage, info_page_bytes};
 use island::passthrough_island_bytes;
 use patcher::{ISLAND_STUB_SIZE, PatchError, PatchSite, patch_svc_zero};
 
+mod asid;
 mod info_page;
 mod island;
 mod patcher;
+mod process_table;
+
+use process_table::{GuestPid, ProcessTable};
+
+/// Per-kernel binding to one Linux process inside the shared hvpatch VM.
+/// Child kernels will carry the same table with a different `pid`.
+#[derive(Clone, Debug)]
+pub(crate) struct ProcessContext {
+    table: std::sync::Arc<ProcessTable>,
+    pid: GuestPid,
+}
+
+impl ProcessContext {
+    pub(crate) fn pid(&self) -> i32 {
+        self.pid.raw()
+    }
+
+    pub(crate) fn live_process_count(&self) -> usize {
+        self.table.live_process_count()
+    }
+}
+
+/// Install the root in-process guest's nonzero ASID before its first entry.
+/// All other backends return `None` and retain their existing register values.
+pub(crate) fn initialize_root_process<E: ThreadedEngine>(
+    engine: &mut E,
+    dispatcher: &SyscallDispatcher,
+) -> Result<Option<ProcessContext>, RuntimeError> {
+    if dispatcher.execution_backend() != crate::page_profile::ExecutionBackend::HvPatch {
+        return Ok(None);
+    }
+    const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
+    let stage1_root = engine.get_sys_reg(SysReg::Ttbr0).map_err(|error| {
+        RuntimeError::Trap(crate::trap::TrapError::Hypervisor(error.to_string()))
+    })? & TTBR_ROOT_MASK;
+    let pid = GuestPid::root();
+    let table = std::sync::Arc::new(
+        ProcessTable::new_root(pid, stage1_root)
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?,
+    );
+    let root = table.process(pid).ok_or_else(|| {
+        RuntimeError::Configuration("hvpatch root process disappeared".to_owned())
+    })?;
+    engine.configure_process_asid(root.asid().raw())?;
+    debug_assert_eq!(root.ttbr0(), engine.get_sys_reg(SysReg::Ttbr0).unwrap_or(0));
+    Ok(Some(ProcessContext { table, pid }))
+}
 
 const PAGE_SIZE: u64 = 4096;
 const STAGE2_PAGE_SIZE: u64 = crate::trap::HVF_PAGE_SIZE;
