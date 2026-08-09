@@ -384,6 +384,10 @@ impl GuestVmBackend for HvfAarch64Vmm {
 }
 
 impl Aarch64Vmm for HvfAarch64Vmm {
+    fn set_persistent_vm_lifecycle(&mut self, enabled: bool) {
+        self.state.set_persistent_vm_lifecycle(enabled);
+    }
+
     type Vcpu = HvfAarch64Vcpu;
     type KickHandle = crate::vcpu_kick::VcpuKickHandle;
     type SiblingBuilder = ThreadSpec;

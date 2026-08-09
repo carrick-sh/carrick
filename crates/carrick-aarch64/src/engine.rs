@@ -1388,6 +1388,10 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     type KickHandle = V::KickHandle;
     type SiblingSpec = Aarch64SiblingSpec<V>;
 
+    fn set_persistent_vm_lifecycle(&mut self, enabled: bool) {
+        self.vm.set_persistent_vm_lifecycle(enabled);
+    }
+
     fn kick_handle(&self) -> Self::KickHandle {
         self.vm.kick_handle()
     }
