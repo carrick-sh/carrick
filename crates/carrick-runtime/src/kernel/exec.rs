@@ -275,6 +275,7 @@ impl Kernel {
             record.thread_claims.insert(leader_tid, dead_leader._claim);
         }
         record.revision = revision;
+        record.has_execed = true;
         reservations.remove(&prepared.task.id);
         prepared.guard.commit_reservation();
         drop(state);

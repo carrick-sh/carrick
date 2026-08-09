@@ -246,6 +246,7 @@ impl PreparedFork {
                     task_claim,
                     thread_claims: std::collections::BTreeMap::from([(leader_tid, leader_claim)]),
                     dead_leader: None,
+                    has_execed: false,
                     diagnostic_name,
                 },
             );
@@ -631,6 +632,109 @@ impl Kernel {
         })
     }
 
+    pub fn set_process_group(
+        &self,
+        caller_id: TaskId,
+        target_id: Option<TaskId>,
+        requested_group: Option<ProcessGroupId>,
+    ) -> Result<(), KernelOperationError> {
+        self.sweep_retired_threads();
+        let target_id = target_id.unwrap_or(caller_id);
+        let target_group =
+            requested_group.unwrap_or_else(|| ProcessGroupId::from_leader(target_id));
+
+        let prospective_claim = if target_group == ProcessGroupId::from_leader(target_id) {
+            match self.ids().claim_process_group(target_group) {
+                Ok(claim) => Some(claim),
+                Err(IdError::UnknownNamespaceId(_)) => {
+                    return Err(KernelOperationError::UnknownTask(target_id));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            None
+        };
+
+        let mut state = self.registry().state.write();
+        ensure_task_unreserved(&state, target_id)?;
+        let caller = state
+            .tasks
+            .get(&caller_id)
+            .map(|record| Arc::clone(&record.task))
+            .ok_or(KernelOperationError::UnknownTask(caller_id))?;
+        let (target, target_revision, target_has_execed) = state
+            .tasks
+            .get(&target_id)
+            .map(|record| (Arc::clone(&record.task), record.revision, record.has_execed))
+            .ok_or(KernelOperationError::UnknownTask(target_id))?;
+        if target_id != caller_id {
+            if target.parent().map(|parent| parent.id) != Some(caller_id) {
+                return Err(KernelOperationError::UnknownTask(target_id));
+            }
+            if target_has_execed {
+                return Err(KernelOperationError::ChildExeced(target_id));
+            }
+        }
+        if target.session() != caller.session()
+            || SessionId::from_leader(target_id) == target.session()
+        {
+            return Err(KernelOperationError::IdentityPermission);
+        }
+        if target.process_group() == target_group {
+            return Ok(());
+        }
+
+        let group_exists = match state.process_groups.get(&target_group) {
+            Some(group) if group.object.session() == caller.session() => true,
+            Some(_) => return Err(KernelOperationError::IdentityPermission),
+            None => false,
+        };
+        if !group_exists && target_group != ProcessGroupId::from_leader(target_id) {
+            return Err(KernelOperationError::IdentityPermission);
+        }
+
+        let published_revision = next_revision(target_revision)?;
+        if !group_exists {
+            if !state.sessions.contains_key(&caller.session()) {
+                return Err(KernelOperationError::IdentityObjectMissing);
+            }
+            let claim = prospective_claim.ok_or(KernelOperationError::IdentityPermission)?;
+            let object = Arc::new(ProcessGroup::new(
+                target_group,
+                caller.session(),
+                self.ids(),
+                claim,
+            )?);
+            state
+                .sessions
+                .get_mut(&caller.session())
+                .ok_or(KernelOperationError::IdentityObjectMissing)?
+                .process_groups
+                .insert(target_group);
+            state.process_groups.insert(
+                target_group,
+                ProcessGroupRecord {
+                    object,
+                    members: std::collections::BTreeSet::new(),
+                },
+            );
+        }
+
+        let old_group = target.process_group();
+        let session = target.session();
+        remove_group_member(&mut state, old_group, session, target.key());
+        let group = state
+            .process_groups
+            .get_mut(&target_group)
+            .ok_or(KernelOperationError::IdentityObjectMissing)?;
+        group.members.insert(target.key());
+        target.replace_identity(target_group, session);
+        if let Some(record) = state.tasks.get_mut(&target_id) {
+            record.revision = published_revision;
+        }
+        Ok(())
+    }
+
     pub fn join_process_group(
         &self,
         task_id: TaskId,
@@ -916,6 +1020,7 @@ impl Kernel {
             task_claim,
             thread_claims,
             dead_leader,
+            has_execed: _,
             diagnostic_name,
         } = record;
         let zombie = Zombie::from_task(&task, status, rusage, diagnostic_name);
@@ -1146,6 +1251,10 @@ pub enum KernelOperationError {
     TaskChangedBeforeCommit,
     #[error("process-group or session identity already exists")]
     IdentityObjectExists,
+    #[error("child task {0:?} has completed exec")]
+    ChildExeced(TaskId),
+    #[error("process-group identity change is not permitted")]
+    IdentityPermission,
     #[error("a process-group leader cannot create a session")]
     AlreadyProcessGroupLeader,
     #[error("injected kernel operation failure at {0:?}")]
@@ -1882,6 +1991,105 @@ mod tests {
             vec![first.task.key(), second.task.key()]
         );
         assert_eq!(first.task.session(), root.task.session());
+    }
+
+    #[test]
+    fn set_process_group_enforces_parent_session_and_group_policy_atomically() {
+        let (kernel, root) = bootstrap(360);
+        let fork_plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
+        let first = kernel
+            .fork_task(
+                &root,
+                fork_plan,
+                ThreadId::synthetic_for_tests(361),
+                "first".to_string(),
+                None,
+            )
+            .expect("first child");
+        let refreshed_root = kernel
+            .context(root.task.key().id, root.thread.key().tid)
+            .expect("refreshed root context");
+        let second = kernel
+            .fork_task(
+                &refreshed_root,
+                fork_plan,
+                ThreadId::synthetic_for_tests(362),
+                "second".to_string(),
+                None,
+            )
+            .expect("second child");
+        let first_group = ProcessGroupId::from_leader(first.task.key().id);
+
+        kernel
+            .set_process_group(root.task.key().id, Some(first.task.key().id), None)
+            .expect("create child's group");
+        kernel
+            .set_process_group(
+                root.task.key().id,
+                Some(second.task.key().id),
+                Some(first_group),
+            )
+            .expect("join sibling's group");
+        assert_eq!(first.task.process_group(), first_group);
+        assert_eq!(second.task.process_group(), first_group);
+        assert_eq!(
+            kernel.registry().process_group_members(first_group),
+            vec![first.task.key(), second.task.key()]
+        );
+
+        let first_context = kernel
+            .context(first.task.key().id, first.thread.key().tid)
+            .expect("first child context");
+        let grandchild = kernel
+            .fork_task(
+                &first_context,
+                fork_plan,
+                ThreadId::synthetic_for_tests(363),
+                "grandchild".to_string(),
+                None,
+            )
+            .expect("grandchild");
+        assert!(matches!(
+            kernel.set_process_group(
+                root.task.key().id,
+                Some(grandchild.task.key().id),
+                None,
+            ),
+            Err(KernelOperationError::UnknownTask(task_id)) if task_id == grandchild.task.key().id
+        ));
+        assert!(matches!(
+            kernel.set_process_group(
+                root.task.key().id,
+                Some(second.task.key().id),
+                Some(ProcessGroupId::from_leader(grandchild.task.key().id)),
+            ),
+            Err(KernelOperationError::IdentityPermission)
+        ));
+        assert!(matches!(
+            kernel.set_process_group(root.task.key().id, None, None),
+            Err(KernelOperationError::IdentityPermission)
+        ));
+    }
+
+    #[test]
+    fn parent_cannot_change_process_group_after_child_exec() {
+        let (kernel, root) = bootstrap(370);
+        let child = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(371),
+                "child".to_string(),
+                None,
+            )
+            .expect("child");
+        let prepared = kernel.prepare_exec(&child, None).expect("prepare exec");
+        kernel.commit_exec(prepared, None).expect("commit exec");
+
+        assert!(matches!(
+            kernel.set_process_group(root.task.key().id, Some(child.task.key().id), None),
+            Err(KernelOperationError::ChildExeced(task_id)) if task_id == child.task.key().id
+        ));
     }
 
     #[test]
