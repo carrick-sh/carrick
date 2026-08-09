@@ -862,8 +862,29 @@ where
             parent_process.pid(),
             self.this_tid.raw(),
         );
+        let parent_pid = parent_process.pid();
+        let forking_tid = self.this_tid.raw();
+        let emit_fork_runtime_stage =
+            |phase: carrick_observability::probes::HvpatchForkRuntimeStagePhase,
+             started: Instant,
+             child_pid: i32| {
+                let elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+                crate::probes::hvpatch_fork_runtime_stage(
+                    carrick_observability::probes::HvpatchForkRuntimeStage::new(
+                        phase,
+                        parent_pid,
+                        child_pid,
+                        forking_tid,
+                        elapsed_ns,
+                    ),
+                );
+            };
+        let fork_total_started = Instant::now();
+        let mut fork_stage_started = fork_total_started;
         let mut quiesced = false;
-        if self.kicker.count() > 1 {
+        let initial_siblings = self.kicker.count().saturating_sub(1);
+        let mut quiesce_poll_iterations = 0_u64;
+        if initial_siblings > 0 {
             process_barrier.set_quiescing();
             self.kicker.kick_all_except(self.this_tid);
             self.futex.notify_signal_pending();
@@ -871,6 +892,7 @@ where
             kernel.signal_arrival.wake_all_waiters();
             let deadline = Instant::now() + Duration::from_secs(10);
             while self.kicker.count() > 1 {
+                quiesce_poll_iterations = quiesce_poll_iterations.saturating_add(1);
                 if Instant::now() >= deadline {
                     tracing::error!(
                         pid = parent_process.pid(),
@@ -887,7 +909,30 @@ where
             }
             quiesced = true;
         }
+        let quiesce_elapsed_ns = fork_stage_started
+            .elapsed()
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64;
+        crate::probes::hvpatch_fork_quiesce(
+            carrick_observability::probes::HvpatchForkQuiesce::new(
+                parent_pid,
+                forking_tid,
+                initial_siblings.min(u32::MAX as usize) as u32,
+                quiesce_poll_iterations,
+                quiesce_elapsed_ns,
+            ),
+        );
+        crate::probes::hvpatch_fork_runtime_stage(
+            carrick_observability::probes::HvpatchForkRuntimeStage::new(
+                carrick_observability::probes::HvpatchForkRuntimeStagePhase::Quiesce,
+                parent_pid,
+                0,
+                forking_tid,
+                quiesce_elapsed_ns,
+            ),
+        );
 
+        fork_stage_started = Instant::now();
         crate::trap::set_guest_arena_high_water(kernel.dispatcher.mmap_arena_high_water());
         let (child_process, child_record) = match parent_process.fork_child() {
             Ok(child) => child,
@@ -912,10 +957,16 @@ where
             ));
         };
         let child_tid = ThreadId::from_guest_supplied_tid(child_pid);
+        emit_fork_runtime_stage(
+            carrick_observability::probes::HvpatchForkRuntimeStagePhase::ProcessAllocate,
+            fork_stage_started,
+            child_pid,
+        );
         // CLONE_PIDFD is part of child creation, not a best-effort postscript.
         // Install the guest-virtual pidfd while the process-table record is live
         // and before any child vCPU can run. Every later setup failure removes
         // the fd and retires the unstarted process atomically.
+        fork_stage_started = Instant::now();
         let installed_pidfd = if request.pidfd_out.is_some() {
             match kernel
                 .dispatcher
@@ -937,6 +988,12 @@ where
         if let Some(address) = request.parent_tid_addr {
             let _ = engine.write_bytes(address, &child_pid.to_le_bytes());
         }
+        emit_fork_runtime_stage(
+            carrick_observability::probes::HvpatchForkRuntimeStagePhase::PidfdParent,
+            fork_stage_started,
+            child_pid,
+        );
+        fork_stage_started = Instant::now();
         let spec = match engine.build_process_spec(
             carrick_hal::GuestEntryRegs {
                 return_value: 0,
@@ -964,6 +1021,12 @@ where
                 return Err(RuntimeError::Trap(error));
             }
         };
+        emit_fork_runtime_stage(
+            carrick_observability::probes::HvpatchForkRuntimeStagePhase::ProcessSpec,
+            fork_stage_started,
+            child_pid,
+        );
+        fork_stage_started = Instant::now();
         let child_dispatcher = kernel.dispatcher.fork_clone_in_process(
             self.this_tid,
             child_tid,
@@ -971,6 +1034,12 @@ where
             child_pid as u32,
         );
         child_dispatcher.bind_hvpatch_process(child_process.clone());
+        emit_fork_runtime_stage(
+            carrick_observability::probes::HvpatchForkRuntimeStagePhase::DispatcherClone,
+            fork_stage_started,
+            child_pid,
+        );
+        fork_stage_started = Instant::now();
         let child_unstarted_context = child_process.clone();
         let child_exit_context = child_process.clone();
         let child_trace_context = child_process.clone();
@@ -998,6 +1067,12 @@ where
         let max_traps = self.max_traps;
         let child_tid_addr = request.child_tid_addr;
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        emit_fork_runtime_stage(
+            carrick_observability::probes::HvpatchForkRuntimeStagePhase::RuntimeState,
+            fork_stage_started,
+            child_pid,
+        );
+        fork_stage_started = Instant::now();
         let handle = match std::thread::Builder::new()
             .name(format!("guest-pid-{child_pid}"))
             .spawn(move || {
@@ -1105,6 +1180,12 @@ where
                 ))));
             }
         };
+        emit_fork_runtime_stage(
+            carrick_observability::probes::HvpatchForkRuntimeStagePhase::ThreadSpawn,
+            fork_stage_started,
+            child_pid,
+        );
+        fork_stage_started = Instant::now();
         all_threads.lock().push(handle);
         match ready_rx.recv() {
             Ok(Ok(())) => {}
@@ -1137,6 +1218,12 @@ where
                 ))));
             }
         }
+        emit_fork_runtime_stage(
+            carrick_observability::probes::HvpatchForkRuntimeStagePhase::ChildReady,
+            fork_stage_started,
+            child_pid,
+        );
+        fork_stage_started = Instant::now();
         if let (Some(address), Some(fd)) = (request.pidfd_out, installed_pidfd) {
             let _ = engine.write_bytes(address, &fd.to_le_bytes());
         }
@@ -1156,6 +1243,16 @@ where
                 "hvpatch in-process fork currently records clone-parent/exit-signal metadata for later wait integration"
             );
         }
+        emit_fork_runtime_stage(
+            carrick_observability::probes::HvpatchForkRuntimeStagePhase::Publication,
+            fork_stage_started,
+            child_pid,
+        );
+        emit_fork_runtime_stage(
+            carrick_observability::probes::HvpatchForkRuntimeStagePhase::Total,
+            fork_total_started,
+            child_pid,
+        );
         Ok(Some(i64::from(child_pid)))
     }
 }
