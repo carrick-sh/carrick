@@ -804,6 +804,7 @@ impl Drop for HvpatchSyscallServiceGuard {
             HvpatchSyscallService::new(self.pid, self.tid, self.asid, self.number, duration_ns)
         {
             crate::probes::hvpatch_syscall_service(event);
+            crate::probes::hvpatch_syscall_service_clear(event);
         }
     }
 }
