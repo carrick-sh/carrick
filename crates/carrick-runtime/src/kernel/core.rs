@@ -246,6 +246,7 @@ impl Kernel {
             task_claim,
             thread_claims: BTreeMap::from([(leader_tid, leader_claim)]),
             dead_leader: None,
+            has_execed: false,
             diagnostic_name: bootstrap.diagnostic_name,
         };
         let registry = Registry {
@@ -542,6 +543,7 @@ pub(super) struct TaskRecord {
     pub(super) task_claim: TaskClaim,
     pub(super) thread_claims: BTreeMap<LinuxTid, ThreadClaim>,
     pub(super) dead_leader: Option<RetiredThreadRecord>,
+    pub(super) has_execed: bool,
     pub(super) diagnostic_name: String,
 }
 
