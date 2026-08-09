@@ -1212,7 +1212,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // `execve_rebuild` installed a fresh table image. Drop the manager for
         // the old image before the hvpatch ASID configuration reserves its
         // private-bank aperture in the NEW tables.
-        self.page_tables = Arc::new(Mutex::new(None));
+        self.page_tables = Arc::new(Mutex::new(self.vm.exec_page_tables()));
         if let Some(asid) = self.process_asid {
             <Self as ThreadedEngine>::configure_process_asid(self, asid)?;
         }
@@ -1359,6 +1359,16 @@ pub struct Aarch64SiblingSpec<V: Aarch64Vmm> {
     process_asid: Option<u16>,
 }
 
+pub struct Aarch64ProcessSpec<V: Aarch64Vmm> {
+    builder: V::ProcessBuilder,
+    snapshot: Aarch64VcpuSnapshot,
+    page_tables: Arc<Mutex<Option<PageTableManager>>>,
+    protections: Arc<MemoryProtections>,
+    process_asid: u16,
+}
+
+unsafe impl<V: Aarch64Vmm> Send for Aarch64ProcessSpec<V> where V::ProcessBuilder: Send {}
+
 // SAFETY: the snapshot is POD; the page-table / protections `Arc`s are Send+Sync;
 // the builder is the backend's own bounded-`Send` payload.
 unsafe impl<V: Aarch64Vmm> Send for Aarch64SiblingSpec<V> where V::SiblingBuilder: Send {}
@@ -1395,6 +1405,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     type Arch = carrick_hal::Aarch64GuestArch;
     type KickHandle = V::KickHandle;
     type SiblingSpec = Aarch64SiblingSpec<V>;
+    type ProcessSpec = Aarch64ProcessSpec<V>;
 
     fn set_persistent_vm_lifecycle(&mut self, enabled: bool) {
         self.vm.set_persistent_vm_lifecycle(enabled);
@@ -1425,6 +1436,74 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.vcpu.set_sys_reg(SysReg::Ttbr1, ttbr)?;
         self.process_asid = Some(asid);
         Ok(())
+    }
+
+    fn supports_in_process_fork(&self) -> bool {
+        self.process_asid.is_some()
+    }
+
+    fn retire_in_process_address_space(&mut self) -> Result<(), TrapError> {
+        self.run_el1_maintenance()?;
+        self.vm.process_exit_cleanup()?;
+        self.vm.destroy_vcpu_on_thread_exit(&mut self.vcpu);
+        Ok(())
+    }
+
+    fn build_process_spec(
+        &mut self,
+        entry: GuestEntryRegs,
+        child_ttbr0: u64,
+        bank_base: u64,
+        bank_size: u64,
+    ) -> Result<Self::ProcessSpec, TrapError> {
+        let parent = self.vcpu.snapshot()?;
+        // A process child, like a thread sibling, starts at the instruction
+        // after the trapped clone in EL0. The raw parent snapshot is currently
+        // parked in the EL1 syscall vector; using its live PC/PSTATE would send
+        // a brand-new vCPU back into that vector as EL0 code and spin forever.
+        let mut snapshot = seed_sibling_snapshot(&parent, entry);
+        snapshot.ttbr0 = child_ttbr0;
+        snapshot.ttbr1 = child_ttbr0;
+        let child_asid = (child_ttbr0 >> 48) as u16;
+        if child_asid == 0 {
+            return Err(TrapError::Hypervisor(
+                "in-process child ASID zero is reserved".to_owned(),
+            ));
+        }
+
+        let mut page_tables = self
+            .page_tables
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .ok_or_else(|| {
+                TrapError::Hypervisor("hvpatch parent page tables are absent".to_owned())
+            })?;
+        let child_root = child_ttbr0 & ((1_u64 << 48) - 1);
+        page_tables.rebase(child_root).map_err(|error| {
+            TrapError::Hypervisor(format!("rebase child page tables: {error:?}"))
+        })?;
+        let builder = self
+            .vm
+            .build_process_builder(bank_base, bank_size, &mut page_tables)?;
+        let protections = Arc::new(MemoryProtections::from_snapshot(
+            self.protections.snapshot_all(),
+        ));
+        Ok(Aarch64ProcessSpec {
+            builder,
+            snapshot,
+            page_tables: Arc::new(Mutex::new(Some(page_tables))),
+            protections,
+            process_asid: child_asid,
+        })
+    }
+
+    fn materialize_process(spec: Self::ProcessSpec) -> Result<Self, TrapError> {
+        let (vm, mut vcpu) = V::materialize_process(spec.builder)?;
+        vcpu.restore_thread_start(&spec.snapshot)?;
+        let mut engine = Self::from_parts_with_shared(vm, vcpu, spec.page_tables, spec.protections);
+        engine.process_asid = Some(spec.process_asid);
+        Ok(engine)
     }
 
     fn kick_handle(&self) -> Self::KickHandle {

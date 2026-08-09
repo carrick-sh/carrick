@@ -17,6 +17,7 @@ mod island;
 mod patcher;
 mod process_table;
 
+pub(crate) use process_table::WaitResult;
 use process_table::{GuestPid, ProcessTable};
 
 /// Per-kernel binding to one Linux process inside the shared hvpatch VM.
@@ -34,6 +35,42 @@ impl ProcessContext {
 
     pub(crate) fn live_process_count(&self) -> usize {
         self.table.live_process_count()
+    }
+
+    pub(crate) fn is_child(&self) -> bool {
+        self.table
+            .process(self.pid)
+            .is_some_and(|process| process.parent().is_some())
+    }
+
+    pub(crate) fn fork_child(
+        &self,
+    ) -> Result<(Self, process_table::GuestProcess), process_table::ProcessTableError> {
+        let child = self.table.fork_process(self.pid)?;
+        Ok((
+            Self {
+                table: std::sync::Arc::clone(&self.table),
+                pid: child.pid(),
+            },
+            child,
+        ))
+    }
+
+    pub(crate) fn discard_unstarted_child(&self) -> Result<(), process_table::ProcessTableError> {
+        let retired = self.table.exit_process(self.pid)?;
+        self.table.acknowledge_tlb_flush(retired)
+    }
+
+    pub(crate) fn publish_exit_code(
+        &self,
+        exit_code: i32,
+    ) -> Result<(), process_table::ProcessTableError> {
+        self.table.publish_exit(self.pid, (exit_code & 0xff) << 8)
+    }
+
+    pub(crate) fn wait_child(&self, target: Option<i32>, nohang: bool, nowait: bool) -> WaitResult {
+        let target = target.and_then(GuestPid::from_raw);
+        self.table.wait_child(self.pid, target, nohang, nowait)
     }
 }
 
@@ -60,7 +97,9 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
     })?;
     engine.configure_process_asid(root.asid().raw())?;
     debug_assert_eq!(root.ttbr0(), engine.get_sys_reg(SysReg::Ttbr0).unwrap_or(0));
-    Ok(Some(ProcessContext { table, pid }))
+    let context = ProcessContext { table, pid };
+    dispatcher.bind_hvpatch_process(context.clone());
+    Ok(Some(context))
 }
 
 const PAGE_SIZE: u64 = 4096;

@@ -654,6 +654,12 @@ pub(super) struct ProcState {
     /// forked child reports its real host parent — which, because the trees
     /// mirror, IS its parent guest process. See `sys_getppid`.
     pub bootstrap_host_pid: u32,
+    /// Hvpatch-only guest PID when multiple Linux processes share one host
+    /// process. `None` preserves the host-pid identity model of every other
+    /// backend.
+    pub virtual_pid: Option<u32>,
+    pub virtual_ppid: Option<u32>,
+    pub hvpatch_process: Option<crate::hvpatch::ProcessContext>,
     /// Interval-timer state for `[ITIMER_REAL, ITIMER_VIRTUAL, ITIMER_PROF]`,
     /// indexed by the `which` value. Anchored to the monotonic clock so
     /// setitimer/getitimer report the time remaining; `None` = disarmed.
@@ -796,6 +802,9 @@ impl ProcState {
             timerslack_default: LINUX_DEFAULT_TIMERSLACK_NS,
             rlimit_overrides: [None; 16],
             bootstrap_host_pid: std::process::id(),
+            virtual_pid: None,
+            virtual_ppid: None,
+            hvpatch_process: None,
             itimers: [None, None, None],
             affinity: default_affinity(crate::host_facts::logical_cpu_count()),
             tso_enabled: false,
@@ -805,8 +814,10 @@ impl ProcState {
         }
     }
 
-    pub(super) fn fork_clone(&self, parent_guest_pid: u32) -> Self {
+    pub(super) fn fork_clone(&self, parent_guest_pid: u32, child_guest_pid: u32) -> Self {
         let mut child = self.clone();
+        child.virtual_pid = Some(child_guest_pid);
+        child.virtual_ppid = Some(parent_guest_pid);
         child.pdeathsig = 0;
         child.subreaper_ancestor = if self.child_subreaper != 0 {
             parent_guest_pid
@@ -2925,6 +2936,42 @@ impl SyscallDispatcher {
             let options = LinuxWaitOptions::from_bits_retain(options);
             if !LinuxWaitOptions::WAIT4_SUPPORTED.contains(options) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            if let Some(process) = this.hvpatch_process() {
+                let target = match pid.0 {
+                    -1 => None,
+                    value if value > 0 => Some(value),
+                    // Process-group selection needs the shared guest pgid
+                    // registry. Do not ask Darwin about a host-child relation
+                    // that intentionally does not exist.
+                    _ => {
+                        return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
+                    }
+                };
+                match process.wait_child(
+                    target,
+                    options.contains(LinuxWaitOptions::WNOHANG),
+                    false,
+                ) {
+                    crate::hvpatch::WaitResult::Exited(exit) => {
+                        if wstatus_addr.0 != 0 {
+                            memory.write_bytes(wstatus_addr.0, &exit.status().to_ne_bytes())?;
+                        }
+                        if rusage_addr.0 != 0 {
+                            let rusage = LinuxRusage::zeroed();
+                            memory.write_bytes(rusage_addr.0, rusage.abi_bytes())?;
+                        }
+                        return Ok(DispatchOutcome::Returned {
+                            value: i64::from(exit.pid().raw()),
+                        });
+                    }
+                    crate::hvpatch::WaitResult::StillRunning => {
+                        return Ok(DispatchOutcome::Returned { value: 0 });
+                    }
+                    crate::hvpatch::WaitResult::NoChild => {
+                        return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
+                    }
+                }
             }
             // PID namespace (§5.3): a positive `pid` arg names a child by its
             // ns-pid; translate it to the host pid the kernel knows. An ns-pid

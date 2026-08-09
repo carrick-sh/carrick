@@ -327,6 +327,9 @@ impl SyscallDispatcher {
 
     /// Namespace-visible process identity without taking the credential lock.
     pub(crate) fn identity_pid(&self) -> u32 {
+        if let Some(pid) = self.proc.lock().virtual_pid {
+            return pid;
+        }
         crate::namespace::pid::self_ns_pid()
     }
 
@@ -334,7 +337,7 @@ impl SyscallDispatcher {
         // In a PID namespace the container init is pid 1 and every member sees
         // its ns-local pid; identity (the host pid) otherwise (§5.3).
         DispatchOutcome::Returned {
-            value: i64::from(crate::namespace::pid::self_ns_pid()),
+            value: i64::from(self.identity_pid()),
         }
     }
 
@@ -857,6 +860,11 @@ impl SyscallDispatcher {
         }
 
         fn sys_getppid(this, cx) {
+            if let Some(ppid) = this.proc.lock().virtual_ppid {
+                return Ok(DispatchOutcome::Returned {
+                    value: i64::from(ppid),
+                });
+            }
             // PID-namespace translation (§5.3, §5.4): the ns-init (ns-pid 1) has
             // no parent inside the namespace, so getppid()==0; other members map
             // their host ppid to its ns-pid (0 if the parent is outside the ns);

@@ -297,6 +297,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// thread; `materialize_sibling` turns it into a fresh `(Self, Self::Vcpu)`
     /// pair on the SAME VM (`clone(CLONE_THREAD)`) without re-registering memory.
     type SiblingBuilder: Send;
+    type ProcessBuilder: Send;
 
     /// Retain the host VM across guest process lifecycle operations. HVF's
     /// hvpatch lane overrides this; ordinary VMM and non-HVF backends preserve
@@ -525,6 +526,10 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         new_image: &AddressSpace,
     ) -> Result<(), TrapError>;
 
+    fn exec_page_tables(&self) -> Option<carrick_mem::page_table::PageTableManager> {
+        None
+    }
+
     // NOTE: `process_exit_cleanup` is inherited from the shared [`GuestVmBackend`]
     // supertrait (ISA-neutral hook, signature-identical with x86).
 
@@ -633,6 +638,25 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// SAME VM. KVM `materialize_sibling`; the engine restores the seeded snapshot
     /// and SHARES the protections/page_tables Arc.
     fn materialize_sibling(builder: Self::SiblingBuilder) -> Result<(Self, Self::Vcpu), TrapError>;
+
+    fn build_process_builder(
+        &self,
+        _bank_base: u64,
+        _bank_size: u64,
+        _page_tables: &mut carrick_mem::page_table::PageTableManager,
+    ) -> Result<Self::ProcessBuilder, TrapError> {
+        Err(TrapError::Hypervisor(
+            "aarch64 backend does not support in-process fork".to_owned(),
+        ))
+    }
+
+    fn materialize_process(
+        _builder: Self::ProcessBuilder,
+    ) -> Result<(Self, Self::Vcpu), TrapError> {
+        Err(TrapError::Hypervisor(
+            "aarch64 backend does not support in-process fork".to_owned(),
+        ))
+    }
 
     /// Set SP_EL0 on a vfork child given an explicit `child_stack`, through
     /// `&self` (the shared loop holds only `&engine`).

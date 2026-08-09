@@ -186,8 +186,8 @@ where
             factory_host.make_futex(table)
         },
     );
-    let fork_coordinator: Box<dyn carrick_hal::HostForkCoordinator> =
-        host_for_factory.make_fork_coordinator();
+    let fork_coordinator: Arc<dyn carrick_hal::HostForkCoordinator> =
+        Arc::from(host_for_factory.make_fork_coordinator());
     // The live-vCPU registry. Constructing the kicker installs the kick-signal
     // handler (idempotent) so a cross-thread `pthread_kill` forces a target
     // vCPU out of its run ioctl. Built before the kernel so the signal-arrival

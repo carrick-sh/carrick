@@ -39,8 +39,8 @@ use carrick_mem::memory::AddressSpace;
 
 use crate::syscall_mailbox::{HvfSyscallTransport, MailboxBinding};
 use crate::trap::{
-    GuestMappingPlan, HvfInner, HvfVmState, ThreadSpec, VcpuSnapshot, hvf_get_reg, hvf_get_sys_reg,
-    hvf_set_reg, hvf_set_sys_reg, set_simd_fp_reg_v,
+    GuestMappingPlan, HvfInner, HvfVmState, ProcessSpec, ThreadSpec, VcpuSnapshot, hvf_get_reg,
+    hvf_get_sys_reg, hvf_set_reg, hvf_set_sys_reg, set_simd_fp_reg_v,
 };
 
 /// The public engine type: the HVF aarch64 lane IS `Aarch64EngineCore<HvfAarch64Vmm>`.
@@ -364,6 +364,7 @@ impl GuestVmBackend for HvfAarch64Vmm {
         // permit is fd-lifetime-bound, and HVF's VM is swapped/leaked-until-exit
         // (ManuallyDrop discipline), so there is nothing to release on a
         // forked-child `_exit`. Matches the historical no-op byte-for-byte.
+        self.state.retire_process_mappings()?;
         let _ = crate::trap::cooperative_release_atomic_permit();
         Ok(())
     }
@@ -391,6 +392,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     type Vcpu = HvfAarch64Vcpu;
     type KickHandle = crate::vcpu_kick::VcpuKickHandle;
     type SiblingBuilder = ThreadSpec;
+    type ProcessBuilder = ProcessSpec;
 
     // ── memory windows + stage-2 ──
 
@@ -586,6 +588,10 @@ impl Aarch64Vmm for HvfAarch64Vmm {
             .execve_rebuild(&mut vcpu.inner, &mut vcpu.mailbox, &plan)
     }
 
+    fn exec_page_tables(&self) -> Option<carrick_mem::page_table::PageTableManager> {
+        self.state.page_tables_snapshot()
+    }
+
     // ── threaded sibling lifecycle ──
 
     fn kick_handle(&self) -> Self::KickHandle {
@@ -698,6 +704,21 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         // pair; the engine restores the seeded snapshot via `restore_thread_start`
         // (HVF's EL0-trampoline thread-start for a brand-new vCPU).
         let (state, vcpu, mailbox) = HvfVmState::from_thread_spec(builder)?;
+        Ok((Self { state }, HvfAarch64Vcpu::new(vcpu, mailbox)))
+    }
+
+    fn build_process_builder(
+        &self,
+        bank_base: u64,
+        bank_size: u64,
+        page_tables: &mut carrick_mem::page_table::PageTableManager,
+    ) -> Result<Self::ProcessBuilder, TrapError> {
+        self.state
+            .build_process_spec(bank_base, bank_size, page_tables)
+    }
+
+    fn materialize_process(builder: Self::ProcessBuilder) -> Result<(Self, Self::Vcpu), TrapError> {
+        let (state, vcpu, mailbox) = HvfVmState::from_process_spec(builder)?;
         Ok((Self { state }, HvfAarch64Vcpu::new(vcpu, mailbox)))
     }
 

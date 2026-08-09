@@ -2396,6 +2396,16 @@ fn resolve_handler<M: GuestMemory>(number: u64) -> Option<SyscallHandler<M>> {
 }
 
 impl SyscallDispatcher {
+    pub(crate) fn bind_hvpatch_process(&self, process: crate::hvpatch::ProcessContext) {
+        let mut proc = self.proc.lock();
+        proc.virtual_pid = Some(process.pid() as u32);
+        proc.hvpatch_process = Some(process);
+    }
+
+    pub(crate) fn hvpatch_process(&self) -> Option<crate::hvpatch::ProcessContext> {
+        self.proc.lock().hvpatch_process.clone()
+    }
+
     /// Clone process-private dispatcher state for an hvpatch in-process fork.
     /// Shared kernel objects (open descriptions, filesystem namespace, network)
     /// stay shared; fd numbers, signals, credentials, memory metadata, and
@@ -2406,12 +2416,17 @@ impl SyscallDispatcher {
         parent_tid: crate::thread::ThreadId,
         child_tid: crate::thread::ThreadId,
         parent_guest_pid: u32,
+        child_guest_pid: u32,
     ) -> Self {
         Self {
             io: self.io.fork_clone(),
             mem: Mutex::new(self.mem.lock().clone()),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
-            proc: Mutex::new(self.proc.lock().fork_clone(parent_guest_pid)),
+            proc: Mutex::new(
+                self.proc
+                    .lock()
+                    .fork_clone(parent_guest_pid, child_guest_pid),
+            ),
             creds: Mutex::new(*self.creds.lock()),
             signal: Mutex::new(self.signal.lock().fork_clone(parent_tid, child_tid)),
             signal_tid_pending_hint: std::sync::atomic::AtomicU64::new(0),
@@ -10683,7 +10698,7 @@ mod hvpatch_in_process_fork_tests {
         parent.proc.lock().membarrier_ready = u64::MAX;
         parent.mem.lock().brk_current = 0x1234_0000;
 
-        let child = parent.fork_clone_in_process(parent_tid, child_tid, 41);
+        let child = parent.fork_clone_in_process(parent_tid, child_tid, 41, 42);
 
         let child_file = child.io.open_files.read().get(&3).cloned().unwrap();
         assert!(Arc::ptr_eq(&description, &child_file.description));
