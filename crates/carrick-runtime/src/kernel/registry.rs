@@ -335,6 +335,10 @@ macro_rules! claim_role {
             pub const fn raw(&self) -> i32 {
                 self.0.raw.get()
             }
+
+            pub(crate) fn belongs_to(&self, registry: &IdRegistry) -> bool {
+                Arc::ptr_eq(&self.0.state, &registry.state)
+            }
         }
     };
 }
