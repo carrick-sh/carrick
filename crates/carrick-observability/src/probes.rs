@@ -1947,6 +1947,13 @@ mod real {
         /// 4=first-vcpu-run, 5=vm-destroy-begin, 6=vm-destroy-end. (guest-exit has
         /// its own probe between 4 and 5.) Cheap: fires a handful of times per run.
         fn lifecycle(_: u32) {}
+        /// Every Hypervisor.framework VM ownership transition. `operation`:
+        /// 0=create-attempt, 1=create-success, 2=destroy-attempt,
+        /// 3=destroy-success. `admission` is the backend's admission class for
+        /// create operations and -1 for destroy operations. This is distinct
+        /// from `lifecycle`: exec/fork may transition VM ownership more than once
+        /// during one Carrick run.
+        fn vm__lifecycle(_: u32, _: i32) {}
         /// Fires every syscall trap. `arg0` is the ADDRESS of a
         /// `compat::GuestRegs` (`#[repr(C)]`); DTrace does
         /// `copyin(arg0, sizeof(gregs_t))` and reads fields by offset. A
@@ -2721,6 +2728,10 @@ mod real {
 
     pub fn lifecycle(phase: u32) {
         carrick_usdt::lifecycle!(|| phase);
+    }
+
+    pub fn vm_lifecycle(operation: u32, admission: i32) {
+        carrick_usdt::vm__lifecycle!(|| (operation, admission));
     }
 
     pub fn execve_argv(path: &str, argv: &[Vec<u8>]) {
@@ -4094,6 +4105,7 @@ mod stub {
     stub!(mn_admit(tid: i32, slot: u32, budget: u32));
     stub!(mn_reclaim(tid: i32, old_slot: u32, new_slot: u32, kind: i32));
     stub!(lifecycle(phase: u32));
+    stub!(vm_lifecycle(operation: u32, admission: i32));
     stub!(execve_argv(path: &str, argv: &[Vec<u8>]));
     stub!(host_image_base());
     stub!(host_image_text_range());

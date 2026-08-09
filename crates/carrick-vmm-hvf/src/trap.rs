@@ -745,6 +745,16 @@ enum VmCreateAdmission {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl VmCreateAdmission {
+    fn probe_code(self) -> i32 {
+        match self {
+            Self::Initial => 0,
+            Self::ForkRebuild { vfork: false } => 1,
+            Self::ForkRebuild { vfork: true } => 2,
+            Self::ExecveRebuild => 3,
+            Self::SharedWaitResume => 4,
+        }
+    }
+
     /// Soft pre-throttle on concurrently-CREATING HVF VMs across a fork tree.
     /// This bounds VM/vCPU *creation* only (the pre-block window of a fork storm),
     /// NOT guest *execution* — execution is already bounded by the per-process M:N
@@ -1566,6 +1576,7 @@ fn record_vm_resident() {
 /// `hv_vm_destroy`. Idempotent (token-guarded).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn record_vm_released() {
+    crate::probes::vm_lifecycle(3, -1);
     if !atomic_permit_enabled() {
         return;
     }
@@ -1863,12 +1874,14 @@ fn create_vm_with_admission(
     };
     // Config is rebuilt per attempt inside the closure because `with_config`
     // consumes it, so an HV_NO_RESOURCES retry needs a fresh one.
+    crate::probes::vm_lifecycle(0, admission.probe_code());
     match create_with_no_resources_backpressure("hv_vm_create", || {
         let config = fresh_vm_config()?;
         virtual_machine_with_private_signals_blocked(config)
     }) {
         Ok(vm) => {
             record_vm_resident();
+            crate::probes::vm_lifecycle(1, admission.probe_code());
             Ok((vm, permit))
         }
         Err(e) => {
@@ -4103,6 +4116,7 @@ impl HvfVmState {
                 "shared_wait_park: hv_vcpu_destroy rc={vcpu_rc:#x}"
             )));
         }
+        crate::probes::vm_lifecycle(2, -1);
         let vm_rc = unsafe { applevisor_sys::hv_vm_destroy() };
         if vm_rc != 0 {
             return Err(TrapError::Hypervisor(format!(
@@ -4131,6 +4145,7 @@ impl HvfVmState {
                     .into(),
             ));
         }
+        crate::probes::vm_lifecycle(2, -1);
         let vm_rc = unsafe { applevisor_sys::hv_vm_destroy() };
         if vm_rc != 0 {
             return Err(TrapError::Hypervisor(format!(
@@ -4493,6 +4508,7 @@ impl HvfVmState {
             self.vcpu_id as i64,
         );
         let phase_start = std::time::Instant::now();
+        crate::probes::vm_lifecycle(2, -1);
         let vm_destroy_rc = unsafe { applevisor_sys::hv_vm_destroy() };
         if vm_destroy_rc == 0 {
             record_vm_released();
@@ -4959,6 +4975,7 @@ impl HvfVmState {
         if vcpu_destroy_rc == 0 {
             vcpu_destroyed(inherited_vcpu_id);
         }
+        crate::probes::vm_lifecycle(2, -1);
         let vm_destroy_rc = unsafe { applevisor_sys::hv_vm_destroy() };
         if vm_destroy_rc == 0 {
             record_vm_released();
