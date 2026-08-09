@@ -1412,6 +1412,14 @@ impl SyscallDispatcher {
         }
     }
 
+    /// Publish an asynchronous signal from another Linux process multiplexed
+    /// inside the same hvpatch host process. The caller owns wakeup/kick routing;
+    /// this method only records the signal in this dispatcher's process-private
+    /// pending set, avoiding host-global signal slots.
+    pub(crate) fn mark_in_process_signal_pending(&self, signum: i32) {
+        self.mark_process_signal_pending(signum);
+    }
+
     /// Raise a process-directed `signum` against the guest itself
     /// (`kill(getpid(), sig)`). If the signal is blocked it is held pending;
     /// otherwise it is handed to the runtime's process-directed delivery slot.

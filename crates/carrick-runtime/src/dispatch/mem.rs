@@ -2449,6 +2449,7 @@ impl SyscallDispatcher {
             }
 
             let mut bus_fault_offset = None;
+            let mut bus_fault_debug = None;
             // A MAP_SHARED mapping of a memfd sealed F_SEAL_WRITE is created
             // read-only here (a writable one already returned EPERM above); record
             // it so a later mprotect(PROT_WRITE) is rejected.
@@ -2509,11 +2510,44 @@ impl SyscallDispatcher {
                 let Some(open_file) = this.open_file(fd.0) else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
+                // Independently opened in-memory descriptions are snapshots of
+                // one shared overlay inode. Another process can extend/write
+                // that inode after this description was opened (Go telemetry
+                // does exactly this before MAP_SHARED). Refresh at map time so
+                // EOF classification and the initial mapped bytes come from the
+                // live inode rather than a stale per-open snapshot.
+                if map_sharing == MmapSharing::Shared {
+                    let path = match &*open_file.description.read() {
+                        OpenDescription::File { path, .. } => Some(path.clone()),
+                        _ => None,
+                    };
+                    if let Some(path) = path
+                        && let Some(live) = this.fs.rootfs_vfs.overlay.file_contents(&path)
+                    {
+                        let mut open = open_file.description.write();
+                        if let OpenDescription::File {
+                            path: open_path,
+                            contents,
+                            metadata,
+                            ..
+                        } = &mut *open
+                            && *open_path == path
+                        {
+                            metadata.size = live.len();
+                            *contents = FileContents::dense(live);
+                        }
+                    }
+                }
                 let open = open_file.description.read();
                 let offset_usize =
                     usize::try_from(offset).map_err(|_| DispatchError::LengthTooLarge(offset))?;
                 match &*open {
-                    OpenDescription::File { contents, base, .. } => {
+                    OpenDescription::File {
+                        contents,
+                        base,
+                        path,
+                        ..
+                    } => {
                         if map_sharing == MmapSharing::Shared
                             && let Some(bus_offset) = shared_file_bus_offset(
                                 contents.len() as u64,
@@ -2523,6 +2557,10 @@ impl SyscallDispatcher {
                             )
                         {
                             bus_fault_offset = Some(bus_offset);
+                            bus_fault_debug = Some(format!(
+                                "vfs path={path:?} file_len={} desc=File",
+                                contents.len()
+                            ));
                         }
                         if map_sharing == MmapSharing::Shared
                             && matches!(base.seals(), Some(s) if s
@@ -2542,7 +2580,7 @@ impl SyscallDispatcher {
                         let available = contents.read_at(offset_usize, length_usize);
                         bytes[..available.len()].copy_from_slice(&available);
                     }
-                    OpenDescription::SyntheticFile { contents, .. } => {
+                    OpenDescription::SyntheticFile { contents, path, .. } => {
                         if map_sharing == MmapSharing::Shared
                             && let Some(bus_offset) = shared_file_bus_offset(
                                 contents.len() as u64,
@@ -2552,6 +2590,10 @@ impl SyscallDispatcher {
                             )
                         {
                             bus_fault_offset = Some(bus_offset);
+                            bus_fault_debug = Some(format!(
+                                "vfs path={path:?} file_len={} desc=SyntheticFile",
+                                contents.len()
+                            ));
                         }
                         if offset_usize < contents.len() {
                             let available = &contents[offset_usize..];
@@ -2566,6 +2608,11 @@ impl SyscallDispatcher {
                                 shared_file_bus_offset(file_len, offset, length, page_size)
                         {
                             bus_fault_offset = Some(bus_offset);
+                            bus_fault_debug = Some(format!(
+                                "host path={:?} file_len={file_len} desc=HostFile host_fd={}",
+                                carrick_portable::fd_abs_path(host_fd.raw()),
+                                host_fd.raw()
+                            ));
                         }
                         let n = unsafe {
                             libc::pread(
@@ -2725,6 +2772,13 @@ impl SyscallDispatcher {
                         lowered_file_backed = true;
                         bus_fault_offset =
                             shared_file_bus_offset(file_len, offset, length, page_size);
+                        if bus_fault_offset.is_some() {
+                            bus_fault_debug = Some(format!(
+                                "host path={:?} file_len={file_len} desc=HostFile host_fd={}",
+                                carrick_portable::fd_abs_path(host_fd.raw()),
+                                host_fd.raw()
+                            ));
+                        }
                     }
                 }
                 if !lowered_file_backed {
@@ -2781,6 +2835,15 @@ impl SyscallDispatcher {
                 && let Some(bus_len) = length.checked_sub(bus_offset)
                 && let Ok(bus_len_usize) = usize::try_from(bus_len)
             {
+                if std::env::var_os("CARRICK_FAULT_DEBUG").is_some() {
+                    eprintln!(
+                        "[FAULTDBG] mmap BUS fd={} addr={address:#x} len={length:#x} \
+                         offset={offset:#x} bus_offset={bus_offset:#x} sharing={map_sharing:?} \
+                         prot={prot_flags:?} flags={map_flags:?} {}",
+                        fd.0,
+                        bus_fault_debug.as_deref().unwrap_or("desc=unknown")
+                    );
+                }
                 memory.set_no_access(bus_start, bus_len_usize, true);
                 if memory.protect_range(bus_start, bus_len_usize, 0).is_err()
                     && memory.supports_concurrent_exec_protection()
@@ -5246,6 +5309,132 @@ mod tests {
                 "{source} partial-page tail must be zero-filled"
             );
         }
+    }
+
+    #[test]
+    fn shared_mmap_refreshes_an_independently_opened_vfs_inode() {
+        const SYS_PWRITE64: u64 = 68;
+        const SYS_MMAP: u64 = 222;
+        const FILE_LEN: u64 = 16 * 1024;
+        const WRITER_FD: i32 = 23;
+        const MAPPER_FD: i32 = 24;
+        const PATH: &str = "/telemetry.count";
+
+        let dispatcher = native16k_dispatcher();
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .set_file_contents(PATH, Vec::new())
+            .expect("create shared overlay inode");
+        let install_snapshot = |fd| {
+            dispatcher.io.open_files.write().insert(
+                fd,
+                OpenFile::new(
+                    std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::File {
+                        base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
+                        path: PATH.into(),
+                        metadata: RootFsMetadata {
+                            path: PATH.into(),
+                            kind: RootFsEntryKind::File,
+                            mode: 0o600,
+                            size: 0,
+                        },
+                        contents: FileContents::dense(Vec::new()),
+                        offset: 0,
+                        writable: true,
+                    })),
+                    0,
+                ),
+            );
+        };
+        install_snapshot(WRITER_FD);
+        install_snapshot(MAPPER_FD);
+
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1299));
+        let reporter = CompatReporter::default();
+        let mut memory =
+            CountingMmapMemory::new(crate::memory::LINUX_MMAP_BASE, 4 * FILE_LEN as usize);
+        let header_address = crate::memory::LINUX_MMAP_BASE + 2 * FILE_LEN;
+        memory
+            .write_bytes(header_address, b"telemetry-header")
+            .expect("stage header write payload");
+        memory
+            .write_bytes(header_address + 32, &[0; 4])
+            .expect("stage extension write payload");
+
+        assert_eq!(
+            returned(threaded_memory_call(
+                &dispatcher,
+                &mut memory,
+                &registry,
+                &reporter,
+                SyscallRequest::new(
+                    SYS_PWRITE64,
+                    SyscallArgs([
+                        WRITER_FD as u64,
+                        header_address,
+                        b"telemetry-header".len() as u64,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+            )),
+            b"telemetry-header".len() as i64
+        );
+        assert_eq!(
+            returned(threaded_memory_call(
+                &dispatcher,
+                &mut memory,
+                &registry,
+                &reporter,
+                SyscallRequest::new(
+                    SYS_PWRITE64,
+                    SyscallArgs([WRITER_FD as u64, header_address + 32, 4, FILE_LEN - 4, 0, 0,]),
+                ),
+            )),
+            4
+        );
+        let mapper = dispatcher.open_file(MAPPER_FD).expect("mapper fd");
+        assert_eq!(
+            match &*mapper.description.read() {
+                OpenDescription::File { contents, .. } => contents.len(),
+                other => panic!("expected File, got {other:?}"),
+            },
+            0,
+            "the independently opened description deliberately retains its stale snapshot"
+        );
+
+        let mapped = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    FILE_LEN,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_SHARED,
+                    MAPPER_FD as u64,
+                    0,
+                ]),
+            ),
+        )) as u64;
+
+        assert_eq!(
+            memory
+                .read_bytes(mapped, b"telemetry-header".len())
+                .expect("mapped header"),
+            b"telemetry-header"
+        );
+        assert!(
+            !dispatcher.mmap_fault_is_sigbus(mapped),
+            "a live 16 KiB inode must not inherit the stale zero-length description's BUS range"
+        );
     }
 
     /// Mock backend for the Move-3 E1 lowering: records every

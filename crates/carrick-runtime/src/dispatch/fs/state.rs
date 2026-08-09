@@ -195,6 +195,13 @@ pub(in crate::dispatch) struct FsState {
     /// on structural fs mutations, so a sibling's mkdir/rename/unlink correctly
     /// invalidates it. See [`crate::fs_resolve_cache`].
     pub(in crate::dispatch) resolve_cache: crate::fs_resolve_cache::ResolveCache,
+
+    /// Fully prepared, stack-independent HvPatch exec images keyed by real
+    /// host-file identity and mutation timestamps. Shared by every in-process
+    /// child: repeatedly starting the Go compiler must not re-read, re-parse,
+    /// and re-patch the same ELF. Non-host-backed targets bypass this cache.
+    pub(in crate::dispatch) hvpatch_exec_cache:
+        std::sync::Arc<parking_lot::Mutex<HashMap<String, crate::memory::AddressSpace>>>,
 }
 
 /// Owned I/O-subsystem state. Split out of `SyscallDispatcher` so the I/O
@@ -472,6 +479,7 @@ impl FsState {
             inotify_registry: crate::inotify::InotifyRegistry::default(),
             dnotify_registry: parking_lot::Mutex::new(Vec::new()),
             resolve_cache: crate::fs_resolve_cache::ResolveCache::new(),
+            hvpatch_exec_cache: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
 
@@ -483,6 +491,7 @@ impl FsState {
             inotify_registry: self.inotify_registry.clone(),
             dnotify_registry: parking_lot::Mutex::new(self.dnotify_registry.lock().clone()),
             resolve_cache: crate::fs_resolve_cache::ResolveCache::new(),
+            hvpatch_exec_cache: std::sync::Arc::clone(&self.hvpatch_exec_cache),
         }
     }
 }

@@ -1150,13 +1150,34 @@ impl SyscallDispatcher {
     /// `open_files` lock held — it takes a read lock to snapshot the instances.
     pub(in crate::dispatch) fn detach_fd_from_epolls(&self, fd: i32) {
         let detached_host_fd = self.host_fd_for_poll(fd);
-        let descriptions: Vec<OpenDescriptionRef> = self
-            .io
-            .open_files
-            .read()
-            .values()
-            .map(|of| of.description.clone())
-            .collect();
+        let (detached_description, descriptions, should_auto_detach) = {
+            let table = self.io.open_files.read();
+            let detached_description = table.get(&fd).map(|file| file.description.clone());
+            let (local_aliases, logical_refs) = detached_description
+                .as_ref()
+                .map(|target| {
+                    let local_aliases = table
+                        .values()
+                        .filter(|file| Arc::ptr_eq(&file.description, target))
+                        .count();
+                    let logical_refs = target.read().fd_ref_count();
+                    (local_aliases, logical_refs)
+                })
+                .unwrap_or((1, 1));
+            let descriptions: Vec<OpenDescriptionRef> =
+                table.values().map(|of| of.description.clone()).collect();
+            // A lone local fd with additional logical owners means forked
+            // process tables still hold this SAME description. Closing one
+            // process's inherited numeric slot must not remove the shared
+            // registration. A same-process dup, however, has another local
+            // alias and must preserve Carrick's established close/rebind
+            // behavior for separately-added dup registrations.
+            let should_auto_detach = logical_refs == 1 || local_aliases > 1;
+            (detached_description, descriptions, should_auto_detach)
+        };
+        if !should_auto_detach {
+            return;
+        }
         for description in descriptions {
             let mut guard = description.write();
             if let OpenDescription::Epoll {
@@ -1165,8 +1186,15 @@ impl SyscallDispatcher {
                 kqueue,
                 ..
             } = &mut *guard
-                && interest.remove(&fd).is_some()
+                && interest.get(&fd).is_some_and(|slot| {
+                    match (&slot.target, &detached_description) {
+                        (Some(registered), Some(closing)) => Arc::ptr_eq(registered, closing),
+                        (None, None) => true,
+                        _ => false,
+                    }
+                })
             {
+                interest.remove(&fd);
                 clear_pending_epoll_ready(pending_ready, fd);
                 if let Some(host_fd) = detached_host_fd {
                     #[cfg(any(
@@ -2980,14 +3008,19 @@ impl SyscallDispatcher {
         // Snapshot any already-queued ready events first. `ready` is
         // reassigned on the multiplexer path below (it collects the
         // drained-and-tagged events), so the `mut` is load-bearing.
-        let mut ready = {
+        let pending_ready = {
             let mut open = open_file.description.write();
             let OpenDescription::Epoll { pending_ready, .. } = &mut *open else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
             drain_pending_epoll_ready(pending_ready, max_events)
         };
+        let mut ready: Vec<LinuxEpollEvent> =
+            pending_ready.iter().map(|(_fd, event)| *event).collect();
         if !ready.is_empty() {
+            for (fd, event) in &pending_ready {
+                crate::event_ring::rec(crate::event_ring::EPREADY, epfd, *fd, event.events as i32);
+            }
             crate::probes::epoll_result(epfd, ready.len() as i32, 0, timeout_ms, 0);
             return write_epoll_events(memory, events_address, &ready, guest_abi);
         }
@@ -3143,6 +3176,14 @@ impl SyscallDispatcher {
                                     }
                                 }
                                 _ => {
+                                    let live_generation =
+                                        gfd_info.get(&guest_fd).map_or(-1, |entry| entry.3 as i32);
+                                    crate::event_ring::rec(
+                                        crate::event_ring::EPSTALE,
+                                        guest_fd,
+                                        generation as i32,
+                                        live_generation,
+                                    );
                                     crate::probes::epoll_stale_edge(ev.token, guest_fd, generation);
                                 }
                             }
@@ -3594,6 +3635,9 @@ impl SyscallDispatcher {
                     pending_ready.extend(overflow);
                 }
             }
+            for (fd, event) in &ready_tagged {
+                crate::event_ring::rec(crate::event_ring::EPREADY, epfd, *fd, event.events as i32);
+            }
             ready = ready_tagged.into_iter().map(|(_fd, event)| event).collect();
 
             crate::event_ring::rec(
@@ -3767,6 +3811,7 @@ impl SyscallDispatcher {
             // `epoll_wait` rather than registered on the kqueue. Computed before
             // taking the epoll write lock (it locks the *target* fd's description).
             let host_fd = this.host_fd_for_poll(fd);
+            let target_description = this.open_file(fd).map(|file| file.description);
 
             // Record this epoll instance for the consumption-based EPOLLET
             // re-arm ([`Self::epoll_rearm_after_io`]) BEFORE taking the
@@ -3839,6 +3884,7 @@ impl SyscallDispatcher {
                     interest.insert(
                         fd,
                         EpollInterest {
+                            target: target_description,
                             event,
                             last_ready: 0,
                             last_read_avail: 0,
@@ -3886,6 +3932,7 @@ impl SyscallDispatcher {
                     }
                     clear_pending_epoll_ready(pending_ready, fd);
                     *slot = EpollInterest {
+                        target: slot.target.clone(),
                         event,
                         last_ready: 0,
                         last_read_avail: 0,

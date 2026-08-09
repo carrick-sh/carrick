@@ -94,14 +94,19 @@ impl AsidAllocator {
     }
 
     pub(crate) fn allocate(&mut self) -> Result<Asid, AsidError> {
-        let asid = if let Some(asid) = self.reusable.pop_front() {
-            asid
-        } else if self.next <= u32::from(self.limit) {
+        // Prefer a never-used identifier while the 16-bit architectural space
+        // has one.  Recycling immediately after a process exit needlessly puts
+        // a new address space behind the exact ASID most likely to remain in a
+        // physical CPU's translation structures; the acknowledged pool is the
+        // exhaustion fallback, not the fast path.
+        let asid = if self.next <= u32::from(self.limit) {
             let Ok(raw) = u16::try_from(self.next) else {
                 return Err(AsidError::Exhausted);
             };
             let asid = Asid(raw);
             self.next += 1;
+            asid
+        } else if let Some(asid) = self.reusable.pop_front() {
             asid
         } else {
             return Err(AsidError::Exhausted);
@@ -161,6 +166,24 @@ mod tests {
             .acknowledge_tlb_flush(retired)
             .expect("acknowledge flush");
         assert_eq!(allocator.allocate().expect("recycled ASID"), asid);
+    }
+
+    #[test]
+    fn fresh_asids_are_consumed_before_a_retired_identifier_is_recycled() {
+        let mut allocator = AsidAllocator::with_limit_for_tests(3);
+        let first = allocator.allocate().expect("first ASID");
+        let retired = allocator.retire(first).expect("retire first ASID");
+        allocator
+            .acknowledge_tlb_flush(retired)
+            .expect("acknowledge flush");
+
+        let second = allocator.allocate().expect("fresh second ASID");
+        let third = allocator.allocate().expect("fresh third ASID");
+        let recycled = allocator.allocate().expect("recycled first ASID");
+
+        assert_eq!(second.raw(), 2);
+        assert_eq!(third.raw(), 3);
+        assert_eq!(recycled, first);
     }
 
     #[test]

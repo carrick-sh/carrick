@@ -10,6 +10,78 @@ enum SharedWordWaitRaw {
     ExecReplacedThread,
 }
 
+fn guest_host_thread_name(process_pid: Option<i32>, tid: ThreadId) -> String {
+    process_pid.map_or_else(
+        || format!("guest-tid-{tid}"),
+        |pid| format!("guest-pid-{pid}-tid-{tid}"),
+    )
+}
+
+fn acquire_vcpu_lease_while_live<A, R>(
+    registry: &ThreadRegistry,
+    tid: ThreadId,
+    mut acquire: A,
+    mut on_retry: R,
+) -> Option<carrick_hal::vcpu_sched::SlotLease>
+where
+    A: FnMut() -> Option<carrick_hal::vcpu_sched::SlotLease>,
+    R: FnMut(),
+{
+    loop {
+        if thread_should_finish_for_exec_replacement(registry, tid) {
+            return None;
+        }
+        if let Some(lease) = acquire() {
+            return Some(lease);
+        }
+        // Process teardown can remove this thread while the bounded scheduler
+        // wait is in progress. Re-check before retrying: otherwise a reclaimed
+        // sibling with no vCPU lease can wait forever while its process owner
+        // waits for the sibling's JoinHandle before retiring the process bank.
+        if thread_should_finish_for_exec_replacement(registry, tid) {
+            return None;
+        }
+        on_retry();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hvpatch_host_thread_name_carries_process_and_thread_identity() {
+        let tid = ThreadId::synthetic_for_tests(456);
+        assert_eq!(
+            guest_host_thread_name(Some(123), tid),
+            "guest-pid-123-tid-456"
+        );
+        assert_eq!(guest_host_thread_name(None, tid), "guest-tid-456");
+    }
+
+    #[test]
+    fn reclaimed_vcpu_reacquire_stops_when_teardown_removes_thread() {
+        let owner = ThreadId::synthetic_for_tests(1000);
+        let registry = ThreadRegistry::new(owner);
+        let sibling = registry.register_child(0);
+        let mut attempts = 0;
+
+        let lease = acquire_vcpu_lease_while_live(
+            &registry,
+            sibling,
+            || {
+                attempts += 1;
+                registry.remove_all_except(owner);
+                None
+            },
+            || panic!("a removed thread must not retry vCPU acquisition"),
+        );
+
+        assert!(lease.is_none());
+        assert_eq!(attempts, 1);
+    }
+}
+
 impl<E: ThreadedEngine + 'static> ThreadRuntimeState<E>
 where
     E::SiblingSpec: 'static,
@@ -23,25 +95,28 @@ where
 
     pub(super) fn complete_futex_wait(
         &self,
+        kernel: &Kernel,
         engine: &mut E,
         wait: crate::thread::FutexWait,
         timeout: Option<Duration>,
     ) -> Result<BlockingWaitCompletion, RuntimeError> {
-        self.complete_futex_wait_with_value(engine, wait, timeout, 0)
+        self.complete_futex_wait_with_value(kernel, engine, wait, timeout, 0)
     }
 
     pub(super) fn complete_futex_waitv(
         &self,
+        kernel: &Kernel,
         engine: &mut E,
         wait: crate::thread::FutexWait,
         timeout: Option<Duration>,
         index: i64,
     ) -> Result<BlockingWaitCompletion, RuntimeError> {
-        self.complete_futex_wait_with_value(engine, wait, timeout, index)
+        self.complete_futex_wait_with_value(kernel, engine, wait, timeout, index)
     }
 
     fn complete_futex_wait_with_value(
         &self,
+        kernel: &Kernel,
         engine: &mut E,
         wait: crate::thread::FutexWait,
         timeout: Option<Duration>,
@@ -50,6 +125,7 @@ where
         use crate::thread::FutexWaitOutcome;
 
         let retval: i64 = loop {
+            let wait_trace = trace_hvpatch_wait_begin(kernel, self.this_tid, 7, &[], engine);
             // M:N reclaim-on-block: free this thread's vCPU slot for the duration of
             // the blocking wait so another guest thread can run on it, restoring this
             // thread's state into a (possibly different) slot on wake. Reclaim every
@@ -86,13 +162,35 @@ where
                 self.this_tid.raw(),
                 crate::run_state::RunState::Blocked,
             );
+            crate::event_ring::rec_futex_wait(wait.addr, self.this_tid.raw());
             let raw = self
                 .futex
                 .wait_prepared_for_thread(wait, timeout, self.this_tid, &|| {
                     crate::host_signal::has_pending_for(self.this_tid.raw())
-                        || crate::fork_quiesce::is_quiescing()
+                        || self.fork_is_quiescing()
                         || crate::fork_quiesce::exec_replacing_other_thread(self.this_tid)
+                        || !self.registry.is_live(self.this_tid)
                 });
+            crate::event_ring::rec_futex_end(
+                wait.addr,
+                match raw {
+                    FutexWaitOutcome::Woken => 0,
+                    FutexWaitOutcome::Interrupted => 1,
+                    FutexWaitOutcome::TimedOut => 2,
+                },
+            );
+            trace_hvpatch_wait_end(
+                kernel,
+                self.this_tid,
+                7,
+                match raw {
+                    FutexWaitOutcome::Woken => 2,
+                    FutexWaitOutcome::Interrupted => 4,
+                    FutexWaitOutcome::TimedOut => 3,
+                },
+                0,
+                wait_trace,
+            );
             crate::thread::set_current_thread_state(self.this_tid, 'R');
             crate::run_state::publish_guest_tid(
                 self.this_tid.raw(),
@@ -115,21 +213,28 @@ where
                 // (letting the drain complete), park at the fork barrier, and
                 // resume waiting once the fork is done.
                 let mut kicker_dropped = engine.reclaim_refreshes_kicker();
-                let new = loop {
-                    if let Some(l) = carrick_hal::vcpu_sched::global().acquire_timeout(
-                        self.this_tid.raw() as u64,
-                        old_slot,
-                        Duration::from_millis(50),
-                    ) {
-                        break l;
-                    }
-                    if crate::fork_quiesce::is_quiescing() {
-                        if !kicker_dropped {
-                            self.kicker.unregister(self.this_tid);
-                            kicker_dropped = true;
+                let new = acquire_vcpu_lease_while_live(
+                    &self.registry,
+                    self.this_tid,
+                    || {
+                        carrick_hal::vcpu_sched::global().acquire_timeout(
+                            self.this_tid.raw() as u64,
+                            old_slot,
+                            Duration::from_millis(50),
+                        )
+                    },
+                    || {
+                        if self.fork_is_quiescing() {
+                            if !kicker_dropped {
+                                self.kicker.unregister(self.this_tid);
+                                kicker_dropped = true;
+                            }
+                            self.park_if_fork_quiescing();
                         }
-                        fork_barrier().park_if_quiescing();
-                    }
+                    },
+                );
+                let Some(new) = new else {
+                    return Ok(BlockingWaitCompletion::ExecReplacedThread);
                 };
                 carrick_hal::vcpu_sched::set_current_lease(new);
                 if engine.reclaim_refreshes_kicker() {
@@ -152,12 +257,12 @@ where
                     // which must not overlap the forker's stop-the-world RAM
                     // snapshot. Unregister before parking so the forker's
                     // drain (kicker count → 1) can complete.
-                    if crate::fork_quiesce::is_quiescing() {
+                    if self.fork_is_quiescing() {
                         if !kicker_dropped {
                             self.kicker.unregister(self.this_tid);
                             kicker_dropped = true;
                         }
-                        fork_barrier().park_if_quiescing();
+                        self.park_if_fork_quiescing();
                     }
                     // Re-register BEFORE the re-bind so a quiesce that starts
                     // mid-re-bind waits for us to reach the run-loop-top park
@@ -185,7 +290,7 @@ where
             let outcome = match raw {
                 FutexWaitOutcome::Woken => woken_value,
                 FutexWaitOutcome::TimedOut => crate::linux_abi::LINUX_ETIMEDOUT.guest_retval(),
-                FutexWaitOutcome::Interrupted if crate::fork_quiesce::is_quiescing() => {
+                FutexWaitOutcome::Interrupted if self.fork_is_quiescing() => {
                     self.release_and_park_vcpu_for_fork(engine)?;
                     continue;
                 }
@@ -232,8 +337,9 @@ where
     ) -> Result<SharedWordWaitRaw, RuntimeError> {
         let interrupted = || {
             crate::host_signal::has_pending_for(self.this_tid.raw())
-                || crate::fork_quiesce::is_quiescing()
+                || self.fork_is_quiescing()
                 || crate::fork_quiesce::exec_replacing_other_thread(self.this_tid)
+                || !self.registry.is_live(self.this_tid)
         };
         let retval = loop {
             // Shared park/resume pair (mod.rs): reclaim this thread's vCPU —
@@ -269,9 +375,7 @@ where
                 return Ok(SharedWordWaitRaw::ExecReplacedThread);
             }
             self.resume_vcpu_after_blocking_wait(engine, reclaim)?;
-            if retval == crate::linux_abi::LINUX_EINTR.guest_retval()
-                && crate::fork_quiesce::is_quiescing()
-            {
+            if retval == crate::linux_abi::LINUX_EINTR.guest_retval() && self.fork_is_quiescing() {
                 self.release_and_park_vcpu_for_fork(engine)?;
                 continue;
             }
@@ -339,7 +443,23 @@ where
         child_tid_addr: u64,
         clear_child_tid_addr: u64,
     ) -> Result<ThreadId, RuntimeError> {
-        let tid = self.registry.register_child(clear_child_tid_addr);
+        if kernel.process_exiting() {
+            return Err(RuntimeError::Trap(TrapError::Hypervisor(
+                "clone raced process exit".to_owned(),
+            )));
+        }
+        let tid = if let Some(process) = kernel.hvpatch_process.as_ref() {
+            let tid = process.allocate_thread_id().map_err(|error| {
+                RuntimeError::Trap(TrapError::Hypervisor(format!(
+                    "allocate hvpatch thread id: {error}"
+                )))
+            })?;
+            self.registry
+                .register_child_with_tid(tid, clear_child_tid_addr);
+            tid
+        } else {
+            self.registry.register_child(clear_child_tid_addr)
+        };
         kernel
             .dispatcher
             .inherit_thread_signal_mask(self.this_tid, tid);
@@ -372,8 +492,15 @@ where
         let cleanup_kernel = Arc::clone(kernel);
         let max_traps = self.max_traps;
         let trace = self.trace;
+        let host_thread_name = guest_host_thread_name(
+            child_kernel
+                .hvpatch_process
+                .as_ref()
+                .map(crate::hvpatch::ProcessContext::pid),
+            tid,
+        );
         let handle = std::thread::Builder::new()
-            .name(format!("guest-tid-{tid}"))
+            .name(host_thread_name)
             .spawn(move || {
                 if trace {
                     eprintln!("[sibling tid#{tid}] thread started, building vCPU");
@@ -392,8 +519,32 @@ where
                 // RAII guard frees it on EVERY exit path (including the early
                 // `!is_live` return below) except a full-process `_exit`, where
                 // process death frees it anyway.
-                let lease = carrick_hal::vcpu_sched::global().acquire(tid.raw() as u64);
+                // Admission itself must be cancellable. A clone can be queued
+                // here when another thread begins exit_group; an unbounded
+                // acquire leaves its JoinHandle live past the process-bank
+                // teardown deadline even though it never created a vCPU.
+                let lease = loop {
+                    if child_kernel.process_exiting() || !child_registry.is_live(tid) {
+                        let _cleanup_gate = crate::fork_quiesce::begin_exit_cleanup();
+                        child_registry.exit(tid);
+                        crate::host_signal::forget_thread(tid.raw());
+                        child_kernel.dispatcher.forget_thread_signal_state(tid);
+                        return;
+                    }
+                    if let Some(lease) = carrick_hal::vcpu_sched::global().acquire_timeout(
+                        tid.raw() as u64,
+                        None,
+                        Duration::from_millis(10),
+                    ) {
+                        break lease;
+                    }
+                };
                 carrick_hal::vcpu_sched::set_current_lease(lease);
+                // Covers every pre-loop exit (the process-exiting recheck and a
+                // materialization error). run_vcpu_until_exit installs its own
+                // guard; whichever guard sees the lease first releases it and
+                // the other becomes a no-op.
+                let _pre_loop_lease_guard = VcpuLeaseGuard;
                 crate::probes::mn_admit(
                     tid.raw(),
                     lease.slot,
@@ -401,26 +552,20 @@ where
                         .budget()
                         .min(u32::MAX as usize) as u32,
                 );
-                struct SlotGuard;
-                impl Drop for SlotGuard {
-                    fn drop(&mut self) {
-                        if let Some(l) = carrick_hal::vcpu_sched::take_current_lease() {
-                            carrick_hal::vcpu_sched::global()
-                                .release(l, carrick_hal::vcpu_sched::Yield::Exited);
-                        }
-                    }
-                }
-                let _slot_guard = SlotGuard;
+                // `run_vcpu_until_exit` owns lease release for every guest
+                // thread kind, including hvpatch process leaders which can
+                // acquire their first lease only after a blocking wait.
                 // Build the vCPU + register it in the kicker UNDER the topology
                 // lock, so this is atomic w.r.t. a fork's VM teardown.
                 let topo = crate::fork_quiesce::topology_lock()
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                if !child_registry.is_live(tid) {
+                if child_kernel.process_exiting() || !child_registry.is_live(tid) {
                     // Exit-cleanup gate (see handle_thread_exit): taken BEFORE
                     // dropping the topology lock so a fork can never land
                     // mid-cleanup with one of these global mutexes held.
                     let _cleanup_gate = crate::fork_quiesce::begin_exit_cleanup();
+                    child_registry.exit(tid);
                     drop(topo);
                     child_kicker.unregister(tid);
                     crate::host_signal::forget_thread(tid.raw());
@@ -438,7 +583,7 @@ where
                             eprintln!("[sibling tid#{tid}] vCPU built, pc={pc:#x}, entering loop");
                         }
                         let r = run_vcpu_until_exit(
-                            child_kernel,
+                            Arc::clone(&child_kernel),
                             child_engine,
                             child_registry,
                             child_futex,
@@ -451,6 +596,11 @@ where
                         );
                         match r {
                             Ok(VcpuLoopOutcome::ProcessExit(result)) => {
+                                tracing::trace!(
+                                    tid = tid.raw(),
+                                    exit_code = result.exit_code,
+                                    "hvpatch sibling reached process exit publication"
+                                );
                                 let _ = std::io::Write::flush(&mut std::io::stdout());
                                 let _ = std::io::Write::flush(&mut std::io::stderr());
                                 let _ = unsafe {
@@ -467,12 +617,47 @@ where
                                         result.stderr.len(),
                                     )
                                 };
+                                if let Some(process) = child_kernel
+                                    .hvpatch_process
+                                    .as_ref()
+                                    .filter(|process| process.is_child())
+                                {
+                                    // In the shared-VM backend a non-leader
+                                    // thread can be the one that executes
+                                    // exit_group. Its run loop has already
+                                    // drained the process thread group and
+                                    // retired the address-space bank; publish
+                                    // the Linux child status instead of
+                                    // terminating the Carrick host process.
+                                    if let Err(error) =
+                                        process.publish_exit_code(result.exit_code, tid)
+                                    {
+                                        tracing::error!(
+                                            pid = process.pid(),
+                                            %error,
+                                            "publish sibling-initiated hvpatch child exit failed"
+                                        );
+                                    }
+                                    return;
+                                }
                                 unsafe { libc::_exit(result.exit_code) };
                             }
                             Ok(VcpuLoopOutcome::TrapLimit(_)) | Ok(VcpuLoopOutcome::ThreadDone) => {
                             }
                             Err(e) => {
                                 tracing::error!(tid = tid.raw(), error = %e, "thread sibling vCPU loop failed");
+                                if let Some(process) = child_kernel
+                                    .hvpatch_process
+                                    .as_ref()
+                                    .filter(|process| process.is_child())
+                                    && let Err(error) = process.publish_exit_code(127, tid)
+                                {
+                                    tracing::error!(
+                                        pid = process.pid(),
+                                        %error,
+                                        "publish failed sibling-initiated hvpatch child exit failed"
+                                    );
+                                }
                                 // Exit-cleanup gate (see handle_thread_exit).
                                 let _cleanup_gate = crate::fork_quiesce::begin_exit_cleanup();
                                 cleanup_registry.exit(tid);
@@ -498,6 +683,105 @@ where
         Ok(tid)
     }
 
+    /// Stop every sibling vCPU belonging to this Linux process before its
+    /// process bank is unmapped.  The old `VCPU_LIVE == 1` exec drain is
+    /// process-global and therefore cannot distinguish unrelated processes in
+    /// a shared VM; this path instead uses the process-private registry,
+    /// kicker, and sibling JoinHandles.
+    pub(super) fn terminate_siblings_for_process_exit(
+        &self,
+        kernel: &Kernel,
+    ) -> Result<(), RuntimeError> {
+        kernel.begin_process_exit();
+        let current_host_thread = std::thread::current().id();
+        // Give an attached debugger a bounded window to capture a stranded
+        // sibling when fault diagnostics are explicitly enabled. Production
+        // behavior retains the five-second fail-closed deadline.
+        let teardown_timeout = if std::env::var_os("CARRICK_FAULT_DEBUG").is_some() {
+            std::time::Duration::from_secs(30)
+        } else {
+            std::time::Duration::from_secs(5)
+        };
+        let teardown_started = std::time::Instant::now();
+        let deadline = std::time::Instant::now() + teardown_timeout;
+        let mut debugger_window_announced = false;
+
+        loop {
+            // Registry removal is the durable stop predicate used by guest-loop
+            // tops and every blocking-wait completion path. Keep the owner's
+            // entry until all siblings have finished so none can report itself
+            // as the final process thread and retire the bank concurrently.
+            let _ = self.registry.remove_all_except(self.this_tid);
+            self.kicker.kick_all_except(self.this_tid);
+            self.futex.notify_signal_pending();
+            self.platform_futex.notify_signal_pending();
+            kernel.signal_arrival.wake_all_waiters();
+
+            let unfinished = self
+                .threads
+                .lock()
+                .iter()
+                .filter(|handle| handle.thread().id() != current_host_thread)
+                .filter(|handle| !handle.is_finished())
+                .count();
+            let process_vcpu_live = kernel.process_vcpu_live();
+            if unfinished == 0 && process_vcpu_live <= 1 {
+                break;
+            }
+            if !debugger_window_announced
+                && teardown_timeout > std::time::Duration::from_secs(5)
+                && teardown_started.elapsed() >= std::time::Duration::from_secs(5)
+            {
+                let unfinished_names: Vec<_> = self
+                    .threads
+                    .lock()
+                    .iter()
+                    .filter(|handle| handle.thread().id() != current_host_thread)
+                    .filter(|handle| !handle.is_finished())
+                    .map(|handle| handle.thread().name().unwrap_or("<unnamed>").to_owned())
+                    .collect();
+                eprintln!(
+                    "[FAULTDBG teardown pid={}] unfinished={unfinished_names:?}; debugger window open",
+                    kernel
+                        .hvpatch_process
+                        .as_ref()
+                        .map_or(0, crate::hvpatch::ProcessContext::pid)
+                );
+                debugger_window_announced = true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(RuntimeError::Trap(TrapError::Hypervisor(format!(
+                    "hvpatch process thread-group teardown timed out: pid={} unfinished={} process_vcpu_live={} kicker={}",
+                    kernel
+                        .hvpatch_process
+                        .as_ref()
+                        .map_or(0, crate::hvpatch::ProcessContext::pid),
+                    unfinished,
+                    process_vcpu_live,
+                    self.kicker.count()
+                ))));
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+
+        let handles = std::mem::take(&mut *self.threads.lock());
+        for handle in handles {
+            // A non-leader thread may itself initiate fatal termination. Its
+            // JoinHandle lives in this vector, but a thread cannot join itself;
+            // dropping that one handle is correct because this stack is already
+            // performing its terminal cleanup.
+            if handle.thread().id() == current_host_thread {
+                continue;
+            }
+            if handle.join().is_err() {
+                return Err(RuntimeError::Trap(TrapError::Hypervisor(
+                    "hvpatch sibling panicked during process exit".to_owned(),
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn handle_thread_exit(
         &self,
         kernel: &Kernel,
@@ -515,17 +799,23 @@ where
         // a non-blocking atomic count; `handle_fork` waits for it to drain
         // (bounded) after the quiesce and before forking.
         let _cleanup_gate = crate::fork_quiesce::begin_exit_cleanup();
+        trace_hvpatch_thread_teardown(kernel, self.this_tid, 1);
         if let Some(addr) = self.registry.clear_child_tid(self.this_tid)
             && addr != 0
         {
             let _ = engine.write_bytes(addr, &0i32.to_le_bytes());
-            self.futex.wake(addr, 1);
+            let woken = self.futex.wake(addr, 1);
+            crate::event_ring::rec_futex_wake(addr, woken);
         }
         let last = self.registry.exit(self.this_tid);
+        trace_hvpatch_thread_teardown(kernel, self.this_tid, 2);
         crate::run_state::clear_guest_tid(self.this_tid.raw());
         self.kicker.unregister(self.this_tid);
+        trace_hvpatch_thread_teardown(kernel, self.this_tid, 3);
         crate::host_signal::forget_thread(self.this_tid.raw());
+        trace_hvpatch_thread_teardown(kernel, self.this_tid, 4);
         kernel.dispatcher.forget_thread_signal_state(self.this_tid);
+        trace_hvpatch_thread_teardown(kernel, self.this_tid, 5);
         if last {
             let result = assemble_run_result(kernel, code, traps, false);
             VcpuLoopOutcome::ProcessExit(Box::new(result))
@@ -534,6 +824,7 @@ where
             // its vCPU now (the no-op Drop won't), else it leaks live and a
             // later fork's hv_vm_destroy hits HV_BUSY on the dead thread's vCPU.
             engine.destroy_vcpu_on_thread_exit();
+            trace_hvpatch_thread_teardown(kernel, self.this_tid, 6);
             VcpuLoopOutcome::ThreadDone
         }
     }
@@ -560,9 +851,75 @@ where
         // the flag and exits — the wait stays BOUNDED (5s) against pathology
         // either way. (Non-linux scaffolding (bhyve): inert always-0
         // VCPU_LIVE → no wait, unchanged until it implements the contract.)
-        let _topology = crate::fork_quiesce::topology_lock()
+        let topology = crate::fork_quiesce::topology_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+
+        if kernel.hvpatch_process.is_some() {
+            // In one shared VM, exec replaces only THIS Linux process's thread
+            // group. The legacy global exec marker + VCPU_LIVE drain makes one
+            // compiler process terminate unrelated compiler processes. Remove
+            // this process's sibling registry entries first (the durable stop
+            // predicate used by every wait/reclaim path), then drain only its
+            // JoinHandles and live-vCPU counter. The topology lock still
+            // serializes the shared VM's stage-2 mutation across processes.
+            // A not-yet-materialized clone may need this lock once admission
+            // succeeds so it can observe the registry removal and retire.
+            // Actual exec stage-2 mutation is serialized separately around
+            // `engine.execve_into` after this drain.
+            drop(topology);
+            let current_host_thread = std::thread::current().id();
+            let _ = self.registry.remove_all_except(self.this_tid);
+            self.kicker.kick_all_except(self.this_tid);
+            self.futex.notify_signal_pending();
+            self.platform_futex.notify_signal_pending();
+            kernel.signal_arrival.wake_all_waiters();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let unfinished = self
+                    .threads
+                    .lock()
+                    .iter()
+                    .filter(|handle| handle.thread().id() != current_host_thread)
+                    .filter(|handle| !handle.is_finished())
+                    .count();
+                if unfinished == 0 && kernel.process_vcpu_live() <= 1 {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(RuntimeError::Trap(TrapError::Hypervisor(format!(
+                        "hvpatch exec thread-group teardown timed out: pid={} unfinished={} process_vcpu_live={} kicker={}",
+                        kernel
+                            .hvpatch_process
+                            .as_ref()
+                            .map_or(0, crate::hvpatch::ProcessContext::pid),
+                        unfinished,
+                        kernel.process_vcpu_live(),
+                        self.kicker.count()
+                    ))));
+                }
+                self.kicker.kick_all_except(self.this_tid);
+                self.futex.notify_signal_pending();
+                self.platform_futex.notify_signal_pending();
+                kernel.signal_arrival.wake_all_waiters();
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+
+            let handles = std::mem::take(&mut *self.threads.lock());
+            for handle in handles {
+                if handle.thread().id() == current_host_thread {
+                    continue;
+                }
+                if handle.join().is_err() {
+                    return Err(RuntimeError::Trap(TrapError::Hypervisor(
+                        "hvpatch sibling panicked during exec".to_owned(),
+                    )));
+                }
+            }
+            return Ok(());
+        }
+
         kernel.begin_exec_replacement(self.this_tid);
         self.kicker.kick_all_except(self.this_tid);
         self.platform_futex.notify_signal_pending();

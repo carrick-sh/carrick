@@ -31,13 +31,33 @@ use carrick_guest_mem::{
 };
 use carrick_hal::guest_arch::GuestArch as _;
 use carrick_hal::{
-    ForkOutcome, GuestEntryRegs, OsError, RawSyscall, Reg, SlotId, SysReg, SyscallTrap,
+    ForkOutcome, GuestEntryRegs, OsError, RawSyscall, Reg, SlotId, SysReg, SyscallTrap, ThreadId,
     ThreadedEngine, TrapError,
 };
 use carrick_mem::memory::AddressSpace;
 use carrick_mem::page_table::{PageTableError, PageTableManager};
 
 use crate::vmm::{Aarch64Exit, Aarch64Vcpu, Aarch64VcpuSnapshot, Aarch64Vmm, ForkRamStrategy};
+
+/// Remove Carrick's two reserved process-bank apertures from an AArch64
+/// stage-1 image before it is published for an HvPatch process.
+///
+/// The operation is deterministic for an exec layout, so the HVF backend can
+/// bake it into its bank-layout cache. Initial root bring-up still applies it
+/// through the live editor before the first ASID is installed.
+pub fn reserve_hvpatch_process_apertures(
+    manager: &mut PageTableManager,
+) -> Result<bool, PageTableError> {
+    let aux_changed = manager.invalidate(
+        carrick_mem::memory::LINUX_PROCESS_AUX_BANK_BASE,
+        carrick_mem::memory::LINUX_PROCESS_AUX_BANK_SIZE as usize,
+    )?;
+    let bank_changed = manager.invalidate(
+        carrick_mem::memory::LINUX_PROCESS_BANK_BASE,
+        carrick_mem::memory::LINUX_PROCESS_BANK_SIZE as usize,
+    )?;
+    Ok(aux_changed || bank_changed)
+}
 
 /// The generic aarch64 trap engine. Owns the VM, the (one) vCPU, the
 /// pending-syscall resume PC, and the SA_RESTART syscall-number stash.
@@ -293,11 +313,16 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         &mut self,
         edit: impl FnOnce(&mut PageTableManager) -> Result<bool, PageTableError>,
     ) -> Result<bool, MemoryError> {
-        const PT_BASE: u64 = carrick_mem::memory::LINUX_PAGE_TABLES_BASE;
+        const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
+        let pt_base = self
+            .vcpu
+            .get_sys_reg(SysReg::Ttbr0)
+            .map_err(|error| MemoryError::HostMap(format!("read TTBR0_EL1: {error}")))?
+            & TTBR_ROOT_MASK;
         let size = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
         let host = self
             .vm
-            .host_ptr(PT_BASE, size)
+            .host_ptr(pt_base, size)
             .ok_or_else(|| MemoryError::HostMap("page-table region not mapped".to_string()))?;
         // `Arc::strong_count > 1` ⟺ a `clone(CLONE_THREAD)` sibling shares THIS
         // page-table manager (the spec clones the Arc into each sibling engine);
@@ -327,13 +352,13 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             // nothing else writes the tables before this, so it matches the image.
             let bytes = self
                 .vm
-                .read_gpa(PT_BASE, size)
+                .read_gpa(pt_base, size)
                 .map_err(|_| MemoryError::HostMap("read live page tables".to_string()))?;
             // Build through this engine's `GuestArch` MMU codec.
             use carrick_hal::PageTableCodec as _;
             *guard = Some(
                 <<Self as ThreadedEngine>::Arch as carrick_hal::GuestArch>::Mmu::new_manager(
-                    bytes, PT_BASE,
+                    bytes, pt_base,
                 ),
             );
         }
@@ -344,6 +369,12 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 "page-table manager unexpectedly absent".to_string(),
             ));
         };
+        if mgr.base() != pt_base {
+            return Err(MemoryError::HostMap(format!(
+                "page-table manager root 0x{:x} does not match TTBR0 root 0x{pt_base:x}",
+                mgr.base()
+            )));
+        }
         mgr.set_multi_vcpu(unsafe_to_coalesce);
         let changed = edit(mgr).map_err(|e| match e {
             PageTableError::OutOfTables => {
@@ -1407,6 +1438,26 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     type SiblingSpec = Aarch64SiblingSpec<V>;
     type ProcessSpec = Aarch64ProcessSpec<V>;
 
+    fn diagnostic_wait_registers(&self) -> Option<carrick_hal::GuestWaitRegisters> {
+        let live_pc = self.vcpu.get_reg(Reg::Pc).ok()?;
+        let resume_pc = diagnostic_resume_pc(self.pending_resume_pc, live_pc);
+        let pc = if self.process_asid.is_some() && self.pending_resume_pc.is_some() {
+            let start = resume_pc.checked_sub(4)?;
+            let mut island_words = [0_u8; 8];
+            self.read_into(start, &mut island_words).ok()?;
+            let svc = u32::from_le_bytes(island_words[..4].try_into().ok()?);
+            let return_branch = u32::from_le_bytes(island_words[4..].try_into().ok()?);
+            decode_hvpatch_island_origin(resume_pc, svc, return_branch).unwrap_or(resume_pc)
+        } else {
+            resume_pc
+        };
+        Some(carrick_hal::GuestWaitRegisters {
+            pc,
+            sp: self.vcpu.get_reg(Reg::Sp).ok()?,
+            lr: self.vcpu.get_reg(Reg::X(30)).ok()?,
+        })
+    }
+
     fn set_persistent_vm_lifecycle(&mut self, enabled: bool) {
         self.vm.set_persistent_vm_lifecycle(enabled);
     }
@@ -1419,14 +1470,28 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         }
         const TCR_AS: u64 = 1 << 36;
         const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
+        let aux_bank_len = usize::try_from(carrick_mem::memory::LINUX_PROCESS_AUX_BANK_SIZE)
+            .map_err(|_| {
+                TrapError::Hypervisor("hvpatch auxiliary process-bank size overflow".to_owned())
+            })?;
         let bank_len = usize::try_from(carrick_mem::memory::LINUX_PROCESS_BANK_SIZE)
             .map_err(|_| TrapError::Hypervisor("hvpatch process-bank size overflow".to_owned()))?;
-        self.pt_edit_and_flush(|manager| {
-            manager.invalidate(carrick_mem::memory::LINUX_PROCESS_BANK_BASE, bank_len)
-        })
-        .map_err(|error| {
-            TrapError::Hypervisor(format!("reserve hvpatch process-bank aperture: {error}"))
-        })?;
+        // Root bring-up starts from the generic identity tables and must carve
+        // these apertures live. Exec replacement receives a banked image with
+        // the same deterministic invalidations already baked into the cached
+        // table bytes, so repeating the edit would rebuild/copy the complete
+        // software manager solely to rediscover two no-ops.
+        if self.process_asid.is_none() {
+            self.pt_edit_and_flush(reserve_hvpatch_process_apertures)
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!("reserve hvpatch process-bank aperture: {error}"))
+                })?;
+        }
+        self.set_unmapped(
+            carrick_mem::memory::LINUX_PROCESS_AUX_BANK_BASE,
+            aux_bank_len,
+            true,
+        );
         self.set_unmapped(carrick_mem::memory::LINUX_PROCESS_BANK_BASE, bank_len, true);
         let tcr = self.vcpu.get_sys_reg(SysReg::Tcr)?;
         let root = self.vcpu.get_sys_reg(SysReg::Ttbr0)? & TTBR_ROOT_MASK;
@@ -1443,8 +1508,16 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     }
 
     fn retire_in_process_address_space(&mut self) -> Result<(), TrapError> {
-        self.run_el1_maintenance()?;
-        self.vm.process_exit_cleanup()?;
+        self.run_el1_maintenance().map_err(|error| {
+            TrapError::Hypervisor(format!(
+                "hvpatch process-exit ASID maintenance failed: {error}"
+            ))
+        })?;
+        self.vm.process_exit_cleanup().map_err(|error| {
+            TrapError::Hypervisor(format!(
+                "hvpatch process-exit stage-2 retirement failed: {error}"
+            ))
+        })?;
         self.vm.destroy_vcpu_on_thread_exit(&mut self.vcpu);
         Ok(())
     }
@@ -1455,7 +1528,26 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         child_ttbr0: u64,
         bank_base: u64,
         bank_size: u64,
+        child_tid: ThreadId,
+        forking_tid: ThreadId,
     ) -> Result<Self::ProcessSpec, TrapError> {
+        // Persistent-VM exec leaves the software editor absent until it is
+        // needed. A process fork needs a complete manager immediately so it can
+        // rebase a private child copy; initialize from the live backing here if
+        // no mmap/mprotect edit has already done so. The no-op edit publishes
+        // nothing and performs no TLBI.
+        let page_tables_absent = self
+            .page_tables
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_none();
+        if page_tables_absent {
+            self.pt_edit(|_| Ok(false)).map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "load hvpatch parent page tables for process fork: {error}"
+                ))
+            })?;
+        }
         let parent = self.vcpu.snapshot()?;
         // A process child, like a thread sibling, starts at the instruction
         // after the trapped clone in EL0. The raw parent snapshot is currently
@@ -1483,9 +1575,13 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         page_tables.rebase(child_root).map_err(|error| {
             TrapError::Hypervisor(format!("rebase child page tables: {error:?}"))
         })?;
-        let builder = self
-            .vm
-            .build_process_builder(bank_base, bank_size, &mut page_tables)?;
+        let builder = self.vm.build_process_builder(
+            bank_base,
+            bank_size,
+            &mut page_tables,
+            child_tid.raw(),
+            forking_tid.raw(),
+        )?;
         let protections = Arc::new(MemoryProtections::from_snapshot(
             self.protections.snapshot_all(),
         ));
@@ -1666,6 +1762,29 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // A guest thread exiting frees an HVF concurrent-vCPU slot (HVF). KVM no-op.
         self.vm.destroy_vcpu_on_thread_exit(&mut self.vcpu);
     }
+}
+
+#[inline]
+fn diagnostic_resume_pc(pending_resume_pc: Option<u64>, live_pc: u64) -> u64 {
+    pending_resume_pc.unwrap_or(live_pc)
+}
+
+/// Recover the original patched `svc #0` address from an HvPatch island. At a
+/// host-dispatched syscall the pending resume PC addresses the island's return
+/// branch (`svc` is the preceding word); the branch target is original-svc+4.
+/// This keeps crash/wait symbols tied to guest code instead of generated stubs.
+fn decode_hvpatch_island_origin(resume_pc: u64, svc: u32, return_branch: u32) -> Option<u64> {
+    const SVC_ZERO: u32 = 0xd400_0001;
+    const B_OPCODE: u32 = 0x1400_0000;
+    const B_OPCODE_MASK: u32 = 0xfc00_0000;
+    if svc != SVC_ZERO || return_branch & B_OPCODE_MASK != B_OPCODE {
+        return None;
+    }
+    let imm26 = i64::from(return_branch & 0x03ff_ffff);
+    let signed_imm26 = (imm26 << 38) >> 38;
+    let target = i128::from(resume_pc).checked_add(i128::from(signed_imm26) * 4)?;
+    let origin = target.checked_sub(4)?;
+    u64::try_from(origin).ok()
 }
 
 /// An all-zero [`Aarch64VcpuSnapshot`]. Used as the placeholder the engine hands to
@@ -1926,5 +2045,61 @@ mod tests {
         assert_eq!(back.fpcr, s.fpcr);
         // A short buffer is rejected, not silently zero-filled.
         assert!(deserialize_snapshot(&bytes[..bytes.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn wait_diagnostics_prefer_post_syscall_guest_resume_pc() {
+        assert_eq!(
+            diagnostic_resume_pc(Some(0x0040_1234), 0xffff_0000),
+            0x0040_1234
+        );
+        assert_eq!(diagnostic_resume_pc(None, 0x0040_5678), 0x0040_5678);
+    }
+
+    #[test]
+    fn wait_diagnostics_decode_hvpatch_island_back_to_original_svc() {
+        // Island layout: svc #0 at 0x2000, then `b 0x1004` at the trapped
+        // resume PC 0x2004. The diagnostic call site is the original svc at
+        // target-4 = 0x1000.
+        assert_eq!(
+            decode_hvpatch_island_origin(0x2004, 0xd400_0001, 0x17ff_fc00),
+            Some(0x1000)
+        );
+        assert_eq!(
+            decode_hvpatch_island_origin(0x2004, 0xd503_201f, 0x17ff_fc00),
+            None,
+            "a non-svc predecessor is not an HvPatch island"
+        );
+        assert_eq!(
+            decode_hvpatch_island_origin(0x2004, 0xd400_0001, 0xd503_201f),
+            None,
+            "the instruction after svc must be an immediate branch"
+        );
+    }
+
+    #[test]
+    fn hvpatch_process_aperture_reservation_removes_both_identity_ranges() {
+        let bytes = carrick_mem::memory::stage1_identity_page_tables();
+        let mut manager = PageTableManager::new(bytes, carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
+        assert!(
+            manager
+                .translate(carrick_mem::memory::LINUX_PROCESS_AUX_BANK_BASE)
+                .is_some()
+        );
+        assert!(
+            manager
+                .translate(carrick_mem::memory::LINUX_PROCESS_BANK_BASE)
+                .is_some()
+        );
+
+        assert!(reserve_hvpatch_process_apertures(&mut manager).expect("reserve apertures"));
+        assert_eq!(
+            manager.translate(carrick_mem::memory::LINUX_PROCESS_AUX_BANK_BASE),
+            None
+        );
+        assert_eq!(
+            manager.translate(carrick_mem::memory::LINUX_PROCESS_BANK_BASE),
+            None
+        );
     }
 }

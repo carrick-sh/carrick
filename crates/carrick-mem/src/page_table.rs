@@ -176,6 +176,15 @@ impl PageTableManager {
         }
     }
 
+    /// Guest-physical address of the L0 table represented by this image.
+    ///
+    /// A process-local table clone may be rebased away from the boot identity
+    /// address. Callers that publish edits must use this address, not a fixed
+    /// global page-table constant, to select the live backing.
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
     /// Relocate this complete stage-1 table image to `new_base` while
     /// preserving every leaf translation. Only table descriptors at levels
     /// L0-L2 contain addresses within the table backing; block/page leaves keep
@@ -1496,7 +1505,7 @@ mod tests {
 
         mgr.rebase(new_base).expect("rebase cloned tables");
 
-        assert_eq!(mgr.base, new_base);
+        assert_eq!(mgr.base(), new_base);
         assert_eq!(mgr.translate(identity_va), before_identity);
         assert_eq!(mgr.translate(alias_va + 0x234), before_alias);
         assert!(!mgr.is_valid(invalid_va));

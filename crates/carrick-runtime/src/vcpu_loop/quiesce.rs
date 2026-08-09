@@ -106,7 +106,7 @@ where
         // have no live vCPU, so another fork must not count us in `others` nor
         // try to kick a destroyed vCPU.
         self.kicker.unregister(self.this_tid);
-        fork_barrier().park_if_quiescing();
+        self.park_if_fork_quiescing();
         // Recreate the vCPU under the topology lock so vcpu_create cannot race
         // another fork's hv_vm_destroy/create. Register only after it exists.
         {
@@ -839,8 +839,13 @@ where
                 "in-process fork requested without hvpatch process context".to_owned(),
             ));
         };
-        while !fork_barrier().try_begin_fork() {
-            if fork_barrier().is_quiescing() {
+        let process_barrier = kernel.process_fork_barrier.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration(
+                "in-process fork requested without a process-local barrier".to_owned(),
+            )
+        })?;
+        while !process_barrier.try_begin_fork() {
+            if process_barrier.is_quiescing() {
                 self.release_and_park_vcpu_for_fork(engine)?;
             }
             std::thread::yield_now();
@@ -850,8 +855,9 @@ where
             .unwrap_or_else(|error| error.into_inner());
         let mut quiesced = false;
         if self.kicker.count() > 1 {
-            fork_barrier().set_quiescing();
+            process_barrier.set_quiescing();
             self.kicker.kick_all_except(self.this_tid);
+            self.futex.notify_signal_pending();
             self.platform_futex.notify_signal_pending();
             kernel.signal_arrival.wake_all_waiters();
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -865,6 +871,7 @@ where
                     std::process::abort();
                 }
                 self.kicker.kick_all_except(self.this_tid);
+                self.futex.notify_signal_pending();
                 self.platform_futex.notify_signal_pending();
                 kernel.signal_arrival.wake_all_waiters();
                 std::thread::sleep(Duration::from_micros(200));
@@ -877,9 +884,9 @@ where
             Ok(child) => child,
             Err(error) => {
                 if quiesced {
-                    fork_barrier().end_quiesce();
+                    process_barrier.end_quiesce();
                 }
-                fork_barrier().end_fork();
+                process_barrier.end_fork();
                 tracing::warn!(%error, "hvpatch process allocation failed; fork(2) = EAGAIN");
                 return Ok(Some(crate::linux_abi::LINUX_EAGAIN.guest_retval()));
             }
@@ -888,14 +895,36 @@ where
         let Some(bank) = child_record.bank() else {
             let _ = child_process.discard_unstarted_child();
             if quiesced {
-                fork_barrier().end_quiesce();
+                process_barrier.end_quiesce();
             }
-            fork_barrier().end_fork();
+            process_barrier.end_fork();
             return Err(RuntimeError::Configuration(
                 "hvpatch fork child has no process bank".to_owned(),
             ));
         };
         let child_tid = ThreadId::from_guest_supplied_tid(child_pid);
+        // CLONE_PIDFD is part of child creation, not a best-effort postscript.
+        // Install the guest-virtual pidfd while the process-table record is live
+        // and before any child vCPU can run. Every later setup failure removes
+        // the fd and retires the unstarted process atomically.
+        let installed_pidfd = if request.pidfd_out.is_some() {
+            match kernel
+                .dispatcher
+                .install_hvpatch_child_pidfd(parent_process, child_pid)
+            {
+                Ok(fd) => Some(fd),
+                Err(errno) => {
+                    let _ = child_process.discard_unstarted_child();
+                    if quiesced {
+                        process_barrier.end_quiesce();
+                    }
+                    process_barrier.end_fork();
+                    return Ok(Some(errno.guest_retval()));
+                }
+            }
+        } else {
+            None
+        };
         if let Some(address) = request.parent_tid_addr {
             let _ = engine.write_bytes(address, &child_pid.to_le_bytes());
         }
@@ -908,14 +937,21 @@ where
             child_record.ttbr0(),
             bank.base(),
             bank.size(),
+            child_tid,
+            self.this_tid,
         ) {
             Ok(spec) => spec,
             Err(error) => {
+                if let Some(fd) = installed_pidfd {
+                    let _ = kernel
+                        .dispatcher
+                        .remove_installed_hvpatch_child_pidfd(fd, child_pid);
+                }
                 let _ = child_process.discard_unstarted_child();
                 if quiesced {
-                    fork_barrier().end_quiesce();
+                    process_barrier.end_quiesce();
                 }
-                fork_barrier().end_fork();
+                process_barrier.end_fork();
                 return Err(RuntimeError::Trap(error));
             }
         };
@@ -926,13 +962,23 @@ where
             child_pid as u32,
         );
         child_dispatcher.bind_hvpatch_process(child_process.clone());
+        let child_unstarted_context = child_process.clone();
         let child_exit_context = child_process.clone();
+        let child_trace_context = child_process.clone();
+        let parent_kernel = Arc::clone(kernel);
+        let parent_futex = Arc::clone(&self.futex);
+        let parent_kicker = Arc::clone(&self.kicker);
+        let parent_tid = self.this_tid;
+        let child_exit_signal = i32::try_from(request.exit_signal)
+            .ok()
+            .filter(|signal| *signal != 0);
         let child_kernel = Arc::new(KernelState::new(
             child_dispatcher,
             Arc::clone(&kernel.fork),
             Arc::clone(&kernel.signal_arrival),
             Some(child_process),
         ));
+        let child_exit_kernel = Arc::clone(&child_kernel);
         let child_registry = Arc::new(ThreadRegistry::new(child_tid));
         let child_futex = Arc::new(crate::thread::FutexTable::new());
         let child_platform_futex = (self.platform_futex_factory)(Arc::clone(&child_futex));
@@ -943,7 +989,7 @@ where
         let max_traps = self.max_traps;
         let child_tid_addr = request.child_tid_addr;
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-        let handle = std::thread::Builder::new()
+        let handle = match std::thread::Builder::new()
             .name(format!("guest-pid-{child_pid}"))
             .spawn(move || {
                 let mut child_engine = match E::materialize_process(spec) {
@@ -975,8 +1021,28 @@ where
                     max_traps,
                 ) {
                     Ok(VcpuLoopOutcome::ProcessExit(result)) => {
-                        if let Err(error) = child_exit_context.publish_exit_code(result.exit_code) {
+                        tracing::trace!(
+                            child_pid,
+                            exit_code = result.exit_code,
+                            "hvpatch child reached process exit publication"
+                        );
+                        child_exit_kernel.dispatcher.retire_hvpatch_process_fds();
+                        if let Err(error) =
+                            child_exit_context.publish_exit_code(result.exit_code, child_tid)
+                        {
                             tracing::error!(child_pid, %error, "publish hvpatch child exit failed");
+                        }
+                        if let Some(signal) = child_exit_signal
+                            && parent_kernel
+                                .dispatcher
+                                .child_exit_signal_needs_pump(parent_tid, signal as u32)
+                        {
+                            parent_kernel
+                                .dispatcher
+                                .mark_in_process_signal_pending(signal);
+                            parent_futex.notify_signal_pending();
+                            parent_kernel.signal_arrival.wake_all_waiters();
+                            parent_kicker.kick_all();
                         }
                         let _ = unsafe {
                             libc::write(1, result.stdout.as_ptr().cast(), result.stdout.len())
@@ -988,50 +1054,97 @@ where
                     Ok(VcpuLoopOutcome::TrapLimit(_)) | Ok(VcpuLoopOutcome::ThreadDone) => {}
                     Err(error) => {
                         tracing::error!(child_pid, %error, "hvpatch child loop failed");
-                        if let Err(publish_error) = child_exit_context.publish_exit_code(127) {
+                        child_exit_kernel.dispatcher.retire_hvpatch_process_fds();
+                        if let Err(publish_error) =
+                            child_exit_context.publish_exit_code(127, child_tid)
+                        {
                             tracing::error!(
                                 child_pid,
                                 %publish_error,
                                 "publish failed hvpatch child exit failed"
                             );
                         }
+                        if let Some(signal) = child_exit_signal
+                            && parent_kernel
+                                .dispatcher
+                                .child_exit_signal_needs_pump(parent_tid, signal as u32)
+                        {
+                            parent_kernel
+                                .dispatcher
+                                .mark_in_process_signal_pending(signal);
+                            parent_futex.notify_signal_pending();
+                            parent_kernel.signal_arrival.wake_all_waiters();
+                            parent_kicker.kick_all();
+                        }
                     }
                 }
-            })
-            .map_err(|error| {
-                RuntimeError::Trap(TrapError::Hypervisor(format!(
+            }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                if let Some(fd) = installed_pidfd {
+                    let _ = kernel
+                        .dispatcher
+                        .remove_installed_hvpatch_child_pidfd(fd, child_pid);
+                }
+                let _ = child_unstarted_context.discard_unstarted_child();
+                if quiesced {
+                    process_barrier.end_quiesce();
+                }
+                process_barrier.end_fork();
+                return Err(RuntimeError::Trap(TrapError::Hypervisor(format!(
                     "spawn hvpatch process failed: {error}"
-                )))
-            })?;
+                ))));
+            }
+        };
         all_threads.lock().push(handle);
         match ready_rx.recv() {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
-                if quiesced {
-                    fork_barrier().end_quiesce();
+                if let Some(fd) = installed_pidfd {
+                    let _ = kernel
+                        .dispatcher
+                        .remove_installed_hvpatch_child_pidfd(fd, child_pid);
                 }
-                fork_barrier().end_fork();
+                let _ = child_unstarted_context.discard_unstarted_child();
+                if quiesced {
+                    process_barrier.end_quiesce();
+                }
+                process_barrier.end_fork();
                 return Err(RuntimeError::Trap(TrapError::Hypervisor(error)));
             }
             Err(error) => {
-                if quiesced {
-                    fork_barrier().end_quiesce();
+                if let Some(fd) = installed_pidfd {
+                    let _ = kernel
+                        .dispatcher
+                        .remove_installed_hvpatch_child_pidfd(fd, child_pid);
                 }
-                fork_barrier().end_fork();
+                let _ = child_unstarted_context.discard_unstarted_child();
+                if quiesced {
+                    process_barrier.end_quiesce();
+                }
+                process_barrier.end_fork();
                 return Err(RuntimeError::Trap(TrapError::Hypervisor(format!(
                     "hvpatch child startup channel failed: {error}"
                 ))));
             }
         }
-        if quiesced {
-            fork_barrier().end_quiesce();
+        if let (Some(address), Some(fd)) = (request.pidfd_out, installed_pidfd) {
+            let _ = engine.write_bytes(address, &fd.to_le_bytes());
         }
-        fork_barrier().end_fork();
+        if quiesced {
+            process_barrier.end_quiesce();
+        }
+        process_barrier.end_fork();
+        child_trace_context.trace_lifecycle(
+            carrick_observability::probes::HvpatchGuestLifecyclePhase::Fork,
+            child_tid,
+            0,
+        );
         crate::event_ring::rec(crate::event_ring::FORK, child_pid, 0, 0);
-        if request.pidfd_out.is_some() || request.clone_parent || request.exit_signal != 0 {
+        if request.clone_parent || request.exit_signal != 0 {
             tracing::debug!(
                 child_pid,
-                "hvpatch in-process fork currently records pidfd/clone-parent/exit-signal metadata for later wait integration"
+                "hvpatch in-process fork currently records clone-parent/exit-signal metadata for later wait integration"
             );
         }
         Ok(Some(i64::from(child_pid)))

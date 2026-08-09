@@ -60,6 +60,12 @@ use super::{EpollKqueue, Fd, GuestPtr, HostFd, inode_for_path, linux_mode};
 
 #[derive(Debug, Clone)]
 pub(super) struct EpollInterest {
+    /// The open-file description named by `fd` when EPOLL_CTL_ADD succeeded.
+    /// This identity is load-bearing once forked processes have private fd
+    /// tables: the same numeric fd can later name a different description in a
+    /// child, whose close must not auto-remove the parent's shared epoll entry.
+    /// Bare inherited stdio has no table-backed description and remains `None`.
+    pub(super) target: Option<OpenDescriptionRef>,
     pub(super) event: LinuxEpollEvent,
     /// Readiness bits already REPORTED to the guest for this registration. The
     /// software EPOLLET latch: `raw & !last_ready` is the edge. Cleared on
@@ -265,6 +271,12 @@ pub(super) struct TimerFdInner {
 #[derive(Debug, Clone)]
 pub(super) struct OpenDescriptionBase {
     status_flags: u64,
+    /// Number of Linux fd-table entries that currently name this open file
+    /// description across every HvPatch process namespace. This deliberately
+    /// excludes transient Rust `Arc` clones used by in-flight syscalls. Linux
+    /// removes an epoll interest only after the last fd referring to the open
+    /// description closes; `Arc::strong_count` cannot express that invariant.
+    fd_refs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Linux file-lease state (F_SETLEASE/F_GETLEASE): F_RDLCK(0)/F_WRLCK(1)/
     /// F_UNLCK(2). Lives on the open-file-description so a dup'd fd shares it,
     /// matching the kernel. Default F_UNLCK = no lease.
@@ -348,6 +360,7 @@ impl OpenDescriptionBase {
     pub(super) fn new(status_flags: u64) -> Self {
         Self {
             status_flags,
+            fd_refs: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             so_reuseaddr: false,
             so_reuseport: false,
             so_rcvbuf: None,
@@ -787,7 +800,7 @@ fn insert_dirty_range(
 /// `OpenDescription` can keep deriving `Debug` (the trait object is not `Debug`);
 /// the poll fd (the kqueue fd on macOS, the pidfd-bearing epoll fd on Linux) is
 /// the only state callers read.
-pub(super) struct PidfdWatch {
+pub(crate) struct PidfdWatch {
     /// Owns the backing fds; held only so `Drop` closes them (the registered
     /// process-exit watch is reclaimed with it). Never read after construction.
     /// `Mutex` only to make the otherwise-`!Sync` trait object shareable across
@@ -798,7 +811,7 @@ pub(super) struct PidfdWatch {
 }
 
 impl PidfdWatch {
-    pub(super) fn new(mux: Box<dyn carrick_hal::event::EventMultiplexer>) -> Self {
+    pub(crate) fn new(mux: Box<dyn carrick_hal::event::EventMultiplexer>) -> Self {
         let poll_fd = mux.poll_fd();
         Self {
             mux: Mutex::new(mux),
@@ -807,8 +820,16 @@ impl PidfdWatch {
     }
 
     /// The pollable fd readable when the watched process exits.
-    pub(super) fn poll_fd(&self) -> i32 {
+    pub(crate) fn poll_fd(&self) -> i32 {
         self.poll_fd
+    }
+
+    /// Make a guest-virtual pidfd readable after its in-process target exits.
+    /// The process table calls this exactly when it publishes the target's
+    /// zombie record. A saturated user wake is already the required persistent
+    /// readiness, so firing is deliberately best-effort.
+    pub(crate) fn publish_exit(&self) {
+        let _ = self.mux.lock().trigger_user(0);
     }
 }
 
@@ -820,6 +841,15 @@ impl std::fmt::Debug for PidfdWatch {
             .field("mux", &"<dyn EventMultiplexer>")
             .finish()
     }
+}
+
+/// Identity carried by a pidfd's open-file description. This is intentionally
+/// typed: treating an HvPatch guest pid as a Darwin pid recreated the 1:1
+/// process model inside the backend whose purpose is to break that mapping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PidfdTarget {
+    Host(i32),
+    Hvpatch(i32),
 }
 
 /// A TRUSTED host dirfd backing an `OpenDescription::Directory` on the
@@ -934,15 +964,14 @@ pub(super) enum OpenDescription {
         /// kqueue's `EVFILT_USER(0)`. See `docs/archive/epoll-kqueue-plan.md`.
         kqueue: Arc<EpollKqueue>,
     },
-    /// A Linux pidfd referring to a process. Backed by a host `kqueue` watching
-    /// the real macOS process (`EVFILT_PROC`/`NOTE_EXIT`): the kqueue fd becomes
-    /// read-ready when the process exits, so poll/epoll/`waitid(P_PIDFD)` on the
-    /// pidfd are serviced by the macOS kernel's process-lifecycle tracking
-    /// rather than carrick bookkeeping. `host_pid` is the macOS pid (guest pids
-    /// mirror host pids in carrick). Used by Go 1.24's `os/exec`.
+    /// A Linux pidfd referring to a process. Mirrored-process backends watch a
+    /// host process through `EVFILT_PROC`/native pidfd. HvPatch instead arms an
+    /// `EVFILT_USER`-style wake and lets its shared guest process table publish
+    /// readiness: several Linux processes intentionally share one host pid in
+    /// that backend, so a host-process watch cannot encode the target.
     Pidfd {
         base: OpenDescriptionBase,
-        host_pid: i32,
+        target: PidfdTarget,
         /// The readiness backend (kqueue on macOS, epoll+pidfd on Linux). Named
         /// `kqueue` for historical continuity; both platforms now route through
         /// the `EventMultiplexer` via [`PidfdWatch`].
@@ -1475,6 +1504,26 @@ impl OpenDescription {
             | OpenDescription::Netlink { base, .. }
             | OpenDescription::Mqueue { base, .. } => base,
         }
+    }
+
+    pub(super) fn retain_fd_ref(&self) {
+        self.base()
+            .fd_refs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(super) fn release_fd_ref(&self) {
+        let previous = self
+            .base()
+            .fd_refs
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        debug_assert!(previous > 0, "logical fd reference count underflow");
+    }
+
+    pub(super) fn fd_ref_count(&self) -> usize {
+        self.base()
+            .fd_refs
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(super) fn status_flags(&self) -> u64 {

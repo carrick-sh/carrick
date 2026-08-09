@@ -644,6 +644,8 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         _bank_base: u64,
         _bank_size: u64,
         _page_tables: &mut carrick_mem::page_table::PageTableManager,
+        _child_pid: i32,
+        _forking_tid: i32,
     ) -> Result<Self::ProcessBuilder, TrapError> {
         Err(TrapError::Hypervisor(
             "aarch64 backend does not support in-process fork".to_owned(),

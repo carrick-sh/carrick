@@ -1103,13 +1103,43 @@ impl SyscallDispatcher {
             std::sync::Arc::new(PidfdWatch::new(mux))
         };
         let description = OpenDescription::Pidfd {
-            host_pid,
+            target: PidfdTarget::Host(host_pid),
             kqueue,
             base: OpenDescriptionBase::new(status_flags),
         };
         // Linux creates the pidfd with O_CLOEXEC unconditionally (the flags arg
         // only carries PIDFD_NONBLOCK), so the returned fd must have FD_CLOEXEC
         // set — pidfd_open01 asserts F_GETFD & FD_CLOEXEC.
+        self.install_fd(description, LINUX_FD_CLOEXEC)
+    }
+
+    /// Allocate a pidfd for one Linux process multiplexed inside the shared
+    /// HvPatch VM. Its readiness is a user event published by the guest process
+    /// table, never an `EVFILT_PROC` watch on the common Carrick host pid.
+    pub(super) fn open_hvpatch_pidfd(
+        &self,
+        process: &crate::hvpatch::ProcessContext,
+        guest_pid: i32,
+        status_flags: u64,
+    ) -> DispatchOutcome {
+        let kqueue = {
+            let mut mux = match crate::event_mux::make_event_multiplexer() {
+                Ok(mux) => mux,
+                Err(_) => return DispatchOutcome::errno(crate::linux_abi::LINUX_EMFILE),
+            };
+            if mux.register_user(0).is_err() {
+                return DispatchOutcome::errno(crate::linux_abi::LINUX_EMFILE);
+            }
+            std::sync::Arc::new(PidfdWatch::new(mux))
+        };
+        if !process.register_pidfd_watch(guest_pid, &kqueue) {
+            return DispatchOutcome::errno(crate::linux_abi::LINUX_ESRCH);
+        }
+        let description = OpenDescription::Pidfd {
+            target: PidfdTarget::Hvpatch(guest_pid),
+            kqueue,
+            base: OpenDescriptionBase::new(status_flags),
+        };
         self.install_fd(description, LINUX_FD_CLOEXEC)
     }
 
@@ -1127,13 +1157,40 @@ impl SyscallDispatcher {
         }
     }
 
+    /// Install a pidfd for a child in the shared HvPatch process table.
+    pub(crate) fn install_hvpatch_child_pidfd(
+        &self,
+        process: &crate::hvpatch::ProcessContext,
+        child_pid: i32,
+    ) -> Result<i32, crate::linux_abi::LinuxErrno> {
+        match self.open_hvpatch_pidfd(process, child_pid, 0) {
+            DispatchOutcome::Returned { value } => {
+                i32::try_from(value).map_err(|_| crate::linux_abi::LINUX_EMFILE)
+            }
+            DispatchOutcome::Errno { errno } => Err(errno),
+            _ => Err(crate::linux_abi::LINUX_EMFILE),
+        }
+    }
+
     /// Roll back one freshly installed CLONE_PIDFD descriptor before its gated
     /// child is released. The native fork path retains exact thread exclusion,
     /// so this fd cannot have been observed, closed, or reused by guest code.
     pub fn remove_installed_child_pidfd(&self, fd: i32, child_pid: i32) -> bool {
-        if self.pidfd_host_pid(fd) != Some(child_pid) {
+        if self.pidfd_target(fd) != Some(PidfdTarget::Host(child_pid)) {
             return false;
         }
+        self.remove_pidfd(fd)
+    }
+
+    /// Roll back a pidfd installed before an HvPatch child was materialized.
+    pub(crate) fn remove_installed_hvpatch_child_pidfd(&self, fd: i32, child_pid: i32) -> bool {
+        if self.pidfd_target(fd) != Some(PidfdTarget::Hvpatch(child_pid)) {
+            return false;
+        }
+        self.remove_pidfd(fd)
+    }
+
+    fn remove_pidfd(&self, fd: i32) -> bool {
         self.detach_fd_from_epolls(fd);
         let removed = self.io.open_files.write().remove(&fd);
         if let Some(open_file) = removed {
@@ -1145,20 +1202,37 @@ impl SyscallDispatcher {
         }
     }
 
-    /// Resolve a pidfd to its backing host pid, or `None` if `fd` isn't a pidfd.
-    pub(super) fn pidfd_host_pid(&self, fd: i32) -> Option<i32> {
+    /// Resolve a pidfd to its typed process target.
+    fn pidfd_target(&self, fd: i32) -> Option<PidfdTarget> {
         let open = self.open_file(fd)?;
         let desc = open.description.read();
         match &*desc {
-            OpenDescription::Pidfd { host_pid, .. } => Some(*host_pid),
+            OpenDescription::Pidfd { target, .. } => Some(*target),
             // A `/proc/<pid>` directory fd is a valid pidfd on Linux (e.g.
             // `pidfd_send_signal`/`waitid(P_PIDFD)` accept one). Resolve its
             // backing host pid; any other directory (or non-numeric /proc path)
             // yields None → EBADF. (CPython test_pidfd_send_signal.)
             OpenDescription::Directory { path, .. } => {
-                crate::vfs::proc::proc_pid_dir_host_pid(path).map(|p| p as i32)
+                crate::vfs::proc::proc_pid_dir_host_pid(path)
+                    .map(|pid| PidfdTarget::Host(pid as i32))
             }
             _ => None,
+        }
+    }
+
+    /// Resolve a pidfd to its backing host pid, or `None` for guest-virtual
+    /// HvPatch pidfds and non-pidfd descriptors.
+    pub(super) fn pidfd_host_pid(&self, fd: i32) -> Option<i32> {
+        match self.pidfd_target(fd)? {
+            PidfdTarget::Host(pid) => Some(pid),
+            PidfdTarget::Hvpatch(_) => None,
+        }
+    }
+
+    fn pidfd_hvpatch_pid(&self, fd: i32) -> Option<i32> {
+        match self.pidfd_target(fd)? {
+            PidfdTarget::Hvpatch(pid) => Some(pid),
+            PidfdTarget::Host(_) => None,
         }
     }
 
@@ -2176,6 +2250,7 @@ impl SyscallDispatcher {
                         });
                     }
                     let n = thread.futex.wake(address.0, value);
+                    crate::event_ring::rec_futex_wake(address.0, n);
                     DispatchOutcome::Returned {
                         value: i64::from(n),
                     }
@@ -2498,6 +2573,20 @@ impl SyscallDispatcher {
         }
 
         fn setpgid(this, cx, pid: Pid, pgid: Pid) {
+            if let Some(process) = this.hvpatch_process() {
+                if pgid.0 < 0 {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                if pid.0 < 0 {
+                    return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                }
+                let target = (pid.0 != 0).then_some(pid.0);
+                let group = (pgid.0 != 0).then_some(pgid.0);
+                return match process.set_process_group(target, group) {
+                    Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
+                };
+            }
             // PID namespace (§6.6): pgids stay host-level in Phase 2, but the
             // ns-pid ARGS must be translated to host pids before the host call.
             // pid 0 = "the calling process", pgid 0 = "same as pid" — both pass
@@ -2523,6 +2612,17 @@ impl SyscallDispatcher {
         }
 
         fn getpgid(this, cx, pid: Pid) {
+            if let Some(process) = this.hvpatch_process() {
+                if pid.0 < 0 {
+                    return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                }
+                return match process.process_group((pid.0 != 0).then_some(pid.0)) {
+                    Ok(pgid) => Ok(DispatchOutcome::Returned {
+                        value: i64::from(pgid),
+                    }),
+                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
+                };
+            }
             // Translate the ns-pid arg (0 = self) to a host pid, then translate
             // the returned host pgid back to its ns-pid so a self-led group
             // reads as the caller's own ns-pid — getpgid(0)==getpid() holds
@@ -2547,6 +2647,17 @@ impl SyscallDispatcher {
         }
 
         fn getsid(this, cx, pid: Pid) {
+            if let Some(process) = this.hvpatch_process() {
+                if pid.0 < 0 {
+                    return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                }
+                return match process.session_id((pid.0 != 0).then_some(pid.0)) {
+                    Ok(sid) => Ok(DispatchOutcome::Returned {
+                        value: i64::from(sid),
+                    }),
+                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
+                };
+            }
             let hpid = if crate::namespace::pid::enabled() && pid.0 != 0 {
                 match crate::namespace::pid::ns_to_host_or_self(pid.0 as u32) {
                     Some(h) => h as i32,
@@ -2567,6 +2678,14 @@ impl SyscallDispatcher {
         }
 
         fn setsid(this, cx) {
+            if let Some(process) = this.hvpatch_process() {
+                return match process.create_session() {
+                    Ok(sid) => Ok(DispatchOutcome::Returned {
+                        value: i64::from(sid),
+                    }),
+                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
+                };
+            }
             let r = (unsafe { libc::setsid() }).host_syscall_errno()?;
             // setsid returns the new session id (== the caller's pid); report it
             // as the caller's ns-pid (§5.3, §6.6). Identity when ns is off.
@@ -2590,6 +2709,77 @@ impl SyscallDispatcher {
             }
             if !options.intersects(LinuxWaitOptions::WAITID_STATE_MASK) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            if let Some(process) = this.hvpatch_process() {
+                // HvPatch children are Linux processes in the in-process table,
+                // not Darwin children, so a host waitid would truthfully return
+                // ECHILD. Route terminal child state through the same table as
+                // wait4 and synthesize Linux's SIGCHLD siginfo layout.
+                if !options.contains(LinuxWaitOptions::WEXITED) {
+                    return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
+                }
+                let target = match idtype {
+                    LINUX_P_ALL => None,
+                    LINUX_P_PID if id > 0 && id <= i32::MAX as u64 => Some(id as i32),
+                    LINUX_P_PID => {
+                        return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
+                    }
+                    // Process-group membership needs its own process-table
+                    // index; do not fall through to Darwin and accidentally
+                    // inspect an unrelated host process.
+                    LINUX_P_PGID => {
+                        return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
+                    }
+                    LINUX_P_PIDFD => match this.pidfd_hvpatch_pid(id as i32) {
+                        Some(pid) => Some(pid),
+                        None => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
+                    },
+                    _ => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+                };
+                let guest_nohang = options.contains(LinuxWaitOptions::WNOHANG);
+                match process.wait_child(target, true, options.contains(LinuxWaitOptions::WNOWAIT)) {
+                    crate::hvpatch::WaitResult::Exited(exit) => {
+                        if infop_addr.0 != 0 {
+                            let (si_code, si_status) =
+                                hvpatch_waitid_exit_fields(exit.status());
+                            let bytes = build_linux_sigchld_siginfo(
+                                exit.pid().raw(),
+                                unsafe { libc::getuid() },
+                                si_code,
+                                si_status,
+                            );
+                            (*cx.memory).write_bytes(infop_addr.0, &bytes)?;
+                        }
+                        return Ok(DispatchOutcome::Returned { value: 0 });
+                    }
+                    crate::hvpatch::WaitResult::StillRunning => {
+                        if guest_nohang {
+                            if infop_addr.0 != 0 {
+                                (*cx.memory).write_bytes(
+                                    infop_addr.0,
+                                    &[0u8; crate::linux_abi::LINUX_SIGINFO_SIZE],
+                                )?;
+                            }
+                            return Ok(DispatchOutcome::Returned { value: 0 });
+                        }
+                        if idtype == LINUX_P_PIDFD
+                            && this
+                                .pidfd_status_flags(id as i32)
+                                .is_some_and(|flags| flags & LINUX_O_NONBLOCK != 0)
+                        {
+                            return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                        }
+                        let tid = Self::ctx_tid(cx);
+                        let non_interrupting = this.non_interrupting_signal_mask(tid);
+                        return Ok(DispatchOutcome::WaitOnHvpatchChild {
+                            target,
+                            sig_mask: carrick_abi::WaitSigMask::Additive(non_interrupting),
+                        });
+                    }
+                    crate::hvpatch::WaitResult::NoChild => {
+                        return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
+                    }
+                }
             }
             let (host_idtype, host_id): (libc::idtype_t, libc::id_t) = match idtype {
                 LINUX_P_ALL => (libc::P_ALL, 0),
@@ -2948,11 +3138,8 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
                     }
                 };
-                match process.wait_child(
-                    target,
-                    options.contains(LinuxWaitOptions::WNOHANG),
-                    false,
-                ) {
+                let guest_nohang = options.contains(LinuxWaitOptions::WNOHANG);
+                match process.wait_child(target, true, false) {
                     crate::hvpatch::WaitResult::Exited(exit) => {
                         if wstatus_addr.0 != 0 {
                             memory.write_bytes(wstatus_addr.0, &exit.status().to_ne_bytes())?;
@@ -2966,7 +3153,15 @@ impl SyscallDispatcher {
                         });
                     }
                     crate::hvpatch::WaitResult::StillRunning => {
-                        return Ok(DispatchOutcome::Returned { value: 0 });
+                        if guest_nohang {
+                            return Ok(DispatchOutcome::Returned { value: 0 });
+                        }
+                        let tid = Self::ctx_tid(cx);
+                        let non_interrupting = this.non_interrupting_signal_mask(tid);
+                        return Ok(DispatchOutcome::WaitOnHvpatchChild {
+                            target,
+                            sig_mask: carrick_abi::WaitSigMask::Additive(non_interrupting),
+                        });
                     }
                     crate::hvpatch::WaitResult::NoChild => {
                         return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
@@ -3602,6 +3797,9 @@ impl SyscallDispatcher {
             if flags & !PIDFD_NONBLOCK != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
+            if let Some(process) = this.hvpatch_process() {
+                return Ok(this.open_hvpatch_pidfd(&process, pid.0, flags));
+            }
             // PID namespace (§5.3): the guest names the target by its ns-pid;
             // the pidfd must watch the underlying host pid. A foreign ns-pid is
             // ESRCH. Identity when namespaces are off.
@@ -3627,12 +3825,34 @@ impl SyscallDispatcher {
         }
 
         fn pidfd_send_signal(this, cx, fd: Fd, signum: u64, info: GuestPtr, flags: u64) {
-            let Some(host_pid) = this.pidfd_host_pid(fd.0) else {
+            let Some(target) = this.pidfd_target(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             if flags != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
+            if let PidfdTarget::Hvpatch(guest_pid) = target {
+                let Some(process) = this.hvpatch_process() else {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                };
+                if !process.process_is_live(guest_pid) {
+                    return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                }
+                if signum == 0 {
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+                if !crate::dispatch::signal::is_valid_signum(signum) {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                // A nonzero signal needs a process-table route to the target's
+                // process-private signal state and wake handles. Do not leak it
+                // to the common Carrick host pid; that would signal every Linux
+                // process in the shared VM.
+                return Ok(DispatchOutcome::errno(LINUX_ENOSYS));
+            }
+            let PidfdTarget::Host(host_pid) = target else {
+                unreachable!("HvPatch pidfd handled above")
+            };
             if signum == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
@@ -4155,6 +4375,19 @@ fn waitid_host_state_option(si_code: i32) -> Option<i32> {
     }
 }
 
+/// Decode the Linux wait-status word stored by the in-process process table
+/// into the `si_code`/`si_status` pair returned by `waitid(2)`.
+fn hvpatch_waitid_exit_fields(wait_status: i32) -> (i32, i32) {
+    let signal = wait_status & 0x7f;
+    if signal == 0 {
+        (libc::CLD_EXITED, (wait_status >> 8) & 0xff)
+    } else if wait_status & 0x80 != 0 {
+        (libc::CLD_DUMPED, signal)
+    } else {
+        (libc::CLD_KILLED, signal)
+    }
+}
+
 /// Build a Linux `siginfo_t` (SIGCHLD layout) for `waitid` from the fields
 /// macOS's `waitid` filled. The Linux struct places si_pid@16, si_uid@20,
 /// si_status@24 after the common si_signo/si_errno/si_code header. The CLD_*
@@ -4264,6 +4497,16 @@ mod native_virtual_ptrace_tests {
     fn virtual_stop_status_uses_linux_wait_encoding() {
         assert_eq!(virtual_ptrace_stop_status(19), 0x137f);
         assert_eq!(virtual_ptrace_stop_status(5), 0x057f);
+    }
+
+    #[test]
+    fn hvpatch_waitid_decodes_linux_terminal_wait_status() {
+        assert_eq!(hvpatch_waitid_exit_fields(7 << 8), (libc::CLD_EXITED, 7));
+        assert_eq!(hvpatch_waitid_exit_fields(9), (libc::CLD_KILLED, 9));
+        assert_eq!(
+            hvpatch_waitid_exit_fields(11 | 0x80),
+            (libc::CLD_DUMPED, 11)
+        );
     }
 
     #[test]

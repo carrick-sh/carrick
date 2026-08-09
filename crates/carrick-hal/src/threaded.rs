@@ -634,6 +634,18 @@ pub struct GuestEntryRegs {
     pub tls: Option<u64>,
 }
 
+/// Minimal architecture-neutral register set recorded when a guest thread
+/// enters a host-backed blocking wait. This is deliberately small enough for
+/// the always-on event ring and crash bundles: instruction, stack, and return
+/// linkage are sufficient to symbolize the park site without saving a core.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GuestWaitRegisters {
+    pub pc: u64,
+    pub sp: u64,
+    /// AArch64 X30. Architectures without a link register report zero.
+    pub lr: u64,
+}
+
 pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
     /// The guest CPU ISA this engine runs. Fixed per process (the guest ISA
     /// equals the host ISA), so it is an associated type — monomorphized per
@@ -642,6 +654,13 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
     type KickHandle: VcpuKick + 'static;
     type SiblingSpec: Send;
     type ProcessSpec: Send;
+
+    /// Best-effort guest register snapshot taken before blocking-wait reclaim
+    /// destroys or releases the live vCPU. Backends opt in; absence degrades
+    /// diagnostics only and never changes guest behavior.
+    fn diagnostic_wait_registers(&self) -> Option<GuestWaitRegisters> {
+        None
+    }
 
     /// Select a backend lifecycle in which guest exec/fork operations retain
     /// one host VM and replace only per-process address-space state. Backends
@@ -678,6 +697,8 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
         _child_ttbr0: u64,
         _bank_base: u64,
         _bank_size: u64,
+        _child_tid: ThreadId,
+        _forking_tid: ThreadId,
     ) -> Result<Self::ProcessSpec, TrapError> {
         Err(TrapError::Hypervisor(
             "backend does not support in-process fork".to_owned(),

@@ -453,13 +453,23 @@ pub const LINUX_PRIVATE_OVERLAY_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB, mi
 /// invalidates this VA range in stage-1 before its first entry. Child-private
 /// pages may therefore live here without becoming reachable through the boot
 /// identity mapping of any process.
-pub const LINUX_PROCESS_BANK_BASE: u64 = 0xA0_0000_0000; // 640 GiB
-pub const LINUX_PROCESS_BANK_SIZE: u64 = 0x40_0000_0000; // 256 GiB
+// Ten 40 GiB banks fit above the private-overlay aperture while leaving the
+// initial stack intact. One additional bank lives in the otherwise-unused
+// 320..360 GiB IPA hole between the heap and mmap arena. Banks are IPA-only:
+// every hvpatch page table invalidates both reserved apertures, so no process
+// can reach another process's private stage-2 backing through identity VA.
+pub const LINUX_PROCESS_AUX_BANK_BASE: u64 = 0x50_0000_0000; // 320 GiB
+pub const LINUX_PROCESS_AUX_BANK_SIZE: u64 = 0x0A_0000_0000; // 40 GiB
+pub const LINUX_PROCESS_BANK_BASE: u64 = 0x9A_0000_0000; // 616 GiB
+pub const LINUX_PROCESS_BANK_SIZE: u64 = 0x64_0000_0000; // 400 GiB (10 × 40 GiB)
 pub const LINUX_PROCESS_BANK_END: u64 = LINUX_PROCESS_BANK_BASE + LINUX_PROCESS_BANK_SIZE;
 
 const _: () =
     assert!(LINUX_PRIVATE_OVERLAY_BASE + LINUX_PRIVATE_OVERLAY_SIZE <= LINUX_PROCESS_BANK_BASE);
+const _: () = assert!(LINUX_HEAP_BASE + LINUX_HEAP_SIZE <= LINUX_PROCESS_AUX_BANK_BASE);
+const _: () = assert!(LINUX_PROCESS_AUX_BANK_BASE + LINUX_PROCESS_AUX_BANK_SIZE <= LINUX_MMAP_BASE);
 const _: () = assert!(LINUX_PROCESS_BANK_END <= 1_u64 << 40);
+const _: () = assert!(LINUX_PROCESS_BANK_END <= LINUX_STACK_TOP - LINUX_STACK_SIZE);
 
 /// True if `[va, va+len)` lies entirely within the boot-mapped shared aperture
 /// window. Used by `mmap` to detect a MAP_FIXED|MAP_PRIVATE that overlaps a
@@ -741,7 +751,7 @@ pub struct MemoryRegion {
     /// aperture. All other regions are private.
     pub shared: bool,
     #[serde(skip)]
-    bytes: Vec<u8>,
+    bytes: std::sync::Arc<Vec<u8>>,
 }
 
 impl MemoryRegion {
@@ -764,7 +774,15 @@ impl MemoryRegion {
     }
 
     pub fn bytes(&self) -> &[u8] {
-        &self.bytes
+        self.bytes.as_slice()
+    }
+
+    /// Share this region's immutable payload without copying it.
+    ///
+    /// A later write through [`GuestMemory`] or [`AddressSpace::region_bytes_mut`]
+    /// detaches the writer with copy-on-write semantics.
+    pub fn shared_bytes(&self) -> std::sync::Arc<Vec<u8>> {
+        std::sync::Arc::clone(&self.bytes)
     }
 
     /// Mutable access to a region's already-sized host backing.
@@ -772,7 +790,7 @@ impl MemoryRegion {
     /// Callers may rewrite bytes but cannot resize the region, preserving the
     /// `start..end`/backing-length invariant enforced by `AddressSpace`.
     fn bytes_mut(&mut self) -> &mut [u8] {
-        &mut self.bytes
+        std::sync::Arc::make_mut(&mut self.bytes).as_mut_slice()
     }
 }
 
@@ -1045,7 +1063,7 @@ impl AddressSpace {
                 end,
                 perms,
                 shared: false,
-                bytes,
+                bytes: bytes.into(),
             });
         }
         Self::from_regions(entry, regions)
@@ -1104,7 +1122,7 @@ impl AddressSpace {
                 end,
                 perms: region.perms,
                 shared: region.shared,
-                bytes: Vec::new(),
+                bytes: Vec::new().into(),
             });
         }
 
@@ -1286,7 +1304,7 @@ impl AddressSpace {
             end,
             perms,
             shared,
-            bytes,
+            bytes: bytes.into(),
         };
 
         let AddressSpace {
@@ -1372,7 +1390,7 @@ impl AddressSpace {
                 execute: true,
             },
             shared: false,
-            bytes,
+            bytes: bytes.into(),
         };
 
         // Reconstruct via `from_regions` so the overlap check still runs.
@@ -1448,7 +1466,7 @@ impl AddressSpace {
                 execute: true,
             },
             shared: false,
-            bytes,
+            bytes: bytes.into(),
         };
 
         let AddressSpace {
@@ -1504,7 +1522,7 @@ impl AddressSpace {
                 execute: false,
             },
             shared: false,
-            bytes: vec![0u8; LINUX_IDENTITY_PAGE_SIZE as usize],
+            bytes: vec![0u8; LINUX_IDENTITY_PAGE_SIZE as usize].into(),
         };
 
         let AddressSpace {
@@ -1547,7 +1565,7 @@ impl AddressSpace {
                 execute: false,
             },
             shared: false,
-            bytes: vec![0_u8; LINUX_SYSCALL_MAILBOX_ARENA_SIZE as usize],
+            bytes: vec![0_u8; LINUX_SYSCALL_MAILBOX_ARENA_SIZE as usize].into(),
         };
 
         let AddressSpace {
@@ -1632,7 +1650,7 @@ impl AddressSpace {
                 execute: false,
             },
             shared: false,
-            bytes,
+            bytes: bytes.into(),
         };
 
         // The EL1 stage-1 maintenance trampoline lives in the same kernel hole
@@ -1647,7 +1665,7 @@ impl AddressSpace {
                 execute: true,
             },
             shared: false,
-            bytes: el1_maintenance_bytes(),
+            bytes: el1_maintenance_bytes().into(),
         };
 
         let AddressSpace {
@@ -1730,7 +1748,7 @@ impl AddressSpace {
                 execute: false,
             },
             shared: false,
-            bytes: vec![0u8; crate::vdso::LINUX_VVAR_SIZE as usize],
+            bytes: vec![0u8; crate::vdso::LINUX_VVAR_SIZE as usize].into(),
         };
         vdso_bytes.resize(crate::vdso::LINUX_VDSO_SIZE as usize, 0);
         let vdso = MemoryRegion {
@@ -1742,7 +1760,7 @@ impl AddressSpace {
                 execute: true,
             },
             shared: false,
-            bytes: vdso_bytes,
+            bytes: vdso_bytes.into(),
         };
 
         let AddressSpace {
@@ -2024,7 +2042,7 @@ pub fn build_linux_initial_stack(
                 execute: false,
             },
             shared: false,
-            bytes,
+            bytes: bytes.into(),
         },
         stack_start + stack_pointer_offset as u64,
         auxv_image,
@@ -2263,7 +2281,7 @@ fn region_from_load_segment_page_aligned(
         end,
         perms: segment.perms,
         shared: false,
-        bytes,
+        bytes: bytes.into(),
     })
 }
 
@@ -2340,7 +2358,7 @@ fn region_from_load_segments(
         end,
         perms,
         shared: false,
-        bytes,
+        bytes: bytes.into(),
     })
 }
 
@@ -3192,7 +3210,7 @@ fn linux_runtime_regions() -> Result<Vec<MemoryRegion>, AddressSpaceError> {
                 execute: true,
             },
             shared: false,
-            bytes: sigreturn_trampoline_bytes(),
+            bytes: sigreturn_trampoline_bytes().into(),
         },
         zeroed_region(
             LINUX_HEAP_BASE,
@@ -3261,7 +3279,7 @@ fn zeroed_region(
         end,
         perms,
         shared: false,
-        bytes: Vec::new(),
+        bytes: Vec::new().into(),
     })
 }
 
@@ -3405,10 +3423,11 @@ impl GuestMemory for AddressSpace {
         // Grow the initialised prefix with zeroes so a write into the
         // lazily-zeroed tail of a region (heap / mmap arena) materialises the
         // bytes it lands in rather than slicing past the end of the Vec.
-        if end > region.bytes.len() {
-            region.bytes.resize(end, 0);
+        let region_bytes = std::sync::Arc::make_mut(&mut region.bytes);
+        if end > region_bytes.len() {
+            region_bytes.resize(end, 0);
         }
-        region.bytes[offset..end].copy_from_slice(bytes);
+        region_bytes[offset..end].copy_from_slice(bytes);
         Ok(())
     }
 }
@@ -3441,6 +3460,36 @@ mod tests {
     use super::*;
     use crate::elf::RoSpan;
     use carrick_guest_mem::GuestVa;
+
+    #[test]
+    fn address_space_clone_shares_payload_until_first_write() {
+        let perms = SegmentPerms {
+            read: true,
+            write: true,
+            execute: false,
+        };
+        let original = AddressSpace::from_segments(0x1000, [(0x1000, perms, vec![1, 2, 3, 4], 4)])
+            .expect("one valid region");
+        let mut cloned = original.clone();
+
+        assert_eq!(
+            original.regions()[0].bytes().as_ptr(),
+            cloned.regions()[0].bytes().as_ptr(),
+            "cloning an immutable exec image must share its payload"
+        );
+
+        cloned
+            .write_bytes_raw(0x1001, &[9])
+            .expect("write into cloned region");
+
+        assert_eq!(original.regions()[0].bytes(), &[1, 2, 3, 4]);
+        assert_eq!(cloned.regions()[0].bytes(), &[1, 9, 3, 4]);
+        assert_ne!(
+            original.regions()[0].bytes().as_ptr(),
+            cloned.regions()[0].bytes().as_ptr(),
+            "the first mutation must detach the cloned payload"
+        );
+    }
 
     fn region(
         start: u64,

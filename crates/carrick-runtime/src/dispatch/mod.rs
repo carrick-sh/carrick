@@ -1678,6 +1678,16 @@ pub enum DispatchOutcome {
         pid: i32,
         sig_mask: carrick_abi::WaitSigMask,
     },
+    /// An in-process HvPatch child is still running. There is no Darwin child
+    /// fd/kqueue event to wait on, so the threaded loop performs a short,
+    /// signal/fork-interruptible park and re-dispatches the original wait.
+    WaitOnHvpatchChild {
+        /// Exact guest PID for `wait4(pid)` / `waitid(P_PID, pid)`, or `None`
+        /// for an any-child selector. This is guest-domain process identity;
+        /// no Darwin child process exists for HvPatch.
+        target: Option<i32>,
+        sig_mask: carrick_abi::WaitSigMask,
+    },
     /// A synchronous signal wait found no matching signal already pending and
     /// must wait until one of `wait_set` arrives, or until `timeout` elapses.
     /// `rt_sigtimedwait` uses its caller-supplied timeout; `rt_sigsuspend` uses
@@ -1754,6 +1764,7 @@ impl DispatchOutcome {
             DispatchOutcome::WaitOnPollFds { .. } => (0, None),
             DispatchOutcome::WaitOnProcExit { .. } => (0, None),
             DispatchOutcome::WaitOnProcState { .. } => (0, None),
+            DispatchOutcome::WaitOnHvpatchChild { .. } => (0, None),
             DispatchOutcome::WaitOnSignals { .. } => (0, None),
             DispatchOutcome::WaitOnSleep { .. } => (0, None),
         }
@@ -2445,6 +2456,47 @@ impl SyscallDispatcher {
         }
     }
 
+    /// Apply Linux's process-exit fd lifetime at the HvPatch process boundary.
+    ///
+    /// HvPatch multiplexes Linux processes inside one host process, so host fd
+    /// lifetime cannot rely on host `_exit`. Drain this process's descriptor
+    /// table before publishing its zombie; otherwise a retained pipe writer
+    /// suppresses EOF in the parent and leaves `os/exec` stuck in `IO wait`.
+    pub(crate) fn retire_hvpatch_process_fds(&self) {
+        let files = std::mem::take(&mut *self.io.open_files.write());
+        for (fd, open_file) in files {
+            let pid = self.event_ring_guest_pid();
+            self.record_fd_close_owner(fd, pid, &open_file);
+            crate::event_ring::rec(crate::event_ring::FDCLOSE, fd, -1, 0);
+            self.close_open_file_and_free_pty(&open_file);
+            self.note_fd_closed(fd);
+        }
+    }
+
+    fn event_ring_guest_pid(&self) -> i32 {
+        self.proc
+            .lock()
+            .virtual_pid
+            .and_then(|pid| i32::try_from(pid).ok())
+            .unwrap_or_else(|| std::process::id() as i32)
+    }
+
+    /// Bind an fd-table removal to the multiplexed Linux process/thread that
+    /// performed it, plus the pre-removal logical ownership count. The
+    /// historical FDCLOSE record cannot carry this because its other fields
+    /// are already the guest/host fd pair.
+    fn record_fd_close_owner(&self, fd: i32, guest_tid: i32, open_file: &OpenFile) {
+        let guest_pid = self.event_ring_guest_pid();
+        let refs_before = open_file.description.read().fd_ref_count();
+        crate::event_ring::rec(crate::event_ring::FDOWNER, guest_pid, guest_tid, fd);
+        crate::event_ring::rec(
+            crate::event_ring::FDREF,
+            guest_pid,
+            fd,
+            i32::try_from(refs_before).unwrap_or(i32::MAX),
+        );
+    }
+
     /// Dispatch a syscall through the chained per-module routing. Returns `None`
     /// for an unclaimed number (the caller ENOSYSes); otherwise builds the
     /// transient `SyscallCtx` and invokes the resolved handler.
@@ -2944,6 +2996,66 @@ impl SyscallDispatcher {
             .vfs_mounts
             .resolve(path)
             .and_then(|m| m.vfs.read_file(path).ok())
+    }
+
+    /// Return a run-local cache key for a real host-backed executable. The
+    /// inode identity and nanosecond mutation timestamps make writes, replaces,
+    /// and overlay shadows select a fresh entry; in-memory/bind targets bypass.
+    /// This lets the default materialized host root share prepared tool images
+    /// without assuming that its writable overlay is immutable.
+    pub(crate) fn hvpatch_exec_cache_key(
+        &self,
+        path: &str,
+        vdso: bool,
+        needs_at_base: bool,
+    ) -> Option<String> {
+        if self.execution_backend != crate::page_profile::ExecutionBackend::HvPatch {
+            return None;
+        }
+        use std::os::unix::fs::MetadataExt as _;
+        let file = self.open_exec_host_file(path)?;
+        let metadata = file.metadata().ok()?;
+        Some(format!(
+            "{path}\0{}:{}:{}:{}:{}:{}:{}\0{}\0{}\0{}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.size(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+            self.linux_page_size(),
+            u8::from(vdso),
+            u8::from(needs_at_base)
+        ))
+    }
+
+    /// Get or construct one stack-independent HvPatch exec image. The lock is
+    /// intentionally held through the first construction: concurrent Go tool
+    /// launches otherwise stampede into four identical ELF reads and patch
+    /// passes. The cache is bounded because retaining prepared binaries also
+    /// retains their immutable region payloads.
+    pub(crate) fn with_hvpatch_exec_cache<E>(
+        &self,
+        key: Option<String>,
+        build: impl FnOnce() -> Result<crate::memory::AddressSpace, E>,
+    ) -> Result<crate::memory::AddressSpace, E> {
+        let Some(key) = key else {
+            return build();
+        };
+        let mut cache = self.fs.hvpatch_exec_cache.lock();
+        if let Some(image) = cache.get(&key) {
+            return Ok(image.clone());
+        }
+        let image = build()?;
+        const MAX_PREPARED_EXEC_IMAGES: usize = 16;
+        if cache.len() >= MAX_PREPARED_EXEC_IMAGES
+            && let Some(evicted) = cache.keys().next().cloned()
+        {
+            cache.remove(&evicted);
+        }
+        cache.insert(key, image.clone());
+        Ok(image)
     }
 
     /// Bounded head of [`SyscallDispatcher::read_exec_file`]: at most `max`
@@ -3569,6 +3681,7 @@ impl SyscallDispatcher {
             let description = descriptions
                 .get(file.description_id as usize)
                 .ok_or_else(|| "native reexec description id is out of range".to_owned())?;
+            retain_open_file(description);
             table.insert(
                 file.guest_fd,
                 OpenFile::new(std::sync::Arc::clone(description), file.fd_flags),
@@ -3612,31 +3725,27 @@ impl SyscallDispatcher {
     /// remove it and run close_open_file (which honours the Rc-count
     /// guard, so we don't close a host fd a sibling fd still aliases).
     pub fn close_cloexec_fds(&self) {
-        let removed: Vec<(i32, OpenFile)> = {
-            let mut table = self.io.open_files.write();
-            let cloexec_fds: Vec<i32> = table
-                .iter()
-                .filter_map(|(fd, of)| {
-                    if of.fd_flags & LINUX_FD_CLOEXEC != 0 {
-                        Some(*fd)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+        let cloexec_fds: Vec<i32> = self
+            .io
+            .open_files
+            .read()
+            .iter()
+            .filter_map(|(fd, of)| (of.fd_flags & LINUX_FD_CLOEXEC != 0).then_some(*fd))
+            .collect();
 
-            cloexec_fds
-                .into_iter()
-                .filter_map(|fd| table.remove(&fd).map(|of| (fd, of)))
-                .collect()
-        };
-
-        for (fd, open_file) in removed {
+        for fd in cloexec_fds {
+            // The fd must still be in the table while detach resolves its host
+            // identity. detach itself distinguishes same-process aliases from
+            // surviving forked-process owners of the description.
+            self.detach_fd_from_epolls(fd);
+            let Some(open_file) = self.io.open_files.write().remove(&fd) else {
+                continue;
+            };
             self.io.splice_pushback.lock().remove(&fd);
+            let pid = self.event_ring_guest_pid();
+            self.record_fd_close_owner(fd, pid, &open_file);
             self.close_open_file_and_free_pty(&open_file);
             self.note_fd_closed(fd);
-            // Linux auto-removes a closed fd from every epoll interest set.
-            self.detach_fd_from_epolls(fd);
         }
     }
 
@@ -4619,7 +4728,8 @@ fn dispatch_futex_pi(
                 return DispatchOutcome::Errno { errno };
             }
             if let Some(futex) = futex {
-                let _ = futex.wake(address, 1);
+                let woken = futex.wake(address, 1);
+                crate::event_ring::rec_futex_wake(address, woken);
             }
             DispatchOutcome::Returned { value: 0 }
         }
@@ -4770,6 +4880,7 @@ fn dispatch_threaded_futex(
                 };
             }
             let n = futex.wake(address, value);
+            crate::event_ring::rec_futex_wake(address, n);
             DispatchOutcome::Returned {
                 value: i64::from(n),
             }
@@ -5247,7 +5358,9 @@ fn fd_is_tty(open_files: &HashMap<i32, OpenFile>, fd: i32) -> bool {
 }
 
 fn retain_open_file(description: &OpenDescriptionRef) {
-    match &*description.read() {
+    let description = description.read();
+    description.retain_fd_ref();
+    match &*description {
         OpenDescription::PipeReader { pipe, .. } => {
             let mut pipe = pipe.lock();
             pipe.readers = pipe.readers.saturating_add(1);
@@ -5261,7 +5374,9 @@ fn retain_open_file(description: &OpenDescriptionRef) {
 }
 
 fn close_open_file(open_file: &OpenFile) {
-    match &*open_file.description.read() {
+    let description = open_file.description.read();
+    description.release_fd_ref();
+    match &*description {
         OpenDescription::PipeReader { pipe, .. } => {
             let mut pipe = pipe.lock();
             pipe.readers = pipe.readers.saturating_sub(1);
@@ -5272,6 +5387,11 @@ fn close_open_file(open_file: &OpenFile) {
         }
         _ => {}
     }
+}
+
+#[cfg(test)]
+fn is_last_open_file_ref(open_file: &OpenFile) -> bool {
+    open_file.description.read().fd_ref_count() == 1
 }
 
 fn linux_min_fd(value: u64) -> Result<i32, LinuxErrno> {
@@ -10128,6 +10248,12 @@ mod overlay_dispatch_tests {
 
         assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
         assert_eq!(memory.shared_futex_lookups.get(), 0);
+        assert!(crate::event_ring::contains_event(
+            crate::event_ring::FUTEXWAKE,
+            0x10800,
+            0,
+            0
+        ));
     }
 
     #[test]
@@ -10716,6 +10842,223 @@ mod hvpatch_in_process_fork_tests {
         assert!(parent.io.open_files.read().contains_key(&3));
         assert_eq!(parent.io.cwd.read().as_str(), "/parent");
         assert_eq!(parent.mem.lock().brk_current, 0x1234_0000);
+    }
+
+    #[test]
+    fn hvpatch_process_exit_drops_inherited_host_pipe_writer() {
+        let mut host_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(host_fds.as_mut_ptr()) }, 0);
+        let read_host_fd = host_fds[0];
+        let write_host_fd = host_fds[1];
+
+        let parent = SyscallDispatcher::new();
+        parent.io.open_files.write().insert(
+            3,
+            OpenFile::new(
+                Arc::new(RwLock::new(OpenDescription::HostPipe {
+                    host_fd: HostFdRef::new(read_host_fd),
+                    is_read_end: true,
+                    pipe_id: 1,
+                    base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
+                    pty: None,
+                    bidirectional: false,
+                    write_kind: HostWriteKind::PipeLike,
+                })),
+                0,
+            ),
+        );
+        parent.io.open_files.write().insert(
+            4,
+            OpenFile::new(
+                Arc::new(RwLock::new(OpenDescription::HostPipe {
+                    host_fd: HostFdRef::new(write_host_fd),
+                    is_read_end: false,
+                    pipe_id: 1,
+                    base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_WRONLY),
+                    pty: None,
+                    bidirectional: false,
+                    write_kind: HostWriteKind::PipeLike,
+                })),
+                0,
+            ),
+        );
+        for open_file in parent.io.open_files.read().values() {
+            retain_open_file(&open_file.description);
+        }
+
+        let parent_tid = crate::thread::ThreadId::synthetic_for_tests(5100);
+        let child_tid = crate::thread::ThreadId::synthetic_for_tests(5101);
+        let child = parent.fork_clone_in_process(parent_tid, child_tid, 51, 52);
+        let parent_writer = parent.io.open_files.write().remove(&4).unwrap();
+        parent.close_open_file_and_free_pty(&parent_writer);
+        drop(parent_writer);
+
+        let mut pollfd = libc::pollfd {
+            fd: read_host_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 0);
+
+        child.retire_hvpatch_process_fds();
+
+        pollfd.revents = 0;
+        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 1);
+        assert_ne!(pollfd.revents & libc::POLLHUP, 0);
+    }
+
+    #[test]
+    fn hvpatch_inherited_fd_close_is_not_the_last_logical_reference() {
+        let dispatcher = SyscallDispatcher::new();
+        let description = Arc::new(RwLock::new(OpenDescription::SyntheticFile {
+            base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
+            path: "epoll-inherited-owner".to_owned(),
+            contents: Vec::new(),
+            offset: 0,
+        }));
+        let fd = dispatcher
+            .install_fd_at_or_above(3, OpenFile::new(Arc::clone(&description), 0))
+            .unwrap();
+        let parent_tid = crate::thread::ThreadId::synthetic_for_tests(5200);
+        let child_tid = crate::thread::ThreadId::synthetic_for_tests(5201);
+        let child = dispatcher.fork_clone_in_process(parent_tid, child_tid, 61, 62);
+
+        let child_file = child.open_file(fd).unwrap();
+        assert_eq!(description.read().fd_ref_count(), 2);
+        assert!(!is_last_open_file_ref(&child_file));
+
+        let child_file = child.io.open_files.write().remove(&fd).unwrap();
+        child.close_open_file_and_free_pty(&child_file);
+        assert_eq!(description.read().fd_ref_count(), 1);
+        let parent_file = dispatcher.open_file(fd).unwrap();
+        assert!(is_last_open_file_ref(&parent_file));
+    }
+
+    /// Linux epoll registrations attach to the monitored open-file
+    /// description, not to one process's numeric fd slot.  After fork the
+    /// parent and child share both descriptions.  If the child replaces its
+    /// inherited monitored slot with dup3(), the parent's registration must
+    /// survive until the parent's reference to the original description is
+    /// closed.
+    ///
+    /// This is the reduced form of the HvPatch Go os/exec hang: the child fd
+    /// shuffle replaced an inherited pipe slot and Carrick detached the shared
+    /// epoll interest by guest-fd number after installing the replacement.
+    #[cfg(unix)]
+    #[test]
+    fn hvpatch_child_dup3_does_not_detach_parent_epoll_interest() {
+        const MEM_BASE: u64 = 0x5200_0000;
+        const MEM_LEN: usize = 0x1000;
+        const EPOLLIN: u32 = 0x1;
+        const EPOLLET: u32 = 0x8000_0000;
+
+        let parent = SyscallDispatcher::new();
+        let reporter = crate::compat::CompatReporter::default();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(5300));
+        let futex = crate::thread::FutexTable::new();
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0; MEM_LEN]);
+        let tid = crate::thread::ThreadId::synthetic_for_tests(5301);
+
+        macro_rules! call {
+            ($dispatcher:expr, $number:expr, $args:expr $(,)?) => {
+                $dispatcher
+                    .dispatch_threaded(
+                        SyscallRequest::new($number, SyscallArgs::from($args)),
+                        &mut memory,
+                        &reporter,
+                        tid,
+                        &registry,
+                        &futex,
+                    )
+                    .expect("dispatch")
+            };
+        }
+
+        let epfd = match call!(&parent, 20, [0; 6]) {
+            DispatchOutcome::Returned { value } => value as i32,
+            other => panic!("epoll_create1 failed: {other:?}"),
+        };
+        let pipe_addr = MEM_BASE + 0x100;
+        assert_eq!(
+            call!(&parent, 59, [pipe_addr, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let pipe_fds = memory.read_bytes(pipe_addr, 8).unwrap();
+        let read_fd = i32::from_le_bytes(pipe_fds[0..4].try_into().unwrap());
+        let write_fd = i32::from_le_bytes(pipe_fds[4..8].try_into().unwrap());
+
+        let event_addr = MEM_BASE + 0x120;
+        let mut event = [0u8; 16];
+        event[0..4].copy_from_slice(&(EPOLLIN | EPOLLET).to_le_bytes());
+        event[8..16].copy_from_slice(&0xfeed_face_u64.to_le_bytes());
+        memory.write_bytes(event_addr, &event).unwrap();
+        assert_eq!(
+            call!(
+                &parent,
+                21,
+                [epfd as u64, 1, read_fd as u64, event_addr, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 }
+        );
+
+        let child = parent.fork_clone_in_process(
+            crate::thread::ThreadId::synthetic_for_tests(5301),
+            crate::thread::ThreadId::synthetic_for_tests(5302),
+            71,
+            72,
+        );
+        assert_eq!(
+            call!(&child, 24, [write_fd as u64, read_fd as u64, 0, 0, 0, 0],),
+            DispatchOutcome::Returned {
+                value: read_fd as i64
+            }
+        );
+
+        // Make `read_fd` name a child-only description, then close its final
+        // logical reference. Numeric-only auto-detach used to remove the
+        // parent's registration here even though the registered description
+        // and the closing description are unrelated.
+        let child_pipe_addr = MEM_BASE + 0x180;
+        assert_eq!(
+            call!(&child, 59, [child_pipe_addr, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let child_pipe_fds = memory.read_bytes(child_pipe_addr, 8).unwrap();
+        let child_read_fd = i32::from_le_bytes(child_pipe_fds[0..4].try_into().unwrap());
+        let child_write_fd = i32::from_le_bytes(child_pipe_fds[4..8].try_into().unwrap());
+        assert_eq!(
+            call!(
+                &child,
+                24,
+                [child_write_fd as u64, read_fd as u64, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned {
+                value: read_fd as i64
+            }
+        );
+        assert_eq!(
+            call!(&child, 57, [child_read_fd as u64, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(
+            call!(&child, 57, [child_write_fd as u64, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(
+            call!(&child, 57, [read_fd as u64, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+
+        let epoll = parent.open_file(epfd).expect("parent epoll fd");
+        let epoll = epoll.description.read();
+        let OpenDescription::Epoll { interest, .. } = &*epoll else {
+            panic!("epoll fd changed description kind");
+        };
+        assert!(
+            interest.contains_key(&read_fd),
+            "child dup3 detached the parent's inherited epoll registration"
+        );
     }
 }
 
