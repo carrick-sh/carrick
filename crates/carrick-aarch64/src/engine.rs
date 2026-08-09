@@ -1209,6 +1209,10 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // path even after it execve's into a different image. The flag is a plain
         // field on `self`, untouched by the remap.
         self.vm.execve_rebuild(&mut self.vcpu, new_image)?;
+        // `execve_rebuild` installed a fresh table image. Drop the manager for
+        // the old image before the hvpatch ASID configuration reserves its
+        // private-bank aperture in the NEW tables.
+        self.page_tables = Arc::new(Mutex::new(None));
         if let Some(asid) = self.process_asid {
             <Self as ThreadedEngine>::configure_process_asid(self, asid)?;
         }
@@ -1217,12 +1221,6 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         self.last_syscall_nr = None;
         self.last_syscall_orig_x0 = 0;
         self.last_fault_esr = 0;
-        // `execve_rebuild` wrote fresh `stage1_identity_page_tables` into the new
-        // RAM, so the old page-table editor is stale — drop it so the next edit
-        // rebuilds from the new image's tables. (execve replaces the whole address
-        // space; Linux has already torn down sibling threads, so the shared Arc is
-        // moot here.)
-        self.page_tables = Arc::new(Mutex::new(None));
         Ok(())
     }
 
@@ -1410,6 +1408,15 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         }
         const TCR_AS: u64 = 1 << 36;
         const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
+        let bank_len = usize::try_from(carrick_mem::memory::LINUX_PROCESS_BANK_SIZE)
+            .map_err(|_| TrapError::Hypervisor("hvpatch process-bank size overflow".to_owned()))?;
+        self.pt_edit_and_flush(|manager| {
+            manager.invalidate(carrick_mem::memory::LINUX_PROCESS_BANK_BASE, bank_len)
+        })
+        .map_err(|error| {
+            TrapError::Hypervisor(format!("reserve hvpatch process-bank aperture: {error}"))
+        })?;
+        self.set_unmapped(carrick_mem::memory::LINUX_PROCESS_BANK_BASE, bank_len, true);
         let tcr = self.vcpu.get_sys_reg(SysReg::Tcr)?;
         let root = self.vcpu.get_sys_reg(SysReg::Ttbr0)? & TTBR_ROOT_MASK;
         let ttbr = (u64::from(asid) << 48) | root;
