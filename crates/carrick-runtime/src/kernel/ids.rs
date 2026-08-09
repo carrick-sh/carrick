@@ -48,6 +48,41 @@ linux_i32_id!(LinuxTid);
 linux_i32_id!(ProcessGroupId);
 linux_i32_id!(SessionId);
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct FileSlotNumber(i32);
+
+impl FileSlotNumber {
+    pub fn for_open_fd(raw: i32) -> Result<Self, InvalidFileSlot> {
+        if raw < 0 {
+            return Err(InvalidFileSlot(raw));
+        }
+        Ok(Self(raw))
+    }
+
+    pub const fn raw(self) -> i32 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct LinuxSignal(NonZeroI32);
+
+impl LinuxSignal {
+    pub fn for_signal_number(raw: i32) -> Result<Self, InvalidLinuxSignal> {
+        let value = NonZeroI32::new(raw).ok_or(InvalidLinuxSignal::OutOfRange(raw))?;
+        if !(1..=64).contains(&raw) {
+            return Err(InvalidLinuxSignal::OutOfRange(raw));
+        }
+        Ok(Self(value))
+    }
+
+    pub const fn raw(self) -> i32 {
+        self.0.get()
+    }
+}
+
 serial_id!(TaskSerial);
 serial_id!(ThreadSerial);
 serial_id!(MmId);
@@ -97,6 +132,16 @@ pub enum InvalidLinuxId {
     #[error("Linux identity {0} is negative")]
     Negative(i32),
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum InvalidLinuxSignal {
+    #[error("Linux signal number {0} is outside 1..=64")]
+    OutOfRange(i32),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("file slot {0} is negative")]
+pub struct InvalidFileSlot(i32);
 
 /// Monotonic source for object identities that are never reused by one kernel.
 #[derive(Debug)]
@@ -187,6 +232,11 @@ mod tests {
             LinuxTid::from_abi_positive(-2),
             Err(InvalidLinuxId::Negative(-2))
         );
+        assert_eq!(
+            LinuxSignal::for_signal_number(65),
+            Err(InvalidLinuxSignal::OutOfRange(65))
+        );
+        assert_eq!(FileSlotNumber::for_open_fd(-1), Err(InvalidFileSlot(-1)));
     }
 
     #[test]

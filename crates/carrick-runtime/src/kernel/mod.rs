@@ -6,6 +6,7 @@
 pub mod address;
 pub mod clone_plan;
 pub mod core;
+pub mod exec;
 pub mod ids;
 pub mod objects;
 pub mod operations;
@@ -17,15 +18,18 @@ pub use core::{
     Kernel, KernelContext, KernelError, Registry, RegistryInvariantError, RootBootstrap,
     TaskRevision,
 };
+pub use exec::{ExecError, PreparedExec};
 pub use ids::{
-    FileDescriptionId, FileTableId, FsContextId, LinuxTid, MmId, ObjectIdError, ObjectIdRegistry,
+    FileDescriptionId, FileSlotNumber, FileTableId, FsContextId, InvalidFileSlot,
+    InvalidLinuxSignal, LinuxSignal, LinuxTid, MmId, ObjectIdError, ObjectIdRegistry,
     ProcessGroupId, SessionId, SighandId, TaskId, TaskSerial, ThreadSerial,
 };
 pub use objects::{
-    Credentials, FileDescription, FileTable, FsContext, LinuxWaitStatus, Mm, ObjectGraphError,
-    PidfdTarget, ProcessGroup, Session, Sighand, Task, TaskKey, TaskLifecycle, TaskPendingSignals,
-    TaskRef, TaskRusage, TaskShared, TaskSharedCloneError, Thread, ThreadKey, ThreadRef,
-    ThreadResources, Zombie,
+    Credentials, FileDescription, FileSlot, FileTable, FsContext, LinuxWaitStatus, Mm,
+    ObjectGraphError, PidfdTarget, ProcessGroup, RunnerDirective, Session, Sighand,
+    SignalDisposition, Task, TaskKey, TaskLifecycle, TaskPendingSignals, TaskRef, TaskRusage,
+    TaskShared, TaskSharedCloneError, Thread, ThreadKey, ThreadRef, ThreadResources, ThreadRunner,
+    ThreadSignalState, Zombie,
 };
 pub use operations::{
     KernelFailpoint, KernelOperationError, TaskOperationReservation, WaitMode, WaitOutcome,
