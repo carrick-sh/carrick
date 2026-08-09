@@ -2165,6 +2165,10 @@ pub struct SyscallDispatcher {
     /// Linux/host page geometry selected for this run. Default dispatch stays
     /// 4 KiB Linux pages; native-only lanes can override before first syscall.
     page_geometry: crate::page_profile::PageGeometry,
+    /// Backend selected for this process. In addition to signal-wake routing,
+    /// execve staging consults this to preserve backend-specific image policy
+    /// (HvPatch must repatch replacement text before internal HVF pages exist).
+    execution_backend: crate::page_profile::ExecutionBackend,
     /// The supplementary group set installed by `setgroups(2)`, or `None` if the
     /// guest never called it (then `getgroups` falls back to the /etc/group-
     /// derived membership for `id(1)` compatibility). `setgroups` replaces this
@@ -2465,6 +2469,7 @@ impl SyscallDispatcher {
                 linux_page_size: crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
                 native_profile: None,
             },
+            execution_backend: crate::page_profile::ExecutionBackend::Vmm,
             setgroups_override: Mutex::new(None),
             signal_pump_requested: std::sync::atomic::AtomicBool::new(false),
             async_signal_wake_owner: AsyncSignalWakeOwner::SignalPump,
@@ -2573,11 +2578,16 @@ impl SyscallDispatcher {
     }
 
     pub(crate) fn set_execution_backend(&mut self, backend: crate::page_profile::ExecutionBackend) {
+        self.execution_backend = backend;
         self.async_signal_wake_owner = match backend {
             crate::page_profile::ExecutionBackend::Vmm
             | crate::page_profile::ExecutionBackend::HvPatch => AsyncSignalWakeOwner::SignalPump,
             crate::page_profile::ExecutionBackend::Native => AsyncSignalWakeOwner::NativeDirect,
         };
+    }
+
+    pub(crate) fn execution_backend(&self) -> crate::page_profile::ExecutionBackend {
+        self.execution_backend
     }
 
     pub(crate) fn async_signal_wake_owner(&self) -> AsyncSignalWakeOwner {

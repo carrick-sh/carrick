@@ -88,6 +88,11 @@ pub(crate) fn load_execve_image(
     if needs_at_base {
         staged = staged.with_auxv_base(ROSETTA_AT_BASE_PLACEHOLDER);
     }
+    // HvPatch text must be rewritten BEFORE the executable EL0 trampoline and
+    // EL1 vector pages are added; scanning after this point could rewrite
+    // Carrick's own trap machinery. VMM returns the image byte-identically.
+    let staged = crate::hvpatch::prepare_exec_image_for_dispatcher(staged, dispatcher)
+        .map_err(|_| LINUX_ENOEXEC)?;
     // Per-ISA trampoline/vDSO bytes come from the engine's GuestArch (the
     // x86_64 seam); this is the macOS/HVF execve staging path.
     use carrick_hal::GuestArch as _;
