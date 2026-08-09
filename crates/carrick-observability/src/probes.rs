@@ -770,6 +770,127 @@ impl HvpatchTopologyLock {
     }
 }
 
+/// Mutually exclusive parent-thread stages inside the in-process-fork
+/// topology-lock hold. Ordinals are append-only DTrace ABI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchForkRuntimeStagePhase {
+    Quiesce = 0,
+    ProcessAllocate = 1,
+    PidfdParent = 2,
+    ProcessSpec = 3,
+    DispatcherClone = 4,
+    RuntimeState = 5,
+    ThreadSpawn = 6,
+    ChildReady = 7,
+    Publication = 8,
+    /// Cumulative parent-thread critical-section time. This encloses phases
+    /// 0..=8 and must not be summed with them as a peer stage.
+    Total = 9,
+}
+
+impl HvpatchForkRuntimeStagePhase {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Typed source record for `hvpatch-fork-runtime-stage`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchForkRuntimeStage {
+    phase: HvpatchForkRuntimeStagePhase,
+    parent_pid: i32,
+    child_pid: i32,
+    forking_tid: i32,
+    elapsed_ns: u64,
+}
+
+impl HvpatchForkRuntimeStage {
+    pub const fn new(
+        phase: HvpatchForkRuntimeStagePhase,
+        parent_pid: i32,
+        child_pid: i32,
+        forking_tid: i32,
+        elapsed_ns: u64,
+    ) -> Self {
+        Self {
+            phase,
+            parent_pid,
+            child_pid,
+            forking_tid,
+            elapsed_ns,
+        }
+    }
+
+    pub const fn phase(self) -> HvpatchForkRuntimeStagePhase {
+        self.phase
+    }
+
+    pub const fn parent_pid(self) -> i32 {
+        self.parent_pid
+    }
+
+    pub const fn child_pid(self) -> i32 {
+        self.child_pid
+    }
+
+    pub const fn forking_tid(self) -> i32 {
+        self.forking_tid
+    }
+
+    pub const fn elapsed_ns(self) -> u64 {
+        self.elapsed_ns
+    }
+}
+
+/// Typed source record for `hvpatch-fork-quiesce`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchForkQuiesce {
+    parent_pid: i32,
+    forking_tid: i32,
+    initial_siblings: u32,
+    poll_iterations: u64,
+    elapsed_ns: u64,
+}
+
+impl HvpatchForkQuiesce {
+    pub const fn new(
+        parent_pid: i32,
+        forking_tid: i32,
+        initial_siblings: u32,
+        poll_iterations: u64,
+        elapsed_ns: u64,
+    ) -> Self {
+        Self {
+            parent_pid,
+            forking_tid,
+            initial_siblings,
+            poll_iterations,
+            elapsed_ns,
+        }
+    }
+
+    pub const fn parent_pid(self) -> i32 {
+        self.parent_pid
+    }
+
+    pub const fn forking_tid(self) -> i32 {
+        self.forking_tid
+    }
+
+    pub const fn initial_siblings(self) -> u32 {
+        self.initial_siblings
+    }
+
+    pub const fn poll_iterations(self) -> u64 {
+        self.poll_iterations
+    }
+
+    pub const fn elapsed_ns(self) -> u64 {
+        self.elapsed_ns
+    }
+}
+
 impl HvpatchExecStage2 {
     pub const fn new(
         phase: HvpatchExecStage2Phase,
@@ -1166,6 +1287,62 @@ mod hvpatch_guest_probe_abi {
             assert!(
                 source.matches(declaration).count() >= 2,
                 "missing topology-lock ABI declaration {declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn fork_runtime_stage_event_keeps_parent_child_identity_and_timing_typed() {
+        let event = HvpatchForkRuntimeStage::new(
+            HvpatchForkRuntimeStagePhase::ChildReady,
+            41,
+            42,
+            43,
+            1_750_000,
+        );
+        assert_eq!(HvpatchForkRuntimeStagePhase::Quiesce.raw(), 0);
+        assert_eq!(HvpatchForkRuntimeStagePhase::ProcessAllocate.raw(), 1);
+        assert_eq!(HvpatchForkRuntimeStagePhase::PidfdParent.raw(), 2);
+        assert_eq!(HvpatchForkRuntimeStagePhase::ProcessSpec.raw(), 3);
+        assert_eq!(HvpatchForkRuntimeStagePhase::DispatcherClone.raw(), 4);
+        assert_eq!(HvpatchForkRuntimeStagePhase::RuntimeState.raw(), 5);
+        assert_eq!(HvpatchForkRuntimeStagePhase::ThreadSpawn.raw(), 6);
+        assert_eq!(HvpatchForkRuntimeStagePhase::ChildReady.raw(), 7);
+        assert_eq!(HvpatchForkRuntimeStagePhase::Publication.raw(), 8);
+        assert_eq!(HvpatchForkRuntimeStagePhase::Total.raw(), 9);
+        assert_eq!(event.phase(), HvpatchForkRuntimeStagePhase::ChildReady);
+        assert_eq!(event.parent_pid(), 41);
+        assert_eq!(event.child_pid(), 42);
+        assert_eq!(event.forking_tid(), 43);
+        assert_eq!(event.elapsed_ns(), 1_750_000);
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn hvpatch__fork__runtime__stage(_: u32, _: i32, _: i32, _: i32, _: u64) {}",
+            "stub!(hvpatch_fork_runtime_stage(event: super::HvpatchForkRuntimeStage));",
+        ] {
+            assert!(
+                source.matches(declaration).count() >= 2,
+                "missing fork runtime-stage ABI declaration {declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn fork_quiesce_detail_keeps_guest_identity_population_and_polling_typed() {
+        let event = HvpatchForkQuiesce::new(41, 43, 7, 12, 2_500_000);
+        assert_eq!(event.parent_pid(), 41);
+        assert_eq!(event.forking_tid(), 43);
+        assert_eq!(event.initial_siblings(), 7);
+        assert_eq!(event.poll_iterations(), 12);
+        assert_eq!(event.elapsed_ns(), 2_500_000);
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn hvpatch__fork__quiesce(_: i32, _: i32, _: u32, _: u64, _: u64) {}",
+            "stub!(hvpatch_fork_quiesce(event: super::HvpatchForkQuiesce));",
+        ] {
+            assert!(
+                source.matches(declaration).count() >= 2,
+                "missing fork-quiesce ABI declaration {declaration}"
             );
         }
     }
@@ -2969,6 +3146,17 @@ mod real {
         /// (0=requested, 1=acquired, 2=released, 3=try miss), Linux guest PID,
         /// Linux guest TID, and wait/hold elapsed nanoseconds.
         fn hvpatch__topology__lock(_: u32, _: u32, _: i32, _: i32, _: u64) {}
+        /// Parent-thread stages inside one in-process-fork topology critical
+        /// section. Args: phase (0=quiesce, 1=process allocation, 2=pidfd and
+        /// parent-TID publication, 3=process spec, 4=dispatcher clone,
+        /// 5=runtime state, 6=thread spawn, 7=child ready, 8=publication,
+        /// 9=cumulative total enclosing phases 0..=8), parent PID, child PID
+        /// (zero before allocation), forking TID, elapsed nanoseconds.
+        fn hvpatch__fork__runtime__stage(_: u32, _: i32, _: i32, _: i32, _: u64) {}
+        /// One in-process-fork sibling-quiesce result. Args: parent PID,
+        /// forking TID, initial sibling-vCPU count, 200-us poll iterations, and
+        /// elapsed nanoseconds.
+        fn hvpatch__fork__quiesce(_: i32, _: i32, _: u32, _: u64, _: u64) {}
         /// Fires every syscall trap. `arg0` is the ADDRESS of a
         /// `compat::GuestRegs` (`#[repr(C)]`); DTrace does
         /// `copyin(arg0, sizeof(gregs_t))` and reads fields by offset. A
@@ -3887,6 +4075,28 @@ mod real {
             event.phase().raw(),
             event.guest_pid(),
             event.guest_tid(),
+            event.elapsed_ns()
+        ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_fork_runtime_stage(event: super::HvpatchForkRuntimeStage) {
+        carrick_usdt::hvpatch__fork__runtime__stage!(|| (
+            event.phase().raw(),
+            event.parent_pid(),
+            event.child_pid(),
+            event.forking_tid(),
+            event.elapsed_ns()
+        ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_fork_quiesce(event: super::HvpatchForkQuiesce) {
+        carrick_usdt::hvpatch__fork__quiesce!(|| (
+            event.parent_pid(),
+            event.forking_tid(),
+            event.initial_siblings(),
+            event.poll_iterations(),
             event.elapsed_ns()
         ));
     }
@@ -5278,6 +5488,8 @@ mod stub {
     stub!(hvpatch_exec_replace_stage(event: super::HvpatchExecReplaceStage));
     stub!(hvpatch_exec_runtime_stage(event: super::HvpatchExecRuntimeStage));
     stub!(hvpatch_topology_lock(event: super::HvpatchTopologyLock));
+    stub!(hvpatch_fork_runtime_stage(event: super::HvpatchForkRuntimeStage));
+    stub!(hvpatch_fork_quiesce(event: super::HvpatchForkQuiesce));
     stub!(vm_lifecycle(operation: u32, admission: i32));
     stub!(execve_argv(path: &str, argv: &[Vec<u8>]));
     stub!(host_image_base());
