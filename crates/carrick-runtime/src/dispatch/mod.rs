@@ -2396,6 +2396,40 @@ fn resolve_handler<M: GuestMemory>(number: u64) -> Option<SyscallHandler<M>> {
 }
 
 impl SyscallDispatcher {
+    /// Clone process-private dispatcher state for an hvpatch in-process fork.
+    /// Shared kernel objects (open descriptions, filesystem namespace, network)
+    /// stay shared; fd numbers, signals, credentials, memory metadata, and
+    /// process controls become independent child state.
+    #[allow(dead_code)]
+    pub(crate) fn fork_clone_in_process(
+        &self,
+        parent_tid: crate::thread::ThreadId,
+        child_tid: crate::thread::ThreadId,
+        parent_guest_pid: u32,
+    ) -> Self {
+        Self {
+            io: self.io.fork_clone(),
+            mem: Mutex::new(self.mem.lock().clone()),
+            host_alias_transactions: Arc::new(HostAliasTransactions::new()),
+            proc: Mutex::new(self.proc.lock().fork_clone(parent_guest_pid)),
+            creds: Mutex::new(*self.creds.lock()),
+            signal: Mutex::new(self.signal.lock().fork_clone(parent_tid, child_tid)),
+            signal_tid_pending_hint: std::sync::atomic::AtomicU64::new(0),
+            signal_process_pending_hint: std::sync::atomic::AtomicU64::new(0),
+            fs: self.fs.fork_clone(),
+            seccomp: self.seccomp.fork_clone(),
+            container_policy: self.container_policy.clone(),
+            sysv: Mutex::new(self.sysv.lock().fork_clone()),
+            network: Arc::clone(&self.network),
+            page_geometry: self.page_geometry,
+            execution_backend: self.execution_backend,
+            setgroups_override: Mutex::new(self.setgroups_override.lock().clone()),
+            signal_pump_requested: std::sync::atomic::AtomicBool::new(false),
+            async_signal_wake_owner: self.async_signal_wake_owner,
+            exec_host_fs_fallback: self.exec_host_fs_fallback,
+        }
+    }
+
     /// Dispatch a syscall through the chained per-module routing. Returns `None`
     /// for an unclaimed number (the caller ENOSYSes); otherwise builds the
     /// transient `SyscallCtx` and invokes the resolved handler.
@@ -2549,7 +2583,7 @@ impl SyscallDispatcher {
     pub fn with_network(network: std::sync::Arc<crate::network::RuntimeNetwork>) -> Self {
         let mut dispatcher = Self::new();
         if network.spec.mode != carrick_spec::NetworkMode::Host {
-            dispatcher.fs.vfs_mounts.mount(
+            dispatcher.fs.vfs_mounts_mut().mount(
                 "/sys",
                 Box::new(crate::vfs::SysVfs::from_network_model(
                     network.model.clone(),
@@ -2558,7 +2592,7 @@ impl SyscallDispatcher {
         }
         if should_mount_network_resolv_conf(&network.model) {
             let contents = resolv_conf_contents_for_network(&network.model);
-            dispatcher.fs.vfs_mounts.mount(
+            dispatcher.fs.vfs_mounts_mut().mount(
                 "/etc/resolv.conf",
                 Box::new(crate::vfs::ResolvConfVfs::from_contents(contents)),
             );
@@ -2666,7 +2700,7 @@ impl SyscallDispatcher {
 
     pub fn with_rootfs(rootfs: RootFs) -> Self {
         let mut s = Self::new();
-        s.fs.rootfs_vfs.rootfs = Some(rootfs);
+        s.fs.rootfs_vfs_mut().rootfs = Some(rootfs);
         // A rootfs means a sandboxed container filesystem: no host-fs execve escape.
         s.exec_host_fs_fallback = false;
         s
@@ -2674,7 +2708,7 @@ impl SyscallDispatcher {
 
     pub fn with_rootfs_and_executable(rootfs: RootFs, executable_path: impl Into<String>) -> Self {
         let mut s = Self::new();
-        s.fs.rootfs_vfs.rootfs = Some(rootfs);
+        s.fs.rootfs_vfs_mut().rootfs = Some(rootfs);
         s.exec_host_fs_fallback = false;
         s.set_executable_path(executable_path);
         s
@@ -2701,14 +2735,14 @@ impl SyscallDispatcher {
     /// directory. Returns the previously-installed backend so the
     /// caller can decide what to do with it (normally just drop).
     pub fn set_fs_backend(&mut self, backend: Box<dyn FsBackend>) -> Box<dyn FsBackend> {
-        self.fs.rootfs_vfs.set_overlay(backend)
+        self.fs.rootfs_vfs_mut().set_overlay(backend)
     }
 
     /// Install an immutable lower beneath the current writable backend. Used
     /// by Darwin's cached-rootfs setup, which constructs the network-aware
     /// dispatcher before the layer cache is acquired.
     pub fn set_rootfs_layer(&mut self, rootfs: RootFs) {
-        self.fs.rootfs_vfs.rootfs = Some(rootfs);
+        self.fs.rootfs_vfs_mut().rootfs = Some(rootfs);
         self.exec_host_fs_fallback = false;
     }
 
@@ -2721,7 +2755,7 @@ impl SyscallDispatcher {
     /// only" when the rootfs is `None`. Never call this for `--fs memory`,
     /// whose overlay starts empty and relies on the rootfs for reads.
     pub fn drop_rootfs_layer(&mut self) {
-        self.fs.rootfs_vfs.rootfs = None;
+        self.fs.rootfs_vfs_mut().rootfs = None;
     }
 
     /// Set the executable path recorded in `/proc/self/cmdline`,
@@ -10612,6 +10646,61 @@ mod rosetta_handshake_tests {
                 errno: LINUX_EFAULT
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod hvpatch_in_process_fork_tests {
+    use super::*;
+
+    #[test]
+    fn dispatcher_fork_clone_splits_process_state_without_duping_descriptions() {
+        let parent_tid = crate::thread::ThreadId::synthetic_for_tests(4100);
+        let child_tid = crate::thread::ThreadId::synthetic_for_tests(4101);
+        let parent = SyscallDispatcher::new();
+        let description = Arc::new(RwLock::new(OpenDescription::SyntheticFile {
+            base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
+            path: "/fork-clone".to_owned(),
+            contents: b"payload".to_vec(),
+            offset: 2,
+        }));
+        parent.io.open_files.write().insert(
+            3,
+            OpenFile::new(Arc::clone(&description), crate::linux_abi::LINUX_FD_CLOEXEC),
+        );
+        *parent.io.cwd.write() = "/parent".to_owned();
+        parent
+            .signal
+            .lock()
+            .masks
+            .insert(parent_tid, carrick_abi::SigSet::EMPTY.with(12));
+        parent
+            .signal
+            .lock()
+            .pendings
+            .insert(parent_tid, carrick_abi::SigSet::EMPTY.with(15));
+        parent.proc.lock().pdeathsig = 9;
+        parent.proc.lock().membarrier_ready = u64::MAX;
+        parent.mem.lock().brk_current = 0x1234_0000;
+
+        let child = parent.fork_clone_in_process(parent_tid, child_tid, 41);
+
+        let child_file = child.io.open_files.read().get(&3).cloned().unwrap();
+        assert!(Arc::ptr_eq(&description, &child_file.description));
+        assert_eq!(child_file.fd_flags, crate::linux_abi::LINUX_FD_CLOEXEC);
+        assert_eq!(child.io.cwd.read().as_str(), "/parent");
+        assert_eq!(child.signal_mask_for(child_tid).raw(), 1 << 11);
+        assert!(child.signal.lock().pendings.is_empty());
+        assert_eq!(child.proc.lock().pdeathsig, 0);
+        assert_eq!(child.proc.lock().membarrier_ready, 0);
+        assert_eq!(child.mem.lock().brk_current, 0x1234_0000);
+
+        child.io.open_files.write().remove(&3);
+        *child.io.cwd.write() = "/child".to_owned();
+        child.mem.lock().brk_current = 0x5678_0000;
+        assert!(parent.io.open_files.read().contains_key(&3));
+        assert_eq!(parent.io.cwd.read().as_str(), "/parent");
+        assert_eq!(parent.mem.lock().brk_current, 0x1234_0000);
     }
 }
 

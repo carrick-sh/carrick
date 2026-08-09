@@ -58,13 +58,13 @@ impl LegacyAioContextId {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(in crate::dispatch) struct SplicePushback {
     chunks: VecDeque<SplicePushbackChunk>,
     len: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct SplicePushbackChunk {
     bytes: Vec<u8>,
     offset: usize,
@@ -160,13 +160,13 @@ pub(in crate::dispatch) struct FsState {
     /// path no mount claims (or that a mount returns ENOSYS for)
     /// falls through to the legacy code path, which reads the rootfs +
     /// overlay from [`Self::rootfs_vfs`].
-    pub vfs_mounts: crate::vfs::VfsMounts,
+    pub vfs_mounts: std::sync::Arc<crate::vfs::VfsMounts>,
 
     /// The `/` mount: immutable OCI rootfs + writable overlay
     /// ([`FsBackend`]). Held as a typed field rather than mounted in
     /// `vfs_mounts` because the dispatcher's existing fs syscalls reach
     /// into the overlay/rootfs state through ~50 call sites today.
-    pub rootfs_vfs: crate::vfs::RootFsVfs,
+    pub rootfs_vfs: std::sync::Arc<crate::vfs::RootFsVfs>,
 
     /// Shared pseudo-terminal table, also cloned into the /dev (ptmx) and
     /// /dev/pts mounts. The ioctl (TIOCSPTLCK) and close (free-on-master-
@@ -303,6 +303,47 @@ impl IoState {
             epoll_wake_registry: crate::dispatch::new_epoll_wake_registry(),
         }
     }
+
+    /// Clone the Linux fd namespace for an in-process fork. Guest fd numbers
+    /// and descriptor flags become independent, while every `OpenFile` keeps
+    /// the same `Arc<OpenDescription>` so offsets/status flags retain Linux's
+    /// shared-open-file-description semantics.
+    pub(in crate::dispatch) fn fork_clone(&self) -> Self {
+        let open_files = self.open_files.read().clone();
+        for file in open_files.values() {
+            retain_open_file(&file.description);
+        }
+        let epoll_wake_registry = crate::dispatch::new_epoll_wake_registry();
+        for file in open_files.values() {
+            if let OpenDescription::Epoll { kqueue, .. } = &*file.description.read() {
+                crate::dispatch::register_epoll_kqueue(&epoll_wake_registry, kqueue.wake_fd);
+            }
+        }
+        Self {
+            // The host-fork child clears inherited buffered output before it
+            // resumes. An in-process child starts with the same clean boundary.
+            stdout: Mutex::new(Vec::new()),
+            stderr: Mutex::new(Vec::new()),
+            stream_stdio: Mutex::new(*self.stream_stdio.lock()),
+            open_files: RwLock::new(open_files),
+            next_fd: Mutex::new(*self.next_fd.lock()),
+            cwd: RwLock::new(self.cwd.read().clone()),
+            chroot_root: RwLock::new(self.chroot_root.read().clone()),
+            stdio_cloexec: Mutex::new(*self.stdio_cloexec.lock()),
+            closed_stdio: Mutex::new(*self.closed_stdio.lock()),
+            fd_open_paths: RwLock::new(self.fd_open_paths.read().clone()),
+            splice_pushback: Mutex::new(self.splice_pushback.lock().clone()),
+            io_uring_instances: RwLock::new(self.io_uring_instances.read().clone()),
+            // Linux AIO contexts are not inherited by fork children.
+            legacy_aio_contexts: RwLock::new(std::collections::BTreeSet::new()),
+            next_legacy_aio_context: AtomicU64::new(1),
+            nofile_soft: AtomicU64::new(
+                self.nofile_soft.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            epoll_fds: RwLock::new(self.epoll_fds.read().clone()),
+            epoll_wake_registry,
+        }
+    }
 }
 
 pub(super) fn flush_host_fd(host_fd: i32) -> Result<(), LinuxErrno> {
@@ -344,10 +385,26 @@ pub(super) fn set_host_fd_offset(host_fd: crate::dispatch::HostFd, offset: u64) 
 }
 
 impl FsState {
+    pub(in crate::dispatch) fn vfs_mounts_mut(&mut self) -> &mut crate::vfs::VfsMounts {
+        let Some(mounts) = std::sync::Arc::get_mut(&mut self.vfs_mounts) else {
+            eprintln!("carrick: FATAL: VFS mounts cannot be reconfigured after guest fork");
+            std::process::abort();
+        };
+        mounts
+    }
+
+    pub(in crate::dispatch) fn rootfs_vfs_mut(&mut self) -> &mut crate::vfs::RootFsVfs {
+        let Some(rootfs) = std::sync::Arc::get_mut(&mut self.rootfs_vfs) else {
+            eprintln!("carrick: FATAL: rootfs cannot be reconfigured after guest fork");
+            std::process::abort();
+        };
+        rootfs
+    }
+
     pub(in crate::dispatch) fn new() -> Self {
         let pty_table = std::sync::Arc::new(parking_lot::Mutex::new(crate::vfs::PtyTable::new()));
         Self {
-            vfs_mounts: {
+            vfs_mounts: std::sync::Arc::new({
                 let mut m = crate::vfs::VfsMounts::new();
                 m.mount(
                     "/dev",
@@ -409,12 +466,55 @@ impl FsState {
                     Box::new(crate::vfs::BindVfs::new("/dev/shm", shm_host, false)),
                 );
                 m
-            },
-            rootfs_vfs: crate::vfs::RootFsVfs::new(),
+            }),
+            rootfs_vfs: std::sync::Arc::new(crate::vfs::RootFsVfs::new()),
             pty_table,
             inotify_registry: crate::inotify::InotifyRegistry::default(),
             dnotify_registry: parking_lot::Mutex::new(Vec::new()),
             resolve_cache: crate::fs_resolve_cache::ResolveCache::new(),
         }
+    }
+
+    pub(in crate::dispatch) fn fork_clone(&self) -> Self {
+        Self {
+            vfs_mounts: std::sync::Arc::clone(&self.vfs_mounts),
+            rootfs_vfs: std::sync::Arc::clone(&self.rootfs_vfs),
+            pty_table: std::sync::Arc::clone(&self.pty_table),
+            inotify_registry: self.inotify_registry.clone(),
+            dnotify_registry: parking_lot::Mutex::new(self.dnotify_registry.lock().clone()),
+            resolve_cache: crate::fs_resolve_cache::ResolveCache::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod fork_clone_tests {
+    use super::*;
+
+    #[test]
+    fn forked_io_has_independent_fd_namespace_and_shared_open_description() {
+        let parent = SyscallDispatcher::new();
+        let description = Arc::new(RwLock::new(OpenDescription::SyntheticFile {
+            base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
+            path: "/fork-shared".to_owned(),
+            contents: b"abc".to_vec(),
+            offset: 0,
+        }));
+        parent.io.open_files.write().insert(
+            3,
+            OpenFile::new(Arc::clone(&description), crate::linux_abi::LINUX_FD_CLOEXEC),
+        );
+        *parent.io.cwd.write() = "/parent-cwd".to_owned();
+
+        let child = parent.io.fork_clone();
+
+        let child_file = child.open_files.read().get(&3).cloned().unwrap();
+        assert!(Arc::ptr_eq(&description, &child_file.description));
+        assert_eq!(child_file.fd_flags, crate::linux_abi::LINUX_FD_CLOEXEC);
+        assert_eq!(child.cwd.read().as_str(), "/parent-cwd");
+
+        parent.io.open_files.write().remove(&3);
+        assert!(!parent.io.open_files.read().contains_key(&3));
+        assert!(child.open_files.read().contains_key(&3));
     }
 }

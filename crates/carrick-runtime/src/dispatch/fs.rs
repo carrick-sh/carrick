@@ -939,7 +939,7 @@ impl SyscallDispatcher {
         point: impl Into<std::path::PathBuf>,
         vfs: Box<dyn crate::vfs::Vfs>,
     ) {
-        self.fs.vfs_mounts.mount(point, vfs);
+        self.fs.vfs_mounts_mut().mount(point, vfs);
     }
 
     pub(super) fn write_shared_supported(&self, fd: i32) -> bool {

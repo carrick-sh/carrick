@@ -575,6 +575,7 @@ fn sched_read_param_priority<M: GuestMemory>(
 }
 
 /// Owned process-subsystem state. Split out of `SyscallDispatcher`.
+#[derive(Clone)]
 pub(super) struct ProcState {
     /// Path of the currently-running executable, surfaced via
     /// `/proc/self/exe`, `/proc/self/cmdline`, `/proc/self/comm`, etc.
@@ -802,6 +803,24 @@ impl ProcState {
             virtual_ptrace_stops: std::collections::HashMap::new(),
             membarrier_ready: 0,
         }
+    }
+
+    pub(super) fn fork_clone(&self, parent_guest_pid: u32) -> Self {
+        let mut child = self.clone();
+        child.pdeathsig = 0;
+        child.subreaper_ancestor = if self.child_subreaper != 0 {
+            parent_guest_pid
+        } else {
+            self.subreaper_ancestor
+        };
+        child.child_subreaper = 0;
+        child.child_subreaper_owner = 0;
+        child.timerslack_default = self.timerslack;
+        child.itimers = [None, None, None];
+        child.ptrace_traceme = false;
+        child.virtual_ptrace_stops.clear();
+        child.membarrier_ready = 0;
+        child
     }
 
     /// The ISA this guest reports about *itself*. A native x86_64 guest
