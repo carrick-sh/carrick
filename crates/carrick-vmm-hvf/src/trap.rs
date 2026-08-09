@@ -6072,7 +6072,26 @@ impl HvfVmState {
         plan: &GuestMappingPlan,
     ) -> Result<(), TrapError> {
         use applevisor::prelude::*;
+        let bank_plan_started = std::time::Instant::now();
         let mut banked_plan = self.bank_exec_plan(plan)?;
+        let bank_plan_elapsed_ns = bank_plan_started
+            .elapsed()
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64;
+        let replacement_mapping_count = banked_plan.mappings.len() as u64;
+        let replacement_mapped_bytes = banked_plan
+            .mappings
+            .iter()
+            .map(|mapping| mapping.mapped_size)
+            .sum::<u64>();
+        crate::probes::hvpatch_exec_replace_stage(
+            carrick_observability::probes::HvpatchExecReplaceStage::new(
+                carrick_observability::probes::HvpatchExecReplaceStagePhase::BankPlan,
+                bank_plan_elapsed_ns,
+                replacement_mapping_count,
+                replacement_mapped_bytes,
+            ),
+        );
         let private_file_artifacts_started = std::time::Instant::now();
         if self.persistent_vm_lifecycle {
             attach_exec_private_file_backings(&mut banked_plan)?;
@@ -6082,12 +6101,6 @@ impl HvfVmState {
             .as_nanos()
             .min(u128::from(u64::MAX)) as u64;
         let plan = &banked_plan;
-        let replacement_mapping_count = plan.mappings.len() as u64;
-        let replacement_mapped_bytes = plan
-            .mappings
-            .iter()
-            .map(|mapping| mapping.mapped_size)
-            .sum::<u64>();
         let emit_replace_stage =
             |phase: carrick_observability::probes::HvpatchExecReplaceStagePhase,
              started: std::time::Instant| {
@@ -6135,6 +6148,7 @@ impl HvfVmState {
         // own JSON report to stdout (interleaved with the parent's), making the
         // user-visible output unreadable.
         let was_forked_child = self.is_forked_child;
+        let address_space_teardown_started = std::time::Instant::now();
         if self.persistent_vm_lifecycle {
             // The vCPU is stopped at the execve syscall exit and every sibling
             // has already retired. Remove the old process address space from the
@@ -6162,6 +6176,10 @@ impl HvfVmState {
             std::mem::forget(std::mem::replace(vcpu, new_vcpu));
             replace_destroyed_vm(self, new_vm);
         }
+        emit_replace_stage(
+            carrick_observability::probes::HvpatchExecReplaceStagePhase::AddressSpaceTeardown,
+            address_space_teardown_started,
+        );
         // execve replaces the WHOLE address space: clear every dynamic alias
         // after persistent-mode unmap has consumed its extents.
         let alias_cleanup_started = std::time::Instant::now();
