@@ -1531,11 +1531,31 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         child_tid: ThreadId,
         forking_tid: ThreadId,
     ) -> Result<Self::ProcessSpec, TrapError> {
+        use carrick_observability::probes::{
+            HvpatchForkProcessSpecStage, HvpatchForkProcessSpecStagePhase,
+        };
+
+        let total_started = std::time::Instant::now();
+        let emit_stage =
+            |phase: HvpatchForkProcessSpecStagePhase, started: std::time::Instant, units: u64| {
+                let elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+                carrick_observability::probes::hvpatch_fork_process_spec_stage(
+                    HvpatchForkProcessSpecStage::new(
+                        phase,
+                        child_tid.raw(),
+                        forking_tid.raw(),
+                        elapsed_ns,
+                        units,
+                    ),
+                );
+            };
+
         // Persistent-VM exec leaves the software editor absent until it is
         // needed. A process fork needs a complete manager immediately so it can
         // rebase a private child copy; initialize from the live backing here if
         // no mmap/mprotect edit has already done so. The no-op edit publishes
         // nothing and performs no TLBI.
+        let stage_started = std::time::Instant::now();
         let page_tables_absent = self
             .page_tables
             .lock()
@@ -1548,6 +1568,13 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 ))
             })?;
         }
+        emit_stage(
+            HvpatchForkProcessSpecStagePhase::ParentPageTablesLoad,
+            stage_started,
+            u64::from(page_tables_absent),
+        );
+
+        let stage_started = std::time::Instant::now();
         let parent = self.vcpu.snapshot()?;
         // A process child, like a thread sibling, starts at the instruction
         // after the trapped clone in EL0. The raw parent snapshot is currently
@@ -1562,7 +1589,13 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 "in-process child ASID zero is reserved".to_owned(),
             ));
         }
+        emit_stage(
+            HvpatchForkProcessSpecStagePhase::VcpuSnapshot,
+            stage_started,
+            0,
+        );
 
+        let stage_started = std::time::Instant::now();
         let mut page_tables = self
             .page_tables
             .lock()
@@ -1571,10 +1604,22 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             .ok_or_else(|| {
                 TrapError::Hypervisor("hvpatch parent page tables are absent".to_owned())
             })?;
+        emit_stage(
+            HvpatchForkProcessSpecStagePhase::ParentPageTablesClone,
+            stage_started,
+            carrick_mem::memory::LINUX_PAGE_TABLES_SIZE,
+        );
+
+        let stage_started = std::time::Instant::now();
         let child_root = child_ttbr0 & ((1_u64 << 48) - 1);
         page_tables.rebase(child_root).map_err(|error| {
             TrapError::Hypervisor(format!("rebase child page tables: {error:?}"))
         })?;
+        emit_stage(
+            HvpatchForkProcessSpecStagePhase::PageTablesRebase,
+            stage_started,
+            carrick_mem::memory::LINUX_PAGE_TABLES_SIZE,
+        );
         let builder = self.vm.build_process_builder(
             bank_base,
             bank_size,
@@ -1582,16 +1627,24 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             child_tid.raw(),
             forking_tid.raw(),
         )?;
+        let stage_started = std::time::Instant::now();
         let protections = Arc::new(MemoryProtections::from_snapshot(
             self.protections.snapshot_all(),
         ));
-        Ok(Aarch64ProcessSpec {
+        emit_stage(
+            HvpatchForkProcessSpecStagePhase::WrapperProtections,
+            stage_started,
+            0,
+        );
+        let spec = Aarch64ProcessSpec {
             builder,
             snapshot,
             page_tables: Arc::new(Mutex::new(Some(page_tables))),
             protections,
             process_asid: child_asid,
-        })
+        };
+        emit_stage(HvpatchForkProcessSpecStagePhase::Total, total_started, 0);
+        Ok(spec)
     }
 
     fn materialize_process(spec: Self::ProcessSpec) -> Result<Self, TrapError> {

@@ -843,6 +843,85 @@ impl HvpatchForkRuntimeStage {
     }
 }
 
+/// Mutually exclusive construction stages inside an hvpatch in-process fork's
+/// process-spec build. Ordinals are append-only DTrace ABI. `Total` encloses
+/// every peer stage and therefore must not be summed with them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchForkProcessSpecStagePhase {
+    ParentPageTablesLoad = 0,
+    VcpuSnapshot = 1,
+    ParentPageTablesClone = 2,
+    PageTablesRebase = 3,
+    AliasUnion = 4,
+    PrivateSnapshot = 5,
+    Validation = 6,
+    TablePublish = 7,
+    BackendProtections = 8,
+    BackendSpecFinalize = 9,
+    WrapperProtections = 10,
+    Total = 11,
+}
+
+impl HvpatchForkProcessSpecStagePhase {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Typed source record for `hvpatch-fork-process-spec-stage`.
+///
+/// `units` is stage-specific supporting shape: a boolean load flag for parent
+/// table load; bytes for page-table clone, rebase, publication, and backend
+/// finalization; packed bank span for private snapshot; mapping count for alias
+/// union and validation; zero where no useful cardinality exists.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchForkProcessSpecStage {
+    phase: HvpatchForkProcessSpecStagePhase,
+    child_pid: i32,
+    forking_tid: i32,
+    elapsed_ns: u64,
+    units: u64,
+}
+
+impl HvpatchForkProcessSpecStage {
+    pub const fn new(
+        phase: HvpatchForkProcessSpecStagePhase,
+        child_pid: i32,
+        forking_tid: i32,
+        elapsed_ns: u64,
+        units: u64,
+    ) -> Self {
+        Self {
+            phase,
+            child_pid,
+            forking_tid,
+            elapsed_ns,
+            units,
+        }
+    }
+
+    pub const fn phase(self) -> HvpatchForkProcessSpecStagePhase {
+        self.phase
+    }
+
+    pub const fn child_pid(self) -> i32 {
+        self.child_pid
+    }
+
+    pub const fn forking_tid(self) -> i32 {
+        self.forking_tid
+    }
+
+    pub const fn elapsed_ns(self) -> u64 {
+        self.elapsed_ns
+    }
+
+    pub const fn units(self) -> u64 {
+        self.units
+    }
+}
+
 /// Typed source record for `hvpatch-fork-quiesce`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HvpatchForkQuiesce {
@@ -1323,6 +1402,62 @@ mod hvpatch_guest_probe_abi {
             assert!(
                 source.matches(declaration).count() >= 2,
                 "missing fork runtime-stage ABI declaration {declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn fork_process_spec_stage_keeps_guest_identity_timing_and_shape_typed() {
+        let event = HvpatchForkProcessSpecStage::new(
+            HvpatchForkProcessSpecStagePhase::TablePublish,
+            42,
+            43,
+            1_750_000,
+            0x1c0000,
+        );
+        assert_eq!(
+            HvpatchForkProcessSpecStagePhase::ParentPageTablesLoad.raw(),
+            0
+        );
+        assert_eq!(HvpatchForkProcessSpecStagePhase::VcpuSnapshot.raw(), 1);
+        assert_eq!(
+            HvpatchForkProcessSpecStagePhase::ParentPageTablesClone.raw(),
+            2
+        );
+        assert_eq!(HvpatchForkProcessSpecStagePhase::PageTablesRebase.raw(), 3);
+        assert_eq!(HvpatchForkProcessSpecStagePhase::AliasUnion.raw(), 4);
+        assert_eq!(HvpatchForkProcessSpecStagePhase::PrivateSnapshot.raw(), 5);
+        assert_eq!(HvpatchForkProcessSpecStagePhase::Validation.raw(), 6);
+        assert_eq!(HvpatchForkProcessSpecStagePhase::TablePublish.raw(), 7);
+        assert_eq!(
+            HvpatchForkProcessSpecStagePhase::BackendProtections.raw(),
+            8
+        );
+        assert_eq!(
+            HvpatchForkProcessSpecStagePhase::BackendSpecFinalize.raw(),
+            9
+        );
+        assert_eq!(
+            HvpatchForkProcessSpecStagePhase::WrapperProtections.raw(),
+            10
+        );
+        assert_eq!(HvpatchForkProcessSpecStagePhase::Total.raw(), 11);
+        assert_eq!(
+            event.phase(),
+            HvpatchForkProcessSpecStagePhase::TablePublish
+        );
+        assert_eq!(event.child_pid(), 42);
+        assert_eq!(event.forking_tid(), 43);
+        assert_eq!(event.elapsed_ns(), 1_750_000);
+        assert_eq!(event.units(), 0x1c0000);
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn hvpatch__fork__process__spec__stage(_: u32, _: i32, _: i32, _: u64, _: u64) {}",
+            "stub!(hvpatch_fork_process_spec_stage(event: super::HvpatchForkProcessSpecStage));",
+        ] {
+            assert!(
+                source.matches(declaration).count() >= 2,
+                "missing fork process-spec stage ABI declaration {declaration}"
             );
         }
     }
@@ -3153,6 +3288,13 @@ mod real {
         /// 9=cumulative total enclosing phases 0..=8), parent PID, child PID
         /// (zero before allocation), forking TID, elapsed nanoseconds.
         fn hvpatch__fork__runtime__stage(_: u32, _: i32, _: i32, _: i32, _: u64) {}
+        /// Mutually exclusive process-spec construction stages. Args: phase
+        /// (0=parent tables load, 1=vCPU snapshot, 2=parent table clone,
+        /// 3=rebase, 4=alias union, 5=private snapshot, 6=validation,
+        /// 7=table publish, 8=backend protections, 9=backend finalization,
+        /// 10=wrapper protections, 11=cumulative total), Linux child PID,
+        /// Linux forking TID, elapsed nanoseconds, and stage-specific units.
+        fn hvpatch__fork__process__spec__stage(_: u32, _: i32, _: i32, _: u64, _: u64) {}
         /// One in-process-fork sibling-quiesce result. Args: parent PID,
         /// forking TID, initial sibling-vCPU count, 200-us poll iterations, and
         /// elapsed nanoseconds.
@@ -4087,6 +4229,17 @@ mod real {
             event.child_pid(),
             event.forking_tid(),
             event.elapsed_ns()
+        ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_fork_process_spec_stage(event: super::HvpatchForkProcessSpecStage) {
+        carrick_usdt::hvpatch__fork__process__spec__stage!(|| (
+            event.phase().raw(),
+            event.child_pid(),
+            event.forking_tid(),
+            event.elapsed_ns(),
+            event.units()
         ));
     }
 
@@ -5489,6 +5642,7 @@ mod stub {
     stub!(hvpatch_exec_runtime_stage(event: super::HvpatchExecRuntimeStage));
     stub!(hvpatch_topology_lock(event: super::HvpatchTopologyLock));
     stub!(hvpatch_fork_runtime_stage(event: super::HvpatchForkRuntimeStage));
+    stub!(hvpatch_fork_process_spec_stage(event: super::HvpatchForkProcessSpecStage));
     stub!(hvpatch_fork_quiesce(event: super::HvpatchForkQuiesce));
     stub!(vm_lifecycle(operation: u32, admission: i32));
     stub!(execve_argv(path: &str, argv: &[Vec<u8>]));
