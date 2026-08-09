@@ -303,7 +303,7 @@ pub struct Task {
     key: TaskKey,
     parent: Mutex<Option<TaskKey>>,
     children: Mutex<BTreeSet<TaskKey>>,
-    identity: TaskIdentity,
+    identity: Mutex<TaskIdentity>,
     lifecycle: Mutex<TaskLifecycle>,
     shared: ArcSwap<TaskShared>,
     threads: Mutex<BTreeMap<LinuxTid, (ThreadKey, ThreadRef)>>,
@@ -321,10 +321,10 @@ impl Task {
             key,
             parent: Mutex::new(parent),
             children: Mutex::new(BTreeSet::new()),
-            identity: TaskIdentity {
+            identity: Mutex::new(TaskIdentity {
                 process_group,
                 session,
-            },
+            }),
             lifecycle: Mutex::new(TaskLifecycle::Live),
             shared: ArcSwap::new(shared),
             threads: Mutex::new(BTreeMap::new()),
@@ -335,39 +335,44 @@ impl Task {
         self.key
     }
 
-    pub fn parent(&self) -> Option<TaskKey> {
+    pub(super) fn parent(&self) -> Option<TaskKey> {
         *self.parent.lock()
     }
 
-    pub fn reparent(&self, parent: Option<TaskKey>) {
+    pub(super) fn reparent(&self, parent: Option<TaskKey>) {
         *self.parent.lock() = parent;
     }
 
-    pub fn add_child(&self, child: TaskKey) -> bool {
+    pub(super) fn add_child(&self, child: TaskKey) -> bool {
         self.children.lock().insert(child)
     }
 
-    pub fn remove_child(&self, child: TaskKey) -> bool {
+    pub(super) fn remove_child(&self, child: TaskKey) -> bool {
         self.children.lock().remove(&child)
     }
 
-    pub fn children(&self) -> Vec<TaskKey> {
+    pub(super) fn children(&self) -> Vec<TaskKey> {
         self.children.lock().iter().copied().collect()
     }
 
-    pub const fn process_group(&self) -> ProcessGroupId {
-        self.identity.process_group
+    pub(super) fn process_group(&self) -> ProcessGroupId {
+        self.identity.lock().process_group
     }
 
-    pub const fn session(&self) -> SessionId {
-        self.identity.session
+    pub(super) fn session(&self) -> SessionId {
+        self.identity.lock().session
     }
 
-    pub fn lifecycle(&self) -> TaskLifecycle {
-        *self.lifecycle.lock()
+    /// Registry-transaction publication point. Callers must hold the kernel
+    /// registry write lock before taking this one task leaf lock.
+    pub(super) fn replace_identity(&self, process_group: ProcessGroupId, session: SessionId) {
+        *self.identity.lock() = TaskIdentity {
+            process_group,
+            session,
+        };
     }
 
-    pub fn begin_exit(&self) -> bool {
+    pub(super) fn begin_exit(&self) -> bool {
         let mut lifecycle = self.lifecycle.lock();
         if *lifecycle == TaskLifecycle::Exiting {
             return false;
@@ -376,20 +381,37 @@ impl Task {
         true
     }
 
-    pub fn shared(&self) -> Arc<TaskShared> {
+    pub(super) fn shared(&self) -> Arc<TaskShared> {
         self.shared.load_full()
     }
 
-    pub fn replace_shared(&self, replacement: Arc<TaskShared>) -> Arc<TaskShared> {
+    #[cfg(test)]
+    pub(super) fn replace_shared(&self, replacement: Arc<TaskShared>) -> Arc<TaskShared> {
         self.shared.swap(replacement)
     }
 
-    pub fn attach_thread(
+    pub(super) fn prepare_thread(
         self: &Arc<Self>,
         key: ThreadKey,
         registry_id: ThreadId,
         resources: Arc<ThreadResources>,
-    ) -> Result<ThreadRef, ObjectGraphError> {
+    ) -> ThreadRef {
+        Arc::new(Thread {
+            key,
+            registry_id,
+            task_key: self.key,
+            task: Arc::downgrade(self),
+            resources: ArcSwap::new(resources),
+        })
+    }
+
+    /// Publish a prepared thread. Kernel operations call this only while the
+    /// registry write lock is held, after every other fallible preparation.
+    pub(super) fn publish_thread(&self, thread: ThreadRef) -> Result<(), ObjectGraphError> {
+        if thread.task_key != self.key {
+            return Err(ObjectGraphError::WrongThreadTask);
+        }
+        let key = thread.key;
         let mut threads = self.threads.lock();
         if threads.contains_key(&key.tid) {
             return Err(ObjectGraphError::DuplicateThread(key.tid));
@@ -400,27 +422,34 @@ impl Task {
                 tid: key.tid,
             });
         }
-        let thread = Arc::new(Thread {
-            key,
-            registry_id,
-            task_key: self.key,
-            task: Arc::downgrade(self),
-            resources: ArcSwap::new(resources),
-        });
-        threads.insert(key.tid, (key, Arc::clone(&thread)));
+        threads.insert(key.tid, (key, thread));
+        Ok(())
+    }
+
+    pub(super) fn attach_thread(
+        self: &Arc<Self>,
+        key: ThreadKey,
+        registry_id: ThreadId,
+        resources: Arc<ThreadResources>,
+    ) -> Result<ThreadRef, ObjectGraphError> {
+        let thread = self.prepare_thread(key, registry_id, resources);
+        self.publish_thread(Arc::clone(&thread))?;
         Ok(thread)
     }
 
-    pub fn detach_thread(&self, key: ThreadKey) -> bool {
-        let mut threads = self.threads.lock();
-        if threads.get(&key.tid).map(|(stored, _)| *stored) != Some(key) {
-            return false;
-        }
-        threads.remove(&key.tid);
-        true
+    pub(super) fn thread_keys(&self) -> Vec<ThreadKey> {
+        self.threads.lock().values().map(|(key, _)| *key).collect()
     }
 
-    pub fn live_thread_count(&self) -> usize {
+    pub(super) fn thread(&self, tid: LinuxTid) -> Option<ThreadRef> {
+        self.threads
+            .lock()
+            .get(&tid)
+            .map(|(_, thread)| Arc::clone(thread))
+    }
+
+    #[cfg(test)]
+    pub(super) fn live_thread_count(&self) -> usize {
         self.threads.lock().len()
     }
 }
@@ -451,11 +480,15 @@ impl Thread {
         self.task.upgrade()
     }
 
-    pub fn resources(&self) -> Arc<ThreadResources> {
+    pub(super) fn resources(&self) -> Arc<ThreadResources> {
         self.resources.load_full()
     }
 
-    pub fn replace_resources(&self, replacement: Arc<ThreadResources>) -> Arc<ThreadResources> {
+    #[cfg(test)]
+    pub(super) fn replace_resources(
+        &self,
+        replacement: Arc<ThreadResources>,
+    ) -> Arc<ThreadResources> {
         self.resources.swap(replacement)
     }
 }
@@ -608,6 +641,8 @@ pub enum ObjectGraphError {
     LeaderTidMismatch { task: TaskId, tid: LinuxTid },
     #[error("thread TID {0:?} is already attached")]
     DuplicateThread(LinuxTid),
+    #[error("prepared thread belongs to a different task")]
+    WrongThreadTask,
     #[error("process-group claim does not match its typed ID")]
     ProcessGroupClaimMismatch,
     #[error("session claim does not match its typed ID")]
