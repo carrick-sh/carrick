@@ -20,6 +20,12 @@ pub mod vm_backend;
 pub use vm_backend::{ForkRamStrategy, GuestVmBackend};
 pub mod hypervisor;
 pub use hypervisor::{HvVcpu, HvVm, VcpuExit};
+pub mod kernel;
+pub use kernel::{
+    FrameEventCapacity, FrameId, FrameInventoryBatch, FrameInventoryBatchError,
+    FrameInventoryEvent, FrameLength, KernelTransactionId, MAX_FRAME_INVENTORY_EVENTS_PER_BATCH,
+    MappingGeneration, MappingId,
+};
 pub mod event;
 pub use event::{EventMultiplexer, Interest, PollEvent, Readiness, TriggerMode, VnodeEvents};
 pub mod futex;

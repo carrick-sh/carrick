@@ -3,35 +3,12 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeSet, VecDeque};
+use std::num::NonZeroU16;
+
+use crate::kernel::Asid;
 
 const FIRST_GUEST_ASID: u16 = 1;
 const LAST_GUEST_ASID: u16 = u16::MAX;
-const TTBR0_ROOT_ALIGNMENT: u64 = 4096;
-const TTBR0_ROOT_MASK: u64 = (1_u64 << 48) - 1;
-
-/// A nonzero AArch64 stage-1 address-space identifier owned by one live guest
-/// process. ASID zero remains reserved for bootstrap and diagnostics.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct Asid(u16);
-
-impl Asid {
-    pub(crate) fn raw(self) -> u16 {
-        self.0
-    }
-
-    /// Compose this process's ASID with a 4 KiB-aligned stage-1 root for
-    /// `TTBR0_EL1`. Carrick's current AArch64 translation regime uses a 48-bit
-    /// base field and the upper 16 bits for the ASID.
-    pub(crate) fn ttbr0(self, root_ipa: u64) -> Result<u64, AsidError> {
-        if root_ipa & (TTBR0_ROOT_ALIGNMENT - 1) != 0 {
-            return Err(AsidError::UnalignedRoot(root_ipa));
-        }
-        if root_ipa & !TTBR0_ROOT_MASK != 0 {
-            return Err(AsidError::RootOutOfRange(root_ipa));
-        }
-        Ok((u64::from(self.0) << 48) | root_ipa)
-    }
-}
 
 /// Proof that an ASID left the live set but has not yet had its stale TLB
 /// translations invalidated. The token is deliberately neither `Clone` nor
@@ -50,10 +27,6 @@ pub(crate) enum AsidError {
     NotLive(Asid),
     #[error("guest ASID {0:?} is not awaiting TLB invalidation")]
     NotRetired(Asid),
-    #[error("stage-1 root IPA 0x{0:x} is not 4 KiB aligned")]
-    UnalignedRoot(u64),
-    #[error("stage-1 root IPA 0x{0:x} does not fit TTBR0_EL1's 48-bit base field")]
-    RootOutOfRange(u64),
 }
 
 /// Allocates nonzero process ASIDs and quarantines retired identifiers until
@@ -103,7 +76,8 @@ impl AsidAllocator {
             let Ok(raw) = u16::try_from(self.next) else {
                 return Err(AsidError::Exhausted);
             };
-            let asid = Asid(raw);
+            let raw = NonZeroU16::new(raw).ok_or(AsidError::Exhausted)?;
+            let asid = Asid::from_registry_allocation(raw);
             self.next += 1;
             asid
         } else if let Some(asid) = self.reusable.pop_front() {
@@ -193,28 +167,5 @@ mod tests {
         let _retired = allocator.retire(asid).expect("first retirement");
 
         assert_eq!(allocator.retire(asid), Err(AsidError::NotLive(asid)));
-    }
-
-    #[test]
-    fn encodes_asid_and_aligned_root_in_ttbr0() {
-        let mut allocator = AsidAllocator::with_limit_for_tests(1);
-        let asid = allocator.allocate().expect("ASID");
-
-        assert_eq!(asid.ttbr0(0x1234_5000), Ok(0x0001_0000_1234_5000));
-    }
-
-    #[test]
-    fn rejects_unaligned_or_out_of_range_ttbr0_roots() {
-        let mut allocator = AsidAllocator::with_limit_for_tests(1);
-        let asid = allocator.allocate().expect("ASID");
-
-        assert_eq!(
-            asid.ttbr0(0x1234_5001),
-            Err(AsidError::UnalignedRoot(0x1234_5001))
-        );
-        assert_eq!(
-            asid.ttbr0(0x0001_0000_0000_0000),
-            Err(AsidError::RootOutOfRange(0x0001_0000_0000_0000))
-        );
     }
 }
