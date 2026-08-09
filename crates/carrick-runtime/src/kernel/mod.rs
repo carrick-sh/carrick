@@ -19,7 +19,7 @@ pub use address::{
 pub use clone_plan::{CloneObjectMode, ClonePlan, ClonePlanError, CloneTaskMode};
 pub use core::{
     Kernel, KernelContext, KernelError, Registry, RegistryInvariantError, RootBootstrap,
-    TaskRevision,
+    TaskExitSubscriber, TaskRevision,
 };
 pub use exec::{ExecError, PreparedExec};
 pub use ids::{

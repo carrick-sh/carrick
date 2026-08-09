@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Weak};
 
 use carrick_hal::ThreadId;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use super::address::MmBackend;
 use super::ids::{LinuxTid, ObjectIdError, ObjectIdRegistry, ProcessGroupId, SessionId, TaskId};
@@ -148,10 +148,47 @@ pub struct Kernel {
     registry: Registry,
     ids: IdRegistry,
     object_ids: ObjectIdRegistry,
+    pub(super) exit_subscribers: TaskExitSubscribers,
 }
 
 #[derive(Debug)]
 pub(super) struct KernelDomain;
+
+pub trait TaskExitSubscriber: Send + Sync {
+    fn publish_exit(&self);
+}
+
+#[derive(Default)]
+pub(super) struct TaskExitSubscribers {
+    watchers: Mutex<BTreeMap<TaskId, Vec<Weak<dyn TaskExitSubscriber>>>>,
+}
+
+impl TaskExitSubscribers {
+    pub(super) fn register<T>(&self, task_id: TaskId, subscriber: &Arc<T>)
+    where
+        T: TaskExitSubscriber + 'static,
+    {
+        let subscriber: Arc<dyn TaskExitSubscriber> = subscriber.clone();
+        self.watchers
+            .lock()
+            .entry(task_id)
+            .or_default()
+            .push(Arc::downgrade(&subscriber));
+    }
+
+    pub(super) fn take(&self, task_id: TaskId) -> Vec<Weak<dyn TaskExitSubscriber>> {
+        self.watchers.lock().remove(&task_id).unwrap_or_default()
+    }
+}
+
+impl std::fmt::Debug for TaskExitSubscribers {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TaskExitSubscribers")
+            .field("task_count", &self.watchers.lock().len())
+            .finish()
+    }
+}
 
 impl Kernel {
     pub fn bootstrap_root(
@@ -239,6 +276,7 @@ impl Kernel {
             registry,
             ids,
             object_ids,
+            exit_subscribers: TaskExitSubscribers::default(),
         });
         let context = KernelContext::capture(kernel.clone(), task, leader, TaskRevision::INITIAL);
         Ok((kernel, context))

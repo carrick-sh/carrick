@@ -366,6 +366,32 @@ impl PreparedThreadClone {
 }
 
 impl Kernel {
+    pub fn task_is_live(&self, task_id: TaskId) -> bool {
+        self.registry().state.read().tasks.contains_key(&task_id)
+    }
+
+    pub fn task_exists(&self, task_id: TaskId) -> bool {
+        let state = self.registry().state.read();
+        state.tasks.contains_key(&task_id) || state.zombies.contains_key(&task_id)
+    }
+
+    pub fn register_task_exit_subscriber<T>(&self, task_id: TaskId, subscriber: &Arc<T>) -> bool
+    where
+        T: super::core::TaskExitSubscriber + 'static,
+    {
+        let state = self.registry().state.read();
+        if state.tasks.contains_key(&task_id) {
+            self.exit_subscribers.register(task_id, subscriber);
+            return true;
+        }
+        let exited = state.zombies.contains_key(&task_id);
+        drop(state);
+        if exited {
+            subscriber.publish_exit();
+        }
+        exited
+    }
+
     pub fn reserve_fork(
         self: &Arc<Self>,
         parent: &KernelContext,
@@ -931,6 +957,14 @@ impl Kernel {
                 _task_claim: task_claim,
             },
         );
+        let subscribers = self.exit_subscribers.take(task_id);
+        drop(state);
+        for subscriber in subscribers
+            .into_iter()
+            .filter_map(|subscriber| subscriber.upgrade())
+        {
+            subscriber.publish_exit();
+        }
         Ok(zombie)
     }
 
@@ -1099,6 +1133,7 @@ pub enum KernelOperationError {
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU16;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use carrick_abi::{LinuxCloneFlags, SigSet};
     use carrick_guest_mem::Gpa;
@@ -1111,6 +1146,15 @@ mod tests {
         MmBinding, RootBootstrap, Sighand, SignalDisposition, SnapshotError, SnapshotTable,
         Stage1Root, ThreadSignalState, VmaSummary,
     };
+
+    #[derive(Debug, Default)]
+    struct CountingExitSubscriber(AtomicUsize);
+
+    impl super::super::core::TaskExitSubscriber for CountingExitSubscriber {
+        fn publish_exit(&self) {
+            self.0.fetch_add(1, Ordering::Release);
+        }
+    }
 
     #[derive(Debug)]
     struct TestMmBackend(MmBinding);
@@ -1143,6 +1187,46 @@ mod tests {
         )
         .expect("bootstrap input");
         Kernel::bootstrap_root(input).expect("kernel")
+    }
+
+    #[test]
+    fn task_exit_subscribers_observe_live_zombie_and_unknown_targets() {
+        let (kernel, root) = bootstrap(75);
+        let child = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(9_075),
+                "child".to_string(),
+                None,
+            )
+            .expect("child");
+        let child_id = child.task.key().id;
+        let live = Arc::new(CountingExitSubscriber::default());
+        assert!(kernel.task_is_live(child_id));
+        assert!(kernel.task_exists(child_id));
+        assert!(kernel.register_task_exit_subscriber(child_id, &live));
+        assert_eq!(live.0.load(Ordering::Acquire), 0);
+
+        kernel
+            .exit_task(
+                child_id,
+                LinuxWaitStatus::from_wait_encoding(0),
+                TaskRusage::default(),
+                None,
+            )
+            .expect("child exit");
+        assert!(!kernel.task_is_live(child_id));
+        assert!(kernel.task_exists(child_id));
+        assert_eq!(live.0.load(Ordering::Acquire), 1);
+
+        let zombie = Arc::new(CountingExitSubscriber::default());
+        assert!(kernel.register_task_exit_subscriber(child_id, &zombie));
+        assert_eq!(zombie.0.load(Ordering::Acquire), 1);
+        let unknown = Arc::new(CountingExitSubscriber::default());
+        let unknown_id = TaskId::for_root_bootstrap(9_999).expect("unknown task");
+        assert!(!kernel.register_task_exit_subscriber(unknown_id, &unknown));
+        assert_eq!(unknown.0.load(Ordering::Acquire), 0);
     }
 
     #[test]
