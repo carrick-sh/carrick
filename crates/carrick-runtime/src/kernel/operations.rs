@@ -13,7 +13,7 @@ use super::objects::{
     LinuxWaitStatus, Mm, ObjectGraphError, ProcessGroup, Session, Task, TaskKey, TaskRef,
     TaskRusage, TaskShared, TaskSharedCloneError, ThreadKey, ThreadRef, ThreadResources, Zombie,
 };
-use super::registry::{IdError, TaskReservation, ThreadClaim};
+use super::registry::{IdError, TaskReservation, ThreadClaim, ThreadReservation};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KernelFailpoint {
@@ -256,6 +256,114 @@ impl PreparedFork {
     }
 }
 
+#[derive(Debug)]
+pub struct ThreadCloneReservation {
+    kernel: Arc<Kernel>,
+    task: TaskRef,
+    caller: ThreadRef,
+    shared: Arc<TaskShared>,
+    parent_resources: Arc<ThreadResources>,
+    parent_revision: TaskRevision,
+    published_revision: TaskRevision,
+    plan: ClonePlan,
+    tid: LinuxTid,
+    reservation: ThreadReservation,
+    failpoint: Option<KernelFailpoint>,
+}
+
+impl ThreadCloneReservation {
+    pub const fn tid(&self) -> LinuxTid {
+        self.tid
+    }
+
+    pub fn prepare(
+        self,
+        registry_id: ThreadId,
+    ) -> Result<PreparedThreadClone, KernelOperationError> {
+        let resources = Arc::new(ThreadResources::for_clone(
+            &self.parent_resources,
+            self.plan,
+            self.kernel.object_ids(),
+        )?);
+        let thread = self.task.prepare_clone_thread(
+            ThreadKey {
+                tid: self.tid,
+                serial: self.kernel.object_ids().thread_serial()?,
+            },
+            registry_id,
+            Arc::clone(&resources),
+            self.caller.signal_state(),
+        );
+        check_failpoint(self.failpoint, KernelFailpoint::AfterObjects)?;
+        check_failpoint(self.failpoint, KernelFailpoint::AfterBackendPrepare)?;
+        Ok(PreparedThreadClone {
+            reservation: self,
+            thread,
+            resources,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct PreparedThreadClone {
+    reservation: ThreadCloneReservation,
+    thread: ThreadRef,
+    resources: Arc<ThreadResources>,
+}
+
+impl PreparedThreadClone {
+    pub const fn tid(&self) -> LinuxTid {
+        self.reservation.tid
+    }
+
+    pub fn commit(self) -> Result<KernelContext, KernelOperationError> {
+        let Self {
+            reservation,
+            thread,
+            resources,
+        } = self;
+        let ThreadCloneReservation {
+            kernel,
+            task,
+            caller: _,
+            shared,
+            parent_resources: _,
+            parent_revision,
+            published_revision,
+            plan: _,
+            tid,
+            reservation,
+            failpoint,
+        } = reservation;
+        {
+            let mut state = kernel.registry().state.write();
+            ensure_task_unreserved(&state, task.key().id)?;
+            let Some(record) = state.tasks.get_mut(&task.key().id) else {
+                return Err(KernelOperationError::ParentExited);
+            };
+            if record.task.key() != task.key() {
+                return Err(KernelOperationError::ParentExited);
+            }
+            if record.revision != parent_revision {
+                return Err(KernelOperationError::StaleContext);
+            }
+            check_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
+            let claim = reservation.commit();
+            task.publish_thread(Arc::clone(&thread))?;
+            record.thread_claims.insert(tid, claim);
+            record.revision = published_revision;
+        }
+        Ok(KernelContext::from_parts(
+            kernel,
+            task,
+            thread,
+            shared,
+            resources,
+            published_revision,
+        ))
+    }
+}
+
 impl Kernel {
     pub fn reserve_fork(
         self: &Arc<Self>,
@@ -304,15 +412,15 @@ impl Kernel {
             .commit()
     }
 
-    /// Prepare a thread and its independently selectable files/fs associations,
-    /// then make the thread discoverable only at the registry commit point.
-    pub fn clone_thread(
+    /// Reserve a Linux TID while keeping the thread undiscoverable. The
+    /// execution adapter prepares its host registry/vCPU state from the typed
+    /// TID, then supplies the distinct registry identity to `prepare`.
+    pub fn reserve_thread_clone(
         self: &Arc<Self>,
         parent: &KernelContext,
         plan: ClonePlan,
-        registry_id: ThreadId,
         failpoint: Option<KernelFailpoint>,
-    ) -> Result<KernelContext, KernelOperationError> {
+    ) -> Result<ThreadCloneReservation, KernelOperationError> {
         self.sweep_retired_threads();
         if !Arc::ptr_eq(self, &parent.kernel) {
             return Err(KernelOperationError::ForeignContext);
@@ -321,53 +429,34 @@ impl Kernel {
             return Err(KernelOperationError::ExpectedThreadGroup);
         }
         let published_revision = next_revision(parent.revision)?;
-
         let (tid, reservation) = self.ids().reserve_thread()?;
         check_failpoint(failpoint, KernelFailpoint::AfterReserve)?;
-        let resources = Arc::new(ThreadResources::for_clone(
-            &parent.resources,
-            plan,
-            self.object_ids(),
-        )?);
-        let thread = parent.task.prepare_clone_thread(
-            ThreadKey {
-                tid,
-                serial: self.object_ids().thread_serial()?,
-            },
-            registry_id,
-            Arc::clone(&resources),
-            parent.thread.signal_state(),
-        );
-        check_failpoint(failpoint, KernelFailpoint::AfterObjects)?;
-        check_failpoint(failpoint, KernelFailpoint::AfterBackendPrepare)?;
-
-        {
-            let mut state = self.registry().state.write();
-            ensure_task_unreserved(&state, parent.task.key().id)?;
-            let Some(record) = state.tasks.get_mut(&parent.task.key().id) else {
-                return Err(KernelOperationError::ParentExited);
-            };
-            if record.task.key() != parent.task.key() {
-                return Err(KernelOperationError::ParentExited);
-            }
-            if record.revision != parent.revision {
-                return Err(KernelOperationError::StaleContext);
-            }
-            check_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
-            let claim = reservation.commit();
-            parent.task.publish_thread(Arc::clone(&thread))?;
-            record.thread_claims.insert(tid, claim);
-            record.revision = published_revision;
-        }
-
-        Ok(KernelContext::from_parts(
-            self.clone(),
-            Arc::clone(&parent.task),
-            thread,
-            Arc::clone(&parent.shared),
-            resources,
+        Ok(ThreadCloneReservation {
+            kernel: self.clone(),
+            task: Arc::clone(&parent.task),
+            caller: Arc::clone(&parent.thread),
+            shared: Arc::clone(&parent.shared),
+            parent_resources: Arc::clone(&parent.resources),
+            parent_revision: parent.revision,
             published_revision,
-        ))
+            plan,
+            tid,
+            reservation,
+            failpoint,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn clone_thread(
+        self: &Arc<Self>,
+        parent: &KernelContext,
+        plan: ClonePlan,
+        registry_id: ThreadId,
+        failpoint: Option<KernelFailpoint>,
+    ) -> Result<KernelContext, KernelOperationError> {
+        self.reserve_thread_clone(parent, plan, failpoint)?
+            .prepare(registry_id)?
+            .commit()
     }
 
     /// Test registry-locked association publication without invoking the exec
@@ -1101,6 +1190,30 @@ mod tests {
                 .is_err()
         );
         assert_eq!(kernel.registry().task_count(), 1);
+    }
+
+    #[test]
+    fn thread_clone_reservation_keeps_tid_private_until_commit() {
+        let (kernel, root) = bootstrap(190);
+        let plan = ClonePlan::from_flags(
+            LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+        )
+        .expect("thread plan");
+        let reservation = kernel
+            .reserve_thread_clone(&root, plan, None)
+            .expect("reserve thread");
+        let tid = reservation.tid();
+        assert!(root.task.thread(tid).is_none());
+
+        let registry_id = ThreadId::synthetic_for_tests(8_888);
+        let prepared = reservation.prepare(registry_id).expect("prepare thread");
+        assert_eq!(prepared.tid(), tid);
+        assert!(root.task.thread(tid).is_none());
+        let child = prepared.commit().expect("publish thread");
+
+        assert_eq!(child.thread.key().tid, tid);
+        assert_eq!(child.thread.registry_id(), registry_id);
+        assert!(root.task.thread(tid).is_some());
     }
 
     #[test]
