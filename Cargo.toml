@@ -82,6 +82,7 @@ debug = true
 split-debuginfo = "packed"
 
 [workspace.dependencies]
+arc-swap = "1.7.1"
 chrono = "0.4.44"
 anyhow = "1.0.100"
 bad64 = "0.12.0"
