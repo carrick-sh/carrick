@@ -833,6 +833,12 @@ impl PidfdWatch {
     }
 }
 
+impl crate::kernel::TaskExitSubscriber for PidfdWatch {
+    fn publish_exit(&self) {
+        PidfdWatch::publish_exit(self);
+    }
+}
+
 impl std::fmt::Debug for PidfdWatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PidfdWatch")
