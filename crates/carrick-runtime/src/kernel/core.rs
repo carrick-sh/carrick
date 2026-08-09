@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use carrick_hal::ThreadId;
 use parking_lot::RwLock;
 
 use super::ids::{LinuxTid, ObjectIdError, ObjectIdRegistry, ProcessGroupId, SessionId, TaskId};
 use super::objects::{
-    ObjectGraphError, ProcessGroup, Session, Task, TaskKey, TaskRef, TaskShared, ThreadKey,
+    ObjectGraphError, ProcessGroup, Session, Task, TaskKey, TaskRef, TaskShared, Thread, ThreadKey,
     ThreadRef, ThreadResources, Zombie,
 };
 use super::registry::{IdError, IdRegistry, TaskClaim, ThreadClaim};
@@ -16,15 +16,39 @@ use super::registry::{IdError, IdRegistry, TaskClaim, ThreadClaim};
 /// syscall across old and new bundles.
 #[derive(Debug)]
 pub struct KernelContext {
-    pub kernel: Arc<Kernel>,
-    pub task: TaskRef,
-    pub thread: ThreadRef,
-    pub shared: Arc<TaskShared>,
-    pub resources: Arc<ThreadResources>,
-    pub revision: TaskRevision,
+    pub(super) kernel: Arc<Kernel>,
+    pub(super) task: TaskRef,
+    pub(super) thread: ThreadRef,
+    pub(super) shared: Arc<TaskShared>,
+    pub(super) resources: Arc<ThreadResources>,
+    pub(super) revision: TaskRevision,
 }
 
 impl KernelContext {
+    pub fn kernel(&self) -> &Arc<Kernel> {
+        &self.kernel
+    }
+
+    pub fn task(&self) -> &TaskRef {
+        &self.task
+    }
+
+    pub fn thread(&self) -> &ThreadRef {
+        &self.thread
+    }
+
+    pub fn shared(&self) -> &Arc<TaskShared> {
+        &self.shared
+    }
+
+    pub fn resources(&self) -> &Arc<ThreadResources> {
+        &self.resources
+    }
+
+    pub const fn revision(&self) -> TaskRevision {
+        self.revision
+    }
+
     fn capture(
         kernel: Arc<Kernel>,
         task: TaskRef,
@@ -168,6 +192,8 @@ impl Kernel {
                         members: BTreeSet::from([task_key]),
                     },
                 )]),
+                reservations: BTreeMap::new(),
+                retired_threads: Vec::new(),
                 sessions: BTreeMap::from([(
                     session_id,
                     SessionRecord {
@@ -227,6 +253,13 @@ impl Kernel {
         let state = self.registry.state.read();
         if !state.tasks.contains_key(&state.root.id) {
             return Err(RegistryInvariantError::RootNotLive);
+        }
+        if state
+            .reservations
+            .keys()
+            .any(|task_id| !state.tasks.contains_key(task_id))
+        {
+            return Err(RegistryInvariantError::OrphanReservation);
         }
         for (task_id, record) in &state.tasks {
             let key = record.task.key();
@@ -288,6 +321,11 @@ impl Kernel {
                 if group.object.session() != *session_id {
                     return Err(RegistryInvariantError::SessionBacklink);
                 }
+            }
+        }
+        for retired in &state.retired_threads {
+            if !self.ids.is_reserved_number(retired._claim.raw()) {
+                return Err(RegistryInvariantError::ThreadClaims);
             }
         }
         for zombie in state.zombies.values() {
@@ -403,6 +441,10 @@ impl Registry {
     pub fn session_count(&self) -> usize {
         self.state.read().sessions.len()
     }
+
+    pub fn retired_thread_count(&self) -> usize {
+        self.state.read().retired_threads.len()
+    }
 }
 
 #[derive(Debug)]
@@ -411,6 +453,8 @@ pub(super) struct RegistryState {
     pub(super) tasks: BTreeMap<TaskId, TaskRecord>,
     pub(super) zombies: BTreeMap<TaskId, ZombieRecord>,
     pub(super) process_groups: BTreeMap<ProcessGroupId, ProcessGroupRecord>,
+    pub(super) reservations: BTreeMap<TaskId, carrick_hal::KernelTransactionId>,
+    pub(super) retired_threads: Vec<RetiredThreadRecord>,
     pub(super) sessions: BTreeMap<SessionId, SessionRecord>,
 }
 
@@ -427,6 +471,12 @@ pub(super) struct TaskRecord {
 pub(super) struct ZombieRecord {
     pub(super) zombie: Zombie,
     pub(super) _task_claim: TaskClaim,
+}
+
+#[derive(Debug)]
+pub(super) struct RetiredThreadRecord {
+    pub(super) thread: Weak<Thread>,
+    pub(super) _claim: ThreadClaim,
 }
 
 #[derive(Debug)]
@@ -463,6 +513,8 @@ pub enum RegistryInvariantError {
     RootNotLive,
     #[error("task map key, object key, or numeric claim disagree")]
     TaskIdentity,
+    #[error("operation reservation targets a non-live task")]
+    OrphanReservation,
     #[error("task has no process-group object")]
     MissingProcessGroup,
     #[error("task and process-group backlinks disagree")]

@@ -64,6 +64,7 @@ impl Kernel {
         diagnostic_name: String,
         failpoint: Option<KernelFailpoint>,
     ) -> Result<KernelContext, KernelOperationError> {
+        self.sweep_retired_threads();
         if !Arc::ptr_eq(self, &parent.kernel) {
             return Err(KernelOperationError::ForeignContext);
         }
@@ -97,19 +98,21 @@ impl Kernel {
             Arc::clone(&child_shared),
         ));
         let leader_tid = LinuxTid::for_task_leader(child_id);
-        let leader = child.attach_thread(
+        let leader = child.attach_fork_thread(
             ThreadKey {
                 tid: leader_tid,
                 serial: self.object_ids().thread_serial()?,
             },
             child_registry_id,
             Arc::clone(&child_resources),
+            parent.thread.signal_state(),
         )?;
         check_failpoint(failpoint, KernelFailpoint::AfterObjects)?;
         check_failpoint(failpoint, KernelFailpoint::AfterBackendPrepare)?;
 
         {
             let mut state = self.registry().state.write();
+            ensure_task_unreserved(&state, parent.task.key().id)?;
             let Some(parent_record) = state.tasks.get(&parent.task.key().id) else {
                 return Err(KernelOperationError::ParentExited);
             };
@@ -168,6 +171,7 @@ impl Kernel {
         registry_id: ThreadId,
         failpoint: Option<KernelFailpoint>,
     ) -> Result<KernelContext, KernelOperationError> {
+        self.sweep_retired_threads();
         if !Arc::ptr_eq(self, &parent.kernel) {
             return Err(KernelOperationError::ForeignContext);
         }
@@ -183,19 +187,21 @@ impl Kernel {
             plan,
             self.object_ids(),
         )?);
-        let thread = parent.task.prepare_thread(
+        let thread = parent.task.prepare_clone_thread(
             ThreadKey {
                 tid,
                 serial: self.object_ids().thread_serial()?,
             },
             registry_id,
             Arc::clone(&resources),
+            parent.thread.signal_state(),
         );
         check_failpoint(failpoint, KernelFailpoint::AfterObjects)?;
         check_failpoint(failpoint, KernelFailpoint::AfterBackendPrepare)?;
 
         {
             let mut state = self.registry().state.write();
+            ensure_task_unreserved(&state, parent.task.key().id)?;
             let Some(record) = state.tasks.get_mut(&parent.task.key().id) else {
                 return Err(KernelOperationError::ParentExited);
             };
@@ -222,8 +228,8 @@ impl Kernel {
         ))
     }
 
-    /// Test the same registry-locked association publication that exec will
-    /// use once its backend prepare/commit adapter lands.
+    /// Test registry-locked association publication without invoking the exec
+    /// backend stop/drain protocol.
     #[cfg(test)]
     pub(super) fn publish_task_associations(
         &self,
@@ -233,6 +239,7 @@ impl Kernel {
         resources: Arc<ThreadResources>,
     ) -> Result<TaskRevision, KernelOperationError> {
         let mut state = self.registry().state.write();
+        ensure_task_unreserved(&state, task_id)?;
         let record = state
             .tasks
             .get_mut(&task_id)
@@ -253,7 +260,9 @@ impl Kernel {
         &self,
         task_id: TaskId,
     ) -> Result<TaskOperationReservation, KernelOperationError> {
+        self.sweep_retired_threads();
         let state = self.registry().state.read();
+        ensure_task_unreserved(&state, task_id)?;
         let record = state
             .tasks
             .get(&task_id)
@@ -270,7 +279,9 @@ impl Kernel {
         task_id: TaskId,
         target_group: ProcessGroupId,
     ) -> Result<(), KernelOperationError> {
+        self.sweep_retired_threads();
         let mut state = self.registry().state.write();
+        ensure_task_unreserved(&state, task_id)?;
         let Some((task, revision)) = state
             .tasks
             .get(&task_id)
@@ -322,6 +333,7 @@ impl Kernel {
         let task_id = reservation.task.id;
         let task = {
             let state = self.registry().state.read();
+            ensure_task_unreserved(&state, task_id)?;
             let record = state
                 .tasks
                 .get(&task_id)
@@ -340,6 +352,7 @@ impl Kernel {
         check_failpoint(failpoint, KernelFailpoint::AfterBackendPrepare)?;
 
         let mut state = self.registry().state.write();
+        ensure_task_unreserved(&state, task_id)?;
         let Some(current) = state
             .tasks
             .get(&task_id)
@@ -404,6 +417,7 @@ impl Kernel {
         let task_id = reservation.task.id;
         let task = {
             let state = self.registry().state.read();
+            ensure_task_unreserved(&state, task_id)?;
             let record = state
                 .tasks
                 .get(&task_id)
@@ -434,6 +448,7 @@ impl Kernel {
         check_failpoint(failpoint, KernelFailpoint::AfterBackendPrepare)?;
 
         let mut state = self.registry().state.write();
+        ensure_task_unreserved(&state, task_id)?;
         let Some(current) = state
             .tasks
             .get(&task_id)
@@ -492,17 +507,33 @@ impl Kernel {
         rusage: TaskRusage,
         failpoint: Option<KernelFailpoint>,
     ) -> Result<Zombie, KernelOperationError> {
+        self.sweep_retired_threads();
         check_failpoint(failpoint, KernelFailpoint::AfterReserve)?;
         check_failpoint(failpoint, KernelFailpoint::AfterObjects)?;
         check_failpoint(failpoint, KernelFailpoint::AfterBackendPrepare)?;
 
         let mut state = self.registry().state.write();
-        let Some(record) = state.tasks.get(&task_id) else {
+        ensure_task_unreserved(&state, task_id)?;
+        let Some((exiting_task, retired_thread_count)) = state
+            .tasks
+            .get(&task_id)
+            .map(|record| (Arc::clone(&record.task), record.thread_claims.len()))
+        else {
             return Err(KernelOperationError::UnknownTask(task_id));
         };
-        let task_key = record.task.key();
+        let task_key = exiting_task.key();
         let adopter = (task_key != state.root).then_some(state.root);
-        let children = record.task.children();
+        let mut children = exiting_task.children();
+        children.sort_by_key(|child| child.serial);
+        for affected in children.iter().copied().chain(adopter) {
+            if state.tasks.contains_key(&affected.id) {
+                ensure_task_unreserved(&state, affected.id)?;
+            }
+        }
+        state
+            .retired_threads
+            .try_reserve_exact(retired_thread_count)
+            .map_err(|_| KernelOperationError::RetiredThreadCapacity(retired_thread_count))?;
         let mut revision_updates = std::collections::BTreeMap::new();
         for child_key in &children {
             if let Some(child) = state.tasks.get(&child_key.id) {
@@ -515,7 +546,7 @@ impl Kernel {
             }
         }
         check_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
-        if !record.task.begin_exit() {
+        if !exiting_task.begin_exit() {
             return Err(KernelOperationError::AlreadyExiting(task_id));
         }
         let Some(record) = state.tasks.remove(&task_id) else {
@@ -525,10 +556,20 @@ impl Kernel {
             task,
             revision: _,
             task_claim,
-            thread_claims: _,
+            thread_claims,
             diagnostic_name,
         } = record;
         let zombie = Zombie::from_task(&task, status, rusage, diagnostic_name);
+        for (tid, claim) in thread_claims {
+            if let Some(thread) = task.thread(tid) {
+                state
+                    .retired_threads
+                    .push(super::core::RetiredThreadRecord {
+                        thread: Arc::downgrade(&thread),
+                        _claim: claim,
+                    });
+            }
+        }
 
         for child_key in children {
             if let Some(child) = state.tasks.get(&child_key.id) {
@@ -585,7 +626,11 @@ impl Kernel {
         target: Option<TaskId>,
         mode: WaitMode,
     ) -> Result<WaitOutcome, KernelOperationError> {
+        self.sweep_retired_threads();
         let mut state = self.registry().state.write();
+        if mode == WaitMode::Consume {
+            ensure_task_unreserved(&state, parent_id)?;
+        }
         let Some(parent) = state.tasks.get(&parent_id).map(|record| record.task.key()) else {
             return Err(KernelOperationError::UnknownTask(parent_id));
         };
@@ -657,6 +702,16 @@ fn remove_group_member(
     }
 }
 
+fn ensure_task_unreserved(
+    state: &RegistryState,
+    task_id: TaskId,
+) -> Result<(), KernelOperationError> {
+    if state.reservations.contains_key(&task_id) {
+        return Err(KernelOperationError::TaskBusy(task_id));
+    }
+    Ok(())
+}
+
 fn check_failpoint(
     selected: Option<KernelFailpoint>,
     point: KernelFailpoint,
@@ -693,10 +748,14 @@ pub enum KernelOperationError {
     ForeignReservation,
     #[error("task revision space is exhausted")]
     RevisionExhausted,
+    #[error("could not reserve {0} retired-thread records")]
+    RetiredThreadCapacity(usize),
     #[error("task's process-group or session object disappeared before commit")]
     IdentityObjectMissing,
     #[error("kernel task {0:?} is not live")]
     UnknownTask(TaskId),
+    #[error("kernel task {0:?} has a preparing operation")]
+    TaskBusy(TaskId),
     #[error("kernel thread {0:?} is not live")]
     UnknownThread(LinuxTid),
     #[error("kernel task {0:?} is already exiting")]
@@ -719,12 +778,13 @@ pub enum KernelOperationError {
 
 #[cfg(test)]
 mod tests {
-    use carrick_abi::LinuxCloneFlags;
+    use carrick_abi::{LinuxCloneFlags, SigSet};
     use proptest::prelude::*;
 
     use super::*;
     use crate::kernel::{
-        Credentials, FileTable, FsContext, Mm, ObjectIdRegistry, RootBootstrap, Sighand,
+        Credentials, FileDescription, FileSlotNumber, FileTable, FsContext, LinuxSignal, Mm,
+        ObjectIdRegistry, RootBootstrap, Sighand, SignalDisposition, ThreadSignalState,
     };
 
     fn bootstrap(pid: i32) -> (Arc<Kernel>, KernelContext) {
@@ -750,6 +810,30 @@ mod tests {
     #[test]
     fn fork_publishes_task_and_independently_selected_resources() {
         let (kernel, root) = bootstrap(100);
+        let ignored = LinuxSignal::for_signal_number(2).expect("ignored signal");
+        let caught = LinuxSignal::for_signal_number(3).expect("caught signal");
+        root.shared
+            .sighand()
+            .set_disposition(ignored, SignalDisposition::Ignore);
+        root.shared
+            .sighand()
+            .set_disposition(caught, SignalDisposition::Caught);
+        let parent_signals =
+            ThreadSignalState::new(SigSet::EMPTY.with(4), SigSet::EMPTY.with(5), true, 2);
+        root.thread.replace_signal_state(parent_signals);
+        let slot = FileSlotNumber::for_open_fd(3).expect("file slot");
+        let description = Arc::new(FileDescription::regular(
+            kernel
+                .object_ids()
+                .file_description_id()
+                .expect("description"),
+        ));
+        assert!(
+            root.resources
+                .files()
+                .install(slot, Arc::clone(&description), false)
+                .is_none()
+        );
         let plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
         let child = kernel
             .fork_task(
@@ -768,6 +852,25 @@ mod tests {
             &root.resources.files(),
             &child.resources.files()
         ));
+        assert_eq!(
+            child.shared.sighand().disposition(ignored),
+            SignalDisposition::Ignore
+        );
+        assert_eq!(
+            child.shared.sighand().disposition(caught),
+            SignalDisposition::Caught
+        );
+        let child_signals = child.thread.signal_state();
+        assert_eq!(child_signals.blocked(), parent_signals.blocked());
+        assert!(child_signals.pending().is_empty());
+        assert!(child_signals.altstack_enabled());
+        assert_eq!(child_signals.handler_frame_depth(), 2);
+        let child_slot = child
+            .resources
+            .files()
+            .slot(slot)
+            .expect("fork copies file slot");
+        assert!(Arc::ptr_eq(&child_slot.description(), &description));
     }
 
     #[test]
@@ -1253,6 +1356,7 @@ mod tests {
             kernel.wait_child(root.task.key().id, Some(grandchild_id), WaitMode::Consume),
             Ok(WaitOutcome::Exited(_))
         ));
+        kernel.sweep_retired_threads();
         assert!(!kernel.ids().is_reserved_number(grandchild_id.raw()));
     }
 
@@ -1370,6 +1474,7 @@ mod tests {
             kernel.wait_child(root.task.key().id, Some(child_id), WaitMode::Consume),
             Ok(WaitOutcome::Exited(_))
         ));
+        kernel.sweep_retired_threads();
         assert!(!kernel.ids().is_reserved_number(child_id.raw()));
         assert_eq!(kernel.registry().zombie_count(), 0);
     }
