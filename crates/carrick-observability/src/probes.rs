@@ -922,6 +922,161 @@ impl HvpatchForkProcessSpecStage {
     }
 }
 
+/// Stable private-mapping roles reported by
+/// `hvpatch-fork-private-snapshot-outcome`.
+///
+/// The ordinals intentionally match the append-only fork-footprint taxonomy
+/// used by the existing Phase-4 census, so consumers can join the two ledgers
+/// without translating an investigation-local enum.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchForkPrivateSnapshotRole {
+    PrivateMmapArena = 1,
+    PrivateHeap = 2,
+    PrivateOverlay = 3,
+    PrivateHighAlias = 4,
+    PrivateWritableOther = 5,
+    PrivateReadOnlyOrInternal = 6,
+    SharedAperture = 7,
+    SharedOther = 8,
+    PrivatePageTables = 9,
+}
+
+impl HvpatchForkPrivateSnapshotRole {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+
+    pub const fn from_footprint_class(raw: i32) -> Option<Self> {
+        match raw {
+            1 => Some(Self::PrivateMmapArena),
+            2 => Some(Self::PrivateHeap),
+            3 => Some(Self::PrivateOverlay),
+            4 => Some(Self::PrivateHighAlias),
+            5 => Some(Self::PrivateWritableOther),
+            6 => Some(Self::PrivateReadOnlyOrInternal),
+            7 => Some(Self::SharedAperture),
+            8 => Some(Self::SharedOther),
+            9 => Some(Self::PrivatePageTables),
+            _ => None,
+        }
+    }
+}
+
+/// Host mechanism that produced one child's private mapping snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchForkPrivateSnapshotMethod {
+    MachCowRemap = 0,
+    SparseCopyFallback = 1,
+}
+
+impl HvpatchForkPrivateSnapshotMethod {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Timing half of the per-mapping private-snapshot DTrace record.
+///
+/// Keeping timing and outcome in separate five-scalar probes avoids macOS's
+/// qualified sixth-USDT-argument corruption while retaining guest identity,
+/// mapping address/size, duration, role, and mechanism.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchForkPrivateSnapshot {
+    child_pid: i32,
+    forking_tid: i32,
+    guest_start: u64,
+    mapped_size: u64,
+    elapsed_ns: u64,
+}
+
+impl HvpatchForkPrivateSnapshot {
+    pub const fn new(
+        child_pid: i32,
+        forking_tid: i32,
+        guest_start: u64,
+        mapped_size: u64,
+        elapsed_ns: u64,
+    ) -> Self {
+        Self {
+            child_pid,
+            forking_tid,
+            guest_start,
+            mapped_size,
+            elapsed_ns,
+        }
+    }
+
+    pub const fn child_pid(self) -> i32 {
+        self.child_pid
+    }
+
+    pub const fn forking_tid(self) -> i32 {
+        self.forking_tid
+    }
+
+    pub const fn guest_start(self) -> u64 {
+        self.guest_start
+    }
+
+    pub const fn mapped_size(self) -> u64 {
+        self.mapped_size
+    }
+
+    pub const fn elapsed_ns(self) -> u64 {
+        self.elapsed_ns
+    }
+}
+
+/// Classification half of the per-mapping private-snapshot DTrace record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchForkPrivateSnapshotOutcome {
+    child_pid: i32,
+    forking_tid: i32,
+    guest_start: u64,
+    role: HvpatchForkPrivateSnapshotRole,
+    method: HvpatchForkPrivateSnapshotMethod,
+}
+
+impl HvpatchForkPrivateSnapshotOutcome {
+    pub const fn new(
+        child_pid: i32,
+        forking_tid: i32,
+        guest_start: u64,
+        role: HvpatchForkPrivateSnapshotRole,
+        method: HvpatchForkPrivateSnapshotMethod,
+    ) -> Self {
+        Self {
+            child_pid,
+            forking_tid,
+            guest_start,
+            role,
+            method,
+        }
+    }
+
+    pub const fn child_pid(self) -> i32 {
+        self.child_pid
+    }
+
+    pub const fn forking_tid(self) -> i32 {
+        self.forking_tid
+    }
+
+    pub const fn guest_start(self) -> u64 {
+        self.guest_start
+    }
+
+    pub const fn role(self) -> HvpatchForkPrivateSnapshotRole {
+        self.role
+    }
+
+    pub const fn method(self) -> HvpatchForkPrivateSnapshotMethod {
+        self.method
+    }
+}
+
 /// Typed source record for `hvpatch-fork-quiesce`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HvpatchForkQuiesce {
@@ -1458,6 +1613,59 @@ mod hvpatch_guest_probe_abi {
             assert!(
                 source.matches(declaration).count() >= 2,
                 "missing fork process-spec stage ABI declaration {declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn fork_private_snapshot_provider_and_stub_keep_timing_and_outcome_separate() {
+        let timing = HvpatchForkPrivateSnapshot::new(42, 43, 0x4000, 0x8000, 1_750_000);
+        let outcome = HvpatchForkPrivateSnapshotOutcome::new(
+            42,
+            43,
+            0x4000,
+            HvpatchForkPrivateSnapshotRole::PrivateHeap,
+            HvpatchForkPrivateSnapshotMethod::MachCowRemap,
+        );
+        assert_eq!(timing.child_pid(), 42);
+        assert_eq!(timing.forking_tid(), 43);
+        assert_eq!(timing.guest_start(), 0x4000);
+        assert_eq!(timing.mapped_size(), 0x8000);
+        assert_eq!(timing.elapsed_ns(), 1_750_000);
+        assert_eq!(outcome.child_pid(), 42);
+        assert_eq!(outcome.forking_tid(), 43);
+        assert_eq!(outcome.guest_start(), 0x4000);
+        assert_eq!(outcome.role(), HvpatchForkPrivateSnapshotRole::PrivateHeap);
+        assert_eq!(
+            outcome.method(),
+            HvpatchForkPrivateSnapshotMethod::MachCowRemap
+        );
+        assert_eq!(HvpatchForkPrivateSnapshotRole::PrivateMmapArena.raw(), 1);
+        assert_eq!(HvpatchForkPrivateSnapshotRole::PrivateHeap.raw(), 2);
+        assert_eq!(HvpatchForkPrivateSnapshotRole::PrivatePageTables.raw(), 9);
+        assert_eq!(
+            HvpatchForkPrivateSnapshotRole::from_footprint_class(6),
+            Some(HvpatchForkPrivateSnapshotRole::PrivateReadOnlyOrInternal)
+        );
+        assert_eq!(
+            HvpatchForkPrivateSnapshotRole::from_footprint_class(10),
+            None
+        );
+        assert_eq!(HvpatchForkPrivateSnapshotMethod::MachCowRemap.raw(), 0);
+        assert_eq!(
+            HvpatchForkPrivateSnapshotMethod::SparseCopyFallback.raw(),
+            1
+        );
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn hvpatch__fork__private__snapshot(_: i32, _: i32, _: u64, _: u64, _: u64) {}",
+            "fn hvpatch__fork__private__snapshot__outcome(_: i32, _: i32, _: u64, _: u32, _: u32) {}",
+            "stub!(hvpatch_fork_private_snapshot(event: super::HvpatchForkPrivateSnapshot));",
+            "stub!(hvpatch_fork_private_snapshot_outcome(event: super::HvpatchForkPrivateSnapshotOutcome));",
+        ] {
+            assert!(
+                source.matches(declaration).count() >= 2,
+                "missing private snapshot ABI declaration {declaration}"
             );
         }
     }
@@ -3295,6 +3503,15 @@ mod real {
         /// 10=wrapper protections, 11=cumulative total), Linux child PID,
         /// Linux forking TID, elapsed nanoseconds, and stage-specific units.
         fn hvpatch__fork__process__spec__stage(_: u32, _: i32, _: i32, _: u64, _: u64) {}
+        /// Per-private-mapping snapshot timing. Args: Linux child PID, Linux
+        /// forking TID, guest virtual start, mapped bytes, elapsed nanoseconds.
+        /// Classification is a companion probe to respect macOS's five-reliable-
+        /// USDT-argument ceiling.
+        fn hvpatch__fork__private__snapshot(_: i32, _: i32, _: u64, _: u64, _: u64) {}
+        /// Per-private-mapping snapshot classification. Args: Linux child PID,
+        /// Linux forking TID, guest virtual start, stable mapping role
+        /// (1..=9), mechanism (0=Mach COW remap, 1=sparse-copy fallback).
+        fn hvpatch__fork__private__snapshot__outcome(_: i32, _: i32, _: u64, _: u32, _: u32) {}
         /// One in-process-fork sibling-quiesce result. Args: parent PID,
         /// forking TID, initial sibling-vCPU count, 200-us poll iterations, and
         /// elapsed nanoseconds.
@@ -4240,6 +4457,28 @@ mod real {
             event.forking_tid(),
             event.elapsed_ns(),
             event.units()
+        ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_fork_private_snapshot(event: super::HvpatchForkPrivateSnapshot) {
+        carrick_usdt::hvpatch__fork__private__snapshot!(|| (
+            event.child_pid(),
+            event.forking_tid(),
+            event.guest_start(),
+            event.mapped_size(),
+            event.elapsed_ns()
+        ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_fork_private_snapshot_outcome(event: super::HvpatchForkPrivateSnapshotOutcome) {
+        carrick_usdt::hvpatch__fork__private__snapshot__outcome!(|| (
+            event.child_pid(),
+            event.forking_tid(),
+            event.guest_start(),
+            event.role().raw(),
+            event.method().raw()
         ));
     }
 
@@ -5643,6 +5882,8 @@ mod stub {
     stub!(hvpatch_topology_lock(event: super::HvpatchTopologyLock));
     stub!(hvpatch_fork_runtime_stage(event: super::HvpatchForkRuntimeStage));
     stub!(hvpatch_fork_process_spec_stage(event: super::HvpatchForkProcessSpecStage));
+    stub!(hvpatch_fork_private_snapshot(event: super::HvpatchForkPrivateSnapshot));
+    stub!(hvpatch_fork_private_snapshot_outcome(event: super::HvpatchForkPrivateSnapshotOutcome));
     stub!(hvpatch_fork_quiesce(event: super::HvpatchForkQuiesce));
     stub!(vm_lifecycle(operation: u32, admission: i32));
     stub!(execve_argv(path: &str, argv: &[Vec<u8>]));
