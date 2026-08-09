@@ -5560,6 +5560,8 @@ impl HvfVmState {
         forking_tid: i32,
     ) -> Result<ProcessSpec, TrapError> {
         use carrick_observability::probes::{
+            HvpatchForkPrivateSnapshot, HvpatchForkPrivateSnapshotMethod,
+            HvpatchForkPrivateSnapshotOutcome, HvpatchForkPrivateSnapshotRole,
             HvpatchForkProcessSpecStage, HvpatchForkProcessSpecStagePhase,
         };
 
@@ -5669,14 +5671,45 @@ impl HvfVmState {
                     bank_size >> 30
                 )));
             }
-            let host = unsafe {
+            let snapshot_started = std::time::Instant::now();
+            let remap = unsafe {
                 crate::host_mapping::OwnedHostMapping::remap_copy(
                     mapping.host_addr,
                     mapping.size,
                     crate::host_mapping::HostMappingKind::ChildPrivateSnapshot,
                 )
+            };
+            let (host, snapshot_method) = match remap {
+                Ok(host) => (host, HvpatchForkPrivateSnapshotMethod::MachCowRemap),
+                Err(_) => (
+                    clone_region_for_child(mapping.host_addr, mapping.size, mapping.start)?,
+                    HvpatchForkPrivateSnapshotMethod::SparseCopyFallback,
+                ),
+            };
+            let snapshot_elapsed_ns = snapshot_started
+                .elapsed()
+                .as_nanos()
+                .min(u128::from(u64::MAX)) as u64;
+            if let Some(snapshot_role) = HvpatchForkPrivateSnapshotRole::from_footprint_class(
+                fork_footprint_class_id(mapping.start, false, mapping.guest_writable),
+            ) {
+                crate::probes::hvpatch_fork_private_snapshot(HvpatchForkPrivateSnapshot::new(
+                    child_pid,
+                    forking_tid,
+                    mapping.start,
+                    mapping.size as u64,
+                    snapshot_elapsed_ns,
+                ));
+                crate::probes::hvpatch_fork_private_snapshot_outcome(
+                    HvpatchForkPrivateSnapshotOutcome::new(
+                        child_pid,
+                        forking_tid,
+                        mapping.start,
+                        snapshot_role,
+                        snapshot_method,
+                    ),
+                );
             }
-            .or_else(|_| clone_region_for_child(mapping.host_addr, mapping.size, mapping.start))?;
             let mapped = if (crate::memory::LINUX_KERNEL_REGION_BASE
                 ..crate::memory::LINUX_KERNEL_REGION_BASE + TWO_MIB)
                 .contains(&mapping.start)
