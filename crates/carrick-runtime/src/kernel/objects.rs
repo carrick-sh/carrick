@@ -338,17 +338,22 @@ impl TaskShared {
         }
     }
 
-    pub fn for_new_task(
+    pub fn for_new_task_with_mm(
         parent: &Self,
         plan: ClonePlan,
         ids: &ObjectIdRegistry,
+        copied_mm: Option<Arc<Mm>>,
     ) -> Result<Self, TaskSharedCloneError> {
         if plan.task() != CloneTaskMode::NewTask {
             return Err(TaskSharedCloneError::ThreadGroupMustReuseTaskShared);
         }
-        let mm = match plan.mm() {
-            CloneObjectMode::Share => Arc::clone(&parent.mm),
-            CloneObjectMode::Copy => Arc::new(Mm::new_reference(ids.mm_id()?)),
+        let mm = match (plan.mm(), copied_mm) {
+            (CloneObjectMode::Share, None) => Arc::clone(&parent.mm),
+            (CloneObjectMode::Copy, Some(mm)) => mm,
+            (CloneObjectMode::Copy, None) => return Err(TaskSharedCloneError::MissingCopiedMm),
+            (CloneObjectMode::Share, Some(_)) => {
+                return Err(TaskSharedCloneError::UnexpectedCopiedMm);
+            }
         };
         let sighand = match plan.sighand() {
             CloneObjectMode::Share => Arc::clone(&parent.sighand),
@@ -357,6 +362,18 @@ impl TaskShared {
             }
         };
         Ok(Self::new(mm, sighand))
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_new_task_reference(
+        parent: &Self,
+        plan: ClonePlan,
+        ids: &ObjectIdRegistry,
+    ) -> Result<Self, TaskSharedCloneError> {
+        let copied_mm = (plan.mm() == CloneObjectMode::Copy)
+            .then(|| ids.mm_id().map(Mm::new_reference).map(Arc::new))
+            .transpose()?;
+        Self::for_new_task_with_mm(parent, plan, ids, copied_mm)
     }
 
     pub(super) fn for_exec(caller: &Self, ids: &ObjectIdRegistry) -> Result<Self, ObjectIdError> {
@@ -1205,6 +1222,10 @@ impl PidfdTarget {
 pub enum TaskSharedCloneError {
     #[error("thread-group clones must reuse the task's existing TaskShared association")]
     ThreadGroupMustReuseTaskShared,
+    #[error("a copied mm must be prepared before fork publication")]
+    MissingCopiedMm,
+    #[error("a shared-mm clone cannot publish a replacement mm")]
+    UnexpectedCopiedMm,
     #[error(transparent)]
     ObjectId(#[from] ObjectIdError),
 }
@@ -1309,8 +1330,8 @@ mod tests {
             | LinuxCloneFlags::FS;
         let plan = ClonePlan::from_flags(flags).expect("legal clone plan");
         let parent_shared = fixture.task.shared();
-        let child_shared =
-            TaskShared::for_new_task(&parent_shared, plan, &fixture.ids).expect("shared resources");
+        let child_shared = TaskShared::for_new_task_reference(&parent_shared, plan, &fixture.ids)
+            .expect("shared resources");
         let parent_resources = fixture.leader.resources();
         let child_resources = ThreadResources::for_clone(&parent_resources, plan, &fixture.ids)
             .expect("thread resources");
@@ -1351,7 +1372,7 @@ mod tests {
         let plan = ClonePlan::from_flags(flags).expect("thread plan");
 
         assert!(matches!(
-            TaskShared::for_new_task(&fixture.task.shared(), plan, &fixture.ids),
+            TaskShared::for_new_task_reference(&fixture.task.shared(), plan, &fixture.ids),
             Err(TaskSharedCloneError::ThreadGroupMustReuseTaskShared)
         ));
     }
