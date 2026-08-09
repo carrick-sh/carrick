@@ -130,24 +130,68 @@ where
                     img.initial_stack_pointer().unwrap_or(0),
                     img.regions().len() as u64,
                 );
+                let runtime_region_count = img.regions().len() as u64;
+                let runtime_mapped_bytes = img.regions().iter().map(|region| region.len()).sum();
+                let emit_runtime_stage =
+                    |phase: carrick_observability::probes::HvpatchExecRuntimeStagePhase,
+                     started: std::time::Instant| {
+                        if kernel.hvpatch_process.is_some() {
+                            let elapsed_ns =
+                                started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+                            crate::probes::hvpatch_exec_runtime_stage(
+                                carrick_observability::probes::HvpatchExecRuntimeStage::new(
+                                    phase,
+                                    elapsed_ns,
+                                    runtime_region_count,
+                                    runtime_mapped_bytes,
+                                ),
+                            );
+                        }
+                    };
+                let proc_state_started = std::time::Instant::now();
                 kernel
                     .dispatcher
                     .set_executable_identity(path.clone(), proc_argv, proc_env);
                 // Refresh /proc/self/maps + /proc/self/auxv for the new image.
                 apply_image_proc_state(&kernel.dispatcher, &img);
+                emit_runtime_stage(
+                    carrick_observability::probes::HvpatchExecRuntimeStagePhase::ProcState,
+                    proc_state_started,
+                );
+                let close_cloexec_started = std::time::Instant::now();
                 kernel.dispatcher.close_cloexec_fds();
+                emit_runtime_stage(
+                    carrick_observability::probes::HvpatchExecRuntimeStagePhase::CloseCloexec,
+                    close_cloexec_started,
+                );
+                let sibling_drain_started = std::time::Instant::now();
                 if self.registry.live_count() > 1 {
                     self.terminate_siblings_for_exec(kernel, engine)?;
                 }
+                emit_runtime_stage(
+                    carrick_observability::probes::HvpatchExecRuntimeStagePhase::SiblingDrain,
+                    sibling_drain_started,
+                );
                 // All hvpatch processes mutate stage-2 in one HVF VM. Keep
                 // process-local thread-group drain separate, but serialize the
                 // actual unmap/remap transaction across concurrent execs.
+                let topology_lock_started = std::time::Instant::now();
                 let _hvpatch_topology = kernel.hvpatch_process.as_ref().map(|_| {
                     crate::fork_quiesce::topology_lock()
                         .lock()
                         .unwrap_or_else(|error| error.into_inner())
                 });
+                emit_runtime_stage(
+                    carrick_observability::probes::HvpatchExecRuntimeStagePhase::TopologyLock,
+                    topology_lock_started,
+                );
+                let engine_replace_started = std::time::Instant::now();
                 engine.execve_into(&img)?;
+                emit_runtime_stage(
+                    carrick_observability::probes::HvpatchExecRuntimeStagePhase::EngineReplace,
+                    engine_replace_started,
+                );
+                let publication_started = std::time::Instant::now();
                 if kernel.hvpatch_process.is_some()
                     && std::env::var_os("CARRICK_HVPATCH_VERIFY_EXEC_CODE").is_some()
                 {
@@ -158,6 +202,10 @@ where
                 // (zeroed) and TPIDR_EL1 (reset) for the same thread/tid.
                 stamp_identity_page(engine, &kernel.dispatcher);
                 stamp_guest_tid(engine, self.this_tid, &self.registry);
+                emit_runtime_stage(
+                    carrick_observability::probes::HvpatchExecRuntimeStagePhase::Publication,
+                    publication_started,
+                );
                 if let Some(process) = kernel.hvpatch_process.as_ref() {
                     process.trace_lifecycle(
                         carrick_observability::probes::HvpatchGuestLifecyclePhase::Exec,

@@ -563,6 +563,12 @@ pub enum HvpatchExecReplaceStagePhase {
     Registers = 4,
     Mailbox = 5,
     PrivateFileArtifacts = 6,
+    /// Rebase or retrieve the complete stage-1 mapping plan for this process
+    /// bank. This happens before every other replacement stage.
+    BankPlan = 7,
+    /// Remove the predecessor image's stage-2 address space (or rebuild the VM
+    /// on the mature non-persistent path).
+    AddressSpaceTeardown = 8,
 }
 
 impl HvpatchExecReplaceStagePhase {
@@ -609,6 +615,68 @@ impl HvpatchExecReplaceStage {
 
     pub const fn mapping_count(self) -> u64 {
         self.mapping_count
+    }
+
+    pub const fn mapped_bytes(self) -> u64 {
+        self.mapped_bytes
+    }
+}
+
+/// Outer runtime stages between a loaded replacement image and publication to
+/// the Linux guest. This is deliberately separate from
+/// [`HvpatchExecReplaceStagePhase`]: `EngineReplace` encloses that engine's
+/// non-overlapping inner ledger. Ordinals are append-only DTrace ABI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchExecRuntimeStagePhase {
+    ProcState = 0,
+    CloseCloexec = 1,
+    SiblingDrain = 2,
+    TopologyLock = 3,
+    EngineReplace = 4,
+    Publication = 5,
+}
+
+impl HvpatchExecRuntimeStagePhase {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Typed source record for `hvpatch-exec-runtime-stage`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchExecRuntimeStage {
+    phase: HvpatchExecRuntimeStagePhase,
+    elapsed_ns: u64,
+    region_count: u64,
+    mapped_bytes: u64,
+}
+
+impl HvpatchExecRuntimeStage {
+    pub const fn new(
+        phase: HvpatchExecRuntimeStagePhase,
+        elapsed_ns: u64,
+        region_count: u64,
+        mapped_bytes: u64,
+    ) -> Self {
+        Self {
+            phase,
+            elapsed_ns,
+            region_count,
+            mapped_bytes,
+        }
+    }
+
+    pub const fn phase(self) -> HvpatchExecRuntimeStagePhase {
+        self.phase
+    }
+
+    pub const fn elapsed_ns(self) -> u64 {
+        self.elapsed_ns
+    }
+
+    pub const fn region_count(self) -> u64 {
+        self.region_count
     }
 
     pub const fn mapped_bytes(self) -> u64 {
@@ -942,10 +1010,41 @@ mod hvpatch_guest_probe_abi {
         assert_eq!(HvpatchExecReplaceStagePhase::Registers.raw(), 4);
         assert_eq!(HvpatchExecReplaceStagePhase::Mailbox.raw(), 5);
         assert_eq!(HvpatchExecReplaceStagePhase::PrivateFileArtifacts.raw(), 6);
+        assert_eq!(HvpatchExecReplaceStagePhase::BankPlan.raw(), 7);
+        assert_eq!(HvpatchExecReplaceStagePhase::AddressSpaceTeardown.raw(), 8);
         assert_eq!(event.phase(), HvpatchExecReplaceStagePhase::MapBackings);
         assert_eq!(event.elapsed_ns(), 825_000);
         assert_eq!(event.mapping_count(), 19);
         assert_eq!(event.mapped_bytes(), 42 * 1024 * 1024);
+    }
+
+    #[test]
+    fn exec_runtime_stage_event_keeps_outer_runtime_cost_typed() {
+        let event = HvpatchExecRuntimeStage::new(
+            HvpatchExecRuntimeStagePhase::EngineReplace,
+            1_250_000,
+            18,
+            38_805_159_936,
+        );
+        assert_eq!(HvpatchExecRuntimeStagePhase::ProcState.raw(), 0);
+        assert_eq!(HvpatchExecRuntimeStagePhase::CloseCloexec.raw(), 1);
+        assert_eq!(HvpatchExecRuntimeStagePhase::SiblingDrain.raw(), 2);
+        assert_eq!(HvpatchExecRuntimeStagePhase::TopologyLock.raw(), 3);
+        assert_eq!(HvpatchExecRuntimeStagePhase::EngineReplace.raw(), 4);
+        assert_eq!(HvpatchExecRuntimeStagePhase::Publication.raw(), 5);
+        assert_eq!(event.elapsed_ns(), 1_250_000);
+        assert_eq!(event.region_count(), 18);
+        assert_eq!(event.mapped_bytes(), 38_805_159_936);
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn hvpatch__exec__runtime__stage(_: u32, _: u64, _: u64, _: u64) {}",
+            "stub!(hvpatch_exec_runtime_stage(event: super::HvpatchExecRuntimeStage));",
+        ] {
+            assert!(
+                source.matches(declaration).count() >= 2,
+                "missing exec runtime-stage ABI declaration {declaration}"
+            );
+        }
     }
 }
 
@@ -2732,9 +2831,15 @@ mod real {
         /// Coarse persistent-VM exec replacement stage. Args: phase
         /// (0=alias cleanup, 1=drop old backings, 2=page-table manager,
         /// 3=map new backings, 4=registers, 5=mailbox, 6=private-file
-        /// artifacts), elapsed nanoseconds, replacement mapping count, and
-        /// total mapped bytes.
+        /// artifacts, 7=bank plan, 8=old address-space teardown), elapsed
+        /// nanoseconds, replacement mapping count, and total mapped bytes.
         fn hvpatch__exec__replace__stage(_: u32, _: u64, _: u64, _: u64) {}
+        /// Outer successful exec runtime stage. Args: phase (0=proc state,
+        /// 1=close-on-exec, 2=sibling drain, 3=topology lock, 4=engine replace,
+        /// 5=publication), elapsed nanoseconds, image region count, and mapped
+        /// bytes. The engine-replace phase encloses the inner replacement-stage
+        /// ledger rather than overlapping its siblings.
+        fn hvpatch__exec__runtime__stage(_: u32, _: u64, _: u64, _: u64) {}
         /// Fires every syscall trap. `arg0` is the ADDRESS of a
         /// `compat::GuestRegs` (`#[repr(C)]`); DTrace does
         /// `copyin(arg0, sizeof(gregs_t))` and reads fields by offset. A
@@ -3632,6 +3737,16 @@ mod real {
             event.phase().raw(),
             event.elapsed_ns(),
             event.mapping_count(),
+            event.mapped_bytes()
+        ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_exec_runtime_stage(event: super::HvpatchExecRuntimeStage) {
+        carrick_usdt::hvpatch__exec__runtime__stage!(|| (
+            event.phase().raw(),
+            event.elapsed_ns(),
+            event.region_count(),
             event.mapped_bytes()
         ));
     }
@@ -5021,6 +5136,7 @@ mod stub {
     stub!(hvpatch_exec_backing(event: super::HvpatchExecBacking));
     stub!(hvpatch_exec_stage2(event: super::HvpatchExecStage2));
     stub!(hvpatch_exec_replace_stage(event: super::HvpatchExecReplaceStage));
+    stub!(hvpatch_exec_runtime_stage(event: super::HvpatchExecRuntimeStage));
     stub!(vm_lifecycle(operation: u32, admission: i32));
     stub!(execve_argv(path: &str, argv: &[Vec<u8>]));
     stub!(host_image_base());

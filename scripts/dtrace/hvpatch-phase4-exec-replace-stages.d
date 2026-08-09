@@ -8,12 +8,13 @@
  * uint64_t mapped_bytes). Stable phase ordinals are 0=alias cleanup,
  * 1=drop old host backings, 2=page-table manager/reset metadata, 3=map new
  * host backings, 4=vCPU register publication, 5=vDSO/mailbox publication,
- * 6=lookup/create immutable private-file artifacts.
+ * 6=lookup/create immutable private-file artifacts, 7=rebase/cache the process
+ * bank plan, 8=remove the predecessor address space.
  * The script joins the event on its host thread to hvpatch-guest-lifecycle
  * phase 6, preserving Linux guest PID, TID and ASID rather than confusing
  * them with the Darwin tracer PID.
  *
- * Perturbation: six low-frequency USDT firings per successful exec plus the
+ * Perturbation: nine low-frequency USDT firings per successful exec plus the
  * existing lifecycle pair. No syscall, scheduler, or VM-fault provider is
  * armed. Same-instrument ratios are citable; untraced timing remains the
  * performance gate. Zero stage events is an error, never a zero-cost result.
@@ -43,7 +44,7 @@ carrick*:::hvpatch-guest-lifecycle
 }
 
 carrick*:::hvpatch-exec-replace-stage
-/(pid == $target || progenyof($target)) && arg0 <= 6 && self->guest_pid > 0/
+/(pid == $target || progenyof($target)) && arg0 <= 8 && self->guest_pid > 0/
 {
     events++;
     @stage_count[arg0] = count();
@@ -55,7 +56,7 @@ carrick*:::hvpatch-exec-replace-stage
 }
 
 carrick*:::hvpatch-exec-replace-stage
-/(pid == $target || progenyof($target)) && arg0 > 6/
+/(pid == $target || progenyof($target)) && arg0 > 8/
 {
     phase_errors++;
 }
