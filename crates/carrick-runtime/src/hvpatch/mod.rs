@@ -37,6 +37,15 @@ impl ProcessContext {
         self.table.live_process_count()
     }
 
+    /// Return the Linux process identity needed to bind a host service record
+    /// to this multiplexed address space. A missing record means the process is
+    /// already retired, so callers omit rather than forge diagnostic identity.
+    pub(crate) fn syscall_trace_identity(&self) -> Option<(i32, u32)> {
+        self.table
+            .process(self.pid)
+            .map(|process| (process.pid().raw(), u32::from(process.asid().raw())))
+    }
+
     /// Register a readiness subscriber for a pidfd targeting this shared VM's
     /// guest process namespace. Returns false only when the pid is neither live
     /// nor a retained zombie.
