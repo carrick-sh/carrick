@@ -2343,6 +2343,9 @@ pub(crate) struct HvfVmState {
     /// populated between the two halves of a single fork.
     fork_mapping_descs: Vec<ForkMappingDesc>,
     fork_child_descs: Vec<ForkMappingDesc>,
+    /// HvPatch owns one process-wide HVF VM across guest exec/fork lifecycle;
+    /// ordinary VMM preserves the mature destroy/recreate behavior.
+    persistent_vm_lifecycle: bool,
 }
 
 /// Thread/process exit must LEAK the per-thread host backings, never `munmap`
@@ -2617,6 +2620,7 @@ pub struct ThreadSpec {
     page_tables: std::sync::Arc<parking_lot::Mutex<Option<crate::page_table::PageTableManager>>>,
     mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
     syscall_transport: HvfSyscallTransport,
+    persistent_vm_lifecycle: bool,
 }
 
 // SAFETY: `ThreadSpec` carries raw `*mut u8` host pointers (inside the
@@ -2636,6 +2640,10 @@ pub struct ThreadSpec;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfVmState {
+    pub(crate) fn set_persistent_vm_lifecycle(&mut self, enabled: bool) {
+        self.persistent_vm_lifecycle = enabled;
+    }
+
     fn seed_readonly_spans_from_plan(&self, plan: &GuestMappingPlan) {
         for span in &plan.ro_spans {
             let Ok(len) = usize::try_from(span.len) else {
@@ -2680,6 +2688,7 @@ impl HvfVmState {
             vfork_share: false,
             fork_mapping_descs: Vec::new(),
             fork_child_descs: Vec::new(),
+            persistent_vm_lifecycle: false,
         };
         state.seed_readonly_spans_from_plan(plan);
 
@@ -4885,6 +4894,7 @@ impl HvfVmState {
             page_tables: std::sync::Arc::clone(&self.page_tables),
             mailbox_slots: std::sync::Arc::clone(&self.mailbox_slots),
             syscall_transport: self.syscall_transport,
+            persistent_vm_lifecycle: self.persistent_vm_lifecycle,
         })
     }
 
@@ -4903,6 +4913,7 @@ impl HvfVmState {
             page_tables,
             mailbox_slots,
             syscall_transport,
+            persistent_vm_lifecycle,
         } = spec;
 
         // The spec captured `vm` at clone time. If a fork rebuilt the VM since
@@ -4935,6 +4946,7 @@ impl HvfVmState {
             vfork_share: false,
             fork_mapping_descs: Vec::new(),
             fork_child_descs: Vec::new(),
+            persistent_vm_lifecycle,
         };
 
         for mapping in mappings {
@@ -4951,9 +4963,29 @@ impl HvfVmState {
         Ok((state, vcpu, mailbox))
     }
 
-    /// `execve(2)` image replacement: tear down + rebuild the VM around the new
-    /// image, reset the vCPU to "initial process startup" (zeroed GPRs, EL0
-    /// trampoline). Clears the alias registry. Preserves `is_forked_child`.
+    /// Remove every stage-2 range owned by the current guest address space
+    /// while retaining the process-wide HVF VM. The per-thread mapping list
+    /// covers the boot image; the alias registry contributes dynamic mappings
+    /// installed by any sibling. Duplicate IPA extents are unmap-once.
+    fn unmap_address_space_for_exec(&self) -> Result<(), TrapError> {
+        let mut extents = std::collections::BTreeSet::new();
+        extents.extend(self.mappings.iter().map(|m| (m.ipa, m.size)));
+        extents.extend(alias_registry().lock().iter().map(|m| (m.ipa, m.size)));
+        for (ipa, size) in extents {
+            let rc = unsafe { applevisor_sys::hv_vm_unmap(ipa, size) };
+            if rc != 0 {
+                return Err(TrapError::Hypervisor(format!(
+                    "hvpatch exec hv_vm_unmap(ipa=0x{ipa:x}, size={size}) failed: 0x{rc:x}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// `execve(2)` image replacement. Ordinary VMM tears down and rebuilds the
+    /// VM; hvpatch retains its one process-wide VM and replaces only stage-2
+    /// mappings plus vCPU architectural state. Clears the alias registry and
+    /// preserves `is_forked_child`.
     pub(crate) fn execve_rebuild(
         &mut self,
         vcpu: &mut applevisor::vcpu::Vcpu,
@@ -4962,32 +4994,6 @@ impl HvfVmState {
     ) -> Result<(), TrapError> {
         use applevisor::prelude::*;
 
-        // execve replaces the WHOLE address space: drop every process-shared alias
-        // index entry so a stale pre-exec high-VA `host_addr` can never be resolved
-        // by a syscall in the new image. (execve already killed sibling threads, so
-        // no other thread is mid-lookup against these entries.)
-        alias_registry().lock().clear();
-
-        // Tear down the current HVF VM. Same dance as fork(): destroy vCPU then VM
-        // via raw API (applevisor's Drop is bypassed).
-        let inherited_vcpu_id = vcpu.id();
-        let vcpu_destroy_rc = unsafe { applevisor_sys::hv_vcpu_destroy(inherited_vcpu_id) };
-        if vcpu_destroy_rc == 0 {
-            vcpu_destroyed(inherited_vcpu_id);
-        }
-        crate::probes::vm_lifecycle(2, -1);
-        let vm_destroy_rc = unsafe { applevisor_sys::hv_vm_destroy() };
-        if vm_destroy_rc == 0 {
-            record_vm_released();
-        }
-
-        // Create a fresh VM + vCPU.
-        let (new_vm, permit) = create_vm_with_admission(VmCreateAdmission::ExecveRebuild)?;
-        let new_vcpu = create_vcpu_with_permit(&new_vm, permit)?;
-        enable_el0_counter_access(new_vcpu.id());
-        self.vcpu_id = new_vcpu.id();
-        self.vcpu_handle = new_vcpu.get_handle();
-
         // Preserve `is_forked_child` across execve. A process that descended from
         // the original `carrick run` invocation should keep using the
         // `_exit`-without-JSON shutdown path even after it execve's into a
@@ -4995,17 +5001,47 @@ impl HvfVmState {
         // own JSON report to stdout (interleaved with the parent's), making the
         // user-visible output unreadable.
         let was_forked_child = self.is_forked_child;
-        // Swap the new VM + vCPU into place WITHOUT running Drop on the old.
-        std::mem::forget(std::mem::replace(vcpu, new_vcpu));
-        replace_destroyed_vm(self, new_vm);
-        // LEAK the old image's mappings (do NOT drop): the old VM was just
-        // raw-`hv_vm_destroy`'d, and the original monolithic `execve_into` swapped
-        // the whole `HvfInner` via `ptr::write`/`mem::forget` and so never ran Drop
-        // on the old mappings (the leak-until-exit discipline; the kernel reclaims
-        // at process exit). Dropping here would `munmap` the old `OwnedHostMapping`s
-        // — harmless for the now-unmapped image, but we keep the exact discipline so
-        // no stale alias-registry/sibling reference can dangle.
-        std::mem::forget(std::mem::take(&mut self.mappings));
+        if self.persistent_vm_lifecycle {
+            // The vCPU is stopped at the execve syscall exit and every sibling
+            // has already retired. Remove the old process address space from the
+            // live VM, then reuse this vCPU and VM for the replacement image.
+            self.unmap_address_space_for_exec()?;
+        } else {
+            // Mature VMM behavior: tear down the current HVF VM and rebuild it.
+            let inherited_vcpu_id = vcpu.id();
+            let vcpu_destroy_rc = unsafe { applevisor_sys::hv_vcpu_destroy(inherited_vcpu_id) };
+            if vcpu_destroy_rc == 0 {
+                vcpu_destroyed(inherited_vcpu_id);
+            }
+            crate::probes::vm_lifecycle(2, -1);
+            let vm_destroy_rc = unsafe { applevisor_sys::hv_vm_destroy() };
+            if vm_destroy_rc == 0 {
+                record_vm_released();
+            }
+
+            let (new_vm, permit) = create_vm_with_admission(VmCreateAdmission::ExecveRebuild)?;
+            let new_vcpu = create_vcpu_with_permit(&new_vm, permit)?;
+            enable_el0_counter_access(new_vcpu.id());
+            self.vcpu_id = new_vcpu.id();
+            self.vcpu_handle = new_vcpu.get_handle();
+            // Swap the new VM + vCPU into place WITHOUT running Drop on the old.
+            std::mem::forget(std::mem::replace(vcpu, new_vcpu));
+            replace_destroyed_vm(self, new_vm);
+        }
+        // execve replaces the WHOLE address space: clear every dynamic alias
+        // after persistent-mode unmap has consumed its extents.
+        alias_registry().lock().clear();
+        if self.persistent_vm_lifecycle {
+            // Stage-2 no longer references these ranges and every alias index was
+            // cleared above, so reclaim host mappings owned by the execing thread.
+            // Unowned sibling projections drop as no-ops.
+            drop(std::mem::take(&mut self.mappings));
+        } else {
+            // Preserve mature VMM's historical leak-until-process-exit discipline:
+            // the old VM was raw-destroyed and sibling/alias projections may still
+            // carry non-owning pointers into these backings.
+            std::mem::forget(std::mem::take(&mut self.mappings));
+        }
         self.reclaim_snapshot = None;
         self.last_exit_class = 0;
         self.last_fault_esr = 0;

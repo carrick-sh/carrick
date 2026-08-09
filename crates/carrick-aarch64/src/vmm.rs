@@ -298,6 +298,11 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// pair on the SAME VM (`clone(CLONE_THREAD)`) without re-registering memory.
     type SiblingBuilder: Send;
 
+    /// Retain the host VM across guest process lifecycle operations. HVF's
+    /// hvpatch lane overrides this; ordinary VMM and non-HVF backends preserve
+    /// their established rebuild behavior.
+    fn set_persistent_vm_lifecycle(&mut self, _enabled: bool) {}
+
     // ── memory windows + stage-2 (the hv_vm_map / KVM-slot seam) ──
     //
     // NOTE: `host_ptr` / `host_ptr_mut` / `write_gpa` are inherited from the shared

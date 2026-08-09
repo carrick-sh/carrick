@@ -642,6 +642,12 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
     type KickHandle: VcpuKick + 'static;
     type SiblingSpec: Send;
 
+    /// Select a backend lifecycle in which guest exec/fork operations retain
+    /// one host VM and replace only per-process address-space state. Backends
+    /// without shared-VM process support keep the default no-op; callers still
+    /// gate process creation on their explicit backend policy.
+    fn set_persistent_vm_lifecycle(&mut self, _enabled: bool) {}
+
     fn kick_handle(&self) -> Self::KickHandle;
     fn wait_for_vcpu_slot();
     /// Live concurrent-vCPU budget N for the admission scheduler (the M:N pool).

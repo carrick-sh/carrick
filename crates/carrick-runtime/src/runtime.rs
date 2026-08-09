@@ -742,6 +742,10 @@ fn run_address_space_with_hvf_and_dispatcher(
         // Build the engine (create VM + vCPU, map the address space, park at the EL0
         // trampoline) — the shared `Aarch64EngineCore<HvfAarch64Vmm>` bring-up.
         let mut trap = crate::trap::new_hvf_trap_engine(&image)?;
+        carrick_hal::ThreadedEngine::set_persistent_vm_lifecycle(
+            &mut trap,
+            persistent_hvf_vm_lifecycle(dispatcher.execution_backend()),
+        );
         // Hand the dispatcher the real region list + auxv so /proc/self/maps
         // (regions, bootstrap pages, stack) and /proc/self/auxv reflect the loaded
         // ELF instead of the legacy summary. Language runtimes, malloc
@@ -836,6 +840,10 @@ fn with_hvf_syscall_mailbox(image: AddressSpace) -> Result<AddressSpace, Address
 enum ImageFinalizer {
     Vmm,
     HvPatch,
+}
+
+fn persistent_hvf_vm_lifecycle(backend: crate::page_profile::ExecutionBackend) -> bool {
+    backend == crate::page_profile::ExecutionBackend::HvPatch
 }
 
 fn image_finalizer_for_backend(
@@ -2431,6 +2439,19 @@ mod tests {
         assert!(
             image_finalizer_for_backend(crate::page_profile::ExecutionBackend::Native).is_err()
         );
+    }
+
+    #[test]
+    fn only_hvpatch_selects_persistent_hvf_vm_lifecycle() {
+        assert!(persistent_hvf_vm_lifecycle(
+            crate::page_profile::ExecutionBackend::HvPatch
+        ));
+        assert!(!persistent_hvf_vm_lifecycle(
+            crate::page_profile::ExecutionBackend::Vmm
+        ));
+        assert!(!persistent_hvf_vm_lifecycle(
+            crate::page_profile::ExecutionBackend::Native
+        ));
     }
 
     fn rootfs_with(files: &[(&str, &[u8])]) -> crate::rootfs::RootFs {
