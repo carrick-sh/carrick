@@ -483,6 +483,11 @@ pub(crate) fn finish_hvpatch_image(
     max_traps: usize,
     debug_state_path: Option<&PathBuf>,
 ) -> Result<RunResult, RuntimeError> {
+    // Offline stack attribution needs the exact Carrick Mach-O identity on
+    // every file/rootfs/raw-image path before any syscall-service probe can
+    // fire. All dyld queries remain inside the USDT closure, so an untraced
+    // launch pays only this disabled-probe call.
+    crate::probes::host_image_base();
     let prepared = prepare_image(image, InfoPage::default()).map_err(|error| {
         RuntimeError::Unsupported(format!("hvpatch image preparation failed: {error}"))
     })?;
@@ -609,6 +614,30 @@ mod tests {
         );
         assert!(prepared.manifest.is_empty());
         assert!(prepared.island_bases.is_empty());
+    }
+
+    #[test]
+    fn every_hvpatch_image_publishes_host_identity_before_preparation() {
+        let source = include_str!("mod.rs");
+        let function = source
+            .split_once("pub(crate) fn finish_hvpatch_image")
+            .expect("finish_hvpatch_image definition")
+            .1
+            .split_once("pub(crate) fn run_static_hvpatch")
+            .expect("end of finish_hvpatch_image")
+            .0;
+        let publish_needle = ["crate::probes::", "host_image_base();"].concat();
+        let publish = function
+            .find(&publish_needle)
+            .expect("hvpatch host-image publication");
+        let guest_load = function
+            .find("prepare_image(image")
+            .expect("hvpatch preparation");
+
+        assert!(
+            publish < guest_load,
+            "host identity must be available on every image path before service probes"
+        );
     }
 
     #[test]

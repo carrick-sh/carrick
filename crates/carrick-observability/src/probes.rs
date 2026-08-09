@@ -1742,8 +1742,10 @@ mod hvpatch_guest_probe_abi {
         for declaration in [
             "fn hvpatch__syscall__service__begin(_: i32, _: i32, _: u32, _: u64) {}",
             "fn hvpatch__syscall__service(_: i32, _: i32, _: u32, _: u64, _: u64) {}",
+            "fn hvpatch__syscall__service__clear(_: i32, _: i32, _: u32, _: u64) {}",
             "stub!(hvpatch_syscall_service_begin(event: super::HvpatchSyscallService) -> Option<std::time::Instant> => None);",
             "stub!(hvpatch_syscall_service(event: super::HvpatchSyscallService));",
+            "stub!(hvpatch_syscall_service_clear(event: super::HvpatchSyscallService));",
         ] {
             assert!(
                 source.matches(declaration).count() >= 2,
@@ -3531,6 +3533,10 @@ mod real {
         /// TID, ASID, Linux syscall number, and monotonic duration nanoseconds.
         fn hvpatch__syscall__service__begin(_: i32, _: i32, _: u32, _: u64) {}
         fn hvpatch__syscall__service(_: i32, _: i32, _: u32, _: u64, _: u64) {}
+        /// Distinct post-completion retirement marker. Keeping this separate
+        /// lets DTrace consumers read and then clear thread-local join state
+        /// without relying on action ordering within one probe clause.
+        fn hvpatch__syscall__service__clear(_: i32, _: i32, _: u32, _: u64) {}
         /// Fork snapshot timing anchor. Args: child guest PID and the guest TID
         /// that issued clone/fork. Consumers key `timestamp` by child PID and
         /// subtract it from `hvpatch__fork__snapshot__end`.
@@ -4441,6 +4447,16 @@ mod real {
             event.asid(),
             event.number(),
             event.duration_ns()
+        ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_syscall_service_clear(event: super::HvpatchSyscallService) {
+        carrick_usdt::hvpatch__syscall__service__clear!(|| (
+            event.pid(),
+            event.tid(),
+            event.asid(),
+            event.number()
         ));
     }
 
@@ -5987,6 +6003,7 @@ mod stub {
     stub!(hvpatch_guest_address_space(event: super::HvpatchGuestAddressSpace));
     stub!(hvpatch_syscall_service_begin(event: super::HvpatchSyscallService) -> Option<std::time::Instant> => None);
     stub!(hvpatch_syscall_service(event: super::HvpatchSyscallService));
+    stub!(hvpatch_syscall_service_clear(event: super::HvpatchSyscallService));
     stub!(hvpatch_fork_snapshot_begin(child_pid: i32, forking_tid: i32));
     stub!(hvpatch_fork_snapshot_end(child_pid: i32, local_regions: u64, candidate_regions: u64, added_regions: u64, added_bytes: u64));
     stub!(hvpatch_fork_snapshot_shape(child_pid: i32, private_added_regions: u64, shared_added_regions: u64, largest_added_bytes: u64, bank_used_bytes: u64));
