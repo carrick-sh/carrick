@@ -5559,7 +5559,24 @@ impl HvfVmState {
         child_pid: i32,
         forking_tid: i32,
     ) -> Result<ProcessSpec, TrapError> {
+        use carrick_observability::probes::{
+            HvpatchForkProcessSpecStage, HvpatchForkProcessSpecStagePhase,
+        };
+
+        let emit_stage =
+            |phase: HvpatchForkProcessSpecStagePhase, started: std::time::Instant, units: u64| {
+                let elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+                crate::probes::hvpatch_fork_process_spec_stage(HvpatchForkProcessSpecStage::new(
+                    phase,
+                    child_pid,
+                    forking_tid,
+                    elapsed_ns,
+                    units,
+                ));
+            };
+
         crate::probes::hvpatch_fork_snapshot_begin(child_pid, forking_tid);
+        let stage_started = std::time::Instant::now();
         const STAGE2_PAGE: u64 = 16 * 1024;
         let bank_end = bank_base.checked_add(bank_size).ok_or_else(|| {
             TrapError::Hypervisor("hvpatch child process bank overflow".to_owned())
@@ -5601,6 +5618,13 @@ impl HvfVmState {
                 source_mappings.push(mapping);
             }
         }
+        emit_stage(
+            HvpatchForkProcessSpecStagePhase::AliasUnion,
+            stage_started,
+            source_mappings.len() as u64,
+        );
+
+        let stage_started = std::time::Instant::now();
         let mut mappings = Vec::with_capacity(source_mappings.len());
 
         // Put the stage-1 backing at the bank root promised by TTBR, regardless
@@ -5689,7 +5713,13 @@ impl HvfVmState {
                 shared_key_offset: mapping.shared_key_offset,
             });
         }
+        emit_stage(
+            HvpatchForkProcessSpecStagePhase::PrivateSnapshot,
+            stage_started,
+            cursor.saturating_sub(bank_base),
+        );
 
+        let stage_started = std::time::Instant::now();
         for mapping in &mappings {
             let Some(translated) = page_tables.translate(mapping.start) else {
                 return Err(TrapError::Hypervisor(format!(
@@ -5704,8 +5734,15 @@ impl HvfVmState {
                 )));
             }
         }
+        emit_stage(
+            HvpatchForkProcessSpecStagePhase::Validation,
+            stage_started,
+            mappings.len() as u64,
+        );
 
+        let stage_started = std::time::Instant::now();
         let table_bytes = page_tables.clone().into_bytes();
+        let table_bytes_len = table_bytes.len() as u64;
         let table = mappings
             .iter_mut()
             .find(|mapping| mapping.start == crate::memory::LINUX_PAGE_TABLES_BASE)
@@ -5724,6 +5761,11 @@ impl HvfVmState {
                 table_bytes.len(),
             );
         }
+        emit_stage(
+            HvpatchForkProcessSpecStagePhase::TablePublish,
+            stage_started,
+            table_bytes_len,
+        );
 
         crate::probes::hvpatch_fork_snapshot_end(
             child_pid,
@@ -5740,12 +5782,21 @@ impl HvfVmState {
             cursor.saturating_sub(bank_base),
         );
 
-        Ok(ProcessSpec {
+        let stage_started = std::time::Instant::now();
+        let protections = std::sync::Arc::new(MemoryProtections::from_snapshot(
+            self.protections.snapshot_all(),
+        ));
+        emit_stage(
+            HvpatchForkProcessSpecStagePhase::BackendProtections,
+            stage_started,
+            0,
+        );
+
+        let stage_started = std::time::Instant::now();
+        let spec = ProcessSpec {
             vm: (*self._vm).clone(),
             mappings,
-            protections: std::sync::Arc::new(MemoryProtections::from_snapshot(
-                self.protections.snapshot_all(),
-            )),
+            protections,
             page_tables: std::sync::Arc::new(parking_lot::Mutex::new(Some(page_tables.clone()))),
             mailbox_slots: std::sync::Arc::clone(&self.mailbox_slots),
             syscall_transport: self.syscall_transport,
@@ -5755,7 +5806,13 @@ impl HvfVmState {
                 cursor,
                 2 * 1024 * 1024,
             )?)),
-        })
+        };
+        emit_stage(
+            HvpatchForkProcessSpecStagePhase::BackendSpecFinalize,
+            stage_started,
+            carrick_mem::memory::LINUX_PAGE_TABLES_SIZE,
+        );
+        Ok(spec)
     }
 
     pub(crate) fn from_process_spec(
