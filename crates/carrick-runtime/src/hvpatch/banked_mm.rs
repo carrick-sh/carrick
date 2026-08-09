@@ -72,8 +72,7 @@ mod tests {
     fn observes_live_binding_and_keeps_last_binding_after_retirement() {
         let pid = GuestPid::root();
         let table = Arc::new(ProcessTable::new_root(pid, 0x8000).expect("root table"));
-        let mm = table.mm(pid).expect("typed mm");
-        let backend = mm.backend().expect("banked backend");
+        let backend = table.mm_backend(pid).expect("banked backend");
         let initial = backend.binding();
 
         table.exec_process(pid, 0xc000).expect("replace root");
@@ -93,8 +92,7 @@ mod tests {
     fn fails_closed_when_snapshot_authority_is_elsewhere() {
         let pid = GuestPid::root();
         let table = Arc::new(ProcessTable::new_root(pid, 0x8000).expect("root table"));
-        let mm = table.mm(pid).expect("typed mm");
-        let backend = mm.backend().expect("banked backend");
+        let backend = table.mm_backend(pid).expect("banked backend");
 
         assert_eq!(
             backend.vma_summaries(),
