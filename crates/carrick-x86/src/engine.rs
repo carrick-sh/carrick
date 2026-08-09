@@ -1458,6 +1458,7 @@ impl<V: X86Vmm> ThreadedEngine for X86EngineCore<V> {
     type Arch = X8664GuestArch;
     type KickHandle = V::KickHandle;
     type SiblingSpec = X86SiblingSpec<V>;
+    type ProcessSpec = ();
 
     fn kick_handle(&self) -> Self::KickHandle {
         self.vm.kick_handle()

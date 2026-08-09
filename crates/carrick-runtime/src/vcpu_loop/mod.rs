@@ -396,7 +396,7 @@ use signal::el0_debug_signal;
 pub(crate) struct KernelState {
     pub(crate) dispatcher: SyscallDispatcher,
     pub(crate) reporter: CompatReporter,
-    pub(crate) fork: Box<dyn HostForkCoordinator>,
+    pub(crate) fork: Arc<dyn HostForkCoordinator>,
     /// Per-backend signal ARRIVAL / wake mechanism (kicker+futex on KVM, the
     /// kqueue pump / self-pipe / xsig ring on HVF). The neutral pending STORE is
     /// carrick-signal-core; this is only how an async signal physically wakes a
@@ -410,7 +410,7 @@ pub(crate) struct KernelState {
 impl KernelState {
     pub(crate) fn new(
         dispatcher: SyscallDispatcher,
-        fork: Box<dyn HostForkCoordinator>,
+        fork: Arc<dyn HostForkCoordinator>,
         signal_arrival: Arc<dyn carrick_hal::SignalArrival>,
         hvpatch_process: Option<crate::hvpatch::ProcessContext>,
     ) -> Self {
@@ -433,6 +433,15 @@ impl KernelState {
 
     fn exec_replacing_other_thread(&self, tid: ThreadId) -> bool {
         crate::fork_quiesce::exec_replacing_other_thread(tid)
+    }
+
+    /// True for a Linux child process multiplexed inside the current host
+    /// process.  These children must return a `ProcessExit` to the lifecycle
+    /// owner; the legacy fork-child paths below must never call host `_exit`.
+    fn is_hvpatch_child(&self) -> bool {
+        self.hvpatch_process
+            .as_ref()
+            .is_some_and(crate::hvpatch::ProcessContext::is_child)
     }
 }
 
@@ -1841,6 +1850,10 @@ where
     stamp_guest_tid(&engine, state.this_tid, &state.registry);
     // Run the vCPU loop in a closure so we can run vCPU cleanup on EVERY exit
     // path — `?` errors, early returns, and the trap-limit fall-through alike.
+    let is_hvpatch_child = kernel
+        .hvpatch_process
+        .as_ref()
+        .is_some_and(crate::hvpatch::ProcessContext::is_child);
     let result: Result<VcpuLoopOutcome, RuntimeError> = (|| {
         // Progress-aware trap watchdog: bound the traps SINCE THE LAST DELIVERED
         // SIGNAL HANDLER, not the lifetime total. A guest legitimately spinning
@@ -1996,7 +2009,10 @@ where
                                 (syndrome >> 26) & 0x3f
                             );
                         }
-                        if engine.is_forked_child() || kernel.dispatcher.is_forked_guest_process() {
+                        if !kernel.is_hvpatch_child()
+                            && (engine.is_forked_child()
+                                || kernel.dispatcher.is_forked_guest_process())
+                        {
                             let out = kernel.dispatcher.stdout();
                             let err = kernel.dispatcher.stderr();
                             kernel.dispatcher.cleanup_sysv_ipc_on_process_exit();
@@ -2064,7 +2080,9 @@ where
                     crate::trap::dump_kick_stats();
                     // A forked child process (real macOS fork) exits via _exit so
                     // the rebuilt HVF context doesn't run the panicky Drops.
-                    if engine.is_forked_child() || kernel.dispatcher.is_forked_guest_process() {
+                    if !kernel.is_hvpatch_child()
+                        && (engine.is_forked_child() || kernel.dispatcher.is_forked_guest_process())
+                    {
                         crate::probes::guest_exit(code);
                         // Destroy a name-bound child VM (bhyve) before _exit — KVM/HVF
                         // is a no-op (fd-lifetime-bound VM). A copied shared-file
@@ -2081,7 +2099,7 @@ where
                     // exit_group, or exit(2) as the last live thread. Tear the whole
                     // process down.
                     let last = state.registry.exit(state.this_tid);
-                    if !last {
+                    if !last && !kernel.is_hvpatch_child() {
                         // exit_group(94) or fatal process termination: flush shared
                         // buffers and terminate the entire host process.
                         let _ = std::io::Write::flush(&mut std::io::stdout());
@@ -2098,7 +2116,9 @@ where
                 }
                 DispatchOutcome::SignalDeath { signum } => {
                     crate::trap::dump_kick_stats();
-                    if engine.is_forked_child() || kernel.dispatcher.is_forked_guest_process() {
+                    if !kernel.is_hvpatch_child()
+                        && (engine.is_forked_child() || kernel.dispatcher.is_forked_guest_process())
+                    {
                         // Destroy a name-bound child VM (bhyve) before _exit — KVM/HVF
                         // is a no-op (fd-lifetime-bound VM). Writeback failures
                         // propagate before the terminal signal is reported.
@@ -2112,7 +2132,7 @@ where
                     }
                     let code = 128 + signum;
                     let last = state.registry.exit(state.this_tid);
-                    if !last {
+                    if !last && !kernel.is_hvpatch_child() {
                         let _ = std::io::Write::flush(&mut std::io::stdout());
                         let _ = std::io::Write::flush(&mut std::io::stderr());
                         let out = kernel.dispatcher.stdout();
@@ -2282,8 +2302,9 @@ where
                         // THIS process by SIGSEGV (exit 139), never abort the whole
                         // carrick runtime. Mirrors the unclassified-EL0-fault path.
                         Err(TrapError::SignalDeliveryFault) => {
-                            if engine.is_forked_child()
-                                || kernel.dispatcher.is_forked_guest_process()
+                            if !kernel.is_hvpatch_child()
+                                && (engine.is_forked_child()
+                                    || kernel.dispatcher.is_forked_guest_process())
                             {
                                 let out = kernel.dispatcher.stdout();
                                 let err = kernel.dispatcher.stderr();
@@ -2436,6 +2457,12 @@ where
         let result = assemble_run_result(&kernel, -1, state.max_traps, true);
         Ok(VcpuLoopOutcome::TrapLimit(Box::new(result)))
     })();
+    // An in-process hvpatch child must release its backend-owned process state
+    // without terminating the shared host process. Other backends perform this
+    // cleanup immediately before their real child calls `_exit`.
+    if is_hvpatch_child && matches!(&result, Ok(VcpuLoopOutcome::ProcessExit(_)) | Err(_)) {
+        engine.retire_in_process_address_space()?;
+    }
     // This thread is leaving its vCPU loop. The engine's Drop is a no-op, so
     // destroy the vCPU here on every path EXCEPT ProcessExit (the whole process
     // is exiting) and ThreadDone (handle_thread_exit already destroyed it).
@@ -2541,7 +2568,9 @@ fn service_signals_threaded<E: ThreadedEngine>(
                 return Ok(None);
             }
             if let Some(signum) = action.term_signal {
-                if engine.is_forked_child() || kernel.dispatcher.is_forked_guest_process() {
+                if !kernel.is_hvpatch_child()
+                    && (engine.is_forked_child() || kernel.dispatcher.is_forked_guest_process())
+                {
                     // Destroy a name-bound child VM (bhyve) before _exit — KVM/HVF
                     // is a no-op (fd-lifetime-bound VM). Fail before terminal
                     // publication if copied shared-file writeback is incomplete.

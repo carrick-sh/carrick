@@ -873,8 +873,6 @@ impl PageTableManager {
         len: u64,
         writable: bool,
     ) -> Result<bool, PageTableError> {
-        const TWO_MIB: u64 = 1 << 21;
-        const FOUR_KIB: u64 = 1 << 12;
         let block_flags = if writable {
             USER_BLOCK_FLAGS
         } else {
@@ -885,6 +883,39 @@ impl PageTableManager {
         } else {
             (USER_PAGE_FLAGS & !AP_MASK) | AP_RO
         };
+        self.map_aliased_with_flags(va, ipa, len, block_flags, page_flags)
+    }
+
+    /// Repoint an EL1-only Carrick control-page range while preserving the
+    /// kernel-hole execution regime: AP=00, UXN=1, PXN=0. Using the ordinary
+    /// user alias flags here sets PXN and makes the entry trampoline/vector
+    /// page unexecutable at EL1 under FEAT_PAN3.
+    pub fn map_kernel_aliased(
+        &mut self,
+        va: u64,
+        ipa: u64,
+        len: u64,
+    ) -> Result<bool, PageTableError> {
+        const KERNEL_ATTRS: u64 = (1u64 << 54) | (1 << 10) | (0b11 << 8);
+        self.map_aliased_with_flags(
+            va,
+            ipa,
+            len,
+            KERNEL_ATTRS | TYPE_BLOCK,
+            KERNEL_ATTRS | TYPE_TABLE_OR_PAGE,
+        )
+    }
+
+    fn map_aliased_with_flags(
+        &mut self,
+        va: u64,
+        ipa: u64,
+        len: u64,
+        block_flags: u64,
+        page_flags: u64,
+    ) -> Result<bool, PageTableError> {
+        const TWO_MIB: u64 = 1 << 21;
+        const FOUR_KIB: u64 = 1 << 12;
         if va.is_multiple_of(TWO_MIB) && ipa.is_multiple_of(TWO_MIB) {
             // Map the 2 MiB-aligned BULK as L2 block leaves (one descriptor per
             // 2 MiB, no per-2-MiB L3 table), then the sub-2-MiB TAIL as 4 KiB

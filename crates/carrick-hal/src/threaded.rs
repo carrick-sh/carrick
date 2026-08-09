@@ -641,6 +641,7 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
     type Arch: crate::guest_arch::GuestArch;
     type KickHandle: VcpuKick + 'static;
     type SiblingSpec: Send;
+    type ProcessSpec: Send;
 
     /// Select a backend lifecycle in which guest exec/fork operations retain
     /// one host VM and replace only per-process address-space state. Backends
@@ -653,6 +654,43 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
     /// model. Hvpatch overrides this and keeps the ASID across exec replacement.
     fn configure_process_asid(&mut self, _asid: u16) -> Result<(), TrapError> {
         Ok(())
+    }
+
+    /// True only for a backend that represents Linux fork as another vCPU plus
+    /// another stage-1 address space inside the current host VM.
+    fn supports_in_process_fork(&self) -> bool {
+        false
+    }
+
+    /// Retire an in-process guest address space after its last vCPU reports a
+    /// terminal exit. Backends with per-process stage-1/stage-2 state override
+    /// this to flush translations and unmap owned ranges before lifecycle code
+    /// makes the ASID/bank reusable.
+    fn retire_in_process_address_space(&mut self) -> Result<(), TrapError> {
+        self.process_exit_cleanup()?;
+        self.destroy_vcpu_on_thread_exit();
+        Ok(())
+    }
+
+    fn build_process_spec(
+        &mut self,
+        _entry: GuestEntryRegs,
+        _child_ttbr0: u64,
+        _bank_base: u64,
+        _bank_size: u64,
+    ) -> Result<Self::ProcessSpec, TrapError> {
+        Err(TrapError::Hypervisor(
+            "backend does not support in-process fork".to_owned(),
+        ))
+    }
+
+    fn materialize_process(_spec: Self::ProcessSpec) -> Result<Self, TrapError>
+    where
+        Self: Sized,
+    {
+        Err(TrapError::Hypervisor(
+            "backend does not support in-process fork".to_owned(),
+        ))
     }
 
     fn kick_handle(&self) -> Self::KickHandle;

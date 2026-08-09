@@ -272,6 +272,7 @@ impl Aarch64Vmm for KvmAarch64Vmm {
     type Vcpu = KvmVcpu;
     type KickHandle = KvmKickHandle;
     type SiblingBuilder = KvmAarch64SiblingBuilder;
+    type ProcessBuilder = ();
 
     // ── memory windows + stage-2 ──
 
