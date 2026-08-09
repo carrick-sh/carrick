@@ -216,6 +216,739 @@ pub struct UlockRequeueProbe {
     pub to_logical_wake: u32,
 }
 
+/// Stable lifecycle phases for Linux processes multiplexed inside one hvpatch VM.
+/// These ordinals are part of the DTrace provider ABI; append, never renumber.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchGuestLifecyclePhase {
+    Root = 0,
+    Fork = 1,
+    Exec = 2,
+    ThreadStart = 3,
+    ThreadExit = 4,
+    ProcessExit = 5,
+    /// Entered `handle_execve`, before ELF loading, patching, address-space
+    /// replacement, or publication. The existing `Exec` phase is its success
+    /// boundary and therefore closes a complete in-process exec latency window.
+    ExecBegin = 6,
+}
+
+impl HvpatchGuestLifecyclePhase {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Typed source event for the scalar `hvpatch-guest-lifecycle` USDT ABI.
+///
+/// `detail` is phase-specific: it is the Linux wait exit code for
+/// `ProcessExit` and zero for the currently published Root/Fork/Exec events.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchGuestLifecycle {
+    phase: HvpatchGuestLifecyclePhase,
+    pid: i32,
+    ppid: i32,
+    tid: i32,
+    asid: u32,
+    detail: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum HvpatchGuestLifecycleError {
+    #[error("hvpatch guest pid and tid must be positive")]
+    InvalidTaskIdentity,
+    #[error("hvpatch guest ppid must be nonnegative")]
+    InvalidParentIdentity,
+    #[error("hvpatch guest ASID must be nonzero")]
+    InvalidAsid,
+    #[error("hvpatch guest process bank must be nonempty")]
+    InvalidBank,
+    #[error("hvpatch TTBR0 does not encode the event ASID and bank root")]
+    InvalidTtbr0,
+}
+
+impl HvpatchGuestLifecycle {
+    pub fn new(
+        phase: HvpatchGuestLifecyclePhase,
+        pid: i32,
+        ppid: i32,
+        tid: i32,
+        asid: u32,
+        detail: i64,
+    ) -> Result<Self, HvpatchGuestLifecycleError> {
+        if pid <= 0 || tid <= 0 {
+            return Err(HvpatchGuestLifecycleError::InvalidTaskIdentity);
+        }
+        if ppid < 0 {
+            return Err(HvpatchGuestLifecycleError::InvalidParentIdentity);
+        }
+        if asid == 0 {
+            return Err(HvpatchGuestLifecycleError::InvalidAsid);
+        }
+        Ok(Self {
+            phase,
+            pid,
+            ppid,
+            tid,
+            asid,
+            detail,
+        })
+    }
+
+    pub const fn phase(self) -> HvpatchGuestLifecyclePhase {
+        self.phase
+    }
+
+    pub const fn pid(self) -> i32 {
+        self.pid
+    }
+
+    pub const fn ppid(self) -> i32 {
+        self.ppid
+    }
+
+    pub const fn tid(self) -> i32 {
+        self.tid
+    }
+
+    pub const fn asid(self) -> u32 {
+        self.asid
+    }
+
+    pub const fn detail(self) -> i64 {
+        self.detail
+    }
+}
+
+/// Fatal or signal-lowered AArch64 fault with its Linux guest identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchGuestFault {
+    syndrome: u64,
+    elr: u64,
+    far: u64,
+    pid: i32,
+    tid: i32,
+    asid: u32,
+}
+
+impl HvpatchGuestFault {
+    pub fn new(
+        syndrome: u64,
+        elr: u64,
+        far: u64,
+        pid: i32,
+        tid: i32,
+        asid: u32,
+    ) -> Result<Self, HvpatchGuestLifecycleError> {
+        if pid <= 0 || tid <= 0 {
+            return Err(HvpatchGuestLifecycleError::InvalidTaskIdentity);
+        }
+        if asid == 0 {
+            return Err(HvpatchGuestLifecycleError::InvalidAsid);
+        }
+        Ok(Self {
+            syndrome,
+            elr,
+            far,
+            pid,
+            tid,
+            asid,
+        })
+    }
+
+    pub const fn syndrome(self) -> u64 {
+        self.syndrome
+    }
+
+    pub const fn elr(self) -> u64 {
+        self.elr
+    }
+
+    pub const fn far(self) -> u64 {
+        self.far
+    }
+
+    pub const fn pid(self) -> i32 {
+        self.pid
+    }
+
+    pub const fn tid(self) -> i32 {
+        self.tid
+    }
+
+    pub const fn asid(self) -> u32 {
+        self.asid
+    }
+}
+
+/// Process-bank provenance for one Linux guest address space in the shared VM.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchGuestAddressSpace {
+    pid: i32,
+    asid: u32,
+    bank_base: u64,
+    bank_size: u64,
+    ttbr0: u64,
+}
+
+/// Result of preparing the stage-1 page-table layout for one hvpatch process
+/// bank. These ordinals are part of the DTrace provider ABI; append only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchExecBankLayoutPhase {
+    CacheMiss = 0,
+    CacheHit = 1,
+}
+
+impl HvpatchExecBankLayoutPhase {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Typed source record for `hvpatch-exec-bank-layout`.
+///
+/// `bank_base` joins this low-level engine event to
+/// `hvpatch-guest-address-space`, which supplies the Linux PID and ASID without
+/// relying on Darwin's host process namespace. `elapsed_ns` covers lookup plus
+/// a cache miss's complete page-table rebase/remap construction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchExecBankLayout {
+    phase: HvpatchExecBankLayoutPhase,
+    bank_base: u64,
+    mapping_count: u64,
+    cache_entries: u64,
+    elapsed_ns: u64,
+}
+
+impl HvpatchExecBankLayout {
+    pub const fn new(
+        phase: HvpatchExecBankLayoutPhase,
+        bank_base: u64,
+        mapping_count: u64,
+        cache_entries: u64,
+        elapsed_ns: u64,
+    ) -> Self {
+        Self {
+            phase,
+            bank_base,
+            mapping_count,
+            cache_entries,
+            elapsed_ns,
+        }
+    }
+
+    pub const fn phase(self) -> HvpatchExecBankLayoutPhase {
+        self.phase
+    }
+
+    pub const fn bank_base(self) -> u64 {
+        self.bank_base
+    }
+
+    pub const fn mapping_count(self) -> u64 {
+        self.mapping_count
+    }
+
+    pub const fn cache_entries(self) -> u64 {
+        self.cache_entries
+    }
+
+    pub const fn elapsed_ns(self) -> u64 {
+        self.elapsed_ns
+    }
+}
+
+/// Result of materializing one exec-image host backing. Append-only DTrace ABI
+/// ordinals.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchExecBackingPhase {
+    Materialized = 0,
+    Reused = 1,
+    /// Fresh MAP_PRIVATE view of an immutable, fully-patched file artifact.
+    PrivateFileMapped = 2,
+}
+
+impl HvpatchExecBackingPhase {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Typed source record for `hvpatch-exec-backing`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchExecBacking {
+    phase: HvpatchExecBackingPhase,
+    guest_start: u64,
+    ipa_start: u64,
+    mapped_size: u64,
+    elapsed_ns: u64,
+}
+
+impl HvpatchExecBacking {
+    pub const fn new(
+        phase: HvpatchExecBackingPhase,
+        guest_start: u64,
+        ipa_start: u64,
+        mapped_size: u64,
+        elapsed_ns: u64,
+    ) -> Self {
+        Self {
+            phase,
+            guest_start,
+            ipa_start,
+            mapped_size,
+            elapsed_ns,
+        }
+    }
+
+    pub const fn phase(self) -> HvpatchExecBackingPhase {
+        self.phase
+    }
+
+    pub const fn guest_start(self) -> u64 {
+        self.guest_start
+    }
+
+    pub const fn ipa_start(self) -> u64 {
+        self.ipa_start
+    }
+
+    pub const fn mapped_size(self) -> u64 {
+        self.mapped_size
+    }
+
+    pub const fn elapsed_ns(self) -> u64 {
+        self.elapsed_ns
+    }
+}
+
+/// Raw Hypervisor.framework stage-2 transition boundaries during one-VM exec.
+/// Append-only DTrace ABI ordinals.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchExecStage2Phase {
+    UnmapBegin = 0,
+    UnmapEnd = 1,
+    MapBegin = 2,
+    MapEnd = 3,
+}
+
+impl HvpatchExecStage2Phase {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Typed source record for `hvpatch-exec-stage2`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchExecStage2 {
+    phase: HvpatchExecStage2Phase,
+    ipa: u64,
+    size: u64,
+    guest_start: u64,
+    rc: i32,
+}
+
+/// Coarse, mutually exclusive host stages inside one persistent-VM exec image
+/// replacement. These append-only ordinals are a stable DTrace ABI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchExecReplaceStagePhase {
+    AliasCleanup = 0,
+    DropBackings = 1,
+    PageTables = 2,
+    MapBackings = 3,
+    Registers = 4,
+    Mailbox = 5,
+    PrivateFileArtifacts = 6,
+}
+
+impl HvpatchExecReplaceStagePhase {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Typed source record for `hvpatch-exec-replace-stage`.
+///
+/// `mapping_count` and `mapped_bytes` describe the replacement image for
+/// every phase so a consumer can compare like-shaped execs without relying on
+/// process-local pointers or private Rust layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchExecReplaceStage {
+    phase: HvpatchExecReplaceStagePhase,
+    elapsed_ns: u64,
+    mapping_count: u64,
+    mapped_bytes: u64,
+}
+
+impl HvpatchExecReplaceStage {
+    pub const fn new(
+        phase: HvpatchExecReplaceStagePhase,
+        elapsed_ns: u64,
+        mapping_count: u64,
+        mapped_bytes: u64,
+    ) -> Self {
+        Self {
+            phase,
+            elapsed_ns,
+            mapping_count,
+            mapped_bytes,
+        }
+    }
+
+    pub const fn phase(self) -> HvpatchExecReplaceStagePhase {
+        self.phase
+    }
+
+    pub const fn elapsed_ns(self) -> u64 {
+        self.elapsed_ns
+    }
+
+    pub const fn mapping_count(self) -> u64 {
+        self.mapping_count
+    }
+
+    pub const fn mapped_bytes(self) -> u64 {
+        self.mapped_bytes
+    }
+}
+
+impl HvpatchExecStage2 {
+    pub const fn new(
+        phase: HvpatchExecStage2Phase,
+        ipa: u64,
+        size: u64,
+        guest_start: u64,
+        rc: i32,
+    ) -> Self {
+        Self {
+            phase,
+            ipa,
+            size,
+            guest_start,
+            rc,
+        }
+    }
+
+    pub const fn phase(self) -> HvpatchExecStage2Phase {
+        self.phase
+    }
+
+    pub const fn ipa(self) -> u64 {
+        self.ipa
+    }
+
+    pub const fn size(self) -> u64 {
+        self.size
+    }
+
+    pub const fn guest_start(self) -> u64 {
+        self.guest_start
+    }
+
+    pub const fn rc(self) -> i32 {
+        self.rc
+    }
+}
+
+impl HvpatchGuestAddressSpace {
+    pub fn new(
+        pid: i32,
+        asid: u32,
+        bank_base: u64,
+        bank_size: u64,
+        ttbr0: u64,
+    ) -> Result<Self, HvpatchGuestLifecycleError> {
+        if pid <= 0 {
+            return Err(HvpatchGuestLifecycleError::InvalidTaskIdentity);
+        }
+        if asid == 0 || asid > u32::from(u16::MAX) {
+            return Err(HvpatchGuestLifecycleError::InvalidAsid);
+        }
+        if bank_size == 0 {
+            return Err(HvpatchGuestLifecycleError::InvalidBank);
+        }
+        const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
+        if (ttbr0 >> 48) != u64::from(asid) || (ttbr0 & TTBR_ROOT_MASK) != bank_base {
+            return Err(HvpatchGuestLifecycleError::InvalidTtbr0);
+        }
+        Ok(Self {
+            pid,
+            asid,
+            bank_base,
+            bank_size,
+            ttbr0,
+        })
+    }
+
+    pub const fn pid(self) -> i32 {
+        self.pid
+    }
+
+    pub const fn asid(self) -> u32 {
+        self.asid
+    }
+
+    pub const fn bank_base(self) -> u64 {
+        self.bank_base
+    }
+
+    pub const fn bank_size(self) -> u64 {
+        self.bank_size
+    }
+
+    pub const fn ttbr0(self) -> u64 {
+        self.ttbr0
+    }
+}
+
+#[cfg(test)]
+mod hvpatch_guest_probe_abi {
+    use super::*;
+
+    #[test]
+    fn lifecycle_event_keeps_guest_identity_and_phase_typed() {
+        let event =
+            HvpatchGuestLifecycle::new(HvpatchGuestLifecyclePhase::Fork, 123, 100, 123, 7, 0)
+                .expect("valid guest lifecycle event");
+        assert_eq!(event.phase(), HvpatchGuestLifecyclePhase::Fork);
+        assert_eq!(event.pid(), 123);
+        assert_eq!(event.ppid(), 100);
+        assert_eq!(event.tid(), 123);
+        assert_eq!(event.asid(), 7);
+        assert_eq!(event.detail(), 0);
+    }
+
+    #[test]
+    fn lifecycle_phase_ordinals_are_append_only() {
+        assert_eq!(HvpatchGuestLifecyclePhase::Root.raw(), 0);
+        assert_eq!(HvpatchGuestLifecyclePhase::Fork.raw(), 1);
+        assert_eq!(HvpatchGuestLifecyclePhase::Exec.raw(), 2);
+        assert_eq!(HvpatchGuestLifecyclePhase::ThreadStart.raw(), 3);
+        assert_eq!(HvpatchGuestLifecyclePhase::ThreadExit.raw(), 4);
+        assert_eq!(HvpatchGuestLifecyclePhase::ProcessExit.raw(), 5);
+        assert_eq!(HvpatchGuestLifecyclePhase::ExecBegin.raw(), 6);
+    }
+
+    #[test]
+    fn lifecycle_event_rejects_non_linux_identity_values() {
+        assert!(
+            HvpatchGuestLifecycle::new(HvpatchGuestLifecyclePhase::Root, 0, 0, 1, 1, 0,).is_err()
+        );
+        assert!(
+            HvpatchGuestLifecycle::new(HvpatchGuestLifecyclePhase::ThreadStart, 1, 0, 0, 1, 0,)
+                .is_err()
+        );
+        assert!(
+            HvpatchGuestLifecycle::new(HvpatchGuestLifecyclePhase::Exec, 1, 0, 1, 0, 0,).is_err()
+        );
+    }
+
+    #[test]
+    fn lifecycle_provider_and_stub_keep_the_same_typed_shape() {
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn hvpatch__guest__lifecycle(_: u32, _: i32, _: i32, _: i32, _: u32) {}",
+            "fn hvpatch__guest__exit(_: i32, _: i32, _: u32, _: i64) {}",
+            "stub!(hvpatch_guest_lifecycle(event: super::HvpatchGuestLifecycle));",
+            "fn hvpatch__guest__fault(_: u64, _: u64, _: u64, _: i32, _: i32) {}",
+            "fn hvpatch__guest__fault__asid(_: i32, _: i32, _: u32) {}",
+            "stub!(hvpatch_guest_fault(event: super::HvpatchGuestFault));",
+            "fn hvpatch__guest__address__space(_: i32, _: u32, _: u64, _: u64, _: u64) {}",
+            "stub!(hvpatch_guest_address_space(event: super::HvpatchGuestAddressSpace));",
+        ] {
+            assert!(
+                source.contains(declaration),
+                "missing lifecycle ABI {declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn fork_snapshot_provider_and_stub_are_declared_outside_the_abi_test() {
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn hvpatch__fork__snapshot__begin(_: i32, _: i32) {}",
+            "fn hvpatch__fork__snapshot__end(_: i32, _: u64, _: u64, _: u64, _: u64) {}",
+            "fn hvpatch__fork__snapshot__shape(_: i32, _: u64, _: u64, _: u64, _: u64) {}",
+            "stub!(hvpatch_fork_snapshot_begin(child_pid: i32, forking_tid: i32));",
+            "stub!(hvpatch_fork_snapshot_end(child_pid: i32, local_regions: u64, candidate_regions: u64, added_regions: u64, added_bytes: u64));",
+            "stub!(hvpatch_fork_snapshot_shape(child_pid: i32, private_added_regions: u64, shared_added_regions: u64, largest_added_bytes: u64, bank_used_bytes: u64));",
+        ] {
+            assert!(
+                source.matches(declaration).count() >= 2,
+                "missing real fork snapshot ABI declaration {declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_bank_layout_provider_and_stub_keep_the_same_typed_shape() {
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn hvpatch__exec__bank__layout(_: u32, _: u64, _: u64, _: u64, _: u64) {}",
+            "stub!(hvpatch_exec_bank_layout(event: super::HvpatchExecBankLayout));",
+        ] {
+            assert!(
+                source.matches(declaration).count() >= 2,
+                "missing exec bank layout ABI declaration {declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_backing_provider_and_stub_keep_the_same_typed_shape() {
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn hvpatch__exec__backing(_: u32, _: u64, _: u64, _: u64, _: u64) {}",
+            "stub!(hvpatch_exec_backing(event: super::HvpatchExecBacking));",
+        ] {
+            assert!(
+                source.matches(declaration).count() >= 2,
+                "missing exec backing ABI declaration {declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_stage2_provider_and_stub_keep_the_same_typed_shape() {
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn hvpatch__exec__stage2(_: u32, _: u64, _: u64, _: u64, _: i32) {}",
+            "stub!(hvpatch_exec_stage2(event: super::HvpatchExecStage2));",
+        ] {
+            assert!(
+                source.matches(declaration).count() >= 2,
+                "missing exec stage-2 ABI declaration {declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_replace_stage_provider_and_stub_keep_the_same_typed_shape() {
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn hvpatch__exec__replace__stage(_: u32, _: u64, _: u64, _: u64) {}",
+            "stub!(hvpatch_exec_replace_stage(event: super::HvpatchExecReplaceStage));",
+        ] {
+            assert!(
+                source.matches(declaration).count() >= 2,
+                "missing exec replacement-stage ABI declaration {declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn fault_event_keeps_guest_process_thread_and_asid_together() {
+        let event = HvpatchGuestFault::new(0x9600_0004, 0x85540, 0x80, 123, 456, 7)
+            .expect("valid guest fault event");
+        assert_eq!(event.syndrome(), 0x9600_0004);
+        assert_eq!(event.elr(), 0x85540);
+        assert_eq!(event.far(), 0x80);
+        assert_eq!(event.pid(), 123);
+        assert_eq!(event.tid(), 456);
+        assert_eq!(event.asid(), 7);
+    }
+
+    #[test]
+    fn address_space_event_keeps_bank_and_ttbr_provenance_together() {
+        let event = HvpatchGuestAddressSpace::new(
+            123,
+            7,
+            0x9a_0000_0000,
+            40 * 1024 * 1024 * 1024,
+            0x0007_009a_0000_0000,
+        )
+        .expect("valid guest address-space event");
+        assert_eq!(event.pid(), 123);
+        assert_eq!(event.asid(), 7);
+        assert_eq!(event.bank_base(), 0x9a_0000_0000);
+        assert_eq!(event.bank_size(), 40 * 1024 * 1024 * 1024);
+        assert_eq!(event.ttbr0(), 0x0007_009a_0000_0000);
+    }
+
+    #[test]
+    fn exec_bank_layout_event_keeps_join_and_cost_fields_typed() {
+        let event = HvpatchExecBankLayout::new(
+            HvpatchExecBankLayoutPhase::CacheHit,
+            0x9a_0000_0000,
+            17,
+            6,
+            42_000,
+        );
+        assert_eq!(event.phase(), HvpatchExecBankLayoutPhase::CacheHit);
+        assert_eq!(HvpatchExecBankLayoutPhase::CacheMiss.raw(), 0);
+        assert_eq!(HvpatchExecBankLayoutPhase::CacheHit.raw(), 1);
+        assert_eq!(event.bank_base(), 0x9a_0000_0000);
+        assert_eq!(event.mapping_count(), 17);
+        assert_eq!(event.cache_entries(), 6);
+        assert_eq!(event.elapsed_ns(), 42_000);
+    }
+
+    #[test]
+    fn exec_backing_event_keeps_virtual_and_physical_identity_typed() {
+        let event = HvpatchExecBacking::new(
+            HvpatchExecBackingPhase::Reused,
+            0x40_0000,
+            0x9a_0040_0000,
+            0x20_0000,
+            8_000,
+        );
+        assert_eq!(HvpatchExecBackingPhase::Materialized.raw(), 0);
+        assert_eq!(HvpatchExecBackingPhase::Reused.raw(), 1);
+        assert_eq!(HvpatchExecBackingPhase::PrivateFileMapped.raw(), 2);
+        assert_eq!(event.phase(), HvpatchExecBackingPhase::Reused);
+        assert_eq!(event.guest_start(), 0x40_0000);
+        assert_eq!(event.ipa_start(), 0x9a_0040_0000);
+        assert_eq!(event.mapped_size(), 0x20_0000);
+        assert_eq!(event.elapsed_ns(), 8_000);
+    }
+
+    #[test]
+    fn exec_stage2_event_keeps_operation_and_address_identity_typed() {
+        let event = HvpatchExecStage2::new(
+            HvpatchExecStage2Phase::MapEnd,
+            0x9a_0040_0000,
+            0x20_0000,
+            0x40_0000,
+            0,
+        );
+        assert_eq!(HvpatchExecStage2Phase::UnmapBegin.raw(), 0);
+        assert_eq!(HvpatchExecStage2Phase::UnmapEnd.raw(), 1);
+        assert_eq!(HvpatchExecStage2Phase::MapBegin.raw(), 2);
+        assert_eq!(HvpatchExecStage2Phase::MapEnd.raw(), 3);
+        assert_eq!(event.phase(), HvpatchExecStage2Phase::MapEnd);
+        assert_eq!(event.ipa(), 0x9a_0040_0000);
+        assert_eq!(event.size(), 0x20_0000);
+        assert_eq!(event.guest_start(), 0x40_0000);
+        assert_eq!(event.rc(), 0);
+    }
+
+    #[test]
+    fn exec_replace_stage_event_keeps_stage_cost_and_shape_typed() {
+        let event = HvpatchExecReplaceStage::new(
+            HvpatchExecReplaceStagePhase::MapBackings,
+            825_000,
+            19,
+            42 * 1024 * 1024,
+        );
+        assert_eq!(HvpatchExecReplaceStagePhase::AliasCleanup.raw(), 0);
+        assert_eq!(HvpatchExecReplaceStagePhase::DropBackings.raw(), 1);
+        assert_eq!(HvpatchExecReplaceStagePhase::PageTables.raw(), 2);
+        assert_eq!(HvpatchExecReplaceStagePhase::MapBackings.raw(), 3);
+        assert_eq!(HvpatchExecReplaceStagePhase::Registers.raw(), 4);
+        assert_eq!(HvpatchExecReplaceStagePhase::Mailbox.raw(), 5);
+        assert_eq!(HvpatchExecReplaceStagePhase::PrivateFileArtifacts.raw(), 6);
+        assert_eq!(event.phase(), HvpatchExecReplaceStagePhase::MapBackings);
+        assert_eq!(event.elapsed_ns(), 825_000);
+        assert_eq!(event.mapping_count(), 19);
+        assert_eq!(event.mapped_bytes(), 42 * 1024 * 1024);
+    }
+}
+
 macro_rules! dsr_ordinal_enum {
     (
         $(#[$meta:meta])*
@@ -1954,6 +2687,54 @@ mod real {
         /// from `lifecycle`: exec/fork may transition VM ownership more than once
         /// during one Carrick run.
         fn vm__lifecycle(_: u32, _: i32) {}
+        /// Linux guest lifecycle inside a shared hvpatch VM. Unlike `proc:::`
+        /// and `fork__post`, these identities are guest namespace values, not
+        /// Darwin host PIDs. Args: phase, pid, ppid, tid, ASID. The process-exit
+        /// detail is a companion probe because macOS zeros a sixth USDT arg.
+        fn hvpatch__guest__lifecycle(_: u32, _: i32, _: i32, _: i32, _: u32) {}
+        /// Terminal process detail. Args: guest PID, guest TID, ASID, exit code.
+        fn hvpatch__guest__exit(_: i32, _: i32, _: u32, _: i64) {}
+        /// AArch64 guest fault with Linux process/thread identity and stage-1
+        /// context. Args: ESR, ELR, FAR, guest PID, guest TID. ASID is emitted
+        /// separately to stay below macOS's five-reliable-argument limit.
+        fn hvpatch__guest__fault(_: u64, _: u64, _: u64, _: i32, _: i32) {}
+        /// Companion identity for `hvpatch__guest__fault`: PID, TID, ASID.
+        fn hvpatch__guest__fault__asid(_: i32, _: i32, _: u32) {}
+        /// Address-space provenance: guest PID, ASID, bank base, bank size,
+        /// TTBR0. Five scalars keep the complete record reliable on macOS.
+        fn hvpatch__guest__address__space(_: i32, _: u32, _: u64, _: u64, _: u64) {}
+        /// Fork snapshot timing anchor. Args: child guest PID and the guest TID
+        /// that issued clone/fork. Consumers key `timestamp` by child PID and
+        /// subtract it from `hvpatch__fork__snapshot__end`.
+        fn hvpatch__fork__snapshot__begin(_: i32, _: i32) {}
+        /// Fork snapshot census. Args: child PID, mappings already local to the
+        /// forking vCPU, process-scoped alias candidates, aliases selected by the
+        /// live page tables, and selected bytes.
+        fn hvpatch__fork__snapshot__end(_: i32, _: u64, _: u64, _: u64, _: u64) {}
+        /// Fork snapshot shape companion. Args: child PID, selected private
+        /// regions, selected shared regions, largest selected extent, and bytes
+        /// consumed in the child's private stage-2 bank.
+        fn hvpatch__fork__snapshot__shape(_: i32, _: u64, _: u64, _: u64, _: u64) {}
+        /// Exec bank-layout cache result. Args: phase (0=miss, 1=hit), process
+        /// bank base, mapping count, bounded process-wide cache entries, and
+        /// lookup plus construction elapsed nanoseconds. Join bank base to
+        /// `hvpatch__guest__address__space` for guest PID and ASID.
+        fn hvpatch__exec__bank__layout(_: u32, _: u64, _: u64, _: u64, _: u64) {}
+        /// Exec-image host backing result. Args: phase (0=materialized,
+        /// 1=reused, 2=fresh MAP_PRIVATE view of a cached patched artifact),
+        /// Linux guest VA, process-bank IPA, mapped bytes, and lookup plus
+        /// allocation/copy elapsed nanoseconds.
+        fn hvpatch__exec__backing(_: u32, _: u64, _: u64, _: u64, _: u64) {}
+        /// Raw stage-2 exec transition. Args: phase (0=unmap begin, 1=unmap
+        /// end, 2=map begin, 3=map end), IPA, size, guest VA (`UINT64_MAX`
+        /// when the unmap ledger has only an IPA extent), and raw HVF rc.
+        fn hvpatch__exec__stage2(_: u32, _: u64, _: u64, _: u64, _: i32) {}
+        /// Coarse persistent-VM exec replacement stage. Args: phase
+        /// (0=alias cleanup, 1=drop old backings, 2=page-table manager,
+        /// 3=map new backings, 4=registers, 5=mailbox, 6=private-file
+        /// artifacts), elapsed nanoseconds, replacement mapping count, and
+        /// total mapped bytes.
+        fn hvpatch__exec__replace__stage(_: u32, _: u64, _: u64, _: u64) {}
         /// Fires every syscall trap. `arg0` is the ADDRESS of a
         /// `compat::GuestRegs` (`#[repr(C)]`); DTrace does
         /// `copyin(arg0, sizeof(gregs_t))` and reads fields by offset. A
@@ -1971,8 +2752,9 @@ mod real {
         /// Companion to `vcpu__fault` carrying the decoded fault diagnostics as
         /// SCALARS (captured at probe-fire time — robust even when the fault kills
         /// the process immediately, unlike a copyin-a-pointer probe whose action
-        /// runs too late). `insn` is the faulting instruction word (read host-side
-        /// at `elr` — DTrace can't copyin a guest VA); `rn` is the base register a
+        /// runs too late). `insn` is the faulting instruction word (read through
+        /// the active guest address space at `elr`; `UINT64_MAX` means unreadable),
+        /// `rn` is the base register a
         /// load/store dereferenced (`(insn>>5)&0x1f`); `xrn` is that register's
         /// value, BEST-EFFORT (read after the EL1 trap trampoline, which may have
         /// clobbered it). The AUTHORITATIVE faulting pointer is `far` (HW-latched):
@@ -2728,6 +3510,130 @@ mod real {
 
     pub fn lifecycle(phase: u32) {
         carrick_usdt::lifecycle!(|| phase);
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_guest_lifecycle(event: super::HvpatchGuestLifecycle) {
+        carrick_usdt::hvpatch__guest__lifecycle!(|| (
+            event.phase().raw(),
+            event.pid(),
+            event.ppid(),
+            event.tid(),
+            event.asid()
+        ));
+        if event.phase() == super::HvpatchGuestLifecyclePhase::ProcessExit {
+            carrick_usdt::hvpatch__guest__exit!(|| (
+                event.pid(),
+                event.tid(),
+                event.asid(),
+                event.detail()
+            ));
+        }
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_guest_fault(event: super::HvpatchGuestFault) {
+        carrick_usdt::hvpatch__guest__fault__asid!(|| (event.pid(), event.tid(), event.asid()));
+        carrick_usdt::hvpatch__guest__fault!(|| (
+            event.syndrome(),
+            event.elr(),
+            event.far(),
+            event.pid(),
+            event.tid()
+        ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_guest_address_space(event: super::HvpatchGuestAddressSpace) {
+        carrick_usdt::hvpatch__guest__address__space!(|| (
+            event.pid(),
+            event.asid(),
+            event.bank_base(),
+            event.bank_size(),
+            event.ttbr0()
+        ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_fork_snapshot_begin(child_pid: i32, forking_tid: i32) {
+        carrick_usdt::hvpatch__fork__snapshot__begin!(|| (child_pid, forking_tid));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_fork_snapshot_end(
+        child_pid: i32,
+        local_regions: u64,
+        candidate_regions: u64,
+        added_regions: u64,
+        added_bytes: u64,
+    ) {
+        carrick_usdt::hvpatch__fork__snapshot__end!(|| (
+            child_pid,
+            local_regions,
+            candidate_regions,
+            added_regions,
+            added_bytes
+        ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_fork_snapshot_shape(
+        child_pid: i32,
+        private_added_regions: u64,
+        shared_added_regions: u64,
+        largest_added_bytes: u64,
+        bank_used_bytes: u64,
+    ) {
+        carrick_usdt::hvpatch__fork__snapshot__shape!(|| (
+            child_pid,
+            private_added_regions,
+            shared_added_regions,
+            largest_added_bytes,
+            bank_used_bytes
+        ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_exec_bank_layout(event: super::HvpatchExecBankLayout) {
+        carrick_usdt::hvpatch__exec__bank__layout!(|| (
+            event.phase().raw(),
+            event.bank_base(),
+            event.mapping_count(),
+            event.cache_entries(),
+            event.elapsed_ns()
+        ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_exec_backing(event: super::HvpatchExecBacking) {
+        carrick_usdt::hvpatch__exec__backing!(|| (
+            event.phase().raw(),
+            event.guest_start(),
+            event.ipa_start(),
+            event.mapped_size(),
+            event.elapsed_ns()
+        ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_exec_stage2(event: super::HvpatchExecStage2) {
+        carrick_usdt::hvpatch__exec__stage2!(|| (
+            event.phase().raw(),
+            event.ipa(),
+            event.size(),
+            event.guest_start(),
+            event.rc()
+        ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_exec_replace_stage(event: super::HvpatchExecReplaceStage) {
+        carrick_usdt::hvpatch__exec__replace__stage!(|| (
+            event.phase().raw(),
+            event.elapsed_ns(),
+            event.mapping_count(),
+            event.mapped_bytes()
+        ));
     }
 
     pub fn vm_lifecycle(operation: u32, admission: i32) {
@@ -4105,6 +5011,16 @@ mod stub {
     stub!(mn_admit(tid: i32, slot: u32, budget: u32));
     stub!(mn_reclaim(tid: i32, old_slot: u32, new_slot: u32, kind: i32));
     stub!(lifecycle(phase: u32));
+    stub!(hvpatch_guest_lifecycle(event: super::HvpatchGuestLifecycle));
+    stub!(hvpatch_guest_fault(event: super::HvpatchGuestFault));
+    stub!(hvpatch_guest_address_space(event: super::HvpatchGuestAddressSpace));
+    stub!(hvpatch_fork_snapshot_begin(child_pid: i32, forking_tid: i32));
+    stub!(hvpatch_fork_snapshot_end(child_pid: i32, local_regions: u64, candidate_regions: u64, added_regions: u64, added_bytes: u64));
+    stub!(hvpatch_fork_snapshot_shape(child_pid: i32, private_added_regions: u64, shared_added_regions: u64, largest_added_bytes: u64, bank_used_bytes: u64));
+    stub!(hvpatch_exec_bank_layout(event: super::HvpatchExecBankLayout));
+    stub!(hvpatch_exec_backing(event: super::HvpatchExecBacking));
+    stub!(hvpatch_exec_stage2(event: super::HvpatchExecStage2));
+    stub!(hvpatch_exec_replace_stage(event: super::HvpatchExecReplaceStage));
     stub!(vm_lifecycle(operation: u32, admission: i32));
     stub!(execve_argv(path: &str, argv: &[Vec<u8>]));
     stub!(host_image_base());

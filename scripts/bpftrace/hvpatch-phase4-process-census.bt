@@ -1,0 +1,100 @@
+/*
+ * Linux-oracle process census for the canonical HvPatch Phase 4 cold build.
+ *
+ * Run inside the privileged, native-arm64 diagnostic image with:
+ *   bpftrace this-file.bt -c /tmp/hvpatch-cold-go-build.sh
+ *
+ * `cpid` is the bpftrace-owned root shell. Its initial exec is deliberately
+ * excluded: Carrick's lifecycle census names that image `guest_roots=1` and
+ * counts only successful child exec transitions. Fork descendants are admitted
+ * at sched_process_fork before they can exec. Event rows expose Linux PID/TID
+ * and filename; the final summary is the parity gate.
+ *
+ * Perturbation: sched fork/exit plus execve entry only. No syscall hot path is
+ * traced. A valid run has BUILD_OK, natural bpftrace completion, one root, and
+ * nonzero forks/execs/exits.
+ */
+
+BEGIN
+{
+    @tracked[cpid] = 1;
+    @root = cpid;
+    @sched_creates = 0;
+    @process_clones = 0;
+    @thread_clones = 0;
+    @clone3_calls = 0;
+    @execs = 0;
+    @exits = 0;
+    printf("HVPATCH4ORACLE|ready|root_pid=%d\n", cpid);
+}
+
+tracepoint:sched:sched_process_fork
+/@tracked[args->parent_pid]/
+{
+    @tracked[args->child_pid] = 1;
+    @sched_creates = @sched_creates + 1;
+    printf("HVPATCH4ORACLE|fork|parent_pid=%d|child_pid=%d|parent_comm=%s|child_comm=%s\n",
+        args->parent_pid, args->child_pid, args->parent_comm,
+        args->child_comm);
+}
+
+tracepoint:syscalls:sys_enter_clone
+/@tracked[pid] && (args->clone_flags & 0x10000) == 0/
+{
+    @process_clones = @process_clones + 1;
+    printf("HVPATCH4ORACLE|clone|class=process|pid=%d|tid=%d|flags=0x%llx\n",
+        pid, tid, args->clone_flags);
+}
+
+tracepoint:syscalls:sys_enter_clone
+/@tracked[pid] && (args->clone_flags & 0x10000) != 0/
+{
+    @thread_clones = @thread_clones + 1;
+    printf("HVPATCH4ORACLE|clone|class=thread|pid=%d|tid=%d|flags=0x%llx\n",
+        pid, tid, args->clone_flags);
+}
+
+tracepoint:syscalls:sys_enter_clone3
+/@tracked[pid]/
+{
+    @clone3_calls = @clone3_calls + 1;
+    printf("HVPATCH4ORACLE|clone3-unclassified|pid=%d|tid=%d|uargs=0x%llx|size=%llu\n",
+        pid, tid, args->uargs, args->size);
+}
+
+tracepoint:syscalls:sys_enter_execve
+/@tracked[pid] && pid != @root/
+{
+    @execs = @execs + 1;
+    printf("HVPATCH4ORACLE|exec|pid=%d|tid=%d|filename=%s\n",
+        pid, tid, str(args->filename));
+}
+
+tracepoint:syscalls:sys_enter_execveat
+/@tracked[pid] && pid != @root/
+{
+    @execs = @execs + 1;
+    printf("HVPATCH4ORACLE|execat|pid=%d|tid=%d|filename=%s\n",
+        pid, tid, str(args->filename));
+}
+
+tracepoint:sched:sched_process_exit
+/@tracked[pid] && args->pid == (int32)pid/
+{
+    @exits = @exits + 1;
+}
+
+END
+{
+    printf("HVPATCH4ORACLE|end|roots=1|process_clones=%llu|clone3_unclassified=%llu|total_processes=%llu|thread_clones=%llu|sched_creates=%llu|execs=%llu|process_exits=%llu\n",
+        @process_clones, @clone3_calls, @process_clones + 1,
+        @thread_clones, @sched_creates, @execs, @exits);
+    clear(@tracked);
+    clear(@root);
+    clear(@sched_creates);
+    clear(@process_clones);
+    clear(@thread_clones);
+    clear(@clone3_calls);
+    clear(@execs);
+    clear(@exits);
+}
