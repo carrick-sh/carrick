@@ -1,0 +1,14 @@
+{"schema":"carrick.hvpatch.phase1.v1","captured_at":"2026-08-08","implementation_commit":"ef4b174d313880ea02f369b9605c2df74fd8938b","host":{"model":"Mac16,12","arch":"arm64","host_page_size":16384,"macos":"27.0","build":"26A5388g"},"toolchain":"rustc 1.96.0 (ac68faa20 2026-05-25)","signed_binary":{"sha256":"59845b1fe06d5637ea38e637a2a30d00faf73223fada9e9906727a86084d5cc8","macho_uuid":"DC081655-2CD4-3854-A158-935DCCEB1463","hypervisor_entitlement":true,"dof_section":true},"static_fixture_sha256":"bed8073226947f620b5578f3f61d1b8551e1abc777afcd2bbbaa04fd5c7cca31"}
+{"gate":"static-smoke","backend":"hvpatch","status":"PASS","stdout":"ok","exit_code":0}
+{"gate":"dynamic-smoke","backend":"hvpatch","image":"ubuntu:24.04","argv":["/bin/echo","hello"],"status":"PASS","stdout":"hello","exit_code":0}
+{"gate":"dtrace-origin","status":"PASS","capture_sha256":"e2cc04d7bda19e40b3ce48b4c1f2b7a1348c930c087557ad9870ee665e8ffe16","text_start":"0x200000","text_end":"0x210143","island_base":"0x214000","events":[{"syscall":64,"name":"write","pc":"0x214004","count":1},{"syscall":94,"name":"exit_group","pc":"0x21400c","count":1}]}
+{"measurement":"exec-20","exact_commit_bound":false,"backend":"vmm","run":1,"in_guest_ns":380159958,"user_plus_sys_s":0.73,"real_s":0.79}
+{"measurement":"exec-20","exact_commit_bound":false,"backend":"vmm","run":2,"in_guest_ns":395742333,"user_plus_sys_s":0.90,"real_s":1.05}
+{"measurement":"exec-20","exact_commit_bound":false,"backend":"vmm","run":3,"in_guest_ns":367116791,"user_plus_sys_s":1.39,"real_s":1.65}
+{"measurement":"exec-20","exact_commit_bound":false,"backend":"native","run":1,"in_guest_ns":1265168000,"user_plus_sys_s":2.27,"real_s":2.48}
+{"measurement":"exec-20","exact_commit_bound":false,"backend":"native","run":2,"in_guest_ns":1041958833,"user_plus_sys_s":1.13,"real_s":1.13}
+{"measurement":"exec-20","exact_commit_bound":false,"backend":"native","run":3,"in_guest_ns":1041546707,"user_plus_sys_s":1.13,"real_s":1.12}
+{"measurement":"exec-20","exact_commit_bound":false,"backend":"hvpatch","run":1,"in_guest_ns":383275666,"user_plus_sys_s":0.73,"real_s":0.84}
+{"measurement":"exec-20","exact_commit_bound":false,"backend":"hvpatch","run":2,"in_guest_ns":403656917,"user_plus_sys_s":1.12,"real_s":1.36}
+{"measurement":"exec-20","exact_commit_bound":false,"backend":"hvpatch","run":3,"in_guest_ns":378314083,"user_plus_sys_s":2.07,"real_s":2.35}
+{"gate":"just-ci","commit":"ef4b174d313880ea02f369b9605c2df74fd8938b","status":"PASS","runtime_unit":{"passed":1244,"ignored":5,"failed":0},"runtime_integration":{"passed":296,"ignored":0,"failed":0}}
