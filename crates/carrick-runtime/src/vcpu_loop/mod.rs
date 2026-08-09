@@ -763,6 +763,51 @@ impl Drop for VcpuLeaseGuard {
     }
 }
 
+/// RAII-timed completion record for Linux syscalls multiplexed inside the
+/// one-VM hvpatch host process. Keeping publication in `Drop` covers every
+/// returned, blocking, fork/exec, exit, and error path that unwinds normally,
+/// without changing control flow. A terminal `_exit` cannot run destructors and
+/// is intentionally absent from the completed population.
+struct HvpatchSyscallServiceGuard {
+    pid: i32,
+    tid: i32,
+    asid: u32,
+    number: u64,
+    started: std::time::Instant,
+}
+
+impl HvpatchSyscallServiceGuard {
+    fn begin(pid: i32, tid: i32, asid: u32, number: u64) -> Option<Self> {
+        // The wrapper materializes the clock only inside the USDT enabled
+        // closure. With no consumer this returns `None`, preserving the probe
+        // surface's predicted-not-taken-branch cost contract.
+        let event =
+            carrick_observability::probes::HvpatchSyscallService::new(pid, tid, asid, number, 0)
+                .ok()?;
+        let started = crate::probes::hvpatch_syscall_service_begin(event)?;
+        Some(Self {
+            pid,
+            tid,
+            asid,
+            number,
+            started,
+        })
+    }
+}
+
+impl Drop for HvpatchSyscallServiceGuard {
+    fn drop(&mut self) {
+        use carrick_observability::probes::HvpatchSyscallService;
+
+        let duration_ns = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if let Ok(event) =
+            HvpatchSyscallService::new(self.pid, self.tid, self.asid, self.number, duration_ns)
+        {
+            crate::probes::hvpatch_syscall_service(event);
+        }
+    }
+}
+
 struct ProcessVcpuLiveGuard<'a>(&'a std::sync::atomic::AtomicUsize);
 
 impl Drop for ProcessVcpuLiveGuard<'_> {
@@ -2407,6 +2452,19 @@ where
                 Err(e) => return Err(e.into()),
             };
             state.trace_syscall(traps, frame);
+
+            let _hvpatch_syscall_service = kernel
+                .hvpatch_process
+                .as_ref()
+                .and_then(crate::hvpatch::ProcessContext::syscall_trace_identity)
+                .and_then(|(pid, asid)| {
+                    HvpatchSyscallServiceGuard::begin(
+                        pid,
+                        state.this_tid.raw(),
+                        asid,
+                        frame.number.raw(),
+                    )
+                });
 
             // ---- syscall service: no dispatcher-wide lock held ----
             let outcome = state.service_threaded_syscall(&kernel, &mut engine, frame)?;

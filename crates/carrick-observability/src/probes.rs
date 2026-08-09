@@ -320,6 +320,63 @@ impl HvpatchGuestLifecycle {
     }
 }
 
+/// Completed Linux syscall service with one-VM task/address-space identity and
+/// monotonic wall duration. Publishing the duration in the event keeps DTrace
+/// consumers stateless under hot all-syscall workloads, where dynamic-variable
+/// drops can otherwise make paired boundary captures look complete.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchSyscallService {
+    pid: i32,
+    tid: i32,
+    asid: u32,
+    number: u64,
+    duration_ns: u64,
+}
+
+impl HvpatchSyscallService {
+    pub fn new(
+        pid: i32,
+        tid: i32,
+        asid: u32,
+        number: u64,
+        duration_ns: u64,
+    ) -> Result<Self, HvpatchGuestLifecycleError> {
+        if pid <= 0 || tid <= 0 {
+            return Err(HvpatchGuestLifecycleError::InvalidTaskIdentity);
+        }
+        if asid == 0 {
+            return Err(HvpatchGuestLifecycleError::InvalidAsid);
+        }
+        Ok(Self {
+            pid,
+            tid,
+            asid,
+            number,
+            duration_ns,
+        })
+    }
+
+    pub const fn pid(self) -> i32 {
+        self.pid
+    }
+
+    pub const fn tid(self) -> i32 {
+        self.tid
+    }
+
+    pub const fn asid(self) -> u32 {
+        self.asid
+    }
+
+    pub const fn number(self) -> u64 {
+        self.number
+    }
+
+    pub const fn duration_ns(self) -> u64 {
+        self.duration_ns
+    }
+}
+
 /// Fatal or signal-lowered AArch64 fault with its Linux guest identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HvpatchGuestFault {
@@ -1666,6 +1723,31 @@ mod hvpatch_guest_probe_abi {
             assert!(
                 source.matches(declaration).count() >= 2,
                 "missing private snapshot ABI declaration {declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn syscall_service_provider_and_stub_keep_guest_task_identity_typed() {
+        let completion =
+            HvpatchSyscallService::new(41, 43, 7, 56, 12_345).expect("valid task identity");
+        assert_eq!(completion.pid(), 41);
+        assert_eq!(completion.tid(), 43);
+        assert_eq!(completion.asid(), 7);
+        assert_eq!(completion.number(), 56);
+        assert_eq!(completion.duration_ns(), 12_345);
+        assert!(HvpatchSyscallService::new(0, 43, 7, 56, 12_345).is_err());
+        assert!(HvpatchSyscallService::new(41, 43, 0, 56, 12_345).is_err());
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn hvpatch__syscall__service__begin(_: i32, _: i32, _: u32, _: u64) {}",
+            "fn hvpatch__syscall__service(_: i32, _: i32, _: u32, _: u64, _: u64) {}",
+            "stub!(hvpatch_syscall_service_begin(event: super::HvpatchSyscallService) -> Option<std::time::Instant> => None);",
+            "stub!(hvpatch_syscall_service(event: super::HvpatchSyscallService));",
+        ] {
+            assert!(
+                source.matches(declaration).count() >= 2,
+                "missing hvpatch syscall-service ABI declaration {declaration}"
             );
         }
     }
@@ -3445,6 +3527,10 @@ mod real {
         /// Address-space provenance: guest PID, ASID, bank base, bank size,
         /// TTBR0. Five scalars keep the complete record reliable on macOS.
         fn hvpatch__guest__address__space(_: i32, _: u32, _: u64, _: u64, _: u64) {}
+        /// Completed Linux syscall service. Args: Linux guest PID, Linux guest
+        /// TID, ASID, Linux syscall number, and monotonic duration nanoseconds.
+        fn hvpatch__syscall__service__begin(_: i32, _: i32, _: u32, _: u64) {}
+        fn hvpatch__syscall__service(_: i32, _: i32, _: u32, _: u64, _: u64) {}
         /// Fork snapshot timing anchor. Args: child guest PID and the guest TID
         /// that issued clone/fork. Consumers key `timestamp` by child PID and
         /// subtract it from `hvpatch__fork__snapshot__end`.
@@ -4332,6 +4418,29 @@ mod real {
             event.bank_base(),
             event.bank_size(),
             event.ttbr0()
+        ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_syscall_service_begin(
+        event: super::HvpatchSyscallService,
+    ) -> Option<std::time::Instant> {
+        let mut started = None;
+        carrick_usdt::hvpatch__syscall__service__begin!(|| {
+            started = Some(std::time::Instant::now());
+            (event.pid(), event.tid(), event.asid(), event.number())
+        });
+        started
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_syscall_service(event: super::HvpatchSyscallService) {
+        carrick_usdt::hvpatch__syscall__service!(|| (
+            event.pid(),
+            event.tid(),
+            event.asid(),
+            event.number(),
+            event.duration_ns()
         ));
     }
 
@@ -5817,6 +5926,11 @@ mod stub {
     }
 
     macro_rules! stub {
+        ($name:ident($($param:ident: $ty:ty),* $(,)?) -> $return:ty => $value:expr) => {
+            #[allow(dead_code, unused_variables)]
+            #[inline(always)]
+            pub fn $name($($param: $ty),*) -> $return { $value }
+        };
         ($name:ident($($param:ident: $ty:ty),* $(,)?)) => {
             #[allow(dead_code, unused_variables)]
             #[inline(always)]
@@ -5871,6 +5985,8 @@ mod stub {
     stub!(hvpatch_guest_lifecycle(event: super::HvpatchGuestLifecycle));
     stub!(hvpatch_guest_fault(event: super::HvpatchGuestFault));
     stub!(hvpatch_guest_address_space(event: super::HvpatchGuestAddressSpace));
+    stub!(hvpatch_syscall_service_begin(event: super::HvpatchSyscallService) -> Option<std::time::Instant> => None);
+    stub!(hvpatch_syscall_service(event: super::HvpatchSyscallService));
     stub!(hvpatch_fork_snapshot_begin(child_pid: i32, forking_tid: i32));
     stub!(hvpatch_fork_snapshot_end(child_pid: i32, local_regions: u64, candidate_regions: u64, added_regions: u64, added_bytes: u64));
     stub!(hvpatch_fork_snapshot_shape(child_pid: i32, private_added_regions: u64, shared_added_regions: u64, largest_added_bytes: u64, bank_used_bytes: u64));
