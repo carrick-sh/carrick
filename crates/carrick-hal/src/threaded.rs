@@ -648,6 +648,13 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
     /// gate process creation on their explicit backend policy.
     fn set_persistent_vm_lifecycle(&mut self, _enabled: bool) {}
 
+    /// Bind this engine to one in-process guest's AArch64 ASID. The default is
+    /// a no-op for backends that retain the one-host-process-per-guest-process
+    /// model. Hvpatch overrides this and keeps the ASID across exec replacement.
+    fn configure_process_asid(&mut self, _asid: u16) -> Result<(), TrapError> {
+        Ok(())
+    }
+
     fn kick_handle(&self) -> Self::KickHandle;
     fn wait_for_vcpu_slot();
     /// Live concurrent-vCPU budget N for the admission scheduler (the M:N pool).

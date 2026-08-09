@@ -88,6 +88,10 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
     /// `_exit`-without-report shutdown path + the `forked=` diagnostic.
     is_forked_child: bool,
 
+    /// Hvpatch-only in-process guest ASID. `None` preserves the mature VMM/KVM
+    /// bootstrap exactly; `Some` is re-applied after every exec replacement.
+    process_asid: Option<u16>,
+
     // ── shared memory state (the X86EngineCore parallels) ──
     /// Live stage-1 page-table editor over the guest's own translation tables at
     /// `LINUX_PAGE_TABLES_BASE`. Built lazily on first protect/unmap edit; reset
@@ -127,6 +131,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             last_fault_esr: 0,
             last_exit_class: 0,
             is_forked_child: false,
+            process_asid: None,
             page_tables: Arc::new(Mutex::new(None)),
             protections: Arc::new(MemoryProtections::default()),
             reclaim_snapshot: None,
@@ -226,6 +231,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             last_fault_esr: 0,
             last_exit_class: 0,
             is_forked_child: false,
+            process_asid: None,
             page_tables,
             protections,
             reclaim_snapshot: None,
@@ -1203,6 +1209,9 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // path even after it execve's into a different image. The flag is a plain
         // field on `self`, untouched by the remap.
         self.vm.execve_rebuild(&mut self.vcpu, new_image)?;
+        if let Some(asid) = self.process_asid {
+            <Self as ThreadedEngine>::configure_process_asid(self, asid)?;
+        }
         // A fresh image has no in-flight syscall or fault.
         self.pending_resume_pc = None;
         self.last_syscall_nr = None;
@@ -1349,6 +1358,7 @@ pub struct Aarch64SiblingSpec<V: Aarch64Vmm> {
     /// load-bearing share is inside the backend `GuestRam` (via
     /// `from_shared_windows`); this is the engine-side mirror.
     protections: Arc<MemoryProtections>,
+    process_asid: Option<u16>,
 }
 
 // SAFETY: the snapshot is POD; the page-table / protections `Arc`s are Send+Sync;
@@ -1390,6 +1400,24 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
 
     fn set_persistent_vm_lifecycle(&mut self, enabled: bool) {
         self.vm.set_persistent_vm_lifecycle(enabled);
+    }
+
+    fn configure_process_asid(&mut self, asid: u16) -> Result<(), TrapError> {
+        if asid == 0 {
+            return Err(TrapError::Hypervisor(
+                "hvpatch process ASID zero is reserved".to_owned(),
+            ));
+        }
+        const TCR_AS: u64 = 1 << 36;
+        const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
+        let tcr = self.vcpu.get_sys_reg(SysReg::Tcr)?;
+        let root = self.vcpu.get_sys_reg(SysReg::Ttbr0)? & TTBR_ROOT_MASK;
+        let ttbr = (u64::from(asid) << 48) | root;
+        self.vcpu.set_sys_reg(SysReg::Tcr, tcr | TCR_AS)?;
+        self.vcpu.set_sys_reg(SysReg::Ttbr0, ttbr)?;
+        self.vcpu.set_sys_reg(SysReg::Ttbr1, ttbr)?;
+        self.process_asid = Some(asid);
+        Ok(())
     }
 
     fn kick_handle(&self) -> Self::KickHandle {
@@ -1481,6 +1509,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             // Share the SAME PROT_NONE bookkeeping (engine-side mirror; the backing
             // share lives in the backend `GuestRam`).
             protections: Arc::clone(&self.protections),
+            process_asid: self.process_asid,
         })
     }
 
@@ -1493,12 +1522,9 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // post-clone instruction.
         vcpu.restore_thread_start(&spec.snapshot)?;
         // SHARE the spawning thread's page-table editor + PROT_NONE set.
-        Ok(Self::from_parts_with_shared(
-            vm,
-            vcpu,
-            spec.page_tables,
-            spec.protections,
-        ))
+        let mut engine = Self::from_parts_with_shared(vm, vcpu, spec.page_tables, spec.protections);
+        engine.process_asid = spec.process_asid;
+        Ok(engine)
     }
 
     fn program_counter(&self) -> Result<u64, TrapError> {

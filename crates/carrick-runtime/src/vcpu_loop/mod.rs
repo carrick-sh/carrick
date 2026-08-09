@@ -402,6 +402,9 @@ pub(crate) struct KernelState {
     /// carrick-signal-core; this is only how an async signal physically wakes a
     /// waiter. Held object-safe so the loop never names the concrete impl.
     pub(crate) signal_arrival: Arc<dyn carrick_hal::SignalArrival>,
+    /// Present only for hvpatch: binds this kernel/dispatcher to one Linux
+    /// process in the shared in-process process table.
+    pub(crate) hvpatch_process: Option<crate::hvpatch::ProcessContext>,
 }
 
 impl KernelState {
@@ -409,12 +412,14 @@ impl KernelState {
         dispatcher: SyscallDispatcher,
         fork: Box<dyn HostForkCoordinator>,
         signal_arrival: Arc<dyn carrick_hal::SignalArrival>,
+        hvpatch_process: Option<crate::hvpatch::ProcessContext>,
     ) -> Self {
         Self {
             dispatcher,
             reporter: CompatReporter::default(),
             fork,
             signal_arrival,
+            hvpatch_process,
         }
     }
 
