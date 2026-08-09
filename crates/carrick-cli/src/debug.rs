@@ -483,12 +483,15 @@ fn run_lldb_attach(
         .arg("-o")
         .arg(format!("attach {pid}"))
         .arg("-o")
-        .arg("carrick eventring")
+        .arg("carrick guest-processes")
+        .arg("-o")
+        .arg("carrick guest-threads")
+        .arg("-o")
+        .arg(lldb_eventring_capture_command())
         .arg("-o")
         .arg("thread backtrace all");
     if !ctx.no_core {
-        lldb.arg("-o")
-            .arg(format!("process save-core {}", lldb_quoted_path(core_path)));
+        lldb.arg("-o").arg(modified_memory_core_command(core_path));
     }
     lldb.arg("-o").arg("detach").arg(ctx.exe);
 
@@ -651,6 +654,20 @@ fn lldb_quoted_path(path: &Path) -> String {
     format!("\"{}\"", path.display())
 }
 
+fn modified_memory_core_command(path: &Path) -> String {
+    format!(
+        "process save-core --style modified-memory {}",
+        lldb_quoted_path(path)
+    )
+}
+
+fn lldb_eventring_capture_command() -> &'static str {
+    // The interactive plugin defaults to a concise 128-event tail. Deadline
+    // captures preserve the whole fixed ring so a high-rate workload cannot
+    // hide the child's exit publication immediately before a parent wait.
+    "carrick eventring 8192"
+}
+
 /// Decode an `ESR_EL1` value into a human-readable struct. Mirrors the
 /// fields documented in the ARMv8-A ARM and the lldb plugin's table so
 /// CLI and lldb give the same answer for a given syndrome.
@@ -735,7 +752,21 @@ fn decode_esr_el1(value: u64) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_esr_el1;
+    use super::{decode_esr_el1, lldb_eventring_capture_command, modified_memory_core_command};
+    use std::path::Path;
+
+    #[test]
+    fn lldb_core_capture_keeps_modified_guest_and_runtime_memory() {
+        assert_eq!(
+            modified_memory_core_command(Path::new("/tmp/hvpatch.core")),
+            "process save-core --style modified-memory \"/tmp/hvpatch.core\""
+        );
+    }
+
+    #[test]
+    fn deadline_capture_keeps_enough_event_history_for_cross_thread_waits() {
+        assert_eq!(lldb_eventring_capture_command(), "carrick eventring 8192");
+    }
 
     #[test]
     fn decodes_tier_b_data_abort_syndrome() {

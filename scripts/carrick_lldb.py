@@ -20,6 +20,9 @@ Commands
     carrick decode-esr <hex>             # ARMv8 ESR_EL1 decoder
     carrick gva <addr>                   # resolve guest VA to region/segment
     carrick where                        # one-line situational dump
+    carrick guest-processes              # summarize guest PID/TID host threads
+    carrick guest-threads [pid]          # list guest threads, optionally by PID
+    carrick eventring [count|start:count]# decode ring (default: last 128)
     carrick mach-exceptions              # correlate DSR Mach exception ports
 
 The plugin caches the state file path between calls so you only have to
@@ -55,6 +58,53 @@ def _parse_int(text: str) -> int:
 
 def _fmt_hex(n: int) -> str:
     return f"0x{n:x}"
+
+
+_GUEST_PROCESS_THREAD_RE = re.compile(r"^guest-pid-(\d+)-tid-(\d+)$")
+_GUEST_PROCESS_LEADER_RE = re.compile(r"^guest-pid-(\d+)$")
+_GUEST_LEGACY_THREAD_RE = re.compile(r"^guest-tid-(\d+)$")
+
+
+def _guest_thread_identity(name: Optional[str]) -> Optional[tuple[Optional[int], int]]:
+    """Decode the stable guest identity carried by a Carrick host-thread name."""
+    if not name:
+        return None
+    match = _GUEST_PROCESS_THREAD_RE.fullmatch(name)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    match = _GUEST_PROCESS_LEADER_RE.fullmatch(name)
+    if match:
+        pid = int(match.group(1))
+        return pid, pid
+    match = _GUEST_LEGACY_THREAD_RE.fullmatch(name)
+    if match:
+        return None, int(match.group(1))
+    return None
+
+
+def _guest_threads(process) -> list[dict[str, Any]]:
+    rows = []
+    for index in range(process.GetNumThreads()):
+        thread = process.GetThreadAtIndex(index)
+        identity = _guest_thread_identity(thread.GetName())
+        if identity is None:
+            continue
+        guest_pid, guest_tid = identity
+        frame = thread.GetFrameAtIndex(0) if thread.GetNumFrames() else None
+        top = "(no frames)"
+        if frame is not None and frame.IsValid():
+            top = frame.GetDisplayFunctionName() or frame.GetFunctionName() or "(unknown)"
+        rows.append(
+            {
+                "guest_pid": guest_pid,
+                "guest_tid": guest_tid,
+                "host_tid": thread.GetThreadID(),
+                "lldb_index": thread.GetIndexID(),
+                "name": thread.GetName() or "(unnamed)",
+                "top": top,
+            }
+        )
+    return rows
 
 
 def _read_state_file(path: str, result: lldb.SBCommandReturnObject) -> Optional[dict]:
@@ -328,6 +378,57 @@ def cmd_where(debugger, command, exe_ctx, result, internal_dict):
 # Mirrors the Rust decode in `crates/carrick-runtime/src/event_ring.rs`.
 
 _EVENTRING_N = 8192  # must match event_ring::N
+_EVENTRING_DEFAULT_COUNT = 128
+
+
+def _format_hvpatch_wait(pid: int, tid: int, detail: int) -> str:
+    packed = detail & 0xFFFFFFFF
+    wait_class = {
+        1: "fds",
+        2: "select",
+        3: "poll",
+        4: "proc-exit",
+        5: "proc-state",
+        6: "child",
+        7: "futex",
+    }.get(packed & 0xFF, "unknown")
+    phase = {
+        1: "begin",
+        2: "ready",
+        3: "timed-out",
+        4: "interrupted",
+        5: "errno",
+    }.get((packed >> 8) & 0xFF, "unknown")
+    return f"pid={pid} tid={tid} wait={wait_class} phase={phase} fds={packed >> 16}"
+
+
+def _format_hvpatch_wait_correlation(pid: int, tid: int, detail: int) -> str:
+    packed = detail & 0xFFFFFFFF
+    wait_class = {
+        1: "fds",
+        2: "select",
+        3: "poll",
+        4: "proc-exit",
+        5: "proc-state",
+        6: "child",
+        7: "futex",
+    }.get((packed >> 24) & 0xF, "unknown")
+    phase = {
+        1: "begin",
+        2: "ready",
+        3: "timed-out",
+        4: "interrupted",
+        5: "errno",
+    }.get((packed >> 28) & 0xF, "unknown")
+    return (
+        f"pid={pid} tid={tid} id={packed & 0xFFFFFF:#08x} "
+        f"wait={wait_class} phase={phase}"
+    )
+
+
+def _format_hvpatch_wait_register(label: str, low: int, high: int, wait_id: int) -> str:
+    value = (low & 0xFFFFFFFF) | ((high & 0xFFFFFFFF) << 32)
+    return f"id={wait_id & 0xFFFFFF:#08x} {label}={value:#018x}"
 
 # kind -> (name, formatter(a, b, c))
 _EVENTRING_KINDS = {
@@ -368,6 +469,62 @@ _EVENTRING_KINDS = {
     ),
     21: ("EFDWRITE", lambda a, b, c: f"hfd={a} before={b & 0xffffffff} after={c & 0xffffffff}"),
     22: ("EFDREAD", lambda a, b, c: f"hfd={a} before={b & 0xffffffff} after={c & 0xffffffff}"),
+    23: (
+        "FUTEXWAIT",
+        lambda a, b, c: f"addr={((a & 0xffffffff) | ((b & 0xffffffff) << 32)):#018x} tid={c}",
+    ),
+    24: (
+        "FUTEXWAKE",
+        lambda a, b, c: f"addr={((a & 0xffffffff) | ((b & 0xffffffff) << 32)):#018x} woken={c}",
+    ),
+    25: (
+        "FUTEXEND",
+        lambda a, b, c: (
+            f"addr={((a & 0xffffffff) | ((b & 0xffffffff) << 32)):#018x} "
+            f"outcome={('woken', 'interrupted', 'timed-out')[c] if 0 <= c < 3 else 'unknown'}"
+        ),
+    ),
+    26: (
+        "HVPTHREAD",
+        lambda a, b, c: (
+            f"pid={a} tid={b} phase="
+            f"{('unknown', 'cleanup-start', 'registry-removed', 'kicker-unregistered', 'signal-forgotten', 'dispatcher-forgotten', 'vcpu-destroyed', 'loop-return')[c] if 0 <= c < 8 else 'unknown'}"
+        ),
+    ),
+    27: ("HVPWAIT", _format_hvpatch_wait),
+    28: ("HVPWAITX", _format_hvpatch_wait_correlation),
+    29: ("HVPWAITPC", lambda a, b, c: _format_hvpatch_wait_register("pc", a, b, c)),
+    30: ("HVPWAITSP", lambda a, b, c: _format_hvpatch_wait_register("sp", a, b, c)),
+    31: ("HVPWAITLR", lambda a, b, c: _format_hvpatch_wait_register("lr", a, b, c)),
+    32: (
+        "HVPWAITFD",
+        lambda a, b, c: f"id={a & 0xFFFFFF:#08x} fd={b} events={c & 0xffffffff:#x}",
+    ),
+    33: (
+        "HVPPEXIT",
+        lambda a, b, c: f"pid={a} tid={b} exit={c} publication=begin",
+    ),
+    34: (
+        "HVPPEXIT",
+        lambda a, b, c: f"pid={a} tid={b} exit={c} publication=complete",
+    ),
+    35: (
+        "HVPWAITTARGET",
+        lambda a, b, c: f"id={a & 0xFFFFFF:#08x} target_pid={b}",
+    ),
+    36: (
+        "EPREADY",
+        lambda a, b, c: f"epfd={a} gfd={b} events={c & 0xffffffff:#x}",
+    ),
+    37: (
+        "EPSTALE",
+        lambda a, b, c: (
+            f"gfd={a} observed_gen={b & 0xffffffff} "
+            f"live_gen={c & 0xffffffff if c >= 0 else 'none'}"
+        ),
+    ),
+    38: ("FDOWNER", lambda a, b, c: f"pid={a} tid={b} gfd={c}"),
+    39: ("FDREF", lambda a, b, c: f"pid={a} gfd={b} refs_before={c}"),
 }
 
 
@@ -409,6 +566,99 @@ def _static_load_addr(target, fullname: str) -> Optional[int]:
     return None
 
 
+def _selected_process(debugger, exe_ctx, result):
+    target = exe_ctx.GetTarget() or debugger.GetSelectedTarget()
+    if not target or not target.IsValid():
+        result.SetError("no target; `lldb <binary>` (attach) or `lldb -c <core> <binary>`")
+        return None
+    process = exe_ctx.GetProcess() or target.GetProcess()
+    if not process or not process.IsValid():
+        result.SetError(
+            "no process/core loaded. Attach to a live carrick (`lldb -p <pid>`) "
+            "or load a core (`lldb -c <core> target/release/carrick`)."
+        )
+        return None
+    return process
+
+
+def cmd_guest_processes(debugger, command, exe_ctx, result, internal_dict):
+    """carrick guest-processes — summarize guest processes in a live target/core."""
+    if command.strip():
+        result.SetError("usage: carrick guest-processes")
+        return
+    process = _selected_process(debugger, exe_ctx, result)
+    if process is None:
+        return
+    rows = _guest_threads(process)
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    legacy = []
+    for row in rows:
+        guest_pid = row["guest_pid"]
+        if guest_pid is None:
+            legacy.append(row)
+        else:
+            grouped.setdefault(guest_pid, []).append(row)
+    lines = [
+        f"# carrick guest processes host_pid={process.GetProcessID()} "
+        f"processes={len(grouped)} threads={len(rows)} legacy_unowned={len(legacy)}"
+    ]
+    for guest_pid, threads in sorted(grouped.items()):
+        tids = ",".join(str(row["guest_tid"]) for row in sorted(threads, key=lambda r: r["guest_tid"]))
+        tops = sorted({row["top"] for row in threads})
+        lines.append(
+            f"pid={guest_pid:<6} threads={len(threads):<3} tids={tids} "
+            f"top={'; '.join(tops)}"
+        )
+    if legacy:
+        tids = ",".join(str(row["guest_tid"]) for row in legacy)
+        lines.append(f"legacy-unowned tids={tids}")
+    if not rows:
+        lines.append(
+            "(no guest threads found; use a binary with process-aware thread names "
+            "or attach after guest startup)"
+        )
+    result.AppendMessage("\n".join(lines))
+
+
+def cmd_guest_threads(debugger, command, exe_ctx, result, internal_dict):
+    """carrick guest-threads [pid] — list guest threads in a live target/core."""
+    args = shlex.split(command)
+    if len(args) > 1:
+        result.SetError("usage: carrick guest-threads [pid]")
+        return
+    guest_pid_filter = None
+    if args:
+        try:
+            guest_pid_filter = _parse_int(args[0])
+        except ValueError as exc:
+            result.SetError(f"can't parse guest pid {args[0]!r}: {exc}")
+            return
+        if guest_pid_filter <= 0:
+            result.SetError("guest pid must be positive")
+            return
+    process = _selected_process(debugger, exe_ctx, result)
+    if process is None:
+        return
+    rows = _guest_threads(process)
+    if guest_pid_filter is not None:
+        rows = [row for row in rows if row["guest_pid"] == guest_pid_filter]
+    lines = [
+        f"# carrick guest threads host_pid={process.GetProcessID()} "
+        f"guest_pid={guest_pid_filter if guest_pid_filter is not None else '*'} "
+        f"count={len(rows)}"
+    ]
+    for row in sorted(rows, key=lambda r: ((r["guest_pid"] or -1), r["guest_tid"])):
+        pid_text = str(row["guest_pid"]) if row["guest_pid"] is not None else "?"
+        lines.append(
+            f"pid={pid_text:<6} tid={row['guest_tid']:<6} "
+            f"lldb=#{row['lldb_index']:<3} host_tid={_fmt_hex(row['host_tid'])} "
+            f"top={row['top']}"
+        )
+    if not rows:
+        lines.append("(no matching guest threads)")
+    result.AppendMessage("\n".join(lines))
+
+
 def cmd_eventring(debugger, command, exe_ctx, result, internal_dict):
     """carrick eventring [COUNT|START:COUNT] — decode the event ring."""
     target = exe_ctx.GetTarget() or debugger.GetSelectedTarget()
@@ -436,7 +686,7 @@ def cmd_eventring(debugger, command, exe_ctx, result, internal_dict):
         result.SetError(f"read IDX @ {_fmt_hex(idx_addr)} failed: {err.GetCString()}")
         return
     total = int.from_bytes(raw_idx, "little")
-    requested = _EVENTRING_N
+    requested = _EVENTRING_DEFAULT_COUNT
     requested_start = None
     argument = command.strip()
     if argument:
@@ -892,6 +1142,8 @@ _SUBCOMMANDS = {
     "decode-esr": cmd_decode_esr,
     "gva": cmd_gva,
     "where": cmd_where,
+    "guest-processes": cmd_guest_processes,
+    "guest-threads": cmd_guest_threads,
     "eventring": cmd_eventring,
     "mach-exceptions": cmd_mach_exceptions,
 }
