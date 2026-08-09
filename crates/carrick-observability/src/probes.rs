@@ -684,6 +684,92 @@ impl HvpatchExecRuntimeStage {
     }
 }
 
+/// Shared-HVF topology-lock operation classes. Ordinals are an append-only
+/// DTrace ABI so offline consumers can retain stable names across releases.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchTopologyOperation {
+    InProcessFork = 0,
+    ExecReplace = 1,
+    ExecSiblingGate = 2,
+    SiblingMaterialize = 3,
+    VcpuRebind = 4,
+    VmRelease = 5,
+    LegacyFork = 6,
+}
+
+impl HvpatchTopologyOperation {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Lifecycle of one topology-lock acquisition attempt. `Requested` precedes a
+/// blocking lock call, `Acquired` carries its wait time, and `Released` carries
+/// the hold time. `TryMiss` closes a nonblocking attempt that found contention.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchTopologyPhase {
+    Requested = 0,
+    Acquired = 1,
+    Released = 2,
+    TryMiss = 3,
+}
+
+impl HvpatchTopologyPhase {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Typed source record for `hvpatch-topology-lock`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchTopologyLock {
+    operation: HvpatchTopologyOperation,
+    phase: HvpatchTopologyPhase,
+    guest_pid: i32,
+    guest_tid: i32,
+    elapsed_ns: u64,
+}
+
+impl HvpatchTopologyLock {
+    pub const fn new(
+        operation: HvpatchTopologyOperation,
+        phase: HvpatchTopologyPhase,
+        guest_pid: i32,
+        guest_tid: i32,
+        elapsed_ns: u64,
+    ) -> Self {
+        Self {
+            operation,
+            phase,
+            guest_pid,
+            guest_tid,
+            elapsed_ns,
+        }
+    }
+
+    pub const fn operation(self) -> HvpatchTopologyOperation {
+        self.operation
+    }
+
+    pub const fn phase(self) -> HvpatchTopologyPhase {
+        self.phase
+    }
+
+    pub const fn guest_pid(self) -> i32 {
+        self.guest_pid
+    }
+
+    pub const fn guest_tid(self) -> i32 {
+        self.guest_tid
+    }
+
+    pub const fn elapsed_ns(self) -> u64 {
+        self.elapsed_ns
+    }
+}
+
 impl HvpatchExecStage2 {
     pub const fn new(
         phase: HvpatchExecStage2Phase,
@@ -1043,6 +1129,43 @@ mod hvpatch_guest_probe_abi {
             assert!(
                 source.matches(declaration).count() >= 2,
                 "missing exec runtime-stage ABI declaration {declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn topology_lock_event_keeps_holder_identity_and_timing_typed() {
+        let event = HvpatchTopologyLock::new(
+            HvpatchTopologyOperation::InProcessFork,
+            HvpatchTopologyPhase::Released,
+            42,
+            43,
+            1_250_000,
+        );
+        assert_eq!(HvpatchTopologyOperation::InProcessFork.raw(), 0);
+        assert_eq!(HvpatchTopologyOperation::ExecReplace.raw(), 1);
+        assert_eq!(HvpatchTopologyOperation::ExecSiblingGate.raw(), 2);
+        assert_eq!(HvpatchTopologyOperation::SiblingMaterialize.raw(), 3);
+        assert_eq!(HvpatchTopologyOperation::VcpuRebind.raw(), 4);
+        assert_eq!(HvpatchTopologyOperation::VmRelease.raw(), 5);
+        assert_eq!(HvpatchTopologyOperation::LegacyFork.raw(), 6);
+        assert_eq!(HvpatchTopologyPhase::Requested.raw(), 0);
+        assert_eq!(HvpatchTopologyPhase::Acquired.raw(), 1);
+        assert_eq!(HvpatchTopologyPhase::Released.raw(), 2);
+        assert_eq!(HvpatchTopologyPhase::TryMiss.raw(), 3);
+        assert_eq!(event.operation(), HvpatchTopologyOperation::InProcessFork);
+        assert_eq!(event.phase(), HvpatchTopologyPhase::Released);
+        assert_eq!(event.guest_pid(), 42);
+        assert_eq!(event.guest_tid(), 43);
+        assert_eq!(event.elapsed_ns(), 1_250_000);
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn hvpatch__topology__lock(_: u32, _: u32, _: i32, _: i32, _: u64) {}",
+            "stub!(hvpatch_topology_lock(event: super::HvpatchTopologyLock));",
+        ] {
+            assert!(
+                source.matches(declaration).count() >= 2,
+                "missing topology-lock ABI declaration {declaration}"
             );
         }
     }
@@ -2840,6 +2963,12 @@ mod real {
         /// bytes. The engine-replace phase encloses the inner replacement-stage
         /// ledger rather than overlapping its siblings.
         fn hvpatch__exec__runtime__stage(_: u32, _: u64, _: u64, _: u64) {}
+        /// Shared-HVF topology-lock lifecycle. Args: operation (0=in-process
+        /// fork, 1=exec replacement, 2=exec sibling gate, 3=sibling
+        /// materialization, 4=vCPU rebind, 5=VM release, 6=legacy fork), phase
+        /// (0=requested, 1=acquired, 2=released, 3=try miss), Linux guest PID,
+        /// Linux guest TID, and wait/hold elapsed nanoseconds.
+        fn hvpatch__topology__lock(_: u32, _: u32, _: i32, _: i32, _: u64) {}
         /// Fires every syscall trap. `arg0` is the ADDRESS of a
         /// `compat::GuestRegs` (`#[repr(C)]`); DTrace does
         /// `copyin(arg0, sizeof(gregs_t))` and reads fields by offset. A
@@ -3748,6 +3877,17 @@ mod real {
             event.elapsed_ns(),
             event.region_count(),
             event.mapped_bytes()
+        ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_topology_lock(event: super::HvpatchTopologyLock) {
+        carrick_usdt::hvpatch__topology__lock!(|| (
+            event.operation().raw(),
+            event.phase().raw(),
+            event.guest_pid(),
+            event.guest_tid(),
+            event.elapsed_ns()
         ));
     }
 
@@ -5137,6 +5277,7 @@ mod stub {
     stub!(hvpatch_exec_stage2(event: super::HvpatchExecStage2));
     stub!(hvpatch_exec_replace_stage(event: super::HvpatchExecReplaceStage));
     stub!(hvpatch_exec_runtime_stage(event: super::HvpatchExecRuntimeStage));
+    stub!(hvpatch_topology_lock(event: super::HvpatchTopologyLock));
     stub!(vm_lifecycle(operation: u32, admission: i32));
     stub!(execve_argv(path: &str, argv: &[Vec<u8>]));
     stub!(host_image_base());

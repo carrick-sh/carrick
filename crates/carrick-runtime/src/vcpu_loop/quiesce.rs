@@ -110,9 +110,11 @@ where
         // Recreate the vCPU under the topology lock so vcpu_create cannot race
         // another fork's hv_vm_destroy/create. Register only after it exists.
         {
-            let _topo = crate::fork_quiesce::topology_lock()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let _topo = crate::fork_quiesce::acquire_topology_lock(
+                carrick_observability::probes::HvpatchTopologyOperation::VcpuRebind,
+                0,
+                self.this_tid.raw(),
+            );
             if !engine.supports_in_process_fork() {
                 engine.rebuild_vcpu_after_fork()?;
             }
@@ -193,9 +195,14 @@ where
         }
         // Serialize VM topology against sibling vCPU creation for the whole fork.
         let phase_start = std::time::Instant::now();
-        let _topology = crate::fork_quiesce::topology_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _topology = crate::fork_quiesce::acquire_topology_lock(
+            carrick_observability::probes::HvpatchTopologyOperation::LegacyFork,
+            kernel
+                .hvpatch_process
+                .as_ref()
+                .map_or(0, crate::hvpatch::ProcessContext::pid),
+            self.this_tid.raw(),
+        );
         crate::probes::fork_lifecycle(0, 1, elapsed_us(phase_start), 0, 0);
         // Clear any VM published by a previous fork so siblings that release their
         // vCPUs this round see only THIS fork's republished VM. Also reset the
@@ -850,9 +857,11 @@ where
             }
             std::thread::yield_now();
         }
-        let _topology = crate::fork_quiesce::topology_lock()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let _topology = crate::fork_quiesce::acquire_topology_lock(
+            carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
+            parent_process.pid(),
+            self.this_tid.raw(),
+        );
         let mut quiesced = false;
         if self.kicker.count() > 1 {
             process_barrier.set_quiescing();

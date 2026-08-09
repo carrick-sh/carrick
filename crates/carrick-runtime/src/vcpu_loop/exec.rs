@@ -176,10 +176,12 @@ where
                 // process-local thread-group drain separate, but serialize the
                 // actual unmap/remap transaction across concurrent execs.
                 let topology_lock_started = std::time::Instant::now();
-                let _hvpatch_topology = kernel.hvpatch_process.as_ref().map(|_| {
-                    crate::fork_quiesce::topology_lock()
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
+                let _hvpatch_topology = kernel.hvpatch_process.as_ref().map(|process| {
+                    crate::fork_quiesce::acquire_topology_lock(
+                        carrick_observability::probes::HvpatchTopologyOperation::ExecReplace,
+                        process.pid(),
+                        self.this_tid.raw(),
+                    )
                 });
                 emit_runtime_stage(
                     carrick_observability::probes::HvpatchExecRuntimeStagePhase::TopologyLock,

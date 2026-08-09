@@ -994,10 +994,12 @@ where
     ///
     /// Returns true iff the VM stands released on return.
     fn try_release_vm_mt(&self, engine: &mut E) -> bool {
-        let _topo = match crate::fork_quiesce::topology_lock().try_lock() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return false,
+        let Some(_topo) = crate::fork_quiesce::try_acquire_topology_lock(
+            carrick_observability::probes::HvpatchTopologyOperation::VmRelease,
+            0,
+            self.this_tid.raw(),
+        ) else {
+            return false;
         };
         if self.registry.vm_released() {
             // A slicing sibling already released this tick cycle and no
@@ -1081,9 +1083,11 @@ where
         };
         carrick_hal::vcpu_sched::set_current_lease(new_lease);
         if engine.reclaim_refreshes_kicker() {
-            let _topo = crate::fork_quiesce::topology_lock()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let _topo = crate::fork_quiesce::acquire_topology_lock(
+                carrick_observability::probes::HvpatchTopologyOperation::VcpuRebind,
+                0,
+                self.this_tid.raw(),
+            );
             // Claim the whole-VM rebuild INSIDE the topology lock — the same
             // lock the park-side teardown and every rebind hold — so a
             // claim-FALSE result proves the claimer's rebuild (or the
