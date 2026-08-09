@@ -2,17 +2,18 @@ use std::sync::Arc;
 
 use carrick_hal::ThreadId;
 
-use super::clone_plan::{ClonePlan, CloneTaskMode};
+use super::address::MmBackend;
+use super::clone_plan::{CloneObjectMode, ClonePlan, CloneTaskMode};
 use super::core::{
     Kernel, KernelContext, KernelDomain, ProcessGroupRecord, RegistryState, SessionRecord,
     TaskRecord, TaskRevision, ZombieRecord,
 };
 use super::ids::{LinuxTid, ObjectIdError, ProcessGroupId, SessionId, TaskId};
 use super::objects::{
-    LinuxWaitStatus, ObjectGraphError, ProcessGroup, Session, Task, TaskKey, TaskRusage,
-    TaskShared, TaskSharedCloneError, ThreadKey, ThreadResources, Zombie,
+    LinuxWaitStatus, Mm, ObjectGraphError, ProcessGroup, Session, Task, TaskKey, TaskRef,
+    TaskRusage, TaskShared, TaskSharedCloneError, ThreadKey, ThreadRef, ThreadResources, Zombie,
 };
-use super::registry::IdError;
+use super::registry::{IdError, TaskReservation, ThreadClaim};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KernelFailpoint {
@@ -53,73 +54,165 @@ impl TaskOperationReservation {
     }
 }
 
-impl Kernel {
-    /// Prepare a new Linux task outside the registry lock, then publish every
-    /// registry/backlink change under one write-lock commit.
-    pub fn fork_task(
-        self: &Arc<Self>,
-        parent: &KernelContext,
-        plan: ClonePlan,
+/// Reserved child identity that remains undiscoverable until backend
+/// preparation completes and `PreparedFork::commit` publishes it.
+#[derive(Debug)]
+pub struct ForkReservation {
+    kernel: Arc<Kernel>,
+    parent_task: TaskRef,
+    parent_thread: ThreadRef,
+    parent_shared: Arc<TaskShared>,
+    parent_resources: Arc<ThreadResources>,
+    parent_revision: TaskRevision,
+    plan: ClonePlan,
+    child_id: TaskId,
+    task_reservation: TaskReservation,
+    leader_claim: ThreadClaim,
+    diagnostic_name: String,
+    failpoint: Option<KernelFailpoint>,
+}
+
+impl ForkReservation {
+    pub const fn child_id(&self) -> TaskId {
+        self.child_id
+    }
+
+    pub fn prepare_with_mm_backend(
+        self,
+        backend: Arc<dyn MmBackend>,
         child_registry_id: ThreadId,
-        diagnostic_name: String,
-        failpoint: Option<KernelFailpoint>,
-    ) -> Result<KernelContext, KernelOperationError> {
-        self.sweep_retired_threads();
-        if !Arc::ptr_eq(self, &parent.kernel) {
-            return Err(KernelOperationError::ForeignContext);
+    ) -> Result<PreparedFork, KernelOperationError> {
+        if self.plan.mm() != CloneObjectMode::Copy {
+            return Err(KernelOperationError::UnexpectedForkMmBackend);
         }
-        if plan.task() != CloneTaskMode::NewTask {
-            return Err(KernelOperationError::ExpectedNewTask);
+        let mm = Arc::new(Mm::with_backend(self.kernel.object_ids().mm_id()?, backend));
+        self.prepare(Some(mm), child_registry_id)
+    }
+
+    pub fn prepare_shared_mm(
+        self,
+        child_registry_id: ThreadId,
+    ) -> Result<PreparedFork, KernelOperationError> {
+        if self.plan.mm() != CloneObjectMode::Share {
+            return Err(KernelOperationError::MissingForkMmBackend);
         }
+        self.prepare(None, child_registry_id)
+    }
 
-        let (child_id, task_reservation) = self.ids().reserve_task()?;
-        let leader_claim = self.ids().claim_task_leader_thread(child_id)?;
-        check_failpoint(failpoint, KernelFailpoint::AfterReserve)?;
+    #[cfg(test)]
+    fn prepare_reference(
+        self,
+        child_registry_id: ThreadId,
+    ) -> Result<PreparedFork, KernelOperationError> {
+        let copied_mm = (self.plan.mm() == CloneObjectMode::Copy)
+            .then(|| {
+                self.kernel
+                    .object_ids()
+                    .mm_id()
+                    .map(Mm::new_reference)
+                    .map(Arc::new)
+            })
+            .transpose()?;
+        self.prepare(copied_mm, child_registry_id)
+    }
 
-        let child_shared = Arc::new(TaskShared::for_new_task(
-            &parent.shared,
-            plan,
-            self.object_ids(),
+    fn prepare(
+        self,
+        copied_mm: Option<Arc<Mm>>,
+        child_registry_id: ThreadId,
+    ) -> Result<PreparedFork, KernelOperationError> {
+        let child_shared = Arc::new(TaskShared::for_new_task_with_mm(
+            &self.parent_shared,
+            self.plan,
+            self.kernel.object_ids(),
+            copied_mm,
         )?);
         let child_resources = Arc::new(ThreadResources::for_clone(
-            &parent.resources,
-            plan,
-            self.object_ids(),
+            &self.parent_resources,
+            self.plan,
+            self.kernel.object_ids(),
         )?);
         let child_key = TaskKey {
-            id: child_id,
-            serial: self.object_ids().task_serial()?,
+            id: self.child_id,
+            serial: self.kernel.object_ids().task_serial()?,
         };
         let child = Arc::new(Task::new(
             child_key,
-            Some(parent.task.key()),
-            parent.task.process_group(),
-            parent.task.session(),
+            Some(self.parent_task.key()),
+            self.parent_task.process_group(),
+            self.parent_task.session(),
             Arc::clone(&child_shared),
         ));
-        let leader_tid = LinuxTid::for_task_leader(child_id);
+        let leader_tid = LinuxTid::for_task_leader(self.child_id);
         let leader = child.attach_fork_thread(
             ThreadKey {
                 tid: leader_tid,
-                serial: self.object_ids().thread_serial()?,
+                serial: self.kernel.object_ids().thread_serial()?,
             },
             child_registry_id,
             Arc::clone(&child_resources),
-            parent.thread.signal_state(),
+            self.parent_thread.signal_state(),
         )?;
-        check_failpoint(failpoint, KernelFailpoint::AfterObjects)?;
-        check_failpoint(failpoint, KernelFailpoint::AfterBackendPrepare)?;
+        check_failpoint(self.failpoint, KernelFailpoint::AfterObjects)?;
+        check_failpoint(self.failpoint, KernelFailpoint::AfterBackendPrepare)?;
+        Ok(PreparedFork {
+            reservation: self,
+            child,
+            leader,
+            child_shared,
+            child_resources,
+        })
+    }
+}
 
+#[derive(Debug)]
+pub struct PreparedFork {
+    reservation: ForkReservation,
+    child: TaskRef,
+    leader: ThreadRef,
+    child_shared: Arc<TaskShared>,
+    child_resources: Arc<ThreadResources>,
+}
+
+impl PreparedFork {
+    pub const fn child_id(&self) -> TaskId {
+        self.reservation.child_id
+    }
+
+    pub fn commit(self) -> Result<KernelContext, KernelOperationError> {
+        let Self {
+            reservation,
+            child,
+            leader,
+            child_shared,
+            child_resources,
+        } = self;
+        let ForkReservation {
+            kernel,
+            parent_task,
+            parent_thread: _,
+            parent_shared: _,
+            parent_resources: _,
+            parent_revision,
+            plan: _,
+            child_id,
+            task_reservation,
+            leader_claim,
+            diagnostic_name,
+            failpoint,
+        } = reservation;
+        let child_key = child.key();
+        let leader_tid = LinuxTid::for_task_leader(child_id);
         {
-            let mut state = self.registry().state.write();
-            ensure_task_unreserved(&state, parent.task.key().id)?;
-            let Some(parent_record) = state.tasks.get(&parent.task.key().id) else {
+            let mut state = kernel.registry().state.write();
+            ensure_task_unreserved(&state, parent_task.key().id)?;
+            let Some(parent_record) = state.tasks.get(&parent_task.key().id) else {
                 return Err(KernelOperationError::ParentExited);
             };
-            if parent_record.task.key() != parent.task.key() {
+            if parent_record.task.key() != parent_task.key() {
                 return Err(KernelOperationError::ParentExited);
             }
-            if parent_record.revision != parent.revision {
+            if parent_record.revision != parent_revision {
                 return Err(KernelOperationError::StaleContext);
             }
             let next_parent_revision = next_revision(parent_record.revision)?;
@@ -133,7 +226,7 @@ impl Kernel {
             check_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
 
             let task_claim = task_reservation.commit();
-            parent.task.add_child(child_key);
+            parent_task.add_child(child_key);
             if let Some(group) = state.process_groups.get_mut(&process_group) {
                 group.members.insert(child_key);
             }
@@ -147,19 +240,68 @@ impl Kernel {
                     diagnostic_name,
                 },
             );
-            if let Some(parent_record) = state.tasks.get_mut(&parent.task.key().id) {
+            if let Some(parent_record) = state.tasks.get_mut(&parent_task.key().id) {
                 parent_record.revision = next_parent_revision;
             }
         }
 
         Ok(KernelContext::from_parts(
-            self.clone(),
+            kernel,
             child,
             leader,
             child_shared,
             child_resources,
             TaskRevision::INITIAL,
         ))
+    }
+}
+
+impl Kernel {
+    pub fn reserve_fork(
+        self: &Arc<Self>,
+        parent: &KernelContext,
+        plan: ClonePlan,
+        diagnostic_name: String,
+        failpoint: Option<KernelFailpoint>,
+    ) -> Result<ForkReservation, KernelOperationError> {
+        self.sweep_retired_threads();
+        if !Arc::ptr_eq(self, &parent.kernel) {
+            return Err(KernelOperationError::ForeignContext);
+        }
+        if plan.task() != CloneTaskMode::NewTask {
+            return Err(KernelOperationError::ExpectedNewTask);
+        }
+        let (child_id, task_reservation) = self.ids().reserve_task()?;
+        let leader_claim = self.ids().claim_task_leader_thread(child_id)?;
+        check_failpoint(failpoint, KernelFailpoint::AfterReserve)?;
+        Ok(ForkReservation {
+            kernel: self.clone(),
+            parent_task: Arc::clone(&parent.task),
+            parent_thread: Arc::clone(&parent.thread),
+            parent_shared: Arc::clone(&parent.shared),
+            parent_resources: Arc::clone(&parent.resources),
+            parent_revision: parent.revision,
+            plan,
+            child_id,
+            task_reservation,
+            leader_claim,
+            diagnostic_name,
+            failpoint,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn fork_task(
+        self: &Arc<Self>,
+        parent: &KernelContext,
+        plan: ClonePlan,
+        child_registry_id: ThreadId,
+        diagnostic_name: String,
+        failpoint: Option<KernelFailpoint>,
+    ) -> Result<KernelContext, KernelOperationError> {
+        self.reserve_fork(parent, plan, diagnostic_name, failpoint)?
+            .prepare_reference(child_registry_id)?
+            .commit()
     }
 
     /// Prepare a thread and its independently selectable files/fs associations,
@@ -738,6 +880,10 @@ pub enum KernelOperationError {
     ExpectedNewTask,
     #[error("clone plan creates a task, not a thread-group member")]
     ExpectedThreadGroup,
+    #[error("copied-mm fork requires a prepared backend")]
+    MissingForkMmBackend,
+    #[error("shared-mm fork cannot accept a replacement backend")]
+    UnexpectedForkMmBackend,
     #[error("parent task exited before commit")]
     ParentExited,
     #[error("kernel context revision is stale")]
@@ -778,14 +924,42 @@ pub enum KernelOperationError {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU16;
+
     use carrick_abi::{LinuxCloneFlags, SigSet};
+    use carrick_guest_mem::Gpa;
+    use carrick_hal::MappingId;
     use proptest::prelude::*;
 
     use super::*;
     use crate::kernel::{
-        Credentials, FileDescription, FileSlotNumber, FileTable, FsContext, LinuxSignal, Mm,
-        RootBootstrap, Sighand, SignalDisposition, ThreadSignalState,
+        Asid, Credentials, FileDescription, FileSlotNumber, FileTable, FsContext, LinuxSignal, Mm,
+        MmBinding, RootBootstrap, Sighand, SignalDisposition, SnapshotError, SnapshotTable,
+        Stage1Root, ThreadSignalState, VmaSummary,
     };
+
+    #[derive(Debug)]
+    struct TestMmBackend(MmBinding);
+
+    impl MmBackend for TestMmBackend {
+        fn binding(&self) -> MmBinding {
+            self.0
+        }
+
+        fn vma_summaries(&self) -> Result<Vec<VmaSummary>, SnapshotError> {
+            Err(SnapshotError::AuthorityUnavailable(SnapshotTable::Vmas))
+        }
+
+        fn mapping_ids(&self) -> Result<Vec<MappingId>, SnapshotError> {
+            Err(SnapshotError::AuthorityUnavailable(SnapshotTable::Mappings))
+        }
+    }
+
+    fn test_binding() -> MmBinding {
+        let asid = Asid::from_registry_allocation(NonZeroU16::new(7).expect("nonzero ASID"));
+        let root = Stage1Root::for_aarch64_4k(Gpa(0x8000)).expect("aligned root");
+        MmBinding::for_aarch64(asid, root)
+    }
 
     fn bootstrap(pid: i32) -> (Arc<Kernel>, KernelContext) {
         let input = RootBootstrap::for_reference_model(
@@ -868,6 +1042,65 @@ mod tests {
             .slot(slot)
             .expect("fork copies file slot");
         assert!(Arc::ptr_eq(&child_slot.description(), &description));
+    }
+
+    #[test]
+    fn fork_reservation_stays_undiscoverable_until_backend_commit() {
+        let (kernel, root) = bootstrap(150);
+        let plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
+        let before = kernel.ids().counts();
+        let reservation = kernel
+            .reserve_fork(&root, plan, "child".to_string(), None)
+            .expect("reserve fork");
+        let child_id = reservation.child_id();
+        assert!(
+            kernel
+                .context(child_id, LinuxTid::for_task_leader(child_id))
+                .is_err()
+        );
+
+        let child_registry_id = ThreadId::synthetic_for_tests(9_999);
+        let prepared = reservation
+            .prepare_with_mm_backend(Arc::new(TestMmBackend(test_binding())), child_registry_id)
+            .expect("prepare backend");
+        assert!(
+            kernel
+                .context(child_id, LinuxTid::for_task_leader(child_id))
+                .is_err()
+        );
+        let child = prepared.commit().expect("publish child");
+
+        assert_eq!(child.thread.registry_id(), child_registry_id);
+        assert_eq!(
+            child
+                .shared
+                .mm()
+                .backend()
+                .expect("production backend")
+                .binding(),
+            test_binding()
+        );
+        assert_ne!(kernel.ids().counts(), before);
+    }
+
+    #[test]
+    fn dropped_fork_reservation_restores_identity_claim_counts() {
+        let (kernel, root) = bootstrap(175);
+        let plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
+        let before = kernel.ids().counts();
+        let reservation = kernel
+            .reserve_fork(&root, plan, "child".to_string(), None)
+            .expect("reserve fork");
+        let child_id = reservation.child_id();
+        drop(reservation);
+
+        assert_eq!(kernel.ids().counts(), before);
+        assert!(
+            kernel
+                .context(child_id, LinuxTid::for_task_leader(child_id))
+                .is_err()
+        );
+        assert_eq!(kernel.registry().task_count(), 1);
     }
 
     #[test]
