@@ -351,24 +351,9 @@ mod tests {
 
     use super::*;
     use crate::kernel::{
-        ClonePlan, Credentials, FileDescription, FileSlotNumber, FileTable, FsContext, LinuxSignal,
-        LinuxWaitStatus, Mm, ObjectIdRegistry, RootBootstrap, Sighand, SignalDisposition,
-        TaskRusage,
+        ClonePlan, FileDescription, FileSlotNumber, LinuxSignal, LinuxWaitStatus, RootBootstrap,
+        SignalDisposition, TaskRusage,
     };
-
-    fn associations(ids: &ObjectIdRegistry) -> (Arc<TaskShared>, Arc<ThreadResources>) {
-        (
-            Arc::new(TaskShared::new(
-                Arc::new(Mm::new_reference(ids.mm_id().expect("mm"))),
-                Arc::new(Sighand::new(ids.sighand_id().expect("sighand"))),
-            )),
-            Arc::new(ThreadResources::new(
-                Arc::new(FileTable::new(ids.file_table_id().expect("files"))),
-                Arc::new(FsContext::new(ids.fs_context_id().expect("fs"))),
-                Arc::new(Credentials::new()),
-            )),
-        )
-    }
 
     fn spawn_active_runner(
         thread_ref: &ThreadRef,
@@ -402,13 +387,9 @@ mod tests {
     }
 
     fn bootstrap(pid: i32) -> (Arc<Kernel>, KernelContext) {
-        let ids = ObjectIdRegistry::new();
-        let (shared, resources) = associations(&ids);
-        let input = RootBootstrap::from_observed_pid(
+        let input = RootBootstrap::for_reference_model(
             pid,
             ThreadId::synthetic_for_tests(pid),
-            shared,
-            resources,
             "root".to_string(),
         )
         .expect("bootstrap input");

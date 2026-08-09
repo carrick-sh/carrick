@@ -784,23 +784,13 @@ mod tests {
     use super::*;
     use crate::kernel::{
         Credentials, FileDescription, FileSlotNumber, FileTable, FsContext, LinuxSignal, Mm,
-        ObjectIdRegistry, RootBootstrap, Sighand, SignalDisposition, ThreadSignalState,
+        RootBootstrap, Sighand, SignalDisposition, ThreadSignalState,
     };
 
     fn bootstrap(pid: i32) -> (Arc<Kernel>, KernelContext) {
-        let ids = ObjectIdRegistry::new();
-        let input = RootBootstrap::from_observed_pid(
+        let input = RootBootstrap::for_reference_model(
             pid,
             ThreadId::synthetic_for_tests(pid),
-            Arc::new(TaskShared::new(
-                Arc::new(Mm::new_reference(ids.mm_id().expect("mm"))),
-                Arc::new(Sighand::new(ids.sighand_id().expect("sighand"))),
-            )),
-            Arc::new(ThreadResources::new(
-                Arc::new(FileTable::new(ids.file_table_id().expect("files"))),
-                Arc::new(FsContext::new(ids.fs_context_id().expect("fs"))),
-                Arc::new(Credentials::new()),
-            )),
             "root".to_string(),
         )
         .expect("bootstrap input");
@@ -848,10 +838,17 @@ mod tests {
         assert_eq!(kernel.registry().task_count(), 2);
         assert_eq!(child.task.parent(), Some(root.task.key()));
         assert!(!Arc::ptr_eq(&root.shared.mm(), &child.shared.mm()));
+        assert_ne!(root.shared.mm().id(), child.shared.mm().id());
         assert!(!Arc::ptr_eq(
             &root.resources.files(),
             &child.resources.files()
         ));
+        assert_ne!(root.resources.files().id(), child.resources.files().id());
+        assert_ne!(
+            root.resources.fs_context().id(),
+            child.resources.fs_context().id()
+        );
+        assert_ne!(root.shared.sighand().id(), child.shared.sighand().id());
         assert_eq!(
             child.shared.sighand().disposition(ignored),
             SignalDisposition::Ignore

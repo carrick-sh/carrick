@@ -4,10 +4,11 @@ use std::sync::{Arc, Weak};
 use carrick_hal::ThreadId;
 use parking_lot::RwLock;
 
+use super::address::MmBackend;
 use super::ids::{LinuxTid, ObjectIdError, ObjectIdRegistry, ProcessGroupId, SessionId, TaskId};
 use super::objects::{
-    ObjectGraphError, ProcessGroup, Session, Task, TaskKey, TaskRef, TaskShared, Thread, ThreadKey,
-    ThreadRef, ThreadResources, Zombie,
+    Credentials, FileTable, FsContext, Mm, ObjectGraphError, ProcessGroup, Session, Sighand, Task,
+    TaskKey, TaskRef, TaskShared, Thread, ThreadKey, ThreadRef, ThreadResources, Zombie,
 };
 use super::registry::{IdError, IdRegistry, TaskClaim, ThreadClaim};
 
@@ -98,28 +99,43 @@ impl TaskRevision {
     }
 }
 
-#[derive(Debug)]
 pub struct RootBootstrap {
     task_id: TaskId,
     registry_id: ThreadId,
-    shared: Arc<TaskShared>,
-    resources: Arc<ThreadResources>,
+    mm_backend: Option<Arc<dyn MmBackend>>,
     diagnostic_name: String,
 }
 
 impl RootBootstrap {
-    pub fn from_observed_pid(
+    /// Build an identity-only root for the in-crate reference model.
+    pub fn for_reference_model(
         observed_pid: i32,
         registry_id: ThreadId,
-        shared: Arc<TaskShared>,
-        resources: Arc<ThreadResources>,
+        diagnostic_name: String,
+    ) -> Result<Self, KernelError> {
+        Self::new(observed_pid, registry_id, None, diagnostic_name)
+    }
+
+    /// Build a production root whose mm is backed by the execution adapter.
+    pub fn with_mm_backend(
+        observed_pid: i32,
+        registry_id: ThreadId,
+        mm_backend: Arc<dyn MmBackend>,
+        diagnostic_name: String,
+    ) -> Result<Self, KernelError> {
+        Self::new(observed_pid, registry_id, Some(mm_backend), diagnostic_name)
+    }
+
+    fn new(
+        observed_pid: i32,
+        registry_id: ThreadId,
+        mm_backend: Option<Arc<dyn MmBackend>>,
         diagnostic_name: String,
     ) -> Result<Self, KernelError> {
         Ok(Self {
             task_id: TaskId::for_root_bootstrap(observed_pid)?,
             registry_id,
-            shared,
-            resources,
+            mm_backend,
             diagnostic_name,
         })
     }
@@ -148,6 +164,20 @@ impl Kernel {
         let process_group_claim = ids.claim_process_group(process_group_id)?;
         let session_claim = ids.claim_session(session_id)?;
         let object_ids = ObjectIdRegistry::new();
+        let mm_id = object_ids.mm_id()?;
+        let mm = match bootstrap.mm_backend {
+            Some(backend) => Arc::new(Mm::with_backend(mm_id, backend)),
+            None => Arc::new(Mm::new_reference(mm_id)),
+        };
+        let shared = Arc::new(TaskShared::new(
+            mm,
+            Arc::new(Sighand::new(object_ids.sighand_id()?)),
+        ));
+        let resources = Arc::new(ThreadResources::new(
+            Arc::new(FileTable::new(object_ids.file_table_id()?)),
+            Arc::new(FsContext::new(object_ids.fs_context_id()?)),
+            Arc::new(Credentials::new()),
+        ));
         let task_key = TaskKey {
             id: bootstrap.task_id,
             serial: object_ids.task_serial()?,
@@ -157,14 +187,14 @@ impl Kernel {
             None,
             process_group_id,
             session_id,
-            bootstrap.shared,
+            Arc::clone(&shared),
         ));
         let leader_tid = LinuxTid::for_task_leader(bootstrap.task_id);
         let leader_key = ThreadKey {
             tid: leader_tid,
             serial: object_ids.thread_serial()?,
         };
-        let leader = task.attach_thread(leader_key, bootstrap.registry_id, bootstrap.resources)?;
+        let leader = task.attach_thread(leader_key, bootstrap.registry_id, resources)?;
         let process_group = Arc::new(ProcessGroup::new(
             process_group_id,
             session_id,
@@ -547,25 +577,9 @@ mod tests {
     use crate::kernel::{Credentials, FileTable, FsContext, Mm, Sighand};
 
     fn bootstrap(pid: i32) -> (Arc<Kernel>, KernelContext) {
-        let object_ids = ObjectIdRegistry::new();
-        let shared = Arc::new(TaskShared::new(
-            Arc::new(Mm::new_reference(object_ids.mm_id().expect("mm ID"))),
-            Arc::new(Sighand::new(object_ids.sighand_id().expect("sighand ID"))),
-        ));
-        let resources = Arc::new(ThreadResources::new(
-            Arc::new(FileTable::new(
-                object_ids.file_table_id().expect("file table ID"),
-            )),
-            Arc::new(FsContext::new(
-                object_ids.fs_context_id().expect("fs context ID"),
-            )),
-            Arc::new(Credentials::new()),
-        ));
-        let bootstrap = RootBootstrap::from_observed_pid(
+        let bootstrap = RootBootstrap::for_reference_model(
             pid,
             ThreadId::synthetic_for_tests(pid),
-            shared,
-            resources,
             "root".to_string(),
         )
         .expect("root bootstrap input");
