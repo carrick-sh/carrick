@@ -924,6 +924,14 @@ pub(crate) struct InotifyRegistry {
     by_path: parking_lot::RwLock<HashMap<String, Vec<RegisteredWatch>>>,
 }
 
+impl Clone for InotifyRegistry {
+    fn clone(&self) -> Self {
+        Self {
+            by_path: parking_lot::RwLock::new(self.by_path.read().clone()),
+        }
+    }
+}
+
 impl std::fmt::Debug for InotifyRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InotifyRegistry")

@@ -299,6 +299,17 @@ impl Default for SeccompState {
 }
 
 impl SeccompState {
+    pub(crate) fn fork_clone(&self) -> Self {
+        let filters = self.filters.lock().clone();
+        let strict = *self.strict.lock();
+        let active = strict || !filters.is_empty();
+        Self {
+            filters: Mutex::new(filters),
+            strict: Mutex::new(strict),
+            identity_fast_path_allowed: AtomicU32::new(u32::from(!active)),
+        }
+    }
+
     /// Install a parsed filter program (appended to the stack).
     pub(crate) fn install(&self, prog: Vec<SockFilter>) {
         let mut filters = self.filters.lock();

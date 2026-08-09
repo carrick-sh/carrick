@@ -100,6 +100,7 @@ use std::collections::VecDeque;
 /// signal handlers borrow only what they touch instead of the whole
 /// dispatcher. Field semantics are unchanged from the former loose
 /// fields (`signal_handlers`/`signal_mask`/`pending_signals`/`sig_altstack`).
+#[derive(Clone)]
 pub(super) struct SignalState {
     /// Installed signal handlers per signum (1..=64). When the guest
     /// calls `rt_sigaction(signum, new, old, 8)` we record `new` here
@@ -198,6 +199,50 @@ impl SignalState {
             altstack: HashMap::new(),
             handler_frames: HashMap::new(),
             restore_masks: HashMap::new(),
+            pending_siginfos: HashMap::new(),
+            process_pending_siginfos: HashMap::new(),
+            pending_actions: HashMap::new(),
+        }
+    }
+
+    pub(super) fn fork_clone(
+        &self,
+        parent_tid: crate::thread::ThreadId,
+        child_tid: crate::thread::ThreadId,
+    ) -> Self {
+        Self {
+            handlers: self.handlers.clone(),
+            masks: self
+                .masks
+                .get(&parent_tid)
+                .copied()
+                .map(|value| HashMap::from([(child_tid, value)]))
+                .unwrap_or_default(),
+            // Pending signals are not inherited across fork.
+            pendings: HashMap::new(),
+            rt_pending_counts: HashMap::new(),
+            process_pending: SigSet::EMPTY,
+            process_rt_pending_counts: HashMap::new(),
+            altstack: self
+                .altstack
+                .get(&parent_tid)
+                .copied()
+                .map(|value| HashMap::from([(child_tid, value)]))
+                .unwrap_or_default(),
+            // A fork from inside a handler resumes inside that same handler in
+            // the child, so preserve only the calling thread's frame stack.
+            handler_frames: self
+                .handler_frames
+                .get(&parent_tid)
+                .cloned()
+                .map(|value| HashMap::from([(child_tid, value)]))
+                .unwrap_or_default(),
+            restore_masks: self
+                .restore_masks
+                .get(&parent_tid)
+                .copied()
+                .map(|value| HashMap::from([(child_tid, value)]))
+                .unwrap_or_default(),
             pending_siginfos: HashMap::new(),
             process_pending_siginfos: HashMap::new(),
             pending_actions: HashMap::new(),

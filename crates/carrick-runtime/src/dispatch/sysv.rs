@@ -596,6 +596,19 @@ impl SysvShmState {
         }
     }
 
+    pub(super) fn fork_clone(&self) -> Self {
+        Self {
+            segments: self.segments.clone(),
+            attachments: self.attachments.clone(),
+            remapped_attachments: self.remapped_attachments.clone(),
+            private_counter: AtomicU32::new(self.private_counter.load(Ordering::Relaxed)),
+            message_queues: self.message_queues.clone(),
+            semaphores: self.semaphores.clone(),
+            sem_keys: self.sem_keys.clone(),
+            next_sem_scan_index: self.next_sem_scan_index,
+        }
+    }
+
     fn allocate_sem_id(&mut self) -> Result<(GuestSemId, SemScanIndex), LinuxErrno> {
         let raw = i32::try_from(self.next_sem_scan_index).map_err(|_| LINUX_ENOSPC)?;
         let index = SemScanIndex(self.next_sem_scan_index);
