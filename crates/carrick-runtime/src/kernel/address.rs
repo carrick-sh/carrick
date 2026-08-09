@@ -1,6 +1,7 @@
 use std::num::NonZeroU16;
 
-use carrick_guest_mem::Gpa;
+use carrick_guest_mem::{Gpa, GuestVa};
+use carrick_hal::MappingId;
 
 const AARCH64_STAGE1_ROOT_ALIGNMENT: u64 = 4096;
 const AARCH64_TTBR0_ROOT_MASK: u64 = (1_u64 << 48) - 1;
@@ -41,6 +42,49 @@ impl Stage1Root {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MmBinding {
+    pub asid: Asid,
+    pub stage1_root: Stage1Root,
+    pub ttbr0: Ttbr0,
+}
+
+impl MmBinding {
+    pub const fn for_aarch64(asid: Asid, stage1_root: Stage1Root) -> Self {
+        Self {
+            asid,
+            stage1_root,
+            ttbr0: Ttbr0::for_aarch64(asid, stage1_root),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmaSummary {
+    pub start: GuestVa,
+    pub end: GuestVa,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotTable {
+    Vmas,
+    Mappings,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum SnapshotError {
+    #[error("{0:?} snapshot authority is not attached to this K1 backend adapter")]
+    AuthorityUnavailable(SnapshotTable),
+    #[error("backend snapshot changed while it was being observed")]
+    ChangedDuringObservation,
+}
+
+pub trait MmBackend: Send + Sync {
+    fn binding(&self) -> MmBinding;
+    fn vma_summaries(&self) -> Result<Vec<VmaSummary>, SnapshotError>;
+    fn mapping_ids(&self) -> Result<Vec<MappingId>, SnapshotError>;
+}
+
 /// A validated `TTBR0_EL1` value composed from typed ASID and root domains.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
@@ -79,6 +123,14 @@ mod tests {
         assert_eq!(
             Ttbr0::for_aarch64(asid(1), root).raw(),
             0x0001_0000_1234_5000
+        );
+        assert_eq!(
+            MmBinding::for_aarch64(asid(1), root),
+            MmBinding {
+                asid: asid(1),
+                stage1_root: root,
+                ttbr0: Ttbr0::for_aarch64(asid(1), root),
+            }
         );
     }
 

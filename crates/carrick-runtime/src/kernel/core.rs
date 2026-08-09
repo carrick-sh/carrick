@@ -549,7 +549,7 @@ mod tests {
     fn bootstrap(pid: i32) -> (Arc<Kernel>, KernelContext) {
         let object_ids = ObjectIdRegistry::new();
         let shared = Arc::new(TaskShared::new(
-            Arc::new(Mm::new(object_ids.mm_id().expect("mm ID"))),
+            Arc::new(Mm::new_reference(object_ids.mm_id().expect("mm ID"))),
             Arc::new(Sighand::new(object_ids.sighand_id().expect("sighand ID"))),
         ));
         let resources = Arc::new(ThreadResources::new(
@@ -605,7 +605,9 @@ mod tests {
         let original_shared = Arc::clone(&first.shared);
         let original_resources = Arc::clone(&first.resources);
         first.task.replace_shared(Arc::new(TaskShared::new(
-            Arc::new(Mm::new(kernel.object_ids().mm_id().expect("new mm"))),
+            Arc::new(Mm::new_reference(
+                kernel.object_ids().mm_id().expect("new mm"),
+            )),
             Arc::new(Sighand::new(
                 kernel.object_ids().sighand_id().expect("new sighand"),
             )),

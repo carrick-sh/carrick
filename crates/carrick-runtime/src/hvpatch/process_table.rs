@@ -8,7 +8,11 @@ use std::sync::{Arc, Weak};
 use parking_lot::{Condvar, Mutex};
 
 use super::asid::{AsidAllocator, AsidError, RetiredAsid};
-use crate::kernel::{Asid, Stage1Root, Stage1RootError, Ttbr0};
+use super::banked_mm::{BankedMmBackend, BankedMmState};
+use crate::kernel::{
+    Asid, Mm, MmBackend, MmBinding, ObjectIdError, ObjectIdRegistry, Stage1Root, Stage1RootError,
+    Ttbr0,
+};
 
 const PROCESS_BANK_SIZE: u64 = 40 * 1024 * 1024 * 1024;
 const PROCESS_BANK_COUNT: u8 =
@@ -92,6 +96,14 @@ impl GuestProcess {
         self.asid
     }
 
+    pub(crate) const fn binding(self) -> MmBinding {
+        MmBinding {
+            asid: self.asid,
+            stage1_root: self.stage1_root,
+            ttbr0: self.ttbr0,
+        }
+    }
+
     pub(crate) fn stage1_root(self) -> u64 {
         self.stage1_root.gpa().raw()
     }
@@ -152,6 +164,8 @@ pub(crate) enum ProcessTableError {
     BankExhausted,
     #[error("hvpatch process-group/session operation is not permitted")]
     IdentityPermission,
+    #[error(transparent)]
+    ObjectId(#[from] ObjectIdError),
 }
 
 impl From<AsidError> for ProcessTableError {
@@ -168,6 +182,8 @@ struct ProcessTableInner {
     next_pid: i32,
     asids: AsidAllocator,
     processes: BTreeMap<GuestPid, GuestProcess>,
+    mm_states: BTreeMap<GuestPid, Arc<BankedMmState>>,
+    mms: BTreeMap<GuestPid, Arc<Mm>>,
     exited: BTreeMap<GuestPid, ChildExit>,
     /// Weak readiness subscribers for guest-virtual pidfds. The fd table owns
     /// each watch; this lifecycle index only fires watches that remain open.
@@ -180,6 +196,7 @@ struct ProcessTableInner {
 pub(crate) struct ProcessTable {
     inner: Mutex<ProcessTableInner>,
     child_changed: Condvar,
+    object_ids: ObjectIdRegistry,
 }
 
 impl ProcessTable {
@@ -221,21 +238,32 @@ impl ProcessTable {
             bank: None,
         };
         let next_pid = root_pid.raw().checked_add(1).unwrap_or(1);
+        let object_ids = ObjectIdRegistry::new();
+        let mm_state = Arc::new(BankedMmState::new(root.binding()));
+        let backend: Arc<dyn MmBackend> = Arc::new(BankedMmBackend::new(Arc::clone(&mm_state)));
+        let mm = Arc::new(Mm::with_backend(object_ids.mm_id()?, backend));
         Ok(Self {
             inner: Mutex::new(ProcessTableInner {
                 next_pid,
                 asids,
                 processes: BTreeMap::from([(root_pid, root)]),
+                mm_states: BTreeMap::from([(root_pid, mm_state)]),
+                mms: BTreeMap::from([(root_pid, mm)]),
                 exited: BTreeMap::new(),
                 pidfd_watchers: BTreeMap::new(),
                 free_banks: (0..PROCESS_BANK_COUNT).map(ProcessBank).collect(),
             }),
             child_changed: Condvar::new(),
+            object_ids,
         })
     }
 
     pub(crate) fn process(&self, pid: GuestPid) -> Option<GuestProcess> {
         self.inner.lock().processes.get(&pid).copied()
+    }
+
+    pub(crate) fn mm(&self, pid: GuestPid) -> Option<Arc<Mm>> {
+        self.inner.lock().mms.get(&pid).cloned()
     }
 
     pub(crate) fn is_live(&self, pid: GuestPid) -> bool {
@@ -282,6 +310,7 @@ impl ProcessTable {
         if !inner.processes.contains_key(&parent) {
             return Err(ProcessTableError::UnknownProcess(parent));
         }
+        let mm_id = self.object_ids.mm_id()?;
         let pid = allocate_pid(&mut inner)?;
         let bank = inner
             .free_banks
@@ -312,6 +341,11 @@ impl ProcessTable {
             ttbr0: Ttbr0::for_aarch64(asid, child_stage1_root),
             bank: Some(bank),
         };
+        let mm_state = Arc::new(BankedMmState::new(process.binding()));
+        let backend: Arc<dyn MmBackend> = Arc::new(BankedMmBackend::new(Arc::clone(&mm_state)));
+        let mm = Arc::new(Mm::with_backend(mm_id, backend));
+        inner.mm_states.insert(pid, mm_state);
+        inner.mms.insert(pid, mm);
         inner.processes.insert(pid, process);
         Ok(process)
     }
@@ -412,7 +446,12 @@ impl ProcessTable {
         let new_stage1_root = Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa(new_stage1_root))?;
         process.stage1_root = new_stage1_root;
         process.ttbr0 = Ttbr0::for_aarch64(process.asid, new_stage1_root);
-        Ok(*process)
+        let binding = process.binding();
+        let result = *process;
+        if let Some(state) = inner.mm_states.get(&pid) {
+            state.publish_binding(binding);
+        }
+        Ok(result)
     }
 
     pub(crate) fn exit_process(&self, pid: GuestPid) -> Result<RetiredProcess, ProcessTableError> {
@@ -421,6 +460,10 @@ impl ProcessTable {
             .processes
             .remove(&pid)
             .ok_or(ProcessTableError::UnknownProcess(pid))?;
+        if let Some(state) = inner.mm_states.remove(&pid) {
+            state.publish_binding(process.binding());
+        }
+        inner.mms.remove(&pid);
         let asid = inner.asids.retire(process.asid)?;
         inner.pidfd_watchers.remove(&pid);
         Ok(RetiredProcess {
@@ -442,6 +485,10 @@ impl ProcessTable {
         let parent = process
             .parent
             .ok_or(ProcessTableError::UnknownProcess(pid))?;
+        if let Some(state) = inner.mm_states.remove(&pid) {
+            state.publish_binding(process.binding());
+        }
+        inner.mms.remove(&pid);
         let retired = inner.asids.retire(process.asid)?;
         inner.asids.acknowledge_tlb_flush(retired)?;
         if let Some(bank) = process.bank {
@@ -666,6 +713,9 @@ mod tests {
         let parent = GuestPid::new_for_tests(80);
         let table = ProcessTable::new_for_tests(parent, 0x4000, 2).expect("root process");
         let child = table.fork_process(parent).expect("child process");
+        let child_mm = table.mm(child.pid()).expect("live child mm");
+        let child_backend = child_mm.backend().expect("live child backend");
+        let child_binding = child_backend.binding();
 
         assert_eq!(
             table.wait_child(parent, Some(child.pid()), true, false),
@@ -674,6 +724,8 @@ mod tests {
         table
             .publish_exit(child.pid(), 23 << 8)
             .expect("publish child exit");
+        assert!(table.mm(child.pid()).is_none());
+        assert_eq!(child_backend.binding(), child_binding);
         let WaitResult::Exited(exit) = table.wait_child(parent, None, false, false) else {
             panic!("published exit was not waitable");
         };

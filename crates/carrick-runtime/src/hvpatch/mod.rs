@@ -12,6 +12,7 @@ use island::passthrough_island_bytes;
 use patcher::{ISLAND_STUB_SIZE, PatchError, PatchSite, patch_svc_zero};
 
 mod asid;
+mod banked_mm;
 mod info_page;
 mod island;
 mod patcher;
@@ -26,9 +27,20 @@ use process_table::{GuestPid, ProcessTable};
 pub(crate) struct ProcessContext {
     table: std::sync::Arc<ProcessTable>,
     pid: GuestPid,
+    mm: std::sync::Arc<crate::kernel::Mm>,
 }
 
 impl ProcessContext {
+    fn new(
+        table: std::sync::Arc<ProcessTable>,
+        pid: GuestPid,
+    ) -> Result<Self, process_table::ProcessTableError> {
+        let mm = table
+            .mm(pid)
+            .ok_or(process_table::ProcessTableError::UnknownProcess(pid))?;
+        Ok(Self { table, pid, mm })
+    }
+
     pub(crate) fn pid(&self) -> i32 {
         self.pid.raw()
     }
@@ -37,13 +49,19 @@ impl ProcessContext {
         self.table.live_process_count()
     }
 
+    pub(crate) fn mm_binding(&self) -> Option<crate::kernel::MmBinding> {
+        self.mm
+            .backend()
+            .map(|backend| crate::kernel::MmBackend::binding(backend.as_ref()))
+    }
+
     /// Return the Linux process identity needed to bind a host service record
     /// to this multiplexed address space. A missing record means the process is
     /// already retired, so callers omit rather than forge diagnostic identity.
     pub(crate) fn syscall_trace_identity(&self) -> Option<(i32, u32)> {
-        self.table
-            .process(self.pid)
-            .map(|process| (process.pid().raw(), u32::from(process.asid().raw())))
+        let process = self.table.process(self.pid)?;
+        let binding = self.mm_binding()?;
+        Some((process.pid().raw(), u32::from(binding.asid.raw())))
     }
 
     /// Register a readiness subscriber for a pidfd targeting this shared VM's
@@ -91,12 +109,16 @@ impl ProcessContext {
             return;
         };
         let ppid = process.parent().map_or(0, GuestPid::raw);
+        let Some(binding) = self.mm_binding() else {
+            tracing::error!(pid = self.pid.raw(), "hvpatch task has no mm backend");
+            return;
+        };
         let event = carrick_observability::probes::HvpatchGuestLifecycle::new(
             phase,
             process.pid().raw(),
             ppid,
             tid.raw(),
-            u32::from(process.asid().raw()),
+            u32::from(binding.asid.raw()),
             detail,
         );
         match event {
@@ -108,10 +130,10 @@ impl ProcessContext {
         if let Some(bank) = process.bank() {
             let address_space = carrick_observability::probes::HvpatchGuestAddressSpace::new(
                 process.pid().raw(),
-                u32::from(process.asid().raw()),
+                u32::from(binding.asid.raw()),
                 bank.base(),
                 bank.size(),
-                process.ttbr0(),
+                binding.ttbr0.raw(),
             );
             match address_space {
                 Ok(event) => crate::probes::hvpatch_guest_address_space(event),
@@ -138,13 +160,17 @@ impl ProcessContext {
             );
             return;
         };
+        let Some(binding) = self.mm_binding() else {
+            tracing::error!(pid = self.pid.raw(), "hvpatch task has no mm backend");
+            return;
+        };
         let event = carrick_observability::probes::HvpatchGuestFault::new(
             syndrome,
             elr,
             far,
             process.pid().raw(),
             tid.raw(),
-            u32::from(process.asid().raw()),
+            u32::from(binding.asid.raw()),
         );
         match event {
             Ok(event) => crate::probes::hvpatch_guest_fault(event),
@@ -158,13 +184,8 @@ impl ProcessContext {
         &self,
     ) -> Result<(Self, process_table::GuestProcess), process_table::ProcessTableError> {
         let child = self.table.fork_process(self.pid)?;
-        Ok((
-            Self {
-                table: std::sync::Arc::clone(&self.table),
-                pid: child.pid(),
-            },
-            child,
-        ))
+        let context = Self::new(std::sync::Arc::clone(&self.table), child.pid())?;
+        Ok((context, child))
     }
 
     pub(crate) fn discard_unstarted_child(&self) -> Result<(), process_table::ProcessTableError> {
@@ -263,12 +284,16 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
         ProcessTable::new_root(pid, stage1_root)
             .map_err(|error| RuntimeError::Configuration(error.to_string()))?,
     );
-    let root = table.process(pid).ok_or_else(|| {
-        RuntimeError::Configuration("hvpatch root process disappeared".to_owned())
+    let context = ProcessContext::new(table, pid)
+        .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+    let binding = context.mm_binding().ok_or_else(|| {
+        RuntimeError::Configuration("hvpatch root mm backend disappeared".to_owned())
     })?;
-    engine.configure_process_asid(root.asid().raw())?;
-    debug_assert_eq!(root.ttbr0(), engine.get_sys_reg(SysReg::Ttbr0).unwrap_or(0));
-    let context = ProcessContext { table, pid };
+    engine.configure_process_asid(binding.asid.raw())?;
+    debug_assert_eq!(
+        binding.ttbr0.raw(),
+        engine.get_sys_reg(SysReg::Ttbr0).unwrap_or(0)
+    );
     context.trace_lifecycle(
         carrick_observability::probes::HvpatchGuestLifecyclePhase::Root,
         crate::thread::ThreadId::from_guest_supplied_tid(pid.raw()),

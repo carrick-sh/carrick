@@ -12,7 +12,10 @@ pub mod objects;
 pub mod operations;
 pub mod registry;
 
-pub use address::{Asid, Stage1Root, Stage1RootError, Ttbr0};
+pub use address::{
+    Asid, MmBackend, MmBinding, SnapshotError, SnapshotTable, Stage1Root, Stage1RootError, Ttbr0,
+    VmaSummary,
+};
 pub use clone_plan::{CloneObjectMode, ClonePlan, ClonePlanError, CloneTaskMode};
 pub use core::{
     Kernel, KernelContext, KernelError, Registry, RegistryInvariantError, RootBootstrap,

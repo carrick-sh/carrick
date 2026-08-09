@@ -793,7 +793,7 @@ mod tests {
             pid,
             ThreadId::synthetic_for_tests(pid),
             Arc::new(TaskShared::new(
-                Arc::new(Mm::new(ids.mm_id().expect("mm"))),
+                Arc::new(Mm::new_reference(ids.mm_id().expect("mm"))),
                 Arc::new(Sighand::new(ids.sighand_id().expect("sighand"))),
             )),
             Arc::new(ThreadResources::new(
@@ -903,7 +903,9 @@ mod tests {
         let first_shared = Arc::clone(&root.shared);
         let first_resources = Arc::clone(&root.resources);
         let second_shared = Arc::new(TaskShared::new(
-            Arc::new(Mm::new(kernel.object_ids().mm_id().expect("second mm"))),
+            Arc::new(Mm::new_reference(
+                kernel.object_ids().mm_id().expect("second mm"),
+            )),
             Arc::new(Sighand::new(
                 kernel.object_ids().sighand_id().expect("second sighand"),
             )),

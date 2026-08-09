@@ -8,6 +8,7 @@ use carrick_abi::SigSet;
 use carrick_hal::ThreadId;
 use parking_lot::{Condvar, Mutex};
 
+use super::address::MmBackend;
 use super::clone_plan::{CloneObjectMode, ClonePlan, CloneTaskMode};
 use super::ids::{
     FileDescriptionId, FileSlotNumber, FileTableId, FsContextId, LinuxSignal, LinuxTid, MmId,
@@ -28,18 +29,42 @@ pub struct ThreadKey {
     pub serial: ThreadSerial,
 }
 
-#[derive(Debug)]
 pub struct Mm {
     id: MmId,
+    backend: Option<Arc<dyn MmBackend>>,
 }
 
 impl Mm {
-    pub const fn new(id: MmId) -> Self {
-        Self { id }
+    /// Identity-only constructor for the in-crate K1 reference model. Runtime
+    /// adapters must use `with_backend`; callers outside `kernel` cannot create
+    /// an observation-less mm.
+    pub(super) const fn new_reference(id: MmId) -> Self {
+        Self { id, backend: None }
+    }
+
+    pub fn with_backend(id: MmId, backend: Arc<dyn MmBackend>) -> Self {
+        Self {
+            id,
+            backend: Some(backend),
+        }
     }
 
     pub const fn id(&self) -> MmId {
         self.id
+    }
+
+    pub fn backend(&self) -> Option<&Arc<dyn MmBackend>> {
+        self.backend.as_ref()
+    }
+}
+
+impl std::fmt::Debug for Mm {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Mm")
+            .field("id", &self.id)
+            .field("has_backend", &self.backend.is_some())
+            .finish()
     }
 }
 
@@ -323,7 +348,7 @@ impl TaskShared {
         }
         let mm = match plan.mm() {
             CloneObjectMode::Share => Arc::clone(&parent.mm),
-            CloneObjectMode::Copy => Arc::new(Mm::new(ids.mm_id()?)),
+            CloneObjectMode::Copy => Arc::new(Mm::new_reference(ids.mm_id()?)),
         };
         let sighand = match plan.sighand() {
             CloneObjectMode::Share => Arc::clone(&parent.sighand),
@@ -336,7 +361,7 @@ impl TaskShared {
 
     pub(super) fn for_exec(caller: &Self, ids: &ObjectIdRegistry) -> Result<Self, ObjectIdError> {
         Ok(Self {
-            mm: Arc::new(Mm::new(ids.mm_id()?)),
+            mm: Arc::new(Mm::new_reference(ids.mm_id()?)),
             // Ignored dispositions survive; caught handlers reset to default.
             // K4 binds this model to the concrete signal backend.
             sighand: Arc::new(Sighand::for_exec(ids.sighand_id()?, &caller.sighand)),
@@ -1233,7 +1258,7 @@ mod tests {
                 id: task_id,
                 serial: ids.task_serial().expect("task serial"),
             };
-            let mm = Arc::new(Mm::new(ids.mm_id().expect("mm ID")));
+            let mm = Arc::new(Mm::new_reference(ids.mm_id().expect("mm ID")));
             let sighand = Arc::new(Sighand::new(ids.sighand_id().expect("sighand ID")));
             let shared = Arc::new(TaskShared::new(mm, sighand));
             let task = Arc::new(Task::new(

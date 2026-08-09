@@ -359,7 +359,7 @@ mod tests {
     fn associations(ids: &ObjectIdRegistry) -> (Arc<TaskShared>, Arc<ThreadResources>) {
         (
             Arc::new(TaskShared::new(
-                Arc::new(Mm::new(ids.mm_id().expect("mm"))),
+                Arc::new(Mm::new_reference(ids.mm_id().expect("mm"))),
                 Arc::new(Sighand::new(ids.sighand_id().expect("sighand"))),
             )),
             Arc::new(ThreadResources::new(
