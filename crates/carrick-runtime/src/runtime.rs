@@ -309,6 +309,14 @@ where
                 options.debug_state_path,
             )
         }
+        crate::page_profile::ExecutionBackend::HvPatch => crate::hvpatch::run_static_hvpatch(
+            path.as_ref(),
+            dispatcher,
+            argv,
+            env,
+            options.max_traps,
+            options.debug_state_path,
+        ),
         crate::page_profile::ExecutionBackend::Native => crate::native::run_static_native(
             path.as_ref(),
             dispatcher,
@@ -467,6 +475,30 @@ where
     A: IntoIterator<Item = String>,
     E: IntoIterator<Item = String>,
 {
+    run_elf_from_dispatcher_with_backend_debug(
+        path,
+        dispatcher,
+        argv,
+        env,
+        max_traps,
+        debug_state_path,
+        crate::page_profile::ExecutionBackend::Vmm,
+    )
+}
+
+pub(crate) fn run_elf_from_dispatcher_with_backend_debug<A, E>(
+    path: &str,
+    dispatcher: SyscallDispatcher,
+    argv: A,
+    env: E,
+    max_traps: usize,
+    debug_state_path: Option<&PathBuf>,
+    backend: crate::page_profile::ExecutionBackend,
+) -> Result<RunResult, RuntimeError>
+where
+    A: IntoIterator<Item = String>,
+    E: IntoIterator<Item = String>,
+{
     let argv: Vec<String> = argv.into_iter().collect();
     let env: Vec<String> = env.into_iter().collect();
     // Docker accepts a bare entrypoint command (`carrick run alpine ls`); resolve
@@ -532,7 +564,7 @@ where
         vdso_enabled_for_debug(),
         needs_at_base.then_some(ROSETTA_AT_BASE_PLACEHOLDER),
     )?;
-    finish_and_run_image(image, dispatcher, max_traps, debug_state_path)
+    finish_image_for_backend(image, dispatcher, max_traps, debug_state_path, backend)
 }
 
 pub fn run_rootfs_elf_with_hvf_args<A, E>(
@@ -800,6 +832,39 @@ fn with_hvf_syscall_mailbox(image: AddressSpace) -> Result<AddressSpace, Address
     image.with_syscall_mailbox_arena()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageFinalizer {
+    Vmm,
+    HvPatch,
+}
+
+fn image_finalizer_for_backend(
+    backend: crate::page_profile::ExecutionBackend,
+) -> Result<ImageFinalizer, RuntimeError> {
+    match backend {
+        crate::page_profile::ExecutionBackend::Vmm => Ok(ImageFinalizer::Vmm),
+        crate::page_profile::ExecutionBackend::HvPatch => Ok(ImageFinalizer::HvPatch),
+        crate::page_profile::ExecutionBackend::Native => Err(RuntimeError::Unsupported(
+            "native images must use the native backend finalizer".to_string(),
+        )),
+    }
+}
+
+fn finish_image_for_backend(
+    image: AddressSpace,
+    dispatcher: SyscallDispatcher,
+    max_traps: usize,
+    debug_state_path: Option<&PathBuf>,
+    backend: crate::page_profile::ExecutionBackend,
+) -> Result<RunResult, RuntimeError> {
+    match image_finalizer_for_backend(backend)? {
+        ImageFinalizer::Vmm => finish_and_run_image(image, dispatcher, max_traps, debug_state_path),
+        ImageFinalizer::HvPatch => {
+            crate::hvpatch::finish_hvpatch_image(image, dispatcher, max_traps, debug_state_path)
+        }
+    }
+}
+
 /// Finish a freshly-loaded image (its initial stack already set, if any) and
 /// run it: install the EL0 trampoline, EL1 vectors, stage-1 page tables and
 /// vDSO, optionally dump debug state, then enter the HVF run loop. This
@@ -807,7 +872,7 @@ fn with_hvf_syscall_mailbox(image: AddressSpace) -> Result<AddressSpace, Address
 /// across every `run_*` entry point; the entry points now differ only in how
 /// they obtain the image bytes (host file / raw bytes / rootfs / overlay) and
 /// set up identity + Rosetta redirection.
-fn finish_and_run_image(
+pub(crate) fn finish_and_run_image(
     image: AddressSpace,
     dispatcher: SyscallDispatcher,
     max_traps: usize,
@@ -2352,6 +2417,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_finalizer_routes_hvpatch_without_native_fallthrough() {
+        assert_eq!(
+            image_finalizer_for_backend(crate::page_profile::ExecutionBackend::Vmm).unwrap(),
+            ImageFinalizer::Vmm
+        );
+        assert_eq!(
+            image_finalizer_for_backend(crate::page_profile::ExecutionBackend::HvPatch).unwrap(),
+            ImageFinalizer::HvPatch
+        );
+        assert!(
+            image_finalizer_for_backend(crate::page_profile::ExecutionBackend::Native).is_err()
+        );
+    }
 
     fn rootfs_with(files: &[(&str, &[u8])]) -> crate::rootfs::RootFs {
         let mut b = tar::Builder::new(Vec::new());

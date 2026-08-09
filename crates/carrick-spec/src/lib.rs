@@ -238,6 +238,7 @@ pub enum ExecBackendRequest {
     #[default]
     Native,
     Vmm,
+    HvPatch,
 }
 
 impl ExecBackendRequest {
@@ -254,6 +255,8 @@ impl ExecBackendRequest {
             Ok(Self::Native)
         } else if matches("vmm") {
             Ok(Self::Vmm)
+        } else if matches("hvpatch") {
+            Ok(Self::HvPatch)
         } else if matches("auto") {
             Err(
                 "execution backend 'auto' was removed; omit --exec-backend for native execution or pass --exec-backend vmm"
@@ -263,7 +266,7 @@ impl ExecBackendRequest {
             Err("execution backend 'hvf' was renamed; pass --exec-backend vmm".to_string())
         } else {
             Err(format!(
-                "unknown execution backend '{input}'; expected 'native' or 'vmm'"
+                "unknown execution backend '{input}'; expected 'native', 'vmm', or 'hvpatch'"
             ))
         }
     }
@@ -282,7 +285,7 @@ impl<'de> Deserialize<'de> for ExecBackendRequest {
 #[cfg(feature = "clap")]
 impl clap::ValueEnum for ExecBackendRequest {
     fn value_variants<'a>() -> &'a [Self] {
-        &[Self::Native, Self::Vmm]
+        &[Self::Native, Self::Vmm, Self::HvPatch]
     }
 
     fn from_str(input: &str, ignore_case: bool) -> Result<Self, String> {
@@ -293,6 +296,7 @@ impl clap::ValueEnum for ExecBackendRequest {
         Some(match self {
             Self::Native => clap::builder::PossibleValue::new("native"),
             Self::Vmm => clap::builder::PossibleValue::new("vmm"),
+            Self::HvPatch => clap::builder::PossibleValue::new("hvpatch"),
         })
     }
 }
@@ -902,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn exec_backend_serde_accepts_only_native_and_vmm() {
+    fn exec_backend_serde_accepts_native_vmm_and_hvpatch() {
         assert_eq!(
             serde_json::from_str::<ExecBackendRequest>(r#""native""#)
                 .expect("native backend should deserialize"),
@@ -912,6 +916,11 @@ mod tests {
             serde_json::from_str::<ExecBackendRequest>(r#""vmm""#)
                 .expect("vmm backend should deserialize"),
             ExecBackendRequest::Vmm
+        );
+        assert_eq!(
+            serde_json::from_str::<ExecBackendRequest>(r#""hvpatch""#)
+                .expect("hvpatch backend should deserialize"),
+            ExecBackendRequest::HvPatch
         );
 
         let auto = serde_json::from_str::<ExecBackendRequest>(r#""auto""#)
@@ -934,7 +943,7 @@ mod tests {
 
     #[cfg(feature = "clap")]
     #[test]
-    fn exec_backend_clap_accepts_only_native_and_vmm() {
+    fn exec_backend_clap_accepts_native_vmm_and_hvpatch() {
         use clap::ValueEnum;
 
         assert_eq!(
@@ -945,11 +954,19 @@ mod tests {
             ExecBackendRequest::from_str("vmm", false).expect("vmm should parse"),
             ExecBackendRequest::Vmm
         );
+        assert_eq!(
+            ExecBackendRequest::from_str("hvpatch", false).expect("hvpatch should parse"),
+            ExecBackendRequest::HvPatch
+        );
 
         let values = ExecBackendRequest::value_variants();
         assert_eq!(
-            values,
-            &[ExecBackendRequest::Native, ExecBackendRequest::Vmm]
+            values
+                .iter()
+                .filter_map(clap::ValueEnum::to_possible_value)
+                .map(|value| value.get_name().to_owned())
+                .collect::<Vec<_>>(),
+            ["native", "vmm", "hvpatch"]
         );
 
         let auto = ExecBackendRequest::from_str("auto", false).expect_err("auto must fail");
