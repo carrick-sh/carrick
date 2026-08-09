@@ -310,6 +310,13 @@ impl ThreadRegistry {
 
     pub fn register_child(&self, clear_child_tid: u64) -> ThreadId {
         let tid = ThreadId::from_registry_allocation(self.next_tid.fetch_add(1, Ordering::Relaxed));
+        self.register_child_with_tid(tid, clear_child_tid);
+        tid
+    }
+
+    /// Register a child whose tid was allocated by an external process-wide
+    /// task-id namespace (hvpatch's one-VM process table).
+    pub fn register_child_with_tid(&self, tid: ThreadId, clear_child_tid: u64) {
         self.inner.lock().map.insert(
             tid,
             ThreadEntry {
@@ -320,7 +327,6 @@ impl ThreadRegistry {
                 vcpu_parked: None,
             },
         );
-        tid
     }
 
     pub fn clear_child_tid(&self, tid: ThreadId) -> Option<u64> {

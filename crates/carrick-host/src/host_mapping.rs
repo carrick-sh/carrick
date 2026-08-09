@@ -33,6 +33,10 @@ pub enum HostMappingKind {
     /// page cache and shared across `fork(2)`. Backs a guest MAP_SHARED file
     /// mapping `hv_vm_map`'d at a fresh IPA.
     SharedFile,
+    /// A COW mapping of an immutable Carrick-owned file artifact. Used for
+    /// patched executable regions: every exec gets a distinct host mapping,
+    /// while untouched pages stay demand-backed by the cached artifact.
+    PrivateFile,
 }
 
 /// RAII owner for host virtual memory that backs a guest HVF mapping.
@@ -160,6 +164,28 @@ impl OwnedHostMapping {
             )
         };
         Self::from_mmap_result(host, len, HostMappingKind::SharedFile)
+    }
+
+    /// `MAP_PRIVATE` a Carrick-owned file artifact read-write. Host writes
+    /// (HvPatch overlays or an HVF-coherent guest store) COW-fault private
+    /// pages and can never mutate the cached artifact. `fd` need only outlive
+    /// this call; the VM mapping retains its own vnode reference.
+    pub fn map_private_file(
+        fd: libc::c_int,
+        offset: libc::off_t,
+        len: usize,
+    ) -> Result<Self, std::io::Error> {
+        let host = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE,
+                fd,
+                offset,
+            )
+        };
+        Self::from_mmap_result(host, len, HostMappingKind::PrivateFile)
     }
 
     fn from_mmap_result(
@@ -410,6 +436,43 @@ mod tests {
              alias-window MAP_SHARED file path is leaking host fds (an \
              engine's map_host_alias likely forgot to close the dispatcher's \
              dup'd fd, or map_shared_file retained a descriptor of its own)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn map_private_file_is_cow_and_outlives_the_source_fd() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::os::fd::AsRawFd;
+
+        let _serialize = MMAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let len = 16 * 1024usize;
+        let mut file = tempfile::tempfile().expect("create private-file fixture");
+        file.write_all(&vec![0xA5; len]).expect("write fixture");
+        file.seek(SeekFrom::Start(0)).expect("rewind fixture");
+        let mapping =
+            OwnedHostMapping::map_private_file(file.as_raw_fd(), 0, len).expect("map private file");
+        let bytes = unsafe { std::slice::from_raw_parts_mut(mapping.as_ptr(), len) };
+        assert_eq!(bytes[0], 0xA5);
+        bytes[0] = 0x5A;
+        assert_eq!(bytes[0], 0x5A, "private mapping must be writable");
+
+        file.seek(SeekFrom::Start(0)).expect("rewind source");
+        let mut source_byte = [0_u8; 1];
+        file.read_exact(&mut source_byte).expect("read source");
+        assert_eq!(
+            source_byte[0], 0xA5,
+            "a COW write must not mutate the file artifact"
+        );
+        drop(file);
+
+        // The fd is closed above; the mapping's vnode reference must remain
+        // live and the COW write must not fault.
+        assert_eq!(
+            unsafe { libc::msync(mapping.as_ptr().cast(), len, libc::MS_ASYNC) },
+            0
         );
     }
 

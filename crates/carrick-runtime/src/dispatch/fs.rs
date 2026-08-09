@@ -3052,15 +3052,26 @@ impl SyscallDispatcher {
             None => return DispatchOutcome::errno(LINUX_EBADF),
         };
 
-        let replaced_existing;
+        // dup2/dup3 closes `new_fd` before installing the duplicate.  Carrick's
+        // epoll emulation keys its interest map by guest-fd number, so the
+        // detach must happen while that slot still names the DISPLACED open-file
+        // description.  Detaching after insertion resolves `new_fd` through the
+        // replacement and can tear down the parent's inherited registration
+        // for the old description (the HvPatch Go os/exec two-pipe hang).
+        //
+        // Linux attaches epoll interest to the open-file description.  A forked
+        // parent's reference therefore keeps the registration alive when the
+        // child replaces its numeric slot; only the final logical fd reference
+        // is allowed to trigger automatic close-detach.
+        self.detach_fd_from_epolls(new_fd);
+
         {
             let mut table = self.io.open_files.write();
-            replaced_existing = if let Some(replaced) = table.remove(&new_fd) {
+            if let Some(replaced) = table.remove(&new_fd) {
+                let pid = self.event_ring_guest_pid();
+                self.record_fd_close_owner(new_fd, pid, &replaced);
                 self.close_open_file_and_free_pty(&replaced);
-                true
-            } else {
-                false
-            };
+            }
             retain_open_file(&description);
             table.insert(
                 new_fd,
@@ -3071,9 +3082,6 @@ impl SyscallDispatcher {
             );
         }
         self.clear_closed_stdio(new_fd);
-        if replaced_existing {
-            self.detach_fd_from_epolls(new_fd);
-        }
         DispatchOutcome::Returned {
             value: new_fd as i64,
         }
@@ -7875,6 +7883,7 @@ impl SyscallDispatcher {
             let removed = this.io.open_files.write().remove(&fd.0);
             Ok(
                 if let Some(open_file) = removed {
+                    this.record_fd_close_owner(fd.0, cx.tid().raw(), &open_file);
                     crate::event_ring::rec(
                         crate::event_ring::FDCLOSE,
                         fd.0,
@@ -7943,6 +7952,7 @@ impl SyscallDispatcher {
                     this.io.splice_pushback.lock().remove(&fd);
                     this.detach_fd_from_epolls(fd);
                     if let Some(open_file) = this.io.open_files.write().remove(&fd) {
+                        this.record_fd_close_owner(fd, cx.tid().raw(), &open_file);
                         crate::event_ring::rec(
                             crate::event_ring::FDCLOSE,
                             fd,

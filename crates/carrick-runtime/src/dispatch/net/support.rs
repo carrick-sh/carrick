@@ -207,12 +207,9 @@ pub(super) fn clear_pending_epoll_ready(
 pub(super) fn drain_pending_epoll_ready(
     pending_ready: &mut VecDeque<(i32, LinuxEpollEvent)>,
     max_events: usize,
-) -> Vec<LinuxEpollEvent> {
+) -> Vec<(i32, LinuxEpollEvent)> {
     let take = pending_ready.len().min(max_events);
-    pending_ready
-        .drain(..take)
-        .map(|(_fd, event)| event)
-        .collect()
+    pending_ready.drain(..take).collect()
 }
 
 pub(super) fn write_epoll_events<M: GuestMemory>(

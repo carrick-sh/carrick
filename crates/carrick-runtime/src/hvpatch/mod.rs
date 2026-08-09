@@ -37,10 +37,112 @@ impl ProcessContext {
         self.table.live_process_count()
     }
 
+    /// Register a readiness subscriber for a pidfd targeting this shared VM's
+    /// guest process namespace. Returns false only when the pid is neither live
+    /// nor a retained zombie.
+    pub(crate) fn register_pidfd_watch(
+        &self,
+        target: i32,
+        watch: &std::sync::Arc<crate::dispatch::fd_table::PidfdWatch>,
+    ) -> bool {
+        GuestPid::from_raw(target)
+            .is_some_and(|target| self.table.register_pidfd_watch(target, watch))
+    }
+
+    pub(crate) fn process_is_live(&self, target: i32) -> bool {
+        GuestPid::from_raw(target).is_some_and(|target| self.table.is_live(target))
+    }
+
+    pub(crate) fn allocate_thread_id(
+        &self,
+    ) -> Result<crate::thread::ThreadId, process_table::ProcessTableError> {
+        self.table
+            .allocate_task_id()
+            .map(crate::thread::ThreadId::from_guest_supplied_tid)
+    }
+
     pub(crate) fn is_child(&self) -> bool {
         self.table
             .process(self.pid)
             .is_some_and(|process| process.parent().is_some())
+    }
+
+    pub(crate) fn trace_lifecycle(
+        &self,
+        phase: carrick_observability::probes::HvpatchGuestLifecyclePhase,
+        tid: crate::thread::ThreadId,
+        detail: i64,
+    ) {
+        let Some(process) = self.table.process(self.pid) else {
+            tracing::warn!(
+                pid = self.pid.raw(),
+                ?phase,
+                "hvpatch lifecycle record disappeared"
+            );
+            return;
+        };
+        let ppid = process.parent().map_or(0, GuestPid::raw);
+        let event = carrick_observability::probes::HvpatchGuestLifecycle::new(
+            phase,
+            process.pid().raw(),
+            ppid,
+            tid.raw(),
+            u32::from(process.asid().raw()),
+            detail,
+        );
+        match event {
+            Ok(event) => crate::probes::hvpatch_guest_lifecycle(event),
+            Err(error) => {
+                tracing::error!(pid = self.pid.raw(), %error, "invalid hvpatch lifecycle event")
+            }
+        }
+        if let Some(bank) = process.bank() {
+            let address_space = carrick_observability::probes::HvpatchGuestAddressSpace::new(
+                process.pid().raw(),
+                u32::from(process.asid().raw()),
+                bank.base(),
+                bank.size(),
+                process.ttbr0(),
+            );
+            match address_space {
+                Ok(event) => crate::probes::hvpatch_guest_address_space(event),
+                Err(error) => tracing::error!(
+                    pid = self.pid.raw(),
+                    %error,
+                    "invalid hvpatch address-space event"
+                ),
+            }
+        }
+    }
+
+    pub(crate) fn trace_fault(
+        &self,
+        syndrome: u64,
+        elr: u64,
+        far: u64,
+        tid: crate::thread::ThreadId,
+    ) {
+        let Some(process) = self.table.process(self.pid) else {
+            tracing::warn!(
+                pid = self.pid.raw(),
+                "hvpatch fault process record disappeared"
+            );
+            return;
+        };
+        let event = carrick_observability::probes::HvpatchGuestFault::new(
+            syndrome,
+            elr,
+            far,
+            process.pid().raw(),
+            tid.raw(),
+            u32::from(process.asid().raw()),
+        );
+        match event {
+            Ok(event) => crate::probes::hvpatch_guest_fault(event),
+            Err(error) => {
+                tracing::error!(pid = self.pid.raw(), %error, "invalid hvpatch fault event")
+            }
+        }
     }
 
     pub(crate) fn fork_child(
@@ -64,13 +166,73 @@ impl ProcessContext {
     pub(crate) fn publish_exit_code(
         &self,
         exit_code: i32,
+        tid: crate::thread::ThreadId,
     ) -> Result<(), process_table::ProcessTableError> {
-        self.table.publish_exit(self.pid, (exit_code & 0xff) << 8)
+        crate::event_ring::rec_hvpatch_process_exit_begin(self.pid.raw(), tid.raw(), exit_code);
+        self.trace_lifecycle(
+            carrick_observability::probes::HvpatchGuestLifecyclePhase::ProcessExit,
+            tid,
+            i64::from(exit_code),
+        );
+        self.table.publish_exit(self.pid, (exit_code & 0xff) << 8)?;
+        crate::event_ring::rec_hvpatch_process_exit_end(self.pid.raw(), tid.raw(), exit_code);
+        Ok(())
     }
 
     pub(crate) fn wait_child(&self, target: Option<i32>, nohang: bool, nowait: bool) -> WaitResult {
         let target = target.and_then(GuestPid::from_raw);
         self.table.wait_child(self.pid, target, nohang, nowait)
+    }
+
+    pub(crate) fn process_group(
+        &self,
+        target: Option<i32>,
+    ) -> Result<i32, crate::linux_abi::LinuxErrno> {
+        self.table
+            .process_group(self.pid, target.and_then(GuestPid::from_raw))
+            .map(GuestPid::raw)
+            .map_err(identity_operation_errno)
+    }
+
+    pub(crate) fn session_id(
+        &self,
+        target: Option<i32>,
+    ) -> Result<i32, crate::linux_abi::LinuxErrno> {
+        self.table
+            .session_id(self.pid, target.and_then(GuestPid::from_raw))
+            .map(GuestPid::raw)
+            .map_err(identity_operation_errno)
+    }
+
+    pub(crate) fn set_process_group(
+        &self,
+        target: Option<i32>,
+        group: Option<i32>,
+    ) -> Result<(), crate::linux_abi::LinuxErrno> {
+        self.table
+            .set_process_group(
+                self.pid,
+                target.and_then(GuestPid::from_raw),
+                group.and_then(GuestPid::from_raw),
+            )
+            .map_err(identity_operation_errno)
+    }
+
+    pub(crate) fn create_session(&self) -> Result<i32, crate::linux_abi::LinuxErrno> {
+        self.table
+            .create_session(self.pid)
+            .map(GuestPid::raw)
+            .map_err(identity_operation_errno)
+    }
+}
+
+fn identity_operation_errno(
+    error: process_table::ProcessTableError,
+) -> crate::linux_abi::LinuxErrno {
+    match error {
+        process_table::ProcessTableError::UnknownProcess(_) => crate::linux_abi::LINUX_ESRCH,
+        process_table::ProcessTableError::IdentityPermission => crate::linux_abi::LINUX_EPERM,
+        _ => crate::linux_abi::LINUX_EINVAL,
     }
 }
 
@@ -98,6 +260,11 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
     engine.configure_process_asid(root.asid().raw())?;
     debug_assert_eq!(root.ttbr0(), engine.get_sys_reg(SysReg::Ttbr0).unwrap_or(0));
     let context = ProcessContext { table, pid };
+    context.trace_lifecycle(
+        carrick_observability::probes::HvpatchGuestLifecyclePhase::Root,
+        crate::thread::ThreadId::from_guest_supplied_tid(pid.raw()),
+        0,
+    );
     dispatcher.bind_hvpatch_process(context.clone());
     Ok(Some(context))
 }

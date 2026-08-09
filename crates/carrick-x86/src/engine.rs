@@ -1460,6 +1460,14 @@ impl<V: X86Vmm> ThreadedEngine for X86EngineCore<V> {
     type SiblingSpec = X86SiblingSpec<V>;
     type ProcessSpec = ();
 
+    fn diagnostic_wait_registers(&self) -> Option<carrick_hal::GuestWaitRegisters> {
+        Some(carrick_hal::GuestWaitRegisters {
+            pc: self.current_pc().ok()?,
+            sp: self.vcpu.get_gpr(X86Reg::Rsp).ok()?,
+            lr: 0,
+        })
+    }
+
     fn kick_handle(&self) -> Self::KickHandle {
         self.vm.kick_handle()
     }

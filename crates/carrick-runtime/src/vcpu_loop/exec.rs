@@ -5,6 +5,92 @@
 
 use super::*;
 
+fn first_byte_mismatch(expected: &[u8], observed: &[u8]) -> Option<usize> {
+    expected
+        .iter()
+        .zip(observed)
+        .position(|(expected, observed)| expected != observed)
+        .or_else(|| (expected.len() != observed.len()).then(|| expected.len().min(observed.len())))
+}
+
+fn word_at(bytes: &[u8], offset: usize) -> Option<u32> {
+    bytes
+        .get(offset..offset.checked_add(4)?)?
+        .try_into()
+        .ok()
+        .map(u32::from_le_bytes)
+}
+
+fn should_update_host_process_title(is_hvpatch: bool) -> bool {
+    // HvPatch multiplexes many Linux processes inside one host process. A
+    // per-guest exec cannot truthfully rename that shared process, and the
+    // macOS helper also overwrites the executing host thread's stable
+    // `guest-pid-*` name used by LLDB. Legacy one-process backends retain the
+    // useful process-title update.
+    !is_hvpatch
+}
+
+/// Fail-closed, opt-in proof that the image Carrick prepared for `execve` is
+/// the image its freshly rebuilt engine exposes before the vCPU re-enters the
+/// guest.  This deliberately reads through `ThreadedEngine::read_bytes`, the
+/// same mapping-ledger path used by the fatal-fault recorder.  It therefore
+/// distinguishes an already-wrong exec publication from corruption that only
+/// appears after another process reuses the stage-2 bank.
+fn verify_published_exec_image<E: ThreadedEngine>(
+    engine: &E,
+    image: &AddressSpace,
+    path: &str,
+) -> Result<(), RuntimeError> {
+    const CHUNK_SIZE: usize = 64 * 1024;
+
+    for region in image.regions().iter().filter(|region| region.perms.execute) {
+        let expected = region.bytes();
+        for offset in (0..expected.len()).step_by(CHUNK_SIZE) {
+            let end = offset.saturating_add(CHUNK_SIZE).min(expected.len());
+            let guest_address = region.start.checked_add(offset as u64).ok_or_else(|| {
+                RuntimeError::Configuration(format!(
+                    "hvpatch exec verifier address overflow for {path:?}"
+                ))
+            })?;
+            let observed = engine.read_bytes(guest_address, end - offset).map_err(|error| {
+                RuntimeError::Configuration(format!(
+                    "hvpatch exec verifier could not read {path:?} at {guest_address:#x}: {error}"
+                ))
+            })?;
+            if let Some(delta) = first_byte_mismatch(&expected[offset..end], &observed) {
+                let mismatch_offset = offset + delta;
+                let mismatch_address = region.start + mismatch_offset as u64;
+                return Err(RuntimeError::Configuration(format!(
+                    "hvpatch exec publication mismatch for {path:?} at VA {mismatch_address:#x}: expected_word={:?} observed_word={:?} region={:#x}..{:#x}",
+                    word_at(expected, mismatch_offset),
+                    word_at(&observed, delta),
+                    region.start,
+                    region.end,
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod exec_image_verification_tests {
+    use super::{first_byte_mismatch, should_update_host_process_title};
+
+    #[test]
+    fn reports_the_first_divergent_exec_byte() {
+        assert_eq!(first_byte_mismatch(b"same", b"same"), None);
+        assert_eq!(first_byte_mismatch(b"abXd", b"abYd"), Some(2));
+        assert_eq!(first_byte_mismatch(b"short", b"shorter"), Some(5));
+    }
+
+    #[test]
+    fn shared_vm_exec_preserves_process_aware_host_thread_identity() {
+        assert!(!should_update_host_process_title(true));
+        assert!(should_update_host_process_title(false));
+    }
+}
+
 impl<E: ThreadedEngine + 'static> ThreadRuntimeState<E>
 where
     E::SiblingSpec: 'static,
@@ -17,6 +103,13 @@ where
         argv: Vec<Vec<u8>>,
         env: Vec<Vec<u8>>,
     ) -> Result<(), RuntimeError> {
+        if let Some(process) = kernel.hvpatch_process.as_ref() {
+            process.trace_lifecycle(
+                carrick_observability::probes::HvpatchGuestLifecyclePhase::ExecBegin,
+                self.this_tid,
+                0,
+            );
+        }
         crate::probes::execve_argv(&path, &argv);
         // The proctitle / /proc/self/cmdline identity is display text; lossily
         // decode the byte argv (a genuinely non-UTF-8 argv is rare).
@@ -25,7 +118,9 @@ where
             .map(|a| String::from_utf8_lossy(a).into_owned())
             .collect();
         let cmdline = proc_argv.join(" ");
-        crate::dispatch::set_host_process_name(cmdline.as_bytes());
+        if should_update_host_process_title(kernel.hvpatch_process.is_some()) {
+            crate::dispatch::set_host_process_name(cmdline.as_bytes());
+        }
         let proc_env = env.clone();
         match load_execve_image(&kernel.dispatcher, &path, argv, env) {
             Ok(img) => {
@@ -44,12 +139,32 @@ where
                 if self.registry.live_count() > 1 {
                     self.terminate_siblings_for_exec(kernel, engine)?;
                 }
+                // All hvpatch processes mutate stage-2 in one HVF VM. Keep
+                // process-local thread-group drain separate, but serialize the
+                // actual unmap/remap transaction across concurrent execs.
+                let _hvpatch_topology = kernel.hvpatch_process.as_ref().map(|_| {
+                    crate::fork_quiesce::topology_lock()
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                });
                 engine.execve_into(&img)?;
+                if kernel.hvpatch_process.is_some()
+                    && std::env::var_os("CARRICK_HVPATCH_VERIFY_EXEC_CODE").is_some()
+                {
+                    verify_published_exec_image(engine, &img, &path)?;
+                }
                 crate::namespace::pid::mark_self_execed();
                 // execve_into rebuilt a fresh vCPU: re-stamp the identity page
                 // (zeroed) and TPIDR_EL1 (reset) for the same thread/tid.
                 stamp_identity_page(engine, &kernel.dispatcher);
                 stamp_guest_tid(engine, self.this_tid, &self.registry);
+                if let Some(process) = kernel.hvpatch_process.as_ref() {
+                    process.trace_lifecycle(
+                        carrick_observability::probes::HvpatchGuestLifecyclePhase::Exec,
+                        self.this_tid,
+                        0,
+                    );
+                }
                 // vfork: the execve SUCCEEDED and we now have our own private VM.
                 // Release the suspended parent by writing one byte to the
                 // inherited pipe, then close it. A FAILED execve returns above via
@@ -63,6 +178,13 @@ where
                 Ok(())
             }
             Err(errno) => {
+                if std::env::var_os("CARRICK_FAULT_DEBUG").is_some() {
+                    eprintln!(
+                        "[FAULTDBG tid={}] execve path={path:?} failed errno={}",
+                        self.this_tid.raw(),
+                        errno.get()
+                    );
+                }
                 let retval = errno.guest_retval();
                 engine.complete_syscall(retval)?;
                 Ok(())

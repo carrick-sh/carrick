@@ -27,7 +27,7 @@
 
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use carrick_aarch64::{
     Aarch64EngineCore, Aarch64Exit, Aarch64Vcpu, Aarch64VcpuSnapshot, Aarch64Vmm, ForkRamStrategy,
@@ -47,6 +47,21 @@ use crate::trap::{
 /// `crate::trap::HvfTrapEngine` is a thin alias to this so every existing call site
 /// (runtime.rs `run_threaded_hvf_loop`, the vcpu loop) is unchanged.
 pub type HvfAarch64Engine = Aarch64EngineCore<HvfAarch64Vmm>;
+
+fn hvf_vcpu_reclaim_enabled_value(value: Option<&str>) -> bool {
+    value != Some("0")
+}
+
+/// Exact diagnostic hatch for separating HVF vCPU destroy/recreate defects
+/// from guest futex/scheduler defects. Default-on is the shipped M:N path.
+/// `0` keeps one VM but admits one live HVF vCPU per guest thread, so it is a
+/// correctness experiment rather than a performance configuration.
+fn hvf_vcpu_reclaim_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        hvf_vcpu_reclaim_enabled_value(std::env::var("CARRICK_HVF_VCPU_RECLAIM").ok().as_deref())
+    })
+}
 
 /// Build the engine from a freestanding/loaded image: create the VM + vCPU, map the
 /// guest address space, and park the vCPU at the EL0-entry trampoline (the first
@@ -376,11 +391,15 @@ impl GuestVmBackend for HvfAarch64Vmm {
     }
 
     fn vcpu_budget() -> usize {
-        crate::trap::hvf_vcpu_budget()
+        if hvf_vcpu_reclaim_enabled() {
+            crate::trap::hvf_vcpu_budget()
+        } else {
+            usize::MAX
+        }
     }
 
     fn reclaims(&self) -> bool {
-        true
+        hvf_vcpu_reclaim_enabled()
     }
 }
 
@@ -485,7 +504,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         // The shared engine calls this only after checked stage-1 teardown and
         // TLBI succeed. A failed edit therefore retains this process-shared alias
         // owner; successful teardown removes the high-VA lookup (low VA no-op).
-        crate::trap::unregister_alias(va, len);
+        self.state.unregister_process_alias(va, len);
     }
 
     fn add_alias(
@@ -712,9 +731,11 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         bank_base: u64,
         bank_size: u64,
         page_tables: &mut carrick_mem::page_table::PageTableManager,
+        child_pid: i32,
+        forking_tid: i32,
     ) -> Result<Self::ProcessBuilder, TrapError> {
         self.state
-            .build_process_spec(bank_base, bank_size, page_tables)
+            .build_process_spec(bank_base, bank_size, page_tables, child_pid, forking_tid)
     }
 
     fn materialize_process(builder: Self::ProcessBuilder) -> Result<(Self, Self::Vcpu), TrapError> {
@@ -782,5 +803,18 @@ fn zeroed_snapshot() -> Aarch64VcpuSnapshot {
         vregs: [0; 32],
         fpsr: 0,
         fpcr: 0,
+    }
+}
+
+#[cfg(test)]
+mod reclaim_hatch_tests {
+    use super::hvf_vcpu_reclaim_enabled_value;
+
+    #[test]
+    fn hvf_vcpu_reclaim_hatch_is_default_on_and_exact_zero_off() {
+        assert!(hvf_vcpu_reclaim_enabled_value(None));
+        assert!(!hvf_vcpu_reclaim_enabled_value(Some("0")));
+        assert!(hvf_vcpu_reclaim_enabled_value(Some("1")));
+        assert!(hvf_vcpu_reclaim_enabled_value(Some("false")));
     }
 }
