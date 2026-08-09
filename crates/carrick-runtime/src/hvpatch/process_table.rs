@@ -2,35 +2,16 @@
 // Keeping the whole lifecycle API together avoids a root-only placeholder API.
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
 
 use parking_lot::{Condvar, Mutex};
 
-use super::asid::{AsidAllocator, AsidError, RetiredAsid};
-use super::banked_mm::{BankedMmBackend, BankedMmState};
+use super::asid::AsidError;
+use super::banked_mm::{
+    BankedMmBackend, BankedMmError, BankedMmLease, BankedMmPool, BankedMmRetirement, ProcessBank,
+};
 use crate::kernel::{Asid, MmBinding, Stage1Root, Stage1RootError, Ttbr0};
-
-const PROCESS_BANK_SIZE: u64 = 40 * 1024 * 1024 * 1024;
-const PROCESS_BANK_COUNT: u8 =
-    1 + (carrick_mem::memory::LINUX_PROCESS_BANK_SIZE / PROCESS_BANK_SIZE) as u8;
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct ProcessBank(u8);
-
-impl ProcessBank {
-    pub(crate) fn base(self) -> u64 {
-        if self.0 == 0 {
-            carrick_mem::memory::LINUX_PROCESS_AUX_BANK_BASE
-        } else {
-            carrick_mem::memory::LINUX_PROCESS_BANK_BASE + u64::from(self.0 - 1) * PROCESS_BANK_SIZE
-        }
-    }
-
-    pub(crate) fn size(self) -> u64 {
-        PROCESS_BANK_SIZE
-    }
-}
 
 /// Guest-visible process identity. This is deliberately distinct from a host
 /// PID: hvpatch processes share one host process.
@@ -117,8 +98,7 @@ impl GuestProcess {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct RetiredProcess {
     pid: GuestPid,
-    asid: RetiredAsid,
-    bank: Option<ProcessBank>,
+    retirement: BankedMmRetirement,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,17 +152,26 @@ impl From<AsidError> for ProcessTableError {
     }
 }
 
+impl From<BankedMmError> for ProcessTableError {
+    fn from(error: BankedMmError) -> Self {
+        match error {
+            BankedMmError::AsidExhausted => Self::AsidExhausted,
+            BankedMmError::Asid(error) => Self::Asid(error),
+            BankedMmError::Stage1Root(error) => Self::Stage1Root(error),
+            BankedMmError::BankExhausted | BankedMmError::Retired => Self::BankExhausted,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ProcessTableInner {
     next_pid: i32,
-    asids: AsidAllocator,
     processes: BTreeMap<GuestPid, GuestProcess>,
-    mm_states: BTreeMap<GuestPid, Arc<BankedMmState>>,
+    mm_leases: BTreeMap<GuestPid, Arc<BankedMmLease>>,
     exited: BTreeMap<GuestPid, ChildExit>,
     /// Weak readiness subscribers for guest-virtual pidfds. The fd table owns
     /// each watch; this lifecycle index only fires watches that remain open.
     pidfd_watchers: BTreeMap<GuestPid, Vec<Weak<crate::dispatch::fd_table::PidfdWatch>>>,
-    free_banks: BTreeSet<ProcessBank>,
 }
 
 /// Shared registry for every Linux process multiplexed in one hvpatch VM.
@@ -190,6 +179,7 @@ struct ProcessTableInner {
 pub(crate) struct ProcessTable {
     inner: Mutex<ProcessTableInner>,
     child_changed: Condvar,
+    mm_pool: BankedMmPool,
 }
 
 impl ProcessTable {
@@ -197,7 +187,8 @@ impl ProcessTable {
         root_pid: GuestPid,
         stage1_root: u64,
     ) -> Result<Self, ProcessTableError> {
-        Self::with_allocator(root_pid, stage1_root, AsidAllocator::new())
+        let (mm_pool, root_mm) = BankedMmPool::new_root(stage1_root)?;
+        Ok(Self::with_pool(root_pid, mm_pool, root_mm))
     }
 
     #[cfg(test)]
@@ -206,44 +197,34 @@ impl ProcessTable {
         stage1_root: u64,
         asid_limit: u16,
     ) -> Result<Self, ProcessTableError> {
-        Self::with_allocator(
-            root_pid,
-            stage1_root,
-            AsidAllocator::with_limit_for_tests(asid_limit),
-        )
+        let (mm_pool, root_mm) = BankedMmPool::new_root_for_tests(stage1_root, asid_limit)?;
+        Ok(Self::with_pool(root_pid, mm_pool, root_mm))
     }
 
-    fn with_allocator(
-        root_pid: GuestPid,
-        stage1_root: u64,
-        mut asids: AsidAllocator,
-    ) -> Result<Self, ProcessTableError> {
-        let asid = asids.allocate()?;
-        let stage1_root = Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa(stage1_root))?;
+    fn with_pool(root_pid: GuestPid, mm_pool: BankedMmPool, root_mm: Arc<BankedMmLease>) -> Self {
+        let binding = root_mm.binding();
         let root = GuestProcess {
             pid: root_pid,
             parent: None,
             pgid: root_pid,
             sid: root_pid,
-            asid,
-            stage1_root,
-            ttbr0: Ttbr0::for_aarch64(asid, stage1_root),
+            asid: binding.asid,
+            stage1_root: binding.stage1_root,
+            ttbr0: binding.ttbr0,
             bank: None,
         };
         let next_pid = root_pid.raw().checked_add(1).unwrap_or(1);
-        let mm_state = Arc::new(BankedMmState::new(root.binding()));
-        Ok(Self {
+        Self {
             inner: Mutex::new(ProcessTableInner {
                 next_pid,
-                asids,
                 processes: BTreeMap::from([(root_pid, root)]),
-                mm_states: BTreeMap::from([(root_pid, mm_state)]),
+                mm_leases: BTreeMap::from([(root_pid, root_mm)]),
                 exited: BTreeMap::new(),
                 pidfd_watchers: BTreeMap::new(),
-                free_banks: (0..PROCESS_BANK_COUNT).map(ProcessBank).collect(),
             }),
             child_changed: Condvar::new(),
-        })
+            mm_pool,
+        }
     }
 
     pub(crate) fn process(&self, pid: GuestPid) -> Option<GuestProcess> {
@@ -253,9 +234,9 @@ impl ProcessTable {
     pub(crate) fn mm_backend(&self, pid: GuestPid) -> Option<Arc<BankedMmBackend>> {
         self.inner
             .lock()
-            .mm_states
+            .mm_leases
             .get(&pid)
-            .map(|state| Arc::new(BankedMmBackend::new(Arc::clone(state))))
+            .map(|lease| lease.backend())
     }
 
     pub(crate) fn is_live(&self, pid: GuestPid) -> bool {
@@ -303,37 +284,21 @@ impl ProcessTable {
             return Err(ProcessTableError::UnknownProcess(parent));
         }
         let pid = allocate_pid(&mut inner)?;
-        let bank = inner
-            .free_banks
-            .pop_first()
-            .ok_or(ProcessTableError::BankExhausted)?;
-        let child_stage1_root =
-            match Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa(bank.base())) {
-                Ok(root) => root,
-                Err(error) => {
-                    inner.free_banks.insert(bank);
-                    return Err(error.into());
-                }
-            };
-        let asid = match inner.asids.allocate() {
-            Ok(asid) => asid,
-            Err(error) => {
-                inner.free_banks.insert(bank);
-                return Err(error.into());
-            }
-        };
+        let parent_record = inner.processes[&parent];
+        let mm = self.mm_pool.allocate_child()?;
+        let binding = mm.binding();
+        let bank = mm.bank().ok_or(ProcessTableError::BankExhausted)?;
         let process = GuestProcess {
             pid,
             parent: Some(parent),
-            pgid: inner.processes[&parent].pgid,
-            sid: inner.processes[&parent].sid,
-            asid,
-            stage1_root: child_stage1_root,
-            ttbr0: Ttbr0::for_aarch64(asid, child_stage1_root),
+            pgid: parent_record.pgid,
+            sid: parent_record.sid,
+            asid: binding.asid,
+            stage1_root: binding.stage1_root,
+            ttbr0: binding.ttbr0,
             bank: Some(bank),
         };
-        let mm_state = Arc::new(BankedMmState::new(process.binding()));
-        inner.mm_states.insert(pid, mm_state);
+        inner.mm_leases.insert(pid, mm);
         inner.processes.insert(pid, process);
         Ok(process)
     }
@@ -427,37 +392,37 @@ impl ProcessTable {
         new_stage1_root: u64,
     ) -> Result<GuestProcess, ProcessTableError> {
         let mut inner = self.inner.lock();
+        let mm = inner
+            .mm_leases
+            .get(&pid)
+            .cloned()
+            .ok_or(ProcessTableError::UnknownProcess(pid))?;
+        let binding = mm.publish_stage1_root(new_stage1_root)?;
         let process = inner
             .processes
             .get_mut(&pid)
             .ok_or(ProcessTableError::UnknownProcess(pid))?;
-        let new_stage1_root = Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa(new_stage1_root))?;
-        process.stage1_root = new_stage1_root;
-        process.ttbr0 = Ttbr0::for_aarch64(process.asid, new_stage1_root);
-        let binding = process.binding();
-        let result = *process;
-        if let Some(state) = inner.mm_states.get(&pid) {
-            state.publish_binding(binding);
-        }
-        Ok(result)
+        process.asid = binding.asid;
+        process.stage1_root = binding.stage1_root;
+        process.ttbr0 = binding.ttbr0;
+        Ok(*process)
     }
 
     pub(crate) fn exit_process(&self, pid: GuestPid) -> Result<RetiredProcess, ProcessTableError> {
         let mut inner = self.inner.lock();
-        let process = inner
-            .processes
-            .remove(&pid)
-            .ok_or(ProcessTableError::UnknownProcess(pid))?;
-        if let Some(state) = inner.mm_states.remove(&pid) {
-            state.publish_binding(process.binding());
+        if !inner.processes.contains_key(&pid) {
+            return Err(ProcessTableError::UnknownProcess(pid));
         }
-        let asid = inner.asids.retire(process.asid)?;
+        let mm = inner
+            .mm_leases
+            .get(&pid)
+            .cloned()
+            .ok_or(ProcessTableError::UnknownProcess(pid))?;
+        let retirement = self.mm_pool.retire(&mm)?;
+        inner.processes.remove(&pid);
+        inner.mm_leases.remove(&pid);
         inner.pidfd_watchers.remove(&pid);
-        Ok(RetiredProcess {
-            pid,
-            asid,
-            bank: process.bank,
-        })
+        Ok(RetiredProcess { pid, retirement })
     }
 
     /// Publish a terminal Linux wait status after the process's vCPU, stage-2
@@ -467,19 +432,21 @@ impl ProcessTable {
         let mut inner = self.inner.lock();
         let process = inner
             .processes
-            .remove(&pid)
+            .get(&pid)
+            .copied()
             .ok_or(ProcessTableError::UnknownProcess(pid))?;
         let parent = process
             .parent
             .ok_or(ProcessTableError::UnknownProcess(pid))?;
-        if let Some(state) = inner.mm_states.remove(&pid) {
-            state.publish_binding(process.binding());
-        }
-        let retired = inner.asids.retire(process.asid)?;
-        inner.asids.acknowledge_tlb_flush(retired)?;
-        if let Some(bank) = process.bank {
-            inner.free_banks.insert(bank);
-        }
+        let mm = inner
+            .mm_leases
+            .get(&pid)
+            .cloned()
+            .ok_or(ProcessTableError::UnknownProcess(pid))?;
+        let retirement = self.mm_pool.retire(&mm)?;
+        self.mm_pool.acknowledge_tlb_flush(retirement)?;
+        inner.processes.remove(&pid);
+        inner.mm_leases.remove(&pid);
         inner.exited.insert(
             pid,
             ChildExit {
@@ -534,12 +501,9 @@ impl ProcessTable {
         &self,
         retired: RetiredProcess,
     ) -> Result<(), ProcessTableError> {
-        let mut inner = self.inner.lock();
-        inner.asids.acknowledge_tlb_flush(retired.asid)?;
-        if let Some(bank) = retired.bank {
-            inner.free_banks.insert(bank);
-        }
-        Ok(())
+        self.mm_pool
+            .acknowledge_tlb_flush(retired.retirement)
+            .map_err(Into::into)
     }
 }
 
@@ -605,7 +569,7 @@ mod tests {
         );
         assert_eq!(
             child.bank().expect("child bank").size(),
-            super::PROCESS_BANK_SIZE
+            40 * 1024 * 1024 * 1024
         );
         assert_eq!(table.live_process_count(), 2);
     }
