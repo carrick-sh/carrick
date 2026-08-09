@@ -27,7 +27,7 @@ use process_table::{GuestPid, ProcessTable};
 pub(crate) struct ProcessContext {
     table: std::sync::Arc<ProcessTable>,
     pid: GuestPid,
-    mm: std::sync::Arc<crate::kernel::Mm>,
+    mm_backend: std::sync::Arc<banked_mm::BankedMmBackend>,
 }
 
 impl ProcessContext {
@@ -35,10 +35,14 @@ impl ProcessContext {
         table: std::sync::Arc<ProcessTable>,
         pid: GuestPid,
     ) -> Result<Self, process_table::ProcessTableError> {
-        let mm = table
-            .mm(pid)
+        let mm_backend = table
+            .mm_backend(pid)
             .ok_or(process_table::ProcessTableError::UnknownProcess(pid))?;
-        Ok(Self { table, pid, mm })
+        Ok(Self {
+            table,
+            pid,
+            mm_backend,
+        })
     }
 
     pub(crate) fn pid(&self) -> i32 {
@@ -50,9 +54,7 @@ impl ProcessContext {
     }
 
     pub(crate) fn mm_binding(&self) -> Option<crate::kernel::MmBinding> {
-        self.mm
-            .backend()
-            .map(|backend| crate::kernel::MmBackend::binding(backend.as_ref()))
+        Some(crate::kernel::MmBackend::binding(self.mm_backend.as_ref()))
     }
 
     /// Return the Linux process identity needed to bind a host service record
