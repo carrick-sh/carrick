@@ -808,7 +808,17 @@ impl Task {
             .map(|(_, thread)| Arc::clone(thread))
     }
 
-    #[cfg(test)]
+    pub(super) fn retire_thread(&self, key: ThreadKey) -> Option<ThreadRef> {
+        let mut threads = self.threads.lock();
+        if threads
+            .get(&key.tid)
+            .is_none_or(|(published_key, _)| *published_key != key)
+        {
+            return None;
+        }
+        threads.remove(&key.tid).map(|(_, thread)| thread)
+    }
+
     pub(super) fn live_thread_count(&self) -> usize {
         self.threads.lock().len()
     }

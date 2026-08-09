@@ -208,6 +208,7 @@ impl Kernel {
             revision: TaskRevision::INITIAL,
             task_claim,
             thread_claims: BTreeMap::from([(leader_tid, leader_claim)]),
+            dead_leader: None,
             diagnostic_name: bootstrap.diagnostic_name,
         };
         let registry = Registry {
@@ -316,6 +317,14 @@ impl Kernel {
                     .iter()
                     .any(|thread| !record.thread_claims.contains_key(&thread.tid))
             {
+                return Err(RegistryInvariantError::ThreadClaims);
+            }
+            let leader_tid = LinuxTid::for_task_leader(*task_id);
+            if record.dead_leader.as_ref().is_some_and(|retired| {
+                retired._claim.raw() != leader_tid.raw()
+                    || record.thread_claims.contains_key(&leader_tid)
+                    || thread_keys.iter().any(|thread| thread.tid == leader_tid)
+            }) {
                 return Err(RegistryInvariantError::ThreadClaims);
             }
             if let Some(parent) = record.task.parent() {
@@ -494,6 +503,7 @@ pub(super) struct TaskRecord {
     pub(super) revision: TaskRevision,
     pub(super) task_claim: TaskClaim,
     pub(super) thread_claims: BTreeMap<LinuxTid, ThreadClaim>,
+    pub(super) dead_leader: Option<RetiredThreadRecord>,
     pub(super) diagnostic_name: String,
 }
 
