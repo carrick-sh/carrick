@@ -26,9 +26,11 @@ carrick ships an lldb plugin at `scripts/carrick_lldb.py` and an always-on
 in-memory **event ring** (`crates/carrick-runtime/src/event_ring.rs`). Together
 they give a **zero-perturbation** view of a hung or wedged carrick process —
 live or from a core file. This is the tool for timing-sensitive races that
-`carrick trace` (dtrace) perturbs away (see [[carrick-trace]]); the event ring is
-recorded with a few relaxed atomics on the hot path, so it doesn't shift the
-schedule the way a per-syscall dtrace probe or an `eprintln!` does.
+`carrick trace` (dtrace) perturbs away (see
+[carrick-trace](../carrick-trace/SKILL.md)); each event-ring slot uses an
+odd/even generation claim around fixed atomic payload stores, so readers reject
+mixed records without adding locks, allocation, syscalls, or formatting to the
+hot path.
 
 It is what cracked the CPython forkserver-from-forkserver `test_parent_process`
 deadlock: the ring showed the worker `BIND`+`LISTEN` the nested server's listener
@@ -52,7 +54,7 @@ for a quick reproducible run.
 
 ## Loading the plugin
 
-```
+```text
 (lldb) command script import /path/to/carrick/scripts/carrick_lldb.py
 (lldb) carrick                       # lists subcommands
 ```
@@ -104,7 +106,8 @@ process matching to the investigation loop.
 
 A `carrick run` is **two host processes**: an orchestrator parent and the guest.
 **Attach to the GUEST** — the one whose ring is non-empty. Find pids by the
-proctitle (`carrick:<run-id>`), set with `CARRICK_RUN_ID` (see [[carrick-trace]]):
+proctitle (`carrick:<run-id>`), set with `CARRICK_RUN_ID` (see
+[carrick-trace](../carrick-trace/SKILL.md)):
 
 ```sh
 # reproduce the hang, then:
@@ -160,9 +163,10 @@ lldb -c /tmp/c.core target/release/carrick \
 
 4. **Reach for this when carrick-trace perturbs the bug.** dtrace's per-syscall
    probes and any `eprintln!` change a timing-sensitive race's outcome (the bug
-   stops reproducing, or moves). The event ring is on the hot path but only a few
-   relaxed atomics, so it (and a passive core read) leave the schedule intact.
-   For a *reproducible* live guest, [[carrick-trace]] is still the richer tool
+   stops reproducing, or moves). The event ring uses only a bounded generation
+   claim and fixed atomic payload stores, so it (and a passive core read) remain
+   far less perturbing than tracing. For a *reproducible* live guest,
+   [carrick-trace](../carrick-trace/SKILL.md) is still the richer tool
    (guest↔host syscall correlation, fork-post tree, profile sampling).
 
 5. **Read the ring as a timeline + cross-process.** Reconstruct who-forks-whom
@@ -175,13 +179,14 @@ lldb -c /tmp/c.core target/release/carrick \
 6. **Symbolicating carrick host stacks:** `thread backtrace all` resolves Rust
    frames when the binary has symbols. For frame pointers / cleaner stacks build
    with `RUSTFLAGS="-C force-frame-pointers=yes" CARGO_PROFILE_RELEASE_DEBUG=1`
-   (same as [[carrick-trace]]'s symbolication note). For the GUEST (vCPU) state,
+   (same as [carrick-trace](../carrick-trace/SKILL.md)'s symbolication note). For
+   the GUEST (vCPU) state,
    `carrick trace --stack` / a debug-state JSON + `carrick mappings`/`gva` is the
    route — lldb sees the *host* threads, not the guest registers.
 
 ## The `eventring` output
 
-```
+```text
 # carrick event ring  pid=<host pid>  total=<events seen>  showing=<min(total,8192)>
    <seq> BIND     gfd=<guest fd> hfd=<host fd> pathhash=<0x…>     # AF_UNIX bind
    <seq> LISTEN   hfd=<host fd>
@@ -191,7 +196,12 @@ lldb -c /tmp/c.core target/release/carrick \
    <seq> EPWAIT   kq=<kqueue fd> ready=<n ready> timeout=<ms, -1=block>
    <seq> FORK     child_pid=<host pid of the forked child>
    <seq> EXEC     path_present=1
+   <seq> ERROR    BUSY|GAP|OVERWRITTEN|TORN|UNKNOWN ...
 ```
+
+Any `ERROR` line invalidates a claim that the displayed range is complete. Save
+it with the core/transcript; do not silently omit the slot or infer the missing
+event.
 
 `kq` ≥ 16384 is a relocated carrick-internal fd (the epoll instance's kqueue);
 `hfd` ≥ 16384 likewise (eventfd/pidfd/wake-pipe backings). A guest blocking on a

@@ -38,7 +38,7 @@ import shlex
 import ctypes
 from typing import Any, Optional
 
-import lldb
+import lldb  # type: ignore[import-not-found]  # provided by LLDB at plugin load
 
 
 _STATE: Optional[dict] = None
@@ -69,16 +69,19 @@ def _guest_thread_identity(name: Optional[str]) -> Optional[tuple[Optional[int],
     """Decode the stable guest identity carried by a Carrick host-thread name."""
     if not name:
         return None
-    match = _GUEST_PROCESS_THREAD_RE.fullmatch(name)
-    if match:
-        return int(match.group(1)), int(match.group(2))
-    match = _GUEST_PROCESS_LEADER_RE.fullmatch(name)
-    if match:
-        pid = int(match.group(1))
-        return pid, pid
-    match = _GUEST_LEGACY_THREAD_RE.fullmatch(name)
-    if match:
-        return None, int(match.group(1))
+    try:
+        match = _GUEST_PROCESS_THREAD_RE.fullmatch(name)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+        match = _GUEST_PROCESS_LEADER_RE.fullmatch(name)
+        if match:
+            pid = int(match.group(1))
+            return pid, pid
+        match = _GUEST_LEGACY_THREAD_RE.fullmatch(name)
+        if match:
+            return None, int(match.group(1))
+    except (IndexError, ValueError):
+        return None
     return None
 
 
@@ -378,7 +381,25 @@ def cmd_where(debugger, command, exe_ctx, result, internal_dict):
 # Mirrors the Rust decode in `crates/carrick-runtime/src/event_ring.rs`.
 
 _EVENTRING_N = 8192  # must match event_ring::N
+_EVENTRING_SLOT_BYTES = 24  # generation + lo + hi (three u64 cells)
 _EVENTRING_DEFAULT_COUNT = 128
+
+
+def _eventring_complete_generation(logical_index: int) -> int:
+    return ((logical_index // _EVENTRING_N) * 2) + 2
+
+
+def _eventring_slot_error(logical_index: int, before: int, after: int) -> Optional[str]:
+    expected = _eventring_complete_generation(logical_index)
+    if before > expected:
+        return f"OVERWRITTEN expected_gen={expected} observed_gen={before}"
+    if before == expected - 1:
+        return f"BUSY generation={before}"
+    if before != expected:
+        return f"GAP expected_gen={expected} observed_gen={before}"
+    if after != before:
+        return f"TORN before_gen={before} after_gen={after}"
+    return None
 
 
 def _format_hvpatch_wait(pid: int, tid: int, detail: int) -> str:
@@ -710,30 +731,50 @@ def cmd_eventring(debugger, command, exe_ctx, result, internal_dict):
     else:
         start = max(requested_start, oldest)
         count = min(requested, max(0, total - start))
-    # Bulk-read the whole ring once (128 KiB) so a core read is one round-trip.
-    raw_ring = process.ReadMemory(ring_addr, _EVENTRING_N * 16, err)
+    # Two bulk snapshots validate slot generations around payload reads. A core
+    # is stable; a live target can change between reads and is reported TORN.
+    ring_bytes = _EVENTRING_N * _EVENTRING_SLOT_BYTES
+    raw_ring = process.ReadMemory(ring_addr, ring_bytes, err)
     if not err.Success():
         result.SetError(f"read RING @ {_fmt_hex(ring_addr)} failed: {err.GetCString()}")
+        return
+    second_err = lldb.SBError()
+    raw_ring_after = process.ReadMemory(ring_addr, ring_bytes, second_err)
+    if not second_err.Success():
+        result.SetError(
+            f"second RING read @ {_fmt_hex(ring_addr)} failed: {second_err.GetCString()}"
+        )
         return
     pid = process.GetProcessID()
     out = [
         f"# carrick event ring  pid={pid}  total={total}  "
         f"showing={count}  start={start}  oldest={oldest}"
     ]
+    errors = 0
     for k in range(count):
         gi = start + k
-        off = (gi % _EVENTRING_N) * 16
-        lo = int.from_bytes(raw_ring[off : off + 8], "little")
-        hi = int.from_bytes(raw_ring[off + 8 : off + 16], "little")
+        off = (gi % _EVENTRING_N) * _EVENTRING_SLOT_BYTES
+        before = int.from_bytes(raw_ring[off : off + 8], "little")
+        lo = int.from_bytes(raw_ring[off + 8 : off + 16], "little")
+        hi = int.from_bytes(raw_ring[off + 16 : off + 24], "little")
+        after = int.from_bytes(raw_ring_after[off : off + 8], "little")
+        slot_error = _eventring_slot_error(gi, before, after)
+        if slot_error is not None:
+            errors += 1
+            out.append(f"{gi:6} ERROR    {slot_error}")
+            continue
         a = _signed32(lo & 0xFFFFFFFF)
         b = _signed32(lo >> 32)
         c = _signed32(hi & 0xFFFFFFFF)
         kind = (hi >> 32) & 0xFF
         spec = _EVENTRING_KINDS.get(kind)
         if spec is None:
-            continue  # torn/empty slot
+            errors += 1
+            out.append(f"{gi:6} ERROR    UNKNOWN kind={kind}")
+            continue
         name, fmt = spec
         out.append(f"{gi:6} {name:8} {fmt(a, b, c)}")
+    out[0] += f"  errors={errors}"
     result.AppendMessage("\n".join(out))
 
 
@@ -947,6 +988,9 @@ def cmd_mach_exceptions(debugger, command, exe_ctx, result, internal_dict):
 
     members_ptr = ctypes.POINTER(ctypes.c_uint)()
     member_count = ctypes.c_uint(0)
+    mach_port_deallocate = libsystem.mach_port_deallocate
+    mach_port_deallocate.argtypes = [ctypes.c_uint, ctypes.c_uint]
+    mach_port_deallocate.restype = ctypes.c_int
     try:
         kr = get_set_status(
             task.value, port_set, ctypes.byref(members_ptr), ctypes.byref(member_count)
@@ -967,9 +1011,6 @@ def cmd_mach_exceptions(debugger, command, exe_ctx, result, internal_dict):
         copy_send = 19  # MACH_MSG_TYPE_COPY_SEND
         exception_mask = (1 << 1) | (1 << 2) | (1 << 6)
         bindings = []
-        mach_port_deallocate = libsystem.mach_port_deallocate
-        mach_port_deallocate.argtypes = [ctypes.c_uint, ctypes.c_uint]
-        mach_port_deallocate.restype = ctypes.c_int
         for registration in registrations:
             receive_status = (ctypes.c_uint * 10)()
             receive_status_count = ctypes.c_uint(10)

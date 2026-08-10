@@ -5,8 +5,9 @@
 //! the race enough to change the manifestation (see
 //! `docs/archive/forkserver-parent-process-deadlock.md`).
 //!
-//! Recording is hot-path-cheap and ALWAYS ON: an atomic `fetch_add` index + two
-//! atomic `store`s into a fixed array — no lock, no syscall, no allocation, ~ns.
+//! Recording is hot-path-cheap and ALWAYS ON: an atomic reservation plus one
+//! odd/even slot-generation claim, two payload stores, and one release publish
+//! into a fixed array — no lock, no syscall, and no allocation.
 //! It is unconditional on purpose, so the ring is present in a core file or a
 //! live process from ANY run with nothing pre-armed — an intermittent Heisenbug
 //! you can't predict still leaves its history behind. Read it post-mortem with
@@ -28,26 +29,29 @@
 
 #[cfg(feature = "event-ring-dump")]
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 const N: usize = 8192;
 
-// Each event is two u64 cells (lo, hi). A reader may observe a torn write
-// (lo updated, hi stale) under concurrency; that's acceptable for a diagnostic
-// (rare, and a decoded `kind` outside the known event set is dropped).
+// Generation is odd while a writer owns the slot and even only after both
+// payload cells are complete. It also encodes the global logical index, so a
+// delayed writer cannot publish over a newer wrap of the same physical slot.
+#[repr(C)]
 struct Slot {
+    generation: AtomicU64,
     lo: AtomicU64,
     hi: AtomicU64,
 }
 
 #[allow(clippy::declare_interior_mutable_const)]
 const EMPTY: Slot = Slot {
+    generation: AtomicU64::new(0),
     lo: AtomicU64::new(0),
     hi: AtomicU64::new(0),
 };
 
 static RING: [Slot; N] = [EMPTY; N];
-static IDX: AtomicUsize = AtomicUsize::new(0);
+static IDX: AtomicU64 = AtomicU64::new(0);
 static WATCHDOG: AtomicBool = AtomicBool::new(false);
 static NEXT_HVPWAIT_ID: AtomicU32 = AtomicU32::new(1);
 
@@ -151,21 +155,70 @@ fn dir() -> Option<&'static str> {
         .as_deref()
 }
 
-/// Append one event. ALWAYS records (a few relaxed atomics, no lock/syscall/
-/// alloc — ~ns) so the ring is present in a core file or live process from ANY
-/// run, with no env pre-armed. That is the point: an intermittent Heisenbug you
-/// can't predict still leaves its fork/socket/epoll history in the ring, readable
-/// post-mortem via `lldb ... carrick eventring`. Only the perturbing FILE dump
-/// (the 1 Hz watchdog) is gated, behind the `event-ring-dump` feature.
+const fn busy_generation(logical_index: u64) -> u64 {
+    // Encode the physical-slot lap, not twice the global index. The quotient is
+    // at most u64::MAX / 8192, so both odd and even generations remain strictly
+    // monotonic for the full non-wrapping IDX domain.
+    (logical_index / N as u64) * 2 + 1
+}
+
+const fn complete_generation(logical_index: u64) -> u64 {
+    busy_generation(logical_index) + 1
+}
+
+#[inline]
+fn claim_slot(slot: &Slot, busy: u64) -> bool {
+    let mut observed = slot.generation.load(Ordering::Acquire);
+    loop {
+        // Never supersede an in-flight writer: it may still store payload after
+        // losing ownership, which could corrupt a newer completed generation.
+        // The newer logical record becomes an explicit reader-visible gap.
+        if observed & 1 == 1 || observed >= busy {
+            return false;
+        }
+        match slot.generation.compare_exchange_weak(
+            observed,
+            busy,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => observed = actual,
+        }
+    }
+}
+
+#[inline]
+fn write_reserved(slot: &Slot, logical_index: u64, lo: u64, hi: u64) -> bool {
+    let busy = busy_generation(logical_index);
+    if !claim_slot(slot, busy) {
+        return false;
+    }
+    slot.lo.store(lo, Ordering::Relaxed);
+    slot.hi.store(hi, Ordering::Relaxed);
+    slot.generation
+        .compare_exchange(
+            busy,
+            complete_generation(logical_index),
+            Ordering::Release,
+            Ordering::Relaxed,
+        )
+        .is_ok()
+}
+
+/// Append one event. ALWAYS records with no lock, syscall, or allocation so a
+/// core/live LLDB read has trustworthy history without pre-arming diagnostics.
 #[inline]
 pub fn rec(kind: u8, a: i32, b: i32, c: i32) {
     let lo = (a as u32 as u64) | ((b as u32 as u64) << 32);
     let hi = (c as u32 as u64) | ((kind as u64) << 32);
-    let i = IDX.fetch_add(1, Ordering::Relaxed) % N;
-    // Write hi (with the kind tag) LAST so a reader that sees a valid kind has
-    // a good chance of also seeing the matching lo.
-    RING[i].lo.store(lo, Ordering::Relaxed);
-    RING[i].hi.store(hi, Ordering::Relaxed);
+    let Ok(logical_index) = IDX.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+        next.checked_add(1)
+    }) else {
+        return;
+    };
+    let slot = &RING[(logical_index % N as u64) as usize];
+    let _published = write_reserved(slot, logical_index, lo, hi);
     #[cfg(feature = "event-ring-dump")]
     maybe_start_watchdog();
 }
@@ -306,15 +359,123 @@ pub fn rec_hvpatch_process_exit_end(pid: i32, tid: i32, exit_code: i32) {
     rec(HVPPEXIT_END, pid, tid, exit_code);
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EventRecord {
+    pub logical_index: u64,
+    pub kind: u8,
+    pub a: i32,
+    pub b: i32,
+    pub c: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum RingReadError {
+    #[error("event-ring slot {logical_index} is busy at generation {generation}")]
+    Busy { logical_index: u64, generation: u64 },
+    #[error(
+        "event-ring slot {logical_index} is missing: expected generation {expected}, observed {observed}"
+    )]
+    Gap {
+        logical_index: u64,
+        expected: u64,
+        observed: u64,
+    },
+    #[error(
+        "event-ring slot {logical_index} was overwritten: expected generation {expected}, observed {observed}"
+    )]
+    Overwritten {
+        logical_index: u64,
+        expected: u64,
+        observed: u64,
+    },
+    #[error(
+        "event-ring slot {logical_index} changed during read: generation {before} became {after}"
+    )]
+    Torn {
+        logical_index: u64,
+        before: u64,
+        after: u64,
+    },
+    #[error("event-ring slot {logical_index} has unknown event kind {kind}")]
+    UnknownKind { logical_index: u64, kind: u8 },
+}
+
+#[cfg(any(test, feature = "event-ring-dump"))]
+const fn known_kind(kind: u8) -> bool {
+    kind >= BIND && kind <= FDREF
+}
+
+#[cfg(any(test, feature = "event-ring-dump"))]
+fn read_slot_after(
+    slot: &Slot,
+    logical_index: u64,
+    after_payload: impl FnOnce(),
+) -> Result<EventRecord, RingReadError> {
+    let expected = complete_generation(logical_index);
+    let before = slot.generation.load(Ordering::Acquire);
+    if before != expected {
+        return Err(if before > expected {
+            RingReadError::Overwritten {
+                logical_index,
+                expected,
+                observed: before,
+            }
+        } else if before == busy_generation(logical_index) {
+            RingReadError::Busy {
+                logical_index,
+                generation: before,
+            }
+        } else {
+            RingReadError::Gap {
+                logical_index,
+                expected,
+                observed: before,
+            }
+        });
+    }
+    let lo = slot.lo.load(Ordering::Relaxed);
+    let hi = slot.hi.load(Ordering::Relaxed);
+    after_payload();
+    // Seqlock trailing read barrier: keep both payload loads before generation
+    // validation. The first Acquire pairs with writer publication; this fence
+    // prevents the final generation read from moving ahead of the payload.
+    std::sync::atomic::fence(Ordering::Acquire);
+    let after = slot.generation.load(Ordering::Acquire);
+    if after != before {
+        return Err(RingReadError::Torn {
+            logical_index,
+            before,
+            after,
+        });
+    }
+    let kind = (hi >> 32) as u8;
+    if !known_kind(kind) {
+        return Err(RingReadError::UnknownKind {
+            logical_index,
+            kind,
+        });
+    }
+    Ok(EventRecord {
+        logical_index,
+        kind,
+        a: (lo & 0xffff_ffff) as u32 as i32,
+        b: (lo >> 32) as u32 as i32,
+        c: (hi & 0xffff_ffff) as u32 as i32,
+    })
+}
+
+#[cfg(any(test, feature = "event-ring-dump"))]
+fn read_slot(slot: &Slot, logical_index: u64) -> Result<EventRecord, RingReadError> {
+    read_slot_after(slot, logical_index, || {})
+}
+
 #[cfg(test)]
 pub(crate) fn contains_event(kind: u8, a: i32, b: i32, c: i32) -> bool {
-    RING.iter().any(|slot| {
-        let lo = slot.lo.load(Ordering::Relaxed);
-        let hi = slot.hi.load(Ordering::Relaxed);
-        (hi >> 32) as u8 == kind
-            && (lo & 0xffff_ffff) as u32 as i32 == a
-            && (lo >> 32) as u32 as i32 == b
-            && (hi & 0xffff_ffff) as u32 as i32 == c
+    let total = IDX.load(Ordering::Acquire);
+    let start = total.saturating_sub(N as u64);
+    (start..total).any(|logical_index| {
+        read_slot(&RING[(logical_index % N as u64) as usize], logical_index)
+            .is_ok_and(|event| event.kind == kind && event.a == a && event.b == b && event.c == c)
     })
 }
 
@@ -370,7 +531,12 @@ pub fn path_hash(path: &[u8]) -> i32 {
 /// inherited watchdog thread did not survive the fork). The child keeps its OWN
 /// event history from here, so a per-process core shows that process's events.
 pub fn reinit_after_fork() {
+    // Only the forking thread survives, so no writer can race this reset.
+    for slot in &RING {
+        slot.generation.store(0, Ordering::SeqCst);
+    }
     IDX.store(0, Ordering::SeqCst);
+    NEXT_HVPWAIT_ID.store(1, Ordering::SeqCst);
     WATCHDOG.store(false, Ordering::SeqCst);
 }
 
@@ -571,29 +737,30 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
 #[cfg(feature = "event-ring-dump")]
 fn dump(path: &str) {
     use std::io::Write;
-    let total = IDX.load(Ordering::SeqCst);
-    let count = total.min(N);
+    let total = IDX.load(Ordering::Acquire);
+    let count = total.min(N as u64);
     let start = total.saturating_sub(count);
-    let mut out = String::with_capacity(count * 48);
+    let mut out = String::with_capacity(count as usize * 64);
     out.push_str(&format!(
         "# carrick event ring pid={} events={}\n",
         std::process::id(),
         total
     ));
-    for k in 0..count {
-        let global = start + k;
-        let i = global % N;
-        let lo = RING[i].lo.load(Ordering::Relaxed);
-        let hi = RING[i].hi.load(Ordering::Relaxed);
-        let a = (lo & 0xffff_ffff) as u32 as i32;
-        let b = (lo >> 32) as u32 as i32;
-        let c = (hi & 0xffff_ffff) as u32 as i32;
-        let kind = (hi >> 32) as u8;
-        let line = decode(kind, a, b, c);
-        if line.is_empty() {
-            continue; // torn/empty slot
+    for logical_index in start..total {
+        match read_slot(&RING[(logical_index % N as u64) as usize], logical_index) {
+            Ok(event) => {
+                let line = decode(event.kind, event.a, event.b, event.c);
+                if line.is_empty() {
+                    out.push_str(&format!(
+                        "{logical_index:6} ERROR unknown-kind={}\n",
+                        event.kind
+                    ));
+                } else {
+                    out.push_str(&format!("{logical_index:6} {line}\n"));
+                }
+            }
+            Err(error) => out.push_str(&format!("{logical_index:6} ERROR {error}\n")),
         }
-        out.push_str(&format!("{global:6} {line}\n"));
     }
     if let Ok(mut f) = std::fs::File::create(path) {
         let _ = f.write_all(out.as_bytes());
@@ -602,7 +769,249 @@ fn dump(path: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+
+    fn empty_slot() -> Slot {
+        Slot {
+            generation: AtomicU64::new(0),
+            lo: AtomicU64::new(0),
+            hi: AtomicU64::new(0),
+        }
+    }
+
+    fn payload(kind: u8, a: i32, b: i32, c: i32) -> (u64, u64) {
+        (
+            (a as u32 as u64) | ((b as u32 as u64) << 32),
+            (c as u32 as u64) | ((kind as u64) << 32),
+        )
+    }
+
+    #[test]
+    fn slot_layout_matches_lldb_wire_reader() {
+        assert_eq!(std::mem::size_of::<Slot>(), 24);
+        assert_eq!(std::mem::align_of::<Slot>(), 8);
+    }
+
+    #[test]
+    fn generation_protocol_accepts_only_matching_complete_slot() {
+        let slot = empty_slot();
+        let logical_index = 41;
+        let (lo, hi) = payload(FORK, 123, 0, 0);
+        assert!(write_reserved(&slot, logical_index, lo, hi));
+        assert_eq!(
+            read_slot(&slot, logical_index),
+            Ok(EventRecord {
+                logical_index,
+                kind: FORK,
+                a: 123,
+                b: 0,
+                c: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn generation_protocol_reports_busy_gap_overwrite_torn_and_unknown_kind() {
+        let logical_index = 51;
+
+        let busy = empty_slot();
+        assert!(claim_slot(&busy, busy_generation(logical_index)));
+        assert!(matches!(
+            read_slot(&busy, logical_index),
+            Err(RingReadError::Busy {
+                logical_index: 51,
+                ..
+            })
+        ));
+
+        let gap = empty_slot();
+        assert!(matches!(
+            read_slot(&gap, logical_index),
+            Err(RingReadError::Gap {
+                logical_index: 51,
+                ..
+            })
+        ));
+
+        let overwritten = empty_slot();
+        let (lo, hi) = payload(EXEC, 1, 0, 0);
+        assert!(write_reserved(
+            &overwritten,
+            logical_index + N as u64,
+            lo,
+            hi
+        ));
+        assert!(matches!(
+            read_slot(&overwritten, logical_index),
+            Err(RingReadError::Overwritten {
+                logical_index: 51,
+                ..
+            })
+        ));
+
+        let torn = empty_slot();
+        assert!(write_reserved(&torn, logical_index, lo, hi));
+        assert!(matches!(
+            read_slot_after(&torn, logical_index, || {
+                torn.generation.store(
+                    complete_generation(logical_index + N as u64),
+                    Ordering::Release,
+                );
+            }),
+            Err(RingReadError::Torn {
+                logical_index: 51,
+                ..
+            })
+        ));
+
+        let unknown = empty_slot();
+        let (lo, hi) = payload(0xff, 0, 0, 0);
+        assert!(write_reserved(&unknown, logical_index, lo, hi));
+        assert_eq!(
+            read_slot(&unknown, logical_index),
+            Err(RingReadError::UnknownKind {
+                logical_index,
+                kind: 0xff,
+            })
+        );
+    }
+
+    #[test]
+    fn in_flight_writer_is_not_superseded_after_ring_wrap() {
+        let slot = empty_slot();
+        let old = 7;
+        let newer = old + N as u64;
+        let old_busy = busy_generation(old);
+        assert!(claim_slot(&slot, old_busy));
+        assert!(!claim_slot(&slot, busy_generation(newer)));
+        let (lo, hi) = payload(BIND, 4, 9, 12);
+        slot.lo.store(lo, Ordering::Relaxed);
+        slot.hi.store(hi, Ordering::Relaxed);
+        assert!(
+            slot.generation
+                .compare_exchange(
+                    old_busy,
+                    complete_generation(old),
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        );
+        assert!(matches!(
+            read_slot(&slot, newer),
+            Err(RingReadError::Gap { logical_index, .. }) if logical_index == newer
+        ));
+    }
+
+    #[test]
+    fn generations_remain_ordered_across_the_old_high_bit_boundary() {
+        let slot = empty_slot();
+        let high = 1_u64 << 63;
+        let predecessor = high - N as u64;
+        let (lo, hi) = payload(EXEC, 1, 0, 0);
+        assert!(write_reserved(&slot, predecessor, lo, hi));
+        assert!(write_reserved(&slot, high, lo, hi));
+        assert!(read_slot(&slot, high).is_ok());
+        assert!(complete_generation(u64::MAX) > complete_generation(high));
+    }
+
+    #[test]
+    fn concurrent_wrap_never_accepts_payload_from_another_generation() {
+        const LOCAL_N: usize = N;
+        let slots = Arc::new(std::array::from_fn::<_, LOCAL_N, _>(|_| empty_slot()));
+        let index = Arc::new(AtomicU64::new(0));
+        let mut writers = Vec::new();
+        for writer in 0..8_i32 {
+            let slots = Arc::clone(&slots);
+            let index = Arc::clone(&index);
+            writers.push(std::thread::spawn(move || {
+                for _ in 0..2_000 {
+                    let logical = index.fetch_add(1, Ordering::Relaxed);
+                    let (lo, hi) = payload(
+                        FORK,
+                        logical as u32 as i32,
+                        (logical >> 32) as u32 as i32,
+                        writer,
+                    );
+                    let _ = write_reserved(
+                        &slots[(logical % LOCAL_N as u64) as usize],
+                        logical,
+                        lo,
+                        hi,
+                    );
+                }
+            }));
+        }
+        for writer in writers {
+            assert!(writer.join().is_ok(), "event-ring writer panicked");
+        }
+
+        let total = index.load(Ordering::Acquire);
+        for logical in total - LOCAL_N as u64..total {
+            match read_slot(&slots[(logical % LOCAL_N as u64) as usize], logical) {
+                Ok(event) => {
+                    let payload_logical = event.a as u32 as u64 | ((event.b as u32 as u64) << 32);
+                    assert_eq!(payload_logical, logical);
+                }
+                Err(RingReadError::Gap { .. } | RingReadError::Overwritten { .. }) => {}
+                Err(other) => panic!("completed writers left invalid slot state: {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_reader_never_accepts_a_mixed_generation() {
+        let slots = Arc::new(std::array::from_fn::<_, N, _>(|_| empty_slot()));
+        let index = Arc::new(AtomicU64::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+        let writer_slots = Arc::clone(&slots);
+        let writer_index = Arc::clone(&index);
+        let writer_done = Arc::clone(&done);
+        let writer = std::thread::spawn(move || {
+            for _ in 0..50_000 {
+                let logical = writer_index.fetch_add(1, Ordering::Relaxed);
+                let (lo, hi) = payload(
+                    FORK,
+                    logical as u32 as i32,
+                    (logical >> 32) as u32 as i32,
+                    0,
+                );
+                let _ = write_reserved(
+                    &writer_slots[(logical % N as u64) as usize],
+                    logical,
+                    lo,
+                    hi,
+                );
+            }
+            writer_done.store(true, Ordering::Release);
+        });
+
+        while !done.load(Ordering::Acquire) {
+            let total = index.load(Ordering::Acquire);
+            let Some(logical) = total.checked_sub(1) else {
+                std::hint::spin_loop();
+                continue;
+            };
+            match read_slot(&slots[(logical % N as u64) as usize], logical) {
+                Ok(event) => {
+                    let payload_logical = event.a as u32 as u64 | ((event.b as u32 as u64) << 32);
+                    assert_eq!(payload_logical, logical);
+                }
+                Err(
+                    RingReadError::Busy { .. }
+                    | RingReadError::Gap { .. }
+                    | RingReadError::Overwritten { .. }
+                    | RingReadError::Torn { .. },
+                ) => {}
+                Err(RingReadError::UnknownKind { .. }) => {
+                    panic!("reader accepted an unknown mixed payload")
+                }
+            }
+        }
+        assert!(writer.join().is_ok(), "event-ring writer panicked");
+    }
 
     #[test]
     fn futex_events_preserve_full_width_address_and_lifecycle_detail() {

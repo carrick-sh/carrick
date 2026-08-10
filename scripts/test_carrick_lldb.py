@@ -11,7 +11,8 @@ import unittest
 
 
 def _load_plugin():
-    fake_lldb = types.SimpleNamespace(LLDB_INVALID_ADDRESS=(1 << 64) - 1)
+    fake_lldb = types.ModuleType("lldb")
+    setattr(fake_lldb, "LLDB_INVALID_ADDRESS", (1 << 64) - 1)
     sys.modules.setdefault("lldb", fake_lldb)
     path = Path(__file__).with_name("carrick_lldb.py")
     spec = importlib.util.spec_from_file_location("carrick_lldb_under_test", path)
@@ -42,7 +43,39 @@ class CarrickLldbHelperTests(unittest.TestCase):
 
     def test_eventring_default_is_a_concise_tail(self):
         self.assertEqual(PLUGIN._EVENTRING_DEFAULT_COUNT, 128)
+        self.assertEqual(PLUGIN._EVENTRING_SLOT_BYTES, 24)
         self.assertLess(PLUGIN._EVENTRING_DEFAULT_COUNT, PLUGIN._EVENTRING_N)
+
+    def test_eventring_generation_validation_reports_every_failure_shape(self):
+        logical = 51
+        complete = PLUGIN._eventring_complete_generation(logical)
+        self.assertIsNone(PLUGIN._eventring_slot_error(logical, complete, complete))
+        self.assertEqual(
+            PLUGIN._eventring_slot_error(logical, complete - 1, complete - 1),
+            f"BUSY generation={complete - 1}",
+        )
+        self.assertEqual(
+            PLUGIN._eventring_slot_error(logical, 0, 0),
+            f"GAP expected_gen={complete} observed_gen=0",
+        )
+        self.assertEqual(
+            PLUGIN._eventring_slot_error(logical, complete + 2, complete + 2),
+            f"OVERWRITTEN expected_gen={complete} observed_gen={complete + 2}",
+        )
+        self.assertEqual(
+            PLUGIN._eventring_slot_error(logical, complete, complete + 2),
+            f"TORN before_gen={complete} after_gen={complete + 2}",
+        )
+
+        high = 1 << 63
+        high_generation = PLUGIN._eventring_complete_generation(high)
+        self.assertIsNone(
+            PLUGIN._eventring_slot_error(high, high_generation, high_generation)
+        )
+        self.assertGreater(
+            PLUGIN._eventring_complete_generation((1 << 64) - 1),
+            high_generation,
+        )
 
     def test_eventring_formats_futex_lifecycle_with_full_width_address(self):
         low = 0x89ABCDEF
