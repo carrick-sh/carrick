@@ -27,6 +27,7 @@ fn write_syscall_reads_guest_memory_and_writes_stdout() {
 
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(64, SyscallArgs::from([1, 0x4000, 17, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -49,6 +50,7 @@ fn write_syscall_rejects_bad_guest_pointer_with_efault() {
 
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(64, SyscallArgs::from([1, 0x5000, 5, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -79,6 +81,7 @@ fn lseek_repositions_rootfs_file_reads() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -92,6 +95,7 @@ fn lseek_repositions_rootfs_file_reads() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(62, SyscallArgs::from([3, 7, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -102,6 +106,7 @@ fn lseek_repositions_rootfs_file_reads() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4100, 4, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -127,6 +132,7 @@ fn pread64_reads_from_offset_without_changing_file_offset() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -140,6 +146,7 @@ fn pread64_reads_from_offset_without_changing_file_offset() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(67, SyscallArgs::from([3, 0x4100, 4, 7, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -151,6 +158,7 @@ fn pread64_reads_from_offset_without_changing_file_offset() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4200, 4, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -182,6 +190,7 @@ fn preadv_reads_from_offset_across_iovecs_without_changing_file_offset() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -195,6 +204,7 @@ fn preadv_reads_from_offset_across_iovecs_without_changing_file_offset() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(69, SyscallArgs::from([3, 0x4100, 2, 7, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -207,6 +217,7 @@ fn preadv_reads_from_offset_across_iovecs_without_changing_file_offset() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4400, 4, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -234,6 +245,7 @@ fn sendfile_copies_rootfs_file_to_stdout_and_updates_offset_pointer() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -247,6 +259,7 @@ fn sendfile_copies_rootfs_file_to_stdout_and_updates_offset_pointer() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(71, SyscallArgs::from([1, 3, 0x4100, 4, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -259,6 +272,7 @@ fn sendfile_copies_rootfs_file_to_stdout_and_updates_offset_pointer() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4200, 4, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -285,6 +299,7 @@ fn sendfile_without_offset_pointer_advances_file_offset_and_writes_pipe() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -298,6 +313,7 @@ fn sendfile_without_offset_pointer_advances_file_offset_and_writes_pipe() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     59,
                     SyscallArgs::from([0x4100, LINUX_O_NONBLOCK, 0, 0, 0, 0])
@@ -312,6 +328,7 @@ fn sendfile_without_offset_pointer_advances_file_offset_and_writes_pipe() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(71, SyscallArgs::from([pair.write_fd as u64, 3, 0, 6, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -322,6 +339,7 @@ fn sendfile_without_offset_pointer_advances_file_offset_and_writes_pipe() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     63,
                     SyscallArgs::from([pair.read_fd as u64, 0x4200, 6, 0, 0, 0])
@@ -336,6 +354,7 @@ fn sendfile_without_offset_pointer_advances_file_offset_and_writes_pipe() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4300, 1, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -376,6 +395,7 @@ fn sendfile_null_offset_advances_host_backed_file_across_calls() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0])
@@ -390,6 +410,7 @@ fn sendfile_null_offset_advances_host_backed_file_across_calls() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     59,
                     SyscallArgs::from([0x4100, LINUX_O_NONBLOCK, 0, 0, 0, 0])
@@ -408,6 +429,7 @@ fn sendfile_null_offset_advances_host_backed_file_across_calls() {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(
                         71,
                         SyscallArgs::from([pair.write_fd as u64, 3, 0, 4, 0, 0]),
@@ -421,6 +443,7 @@ fn sendfile_null_offset_advances_host_backed_file_across_calls() {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(
                         63,
                         SyscallArgs::from([pair.read_fd as u64, 0x4200, 4, 0, 0, 0])
@@ -440,6 +463,7 @@ fn sendfile_null_offset_advances_host_backed_file_across_calls() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(71, SyscallArgs::from([pair.write_fd as u64, 3, 0, 4, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -466,6 +490,7 @@ fn splice_moves_bytes_between_rootfs_files_pipes_and_stdout() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -479,6 +504,7 @@ fn splice_moves_bytes_between_rootfs_files_pipes_and_stdout() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     59,
                     SyscallArgs::from([0x4200, LINUX_O_NONBLOCK, 0, 0, 0, 0])
@@ -494,6 +520,7 @@ fn splice_moves_bytes_between_rootfs_files_pipes_and_stdout() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     76,
                     SyscallArgs::from(
@@ -510,6 +537,7 @@ fn splice_moves_bytes_between_rootfs_files_pipes_and_stdout() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(76, SyscallArgs::from([pair.read_fd as u64, 0, 1, 0, 4, 0])),
                 &mut memory,
                 &reporter,
@@ -521,6 +549,7 @@ fn splice_moves_bytes_between_rootfs_files_pipes_and_stdout() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4300, 4, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -532,6 +561,7 @@ fn splice_moves_bytes_between_rootfs_files_pipes_and_stdout() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     76,
                     SyscallArgs::from([3, 0, pair.write_fd as u64, 0, 1, 0x10]),
@@ -562,6 +592,7 @@ fn splice_moves_bytes_between_sockets_and_pipes() {
     let ret = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| -> i64 {
         match d
             .dispatch(
+                &d.capture_one_task_context().unwrap(),
                 SyscallRequest::new(nr, SyscallArgs::from(args)),
                 m,
                 &reporter,
@@ -677,6 +708,7 @@ fn readv_reads_file_across_packed_iovecs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -690,6 +722,7 @@ fn readv_reads_file_across_packed_iovecs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(65, SyscallArgs::from([3, 0x4100, 2, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -715,6 +748,7 @@ fn readv_reads_host_pipe_across_packed_iovecs() {
     let mut dispatcher = SyscallDispatcher::new();
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -770,6 +804,7 @@ fn writev_writes_host_pipe_from_packed_iovecs() {
     let mut dispatcher = SyscallDispatcher::new();
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -820,6 +855,7 @@ fn writev_writes_stdout_from_packed_iovecs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(66, SyscallArgs::from([1, 0x4100, 2, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -853,6 +889,7 @@ fn pwritev_bootstrap_validates_iovecs_and_reports_stream_errors() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(70, SyscallArgs::from([1, 0x4100, 2, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -865,6 +902,7 @@ fn pwritev_bootstrap_validates_iovecs_and_reports_stream_errors() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(70, SyscallArgs::from([2, 0x4100, 2, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -877,6 +915,7 @@ fn pwritev_bootstrap_validates_iovecs_and_reports_stream_errors() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(70, SyscallArgs::from([99, 0x4100, 2, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -889,6 +928,7 @@ fn pwritev_bootstrap_validates_iovecs_and_reports_stream_errors() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(70, SyscallArgs::from([1, 0x4100, 2, (-1_i64) as u64, 0, 0]),),
                 &mut memory,
                 &reporter,
@@ -907,6 +947,7 @@ fn pwritev_bootstrap_validates_iovecs_and_reports_stream_errors() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(70, SyscallArgs::from([1, 0x4150, 2, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -920,6 +961,7 @@ fn pwritev_bootstrap_validates_iovecs_and_reports_stream_errors() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -933,6 +975,7 @@ fn pwritev_bootstrap_validates_iovecs_and_reports_stream_errors() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(70, SyscallArgs::from([3, 0x4100, 2, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1133,6 +1176,7 @@ fn open_host_file_at_path(
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, path_addr, flags, 0o644, 0, 0,]),
@@ -1188,6 +1232,7 @@ fn readv_host_file_uses_guest_host_ptrs_for_writable_iovecs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(65, SyscallArgs::from([3, 0x4100, 2, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1238,6 +1283,7 @@ fn preadv_host_file_preserves_offset_with_borrowed_iovecs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(69, SyscallArgs::from([3, 0x4100, 2, 7, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1260,6 +1306,7 @@ fn preadv_host_file_preserves_offset_with_borrowed_iovecs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4400, 4, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1298,6 +1345,7 @@ fn readv_host_file_falls_back_to_staging_when_any_iovec_lacks_host_ptr() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(65, SyscallArgs::from([3, 0x4100, 2, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1344,6 +1392,7 @@ fn pwritev_host_file_uses_guest_host_ptrs_without_payload_reads() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(70, SyscallArgs::from([3, 0x4100, 2, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1396,6 +1445,7 @@ fn pwritev_host_file_falls_back_to_staging_when_any_iovec_lacks_host_ptr() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(70, SyscallArgs::from([3, 0x4100, 2, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1441,6 +1491,7 @@ fn pwritev_host_file_reports_efault_when_fallback_payload_is_unreadable() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(70, SyscallArgs::from([3, 0x4100, 2, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1534,6 +1585,7 @@ fn pwritev_host_file_reads_each_guest_iovec_once() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([
@@ -1556,6 +1608,7 @@ fn pwritev_host_file_reads_each_guest_iovec_once() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(70, SyscallArgs::from([3, 0x4100, 2, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1591,6 +1644,7 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(68, SyscallArgs::from([1, 0x4100, 8, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1603,6 +1657,7 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(68, SyscallArgs::from([2, 0x4100, 8, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1615,6 +1670,7 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(68, SyscallArgs::from([99, 0x4100, 8, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1627,6 +1683,7 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(68, SyscallArgs::from([1, 0x4100, 8, (-1_i64) as u64, 0, 0]),),
                 &mut memory,
                 &reporter,
@@ -1640,6 +1697,7 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -1653,6 +1711,7 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(68, SyscallArgs::from([3, 0x4100, 8, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1667,6 +1726,7 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(59, SyscallArgs::from([pipe_pair_address, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1678,6 +1738,7 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     68,
                     SyscallArgs::from([pair.write_fd as u64, 0x4100, 8, 0, 0, 0]),
@@ -1693,6 +1754,7 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     68,
                     SyscallArgs::from([pair.read_fd as u64, 0x4100, 8, 0, 0, 0]),
@@ -1724,6 +1786,7 @@ fn sync_and_fsync_family_return_zero_for_valid_fds_and_ebadf_otherwise() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(81, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1734,6 +1797,7 @@ fn sync_and_fsync_family_return_zero_for_valid_fds_and_ebadf_otherwise() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(82, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1744,6 +1808,7 @@ fn sync_and_fsync_family_return_zero_for_valid_fds_and_ebadf_otherwise() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(83, SyscallArgs::from([2, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1755,6 +1820,7 @@ fn sync_and_fsync_family_return_zero_for_valid_fds_and_ebadf_otherwise() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -1768,6 +1834,7 @@ fn sync_and_fsync_family_return_zero_for_valid_fds_and_ebadf_otherwise() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(82, SyscallArgs::from([3, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1778,6 +1845,7 @@ fn sync_and_fsync_family_return_zero_for_valid_fds_and_ebadf_otherwise() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(83, SyscallArgs::from([3, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1789,6 +1857,7 @@ fn sync_and_fsync_family_return_zero_for_valid_fds_and_ebadf_otherwise() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(82, SyscallArgs::from([99, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1801,6 +1870,7 @@ fn sync_and_fsync_family_return_zero_for_valid_fds_and_ebadf_otherwise() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(83, SyscallArgs::from([99, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1831,6 +1901,7 @@ fn fsync_family_flushes_host_backed_files() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0o100 | 0o2, 0o644, 0, 0]),
@@ -1845,6 +1916,7 @@ fn fsync_family_flushes_host_backed_files() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(64, SyscallArgs::from([3, 0x4040, 7, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1856,6 +1928,7 @@ fn fsync_family_flushes_host_backed_files() {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(syscall, SyscallArgs::from([3, 0, 0, 0, 0, 0])),
                     &mut memory,
                     &reporter,
@@ -1891,6 +1964,7 @@ fn copy_file_range_uses_darwin_fast_path_for_whole_host_files() {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(
                         56,
                         SyscallArgs::from([(-100_i64) as u64, path, 0o100 | 0o2, 0o644, 0, 0,]),
@@ -1909,6 +1983,7 @@ fn copy_file_range_uses_darwin_fast_path_for_whole_host_files() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(64, SyscallArgs::from([3, 0x4100, 21, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1919,6 +1994,7 @@ fn copy_file_range_uses_darwin_fast_path_for_whole_host_files() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(62, SyscallArgs::from([3, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1929,6 +2005,7 @@ fn copy_file_range_uses_darwin_fast_path_for_whole_host_files() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(285, SyscallArgs::from([3, 0, 4, 0, 21, 0])),
                 &mut memory,
                 &reporter,
@@ -1944,6 +2021,7 @@ fn copy_file_range_uses_darwin_fast_path_for_whole_host_files() {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(62, SyscallArgs::from([fd, 0, 1, 0, 0, 0])),
                     &mut memory,
                     &reporter,
@@ -1976,6 +2054,7 @@ fn f_getfl_strips_creation_only_open_flags() {
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,

@@ -757,6 +757,9 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     platform_futex_factory: PlatformFutexFactory,
     /// `Some` only for a process multiplexed in the shared HvPatch VM.
     process_fork_barrier: Option<Arc<crate::fork_quiesce::QuiesceBarrier>>,
+    /// Guest-visible identity allocated in the kernel namespace. It is never
+    /// inferred from the backend-local thread registry key.
+    linux_tid: crate::kernel::LinuxTid,
     this_tid: ThreadId,
     threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
     /// The object-safe vCPU registry (the kicker). The shared loop never names
@@ -866,6 +869,7 @@ where
         platform_futex: Arc<dyn PlatformFutex>,
         platform_futex_factory: PlatformFutexFactory,
         process_fork_barrier: Option<Arc<crate::fork_quiesce::QuiesceBarrier>>,
+        linux_tid: crate::kernel::LinuxTid,
         this_tid: ThreadId,
         threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
         kicker: Arc<dyn VcpuRegistry>,
@@ -878,6 +882,7 @@ where
             platform_futex,
             platform_futex_factory,
             process_fork_barrier,
+            linux_tid,
             this_tid,
             threads,
             kicker,
@@ -1335,6 +1340,14 @@ where
         // post-mortem attach. Keep the selector even when register capture is
         // unavailable so the uncorrelated fallback is also emitted only once.
         let mut hvpatch_child_wait_trace: Option<(Option<i32>, Option<u32>)> = None;
+        let kernel_context = kernel
+            .dispatcher
+            .capture_kernel_context(self.linux_tid)
+            .map_err(|error| {
+                RuntimeError::Configuration(format!(
+                    "capture mandatory syscall kernel context: {error}"
+                ))
+            })?;
         let sync_shared_file_aliases = engine.needs_shared_file_alias_sync();
         loop {
             if sync_shared_file_aliases && !matches!(frame.number.raw(), 260 | 95) {
@@ -1346,6 +1359,7 @@ where
             let outcome =
                 dispatch_with_panic_backstop(request.number.raw(), self.this_tid, || {
                     kernel.dispatcher.dispatch_threaded(
+                        &kernel_context,
                         request,
                         engine,
                         &kernel.reporter,
@@ -2207,6 +2221,7 @@ pub(crate) fn run_vcpu_until_exit<E: ThreadedEngine + 'static>(
     futex: Arc<FutexTable>,
     platform_futex: Arc<dyn PlatformFutex>,
     platform_futex_factory: PlatformFutexFactory,
+    linux_tid: crate::kernel::LinuxTid,
     this_tid: ThreadId,
     threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
     kicker: Arc<dyn VcpuRegistry>,
@@ -2232,6 +2247,7 @@ where
         platform_futex,
         platform_futex_factory,
         kernel.process_fork_barrier.clone(),
+        linux_tid,
         this_tid,
         threads,
         kicker,
@@ -2739,7 +2755,7 @@ where
                 DispatchOutcome::CloneThread {
                     stack,
                     tls,
-                    flags: _,
+                    flags,
                     parent_tid_addr,
                     child_tid_addr,
                     clear_child_tid_addr,
@@ -2749,11 +2765,19 @@ where
                         &mut engine,
                         stack,
                         tls,
+                        flags,
                         parent_tid_addr,
                         child_tid_addr,
                         clear_child_tid_addr,
                     )?;
-                    state.complete_returned(&mut engine, i64::from(tid.raw()))?;
+                    match tid {
+                        threads::CloneThreadSpawn::Started(tid) => {
+                            state.complete_returned(&mut engine, i64::from(tid.raw()))?;
+                        }
+                        threads::CloneThreadSpawn::Errno(errno) => {
+                            state.complete_returned(&mut engine, errno.guest_retval())?;
+                        }
+                    }
                 }
                 DispatchOutcome::ThreadExit { code } => {
                     return Ok(state.handle_thread_exit(&kernel, &mut engine, code, traps));
@@ -2800,6 +2824,7 @@ where
                     signal_interrupted_pc = Some(engine.current_pc()?);
                 }
                 DispatchOutcome::Fork {
+                    flags,
                     pidfd_out,
                     clone_parent,
                     parent_tid_addr,
@@ -2812,6 +2837,7 @@ where
                         &kernel,
                         &mut engine,
                         quiesce::ForkRequest {
+                            flags,
                             pidfd_out,
                             clone_parent,
                             parent_tid_addr,

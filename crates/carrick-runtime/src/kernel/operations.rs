@@ -1131,6 +1131,40 @@ impl Kernel {
         })
     }
 
+    /// Publish only the lifecycle effects of the current destructive exec
+    /// adapter. K4 will replace this RED seam with candidate-mm prepare/commit;
+    /// K1 must nevertheless release a vfork parent and enforce post-exec
+    /// process-group rules without pretending the old image was transactional.
+    pub fn publish_legacy_exec(
+        &self,
+        context: &KernelContext,
+    ) -> Result<TaskRevision, KernelOperationError> {
+        if !Arc::ptr_eq(self.domain(), context.kernel().domain()) {
+            return Err(KernelOperationError::ForeignContext);
+        }
+        let mut state = self.registry().state.write();
+        ensure_task_unreserved(&state, context.task().key().id)?;
+        let record = state
+            .tasks
+            .get_mut(&context.task().key().id)
+            .ok_or(KernelOperationError::UnknownTask(context.task().key().id))?;
+        if record.task.key() != context.task().key() {
+            return Err(KernelOperationError::ParentExited);
+        }
+        if record.revision != context.revision() {
+            return Err(KernelOperationError::StaleContext);
+        }
+        let revision = next_revision(record.revision)?;
+        record.has_execed = true;
+        record.revision = revision;
+        let vfork_release = record.vfork_release.take();
+        drop(state);
+        if let Some(release) = vfork_release {
+            release.release(VforkReleaseReason::Exec);
+        }
+        Ok(revision)
+    }
+
     pub fn set_process_group(
         &self,
         caller_id: TaskId,
@@ -1794,6 +1828,8 @@ fn check_failpoint(
 
 #[derive(Debug, thiserror::Error)]
 pub enum KernelOperationError {
+    #[error(transparent)]
+    ClonePlan(#[from] crate::kernel::ClonePlanError),
     #[error(transparent)]
     Id(#[from] IdError),
     #[error(transparent)]

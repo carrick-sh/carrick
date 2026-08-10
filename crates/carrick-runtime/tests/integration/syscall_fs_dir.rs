@@ -37,6 +37,7 @@ fn inotify_init_add_watch_read_dispatch_plumbing() {
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -193,6 +194,7 @@ fn inotify_add_watch_under_bind_mount_uses_host_vnode() {
     );
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -276,6 +278,7 @@ fn bind_mount_cwd_relative_stat_open_mkdir_and_inotify_use_host_tree() {
     );
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -431,6 +434,7 @@ fn bind_mount_directory_inotify_reports_child_file_write_name() {
     );
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -509,6 +513,7 @@ fn getdents64_lists_rootfs_directory_entries() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -522,6 +527,7 @@ fn getdents64_lists_rootfs_directory_entries() {
 
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(61, SyscallArgs::from([3, 0x4100, 0x100, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -573,6 +579,7 @@ fn getdents64_lists_rootfs_directory_entries() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(61, SyscallArgs::from([3, 0x4100, 0x100, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -600,6 +607,7 @@ fn linkat_reports_eexist_enoent_and_links_into_writable_overlay() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     37,
                     SyscallArgs::from(
@@ -617,6 +625,7 @@ fn linkat_reports_eexist_enoent_and_links_into_writable_overlay() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     37,
                     SyscallArgs::from(
@@ -635,6 +644,7 @@ fn linkat_reports_eexist_enoent_and_links_into_writable_overlay() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     37,
                     SyscallArgs::from(
@@ -652,6 +662,7 @@ fn linkat_reports_eexist_enoent_and_links_into_writable_overlay() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     37,
                     SyscallArgs::from(
@@ -669,6 +680,7 @@ fn linkat_reports_eexist_enoent_and_links_into_writable_overlay() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     37,
                     SyscallArgs::from([
@@ -710,6 +722,7 @@ fn symlinkat_bootstrap_reports_eexist_for_known_links_and_erofs_for_new_paths() 
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     36,
                     SyscallArgs::from([0x4000, (-100_i64) as u64, 0x4020, 0, 0, 0]),
@@ -725,6 +738,7 @@ fn symlinkat_bootstrap_reports_eexist_for_known_links_and_erofs_for_new_paths() 
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     36,
                     SyscallArgs::from([0x4000, (-100_i64) as u64, 0x4040, 0, 0, 0]),
@@ -740,6 +754,7 @@ fn symlinkat_bootstrap_reports_eexist_for_known_links_and_erofs_for_new_paths() 
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     36,
                     SyscallArgs::from([0x4060, (-100_i64) as u64, 0x4040, 0, 0, 0]),
@@ -755,6 +770,7 @@ fn symlinkat_bootstrap_reports_eexist_for_known_links_and_erofs_for_new_paths() 
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     36,
                     SyscallArgs::from([0x4000, (-100_i64) as u64, 0x4060, 0, 0, 0]),
@@ -789,6 +805,7 @@ fn renameat_renames_known_sources_into_overlay_and_enoent_otherwise() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     38,
                     SyscallArgs::from(
@@ -807,6 +824,7 @@ fn renameat_renames_known_sources_into_overlay_and_enoent_otherwise() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     38,
                     SyscallArgs::from(
@@ -824,6 +842,7 @@ fn renameat_renames_known_sources_into_overlay_and_enoent_otherwise() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     38,
                     SyscallArgs::from(
@@ -841,6 +860,7 @@ fn renameat_renames_known_sources_into_overlay_and_enoent_otherwise() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     38,
                     SyscallArgs::from(
@@ -881,6 +901,7 @@ fn renameat2_exchange_swaps_content_and_rejects_invalid_flag_combos() {
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -1007,6 +1028,7 @@ fn unlinkat_removes_files_on_overlay_and_validates_directory_kind() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     35,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, AT_REMOVEDIR, 0, 0, 0]),
@@ -1022,6 +1044,7 @@ fn unlinkat_removes_files_on_overlay_and_validates_directory_kind() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     35,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0])
@@ -1039,6 +1062,7 @@ fn unlinkat_removes_files_on_overlay_and_validates_directory_kind() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     35,
                     SyscallArgs::from([(-100_i64) as u64, 0x4020, 0, 0, 0, 0])
@@ -1056,6 +1080,7 @@ fn unlinkat_removes_files_on_overlay_and_validates_directory_kind() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     35,
                     SyscallArgs::from([(-100_i64) as u64, 0x4020, AT_REMOVEDIR, 0, 0, 0]),
@@ -1071,6 +1096,7 @@ fn unlinkat_removes_files_on_overlay_and_validates_directory_kind() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     35,
                     SyscallArgs::from([(-100_i64) as u64, 0x4040, 0, 0, 0, 0])
@@ -1086,6 +1112,7 @@ fn unlinkat_removes_files_on_overlay_and_validates_directory_kind() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     35,
                     SyscallArgs::from([(-100_i64) as u64, 0x4060, 0, 0, 0, 0])
@@ -1101,6 +1128,7 @@ fn unlinkat_removes_files_on_overlay_and_validates_directory_kind() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     35,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0xdead, 0, 0, 0]),
@@ -1134,6 +1162,7 @@ fn mknodat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     33,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0o100644, 0, 0, 0]),
@@ -1149,6 +1178,7 @@ fn mknodat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     33,
                     SyscallArgs::from([(-100_i64) as u64, 0x4020, 0o100644, 0, 0, 0]),
@@ -1165,6 +1195,7 @@ fn mknodat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     33,
                     SyscallArgs::from([(-100_i64) as u64, 0x4040, 0o100644, 0, 0, 0]),
@@ -1200,6 +1231,7 @@ fn mkdirat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     34,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0o755, 0, 0, 0]),
@@ -1215,6 +1247,7 @@ fn mkdirat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     34,
                     SyscallArgs::from([(-100_i64) as u64, 0x4060, 0o755, 0, 0, 0]),
@@ -1230,6 +1263,7 @@ fn mkdirat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     34,
                     SyscallArgs::from([(-100_i64) as u64, 0x4020, 0o755, 0, 0, 0]),
@@ -1245,6 +1279,7 @@ fn mkdirat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     34,
                     SyscallArgs::from([(-100_i64) as u64, 0x4040, 0o755, 0, 0, 0]),
@@ -1260,6 +1295,7 @@ fn mkdirat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(34, SyscallArgs::from([99, 0x4080, 0o755, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1294,6 +1330,7 @@ fn mkdirat_under_bind_mount_creates_host_directory_for_openat_children() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     34,
                     SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, 0o700, 0, 0, 0]),
@@ -1307,6 +1344,7 @@ fn mkdirat_under_bind_mount_creates_host_directory_for_openat_children() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     34,
                     SyscallArgs::from([LINUX_AT_FDCWD, 0x4020, 0o755, 0, 0, 0]),
@@ -1322,6 +1360,7 @@ fn mkdirat_under_bind_mount_creates_host_directory_for_openat_children() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([
@@ -1343,6 +1382,7 @@ fn mkdirat_under_bind_mount_creates_host_directory_for_openat_children() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(57, SyscallArgs::from([3, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1353,6 +1393,7 @@ fn mkdirat_under_bind_mount_creates_host_directory_for_openat_children() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(35, SyscallArgs::from([LINUX_AT_FDCWD, 0x4060, 0, 0, 0, 0]),),
                 &mut memory,
                 &reporter,
@@ -1364,6 +1405,7 @@ fn mkdirat_under_bind_mount_creates_host_directory_for_openat_children() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     35,
                     SyscallArgs::from([LINUX_AT_FDCWD, 0x4020, LINUX_AT_REMOVEDIR, 0, 0, 0]),
@@ -1400,6 +1442,7 @@ fn bind_mount_create_stamps_guest_owner_on_files_and_directories() {
     );
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -1512,6 +1555,7 @@ fn bind_mount_directory_inotify_reports_created_child_name() {
     );
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -1602,6 +1646,7 @@ fn host_overlay_directory_inotify_reports_created_child_name() {
     dispatcher.set_fs_backend(Box::new(backend));
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -1705,6 +1750,7 @@ fn bind_mount_repeated_relative_stat_after_guest_mkdir_uses_host_tree() {
     );
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -1818,6 +1864,7 @@ fn renameat_under_bind_mount_moves_host_entries() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     38,
                     SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, LINUX_AT_FDCWD, 0x4040, 0, 0]),
@@ -1855,6 +1902,7 @@ fn symlinkat_and_readlinkat_under_bind_mount_use_host_tree() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     34,
                     SyscallArgs::from([LINUX_AT_FDCWD, 0x4020, 0o755, 0, 0, 0]),
@@ -1868,6 +1916,7 @@ fn symlinkat_and_readlinkat_under_bind_mount_use_host_tree() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     36,
                     SyscallArgs::from([0x4000, LINUX_AT_FDCWD, 0x4060, 0, 0, 0]),
@@ -1885,6 +1934,7 @@ fn symlinkat_and_readlinkat_under_bind_mount_use_host_tree() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     78,
                     SyscallArgs::from([LINUX_AT_FDCWD, 0x4060, 0x4100, 64, 0, 0]),
@@ -1925,6 +1975,7 @@ fn linkat_and_unlinkat_under_bind_mount_use_host_tree() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     37,
                     SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, LINUX_AT_FDCWD, 0x4040, 0, 0]),
@@ -1942,6 +1993,7 @@ fn linkat_and_unlinkat_under_bind_mount_use_host_tree() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(35, SyscallArgs::from([LINUX_AT_FDCWD, 0x4040, 0, 0, 0, 0]),),
                 &mut memory,
                 &reporter,

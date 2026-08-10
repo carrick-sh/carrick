@@ -61,6 +61,7 @@ fn fionread_and_fionbio_bootstrap_succeed_for_valid_fds() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(29, SyscallArgs::from([0, LINUX_FIONREAD, 0x4000, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -75,6 +76,7 @@ fn fionread_and_fionbio_bootstrap_succeed_for_valid_fds() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(29, SyscallArgs::from([1, LINUX_FIONBIO, 0x4010, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -87,6 +89,7 @@ fn fionread_and_fionbio_bootstrap_succeed_for_valid_fds() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(29, SyscallArgs::from([99, LINUX_FIONBIO, 0x4010, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -101,6 +104,7 @@ fn fionread_and_fionbio_bootstrap_succeed_for_valid_fds() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(29, SyscallArgs::from([99, LINUX_FIONREAD, 0x4020, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -126,6 +130,7 @@ fn siocgifname_on_socket_maps_interface_index_to_name() {
 
     let fd = match dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 198,
                 SyscallArgs::from([LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0]),
@@ -147,6 +152,7 @@ fn siocgifname_on_socket_maps_interface_index_to_name() {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(
                         29,
                         SyscallArgs::from([fd, LINUX_SIOCGIFNAME, 0x4000, 0, 0, 0])
@@ -168,6 +174,7 @@ fn siocgifname_on_socket_maps_interface_index_to_name() {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(
                         29,
                         SyscallArgs::from([fd, LINUX_SIOCGIFINDEX, 0x4040, 0, 0, 0])
@@ -195,6 +202,7 @@ fn fionbio_updates_pipe_status_flags_and_host_nonblocking_mode() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(59, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -207,6 +215,7 @@ fn fionbio_updates_pipe_status_flags_and_host_nonblocking_mode() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     29,
                     SyscallArgs::from([pair.read_fd as u64, LINUX_FIONBIO, 0x4020, 0, 0, 0]),
@@ -220,6 +229,7 @@ fn fionbio_updates_pipe_status_flags_and_host_nonblocking_mode() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     63,
                     SyscallArgs::from([pair.read_fd as u64, 0x4040, 1, 0, 0, 0])
@@ -237,6 +247,7 @@ fn fionbio_updates_pipe_status_flags_and_host_nonblocking_mode() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     29,
                     SyscallArgs::from([pair.read_fd as u64, LINUX_FIONBIO, 0x4020, 0, 0, 0]),
@@ -249,6 +260,7 @@ fn fionbio_updates_pipe_status_flags_and_host_nonblocking_mode() {
     );
     match dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 63,
                 SyscallArgs::from([pair.read_fd as u64, 0x4040, 1, 0, 0, 0]),
@@ -272,6 +284,7 @@ fn eventfd2_read_write_round_trip_uses_packed_counter() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(19, SyscallArgs::from([7, LINUX_EFD_NONBLOCK, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -282,6 +295,7 @@ fn eventfd2_read_write_round_trip_uses_packed_counter() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4000, 8, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -294,6 +308,7 @@ fn eventfd2_read_write_round_trip_uses_packed_counter() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4000, 8, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -310,6 +325,7 @@ fn eventfd2_read_write_round_trip_uses_packed_counter() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(64, SyscallArgs::from([3, 0x4010, 8, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -320,6 +336,7 @@ fn eventfd2_read_write_round_trip_uses_packed_counter() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4020, 8, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -341,6 +358,7 @@ fn pipe2_writes_packed_fd_pair_and_round_trips_bytes() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     59,
                     SyscallArgs::from([0x4000, LINUX_O_CLOEXEC | LINUX_O_NONBLOCK, 0, 0, 0, 0]),
@@ -360,6 +378,7 @@ fn pipe2_writes_packed_fd_pair_and_round_trips_bytes() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(25, SyscallArgs::from([read_fd, LINUX_F_GETFD, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -372,6 +391,7 @@ fn pipe2_writes_packed_fd_pair_and_round_trips_bytes() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(25, SyscallArgs::from([read_fd, LINUX_F_GETFL, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -385,6 +405,7 @@ fn pipe2_writes_packed_fd_pair_and_round_trips_bytes() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([read_fd, 0x4080, 8, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -399,6 +420,7 @@ fn pipe2_writes_packed_fd_pair_and_round_trips_bytes() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(64, SyscallArgs::from([write_fd, 0x4040, 9, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -409,6 +431,7 @@ fn pipe2_writes_packed_fd_pair_and_round_trips_bytes() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([read_fd, 0x4080, 32, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -429,6 +452,7 @@ fn pipe2_duplicate_writer_keeps_pipe_open_until_all_writers_close() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     59,
                     SyscallArgs::from([0x4000, LINUX_O_NONBLOCK, 0, 0, 0, 0])
@@ -445,6 +469,7 @@ fn pipe2_duplicate_writer_keeps_pipe_open_until_all_writers_close() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(23, SyscallArgs::from([write_fd, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -455,6 +480,7 @@ fn pipe2_duplicate_writer_keeps_pipe_open_until_all_writers_close() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(57, SyscallArgs::from([write_fd, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -465,6 +491,7 @@ fn pipe2_duplicate_writer_keeps_pipe_open_until_all_writers_close() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([read_fd, 0x4080, 8, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -477,6 +504,7 @@ fn pipe2_duplicate_writer_keeps_pipe_open_until_all_writers_close() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(57, SyscallArgs::from([5, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -487,6 +515,7 @@ fn pipe2_duplicate_writer_keeps_pipe_open_until_all_writers_close() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([read_fd, 0x4080, 8, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -508,6 +537,7 @@ fn pipe2_fd_fill_fails_fast_with_emfile() {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(59, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
                     &mut memory,
                     &reporter,
@@ -523,6 +553,7 @@ fn pipe2_fd_fill_fails_fast_with_emfile() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(59, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -537,6 +568,7 @@ fn pipe2_fd_fill_fails_fast_with_emfile() {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(57, SyscallArgs::from([fd, 0, 0, 0, 0, 0])),
                     &mut memory,
                     &reporter,
@@ -556,6 +588,7 @@ fn fcntl_getpipe_size_reports_bootstrap_pipe_capacity() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(59, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -567,6 +600,7 @@ fn fcntl_getpipe_size_reports_bootstrap_pipe_capacity() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     25,
                     SyscallArgs::from([pair.read_fd as u64, LINUX_F_GETPIPE_SZ, 0, 0, 0, 0]),
@@ -589,6 +623,7 @@ fn timerfd_settime_read_round_trip_uses_packed_records() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(85, SyscallArgs::from([1, LINUX_TFD_NONBLOCK, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -599,6 +634,7 @@ fn timerfd_settime_read_round_trip_uses_packed_records() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(25, SyscallArgs::from([3, LINUX_F_GETFL, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -611,6 +647,7 @@ fn timerfd_settime_read_round_trip_uses_packed_records() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4100, 8, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -629,6 +666,7 @@ fn timerfd_settime_read_round_trip_uses_packed_records() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(86, SyscallArgs::from([3, 0, 0x4000, 0x4080, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -645,6 +683,7 @@ fn timerfd_settime_read_round_trip_uses_packed_records() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4100, 8, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -657,6 +696,7 @@ fn timerfd_settime_read_round_trip_uses_packed_records() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4100, 8, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -678,6 +718,7 @@ fn timerfd_gettime_writes_packed_itimerspec_for_armed_timer() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(85, SyscallArgs::from([1, LINUX_TFD_NONBLOCK, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -693,6 +734,7 @@ fn timerfd_gettime_writes_packed_itimerspec_for_armed_timer() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(86, SyscallArgs::from([3, 0, 0x4000, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -703,6 +745,7 @@ fn timerfd_gettime_writes_packed_itimerspec_for_armed_timer() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(87, SyscallArgs::from([3, 0x4080, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -727,6 +770,7 @@ fn epoll_reports_timerfd_readiness_with_packed_event() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(85, SyscallArgs::from([1, LINUX_TFD_NONBLOCK, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -737,6 +781,7 @@ fn epoll_reports_timerfd_readiness_with_packed_event() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -753,6 +798,7 @@ fn epoll_reports_timerfd_readiness_with_packed_event() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     21,
                     SyscallArgs::from([4, LINUX_EPOLL_CTL_ADD, 3, 0x4000, 0, 0]),
@@ -771,6 +817,7 @@ fn epoll_reports_timerfd_readiness_with_packed_event() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(86, SyscallArgs::from([3, 0, 0x4040, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -781,6 +828,7 @@ fn epoll_reports_timerfd_readiness_with_packed_event() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(22, SyscallArgs::from([4, 0x4100, 4, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -794,6 +842,7 @@ fn epoll_reports_timerfd_readiness_with_packed_event() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4200, 8, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -804,6 +853,7 @@ fn epoll_reports_timerfd_readiness_with_packed_event() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(22, SyscallArgs::from([4, 0x4100, 4, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -826,6 +876,7 @@ fn blocking_timerfd_read_waits_until_timer_is_armed() {
     let mut setup_memory = LinearMemory::new(0x4000, vec![0; 0x100]);
     let created = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(85, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
             &mut setup_memory,
             &reporter,
@@ -847,6 +898,7 @@ fn blocking_timerfd_read_waits_until_timer_is_armed() {
         let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
         let outcome = read_dispatcher
             .dispatch_threaded(
+                &read_dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x4000, 8, 0, 0, 0])),
                 &mut memory,
                 &read_reporter,
@@ -874,6 +926,7 @@ fn blocking_timerfd_read_waits_until_timer_is_armed() {
     assert_eq!(
         dispatcher
             .dispatch_threaded(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(86, SyscallArgs::from([fd as u64, 0, 0x4000, 0, 0, 0])),
                 &mut arm_memory,
                 &reporter,
@@ -905,6 +958,7 @@ fn timerfd_rearm_wakes_blocked_reader_without_waiting_for_old_deadline() {
     let mut setup_memory = LinearMemory::new(0x4000, vec![0; 0x100]);
     let created = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(85, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
             &mut setup_memory,
             &reporter,
@@ -927,6 +981,7 @@ fn timerfd_rearm_wakes_blocked_reader_without_waiting_for_old_deadline() {
     assert_eq!(
         dispatcher
             .dispatch_threaded(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(86, SyscallArgs::from([fd as u64, 0, 0x4000, 0, 0, 0])),
                 &mut setup_memory,
                 &reporter,
@@ -947,6 +1002,7 @@ fn timerfd_rearm_wakes_blocked_reader_without_waiting_for_old_deadline() {
         let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
         let outcome = read_dispatcher
             .dispatch_threaded(
+                &read_dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x4000, 8, 0, 0, 0])),
                 &mut memory,
                 &read_reporter,
@@ -971,6 +1027,7 @@ fn timerfd_rearm_wakes_blocked_reader_without_waiting_for_old_deadline() {
     assert_eq!(
         dispatcher
             .dispatch_threaded(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(86, SyscallArgs::from([fd as u64, 0, 0x4000, 0, 0, 0])),
                 &mut rearm_memory,
                 &reporter,
@@ -1070,6 +1127,7 @@ fn epoll_reports_eventfd_readiness_with_packed_events() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(19, SyscallArgs::from([1, LINUX_EFD_NONBLOCK, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1080,6 +1138,7 @@ fn epoll_reports_eventfd_readiness_with_packed_events() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1096,6 +1155,7 @@ fn epoll_reports_eventfd_readiness_with_packed_events() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     21,
                     SyscallArgs::from([4, LINUX_EPOLL_CTL_ADD, 3, 0x4000, 0, 0]),
@@ -1110,6 +1170,7 @@ fn epoll_reports_eventfd_readiness_with_packed_events() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(22, SyscallArgs::from([4, 0x4100, 4, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1126,6 +1187,7 @@ fn epoll_reports_eventfd_readiness_with_packed_events() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4200, 8, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1136,6 +1198,7 @@ fn epoll_reports_eventfd_readiness_with_packed_events() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(22, SyscallArgs::from([4, 0x4100, 4, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1155,6 +1218,7 @@ fn epoll_edge_triggered_eventfd_reports_only_new_readiness() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(19, SyscallArgs::from([1, LINUX_EFD_NONBLOCK, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1165,6 +1229,7 @@ fn epoll_edge_triggered_eventfd_reports_only_new_readiness() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1181,6 +1246,7 @@ fn epoll_edge_triggered_eventfd_reports_only_new_readiness() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     21,
                     SyscallArgs::from([4, LINUX_EPOLL_CTL_ADD, 3, 0x4000, 0, 0]),
@@ -1195,6 +1261,7 @@ fn epoll_edge_triggered_eventfd_reports_only_new_readiness() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(22, SyscallArgs::from([4, 0x4100, 4, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1210,6 +1277,7 @@ fn epoll_edge_triggered_eventfd_reports_only_new_readiness() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(22, SyscallArgs::from([4, 0x4100, 4, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1221,6 +1289,7 @@ fn epoll_edge_triggered_eventfd_reports_only_new_readiness() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4200, 8, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1231,6 +1300,7 @@ fn epoll_edge_triggered_eventfd_reports_only_new_readiness() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(22, SyscallArgs::from([4, 0x4100, 4, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1244,6 +1314,7 @@ fn epoll_edge_triggered_eventfd_reports_only_new_readiness() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(64, SyscallArgs::from([3, 0x4300, 8, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1254,6 +1325,7 @@ fn epoll_edge_triggered_eventfd_reports_only_new_readiness() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(22, SyscallArgs::from([4, 0x4100, 4, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1274,7 +1346,7 @@ fn epoll_edge_triggered_ready_overflow_is_returned_on_next_wait() {
     for fd in 3..=5 {
         assert_eq!(
             dispatcher
-                .dispatch(
+                .dispatch(&dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(
                         19,
                         SyscallArgs::from([1, LINUX_EFD_NONBLOCK, 0, 0, 0, 0]),
@@ -1289,6 +1361,7 @@ fn epoll_edge_triggered_ready_overflow_is_returned_on_next_wait() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1310,6 +1383,7 @@ fn epoll_edge_triggered_ready_overflow_is_returned_on_next_wait() {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(
                         21,
                         SyscallArgs::from([6, LINUX_EPOLL_CTL_ADD, fd, addr, 0, 0]),
@@ -1325,6 +1399,7 @@ fn epoll_edge_triggered_ready_overflow_is_returned_on_next_wait() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(22, SyscallArgs::from([6, 0x4100, 2, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1342,6 +1417,7 @@ fn epoll_edge_triggered_ready_overflow_is_returned_on_next_wait() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(22, SyscallArgs::from([6, 0x4100, 2, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1369,6 +1445,7 @@ fn epoll_timed_wait_blocks_after_edge_event_was_already_reported() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(19, SyscallArgs::from([1, LINUX_EFD_NONBLOCK, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1379,6 +1456,7 @@ fn epoll_timed_wait_blocks_after_edge_event_was_already_reported() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1395,6 +1473,7 @@ fn epoll_timed_wait_blocks_after_edge_event_was_already_reported() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     21,
                     SyscallArgs::from([4, LINUX_EPOLL_CTL_ADD, 3, 0x4000, 0, 0]),
@@ -1409,6 +1488,7 @@ fn epoll_timed_wait_blocks_after_edge_event_was_already_reported() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(22, SyscallArgs::from([4, 0x4100, 4, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1419,6 +1499,7 @@ fn epoll_timed_wait_blocks_after_edge_event_was_already_reported() {
 
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(22, SyscallArgs::from([4, 0x4100, 4, 25, 0, 0])),
             &mut memory,
             &reporter,
@@ -1453,6 +1534,7 @@ fn epoll_waits_on_host_backed_edge_interests_when_no_event_is_ready() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     59,
                     SyscallArgs::from([0x4000, LINUX_O_NONBLOCK, 0, 0, 0, 0]),
@@ -1468,6 +1550,7 @@ fn epoll_waits_on_host_backed_edge_interests_when_no_event_is_ready() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1484,6 +1567,7 @@ fn epoll_waits_on_host_backed_edge_interests_when_no_event_is_ready() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     21,
                     SyscallArgs::from([5, LINUX_EPOLL_CTL_ADD, read_fd, 0x4040, 0, 0]),
@@ -1497,6 +1581,7 @@ fn epoll_waits_on_host_backed_edge_interests_when_no_event_is_ready() {
 
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(22, SyscallArgs::from([5, 0x4100, 4, 25, 0, 0])),
             &mut memory,
             &reporter,
@@ -1541,6 +1626,7 @@ fn epoll_latched_host_edge_parks_on_kqueue_edge_not_timeout_backstop() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     59,
                     SyscallArgs::from([0x4000, LINUX_O_NONBLOCK, 0, 0, 0, 0]),
@@ -1558,6 +1644,7 @@ fn epoll_latched_host_edge_parks_on_kqueue_edge_not_timeout_backstop() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1574,6 +1661,7 @@ fn epoll_latched_host_edge_parks_on_kqueue_edge_not_timeout_backstop() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     21,
                     SyscallArgs::from([5, LINUX_EPOLL_CTL_ADD, read_fd, 0x4040, 0, 0]),
@@ -1589,6 +1677,7 @@ fn epoll_latched_host_edge_parks_on_kqueue_edge_not_timeout_backstop() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(64, SyscallArgs::from([write_fd, 0x4060, 1, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1600,6 +1689,7 @@ fn epoll_latched_host_edge_parks_on_kqueue_edge_not_timeout_backstop() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(22, SyscallArgs::from([5, 0x4100, 4, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1615,6 +1705,7 @@ fn epoll_latched_host_edge_parks_on_kqueue_edge_not_timeout_backstop() {
 
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(22, SyscallArgs::from([5, 0x4100, 4, 25, 0, 0])),
             &mut memory,
             &reporter,
@@ -1649,6 +1740,7 @@ fn epoll_et_read_growth_does_not_rearm_latched_read_level() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     59,
                     SyscallArgs::from([0x4000, LINUX_O_NONBLOCK, 0, 0, 0, 0]),
@@ -1666,6 +1758,7 @@ fn epoll_et_read_growth_does_not_rearm_latched_read_level() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1682,6 +1775,7 @@ fn epoll_et_read_growth_does_not_rearm_latched_read_level() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     21,
                     SyscallArgs::from([5, LINUX_EPOLL_CTL_ADD, read_fd, 0x4040, 0, 0]),
@@ -1697,6 +1791,7 @@ fn epoll_et_read_growth_does_not_rearm_latched_read_level() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(64, SyscallArgs::from([write_fd, 0x4060, 1, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1707,6 +1802,7 @@ fn epoll_et_read_growth_does_not_rearm_latched_read_level() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(22, SyscallArgs::from([5, 0x4100, 4, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1724,6 +1820,7 @@ fn epoll_et_read_growth_does_not_rearm_latched_read_level() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(64, SyscallArgs::from([write_fd, 0x4060, 1, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1734,6 +1831,7 @@ fn epoll_et_read_growth_does_not_rearm_latched_read_level() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(22, SyscallArgs::from([5, 0x4100, 4, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1749,6 +1847,7 @@ fn epoll_et_read_growth_does_not_rearm_latched_read_level() {
 
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(22, SyscallArgs::from([5, 0x4100, 4, 25, 0, 0])),
             &mut memory,
             &reporter,
@@ -1794,6 +1893,7 @@ fn epoll_wakes_accepted_socket_after_peer_write() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     198,
                     SyscallArgs::from([LINUX_AF_INET as u64, socket_type, 0, 0, 0, 0])
@@ -1808,6 +1908,7 @@ fn epoll_wakes_accepted_socket_after_peer_write() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(200, SyscallArgs::from([3, 0x4000, 16, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1818,6 +1919,7 @@ fn epoll_wakes_accepted_socket_after_peer_write() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(201, SyscallArgs::from([3, 128, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1830,6 +1932,7 @@ fn epoll_wakes_accepted_socket_after_peer_write() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(204, SyscallArgs::from([3, 0x4010, 0x4020, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1842,6 +1945,7 @@ fn epoll_wakes_accepted_socket_after_peer_write() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1854,6 +1958,7 @@ fn epoll_wakes_accepted_socket_after_peer_write() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     198,
                     SyscallArgs::from([LINUX_AF_INET as u64, socket_type, 0, 0, 0, 0])
@@ -1868,6 +1973,7 @@ fn epoll_wakes_accepted_socket_after_peer_write() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(203, SyscallArgs::from([5, 0x4030, 16, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1883,6 +1989,7 @@ fn epoll_wakes_accepted_socket_after_peer_write() {
     let accepted_fd = loop {
         match dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     242,
                     SyscallArgs::from([
@@ -1923,6 +2030,7 @@ fn epoll_wakes_accepted_socket_after_peer_write() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([accepted_fd, 0x5200, 64, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1934,6 +2042,7 @@ fn epoll_wakes_accepted_socket_after_peer_write() {
     );
     let initial_count = match dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(22, SyscallArgs::from([4, 0x5100, 8, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -1958,6 +2067,7 @@ fn epoll_wakes_accepted_socket_after_peer_write() {
 
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(22, SyscallArgs::from([4, 0x5100, 8, 25, 0, 0])),
             &mut memory,
             &reporter,
@@ -2012,6 +2122,7 @@ fn epoll_wakes_accepted_socket_after_peer_write() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(64, SyscallArgs::from([5, 0x5300, 22, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -2044,6 +2155,7 @@ fn epoll_wakes_accepted_socket_after_peer_write() {
 
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(22, SyscallArgs::from([4, 0x5100, 8, 25, 0, 0])),
             &mut memory,
             &reporter,
@@ -2350,6 +2462,7 @@ fn add_epoll_interest(
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     21,
                     SyscallArgs::from([epfd, LINUX_EPOLL_CTL_ADD, fd, event_addr, 0, 0]),
@@ -2370,7 +2483,15 @@ fn dispatch_with_wait(
     reporter: &CompatReporter,
 ) -> DispatchOutcome {
     loop {
-        match dispatcher.dispatch(request, memory, reporter).unwrap() {
+        match dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                request,
+                memory,
+                reporter,
+            )
+            .unwrap()
+        {
             DispatchOutcome::WaitOnFds {
                 fds,
                 timeout,
@@ -2428,6 +2549,7 @@ fn set_tcp_keepidle(
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     208,
                     SyscallArgs::from([
@@ -2479,6 +2601,7 @@ fn dispatch_threaded_once(
     threaded
         .dispatcher
         .dispatch_threaded(
+            &threaded.dispatcher.capture_one_task_context().unwrap(),
             request,
             &mut *memory,
             threaded.reporter.as_ref(),
@@ -2598,6 +2721,7 @@ fn ppoll_reports_eventfd_pipe_and_invalid_fd_readiness() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(19, SyscallArgs::from([1, LINUX_EFD_NONBLOCK, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -2608,6 +2732,7 @@ fn ppoll_reports_eventfd_pipe_and_invalid_fd_readiness() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     59,
                     SyscallArgs::from([0x4000, LINUX_O_NONBLOCK, 0, 0, 0, 0])
@@ -2623,6 +2748,7 @@ fn ppoll_reports_eventfd_pipe_and_invalid_fd_readiness() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     64,
                     SyscallArgs::from([pair.write_fd as u64, 0x4080, 1, 0, 0, 0])
@@ -2663,6 +2789,7 @@ fn ppoll_reports_eventfd_pipe_and_invalid_fd_readiness() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(73, SyscallArgs::from([0x4100, 4, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -2688,6 +2815,7 @@ fn ppoll_reports_epoll_fd_readiness_when_registered_fd_is_ready() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -2698,6 +2826,7 @@ fn ppoll_reports_epoll_fd_readiness_when_registered_fd_is_ready() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(59, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -2716,6 +2845,7 @@ fn ppoll_reports_epoll_fd_readiness_when_registered_fd_is_ready() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     21,
                     SyscallArgs::from([3, LINUX_EPOLL_CTL_ADD, pair.read_fd as u64, 0x4100, 0, 0])
@@ -2731,6 +2861,7 @@ fn ppoll_reports_epoll_fd_readiness_when_registered_fd_is_ready() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     64,
                     SyscallArgs::from([pair.write_fd as u64, 0x4200, 1, 0, 0, 0])
@@ -2757,6 +2888,7 @@ fn ppoll_reports_epoll_fd_readiness_when_registered_fd_is_ready() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(73, SyscallArgs::from([0x4300, 1, 0x4400, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -2779,6 +2911,7 @@ fn pselect6_reports_eventfd_pipe_and_write_readiness() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(19, SyscallArgs::from([1, LINUX_EFD_NONBLOCK, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -2789,6 +2922,7 @@ fn pselect6_reports_eventfd_pipe_and_write_readiness() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     59,
                     SyscallArgs::from([0x4000, LINUX_O_NONBLOCK, 0, 0, 0, 0])
@@ -2804,6 +2938,7 @@ fn pselect6_reports_eventfd_pipe_and_write_readiness() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     64,
                     SyscallArgs::from([pair.write_fd as u64, 0x4080, 1, 0, 0, 0])
@@ -2821,6 +2956,7 @@ fn pselect6_reports_eventfd_pipe_and_write_readiness() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     72,
                     SyscallArgs::from([nfds as u64, 0x4100, 0x4200, 0, 0, 0]),
@@ -2850,6 +2986,7 @@ fn pselect6_empty_zero_timeout_returns_without_wait_handoff() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(72, SyscallArgs::from([0, 0, 0, 0, 0x4100, 0])),
                 &mut memory,
                 &reporter,
@@ -2870,6 +3007,7 @@ fn pselect6_invalid_fd_returns_ebadf() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(72, SyscallArgs::from([100, 0x4100, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -2894,6 +3032,7 @@ fn close_of_added_fd_auto_removes_it_from_epoll_interest() {
 
     let call = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -2964,7 +3103,15 @@ fn x86_64_epoll_uses_packed_event_layout() {
                memory: &mut LinearMemory,
                request: SyscallRequest|
      -> i64 {
-        match dispatcher.dispatch(request, memory, &reporter).unwrap() {
+        match dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                request,
+                memory,
+                &reporter,
+            )
+            .unwrap()
+        {
             DispatchOutcome::Returned { value } => value,
             other => panic!("unexpected outcome: {other:?}"),
         }

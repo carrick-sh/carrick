@@ -4373,6 +4373,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                 )?;
             }
             DispatchOutcome::Fork {
+                flags: _,
                 pidfd_out,
                 clone_parent,
                 parent_tid_addr,
@@ -6387,6 +6388,9 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
     trace_syscalls: bool,
     blocked_ns: &mut NativeBlockedSpan,
 ) -> Result<DispatchOutcome, RuntimeError> {
+    let kernel_context = dispatcher.capture_one_task_context().map_err(|error| {
+        RuntimeError::Configuration(format!("capture native one-task kernel context: {error}"))
+    })?;
     let mut signal_wait_deadline = None;
     let mut fd_wait_deadline = None;
     loop {
@@ -6403,6 +6407,7 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
                     NativeDispatchGuardClassScope::enter(NativeDispatchGuardClass::Exclusive);
                 let mut memory = memory.write();
                 let outcome = dispatcher.dispatch_threaded(
+                    &kernel_context,
                     request,
                     &mut *memory,
                     reporter,
@@ -6454,6 +6459,7 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
                     NativeDispatchGuardClassScope::enter(NativeDispatchGuardClass::Shared);
                 let mut memory = NativeDispatchMemory::new_read(memory);
                 dispatcher.dispatch_threaded(
+                    &kernel_context,
                     request,
                     &mut memory,
                     reporter,

@@ -17,6 +17,7 @@ fn rt_signal_stubs_zero_old_state() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(135, SyscallArgs::from([0, 0, 0x4000, 8, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -28,6 +29,7 @@ fn rt_signal_stubs_zero_old_state() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(134, SyscallArgs::from([2, 0, 0x4010, 8, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -80,6 +82,7 @@ fn rt_sigaction_sig_dfl_resets_host_disposition_for_job_control() {
         .unwrap();
     dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 RT_SIGACTION,
                 SyscallArgs::from([LINUX_SIGTSTP, 0x4000, 0, 8, 0, 0]),
@@ -96,6 +99,7 @@ fn rt_sigaction_sig_dfl_resets_host_disposition_for_job_control() {
         .unwrap();
     dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 RT_SIGACTION,
                 SyscallArgs::from([LINUX_SIGTSTP, 0x4000, 0, 8, 0, 0]),
@@ -143,6 +147,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(133, SyscallArgs::from([0x4000, 8, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -158,6 +163,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(133, SyscallArgs::from([0x4000, 9, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -171,6 +177,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(133, SyscallArgs::from([0xdead_0000, 8, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -190,6 +197,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(137, SyscallArgs::from([0x4000, 0, 0, 8, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -216,6 +224,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(137, SyscallArgs::from([0x4000, 0, 0x4040, 8, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -229,6 +238,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(137, SyscallArgs::from([0x4000, 0, 0, 9, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -245,6 +255,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(137, SyscallArgs::from([0x4000, 0, 0x4040, 8, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -259,6 +270,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(138, SyscallArgs::from([1, 65, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -272,6 +284,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(138, SyscallArgs::from([99, 1, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -285,6 +298,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 // rt_sigprocmask(SIG_BLOCK=0, set=0x4080, oldset=NULL, size=8)
                 SyscallRequest::new(135, SyscallArgs::from([0, 0x4080, 0, 8, 0, 0])),
                 &mut memory,
@@ -297,6 +311,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(138, SyscallArgs::from([1, 1, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -309,6 +324,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     138,
                     SyscallArgs::from([std::process::id() as u64, 1, 0, 0, 0, 0])
@@ -326,6 +342,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(139, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -355,6 +372,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(129, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -366,6 +384,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(129, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -377,6 +396,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(129, SyscallArgs::from([1, 65, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -390,6 +410,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(129, SyscallArgs::from([99, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -402,6 +423,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(129, SyscallArgs::from([1, 15, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -417,6 +439,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(130, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -427,6 +450,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(130, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -440,6 +464,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(130, SyscallArgs::from([1, 65, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -452,6 +477,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(130, SyscallArgs::from([99, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -463,6 +489,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(130, SyscallArgs::from([1, 1, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -476,6 +503,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(131, SyscallArgs::from([1, 1, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -487,6 +515,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(131, SyscallArgs::from([1, 1, 65, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -500,6 +529,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(131, SyscallArgs::from([99, 1, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -510,6 +540,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(131, SyscallArgs::from([1, 99, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -521,6 +552,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(131, SyscallArgs::from([1, 1, 1, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -553,6 +585,7 @@ fn sigaltstack_bootstrap_zeroes_old_stack_and_validates_new() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(132, SyscallArgs::from([0, old_ptr, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -577,6 +610,7 @@ fn sigaltstack_bootstrap_zeroes_old_stack_and_validates_new() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(132, SyscallArgs::from([new_ptr, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -596,6 +630,7 @@ fn sigaltstack_bootstrap_zeroes_old_stack_and_validates_new() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(132, SyscallArgs::from([new_ptr, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -617,6 +652,7 @@ fn sigaltstack_bootstrap_zeroes_old_stack_and_validates_new() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(132, SyscallArgs::from([new_ptr, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -638,6 +674,7 @@ fn sigaltstack_bootstrap_zeroes_old_stack_and_validates_new() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(132, SyscallArgs::from([new_ptr, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -667,6 +704,7 @@ fn rt_sigsuspend_applies_mask_then_returns_eintr_on_pending_signal() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(133, SyscallArgs::from([0x4000, 8, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -707,6 +745,7 @@ fn rt_sigsuspend_restores_nondefault_mask_when_no_handler_runs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(133, SyscallArgs::from([0x4000, 8, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -739,6 +778,7 @@ fn signalfd_read_drains_pending_masked_signals() {
     // signalfd4(-1, mask@0x4000, 8, 0) -> sfd.
     let sfd = match dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(74, SyscallArgs::from([u64::MAX, 0x4000, 8, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -752,6 +792,7 @@ fn signalfd_read_drains_pending_masked_signals() {
 
     let read = |d: &mut SyscallDispatcher, m: &mut LinearMemory, count: u64| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(63, SyscallArgs::from([sfd, 0x4100, count, 0, 0, 0])),
             m,
             &reporter,
@@ -821,6 +862,7 @@ fn rt_sigtimedwait_writes_full_siginfo_from_queued_payload() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(137, SyscallArgs::from([0x4000, 0x4100, 0, 8, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -884,6 +926,7 @@ fn fasync_self_owner_delivers_io_signal_to_sigtimedwait() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(SYS_PIPE2, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -900,6 +943,7 @@ fn fasync_self_owner_delivers_io_signal_to_sigtimedwait() {
     let mut fcntl = |fd: u64, cmd: u64, arg: u64| {
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(SYS_FCNTL, SyscallArgs::from([fd, cmd, arg, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -927,6 +971,7 @@ fn fasync_self_owner_delivers_io_signal_to_sigtimedwait() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(SYS_WRITE, SyscallArgs::from([wfd, 0x4100, 1, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -943,6 +988,7 @@ fn fasync_self_owner_delivers_io_signal_to_sigtimedwait() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     SYS_RT_SIGTIMEDWAIT,
                     SyscallArgs::from([0x4200, 0, 0, 8, 0, 0]),

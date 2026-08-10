@@ -41,6 +41,7 @@ fn exit_syscall_requests_process_exit() {
 
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(93, SyscallArgs::from([42, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -59,6 +60,7 @@ fn exit_group_syscall_requests_process_exit() {
 
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(94, SyscallArgs::from([7, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -77,6 +79,7 @@ fn unknown_syscall_returns_enosys_and_records_report_entry() {
 
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(9999, SyscallArgs::from([1, 2, 3, 4, 5, 6])),
             &mut memory,
             &reporter,
@@ -122,6 +125,7 @@ fn getrandom_fills_guest_buffer() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(278, SyscallArgs::from([0x4000, 16, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -153,6 +157,7 @@ fn privileged_op_stubs_return_eperm_or_enosys() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(117, SyscallArgs::from([16, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -167,6 +172,7 @@ fn privileged_op_stubs_return_eperm_or_enosys() {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(number, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                     &mut memory,
                     &reporter,
@@ -195,6 +201,7 @@ fn job_control_queries_match_host_process_group_state() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(154, SyscallArgs::from([99, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -207,6 +214,7 @@ fn job_control_queries_match_host_process_group_state() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(154, SyscallArgs::from([0, (-1_i64) as u64, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -222,6 +230,7 @@ fn job_control_queries_match_host_process_group_state() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(155, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -234,6 +243,7 @@ fn job_control_queries_match_host_process_group_state() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(155, SyscallArgs::from([99, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -246,6 +256,7 @@ fn job_control_queries_match_host_process_group_state() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(156, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -258,6 +269,7 @@ fn job_control_queries_match_host_process_group_state() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(156, SyscallArgs::from([99, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -291,6 +303,7 @@ fn unhandled_named_syscall_surfaces_by_name_in_compat_report() {
 
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(18, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -338,6 +351,7 @@ fn wait_family_bootstrap_returns_echild() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     95,
                     SyscallArgs::from([LINUX_P_ALL, 0, 0, LINUX_WEXITED, 0, 0]),
@@ -355,6 +369,7 @@ fn wait_family_bootstrap_returns_echild() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(95, SyscallArgs::from([99, 0, 0, LINUX_WEXITED, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -369,6 +384,7 @@ fn wait_family_bootstrap_returns_echild() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(95, SyscallArgs::from([LINUX_P_ALL, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -383,6 +399,7 @@ fn wait_family_bootstrap_returns_echild() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     95,
                     SyscallArgs::from([LINUX_P_ALL, 0, 0, LINUX_WEXITED | 0xdead_0000, 0, 0,]),
@@ -400,6 +417,7 @@ fn wait_family_bootstrap_returns_echild() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(260, SyscallArgs::from([(-1_i64) as u64, 0, 0, 0, 0, 0]),),
                 &mut memory,
                 &reporter,
@@ -414,6 +432,7 @@ fn wait_family_bootstrap_returns_echild() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     260,
                     SyscallArgs::from([(-1_i64) as u64, 0, LINUX_WNOHANG, 0, 0, 0]),
@@ -431,6 +450,7 @@ fn wait_family_bootstrap_returns_echild() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     260,
                     SyscallArgs::from([(-1_i64) as u64, 0, 0xdead_0000, 0, 0, 0]),
@@ -466,6 +486,7 @@ fn blocking_wait4_for_specific_child_parks_on_proc_exit() {
 
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(260, SyscallArgs::from([child as u64, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -539,6 +560,7 @@ fn waitid_wexited_ignores_stopped_child() {
 
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 95,
                 SyscallArgs::from([
@@ -647,6 +669,7 @@ fn native_waitid_translates_and_controls_virtual_ptrace_stop() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     95,
                     SyscallArgs::from([
@@ -670,6 +693,7 @@ fn native_waitid_translates_and_controls_virtual_ptrace_stop() {
     for _ in 0..100 {
         let outcome = dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     95,
                     SyscallArgs::from([
@@ -704,6 +728,7 @@ fn native_waitid_translates_and_controls_virtual_ptrace_stop() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     95,
                     SyscallArgs::from([
@@ -739,6 +764,7 @@ fn native_waitid_translates_and_controls_virtual_ptrace_stop() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     95,
                     SyscallArgs::from([
@@ -760,6 +786,7 @@ fn native_waitid_translates_and_controls_virtual_ptrace_stop() {
 
     let continued_waitid = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 95,
                 SyscallArgs::from([LINUX_P_PID, child as u64, 0, LINUX_WCONTINUED, 0, 0]),
@@ -774,6 +801,7 @@ fn native_waitid_translates_and_controls_virtual_ptrace_stop() {
     ));
     let continued_wait4 = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 260,
                 SyscallArgs::from([child as u64, 0, LINUX_WCONTINUED, 0, 0, 0]),
@@ -825,6 +853,7 @@ fn native_waitid_translates_and_controls_virtual_ptrace_stop() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     260,
                     SyscallArgs::from([u64::MAX, 0, LINUX_WNOHANG, 0, 0, 0]),
@@ -842,6 +871,7 @@ fn native_waitid_translates_and_controls_virtual_ptrace_stop() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(117, SyscallArgs::from([7, child as u64, 0, 0, 0, 0]),),
                 &mut memory,
                 &reporter,
@@ -903,6 +933,7 @@ fn native_ptrace_wait_without_wuntraced_uses_state_readiness() {
     let mut dispatcher = SyscallDispatcher::with_page_geometry(geometry);
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(260, SyscallArgs::from([child as u64, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -1014,6 +1045,7 @@ fn native_broad_waitid_skips_unrequested_stop_for_exited_sibling() {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(
                         95,
                         SyscallArgs::from([
@@ -1094,6 +1126,7 @@ fn native_process_group_waits_park_without_blocking_in_host_wait() {
 
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(260, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -1107,6 +1140,7 @@ fn native_process_group_waits_park_without_blocking_in_host_wait() {
 
     let waitid_outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(95, SyscallArgs::from([2, 0, 0, 4, 0, 0])),
             &mut memory,
             &reporter,
@@ -1155,6 +1189,7 @@ fn native_untraced_wait_uses_child_state_readiness() {
     let mut dispatcher = SyscallDispatcher::with_page_geometry(geometry);
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(260, SyscallArgs::from([child as u64, 0, 2, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -1203,6 +1238,7 @@ fn seccomp_filter_blocks_the_targeted_syscall_with_errno() {
 
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,

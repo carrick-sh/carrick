@@ -36,6 +36,7 @@ fn getsockname_returns_the_guest_unix_path_not_the_host_translation() {
     let ret = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| -> i64 {
         match d
             .dispatch(
+                &d.capture_one_task_context().unwrap(),
                 SyscallRequest::new(nr, SyscallArgs::from(args)),
                 m,
                 &reporter,
@@ -115,6 +116,7 @@ fn unix_bind_existing_guest_socket_path_returns_eaddrinuse() {
     let mut dispatcher = SyscallDispatcher::new();
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -209,6 +211,7 @@ fn unix_connect_checks_guest_path_before_host_hash_path() {
     let mut dispatcher = SyscallDispatcher::new();
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -298,6 +301,7 @@ fn unix_pathname_stream_listener_accepts_local_client() {
     let mut dispatcher = SyscallDispatcher::new();
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -374,6 +378,7 @@ fn unix_relative_socket_getsockname_can_be_chmodded() {
     let mut dispatcher = SyscallDispatcher::new();
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -477,6 +482,7 @@ fn unix_relative_socket_under_bind_mount_can_be_chmodded() {
     dispatcher.set_cwd("/tmp/nodejs-bindsock");
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -590,6 +596,7 @@ fn epoll_del_of_one_dup_keeps_readiness_for_the_shared_host_socket() {
     let ret = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| -> i64 {
         match d
             .dispatch(
+                &d.capture_one_task_context().unwrap(),
                 SyscallRequest::new(nr, SyscallArgs::from(args)),
                 m,
                 &reporter,
@@ -698,6 +705,7 @@ fn getsockopt_so_peercred_returns_linux_ucred_from_local_peercred() {
     let ret = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| -> i64 {
         match d
             .dispatch(
+                &d.capture_one_task_context().unwrap(),
                 SyscallRequest::new(nr, SyscallArgs::from(args)),
                 m,
                 &reporter,
@@ -777,6 +785,7 @@ fn so_passcred_set_get_round_trips() {
     let mut dispatcher = SyscallDispatcher::new();
     let call = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,

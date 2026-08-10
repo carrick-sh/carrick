@@ -1140,6 +1140,7 @@ where
                 last_syscall_retval = Some(value);
             }
             DispatchOutcome::Fork {
+                flags: _,
                 pidfd_out,
                 clone_parent,
                 parent_tid_addr,
@@ -1582,6 +1583,9 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
     // blocking path: poll the host fds, then re-dispatch the same syscall on
     // readiness. This is the common single-threaded path for the combined and
     // split runtimes; the threaded runtime keeps its own fork-quiesce handling.
+    let kernel_context = dispatcher.capture_one_task_context().map_err(|error| {
+        RuntimeError::Configuration(format!("capture one-task kernel context: {error}"))
+    })?;
     let mut signal_wait_deadline = None;
     let mut sleep_deadline: Option<Instant> = None;
     let mut poll_deadline: Option<Instant> = None;
@@ -1589,7 +1593,7 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
         let outcome = dispatch_with_panic_backstop(
             request.number.raw(),
             ThreadId::main_from_host_pid(),
-            || dispatcher.dispatch(request, memory, reporter),
+            || dispatcher.dispatch(&kernel_context, request, memory, reporter),
         )?;
         match outcome {
             DispatchOutcome::BlockingHostWrite(mut write) => {

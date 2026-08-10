@@ -12,88 +12,130 @@ use island::passthrough_island_bytes;
 use patcher::{ISLAND_STUB_SIZE, PatchError, PatchSite, patch_svc_zero};
 
 mod asid;
+mod bank_resources;
 mod banked_mm;
 mod info_page;
 mod island;
 mod patcher;
-mod process_table;
 
-pub(crate) use process_table::WaitResult;
-use process_table::{GuestPid, ProcessTable};
+use bank_resources::BankResources;
 
-/// Per-kernel binding to one Linux process inside the shared hvpatch VM.
-/// Child kernels will carry the same table with a different `pid`.
 #[derive(Clone, Debug)]
 pub(crate) struct ProcessContext {
-    table: std::sync::Arc<ProcessTable>,
-    pid: GuestPid,
+    resources: std::sync::Arc<BankResources>,
+    binding: crate::kernel::KernelTaskBinding,
     mm_backend: std::sync::Arc<banked_mm::BankedMmBackend>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ChildExit {
+    pid: crate::kernel::TaskId,
+    status: i32,
+}
+
+impl ChildExit {
+    pub(crate) const fn pid(self) -> crate::kernel::TaskId {
+        self.pid
+    }
+
+    pub(crate) const fn status(self) -> i32 {
+        self.status
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WaitResult {
+    Exited(ChildExit),
+    StillRunning,
+    NoChild,
 }
 
 impl ProcessContext {
     fn new(
-        table: std::sync::Arc<ProcessTable>,
-        pid: GuestPid,
-    ) -> Result<Self, process_table::ProcessTableError> {
-        let mm_backend = table
-            .mm_backend(pid)
-            .ok_or(process_table::ProcessTableError::UnknownProcess(pid))?;
-        Ok(Self {
-            table,
-            pid,
+        resources: std::sync::Arc<BankResources>,
+        binding: crate::kernel::KernelTaskBinding,
+        mm_backend: std::sync::Arc<banked_mm::BankedMmBackend>,
+    ) -> Self {
+        Self {
+            resources,
+            binding,
             mm_backend,
-        })
+        }
     }
 
     pub(crate) fn pid(&self) -> i32 {
-        self.pid.raw()
+        self.binding.task_id().raw()
+    }
+
+    pub(crate) fn task_id(&self) -> crate::kernel::TaskId {
+        self.binding.task_id()
+    }
+
+    pub(crate) fn task_binding(&self) -> crate::kernel::KernelTaskBinding {
+        self.binding.clone()
+    }
+
+    pub(crate) fn kernel_graph(&self) -> &std::sync::Arc<crate::kernel::Kernel> {
+        self.binding.kernel()
+    }
+
+    pub(crate) fn bank_resources(&self) -> &std::sync::Arc<BankResources> {
+        &self.resources
+    }
+
+    pub(crate) fn context_for_linux_tid(
+        &self,
+        tid: crate::kernel::LinuxTid,
+    ) -> Result<crate::kernel::KernelContext, crate::kernel::KernelError> {
+        self.binding.capture(tid)
+    }
+
+    pub(crate) fn published_child_context(
+        &self,
+        context: &crate::kernel::KernelContext,
+        mm_backend: std::sync::Arc<banked_mm::BankedMmBackend>,
+    ) -> Self {
+        Self::new(
+            std::sync::Arc::clone(&self.resources),
+            context.task_binding(),
+            mm_backend,
+        )
     }
 
     pub(crate) fn live_process_count(&self) -> usize {
-        self.table.live_process_count()
+        self.kernel_graph().registry().task_count()
     }
 
     pub(crate) fn mm_binding(&self) -> Option<crate::kernel::MmBinding> {
         Some(crate::kernel::MmBackend::binding(self.mm_backend.as_ref()))
     }
 
-    /// Return the Linux process identity needed to bind a host service record
-    /// to this multiplexed address space. A missing record means the process is
-    /// already retired, so callers omit rather than forge diagnostic identity.
     pub(crate) fn syscall_trace_identity(&self) -> Option<(i32, u32)> {
-        let process = self.table.process(self.pid)?;
+        let identity = self.kernel_graph().task_identity(self.task_id()).ok()?;
         let binding = self.mm_binding()?;
-        Some((process.pid().raw(), u32::from(binding.asid.raw())))
+        Some((identity.task_id.raw(), u32::from(binding.asid.raw())))
     }
 
-    /// Register a readiness subscriber for a pidfd targeting this shared VM's
-    /// guest process namespace. Returns false only when the pid is neither live
-    /// nor a retained zombie.
     pub(crate) fn register_pidfd_watch(
         &self,
         target: i32,
         watch: &std::sync::Arc<crate::dispatch::fd_table::PidfdWatch>,
     ) -> bool {
-        GuestPid::from_raw(target)
-            .is_some_and(|target| self.table.register_pidfd_watch(target, watch))
+        crate::kernel::TaskId::from_abi_positive(target).is_ok_and(|target| {
+            self.kernel_graph()
+                .register_task_exit_subscriber(target, watch)
+        })
     }
 
     pub(crate) fn process_is_live(&self, target: i32) -> bool {
-        GuestPid::from_raw(target).is_some_and(|target| self.table.is_live(target))
-    }
-
-    pub(crate) fn allocate_thread_id(
-        &self,
-    ) -> Result<crate::thread::ThreadId, process_table::ProcessTableError> {
-        self.table
-            .allocate_task_id()
-            .map(crate::thread::ThreadId::from_guest_supplied_tid)
+        crate::kernel::TaskId::from_abi_positive(target)
+            .is_ok_and(|target| self.kernel_graph().task_is_live(target))
     }
 
     pub(crate) fn is_child(&self) -> bool {
-        self.table
-            .process(self.pid)
-            .is_some_and(|process| process.parent().is_some())
+        self.kernel_graph()
+            .task_identity(self.task_id())
+            .is_ok_and(|identity| identity.parent.is_some())
     }
 
     pub(crate) fn trace_lifecycle(
@@ -102,23 +144,22 @@ impl ProcessContext {
         tid: crate::thread::ThreadId,
         detail: i64,
     ) {
-        let Some(process) = self.table.process(self.pid) else {
+        let Ok(identity) = self.kernel_graph().task_identity(self.task_id()) else {
             tracing::warn!(
-                pid = self.pid.raw(),
+                pid = self.pid(),
                 ?phase,
                 "hvpatch lifecycle record disappeared"
             );
             return;
         };
-        let ppid = process.parent().map_or(0, GuestPid::raw);
         let Some(binding) = self.mm_binding() else {
-            tracing::error!(pid = self.pid.raw(), "hvpatch task has no mm backend");
+            tracing::error!(pid = self.pid(), "hvpatch task has no mm backend");
             return;
         };
         let event = carrick_observability::probes::HvpatchGuestLifecycle::new(
             phase,
-            process.pid().raw(),
-            ppid,
+            identity.task_id.raw(),
+            identity.parent.map_or(0, crate::kernel::TaskId::raw),
             tid.raw(),
             u32::from(binding.asid.raw()),
             detail,
@@ -126,12 +167,12 @@ impl ProcessContext {
         match event {
             Ok(event) => crate::probes::hvpatch_guest_lifecycle(event),
             Err(error) => {
-                tracing::error!(pid = self.pid.raw(), %error, "invalid hvpatch lifecycle event")
+                tracing::error!(pid = self.pid(), %error, "invalid hvpatch lifecycle event")
             }
         }
-        if let Some(bank) = process.bank() {
+        if let Some(bank) = self.resources.bank(self.task_id()) {
             let address_space = carrick_observability::probes::HvpatchGuestAddressSpace::new(
-                process.pid().raw(),
+                self.pid(),
                 u32::from(binding.asid.raw()),
                 bank.base(),
                 bank.size(),
@@ -139,11 +180,9 @@ impl ProcessContext {
             );
             match address_space {
                 Ok(event) => crate::probes::hvpatch_guest_address_space(event),
-                Err(error) => tracing::error!(
-                    pid = self.pid.raw(),
-                    %error,
-                    "invalid hvpatch address-space event"
-                ),
+                Err(error) => {
+                    tracing::error!(pid = self.pid(), %error, "invalid hvpatch address-space event")
+                }
             }
         }
     }
@@ -155,74 +194,130 @@ impl ProcessContext {
         far: u64,
         tid: crate::thread::ThreadId,
     ) {
-        let Some(process) = self.table.process(self.pid) else {
-            tracing::warn!(
-                pid = self.pid.raw(),
-                "hvpatch fault process record disappeared"
-            );
-            return;
-        };
         let Some(binding) = self.mm_binding() else {
-            tracing::error!(pid = self.pid.raw(), "hvpatch task has no mm backend");
+            tracing::error!(pid = self.pid(), "hvpatch task has no mm backend");
             return;
         };
         let event = carrick_observability::probes::HvpatchGuestFault::new(
             syndrome,
             elr,
             far,
-            process.pid().raw(),
+            self.pid(),
             tid.raw(),
             u32::from(binding.asid.raw()),
         );
         match event {
             Ok(event) => crate::probes::hvpatch_guest_fault(event),
-            Err(error) => {
-                tracing::error!(pid = self.pid.raw(), %error, "invalid hvpatch fault event")
-            }
+            Err(error) => tracing::error!(pid = self.pid(), %error, "invalid hvpatch fault event"),
         }
     }
 
-    pub(crate) fn fork_child(
+    pub(crate) fn publish_legacy_exec(
         &self,
-    ) -> Result<(Self, process_table::GuestProcess), process_table::ProcessTableError> {
-        let child = self.table.fork_process(self.pid)?;
-        let context = Self::new(std::sync::Arc::clone(&self.table), child.pid())?;
-        Ok((context, child))
-    }
-
-    pub(crate) fn discard_unstarted_child(&self) -> Result<(), process_table::ProcessTableError> {
-        let retired = self.table.exit_process(self.pid)?;
-        self.table.acknowledge_tlb_flush(retired)
+        tid: crate::kernel::LinuxTid,
+        stage1_root: u64,
+    ) -> Result<(), String> {
+        let context = self
+            .context_for_linux_tid(tid)
+            .map_err(|error| error.to_string())?;
+        self.resources
+            .publish_exec(self.task_id(), stage1_root)
+            .map_err(|error| error.to_string())?;
+        self.kernel_graph()
+            .publish_legacy_exec(&context)
+            .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     pub(crate) fn publish_exit_code(
         &self,
         exit_code: i32,
         tid: crate::thread::ThreadId,
-    ) -> Result<(), process_table::ProcessTableError> {
-        crate::event_ring::rec_hvpatch_process_exit_begin(self.pid.raw(), tid.raw(), exit_code);
+    ) -> Result<(), String> {
+        crate::event_ring::rec_hvpatch_process_exit_begin(self.pid(), tid.raw(), exit_code);
         self.trace_lifecycle(
             carrick_observability::probes::HvpatchGuestLifecyclePhase::ProcessExit,
             tid,
             i64::from(exit_code),
         );
-        self.table.publish_exit(self.pid, (exit_code & 0xff) << 8)?;
-        crate::event_ring::rec_hvpatch_process_exit_end(self.pid.raw(), tid.raw(), exit_code);
+        // Publish the Linux zombie and pidfd readiness before irreversible
+        // bank/ASID retirement. A backend failure may leak resources, but it
+        // cannot make an already-retired child disappear from wait semantics.
+        self.kernel_graph()
+            .exit_task(
+                self.task_id(),
+                crate::kernel::LinuxWaitStatus::from_wait_encoding((exit_code & 0xff) << 8),
+                crate::kernel::TaskRusage::default(),
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+        let retired = match self.resources.retire(self.task_id()) {
+            Ok(retired) => retired,
+            Err(error) => {
+                tracing::error!(
+                    pid = self.pid(),
+                    %error,
+                    "authoritative exit published but hvpatch bank retirement failed"
+                );
+                crate::event_ring::rec_hvpatch_process_exit_end(self.pid(), tid.raw(), exit_code);
+                return Ok(());
+            }
+        };
+        if let Err(error) = self.resources.acknowledge_tlb_flush(retired) {
+            tracing::error!(
+                pid = self.pid(),
+                %error,
+                "authoritative exit published but hvpatch TLB retirement acknowledgement failed"
+            );
+        }
+        crate::event_ring::rec_hvpatch_process_exit_end(self.pid(), tid.raw(), exit_code);
         Ok(())
     }
 
-    pub(crate) fn wait_child(&self, target: Option<i32>, nohang: bool, nowait: bool) -> WaitResult {
-        let target = target.and_then(GuestPid::from_raw);
-        self.table.wait_child(self.pid, target, nohang, nowait)
+    pub(crate) fn exit_thread(
+        &self,
+        tid: crate::kernel::LinuxTid,
+    ) -> Result<(), crate::kernel::KernelOperationError> {
+        let context = self
+            .context_for_linux_tid(tid)
+            .map_err(|_| crate::kernel::KernelOperationError::UnknownTask(self.task_id()))?;
+        self.kernel_graph().exit_thread(&context, None).map(|_| ())
+    }
+
+    pub(crate) fn wait_child(
+        &self,
+        target: Option<i32>,
+        _nohang: bool,
+        nowait: bool,
+    ) -> WaitResult {
+        let target = target.and_then(|raw| crate::kernel::TaskId::from_abi_positive(raw).ok());
+        let mode = if nowait {
+            crate::kernel::WaitMode::Observe
+        } else {
+            crate::kernel::WaitMode::Consume
+        };
+        match self.kernel_graph().wait_child(self.task_id(), target, mode) {
+            Ok(crate::kernel::WaitOutcome::Exited(zombie)) => WaitResult::Exited(ChildExit {
+                pid: zombie.key.id,
+                status: zombie.status.raw(),
+            }),
+            Ok(crate::kernel::WaitOutcome::StillRunning) => WaitResult::StillRunning,
+            Ok(crate::kernel::WaitOutcome::NoChild) | Err(_) => WaitResult::NoChild,
+        }
     }
 
     pub(crate) fn process_group(
         &self,
         target: Option<i32>,
     ) -> Result<i32, crate::linux_abi::LinuxErrno> {
-        self.table
-            .process_group(self.pid, target.and_then(GuestPid::from_raw))
-            .map(GuestPid::raw)
+        let target = target
+            .map(crate::kernel::TaskId::from_abi_positive)
+            .transpose()
+            .map_err(|_| crate::linux_abi::LINUX_ESRCH)?
+            .unwrap_or(self.task_id());
+        self.kernel_graph()
+            .task_identity(target)
+            .map(|identity| identity.process_group.raw())
             .map_err(identity_operation_errno)
     }
 
@@ -230,9 +325,14 @@ impl ProcessContext {
         &self,
         target: Option<i32>,
     ) -> Result<i32, crate::linux_abi::LinuxErrno> {
-        self.table
-            .session_id(self.pid, target.and_then(GuestPid::from_raw))
-            .map(GuestPid::raw)
+        let target = target
+            .map(crate::kernel::TaskId::from_abi_positive)
+            .transpose()
+            .map_err(|_| crate::linux_abi::LINUX_ESRCH)?
+            .unwrap_or(self.task_id());
+        self.kernel_graph()
+            .task_identity(target)
+            .map(|identity| identity.session.raw())
             .map_err(identity_operation_errno)
     }
 
@@ -241,29 +341,34 @@ impl ProcessContext {
         target: Option<i32>,
         group: Option<i32>,
     ) -> Result<(), crate::linux_abi::LinuxErrno> {
-        self.table
-            .set_process_group(
-                self.pid,
-                target.and_then(GuestPid::from_raw),
-                group.and_then(GuestPid::from_raw),
-            )
+        let target = target
+            .map(crate::kernel::TaskId::from_abi_positive)
+            .transpose()
+            .map_err(|_| crate::linux_abi::LINUX_ESRCH)?;
+        let group = group
+            .map(crate::kernel::ProcessGroupId::from_abi_positive)
+            .transpose()
+            .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
+        self.kernel_graph()
+            .set_process_group(self.task_id(), target, group)
             .map_err(identity_operation_errno)
     }
 
     pub(crate) fn create_session(&self) -> Result<i32, crate::linux_abi::LinuxErrno> {
-        self.table
-            .create_session(self.pid)
-            .map(GuestPid::raw)
+        self.kernel_graph()
+            .create_session(self.task_id(), None)
+            .map(crate::kernel::SessionId::raw)
             .map_err(identity_operation_errno)
     }
 }
 
 fn identity_operation_errno(
-    error: process_table::ProcessTableError,
+    error: crate::kernel::KernelOperationError,
 ) -> crate::linux_abi::LinuxErrno {
     match error {
-        process_table::ProcessTableError::UnknownProcess(_) => crate::linux_abi::LINUX_ESRCH,
-        process_table::ProcessTableError::IdentityPermission => crate::linux_abi::LINUX_EPERM,
+        crate::kernel::KernelOperationError::UnknownTask(_) => crate::linux_abi::LINUX_ESRCH,
+        crate::kernel::KernelOperationError::IdentityPermission
+        | crate::kernel::KernelOperationError::ChildExeced(_) => crate::linux_abi::LINUX_EPERM,
         _ => crate::linux_abi::LINUX_EINVAL,
     }
 }
@@ -281,13 +386,25 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
     let stage1_root = engine.get_sys_reg(SysReg::Ttbr0).map_err(|error| {
         RuntimeError::Trap(crate::trap::TrapError::Hypervisor(error.to_string()))
     })? & TTBR_ROOT_MASK;
-    let pid = GuestPid::root();
-    let table = std::sync::Arc::new(
-        ProcessTable::new_root(pid, stage1_root)
-            .map_err(|error| RuntimeError::Configuration(error.to_string()))?,
-    );
-    let context = ProcessContext::new(table, pid)
+    let pid = i32::try_from(std::process::id()).map_err(|_| {
+        RuntimeError::Configuration("host PID does not fit Linux task identity".to_owned())
+    })?;
+    let task_id = crate::kernel::TaskId::for_root_bootstrap(pid)
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+    let (table, mm_backend) = BankResources::new_root(task_id, stage1_root)
+        .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+    let table = std::sync::Arc::new(table);
+    let root_tid = crate::thread::ThreadId::from_guest_supplied_tid(pid);
+    let bootstrap = crate::kernel::RootBootstrap::with_mm_backend(
+        pid,
+        root_tid,
+        mm_backend.clone(),
+        "hvpatch-root".to_owned(),
+    )
+    .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+    let (_kernel, root) = crate::kernel::Kernel::bootstrap_root(bootstrap)
+        .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+    let context = ProcessContext::new(table, root.task_binding(), mm_backend);
     let binding = context.mm_binding().ok_or_else(|| {
         RuntimeError::Configuration("hvpatch root mm backend disappeared".to_owned())
     })?;
@@ -298,7 +415,7 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
     );
     context.trace_lifecycle(
         carrick_observability::probes::HvpatchGuestLifecyclePhase::Root,
-        crate::thread::ThreadId::from_guest_supplied_tid(pid.raw()),
+        root_tid,
         0,
     );
     dispatcher.bind_hvpatch_process(context.clone());
@@ -573,6 +690,190 @@ mod tests {
 
     fn text(words: &[u32]) -> Vec<u8> {
         words.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    fn authoritative_root() -> (ProcessContext, crate::kernel::KernelContext) {
+        let pid = 10_000;
+        let task_id = crate::kernel::TaskId::for_root_bootstrap(pid).unwrap();
+        let (table, backend) = BankResources::new_root(task_id, 0x4000).unwrap();
+        let bootstrap = crate::kernel::RootBootstrap::with_mm_backend(
+            pid,
+            crate::thread::ThreadId::synthetic_for_tests(pid),
+            backend.clone(),
+            "adapter-root".to_owned(),
+        )
+        .unwrap();
+        let (_kernel, root) = crate::kernel::Kernel::bootstrap_root(bootstrap).unwrap();
+        (
+            ProcessContext::new(std::sync::Arc::new(table), root.task_binding(), backend),
+            root,
+        )
+    }
+
+    #[test]
+    fn root_kernel_mm_keeps_the_exact_banked_backend() {
+        let (process, root) = authoritative_root();
+        let expected: std::sync::Arc<dyn crate::kernel::MmBackend> = process.mm_backend.clone();
+        let mm = root.shared().mm();
+        let actual = mm.backend().expect("root mm backend");
+
+        assert!(
+            std::sync::Arc::ptr_eq(actual, &expected),
+            "root bootstrap must not replace the live banked backend with a snapshot"
+        );
+        assert_eq!(
+            crate::kernel::MmBackend::binding(actual.as_ref()),
+            process.mm_binding().unwrap()
+        );
+    }
+
+    #[test]
+    fn shared_mm_fork_keeps_kernel_mm_and_vfork_release_authoritative() {
+        let (parent, root) = authoritative_root();
+        let prepared_mm = parent.bank_resources().prepare_child().unwrap();
+        let plan = crate::kernel::ClonePlan::from_flags(
+            carrick_abi::LinuxCloneFlags::VM | carrick_abi::LinuxCloneFlags::VFORK,
+        )
+        .unwrap();
+        let child_tid = crate::thread::ThreadId::synthetic_for_tests(10_001);
+        let published = parent
+            .kernel_graph()
+            .reserve_fork(&root, plan, "shared-mm-child".to_owned(), None)
+            .unwrap()
+            .prepare_shared_mm(child_tid)
+            .unwrap()
+            .commit()
+            .unwrap();
+        let (child_context, wait) = published.into_parts().unwrap();
+        let wait = wait.expect("vfork parent wait");
+        assert!(std::sync::Arc::ptr_eq(
+            &root.shared().mm(),
+            &child_context.shared().mm()
+        ));
+        assert_eq!(wait.released_reason(), None);
+
+        let child_id = child_context.task().key().id;
+        let backend = parent.bank_resources().publish_child(child_id, prepared_mm);
+        let child = parent.published_child_context(&child_context, backend);
+        child.publish_exit_code(0, child_tid).unwrap();
+        assert_eq!(
+            wait.released_reason(),
+            Some(crate::kernel::VforkReleaseReason::Exit)
+        );
+    }
+
+    #[test]
+    fn destructive_exec_releases_the_vfork_parent_gate() {
+        let (parent, root) = authoritative_root();
+        let prepared_mm = parent.bank_resources().prepare_child().unwrap();
+        let stage1_root = prepared_mm.binding().stage1_root.gpa().raw();
+        let child_tid = crate::thread::ThreadId::synthetic_for_tests(10_001);
+        let published = parent
+            .kernel_graph()
+            .reserve_fork(
+                &root,
+                crate::kernel::ClonePlan::from_flags(
+                    carrick_abi::LinuxCloneFlags::VM | carrick_abi::LinuxCloneFlags::VFORK,
+                )
+                .unwrap(),
+                "vfork-exec-child".to_owned(),
+                None,
+            )
+            .unwrap()
+            .prepare_shared_mm(child_tid)
+            .unwrap()
+            .commit()
+            .unwrap();
+        let (child_context, wait) = published.into_parts().unwrap();
+        let wait = wait.expect("vfork parent wait");
+        let child_id = child_context.task().key().id;
+        let backend = parent.bank_resources().publish_child(child_id, prepared_mm);
+        let child = parent.published_child_context(&child_context, backend);
+
+        child
+            .publish_legacy_exec(
+                crate::kernel::LinuxTid::for_task_leader(child_id),
+                stage1_root,
+            )
+            .unwrap();
+        assert_eq!(
+            wait.released_reason(),
+            Some(crate::kernel::VforkReleaseReason::Exec)
+        );
+        child.publish_exit_code(0, child_tid).unwrap();
+    }
+
+    #[test]
+    fn copied_mm_fork_keeps_the_prepared_banked_backend() {
+        let (parent, root) = authoritative_root();
+        let prepared_mm = parent.bank_resources().prepare_child().unwrap();
+        let expected: std::sync::Arc<dyn crate::kernel::MmBackend> = prepared_mm.backend();
+        let child = parent
+            .kernel_graph()
+            .reserve_fork(
+                &root,
+                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
+                    .unwrap(),
+                "copied-mm-child".to_owned(),
+                None,
+            )
+            .unwrap()
+            .prepare_with_mm_backend(
+                prepared_mm.backend(),
+                crate::thread::ThreadId::synthetic_for_tests(10_001),
+            )
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_parts()
+            .unwrap()
+            .0;
+        let mm = child.shared().mm();
+        assert!(std::sync::Arc::ptr_eq(
+            mm.backend().expect("copied child mm backend"),
+            &expected
+        ));
+    }
+
+    #[test]
+    fn process_adapter_publishes_and_retires_through_kernel_authority() {
+        let (parent, root) = authoritative_root();
+        let prepared_mm = parent.bank_resources().prepare_child().unwrap();
+        let child_tid = crate::thread::ThreadId::synthetic_for_tests(10_001);
+        let prepared = parent
+            .kernel_graph()
+            .reserve_fork(
+                &root,
+                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
+                    .unwrap(),
+                "adapter-child".to_owned(),
+                None,
+            )
+            .unwrap()
+            .prepare_with_mm_backend(prepared_mm.backend(), child_tid)
+            .unwrap();
+        let published = prepared.commit().unwrap();
+        let (child_context, wait) = published.into_parts().unwrap();
+        assert!(wait.is_none());
+        let child_id = child_context.task().key().id;
+        let backend = parent.bank_resources().publish_child(child_id, prepared_mm);
+        let child = parent.published_child_context(&child_context, backend);
+
+        assert_eq!(parent.live_process_count(), 2);
+        assert_eq!(child.process_group(None).unwrap(), parent.pid());
+        assert!(matches!(
+            parent.wait_child(Some(child.pid()), true, false),
+            WaitResult::StillRunning
+        ));
+
+        child.publish_exit_code(23, child_tid).unwrap();
+        assert!(parent.bank_resources().bank(child_id).is_none());
+        let WaitResult::Exited(exit) = parent.wait_child(Some(child.pid()), true, false) else {
+            panic!("kernel zombie was not visible through adapter wait");
+        };
+        assert_eq!(exit.pid(), child_id);
+        assert_eq!(exit.status(), 23 << 8);
+        assert_eq!(parent.live_process_count(), 1);
     }
 
     #[test]

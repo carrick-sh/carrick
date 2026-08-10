@@ -25,6 +25,7 @@ fn ptmx_tiocgptn_returns_index_and_tcgets_succeeds() {
     // openat(AT_FDCWD, "/dev/ptmx", O_RDWR=2)
     let fd = match dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 56,
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 2, 0, 0, 0]),
@@ -43,6 +44,7 @@ fn ptmx_tiocgptn_returns_index_and_tcgets_succeeds() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     29,
                     SyscallArgs::from([fd, LINUX_TIOCGPTN, out_ptr, 0, 0, 0])
@@ -66,6 +68,7 @@ fn ptmx_tiocgptn_returns_index_and_tcgets_succeeds() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     29,
                     SyscallArgs::from([fd, LINUX_TIOCSPTLCK, lockarg, 0, 0, 0])
@@ -82,6 +85,7 @@ fn ptmx_tiocgptn_returns_index_and_tcgets_succeeds() {
     let buf_ptr = 0x4200u64;
     let r = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(29, SyscallArgs::from([fd, LINUX_TCGETS, buf_ptr, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -107,6 +111,7 @@ fn closing_ptmx_master_removes_pts_entry() {
     // open /dev/ptmx (O_RDWR=2) -> master fd; allocates pts index 0.
     let master = match dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 56,
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 2, 0, 0, 0]),
@@ -126,6 +131,7 @@ fn closing_ptmx_master_removes_pts_entry() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     29,
                     SyscallArgs::from([master, LINUX_TIOCSPTLCK, lockarg, 0, 0, 0])
@@ -143,6 +149,7 @@ fn closing_ptmx_master_removes_pts_entry() {
         matches!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(
                         56,
                         SyscallArgs::from([(-100_i64) as u64, 0x4040, 2, 0, 0, 0])
@@ -160,6 +167,7 @@ fn closing_ptmx_master_removes_pts_entry() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(57, SyscallArgs::from([master, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -173,6 +181,7 @@ fn closing_ptmx_master_removes_pts_entry() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4040, 2, 0, 0, 0])
@@ -206,6 +215,7 @@ fn tiocswinsz_on_pty_master_succeeds_via_slave() {
     // open /dev/ptmx (O_RDWR=2) -> master fd.
     let master = match dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 56,
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 2, 0, 0, 0]),
@@ -227,6 +237,7 @@ fn tiocswinsz_on_pty_master_succeeds_via_slave() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     29,
                     SyscallArgs::from([master, LINUX_TIOCSPTLCK, 0x4100, 0, 0, 0])
@@ -239,6 +250,7 @@ fn tiocswinsz_on_pty_master_succeeds_via_slave() {
     );
     let _slave = match dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 56,
                 SyscallArgs::from([(-100_i64) as u64, 0x4040, 2, 0, 0, 0]),
@@ -259,6 +271,7 @@ fn tiocswinsz_on_pty_master_succeeds_via_slave() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     29,
                     SyscallArgs::from([master, LINUX_TIOCSWINSZ, ws_ptr, 0, 0, 0])
@@ -276,6 +289,7 @@ fn tiocswinsz_on_pty_master_succeeds_via_slave() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     29,
                     SyscallArgs::from([master, LINUX_TIOCGWINSZ, got_ptr, 0, 0, 0])
@@ -325,6 +339,7 @@ fn pty_master_slave_data_roundtrip() {
     // openat(AT_FDCWD, "/dev/ptmx", O_RDWR=2) → master fd
     let master = match dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 56,
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 2, 0, 0, 0]),
@@ -343,6 +358,7 @@ fn pty_master_slave_data_roundtrip() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     29,
                     SyscallArgs::from([master, LINUX_TIOCSPTLCK, 0x4100, 0, 0, 0])
@@ -358,6 +374,7 @@ fn pty_master_slave_data_roundtrip() {
     // openat(AT_FDCWD, "/dev/pts/0", O_RDWR=2) → slave fd
     let slave = match dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 56,
                 SyscallArgs::from([(-100_i64) as u64, 0x4040, 2, 0, 0, 0]),
@@ -375,6 +392,7 @@ fn pty_master_slave_data_roundtrip() {
     memory.write_bytes(0x4200, b"ping").unwrap();
     let w = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(64, SyscallArgs::from([slave, 0x4200, 4, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -389,6 +407,7 @@ fn pty_master_slave_data_roundtrip() {
     // read(master, buf, 4) — slave output goes to master read buffer
     let r = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(63, SyscallArgs::from([master, 0x4300, 4, 0, 0, 0])),
             &mut memory,
             &reporter,

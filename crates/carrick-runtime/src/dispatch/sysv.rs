@@ -4131,6 +4131,7 @@ mod ipc_set_tests {
             dispatcher.sysv.lock().attachments.insert(addr, shmid);
             let mut memory = FailingUnmapMemory::new(0x1000, 0x1000);
             let _ = dispatcher.dispatch_normalized(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(197, SyscallArgs::from([addr, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &CompatReporter::default(),
@@ -4196,6 +4197,7 @@ mod ipc_set_tests {
 
         let outcome = dispatcher
             .dispatch_normalized(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(197, SyscallArgs::from([addr, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &CompatReporter::default(),
@@ -4233,6 +4235,7 @@ mod ipc_set_tests {
         let mut memory = LinearMemory::new(0x1000, vec![0; 0x1000]);
         let outcome = dispatcher
             .dispatch_normalized(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     196,
                     SyscallArgs::from([shmid as u64, REQUESTED, 0, 0, 0, 0]),
@@ -4265,6 +4268,7 @@ mod ipc_set_tests {
         let mut memory = LinearMemory::new(0x1000, vec![0; 0x1000]);
         let outcome = dispatcher
             .dispatch_normalized(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     196,
                     SyscallArgs::from([shmid as u64, REQUESTED, 0, 0, 0, 0]),
@@ -4384,6 +4388,7 @@ mod ipc_set_tests {
 
         let set = dispatcher
             .dispatch_normalized(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     195,
                     SyscallArgs::from([shmid as u64, LINUX_IPC_SET, buf_addr, 0, 0, 0]),
@@ -4400,6 +4405,7 @@ mod ipc_set_tests {
         let stat_addr = 0x10100u64;
         let stat = dispatcher
             .dispatch_normalized(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     195,
                     SyscallArgs::from([shmid as u64, LINUX_IPC_STAT, stat_addr, 0, 0, 0]),

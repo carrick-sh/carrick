@@ -189,6 +189,23 @@ where
                 );
                 let engine_replace_started = std::time::Instant::now();
                 engine.execve_into(&img)?;
+                if let Some(process) = kernel.hvpatch_process.as_ref() {
+                    const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
+                    let stage1_root =
+                        engine
+                            .get_sys_reg(carrick_hal::SysReg::Ttbr0)
+                            .map_err(|error| {
+                                RuntimeError::Trap(TrapError::Hypervisor(error.to_string()))
+                            })?
+                            & TTBR_ROOT_MASK;
+                    process
+                        .publish_legacy_exec(self.linux_tid, stage1_root)
+                        .map_err(|error| {
+                            RuntimeError::Configuration(format!(
+                                "publish destructive hvpatch exec lifecycle: {error}"
+                            ))
+                        })?;
+                }
                 emit_runtime_stage(
                     carrick_observability::probes::HvpatchExecRuntimeStagePhase::EngineReplace,
                     engine_replace_started,

@@ -31,6 +31,7 @@ fn socket_syscalls_dispatch_to_real_host_handlers() {
     for number in numbers {
         let outcome = dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(*number, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -61,6 +62,7 @@ fn signalfd4_and_tee_return_einval_not_enosys_stub() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(74, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -80,6 +82,7 @@ fn signalfd4_and_tee_return_einval_not_enosys_stub() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(77, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -109,6 +112,7 @@ fn netlink_getsockopt_so_type_reports_guest_type_not_hardcoded_raw() {
     let mut dispatcher = SyscallDispatcher::new();
     let call = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -165,6 +169,7 @@ fn so_reuseport_and_bufsize_report_guest_values_not_host_widening() {
     let mut dispatcher = SyscallDispatcher::new();
     let call = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,

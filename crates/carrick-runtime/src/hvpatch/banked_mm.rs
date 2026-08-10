@@ -56,6 +56,7 @@ impl BankedMmState {
 #[derive(Debug)]
 pub(crate) struct BankedMmLease {
     state: Arc<BankedMmState>,
+    backend: Arc<BankedMmBackend>,
     asid: Asid,
     bank: Option<ProcessBank>,
     retired: AtomicBool,
@@ -63,12 +64,15 @@ pub(crate) struct BankedMmLease {
 
 impl BankedMmLease {
     fn new(asid: Asid, stage1_root: Stage1Root, bank: Option<ProcessBank>) -> Self {
+        let state = Arc::new(BankedMmState::new(MmBinding {
+            asid,
+            stage1_root,
+            ttbr0: Ttbr0::for_aarch64(asid, stage1_root),
+        }));
+        let backend = Arc::new(BankedMmBackend::new(Arc::clone(&state)));
         Self {
-            state: Arc::new(BankedMmState::new(MmBinding {
-                asid,
-                stage1_root,
-                ttbr0: Ttbr0::for_aarch64(asid, stage1_root),
-            })),
+            state,
+            backend,
             asid,
             bank,
             retired: AtomicBool::new(false),
@@ -84,7 +88,7 @@ impl BankedMmLease {
     }
 
     pub(crate) fn backend(&self) -> Arc<BankedMmBackend> {
-        Arc::new(BankedMmBackend::new(Arc::clone(&self.state)))
+        Arc::clone(&self.backend)
     }
 
     pub(crate) fn publish_stage1_root(&self, stage1_root: u64) -> Result<MmBinding, BankedMmError> {
@@ -233,6 +237,10 @@ impl PreparedBankedMm {
         self.lease.bank()
     }
 
+    pub(crate) fn backend(&self) -> Arc<BankedMmBackend> {
+        self.lease.backend()
+    }
+
     pub(crate) fn commit(mut self) -> Arc<BankedMmLease> {
         self.committed = true;
         Arc::clone(&self.lease)
@@ -280,7 +288,7 @@ impl From<AsidError> for BankedMmError {
 }
 
 /// Live K1 observation seam over the existing per-process-bank prototype.
-/// ProcessTable publishes every binding into this stable per-mm state before
+/// BankResources publishes every binding into this stable per-mm state before
 /// lifecycle retirement, so draining objects cannot follow PID reuse or regress
 /// to an older root under concurrent observation.
 #[derive(Debug)]
@@ -304,7 +312,7 @@ impl MmBackend for BankedMmBackend {
     }
 
     fn vma_summaries(&self) -> Result<Vec<VmaSummary>, SnapshotError> {
-        // ProcessTable owns only the bank/root lifecycle record. AddressSpace
+        // BankResources owns only the bank/root lifecycle record. AddressSpace
         // remains the VMA authority until the K2 global-mm cutover.
         Err(SnapshotError::AuthorityUnavailable(SnapshotTable::Vmas))
     }
@@ -318,18 +326,21 @@ impl MmBackend for BankedMmBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::super::process_table::{GuestPid, ProcessTable};
+    use super::super::bank_resources::BankResources;
     use super::*;
+
+    fn root_id() -> crate::kernel::TaskId {
+        crate::kernel::TaskId::for_root_bootstrap(40).unwrap()
+    }
 
     #[test]
     fn observes_live_binding_and_keeps_last_binding_after_retirement() {
-        let pid = GuestPid::root();
-        let table = Arc::new(ProcessTable::new_root(pid, 0x8000).expect("root table"));
-        let backend = table.mm_backend(pid).expect("banked backend");
+        let task_id = root_id();
+        let (table, backend) = BankResources::new_root(task_id, 0x8000).expect("root table");
         let initial = backend.binding();
 
-        table.exec_process(pid, 0xc000).expect("replace root");
-        let retired = table.exit_process(pid).expect("retire");
+        table.publish_exec(task_id, 0xc000).expect("replace root");
+        let retired = table.retire(task_id).expect("retire");
         let replaced = backend.binding();
         assert_eq!(replaced.asid, initial.asid);
         assert_ne!(replaced.stage1_root, initial.stage1_root);
@@ -361,9 +372,7 @@ mod tests {
 
     #[test]
     fn fails_closed_when_snapshot_authority_is_elsewhere() {
-        let pid = GuestPid::root();
-        let table = Arc::new(ProcessTable::new_root(pid, 0x8000).expect("root table"));
-        let backend = table.mm_backend(pid).expect("banked backend");
+        let (_table, backend) = BankResources::new_root(root_id(), 0x8000).expect("root table");
 
         assert_eq!(
             backend.vma_summaries(),

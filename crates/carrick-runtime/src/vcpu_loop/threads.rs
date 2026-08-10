@@ -10,6 +10,11 @@ enum SharedWordWaitRaw {
     ExecReplacedThread,
 }
 
+pub(super) enum CloneThreadSpawn {
+    Started(ThreadId),
+    Errno(crate::linux_abi::LinuxErrno),
+}
+
 fn guest_host_thread_name(process_pid: Option<i32>, tid: ThreadId) -> String {
     process_pid.map_or_else(
         || format!("guest-tid-{tid}"),
@@ -444,43 +449,85 @@ where
         engine: &mut E,
         stack: u64,
         tls: Option<u64>,
+        flags: u64,
         parent_tid_addr: u64,
         child_tid_addr: u64,
         clear_child_tid_addr: u64,
-    ) -> Result<ThreadId, RuntimeError> {
+    ) -> Result<CloneThreadSpawn, RuntimeError> {
         if kernel.process_exiting() {
             return Err(RuntimeError::Trap(TrapError::Hypervisor(
                 "clone raced process exit".to_owned(),
             )));
         }
-        let tid = if let Some(process) = kernel.hvpatch_process.as_ref() {
-            let tid = process.allocate_thread_id().map_err(|error| {
-                RuntimeError::Trap(TrapError::Hypervisor(format!(
-                    "allocate hvpatch thread id: {error}"
-                )))
-            })?;
-            self.registry
-                .register_child_with_tid(tid, clear_child_tid_addr);
-            tid
-        } else {
-            self.registry.register_child(clear_child_tid_addr)
-        };
-        kernel
-            .dispatcher
-            .inherit_thread_signal_mask(self.this_tid, tid);
+        let (linux_tid, tid, prepared_thread) =
+            if let Some(process) = kernel.hvpatch_process.as_ref() {
+                let plan = match crate::kernel::ClonePlan::from_flags(
+                    carrick_abi::LinuxCloneFlags::from_bits_retain(flags),
+                ) {
+                    Ok(plan) => plan,
+                    Err(_) => return Ok(CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EINVAL)),
+                };
+                let parent = process
+                    .context_for_linux_tid(self.linux_tid)
+                    .map_err(|error| {
+                        RuntimeError::Configuration(format!(
+                            "capture authoritative hvpatch thread parent: {error}"
+                        ))
+                    })?;
+                let reservation = process
+                    .kernel_graph()
+                    .reserve_thread_clone(&parent, plan, None)
+                    .map_err(|error| {
+                        RuntimeError::Configuration(format!(
+                            "reserve authoritative hvpatch thread: {error}"
+                        ))
+                    })?;
+                let linux_tid = reservation.tid();
+                let tid = ThreadId::from_guest_supplied_tid(linux_tid.raw());
+                let prepared = reservation.prepare(tid).map_err(|error| {
+                    RuntimeError::Configuration(format!(
+                        "prepare authoritative hvpatch thread: {error}"
+                    ))
+                })?;
+                (linux_tid, tid, Some(prepared))
+            } else {
+                let tid = self.registry.register_child(clear_child_tid_addr);
+                let linux_tid = match kernel.dispatcher.register_one_task_thread(tid) {
+                    Ok(linux_tid) => linux_tid,
+                    Err(error) => {
+                        self.registry.exit(tid);
+                        return Err(RuntimeError::Configuration(format!(
+                            "register one-task adapter thread: {error}"
+                        )));
+                    }
+                };
+                (linux_tid, tid, None)
+            };
         let tid_bytes = tid.raw().to_le_bytes();
-        if parent_tid_addr != 0 {
-            let _ = engine.write_bytes(parent_tid_addr, &tid_bytes);
-        }
-        if child_tid_addr != 0 {
-            let _ = engine.write_bytes(child_tid_addr, &tid_bytes);
+        if (parent_tid_addr != 0 && engine.write_bytes(parent_tid_addr, &tid_bytes).is_err())
+            || (child_tid_addr != 0 && engine.write_bytes(child_tid_addr, &tid_bytes).is_err())
+        {
+            if prepared_thread.is_none() {
+                self.registry.exit(tid);
+                let _ = kernel.dispatcher.exit_one_task_thread(linux_tid);
+            }
+            return Ok(CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EFAULT));
         }
 
-        let spec = engine.build_sibling_spec(carrick_hal::GuestEntryRegs {
+        let spec = match engine.build_sibling_spec(carrick_hal::GuestEntryRegs {
             return_value: 0,
             stack: Some(stack),
             tls,
-        })?;
+        }) {
+            Ok(spec) => spec,
+            Err(error) => {
+                if prepared_thread.is_none() {
+                    self.registry.exit(tid);
+                    let _ = kernel.dispatcher.exit_one_task_thread(linux_tid);
+                }
+                return Err(RuntimeError::Trap(error));
+            }
+        };
         let child_kernel = Arc::clone(kernel);
         let child_registry = Arc::clone(&self.registry);
         let child_futex = Arc::clone(&self.futex);
@@ -497,6 +544,8 @@ where
         let cleanup_kernel = Arc::clone(kernel);
         let max_traps = self.max_traps;
         let trace = self.trace;
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (start_tx, start_rx) = std::sync::mpsc::sync_channel(1);
         let host_thread_name = guest_host_thread_name(
             child_kernel
                 .hvpatch_process
@@ -529,11 +578,8 @@ where
                 // acquire leaves its JoinHandle live past the process-bank
                 // teardown deadline even though it never created a vCPU.
                 let lease = loop {
-                    if child_kernel.process_exiting() || !child_registry.is_live(tid) {
-                        let _cleanup_gate = crate::fork_quiesce::begin_exit_cleanup();
-                        child_registry.exit(tid);
-                        crate::host_signal::forget_thread(tid.raw());
-                        child_kernel.dispatcher.forget_thread_signal_state(tid);
+                    if child_kernel.process_exiting() {
+                        let _ = ready_tx.send(Err("process exited before sibling admission".to_owned()));
                         return;
                     }
                     if let Some(lease) = carrick_hal::vcpu_sched::global().acquire_timeout(
@@ -570,20 +616,17 @@ where
                         .map_or(0, crate::hvpatch::ProcessContext::pid),
                     tid.raw(),
                 );
-                if child_kernel.process_exiting() || !child_registry.is_live(tid) {
-                    // Exit-cleanup gate (see handle_thread_exit): taken BEFORE
-                    // dropping the topology lock so a fork can never land
-                    // mid-cleanup with one of these global mutexes held.
-                    let _cleanup_gate = crate::fork_quiesce::begin_exit_cleanup();
-                    child_registry.exit(tid);
+                if child_kernel.process_exiting() {
                     drop(topo);
-                    child_kicker.unregister(tid);
-                    crate::host_signal::forget_thread(tid.raw());
-                    child_kernel.dispatcher.forget_thread_signal_state(tid);
+                    let _ = ready_tx.send(Err("process exited before sibling materialization".to_owned()));
                     return;
                 }
                 match E::materialize_sibling(spec) {
                     Ok(child_engine) => {
+                        if ready_tx.send(Ok(())).is_err() || start_rx.recv() != Ok(true) {
+                            drop(topo);
+                            return;
+                        }
                         let handle: Box<dyn carrick_hal::VcpuKickDyn> =
                             Box::new(child_engine.kick_handle());
                         child_kicker.register(tid, handle);
@@ -599,6 +642,7 @@ where
                             child_futex,
                             child_platform_futex,
                             child_platform_futex_factory,
+                            linux_tid,
                             tid,
                             child_threads,
                             child_kicker,
@@ -690,23 +734,92 @@ where
                                 cleanup_kicker.unregister(tid);
                                 crate::host_signal::forget_thread(tid.raw());
                                 cleanup_kernel.dispatcher.forget_thread_signal_state(tid);
+                                if cleanup_kernel.hvpatch_process.is_none() {
+                                    let _ = cleanup_kernel
+                                        .dispatcher
+                                        .exit_one_task_thread(linux_tid);
+                                }
                             }
                         }
                     }
-                    Err(e) => {
+                    Err(error) => {
                         drop(topo);
-                        tracing::error!(tid = tid.raw(), error = %e, "thread sibling vCPU failed to start");
-                        child_registry.exit(tid);
+                        let _ = ready_tx.send(Err(error.to_string()));
                     }
                 }
             })
-            .map_err(|e| {
+            .map_err(|error| {
                 RuntimeError::Trap(TrapError::Hypervisor(format!(
-                    "spawn guest thread failed: {e}"
+                    "spawn guest thread failed: {error}"
                 )))
+            });
+        let handle = match handle {
+            Ok(handle) => handle,
+            Err(error) => {
+                if prepared_thread.is_none() {
+                    self.registry.exit(tid);
+                    let _ = kernel.dispatcher.exit_one_task_thread(linux_tid);
+                }
+                return Err(error);
+            }
+        };
+        match ready_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let _ = start_tx.send(false);
+                let _ = handle.join();
+                if prepared_thread.is_none() {
+                    self.registry.exit(tid);
+                    let _ = kernel.dispatcher.exit_one_task_thread(linux_tid);
+                }
+                return Err(RuntimeError::Trap(TrapError::Hypervisor(error)));
+            }
+            Err(error) => {
+                let _ = start_tx.send(false);
+                let _ = handle.join();
+                if prepared_thread.is_none() {
+                    self.registry.exit(tid);
+                    let _ = kernel.dispatcher.exit_one_task_thread(linux_tid);
+                }
+                return Err(RuntimeError::Trap(TrapError::Hypervisor(format!(
+                    "sibling materialization channel failed: {error}"
+                ))));
+            }
+        }
+        if let Some(prepared) = prepared_thread {
+            let published = match prepared.commit() {
+                Ok(published) => published,
+                Err(error) => {
+                    let _ = start_tx.send(false);
+                    let _ = handle.join();
+                    return Err(RuntimeError::Configuration(format!(
+                        "publish authoritative hvpatch thread: {error}"
+                    )));
+                }
+            };
+            published.into_context().map_err(|error| {
+                RuntimeError::Configuration(format!("start authoritative hvpatch thread: {error}"))
             })?;
+            self.registry
+                .register_child_with_tid(tid, clear_child_tid_addr);
+        }
+        kernel
+            .dispatcher
+            .inherit_thread_signal_mask(self.this_tid, tid);
+        if start_tx.send(true).is_err() {
+            self.registry.exit(tid);
+            if let Some(process) = kernel.hvpatch_process.as_ref() {
+                let _ = process.exit_thread(linux_tid);
+            } else {
+                let _ = kernel.dispatcher.exit_one_task_thread(linux_tid);
+            }
+            let _ = handle.join();
+            return Err(RuntimeError::Configuration(
+                "sibling start gate disappeared after publication".to_owned(),
+            ));
+        }
         self.threads.lock().push(handle);
-        Ok(tid)
+        Ok(CloneThreadSpawn::Started(tid))
     }
 
     /// Stop every sibling vCPU belonging to this Linux process before its
@@ -834,6 +947,24 @@ where
             crate::event_ring::rec_futex_wake(addr, woken);
         }
         let last = self.registry.exit(self.this_tid);
+        if !last {
+            if let Some(process) = kernel.hvpatch_process.as_ref() {
+                if let Err(error) = process.exit_thread(self.linux_tid) {
+                    tracing::error!(
+                        pid = process.pid(),
+                        tid = self.this_tid.raw(),
+                        %error,
+                        "retire authoritative hvpatch thread failed"
+                    );
+                }
+            } else if let Err(error) = kernel.dispatcher.exit_one_task_thread(self.linux_tid) {
+                tracing::error!(
+                    tid = self.this_tid.raw(),
+                    %error,
+                    "retire one-task adapter thread failed"
+                );
+            }
+        }
         trace_hvpatch_thread_teardown(kernel, self.this_tid, 2);
         crate::run_state::clear_guest_tid(self.this_tid.raw());
         self.kicker.unregister(self.this_tid);

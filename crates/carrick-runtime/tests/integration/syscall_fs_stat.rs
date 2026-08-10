@@ -32,6 +32,7 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(17, SyscallArgs::from([0x4100, 16, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -46,6 +47,7 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(49, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -58,6 +60,7 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(17, SyscallArgs::from([0x4100, 16, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -71,6 +74,7 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     48,
                     SyscallArgs::from([(-100_i64) as u64, 0x4010, 4, 0, 0, 0]),
@@ -84,6 +88,7 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     48,
                     SyscallArgs::from([(-100_i64) as u64, 0x4010, 2, 0, 0, 0]),
@@ -101,6 +106,7 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4010, 0, 0, 0, 0]),
@@ -114,6 +120,7 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4200, 64, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -129,6 +136,7 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(49, SyscallArgs::from([0x4020, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -140,6 +148,7 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(49, SyscallArgs::from([0x4030, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -151,6 +160,7 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -164,6 +174,7 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(50, SyscallArgs::from([4, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -193,6 +204,7 @@ fn faccessat2_supports_bootstrap_access_flags_and_fd_checks() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     439,
                     SyscallArgs::from([
@@ -213,6 +225,7 @@ fn faccessat2_supports_bootstrap_access_flags_and_fd_checks() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     439,
                     SyscallArgs::from([
@@ -236,6 +249,7 @@ fn faccessat2_supports_bootstrap_access_flags_and_fd_checks() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     439,
                     SyscallArgs::from([
@@ -261,6 +275,7 @@ fn faccessat2_supports_bootstrap_access_flags_and_fd_checks() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -274,6 +289,7 @@ fn faccessat2_supports_bootstrap_access_flags_and_fd_checks() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     439,
                     SyscallArgs::from([3, 0x4060, LINUX_R_OK, LINUX_AT_EMPTY_PATH, 0, 0]),
@@ -287,6 +303,7 @@ fn faccessat2_supports_bootstrap_access_flags_and_fd_checks() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     439,
                     SyscallArgs::from([
@@ -307,6 +324,7 @@ fn faccessat2_supports_bootstrap_access_flags_and_fd_checks() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     439,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 8, 0, 0, 0]),
@@ -322,6 +340,7 @@ fn faccessat2_supports_bootstrap_access_flags_and_fd_checks() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     439,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, LINUX_R_OK, 0x80, 0, 0]),
@@ -352,6 +371,7 @@ fn statfs_writes_packed_linux_statfs_for_rootfs_path() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(43, SyscallArgs::from([0x4000, 0x4100, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -384,6 +404,7 @@ fn fstatfs_writes_packed_linux_statfs_for_open_fd() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -397,6 +418,7 @@ fn fstatfs_writes_packed_linux_statfs_for_open_fd() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(44, SyscallArgs::from([3, 0x4100, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -427,6 +449,7 @@ fn newfstatat_and_fstat_write_typed_linux_stat() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     79,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4100, 0, 0, 0]),
@@ -447,6 +470,7 @@ fn newfstatat_and_fstat_write_typed_linux_stat() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -460,6 +484,7 @@ fn newfstatat_and_fstat_write_typed_linux_stat() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(80, SyscallArgs::from([3, 0x4200, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -477,6 +502,7 @@ fn newfstatat_and_fstat_write_typed_linux_stat() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     79,
                     SyscallArgs::from([(-100_i64) as u64, 0x4300, 0x4400, 0, 0, 0]),
@@ -509,6 +535,7 @@ fn statx_writes_basic_rootfs_fd_and_symlink_metadata() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     291,
                     SyscallArgs::from([
@@ -548,6 +575,7 @@ fn statx_writes_basic_rootfs_fd_and_symlink_metadata() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -561,6 +589,7 @@ fn statx_writes_basic_rootfs_fd_and_symlink_metadata() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     291,
                     SyscallArgs::from([
@@ -587,6 +616,7 @@ fn statx_writes_basic_rootfs_fd_and_symlink_metadata() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     291,
                     SyscallArgs::from([
@@ -613,6 +643,7 @@ fn statx_writes_basic_rootfs_fd_and_symlink_metadata() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     291,
                     SyscallArgs::from([
@@ -635,6 +666,7 @@ fn statx_writes_basic_rootfs_fd_and_symlink_metadata() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     291,
                     SyscallArgs::from([
@@ -657,6 +689,7 @@ fn statx_writes_basic_rootfs_fd_and_symlink_metadata() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     291,
                     SyscallArgs::from([
@@ -705,6 +738,7 @@ fn host_stat_following_symlink_reports_target_inode() {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(
                         79,
                         SyscallArgs::from([(-100_i64) as u64, path_addr, stat_addr, flags, 0, 0,]),
@@ -732,6 +766,7 @@ fn host_stat_following_symlink_reports_target_inode() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(49, SyscallArgs::from([0x4020, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -755,6 +790,7 @@ fn assert_fstat_and_statx_empty_path_agree(
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(80, SyscallArgs::from([fd as u64, stat_addr, 0, 0, 0, 0])),
                 memory,
                 reporter,
@@ -765,6 +801,7 @@ fn assert_fstat_and_statx_empty_path_agree(
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     291,
                     SyscallArgs::from([
@@ -814,6 +851,7 @@ fn fstat_and_statx_empty_path_agree_for_anonymous_fd_kinds() {
 
     let eventfd = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(19, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -825,6 +863,7 @@ fn fstat_and_statx_empty_path_agree_for_anonymous_fd_kinds() {
 
     let timerfd = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(85, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -836,6 +875,7 @@ fn fstat_and_statx_empty_path_agree_for_anonymous_fd_kinds() {
 
     let epoll = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -849,6 +889,7 @@ fn fstat_and_statx_empty_path_agree_for_anonymous_fd_kinds() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(59, SyscallArgs::from([pipe_addr, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -860,6 +901,7 @@ fn fstat_and_statx_empty_path_agree_for_anonymous_fd_kinds() {
 
     let socket = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 198,
                 SyscallArgs::from([
@@ -926,6 +968,7 @@ fn fstat_pty_reports_char_device() {
     // openat(AT_FDCWD, "/dev/ptmx", O_RDWR=2) → master fd.
     let master = match dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 56,
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 2, 0, 0, 0]),
@@ -944,6 +987,7 @@ fn fstat_pty_reports_char_device() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(80, SyscallArgs::from([master, statbuf, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -980,6 +1024,7 @@ fn faccessat2_dotdot_after_missing_intermediate_returns_enoent() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     439,
                     SyscallArgs::from([
@@ -1016,6 +1061,7 @@ fn x86_stat_writes_x8664_stat_layout() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     CARRICK_PRIVATE_X86_STAT,
                     SyscallArgs::from([0x4000, 0x4100, 0, 0, 0, 0]),
@@ -1036,6 +1082,7 @@ fn x86_stat_writes_x8664_stat_layout() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     CARRICK_PRIVATE_X86_LSTAT,
                     SyscallArgs::from([0x4000, 0x4180, 0, 0, 0, 0]),
@@ -1053,6 +1100,7 @@ fn x86_stat_writes_x8664_stat_layout() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     CARRICK_PRIVATE_X86_NEWFSTATAT,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x41c0, 0, 0, 0]),
@@ -1070,6 +1118,7 @@ fn x86_stat_writes_x8664_stat_layout() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -1083,6 +1132,7 @@ fn x86_stat_writes_x8664_stat_layout() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     CARRICK_PRIVATE_X86_FSTAT,
                     SyscallArgs::from([3, 0x4200, 0, 0, 0, 0]),

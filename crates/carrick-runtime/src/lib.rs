@@ -1195,11 +1195,14 @@ pub mod runtime {
     ) -> Result<DispatchOutcome, RuntimeError> {
         use crate::io_wait::{WaitFd, WaitResult};
         const EINTR: crate::linux_abi::LinuxErrno = crate::linux_abi::LINUX_EINTR;
+        let kernel_context = dispatcher.capture_one_task_context().map_err(|error| {
+            RuntimeError::Configuration(format!("capture one-task kernel context: {error}"))
+        })?;
         let mut poll_deadline: Option<std::time::Instant> = None;
         let mut sleep_deadline: Option<std::time::Instant> = None;
         loop {
             // `dispatch` returns `DispatchError`, absorbed via `#[from]`.
-            let outcome = dispatcher.dispatch(request, memory, reporter)?;
+            let outcome = dispatcher.dispatch(&kernel_context, request, memory, reporter)?;
             match outcome {
                 DispatchOutcome::WaitOnFds {
                     fds,

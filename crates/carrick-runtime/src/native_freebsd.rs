@@ -3264,6 +3264,7 @@ mod executable_epoch_tests {
         let mut memory = NativeIdentityMemory::uncoordinated();
         let outcome = dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     222,
                     [
@@ -10615,6 +10616,9 @@ fn service_syscall(
         Err(NativeSyscallServiceError::Dispatch(error)) => {
             return Step::Fault(format!("dispatch error: {error:?}"));
         }
+        Err(NativeSyscallServiceError::Kernel(error)) => {
+            return Step::Fault(format!("capture mandatory kernel context: {error}"));
+        }
         Err(NativeSyscallServiceError::Memory(error)) => {
             return Step::Fault(format!("native identity mapping error: {error}"));
         }
@@ -11141,6 +11145,7 @@ fn wait_x86_futex(
 #[derive(Debug)]
 enum NativeSyscallServiceError {
     Dispatch(crate::dispatch::DispatchError),
+    Kernel(crate::kernel::KernelError),
     Memory(MemoryError),
     Epoch(ExecutableEpochError),
     AliasInvariant {
@@ -11290,6 +11295,9 @@ fn service_syscall_threaded(
     let mut poll_deadline: Option<std::time::Instant> = None;
     let mut sleep_deadline: Option<std::time::Instant> = None;
     let alias_syscall = is_alias_mapping_syscall(request.number);
+    let kernel_context = dispatcher
+        .capture_one_task_context()
+        .map_err(NativeSyscallServiceError::Kernel)?;
     loop {
         begin_threaded_dispatch_iteration(
             executable_epoch,
@@ -11298,7 +11306,15 @@ fn service_syscall_threaded(
             alias_critical,
         )?;
         drain_native_child_exit_watches(false);
-        let outcome = dispatcher.dispatch_threaded(request, memory, reporter, tid, registry, futex);
+        let outcome = dispatcher.dispatch_threaded(
+            &kernel_context,
+            request,
+            memory,
+            reporter,
+            tid,
+            registry,
+            futex,
+        );
         if let Some(error) = memory.take_mapping_failure() {
             // A successful dispatch can already own a deferred transaction.
             // Roll it back before releasing the lease that excludes host fork.
@@ -14032,6 +14048,7 @@ mod tests {
     ) -> FixedAliasDispatchOutcome {
         let outcome = dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     222,
                     [
@@ -14315,6 +14332,7 @@ mod tests {
 
         let shrink = dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(216, [address, len, PAGE, 0, 0, 0].into()),
                 &mut memory,
                 &CompatReporter::default(),

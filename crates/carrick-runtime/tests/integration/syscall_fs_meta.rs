@@ -30,6 +30,7 @@ fn readlinkat_reads_rootfs_symlink_target_without_nul() {
 
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 78,
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4100, 64, 0, 0]),
@@ -68,6 +69,7 @@ fn readlinkat_reports_synthetic_proc_self_exe() {
 
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 78,
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4100, 64, 0, 0]),
@@ -98,6 +100,7 @@ fn proc_self_magic_links_readlink_and_lstat() {
     memory.write_bytes(0x4000, b"/proc/self/cwd\0").unwrap();
     let out = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 78,
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4100, 64, 0, 0]),
@@ -114,6 +117,7 @@ fn proc_self_magic_links_readlink_and_lstat() {
     memory.write_bytes(0x4000, b"/proc/self\0").unwrap();
     let out = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 78,
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4200, 64, 0, 0]),
@@ -135,6 +139,7 @@ fn proc_self_magic_links_readlink_and_lstat() {
     memory.write_bytes(0x4000, b"/proc/self/exe\0").unwrap();
     let out = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 79,
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4300, 0x100, 0, 0]),
@@ -167,6 +172,7 @@ fn proc_self_fd_readlink_synthesizes_anon_inode_target() {
     // eventfd2(0, 0) = syscall 19.
     let DispatchOutcome::Returned { value: fd } = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(19, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -180,6 +186,7 @@ fn proc_self_fd_readlink_synthesizes_anon_inode_target() {
     memory.write_bytes(0x4000, path.as_bytes()).unwrap();
     let out = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 78,
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4100, 64, 0, 0]),
@@ -210,6 +217,7 @@ fn dev_fd_opens_descriptor_like_proc_self_fd() {
     // eventfd2(0,0) → a non-stdio fd with no backing path (the process-sub case).
     let DispatchOutcome::Returned { value: efd } = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(19, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -224,6 +232,7 @@ fn dev_fd_opens_descriptor_like_proc_self_fd() {
     // openat(AT_FDCWD, "/dev/fd/{efd}", O_RDONLY)
     let out = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 56,
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -251,6 +260,7 @@ fn proc_self_fd_directory_lists_open_fds() {
     // eventfd2(0, 0) = syscall 19 → a non-stdio fd that must appear in the list.
     let DispatchOutcome::Returned { value: efd } = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(19, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -263,6 +273,7 @@ fn proc_self_fd_directory_lists_open_fds() {
     // openat(AT_FDCWD, "/proc/self/fd", O_RDONLY) — a directory open.
     let open = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 56,
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -278,6 +289,7 @@ fn proc_self_fd_directory_lists_open_fds() {
     // getdents64(dirfd, buf, count) = syscall 61.
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 61,
                 SyscallArgs::from([dirfd as u64, 0x4400, 0x1000, 0, 0, 0]),
@@ -332,6 +344,7 @@ fn proc_self_auxv_refreshes_when_image_state_is_updated() {
         memory.write_bytes(0x4000, b"/proc/self/auxv\0").unwrap();
         let DispatchOutcome::Returned { value: fd } = dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -345,6 +358,7 @@ fn proc_self_auxv_refreshes_when_image_state_is_updated() {
         };
         let DispatchOutcome::Returned { value: n } = dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x4400, 0x400, 0, 0, 0])),
                 memory,
                 &reporter,
@@ -380,6 +394,7 @@ fn proc_self_fdinfo_renders_pos_flags_ino() {
 
     let DispatchOutcome::Returned { value: efd } = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(19, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -393,6 +408,7 @@ fn proc_self_fdinfo_renders_pos_flags_ino() {
     memory.write_bytes(0x4000, path.as_bytes()).unwrap();
     let open = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 56,
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -406,6 +422,7 @@ fn proc_self_fdinfo_renders_pos_flags_ino() {
     };
     let read = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x4400, 0x400, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -428,6 +445,7 @@ fn proc_self_fdinfo_renders_pos_flags_ino() {
         .unwrap();
     let missing = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 56,
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -455,6 +473,7 @@ fn openat_reads_synthetic_proc_maps_and_cpuinfo() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -467,6 +486,7 @@ fn openat_reads_synthetic_proc_maps_and_cpuinfo() {
     );
     let maps_read = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(63, SyscallArgs::from([3, 0x4100, 0x400, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -484,6 +504,7 @@ fn openat_reads_synthetic_proc_maps_and_cpuinfo() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4040, 0, 0, 0, 0]),
@@ -496,6 +517,7 @@ fn openat_reads_synthetic_proc_maps_and_cpuinfo() {
     );
     let cpuinfo_read = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(63, SyscallArgs::from([4, 0x4500, 0x200, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -561,6 +583,7 @@ fn synthetic_proc_surface_serves_common_process_and_system_files() {
         memory.write_bytes(path_address, &path_bytes).unwrap();
         let open = dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, path_address, 0, 0, 0, 0]),
@@ -576,6 +599,7 @@ fn synthetic_proc_surface_serves_common_process_and_system_files() {
         );
         let read = dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     63,
                     SyscallArgs::from([next_fd as u64, read_buffer, read_len_max, 0, 0, 0]),
@@ -621,6 +645,7 @@ fn synthetic_proc_files_write_regular_packed_stat_records() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     79,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4100, 0, 0, 0]),
@@ -641,6 +666,7 @@ fn synthetic_proc_files_write_regular_packed_stat_records() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -654,6 +680,7 @@ fn synthetic_proc_files_write_regular_packed_stat_records() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(80, SyscallArgs::from([3, 0x4200, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -686,6 +713,7 @@ fn proc_self_oom_score_adj_is_writable() {
     // openat(AT_FDCWD, path, O_WRONLY) — must NOT EACCES.
     let open = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 56,
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 1, 0, 0, 0]),
@@ -700,6 +728,7 @@ fn proc_self_oom_score_adj_is_writable() {
     // write(fd, "-1000\n", 6) — accepted, returns the byte count.
     let write = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(64, SyscallArgs::from([fd as u64, 0x4200, 6, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -719,6 +748,7 @@ fn missing_proc_file_records_compat_report_entry() {
 
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 56,
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -814,6 +844,7 @@ fn synthetic_sys_surface_serves_common_cpu_and_mm_files() {
         memory.write_bytes(path_address, &path_bytes).unwrap();
         let open = dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, path_address, 0, 0, 0, 0]),
@@ -829,6 +860,7 @@ fn synthetic_sys_surface_serves_common_cpu_and_mm_files() {
         );
         let read = dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     63,
                     SyscallArgs::from([next_fd as u64, read_buffer, read_len_max, 0, 0, 0]),
@@ -865,6 +897,7 @@ fn missing_sys_file_records_compat_report_entry() {
 
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 56,
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -907,6 +940,7 @@ fn fchown_and_fchownat_succeed_on_writable_overlay_and_validate_args() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(55, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -920,6 +954,7 @@ fn fchown_and_fchownat_succeed_on_writable_overlay_and_validate_args() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(55, SyscallArgs::from([99, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -933,6 +968,7 @@ fn fchown_and_fchownat_succeed_on_writable_overlay_and_validate_args() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     54,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -947,6 +983,7 @@ fn fchown_and_fchownat_succeed_on_writable_overlay_and_validate_args() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     54,
                     SyscallArgs::from([(-100_i64) as u64, 0x4020, 0, 0, 0, 0]),
@@ -962,6 +999,7 @@ fn fchown_and_fchownat_succeed_on_writable_overlay_and_validate_args() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     54,
                     SyscallArgs::from([(-100_i64) as u64, 0x4040, 0, 0, 0, 0]),
@@ -978,6 +1016,7 @@ fn fchown_and_fchownat_succeed_on_writable_overlay_and_validate_args() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -991,6 +1030,7 @@ fn fchown_and_fchownat_succeed_on_writable_overlay_and_validate_args() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(54, SyscallArgs::from([3, 0x4040, 0, 0, AT_EMPTY_PATH, 0]),),
                 &mut memory,
                 &reporter,
@@ -1002,6 +1042,7 @@ fn fchown_and_fchownat_succeed_on_writable_overlay_and_validate_args() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     54,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0xdead, 0]),
@@ -1035,6 +1076,7 @@ fn fchmod_and_fchmodat_succeed_on_writable_overlay_and_validate_args() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(52, SyscallArgs::from([1, 0o644, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1047,6 +1089,7 @@ fn fchmod_and_fchmodat_succeed_on_writable_overlay_and_validate_args() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(52, SyscallArgs::from([99, 0o644, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1060,6 +1103,7 @@ fn fchmod_and_fchmodat_succeed_on_writable_overlay_and_validate_args() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     53,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0o644, 0, 0, 0]),
@@ -1075,6 +1119,7 @@ fn fchmod_and_fchmodat_succeed_on_writable_overlay_and_validate_args() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     53,
                     SyscallArgs::from([(-100_i64) as u64, 0x4020, 0o644, 0, 0, 0]),
@@ -1090,6 +1135,7 @@ fn fchmod_and_fchmodat_succeed_on_writable_overlay_and_validate_args() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     53,
                     SyscallArgs::from([(-100_i64) as u64, 0x4040, 0o644, 0, 0, 0]),
@@ -1111,6 +1157,7 @@ fn fchmod_and_fchmodat_succeed_on_writable_overlay_and_validate_args() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     53,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0o644, 0x100, 0, 0]),
@@ -1125,6 +1172,7 @@ fn fchmod_and_fchmodat_succeed_on_writable_overlay_and_validate_args() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     452,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0o600, 0x100, 0, 0]),
@@ -1161,6 +1209,7 @@ fn chmod_and_fchmod_under_bind_mount_update_host_mode() {
     );
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -1244,6 +1293,7 @@ fn utimensat_under_bind_mount_updates_host_times() {
     );
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -1303,6 +1353,7 @@ fn non_root_chown_under_bind_mount_to_root_returns_eperm() {
     );
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -1350,6 +1401,7 @@ fn root_chown_under_bind_mount_records_guest_owner_without_host_chown() {
     );
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -1436,6 +1488,7 @@ fn fchownat_at_empty_path_records_owner_like_fchown() {
     );
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -1516,6 +1569,7 @@ fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     88,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, valid_pair, 0, 0, 0]),
@@ -1532,6 +1586,7 @@ fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     88,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, now_pair, 0, 0, 0]),
@@ -1546,6 +1601,7 @@ fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     88,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -1560,6 +1616,7 @@ fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     88,
                     SyscallArgs::from([(-100_i64) as u64, 0x4020, 0, 0, 0, 0]),
@@ -1575,6 +1632,7 @@ fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     88,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, valid_pair, 0xdead, 0, 0]),
@@ -1590,6 +1648,7 @@ fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     88,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, omit_pair, 0, 0, 0]),
@@ -1605,6 +1664,7 @@ fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(88, SyscallArgs::from([(-100_i64) as u64, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1618,6 +1678,7 @@ fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -1631,6 +1692,7 @@ fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(88, SyscallArgs::from([3, 0, valid_pair, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1643,6 +1705,7 @@ fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(88, SyscallArgs::from([99, 0, valid_pair, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1674,6 +1737,7 @@ fn truncate_bootstrap_returns_erofs_for_known_paths_and_enoent_for_missing() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(45, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1686,6 +1750,7 @@ fn truncate_bootstrap_returns_erofs_for_known_paths_and_enoent_for_missing() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(45, SyscallArgs::from([0x4020, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1698,6 +1763,7 @@ fn truncate_bootstrap_returns_erofs_for_known_paths_and_enoent_for_missing() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(45, SyscallArgs::from([0x4040, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1710,6 +1776,7 @@ fn truncate_bootstrap_returns_erofs_for_known_paths_and_enoent_for_missing() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(45, SyscallArgs::from([0x4060, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1722,6 +1789,7 @@ fn truncate_bootstrap_returns_erofs_for_known_paths_and_enoent_for_missing() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(45, SyscallArgs::from([0x4000, (-1_i64) as u64, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1761,6 +1829,7 @@ fn xattr_family_dispatches_per_target_on_in_memory_backend() {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(
                         number,
                         SyscallArgs::from([0x4000, 0x4020, 0x4040, 4, 0, 0]),
@@ -1784,6 +1853,7 @@ fn xattr_family_dispatches_per_target_on_in_memory_backend() {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(
                         number,
                         SyscallArgs::from([0x4000, 0x4020, 0x4040, 4, 0, 0]),
@@ -1817,6 +1887,7 @@ fn fallocate_grows_open_files_on_writable_overlay_and_validates_arguments() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(47, SyscallArgs::from([1, 0, 0, 4096, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1829,6 +1900,7 @@ fn fallocate_grows_open_files_on_writable_overlay_and_validates_arguments() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(47, SyscallArgs::from([999, 0, 0, 4096, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1841,6 +1913,7 @@ fn fallocate_grows_open_files_on_writable_overlay_and_validates_arguments() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(47, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1853,6 +1926,7 @@ fn fallocate_grows_open_files_on_writable_overlay_and_validates_arguments() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(47, SyscallArgs::from([1, 0xdead, 0, 4096, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1865,6 +1939,7 @@ fn fallocate_grows_open_files_on_writable_overlay_and_validates_arguments() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(47, SyscallArgs::from([1, 0, (-1_i64) as u64, 4096, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1878,6 +1953,7 @@ fn fallocate_grows_open_files_on_writable_overlay_and_validates_arguments() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, LINUX_O_RDWR, 0, 0, 0]),
@@ -1891,6 +1967,7 @@ fn fallocate_grows_open_files_on_writable_overlay_and_validates_arguments() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(47, SyscallArgs::from([3, 0, 0, 4096, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1920,6 +1997,7 @@ fn ftruncate_bootstrap_rejects_streams_and_read_only_rootfs_fds() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(46, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1932,6 +2010,7 @@ fn ftruncate_bootstrap_rejects_streams_and_read_only_rootfs_fds() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(46, SyscallArgs::from([2, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1944,6 +2023,7 @@ fn ftruncate_bootstrap_rejects_streams_and_read_only_rootfs_fds() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(46, SyscallArgs::from([99, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1956,6 +2036,7 @@ fn ftruncate_bootstrap_rejects_streams_and_read_only_rootfs_fds() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(46, SyscallArgs::from([1, (-1_i64) as u64, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1969,6 +2050,7 @@ fn ftruncate_bootstrap_rejects_streams_and_read_only_rootfs_fds() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -1982,6 +2064,7 @@ fn ftruncate_bootstrap_rejects_streams_and_read_only_rootfs_fds() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(46, SyscallArgs::from([3, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -2005,6 +2088,7 @@ fn ftruncate_rejects_unbounded_in_memory_file_growth() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([
@@ -2026,6 +2110,7 @@ fn ftruncate_rejects_unbounded_in_memory_file_growth() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     46,
                     SyscallArgs::from([3, MAX_IN_MEMORY_FILE_SIZE + 1, 0, 0, 0, 0]),
@@ -2071,6 +2156,7 @@ fn guest_can_override_synthetic_etc_services_via_unlink_then_recreate() {
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,

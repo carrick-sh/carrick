@@ -3010,7 +3010,9 @@ mod tests {
         let d = SyscallDispatcher::new();
         let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
         let reporter = crate::compat::CompatReporter::default();
+        let kernel = d.capture_one_task_context().unwrap();
         let cx = crate::dispatch::SyscallCtx {
+            kernel: &kernel,
             request: crate::dispatch::SyscallRequest::new(
                 138,
                 crate::dispatch::SyscallArgs::from([0, 0, 0, 0, 0, 0]),
@@ -3089,7 +3091,9 @@ mod tests {
         let reporter = crate::compat::CompatReporter::default();
         let siginfo = LinuxSiginfo::rt_queue(usr1, me, 0, 0x5eed_cafe);
         memory.write_bytes(0x400, siginfo.as_bytes()).unwrap();
+        let kernel = d.capture_one_task_context().unwrap();
         let cx = crate::dispatch::SyscallCtx {
+            kernel: &kernel,
             request: crate::dispatch::SyscallRequest::new(
                 138,
                 crate::dispatch::SyscallArgs::from([child_pid as u64, usr1 as u64, 0x400, 0, 0, 0]),
@@ -3170,7 +3174,9 @@ mod tests {
         let reporter = crate::compat::CompatReporter::default();
         let siginfo = LinuxSiginfo::rt_queue(usr1, me, 1000, 0x5eed_cafe);
         memory.write_bytes(0x400, siginfo.as_bytes()).unwrap();
+        let kernel = d.capture_one_task_context().unwrap();
         let cx = crate::dispatch::SyscallCtx {
+            kernel: &kernel,
             request: crate::dispatch::SyscallRequest::new(
                 138,
                 crate::dispatch::SyscallArgs::from([child_pid as u64, usr1 as u64, 0x400, 0, 0, 0]),
@@ -3230,7 +3236,9 @@ mod tests {
         d.set_credentials(1000, 1000);
         let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
         let reporter = crate::compat::CompatReporter::default();
+        let kernel = d.capture_one_task_context().unwrap();
         let cx = crate::dispatch::SyscallCtx {
+            kernel: &kernel,
             request: crate::dispatch::SyscallRequest::new(
                 138,
                 crate::dispatch::SyscallArgs::from([child_pid as u64, 0, 0, 0, 0, 0]),
@@ -3872,7 +3880,9 @@ mod tests {
         let futex = crate::thread::FutexTable::new();
         let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
         let reporter = crate::compat::CompatReporter::default();
+        let kernel = d.capture_one_task_context().unwrap();
         let cx = crate::dispatch::SyscallCtx {
+            kernel: &kernel,
             request: crate::dispatch::SyscallRequest::new(
                 130,
                 crate::dispatch::SyscallArgs::from([target.raw() as u64, 34, 0, 0, 0, 0]),
@@ -3923,7 +3933,9 @@ mod tests {
         let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
         let reporter = crate::compat::CompatReporter::default();
         let guest_main_tid = i64::from(std::process::id());
+        let kernel = d.capture_one_task_context().unwrap();
         let cx = crate::dispatch::SyscallCtx {
+            kernel: &kernel,
             request: crate::dispatch::SyscallRequest::new(
                 130,
                 crate::dispatch::SyscallArgs::from([guest_main_tid as u64, 34, 0, 0, 0, 0]),
@@ -3966,7 +3978,9 @@ mod tests {
         let guest_main_tid = i64::from(std::process::id());
         let siginfo = LinuxSiginfo::rt_queue(34, 1234, 0, 0x00ca_fe42);
         memory.write_bytes(0x400, siginfo.as_bytes()).unwrap();
+        let kernel = d.capture_one_task_context().unwrap();
         let cx = crate::dispatch::SyscallCtx {
+            kernel: &kernel,
             request: crate::dispatch::SyscallRequest::new(
                 129,
                 crate::dispatch::SyscallArgs::from([guest_main_tid as u64, 34, 0x400, 0, 0, 0]),
@@ -4224,6 +4238,7 @@ mod tests {
         let started = Instant::now();
         let outcome = d
             .dispatch_threaded(
+                &d.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     133,
                     SyscallArgs::from([MASK_PTR, LINUX_RT_SIGSET_SIZE, 0, 0, 0, 0]),
