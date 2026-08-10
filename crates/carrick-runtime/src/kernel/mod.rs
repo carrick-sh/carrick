@@ -38,9 +38,10 @@ pub use objects::{
     ThreadSignalState, Zombie,
 };
 pub use operations::{
-    ForkReservation, KernelFailpoint, KernelOperationError, PreparedFork, PreparedTaskExit,
-    PreparedThreadClone, PublishedFork, ReservedPidfdSubscription, TaskIdentity,
-    TaskOperationReservation, ThreadCloneReservation, WaitMode, WaitOutcome,
+    ChildStartOutcome, ChildStartWait, ForkReservation, KernelFailpoint, KernelOperationError,
+    PreparedFork, PreparedTaskExit, PreparedThreadClone, PublishedFork, ReservedPidfdSubscription,
+    StartedFork, TaskIdentity, TaskOperationReservation, ThreadCloneReservation, WaitMode,
+    WaitOutcome,
 };
 pub use registry::{
     IdError, IdRegistry, IdRegistryCounts, ProcessGroupClaim, SessionClaim, TaskClaim,

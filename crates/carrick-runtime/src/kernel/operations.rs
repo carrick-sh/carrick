@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use carrick_hal::{KernelTransactionId, ThreadId};
+use parking_lot::{Condvar, Mutex};
 
 use super::address::MmBackend;
 use super::clone_plan::{
@@ -77,13 +78,97 @@ impl std::fmt::Debug for ReservedExitSubscriber {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChildStartOutcome {
+    Started,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChildStartState {
+    Waiting,
+    Started,
+    Cancelled,
+}
+
 #[derive(Debug)]
-pub struct PublishedFork {
+struct ChildStartShared {
+    state: Mutex<ChildStartState>,
+    changed: Condvar,
+}
+
+/// Child-thread-owned permission to wait until fork publication completes.
+/// This handle is deliberately non-cloneable: exactly one materialized child
+/// consumes the start decision.
+#[derive(Debug)]
+pub struct ChildStartWait {
+    shared: Arc<ChildStartShared>,
+}
+
+impl ChildStartWait {
+    fn pair() -> (Self, ChildStartRelease) {
+        let shared = Arc::new(ChildStartShared {
+            state: Mutex::new(ChildStartState::Waiting),
+            changed: Condvar::new(),
+        });
+        (
+            Self {
+                shared: Arc::clone(&shared),
+            },
+            ChildStartRelease {
+                shared,
+                active: true,
+            },
+        )
+    }
+
+    pub fn wait(self) -> ChildStartOutcome {
+        let mut state = self.shared.state.lock();
+        loop {
+            match *state {
+                ChildStartState::Started => return ChildStartOutcome::Started,
+                ChildStartState::Cancelled => return ChildStartOutcome::Cancelled,
+                ChildStartState::Waiting => self.shared.changed.wait(&mut state),
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ChildStartRelease {
+    shared: Arc<ChildStartShared>,
+    active: bool,
+}
+
+impl ChildStartRelease {
+    fn start(&mut self) {
+        if !self.active {
+            return;
+        }
+        *self.shared.state.lock() = ChildStartState::Started;
+        self.active = false;
+        self.shared.changed.notify_all();
+    }
+}
+
+impl Drop for ChildStartRelease {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        *self.shared.state.lock() = ChildStartState::Cancelled;
+        self.active = false;
+        self.shared.changed.notify_all();
+    }
+}
+
+#[derive(Debug)]
+pub struct StartedFork {
     context: KernelContext,
     vfork_parent_wait: Option<VforkParentWait>,
 }
 
-impl PublishedFork {
+impl StartedFork {
     pub fn context(&self) -> &KernelContext {
         &self.context
     }
@@ -94,6 +179,47 @@ impl PublishedFork {
 
     pub fn into_parts(self) -> (KernelContext, Option<VforkParentWait>) {
         (self.context, self.vfork_parent_wait)
+    }
+}
+
+/// Registry-published child whose execution gate is still closed.
+///
+/// Dropping this token opens the gate as a fail-safe: after publication there
+/// is no rollback to an undiscoverable child, so cancellation would leak a live
+/// task and could strand a vfork parent. The vfork wait handle is intentionally
+/// unavailable until `start_child` returns `StartedFork`.
+#[derive(Debug)]
+#[must_use = "a published child must be started or explicitly retired"]
+pub struct PublishedFork {
+    started: Option<StartedFork>,
+    start_wait: Option<ChildStartWait>,
+    start_release: ChildStartRelease,
+}
+
+impl PublishedFork {
+    pub fn context(&self) -> Option<&KernelContext> {
+        self.started.as_ref().map(StartedFork::context)
+    }
+
+    pub fn start_child(mut self) -> Result<StartedFork, KernelOperationError> {
+        self.start_release.start();
+        drop(self.start_wait.take());
+        self.started
+            .take()
+            .ok_or(KernelOperationError::PublishedForkConsumed)
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> Result<(KernelContext, Option<VforkParentWait>), KernelOperationError> {
+        Ok(self.start_child()?.into_parts())
+    }
+}
+
+impl Drop for PublishedFork {
+    fn drop(&mut self) {
+        self.start_release.start();
+        drop(self.start_wait.take());
     }
 }
 
@@ -321,6 +447,7 @@ impl ForkReservation {
         )?;
         check_failpoint(self.failpoint, KernelFailpoint::AfterObjects)?;
         check_failpoint(self.failpoint, KernelFailpoint::AfterBackendPrepare)?;
+        let (start_wait, start_release) = ChildStartWait::pair();
         Ok(PreparedFork {
             reservation: self,
             child,
@@ -328,6 +455,8 @@ impl ForkReservation {
             child_shared,
             child_resources,
             pidfd_subscriber: None,
+            start_wait: Some(start_wait),
+            start_release,
         })
     }
 }
@@ -340,11 +469,22 @@ pub struct PreparedFork {
     child_shared: Arc<TaskShared>,
     child_resources: Arc<ThreadResources>,
     pidfd_subscriber: Option<ReservedExitSubscriber>,
+    start_wait: Option<ChildStartWait>,
+    start_release: ChildStartRelease,
 }
 
 impl PreparedFork {
     pub const fn child_id(&self) -> TaskId {
         self.reservation.child_id
+    }
+
+    /// Transfer the unique wait handle to a materialized child before commit.
+    /// Dropping this preparation wakes it with `Cancelled`; a published child
+    /// remains blocked until `PublishedFork::start_child`.
+    pub fn take_child_start_wait(&mut self) -> Result<ChildStartWait, KernelOperationError> {
+        self.start_wait
+            .take()
+            .ok_or(KernelOperationError::ChildStartWaitTaken)
     }
 
     pub fn reserve_pidfd_subscription<T>(
@@ -376,6 +516,8 @@ impl PreparedFork {
             child_shared,
             child_resources,
             pidfd_subscriber,
+            start_wait,
+            start_release,
         } = self;
         if reservation.plan.pidfd() == ForkPidfdMode::Requested && pidfd_subscriber.is_none() {
             return Err(KernelOperationError::MissingPidfdSubscription);
@@ -465,15 +607,19 @@ impl PreparedFork {
         }
 
         Ok(PublishedFork {
-            context: KernelContext::from_parts(
-                kernel,
-                child,
-                leader,
-                child_shared,
-                child_resources,
-                TaskRevision::INITIAL,
-            ),
-            vfork_parent_wait,
+            started: Some(StartedFork {
+                context: KernelContext::from_parts(
+                    kernel,
+                    child,
+                    leader,
+                    child_shared,
+                    child_resources,
+                    TaskRevision::INITIAL,
+                ),
+                vfork_parent_wait,
+            }),
+            start_wait,
+            start_release,
         })
     }
 }
@@ -722,7 +868,7 @@ impl Kernel {
             .reserve_fork(parent, plan, diagnostic_name, failpoint)?
             .prepare_reference(child_registry_id)?
             .commit()?;
-        let (context, vfork_parent_wait) = published.into_parts();
+        let (context, vfork_parent_wait) = published.into_parts()?;
         if vfork_parent_wait.is_some() {
             return Err(KernelOperationError::VforkParentWaitRequired);
         }
@@ -1606,6 +1752,10 @@ pub enum KernelOperationError {
     UnexpectedPidfdSubscription,
     #[error("fork already has a reserved pidfd subscription")]
     PidfdSubscriptionExists,
+    #[error("fork child start wait handle was already transferred")]
+    ChildStartWaitTaken,
+    #[error("published fork start state was already consumed")]
+    PublishedForkConsumed,
     #[error("vfork publication must retain its parent wait handle")]
     VforkParentWaitRequired,
     #[error("CLONE_PIDFD fork has no reserved exit subscription")]
@@ -1840,6 +1990,117 @@ mod tests {
     }
 
     #[test]
+    fn child_start_gate_opens_only_after_fork_publication() {
+        let (kernel, root) = bootstrap(149);
+        let reservation = kernel
+            .reserve_fork(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                "gated child".to_owned(),
+                None,
+            )
+            .expect("reserve fork");
+        let child_id = reservation.child_id();
+        let mut prepared = reservation
+            .prepare_reference(ThreadId::synthetic_for_tests(150))
+            .expect("prepare fork");
+        let wait = prepared.take_child_start_wait().expect("unique child wait");
+        assert!(matches!(
+            prepared.take_child_start_wait(),
+            Err(KernelOperationError::ChildStartWaitTaken)
+        ));
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::sync_channel(1);
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::sync_channel(1);
+        let waiter = std::thread::spawn(move || {
+            waiting_tx.send(()).expect("report waiting");
+            outcome_tx.send(wait.wait()).expect("report outcome");
+        });
+        waiting_rx.recv().expect("child reached gate");
+        assert!(!kernel.task_is_live(child_id));
+        assert!(matches!(
+            outcome_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        let published = prepared.commit().expect("publish fork");
+        assert!(kernel.task_is_live(child_id));
+        assert!(matches!(
+            outcome_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        let started = published.start_child().expect("start published child");
+        assert_eq!(
+            outcome_rx.recv().expect("started outcome"),
+            ChildStartOutcome::Started
+        );
+        waiter.join().expect("join child waiter");
+        let (child, _) = started.into_parts();
+        assert_eq!(child.task.key().id, child_id);
+    }
+
+    #[test]
+    fn dropped_fork_preparation_cancels_materialized_child_gate() {
+        let (kernel, root) = bootstrap(151);
+        let reservation = kernel
+            .reserve_fork(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                "cancelled child".to_owned(),
+                None,
+            )
+            .expect("reserve fork");
+        let child_id = reservation.child_id();
+        let mut prepared = reservation
+            .prepare_reference(ThreadId::synthetic_for_tests(152))
+            .expect("prepare fork");
+        let wait = prepared.take_child_start_wait().expect("unique child wait");
+        let waiter = std::thread::spawn(move || wait.wait());
+
+        drop(prepared);
+        assert_eq!(
+            waiter.join().expect("join cancelled child"),
+            ChildStartOutcome::Cancelled
+        );
+        assert!(!kernel.task_is_live(child_id));
+        assert_eq!(kernel.registry().task_count(), 1);
+    }
+
+    #[test]
+    fn dropped_published_fork_fail_safe_starts_instead_of_leaking_task() {
+        let (kernel, root) = bootstrap(153);
+        let reservation = kernel
+            .reserve_fork(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                "fail-safe child".to_owned(),
+                None,
+            )
+            .expect("reserve fork");
+        let child_id = reservation.child_id();
+        let mut prepared = reservation
+            .prepare_reference(ThreadId::synthetic_for_tests(154))
+            .expect("prepare fork");
+        let wait = prepared.take_child_start_wait().expect("unique child wait");
+        let waiter = std::thread::spawn(move || wait.wait());
+        let published = prepared.commit().expect("publish fork");
+
+        drop(published);
+        assert_eq!(
+            waiter.join().expect("join fail-safe child"),
+            ChildStartOutcome::Started
+        );
+        assert!(kernel.task_is_live(child_id));
+        kernel
+            .exit_task(
+                child_id,
+                LinuxWaitStatus::from_wait_encoding(0),
+                TaskRusage::default(),
+                None,
+            )
+            .expect("retire fail-safe child");
+    }
+
+    #[test]
     fn fork_reservation_stays_undiscoverable_until_backend_commit() {
         let (kernel, root) = bootstrap(150);
         let plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
@@ -1865,10 +2126,18 @@ mod tests {
         );
         let child = prepared.commit().expect("publish child");
 
-        assert_eq!(child.context().thread().registry_id(), child_registry_id);
         assert_eq!(
             child
                 .context()
+                .expect("published child context")
+                .thread()
+                .registry_id(),
+            child_registry_id
+        );
+        assert_eq!(
+            child
+                .context()
+                .expect("published child context")
                 .shared()
                 .mm()
                 .backend()
@@ -1972,7 +2241,7 @@ mod tests {
             .expect("prepare vfork")
             .commit()
             .expect("publish vfork");
-        let (child, wait) = published.into_parts();
+        let (child, wait) = published.into_parts().expect("start vfork child");
         let wait = wait.expect("vfork parent wait");
         assert_eq!(wait.released_reason(), None);
 
@@ -2014,7 +2283,7 @@ mod tests {
             .expect("prepare exiting vfork")
             .commit()
             .expect("publish exiting vfork");
-        let (exiting_child, exit_wait) = exited.into_parts();
+        let (exiting_child, exit_wait) = exited.into_parts().expect("start exiting vfork child");
         let exit_wait = exit_wait.expect("exit vfork parent wait");
         let blocking_wait = exit_wait.clone();
         let waiter = std::thread::spawn(move || blocking_wait.wait());
@@ -2061,7 +2330,11 @@ mod tests {
         assert_eq!(subscriber.0.load(Ordering::Acquire), 0);
         assert!(!kernel.task_exists(target.task_id()));
 
-        let child = prepared.commit().expect("publish pidfd child");
+        let child = prepared
+            .commit()
+            .expect("publish pidfd child")
+            .start_child()
+            .expect("start pidfd child");
         assert_eq!(subscriber.0.load(Ordering::Acquire), 0);
         kernel
             .exit_task(
