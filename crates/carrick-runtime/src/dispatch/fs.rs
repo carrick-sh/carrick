@@ -12622,6 +12622,7 @@ mod tests {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(51, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
                     &mut memory,
                     &reporter,
@@ -12697,6 +12698,7 @@ mod tests {
         let reporter = CompatReporter::default();
         match dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(nr, SyscallArgs::from(args)),
                 memory,
                 &reporter,
@@ -13270,6 +13272,7 @@ mod tests {
             assert_eq!(
                 dispatcher
                     .dispatch(
+                        &dispatcher.capture_one_task_context().unwrap(),
                         SyscallRequest::new(23, SyscallArgs::from([base_fd as u64, 0, 0, 0, 0, 0])),
                         &mut memory,
                         &reporter,
@@ -13282,6 +13285,7 @@ mod tests {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(57, SyscallArgs::from([10, 0, 0, 0, 0, 0])),
                     &mut memory,
                     &reporter,
@@ -13292,6 +13296,7 @@ mod tests {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(23, SyscallArgs::from([base_fd as u64, 0, 0, 0, 0, 0])),
                     &mut memory,
                     &reporter,
@@ -13302,6 +13307,7 @@ mod tests {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(23, SyscallArgs::from([base_fd as u64, 0, 0, 0, 0, 0])),
                     &mut memory,
                     &reporter,
@@ -13518,6 +13524,7 @@ mod tests {
         let mut memory = LinearMemory::new(0x1000, vec![0; 0x1000]);
         let outcome = dispatcher
             .dispatch_normalized(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     76,
                     SyscallArgs::from([
@@ -13683,6 +13690,7 @@ mod tests {
             started_tx.send(()).expect("report F_ADD_SEALS start");
             let outcome = sibling
                 .dispatch_normalized(
+                    &sibling.capture_one_task_context().unwrap(),
                     SyscallRequest::new(
                         25,
                         SyscallArgs::from([
@@ -13823,6 +13831,7 @@ mod tests {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(
                         56,
                         SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, 0, 0, 0, 0]),
@@ -13838,6 +13847,7 @@ mod tests {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(
                         78,
                         SyscallArgs::from([LINUX_AT_FDCWD, 0x4100, 0x4200, 64, 0, 0]),
@@ -13907,6 +13917,7 @@ mod tests {
         memory.write_bytes(0x4000, b"/root/dir\0").unwrap();
         let dirfd = match dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([
@@ -13977,6 +13988,7 @@ mod tests {
         memory.write_bytes(0x4000, b"/regular.bin\0").unwrap();
         let fd = match dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, LINUX_O_RDONLY, 0, 0, 0]),
@@ -14022,6 +14034,7 @@ mod tests {
         memory.write_bytes(0x4000, b"/root\0").unwrap();
         let dirfd = match dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([
@@ -14082,6 +14095,7 @@ mod tests {
             .write_bytes(HOW_ADDR + 16, &resolve.to_le_bytes())
             .unwrap();
         dispatcher.dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 437,
                 SyscallArgs::from([

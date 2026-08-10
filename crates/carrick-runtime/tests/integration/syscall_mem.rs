@@ -82,6 +82,7 @@ fn brk_tracks_heap_within_runtime_arena() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(214, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -96,6 +97,7 @@ fn brk_tracks_heap_within_runtime_arena() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(214, SyscallArgs::from([next, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -107,6 +109,7 @@ fn brk_tracks_heap_within_runtime_arena() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     214,
                     SyscallArgs::from([LINUX_HEAP_BASE + LINUX_HEAP_SIZE + 1, 0, 0, 0, 0, 0]),
@@ -141,6 +144,7 @@ fn mmap_maps_file_bytes_into_guest_memory_arena() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -154,6 +158,7 @@ fn mmap_maps_file_bytes_into_guest_memory_arena() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(222, SyscallArgs::from([0, 4, 1, 0x02, 3, 0])),
                 &mut memory,
                 &reporter,
@@ -190,6 +195,7 @@ fn mmap_anonymous_reservations_fit_in_runtime_arena() {
     for length in reservations {
         let outcome = dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     222,
                     SyscallArgs::from([0, length, 0, map_private_anonymous, (-1_i64) as u64, 0]),
@@ -226,6 +232,7 @@ fn mmap_rejects_unknown_map_flag_bits() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     222,
                     SyscallArgs::from([
@@ -262,6 +269,7 @@ fn mmap_out_of_bounds_hint_relocated_advisory() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     222,
                     SyscallArgs::from([
@@ -286,6 +294,7 @@ fn mmap_out_of_bounds_hint_relocated_advisory() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     222,
                     SyscallArgs::from([0, 0x1000, 0, map_private_anonymous, (-1_i64) as u64, 0]),
@@ -316,6 +325,7 @@ fn mmap_without_hint_uses_next_page_granular_address() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     222,
                     SyscallArgs::from([
@@ -338,6 +348,7 @@ fn mmap_without_hint_uses_next_page_granular_address() {
 
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 222,
                 SyscallArgs::from([
@@ -381,6 +392,7 @@ fn dispatcher_mmap_uses_configured_16k_linux_page_size() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     222,
                     SyscallArgs::from([0, 1, 0, map_private_anonymous, (-1_i64) as u64, 0]),
@@ -396,6 +408,7 @@ fn dispatcher_mmap_uses_configured_16k_linux_page_size() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     222,
                     SyscallArgs::from([0, 1, 0, map_private_anonymous, (-1_i64) as u64, 0]),
@@ -431,6 +444,7 @@ fn mprotect_rounds_length_to_configured_16k_linux_page_size() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     222,
                     SyscallArgs::from([0, 1, 3, map_private_anonymous, (-1_i64) as u64, 0]),
@@ -450,6 +464,7 @@ fn mprotect_rounds_length_to_configured_16k_linux_page_size() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(226, SyscallArgs::from([LINUX_MMAP_BASE, 1, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -460,6 +475,7 @@ fn mprotect_rounds_length_to_configured_16k_linux_page_size() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     64,
                     SyscallArgs::from([1, LINUX_MMAP_BASE + 4096, 1, 0, 0, 0]),
@@ -494,6 +510,7 @@ fn mremap_rounds_old_size_to_configured_16k_linux_page_size_when_moving() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     222,
                     SyscallArgs::from([0, 1, 3, map_private_anonymous, (-1_i64) as u64, 0]),
@@ -509,6 +526,7 @@ fn mremap_rounds_old_size_to_configured_16k_linux_page_size_when_moving() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     222,
                     SyscallArgs::from([0, 1, 3, map_private_anonymous, (-1_i64) as u64, 0]),
@@ -527,6 +545,7 @@ fn mremap_rounds_old_size_to_configured_16k_linux_page_size_when_moving() {
 
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 216,
                 SyscallArgs::from([LINUX_MMAP_BASE, 1, 32_768, MREMAP_MAYMOVE, 0, 0]),
@@ -556,6 +575,7 @@ fn mmap_non_fixed_hint_does_not_overlap_existing_bump_allocation() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     222,
                     SyscallArgs::from([0, 0x2000, 0, map_private_anonymous, (-1_i64) as u64, 0]),
@@ -572,6 +592,7 @@ fn mmap_non_fixed_hint_does_not_overlap_existing_bump_allocation() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     222,
                     SyscallArgs::from([
@@ -609,6 +630,7 @@ fn mm_lock_msync_mincore_stubs_validate_args_and_succeed() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     227,
                     SyscallArgs::from([LINUX_MMAP_BASE, 0x1000, MS_SYNC, 0, 0, 0]),
@@ -622,6 +644,7 @@ fn mm_lock_msync_mincore_stubs_validate_args_and_succeed() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     227,
                     SyscallArgs::from([LINUX_MMAP_BASE, 0x1000, MS_SYNC | MS_ASYNC, 0, 0, 0]),
@@ -637,6 +660,7 @@ fn mm_lock_msync_mincore_stubs_validate_args_and_succeed() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     227,
                     SyscallArgs::from([0xdead_0000, 0x1000, MS_SYNC, 0, 0, 0]),
@@ -653,6 +677,7 @@ fn mm_lock_msync_mincore_stubs_validate_args_and_succeed() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     228,
                     SyscallArgs::from([LINUX_MMAP_BASE, 0x1000, 0, 0, 0, 0]),
@@ -666,6 +691,7 @@ fn mm_lock_msync_mincore_stubs_validate_args_and_succeed() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(229, SyscallArgs::from([LINUX_MMAP_BASE, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -677,6 +703,7 @@ fn mm_lock_msync_mincore_stubs_validate_args_and_succeed() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(230, SyscallArgs::from([MCL_CURRENT, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -687,6 +714,7 @@ fn mm_lock_msync_mincore_stubs_validate_args_and_succeed() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(230, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -699,6 +727,7 @@ fn mm_lock_msync_mincore_stubs_validate_args_and_succeed() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(231, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -711,6 +740,7 @@ fn mm_lock_msync_mincore_stubs_validate_args_and_succeed() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     232,
                     SyscallArgs::from([LINUX_MMAP_BASE, 0x4000, vec_addr, 0, 0, 0]),
@@ -740,6 +770,7 @@ fn mremap_bootstrap_accepts_shrinking_and_rejects_growth_with_enomem() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     216,
                     SyscallArgs::from([LINUX_MMAP_BASE, 0x4000, 0x2000, MREMAP_MAYMOVE, 0, 0]),
@@ -760,6 +791,7 @@ fn mremap_bootstrap_accepts_shrinking_and_rejects_growth_with_enomem() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     216,
                     SyscallArgs::from([LINUX_MMAP_BASE, 0x1000, 0x8000, MREMAP_MAYMOVE, 0, 0]),
@@ -777,6 +809,7 @@ fn mremap_bootstrap_accepts_shrinking_and_rejects_growth_with_enomem() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     216,
                     SyscallArgs::from([LINUX_MMAP_BASE, 0x1000, 0x8000, 0, 0, 0]),
@@ -792,6 +825,7 @@ fn mremap_bootstrap_accepts_shrinking_and_rejects_growth_with_enomem() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     216,
                     SyscallArgs::from([LINUX_MMAP_BASE, 0x1000, 0, 0, 0, 0]),
@@ -814,6 +848,7 @@ fn mremap_bootstrap_accepts_shrinking_and_rejects_growth_with_enomem() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     216,
                     SyscallArgs::from([LINUX_MMAP_BASE, 0x1000, 0x2000, 0xdead, 0, 0]),
@@ -829,6 +864,7 @@ fn mremap_bootstrap_accepts_shrinking_and_rejects_growth_with_enomem() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     216,
                     SyscallArgs::from([0x1000, 0x1000, 0x2000, MREMAP_MAYMOVE, 0, 0]),
@@ -858,6 +894,7 @@ fn mmap_anonymous_fixed_mapping_zeroes_guest_memory_and_mprotect_munmap_are_noop
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     222,
                     SyscallArgs::from([LINUX_MMAP_BASE, 5, 3, 0x12 | 0x20, (-1_i64) as u64, 0]),
@@ -877,6 +914,7 @@ fn mmap_anonymous_fixed_mapping_zeroes_guest_memory_and_mprotect_munmap_are_noop
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(226, SyscallArgs::from([LINUX_MMAP_BASE, 5, 1, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -887,6 +925,7 @@ fn mmap_anonymous_fixed_mapping_zeroes_guest_memory_and_mprotect_munmap_are_noop
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(215, SyscallArgs::from([LINUX_MMAP_BASE, 5, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -911,6 +950,7 @@ fn madvise_accepts_common_advice_for_mapped_ranges() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     233,
                     SyscallArgs::from([LINUX_MMAP_BASE, 0x1000, LINUX_MADV_DONTNEED, 0, 0, 0]),
@@ -929,6 +969,7 @@ fn madvise_accepts_common_advice_for_mapped_ranges() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     233,
                     SyscallArgs::from([LINUX_MMAP_BASE, 0x1000, LINUX_MADV_WILLNEED, 0, 0, 0]),
@@ -942,6 +983,7 @@ fn madvise_accepts_common_advice_for_mapped_ranges() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     233,
                     SyscallArgs::from([LINUX_MMAP_BASE + 1, 0x1000, 0, 0, 0, 0])
@@ -957,6 +999,7 @@ fn madvise_accepts_common_advice_for_mapped_ranges() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     233,
                     SyscallArgs::from([LINUX_MMAP_BASE, 0x1000, 999, 0, 0, 0])
@@ -972,6 +1015,7 @@ fn madvise_accepts_common_advice_for_mapped_ranges() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     233,
                     SyscallArgs::from([LINUX_MMAP_BASE + 0x8000, 0x1000, 0, 0, 0, 0])

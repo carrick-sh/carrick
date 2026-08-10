@@ -78,6 +78,7 @@ fn shared_dispatcher_services_syscalls_from_multiple_host_threads() {
                 let mut memory = LinearMemory::new(0x4000, Vec::new());
                 dispatcher
                     .dispatch_threaded(
+                        &dispatcher.capture_one_task_context().unwrap(),
                         SyscallRequest::new(178, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                         &mut memory,
                         &reporter,
@@ -132,6 +133,7 @@ fn shared_dispatcher_services_thread_registry_and_futex_syscalls() {
 
     let set_tid = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(96, SyscallArgs::from([0x10840, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -145,6 +147,7 @@ fn shared_dispatcher_services_thread_registry_and_futex_syscalls() {
 
     let futex_wait = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 98,
                 SyscallArgs::from([
@@ -182,6 +185,7 @@ fn shared_dispatcher_routes_sibling_thread_signals() {
 
     let routed = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(131, SyscallArgs::from([10, 11, 10, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -209,6 +213,7 @@ fn shared_dispatcher_services_credential_state() {
 
     let setresuid = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(147, SyscallArgs::from([100, 101, 102, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -221,6 +226,7 @@ fn shared_dispatcher_services_credential_state() {
 
     let getuid = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(174, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -233,6 +239,7 @@ fn shared_dispatcher_services_credential_state() {
 
     let geteuid = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(175, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -257,6 +264,7 @@ fn shared_dispatcher_services_process_state() {
 
     let previous = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 92,
                 SyscallArgs::from([LINUX_ADDR_NO_RANDOMIZE, 0, 0, 0, 0, 0]),
@@ -272,6 +280,7 @@ fn shared_dispatcher_services_process_state() {
 
     let current = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 92,
                 SyscallArgs::from([LINUX_PERSONALITY_QUERY, 0, 0, 0, 0, 0]),
@@ -320,6 +329,7 @@ fn shared_dispatcher_services_thread_lifecycle_syscalls() {
         | CLONE_CHILD_SETTID;
     let cloned = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 220,
                 SyscallArgs::from([flags, 0x20000, 0x10800, 0x30000, 0x10808, 0]),
@@ -346,6 +356,7 @@ fn shared_dispatcher_services_thread_lifecycle_syscalls() {
     assert_eq!(registry.register_child(0), t(11));
     let thread_exit = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(93, SyscallArgs::from([7, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -358,6 +369,7 @@ fn shared_dispatcher_services_thread_lifecycle_syscalls() {
 
     let exit_group = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(94, SyscallArgs::from([9, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -386,6 +398,7 @@ fn shared_dispatcher_services_execve_request_without_serialized_fallback() {
 
     let exec = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(221, SyscallArgs::from([0x10800, 0x10820, 0x10840, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -415,6 +428,7 @@ fn shared_dispatcher_services_memory_state() {
 
     let initial = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(214, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -433,6 +447,7 @@ fn shared_dispatcher_services_memory_state() {
     let next = LINUX_HEAP_BASE + 0x1000;
     let updated = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(214, SyscallArgs::from([next, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -454,6 +469,7 @@ fn shared_dispatcher_services_readonly_fs_state() {
 
     let getcwd = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(17, SyscallArgs::from([0x10800, 64, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -468,6 +484,7 @@ fn shared_dispatcher_services_readonly_fs_state() {
     memory.write_bytes(0x10900, b"/proc/self/status\0").unwrap();
     let stat = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(79, SyscallArgs::from([0, 0x10900, 0x10a00, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -490,6 +507,7 @@ fn shared_dispatcher_services_fd_table_open_read_close() {
 
     let opened = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 56,
                 SyscallArgs::from([(-100_i64) as u64, 0x10800, 0, 0, 0, 0]),
@@ -508,6 +526,7 @@ fn shared_dispatcher_services_fd_table_open_read_close() {
 
     let read = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x10900, 0x100, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -523,6 +542,7 @@ fn shared_dispatcher_services_fd_table_open_read_close() {
 
     let closed = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(57, SyscallArgs::from([fd as u64, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -545,6 +565,7 @@ fn shared_dispatcher_services_nested_pipe_redirect_syscalls() {
     let pipe_addr = 0x10800;
     let pipe2 = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(59, SyscallArgs::from([pipe_addr, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -561,6 +582,7 @@ fn shared_dispatcher_services_nested_pipe_redirect_syscalls() {
 
     let dup_stderr = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(24, SyscallArgs::from([write_fd as u64, 2, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -574,6 +596,7 @@ fn shared_dispatcher_services_nested_pipe_redirect_syscalls() {
     memory.write_bytes(0x10820, b"hi").unwrap();
     let write = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(64, SyscallArgs::from([2, 0x10820, 2, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -586,6 +609,7 @@ fn shared_dispatcher_services_nested_pipe_redirect_syscalls() {
 
     let read = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(63, SyscallArgs::from([read_fd as u64, 0x10840, 8, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -614,6 +638,7 @@ fn shared_dispatcher_opens_rootfs_file_without_serialized_fallback() {
 
     let opened = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 56,
                 SyscallArgs::from([(-100_i64) as u64, 0x10800, 0, 0, 0, 0]),
@@ -632,6 +657,7 @@ fn shared_dispatcher_opens_rootfs_file_without_serialized_fallback() {
 
     let read = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x10900, 0x100, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -645,6 +671,7 @@ fn shared_dispatcher_opens_rootfs_file_without_serialized_fallback() {
 
     let closed = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(57, SyscallArgs::from([fd as u64, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -667,6 +694,7 @@ fn shared_dispatcher_services_stdio_write_buffers() {
 
     let written = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(64, SyscallArgs::from([1, 0x10800, 7, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -689,6 +717,7 @@ fn shared_dispatcher_reports_unknown_syscalls_without_serialized_fallback() {
 
     let outcome = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(9999, SyscallArgs::from([1, 2, 3, 4, 5, 6])),
             &mut memory,
             &reporter,

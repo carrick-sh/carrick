@@ -987,6 +987,11 @@ impl SyscallDispatcher {
         proc.itimers = [None, None, None];
         proc.ptrace_traceme = false;
         proc.virtual_ptrace_stops.clear();
+        let reset_one_task_binding = proc.hvpatch_process.is_none();
+        drop(proc);
+        if reset_one_task_binding {
+            *self.kernel_binding.write() = super::bootstrap_one_task_binding();
+        }
     }
 
     pub(crate) fn subreaper_for_fork_child(&self) -> u32 {
@@ -1157,13 +1162,27 @@ impl SyscallDispatcher {
         }
     }
 
-    /// Install a pidfd for a child in the shared HvPatch process table.
-    pub(crate) fn install_hvpatch_child_pidfd(
+    /// Reserve and install a pidfd while its HVPatch child is still
+    /// undiscoverable. The watch is armed by `PreparedFork::commit` in the
+    /// same registry transaction that publishes the child.
+    pub(crate) fn install_reserved_hvpatch_child_pidfd(
         &self,
-        process: &crate::hvpatch::ProcessContext,
-        child_pid: i32,
+        prepared: &mut crate::kernel::PreparedFork,
     ) -> Result<i32, crate::linux_abi::LinuxErrno> {
-        match self.open_hvpatch_pidfd(process, child_pid, 0) {
+        let mut mux = crate::event_mux::make_event_multiplexer()
+            .map_err(|_| crate::linux_abi::LINUX_EMFILE)?;
+        mux.register_user(0)
+            .map_err(|_| crate::linux_abi::LINUX_EMFILE)?;
+        let watch = std::sync::Arc::new(PidfdWatch::new(mux));
+        let target = prepared
+            .reserve_pidfd_subscription(&watch)
+            .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
+        let description = OpenDescription::Pidfd {
+            target: PidfdTarget::Hvpatch(target.task_id().raw()),
+            kqueue: watch,
+            base: OpenDescriptionBase::new(0),
+        };
+        match self.install_fd(description, LINUX_FD_CLOEXEC) {
             DispatchOutcome::Returned { value } => {
                 i32::try_from(value).map_err(|_| crate::linux_abi::LINUX_EMFILE)
             }
@@ -1371,6 +1390,7 @@ impl SyscallDispatcher {
             && flags & LinuxCloneFlags::VM.bits() != 0)
             .then_some(args.stack.wrapping_add(args.stack_size));
         DispatchOutcome::Fork {
+            flags,
             pidfd_out,
             clone_parent: flags & LinuxCloneFlags::PARENT.bits() != 0,
             parent_tid_addr: if flags & LinuxCloneFlags::PARENT_SETTID.bits() != 0 {
@@ -3771,6 +3791,7 @@ impl SyscallDispatcher {
                 .then_some(stack);
             // Legacy clone's `stack` IS the child SP (clone3 passes base+len).
             Ok(DispatchOutcome::Fork {
+                flags,
                 child_stack: stack,
                 pidfd_out,
                 clone_parent: flags & LinuxCloneFlags::PARENT.bits() != 0,
@@ -4666,6 +4687,7 @@ mod futex_timeout_tests {
         };
         let out = dispatcher
             .dispatch_normalized(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     98,
                     SyscallArgs::from([

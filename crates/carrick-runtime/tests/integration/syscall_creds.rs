@@ -43,6 +43,7 @@ fn process_identity_syscalls_return_bootstrap_ids() {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(number, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                     &mut memory,
                     &reporter,
@@ -67,6 +68,7 @@ fn capget_writes_docker_default_capability_sets() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(90, SyscallArgs::from([0x4000, 0x4080, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -98,6 +100,7 @@ fn capset_accepts_empty_sets_and_rejects_nonempty_sets() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(91, SyscallArgs::from([0x4000, 0x4080, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -110,6 +113,7 @@ fn capset_accepts_empty_sets_and_rejects_nonempty_sets() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(91, SyscallArgs::from([0x4000, 0x4080, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -131,6 +135,7 @@ fn personality_query_and_set_round_trip_bootstrap_flags() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     92,
                     SyscallArgs::from([LINUX_PERSONALITY_QUERY, 0, 0, 0, 0, 0]),
@@ -144,6 +149,7 @@ fn personality_query_and_set_round_trip_bootstrap_flags() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     92,
                     SyscallArgs::from([LINUX_ADDR_NO_RANDOMIZE, 0, 0, 0, 0, 0]),
@@ -157,6 +163,7 @@ fn personality_query_and_set_round_trip_bootstrap_flags() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     92,
                     SyscallArgs::from([LINUX_PERSONALITY_QUERY, 0, 0, 0, 0, 0]),
@@ -182,6 +189,7 @@ fn prctl_handles_bootstrap_process_controls() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     167,
                     SyscallArgs::from([LINUX_PR_GET_DUMPABLE, 0, 0, 0, 0, 0]),
@@ -195,6 +203,7 @@ fn prctl_handles_bootstrap_process_controls() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     167,
                     SyscallArgs::from([LINUX_PR_SET_DUMPABLE, 0, 0, 0, 0, 0]),
@@ -208,6 +217,7 @@ fn prctl_handles_bootstrap_process_controls() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     167,
                     SyscallArgs::from([LINUX_PR_GET_DUMPABLE, 0, 0, 0, 0, 0]),
@@ -221,6 +231,7 @@ fn prctl_handles_bootstrap_process_controls() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     167,
                     SyscallArgs::from([LINUX_PR_SET_NAME, 0x4000, 0, 0, 0, 0])
@@ -234,6 +245,7 @@ fn prctl_handles_bootstrap_process_controls() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     167,
                     SyscallArgs::from([LINUX_PR_GET_NAME, 0x4040, 0, 0, 0, 0])
@@ -251,6 +263,7 @@ fn prctl_handles_bootstrap_process_controls() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     167,
                     SyscallArgs::from([LINUX_PR_SET_DUMPABLE, 99, 0, 0, 0, 0]),
@@ -266,6 +279,7 @@ fn prctl_handles_bootstrap_process_controls() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     167,
                     SyscallArgs::from([LINUX_PR_SET_NAME, 0x5000, 0, 0, 0, 0])
@@ -281,6 +295,7 @@ fn prctl_handles_bootstrap_process_controls() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(167, SyscallArgs::from([999, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -302,6 +317,7 @@ fn getcpu_writes_bootstrap_cpu_and_numa_node() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(168, SyscallArgs::from([0x4000, 0x4004, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -314,6 +330,7 @@ fn getcpu_writes_bootstrap_cpu_and_numa_node() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(168, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -324,6 +341,7 @@ fn getcpu_writes_bootstrap_cpu_and_numa_node() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(168, SyscallArgs::from([0x5000, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -346,6 +364,7 @@ fn set_tid_address_and_robust_list_are_bootstrap_successes() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(96, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -356,6 +375,7 @@ fn set_tid_address_and_robust_list_are_bootstrap_successes() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(99, SyscallArgs::from([0x4000, 24, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -375,6 +395,7 @@ fn rseq_reports_clean_bootstrap_fallback() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(293, SyscallArgs::from([0x4000, 32, 0, 0x5305_3053, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -396,6 +417,7 @@ fn membarrier_query_reports_supported_commands() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     283,
                     SyscallArgs::from([LINUX_MEMBARRIER_CMD_QUERY, 0, 0, 0, 0, 0]),
@@ -409,6 +431,7 @@ fn membarrier_query_reports_supported_commands() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     283,
                     SyscallArgs::from([
@@ -431,6 +454,7 @@ fn membarrier_query_reports_supported_commands() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     283,
                     SyscallArgs::from([LINUX_MEMBARRIER_CMD_GLOBAL, 0, 0, 0, 0, 0]),
@@ -454,6 +478,7 @@ fn scheduler_bootstrap_yields_and_writes_current_affinity() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(124, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -464,6 +489,7 @@ fn scheduler_bootstrap_yields_and_writes_current_affinity() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     123,
                     SyscallArgs::from([0, LINUX_BOOTSTRAP_AFFINITY_BYTES as u64, 0x4000, 0, 0, 0]),
@@ -490,6 +516,7 @@ fn scheduler_bootstrap_yields_and_writes_current_affinity() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(123, SyscallArgs::from([pid, 4, 0x4000, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -502,6 +529,7 @@ fn scheduler_bootstrap_yields_and_writes_current_affinity() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     123,
                     SyscallArgs::from([
@@ -538,6 +566,7 @@ fn futex_wait_and_wake_cover_bootstrap_private_operations() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     98,
                     SyscallArgs::from([
@@ -558,6 +587,7 @@ fn futex_wait_and_wake_cover_bootstrap_private_operations() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     98,
                     SyscallArgs::from([
@@ -580,6 +610,7 @@ fn futex_wait_and_wake_cover_bootstrap_private_operations() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     98,
                     SyscallArgs::from([
@@ -608,6 +639,7 @@ fn futex_wait_and_wake_cover_bootstrap_private_operations() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     98,
                     SyscallArgs::from([
@@ -637,6 +669,7 @@ fn uname_writes_packed_linux_utsname() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(160, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -659,6 +692,7 @@ fn prlimit64_writes_packed_rlimit() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(261, SyscallArgs::from([0, 3, 0, 0x4000, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -692,6 +726,7 @@ fn getrusage_bootstrap_zeros_rusage_for_self_and_validates_who() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     165,
                     SyscallArgs::from([LINUX_RUSAGE_SELF, 0x4000, 0, 0, 0, 0])
@@ -722,6 +757,7 @@ fn getrusage_bootstrap_zeros_rusage_for_self_and_validates_who() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     165,
                     SyscallArgs::from([LINUX_RUSAGE_CHILDREN, 0x4000, 0, 0, 0, 0]),
@@ -746,6 +782,7 @@ fn getrusage_bootstrap_zeros_rusage_for_self_and_validates_who() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(165, SyscallArgs::from([99, 0x4000, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -760,6 +797,7 @@ fn getrusage_bootstrap_zeros_rusage_for_self_and_validates_who() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     165,
                     SyscallArgs::from([LINUX_RUSAGE_SELF, 0xdead_0000, 0, 0, 0, 0]),
@@ -777,6 +815,7 @@ fn getrusage_bootstrap_zeros_rusage_for_self_and_validates_who() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(165, SyscallArgs::from([LINUX_RUSAGE_SELF, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -799,6 +838,7 @@ fn umask_setpriority_getpriority_sysinfo_bootstrap_stubs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(166, SyscallArgs::from([0o077, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -809,6 +849,7 @@ fn umask_setpriority_getpriority_sysinfo_bootstrap_stubs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(166, SyscallArgs::from([0o644, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -825,6 +866,7 @@ fn umask_setpriority_getpriority_sysinfo_bootstrap_stubs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     140,
                     SyscallArgs::from([0, 0, 21_u64.wrapping_neg(), 0, 0, 0]),
@@ -838,6 +880,7 @@ fn umask_setpriority_getpriority_sysinfo_bootstrap_stubs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(140, SyscallArgs::from([99, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -851,6 +894,7 @@ fn umask_setpriority_getpriority_sysinfo_bootstrap_stubs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(140, SyscallArgs::from([0, 0, 5_u64, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -862,6 +906,7 @@ fn umask_setpriority_getpriority_sysinfo_bootstrap_stubs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(140, SyscallArgs::from([0, 42, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -878,6 +923,7 @@ fn umask_setpriority_getpriority_sysinfo_bootstrap_stubs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(141, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -889,6 +935,7 @@ fn umask_setpriority_getpriority_sysinfo_bootstrap_stubs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(141, SyscallArgs::from([0, current_pid, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -902,6 +949,7 @@ fn umask_setpriority_getpriority_sysinfo_bootstrap_stubs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(140, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -912,6 +960,7 @@ fn umask_setpriority_getpriority_sysinfo_bootstrap_stubs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(146, SyscallArgs::from([1000, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -922,6 +971,7 @@ fn umask_setpriority_getpriority_sysinfo_bootstrap_stubs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     140,
                     SyscallArgs::from([0, 0, 20_u64.wrapping_neg(), 0, 0, 0]),
@@ -939,6 +989,7 @@ fn umask_setpriority_getpriority_sysinfo_bootstrap_stubs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(179, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -967,6 +1018,7 @@ fn prctl(
     arg3: u64,
 ) -> DispatchOutcome {
     d.dispatch(
+        &d.capture_one_task_context().unwrap(),
         SyscallRequest::new(PRCTL, SyscallArgs::from([option, arg2, arg3, 0, 0, 0])),
         m,
         r,
@@ -1223,6 +1275,7 @@ fn prlimit64_and_getrlimit_round_trip_per_resource() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     PRLIMIT64,
                     SyscallArgs::from([0, RLIMIT_STACK, new, 0, 0, 0])
@@ -1237,6 +1290,7 @@ fn prlimit64_and_getrlimit_round_trip_per_resource() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     PRLIMIT64,
                     SyscallArgs::from([0, RLIMIT_STACK, 0, old, 0, 0])
@@ -1253,6 +1307,7 @@ fn prlimit64_and_getrlimit_round_trip_per_resource() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     GETRLIMIT,
                     SyscallArgs::from([RLIMIT_STACK, old, 0, 0, 0, 0])
@@ -1270,6 +1325,7 @@ fn prlimit64_and_getrlimit_round_trip_per_resource() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(PRLIMIT64, SyscallArgs::from([0, RLIMIT_AS, new, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1280,6 +1336,7 @@ fn prlimit64_and_getrlimit_round_trip_per_resource() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(PRLIMIT64, SyscallArgs::from([0, RLIMIT_AS, 0, old, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1291,6 +1348,7 @@ fn prlimit64_and_getrlimit_round_trip_per_resource() {
     // STACK is unaffected by the AS set.
     dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 GETRLIMIT,
                 SyscallArgs::from([RLIMIT_STACK, old, 0, 0, 0, 0]),
@@ -1306,6 +1364,7 @@ fn prlimit64_and_getrlimit_round_trip_per_resource() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(PRLIMIT64, SyscallArgs::from([0, RLIMIT_AS, new, 0, 0, 0])),
                 &mut memory,
                 &reporter,

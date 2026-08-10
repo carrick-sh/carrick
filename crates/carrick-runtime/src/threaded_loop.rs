@@ -221,6 +221,17 @@ where
         // Retire only this already-created vCPU so teardown has one owner.
         engine.destroy_vcpu_on_thread_exit();
     })?;
+    let root_linux_tid = if let Some(process) = hvpatch_process.as_ref() {
+        crate::kernel::LinuxTid::for_task_leader(process.task_id())
+    } else {
+        let task_id = crate::kernel::TaskId::for_root_bootstrap(
+            i32::try_from(std::process::id()).map_err(|_| {
+                RuntimeError::Configuration("host pid does not fit Linux task identity".to_owned())
+            })?,
+        )
+        .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        crate::kernel::LinuxTid::for_task_leader(task_id)
+    };
     let kernel = Arc::new(KernelState::new(
         dispatcher,
         fork_coordinator,
@@ -258,6 +269,7 @@ where
         Arc::clone(&futex),
         Arc::clone(&platform_futex),
         Arc::clone(&platform_futex_factory),
+        root_linux_tid,
         main_tid,
         Arc::clone(&threads),
         Arc::clone(&kicker),

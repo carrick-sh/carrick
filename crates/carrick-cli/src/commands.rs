@@ -1272,7 +1272,11 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 allow(clippy::default_constructed_unit_structs)
             )]
             let reporter = CompatReporter::default();
+            let kernel_context = dispatcher
+                .capture_one_task_context()
+                .context("capture dispatch-syscall kernel context")?;
             let outcome = dispatcher.dispatch(
+                &kernel_context,
                 SyscallRequest::new(
                     number,
                     SyscallArgs::from([args[0], args[1], args[2], args[3], args[4], args[5]]),

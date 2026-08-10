@@ -234,6 +234,7 @@ fn dispatcher_can_write_from_loaded_guest_memory() {
 
     dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(64, SyscallArgs::from([1, 0x4000, 5, 0, 0, 0])),
             &mut image,
             &reporter,

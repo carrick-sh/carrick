@@ -4835,6 +4835,7 @@ mod tests {
     ) -> DispatchOutcome {
         dispatcher
             .dispatch_threaded(
+                &dispatcher.capture_one_task_context().unwrap(),
                 request,
                 memory,
                 reporter,
@@ -7507,6 +7508,7 @@ mod tests {
 
         let outcome = dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     SYS_MREMAP,
                     SyscallArgs([BOOT_VMA, 2 * LINUX_PAGE_SIZE, LINUX_PAGE_SIZE, 0, 0, 0]),
@@ -7560,6 +7562,7 @@ mod tests {
 
         let outcome = dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     SYS_MREMAP,
                     SyscallArgs([
@@ -7596,6 +7599,7 @@ mod tests {
             ProtectionTrackingMemory::new(LINUX_MMAP_BASE, (2 * LINUX_PAGE_SIZE) as usize);
         let outcome = dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     SYS_MREMAP,
                     SyscallArgs([LINUX_MMAP_BASE, LINUX_PAGE_SIZE, LINUX_PAGE_SIZE, 0, 0, 0]),
@@ -7636,6 +7640,7 @@ mod tests {
             let mut memory = ProtectionTrackingMemory::new(base, LINUX_PAGE_SIZE as usize);
             let outcome = dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(
                         SYS_MREMAP,
                         SyscallArgs([base, LINUX_PAGE_SIZE, LINUX_PAGE_SIZE, 0, 0, 0]),
@@ -7670,6 +7675,7 @@ mod tests {
 
         let live = dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     SYS_MREMAP,
                     SyscallArgs([layout.heap_base, LINUX_PAGE_SIZE, LINUX_PAGE_SIZE, 0, 0, 0]),
@@ -7687,6 +7693,7 @@ mod tests {
 
         let hidden = dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     SYS_MREMAP,
                     SyscallArgs([
@@ -7735,6 +7742,7 @@ mod tests {
         let reporter = CompatReporter::default();
         let mapped = dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     SYS_MMAP,
                     SyscallArgs([
@@ -7753,6 +7761,7 @@ mod tests {
         assert_eq!(returned(mapped), LINUX_MMAP_BASE as i64);
         let unmapped = dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     SYS_MUNMAP,
                     SyscallArgs([LINUX_MMAP_BASE, LINUX_PAGE_SIZE, 0, 0, 0, 0]),
@@ -7765,6 +7774,7 @@ mod tests {
 
         let remapped = dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     SYS_MREMAP,
                     SyscallArgs([LINUX_MMAP_BASE, LINUX_PAGE_SIZE, LINUX_PAGE_SIZE, 0, 0, 0]),
@@ -8423,6 +8433,7 @@ mod tests {
         };
         let outcome = dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     SYS_MPROTECT,
                     SyscallArgs([LINUX_HEAP_BASE, PAGE_SIZE, LINUX_PROT_READ, 0, 0, 0]),
@@ -8541,7 +8552,12 @@ mod tests {
         assert_eq!(
             returned(
                 dispatcher
-                    .dispatch(read_only, &mut memory, &reporter)
+                    .dispatch(
+                        &dispatcher.capture_one_task_context().unwrap(),
+                        read_only,
+                        &mut memory,
+                        &reporter
+                    )
                     .expect("read-only mmap dispatch")
             ),
             LINUX_MMAP_BASE as i64
@@ -8558,7 +8574,12 @@ mod tests {
         );
         assert_eq!(
             dispatcher
-                .dispatch(unmap, &mut memory, &reporter)
+                .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
+                    unmap,
+                    &mut memory,
+                    &reporter
+                )
                 .expect("munmap dispatch"),
             DispatchOutcome::Returned { value: 0 }
         );
@@ -8590,7 +8611,12 @@ mod tests {
         );
         assert_eq!(
             dispatcher
-                .dispatch(protect_hole, &mut memory, &reporter)
+                .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
+                    protect_hole,
+                    &mut memory,
+                    &reporter
+                )
                 .expect("mprotect post-munmap hole dispatch"),
             DispatchOutcome::errno(LINUX_ENOMEM),
             "retained host backing must not let mprotect resurrect an unmapped VMA"
@@ -8615,7 +8641,12 @@ mod tests {
         assert_eq!(
             returned(
                 dispatcher
-                    .dispatch(writable, &mut memory, &reporter)
+                    .dispatch(
+                        &dispatcher.capture_one_task_context().unwrap(),
+                        writable,
+                        &mut memory,
+                        &reporter
+                    )
                     .expect("writable reuse mmap dispatch")
             ),
             LINUX_MMAP_BASE as i64
@@ -8857,6 +8888,7 @@ mod tests {
         let mut dispatcher = SyscallDispatcher::new();
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(232, SyscallArgs::from([address, length, address, 0, 0, 0])),
                 memory,
                 &reporter,
@@ -9019,7 +9051,12 @@ mod tests {
         let shrink = SyscallRequest::new(SYS_BRK, SyscallArgs([initial, 0, 0, 0, 0, 0]));
 
         let outcome = dispatcher
-            .dispatch(shrink, &mut memory, &reporter)
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                shrink,
+                &mut memory,
+                &reporter,
+            )
             .expect("brk shrink dispatch should succeed");
 
         assert_eq!(returned(outcome), initial as i64);
@@ -9050,7 +9087,12 @@ mod tests {
         );
 
         let outcome = dispatcher
-            .dispatch(request, &mut memory, &reporter)
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                request,
+                &mut memory,
+                &reporter,
+            )
             .expect("mmap dispatch should succeed");
 
         assert_eq!(returned(outcome), LINUX_MMAP_BASE as i64);
@@ -9093,7 +9135,12 @@ mod tests {
         );
 
         let outcome = dispatcher
-            .dispatch(request, &mut memory, &reporter)
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                request,
+                &mut memory,
+                &reporter,
+            )
             .expect("mmap dispatch should succeed");
 
         assert_eq!(returned(outcome), LINUX_MMAP_BASE as i64);
@@ -9496,6 +9543,7 @@ mod tests {
             let mut memory = LinearMemory::new(LINUX_HEAP_BASE, vec![0; LINUX_PAGE_SIZE as usize]);
             dispatcher
                 .dispatch_threaded(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(SYS_BRK, SyscallArgs([0, 0, 0, 0, 0, 0])),
                     &mut memory,
                     &reporter,
@@ -9518,6 +9566,7 @@ mod tests {
             let mut memory = LinearMemory::new(LINUX_MMAP_BASE, vec![0; LINUX_PAGE_SIZE as usize]);
             dispatcher
                 .dispatch_threaded(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(
                         SYS_MSYNC,
                         SyscallArgs([LINUX_MMAP_BASE, LINUX_PAGE_SIZE, 0, 0, 0, 0]),
@@ -9544,6 +9593,7 @@ mod tests {
                 LinearMemory::new(LINUX_MMAP_BASE, vec![0; (2 * LINUX_PAGE_SIZE) as usize]);
             dispatcher
                 .dispatch_threaded(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(
                         SYS_MINCORE,
                         SyscallArgs([
@@ -9586,7 +9636,12 @@ mod tests {
         );
 
         let outcome = dispatcher
-            .dispatch(request, &mut memory, &reporter)
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                request,
+                &mut memory,
+                &reporter,
+            )
             .expect("mmap dispatch should succeed");
 
         let DispatchOutcome::MapHostAlias {
@@ -9634,13 +9689,23 @@ mod tests {
         );
 
         let outcome = dispatcher
-            .dispatch(request, &mut memory, &reporter)
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                request,
+                &mut memory,
+                &reporter,
+            )
             .expect("mmap dispatch should succeed");
 
         assert_eq!(outcome, DispatchOutcome::Returned { value: va as i64 });
         let unmap = SyscallRequest::new(SYS_MUNMAP, SyscallArgs([va, len, 0, 0, 0, 0]));
         let unmap_outcome = dispatcher
-            .dispatch(unmap, &mut memory, &reporter)
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                unmap,
+                &mut memory,
+                &reporter,
+            )
             .expect("munmap dispatch should succeed");
         assert_eq!(unmap_outcome, DispatchOutcome::Returned { value: 0 });
         assert_eq!(
@@ -9672,7 +9737,12 @@ mod tests {
         );
 
         let outcome = dispatcher
-            .dispatch(request, &mut memory, &reporter)
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                request,
+                &mut memory,
+                &reporter,
+            )
             .expect("mmap dispatch should succeed");
 
         let DispatchOutcome::MapHostAlias {

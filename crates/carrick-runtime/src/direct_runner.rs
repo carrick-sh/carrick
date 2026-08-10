@@ -1818,7 +1818,12 @@ impl DirectRunner {
         });
         let reporter = crate::compat::CompatReporter::default();
         let mut memory = self.memory;
+        let kernel = self
+            .dispatcher
+            .capture_one_task_context()
+            .map_err(|_| crate::host_to_linux_errno(libc::EIO).guest_retval())?;
         match self.dispatcher.dispatch_threaded(
+            &kernel,
             request,
             &mut memory,
             &reporter,
@@ -2134,12 +2139,23 @@ impl DirectRunner {
         let mut fd_wait_deadline: Option<Instant> = None;
         // The signal-wait (`WaitOnSignals`) overall deadline, same contract.
         let mut signal_wait_deadline: Option<Instant> = None;
+        let kernel = match self.dispatcher.capture_one_task_context() {
+            Ok(kernel) => kernel,
+            Err(error) => {
+                self.end_process(DirectRunOutcome::Unsupported {
+                    syscall: number,
+                    outcome: format!("capture one-task kernel context: {error}"),
+                });
+                return ServiceVerdict::Leave;
+            }
+        };
         loop {
             self.park_for_fork_quiesce();
             if self.exiting.load(Ordering::SeqCst) {
                 return ServiceVerdict::Leave;
             }
             let outcome = self.dispatcher.dispatch_threaded(
+                &kernel,
                 request,
                 &mut memory,
                 &self.reporter,
@@ -2190,6 +2206,7 @@ impl DirectRunner {
                 // process — identity memory makes the copied address space
                 // the child's guest state by construction (Phase 2 item 2).
                 Ok(DispatchOutcome::Fork {
+                    flags: _,
                     pidfd_out,
                     clone_parent,
                     parent_tid_addr,

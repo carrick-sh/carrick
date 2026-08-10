@@ -262,6 +262,7 @@ fn memory_overlay_regular_open_skips_fifo_probe_when_backend_cannot_have_fifos()
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, LINUX_O_RDWR, 0, 0, 0]),
@@ -299,6 +300,7 @@ fn memory_overlay_regular_open_skips_legacy_kind_lookups() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, LINUX_O_RDWR, 0, 0, 0]),
@@ -330,6 +332,7 @@ fn ioctl_writes_packed_winsize_and_reports_unknown_requests() {
     // fd 1 may be either, so assert against the host's actual answer.
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 29,
                 SyscallArgs::from([1, LINUX_TIOCGWINSZ, 0x4000, 0, 0, 0]),
@@ -355,6 +358,7 @@ fn ioctl_writes_packed_winsize_and_reports_unknown_requests() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(29, SyscallArgs::from([1, 0xdead_beef, 0x4040, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -384,6 +388,7 @@ fn ioctl_tcgets_writes_default_termios_for_stdio_and_enotty_for_files() {
     let stdin_is_tty = carrick_runtime::host_tty::host_isatty(0);
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TCGETS, 0x4000, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -404,6 +409,7 @@ fn ioctl_tcgets_writes_default_termios_for_stdio_and_enotty_for_files() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(29, SyscallArgs::from([99, LINUX_TCGETS, 0x4080, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -426,6 +432,7 @@ fn ioctl_tcgets_writes_default_termios_for_stdio_and_enotty_for_files() {
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
     let opened = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 56,
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -441,6 +448,7 @@ fn ioctl_tcgets_writes_default_termios_for_stdio_and_enotty_for_files() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     29,
                     SyscallArgs::from([file_fd as u64, LINUX_TCGETS, 0x4080, 0, 0, 0])
@@ -466,6 +474,7 @@ fn ioctl_tcgets_writes_default_termios_for_stdio_and_enotty_for_files() {
         .unwrap();
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TCSETS, 0x4000, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -479,6 +488,7 @@ fn ioctl_tcgets_writes_default_termios_for_stdio_and_enotty_for_files() {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TCSETS, 0x1, 0, 0, 0])),
                     &mut memory,
                     &reporter,
@@ -519,6 +529,7 @@ fn ioctl_tcgets2_is_recognized_and_mirrors_tcgets() {
     let stdin_is_tty = carrick_runtime::host_tty::host_isatty(0);
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TCGETS2, 0x4000, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -543,6 +554,7 @@ fn ioctl_tcgets2_is_recognized_and_mirrors_tcgets() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(29, SyscallArgs::from([99, LINUX_TCGETS2, 0x4080, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -559,6 +571,7 @@ fn ioctl_tcgets2_is_recognized_and_mirrors_tcgets() {
         .unwrap();
     let set_outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TCSETS2, 0x4000, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -602,6 +615,7 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TIOCGPGRP, 0x4000, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -622,6 +636,7 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(29, SyscallArgs::from([2, LINUX_TIOCGSID, 0x4010, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -641,6 +656,7 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     29,
                     SyscallArgs::from([99, LINUX_TIOCGPGRP, 0x4020, 0, 0, 0])
@@ -661,6 +677,7 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TIOCSPGRP, 0x4030, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -673,6 +690,7 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(
                         29,
                         SyscallArgs::from([0, LINUX_TIOCSPGRP, 0x4040, 0, 0, 0])
@@ -691,6 +709,7 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(29, SyscallArgs::from([1, LINUX_TIOCSCTTY, 1, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -701,6 +720,7 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TIOCNOTTY, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -721,6 +741,7 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
     let opened = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 56,
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -736,6 +757,7 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     29,
                     SyscallArgs::from([file_fd as u64, LINUX_TIOCGPGRP, 0x4040, 0, 0, 0])
@@ -751,6 +773,7 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     29,
                     SyscallArgs::from([file_fd as u64, LINUX_TIOCGSID, 0x4048, 0, 0, 0])
@@ -955,6 +978,7 @@ fn flock_accepts_bootstrap_advisory_locks_on_open_files() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -968,6 +992,7 @@ fn flock_accepts_bootstrap_advisory_locks_on_open_files() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     32,
                     SyscallArgs::from([3, LINUX_LOCK_SH | LINUX_LOCK_NB, 0, 0, 0, 0]),
@@ -981,6 +1006,7 @@ fn flock_accepts_bootstrap_advisory_locks_on_open_files() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(32, SyscallArgs::from([3, LINUX_LOCK_UN, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -991,6 +1017,7 @@ fn flock_accepts_bootstrap_advisory_locks_on_open_files() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(32, SyscallArgs::from([3, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1003,6 +1030,7 @@ fn flock_accepts_bootstrap_advisory_locks_on_open_files() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(32, SyscallArgs::from([99, LINUX_LOCK_SH, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1029,6 +1057,7 @@ fn openat_read_close_round_trip_through_rootfs_fd() {
 
     let opened = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 56,
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -1041,6 +1070,7 @@ fn openat_read_close_round_trip_through_rootfs_fd() {
 
     let read = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(63, SyscallArgs::from([3, 0x4100, 64, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -1054,6 +1084,7 @@ fn openat_read_close_round_trip_through_rootfs_fd() {
 
     let closed = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(57, SyscallArgs::from([3, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -1076,6 +1107,7 @@ fn openat_missing_rootfs_file_returns_enoent() {
 
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 56,
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -1112,6 +1144,7 @@ fn openat2_reads_open_how_and_opens_readonly_rootfs_paths() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     437,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4020, 24, 0, 0]),
@@ -1125,6 +1158,7 @@ fn openat2_reads_open_how_and_opens_readonly_rootfs_paths() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(25, SyscallArgs::from([3, LINUX_F_GETFD, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1137,6 +1171,7 @@ fn openat2_reads_open_how_and_opens_readonly_rootfs_paths() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4100, 64, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1152,6 +1187,7 @@ fn openat2_reads_open_how_and_opens_readonly_rootfs_paths() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     437,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4060, 24, 0, 0]),
@@ -1165,6 +1201,7 @@ fn openat2_reads_open_how_and_opens_readonly_rootfs_paths() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     437,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x40a0, 24, 0, 0]),
@@ -1178,6 +1215,7 @@ fn openat2_reads_open_how_and_opens_readonly_rootfs_paths() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     437,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4020, 16, 0, 0]),
@@ -1205,6 +1243,7 @@ fn open_o_tmpfile_creates_anonymous_writable_file() {
     let mut dispatcher = SyscallDispatcher::new();
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -1280,6 +1319,7 @@ fn open_o_tmpfile_materializes_via_proc_self_fd_linkat() {
     let mut dispatcher = SyscallDispatcher::new();
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -1391,6 +1431,7 @@ fn open_o_tmpfile_materialize_preserves_setuid_setgid_host_backend() {
 
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -1495,6 +1536,7 @@ fn fcntl_async_io_setup_retains_o_async_and_round_trips_owner_and_sig() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -1630,6 +1672,7 @@ fn fcntl_setlease_wrlck_conflicts_with_a_second_opener() {
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
         d.dispatch(
+            &d.capture_one_task_context().unwrap(),
             SyscallRequest::new(nr, SyscallArgs::from(args)),
             m,
             &reporter,
@@ -1702,6 +1745,7 @@ fn dup_shares_rootfs_file_offset_with_original_fd() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -1715,6 +1759,7 @@ fn dup_shares_rootfs_file_offset_with_original_fd() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(23, SyscallArgs::from([3, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1725,6 +1770,7 @@ fn dup_shares_rootfs_file_offset_with_original_fd() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4100, 4, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1735,6 +1781,7 @@ fn dup_shares_rootfs_file_offset_with_original_fd() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([4, 0x4200, 4, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1762,6 +1809,7 @@ fn dup3_installs_requested_fd_and_cloexec_is_per_descriptor() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -1775,6 +1823,7 @@ fn dup3_installs_requested_fd_and_cloexec_is_per_descriptor() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(24, SyscallArgs::from([3, 9, LINUX_O_CLOEXEC, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1785,6 +1834,7 @@ fn dup3_installs_requested_fd_and_cloexec_is_per_descriptor() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(25, SyscallArgs::from([3, LINUX_F_GETFD, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1795,6 +1845,7 @@ fn dup3_installs_requested_fd_and_cloexec_is_per_descriptor() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(25, SyscallArgs::from([9, LINUX_F_GETFD, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1822,6 +1873,7 @@ fn fcntl_gets_and_sets_descriptor_and_status_flags() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, LINUX_O_CLOEXEC, 0, 0, 0]),
@@ -1835,6 +1887,7 @@ fn fcntl_gets_and_sets_descriptor_and_status_flags() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(25, SyscallArgs::from([3, LINUX_F_GETFD, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1847,6 +1900,7 @@ fn fcntl_gets_and_sets_descriptor_and_status_flags() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(25, SyscallArgs::from([3, LINUX_F_SETFD, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1857,6 +1911,7 @@ fn fcntl_gets_and_sets_descriptor_and_status_flags() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(25, SyscallArgs::from([3, LINUX_F_GETFD, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1867,6 +1922,7 @@ fn fcntl_gets_and_sets_descriptor_and_status_flags() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(25, SyscallArgs::from([3, LINUX_F_GETFL, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1877,6 +1933,7 @@ fn fcntl_gets_and_sets_descriptor_and_status_flags() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     25,
                     SyscallArgs::from([3, LINUX_F_DUPFD_CLOEXEC, 8, 0, 0, 0]),
@@ -1890,6 +1947,7 @@ fn fcntl_gets_and_sets_descriptor_and_status_flags() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(25, SyscallArgs::from([8, LINUX_F_GETFD, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1902,6 +1960,7 @@ fn fcntl_gets_and_sets_descriptor_and_status_flags() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(25, SyscallArgs::from([3, LINUX_F_DUPFD, 8, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -1928,6 +1987,7 @@ fn fcntl_on_bare_stdio_succeeds_not_ebadf() {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(
                         25,
                         SyscallArgs::from([fd, LINUX_F_SETFL, LINUX_O_NONBLOCK, 0, 0, 0]),
@@ -1942,6 +2002,7 @@ fn fcntl_on_bare_stdio_succeeds_not_ebadf() {
         for cmd in [LINUX_F_GETFD, LINUX_F_GETFL] {
             let outcome = dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(25, SyscallArgs::from([fd, cmd, 0, 0, 0, 0])),
                     &mut memory,
                     &reporter,
@@ -1958,6 +2019,7 @@ fn fcntl_on_bare_stdio_succeeds_not_ebadf() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     25,
                     SyscallArgs::from([999, LINUX_F_SETFL, LINUX_O_NONBLOCK, 0, 0, 0]),
@@ -1990,6 +2052,7 @@ fn close_range_frees_pty_master_entry() {
     // openat(AT_FDCWD, "/dev/ptmx", O_RDWR=2) → master fd; allocates pts index 0.
     let master = match dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 56,
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 2, 0, 0, 0]),
@@ -2009,6 +2072,7 @@ fn close_range_frees_pty_master_entry() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     29,
                     SyscallArgs::from([master, LINUX_TIOCSPTLCK, lockarg, 0, 0, 0])
@@ -2026,6 +2090,7 @@ fn close_range_frees_pty_master_entry() {
         matches!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(
                         56,
                         SyscallArgs::from([(-100_i64) as u64, 0x4040, 2, 0, 0, 0])
@@ -2044,6 +2109,7 @@ fn close_range_frees_pty_master_entry() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(436, SyscallArgs::from([master, master, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -2057,6 +2123,7 @@ fn close_range_frees_pty_master_entry() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4040, 2, 0, 0, 0])
@@ -2094,6 +2161,7 @@ fn small_write_to_large_overlay_file_does_not_rewrite_whole_file() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, LINUX_O_RDWR, 0, 0, 0]),
@@ -2107,6 +2175,7 @@ fn small_write_to_large_overlay_file_does_not_rewrite_whole_file() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(64, SyscallArgs::from([3, 0x4100, 1, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -2117,6 +2186,7 @@ fn small_write_to_large_overlay_file_does_not_rewrite_whole_file() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(56, SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -2127,6 +2197,7 @@ fn small_write_to_large_overlay_file_does_not_rewrite_whole_file() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(63, SyscallArgs::from([4, 0x4200, 1, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -2172,6 +2243,7 @@ fn small_write_to_large_rootfs_file_does_not_copy_up_whole_file() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, LINUX_O_RDWR, 0, 0, 0]),
@@ -2185,6 +2257,7 @@ fn small_write_to_large_rootfs_file_does_not_copy_up_whole_file() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(64, SyscallArgs::from([3, 0x4100, 1, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -2195,6 +2268,7 @@ fn small_write_to_large_rootfs_file_does_not_copy_up_whole_file() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(67, SyscallArgs::from([3, 0x4200, 2, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -2227,6 +2301,7 @@ fn x86_private_dup2_installs_requested_fd_and_allows_same_fd_noop() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     56,
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
@@ -2240,6 +2315,7 @@ fn x86_private_dup2_installs_requested_fd_and_allows_same_fd_noop() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     carrick_runtime::linux_abi::CARRICK_PRIVATE_X86_DUP2,
                     SyscallArgs::from([3, 1, 0, 0, 0, 0]),
@@ -2253,6 +2329,7 @@ fn x86_private_dup2_installs_requested_fd_and_allows_same_fd_noop() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     carrick_runtime::linux_abi::CARRICK_PRIVATE_X86_DUP2,
                     SyscallArgs::from([1, 1, 0, 0, 0, 0]),
@@ -2266,6 +2343,7 @@ fn x86_private_dup2_installs_requested_fd_and_allows_same_fd_noop() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(24, SyscallArgs::from([1, 1, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,

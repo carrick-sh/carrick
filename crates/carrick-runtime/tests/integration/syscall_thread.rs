@@ -32,6 +32,7 @@ fn clone_with_pthread_flags_emits_clone_thread() {
     // clone(flags, stack, parent_tid, tls, child_tid)  [syscall 220]
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 220,
                 SyscallArgs::from([flags, 0x7000, 0x100, 0x9000, 0x200, 0]),
@@ -61,6 +62,7 @@ fn clone_fork_flags_still_fork() {
     let mut dispatcher = SyscallDispatcher::new();
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(220, SyscallArgs::from([0x1200011, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -71,6 +73,7 @@ fn clone_fork_flags_still_fork() {
     assert_eq!(
         outcome,
         DispatchOutcome::Fork {
+            flags: 0x1200011,
             pidfd_out: None,
             clone_parent: false,
             parent_tid_addr: None,
@@ -111,6 +114,7 @@ fn gettid_returns_per_thread_tid_not_pid() {
     // gettid is syscall 178.
     let outcome = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(178, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -139,6 +143,7 @@ fn set_tid_address_records_clear_child_tid_and_returns_tid() {
     // set_tid_address(addr) is syscall 96.
     let outcome = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(96, SyscallArgs::from([0x10500, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -168,6 +173,7 @@ fn sched_getscheduler_accepts_live_sibling_tid() {
 
     let outcome = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 SYS_SCHED_GETSCHEDULER,
                 SyscallArgs::from([sibling.raw() as u64, 0, 0, 0, 0, 0]),
@@ -200,6 +206,7 @@ fn sched_getparam_accepts_live_sibling_tid() {
 
     let outcome = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 SYS_SCHED_GETPARAM,
                 SyscallArgs::from([sibling.raw() as u64, 0x10800, 0, 0, 0, 0]),
@@ -227,6 +234,7 @@ fn sched_getscheduler_unknown_sibling_tid_is_esrch() {
 
     let outcome = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 SYS_SCHED_GETSCHEDULER,
                 SyscallArgs::from([424242, 0, 0, 0, 0, 0]),
@@ -256,6 +264,7 @@ fn futex_wait_value_mismatch_returns_eagain() {
     let op = LINUX_FUTEX_WAIT | LINUX_FUTEX_PRIVATE_FLAG;
     let outcome = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 7, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -284,6 +293,7 @@ fn futex_wake_returns_count_and_advances_table() {
     // FUTEX_WAKE with no parked waiter reports the actual wake count: zero.
     let outcome = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 1, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -308,6 +318,7 @@ fn futex_wait_matching_value_blocks_via_outcome() {
     let op = LINUX_FUTEX_WAIT | LINUX_FUTEX_PRIVATE_FLAG;
     let outcome = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 42, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -338,6 +349,7 @@ fn futex_requeue_private_no_waiters_returns_zero() {
     let op = LINUX_FUTEX_REQUEUE | LINUX_FUTEX_PRIVATE_FLAG;
     let outcome = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 1, 8, 0x10900, 0])),
             &mut memory,
             &reporter,
@@ -370,6 +382,7 @@ fn futex_cmp_requeue_matching_val3_no_waiters_returns_zero() {
     let op = LINUX_FUTEX_CMP_REQUEUE | LINUX_FUTEX_PRIVATE_FLAG;
     let outcome = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 1, 8, 0x10900, 77])),
             &mut memory,
             &reporter,
@@ -403,6 +416,7 @@ fn futex_lock_pi_private_uncontended_records_owner_tid() {
     let op = LINUX_FUTEX_LOCK_PI | LINUX_FUTEX_PRIVATE_FLAG;
     let outcome = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -429,6 +443,7 @@ fn futex_trylock_pi_private_owned_by_self_is_deadlock() {
     let op = LINUX_FUTEX_TRYLOCK_PI | LINUX_FUTEX_PRIVATE_FLAG;
     let outcome = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -460,6 +475,7 @@ fn futex_unlock_pi_private_owned_by_self_clears_word() {
     let op = LINUX_FUTEX_UNLOCK_PI | LINUX_FUTEX_PRIVATE_FLAG;
     let outcome = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -496,6 +512,7 @@ fn tgkill_to_sibling_emits_signalthread() {
     // tgkill(tgid, tid=sibling, SIGUSR1) issued by the main thread (tid 1000).
     let outcome = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 131,
                 SyscallArgs::from([1000, sibling.raw() as u64, SIGUSR1, 0, 0, 0]),
@@ -527,6 +544,7 @@ fn tgkill_to_sibling_queues_si_tkill_siginfo() {
 
     let outcome = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 131,
                 SyscallArgs::from([1000, sibling.raw() as u64, SIGUSR1, 0, 0, 0]),
@@ -570,6 +588,7 @@ fn tgkill_to_self_raises_locally() {
     // process-directed: a sibling must not be able to drain it.
     let outcome = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(131, SyscallArgs::from([1000, 1000, SIGUSR1, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -602,6 +621,7 @@ fn tgkill_to_masked_sibling_queues_without_signalthread() {
     assert_eq!(
         dispatcher
             .dispatch_threaded(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     135,
                     SyscallArgs::from([LINUX_SIG_BLOCK, 0x10000, 0, 8, 0, 0])
@@ -618,6 +638,7 @@ fn tgkill_to_masked_sibling_queues_without_signalthread() {
 
     let outcome = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(
                 131,
                 SyscallArgs::from([1000, sibling.raw() as u64, SIGUSR1, 0, 0, 0]),
@@ -634,6 +655,7 @@ fn tgkill_to_masked_sibling_queues_without_signalthread() {
     assert_eq!(
         dispatcher
             .dispatch_threaded(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     135,
                     SyscallArgs::from([LINUX_SIG_UNBLOCK, 0x10000, 0, 8, 0, 0]),
@@ -664,6 +686,7 @@ fn tkill_to_unknown_tid_is_esrch() {
     // bootstrap pid -> ESRCH.
     let outcome = dispatcher
         .dispatch_threaded(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(130, SyscallArgs::from([424242, SIGUSR1, 0, 0, 0, 0])),
             &mut memory,
             &reporter,

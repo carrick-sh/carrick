@@ -2838,6 +2838,7 @@ mod ipv6_addrform_tests {
 
         let fd = match dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     198,
                     SyscallArgs::from([
@@ -2864,6 +2865,7 @@ mod ipv6_addrform_tests {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(
                         208,
                         SyscallArgs::from([
@@ -2889,6 +2891,7 @@ mod ipv6_addrform_tests {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(203, SyscallArgs::from([fd as u64, 0x4010, 16, 0, 0, 0]),),
                     &mut memory,
                     &reporter,

@@ -836,6 +836,8 @@ pub struct SyscallRequest {
 ///
 /// See [[plan-syscall-macro-split]].
 pub struct SyscallCtx<'a, M: GuestMemory> {
+    /// Coherent kernel object generation captured once at syscall entry.
+    pub kernel: &'a crate::kernel::KernelContext,
     pub request: SyscallRequest,
     pub memory: &'a mut M,
     pub reporter: &'a CompatReporter,
@@ -1366,6 +1368,8 @@ pub enum DispatchOutcome {
     /// to `addr` in the parent. Go's `os/exec` clones with `CLONE_PIDFD` and
     /// then waits on that fd.
     Fork {
+        /// Complete clone flag set used to derive the authoritative kernel plan.
+        flags: u64,
         pidfd_out: Option<u64>,
         /// `CLONE_PARENT`: the child is guest-parented to the caller's parent,
         /// even though Carrick must still create it as a host child of the
@@ -2098,6 +2102,10 @@ impl Drop for HostAliasDispatchGuard {
 }
 
 pub struct SyscallDispatcher {
+    /// Generation-safe task adapter used to capture the mandatory kernel
+    /// context at each backend dispatch boundary. HVPatch replaces the initial
+    /// one-task binding when its root/child task is published.
+    kernel_binding: RwLock<crate::kernel::KernelTaskBinding>,
     /// Owned I/O subsystem state (buffered stdout/stderr, stream toggle,
     /// the open-fd table, next-fd cursor, and cwd). See [`fs::IoState`].
     /// Handlers that touch only I/O state borrow `self.io` narrowly.
@@ -2371,9 +2379,57 @@ fn normalize_abs_path(path: &str) -> String {
     }
 }
 
+fn bootstrap_one_task_binding() -> crate::kernel::KernelTaskBinding {
+    let observed_pid = i32::try_from(std::process::id()).unwrap_or(1);
+    let registry_id = crate::thread::ThreadId::main_from_host_pid();
+    let bootstrap = match crate::kernel::RootBootstrap::for_reference_model(
+        observed_pid,
+        registry_id,
+        "one-task-dispatch-adapter".to_owned(),
+    ) {
+        Ok(bootstrap) => bootstrap,
+        Err(error) => {
+            tracing::error!(%error, "cannot build mandatory one-task kernel adapter");
+            std::process::abort();
+        }
+    };
+    let context = match crate::kernel::Kernel::bootstrap_root(bootstrap) {
+        Ok((_, context)) => context,
+        Err(error) => {
+            tracing::error!(%error, "cannot bootstrap mandatory one-task kernel adapter");
+            std::process::abort();
+        }
+    };
+    context.task_binding()
+}
+
 impl Default for SyscallDispatcher {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod kernel_context_tests {
+    use super::*;
+
+    #[test]
+    fn one_task_adapter_registers_explicit_linux_tid_for_backend_thread() {
+        let dispatcher = SyscallDispatcher::new();
+        let registry_id = crate::thread::ThreadId::synthetic_for_tests(91_337);
+        let linux_tid = dispatcher
+            .register_one_task_thread(registry_id)
+            .expect("register one-task thread");
+        let context = dispatcher
+            .capture_kernel_context(linux_tid)
+            .expect("capture registered Linux tid");
+
+        assert_eq!(context.thread().key().tid, linux_tid);
+        assert_eq!(context.thread().registry_id(), registry_id);
+        dispatcher
+            .exit_one_task_thread(linux_tid)
+            .expect("retire one-task thread");
+        assert!(dispatcher.capture_kernel_context(linux_tid).is_err());
     }
 }
 
@@ -2408,9 +2464,59 @@ fn resolve_handler<M: GuestMemory>(number: u64) -> Option<SyscallHandler<M>> {
 
 impl SyscallDispatcher {
     pub(crate) fn bind_hvpatch_process(&self, process: crate::hvpatch::ProcessContext) {
+        *self.kernel_binding.write() = process.task_binding();
         let mut proc = self.proc.lock();
         proc.virtual_pid = Some(process.pid() as u32);
         proc.hvpatch_process = Some(process);
+    }
+
+    pub(crate) fn capture_kernel_context(
+        &self,
+        tid: crate::kernel::LinuxTid,
+    ) -> Result<crate::kernel::KernelContext, crate::kernel::KernelError> {
+        self.kernel_binding.read().capture(tid)
+    }
+
+    pub fn capture_one_task_context(
+        &self,
+    ) -> Result<crate::kernel::KernelContext, crate::kernel::KernelError> {
+        let binding = self.kernel_binding.read();
+        binding.capture(crate::kernel::LinuxTid::for_task_leader(binding.task_id()))
+    }
+
+    pub(crate) fn register_one_task_thread(
+        &self,
+        registry_id: crate::thread::ThreadId,
+    ) -> Result<crate::kernel::LinuxTid, crate::kernel::KernelOperationError> {
+        let binding = self.kernel_binding.read().clone();
+        let leader = binding
+            .capture(crate::kernel::LinuxTid::for_task_leader(binding.task_id()))
+            .map_err(|_| crate::kernel::KernelOperationError::UnknownTask(binding.task_id()))?;
+        let flags = carrick_abi::LinuxCloneFlags::VM
+            | carrick_abi::LinuxCloneFlags::FS
+            | carrick_abi::LinuxCloneFlags::FILES
+            | carrick_abi::LinuxCloneFlags::SIGHAND
+            | carrick_abi::LinuxCloneFlags::THREAD;
+        let plan = crate::kernel::ClonePlan::from_flags(flags)
+            .map_err(crate::kernel::KernelOperationError::ClonePlan)?;
+        binding
+            .kernel()
+            .reserve_thread_clone(&leader, plan, None)?
+            .prepare(registry_id)?
+            .commit()?
+            .into_context()
+            .map(|context| context.thread().key().tid)
+    }
+
+    pub(crate) fn exit_one_task_thread(
+        &self,
+        tid: crate::kernel::LinuxTid,
+    ) -> Result<(), crate::kernel::KernelOperationError> {
+        let binding = self.kernel_binding.read().clone();
+        let context = binding
+            .capture(tid)
+            .map_err(|_| crate::kernel::KernelOperationError::UnknownTask(binding.task_id()))?;
+        binding.kernel().exit_thread(&context, None).map(|_| ())
     }
 
     pub(crate) fn hvpatch_process(&self) -> Option<crate::hvpatch::ProcessContext> {
@@ -2430,6 +2536,7 @@ impl SyscallDispatcher {
         child_guest_pid: u32,
     ) -> Self {
         Self {
+            kernel_binding: RwLock::new(self.kernel_binding.read().clone()),
             io: self.io.fork_clone(),
             mem: Mutex::new(self.mem.lock().clone()),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
@@ -2502,6 +2609,7 @@ impl SyscallDispatcher {
     /// transient `SyscallCtx` and invokes the resolved handler.
     fn dispatch_normalized(
         &self,
+        kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
         memory: &mut impl GuestMemory,
         reporter: &CompatReporter,
@@ -2510,6 +2618,7 @@ impl SyscallDispatcher {
         let handler = resolve_handler(request.number.raw())?;
         let canonical_nr = request.number.raw();
         let mut ctx = SyscallCtx {
+            kernel,
             request,
             memory,
             reporter,
@@ -2550,6 +2659,7 @@ impl SyscallDispatcher {
 
     pub fn new() -> Self {
         Self {
+            kernel_binding: RwLock::new(bootstrap_one_task_binding()),
             io: fs::IoState::new(),
             mem: Mutex::new(mem::MemState::new()),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
@@ -3886,13 +3996,14 @@ impl SyscallDispatcher {
     /// runtime path). Tid-aware handlers see `thread: None`.
     pub fn dispatch(
         &mut self,
+        kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
         memory: &mut impl GuestMemory,
         reporter: &CompatReporter,
     ) -> Result<DispatchOutcome, DispatchError> {
         // Tree-wide forward-progress beat for the deadlock watchdog.
         crate::deadlock_watchdog::tick();
-        self.dispatch_inner(request, memory, reporter, None)
+        self.dispatch_inner(kernel, request, memory, reporter, None)
     }
 
     /// Apply a launch-time container syscall policy (the `carrick run` /
@@ -4029,6 +4140,7 @@ impl SyscallDispatcher {
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch_threaded(
         &self,
+        kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
         memory: &mut impl GuestMemory,
         reporter: &CompatReporter,
@@ -4049,7 +4161,7 @@ impl SyscallDispatcher {
             return Ok(outcome);
         }
         if let Some(result) =
-            self.dispatch_threaded_shared(request, memory, reporter, tid, registry, futex)
+            self.dispatch_threaded_shared(kernel, request, memory, reporter, tid, registry, futex)
         {
             return result;
         }
@@ -4089,6 +4201,7 @@ impl SyscallDispatcher {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_threaded_shared(
         &self,
+        kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
         memory: &mut impl GuestMemory,
         reporter: &CompatReporter,
@@ -4096,9 +4209,9 @@ impl SyscallDispatcher {
         registry: &crate::thread::ThreadRegistry,
         futex: &crate::thread::FutexTable,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        if let Some(result) =
-            Self::dispatch_threaded_independent(request, memory, reporter, tid, registry, futex)
-        {
+        if let Some(result) = Self::dispatch_threaded_independent(
+            kernel, request, memory, reporter, tid, registry, futex,
+        ) {
             return Some(result);
         }
 
@@ -4148,7 +4261,7 @@ impl SyscallDispatcher {
             futex,
         });
 
-        let result = self.dispatch_normalized(request, memory, reporter, thread);
+        let result = self.dispatch_normalized(kernel, request, memory, reporter, thread);
         let outcome = match result {
             Some(r) => match lower_handler_result(r) {
                 Ok(outcome) => outcome,
@@ -4181,6 +4294,7 @@ impl SyscallDispatcher {
     /// the dispatcher-wide lock.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_threaded_independent(
+        _kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
         memory: &mut impl GuestMemory,
         reporter: &CompatReporter,
@@ -4305,6 +4419,7 @@ impl SyscallDispatcher {
 
     fn dispatch_inner(
         &mut self,
+        kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
         memory: &mut impl GuestMemory,
         reporter: &CompatReporter,
@@ -4381,7 +4496,7 @@ impl SyscallDispatcher {
         // Syscalls migrated to the normalized SyscallCtx handler contract are
         // dispatched here first; the borrow of memory/reporter is scoped to
         // the call, so the legacy match below can still use them for the rest.
-        if let Some(result) = self.dispatch_normalized(request, memory, reporter, thread) {
+        if let Some(result) = self.dispatch_normalized(kernel, request, memory, reporter, thread) {
             let outcome = lower_handler_result(result)?;
             // Consumption-based EPOLLET re-arm (see `epoll_rearm_after_io`).
             self.epoll_rearm_after_io(&request, &outcome);
@@ -8379,7 +8494,12 @@ mod overlay_dispatch_tests {
         fn call(&mut self, number: u64, args: [u64; 6]) -> DispatchOutcome {
             let request = SyscallRequest::new(number, SyscallArgs(args));
             self.dispatcher
-                .dispatch(request, &mut self.memory, &self.reporter)
+                .dispatch(
+                    &self.dispatcher.capture_one_task_context().unwrap(),
+                    request,
+                    &mut self.memory,
+                    &self.reporter,
+                )
                 .expect("dispatch must not surface a fatal error")
         }
     }
@@ -8702,7 +8822,12 @@ mod overlay_dispatch_tests {
         let read_request = SyscallRequest::new(63, read_args);
         let read_outcome = h
             .dispatcher
-            .dispatch(read_request, &mut h.memory, &h.reporter)
+            .dispatch(
+                &h.dispatcher.capture_one_task_context().unwrap(),
+                read_request,
+                &mut h.memory,
+                &h.reporter,
+            )
             .expect("read dispatch");
         assert!(matches!(
             read_outcome,
@@ -9390,6 +9515,7 @@ mod overlay_dispatch_tests {
             let mut mem = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
             let out = dispatcher
                 .dispatch_threaded(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(20, SyscallArgs::from([0u64; 6])),
                     &mut mem,
                     &reporter,
@@ -9426,6 +9552,7 @@ mod overlay_dispatch_tests {
                 while !stop.load(Ordering::Relaxed) {
                     let out = dispatcher
                         .dispatch_threaded(
+                            &dispatcher.capture_one_task_context().unwrap(),
                             SyscallRequest::new(
                                 22,
                                 SyscallArgs::from([epfd, ev_buf, max, 50, 0, 0]),
@@ -9488,6 +9615,7 @@ mod overlay_dispatch_tests {
                         |mem: &mut LinearMemory, num: u64, args: [u64; 6]| -> DispatchOutcome {
                             dispatcher
                                 .dispatch_threaded(
+                                    &dispatcher.capture_one_task_context().unwrap(),
                                     SyscallRequest::new(num, SyscallArgs::from(args)),
                                     mem,
                                     reporter,
@@ -9589,6 +9717,7 @@ mod overlay_dispatch_tests {
             let mut mem = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
             let out = dispatcher
                 .dispatch_threaded(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(20, SyscallArgs::from([0u64; 6])),
                     &mut mem,
                     &reporter,
@@ -9625,6 +9754,7 @@ mod overlay_dispatch_tests {
                 while !stop.load(Ordering::Relaxed) {
                     let out = dispatcher
                         .dispatch_threaded(
+                            &dispatcher.capture_one_task_context().unwrap(),
                             SyscallRequest::new(
                                 22,
                                 SyscallArgs::from([epfd, ev_buf, max, 50, 0, 0]),
@@ -9686,6 +9816,7 @@ mod overlay_dispatch_tests {
                         |mem: &mut LinearMemory, num: u64, args: [u64; 6]| -> DispatchOutcome {
                             dispatcher
                                 .dispatch_threaded(
+                                    &dispatcher.capture_one_task_context().unwrap(),
                                     SyscallRequest::new(num, SyscallArgs::from(args)),
                                     mem,
                                     reporter,
@@ -9730,6 +9861,7 @@ mod overlay_dispatch_tests {
                         |mem: &mut LinearMemory, num: u64, args: [u64; 6]| -> DispatchOutcome {
                             dispatcher
                                 .dispatch_threaded(
+                                    &dispatcher.capture_one_task_context().unwrap(),
                                     SyscallRequest::new(num, SyscallArgs::from(args)),
                                     mem,
                                     reporter,
@@ -10411,6 +10543,7 @@ mod overlay_dispatch_tests {
 
         let outcome = dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     222,
                     SyscallArgs::from([
@@ -10464,7 +10597,12 @@ mod overlay_dispatch_tests {
 
         assert_eq!(
             dispatcher
-                .dispatch(SyscallRequest::new(222, mmap_args), &mut memory, &reporter)
+                .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
+                    SyscallRequest::new(222, mmap_args),
+                    &mut memory,
+                    &reporter
+                )
                 .unwrap(),
             DispatchOutcome::Returned {
                 value: crate::memory::LINUX_SHARED_FILE_BASE as i64
@@ -10475,6 +10613,7 @@ mod overlay_dispatch_tests {
         assert_eq!(
             dispatcher
                 .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
                     SyscallRequest::new(
                         215,
                         SyscallArgs::from([
@@ -10496,7 +10635,12 @@ mod overlay_dispatch_tests {
 
         assert_eq!(
             dispatcher
-                .dispatch(SyscallRequest::new(222, mmap_args), &mut memory, &reporter)
+                .dispatch(
+                    &dispatcher.capture_one_task_context().unwrap(),
+                    SyscallRequest::new(222, mmap_args),
+                    &mut memory,
+                    &reporter
+                )
                 .unwrap(),
             DispatchOutcome::Returned {
                 value: crate::memory::LINUX_SHARED_FILE_BASE as i64
@@ -10543,8 +10687,14 @@ mod overlay_dispatch_tests {
         ] {
             let req = SyscallRequest::new(nr, SyscallArgs::from([0, 0, 0, 0, 0, 0]));
             assert!(
-                d.dispatch_normalized(req, &mut mem, &reporter, None)
-                    .is_some(),
+                d.dispatch_normalized(
+                    &d.capture_one_task_context().unwrap(),
+                    req,
+                    &mut mem,
+                    &reporter,
+                    None
+                )
+                .is_some(),
                 "syscall {nr} fell through the normalized table",
             );
         }
@@ -10574,7 +10724,12 @@ mod overlay_dispatch_tests {
         // 999 is not a real aarch64 syscall and is not in the table.
         let req = SyscallRequest::new(999, SyscallArgs::from([0, 0, 0, 0, 0, 0]));
         let outcome = d
-            .dispatch(req, &mut mem, &reporter)
+            .dispatch(
+                &d.capture_one_task_context().unwrap(),
+                req,
+                &mut mem,
+                &reporter,
+            )
             .expect("must not error");
         assert_eq!(
             outcome,
@@ -10964,6 +11119,7 @@ mod hvpatch_in_process_fork_tests {
             ($dispatcher:expr, $number:expr, $args:expr $(,)?) => {
                 $dispatcher
                     .dispatch_threaded(
+                        &$dispatcher.capture_one_task_context().unwrap(),
                         SyscallRequest::new($number, SyscallArgs::from($args)),
                         &mut memory,
                         &reporter,
@@ -11330,6 +11486,7 @@ mod container_policy_dispatch_tests {
         let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; 4096]);
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(nr, SyscallArgs([0; 6])),
                 &mut memory,
                 &reporter,
@@ -11357,6 +11514,7 @@ mod container_policy_dispatch_tests {
         let mut dispatcher = dispatcher;
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(SYS_ADD_KEY, SyscallArgs([0; 6])),
                 &mut memory,
                 &reporter,
@@ -11424,6 +11582,7 @@ mod container_policy_dispatch_tests {
         let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; 4096]);
         let outcome = dispatcher
             .dispatch_threaded(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(SYS_KEYCTL, SyscallArgs([0; 6])),
                 &mut memory,
                 &reporter,

@@ -19,6 +19,7 @@ fn clock_gettime_writes_packed_linux_timespec() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(113, SyscallArgs::from([0, 0x4000, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -43,6 +44,7 @@ fn sysinfo_reports_uptime_not_epoch_time() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(179, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -71,6 +73,7 @@ fn clock_getres_writes_packed_linux_timespec() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(114, SyscallArgs::from([1, 0x4000, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -99,6 +102,7 @@ fn nanosleep_accepts_packed_timespec_and_rejects_invalid_inputs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(101, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -110,6 +114,7 @@ fn nanosleep_accepts_packed_timespec_and_rejects_invalid_inputs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(101, SyscallArgs::from([0x5000, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -126,6 +131,7 @@ fn nanosleep_accepts_packed_timespec_and_rejects_invalid_inputs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(101, SyscallArgs::from([0x4010, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -151,6 +157,7 @@ fn relative_sleeps_carry_remaining_time_pointer_for_eintr() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(101, SyscallArgs::from([0x4000, 0x4020, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -165,6 +172,7 @@ fn relative_sleeps_carry_remaining_time_pointer_for_eintr() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     115,
                     SyscallArgs::from([LINUX_CLOCK_MONOTONIC, 0, 0x4000, 0x4030, 0, 0]),
@@ -192,6 +200,7 @@ fn clock_nanosleep_accepts_relative_and_absolute_timespecs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     115,
                     SyscallArgs::from([LINUX_CLOCK_MONOTONIC, 0, 0x4000, 0, 0, 0]),
@@ -206,6 +215,7 @@ fn clock_nanosleep_accepts_relative_and_absolute_timespecs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     115,
                     SyscallArgs::from([
@@ -227,6 +237,7 @@ fn clock_nanosleep_accepts_relative_and_absolute_timespecs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(115, SyscallArgs::from([99, 0, 0x4000, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -239,6 +250,7 @@ fn clock_nanosleep_accepts_relative_and_absolute_timespecs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     115,
                     SyscallArgs::from([LINUX_CLOCK_MONOTONIC, 2, 0x4000, 0, 0, 0]),
@@ -254,6 +266,7 @@ fn clock_nanosleep_accepts_relative_and_absolute_timespecs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     115,
                     SyscallArgs::from([LINUX_CLOCK_MONOTONIC, 0, 0x5000, 0, 0, 0]),
@@ -289,6 +302,7 @@ fn clock_settime_bootstrap_returns_eperm_for_realtime_and_einval_for_unknown() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     112,
                     SyscallArgs::from([LINUX_CLOCK_REALTIME, 0x4000, 0, 0, 0, 0]),
@@ -304,6 +318,7 @@ fn clock_settime_bootstrap_returns_eperm_for_realtime_and_einval_for_unknown() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     112,
                     SyscallArgs::from([LINUX_CLOCK_MONOTONIC, 0x4000, 0, 0, 0, 0]),
@@ -321,6 +336,7 @@ fn clock_settime_bootstrap_returns_eperm_for_realtime_and_einval_for_unknown() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(112, SyscallArgs::from([99, 0x4000, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -335,6 +351,7 @@ fn clock_settime_bootstrap_returns_eperm_for_realtime_and_einval_for_unknown() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     112,
                     SyscallArgs::from([LINUX_CLOCK_REALTIME, 0x9000, 0, 0, 0, 0]),
@@ -355,6 +372,7 @@ fn clock_settime_bootstrap_returns_eperm_for_realtime_and_einval_for_unknown() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     112,
                     SyscallArgs::from([LINUX_CLOCK_REALTIME, 0x4010, 0, 0, 0, 0]),
@@ -385,6 +403,7 @@ fn getitimer_setitimer_bootstrap_validate_args_and_zero_output() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(102, SyscallArgs::from([0, 0x4000, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -399,6 +418,7 @@ fn getitimer_setitimer_bootstrap_validate_args_and_zero_output() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(102, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -413,6 +433,7 @@ fn getitimer_setitimer_bootstrap_validate_args_and_zero_output() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(102, SyscallArgs::from([99, 0x4000, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -430,6 +451,7 @@ fn getitimer_setitimer_bootstrap_validate_args_and_zero_output() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(103, SyscallArgs::from([0, 0x4040, 0x4080, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -444,6 +466,7 @@ fn getitimer_setitimer_bootstrap_validate_args_and_zero_output() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(103, SyscallArgs::from([99, 0x4040, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -460,6 +483,7 @@ fn getitimer_setitimer_bootstrap_validate_args_and_zero_output() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(103, SyscallArgs::from([0, 0x40c0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -474,6 +498,7 @@ fn getitimer_setitimer_bootstrap_validate_args_and_zero_output() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(103, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -514,6 +539,7 @@ fn timer_create_rejects_thread_cpu_sigev_thread_id() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     107,
                     SyscallArgs::from([LINUX_CLOCK_THREAD_CPUTIME_ID, 0x4000, 0x4080, 0, 0, 0]),
@@ -530,6 +556,7 @@ fn timer_create_rejects_thread_cpu_sigev_thread_id() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     107,
                     SyscallArgs::from([LINUX_CLOCK_MONOTONIC, 0x4000, 0x4080, 0, 0, 0]),
@@ -544,6 +571,7 @@ fn timer_create_rejects_thread_cpu_sigev_thread_id() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(111, SyscallArgs::from([id, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -574,6 +602,7 @@ fn adjtimex_and_clock_adjtime_return_eperm() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(171, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -586,6 +615,7 @@ fn adjtimex_and_clock_adjtime_return_eperm() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(171, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -600,6 +630,7 @@ fn adjtimex_and_clock_adjtime_return_eperm() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(171, SyscallArgs::from([0x9000, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -614,6 +645,7 @@ fn adjtimex_and_clock_adjtime_return_eperm() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     266,
                     SyscallArgs::from([LINUX_CLOCK_REALTIME, 0x4000, 0, 0, 0, 0]),
@@ -629,6 +661,7 @@ fn adjtimex_and_clock_adjtime_return_eperm() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     266,
                     SyscallArgs::from([LINUX_CLOCK_MONOTONIC, 0x4000, 0, 0, 0, 0]),
@@ -646,6 +679,7 @@ fn adjtimex_and_clock_adjtime_return_eperm() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(
                     266,
                     SyscallArgs::from([LINUX_CLOCK_REALTIME, 0x9000, 0, 0, 0, 0]),
@@ -671,6 +705,7 @@ fn gettimeofday_writes_packed_linux_timeval_and_timezone() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(169, SyscallArgs::from([0x4000, 0x4020, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -700,6 +735,7 @@ fn times_bootstrap_writes_tms_and_returns_monotonic_clock() {
     // Valid buffer: write tms accounting, return positive clock value.
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(153, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -723,6 +759,7 @@ fn times_bootstrap_writes_tms_and_returns_monotonic_clock() {
     // NULL buffer: just return the clock value, nothing written.
     let outcome = dispatcher
         .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
             SyscallRequest::new(153, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -738,6 +775,7 @@ fn times_bootstrap_writes_tms_and_returns_monotonic_clock() {
     assert_eq!(
         dispatcher
             .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(153, SyscallArgs::from([0xdead_0000, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
