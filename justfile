@@ -155,7 +155,14 @@ test *ARGS:
         # cases execute real guests. This recipe is defined as the tests that do
         # NOT need the HVF runtime or Docker; those belong to a guest-capable
         # lane.
-        cargo test --workspace --exclude carrick-runtime --lib --bins {{ARGS}}
+        cargo test --workspace --exclude carrick-runtime --exclude carrick-cli --lib --bins {{ARGS}}
+        # The authenticated jit-shape builders/parsers have measured >1 MiB
+        # debug frames. Several tests need two in one body; libtest's ~2 MiB
+        # default has repeatedly been tipped over by unrelated additions. Keep
+        # the explicit 8 MiB budget already used by their bounded-stack tests,
+        # scoped to the bin-only CLI test process rather than every workspace
+        # crate (see `test(debug): bound the jit-shape publication test's stack`).
+        env RUST_MIN_STACK=8388608 cargo test -p carrick-cli --bin carrick {{ARGS}}
         env RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib {{ARGS}}
         exit 0
     fi

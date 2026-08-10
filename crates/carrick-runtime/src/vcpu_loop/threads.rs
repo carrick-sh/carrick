@@ -611,6 +611,45 @@ where
                                     exit_code = result.exit_code,
                                     "hvpatch sibling reached process exit publication"
                                 );
+                                if child_kernel.dispatcher.execution_backend()
+                                    == crate::page_profile::ExecutionBackend::HvPatch
+                                {
+                                    if let Some(process) = child_kernel
+                                        .hvpatch_process
+                                        .as_ref()
+                                        .filter(|process| process.is_child())
+                                    {
+                                        // An in-process Linux child has no outer
+                                        // CLI owner for its private dispatcher.
+                                        let _ = unsafe {
+                                            libc::write(
+                                                1,
+                                                result.stdout.as_ptr() as *const _,
+                                                result.stdout.len(),
+                                            )
+                                        };
+                                        let _ = unsafe {
+                                            libc::write(
+                                                2,
+                                                result.stderr.as_ptr() as *const _,
+                                                result.stderr.len(),
+                                            )
+                                        };
+                                        if let Err(error) =
+                                            process.publish_exit_code(result.exit_code, tid)
+                                        {
+                                            tracing::error!(
+                                                pid = process.pid(),
+                                                %error,
+                                                "publish sibling-initiated hvpatch child exit failed"
+                                            );
+                                        }
+                                    }
+                                    // A root result is emitted exactly once by
+                                    // the main CLI owner after the completion
+                                    // barrier; never write it from this worker.
+                                    return;
+                                }
                                 let _ = std::io::Write::flush(&mut std::io::stdout());
                                 let _ = std::io::Write::flush(&mut std::io::stderr());
                                 let _ = unsafe {
@@ -627,29 +666,6 @@ where
                                         result.stderr.len(),
                                     )
                                 };
-                                if let Some(process) = child_kernel
-                                    .hvpatch_process
-                                    .as_ref()
-                                    .filter(|process| process.is_child())
-                                {
-                                    // In the shared-VM backend a non-leader
-                                    // thread can be the one that executes
-                                    // exit_group. Its run loop has already
-                                    // drained the process thread group and
-                                    // retired the address-space bank; publish
-                                    // the Linux child status instead of
-                                    // terminating the Carrick host process.
-                                    if let Err(error) =
-                                        process.publish_exit_code(result.exit_code, tid)
-                                    {
-                                        tracing::error!(
-                                            pid = process.pid(),
-                                            %error,
-                                            "publish sibling-initiated hvpatch child exit failed"
-                                        );
-                                    }
-                                    return;
-                                }
                                 unsafe { libc::_exit(result.exit_code) };
                             }
                             Ok(VcpuLoopOutcome::TrapLimit(_)) | Ok(VcpuLoopOutcome::ThreadDone) => {
