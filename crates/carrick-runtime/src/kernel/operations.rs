@@ -3,10 +3,13 @@ use std::sync::Arc;
 use carrick_hal::ThreadId;
 
 use super::address::MmBackend;
-use super::clone_plan::{CloneObjectMode, ClonePlan, CloneTaskMode};
+use super::clone_plan::{
+    CloneObjectMode, ClonePlan, CloneTaskMode, ForkParentMode, ForkPidfdMode, VforkMode,
+};
 use super::core::{
     Kernel, KernelContext, KernelDomain, ProcessGroupRecord, RegistryState, SessionRecord,
-    TaskRecord, TaskRevision, ZombieRecord,
+    TaskExitSubscriber, TaskRecord, TaskRevision, VforkChildRelease, VforkParentWait,
+    VforkReleaseReason, ZombieRecord,
 };
 use super::ids::{LinuxTid, ObjectIdError, ProcessGroupId, SessionId, TaskId};
 use super::objects::{
@@ -44,6 +47,54 @@ pub struct TaskIdentity {
     pub session: SessionId,
 }
 
+#[derive(Clone, Debug)]
+pub struct ReservedPidfdSubscription {
+    domain: Arc<KernelDomain>,
+    task: TaskKey,
+}
+
+impl ReservedPidfdSubscription {
+    pub const fn task(&self) -> TaskKey {
+        self.task
+    }
+
+    pub const fn task_id(&self) -> TaskId {
+        self.task.id
+    }
+
+    pub fn belongs_to(&self, kernel: &Arc<Kernel>) -> bool {
+        Arc::ptr_eq(&self.domain, kernel.domain())
+    }
+}
+
+struct ReservedExitSubscriber(Arc<dyn TaskExitSubscriber>);
+
+impl std::fmt::Debug for ReservedExitSubscriber {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ReservedExitSubscriber(<dyn TaskExitSubscriber>)")
+    }
+}
+
+#[derive(Debug)]
+pub struct PublishedFork {
+    context: KernelContext,
+    vfork_parent_wait: Option<VforkParentWait>,
+}
+
+impl PublishedFork {
+    pub fn context(&self) -> &KernelContext {
+        &self.context
+    }
+
+    pub fn vfork_parent_wait(&self) -> Option<&VforkParentWait> {
+        self.vfork_parent_wait.as_ref()
+    }
+
+    pub fn into_parts(self) -> (KernelContext, Option<VforkParentWait>) {
+        (self.context, self.vfork_parent_wait)
+    }
+}
+
 /// Typed permission to prepare work against one exact task topology revision.
 #[derive(Debug)]
 pub struct TaskOperationReservation {
@@ -67,16 +118,19 @@ impl TaskOperationReservation {
 #[derive(Debug)]
 pub struct ForkReservation {
     kernel: Arc<Kernel>,
-    parent_task: TaskRef,
-    parent_thread: ThreadRef,
-    parent_shared: Arc<TaskShared>,
-    parent_resources: Arc<ThreadResources>,
-    parent_revision: TaskRevision,
+    caller_task: TaskRef,
+    caller_thread: ThreadRef,
+    caller_shared: Arc<TaskShared>,
+    caller_resources: Arc<ThreadResources>,
+    caller_revision: TaskRevision,
+    child_parent_task: TaskRef,
+    child_parent_revision: TaskRevision,
     plan: ClonePlan,
     child_id: TaskId,
     task_reservation: TaskReservation,
     leader_claim: ThreadClaim,
     diagnostic_name: String,
+    vfork_relationship: Option<(VforkParentWait, VforkChildRelease)>,
     failpoint: Option<KernelFailpoint>,
 }
 
@@ -130,13 +184,13 @@ impl ForkReservation {
         child_registry_id: ThreadId,
     ) -> Result<PreparedFork, KernelOperationError> {
         let child_shared = Arc::new(TaskShared::for_new_task_with_mm(
-            &self.parent_shared,
+            &self.caller_shared,
             self.plan,
             self.kernel.object_ids(),
             copied_mm,
         )?);
         let child_resources = Arc::new(ThreadResources::for_clone(
-            &self.parent_resources,
+            &self.caller_resources,
             self.plan,
             self.kernel.object_ids(),
         )?);
@@ -146,9 +200,9 @@ impl ForkReservation {
         };
         let child = Arc::new(Task::new(
             child_key,
-            Some(self.parent_task.key()),
-            self.parent_task.process_group(),
-            self.parent_task.session(),
+            Some(self.child_parent_task.key()),
+            self.caller_task.process_group(),
+            self.caller_task.session(),
             Arc::clone(&child_shared),
         ));
         let leader_tid = LinuxTid::for_task_leader(self.child_id);
@@ -159,7 +213,7 @@ impl ForkReservation {
             },
             child_registry_id,
             Arc::clone(&child_resources),
-            self.parent_thread.signal_state(),
+            self.caller_thread.signal_state(),
         )?;
         check_failpoint(self.failpoint, KernelFailpoint::AfterObjects)?;
         check_failpoint(self.failpoint, KernelFailpoint::AfterBackendPrepare)?;
@@ -169,6 +223,7 @@ impl ForkReservation {
             leader,
             child_shared,
             child_resources,
+            pidfd_subscriber: None,
         })
     }
 }
@@ -180,6 +235,7 @@ pub struct PreparedFork {
     leader: ThreadRef,
     child_shared: Arc<TaskShared>,
     child_resources: Arc<ThreadResources>,
+    pidfd_subscriber: Option<ReservedExitSubscriber>,
 }
 
 impl PreparedFork {
@@ -187,43 +243,87 @@ impl PreparedFork {
         self.reservation.child_id
     }
 
-    pub fn commit(self) -> Result<KernelContext, KernelOperationError> {
+    pub fn reserve_pidfd_subscription<T>(
+        &mut self,
+        subscriber: &Arc<T>,
+    ) -> Result<ReservedPidfdSubscription, KernelOperationError>
+    where
+        T: TaskExitSubscriber + 'static,
+    {
+        if self.reservation.plan.pidfd() != ForkPidfdMode::Requested {
+            return Err(KernelOperationError::UnexpectedPidfdSubscription);
+        }
+        if self.pidfd_subscriber.is_some() {
+            return Err(KernelOperationError::PidfdSubscriptionExists);
+        }
+        let subscriber: Arc<dyn TaskExitSubscriber> = subscriber.clone();
+        self.pidfd_subscriber = Some(ReservedExitSubscriber(subscriber));
+        Ok(ReservedPidfdSubscription {
+            domain: Arc::clone(self.reservation.kernel.domain()),
+            task: self.child.key(),
+        })
+    }
+
+    pub fn commit(self) -> Result<PublishedFork, KernelOperationError> {
         let Self {
             reservation,
             child,
             leader,
             child_shared,
             child_resources,
+            pidfd_subscriber,
         } = self;
+        if reservation.plan.pidfd() == ForkPidfdMode::Requested && pidfd_subscriber.is_none() {
+            return Err(KernelOperationError::MissingPidfdSubscription);
+        }
         let ForkReservation {
             kernel,
-            parent_task,
-            parent_thread: _,
-            parent_shared: _,
-            parent_resources: _,
-            parent_revision,
+            caller_task,
+            caller_thread: _,
+            caller_shared: _,
+            caller_resources: _,
+            caller_revision,
+            child_parent_task,
+            child_parent_revision,
             plan: _,
             child_id,
             task_reservation,
             leader_claim,
             diagnostic_name,
+            vfork_relationship,
             failpoint,
         } = reservation;
         let child_key = child.key();
         let leader_tid = LinuxTid::for_task_leader(child_id);
+        let (vfork_parent_wait, vfork_release) = match vfork_relationship {
+            Some((parent_wait, child_release)) => (Some(parent_wait), Some(child_release)),
+            None => (None, None),
+        };
         {
             let mut state = kernel.registry().state.write();
-            ensure_task_unreserved(&state, parent_task.key().id)?;
-            let Some(parent_record) = state.tasks.get(&parent_task.key().id) else {
+            ensure_task_unreserved(&state, caller_task.key().id)?;
+            if child_parent_task.key() != caller_task.key() {
+                ensure_task_unreserved(&state, child_parent_task.key().id)?;
+            }
+            let Some(caller_record) = state.tasks.get(&caller_task.key().id) else {
                 return Err(KernelOperationError::ParentExited);
             };
-            if parent_record.task.key() != parent_task.key() {
+            if caller_record.task.key() != caller_task.key() {
                 return Err(KernelOperationError::ParentExited);
             }
-            if parent_record.revision != parent_revision {
+            if caller_record.revision != caller_revision {
                 return Err(KernelOperationError::StaleContext);
             }
-            let next_parent_revision = next_revision(parent_record.revision)?;
+            let Some(child_parent_record) = state.tasks.get(&child_parent_task.key().id) else {
+                return Err(KernelOperationError::ForkParentExited);
+            };
+            if child_parent_record.task.key() != child_parent_task.key() {
+                return Err(KernelOperationError::ForkParentExited);
+            }
+            if child_parent_record.revision != child_parent_revision {
+                return Err(KernelOperationError::ForkParentChanged);
+            }
+            let next_child_parent_revision = next_revision(child_parent_record.revision)?;
             let process_group = child.process_group();
             let session = child.session();
             if !state.process_groups.contains_key(&process_group)
@@ -234,7 +334,7 @@ impl PreparedFork {
             check_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
 
             let task_claim = task_reservation.commit();
-            parent_task.add_child(child_key);
+            child_parent_task.add_child(child_key);
             if let Some(group) = state.process_groups.get_mut(&process_group) {
                 group.members.insert(child_key);
             }
@@ -246,23 +346,32 @@ impl PreparedFork {
                     task_claim,
                     thread_claims: std::collections::BTreeMap::from([(leader_tid, leader_claim)]),
                     dead_leader: None,
+                    vfork_release,
                     has_execed: false,
                     diagnostic_name,
                 },
             );
-            if let Some(parent_record) = state.tasks.get_mut(&parent_task.key().id) {
-                parent_record.revision = next_parent_revision;
+            if let Some(subscriber) = pidfd_subscriber {
+                kernel
+                    .exit_subscribers
+                    .register_erased(child_id, &subscriber.0);
+            }
+            if let Some(parent_record) = state.tasks.get_mut(&child_parent_task.key().id) {
+                parent_record.revision = next_child_parent_revision;
             }
         }
 
-        Ok(KernelContext::from_parts(
-            kernel,
-            child,
-            leader,
-            child_shared,
-            child_resources,
-            TaskRevision::INITIAL,
-        ))
+        Ok(PublishedFork {
+            context: KernelContext::from_parts(
+                kernel,
+                child,
+                leader,
+                child_shared,
+                child_resources,
+                TaskRevision::INITIAL,
+            ),
+            vfork_parent_wait,
+        })
     }
 }
 
@@ -429,21 +538,55 @@ impl Kernel {
         if plan.task() != CloneTaskMode::NewTask {
             return Err(KernelOperationError::ExpectedNewTask);
         }
+        let (child_parent_task, child_parent_revision) = {
+            let state = self.registry().state.read();
+            let caller_record = state
+                .tasks
+                .get(&parent.task.key().id)
+                .ok_or(KernelOperationError::ParentExited)?;
+            if caller_record.task.key() != parent.task.key() {
+                return Err(KernelOperationError::ParentExited);
+            }
+            if caller_record.revision != parent.revision {
+                return Err(KernelOperationError::StaleContext);
+            }
+            match plan.fork_parent() {
+                ForkParentMode::Caller => (Arc::clone(&parent.task), parent.revision),
+                ForkParentMode::InheritCallerParent => {
+                    let parent_key = parent.task.parent().ok_or(
+                        KernelOperationError::CloneParentUnavailable(parent.task.key().id),
+                    )?;
+                    let parent_record = state
+                        .tasks
+                        .get(&parent_key.id)
+                        .ok_or(KernelOperationError::ForkParentExited)?;
+                    if parent_record.task.key() != parent_key {
+                        return Err(KernelOperationError::ForkParentExited);
+                    }
+                    (Arc::clone(&parent_record.task), parent_record.revision)
+                }
+            }
+        };
         let (child_id, task_reservation) = self.ids().reserve_task()?;
         let leader_claim = self.ids().claim_task_leader_thread(child_id)?;
         check_failpoint(failpoint, KernelFailpoint::AfterReserve)?;
+        let vfork_relationship =
+            (plan.vfork() == VforkMode::SuspendParent).then(VforkChildRelease::pair);
         Ok(ForkReservation {
             kernel: self.clone(),
-            parent_task: Arc::clone(&parent.task),
-            parent_thread: Arc::clone(&parent.thread),
-            parent_shared: Arc::clone(&parent.shared),
-            parent_resources: Arc::clone(&parent.resources),
-            parent_revision: parent.revision,
+            caller_task: Arc::clone(&parent.task),
+            caller_thread: Arc::clone(&parent.thread),
+            caller_shared: Arc::clone(&parent.shared),
+            caller_resources: Arc::clone(&parent.resources),
+            caller_revision: parent.revision,
+            child_parent_task,
+            child_parent_revision,
             plan,
             child_id,
             task_reservation,
             leader_claim,
             diagnostic_name,
+            vfork_relationship,
             failpoint,
         })
     }
@@ -457,9 +600,18 @@ impl Kernel {
         diagnostic_name: String,
         failpoint: Option<KernelFailpoint>,
     ) -> Result<KernelContext, KernelOperationError> {
-        self.reserve_fork(parent, plan, diagnostic_name, failpoint)?
+        if plan.vfork() == VforkMode::SuspendParent {
+            return Err(KernelOperationError::VforkParentWaitRequired);
+        }
+        let published = self
+            .reserve_fork(parent, plan, diagnostic_name, failpoint)?
             .prepare_reference(child_registry_id)?
-            .commit()
+            .commit()?;
+        let (context, vfork_parent_wait) = published.into_parts();
+        if vfork_parent_wait.is_some() {
+            return Err(KernelOperationError::VforkParentWaitRequired);
+        }
+        Ok(context)
     }
 
     /// Reserve a Linux TID while keeping the thread undiscoverable. The
@@ -1020,6 +1172,7 @@ impl Kernel {
             task_claim,
             thread_claims,
             dead_leader,
+            vfork_release,
             has_execed: _,
             diagnostic_name,
         } = record;
@@ -1086,6 +1239,9 @@ impl Kernel {
         );
         let subscribers = self.exit_subscribers.take(task_id);
         drop(state);
+        if let Some(release) = vfork_release {
+            release.release(VforkReleaseReason::Exit);
+        }
         for subscriber in subscribers
             .into_iter()
             .filter_map(|subscriber| subscriber.upgrade())
@@ -1217,6 +1373,20 @@ pub enum KernelOperationError {
     MissingForkMmBackend,
     #[error("shared-mm fork cannot accept a replacement backend")]
     UnexpectedForkMmBackend,
+    #[error("task {0:?} has no parent to inherit for CLONE_PARENT")]
+    CloneParentUnavailable(TaskId),
+    #[error("selected fork parent exited before commit")]
+    ForkParentExited,
+    #[error("selected fork parent changed before commit")]
+    ForkParentChanged,
+    #[error("fork does not request a pidfd subscription")]
+    UnexpectedPidfdSubscription,
+    #[error("fork already has a reserved pidfd subscription")]
+    PidfdSubscriptionExists,
+    #[error("vfork publication must retain its parent wait handle")]
+    VforkParentWaitRequired,
+    #[error("CLONE_PIDFD fork has no reserved exit subscription")]
+    MissingPidfdSubscription,
     #[error("parent task exited before commit")]
     ParentExited,
     #[error("kernel context revision is stale")]
@@ -1470,10 +1640,11 @@ mod tests {
         );
         let child = prepared.commit().expect("publish child");
 
-        assert_eq!(child.thread.registry_id(), child_registry_id);
+        assert_eq!(child.context().thread().registry_id(), child_registry_id);
         assert_eq!(
             child
-                .shared
+                .context()
+                .shared()
                 .mm()
                 .backend()
                 .expect("production backend")
@@ -1481,6 +1652,221 @@ mod tests {
             test_binding()
         );
         assert_ne!(kernel.ids().counts(), before);
+    }
+
+    #[test]
+    fn fork_parent_selection_and_failpoint_preserve_exact_parentage() {
+        let (kernel, root) = bootstrap(160);
+        let caller = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("caller plan"),
+                ThreadId::synthetic_for_tests(161),
+                "caller".to_string(),
+                None,
+            )
+            .expect("caller");
+        let clone_parent_plan =
+            ClonePlan::from_flags(LinuxCloneFlags::PARENT).expect("CLONE_PARENT plan");
+        let sibling = kernel
+            .fork_task(
+                &caller,
+                clone_parent_plan,
+                ThreadId::synthetic_for_tests(162),
+                "sibling".to_string(),
+                None,
+            )
+            .expect("CLONE_PARENT child");
+
+        assert_eq!(sibling.task.parent(), Some(root.task.key()));
+        assert!(root.task.children().contains(&sibling.task.key()));
+        assert!(!caller.task.children().contains(&sibling.task.key()));
+
+        let before = root.task.children();
+        let prepared = kernel
+            .reserve_fork(
+                &caller,
+                clone_parent_plan,
+                "rolled back sibling".to_string(),
+                Some(KernelFailpoint::BeforePublish),
+            )
+            .expect("reserve rolled back fork")
+            .prepare_reference(ThreadId::synthetic_for_tests(163))
+            .expect("prepare rolled back fork");
+        assert!(matches!(
+            prepared.commit(),
+            Err(KernelOperationError::Injected(
+                KernelFailpoint::BeforePublish
+            ))
+        ));
+        assert_eq!(root.task.children(), before);
+
+        let current_root = kernel
+            .context(root.task.key().id, root.thread.key().tid)
+            .expect("current selected parent");
+        let stale_parent = kernel
+            .reserve_fork(
+                &caller,
+                clone_parent_plan,
+                "stale selected parent".to_string(),
+                None,
+            )
+            .expect("reserve against selected parent")
+            .prepare_reference(ThreadId::synthetic_for_tests(164))
+            .expect("prepare against selected parent");
+        kernel
+            .fork_task(
+                &current_root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("concurrent fork plan"),
+                ThreadId::synthetic_for_tests(165),
+                "concurrent root child".to_string(),
+                None,
+            )
+            .expect("change selected parent revision");
+        assert!(matches!(
+            stale_parent.commit(),
+            Err(KernelOperationError::ForkParentChanged)
+        ));
+    }
+
+    #[test]
+    fn vfork_parent_gate_releases_once_on_exec_or_exit() {
+        let (kernel, root) = bootstrap(170);
+        let plan = ClonePlan::from_flags(LinuxCloneFlags::VFORK | LinuxCloneFlags::VM)
+            .expect("vfork plan");
+        let published = kernel
+            .reserve_fork(&root, plan, "vfork exec".to_string(), None)
+            .expect("reserve vfork")
+            .prepare_reference(ThreadId::synthetic_for_tests(171))
+            .expect("prepare vfork")
+            .commit()
+            .expect("publish vfork");
+        let (child, wait) = published.into_parts();
+        let wait = wait.expect("vfork parent wait");
+        assert_eq!(wait.released_reason(), None);
+
+        let failed_exec = kernel
+            .prepare_exec(&child, None)
+            .expect("prepare failed child exec");
+        assert!(matches!(
+            kernel.commit_exec(failed_exec, Some(KernelFailpoint::BeforePublish)),
+            Err(crate::kernel::ExecError::Injected(
+                KernelFailpoint::BeforePublish
+            ))
+        ));
+        assert_eq!(wait.released_reason(), None);
+
+        let prepared_exec = kernel
+            .prepare_exec(&child, None)
+            .expect("prepare child exec");
+        kernel
+            .commit_exec(prepared_exec, None)
+            .expect("commit child exec");
+        assert_eq!(wait.released_reason(), Some(VforkReleaseReason::Exec));
+        kernel
+            .exit_task(
+                child.task.key().id,
+                LinuxWaitStatus::from_wait_encoding(0),
+                TaskRusage::default(),
+                None,
+            )
+            .expect("exit execed child");
+        assert_eq!(wait.released_reason(), Some(VforkReleaseReason::Exec));
+
+        let refreshed_root = kernel
+            .context(root.task.key().id, root.thread.key().tid)
+            .expect("refreshed root");
+        let exited = kernel
+            .reserve_fork(&refreshed_root, plan, "vfork exit".to_string(), None)
+            .expect("reserve exiting vfork")
+            .prepare_reference(ThreadId::synthetic_for_tests(172))
+            .expect("prepare exiting vfork")
+            .commit()
+            .expect("publish exiting vfork");
+        let (exiting_child, exit_wait) = exited.into_parts();
+        let exit_wait = exit_wait.expect("exit vfork parent wait");
+        let blocking_wait = exit_wait.clone();
+        let waiter = std::thread::spawn(move || blocking_wait.wait());
+        kernel
+            .exit_task(
+                exiting_child.task.key().id,
+                LinuxWaitStatus::from_wait_encoding(0),
+                TaskRusage::default(),
+                None,
+            )
+            .expect("exit vfork child");
+        assert_eq!(exit_wait.released_reason(), Some(VforkReleaseReason::Exit));
+        assert_eq!(
+            waiter.join().expect("vfork waiter"),
+            VforkReleaseReason::Exit
+        );
+    }
+
+    #[test]
+    fn reserved_pidfd_subscription_arms_only_with_fork_commit() {
+        let (kernel, root) = bootstrap(180);
+        let plan = ClonePlan::from_flags(LinuxCloneFlags::PIDFD).expect("pidfd plan");
+        let missing = kernel
+            .reserve_fork(&root, plan, "missing pidfd".to_string(), None)
+            .expect("reserve missing pidfd")
+            .prepare_reference(ThreadId::synthetic_for_tests(180))
+            .expect("prepare missing pidfd");
+        assert!(matches!(
+            missing.commit(),
+            Err(KernelOperationError::MissingPidfdSubscription)
+        ));
+
+        let subscriber = Arc::new(CountingExitSubscriber::default());
+        let mut prepared = kernel
+            .reserve_fork(&root, plan, "pidfd child".to_string(), None)
+            .expect("reserve pidfd fork")
+            .prepare_reference(ThreadId::synthetic_for_tests(181))
+            .expect("prepare pidfd fork");
+        let target = prepared
+            .reserve_pidfd_subscription(&subscriber)
+            .expect("reserve pidfd subscription");
+        assert!(target.belongs_to(&kernel));
+        assert_eq!(target.task_id(), prepared.child_id());
+        assert_eq!(subscriber.0.load(Ordering::Acquire), 0);
+        assert!(!kernel.task_exists(target.task_id()));
+
+        let child = prepared.commit().expect("publish pidfd child");
+        assert_eq!(subscriber.0.load(Ordering::Acquire), 0);
+        kernel
+            .exit_task(
+                child.context().task().key().id,
+                LinuxWaitStatus::from_wait_encoding(0),
+                TaskRusage::default(),
+                None,
+            )
+            .expect("exit pidfd child");
+        assert_eq!(subscriber.0.load(Ordering::Acquire), 1);
+
+        let refreshed_root = kernel
+            .context(root.task.key().id, root.thread.key().tid)
+            .expect("refreshed root");
+        let rollback_subscriber = Arc::new(CountingExitSubscriber::default());
+        let mut rolled_back = kernel
+            .reserve_fork(
+                &refreshed_root,
+                plan,
+                "rolled back pidfd".to_string(),
+                Some(KernelFailpoint::BeforePublish),
+            )
+            .expect("reserve rolled back pidfd")
+            .prepare_reference(ThreadId::synthetic_for_tests(182))
+            .expect("prepare rolled back pidfd");
+        let rolled_back_target = rolled_back
+            .reserve_pidfd_subscription(&rollback_subscriber)
+            .expect("reserve rolled back subscription");
+        assert!(matches!(
+            rolled_back.commit(),
+            Err(KernelOperationError::Injected(
+                KernelFailpoint::BeforePublish
+            ))
+        ));
+        assert_eq!(rollback_subscriber.0.load(Ordering::Acquire), 0);
+        assert!(!kernel.task_exists(rolled_back_target.task_id()));
     }
 
     #[test]
