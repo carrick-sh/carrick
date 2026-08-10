@@ -376,9 +376,13 @@ impl TaskShared {
         Self::for_new_task_with_mm(parent, plan, ids, copied_mm)
     }
 
-    pub(super) fn for_exec(caller: &Self, ids: &ObjectIdRegistry) -> Result<Self, ObjectIdError> {
+    pub(super) fn for_exec_with_mm(
+        caller: &Self,
+        ids: &ObjectIdRegistry,
+        mm: Arc<Mm>,
+    ) -> Result<Self, ObjectIdError> {
         Ok(Self {
-            mm: Arc::new(Mm::new_reference(ids.mm_id()?)),
+            mm,
             // Ignored dispositions survive; caught handlers reset to default.
             // K4 binds this model to the concrete signal backend.
             sighand: Arc::new(Sighand::for_exec(ids.sighand_id()?, &caller.sighand)),
