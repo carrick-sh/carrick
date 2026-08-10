@@ -16,10 +16,13 @@ pub use address::{
     Asid, MmBackend, MmBinding, SnapshotError, SnapshotTable, Stage1Root, Stage1RootError, Ttbr0,
     VmaSummary,
 };
-pub use clone_plan::{CloneObjectMode, ClonePlan, ClonePlanError, CloneTaskMode};
+pub use clone_plan::{
+    CloneObjectMode, ClonePlan, ClonePlanError, CloneTaskMode, ForkParentMode, ForkPidfdMode,
+    VforkMode,
+};
 pub use core::{
     Kernel, KernelContext, KernelError, Registry, RegistryInvariantError, RootBootstrap,
-    TaskExitSubscriber, TaskRevision,
+    TaskExitSubscriber, TaskRevision, VforkParentWait, VforkReleaseReason,
 };
 pub use exec::{ExecError, PreparedExec};
 pub use ids::{
@@ -36,7 +39,8 @@ pub use objects::{
 };
 pub use operations::{
     ForkReservation, KernelFailpoint, KernelOperationError, PreparedFork, PreparedThreadClone,
-    TaskIdentity, TaskOperationReservation, ThreadCloneReservation, WaitMode, WaitOutcome,
+    PublishedFork, ReservedPidfdSubscription, TaskIdentity, TaskOperationReservation,
+    ThreadCloneReservation, WaitMode, WaitOutcome,
 };
 pub use registry::{
     IdError, IdRegistry, IdRegistryCounts, ProcessGroupClaim, SessionClaim, TaskClaim,

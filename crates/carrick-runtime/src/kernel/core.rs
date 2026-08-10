@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Weak};
 
 use carrick_hal::ThreadId;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 
 use super::address::MmBackend;
 use super::ids::{LinuxTid, ObjectIdError, ObjectIdRegistry, ProcessGroupId, SessionId, TaskId};
@@ -158,6 +158,64 @@ pub trait TaskExitSubscriber: Send + Sync {
     fn publish_exit(&self);
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VforkReleaseReason {
+    Exec,
+    Exit,
+}
+
+#[derive(Debug)]
+struct VforkGateState {
+    release: Mutex<Option<VforkReleaseReason>>,
+    changed: Condvar,
+}
+
+#[derive(Clone, Debug)]
+pub struct VforkParentWait {
+    state: Arc<VforkGateState>,
+}
+
+impl VforkParentWait {
+    pub fn released_reason(&self) -> Option<VforkReleaseReason> {
+        *self.state.release.lock()
+    }
+
+    pub fn wait(&self) -> VforkReleaseReason {
+        let mut release = self.state.release.lock();
+        loop {
+            if let Some(reason) = *release {
+                return reason;
+            }
+            self.state.changed.wait(&mut release);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct VforkChildRelease {
+    state: Arc<VforkGateState>,
+}
+
+impl VforkChildRelease {
+    pub(super) fn pair() -> (VforkParentWait, Self) {
+        let state = Arc::new(VforkGateState {
+            release: Mutex::new(None),
+            changed: Condvar::new(),
+        });
+        (
+            VforkParentWait {
+                state: Arc::clone(&state),
+            },
+            Self { state },
+        )
+    }
+
+    pub(super) fn release(self, reason: VforkReleaseReason) {
+        *self.state.release.lock() = Some(reason);
+        self.state.changed.notify_all();
+    }
+}
+
 #[derive(Default)]
 pub(super) struct TaskExitSubscribers {
     watchers: Mutex<BTreeMap<TaskId, Vec<Weak<dyn TaskExitSubscriber>>>>,
@@ -169,11 +227,19 @@ impl TaskExitSubscribers {
         T: TaskExitSubscriber + 'static,
     {
         let subscriber: Arc<dyn TaskExitSubscriber> = subscriber.clone();
+        self.register_erased(task_id, &subscriber);
+    }
+
+    pub(super) fn register_erased(
+        &self,
+        task_id: TaskId,
+        subscriber: &Arc<dyn TaskExitSubscriber>,
+    ) {
         self.watchers
             .lock()
             .entry(task_id)
             .or_default()
-            .push(Arc::downgrade(&subscriber));
+            .push(Arc::downgrade(subscriber));
     }
 
     pub(super) fn take(&self, task_id: TaskId) -> Vec<Weak<dyn TaskExitSubscriber>> {
@@ -246,6 +312,7 @@ impl Kernel {
             task_claim,
             thread_claims: BTreeMap::from([(leader_tid, leader_claim)]),
             dead_leader: None,
+            vfork_release: None,
             has_execed: false,
             diagnostic_name: bootstrap.diagnostic_name,
         };
@@ -543,6 +610,7 @@ pub(super) struct TaskRecord {
     pub(super) task_claim: TaskClaim,
     pub(super) thread_claims: BTreeMap<LinuxTid, ThreadClaim>,
     pub(super) dead_leader: Option<RetiredThreadRecord>,
+    pub(super) vfork_release: Option<VforkChildRelease>,
     pub(super) has_execed: bool,
     pub(super) diagnostic_name: String,
 }

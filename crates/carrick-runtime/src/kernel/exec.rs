@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use carrick_hal::KernelTransactionId;
 
-use super::core::{Kernel, KernelContext, RetiredThreadRecord, TaskRevision};
+use super::core::{Kernel, KernelContext, RetiredThreadRecord, TaskRevision, VforkReleaseReason};
 use super::ids::LinuxTid;
 use super::objects::{
     ExecDrain, ObjectGraphError, PreparedThreadSet, TaskKey, TaskShared, ThreadKey, ThreadRef,
@@ -276,10 +276,14 @@ impl Kernel {
         }
         record.revision = revision;
         record.has_execed = true;
+        let vfork_release = record.vfork_release.take();
         reservations.remove(&prepared.task.id);
         prepared.guard.commit_reservation();
         drop(state);
         drop(old_threads);
+        if let Some(release) = vfork_release {
+            release.release(VforkReleaseReason::Exec);
+        }
 
         Ok(KernelContext::from_parts(
             self.clone(),

@@ -12,6 +12,24 @@ pub enum CloneTaskMode {
     JoinThreadGroup,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ForkParentMode {
+    Caller,
+    InheritCallerParent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VforkMode {
+    None,
+    SuspendParent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ForkPidfdMode {
+    None,
+    Requested,
+}
+
 /// Validated Linux clone sharing topology. This deliberately keeps files and
 /// fs-context independent from thread-group membership.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -21,6 +39,9 @@ pub struct ClonePlan {
     sighand: CloneObjectMode,
     files: CloneObjectMode,
     fs_context: CloneObjectMode,
+    fork_parent: ForkParentMode,
+    vfork: VforkMode,
+    pidfd: ForkPidfdMode,
 }
 
 impl ClonePlan {
@@ -43,8 +64,17 @@ impl ClonePlan {
         if flags.contains(LinuxCloneFlags::NEWPID) && flags.contains(LinuxCloneFlags::THREAD) {
             return Err(ClonePlanError::NewPidWithThreadGroup);
         }
+        if flags.contains(LinuxCloneFlags::PARENT) && flags.contains(LinuxCloneFlags::NEWUSER) {
+            return Err(ClonePlanError::ParentWithNewUser);
+        }
+        if flags.contains(LinuxCloneFlags::PARENT) && flags.contains(LinuxCloneFlags::NEWPID) {
+            return Err(ClonePlanError::ParentWithNewPid);
+        }
         if flags.contains(LinuxCloneFlags::PIDFD) && flags.contains(LinuxCloneFlags::THREAD) {
             return Err(ClonePlanError::PidfdWithThreadGroup);
+        }
+        if flags.contains(LinuxCloneFlags::VFORK) && flags.contains(LinuxCloneFlags::THREAD) {
+            return Err(ClonePlanError::VforkWithThreadGroup);
         }
 
         Ok(Self {
@@ -57,6 +87,21 @@ impl ClonePlan {
             sighand: mode(flags.contains(LinuxCloneFlags::SIGHAND)),
             files: mode(flags.contains(LinuxCloneFlags::FILES)),
             fs_context: mode(flags.contains(LinuxCloneFlags::FS)),
+            fork_parent: if flags.contains(LinuxCloneFlags::PARENT) {
+                ForkParentMode::InheritCallerParent
+            } else {
+                ForkParentMode::Caller
+            },
+            vfork: if flags.contains(LinuxCloneFlags::VFORK) {
+                VforkMode::SuspendParent
+            } else {
+                VforkMode::None
+            },
+            pidfd: if flags.contains(LinuxCloneFlags::PIDFD) {
+                ForkPidfdMode::Requested
+            } else {
+                ForkPidfdMode::None
+            },
         })
     }
 
@@ -78,6 +123,18 @@ impl ClonePlan {
 
     pub const fn fs_context(self) -> CloneObjectMode {
         self.fs_context
+    }
+
+    pub const fn fork_parent(self) -> ForkParentMode {
+        self.fork_parent
+    }
+
+    pub const fn vfork(self) -> VforkMode {
+        self.vfork
+    }
+
+    pub const fn pidfd(self) -> ForkPidfdMode {
+        self.pidfd
     }
 }
 
@@ -101,8 +158,14 @@ pub enum ClonePlanError {
     NewUserWithThreadGroup,
     #[error("CLONE_NEWPID cannot be combined with CLONE_THREAD")]
     NewPidWithThreadGroup,
+    #[error("CLONE_PARENT cannot be combined with CLONE_NEWUSER")]
+    ParentWithNewUser,
+    #[error("CLONE_PARENT cannot be combined with CLONE_NEWPID")]
+    ParentWithNewPid,
     #[error("CLONE_PIDFD cannot be combined with CLONE_THREAD")]
     PidfdWithThreadGroup,
+    #[error("CLONE_VFORK cannot be combined with CLONE_THREAD")]
+    VforkWithThreadGroup,
     #[error("CLONE_FS cannot be combined with CLONE_NEWNS")]
     SharedFsWithNewMountNamespace,
 }
@@ -139,6 +202,22 @@ mod tests {
     }
 
     #[test]
+    fn fork_lifecycle_flags_have_typed_modes() {
+        let plan = ClonePlan::from_flags(
+            LinuxCloneFlags::PARENT | LinuxCloneFlags::VFORK | LinuxCloneFlags::PIDFD,
+        )
+        .expect("fork lifecycle plan");
+
+        assert_eq!(plan.fork_parent(), ForkParentMode::InheritCallerParent);
+        assert_eq!(plan.vfork(), VforkMode::SuspendParent);
+        assert_eq!(plan.pidfd(), ForkPidfdMode::Requested);
+        let ordinary = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("ordinary fork");
+        assert_eq!(ordinary.fork_parent(), ForkParentMode::Caller);
+        assert_eq!(ordinary.vfork(), VforkMode::None);
+        assert_eq!(ordinary.pidfd(), ForkPidfdMode::None);
+    }
+
+    #[test]
     fn invalid_linux_flag_dependencies_fail_closed() {
         assert_eq!(
             ClonePlan::from_flags(LinuxCloneFlags::THREAD),
@@ -166,8 +245,20 @@ mod tests {
             Err(ClonePlanError::NewPidWithThreadGroup)
         );
         assert_eq!(
+            ClonePlan::from_flags(LinuxCloneFlags::PARENT | LinuxCloneFlags::NEWUSER),
+            Err(ClonePlanError::ParentWithNewUser)
+        );
+        assert_eq!(
+            ClonePlan::from_flags(LinuxCloneFlags::PARENT | LinuxCloneFlags::NEWPID),
+            Err(ClonePlanError::ParentWithNewPid)
+        );
+        assert_eq!(
             ClonePlan::from_flags(valid_thread | LinuxCloneFlags::PIDFD),
             Err(ClonePlanError::PidfdWithThreadGroup)
+        );
+        assert_eq!(
+            ClonePlan::from_flags(valid_thread | LinuxCloneFlags::VFORK),
+            Err(ClonePlanError::VforkWithThreadGroup)
         );
     }
 }
