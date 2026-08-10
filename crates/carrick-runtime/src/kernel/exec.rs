@@ -2,10 +2,11 @@ use std::sync::Arc;
 
 use carrick_hal::KernelTransactionId;
 
+use super::address::MmBackend;
 use super::core::{Kernel, KernelContext, RetiredThreadRecord, TaskRevision, VforkReleaseReason};
 use super::ids::LinuxTid;
 use super::objects::{
-    ExecDrain, ObjectGraphError, PreparedThreadSet, TaskKey, TaskShared, ThreadKey, ThreadRef,
+    ExecDrain, Mm, ObjectGraphError, PreparedThreadSet, TaskKey, TaskShared, ThreadKey, ThreadRef,
     ThreadResources,
 };
 use super::operations::KernelFailpoint;
@@ -103,6 +104,30 @@ impl Kernel {
         context: &KernelContext,
         failpoint: Option<KernelFailpoint>,
     ) -> Result<PreparedExec, ExecError> {
+        self.prepare_exec_with_optional_backend(context, None, failpoint)
+    }
+
+    /// Prepare exec with a concrete replacement address-space backend.
+    ///
+    /// This is the transactional detach point required by a future HVPatch
+    /// `vfork`: the child may share its parent's `Mm` until this preparation,
+    /// while commit publishes a distinct `Mm` without mutating the parent.
+    /// Production exec cutover and backend retirement remain K4 work.
+    pub fn prepare_exec_with_mm_backend(
+        self: &Arc<Self>,
+        context: &KernelContext,
+        backend: Arc<dyn MmBackend>,
+        failpoint: Option<KernelFailpoint>,
+    ) -> Result<PreparedExec, ExecError> {
+        self.prepare_exec_with_optional_backend(context, Some(backend), failpoint)
+    }
+
+    fn prepare_exec_with_optional_backend(
+        self: &Arc<Self>,
+        context: &KernelContext,
+        backend: Option<Arc<dyn MmBackend>>,
+        failpoint: Option<KernelFailpoint>,
+    ) -> Result<PreparedExec, ExecError> {
         self.sweep_retired_threads();
         if !Arc::ptr_eq(self, &context.kernel) {
             return Err(ExecError::ForeignContext);
@@ -146,7 +171,16 @@ impl Kernel {
         // Only the validated caller supplies exec survivors. K1 gives the new
         // image, staged file table, and caught-handler reset fresh identities;
         // fs context, credentials, and pending signals retain caller identity.
-        let shared = Arc::new(TaskShared::for_exec(&context.shared, self.object_ids())?);
+        let mm_id = self.object_ids().mm_id()?;
+        let mm = Arc::new(match backend {
+            Some(backend) => Mm::with_backend(mm_id, backend),
+            None => Mm::new_reference(mm_id),
+        });
+        let shared = Arc::new(TaskShared::for_exec_with_mm(
+            &context.shared,
+            self.object_ids(),
+            mm,
+        )?);
         let resources = Arc::new(ThreadResources::for_exec(
             &context.resources,
             self.object_ids(),
@@ -353,19 +387,46 @@ pub enum ExecError {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU16;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
 
     use carrick_abi::{LinuxCloneFlags, SigSet};
-    use carrick_hal::ThreadId;
+    use carrick_guest_mem::Gpa;
+    use carrick_hal::{MappingId, ThreadId};
 
     use super::*;
     use crate::kernel::{
-        ClonePlan, FileDescription, FileSlotNumber, LinuxSignal, LinuxWaitStatus, RootBootstrap,
-        SignalDisposition, TaskRusage,
+        Asid, ClonePlan, FileDescription, FileSlotNumber, LinuxSignal, LinuxWaitStatus, MmBinding,
+        RootBootstrap, SignalDisposition, SnapshotError, SnapshotTable, Stage1Root, TaskRusage,
+        VmaSummary,
     };
+
+    #[derive(Debug)]
+    struct TestMmBackend(MmBinding);
+
+    impl MmBackend for TestMmBackend {
+        fn binding(&self) -> MmBinding {
+            self.0
+        }
+
+        fn vma_summaries(&self) -> Result<Vec<VmaSummary>, SnapshotError> {
+            Err(SnapshotError::AuthorityUnavailable(SnapshotTable::Vmas))
+        }
+
+        fn mapping_ids(&self) -> Result<Vec<MappingId>, SnapshotError> {
+            Err(SnapshotError::AuthorityUnavailable(SnapshotTable::Mappings))
+        }
+    }
+
+    fn test_binding(asid: u16, stage1_root: u64) -> MmBinding {
+        let asid =
+            Asid::from_registry_allocation(NonZeroU16::new(asid).expect("nonzero test ASID"));
+        let root = Stage1Root::for_aarch64_4k(Gpa(stage1_root)).expect("stage-1 root");
+        MmBinding::for_aarch64(asid, root)
+    }
 
     fn spawn_active_runner(
         thread_ref: &ThreadRef,
@@ -406,6 +467,78 @@ mod tests {
         )
         .expect("bootstrap input");
         Kernel::bootstrap_root(input).expect("kernel")
+    }
+
+    #[test]
+    fn shared_mm_child_exec_publishes_distinct_backend_without_mutating_parent() {
+        let (kernel, parent) = bootstrap(580);
+        let child = kernel
+            .fork_task(
+                &parent,
+                ClonePlan::from_flags(LinuxCloneFlags::VM).expect("shared-mm task plan"),
+                ThreadId::synthetic_for_tests(581),
+                "shared-mm child".to_owned(),
+                None,
+            )
+            .expect("shared-mm child");
+        let parent_mm = parent.shared.mm();
+        assert!(Arc::ptr_eq(&parent_mm, &child.shared.mm()));
+
+        let replacement_binding = test_binding(17, 0x44_000);
+        let replacement_backend: Arc<dyn MmBackend> = Arc::new(TestMmBackend(replacement_binding));
+        let prepared = kernel
+            .prepare_exec_with_mm_backend(&child, replacement_backend, None)
+            .expect("prepare replacement mm");
+
+        // Preparation cannot mutate either side of the shared association.
+        assert!(Arc::ptr_eq(&parent_mm, &parent.shared.mm()));
+        assert!(Arc::ptr_eq(&parent_mm, &child.task.shared().mm()));
+
+        let published = kernel
+            .commit_exec(prepared, None)
+            .expect("publish replacement mm");
+        let child_mm = published.shared.mm();
+        assert!(!Arc::ptr_eq(&parent_mm, &child_mm));
+        assert_ne!(parent_mm.id(), child_mm.id());
+        assert_eq!(
+            child_mm.backend().expect("replacement backend").binding(),
+            replacement_binding
+        );
+        assert!(Arc::ptr_eq(&parent_mm, &parent.task.shared().mm()));
+    }
+
+    #[test]
+    fn failed_replacement_mm_preparation_restores_shared_child_and_reservation() {
+        let (kernel, parent) = bootstrap(590);
+        let child = kernel
+            .fork_task(
+                &parent,
+                ClonePlan::from_flags(LinuxCloneFlags::VM).expect("shared-mm task plan"),
+                ThreadId::synthetic_for_tests(591),
+                "shared-mm child".to_owned(),
+                None,
+            )
+            .expect("shared-mm child");
+        let shared_mm = parent.shared.mm();
+        let backend = Arc::new(TestMmBackend(test_binding(18, 0x48_000)));
+        let backend_weak = Arc::downgrade(&backend);
+
+        assert!(matches!(
+            kernel.prepare_exec_with_mm_backend(
+                &child,
+                backend,
+                Some(KernelFailpoint::AfterObjects),
+            ),
+            Err(ExecError::Injected(KernelFailpoint::AfterObjects))
+        ));
+        assert!(backend_weak.upgrade().is_none());
+        assert!(Arc::ptr_eq(&shared_mm, &child.task.shared().mm()));
+
+        // The dropped preparation must also return task-mutator ownership.
+        let retry = kernel
+            .prepare_exec(&child, None)
+            .expect("reservation released for retry");
+        drop(retry);
     }
 
     #[test]
