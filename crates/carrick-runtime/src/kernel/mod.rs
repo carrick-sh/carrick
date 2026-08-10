@@ -21,8 +21,8 @@ pub use clone_plan::{
     VforkMode,
 };
 pub use core::{
-    Kernel, KernelContext, KernelError, Registry, RegistryInvariantError, RootBootstrap,
-    TaskExitSubscriber, TaskRevision, VforkParentWait, VforkReleaseReason,
+    Kernel, KernelContext, KernelError, KernelTaskBinding, Registry, RegistryInvariantError,
+    RootBootstrap, TaskExitSubscriber, TaskRevision, VforkParentWait, VforkReleaseReason,
 };
 pub use exec::{ExecError, PreparedExec};
 pub use ids::{
