@@ -4652,6 +4652,7 @@ mod real {
     }
 
     pub fn vm_lifecycle(operation: u32, admission: i32) {
+        crate::vm_lifecycle::record_raw(operation, admission);
         carrick_usdt::vm__lifecycle!(|| (operation, admission));
     }
 
@@ -6051,7 +6052,11 @@ mod stub {
     stub!(hvpatch_fork_private_snapshot(event: super::HvpatchForkPrivateSnapshot));
     stub!(hvpatch_fork_private_snapshot_outcome(event: super::HvpatchForkPrivateSnapshotOutcome));
     stub!(hvpatch_fork_quiesce(event: super::HvpatchForkQuiesce));
-    stub!(vm_lifecycle(operation: u32, admission: i32));
+
+    pub fn vm_lifecycle(operation: u32, admission: i32) {
+        crate::vm_lifecycle::record_raw(operation, admission);
+    }
+
     stub!(execve_argv(path: &str, argv: &[Vec<u8>]));
     stub!(host_image_base());
     stub!(host_image_text_range());

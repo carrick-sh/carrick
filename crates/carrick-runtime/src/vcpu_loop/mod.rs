@@ -40,7 +40,7 @@ use std::os::fd::IntoRawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use carrick_hal::{HostForkCoordinator, PlatformFutex, ThreadedEngine, VcpuRegistry};
 
@@ -71,6 +71,16 @@ fn threaded_fd_wait_should_interrupt(fork_quiescing: bool, dispatch_pending: boo
     // starving the run-loop-top quiesce check (captured in a go-build core as
     // the sole still-registered vCPU while every sibling was barrier-parked).
     fork_quiescing || dispatch_pending
+}
+
+fn should_destroy_departing_vcpu(process_exit: bool, thread_done: bool) -> bool {
+    !process_exit && !thread_done
+}
+
+pub(super) fn requires_no_unwind_host_exit(kernel: &Kernel, engine_is_forked_child: bool) -> bool {
+    !kernel.is_hvpatch_child()
+        && kernel.dispatcher.execution_backend() != crate::page_profile::ExecutionBackend::HvPatch
+        && (engine_is_forked_child || kernel.dispatcher.is_forked_guest_process())
 }
 
 /// MT whole-VM residency lease (E4 Track 3): when every thread of a
@@ -420,11 +430,12 @@ pub(crate) struct KernelState {
     /// Per-Linux-process fork pause for the shared-VM backend. The legacy
     /// barrier is host-process-global because it assumed one process per VM.
     process_fork_barrier: Option<Arc<crate::fork_quiesce::QuiesceBarrier>>,
-    /// Number of host vCPU loops still alive for this Linux process.  The
-    /// process-leader host thread is not stored in its own clone JoinHandle
-    /// vector, so exit_group teardown needs this counter to prove it has also
-    /// destroyed/unregistered before the bank is unmapped.
+    /// Number of host vCPU loops still alive for this Linux process.
     process_vcpu_live: std::sync::atomic::AtomicUsize,
+    /// Terminal result published by whichever HVPatch thread owns process
+    /// teardown. The main loop consumes it after sibling-driven exit_group.
+    process_terminal: Mutex<Option<Result<RunResult, ()>>>,
+    process_terminal_ready: Condvar,
 }
 
 impl KernelState {
@@ -446,6 +457,8 @@ impl KernelState {
             process_exiting: std::sync::atomic::AtomicBool::new(false),
             process_fork_barrier,
             process_vcpu_live: std::sync::atomic::AtomicUsize::new(0),
+            process_terminal: Mutex::new(None),
+            process_terminal_ready: Condvar::new(),
         }
     }
 
@@ -485,7 +498,7 @@ impl KernelState {
             .is_ok()
     }
 
-    fn process_exiting(&self) -> bool {
+    pub(crate) fn process_exiting(&self) -> bool {
         self.process_exiting
             .load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -493,6 +506,31 @@ impl KernelState {
     fn process_vcpu_live(&self) -> usize {
         self.process_vcpu_live
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn publish_process_terminal(&self, terminal: Result<RunResult, ()>) {
+        let mut published = self.process_terminal.lock();
+        if published.is_none() {
+            *published = Some(terminal);
+            self.process_terminal_ready.notify_all();
+        }
+    }
+
+    pub(crate) fn take_process_terminal(
+        &self,
+    ) -> Result<Option<Result<RunResult, ()>>, RuntimeError> {
+        let mut published = self.process_terminal.lock();
+        if published.is_none() && self.process_exiting() {
+            let wait = self
+                .process_terminal_ready
+                .wait_for(&mut published, std::time::Duration::from_secs(5));
+            if wait.timed_out() && published.is_none() {
+                return Err(RuntimeError::Unsupported(
+                    "HVPatch terminal owner did not complete teardown".to_owned(),
+                ));
+            }
+        }
+        Ok(published.take())
     }
 }
 
@@ -2205,10 +2243,6 @@ where
     stamp_guest_tid(&engine, state.this_tid, &state.registry);
     // Run the vCPU loop in a closure so we can run vCPU cleanup on EVERY exit
     // path — `?` errors, early returns, and the trap-limit fall-through alike.
-    let is_hvpatch_child = kernel
-        .hvpatch_process
-        .as_ref()
-        .is_some_and(crate::hvpatch::ProcessContext::is_child);
     let mut result: Result<VcpuLoopOutcome, RuntimeError> = (|| {
         // Progress-aware trap watchdog: bound the traps SINCE THE LAST DELIVERED
         // SIGNAL HANDLER, not the lifetime total. A guest legitimately spinning
@@ -2406,10 +2440,7 @@ where
                                 (syndrome >> 26) & 0x3f
                             );
                         }
-                        if !kernel.is_hvpatch_child()
-                            && (engine.is_forked_child()
-                                || kernel.dispatcher.is_forked_guest_process())
-                        {
+                        if requires_no_unwind_host_exit(&kernel, engine.is_forked_child()) {
                             let out = kernel.dispatcher.stdout();
                             let err = kernel.dispatcher.stderr();
                             kernel.dispatcher.cleanup_sysv_ipc_on_process_exit();
@@ -2501,16 +2532,12 @@ where
                         "guest requested process exit"
                     );
                     crate::trap::dump_kick_stats();
-                    // A forked child process (real macOS fork) exits via _exit so
-                    // the rebuilt HVF context doesn't run the panicky Drops.
-                    if !kernel.is_hvpatch_child()
-                        && (engine.is_forked_child() || kernel.dispatcher.is_forked_guest_process())
-                    {
+                    // Mature real-fork children keep the historical no-unwind
+                    // `_exit` path. A namespace-forked HVPatch root was created
+                    // after that fork, so it returns through typed process
+                    // teardown and publishes the complete VM ledger instead.
+                    if requires_no_unwind_host_exit(&kernel, engine.is_forked_child()) {
                         crate::probes::guest_exit(code);
-                        // Destroy a name-bound child VM (bhyve) before _exit — KVM/HVF
-                        // is a no-op (fd-lifetime-bound VM). A copied shared-file
-                        // writeback failure is propagated instead of reporting a
-                        // successful child exit with stale data.
                         engine.process_exit_cleanup()?;
                         kernel.dispatcher.cleanup_sysv_ipc_on_process_exit();
                         forked_child_exit(
@@ -2521,12 +2548,13 @@ where
                     }
                     // exit_group, or exit(2) as the last live thread. Tear the whole
                     // process down.
-                    let last = if kernel.is_hvpatch_child() {
-                        // The process-local post-loop cleanup first drains every
-                        // sibling vCPU, then removes this owner and unmaps its
-                        // bank.  Removing the owner here would let a kicked
-                        // sibling mistake itself for the last thread and race a
-                        // second address-space retirement.
+                    let last = if kernel.is_hvpatch_child()
+                        || kernel.dispatcher.execution_backend()
+                            == crate::page_profile::ExecutionBackend::HvPatch
+                    {
+                        // HVPatch process cleanup first drains every sibling
+                        // vCPU, then removes this owner and unmaps its bank.
+                        // Removing the owner here would permit a second retire.
                         true
                     } else {
                         state.registry.exit(state.this_tid)
@@ -2559,12 +2587,7 @@ where
                         "guest process terminated by signal"
                     );
                     crate::trap::dump_kick_stats();
-                    if !kernel.is_hvpatch_child()
-                        && (engine.is_forked_child() || kernel.dispatcher.is_forked_guest_process())
-                    {
-                        // Destroy a name-bound child VM (bhyve) before _exit — KVM/HVF
-                        // is a no-op (fd-lifetime-bound VM). Writeback failures
-                        // propagate before the terminal signal is reported.
+                    if requires_no_unwind_host_exit(&kernel, engine.is_forked_child()) {
                         engine.process_exit_cleanup()?;
                         kernel.dispatcher.cleanup_sysv_ipc_on_process_exit();
                         forked_child_die_by_signal(
@@ -2574,7 +2597,10 @@ where
                         );
                     }
                     let code = 128 + signum;
-                    let last = if kernel.is_hvpatch_child() {
+                    let last = if kernel.is_hvpatch_child()
+                        || kernel.dispatcher.execution_backend()
+                            == crate::page_profile::ExecutionBackend::HvPatch
+                    {
                         true
                     } else {
                         state.registry.exit(state.this_tid)
@@ -2751,10 +2777,7 @@ where
                         // THIS process by SIGSEGV (exit 139), never abort the whole
                         // carrick runtime. Mirrors the unclassified-EL0-fault path.
                         Err(TrapError::SignalDeliveryFault) => {
-                            if !kernel.is_hvpatch_child()
-                                && (engine.is_forked_child()
-                                    || kernel.dispatcher.is_forked_guest_process())
-                            {
+                            if requires_no_unwind_host_exit(&kernel, engine.is_forked_child()) {
                                 let out = kernel.dispatcher.stdout();
                                 let err = kernel.dispatcher.stderr();
                                 kernel.dispatcher.cleanup_sysv_ipc_on_process_exit();
@@ -2906,11 +2929,21 @@ where
         let result = assemble_run_result(&kernel, -1, state.max_traps, true);
         Ok(VcpuLoopOutcome::TrapLimit(Box::new(result)))
     })();
-    // An in-process hvpatch child must release its backend-owned process state
-    // without terminating the shared host process. Other backends perform this
-    // cleanup immediately before their real child calls `_exit`.
-    if is_hvpatch_child && matches!(&result, Ok(VcpuLoopOutcome::ProcessExit(_)) | Err(_)) {
+    // Every terminal HVPatch process transition (root or in-process child)
+    // drains sibling vCPUs and retires its address space before the persistent
+    // process-wide VM can be destroyed. Other backends retain their historical
+    // real-process teardown.
+    let terminal_hvpatch_process = kernel.dispatcher.execution_backend()
+        == crate::page_profile::ExecutionBackend::HvPatch
+        && matches!(&result, Ok(VcpuLoopOutcome::ProcessExit(_)) | Err(_));
+    let mut vcpu_retired_by_hvpatch_cleanup = false;
+    if terminal_hvpatch_process {
         if kernel.try_begin_process_exit() {
+            let terminal_publication = match &result {
+                Ok(VcpuLoopOutcome::ProcessExit(run)) => Some(Ok((**run).clone())),
+                Err(_) => Some(Err(())),
+                Ok(VcpuLoopOutcome::ThreadDone | VcpuLoopOutcome::TrapLimit(_)) => None,
+            };
             state.terminate_siblings_for_process_exit(&kernel)?;
             trace_hvpatch_thread_teardown(&kernel, state.this_tid, 1);
             state.registry.exit(state.this_tid);
@@ -2923,7 +2956,14 @@ where
             kernel.dispatcher.forget_thread_signal_state(state.this_tid);
             trace_hvpatch_thread_teardown(&kernel, state.this_tid, 5);
             engine.retire_in_process_address_space()?;
+            vcpu_retired_by_hvpatch_cleanup = true;
             trace_hvpatch_thread_teardown(&kernel, state.this_tid, 6);
+            if let Some(terminal) = terminal_publication {
+                // Publication is the completion barrier: the main owner may
+                // destroy the process-wide VM only after sibling drain,
+                // address-space retirement, and current-vCPU destruction.
+                kernel.publish_process_terminal(terminal);
+            }
         } else {
             // Another thread owns the terminal process transition. Retire only
             // this vCPU/thread and suppress a second ProcessExit publication.
@@ -2943,13 +2983,15 @@ where
             result = Ok(VcpuLoopOutcome::ThreadDone);
         }
     }
-    // This thread is leaving its vCPU loop. The engine's Drop is a no-op, so
-    // destroy the vCPU here on every path EXCEPT ProcessExit (the whole process
-    // is exiting) and ThreadDone (handle_thread_exit already destroyed it).
-    if !matches!(
-        &result,
-        Ok(VcpuLoopOutcome::ProcessExit(_)) | Ok(VcpuLoopOutcome::ThreadDone)
-    ) {
+    // This thread is leaving its vCPU loop. The engine's Drop is a no-op.
+    // HVPatch ProcessExit retires its vCPU in the process cleanup above;
+    // mature VMM ProcessExit keeps its historical process-death teardown.
+    if !vcpu_retired_by_hvpatch_cleanup
+        && should_destroy_departing_vcpu(
+            matches!(&result, Ok(VcpuLoopOutcome::ProcessExit(_))),
+            matches!(&result, Ok(VcpuLoopOutcome::ThreadDone)),
+        )
+    {
         engine.destroy_vcpu_on_thread_exit();
     }
     trace_hvpatch_thread_teardown(&kernel, state.this_tid, 7);
@@ -3049,9 +3091,7 @@ fn service_signals_threaded<E: ThreadedEngine>(
                 return Ok(None);
             }
             if let Some(signum) = action.term_signal {
-                if !kernel.is_hvpatch_child()
-                    && (engine.is_forked_child() || kernel.dispatcher.is_forked_guest_process())
-                {
+                if requires_no_unwind_host_exit(kernel, engine.is_forked_child()) {
                     // Destroy a name-bound child VM (bhyve) before _exit — KVM/HVF
                     // is a no-op (fd-lifetime-bound VM). Fail before terminal
                     // publication if copied shared-file writeback is incomplete.
@@ -3175,6 +3215,13 @@ mod tests {
             ),
             TrapWatchdog::Trip
         );
+    }
+
+    #[test]
+    fn departing_vcpu_is_destroyed_unless_terminal_cleanup_already_owns_it() {
+        assert!(!should_destroy_departing_vcpu(true, false));
+        assert!(!should_destroy_departing_vcpu(false, true));
+        assert!(should_destroy_departing_vcpu(false, false));
     }
 
     #[test]

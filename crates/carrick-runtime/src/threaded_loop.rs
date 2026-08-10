@@ -112,6 +112,23 @@ pub trait HostBackend: Send + Sync + 'static {
 /// `vcpu_loop::run_vcpu_until_exit`. `handle_fork` (real `libc::fork` + child VM
 /// rebuild), `spawn_clone_thread` (sibling vCPUs), and the private/shared futex
 /// paths all flow through the shared loop.
+fn resolve_hvpatch_setup<T, Retire>(
+    backend: crate::page_profile::ExecutionBackend,
+    setup: Result<T, RuntimeError>,
+    retire_vcpu: Retire,
+) -> Result<T, RuntimeError>
+where
+    Retire: FnOnce(),
+{
+    match setup {
+        Err(error) if backend == crate::page_profile::ExecutionBackend::HvPatch => {
+            retire_vcpu();
+            Err(error)
+        }
+        other => other,
+    }
+}
+
 pub fn run_threaded_loop<E, H>(
     mut engine: E,
     dispatcher: SyscallDispatcher,
@@ -197,7 +214,13 @@ where
     // vCPU + nudge the futex; HVF supplies its kqueue-pump wake.
     let signal_arrival: Arc<dyn carrick_hal::SignalArrival> =
         host_for_factory.make_signal_arrival(&kicker, &platform_futex);
-    let hvpatch_process = crate::hvpatch::initialize_root_process(&mut engine, &dispatcher)?;
+    let backend = dispatcher.execution_backend();
+    let setup = crate::hvpatch::initialize_root_process(&mut engine, &dispatcher);
+    let hvpatch_process = resolve_hvpatch_setup(backend, setup, || {
+        // The outer HVPatch owner destroys the VM and records the terminal.
+        // Retire only this already-created vCPU so teardown has one owner.
+        engine.destroy_vcpu_on_thread_exit();
+    })?;
     let kernel = Arc::new(KernelState::new(
         dispatcher,
         fork_coordinator,
@@ -241,22 +264,59 @@ where
         max_traps,
     )?;
 
-    let result = match outcome {
-        VcpuLoopOutcome::ProcessExit(r) | VcpuLoopOutcome::TrapLimit(r) => *r,
-        VcpuLoopOutcome::ThreadDone => {
-            // The main thread ran exit(2) while siblings were alive. Assemble
-            // a result from the shared kernel buffers (run-to-completion CLI).
-            let report = kernel.reporter.snapshot();
-            RunResult {
-                exit_code: 0,
-                stdout: kernel.dispatcher.stdout(),
-                stderr: kernel.dispatcher.stderr(),
-                traps: 0,
-                report,
-                trap_limit_hit: false,
-            }
+    let result = match kernel.take_process_terminal()? {
+        Some(Ok(result)) => result,
+        Some(Err(())) => {
+            return Err(RuntimeError::Unsupported(
+                "HVPatch sibling-owned process termination failed".to_owned(),
+            ));
         }
+        None => match outcome {
+            VcpuLoopOutcome::ProcessExit(r) | VcpuLoopOutcome::TrapLimit(r) => *r,
+            VcpuLoopOutcome::ThreadDone => {
+                // Ordinary main-thread exit(2) with surviving siblings keeps the
+                // historical synthesized success. HVPatch exit_group/fatal
+                // ownership publishes an exact result above instead.
+                let report = kernel.reporter.snapshot();
+                RunResult {
+                    exit_code: 0,
+                    stdout: kernel.dispatcher.stdout(),
+                    stderr: kernel.dispatcher.stderr(),
+                    traps: 0,
+                    report,
+                    trap_limit_hit: false,
+                }
+            }
+        },
     };
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hvpatch_setup_failure_retires_only_the_created_vcpu_once() {
+        let retire_count = std::cell::Cell::new(0_u32);
+        let result = resolve_hvpatch_setup::<(), _>(
+            crate::page_profile::ExecutionBackend::HvPatch,
+            Err(RuntimeError::Unsupported(
+                "deterministic post-vCPU setup failure".to_owned(),
+            )),
+            || retire_count.set(retire_count.get() + 1),
+        );
+        assert!(result.is_err());
+        assert_eq!(retire_count.get(), 1);
+
+        let mature_retire_count = std::cell::Cell::new(0_u32);
+        let result = resolve_hvpatch_setup::<(), _>(
+            crate::page_profile::ExecutionBackend::Vmm,
+            Err(RuntimeError::Unsupported("mature setup failure".to_owned())),
+            || mature_retire_count.set(mature_retire_count.get() + 1),
+        );
+        assert!(result.is_err());
+        assert_eq!(mature_retire_count.get(), 0);
+    }
 }

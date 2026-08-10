@@ -2005,6 +2005,21 @@ fn record_vm_released() {
     vm_residency_region().release_token(VM_RESIDENCY_LOCAL_KEY);
 }
 
+/// Explicitly retire the one persistent HVPatch VM after every guest vCPU has
+/// left the threaded loop. The VM wrapper is `ManuallyDrop`, so relying on host
+/// process death would leave no authoritative destroy-success boundary.
+pub fn destroy_persistent_vm_at_run_terminal() -> Result<(), TrapError> {
+    crate::probes::vm_lifecycle(2, -1);
+    let rc = unsafe { applevisor_sys::hv_vm_destroy() };
+    if rc != 0 {
+        return Err(TrapError::Hypervisor(format!(
+            "terminal hv_vm_destroy rc={rc:#x}"
+        )));
+    }
+    record_vm_released();
+    Ok(())
+}
+
 /// Whether the atomic slot-table admission permit is active; cached once.
 ///
 /// The atomic permit is the DEFAULT: it is enabled UNLESS
@@ -2117,6 +2132,7 @@ fn release_admission_permit_for_vcpu(vcpu_id: u64) {
 /// Dispatch the fork-child reset to whichever permit path is active.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn reset_admission_permits_after_fork_child() {
+    carrick_observability::vm_lifecycle::reset_after_fork_child();
     if atomic_permit_enabled() {
         permit_region().reset_local_after_fork_child();
         vm_residency_region().reset_local_after_fork_child();

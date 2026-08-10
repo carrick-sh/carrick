@@ -713,6 +713,35 @@ fn maybe_fork_ns_supervisor() -> Result<SupervisorRole, RuntimeError> {
     }))
 }
 
+fn finalize_persistent_hvf_run<Destroy, Record, Publish>(
+    mut run: Result<RunResult, RuntimeError>,
+    destroy_vm: Destroy,
+    record_terminal: Record,
+    publish_artifact: Publish,
+) -> Result<RunResult, RuntimeError>
+where
+    Destroy: FnOnce() -> Result<(), RuntimeError>,
+    Record: FnOnce(crate::vm_lifecycle::VmRunTerminalOutcome),
+    Publish: FnOnce(&Result<RunResult, RuntimeError>) -> Result<(), RuntimeError>,
+{
+    if let Err(error) = destroy_vm()
+        && run.is_ok()
+    {
+        run = Err(error);
+    }
+    let terminal = match &run {
+        Ok(result) => crate::vm_lifecycle::VmRunTerminalOutcome::Completed {
+            exit_code: result.exit_code,
+            traps: u64::try_from(result.traps).unwrap_or(u64::MAX),
+            trap_limit_hit: result.trap_limit_hit,
+        },
+        Err(_) => crate::vm_lifecycle::VmRunTerminalOutcome::RuntimeError,
+    };
+    record_terminal(terminal);
+    publish_artifact(&run)?;
+    run
+}
+
 fn run_address_space_with_hvf_and_dispatcher(
     image: AddressSpace,
     dispatcher: SyscallDispatcher,
@@ -742,10 +771,8 @@ fn run_address_space_with_hvf_and_dispatcher(
         // Build the engine (create VM + vCPU, map the address space, park at the EL0
         // trampoline) — the shared `Aarch64EngineCore<HvfAarch64Vmm>` bring-up.
         let mut trap = crate::trap::new_hvf_trap_engine(&image)?;
-        carrick_hal::ThreadedEngine::set_persistent_vm_lifecycle(
-            &mut trap,
-            persistent_hvf_vm_lifecycle(dispatcher.execution_backend()),
-        );
+        let persistent_vm = persistent_hvf_vm_lifecycle(dispatcher.execution_backend());
+        carrick_hal::ThreadedEngine::set_persistent_vm_lifecycle(&mut trap, persistent_vm);
         // Hand the dispatcher the real region list + auxv so /proc/self/maps
         // (regions, bootstrap pages, stack) and /proc/self/auxv reflect the loaded
         // ELF instead of the legacy summary. Language runtimes, malloc
@@ -754,7 +781,32 @@ fn run_address_space_with_hvf_and_dispatcher(
         // Boot-stamp the identity page before the guest runs a single syscall,
         // so the very first fast-path getpid/get*id reads the right value.
         stamp_identity_page(&mut trap, &dispatcher);
-        run_threaded_hvf_loop(trap, dispatcher, max_traps)
+        let run = run_threaded_hvf_loop(trap, dispatcher, max_traps);
+        if persistent_vm {
+            finalize_persistent_hvf_run(
+                run,
+                || crate::trap::destroy_persistent_vm_at_run_terminal().map_err(RuntimeError::from),
+                crate::vm_lifecycle::record_process_terminal,
+                |run| {
+                    if let Some(path) =
+                        std::env::var_os(crate::vm_lifecycle::VM_LIFECYCLE_ARTIFACT_PATH_ENV)
+                        && let Err(artifact_error) =
+                            crate::vm_lifecycle::write_completed_process_artifact(Path::new(&path))
+                    {
+                        let run_context = run
+                            .as_ref()
+                            .err()
+                            .map_or_else(|| "guest run completed".to_owned(), ToString::to_string);
+                        return Err(RuntimeError::Unsupported(format!(
+                            "HVPatch VM lifecycle artifact publication failed after {run_context}: {artifact_error}"
+                        )));
+                    }
+                    Ok(())
+                },
+            )
+        } else {
+            run
+        }
     })();
     match run {
         Ok(r) => Ok(r),
@@ -2472,6 +2524,60 @@ mod tests {
         assert!(!persistent_hvf_vm_lifecycle(
             crate::page_profile::ExecutionBackend::Native
         ));
+    }
+
+    #[test]
+    fn setup_failure_has_one_vm_teardown_and_runtime_error_artifact() {
+        let ledger = std::sync::Arc::new(crate::vm_lifecycle::VmLifecycleLedger::default());
+        ledger.record_raw(0, 0);
+        ledger.record_raw(1, 0);
+        let destroy_count = std::cell::Cell::new(0_u32);
+        let terminal_count = std::cell::Cell::new(0_u32);
+        let publication_count = std::cell::Cell::new(0_u32);
+
+        let destroy_ledger = std::sync::Arc::clone(&ledger);
+        let terminal_ledger = std::sync::Arc::clone(&ledger);
+        let publication_ledger = std::sync::Arc::clone(&ledger);
+        let result = finalize_persistent_hvf_run(
+            Err(RuntimeError::Unsupported(
+                "deterministic post-vCPU setup failure".to_owned(),
+            )),
+            || {
+                destroy_count.set(destroy_count.get() + 1);
+                destroy_ledger.record_raw(2, -1);
+                destroy_ledger.record_raw(3, -1);
+                Ok(())
+            },
+            |terminal| {
+                terminal_count.set(terminal_count.get() + 1);
+                terminal_ledger.record_terminal(terminal);
+            },
+            |run| {
+                assert!(run.is_err());
+                publication_count.set(publication_count.get() + 1);
+                let digest = "00".repeat(32);
+                let bytes = crate::vm_lifecycle::render_completed_artifact(
+                    &publication_ledger.snapshot(),
+                    digest.clone(),
+                    digest.clone(),
+                    digest.clone(),
+                    digest,
+                )
+                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                let summary = crate::vm_lifecycle::validate_artifact(&bytes)
+                    .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                assert!(matches!(
+                    summary.terminal,
+                    crate::vm_lifecycle::VmRunTerminalOutcome::RuntimeError
+                ));
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(destroy_count.get(), 1);
+        assert_eq!(terminal_count.get(), 1);
+        assert_eq!(publication_count.get(), 1);
     }
 
     fn rootfs_with(files: &[(&str, &[u8])]) -> crate::rootfs::RootFs {

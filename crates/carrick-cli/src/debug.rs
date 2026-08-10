@@ -37,6 +37,67 @@ use crate::debug_layout::native_x86_layout_json;
 
 pub(crate) fn run_debug(command: DebugCommand) -> anyhow::Result<()> {
     match command {
+        DebugCommand::HvpatchVmLedger {
+            artifact,
+            run_id,
+            source_sha256,
+            command_sha256,
+        } => {
+            let metadata = std::fs::metadata(&artifact)
+                .with_context(|| format!("failed to inspect {}", artifact.display()))?;
+            let observed = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+            if observed > carrick_runtime::vm_lifecycle::VM_LIFECYCLE_ARTIFACT_MAX_BYTES {
+                bail!(
+                    "HVPatch VM ledger {} is {observed} bytes; maximum is {}",
+                    artifact.display(),
+                    carrick_runtime::vm_lifecycle::VM_LIFECYCLE_ARTIFACT_MAX_BYTES
+                );
+            }
+            let bytes = std::fs::read(&artifact)
+                .with_context(|| format!("failed to read {}", artifact.display()))?;
+            let executable = std::env::current_exe().context("resolve validator executable")?;
+            let binary_sha256 = carrick_runtime::vm_lifecycle::sha256_file(&executable)
+                .context("hash validator executable")?;
+            let expected = carrick_runtime::vm_lifecycle::VmLifecycleArtifactExpectations::new(
+                run_id.as_bytes(),
+                source_sha256,
+                binary_sha256,
+                command_sha256,
+            )
+            .context("build trusted HVPatch VM ledger expectations")?;
+            let summary =
+                carrick_runtime::vm_lifecycle::validate_authenticated_artifact(&bytes, &expected)
+                    .with_context(|| format!("invalid HVPatch VM ledger {}", artifact.display()))?;
+            let terminal = match summary.terminal {
+                carrick_runtime::vm_lifecycle::VmRunTerminalOutcome::Completed {
+                    exit_code,
+                    traps,
+                    trap_limit_hit,
+                } => serde_json::json!({
+                    "kind": "completed",
+                    "exit_code": exit_code,
+                    "traps": traps,
+                    "trap_limit_hit": trap_limit_hit,
+                }),
+                carrick_runtime::vm_lifecycle::VmRunTerminalOutcome::RuntimeError => {
+                    serde_json::json!({ "kind": "runtime-error" })
+                }
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schema": carrick_runtime::vm_lifecycle::VM_LIFECYCLE_ARTIFACT_SCHEMA,
+                    "serial": summary.serial.get(),
+                    "terminal": terminal,
+                    "program_sha256": summary.program_sha256,
+                    "run_id_sha256": summary.run_id_sha256,
+                    "source_sha256": summary.source_sha256,
+                    "binary_sha256": summary.binary_sha256,
+                    "command_sha256": summary.command_sha256,
+                    "payload_sha256": summary.payload_sha256,
+                }))?
+            );
+        }
         DebugCommand::NativeX86Layout => {
             println!(
                 "{}",

@@ -249,11 +249,26 @@ fn start_alloc_owner_census() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn seed_vm_lifecycle_command_identity()
+-> Result<(), carrick_runtime::vm_lifecycle::VmLifecycleArtifactError> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mut command = Vec::new();
+    for argument in std::env::args_os() {
+        command.extend_from_slice(argument.as_os_str().as_bytes());
+        command.push(0);
+    }
+    carrick_runtime::vm_lifecycle::install_process_command_sha256(
+        carrick_runtime::vm_lifecycle::sha256_bytes(&command),
+    )
+}
+
 fn main() -> anyhow::Result<()> {
     // FIRST statement: the exec-stamp gauge measures kernel exec + dyld +
     // static initializers as `pre-exec -> main-entry`, so nothing may run
     // before it (env-gated; one getenv when off).
     carrick_runtime::exec_stamps::stamp(carrick_runtime::exec_stamps::ExecStampPhase::MainEntry);
+    seed_vm_lifecycle_command_identity()?;
     #[cfg(feature = "alloc-owner-census")]
     start_alloc_owner_census()?;
     #[cfg(feature = "alloc-census")]

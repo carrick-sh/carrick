@@ -936,6 +936,23 @@ pub(crate) enum VolumeCommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum DebugCommand {
+    /// Validate an authenticated HVPatch process-wide VM lifecycle artifact.
+    /// Refuses unknown schema/fields, digest drift, malformed transitions,
+    /// multiple VM serials, incomplete teardown, and a missing run terminal.
+    HvpatchVmLedger {
+        /// `carrick.hvpatch-vm-lifecycle.v1` artifact published by a run with
+        /// `CARRICK_HVPATCH_VM_LEDGER_PATH` set to this path.
+        artifact: PathBuf,
+        /// Exact external run identity used for `CARRICK_RUN_ID`.
+        #[arg(long)]
+        run_id: String,
+        /// Trusted source-tree digest supplied as `CARRICK_SOURCE_SHA256`.
+        #[arg(long)]
+        source_sha256: String,
+        /// Trusted digest of the NUL-delimited Carrick argv used for the run.
+        #[arg(long)]
+        command_sha256: String,
+    },
     /// Print the versioned native-x86 DSR context layout consumed by
     /// `scripts/native-x86-profile.py`. The running process's matching Carrick
     /// binary is authoritative; do not hardcode these offsets in D scripts.
@@ -1251,6 +1268,44 @@ mod tests {
     use super::{Cli, Commands, DebugCommand};
     use crate::trace_profile::TraceProfileKind;
     use clap::Parser;
+
+    #[test]
+    fn authenticated_vm_ledger_requires_external_provenance() {
+        let cli = Cli::try_parse_from([
+            "carrick",
+            "debug",
+            "hvpatch-vm-ledger",
+            "/secure/run.json",
+            "--run-id",
+            "k1-run",
+            "--source-sha256",
+            &"11".repeat(32),
+            "--command-sha256",
+            &"22".repeat(32),
+        ])
+        .expect("trusted lifecycle provenance should parse");
+        let Commands::Debug {
+            command:
+                DebugCommand::HvpatchVmLedger {
+                    artifact,
+                    run_id,
+                    source_sha256,
+                    command_sha256,
+                },
+        } = cli.command
+        else {
+            panic!("expected hvpatch-vm-ledger command");
+        };
+        assert_eq!(artifact, std::path::Path::new("/secure/run.json"));
+        assert_eq!(run_id, "k1-run");
+        assert_eq!(source_sha256, "11".repeat(32));
+        assert_eq!(command_sha256, "22".repeat(32));
+        assert!(
+            Cli::try_parse_from(["carrick", "debug", "hvpatch-vm-ledger", "/secure/run.json",])
+                .is_err(),
+            "self-reported artifact provenance must not qualify itself"
+        );
+    }
 
     #[test]
     fn native_shape_profile_parses_with_all_dedicated_outputs() {

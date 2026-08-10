@@ -280,9 +280,8 @@ pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
     // borrow `engine` — it is now also called in the inject-failure arm below,
     // after a &mut engine use, and a closure-held &engine would conflict. (M1b)
     let is_forked_child = engine.is_forked_child();
-    let is_hvpatch_child = kernel.is_hvpatch_child();
     let terminate = |signum: i32| -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
-        if !is_hvpatch_child && (is_forked_child || kernel.dispatcher.is_forked_guest_process()) {
+        if super::requires_no_unwind_host_exit(kernel, is_forked_child) {
             let out = dispatcher.stdout();
             let err = dispatcher.stderr();
             dispatcher.cleanup_sysv_ipc_on_process_exit();

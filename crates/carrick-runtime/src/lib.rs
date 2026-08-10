@@ -339,6 +339,7 @@ pub use carrick_observability::compat;
 // carrick-vmm-hvf re-export). Re-exported at `crate::probes` on EVERY platform so
 // the dispatcher's call sites are unchanged.
 pub use carrick_observability::probes;
+pub use carrick_observability::vm_lifecycle;
 // AArch64 syscall metadata is platform-neutral ABI data, hoisted to carrick-abi
 // so every backend shares ONE table (the Linux/KVM arm was a `lookup → None`
 // stub; bhyve would have inherited it). Re-exported at `crate::syscall` so the

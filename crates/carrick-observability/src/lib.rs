@@ -18,3 +18,4 @@
 
 pub mod compat;
 pub mod probes;
+pub mod vm_lifecycle;
