@@ -285,9 +285,9 @@ impl ProcessTable {
         }
         let pid = allocate_pid(&mut inner)?;
         let parent_record = inner.processes[&parent];
-        let mm = self.mm_pool.allocate_child()?;
-        let binding = mm.binding();
-        let bank = mm.bank().ok_or(ProcessTableError::BankExhausted)?;
+        let prepared_mm = self.mm_pool.prepare_child()?;
+        let binding = prepared_mm.binding();
+        let bank = prepared_mm.bank().ok_or(ProcessTableError::BankExhausted)?;
         let process = GuestProcess {
             pid,
             parent: Some(parent),
@@ -298,7 +298,7 @@ impl ProcessTable {
             ttbr0: binding.ttbr0,
             bank: Some(bank),
         };
-        inner.mm_leases.insert(pid, mm);
+        inner.mm_leases.insert(pid, prepared_mm.commit());
         inner.processes.insert(pid, process);
         Ok(process)
     }
