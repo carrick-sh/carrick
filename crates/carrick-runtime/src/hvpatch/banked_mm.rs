@@ -102,9 +102,9 @@ impl BankedMmLease {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct BankedMmPool {
-    inner: Mutex<BankedMmPoolInner>,
+    inner: Arc<Mutex<BankedMmPoolInner>>,
 }
 
 #[derive(Debug)]
@@ -135,16 +135,16 @@ impl BankedMmPool {
         let root = Arc::new(BankedMmLease::new(asid, stage1_root, None));
         Ok((
             Self {
-                inner: Mutex::new(BankedMmPoolInner {
+                inner: Arc::new(Mutex::new(BankedMmPoolInner {
                     asids,
                     free_banks: (0..PROCESS_BANK_COUNT).map(ProcessBank).collect(),
-                }),
+                })),
             },
             root,
         ))
     }
 
-    pub(crate) fn allocate_child(&self) -> Result<Arc<BankedMmLease>, BankedMmError> {
+    pub(crate) fn prepare_child(&self) -> Result<PreparedBankedMm, BankedMmError> {
         let mut inner = self.inner.lock();
         let bank = inner
             .free_banks
@@ -164,7 +164,22 @@ impl BankedMmPool {
                 return Err(error.into());
             }
         };
-        Ok(Arc::new(BankedMmLease::new(asid, stage1_root, Some(bank))))
+        let lease = Arc::new(BankedMmLease::new(asid, stage1_root, Some(bank)));
+        drop(inner);
+        Ok(PreparedBankedMm {
+            pool: self.clone(),
+            lease,
+            committed: false,
+        })
+    }
+
+    fn release_unpublished(&self, lease: &BankedMmLease) -> Result<(), BankedMmError> {
+        let mut inner = self.inner.lock();
+        inner.asids.release_unpublished(lease.asid)?;
+        if let Some(bank) = lease.bank {
+            inner.free_banks.insert(bank);
+        }
+        Ok(())
     }
 
     pub(crate) fn retire(
@@ -199,6 +214,39 @@ impl BankedMmPool {
             inner.free_banks.insert(bank);
         }
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedBankedMm {
+    pool: BankedMmPool,
+    lease: Arc<BankedMmLease>,
+    committed: bool,
+}
+
+impl PreparedBankedMm {
+    pub(crate) fn binding(&self) -> MmBinding {
+        self.lease.binding()
+    }
+
+    pub(crate) fn bank(&self) -> Option<ProcessBank> {
+        self.lease.bank()
+    }
+
+    pub(crate) fn commit(mut self) -> Arc<BankedMmLease> {
+        self.committed = true;
+        Arc::clone(&self.lease)
+    }
+}
+
+impl Drop for PreparedBankedMm {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if let Err(error) = self.pool.release_unpublished(&self.lease) {
+            tracing::error!(%error, "failed to release unpublished hvpatch banked mm");
+        }
     }
 }
 
@@ -291,6 +339,24 @@ mod tests {
         );
         assert_eq!(backend.binding(), replaced);
         table.acknowledge_tlb_flush(retired).expect("ack retire");
+    }
+
+    #[test]
+    fn dropped_preparation_returns_bank_and_asid_without_retirement_proof() {
+        let (pool, _root) = BankedMmPool::new_root_for_tests(0x8000, 2).expect("root pool");
+        let prepared = pool.prepare_child().expect("first preparation");
+        let first_binding = prepared.binding();
+        let first_bank = prepared.bank();
+
+        drop(prepared);
+
+        let replacement = pool.prepare_child().expect("replacement preparation");
+        assert_eq!(replacement.binding().asid, first_binding.asid);
+        assert_eq!(replacement.bank(), first_bank);
+        let lease = replacement.commit();
+        let retirement = pool.retire(&lease).expect("retire committed lease");
+        pool.acknowledge_tlb_flush(retirement)
+            .expect("acknowledge retirement");
     }
 
     #[test]

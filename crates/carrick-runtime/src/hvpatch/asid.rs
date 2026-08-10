@@ -90,6 +90,17 @@ impl AsidAllocator {
         Ok(asid)
     }
 
+    /// Release an ASID reserved for an address space that was never published
+    /// to a vCPU. No TLB proof is required because no translation could have
+    /// been installed under this identity.
+    pub(crate) fn release_unpublished(&mut self, asid: Asid) -> Result<(), AsidError> {
+        if !self.live.remove(&asid) {
+            return Err(AsidError::NotLive(asid));
+        }
+        self.reusable.push_back(asid);
+        Ok(())
+    }
+
     pub(crate) fn retire(&mut self, asid: Asid) -> Result<RetiredAsid, AsidError> {
         if !self.live.remove(&asid) {
             return Err(AsidError::NotLive(asid));
@@ -158,6 +169,18 @@ mod tests {
         assert_eq!(second.raw(), 2);
         assert_eq!(third.raw(), 3);
         assert_eq!(recycled, first);
+    }
+
+    #[test]
+    fn unpublished_asid_returns_without_entering_retirement_quarantine() {
+        let mut allocator = AsidAllocator::with_limit_for_tests(1);
+        let asid = allocator.allocate().expect("ASID");
+
+        allocator
+            .release_unpublished(asid)
+            .expect("release unpublished ASID");
+
+        assert_eq!(allocator.allocate().expect("recycled ASID"), asid);
     }
 
     #[test]
