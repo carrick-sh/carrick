@@ -50,6 +50,15 @@ impl KernelContext {
         self.revision
     }
 
+    /// Stable task-generation handle used by runtime lanes to capture one fresh
+    /// syscall context for an explicit Linux TID at every dispatch boundary.
+    pub fn task_binding(&self) -> KernelTaskBinding {
+        KernelTaskBinding {
+            kernel: Arc::clone(&self.kernel),
+            task: self.task.key(),
+        }
+    }
+
     fn capture(
         kernel: Arc<Kernel>,
         task: TaskRef,
@@ -77,6 +86,35 @@ impl KernelContext {
             resources,
             revision,
         }
+    }
+}
+
+/// Generation-safe binding from one runtime lane to one Linux task.
+///
+/// The binding deliberately stores a `TaskKey`, not only its reusable numeric
+/// TGID. Capturing also requires an explicit `LinuxTid`; callers must never
+/// reinterpret the backend-local `carrick_hal::ThreadId` as Linux identity.
+#[derive(Clone, Debug)]
+pub struct KernelTaskBinding {
+    kernel: Arc<Kernel>,
+    task: TaskKey,
+}
+
+impl KernelTaskBinding {
+    pub const fn task_id(&self) -> TaskId {
+        self.task.id
+    }
+
+    pub fn kernel(&self) -> &Arc<Kernel> {
+        &self.kernel
+    }
+
+    pub fn capture(&self, tid: LinuxTid) -> Result<KernelContext, KernelError> {
+        let context = self.kernel.context(self.task.id, tid)?;
+        if context.task.key() != self.task {
+            return Err(KernelError::StaleTaskBinding(self.task.id));
+        }
+        Ok(context)
     }
 }
 
@@ -649,6 +687,8 @@ pub enum KernelError {
     ObjectGraph(#[from] ObjectGraphError),
     #[error("kernel task {0:?} is not live")]
     UnknownTask(TaskId),
+    #[error("kernel task {0:?} binding names a retired generation")]
+    StaleTaskBinding(TaskId),
     #[error("kernel thread {0:?} is not live")]
     UnknownThread(LinuxTid),
 }
@@ -689,8 +729,10 @@ pub enum RegistryInvariantError {
 
 #[cfg(test)]
 mod tests {
+    use carrick_abi::LinuxCloneFlags;
+
     use super::*;
-    use crate::kernel::{Credentials, FileTable, FsContext, Mm, Sighand};
+    use crate::kernel::{ClonePlan, Credentials, FileTable, FsContext, Mm, Sighand};
 
     fn bootstrap(pid: i32) -> (Arc<Kernel>, KernelContext) {
         let bootstrap = RootBootstrap::for_reference_model(
@@ -725,6 +767,50 @@ mod tests {
                 .session(SessionId::from_leader(task_id))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn task_binding_captures_explicit_worker_identity_and_rejects_stale_generation() {
+        let (kernel, leader) = bootstrap(4300);
+        let worker_registry_id = ThreadId::synthetic_for_tests(99);
+        let worker = kernel
+            .clone_thread(
+                &leader,
+                ClonePlan::from_flags(
+                    LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+                )
+                .expect("thread plan"),
+                worker_registry_id,
+                None,
+            )
+            .expect("worker");
+        let binding = leader.task_binding();
+        let captured = binding
+            .capture(worker.thread.key().tid)
+            .expect("worker context");
+
+        assert_eq!(binding.task_id(), leader.task.key().id);
+        assert!(Arc::ptr_eq(binding.kernel(), &kernel));
+        assert_eq!(captured.thread.registry_id(), worker_registry_id);
+        assert_eq!(captured.thread.key(), worker.thread.key());
+        assert!(Arc::ptr_eq(&captured.shared, &worker.shared));
+        assert!(Arc::ptr_eq(&captured.resources, &worker.resources));
+
+        let stale = KernelTaskBinding {
+            kernel,
+            task: TaskKey {
+                id: leader.task.key().id,
+                serial: binding
+                    .kernel()
+                    .object_ids()
+                    .task_serial()
+                    .expect("different task generation"),
+            },
+        };
+        assert!(matches!(
+            stale.capture(leader.thread.key().tid),
+            Err(KernelError::StaleTaskBinding(id)) if id == leader.task.key().id
+        ));
     }
 
     #[test]
