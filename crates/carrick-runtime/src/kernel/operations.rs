@@ -625,6 +625,56 @@ impl PreparedFork {
 }
 
 #[derive(Debug)]
+pub struct StartedThreadClone {
+    context: KernelContext,
+}
+
+impl StartedThreadClone {
+    pub fn context(&self) -> &KernelContext {
+        &self.context
+    }
+
+    pub fn into_context(self) -> KernelContext {
+        self.context
+    }
+}
+
+/// Registry-published thread whose backend start gate is still closed.
+/// Dropping it fail-safe starts the thread because publication cannot roll back.
+#[derive(Debug)]
+#[must_use = "a published thread must be started or explicitly retired"]
+pub struct PublishedThreadClone {
+    started: Option<StartedThreadClone>,
+    start_wait: Option<ChildStartWait>,
+    start_release: ChildStartRelease,
+}
+
+impl PublishedThreadClone {
+    pub fn context(&self) -> Option<&KernelContext> {
+        self.started.as_ref().map(StartedThreadClone::context)
+    }
+
+    pub fn start_thread(mut self) -> Result<StartedThreadClone, KernelOperationError> {
+        self.start_release.start();
+        drop(self.start_wait.take());
+        self.started
+            .take()
+            .ok_or(KernelOperationError::PublishedThreadCloneConsumed)
+    }
+
+    pub fn into_context(self) -> Result<KernelContext, KernelOperationError> {
+        Ok(self.start_thread()?.into_context())
+    }
+}
+
+impl Drop for PublishedThreadClone {
+    fn drop(&mut self) {
+        self.start_release.start();
+        drop(self.start_wait.take());
+    }
+}
+
+#[derive(Debug)]
 pub struct ThreadCloneReservation {
     kernel: Arc<Kernel>,
     operation: TaskSetReservation,
@@ -665,10 +715,13 @@ impl ThreadCloneReservation {
         );
         check_failpoint(self.failpoint, KernelFailpoint::AfterObjects)?;
         check_failpoint(self.failpoint, KernelFailpoint::AfterBackendPrepare)?;
+        let (start_wait, start_release) = ChildStartWait::pair();
         Ok(PreparedThreadClone {
             reservation: self,
             thread,
             resources,
+            start_wait: Some(start_wait),
+            start_release,
         })
     }
 }
@@ -678,6 +731,8 @@ pub struct PreparedThreadClone {
     reservation: ThreadCloneReservation,
     thread: ThreadRef,
     resources: Arc<ThreadResources>,
+    start_wait: Option<ChildStartWait>,
+    start_release: ChildStartRelease,
 }
 
 impl PreparedThreadClone {
@@ -685,11 +740,19 @@ impl PreparedThreadClone {
         self.reservation.tid
     }
 
-    pub fn commit(self) -> Result<KernelContext, KernelOperationError> {
+    pub fn take_child_start_wait(&mut self) -> Result<ChildStartWait, KernelOperationError> {
+        self.start_wait
+            .take()
+            .ok_or(KernelOperationError::ChildStartWaitTaken)
+    }
+
+    pub fn commit(self) -> Result<PublishedThreadClone, KernelOperationError> {
         let Self {
             reservation,
             thread,
             resources,
+            start_wait,
+            start_release,
         } = self;
         let ThreadCloneReservation {
             kernel,
@@ -724,14 +787,20 @@ impl PreparedThreadClone {
             record.revision = published_revision;
             operation.commit(&mut state)?;
         }
-        Ok(KernelContext::from_parts(
-            kernel,
-            task,
-            thread,
-            shared,
-            resources,
-            published_revision,
-        ))
+        Ok(PublishedThreadClone {
+            started: Some(StartedThreadClone {
+                context: KernelContext::from_parts(
+                    kernel,
+                    task,
+                    thread,
+                    shared,
+                    resources,
+                    published_revision,
+                ),
+            }),
+            start_wait,
+            start_release,
+        })
     }
 }
 
@@ -935,7 +1004,8 @@ impl Kernel {
     ) -> Result<KernelContext, KernelOperationError> {
         self.reserve_thread_clone(parent, plan, failpoint)?
             .prepare(registry_id)?
-            .commit()
+            .commit()?
+            .into_context()
     }
 
     /// Retire one non-final thread from the authoritative task graph. The TID
@@ -1756,6 +1826,8 @@ pub enum KernelOperationError {
     ChildStartWaitTaken,
     #[error("published fork start state was already consumed")]
     PublishedForkConsumed,
+    #[error("published thread-clone start state was already consumed")]
+    PublishedThreadCloneConsumed,
     #[error("vfork publication must retain its parent wait handle")]
     VforkParentWaitRequired,
     #[error("CLONE_PIDFD fork has no reserved exit subscription")]
@@ -2410,11 +2482,114 @@ mod tests {
         let prepared = reservation.prepare(registry_id).expect("prepare thread");
         assert_eq!(prepared.tid(), tid);
         assert!(root.task.thread(tid).is_none());
-        let child = prepared.commit().expect("publish thread");
+        let published = prepared.commit().expect("publish thread");
 
-        assert_eq!(child.thread.key().tid, tid);
-        assert_eq!(child.thread.registry_id(), registry_id);
+        assert_eq!(
+            published
+                .context()
+                .expect("published thread context")
+                .thread
+                .key()
+                .tid,
+            tid
+        );
         assert!(root.task.thread(tid).is_some());
+        let child = published.start_thread().expect("start thread");
+        assert_eq!(child.context().thread.registry_id(), registry_id);
+    }
+
+    #[test]
+    fn thread_start_gate_opens_only_after_clone_publication() {
+        let (kernel, root) = bootstrap(191);
+        let plan = ClonePlan::from_flags(
+            LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+        )
+        .expect("thread plan");
+        let reservation = kernel
+            .reserve_thread_clone(&root, plan, None)
+            .expect("reserve thread");
+        let tid = reservation.tid();
+        let mut prepared = reservation
+            .prepare(ThreadId::synthetic_for_tests(8_889))
+            .expect("prepare thread");
+        let wait = prepared
+            .take_child_start_wait()
+            .expect("unique thread wait");
+        assert!(matches!(
+            prepared.take_child_start_wait(),
+            Err(KernelOperationError::ChildStartWaitTaken)
+        ));
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::sync_channel(1);
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::sync_channel(1);
+        let waiter = std::thread::spawn(move || {
+            waiting_tx.send(()).expect("report waiting");
+            outcome_tx.send(wait.wait()).expect("report outcome");
+        });
+        waiting_rx.recv().expect("thread reached gate");
+        assert!(root.task.thread(tid).is_none());
+
+        let published = prepared.commit().expect("publish thread");
+        assert!(root.task.thread(tid).is_some());
+        assert!(matches!(
+            outcome_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        let started = published.start_thread().expect("start thread");
+        assert_eq!(started.context().thread.key().tid, tid);
+        assert_eq!(
+            outcome_rx.recv().expect("started outcome"),
+            ChildStartOutcome::Started
+        );
+        waiter.join().expect("join thread waiter");
+    }
+
+    #[test]
+    fn thread_clone_drop_cancels_before_publish_and_starts_after_publish() {
+        let (kernel, root) = bootstrap(192);
+        let plan = ClonePlan::from_flags(
+            LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+        )
+        .expect("thread plan");
+        let reservation = kernel
+            .reserve_thread_clone(&root, plan, None)
+            .expect("reserve cancelled thread");
+        let cancelled_tid = reservation.tid();
+        let mut prepared = reservation
+            .prepare(ThreadId::synthetic_for_tests(8_890))
+            .expect("prepare cancelled thread");
+        let wait = prepared.take_child_start_wait().expect("cancel wait");
+        let cancelled = std::thread::spawn(move || wait.wait());
+        drop(prepared);
+        assert_eq!(
+            cancelled.join().expect("join cancelled thread"),
+            ChildStartOutcome::Cancelled
+        );
+        assert!(root.task.thread(cancelled_tid).is_none());
+
+        let refreshed = kernel
+            .context(root.task.key().id, root.thread.key().tid)
+            .expect("refreshed root");
+        let reservation = kernel
+            .reserve_thread_clone(&refreshed, plan, None)
+            .expect("reserve fail-safe thread");
+        let started_tid = reservation.tid();
+        let mut prepared = reservation
+            .prepare(ThreadId::synthetic_for_tests(8_891))
+            .expect("prepare fail-safe thread");
+        let wait = prepared.take_child_start_wait().expect("fail-safe wait");
+        let started = std::thread::spawn(move || wait.wait());
+        let published = prepared.commit().expect("publish fail-safe thread");
+        drop(published);
+        assert_eq!(
+            started.join().expect("join fail-safe thread"),
+            ChildStartOutcome::Started
+        );
+        let started_context = kernel
+            .context(root.task.key().id, started_tid)
+            .expect("started thread context");
+        kernel
+            .exit_thread(&started_context, None)
+            .expect("retire fail-safe thread");
     }
 
     #[test]
