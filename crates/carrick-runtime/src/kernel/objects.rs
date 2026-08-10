@@ -608,6 +608,14 @@ impl Task {
         self.children.lock().iter().copied().collect()
     }
 
+    pub(super) fn children_set(&self) -> BTreeSet<TaskKey> {
+        self.children.lock().clone()
+    }
+
+    pub(super) fn publish_prepared_children(&self, children: BTreeSet<TaskKey>) {
+        *self.children.lock() = children;
+    }
+
     pub(super) fn process_group(&self) -> ProcessGroupId {
         self.identity.lock().process_group
     }
@@ -623,6 +631,10 @@ impl Task {
             process_group,
             session,
         };
+    }
+
+    pub(super) fn lifecycle(&self) -> TaskLifecycle {
+        *self.lifecycle.lock()
     }
 
     pub(super) fn begin_exit(&self) -> bool {

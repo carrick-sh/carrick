@@ -391,11 +391,9 @@ impl Kernel {
         if !state.tasks.contains_key(&state.root.id) {
             return Err(RegistryInvariantError::RootNotLive);
         }
-        if state
-            .reservations
-            .keys()
-            .any(|task_id| !state.tasks.contains_key(task_id))
-        {
+        if state.reservations.keys().any(|task_id| {
+            !state.tasks.contains_key(task_id) && !state.zombies.contains_key(task_id)
+        }) {
             return Err(RegistryInvariantError::OrphanReservation);
         }
         for (task_id, record) in &state.tasks {
