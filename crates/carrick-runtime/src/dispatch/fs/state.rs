@@ -207,7 +207,8 @@ pub(in crate::dispatch) struct FsState {
 /// Owned I/O-subsystem state. Split out of `SyscallDispatcher` so the I/O
 /// handlers borrow only the fd/stdio state they touch. Field semantics are
 /// unchanged from the former loose fields (`stdout`/`stderr`/`stream_stdio`/
-/// `open_files`/`next_fd`/`cwd`).
+/// `open_files`/`next_fd`). Cwd and chroot authority live exclusively in
+/// [`crate::kernel::FsContext`].
 pub(in crate::dispatch) struct IoState {
     pub stdout: Mutex<Vec<u8>>,
     pub stderr: Mutex<Vec<u8>>,
@@ -218,14 +219,6 @@ pub(in crate::dispatch) struct IoState {
     pub stream_stdio: Mutex<bool>,
     pub open_files: RwLock<HashMap<i32, OpenFile>>,
     pub next_fd: Mutex<i32>,
-    pub cwd: RwLock<String>,
-    /// The process's chroot root as a GLOBAL (un-rerooted) guest path, set by a
-    /// successful `chroot(2)`; `None` means the default root `/`. carrick does
-    /// not yet re-root path resolution (a tracked follow-up), but getcwd
-    /// consults this so a cwd that lies OUTSIDE the new root reports ENOENT —
-    /// the CVE-2018-1000001 semantics realpath01 exercises. Fork-inherited via
-    /// the copied address space.
-    pub chroot_root: RwLock<Option<String>>,
     /// FD_CLOEXEC state for bare stdio fds (0/1/2) that have no
     /// `OpenDescription` in `open_files`. Linux lets `fcntl(F_SETFD,
     /// FD_CLOEXEC)` on stdio and a subsequent `F_GETFD` reflects the bit;
@@ -296,8 +289,6 @@ impl IoState {
             stream_stdio: Mutex::new(false),
             open_files: RwLock::new(HashMap::new()),
             next_fd: Mutex::new(3),
-            cwd: RwLock::new("/".to_owned()),
-            chroot_root: RwLock::new(None),
             stdio_cloexec: Mutex::new([false; 3]),
             closed_stdio: Mutex::new([false; 3]),
             fd_open_paths: RwLock::new(HashMap::new()),
@@ -334,8 +325,6 @@ impl IoState {
             stream_stdio: Mutex::new(*self.stream_stdio.lock()),
             open_files: RwLock::new(open_files),
             next_fd: Mutex::new(*self.next_fd.lock()),
-            cwd: RwLock::new(self.cwd.read().clone()),
-            chroot_root: RwLock::new(self.chroot_root.read().clone()),
             stdio_cloexec: Mutex::new(*self.stdio_cloexec.lock()),
             closed_stdio: Mutex::new(*self.closed_stdio.lock()),
             fd_open_paths: RwLock::new(self.fd_open_paths.read().clone()),
@@ -513,14 +502,11 @@ mod fork_clone_tests {
             3,
             OpenFile::new(Arc::clone(&description), crate::linux_abi::LINUX_FD_CLOEXEC),
         );
-        *parent.io.cwd.write() = "/parent-cwd".to_owned();
-
         let child = parent.io.fork_clone();
 
         let child_file = child.open_files.read().get(&3).cloned().unwrap();
         assert!(Arc::ptr_eq(&description, &child_file.description));
         assert_eq!(child_file.fd_flags, crate::linux_abi::LINUX_FD_CLOEXEC);
-        assert_eq!(child.cwd.read().as_str(), "/parent-cwd");
 
         parent.io.open_files.write().remove(&3);
         assert!(!parent.io.open_files.read().contains_key(&3));

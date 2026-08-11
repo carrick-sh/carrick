@@ -6,7 +6,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use carrick_abi::SigSet;
 use carrick_hal::ThreadId;
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, RwLock};
 
 use crate::linux_abi::LINUX_DEFAULT_UMASK;
 
@@ -380,18 +380,86 @@ impl FileTable {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FsContextState {
+    cwd: String,
+    chroot_root: Option<String>,
+}
+
+/// Authoritative Linux filesystem traversal context.
+///
+/// Mount tables and rootfs services remain runtime infrastructure. Only the
+/// caller-visible `fs_struct` values live here, so `CLONE_FS` can share them
+/// while fork and clones without `CLONE_FS` copy their exact values.
 #[derive(Debug)]
 pub struct FsContext {
     id: FsContextId,
+    state: RwLock<FsContextState>,
+    revision: ObjectRevision,
 }
 
 impl FsContext {
-    pub const fn new(id: FsContextId) -> Self {
-        Self { id }
+    pub fn new(id: FsContextId) -> Self {
+        Self {
+            id,
+            state: RwLock::new(FsContextState {
+                cwd: "/".to_owned(),
+                chroot_root: None,
+            }),
+            revision: ObjectRevision::new(),
+        }
+    }
+
+    fn for_fork_copy(id: FsContextId, parent: &Self) -> Self {
+        Self {
+            id,
+            state: RwLock::new(parent.state.read().clone()),
+            revision: ObjectRevision::new(),
+        }
     }
 
     pub const fn id(&self) -> FsContextId {
         self.id
+    }
+
+    pub fn cwd(&self) -> String {
+        self.state.read().cwd.clone()
+    }
+
+    pub fn chroot_root(&self) -> Option<String> {
+        self.state.read().chroot_root.clone()
+    }
+
+    pub fn set_cwd(&self, cwd: String) {
+        let mut state = self.state.write();
+        if state.cwd != cwd {
+            state.cwd = cwd;
+            self.revision.publish();
+        }
+    }
+
+    pub fn set_chroot_root(&self, chroot_root: Option<String>) {
+        let mut state = self.state.write();
+        if state.chroot_root != chroot_root {
+            state.chroot_root = chroot_root;
+            self.revision.publish();
+        }
+    }
+
+    pub(super) fn snapshot_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Option<(u64, String, Option<String>)> {
+        let state = self.state.try_read_until(deadline)?;
+        Some((
+            self.revision.load(),
+            state.cwd.clone(),
+            state.chroot_root.clone(),
+        ))
+    }
+
+    pub(super) fn revision(&self) -> u64 {
+        self.revision.load()
     }
 }
 
@@ -758,7 +826,10 @@ impl ThreadResources {
         };
         let fs_context = match plan.fs_context() {
             CloneObjectMode::Share => Arc::clone(&parent.fs_context),
-            CloneObjectMode::Copy => Arc::new(FsContext::new(ids.fs_context_id()?)),
+            CloneObjectMode::Copy => Arc::new(FsContext::for_fork_copy(
+                ids.fs_context_id()?,
+                &parent.fs_context,
+            )),
         };
         Ok(Self::new(
             files,
@@ -1653,10 +1724,21 @@ mod tests {
         let flags = LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM;
         let plan = ClonePlan::from_flags(flags).expect("legal clone plan");
         let parent = fixture.leader.resources();
+        parent.fs_context().set_cwd("/parent/cwd".to_owned());
+        parent
+            .fs_context()
+            .set_chroot_root(Some("/parent/root".to_owned()));
         let child = ThreadResources::for_clone(&parent, plan, &fixture.ids).expect("resources");
 
         assert!(!Arc::ptr_eq(&parent.files(), &child.files()));
         assert!(!Arc::ptr_eq(&parent.fs_context(), &child.fs_context()));
+        assert_eq!(child.fs_context().cwd(), "/parent/cwd");
+        assert_eq!(
+            child.fs_context().chroot_root().as_deref(),
+            Some("/parent/root")
+        );
+        child.fs_context().set_cwd("/child/cwd".to_owned());
+        assert_eq!(parent.fs_context().cwd(), "/parent/cwd");
         assert!(!Arc::ptr_eq(&parent.credentials(), &child.credentials()));
         assert_eq!(parent.credentials().ruid(), child.credentials().ruid());
     }
@@ -1673,6 +1755,9 @@ mod tests {
         let child_shared = TaskShared::for_new_task_reference(&parent_shared, plan, &fixture.ids)
             .expect("shared resources");
         let parent_resources = fixture.leader.resources();
+        parent_resources
+            .fs_context()
+            .set_cwd("/shared/cwd".to_owned());
         let child_resources = ThreadResources::for_clone(&parent_resources, plan, &fixture.ids)
             .expect("thread resources");
 
@@ -1689,6 +1774,10 @@ mod tests {
             &parent_resources.fs_context(),
             &child_resources.fs_context()
         ));
+        child_resources
+            .fs_context()
+            .set_cwd("/shared/updated".to_owned());
+        assert_eq!(parent_resources.fs_context().cwd(), "/shared/updated");
     }
 
     #[test]

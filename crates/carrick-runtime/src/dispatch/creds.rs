@@ -41,37 +41,6 @@
 use super::*;
 use crate::linux_abi::LinuxErrno;
 
-thread_local! {
-    static CAPTURED_CREDENTIALS: std::cell::RefCell<Vec<Arc<crate::kernel::Credentials>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-pub(super) fn with_captured_credentials<R>(
-    kernel: &crate::kernel::KernelContext,
-    operation: impl FnOnce() -> R,
-) -> R {
-    with_credentials(kernel.resources().credentials(), operation)
-}
-
-pub(super) fn with_credentials<R>(
-    credentials: Arc<crate::kernel::Credentials>,
-    operation: impl FnOnce() -> R,
-) -> R {
-    struct Pop;
-    impl Drop for Pop {
-        fn drop(&mut self) {
-            CAPTURED_CREDENTIALS.with(|stack| {
-                stack.borrow_mut().pop();
-            });
-        }
-    }
-    CAPTURED_CREDENTIALS.with(|stack| {
-        stack.borrow_mut().push(credentials);
-    });
-    let _pop = Pop;
-    operation()
-}
-
 syscall_table! {
     /// Per-module syscall routing for the `creds` subsystem (Task A1).
     ///
@@ -267,23 +236,21 @@ pub(crate) struct IdentitySnapshot {
 
 impl SyscallDispatcher {
     pub(super) fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials> {
-        CAPTURED_CREDENTIALS.with(|stack| {
-            if let Some(credentials) = stack.borrow().last().cloned() {
-                return credentials;
-            }
-            #[cfg(test)]
-            {
-                self.capture_one_task_context()
-                    .expect("test credential context")
-                    .resources()
-                    .credentials()
-            }
-            #[cfg(not(test))]
-            {
-                tracing::error!("credential read escaped its captured KernelContext scope");
-                std::process::abort();
-            }
-        })
+        if let Some(credentials) = super::resources::credentials() {
+            return credentials;
+        }
+        #[cfg(test)]
+        {
+            self.capture_one_task_context()
+                .expect("test credential context")
+                .resources()
+                .credentials()
+        }
+        #[cfg(not(test))]
+        {
+            tracing::error!("credential read escaped its captured KernelContext scope");
+            std::process::abort();
+        }
     }
 
     pub(super) fn credentials_from_context(

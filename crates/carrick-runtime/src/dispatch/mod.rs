@@ -714,6 +714,7 @@ mod net;
 #[macro_use]
 mod proc;
 mod proctitle;
+mod resources;
 #[macro_use]
 mod signal;
 mod mqueue;
@@ -2194,7 +2195,7 @@ impl Drop for HostAliasDispatchGuard {
 
 #[derive(Clone)]
 pub(crate) struct CapturedCredentialAuthority {
-    credentials: Arc<crate::kernel::Credentials>,
+    resources: resources::CapturedResources,
 }
 
 pub struct SyscallDispatcher {
@@ -2202,9 +2203,9 @@ pub struct SyscallDispatcher {
     /// context at each backend dispatch boundary. HVPatch replaces the initial
     /// one-task binding when its root/child task is published.
     kernel_binding: RwLock<crate::kernel::KernelTaskBinding>,
-    /// Owned I/O subsystem state (buffered stdout/stderr, stream toggle,
-    /// the open-fd table, next-fd cursor, and cwd). See [`fs::IoState`].
-    /// Handlers that touch only I/O state borrow `self.io` narrowly.
+    /// Transitional I/O state: runtime output plus fd-table authority awaiting
+    /// the FileTable cutover. Cwd/chroot authority is already exclusive to the
+    /// captured Kernel [`crate::kernel::FsContext`]. See [`fs::IoState`].
     io: fs::IoState,
     /// Owned memory subsystem state (brk, mmap arena, shared-file IPA
     /// window + live maps, and the captured address-space regions for
@@ -2586,6 +2587,14 @@ mod kernel_context_tests {
         let original = dispatcher
             .capture_one_task_context()
             .expect("original context");
+        original
+            .resources()
+            .fs_context()
+            .set_cwd("/inherited/cwd".to_owned());
+        original
+            .resources()
+            .fs_context()
+            .set_chroot_root(Some("/inherited/root".to_owned()));
         let original = original
             .kernel()
             .update_credentials(&original, |credentials| {
@@ -2610,6 +2619,11 @@ mod kernel_context_tests {
         assert_eq!((credentials.ruid(), credentials.rgid()), (1001, 2001));
         assert_eq!((credentials.fsuid(), credentials.fsgid()), (1002, 2002));
         assert_eq!(credentials.umask(), 0o077);
+        assert_eq!(rebound.resources().fs_context().cwd(), "/inherited/cwd");
+        assert_eq!(
+            rebound.resources().fs_context().chroot_root().as_deref(),
+            Some("/inherited/root")
+        );
         assert_eq!(
             credentials.supplementary_groups_override(),
             Some([9, 10].as_slice())
@@ -2680,7 +2694,7 @@ impl SyscallDispatcher {
         context: &crate::kernel::KernelContext,
         operation: impl FnOnce() -> R,
     ) -> R {
-        creds::with_captured_credentials(context, operation)
+        resources::with_captured_resources(context, operation)
     }
 
     pub(crate) fn retain_kernel_credentials(
@@ -2688,7 +2702,7 @@ impl SyscallDispatcher {
         context: &crate::kernel::KernelContext,
     ) -> CapturedCredentialAuthority {
         CapturedCredentialAuthority {
-            credentials: context.resources().credentials(),
+            resources: resources::CapturedResources::from_context(context),
         }
     }
 
@@ -2697,7 +2711,7 @@ impl SyscallDispatcher {
         authority: &CapturedCredentialAuthority,
         operation: impl FnOnce() -> R,
     ) -> R {
-        creds::with_credentials(Arc::clone(&authority.credentials), operation)
+        resources::with_resources(authority.resources.clone(), operation)
     }
 
     pub(crate) fn prepare_one_task_kernel_exec(
@@ -2742,6 +2756,7 @@ impl SyscallDispatcher {
         let observed_pid = i32::try_from(std::process::id())
             .map_err(|_| "host PID does not fit Linux task identity".to_owned())?;
         let inherited_credentials = inherited.resources().credentials();
+        let inherited_fs_context = inherited.resources().fs_context();
         let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
             observed_pid,
             registry_id,
@@ -2750,6 +2765,9 @@ impl SyscallDispatcher {
         .map_err(|error| error.to_string())?;
         let (kernel, context) =
             crate::kernel::Kernel::bootstrap_root(bootstrap).map_err(|error| error.to_string())?;
+        let replacement_fs_context = context.resources().fs_context();
+        replacement_fs_context.set_cwd(inherited_fs_context.cwd());
+        replacement_fs_context.set_chroot_root(inherited_fs_context.chroot_root());
         let context = kernel
             .update_credentials(&context, |credentials| {
                 credentials.copy_values_from(&inherited_credentials);
@@ -2930,7 +2948,7 @@ impl SyscallDispatcher {
             reporter,
             thread,
         };
-        let outcome = creds::with_captured_credentials(kernel, || handler(self, &mut ctx));
+        let outcome = resources::with_captured_resources(kernel, || handler(self, &mut ctx));
         // Single choke point for the fork-coherent resolve cache: a structural
         // namespace mutation (mkdirat/unlinkat/symlinkat/linkat/renameat/
         // renameat2/mknodat) can change how OTHER paths resolve, so bump the
@@ -4300,8 +4318,47 @@ impl SyscallDispatcher {
         self.io.stderr.lock().clone()
     }
 
+    fn captured_fs_context(&self) -> Arc<crate::kernel::FsContext> {
+        if let Some(fs_context) = resources::fs_context() {
+            return fs_context;
+        }
+        #[cfg(test)]
+        {
+            self.capture_one_task_context()
+                .expect("test filesystem context")
+                .resources()
+                .fs_context()
+        }
+        #[cfg(not(test))]
+        {
+            tracing::error!("filesystem-context read escaped its captured KernelContext scope");
+            std::process::abort();
+        }
+    }
+
     pub fn cwd(&self) -> String {
-        self.io.cwd.read().clone()
+        if let Some(fs_context) = resources::fs_context() {
+            return fs_context.cwd();
+        }
+        self.capture_one_task_context()
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, "cannot capture initial filesystem context");
+                std::process::abort();
+            })
+            .resources()
+            .fs_context()
+            .cwd()
+    }
+
+    pub(crate) fn cwd_for_context(&self, context: &crate::kernel::KernelContext) -> String {
+        context.resources().fs_context().cwd()
+    }
+
+    pub(crate) fn chroot_root_for_context(
+        &self,
+        context: &crate::kernel::KernelContext,
+    ) -> Option<String> {
+        context.resources().fs_context().chroot_root()
     }
 
     /// Absolutize an `execve(2)` target path against the guest cwd, matching
@@ -4333,11 +4390,20 @@ impl SyscallDispatcher {
             return;
         }
         let trimmed = path.trim_end_matches('/');
-        *self.io.cwd.write() = if trimmed.is_empty() {
+        let cwd = if trimmed.is_empty() {
             "/".to_owned()
         } else {
             trimmed.to_owned()
         };
+        if let Some(fs_context) = resources::fs_context() {
+            fs_context.set_cwd(cwd);
+            return;
+        }
+        let context = self.capture_one_task_context().unwrap_or_else(|error| {
+            tracing::error!(%error, "cannot capture initial filesystem context");
+            std::process::abort();
+        });
+        context.resources().fs_context().set_cwd(cwd);
     }
 
     /// Shared pseudo-terminal table. Also held by the `/dev` (ptmx) and
@@ -11331,7 +11397,6 @@ mod hvpatch_in_process_fork_tests {
             3,
             OpenFile::new(Arc::clone(&description), crate::linux_abi::LINUX_FD_CLOEXEC),
         );
-        *parent.io.cwd.write() = "/parent".to_owned();
         parent
             .signal
             .lock()
@@ -11351,7 +11416,6 @@ mod hvpatch_in_process_fork_tests {
         let child_file = child.io.open_files.read().get(&3).cloned().unwrap();
         assert!(Arc::ptr_eq(&description, &child_file.description));
         assert_eq!(child_file.fd_flags, crate::linux_abi::LINUX_FD_CLOEXEC);
-        assert_eq!(child.io.cwd.read().as_str(), "/parent");
         assert_eq!(child.signal_mask_for(child_tid).raw(), 1 << 11);
         assert!(child.signal.lock().pendings.is_empty());
         assert_eq!(child.proc.lock().pdeathsig, 0);
@@ -11359,10 +11423,8 @@ mod hvpatch_in_process_fork_tests {
         assert_eq!(child.mem.lock().brk_current, 0x1234_0000);
 
         child.io.open_files.write().remove(&3);
-        *child.io.cwd.write() = "/child".to_owned();
         child.mem.lock().brk_current = 0x5678_0000;
         assert!(parent.io.open_files.read().contains_key(&3));
-        assert_eq!(parent.io.cwd.read().as_str(), "/parent");
         assert_eq!(parent.mem.lock().brk_current, 0x1234_0000);
     }
 

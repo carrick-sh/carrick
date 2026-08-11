@@ -49,6 +49,7 @@ pub(crate) struct NativeGuestExecV1 {
     #[serde(default)]
     pub(crate) lower_rootfs: Option<crate::rootfs::ImmutableHostRootAuthority>,
     pub(crate) cwd: String,
+    pub(crate) chroot_root: Option<String>,
     pub(crate) stream_stdio: bool,
     pub(crate) exec_host_fs_fallback: bool,
     pub(crate) max_traps: u64,
@@ -262,6 +263,10 @@ impl NativeGuestExecV1 {
             || self.resolved_path.len() > MAX_PATH_LEN
             || self.cwd.is_empty()
             || self.cwd.len() > MAX_PATH_LEN
+            || self
+                .chroot_root
+                .as_ref()
+                .is_some_and(|root| root.is_empty() || root.len() > MAX_PATH_LEN)
             || self.rootfs.root_path.is_empty()
             || self.rootfs.root_path.len() > MAX_PATH_LEN
             || self
@@ -416,7 +421,8 @@ pub(crate) fn begin_guest_exec(
             executable_digest,
             rootfs,
             lower_rootfs,
-            cwd: dispatcher.cwd(),
+            cwd: dispatcher.cwd_for_context(kernel_context),
+            chroot_root: dispatcher.chroot_root_for_context(kernel_context),
             stream_stdio: dispatcher.stream_stdio_enabled(),
             exec_host_fs_fallback: dispatcher.exec_host_fs_fallback(),
             max_traps: u64::try_from(max_traps)?,
@@ -1344,6 +1350,7 @@ mod tests {
                 },
                 lower_rootfs: None,
                 cwd: "/".to_owned(),
+                chroot_root: None,
                 stream_stdio: true,
                 exec_host_fs_fallback: false,
                 max_traps: 100,
