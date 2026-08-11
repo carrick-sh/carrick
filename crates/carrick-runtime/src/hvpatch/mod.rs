@@ -116,6 +116,7 @@ impl ProcessContext {
         context: &crate::kernel::KernelContext,
         mm_backend: std::sync::Arc<banked_mm::BankedMmBackend>,
     ) -> Self {
+        mm_backend.bind_inventory(context.kernel(), context.shared().mm().id());
         Self::new(
             std::sync::Arc::clone(&self.resources),
             context.task_binding(),
@@ -267,9 +268,13 @@ impl ProcessContext {
         self.resources
             .publish_exec(self.task_key(), stage1_root)
             .map_err(|error| error.to_string())?;
-        self.kernel_graph()
+        let context = self
+            .kernel_graph()
             .commit_exec(prepared, None)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        self.mm_backend
+            .bind_inventory(context.kernel(), context.shared().mm().id());
+        Ok(context)
     }
 
     pub(crate) fn record_process_exit_begin(
@@ -551,8 +556,9 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
         "hvpatch-root".to_owned(),
     )
     .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-    let (_kernel, root) = crate::kernel::Kernel::bootstrap_root(bootstrap)
+    let (kernel, root) = crate::kernel::Kernel::bootstrap_root(bootstrap)
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+    mm_backend.bind_inventory(&kernel, root.shared().mm().id());
     table
         .publish_root(root.task().key())
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
@@ -864,7 +870,8 @@ mod tests {
             "adapter-root".to_owned(),
         )
         .unwrap();
-        let (_kernel, root) = crate::kernel::Kernel::bootstrap_root(bootstrap).unwrap();
+        let (kernel, root) = crate::kernel::Kernel::bootstrap_root(bootstrap).unwrap();
+        backend.bind_inventory(&kernel, root.shared().mm().id());
         let table = std::sync::Arc::new(table);
         table.publish_root(root.task().key()).unwrap();
         (
@@ -956,6 +963,54 @@ mod tests {
             crate::kernel::MmBackend::binding(actual.as_ref()),
             process.mm_binding().unwrap()
         );
+    }
+
+    #[test]
+    fn banked_mm_reports_authoritative_mapping_ids_for_its_exact_mm() {
+        let (_process, root) = authoritative_root();
+        let capacity = carrick_hal::FrameEventCapacity::for_event_count(2).unwrap();
+        let mut reservation = root
+            .kernel()
+            .reserve_frame_inventory(1, 1, capacity)
+            .unwrap();
+        let transaction = reservation.transaction();
+        let frame = reservation.claim_frame().unwrap();
+        let mapping = reservation.claim_mapping().unwrap();
+        let generation = carrick_hal::MappingGeneration::from_backend_counter(
+            std::num::NonZeroU64::new(1).unwrap(),
+        );
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation,
+                gpa: carrick_guest_mem::Gpa(0x4000),
+                length: carrick_hal::FrameLength::from_mapping_extent(
+                    std::num::NonZeroU64::new(0x4000).unwrap(),
+                ),
+                permissions: carrick_hal::MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation,
+            })
+            .unwrap();
+        root.kernel()
+            .frame_inventory()
+            .apply(root.shared().mm().id(), reservation.commit(()))
+            .unwrap();
+
+        let mm = root.shared().mm();
+        let backend = mm.backend().expect("banked mm backend");
+        assert_eq!(backend.mapping_ids().unwrap(), vec![mapping]);
     }
 
     #[test]
