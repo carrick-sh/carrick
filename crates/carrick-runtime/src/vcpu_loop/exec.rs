@@ -301,8 +301,23 @@ where
                 kernel
                     .dispatcher
                     .set_executable_identity(path.clone(), proc_argv, proc_env);
-                // Refresh /proc/self/maps + /proc/self/auxv for the new image.
-                apply_image_proc_state(&kernel.dispatcher, &img);
+                // Preserve the old typed Mm's historical VMA generation before
+                // replacing the dispatcher's sole production authority.
+                if let Some(process) = kernel.hvpatch_process.as_ref() {
+                    process
+                        .freeze_current_vmas(
+                            std::time::Instant::now() + std::time::Duration::from_secs(1),
+                        )
+                        .map_err(|error| {
+                            RuntimeError::Configuration(format!(
+                                "freeze HVPatch VMA authority before exec: {error}"
+                            ))
+                        })?;
+                }
+                kernel.dispatcher.reset_signal_handlers_on_execve();
+                // Reset + refresh /proc/self/maps and /proc/self/auxv under one
+                // dispatcher memory-authority generation.
+                apply_exec_image_proc_state(&kernel.dispatcher, &img);
                 emit_runtime_stage(
                     carrick_observability::probes::HvpatchExecRuntimeStagePhase::ProcState,
                     proc_state_started,
@@ -380,7 +395,11 @@ where
                                     std::process::abort();
                                 }
                             };
-                            process.commit_exec(prepared, stage1_root)
+                            process.commit_exec(
+                                prepared,
+                                stage1_root,
+                                kernel.dispatcher.vma_snapshot_source(),
+                            )
                         }
                         (None, RuntimePreparedExec::Other(prepared)) => {
                             kernel.dispatcher.commit_one_task_kernel_exec(prepared)

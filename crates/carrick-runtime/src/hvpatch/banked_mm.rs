@@ -7,8 +7,8 @@ use parking_lot::{Mutex, RwLock};
 
 use super::asid::{AsidAllocator, AsidError, RetiredAsid};
 use crate::kernel::{
-    Asid, MmBackend, MmBackendSnapshot, MmBinding, SnapshotError, Stage1Root, Stage1RootError,
-    Ttbr0,
+    Asid, MmBackend, MmBackendSnapshot, MmBinding, SharedVmaSnapshotSource, SnapshotError,
+    SnapshotTable, Stage1Root, Stage1RootError, Ttbr0, VmaRevision,
 };
 
 const PROCESS_BANK_SIZE: u64 = 40 * 1024 * 1024 * 1024;
@@ -295,6 +295,7 @@ impl From<AsidError> for BankedMmError {
 pub(crate) struct BankedMmBackend {
     binding: RwLock<MmBinding>,
     inventory: RwLock<Option<InventoryBinding>>,
+    vma_source: RwLock<Option<SharedVmaSnapshotSource>>,
     revision: AtomicU64,
 }
 
@@ -313,6 +314,7 @@ impl BankedMmBackend {
         Self {
             binding: RwLock::new(binding),
             inventory: RwLock::new(None),
+            vma_source: RwLock::new(None),
             revision: AtomicU64::new(1),
         }
     }
@@ -340,6 +342,34 @@ impl BankedMmBackend {
         self.bump_revision();
     }
 
+    pub(crate) fn bind_vma_source(&self, source: SharedVmaSnapshotSource) {
+        *self.vma_source.write() = Some(source);
+        self.bump_revision();
+    }
+
+    /// Detach this historical observer from the mutable dispatcher authority.
+    /// The owned snapshot remains readable for as long as the old typed `Mm`
+    /// is retained, even after destructive exec publishes the replacement.
+    pub(crate) fn freeze_vmas(&self, deadline: Instant) -> Result<(), SnapshotError> {
+        let source = self
+            .vma_source
+            .try_read_until(deadline)
+            .ok_or_else(|| deadline_error(deadline))?
+            .clone()
+            .ok_or(SnapshotError::AuthorityUnavailable(SnapshotTable::Vmas))?;
+        let snapshot = source.snapshot(deadline)?;
+        if source.revision() != snapshot.revision {
+            return Err(SnapshotError::ChangedDuringObservation);
+        }
+        let frozen: SharedVmaSnapshotSource = Arc::new(snapshot);
+        *self
+            .vma_source
+            .try_write_until(deadline)
+            .ok_or_else(|| deadline_error(deadline))? = Some(frozen);
+        self.bump_revision();
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn inventory_mm_for_tests(&self) -> Option<crate::kernel::MmId> {
         self.inventory.read().as_ref().map(|binding| binding.mm)
@@ -356,26 +386,32 @@ impl BankedMmBackend {
     }
 }
 
+fn deadline_error(deadline: Instant) -> SnapshotError {
+    if Instant::now() >= deadline {
+        SnapshotError::TimedOut
+    } else {
+        SnapshotError::Busy
+    }
+}
+
 impl MmBackend for BankedMmBackend {
     fn snapshot(&self, deadline: Instant) -> Result<MmBackendSnapshot, SnapshotError> {
         let before = self.revision.load(Ordering::Acquire);
         let binding = {
             let Some(guard) = self.binding.try_read_until(deadline) else {
-                return Err(if Instant::now() >= deadline {
-                    SnapshotError::TimedOut
-                } else {
-                    SnapshotError::Busy
-                });
+                return Err(deadline_error(deadline));
             };
             *guard
         };
+        let vma_source = self
+            .vma_source
+            .try_read_until(deadline)
+            .ok_or_else(|| deadline_error(deadline))?
+            .clone()
+            .ok_or(SnapshotError::AuthorityUnavailable(SnapshotTable::Vmas))?;
         let (kernel, mm) = {
             let Some(guard) = self.inventory.try_read_until(deadline) else {
-                return Err(if Instant::now() >= deadline {
-                    SnapshotError::TimedOut
-                } else {
-                    SnapshotError::Busy
-                });
+                return Err(deadline_error(deadline));
             };
             let inventory = guard.as_ref().ok_or(SnapshotError::AuthorityUnavailable(
                 crate::kernel::SnapshotTable::Mappings,
@@ -388,6 +424,9 @@ impl MmBackend for BankedMmBackend {
                 ))?;
             (kernel, inventory.mm)
         };
+        // No backend lock is held while either independent authority is
+        // observed. This preserves the K1 backend/frame/kernel lock boundary.
+        let vma_snapshot = vma_source.snapshot(deadline)?;
         let frame_snapshot = kernel
             .frame_inventory()
             .snapshot_for_mm_until(mm, deadline)
@@ -399,16 +438,14 @@ impl MmBackend for BankedMmBackend {
                 }
             })?;
         let after = self.revision.load(Ordering::Acquire);
-        if before != after {
+        if before != after || vma_source.revision() != vma_snapshot.revision {
             return Err(SnapshotError::ChangedDuringObservation);
         }
         Ok(MmBackendSnapshot {
             revision: after,
             binding,
-            // The typed K1 model has not yet extracted concrete VMA state.
-            // Its authoritative projection is therefore exactly an empty table;
-            // dispatcher AddressSpace state is deliberately not consulted.
-            vmas: Vec::new(),
+            vmas: vma_snapshot.vmas,
+            vma_revision: Some(vma_snapshot.revision),
             mapping_ids: frame_snapshot
                 .mappings
                 .into_iter()
@@ -420,6 +457,13 @@ impl MmBackend for BankedMmBackend {
 
     fn revision(&self) -> u64 {
         self.revision.load(Ordering::Acquire)
+    }
+
+    fn vma_revision(&self) -> Option<VmaRevision> {
+        self.vma_source
+            .read()
+            .as_ref()
+            .map(|source| source.revision())
     }
 }
 
@@ -478,13 +522,13 @@ mod tests {
     }
 
     #[test]
-    fn fails_closed_when_mapping_authority_is_unbound() {
+    fn fails_closed_when_vma_authority_is_unbound() {
         let (_table, backend) = BankResources::new_root(0x8000).expect("root table");
 
         assert_eq!(
             backend.snapshot(Instant::now() + std::time::Duration::from_secs(1)),
             Err(SnapshotError::AuthorityUnavailable(
-                crate::kernel::SnapshotTable::Mappings
+                crate::kernel::SnapshotTable::Vmas
             ))
         );
     }

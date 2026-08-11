@@ -2129,6 +2129,7 @@ mod tests {
                 revision: 1,
                 binding: self.0,
                 vmas: Vec::new(),
+                vma_revision: None,
                 mapping_ids: Vec::new(),
                 frame_inventory_revision: None,
             })

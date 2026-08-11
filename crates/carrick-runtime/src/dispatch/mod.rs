@@ -2113,7 +2113,7 @@ pub struct SyscallDispatcher {
     /// Owned memory subsystem state (brk, mmap arena, shared-file IPA
     /// window + live maps, and the captured address-space regions for
     /// `/proc/self/maps`). See [`mem::MemState`].
-    mem: Mutex<mem::MemState>,
+    mem: Arc<mem::MemAuthority>,
     /// Serializes mapping syscalls across the dispatcher/runtime split. A
     /// `MapHostAlias` remains `Pending` until its runtime consumer claims it,
     /// then `Installing` until exact metadata commit or abort, so no sibling
@@ -2464,10 +2464,16 @@ fn resolve_handler<M: GuestMemory>(number: u64) -> Option<SyscallHandler<M>> {
 
 impl SyscallDispatcher {
     pub(crate) fn bind_hvpatch_process(&self, process: crate::hvpatch::ProcessContext) {
+        process.bind_vma_source(self.vma_snapshot_source());
         *self.kernel_binding.write() = process.task_binding();
         let mut proc = self.proc.lock();
         proc.virtual_pid = Some(process.pid() as u32);
         proc.hvpatch_process = Some(process);
+    }
+
+    pub(crate) fn vma_snapshot_source(&self) -> crate::kernel::SharedVmaSnapshotSource {
+        let source: crate::kernel::SharedVmaSnapshotSource = Arc::clone(&self.mem) as _;
+        source
     }
 
     pub(crate) fn capture_kernel_context(
@@ -2626,7 +2632,7 @@ impl SyscallDispatcher {
         Self {
             kernel_binding: RwLock::new(self.kernel_binding.read().clone()),
             io: self.io.fork_clone(),
-            mem: Mutex::new(self.mem.lock().clone()),
+            mem: self.mem.fork_private(),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
             proc: Mutex::new(
                 self.proc
@@ -2749,7 +2755,7 @@ impl SyscallDispatcher {
         Self {
             kernel_binding: RwLock::new(bootstrap_one_task_binding()),
             io: fs::IoState::new(),
-            mem: Mutex::new(mem::MemState::new()),
+            mem: Arc::new(mem::MemAuthority::new(mem::MemState::new())),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
             proc: Mutex::new(proc::ProcState::new()),
             creds: Mutex::new(creds::CredState::new()),
@@ -2943,6 +2949,16 @@ impl SyscallDispatcher {
     /// succeeds.
     pub fn set_address_space_regions(&self, regions: Vec<ProcMapsEntry>) {
         self.mem.lock().address_space_regions = Some(regions);
+    }
+
+    /// Publish a replacement image's complete dispatcher memory generation.
+    /// Reset, boot-region metadata and auxv become visible under one authority
+    /// write, so K1 observers cannot see the destructive exec midpoint.
+    pub(crate) fn publish_exec_image_state(&self, regions: Vec<ProcMapsEntry>, auxv: Vec<u8>) {
+        let mut mem = self.mem.lock();
+        mem.reset_for_execve();
+        mem.address_space_regions = Some(regions);
+        mem.linux_auxv_image = auxv;
     }
 
     /// Capture the guest's serialized ELF auxv image (from the loaded

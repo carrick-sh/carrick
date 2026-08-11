@@ -208,6 +208,7 @@ struct LeafChecks {
     file_tables: Vec<(Arc<FileTable>, u64)>,
     descriptions: Vec<(Arc<FileDescription>, u64)>,
     backends: Vec<(Arc<dyn MmBackend>, u64)>,
+    vma_revisions: Vec<(Arc<dyn MmBackend>, super::VmaRevision)>,
     frame_inventory_revisions: Vec<u64>,
 }
 
@@ -292,6 +293,7 @@ impl Kernel {
             file_tables: Vec::new(),
             descriptions: Vec::new(),
             backends: Vec::new(),
+            vma_revisions: Vec::new(),
             frame_inventory_revisions: Vec::new(),
         };
         let mut thread_rows = Vec::new();
@@ -411,6 +413,9 @@ impl Kernel {
             if observed.revision != backend.revision() {
                 return Err(AttemptError::Race);
             }
+            if let Some(revision) = observed.vma_revision {
+                checks.vma_revisions.push((Arc::clone(&backend), revision));
+            }
             if let Some(revision) = observed.frame_inventory_revision {
                 checks.frame_inventory_revisions.push(revision);
             }
@@ -512,6 +517,11 @@ impl Kernel {
         }
         for (backend, revision) in checks.backends {
             if backend.revision() != revision {
+                return Err(AttemptError::Race);
+            }
+        }
+        for (backend, revision) in checks.vma_revisions {
+            if backend.vma_revision() != Some(revision) {
                 return Err(AttemptError::Race);
             }
         }
@@ -996,12 +1006,14 @@ mod tests {
         BrokenMappingJoin,
         FrameRevisionRace,
         RevisionRace,
+        VmaRevisionRace,
     }
 
     #[derive(Debug)]
     struct TestBackend {
         binding: MmBinding,
         revision: AtomicU64,
+        vma_revision: AtomicU64,
         mode: BackendMode,
         kernel: Mutex<Option<Weak<Kernel>>>,
         bump_epoch: bool,
@@ -1014,6 +1026,7 @@ mod tests {
             Arc::new(Self {
                 binding: MmBinding::for_aarch64(asid, root),
                 revision: AtomicU64::new(1),
+                vma_revision: AtomicU64::new(1),
                 mode,
                 kernel: Mutex::new(None),
                 bump_epoch: false,
@@ -1046,6 +1059,7 @@ mod tests {
                         start: GuestVa(0x2000),
                         end: GuestVa(0x1000),
                     }],
+                    vma_revision: None,
                     mapping_ids: Vec::new(),
                     frame_inventory_revision: None,
                 }),
@@ -1053,6 +1067,7 @@ mod tests {
                     revision: self.revision(),
                     binding: self.binding,
                     vmas: Vec::new(),
+                    vma_revision: None,
                     mapping_ids: vec![MappingId::from_kernel_allocation(
                         NonZeroU64::new(99).expect("mapping"),
                     )],
@@ -1062,6 +1077,7 @@ mod tests {
                     revision: self.revision(),
                     binding: self.binding,
                     vmas: Vec::new(),
+                    vma_revision: None,
                     mapping_ids: Vec::new(),
                     frame_inventory_revision: Some(u64::MAX),
                 }),
@@ -1071,6 +1087,20 @@ mod tests {
                         revision: observed,
                         binding: self.binding,
                         vmas: Vec::new(),
+                        vma_revision: None,
+                        mapping_ids: Vec::new(),
+                        frame_inventory_revision: None,
+                    })
+                }
+                BackendMode::VmaRevisionRace => {
+                    let observed = self.vma_revision.fetch_add(1, Ordering::Release);
+                    Ok(MmBackendSnapshot {
+                        revision: self.revision(),
+                        binding: self.binding,
+                        vmas: Vec::new(),
+                        vma_revision: Some(crate::kernel::VmaRevision::from_authority_raw(
+                            observed,
+                        )),
                         mapping_ids: Vec::new(),
                         frame_inventory_revision: None,
                     })
@@ -1082,6 +1112,7 @@ mod tests {
                         start: GuestVa(0x1000),
                         end: GuestVa(0x2000),
                     }],
+                    vma_revision: None,
                     mapping_ids: Vec::new(),
                     frame_inventory_revision: None,
                 }),
@@ -1090,6 +1121,14 @@ mod tests {
 
         fn revision(&self) -> u64 {
             self.revision.load(Ordering::Acquire)
+        }
+
+        fn vma_revision(&self) -> Option<crate::kernel::VmaRevision> {
+            matches!(self.mode, BackendMode::VmaRevisionRace).then(|| {
+                crate::kernel::VmaRevision::from_authority_raw(
+                    self.vma_revision.load(Ordering::Acquire),
+                )
+            })
         }
     }
 
@@ -1147,7 +1186,11 @@ mod tests {
     fn epoch_and_revision_races_exhaust_three_retries() {
         let (kernel, _) = bootstrap(TestBackend::epoch_racer());
         assert_eq!(kernel.snapshot(deadline()), Err(KernelSnapshotError::Busy));
-        for mode in [BackendMode::RevisionRace, BackendMode::FrameRevisionRace] {
+        for mode in [
+            BackendMode::RevisionRace,
+            BackendMode::FrameRevisionRace,
+            BackendMode::VmaRevisionRace,
+        ] {
             let (kernel, _) = bootstrap(TestBackend::new(mode));
             assert_eq!(kernel.snapshot(deadline()), Err(KernelSnapshotError::Busy));
         }

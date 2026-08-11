@@ -15,8 +15,9 @@ pub mod registry;
 pub mod snapshot;
 
 pub use address::{
-    Asid, MmBackend, MmBackendSnapshot, MmBinding, SnapshotError, SnapshotTable, Stage1Root,
-    Stage1RootError, Ttbr0, VmaSummary,
+    Asid, MmBackend, MmBackendSnapshot, MmBinding, OwnedVmaSnapshot, SharedVmaSnapshotSource,
+    SnapshotError, SnapshotTable, Stage1Root, Stage1RootError, Ttbr0, VmaRevision,
+    VmaSnapshotSource, VmaSummary,
 };
 pub use clone_plan::{
     CloneObjectMode, ClonePlan, ClonePlanError, CloneTaskMode, ForkParentMode, ForkPidfdMode,
