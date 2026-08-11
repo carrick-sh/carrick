@@ -3172,6 +3172,7 @@ struct ProcessMappingDesc {
     shared_key_base: u64,
     shared_key_offset: u64,
     inherited_frame: Option<carrick_hal::FrameId>,
+    inherited_backing: Option<InventoryBackingIdentity>,
 }
 
 /// A fork child address space waiting for vCPU materialization on its owning
@@ -3250,6 +3251,11 @@ impl HvfVmState {
         backing: InventoryBackingIdentity,
         inherited_frame: Option<carrick_hal::FrameId>,
     ) -> Result<(), TrapError> {
+        if inventory.extents.contains_key(&(gpa, length)) {
+            return Err(TrapError::Hypervisor(format!(
+                "HVPatch inventory extent IPA 0x{gpa:x} size {length} is duplicated"
+            )));
+        }
         let transaction = reservation.transaction();
         let mapping = reservation
             .claim_mapping()
@@ -3298,7 +3304,12 @@ impl HvfVmState {
             },
         );
         let mut frames = inventory.frames.lock();
-        *frames.references.entry(frame).or_default() += 1;
+        let references = frames.references.entry(frame).or_default();
+        *references = references.checked_add(1).ok_or_else(|| {
+            TrapError::Hypervisor(format!(
+                "HVPatch frame {frame:?} backend reference count exhausted"
+            ))
+        })?;
         if matches!(backing, InventoryBackingIdentity::SharedFile { .. }) {
             frames.shared.entry(backing).or_insert(frame);
         }
@@ -3327,7 +3338,12 @@ impl HvfVmState {
                     extent.frame
                 ))
             })?;
-            *references -= 1;
+            *references = references.checked_sub(1).ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "HVPatch frame {:?} backend reference count underflow",
+                    extent.frame
+                ))
+            })?;
             if *references == 0 {
                 frames.references.remove(&extent.frame);
                 if matches!(extent.backing, InventoryBackingIdentity::SharedFile { .. }) {
@@ -4174,21 +4190,29 @@ impl HvfVmState {
             // SAFETY: dispatcher-to-backend alias setup transfers this dup.
             (unsafe { OwnedFd::from_raw_fd(fd) }, offset, prot)
         });
-        let inventory_backing = file
-            .as_ref()
-            .and_then(|(fd, offset, _)| {
+        let inventory_backing = match file.as_ref() {
+            Some((fd, offset, _)) => {
                 let mut stat: libc::stat = unsafe { std::mem::zeroed() };
                 if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } != 0 {
-                    return None;
+                    return Err(TrapError::Hypervisor(format!(
+                        "identify HVPatch shared-file frame: {}",
+                        std::io::Error::last_os_error()
+                    )));
                 }
-                Some(InventoryBackingIdentity::SharedFile {
+                let offset = u64::try_from(*offset).map_err(|_| {
+                    TrapError::Hypervisor(
+                        "HVPatch shared-file frame has negative offset".to_owned(),
+                    )
+                })?;
+                InventoryBackingIdentity::SharedFile {
                     device: stat.st_dev as u64,
                     inode: stat.st_ino as u64,
-                    offset: u64::try_from(*offset).ok()?,
+                    offset,
                     length: len,
-                })
-            })
-            .unwrap_or_else(Self::private_backing_identity);
+                }
+            }
+            None => Self::private_backing_identity(),
+        };
         // Mature VMM/root uses the IPA the dispatcher allocated from the global
         // alias arena. An in-process hvpatch child relocates PRIVATE aliases into
         // its own process bank; the returned GPA is authoritative for stage-1,
@@ -6058,6 +6082,14 @@ impl HvfVmState {
         for index in order {
             let mapping = &source_mappings[index];
             if mapping.guest_shared {
+                let parent_extent = parent_inventory
+                    .get(&(mapping.ipa, mapping.size as u64))
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor(format!(
+                            "HVPatch shared child extent IPA 0x{:x} size {} lacks parent inventory",
+                            mapping.ipa, mapping.size
+                        ))
+                    })?;
                 mappings.push(ProcessMappingDesc {
                     start: mapping.start,
                     ipa: mapping.ipa,
@@ -6069,9 +6101,8 @@ impl HvfVmState {
                     guest_writable: mapping.guest_writable,
                     shared_key_base: mapping.shared_key_base,
                     shared_key_offset: mapping.shared_key_offset,
-                    inherited_frame: parent_inventory
-                        .get(&(mapping.ipa, mapping.size as u64))
-                        .map(|extent| extent.frame),
+                    inherited_frame: Some(parent_extent.frame),
+                    inherited_backing: Some(parent_extent.backing),
                 });
                 continue;
             }
@@ -6168,6 +6199,7 @@ impl HvfVmState {
                 shared_key_base: mapping.shared_key_base,
                 shared_key_offset: mapping.shared_key_offset,
                 inherited_frame: None,
+                inherited_backing: None,
             });
         }
         emit_stage(
@@ -6330,6 +6362,7 @@ impl HvfVmState {
                     }
                 },
                 mapping.inherited_frame,
+                mapping.inherited_backing,
             ));
             let host_addr = mapping.host.ptr();
             mapped.push(HvfMappedRegion {
@@ -6354,12 +6387,17 @@ impl HvfVmState {
                     "HVPatch child materialized without frame inventory reservation".to_owned(),
                 )
             })?;
-            for (gpa, length, permissions, inherited_frame) in inventory_mappings {
-                let backing = if inherited_frame.is_some() {
-                    // Shared mappings retain exact backing identity and FrameId.
-                    InventoryBackingIdentity::Private(0)
-                } else {
-                    Self::private_backing_identity()
+            for (gpa, length, permissions, inherited_frame, inherited_backing) in inventory_mappings
+            {
+                let backing = match (inherited_frame, inherited_backing) {
+                    (Some(_), Some(backing)) => backing,
+                    (None, None) => Self::private_backing_identity(),
+                    _ => {
+                        eprintln!(
+                            "carrick: FATAL: HVPatch child frame/backing inheritance mismatch"
+                        );
+                        std::process::abort();
+                    }
                 };
                 if let Err(error) = Self::stage_mapping(
                     &mut inventory,
