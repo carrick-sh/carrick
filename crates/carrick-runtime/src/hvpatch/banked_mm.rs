@@ -359,27 +359,27 @@ impl BankedMmBackend {
 impl MmBackend for BankedMmBackend {
     fn snapshot(&self, deadline: Instant) -> Result<MmBackendSnapshot, SnapshotError> {
         let before = self.revision.load(Ordering::Acquire);
-        let Some(binding) = self.binding.try_read_until(deadline) else {
-            return Err(if Instant::now() >= deadline {
-                SnapshotError::TimedOut
-            } else {
-                SnapshotError::Busy
-            });
-        };
-        let binding = *binding;
-        let Some(inventory) = self.inventory.try_read_until(deadline) else {
-            return Err(if Instant::now() >= deadline {
-                SnapshotError::TimedOut
-            } else {
-                SnapshotError::Busy
-            });
+        let binding = {
+            let Some(guard) = self.binding.try_read_until(deadline) else {
+                return Err(if Instant::now() >= deadline {
+                    SnapshotError::TimedOut
+                } else {
+                    SnapshotError::Busy
+                });
+            };
+            *guard
         };
         let (kernel, mm) = {
-            let inventory = inventory
-                .as_ref()
-                .ok_or(SnapshotError::AuthorityUnavailable(
-                    crate::kernel::SnapshotTable::Mappings,
-                ))?;
+            let Some(guard) = self.inventory.try_read_until(deadline) else {
+                return Err(if Instant::now() >= deadline {
+                    SnapshotError::TimedOut
+                } else {
+                    SnapshotError::Busy
+                });
+            };
+            let inventory = guard.as_ref().ok_or(SnapshotError::AuthorityUnavailable(
+                crate::kernel::SnapshotTable::Mappings,
+            ))?;
             let kernel = inventory
                 .kernel
                 .upgrade()
@@ -388,7 +388,6 @@ impl MmBackend for BankedMmBackend {
                 ))?;
             (kernel, inventory.mm)
         };
-        drop(inventory);
         let frame_snapshot = kernel
             .frame_inventory()
             .snapshot_for_mm_until(mm, deadline)
@@ -415,6 +414,7 @@ impl MmBackend for BankedMmBackend {
                 .into_iter()
                 .map(|mapping| mapping.mapping)
                 .collect(),
+            frame_inventory_revision: Some(frame_snapshot.revision),
         })
     }
 

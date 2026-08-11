@@ -82,6 +82,11 @@ pub struct MmBackendSnapshot {
     pub binding: MmBinding,
     pub vmas: Vec<VmaSummary>,
     pub mapping_ids: Vec<MappingId>,
+    /// Revision of the global frame inventory from which `mapping_ids` were
+    /// copied. Backends without frame inventory return `None`; HVPatch must
+    /// return `Some` so the collector can classify concurrent churn as a retry
+    /// rather than permanent corruption.
+    pub frame_inventory_revision: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]

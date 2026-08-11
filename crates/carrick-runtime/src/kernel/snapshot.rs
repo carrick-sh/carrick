@@ -18,8 +18,8 @@ use super::ids::{
     SessionId, SighandId,
 };
 use super::objects::{
-    FileDescription, FileTable, Sighand, SignalDisposition, TaskKey, TaskLifecycle, TaskRef,
-    ThreadKey, ThreadRef, ThreadSignalState, Zombie,
+    FileDescription, FileTable, FsContext, Sighand, SignalDisposition, TaskKey, TaskLifecycle,
+    TaskRef, ThreadKey, ThreadRef, ThreadSignalState, Zombie,
 };
 
 pub const KERNEL_SNAPSHOT_V1_SCHEMA: u16 = 1;
@@ -208,6 +208,7 @@ struct LeafChecks {
     file_tables: Vec<(Arc<FileTable>, u64)>,
     descriptions: Vec<(Arc<FileDescription>, u64)>,
     backends: Vec<(Arc<dyn MmBackend>, u64)>,
+    frame_inventory_revisions: Vec<u64>,
 }
 
 impl Kernel {
@@ -291,12 +292,13 @@ impl Kernel {
             file_tables: Vec::new(),
             descriptions: Vec::new(),
             backends: Vec::new(),
+            frame_inventory_revisions: Vec::new(),
         };
         let mut thread_rows = Vec::new();
         let mut thread_signals = Vec::new();
         let mut credentials = Vec::new();
         let mut file_table_by_id = BTreeMap::new();
-        let mut fs_contexts = BTreeSet::new();
+        let mut fs_context_by_id = BTreeMap::<FsContextId, Arc<FsContext>>::new();
 
         for (key, (thread, class)) in threads_by_key {
             let resources = thread.resources();
@@ -308,7 +310,12 @@ impl Kernel {
                 Arc::clone(&files),
                 "duplicate file-table identity",
             )?;
-            fs_contexts.insert(fs.id());
+            insert_shared(
+                &mut fs_context_by_id,
+                fs.id(),
+                Arc::clone(&fs),
+                "duplicate fs-context identity",
+            )?;
             let (revision, signal) = lock_result(thread.snapshot_signal_until(deadline), deadline)?;
             checks.threads.push((Arc::clone(&thread), revision));
             thread_signals.push(thread_signal_row(key, revision, signal));
@@ -404,6 +411,9 @@ impl Kernel {
             if observed.revision != backend.revision() {
                 return Err(AttemptError::Race);
             }
+            if let Some(revision) = observed.frame_inventory_revision {
+                checks.frame_inventory_revisions.push(revision);
+            }
             let mut mapping_ids = observed.mapping_ids;
             mapping_ids.sort_unstable();
             if has_duplicates(&mapping_ids) {
@@ -433,6 +443,13 @@ impl Kernel {
         let frame_inventory =
             lock_result(self.frame_inventory().snapshot_until(deadline), deadline)?;
         let frame_revision = frame_inventory.revision;
+        if checks
+            .frame_inventory_revisions
+            .iter()
+            .any(|revision| *revision != frame_revision)
+        {
+            return Err(AttemptError::Race);
+        }
         self.verify_registry(&registry, deadline)?;
         let mut snapshot = KernelSnapshotV1 {
             schema_version: KERNEL_SNAPSHOT_V1_SCHEMA,
@@ -440,7 +457,8 @@ impl Kernel {
             tasks,
             zombies: registry
                 .zombies
-                .into_iter()
+                .iter()
+                .cloned()
                 .map(|zombie| ZombieSnapshotRow { zombie })
                 .collect(),
             threads: thread_rows,
@@ -451,13 +469,13 @@ impl Kernel {
             file_tables,
             file_slots,
             file_descriptions,
-            fs_contexts: fs_contexts
-                .into_iter()
+            fs_contexts: fs_context_by_id
+                .into_keys()
                 .map(|id| FsContextSnapshotRow { id })
                 .collect(),
             credentials,
-            process_groups: registry.groups,
-            sessions: registry.sessions,
+            process_groups: registry.groups.clone(),
+            sessions: registry.sessions.clone(),
             sighands,
             task_signals: registry
                 .tasks
@@ -501,6 +519,11 @@ impl Kernel {
         {
             return Err(AttemptError::Race);
         }
+        // Registry publication may race after the first verification while
+        // leaf revisions are checked. Recheck it last so no successful
+        // snapshot combines an old task association with new signal/resource
+        // state.
+        self.verify_registry(&registry, deadline)?;
         Ok(snapshot)
     }
 
@@ -635,8 +658,8 @@ fn insert_shared<K: Ord, V>(
     Ok(())
 }
 
-fn has_duplicates<T: Eq>(values: &[T]) -> bool {
-    values.windows(2).any(|window| window[0] == window[1])
+fn has_duplicates<T: Copy + Ord>(values: &[T]) -> bool {
+    values.iter().copied().collect::<BTreeSet<_>>().len() != values.len()
 }
 
 fn thread_signal_row(
@@ -679,16 +702,36 @@ fn sort_snapshot(snapshot: &mut KernelSnapshotV1) {
 }
 
 fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
-    let live_tasks: BTreeSet<_> = snapshot.tasks.iter().map(|row| row.key).collect();
+    let task_by_key: BTreeMap<_, _> = snapshot.tasks.iter().map(|row| (row.key, row)).collect();
+    let live_tasks: BTreeSet<_> = task_by_key.keys().copied().collect();
     let zombies: BTreeSet<_> = snapshot.zombies.iter().map(|row| row.zombie.key).collect();
-    if live_tasks.len() != snapshot.tasks.len() || zombies.len() != snapshot.zombies.len() {
-        return invariant("duplicate task or zombie key");
+    if live_tasks.len() != snapshot.tasks.len()
+        || zombies.len() != snapshot.zombies.len()
+        || !live_tasks.is_disjoint(&zombies)
+    {
+        return invariant("duplicate or overlapping task/zombie key");
     }
     let mm_ids: BTreeSet<_> = snapshot.mms.iter().map(|row| row.id).collect();
     let sighand_ids: BTreeSet<_> = snapshot.sighands.iter().map(|row| row.id).collect();
-    let group_ids: BTreeSet<_> = snapshot.process_groups.iter().map(|row| row.id).collect();
-    let session_ids: BTreeSet<_> = snapshot.sessions.iter().map(|row| row.id).collect();
+    let group_by_id: BTreeMap<_, _> = snapshot
+        .process_groups
+        .iter()
+        .map(|row| (row.id, row))
+        .collect();
+    let session_by_id: BTreeMap<_, _> = snapshot.sessions.iter().map(|row| (row.id, row)).collect();
+    let group_ids: BTreeSet<_> = group_by_id.keys().copied().collect();
+    let session_ids: BTreeSet<_> = session_by_id.keys().copied().collect();
+    if mm_ids.len() != snapshot.mms.len()
+        || sighand_ids.len() != snapshot.sighands.len()
+        || group_ids.len() != snapshot.process_groups.len()
+        || session_ids.len() != snapshot.sessions.len()
+    {
+        return invariant("duplicate mm/sighand/group/session identity");
+    }
     for task in &snapshot.tasks {
+        if has_duplicates(&task.children) {
+            return invariant("task contains duplicate child keys");
+        }
         if !mm_ids.contains(&task.mm)
             || !sighand_ids.contains(&task.sighand)
             || !group_ids.contains(&task.process_group)
@@ -696,15 +739,35 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
         {
             return invariant("task leaf or identity join is missing");
         }
-        if task
-            .parent
-            .is_some_and(|parent| !live_tasks.contains(&parent))
-            || task
-                .children
-                .iter()
-                .any(|child| !live_tasks.contains(child) && !zombies.contains(child))
+        if task.parent.is_some_and(|parent| {
+            task_by_key
+                .get(&parent)
+                .is_none_or(|parent_row| !parent_row.children.contains(&task.key))
+        }) || task.children.iter().any(|child| {
+            task_by_key.get(child).map_or_else(
+                || {
+                    snapshot
+                        .zombies
+                        .iter()
+                        .find(|row| row.zombie.key == *child)
+                        .is_none_or(|row| row.zombie.parent != Some(task.key))
+                },
+                |child_row| child_row.parent != Some(task.key),
+            )
+        }) {
+            return invariant("task parent/child backlink is missing");
+        }
+        let Some(group) = group_by_id.get(&task.process_group) else {
+            return invariant("task process-group join is missing");
+        };
+        let Some(session_row) = session_by_id.get(&task.session) else {
+            return invariant("task session join is missing");
+        };
+        if group.session != task.session
+            || !group.members.contains(&task.key)
+            || !session_row.process_groups.contains(&task.process_group)
         {
-            return invariant("task parent/child join is missing");
+            return invariant("task group/session backlink is missing");
         }
     }
     for zombie in &snapshot.zombies {
@@ -717,20 +780,30 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
         }
     }
     for group in &snapshot.process_groups {
-        if !session_ids.contains(&group.session)
-            || group
-                .members
-                .iter()
-                .any(|member| !live_tasks.contains(member))
+        if has_duplicates(&group.members)
+            || !session_ids.contains(&group.session)
+            || group.members.iter().any(|member| {
+                task_by_key.get(member).is_none_or(|task| {
+                    task.process_group != group.id || task.session != group.session
+                })
+            })
         {
             return invariant("process-group join is missing");
         }
+        if session_by_id
+            .get(&group.session)
+            .is_none_or(|session| !session.process_groups.contains(&group.id))
+        {
+            return invariant("process-group session backlink is missing");
+        }
     }
     for session in &snapshot.sessions {
-        if session
-            .process_groups
-            .iter()
-            .any(|group| !group_ids.contains(group))
+        if has_duplicates(&session.process_groups)
+            || session.process_groups.iter().any(|group| {
+                group_by_id
+                    .get(group)
+                    .is_none_or(|group| group.session != session.id)
+            })
         {
             return invariant("session join is missing");
         }
@@ -742,6 +815,11 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
     }
     let file_tables: BTreeSet<_> = snapshot.file_tables.iter().map(|row| row.id).collect();
     let fs_contexts: BTreeSet<_> = snapshot.fs_contexts.iter().map(|row| row.id).collect();
+    if file_tables.len() != snapshot.file_tables.len()
+        || fs_contexts.len() != snapshot.fs_contexts.len()
+    {
+        return invariant("duplicate file-table or fs-context identity");
+    }
     for thread in &snapshot.threads {
         if !live_tasks.contains(&thread.task) && !zombies.contains(&thread.task) {
             return invariant("thread task join is missing");
@@ -761,16 +839,27 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
             return invariant("thread resource join is missing");
         }
     }
-    if snapshot
-        .credentials
+    let leaf_threads: BTreeSet<_> = snapshot
+        .threads
         .iter()
-        .any(|row| !thread_keys.contains(&row.thread))
-        || snapshot
-            .thread_signals
-            .iter()
-            .any(|row| !thread_keys.contains(&row.thread))
+        .filter_map(|row| row.registry_id.map(|_| row.key))
+        .collect();
+    let credential_threads: BTreeSet<_> =
+        snapshot.credentials.iter().map(|row| row.thread).collect();
+    let signal_threads: BTreeSet<_> = snapshot
+        .thread_signals
+        .iter()
+        .map(|row| row.thread)
+        .collect();
+    let task_signal_tasks: BTreeSet<_> = snapshot.task_signals.iter().map(|row| row.task).collect();
+    if credential_threads.len() != snapshot.credentials.len()
+        || signal_threads.len() != snapshot.thread_signals.len()
+        || task_signal_tasks.len() != snapshot.task_signals.len()
+        || credential_threads != leaf_threads
+        || signal_threads != leaf_threads
+        || task_signal_tasks != live_tasks
     {
-        return invariant("thread credential or signal join is missing");
+        return invariant("thread credential/signal or task-signal coverage is incomplete");
     }
 
     let descriptions: BTreeSet<_> = snapshot
@@ -778,21 +867,58 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
         .iter()
         .map(|row| row.id)
         .collect();
+    let slot_keys: BTreeSet<_> = snapshot
+        .file_slots
+        .iter()
+        .map(|row| (row.table, row.number))
+        .collect();
+    if descriptions.len() != snapshot.file_descriptions.len()
+        || slot_keys.len() != snapshot.file_slots.len()
+    {
+        return invariant("duplicate file-description or file-slot identity");
+    }
     for slot in &snapshot.file_slots {
         if !file_tables.contains(&slot.table) || !descriptions.contains(&slot.description) {
             return invariant("file slot join is missing");
         }
     }
     for description in &snapshot.file_descriptions {
-        if description
-            .epoll_interests
-            .iter()
-            .any(|target| !descriptions.contains(target))
+        if has_duplicates(&description.epoll_interests)
+            || description
+                .epoll_interests
+                .iter()
+                .any(|target| !descriptions.contains(target))
         {
             return invariant("epoll description join is missing");
         }
     }
 
+    let vma_keys: BTreeSet<_> = snapshot
+        .vmas
+        .iter()
+        .map(|row| (row.mm, row.start, row.end))
+        .collect();
+    if vma_keys.len() != snapshot.vmas.len()
+        || snapshot
+            .vmas
+            .iter()
+            .any(|row| !mm_ids.contains(&row.mm) || row.start >= row.end)
+    {
+        return invariant("duplicate, malformed, or unjoined VMA row");
+    }
+
+    if snapshot
+        .frames
+        .iter()
+        .any(|row| has_duplicates(&row.mappings))
+    {
+        return invariant("frame contains duplicate mapping aliases");
+    }
+    let frame_lengths: BTreeMap<_, _> = snapshot
+        .frames
+        .iter()
+        .map(|row| (row.frame, row.length))
+        .collect();
     let frames: BTreeMap<FrameId, BTreeSet<MappingId>> = snapshot
         .frames
         .iter()
@@ -810,8 +936,11 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
             || frames
                 .get(&mapping.frame)
                 .is_none_or(|aliases| !aliases.contains(&mapping.mapping))
+            || frame_lengths
+                .get(&mapping.frame)
+                .is_none_or(|length| *length != mapping.length)
         {
-            return invariant("mapping frame/mm join is missing");
+            return invariant("mapping frame/mm/length join is missing");
         }
     }
     for (frame, aliases) in &frames {
@@ -865,6 +994,7 @@ mod tests {
         Unavailable,
         MalformedVma,
         BrokenMappingJoin,
+        FrameRevisionRace,
         RevisionRace,
     }
 
@@ -917,6 +1047,7 @@ mod tests {
                         end: GuestVa(0x1000),
                     }],
                     mapping_ids: Vec::new(),
+                    frame_inventory_revision: None,
                 }),
                 BackendMode::BrokenMappingJoin => Ok(MmBackendSnapshot {
                     revision: self.revision(),
@@ -925,6 +1056,14 @@ mod tests {
                     mapping_ids: vec![MappingId::from_kernel_allocation(
                         NonZeroU64::new(99).expect("mapping"),
                     )],
+                    frame_inventory_revision: None,
+                }),
+                BackendMode::FrameRevisionRace => Ok(MmBackendSnapshot {
+                    revision: self.revision(),
+                    binding: self.binding,
+                    vmas: Vec::new(),
+                    mapping_ids: Vec::new(),
+                    frame_inventory_revision: Some(u64::MAX),
                 }),
                 BackendMode::RevisionRace => {
                     let observed = self.revision.fetch_add(1, Ordering::Release);
@@ -933,6 +1072,7 @@ mod tests {
                         binding: self.binding,
                         vmas: Vec::new(),
                         mapping_ids: Vec::new(),
+                        frame_inventory_revision: None,
                     })
                 }
                 BackendMode::Good => Ok(MmBackendSnapshot {
@@ -943,6 +1083,7 @@ mod tests {
                         end: GuestVa(0x2000),
                     }],
                     mapping_ids: Vec::new(),
+                    frame_inventory_revision: None,
                 }),
             }
         }
@@ -1006,8 +1147,10 @@ mod tests {
     fn epoch_and_revision_races_exhaust_three_retries() {
         let (kernel, _) = bootstrap(TestBackend::epoch_racer());
         assert_eq!(kernel.snapshot(deadline()), Err(KernelSnapshotError::Busy));
-        let (kernel, _) = bootstrap(TestBackend::new(BackendMode::RevisionRace));
-        assert_eq!(kernel.snapshot(deadline()), Err(KernelSnapshotError::Busy));
+        for mode in [BackendMode::RevisionRace, BackendMode::FrameRevisionRace] {
+            let (kernel, _) = bootstrap(TestBackend::new(mode));
+            assert_eq!(kernel.snapshot(deadline()), Err(KernelSnapshotError::Busy));
+        }
     }
 
     #[test]
@@ -1019,6 +1162,59 @@ mod tests {
                 Err(KernelSnapshotError::InvariantViolation(_))
             ));
         }
+    }
+
+    #[test]
+    fn duplicate_and_broken_bidirectional_joins_fail_closed() {
+        let (kernel, root) = bootstrap(TestBackend::new(BackendMode::Good));
+        let _child = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::VM | LinuxCloneFlags::SIGHAND)
+                    .expect("shared-mm child plan"),
+                ThreadId::synthetic_for_tests(7002),
+                "child".to_owned(),
+                None,
+            )
+            .expect("shared-mm child");
+        let snapshot = kernel.snapshot(deadline()).expect("snapshot");
+        let assert_corrupt = |snapshot: &KernelSnapshotV1| {
+            assert!(matches!(
+                validate_snapshot(snapshot),
+                Err(AttemptError::Public(
+                    KernelSnapshotError::InvariantViolation(_)
+                ))
+            ));
+        };
+
+        let mut duplicate_credentials = snapshot.clone();
+        duplicate_credentials
+            .credentials
+            .push(duplicate_credentials.credentials[0]);
+        assert_corrupt(&duplicate_credentials);
+
+        let mut duplicate_child = snapshot.clone();
+        let parent = duplicate_child
+            .tasks
+            .iter_mut()
+            .find(|task| !task.children.is_empty())
+            .expect("parent row");
+        parent.children.push(parent.children[0]);
+        assert_corrupt(&duplicate_child);
+
+        let mut missing_group_backlink = snapshot.clone();
+        missing_group_backlink.process_groups[0].members.clear();
+        assert_corrupt(&missing_group_backlink);
+
+        let mut unjoined_vma = snapshot.clone();
+        unjoined_vma.vmas[0].mm = MmId::from_registry_allocation(
+            NonZeroU64::new(u64::MAX).expect("unjoined mm identity"),
+        );
+        assert_corrupt(&unjoined_vma);
+
+        let mut missing_signal = snapshot;
+        missing_signal.thread_signals.clear();
+        assert_corrupt(&missing_signal);
     }
 
     #[test]

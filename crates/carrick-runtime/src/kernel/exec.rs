@@ -450,6 +450,7 @@ mod tests {
                 binding: self.0,
                 vmas: Vec::new(),
                 mapping_ids: Vec::new(),
+                frame_inventory_revision: None,
             })
         }
 
