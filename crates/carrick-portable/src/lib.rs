@@ -1204,18 +1204,30 @@ pub unsafe fn freebsd_minherit(addr: *mut libc::c_void, len: usize, inherit: i32
     unsafe { libc::syscall(NETBSD_SYS_MINHERIT, addr, len, inherit) as i32 }
 }
 
-/// Peer credentials `(pid, uid, gid)` of a connected `AF_UNIX` `host_fd`,
-/// best-effort (`0` where unavailable). Linux exposes them in one call via
-/// `SO_PEERCRED` -> `struct ucred`; Darwin has no single equivalent, so we read
-/// `LOCAL_PEERCRED` (uid + primary gid via `xucred`) and `LOCAL_PEERPID` (pid).
-/// Used to synthesize the `SO_PEERCRED`/`SCM_CREDENTIALS` the guest expects.
-pub fn peer_ucred(host_fd: i32) -> (u32, u32, u32) {
+/// Authenticated host credentials of a connected `AF_UNIX` peer.
+///
+/// FreeBSD and NetBSD expose only the peer effective uid/gid, so `pid` is
+/// explicitly absent there instead of being forged as zero. A successful
+/// lookup may legitimately describe uid 0; callers distinguish success from
+/// failure through [`peer_credentials`]'s `Result`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeerCredentials {
+    pub pid: Option<u32>,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// Read peer credentials without the legacy best-effort zero fallback.
+///
+/// This is the authentication primitive for host control sockets. Any failed
+/// or truncated host query is an error and must fail closed.
+pub fn peer_credentials(host_fd: i32) -> std::io::Result<PeerCredentials> {
     #[cfg(target_os = "linux")]
     {
         let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
         // SAFETY: cred/len are valid out-params for getsockopt on a socket fd.
-        let rc = unsafe {
+        if unsafe {
             libc::getsockopt(
                 host_fd,
                 libc::SOL_SOCKET,
@@ -1223,19 +1235,28 @@ pub fn peer_ucred(host_fd: i32) -> (u32, u32, u32) {
                 (&mut cred as *mut libc::ucred).cast(),
                 &mut len,
             )
-        };
-        if rc == 0 {
-            (cred.pid as u32, cred.uid, cred.gid)
-        } else {
-            (0, 0, 0)
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
         }
+        if len as usize != std::mem::size_of::<libc::ucred>() || cred.pid <= 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "host returned an invalid SO_PEERCRED record",
+            ));
+        }
+        Ok(PeerCredentials {
+            pid: Some(cred.pid as u32),
+            uid: cred.uid,
+            gid: cred.gid,
+        })
     }
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         let mut xucred: libc::xucred = unsafe { std::mem::zeroed() };
         let mut xlen = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
         // SAFETY: xucred/xlen are valid out-params for getsockopt on a socket fd.
-        let (uid, gid) = if unsafe {
+        if unsafe {
             libc::getsockopt(
                 host_fd,
                 libc::SOL_LOCAL,
@@ -1243,19 +1264,23 @@ pub fn peer_ucred(host_fd: i32) -> (u32, u32, u32) {
                 (&mut xucred as *mut libc::xucred).cast(),
                 &mut xlen,
             )
-        } == 0
+        } != 0
         {
-            (
-                xucred.cr_uid,
-                xucred.cr_groups.first().copied().unwrap_or(0),
-            )
-        } else {
-            (0, 0)
-        };
+            return Err(std::io::Error::last_os_error());
+        }
+        if xlen as usize != std::mem::size_of::<libc::xucred>()
+            || xucred.cr_version != libc::XUCRED_VERSION
+            || xucred.cr_ngroups <= 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "host returned an invalid LOCAL_PEERCRED record",
+            ));
+        }
         let mut peer_pid: libc::pid_t = 0;
         let mut plen = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
         // SAFETY: peer_pid/plen are valid out-params for getsockopt.
-        let pid = if unsafe {
+        if unsafe {
             libc::getsockopt(
                 host_fd,
                 libc::SOL_LOCAL,
@@ -1263,26 +1288,35 @@ pub fn peer_ucred(host_fd: i32) -> (u32, u32, u32) {
                 (&mut peer_pid as *mut libc::pid_t).cast(),
                 &mut plen,
             )
-        } == 0
+        } != 0
         {
-            peer_pid as u32
-        } else {
-            0
-        };
-        (pid, uid, gid)
+            return Err(std::io::Error::last_os_error());
+        }
+        if plen as usize != std::mem::size_of::<libc::pid_t>() || peer_pid <= 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "host returned an invalid LOCAL_PEERPID record",
+            ));
+        }
+        Ok(PeerCredentials {
+            pid: Some(peer_pid as u32),
+            uid: xucred.cr_uid,
+            gid: xucred.cr_groups[0],
+        })
     }
     #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
     {
         let mut uid: libc::uid_t = 0;
         let mut gid: libc::gid_t = 0;
         // SAFETY: uid/gid are valid out-params for getpeereid on a socket fd.
-        // FreeBSD/NetBSD have no peer-pid API; report pid as 0.
-        let rc = unsafe { libc::getpeereid(host_fd, &mut uid, &mut gid) };
-        if rc == 0 {
-            (0, uid as u32, gid as u32)
-        } else {
-            (0, 0, 0)
+        if unsafe { libc::getpeereid(host_fd, &mut uid, &mut gid) } != 0 {
+            return Err(std::io::Error::last_os_error());
         }
+        Ok(PeerCredentials {
+            pid: None,
+            uid: uid as u32,
+            gid: gid as u32,
+        })
     }
     #[cfg(not(any(
         target_os = "linux",
@@ -1293,8 +1327,25 @@ pub fn peer_ucred(host_fd: i32) -> (u32, u32, u32) {
     )))]
     {
         let _ = host_fd;
-        (0, 0, 0)
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "AF_UNIX peer credentials are unavailable on this host",
+        ))
     }
+}
+
+/// Peer credentials `(pid, uid, gid)` for guest `SO_PEERCRED` synthesis.
+///
+/// This preserves the guest ABI's historical best-effort zeros. Host control
+/// planes must call [`peer_credentials`] directly and reject errors.
+pub fn peer_ucred(host_fd: i32) -> (u32, u32, u32) {
+    peer_credentials(host_fd).map_or((0, 0, 0), |credentials| {
+        (
+            credentials.pid.unwrap_or(0),
+            credentials.uid,
+            credentials.gid,
+        )
+    })
 }
 
 /// Re-export a constant that has a real (possibly differently-named) equivalent
@@ -1960,5 +2011,28 @@ mod pure_transform_tests {
             resolve_sendfile_result(-1, 100, libc::EPIPE),
             -(libc::EPIPE as i64)
         );
+    }
+
+    #[test]
+    fn unix_peer_credentials_are_exact_and_fallible() {
+        use std::os::fd::AsRawFd;
+
+        let (left, _right) = std::os::unix::net::UnixStream::pair().expect("unix stream pair");
+        let credentials = peer_credentials(left.as_raw_fd()).expect("peer credentials");
+        assert_eq!(credentials.uid, unsafe { libc::geteuid() });
+        assert_eq!(credentials.gid, unsafe { libc::getegid() });
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+        assert_eq!(credentials.pid, Some(std::process::id()));
+        #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+        assert_eq!(credentials.pid, None);
+    }
+
+    #[test]
+    fn unix_peer_credentials_reject_non_socket_and_closed_descriptors() {
+        use std::os::fd::AsRawFd;
+
+        let file = tempfile::tempfile().expect("temporary file");
+        assert!(peer_credentials(file.as_raw_fd()).is_err());
+        assert!(peer_credentials(-1).is_err());
     }
 }
