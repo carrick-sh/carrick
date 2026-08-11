@@ -294,11 +294,32 @@ impl From<AsidError> for BankedMmError {
 #[derive(Debug)]
 pub(crate) struct BankedMmBackend {
     state: Arc<BankedMmState>,
+    inventory: RwLock<Option<InventoryBinding>>,
+}
+
+#[derive(Debug)]
+struct InventoryBinding {
+    kernel: std::sync::Weak<crate::kernel::Kernel>,
+    mm: crate::kernel::MmId,
 }
 
 impl BankedMmBackend {
     pub(crate) fn new(state: Arc<BankedMmState>) -> Self {
-        Self { state }
+        Self {
+            state,
+            inventory: RwLock::new(None),
+        }
+    }
+
+    pub(crate) fn bind_inventory(
+        &self,
+        kernel: &Arc<crate::kernel::Kernel>,
+        mm: crate::kernel::MmId,
+    ) {
+        *self.inventory.write() = Some(InventoryBinding {
+            kernel: Arc::downgrade(kernel),
+            mm,
+        });
     }
 
     fn observed_binding(&self) -> MmBinding {
@@ -318,9 +339,21 @@ impl MmBackend for BankedMmBackend {
     }
 
     fn mapping_ids(&self) -> Result<Vec<MappingId>, SnapshotError> {
-        // Runtime frame-inventory application lands with the K1 snapshot slice;
-        // never fabricate IDs from bank addresses.
-        Err(SnapshotError::AuthorityUnavailable(SnapshotTable::Mappings))
+        let inventory = self.inventory.read();
+        let binding = inventory
+            .as_ref()
+            .ok_or(SnapshotError::AuthorityUnavailable(SnapshotTable::Mappings))?;
+        let kernel = binding
+            .kernel
+            .upgrade()
+            .ok_or(SnapshotError::AuthorityUnavailable(SnapshotTable::Mappings))?;
+        Ok(kernel
+            .frame_inventory()
+            .snapshot_for_mm(binding.mm)
+            .mappings
+            .into_iter()
+            .map(|mapping| mapping.mapping)
+            .collect())
     }
 }
 
