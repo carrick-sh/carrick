@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Weak};
 
-use carrick_hal::ThreadId;
+use carrick_hal::{FrameEventCapacity, FrameInventoryReservation, ThreadId};
 use parking_lot::{Condvar, Mutex, RwLock};
 
 use super::address::MmBackend;
+use super::frame_inventory::{self, FrameInventoryAuthority, FrameInventoryReserveError};
 use super::ids::{LinuxTid, ObjectIdError, ObjectIdRegistry, ProcessGroupId, SessionId, TaskId};
 use super::objects::{
     Credentials, FileTable, FsContext, Mm, ObjectGraphError, ProcessGroup, Session, Sighand, Task,
@@ -196,6 +197,7 @@ pub struct Kernel {
     registry: Registry,
     ids: IdRegistry,
     object_ids: ObjectIdRegistry,
+    frame_inventory: FrameInventoryAuthority,
     pub(super) exit_subscribers: TaskExitSubscribers,
     reservation_gate: ReservationGate,
 }
@@ -451,6 +453,7 @@ impl Kernel {
             registry,
             ids,
             object_ids,
+            frame_inventory: FrameInventoryAuthority::new(),
             exit_subscribers: TaskExitSubscribers::default(),
             reservation_gate: ReservationGate::default(),
         });
@@ -472,6 +475,28 @@ impl Kernel {
 
     pub const fn object_ids(&self) -> &ObjectIdRegistry {
         &self.object_ids
+    }
+
+    /// Sole runtime authority for applied frame/mapping inventory. `BankedMm`
+    /// remains only an mm-binding seam during K1 and does not write this state.
+    pub const fn frame_inventory(&self) -> &FrameInventoryAuthority {
+        &self.frame_inventory
+    }
+
+    /// Allocate every candidate ID and all batch storage before entering a
+    /// backend topology lock. Unclaimed candidates intentionally burn.
+    pub fn reserve_frame_inventory(
+        &self,
+        frame_candidates: usize,
+        mapping_candidates: usize,
+        event_capacity: FrameEventCapacity,
+    ) -> Result<FrameInventoryReservation, FrameInventoryReserveError> {
+        frame_inventory::reserve(
+            &self.object_ids,
+            frame_candidates,
+            mapping_candidates,
+            event_capacity,
+        )
     }
 
     pub(crate) fn reservation_epoch(&self) -> u64 {

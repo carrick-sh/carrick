@@ -7,6 +7,7 @@ pub mod address;
 pub mod clone_plan;
 pub mod core;
 pub mod exec;
+pub mod frame_inventory;
 pub mod ids;
 pub mod objects;
 pub mod operations;
@@ -25,6 +26,10 @@ pub use core::{
     RootBootstrap, TaskExitSubscriber, TaskRevision, VforkParentWait, VforkReleaseReason,
 };
 pub use exec::{ExecError, PreparedExec};
+pub use frame_inventory::{
+    FrameInventoryAuthority, FrameInventoryError, FrameInventoryReserveError,
+    FrameInventorySnapshot, FrameRow, MappingRow,
+};
 pub use ids::{
     FileDescriptionId, FileSlotNumber, FileTableId, FsContextId, InvalidFileSlot,
     InvalidLinuxSignal, LinuxSignal, LinuxTid, MmId, ObjectIdError, ObjectIdRegistry,
