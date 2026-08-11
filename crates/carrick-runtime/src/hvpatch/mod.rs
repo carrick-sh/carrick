@@ -35,7 +35,23 @@ use bank_resources::BankResources;
 pub(crate) struct ProcessContext {
     resources: std::sync::Arc<BankResources>,
     binding: crate::kernel::KernelTaskBinding,
-    mm_backend: std::sync::Arc<banked_mm::BankedMmBackend>,
+    mm_backend: std::sync::Arc<parking_lot::RwLock<std::sync::Arc<banked_mm::BankedMmBackend>>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedProcessExec {
+    kernel: crate::kernel::PreparedExec,
+    backend: std::sync::Arc<banked_mm::BankedMmBackend>,
+}
+
+impl PreparedProcessExec {
+    pub(crate) const fn old_mm_id(&self) -> crate::kernel::MmId {
+        self.kernel.old_mm_id()
+    }
+
+    pub(crate) fn replacement_mm_id(&self) -> crate::kernel::MmId {
+        self.kernel.replacement_mm_id()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,7 +92,7 @@ impl ProcessContext {
         Self {
             resources,
             binding,
-            mm_backend,
+            mm_backend: std::sync::Arc::new(parking_lot::RwLock::new(mm_backend)),
         }
     }
 
@@ -129,7 +145,9 @@ impl ProcessContext {
     }
 
     pub(crate) fn mm_binding(&self) -> Option<crate::kernel::MmBinding> {
-        Some(crate::kernel::MmBackend::binding(self.mm_backend.as_ref()))
+        Some(crate::kernel::MmBackend::binding(
+            self.mm_backend.read().as_ref(),
+        ))
     }
 
     pub(crate) fn syscall_trace_identity(&self) -> Option<(i32, u32)> {
@@ -250,30 +268,38 @@ impl ProcessContext {
     pub(crate) fn prepare_exec(
         &self,
         tid: crate::kernel::LinuxTid,
-    ) -> Result<crate::kernel::PreparedExec, String> {
+    ) -> Result<PreparedProcessExec, String> {
         let context = self
             .context_for_linux_tid(tid)
             .map_err(|error| error.to_string())?;
-        let backend: std::sync::Arc<dyn crate::kernel::MmBackend> = self.mm_backend.clone();
-        self.kernel_graph()
-            .prepare_exec_with_mm_backend(&context, backend, None)
-            .map_err(|error| error.to_string())
+        let backend = self.mm_backend.read().exec_observer();
+        let kernel_backend: std::sync::Arc<dyn crate::kernel::MmBackend> = backend.clone();
+        let kernel = self
+            .kernel_graph()
+            .prepare_exec_with_mm_backend(&context, kernel_backend, None)
+            .map_err(|error| error.to_string())?;
+        Ok(PreparedProcessExec { kernel, backend })
     }
 
     pub(crate) fn commit_exec(
         &self,
-        prepared: crate::kernel::PreparedExec,
+        prepared: PreparedProcessExec,
         stage1_root: u64,
     ) -> Result<crate::kernel::KernelContext, String> {
-        self.resources
+        let binding = self
+            .resources
             .publish_exec(self.task_key(), stage1_root)
             .map_err(|error| error.to_string())?;
+        let replacement_mm = prepared.kernel.replacement_mm_id();
+        prepared.backend.publish_binding(binding);
+        prepared
+            .backend
+            .bind_inventory(self.kernel_graph(), replacement_mm);
         let context = self
             .kernel_graph()
-            .commit_exec(prepared, None)
+            .commit_exec(prepared.kernel, None)
             .map_err(|error| error.to_string())?;
-        self.mm_backend
-            .bind_inventory(context.kernel(), context.shared().mm().id());
+        *self.mm_backend.write() = prepared.backend;
         Ok(context)
     }
 
@@ -951,7 +977,8 @@ mod tests {
     #[test]
     fn root_kernel_mm_keeps_the_exact_banked_backend() {
         let (process, root) = authoritative_root();
-        let expected: std::sync::Arc<dyn crate::kernel::MmBackend> = process.mm_backend.clone();
+        let expected: std::sync::Arc<dyn crate::kernel::MmBackend> =
+            process.mm_backend.read().clone();
         let mm = root.shared().mm();
         let actual = mm.backend().expect("root mm backend");
 
@@ -1011,6 +1038,42 @@ mod tests {
         let mm = root.shared().mm();
         let backend = mm.backend().expect("banked mm backend");
         assert_eq!(backend.mapping_ids().unwrap(), vec![mapping]);
+    }
+
+    #[test]
+    fn exec_keeps_old_and_replacement_mm_observers_permanently_distinct() {
+        let (process, root) = authoritative_root();
+        let old_mm = root.shared().mm().id();
+        let old_backend = process.mm_backend.read().clone();
+        let old_binding = crate::kernel::MmBackend::binding(old_backend.as_ref());
+        let prepared = process
+            .prepare_exec(root.thread().key().tid)
+            .expect("prepare exec observer");
+        let replacement_mm = prepared.replacement_mm_id();
+        assert_ne!(old_mm, replacement_mm);
+        let stage1_root = old_binding.stage1_root.gpa().raw() + 0x4000;
+
+        process
+            .commit_exec(prepared, stage1_root)
+            .expect("commit exec observer");
+        let replacement_backend = process.mm_backend.read().clone();
+        assert!(!std::sync::Arc::ptr_eq(&old_backend, &replacement_backend));
+        assert_eq!(old_backend.inventory_mm_for_tests(), Some(old_mm));
+        assert_eq!(
+            crate::kernel::MmBackend::binding(old_backend.as_ref()),
+            old_binding
+        );
+        assert_eq!(
+            replacement_backend.inventory_mm_for_tests(),
+            Some(replacement_mm)
+        );
+        assert_eq!(
+            crate::kernel::MmBackend::binding(replacement_backend.as_ref())
+                .stage1_root
+                .gpa()
+                .raw(),
+            stage1_root
+        );
     }
 
     #[test]

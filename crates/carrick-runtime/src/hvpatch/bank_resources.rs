@@ -174,7 +174,7 @@ impl BankResources {
         &self,
         task: TaskKey,
         new_stage1_root: u64,
-    ) -> Result<(), BankResourcesError> {
+    ) -> Result<crate::kernel::MmBinding, BankResourcesError> {
         let lease = self
             .state
             .lock()
@@ -182,8 +182,9 @@ impl BankResources {
             .get(&task)
             .cloned()
             .ok_or(BankResourcesError::UnknownTask(task))?;
-        lease.publish_stage1_root(new_stage1_root)?;
-        Ok(())
+        lease
+            .publish_stage1_root(new_stage1_root)
+            .map_err(Into::into)
     }
 
     /// Detach one exact task generation from its prototype mm. Shared-mm clones
@@ -296,13 +297,14 @@ mod tests {
     }
 
     #[test]
-    fn exec_rebinds_existing_backend_without_replacing_asid() {
+    fn exec_publishes_a_new_binding_without_mutating_the_old_observer() {
         let root = task(70, 1);
         let (resources, backend) = resources(root, 2);
-        let asid = backend.binding().asid;
-        resources.publish_exec(root, 0xc000).unwrap();
-        assert_eq!(backend.binding().asid, asid);
-        assert_eq!(backend.binding().stage1_root.gpa().raw(), 0xc000);
+        let old = backend.binding();
+        let replacement = resources.publish_exec(root, 0xc000).unwrap();
+        assert_eq!(replacement.asid, old.asid);
+        assert_eq!(replacement.stage1_root.gpa().raw(), 0xc000);
+        assert_eq!(backend.binding(), old);
     }
 
     #[test]

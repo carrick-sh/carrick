@@ -323,7 +323,7 @@ fn apply_event(
             permissions,
             ..
         } => {
-            if !reservation.mappings.contains(&mapping) {
+            if reservation.mappings.binary_search(&mapping).is_err() {
                 return Err(FrameInventoryError::UnreservedMapping(mapping));
             }
             if gpa.0.checked_add(length.raw()).is_none() {
@@ -348,7 +348,7 @@ fn apply_event(
                 });
             }
             if state.frame(frame).is_none() {
-                if !reservation.frames.contains(&frame) {
+                if reservation.frames.binary_search(&frame).is_err() {
                     return Err(FrameInventoryError::UnreservedFrame(frame));
                 }
                 state.insert_frame(

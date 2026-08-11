@@ -32,6 +32,27 @@ fn apply_exec_inventory<E>(
     apply(replacement_mm, replacement)
 }
 
+enum RuntimePreparedExec {
+    Hvpatch(crate::hvpatch::PreparedProcessExec),
+    Other(crate::kernel::PreparedExec),
+}
+
+impl RuntimePreparedExec {
+    fn old_mm_id(&self) -> crate::kernel::MmId {
+        match self {
+            Self::Hvpatch(prepared) => prepared.old_mm_id(),
+            Self::Other(prepared) => prepared.old_mm_id(),
+        }
+    }
+
+    fn replacement_mm_id(&self) -> crate::kernel::MmId {
+        match self {
+            Self::Hvpatch(prepared) => prepared.replacement_mm_id(),
+            Self::Other(prepared) => prepared.replacement_mm_id(),
+        }
+    }
+}
+
 fn should_update_host_process_title(is_hvpatch: bool) -> bool {
     // HvPatch multiplexes many Linux processes inside one host process. A
     // per-guest exec cannot truthfully rename that shared process, and the
@@ -210,10 +231,13 @@ where
                 // mutation. From here, the prepared exec transaction is the
                 // sole owner of nonleader promotion and replacement Mm state.
                 let prepared_kernel_exec = match kernel.hvpatch_process.as_ref() {
-                    Some(process) => process.prepare_exec(self.linux_tid),
+                    Some(process) => process
+                        .prepare_exec(self.linux_tid)
+                        .map(RuntimePreparedExec::Hvpatch),
                     None => kernel
                         .dispatcher
-                        .prepare_one_task_kernel_exec(self.linux_tid),
+                        .prepare_one_task_kernel_exec(self.linux_tid)
+                        .map(RuntimePreparedExec::Other),
                 }
                 .map_err(|error| {
                     RuntimeError::Configuration(format!(
@@ -342,25 +366,30 @@ where
                         std::process::abort();
                     }
                 }
-                let committed_context = match kernel.hvpatch_process.as_ref() {
-                    Some(process) => {
-                        const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
-                        let stage1_root = match engine.get_sys_reg(carrick_hal::SysReg::Ttbr0) {
-                            Ok(root) => root & TTBR_ROOT_MASK,
-                            Err(error) => {
-                                tracing::error!(
-                                    %error,
-                                    "read HVPatch stage-1 root after destructive exec"
-                                );
-                                std::process::abort();
-                            }
-                        };
-                        process.commit_exec(prepared_kernel_exec, stage1_root)
-                    }
-                    None => kernel
-                        .dispatcher
-                        .commit_one_task_kernel_exec(prepared_kernel_exec),
-                };
+                let committed_context =
+                    match (kernel.hvpatch_process.as_ref(), prepared_kernel_exec) {
+                        (Some(process), RuntimePreparedExec::Hvpatch(prepared)) => {
+                            const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
+                            let stage1_root = match engine.get_sys_reg(carrick_hal::SysReg::Ttbr0) {
+                                Ok(root) => root & TTBR_ROOT_MASK,
+                                Err(error) => {
+                                    tracing::error!(
+                                        %error,
+                                        "read HVPatch stage-1 root after destructive exec"
+                                    );
+                                    std::process::abort();
+                                }
+                            };
+                            process.commit_exec(prepared, stage1_root)
+                        }
+                        (None, RuntimePreparedExec::Other(prepared)) => {
+                            kernel.dispatcher.commit_one_task_kernel_exec(prepared)
+                        }
+                        _ => {
+                            tracing::error!("exec preparation/backend authority mismatch");
+                            std::process::abort();
+                        }
+                    };
                 let committed_context = match committed_context {
                     Ok(context) => context,
                     Err(error) => {
