@@ -118,12 +118,15 @@ where
             .map(|a| String::from_utf8_lossy(a).into_owned())
             .collect();
         let cmdline = proc_argv.join(" ");
-        if should_update_host_process_title(kernel.hvpatch_process.is_some()) {
-            crate::dispatch::set_host_process_name(cmdline.as_bytes());
-        }
         let proc_env = env.clone();
         match load_execve_image(&kernel.dispatcher, &path, argv, env) {
             Ok(img) => {
+                // Close thread-clone admission across the full destructive
+                // exec transaction. Every pre-existing permit must either
+                // publish a handle-visible started child or roll back before
+                // sibling census and VM replacement; Drop reopens only if a
+                // concurrent process exit did not promote the gate to Exit.
+                let _clone_admission = kernel.close_clone_admission_for_exec(self.this_tid)?;
                 crate::probes::execve_loaded(
                     &path,
                     img.entry(),
@@ -148,7 +151,34 @@ where
                             );
                         }
                     };
+                let sibling_drain_started = std::time::Instant::now();
+                if self.registry.live_count() > 1 {
+                    self.terminate_siblings_for_exec(kernel, engine)?;
+                }
+                emit_runtime_stage(
+                    carrick_observability::probes::HvpatchExecRuntimeStagePhase::SiblingDrain,
+                    sibling_drain_started,
+                );
+                // Kernel preparation follows the runtime sibling drain (whose
+                // exiting host loops retire their own old Kernel threads) but
+                // precedes every destructive image, CLOEXEC, and proc-state
+                // mutation. From here, the prepared exec transaction is the
+                // sole owner of nonleader promotion and replacement Mm state.
+                let prepared_kernel_exec = match kernel.hvpatch_process.as_ref() {
+                    Some(process) => process.prepare_exec(self.linux_tid),
+                    None => kernel
+                        .dispatcher
+                        .prepare_one_task_kernel_exec(self.linux_tid),
+                }
+                .map_err(|error| {
+                    RuntimeError::Configuration(format!(
+                        "prepare authoritative Kernel exec: {error}"
+                    ))
+                })?;
                 let proc_state_started = std::time::Instant::now();
+                if should_update_host_process_title(kernel.hvpatch_process.is_some()) {
+                    crate::dispatch::set_host_process_name(cmdline.as_bytes());
+                }
                 kernel
                     .dispatcher
                     .set_executable_identity(path.clone(), proc_argv, proc_env);
@@ -163,14 +193,6 @@ where
                 emit_runtime_stage(
                     carrick_observability::probes::HvpatchExecRuntimeStagePhase::CloseCloexec,
                     close_cloexec_started,
-                );
-                let sibling_drain_started = std::time::Instant::now();
-                if self.registry.live_count() > 1 {
-                    self.terminate_siblings_for_exec(kernel, engine)?;
-                }
-                emit_runtime_stage(
-                    carrick_observability::probes::HvpatchExecRuntimeStagePhase::SiblingDrain,
-                    sibling_drain_started,
                 );
                 // All hvpatch processes mutate stage-2 in one HVF VM. Keep
                 // process-local thread-group drain separate, but serialize the
@@ -189,23 +211,36 @@ where
                 );
                 let engine_replace_started = std::time::Instant::now();
                 engine.execve_into(&img)?;
-                if let Some(process) = kernel.hvpatch_process.as_ref() {
-                    const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
-                    let stage1_root =
-                        engine
-                            .get_sys_reg(carrick_hal::SysReg::Ttbr0)
-                            .map_err(|error| {
-                                RuntimeError::Trap(TrapError::Hypervisor(error.to_string()))
-                            })?
-                            & TTBR_ROOT_MASK;
-                    process
-                        .publish_legacy_exec(self.linux_tid, stage1_root)
-                        .map_err(|error| {
-                            RuntimeError::Configuration(format!(
-                                "publish destructive hvpatch exec lifecycle: {error}"
-                            ))
-                        })?;
-                }
+                let committed_context = match kernel.hvpatch_process.as_ref() {
+                    Some(process) => {
+                        const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
+                        let stage1_root = match engine.get_sys_reg(carrick_hal::SysReg::Ttbr0) {
+                            Ok(root) => root & TTBR_ROOT_MASK,
+                            Err(error) => {
+                                tracing::error!(
+                                    %error,
+                                    "read HVPatch stage-1 root after destructive exec"
+                                );
+                                std::process::abort();
+                            }
+                        };
+                        process.commit_exec(prepared_kernel_exec, stage1_root)
+                    }
+                    None => kernel
+                        .dispatcher
+                        .commit_one_task_kernel_exec(prepared_kernel_exec),
+                };
+                let committed_context = match committed_context {
+                    Ok(context) => context,
+                    Err(error) => {
+                        // The engine now runs the replacement image. Returning a
+                        // guest-visible exec failure or resuming the old Kernel
+                        // graph would create split lifecycle authority.
+                        tracing::error!(%error, "commit Kernel exec after image replacement");
+                        std::process::abort();
+                    }
+                };
+                self.linux_tid = committed_context.thread().key().tid;
                 emit_runtime_stage(
                     carrick_observability::probes::HvpatchExecRuntimeStagePhase::EngineReplace,
                     engine_replace_started,
@@ -220,7 +255,11 @@ where
                 // execve_into rebuilt a fresh vCPU: re-stamp the identity page
                 // (zeroed) and TPIDR_EL1 (reset) for the same thread/tid.
                 stamp_identity_page(engine, &kernel.dispatcher);
-                stamp_guest_tid(engine, self.this_tid, &self.registry);
+                engine
+                    .set_guest_thread_id(self.linux_tid.raw() as u64)
+                    .map_err(|error| {
+                        RuntimeError::Trap(TrapError::Hypervisor(error.to_string()))
+                    })?;
                 emit_runtime_stage(
                     carrick_observability::probes::HvpatchExecRuntimeStagePhase::Publication,
                     publication_started,

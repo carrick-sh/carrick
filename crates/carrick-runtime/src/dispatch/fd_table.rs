@@ -855,7 +855,7 @@ impl std::fmt::Debug for PidfdWatch {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PidfdTarget {
     Host(i32),
-    Hvpatch(i32),
+    Hvpatch(crate::kernel::TaskKey),
 }
 
 /// A TRUSTED host dirfd backing an `OpenDescription::Directory` on the

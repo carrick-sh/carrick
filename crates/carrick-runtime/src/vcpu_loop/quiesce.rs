@@ -68,27 +68,6 @@ fn acquire_pt_pause(
     Ok(barrier.pause_guard(tid))
 }
 
-fn publish_hvpatch_child_exit_signal(
-    parent_kernel: &Kernel,
-    parent_futex: &crate::thread::FutexTable,
-    parent_kicker: &Arc<dyn carrick_hal::VcpuRegistry>,
-    parent_tid: ThreadId,
-    exit_signal: Option<i32>,
-) {
-    if let Some(signal) = exit_signal
-        && parent_kernel
-            .dispatcher
-            .child_exit_signal_needs_pump(parent_tid, signal as u32)
-    {
-        parent_kernel
-            .dispatcher
-            .mark_in_process_signal_pending(signal);
-        parent_futex.notify_signal_pending();
-        parent_kernel.signal_arrival.wake_all_waiters();
-        parent_kicker.kick_all();
-    }
-}
-
 pub(super) struct ForkRequest {
     pub(super) flags: u64,
     pub(super) pidfd_out: Option<u64>,
@@ -918,9 +897,25 @@ where
             while self.kicker.count() > 1 {
                 quiesce_poll_iterations = quiesce_poll_iterations.saturating_add(1);
                 if Instant::now() >= deadline {
+                    let unfinished: Vec<_> = self
+                        .threads
+                        .lock()
+                        .iter()
+                        .filter(|handle| !handle.is_finished())
+                        .map(|handle| handle.thread().name().unwrap_or("<unnamed>").to_owned())
+                        .collect();
+                    let registered: Vec<_> = self
+                        .kicker
+                        .debug_registered_vcpus()
+                        .into_iter()
+                        .map(|(tid, in_guest)| (tid.raw(), in_guest))
+                        .collect();
                     tracing::error!(
                         pid = parent_process.pid(),
+                        forking_tid = self.this_tid.raw(),
                         remaining = self.kicker.count().saturating_sub(1),
+                        ?registered,
+                        ?unfinished,
                         "hvpatch in-process fork quiesce timed out"
                     );
                     std::process::abort();
@@ -969,6 +964,7 @@ where
                 return Ok(Some(crate::linux_abi::LINUX_EINVAL.guest_retval()));
             }
         };
+        let shares_mm = clone_plan.mm() == crate::kernel::CloneObjectMode::Share;
         let parent_context = match parent_process.context_for_linux_tid(self.linux_tid) {
             Ok(context) => context,
             Err(error) => {
@@ -1047,6 +1043,38 @@ where
             fork_stage_started,
             child_pid,
         );
+        let child_key = prepared_fork.child_key();
+
+        let read_output = |address: Option<u64>| -> Option<Option<Vec<u8>>> {
+            match address {
+                None => Some(None),
+                Some(address) => engine
+                    .read_bytes(address, std::mem::size_of::<i32>())
+                    .ok()
+                    .map(Some),
+            }
+        };
+        let Some(parent_tid_original) = read_output(request.parent_tid_addr) else {
+            if quiesced {
+                process_barrier.end_quiesce();
+            }
+            process_barrier.end_fork();
+            return Ok(Some(crate::linux_abi::LINUX_EFAULT.guest_retval()));
+        };
+        let Some(pidfd_original) = read_output(request.pidfd_out) else {
+            if quiesced {
+                process_barrier.end_quiesce();
+            }
+            process_barrier.end_fork();
+            return Ok(Some(crate::linux_abi::LINUX_EFAULT.guest_retval()));
+        };
+        let Some(child_tid_original) = read_output(request.child_tid_addr) else {
+            if quiesced {
+                process_barrier.end_quiesce();
+            }
+            process_barrier.end_fork();
+            return Ok(Some(crate::linux_abi::LINUX_EFAULT.guest_retval()));
+        };
 
         fork_stage_started = Instant::now();
         let installed_pidfd = if request.pidfd_out.is_some() {
@@ -1070,31 +1098,9 @@ where
             if let Some(fd) = fd {
                 let _ = kernel
                     .dispatcher
-                    .remove_installed_hvpatch_child_pidfd(fd, child_pid);
+                    .remove_installed_hvpatch_child_pidfd(fd, child_key);
             }
         };
-        if let Some(address) = request.parent_tid_addr
-            && engine
-                .write_bytes(address, &child_pid.to_le_bytes())
-                .is_err()
-        {
-            rollback_pidfd(installed_pidfd);
-            if quiesced {
-                process_barrier.end_quiesce();
-            }
-            process_barrier.end_fork();
-            return Ok(Some(crate::linux_abi::LINUX_EFAULT.guest_retval()));
-        }
-        if let (Some(address), Some(fd)) = (request.pidfd_out, installed_pidfd)
-            && engine.write_bytes(address, &fd.to_le_bytes()).is_err()
-        {
-            rollback_pidfd(installed_pidfd);
-            if quiesced {
-                process_barrier.end_quiesce();
-            }
-            process_barrier.end_fork();
-            return Ok(Some(crate::linux_abi::LINUX_EFAULT.guest_retval()));
-        }
         emit_fork_runtime_stage(
             carrick_observability::probes::HvpatchForkRuntimeStagePhase::PidfdParent,
             fork_stage_started,
@@ -1144,10 +1150,6 @@ where
         );
 
         fork_stage_started = Instant::now();
-        let parent_kernel = Arc::clone(kernel);
-        let parent_futex = Arc::clone(&self.futex);
-        let parent_kicker = Arc::clone(&self.kicker);
-        let parent_tid = self.this_tid;
         let child_exit_signal = i32::try_from(request.exit_signal)
             .ok()
             .filter(|signal| *signal != 0);
@@ -1156,8 +1158,9 @@ where
         let child_platform_futex = (self.platform_futex_factory)(Arc::clone(&child_futex));
         let child_platform_futex_factory = Arc::clone(&self.platform_futex_factory);
         let child_kicker = engine.fresh_fork_kicker();
+        let child_runtime_futex = Arc::clone(&child_futex);
+        let child_runtime_kicker = Arc::clone(&child_kicker);
         let child_threads = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let all_threads = Arc::clone(&self.threads);
         let max_traps = self.max_traps;
         let child_tid_addr = request.child_tid_addr;
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
@@ -1189,7 +1192,8 @@ where
                 if ready_tx.send(Ok(())).is_err() {
                     return;
                 }
-                let Ok(Some((child_kernel, child_process))) = start_rx.recv() else {
+                let Ok(Some((child_kernel, _child_process))) = start_rx.recv() else {
+                    child_engine.destroy_vcpu_on_thread_exit();
                     return;
                 };
                 let handle: Box<dyn carrick_hal::VcpuKickDyn> =
@@ -1210,60 +1214,16 @@ where
                     child_kicker,
                     max_traps,
                 ) {
-                    Ok(VcpuLoopOutcome::ProcessExit(result)) => {
-                        // Preserve Linux wait/output ordering for the in-process
-                        // adapter: flush the child's captured streams before
-                        // publishing its zombie or waking pidfd/SIGCHLD waiters.
-                        let _ = unsafe {
-                            libc::write(1, result.stdout.as_ptr().cast(), result.stdout.len())
-                        };
-                        let _ = unsafe {
-                            libc::write(2, result.stderr.as_ptr().cast(), result.stderr.len())
-                        };
-                        child_kernel.dispatcher.retire_hvpatch_process_fds();
-                        match child_process.publish_exit_code(result.exit_code, child_tid) {
-                            Ok(()) => publish_hvpatch_child_exit_signal(
-                                &parent_kernel,
-                                &parent_futex,
-                                &parent_kicker,
-                                parent_tid,
-                                child_exit_signal,
-                            ),
-                            Err(error) => {
-                                tracing::error!(child_pid, %error, "publish hvpatch child exit failed");
-                            }
-                        }
-                    }
-                    Ok(VcpuLoopOutcome::TrapLimit(_)) | Ok(VcpuLoopOutcome::ThreadDone) => {
-                        child_kernel.dispatcher.retire_hvpatch_process_fds();
-                        match child_process.publish_exit_code(127, child_tid) {
-                            Ok(()) => publish_hvpatch_child_exit_signal(
-                                &parent_kernel,
-                                &parent_futex,
-                                &parent_kicker,
-                                parent_tid,
-                                child_exit_signal,
-                            ),
-                            Err(error) => {
-                                tracing::error!(child_pid, %error, "publish incomplete hvpatch child exit failed");
-                            }
-                        }
-                    }
+                    Ok(
+                        VcpuLoopOutcome::ProcessExit(_)
+                        | VcpuLoopOutcome::ThreadDone
+                        | VcpuLoopOutcome::TrapLimit(_),
+                    ) => {}
                     Err(error) => {
+                        // The vCPU loop's single terminal owner already ran the
+                        // unified output/fd/Kernel/backend finalizer. This host
+                        // wrapper only reports the runtime failure.
                         tracing::error!(child_pid, %error, "hvpatch child loop failed");
-                        child_kernel.dispatcher.retire_hvpatch_process_fds();
-                        match child_process.publish_exit_code(127, child_tid) {
-                            Ok(()) => publish_hvpatch_child_exit_signal(
-                                &parent_kernel,
-                                &parent_futex,
-                                &parent_kicker,
-                                parent_tid,
-                                child_exit_signal,
-                            ),
-                            Err(publish_error) => {
-                                tracing::error!(child_pid, %publish_error, "publish failed hvpatch child exit failed");
-                            }
-                        }
                     }
                 }
             }) {
@@ -1284,30 +1244,62 @@ where
             fork_stage_started,
             child_pid,
         );
-        fork_stage_started = Instant::now();
-        match ready_rx.recv() {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                let _ = start_tx.send(None);
-                let _ = handle.join();
-                rollback_pidfd(installed_pidfd);
-                if quiesced {
-                    process_barrier.end_quiesce();
-                }
-                process_barrier.end_fork();
-                return Err(RuntimeError::Trap(TrapError::Hypervisor(error)));
+        let restore_outputs = |engine: &mut E| {
+            if let (Some(address), Some(bytes)) =
+                (request.parent_tid_addr, parent_tid_original.as_ref())
+            {
+                let _ = engine.write_bytes(address, bytes);
             }
-            Err(error) => {
-                let _ = start_tx.send(None);
-                let _ = handle.join();
-                rollback_pidfd(installed_pidfd);
-                if quiesced {
-                    process_barrier.end_quiesce();
+            if let (Some(address), Some(bytes)) = (request.pidfd_out, pidfd_original.as_ref()) {
+                let _ = engine.write_bytes(address, bytes);
+            }
+            if shares_mm
+                && let (Some(address), Some(bytes)) =
+                    (request.child_tid_addr, child_tid_original.as_ref())
+            {
+                let _ = engine.write_bytes(address, bytes);
+            }
+        };
+        fork_stage_started = Instant::now();
+        let ready_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match ready_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(Ok(())) => break,
+                Ok(Err(error)) => {
+                    let _ = start_tx.send(None);
+                    let _ = handle.join();
+                    restore_outputs(engine);
+                    rollback_pidfd(installed_pidfd);
+                    if quiesced {
+                        process_barrier.end_quiesce();
+                    }
+                    process_barrier.end_fork();
+                    return Err(RuntimeError::Trap(TrapError::Hypervisor(error)));
                 }
-                process_barrier.end_fork();
-                return Err(RuntimeError::Trap(TrapError::Hypervisor(format!(
-                    "hvpatch child startup channel failed: {error}"
-                ))));
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = start_tx.send(None);
+                    let _ = handle.join();
+                    restore_outputs(engine);
+                    rollback_pidfd(installed_pidfd);
+                    if quiesced {
+                        process_barrier.end_quiesce();
+                    }
+                    process_barrier.end_fork();
+                    return Err(RuntimeError::Trap(TrapError::Hypervisor(
+                        "hvpatch child startup channel disconnected".to_owned(),
+                    )));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if Instant::now() >= ready_deadline {
+                        tracing::error!(
+                            parent_pid,
+                            child_pid,
+                            forking_tid,
+                            "hvpatch process materialization start gate timed out"
+                        );
+                        std::process::abort();
+                    }
+                }
             }
         }
         emit_fork_runtime_stage(
@@ -1316,12 +1308,34 @@ where
             child_pid,
         );
 
+        let parent_outputs_published = request.parent_tid_addr.is_none_or(|address| {
+            engine
+                .write_bytes(address, &child_pid.to_le_bytes())
+                .is_ok()
+        }) && match (request.pidfd_out, installed_pidfd) {
+            (Some(address), Some(fd)) => engine.write_bytes(address, &fd.to_le_bytes()).is_ok(),
+            (None, _) => true,
+            (Some(_), None) => false,
+        };
+        if !parent_outputs_published {
+            let _ = start_tx.send(None);
+            let _ = handle.join();
+            restore_outputs(engine);
+            rollback_pidfd(installed_pidfd);
+            if quiesced {
+                process_barrier.end_quiesce();
+            }
+            process_barrier.end_fork();
+            return Ok(Some(crate::linux_abi::LINUX_EFAULT.guest_retval()));
+        }
+
         fork_stage_started = Instant::now();
         let published = match prepared_fork.commit() {
             Ok(published) => published,
             Err(error) => {
                 let _ = start_tx.send(None);
                 let _ = handle.join();
+                restore_outputs(engine);
                 rollback_pidfd(installed_pidfd);
                 if quiesced {
                     process_barrier.end_quiesce();
@@ -1332,12 +1346,30 @@ where
                 )));
             }
         };
-        let child_backend = parent_process
+        let (child_context, vfork_parent_wait) = match published.into_parts() {
+            Ok(parts) => parts,
+            Err(error) => {
+                tracing::error!(
+                    child_pid,
+                    %error,
+                    "authoritative child start gate failed after publication"
+                );
+                std::process::abort();
+            }
+        };
+        let child_backend = match parent_process
             .bank_resources()
-            .publish_child(child_id, prepared_mm);
-        let (child_context, vfork_parent_wait) = published.into_parts().map_err(|error| {
-            RuntimeError::Configuration(format!("start authoritative hvpatch child: {error}"))
-        })?;
+            .publish_child(child_context.task().key(), prepared_mm)
+        {
+            Ok(backend) => backend,
+            Err(error) => {
+                // Kernel publication is already authoritative; a backend-bank
+                // collision now means internal generation accounting is corrupt
+                // and cannot be represented as a failed guest fork.
+                tracing::error!(child_pid, %error, "publish hvpatch child bank failed");
+                std::process::abort();
+            }
+        };
         let child_process = parent_process.published_child_context(&child_context, child_backend);
         child_dispatcher.bind_hvpatch_process(child_process.clone());
         let child_kernel = Arc::new(KernelState::new(
@@ -1345,22 +1377,25 @@ where
             Arc::clone(&kernel.fork),
             Arc::clone(&kernel.signal_arrival),
             Some(child_process.clone()),
+            kernel.hvpatch_runtime.clone(),
+            child_exit_signal,
         ));
+        child_kernel.register_hvpatch_runtime_endpoint(child_runtime_futex, child_runtime_kicker);
+        kernel.enroll_hvpatch_process_thread(handle);
         if start_tx
             .send(Some((Arc::clone(&child_kernel), child_process.clone())))
             .is_err()
         {
-            let _ = child_process.publish_exit_code(127, child_tid);
-            let _ = handle.join();
-            if quiesced {
-                process_barrier.end_quiesce();
-            }
-            process_barrier.end_fork();
-            return Err(RuntimeError::Configuration(
-                "hvpatch child start gate disappeared after publication".to_owned(),
-            ));
+            // Publication is already authoritative and cannot be represented to
+            // the guest as a failed fork. The receiver can disappear only after
+            // an internal host-thread failure; continuing would leave a live
+            // Kernel task with no execution owner, so fail closed.
+            tracing::error!(
+                child_pid,
+                "hvpatch child start gate disappeared after publication"
+            );
+            std::process::abort();
         }
-        all_threads.lock().push(handle);
         if quiesced {
             process_barrier.end_quiesce();
         }
@@ -1383,7 +1418,24 @@ where
         );
         drop(_topology);
         if let Some(wait) = vfork_parent_wait {
-            let _ = wait.wait();
+            loop {
+                if wait.wait_for_release(Duration::from_millis(1)).is_some() {
+                    break;
+                }
+                // A sibling exec replaces this suspended parent, and process
+                // exit retires it. Return the typed no-retval outcome so the run
+                // loop performs ordinary thread cleanup instead of completing
+                // the obsolete fork syscall or waiting forever for the child.
+                if kernel.process_exiting() || kernel.clone_admission_cancelled() {
+                    return Ok(None);
+                }
+                // A suspended vfork parent still owns a registered vCPU. Let a
+                // concurrent sibling fork drain it rather than waiting forever
+                // for the vfork child while that fork waits for this parent.
+                if process_barrier.is_quiescing() {
+                    self.release_and_park_vcpu_for_fork(engine)?;
+                }
+            }
         }
         Ok(Some(i64::from(child_pid)))
     }

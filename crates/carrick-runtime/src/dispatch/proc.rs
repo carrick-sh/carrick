@@ -1137,11 +1137,11 @@ impl SyscallDispatcher {
             }
             std::sync::Arc::new(PidfdWatch::new(mux))
         };
-        if !process.register_pidfd_watch(guest_pid, &kqueue) {
+        let Some(target) = process.register_pidfd_watch(guest_pid, &kqueue) else {
             return DispatchOutcome::errno(crate::linux_abi::LINUX_ESRCH);
-        }
+        };
         let description = OpenDescription::Pidfd {
-            target: PidfdTarget::Hvpatch(guest_pid),
+            target: PidfdTarget::Hvpatch(target),
             kqueue,
             base: OpenDescriptionBase::new(status_flags),
         };
@@ -1178,7 +1178,7 @@ impl SyscallDispatcher {
             .reserve_pidfd_subscription(&watch)
             .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
         let description = OpenDescription::Pidfd {
-            target: PidfdTarget::Hvpatch(target.task_id().raw()),
+            target: PidfdTarget::Hvpatch(target.task()),
             kqueue: watch,
             base: OpenDescriptionBase::new(0),
         };
@@ -1202,8 +1202,12 @@ impl SyscallDispatcher {
     }
 
     /// Roll back a pidfd installed before an HvPatch child was materialized.
-    pub(crate) fn remove_installed_hvpatch_child_pidfd(&self, fd: i32, child_pid: i32) -> bool {
-        if self.pidfd_target(fd) != Some(PidfdTarget::Hvpatch(child_pid)) {
+    pub(crate) fn remove_installed_hvpatch_child_pidfd(
+        &self,
+        fd: i32,
+        child: crate::kernel::TaskKey,
+    ) -> bool {
+        if self.pidfd_target(fd) != Some(PidfdTarget::Hvpatch(child)) {
             return false;
         }
         self.remove_pidfd(fd)
@@ -1248,9 +1252,9 @@ impl SyscallDispatcher {
         }
     }
 
-    fn pidfd_hvpatch_pid(&self, fd: i32) -> Option<i32> {
+    fn pidfd_hvpatch_task(&self, fd: i32) -> Option<crate::kernel::TaskKey> {
         match self.pidfd_target(fd)? {
-            PidfdTarget::Hvpatch(pid) => Some(pid),
+            PidfdTarget::Hvpatch(task) => Some(task),
             PidfdTarget::Host(_) => None,
         }
     }
@@ -2738,6 +2742,7 @@ impl SyscallDispatcher {
                 if !options.contains(LinuxWaitOptions::WEXITED) {
                     return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
                 }
+                let mut pidfd_target = None;
                 let target = match idtype {
                     LINUX_P_ALL => None,
                     LINUX_P_PID if id > 0 && id <= i32::MAX as u64 => Some(id as i32),
@@ -2750,14 +2755,28 @@ impl SyscallDispatcher {
                     LINUX_P_PGID => {
                         return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
                     }
-                    LINUX_P_PIDFD => match this.pidfd_hvpatch_pid(id as i32) {
-                        Some(pid) => Some(pid),
+                    LINUX_P_PIDFD => match this.pidfd_hvpatch_task(id as i32) {
+                        Some(task) => {
+                            pidfd_target = Some(task);
+                            None
+                        }
                         None => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
                     },
                     _ => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
                 };
                 let guest_nohang = options.contains(LinuxWaitOptions::WNOHANG);
-                match process.wait_child(target, true, options.contains(LinuxWaitOptions::WNOWAIT)) {
+                let waited = match pidfd_target {
+                    Some(task) => process.wait_child_key(
+                        task,
+                        options.contains(LinuxWaitOptions::WNOWAIT),
+                    ),
+                    None => process.wait_child(
+                        target,
+                        true,
+                        options.contains(LinuxWaitOptions::WNOWAIT),
+                    ),
+                };
+                match waited {
                     crate::hvpatch::WaitResult::Exited(exit) => {
                         if infop_addr.0 != 0 {
                             let (si_code, si_status) =

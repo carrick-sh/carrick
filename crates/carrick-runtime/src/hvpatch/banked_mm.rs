@@ -326,21 +326,29 @@ impl MmBackend for BankedMmBackend {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU64;
+
     use super::super::bank_resources::BankResources;
     use super::*;
 
-    fn root_id() -> crate::kernel::TaskId {
-        crate::kernel::TaskId::for_root_bootstrap(40).unwrap()
+    fn root_key() -> crate::kernel::TaskKey {
+        crate::kernel::TaskKey {
+            id: crate::kernel::TaskId::for_root_bootstrap(40).unwrap(),
+            serial: crate::kernel::TaskSerial::from_registry_allocation(
+                NonZeroU64::new(1).unwrap(),
+            ),
+        }
     }
 
     #[test]
     fn observes_live_binding_and_keeps_last_binding_after_retirement() {
-        let task_id = root_id();
-        let (table, backend) = BankResources::new_root(task_id, 0x8000).expect("root table");
+        let task = root_key();
+        let (table, backend) = BankResources::new_root(0x8000).expect("root table");
+        table.publish_root(task).expect("publish root");
         let initial = backend.binding();
 
-        table.publish_exec(task_id, 0xc000).expect("replace root");
-        let retired = table.retire(task_id).expect("retire");
+        table.publish_exec(task, 0xc000).expect("replace root");
+        let retired = table.retire(task).expect("retire");
         let replaced = backend.binding();
         assert_eq!(replaced.asid, initial.asid);
         assert_ne!(replaced.stage1_root, initial.stage1_root);
@@ -372,7 +380,7 @@ mod tests {
 
     #[test]
     fn fails_closed_when_snapshot_authority_is_elsewhere() {
-        let (_table, backend) = BankResources::new_root(root_id(), 0x8000).expect("root table");
+        let (_table, backend) = BankResources::new_root(0x8000).expect("root table");
 
         assert_eq!(
             backend.vma_summaries(),

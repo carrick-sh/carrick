@@ -50,6 +50,12 @@ impl KernelContext {
         self.revision
     }
 
+    pub fn exact_thread_is_live(&self) -> bool {
+        self.task
+            .thread(self.thread.key().tid)
+            .is_some_and(|thread| thread.key() == self.thread.key())
+    }
+
     /// Stable task-generation handle used by runtime lanes to capture one fresh
     /// syscall context for an explicit Linux TID at every dispatch boundary.
     pub fn task_binding(&self) -> KernelTaskBinding {
@@ -103,6 +109,10 @@ pub struct KernelTaskBinding {
 impl KernelTaskBinding {
     pub const fn task_id(&self) -> TaskId {
         self.task.id
+    }
+
+    pub const fn task_key(&self) -> TaskKey {
+        self.task
     }
 
     pub fn kernel(&self) -> &Arc<Kernel> {
@@ -187,6 +197,59 @@ pub struct Kernel {
     ids: IdRegistry,
     object_ids: ObjectIdRegistry,
     pub(super) exit_subscribers: TaskExitSubscribers,
+    reservation_gate: ReservationGate,
+}
+
+#[derive(Debug, Default)]
+struct ReservationGate {
+    epoch: Mutex<u64>,
+    changed: Condvar,
+    #[cfg(test)]
+    waiters: Mutex<usize>,
+    #[cfg(test)]
+    waiters_changed: Condvar,
+}
+
+impl ReservationGate {
+    fn snapshot(&self) -> u64 {
+        *self.epoch.lock()
+    }
+
+    fn publish_change(&self) {
+        let mut epoch = self.epoch.lock();
+        *epoch = epoch.wrapping_add(1);
+        self.changed.notify_all();
+    }
+
+    fn wait_for_change(&self, observed: u64) {
+        let mut epoch = self.epoch.lock();
+        #[cfg(test)]
+        {
+            let mut waiters = self.waiters.lock();
+            *waiters += 1;
+            self.waiters_changed.notify_all();
+        }
+        while *epoch == observed {
+            self.changed.wait(&mut epoch);
+        }
+        #[cfg(test)]
+        {
+            let mut waiters = self.waiters.lock();
+            let Some(remaining) = waiters.checked_sub(1) else {
+                std::process::abort();
+            };
+            *waiters = remaining;
+            self.waiters_changed.notify_all();
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_until_waiting(&self) {
+        let mut waiters = self.waiters.lock();
+        while *waiters == 0 {
+            self.waiters_changed.wait(&mut waiters);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -227,6 +290,16 @@ impl VforkParentWait {
             self.state.changed.wait(&mut release);
         }
     }
+
+    /// Wait for at most `timeout`, allowing an execution backend to service a
+    /// concurrent quiesce request while a vfork parent remains suspended.
+    pub fn wait_for_release(&self, timeout: std::time::Duration) -> Option<VforkReleaseReason> {
+        let mut release = self.state.release.lock();
+        if release.is_none() {
+            self.state.changed.wait_for(&mut release, timeout);
+        }
+        *release
+    }
 }
 
 #[derive(Debug)]
@@ -256,32 +329,28 @@ impl VforkChildRelease {
 
 #[derive(Default)]
 pub(super) struct TaskExitSubscribers {
-    watchers: Mutex<BTreeMap<TaskId, Vec<Weak<dyn TaskExitSubscriber>>>>,
+    watchers: Mutex<BTreeMap<TaskKey, Vec<Weak<dyn TaskExitSubscriber>>>>,
 }
 
 impl TaskExitSubscribers {
-    pub(super) fn register<T>(&self, task_id: TaskId, subscriber: &Arc<T>)
+    pub(super) fn register<T>(&self, task: TaskKey, subscriber: &Arc<T>)
     where
         T: TaskExitSubscriber + 'static,
     {
         let subscriber: Arc<dyn TaskExitSubscriber> = subscriber.clone();
-        self.register_erased(task_id, &subscriber);
+        self.register_erased(task, &subscriber);
     }
 
-    pub(super) fn register_erased(
-        &self,
-        task_id: TaskId,
-        subscriber: &Arc<dyn TaskExitSubscriber>,
-    ) {
+    pub(super) fn register_erased(&self, task: TaskKey, subscriber: &Arc<dyn TaskExitSubscriber>) {
         self.watchers
             .lock()
-            .entry(task_id)
+            .entry(task)
             .or_default()
             .push(Arc::downgrade(subscriber));
     }
 
-    pub(super) fn take(&self, task_id: TaskId) -> Vec<Weak<dyn TaskExitSubscriber>> {
-        self.watchers.lock().remove(&task_id).unwrap_or_default()
+    pub(super) fn take(&self, task: TaskKey) -> Vec<Weak<dyn TaskExitSubscriber>> {
+        self.watchers.lock().remove(&task).unwrap_or_default()
     }
 }
 
@@ -383,6 +452,7 @@ impl Kernel {
             ids,
             object_ids,
             exit_subscribers: TaskExitSubscribers::default(),
+            reservation_gate: ReservationGate::default(),
         });
         let context = KernelContext::capture(kernel.clone(), task, leader, TaskRevision::INITIAL);
         Ok((kernel, context))
@@ -402,6 +472,23 @@ impl Kernel {
 
     pub const fn object_ids(&self) -> &ObjectIdRegistry {
         &self.object_ids
+    }
+
+    pub(crate) fn reservation_epoch(&self) -> u64 {
+        self.reservation_gate.snapshot()
+    }
+
+    pub(crate) fn publish_reservation_change(&self) {
+        self.reservation_gate.publish_change();
+    }
+
+    pub(crate) fn wait_for_reservation_change(&self, observed: u64) {
+        self.reservation_gate.wait_for_change(observed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_reservation_waiter_for_tests(&self) {
+        self.reservation_gate.wait_until_waiting();
     }
 
     pub fn context(

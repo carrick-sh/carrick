@@ -2683,6 +2683,7 @@ fn run_image_in_current_process(
     let reporter = Arc::new(CompatReporter::default());
     let plan = Arc::new(plan.clone());
     let mut thread_runtime = NativeThreadRuntime::new_current();
+    thread_runtime.reset_one_task_kernel_identity(&dispatcher)?;
     thread_runtime.prepare_kick_target()?;
     thread_runtime.start_signal_wake_pump();
     // Timer-signal delivery (setitimer/timer_settime): publish + kick-all via
@@ -3331,6 +3332,7 @@ fn native_clone_child_context(
 struct NativeCloneThreadRequest {
     context: NativeUcontextSnapshot,
     resume_pc: u64,
+    flags: u64,
     parent_guest_tpidr_el0: u64,
     stack: u64,
     tls: Option<u64>,
@@ -3339,6 +3341,11 @@ struct NativeCloneThreadRequest {
     clear_child_tid_addr: u64,
     service_number: u64,
     service_name: &'static str,
+}
+
+enum NativeCloneThreadSpawn {
+    Started(crate::kernel::LinuxTid),
+    Errno(crate::linux_abi::LinuxErrno),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3866,7 +3873,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
         // The placement descends from the removed direct executor, but DSR is
         // the only native instruction engine now.
         if crate::fork_quiesce::exec_replacing_other_thread(thread_runtime.tid()) {
-            if thread_runtime.finish_thread(&dispatcher, &memory) {
+            if thread_runtime.finish_thread_for_exec(&dispatcher, &memory) {
                 finalize_native_process_exit(&mut translator, &memory);
                 return Ok(NativeThreadLoopOutcome::ProcessExit(0));
             }
@@ -4300,7 +4307,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
             DispatchOutcome::CloneThread {
                 stack,
                 tls,
-                flags: _,
+                flags,
                 parent_tid_addr,
                 child_tid_addr,
                 clear_child_tid_addr,
@@ -4338,7 +4345,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     service.branch(NativeSyscallBranchKind::Thread),
                     "thread branch",
                 )?;
-                let tid = thread_runtime.spawn_clone_thread(
+                let clone = thread_runtime.spawn_clone_thread(
                     &dispatcher,
                     &memory,
                     &reporter,
@@ -4347,6 +4354,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     NativeCloneThreadRequest {
                         context: snapshot,
                         resume_pc: resume.raw(),
+                        flags,
                         parent_guest_tpidr_el0: guest_tpidr_el0,
                         stack,
                         tls,
@@ -4357,13 +4365,17 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         service_name,
                     },
                 )?;
+                let clone_retval = match clone {
+                    NativeCloneThreadSpawn::Started(tid) => i64::from(tid.raw()),
+                    NativeCloneThreadSpawn::Errno(errno) => errno.guest_retval(),
+                };
                 snapshot = complete_dsr_syscall(
                     &dispatcher,
                     &memory,
                     snapshot,
                     thread_runtime.tid(),
                     request.number.raw(),
-                    i64::from(tid.raw()),
+                    clone_retval,
                     resume,
                     &mut translator,
                 )?;
@@ -4469,7 +4481,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         )?;
                     }
                     NativeForkFlow::RetireForExec => {
-                        if thread_runtime.finish_thread(&dispatcher, &memory) {
+                        if thread_runtime.finish_thread_for_exec(&dispatcher, &memory) {
                             finalize_native_process_exit(&mut translator, &memory);
                             require_native_syscall_service_transition(
                                 service.terminal_handoff(),
@@ -4701,7 +4713,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         )? {
                             NativeExecTeardownFlow::Proceed => {}
                             NativeExecTeardownFlow::RetireForExec => {
-                                if thread_runtime.finish_thread(&dispatcher, &memory) {
+                                if thread_runtime.finish_thread_for_exec(&dispatcher, &memory) {
                                     finalize_native_process_exit(&mut translator, &memory);
                                     require_native_syscall_service_transition(
                                         service.terminal_handoff(),
@@ -4716,6 +4728,13 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                                 return Ok(NativeThreadLoopOutcome::ExecReplacedThread);
                             }
                         }
+                        let prepared_kernel_exec = dispatcher
+                            .prepare_one_task_kernel_exec(thread_runtime.linux_tid())
+                            .map_err(|error| {
+                                RuntimeError::Configuration(format!(
+                                    "prepare native Darwin Kernel exec: {error}"
+                                ))
+                            })?;
                         publish_native_shared_candidates(&translator, &memory);
                         // In-process `execve` replaces guest memory but not
                         // carrick's own statics, so without a flush here the
@@ -4779,6 +4798,20 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         // point a validation failure returned to the old image;
                         // after retirement, failure is fatal and no partial
                         // dispatcher identity may escape.
+                        let exec_context = match dispatcher
+                            .commit_one_task_kernel_exec(prepared_kernel_exec)
+                        {
+                            Ok(context) => context,
+                            Err(error) => {
+                                tracing::error!(
+                                    %error,
+                                    "native Darwin Kernel exec commit failed after image retirement"
+                                );
+                                std::process::abort();
+                            }
+                        };
+                        thread_runtime.linux_tid = exec_context.thread().key().tid;
+                        thread_runtime.kernel_thread_live = true;
                         dispatcher.reset_memory_state_on_execve();
                         dispatcher.reset_signal_handlers_on_execve();
                         dispatcher.set_executable_identity(
@@ -5191,6 +5224,7 @@ struct NativeSignalTrap<'a> {
 
 struct NativeThreadRuntime {
     tid: crate::thread::ThreadId,
+    linux_tid: crate::kernel::LinuxTid,
     registry: Arc<crate::thread::ThreadRegistry>,
     futex: Arc<crate::thread::FutexTable>,
     platform_futex: Arc<dyn carrick_hal::PlatformFutex>,
@@ -5203,6 +5237,7 @@ struct NativeThreadRuntime {
     /// Host gateway/context stores clear the architectural monitor at every
     /// translated block boundary, so it cannot be the authority here.
     exclusive_reservation: Option<NativeExclusiveReservation>,
+    kernel_thread_live: bool,
     finished: bool,
     /// True on the COW copy a fork child replaces in `reset_after_fork_child`:
     /// its `kicker` registry mutexes may have been inherited LOCKED (another
@@ -5214,6 +5249,20 @@ struct NativeThreadRuntime {
 impl NativeThreadRuntime {
     fn new_current() -> Self {
         let tid = crate::thread::ThreadId::main_from_host_pid();
+        let task_id = match i32::try_from(std::process::id())
+            .ok()
+            .and_then(|pid| crate::kernel::TaskId::for_root_bootstrap(pid).ok())
+        {
+            Some(task_id) => task_id,
+            None => {
+                tracing::error!(
+                    host_pid = std::process::id(),
+                    "host pid cannot seed native Kernel identity"
+                );
+                std::process::abort();
+            }
+        };
+        let linux_tid = crate::kernel::LinuxTid::for_task_leader(task_id);
         let registry = Arc::new(crate::thread::ThreadRegistry::new(tid));
         crate::thread::set_current_registry(Arc::clone(&registry));
         let futex = Arc::new(crate::thread::FutexTable::new());
@@ -5226,6 +5275,7 @@ impl NativeThreadRuntime {
         install_native_process_kicker(&kicker);
         let runtime = Self {
             tid,
+            linux_tid,
             registry,
             futex,
             platform_futex,
@@ -5235,6 +5285,7 @@ impl NativeThreadRuntime {
             kick_state: None,
             threads: Arc::new(parking_lot::Mutex::new(Vec::new())),
             exclusive_reservation: None,
+            kernel_thread_live: true,
             finished: false,
             forked_stale: false,
         };
@@ -5262,9 +5313,30 @@ impl NativeThreadRuntime {
         self.tid
     }
 
-    fn sibling(&self, tid: crate::thread::ThreadId) -> Self {
+    fn linux_tid(&self) -> crate::kernel::LinuxTid {
+        self.linux_tid
+    }
+
+    fn reset_one_task_kernel_identity(
+        &mut self,
+        dispatcher: &SyscallDispatcher,
+    ) -> Result<(), RuntimeError> {
+        let context = dispatcher
+            .reset_one_task_kernel_binding_for_current_process(self.tid)
+            .map_err(|error| {
+                RuntimeError::Configuration(format!(
+                    "rebind native Darwin one-task Kernel identity: {error}"
+                ))
+            })?;
+        self.linux_tid = context.thread().key().tid;
+        self.kernel_thread_live = true;
+        Ok(())
+    }
+
+    fn sibling(&self, tid: crate::thread::ThreadId, linux_tid: crate::kernel::LinuxTid) -> Self {
         Self {
             tid,
+            linux_tid,
             registry: Arc::clone(&self.registry),
             futex: Arc::clone(&self.futex),
             platform_futex: Arc::clone(&self.platform_futex),
@@ -5274,9 +5346,17 @@ impl NativeThreadRuntime {
             kick_state: None,
             threads: Arc::clone(&self.threads),
             exclusive_reservation: None,
+            kernel_thread_live: false,
             finished: false,
             forked_stale: false,
         }
+    }
+
+    #[cfg(test)]
+    fn sibling_for_test(&self, tid: crate::thread::ThreadId) -> Self {
+        let linux_tid = crate::kernel::LinuxTid::from_abi_positive(tid.raw())
+            .expect("synthetic test thread id is a positive Linux TID");
+        self.sibling(tid, linux_tid)
     }
 
     fn prepare_kick_target(&mut self) -> Result<(), RuntimeError> {
@@ -5387,18 +5467,55 @@ impl NativeThreadRuntime {
         plan: &Arc<ExecutionPlan>,
         max_traps: usize,
         request: NativeCloneThreadRequest,
-    ) -> Result<crate::thread::ThreadId, RuntimeError> {
+    ) -> Result<NativeCloneThreadSpawn, RuntimeError> {
+        let clone_plan = match crate::kernel::ClonePlan::from_flags(
+            carrick_abi::LinuxCloneFlags::from_bits_retain(request.flags),
+        ) {
+            Ok(plan) => plan,
+            Err(_) => {
+                return Ok(NativeCloneThreadSpawn::Errno(
+                    crate::linux_abi::LINUX_EINVAL,
+                ));
+            }
+        };
+        let parent_context = dispatcher
+            .capture_kernel_context(self.linux_tid)
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        let reservation = parent_context
+            .kernel()
+            .reserve_thread_clone(&parent_context, clone_plan, None)
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        let linux_tid = reservation.tid();
+        let read_tid_output = |address: u64| -> Option<Option<Vec<u8>>> {
+            if address == 0 {
+                Some(None)
+            } else {
+                memory
+                    .read()
+                    .read_bytes(address, std::mem::size_of::<i32>())
+                    .ok()
+                    .map(Some)
+            }
+        };
+        let Some(parent_tid_original) = read_tid_output(request.parent_tid_addr) else {
+            return Ok(NativeCloneThreadSpawn::Errno(
+                crate::linux_abi::LINUX_EFAULT,
+            ));
+        };
+        let Some(child_tid_original) = read_tid_output(request.child_tid_addr) else {
+            return Ok(NativeCloneThreadSpawn::Errno(
+                crate::linux_abi::LINUX_EFAULT,
+            ));
+        };
         let tid = self.registry.register_child(request.clear_child_tid_addr);
+        let prepared_thread = match reservation.prepare(tid) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.registry.exit(tid);
+                return Err(RuntimeError::Configuration(error.to_string()));
+            }
+        };
         dispatcher.inherit_thread_signal_mask(self.tid, tid);
-        let tid_bytes = tid.raw().to_le_bytes();
-        {
-            if request.parent_tid_addr != 0 {
-                let _ = write_guest_ram_through_lock(memory, request.parent_tid_addr, &tid_bytes);
-            }
-            if request.child_tid_addr != 0 {
-                let _ = write_guest_ram_through_lock(memory, request.child_tid_addr, &tid_bytes);
-            }
-        }
 
         let (context, guest_tpidr_el0) = native_clone_child_context(
             request.context,
@@ -5411,10 +5528,11 @@ impl NativeThreadRuntime {
         let child_memory = Arc::clone(memory);
         let child_reporter = Arc::clone(reporter);
         let child_plan = Arc::clone(plan);
-        let mut child_runtime = self.sibling(tid);
+        let mut child_runtime = self.sibling(tid, linux_tid);
         let service_number = request.service_number;
         let service_name = request.service_name;
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (start_tx, start_rx) = std::sync::mpsc::sync_channel(1);
         let spawn_result = std::thread::Builder::new()
             .name(format!("native-guest-tid-{tid}"))
             .spawn(move || {
@@ -5440,6 +5558,11 @@ impl NativeThreadRuntime {
                             "native Darwin clone parent dropped readiness channel".to_string(),
                         )
                     })?;
+                    if start_rx.recv() != Ok(true) {
+                        child_runtime.finish_thread(&child_dispatcher, &child_memory);
+                        return Ok(NativeThreadLoopOutcome::ThreadDone);
+                    }
+                    child_runtime.kernel_thread_live = true;
                     require_native_syscall_service_transition(
                         inherited_service.end(NativeSyscallServiceOutcome::Resume),
                         "clone child resume end",
@@ -5503,32 +5626,100 @@ impl NativeThreadRuntime {
                 self.registry.exit(tid);
                 crate::host_signal::forget_thread(tid.raw());
                 dispatcher.forget_thread_signal_state(tid);
-                return Err(RuntimeError::Trap(TrapError::Hypervisor(format!(
-                    "spawn native Darwin guest thread failed: {err}"
-                ))));
+                tracing::debug!(%err, "spawn native Darwin guest thread failed");
+                return Ok(NativeCloneThreadSpawn::Errno(
+                    crate::linux_abi::LINUX_EAGAIN,
+                ));
             }
         };
         match ready_rx.recv() {
             Ok(Ok(())) => {}
             Ok(Err(message)) => {
+                let _ = start_tx.send(false);
                 let _ = handle.join();
                 return Err(RuntimeError::Unsupported(message));
             }
             Err(_) => {
+                let _ = start_tx.send(false);
                 let _ = handle.join();
                 return Err(RuntimeError::Unsupported(
                     "native Darwin guest thread exited before kick readiness".to_string(),
                 ));
             }
         }
+        let restore_tid_outputs = || {
+            if let Some(bytes) = parent_tid_original.as_ref() {
+                let _ = write_guest_ram_through_lock(memory, request.parent_tid_addr, bytes);
+            }
+            if let Some(bytes) = child_tid_original.as_ref() {
+                let _ = write_guest_ram_through_lock(memory, request.child_tid_addr, bytes);
+            }
+        };
+        let tid_bytes = linux_tid.raw().to_le_bytes();
+        let tid_outputs_published = (request.parent_tid_addr == 0
+            || write_guest_ram_through_lock(memory, request.parent_tid_addr, &tid_bytes).is_ok())
+            && (request.child_tid_addr == 0
+                || write_guest_ram_through_lock(memory, request.child_tid_addr, &tid_bytes)
+                    .is_ok());
+        if !tid_outputs_published {
+            restore_tid_outputs();
+            let _ = start_tx.send(false);
+            let _ = handle.join();
+            return Ok(NativeCloneThreadSpawn::Errno(
+                crate::linux_abi::LINUX_EFAULT,
+            ));
+        }
+        let published = match prepared_thread.commit() {
+            Ok(published) => published,
+            Err(error) => {
+                restore_tid_outputs();
+                let _ = start_tx.send(false);
+                let _ = handle.join();
+                return Err(RuntimeError::Configuration(error.to_string()));
+            }
+        };
+        if let Err(error) = published.into_context() {
+            tracing::error!(
+                linux_tid = linux_tid.raw(),
+                backend_tid = tid.raw(),
+                %error,
+                "native Darwin Kernel start gate failed after publication"
+            );
+            std::process::abort();
+        }
         self.threads.lock().push(handle);
-        Ok(tid)
+        if start_tx.send(true).is_err() {
+            tracing::error!(
+                linux_tid = linux_tid.raw(),
+                backend_tid = tid.raw(),
+                "native Darwin clone start gate disappeared after publication"
+            );
+            std::process::abort();
+        }
+        Ok(NativeCloneThreadSpawn::Started(linux_tid))
     }
 
     fn finish_thread(
         &mut self,
         dispatcher: &SyscallDispatcher,
         memory: &SharedNativeMemory,
+    ) -> bool {
+        self.finish_thread_with_kernel_retirement(dispatcher, memory, true)
+    }
+
+    fn finish_thread_for_exec(
+        &mut self,
+        dispatcher: &SyscallDispatcher,
+        memory: &SharedNativeMemory,
+    ) -> bool {
+        self.finish_thread_with_kernel_retirement(dispatcher, memory, false)
+    }
+
+    fn finish_thread_with_kernel_retirement(
+        &mut self,
+        dispatcher: &SyscallDispatcher,
+        memory: &SharedNativeMemory,
+        retire_kernel_thread: bool,
     ) -> bool {
         if self.finished {
             return false;
@@ -5543,6 +5734,21 @@ impl NativeThreadRuntime {
             self.futex.wake(address, 1);
         }
         let last = self.registry.exit(self.tid);
+        if self.kernel_thread_live && !last {
+            if retire_kernel_thread
+                && let Err(error) = dispatcher.exit_one_task_thread(self.linux_tid)
+            {
+                tracing::error!(
+                    linux_tid = self.linux_tid.raw(),
+                    backend_tid = self.tid.raw(),
+                    %error,
+                    "retire native Darwin one-task Kernel thread failed"
+                );
+            }
+            // During exec, the prepared Kernel transaction owns retirement of
+            // every old thread. Ordinary exit retires this exact Linux TID here.
+            self.kernel_thread_live = false;
+        }
         crate::run_state::clear_guest_tid(self.tid.raw());
         crate::host_signal::forget_thread(self.tid.raw());
         dispatcher.forget_thread_signal_state(self.tid);
@@ -6388,9 +6594,13 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
     trace_syscalls: bool,
     blocked_ns: &mut NativeBlockedSpan,
 ) -> Result<DispatchOutcome, RuntimeError> {
-    let kernel_context = dispatcher.capture_one_task_context().map_err(|error| {
-        RuntimeError::Configuration(format!("capture native one-task kernel context: {error}"))
-    })?;
+    let kernel_context = dispatcher
+        .capture_kernel_context(thread_runtime.linux_tid())
+        .map_err(|error| {
+            RuntimeError::Configuration(format!(
+                "capture native Darwin thread Kernel context: {error}"
+            ))
+        })?;
     let mut signal_wait_deadline = None;
     let mut fd_wait_deadline = None;
     loop {
@@ -7793,6 +8003,7 @@ fn handle_native_fork(
         );
         child_phase_start = Instant::now();
         thread_runtime.reset_after_fork_child();
+        thread_runtime.reset_one_task_kernel_identity(dispatcher)?;
         // Retire SIBLING per-tid signal state before re-keying the forking
         // thread's own: fork clones only the calling thread, and the child's
         // fresh registry allocates tids that can collide with a dead parent
@@ -9120,6 +9331,7 @@ mod tests {
         let request = NativeCloneThreadRequest {
             context: NativeUcontextSnapshot::default(),
             resume_pc: 0,
+            flags: 0,
             parent_guest_tpidr_el0: 0,
             stack: 0,
             tls: None,
@@ -12324,7 +12536,7 @@ mod tests {
         assert_eq!(runtime.waiter.tid(), runtime.tid());
 
         let child_tid = runtime.registry.register_child(0);
-        let child = runtime.sibling(child_tid);
+        let child = runtime.sibling_for_test(child_tid);
         assert_eq!(child.waiter.tid(), child_tid);
         runtime.registry.exit(child_tid);
     }
@@ -12497,7 +12709,7 @@ mod tests {
         let _stw = STW_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let runtime = NativeThreadRuntime::new_current();
         let sib_tid = runtime.registry.register_child(0);
-        let mut sibling = runtime.sibling(sib_tid);
+        let mut sibling = runtime.sibling_for_test(sib_tid);
         let kicker = Arc::clone(&runtime.kicker);
         let registered = Arc::new(AtomicBool::new(false));
         let reregistered_count = Arc::new(AtomicUsize::new(0));
@@ -12620,7 +12832,7 @@ mod tests {
         let _stw = STW_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let runtime = NativeThreadRuntime::new_current();
         let sib_tid = runtime.registry.register_child(0);
-        let sibling = runtime.sibling(sib_tid);
+        let sibling = runtime.sibling_for_test(sib_tid);
 
         crate::fork_quiesce::begin_exec_replacement(runtime.tid());
         let value = {

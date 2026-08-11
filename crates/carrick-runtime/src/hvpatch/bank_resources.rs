@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -8,7 +8,7 @@ use super::banked_mm::{
     BankedMmBackend, BankedMmError, BankedMmLease, BankedMmPool, BankedMmRetirement,
     PreparedBankedMm,
 };
-use crate::kernel::{Stage1RootError, TaskId};
+use crate::kernel::{Stage1RootError, TaskKey};
 
 #[derive(Debug)]
 pub(crate) struct RetiredBankedMm {
@@ -17,8 +17,12 @@ pub(crate) struct RetiredBankedMm {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum BankResourcesError {
-    #[error("guest task {0:?} has no live hvpatch address space")]
-    UnknownTask(TaskId),
+    #[error("guest task generation {0:?} has no live hvpatch address space")]
+    UnknownTask(TaskKey),
+    #[error("guest task generation {0:?} already owns or retired an address space")]
+    DuplicateTask(TaskKey),
+    #[error("the prepared root address space was already published")]
+    RootAlreadyPublished,
     #[error("guest ASID space is exhausted")]
     AsidExhausted,
     #[error(transparent)]
@@ -54,31 +58,54 @@ impl From<BankedMmError> for BankResourcesError {
 /// Linux task identity, parentage, groups, sessions, exits, waits, and pidfd
 /// readiness live exclusively in [`crate::kernel::Kernel`]. This table retains
 /// only the prototype bank/ASID leases that K2 will replace.
+#[derive(Debug, Default)]
+struct BankResourceState {
+    leases: BTreeMap<TaskKey, Arc<BankedMmLease>>,
+    /// Permanent within one runtime: exact-generation tombstones make delayed
+    /// duplicate cleanup idempotent without permitting a reused numeric PID to
+    /// target its successor's bank.
+    retired: BTreeSet<TaskKey>,
+}
+
 #[derive(Debug)]
 pub(crate) struct BankResources {
-    leases: Mutex<BTreeMap<TaskId, Arc<BankedMmLease>>>,
+    state: Mutex<BankResourceState>,
+    pending_root: Mutex<Option<Arc<BankedMmLease>>>,
     mm_pool: BankedMmPool,
 }
 
 impl BankResources {
     pub(crate) fn new_root(
-        root_id: TaskId,
         stage1_root: u64,
     ) -> Result<(Self, Arc<BankedMmBackend>), BankResourcesError> {
         let (mm_pool, root_mm) = BankedMmPool::new_root(stage1_root)?;
         let backend = root_mm.backend();
         Ok((
             Self {
-                leases: Mutex::new(BTreeMap::from([(root_id, root_mm)])),
+                state: Mutex::new(BankResourceState::default()),
+                pending_root: Mutex::new(Some(root_mm)),
                 mm_pool,
             },
             backend,
         ))
     }
 
+    pub(crate) fn publish_root(&self, root: TaskKey) -> Result<(), BankResourcesError> {
+        let mut state = self.state.lock();
+        if state.leases.contains_key(&root) || state.retired.contains(&root) {
+            return Err(BankResourcesError::DuplicateTask(root));
+        }
+        let lease = self
+            .pending_root
+            .lock()
+            .take()
+            .ok_or(BankResourcesError::RootAlreadyPublished)?;
+        state.leases.insert(root, lease);
+        Ok(())
+    }
+
     #[cfg(test)]
     fn new_for_tests(
-        root_id: TaskId,
         stage1_root: u64,
         asid_limit: u16,
     ) -> Result<(Self, Arc<BankedMmBackend>), BankResourcesError> {
@@ -86,7 +113,8 @@ impl BankResources {
         let backend = root_mm.backend();
         Ok((
             Self {
-                leases: Mutex::new(BTreeMap::from([(root_id, root_mm)])),
+                state: Mutex::new(BankResourceState::default()),
+                pending_root: Mutex::new(Some(root_mm)),
                 mm_pool,
             },
             backend,
@@ -99,69 +127,92 @@ impl BankResources {
 
     pub(crate) fn publish_child(
         &self,
-        task_id: TaskId,
+        task: TaskKey,
         prepared: PreparedBankedMm,
-    ) -> Arc<BankedMmBackend> {
+    ) -> Result<Arc<BankedMmBackend>, BankResourcesError> {
+        let mut state = self.state.lock();
+        if state.leases.contains_key(&task) || state.retired.contains(&task) {
+            return Err(BankResourcesError::DuplicateTask(task));
+        }
+        // Commit only after the exact-generation vacancy check. On rejection,
+        // dropping `prepared` returns its ASID/bank reservation to the pool.
         let lease = prepared.commit();
         let backend = lease.backend();
-        let replaced = self.leases.lock().insert(task_id, lease);
-        debug_assert!(replaced.is_none(), "kernel published a duplicate task id");
-        backend
+        state.leases.insert(task, lease);
+        Ok(backend)
     }
 
     #[cfg(test)]
     pub(crate) fn publish_shared_child(
         &self,
-        parent_id: TaskId,
-        child_id: TaskId,
+        parent: TaskKey,
+        child: TaskKey,
     ) -> Result<Arc<BankedMmBackend>, BankResourcesError> {
-        let mut leases = self.leases.lock();
-        let lease = leases
-            .get(&parent_id)
+        let mut state = self.state.lock();
+        if state.leases.contains_key(&child) || state.retired.contains(&child) {
+            return Err(BankResourcesError::DuplicateTask(child));
+        }
+        let lease = state
+            .leases
+            .get(&parent)
             .cloned()
-            .ok_or(BankResourcesError::UnknownTask(parent_id))?;
+            .ok_or(BankResourcesError::UnknownTask(parent))?;
         let backend = lease.backend();
-        let replaced = leases.insert(child_id, lease);
-        debug_assert!(replaced.is_none(), "kernel published a duplicate task id");
+        state.leases.insert(child, lease);
         Ok(backend)
     }
 
-    pub(crate) fn bank(&self, task_id: TaskId) -> Option<super::banked_mm::ProcessBank> {
-        self.leases
+    pub(crate) fn bank(&self, task: TaskKey) -> Option<super::banked_mm::ProcessBank> {
+        self.state
             .lock()
-            .get(&task_id)
+            .leases
+            .get(&task)
             .and_then(|lease| lease.bank())
     }
 
     pub(crate) fn publish_exec(
         &self,
-        task_id: TaskId,
+        task: TaskKey,
         new_stage1_root: u64,
     ) -> Result<(), BankResourcesError> {
         let lease = self
-            .leases
+            .state
             .lock()
-            .get(&task_id)
+            .leases
+            .get(&task)
             .cloned()
-            .ok_or(BankResourcesError::UnknownTask(task_id))?;
+            .ok_or(BankResourcesError::UnknownTask(task))?;
         lease.publish_stage1_root(new_stage1_root)?;
         Ok(())
     }
 
-    /// Detach a task from its prototype mm. Shared-mm clones merely release
-    /// their task-to-lease edge; the final owner performs ASID/bank retirement.
-    pub(crate) fn retire(&self, task_id: TaskId) -> Result<RetiredBankedMm, BankResourcesError> {
-        let mut leases = self.leases.lock();
-        let lease = leases
-            .remove(&task_id)
-            .ok_or(BankResourcesError::UnknownTask(task_id))?;
-        let shared = leases.values().any(|other| Arc::ptr_eq(other, &lease));
-        drop(leases);
+    /// Detach one exact task generation from its prototype mm. Shared-mm clones
+    /// merely release their edge; the final owner performs ASID/bank retirement.
+    /// A repeated cleanup for the same retired generation is idempotent.
+    pub(crate) fn retire(&self, task: TaskKey) -> Result<RetiredBankedMm, BankResourcesError> {
+        let mut state = self.state.lock();
+        if state.retired.contains(&task) {
+            return Ok(RetiredBankedMm { retirement: None });
+        }
+        let lease = state
+            .leases
+            .get(&task)
+            .cloned()
+            .ok_or(BankResourcesError::UnknownTask(task))?;
+        let shared = state
+            .leases
+            .iter()
+            .any(|(other_task, other)| *other_task != task && Arc::ptr_eq(other, &lease));
         let retirement = if shared {
             None
         } else {
+            // Do not tombstone an exact generation until the fallible pool
+            // retirement succeeds. A failed attempt must remain retryable and
+            // its bank/ASID must stay live rather than becoming reusable.
             Some(self.mm_pool.retire(&lease)?)
         };
+        state.leases.remove(&task);
+        state.retired.insert(task);
         Ok(RetiredBankedMm { retirement })
     }
 
@@ -181,16 +232,27 @@ impl BankResources {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::kernel::MmBackend as _;
+    use std::num::NonZeroU64;
 
-    fn task(raw: i32) -> TaskId {
-        TaskId::for_root_bootstrap(raw).unwrap()
+    use super::*;
+    use crate::kernel::{MmBackend as _, TaskId, TaskSerial};
+
+    fn task(raw: i32, serial: u64) -> TaskKey {
+        TaskKey {
+            id: TaskId::for_root_bootstrap(raw).unwrap(),
+            serial: TaskSerial::from_registry_allocation(NonZeroU64::new(serial).unwrap()),
+        }
+    }
+
+    fn resources(root: TaskKey, asid_limit: u16) -> (BankResources, Arc<BankedMmBackend>) {
+        let (resources, backend) = BankResources::new_for_tests(0x4000, asid_limit).unwrap();
+        resources.publish_root(root).unwrap();
+        (resources, backend)
     }
 
     #[test]
     fn unpublished_child_preparation_rolls_back_bank_and_asid() {
-        let (resources, _) = BankResources::new_for_tests(task(40), 0x4000, 2).unwrap();
+        let (resources, _) = resources(task(40, 1), 2);
         let first = resources.prepare_child().unwrap();
         let binding = first.binding();
         drop(first);
@@ -200,14 +262,14 @@ mod tests {
 
     #[test]
     fn published_backend_retires_only_after_tlb_acknowledgement() {
-        let (resources, _) = BankResources::new_for_tests(task(50), 0x4000, 2).unwrap();
-        let child_id = task(51);
+        let (resources, _) = resources(task(50, 1), 2);
+        let child = task(51, 2);
         let prepared = resources.prepare_child().unwrap();
         let binding = prepared.binding();
-        let backend = resources.publish_child(child_id, prepared);
+        let backend = resources.publish_child(child, prepared).unwrap();
         assert_eq!(backend.binding(), binding);
 
-        let retired = resources.retire(child_id).unwrap();
+        let retired = resources.retire(child).unwrap();
         assert!(matches!(
             resources.prepare_child(),
             Err(BankResourcesError::AsidExhausted)
@@ -221,9 +283,9 @@ mod tests {
 
     #[test]
     fn shared_mm_child_does_not_retire_parent_lease() {
-        let parent = task(60);
-        let child = task(61);
-        let (resources, backend) = BankResources::new_for_tests(parent, 0x4000, 2).unwrap();
+        let parent = task(60, 1);
+        let child = task(61, 2);
+        let (resources, backend) = resources(parent, 2);
         let shared = resources.publish_shared_child(parent, child).unwrap();
         assert_eq!(shared.binding(), backend.binding());
 
@@ -235,11 +297,60 @@ mod tests {
 
     #[test]
     fn exec_rebinds_existing_backend_without_replacing_asid() {
-        let root = task(70);
-        let (resources, backend) = BankResources::new_for_tests(root, 0x4000, 2).unwrap();
+        let root = task(70, 1);
+        let (resources, backend) = resources(root, 2);
         let asid = backend.binding().asid;
         resources.publish_exec(root, 0xc000).unwrap();
         assert_eq!(backend.binding().asid, asid);
         assert_eq!(backend.binding().stage1_root.gpa().raw(), 0xc000);
+    }
+
+    #[test]
+    fn delayed_old_generation_cleanup_cannot_touch_reused_pid() {
+        let root = task(80, 1);
+        let old = task(81, 2);
+        let replacement = task(81, 3);
+        let (resources, _) = resources(root, 2);
+        let old_backend = resources
+            .publish_child(old, resources.prepare_child().unwrap())
+            .unwrap();
+        let old_binding = old_backend.binding();
+        let retired = resources.retire(old).unwrap();
+        resources.acknowledge_tlb_flush(retired).unwrap();
+
+        let replacement_backend = resources
+            .publish_child(replacement, resources.prepare_child().unwrap())
+            .unwrap();
+        let replacement_binding = replacement_backend.binding();
+        assert_eq!(replacement_binding.asid, old_binding.asid);
+
+        let duplicate = resources.retire(old).unwrap();
+        resources.acknowledge_tlb_flush(duplicate).unwrap();
+        assert_eq!(replacement_backend.binding(), replacement_binding);
+        assert!(matches!(
+            resources.publish_exec(old, 0xd000),
+            Err(BankResourcesError::UnknownTask(key)) if key == old
+        ));
+        assert_eq!(replacement_backend.binding(), replacement_binding);
+    }
+
+    #[test]
+    fn duplicate_exact_generation_does_not_consume_prepared_bank() {
+        let root = task(90, 1);
+        let child = task(91, 2);
+        let (resources, _) = resources(root, 3);
+        resources
+            .publish_child(child, resources.prepare_child().unwrap())
+            .unwrap();
+        let duplicate = resources.prepare_child().unwrap();
+        let duplicate_binding = duplicate.binding();
+        assert!(matches!(
+            resources.publish_child(child, duplicate),
+            Err(BankResourcesError::DuplicateTask(key)) if key == child
+        ));
+        assert_eq!(
+            resources.prepare_child().unwrap().binding(),
+            duplicate_binding
+        );
     }
 }

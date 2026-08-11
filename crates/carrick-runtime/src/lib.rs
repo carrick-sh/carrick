@@ -554,14 +554,9 @@ pub(crate) mod container_policy;
 // macOS `runtime.rs` arm; both `runtime` arms re-export them so the original
 // `crate::runtime::…` call-site paths resolve on every platform).
 pub mod debug_state;
-#[cfg(feature = "platform-macos")]
 pub mod exec_stamps;
+#[cfg(feature = "platform-macos")]
 pub mod execute;
-#[cfg(all(
-    feature = "platform-macos",
-    target_os = "macos",
-    target_arch = "aarch64"
-))]
 pub(crate) mod hvpatch;
 pub mod pty_relay;
 pub mod rootfs;

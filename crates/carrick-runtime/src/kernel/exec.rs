@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use carrick_hal::KernelTransactionId;
+use carrick_hal::{KernelTransactionId, ThreadId};
 
 use super::address::MmBackend;
 use super::core::{Kernel, KernelContext, RetiredThreadRecord, TaskRevision, VforkReleaseReason};
@@ -104,7 +104,7 @@ impl Kernel {
         context: &KernelContext,
         failpoint: Option<KernelFailpoint>,
     ) -> Result<PreparedExec, ExecError> {
-        self.prepare_exec_with_optional_backend(context, None, failpoint)
+        self.prepare_exec_with_optional_backend(context, None, None, failpoint)
     }
 
     /// Prepare exec with a concrete replacement address-space backend.
@@ -119,13 +119,27 @@ impl Kernel {
         backend: Arc<dyn MmBackend>,
         failpoint: Option<KernelFailpoint>,
     ) -> Result<PreparedExec, ExecError> {
-        self.prepare_exec_with_optional_backend(context, Some(backend), failpoint)
+        self.prepare_exec_with_optional_backend(context, Some(backend), None, failpoint)
+    }
+
+    /// Prepare an exec whose surviving host runner is re-keyed while the Linux
+    /// caller is promoted to the thread-group leader. Native x86 uses this
+    /// because its backend `ThreadId` follows the post-exec host-thread key;
+    /// Linux identity remains the task leader allocated by the Kernel.
+    pub fn prepare_exec_with_registry_id(
+        self: &Arc<Self>,
+        context: &KernelContext,
+        registry_id: ThreadId,
+        failpoint: Option<KernelFailpoint>,
+    ) -> Result<PreparedExec, ExecError> {
+        self.prepare_exec_with_optional_backend(context, None, Some(registry_id), failpoint)
     }
 
     fn prepare_exec_with_optional_backend(
         self: &Arc<Self>,
         context: &KernelContext,
         backend: Option<Arc<dyn MmBackend>>,
+        replacement_registry_id: Option<ThreadId>,
         failpoint: Option<KernelFailpoint>,
     ) -> Result<PreparedExec, ExecError> {
         self.sweep_retired_threads();
@@ -191,7 +205,7 @@ impl Kernel {
                 tid: leader_tid,
                 serial: self.object_ids().thread_serial()?,
             },
-            context.thread.registry_id(),
+            replacement_registry_id.unwrap_or_else(|| context.thread.registry_id()),
             Arc::clone(&resources),
             &context.thread,
         );
@@ -612,7 +626,10 @@ mod tests {
         let quit = Arc::new(AtomicBool::new(false));
         let runner = spawn_active_runner(&leader.thread, Arc::clone(&progress), quit);
         wait_for_progress(&progress, 0);
-        let prepared = kernel.prepare_exec(&sibling, None).expect("prepare exec");
+        let replacement_registry_id = ThreadId::synthetic_for_tests(602);
+        let prepared = kernel
+            .prepare_exec_with_registry_id(&sibling, replacement_registry_id, None)
+            .expect("prepare exec");
         let committed = kernel.commit_exec(prepared, None).expect("commit exec");
         runner.join().expect("old leader terminated");
         assert!(matches!(
@@ -632,6 +649,7 @@ mod tests {
             committed.thread.key().tid,
             LinuxTid::for_task_leader(committed.task.key().id)
         );
+        assert_eq!(committed.thread.registry_id(), replacement_registry_id);
         assert_eq!(committed.task.live_thread_count(), 1);
         assert_ne!(committed.shared.mm().id(), old_mm_id);
         assert_ne!(committed.shared.sighand().id(), old_sighand_id);

@@ -237,7 +237,10 @@ where
         fork_coordinator,
         signal_arrival,
         hvpatch_process,
+        None,
+        None,
     ));
+    kernel.register_hvpatch_runtime_endpoint(Arc::clone(&futex), Arc::clone(&kicker));
     debug_assert!(kernel.hvpatch_process.as_ref().is_none_or(|process| {
         process.pid() == std::process::id() as i32 && process.live_process_count() == 1
     }));
@@ -274,7 +277,14 @@ where
         Arc::clone(&threads),
         Arc::clone(&kicker),
         max_traps,
-    )?;
+    );
+    // Process children are not Linux thread-group siblings of their creator.
+    // The outer root run, which owns the shared HVPatch VM lifetime, joins the
+    // global process topology after its own terminal loop even when that loop
+    // reports an error, so no shared-VM execution owner is detached.
+    let process_join = kernel.join_hvpatch_process_threads();
+    let outcome = outcome?;
+    process_join?;
 
     let result = match kernel.take_process_terminal()? {
         Some(Ok(result)) => result,
