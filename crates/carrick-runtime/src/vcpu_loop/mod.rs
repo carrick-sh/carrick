@@ -3343,7 +3343,8 @@ where
             trace_hvpatch_thread_teardown(&kernel, state.this_tid, 5);
 
             if let Some(process) = kernel.hvpatch_process.as_ref() {
-                process.record_process_exit_begin(published_exit_code, state.this_tid);
+                let process_exit_event =
+                    process.record_process_exit_begin(published_exit_code, state.this_tid);
                 let child = process.is_child();
                 if child {
                     for (fd, stream, bytes) in [
@@ -3407,6 +3408,8 @@ where
                     );
                     std::process::abort();
                 }
+                drop(_topology);
+                process.record_process_exit_commit(process_exit_event);
             } else if let Err(error) = engine.retire_in_process_address_space() {
                 tracing::error!(%error, "terminal owner could not retire HVPatch root engine");
                 std::process::abort();

@@ -21,9 +21,8 @@ const EXPECTED_EXECS: u64 = 67;
 const EXPECTED_BIRTHS: u64 = EXPECTED_ROOTS + EXPECTED_FORKS;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct BirthKey {
+struct ProcessKey {
     pid: i32,
-    tid: i32,
     asid: u32,
 }
 
@@ -31,6 +30,7 @@ struct BirthKey {
 struct Birth {
     kind: BirthKind,
     ppid: i32,
+    tid: i32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -117,22 +117,28 @@ impl Record {
             .with_context(|| format!("HVPatch K1 {:?} {field} exceeds i32", self.tag))
     }
 
-    fn birth_key(&self) -> Result<BirthKey> {
-        let key = BirthKey {
+    fn process_identity(&self) -> Result<(ProcessKey, i32)> {
+        let key = ProcessKey {
             pid: self.i32("pid")?,
-            tid: self.i32("tid")?,
             asid: self.u32("asid")?,
         };
-        if key.pid <= 0 || key.tid <= 0 || key.asid == 0 {
+        let tid = self.i32("tid")?;
+        if key.pid <= 0 || tid <= 0 || key.asid == 0 {
             bail!("HVPatch K1 guest pid/tid/ASID must be positive");
         }
-        Ok(key)
+        Ok((key, tid))
     }
 }
 
 fn parse_u64(value: &str) -> Result<u64> {
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        bail!("expected unsigned decimal integer, got {value:?}");
+    let canonical = value == "0"
+        || value
+            .as_bytes()
+            .first()
+            .is_some_and(|first| first.is_ascii_digit() && *first != b'0')
+            && value.bytes().all(|byte| byte.is_ascii_digit());
+    if !canonical {
+        bail!("expected canonical unsigned decimal integer, got {value:?}");
     }
     value
         .parse()
@@ -140,9 +146,22 @@ fn parse_u64(value: &str) -> Result<u64> {
 }
 
 fn parse_i64(value: &str) -> Result<i64> {
-    let digits = value.strip_prefix('-').unwrap_or(value);
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        bail!("expected signed decimal integer, got {value:?}");
+    let canonical = if let Some(digits) = value.strip_prefix('-') {
+        digits
+            .as_bytes()
+            .first()
+            .is_some_and(|first| first.is_ascii_digit() && *first != b'0')
+            && digits.bytes().all(|byte| byte.is_ascii_digit())
+    } else {
+        value == "0"
+            || value
+                .as_bytes()
+                .first()
+                .is_some_and(|first| first.is_ascii_digit() && *first != b'0')
+                && value.bytes().all(|byte| byte.is_ascii_digit())
+    };
+    if !canonical {
+        bail!("expected canonical signed decimal integer, got {value:?}");
     }
     value
         .parse()
@@ -175,6 +194,8 @@ struct EndRecord {
     live: i64,
     bounded: u64,
     errors: u64,
+    target_exit_seen: u64,
+    target_exit_code: i64,
     target_exit_reason: u64,
 }
 
@@ -207,16 +228,19 @@ impl HvpatchK1LifecycleSummary {
 
         let mut header_seen = false;
         let mut end = None;
-        let mut births = BTreeMap::<BirthKey, Birth>::new();
+        let mut births = BTreeMap::<ProcessKey, Birth>::new();
         let mut birth_pids = BTreeSet::new();
-        let mut execs = BTreeMap::<BirthKey, u64>::new();
-        let mut terminals = BTreeMap::<BirthKey, (i64, u64)>::new();
+        let mut execs = BTreeMap::<ProcessKey, (i32, u64)>::new();
+        let mut terminals = BTreeMap::<ProcessKey, (i32, i64, u64)>::new();
         let mut vm = BTreeMap::<(u32, i32), u64>::new();
 
         for (index, raw_line) in lines.into_iter().enumerate() {
-            let line = raw_line.as_ref().trim();
+            let line = raw_line.as_ref();
             if line.is_empty() {
                 continue;
+            }
+            if line.trim() != line {
+                bail!("HVPatch K1 record has noncanonical surrounding whitespace");
             }
             if end.is_some() {
                 bail!("HVPatch K1 record appears after end at line {}", index + 1);
@@ -247,7 +271,7 @@ impl HvpatchK1LifecycleSummary {
                     if record.u64("count")? != 1 {
                         bail!("every HVPatch K1 birth identity must occur exactly once");
                     }
-                    let key = record.birth_key()?;
+                    let (key, tid) = record.process_identity()?;
                     let ppid = record.i32("ppid")?;
                     if ppid < 0 {
                         bail!("HVPatch K1 parent pid must be nonnegative");
@@ -255,7 +279,7 @@ impl HvpatchK1LifecycleSummary {
                     if !birth_pids.insert(key.pid) {
                         bail!("duplicate HVPatch K1 guest pid {}", key.pid);
                     }
-                    if births.insert(key, Birth { kind, ppid }).is_some() {
+                    if births.insert(key, Birth { kind, ppid, tid }).is_some() {
                         bail!("duplicate HVPatch K1 birth identity");
                     }
                 }
@@ -265,16 +289,16 @@ impl HvpatchK1LifecycleSummary {
                     if count == 0 {
                         bail!("HVPatch K1 exec count must be positive");
                     }
-                    let key = record.birth_key()?;
-                    if execs.insert(key, count).is_some() {
+                    let (key, tid) = record.process_identity()?;
+                    if execs.insert(key, (tid, count)).is_some() {
                         bail!("duplicate HVPatch K1 exec aggregate");
                     }
                 }
                 "terminal" => {
                     record.exact_fields(&["asid", "count", "pid", "status", "tid"])?;
-                    let key = record.birth_key()?;
-                    let terminal = (record.i64("status")?, record.u64("count")?);
-                    if terminal.1 != 1 {
+                    let (key, tid) = record.process_identity()?;
+                    let terminal = (tid, record.i64("status")?, record.u64("count")?);
+                    if terminal.2 != 1 {
                         bail!("every HVPatch K1 terminal identity must occur exactly once");
                     }
                     if terminals.insert(key, terminal).is_some() {
@@ -306,7 +330,9 @@ impl HvpatchK1LifecycleSummary {
                         "forks",
                         "live",
                         "roots",
+                        "target_exit_code",
                         "target_exit_reason",
+                        "target_exit_seen",
                         "version",
                     ])?;
                     if record.u64("version")? != VERSION {
@@ -321,6 +347,8 @@ impl HvpatchK1LifecycleSummary {
                         live: record.i64("live")?,
                         bounded: record.u64("bounded")?,
                         errors: record.u64("errors")?,
+                        target_exit_seen: record.u64("target_exit_seen")?,
+                        target_exit_code: record.i64("target_exit_code")?,
                         target_exit_reason: record.u64("target_exit_reason")?,
                     });
                 }
@@ -359,9 +387,9 @@ fn checked_sum<'a>(values: impl IntoIterator<Item = &'a u64>, what: &str) -> Res
 }
 
 fn validate_capture(
-    births: &BTreeMap<BirthKey, Birth>,
-    execs: &BTreeMap<BirthKey, u64>,
-    terminals: &BTreeMap<BirthKey, (i64, u64)>,
+    births: &BTreeMap<ProcessKey, Birth>,
+    execs: &BTreeMap<ProcessKey, (i32, u64)>,
+    terminals: &BTreeMap<ProcessKey, (i32, i64, u64)>,
     vm: &BTreeMap<(u32, i32), u64>,
     end: EndRecord,
 ) -> Result<HvpatchK1LifecycleSummary> {
@@ -371,9 +399,11 @@ fn validate_capture(
     if end.errors != 0 {
         bail!("HVPatch K1 capture reported {} DTrace error(s)", end.errors);
     }
-    if end.target_exit_reason != 1 {
+    if end.target_exit_seen != 1 || end.target_exit_code != 0 || end.target_exit_reason != 1 {
         bail!(
-            "HVPatch K1 trace target did not exit normally (reason={})",
+            "HVPatch K1 trace target did not exit zero (seen={}, code={}, reason={})",
+            end.target_exit_seen,
+            end.target_exit_code,
             end.target_exit_reason
         );
     }
@@ -390,8 +420,8 @@ fn validate_capture(
         .filter(|birth| birth.kind == BirthKind::Fork)
         .count() as u64;
     let unique_births = u64::try_from(births.len()).context("birth cardinality exceeds u64")?;
-    let exec_count = checked_sum(execs.values(), "exec")?;
-    let terminal_count = checked_sum(terminals.values().map(|(_, count)| count), "terminal")?;
+    let exec_count = checked_sum(execs.values().map(|(_, count)| count), "exec")?;
+    let terminal_count = checked_sum(terminals.values().map(|(_, _, count)| count), "terminal")?;
 
     if roots != EXPECTED_ROOTS || end.roots != EXPECTED_ROOTS {
         bail!(
@@ -431,15 +461,45 @@ fn validate_capture(
     if root.1.ppid != 0 {
         bail!("HVPatch K1 root parent pid must be zero");
     }
+    let births_by_pid = births
+        .iter()
+        .map(|(key, birth)| (key.pid, birth))
+        .collect::<BTreeMap<_, _>>();
     for (key, birth) in births {
+        if birth.tid != key.pid {
+            bail!(
+                "HVPatch K1 process birth {} used nonleader tid {}",
+                key.pid,
+                birth.tid
+            );
+        }
         if birth.kind == BirthKind::Fork
-            && (birth.ppid == key.pid || !births.keys().any(|parent| parent.pid == birth.ppid))
+            && (birth.ppid == key.pid || !births_by_pid.contains_key(&birth.ppid))
         {
             bail!(
                 "HVPatch K1 fork {} has an unknown or self parent {}",
                 key.pid,
                 birth.ppid
             );
+        }
+        let mut lineage = BTreeSet::new();
+        let mut ancestor = key.pid;
+        while ancestor != root.0.pid {
+            if !lineage.insert(ancestor) {
+                bail!("HVPatch K1 parent graph contains a cycle at pid {ancestor}");
+            }
+            let parent = births_by_pid
+                .get(&ancestor)
+                .ok_or_else(|| anyhow!("HVPatch K1 parent graph lost pid {ancestor}"))?
+                .ppid;
+            if parent == 0 {
+                bail!(
+                    "HVPatch K1 pid {} reaches parent zero before root {}",
+                    key.pid,
+                    root.0.pid
+                );
+            }
+            ancestor = parent;
         }
         if !terminals.contains_key(key) {
             bail!("HVPatch K1 birth {} has no terminal exit", key.pid);
@@ -453,7 +513,7 @@ fn validate_capture(
             );
         }
     }
-    if terminals.get(root.0).map(|(status, _)| *status) != Some(0) {
+    if terminals.get(root.0).map(|(_, status, _)| *status) != Some(0) {
         bail!("HVPatch K1 root terminal status must be zero");
     }
 
@@ -515,8 +575,9 @@ mod tests {
                     index + 2
                 ));
             }
+            let terminal_tid = if index == 0 { 900 } else { pid };
             lines.push(format!(
-                "HVPATCHK1|terminal|pid={pid}|tid={pid}|asid={}|status=0|count=1",
+                "HVPATCHK1|terminal|pid={pid}|tid={terminal_tid}|asid={}|status=0|count=1",
                 index + 2
             ));
         }
@@ -526,7 +587,7 @@ mod tests {
                 "HVPATCHK1|vm|operation={operation}|admission={admission}|count=1"
             ));
         }
-        lines.push("HVPATCHK1|end|version=1|roots=1|forks=68|execs=67|exits=69|births=69|live=0|bounded=0|errors=0|target_exit_reason=1".to_owned());
+        lines.push("HVPATCHK1|end|version=1|roots=1|forks=68|execs=67|exits=69|births=69|live=0|bounded=0|errors=0|target_exit_seen=1|target_exit_code=0|target_exit_reason=1".to_owned());
         lines.join("\n")
     }
 
@@ -546,6 +607,8 @@ mod tests {
             "carrick*:::hvpatch-guest-lifecycle",
             "carrick*:::hvpatch-guest-exit",
             "carrick*:::vm-lifecycle",
+            "syscall::exit:entry",
+            "target_exit_code",
             "dtrace:::ERROR",
             "profile:::tick-1sec",
             "HVPATCHK1|end|version=1",
@@ -579,6 +642,8 @@ mod tests {
         for corrupt in [
             valid_stream().replace("version=1\n", "version=1|extra=1\n"),
             valid_stream().replacen("version=1", "version=2", 1),
+            valid_stream().replacen("version=1", "version=01", 1),
+            format!(" {}", valid_stream()),
         ] {
             assert!(
                 HvpatchK1LifecycleSummary::from_lines(
@@ -594,13 +659,16 @@ mod tests {
     fn rejects_birth_terminal_and_count_corruption() {
         for corrupt in [
             valid_stream().replace(
-                "HVPATCHK1|terminal|pid=101|tid=101|asid=2|status=0|count=1\n",
+                "HVPATCHK1|terminal|pid=101|tid=900|asid=2|status=0|count=1\n",
                 "",
             ),
             valid_stream().replace("forks=68", "forks=67"),
             valid_stream().replace("births=69", "births=68"),
             valid_stream().replace("live=0", "live=1"),
             valid_stream().replace("status=0|count=1", "status=0|count=2"),
+            valid_stream()
+                .replace("pid=101|ppid=100", "pid=101|ppid=102")
+                .replace("pid=102|ppid=100", "pid=102|ppid=101"),
         ] {
             assert!(
                 HvpatchK1LifecycleSummary::from_lines(
@@ -621,6 +689,8 @@ mod tests {
             ),
             valid_stream().replace("bounded=0", "bounded=1"),
             valid_stream().replace("errors=0", "errors=1"),
+            valid_stream().replace("target_exit_seen=1", "target_exit_seen=0"),
+            valid_stream().replace("target_exit_code=0", "target_exit_code=7"),
         ] {
             assert!(
                 HvpatchK1LifecycleSummary::from_lines(

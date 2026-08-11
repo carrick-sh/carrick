@@ -32,6 +32,8 @@ dtrace:::BEGIN
     live = 0;
     bounded = 0;
     errors = 0;
+    target_exit_seen = 0;
+    target_exit_code = -1;
     target_exit_reason = 0;
     printf("HVPATCHK1|header|version=1\n");
 }
@@ -85,6 +87,18 @@ dtrace:::ERROR
     errors++;
 }
 
+/*
+ * proc:::exit arg0 is CLD_* reason, not the exit status. Qualify the exact
+ * traced Carrick CLI status at the host syscall boundary so CLD_EXITED cannot
+ * false-green a nonzero return.
+ */
+syscall::exit:entry
+/pid == $target/
+{
+    target_exit_seen = 1;
+    target_exit_code = (int)arg0;
+}
+
 proc:::exit
 /pid == $target/
 {
@@ -105,7 +119,7 @@ dtrace:::END
     printa("HVPATCHK1|exec|pid=%d|tid=%d|asid=%u|count=%@d\n", @exec);
     printa("HVPATCHK1|terminal|pid=%d|tid=%d|asid=%u|status=%d|count=%@d\n", @terminal);
     printa("HVPATCHK1|vm|operation=%u|admission=%d|count=%@d\n", @vm);
-    printf("HVPATCHK1|end|version=1|roots=%d|forks=%d|execs=%d|exits=%d|births=%d|live=%d|bounded=%d|errors=%d|target_exit_reason=%d\n",
+    printf("HVPATCHK1|end|version=1|roots=%d|forks=%d|execs=%d|exits=%d|births=%d|live=%d|bounded=%d|errors=%d|target_exit_seen=%d|target_exit_code=%d|target_exit_reason=%d\n",
         roots, forks, execs, exits, births, live, bounded, errors,
-        target_exit_reason);
+        target_exit_seen, target_exit_code, target_exit_reason);
 }
