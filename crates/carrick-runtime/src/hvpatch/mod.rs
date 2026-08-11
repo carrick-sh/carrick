@@ -157,38 +157,53 @@ impl ProcessContext {
             .is_ok_and(|identity| identity.parent.is_some())
     }
 
-    pub(crate) fn trace_lifecycle(
+    fn prepare_lifecycle_event(
         &self,
         phase: carrick_observability::probes::HvpatchGuestLifecyclePhase,
         tid: crate::thread::ThreadId,
         detail: i64,
-    ) {
+    ) -> Option<(
+        carrick_observability::probes::HvpatchGuestLifecycle,
+        crate::kernel::MmBinding,
+    )> {
         let Ok(identity) = self.kernel_graph().task_identity(self.task_id()) else {
             tracing::warn!(
                 pid = self.pid(),
                 ?phase,
                 "hvpatch lifecycle record disappeared"
             );
-            return;
+            return None;
         };
         let Some(binding) = self.mm_binding() else {
             tracing::error!(pid = self.pid(), "hvpatch task has no mm backend");
-            return;
+            return None;
         };
-        let event = carrick_observability::probes::HvpatchGuestLifecycle::new(
+        match carrick_observability::probes::HvpatchGuestLifecycle::new(
             phase,
             identity.task_id.raw(),
             identity.parent.map_or(0, crate::kernel::TaskId::raw),
             tid.raw(),
             u32::from(binding.asid.raw()),
             detail,
-        );
-        match event {
-            Ok(event) => crate::probes::hvpatch_guest_lifecycle(event),
+        ) {
+            Ok(event) => Some((event, binding)),
             Err(error) => {
-                tracing::error!(pid = self.pid(), %error, "invalid hvpatch lifecycle event")
+                tracing::error!(pid = self.pid(), %error, "invalid hvpatch lifecycle event");
+                None
             }
         }
+    }
+
+    pub(crate) fn trace_lifecycle(
+        &self,
+        phase: carrick_observability::probes::HvpatchGuestLifecyclePhase,
+        tid: crate::thread::ThreadId,
+        detail: i64,
+    ) {
+        let Some((event, binding)) = self.prepare_lifecycle_event(phase, tid, detail) else {
+            return;
+        };
+        crate::probes::hvpatch_guest_lifecycle(event);
         if let Some(bank) = self.resources.bank(self.task_key()) {
             let address_space = carrick_observability::probes::HvpatchGuestAddressSpace::new(
                 self.pid(),
@@ -257,13 +272,32 @@ impl ProcessContext {
             .map_err(|error| error.to_string())
     }
 
-    pub(crate) fn record_process_exit_begin(&self, exit_code: i32, tid: crate::thread::ThreadId) {
+    pub(crate) fn record_process_exit_begin(
+        &self,
+        exit_code: i32,
+        tid: crate::thread::ThreadId,
+    ) -> Option<carrick_observability::probes::HvpatchGuestLifecycle> {
         crate::event_ring::rec_hvpatch_process_exit_begin(self.pid(), tid.raw(), exit_code);
-        self.trace_lifecycle(
+        self.prepare_lifecycle_event(
             carrick_observability::probes::HvpatchGuestLifecyclePhase::ProcessExit,
             tid,
             i64::from(exit_code),
-        );
+        )
+        .map(|(event, _)| event)
+    }
+
+    /// Publish the guest-process terminal event only after Kernel status,
+    /// descriptor teardown, and backend bank/ASID retirement have all
+    /// committed. The event is prepared while the live task/mm identity is
+    /// still discoverable, but cannot fire until every terminal authority has
+    /// committed.
+    pub(crate) fn record_process_exit_commit(
+        &self,
+        event: Option<carrick_observability::probes::HvpatchGuestLifecycle>,
+    ) {
+        if let Some(event) = event {
+            crate::probes::hvpatch_guest_lifecycle(event);
+        }
     }
 
     /// Publish Linux lifecycle state before any irreversible backend teardown.
@@ -840,9 +874,10 @@ mod tests {
     }
 
     fn finalize_test_child(process: &ProcessContext, exit_code: i32, tid: crate::thread::ThreadId) {
-        process.record_process_exit_begin(exit_code, tid);
+        let event = process.record_process_exit_begin(exit_code, tid);
         let _ = process.publish_exit_status(exit_code).unwrap();
         process.retire_address_space(exit_code, tid).unwrap();
+        process.record_process_exit_commit(event);
     }
 
     #[test]
