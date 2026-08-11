@@ -4,7 +4,7 @@ use carrick_hal::{KernelTransactionId, ThreadId};
 
 use super::address::MmBackend;
 use super::core::{Kernel, KernelContext, RetiredThreadRecord, TaskRevision, VforkReleaseReason};
-use super::ids::LinuxTid;
+use super::ids::{LinuxTid, MmId};
 use super::objects::{
     ExecDrain, Mm, ObjectGraphError, PreparedThreadSet, TaskKey, TaskShared, ThreadKey, ThreadRef,
     ThreadResources,
@@ -79,11 +79,27 @@ pub struct PreparedExec {
     task: TaskKey,
     caller: ThreadKey,
     revision: TaskRevision,
+    old_mm: MmId,
     shared: Arc<TaskShared>,
     resources: Arc<ThreadResources>,
     old_caller: ThreadRef,
     replacement: ThreadRef,
     thread_set: PreparedThreadSet,
+}
+
+impl PreparedExec {
+    /// Exact currently published address-space identity captured by this
+    /// preparation. Destructive backend retirement must be routed here.
+    pub const fn old_mm_id(&self) -> MmId {
+        self.old_mm
+    }
+
+    /// Exact unpublished replacement address-space identity allocated by the
+    /// Kernel transaction. Replacement mappings must be applied here before
+    /// authoritative exec publication.
+    pub fn replacement_mm_id(&self) -> MmId {
+        self.shared.mm().id()
+    }
 }
 
 impl std::fmt::Debug for PreparedExec {
@@ -221,6 +237,7 @@ impl Kernel {
             task: context.task.key(),
             caller: context.thread.key(),
             revision: context.revision,
+            old_mm: context.shared.mm().id(),
             shared,
             resources,
             old_caller: Arc::clone(&context.thread),
@@ -503,6 +520,9 @@ mod tests {
         let prepared = kernel
             .prepare_exec_with_mm_backend(&child, replacement_backend, None)
             .expect("prepare replacement mm");
+        let prepared_replacement_mm = prepared.replacement_mm_id();
+        assert_eq!(prepared.old_mm_id(), parent_mm.id());
+        assert_ne!(prepared_replacement_mm, parent_mm.id());
 
         // Preparation cannot mutate either side of the shared association.
         assert!(Arc::ptr_eq(&parent_mm, &parent.shared.mm()));
@@ -512,6 +532,7 @@ mod tests {
             .commit_exec(prepared, None)
             .expect("publish replacement mm");
         let child_mm = published.shared.mm();
+        assert_eq!(child_mm.id(), prepared_replacement_mm);
         assert!(!Arc::ptr_eq(&parent_mm, &child_mm));
         assert_ne!(parent_mm.id(), child_mm.id());
         assert_eq!(

@@ -13,7 +13,7 @@ use super::core::{
     TaskExitSubscriber, TaskRecord, TaskRevision, VforkChildRelease, VforkParentWait,
     VforkReleaseReason, ZombieRecord,
 };
-use super::ids::{LinuxTid, ObjectIdError, ProcessGroupId, SessionId, TaskId};
+use super::ids::{LinuxTid, MmId, ObjectIdError, ProcessGroupId, SessionId, TaskId};
 use super::objects::{
     LinuxWaitStatus, Mm, ObjectGraphError, ProcessGroup, Session, Task, TaskKey, TaskLifecycle,
     TaskRef, TaskRusage, TaskShared, TaskSharedCloneError, ThreadKey, ThreadRef, ThreadResources,
@@ -483,6 +483,13 @@ pub struct PreparedFork {
 impl PreparedFork {
     pub const fn child_id(&self) -> TaskId {
         self.reservation.child_id
+    }
+
+    /// Exact address-space identity already selected by Kernel preparation.
+    /// Runtime/backend publication must route child mappings to this ID rather
+    /// than allocating or reconstructing one from backend process state.
+    pub fn child_mm_id(&self) -> MmId {
+        self.child_shared.mm().id()
     }
 
     pub fn child_key(&self) -> TaskKey {
@@ -2342,6 +2349,7 @@ mod tests {
         let mut prepared = reservation
             .prepare_reference(ThreadId::synthetic_for_tests(150))
             .expect("prepare fork");
+        let prepared_child_mm = prepared.child_mm_id();
         let wait = prepared.take_child_start_wait().expect("unique child wait");
         assert!(matches!(
             prepared.take_child_start_wait(),
@@ -2374,6 +2382,7 @@ mod tests {
         waiter.join().expect("join child waiter");
         let (child, _) = started.into_parts();
         assert_eq!(child.task.key().id, child_id);
+        assert_eq!(child.shared.mm().id(), prepared_child_mm);
     }
 
     #[test]
