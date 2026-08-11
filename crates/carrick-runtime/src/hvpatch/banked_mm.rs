@@ -347,10 +347,13 @@ impl BankedMmBackend {
         self.bump_revision();
     }
 
-    /// Detach this historical observer from the mutable dispatcher authority.
-    /// The owned snapshot remains readable for as long as the old typed `Mm`
-    /// is retained, even after destructive exec publishes the replacement.
-    pub(crate) fn freeze_vmas(&self, deadline: Instant) -> Result<(), SnapshotError> {
+    /// Capture the old image without detaching the still-live backend. The
+    /// caller publishes this only after engine replacement is irreversible, so
+    /// every earlier exec error leaves the old mm following live VMA updates.
+    pub(crate) fn prepare_vma_freeze(
+        &self,
+        deadline: Instant,
+    ) -> Result<PreparedVmaFreeze, SnapshotError> {
         let source = self
             .vma_source
             .try_read_until(deadline)
@@ -361,13 +364,12 @@ impl BankedMmBackend {
         if source.revision() != snapshot.revision {
             return Err(SnapshotError::ChangedDuringObservation);
         }
-        let frozen: SharedVmaSnapshotSource = Arc::new(snapshot);
-        *self
-            .vma_source
-            .try_write_until(deadline)
-            .ok_or_else(|| deadline_error(deadline))? = Some(frozen);
-        self.bump_revision();
-        Ok(())
+        let expected_revision = snapshot.revision;
+        Ok(PreparedVmaFreeze {
+            source,
+            snapshot,
+            expected_revision,
+        })
     }
 
     #[cfg(test)]
@@ -383,6 +385,78 @@ impl BankedMmBackend {
         if self.revision.fetch_add(1, Ordering::Release) == u64::MAX {
             std::process::abort();
         }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedVmaFreeze {
+    source: SharedVmaSnapshotSource,
+    snapshot: crate::kernel::OwnedVmaSnapshot,
+    expected_revision: crate::kernel::VmaRevision,
+}
+
+impl PreparedVmaFreeze {
+    /// Accept the caller's deliberate exec-image staging mutations while
+    /// retaining the pre-staging snapshot for the historical MM.
+    pub(crate) fn acknowledge_staged_revision(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(), SnapshotError> {
+        self.expected_revision = self.source.snapshot(deadline)?.revision;
+        Ok(())
+    }
+
+    pub(crate) fn validate(
+        &self,
+        backend: &BankedMmBackend,
+        deadline: Instant,
+    ) -> Result<(), SnapshotError> {
+        self.source
+            .publish_if_revision(self.expected_revision, deadline, &mut || {
+                let slot = backend
+                    .vma_source
+                    .try_read_until(deadline)
+                    .ok_or_else(|| deadline_error(deadline))?;
+                let Some(current) = slot.as_ref() else {
+                    return Err(SnapshotError::AuthorityUnavailable(SnapshotTable::Vmas));
+                };
+                if !Arc::ptr_eq(current, &self.source) {
+                    return Err(SnapshotError::ChangedDuringObservation);
+                }
+                Ok(())
+            })
+    }
+
+    pub(crate) fn commit(
+        self,
+        backend: &BankedMmBackend,
+        deadline: Instant,
+    ) -> Result<(), SnapshotError> {
+        let Self {
+            source,
+            snapshot,
+            expected_revision,
+        } = self;
+        let mut snapshot = Some(snapshot);
+        source.publish_if_revision(expected_revision, deadline, &mut || {
+            let mut slot = backend
+                .vma_source
+                .try_write_until(deadline)
+                .ok_or_else(|| deadline_error(deadline))?;
+            let Some(current) = slot.as_ref() else {
+                return Err(SnapshotError::AuthorityUnavailable(SnapshotTable::Vmas));
+            };
+            if !Arc::ptr_eq(current, &source) {
+                return Err(SnapshotError::ChangedDuringObservation);
+            }
+            let frozen = snapshot
+                .take()
+                .ok_or(SnapshotError::ChangedDuringObservation)?;
+            *slot = Some(Arc::new(frozen));
+            drop(slot);
+            backend.bump_revision();
+            Ok(())
+        })
     }
 }
 
@@ -459,11 +533,13 @@ impl MmBackend for BankedMmBackend {
         self.revision.load(Ordering::Acquire)
     }
 
-    fn vma_revision(&self) -> Option<VmaRevision> {
-        self.vma_source
-            .read()
+    fn vma_revision(&self, deadline: Instant) -> Result<Option<VmaRevision>, SnapshotError> {
+        Ok(self
+            .vma_source
+            .try_read_until(deadline)
+            .ok_or_else(|| deadline_error(deadline))?
             .as_ref()
-            .map(|source| source.revision())
+            .map(|source| source.revision()))
     }
 }
 

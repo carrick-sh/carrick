@@ -92,7 +92,7 @@ enum PrivateRepointRecovery {
 /// `MemState` mutex; the K1 observer only derives owned occupancy rows from it.
 pub(crate) struct MemAuthority {
     state: parking_lot::Mutex<MemState>,
-    revision: std::sync::atomic::AtomicU64,
+    revision: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl std::fmt::Debug for MemAuthority {
@@ -112,16 +112,16 @@ impl MemAuthority {
     fn with_revision(state: MemState, revision: crate::kernel::VmaRevision) -> Self {
         Self {
             state: parking_lot::Mutex::new(state),
-            revision: std::sync::atomic::AtomicU64::new(revision.raw()),
+            revision: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(revision.raw())),
         }
     }
 
-    pub(super) fn lock(&self) -> MemAuthorityGuard<'_> {
-        MemAuthorityGuard {
-            authority: self,
-            guard: self.state.lock(),
-            mutated: false,
-        }
+    pub(super) fn lock(&self) -> parking_lot::MutexGuard<'_, MemState> {
+        self.state.lock()
+    }
+
+    pub(super) fn revision_publisher(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        std::sync::Arc::clone(&self.revision)
     }
 
     pub(super) fn fork_private(&self) -> std::sync::Arc<Self> {
@@ -132,56 +132,13 @@ impl MemAuthority {
         std::sync::Arc::new(Self::with_revision(forked, revision))
     }
 
-    fn vma_revision(&self) -> crate::kernel::VmaRevision {
+    pub(super) fn vma_revision(&self) -> crate::kernel::VmaRevision {
         crate::kernel::VmaRevision::from_authority_raw(
             self.revision.load(std::sync::atomic::Ordering::Acquire),
         )
     }
 
-    fn bump_revision(&self) {
-        if self
-            .revision
-            .fetch_add(1, std::sync::atomic::Ordering::Release)
-            == u64::MAX
-        {
-            std::process::abort();
-        }
-    }
-}
-
-pub(super) struct MemAuthorityGuard<'a> {
-    authority: &'a MemAuthority,
-    guard: parking_lot::MutexGuard<'a, MemState>,
-    mutated: bool,
-}
-
-impl std::ops::Deref for MemAuthorityGuard<'_> {
-    type Target = MemState;
-
-    fn deref(&self) -> &Self::Target {
-        &self.guard
-    }
-}
-
-impl std::ops::DerefMut for MemAuthorityGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.mutated = true;
-        &mut self.guard
-    }
-}
-
-impl Drop for MemAuthorityGuard<'_> {
-    fn drop(&mut self) {
-        // Publish while the state lock is still held. A snapshot therefore
-        // cannot observe mutated rows paired with the preceding revision.
-        if self.mutated {
-            self.authority.bump_revision();
-        }
-    }
-}
-
-impl crate::kernel::VmaSnapshotSource for MemAuthority {
-    fn snapshot(
+    pub(super) fn snapshot_until(
         &self,
         deadline: std::time::Instant,
     ) -> Result<crate::kernel::OwnedVmaSnapshot, crate::kernel::SnapshotError> {
@@ -197,8 +154,14 @@ impl crate::kernel::VmaSnapshotSource for MemAuthority {
         Ok(crate::kernel::OwnedVmaSnapshot { revision, vmas })
     }
 
-    fn revision(&self) -> crate::kernel::VmaRevision {
-        self.vma_revision()
+    fn bump_revision(&self) {
+        if self
+            .revision
+            .fetch_add(1, std::sync::atomic::Ordering::Release)
+            == u64::MAX
+        {
+            std::process::abort();
+        }
     }
 }
 
@@ -562,6 +525,25 @@ fn dynamic_mapping_overlaps_sorted(maps: &[ProcMapsEntry], start: u64, len: u64)
     maps.get(idx).is_some_and(|map| map.start < end)
 }
 
+fn guest_vma_overlaps_locked(mem: &MemState, start: u64, len: u64) -> bool {
+    let Some(end) = start.checked_add(len) else {
+        return true;
+    };
+    dynamic_mapping_overlaps_sorted(&mem.dynamic_maps, start, len)
+        || mem
+            .growdown_ranges
+            .iter()
+            .any(|(_, current, vma_end)| *current < end && start < *vma_end)
+        || (mem.brk_current > mem.layout.heap_base
+            && start < mem.brk_current
+            && mem.layout.heap_base < end)
+        || mem.address_space_regions.iter().flatten().any(|map| {
+            map.start < end
+                && start < map.end
+                && !boot_region_is_hidden_reservation(map, mem.layout)
+        })
+}
+
 fn boot_region_is_hidden_mmap_backing(map: &ProcMapsEntry, layout: MemoryLayout) -> bool {
     map.start == layout.mmap_base && map.end == layout.mmap_base.saturating_add(layout.mmap_size)
 }
@@ -600,6 +582,11 @@ fn project_vma_summaries(mem: &MemState) -> Vec<crate::kernel::VmaSummary> {
         .chain(mem.dynamic_maps.iter())
         .filter_map(|map| (map.start < map.end).then_some((map.start, map.end)))
         .collect();
+    ranges.extend(
+        mem.growdown_ranges
+            .iter()
+            .filter_map(|(_, current, end)| (current < end).then_some((*current, *end))),
+    );
     if mem.layout.heap_base < mem.brk_current {
         ranges.push((mem.layout.heap_base, mem.brk_current));
     }
@@ -608,7 +595,7 @@ fn project_vma_summaries(mem: &MemState) -> Vec<crate::kernel::VmaSummary> {
     let mut unioned: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
     for (start, end) in ranges {
         if let Some((_, previous_end)) = unioned.last_mut()
-            && start <= *previous_end
+            && start < *previous_end
         {
             *previous_end = (*previous_end).max(end);
         } else {
@@ -842,8 +829,85 @@ fn trim_remap_snapshots_for_range(
     *snapshots = retained;
 }
 
+fn update_proc_map_prot(maps: &mut Vec<ProcMapsEntry>, start: u64, len: u64, prot: LinuxProtFlags) {
+    let (read, write, execute) = prot_to_proc_perms(prot);
+    let Some(end) = start.checked_add(len) else {
+        return;
+    };
+    let previous = std::mem::take(maps);
+    let mut updated = Vec::with_capacity(previous.len().saturating_add(2));
+    for map in previous {
+        if map.start >= end || map.end <= start {
+            updated.push(map);
+            continue;
+        }
+        let protected_start = map.start.max(start);
+        let protected_end = map.end.min(end);
+        if map.start < protected_start {
+            let mut left = map.clone();
+            left.end = protected_start;
+            updated.push(left);
+        }
+        let mut protected = map.clone();
+        protected.start = protected_start;
+        protected.end = protected_end;
+        protected.read = read;
+        protected.write = write;
+        protected.execute = execute;
+        updated.push(protected);
+        if protected_end < map.end {
+            let mut right = map;
+            right.start = protected_end;
+            updated.push(right);
+        }
+    }
+    *maps = updated;
+}
+
+fn trim_live_boot_regions_for_range(mem: &mut MemState, start: u64, len: u64) {
+    let Some(regions) = mem.address_space_regions.as_mut() else {
+        return;
+    };
+    let layout = mem.layout;
+    let mut visible = Vec::new();
+    let mut reservations = Vec::new();
+    for region in regions.drain(..) {
+        if boot_region_is_hidden_reservation(&region, layout) {
+            reservations.push(region);
+        } else {
+            visible.push(region);
+        }
+    }
+    trim_dynamic_maps_for_range(&mut visible, start, len);
+    visible.extend(reservations);
+    visible.sort_by_key(|region| region.start);
+    *regions = visible;
+}
+
+fn trim_growdown_ranges_for_range(mem: &mut MemState, start: u64, len: u64) {
+    let end = start.saturating_add(len);
+    mem.growdown_ranges.retain_mut(|(_low, current, vma_end)| {
+        if end <= *current || start >= *vma_end {
+            return true;
+        }
+        if start <= *current {
+            // Removing the lower edge (or the entire VMA) leaves no live
+            // downward-growth frontier. Any surviving upper fragment remains
+            // represented by `dynamic_maps` but cannot regrow this hole.
+            return false;
+        }
+        // Removing a suffix or middle range leaves only the lower fragment as
+        // the grow-down VMA. The ordinary dynamic-map trim retains any upper
+        // non-growing fragment separately.
+        *vma_end = start;
+        *current < *vma_end
+    });
+}
+
 fn remove_mapping_metadata_locked(mem: &mut MemState, start: u64, len: u64) {
     trim_dynamic_maps_for_range(&mut mem.dynamic_maps, start, len);
+    trim_live_boot_regions_for_range(mem, start, len);
+    trim_growdown_ranges_for_range(mem, start, len);
     trim_ranges_for_range(&mut mem.bus_fault_ranges, start, len);
     trim_writable_memfd_maps_for_range(&mut mem.writable_memfd_maps, start, len);
     trim_remap_snapshots_for_range(&mut mem.remap_snapshots, start, len);
@@ -1002,6 +1066,15 @@ impl SyscallDispatcher {
                 PrivateRepointRecovery::FailStopRetainingOwners
             }
         }
+    }
+
+    pub(super) fn commit_host_alias_mmap_observed(&self, commit: HostAliasMmapCommit) {
+        // The matching install guard keeps HostAliasTransactions non-idle for
+        // this complete state+revision publication. Snapshot and fork observers
+        // acquire that same exclusion before MemState, so neither can enter the
+        // narrow interval between the state unlock and release-ordered revision.
+        self.commit_host_alias_mmap(commit);
+        self.mem.bump_revision();
     }
 
     pub(super) fn commit_host_alias_mmap(&self, commit: HostAliasMmapCommit) {
@@ -1227,24 +1300,7 @@ impl SyscallDispatcher {
     /// either arena and the live `[heap_base, brk_current)` span are real VMAs and
     /// are checked separately before the hidden boot reservations are filtered.
     pub(super) fn guest_vma_overlaps(&self, start: u64, len: u64) -> bool {
-        let Some(end) = start.checked_add(len) else {
-            return true;
-        };
-        let mem = self.mem.lock();
-        if dynamic_mapping_overlaps_sorted(&mem.dynamic_maps, start, len) {
-            return true;
-        }
-        if mem.brk_current > mem.layout.heap_base
-            && start < mem.brk_current
-            && mem.layout.heap_base < end
-        {
-            return true;
-        }
-        mem.address_space_regions.iter().flatten().any(|map| {
-            map.start < end
-                && start < map.end
-                && !boot_region_is_hidden_reservation(map, mem.layout)
-        })
+        guest_vma_overlaps_locked(&self.mem.lock(), start, len)
     }
 
     fn range_intersects_shared_mapping(&self, start: u64, len: u64) -> bool {
@@ -1492,7 +1548,7 @@ impl SyscallDispatcher {
                 return Some(MmapGrowdownFaultPlan {
                     start: page,
                     len,
-                    exclusion,
+                    exclusion: exclusion.with_vma_revision(self.mem.revision_publisher()),
                 });
             }
         }
@@ -1510,45 +1566,29 @@ impl SyscallDispatcher {
                 break;
             }
         }
+        drop(mem);
     }
 
     fn update_dynamic_mapping_prot(&self, start: u64, len: u64, prot: LinuxProtFlags) {
-        let (read, write, execute) = prot_to_proc_perms(prot);
-        let Some(end) = start.checked_add(len) else {
-            return;
-        };
         let mut mem = self.mem.lock();
-        let maps = std::mem::take(&mut mem.dynamic_maps);
-        let mut updated = Vec::with_capacity(maps.len().saturating_add(2));
-        for map in maps {
-            if map.start >= end || map.end <= start {
-                updated.push(map);
-                continue;
-            }
+        update_proc_map_prot(&mut mem.dynamic_maps, start, len, prot);
 
-            let protected_start = map.start.max(start);
-            let protected_end = map.end.min(end);
-            if map.start < protected_start {
-                let mut left = map.clone();
-                left.end = protected_start;
-                updated.push(left);
+        let layout = mem.layout;
+        if let Some(regions) = mem.address_space_regions.as_mut() {
+            let mut visible = Vec::new();
+            let mut reservations = Vec::new();
+            for region in regions.drain(..) {
+                if boot_region_is_hidden_reservation(&region, layout) {
+                    reservations.push(region);
+                } else {
+                    visible.push(region);
+                }
             }
-
-            let mut protected = map.clone();
-            protected.start = protected_start;
-            protected.end = protected_end;
-            protected.read = read;
-            protected.write = write;
-            protected.execute = execute;
-            updated.push(protected);
-
-            if protected_end < map.end {
-                let mut right = map;
-                right.start = protected_end;
-                updated.push(right);
-            }
+            update_proc_map_prot(&mut visible, start, len, prot);
+            visible.extend(reservations);
+            visible.sort_by_key(|region| region.start);
+            *regions = visible;
         }
-        mem.dynamic_maps = updated;
     }
 
     /// Reset memory-accounting state that Linux destroys across `execve(2)`.
@@ -1559,6 +1599,7 @@ impl SyscallDispatcher {
     /// old image. The proc/auxv snapshot is preserved because callers refresh it
     /// for the new image in the same execve transition.
     pub(crate) fn reset_memory_state_on_execve(&self) {
+        let _vma_dispatch = self.begin_vma_dispatch();
         self.mem.lock().reset_for_execve();
     }
 
@@ -1820,7 +1861,7 @@ impl SyscallDispatcher {
         }
 
         fn brk(this, cx, requested: u64) {
-            let _host_alias_dispatch = this.begin_host_alias_dispatch();
+            let mut host_alias_dispatch = this.begin_host_alias_dispatch();
             let mut mem = this.mem.lock();
             let current = mem.brk_current;
             if requested == 0 {
@@ -1857,7 +1898,10 @@ impl SyscallDispatcher {
                         });
                     }
                 }
-                mem.brk_current = requested;
+                if requested != current {
+                    mem.brk_current = requested;
+                    host_alias_dispatch.mark_vma_revision(this.mem.revision_publisher());
+                }
             }
             Ok(DispatchOutcome::Returned {
                 value: mem.brk_current as i64,
@@ -1865,7 +1909,7 @@ impl SyscallDispatcher {
         }
 
         fn mmap(this, cx, requested: GuestPtr, length: u64, prot: u64, flags: u64, fd: Fd, offset: u64) {
-            let host_alias_dispatch = this.begin_host_alias_dispatch();
+            let mut host_alias_dispatch = this.begin_conditional_vma_dispatch();
             let mut flags = flags;
             let memory = &mut *cx.memory;
             let page_size = this.linux_page_size();
@@ -2477,6 +2521,7 @@ impl SyscallDispatcher {
                         ProcMapSharing::Shared,
                         String::new(),
                     );
+                    this.mark_vma_dispatch(&mut host_alias_dispatch);
                     return Ok(DispatchOutcome::Returned { value: addr as i64 });
                 }
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
@@ -2556,6 +2601,7 @@ impl SyscallDispatcher {
                 if map_flags.contains(LinuxMmapFlags::GROWSDOWN) {
                     this.record_growdown_mapping(address, length);
                 }
+                this.mark_vma_dispatch(&mut host_alias_dispatch);
                 return Ok(DispatchOutcome::Returned {
                     value: address as i64,
                 });
@@ -2591,6 +2637,7 @@ impl SyscallDispatcher {
                 if map_flags.contains(LinuxMmapFlags::GROWSDOWN) {
                     this.record_growdown_mapping(address, length);
                 }
+                this.mark_vma_dispatch(&mut host_alias_dispatch);
                 return Ok(DispatchOutcome::Returned {
                     value: address as i64,
                 });
@@ -3023,13 +3070,14 @@ impl SyscallDispatcher {
                 map_sharing.proc_map_sharing(),
                 String::new(),
             );
+            this.mark_vma_dispatch(&mut host_alias_dispatch);
             Ok(DispatchOutcome::Returned {
                 value: address as i64,
             })
         }
 
         fn munmap(this, cx, address: GuestPtr, length: u64) {
-            let _host_alias_dispatch = this.begin_host_alias_dispatch();
+            let mut host_alias_dispatch = this.begin_conditional_vma_dispatch();
             let page_size = this.linux_page_size();
             // Linux munmap EINVAL edges (__vm_munmap): the address must be
             // page-aligned and the length non-zero. LTP munmap03 munmaps the
@@ -3044,6 +3092,7 @@ impl SyscallDispatcher {
             let Some(aligned_len) = align_up_u64(length, page_size) else {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
+            let had_vma = guest_vma_overlaps_locked(&this.mem.lock(), address.0, aligned_len);
             let (
                 shared_owned,
                 shared_carvable,
@@ -3081,6 +3130,9 @@ impl SyscallDispatcher {
                     .is_none()
                 {
                     std::process::abort();
+                }
+                if had_vma {
+                    this.mark_vma_dispatch(&mut host_alias_dispatch);
                 }
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
@@ -3126,6 +3178,9 @@ impl SyscallDispatcher {
                 }
                 drop(displaced_shared);
                 drop(shared_preview);
+                if had_vma {
+                    this.mark_vma_dispatch(&mut host_alias_dispatch);
+                }
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
             // A canonical alias-window guest VA is a dynamic alias mapping:
@@ -3159,6 +3214,9 @@ impl SyscallDispatcher {
                 }
                 mark_range_unmapped(&mut *cx.memory, address.0, len_usize);
                 this.remove_mapping_metadata(address.0, aligned_len);
+                if had_vma {
+                    this.mark_vma_dispatch(&mut host_alias_dispatch);
+                }
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
             if !range_within(address.0, length, layout.mmap_base, layout.mmap_size) {
@@ -3194,6 +3252,10 @@ impl SyscallDispatcher {
                 }
             } else {
                 free_regions_insert(&mut mem.free_regions, address.0, aligned_len);
+            }
+            drop(mem);
+            if had_vma {
+                this.mark_vma_dispatch(&mut host_alias_dispatch);
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -3356,7 +3418,7 @@ impl SyscallDispatcher {
         }
 
         fn mremap(this, cx, old_address: GuestPtr, old_size: u64, new_size_req: u64, flags: u64, _new_address: GuestPtr) {
-            let _host_alias_dispatch = this.begin_host_alias_dispatch();
+            let mut host_alias_dispatch = this.begin_conditional_vma_dispatch();
             let memory = &mut *cx.memory;
             let page_size = this.linux_page_size();
             // Errno precedence below is oracle-derived (real Linux 6.12.76,
@@ -3539,6 +3601,9 @@ impl SyscallDispatcher {
                         source_metadata.sharing,
                         source_metadata.path.clone(),
                     );
+                    if new_size != old_size {
+                        this.mark_vma_dispatch(&mut host_alias_dispatch);
+                    }
                     return Ok(DispatchOutcome::Returned {
                         value: old_address.0 as i64,
                     });
@@ -3594,6 +3659,9 @@ impl SyscallDispatcher {
                     source_metadata.sharing,
                     source_metadata.path.clone(),
                 );
+                if new_size != old_size {
+                    this.mark_vma_dispatch(&mut host_alias_dispatch);
+                }
                 return Ok(DispatchOutcome::Returned {
                     value: old_address.0 as i64,
                 });
@@ -3644,6 +3712,7 @@ impl SyscallDispatcher {
                         source_metadata.sharing,
                         source_metadata.path.clone(),
                     );
+                    this.mark_vma_dispatch(&mut host_alias_dispatch);
                     return Ok(DispatchOutcome::Returned {
                         value: old_address.0 as i64,
                     });
@@ -3780,13 +3849,14 @@ impl SyscallDispatcher {
                         free_regions_insert(&mut mem.free_regions, old_address.0, old_size);
                     }
                 }
+            this.mark_vma_dispatch(&mut host_alias_dispatch);
             Ok(DispatchOutcome::Returned {
                 value: new_addr as i64,
             })
         }
 
         fn mprotect(this, cx, address: GuestPtr, length: u64, prot: u64) {
-            let _host_alias_dispatch = this.begin_host_alias_dispatch();
+            let mut host_alias_dispatch = this.begin_conditional_vma_dispatch();
             let page_size = this.linux_page_size();
             if prot & !LinuxProtFlags::SUPPORTED_MASK != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -3930,11 +4000,8 @@ impl SyscallDispatcher {
                 prot_none,
                 !prot_none && prot & LINUX_PROT_WRITE == 0,
             );
-            this.update_dynamic_mapping_prot(
-                address.0,
-                length,
-                prot_flags,
-            );
+            this.update_dynamic_mapping_prot(address.0, length, prot_flags);
+            this.mark_vma_dispatch(&mut host_alias_dispatch);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -8874,11 +8941,10 @@ mod tests {
         assert!(!dispatcher.guest_vma_overlaps(layout.mmap_base, LINUX_PAGE_SIZE));
         assert!(dispatcher.guest_vma_overlaps(BOOT, LINUX_PAGE_SIZE));
 
-        let snapshot = crate::kernel::VmaSnapshotSource::snapshot(
-            dispatcher.mem.as_ref(),
-            std::time::Instant::now() + std::time::Duration::from_secs(1),
-        )
-        .expect("VMA authority snapshot");
+        let snapshot = dispatcher
+            .mem
+            .snapshot_until(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .expect("VMA authority snapshot");
         assert!(snapshot.vmas.contains(&crate::kernel::VmaSummary {
             start: GuestVa(layout.heap_base),
             end: GuestVa(layout.heap_base + LINUX_PAGE_SIZE),
@@ -8904,21 +8970,185 @@ mod tests {
     }
 
     #[test]
-    fn mem_authority_revises_only_after_mutable_access() {
+    fn vma_projection_preserves_adjacency_and_removes_unmapped_boot_ranges() {
         let dispatcher = SyscallDispatcher::new();
-        let initial = crate::kernel::VmaSnapshotSource::revision(dispatcher.mem.as_ref());
+        dispatcher.set_address_space_regions(vec![
+            ProcMapsEntry {
+                start: 0x1000,
+                end: 0x2000,
+                read: true,
+                write: false,
+                execute: true,
+                sharing: ProcMapSharing::Private,
+                path: "text".to_owned(),
+            },
+            ProcMapsEntry {
+                start: 0x2000,
+                end: 0x3000,
+                read: true,
+                write: false,
+                execute: false,
+                sharing: ProcMapSharing::Private,
+                path: "rodata".to_owned(),
+            },
+        ]);
+        let before = dispatcher
+            .mem
+            .snapshot_until(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .expect("adjacent VMA snapshot");
+        assert_eq!(before.vmas.len(), 2);
+
+        let vma_dispatch = dispatcher.begin_vma_dispatch();
+        dispatcher.remove_mapping_metadata(0x1000, 0x1000);
+        drop(vma_dispatch);
+        let after = dispatcher
+            .mem
+            .snapshot_until(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .expect("trimmed VMA snapshot");
+        assert_eq!(
+            after.vmas,
+            vec![crate::kernel::VmaSummary {
+                start: GuestVa(0x2000),
+                end: GuestVa(0x3000),
+            }]
+        );
+    }
+
+    #[test]
+    fn mem_authority_revises_once_per_published_vma_transaction() {
+        let dispatcher = SyscallDispatcher::new();
+        let initial = dispatcher.mem.vma_revision();
 
         let _layout = dispatcher.mem.lock().layout;
+        dispatcher.mem.lock().linux_auxv_image.push(1);
+        assert_eq!(dispatcher.mem.vma_revision(), initial);
+
+        // Failed/no-op mapping paths take exclusion but never arm publication.
+        drop(dispatcher.begin_conditional_vma_dispatch());
+        assert_eq!(dispatcher.mem.vma_revision(), initial);
+
+        let vma_dispatch = dispatcher.begin_vma_dispatch();
+        dispatcher.mem.lock().brk_current += LINUX_PAGE_SIZE;
+        drop(vma_dispatch);
         assert_eq!(
-            crate::kernel::VmaSnapshotSource::revision(dispatcher.mem.as_ref()),
-            initial
+            dispatcher.mem.vma_revision(),
+            initial.next().expect("revision")
         );
 
-        let current = dispatcher.mem.lock().brk_current;
-        dispatcher.mem.lock().brk_current = current;
+        let mut conditional = dispatcher.begin_conditional_vma_dispatch();
+        dispatcher.mark_vma_dispatch(&mut conditional);
+        drop(conditional);
         assert_eq!(
-            crate::kernel::VmaSnapshotSource::revision(dispatcher.mem.as_ref()),
-            initial.next().expect("revision")
+            dispatcher.mem.vma_revision(),
+            initial
+                .next()
+                .and_then(crate::kernel::VmaRevision::next)
+                .expect("second revision")
+        );
+    }
+
+    #[test]
+    fn revision_checked_publication_excludes_concurrent_vma_mutation() {
+        let dispatcher = std::sync::Arc::new(SyscallDispatcher::new());
+        let source = dispatcher.vma_snapshot_source();
+        let expected = source.revision();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let acquired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (attempting_tx, attempting_rx) = std::sync::mpsc::sync_channel(0);
+        let worker_dispatcher = std::sync::Arc::clone(&dispatcher);
+        let worker_barrier = std::sync::Arc::clone(&barrier);
+        let worker_acquired = std::sync::Arc::clone(&acquired);
+        let worker = std::thread::spawn(move || {
+            worker_barrier.wait();
+            attempting_tx.send(()).expect("announce mutation attempt");
+            let _guard = worker_dispatcher.begin_conditional_vma_dispatch();
+            worker_acquired.store(true, std::sync::atomic::Ordering::Release);
+        });
+
+        source
+            .publish_if_revision(
+                expected,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+                &mut || {
+                    barrier.wait();
+                    attempting_rx
+                        .recv_timeout(std::time::Duration::from_secs(1))
+                        .expect("mutation waiter reached acquisition");
+                    let waiter_deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(1);
+                    while dispatcher.host_alias_transactions.waiting_dispatchers() == 0 {
+                        assert!(
+                            std::time::Instant::now() < waiter_deadline,
+                            "mutation thread never blocked on VMA exclusion"
+                        );
+                        std::thread::yield_now();
+                    }
+                    assert!(!acquired.load(std::sync::atomic::Ordering::Acquire));
+                    Ok(())
+                },
+            )
+            .expect("revision-checked publication");
+        worker.join().expect("mutation waiter");
+        assert!(acquired.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn growdown_metadata_is_trimmed_with_mapping_teardown() {
+        let dispatcher = SyscallDispatcher::new();
+        let page = dispatcher.linux_page_size();
+        let start = 0x10_000;
+        dispatcher.record_dynamic_mapping(
+            start,
+            page * 4,
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            ProcMapSharing::Private,
+            "stack".to_owned(),
+        );
+        dispatcher.record_growdown_mapping(start, page * 4);
+        let plan = dispatcher
+            .mmap_growdown_fault_plan(start - page)
+            .expect("grow-down plan");
+        dispatcher.commit_mmap_growdown(plan);
+
+        let vma_dispatch = dispatcher.begin_vma_dispatch();
+        dispatcher.remove_mapping_metadata(start + page, page);
+        drop(vma_dispatch);
+        let split = dispatcher
+            .vma_snapshot_source()
+            .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .expect("split grow-down snapshot");
+        assert_eq!(
+            split.vmas,
+            vec![
+                crate::kernel::VmaSummary {
+                    start: GuestVa(start - page),
+                    end: GuestVa(start + page),
+                },
+                crate::kernel::VmaSummary {
+                    start: GuestVa(start + page * 2),
+                    end: GuestVa(start + page * 4),
+                },
+            ]
+        );
+
+        let vma_dispatch = dispatcher.begin_vma_dispatch();
+        dispatcher.remove_mapping_metadata(start - page, page * 2);
+        drop(vma_dispatch);
+        assert!(
+            dispatcher
+                .mmap_growdown_fault_plan(start - page * 2)
+                .is_none()
+        );
+        let retired = dispatcher
+            .vma_snapshot_source()
+            .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .expect("retired grow-down snapshot");
+        assert_eq!(
+            retired.vmas,
+            vec![crate::kernel::VmaSummary {
+                start: GuestVa(start + page * 2),
+                end: GuestVa(start + page * 4),
+            }]
         );
     }
 
@@ -8926,8 +9156,10 @@ mod tests {
     fn mem_authority_fork_is_independent_after_one_existing_state_clone() {
         let parent = SyscallDispatcher::new();
         let layout = parent.mem.lock().layout;
+        let parent_vma_dispatch = parent.begin_vma_dispatch();
         parent.mem.lock().brk_current = layout.heap_base + LINUX_PAGE_SIZE;
-        let parent_revision = crate::kernel::VmaSnapshotSource::revision(parent.mem.as_ref());
+        drop(parent_vma_dispatch);
+        let parent_revision = parent.mem.vma_revision();
         let child = parent.fork_clone_in_process(
             crate::thread::ThreadId::synthetic_for_tests(71),
             crate::thread::ThreadId::synthetic_for_tests(72),
@@ -8936,43 +9168,37 @@ mod tests {
         );
 
         assert!(!std::sync::Arc::ptr_eq(&parent.mem, &child.mem));
-        assert_eq!(
-            crate::kernel::VmaSnapshotSource::revision(child.mem.as_ref()),
-            parent_revision
-        );
+        assert_eq!(child.mem.vma_revision(), parent_revision);
+        let child_vma_dispatch = child.begin_vma_dispatch();
         child.mem.lock().brk_current += LINUX_PAGE_SIZE;
+        drop(child_vma_dispatch);
         assert_eq!(
             parent.mem.lock().brk_current,
             layout.heap_base + LINUX_PAGE_SIZE
         );
+        assert_eq!(parent.mem.vma_revision(), parent_revision);
         assert_eq!(
-            crate::kernel::VmaSnapshotSource::revision(parent.mem.as_ref()),
-            parent_revision
-        );
-        assert_eq!(
-            crate::kernel::VmaSnapshotSource::revision(child.mem.as_ref()),
+            child.mem.vma_revision(),
             parent_revision.next().expect("child revision")
         );
     }
 
     #[test]
     fn mem_authority_snapshot_honors_deadline_contention() {
-        let authority = SyscallDispatcher::new().mem;
-        let held = std::sync::Arc::clone(&authority);
+        let dispatcher = std::sync::Arc::new(SyscallDispatcher::new());
+        let source = dispatcher.vma_snapshot_source();
+        let held = std::sync::Arc::clone(&dispatcher);
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let worker_barrier = std::sync::Arc::clone(&barrier);
         let worker = std::thread::spawn(move || {
-            let _guard = held.lock();
+            let _dispatch = held.begin_vma_dispatch();
             worker_barrier.wait();
             std::thread::sleep(std::time::Duration::from_millis(40));
         });
         barrier.wait();
 
         assert_eq!(
-            crate::kernel::VmaSnapshotSource::snapshot(
-                authority.as_ref(),
-                std::time::Instant::now() + std::time::Duration::from_millis(5),
-            ),
+            source.snapshot(std::time::Instant::now() + std::time::Duration::from_millis(5)),
             Err(crate::kernel::SnapshotError::TimedOut)
         );
         worker.join().expect("authority lock worker");
@@ -9602,6 +9828,7 @@ mod tests {
                 .push((start + LINUX_PAGE_SIZE, LINUX_PAGE_SIZE));
         }
         let before = dispatcher.mem.lock().clone();
+        let vma_source = dispatcher.vma_snapshot_source();
         let guard = dispatcher.begin_host_alias_dispatch();
         let transaction = guard.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
             start,
@@ -9616,6 +9843,10 @@ mod tests {
             writable_memfd: None,
         }));
 
+        assert_eq!(
+            vma_source.snapshot(std::time::Instant::now() + std::time::Duration::from_millis(5)),
+            Err(crate::kernel::SnapshotError::TimedOut)
+        );
         let pending = dispatcher.mem.lock().clone();
         assert_eq!(pending.dynamic_maps, before.dynamic_maps);
         assert_eq!(pending.locked_ranges, before.locked_ranges);

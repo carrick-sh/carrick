@@ -107,6 +107,17 @@ pub struct OwnedVmaSnapshot {
 pub trait VmaSnapshotSource: Debug + Send + Sync {
     fn snapshot(&self, deadline: Instant) -> Result<OwnedVmaSnapshot, SnapshotError>;
     fn revision(&self) -> VmaRevision;
+
+    /// Run `publish` while this source's observable VMA revision cannot change.
+    ///
+    /// Historical-MM cutover uses this to validate the exact preparation
+    /// generation and install its owned snapshot without a detach window.
+    fn publish_if_revision(
+        &self,
+        expected: VmaRevision,
+        deadline: Instant,
+        publish: &mut dyn FnMut() -> Result<(), SnapshotError>,
+    ) -> Result<(), SnapshotError>;
 }
 
 impl VmaSnapshotSource for OwnedVmaSnapshot {
@@ -116,6 +127,18 @@ impl VmaSnapshotSource for OwnedVmaSnapshot {
 
     fn revision(&self) -> VmaRevision {
         self.revision
+    }
+
+    fn publish_if_revision(
+        &self,
+        expected: VmaRevision,
+        _deadline: Instant,
+        publish: &mut dyn FnMut() -> Result<(), SnapshotError>,
+    ) -> Result<(), SnapshotError> {
+        if self.revision != expected {
+            return Err(SnapshotError::ChangedDuringObservation);
+        }
+        publish()
     }
 }
 
@@ -159,8 +182,8 @@ pub enum SnapshotError {
 pub trait MmBackend: Send + Sync {
     fn snapshot(&self, deadline: Instant) -> Result<MmBackendSnapshot, SnapshotError>;
     fn revision(&self) -> u64;
-    fn vma_revision(&self) -> Option<VmaRevision> {
-        None
+    fn vma_revision(&self, _deadline: Instant) -> Result<Option<VmaRevision>, SnapshotError> {
+        Ok(None)
     }
 }
 
