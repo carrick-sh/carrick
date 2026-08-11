@@ -145,6 +145,8 @@ mod debug_exec_stamps;
 mod debug_jit_shape;
 mod debug_layout;
 mod fs_setup;
+// Strict text reader for the bundled one-VM HVPatch K1 lifecycle profile.
+mod hvpatch_k1_profile;
 mod jit_shape_snapshot;
 mod lifecycle;
 #[cfg(target_os = "macos")]

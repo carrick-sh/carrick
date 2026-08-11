@@ -89,6 +89,9 @@ pub const BUNDLED_GUEST_STACK_D: &str = include_str!("../../../scripts/dtrace/gu
 pub const BUNDLED_DSR_PROFILE_D: &str = include_str!("../../../scripts/dtrace/dsr-profile.d");
 pub const BUNDLED_DSR_INDIRECT_D: &str = include_str!("../../../scripts/dtrace/dsr-indirect.d");
 pub const BUNDLED_DSR_FORK_D: &str = include_str!("../../../scripts/dtrace/dsr-fork.d");
+/// Complete-workload HVPatch K1 VM and guest-process lifecycle profile.
+pub const BUNDLED_HVPATCH_K1_LIFECYCLE_D: &str =
+    include_str!("../../../scripts/dtrace/hvpatch-k1-lifecycle.d");
 pub const BUNDLED_NATIVE_WALL_D: &str = include_str!("../../../scripts/dtrace/native-wall.d");
 pub const BUNDLED_NATIVE_SHAPE_D: &str =
     include_str!("../../../scripts/dtrace/native-shape-census.d");

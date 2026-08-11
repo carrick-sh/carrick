@@ -540,6 +540,7 @@ impl V2ProfileAuthority {
             TraceProfileKind::Dsr
             | TraceProfileKind::DsrFork
             | TraceProfileKind::DsrIndirect
+            | TraceProfileKind::HvpatchK1Lifecycle
             | TraceProfileKind::NativeShape => {
                 bail!("non-native profile cannot construct V2ProfileAuthority")
             }
@@ -2224,6 +2225,7 @@ pub(crate) enum TraceProfileKind {
     Dsr,
     DsrIndirect,
     DsrFork,
+    HvpatchK1Lifecycle,
     NativeAmplification,
     NativeFault,
     NativeShape,
@@ -2236,6 +2238,7 @@ impl TraceProfileKind {
             Self::Dsr => "dsr",
             Self::DsrIndirect => "dsr-indirect",
             Self::DsrFork => "dsr-fork",
+            Self::HvpatchK1Lifecycle => "hvpatch-k1-lifecycle",
             Self::NativeAmplification => "native-amplification",
             Self::NativeFault => "native-fault",
             Self::NativeShape => "native-shape",
@@ -2272,6 +2275,7 @@ impl TraceProfileKind {
             Self::Dsr
             | Self::DsrIndirect
             | Self::DsrFork
+            | Self::HvpatchK1Lifecycle
             | Self::NativeFault
             | Self::NativeShape => None,
         }
@@ -2283,6 +2287,9 @@ impl TraceProfileKind {
             Self::Dsr => carrick_runtime::dtrace_consumer::BUNDLED_DSR_PROFILE_D,
             Self::DsrIndirect => carrick_runtime::dtrace_consumer::BUNDLED_DSR_INDIRECT_D,
             Self::DsrFork => carrick_runtime::dtrace_consumer::BUNDLED_DSR_FORK_D,
+            Self::HvpatchK1Lifecycle => {
+                carrick_runtime::dtrace_consumer::BUNDLED_HVPATCH_K1_LIFECYCLE_D
+            }
             Self::NativeAmplification => {
                 carrick_runtime::dtrace_consumer::BUNDLED_NATIVE_AMPLIFICATION_D
             }
@@ -2297,6 +2304,7 @@ impl TraceProfileKind {
             "dsr" => Ok(Self::Dsr),
             "dsr-indirect" => Ok(Self::DsrIndirect),
             "dsr-fork" => Ok(Self::DsrFork),
+            "hvpatch-k1-lifecycle" => Ok(Self::HvpatchK1Lifecycle),
             "native-amplification" => Ok(Self::NativeAmplification),
             "native-fault" => Ok(Self::NativeFault),
             "native-shape" => Ok(Self::NativeShape),
