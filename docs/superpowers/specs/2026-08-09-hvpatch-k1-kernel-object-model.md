@@ -189,14 +189,22 @@ The sole HVPatch K1 implementation is `hvpatch/banked_mm.rs`. K2 replaces and
 deletes it; there is no runtime selection enum or feature flag.
 
 Frame observation requires a HAL-level inventory sink because authoritative
-mappings live in `carrick-vmm-hvf`, not the dispatcher. Each 16 KiB compound
-backing slice receives one stable `FrameId`; each stage-2 alias receives a
-`MappingId`. A frame summary has zero or more typed IPA aliases—it never assumes
-one backing has one IPA. Variable-size `hv_vm_map` extents are split into
-compound-frame records with checked offset/length. Shared host backing plus
-offset reuses `FrameId`; a copied backing gets a new ID. Host addresses never
-cross the sink. K2 preserves these identities while replacing inventory policy
-with the global `FrameTable`.
+mappings live in `carrick-vmm-hvf`, not the dispatcher. The K1 adapter assigns
+one stable `FrameId` to each exact sparse host-backing extent and one
+`MappingId` to each logical stage-2 alias extent. A frame summary has zero or
+more typed IPA aliases—it never assumes one backing has one IPA. `FrameLength`
+carries the checked extent length; shared host backing plus offset reuses
+`FrameId`, while a copied backing gets a new ID. Host addresses never cross the
+sink.
+
+This extent granularity is a deliberate K1 phase boundary. A current HVPatch
+process bank is a sparse 40 GiB mapping: expanding it eagerly would create
+2,621,440 16 KiB records and more than 5.2 million prepare/publish events per
+birth, violating both the 262,144-event batch cap and the 16 MiB debug-response
+cap while adding work proportional to sparse virtual extent. K2 remains RED for
+replacing those sparse extents with demand-materialized 16 KiB compound-frame
+records in the global `FrameTable`; K1 must neither pretend the sparse pages are
+materialized nor pull that memory-mechanism replacement forward.
 
 `carrick-hal::kernel` also defines the pointer-free `FrameInventoryEvent` and
 owned `FrameInventoryBatch` contract. The backend records prepare, publish,
