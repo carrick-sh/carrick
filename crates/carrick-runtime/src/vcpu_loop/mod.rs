@@ -3461,6 +3461,45 @@ where
             trace_hvpatch_thread_teardown(&kernel, state.this_tid, 5);
 
             if let Some(process) = kernel.hvpatch_process.as_ref() {
+                let terminal_context = match process.context_for_linux_tid(state.linux_tid) {
+                    Ok(context) => context,
+                    Err(error) => {
+                        tracing::error!(pid = process.pid(), %error, "capture terminal frame inventory mm");
+                        std::process::abort();
+                    }
+                };
+                let terminal_mm = terminal_context.shared().mm().id();
+                let extent_count = engine.frame_inventory_extent_count();
+                if extent_count > 0 {
+                    let event_count = match extent_count.checked_mul(2) {
+                        Some(count) => count,
+                        None => std::process::abort(),
+                    };
+                    let capacity =
+                        match carrick_hal::FrameEventCapacity::for_event_count(event_count) {
+                            Ok(capacity) => capacity,
+                            Err(_) => std::process::abort(),
+                        };
+                    let reservation = match terminal_context
+                        .kernel()
+                        .reserve_frame_inventory(0, 0, capacity)
+                    {
+                        Ok(reservation) => reservation,
+                        Err(error) => {
+                            tracing::error!(pid = process.pid(), %error, "reserve terminal frame inventory");
+                            std::process::abort();
+                        }
+                    };
+                    let transaction = reservation.transaction();
+                    if let Err(error) = engine.begin_retirement_inventory(reservation) {
+                        terminal_context
+                            .kernel()
+                            .frame_inventory()
+                            .abandon(transaction);
+                        tracing::error!(pid = process.pid(), %error, "arm terminal frame inventory");
+                        std::process::abort();
+                    }
+                }
                 let process_exit_event =
                     process.record_process_exit_begin(published_exit_code, state.this_tid);
                 let child = process.is_child();
@@ -3503,7 +3542,7 @@ where
                 }
                 kernel.unregister_hvpatch_runtime_endpoint();
 
-                let _topology = crate::fork_quiesce::acquire_topology_lock(
+                let topology = crate::fork_quiesce::acquire_topology_lock(
                     carrick_observability::probes::HvpatchTopologyOperation::ProcessRetire,
                     process.pid(),
                     state.this_tid.raw(),
@@ -3516,6 +3555,36 @@ where
                     );
                     std::process::abort();
                 }
+                let retirement_commit = (extent_count > 0).then(|| {
+                    engine.take_retirement_inventory().unwrap_or_else(|| {
+                        tracing::error!(
+                            pid = process.pid(),
+                            "terminal HVPatch frame inventory commit is missing"
+                        );
+                        std::process::abort();
+                    })
+                });
+                drop(topology);
+
+                if let Some(commit) = retirement_commit
+                    && terminal_context
+                        .kernel()
+                        .frame_inventory()
+                        .apply(terminal_mm, commit)
+                        .is_err()
+                {
+                    tracing::error!(
+                        pid = process.pid(),
+                        "terminal HVPatch frame inventory publication failed"
+                    );
+                    std::process::abort();
+                }
+
+                let topology = crate::fork_quiesce::acquire_topology_lock(
+                    carrick_observability::probes::HvpatchTopologyOperation::ProcessRetire,
+                    process.pid(),
+                    state.this_tid.raw(),
+                );
                 if let Err(error) =
                     process.retire_address_space(published_exit_code, state.this_tid)
                 {
@@ -3526,10 +3595,10 @@ where
                     );
                     std::process::abort();
                 }
-                drop(_topology);
+                drop(topology);
                 process.record_process_exit_commit(process_exit_event);
-            } else if let Err(error) = engine.retire_in_process_address_space() {
-                tracing::error!(%error, "terminal owner could not retire HVPatch root engine");
+            } else {
+                tracing::error!("terminal HVPatch process lacks authoritative process context");
                 std::process::abort();
             }
             vcpu_retired_by_hvpatch_cleanup = true;
