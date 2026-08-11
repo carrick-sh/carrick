@@ -803,6 +803,34 @@ fn alias_registry() -> &'static parking_lot::Mutex<Vec<AliasBacking>> {
     CELL.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+type ReplayMappingKey = (u64, usize, usize, u64);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn replay_mappings() -> &'static parking_lot::Mutex<std::collections::BTreeSet<ReplayMappingKey>> {
+    static CELL: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::BTreeSet<ReplayMappingKey>>,
+    > = std::sync::OnceLock::new();
+    CELL.get_or_init(|| parking_lot::Mutex::new(std::collections::BTreeSet::new()))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn replay_mapping_key(backing: AliasBacking) -> ReplayMappingKey {
+    (backing.ipa, backing.size, backing.host_addr, backing.perms)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn forget_replay_extent(ipa: u64, size: usize) {
+    replay_mappings()
+        .lock()
+        .retain(|(mapped_ipa, mapped_size, _, _)| *mapped_ipa != ipa || *mapped_size != size);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn clear_replay_mappings() {
+    replay_mappings().lock().clear();
+}
+
 /// Diagnostic: lazy-alias re-map count (the `debug-stats` feature logs every 256th).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub static ALIAS_REMAP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -814,6 +842,10 @@ pub static ALIAS_REMAP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// replaces the entry.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn register_shared_alias(b: AliasBacking) {
+    let mut replay = replay_mappings().lock();
+    replay.retain(|(ipa, _, _, _)| *ipa != b.ipa);
+    replay.insert(replay_mapping_key(b));
+    drop(replay);
     let mut reg = alias_registry().lock();
     if let Some(e) = reg.iter_mut().find(|e| e.ipa == b.ipa) {
         *e = b;
@@ -2010,7 +2042,7 @@ fn record_vm_released() {
 /// process death would leave no authoritative destroy-success boundary.
 pub fn destroy_persistent_vm_at_run_terminal() -> Result<(), TrapError> {
     crate::probes::vm_lifecycle(2, -1);
-    let rc = unsafe { applevisor_sys::hv_vm_destroy() };
+    let rc = unsafe { inventory_hv_vm_destroy() };
     if rc != 0 {
         return Err(TrapError::Hypervisor(format!(
             "terminal hv_vm_destroy rc={rc:#x}"
@@ -2720,6 +2752,7 @@ struct InventoryExtent {
 struct InventoryFrameRegistry {
     shared: std::collections::BTreeMap<InventoryBackingIdentity, carrick_hal::FrameId>,
     references: std::collections::BTreeMap<carrick_hal::FrameId, usize>,
+    extent_references: std::collections::BTreeMap<(carrick_hal::FrameId, u64, u64), usize>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2750,6 +2783,29 @@ impl HvpatchFrameInventory {
             ..Self::default()
         }
     }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn final_exec_physical_extents(
+    inventory: &HvpatchFrameInventory,
+) -> Result<std::collections::BTreeSet<(u64, usize)>, TrapError> {
+    let frames = inventory.frames.lock();
+    let mut physical = std::collections::BTreeSet::new();
+    for (&(ipa, length), extent) in &inventory.extents {
+        let key = (extent.frame, ipa, length);
+        let references = frames.extent_references.get(&key).copied().ok_or_else(|| {
+            TrapError::Hypervisor(format!(
+                "HVPatch physical extent {key:?} has no backend reference"
+            ))
+        })?;
+        if references == 1 {
+            physical.insert((
+                ipa,
+                usize::try_from(length).map_err(|_| TrapError::MappingTooLarge(length))?,
+            ));
+        }
+    }
+    Ok(physical)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3296,6 +3352,38 @@ impl HvfVmState {
                 generation: Self::inventory_generation(1),
             })
             .map_err(Self::reservation_error)?;
+        let mut frames = inventory.frames.lock();
+        let frame_references = frames
+            .references
+            .get(&frame)
+            .copied()
+            .unwrap_or_default()
+            .checked_add(1)
+            .ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "HVPatch frame {frame:?} backend reference count exhausted"
+                ))
+            })?;
+        let extent_key = (frame, gpa, length);
+        let extent_references = frames
+            .extent_references
+            .get(&extent_key)
+            .copied()
+            .unwrap_or_default()
+            .checked_add(1)
+            .ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "HVPatch physical extent {extent_key:?} reference count exhausted"
+                ))
+            })?;
+        frames.references.insert(frame, frame_references);
+        frames
+            .extent_references
+            .insert(extent_key, extent_references);
+        if matches!(backing, InventoryBackingIdentity::SharedFile { .. }) {
+            frames.shared.entry(backing).or_insert(frame);
+        }
+        drop(frames);
         inventory.extents.insert(
             (gpa, length),
             InventoryExtent {
@@ -3304,16 +3392,6 @@ impl HvfVmState {
                 backing,
             },
         );
-        let mut frames = inventory.frames.lock();
-        let references = frames.references.entry(frame).or_default();
-        *references = references.checked_add(1).ok_or_else(|| {
-            TrapError::Hypervisor(format!(
-                "HVPatch frame {frame:?} backend reference count exhausted"
-            ))
-        })?;
-        if matches!(backing, InventoryBackingIdentity::SharedFile { .. }) {
-            frames.shared.entry(backing).or_insert(frame);
-        }
         Ok(())
     }
 
@@ -3322,10 +3400,9 @@ impl HvfVmState {
         reservation: &mut carrick_hal::FrameInventoryReservation,
     ) -> Result<(), TrapError> {
         let transaction = reservation.transaction();
-        let extents = std::mem::take(&mut inventory.extents);
-        let mut frames = inventory.frames.lock();
-        let mut retired = std::collections::BTreeSet::new();
-        for extent in extents.into_values() {
+        let mut local_frame_references =
+            std::collections::BTreeMap::<carrick_hal::FrameId, usize>::new();
+        for (&(gpa, length), extent) in &inventory.extents {
             reservation
                 .push(carrick_hal::FrameInventoryEvent::UnmapMapping {
                     transaction,
@@ -3333,28 +3410,49 @@ impl HvfVmState {
                     generation: Self::inventory_generation(2),
                 })
                 .map_err(Self::reservation_error)?;
-            let references = frames.references.get_mut(&extent.frame).ok_or_else(|| {
+            let local = local_frame_references.entry(extent.frame).or_default();
+            *local = local.checked_add(1).ok_or_else(|| {
                 TrapError::Hypervisor(format!(
-                    "HVPatch frame {:?} has no backend reference",
+                    "HVPatch frame {:?} local retirement count exhausted",
                     extent.frame
                 ))
             })?;
-            *references = references.checked_sub(1).ok_or_else(|| {
-                TrapError::Hypervisor(format!(
-                    "HVPatch frame {:?} backend reference count underflow",
-                    extent.frame
-                ))
-            })?;
-            if *references == 0 {
-                frames.references.remove(&extent.frame);
-                if matches!(extent.backing, InventoryBackingIdentity::SharedFile { .. }) {
-                    frames.shared.remove(&extent.backing);
-                }
-                retired.insert(extent.frame);
+            if length == 0 {
+                return Err(TrapError::Hypervisor(format!(
+                    "HVPatch retirement contains empty extent at IPA 0x{gpa:x}"
+                )));
             }
         }
-        drop(frames);
-        for frame in retired {
+
+        let mut frames = inventory.frames.lock();
+        let mut retired = std::collections::BTreeSet::new();
+        for (&frame, &local) in &local_frame_references {
+            let global = frames.references.get(&frame).copied().ok_or_else(|| {
+                TrapError::Hypervisor(format!("HVPatch frame {frame:?} has no backend reference"))
+            })?;
+            if global < local {
+                return Err(TrapError::Hypervisor(format!(
+                    "HVPatch frame {frame:?} backend reference count underflow"
+                )));
+            }
+            if global == local {
+                retired.insert(frame);
+            }
+        }
+        for (&(gpa, length), extent) in &inventory.extents {
+            let key = (extent.frame, gpa, length);
+            let references = frames.extent_references.get(&key).copied().ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "HVPatch physical extent {key:?} has no backend reference"
+                ))
+            })?;
+            if references == 0 {
+                return Err(TrapError::Hypervisor(format!(
+                    "HVPatch physical extent {key:?} reference count underflow"
+                )));
+            }
+        }
+        for &frame in &retired {
             reservation
                 .push(carrick_hal::FrameInventoryEvent::RetireFrame {
                     transaction,
@@ -3363,6 +3461,31 @@ impl HvfVmState {
                 })
                 .map_err(Self::reservation_error)?;
         }
+
+        for (&frame, &local) in &local_frame_references {
+            let remaining = frames.references[&frame] - local;
+            if remaining == 0 {
+                frames.references.remove(&frame);
+            } else {
+                frames.references.insert(frame, remaining);
+            }
+        }
+        for (&(gpa, length), extent) in &inventory.extents {
+            let key = (extent.frame, gpa, length);
+            let remaining = frames.extent_references[&key] - 1;
+            if remaining == 0 {
+                frames.extent_references.remove(&key);
+            } else {
+                frames.extent_references.insert(key, remaining);
+            }
+            if retired.contains(&extent.frame)
+                && matches!(extent.backing, InventoryBackingIdentity::SharedFile { .. })
+            {
+                frames.shared.remove(&extent.backing);
+            }
+        }
+        drop(frames);
+        inventory.extents.clear();
         Ok(())
     }
 
@@ -3503,41 +3626,30 @@ impl HvfVmState {
     }
 
     pub(crate) fn retire_process_mappings(&mut self) -> Result<(), TrapError> {
-        let Some((bank_base, bank_size)) = self.process_bank else {
-            let mut inventory = self.frame_inventory.lock();
-            if !inventory.extents.is_empty() {
-                let mut reservation = inventory.retirement_reservation.take().ok_or_else(|| {
-                    TrapError::Hypervisor(
-                        "HVPatch root retirement began without frame inventory reservation"
-                            .to_owned(),
-                    )
-                })?;
-                Self::stage_retirement(&mut inventory, &mut reservation)?;
-                inventory.retirement_commit = Some(reservation.commit(()));
+        // The runtime holds the process-wide HVPatch topology lock across this
+        // method. Select exact extents whose final logical owner is this mm;
+        // global shared aliases are therefore retired by their actual last
+        // owner rather than being omitted merely because they sit outside a
+        // child's private IPA bank.
+        let extents = {
+            let inventory = self.frame_inventory.lock();
+            if inventory.extents.is_empty() {
+                if self.mappings.is_empty() {
+                    return Ok(());
+                }
+                return Err(TrapError::Hypervisor(
+                    "HVPatch process retirement has mappings without frame inventory authority"
+                        .to_owned(),
+                ));
             }
-            return Ok(());
+            if inventory.retirement_reservation.is_none() {
+                return Err(TrapError::Hypervisor(
+                    "HVPatch retirement began without frame inventory reservation".to_owned(),
+                ));
+            }
+            final_exec_physical_extents(&inventory)?
         };
-        let bank_end = bank_base.saturating_add(bank_size);
-        let mut extents: std::collections::BTreeSet<(u64, usize)> = self
-            .mappings
-            .iter()
-            .filter(|mapping| mapping.ipa >= bank_base && mapping.ipa < bank_end)
-            .map(|mapping| (mapping.ipa, mapping.size))
-            .collect();
-        // `mappings` is per-vCPU, while aliases installed by sibling threads
-        // are process-wide.  exit_group can be initiated by any thread; after
-        // its sibling drain those owners are gone and their per-thread Vecs
-        // have deliberately leaked the host backing, so the alias index is the
-        // only complete ledger of stage-2 ranges that still occupy this bank.
-        // Leaving one behind makes the next process to reuse the bank fail
-        // hv_vm_map(HV_ERROR) during exec/fork.
-        extents.extend(
-            alias_registry()
-                .lock()
-                .iter()
-                .filter(|alias| alias.ipa >= bank_base && alias.ipa < bank_end)
-                .map(|alias| (alias.ipa, alias.size)),
-        );
+
         let mut physical_mutated = false;
         for &(ipa, size) in &extents {
             let rc = unsafe { inventory_hv_vm_unmap(ipa, size) };
@@ -3555,24 +3667,33 @@ impl HvfVmState {
         }
         alias_registry()
             .lock()
-            .retain(|alias| alias.ipa < bank_base || alias.ipa >= bank_end);
-        self.mappings
-            .retain(|mapping| mapping.ipa < bank_base || mapping.ipa >= bank_end);
+            .retain(|alias| !extents.contains(&(alias.ipa, alias.size)));
+
+        // A retained shared extent still points at its original host allocation.
+        // Reclaim only exact extents removed above and preserve the remaining
+        // backing until the single VM is finally destroyed.
+        let mut retained_backings = Vec::new();
+        for mapping in std::mem::take(&mut self.mappings) {
+            if extents.contains(&(mapping.ipa, mapping.size)) {
+                drop(mapping);
+            } else {
+                retained_backings.push(mapping);
+            }
+        }
+        std::mem::forget(retained_backings);
         self.process_bank = None;
         self.process_alias_next = None;
+
         let mut inventory = self.frame_inventory.lock();
-        if !inventory.extents.is_empty() {
-            let mut reservation = inventory.retirement_reservation.take().ok_or_else(|| {
-                TrapError::Hypervisor(
-                    "HVPatch retirement began without frame inventory reservation".to_owned(),
-                )
-            })?;
-            if let Err(error) = Self::stage_retirement(&mut inventory, &mut reservation) {
-                eprintln!("carrick: FATAL: stage inventory after HVPatch retirement: {error}");
-                std::process::abort();
-            }
-            inventory.retirement_commit = Some(reservation.commit(()));
+        let mut reservation = inventory.retirement_reservation.take().unwrap_or_else(|| {
+            eprintln!("carrick: FATAL: validated HVPatch retirement reservation disappeared");
+            std::process::abort();
+        });
+        if let Err(error) = Self::stage_retirement(&mut inventory, &mut reservation) {
+            eprintln!("carrick: FATAL: stage inventory after HVPatch retirement: {error}");
+            std::process::abort();
         }
+        inventory.retirement_commit = Some(reservation.commit(()));
         Ok(())
     }
 
@@ -4165,9 +4286,7 @@ impl HvfVmState {
         // SAFETY: `host_addr` is a live MAP_SHARED mmap registered by
         // `add_alias`. Replay succeeds only when HVF confirms the installation;
         // an arbitrary nonzero result is never evidence that a racing mapper won.
-        let rc = unsafe {
-            inventory_hv_vm_map(b.host_addr as *mut std::ffi::c_void, b.ipa, b.size, b.perms)
-        };
+        let rc = unsafe { inventory_hv_vm_map_replay(b) };
         crate::probes::hv_vm_map_alias(
             va,
             b.ipa,
@@ -5158,7 +5277,7 @@ impl HvfVmState {
             )));
         }
         crate::probes::vm_lifecycle(2, -1);
-        let vm_rc = unsafe { applevisor_sys::hv_vm_destroy() };
+        let vm_rc = unsafe { inventory_hv_vm_destroy() };
         if vm_rc != 0 {
             return Err(TrapError::Hypervisor(format!(
                 "shared_wait_park: hv_vm_destroy rc={vm_rc:#x}"
@@ -5187,7 +5306,7 @@ impl HvfVmState {
             ));
         }
         crate::probes::vm_lifecycle(2, -1);
-        let vm_rc = unsafe { applevisor_sys::hv_vm_destroy() };
+        let vm_rc = unsafe { inventory_hv_vm_destroy() };
         if vm_rc != 0 {
             return Err(TrapError::Hypervisor(format!(
                 "release_vm_after_reclaim_park: hv_vm_destroy rc={vm_rc:#x}"
@@ -5550,7 +5669,7 @@ impl HvfVmState {
         );
         let phase_start = std::time::Instant::now();
         crate::probes::vm_lifecycle(2, -1);
-        let vm_destroy_rc = unsafe { applevisor_sys::hv_vm_destroy() };
+        let vm_destroy_rc = unsafe { inventory_hv_vm_destroy() };
         if vm_destroy_rc == 0 {
             record_vm_released();
         }
@@ -6457,32 +6576,19 @@ impl HvfVmState {
     /// while retaining the process-wide HVF VM. The per-thread mapping list
     /// covers the boot image; the alias registry contributes dynamic mappings
     /// installed by any sibling. Duplicate IPA extents are unmap-once.
-    fn unmap_address_space_for_exec(&self) -> Result<(), TrapError> {
-        let mut extents = std::collections::BTreeSet::new();
-        if let Some((bank_base, bank_size)) = self.process_bank {
-            let bank_end = bank_base.saturating_add(bank_size);
-            extents.extend(
-                self.mappings
-                    .iter()
-                    .filter(|mapping| mapping.ipa >= bank_base && mapping.ipa < bank_end)
-                    .map(|mapping| (mapping.ipa, mapping.size)),
-            );
-            // A process's aliases are spread across its vCPU-local mapping
-            // Vecs. Siblings have been drained before exec, so collect their
-            // remaining stage-2 ranges from the bank-scoped global index.
-            extents.extend(
-                alias_registry()
-                    .lock()
-                    .iter()
-                    .filter(|alias| alias.ipa >= bank_base && alias.ipa < bank_end)
-                    .map(|alias| (alias.ipa, alias.size)),
-            );
-        } else {
-            extents.extend(self.mappings.iter().map(|m| (m.ipa, m.size)));
-            extents.extend(alias_registry().lock().iter().map(|m| (m.ipa, m.size)));
-        }
+    fn unmap_address_space_for_exec(
+        &self,
+    ) -> Result<std::collections::BTreeSet<(u64, usize)>, TrapError> {
+        // The backend inventory, not a vCPU-local mapping Vec or the global
+        // alias index, is the exact logical ownership ledger. A physical extent
+        // shared by another live mm stays installed until the last logical
+        // reference retires. The runtime holds its process-wide HVPatch topology
+        // lock across this selection, every unmap below, and stage_retirement;
+        // alias map, fork materialization, and process retirement take that same
+        // lock, so the shared reference ledger cannot change between them.
+        let extents = final_exec_physical_extents(&self.frame_inventory.lock())?;
         let mut physical_mutated = false;
-        for (ipa, size) in extents {
+        for &(ipa, size) in &extents {
             crate::probes::hvpatch_exec_stage2(
                 carrick_observability::probes::HvpatchExecStage2::new(
                     carrick_observability::probes::HvpatchExecStage2Phase::UnmapBegin,
@@ -6514,7 +6620,7 @@ impl HvfVmState {
             }
             physical_mutated = true;
         }
-        Ok(())
+        Ok(extents)
     }
 
     fn bank_exec_plan(&self, plan: &GuestMappingPlan) -> Result<GuestMappingPlan, TrapError> {
@@ -6801,11 +6907,11 @@ impl HvfVmState {
         // user-visible output unreadable.
         let was_forked_child = self.is_forked_child;
         let address_space_teardown_started = std::time::Instant::now();
-        if self.persistent_vm_lifecycle {
+        let retired_physical_extents = if self.persistent_vm_lifecycle {
             // The vCPU is stopped at the execve syscall exit and every sibling
-            // has already retired. Remove the old process address space from the
-            // live VM, then reuse this vCPU and VM for the replacement image.
-            self.unmap_address_space_for_exec()?;
+            // has already retired. Remove only extents whose final logical
+            // references belong to this old mm.
+            let extents = self.unmap_address_space_for_exec()?;
             if let Some((retired, _)) = inventory_reservations.as_mut() {
                 let mut inventory = self.frame_inventory.lock();
                 if let Err(error) = Self::stage_retirement(&mut inventory, retired) {
@@ -6813,6 +6919,7 @@ impl HvfVmState {
                     std::process::abort();
                 }
             }
+            extents
         } else {
             // Mature VMM behavior: tear down the current HVF VM and rebuild it.
             let inherited_vcpu_id = vcpu.id();
@@ -6821,7 +6928,7 @@ impl HvfVmState {
                 vcpu_destroyed(inherited_vcpu_id);
             }
             crate::probes::vm_lifecycle(2, -1);
-            let vm_destroy_rc = unsafe { applevisor_sys::hv_vm_destroy() };
+            let vm_destroy_rc = unsafe { inventory_hv_vm_destroy() };
             if vm_destroy_rc == 0 {
                 record_vm_released();
             }
@@ -6834,21 +6941,22 @@ impl HvfVmState {
             // Swap the new VM + vCPU into place WITHOUT running Drop on the old.
             std::mem::forget(std::mem::replace(vcpu, new_vcpu));
             replace_destroyed_vm(self, new_vm);
-        }
+            std::collections::BTreeSet::new()
+        };
         emit_replace_stage(
             carrick_observability::probes::HvpatchExecReplaceStagePhase::AddressSpaceTeardown,
             address_space_teardown_started,
         );
-        // execve replaces the WHOLE address space: clear every dynamic alias
-        // after persistent-mode unmap has consumed its extents.
+        // Retain aliases still backed by another live mm. Mature VMM destroyed
+        // the whole VM; persistent HVPatch removes only physical extents whose
+        // final logical references retired above.
         let alias_cleanup_started = std::time::Instant::now();
-        if self.process_bank.is_none() {
-            alias_registry().lock().clear();
-        } else if let Some((bank_base, bank_size)) = self.process_bank {
-            let bank_end = bank_base.saturating_add(bank_size);
+        if self.persistent_vm_lifecycle {
             alias_registry()
                 .lock()
-                .retain(|alias| alias.ipa < bank_base || alias.ipa >= bank_end);
+                .retain(|alias| !retired_physical_extents.contains(&(alias.ipa, alias.size)));
+        } else {
+            alias_registry().lock().clear();
         }
         emit_replace_stage(
             carrick_observability::probes::HvpatchExecReplaceStagePhase::AliasCleanup,
@@ -6856,10 +6964,18 @@ impl HvfVmState {
         );
         let drop_backings_started = std::time::Instant::now();
         if self.persistent_vm_lifecycle {
-            // Stage-2 no longer references these ranges and every alias index was
-            // cleared above, so reclaim host mappings owned by the execing thread.
-            // Unowned sibling projections drop as no-ops.
-            drop(std::mem::take(&mut self.mappings));
+            // Reclaim only host mappings whose exact stage-2 extents were
+            // removed. A shared extent retained for another mm still points at
+            // this host allocation, so preserve that backing until VM teardown.
+            let mut retained_backings = Vec::new();
+            for mapping in std::mem::take(&mut self.mappings) {
+                if retired_physical_extents.contains(&(mapping.ipa, mapping.size)) {
+                    drop(mapping);
+                } else {
+                    retained_backings.push(mapping);
+                }
+            }
+            std::mem::forget(retained_backings);
         } else {
             // Preserve mature VMM's historical leak-until-process-exit discipline:
             // the old VM was raw-destroyed and sibling/alias projections may still
@@ -7316,14 +7432,7 @@ impl HvfInner {
                 {
                     // SAFETY: `host_addr` is a live MAP_SHARED mmap registered
                     // by add_alias. Only rc=0 proves replay installation.
-                    let rc = unsafe {
-                        inventory_hv_vm_map(
-                            b.host_addr as *mut std::ffi::c_void,
-                            b.ipa,
-                            b.size,
-                            b.perms,
-                        )
-                    };
+                    let rc = unsafe { inventory_hv_vm_map_replay(b) };
                     crate::probes::hv_vm_map_alias(
                         exit.exception.virtual_address,
                         b.ipa,
@@ -7667,10 +7776,47 @@ unsafe fn inventory_hv_vm_map(
     unsafe { applevisor_sys::hv_vm_map(host, ipa, size, permissions) }
 }
 
+/// Serialize lazy replay and make a sibling that lost the race observe the
+/// exact already-installed extent as success without accepting arbitrary HVF
+/// errors. The marker is cleared on unmap and every VM destruction.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn inventory_hv_vm_map_replay(backing: AliasBacking) -> applevisor_sys::hv_return_t {
+    let key = replay_mapping_key(backing);
+    let mut installed = replay_mappings().lock();
+    if installed.contains(&key) {
+        return 0;
+    }
+    let result = unsafe {
+        inventory_hv_vm_map(
+            backing.host_addr as *mut std::ffi::c_void,
+            backing.ipa,
+            backing.size,
+            backing.perms,
+        )
+    };
+    if result == 0 {
+        installed.insert(key);
+    }
+    result
+}
+
 /// Sole raw Hypervisor.framework stage-2 unmap boundary.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe fn inventory_hv_vm_unmap(ipa: u64, size: usize) -> applevisor_sys::hv_return_t {
-    unsafe { applevisor_sys::hv_vm_unmap(ipa, size) }
+    let result = unsafe { applevisor_sys::hv_vm_unmap(ipa, size) };
+    if result == 0 {
+        forget_replay_extent(ipa, size);
+    }
+    result
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn inventory_hv_vm_destroy() -> applevisor_sys::hv_return_t {
+    let result = unsafe { applevisor_sys::hv_vm_destroy() };
+    if result == 0 {
+        clear_replay_mappings();
+    }
+    result
 }
 
 #[cfg(test)]
@@ -7690,6 +7836,13 @@ fn raw_hvf_stage2_calls_are_inventory_gated() {
             .count(),
         1,
         "raw hv_vm_unmap must appear only in inventory_hv_vm_unmap"
+    );
+    assert_eq!(
+        source
+            .matches(concat!("inventory_hv_vm_map_replay", "(b)"))
+            .count(),
+        2,
+        "both lazy replay paths must use exact serialized replay"
     );
 }
 
@@ -8793,8 +8946,100 @@ mod vm_create_admission_tests {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg(test)]
+mod frame_inventory_backend_tests {
+    use super::*;
+
+    fn id(raw: u64) -> std::num::NonZeroU64 {
+        std::num::NonZeroU64::new(raw).unwrap()
+    }
+
+    #[test]
+    fn exec_keeps_a_physical_extent_owned_by_another_mm() {
+        let shared = carrick_hal::FrameId::from_kernel_allocation(id(1));
+        let private = carrick_hal::FrameId::from_kernel_allocation(id(2));
+        let mut inventory = HvpatchFrameInventory::default();
+        inventory.extents.insert(
+            (0x4000, 0x4000),
+            InventoryExtent {
+                frame: shared,
+                mapping: carrick_hal::MappingId::from_kernel_allocation(id(3)),
+                backing: InventoryBackingIdentity::SharedFile {
+                    device: 1,
+                    inode: 2,
+                    offset: 0,
+                    length: 0x4000,
+                },
+            },
+        );
+        inventory.extents.insert(
+            (0x8000, 0x4000),
+            InventoryExtent {
+                frame: private,
+                mapping: carrick_hal::MappingId::from_kernel_allocation(id(4)),
+                backing: InventoryBackingIdentity::Private(1),
+            },
+        );
+        {
+            let mut frames = inventory.frames.lock();
+            frames.references.insert(shared, 2);
+            frames.references.insert(private, 1);
+            frames.extent_references.insert((shared, 0x4000, 0x4000), 2);
+            frames
+                .extent_references
+                .insert((private, 0x8000, 0x4000), 1);
+        }
+
+        let extents = final_exec_physical_extents(&inventory).unwrap();
+        assert_eq!(
+            extents,
+            std::collections::BTreeSet::from([(0x8000, 0x4000)])
+        );
+
+        // The same shared frame may also be mapped at another IPA. Once this
+        // exact IPA has no other owner it is independently removable even while
+        // the frame itself remains live.
+        inventory
+            .frames
+            .lock()
+            .extent_references
+            .insert((shared, 0x4000, 0x4000), 1);
+        let extents = final_exec_physical_extents(&inventory).unwrap();
+        assert_eq!(
+            extents,
+            std::collections::BTreeSet::from([(0x4000, 0x4000), (0x8000, 0x4000)])
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(test)]
 mod alias_remap_limiter_tests {
     use super::*;
+
+    #[test]
+    fn exact_replay_marker_turns_a_sibling_race_into_success() {
+        let backing = AliasBacking {
+            start: 0x1000,
+            ipa: crate::memory::LINUX_ALIAS_IPA_BASE + 0x7f00_0000,
+            host_addr: 0x1234_0000,
+            size: HVF_PAGE_SIZE as usize,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+            guest_writable: true,
+            guest_shared: false,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+        };
+        let key = replay_mapping_key(backing);
+        replay_mappings().lock().insert(key);
+
+        // The exact installed marker returns before touching Hypervisor.framework.
+        let result = unsafe { inventory_hv_vm_map_replay(backing) };
+        assert_eq!(result, 0);
+        assert!(replay_mappings().lock().contains(&key));
+
+        forget_replay_extent(backing.ipa, backing.size);
+        assert!(!replay_mappings().lock().contains(&key));
+    }
 
     #[test]
     fn caps_repeated_faults_on_one_alias_backing() {
@@ -8805,6 +9050,43 @@ mod alias_remap_limiter_tests {
             assert!(limiter.allow(ipa));
         }
         assert!(!limiter.allow(ipa));
+    }
+
+    #[test]
+    fn alias_replacement_keeps_one_replay_identity_per_ipa() {
+        let original = AliasBacking {
+            start: 0x1000,
+            ipa: crate::memory::LINUX_ALIAS_IPA_BASE + 0x7e00_0000,
+            host_addr: 0x1234_0000,
+            size: HVF_PAGE_SIZE as usize,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+            guest_writable: true,
+            guest_shared: false,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+        };
+        let replacement = AliasBacking {
+            host_addr: 0x5678_0000,
+            ..original
+        };
+        register_shared_alias(original);
+        register_shared_alias(replacement);
+
+        let replay = replay_mappings().lock();
+        assert!(!replay.contains(&replay_mapping_key(original)));
+        assert!(replay.contains(&replay_mapping_key(replacement)));
+        assert_eq!(
+            replay
+                .iter()
+                .filter(|(ipa, _, _, _)| *ipa == original.ipa)
+                .count(),
+            1
+        );
+        drop(replay);
+        forget_replay_extent(original.ipa, original.size);
+        alias_registry()
+            .lock()
+            .retain(|alias| alias.ipa != original.ipa);
     }
 
     #[test]

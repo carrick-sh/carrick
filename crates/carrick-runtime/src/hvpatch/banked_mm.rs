@@ -293,7 +293,7 @@ impl From<AsidError> for BankedMmError {
 /// to an older root under concurrent observation.
 #[derive(Debug)]
 pub(crate) struct BankedMmBackend {
-    state: Arc<BankedMmState>,
+    binding: RwLock<MmBinding>,
     inventory: RwLock<Option<InventoryBinding>>,
 }
 
@@ -305,10 +305,22 @@ struct InventoryBinding {
 
 impl BankedMmBackend {
     pub(crate) fn new(state: Arc<BankedMmState>) -> Self {
+        Self::for_binding(state.binding())
+    }
+
+    fn for_binding(binding: MmBinding) -> Self {
         Self {
-            state,
+            binding: RwLock::new(binding),
             inventory: RwLock::new(None),
         }
+    }
+
+    pub(crate) fn exec_observer(&self) -> Arc<Self> {
+        Arc::new(Self::for_binding(self.observed_binding()))
+    }
+
+    pub(crate) fn publish_binding(&self, binding: MmBinding) {
+        *self.binding.write() = binding;
     }
 
     pub(crate) fn bind_inventory(
@@ -322,8 +334,13 @@ impl BankedMmBackend {
         });
     }
 
+    #[cfg(test)]
+    pub(crate) fn inventory_mm_for_tests(&self) -> Option<crate::kernel::MmId> {
+        self.inventory.read().as_ref().map(|binding| binding.mm)
+    }
+
     fn observed_binding(&self) -> MmBinding {
-        self.state.binding()
+        *self.binding.read()
     }
 }
 
@@ -374,23 +391,23 @@ mod tests {
     }
 
     #[test]
-    fn observes_live_binding_and_keeps_last_binding_after_retirement() {
+    fn old_observer_keeps_its_binding_after_exec_and_retirement() {
         let task = root_key();
         let (table, backend) = BankResources::new_root(0x8000).expect("root table");
         table.publish_root(task).expect("publish root");
         let initial = backend.binding();
 
-        table.publish_exec(task, 0xc000).expect("replace root");
+        let replaced = table.publish_exec(task, 0xc000).expect("replace root");
         let retired = table.retire(task).expect("retire");
-        let replaced = backend.binding();
         assert_eq!(replaced.asid, initial.asid);
         assert_ne!(replaced.stage1_root, initial.stage1_root);
         assert_eq!(
             replaced.ttbr0,
             crate::kernel::Ttbr0::for_aarch64(replaced.asid, replaced.stage1_root)
         );
-        assert_eq!(backend.binding(), replaced);
+        assert_eq!(backend.binding(), initial);
         table.acknowledge_tlb_flush(retired).expect("ack retire");
+        assert_eq!(backend.binding(), initial);
     }
 
     #[test]
