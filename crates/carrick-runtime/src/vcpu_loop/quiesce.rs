@@ -1277,8 +1277,8 @@ where
                 if let Some(address) = child_tid_addr
                     && let Err(error) = child_engine.write_bytes(address, &child_pid.to_le_bytes())
                 {
-                    let _ = ready_tx.send(Err(error.to_string()));
-                    return;
+                    tracing::error!(child_pid, %error, "materialized child TID copyout diverged from preflight");
+                    std::process::abort();
                 }
                 if ready_tx.send(Ok(child_inventory_commit)).is_err() {
                     return;
@@ -1422,32 +1422,24 @@ where
             (Some(_), None) => false,
         };
         if !parent_outputs_published {
-            let _ = start_tx.send(None);
-            let _ = handle.join();
-            restore_outputs(engine);
-            rollback_pidfd(installed_pidfd);
-            if quiesced {
-                process_barrier.end_quiesce();
-            }
-            process_barrier.end_fork();
-            return Ok(Some(crate::linux_abi::LINUX_EFAULT.guest_retval()));
+            tracing::error!(
+                parent_pid,
+                child_pid,
+                "parent fork copyout diverged from successful preflight after child materialization"
+            );
+            std::process::abort();
         }
 
         fork_stage_started = Instant::now();
         let published = match prepared_fork.commit() {
             Ok(published) => published,
             Err(error) => {
-                let _ = start_tx.send(None);
-                let _ = handle.join();
-                restore_outputs(engine);
-                rollback_pidfd(installed_pidfd);
-                if quiesced {
-                    process_barrier.end_quiesce();
-                }
-                process_barrier.end_fork();
-                return Err(RuntimeError::Configuration(format!(
-                    "publish authoritative hvpatch child: {error}"
-                )));
+                tracing::error!(
+                    child_pid,
+                    %error,
+                    "authoritative child publication failed after frame inventory commit"
+                );
+                std::process::abort();
             }
         };
         let (child_context, vfork_parent_wait) = match published.into_parts() {
