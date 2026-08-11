@@ -5,7 +5,7 @@ use carrick_hal::{FrameEventCapacity, FrameInventoryReservation, ThreadId};
 use parking_lot::{Condvar, Mutex, RwLock};
 
 use super::address::MmBackend;
-use super::frame_inventory::{self, FrameInventoryAuthority, FrameInventoryReserveError};
+use super::frame_inventory::{FrameInventoryAuthority, FrameInventoryReserveError};
 use super::ids::{LinuxTid, ObjectIdError, ObjectIdRegistry, ProcessGroupId, SessionId, TaskId};
 use super::objects::{
     Credentials, FileTable, FsContext, Mm, ObjectGraphError, ProcessGroup, Session, Sighand, Task,
@@ -491,7 +491,7 @@ impl Kernel {
         mapping_candidates: usize,
         event_capacity: FrameEventCapacity,
     ) -> Result<FrameInventoryReservation, FrameInventoryReserveError> {
-        frame_inventory::reserve(
+        self.frame_inventory.reserve(
             &self.object_ids,
             frame_candidates,
             mapping_candidates,
