@@ -6,14 +6,14 @@
 //! by one from the greatest mapping generation ever observed for that frame.
 //! IDs and generations never restart after unmap or retirement.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
 use carrick_guest_mem::Gpa;
 use carrick_hal::{
     FrameEventCapacity, FrameId, FrameInventoryBatch, FrameInventoryBatchError,
-    FrameInventoryEvent, FrameInventoryReservation, FrameLength, KernelTransactionId,
-    MappingGeneration, MappingId, MemPerms,
+    FrameInventoryCommit, FrameInventoryEvent, FrameInventoryReservation, FrameLength,
+    KernelTransactionId, MappingGeneration, MappingId, MemPerms,
 };
 use parking_lot::Mutex;
 
@@ -52,17 +52,21 @@ pub struct FrameInventoryAuthority {
 #[derive(Debug, Default, Eq, PartialEq)]
 struct InventoryState {
     revision: u64,
-    transactions: BTreeSet<KernelTransactionId>,
-    known_frames: BTreeSet<FrameId>,
+    reservations: BTreeMap<KernelTransactionId, ReservationRecord>,
     frames: BTreeMap<FrameId, FrameEntry>,
     mappings: BTreeMap<MappingId, MappingEntry>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
+struct ReservationRecord {
+    frames: Vec<FrameId>,
+    mappings: Vec<MappingId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FrameEntry {
     length: FrameLength,
-    mappings: BTreeSet<MappingId>,
-    greatest_generation: MappingGeneration,
+    mapping_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,7 +84,6 @@ struct MappingEntry {
 enum MappingState {
     Prepared(KernelTransactionId),
     Published,
-    Unmapped,
 }
 
 /// Transaction-local copy-on-write view. Only touched mappings and frames are
@@ -89,14 +92,13 @@ enum MappingState {
 struct InventoryOverlay<'a> {
     base: &'a InventoryState,
     frames: BTreeMap<FrameId, Option<FrameEntry>>,
-    mappings: BTreeMap<MappingId, MappingEntry>,
-    new_frames: BTreeSet<FrameId>,
+    mappings: BTreeMap<MappingId, Option<MappingEntry>>,
+    last_unmapped: BTreeMap<FrameId, MappingGeneration>,
 }
 
 struct InventoryChanges {
     frames: BTreeMap<FrameId, Option<FrameEntry>>,
-    mappings: BTreeMap<MappingId, MappingEntry>,
-    new_frames: BTreeSet<FrameId>,
+    mappings: BTreeMap<MappingId, Option<MappingEntry>>,
 }
 
 impl<'a> InventoryOverlay<'a> {
@@ -105,26 +107,33 @@ impl<'a> InventoryOverlay<'a> {
             base,
             frames: BTreeMap::new(),
             mappings: BTreeMap::new(),
-            new_frames: BTreeSet::new(),
+            last_unmapped: BTreeMap::new(),
         }
     }
 
     fn mapping(&self, mapping: MappingId) -> Option<&MappingEntry> {
-        self.mappings
-            .get(&mapping)
-            .or_else(|| self.base.mappings.get(&mapping))
+        match self.mappings.get(&mapping) {
+            Some(Some(entry)) => Some(entry),
+            Some(None) => None,
+            None => self.base.mappings.get(&mapping),
+        }
     }
 
     fn mapping_mut(&mut self, mapping: MappingId) -> Option<&mut MappingEntry> {
         if !self.mappings.contains_key(&mapping) {
             let entry = *self.base.mappings.get(&mapping)?;
-            self.mappings.insert(mapping, entry);
+            self.mappings.insert(mapping, Some(entry));
         }
-        self.mappings.get_mut(&mapping)
+        self.mappings.get_mut(&mapping)?.as_mut()
     }
 
     fn insert_mapping(&mut self, mapping: MappingId, entry: MappingEntry) {
-        self.mappings.insert(mapping, entry);
+        self.mappings.insert(mapping, Some(entry));
+    }
+
+    fn unmap_mapping(&mut self, mapping: MappingId, frame: FrameId, generation: MappingGeneration) {
+        self.mappings.insert(mapping, None);
+        self.last_unmapped.insert(frame, generation);
     }
 
     fn frame(&self, frame: FrameId) -> Option<&FrameEntry> {
@@ -137,18 +146,13 @@ impl<'a> InventoryOverlay<'a> {
 
     fn frame_mut(&mut self, frame: FrameId) -> Option<&mut FrameEntry> {
         if !self.frames.contains_key(&frame) {
-            let entry = self.base.frames.get(&frame)?.clone();
+            let entry = *self.base.frames.get(&frame)?;
             self.frames.insert(frame, Some(entry));
         }
         self.frames.get_mut(&frame)?.as_mut()
     }
 
-    fn frame_is_known(&self, frame: FrameId) -> bool {
-        self.new_frames.contains(&frame) || self.base.known_frames.contains(&frame)
-    }
-
     fn insert_frame(&mut self, frame: FrameId, entry: FrameEntry) {
-        self.new_frames.insert(frame);
         self.frames.insert(frame, Some(entry));
     }
 
@@ -160,7 +164,6 @@ impl<'a> InventoryOverlay<'a> {
         InventoryChanges {
             frames: self.frames,
             mappings: self.mappings,
-            new_frames: self.new_frames,
         }
     }
 }
@@ -170,24 +173,62 @@ impl FrameInventoryAuthority {
         Self::default()
     }
 
-    /// Apply one backend batch atomically after backend locks have been
-    /// released. Validation runs against a private candidate state; no rejected
-    /// batch changes rows, transaction history, or revision.
-    pub fn apply(&self, mm: MmId, batch: FrameInventoryBatch) -> Result<u64, FrameInventoryError> {
-        self.apply_inner(mm, batch, None)
+    /// Allocate and register the only candidate IDs this transaction may
+    /// publish. A forged HAL batch therefore cannot become authoritative.
+    pub fn reserve(
+        &self,
+        ids: &ObjectIdRegistry,
+        frame_candidates: usize,
+        mapping_candidates: usize,
+        event_capacity: FrameEventCapacity,
+    ) -> Result<FrameInventoryReservation, FrameInventoryReserveError> {
+        let (reservation, record) =
+            prepare_reservation(ids, frame_candidates, mapping_candidates, event_capacity)?;
+        let transaction = reservation.transaction();
+        if self
+            .state
+            .lock()
+            .reservations
+            .insert(transaction, record)
+            .is_some()
+        {
+            return Err(FrameInventoryReserveError::DuplicateTransaction);
+        }
+        Ok(reservation)
     }
 
-    fn apply_inner(
+    /// Release provenance after backend work fails before publication.
+    /// Candidate IDs remain burned in the monotonic registry.
+    pub fn abandon(&self, transaction: KernelTransactionId) -> bool {
+        self.state
+            .lock()
+            .reservations
+            .remove(&transaction)
+            .is_some()
+    }
+
+    /// Apply one backend commit atomically after backend locks are released.
+    pub fn apply<T>(
         &self,
         mm: MmId,
-        batch: FrameInventoryBatch,
+        commit: FrameInventoryCommit<T>,
+    ) -> Result<(T, u64), FrameInventoryError> {
+        self.apply_inner(mm, commit, None)
+    }
+
+    fn apply_inner<T>(
+        &self,
+        mm: MmId,
+        commit: FrameInventoryCommit<T>,
         fail_before_event: Option<usize>,
-    ) -> Result<u64, FrameInventoryError> {
+    ) -> Result<(T, u64), FrameInventoryError> {
+        let (outcome, batch) = commit.into_parts();
         let mut state = self.state.lock();
         let transaction = batch.transaction();
-        if state.transactions.contains(&transaction) {
-            return Err(FrameInventoryError::DuplicateTransaction(transaction));
-        }
+        let reservation = state
+            .reservations
+            .get(&transaction)
+            .ok_or(FrameInventoryError::UnreservedTransaction(transaction))?;
         if batch.events().is_empty() {
             return Err(FrameInventoryError::EmptyBatch);
         }
@@ -200,12 +241,12 @@ impl FrameInventoryAuthority {
             if fail_before_event == Some(index) {
                 return Err(FrameInventoryError::InjectedFailure(index));
             }
-            apply_event(&mut candidate, mm, transaction, event)?;
+            apply_event(&mut candidate, reservation, mm, transaction, event)?;
         }
         if fail_before_event == Some(batch.events().len()) {
             return Err(FrameInventoryError::InjectedFailure(batch.events().len()));
         }
-        if candidate.mappings.values().any(|mapping| {
+        if candidate.mappings.values().flatten().any(|mapping| {
             matches!(mapping.state, MappingState::Prepared(owner) if owner == transaction)
         }) {
             return Err(FrameInventoryError::UnpublishedMapping);
@@ -221,11 +262,19 @@ impl FrameInventoryAuthority {
                 }
             }
         }
-        state.mappings.extend(changes.mappings);
-        state.known_frames.extend(changes.new_frames);
-        state.transactions.insert(transaction);
+        for (mapping, entry) in changes.mappings {
+            match entry {
+                Some(entry) => {
+                    state.mappings.insert(mapping, entry);
+                }
+                None => {
+                    state.mappings.remove(&mapping);
+                }
+            }
+        }
+        state.reservations.remove(&transaction);
         state.revision = next_revision;
-        Ok(next_revision)
+        Ok((outcome, next_revision))
     }
 
     pub fn snapshot(&self) -> FrameInventorySnapshot {
@@ -237,18 +286,19 @@ impl FrameInventoryAuthority {
     }
 
     #[cfg(test)]
-    fn apply_with_failpoint(
+    fn apply_with_failpoint<T>(
         &self,
         mm: MmId,
-        batch: FrameInventoryBatch,
+        commit: FrameInventoryCommit<T>,
         fail_before_event: usize,
-    ) -> Result<u64, FrameInventoryError> {
-        self.apply_inner(mm, batch, Some(fail_before_event))
+    ) -> Result<(T, u64), FrameInventoryError> {
+        self.apply_inner(mm, commit, Some(fail_before_event))
     }
 }
 
 fn apply_event(
     state: &mut InventoryOverlay<'_>,
+    reservation: &ReservationRecord,
     mm: MmId,
     transaction: KernelTransactionId,
     event: FrameInventoryEvent,
@@ -266,6 +316,12 @@ fn apply_event(
             permissions,
             ..
         } => {
+            if !reservation.mappings.contains(&mapping) {
+                return Err(FrameInventoryError::UnreservedMapping(mapping));
+            }
+            if gpa.0.checked_add(length.raw()).is_none() {
+                return Err(FrameInventoryError::ExtentOverflow { gpa, length });
+            }
             if generation.raw() != 1 {
                 return Err(FrameInventoryError::GenerationMismatch {
                     mapping,
@@ -285,15 +341,14 @@ fn apply_event(
                 });
             }
             if state.frame(frame).is_none() {
-                if state.frame_is_known(frame) {
-                    return Err(FrameInventoryError::RetiredFrame(frame));
+                if !reservation.frames.contains(&frame) {
+                    return Err(FrameInventoryError::UnreservedFrame(frame));
                 }
                 state.insert_frame(
                     frame,
                     FrameEntry {
                         length,
-                        mappings: BTreeSet::new(),
-                        greatest_generation: generation,
+                        mapping_count: 0,
                     },
                 );
             }
@@ -307,10 +362,10 @@ fn apply_event(
                     actual: length,
                 });
             }
-            frame_entry.mappings.insert(mapping);
-            if generation > frame_entry.greatest_generation {
-                frame_entry.greatest_generation = generation;
-            }
+            frame_entry.mapping_count = frame_entry
+                .mapping_count
+                .checked_add(1)
+                .ok_or(FrameInventoryError::MappingCountExhausted(frame))?;
             state.insert_mapping(
                 mapping,
                 MappingEntry {
@@ -353,19 +408,10 @@ fn apply_event(
             permissions,
             ..
         } => {
-            let frame_id = {
-                let entry = live_mapping_mut(state, mm, mapping)?;
-                require_next_generation(mapping, entry.generation, generation)?;
-                entry.generation = generation;
-                entry.permissions = permissions;
-                entry.frame
-            };
-            let frame = state
-                .frame_mut(frame_id)
-                .ok_or(FrameInventoryError::RetiredFrame(frame_id))?;
-            if generation > frame.greatest_generation {
-                frame.greatest_generation = generation;
-            }
+            let entry = live_mapping_mut(state, mm, mapping)?;
+            require_next_generation(mapping, entry.generation, generation)?;
+            entry.generation = generation;
+            entry.permissions = permissions;
         }
         FrameInventoryEvent::UnmapMapping {
             mapping,
@@ -375,17 +421,16 @@ fn apply_event(
             let frame_id = {
                 let entry = live_mapping_mut(state, mm, mapping)?;
                 require_next_generation(mapping, entry.generation, generation)?;
-                entry.generation = generation;
-                entry.state = MappingState::Unmapped;
                 entry.frame
             };
             let frame = state
                 .frame_mut(frame_id)
                 .ok_or(FrameInventoryError::RetiredFrame(frame_id))?;
-            frame.mappings.remove(&mapping);
-            if generation > frame.greatest_generation {
-                frame.greatest_generation = generation;
-            }
+            frame.mapping_count = frame
+                .mapping_count
+                .checked_sub(1)
+                .ok_or(FrameInventoryError::MappingCountUnderflow(frame_id))?;
+            state.unmap_mapping(mapping, frame_id, generation);
         }
         FrameInventoryEvent::RetireFrame {
             frame, generation, ..
@@ -393,10 +438,14 @@ fn apply_event(
             let entry = state
                 .frame(frame)
                 .ok_or(FrameInventoryError::RetiredFrame(frame))?;
-            if !entry.mappings.is_empty() {
+            if entry.mapping_count != 0 {
                 return Err(FrameInventoryError::FrameStillMapped(frame));
             }
-            let expected = next_generation(entry.greatest_generation)?;
+            let expected = state
+                .last_unmapped
+                .get(&frame)
+                .copied()
+                .ok_or(FrameInventoryError::RetireWithoutUnmap(frame))?;
             if generation != expected {
                 return Err(FrameInventoryError::FrameGenerationMismatch {
                     frame,
@@ -483,20 +532,10 @@ fn snapshot_state(state: &InventoryState, mm_filter: Option<MmId>) -> FrameInven
                 })
         })
         .collect();
-    let mut joins: BTreeMap<FrameId, Vec<MappingId>> = state
-        .frames
-        .keys()
-        .filter(|frame| {
-            mm_filter.is_none_or(|mm| {
-                state.mappings.values().any(|mapping| {
-                    mapping.frame == **frame
-                        && mapping.mm == mm
-                        && mapping.state == MappingState::Published
-                })
-            })
-        })
-        .map(|frame| (*frame, Vec::new()))
-        .collect();
+    let mut joins: BTreeMap<FrameId, Vec<MappingId>> = BTreeMap::new();
+    if mm_filter.is_none() {
+        joins.extend(state.frames.keys().map(|frame| (*frame, Vec::new())));
+    }
     for mapping in &mappings {
         joins
             .entry(mapping.frame)
@@ -518,12 +557,12 @@ fn snapshot_state(state: &InventoryState, mm_filter: Option<MmId>) -> FrameInven
     }
 }
 
-pub(super) fn reserve(
+fn prepare_reservation(
     ids: &ObjectIdRegistry,
     frame_candidates: usize,
     mapping_candidates: usize,
     event_capacity: FrameEventCapacity,
-) -> Result<FrameInventoryReservation, FrameInventoryReserveError> {
+) -> Result<(FrameInventoryReservation, ReservationRecord), FrameInventoryReserveError> {
     if frame_candidates > event_capacity.get() || mapping_candidates > event_capacity.get() {
         return Err(FrameInventoryReserveError::CandidateCountExceedsEvents);
     }
@@ -535,16 +574,33 @@ pub(super) fn reserve(
     mappings
         .try_reserve_exact(mapping_candidates)
         .map_err(|_| FrameInventoryReserveError::AllocationFailed)?;
+    let mut recorded_frames = Vec::new();
+    recorded_frames
+        .try_reserve_exact(frame_candidates)
+        .map_err(|_| FrameInventoryReserveError::AllocationFailed)?;
+    let mut recorded_mappings = Vec::new();
+    recorded_mappings
+        .try_reserve_exact(mapping_candidates)
+        .map_err(|_| FrameInventoryReserveError::AllocationFailed)?;
     let transaction = ids.transaction_id()?;
     let batch = FrameInventoryBatch::prepare(transaction, event_capacity)?;
     for _ in 0..frame_candidates {
-        frames.push(ids.frame_id()?);
+        let frame = ids.frame_id()?;
+        frames.push(frame);
+        recorded_frames.push(frame);
     }
     for _ in 0..mapping_candidates {
-        mappings.push(ids.mapping_id()?);
+        let mapping = ids.mapping_id()?;
+        mappings.push(mapping);
+        recorded_mappings.push(mapping);
     }
-    Ok(FrameInventoryReservation::from_kernel_candidates(
-        batch, frames, mappings,
+    let record = ReservationRecord {
+        frames: recorded_frames,
+        mappings: recorded_mappings,
+    };
+    Ok((
+        FrameInventoryReservation::from_kernel_candidates(batch, frames, mappings),
+        record,
     ))
 }
 
@@ -554,6 +610,8 @@ pub enum FrameInventoryReserveError {
     CandidateCountExceedsEvents,
     #[error("frame inventory candidate storage allocation failed")]
     AllocationFailed,
+    #[error("frame inventory transaction candidate was already registered")]
+    DuplicateTransaction,
     #[error(transparent)]
     ObjectId(#[from] ObjectIdError),
     #[error(transparent)]
@@ -564,8 +622,12 @@ pub enum FrameInventoryReserveError {
 pub enum FrameInventoryError {
     #[error("frame inventory batch is empty")]
     EmptyBatch,
-    #[error("frame inventory transaction {0:?} was already applied")]
-    DuplicateTransaction(KernelTransactionId),
+    #[error("frame inventory transaction {0:?} was not reserved by this authority")]
+    UnreservedTransaction(KernelTransactionId),
+    #[error("frame {0:?} was not reserved by this authority")]
+    UnreservedFrame(FrameId),
+    #[error("mapping {0:?} was not reserved by this authority")]
+    UnreservedMapping(MappingId),
     #[error("frame inventory event transaction does not match its batch")]
     TransactionMismatch,
     #[error("mapping {0:?} is duplicated")]
@@ -592,6 +654,8 @@ pub enum FrameInventoryError {
         expected: u64,
         actual: u64,
     },
+    #[error("mapping extent at {gpa:?} with length {length:?} overflows the GPA domain")]
+    ExtentOverflow { gpa: Gpa, length: FrameLength },
     #[error("frame {frame:?} length {actual:?} does not match {expected:?}")]
     FrameLengthMismatch {
         frame: FrameId,
@@ -602,10 +666,16 @@ pub enum FrameInventoryError {
     RetiredFrame(FrameId),
     #[error("frame {0:?} still has live mappings")]
     FrameStillMapped(FrameId),
+    #[error("frame {0:?} retirement is not paired with its last unmap")]
+    RetireWithoutUnmap(FrameId),
     #[error("batch leaves a prepared mapping unpublished")]
     UnpublishedMapping,
     #[error("mapping generation space exhausted")]
     GenerationExhausted,
+    #[error("frame {0:?} mapping count exhausted")]
+    MappingCountExhausted(FrameId),
+    #[error("frame {0:?} mapping count underflowed")]
+    MappingCountUnderflow(FrameId),
     #[error("frame inventory revision space exhausted")]
     RevisionExhausted,
     #[error("test failpoint before event {0}")]
@@ -660,13 +730,15 @@ mod tests {
             &self,
             events: usize,
             build: impl FnOnce(KernelTransactionId, &mut FrameInventoryReservation),
-        ) -> FrameInventoryBatch {
+        ) -> FrameInventoryCommit<()> {
             let capacity = FrameEventCapacity::for_event_count(events).expect("capacity");
-            let mut reservation =
-                reserve(&self.ids, events, events, capacity).expect("reservation");
+            let mut reservation = self
+                .authority
+                .reserve(&self.ids, events, events, capacity)
+                .expect("reservation");
             let transaction = reservation.transaction();
             build(transaction, &mut reservation);
-            reservation.commit(()).into_parts().1
+            reservation.commit(())
         }
     }
 
@@ -786,16 +858,18 @@ mod tests {
         let first = fixture.batch(2, |transaction, reservation| {
             let frame = reservation.claim_frame().expect("frame");
             let mapping = reservation.claim_mapping().expect("mapping");
-            shared = Some(frame);
+            shared = Some((frame, mapping));
             prepare_publish(reservation, transaction, frame, mapping, 0x4000, 0x4000);
         });
         fixture
             .authority
             .apply(fixture.mm1, first)
             .expect("first alias");
-        let frame = shared.expect("shared frame ID");
+        let (frame, first_mapping) = shared.expect("shared frame ID");
+        let mut second_mapping = None;
         let second = fixture.batch(2, |transaction, reservation| {
             let mapping = reservation.claim_mapping().expect("mapping");
+            second_mapping = Some(mapping);
             prepare_publish(reservation, transaction, frame, mapping, 0x8000, 0x4000);
         });
         fixture
@@ -816,10 +890,56 @@ mod tests {
                 .len(),
             1
         );
+
+        let unmap_first = fixture.batch(1, |transaction, reservation| {
+            reservation
+                .push(FrameInventoryEvent::UnmapMapping {
+                    transaction,
+                    mapping: first_mapping,
+                    generation: generation(2),
+                })
+                .expect("unmap first alias");
+        });
+        fixture
+            .authority
+            .apply(fixture.mm1, unmap_first)
+            .expect("remove first alias");
+        assert!(
+            fixture
+                .authority
+                .snapshot_for_mm(fixture.mm1)
+                .frames
+                .is_empty()
+        );
+        assert_eq!(fixture.authority.snapshot().frames[0].mappings.len(), 1);
+
+        let second_mapping = second_mapping.expect("second mapping");
+        let retire = fixture.batch(2, |transaction, reservation| {
+            reservation
+                .push(FrameInventoryEvent::UnmapMapping {
+                    transaction,
+                    mapping: second_mapping,
+                    generation: generation(2),
+                })
+                .expect("unmap second alias");
+            reservation
+                .push(FrameInventoryEvent::RetireFrame {
+                    transaction,
+                    frame,
+                    generation: generation(2),
+                })
+                .expect("retire shared frame");
+        });
+        fixture
+            .authority
+            .apply(fixture.mm2, retire)
+            .expect("retire last cross-mm alias");
+        assert!(fixture.authority.snapshot().frames.is_empty());
+        assert!(fixture.authority.snapshot().mappings.is_empty());
     }
 
     #[test]
-    fn protect_unmap_and_retire_advance_generations_and_visibility() {
+    fn protect_then_atomic_unmap_retire_advances_generation_and_reclaims_rows() {
         let fixture = Fixture::new();
         let (frame, mapping) = {
             let mut values = None;
@@ -851,7 +971,7 @@ mod tests {
             .expect("protect apply");
         assert!(!fixture.authority.snapshot().mappings[0].permissions.write);
 
-        let unmap = fixture.batch(1, |transaction, reservation| {
+        let retire = fixture.batch(2, |transaction, reservation| {
             reservation
                 .push(FrameInventoryEvent::UnmapMapping {
                     transaction,
@@ -859,34 +979,19 @@ mod tests {
                     generation: generation(3),
                 })
                 .expect("unmap");
-        });
-        fixture
-            .authority
-            .apply(fixture.mm1, unmap)
-            .expect("unmap apply");
-        let unmapped = fixture.authority.snapshot();
-        assert_eq!(unmapped.revision, 3);
-        assert_eq!(unmapped.frames.len(), 1);
-        assert!(unmapped.frames[0].mappings.is_empty());
-        assert!(unmapped.mappings.is_empty());
-        let mm_view = fixture.authority.snapshot_for_mm(fixture.mm1);
-        assert!(mm_view.frames.is_empty());
-        assert!(mm_view.mappings.is_empty());
-
-        let retire = fixture.batch(1, |transaction, reservation| {
             reservation
                 .push(FrameInventoryEvent::RetireFrame {
                     transaction,
                     frame,
-                    generation: generation(4),
+                    generation: generation(3),
                 })
                 .expect("retire");
         });
         fixture
             .authority
             .apply(fixture.mm1, retire)
-            .expect("retire apply");
-        assert_eq!(fixture.authority.snapshot().revision, 4);
+            .expect("unmap and retire apply");
+        assert_eq!(fixture.authority.snapshot().revision, 3);
         assert!(fixture.authority.snapshot().frames.is_empty());
         assert!(fixture.authority.snapshot().mappings.is_empty());
     }
@@ -901,18 +1006,24 @@ mod tests {
             ids = Some((frame, mapping));
             prepare_publish(reservation, transaction, frame, mapping, 0x4000, 0x4000);
         });
-        let duplicate = FrameInventoryBatch::prepare(
-            original.transaction(),
-            FrameEventCapacity::for_event_count(1).expect("capacity"),
+        let transaction = original.batch().transaction();
+        let duplicate = FrameInventoryReservation::from_kernel_candidates(
+            FrameInventoryBatch::prepare(
+                transaction,
+                FrameEventCapacity::for_event_count(1).expect("capacity"),
+            )
+            .expect("forged batch"),
+            Vec::new(),
+            Vec::new(),
         )
-        .expect("duplicate batch");
+        .commit(());
         fixture
             .authority
             .apply(fixture.mm1, original)
             .expect("first");
         assert!(matches!(
             fixture.authority.apply(fixture.mm1, duplicate),
-            Err(FrameInventoryError::DuplicateTransaction(_))
+            Err(FrameInventoryError::UnreservedTransaction(_))
         ));
         let (frame, mapping) = ids.expect("IDs");
 
@@ -990,7 +1101,7 @@ mod tests {
         });
         assert_eq!(
             fixture.authority.apply(fixture.mm1, duplicate),
-            Err(FrameInventoryError::DuplicateMapping(mapping))
+            Err(FrameInventoryError::UnreservedMapping(mapping))
         );
         assert_eq!(fixture.authority.snapshot(), before);
 
@@ -1029,14 +1140,120 @@ mod tests {
     fn unused_candidate_ids_burn_in_the_runtime_registry() {
         let fixture = Fixture::new();
         let capacity = FrameEventCapacity::for_event_count(2).expect("capacity");
-        let mut abandoned = reserve(&fixture.ids, 2, 2, capacity).expect("reservation");
+        let mut abandoned = fixture
+            .authority
+            .reserve(&fixture.ids, 2, 2, capacity)
+            .expect("reservation");
+        let transaction = abandoned.transaction();
         let claimed_frame = abandoned.claim_frame().expect("frame");
         let claimed_mapping = abandoned.claim_mapping().expect("mapping");
         drop(abandoned);
+        assert!(fixture.authority.abandon(transaction));
 
-        let mut replacement = reserve(&fixture.ids, 1, 1, capacity).expect("replacement");
+        let mut replacement = fixture
+            .authority
+            .reserve(&fixture.ids, 1, 1, capacity)
+            .expect("replacement");
         assert!(replacement.claim_frame().expect("new frame").raw() > claimed_frame.raw());
         assert!(replacement.claim_mapping().expect("new mapping").raw() > claimed_mapping.raw());
+    }
+
+    #[test]
+    fn rejects_an_unreserved_new_frame_even_with_a_reserved_mapping() {
+        let fixture = Fixture::new();
+        let forged = fixture.ids.frame_id().expect("forged frame");
+        let batch = fixture.batch(2, |transaction, reservation| {
+            let mapping = reservation.claim_mapping().expect("mapping");
+            prepare_publish(reservation, transaction, forged, mapping, 0x4000, 0x4000);
+        });
+        assert_eq!(
+            fixture.authority.apply(fixture.mm1, batch),
+            Err(FrameInventoryError::UnreservedFrame(forged))
+        );
+        assert!(fixture.authority.snapshot().frames.is_empty());
+    }
+
+    #[test]
+    fn duplicate_mapping_inside_one_reserved_batch_is_rejected_atomically() {
+        let fixture = Fixture::new();
+        let mut duplicate = None;
+        let batch = fixture.batch(3, |transaction, reservation| {
+            let frame = reservation.claim_frame().expect("frame");
+            let mapping = reservation.claim_mapping().expect("mapping");
+            duplicate = Some(mapping);
+            prepare_publish(reservation, transaction, frame, mapping, 0x4000, 0x4000);
+            reservation
+                .push(FrameInventoryEvent::PrepareMapping {
+                    transaction,
+                    frame,
+                    mapping,
+                    generation: generation(1),
+                    gpa: Gpa(0x8000),
+                    length: length(0x4000),
+                    permissions: perms(true),
+                })
+                .expect("duplicate prepare");
+        });
+        let mapping = duplicate.expect("mapping ID");
+        assert_eq!(
+            fixture.authority.apply(fixture.mm1, batch),
+            Err(FrameInventoryError::DuplicateMapping(mapping))
+        );
+        assert!(fixture.authority.snapshot().mappings.is_empty());
+    }
+
+    #[test]
+    fn completed_mapping_churn_reclaims_rows_and_provenance() {
+        let fixture = Fixture::new();
+        for index in 0..128_u64 {
+            let mut ids = None;
+            let publish = fixture.batch(2, |transaction, reservation| {
+                let frame = reservation.claim_frame().expect("frame");
+                let mapping = reservation.claim_mapping().expect("mapping");
+                ids = Some((frame, mapping));
+                prepare_publish(
+                    reservation,
+                    transaction,
+                    frame,
+                    mapping,
+                    0x4000 + index * 0x4000,
+                    0x4000,
+                );
+            });
+            fixture
+                .authority
+                .apply(fixture.mm1, publish)
+                .expect("publish");
+            let (frame, mapping) = ids.expect("IDs");
+            let retire = fixture.batch(2, |transaction, reservation| {
+                reservation
+                    .push(FrameInventoryEvent::UnmapMapping {
+                        transaction,
+                        mapping,
+                        generation: generation(2),
+                    })
+                    .expect("unmap");
+                reservation
+                    .push(FrameInventoryEvent::RetireFrame {
+                        transaction,
+                        frame,
+                        generation: generation(2),
+                    })
+                    .expect("retire");
+            });
+            fixture
+                .authority
+                .apply(fixture.mm1, retire)
+                .expect("retire");
+        }
+        let snapshot = fixture.authority.snapshot();
+        assert_eq!(snapshot.revision, 256);
+        assert!(snapshot.frames.is_empty());
+        assert!(snapshot.mappings.is_empty());
+        let state = fixture.authority.state.lock();
+        assert!(state.reservations.is_empty());
+        assert!(state.frames.is_empty());
+        assert!(state.mappings.is_empty());
     }
 
     #[test]
