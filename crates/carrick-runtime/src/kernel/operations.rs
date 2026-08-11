@@ -735,6 +735,7 @@ impl ThreadCloneReservation {
             reservation: self,
             thread,
             resources,
+            publication: None,
             start_wait: Some(start_wait),
             start_release,
         })
@@ -746,6 +747,7 @@ pub struct PreparedThreadClone {
     reservation: ThreadCloneReservation,
     thread: ThreadRef,
     resources: Arc<ThreadResources>,
+    publication: Option<TaskSetReservation>,
     start_wait: Option<ChildStartWait>,
     start_release: ChildStartRelease,
 }
@@ -761,11 +763,45 @@ impl PreparedThreadClone {
             .ok_or(KernelOperationError::ChildStartWaitTaken)
     }
 
+    /// Reserve the task's publication slot before backend materialization takes
+    /// the HVPatch topology lock. This establishes one lock order:
+    /// task operation → topology → registry publication.
+    pub fn reserve_publication_eventually(mut self) -> Result<Self, KernelOperationError> {
+        let kernel = Arc::clone(&self.reservation.kernel);
+        let task = self.reservation.task.key();
+        let task_id = task.id;
+        let transaction = kernel.object_ids().transaction_id()?;
+        loop {
+            let observed = kernel.reservation_epoch();
+            let mut state = kernel.registry().state.write();
+            if state
+                .tasks
+                .get(&task_id)
+                .is_none_or(|record| record.task.key() != task)
+            {
+                return Err(KernelOperationError::ParentExited);
+            }
+            match TaskSetReservation::acquired(&kernel, &mut state, vec![task_id], transaction) {
+                Ok(publication) => {
+                    drop(state);
+                    self.publication = Some(publication);
+                    return Ok(self);
+                }
+                Err(KernelOperationError::TaskBusy(_)) => {
+                    drop(state);
+                    kernel.wait_for_reservation_change(observed);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     pub fn commit(self) -> Result<PublishedThreadClone, KernelOperationError> {
         let Self {
             reservation,
             thread,
             resources,
+            mut publication,
             start_wait,
             start_release,
         } = self;
@@ -782,7 +818,11 @@ impl PreparedThreadClone {
         } = reservation;
         let published_revision = {
             let mut state = kernel.registry().state.write();
-            ensure_task_unreserved(&state, task.key().id)?;
+            if let Some(publication) = publication.as_ref() {
+                publication.validate(&state)?;
+            } else {
+                ensure_task_unreserved(&state, task.key().id)?;
+            }
             let Some(record) = state.tasks.get_mut(&task.key().id) else {
                 return Err(KernelOperationError::ParentExited);
             };
@@ -806,6 +846,9 @@ impl PreparedThreadClone {
             task.publish_thread(Arc::clone(&thread))?;
             record.thread_claims.insert(tid, claim);
             record.revision = published_revision;
+            if let Some(publication) = publication.as_mut() {
+                publication.commit(&mut state)?;
+            }
             published_revision
         };
         Ok(PublishedThreadClone {
@@ -1047,6 +1090,25 @@ impl Kernel {
             reservation,
             failpoint,
         })
+    }
+
+    /// Reserve a thread identity after any overlapping task transaction
+    /// completes. Callers must invoke this before taking backend topology locks.
+    pub fn reserve_thread_clone_eventually(
+        self: &Arc<Self>,
+        parent: &KernelContext,
+        plan: ClonePlan,
+    ) -> Result<ThreadCloneReservation, KernelOperationError> {
+        loop {
+            let observed = self.reservation_epoch();
+            match self.reserve_thread_clone(parent, plan, None) {
+                Ok(reservation) => return Ok(reservation),
+                Err(KernelOperationError::TaskBusy(_)) => {
+                    self.wait_for_reservation_change(observed);
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     #[cfg(test)]
@@ -3450,6 +3512,78 @@ mod tests {
             .reserve_thread_clone(&root, thread_plan, None)
             .expect("fork drop unlocks thread");
         drop(thread_after_drop);
+        assert_eq!(kernel.validate_invariants(), Ok(()));
+    }
+
+    #[test]
+    fn thread_reservation_waits_for_an_overlapping_task_transaction() {
+        let (kernel, root) = bootstrap(336);
+        let fork_plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
+        let thread_plan = ClonePlan::from_flags(
+            LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+        )
+        .expect("thread plan");
+        let prepared_fork = kernel
+            .reserve_fork(&root, fork_plan, "prepared child".to_owned(), None)
+            .expect("reserve fork")
+            .prepare_reference(ThreadId::synthetic_for_tests(337))
+            .expect("prepare fork backend");
+        let waiter_kernel = Arc::clone(&kernel);
+        let root_task = root.task().key().id;
+        let root_tid = root.thread().key().tid;
+        let waiter = std::thread::spawn(move || {
+            let waiter_root = waiter_kernel
+                .context(root_task, root_tid)
+                .expect("capture reservation waiter context");
+            waiter_kernel.reserve_thread_clone_eventually(&waiter_root, thread_plan)
+        });
+        kernel.wait_for_reservation_waiter_for_tests();
+        drop(prepared_fork);
+        let reservation = waiter
+            .join()
+            .expect("thread reservation waiter")
+            .expect("reserve after transaction release");
+        drop(reservation);
+        assert_eq!(kernel.validate_invariants(), Ok(()));
+    }
+
+    #[test]
+    fn prepared_thread_publication_waits_for_an_overlapping_task_transaction() {
+        let (kernel, root) = bootstrap(338);
+        let thread_plan = ClonePlan::from_flags(
+            LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+        )
+        .expect("thread plan");
+        let prepared_thread = kernel
+            .reserve_thread_clone(&root, thread_plan, None)
+            .expect("reserve thread")
+            .prepare(ThreadId::synthetic_for_tests(339))
+            .expect("prepare thread backend");
+        let prepared_exit = kernel
+            .prepare_task_exit(
+                root.task.key().id,
+                LinuxWaitStatus::from_wait_encoding(0),
+                TaskRusage::default(),
+                None,
+            )
+            .expect("reserve overlapping exit");
+
+        let publisher =
+            std::thread::spawn(move || prepared_thread.reserve_publication_eventually()?.commit());
+        kernel.wait_for_reservation_waiter_for_tests();
+        drop(prepared_exit);
+        let published = publisher
+            .join()
+            .expect("thread publisher")
+            .expect("publish after transaction release");
+        assert_eq!(
+            published
+                .context()
+                .expect("published thread context")
+                .task()
+                .live_thread_count(),
+            2
+        );
         assert_eq!(kernel.validate_invariants(), Ok(()));
     }
 
