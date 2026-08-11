@@ -87,6 +87,121 @@ enum PrivateRepointRecovery {
     FailStopRetainingOwners,
 }
 
+/// Dispatcher-owned, revisioned wrapper around the sole production memory/VMA
+/// authority. Ordinary syscall and `/proc` access keeps using this same
+/// `MemState` mutex; the K1 observer only derives owned occupancy rows from it.
+pub(crate) struct MemAuthority {
+    state: parking_lot::Mutex<MemState>,
+    revision: std::sync::atomic::AtomicU64,
+}
+
+impl std::fmt::Debug for MemAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MemAuthority")
+            .field("revision", &self.vma_revision())
+            .finish_non_exhaustive()
+    }
+}
+
+impl MemAuthority {
+    pub(super) fn new(state: MemState) -> Self {
+        Self::with_revision(state, crate::kernel::VmaRevision::INITIAL)
+    }
+
+    fn with_revision(state: MemState, revision: crate::kernel::VmaRevision) -> Self {
+        Self {
+            state: parking_lot::Mutex::new(state),
+            revision: std::sync::atomic::AtomicU64::new(revision.raw()),
+        }
+    }
+
+    pub(super) fn lock(&self) -> MemAuthorityGuard<'_> {
+        MemAuthorityGuard {
+            authority: self,
+            guard: self.state.lock(),
+            mutated: false,
+        }
+    }
+
+    pub(super) fn fork_private(&self) -> std::sync::Arc<Self> {
+        let state = self.state.lock();
+        let revision = self.vma_revision();
+        let forked = state.clone();
+        drop(state);
+        std::sync::Arc::new(Self::with_revision(forked, revision))
+    }
+
+    fn vma_revision(&self) -> crate::kernel::VmaRevision {
+        crate::kernel::VmaRevision::from_authority_raw(
+            self.revision.load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    fn bump_revision(&self) {
+        if self
+            .revision
+            .fetch_add(1, std::sync::atomic::Ordering::Release)
+            == u64::MAX
+        {
+            std::process::abort();
+        }
+    }
+}
+
+pub(super) struct MemAuthorityGuard<'a> {
+    authority: &'a MemAuthority,
+    guard: parking_lot::MutexGuard<'a, MemState>,
+    mutated: bool,
+}
+
+impl std::ops::Deref for MemAuthorityGuard<'_> {
+    type Target = MemState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for MemAuthorityGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.mutated = true;
+        &mut self.guard
+    }
+}
+
+impl Drop for MemAuthorityGuard<'_> {
+    fn drop(&mut self) {
+        // Publish while the state lock is still held. A snapshot therefore
+        // cannot observe mutated rows paired with the preceding revision.
+        if self.mutated {
+            self.authority.bump_revision();
+        }
+    }
+}
+
+impl crate::kernel::VmaSnapshotSource for MemAuthority {
+    fn snapshot(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<crate::kernel::OwnedVmaSnapshot, crate::kernel::SnapshotError> {
+        let Some(state) = self.state.try_lock_until(deadline) else {
+            return Err(if std::time::Instant::now() >= deadline {
+                crate::kernel::SnapshotError::TimedOut
+            } else {
+                crate::kernel::SnapshotError::Busy
+            });
+        };
+        let revision = self.vma_revision();
+        let vmas = project_vma_summaries(&state);
+        Ok(crate::kernel::OwnedVmaSnapshot { revision, vmas })
+    }
+
+    fn revision(&self) -> crate::kernel::VmaRevision {
+        self.vma_revision()
+    }
+}
+
 /// Owned memory-subsystem state. Split out of `SyscallDispatcher`.
 #[derive(Clone)]
 pub(super) struct MemState {
@@ -219,7 +334,7 @@ impl MemState {
         }
     }
 
-    fn reset_for_execve(&mut self) {
+    pub(super) fn reset_for_execve(&mut self) {
         let layout = self.layout;
         let address_space_regions = self.address_space_regions.take();
         let linux_auxv_image = std::mem::take(&mut self.linux_auxv_image);
@@ -474,6 +589,39 @@ fn boot_region_is_hidden_reservation(map: &ProcMapsEntry, layout: MemoryLayout) 
         || boot_region_is_hidden_heap_backing(map, layout)
         || boot_region_is_hidden_shared_aperture(map)
         || boot_region_is_hidden_private_overlay(map)
+}
+
+fn project_vma_summaries(mem: &MemState) -> Vec<crate::kernel::VmaSummary> {
+    let mut ranges: Vec<(u64, u64)> = mem
+        .address_space_regions
+        .iter()
+        .flatten()
+        .filter(|map| !boot_region_is_hidden_reservation(map, mem.layout))
+        .chain(mem.dynamic_maps.iter())
+        .filter_map(|map| (map.start < map.end).then_some((map.start, map.end)))
+        .collect();
+    if mem.layout.heap_base < mem.brk_current {
+        ranges.push((mem.layout.heap_base, mem.brk_current));
+    }
+    ranges.sort_unstable();
+
+    let mut unioned: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some((_, previous_end)) = unioned.last_mut()
+            && start <= *previous_end
+        {
+            *previous_end = (*previous_end).max(end);
+        } else {
+            unioned.push((start, end));
+        }
+    }
+    unioned
+        .into_iter()
+        .map(|(start, end)| crate::kernel::VmaSummary {
+            start: GuestVa(start),
+            end: GuestVa(end),
+        })
+        .collect()
 }
 
 fn boot_region_source_intersects_hidden_backing(
@@ -8725,6 +8873,109 @@ mod tests {
         );
         assert!(!dispatcher.guest_vma_overlaps(layout.mmap_base, LINUX_PAGE_SIZE));
         assert!(dispatcher.guest_vma_overlaps(BOOT, LINUX_PAGE_SIZE));
+
+        let snapshot = crate::kernel::VmaSnapshotSource::snapshot(
+            dispatcher.mem.as_ref(),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .expect("VMA authority snapshot");
+        assert!(snapshot.vmas.contains(&crate::kernel::VmaSummary {
+            start: GuestVa(layout.heap_base),
+            end: GuestVa(layout.heap_base + LINUX_PAGE_SIZE),
+        }));
+        assert!(snapshot.vmas.contains(&crate::kernel::VmaSummary {
+            start: GuestVa(layout.mmap_base + (2 * LINUX_PAGE_SIZE)),
+            end: GuestVa(layout.mmap_base + (3 * LINUX_PAGE_SIZE)),
+        }));
+        assert!(snapshot.vmas.contains(&crate::kernel::VmaSummary {
+            start: GuestVa(BOOT),
+            end: GuestVa(BOOT + LINUX_PAGE_SIZE),
+        }));
+        assert!(!snapshot.vmas.iter().any(|vma| {
+            vma.start == GuestVa(layout.mmap_base)
+                || vma.end == GuestVa(layout.heap_base + layout.heap_size)
+        }));
+        assert!(
+            snapshot
+                .vmas
+                .windows(2)
+                .all(|rows| rows[0].end.raw() < rows[1].start.raw())
+        );
+    }
+
+    #[test]
+    fn mem_authority_revises_only_after_mutable_access() {
+        let dispatcher = SyscallDispatcher::new();
+        let initial = crate::kernel::VmaSnapshotSource::revision(dispatcher.mem.as_ref());
+
+        let _layout = dispatcher.mem.lock().layout;
+        assert_eq!(
+            crate::kernel::VmaSnapshotSource::revision(dispatcher.mem.as_ref()),
+            initial
+        );
+
+        let current = dispatcher.mem.lock().brk_current;
+        dispatcher.mem.lock().brk_current = current;
+        assert_eq!(
+            crate::kernel::VmaSnapshotSource::revision(dispatcher.mem.as_ref()),
+            initial.next().expect("revision")
+        );
+    }
+
+    #[test]
+    fn mem_authority_fork_is_independent_after_one_existing_state_clone() {
+        let parent = SyscallDispatcher::new();
+        let layout = parent.mem.lock().layout;
+        parent.mem.lock().brk_current = layout.heap_base + LINUX_PAGE_SIZE;
+        let parent_revision = crate::kernel::VmaSnapshotSource::revision(parent.mem.as_ref());
+        let child = parent.fork_clone_in_process(
+            crate::thread::ThreadId::synthetic_for_tests(71),
+            crate::thread::ThreadId::synthetic_for_tests(72),
+            71,
+            72,
+        );
+
+        assert!(!std::sync::Arc::ptr_eq(&parent.mem, &child.mem));
+        assert_eq!(
+            crate::kernel::VmaSnapshotSource::revision(child.mem.as_ref()),
+            parent_revision
+        );
+        child.mem.lock().brk_current += LINUX_PAGE_SIZE;
+        assert_eq!(
+            parent.mem.lock().brk_current,
+            layout.heap_base + LINUX_PAGE_SIZE
+        );
+        assert_eq!(
+            crate::kernel::VmaSnapshotSource::revision(parent.mem.as_ref()),
+            parent_revision
+        );
+        assert_eq!(
+            crate::kernel::VmaSnapshotSource::revision(child.mem.as_ref()),
+            parent_revision.next().expect("child revision")
+        );
+    }
+
+    #[test]
+    fn mem_authority_snapshot_honors_deadline_contention() {
+        let authority = SyscallDispatcher::new().mem;
+        let held = std::sync::Arc::clone(&authority);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let worker_barrier = std::sync::Arc::clone(&barrier);
+        let worker = std::thread::spawn(move || {
+            let _guard = held.lock();
+            worker_barrier.wait();
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        });
+        barrier.wait();
+
+        assert_eq!(
+            crate::kernel::VmaSnapshotSource::snapshot(
+                authority.as_ref(),
+                std::time::Instant::now() + std::time::Duration::from_millis(5),
+            ),
+            Err(crate::kernel::SnapshotError::TimedOut)
+        );
+        worker.join().expect("authority lock worker");
     }
 
     #[test]

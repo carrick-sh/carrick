@@ -1,4 +1,6 @@
+use std::fmt::Debug;
 use std::num::NonZeroU16;
+use std::sync::Arc;
 use std::time::Instant;
 
 use carrick_guest_mem::{Gpa, GuestVa};
@@ -66,6 +68,57 @@ pub struct VmaSummary {
     pub end: GuestVa,
 }
 
+/// Revision of the dispatcher-owned Linux VMA authority.
+///
+/// This is deliberately distinct from backend and frame-inventory revisions:
+/// the three authorities publish independently and their counters must never be
+/// compared as though they belonged to one domain.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct VmaRevision(u64);
+
+impl VmaRevision {
+    pub const INITIAL: Self = Self(1);
+
+    pub(crate) const fn from_authority_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(next) => Some(Self(next)),
+            None => None,
+        }
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// One owned, coherent observation of the production VMA authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnedVmaSnapshot {
+    pub revision: VmaRevision,
+    pub vmas: Vec<VmaSummary>,
+}
+
+/// Read-only K1 adapter over the runtime's sole production VMA authority.
+pub trait VmaSnapshotSource: Debug + Send + Sync {
+    fn snapshot(&self, deadline: Instant) -> Result<OwnedVmaSnapshot, SnapshotError>;
+    fn revision(&self) -> VmaRevision;
+}
+
+impl VmaSnapshotSource for OwnedVmaSnapshot {
+    fn snapshot(&self, _deadline: Instant) -> Result<OwnedVmaSnapshot, SnapshotError> {
+        Ok(self.clone())
+    }
+
+    fn revision(&self) -> VmaRevision {
+        self.revision
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SnapshotTable {
     Mms,
@@ -81,6 +134,8 @@ pub struct MmBackendSnapshot {
     pub revision: u64,
     pub binding: MmBinding,
     pub vmas: Vec<VmaSummary>,
+    /// Revision of the independent VMA authority used for `vmas`.
+    pub vma_revision: Option<VmaRevision>,
     pub mapping_ids: Vec<MappingId>,
     /// Revision of the global frame inventory from which `mapping_ids` were
     /// copied. Backends without frame inventory return `None`; HVPatch must
@@ -104,7 +159,12 @@ pub enum SnapshotError {
 pub trait MmBackend: Send + Sync {
     fn snapshot(&self, deadline: Instant) -> Result<MmBackendSnapshot, SnapshotError>;
     fn revision(&self) -> u64;
+    fn vma_revision(&self) -> Option<VmaRevision> {
+        None
+    }
 }
+
+pub type SharedVmaSnapshotSource = Arc<dyn VmaSnapshotSource>;
 
 /// A validated `TTBR0_EL1` value composed from typed ASID and root domains.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

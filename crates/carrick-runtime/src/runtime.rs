@@ -132,9 +132,9 @@ use crate::rootfs::RootFs;
 // `pub(crate)` so `vcpu_loop` can reach the same helpers.
 pub(crate) mod exec;
 use crate::vcpu_loop::{
-    apply_image_proc_state, deliver_pending_signal, dispatch_with_panic_backstop,
-    partial_write_interrupt_outcome, raise_sigpipe_for_blocking_write, signal_wait_expired,
-    signal_wait_slice, stamp_identity_page,
+    apply_exec_image_proc_state, apply_image_proc_state, deliver_pending_signal,
+    dispatch_with_panic_backstop, partial_write_interrupt_outcome,
+    raise_sigpipe_for_blocking_write, signal_wait_expired, signal_wait_slice, stamp_identity_page,
 };
 use exec::{
     forked_child_die_by_signal, forked_child_exit, load_execve_image, stop_after_traced_exec,
@@ -1304,8 +1304,9 @@ where
                             new_image.regions().len() as u64,
                         );
                         dispatcher.set_executable_identity(path.clone(), proc_argv, proc_env);
-                        // Refresh /proc/self/maps + /proc/self/auxv for the new image.
-                        apply_image_proc_state(&dispatcher, &new_image);
+                        dispatcher.reset_signal_handlers_on_execve();
+                        // Reset and refresh memory proc state as one VMA generation.
+                        apply_exec_image_proc_state(&dispatcher, &new_image);
                         dispatcher.close_cloexec_fds();
                         runtime.execve_into(&new_image)?;
                         crate::namespace::pid::mark_self_execed();

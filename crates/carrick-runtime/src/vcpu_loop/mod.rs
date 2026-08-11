@@ -345,10 +345,6 @@ mod macos_helper_stubs {
             .with_vdso_auxv(false)
             .with_linux_initial_stack_page_size(argv, env, dispatcher.linux_page_size())
             .map_err(|_| LINUX_ENOENT)?;
-        // execve point of no return: reset CAUGHT handlers to SIG_DFL (the kernel
-        // does this; SIG_IGN/mask/pending are preserved).
-        dispatcher.reset_memory_state_on_execve();
-        dispatcher.reset_signal_handlers_on_execve();
         Ok(image)
     }
 
@@ -994,6 +990,14 @@ pub(crate) fn dispatch_with_panic_backstop(
 pub(crate) fn apply_image_proc_state(dispatcher: &SyscallDispatcher, image: &AddressSpace) {
     dispatcher.set_address_space_regions(proc_maps_from_address_space(image));
     dispatcher.set_auxv_image(image.linux_auxv_image().to_vec());
+}
+
+/// Publish a successful exec image as one dispatcher VMA generation.
+pub(crate) fn apply_exec_image_proc_state(dispatcher: &SyscallDispatcher, image: &AddressSpace) {
+    dispatcher.publish_exec_image_state(
+        proc_maps_from_address_space(image),
+        image.linux_auxv_image().to_vec(),
+    );
 }
 
 /// Stamp the per-process identity page the EL1 syscall shim reads (no-op unless
