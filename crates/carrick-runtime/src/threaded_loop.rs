@@ -112,6 +112,50 @@ pub trait HostBackend: Send + Sync + 'static {
 /// `vcpu_loop::run_vcpu_until_exit`. `handle_fork` (real `libc::fork` + child VM
 /// rebuild), `spawn_clone_thread` (sibling vCPUs), and the private/shared futex
 /// paths all flow through the shared loop.
+fn publish_initial_frame_inventory<Inventory>(
+    context: Option<&crate::kernel::KernelContext>,
+    extent_count: usize,
+    inventory: Inventory,
+) -> Result<(), RuntimeError>
+where
+    Inventory: FnOnce(
+        carrick_hal::FrameInventoryReservation,
+    ) -> Result<carrick_hal::FrameInventoryCommit<()>, carrick_hal::TrapError>,
+{
+    let Some(context) = context else {
+        return Ok(());
+    };
+    let event_count = extent_count
+        .checked_mul(2)
+        .ok_or(crate::kernel::FrameInventoryReserveError::CandidateCountExceedsEvents)?;
+    let capacity = carrick_hal::FrameEventCapacity::for_event_count(event_count)
+        .map_err(crate::kernel::FrameInventoryReserveError::from)?;
+    let reservation =
+        context
+            .kernel()
+            .reserve_frame_inventory(extent_count, extent_count, capacity)?;
+    let transaction = reservation.transaction();
+    let commit = match inventory(reservation) {
+        Ok(commit) => commit,
+        Err(error) => {
+            let abandoned = context.kernel().frame_inventory().abandon(transaction);
+            debug_assert!(abandoned);
+            return Err(error.into());
+        }
+    };
+    // These mappings already exist in HVF. A missing/rejected authoritative
+    // publication cannot be recovered without running with two truths.
+    if context
+        .kernel()
+        .frame_inventory()
+        .apply(context.shared().mm().id(), commit)
+        .is_err()
+    {
+        std::process::abort();
+    }
+    Ok(())
+}
+
 fn resolve_hvpatch_setup<T, Retire>(
     backend: crate::page_profile::ExecutionBackend,
     setup: Result<T, RuntimeError>,
@@ -240,6 +284,20 @@ where
         None,
         None,
     ));
+    if kernel.hvpatch_process.is_some() {
+        let context = kernel
+            .dispatcher
+            .capture_kernel_context(root_linux_tid)
+            .map_err(|error| {
+                RuntimeError::Configuration(format!(
+                    "capture initial HVPatch frame inventory context: {error}"
+                ))
+            })?;
+        let extent_count = engine.frame_inventory_extent_count();
+        publish_initial_frame_inventory(Some(&context), extent_count, |reservation| {
+            engine.inventory_initial_mappings(reservation)
+        })?;
+    }
     kernel.register_hvpatch_runtime_endpoint(Arc::clone(&futex), Arc::clone(&kicker));
     debug_assert!(kernel.hvpatch_process.as_ref().is_none_or(|process| {
         process.pid() == std::process::id() as i32 && process.live_process_count() == 1
@@ -318,6 +376,102 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::num::NonZeroU64;
+
+    fn root_context(pid: i32) -> crate::kernel::KernelContext {
+        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+            pid,
+            crate::thread::ThreadId::synthetic_for_tests(pid),
+            "inventory-root".to_owned(),
+        )
+        .expect("root bootstrap");
+        crate::kernel::Kernel::bootstrap_root(bootstrap)
+            .expect("root kernel")
+            .1
+    }
+
+    fn one_mapping_commit(
+        mut reservation: carrick_hal::FrameInventoryReservation,
+    ) -> carrick_hal::FrameInventoryCommit<()> {
+        let transaction = reservation.transaction();
+        let frame = reservation.claim_frame().expect("frame candidate");
+        let mapping = reservation.claim_mapping().expect("mapping candidate");
+        let generation = carrick_hal::MappingGeneration::from_backend_counter(
+            NonZeroU64::new(1).expect("generation"),
+        );
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation,
+                gpa: carrick_guest_mem::Gpa(0x4000),
+                length: carrick_hal::FrameLength::from_mapping_extent(
+                    NonZeroU64::new(0x4000).expect("length"),
+                ),
+                permissions: carrick_hal::MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .expect("prepare event");
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation,
+            })
+            .expect("publish event");
+        reservation.commit(())
+    }
+
+    #[test]
+    fn initial_inventory_is_hvpatch_only_and_publishes_once_to_exact_mm() {
+        let mature_called = Cell::new(false);
+        publish_initial_frame_inventory(None, 1, |reservation| {
+            mature_called.set(true);
+            Ok(one_mapping_commit(reservation))
+        })
+        .expect("non-HVPatch no-op");
+        assert!(!mature_called.get());
+
+        let context = root_context(67_101);
+        let exact_mm = context.shared().mm().id();
+        let calls = Cell::new(0);
+        publish_initial_frame_inventory(Some(&context), 1, |reservation| {
+            calls.set(calls.get() + 1);
+            Ok(one_mapping_commit(reservation))
+        })
+        .expect("initial publication");
+
+        assert_eq!(calls.get(), 1);
+        let snapshot = context.kernel().frame_inventory().snapshot_for_mm(exact_mm);
+        assert_eq!(snapshot.frames.len(), 1);
+        assert_eq!(snapshot.mappings.len(), 1);
+        assert_eq!(snapshot.mappings[0].mm, exact_mm);
+    }
+
+    #[test]
+    fn initial_inventory_abandons_reservation_when_backend_staging_fails() {
+        let context = root_context(67_102);
+        let transaction = RefCell::new(None);
+        let error = publish_initial_frame_inventory(Some(&context), 1, |reservation| {
+            transaction.replace(Some(reservation.transaction()));
+            Err(carrick_hal::TrapError::Hypervisor(
+                "mock initial inventory failure".to_owned(),
+            ))
+        })
+        .expect_err("staging must fail");
+        assert!(matches!(error, RuntimeError::Trap(_)));
+        assert!(
+            !context
+                .kernel()
+                .frame_inventory()
+                .abandon(transaction.into_inner().expect("captured transaction"))
+        );
+    }
 
     #[test]
     fn hvpatch_setup_failure_retires_only_the_created_vcpu_once() {
