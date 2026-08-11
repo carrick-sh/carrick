@@ -6,6 +6,45 @@
 
 use super::*;
 
+/// Keeps runtime provenance live while a non-cloneable reservation is owned
+/// by the backend. Every pre-publication return abandons the authority record;
+/// successful application has already consumed it, making Drop a no-op.
+pub(super) struct InventoryAbandon<'a, const N: usize> {
+    authority: &'a crate::kernel::FrameInventoryAuthority,
+    transactions: [carrick_hal::KernelTransactionId; N],
+}
+
+impl<'a, const N: usize> InventoryAbandon<'a, N> {
+    pub(super) const fn new(
+        authority: &'a crate::kernel::FrameInventoryAuthority,
+        transactions: [carrick_hal::KernelTransactionId; N],
+    ) -> Self {
+        Self {
+            authority,
+            transactions,
+        }
+    }
+}
+
+impl<const N: usize> Drop for InventoryAbandon<'_, N> {
+    fn drop(&mut self) {
+        for transaction in self.transactions {
+            self.authority.abandon(transaction);
+        }
+    }
+}
+
+pub(super) fn inventory_capacity_for_extents(
+    extents: usize,
+) -> Result<carrick_hal::FrameEventCapacity, RuntimeError> {
+    let events = extents.checked_mul(2).ok_or_else(|| {
+        RuntimeError::Configuration("HVPatch frame inventory event count overflow".to_owned())
+    })?;
+    carrick_hal::FrameEventCapacity::for_event_count(events).map_err(|error| {
+        RuntimeError::Configuration(format!("invalid HVPatch frame inventory capacity: {error}"))
+    })
+}
+
 /// Process-wide fork quiesce barrier (defined in `fork_quiesce` so the blocking
 /// wait predicates can reach the same instance).
 pub(crate) fn fork_barrier() -> &'static crate::fork_quiesce::QuiesceBarrier {
@@ -860,11 +899,6 @@ where
             }
             std::thread::yield_now();
         }
-        let _topology = crate::fork_quiesce::acquire_topology_lock(
-            carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
-            parent_process.pid(),
-            self.this_tid.raw(),
-        );
         let parent_pid = parent_process.pid();
         let forking_tid = self.this_tid.raw();
         let emit_fork_runtime_stage =
@@ -1038,6 +1072,53 @@ where
                 )));
             }
         };
+        let child_mm_id = prepared_fork.child_mm_id();
+        let inventory_extent_count = engine.frame_inventory_extent_count();
+        let inventory_capacity = match inventory_capacity_for_extents(inventory_extent_count) {
+            Ok(capacity) => capacity,
+            Err(error) => {
+                if quiesced {
+                    process_barrier.end_quiesce();
+                }
+                process_barrier.end_fork();
+                return Err(error);
+            }
+        };
+        let inventory_reservation = match parent_process.kernel_graph().reserve_frame_inventory(
+            inventory_extent_count,
+            inventory_extent_count,
+            inventory_capacity,
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                if quiesced {
+                    process_barrier.end_quiesce();
+                }
+                process_barrier.end_fork();
+                return Err(RuntimeError::Configuration(format!(
+                    "reserve HVPatch child frame inventory: {error}"
+                )));
+            }
+        };
+        let inventory_transaction = inventory_reservation.transaction();
+        let _inventory_abandon = InventoryAbandon::new(
+            parent_process.kernel_graph().frame_inventory(),
+            [inventory_transaction],
+        );
+        if let Err(error) = engine.begin_process_inventory(inventory_reservation) {
+            if quiesced {
+                process_barrier.end_quiesce();
+            }
+            process_barrier.end_fork();
+            return Err(RuntimeError::Trap(error));
+        }
+        // The reservation and its complete bounded storage exist before this
+        // topology lock. Backend materialization consumes it exactly once.
+        let topology = crate::fork_quiesce::acquire_topology_lock(
+            carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
+            parent_process.pid(),
+            self.this_tid.raw(),
+        );
         emit_fork_runtime_stage(
             carrick_observability::probes::HvpatchForkRuntimeStagePhase::ProcessAllocate,
             fork_stage_started,
@@ -1163,7 +1244,9 @@ where
         let child_threads = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let max_traps = self.max_traps;
         let child_tid_addr = request.child_tid_addr;
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<
+            Result<carrick_hal::FrameInventoryCommit<()>, String>,
+        >(1);
         let (start_tx, start_rx) = std::sync::mpsc::sync_channel::<
             Option<(Arc<KernelState>, crate::hvpatch::ProcessContext)>,
         >(1);
@@ -1183,13 +1266,21 @@ where
                         return;
                     }
                 };
+                let child_inventory_commit =
+                    child_engine.take_process_inventory().unwrap_or_else(|| {
+                        tracing::error!(
+                            child_pid,
+                            "HVPatch child materialized without its frame inventory commit"
+                        );
+                        std::process::abort();
+                    });
                 if let Some(address) = child_tid_addr
                     && let Err(error) = child_engine.write_bytes(address, &child_pid.to_le_bytes())
                 {
                     let _ = ready_tx.send(Err(error.to_string()));
                     return;
                 }
-                if ready_tx.send(Ok(())).is_err() {
+                if ready_tx.send(Ok(child_inventory_commit)).is_err() {
                     return;
                 }
                 let Ok(Some((child_kernel, _child_process))) = start_rx.recv() else {
@@ -1262,9 +1353,9 @@ where
         };
         fork_stage_started = Instant::now();
         let ready_deadline = Instant::now() + Duration::from_secs(10);
-        loop {
+        let child_inventory_commit = loop {
             match ready_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(Ok(())) => break,
+                Ok(Ok(commit)) => break commit,
                 Ok(Err(error)) => {
                     let _ = start_tx.send(None);
                     let _ = handle.join();
@@ -1301,6 +1392,19 @@ where
                     }
                 }
             }
+        };
+        // Child materialization has released its backend mapping locks. Release
+        // global topology serialization before entering runtime inventory
+        // authority, then publish to the exact prepared child Mm while its
+        // execution thread remains behind `start_rx`.
+        drop(topology);
+        if let Err(error) = parent_process
+            .kernel_graph()
+            .frame_inventory()
+            .apply(child_mm_id, child_inventory_commit)
+        {
+            tracing::error!(child_pid, ?child_mm_id, %error, "apply HVPatch child frame inventory");
+            std::process::abort();
         }
         emit_fork_runtime_stage(
             carrick_observability::probes::HvpatchForkRuntimeStagePhase::ChildReady,
@@ -1416,7 +1520,6 @@ where
             fork_total_started,
             child_pid,
         );
-        drop(_topology);
         if let Some(wait) = vfork_parent_wait {
             loop {
                 if wait.wait_for_release(Duration::from_millis(1)).is_some() {
@@ -1463,6 +1566,47 @@ mod pt_pause_tests {
 
     fn tid(raw: i32) -> ThreadId {
         ThreadId::synthetic_for_tests(raw)
+    }
+
+    #[test]
+    fn inventory_bounds_two_events_per_extent_and_rejects_oversize() {
+        assert_eq!(inventory_capacity_for_extents(3).unwrap().get(), 6);
+        assert!(
+            inventory_capacity_for_extents(
+                carrick_hal::MAX_FRAME_INVENTORY_EVENTS_PER_BATCH / 2 + 1
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn inventory_guard_abandons_unpublished_runtime_reservation() {
+        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+            1_530,
+            tid(1_530),
+            "inventory-abandon".to_owned(),
+        )
+        .unwrap();
+        let (kernel, context) = crate::kernel::Kernel::bootstrap_root(bootstrap).unwrap();
+        let reservation = kernel
+            .reserve_frame_inventory(
+                1,
+                1,
+                carrick_hal::FrameEventCapacity::for_event_count(2).unwrap(),
+            )
+            .unwrap();
+        let transaction = reservation.transaction();
+        let commit = reservation.commit(());
+        {
+            let _guard = InventoryAbandon::new(kernel.frame_inventory(), [transaction]);
+        }
+
+        assert!(matches!(
+            kernel
+                .frame_inventory()
+                .apply(context.shared().mm().id(), commit),
+            Err(crate::kernel::FrameInventoryError::UnreservedTransaction(id)) if id == transaction
+        ));
     }
 
     #[test]

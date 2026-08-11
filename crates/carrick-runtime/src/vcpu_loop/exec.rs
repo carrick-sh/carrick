@@ -21,6 +21,17 @@ fn word_at(bytes: &[u8], offset: usize) -> Option<u32> {
         .map(u32::from_le_bytes)
 }
 
+fn apply_exec_inventory<E>(
+    old_mm: crate::kernel::MmId,
+    replacement_mm: crate::kernel::MmId,
+    retired: carrick_hal::FrameInventoryCommit<()>,
+    replacement: carrick_hal::FrameInventoryCommit<()>,
+    mut apply: impl FnMut(crate::kernel::MmId, carrick_hal::FrameInventoryCommit<()>) -> Result<(), E>,
+) -> Result<(), E> {
+    apply(old_mm, retired)?;
+    apply(replacement_mm, replacement)
+}
+
 fn should_update_host_process_title(is_hvpatch: bool) -> bool {
     // HvPatch multiplexes many Linux processes inside one host process. A
     // per-guest exec cannot truthfully rename that shared process, and the
@@ -75,7 +86,7 @@ fn verify_published_exec_image<E: ThreadedEngine>(
 
 #[cfg(test)]
 mod exec_image_verification_tests {
-    use super::{first_byte_mismatch, should_update_host_process_title};
+    use super::{apply_exec_inventory, first_byte_mismatch, should_update_host_process_title};
 
     #[test]
     fn reports_the_first_divergent_exec_byte() {
@@ -88,6 +99,40 @@ mod exec_image_verification_tests {
     fn shared_vm_exec_preserves_process_aware_host_thread_identity() {
         assert!(!should_update_host_process_title(true));
         assert!(should_update_host_process_title(false));
+    }
+
+    #[test]
+    fn exec_inventory_routes_retirement_before_replacement_to_prepared_mms() {
+        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+            1_540,
+            carrick_hal::ThreadId::synthetic_for_tests(1_540),
+            "exec-inventory-routing".to_owned(),
+        )
+        .unwrap();
+        let (kernel, context) = crate::kernel::Kernel::bootstrap_root(bootstrap).unwrap();
+        let prepared = kernel.prepare_exec(&context, None).unwrap();
+        let old_mm = prepared.old_mm_id();
+        let replacement_mm = prepared.replacement_mm_id();
+        assert_ne!(old_mm, replacement_mm);
+
+        let capacity = carrick_hal::FrameEventCapacity::for_event_count(1).unwrap();
+        let retired = kernel
+            .reserve_frame_inventory(0, 0, capacity)
+            .unwrap()
+            .commit(());
+        let replacement = kernel
+            .reserve_frame_inventory(0, 0, capacity)
+            .unwrap()
+            .commit(());
+        let mut routed = Vec::new();
+        apply_exec_inventory(old_mm, replacement_mm, retired, replacement, |mm, _| {
+            routed.push(mm);
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+
+        assert_eq!(routed, [old_mm, replacement_mm]);
+        drop(prepared);
     }
 }
 
@@ -175,6 +220,56 @@ where
                         "prepare authoritative Kernel exec: {error}"
                     ))
                 })?;
+                let old_mm_id = prepared_kernel_exec.old_mm_id();
+                let replacement_mm_id = prepared_kernel_exec.replacement_mm_id();
+                // Allocate both complete transaction envelopes before proc-state
+                // mutation or topology/backend locking. Dropping the guard on
+                // any pre-replacement failure abandons both runtime records and
+                // dropping `prepared_kernel_exec` rolls back Kernel preparation.
+                let _inventory_abandon = if let Some(process) = kernel.hvpatch_process.as_ref() {
+                    let (old_extent_count, replacement_extent_count) =
+                        engine.frame_inventory_exec_extent_counts(&img);
+                    let old_capacity =
+                        super::quiesce::inventory_capacity_for_extents(old_extent_count)?;
+                    let replacement_capacity =
+                        super::quiesce::inventory_capacity_for_extents(replacement_extent_count)?;
+                    let retired = process
+                        .kernel_graph()
+                        .reserve_frame_inventory(0, 0, old_capacity)
+                        .map_err(|error| {
+                            RuntimeError::Configuration(format!(
+                                "reserve HVPatch exec retirement inventory: {error}"
+                            ))
+                        })?;
+                    let retired_transaction = retired.transaction();
+                    let replacement = match process.kernel_graph().reserve_frame_inventory(
+                        replacement_extent_count,
+                        replacement_extent_count,
+                        replacement_capacity,
+                    ) {
+                        Ok(reservation) => reservation,
+                        Err(error) => {
+                            process
+                                .kernel_graph()
+                                .frame_inventory()
+                                .abandon(retired_transaction);
+                            return Err(RuntimeError::Configuration(format!(
+                                "reserve HVPatch exec replacement inventory: {error}"
+                            )));
+                        }
+                    };
+                    let replacement_transaction = replacement.transaction();
+                    let abandon = super::quiesce::InventoryAbandon::new(
+                        process.kernel_graph().frame_inventory(),
+                        [retired_transaction, replacement_transaction],
+                    );
+                    engine
+                        .begin_exec_inventory(retired, replacement)
+                        .map_err(RuntimeError::Trap)?;
+                    Some(abandon)
+                } else {
+                    None
+                };
                 let proc_state_started = std::time::Instant::now();
                 if should_update_host_process_title(kernel.hvpatch_process.is_some()) {
                     crate::dispatch::set_host_process_name(cmdline.as_bytes());
@@ -211,6 +306,42 @@ where
                 );
                 let engine_replace_started = std::time::Instant::now();
                 engine.execve_into(&img)?;
+                // `execve_into` has released every stage-2/frame lock. Topology
+                // serialization must also be released before runtime takes its
+                // frame-inventory authority lock.
+                drop(_hvpatch_topology);
+                if let Some(process) = kernel.hvpatch_process.as_ref() {
+                    let (retired_commit, replacement_commit) =
+                        engine.take_exec_inventory().unwrap_or_else(|| {
+                            tracing::error!(
+                                ?old_mm_id,
+                                ?replacement_mm_id,
+                                "HVPatch destructive exec produced no frame inventory commits"
+                            );
+                            std::process::abort();
+                        });
+                    if let Err(error) = apply_exec_inventory(
+                        old_mm_id,
+                        replacement_mm_id,
+                        retired_commit,
+                        replacement_commit,
+                        |mm, commit| {
+                            process
+                                .kernel_graph()
+                                .frame_inventory()
+                                .apply(mm, commit)
+                                .map(|_| ())
+                        },
+                    ) {
+                        tracing::error!(
+                            ?old_mm_id,
+                            ?replacement_mm_id,
+                            %error,
+                            "apply HVPatch exec frame inventory"
+                        );
+                        std::process::abort();
+                    }
+                }
                 let committed_context = match kernel.hvpatch_process.as_ref() {
                     Some(process) => {
                         const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
