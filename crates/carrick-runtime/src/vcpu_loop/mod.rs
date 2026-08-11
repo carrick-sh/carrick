@@ -2491,6 +2491,16 @@ where
                         .kernel()
                         .reserve_frame_inventory(1, 1, capacity)?;
                     let inventory_transaction = reservation.transaction();
+                    let process = kernel.hvpatch_process.as_ref().ok_or_else(|| {
+                        RuntimeError::Configuration(
+                            "HVPatch alias inventory has no process context".to_owned(),
+                        )
+                    })?;
+                    let topology = crate::fork_quiesce::acquire_topology_lock(
+                        carrick_observability::probes::HvpatchTopologyOperation::AliasMap,
+                        process.pid(),
+                        self.this_tid.raw(),
+                    );
                     if let Err(error) = engine.begin_alias_inventory(reservation) {
                         let abandoned = kernel_context
                             .kernel()
@@ -2515,9 +2525,10 @@ where
                     let Some(commit) = engine.take_alias_inventory() else {
                         std::process::abort();
                     };
-                    // `map_host_alias` has returned and released backend locks.
-                    // Publish to the syscall-entry mm before making the
-                    // dispatcher's install visible to siblings.
+                    // Serialize both the reservation slot and raw HVF topology
+                    // mutation. Authority publication takes its own lock only
+                    // after the topology lock and backend locks are released.
+                    drop(topology);
                     if apply_alias_frame_inventory(&kernel_context, commit).is_err() {
                         std::process::abort();
                     }

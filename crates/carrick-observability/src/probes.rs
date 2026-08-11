@@ -754,6 +754,7 @@ pub enum HvpatchTopologyOperation {
     VmRelease = 5,
     LegacyFork = 6,
     ProcessRetire = 7,
+    AliasMap = 8,
 }
 
 impl HvpatchTopologyOperation {
