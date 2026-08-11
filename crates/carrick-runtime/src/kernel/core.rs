@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Weak};
 
 use carrick_hal::{FrameEventCapacity, FrameInventoryReservation, ThreadId};
-use parking_lot::{Condvar, Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::address::MmBackend;
 use super::frame_inventory::{FrameInventoryAuthority, FrameInventoryReserveError};
@@ -426,7 +426,8 @@ impl Kernel {
             diagnostic_name: bootstrap.diagnostic_name,
         };
         let registry = Registry {
-            state: RwLock::new(RegistryState {
+            state: RegistryLock::new(RegistryState {
+                epoch: 1,
                 root: task_key,
                 tasks: BTreeMap::from([(bootstrap.task_id, task_record)]),
                 zombies: BTreeMap::new(),
@@ -657,7 +658,37 @@ impl Kernel {
 /// may then take at most one Task or subsystem leaf lock.
 #[derive(Debug)]
 pub struct Registry {
-    pub(super) state: RwLock<RegistryState>,
+    pub(super) state: RegistryLock,
+}
+
+#[derive(Debug)]
+pub(super) struct RegistryLock {
+    inner: RwLock<RegistryState>,
+}
+
+impl RegistryLock {
+    fn new(state: RegistryState) -> Self {
+        Self {
+            inner: RwLock::new(state),
+        }
+    }
+
+    pub(super) fn read(&self) -> RwLockReadGuard<'_, RegistryState> {
+        self.inner.read()
+    }
+
+    pub(super) fn try_read_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Option<RwLockReadGuard<'_, RegistryState>> {
+        self.inner.try_read_until(deadline)
+    }
+
+    pub(super) fn write(&self) -> RwLockWriteGuard<'_, RegistryState> {
+        let mut state = self.inner.write();
+        state.publish_epoch();
+        state
+    }
 }
 
 impl Registry {
@@ -742,6 +773,7 @@ impl Registry {
 
 #[derive(Debug)]
 pub(super) struct RegistryState {
+    pub(super) epoch: u64,
     pub(super) root: TaskKey,
     pub(super) tasks: BTreeMap<TaskId, TaskRecord>,
     pub(super) zombies: BTreeMap<TaskId, ZombieRecord>,
@@ -749,6 +781,15 @@ pub(super) struct RegistryState {
     pub(super) reservations: BTreeMap<TaskId, carrick_hal::KernelTransactionId>,
     pub(super) retired_threads: Vec<RetiredThreadRecord>,
     pub(super) sessions: BTreeMap<SessionId, SessionRecord>,
+}
+
+impl RegistryState {
+    fn publish_epoch(&mut self) {
+        let Some(next) = self.epoch.checked_add(1) else {
+            std::process::abort();
+        };
+        self.epoch = next;
+    }
 }
 
 #[derive(Debug)]
@@ -771,6 +812,8 @@ pub(super) struct ZombieRecord {
 
 #[derive(Debug)]
 pub(super) struct RetiredThreadRecord {
+    pub(super) key: ThreadKey,
+    pub(super) task: TaskKey,
     pub(super) thread: Weak<Thread>,
     pub(super) _claim: ThreadClaim,
 }

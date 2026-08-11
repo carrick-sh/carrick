@@ -1,4 +1,5 @@
 use std::num::NonZeroU16;
+use std::time::Instant;
 
 use carrick_guest_mem::{Gpa, GuestVa};
 use carrick_hal::MappingId;
@@ -67,8 +68,20 @@ pub struct VmaSummary {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SnapshotTable {
+    Mms,
     Vmas,
     Mappings,
+}
+
+/// One backend-generation observation. Implementations must copy all three
+/// tables under one revision protocol; callers never compose independent
+/// binding, VMA, and mapping reads.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MmBackendSnapshot {
+    pub revision: u64,
+    pub binding: MmBinding,
+    pub vmas: Vec<VmaSummary>,
+    pub mapping_ids: Vec<MappingId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -77,12 +90,15 @@ pub enum SnapshotError {
     AuthorityUnavailable(SnapshotTable),
     #[error("backend snapshot changed while it was being observed")]
     ChangedDuringObservation,
+    #[error("backend snapshot lock is busy")]
+    Busy,
+    #[error("backend snapshot deadline expired")]
+    TimedOut,
 }
 
 pub trait MmBackend: Send + Sync {
-    fn binding(&self) -> MmBinding;
-    fn vma_summaries(&self) -> Result<Vec<VmaSummary>, SnapshotError>;
-    fn mapping_ids(&self) -> Result<Vec<MappingId>, SnapshotError>;
+    fn snapshot(&self, deadline: Instant) -> Result<MmBackendSnapshot, SnapshotError>;
+    fn revision(&self) -> u64;
 }
 
 /// A validated `TTBR0_EL1` value composed from typed ASID and root domains.

@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU64;
+use std::time::Instant;
 
 use carrick_guest_mem::Gpa;
 use carrick_hal::{
@@ -290,6 +291,28 @@ impl FrameInventoryAuthority {
 
     pub fn snapshot_for_mm(&self, mm: MmId) -> FrameInventorySnapshot {
         snapshot_state(&self.state.lock(), Some(mm))
+    }
+
+    pub(crate) fn snapshot_until(&self, deadline: Instant) -> Option<FrameInventorySnapshot> {
+        self.state
+            .try_lock_until(deadline)
+            .map(|state| snapshot_state(&state, None))
+    }
+
+    pub(crate) fn snapshot_for_mm_until(
+        &self,
+        mm: MmId,
+        deadline: Instant,
+    ) -> Option<FrameInventorySnapshot> {
+        self.state
+            .try_lock_until(deadline)
+            .map(|state| snapshot_state(&state, Some(mm)))
+    }
+
+    pub(crate) fn revision_until(&self, deadline: Instant) -> Option<u64> {
+        self.state
+            .try_lock_until(deadline)
+            .map(|state| state.revision)
     }
 
     #[cfg(test)]

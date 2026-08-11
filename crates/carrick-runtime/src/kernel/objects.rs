@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -16,6 +16,34 @@ use super::ids::{
     ThreadSerial,
 };
 use super::registry::{IdRegistry, ProcessGroupClaim, SessionClaim};
+
+#[derive(Default)]
+pub(super) struct ObjectRevision(AtomicU64);
+
+impl ObjectRevision {
+    const fn new() -> Self {
+        Self(AtomicU64::new(1))
+    }
+
+    pub(super) fn load(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn publish(&self) {
+        if self.0.fetch_add(1, Ordering::Release) == u64::MAX {
+            std::process::abort();
+        }
+    }
+}
+
+impl std::fmt::Debug for ObjectRevision {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("ObjectRevision")
+            .field(&self.load())
+            .finish()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TaskKey {
@@ -79,6 +107,7 @@ pub enum SignalDisposition {
 pub struct Sighand {
     id: SighandId,
     dispositions: Mutex<BTreeMap<LinuxSignal, SignalDisposition>>,
+    revision: ObjectRevision,
 }
 
 impl Sighand {
@@ -86,6 +115,7 @@ impl Sighand {
         Self {
             id,
             dispositions: Mutex::new(BTreeMap::new()),
+            revision: ObjectRevision::new(),
         }
     }
 
@@ -93,6 +123,7 @@ impl Sighand {
         Self {
             id,
             dispositions: Mutex::new(parent.dispositions.lock().clone()),
+            revision: ObjectRevision::new(),
         }
     }
 
@@ -108,6 +139,7 @@ impl Sighand {
         Self {
             id,
             dispositions: Mutex::new(dispositions),
+            revision: ObjectRevision::new(),
         }
     }
 
@@ -122,6 +154,7 @@ impl Sighand {
         } else {
             dispositions.insert(signal, disposition);
         }
+        self.revision.publish();
     }
 
     pub fn disposition(&self, signal: LinuxSignal) -> SignalDisposition {
@@ -130,6 +163,21 @@ impl Sighand {
             .get(&signal)
             .copied()
             .unwrap_or(SignalDisposition::Default)
+    }
+
+    pub(super) fn snapshot_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Option<(u64, Vec<(LinuxSignal, SignalDisposition)>)> {
+        let values = self.dispositions.try_lock_until(deadline)?;
+        Some((
+            self.revision.load(),
+            values.iter().map(|(k, v)| (*k, *v)).collect(),
+        ))
+    }
+
+    pub(super) fn revision(&self) -> u64 {
+        self.revision.load()
     }
 }
 
@@ -145,6 +193,7 @@ enum FileDescriptionKind {
 pub struct FileDescription {
     id: FileDescriptionId,
     kind: FileDescriptionKind,
+    revision: ObjectRevision,
 }
 
 impl FileDescription {
@@ -152,6 +201,7 @@ impl FileDescription {
         Self {
             id,
             kind: FileDescriptionKind::Regular,
+            revision: ObjectRevision::new(),
         }
     }
 
@@ -159,6 +209,7 @@ impl FileDescription {
         Self {
             id,
             kind: FileDescriptionKind::Epoll(Mutex::new(BTreeMap::new())),
+            revision: ObjectRevision::new(),
         }
     }
 
@@ -183,7 +234,9 @@ impl FileDescription {
         if target.is_epoll() {
             return Err(ObjectGraphError::NestedEpollInterest(target.id));
         }
-        interests.lock().insert(target.id, Arc::downgrade(target));
+        let mut interests = interests.lock();
+        interests.insert(target.id, Arc::downgrade(target));
+        self.revision.publish();
         Ok(())
     }
 
@@ -192,8 +245,36 @@ impl FileDescription {
             return Err(ObjectGraphError::NotEpoll(self.id));
         };
         let mut interests = interests.lock();
+        let before = interests.len();
         interests.retain(|_, target| target.strong_count() != 0);
+        if interests.len() != before {
+            self.revision.publish();
+        }
         Ok(interests.len())
+    }
+
+    pub(super) fn snapshot_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Option<(u64, bool, Vec<FileDescriptionId>)> {
+        match &self.kind {
+            FileDescriptionKind::Regular => Some((self.revision.load(), false, Vec::new())),
+            FileDescriptionKind::Epoll(interests) => {
+                let interests = interests.try_lock_until(deadline)?;
+                Some((
+                    self.revision.load(),
+                    true,
+                    interests
+                        .iter()
+                        .filter_map(|(id, target)| (target.strong_count() != 0).then_some(*id))
+                        .collect(),
+                ))
+            }
+        }
+    }
+
+    pub(super) fn revision(&self) -> u64 {
+        self.revision.load()
     }
 }
 
@@ -217,6 +298,7 @@ impl FileSlot {
 pub struct FileTable {
     id: FileTableId,
     slots: Mutex<BTreeMap<FileSlotNumber, FileSlot>>,
+    revision: ObjectRevision,
 }
 
 impl FileTable {
@@ -224,6 +306,7 @@ impl FileTable {
         Self {
             id,
             slots: Mutex::new(BTreeMap::new()),
+            revision: ObjectRevision::new(),
         }
     }
 
@@ -231,6 +314,7 @@ impl FileTable {
         Self {
             id,
             slots: Mutex::new(parent.slots.lock().clone()),
+            revision: ObjectRevision::new(),
         }
     }
 
@@ -244,6 +328,7 @@ impl FileTable {
         Self {
             id,
             slots: Mutex::new(slots),
+            revision: ObjectRevision::new(),
         }
     }
 
@@ -257,13 +342,16 @@ impl FileTable {
         description: Arc<FileDescription>,
         close_on_exec: bool,
     ) -> Option<FileSlot> {
-        self.slots.lock().insert(
+        let mut slots = self.slots.lock();
+        let replaced = slots.insert(
             number,
             FileSlot {
                 description,
                 close_on_exec,
             },
-        )
+        );
+        self.revision.publish();
+        replaced
     }
 
     pub fn slot(&self, number: FileSlotNumber) -> Option<FileSlot> {
@@ -272,6 +360,21 @@ impl FileTable {
 
     pub fn slot_count(&self) -> usize {
         self.slots.lock().len()
+    }
+
+    pub(super) fn snapshot_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Option<(u64, Vec<(FileSlotNumber, FileSlot)>)> {
+        let slots = self.slots.try_lock_until(deadline)?;
+        Some((
+            self.revision.load(),
+            slots.iter().map(|(k, v)| (*k, v.clone())).collect(),
+        ))
+    }
+
+    pub(super) fn revision(&self) -> u64 {
+        self.revision.load()
     }
 }
 
@@ -671,6 +774,7 @@ impl Task {
             task: Arc::downgrade(self),
             resources: ArcSwap::new(resources),
             signal_state: Mutex::new(ThreadSignalState::default()),
+            revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
         })
     }
@@ -689,6 +793,7 @@ impl Task {
             task: Arc::downgrade(self),
             resources: ArcSwap::new(resources),
             signal_state: Mutex::new(ThreadSignalState::for_clone_thread(caller_signal_state)),
+            revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
         })
     }
@@ -707,6 +812,7 @@ impl Task {
             task: Arc::downgrade(self),
             resources: ArcSwap::new(resources),
             signal_state: Mutex::new(ThreadSignalState::for_fork(caller_signal_state)),
+            revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
         })
     }
@@ -725,6 +831,7 @@ impl Task {
             task: Arc::downgrade(self),
             resources: ArcSwap::new(resources),
             signal_state: Mutex::new(ThreadSignalState::for_exec(caller.signal_state())),
+            revision: ObjectRevision::new(),
             runner_gate: Arc::clone(&caller.runner_gate),
         })
     }
@@ -837,6 +944,38 @@ impl Task {
 
     pub(super) fn live_thread_count(&self) -> usize {
         self.threads.lock().len()
+    }
+
+    pub(super) fn parent_until(&self, deadline: std::time::Instant) -> Option<Option<TaskKey>> {
+        self.parent.try_lock_until(deadline).map(|parent| *parent)
+    }
+
+    pub(super) fn children_until(&self, deadline: std::time::Instant) -> Option<Vec<TaskKey>> {
+        self.children
+            .try_lock_until(deadline)
+            .map(|children| children.iter().copied().collect())
+    }
+
+    pub(super) fn identity_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Option<(ProcessGroupId, SessionId)> {
+        self.identity
+            .try_lock_until(deadline)
+            .map(|identity| (identity.process_group, identity.session))
+    }
+
+    pub(super) fn lifecycle_until(&self, deadline: std::time::Instant) -> Option<TaskLifecycle> {
+        self.lifecycle.try_lock_until(deadline).map(|state| *state)
+    }
+
+    pub(super) fn threads_until(&self, deadline: std::time::Instant) -> Option<Vec<ThreadRef>> {
+        self.threads.try_lock_until(deadline).map(|threads| {
+            threads
+                .values()
+                .map(|(_, thread)| Arc::clone(thread))
+                .collect()
+        })
     }
 }
 
@@ -1060,6 +1199,7 @@ pub struct Thread {
     task: Weak<Task>,
     resources: ArcSwap<ThreadResources>,
     signal_state: Mutex<ThreadSignalState>,
+    revision: ObjectRevision,
     runner_gate: Arc<RunnerGate>,
 }
 
@@ -1081,7 +1221,9 @@ impl Thread {
     }
 
     pub fn replace_signal_state(&self, replacement: ThreadSignalState) {
-        *self.signal_state.lock() = replacement;
+        let mut state = self.signal_state.lock();
+        *state = replacement;
+        self.revision.publish();
     }
 
     pub fn bind_runner(self: &Arc<Self>) -> Result<ThreadRunner, ObjectGraphError> {
@@ -1101,12 +1243,26 @@ impl Thread {
         self.resources.load_full()
     }
 
+    pub(super) fn snapshot_signal_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Option<(u64, ThreadSignalState)> {
+        let state = self.signal_state.try_lock_until(deadline)?;
+        Some((self.revision.load(), *state))
+    }
+
+    pub(super) fn revision(&self) -> u64 {
+        self.revision.load()
+    }
+
     #[cfg(test)]
     pub(super) fn replace_resources(
         &self,
         replacement: Arc<ThreadResources>,
     ) -> Arc<ThreadResources> {
-        self.resources.swap(replacement)
+        let previous = self.resources.swap(replacement);
+        self.revision.publish();
+        previous
     }
 }
 

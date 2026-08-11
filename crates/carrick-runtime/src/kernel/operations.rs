@@ -1183,6 +1183,8 @@ impl Kernel {
         record.revision = next;
         if tid == LinuxTid::for_task_leader(context.task.key().id) {
             record.dead_leader = Some(super::core::RetiredThreadRecord {
+                key: thread.key(),
+                task: thread.task_key(),
                 thread: Arc::downgrade(&thread),
                 _claim: claim,
             });
@@ -1190,6 +1192,8 @@ impl Kernel {
             state
                 .retired_threads
                 .push(super::core::RetiredThreadRecord {
+                    key: thread.key(),
+                    task: thread.task_key(),
                     thread: Arc::downgrade(&thread),
                     _claim: claim,
                 });
@@ -1753,6 +1757,8 @@ impl Kernel {
                 state
                     .retired_threads
                     .push(super::core::RetiredThreadRecord {
+                        key: thread.key(),
+                        task: thread.task_key(),
                         thread: Arc::downgrade(&thread),
                         _claim: claim,
                     });
@@ -2093,14 +2099,13 @@ mod tests {
 
     use carrick_abi::{LinuxCloneFlags, SigSet};
     use carrick_guest_mem::Gpa;
-    use carrick_hal::MappingId;
     use proptest::prelude::*;
 
     use super::*;
     use crate::kernel::{
         Asid, Credentials, FileDescription, FileSlotNumber, FileTable, FsContext, LinuxSignal, Mm,
-        MmBinding, RootBootstrap, Sighand, SignalDisposition, SnapshotError, SnapshotTable,
-        Stage1Root, ThreadSignalState, VmaSummary,
+        MmBackendSnapshot, MmBinding, RootBootstrap, Sighand, SignalDisposition, SnapshotError,
+        Stage1Root, ThreadSignalState,
     };
 
     #[derive(Debug, Default)]
@@ -2116,16 +2121,20 @@ mod tests {
     struct TestMmBackend(MmBinding);
 
     impl MmBackend for TestMmBackend {
-        fn binding(&self) -> MmBinding {
-            self.0
+        fn snapshot(
+            &self,
+            _deadline: std::time::Instant,
+        ) -> Result<MmBackendSnapshot, SnapshotError> {
+            Ok(MmBackendSnapshot {
+                revision: 1,
+                binding: self.0,
+                vmas: Vec::new(),
+                mapping_ids: Vec::new(),
+            })
         }
 
-        fn vma_summaries(&self) -> Result<Vec<VmaSummary>, SnapshotError> {
-            Err(SnapshotError::AuthorityUnavailable(SnapshotTable::Vmas))
-        }
-
-        fn mapping_ids(&self) -> Result<Vec<MappingId>, SnapshotError> {
-            Err(SnapshotError::AuthorityUnavailable(SnapshotTable::Mappings))
+        fn revision(&self) -> u64 {
+            1
         }
     }
 
@@ -2551,7 +2560,9 @@ mod tests {
                 .mm()
                 .backend()
                 .expect("production backend")
-                .binding(),
+                .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
+                .expect("backend snapshot")
+                .binding,
             test_binding()
         );
         assert_ne!(kernel.ids().counts(), before);

@@ -12,10 +12,11 @@ pub mod ids;
 pub mod objects;
 pub mod operations;
 pub mod registry;
+pub mod snapshot;
 
 pub use address::{
-    Asid, MmBackend, MmBinding, SnapshotError, SnapshotTable, Stage1Root, Stage1RootError, Ttbr0,
-    VmaSummary,
+    Asid, MmBackend, MmBackendSnapshot, MmBinding, SnapshotError, SnapshotTable, Stage1Root,
+    Stage1RootError, Ttbr0, VmaSummary,
 };
 pub use clone_plan::{
     CloneObjectMode, ClonePlan, ClonePlanError, CloneTaskMode, ForkParentMode, ForkPidfdMode,
@@ -51,4 +52,12 @@ pub use operations::{
 pub use registry::{
     IdError, IdRegistry, IdRegistryCounts, ProcessGroupClaim, SessionClaim, TaskClaim,
     TaskReservation, ThreadClaim, ThreadReservation,
+};
+pub use snapshot::{
+    CredentialsSnapshotRow, FileDescriptionSnapshotKind, FileDescriptionSnapshotRow,
+    FileSlotSnapshotRow, FileTableSnapshotRow, FsContextSnapshotRow, KERNEL_SNAPSHOT_V1_SCHEMA,
+    KernelSnapshotError, KernelSnapshotV1, MmSnapshotRow, ProcessGroupSnapshotRow,
+    SessionSnapshotRow, SighandSnapshotRow, TaskSignalSnapshotRow, TaskSnapshotRow,
+    ThreadSignalSnapshotRow, ThreadSnapshotClass, ThreadSnapshotRow, VmaSnapshotRow,
+    ZombieSnapshotRow,
 };
