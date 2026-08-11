@@ -49,7 +49,7 @@ pub struct FrameInventoryAuthority {
     state: Mutex<InventoryState>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Debug, Default, Eq, PartialEq)]
 struct InventoryState {
     revision: u64,
     transactions: BTreeSet<KernelTransactionId>,
@@ -83,6 +83,88 @@ enum MappingState {
     Unmapped,
 }
 
+/// Transaction-local copy-on-write view. Only touched mappings and frames are
+/// cloned, so applying one alias remains O(events + aliases of touched frames)
+/// rather than O(the process-wide inventory).
+struct InventoryOverlay<'a> {
+    base: &'a InventoryState,
+    frames: BTreeMap<FrameId, Option<FrameEntry>>,
+    mappings: BTreeMap<MappingId, MappingEntry>,
+    new_frames: BTreeSet<FrameId>,
+}
+
+struct InventoryChanges {
+    frames: BTreeMap<FrameId, Option<FrameEntry>>,
+    mappings: BTreeMap<MappingId, MappingEntry>,
+    new_frames: BTreeSet<FrameId>,
+}
+
+impl<'a> InventoryOverlay<'a> {
+    fn new(base: &'a InventoryState) -> Self {
+        Self {
+            base,
+            frames: BTreeMap::new(),
+            mappings: BTreeMap::new(),
+            new_frames: BTreeSet::new(),
+        }
+    }
+
+    fn mapping(&self, mapping: MappingId) -> Option<&MappingEntry> {
+        self.mappings
+            .get(&mapping)
+            .or_else(|| self.base.mappings.get(&mapping))
+    }
+
+    fn mapping_mut(&mut self, mapping: MappingId) -> Option<&mut MappingEntry> {
+        if !self.mappings.contains_key(&mapping) {
+            let entry = *self.base.mappings.get(&mapping)?;
+            self.mappings.insert(mapping, entry);
+        }
+        self.mappings.get_mut(&mapping)
+    }
+
+    fn insert_mapping(&mut self, mapping: MappingId, entry: MappingEntry) {
+        self.mappings.insert(mapping, entry);
+    }
+
+    fn frame(&self, frame: FrameId) -> Option<&FrameEntry> {
+        match self.frames.get(&frame) {
+            Some(Some(entry)) => Some(entry),
+            Some(None) => None,
+            None => self.base.frames.get(&frame),
+        }
+    }
+
+    fn frame_mut(&mut self, frame: FrameId) -> Option<&mut FrameEntry> {
+        if !self.frames.contains_key(&frame) {
+            let entry = self.base.frames.get(&frame)?.clone();
+            self.frames.insert(frame, Some(entry));
+        }
+        self.frames.get_mut(&frame)?.as_mut()
+    }
+
+    fn frame_is_known(&self, frame: FrameId) -> bool {
+        self.new_frames.contains(&frame) || self.base.known_frames.contains(&frame)
+    }
+
+    fn insert_frame(&mut self, frame: FrameId, entry: FrameEntry) {
+        self.new_frames.insert(frame);
+        self.frames.insert(frame, Some(entry));
+    }
+
+    fn retire_frame(&mut self, frame: FrameId) {
+        self.frames.insert(frame, None);
+    }
+
+    fn into_changes(self) -> InventoryChanges {
+        InventoryChanges {
+            frames: self.frames,
+            mappings: self.mappings,
+            new_frames: self.new_frames,
+        }
+    }
+}
+
 impl FrameInventoryAuthority {
     pub fn new() -> Self {
         Self::default()
@@ -113,7 +195,7 @@ impl FrameInventoryAuthority {
             .revision
             .checked_add(1)
             .ok_or(FrameInventoryError::RevisionExhausted)?;
-        let mut candidate = state.clone();
+        let mut candidate = InventoryOverlay::new(&state);
         for (index, event) in batch.events().iter().copied().enumerate() {
             if fail_before_event == Some(index) {
                 return Err(FrameInventoryError::InjectedFailure(index));
@@ -128,9 +210,21 @@ impl FrameInventoryAuthority {
         }) {
             return Err(FrameInventoryError::UnpublishedMapping);
         }
-        candidate.transactions.insert(transaction);
-        candidate.revision = next_revision;
-        *state = candidate;
+        let changes = candidate.into_changes();
+        for (frame, entry) in changes.frames {
+            match entry {
+                Some(entry) => {
+                    state.frames.insert(frame, entry);
+                }
+                None => {
+                    state.frames.remove(&frame);
+                }
+            }
+        }
+        state.mappings.extend(changes.mappings);
+        state.known_frames.extend(changes.new_frames);
+        state.transactions.insert(transaction);
+        state.revision = next_revision;
         Ok(next_revision)
     }
 
@@ -154,7 +248,7 @@ impl FrameInventoryAuthority {
 }
 
 fn apply_event(
-    state: &mut InventoryState,
+    state: &mut InventoryOverlay<'_>,
     mm: MmId,
     transaction: KernelTransactionId,
     event: FrameInventoryEvent,
@@ -179,7 +273,7 @@ fn apply_event(
                     actual: generation.raw(),
                 });
             }
-            if let Some(existing) = state.mappings.get(&mapping) {
+            if let Some(existing) = state.mapping(mapping) {
                 return Err(if existing.mm != mm {
                     FrameInventoryError::CrossMmMappingReuse {
                         mapping,
@@ -190,14 +284,22 @@ fn apply_event(
                     FrameInventoryError::DuplicateMapping(mapping)
                 });
             }
-            if state.known_frames.contains(&frame) && !state.frames.contains_key(&frame) {
-                return Err(FrameInventoryError::RetiredFrame(frame));
+            if state.frame(frame).is_none() {
+                if state.frame_is_known(frame) {
+                    return Err(FrameInventoryError::RetiredFrame(frame));
+                }
+                state.insert_frame(
+                    frame,
+                    FrameEntry {
+                        length,
+                        mappings: BTreeSet::new(),
+                        greatest_generation: generation,
+                    },
+                );
             }
-            let frame_entry = state.frames.entry(frame).or_insert_with(|| FrameEntry {
-                length,
-                mappings: BTreeSet::new(),
-                greatest_generation: generation,
-            });
+            let frame_entry = state
+                .frame_mut(frame)
+                .ok_or(FrameInventoryError::RetiredFrame(frame))?;
             if frame_entry.length != length {
                 return Err(FrameInventoryError::FrameLengthMismatch {
                     frame,
@@ -209,8 +311,7 @@ fn apply_event(
             if generation > frame_entry.greatest_generation {
                 frame_entry.greatest_generation = generation;
             }
-            state.known_frames.insert(frame);
-            state.mappings.insert(
+            state.insert_mapping(
                 mapping,
                 MappingEntry {
                     frame,
@@ -229,8 +330,7 @@ fn apply_event(
             ..
         } => {
             let entry = state
-                .mappings
-                .get_mut(&mapping)
+                .mapping_mut(mapping)
                 .ok_or(FrameInventoryError::NonliveMapping(mapping))?;
             if entry.mm != mm {
                 return Err(FrameInventoryError::CrossMmMappingReuse {
@@ -261,8 +361,7 @@ fn apply_event(
                 entry.frame
             };
             let frame = state
-                .frames
-                .get_mut(&frame_id)
+                .frame_mut(frame_id)
                 .ok_or(FrameInventoryError::RetiredFrame(frame_id))?;
             if generation > frame.greatest_generation {
                 frame.greatest_generation = generation;
@@ -281,8 +380,7 @@ fn apply_event(
                 entry.frame
             };
             let frame = state
-                .frames
-                .get_mut(&frame_id)
+                .frame_mut(frame_id)
                 .ok_or(FrameInventoryError::RetiredFrame(frame_id))?;
             frame.mappings.remove(&mapping);
             if generation > frame.greatest_generation {
@@ -293,8 +391,7 @@ fn apply_event(
             frame, generation, ..
         } => {
             let entry = state
-                .frames
-                .get(&frame)
+                .frame(frame)
                 .ok_or(FrameInventoryError::RetiredFrame(frame))?;
             if !entry.mappings.is_empty() {
                 return Err(FrameInventoryError::FrameStillMapped(frame));
@@ -307,20 +404,19 @@ fn apply_event(
                     actual: generation.raw(),
                 });
             }
-            state.frames.remove(&frame);
+            state.retire_frame(frame);
         }
     }
     Ok(())
 }
 
-fn live_mapping_mut(
-    state: &mut InventoryState,
+fn live_mapping_mut<'a>(
+    state: &'a mut InventoryOverlay<'_>,
     mm: MmId,
     mapping: MappingId,
-) -> Result<&mut MappingEntry, FrameInventoryError> {
+) -> Result<&'a mut MappingEntry, FrameInventoryError> {
     let entry = state
-        .mappings
-        .get_mut(&mapping)
+        .mapping_mut(mapping)
         .ok_or(FrameInventoryError::NonliveMapping(mapping))?;
     if entry.mm != mm {
         return Err(FrameInventoryError::CrossMmMappingReuse {
@@ -392,10 +488,11 @@ fn snapshot_state(state: &InventoryState, mm_filter: Option<MmId>) -> FrameInven
         .keys()
         .filter(|frame| {
             mm_filter.is_none_or(|mm| {
-                state
-                    .mappings
-                    .values()
-                    .any(|mapping| mapping.frame == **frame && mapping.mm == mm)
+                state.mappings.values().any(|mapping| {
+                    mapping.frame == **frame
+                        && mapping.mm == mm
+                        && mapping.state == MappingState::Published
+                })
             })
         })
         .map(|frame| (*frame, Vec::new()))
@@ -602,6 +699,34 @@ mod tests {
     }
 
     #[test]
+    fn sparse_40_gib_extent_stays_one_k1_frame_and_mapping() {
+        let fixture = Fixture::new();
+        const SPARSE_BANK_LEN: u64 = 40 * 1024 * 1024 * 1024;
+        let batch = fixture.batch(2, |transaction, reservation| {
+            let frame = reservation.claim_frame().expect("extent frame");
+            let mapping = reservation.claim_mapping().expect("extent mapping");
+            prepare_publish(
+                reservation,
+                transaction,
+                frame,
+                mapping,
+                0x4000,
+                SPARSE_BANK_LEN,
+            );
+        });
+        fixture
+            .authority
+            .apply(fixture.mm1, batch)
+            .expect("apply sparse extent");
+
+        let snapshot = fixture.authority.snapshot();
+        assert_eq!(snapshot.frames.len(), 1);
+        assert_eq!(snapshot.mappings.len(), 1);
+        assert_eq!(snapshot.frames[0].length.raw(), SPARSE_BANK_LEN);
+        assert_eq!(snapshot.mappings[0].length.raw(), SPARSE_BANK_LEN);
+    }
+
+    #[test]
     fn shared_frame_aliases_and_copied_frames_have_exact_sorted_joins() {
         let fixture = Fixture::new();
         let batch = fixture.batch(6, |transaction, reservation| {
@@ -744,6 +869,9 @@ mod tests {
         assert_eq!(unmapped.frames.len(), 1);
         assert!(unmapped.frames[0].mappings.is_empty());
         assert!(unmapped.mappings.is_empty());
+        let mm_view = fixture.authority.snapshot_for_mm(fixture.mm1);
+        assert!(mm_view.frames.is_empty());
+        assert!(mm_view.mappings.is_empty());
 
         let retire = fixture.batch(1, |transaction, reservation| {
             reservation
