@@ -3,6 +3,7 @@
 //! These values are allocated by the kernel object model and cross the
 //! runtime/backend boundary without exposing pointers or raw host identities.
 
+use std::fmt;
 use std::num::{NonZeroU64, NonZeroUsize};
 
 use carrick_guest_mem::Gpa;
@@ -35,6 +36,26 @@ macro_rules! hal_id {
 hal_id!(FrameId);
 hal_id!(MappingId);
 hal_id!(KernelTransactionId);
+
+/// Unpredictable authority capability bound to one runtime reservation.
+///
+/// The bytes are deliberately not exported or printed. Public construction
+/// lets a dependency-neutral HAL accept kernel entropy, while authentication
+/// still requires matching the authority's independently retained capability.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct FrameInventoryProvenance([u8; 32]);
+
+impl FrameInventoryProvenance {
+    pub const fn from_kernel_entropy(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl fmt::Debug for FrameInventoryProvenance {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FrameInventoryProvenance(REDACTED)")
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
@@ -213,6 +234,7 @@ impl FrameInventoryBatch {
 /// the runtime's monotonic object-ID registry never reissues them.
 #[derive(Debug, Eq, PartialEq)]
 pub struct FrameInventoryReservation {
+    provenance: FrameInventoryProvenance,
     batch: FrameInventoryBatch,
     frame_candidates: Vec<FrameId>,
     mapping_candidates: Vec<MappingId>,
@@ -225,11 +247,13 @@ impl FrameInventoryReservation {
     /// Both candidate vectors and the event batch must already own all storage
     /// needed while backend locks are held.
     pub fn from_kernel_candidates(
+        provenance: FrameInventoryProvenance,
         batch: FrameInventoryBatch,
         frame_candidates: Vec<FrameId>,
         mapping_candidates: Vec<MappingId>,
     ) -> Self {
         Self {
+            provenance,
             batch,
             frame_candidates,
             mapping_candidates,
@@ -269,6 +293,7 @@ impl FrameInventoryReservation {
     /// pointer-free inventory batch. This performs no runtime callback.
     pub fn commit<T>(self, outcome: T) -> FrameInventoryCommit<T> {
         FrameInventoryCommit {
+            provenance: self.provenance,
             outcome,
             batch: self.batch,
         }
@@ -279,11 +304,16 @@ impl FrameInventoryReservation {
 /// after releasing all backend locks.
 #[derive(Debug, Eq, PartialEq)]
 pub struct FrameInventoryCommit<T> {
+    provenance: FrameInventoryProvenance,
     outcome: T,
     batch: FrameInventoryBatch,
 }
 
 impl<T> FrameInventoryCommit<T> {
+    pub fn provenance_matches(&self, expected: FrameInventoryProvenance) -> bool {
+        self.provenance == expected
+    }
+
     pub fn outcome(&self) -> &T {
         &self.outcome
     }
@@ -415,7 +445,9 @@ mod tests {
         let frames = vec![FrameId::from_kernel_allocation(id(2))];
         let mappings = vec![MappingId::from_kernel_allocation(id(3))];
         let batch = FrameInventoryBatch::prepare(transaction, capacity(1)).expect("batch");
+        let provenance = FrameInventoryProvenance::from_kernel_entropy([7; 32]);
         let mut reservation = FrameInventoryReservation::from_kernel_candidates(
+            provenance,
             batch,
             frames.clone(),
             mappings.clone(),
@@ -429,6 +461,8 @@ mod tests {
         assert_eq!(reservation.claim_mapping(), Ok(mappings[0]));
         let commit = reservation.commit("mapped");
         assert_eq!(commit.outcome(), &"mapped");
+        assert!(commit.provenance_matches(provenance));
+        assert!(!commit.provenance_matches(FrameInventoryProvenance::from_kernel_entropy([8; 32])));
         assert_eq!(commit.batch().transaction(), transaction);
         let (outcome, batch) = commit.into_parts();
         assert_eq!(outcome, "mapped");
