@@ -89,6 +89,7 @@ serial_id!(MmId);
 serial_id!(FileTableId);
 serial_id!(FileDescriptionId);
 serial_id!(FsContextId);
+serial_id!(CredentialsId);
 serial_id!(SighandId);
 
 impl TaskId {
@@ -195,6 +196,10 @@ impl ObjectIdRegistry {
 
     pub fn fs_context_id(&self) -> Result<FsContextId, ObjectIdError> {
         self.allocate().map(FsContextId::from_registry_allocation)
+    }
+
+    pub fn credentials_id(&self) -> Result<CredentialsId, ObjectIdError> {
+        self.allocate().map(CredentialsId::from_registry_allocation)
     }
 
     pub fn sighand_id(&self) -> Result<SighandId, ObjectIdError> {

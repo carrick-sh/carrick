@@ -2,9 +2,9 @@
 
 Status:
 
-- The base EL1 identity shim is the mergeable path. It services `getpid`,
-  `getuid`, `geteuid`, `getgid`, `getegid`, and `gettid` without an HVF exit
-  while preserving Carrick's Linux-visible values.
+- The base EL1 identity shim services `getpid` and `gettid` without an HVF
+  exit. Credential reads trap through Kernel dispatch because Linux credentials
+  can diverge per thread and cannot live on one process-shared page.
 - `carrick-cli` enables the base shim by default through the `syscall-shim`
   Cargo feature. `carrick-runtime` has no default feature so the binary remains
   the control point; `--no-default-features` builds the legacy trap-only path.
@@ -23,15 +23,15 @@ The trap path is `svc -> EL1 vector -> hvc #2 -> HVF exit -> host dispatch`.
 Skipping that path is correct only when the answer is already local to Carrick
 or the guest CPU and can be returned exactly.
 
-The safe set is the process/thread identity calls:
+The safe set is the identities that do not diverge across sibling threads:
 
 - `getpid` returns Carrick's namespace-aware process id.
-- `getuid`, `geteuid`, `getgid`, and `getegid` return mutable Carrick credential
-  state.
 - `gettid` returns the current guest-visible thread id.
 
-These values are not host constants, so an extended vDSO is the wrong model for
-them. The dispatcher owns the values and stamps guest-visible state at runtime.
+`getuid`, `geteuid`, `getgid`, and `getegid` are deliberately excluded. Their
+immutable Kernel credential objects can diverge per thread after a COW
+publication. The normal trap path reads the exact dispatch-captured
+`KernelContext`; a process-shared page would be a false mirror.
 
 ## Data Model
 
@@ -40,18 +40,12 @@ The per-process identity page lives in the kernel hole at
 
 ```text
 +0x00  pid
-+0x04  uid
-+0x08  euid
-+0x0c  gid
-+0x10  egid
++0x04  shim-enabled
 ```
 
-The runtime stamps this page:
-
-- before the first vCPU run,
-- after fork in the child,
-- after exec into the new address space,
-- after credential mutations.
+The runtime stamps this page before the first vCPU run, after fork in the
+child, and after exec into a new address space. Credential mutations do not
+write it.
 
 `gettid` is per-thread, so it is not stored in the shared identity page. Each
 vCPU gets its guest-visible tid stamped into `TPIDR_EL1`; the EL1 handler reads

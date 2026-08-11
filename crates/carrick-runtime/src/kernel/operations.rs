@@ -15,9 +15,9 @@ use super::core::{
 };
 use super::ids::{LinuxTid, MmId, ObjectIdError, ProcessGroupId, SessionId, TaskId};
 use super::objects::{
-    LinuxWaitStatus, Mm, ObjectGraphError, ProcessGroup, Session, Task, TaskKey, TaskLifecycle,
-    TaskRef, TaskRusage, TaskShared, TaskSharedCloneError, ThreadKey, ThreadRef, ThreadResources,
-    Zombie,
+    Credentials, LinuxWaitStatus, Mm, ObjectGraphError, ProcessGroup, Session, Task, TaskKey,
+    TaskLifecycle, TaskRef, TaskRusage, TaskShared, TaskSharedCloneError, ThreadKey, ThreadRef,
+    ThreadResources, Zombie,
 };
 use super::registry::{IdError, TaskReservation, ThreadClaim, ThreadReservation};
 
@@ -962,7 +962,7 @@ impl Kernel {
             return Err(KernelOperationError::ExpectedNewTask);
         }
         let transaction = self.object_ids().transaction_id()?;
-        let (child_parent_task, child_parent_revision, operation) = {
+        let (caller_revision, child_parent_task, child_parent_revision, operation) = {
             let mut state = self.registry().state.write();
             let caller_record = state
                 .tasks
@@ -974,8 +974,19 @@ impl Kernel {
             if caller_record.revision != parent.revision {
                 return Err(KernelOperationError::StaleContext);
             }
+            let caller_thread = caller_record
+                .task
+                .thread(parent.thread.key().tid)
+                .ok_or(KernelOperationError::UnknownThread(parent.thread.key().tid))?;
+            if !Arc::ptr_eq(&caller_thread, &parent.thread)
+                || !Arc::ptr_eq(&caller_thread.resources(), &parent.resources)
+                || !Arc::ptr_eq(&caller_record.task.shared(), &parent.shared)
+            {
+                return Err(KernelOperationError::StaleContext);
+            }
+            let caller_revision = caller_record.revision;
             let (child_parent_task, child_parent_revision) = match plan.fork_parent() {
-                ForkParentMode::Caller => (Arc::clone(&parent.task), parent.revision),
+                ForkParentMode::Caller => (Arc::clone(&parent.task), caller_revision),
                 ForkParentMode::InheritCallerParent => {
                     let parent_key = parent.task.parent().ok_or(
                         KernelOperationError::CloneParentUnavailable(parent.task.key().id),
@@ -996,7 +1007,12 @@ impl Kernel {
                 vec![parent.task.key().id, child_parent_task.key().id],
                 transaction,
             )?;
-            (child_parent_task, child_parent_revision, operation)
+            (
+                caller_revision,
+                child_parent_task,
+                child_parent_revision,
+                operation,
+            )
         };
         let (child_id, task_reservation) = self.ids().reserve_task()?;
         let leader_claim = self.ids().claim_task_leader_thread(child_id)?;
@@ -1010,7 +1026,7 @@ impl Kernel {
             caller_thread: Arc::clone(&parent.thread),
             caller_shared: Arc::clone(&parent.shared),
             caller_resources: Arc::clone(&parent.resources),
-            caller_revision: parent.revision,
+            caller_revision,
             child_parent_task,
             child_parent_revision,
             plan,
@@ -1207,6 +1223,74 @@ impl Kernel {
                 });
         }
         Ok(next)
+    }
+
+    /// Publish an immutable credential COW for exactly the calling thread.
+    ///
+    /// The captured resource bundle is validated under the registry write lock,
+    /// then replaced with one `ArcSwap` publication. Sibling threads retain
+    /// their prior credentials and in-flight syscalls retain their captured
+    /// coherent bundle.
+    pub fn update_credentials(
+        self: &Arc<Self>,
+        context: &KernelContext,
+        update: impl FnOnce(&mut Credentials),
+    ) -> Result<KernelContext, KernelOperationError> {
+        if !Arc::ptr_eq(self, &context.kernel) {
+            return Err(KernelOperationError::ForeignContext);
+        }
+        let task_id = context.task.key().id;
+        let mut update = Some(update);
+        loop {
+            let observed = self.reservation_epoch();
+            let state = self.registry().state.write();
+            if let Err(KernelOperationError::TaskBusy(_)) = ensure_task_unreserved(&state, task_id)
+            {
+                drop(state);
+                self.wait_for_reservation_change(observed);
+                continue;
+            }
+            ensure_task_unreserved(&state, task_id)?;
+            let record = state
+                .tasks
+                .get(&task_id)
+                .ok_or(KernelOperationError::ParentExited)?;
+            if record.task.key() != context.task.key() {
+                return Err(KernelOperationError::ParentExited);
+            }
+            let thread = record.task.thread(context.thread.key().tid).ok_or(
+                KernelOperationError::UnknownThread(context.thread.key().tid),
+            )?;
+            if thread.key() != context.thread.key()
+                || !Arc::ptr_eq(&thread, &context.thread)
+                || !Arc::ptr_eq(&thread.resources(), &context.resources)
+            {
+                return Err(KernelOperationError::StaleContext);
+            }
+
+            let mut credentials = Credentials::for_copy(
+                self.object_ids().credentials_id()?,
+                &context.resources.credentials(),
+            );
+            update.take().ok_or(KernelOperationError::StaleContext)?(&mut credentials);
+            let resources = Arc::new(context.resources.with_credentials(Arc::new(credentials)));
+            // `TaskRevision` protects task topology and shared process state.
+            // A thread-local credential COW changes neither; the exact
+            // `ThreadResources` pointer and stable credential identity are the
+            // publication generation for this association.
+            let revision = record.revision;
+            let task = Arc::clone(&record.task);
+            thread.replace_resources(Arc::clone(&resources));
+            self.observe_thread_publication(&thread, &resources, revision);
+            return Ok(KernelContext::from_parts(
+                self.clone(),
+                task,
+                thread,
+                Arc::clone(&context.shared),
+                resources,
+                revision,
+            ));
+        }
     }
 
     /// Test registry-locked association publication without invoking the exec
@@ -3193,7 +3277,12 @@ mod tests {
             Arc::new(FsContext::new(
                 kernel.object_ids().fs_context_id().expect("second fs"),
             )),
-            Arc::new(Credentials::new()),
+            Arc::new(Credentials::root(
+                kernel
+                    .object_ids()
+                    .credentials_id()
+                    .expect("second credentials"),
+            )),
         ));
         let task_id = root.task.key().id;
         let tid = root.thread.key().tid;
@@ -4210,5 +4299,325 @@ mod tests {
         kernel.sweep_retired_threads();
         assert!(!kernel.ids().is_reserved_number(child_id.raw()));
         assert_eq!(kernel.registry().zombie_count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod credential_authority_tests {
+    use super::*;
+    use crate::kernel::{ClonePlan, Kernel, RootBootstrap};
+    use carrick_abi::LinuxCloneFlags;
+    use carrick_hal::ThreadId;
+    use std::sync::Arc;
+
+    fn bootstrap(pid: i32) -> (Arc<Kernel>, KernelContext) {
+        Kernel::bootstrap_root(
+            RootBootstrap::for_reference_model(
+                pid,
+                ThreadId::synthetic_for_tests(pid),
+                "credential-authority-test".to_owned(),
+            )
+            .expect("bootstrap input"),
+        )
+        .expect("bootstrap")
+    }
+
+    #[test]
+    fn sibling_thread_credential_cow_diverges_only_calling_thread() {
+        let (kernel, root) = bootstrap(8_100);
+        let root = kernel
+            .update_credentials(&root, |credentials| credentials.seed_identity(1000, 1000))
+            .expect("seed root credentials");
+        let plan = ClonePlan::from_flags(
+            LinuxCloneFlags::VM
+                | LinuxCloneFlags::SIGHAND
+                | LinuxCloneFlags::THREAD
+                | LinuxCloneFlags::FILES
+                | LinuxCloneFlags::FS,
+        )
+        .expect("thread clone plan");
+        let sibling = kernel
+            .clone_thread(&root, plan, ThreadId::synthetic_for_tests(8_101), None)
+            .expect("clone thread");
+        assert_ne!(
+            root.resources().credentials().id(),
+            sibling.resources().credentials().id()
+        );
+
+        let sibling = kernel
+            .update_credentials(&sibling, |credentials| {
+                credentials.set_fsuid(2000);
+                credentials.set_supplementary_groups(vec![7, 11]);
+            })
+            .expect("publish sibling credentials");
+        assert_eq!(root.resources().credentials().fsuid(), 1000);
+        assert_eq!(
+            root.resources()
+                .credentials()
+                .supplementary_groups_override(),
+            None
+        );
+        assert_eq!(sibling.resources().credentials().fsuid(), 2000);
+        assert_eq!(
+            sibling
+                .resources()
+                .credentials()
+                .supplementary_groups_override(),
+            Some([7, 11].as_slice())
+        );
+        let fresh_root = kernel
+            .context(root.task().key().id, root.thread().key().tid)
+            .expect("fresh root context");
+        assert_eq!(fresh_root.resources().credentials().fsuid(), 1000);
+    }
+
+    #[test]
+    fn fork_copies_values_with_distinct_credential_identity() {
+        let (kernel, root) = bootstrap(8_200);
+        let root = kernel
+            .update_credentials(&root, |credentials| {
+                credentials.seed_identity(123, 456);
+                credentials.set_fsuid(321);
+                credentials.set_fsgid(654);
+                credentials.set_umask(0o077);
+                credentials.set_supplementary_groups(vec![2, 4, 8]);
+            })
+            .expect("seed parent credentials");
+        let child = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(8_201),
+                "credential-child".to_owned(),
+                None,
+            )
+            .expect("fork task");
+        let parent = root.resources().credentials();
+        let child = child.resources().credentials();
+        assert_ne!(parent.id(), child.id());
+        assert_eq!(
+            parent.supplementary_groups_override(),
+            child.supplementary_groups_override()
+        );
+        assert_eq!(
+            child.supplementary_groups_override(),
+            Some([2, 4, 8].as_slice())
+        );
+        assert_eq!(
+            (
+                parent.ruid(),
+                parent.egid(),
+                parent.fsuid(),
+                parent.fsgid(),
+                parent.umask()
+            ),
+            (
+                child.ruid(),
+                child.egid(),
+                child.fsuid(),
+                child.fsgid(),
+                child.umask()
+            )
+        );
+    }
+
+    #[test]
+    fn fork_from_nonleader_copies_the_callers_divergent_credentials() {
+        let (kernel, root) = bootstrap(8_250);
+        let plan = ClonePlan::from_flags(
+            LinuxCloneFlags::VM
+                | LinuxCloneFlags::SIGHAND
+                | LinuxCloneFlags::THREAD
+                | LinuxCloneFlags::FILES
+                | LinuxCloneFlags::FS,
+        )
+        .expect("thread clone plan");
+        let sibling = kernel
+            .clone_thread(&root, plan, ThreadId::synthetic_for_tests(8_251), None)
+            .expect("clone sibling");
+        let sibling = kernel
+            .update_credentials(&sibling, |credentials| {
+                credentials.set_fsuid(9250);
+                credentials.set_supplementary_groups(vec![25, 26]);
+            })
+            .expect("diverge sibling credentials");
+
+        let child = kernel
+            .fork_task(
+                &sibling,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(8_252),
+                "nonleader-credential-child".to_owned(),
+                None,
+            )
+            .expect("fork from sibling");
+
+        assert_eq!(root.resources().credentials().fsuid(), 0);
+        assert_eq!(child.resources().credentials().fsuid(), 9250);
+        assert_eq!(
+            child
+                .resources()
+                .credentials()
+                .supplementary_groups_override(),
+            Some([25, 26].as_slice())
+        );
+    }
+
+    #[test]
+    fn sibling_credential_publication_does_not_stale_exact_fork_caller() {
+        let (kernel, root) = bootstrap(8_275);
+        let plan = ClonePlan::from_flags(
+            LinuxCloneFlags::VM
+                | LinuxCloneFlags::SIGHAND
+                | LinuxCloneFlags::THREAD
+                | LinuxCloneFlags::FILES
+                | LinuxCloneFlags::FS,
+        )
+        .expect("thread clone plan");
+        let sibling = kernel
+            .clone_thread(&root, plan, ThreadId::synthetic_for_tests(8_276), None)
+            .expect("clone sibling");
+        let root = root
+            .task_binding()
+            .capture(root.thread().key().tid)
+            .expect("refresh root after thread clone");
+        kernel
+            .update_credentials(&sibling, |credentials| {
+                credentials.set_fsuid(9275);
+            })
+            .expect("diverge sibling credentials");
+
+        let child = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(8_277),
+                "exact-root-credential-child".to_owned(),
+                None,
+            )
+            .expect("fork exact root after sibling publication");
+
+        assert_eq!(child.resources().credentials().fsuid(), 0);
+    }
+
+    #[test]
+    fn exec_retains_callers_credential_object() {
+        let (kernel, root) = bootstrap(8_300);
+        let root = kernel
+            .update_credentials(&root, |credentials| {
+                credentials.seed_identity(77, 88);
+                credentials.set_supplementary_groups(Vec::new());
+            })
+            .expect("seed credentials");
+        let before = root.resources().credentials();
+        let committed = kernel
+            .commit_exec(
+                kernel.prepare_exec(&root, None).expect("prepare exec"),
+                None,
+            )
+            .expect("commit exec");
+        let after = committed.resources().credentials();
+        assert!(Arc::ptr_eq(&before, &after));
+        assert_eq!((after.ruid(), after.rgid()), (77, 88));
+        assert_eq!(after.supplementary_groups_override(), Some([].as_slice()));
+    }
+
+    #[test]
+    fn replaced_callers_resources_reject_stale_exec_context() {
+        let (kernel, root) = bootstrap(8_315);
+        kernel
+            .update_credentials(&root, |credentials| {
+                credentials.set_fsuid(9315);
+            })
+            .expect("replace caller credentials");
+
+        assert!(matches!(
+            kernel.prepare_exec(&root, None),
+            Err(crate::kernel::ExecError::ForeignContext)
+        ));
+    }
+
+    #[test]
+    fn sibling_credential_publication_does_not_stale_exact_exec_caller() {
+        let (kernel, root) = bootstrap(8_325);
+        let plan = ClonePlan::from_flags(
+            LinuxCloneFlags::VM
+                | LinuxCloneFlags::SIGHAND
+                | LinuxCloneFlags::THREAD
+                | LinuxCloneFlags::FILES
+                | LinuxCloneFlags::FS,
+        )
+        .expect("thread clone plan");
+        let sibling = kernel
+            .clone_thread(&root, plan, ThreadId::synthetic_for_tests(8_326), None)
+            .expect("clone sibling");
+        let root = root
+            .task_binding()
+            .capture(root.thread().key().tid)
+            .expect("refresh root after thread clone");
+        kernel
+            .update_credentials(&sibling, |credentials| {
+                credentials.set_fsuid(9325);
+            })
+            .expect("diverge sibling credentials");
+
+        let prepared = kernel
+            .prepare_exec(&root, None)
+            .expect("prepare exec from exact root after sibling publication");
+        let exec = kernel.commit_exec(prepared, None).expect("commit exec");
+
+        assert_eq!(exec.resources().credentials().fsuid(), 0);
+    }
+
+    #[test]
+    fn credential_publication_waits_for_task_reservation_without_recapture() {
+        let (kernel, root) = bootstrap(8_350);
+        let reservation = kernel
+            .reserve_fork(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                "credential-reservation-child".to_owned(),
+                None,
+            )
+            .expect("hold task reservation");
+        let exact = root.retain_exact();
+        let updating = Arc::clone(&kernel);
+        let (sent, received) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let result = updating.update_credentials(&exact, |credentials| {
+                credentials.set_fsuid(8350);
+            });
+            sent.send(result).unwrap();
+        });
+
+        assert!(matches!(
+            received.recv_timeout(std::time::Duration::from_millis(20)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(reservation);
+        let updated = received
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("credential publication wakes")
+            .expect("credential publication succeeds");
+        worker.join().unwrap();
+        assert_eq!(updated.resources().credentials().fsuid(), 8350);
+    }
+
+    #[test]
+    fn stale_context_cannot_publish_credentials() {
+        let (kernel, original) = bootstrap(8_400);
+        let current = kernel
+            .update_credentials(&original, |credentials| credentials.set_fsuid(42))
+            .expect("publish current credentials");
+
+        assert!(matches!(
+            kernel.update_credentials(&original, |credentials| credentials.set_fsuid(99)),
+            Err(KernelOperationError::StaleContext)
+        ));
+        assert_eq!(current.resources().credentials().fsuid(), 42);
+        let fresh = kernel
+            .context(current.task().key().id, current.thread().key().tid)
+            .expect("fresh context");
+        assert_eq!(fresh.resources().credentials().fsuid(), 42);
     }
 }

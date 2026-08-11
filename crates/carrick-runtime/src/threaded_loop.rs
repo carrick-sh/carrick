@@ -270,13 +270,19 @@ where
         // supervisor fork. Rebind the one-task adapter to this guest-init host
         // process before its first syscall; HVPatch installs its authoritative
         // process binding in `initialize_root_process` above.
+        let inherited_context = dispatcher.capture_one_task_context().map_err(|error| {
+            RuntimeError::Configuration(format!(
+                "capture mature VMM bootstrap Kernel context: {error}"
+            ))
+        })?;
         dispatcher
-            .reset_one_task_kernel_binding_for_current_process(main_tid)
+            .reset_one_task_kernel_binding_for_current_process(&inherited_context, main_tid)
             .map_err(|error| {
                 RuntimeError::Configuration(format!(
                     "rebind mature VMM one-task Kernel identity: {error}"
                 ))
             })?;
+        drop(inherited_context);
     }
     let root_linux_tid = if let Some(process) = hvpatch_process.as_ref() {
         crate::kernel::LinuxTid::for_task_leader(process.task_id())

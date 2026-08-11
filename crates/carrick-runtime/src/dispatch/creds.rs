@@ -10,8 +10,9 @@
 //! new identity ("Could not switch group" if it doesn't match). Returning the
 //! host's real identity unconditionally would break that.
 //!
-//! So the model is a faithful in-memory credential register file
-//! ([`CredState`]): accept every `set*uid`/`set*gid`/`setres*`/`setre*` the
+//! So the model is a faithful immutable credential register file
+//! ([`crate::kernel::Credentials`]): accept every
+//! `set*uid`/`set*gid`/`setres*`/`setre*` the
 //! guest requests, store the new (real, effective, saved) ids, and echo them
 //! back from the corresponding `get*` calls. The default identity is root
 //! (uid 0 / gid 0) — what `id` shows in a typical container. The host kernel is
@@ -39,6 +40,37 @@
 //! dispatcher struct and the normalized dispatch table.
 use super::*;
 use crate::linux_abi::LinuxErrno;
+
+thread_local! {
+    static CAPTURED_CREDENTIALS: std::cell::RefCell<Vec<Arc<crate::kernel::Credentials>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub(super) fn with_captured_credentials<R>(
+    kernel: &crate::kernel::KernelContext,
+    operation: impl FnOnce() -> R,
+) -> R {
+    with_credentials(kernel.resources().credentials(), operation)
+}
+
+pub(super) fn with_credentials<R>(
+    credentials: Arc<crate::kernel::Credentials>,
+    operation: impl FnOnce() -> R,
+) -> R {
+    struct Pop;
+    impl Drop for Pop {
+        fn drop(&mut self) {
+            CAPTURED_CREDENTIALS.with(|stack| {
+                stack.borrow_mut().pop();
+            });
+        }
+    }
+    CAPTURED_CREDENTIALS.with(|stack| {
+        stack.borrow_mut().push(credentials);
+    });
+    let _pop = Pop;
+    operation()
+}
 
 syscall_table! {
     /// Per-module syscall routing for the `creds` subsystem (Task A1).
@@ -125,73 +157,6 @@ fn resolve_prio_process_target<M: GuestMemory>(cx: &SyscallCtx<'_, M>, who: i32)
             euid: crate::cred_ipc::read_target(h as i32).unwrap_or(0),
         },
         _ => PrioTarget::NotFound,
-    }
-}
-
-/// Owned credentials-subsystem state. Split out of `SyscallDispatcher`.
-///
-/// Tracked (real, effective, saved) uid and gid plus the umask. Carrick
-/// runs the guest as a single host identity, but tools like apt's `_apt`
-/// privsep drop to a non-root user via setresuid/setresgid and then
-/// VERIFY the new identity via getuid/geteuid/getresuid (and likewise for
-/// gid). Returning the host's identity unconditionally breaks the
-/// verification with "Could not switch group". We accept any setres*()
-/// the guest requests, record the values here, and echo them back to the
-/// corresponding get*() calls.
-#[derive(Clone, Copy)]
-pub(super) struct CredState {
-    pub ruid: u32,
-    pub euid: u32,
-    pub suid: u32,
-    pub rgid: u32,
-    pub egid: u32,
-    pub sgid: u32,
-    /// Filesystem uid/gid (the id used for VFS access checks). Tracks euid/egid
-    /// by default — every set*uid/set*gid resets it to the new euid/egid — but
-    /// setfsuid/setfsgid can point it elsewhere independently. setfs*id returns
-    /// the PREVIOUS value (LTP setfsuid01/03, setfsgid01/02).
-    pub fsuid: u32,
-    pub fsgid: u32,
-    pub umask: u32,
-}
-
-impl CredState {
-    pub(super) fn new() -> Self {
-        // Default identity is root (uid 0, gid 0) — what `id` shows in a
-        // typical container.
-        Self {
-            ruid: 0,
-            euid: 0,
-            suid: 0,
-            rgid: 0,
-            egid: 0,
-            sgid: 0,
-            fsuid: 0,
-            fsgid: 0,
-            umask: LINUX_DEFAULT_UMASK,
-        }
-    }
-
-    /// Seed every uid/gid view (real/effective/saved/fs) to `(uid, gid)` — the
-    /// container's initial identity from `docker run --user` / image `USER`,
-    /// applied once before the guest starts (so a later set*id still follows the
-    /// Linux transition rules from this baseline).
-    pub(super) fn seed_identity(&mut self, uid: u32, gid: u32) {
-        self.ruid = uid;
-        self.euid = uid;
-        self.suid = uid;
-        self.fsuid = uid;
-        self.rgid = gid;
-        self.egid = gid;
-        self.sgid = gid;
-        self.fsgid = gid;
-    }
-
-    /// We model the CAP_SETUID/CAP_SETGID capability as "running as root"
-    /// (euid 0) — carrick has no finer capability model, and LTP's set*id
-    /// tests gate their privileged/unprivileged expectations on euid==0.
-    fn is_privileged(&self) -> bool {
-        self.euid == 0
     }
 }
 
@@ -292,36 +257,73 @@ mod setid {
     }
 }
 
-/// The per-process identity values the EL1 syscall shim serves from the guest
-/// identity page (getpid/getuid/geteuid/getgid/getegid). Snapshotted by the
-/// runtime and stamped into guest memory at boot/fork/exec; see
-/// `docs/syscall-shim-design.md`. All are per-process and stable except across
-/// the cred-mutating syscalls, which re-stamp at the point of change.
+/// Per-process identity served by the EL1 syscall shim. Credentials are not
+/// present because Linux permits them to diverge per thread; credential reads
+/// always trap through the captured KernelContext path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct IdentitySnapshot {
     pub pid: u32,
-    pub uid: u32,
-    pub euid: u32,
-    pub gid: u32,
-    pub egid: u32,
 }
 
 impl SyscallDispatcher {
-    pub(super) fn cred_snapshot(&self) -> CredState {
-        *self.creds.lock()
+    pub(super) fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials> {
+        CAPTURED_CREDENTIALS.with(|stack| {
+            if let Some(credentials) = stack.borrow().last().cloned() {
+                return credentials;
+            }
+            #[cfg(test)]
+            {
+                self.capture_one_task_context()
+                    .expect("test credential context")
+                    .resources()
+                    .credentials()
+            }
+            #[cfg(not(test))]
+            {
+                tracing::error!("credential read escaped its captured KernelContext scope");
+                std::process::abort();
+            }
+        })
     }
 
-    /// The current per-process identity the EL1 shim must report. Reads the same
-    /// sources as the `getpid`/`get*id` handlers so the fast path and the trap
-    /// path can never disagree.
-    pub(crate) fn identity_snapshot(&self) -> IdentitySnapshot {
-        let c = self.cred_snapshot();
+    pub(super) fn credentials_from_context(
+        &self,
+        kernel: &crate::kernel::KernelContext,
+    ) -> Arc<crate::kernel::Credentials> {
+        kernel.resources().credentials()
+    }
+
+    pub(super) fn update_credentials(
+        &self,
+        kernel: &crate::kernel::KernelContext,
+        update: impl FnOnce(&mut crate::kernel::Credentials),
+    ) -> Result<Arc<crate::kernel::Credentials>, LinuxErrno> {
+        match kernel.kernel().update_credentials(kernel, update) {
+            Ok(updated) => Ok(updated.resources().credentials()),
+            Err(
+                crate::kernel::KernelOperationError::StaleContext
+                | crate::kernel::KernelOperationError::ParentExited
+                | crate::kernel::KernelOperationError::UnknownThread(_),
+            ) => Err(crate::linux_abi::LINUX_EINTR),
+            Err(crate::kernel::KernelOperationError::TaskBusy(_)) => {
+                Err(crate::linux_abi::LINUX_EAGAIN)
+            }
+            Err(error) => {
+                tracing::error!(%error, "credential COW publication invariant failed");
+                std::process::abort();
+            }
+        }
+    }
+
+    /// Capture the per-process identity fast-path value at an explicit Kernel
+    /// boundary. The context parameter prevents lifecycle callers from silently
+    /// reintroducing registry recapture even though PID itself is process-wide.
+    pub(crate) fn identity_snapshot(
+        &self,
+        _kernel: &crate::kernel::KernelContext,
+    ) -> IdentitySnapshot {
         IdentitySnapshot {
             pid: self.identity_pid(),
-            uid: c.ruid,
-            euid: c.euid,
-            gid: c.rgid,
-            egid: c.egid,
         }
     }
 
@@ -341,48 +343,17 @@ impl SyscallDispatcher {
         }
     }
 
-    /// Re-stamp the credential fields of the EL1 shim's identity page after a
-    /// `set*uid`/`set*gid`, so a fast-path `getuid`/`geteuid`/`getgid`/`getegid`
-    /// reflects the new identity (apt's `_apt` privsep verifies the drop right
-    /// after — see this module's theory of operation). No-op unless the shim is
-    /// enabled. `creds` is passed by value so callers stamp AFTER dropping the
-    /// `creds` lock (the snapshot avoids a re-entrant lock / deadlock).
-    pub(super) fn stamp_identity_creds<M: GuestMemory>(
-        &self,
-        cx: &mut SyscallCtx<M>,
-        creds: &CredState,
-    ) {
-        if !crate::syscall_shim_enabled() {
-            return;
-        }
-        use crate::memory::{
-            IDENTITY_OFF_EGID, IDENTITY_OFF_EUID, IDENTITY_OFF_GID, IDENTITY_OFF_UID,
-            LINUX_IDENTITY_PAGE_BASE as B,
-        };
-        let _ = cx
-            .memory
-            .write_bytes(B + IDENTITY_OFF_UID, &creds.ruid.to_le_bytes());
-        let _ = cx
-            .memory
-            .write_bytes(B + IDENTITY_OFF_EUID, &creds.euid.to_le_bytes());
-        let _ = cx
-            .memory
-            .write_bytes(B + IDENTITY_OFF_GID, &creds.rgid.to_le_bytes());
-        let _ = cx
-            .memory
-            .write_bytes(B + IDENTITY_OFF_EGID, &creds.egid.to_le_bytes());
-    }
-
     /// The supplementary group list `getgroups(2)` reports: the primary egid
     /// plus every group in the guest's `/etc/group` that lists the current user
     /// (resolved from `/etc/passwd` by euid) as a member — the same set runc
     /// derives, so `id` matches Docker. Falls back to just the egid when the
     /// files are absent/unreadable.
-    pub(super) fn supplementary_groups(&self) -> Vec<u32> {
-        let (euid, egid) = {
-            let c = self.creds.lock();
-            (c.euid, c.egid)
-        };
+    fn supplementary_groups_from_files(
+        &self,
+        credentials: &crate::kernel::Credentials,
+    ) -> Vec<u32> {
+        let c = credentials;
+        let (euid, egid) = (c.euid, c.egid);
         let mut gids: Vec<u32> = vec![egid];
         // uid -> username via /etc/passwd (name:passwd:uid:gid:...).
         let username = self.read_exec_file("/etc/passwd").and_then(|b| {
@@ -414,9 +385,24 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn current_groups(&self) -> Vec<u32> {
-        match self.setgroups_override.lock().clone() {
-            Some(groups) => groups,
-            None => self.supplementary_groups(),
+        let credentials = self.cred_snapshot();
+        match credentials.supplementary_groups_override() {
+            Some(groups) => groups.to_vec(),
+            None => self.supplementary_groups_from_files(&credentials),
+        }
+    }
+
+    /// Publish the mature one-task adapter's leader credential for peer host
+    /// processes. This file is transport, not in-process authority: nonleaders
+    /// and multiplexed HVPatch tasks never overwrite one host-PID projection.
+    pub(super) fn publish_external_credential_projection(
+        &self,
+        context: &crate::kernel::KernelContext,
+        credentials: &crate::kernel::Credentials,
+    ) {
+        let leader = crate::kernel::LinuxTid::for_task_leader(context.task().key().id);
+        if context.thread().key().tid == leader && self.hvpatch_process().is_none() {
+            crate::cred_ipc::publish_self(credentials.euid());
         }
     }
 }
@@ -538,12 +524,9 @@ impl SyscallDispatcher {
 
         fn umask(this, cx, new: u64) {
             let new = new as u32 & 0o777;
-            let mut creds = this.creds.lock();
-            let previous = creds.umask;
-            creds.umask = new;
-            Ok(DispatchOutcome::Returned {
-                value: previous as i64,
-            })
+            let previous = this.cred_snapshot().umask;
+            this.update_credentials(cx.kernel, |creds| creds.set_umask(new))?;
+            Ok(DispatchOutcome::Returned { value: previous as i64 })
         }
 
         fn setpriority(this, cx, which: u64, who: Pid, prio: u64) {
@@ -642,90 +625,95 @@ impl SyscallDispatcher {
         }
 
         fn setresuid(this, cx, r: u64, e: u64, s: u64) {
-            let mut creds = this.creds.lock();
-            let priv_ = creds.is_privileged();
-            match setid::setres(priv_, (creds.ruid, creds.euid, creds.suid),
-                                 keep_or(r), keep_or(e), keep_or(s)) {
-                Ok((ru, eu, su)) => { creds.ruid = ru; creds.euid = eu; creds.suid = su; creds.fsuid = creds.euid; }
+            let current = this.cred_snapshot();
+            let (ruid, euid, suid) = match setid::setres(
+                current.is_privileged(),
+                (current.ruid, current.euid, current.suid),
+                keep_or(r), keep_or(e), keep_or(s),
+            ) {
+                Ok(values) => values,
                 Err(()) => return Ok(DispatchOutcome::errno(LINUX_EPERM)),
-            }
-            let new_euid = creds.euid;
-            let snap = *creds;
-            drop(creds);
-            crate::cred_ipc::publish_self(new_euid);
-            this.stamp_identity_creds(cx, &snap);
+            };
+            let updated = this.update_credentials(cx.kernel, |credentials| {
+                credentials.set_uid_triple(ruid, euid, suid);
+            })?;
+            this.publish_external_credential_projection(cx.kernel, &updated);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
         fn setresgid(this, cx, r: u64, e: u64, s: u64) {
-            let mut creds = this.creds.lock();
-            let priv_ = creds.is_privileged();
-            match setid::setres(priv_, (creds.rgid, creds.egid, creds.sgid),
-                                 keep_or(r), keep_or(e), keep_or(s)) {
-                Ok((rg, eg, sg)) => { creds.rgid = rg; creds.egid = eg; creds.sgid = sg; creds.fsgid = creds.egid; }
+            let current = this.cred_snapshot();
+            let (rgid, egid, sgid) = match setid::setres(
+                current.is_privileged(),
+                (current.rgid, current.egid, current.sgid),
+                keep_or(r), keep_or(e), keep_or(s),
+            ) {
+                Ok(values) => values,
                 Err(()) => return Ok(DispatchOutcome::errno(LINUX_EPERM)),
-            }
-            let snap = *creds;
-            drop(creds);
-            this.stamp_identity_creds(cx, &snap);
+            };
+            this.update_credentials(cx.kernel, |credentials| {
+                credentials.set_gid_triple(rgid, egid, sgid);
+            })?;
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
         fn setreuid(this, cx, r: u64, e: u64) {
-            let mut creds = this.creds.lock();
-            let priv_ = creds.is_privileged();
-            match setid::setre(priv_, (creds.ruid, creds.euid, creds.suid),
-                               keep_or(r), keep_or(e)) {
-                Ok((ru, eu, su)) => { creds.ruid = ru; creds.euid = eu; creds.suid = su; creds.fsuid = creds.euid; }
+            let current = this.cred_snapshot();
+            let (ruid, euid, suid) = match setid::setre(
+                current.is_privileged(),
+                (current.ruid, current.euid, current.suid), keep_or(r), keep_or(e),
+            ) {
+                Ok(values) => values,
                 Err(()) => return Ok(DispatchOutcome::errno(LINUX_EPERM)),
-            }
-            let new_euid = creds.euid;
-            let snap = *creds;
-            drop(creds);
-            crate::cred_ipc::publish_self(new_euid);
-            this.stamp_identity_creds(cx, &snap);
+            };
+            let updated = this.update_credentials(cx.kernel, |credentials| {
+                credentials.set_uid_triple(ruid, euid, suid);
+            })?;
+            this.publish_external_credential_projection(cx.kernel, &updated);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
         fn setregid(this, cx, r: u64, e: u64) {
-            let mut creds = this.creds.lock();
-            let priv_ = creds.is_privileged();
-            match setid::setre(priv_, (creds.rgid, creds.egid, creds.sgid),
-                               keep_or(r), keep_or(e)) {
-                Ok((rg, eg, sg)) => { creds.rgid = rg; creds.egid = eg; creds.sgid = sg; creds.fsgid = creds.egid; }
+            let current = this.cred_snapshot();
+            let (rgid, egid, sgid) = match setid::setre(
+                current.is_privileged(),
+                (current.rgid, current.egid, current.sgid), keep_or(r), keep_or(e),
+            ) {
+                Ok(values) => values,
                 Err(()) => return Ok(DispatchOutcome::errno(LINUX_EPERM)),
-            }
-            let snap = *creds;
-            drop(creds);
-            this.stamp_identity_creds(cx, &snap);
+            };
+            this.update_credentials(cx.kernel, |credentials| {
+                credentials.set_gid_triple(rgid, egid, sgid);
+            })?;
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
         fn setuid(this, cx, u: u64) {
-            let mut creds = this.creds.lock();
-            let priv_ = creds.is_privileged();
-            match setid::set(priv_, (creds.ruid, creds.euid, creds.suid), u as u32) {
-                Ok((ru, eu, su)) => { creds.ruid = ru; creds.euid = eu; creds.suid = su; creds.fsuid = creds.euid; }
+            let current = this.cred_snapshot();
+            let (ruid, euid, suid) = match setid::set(
+                current.is_privileged(), (current.ruid, current.euid, current.suid), u as u32,
+            ) {
+                Ok(values) => values,
                 Err(()) => return Ok(DispatchOutcome::errno(LINUX_EPERM)),
-            }
-            let new_euid = creds.euid;
-            let snap = *creds;
-            drop(creds);
-            crate::cred_ipc::publish_self(new_euid);
-            this.stamp_identity_creds(cx, &snap);
+            };
+            let updated = this.update_credentials(cx.kernel, |credentials| {
+                credentials.set_uid_triple(ruid, euid, suid);
+            })?;
+            this.publish_external_credential_projection(cx.kernel, &updated);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
         fn setgid(this, cx, g: u64) {
-            let mut creds = this.creds.lock();
-            let priv_ = creds.is_privileged();
-            match setid::set(priv_, (creds.rgid, creds.egid, creds.sgid), g as u32) {
-                Ok((rg, eg, sg)) => { creds.rgid = rg; creds.egid = eg; creds.sgid = sg; creds.fsgid = creds.egid; }
+            let current = this.cred_snapshot();
+            let (rgid, egid, sgid) = match setid::set(
+                current.is_privileged(), (current.rgid, current.egid, current.sgid), g as u32,
+            ) {
+                Ok(values) => values,
                 Err(()) => return Ok(DispatchOutcome::errno(LINUX_EPERM)),
-            }
-            let snap = *creds;
-            drop(creds);
-            this.stamp_identity_creds(cx, &snap);
+            };
+            this.update_credentials(cx.kernel, |credentials| {
+                credentials.set_gid_triple(rgid, egid, sgid);
+            })?;
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -788,42 +776,35 @@ impl SyscallDispatcher {
         }
 
         fn sys_setfsuid(this, cx, uid: u64) {
-            // Always returns the PREVIOUS fsuid (setfsuid never fails). The new
-            // fsuid takes effect only if privileged or `uid` already matches one
-            // of {ruid, euid, suid, fsuid}; `(uid_t)-1` is a pure query.
-            let mut creds = this.creds.lock();
-            let prev = creds.fsuid;
+            let current = this.cred_snapshot();
+            let previous = current.fsuid;
             let uid = uid as u32;
             if uid != u32::MAX
-                && (creds.is_privileged()
-                    || uid == creds.ruid
-                    || uid == creds.euid
-                    || uid == creds.suid
-                    || uid == creds.fsuid)
+                && (current.is_privileged()
+                    || uid == current.ruid
+                    || uid == current.euid
+                    || uid == current.suid)
+                && uid != current.fsuid
             {
-                creds.fsuid = uid;
+                this.update_credentials(cx.kernel, |credentials| credentials.set_fsuid(uid))?;
             }
-            Ok(DispatchOutcome::Returned {
-                value: i64::from(prev),
-            })
+            Ok(DispatchOutcome::Returned { value: i64::from(previous) })
         }
 
         fn sys_setfsgid(this, cx, gid: u64) {
-            let mut creds = this.creds.lock();
-            let prev = creds.fsgid;
+            let current = this.cred_snapshot();
+            let previous = current.fsgid;
             let gid = gid as u32;
             if gid != u32::MAX
-                && (creds.is_privileged()
-                    || gid == creds.rgid
-                    || gid == creds.egid
-                    || gid == creds.sgid
-                    || gid == creds.fsgid)
+                && (current.is_privileged()
+                    || gid == current.rgid
+                    || gid == current.egid
+                    || gid == current.sgid)
+                && gid != current.fsgid
             {
-                creds.fsgid = gid;
+                this.update_credentials(cx.kernel, |credentials| credentials.set_fsgid(gid))?;
             }
-            Ok(DispatchOutcome::Returned {
-                value: i64::from(prev),
-            })
+            Ok(DispatchOutcome::Returned { value: i64::from(previous) })
         }
 
         fn sys_setgroups(this, cx, size: u64, list: GuestPtr) {
@@ -851,7 +832,9 @@ impl SyscallDispatcher {
             // Replace the whole supplementary set (Linux semantics): getgroups
             // now returns exactly this. CPython subprocess `extra_groups=` sets
             // it in the pre-exec child and reads it back via os.getgroups().
-            *this.setgroups_override.lock() = Some(groups);
+            this.update_credentials(cx.kernel, |credentials| {
+                credentials.set_supplementary_groups(groups);
+            })?;
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -1159,14 +1142,69 @@ mod identity_snapshot_tests {
     #[test]
     fn snapshot_mirrors_getpid_and_cred_snapshot() {
         let d = SyscallDispatcher::new();
-        let id = d.identity_snapshot();
-        let c = d.cred_snapshot();
+        let context = d.capture_one_task_context().expect("kernel context");
+        let id = d.identity_snapshot(&context);
+        let c = d.credentials_from_context(&context);
         assert_eq!(id.pid, crate::namespace::pid::self_ns_pid());
+        // Credentials remain Kernel authority and are deliberately absent from
+        // the shared process identity page.
+        assert_eq!((c.ruid, c.euid, c.rgid, c.egid), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn setgroups_publishes_exact_kernel_authority_including_empty_set() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let reporter = CompatReporter::default();
+        let base = 0x4000;
+        let mut memory = LinearMemory::new(base, vec![0; 0x1000]);
+        memory
+            .write_bytes(base, &[9_u32.to_le_bytes(), 10_u32.to_le_bytes()].concat())
+            .unwrap();
+
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let outcome = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(159, SyscallArgs::from([2, base, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert!(matches!(outcome, DispatchOutcome::Returned { value: 0 }));
+
+        let current = dispatcher.capture_one_task_context().unwrap();
         assert_eq!(
-            (id.uid, id.euid, id.gid, id.egid),
-            (c.ruid, c.euid, c.rgid, c.egid),
+            current
+                .resources()
+                .credentials()
+                .supplementary_groups_override(),
+            Some([9, 10].as_slice())
         );
-        // Default container identity is root.
-        assert_eq!((id.uid, id.euid, id.gid, id.egid), (0, 0, 0, 0));
+        let outcome = dispatcher
+            .dispatch(
+                &current,
+                SyscallRequest::new(159, SyscallArgs::from([0; 6])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert!(matches!(outcome, DispatchOutcome::Returned { value: 0 }));
+        let empty = dispatcher.capture_one_task_context().unwrap();
+        assert_eq!(
+            empty
+                .resources()
+                .credentials()
+                .supplementary_groups_override(),
+            Some([].as_slice())
+        );
+        let outcome = dispatcher
+            .dispatch(
+                &empty,
+                SyscallRequest::new(158, SyscallArgs::from([0; 6])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert!(matches!(outcome, DispatchOutcome::Returned { value: 0 }));
     }
 }

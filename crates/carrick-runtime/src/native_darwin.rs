@@ -189,7 +189,13 @@ struct NativeBlockedSpan {
 
 struct TimedDispatchOutcome {
     outcome: DispatchOutcome,
+    kernel_context: crate::kernel::KernelContext,
     blocked: NativeBlockedSpan,
+}
+
+struct NativeDispatchAuthority<'a> {
+    dispatcher: &'a SyscallDispatcher,
+    kernel_context: &'a crate::kernel::KernelContext,
 }
 
 struct NativeForkRequest {
@@ -716,20 +722,27 @@ where
         &canonical_host_executable_path(path),
     );
     let relative_relocations = native_relative_relocations(&file, NATIVE_DARWIN_PIE_BASE)?;
-    let image = AddressSpace::load_elf_bytes_with_reader_at_pie_base_without_runtime_regions(
-        &file,
-        &|p| {
-            dispatcher
-                .read_exec_file(p)
-                .or_else(|| std::fs::read(p).ok())
-        },
-        NATIVE_DARWIN_PIE_BASE,
-        geometry.host_page_size,
-    )?
-    .with_vdso_auxv(crate::runtime::vdso_enabled_for_debug())
-    .without_auxv_hwcap(
-        carrick_abi::LinuxAarch64Hwcap::SHA2 | carrick_abi::LinuxAarch64Hwcap::ATOMICS,
-    );
+    let launch_context = dispatcher.capture_one_task_context().map_err(|error| {
+        RuntimeError::Unsupported(format!("capture native launch Kernel context: {error}"))
+    })?;
+    let loaded = dispatcher.with_kernel_credentials(&launch_context, || {
+        AddressSpace::load_elf_bytes_with_reader_at_pie_base_without_runtime_regions(
+            &file,
+            &|p| {
+                dispatcher
+                    .read_exec_file(p)
+                    .or_else(|| std::fs::read(p).ok())
+            },
+            NATIVE_DARWIN_PIE_BASE,
+            geometry.host_page_size,
+        )
+    });
+    drop(launch_context);
+    let image = loaded?
+        .with_vdso_auxv(crate::runtime::vdso_enabled_for_debug())
+        .without_auxv_hwcap(
+            carrick_abi::LinuxAarch64Hwcap::SHA2 | carrick_abi::LinuxAarch64Hwcap::ATOMICS,
+        );
     // Same vDSO image + debug-mode selection as the HVF boot/execve builders,
     // relocated to the native-mappable bases (`NATIVE_DARWIN_VVAR_BASE`).
     // `NativeMappedMemory::map` rewrites the code page's vvar loads and stamps
@@ -779,27 +792,33 @@ where
     dispatcher.set_memory_layout(native_memory_layout());
     let argv: Vec<String> = argv.into_iter().collect();
     let env: Vec<String> = env.into_iter().collect();
+    let launch_context = dispatcher.capture_one_task_context().map_err(|error| {
+        RuntimeError::Unsupported(format!("capture native launch Kernel context: {error}"))
+    })?;
     let argv_for_cmdline = argv.clone();
     let argv_bytes = argv.into_iter().map(String::into_bytes).collect();
-    let (resolved, argv) =
+    let resolved_entry = dispatcher.with_kernel_credentials(&launch_context, || {
         crate::exec_helpers::resolve_entrypoint_program(path, &env, argv_bytes, &dispatcher)
-            .map_err(|_| {
-                RuntimeError::AddressSpace(AddressSpaceError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    path.to_owned(),
-                )))
-            })?;
+    });
+    let (resolved, argv) = resolved_entry.map_err(|_| {
+        RuntimeError::AddressSpace(AddressSpaceError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            path.to_owned(),
+        )))
+    })?;
     dispatcher.set_executable_identity(
         resolved.clone(),
         argv_for_cmdline,
         env.iter().map(|value| value.as_bytes().to_vec()).collect(),
     );
-    let file = dispatcher.read_exec_file(&resolved).ok_or_else(|| {
-        RuntimeError::AddressSpace(AddressSpaceError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            resolved.clone(),
-        )))
-    })?;
+    let file = dispatcher
+        .with_kernel_credentials(&launch_context, || dispatcher.read_exec_file(&resolved))
+        .ok_or_else(|| {
+            RuntimeError::AddressSpace(AddressSpaceError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                resolved.clone(),
+            )))
+        })?;
     let direct = native_direct_candidate(
         &file,
         argv.clone(),
@@ -807,16 +826,20 @@ where
         &resolved,
     );
     let relative_relocations = native_relative_relocations(&file, NATIVE_DARWIN_PIE_BASE)?;
-    let image = AddressSpace::load_elf_bytes_with_reader_at_pie_base_without_runtime_regions(
-        &file,
-        &|interpreter| dispatcher.read_exec_file(interpreter),
-        NATIVE_DARWIN_PIE_BASE,
-        geometry.host_page_size,
-    )?
-    .with_vdso_auxv(crate::runtime::vdso_enabled_for_debug())
-    .without_auxv_hwcap(
-        carrick_abi::LinuxAarch64Hwcap::SHA2 | carrick_abi::LinuxAarch64Hwcap::ATOMICS,
-    );
+    let loaded = dispatcher.with_kernel_credentials(&launch_context, || {
+        AddressSpace::load_elf_bytes_with_reader_at_pie_base_without_runtime_regions(
+            &file,
+            &|interpreter| dispatcher.read_exec_file(interpreter),
+            NATIVE_DARWIN_PIE_BASE,
+            geometry.host_page_size,
+        )
+    });
+    drop(launch_context);
+    let image = loaded?
+        .with_vdso_auxv(crate::runtime::vdso_enabled_for_debug())
+        .without_auxv_hwcap(
+            carrick_abi::LinuxAarch64Hwcap::SHA2 | carrick_abi::LinuxAarch64Hwcap::ATOMICS,
+        );
     let image = with_native_vdso(image)?.with_linux_initial_stack_page_size(
         argv,
         env,
@@ -952,6 +975,7 @@ fn run_direct_in_current_process(
     candidate: DirectLaunchCandidate,
     resolved: &str,
     dispatcher: SyscallDispatcher,
+    credential_authority: Option<crate::dispatch::CapturedCredentialAuthority>,
     max_traps: usize,
     plan: &ExecutionPlan,
 ) -> Result<DirectLaunchFlow, RuntimeError> {
@@ -959,9 +983,12 @@ fn run_direct_in_current_process(
     let mut group = match carrick_native_darwin::direct::DirectLoadGroup::load_with_interpreter(
         &candidate.elf,
         |path| {
-            dispatcher
-                .read_exec_file(path)
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, path.to_owned()))
+            let read = || dispatcher.read_exec_file(path);
+            let bytes = match credential_authority.as_ref() {
+                Some(authority) => dispatcher.with_retained_kernel_credentials(authority, read),
+                None => read(),
+            };
+            bytes.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, path.to_owned()))
         },
         dr::island_handler(),
     ) {
@@ -1020,6 +1047,9 @@ fn run_direct_in_current_process(
     // Installs the SIGINT + xsig-nudge handlers and initializes the xsig/
     // fasync shared rings (fork/kill need them).
     crate::host_signal::install_default_handlers();
+    // Startup loading is complete. Do not retain obsolete credential objects
+    // while the guest runs and publishes later COW generations.
+    drop(credential_authority);
     let mut runner = dr::DirectRunner::new(dispatcher, dr::IdentityMemory::new(0, u64::MAX));
     runner.enable_exec_services(dr::DirectExecServices {
         plan: plan.clone(),
@@ -1085,14 +1115,19 @@ fn run_direct_in_current_process(
                         "tier D exec leave had no prepared replacement".to_string(),
                     ));
                 };
-                let next_resolved = replacement.resolved.clone();
-                let proc_argv: Vec<String> = replacement
-                    .argv
+                let dr::DirectExecReplacement {
+                    group: next_group,
+                    stack: next_stack,
+                    kernel_exec,
+                    resolved: next_resolved,
+                    argv: next_argv,
+                    env: proc_env,
+                } = replacement;
+                let proc_argv: Vec<String> = next_argv
                     .iter()
                     .map(|value| String::from_utf8_lossy(value).into_owned())
                     .collect();
                 let process_title = proc_argv.join(" ");
-                let proc_env = replacement.env.clone();
 
                 // Nothing fallible remains after this point. Retire every
                 // RAII-owned part of the old image first; the runner then
@@ -1102,6 +1137,17 @@ fn run_direct_in_current_process(
                 drop(slots);
                 drop(stack);
                 drop(group);
+                let exec_context =
+                    match runner.dispatcher().commit_one_task_kernel_exec(kernel_exec) {
+                        Ok(context) => context,
+                        Err(error) => {
+                            tracing::error!(
+                                %error,
+                                "tier D Kernel exec commit failed after image retirement"
+                            );
+                            std::process::abort();
+                        }
+                    };
                 runner.dispatcher().reset_memory_state_on_execve();
                 runner.dispatcher().reset_signal_handlers_on_execve();
                 runner.dispatcher().set_executable_identity(
@@ -1112,11 +1158,11 @@ fn run_direct_in_current_process(
                 runner.dispatcher().close_cloexec_fds();
                 crate::namespace::pid::mark_self_execed();
                 crate::dispatch::set_host_process_name(process_title.as_bytes());
-                runner.commit_in_process_exec();
+                runner.commit_in_process_exec(&exec_context);
                 native_tier_census("direct-exec-commit", &next_resolved, "in-process");
 
-                group = replacement.group;
-                stack = replacement.stack;
+                group = next_group;
+                stack = next_stack;
                 active_resolved = next_resolved;
             }
             Some(dr::DirectRunOutcome::Unsupported { syscall, outcome }) => {
@@ -1149,6 +1195,8 @@ pub(crate) enum TierDExecFlow {
 /// the existing capsule, whose post-reexec tier decision can fall back to DSR.
 fn prepare_tier_d_exec_replacement(
     dispatcher: &SyscallDispatcher,
+    kernel_context: &crate::kernel::KernelContext,
+    replacement_registry_id: crate::thread::ThreadId,
     path: &str,
     argv: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
@@ -1208,10 +1256,17 @@ fn prepare_tier_d_exec_replacement(
             return Ok(None);
         }
     };
+    let kernel_exec = dispatcher
+        .prepare_one_task_kernel_exec_with_registry_id(kernel_context, replacement_registry_id)
+        .map_err(|error| {
+            tracing::warn!(%error, "tier D Kernel exec preparation failed");
+            crate::linux_abi::LINUX_EAGAIN
+        })?;
     native_tier_census("scan-direct", &resolved, "exec-in-process");
     Ok(Some(dr::DirectExecReplacement {
         group,
         stack,
+        kernel_exec,
         resolved,
         argv,
         env,
@@ -1225,28 +1280,41 @@ fn prepare_tier_d_exec_replacement(
 /// with their Linux errno exactly as execve requires.
 pub(crate) fn tier_d_service_execve(
     dispatcher: &SyscallDispatcher,
+    kernel_context: &crate::kernel::KernelContext,
     path: String,
     argv: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
-    plan: &ExecutionPlan,
-    max_traps: usize,
+    replacement_registry_id: crate::thread::ThreadId,
+    services: &crate::direct_runner::DirectExecServices,
 ) -> TierDExecFlow {
     crate::probes::execve_argv(&path, &argv);
-    match prepare_tier_d_exec_replacement(dispatcher, &path, argv.clone(), env.clone()) {
+    let direct_replacement = dispatcher.with_kernel_credentials(kernel_context, || {
+        prepare_tier_d_exec_replacement(
+            dispatcher,
+            kernel_context,
+            replacement_registry_id,
+            &path,
+            argv.clone(),
+            env.clone(),
+        )
+    });
+    match direct_replacement {
         Ok(Some(replacement)) => return TierDExecFlow::Replace(Box::new(replacement)),
         Ok(None) => {}
         Err(errno) => return TierDExecFlow::Resume(errno.guest_retval()),
     }
     let capsule_env = env.clone();
-    let loaded = load_native_execve_image(
-        dispatcher,
-        &path,
-        argv,
-        env,
-        plan,
-        ExecDigestPolicy::DeferredUntilNeeded,
-        ExecFileBackingPolicy::Compute,
-    );
+    let loaded = dispatcher.with_kernel_credentials(kernel_context, || {
+        load_native_execve_image(
+            dispatcher,
+            &path,
+            argv,
+            env,
+            &services.plan,
+            ExecDigestPolicy::DeferredUntilNeeded,
+            ExecFileBackingPolicy::Compute,
+        )
+    });
     let (image, relative_relocations, resolved, resolved_argv, executable_digest, exec_backing) =
         match loaded {
             Ok(loaded) => loaded,
@@ -1262,6 +1330,7 @@ pub(crate) fn tier_d_service_execve(
     }
     if let Err(error) = crate::native_exec_capsule::begin_guest_exec(
         dispatcher,
+        kernel_context,
         &image,
         &relative_relocations,
         exec_backing,
@@ -1269,8 +1338,8 @@ pub(crate) fn tier_d_service_execve(
         resolved_argv,
         capsule_env,
         executable_digest,
-        max_traps,
-        plan,
+        services.max_traps,
+        &services.plan,
     ) {
         tracing::warn!(
             %error,
@@ -1725,7 +1794,12 @@ pub(crate) fn resume_guest_from_capsule(
     }
     dispatcher.set_cwd(&guest.cwd);
     dispatcher.set_stream_stdio(guest.stream_stdio);
-    dispatcher.restore_native_reexec_process_state(&guest.process_state);
+    let reexec_context = dispatcher.capture_one_task_context().map_err(|error| {
+        anyhow::anyhow!("capture native reexec restore Kernel context: {error}")
+    })?;
+    let mut restored_context =
+        dispatcher.restore_native_reexec_process_state(&reexec_context, &guest.process_state);
+    drop(reexec_context);
     if guest.process_state.ptrace_traceme != crate::guest_cpu::self_is_virtual_ptrace_tracee() {
         anyhow::bail!("native self-reexec ptrace state disagrees with the inherited kernel arena");
     }
@@ -1743,9 +1817,14 @@ pub(crate) fn resume_guest_from_capsule(
     // prepared DSR artifact, if any, is discarded — carried because the
     // producer cannot know the consumer's verdict); a refusal falls through
     // to the DSR resume below with the dispatcher intact.
-    if native_direct_enabled()
-        && let Some(file) = dispatcher.read_exec_file(&guest.resolved_path)
-    {
+    let direct_file = native_direct_enabled()
+        .then(|| {
+            dispatcher.with_kernel_credentials(&restored_context, || {
+                dispatcher.read_exec_file(&guest.resolved_path)
+            })
+        })
+        .flatten();
+    if let Some(file) = direct_file {
         match carrick_native_darwin::direct::scan_eligibility_as_interpreted(&file) {
             Ok(Ok(_)) => {
                 native_tier_census("scan-direct", &guest.resolved_path, "exec-resume");
@@ -1776,10 +1855,18 @@ pub(crate) fn resume_guest_from_capsule(
                     argv: argv.clone(),
                     env: env.clone(),
                 };
+                // Retain only the exact credential object needed by a dynamic
+                // interpreter load, then release the full startup context so
+                // it cannot keep obsolete ThreadResources draining while the
+                // direct guest runs. A pre-entry refusal captures the still-
+                // single startup task again for the DSR fallback below.
+                let credential_authority = dispatcher.retain_kernel_credentials(&restored_context);
+                drop(restored_context);
                 match run_direct_in_current_process(
                     candidate,
                     &guest.resolved_path,
                     dispatcher,
+                    Some(credential_authority),
                     max_traps,
                     &plan,
                 )
@@ -1792,6 +1879,12 @@ pub(crate) fn resume_guest_from_capsule(
                     } => {
                         native_tier_census("load-refused", &guest.resolved_path, &reason);
                         dispatcher = *returned;
+                        restored_context =
+                            dispatcher.capture_one_task_context().map_err(|error| {
+                                anyhow::anyhow!(
+                                    "capture native reexec fallback Kernel context: {error}"
+                                )
+                            })?;
                     }
                 }
             }
@@ -1809,17 +1902,19 @@ pub(crate) fn resume_guest_from_capsule(
         native_reexec_lifecycle(
             carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecImageLoadBegin,
         );
-        let loaded = load_native_execve_image(
-            &dispatcher,
-            &guest.resolved_path,
-            argv.clone(),
-            env.clone(),
-            &plan,
-            // The guard this reload feeds IS the digest comparison.
-            ExecDigestPolicy::Required,
-            // This child maps from materialized bytes; windows are dead here.
-            ExecFileBackingPolicy::Skip,
-        );
+        let loaded = dispatcher.with_kernel_credentials(&restored_context, || {
+            load_native_execve_image(
+                &dispatcher,
+                &guest.resolved_path,
+                argv.clone(),
+                env.clone(),
+                &plan,
+                // The guard this reload feeds IS the digest comparison.
+                ExecDigestPolicy::Required,
+                // This child maps from materialized bytes; windows are dead here.
+                ExecFileBackingPolicy::Skip,
+            )
+        });
         if loaded.is_ok() {
             native_reexec_lifecycle(
                 carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecImageLoadEnd,
@@ -1839,6 +1934,7 @@ pub(crate) fn resume_guest_from_capsule(
             .collect(),
         env,
     );
+    drop(restored_context);
     run_image_in_current_process(
         source,
         translation_digest_for_loaded_exec(executable_digest),
@@ -2544,10 +2640,16 @@ fn run_image_in_child(
         // forked child's outcome IS its run's outcome.
         let mut dispatcher = dispatcher;
         if let Some(candidate) = direct {
+            let launch_context = dispatcher.capture_one_task_context().map_err(|error| {
+                RuntimeError::Unsupported(format!("capture direct launch Kernel context: {error}"))
+            })?;
+            let credential_authority = dispatcher.retain_kernel_credentials(&launch_context);
+            drop(launch_context);
             match run_direct_in_current_process(
                 candidate,
                 &resolved_path,
                 dispatcher,
+                Some(credential_authority),
                 max_traps,
                 plan,
             ) {
@@ -2683,7 +2785,13 @@ fn run_image_in_current_process(
     let reporter = Arc::new(CompatReporter::default());
     let plan = Arc::new(plan.clone());
     let mut thread_runtime = NativeThreadRuntime::new_current();
-    thread_runtime.reset_one_task_kernel_identity(&dispatcher)?;
+    let inherited_context = dispatcher.capture_one_task_context().map_err(|error| {
+        RuntimeError::Configuration(format!(
+            "capture native Darwin bootstrap Kernel context: {error}"
+        ))
+    })?;
+    thread_runtime.reset_one_task_kernel_identity(&dispatcher, &inherited_context)?;
+    drop(inherited_context);
     thread_runtime.prepare_kick_target()?;
     thread_runtime.start_signal_wake_pump();
     // Timer-signal delivery (setitimer/timer_settime): publish + kick-all via
@@ -4188,6 +4296,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                 .add_profile_phase_ns(dsr::profile::Phase::SyscallDispatch, active_dispatch_ns)
                 .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
         }
+        let kernel_context = timed_outcome.kernel_context;
         let outcome = timed_outcome.outcome;
         if matches!(outcome, DispatchOutcome::Returned { value: 0 })
             && carrick_abi::syscall::lookup_aarch64(request.number.raw())
@@ -4347,6 +4456,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                 )?;
                 let clone = thread_runtime.spawn_clone_thread(
                     &dispatcher,
+                    &kernel_context,
                     &memory,
                     &reporter,
                     &plan,
@@ -4440,6 +4550,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                 };
                 match handle_native_fork(
                     &dispatcher,
+                    &kernel_context,
                     &memory,
                     thread_runtime,
                     &mut vfork_completion,
@@ -4519,22 +4630,25 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                 let proc_env = env.clone();
                 let forked_child_exec =
                     NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire);
-                match load_native_execve_image(
-                    &dispatcher,
-                    &path,
-                    argv,
-                    env,
-                    &plan,
-                    ExecDigestPolicy::DeferredUntilNeeded,
-                    // Only the forked-child self-reexec transport maps regions
-                    // from the executable fd; the in-process replacement below
-                    // maps materialized bytes.
-                    if forked_child_exec {
-                        ExecFileBackingPolicy::Compute
-                    } else {
-                        ExecFileBackingPolicy::Skip
-                    },
-                ) {
+                let loaded = dispatcher.with_kernel_credentials(&kernel_context, || {
+                    load_native_execve_image(
+                        &dispatcher,
+                        &path,
+                        argv,
+                        env,
+                        &plan,
+                        ExecDigestPolicy::DeferredUntilNeeded,
+                        // Only the forked-child self-reexec transport maps regions
+                        // from the executable fd; the in-process replacement below
+                        // maps materialized bytes.
+                        if forked_child_exec {
+                            ExecFileBackingPolicy::Compute
+                        } else {
+                            ExecFileBackingPolicy::Skip
+                        },
+                    )
+                });
+                match loaded {
                     Ok((
                         image,
                         relative_relocations,
@@ -4597,6 +4711,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                             )?;
                             if let Err(error) = crate::native_exec_capsule::begin_guest_exec(
                                 &dispatcher,
+                                &kernel_context,
                                 &image,
                                 &relative_relocations,
                                 exec_backing,
@@ -4729,7 +4844,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                             }
                         }
                         let prepared_kernel_exec = dispatcher
-                            .prepare_one_task_kernel_exec(thread_runtime.linux_tid())
+                            .prepare_one_task_kernel_exec(&kernel_context)
                             .map_err(|error| {
                                 RuntimeError::Configuration(format!(
                                     "prepare native Darwin Kernel exec: {error}"
@@ -5320,9 +5435,10 @@ impl NativeThreadRuntime {
     fn reset_one_task_kernel_identity(
         &mut self,
         dispatcher: &SyscallDispatcher,
+        inherited: &crate::kernel::KernelContext,
     ) -> Result<(), RuntimeError> {
         let context = dispatcher
-            .reset_one_task_kernel_binding_for_current_process(self.tid)
+            .reset_one_task_kernel_binding_for_current_process(inherited, self.tid)
             .map_err(|error| {
                 RuntimeError::Configuration(format!(
                     "rebind native Darwin one-task Kernel identity: {error}"
@@ -5462,6 +5578,7 @@ impl NativeThreadRuntime {
     fn spawn_clone_thread(
         &self,
         dispatcher: &Arc<SyscallDispatcher>,
+        parent_context: &crate::kernel::KernelContext,
         memory: &SharedNativeMemory,
         reporter: &Arc<CompatReporter>,
         plan: &Arc<ExecutionPlan>,
@@ -5478,12 +5595,9 @@ impl NativeThreadRuntime {
                 ));
             }
         };
-        let parent_context = dispatcher
-            .capture_kernel_context(self.linux_tid)
-            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
         let reservation = parent_context
             .kernel()
-            .reserve_thread_clone(&parent_context, clone_plan, None)
+            .reserve_thread_clone(parent_context, clone_plan, None)
             .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
         let linux_tid = reservation.tid();
         let read_tid_output = |address: u64| -> Option<Option<Vec<u8>>> {
@@ -6058,9 +6172,19 @@ fn dispatch_native_syscall<const PROFILE: bool>(
     reporter: &CompatReporter,
     trace_syscalls: bool,
 ) -> Result<TimedDispatchOutcome, RuntimeError> {
+    let kernel_context = dispatcher
+        .capture_kernel_context(thread_runtime.linux_tid())
+        .map_err(|error| {
+            RuntimeError::Configuration(format!(
+                "capture native Darwin thread Kernel context: {error}"
+            ))
+        })?;
     let mut blocked_ns = NativeBlockedSpan::default();
     let outcome = dispatch_native_syscall_inner::<PROFILE>(
-        dispatcher,
+        NativeDispatchAuthority {
+            dispatcher,
+            kernel_context: &kernel_context,
+        },
         request,
         memory,
         thread_runtime,
@@ -6070,6 +6194,7 @@ fn dispatch_native_syscall<const PROFILE: bool>(
     )?;
     Ok(TimedDispatchOutcome {
         outcome,
+        kernel_context,
         blocked: blocked_ns,
     })
 }
@@ -6586,7 +6711,7 @@ fn install_native_host_alias(
 }
 
 fn dispatch_native_syscall_inner<const PROFILE: bool>(
-    dispatcher: &SyscallDispatcher,
+    authority: NativeDispatchAuthority<'_>,
     request: SyscallRequest,
     memory: &SharedNativeMemory,
     thread_runtime: &NativeThreadRuntime,
@@ -6594,13 +6719,10 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
     trace_syscalls: bool,
     blocked_ns: &mut NativeBlockedSpan,
 ) -> Result<DispatchOutcome, RuntimeError> {
-    let kernel_context = dispatcher
-        .capture_kernel_context(thread_runtime.linux_tid())
-        .map_err(|error| {
-            RuntimeError::Configuration(format!(
-                "capture native Darwin thread Kernel context: {error}"
-            ))
-        })?;
+    let NativeDispatchAuthority {
+        dispatcher,
+        kernel_context,
+    } = authority;
     let mut signal_wait_deadline = None;
     let mut fd_wait_deadline = None;
     loop {
@@ -6617,7 +6739,7 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
                     NativeDispatchGuardClassScope::enter(NativeDispatchGuardClass::Exclusive);
                 let mut memory = memory.write();
                 let outcome = dispatcher.dispatch_threaded(
-                    &kernel_context,
+                    kernel_context,
                     request,
                     &mut *memory,
                     reporter,
@@ -6669,7 +6791,7 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
                     NativeDispatchGuardClassScope::enter(NativeDispatchGuardClass::Shared);
                 let mut memory = NativeDispatchMemory::new_read(memory);
                 dispatcher.dispatch_threaded(
-                    &kernel_context,
+                    kernel_context,
                     request,
                     &mut memory,
                     reporter,
@@ -7589,6 +7711,7 @@ fn native_child_status_ready(pid: i32) -> bool {
 
 fn handle_native_fork(
     dispatcher: &SyscallDispatcher,
+    parent_context: &crate::kernel::KernelContext,
     memory: &SharedNativeMemory,
     thread_runtime: &mut NativeThreadRuntime,
     vfork_completion: &mut Option<NativeVforkCompletion>,
@@ -8003,7 +8126,7 @@ fn handle_native_fork(
         );
         child_phase_start = Instant::now();
         thread_runtime.reset_after_fork_child();
-        thread_runtime.reset_one_task_kernel_identity(dispatcher)?;
+        thread_runtime.reset_one_task_kernel_identity(dispatcher, parent_context)?;
         // Retire SIBLING per-tid signal state before re-keying the forking
         // thread's own: fork clones only the calling thread, and the child's
         // fresh registry allocates tids that can collide with a dead parent
@@ -17378,6 +17501,7 @@ mod tests {
             candidate,
             "/bin/source",
             dispatcher,
+            None,
             usize::MAX,
             &native16k_test_plan(),
         )

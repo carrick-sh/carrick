@@ -1,11 +1,16 @@
-//! Per-process credential publication so peer carrick processes can read
-//! each other's current effective uid. Used by `bootstrap_signal_send` to
-//! enforce Linux's `kill(2)` permission check (LTP `kill05`): a non-root
-//! caller cannot signal a process owned by a different uid.
+//! Durable one-task-adapter credential projection for peer host processes.
+//!
+//! Kernel `Credentials` remains the sole in-process authority. Only the mature
+//! one-Linux-task-per-host-process adapter's task leader publishes here; guest
+//! nonleaders and multiplexed HVPatch tasks never overwrite one host-PID slot.
+//! Readers use this transport when the target Kernel graph lives in another
+//! host process and therefore cannot be joined directly. Used by
+//! `bootstrap_signal_send` for the existing cross-process permission model.
 //!
 //! Storage: `/tmp/carrick-cred-<host_pid>` — a single u32 little-endian
-//! euid value. Each carrick process publishes on `setuid`/`setreuid`/
-//! `setresuid`. The file is created at first publish; the process's exit
+//! leader euid projection. The adapter publishes whenever leader authority is
+//! established or its effective uid changes. The file is created at first
+//! publish; the process's exit
 //! reaps it via the `unpublish` helper. Best-effort throughout — if the
 //! file is missing (peer not yet published, peer is a non-carrick process,
 //! /tmp not writable), the caller falls back to the conservative ALLOW
@@ -23,26 +28,32 @@
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const CRED_DIR: &str = "/tmp";
 
-/// Cached version of the most recently published euid; lets us skip the
-/// fs write when nothing has changed. `u32::MAX` is the sentinel for
-/// "never published yet".
-static LAST_PUBLISHED: AtomicU32 = AtomicU32::new(u32::MAX);
+/// Cached `(host_pid, euid)` publication; including the host PID keeps a
+/// fork child from inheriting a cache hit for its parent's projection.
+/// `u64::MAX` is the sentinel for "never published yet".
+static LAST_PUBLISHED: AtomicU64 = AtomicU64::new(u64::MAX);
 
 fn cred_path(pid: i32) -> PathBuf {
     PathBuf::from(CRED_DIR).join(format!("carrick-cred-{pid}"))
 }
 
+fn publication_key(host_pid: u32, euid: u32) -> u64 {
+    (u64::from(host_pid) << 32) | u64::from(euid)
+}
+
 /// Write `euid` to the current process's cred file. Idempotent + cheap on
 /// the unchanged path.
 pub fn publish_self(euid: u32) {
-    if LAST_PUBLISHED.swap(euid, Ordering::Relaxed) == euid {
+    let host_pid = std::process::id();
+    let publication = publication_key(host_pid, euid);
+    if LAST_PUBLISHED.swap(publication, Ordering::Relaxed) == publication {
         return;
     }
-    let path = cred_path(std::process::id() as i32);
+    let path = cred_path(host_pid as i32);
     // Best-effort atomic-ish write: write to <path>.tmp then rename. A
     // reader catching us mid-write either sees the old contents (rename
     // not yet committed) or the new ones, never a partial.
@@ -106,4 +117,16 @@ pub fn read_target(pid: i32) -> Option<u32> {
 /// Remove our cred file on process exit. Best-effort.
 pub fn unpublish() {
     let _ = std::fs::remove_file(cred_path(std::process::id() as i32));
+    LAST_PUBLISHED.store(u64::MAX, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::publication_key;
+
+    #[test]
+    fn publication_cache_key_distinguishes_forked_host_processes() {
+        assert_ne!(publication_key(41, 1000), publication_key(42, 1000));
+        assert_ne!(publication_key(41, 1000), publication_key(41, 1001));
+    }
 }

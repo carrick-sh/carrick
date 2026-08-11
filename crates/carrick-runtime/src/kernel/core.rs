@@ -51,6 +51,20 @@ impl KernelContext {
         self.revision
     }
 
+    /// Retain this exact captured generation for a lifecycle handoff. This is
+    /// deliberately distinct from registry capture: every Arc and revision is
+    /// preserved byte-for-byte, so no newer association can be substituted.
+    pub(crate) fn retain_exact(&self) -> Self {
+        Self {
+            kernel: Arc::clone(&self.kernel),
+            task: Arc::clone(&self.task),
+            thread: Arc::clone(&self.thread),
+            shared: Arc::clone(&self.shared),
+            resources: Arc::clone(&self.resources),
+            revision: self.revision,
+        }
+    }
+
     pub fn exact_thread_is_live(&self) -> bool {
         self.task
             .thread(self.thread.key().tid)
@@ -300,6 +314,7 @@ impl ObservationInventory {
                     publication,
                     file_table: resources.files().id(),
                     fs_context: resources.fs_context().id(),
+                    credentials: resources.credentials().id(),
                 })
                 .or_default(),
             resources,
@@ -509,7 +524,7 @@ impl Kernel {
         let resources = Arc::new(ThreadResources::new(
             Arc::new(FileTable::new(object_ids.file_table_id()?)),
             Arc::new(FsContext::new(object_ids.fs_context_id()?)),
-            Arc::new(Credentials::new()),
+            Arc::new(Credentials::root(object_ids.credentials_id()?)),
         ));
         let task_key = TaskKey {
             id: bootstrap.task_id,
@@ -1213,7 +1228,12 @@ mod tests {
                 Arc::new(FsContext::new(
                     kernel.object_ids().fs_context_id().expect("new fs"),
                 )),
-                Arc::new(Credentials::new()),
+                Arc::new(Credentials::root(
+                    kernel
+                        .object_ids()
+                        .credentials_id()
+                        .expect("new credentials"),
+                )),
             )));
 
         let second = kernel.context(task_id, tid).expect("fresh context");

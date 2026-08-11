@@ -325,7 +325,7 @@ pub(super) struct ShmSegment {
 }
 
 impl ShmSegment {
-    fn can_read(&self, creds: &super::creds::CredState) -> bool {
+    fn can_read(&self, creds: &crate::kernel::Credentials) -> bool {
         creds.euid == 0
             || if creds.euid == self.uid {
                 self.mode.owner_readable()
@@ -334,7 +334,7 @@ impl ShmSegment {
             }
     }
 
-    fn can_write(&self, creds: &super::creds::CredState) -> bool {
+    fn can_write(&self, creds: &crate::kernel::Credentials) -> bool {
         creds.euid == 0
             || if creds.euid == self.uid {
                 self.mode.owner_writable()
@@ -523,11 +523,11 @@ impl SemScanIndex {
 }
 
 impl SemSet {
-    fn can_admin(&self, creds: &super::creds::CredState) -> bool {
+    fn can_admin(&self, creds: &crate::kernel::Credentials) -> bool {
         creds.euid == 0 || creds.euid == self.uid || creds.euid == self.cuid
     }
 
-    fn can_read(&self, creds: &super::creds::CredState) -> bool {
+    fn can_read(&self, creds: &crate::kernel::Credentials) -> bool {
         creds.euid == 0
             || if creds.euid == self.uid {
                 self.mode.owner_readable()
@@ -536,7 +536,7 @@ impl SemSet {
             }
     }
 
-    fn can_write(&self, creds: &super::creds::CredState) -> bool {
+    fn can_write(&self, creds: &crate::kernel::Credentials) -> bool {
         creds.euid == 0
             || if creds.euid == self.uid {
                 self.mode.owner_writable()
@@ -660,7 +660,7 @@ impl SysvIpcService {
 
     fn msgget(
         state: &mut SysvShmState,
-        creds: &super::creds::CredState,
+        creds: &crate::kernel::Credentials,
         key: MsgKey,
         flags: u64,
     ) -> Result<MsgQueueId, LinuxErrno> {
@@ -669,7 +669,7 @@ impl SysvIpcService {
 
     fn msgsnd(
         id: MsgQueueId,
-        creds: &super::creds::CredState,
+        creds: &crate::kernel::Credentials,
         msg_type: MsgType,
         payload: &[u8],
     ) -> Result<bool, LinuxErrno> {
@@ -679,7 +679,7 @@ impl SysvIpcService {
     fn msgrcv<M: GuestMemory>(
         cx: &mut SyscallCtx<M>,
         id: MsgQueueId,
-        creds: &super::creds::CredState,
+        creds: &crate::kernel::Credentials,
         msgp: u64,
         msgsz: usize,
         wanted: MsgType,
@@ -850,7 +850,12 @@ struct MsgQueueFile {
 }
 
 impl MsgQueueFile {
-    fn new(id: MsgQueueId, key: i32, mode: ShmPermMode, creds: &super::creds::CredState) -> Self {
+    fn new(
+        id: MsgQueueId,
+        key: i32,
+        mode: ShmPermMode,
+        creds: &crate::kernel::Credentials,
+    ) -> Self {
         let now = unix_now_secs();
         Self {
             id,
@@ -872,11 +877,11 @@ impl MsgQueueFile {
         }
     }
 
-    fn can_admin(&self, creds: &super::creds::CredState) -> bool {
+    fn can_admin(&self, creds: &crate::kernel::Credentials) -> bool {
         creds.euid == 0 || creds.euid == self.uid || creds.euid == self.cuid
     }
 
-    fn can_read(&self, creds: &super::creds::CredState) -> bool {
+    fn can_read(&self, creds: &crate::kernel::Credentials) -> bool {
         creds.euid == 0
             || if creds.euid == self.uid {
                 self.mode.owner_readable()
@@ -885,7 +890,7 @@ impl MsgQueueFile {
             }
     }
 
-    fn can_write(&self, creds: &super::creds::CredState) -> bool {
+    fn can_write(&self, creds: &crate::kernel::Credentials) -> bool {
         creds.euid == 0
             || if creds.euid == self.uid {
                 self.mode.owner_writable()
@@ -1791,7 +1796,7 @@ fn adjust_shm_nattch(segment: &ShmSegment, delta: i64) -> u64 {
 /// return (shmid, path, mode). On error returns `Err(linux_errno)`.
 pub(super) fn shmget_open(
     state: &mut SysvShmState,
-    creds: &super::creds::CredState,
+    creds: &crate::kernel::Credentials,
     key: i32,
     size: usize,
     flags: u64,
@@ -1939,7 +1944,10 @@ pub(super) fn shmctl_rmid(state: &mut SysvShmState, shmid: i32) -> Result<(), Li
 /// segment's metadata. LTP shmctl01 reads every populated field, including the
 /// owner/creator ids in `shm_perm` — those come from the GUEST creds (carrick's
 /// host process is not the guest uid), not the host stat.
-pub(super) fn shmid_ds_bytes(segment: &ShmSegment, _creds: &super::creds::CredState) -> [u8; 112] {
+pub(super) fn shmid_ds_bytes(
+    segment: &ShmSegment,
+    _creds: &crate::kernel::Credentials,
+) -> [u8; 112] {
     let ds = LinuxShmidDs {
         shm_perm: LinuxIpcPerm {
             uid: segment.uid,
@@ -2912,7 +2920,7 @@ impl SyscallDispatcher {
 
 fn msgget_open(
     state: &mut SysvShmState,
-    creds: &super::creds::CredState,
+    creds: &crate::kernel::Credentials,
     key: MsgKey,
     flags: u64,
 ) -> Result<MsgQueueId, LinuxErrno> {
@@ -2979,7 +2987,7 @@ fn msgget_open(
 
 fn msg_queue_try_send(
     id: MsgQueueId,
-    creds: &super::creds::CredState,
+    creds: &crate::kernel::Credentials,
     msg_type: MsgType,
     payload: &[u8],
 ) -> Result<bool, LinuxErrno> {
@@ -3041,7 +3049,7 @@ fn selected_msg_index(messages: &[MsgRecord], wanted: MsgType, flags: MsgOpFlags
 fn msg_queue_receive<M: GuestMemory>(
     cx: &mut SyscallCtx<M>,
     id: MsgQueueId,
-    creds: &super::creds::CredState,
+    creds: &crate::kernel::Credentials,
     msgp: u64,
     msgsz: usize,
     wanted: MsgType,
@@ -3203,7 +3211,7 @@ fn msg_stat_by_index<M: GuestMemory>(
     cx: &mut SyscallCtx<M>,
     selector: u64,
     buf: u64,
-    creds: &super::creds::CredState,
+    creds: &crate::kernel::Credentials,
     enforce_read_permission: bool,
 ) -> Result<DispatchOutcome, LinuxErrno> {
     if buf == 0 {
@@ -3574,7 +3582,7 @@ impl SyscallDispatcher {
         semnum: i32,
         cmd: u64,
         arg: u64,
-        creds: &super::creds::CredState,
+        creds: &crate::kernel::Credentials,
     ) -> Result<DispatchOutcome, DispatchError> {
         match cmd {
             LINUX_IPC_INFO | LINUX_SEM_INFO => {
@@ -3733,7 +3741,7 @@ impl SyscallDispatcher {
         cx: &mut SyscallCtx<M>,
         selector: SemStatSelector,
         arg: u64,
-        creds: &super::creds::CredState,
+        creds: &crate::kernel::Credentials,
     ) -> Result<DispatchOutcome, DispatchError> {
         let state = self.sysv.lock();
         let Some((guest_semid, meta)) = state
@@ -3784,7 +3792,7 @@ fn sysv_semctl<M: GuestMemory>(
     semnum: i32,
     cmd: u64,
     arg: u64,
-    creds: &super::creds::CredState,
+    creds: &crate::kernel::Credentials,
 ) -> Result<DispatchOutcome, DispatchError> {
     let Some(host_cmd) = linux_semctl_cmd_to_host(cmd) else {
         // SEM_STAT/SEM_INFO and friends: not supported on macOS.

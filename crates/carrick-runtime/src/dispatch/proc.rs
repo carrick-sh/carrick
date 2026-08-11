@@ -987,11 +987,6 @@ impl SyscallDispatcher {
         proc.itimers = [None, None, None];
         proc.ptrace_traceme = false;
         proc.virtual_ptrace_stops.clear();
-        let reset_one_task_binding = proc.hvpatch_process.is_none();
-        drop(proc);
-        if reset_one_task_binding {
-            *self.kernel_binding.write() = super::bootstrap_one_task_binding();
-        }
     }
 
     pub(crate) fn subreaper_for_fork_child(&self) -> u32 {
@@ -1912,7 +1907,7 @@ impl SyscallDispatcher {
         /// carrick has no real controlling tty to revoke, so success is a
         /// no-op.
         fn vhangup(this, cx) {
-            if this.creds.lock().euid != 0 {
+            if this.cred_snapshot().euid != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
             Ok(DispatchOutcome::Returned { value: 0 })

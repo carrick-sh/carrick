@@ -260,17 +260,24 @@ where
         env.iter().map(|s| s.as_bytes().to_vec()).collect(),
     );
     let file = std::fs::read(path).map_err(AddressSpaceError::Io)?;
-    let image = AddressSpace::load_elf_bytes_with_reader(&file, &|p| {
-        dispatcher
-            .read_exec_file(p)
-            .or_else(|| std::fs::read(p).ok())
-    })?
-    .with_vdso_auxv(vdso_enabled_for_debug())
-    .with_linux_initial_stack_page_size(
-        argv,
-        env,
-        crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
-    )?;
+    let launch_context = dispatcher.capture_one_task_context().map_err(|error| {
+        RuntimeError::Unsupported(format!("capture static launch Kernel context: {error}"))
+    })?;
+    let loaded = dispatcher.with_kernel_credentials(&launch_context, || {
+        AddressSpace::load_elf_bytes_with_reader(&file, &|p| {
+            dispatcher
+                .read_exec_file(p)
+                .or_else(|| std::fs::read(p).ok())
+        })
+    });
+    drop(launch_context);
+    let image = loaded?
+        .with_vdso_auxv(vdso_enabled_for_debug())
+        .with_linux_initial_stack_page_size(
+            argv,
+            env,
+            crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
+        )?;
     finish_and_run_image(image, dispatcher, max_traps, debug_state_path)
 }
 
@@ -507,16 +514,20 @@ where
     // PATH-resolve a bare command AND resolve `#!` shebang scripts to their
     // interpreter (Docker / execve(2) semantics) before loading, so a script
     // entrypoint runs instead of failing "not an ELF binary".
+    let launch_context = dispatcher.capture_one_task_context().map_err(|error| {
+        RuntimeError::Unsupported(format!("capture image launch Kernel context: {error}"))
+    })?;
     let argv_for_cmdline = argv.clone();
     let argv_bytes: Vec<Vec<u8>> = argv.into_iter().map(String::into_bytes).collect();
-    let (resolved, argv) =
+    let resolved_entry = dispatcher.with_kernel_credentials(&launch_context, || {
         crate::exec_helpers::resolve_entrypoint_program(path, &env, argv_bytes, &dispatcher)
-            .map_err(|_| {
-                RuntimeError::AddressSpace(AddressSpaceError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    path.to_owned(),
-                )))
-            })?;
+    });
+    let (resolved, argv) = resolved_entry.map_err(|_| {
+        RuntimeError::AddressSpace(AddressSpaceError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            path.to_owned(),
+        )))
+    })?;
     // /proc/self/cmdline reflects the user's argv, but /proc/self/exe MUST be the
     // RESOLVED absolute binary path — real Linux always stores the resolved path.
     // A bare `uname` would otherwise absolutize to `/uname` (cwd-relative) and
@@ -530,12 +541,14 @@ where
         env.iter().map(|s| s.as_bytes().to_vec()).collect(),
     );
     let path: &str = &resolved;
-    let bytes = dispatcher.read_exec_file(path).ok_or_else(|| {
-        RuntimeError::AddressSpace(AddressSpaceError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            path.to_owned(),
-        )))
-    })?;
+    let bytes = dispatcher
+        .with_kernel_credentials(&launch_context, || dispatcher.read_exec_file(path))
+        .ok_or_else(|| {
+            RuntimeError::AddressSpace(AddressSpaceError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                path.to_owned(),
+            )))
+        })?;
     // Redirect x86_64 binaries through Rosetta 2 (binfmt_misc-style). argv is
     // already opaque bytes (Linux ABI).
     let mut needs_at_base = false;
@@ -556,14 +569,18 @@ where
     // The platform-neutral image assembly (load + auxv + initial stack) is shared
     // with the KVM run path via `exec_helpers::build_run_image`; only the run-loop
     // entry below (HVF `finish_and_run_image`) is macOS-specific.
-    let image = crate::exec_helpers::build_run_image(
-        &bytes,
-        argv,
-        &env,
-        &dispatcher,
-        vdso_enabled_for_debug(),
-        needs_at_base.then_some(ROSETTA_AT_BASE_PLACEHOLDER),
-    )?;
+    let built = dispatcher.with_kernel_credentials(&launch_context, || {
+        crate::exec_helpers::build_run_image(
+            &bytes,
+            argv,
+            &env,
+            &dispatcher,
+            vdso_enabled_for_debug(),
+            needs_at_base.then_some(ROSETTA_AT_BASE_PLACEHOLDER),
+        )
+    });
+    drop(launch_context);
+    let image = built?;
     finish_image_for_backend(image, dispatcher, max_traps, debug_state_path, backend)
 }
 
@@ -780,7 +797,11 @@ fn run_address_space_with_hvf_and_dispatcher(
         apply_image_proc_state(&dispatcher, &image);
         // Boot-stamp the identity page before the guest runs a single syscall,
         // so the very first fast-path getpid/get*id reads the right value.
-        stamp_identity_page(&mut trap, &dispatcher);
+        let boot_context = dispatcher.capture_one_task_context().map_err(|error| {
+            RuntimeError::Configuration(format!("capture boot identity Kernel context: {error}"))
+        })?;
+        stamp_identity_page(&mut trap, &dispatcher, &boot_context);
+        drop(boot_context);
         let run = run_threaded_hvf_loop(trap, dispatcher, max_traps);
         if persistent_vm {
             finalize_persistent_hvf_run(
@@ -1073,8 +1094,12 @@ where
                 a[5]
             );
         }
+        let kernel_context = dispatcher.capture_one_task_context().map_err(|error| {
+            RuntimeError::Configuration(format!("capture one-task syscall Kernel context: {error}"))
+        })?;
         let outcome = dispatch_single_threaded_syscall(
             &mut dispatcher,
+            &kernel_context,
             SyscallRequest::from_raw(frame),
             runtime,
             &reporter,
@@ -1256,9 +1281,18 @@ where
                         // watchdog (shares the tree-global progress counter).
                         crate::deadlock_watchdog::arm();
                         crate::guest_cpu::complete_child_record_post_fork_child();
-                        // Re-stamp the identity page: the child's pid changed
-                        // (ns-pid now registered), so a fast-path getpid is right.
-                        stamp_identity_page(runtime, &dispatcher);
+                        dispatcher.proc_after_fork_child();
+                        let child_context = dispatcher
+                            .reset_one_task_kernel_binding_for_current_process(
+                                &kernel_context,
+                                ThreadId::main_from_host_pid(),
+                            )
+                            .unwrap_or_else(|error| {
+                                tracing::error!(%error, "rebind single-thread fork-child Kernel authority");
+                                std::process::abort();
+                            });
+                        // Re-stamp from the exact child generation published above.
+                        stamp_identity_page(runtime, &dispatcher, &child_context);
                         if let Some(addr) = parent_tid_addr {
                             let tid = (crate::namespace::pid::self_ns_pid() as i32).to_le_bytes();
                             let _ = runtime.write_bytes(addr, &tid);
@@ -1267,7 +1301,6 @@ where
                             let tid = (crate::namespace::pid::self_ns_pid() as i32).to_le_bytes();
                             let _ = runtime.write_bytes(addr, &tid);
                         }
-                        dispatcher.proc_after_fork_child();
                         dispatcher.mem_after_fork_child();
                         dispatcher.sysv_after_fork_child();
                         // The child's pid changed; its waiter watches for
@@ -1295,7 +1328,10 @@ where
                 let cmdline = proc_argv.join(" ");
                 crate::dispatch::set_host_process_name(cmdline.as_bytes());
                 let proc_env = env.clone();
-                match load_execve_image(&dispatcher, &path, argv, env) {
+                let loaded = dispatcher.with_kernel_credentials(&kernel_context, || {
+                    load_execve_image(&dispatcher, &path, argv, env)
+                });
+                match loaded {
                     Ok(new_image) => {
                         crate::probes::execve_loaded(
                             &path,
@@ -1310,8 +1346,9 @@ where
                         dispatcher.close_cloexec_fds();
                         runtime.execve_into(&new_image)?;
                         crate::namespace::pid::mark_self_execed();
-                        // execve_into rebuilt a fresh (zeroed) identity page.
-                        stamp_identity_page(runtime, &dispatcher);
+                        // execve_into rebuilt a fresh (zeroed) identity page;
+                        // exec retains the caller's captured credential values.
+                        stamp_identity_page(runtime, &dispatcher, &kernel_context);
                         stop_after_traced_exec(&dispatcher);
                     }
                     Err(errno) => {
@@ -1573,6 +1610,7 @@ where
 
 fn dispatch_single_threaded_syscall<M: GuestMemory>(
     dispatcher: &mut SyscallDispatcher,
+    kernel_context: &crate::kernel::KernelContext,
     request: SyscallRequest,
     memory: &mut M,
     reporter: &CompatReporter,
@@ -1584,9 +1622,6 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
     // blocking path: poll the host fds, then re-dispatch the same syscall on
     // readiness. This is the common single-threaded path for the combined and
     // split runtimes; the threaded runtime keeps its own fork-quiesce handling.
-    let kernel_context = dispatcher.capture_one_task_context().map_err(|error| {
-        RuntimeError::Configuration(format!("capture one-task kernel context: {error}"))
-    })?;
     let mut signal_wait_deadline = None;
     let mut sleep_deadline: Option<Instant> = None;
     let mut poll_deadline: Option<Instant> = None;
@@ -1594,7 +1629,7 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
         let outcome = dispatch_with_panic_backstop(
             request.number.raw(),
             ThreadId::main_from_host_pid(),
-            || dispatcher.dispatch(&kernel_context, request, memory, reporter),
+            || dispatcher.dispatch(kernel_context, request, memory, reporter),
         )?;
         match outcome {
             DispatchOutcome::BlockingHostWrite(mut write) => {

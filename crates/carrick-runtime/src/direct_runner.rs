@@ -571,6 +571,7 @@ pub(crate) struct DirectExecServices {
 pub(crate) struct DirectExecReplacement {
     pub(crate) group: DirectLoadGroup,
     pub(crate) stack: DirectStack,
+    pub(crate) kernel_exec: crate::kernel::PreparedExec,
     pub(crate) resolved: String,
     pub(crate) argv: Vec<Vec<u8>>,
     pub(crate) env: Vec<Vec<u8>>,
@@ -690,8 +691,12 @@ impl DirectRunner {
     /// the new group and stack have been prepared and the old group/stack
     /// have been dropped.  Closing the vfork completion fd is intentionally
     /// last: that close publishes successful exec to the suspended parent.
-    pub(crate) fn commit_in_process_exec(&self) {
+    pub(crate) fn commit_in_process_exec(&self, context: &crate::kernel::KernelContext) {
         self.retire_identity_memory();
+        let mut linux_tids = write_lock(&self.linux_tids);
+        linux_tids.clear();
+        linux_tids.insert(context.thread().registry_id(), context.thread().key().tid);
+        drop(linux_tids);
         *lock(&self.outcome) = None;
         self.exiting.store(false, Ordering::SeqCst);
         if let Some(fd) = lock(&self.vfork_completion_fd).take() {
@@ -2234,7 +2239,7 @@ impl DirectRunner {
                     return self.service_clone_thread(
                         ctx,
                         tid,
-                        linux_tid,
+                        &kernel,
                         flags,
                         stack,
                         tls,
@@ -2259,6 +2264,7 @@ impl DirectRunner {
                     return self.service_fork(
                         ctx,
                         tid,
+                        &kernel,
                         ForkRequest {
                             pidfd_out,
                             clone_parent,
@@ -2297,11 +2303,12 @@ impl DirectRunner {
                     }
                     return match crate::native_darwin::tier_d_service_execve(
                         &self.dispatcher,
+                        &kernel,
                         path,
                         argv,
                         env,
-                        &exec.plan,
-                        exec.max_traps,
+                        self.main_tid(),
+                        exec,
                     ) {
                         crate::native_darwin::TierDExecFlow::Resume(value) => {
                             ServiceVerdict::Resume(value)
@@ -2614,7 +2621,7 @@ impl DirectRunner {
         &self,
         ctx: &GuestContext,
         parent_tid: ThreadId,
-        parent_linux_tid: crate::kernel::LinuxTid,
+        parent_context: &crate::kernel::KernelContext,
         flags: u64,
         stack: u64,
         tls: Option<u64>,
@@ -2657,20 +2664,10 @@ impl DirectRunner {
                 return ServiceVerdict::Resume(crate::linux_abi::LINUX_EINVAL.guest_retval());
             }
         };
-        let parent_context = match self.dispatcher.capture_kernel_context(parent_linux_tid) {
-            Ok(context) => context,
-            Err(error) => {
-                self.end_process(DirectRunOutcome::Unsupported {
-                    syscall: ctx.syscall_nr(),
-                    outcome: format!("capture tier-D clone parent Kernel context: {error}"),
-                });
-                return ServiceVerdict::Leave;
-            }
-        };
         let reservation =
             match parent_context
                 .kernel()
-                .reserve_thread_clone(&parent_context, clone_plan, None)
+                .reserve_thread_clone(parent_context, clone_plan, None)
             {
                 Ok(reservation) => reservation,
                 Err(error) => {
@@ -2857,6 +2854,7 @@ impl DirectRunner {
         &self,
         ctx: &mut GuestContext,
         parent_tid: ThreadId,
+        parent_context: &crate::kernel::KernelContext,
         request: ForkRequest,
     ) -> ServiceVerdict {
         use carrick_dsr_aarch64::mapped_memory::NATIVE_FORKED_GUEST_CHILD;
@@ -3019,7 +3017,7 @@ impl DirectRunner {
             self.forked_child.store(true, Ordering::Release);
             crate::probes::host_process_birth_current();
             crate::native::fork_child::dispatcher_after_fork_child(&self.dispatcher);
-            let child_tid = self.reset_after_fork_child();
+            let child_tid = self.reset_after_fork_child(parent_context);
             self.dispatcher
                 .retire_sibling_thread_signal_state(parent_tid);
             self.dispatcher
@@ -3117,14 +3115,14 @@ impl DirectRunner {
     /// tid re-pointed at the new main. The futex table, brk and tracked-anon
     /// state are the guest's own memory bookkeeping and stay valid across
     /// the address-space copy.
-    fn reset_after_fork_child(&self) -> ThreadId {
+    fn reset_after_fork_child(&self, inherited: &crate::kernel::KernelContext) -> ThreadId {
         let tid = ThreadId::main_from_host_pid();
         let registry = Arc::new(crate::thread::ThreadRegistry::new(tid));
         *write_lock(&self.registry) = Arc::clone(&registry);
         crate::thread::set_current_registry(registry);
         let context = self
             .dispatcher
-            .reset_one_task_kernel_binding_for_current_process(tid)
+            .reset_one_task_kernel_binding_for_current_process(inherited, tid)
             .unwrap_or_else(|error| {
                 let message = format!("tier-D fork child Kernel reset failed: {error}\n");
                 unsafe {
@@ -4323,7 +4321,23 @@ mod tests {
             "the outgoing guest mapping must exist before exec commit"
         );
 
-        runner.commit_in_process_exec();
+        let context = runner
+            .dispatcher()
+            .capture_one_task_context()
+            .expect("exec context");
+        write_lock(&runner.linux_tids).insert(
+            ThreadId::synthetic_for_tests(90_001),
+            crate::kernel::LinuxTid::from_abi_positive(90_001).expect("synthetic Linux tid"),
+        );
+        runner.commit_in_process_exec(&context);
+        assert_eq!(
+            *read_lock(&runner.linux_tids),
+            std::collections::BTreeMap::from([(
+                context.thread().registry_id(),
+                context.thread().key().tid,
+            )]),
+            "exec commit must discard departed thread mappings and rekey the survivor"
+        );
 
         assert_eq!(
             unsafe {

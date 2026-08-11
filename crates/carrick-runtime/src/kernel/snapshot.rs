@@ -14,8 +14,8 @@ use super::address::{MmBackend, MmBinding, SnapshotError, SnapshotTable};
 use super::core::{Kernel, TaskRevision};
 use super::frame_inventory::{FrameRow, MappingRow};
 use super::ids::{
-    FileDescriptionId, FileSlotNumber, FileTableId, FsContextId, LinuxSignal, MmId, ProcessGroupId,
-    SessionId, SighandId,
+    CredentialsId, FileDescriptionId, FileSlotNumber, FileTableId, FsContextId, LinuxSignal, MmId,
+    ProcessGroupId, SessionId, SighandId,
 };
 use super::objects::{
     FileDescription, FileTable, FsContext, Sighand, SignalDisposition, TaskKey, TaskLifecycle,
@@ -70,6 +70,7 @@ pub struct ThreadResourcesObservationKey {
     pub publication: TaskRevision,
     pub file_table: FileTableId,
     pub fs_context: FsContextId,
+    pub credentials: CredentialsId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,6 +105,7 @@ pub struct ThreadSnapshotRow {
     pub resources: ThreadResourcesObservationKey,
     pub file_table: Option<FileTableId>,
     pub fs_context: Option<FsContextId>,
+    pub credentials: Option<CredentialsId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -167,12 +169,22 @@ pub struct FsContextSnapshotRow {
     pub id: FsContextId,
 }
 
-/// Credentials have no stable object ID in the K1 vocabulary and currently
-/// contain no concrete values. The exact authoritative projection is therefore
-/// one stable thread-keyed association row, not a pointer-derived identity.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CredentialsSnapshotRow {
-    pub thread: ThreadKey,
+    pub id: CredentialsId,
+    pub class: ObjectSnapshotClass,
+    pub ruid: u32,
+    pub euid: u32,
+    pub suid: u32,
+    pub rgid: u32,
+    pub egid: u32,
+    pub sgid: u32,
+    pub fsuid: u32,
+    pub fsgid: u32,
+    pub umask: u32,
+    /// Exact explicit `setgroups(2)` authority. `None` means the runtime will
+    /// derive launch-time compatibility membership from `/etc/group`.
+    pub supplementary_groups_override: Option<Vec<u32>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -376,12 +388,14 @@ impl Kernel {
         };
         let mut thread_rows = Vec::new();
         let mut thread_signals = Vec::new();
-        let mut credentials = Vec::new();
         let mut file_table_by_id = BTreeMap::new();
         let mut fs_context_by_id = BTreeMap::<FsContextId, Arc<FsContext>>::new();
-        for resources in registry.observed_thread_resources.values() {
+        let mut credentials_by_id = BTreeMap::new();
+        let mut live_credentials = BTreeSet::new();
+        for (key, resources) in &registry.observed_thread_resources {
             let files = resources.files();
             let fs = resources.fs_context();
+            let credentials = resources.credentials();
             insert_shared(
                 &mut file_table_by_id,
                 files.id(),
@@ -394,7 +408,39 @@ impl Kernel {
                 fs,
                 "duplicate fs-context identity",
             )?;
+            insert_shared(
+                &mut credentials_by_id,
+                credentials.id(),
+                Arc::clone(&credentials),
+                "duplicate credentials identity",
+            )?;
+            if live_thread_resources.contains(key) {
+                live_credentials.insert(credentials.id());
+            }
         }
+        let credentials = credentials_by_id
+            .values()
+            .map(|credentials| CredentialsSnapshotRow {
+                id: credentials.id(),
+                class: if live_credentials.contains(&credentials.id()) {
+                    ObjectSnapshotClass::Live
+                } else {
+                    ObjectSnapshotClass::Draining
+                },
+                ruid: credentials.ruid(),
+                euid: credentials.euid(),
+                suid: credentials.suid(),
+                rgid: credentials.rgid(),
+                egid: credentials.egid(),
+                sgid: credentials.sgid(),
+                fsuid: credentials.fsuid(),
+                fsgid: credentials.fsgid(),
+                umask: credentials.umask(),
+                supplementary_groups_override: credentials
+                    .supplementary_groups_override()
+                    .map(<[u32]>::to_vec),
+            })
+            .collect();
 
         for (key, (task_key, thread)) in &registry.observed_threads {
             if thread.key() != *key || thread.task_key() != *task_key {
@@ -416,9 +462,7 @@ impl Kernel {
             )?;
             let files = resources.files();
             let fs = resources.fs_context();
-            if class == ObjectSnapshotClass::Live {
-                credentials.push(CredentialsSnapshotRow { thread: *key });
-            }
+            let thread_credentials = resources.credentials();
             let (revision, signal) = lock_result(thread.snapshot_signal_until(deadline), deadline)?;
             checks.threads.push((Arc::clone(thread), revision));
             if class == ObjectSnapshotClass::Live {
@@ -432,6 +476,8 @@ impl Kernel {
                 resources: resources_key,
                 file_table: (class == ObjectSnapshotClass::Live).then_some(files.id()),
                 fs_context: (class == ObjectSnapshotClass::Live).then_some(fs.id()),
+                credentials: (class == ObjectSnapshotClass::Live)
+                    .then_some(thread_credentials.id()),
             });
         }
 
@@ -928,7 +974,7 @@ fn sort_snapshot(snapshot: &mut KernelSnapshotV1) {
         .sort_by_key(|row| (row.table, row.number));
     snapshot.file_descriptions.sort_by_key(|row| row.id);
     snapshot.fs_contexts.sort_by_key(|row| row.id);
-    snapshot.credentials.sort_by_key(|row| row.thread);
+    snapshot.credentials.sort_by_key(|row| row.id);
     snapshot.process_groups.sort_by_key(|row| row.id);
     snapshot.sessions.sort_by_key(|row| row.id);
     snapshot.sighands.sort_by_key(|row| row.id);
@@ -1137,6 +1183,10 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
             && !thread_keys.contains(&resources.key.thread))
             || !file_tables.contains(&resources.key.file_table)
             || !fs_contexts.contains(&resources.key.fs_context)
+            || !snapshot
+                .credentials
+                .iter()
+                .any(|credentials| credentials.id == resources.key.credentials)
             || (resources.class == ObjectSnapshotClass::Live)
                 != live_resources.contains(&resources.key)
         {
@@ -1146,6 +1196,9 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
     for thread in &snapshot.threads {
         if !resources_by_key.contains_key(&thread.resources)
             || thread.resources.thread != thread.key
+            || thread
+                .credentials
+                .is_some_and(|id| id != thread.resources.credentials)
         {
             return invariant("thread task or resources join is missing");
         }
@@ -1153,7 +1206,8 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
             && (!observed_tasks.contains(&thread.task)
                 || !live_tasks.contains(&thread.task)
                 || thread.file_table.is_none()
-                || thread.fs_context.is_none())
+                || thread.fs_context.is_none()
+                || thread.credentials.is_none())
         {
             return invariant("live thread leaf join is missing");
         }
@@ -1172,19 +1226,28 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
         .iter()
         .filter_map(|row| row.registry_id.map(|_| row.key))
         .collect();
-    let credential_threads: BTreeSet<_> =
-        snapshot.credentials.iter().map(|row| row.thread).collect();
+    let credential_ids: BTreeSet<_> = snapshot.credentials.iter().map(|row| row.id).collect();
+    let live_credential_ids: BTreeSet<_> = snapshot
+        .credentials
+        .iter()
+        .filter_map(|row| (row.class == ObjectSnapshotClass::Live).then_some(row.id))
+        .collect();
+    let thread_credential_ids: BTreeSet<_> = snapshot
+        .threads
+        .iter()
+        .filter_map(|row| row.credentials)
+        .collect();
     let signal_threads: BTreeSet<_> = snapshot
         .thread_signals
         .iter()
         .map(|row| row.thread)
         .collect();
     let task_signal_tasks: BTreeSet<_> = snapshot.task_signals.iter().map(|row| row.task).collect();
-    if credential_threads.len() != snapshot.credentials.len()
+    if credential_ids.len() != snapshot.credentials.len()
         || signal_threads.len() != snapshot.thread_signals.len()
         || task_signal_tasks.len() != snapshot.task_signals.len()
         || leaf_threads != thread_keys
-        || credential_threads != live_threads
+        || thread_credential_ids != live_credential_ids
         || signal_threads != live_threads
         || task_signal_tasks != live_tasks
     {
@@ -1473,7 +1536,12 @@ mod tests {
 
     #[test]
     fn snapshot_is_owned_sorted_and_strictly_joined() {
-        let (kernel, _) = bootstrap(TestBackend::new(BackendMode::Good));
+        let (kernel, context) = bootstrap(TestBackend::new(BackendMode::Good));
+        let _context = kernel
+            .update_credentials(&context, |credentials| {
+                credentials.set_supplementary_groups(vec![9, 10]);
+            })
+            .expect("publish credential snapshot values");
         let first = kernel.snapshot(deadline()).expect("snapshot");
         let second = kernel.snapshot(deadline()).expect("snapshot");
         assert_eq!(first, second);
@@ -1483,7 +1551,23 @@ mod tests {
             (1, 1, 1)
         );
         assert_eq!(first.vmas.len(), 1);
-        assert_eq!(first.credentials[0].thread, first.threads[0].key);
+        let live_credentials = first
+            .credentials
+            .iter()
+            .find(|row| row.class == ObjectSnapshotClass::Live)
+            .expect("live credentials");
+        assert_eq!(Some(live_credentials.id), first.threads[0].credentials);
+        assert_eq!(live_credentials.umask, 0o022);
+        assert_eq!(
+            live_credentials.supplementary_groups_override,
+            Some(vec![9, 10])
+        );
+        let draining_credentials = first
+            .credentials
+            .iter()
+            .find(|row| row.class == ObjectSnapshotClass::Draining)
+            .expect("captured prior credentials remain draining");
+        assert_eq!(draining_credentials.supplementary_groups_override, None);
         assert!(first.frames.is_empty() && first.mappings.is_empty());
     }
 
@@ -1555,7 +1639,7 @@ mod tests {
         let mut duplicate_credentials = snapshot.clone();
         duplicate_credentials
             .credentials
-            .push(duplicate_credentials.credentials[0]);
+            .push(duplicate_credentials.credentials[0].clone());
         assert_corrupt(&duplicate_credentials);
 
         let mut duplicate_child = snapshot.clone();

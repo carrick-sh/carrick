@@ -1004,18 +1004,18 @@ pub(crate) fn apply_exec_image_proc_state(dispatcher: &SyscallDispatcher, image:
 /// the shim is enabled). Must run before the guest issues any intercepted
 /// syscall: at boot, and again in a forked child / after execve, since the
 /// child's pid and the new image's identity differ.
-pub(crate) fn stamp_identity_page<M: GuestMemory>(memory: &mut M, dispatcher: &SyscallDispatcher) {
+pub(crate) fn stamp_identity_page<M: GuestMemory>(
+    memory: &mut M,
+    dispatcher: &SyscallDispatcher,
+    kernel_context: &crate::kernel::KernelContext,
+) {
     if !crate::syscall_shim_enabled() {
         return;
     }
-    let id = dispatcher.identity_snapshot();
+    let id = dispatcher.identity_snapshot(kernel_context);
     let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
     for (off, val) in [
         (crate::memory::IDENTITY_OFF_PID, id.pid),
-        (crate::memory::IDENTITY_OFF_UID, id.uid),
-        (crate::memory::IDENTITY_OFF_EUID, id.euid),
-        (crate::memory::IDENTITY_OFF_GID, id.gid),
-        (crate::memory::IDENTITY_OFF_EGID, id.egid),
         (
             crate::memory::IDENTITY_OFF_SHIM_ENABLED,
             u32::from(dispatcher.identity_fast_path_enabled()),
@@ -1092,6 +1092,9 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// Guest-visible identity allocated in the kernel namespace. It is never
     /// inferred from the backend-local thread registry key.
     linux_tid: crate::kernel::LinuxTid,
+    /// Exact authority captured at the current syscall boundary. Lifecycle
+    /// outcomes consume it rather than recapturing a newer registry generation.
+    service_kernel_context: Option<crate::kernel::KernelContext>,
     this_tid: ThreadId,
     threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
     /// The object-safe vCPU registry (the kicker). The shared loop never names
@@ -1215,6 +1218,7 @@ where
             platform_futex_factory,
             process_fork_barrier,
             linux_tid,
+            service_kernel_context: None,
             this_tid,
             threads,
             kicker,
@@ -1625,6 +1629,7 @@ where
         engine: &mut E,
         frame: carrick_hal::RawSyscall,
     ) -> Result<DispatchOutcome, RuntimeError> {
+        self.service_kernel_context = None;
         // Stage-1 page-table editors — munmap(215), mremap(216), mmap(222),
         // mprotect(226) — mutate the shared guest descriptors from the host.
         // With sibling vCPUs live, Pause-Modify-Resume them so none walks a
@@ -2574,9 +2579,30 @@ where
                         value: va.raw() as i64,
                     });
                 }
-                other => break Ok(other),
+                other => {
+                    if matches!(
+                        other,
+                        DispatchOutcome::Fork { .. }
+                            | DispatchOutcome::CloneThread { .. }
+                            | DispatchOutcome::Execve { .. }
+                    ) {
+                        self.service_kernel_context = Some(kernel_context.retain_exact());
+                    }
+                    break Ok(other);
+                }
             }
         }
+    }
+
+    fn take_service_kernel_context(
+        &mut self,
+        operation: &'static str,
+    ) -> Result<crate::kernel::KernelContext, RuntimeError> {
+        self.service_kernel_context.take().ok_or_else(|| {
+            RuntimeError::Configuration(format!(
+                "{operation} outcome lost its captured Kernel context"
+            ))
+        })
     }
 
     pub(super) fn complete_returned(
@@ -3199,8 +3225,10 @@ where
                     child_tid_addr,
                     clear_child_tid_addr,
                 } => {
+                    let kernel_context = state.take_service_kernel_context("clone-thread")?;
                     let tid = state.spawn_clone_thread(
                         &kernel,
+                        &kernel_context,
                         &mut engine,
                         stack,
                         tls,
@@ -3230,7 +3258,8 @@ where
                 }
                 DispatchOutcome::Execve { path, argv, env } => {
                     crate::event_ring::rec(crate::event_ring::EXEC, 1, 0, 0);
-                    state.handle_execve(&kernel, &mut engine, path, argv, env)?;
+                    let kernel_context = state.take_service_kernel_context("execve")?;
+                    state.handle_execve(&kernel, &kernel_context, &mut engine, path, argv, env)?;
                 }
                 DispatchOutcome::SigReturn => {
                     let restored_sigmask = match engine.restore_from_sigframe() {
@@ -3272,8 +3301,10 @@ where
                     child_stack,
                     vfork,
                 } => {
+                    let kernel_context = state.take_service_kernel_context("fork")?;
                     match state.handle_fork(
                         &kernel,
+                        &kernel_context,
                         &mut engine,
                         quiesce::ForkRequest {
                             flags,
