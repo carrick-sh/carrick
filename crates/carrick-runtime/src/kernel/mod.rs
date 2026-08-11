@@ -57,8 +57,9 @@ pub use registry::{
 pub use snapshot::{
     CredentialsSnapshotRow, FileDescriptionSnapshotKind, FileDescriptionSnapshotRow,
     FileSlotSnapshotRow, FileTableSnapshotRow, FsContextSnapshotRow, KERNEL_SNAPSHOT_V1_SCHEMA,
-    KernelSnapshotError, KernelSnapshotV1, MmSnapshotRow, ProcessGroupSnapshotRow,
-    SessionSnapshotRow, SighandSnapshotRow, TaskSignalSnapshotRow, TaskSnapshotRow,
-    ThreadSignalSnapshotRow, ThreadSnapshotClass, ThreadSnapshotRow, VmaSnapshotRow,
-    ZombieSnapshotRow,
+    KernelSnapshotError, KernelSnapshotV1, MmSnapshotRow, ObjectSnapshotClass,
+    ProcessGroupSnapshotRow, SessionSnapshotRow, SighandSnapshotRow, TaskSharedObservationKey,
+    TaskSharedSnapshotRow, TaskSignalSnapshotRow, TaskSnapshotRow, ThreadResourcesObservationKey,
+    ThreadResourcesSnapshotRow, ThreadSignalSnapshotRow, ThreadSnapshotClass, ThreadSnapshotRow,
+    VmaSnapshotRow, ZombieSnapshotRow,
 };

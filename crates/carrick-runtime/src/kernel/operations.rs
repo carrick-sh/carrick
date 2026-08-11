@@ -613,6 +613,13 @@ impl PreparedFork {
                     diagnostic_name,
                 },
             );
+            kernel.observe_task_publication(
+                &child,
+                &leader,
+                &child_shared,
+                &child_resources,
+                TaskRevision::INITIAL,
+            );
             if let Some(subscriber) = pidfd_subscriber {
                 kernel
                     .exit_subscribers
@@ -846,6 +853,7 @@ impl PreparedThreadClone {
             task.publish_thread(Arc::clone(&thread))?;
             record.thread_claims.insert(tid, claim);
             record.revision = published_revision;
+            kernel.observe_thread_publication(&thread, &resources, published_revision);
             if let Some(publication) = publication.as_mut() {
                 publication.commit(&mut state)?;
             }
@@ -1183,8 +1191,8 @@ impl Kernel {
         record.revision = next;
         if tid == LinuxTid::for_task_leader(context.task.key().id) {
             record.dead_leader = Some(super::core::RetiredThreadRecord {
-                key: thread.key(),
-                task: thread.task_key(),
+                _key: thread.key(),
+                _task: thread.task_key(),
                 thread: Arc::downgrade(&thread),
                 _claim: claim,
             });
@@ -1192,8 +1200,8 @@ impl Kernel {
             state
                 .retired_threads
                 .push(super::core::RetiredThreadRecord {
-                    key: thread.key(),
-                    task: thread.task_key(),
+                    _key: thread.key(),
+                    _task: thread.task_key(),
                     thread: Arc::downgrade(&thread),
                     _claim: claim,
                 });
@@ -1223,9 +1231,10 @@ impl Kernel {
             .ok_or(KernelOperationError::UnknownThread(tid))?;
         let revision = next_revision(record.revision)?;
 
-        record.task.replace_shared(shared);
-        thread.replace_resources(resources);
+        record.task.replace_shared(Arc::clone(&shared));
+        thread.replace_resources(Arc::clone(&resources));
         record.revision = revision;
+        self.observe_exec_publication(record.task.key(), &thread, &shared, &resources, revision);
         Ok(revision)
     }
 
@@ -1757,8 +1766,8 @@ impl Kernel {
                 state
                     .retired_threads
                     .push(super::core::RetiredThreadRecord {
-                        key: thread.key(),
-                        task: thread.task_key(),
+                        _key: thread.key(),
+                        _task: thread.task_key(),
                         thread: Arc::downgrade(&thread),
                         _claim: claim,
                     });

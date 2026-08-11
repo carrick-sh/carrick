@@ -198,8 +198,129 @@ pub struct Kernel {
     ids: IdRegistry,
     object_ids: ObjectIdRegistry,
     frame_inventory: FrameInventoryAuthority,
+    pub(super) observations: Mutex<ObservationInventory>,
     pub(super) exit_subscribers: TaskExitSubscribers,
     reservation_gate: ReservationGate,
+}
+
+/// Kernel-owned, non-authoritative index of successfully published K1 object
+/// generations. Every edge is weak: lifecycle and reclamation remain entirely
+/// controlled by the registry/task/thread authority graph.
+#[derive(Debug, Default)]
+pub(super) struct ObservationInventory {
+    pub(super) tasks: BTreeMap<TaskKey, Vec<Weak<Task>>>,
+    pub(super) threads: BTreeMap<ThreadKey, Vec<(TaskKey, Weak<Thread>)>>,
+    pub(super) mms: BTreeMap<super::ids::MmId, Vec<Weak<Mm>>>,
+    pub(super) sighands: BTreeMap<super::ids::SighandId, Vec<Weak<Sighand>>>,
+    pub(super) task_shared:
+        BTreeMap<super::snapshot::TaskSharedObservationKey, Vec<Weak<TaskShared>>>,
+    pub(super) thread_resources:
+        BTreeMap<super::snapshot::ThreadResourcesObservationKey, Vec<Weak<ThreadResources>>>,
+}
+
+fn push_weak_unique<T>(objects: &mut Vec<Weak<T>>, object: &Arc<T>) {
+    let weak = Arc::downgrade(object);
+    if !objects.iter().any(|observed| Weak::ptr_eq(observed, &weak)) {
+        objects.push(weak);
+    }
+}
+
+fn retain_live_weak<T>(objects: &mut Vec<Weak<T>>) -> bool {
+    objects.retain(|object| object.strong_count() != 0);
+    !objects.is_empty()
+}
+
+fn observation_count(inventory: &ObservationInventory) -> usize {
+    inventory.tasks.values().map(Vec::len).sum::<usize>()
+        + inventory.threads.values().map(Vec::len).sum::<usize>()
+        + inventory.mms.values().map(Vec::len).sum::<usize>()
+        + inventory.sighands.values().map(Vec::len).sum::<usize>()
+        + inventory.task_shared.values().map(Vec::len).sum::<usize>()
+        + inventory
+            .thread_resources
+            .values()
+            .map(Vec::len)
+            .sum::<usize>()
+}
+
+impl ObservationInventory {
+    fn register_task(
+        &mut self,
+        task: &TaskRef,
+        thread: &ThreadRef,
+        shared: &Arc<TaskShared>,
+        resources: &Arc<ThreadResources>,
+        publication: TaskRevision,
+    ) {
+        push_weak_unique(self.tasks.entry(task.key()).or_default(), task);
+        self.register_task_shared(task.key(), shared, publication);
+        self.register_thread(thread, resources, publication);
+    }
+
+    fn register_task_shared(
+        &mut self,
+        task: TaskKey,
+        shared: &Arc<TaskShared>,
+        publication: TaskRevision,
+    ) {
+        let mm = shared.mm();
+        let sighand = shared.sighand();
+        push_weak_unique(self.mms.entry(mm.id()).or_default(), &mm);
+        push_weak_unique(self.sighands.entry(sighand.id()).or_default(), &sighand);
+        push_weak_unique(
+            self.task_shared
+                .entry(super::snapshot::TaskSharedObservationKey {
+                    task,
+                    publication,
+                    mm: mm.id(),
+                    sighand: sighand.id(),
+                })
+                .or_default(),
+            shared,
+        );
+    }
+
+    fn register_thread(
+        &mut self,
+        thread: &ThreadRef,
+        resources: &Arc<ThreadResources>,
+        publication: TaskRevision,
+    ) {
+        let threads = self.threads.entry(thread.key()).or_default();
+        if !threads
+            .iter()
+            .any(|(_, observed)| Weak::ptr_eq(observed, &Arc::downgrade(thread)))
+        {
+            threads.push((thread.task_key(), Arc::downgrade(thread)));
+        }
+        push_weak_unique(
+            self.thread_resources
+                .entry(super::snapshot::ThreadResourcesObservationKey {
+                    thread: thread.key(),
+                    publication,
+                    file_table: resources.files().id(),
+                    fs_context: resources.fs_context().id(),
+                })
+                .or_default(),
+            resources,
+        );
+    }
+
+    fn sweep(&mut self) -> usize {
+        let before = observation_count(self);
+        self.tasks.retain(|_, objects| retain_live_weak(objects));
+        self.threads.retain(|_, objects| {
+            objects.retain(|(_, object)| object.strong_count() != 0);
+            !objects.is_empty()
+        });
+        self.mms.retain(|_, objects| retain_live_weak(objects));
+        self.sighands.retain(|_, objects| retain_live_weak(objects));
+        self.task_shared
+            .retain(|_, objects| retain_live_weak(objects));
+        self.thread_resources
+            .retain(|_, objects| retain_live_weak(objects));
+        before - observation_count(self)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -449,12 +570,21 @@ impl Kernel {
                 )]),
             }),
         };
+        let mut observations = ObservationInventory::default();
+        observations.register_task(
+            &task,
+            &leader,
+            &shared,
+            &leader.resources(),
+            TaskRevision::INITIAL,
+        );
         let kernel = Arc::new(Self {
             domain: Arc::new(KernelDomain),
             registry,
             ids,
             object_ids,
             frame_inventory: FrameInventoryAuthority::new(),
+            observations: Mutex::new(observations),
             exit_subscribers: TaskExitSubscribers::default(),
             reservation_gate: ReservationGate::default(),
         });
@@ -476,6 +606,86 @@ impl Kernel {
 
     pub const fn object_ids(&self) -> &ObjectIdRegistry {
         &self.object_ids
+    }
+
+    /// Register one successfully published task generation and its initial
+    /// associations. Callers hold the registry write lock first.
+    pub(super) fn observe_task_publication(
+        &self,
+        task: &TaskRef,
+        thread: &ThreadRef,
+        shared: &Arc<TaskShared>,
+        resources: &Arc<ThreadResources>,
+        publication: TaskRevision,
+    ) {
+        self.observations
+            .lock()
+            .register_task(task, thread, shared, resources, publication);
+    }
+
+    /// Register a successfully published thread generation. Callers hold the
+    /// registry write lock first.
+    pub(super) fn observe_thread_publication(
+        &self,
+        thread: &ThreadRef,
+        resources: &Arc<ThreadResources>,
+        publication: TaskRevision,
+    ) {
+        self.observations
+            .lock()
+            .register_thread(thread, resources, publication);
+    }
+
+    /// Register the replacement associations made visible by exec. Callers
+    /// hold the registry write lock first.
+    pub(super) fn observe_exec_publication(
+        &self,
+        task: TaskKey,
+        thread: &ThreadRef,
+        shared: &Arc<TaskShared>,
+        resources: &Arc<ThreadResources>,
+        publication: TaskRevision,
+    ) {
+        let mut observations = self.observations.lock();
+        observations.register_task_shared(task, shared, publication);
+        observations.register_thread(thread, resources, publication);
+    }
+
+    /// Remove expired weak observations. This never changes lifecycle state or
+    /// releases numeric claims. Registry-before-inventory is the fixed order,
+    /// and the registry epoch makes the removal snapshot-visible.
+    pub fn sweep_observations(&self) -> usize {
+        let mut state = self.registry.state.write_unpublished();
+        let removed = self.observations.lock().sweep();
+        if removed != 0 {
+            state.publish_epoch();
+        }
+        removed
+    }
+
+    pub(super) fn sweep_observations_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<usize, super::snapshot::KernelSnapshotError> {
+        let Some(mut state) = self.registry.state.try_write_unpublished_until(deadline) else {
+            return Err(if std::time::Instant::now() >= deadline {
+                super::snapshot::KernelSnapshotError::TimedOut
+            } else {
+                super::snapshot::KernelSnapshotError::Busy
+            });
+        };
+        let Some(mut observations) = self.observations.try_lock_until(deadline) else {
+            return Err(if std::time::Instant::now() >= deadline {
+                super::snapshot::KernelSnapshotError::TimedOut
+            } else {
+                super::snapshot::KernelSnapshotError::Busy
+            });
+        };
+        let removed = observations.sweep();
+        if removed != 0 {
+            state.publish_epoch();
+        }
+        Ok(removed)
     }
 
     /// Sole runtime authority for applied frame/mapping inventory. `BankedMm`
@@ -689,6 +899,17 @@ impl RegistryLock {
         state.publish_epoch();
         state
     }
+
+    fn write_unpublished(&self) -> RwLockWriteGuard<'_, RegistryState> {
+        self.inner.write()
+    }
+
+    fn try_write_unpublished_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Option<RwLockWriteGuard<'_, RegistryState>> {
+        self.inner.try_write_until(deadline)
+    }
 }
 
 impl Registry {
@@ -812,8 +1033,8 @@ pub(super) struct ZombieRecord {
 
 #[derive(Debug)]
 pub(super) struct RetiredThreadRecord {
-    pub(super) key: ThreadKey,
-    pub(super) task: TaskKey,
+    pub(super) _key: ThreadKey,
+    pub(super) _task: TaskKey,
     pub(super) thread: Weak<Thread>,
     pub(super) _claim: ThreadClaim,
 }
