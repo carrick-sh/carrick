@@ -2713,9 +2713,6 @@ struct InventoryExtent {
     frame: carrick_hal::FrameId,
     mapping: carrick_hal::MappingId,
     backing: InventoryBackingIdentity,
-    gpa: u64,
-    length: u64,
-    permissions: carrick_hal::MemPerms,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3215,9 +3212,10 @@ pub struct ThreadSpec;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfVmState {
     fn inventory_generation(raw: u64) -> carrick_hal::MappingGeneration {
-        carrick_hal::MappingGeneration::from_backend_counter(
-            std::num::NonZeroU64::new(raw).expect("inventory generation is nonzero"),
-        )
+        let Some(raw) = std::num::NonZeroU64::new(raw) else {
+            std::process::abort();
+        };
+        carrick_hal::MappingGeneration::from_backend_counter(raw)
     }
 
     fn private_backing_identity() -> InventoryBackingIdentity {
@@ -3297,9 +3295,6 @@ impl HvfVmState {
                 frame,
                 mapping,
                 backing,
-                gpa,
-                length,
-                permissions,
             },
         );
         let mut frames = inventory.frames.lock();
@@ -3347,7 +3342,7 @@ impl HvfVmState {
                 .push(carrick_hal::FrameInventoryEvent::RetireFrame {
                     transaction,
                     frame,
-                    generation: Self::inventory_generation(3),
+                    generation: Self::inventory_generation(2),
                 })
                 .map_err(Self::reservation_error)?;
         }
