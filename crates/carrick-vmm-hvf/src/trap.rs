@@ -2696,6 +2696,65 @@ pub fn dump_kick_stats() {
 /// longer matches HVF and panics ("no VM or vCPU available"). The process is
 /// exiting either way; the kernel reclaims the VM.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum InventoryBackingIdentity {
+    Private(u64),
+    SharedFile {
+        device: u64,
+        inode: u64,
+        offset: u64,
+        length: u64,
+    },
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug)]
+struct InventoryExtent {
+    frame: carrick_hal::FrameId,
+    mapping: carrick_hal::MappingId,
+    backing: InventoryBackingIdentity,
+    gpa: u64,
+    length: u64,
+    permissions: carrick_hal::MemPerms,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Default)]
+struct InventoryFrameRegistry {
+    shared: std::collections::BTreeMap<InventoryBackingIdentity, carrick_hal::FrameId>,
+    references: std::collections::BTreeMap<carrick_hal::FrameId, usize>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Default)]
+struct HvpatchFrameInventory {
+    extents: std::collections::BTreeMap<(u64, u64), InventoryExtent>,
+    frames: std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
+    alias_reservation: Option<carrick_hal::FrameInventoryReservation>,
+    alias_commit: Option<carrick_hal::FrameInventoryCommit<()>>,
+    process_reservation: Option<carrick_hal::FrameInventoryReservation>,
+    process_commit: Option<carrick_hal::FrameInventoryCommit<()>>,
+    retired_reservation: Option<carrick_hal::FrameInventoryReservation>,
+    replacement_reservation: Option<carrick_hal::FrameInventoryReservation>,
+    exec_commits: Option<(
+        carrick_hal::FrameInventoryCommit<()>,
+        carrick_hal::FrameInventoryCommit<()>,
+    )>,
+    retirement_reservation: Option<carrick_hal::FrameInventoryReservation>,
+    retirement_commit: Option<carrick_hal::FrameInventoryCommit<()>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvpatchFrameInventory {
+    fn with_frames(frames: std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>) -> Self {
+        Self {
+            frames,
+            ..Self::default()
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct HvfVmState {
     _vm:
         std::mem::ManuallyDrop<applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>>,
@@ -2793,6 +2852,10 @@ pub(crate) struct HvfVmState {
     /// HvPatch owns one process-wide HVF VM across guest exec/fork lifecycle;
     /// ordinary VMM preserves the mature destroy/recreate behavior.
     persistent_vm_lifecycle: bool,
+    /// HVPatch-only exact sparse-extent inventory. Sibling vCPUs share this
+    /// ledger; VM/vCPU recreation reuses it and therefore emits no logical
+    /// mapping events.
+    frame_inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
 }
 
 /// Thread/process exit must LEAK the per-thread host backings, never `munmap`
@@ -3096,6 +3159,7 @@ pub struct ThreadSpec {
     persistent_vm_lifecycle: bool,
     process_bank: Option<(u64, u64)>,
     process_alias_next: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    frame_inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3110,6 +3174,7 @@ struct ProcessMappingDesc {
     guest_writable: bool,
     shared_key_base: u64,
     shared_key_offset: u64,
+    inherited_frame: Option<carrick_hal::FrameId>,
 }
 
 /// A fork child address space waiting for vCPU materialization on its owning
@@ -3126,6 +3191,7 @@ pub struct ProcessSpec {
     persistent_vm_lifecycle: bool,
     process_bank: (u64, u64),
     process_alias_next: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    frame_inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3148,6 +3214,272 @@ pub struct ThreadSpec;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfVmState {
+    fn inventory_generation(raw: u64) -> carrick_hal::MappingGeneration {
+        carrick_hal::MappingGeneration::from_backend_counter(
+            std::num::NonZeroU64::new(raw).expect("inventory generation is nonzero"),
+        )
+    }
+
+    fn private_backing_identity() -> InventoryBackingIdentity {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if serial == 0 {
+            eprintln!("carrick: FATAL: HVPatch private backing identity exhausted");
+            std::process::abort();
+        }
+        InventoryBackingIdentity::Private(serial)
+    }
+
+    fn region_permissions(region: &HvfMappedRegion) -> carrick_hal::MemPerms {
+        let raw = u64::from(region.perms);
+        carrick_hal::MemPerms {
+            read: raw & 1 != 0,
+            write: raw & 2 != 0,
+            exec: raw & 4 != 0,
+        }
+    }
+
+    fn reservation_error(error: carrick_hal::FrameInventoryReservationError) -> TrapError {
+        TrapError::Hypervisor(format!("HVPatch frame inventory staging failed: {error}"))
+    }
+
+    fn stage_mapping(
+        inventory: &mut HvpatchFrameInventory,
+        reservation: &mut carrick_hal::FrameInventoryReservation,
+        gpa: u64,
+        length: u64,
+        permissions: carrick_hal::MemPerms,
+        backing: InventoryBackingIdentity,
+        inherited_frame: Option<carrick_hal::FrameId>,
+    ) -> Result<(), TrapError> {
+        let transaction = reservation.transaction();
+        let mapping = reservation
+            .claim_mapping()
+            .map_err(Self::reservation_error)?;
+        let frame = if let Some(frame) = inherited_frame {
+            frame
+        } else if matches!(backing, InventoryBackingIdentity::SharedFile { .. }) {
+            let existing = inventory.frames.lock().shared.get(&backing).copied();
+            match existing {
+                Some(frame) => frame,
+                None => reservation.claim_frame().map_err(Self::reservation_error)?,
+            }
+        } else {
+            reservation.claim_frame().map_err(Self::reservation_error)?
+        };
+        let Some(length_value) = std::num::NonZeroU64::new(length) else {
+            return Err(TrapError::Hypervisor(
+                "HVPatch inventory received an empty mapping extent".to_owned(),
+            ));
+        };
+        let length_typed = carrick_hal::FrameLength::from_mapping_extent(length_value);
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation: Self::inventory_generation(1),
+                gpa: carrick_guest_mem::Gpa(gpa),
+                length: length_typed,
+                permissions,
+            })
+            .map_err(Self::reservation_error)?;
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation: Self::inventory_generation(1),
+            })
+            .map_err(Self::reservation_error)?;
+        inventory.extents.insert(
+            (gpa, length),
+            InventoryExtent {
+                frame,
+                mapping,
+                backing,
+                gpa,
+                length,
+                permissions,
+            },
+        );
+        let mut frames = inventory.frames.lock();
+        *frames.references.entry(frame).or_default() += 1;
+        if matches!(backing, InventoryBackingIdentity::SharedFile { .. }) {
+            frames.shared.entry(backing).or_insert(frame);
+        }
+        Ok(())
+    }
+
+    fn stage_retirement(
+        inventory: &mut HvpatchFrameInventory,
+        reservation: &mut carrick_hal::FrameInventoryReservation,
+    ) -> Result<(), TrapError> {
+        let transaction = reservation.transaction();
+        let extents = std::mem::take(&mut inventory.extents);
+        let mut frames = inventory.frames.lock();
+        let mut retired = std::collections::BTreeSet::new();
+        for extent in extents.into_values() {
+            reservation
+                .push(carrick_hal::FrameInventoryEvent::UnmapMapping {
+                    transaction,
+                    mapping: extent.mapping,
+                    generation: Self::inventory_generation(2),
+                })
+                .map_err(Self::reservation_error)?;
+            let references = frames.references.get_mut(&extent.frame).ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "HVPatch frame {:?} has no backend reference",
+                    extent.frame
+                ))
+            })?;
+            *references -= 1;
+            if *references == 0 {
+                frames.references.remove(&extent.frame);
+                if matches!(extent.backing, InventoryBackingIdentity::SharedFile { .. }) {
+                    frames.shared.remove(&extent.backing);
+                }
+                retired.insert(extent.frame);
+            }
+        }
+        drop(frames);
+        for frame in retired {
+            reservation
+                .push(carrick_hal::FrameInventoryEvent::RetireFrame {
+                    transaction,
+                    frame,
+                    generation: Self::inventory_generation(3),
+                })
+                .map_err(Self::reservation_error)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn frame_inventory_extent_count(&self) -> usize {
+        self.frame_inventory
+            .lock()
+            .extents
+            .len()
+            .max(self.mappings.len())
+    }
+
+    pub(crate) fn inventory_initial_mappings(
+        &mut self,
+        mut reservation: carrick_hal::FrameInventoryReservation,
+    ) -> Result<carrick_hal::FrameInventoryCommit<()>, TrapError> {
+        let mut inventory = self.frame_inventory.lock();
+        if !inventory.extents.is_empty() {
+            return Ok(reservation.commit(()));
+        }
+        for region in &self.mappings {
+            Self::stage_mapping(
+                &mut inventory,
+                &mut reservation,
+                region.ipa,
+                region.size as u64,
+                Self::region_permissions(region),
+                Self::private_backing_identity(),
+                None,
+            )?;
+        }
+        Ok(reservation.commit(()))
+    }
+
+    pub(crate) fn begin_alias_inventory(
+        &mut self,
+        reservation: carrick_hal::FrameInventoryReservation,
+    ) -> Result<(), TrapError> {
+        let mut inventory = self.frame_inventory.lock();
+        if inventory.alias_reservation.is_some() || inventory.alias_commit.is_some() {
+            return Err(TrapError::Hypervisor(
+                "overlapping HVPatch alias inventory transaction".to_owned(),
+            ));
+        }
+        inventory.alias_reservation = Some(reservation);
+        Ok(())
+    }
+
+    pub(crate) fn take_alias_inventory(&mut self) -> Option<carrick_hal::FrameInventoryCommit<()>> {
+        self.frame_inventory.lock().alias_commit.take()
+    }
+
+    pub(crate) fn begin_exec_inventory(
+        &mut self,
+        retired: carrick_hal::FrameInventoryReservation,
+        replacement: carrick_hal::FrameInventoryReservation,
+    ) -> Result<(), TrapError> {
+        let mut inventory = self.frame_inventory.lock();
+        if inventory.retired_reservation.is_some()
+            || inventory.replacement_reservation.is_some()
+            || inventory.exec_commits.is_some()
+        {
+            return Err(TrapError::Hypervisor(
+                "overlapping HVPatch exec inventory transaction".to_owned(),
+            ));
+        }
+        inventory.retired_reservation = Some(retired);
+        inventory.replacement_reservation = Some(replacement);
+        Ok(())
+    }
+
+    pub(crate) fn frame_inventory_exec_extent_counts(
+        &self,
+        new_image: &crate::memory::AddressSpace,
+    ) -> (usize, usize) {
+        let replacement = GuestMappingPlan::from_address_space(new_image)
+            .map(|plan| plan.mappings.len())
+            .unwrap_or(0);
+        (self.frame_inventory.lock().extents.len(), replacement)
+    }
+
+    pub(crate) fn take_exec_inventory(
+        &mut self,
+    ) -> Option<(
+        carrick_hal::FrameInventoryCommit<()>,
+        carrick_hal::FrameInventoryCommit<()>,
+    )> {
+        self.frame_inventory.lock().exec_commits.take()
+    }
+
+    pub(crate) fn begin_process_inventory(
+        &mut self,
+        reservation: carrick_hal::FrameInventoryReservation,
+    ) -> Result<(), TrapError> {
+        let mut inventory = self.frame_inventory.lock();
+        if inventory.process_reservation.is_some() {
+            return Err(TrapError::Hypervisor(
+                "overlapping HVPatch child inventory transaction".to_owned(),
+            ));
+        }
+        inventory.process_reservation = Some(reservation);
+        Ok(())
+    }
+
+    pub(crate) fn take_process_inventory(
+        &mut self,
+    ) -> Option<carrick_hal::FrameInventoryCommit<()>> {
+        self.frame_inventory.lock().process_commit.take()
+    }
+
+    pub(crate) fn begin_retirement_inventory(
+        &mut self,
+        reservation: carrick_hal::FrameInventoryReservation,
+    ) -> Result<(), TrapError> {
+        let mut inventory = self.frame_inventory.lock();
+        if inventory.retirement_reservation.is_some() {
+            return Err(TrapError::Hypervisor(
+                "overlapping HVPatch retirement inventory transaction".to_owned(),
+            ));
+        }
+        inventory.retirement_reservation = Some(reservation);
+        Ok(())
+    }
+
+    pub(crate) fn take_retirement_inventory(
+        &mut self,
+    ) -> Option<carrick_hal::FrameInventoryCommit<()>> {
+        self.frame_inventory.lock().retirement_commit.take()
+    }
+
     pub(crate) fn set_persistent_vm_lifecycle(&mut self, enabled: bool) {
         self.persistent_vm_lifecycle = enabled;
     }
@@ -3158,6 +3490,17 @@ impl HvfVmState {
 
     pub(crate) fn retire_process_mappings(&mut self) -> Result<(), TrapError> {
         let Some((bank_base, bank_size)) = self.process_bank else {
+            let mut inventory = self.frame_inventory.lock();
+            if !inventory.extents.is_empty() {
+                let mut reservation = inventory.retirement_reservation.take().ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "HVPatch root retirement began without frame inventory reservation"
+                            .to_owned(),
+                    )
+                })?;
+                Self::stage_retirement(&mut inventory, &mut reservation)?;
+                inventory.retirement_commit = Some(reservation.commit(()));
+            }
             return Ok(());
         };
         let bank_end = bank_base.saturating_add(bank_size);
@@ -3182,7 +3525,7 @@ impl HvfVmState {
                 .map(|alias| (alias.ipa, alias.size)),
         );
         for &(ipa, size) in &extents {
-            let rc = unsafe { applevisor_sys::hv_vm_unmap(ipa, size) };
+            let rc = unsafe { inventory_hv_vm_unmap(ipa, size) };
             if rc != 0 {
                 return Err(TrapError::Hypervisor(format!(
                     "retire hvpatch process hv_vm_unmap(ipa=0x{ipa:x}, size={size}) failed: 0x{rc:x}"
@@ -3196,6 +3539,19 @@ impl HvfVmState {
             .retain(|mapping| mapping.ipa < bank_base || mapping.ipa >= bank_end);
         self.process_bank = None;
         self.process_alias_next = None;
+        let mut inventory = self.frame_inventory.lock();
+        if !inventory.extents.is_empty() {
+            let mut reservation = inventory.retirement_reservation.take().ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "HVPatch retirement began without frame inventory reservation".to_owned(),
+                )
+            })?;
+            if let Err(error) = Self::stage_retirement(&mut inventory, &mut reservation) {
+                eprintln!("carrick: FATAL: stage inventory after HVPatch retirement: {error}");
+                std::process::abort();
+            }
+            inventory.retirement_commit = Some(reservation.commit(()));
+        }
         Ok(())
     }
 
@@ -3246,6 +3602,9 @@ impl HvfVmState {
             fork_mapping_descs: Vec::new(),
             fork_child_descs: Vec::new(),
             persistent_vm_lifecycle: false,
+            frame_inventory: std::sync::Arc::new(parking_lot::Mutex::new(
+                HvpatchFrameInventory::default(),
+            )),
         };
         state.seed_readonly_spans_from_plan(plan);
 
@@ -3755,7 +4114,7 @@ impl HvfVmState {
     ) -> Result<(), TrapError> {
         let perms_raw: u64 = u64::from(hvf_mem_perms(perms));
         let r = unsafe {
-            applevisor_sys::hv_vm_map(host as *mut std::ffi::c_void, ipa, len as usize, perms_raw)
+            inventory_hv_vm_map(host as *mut std::ffi::c_void, ipa, len as usize, perms_raw)
         };
         if r != 0 {
             return Err(TrapError::Hypervisor(format!(
@@ -3783,14 +4142,19 @@ impl HvfVmState {
             return false;
         };
         // SAFETY: `host_addr` is a live MAP_SHARED mmap registered by
-        // `add_alias`; re-mapping the same host range to the same IPA in this VM
-        // is idempotent (a nonzero rc — already mapped by a racing sibling — is
-        // fine).
-        let _ = unsafe {
-            applevisor_sys::hv_vm_map(b.host_addr as *mut std::ffi::c_void, b.ipa, b.size, b.perms)
+        // `add_alias`. Replay succeeds only when HVF confirms the installation;
+        // an arbitrary nonzero result is never evidence that a racing mapper won.
+        let rc = unsafe {
+            inventory_hv_vm_map(b.host_addr as *mut std::ffi::c_void, b.ipa, b.size, b.perms)
         };
-        crate::probes::hv_vm_map_alias(va, b.ipa, b.size as u64, 0, self.forked_no_exec as i32);
-        true
+        crate::probes::hv_vm_map_alias(
+            va,
+            b.ipa,
+            b.size as u64,
+            rc as i32,
+            self.forked_no_exec as i32,
+        );
+        rc == 0
     }
 
     /// Back a dynamic high-VA `mmap` (`DispatchOutcome::MapHostAlias`): allocate
@@ -3815,6 +4179,21 @@ impl HvfVmState {
             // SAFETY: dispatcher-to-backend alias setup transfers this dup.
             (unsafe { OwnedFd::from_raw_fd(fd) }, offset, prot)
         });
+        let inventory_backing = file
+            .as_ref()
+            .and_then(|(fd, offset, _)| {
+                let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } != 0 {
+                    return None;
+                }
+                Some(InventoryBackingIdentity::SharedFile {
+                    device: stat.st_dev as u64,
+                    inode: stat.st_ino as u64,
+                    offset: u64::try_from(*offset).ok()?,
+                    length: len,
+                })
+            })
+            .unwrap_or_else(Self::private_backing_identity);
         // Mature VMM/root uses the IPA the dispatcher allocated from the global
         // alias arena. An in-process hvpatch child relocates PRIVATE aliases into
         // its own process bank; the returned GPA is authoritative for stage-1,
@@ -3889,7 +4268,7 @@ impl HvfVmState {
             self.process_bank,
             self.process_alias_next.as_deref(),
         )?;
-        let r = unsafe { applevisor_sys::hv_vm_map(host.cast(), ipa, size, u64::from(perms)) };
+        let r = unsafe { inventory_hv_vm_map(host.cast(), ipa, size, u64::from(perms)) };
         crate::probes::hv_vm_map_alias(va, ipa, size as u64, r as i32, self.forked_no_exec as i32);
         if r != 0 {
             return Err(TrapError::Hypervisor(format!(
@@ -3930,6 +4309,32 @@ impl HvfVmState {
             shared_key_base,
             shared_key_offset,
         });
+        if self.persistent_vm_lifecycle {
+            let mut inventory = self.frame_inventory.lock();
+            let mut reservation = inventory.alias_reservation.take().unwrap_or_else(|| {
+                eprintln!(
+                    "carrick: FATAL: HVPatch alias mapped without frame inventory reservation"
+                );
+                std::process::abort();
+            });
+            if let Err(error) = Self::stage_mapping(
+                &mut inventory,
+                &mut reservation,
+                ipa,
+                size as u64,
+                carrick_hal::MemPerms {
+                    read: true,
+                    write: true,
+                    exec: true,
+                },
+                inventory_backing,
+                None,
+            ) {
+                eprintln!("carrick: FATAL: stage inventory after HVPatch alias map: {error}");
+                std::process::abort();
+            }
+            inventory.alias_commit = Some(reservation.commit(()));
+        }
         Ok((ipa, alias_guest_writable))
     }
 
@@ -4823,7 +5228,7 @@ impl HvfVmState {
                 continue;
             }
             let r = unsafe {
-                applevisor_sys::hv_vm_map(
+                inventory_hv_vm_map(
                     mapping.host_addr.cast(),
                     mapping.ipa,
                     mapping.size,
@@ -4864,7 +5269,7 @@ impl HvfVmState {
                     continue;
                 }
                 let r = unsafe {
-                    applevisor_sys::hv_vm_map(
+                    inventory_hv_vm_map(
                         b.host_addr as *mut std::ffi::c_void,
                         b.ipa,
                         b.size,
@@ -5285,7 +5690,7 @@ impl HvfVmState {
             let host_addr = desc.host.ptr();
             let perms_raw: u64 = u64::from(desc.perms);
             let r = unsafe {
-                applevisor_sys::hv_vm_map(
+                inventory_hv_vm_map(
                     host_addr as *mut std::ffi::c_void,
                     desc.ipa,
                     desc.size,
@@ -5393,7 +5798,7 @@ impl HvfVmState {
                     continue;
                 }
                 let r = unsafe {
-                    applevisor_sys::hv_vm_map(
+                    inventory_hv_vm_map(
                         sm.host_addr as *mut std::ffi::c_void,
                         sm.ipa,
                         sm.size,
@@ -5495,6 +5900,7 @@ impl HvfVmState {
             persistent_vm_lifecycle: self.persistent_vm_lifecycle,
             process_bank: self.process_bank,
             process_alias_next: self.process_alias_next.clone(),
+            frame_inventory: std::sync::Arc::clone(&self.frame_inventory),
         })
     }
 
@@ -5516,6 +5922,7 @@ impl HvfVmState {
             persistent_vm_lifecycle,
             process_bank,
             process_alias_next,
+            frame_inventory,
         } = spec;
 
         // The spec captured `vm` at clone time. If a fork rebuilt the VM since
@@ -5551,6 +5958,7 @@ impl HvfVmState {
             fork_mapping_descs: Vec::new(),
             fork_child_descs: Vec::new(),
             persistent_vm_lifecycle,
+            frame_inventory,
         };
 
         for mapping in mappings {
@@ -5644,6 +6052,7 @@ impl HvfVmState {
 
         let stage_started = std::time::Instant::now();
         let mut mappings = Vec::with_capacity(source_mappings.len());
+        let parent_inventory = self.frame_inventory.lock().extents.clone();
 
         // Put the stage-1 backing at the bank root promised by TTBR, regardless
         // of the boot-plan mapping order. Everything else follows compactly.
@@ -5665,6 +6074,9 @@ impl HvfVmState {
                     guest_writable: mapping.guest_writable,
                     shared_key_base: mapping.shared_key_base,
                     shared_key_offset: mapping.shared_key_offset,
+                    inherited_frame: parent_inventory
+                        .get(&(mapping.ipa, mapping.size as u64))
+                        .map(|extent| extent.frame),
                 });
                 continue;
             }
@@ -5760,6 +6172,7 @@ impl HvfVmState {
                 guest_writable: mapping.guest_writable,
                 shared_key_base: mapping.shared_key_base,
                 shared_key_offset: mapping.shared_key_offset,
+                inherited_frame: None,
             });
         }
         emit_stage(
@@ -5842,6 +6255,18 @@ impl HvfVmState {
         );
 
         let stage_started = std::time::Instant::now();
+        let frame_inventory = {
+            let mut parent_inventory = self.frame_inventory.lock();
+            let reservation = parent_inventory.process_reservation.take().ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "HVPatch child map began without a frame inventory reservation".to_owned(),
+                )
+            })?;
+            let mut child =
+                HvpatchFrameInventory::with_frames(std::sync::Arc::clone(&parent_inventory.frames));
+            child.process_reservation = Some(reservation);
+            std::sync::Arc::new(parking_lot::Mutex::new(child))
+        };
         let spec = ProcessSpec {
             vm: (*self._vm).clone(),
             mappings,
@@ -5855,6 +6280,7 @@ impl HvfVmState {
                 cursor,
                 2 * 1024 * 1024,
             )?)),
+            frame_inventory,
         };
         emit_stage(
             HvpatchForkProcessSpecStagePhase::BackendSpecFinalize,
@@ -5870,10 +6296,12 @@ impl HvfVmState {
         let vcpu = create_vcpu(&spec.vm)?;
         enable_el0_counter_access(vcpu.id());
         let mut mapped = Vec::with_capacity(spec.mappings.len());
+        let mut inventory_mappings = Vec::with_capacity(spec.mappings.len());
+        let mut physical_mutated = false;
         for mapping in spec.mappings {
             if !mapping.guest_shared {
                 let rc = unsafe {
-                    applevisor_sys::hv_vm_map(
+                    inventory_hv_vm_map(
                         mapping.host.ptr().cast(),
                         mapping.ipa,
                         mapping.size,
@@ -5881,14 +6309,33 @@ impl HvfVmState {
                     )
                 };
                 if rc != 0 {
-                    return Err(TrapError::ChildMapFailed {
+                    let error = TrapError::ChildMapFailed {
                         host_addr: mapping.host.ptr() as u64,
                         guest_start: mapping.ipa,
                         size: mapping.size,
                         code: rc as u32,
-                    });
+                    };
+                    if physical_mutated {
+                        eprintln!("carrick: FATAL: partial HVPatch child stage-2 map: {error}");
+                        std::process::abort();
+                    }
+                    return Err(error);
                 }
+                physical_mutated = true;
             }
+            inventory_mappings.push((
+                mapping.ipa,
+                mapping.size as u64,
+                {
+                    let raw = u64::from(mapping.perms);
+                    carrick_hal::MemPerms {
+                        read: raw & 1 != 0,
+                        write: raw & 2 != 0,
+                        exec: raw & 4 != 0,
+                    }
+                },
+                mapping.inherited_frame,
+            ));
             let host_addr = mapping.host.ptr();
             mapped.push(HvfMappedRegion {
                 start: mapping.start,
@@ -5904,6 +6351,35 @@ impl HvfVmState {
                 shared_key_base: mapping.shared_key_base,
                 shared_key_offset: mapping.shared_key_offset,
             });
+        }
+        {
+            let mut inventory = spec.frame_inventory.lock();
+            let mut reservation = inventory.process_reservation.take().ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "HVPatch child materialized without frame inventory reservation".to_owned(),
+                )
+            })?;
+            for (gpa, length, permissions, inherited_frame) in inventory_mappings {
+                let backing = if inherited_frame.is_some() {
+                    // Shared mappings retain exact backing identity and FrameId.
+                    InventoryBackingIdentity::Private(0)
+                } else {
+                    Self::private_backing_identity()
+                };
+                if let Err(error) = Self::stage_mapping(
+                    &mut inventory,
+                    &mut reservation,
+                    gpa,
+                    length,
+                    permissions,
+                    backing,
+                    inherited_frame,
+                ) {
+                    eprintln!("carrick: FATAL: stage inventory after HVPatch child map: {error}");
+                    std::process::abort();
+                }
+            }
+            inventory.process_commit = Some(reservation.commit(()));
         }
         let state = HvfVmState {
             _vm: std::mem::ManuallyDrop::new(spec.vm),
@@ -5927,6 +6403,7 @@ impl HvfVmState {
             fork_mapping_descs: Vec::new(),
             fork_child_descs: Vec::new(),
             persistent_vm_lifecycle: spec.persistent_vm_lifecycle,
+            frame_inventory: spec.frame_inventory,
         };
         let mailbox = state.allocate_mailbox_for_vcpu(&vcpu)?;
         Ok((state, vcpu, mailbox))
@@ -5970,7 +6447,7 @@ impl HvfVmState {
                     0,
                 ),
             );
-            let rc = unsafe { applevisor_sys::hv_vm_unmap(ipa, size) };
+            let rc = unsafe { inventory_hv_vm_unmap(ipa, size) };
             crate::probes::hvpatch_exec_stage2(
                 carrick_observability::probes::HvpatchExecStage2::new(
                     carrick_observability::probes::HvpatchExecStage2Phase::UnmapEnd,
@@ -6178,6 +6655,24 @@ impl HvfVmState {
         plan: &GuestMappingPlan,
     ) -> Result<(), TrapError> {
         use applevisor::prelude::*;
+        let mut inventory_reservations = if self.persistent_vm_lifecycle {
+            let mut inventory = self.frame_inventory.lock();
+            Some((
+                inventory.retired_reservation.take().ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "HVPatch exec began without old-mm inventory reservation".to_owned(),
+                    )
+                })?,
+                inventory.replacement_reservation.take().ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "HVPatch exec began without replacement-mm inventory reservation"
+                            .to_owned(),
+                    )
+                })?,
+            ))
+        } else {
+            None
+        };
         let bank_plan_started = std::time::Instant::now();
         let mut banked_plan = self.bank_exec_plan(plan)?;
         let bank_plan_elapsed_ns = bank_plan_started
@@ -6260,6 +6755,13 @@ impl HvfVmState {
             // has already retired. Remove the old process address space from the
             // live VM, then reuse this vCPU and VM for the replacement image.
             self.unmap_address_space_for_exec()?;
+            if let Some((retired, _)) = inventory_reservations.as_mut() {
+                let mut inventory = self.frame_inventory.lock();
+                if let Err(error) = Self::stage_retirement(&mut inventory, retired) {
+                    eprintln!("carrick: FATAL: stage inventory after HVPatch exec unmap: {error}");
+                    std::process::abort();
+                }
+            }
         } else {
             // Mature VMM behavior: tear down the current HVF VM and rebuild it.
             let inherited_vcpu_id = vcpu.id();
@@ -6364,8 +6866,32 @@ impl HvfVmState {
         // Apply the new mapping plan via the shared raw-mmap helper.
         let map_backings_started = std::time::Instant::now();
         for mapping in &plan.mappings {
-            self.mappings
-                .push(map_region_raw(mapping, self.persistent_vm_lifecycle)?);
+            match map_region_raw(mapping, self.persistent_vm_lifecycle) {
+                Ok(region) => self.mappings.push(region),
+                Err(error) if self.persistent_vm_lifecycle => {
+                    eprintln!("carrick: FATAL: HVPatch exec replacement partially mapped: {error}");
+                    std::process::abort();
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some((retired, mut replacement)) = inventory_reservations.take() {
+            let mut inventory = self.frame_inventory.lock();
+            for region in &self.mappings {
+                if let Err(error) = Self::stage_mapping(
+                    &mut inventory,
+                    &mut replacement,
+                    region.ipa,
+                    region.size as u64,
+                    Self::region_permissions(region),
+                    Self::private_backing_identity(),
+                    None,
+                ) {
+                    eprintln!("carrick: FATAL: stage inventory after HVPatch exec map: {error}");
+                    std::process::abort();
+                }
+            }
+            inventory.exec_commits = Some((retired.commit(()), replacement.commit(())));
         }
         emit_replace_stage(
             carrick_observability::probes::HvpatchExecReplaceStagePhase::MapBackings,
@@ -6737,13 +7263,10 @@ impl HvfInner {
                 if let Some(b) = lookup_shared_alias(fault_ipa)
                     && alias_remap_limiter.allow(b.ipa)
                 {
-                    // SAFETY: `host_addr` is a live MAP_SHARED mmap (the alias
-                    // backing) registered by add_alias; re-mapping the same host
-                    // range to the same IPA in this VM is idempotent. A nonzero rc
-                    // (e.g. already mapped by a racing sibling) is fine — re-run
-                    // and re-walk regardless.
-                    let _ = unsafe {
-                        applevisor_sys::hv_vm_map(
+                    // SAFETY: `host_addr` is a live MAP_SHARED mmap registered
+                    // by add_alias. Only rc=0 proves replay installation.
+                    let rc = unsafe {
+                        inventory_hv_vm_map(
                             b.host_addr as *mut std::ffi::c_void,
                             b.ipa,
                             b.size,
@@ -6754,9 +7277,15 @@ impl HvfInner {
                         exit.exception.virtual_address,
                         b.ipa,
                         b.size as u64,
-                        0,
+                        rc as i32,
                         0,
                     );
+                    if rc != 0 {
+                        return Err(TrapError::Hypervisor(format!(
+                            "lazy alias replay hv_vm_map(ipa=0x{:x}, size={}) failed: 0x{rc:x}",
+                            b.ipa, b.size
+                        )));
+                    }
                     // Diagnostic-only alias-remap counter+dump, gated behind
                     // `debug-stats` (no other consumer reads the counter).
                     #[cfg(feature = "debug-stats")]
@@ -7074,6 +7603,45 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, TrapError> {
     }
 }
 
+/// Sole raw Hypervisor.framework stage-2 map boundary. Inventory-aware callers
+/// own logical publication; VM/vCPU replay calls this only to reinstall the
+/// same physical extent and must still treat every nonzero result as failure.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn inventory_hv_vm_map(
+    host: *mut std::ffi::c_void,
+    ipa: u64,
+    size: usize,
+    permissions: u64,
+) -> applevisor_sys::hv_return_t {
+    unsafe { applevisor_sys::hv_vm_map(host, ipa, size, permissions) }
+}
+
+/// Sole raw Hypervisor.framework stage-2 unmap boundary.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn inventory_hv_vm_unmap(ipa: u64, size: usize) -> applevisor_sys::hv_return_t {
+    unsafe { applevisor_sys::hv_vm_unmap(ipa, size) }
+}
+
+#[cfg(test)]
+#[test]
+fn raw_hvf_stage2_calls_are_inventory_gated() {
+    let source = include_str!("trap.rs");
+    assert_eq!(
+        source
+            .matches(concat!("applevisor_sys::hv_vm_", "map("))
+            .count(),
+        1,
+        "raw hv_vm_map must appear only in inventory_hv_vm_map"
+    );
+    assert_eq!(
+        source
+            .matches(concat!("applevisor_sys::hv_vm_", "unmap("))
+            .count(),
+        1,
+        "raw hv_vm_unmap must appear only in inventory_hv_vm_unmap"
+    );
+}
+
 /// Back one guest region with a raw `mmap(MAP_ANON)` buffer + `hv_vm_map`,
 /// returning an UNOWNED [`HvfMappedRegion`] (`memory: None`).
 ///
@@ -7371,7 +7939,7 @@ fn map_region_raw(
         ));
     }
     let r = unsafe {
-        applevisor_sys::hv_vm_map(
+        inventory_hv_vm_map(
             host.cast::<std::ffi::c_void>(),
             mapping.ipa_start,
             size,

@@ -670,6 +670,38 @@ pub struct GuestWaitRegisters {
 }
 
 pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
+    /// Arm the exact child-map transaction before any backend/topology lock is
+    /// acquired. HVPatch transfers this non-cloneable reservation through its
+    /// process specification; other engines retain the no-op default.
+    fn begin_process_inventory(
+        &mut self,
+        reservation: crate::FrameInventoryReservation,
+    ) -> Result<(), TrapError> {
+        drop(reservation);
+        Err(TrapError::Hypervisor(
+            "backend does not expose process frame inventory".to_owned(),
+        ))
+    }
+
+    /// Complete child materialization returns the staged batch through this
+    /// seam. VM/vCPU replay never populates it.
+    fn take_process_inventory(&mut self) -> Option<crate::FrameInventoryCommit<()>> {
+        None
+    }
+
+    fn begin_retirement_inventory(
+        &mut self,
+        reservation: crate::FrameInventoryReservation,
+    ) -> Result<(), TrapError> {
+        drop(reservation);
+        Err(TrapError::Hypervisor(
+            "backend does not expose retirement frame inventory".to_owned(),
+        ))
+    }
+
+    fn take_retirement_inventory(&mut self) -> Option<crate::FrameInventoryCommit<()>> {
+        None
+    }
     /// The guest CPU ISA this engine runs. Fixed per process (the guest ISA
     /// equals the host ISA), so it is an associated type — monomorphized per
     /// ISA, no syscall-hot-path vtable. Aarch64 today; x86_64 in Phase 2.
