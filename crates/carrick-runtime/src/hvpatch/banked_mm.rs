@@ -1,14 +1,14 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 
-use carrick_hal::MappingId;
 use parking_lot::{Mutex, RwLock};
 
 use super::asid::{AsidAllocator, AsidError, RetiredAsid};
 use crate::kernel::{
-    Asid, MmBackend, MmBinding, SnapshotError, SnapshotTable, Stage1Root, Stage1RootError, Ttbr0,
-    VmaSummary,
+    Asid, MmBackend, MmBackendSnapshot, MmBinding, SnapshotError, Stage1Root, Stage1RootError,
+    Ttbr0,
 };
 
 const PROCESS_BANK_SIZE: u64 = 40 * 1024 * 1024 * 1024;
@@ -295,6 +295,7 @@ impl From<AsidError> for BankedMmError {
 pub(crate) struct BankedMmBackend {
     binding: RwLock<MmBinding>,
     inventory: RwLock<Option<InventoryBinding>>,
+    revision: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -312,15 +313,18 @@ impl BankedMmBackend {
         Self {
             binding: RwLock::new(binding),
             inventory: RwLock::new(None),
+            revision: AtomicU64::new(1),
         }
     }
 
     pub(crate) fn exec_observer(&self) -> Arc<Self> {
-        Arc::new(Self::for_binding(self.observed_binding()))
+        Arc::new(Self::for_binding(self.binding()))
     }
 
     pub(crate) fn publish_binding(&self, binding: MmBinding) {
-        *self.binding.write() = binding;
+        let mut current = self.binding.write();
+        *current = binding;
+        self.bump_revision();
     }
 
     pub(crate) fn bind_inventory(
@@ -328,10 +332,12 @@ impl BankedMmBackend {
         kernel: &Arc<crate::kernel::Kernel>,
         mm: crate::kernel::MmId,
     ) {
-        *self.inventory.write() = Some(InventoryBinding {
+        let mut inventory = self.inventory.write();
+        *inventory = Some(InventoryBinding {
             kernel: Arc::downgrade(kernel),
             mm,
         });
+        self.bump_revision();
     }
 
     #[cfg(test)]
@@ -339,38 +345,81 @@ impl BankedMmBackend {
         self.inventory.read().as_ref().map(|binding| binding.mm)
     }
 
-    fn observed_binding(&self) -> MmBinding {
+    pub(crate) fn binding(&self) -> MmBinding {
         *self.binding.read()
+    }
+
+    fn bump_revision(&self) {
+        if self.revision.fetch_add(1, Ordering::Release) == u64::MAX {
+            std::process::abort();
+        }
     }
 }
 
 impl MmBackend for BankedMmBackend {
-    fn binding(&self) -> MmBinding {
-        self.observed_binding()
-    }
-
-    fn vma_summaries(&self) -> Result<Vec<VmaSummary>, SnapshotError> {
-        // BankResources owns only the bank/root lifecycle record. AddressSpace
-        // remains the VMA authority until the K2 global-mm cutover.
-        Err(SnapshotError::AuthorityUnavailable(SnapshotTable::Vmas))
-    }
-
-    fn mapping_ids(&self) -> Result<Vec<MappingId>, SnapshotError> {
-        let inventory = self.inventory.read();
-        let binding = inventory
-            .as_ref()
-            .ok_or(SnapshotError::AuthorityUnavailable(SnapshotTable::Mappings))?;
-        let kernel = binding
-            .kernel
-            .upgrade()
-            .ok_or(SnapshotError::AuthorityUnavailable(SnapshotTable::Mappings))?;
-        Ok(kernel
+    fn snapshot(&self, deadline: Instant) -> Result<MmBackendSnapshot, SnapshotError> {
+        let before = self.revision.load(Ordering::Acquire);
+        let Some(binding) = self.binding.try_read_until(deadline) else {
+            return Err(if Instant::now() >= deadline {
+                SnapshotError::TimedOut
+            } else {
+                SnapshotError::Busy
+            });
+        };
+        let binding = *binding;
+        let Some(inventory) = self.inventory.try_read_until(deadline) else {
+            return Err(if Instant::now() >= deadline {
+                SnapshotError::TimedOut
+            } else {
+                SnapshotError::Busy
+            });
+        };
+        let (kernel, mm) = {
+            let inventory = inventory
+                .as_ref()
+                .ok_or(SnapshotError::AuthorityUnavailable(
+                    crate::kernel::SnapshotTable::Mappings,
+                ))?;
+            let kernel = inventory
+                .kernel
+                .upgrade()
+                .ok_or(SnapshotError::AuthorityUnavailable(
+                    crate::kernel::SnapshotTable::Mappings,
+                ))?;
+            (kernel, inventory.mm)
+        };
+        drop(inventory);
+        let frame_snapshot = kernel
             .frame_inventory()
-            .snapshot_for_mm(binding.mm)
-            .mappings
-            .into_iter()
-            .map(|mapping| mapping.mapping)
-            .collect())
+            .snapshot_for_mm_until(mm, deadline)
+            .ok_or_else(|| {
+                if Instant::now() >= deadline {
+                    SnapshotError::TimedOut
+                } else {
+                    SnapshotError::Busy
+                }
+            })?;
+        let after = self.revision.load(Ordering::Acquire);
+        if before != after {
+            return Err(SnapshotError::ChangedDuringObservation);
+        }
+        Ok(MmBackendSnapshot {
+            revision: after,
+            binding,
+            // The typed K1 model has not yet extracted concrete VMA state.
+            // Its authoritative projection is therefore exactly an empty table;
+            // dispatcher AddressSpace state is deliberately not consulted.
+            vmas: Vec::new(),
+            mapping_ids: frame_snapshot
+                .mappings
+                .into_iter()
+                .map(|mapping| mapping.mapping)
+                .collect(),
+        })
+    }
+
+    fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
     }
 }
 
@@ -429,16 +478,14 @@ mod tests {
     }
 
     #[test]
-    fn fails_closed_when_snapshot_authority_is_elsewhere() {
+    fn fails_closed_when_mapping_authority_is_unbound() {
         let (_table, backend) = BankResources::new_root(0x8000).expect("root table");
 
         assert_eq!(
-            backend.vma_summaries(),
-            Err(SnapshotError::AuthorityUnavailable(SnapshotTable::Vmas))
-        );
-        assert_eq!(
-            backend.mapping_ids(),
-            Err(SnapshotError::AuthorityUnavailable(SnapshotTable::Mappings))
+            backend.snapshot(Instant::now() + std::time::Duration::from_secs(1)),
+            Err(SnapshotError::AuthorityUnavailable(
+                crate::kernel::SnapshotTable::Mappings
+            ))
         );
     }
 }

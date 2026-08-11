@@ -145,9 +145,7 @@ impl ProcessContext {
     }
 
     pub(crate) fn mm_binding(&self) -> Option<crate::kernel::MmBinding> {
-        Some(crate::kernel::MmBackend::binding(
-            self.mm_backend.read().as_ref(),
-        ))
+        Some(self.mm_backend.read().binding())
     }
 
     pub(crate) fn syscall_trace_identity(&self) -> Option<(i32, u32)> {
@@ -987,7 +985,10 @@ mod tests {
             "root bootstrap must not replace the live banked backend with a snapshot"
         );
         assert_eq!(
-            crate::kernel::MmBackend::binding(actual.as_ref()),
+            actual
+                .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
+                .expect("backend snapshot")
+                .binding,
             process.mm_binding().unwrap()
         );
     }
@@ -1037,7 +1038,13 @@ mod tests {
 
         let mm = root.shared().mm();
         let backend = mm.backend().expect("banked mm backend");
-        assert_eq!(backend.mapping_ids().unwrap(), vec![mapping]);
+        assert_eq!(
+            backend
+                .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
+                .expect("backend snapshot")
+                .mapping_ids,
+            vec![mapping]
+        );
     }
 
     #[test]
@@ -1045,7 +1052,12 @@ mod tests {
         let (process, root) = authoritative_root();
         let old_mm = root.shared().mm().id();
         let old_backend = process.mm_backend.read().clone();
-        let old_binding = crate::kernel::MmBackend::binding(old_backend.as_ref());
+        let old_binding = crate::kernel::MmBackend::snapshot(
+            old_backend.as_ref(),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .expect("old backend snapshot")
+        .binding;
         let prepared = process
             .prepare_exec(root.thread().key().tid)
             .expect("prepare exec observer");
@@ -1060,7 +1072,12 @@ mod tests {
         assert!(!std::sync::Arc::ptr_eq(&old_backend, &replacement_backend));
         assert_eq!(old_backend.inventory_mm_for_tests(), Some(old_mm));
         assert_eq!(
-            crate::kernel::MmBackend::binding(old_backend.as_ref()),
+            crate::kernel::MmBackend::snapshot(
+                old_backend.as_ref(),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .expect("old backend snapshot")
+            .binding,
             old_binding
         );
         assert_eq!(
@@ -1068,10 +1085,15 @@ mod tests {
             Some(replacement_mm)
         );
         assert_eq!(
-            crate::kernel::MmBackend::binding(replacement_backend.as_ref())
-                .stage1_root
-                .gpa()
-                .raw(),
+            crate::kernel::MmBackend::snapshot(
+                replacement_backend.as_ref(),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .expect("replacement backend snapshot")
+            .binding
+            .stage1_root
+            .gpa()
+            .raw(),
             stage1_root
         );
     }
@@ -1194,11 +1216,10 @@ mod tests {
             Err(crate::kernel::KernelError::UnknownThread(_))
         ));
         assert_eq!(
-            committed
-                .shared()
-                .mm()
-                .backend()
-                .map(|backend| crate::kernel::MmBackend::binding(backend.as_ref())),
+            committed.shared().mm().backend().map(|backend| backend
+                .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
+                .expect("backend snapshot")
+                .binding),
             process.mm_binding()
         );
     }

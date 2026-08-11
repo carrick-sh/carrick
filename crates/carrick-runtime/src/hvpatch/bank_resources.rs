@@ -236,7 +236,7 @@ mod tests {
     use std::num::NonZeroU64;
 
     use super::*;
-    use crate::kernel::{MmBackend as _, TaskId, TaskSerial};
+    use crate::kernel::{TaskId, TaskSerial};
 
     fn task(raw: i32, serial: u64) -> TaskKey {
         TaskKey {

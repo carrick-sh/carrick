@@ -331,6 +331,8 @@ impl Kernel {
             }
             if let Some(claim) = record.thread_claims.remove(tid) {
                 retired_threads.push(RetiredThreadRecord {
+                    key: thread.key(),
+                    task: thread.task_key(),
                     thread: Arc::downgrade(thread),
                     _claim: claim,
                 });
@@ -426,29 +428,33 @@ mod tests {
 
     use carrick_abi::{LinuxCloneFlags, SigSet};
     use carrick_guest_mem::Gpa;
-    use carrick_hal::{MappingId, ThreadId};
+    use carrick_hal::ThreadId;
 
     use super::*;
     use crate::kernel::{
-        Asid, ClonePlan, FileDescription, FileSlotNumber, LinuxSignal, LinuxWaitStatus, MmBinding,
-        RootBootstrap, SignalDisposition, SnapshotError, SnapshotTable, Stage1Root, TaskRusage,
-        VmaSummary,
+        Asid, ClonePlan, FileDescription, FileSlotNumber, LinuxSignal, LinuxWaitStatus,
+        MmBackendSnapshot, MmBinding, RootBootstrap, SignalDisposition, SnapshotError, Stage1Root,
+        TaskRusage,
     };
 
     #[derive(Debug)]
     struct TestMmBackend(MmBinding);
 
     impl MmBackend for TestMmBackend {
-        fn binding(&self) -> MmBinding {
-            self.0
+        fn snapshot(
+            &self,
+            _deadline: std::time::Instant,
+        ) -> Result<MmBackendSnapshot, SnapshotError> {
+            Ok(MmBackendSnapshot {
+                revision: 1,
+                binding: self.0,
+                vmas: Vec::new(),
+                mapping_ids: Vec::new(),
+            })
         }
 
-        fn vma_summaries(&self) -> Result<Vec<VmaSummary>, SnapshotError> {
-            Err(SnapshotError::AuthorityUnavailable(SnapshotTable::Vmas))
-        }
-
-        fn mapping_ids(&self) -> Result<Vec<MappingId>, SnapshotError> {
-            Err(SnapshotError::AuthorityUnavailable(SnapshotTable::Mappings))
+        fn revision(&self) -> u64 {
+            1
         }
     }
 
@@ -536,7 +542,12 @@ mod tests {
         assert!(!Arc::ptr_eq(&parent_mm, &child_mm));
         assert_ne!(parent_mm.id(), child_mm.id());
         assert_eq!(
-            child_mm.backend().expect("replacement backend").binding(),
+            child_mm
+                .backend()
+                .expect("replacement backend")
+                .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
+                .expect("backend snapshot")
+                .binding,
             replacement_binding
         );
         assert!(Arc::ptr_eq(&parent_mm, &parent.task.shared().mm()));
