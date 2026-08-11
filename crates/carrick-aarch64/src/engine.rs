@@ -973,6 +973,49 @@ impl<V: Aarch64Vmm> carrick_hal::RegAccess for Aarch64EngineCore<V> {
 // ─── SyscallTrap ─────────────────────────────────────────────────────────────
 
 impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
+    fn frame_inventory_extent_count(&self) -> usize {
+        self.vm.frame_inventory_extent_count()
+    }
+
+    fn inventory_initial_mappings(
+        &mut self,
+        reservation: carrick_hal::FrameInventoryReservation,
+    ) -> Result<carrick_hal::FrameInventoryCommit<()>, TrapError> {
+        self.vm.inventory_initial_mappings(reservation)
+    }
+
+    fn begin_alias_inventory(
+        &mut self,
+        reservation: carrick_hal::FrameInventoryReservation,
+    ) -> Result<(), TrapError> {
+        self.vm.begin_alias_inventory(reservation)
+    }
+
+    fn take_alias_inventory(&mut self) -> Option<carrick_hal::FrameInventoryCommit<()>> {
+        self.vm.take_alias_inventory()
+    }
+
+    fn frame_inventory_exec_extent_counts(&self, new_image: &AddressSpace) -> (usize, usize) {
+        self.vm.frame_inventory_exec_extent_counts(new_image)
+    }
+
+    fn begin_exec_inventory(
+        &mut self,
+        retired: carrick_hal::FrameInventoryReservation,
+        replacement: carrick_hal::FrameInventoryReservation,
+    ) -> Result<(), TrapError> {
+        self.vm.begin_exec_inventory(retired, replacement)
+    }
+
+    fn take_exec_inventory(
+        &mut self,
+    ) -> Option<(
+        carrick_hal::FrameInventoryCommit<()>,
+        carrick_hal::FrameInventoryCommit<()>,
+    )> {
+        self.vm.take_exec_inventory()
+    }
+
     fn next_syscall(&mut self) -> Result<Option<RawSyscall>, TrapError> {
         // One guest run per call. The loop exists ONLY to re-enter the guest when a
         // kick lands mid-syscall-trap (the `Kicked` arm); every other exit returns.
@@ -1433,6 +1476,28 @@ fn seed_sibling_snapshot(
 }
 
 impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
+    fn begin_process_inventory(
+        &mut self,
+        reservation: carrick_hal::FrameInventoryReservation,
+    ) -> Result<(), TrapError> {
+        self.vm.begin_process_inventory(reservation)
+    }
+
+    fn take_process_inventory(&mut self) -> Option<carrick_hal::FrameInventoryCommit<()>> {
+        self.vm.take_process_inventory()
+    }
+
+    fn begin_retirement_inventory(
+        &mut self,
+        reservation: carrick_hal::FrameInventoryReservation,
+    ) -> Result<(), TrapError> {
+        self.vm.begin_retirement_inventory(reservation)
+    }
+
+    fn take_retirement_inventory(&mut self) -> Option<carrick_hal::FrameInventoryCommit<()>> {
+        self.vm.take_retirement_inventory()
+    }
+
     type Arch = carrick_hal::Aarch64GuestArch;
     type KickHandle = V::KickHandle;
     type SiblingSpec = Aarch64SiblingSpec<V>;

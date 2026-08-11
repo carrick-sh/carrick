@@ -67,6 +67,69 @@ impl From<OsError> for TrapError {
 /// and fork/execve the guest address space. Implemented by `HvfTrapEngine`
 /// (macOS), `KvmTrapEngine` (Linux), and the runtime's `SplitView` adapter.
 pub trait SyscallTrap {
+    /// Number of exact sparse stage-2 backing extents currently owned by this
+    /// engine. Non-HVPatch engines keep the zero default and never enter the
+    /// inventory transaction hooks below.
+    fn frame_inventory_extent_count(&self) -> usize {
+        0
+    }
+
+    /// Publish the mappings installed before the runtime Kernel existed. The
+    /// caller allocates every candidate and all event storage first.
+    fn inventory_initial_mappings(
+        &mut self,
+        reservation: crate::FrameInventoryReservation,
+    ) -> Result<crate::FrameInventoryCommit<()>, TrapError> {
+        drop(reservation);
+        Err(TrapError::Hypervisor(
+            "backend does not expose initial frame inventory".to_owned(),
+        ))
+    }
+
+    /// Arm an operation-local reservation for one dynamic stage-2 alias. The
+    /// backend consumes it inside `map_host_alias` and exposes the complete
+    /// batch only after that method has returned and released backend locks.
+    fn begin_alias_inventory(
+        &mut self,
+        reservation: crate::FrameInventoryReservation,
+    ) -> Result<(), TrapError> {
+        drop(reservation);
+        Err(TrapError::Hypervisor(
+            "backend does not expose alias frame inventory".to_owned(),
+        ))
+    }
+
+    fn take_alias_inventory(&mut self) -> Option<crate::FrameInventoryCommit<()>> {
+        None
+    }
+
+    /// Exact old/new sparse extent counts for a destructive exec replacement.
+    fn frame_inventory_exec_extent_counts(&self, _new_image: &AddressSpace) -> (usize, usize) {
+        (0, 0)
+    }
+
+    /// Arm independently applicable old-mm retirement and replacement-mm map
+    /// transactions. Keeping them separate prevents an exec batch from being
+    /// applied to the wrong `MmId`.
+    fn begin_exec_inventory(
+        &mut self,
+        retired: crate::FrameInventoryReservation,
+        replacement: crate::FrameInventoryReservation,
+    ) -> Result<(), TrapError> {
+        drop((retired, replacement));
+        Err(TrapError::Hypervisor(
+            "backend does not expose exec frame inventory".to_owned(),
+        ))
+    }
+
+    fn take_exec_inventory(
+        &mut self,
+    ) -> Option<(
+        crate::FrameInventoryCommit<()>,
+        crate::FrameInventoryCommit<()>,
+    )> {
+        None
+    }
     /// Run the vCPU until it traps. `Ok(Some(raw))` is a guest syscall, already
     /// decoded to an ISA-neutral [`RawSyscall`] by the backend's
     /// [`crate::GuestArch::decode_syscall`]; `Ok(None)` means the vCPU was forced

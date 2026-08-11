@@ -304,6 +304,89 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// their established rebuild behavior.
     fn set_persistent_vm_lifecycle(&mut self, _enabled: bool) {}
 
+    // HVPatch-only K1 frame-inventory transaction seam. Defaults preserve the
+    // mature HVF VMM and KVM lanes exactly: they report no inventory authority
+    // and are never called by their runtime paths.
+    fn frame_inventory_extent_count(&self) -> usize {
+        0
+    }
+
+    fn inventory_initial_mappings(
+        &mut self,
+        reservation: carrick_hal::FrameInventoryReservation,
+    ) -> Result<carrick_hal::FrameInventoryCommit<()>, TrapError> {
+        drop(reservation);
+        Err(TrapError::Hypervisor(
+            "aarch64 backend has no initial frame inventory".to_owned(),
+        ))
+    }
+
+    fn begin_alias_inventory(
+        &mut self,
+        reservation: carrick_hal::FrameInventoryReservation,
+    ) -> Result<(), TrapError> {
+        drop(reservation);
+        Err(TrapError::Hypervisor(
+            "aarch64 backend has no alias frame inventory".to_owned(),
+        ))
+    }
+
+    fn take_alias_inventory(&mut self) -> Option<carrick_hal::FrameInventoryCommit<()>> {
+        None
+    }
+
+    fn frame_inventory_exec_extent_counts(&self, _new_image: &AddressSpace) -> (usize, usize) {
+        (0, 0)
+    }
+
+    fn begin_exec_inventory(
+        &mut self,
+        retired: carrick_hal::FrameInventoryReservation,
+        replacement: carrick_hal::FrameInventoryReservation,
+    ) -> Result<(), TrapError> {
+        drop((retired, replacement));
+        Err(TrapError::Hypervisor(
+            "aarch64 backend has no exec frame inventory".to_owned(),
+        ))
+    }
+
+    fn take_exec_inventory(
+        &mut self,
+    ) -> Option<(
+        carrick_hal::FrameInventoryCommit<()>,
+        carrick_hal::FrameInventoryCommit<()>,
+    )> {
+        None
+    }
+
+    fn begin_process_inventory(
+        &mut self,
+        reservation: carrick_hal::FrameInventoryReservation,
+    ) -> Result<(), TrapError> {
+        drop(reservation);
+        Err(TrapError::Hypervisor(
+            "aarch64 backend has no process frame inventory".to_owned(),
+        ))
+    }
+
+    fn take_process_inventory(&mut self) -> Option<carrick_hal::FrameInventoryCommit<()>> {
+        None
+    }
+
+    fn begin_retirement_inventory(
+        &mut self,
+        reservation: carrick_hal::FrameInventoryReservation,
+    ) -> Result<(), TrapError> {
+        drop(reservation);
+        Err(TrapError::Hypervisor(
+            "aarch64 backend has no retirement frame inventory".to_owned(),
+        ))
+    }
+
+    fn take_retirement_inventory(&mut self) -> Option<carrick_hal::FrameInventoryCommit<()>> {
+        None
+    }
+
     // ── memory windows + stage-2 (the hv_vm_map / KVM-slot seam) ──
     //
     // NOTE: `host_ptr` / `host_ptr_mut` / `write_gpa` are inherited from the shared

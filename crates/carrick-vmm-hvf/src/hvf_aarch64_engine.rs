@@ -408,6 +408,71 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.set_persistent_vm_lifecycle(enabled);
     }
 
+    fn frame_inventory_extent_count(&self) -> usize {
+        self.state.frame_inventory_extent_count()
+    }
+
+    fn inventory_initial_mappings(
+        &mut self,
+        reservation: carrick_hal::FrameInventoryReservation,
+    ) -> Result<carrick_hal::FrameInventoryCommit<()>, TrapError> {
+        self.state.inventory_initial_mappings(reservation)
+    }
+
+    fn begin_alias_inventory(
+        &mut self,
+        reservation: carrick_hal::FrameInventoryReservation,
+    ) -> Result<(), TrapError> {
+        self.state.begin_alias_inventory(reservation)
+    }
+
+    fn take_alias_inventory(&mut self) -> Option<carrick_hal::FrameInventoryCommit<()>> {
+        self.state.take_alias_inventory()
+    }
+
+    fn frame_inventory_exec_extent_counts(&self, new_image: &AddressSpace) -> (usize, usize) {
+        self.state.frame_inventory_exec_extent_counts(new_image)
+    }
+
+    fn begin_exec_inventory(
+        &mut self,
+        retired: carrick_hal::FrameInventoryReservation,
+        replacement: carrick_hal::FrameInventoryReservation,
+    ) -> Result<(), TrapError> {
+        self.state.begin_exec_inventory(retired, replacement)
+    }
+
+    fn take_exec_inventory(
+        &mut self,
+    ) -> Option<(
+        carrick_hal::FrameInventoryCommit<()>,
+        carrick_hal::FrameInventoryCommit<()>,
+    )> {
+        self.state.take_exec_inventory()
+    }
+
+    fn begin_process_inventory(
+        &mut self,
+        reservation: carrick_hal::FrameInventoryReservation,
+    ) -> Result<(), TrapError> {
+        self.state.begin_process_inventory(reservation)
+    }
+
+    fn take_process_inventory(&mut self) -> Option<carrick_hal::FrameInventoryCommit<()>> {
+        self.state.take_process_inventory()
+    }
+
+    fn begin_retirement_inventory(
+        &mut self,
+        reservation: carrick_hal::FrameInventoryReservation,
+    ) -> Result<(), TrapError> {
+        self.state.begin_retirement_inventory(reservation)
+    }
+
+    fn take_retirement_inventory(&mut self) -> Option<carrick_hal::FrameInventoryCommit<()>> {
+        self.state.take_retirement_inventory()
+    }
+
     type Vcpu = HvfAarch64Vcpu;
     type KickHandle = crate::vcpu_kick::VcpuKickHandle;
     type SiblingBuilder = ThreadSpec;
