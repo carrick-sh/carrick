@@ -42,6 +42,7 @@ pub(crate) struct ProcessContext {
 pub(crate) struct PreparedProcessExec {
     kernel: crate::kernel::PreparedExec,
     backend: std::sync::Arc<banked_mm::BankedMmBackend>,
+    old_vmas: banked_mm::PreparedVmaFreeze,
 }
 
 impl PreparedProcessExec {
@@ -51,6 +52,14 @@ impl PreparedProcessExec {
 
     pub(crate) fn replacement_mm_id(&self) -> crate::kernel::MmId {
         self.kernel.replacement_mm_id()
+    }
+
+    pub(crate) fn acknowledge_staged_vma_revision(&mut self) -> Result<(), String> {
+        self.old_vmas
+            .acknowledge_staged_revision(
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -141,14 +150,8 @@ impl ProcessContext {
     }
 
     pub(crate) fn bind_vma_source(&self, source: crate::kernel::SharedVmaSnapshotSource) {
-        self.mm_backend.read().bind_vma_source(source);
-    }
-
-    pub(crate) fn freeze_current_vmas(
-        &self,
-        deadline: std::time::Instant,
-    ) -> Result<(), crate::kernel::SnapshotError> {
-        self.mm_backend.read().freeze_vmas(deadline)
+        let backend = std::sync::Arc::clone(&self.mm_backend.read());
+        backend.bind_vma_source(source);
     }
 
     pub(crate) fn live_process_count(&self) -> usize {
@@ -156,7 +159,8 @@ impl ProcessContext {
     }
 
     pub(crate) fn mm_binding(&self) -> Option<crate::kernel::MmBinding> {
-        Some(self.mm_backend.read().binding())
+        let backend = std::sync::Arc::clone(&self.mm_backend.read());
+        Some(backend.binding())
     }
 
     pub(crate) fn syscall_trace_identity(&self) -> Option<(i32, u32)> {
@@ -281,13 +285,21 @@ impl ProcessContext {
         let context = self
             .context_for_linux_tid(tid)
             .map_err(|error| error.to_string())?;
-        let backend = self.mm_backend.read().exec_observer();
+        let current_backend = std::sync::Arc::clone(&self.mm_backend.read());
+        let backend = current_backend.exec_observer();
         let kernel_backend: std::sync::Arc<dyn crate::kernel::MmBackend> = backend.clone();
         let kernel = self
             .kernel_graph()
             .prepare_exec_with_mm_backend(&context, kernel_backend, None)
             .map_err(|error| error.to_string())?;
-        Ok(PreparedProcessExec { kernel, backend })
+        let old_vmas = current_backend
+            .prepare_vma_freeze(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .map_err(|error| error.to_string())?;
+        Ok(PreparedProcessExec {
+            kernel,
+            backend,
+            old_vmas,
+        })
     }
 
     pub(crate) fn commit_exec(
@@ -296,21 +308,41 @@ impl ProcessContext {
         stage1_root: u64,
         vma_source: crate::kernel::SharedVmaSnapshotSource,
     ) -> Result<crate::kernel::KernelContext, String> {
+        let PreparedProcessExec {
+            kernel,
+            backend,
+            old_vmas,
+        } = prepared;
+        let current_backend = std::sync::Arc::clone(&self.mm_backend.read());
+        old_vmas
+            .validate(
+                &current_backend,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .map_err(|error| error.to_string())?;
         let binding = self
             .resources
             .publish_exec(self.task_key(), stage1_root)
             .map_err(|error| error.to_string())?;
-        let replacement_mm = prepared.kernel.replacement_mm_id();
-        prepared.backend.publish_binding(binding);
-        prepared
-            .backend
-            .bind_inventory(self.kernel_graph(), replacement_mm);
-        prepared.backend.bind_vma_source(vma_source);
+        let replacement_mm = kernel.replacement_mm_id();
+        backend.publish_binding(binding);
+        backend.bind_inventory(self.kernel_graph(), replacement_mm);
+        backend.bind_vma_source(vma_source);
         let context = self
             .kernel_graph()
-            .commit_exec(prepared.kernel, None)
+            .commit_exec(kernel, None)
             .map_err(|error| error.to_string())?;
-        *self.mm_backend.write() = prepared.backend;
+        // The caller invokes this method only after destructive engine
+        // replacement. Freeze the detached historical observer after Kernel
+        // publication so no recoverable pre-publication error can strand the
+        // still-live old image on an owned snapshot.
+        old_vmas
+            .commit(
+                &current_backend,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .map_err(|error| error.to_string())?;
+        *self.mm_backend.write() = backend;
         Ok(context)
     }
 
@@ -1155,15 +1187,28 @@ mod tests {
             std::time::Instant::now() + std::time::Duration::from_secs(1),
         )
         .expect("old backend snapshot");
-        let prepared = process
+        let mut prepared = process
             .prepare_exec(root.thread().key().tid)
             .expect("prepare exec observer");
         let replacement_mm = prepared.replacement_mm_id();
         assert_ne!(old_mm, replacement_mm);
         let stage1_root = old_snapshot.binding.stage1_root.gpa().raw() + 0x4000;
-        process
-            .freeze_current_vmas(std::time::Instant::now() + std::time::Duration::from_secs(1))
-            .expect("freeze old VMA generation");
+
+        // Runtime stages the replacement image in the same dispatcher after
+        // capturing the historical image. Acknowledge only that deliberate
+        // source revision; the retained snapshot must remain the old image.
+        old_dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+            start: 0x7000,
+            end: 0x8000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: crate::vfs::ProcMapSharing::Private,
+            path: "staged-new-image".to_owned(),
+        }]);
+        prepared
+            .acknowledge_staged_vma_revision()
+            .expect("acknowledge staged VMA revision");
 
         let replacement_dispatcher = SyscallDispatcher::new();
         replacement_dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
@@ -1207,6 +1252,99 @@ mod tests {
             vec![crate::kernel::VmaSummary {
                 start: carrick_guest_mem::GuestVa(0x3000),
                 end: carrick_guest_mem::GuestVa(0x4000),
+            }]
+        );
+    }
+
+    #[test]
+    fn unacknowledged_exec_vma_change_cannot_detach_the_old_observer() {
+        let (process, root) = authoritative_root();
+        let dispatcher = SyscallDispatcher::new();
+        dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+            start: 0x1000,
+            end: 0x2000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: crate::vfs::ProcMapSharing::Private,
+            path: "old-image".to_owned(),
+        }]);
+        process.bind_vma_source(dispatcher.vma_snapshot_source());
+        let backend = std::sync::Arc::clone(&process.mm_backend.read());
+        let prepared = process
+            .prepare_exec(root.thread().key().tid)
+            .expect("prepare exec observer");
+
+        dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+            start: 0x5000,
+            end: 0x6000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: crate::vfs::ProcMapSharing::Private,
+            path: "unexpected-change".to_owned(),
+        }]);
+        assert_eq!(
+            prepared.old_vmas.commit(
+                backend.as_ref(),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            ),
+            Err(crate::kernel::SnapshotError::ChangedDuringObservation)
+        );
+
+        let observed = crate::kernel::MmBackend::snapshot(
+            backend.as_ref(),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .expect("still-live observer");
+        assert_eq!(
+            observed.vmas,
+            vec![crate::kernel::VmaSummary {
+                start: carrick_guest_mem::GuestVa(0x5000),
+                end: carrick_guest_mem::GuestVa(0x6000),
+            }]
+        );
+    }
+
+    #[test]
+    fn dropped_exec_preparation_keeps_old_vma_observer_live() {
+        let (process, root) = authoritative_root();
+        let dispatcher = SyscallDispatcher::new();
+        dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+            start: 0x1000,
+            end: 0x2000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: crate::vfs::ProcMapSharing::Private,
+            path: "old-image".to_owned(),
+        }]);
+        process.bind_vma_source(dispatcher.vma_snapshot_source());
+        let backend = std::sync::Arc::clone(&process.mm_backend.read());
+        let prepared = process
+            .prepare_exec(root.thread().key().tid)
+            .expect("prepare exec observer");
+        drop(prepared);
+
+        dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
+            start: 0x5000,
+            end: 0x6000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: crate::vfs::ProcMapSharing::Private,
+            path: "continued-old-image".to_owned(),
+        }]);
+        let observed = crate::kernel::MmBackend::snapshot(
+            backend.as_ref(),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .expect("live old observer");
+        assert_eq!(
+            observed.vmas,
+            vec![crate::kernel::VmaSummary {
+                start: carrick_guest_mem::GuestVa(0x5000),
+                end: carrick_guest_mem::GuestVa(0x6000),
             }]
         );
     }
@@ -1278,6 +1416,7 @@ mod tests {
             .publish_child(child_context.task().key(), prepared_mm)
             .unwrap();
         let child = parent.published_child_context(&child_context, backend);
+        child.bind_vma_source(test_vma_source());
 
         let leader_tid = crate::kernel::LinuxTid::for_task_leader(child_id);
         let prepared_exec = child.prepare_exec(leader_tid).unwrap();

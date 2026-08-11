@@ -51,6 +51,13 @@ impl RuntimePreparedExec {
             Self::Other(prepared) => prepared.replacement_mm_id(),
         }
     }
+
+    fn acknowledge_staged_vma_revision(&mut self) -> Result<(), String> {
+        match self {
+            Self::Hvpatch(prepared) => prepared.acknowledge_staged_vma_revision(),
+            Self::Other(_) => Ok(()),
+        }
+    }
 }
 
 fn should_update_host_process_title(is_hvpatch: bool) -> bool {
@@ -230,7 +237,7 @@ where
                 // precedes every destructive image, CLOEXEC, and proc-state
                 // mutation. From here, the prepared exec transaction is the
                 // sole owner of nonleader promotion and replacement Mm state.
-                let prepared_kernel_exec = match kernel.hvpatch_process.as_ref() {
+                let mut prepared_kernel_exec = match kernel.hvpatch_process.as_ref() {
                     Some(process) => process
                         .prepare_exec(self.linux_tid)
                         .map(RuntimePreparedExec::Hvpatch),
@@ -301,23 +308,19 @@ where
                 kernel
                     .dispatcher
                     .set_executable_identity(path.clone(), proc_argv, proc_env);
-                // Preserve the old typed Mm's historical VMA generation before
-                // replacing the dispatcher's sole production authority.
-                if let Some(process) = kernel.hvpatch_process.as_ref() {
-                    process
-                        .freeze_current_vmas(
-                            std::time::Instant::now() + std::time::Duration::from_secs(1),
-                        )
-                        .map_err(|error| {
-                            RuntimeError::Configuration(format!(
-                                "freeze HVPatch VMA authority before exec: {error}"
-                            ))
-                        })?;
-                }
                 kernel.dispatcher.reset_signal_handlers_on_execve();
                 // Reset + refresh /proc/self/maps and /proc/self/auxv under one
-                // dispatcher memory-authority generation.
+                // dispatcher memory-authority generation. The historical MM
+                // retains the pre-staging snapshot, but records this deliberate
+                // source revision so commit can reject any later mutation.
                 apply_exec_image_proc_state(&kernel.dispatcher, &img);
+                prepared_kernel_exec
+                    .acknowledge_staged_vma_revision()
+                    .map_err(|error| {
+                        RuntimeError::Configuration(format!(
+                            "acknowledge staged exec VMA revision: {error}"
+                        ))
+                    })?;
                 emit_runtime_stage(
                     carrick_observability::probes::HvpatchExecRuntimeStagePhase::ProcState,
                     proc_state_started,

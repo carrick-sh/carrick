@@ -2358,7 +2358,7 @@ impl SyscallDispatcher {
         /// mapping, and tear down the dynamic alias leaves so repeated SysV shm
         /// attach/detach cycles reclaim the backend's per-alias page-table pool.
         fn shmdt(this, cx, addr: u64) {
-            let _host_alias_dispatch = this.begin_host_alias_dispatch();
+            let mut host_alias_dispatch = this.begin_conditional_vma_dispatch();
             let (shmid, len) = {
                 let state = this.sysv.lock();
                 if state.remapped_attachments.contains(&addr) {
@@ -2412,6 +2412,8 @@ impl SyscallDispatcher {
             seg.dtime = dtime;
             seg.lpid = lpid;
             state.attachments.remove(&addr);
+            drop(state);
+            this.mark_vma_dispatch(&mut host_alias_dispatch);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 

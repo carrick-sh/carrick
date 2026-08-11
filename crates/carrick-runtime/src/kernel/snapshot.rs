@@ -521,7 +521,7 @@ impl Kernel {
             }
         }
         for (backend, revision) in checks.vma_revisions {
-            if backend.vma_revision() != Some(revision) {
+            if backend.vma_revision(deadline).map_err(map_backend_error)? != Some(revision) {
                 return Err(AttemptError::Race);
             }
         }
@@ -1123,12 +1123,15 @@ mod tests {
             self.revision.load(Ordering::Acquire)
         }
 
-        fn vma_revision(&self) -> Option<crate::kernel::VmaRevision> {
-            matches!(self.mode, BackendMode::VmaRevisionRace).then(|| {
+        fn vma_revision(
+            &self,
+            _deadline: Instant,
+        ) -> Result<Option<crate::kernel::VmaRevision>, SnapshotError> {
+            Ok(matches!(self.mode, BackendMode::VmaRevisionRace).then(|| {
                 crate::kernel::VmaRevision::from_authority_raw(
                     self.vma_revision.load(Ordering::Acquire),
                 )
-            })
+            }))
         }
     }
 

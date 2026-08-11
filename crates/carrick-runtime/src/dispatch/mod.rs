@@ -1966,6 +1966,8 @@ struct HostAliasTransactions {
     phase: parking_lot::Mutex<HostAliasPhase>,
     idle: parking_lot::Condvar,
     next_id: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    waiting_dispatchers: std::sync::atomic::AtomicUsize,
 }
 
 impl HostAliasTransactions {
@@ -1974,25 +1976,37 @@ impl HostAliasTransactions {
             phase: parking_lot::Mutex::new(HostAliasPhase::Idle),
             idle: parking_lot::Condvar::new(),
             next_id: std::sync::atomic::AtomicU64::new(1),
+            #[cfg(test)]
+            waiting_dispatchers: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     fn begin_dispatch(self: &Arc<Self>) -> HostAliasDispatchGuard {
         let mut phase = self.phase.lock();
+        #[cfg(test)]
+        let registered_waiter = if matches!(*phase, HostAliasPhase::Idle) {
+            false
+        } else {
+            self.waiting_dispatchers
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            true
+        };
         while !matches!(*phase, HostAliasPhase::Idle) {
             self.idle.wait(&mut phase);
+        }
+        #[cfg(test)]
+        if registered_waiter {
+            self.waiting_dispatchers
+                .fetch_sub(1, std::sync::atomic::Ordering::Release);
         }
         *phase = HostAliasPhase::Dispatching;
         HostAliasDispatchGuard {
             transactions: Arc::clone(self),
             active: true,
+            vma_revision: None,
         }
     }
 
-    #[cfg(all(
-        any(target_os = "freebsd", target_os = "netbsd"),
-        target_arch = "x86_64"
-    ))]
     fn begin_dispatch_until(
         self: &Arc<Self>,
         deadline: std::time::Instant,
@@ -2016,7 +2030,14 @@ impl HostAliasTransactions {
         Some(HostAliasDispatchGuard {
             transactions: Arc::clone(self),
             active: true,
+            vma_revision: None,
         })
+    }
+
+    #[cfg(test)]
+    fn waiting_dispatchers(&self) -> usize {
+        self.waiting_dispatchers
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn abort_matching(&self, id: HostAliasTransactionId) {
@@ -2033,12 +2054,78 @@ impl HostAliasTransactions {
     }
 }
 
+struct DispatcherVmaSnapshotSource {
+    mem: Arc<mem::MemAuthority>,
+    transactions: Arc<HostAliasTransactions>,
+}
+
+impl std::fmt::Debug for DispatcherVmaSnapshotSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DispatcherVmaSnapshotSource")
+    }
+}
+
+impl crate::kernel::VmaSnapshotSource for DispatcherVmaSnapshotSource {
+    fn snapshot(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<crate::kernel::OwnedVmaSnapshot, crate::kernel::SnapshotError> {
+        let _dispatch = self
+            .transactions
+            .begin_dispatch_until(deadline)
+            .ok_or_else(|| {
+                if std::time::Instant::now() >= deadline {
+                    crate::kernel::SnapshotError::TimedOut
+                } else {
+                    crate::kernel::SnapshotError::Busy
+                }
+            })?;
+        self.mem.snapshot_until(deadline)
+    }
+
+    fn revision(&self) -> crate::kernel::VmaRevision {
+        self.mem.vma_revision()
+    }
+
+    fn publish_if_revision(
+        &self,
+        expected: crate::kernel::VmaRevision,
+        deadline: std::time::Instant,
+        publish: &mut dyn FnMut() -> Result<(), crate::kernel::SnapshotError>,
+    ) -> Result<(), crate::kernel::SnapshotError> {
+        let _dispatch = self
+            .transactions
+            .begin_dispatch_until(deadline)
+            .ok_or_else(|| {
+                if std::time::Instant::now() >= deadline {
+                    crate::kernel::SnapshotError::TimedOut
+                } else {
+                    crate::kernel::SnapshotError::Busy
+                }
+            })?;
+        if self.mem.vma_revision() != expected {
+            return Err(crate::kernel::SnapshotError::ChangedDuringObservation);
+        }
+        publish()
+    }
+}
+
 pub(crate) struct HostAliasDispatchGuard {
     transactions: Arc<HostAliasTransactions>,
     active: bool,
+    vma_revision: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl HostAliasDispatchGuard {
+    fn with_vma_revision(mut self, revision: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        self.vma_revision = Some(revision);
+        self
+    }
+
+    fn mark_vma_revision(&mut self, revision: Arc<std::sync::atomic::AtomicU64>) {
+        self.vma_revision = Some(revision);
+    }
+
     pub(crate) fn publish(mut self, commit: HostAliasCommit) -> HostAliasTransaction {
         // A publisher running under the SHARED native `:3440` dispatch guard
         // defers its install past that guard's release: the alias phase then
@@ -2095,6 +2182,11 @@ impl Drop for HostAliasDispatchGuard {
         }
         let mut phase = self.transactions.phase.lock();
         if matches!(*phase, HostAliasPhase::Dispatching) {
+            if let Some(revision) = &self.vma_revision
+                && revision.fetch_add(1, std::sync::atomic::Ordering::Release) == u64::MAX
+            {
+                std::process::abort();
+            }
             *phase = HostAliasPhase::Idle;
             self.transactions.idle.notify_all();
         }
@@ -2472,8 +2564,10 @@ impl SyscallDispatcher {
     }
 
     pub(crate) fn vma_snapshot_source(&self) -> crate::kernel::SharedVmaSnapshotSource {
-        let source: crate::kernel::SharedVmaSnapshotSource = Arc::clone(&self.mem) as _;
-        source
+        Arc::new(DispatcherVmaSnapshotSource {
+            mem: Arc::clone(&self.mem),
+            transactions: Arc::clone(&self.host_alias_transactions),
+        })
     }
 
     pub(crate) fn capture_kernel_context(
@@ -2629,6 +2723,7 @@ impl SyscallDispatcher {
         parent_guest_pid: u32,
         child_guest_pid: u32,
     ) -> Self {
+        let _vma_snapshot = self.begin_host_alias_dispatch();
         Self {
             kernel_binding: RwLock::new(self.kernel_binding.read().clone()),
             io: self.io.fork_clone(),
@@ -2789,6 +2884,23 @@ impl SyscallDispatcher {
         self.host_alias_transactions.begin_dispatch()
     }
 
+    pub(crate) fn begin_vma_dispatch(&self) -> HostAliasDispatchGuard {
+        self.host_alias_transactions
+            .begin_dispatch()
+            .with_vma_revision(self.mem.revision_publisher())
+    }
+
+    pub(crate) fn begin_conditional_vma_dispatch(&self) -> HostAliasDispatchGuard {
+        self.host_alias_transactions.begin_dispatch()
+    }
+
+    pub(crate) fn mark_vma_dispatch(&self, guard: &mut HostAliasDispatchGuard) {
+        if !self.owns_host_alias_dispatch(guard) {
+            std::process::abort();
+        }
+        guard.mark_vma_revision(self.mem.revision_publisher());
+    }
+
     #[cfg(all(
         any(target_os = "freebsd", target_os = "netbsd"),
         target_arch = "x86_64"
@@ -2840,7 +2952,7 @@ impl SyscallDispatcher {
         };
 
         if let Some(mmap) = commit.mmap {
-            self.commit_host_alias_mmap(mmap);
+            self.commit_host_alias_mmap_observed(mmap);
         }
         if let Some(shmat) = commit.shmat {
             self.commit_host_alias_shmat(shmat);
@@ -2908,6 +3020,7 @@ impl SyscallDispatcher {
     // (this method's own lane gate matches it); no test exercises it directly.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(crate) fn set_memory_layout(&self, layout: MemoryLayout) {
+        let _vma_dispatch = self.begin_vma_dispatch();
         *self.mem.lock() = mem::MemState::new_with_layout(layout);
     }
 
@@ -2948,6 +3061,7 @@ impl SyscallDispatcher {
     /// summary. Called once after `HvfTrapEngine::map_address_space`
     /// succeeds.
     pub fn set_address_space_regions(&self, regions: Vec<ProcMapsEntry>) {
+        let _vma_dispatch = self.begin_vma_dispatch();
         self.mem.lock().address_space_regions = Some(regions);
     }
 
@@ -2955,6 +3069,7 @@ impl SyscallDispatcher {
     /// Reset, boot-region metadata and auxv become visible under one authority
     /// write, so K1 observers cannot see the destructive exec midpoint.
     pub(crate) fn publish_exec_image_state(&self, regions: Vec<ProcMapsEntry>, auxv: Vec<u8>) {
+        let _vma_dispatch = self.begin_vma_dispatch();
         let mut mem = self.mem.lock();
         mem.reset_for_execve();
         mem.address_space_regions = Some(regions);

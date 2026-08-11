@@ -3626,6 +3626,12 @@ impl HvfVmState {
     }
 
     pub(crate) fn retire_process_mappings(&mut self) -> Result<(), TrapError> {
+        // Mature VMM processes own a private VM and retain the historical
+        // teardown path; only the persistent single-VM HVPatch lane publishes
+        // per-process frame-inventory retirement.
+        if !self.persistent_vm_lifecycle {
+            return Ok(());
+        }
         // The runtime holds the process-wide HVPatch topology lock across this
         // method. Select exact extents whose final logical owner is this mm;
         // global shared aliases are therefore retired by their actual last

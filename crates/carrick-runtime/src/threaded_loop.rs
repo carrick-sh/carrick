@@ -265,6 +265,19 @@ where
         // Retire only this already-created vCPU so teardown has one owner.
         engine.destroy_vcpu_on_thread_exit();
     })?;
+    if hvpatch_process.is_none() {
+        // Container VMM runs construct the dispatcher before the namespace
+        // supervisor fork. Rebind the one-task adapter to this guest-init host
+        // process before its first syscall; HVPatch installs its authoritative
+        // process binding in `initialize_root_process` above.
+        dispatcher
+            .reset_one_task_kernel_binding_for_current_process(main_tid)
+            .map_err(|error| {
+                RuntimeError::Configuration(format!(
+                    "rebind mature VMM one-task Kernel identity: {error}"
+                ))
+            })?;
+    }
     let root_linux_tid = if let Some(process) = hvpatch_process.as_ref() {
         crate::kernel::LinuxTid::for_task_leader(process.task_id())
     } else {
