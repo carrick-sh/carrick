@@ -280,17 +280,17 @@ impl ProcessContext {
 
     pub(crate) fn prepare_exec(
         &self,
-        tid: crate::kernel::LinuxTid,
+        context: &crate::kernel::KernelContext,
     ) -> Result<PreparedProcessExec, String> {
-        let context = self
-            .context_for_linux_tid(tid)
-            .map_err(|error| error.to_string())?;
+        if context.task().key() != self.task_key() {
+            return Err("exec context belongs to another HVPatch task generation".to_owned());
+        }
         let current_backend = std::sync::Arc::clone(&self.mm_backend.read());
         let backend = current_backend.exec_observer();
         let kernel_backend: std::sync::Arc<dyn crate::kernel::MmBackend> = backend.clone();
         let kernel = self
             .kernel_graph()
-            .prepare_exec_with_mm_backend(&context, kernel_backend, None)
+            .prepare_exec_with_mm_backend(context, kernel_backend, None)
             .map_err(|error| error.to_string())?;
         let old_vmas = current_backend
             .prepare_vma_freeze(std::time::Instant::now() + std::time::Duration::from_secs(1))
@@ -902,13 +902,20 @@ where
         env.iter().map(|value| value.as_bytes().to_vec()).collect(),
     );
     let file = std::fs::read(path).map_err(AddressSpaceError::Io)?;
-    let image = AddressSpace::load_elf_bytes_with_reader(&file, &|interpreter| {
-        dispatcher
-            .read_exec_file(interpreter)
-            .or_else(|| std::fs::read(interpreter).ok())
-    })?
-    .with_vdso_auxv(crate::runtime::vdso_enabled_for_debug())
-    .with_linux_initial_stack_page_size(argv, env, PAGE_SIZE)?;
+    let launch_context = dispatcher.capture_one_task_context().map_err(|error| {
+        RuntimeError::Unsupported(format!("capture HVPatch launch Kernel context: {error}"))
+    })?;
+    let loaded = dispatcher.with_kernel_credentials(&launch_context, || {
+        AddressSpace::load_elf_bytes_with_reader(&file, &|interpreter| {
+            dispatcher
+                .read_exec_file(interpreter)
+                .or_else(|| std::fs::read(interpreter).ok())
+        })
+    });
+    drop(launch_context);
+    let image = loaded?
+        .with_vdso_auxv(crate::runtime::vdso_enabled_for_debug())
+        .with_linux_initial_stack_page_size(argv, env, PAGE_SIZE)?;
     finish_hvpatch_image(image, dispatcher, max_traps, debug_state_path)
 }
 
@@ -1187,9 +1194,7 @@ mod tests {
             std::time::Instant::now() + std::time::Duration::from_secs(1),
         )
         .expect("old backend snapshot");
-        let mut prepared = process
-            .prepare_exec(root.thread().key().tid)
-            .expect("prepare exec observer");
+        let mut prepared = process.prepare_exec(&root).expect("prepare exec observer");
         let replacement_mm = prepared.replacement_mm_id();
         assert_ne!(old_mm, replacement_mm);
         let stage1_root = old_snapshot.binding.stage1_root.gpa().raw() + 0x4000;
@@ -1271,9 +1276,7 @@ mod tests {
         }]);
         process.bind_vma_source(dispatcher.vma_snapshot_source());
         let backend = std::sync::Arc::clone(&process.mm_backend.read());
-        let prepared = process
-            .prepare_exec(root.thread().key().tid)
-            .expect("prepare exec observer");
+        let prepared = process.prepare_exec(&root).expect("prepare exec observer");
 
         dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
             start: 0x5000,
@@ -1321,9 +1324,7 @@ mod tests {
         }]);
         process.bind_vma_source(dispatcher.vma_snapshot_source());
         let backend = std::sync::Arc::clone(&process.mm_backend.read());
-        let prepared = process
-            .prepare_exec(root.thread().key().tid)
-            .expect("prepare exec observer");
+        let prepared = process.prepare_exec(&root).expect("prepare exec observer");
         drop(prepared);
 
         dispatcher.set_address_space_regions(vec![crate::vfs::ProcMapsEntry {
@@ -1419,7 +1420,7 @@ mod tests {
         child.bind_vma_source(test_vma_source());
 
         let leader_tid = crate::kernel::LinuxTid::for_task_leader(child_id);
-        let prepared_exec = child.prepare_exec(leader_tid).unwrap();
+        let prepared_exec = child.prepare_exec(&child_context).unwrap();
         let committed = child
             .commit_exec(prepared_exec, stage1_root, test_vma_source())
             .unwrap();
@@ -1457,7 +1458,7 @@ mod tests {
         let sibling_tid = sibling.context().thread().key().tid;
         let stage1_root = process.mm_binding().unwrap().stage1_root.gpa().raw();
 
-        let prepared = process.prepare_exec(sibling_tid).unwrap();
+        let prepared = process.prepare_exec(sibling.context()).unwrap();
         let committed = process
             .commit_exec(prepared, stage1_root, test_vma_source())
             .unwrap();

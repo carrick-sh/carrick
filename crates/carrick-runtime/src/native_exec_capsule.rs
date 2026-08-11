@@ -349,6 +349,7 @@ pub(crate) fn begin_pid_probe() -> anyhow::Result<()> {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn begin_guest_exec(
     dispatcher: &crate::dispatch::SyscallDispatcher,
+    kernel_context: &crate::kernel::KernelContext,
     image: &crate::memory::AddressSpace,
     relative_relocations: &[crate::native_prepared_image::NativeRelativeRelocation],
     exec_backing: Option<crate::native_prepared_image::PreparedExecutableBacking>,
@@ -382,7 +383,7 @@ pub(crate) fn begin_guest_exec(
         .snapshot_native_reexec_fd_table()
         .map_err(|error| anyhow::anyhow!("native guest exec fd table is ineligible: {error}"))?;
     let xsig = snapshot_xsig()?;
-    let process_state = dispatcher.snapshot_native_reexec_process_state();
+    let process_state = dispatcher.snapshot_native_reexec_process_state(kernel_context);
     let bind_mounts = dispatcher.snapshot_native_reexec_bind_mounts();
     let kernel_arena = carrick_kernel::arena::KernelArena::global()
         .reexec_authority()

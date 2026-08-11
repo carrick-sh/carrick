@@ -231,23 +231,14 @@ const _: () = assert!(
     (LINUX_SYSCALL_MAILBOX_BASE - LINUX_KERNEL_REGION_BASE) + LINUX_SYSCALL_MAILBOX_ARENA_SIZE
         <= 0x20_0000
 );
-// Field byte offsets within the identity page (one little-endian u32 each).
+// Field byte offsets within the per-process identity page (one little-endian
+// u32 each). Credentials are deliberately absent: Linux credentials may diverge
+// per thread, while this page is shared by every vCPU in the process.
 pub const IDENTITY_OFF_PID: u64 = 0x00;
-pub const IDENTITY_OFF_UID: u64 = 0x04;
-pub const IDENTITY_OFF_EUID: u64 = 0x08;
-pub const IDENTITY_OFF_GID: u64 = 0x0C;
-pub const IDENTITY_OFF_EGID: u64 = 0x10;
-pub const IDENTITY_OFF_SHIM_ENABLED: u64 = 0x14;
-// Linux aarch64 syscall numbers serviced by the EL1 identity fast path, paired
-// with the page offset holding the answer. Pure per-process register reads with
-// no host involvement (see docs/syscall-shim-design.md).
-pub const IDENTITY_SYSCALLS: &[(u16, u64)] = &[
-    (172, IDENTITY_OFF_PID),  // getpid
-    (174, IDENTITY_OFF_UID),  // getuid
-    (175, IDENTITY_OFF_EUID), // geteuid
-    (176, IDENTITY_OFF_GID),  // getgid
-    (177, IDENTITY_OFF_EGID), // getegid
-];
+pub const IDENTITY_OFF_SHIM_ENABLED: u64 = 0x04;
+// Linux aarch64 syscalls serviced by the EL1 per-process fast path. Per-thread
+// credentials must trap through the captured KernelContext dispatch path.
+pub const IDENTITY_SYSCALLS: &[(u16, u64)] = &[(172, IDENTITY_OFF_PID)];
 /// Linux aarch64 `gettid` (178). Unlike the per-process identity reads it is
 /// per-thread, so the EL1 fast path reads it from `CONTEXTIDR_EL1` — which carrick
 /// sets per vCPU to that thread's guest-visible tid — instead of the shared
@@ -4896,6 +4887,13 @@ mod el1_shim_tests {
         assert_eq!(
             page_seen, expected,
             "page-read handlers must be exactly the identity syscalls"
+        );
+        assert_eq!(page_seen, vec![(172, IDENTITY_OFF_PID)]);
+        assert!(
+            [174_u16, 175, 176, 177]
+                .into_iter()
+                .all(|nr| !page_seen.iter().any(|(seen, _)| *seen == nr)),
+            "per-thread credential syscalls must trap through Kernel dispatch"
         );
         assert_eq!(
             sysreg_seen,

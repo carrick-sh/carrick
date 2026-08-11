@@ -166,6 +166,7 @@ where
     pub(super) fn handle_fork(
         &mut self,
         kernel: &Kernel,
+        kernel_context: &crate::kernel::KernelContext,
         engine: &mut E,
         request: ForkRequest,
     ) -> Result<Option<i64>, RuntimeError> {
@@ -186,6 +187,7 @@ where
         if engine.supports_in_process_fork() {
             return self.handle_in_process_fork(
                 kernel,
+                kernel_context,
                 engine,
                 ForkRequest {
                     flags,
@@ -731,7 +733,7 @@ where
                     // execve'd or exited. Its child-side identity stamp therefore
                     // overwrote the shared EL1 shim identity page; restore the
                     // parent's getpid/get*id fast-path values before resuming it.
-                    stamp_identity_page(engine, &kernel.dispatcher);
+                    stamp_identity_page(engine, &kernel.dispatcher, kernel_context);
                     crate::probes::fork_lifecycle(
                         0,
                         9,
@@ -846,9 +848,20 @@ where
                 carrick_hal::vcpu_sched::set_current_lease(
                     carrick_hal::vcpu_sched::global().acquire(self.this_tid.raw() as u64),
                 );
-                // Re-stamp identity + tid: the child's pid changed and the vCPU was
-                // rebuilt.
-                stamp_identity_page(engine, &kernel.dispatcher);
+                kernel.dispatcher.proc_after_fork_child();
+                let child_context = kernel
+                    .dispatcher
+                    .reset_one_task_kernel_binding_for_current_process(
+                        kernel_context,
+                        self.this_tid,
+                    )
+                    .unwrap_or_else(|error| {
+                        tracing::error!(%error, "rebind host-fork child Kernel authority");
+                        std::process::abort();
+                    });
+                self.linux_tid = child_context.thread().key().tid;
+                // Re-stamp from the exact child generation published above.
+                stamp_identity_page(engine, &kernel.dispatcher, &child_context);
                 if let Some(addr) = parent_tid_addr {
                     let tid = (crate::namespace::pid::self_ns_pid() as i32).to_le_bytes();
                     let _ = engine.write_bytes(addr, &tid);
@@ -858,7 +871,6 @@ where
                     let _ = engine.write_bytes(addr, &tid);
                 }
                 stamp_guest_tid(engine, self.this_tid, &self.registry);
-                kernel.dispatcher.proc_after_fork_child();
                 kernel.dispatcher.sysv_after_fork_child();
                 self.waiter = crate::io_wait::ThreadWaiter::new(self.this_tid);
                 let handle: Box<dyn carrick_hal::VcpuKickDyn> = Box::new(engine.kick_handle());
@@ -880,6 +892,7 @@ where
     fn handle_in_process_fork(
         &mut self,
         kernel: &Kernel,
+        parent_context: &crate::kernel::KernelContext,
         engine: &mut E,
         request: ForkRequest,
     ) -> Result<Option<i64>, RuntimeError> {
@@ -999,20 +1012,8 @@ where
             }
         };
         let shares_mm = clone_plan.mm() == crate::kernel::CloneObjectMode::Share;
-        let parent_context = match parent_process.context_for_linux_tid(self.linux_tid) {
-            Ok(context) => context,
-            Err(error) => {
-                if quiesced {
-                    process_barrier.end_quiesce();
-                }
-                process_barrier.end_fork();
-                return Err(RuntimeError::Configuration(format!(
-                    "capture authoritative hvpatch parent: {error}"
-                )));
-            }
-        };
         let reservation = match parent_process.kernel_graph().reserve_fork(
-            &parent_context,
+            parent_context,
             clone_plan,
             format!("hvpatch-child-of-{}", parent_process.pid()),
             None,
@@ -1248,7 +1249,11 @@ where
             Result<carrick_hal::FrameInventoryCommit<()>, String>,
         >(1);
         let (start_tx, start_rx) = std::sync::mpsc::sync_channel::<
-            Option<(Arc<KernelState>, crate::hvpatch::ProcessContext)>,
+            Option<(
+                Arc<KernelState>,
+                crate::hvpatch::ProcessContext,
+                crate::kernel::KernelContext,
+            )>,
         >(1);
         emit_fork_runtime_stage(
             carrick_observability::probes::HvpatchForkRuntimeStagePhase::RuntimeState,
@@ -1283,14 +1288,19 @@ where
                 if ready_tx.send(Ok(child_inventory_commit)).is_err() {
                     return;
                 }
-                let Ok(Some((child_kernel, _child_process))) = start_rx.recv() else {
+                let Ok(Some((child_kernel, _child_process, child_context))) = start_rx.recv() else {
                     child_engine.destroy_vcpu_on_thread_exit();
                     return;
                 };
                 let handle: Box<dyn carrick_hal::VcpuKickDyn> =
                     Box::new(child_engine.kick_handle());
                 child_kicker.register(child_tid, handle);
-                stamp_identity_page(&mut child_engine, &child_kernel.dispatcher);
+                stamp_identity_page(
+                    &mut child_engine,
+                    &child_kernel.dispatcher,
+                    &child_context,
+                );
+                drop(child_context);
                 stamp_guest_tid(&child_engine, child_tid, &child_registry);
                 match run_vcpu_until_exit(
                     Arc::clone(&child_kernel),
@@ -1479,7 +1489,11 @@ where
         child_kernel.register_hvpatch_runtime_endpoint(child_runtime_futex, child_runtime_kicker);
         kernel.enroll_hvpatch_process_thread(handle);
         if start_tx
-            .send(Some((Arc::clone(&child_kernel), child_process.clone())))
+            .send(Some((
+                Arc::clone(&child_kernel),
+                child_process.clone(),
+                child_context,
+            )))
             .is_err()
         {
             // Publication is already authoritative and cannot be represented to

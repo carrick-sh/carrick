@@ -276,7 +276,7 @@ AIO interface, #0–4/#292).
 |---|---|---|---|---|
 | `uname`, `sysinfo` | 160,179 | Emulated (Full) | host info + synthetic Linux fields | `uname` reports the macOS host short name as the guest hostname (`--net=host` behavior; UTS-ns groundwork). |
 | `getrandom` | 278 | Emulated (Full) | Darwin RNG | |
-| `getuid`/`geteuid`/`getgid`/`getegid`, `setuid`/`setgid`/`setre*`/`setres*`/`setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `getresuid`/`getresgid` | 174–177,146,144,145,143,147,149,151,152,158,159,148,150 | Emulated (Partial) | per-process credential model | `setfsuid`/`setfsgid` return the previous value; cred changes published to `/tmp/carrick-cred-<pid>` for cross-process kill checks. |
+| `getuid`/`geteuid`/`getgid`/`getegid`, `setuid`/`setgid`/`setre*`/`setres*`/`setfsuid`/`setfsgid`, `getgroups`/`setgroups`, `getresuid`/`getresgid` | 174–177,146,144,145,143,147,149,151,152,158,159,148,150 | Emulated (Partial) | immutable per-thread Kernel credentials | Credential mutations publish COW `ThreadResources`; fork copies values, exec retains the caller, and supplementary groups are authoritative. The mature one-task adapter publishes only its leader euid to `/tmp/carrick-cred-<pid>` for legacy cross-host-process checks. |
 | `getrlimit`/`setrlimit`/`prlimit64` | 163,164,261 | Emulated (Partial) | per-process rlimit state | `prlimit64` (#261) emulated; `getrlimit`/`setrlimit` (#163/#164) are `Deferred` in the table but exercised through the `prlimit64`/`rlimitroundtrip` paths; invalid resource (≥16) → EINVAL. |
 | `umask`, `sethostname`/`setdomainname`, `vhangup` | 166,161,162,58 | Emulated (Partial) | per-process / host | `sethostname` → EPERM (correct under `--net=host`). |
 

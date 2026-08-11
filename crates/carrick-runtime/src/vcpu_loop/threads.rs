@@ -446,6 +446,7 @@ where
     pub(super) fn spawn_clone_thread(
         &self,
         kernel: &Kernel,
+        parent_context: &crate::kernel::KernelContext,
         engine: &mut E,
         stack: u64,
         tls: Option<u64>,
@@ -484,16 +485,9 @@ where
                     Ok(plan) => plan,
                     Err(_) => return Ok(CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EINVAL)),
                 };
-                let parent = process
-                    .context_for_linux_tid(self.linux_tid)
-                    .map_err(|error| {
-                        RuntimeError::Configuration(format!(
-                            "capture authoritative hvpatch thread parent: {error}"
-                        ))
-                    })?;
                 let reservation = process
                     .kernel_graph()
-                    .reserve_thread_clone_eventually(&parent, plan)
+                    .reserve_thread_clone_eventually(parent_context, plan)
                     .map_err(|error| {
                         RuntimeError::Configuration(format!(
                             "reserve authoritative hvpatch thread: {error}"
@@ -509,7 +503,10 @@ where
                 (linux_tid, tid, Some(prepared))
             } else {
                 let tid = self.registry.register_child(clear_child_tid_addr);
-                let linux_tid = match kernel.dispatcher.register_one_task_thread(tid) {
+                let linux_tid = match kernel
+                    .dispatcher
+                    .register_one_task_thread(parent_context, tid)
+                {
                     Ok(linux_tid) => linux_tid,
                     Err(error) => {
                         self.registry.exit(tid);

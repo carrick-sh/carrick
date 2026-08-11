@@ -201,7 +201,6 @@ use crate::linux_abi::{
     LINUX_CMSG_ALIGN,
     LINUX_CMSGHDR_LEN,
     LINUX_DEFAULT_TIMERSLACK_NS,
-    LINUX_DEFAULT_UMASK,
     LINUX_DIRENT64_HEADER_SIZE,
     LINUX_DT_CHR,
     LINUX_DT_DIR,
@@ -2193,6 +2192,11 @@ impl Drop for HostAliasDispatchGuard {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct CapturedCredentialAuthority {
+    credentials: Arc<crate::kernel::Credentials>,
+}
+
 pub struct SyscallDispatcher {
     /// Generation-safe task adapter used to capture the mandatory kernel
     /// context at each backend dispatch boundary. HVPatch replaces the initial
@@ -2225,11 +2229,6 @@ pub struct SyscallDispatcher {
     /// Owned process subsystem state (executable path, personality,
     /// dumpable flag, task comm name). See [`proc::ProcState`].
     proc: Mutex<proc::ProcState>,
-    /// Owned credentials subsystem state (uids/gids + umask). See
-    /// [`creds::CredState`]. This is internally locked so credential syscalls
-    /// can run through shared threaded dispatch without the legacy dispatcher
-    /// lock.
-    creds: Mutex<creds::CredState>,
     /// Owned signal subsystem state (handlers, mask, pending set, alt
     /// stack). See [`signal::SignalState`]. This is internally locked so
     /// signal syscalls and runtime delivery can run through shared threaded
@@ -2280,13 +2279,6 @@ pub struct SyscallDispatcher {
     /// execve staging consults this to preserve backend-specific image policy
     /// (HvPatch must repatch replacement text before internal HVF pages exist).
     execution_backend: crate::page_profile::ExecutionBackend,
-    /// The supplementary group set installed by `setgroups(2)`, or `None` if the
-    /// guest never called it (then `getgroups` falls back to the /etc/group-
-    /// derived membership for `id(1)` compatibility). `setgroups` replaces this
-    /// whole set; `getgroups` returns it verbatim. Process-wide; a `libc::fork`
-    /// child inherits it via the memory copy and it survives `execve`
-    /// (matching Linux — CPython subprocess `extra_groups=` sets it pre-exec).
-    setgroups_override: Mutex<Option<Vec<u32>>>,
     /// Set by syscall handlers that make process-directed async signal delivery
     /// observable while guest userspace is spinning. The threaded runtime drains
     /// this after completing the syscall and starts the signal pump before
@@ -2509,8 +2501,9 @@ mod kernel_context_tests {
     fn one_task_adapter_registers_explicit_linux_tid_for_backend_thread() {
         let dispatcher = SyscallDispatcher::new();
         let registry_id = crate::thread::ThreadId::synthetic_for_tests(91_337);
+        let parent = dispatcher.capture_one_task_context().unwrap();
         let linux_tid = dispatcher
-            .register_one_task_thread(registry_id)
+            .register_one_task_thread(&parent, registry_id)
             .expect("register one-task thread");
         let context = dispatcher
             .capture_kernel_context(linux_tid)
@@ -2522,6 +2515,105 @@ mod kernel_context_tests {
             .exit_one_task_thread(linux_tid)
             .expect("retire one-task thread");
         assert!(dispatcher.capture_kernel_context(linux_tid).is_err());
+    }
+
+    #[test]
+    fn one_task_thread_registration_copies_the_exact_nonleader_credentials() {
+        let dispatcher = SyscallDispatcher::new();
+        let leader = dispatcher.capture_one_task_context().unwrap();
+        let sibling_tid = dispatcher
+            .register_one_task_thread(
+                &leader,
+                crate::thread::ThreadId::synthetic_for_tests(91_340),
+            )
+            .expect("register sibling");
+        let sibling = dispatcher.capture_kernel_context(sibling_tid).unwrap();
+        let sibling = sibling
+            .kernel()
+            .update_credentials(&sibling, |credentials| {
+                credentials.set_fsuid(7_777);
+                credentials.set_supplementary_groups(vec![77]);
+            })
+            .expect("diverge sibling credentials");
+
+        let child_tid = dispatcher
+            .register_one_task_thread(
+                &sibling,
+                crate::thread::ThreadId::synthetic_for_tests(91_341),
+            )
+            .expect("register from nonleader");
+        let child = dispatcher.capture_kernel_context(child_tid).unwrap();
+
+        assert_eq!(leader.resources().credentials().fsuid(), 0);
+        assert_eq!(child.resources().credentials().fsuid(), 7_777);
+        assert_eq!(
+            child
+                .resources()
+                .credentials()
+                .supplementary_groups_override(),
+            Some([77].as_slice())
+        );
+    }
+
+    #[test]
+    fn lifecycle_credential_scope_uses_the_exact_nonleader_context() {
+        let dispatcher = SyscallDispatcher::new();
+        let leader = dispatcher.capture_one_task_context().unwrap();
+        let sibling_tid = dispatcher
+            .register_one_task_thread(
+                &leader,
+                crate::thread::ThreadId::synthetic_for_tests(91_342),
+            )
+            .expect("register sibling");
+        let sibling = dispatcher.capture_kernel_context(sibling_tid).unwrap();
+        let sibling = sibling
+            .kernel()
+            .update_credentials(&sibling, |credentials| {
+                credentials.set_uid_triple(71, 72, 73);
+            })
+            .expect("diverge sibling credentials");
+
+        let observed =
+            dispatcher.with_kernel_credentials(&sibling, || dispatcher.cred_snapshot().euid());
+
+        assert_eq!(observed, 72);
+        assert_eq!(leader.resources().credentials().euid(), 0);
+    }
+
+    #[test]
+    fn one_task_rebind_copies_complete_credential_values() {
+        let dispatcher = SyscallDispatcher::new();
+        let original = dispatcher
+            .capture_one_task_context()
+            .expect("original context");
+        let original = original
+            .kernel()
+            .update_credentials(&original, |credentials| {
+                credentials.seed_identity(1001, 2001);
+                credentials.set_fsuid(1002);
+                credentials.set_fsgid(2002);
+                credentials.set_umask(0o077);
+                credentials.set_supplementary_groups(vec![9, 10]);
+            })
+            .expect("seed inherited credentials");
+        let old_kernel = Arc::clone(original.kernel());
+
+        let rebound = dispatcher
+            .reset_one_task_kernel_binding_for_current_process(
+                &original,
+                crate::thread::ThreadId::synthetic_for_tests(91_338),
+            )
+            .expect("rebind one-task authority");
+        let credentials = rebound.resources().credentials();
+
+        assert!(!Arc::ptr_eq(&old_kernel, rebound.kernel()));
+        assert_eq!((credentials.ruid(), credentials.rgid()), (1001, 2001));
+        assert_eq!((credentials.fsuid(), credentials.fsgid()), (1002, 2002));
+        assert_eq!(credentials.umask(), 0o077);
+        assert_eq!(
+            credentials.supplementary_groups_override(),
+            Some([9, 10].as_slice())
+        );
     }
 }
 
@@ -2558,6 +2650,9 @@ impl SyscallDispatcher {
     pub(crate) fn bind_hvpatch_process(&self, process: crate::hvpatch::ProcessContext) {
         process.bind_vma_source(self.vma_snapshot_source());
         *self.kernel_binding.write() = process.task_binding();
+        // HVPatch multiplexes Linux tasks inside one host PID, so the mature
+        // one-task adapter's host-PID credential projection is inapplicable.
+        crate::cred_ipc::unpublish();
         let mut proc = self.proc.lock();
         proc.virtual_pid = Some(process.pid() as u32);
         proc.hvpatch_process = Some(process);
@@ -2577,34 +2672,52 @@ impl SyscallDispatcher {
         self.kernel_binding.read().capture(tid)
     }
 
+    /// Run lifecycle work with credentials from the already captured syscall
+    /// boundary. This extends that exact context across deferred exec loading;
+    /// it never consults the current registry binding or substitutes a leader.
+    pub(crate) fn with_kernel_credentials<R>(
+        &self,
+        context: &crate::kernel::KernelContext,
+        operation: impl FnOnce() -> R,
+    ) -> R {
+        creds::with_captured_credentials(context, operation)
+    }
+
+    pub(crate) fn retain_kernel_credentials(
+        &self,
+        context: &crate::kernel::KernelContext,
+    ) -> CapturedCredentialAuthority {
+        CapturedCredentialAuthority {
+            credentials: context.resources().credentials(),
+        }
+    }
+
+    pub(crate) fn with_retained_kernel_credentials<R>(
+        &self,
+        authority: &CapturedCredentialAuthority,
+        operation: impl FnOnce() -> R,
+    ) -> R {
+        creds::with_credentials(Arc::clone(&authority.credentials), operation)
+    }
+
     pub(crate) fn prepare_one_task_kernel_exec(
         &self,
-        tid: crate::kernel::LinuxTid,
+        context: &crate::kernel::KernelContext,
     ) -> Result<crate::kernel::PreparedExec, String> {
-        let context = self
-            .capture_kernel_context(tid)
-            .map_err(|error| error.to_string())?;
         context
             .kernel()
-            .prepare_exec(&context, None)
+            .prepare_exec(context, None)
             .map_err(|error| error.to_string())
     }
 
-    #[cfg(all(
-        any(target_os = "freebsd", target_os = "netbsd"),
-        target_arch = "x86_64"
-    ))]
     pub(crate) fn prepare_one_task_kernel_exec_with_registry_id(
         &self,
-        tid: crate::kernel::LinuxTid,
+        context: &crate::kernel::KernelContext,
         registry_id: crate::thread::ThreadId,
     ) -> Result<crate::kernel::PreparedExec, String> {
-        let context = self
-            .capture_kernel_context(tid)
-            .map_err(|error| error.to_string())?;
         context
             .kernel()
-            .prepare_exec_with_registry_id(&context, registry_id, None)
+            .prepare_exec_with_registry_id(context, registry_id, None)
             .map_err(|error| error.to_string())
     }
 
@@ -2617,24 +2730,33 @@ impl SyscallDispatcher {
             .commit_exec(prepared, None)
             .map_err(|error| error.to_string())?;
         *self.kernel_binding.write() = context.task_binding();
+        self.publish_external_credential_projection(&context, &context.resources().credentials());
         Ok(context)
     }
 
     pub(crate) fn reset_one_task_kernel_binding_for_current_process(
         &self,
+        inherited: &crate::kernel::KernelContext,
         registry_id: crate::thread::ThreadId,
     ) -> Result<crate::kernel::KernelContext, String> {
         let observed_pid = i32::try_from(std::process::id())
             .map_err(|_| "host PID does not fit Linux task identity".to_owned())?;
+        let inherited_credentials = inherited.resources().credentials();
         let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
             observed_pid,
             registry_id,
             "one-task-fork-child-adapter".to_owned(),
         )
         .map_err(|error| error.to_string())?;
-        let (_, context) =
+        let (kernel, context) =
             crate::kernel::Kernel::bootstrap_root(bootstrap).map_err(|error| error.to_string())?;
+        let context = kernel
+            .update_credentials(&context, |credentials| {
+                credentials.copy_values_from(&inherited_credentials);
+            })
+            .map_err(|error| error.to_string())?;
         *self.kernel_binding.write() = context.task_binding();
+        self.publish_external_credential_projection(&context, &context.resources().credentials());
         Ok(context)
     }
 
@@ -2647,12 +2769,9 @@ impl SyscallDispatcher {
 
     pub(crate) fn register_one_task_thread(
         &self,
+        parent: &crate::kernel::KernelContext,
         registry_id: crate::thread::ThreadId,
     ) -> Result<crate::kernel::LinuxTid, crate::kernel::KernelOperationError> {
-        let binding = self.kernel_binding.read().clone();
-        let leader = binding
-            .capture(crate::kernel::LinuxTid::for_task_leader(binding.task_id()))
-            .map_err(|_| crate::kernel::KernelOperationError::UnknownTask(binding.task_id()))?;
         let flags = carrick_abi::LinuxCloneFlags::VM
             | carrick_abi::LinuxCloneFlags::FS
             | carrick_abi::LinuxCloneFlags::FILES
@@ -2660,9 +2779,9 @@ impl SyscallDispatcher {
             | carrick_abi::LinuxCloneFlags::THREAD;
         let plan = crate::kernel::ClonePlan::from_flags(flags)
             .map_err(crate::kernel::KernelOperationError::ClonePlan)?;
-        binding
+        parent
             .kernel()
-            .reserve_thread_clone(&leader, plan, None)?
+            .reserve_thread_clone(parent, plan, None)?
             .prepare(registry_id)?
             .commit()?
             .into_context()
@@ -2734,7 +2853,6 @@ impl SyscallDispatcher {
                     .lock()
                     .fork_clone(parent_guest_pid, child_guest_pid),
             ),
-            creds: Mutex::new(*self.creds.lock()),
             signal: Mutex::new(self.signal.lock().fork_clone(parent_tid, child_tid)),
             signal_tid_pending_hint: std::sync::atomic::AtomicU64::new(0),
             signal_process_pending_hint: std::sync::atomic::AtomicU64::new(0),
@@ -2745,7 +2863,6 @@ impl SyscallDispatcher {
             network: Arc::clone(&self.network),
             page_geometry: self.page_geometry,
             execution_backend: self.execution_backend,
-            setgroups_override: Mutex::new(self.setgroups_override.lock().clone()),
             signal_pump_requested: std::sync::atomic::AtomicBool::new(false),
             async_signal_wake_owner: self.async_signal_wake_owner,
             exec_host_fs_fallback: self.exec_host_fs_fallback,
@@ -2813,7 +2930,7 @@ impl SyscallDispatcher {
             reporter,
             thread,
         };
-        let outcome = handler(self, &mut ctx);
+        let outcome = creds::with_captured_credentials(kernel, || handler(self, &mut ctx));
         // Single choke point for the fork-coherent resolve cache: a structural
         // namespace mutation (mkdirat/unlinkat/symlinkat/linkat/renameat/
         // renameat2/mknodat) can change how OTHER paths resolve, so bump the
@@ -2853,7 +2970,6 @@ impl SyscallDispatcher {
             mem: Arc::new(mem::MemAuthority::new(mem::MemState::new())),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
             proc: Mutex::new(proc::ProcState::new()),
-            creds: Mutex::new(creds::CredState::new()),
             signal: Mutex::new(signal::SignalState::new()),
             signal_tid_pending_hint: std::sync::atomic::AtomicU64::new(0),
             signal_process_pending_hint: std::sync::atomic::AtomicU64::new(0),
@@ -2870,7 +2986,6 @@ impl SyscallDispatcher {
                 native_profile: None,
             },
             execution_backend: crate::page_profile::ExecutionBackend::Vmm,
-            setgroups_override: Mutex::new(None),
             signal_pump_requested: std::sync::atomic::AtomicBool::new(false),
             async_signal_wake_owner: AsyncSignalWakeOwner::SignalPump,
             // Default: bare run-elf boot — allow the host-fs execve fallback.
@@ -3187,7 +3302,19 @@ impl SyscallDispatcher {
     /// Seed the guest's initial credentials (`docker run --user` / image `USER`).
     /// Applied once before the guest starts; defaults to (0, 0) = root.
     pub fn set_credentials(&self, uid: u32, gid: u32) {
-        self.creds.lock().seed_identity(uid, gid);
+        let context = self.capture_one_task_context().unwrap_or_else(|error| {
+            tracing::error!(%error, "cannot capture launch credential context");
+            std::process::abort();
+        });
+        let credentials = self
+            .update_credentials(&context, |credentials| {
+                credentials.seed_identity(uid, gid);
+            })
+            .unwrap_or_else(|errno| {
+                tracing::error!(errno = errno.get(), "publish launch Kernel credentials");
+                std::process::abort();
+            });
+        self.publish_external_credential_projection(&context, &credentials);
     }
 
     /// Record whether the guest's native ISA is x86_64 so `uname(2)` (and other
@@ -3543,8 +3670,9 @@ impl SyscallDispatcher {
     #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
     pub(crate) fn snapshot_native_reexec_process_state(
         &self,
+        context: &crate::kernel::KernelContext,
     ) -> crate::native_exec_capsule::NativeReexecProcessStateV1 {
-        let credentials = self.cred_snapshot();
+        let credentials = self.credentials_from_context(context);
         let rlimit_overrides = self
             .proc
             .lock()
@@ -3569,7 +3697,9 @@ impl SyscallDispatcher {
                 fsgid: credentials.fsgid,
                 umask: credentials.umask,
             },
-            supplementary_groups_override: self.setgroups_override.lock().clone(),
+            supplementary_groups_override: credentials
+                .supplementary_groups_override()
+                .map(<[u32]>::to_vec),
             ignored_signals: self.native_reexec_ignored_signals().raw(),
             nofile_soft: self
                 .io
@@ -3588,24 +3718,37 @@ impl SyscallDispatcher {
     #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
     pub(crate) fn restore_native_reexec_process_state(
         &mut self,
+        context: &crate::kernel::KernelContext,
         state: &crate::native_exec_capsule::NativeReexecProcessStateV1,
-    ) {
+    ) -> crate::kernel::KernelContext {
         // These affect the very next syscall/exec boundary, so restore them
         // before any other reconstructed process state can be observed.
         self.apply_seccomp_policy(state.seccomp_policy);
         let credentials = state.credentials;
-        *self.creds.lock() = creds::CredState {
-            ruid: credentials.ruid,
-            euid: credentials.euid,
-            suid: credentials.suid,
-            rgid: credentials.rgid,
-            egid: credentials.egid,
-            sgid: credentials.sgid,
-            fsuid: credentials.fsuid,
-            fsgid: credentials.fsgid,
-            umask: credentials.umask,
-        };
-        *self.setgroups_override.lock() = state.supplementary_groups_override.clone();
+        let restored_context = context
+            .kernel()
+            .update_credentials(context, |current| {
+                let restored = crate::kernel::Credentials::from_values(
+                    current.id(),
+                    credentials.ruid,
+                    credentials.euid,
+                    credentials.suid,
+                    credentials.rgid,
+                    credentials.egid,
+                    credentials.sgid,
+                    credentials.fsuid,
+                    credentials.fsgid,
+                    credentials.umask,
+                );
+                current.copy_values_from(&restored);
+                if let Some(groups) = state.supplementary_groups_override.clone() {
+                    current.set_supplementary_groups(groups);
+                }
+            })
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, "restore native reexec Kernel credentials");
+                std::process::abort();
+            });
         self.io
             .nofile_soft
             .store(state.nofile_soft, std::sync::atomic::Ordering::Relaxed);
@@ -3623,6 +3766,11 @@ impl SyscallDispatcher {
         self.restore_native_reexec_ignored_signals(carrick_abi::SigSet::from_raw(
             state.ignored_signals,
         ));
+        self.publish_external_credential_projection(
+            &restored_context,
+            &restored_context.resources().credentials(),
+        );
+        restored_context
     }
 
     #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
@@ -11474,9 +11622,15 @@ mod native_reexec_fd_tests {
             ptrace_traceme: true,
         };
         let mut resumed = SyscallDispatcher::new();
-        resumed.restore_native_reexec_process_state(&state);
+        let restore_context = resumed.capture_one_task_context().unwrap();
+        let snapshot_context =
+            resumed.restore_native_reexec_process_state(&restore_context, &state);
+        drop(restore_context);
 
-        assert_eq!(resumed.snapshot_native_reexec_process_state(), state);
+        assert_eq!(
+            resumed.snapshot_native_reexec_process_state(&snapshot_context),
+            state
+        );
     }
 
     #[test]

@@ -12614,7 +12614,7 @@ mod tests {
 
         let mut dispatcher = SyscallDispatcher::new();
         dispatcher.set_fs_backend(Box::new(backend));
-        dispatcher.creds.lock().seed_identity(1000, 1000);
+        dispatcher.set_credentials(1000, 1000);
         let reporter = CompatReporter::default();
         let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
         memory.write_bytes(0x4000, b"/jail\0").unwrap();

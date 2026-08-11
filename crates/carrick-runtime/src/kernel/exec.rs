@@ -163,7 +163,7 @@ impl Kernel {
             return Err(ExecError::ForeignContext);
         }
         let transaction = self.object_ids().transaction_id()?;
-        {
+        let revision = {
             let mut state = self.registry().state.write();
             let record = state
                 .tasks
@@ -175,17 +175,21 @@ impl Kernel {
                 .ok_or(ExecError::CallerExited)?;
             if !Arc::ptr_eq(&record.task, &context.task)
                 || !Arc::ptr_eq(&caller, &context.thread)
+                || !Arc::ptr_eq(&caller.resources(), &context.resources)
+                || !Arc::ptr_eq(&record.task.shared(), &context.shared)
                 || record.revision != context.revision
             {
                 return Err(ExecError::ForeignContext);
             }
+            let revision = record.revision;
             if state.reservations.contains_key(&context.task.key().id) {
                 return Err(ExecError::TaskBusy);
             }
             state
                 .reservations
                 .insert(context.task.key().id, transaction);
-        }
+            revision
+        };
         let reservation = ExecReservation {
             kernel: self.clone(),
             task: context.task.key(),
@@ -236,7 +240,7 @@ impl Kernel {
             guard,
             task: context.task.key(),
             caller: context.thread.key(),
-            revision: context.revision,
+            revision,
             old_mm: context.shared.mm().id(),
             shared,
             resources,

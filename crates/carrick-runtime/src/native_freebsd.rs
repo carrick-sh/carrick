@@ -7185,6 +7185,7 @@ enum Step {
     BecameForkChild {
         resume: u64,
         vfork_completion_fd: Option<i32>,
+        parent_context: crate::kernel::KernelContext,
     },
     /// A default-action fatal signal with no guest handler. A fork DESCENDANT
     /// must die BY the signal so its parent's `wait4` sees `WIFSIGNALED`; the
@@ -7199,6 +7200,7 @@ enum Step {
     /// env bytes, resets the dispatcher's memory/signal exec state and the per-
     /// thread JIT caches, and resumes at the new entry (execve does not return).
     Execve {
+        kernel_context: crate::kernel::KernelContext,
         path: String,
         argv: Vec<Vec<u8>>,
         env: Vec<Vec<u8>>,
@@ -7945,7 +7947,7 @@ fn validate_clone_thread_tid_outputs(
 fn spawn_clone_thread(
     shared: &Arc<SharedRun>,
     parent_tid: crate::thread::ThreadId,
-    parent_linux_tid: crate::kernel::LinuxTid,
+    parent_context: &crate::kernel::KernelContext,
     req: CloneThreadRequest,
     executable_registration: &ExecutableThreadRegistration,
 ) -> Result<crate::kernel::LinuxTid, CloneThreadSpawnError> {
@@ -7974,13 +7976,9 @@ fn spawn_clone_thread(
         carrick_abi::LinuxCloneFlags::from_bits_retain(req.flags),
     )
     .map_err(|_| CloneThreadSpawnError::Errno(crate::linux_abi::LINUX_EINVAL.guest_retval()))?;
-    let parent_context = shared
-        .dispatcher
-        .capture_kernel_context(parent_linux_tid)
-        .map_err(|error| CloneThreadSpawnError::Fatal(error.to_string()))?;
     let reservation = parent_context
         .kernel()
-        .reserve_thread_clone(&parent_context, clone_plan, None)
+        .reserve_thread_clone(parent_context, clone_plan, None)
         .map_err(|error| CloneThreadSpawnError::Fatal(error.to_string()))?;
     let child_linux_tid = reservation.tid();
 
@@ -8349,12 +8347,20 @@ pub(crate) fn run_static_x86_elf_bytes(
     // fork children for wait4/waitid RUSAGE_CHILDREN rollup).
     crate::guest_cpu::set_native_host_provider();
 
-    let interpreter = load_interpreter_bytes(&dispatcher, bytes).map_err(|errno| {
-        RuntimeError::Unsupported(format!(
-            "resolve native x86 PT_INTERP failed with Linux errno {}",
-            errno.get()
-        ))
+    let launch_context = dispatcher.capture_one_task_context().map_err(|error| {
+        RuntimeError::Unsupported(format!("capture native x86 launch Kernel context: {error}"))
     })?;
+    let interpreter = dispatcher
+        .with_kernel_credentials(&launch_context, || {
+            load_interpreter_bytes(&dispatcher, bytes)
+        })
+        .map_err(|errno| {
+            RuntimeError::Unsupported(format!(
+                "resolve native x86 PT_INTERP failed with Linux errno {}",
+                errno.get()
+            ))
+        })?;
+    drop(launch_context);
     let image = load_static_pie(bytes, interpreter.as_deref(), &argv, &env)?;
 
     // Publish the complete initial identity layout before a JIT mapping or
@@ -9856,6 +9862,7 @@ fn run_x86_thread(
                     Step::BecameForkChild {
                         resume: rip,
                         vfork_completion_fd: completion_fd,
+                        parent_context,
                     } => {
                         // This process is now a fork descendant; its exit must
                         // be reaped by the parent, not returned up.
@@ -9884,8 +9891,10 @@ fn run_x86_thread(
                                 tid = active.registry.main_tid();
                                 linux_tid = match active
                                     .dispatcher
-                                    .reset_one_task_kernel_binding_for_current_process(tid)
-                                {
+                                    .reset_one_task_kernel_binding_for_current_process(
+                                        &parent_context,
+                                        tid,
+                                    ) {
                                     Ok(context) => context.thread().key().tid,
                                     Err(error) => {
                                         fault_detail = Some(format!(
@@ -9894,6 +9903,7 @@ fn run_x86_thread(
                                         break;
                                     }
                                 };
+                                drop(parent_context);
                                 identity_stamp = native_x86_identity_stamp(&active, tid);
                                 host_registration.rebind_after_fork(&active, tid);
                                 if let Err(error) = executable_registration
@@ -10004,7 +10014,12 @@ fn run_x86_thread(
                         exit_code = Some(128 + signum);
                         break 'run;
                     }
-                    Step::Execve { path, argv, env } => {
+                    Step::Execve {
+                        kernel_context,
+                        path,
+                        argv,
+                        env,
+                    } => {
                         // In-process image replacement. `snapshot.rip` is the
                         // post-syscall resume the guest returns to if the exec
                         // FAILS (an error return from execve). Resolve + read +
@@ -10012,7 +10027,12 @@ fn run_x86_thread(
                         // only on success do we retire it (Linux's exec point of
                         // no return). Sibling guest threads: Linux execve kills
                         // the whole thread group, keeping only the execing task.
-                        match load_execve_image(&active.dispatcher, &path, argv) {
+                        let loaded = active
+                            .dispatcher
+                            .with_kernel_credentials(&kernel_context, || {
+                                load_execve_image(&active.dispatcher, &path, argv)
+                            });
+                        match loaded {
                             Err(errno) => {
                                 // Exec failed with the old image intact: return
                                 // the errno to the guest and resume.
@@ -10084,7 +10104,7 @@ fn run_x86_thread(
                                 let prepared_kernel_exec = match active
                                     .dispatcher
                                     .prepare_one_task_kernel_exec_with_registry_id(
-                                        linux_tid,
+                                        &kernel_context,
                                         exec_registry_tid,
                                     ) {
                                     Ok(prepared) => prepared,
@@ -10732,14 +10752,20 @@ fn service_syscall(
     // immediately after each exact fork boundary. A returned MapHostAlias
     // keeps it owned through the caller's backend commit/rollback.
     let mut alias_critical = None;
+    let kernel_context = match dispatcher.capture_kernel_context(linux_tid) {
+        Ok(context) => context,
+        Err(error) => {
+            return Step::Fault(format!("capture mandatory kernel context: {error}"));
+        }
+    };
     let outcome = match service_syscall_threaded(
         dispatcher,
+        &kernel_context,
         request,
         memory,
         reporter,
         waiter,
         tid,
-        linux_tid,
         registry,
         futex,
         &shared.exit,
@@ -10750,9 +10776,6 @@ fn service_syscall(
         Ok(o) => o,
         Err(NativeSyscallServiceError::Dispatch(error)) => {
             return Step::Fault(format!("dispatch error: {error:?}"));
-        }
-        Err(NativeSyscallServiceError::Kernel(error)) => {
-            return Step::Fault(format!("capture mandatory kernel context: {error}"));
         }
         Err(NativeSyscallServiceError::Memory(error)) => {
             return Step::Fault(format!("native identity mapping error: {error}"));
@@ -10882,6 +10905,7 @@ fn service_syscall(
             vfork,
         } => service_fork(
             shared,
+            &kernel_context,
             NativeForkRequest {
                 clone_parent,
                 parent_tid_addr,
@@ -11150,7 +11174,7 @@ fn service_syscall(
                 child_tid_addr,
                 clear_child_tid_addr,
             };
-            match spawn_clone_thread(shared, tid, linux_tid, req, executable_registration) {
+            match spawn_clone_thread(shared, tid, &kernel_context, req, executable_registration) {
                 Ok(child_tid) => {
                     snapshot.gpr[reg::RAX] = i64::from(child_tid.raw()) as u64;
                     Step::Continue(resume)
@@ -11215,7 +11239,12 @@ fn service_syscall(
         // uses for the error path (a failed exec returns errno to the guest).
         DispatchOutcome::Execve { path, argv, env } => {
             crate::probes::execve_argv(&path, &argv);
-            Step::Execve { path, argv, env }
+            Step::Execve {
+                kernel_context,
+                path,
+                argv,
+                env,
+            }
         }
         other => Step::Fault(format!(
             "native x86 driver does not service dispatch outcome {other:?} yet \
@@ -11285,7 +11314,6 @@ fn wait_x86_futex(
 #[derive(Debug)]
 enum NativeSyscallServiceError {
     Dispatch(crate::dispatch::DispatchError),
-    Kernel(crate::kernel::KernelError),
     Memory(MemoryError),
     Epoch(ExecutableEpochError),
     AliasInvariant {
@@ -11388,12 +11416,12 @@ fn with_host_wait_safe<T>(
 #[allow(clippy::too_many_arguments)]
 fn service_syscall_threaded(
     dispatcher: &SyscallDispatcher,
+    kernel_context: &crate::kernel::KernelContext,
     request: SyscallRequest,
     memory: &mut NativeIdentityMemory,
     reporter: &CompatReporter,
     waiter: &mut crate::io_wait::ThreadWaiter,
     tid: crate::thread::ThreadId,
-    linux_tid: crate::kernel::LinuxTid,
     registry: &crate::thread::ThreadRegistry,
     futex: &crate::thread::FutexTable,
     exit: &ExitState,
@@ -11436,9 +11464,6 @@ fn service_syscall_threaded(
     let mut poll_deadline: Option<std::time::Instant> = None;
     let mut sleep_deadline: Option<std::time::Instant> = None;
     let alias_syscall = is_alias_mapping_syscall(request.number);
-    let kernel_context = dispatcher
-        .capture_kernel_context(linux_tid)
-        .map_err(NativeSyscallServiceError::Kernel)?;
     loop {
         begin_threaded_dispatch_iteration(
             executable_epoch,
@@ -11448,7 +11473,7 @@ fn service_syscall_threaded(
         )?;
         drain_native_child_exit_watches(false);
         let outcome = dispatcher.dispatch_threaded(
-            &kernel_context,
+            kernel_context,
             request,
             memory,
             reporter,
@@ -12159,6 +12184,7 @@ fn wait_native_vfork_completion(read_fd: i32, exit: &ExitState) -> bool {
 /// `native_after_fork_child` touches dispatcher state.
 fn service_fork(
     shared: &Arc<SharedRun>,
+    parent_context: &crate::kernel::KernelContext,
     request: NativeForkRequest,
     snapshot: &mut X86UcontextSnapshot,
     memory: &mut NativeIdentityMemory,
@@ -12660,6 +12686,7 @@ fn service_fork(
         Step::BecameForkChild {
             resume,
             vfork_completion_fd,
+            parent_context: parent_context.retain_exact(),
         }
     } else {
         if let Some(state) = &vfork_share {

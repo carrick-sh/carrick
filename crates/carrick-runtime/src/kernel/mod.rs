@@ -33,7 +33,7 @@ pub use frame_inventory::{
     FrameInventorySnapshot, FrameRow, MappingRow,
 };
 pub use ids::{
-    FileDescriptionId, FileSlotNumber, FileTableId, FsContextId, InvalidFileSlot,
+    CredentialsId, FileDescriptionId, FileSlotNumber, FileTableId, FsContextId, InvalidFileSlot,
     InvalidLinuxSignal, LinuxSignal, LinuxTid, MmId, ObjectIdError, ObjectIdRegistry,
     ProcessGroupId, SessionId, SighandId, TaskId, TaskSerial, ThreadSerial,
 };

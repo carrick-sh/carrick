@@ -8,12 +8,14 @@ use carrick_abi::SigSet;
 use carrick_hal::ThreadId;
 use parking_lot::{Condvar, Mutex};
 
+use crate::linux_abi::LINUX_DEFAULT_UMASK;
+
 use super::address::MmBackend;
 use super::clone_plan::{CloneObjectMode, ClonePlan, CloneTaskMode};
 use super::ids::{
-    FileDescriptionId, FileSlotNumber, FileTableId, FsContextId, LinuxSignal, LinuxTid, MmId,
-    ObjectIdError, ObjectIdRegistry, ProcessGroupId, SessionId, SighandId, TaskId, TaskSerial,
-    ThreadSerial,
+    CredentialsId, FileDescriptionId, FileSlotNumber, FileTableId, FsContextId, LinuxSignal,
+    LinuxTid, MmId, ObjectIdError, ObjectIdRegistry, ProcessGroupId, SessionId, SighandId, TaskId,
+    TaskSerial, ThreadSerial,
 };
 use super::registry::{IdRegistry, ProcessGroupClaim, SessionClaim};
 
@@ -393,16 +395,159 @@ impl FsContext {
     }
 }
 
-/// Immutable credential snapshot. The concrete dispatcher credential state is
-/// attached by the one-task adapter; distinct `Arc`s preserve per-thread COW.
-#[derive(Debug, Default)]
+/// Immutable Linux credential register file. A mutation publishes a fresh
+/// object and replaces only the calling thread's `ThreadResources` association.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Credentials {
-    _private: (),
+    id: CredentialsId,
+    pub(crate) ruid: u32,
+    pub(crate) euid: u32,
+    pub(crate) suid: u32,
+    pub(crate) rgid: u32,
+    pub(crate) egid: u32,
+    pub(crate) sgid: u32,
+    pub(crate) fsuid: u32,
+    pub(crate) fsgid: u32,
+    pub(crate) umask: u32,
+    /// `None` preserves launch-time `/etc/group` fallback; `Some`, including an
+    /// empty vector, is the complete set installed by `setgroups(2)`.
+    supplementary_groups_override: Option<Vec<u32>>,
 }
 
 impl Credentials {
-    pub const fn new() -> Self {
-        Self { _private: () }
+    pub const fn root(id: CredentialsId) -> Self {
+        Self {
+            id,
+            ruid: 0,
+            euid: 0,
+            suid: 0,
+            rgid: 0,
+            egid: 0,
+            sgid: 0,
+            fsuid: 0,
+            fsgid: 0,
+            umask: LINUX_DEFAULT_UMASK,
+            supplementary_groups_override: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub const fn from_values(
+        id: CredentialsId,
+        ruid: u32,
+        euid: u32,
+        suid: u32,
+        rgid: u32,
+        egid: u32,
+        sgid: u32,
+        fsuid: u32,
+        fsgid: u32,
+        umask: u32,
+    ) -> Self {
+        Self {
+            id,
+            ruid,
+            euid,
+            suid,
+            rgid,
+            egid,
+            sgid,
+            fsuid,
+            fsgid,
+            umask,
+            supplementary_groups_override: None,
+        }
+    }
+
+    pub(super) fn for_copy(id: CredentialsId, source: &Self) -> Self {
+        let mut copy = source.clone();
+        copy.id = id;
+        copy
+    }
+
+    pub const fn id(&self) -> CredentialsId {
+        self.id
+    }
+    pub const fn ruid(&self) -> u32 {
+        self.ruid
+    }
+    pub const fn euid(&self) -> u32 {
+        self.euid
+    }
+    pub const fn suid(&self) -> u32 {
+        self.suid
+    }
+    pub const fn rgid(&self) -> u32 {
+        self.rgid
+    }
+    pub const fn egid(&self) -> u32 {
+        self.egid
+    }
+    pub const fn sgid(&self) -> u32 {
+        self.sgid
+    }
+    pub const fn fsuid(&self) -> u32 {
+        self.fsuid
+    }
+    pub const fn fsgid(&self) -> u32 {
+        self.fsgid
+    }
+    pub const fn umask(&self) -> u32 {
+        self.umask
+    }
+    pub fn supplementary_groups_override(&self) -> Option<&[u32]> {
+        self.supplementary_groups_override.as_deref()
+    }
+
+    pub(crate) fn seed_identity(&mut self, uid: u32, gid: u32) {
+        self.ruid = uid;
+        self.euid = uid;
+        self.suid = uid;
+        self.fsuid = uid;
+        self.rgid = gid;
+        self.egid = gid;
+        self.sgid = gid;
+        self.fsgid = gid;
+    }
+
+    pub(crate) const fn is_privileged(&self) -> bool {
+        self.euid == 0
+    }
+    pub(crate) fn set_uid_triple(&mut self, ruid: u32, euid: u32, suid: u32) {
+        self.ruid = ruid;
+        self.euid = euid;
+        self.suid = suid;
+        self.fsuid = euid;
+    }
+    pub(crate) fn set_gid_triple(&mut self, rgid: u32, egid: u32, sgid: u32) {
+        self.rgid = rgid;
+        self.egid = egid;
+        self.sgid = sgid;
+        self.fsgid = egid;
+    }
+    pub(crate) fn set_fsuid(&mut self, fsuid: u32) {
+        self.fsuid = fsuid;
+    }
+    pub(crate) fn set_fsgid(&mut self, fsgid: u32) {
+        self.fsgid = fsgid;
+    }
+    pub(crate) fn set_umask(&mut self, umask: u32) {
+        self.umask = umask;
+    }
+    pub(crate) fn set_supplementary_groups(&mut self, groups: Vec<u32>) {
+        self.supplementary_groups_override = Some(groups);
+    }
+    pub(crate) fn copy_values_from(&mut self, source: &Self) {
+        self.ruid = source.ruid;
+        self.euid = source.euid;
+        self.suid = source.suid;
+        self.rgid = source.rgid;
+        self.egid = source.egid;
+        self.sgid = source.sgid;
+        self.fsuid = source.fsuid;
+        self.fsgid = source.fsgid;
+        self.umask = source.umask;
+        self.supplementary_groups_override = source.supplementary_groups_override.clone();
     }
 }
 
@@ -618,7 +763,10 @@ impl ThreadResources {
         Ok(Self::new(
             files,
             fs_context,
-            Arc::clone(&parent.credentials),
+            Arc::new(Credentials::for_copy(
+                ids.credentials_id()?,
+                &parent.credentials,
+            )),
         ))
     }
 
@@ -640,6 +788,14 @@ impl ThreadResources {
 
     pub fn credentials(&self) -> Arc<Credentials> {
         Arc::clone(&self.credentials)
+    }
+
+    pub(super) fn with_credentials(&self, credentials: Arc<Credentials>) -> Self {
+        Self::new(
+            Arc::clone(&self.files),
+            Arc::clone(&self.fs_context),
+            credentials,
+        )
     }
 }
 
@@ -1255,7 +1411,6 @@ impl Thread {
         self.revision.load()
     }
 
-    #[cfg(test)]
     pub(super) fn replace_resources(
         &self,
         replacement: Arc<ThreadResources>,
@@ -1474,7 +1629,9 @@ mod tests {
             let resources = Arc::new(ThreadResources::new(
                 Arc::new(FileTable::new(ids.file_table_id().expect("files ID"))),
                 Arc::new(FsContext::new(ids.fs_context_id().expect("fs ID"))),
-                Arc::new(Credentials::new()),
+                Arc::new(Credentials::root(
+                    ids.credentials_id().expect("credentials ID"),
+                )),
             ));
             let leader = task
                 .attach_thread(
@@ -1500,7 +1657,8 @@ mod tests {
 
         assert!(!Arc::ptr_eq(&parent.files(), &child.files()));
         assert!(!Arc::ptr_eq(&parent.fs_context(), &child.fs_context()));
-        assert!(Arc::ptr_eq(&parent.credentials(), &child.credentials()));
+        assert!(!Arc::ptr_eq(&parent.credentials(), &child.credentials()));
+        assert_eq!(parent.credentials().ruid(), child.credentials().ruid());
     }
 
     #[test]

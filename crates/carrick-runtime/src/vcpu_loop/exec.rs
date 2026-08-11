@@ -171,6 +171,7 @@ where
     pub(super) fn handle_execve(
         &mut self,
         kernel: &Kernel,
+        kernel_context: &crate::kernel::KernelContext,
         engine: &mut E,
         path: String,
         argv: Vec<Vec<u8>>,
@@ -192,7 +193,12 @@ where
             .collect();
         let cmdline = proc_argv.join(" ");
         let proc_env = env.clone();
-        match load_execve_image(&kernel.dispatcher, &path, argv, env) {
+        let loaded = kernel
+            .dispatcher
+            .with_kernel_credentials(kernel_context, || {
+                load_execve_image(&kernel.dispatcher, &path, argv, env)
+            });
+        match loaded {
             Ok(img) => {
                 // Close thread-clone admission across the full destructive
                 // exec transaction. Every pre-existing permit must either
@@ -239,11 +245,11 @@ where
                 // sole owner of nonleader promotion and replacement Mm state.
                 let mut prepared_kernel_exec = match kernel.hvpatch_process.as_ref() {
                     Some(process) => process
-                        .prepare_exec(self.linux_tid)
+                        .prepare_exec(kernel_context)
                         .map(RuntimePreparedExec::Hvpatch),
                     None => kernel
                         .dispatcher
-                        .prepare_one_task_kernel_exec(self.linux_tid)
+                        .prepare_one_task_kernel_exec(kernel_context)
                         .map(RuntimePreparedExec::Other),
                 }
                 .map_err(|error| {
@@ -436,7 +442,7 @@ where
                 crate::namespace::pid::mark_self_execed();
                 // execve_into rebuilt a fresh vCPU: re-stamp the identity page
                 // (zeroed) and TPIDR_EL1 (reset) for the same thread/tid.
-                stamp_identity_page(engine, &kernel.dispatcher);
+                stamp_identity_page(engine, &kernel.dispatcher, &committed_context);
                 engine
                     .set_guest_thread_id(self.linux_tid.raw() as u64)
                     .map_err(|error| {

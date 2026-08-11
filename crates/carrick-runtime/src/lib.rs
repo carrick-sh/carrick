@@ -1946,14 +1946,19 @@ pub mod runtime {
         //    step 4 (the run-loop entry). at_base=None: Rosetta amd64 redirection
         //    is not wired on Linux yet (the build_run_image at_base param supports
         //    it the day a Linux Rosetta interpreter is located).
+        let launch_context = dispatcher.capture_one_task_context().map_err(|error| {
+            RuntimeError::Unsupported(format!("capture platform launch Kernel context: {error}"))
+        })?;
         let argv_bytes: Vec<Vec<u8>> = spec.argv.iter().map(|s| s.as_bytes().to_vec()).collect();
-        let (resolved, argv) = crate::exec_helpers::resolve_entrypoint_program(
-            &spec.executable,
-            &spec.envp,
-            argv_bytes,
-            &dispatcher,
-        )
-        .map_err(|_| {
+        let resolved_entry = dispatcher.with_kernel_credentials(&launch_context, || {
+            crate::exec_helpers::resolve_entrypoint_program(
+                &spec.executable,
+                &spec.envp,
+                argv_bytes,
+                &dispatcher,
+            )
+        });
+        let (resolved, argv) = resolved_entry.map_err(|_| {
             RuntimeError::AddressSpace(crate::memory::AddressSpaceError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 spec.executable.clone(),
@@ -1964,12 +1969,13 @@ pub mod runtime {
             spec.argv.clone(),
             spec.envp.iter().map(|s| s.as_bytes().to_vec()).collect(),
         );
-        let bytes = dispatcher.read_exec_file(&resolved).ok_or_else(|| {
-            RuntimeError::AddressSpace(crate::memory::AddressSpaceError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                resolved.clone(),
-            )))
-        })?;
+        let bytes = dispatcher
+            .with_kernel_credentials(&launch_context, || dispatcher.read_exec_file(&resolved))
+            .ok_or_else(|| {
+                RuntimeError::AddressSpace(crate::memory::AddressSpaceError::Io(
+                    std::io::Error::new(std::io::ErrorKind::NotFound, resolved.clone()),
+                ))
+            })?;
         #[cfg(all(
             any(feature = "platform-freebsd", feature = "platform-netbsd"),
             target_arch = "x86_64"
@@ -1977,6 +1983,7 @@ pub mod runtime {
         if plan.backend == crate::page_profile::ExecutionBackend::Native {
             dispatcher.set_native_x86_64(true);
             let env = spec.envp.iter().map(|s| s.as_bytes().to_vec()).collect();
+            drop(launch_context);
             return crate::native::run_dispatch_native_bytes(
                 &bytes,
                 dispatcher,
@@ -1988,19 +1995,23 @@ pub mod runtime {
 
         let vdso = E::Arch::vdso_bytes();
         let vdso_enabled = !vdso.is_empty();
-        let mut image = crate::exec_helpers::build_run_image_for_execfn(
-            &bytes,
-            argv,
-            &spec.envp,
-            resolved.as_bytes(),
-            &dispatcher,
-            crate::exec_helpers::RunImageBuildOptions {
-                vdso_enabled,
-                at_base: None,
-                linux_page_size: crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
-                machine: E::Arch::elf_machine(),
-            },
-        )?;
+        let built = dispatcher.with_kernel_credentials(&launch_context, || {
+            crate::exec_helpers::build_run_image_for_execfn(
+                &bytes,
+                argv,
+                &spec.envp,
+                resolved.as_bytes(),
+                &dispatcher,
+                crate::exec_helpers::RunImageBuildOptions {
+                    vdso_enabled,
+                    at_base: None,
+                    linux_page_size: crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
+                    machine: E::Arch::elf_machine(),
+                },
+            )
+        });
+        drop(launch_context);
+        let mut image = built?;
         // Materialise the vvar+vDSO regions when this ISA provides real bytes.
         // The initial stack must be built with the same decision, otherwise
         // x86_64 would serialize a stale AT_SYSINFO_EHDR pointing at unmapped
