@@ -1792,11 +1792,13 @@ pub(crate) fn resume_guest_from_capsule(
     if !guest.exec_host_fs_fallback {
         dispatcher.sandbox_exec_to_container();
     }
-    dispatcher.set_cwd(&guest.cwd);
     dispatcher.set_stream_stdio(guest.stream_stdio);
     let reexec_context = dispatcher.capture_one_task_context().map_err(|error| {
         anyhow::anyhow!("capture native reexec restore Kernel context: {error}")
     })?;
+    let restored_fs_context = reexec_context.resources().fs_context();
+    restored_fs_context.set_cwd(guest.cwd.clone());
+    restored_fs_context.set_chroot_root(guest.chroot_root.clone());
     let mut restored_context =
         dispatcher.restore_native_reexec_process_state(&reexec_context, &guest.process_state);
     drop(reexec_context);

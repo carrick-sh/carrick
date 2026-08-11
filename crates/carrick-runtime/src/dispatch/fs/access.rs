@@ -26,7 +26,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_ENOENT));
             }
             if dirfd == LINUX_AT_FDCWD {
-                let cwd = self.io.cwd.read().clone();
+                let cwd = self.captured_fs_context().cwd();
                 return Ok(self.access_resolved_path(&cwd, mode, flags));
             }
             return Ok(self.fd_access(dirfd as i32, mode));

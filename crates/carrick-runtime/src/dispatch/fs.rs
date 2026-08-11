@@ -2264,9 +2264,8 @@ impl SyscallDispatcher {
             return None;
         }
         if self
-            .io
-            .chroot_root
-            .read()
+            .captured_fs_context()
+            .chroot_root()
             .as_deref()
             .is_some_and(|root| root != "/")
             || path.starts_with("/proc")
@@ -2330,9 +2329,8 @@ impl SyscallDispatcher {
             return None;
         }
         if self
-            .io
-            .chroot_root
-            .read()
+            .captured_fs_context()
+            .chroot_root()
             .as_deref()
             .is_some_and(|root| root != "/")
         {
@@ -5048,13 +5046,14 @@ impl SyscallDispatcher {
         // A relative path through a REAL dirfd depends on that fd's directory,
         // so it is not keyed here.
         let is_atfdcwd = (dirfd as i32) as i64 as u64 == LINUX_AT_FDCWD;
+        let fs_context = self.captured_fs_context();
         let cache_key: Option<String> = if std::path::Path::new(path).is_absolute() {
-            match self.io.chroot_root.read().as_deref() {
+            match fs_context.chroot_root().as_deref() {
                 Some(root) if root != "/" => Some(format!("{root}\u{0}{path}")),
                 _ => Some(path.to_owned()),
             }
         } else if is_atfdcwd {
-            Some(format!("{}\u{0}{}", self.io.cwd.read(), path))
+            Some(format!("{}\u{0}{}", fs_context.cwd(), path))
         } else {
             None
         };
@@ -5111,13 +5110,14 @@ impl SyscallDispatcher {
     /// `None` when the dirfd anchor can't be determined (not a directory fd).
     fn absolute_input_path(&self, dirfd: u64, path: &str) -> Option<String> {
         let dirfd = (dirfd as i32) as i64 as u64;
+        let fs_context = self.captured_fs_context();
         let (anchor, path) = if Path::new(path).is_absolute() {
-            match self.io.chroot_root.read().as_deref() {
+            match fs_context.chroot_root().as_deref() {
                 Some(root) if root != "/" => (root.to_owned(), path.trim_start_matches('/')),
                 _ => ("/".to_string(), path),
             }
         } else if dirfd == LINUX_AT_FDCWD {
-            (self.io.cwd.read().clone(), path)
+            (fs_context.cwd(), path)
         } else {
             match &*self.open_file(dirfd as i32)?.description.read() {
                 OpenDescription::Directory { path: dir, .. } => (dir.clone(), path),
@@ -5229,13 +5229,14 @@ impl SyscallDispatcher {
         // The anchor directory a relative path resolves against (already a real,
         // symlink-free path): "/" for an absolute path, the cwd for AT_FDCWD, else
         // the dirfd's directory.
+        let fs_context = self.captured_fs_context();
         let (anchor, path) = if Path::new(path).is_absolute() {
-            match self.io.chroot_root.read().as_deref() {
+            match fs_context.chroot_root().as_deref() {
                 Some(root) if root != "/" => (root.to_owned(), path.trim_start_matches('/')),
                 _ => ("/".to_string(), path),
             }
         } else if dirfd == LINUX_AT_FDCWD {
-            (self.io.cwd.read().clone(), path)
+            (fs_context.cwd(), path)
         } else {
             match self.open_file(dirfd as i32).as_ref() {
                 Some(open_file) => match &*open_file.description.read() {
@@ -5814,8 +5815,9 @@ impl SyscallDispatcher {
             // without chdir'ing in, leaving the cwd ABOVE the new root. Such a
             // cwd is unreachable from the root, so getcwd returns ENOENT. A
             // chroot("/") is a no-op and never triggers this.
-            let cwd = this.io.cwd.read().clone();
-            let cwd = match this.io.chroot_root.read().as_deref() {
+            let fs_context = this.captured_fs_context();
+            let cwd = fs_context.cwd();
+            let cwd = match fs_context.chroot_root().as_deref() {
                 Some(root) if root != "/" => {
                     if cwd == root {
                         // The guest chdir'd into the new root itself.
@@ -5889,7 +5891,8 @@ impl SyscallDispatcher {
             if metadata.kind != RootFsEntryKind::Directory {
                 return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
             }
-            *this.io.cwd.write() = display_rootfs_path(&metadata.path);
+            this.captured_fs_context()
+                .set_cwd(display_rootfs_path(&metadata.path));
             Ok(DispatchOutcome::Returned { value: 0 })
 
         }
@@ -5925,7 +5928,7 @@ impl SyscallDispatcher {
             // awaits that plus the DAC search-permission check. We DO record the
             // new root so getcwd can report a cwd left outside it as ENOENT
             // (realpath01 / CVE-2018-1000001).
-            *this.io.chroot_root.write() = Some(new_root);
+            this.captured_fs_context().set_chroot_root(Some(new_root));
             Ok(DispatchOutcome::Returned { value: 0 })
 
         }
@@ -5965,7 +5968,7 @@ impl SyscallDispatcher {
                     {
                         return Ok(DispatchOutcome::errno(LINUX_EACCES));
                     }
-                    *this.io.cwd.write() = dir_path;
+                    this.captured_fs_context().set_cwd(dir_path);
                     DispatchOutcome::Returned { value: 0 }
                 }
                 OpenDescription::File { .. }
@@ -10945,7 +10948,7 @@ impl SyscallDispatcher {
                         this.canonicalize_following(&exe).unwrap_or(exe)
                     }
                     // /proc/self/cwd → the guest working dir; /proc/self/root → the
-                    // guest root. Both tracked dispatcher-side (io.cwd / "/").
+                    // guest root. Both come from the captured Kernel FsContext.
                     "cwd" => this.cwd(),
                     _ => "/".to_string(),
                 }
@@ -12588,7 +12591,12 @@ mod tests {
 
         let mut dispatcher = SyscallDispatcher::new();
         dispatcher.set_fs_backend(Box::new(backend));
-        *dispatcher.io.chroot_root.write() = Some("/jail".to_owned());
+        dispatcher
+            .capture_one_task_context()
+            .unwrap()
+            .resources()
+            .fs_context()
+            .set_chroot_root(Some("/jail".to_owned()));
 
         assert_eq!(
             dispatcher

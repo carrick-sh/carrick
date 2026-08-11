@@ -22,7 +22,7 @@ use super::objects::{
     TaskRef, ThreadKey, ThreadRef, ThreadSignalState, Zombie,
 };
 
-pub const KERNEL_SNAPSHOT_V1_SCHEMA: u16 = 2;
+pub const KERNEL_SNAPSHOT_V1_SCHEMA: u16 = 3;
 const MAX_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -164,9 +164,13 @@ pub struct FileDescriptionSnapshotRow {
     pub epoll_interests: Vec<FileDescriptionId>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FsContextSnapshotRow {
     pub id: FsContextId,
+    pub class: ObjectSnapshotClass,
+    pub revision: u64,
+    pub cwd: String,
+    pub chroot_root: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -261,6 +265,7 @@ struct LeafChecks {
     threads: Vec<(ThreadRef, u64)>,
     sighands: Vec<(Arc<Sighand>, u64)>,
     file_tables: Vec<(Arc<FileTable>, u64)>,
+    fs_contexts: Vec<(Arc<FsContext>, u64)>,
     descriptions: Vec<(Arc<FileDescription>, u64)>,
     backends: Vec<(Arc<dyn MmBackend>, u64)>,
     vma_revisions: Vec<(Arc<dyn MmBackend>, super::VmaRevision)>,
@@ -381,6 +386,7 @@ impl Kernel {
             threads: Vec::new(),
             sighands: Vec::new(),
             file_tables: Vec::new(),
+            fs_contexts: Vec::new(),
             descriptions: Vec::new(),
             backends: Vec::new(),
             vma_revisions: Vec::new(),
@@ -391,6 +397,7 @@ impl Kernel {
         let mut file_table_by_id = BTreeMap::new();
         let mut fs_context_by_id = BTreeMap::<FsContextId, Arc<FsContext>>::new();
         let mut credentials_by_id = BTreeMap::new();
+        let mut live_fs_contexts = BTreeSet::new();
         let mut live_credentials = BTreeSet::new();
         for (key, resources) in &registry.observed_thread_resources {
             let files = resources.files();
@@ -405,7 +412,7 @@ impl Kernel {
             insert_shared(
                 &mut fs_context_by_id,
                 fs.id(),
-                fs,
+                Arc::clone(&fs),
                 "duplicate fs-context identity",
             )?;
             insert_shared(
@@ -415,8 +422,26 @@ impl Kernel {
                 "duplicate credentials identity",
             )?;
             if live_thread_resources.contains(key) {
+                live_fs_contexts.insert(fs.id());
                 live_credentials.insert(credentials.id());
             }
+        }
+        let mut fs_contexts = Vec::with_capacity(fs_context_by_id.len());
+        for fs_context in fs_context_by_id.values() {
+            let (revision, cwd, chroot_root) =
+                lock_result(fs_context.snapshot_until(deadline), deadline)?;
+            checks.fs_contexts.push((Arc::clone(fs_context), revision));
+            fs_contexts.push(FsContextSnapshotRow {
+                id: fs_context.id(),
+                class: if live_fs_contexts.contains(&fs_context.id()) {
+                    ObjectSnapshotClass::Live
+                } else {
+                    ObjectSnapshotClass::Draining
+                },
+                revision,
+                cwd,
+                chroot_root,
+            });
         }
         let credentials = credentials_by_id
             .values()
@@ -645,10 +670,7 @@ impl Kernel {
             file_tables,
             file_slots,
             file_descriptions,
-            fs_contexts: fs_context_by_id
-                .into_keys()
-                .map(|id| FsContextSnapshotRow { id })
-                .collect(),
+            fs_contexts,
             credentials,
             process_groups: registry.groups.clone(),
             sessions: registry.sessions.clone(),
@@ -678,6 +700,11 @@ impl Kernel {
         }
         for (table, revision) in checks.file_tables {
             if table.revision() != revision {
+                return Err(AttemptError::Race);
+            }
+        }
+        for (fs_context, revision) in checks.fs_contexts {
+            if fs_context.revision() != revision {
                 return Err(AttemptError::Race);
             }
         }
@@ -1537,6 +1564,14 @@ mod tests {
     #[test]
     fn snapshot_is_owned_sorted_and_strictly_joined() {
         let (kernel, context) = bootstrap(TestBackend::new(BackendMode::Good));
+        context
+            .resources()
+            .fs_context()
+            .set_cwd("/snapshot/cwd".to_owned());
+        context
+            .resources()
+            .fs_context()
+            .set_chroot_root(Some("/snapshot/root".to_owned()));
         let _context = kernel
             .update_credentials(&context, |credentials| {
                 credentials.set_supplementary_groups(vec![9, 10]);
@@ -1568,6 +1603,17 @@ mod tests {
             .find(|row| row.class == ObjectSnapshotClass::Draining)
             .expect("captured prior credentials remain draining");
         assert_eq!(draining_credentials.supplementary_groups_override, None);
+        let live_fs_context = first
+            .fs_contexts
+            .iter()
+            .find(|row| row.class == ObjectSnapshotClass::Live)
+            .expect("live filesystem context");
+        assert_eq!(live_fs_context.cwd, "/snapshot/cwd");
+        assert_eq!(
+            live_fs_context.chroot_root.as_deref(),
+            Some("/snapshot/root")
+        );
+        assert!(live_fs_context.revision > 1);
         assert!(first.frames.is_empty() && first.mappings.is_empty());
     }
 
@@ -1802,12 +1848,9 @@ mod tests {
                 .iter()
                 .any(|row| row.id == old_resources.file_table)
         );
-        assert!(
-            bundles_only
-                .fs_contexts
-                .iter()
-                .any(|row| row.id == old_resources.fs_context)
-        );
+        assert!(bundles_only.fs_contexts.iter().any(|row| {
+            row.id == old_resources.fs_context && row.class == ObjectSnapshotClass::Live
+        }));
         assert!(bundles_only.mms.iter().any(|row| row.id == old_mm));
         assert!(
             bundles_only
@@ -1944,12 +1987,9 @@ mod tests {
                 .iter()
                 .any(|row| row.id == child_resources_key.file_table)
         );
-        assert!(
-            bundles_only
-                .fs_contexts
-                .iter()
-                .any(|row| row.id == child_resources_key.fs_context)
-        );
+        assert!(bundles_only.fs_contexts.iter().any(|row| {
+            row.id == child_resources_key.fs_context && row.class == ObjectSnapshotClass::Draining
+        }));
 
         drop(bundles_only);
         drop(retained_shared);
