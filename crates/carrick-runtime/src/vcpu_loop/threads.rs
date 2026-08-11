@@ -493,7 +493,7 @@ where
                     })?;
                 let reservation = process
                     .kernel_graph()
-                    .reserve_thread_clone(&parent, plan, None)
+                    .reserve_thread_clone_eventually(&parent, plan)
                     .map_err(|error| {
                         RuntimeError::Configuration(format!(
                             "reserve authoritative hvpatch thread: {error}"
@@ -533,6 +533,17 @@ where
                 }
                 return Err(RuntimeError::Trap(error));
             }
+        };
+        // Reserve Kernel publication before the child can take the HVPatch
+        // topology lock. Fork/exec take their task reservation before topology
+        // too, so this ordering cannot form reservation ↔ topology cycles.
+        let prepared_thread = match prepared_thread {
+            Some(prepared) => Some(prepared.reserve_publication_eventually().map_err(|error| {
+                RuntimeError::Configuration(format!(
+                    "reserve authoritative hvpatch thread publication: {error}"
+                ))
+            })?),
+            None => None,
         };
         let child_kernel = Arc::clone(kernel);
         let child_registry = Arc::clone(&self.registry);
