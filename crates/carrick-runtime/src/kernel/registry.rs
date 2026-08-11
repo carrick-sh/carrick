@@ -167,6 +167,13 @@ impl IdRegistry {
     fn with_range_for_tests(first: i32, last: i32) -> Self {
         Self::with_range(first, last, first)
     }
+
+    #[cfg(test)]
+    pub(super) fn set_next_for_tests(&self, raw: i32) {
+        let mut state = self.state.lock();
+        assert!((state.first..=state.last).contains(&raw));
+        state.next = raw;
+    }
 }
 
 #[derive(Debug)]

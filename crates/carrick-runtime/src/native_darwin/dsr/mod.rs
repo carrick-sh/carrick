@@ -1020,7 +1020,7 @@ mod tests {
             // clear_child_tid=0 so `finish_thread` never dereferences guest
             // memory: this test only exercises the profile-flush contract.
             let sib_tid = runtime.registry.register_child(0);
-            let mut sibling = runtime.sibling(sib_tid);
+            let mut sibling = runtime.sibling_for_test(sib_tid);
             let dispatcher = super::super::SyscallDispatcher::new();
 
             let process = std::sync::Arc::new(

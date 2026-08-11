@@ -3460,31 +3460,10 @@ fn is_guest_xattr_namespace(name: &str) -> bool {
         || name.starts_with("system.")
 }
 
-#[cfg(target_os = "macos")]
-#[cfg(target_os = "macos")]
 fn fremove_xattr(fd: std::os::fd::RawFd, name: &[u8]) {
-    // Best-effort: ENOATTR (no stale override) is the common case.
+    // Best-effort: a missing stale override is the common case on every host.
     unsafe {
-        libc::fremovexattr(fd, name.as_ptr() as *const libc::c_char, 0);
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn fremove_xattr(fd: std::os::fd::RawFd, name: &[u8]) {
-    let _ = carrick_portable::fd_remove_xattr(fd, name);
-}
-
-fn fset_u32_xattr(fd: std::os::fd::RawFd, name: &[u8], val: u32) {
-    let v = val.to_le_bytes();
-    // Portable fd-xattr (carrick-portable maps the Darwin position/options args).
-    unsafe {
-        carrick_portable::fsetxattr(
-            fd,
-            name.as_ptr() as *const libc::c_char,
-            v.as_ptr() as *const libc::c_void,
-            v.len(),
-            0,
-        );
+        carrick_portable::fremovexattr(fd, name.as_ptr().cast());
     }
 }
 
@@ -3502,7 +3481,6 @@ fn fget_u32_xattr(fd: std::os::fd::RawFd, name: &[u8]) -> Option<u32> {
     (n == 4).then(|| u32::from_le_bytes(v))
 }
 
-#[cfg(not(target_os = "macos"))]
 fn fset_u32_xattr(fd: std::os::fd::RawFd, name: &[u8], val: u32) {
     let v = val.to_le_bytes();
     // Portable fd-xattr (Linux fsetxattr / macOS f*xattr+position / FreeBSD extattr_set_fd).

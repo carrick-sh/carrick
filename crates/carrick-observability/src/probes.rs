@@ -753,6 +753,7 @@ pub enum HvpatchTopologyOperation {
     VcpuRebind = 4,
     VmRelease = 5,
     LegacyFork = 6,
+    ProcessRetire = 7,
 }
 
 impl HvpatchTopologyOperation {
@@ -1561,6 +1562,7 @@ mod hvpatch_guest_probe_abi {
         assert_eq!(HvpatchTopologyOperation::VcpuRebind.raw(), 4);
         assert_eq!(HvpatchTopologyOperation::VmRelease.raw(), 5);
         assert_eq!(HvpatchTopologyOperation::LegacyFork.raw(), 6);
+        assert_eq!(HvpatchTopologyOperation::ProcessRetire.raw(), 7);
         assert_eq!(HvpatchTopologyPhase::Requested.raw(), 0);
         assert_eq!(HvpatchTopologyPhase::Acquired.raw(), 1);
         assert_eq!(HvpatchTopologyPhase::Released.raw(), 2);
@@ -3597,9 +3599,10 @@ mod real {
         fn hvpatch__exec__runtime__stage(_: u32, _: u64, _: u64, _: u64) {}
         /// Shared-HVF topology-lock lifecycle. Args: operation (0=in-process
         /// fork, 1=exec replacement, 2=exec sibling gate, 3=sibling
-        /// materialization, 4=vCPU rebind, 5=VM release, 6=legacy fork), phase
-        /// (0=requested, 1=acquired, 2=released, 3=try miss), Linux guest PID,
-        /// Linux guest TID, and wait/hold elapsed nanoseconds.
+        /// materialization, 4=vCPU rebind, 5=VM release, 6=legacy fork,
+        /// 7=process retire), phase (0=requested, 1=acquired, 2=released,
+        /// 3=try miss), Linux guest PID, Linux guest TID, and wait/hold elapsed
+        /// nanoseconds.
         fn hvpatch__topology__lock(_: u32, _: u32, _: i32, _: i32, _: u64) {}
         /// Parent-thread stages inside one in-process-fork topology critical
         /// section. Args: phase (0=quiesce, 1=process allocation, 2=pidfd and

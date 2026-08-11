@@ -275,6 +275,7 @@ impl TaskSetReservation {
             state.reservations.remove(task_id);
         }
         self.active = false;
+        self.kernel.publish_reservation_change();
         Ok(())
     }
 }
@@ -285,10 +286,16 @@ impl Drop for TaskSetReservation {
             return;
         }
         let mut state = self.kernel.registry().state.write();
+        let mut changed = false;
         for task_id in &self.task_ids {
             if state.reservations.get(task_id) == Some(&self.transaction) {
                 state.reservations.remove(task_id);
+                changed = true;
             }
+        }
+        drop(state);
+        if changed {
+            self.kernel.publish_reservation_change();
         }
     }
 }
@@ -478,6 +485,10 @@ impl PreparedFork {
         self.reservation.child_id
     }
 
+    pub fn child_key(&self) -> TaskKey {
+        self.child.key()
+    }
+
     /// Transfer the unique wait handle to a materialized child before commit.
     /// Dropping this preparation wakes it with `Cancelled`; a published child
     /// remains blocked until `PublishedFork::start_child`.
@@ -598,7 +609,7 @@ impl PreparedFork {
             if let Some(subscriber) = pidfd_subscriber {
                 kernel
                     .exit_subscribers
-                    .register_erased(child_id, &subscriber.0);
+                    .register_erased(child_key, &subscriber.0);
             }
             if let Some(parent_record) = state.tasks.get_mut(&child_parent_task.key().id) {
                 parent_record.revision = next_child_parent_revision;
@@ -677,13 +688,10 @@ impl Drop for PublishedThreadClone {
 #[derive(Debug)]
 pub struct ThreadCloneReservation {
     kernel: Arc<Kernel>,
-    operation: TaskSetReservation,
     task: TaskRef,
     caller: ThreadRef,
     shared: Arc<TaskShared>,
     parent_resources: Arc<ThreadResources>,
-    parent_revision: TaskRevision,
-    published_revision: TaskRevision,
     plan: ClonePlan,
     tid: LinuxTid,
     reservation: ThreadReservation,
@@ -756,37 +764,43 @@ impl PreparedThreadClone {
         } = self;
         let ThreadCloneReservation {
             kernel,
-            mut operation,
             task,
-            caller: _,
+            caller,
             shared,
-            parent_resources: _,
-            parent_revision,
-            published_revision,
+            parent_resources,
             plan: _,
             tid,
             reservation,
             failpoint,
         } = reservation;
-        {
+        let published_revision = {
             let mut state = kernel.registry().state.write();
-            operation.validate(&state)?;
+            ensure_task_unreserved(&state, task.key().id)?;
             let Some(record) = state.tasks.get_mut(&task.key().id) else {
                 return Err(KernelOperationError::ParentExited);
             };
             if record.task.key() != task.key() {
                 return Err(KernelOperationError::ParentExited);
             }
-            if record.revision != parent_revision {
+            let current_shared = task.shared();
+            let current_caller = task
+                .thread(caller.key().tid)
+                .ok_or(KernelOperationError::StaleContext)?;
+            if !Arc::ptr_eq(&current_shared, &shared)
+                || current_caller.key() != caller.key()
+                || !Arc::ptr_eq(&current_caller, &caller)
+                || !Arc::ptr_eq(&current_caller.resources(), &parent_resources)
+            {
                 return Err(KernelOperationError::StaleContext);
             }
+            let published_revision = next_revision(record.revision)?;
             check_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
             let claim = reservation.commit();
             task.publish_thread(Arc::clone(&thread))?;
             record.thread_claims.insert(tid, claim);
             record.revision = published_revision;
-            operation.commit(&mut state)?;
-        }
+            published_revision
+        };
         Ok(PublishedThreadClone {
             started: Some(StartedThreadClone {
                 context: KernelContext::from_parts(
@@ -819,8 +833,33 @@ impl Kernel {
         })
     }
 
+    /// Resolve the authoritative current parent of one exact task generation.
+    /// Runtime notification routing uses this immediately before exit
+    /// publication so CLONE_PARENT and orphan reparenting cannot target a stale
+    /// creator captured at fork time.
+    pub fn task_parent_key(&self, task: TaskKey) -> Result<Option<TaskKey>, KernelOperationError> {
+        let state = self.registry().state.read();
+        let record = state
+            .tasks
+            .get(&task.id)
+            .ok_or(KernelOperationError::UnknownTask(task.id))?;
+        if record.task.key() != task {
+            return Err(KernelOperationError::StaleTaskGeneration(task.id));
+        }
+        Ok(record.task.parent())
+    }
+
     pub fn task_is_live(&self, task_id: TaskId) -> bool {
         self.registry().state.read().tasks.contains_key(&task_id)
+    }
+
+    pub fn task_key_is_live(&self, task: TaskKey) -> bool {
+        self.registry()
+            .state
+            .read()
+            .tasks
+            .get(&task.id)
+            .is_some_and(|record| record.task.key() == task)
     }
 
     pub fn task_exists(&self, task_id: TaskId) -> bool {
@@ -828,18 +867,23 @@ impl Kernel {
         state.tasks.contains_key(&task_id) || state.zombies.contains_key(&task_id)
     }
 
-    pub fn register_task_exit_subscriber<T>(&self, task_id: TaskId, subscriber: &Arc<T>) -> bool
+    pub fn register_task_exit_subscriber<T>(
+        &self,
+        task_id: TaskId,
+        subscriber: &Arc<T>,
+    ) -> Option<TaskKey>
     where
         T: super::core::TaskExitSubscriber + 'static,
     {
         let state = self.registry().state.read();
-        if state.tasks.contains_key(&task_id) {
-            self.exit_subscribers.register(task_id, subscriber);
-            return true;
+        if let Some(record) = state.tasks.get(&task_id) {
+            let task = record.task.key();
+            self.exit_subscribers.register(task, subscriber);
+            return Some(task);
         }
-        let exited = state.zombies.contains_key(&task_id);
+        let exited = state.zombies.get(&task_id).map(|record| record.zombie.key);
         drop(state);
-        if exited {
+        if exited.is_some() {
             subscriber.publish_exit();
         }
         exited
@@ -960,10 +1004,9 @@ impl Kernel {
         if plan.task() != CloneTaskMode::JoinThreadGroup {
             return Err(KernelOperationError::ExpectedThreadGroup);
         }
-        let published_revision = next_revision(parent.revision)?;
-        let transaction = self.object_ids().transaction_id()?;
-        let operation = {
-            let mut state = self.registry().state.write();
+        {
+            let state = self.registry().state.read();
+            ensure_task_unreserved(&state, parent.task.key().id)?;
             let record = state
                 .tasks
                 .get(&parent.task.key().id)
@@ -971,22 +1014,27 @@ impl Kernel {
             if record.task.key() != parent.task.key() {
                 return Err(KernelOperationError::ParentExited);
             }
-            if record.revision != parent.revision {
+            let current_shared = record.task.shared();
+            let current_caller = record
+                .task
+                .thread(parent.thread.key().tid)
+                .ok_or(KernelOperationError::StaleContext)?;
+            if !Arc::ptr_eq(&current_shared, &parent.shared)
+                || current_caller.key() != parent.thread.key()
+                || !Arc::ptr_eq(&current_caller, &parent.thread)
+                || !Arc::ptr_eq(&current_caller.resources(), &parent.resources)
+            {
                 return Err(KernelOperationError::StaleContext);
             }
-            TaskSetReservation::acquired(self, &mut state, vec![parent.task.key().id], transaction)?
-        };
+        }
         let (tid, reservation) = self.ids().reserve_thread()?;
         check_failpoint(failpoint, KernelFailpoint::AfterReserve)?;
         Ok(ThreadCloneReservation {
             kernel: self.clone(),
-            operation,
             task: Arc::clone(&parent.task),
             caller: Arc::clone(&parent.thread),
             shared: Arc::clone(&parent.shared),
             parent_resources: Arc::clone(&parent.resources),
-            parent_revision: parent.revision,
-            published_revision,
             plan,
             tid,
             reservation,
@@ -1032,20 +1080,15 @@ impl Kernel {
         if record.task.key() != context.task.key() {
             return Err(KernelOperationError::ParentExited);
         }
-        if record.revision != context.revision {
-            return Err(KernelOperationError::StaleContext);
-        }
         if context.task.live_thread_count() <= 1 {
             return Err(KernelOperationError::LastThreadRequiresTaskExit(
                 context.thread.key().tid,
             ));
         }
         let tid = context.thread.key().tid;
-        if context
-            .task
-            .thread(tid)
-            .is_none_or(|thread| thread.key() != context.thread.key())
-            || !record.thread_claims.contains_key(&tid)
+        if context.task.thread(tid).is_none_or(|thread| {
+            thread.key() != context.thread.key() || !Arc::ptr_eq(&thread, &context.thread)
+        }) || !record.thread_claims.contains_key(&tid)
         {
             return Err(KernelOperationError::UnknownThread(tid));
         }
@@ -1129,40 +1172,6 @@ impl Kernel {
             task: record.task.key(),
             revision: record.revision,
         })
-    }
-
-    /// Publish only the lifecycle effects of the current destructive exec
-    /// adapter. K4 will replace this RED seam with candidate-mm prepare/commit;
-    /// K1 must nevertheless release a vfork parent and enforce post-exec
-    /// process-group rules without pretending the old image was transactional.
-    pub fn publish_legacy_exec(
-        &self,
-        context: &KernelContext,
-    ) -> Result<TaskRevision, KernelOperationError> {
-        if !Arc::ptr_eq(self.domain(), context.kernel().domain()) {
-            return Err(KernelOperationError::ForeignContext);
-        }
-        let mut state = self.registry().state.write();
-        ensure_task_unreserved(&state, context.task().key().id)?;
-        let record = state
-            .tasks
-            .get_mut(&context.task().key().id)
-            .ok_or(KernelOperationError::UnknownTask(context.task().key().id))?;
-        if record.task.key() != context.task().key() {
-            return Err(KernelOperationError::ParentExited);
-        }
-        if record.revision != context.revision() {
-            return Err(KernelOperationError::StaleContext);
-        }
-        let revision = next_revision(record.revision)?;
-        record.has_execed = true;
-        record.revision = revision;
-        let vfork_release = record.vfork_release.take();
-        drop(state);
-        if let Some(release) = vfork_release {
-            release.release(VforkReleaseReason::Exec);
-        }
-        Ok(revision)
     }
 
     pub fn set_process_group(
@@ -1505,13 +1514,35 @@ impl Kernel {
         rusage: TaskRusage,
         failpoint: Option<KernelFailpoint>,
     ) -> Result<PreparedTaskExit, KernelOperationError> {
+        let task = self
+            .registry()
+            .state
+            .read()
+            .tasks
+            .get(&task_id)
+            .map(|record| record.task.key())
+            .ok_or(KernelOperationError::UnknownTask(task_id))?;
+        self.prepare_task_exit_key(task, status, rusage, failpoint)
+    }
+
+    pub fn prepare_task_exit_key(
+        self: &Arc<Self>,
+        task_key: TaskKey,
+        status: LinuxWaitStatus,
+        rusage: TaskRusage,
+        failpoint: Option<KernelFailpoint>,
+    ) -> Result<PreparedTaskExit, KernelOperationError> {
         self.sweep_retired_threads();
+        let task_id = task_key.id;
         let transaction = self.object_ids().transaction_id()?;
         let mut state = self.registry().state.write();
         ensure_task_unreserved(&state, task_id)?;
         let Some(task_record) = state.tasks.get(&task_id) else {
             return Err(KernelOperationError::UnknownTask(task_id));
         };
+        if task_record.task.key() != task_key {
+            return Err(KernelOperationError::StaleTaskGeneration(task_id));
+        }
         if task_record.task.lifecycle() == TaskLifecycle::Exiting {
             return Err(KernelOperationError::AlreadyExiting(task_id));
         }
@@ -1520,7 +1551,6 @@ impl Kernel {
         }
 
         let task = Arc::clone(&task_record.task);
-        let task_key = task.key();
         let task_revision = task_record.revision;
         let diagnostic_name = task_record.diagnostic_name.clone();
         let adopter = (task_key != state.root).then_some(state.root);
@@ -1697,7 +1727,7 @@ impl Kernel {
         // be consumed and its numeric claim eventually reused. Callbacks stay
         // outside the registry lock, but a later generation can no longer be
         // mistaken for this exit.
-        let subscribers = self.exit_subscribers.take(prepared.task.id);
+        let subscribers = self.exit_subscribers.take(prepared.task);
         drop(state);
         if let Some(release) = vfork_release {
             release.release(VforkReleaseReason::Exit);
@@ -1723,10 +1753,73 @@ impl Kernel {
             .commit()
     }
 
+    /// Publish terminal state for one exact task generation, waiting on the
+    /// Kernel's reservation-change event for transient fork/exec/exit overlap.
+    /// Re-observation of the same exact zombie is idempotent; a reused numeric
+    /// PID with another serial is never mutated.
+    pub fn exit_task_key_eventually(
+        self: &Arc<Self>,
+        task: TaskKey,
+        status: LinuxWaitStatus,
+        rusage: TaskRusage,
+    ) -> Result<Zombie, KernelOperationError> {
+        loop {
+            let observed = self.reservation_epoch();
+            match self.prepare_task_exit_key(task, status, rusage, None) {
+                Ok(prepared) => return prepared.commit(),
+                Err(KernelOperationError::TaskBusy(_)) => {
+                    self.wait_for_reservation_change(observed);
+                }
+                Err(KernelOperationError::UnknownTask(_)) => {
+                    let state = self.registry().state.read();
+                    if let Some(zombie) = state
+                        .zombies
+                        .get(&task.id)
+                        .filter(|record| record.zombie.key == task)
+                    {
+                        return Ok(zombie.zombie.clone());
+                    }
+                    if state
+                        .tasks
+                        .get(&task.id)
+                        .is_some_and(|record| record.task.key() != task)
+                        || state
+                            .zombies
+                            .get(&task.id)
+                            .is_some_and(|record| record.zombie.key != task)
+                    {
+                        return Err(KernelOperationError::StaleTaskGeneration(task.id));
+                    }
+                    return Err(KernelOperationError::UnknownTask(task.id));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     pub fn wait_child(
         &self,
         parent_id: TaskId,
         target: Option<TaskId>,
+        mode: WaitMode,
+    ) -> Result<WaitOutcome, KernelOperationError> {
+        self.wait_child_matching(parent_id, target, None, mode)
+    }
+
+    pub fn wait_child_key(
+        &self,
+        parent_id: TaskId,
+        target: TaskKey,
+        mode: WaitMode,
+    ) -> Result<WaitOutcome, KernelOperationError> {
+        self.wait_child_matching(parent_id, Some(target.id), Some(target), mode)
+    }
+
+    fn wait_child_matching(
+        &self,
+        parent_id: TaskId,
+        target: Option<TaskId>,
+        exact_target: Option<TaskKey>,
         mode: WaitMode,
     ) -> Result<WaitOutcome, KernelOperationError> {
         self.sweep_retired_threads();
@@ -1741,7 +1834,11 @@ impl Kernel {
             .zombies
             .iter()
             .find(|(id, record)| {
-                record.zombie.parent == Some(parent) && target.is_none_or(|target| target == **id)
+                record.zombie.parent == Some(parent)
+                    && exact_target.map_or_else(
+                        || target.is_none_or(|target| target == **id),
+                        |target| target == record.zombie.key,
+                    )
             })
             .map(|(id, record)| (*id, record.zombie.clone()));
         if let Some((id, zombie)) = exited {
@@ -1763,7 +1860,11 @@ impl Kernel {
         }
 
         let live_child = state.tasks.iter().any(|(id, record)| {
-            record.task.parent() == Some(parent) && target.is_none_or(|target| target == *id)
+            record.task.parent() == Some(parent)
+                && exact_target.map_or_else(
+                    || target.is_none_or(|target| target == *id),
+                    |target| target == record.task.key(),
+                )
         });
         Ok(if live_child {
             WaitOutcome::StillRunning
@@ -1886,6 +1987,8 @@ pub enum KernelOperationError {
     IdentityObjectMissing,
     #[error("kernel task {0:?} is not live")]
     UnknownTask(TaskId),
+    #[error("kernel task {0:?} belongs to another generation")]
+    StaleTaskGeneration(TaskId),
     #[error("kernel task {0:?} has a preparing operation")]
     TaskBusy(TaskId),
     #[error("kernel thread {0:?} is not live")]
@@ -1989,7 +2092,10 @@ mod tests {
         let live = Arc::new(CountingExitSubscriber::default());
         assert!(kernel.task_is_live(child_id));
         assert!(kernel.task_exists(child_id));
-        assert!(kernel.register_task_exit_subscriber(child_id, &live));
+        assert_eq!(
+            kernel.register_task_exit_subscriber(child_id, &live),
+            Some(child.task.key())
+        );
         assert_eq!(live.0.load(Ordering::Acquire), 0);
 
         kernel
@@ -2005,12 +2111,136 @@ mod tests {
         assert_eq!(live.0.load(Ordering::Acquire), 1);
 
         let zombie = Arc::new(CountingExitSubscriber::default());
-        assert!(kernel.register_task_exit_subscriber(child_id, &zombie));
+        assert_eq!(
+            kernel.register_task_exit_subscriber(child_id, &zombie),
+            Some(child.task.key())
+        );
         assert_eq!(zombie.0.load(Ordering::Acquire), 1);
         let unknown = Arc::new(CountingExitSubscriber::default());
         let unknown_id = TaskId::for_root_bootstrap(9_999).expect("unknown task");
-        assert!(!kernel.register_task_exit_subscriber(unknown_id, &unknown));
+        assert_eq!(
+            kernel.register_task_exit_subscriber(unknown_id, &unknown),
+            None
+        );
         assert_eq!(unknown.0.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn exact_pidfd_generation_never_follows_a_reused_numeric_pid() {
+        let (kernel, root) = bootstrap(76);
+        let root_binding = root.task_binding();
+        let root_tid = root.thread().key().tid;
+        let child_a = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(9_076),
+                "child-a".to_string(),
+                None,
+            )
+            .expect("child A");
+        let child_a_key = child_a.task().key();
+        let pidfd_watch = Arc::new(CountingExitSubscriber::default());
+        assert_eq!(
+            kernel.register_task_exit_subscriber(child_a_key.id, &pidfd_watch),
+            Some(child_a_key)
+        );
+        kernel
+            .exit_task_key_eventually(
+                child_a_key,
+                LinuxWaitStatus::from_wait_encoding(0),
+                TaskRusage::default(),
+            )
+            .expect("exit child A");
+        assert_eq!(pidfd_watch.0.load(Ordering::Acquire), 1);
+        drop(child_a);
+        assert!(matches!(
+            kernel.wait_child(
+                root.task().key().id,
+                Some(child_a_key.id),
+                WaitMode::Consume
+            ),
+            Ok(WaitOutcome::Exited(_))
+        ));
+        kernel.sweep_retired_threads();
+        kernel.ids().set_next_for_tests(child_a_key.id.raw());
+
+        let fresh_root = root_binding.capture(root_tid).expect("fresh root context");
+        let child_b = kernel
+            .fork_task(
+                &fresh_root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(9_077),
+                "child-b".to_string(),
+                None,
+            )
+            .expect("child B");
+        assert_eq!(child_b.task().key().id, child_a_key.id);
+        assert_ne!(child_b.task().key(), child_a_key);
+        assert!(!kernel.task_key_is_live(child_a_key));
+        assert!(kernel.task_key_is_live(child_b.task().key()));
+        assert_eq!(
+            kernel
+                .wait_child_key(root.task().key().id, child_a_key, WaitMode::Observe)
+                .expect("exact old-generation wait"),
+            WaitOutcome::NoChild
+        );
+
+        kernel
+            .exit_task_key_eventually(
+                child_b.task().key(),
+                LinuxWaitStatus::from_wait_encoding(0),
+                TaskRusage::default(),
+            )
+            .expect("exit child B");
+        assert_eq!(pidfd_watch.0.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn child_exit_receipt_uses_parent_committed_during_reservation_wait() {
+        let (kernel, root) = bootstrap(77);
+        let parent = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(9_078),
+                "parent".to_string(),
+                None,
+            )
+            .expect("parent");
+        let child = kernel
+            .fork_task(
+                &parent,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(9_079),
+                "child".to_string(),
+                None,
+            )
+            .expect("child");
+        let prepared_parent = kernel
+            .prepare_task_exit_key(
+                parent.task().key(),
+                LinuxWaitStatus::from_wait_encoding(0),
+                TaskRusage::default(),
+                None,
+            )
+            .expect("prepare parent exit");
+        let exiting_kernel = Arc::clone(&kernel);
+        let child_key = child.task().key();
+        let child_exit = std::thread::spawn(move || {
+            exiting_kernel.exit_task_key_eventually(
+                child_key,
+                LinuxWaitStatus::from_wait_encoding(0),
+                TaskRusage::default(),
+            )
+        });
+        prepared_parent.commit().expect("commit parent exit");
+        let zombie = child_exit
+            .join()
+            .expect("child exit thread")
+            .expect("child exit");
+        assert_eq!(zombie.parent, Some(root.task().key()));
+        assert_ne!(zombie.parent, Some(parent.task().key()));
     }
 
     #[test]
@@ -2352,6 +2582,7 @@ mod tests {
         let (child, wait) = published.into_parts().expect("start vfork child");
         let wait = wait.expect("vfork parent wait");
         assert_eq!(wait.released_reason(), None);
+        assert_eq!(wait.wait_for_release(std::time::Duration::ZERO), None);
 
         let failed_exec = kernel
             .prepare_exec(&child, None)
@@ -2371,6 +2602,10 @@ mod tests {
             .commit_exec(prepared_exec, None)
             .expect("commit child exec");
         assert_eq!(wait.released_reason(), Some(VforkReleaseReason::Exec));
+        assert_eq!(
+            wait.wait_for_release(std::time::Duration::ZERO),
+            Some(VforkReleaseReason::Exec)
+        );
         kernel
             .exit_task(
                 child.task.key().id,
@@ -2532,6 +2767,84 @@ mod tests {
         assert!(root.task.thread(tid).is_some());
         let child = published.start_thread().expect("start thread");
         assert_eq!(child.context().thread.registry_id(), registry_id);
+    }
+
+    #[test]
+    fn concurrent_thread_preparations_publish_against_the_latest_revision() {
+        let (kernel, root) = bootstrap(194);
+        let plan = ClonePlan::from_flags(
+            LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+        )
+        .expect("thread plan");
+        let first = kernel
+            .reserve_thread_clone(&root, plan, None)
+            .expect("reserve first thread")
+            .prepare(ThreadId::synthetic_for_tests(8_894))
+            .expect("prepare first thread");
+        let second = kernel
+            .reserve_thread_clone(&root, plan, None)
+            .expect("reserve concurrent thread")
+            .prepare(ThreadId::synthetic_for_tests(8_895))
+            .expect("prepare concurrent thread");
+        let first_tid = first.tid();
+        let second_tid = second.tid();
+
+        let commit_barrier = Arc::new(std::sync::Barrier::new(3));
+        let first_barrier = Arc::clone(&commit_barrier);
+        let first_handle = std::thread::spawn(move || {
+            first_barrier.wait();
+            first
+                .commit()
+                .expect("publish first thread")
+                .start_thread()
+                .expect("start first thread")
+                .context()
+                .task()
+                .key()
+        });
+        let second_barrier = Arc::clone(&commit_barrier);
+        let second_handle = std::thread::spawn(move || {
+            second_barrier.wait();
+            second
+                .commit()
+                .expect("publish concurrent thread after revision advance")
+                .start_thread()
+                .expect("start concurrent thread")
+                .context()
+                .task()
+                .key()
+        });
+        commit_barrier.wait();
+        let first_task = first_handle.join().expect("first commit thread");
+        let second_task = second_handle.join().expect("second commit thread");
+
+        assert_ne!(first_tid, second_tid);
+        assert_eq!(first_task, root.task().key());
+        assert_eq!(second_task, root.task().key());
+        assert_eq!(kernel.validate_invariants(), Ok(()));
+    }
+
+    #[test]
+    fn sibling_publication_does_not_stale_thread_exit() {
+        let (kernel, root) = bootstrap(195);
+        let plan = ClonePlan::from_flags(
+            LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+        )
+        .expect("thread plan");
+        let first = kernel
+            .clone_thread(&root, plan, ThreadId::synthetic_for_tests(8_896), None)
+            .expect("first thread");
+        let _second = kernel
+            .clone_thread(&root, plan, ThreadId::synthetic_for_tests(8_897), None)
+            .expect("second thread advances task revision");
+
+        kernel
+            .exit_thread(&first, None)
+            .expect("thread identity remains valid across sibling publication");
+
+        assert!(root.task().thread(first.thread().key().tid).is_none());
+        assert_eq!(root.task().live_thread_count(), 2);
+        assert_eq!(kernel.validate_invariants(), Ok(()));
     }
 
     #[test]
@@ -2852,7 +3165,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_context_cannot_commit_a_thread_clone() {
+    fn sibling_publication_does_not_stale_a_thread_clone_context() {
         let (kernel, root) = bootstrap(285);
         let plan = ClonePlan::from_flags(
             LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
@@ -2862,10 +3175,12 @@ mod tests {
             .clone_thread(&root, plan, ThreadId::synthetic_for_tests(286), None)
             .expect("first thread");
         drop(first);
-        let result = kernel.clone_thread(&root, plan, ThreadId::synthetic_for_tests(287), None);
+        let second = kernel
+            .clone_thread(&root, plan, ThreadId::synthetic_for_tests(287), None)
+            .expect("sibling-only revision advance remains compatible");
 
-        assert!(matches!(result, Err(KernelOperationError::StaleContext)));
-        assert_eq!(root.task.live_thread_count(), 2);
+        assert_eq!(second.task().key(), root.task().key());
+        assert_eq!(root.task.live_thread_count(), 3);
     }
 
     #[test]
@@ -3057,7 +3372,7 @@ mod tests {
     }
 
     #[test]
-    fn operation_lifetime_reservations_serialize_exit_and_backend_preparation() {
+    fn operation_lifetime_reservations_allow_thread_prepare_but_serialize_publication() {
         let (kernel, root) = bootstrap(335);
         let fork_plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
         let thread_plan = ClonePlan::from_flags(
@@ -3086,16 +3401,19 @@ mod tests {
             .expect("reserve thread")
             .prepare(ThreadId::synthetic_for_tests(337))
             .expect("prepare thread backend");
-        assert!(matches!(
-            kernel.prepare_task_exit(
+        let prepared_exit_while_thread_prepares = kernel
+            .prepare_task_exit(
                 root.task.key().id,
                 LinuxWaitStatus::from_wait_encoding(0),
                 TaskRusage::default(),
                 None,
-            ),
+            )
+            .expect("thread preparation does not reserve the task");
+        assert!(matches!(
+            prepared_thread.commit(),
             Err(KernelOperationError::TaskBusy(id)) if id == root.task.key().id
         ));
-        drop(prepared_thread);
+        drop(prepared_exit_while_thread_prepares);
 
         let prepared_exit = kernel
             .prepare_task_exit(
@@ -3124,6 +3442,57 @@ mod tests {
             .expect("fork drop unlocks thread");
         drop(thread_after_drop);
         assert_eq!(kernel.validate_invariants(), Ok(()));
+    }
+
+    #[test]
+    fn exact_generation_exit_waits_for_reservation_release_and_is_idempotent() {
+        let (kernel, root) = bootstrap(336);
+        let task = root.task().key();
+        let prepared_fork = kernel
+            .reserve_fork(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).unwrap(),
+                "reservation holder".to_owned(),
+                None,
+            )
+            .unwrap()
+            .prepare_reference(ThreadId::synthetic_for_tests(337))
+            .unwrap();
+
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let exiting = Arc::clone(&kernel);
+        let handle = std::thread::spawn(move || {
+            let result = exiting.exit_task_key_eventually(
+                task,
+                LinuxWaitStatus::from_wait_encoding(17 << 8),
+                TaskRusage::default(),
+            );
+            done_tx.send(result).unwrap();
+        });
+        kernel.wait_for_reservation_waiter_for_tests();
+        assert!(matches!(
+            done_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        drop(prepared_fork);
+        let zombie = done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("reservation release wakes terminal retry")
+            .expect("exact-generation exit succeeds");
+        handle.join().unwrap();
+        assert_eq!(zombie.key, task);
+        assert_eq!(zombie.status.raw(), 17 << 8);
+
+        let repeated = kernel
+            .exit_task_key_eventually(
+                task,
+                LinuxWaitStatus::from_wait_encoding(99 << 8),
+                TaskRusage::default(),
+            )
+            .expect("exact zombie makes repeated cleanup idempotent");
+        assert_eq!(repeated.key, task);
+        assert_eq!(repeated.status.raw(), 17 << 8);
     }
 
     #[test]
@@ -3236,7 +3605,10 @@ mod tests {
             )
             .expect("child");
         let subscriber = Arc::new(CountingExitSubscriber::default());
-        assert!(kernel.register_task_exit_subscriber(parent.task.key().id, &subscriber));
+        assert_eq!(
+            kernel.register_task_exit_subscriber(parent.task.key().id, &subscriber),
+            Some(parent.task.key())
+        );
 
         let prepared = kernel
             .prepare_task_exit(
@@ -3269,7 +3641,10 @@ mod tests {
             Ok(WaitOutcome::Exited(_))
         ));
         let after_exit = Arc::new(CountingExitSubscriber::default());
-        assert!(kernel.register_task_exit_subscriber(parent.task.key().id, &after_exit));
+        assert_eq!(
+            kernel.register_task_exit_subscriber(parent.task.key().id, &after_exit),
+            Some(parent.task.key())
+        );
         assert_eq!(after_exit.0.load(Ordering::Acquire), 1);
         assert_eq!(subscriber.0.load(Ordering::Acquire), 1);
     }

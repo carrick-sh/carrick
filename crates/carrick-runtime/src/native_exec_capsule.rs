@@ -125,6 +125,7 @@ pub(crate) struct NativeReexecAotCacheV1 {
     pub(crate) translator_abi: u32,
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl From<carrick_native_darwin::aot_cache::ContainerCacheReexecConfig> for NativeReexecAotCacheV1 {
     fn from(config: carrick_native_darwin::aot_cache::ContainerCacheReexecConfig) -> Self {
         Self {
@@ -140,6 +141,7 @@ impl From<carrick_native_darwin::aot_cache::ContainerCacheReexecConfig> for Nati
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl From<&NativeReexecAotCacheV1>
     for carrick_native_darwin::aot_cache::ContainerCacheReexecConfig
 {

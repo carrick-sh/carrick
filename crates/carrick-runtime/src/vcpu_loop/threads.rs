@@ -11,7 +11,7 @@ enum SharedWordWaitRaw {
 }
 
 pub(super) enum CloneThreadSpawn {
-    Started(ThreadId),
+    Started(crate::kernel::LinuxTid),
     Errno(crate::linux_abi::LinuxErrno),
 }
 
@@ -454,11 +454,28 @@ where
         child_tid_addr: u64,
         clear_child_tid_addr: u64,
     ) -> Result<CloneThreadSpawn, RuntimeError> {
-        if kernel.process_exiting() {
-            return Err(RuntimeError::Trap(TrapError::Hypervisor(
-                "clone raced process exit".to_owned(),
-            )));
+        let Some(clone_permit) = kernel.try_enroll_clone() else {
+            return Ok(CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EAGAIN));
+        };
+        if kernel.process_exiting() || clone_permit.is_cancelled() {
+            return Ok(CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EAGAIN));
         }
+        let read_tid_output = |address: u64| -> Option<Option<Vec<u8>>> {
+            if address == 0 {
+                Some(None)
+            } else {
+                engine
+                    .read_bytes(address, std::mem::size_of::<i32>())
+                    .ok()
+                    .map(Some)
+            }
+        };
+        let Some(parent_tid_original) = read_tid_output(parent_tid_addr) else {
+            return Ok(CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EFAULT));
+        };
+        let Some(child_tid_original) = read_tid_output(child_tid_addr) else {
+            return Ok(CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EFAULT));
+        };
         let (linux_tid, tid, prepared_thread) =
             if let Some(process) = kernel.hvpatch_process.as_ref() {
                 let plan = match crate::kernel::ClonePlan::from_flags(
@@ -503,17 +520,6 @@ where
                 };
                 (linux_tid, tid, None)
             };
-        let tid_bytes = tid.raw().to_le_bytes();
-        if (parent_tid_addr != 0 && engine.write_bytes(parent_tid_addr, &tid_bytes).is_err())
-            || (child_tid_addr != 0 && engine.write_bytes(child_tid_addr, &tid_bytes).is_err())
-        {
-            if prepared_thread.is_none() {
-                self.registry.exit(tid);
-                let _ = kernel.dispatcher.exit_one_task_thread(linux_tid);
-            }
-            return Ok(CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EFAULT));
-        }
-
         let spec = match engine.build_sibling_spec(carrick_hal::GuestEntryRegs {
             return_value: 0,
             stack: Some(stack),
@@ -578,7 +584,9 @@ where
                 // acquire leaves its JoinHandle live past the process-bank
                 // teardown deadline even though it never created a vCPU.
                 let lease = loop {
-                    if child_kernel.process_exiting() {
+                    if child_kernel.process_exiting()
+                        || child_kernel.clone_admission_cancelled()
+                    {
                         let _ = ready_tx.send(Err("process exited before sibling admission".to_owned()));
                         return;
                     }
@@ -616,14 +624,17 @@ where
                         .map_or(0, crate::hvpatch::ProcessContext::pid),
                     tid.raw(),
                 );
-                if child_kernel.process_exiting() {
+                if child_kernel.process_exiting()
+                    || child_kernel.clone_admission_cancelled()
+                {
                     drop(topo);
                     let _ = ready_tx.send(Err("process exited before sibling materialization".to_owned()));
                     return;
                 }
                 match E::materialize_sibling(spec) {
-                    Ok(child_engine) => {
+                    Ok(mut child_engine) => {
                         if ready_tx.send(Ok(())).is_err() || start_rx.recv() != Ok(true) {
+                            child_engine.destroy_vcpu_on_thread_exit();
                             drop(topo);
                             return;
                         }
@@ -653,45 +664,13 @@ where
                                 tracing::trace!(
                                     tid = tid.raw(),
                                     exit_code = result.exit_code,
-                                    "hvpatch sibling reached process exit publication"
+                                    "sibling reached process exit publication"
                                 );
                                 if child_kernel.dispatcher.execution_backend()
                                     == crate::page_profile::ExecutionBackend::HvPatch
                                 {
-                                    if let Some(process) = child_kernel
-                                        .hvpatch_process
-                                        .as_ref()
-                                        .filter(|process| process.is_child())
-                                    {
-                                        // An in-process Linux child has no outer
-                                        // CLI owner for its private dispatcher.
-                                        let _ = unsafe {
-                                            libc::write(
-                                                1,
-                                                result.stdout.as_ptr() as *const _,
-                                                result.stdout.len(),
-                                            )
-                                        };
-                                        let _ = unsafe {
-                                            libc::write(
-                                                2,
-                                                result.stderr.as_ptr() as *const _,
-                                                result.stderr.len(),
-                                            )
-                                        };
-                                        if let Err(error) =
-                                            process.publish_exit_code(result.exit_code, tid)
-                                        {
-                                            tracing::error!(
-                                                pid = process.pid(),
-                                                %error,
-                                                "publish sibling-initiated hvpatch child exit failed"
-                                            );
-                                        }
-                                    }
-                                    // A root result is emitted exactly once by
-                                    // the main CLI owner after the completion
-                                    // barrier; never write it from this worker.
+                                    // The vCPU loop's terminal owner already ran
+                                    // the unified child/root process finalizer.
                                     return;
                                 }
                                 let _ = std::io::Write::flush(&mut std::io::stdout());
@@ -716,17 +695,12 @@ where
                             }
                             Err(e) => {
                                 tracing::error!(tid = tid.raw(), error = %e, "thread sibling vCPU loop failed");
-                                if let Some(process) = child_kernel
-                                    .hvpatch_process
-                                    .as_ref()
-                                    .filter(|process| process.is_child())
-                                    && let Err(error) = process.publish_exit_code(127, tid)
+                                if child_kernel.dispatcher.execution_backend()
+                                    == crate::page_profile::ExecutionBackend::HvPatch
                                 {
-                                    tracing::error!(
-                                        pid = process.pid(),
-                                        %error,
-                                        "publish failed sibling-initiated hvpatch child exit failed"
-                                    );
+                                    // Unified HVPatch terminal cleanup owns the
+                                    // registry, Kernel task, and backend state.
+                                    return;
                                 }
                                 // Exit-cleanup gate (see handle_thread_exit).
                                 let _cleanup_gate = crate::fork_quiesce::begin_exit_cleanup();
@@ -734,11 +708,9 @@ where
                                 cleanup_kicker.unregister(tid);
                                 crate::host_signal::forget_thread(tid.raw());
                                 cleanup_kernel.dispatcher.forget_thread_signal_state(tid);
-                                if cleanup_kernel.hvpatch_process.is_none() {
-                                    let _ = cleanup_kernel
-                                        .dispatcher
-                                        .exit_one_task_thread(linux_tid);
-                                }
+                                let _ = cleanup_kernel
+                                    .dispatcher
+                                    .exit_one_task_thread(linux_tid);
                             }
                         }
                     }
@@ -763,63 +735,131 @@ where
                 return Err(error);
             }
         };
-        match ready_rx.recv() {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                let _ = start_tx.send(false);
-                let _ = handle.join();
-                if prepared_thread.is_none() {
-                    self.registry.exit(tid);
-                    let _ = kernel.dispatcher.exit_one_task_thread(linux_tid);
+        // Thread creation is a blocking wait for another scheduler consumer.
+        // Reclaim this caller's vCPU before waiting so a full M:N budget cannot
+        // deadlock with every parent holding a slot while its child waits for
+        // one. Keep the caller reclaimed through publication/start: the child
+        // materializer holds the topology lock until `start_tx`, so resuming the
+        // parent first would exchange the slot deadlock for a topology deadlock.
+        let parent_reclaim =
+            self.park_vcpu_for_blocking_wait(engine, crate::thread::VcpuParkClass::ReleaseSafe);
+        let ready_deadline = Instant::now() + Duration::from_secs(10);
+        let ready = loop {
+            match ready_rx.recv_timeout(Duration::from_millis(1)) {
+                Ok(Ok(())) => break Ok(()),
+                Ok(Err(error)) => {
+                    break Err(RuntimeError::Trap(TrapError::Hypervisor(error)));
                 }
-                return Err(RuntimeError::Trap(TrapError::Hypervisor(error)));
-            }
-            Err(error) => {
-                let _ = start_tx.send(false);
-                let _ = handle.join();
-                if prepared_thread.is_none() {
-                    self.registry.exit(tid);
-                    let _ = kernel.dispatcher.exit_one_task_thread(linux_tid);
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if Instant::now() >= ready_deadline {
+                        tracing::error!(
+                            linux_tid = linux_tid.raw(),
+                            backend_tid = tid.raw(),
+                            process_exiting = kernel.process_exiting(),
+                            clone_cancelled = clone_permit.is_cancelled(),
+                            "sibling materialization start gate timed out"
+                        );
+                        std::process::abort();
+                    }
+                    // A process fork owns the topology lock before draining
+                    // sibling vCPUs. A concurrent clone materializer can wait
+                    // on that lock while this caller waits for `ready`.
+                    if self.fork_is_quiescing() {
+                        if parent_reclaim.is_some() {
+                            self.park_if_fork_quiescing();
+                        } else {
+                            self.release_and_park_vcpu_for_fork(engine)?;
+                        }
+                    }
                 }
-                return Err(RuntimeError::Trap(TrapError::Hypervisor(format!(
-                    "sibling materialization channel failed: {error}"
-                ))));
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    break Err(RuntimeError::Trap(TrapError::Hypervisor(
+                        "sibling materialization channel disconnected".to_owned(),
+                    )));
+                }
             }
+        };
+        if let Err(error) = ready {
+            let _ = start_tx.send(false);
+            let _ = handle.join();
+            if prepared_thread.is_none() {
+                self.registry.exit(tid);
+                let _ = kernel.dispatcher.exit_one_task_thread(linux_tid);
+            }
+            self.resume_vcpu_after_blocking_wait(engine, parent_reclaim)?;
+            return Err(error);
         }
+
+        let restore_tid_outputs = |engine: &mut E| {
+            if let Some(bytes) = parent_tid_original.as_ref() {
+                let _ = engine.write_bytes(parent_tid_addr, bytes);
+            }
+            if let Some(bytes) = child_tid_original.as_ref() {
+                let _ = engine.write_bytes(child_tid_addr, bytes);
+            }
+        };
+        let tid_bytes = linux_tid.raw().to_le_bytes();
+        let tid_outputs_published = (parent_tid_addr == 0
+            || engine.write_bytes(parent_tid_addr, &tid_bytes).is_ok())
+            && (child_tid_addr == 0 || engine.write_bytes(child_tid_addr, &tid_bytes).is_ok());
+        if !tid_outputs_published {
+            restore_tid_outputs(engine);
+            let _ = start_tx.send(false);
+            let _ = handle.join();
+            if prepared_thread.is_none() {
+                self.registry.exit(tid);
+                let _ = kernel.dispatcher.exit_one_task_thread(linux_tid);
+            }
+            self.resume_vcpu_after_blocking_wait(engine, parent_reclaim)?;
+            return Ok(CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EFAULT));
+        }
+
         if let Some(prepared) = prepared_thread {
             let published = match prepared.commit() {
                 Ok(published) => published,
                 Err(error) => {
+                    restore_tid_outputs(engine);
                     let _ = start_tx.send(false);
                     let _ = handle.join();
+                    self.resume_vcpu_after_blocking_wait(engine, parent_reclaim)?;
                     return Err(RuntimeError::Configuration(format!(
                         "publish authoritative hvpatch thread: {error}"
                     )));
                 }
             };
-            published.into_context().map_err(|error| {
-                RuntimeError::Configuration(format!("start authoritative hvpatch thread: {error}"))
-            })?;
+            if let Err(error) = published.into_context() {
+                tracing::error!(
+                    tid = tid.raw(),
+                    %error,
+                    "authoritative thread start gate failed after publication"
+                );
+                std::process::abort();
+            }
             self.registry
                 .register_child_with_tid(tid, clear_child_tid_addr);
         }
         kernel
             .dispatcher
             .inherit_thread_signal_mask(self.this_tid, tid);
-        if start_tx.send(true).is_err() {
-            self.registry.exit(tid);
-            if let Some(process) = kernel.hvpatch_process.as_ref() {
-                let _ = process.exit_thread(linux_tid);
-            } else {
-                let _ = kernel.dispatcher.exit_one_task_thread(linux_tid);
-            }
-            let _ = handle.join();
-            return Err(RuntimeError::Configuration(
-                "sibling start gate disappeared after publication".to_owned(),
-            ));
-        }
+        // Make the host child visible to every exit/exec census before opening
+        // its start gate. Once Kernel publication and runtime registration are
+        // authoritative, a vanished receiver is an internal invariant breach,
+        // not a guest-visible clone failure.
         self.threads.lock().push(handle);
-        Ok(CloneThreadSpawn::Started(tid))
+        if start_tx.send(true).is_err() {
+            tracing::error!(
+                tid = tid.raw(),
+                "sibling start gate disappeared after publication"
+            );
+            std::process::abort();
+        }
+        // Publication, registry state, handle visibility, and child start are
+        // now complete. Release admission before reacquiring the parent's vCPU:
+        // the child can itself become terminal and must not wait on a permit
+        // whose owner is queued behind that child's scheduler slot.
+        drop(clone_permit);
+        self.resume_vcpu_after_blocking_wait(engine, parent_reclaim)?;
+        Ok(CloneThreadSpawn::Started(linux_tid))
     }
 
     /// Stop every sibling vCPU belonging to this Linux process before its
@@ -946,16 +986,26 @@ where
             let woken = self.futex.wake(addr, 1);
             crate::event_ring::rec_futex_wake(addr, woken);
         }
-        let last = self.registry.exit(self.this_tid);
+        let mut last = self.registry.exit(self.this_tid);
         if !last {
             if let Some(process) = kernel.hvpatch_process.as_ref() {
-                if let Err(error) = process.exit_thread(self.linux_tid) {
-                    tracing::error!(
-                        pid = process.pid(),
-                        tid = self.this_tid.raw(),
-                        %error,
-                        "retire authoritative hvpatch thread failed"
-                    );
+                match process.exit_thread(self.linux_tid) {
+                    Ok(crate::hvpatch::ProcessThreadExit::Retired) => {}
+                    Ok(crate::hvpatch::ProcessThreadExit::LastThread) => {
+                        // Concurrent sibling retirement made this the final
+                        // authoritative thread after the runtime-registry check.
+                        // Escalate to the one process-terminal owner.
+                        last = true;
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            pid = process.pid(),
+                            tid = self.this_tid.raw(),
+                            %error,
+                            "retire authoritative hvpatch thread failed; terminating process"
+                        );
+                        last = true;
+                    }
                 }
             } else if let Err(error) = kernel.dispatcher.exit_one_task_thread(self.linux_tid) {
                 tracing::error!(

@@ -141,6 +141,12 @@ pub trait VcpuRegistry: Send + Sync {
     fn any_other_in_guest(&self, except: ThreadId) -> bool;
     fn set_in_guest(&self, tid: ThreadId, in_guest: bool);
     fn count(&self) -> usize;
+    /// Bounded timeout diagnostics only: registered vCPU identities and their
+    /// current in-guest handshake state. Ordinary coordination must use the
+    /// scalar predicates above rather than snapshots.
+    fn debug_registered_vcpus(&self) -> Vec<(ThreadId, bool)> {
+        Vec::new()
+    }
 }
 
 /// The platform-NEUTRAL [`VcpuRegistry`] implementation, shared by every backend.
@@ -233,6 +239,23 @@ impl VcpuRegistry for GenericVcpuRegistry {
 
     fn count(&self) -> usize {
         self.lock_handles().len()
+    }
+
+    fn debug_registered_vcpus(&self) -> Vec<(ThreadId, bool)> {
+        let handles = self.lock_handles();
+        let in_guest = self.lock_in_guest();
+        let mut snapshot: Vec<_> = handles
+            .keys()
+            .copied()
+            .map(|tid| {
+                let active = in_guest
+                    .get(&tid)
+                    .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst));
+                (tid, active)
+            })
+            .collect();
+        snapshot.sort_by_key(|(tid, _)| tid.raw());
+        snapshot
     }
 }
 

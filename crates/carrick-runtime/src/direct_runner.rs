@@ -522,6 +522,8 @@ pub struct DirectRunner {
     /// its own pid (`ThreadRegistry`'s main tid is immutable by design);
     /// every other access is a read.
     registry: RwLock<Arc<crate::thread::ThreadRegistry>>,
+    /// Explicit Linux identity for each backend-local execution thread.
+    linux_tids: RwLock<std::collections::BTreeMap<ThreadId, crate::kernel::LinuxTid>>,
     /// Private-futex parking for this guest, shared with the dispatcher's
     /// futex handler so waits and wakes meet in one table. `Arc` so it can be
     /// published as the PROCESS-current table
@@ -604,6 +606,13 @@ impl DirectRunner {
         // implementation).
         crate::thread::set_current_futex_table(&futex);
         crate::native_darwin::ensure_native_timer_delivery();
+        let root_linux_tid = match dispatcher.capture_one_task_context() {
+            Ok(context) => context.thread().key().tid,
+            Err(error) => {
+                tracing::error!(%error, "direct runner lost its one-task Kernel binding");
+                std::process::abort();
+            }
+        };
         Self {
             dispatcher,
             reporter: CompatReporter::default(),
@@ -616,6 +625,10 @@ impl DirectRunner {
             anon_none: Mutex::new(Vec::new()),
             owned_mappings: Mutex::new(Vec::new()),
             registry: RwLock::new(registry),
+            linux_tids: RwLock::new(std::collections::BTreeMap::from([(
+                ThreadId::main_from_host_pid(),
+                root_linux_tid,
+            )])),
             futex,
             threads: Mutex::new(Vec::new()),
             exec: None,
@@ -785,6 +798,12 @@ impl DirectRunner {
         }
     }
 
+    fn current_linux_tid(&self) -> Option<crate::kernel::LinuxTid> {
+        read_lock(&self.linux_tids)
+            .get(&self.current_tid())
+            .copied()
+    }
+
     /// The main guest thread's registry key.
     fn main_tid(&self) -> ThreadId {
         read_lock(&self.registry).main_tid()
@@ -836,6 +855,16 @@ impl DirectRunner {
             self.futex.wake(address, 1);
         }
         let last = read_lock(&self.registry).exit(tid);
+        let linux_tid = write_lock(&self.linux_tids).remove(&tid);
+        if !last
+            && let Some(linux_tid) = linux_tid
+            && let Err(error) = self.dispatcher.exit_one_task_thread(linux_tid)
+        {
+            self.end_process(DirectRunOutcome::Unsupported {
+                syscall: 93,
+                outcome: format!("retire tier-D one-task Kernel thread: {error}"),
+            });
+        }
         self.dispatcher.forget_thread_signal_state(tid);
         if last {
             let mut slot = lock(&self.outcome);
@@ -1818,9 +1847,12 @@ impl DirectRunner {
         });
         let reporter = crate::compat::CompatReporter::default();
         let mut memory = self.memory;
+        let linux_tid = self
+            .current_linux_tid()
+            .ok_or_else(|| crate::host_to_linux_errno(libc::EIO).guest_retval())?;
         let kernel = self
             .dispatcher
-            .capture_one_task_context()
+            .capture_kernel_context(linux_tid)
             .map_err(|_| crate::host_to_linux_errno(libc::EIO).guest_retval())?;
         match self.dispatcher.dispatch_threaded(
             &kernel,
@@ -2139,7 +2171,14 @@ impl DirectRunner {
         let mut fd_wait_deadline: Option<Instant> = None;
         // The signal-wait (`WaitOnSignals`) overall deadline, same contract.
         let mut signal_wait_deadline: Option<Instant> = None;
-        let kernel = match self.dispatcher.capture_one_task_context() {
+        let Some(linux_tid) = self.current_linux_tid() else {
+            self.end_process(DirectRunOutcome::Unsupported {
+                syscall: number,
+                outcome: "missing explicit one-task Linux thread identity".to_string(),
+            });
+            return ServiceVerdict::Leave;
+        };
+        let kernel = match self.dispatcher.capture_kernel_context(linux_tid) {
             Ok(kernel) => kernel,
             Err(error) => {
                 self.end_process(DirectRunOutcome::Unsupported {
@@ -2187,7 +2226,7 @@ impl DirectRunner {
                 Ok(DispatchOutcome::CloneThread {
                     stack,
                     tls,
-                    flags: _,
+                    flags,
                     parent_tid_addr,
                     child_tid_addr,
                     clear_child_tid_addr,
@@ -2195,6 +2234,8 @@ impl DirectRunner {
                     return self.service_clone_thread(
                         ctx,
                         tid,
+                        linux_tid,
+                        flags,
                         stack,
                         tls,
                         parent_tid_addr,
@@ -2573,6 +2614,8 @@ impl DirectRunner {
         &self,
         ctx: &GuestContext,
         parent_tid: ThreadId,
+        parent_linux_tid: crate::kernel::LinuxTid,
+        flags: u64,
         stack: u64,
         tls: Option<u64>,
         parent_tid_addr: u64,
@@ -2606,16 +2649,69 @@ impl DirectRunner {
         slots.guest_tls = tls.unwrap_or(parent_tls);
         slots.guest_x18 = parent_x18;
 
-        let tid = read_lock(&self.registry).register_child(clear_child_tid_addr);
-        self.dispatcher.inherit_thread_signal_mask(parent_tid, tid);
-        let tid_bytes = tid.raw().to_le_bytes();
+        let clone_plan = match crate::kernel::ClonePlan::from_flags(
+            carrick_abi::LinuxCloneFlags::from_bits_retain(flags),
+        ) {
+            Ok(plan) => plan,
+            Err(_) => {
+                return ServiceVerdict::Resume(crate::linux_abi::LINUX_EINVAL.guest_retval());
+            }
+        };
+        let parent_context = match self.dispatcher.capture_kernel_context(parent_linux_tid) {
+            Ok(context) => context,
+            Err(error) => {
+                self.end_process(DirectRunOutcome::Unsupported {
+                    syscall: ctx.syscall_nr(),
+                    outcome: format!("capture tier-D clone parent Kernel context: {error}"),
+                });
+                return ServiceVerdict::Leave;
+            }
+        };
+        let reservation =
+            match parent_context
+                .kernel()
+                .reserve_thread_clone(&parent_context, clone_plan, None)
+            {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    self.end_process(DirectRunOutcome::Unsupported {
+                        syscall: ctx.syscall_nr(),
+                        outcome: format!("reserve tier-D Kernel thread: {error}"),
+                    });
+                    return ServiceVerdict::Leave;
+                }
+            };
+        let linux_tid = reservation.tid();
         let mut memory = self.memory;
-        if parent_tid_addr != 0 {
-            let _ = memory.write_bytes_raw(parent_tid_addr, &tid_bytes);
-        }
-        if child_tid_addr != 0 {
-            let _ = memory.write_bytes_raw(child_tid_addr, &tid_bytes);
-        }
+        let read_tid_output = |memory: &mut IdentityMemory, address: u64| {
+            if address == 0 {
+                Some(None)
+            } else {
+                memory
+                    .read_bytes(address, std::mem::size_of::<i32>())
+                    .ok()
+                    .map(Some)
+            }
+        };
+        let Some(parent_tid_original) = read_tid_output(&mut memory, parent_tid_addr) else {
+            return ServiceVerdict::Resume(crate::linux_abi::LINUX_EFAULT.guest_retval());
+        };
+        let Some(child_tid_original) = read_tid_output(&mut memory, child_tid_addr) else {
+            return ServiceVerdict::Resume(crate::linux_abi::LINUX_EFAULT.guest_retval());
+        };
+        let tid = read_lock(&self.registry).register_child(clear_child_tid_addr);
+        let prepared_thread = match reservation.prepare(tid) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                read_lock(&self.registry).exit(tid);
+                self.end_process(DirectRunOutcome::Unsupported {
+                    syscall: ctx.syscall_nr(),
+                    outcome: format!("prepare tier-D Kernel thread: {error}"),
+                });
+                return ServiceVerdict::Leave;
+            }
+        };
+        self.dispatcher.inherit_thread_signal_mask(parent_tid, tid);
 
         // A process with two guest threads must have Mach delivery on both
         // before either can publish or execute a process-global MAP_JIT range.
@@ -2625,6 +2721,7 @@ impl DirectRunner {
         group.require_mach_exception_handler();
         let runner_ptr = SendPtr(std::ptr::from_ref(self));
         let group_ptr = SendGroupPtr(std::ptr::from_ref(group));
+        let (start_tx, start_rx) = std::sync::mpsc::sync_channel(1);
         let spawned = std::thread::Builder::new()
             .name(format!("tierd-guest-{tid}"))
             .spawn(move || {
@@ -2634,6 +2731,10 @@ impl DirectRunner {
                 // group alive across it — so both pointers outlive this
                 // thread.
                 let (runner, group) = unsafe { (&*runner_ptr.0, &*group_ptr.0) };
+                if start_rx.recv() != Ok(true) {
+                    runner.finish_thread_bookkeeping(tid, 0);
+                    return;
+                }
                 // A child that cannot ENTER is a process-level failure, not
                 // a quiet thread death: the guest was told the clone
                 // succeeded, so a thread that never runs its first
@@ -2682,8 +2783,53 @@ impl DirectRunner {
             });
         match spawned {
             Ok(handle) => {
+                let restore_tid_outputs = |memory: &mut IdentityMemory| {
+                    if let Some(bytes) = parent_tid_original.as_ref() {
+                        let _ = memory.write_bytes_raw(parent_tid_addr, bytes);
+                    }
+                    if let Some(bytes) = child_tid_original.as_ref() {
+                        let _ = memory.write_bytes_raw(child_tid_addr, bytes);
+                    }
+                };
+                let tid_bytes = linux_tid.raw().to_le_bytes();
+                let tid_outputs_published = (parent_tid_addr == 0
+                    || memory.write_bytes_raw(parent_tid_addr, &tid_bytes).is_ok())
+                    && (child_tid_addr == 0
+                        || memory.write_bytes_raw(child_tid_addr, &tid_bytes).is_ok());
+                if !tid_outputs_published {
+                    restore_tid_outputs(&mut memory);
+                    let _ = start_tx.send(false);
+                    let _ = handle.join();
+                    return ServiceVerdict::Resume(crate::linux_abi::LINUX_EFAULT.guest_retval());
+                }
+                let published = match prepared_thread.commit() {
+                    Ok(published) => published,
+                    Err(error) => {
+                        restore_tid_outputs(&mut memory);
+                        let _ = start_tx.send(false);
+                        let _ = handle.join();
+                        self.end_process(DirectRunOutcome::Unsupported {
+                            syscall: ctx.syscall_nr(),
+                            outcome: format!("publish tier-D Kernel thread: {error}"),
+                        });
+                        return ServiceVerdict::Leave;
+                    }
+                };
+                if let Err(error) = published.into_context() {
+                    tracing::error!(
+                        linux_tid = linux_tid.raw(),
+                        backend_tid = tid.raw(),
+                        %error,
+                        "tier-D Kernel start gate failed after publication"
+                    );
+                    std::process::abort();
+                }
+                write_lock(&self.linux_tids).insert(tid, linux_tid);
                 lock(&self.threads).push(handle);
-                ServiceVerdict::Resume(i64::from(tid.raw()))
+                if start_tx.send(true).is_err() {
+                    std::process::abort();
+                }
+                ServiceVerdict::Resume(i64::from(linux_tid.raw()))
             }
             Err(_) => {
                 read_lock(&self.registry).exit(tid);
@@ -2976,6 +3122,18 @@ impl DirectRunner {
         let registry = Arc::new(crate::thread::ThreadRegistry::new(tid));
         *write_lock(&self.registry) = Arc::clone(&registry);
         crate::thread::set_current_registry(registry);
+        let context = self
+            .dispatcher
+            .reset_one_task_kernel_binding_for_current_process(tid)
+            .unwrap_or_else(|error| {
+                let message = format!("tier-D fork child Kernel reset failed: {error}\n");
+                unsafe {
+                    libc::write(2, message.as_ptr().cast(), message.len());
+                    libc::_exit(125);
+                }
+            });
+        *write_lock(&self.linux_tids) =
+            std::collections::BTreeMap::from([(tid, context.thread().key().tid)]);
         for handle in std::mem::take(&mut *lock(&self.threads)) {
             // The copied JoinHandle names a PARENT thread; joining or
             // detaching it here would target a pthread that does not exist

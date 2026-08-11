@@ -432,6 +432,36 @@ impl SyscallDispatcher {
         }
     }
 
+    /// Process-directed child-exit delivery must not retain the thread that
+    /// happened to create the runtime endpoint. A blocked default-ignored
+    /// SIGCHLD remains waitable when any surviving thread blocks it for
+    /// sigwait, while an explicitly ignored signal remains discarded.
+    pub fn child_exit_signal_needs_process_pump(&self, exit_signal: u32) -> bool {
+        let signum = if exit_signal == 0 {
+            return false;
+        } else if (1..=64).contains(&exit_signal) {
+            exit_signal as i32
+        } else {
+            crate::linux_abi::LINUX_SIGCHLD
+        };
+        if sigmask_bit(signum).is_none() {
+            return false;
+        }
+        let signal = self.signal.lock();
+        match signal.handlers.get(&signum).map(|action| action.sa_handler) {
+            Some(handler) if handler == crate::linux_abi::LINUX_SIG_IGN => false,
+            Some(handler) if handler == crate::linux_abi::LINUX_SIG_DFL => {
+                signal.masks.values().any(|mask| mask.contains(signum))
+                    || !is_default_ignore_signum(signum)
+            }
+            Some(_) => true,
+            None => {
+                signal.masks.values().any(|mask| mask.contains(signum))
+                    || !is_default_ignore_signum(signum)
+            }
+        }
+    }
+
     /// The set of signals that must NOT interrupt a blocking,
     /// restartable syscall (wait4/waitid) for `tid`. On Linux a syscall is
     /// interrupted only by a signal that is both unblocked AND has an effect:
@@ -3747,6 +3777,29 @@ mod tests {
             !d.child_exit_signal_needs_pump(tid, 0),
             "clone exit_signal 0 requests no signal"
         );
+    }
+
+    #[test]
+    fn process_child_exit_predicate_follows_surviving_thread_masks() {
+        let d = SyscallDispatcher::new();
+        let retired_leader = crate::thread::ThreadId::synthetic_for_tests(8);
+        let survivor = crate::thread::ThreadId::synthetic_for_tests(9);
+        let chld = crate::linux_abi::LINUX_SIGCHLD;
+        d.signal
+            .lock()
+            .masks
+            .insert(survivor, SigSet::EMPTY.with(chld));
+
+        assert!(d.child_exit_signal_needs_process_pump(chld as u32));
+        assert!(
+            !d.child_exit_signal_needs_pump(retired_leader, chld as u32),
+            "a fixed retired leader would miss the surviving sigwait mask"
+        );
+
+        let mut ignored = LinuxSigaction::empty();
+        ignored.sa_handler = crate::linux_abi::LINUX_SIG_IGN;
+        d.signal.lock().handlers.insert(chld, ignored);
+        assert!(!d.child_exit_signal_needs_process_pump(chld as u32));
     }
 
     #[test]

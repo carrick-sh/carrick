@@ -2477,6 +2477,67 @@ impl SyscallDispatcher {
         self.kernel_binding.read().capture(tid)
     }
 
+    pub(crate) fn prepare_one_task_kernel_exec(
+        &self,
+        tid: crate::kernel::LinuxTid,
+    ) -> Result<crate::kernel::PreparedExec, String> {
+        let context = self
+            .capture_kernel_context(tid)
+            .map_err(|error| error.to_string())?;
+        context
+            .kernel()
+            .prepare_exec(&context, None)
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(all(
+        any(target_os = "freebsd", target_os = "netbsd"),
+        target_arch = "x86_64"
+    ))]
+    pub(crate) fn prepare_one_task_kernel_exec_with_registry_id(
+        &self,
+        tid: crate::kernel::LinuxTid,
+        registry_id: crate::thread::ThreadId,
+    ) -> Result<crate::kernel::PreparedExec, String> {
+        let context = self
+            .capture_kernel_context(tid)
+            .map_err(|error| error.to_string())?;
+        context
+            .kernel()
+            .prepare_exec_with_registry_id(&context, registry_id, None)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn commit_one_task_kernel_exec(
+        &self,
+        prepared: crate::kernel::PreparedExec,
+    ) -> Result<crate::kernel::KernelContext, String> {
+        let kernel = Arc::clone(self.kernel_binding.read().kernel());
+        let context = kernel
+            .commit_exec(prepared, None)
+            .map_err(|error| error.to_string())?;
+        *self.kernel_binding.write() = context.task_binding();
+        Ok(context)
+    }
+
+    pub(crate) fn reset_one_task_kernel_binding_for_current_process(
+        &self,
+        registry_id: crate::thread::ThreadId,
+    ) -> Result<crate::kernel::KernelContext, String> {
+        let observed_pid = i32::try_from(std::process::id())
+            .map_err(|_| "host PID does not fit Linux task identity".to_owned())?;
+        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+            observed_pid,
+            registry_id,
+            "one-task-fork-child-adapter".to_owned(),
+        )
+        .map_err(|error| error.to_string())?;
+        let (_, context) =
+            crate::kernel::Kernel::bootstrap_root(bootstrap).map_err(|error| error.to_string())?;
+        *self.kernel_binding.write() = context.task_binding();
+        Ok(context)
+    }
+
     pub fn capture_one_task_context(
         &self,
     ) -> Result<crate::kernel::KernelContext, crate::kernel::KernelError> {
@@ -2513,10 +2574,37 @@ impl SyscallDispatcher {
         tid: crate::kernel::LinuxTid,
     ) -> Result<(), crate::kernel::KernelOperationError> {
         let binding = self.kernel_binding.read().clone();
-        let context = binding
-            .capture(tid)
-            .map_err(|_| crate::kernel::KernelOperationError::UnknownTask(binding.task_id()))?;
-        binding.kernel().exit_thread(&context, None).map(|_| ())
+        let context = match binding.capture(tid) {
+            Ok(context) => context,
+            Err(crate::kernel::KernelError::UnknownThread(_)) => return Ok(()),
+            Err(_) if !binding.kernel().task_is_live(binding.task_id()) => return Ok(()),
+            Err(_) => {
+                return Err(crate::kernel::KernelOperationError::UnknownTask(
+                    binding.task_id(),
+                ));
+            }
+        };
+        loop {
+            let observed = binding.kernel().reservation_epoch();
+            match binding.kernel().exit_thread(&context, None) {
+                Ok(_) => return Ok(()),
+                Err(crate::kernel::KernelOperationError::TaskBusy(_)) => {
+                    binding.kernel().wait_for_reservation_change(observed);
+                }
+                Err(crate::kernel::KernelOperationError::UnknownThread(_))
+                    if !context.exact_thread_is_live() =>
+                {
+                    return Ok(());
+                }
+                Err(crate::kernel::KernelOperationError::ParentExited)
+                | Err(crate::kernel::KernelOperationError::UnknownTask(_))
+                    if !binding.kernel().task_is_live(binding.task_id()) =>
+                {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     pub(crate) fn hvpatch_process(&self) -> Option<crate::hvpatch::ProcessContext> {

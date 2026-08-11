@@ -36,8 +36,9 @@
 //! handshake (SeqCst on both sides) is preserved verbatim in
 //! [`run_vcpu_until_exit`].
 
+use std::collections::BTreeMap;
 use std::os::fd::IntoRawFd;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
@@ -407,6 +408,243 @@ use signal::el0_debug_signal;
 // Cross-platform kernel-half state.
 // ===================================================================
 
+/// Runtime-only delivery endpoint for one live HVPatch task generation.
+/// Linux parentage remains authoritative in `Kernel`; this table only turns
+/// the parent key selected there into the host wake objects needed to deliver
+/// the configured child-exit signal.
+struct HvpatchRuntimeEndpoint {
+    kernel: Weak<KernelState>,
+    futex: Arc<FutexTable>,
+    kicker: Arc<dyn VcpuRegistry>,
+}
+
+#[derive(Default)]
+pub(crate) struct HvpatchRuntimeDirectory {
+    endpoints: Mutex<BTreeMap<crate::kernel::TaskKey, HvpatchRuntimeEndpoint>>,
+    /// Process-child host threads are shared-VM topology, not members of the
+    /// creating process's Linux thread group. The outer root run owns their
+    /// eventual joins; per-process finalizers must never treat them as sibling
+    /// vCPUs or wait for children that Linux has reparented.
+    process_threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+}
+
+impl HvpatchRuntimeDirectory {
+    fn register(&self, task: crate::kernel::TaskKey, endpoint: HvpatchRuntimeEndpoint) {
+        self.endpoints.lock().insert(task, endpoint);
+    }
+
+    fn remove(&self, task: crate::kernel::TaskKey) {
+        self.endpoints.lock().remove(&task);
+    }
+
+    fn enroll_process_thread(&self, handle: std::thread::JoinHandle<()>) {
+        self.process_threads.lock().push(handle);
+    }
+
+    fn join_process_threads(&self) -> Result<(), RuntimeError> {
+        let mut child_panicked = false;
+        loop {
+            let handles = std::mem::take(&mut *self.process_threads.lock());
+            if handles.is_empty() {
+                return if child_panicked {
+                    Err(RuntimeError::Unsupported(
+                        "HVPatch process child panicked".to_owned(),
+                    ))
+                } else {
+                    Ok(())
+                };
+            }
+            for handle in handles {
+                if handle.join().is_err() {
+                    child_panicked = true;
+                }
+            }
+            // A joined child may have forked another process before it left.
+            // Drain repeatedly until the shared topology census is empty, even
+            // after a panic, so no remaining shared-VM owner is detached.
+        }
+    }
+
+    fn notify_child_exit(&self, parent: crate::kernel::TaskKey, signal: Option<i32>) {
+        let endpoints = self.endpoints.lock();
+        let Some(endpoint) = endpoints.get(&parent) else {
+            return;
+        };
+        let Some(parent_kernel) = endpoint.kernel.upgrade() else {
+            return;
+        };
+        if let Some(signal) = signal
+            && parent_kernel
+                .dispatcher
+                .child_exit_signal_needs_process_pump(signal as u32)
+        {
+            parent_kernel
+                .dispatcher
+                .mark_in_process_signal_pending(signal);
+        }
+        // Child waitability is independent of SIGCHLD disposition. The Kernel
+        // zombie is durable, but a parent can be between its initial wait query
+        // and host-wait enrollment when publication occurs; always nudge every
+        // wait vehicle so it rechecks the authoritative graph even when SIGCHLD
+        // is ignored or blocked.
+        endpoint.futex.notify_signal_pending();
+        parent_kernel.signal_arrival.wake_all_waiters();
+        endpoint.kicker.kick_all();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CloneAdmissionClose {
+    Exec { owner: ThreadId, generation: u64 },
+    Exit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessExitClaim {
+    Owner,
+    LostToExec,
+    AlreadyOwned,
+}
+
+#[derive(Debug, Default)]
+struct CloneAdmissionState {
+    in_flight: usize,
+    generation: u64,
+    closing: Option<CloneAdmissionClose>,
+}
+
+#[derive(Debug, Default)]
+struct CloneAdmissionGate {
+    state: Mutex<CloneAdmissionState>,
+    changed: Condvar,
+}
+
+impl CloneAdmissionGate {
+    fn try_enroll(&self) -> Option<CloneAdmissionPermit<'_>> {
+        let mut state = self.state.lock();
+        if state.closing.is_some() {
+            return None;
+        }
+        state.in_flight = state.in_flight.checked_add(1)?;
+        Some(CloneAdmissionPermit {
+            gate: self,
+            generation: state.generation,
+            active: true,
+        })
+    }
+
+    fn is_closing(&self) -> bool {
+        self.state.lock().closing.is_some()
+    }
+
+    fn close_for_exec(&self, owner: ThreadId) -> Result<ExecCloneAdmission<'_>, RuntimeError> {
+        let mut state = self.state.lock();
+        if let Some(reason) = state.closing {
+            return Err(RuntimeError::Unsupported(format!(
+                "cannot begin exec while clone admission is closing: {reason:?}"
+            )));
+        }
+        let generation = state.generation;
+        state.closing = Some(CloneAdmissionClose::Exec { owner, generation });
+        self.changed.notify_all();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.in_flight != 0 {
+            let now = Instant::now();
+            if now >= deadline {
+                state.closing = None;
+                state.generation = state.generation.wrapping_add(1);
+                self.changed.notify_all();
+                return Err(RuntimeError::Unsupported(format!(
+                    "exec clone-admission drain timed out: in_flight={}",
+                    state.in_flight
+                )));
+            }
+            self.changed
+                .wait_for(&mut state, (deadline - now).min(Duration::from_millis(50)));
+        }
+        Ok(ExecCloneAdmission {
+            gate: self,
+            owner,
+            generation,
+        })
+    }
+
+    fn claim_process_exit(&self) -> Result<ProcessExitClaim, RuntimeError> {
+        let mut state = self.state.lock();
+        match state.closing {
+            Some(CloneAdmissionClose::Exec { .. }) => return Ok(ProcessExitClaim::LostToExec),
+            Some(CloneAdmissionClose::Exit) => return Ok(ProcessExitClaim::AlreadyOwned),
+            None => state.closing = Some(CloneAdmissionClose::Exit),
+        }
+        self.changed.notify_all();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.in_flight != 0 {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(RuntimeError::Unsupported(format!(
+                    "process-exit clone-admission drain timed out: in_flight={}",
+                    state.in_flight
+                )));
+            }
+            self.changed
+                .wait_for(&mut state, (deadline - now).min(Duration::from_millis(50)));
+        }
+        Ok(ProcessExitClaim::Owner)
+    }
+}
+
+struct CloneAdmissionPermit<'a> {
+    gate: &'a CloneAdmissionGate,
+    generation: u64,
+    active: bool,
+}
+
+impl CloneAdmissionPermit<'_> {
+    fn is_cancelled(&self) -> bool {
+        let state = self.gate.state.lock();
+        state.generation != self.generation || state.closing.is_some()
+    }
+}
+
+impl Drop for CloneAdmissionPermit<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = self.gate.state.lock();
+        let Some(in_flight) = state.in_flight.checked_sub(1) else {
+            std::process::abort();
+        };
+        state.in_flight = in_flight;
+        self.active = false;
+        if state.in_flight == 0 {
+            self.gate.changed.notify_all();
+        }
+    }
+}
+
+struct ExecCloneAdmission<'a> {
+    gate: &'a CloneAdmissionGate,
+    owner: ThreadId,
+    generation: u64,
+}
+
+impl Drop for ExecCloneAdmission<'_> {
+    fn drop(&mut self) {
+        let mut state = self.gate.state.lock();
+        if state.closing
+            == Some(CloneAdmissionClose::Exec {
+                owner: self.owner,
+                generation: self.generation,
+            })
+        {
+            state.closing = None;
+            state.generation = state.generation.wrapping_add(1);
+            self.gate.changed.notify_all();
+        }
+    }
+}
+
 /// Shared kernel-half state for the threaded loop: the syscall dispatcher, the
 /// compat reporter, and the host-fork coordinator (held object-safe so this is
 /// cross-platform). Built by the macOS setup wrapper with the boxed HVF
@@ -432,6 +670,15 @@ pub(crate) struct KernelState {
     process_fork_barrier: Option<Arc<crate::fork_quiesce::QuiesceBarrier>>,
     /// Number of host vCPU loops still alive for this Linux process.
     process_vcpu_live: std::sync::atomic::AtomicUsize,
+    /// Cross-layer thread-clone admission spans Kernel reservation through
+    /// runtime registration, handle visibility, and child start.
+    clone_admission: CloneAdmissionGate,
+    /// Runtime-only task-generation to wake-endpoint directory shared by every
+    /// Linux process multiplexed in one HVPatch host process.
+    hvpatch_runtime: Option<Arc<HvpatchRuntimeDirectory>>,
+    /// Signal requested by this process's creating clone/fork operation.
+    /// Parent selection itself is resolved from the Kernel graph at exit.
+    child_exit_signal: Option<i32>,
     /// Terminal result published by whichever HVPatch thread owns process
     /// teardown. The main loop consumes it after sibling-driven exit_group.
     process_terminal: Mutex<Option<Result<RunResult, ()>>>,
@@ -444,10 +691,16 @@ impl KernelState {
         fork: Arc<dyn HostForkCoordinator>,
         signal_arrival: Arc<dyn carrick_hal::SignalArrival>,
         hvpatch_process: Option<crate::hvpatch::ProcessContext>,
+        inherited_hvpatch_runtime: Option<Arc<HvpatchRuntimeDirectory>>,
+        child_exit_signal: Option<i32>,
     ) -> Self {
         let process_fork_barrier = hvpatch_process
             .as_ref()
             .map(|_| Arc::new(crate::fork_quiesce::QuiesceBarrier::new()));
+        let hvpatch_runtime = hvpatch_process.as_ref().map(|_| {
+            inherited_hvpatch_runtime
+                .unwrap_or_else(|| Arc::new(HvpatchRuntimeDirectory::default()))
+        });
         Self {
             dispatcher,
             reporter: CompatReporter::default(),
@@ -457,8 +710,59 @@ impl KernelState {
             process_exiting: std::sync::atomic::AtomicBool::new(false),
             process_fork_barrier,
             process_vcpu_live: std::sync::atomic::AtomicUsize::new(0),
+            clone_admission: CloneAdmissionGate::default(),
+            hvpatch_runtime,
+            child_exit_signal,
             process_terminal: Mutex::new(None),
             process_terminal_ready: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn register_hvpatch_runtime_endpoint(
+        self: &Arc<Self>,
+        futex: Arc<FutexTable>,
+        kicker: Arc<dyn VcpuRegistry>,
+    ) {
+        let (Some(process), Some(directory)) =
+            (self.hvpatch_process.as_ref(), self.hvpatch_runtime.as_ref())
+        else {
+            return;
+        };
+        directory.register(
+            process.task_key(),
+            HvpatchRuntimeEndpoint {
+                kernel: Arc::downgrade(self),
+                futex,
+                kicker,
+            },
+        );
+    }
+
+    fn enroll_hvpatch_process_thread(&self, handle: std::thread::JoinHandle<()>) {
+        let Some(directory) = self.hvpatch_runtime.as_ref() else {
+            std::process::abort();
+        };
+        directory.enroll_process_thread(handle);
+    }
+
+    pub(crate) fn join_hvpatch_process_threads(&self) -> Result<(), RuntimeError> {
+        match self.hvpatch_runtime.as_ref() {
+            Some(directory) => directory.join_process_threads(),
+            None => Ok(()),
+        }
+    }
+
+    fn notify_hvpatch_parent_exit(&self, parent: Option<crate::kernel::TaskKey>) {
+        if let (Some(parent), Some(directory)) = (parent, self.hvpatch_runtime.as_ref()) {
+            directory.notify_child_exit(parent, self.child_exit_signal);
+        }
+    }
+
+    fn unregister_hvpatch_runtime_endpoint(&self) {
+        if let (Some(process), Some(directory)) =
+            (self.hvpatch_process.as_ref(), self.hvpatch_runtime.as_ref())
+        {
+            directory.remove(process.task_key());
         }
     }
 
@@ -484,23 +788,36 @@ impl KernelState {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Claim ownership of whole-process teardown. Multiple guest threads can
-    /// observe exit_group/fatal fallout together; only one may drain siblings,
-    /// retire the ASID/bank, and publish the child wait status.
-    fn try_begin_process_exit(&self) -> bool {
-        self.process_exiting
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            )
-            .is_ok()
+    /// Arbitrate exec and whole-process exit under the same admission lock.
+    /// An exec owner drains terminal siblings as ordinary thread losers; an
+    /// exit owner permanently closes admission and becomes the sole process
+    /// finalizer. This prevents mutually waiting terminal drains.
+    fn claim_process_exit(&self) -> Result<ProcessExitClaim, RuntimeError> {
+        let claim = self.clone_admission.claim_process_exit()?;
+        if claim == ProcessExitClaim::Owner {
+            self.begin_process_exit();
+        }
+        Ok(claim)
     }
 
     pub(crate) fn process_exiting(&self) -> bool {
         self.process_exiting
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn try_enroll_clone(&self) -> Option<CloneAdmissionPermit<'_>> {
+        self.clone_admission.try_enroll()
+    }
+
+    fn clone_admission_cancelled(&self) -> bool {
+        self.clone_admission.is_closing()
+    }
+
+    fn close_clone_admission_for_exec(
+        &self,
+        owner: ThreadId,
+    ) -> Result<ExecCloneAdmission<'_>, RuntimeError> {
+        self.clone_admission.close_for_exec(owner)
     }
 
     fn process_vcpu_live(&self) -> usize {
@@ -2833,7 +3150,7 @@ where
                     child_stack,
                     vfork,
                 } => {
-                    if let Some(retval) = state.handle_fork(
+                    match state.handle_fork(
                         &kernel,
                         &mut engine,
                         quiesce::ForkRequest {
@@ -2847,7 +3164,13 @@ where
                             vfork,
                         },
                     )? {
-                        last_syscall_retval = Some(state.complete_returned(&mut engine, retval)?);
+                        Some(retval) => {
+                            last_syscall_retval =
+                                Some(state.complete_returned(&mut engine, retval)?);
+                        }
+                        None => {
+                            return Ok(state.handle_thread_exit(&kernel, &mut engine, 0, traps));
+                        }
                     }
                 }
                 DispatchOutcome::SetMemoryModel { tso } => {
@@ -2956,21 +3279,58 @@ where
         Ok(VcpuLoopOutcome::TrapLimit(Box::new(result)))
     })();
     // Every terminal HVPatch process transition (root or in-process child)
-    // drains sibling vCPUs and retires its address space before the persistent
-    // process-wide VM can be destroyed. Other backends retain their historical
-    // real-process teardown.
+    // has one owner and one ordering point. Output and process-fd lifetime are
+    // finalized before Linux exit publication; only after the zombie/pidfd and
+    // current-parent signal are visible may the owner retire backend mappings,
+    // bank, ASID, and current vCPU under the global topology lock.
     let terminal_hvpatch_process = kernel.dispatcher.execution_backend()
         == crate::page_profile::ExecutionBackend::HvPatch
-        && matches!(&result, Ok(VcpuLoopOutcome::ProcessExit(_)) | Err(_));
+        && matches!(
+            &result,
+            Ok(VcpuLoopOutcome::ProcessExit(_) | VcpuLoopOutcome::TrapLimit(_)) | Err(_)
+        );
     let mut vcpu_retired_by_hvpatch_cleanup = false;
     if terminal_hvpatch_process {
-        if kernel.try_begin_process_exit() {
-            let terminal_publication = match &result {
-                Ok(VcpuLoopOutcome::ProcessExit(run)) => Some(Ok((**run).clone())),
-                Err(_) => Some(Err(())),
-                Ok(VcpuLoopOutcome::ThreadDone | VcpuLoopOutcome::TrapLimit(_)) => None,
+        let exit_claim = match kernel.claim_process_exit() {
+            Ok(claim) => claim,
+            Err(error) => {
+                tracing::error!(%error, "terminal owner could not close clone admission");
+                std::process::abort();
+            }
+        };
+        if exit_claim == ProcessExitClaim::Owner {
+            let published_exit_code = match &result {
+                Ok(VcpuLoopOutcome::ProcessExit(run)) => run.exit_code,
+                Ok(VcpuLoopOutcome::TrapLimit(_)) | Err(_) => 127,
+                Ok(VcpuLoopOutcome::ThreadDone) => unreachable!("non-terminal outcome"),
             };
-            state.terminate_siblings_for_process_exit(&kernel)?;
+
+            if let Err(error) = state.terminate_siblings_for_process_exit(&kernel) {
+                tracing::error!(%error, "terminal owner could not drain sibling vCPUs");
+                std::process::abort();
+            }
+
+            // The terminal loop outcome may have snapshotted output before a
+            // sibling completed an already-admitted write. Refresh the buffers
+            // only after every sibling loop has drained, while preserving the
+            // original exit/trap metadata.
+            let mut final_result = match &result {
+                Ok(VcpuLoopOutcome::ProcessExit(run) | VcpuLoopOutcome::TrapLimit(run)) => {
+                    (**run).clone()
+                }
+                Err(_) => assemble_run_result(&kernel, 127, 0, false),
+                Ok(VcpuLoopOutcome::ThreadDone) => unreachable!("non-terminal outcome"),
+            };
+            final_result.stdout = kernel.dispatcher.stdout();
+            final_result.stderr = kernel.dispatcher.stderr();
+            let terminal_publication = match &result {
+                Ok(VcpuLoopOutcome::ProcessExit(_) | VcpuLoopOutcome::TrapLimit(_)) => {
+                    Ok(final_result.clone())
+                }
+                Err(_) => Err(()),
+                Ok(VcpuLoopOutcome::ThreadDone) => unreachable!("non-terminal outcome"),
+            };
+
             trace_hvpatch_thread_teardown(&kernel, state.this_tid, 1);
             state.registry.exit(state.this_tid);
             trace_hvpatch_thread_teardown(&kernel, state.this_tid, 2);
@@ -2981,18 +3341,104 @@ where
             trace_hvpatch_thread_teardown(&kernel, state.this_tid, 4);
             kernel.dispatcher.forget_thread_signal_state(state.this_tid);
             trace_hvpatch_thread_teardown(&kernel, state.this_tid, 5);
-            engine.retire_in_process_address_space()?;
+
+            if let Some(process) = kernel.hvpatch_process.as_ref() {
+                process.record_process_exit_begin(published_exit_code, state.this_tid);
+                let child = process.is_child();
+                if child {
+                    for (fd, stream, bytes) in [
+                        (1, "stdout", final_result.stdout.as_slice()),
+                        (2, "stderr", final_result.stderr.as_slice()),
+                    ] {
+                        if let Err(error) = write_hvpatch_child_output(fd, bytes) {
+                            tracing::error!(
+                                pid = process.pid(),
+                                stream,
+                                %error,
+                                "flush HVPatch child output before exit publication failed"
+                            );
+                        }
+                    }
+                }
+                kernel.dispatcher.retire_hvpatch_process_fds();
+                let current_parent = match process.publish_exit_status(published_exit_code) {
+                    Ok(parent) => parent,
+                    Err(error) => {
+                        tracing::error!(
+                            pid = process.pid(),
+                            %error,
+                            "terminal owner could not publish authoritative Kernel exit"
+                        );
+                        std::process::abort();
+                    }
+                };
+                tracing::trace!(
+                    pid = process.pid(),
+                    exit_code = published_exit_code,
+                    child,
+                    parent = ?current_parent,
+                    "finalizing authoritative HVPatch process"
+                );
+                if child {
+                    kernel.notify_hvpatch_parent_exit(current_parent);
+                }
+                kernel.unregister_hvpatch_runtime_endpoint();
+
+                let _topology = crate::fork_quiesce::acquire_topology_lock(
+                    carrick_observability::probes::HvpatchTopologyOperation::ProcessRetire,
+                    process.pid(),
+                    state.this_tid.raw(),
+                );
+                if let Err(error) = engine.retire_in_process_address_space() {
+                    tracing::error!(
+                        pid = process.pid(),
+                        %error,
+                        "terminal owner could not retire HVPatch engine address space"
+                    );
+                    std::process::abort();
+                }
+                if let Err(error) =
+                    process.retire_address_space(published_exit_code, state.this_tid)
+                {
+                    tracing::error!(
+                        pid = process.pid(),
+                        %error,
+                        "terminal owner could not retire HVPatch bank/ASID"
+                    );
+                    std::process::abort();
+                }
+            } else if let Err(error) = engine.retire_in_process_address_space() {
+                tracing::error!(%error, "terminal owner could not retire HVPatch root engine");
+                std::process::abort();
+            }
             vcpu_retired_by_hvpatch_cleanup = true;
             trace_hvpatch_thread_teardown(&kernel, state.this_tid, 6);
-            if let Some(terminal) = terminal_publication {
-                // Publication is the completion barrier: the main owner may
-                // destroy the process-wide VM only after sibling drain,
-                // address-space retirement, and current-vCPU destruction.
-                kernel.publish_process_terminal(terminal);
-            }
+            // Publication is the completion barrier: the main owner may destroy
+            // the process-wide VM only after lifecycle and backend finalization.
+            kernel.publish_process_terminal(terminal_publication);
         } else {
-            // Another thread owns the terminal process transition. Retire only
-            // this vCPU/thread and suppress a second ProcessExit publication.
+            // An exec that claimed admission first owns the replacement. Its
+            // terminal sibling must retire its exact old Kernel thread before
+            // disappearing so the exec owner can finish the runtime drain and
+            // prepare against a one-thread graph. A competing exit owner, in
+            // contrast, will retire the whole task and needs only runtime drain.
+            if exit_claim == ProcessExitClaim::LostToExec
+                && let Some(process) = kernel.hvpatch_process.as_ref()
+            {
+                match process.exit_thread(state.linux_tid) {
+                    Ok(crate::hvpatch::ProcessThreadExit::Retired) => {}
+                    Ok(crate::hvpatch::ProcessThreadExit::LastThread) | Err(_) => {
+                        tracing::error!(
+                            pid = process.pid(),
+                            tid = state.linux_tid.raw(),
+                            "exec-loser could not retire its authoritative Kernel thread"
+                        );
+                        std::process::abort();
+                    }
+                }
+            }
+            // Another terminal operation owns this process transition. Retire
+            // only this vCPU/thread and suppress a second ProcessExit.
             let _cleanup_gate = crate::fork_quiesce::begin_exit_cleanup();
             trace_hvpatch_thread_teardown(&kernel, state.this_tid, 1);
             state.registry.exit(state.this_tid);
@@ -3022,6 +3468,28 @@ where
     }
     trace_hvpatch_thread_teardown(&kernel, state.this_tid, 7);
     result
+}
+
+fn write_hvpatch_child_output(fd: i32, mut bytes: &[u8]) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        if written > 0 {
+            bytes = &bytes[written as usize..];
+            continue;
+        }
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "host output descriptor made no progress",
+            ));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Snapshot the shared kernel buffers + reporter into a RunResult. Called on
@@ -3170,6 +3638,45 @@ mod tests {
     }
 
     #[test]
+    fn process_topology_handles_are_not_thread_group_siblings_and_drain_descendants() {
+        let directory = Arc::new(HvpatchRuntimeDirectory::default());
+        let sibling_threads = Mutex::new(Vec::<std::thread::JoinHandle<()>>::new());
+        let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let child_directory = Arc::clone(&directory);
+        let child_completed = Arc::clone(&completed);
+        let child = std::thread::spawn(move || {
+            let grandchild_completed = Arc::clone(&child_completed);
+            child_directory.enroll_process_thread(std::thread::spawn(move || {
+                grandchild_completed.fetch_add(1, std::sync::atomic::Ordering::Release);
+            }));
+            child_completed.fetch_add(1, std::sync::atomic::Ordering::Release);
+        });
+        directory.enroll_process_thread(child);
+
+        assert!(sibling_threads.lock().is_empty());
+        assert!(directory.join_process_threads().is_ok());
+        assert_eq!(completed.load(std::sync::atomic::Ordering::Acquire), 2);
+        assert!(directory.process_threads.lock().is_empty());
+    }
+
+    #[test]
+    fn process_topology_join_drains_every_owner_after_a_child_panic() {
+        let directory = HvpatchRuntimeDirectory::default();
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        directory.enroll_process_thread(std::thread::spawn(|| {
+            panic!("deliberate process-child panic");
+        }));
+        let surviving_completed = Arc::clone(&completed);
+        directory.enroll_process_thread(std::thread::spawn(move || {
+            surviving_completed.store(true, std::sync::atomic::Ordering::Release);
+        }));
+
+        assert!(directory.join_process_threads().is_err());
+        assert!(completed.load(std::sync::atomic::Ordering::Acquire));
+        assert!(directory.process_threads.lock().is_empty());
+    }
+
+    #[test]
     fn exec_replacement_treats_removed_sibling_as_done_after_flag_clears() {
         let owner = ThreadId::synthetic_for_tests(1000);
         let registry = ThreadRegistry::new(owner);
@@ -3258,6 +3765,75 @@ mod tests {
         assert!(!should_reclaim_vcpu_for_timed_wait(Some(
             SHORT_TIMED_WAIT_RECLAIM_CUTOFF - Duration::from_millis(1)
         )));
+    }
+
+    #[test]
+    fn hvpatch_child_output_writer_drains_payload_larger_than_a_pipe() {
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let payload: Vec<u8> = (0..(256 * 1024)).map(|index| (index % 251) as u8).collect();
+        let reader = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            let mut buffer = [0_u8; 8192];
+            loop {
+                let read = unsafe { libc::read(fds[0], buffer.as_mut_ptr().cast(), buffer.len()) };
+                if read > 0 {
+                    output.extend_from_slice(&buffer[..read as usize]);
+                } else {
+                    break;
+                }
+            }
+            unsafe { libc::close(fds[0]) };
+            output
+        });
+        write_hvpatch_child_output(fds[1], &payload).expect("complete pipe write");
+        unsafe { libc::close(fds[1]) };
+        assert_eq!(reader.join().expect("pipe reader"), payload);
+    }
+
+    #[test]
+    fn clone_admission_exit_waits_for_in_flight_and_stays_closed() {
+        let gate = CloneAdmissionGate::default();
+        let permit = gate.try_enroll().expect("initial clone permit");
+        std::thread::scope(|scope| {
+            let closer = scope.spawn(|| gate.claim_process_exit());
+            while !permit.is_cancelled() {
+                std::thread::yield_now();
+            }
+            assert!(gate.try_enroll().is_none());
+            drop(permit);
+            assert_eq!(
+                closer
+                    .join()
+                    .expect("exit closer thread")
+                    .expect("exit admission drain"),
+                ProcessExitClaim::Owner
+            );
+        });
+        assert!(gate.try_enroll().is_none());
+    }
+
+    #[test]
+    fn clone_admission_arbitrates_exec_before_exit_without_mutual_drain() {
+        let gate = CloneAdmissionGate::default();
+        let owner = ThreadId::synthetic_for_tests(1002);
+        let exec = gate.close_for_exec(owner).expect("exec admission close");
+        assert!(gate.try_enroll().is_none());
+        assert_eq!(
+            gate.claim_process_exit().expect("exit arbitration"),
+            ProcessExitClaim::LostToExec
+        );
+        drop(exec);
+        assert!(gate.try_enroll().is_some());
+
+        // Once exec releases, exit can claim permanent ownership and a later
+        // exec cannot establish a competing terminal drain.
+        assert_eq!(
+            gate.claim_process_exit().expect("exit owns admission"),
+            ProcessExitClaim::Owner
+        );
+        assert!(gate.close_for_exec(owner).is_err());
+        assert!(gate.try_enroll().is_none());
     }
 
     #[test]

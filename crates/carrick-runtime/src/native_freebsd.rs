@@ -7844,6 +7844,7 @@ impl Drop for NativeHostThreadRegistration {
 struct CloneThreadRequest {
     parent_snapshot: X86UcontextSnapshot,
     resume: u64,
+    flags: u64,
     parent_fsbase: u64,
     stack: u64,
     tls: Option<u64>,
@@ -7944,18 +7945,57 @@ fn validate_clone_thread_tid_outputs(
 fn spawn_clone_thread(
     shared: &Arc<SharedRun>,
     parent_tid: crate::thread::ThreadId,
+    parent_linux_tid: crate::kernel::LinuxTid,
     req: CloneThreadRequest,
     executable_registration: &ExecutableThreadRegistration,
-) -> Result<crate::thread::ThreadId, CloneThreadSpawnError> {
+) -> Result<crate::kernel::LinuxTid, CloneThreadSpawnError> {
     let mut tid_memory =
         NativeIdentityMemory::for_run(&shared.executable_epoch, identity_host_seam());
     validate_clone_thread_tid_outputs(&tid_memory, req.parent_tid_addr, req.child_tid_addr)
         .map_err(|errno| CloneThreadSpawnError::Errno(errno.guest_retval()))?;
+    let read_tid_output = |memory: &NativeIdentityMemory, address: u64| {
+        if address == 0 {
+            Some(None)
+        } else {
+            memory
+                .read_bytes(address, std::mem::size_of::<u32>())
+                .ok()
+                .map(Some)
+        }
+    };
+    let parent_tid_original =
+        read_tid_output(&tid_memory, req.parent_tid_addr).ok_or_else(|| {
+            CloneThreadSpawnError::Errno(crate::linux_abi::LINUX_EFAULT.guest_retval())
+        })?;
+    let child_tid_original = read_tid_output(&tid_memory, req.child_tid_addr).ok_or_else(|| {
+        CloneThreadSpawnError::Errno(crate::linux_abi::LINUX_EFAULT.guest_retval())
+    })?;
+    let clone_plan = crate::kernel::ClonePlan::from_flags(
+        carrick_abi::LinuxCloneFlags::from_bits_retain(req.flags),
+    )
+    .map_err(|_| CloneThreadSpawnError::Errno(crate::linux_abi::LINUX_EINVAL.guest_retval()))?;
+    let parent_context = shared
+        .dispatcher
+        .capture_kernel_context(parent_linux_tid)
+        .map_err(|error| CloneThreadSpawnError::Fatal(error.to_string()))?;
+    let reservation = parent_context
+        .kernel()
+        .reserve_thread_clone(&parent_context, clone_plan, None)
+        .map_err(|error| CloneThreadSpawnError::Fatal(error.to_string()))?;
+    let child_linux_tid = reservation.tid();
 
     let slice_off = shared.alloc_slice().ok_or_else(|| {
         CloneThreadSpawnError::Errno(crate::linux_abi::LINUX_EAGAIN.guest_retval())
     })?;
     let child_tid = shared.registry.register_child(req.clear_child_tid_addr);
+    let prepared_thread = match reservation.prepare(child_tid) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            shared.registry.exit(child_tid);
+            shared.free_slice(slice_off);
+            return Err(CloneThreadSpawnError::Fatal(error.to_string()));
+        }
+    };
     shared
         .dispatcher
         .inherit_thread_signal_mask(parent_tid, child_tid);
@@ -8022,6 +8062,7 @@ fn spawn_clone_thread(
                 },
                 &child_shared,
                 child_tid,
+                child_linux_tid,
                 slice_off,
                 JIT_SLICE_LEN,
                 &mut memory,
@@ -8099,7 +8140,15 @@ fn spawn_clone_thread(
         ));
     }
 
-    let tid_bytes = (child_tid.raw() as u32).to_le_bytes();
+    let restore_tid_outputs = |memory: &mut NativeIdentityMemory| {
+        if let Some(bytes) = parent_tid_original.as_ref() {
+            let _ = memory.write_bytes(req.parent_tid_addr, bytes);
+        }
+        if let Some(bytes) = child_tid_original.as_ref() {
+            let _ = memory.write_bytes(req.child_tid_addr, bytes);
+        }
+    };
+    let tid_bytes = (child_linux_tid.raw() as u32).to_le_bytes();
     let write_result = (|| {
         if req.parent_tid_addr != 0 {
             tid_memory.write_bytes(req.parent_tid_addr, &tid_bytes)?;
@@ -8109,7 +8158,8 @@ fn spawn_clone_thread(
         }
         Ok::<(), carrick_guest_mem::MemoryError>(())
     })();
-    if let Err(error) = write_result {
+    if write_result.is_err() {
+        restore_tid_outputs(&mut tid_memory);
         let _ = start_tx.send(CloneThreadStart::Cancel);
         join_failed_clone_thread(
             shared,
@@ -8119,24 +8169,38 @@ fn spawn_clone_thread(
             handle,
         )
         .map_err(CloneThreadSpawnError::Fatal)?;
-        return Err(CloneThreadSpawnError::Fatal(format!(
-            "prevalidated clone TID publication failed: {error}"
-        )));
-    }
-
-    if start_tx.send(CloneThreadStart::Run).is_err() {
-        join_failed_clone_thread(
-            shared,
-            executable_registration,
-            child_registration_id,
-            true,
-            handle,
-        )
-        .map_err(CloneThreadSpawnError::Fatal)?;
-        return Err(CloneThreadSpawnError::Fatal(
-            "gated clone child exited before guest start".to_string(),
+        return Err(CloneThreadSpawnError::Errno(
+            crate::linux_abi::LINUX_EFAULT.guest_retval(),
         ));
     }
+
+    let published = match prepared_thread.commit() {
+        Ok(published) => published,
+        Err(error) => {
+            restore_tid_outputs(&mut tid_memory);
+            let _ = start_tx.send(CloneThreadStart::Cancel);
+            join_failed_clone_thread(
+                shared,
+                executable_registration,
+                child_registration_id,
+                true,
+                handle,
+            )
+            .map_err(CloneThreadSpawnError::Fatal)?;
+            return Err(CloneThreadSpawnError::Fatal(error.to_string()));
+        }
+    };
+    if let Err(error) = published.into_context() {
+        tracing::error!(
+            linux_tid = child_linux_tid.raw(),
+            backend_tid = child_tid.raw(),
+            %error,
+            "native x86 Kernel start gate failed after publication"
+        );
+        std::process::abort();
+    }
+
+    // Make the child handle visible to exit/exec before opening guest start.
     shared
         .threads
         .lock()
@@ -8146,7 +8210,12 @@ fn spawn_clone_thread(
             bound: true,
             handle,
         });
-    Ok(child_tid)
+    if start_tx.send(CloneThreadStart::Run).is_err() {
+        // Kernel publication is already authoritative; receiver loss now is an
+        // internal invariant breach, not a guest-visible clone failure.
+        std::process::abort();
+    }
+    Ok(child_linux_tid)
 }
 
 /// Build a fresh, PRIVATE `SharedRun` for a `fork()` child. The parent's code
@@ -8469,6 +8538,15 @@ pub(crate) fn run_static_x86_elf_bytes(
     // The blocking-I/O waiter (fd wait / poll / select / sleep / blocking
     // write), shared with the KVM/bhyve single-thread loop.
     let mut waiter = crate::io_wait::ThreadWaiter::new(tid);
+    let main_linux_tid = match shared.dispatcher.capture_one_task_context() {
+        Ok(context) => context.thread().key().tid,
+        Err(error) => {
+            let primary = RuntimeError::Configuration(format!(
+                "capture native x86 root Kernel context: {error}"
+            ));
+            return Err(rollback_started_native_run(&shared, &arenas, primary));
+        }
+    };
     let initial_image = shared.current_image();
     let outcome = run_x86_thread(
         ThreadStart::Initial {
@@ -8477,6 +8555,7 @@ pub(crate) fn run_static_x86_elf_bytes(
         },
         &shared,
         tid,
+        main_linux_tid,
         main_slice,
         JIT_SLICE_LEN,
         &mut memory,
@@ -8977,6 +9056,7 @@ fn run_x86_thread(
     start: ThreadStart,
     shared: &Arc<SharedRun>,
     tid: crate::thread::ThreadId,
+    linux_tid: crate::kernel::LinuxTid,
     slice_off: usize,
     slice_len: usize,
     memory: &mut NativeIdentityMemory,
@@ -8990,6 +9070,7 @@ fn run_x86_thread(
     // guest's code pages keep their VAs), so it stays borrowed from the caller.
     let mut active = Arc::clone(shared);
     let mut tid = tid;
+    let mut linux_tid = linux_tid;
     let mut host_registration = NativeHostThreadRegistration::new(&active, tid);
     // Mutable so an in-place `execve` can retire this and swap in the new image.
     let mut image = shared.current_image();
@@ -9758,6 +9839,7 @@ fn run_x86_thread(
                     memory,
                     waiter,
                     tid,
+                    linux_tid,
                     &mut context.snapshot,
                     &mut context.guest_fsbase,
                     executable_registration,
@@ -9800,6 +9882,18 @@ fn run_x86_thread(
                             Ok(child) => {
                                 active = child;
                                 tid = active.registry.main_tid();
+                                linux_tid = match active
+                                    .dispatcher
+                                    .reset_one_task_kernel_binding_for_current_process(tid)
+                                {
+                                    Ok(context) => context.thread().key().tid,
+                                    Err(error) => {
+                                        fault_detail = Some(format!(
+                                            "fork child: rebind one-task Kernel context: {error}"
+                                        ));
+                                        break;
+                                    }
+                                };
                                 identity_stamp = native_x86_identity_stamp(&active, tid);
                                 host_registration.rebind_after_fork(&active, tid);
                                 if let Err(error) = executable_registration
@@ -9982,8 +10076,27 @@ fn run_x86_thread(
 
                                 // Exact registration retirement, not a count,
                                 // has now proved this is the sole executable
-                                // thread. Only now may the guest thread registry
-                                // and old image be retired.
+                                // thread. Prepare the authoritative Kernel exec
+                                // before mutating backend identity. A nonleader
+                                // caller is promoted to Linux TGID while its host
+                                // runner is re-keyed to the backend main thread.
+                                let exec_registry_tid = active.registry.main_tid();
+                                let prepared_kernel_exec = match active
+                                    .dispatcher
+                                    .prepare_one_task_kernel_exec_with_registry_id(
+                                        linux_tid,
+                                        exec_registry_tid,
+                                    ) {
+                                    Ok(prepared) => prepared,
+                                    Err(error) => {
+                                        fault_detail = Some(format!(
+                                            "prepare native x86 Kernel exec: {error}"
+                                        ));
+                                        break;
+                                    }
+                                };
+                                // Only now may the guest thread registry and old
+                                // image be retired.
                                 active.registry.remove_all_except(tid);
                                 // A nonleader exec is re-threaded permanently,
                                 // not merely presented as the tgid while the
@@ -10001,6 +10114,12 @@ fn run_x86_thread(
                                     }
                                 };
                                 let exec_tid = rekey.current();
+                                if exec_tid != exec_registry_tid {
+                                    fault_detail = Some(format!(
+                                        "execve survivor rekey selected {exec_tid}, expected {exec_registry_tid}"
+                                    ));
+                                    break;
+                                }
                                 if let Err(error) = host_registration.rekey_after_exec(exec_tid) {
                                     fault_detail =
                                         Some(format!("execve host-thread rekey failed: {error}"));
@@ -10106,6 +10225,20 @@ fn run_x86_thread(
                                         break;
                                     }
                                 }
+                                let exec_context = match active
+                                    .dispatcher
+                                    .commit_one_task_kernel_exec(prepared_kernel_exec)
+                                {
+                                    Ok(context) => context,
+                                    Err(error) => {
+                                        tracing::error!(
+                                            %error,
+                                            "native x86 Kernel exec commit failed after image retirement"
+                                        );
+                                        std::process::abort();
+                                    }
+                                };
+                                linux_tid = exec_context.thread().key().tid;
                                 // PTRACE_TRACEME survives exec and reports the
                                 // mandatory SIGTRAP stop before the replacement
                                 // image runs its first instruction.
@@ -10560,6 +10693,7 @@ fn service_syscall(
     memory: &mut NativeIdentityMemory,
     waiter: &mut crate::io_wait::ThreadWaiter,
     tid: crate::thread::ThreadId,
+    linux_tid: crate::kernel::LinuxTid,
     snapshot: &mut X86UcontextSnapshot,
     guest_fsbase: &mut u64,
     executable_registration: &mut ExecutableThreadRegistration,
@@ -10605,6 +10739,7 @@ fn service_syscall(
         reporter,
         waiter,
         tid,
+        linux_tid,
         registry,
         futex,
         &shared.exit,
@@ -10737,6 +10872,7 @@ fn service_syscall(
         // parent's wait4 reaps it via host waitpid. The dispatcher's proc model
         // already distinguishes the child by `getpid() != bootstrap_host_pid`.
         DispatchOutcome::Fork {
+            flags: _,
             clone_parent,
             parent_tid_addr,
             child_tid_addr,
@@ -10995,7 +11131,7 @@ fn service_syscall(
         DispatchOutcome::CloneThread {
             stack,
             tls,
-            flags: _,
+            flags,
             parent_tid_addr,
             child_tid_addr,
             clear_child_tid_addr,
@@ -11006,6 +11142,7 @@ fn service_syscall(
                 // gateway round trips reuse the parent's persistent context.
                 parent_snapshot: snapshot.clone(),
                 resume,
+                flags,
                 parent_fsbase: *guest_fsbase,
                 stack,
                 tls,
@@ -11013,7 +11150,7 @@ fn service_syscall(
                 child_tid_addr,
                 clear_child_tid_addr,
             };
-            match spawn_clone_thread(shared, tid, req, executable_registration) {
+            match spawn_clone_thread(shared, tid, linux_tid, req, executable_registration) {
                 Ok(child_tid) => {
                     snapshot.gpr[reg::RAX] = i64::from(child_tid.raw()) as u64;
                     Step::Continue(resume)
@@ -11042,6 +11179,9 @@ fn service_syscall(
                 futex.wake(addr, 1);
             }
             let last = registry.exit(tid);
+            if !last && let Err(error) = dispatcher.exit_one_task_thread(linux_tid) {
+                return Step::Fault(format!("retire native x86 one-task Kernel thread: {error}"));
+            }
             crate::thread::set_current_thread_state(tid, 'Z');
             dispatcher.forget_thread_signal_state(tid);
             if last {
@@ -11253,6 +11393,7 @@ fn service_syscall_threaded(
     reporter: &CompatReporter,
     waiter: &mut crate::io_wait::ThreadWaiter,
     tid: crate::thread::ThreadId,
+    linux_tid: crate::kernel::LinuxTid,
     registry: &crate::thread::ThreadRegistry,
     futex: &crate::thread::FutexTable,
     exit: &ExitState,
@@ -11296,7 +11437,7 @@ fn service_syscall_threaded(
     let mut sleep_deadline: Option<std::time::Instant> = None;
     let alias_syscall = is_alias_mapping_syscall(request.number);
     let kernel_context = dispatcher
-        .capture_one_task_context()
+        .capture_kernel_context(linux_tid)
         .map_err(NativeSyscallServiceError::Kernel)?;
     loop {
         begin_threaded_dispatch_iteration(
