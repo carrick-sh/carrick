@@ -78,6 +78,17 @@ fn should_destroy_departing_vcpu(process_exit: bool, thread_done: bool) -> bool 
     !process_exit && !thread_done
 }
 
+fn apply_alias_frame_inventory(
+    context: &crate::kernel::KernelContext,
+    commit: carrick_hal::FrameInventoryCommit<()>,
+) -> Result<(), crate::kernel::FrameInventoryError> {
+    context
+        .kernel()
+        .frame_inventory()
+        .apply(context.shared().mm().id(), commit)
+        .map(|_| ())
+}
+
 pub(super) fn requires_no_unwind_host_exit(kernel: &Kernel, engine_is_forked_child: bool) -> bool {
     !kernel.is_hvpatch_child()
         && kernel.dispatcher.execution_backend() != crate::page_profile::ExecutionBackend::HvPatch
@@ -2452,6 +2463,102 @@ where
                         break Ok(DispatchOutcome::ThreadExit { code: 0 });
                     }
                 },
+                DispatchOutcome::MapHostAlias {
+                    transaction,
+                    va,
+                    ipa,
+                    len,
+                    payload,
+                    file,
+                    shared,
+                    prot,
+                    prot_none,
+                } if kernel.hvpatch_process.is_some() => {
+                    let file = file.map(|(fd, offset, prot)| (fd.into_owned_fd(), offset, prot));
+                    let Some(install) = transaction.claim() else {
+                        drop(file);
+                        break Ok(DispatchOutcome::Returned {
+                            value: crate::linux_abi::LINUX_ENOMEM.guest_retval(),
+                        });
+                    };
+
+                    // The dispatch transaction is exclusively claimed, but no
+                    // backend mutation has started. Allocate every ID and event
+                    // slot before arming the backend's topology-locked staging.
+                    let capacity = carrick_hal::FrameEventCapacity::for_event_count(2)
+                        .map_err(crate::kernel::FrameInventoryReserveError::from)?;
+                    let reservation = kernel_context
+                        .kernel()
+                        .reserve_frame_inventory(1, 1, capacity)?;
+                    let inventory_transaction = reservation.transaction();
+                    if let Err(error) = engine.begin_alias_inventory(reservation) {
+                        let abandoned = kernel_context
+                            .kernel()
+                            .frame_inventory()
+                            .abandon(inventory_transaction);
+                        debug_assert!(abandoned);
+                        return Err(error.into());
+                    }
+
+                    if engine
+                        .map_host_alias(
+                            va,
+                            ipa,
+                            len,
+                            &payload,
+                            file.map(|(fd, offset, prot)| (fd.into_raw_fd(), offset, prot)),
+                        )
+                        .is_err()
+                    {
+                        std::process::abort();
+                    }
+                    let Some(commit) = engine.take_alias_inventory() else {
+                        std::process::abort();
+                    };
+                    // `map_host_alias` has returned and released backend locks.
+                    // Publish to the syscall-entry mm before making the
+                    // dispatcher's install visible to siblings.
+                    if apply_alias_frame_inventory(&kernel_context, commit).is_err() {
+                        std::process::abort();
+                    }
+
+                    let Ok(len) = usize::try_from(len) else {
+                        std::process::abort();
+                    };
+                    if prot_none && engine.protect_range(va.raw(), len, 0).is_err() {
+                        std::process::abort();
+                    }
+                    engine.set_mapping_protection_and_sharing(
+                        va.raw(),
+                        len,
+                        prot_none,
+                        prot & crate::linux_abi::LINUX_PROT_WRITE == 0,
+                        if shared {
+                            carrick_guest_mem::MappingSharing::Shared
+                        } else {
+                            carrick_guest_mem::MappingSharing::Private
+                        },
+                    );
+                    if let Some((bus_start, bus_len)) = install.bus_fault_range() {
+                        let Ok(bus_len) = usize::try_from(bus_len) else {
+                            std::process::abort();
+                        };
+                        if engine.protect_range(bus_start, bus_len, 0).is_err() {
+                            std::process::abort();
+                        }
+                        engine.set_no_access(bus_start, bus_len, true);
+                    }
+                    if kernel
+                        .dispatcher
+                        .commit_host_alias_install(install)
+                        .is_err()
+                    {
+                        std::process::abort();
+                    }
+                    break Ok(DispatchOutcome::Returned {
+                        value: va.raw() as i64,
+                    });
+                }
                 other => break Ok(other),
             }
         }
@@ -3609,7 +3716,74 @@ fn service_signals_threaded<E: ThreadedEngine>(
 mod tests {
     use super::signal::{lower_el0_fault, upgrade_protection_si_code};
     use super::*;
+    use std::num::NonZeroU64;
     use std::time::Duration;
+
+    fn alias_context(pid: i32) -> crate::kernel::KernelContext {
+        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+            pid,
+            ThreadId::synthetic_for_tests(pid),
+            "alias-inventory".to_owned(),
+        )
+        .expect("root bootstrap");
+        crate::kernel::Kernel::bootstrap_root(bootstrap)
+            .expect("root kernel")
+            .1
+    }
+
+    fn mock_alias_commit(
+        context: &crate::kernel::KernelContext,
+    ) -> carrick_hal::FrameInventoryCommit<()> {
+        let capacity = carrick_hal::FrameEventCapacity::for_event_count(2).expect("capacity");
+        let mut reservation = context
+            .kernel()
+            .reserve_frame_inventory(1, 1, capacity)
+            .expect("reservation");
+        let transaction = reservation.transaction();
+        let frame = reservation.claim_frame().expect("frame candidate");
+        let mapping = reservation.claim_mapping().expect("mapping candidate");
+        let generation = carrick_hal::MappingGeneration::from_backend_counter(
+            NonZeroU64::new(1).expect("generation"),
+        );
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation,
+                gpa: carrick_guest_mem::Gpa(0x8000),
+                length: carrick_hal::FrameLength::from_mapping_extent(
+                    NonZeroU64::new(0x4000).expect("length"),
+                ),
+                permissions: carrick_hal::MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .expect("prepare event");
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation,
+            })
+            .expect("publish event");
+        reservation.commit(())
+    }
+
+    #[test]
+    fn alias_inventory_applies_to_the_syscall_context_mm() {
+        let context = alias_context(67_103);
+        let exact_mm = context.shared().mm().id();
+        let commit = mock_alias_commit(&context);
+
+        apply_alias_frame_inventory(&context, commit).expect("alias publication");
+
+        let snapshot = context.kernel().frame_inventory().snapshot_for_mm(exact_mm);
+        assert_eq!(snapshot.mappings.len(), 1);
+        assert_eq!(snapshot.mappings[0].mm, exact_mm);
+    }
 
     struct ProtectionOnlyMemory {
         protections: carrick_guest_mem::protections::MemoryProtections,

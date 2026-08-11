@@ -28,6 +28,8 @@ pub enum RuntimeError {
     Trap(#[from] TrapError),
     #[error("syscall dispatch failed: {0}")]
     Dispatch(#[from] DispatchError),
+    #[error("frame inventory reservation failed: {0}")]
+    FrameInventoryReserve(#[from] crate::kernel::FrameInventoryReserveError),
     #[error("filesystem backend error: {0}")]
     FsBackend(anyhow::Error),
     #[error("guest did not exit after {max_traps} traps")]
