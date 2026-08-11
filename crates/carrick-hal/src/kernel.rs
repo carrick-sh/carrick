@@ -204,6 +204,109 @@ impl FrameInventoryBatch {
     }
 }
 
+/// Candidate identities and event storage reserved by the runtime before a
+/// backend topology lock is acquired.
+///
+/// The reservation is intentionally non-cloneable. A backend may consume each
+/// candidate at most once, and cannot manufacture replacements when it runs
+/// short. Candidates left in a dropped or committed reservation are burned:
+/// the runtime's monotonic object-ID registry never reissues them.
+#[derive(Debug, Eq, PartialEq)]
+pub struct FrameInventoryReservation {
+    batch: FrameInventoryBatch,
+    frame_candidates: Vec<FrameId>,
+    mapping_candidates: Vec<MappingId>,
+    next_frame: usize,
+    next_mapping: usize,
+}
+
+impl FrameInventoryReservation {
+    /// Assemble candidates allocated by the runtime kernel's object registry.
+    /// Both candidate vectors and the event batch must already own all storage
+    /// needed while backend locks are held.
+    pub fn from_kernel_candidates(
+        batch: FrameInventoryBatch,
+        frame_candidates: Vec<FrameId>,
+        mapping_candidates: Vec<MappingId>,
+    ) -> Self {
+        Self {
+            batch,
+            frame_candidates,
+            mapping_candidates,
+            next_frame: 0,
+            next_mapping: 0,
+        }
+    }
+
+    pub const fn transaction(&self) -> KernelTransactionId {
+        self.batch.transaction()
+    }
+
+    pub fn claim_frame(&mut self) -> Result<FrameId, FrameInventoryReservationError> {
+        let Some(candidate) = self.frame_candidates.get(self.next_frame).copied() else {
+            return Err(FrameInventoryReservationError::FrameCandidatesExhausted);
+        };
+        self.next_frame += 1;
+        Ok(candidate)
+    }
+
+    pub fn claim_mapping(&mut self) -> Result<MappingId, FrameInventoryReservationError> {
+        let Some(candidate) = self.mapping_candidates.get(self.next_mapping).copied() else {
+            return Err(FrameInventoryReservationError::MappingCandidatesExhausted);
+        };
+        self.next_mapping += 1;
+        Ok(candidate)
+    }
+
+    pub fn push(
+        &mut self,
+        event: FrameInventoryEvent,
+    ) -> Result<(), FrameInventoryReservationError> {
+        self.batch.push(event).map_err(Into::into)
+    }
+
+    /// Finish backend work and carry its ordinary outcome beside the complete
+    /// pointer-free inventory batch. This performs no runtime callback.
+    pub fn commit<T>(self, outcome: T) -> FrameInventoryCommit<T> {
+        FrameInventoryCommit {
+            outcome,
+            batch: self.batch,
+        }
+    }
+}
+
+/// Backend outcome paired with the inventory transaction runtime must apply
+/// after releasing all backend locks.
+#[derive(Debug, Eq, PartialEq)]
+pub struct FrameInventoryCommit<T> {
+    outcome: T,
+    batch: FrameInventoryBatch,
+}
+
+impl<T> FrameInventoryCommit<T> {
+    pub fn outcome(&self) -> &T {
+        &self.outcome
+    }
+
+    pub fn batch(&self) -> &FrameInventoryBatch {
+        &self.batch
+    }
+
+    pub fn into_parts(self) -> (T, FrameInventoryBatch) {
+        (self.outcome, self.batch)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum FrameInventoryReservationError {
+    #[error("frame inventory reservation has no unused frame candidate")]
+    FrameCandidatesExhausted,
+    #[error("frame inventory reservation has no unused mapping candidate")]
+    MappingCandidatesExhausted,
+    #[error(transparent)]
+    Batch(#[from] FrameInventoryBatchError),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum FrameInventoryBatchError {
     #[error("frame inventory batches must reserve at least one event")]
@@ -304,6 +407,32 @@ mod tests {
             batch.push(event),
             Err(FrameInventoryBatchError::BatchFull { capacity: 1 })
         );
+    }
+
+    #[test]
+    fn reservation_consumes_candidates_and_carries_backend_outcome() {
+        let transaction = KernelTransactionId::from_kernel_allocation(id(1));
+        let frames = vec![FrameId::from_kernel_allocation(id(2))];
+        let mappings = vec![MappingId::from_kernel_allocation(id(3))];
+        let batch = FrameInventoryBatch::prepare(transaction, capacity(1)).expect("batch");
+        let mut reservation = FrameInventoryReservation::from_kernel_candidates(
+            batch,
+            frames.clone(),
+            mappings.clone(),
+        );
+
+        assert_eq!(reservation.claim_frame(), Ok(frames[0]));
+        assert_eq!(
+            reservation.claim_frame(),
+            Err(FrameInventoryReservationError::FrameCandidatesExhausted)
+        );
+        assert_eq!(reservation.claim_mapping(), Ok(mappings[0]));
+        let commit = reservation.commit("mapped");
+        assert_eq!(commit.outcome(), &"mapped");
+        assert_eq!(commit.batch().transaction(), transaction);
+        let (outcome, batch) = commit.into_parts();
+        assert_eq!(outcome, "mapped");
+        assert!(batch.events().is_empty());
     }
 
     #[test]

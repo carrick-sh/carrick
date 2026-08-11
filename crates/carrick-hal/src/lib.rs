@@ -23,8 +23,9 @@ pub use hypervisor::{HvVcpu, HvVm, VcpuExit};
 pub mod kernel;
 pub use kernel::{
     FrameEventCapacity, FrameId, FrameInventoryBatch, FrameInventoryBatchError,
-    FrameInventoryEvent, FrameLength, KernelTransactionId, MAX_FRAME_INVENTORY_EVENTS_PER_BATCH,
-    MappingGeneration, MappingId,
+    FrameInventoryCommit, FrameInventoryEvent, FrameInventoryReservation,
+    FrameInventoryReservationError, FrameLength, KernelTransactionId,
+    MAX_FRAME_INVENTORY_EVENTS_PER_BATCH, MappingGeneration, MappingId,
 };
 pub mod event;
 pub use event::{EventMultiplexer, Interest, PollEvent, Readiness, TriggerMode, VnodeEvents};
