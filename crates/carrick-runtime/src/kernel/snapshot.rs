@@ -4,7 +4,7 @@
 //! reads dispatcher `FsState`, `IoState`, or `SignalState` as fallback state.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use carrick_abi::SigSet;
@@ -22,7 +22,7 @@ use super::objects::{
     TaskRef, ThreadKey, ThreadRef, ThreadSignalState, Zombie,
 };
 
-pub const KERNEL_SNAPSHOT_V1_SCHEMA: u16 = 1;
+pub const KERNEL_SNAPSHOT_V1_SCHEMA: u16 = 2;
 const MAX_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -32,6 +32,8 @@ pub struct KernelSnapshotV1 {
     pub tasks: Vec<TaskSnapshotRow>,
     pub zombies: Vec<ZombieSnapshotRow>,
     pub threads: Vec<ThreadSnapshotRow>,
+    pub task_shared: Vec<TaskSharedSnapshotRow>,
+    pub thread_resources: Vec<ThreadResourcesSnapshotRow>,
     pub mms: Vec<MmSnapshotRow>,
     pub vmas: Vec<VmaSnapshotRow>,
     pub frames: Vec<FrameRow>,
@@ -48,18 +50,42 @@ pub struct KernelSnapshotV1 {
     pub thread_signals: Vec<ThreadSignalSnapshotRow>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObjectSnapshotClass {
+    Live,
+    Draining,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct TaskSharedObservationKey {
+    pub task: TaskKey,
+    pub publication: TaskRevision,
+    pub mm: MmId,
+    pub sighand: SighandId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ThreadResourcesObservationKey {
+    pub thread: ThreadKey,
+    pub publication: TaskRevision,
+    pub file_table: FileTableId,
+    pub fs_context: FsContextId,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskSnapshotRow {
     pub key: TaskKey,
+    pub class: ObjectSnapshotClass,
     pub parent: Option<TaskKey>,
     pub children: Vec<TaskKey>,
     pub process_group: ProcessGroupId,
     pub session: SessionId,
     pub lifecycle: TaskLifecycle,
+    pub shared: TaskSharedObservationKey,
     pub mm: MmId,
     pub sighand: SighandId,
-    pub revision: TaskRevision,
-    pub diagnostic_name: String,
+    pub revision: Option<TaskRevision>,
+    pub diagnostic_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,25 +93,35 @@ pub struct ZombieSnapshotRow {
     pub zombie: Zombie,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ThreadSnapshotClass {
-    Live,
-    Draining,
-}
+pub type ThreadSnapshotClass = ObjectSnapshotClass;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ThreadSnapshotRow {
     pub key: ThreadKey,
     pub task: TaskKey,
     pub registry_id: Option<ThreadId>,
-    pub class: ThreadSnapshotClass,
+    pub class: ObjectSnapshotClass,
+    pub resources: ThreadResourcesObservationKey,
     pub file_table: Option<FileTableId>,
     pub fs_context: Option<FsContextId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskSharedSnapshotRow {
+    pub key: TaskSharedObservationKey,
+    pub class: ObjectSnapshotClass,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ThreadResourcesSnapshotRow {
+    pub key: ThreadResourcesObservationKey,
+    pub class: ObjectSnapshotClass,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MmSnapshotRow {
     pub id: MmId,
+    pub class: ObjectSnapshotClass,
     pub revision: u64,
     pub binding: MmBinding,
     pub mapping_ids: Vec<MappingId>,
@@ -155,6 +191,7 @@ pub struct SessionSnapshotRow {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SighandSnapshotRow {
     pub id: SighandId,
+    pub class: ObjectSnapshotClass,
     pub revision: u64,
     pub dispositions: Vec<(LinuxSignal, SignalDisposition)>,
 }
@@ -199,7 +236,13 @@ struct RegistryCopy {
     zombies: Vec<Zombie>,
     groups: Vec<ProcessGroupSnapshotRow>,
     sessions: Vec<SessionSnapshotRow>,
-    draining: Vec<(ThreadKey, TaskKey, Option<ThreadRef>)>,
+    observed_tasks: BTreeMap<TaskKey, TaskRef>,
+    observed_threads: BTreeMap<ThreadKey, (TaskKey, ThreadRef)>,
+    observed_mms: BTreeMap<MmId, Arc<super::objects::Mm>>,
+    observed_sighands: BTreeMap<SighandId, Arc<Sighand>>,
+    observed_task_shared: BTreeMap<TaskSharedObservationKey, Arc<super::objects::TaskShared>>,
+    observed_thread_resources:
+        BTreeMap<ThreadResourcesObservationKey, Arc<super::objects::ThreadResources>>,
 }
 
 struct LeafChecks {
@@ -214,6 +257,7 @@ struct LeafChecks {
 
 impl Kernel {
     pub fn snapshot(&self, deadline: Instant) -> Result<KernelSnapshotV1, KernelSnapshotError> {
+        self.sweep_observations_until(deadline)?;
         let mut saw_race = false;
         for _ in 0..MAX_ATTEMPTS {
             if Instant::now() >= deadline {
@@ -231,60 +275,94 @@ impl Kernel {
 
     fn snapshot_once(&self, deadline: Instant) -> Result<KernelSnapshotV1, AttemptError> {
         let registry = self.copy_registry(deadline)?;
-        let mut tasks = Vec::with_capacity(registry.tasks.len());
-        let mut threads_by_key = BTreeMap::<ThreadKey, (ThreadRef, ThreadSnapshotClass)>::new();
-        let mut mm_by_id = BTreeMap::new();
-        let mut sighand_by_id = BTreeMap::new();
-
+        let live_task_by_key: BTreeMap<_, _> = registry
+            .tasks
+            .iter()
+            .map(|record| (record.task.key(), record))
+            .collect();
+        let mut live_threads = BTreeMap::<ThreadKey, ThreadRef>::new();
+        let mut live_task_shared = BTreeSet::new();
+        let mut live_thread_resources = BTreeSet::new();
+        let mut live_mms = BTreeMap::new();
+        let mut live_sighands = BTreeMap::new();
         for record in &registry.tasks {
-            let task = &record.task;
-            let parent = lock_result(task.parent_until(deadline), deadline)?;
-            let children = lock_result(task.children_until(deadline), deadline)?;
-            let (process_group, session) = lock_result(task.identity_until(deadline), deadline)?;
-            let lifecycle = lock_result(task.lifecycle_until(deadline), deadline)?;
-            let shared = task.shared();
+            if registry
+                .observed_tasks
+                .get(&record.task.key())
+                .is_none_or(|observed| !Arc::ptr_eq(observed, &record.task))
+            {
+                return invariant("live registry task generation is unobserved");
+            }
+            let shared = record.task.shared();
+            let shared_key = matching_task_shared_key(
+                &registry.observed_task_shared,
+                record.task.key(),
+                &shared,
+            )?;
+            live_task_shared.insert(shared_key);
             let mm = shared.mm();
-            let sighand = shared.sighand();
-            insert_shared(&mut mm_by_id, mm.id(), mm, "duplicate mm identity")?;
             insert_shared(
-                &mut sighand_by_id,
+                &mut live_mms,
+                mm.id(),
+                mm,
+                "live pointer-distinct mms share one stable identity",
+            )?;
+            let sighand = shared.sighand();
+            insert_shared(
+                &mut live_sighands,
                 sighand.id(),
                 sighand,
-                "duplicate sighand identity",
+                "live pointer-distinct sighands share one stable identity",
             )?;
-            for thread in lock_result(task.threads_until(deadline), deadline)? {
-                if thread.task_key() != task.key()
-                    || threads_by_key
-                        .insert(thread.key(), (thread, ThreadSnapshotClass::Live))
-                        .is_some()
+            for thread in lock_result(record.task.threads_until(deadline), deadline)? {
+                if registry
+                    .observed_threads
+                    .get(&thread.key())
+                    .is_none_or(|(_, observed)| !Arc::ptr_eq(observed, &thread))
                 {
-                    return invariant("duplicate or broken live thread identity");
+                    return invariant("live registry thread generation is unobserved");
+                }
+                let resources = thread.resources();
+                let resources_key = matching_thread_resources_key(
+                    &registry.observed_thread_resources,
+                    thread.key(),
+                    &resources,
+                )?;
+                live_thread_resources.insert(resources_key);
+                if live_threads.insert(thread.key(), thread).is_some() {
+                    return invariant("duplicate live thread identity");
                 }
             }
-            tasks.push(TaskSnapshotRow {
-                key: task.key(),
-                parent,
-                children,
-                process_group,
-                session,
-                lifecycle,
-                mm: shared.mm().id(),
-                sighand: shared.sighand().id(),
-                revision: record.revision,
-                diagnostic_name: record.diagnostic_name.clone(),
-            });
         }
 
-        for (key, task, thread) in &registry.draining {
-            if threads_by_key.contains_key(key) {
-                return invariant("thread is both live and draining");
-            }
-            if let Some(thread) = thread {
-                if thread.key() != *key || thread.task_key() != *task {
-                    return invariant("draining thread identity changed");
-                }
-                threads_by_key.insert(*key, (Arc::clone(thread), ThreadSnapshotClass::Draining));
-            }
+        let mut tasks = Vec::with_capacity(registry.observed_tasks.len());
+        for (key, task) in &registry.observed_tasks {
+            let live_record = live_task_by_key
+                .get(key)
+                .copied()
+                .filter(|record| Arc::ptr_eq(&record.task, task));
+            let shared = task.shared();
+            let shared_key =
+                matching_task_shared_key(&registry.observed_task_shared, *key, &shared)?;
+            let (process_group, session) = lock_result(task.identity_until(deadline), deadline)?;
+            tasks.push(TaskSnapshotRow {
+                key: *key,
+                class: if live_record.is_some() {
+                    ObjectSnapshotClass::Live
+                } else {
+                    ObjectSnapshotClass::Draining
+                },
+                parent: lock_result(task.parent_until(deadline), deadline)?,
+                children: lock_result(task.children_until(deadline), deadline)?,
+                process_group,
+                session,
+                lifecycle: lock_result(task.lifecycle_until(deadline), deadline)?,
+                shared: shared_key,
+                mm: shared.mm().id(),
+                sighand: shared.sighand().id(),
+                revision: live_record.map(|record| record.revision),
+                diagnostic_name: live_record.map(|record| record.diagnostic_name.clone()),
+            });
         }
 
         let mut checks = LeafChecks {
@@ -301,58 +379,76 @@ impl Kernel {
         let mut credentials = Vec::new();
         let mut file_table_by_id = BTreeMap::new();
         let mut fs_context_by_id = BTreeMap::<FsContextId, Arc<FsContext>>::new();
-
-        for (key, (thread, class)) in threads_by_key {
-            let resources = thread.resources();
+        for resources in registry.observed_thread_resources.values() {
             let files = resources.files();
             let fs = resources.fs_context();
             insert_shared(
                 &mut file_table_by_id,
                 files.id(),
-                Arc::clone(&files),
+                files,
                 "duplicate file-table identity",
             )?;
             insert_shared(
                 &mut fs_context_by_id,
                 fs.id(),
-                Arc::clone(&fs),
+                fs,
                 "duplicate fs-context identity",
             )?;
+        }
+
+        for (key, (task_key, thread)) in &registry.observed_threads {
+            if thread.key() != *key || thread.task_key() != *task_key {
+                return invariant("observed thread identity changed");
+            }
+            let class = if live_threads
+                .get(key)
+                .is_some_and(|live| Arc::ptr_eq(live, thread))
+            {
+                ObjectSnapshotClass::Live
+            } else {
+                ObjectSnapshotClass::Draining
+            };
+            let resources = thread.resources();
+            let resources_key = matching_thread_resources_key(
+                &registry.observed_thread_resources,
+                *key,
+                &resources,
+            )?;
+            let files = resources.files();
+            let fs = resources.fs_context();
+            if class == ObjectSnapshotClass::Live {
+                credentials.push(CredentialsSnapshotRow { thread: *key });
+            }
             let (revision, signal) = lock_result(thread.snapshot_signal_until(deadline), deadline)?;
-            checks.threads.push((Arc::clone(&thread), revision));
-            thread_signals.push(thread_signal_row(key, revision, signal));
-            credentials.push(CredentialsSnapshotRow { thread: key });
+            checks.threads.push((Arc::clone(thread), revision));
+            if class == ObjectSnapshotClass::Live {
+                thread_signals.push(thread_signal_row(*key, revision, signal));
+            }
             thread_rows.push(ThreadSnapshotRow {
-                key,
-                task: thread.task_key(),
+                key: *key,
+                task: *task_key,
                 registry_id: Some(thread.registry_id()),
                 class,
-                file_table: Some(files.id()),
-                fs_context: Some(fs.id()),
+                resources: resources_key,
+                file_table: (class == ObjectSnapshotClass::Live).then_some(files.id()),
+                fs_context: (class == ObjectSnapshotClass::Live).then_some(fs.id()),
             });
-        }
-        // A weak draining record may expire after the registry copy. Its stable
-        // identity remains an explicit draining row without pretending leaf
-        // state is still available.
-        for (key, task, thread) in &registry.draining {
-            if thread.is_none() {
-                thread_rows.push(ThreadSnapshotRow {
-                    key: *key,
-                    task: *task,
-                    registry_id: None,
-                    class: ThreadSnapshotClass::Draining,
-                    file_table: None,
-                    fs_context: None,
-                });
-            }
         }
 
         let mut sighands = Vec::new();
-        for (_, sighand) in sighand_by_id {
+        for (id, sighand) in &registry.observed_sighands {
             let (revision, dispositions) = lock_result(sighand.snapshot_until(deadline), deadline)?;
-            checks.sighands.push((Arc::clone(&sighand), revision));
+            checks.sighands.push((Arc::clone(sighand), revision));
             sighands.push(SighandSnapshotRow {
-                id: sighand.id(),
+                id: *id,
+                class: if live_sighands
+                    .get(id)
+                    .is_some_and(|live| Arc::ptr_eq(live, sighand))
+                {
+                    ObjectSnapshotClass::Live
+                } else {
+                    ObjectSnapshotClass::Draining
+                },
                 revision,
                 dispositions,
             });
@@ -405,7 +501,7 @@ impl Kernel {
 
         let mut mms = Vec::new();
         let mut vmas = Vec::new();
-        for (_, mm) in mm_by_id {
+        for (id, mm) in &registry.observed_mms {
             let backend = mm.backend().cloned().ok_or(AttemptError::Public(
                 KernelSnapshotError::AuthorityUnavailable(SnapshotTable::Mms),
             ))?;
@@ -429,7 +525,7 @@ impl Kernel {
                     return invariant("backend returned malformed VMA extent");
                 }
                 vmas.push(VmaSnapshotRow {
-                    mm: mm.id(),
+                    mm: *id,
                     start: vma.start.raw(),
                     end: vma.end.raw(),
                 });
@@ -438,7 +534,12 @@ impl Kernel {
                 .backends
                 .push((Arc::clone(&backend), observed.revision));
             mms.push(MmSnapshotRow {
-                id: mm.id(),
+                id: *id,
+                class: if live_mms.get(id).is_some_and(|live| Arc::ptr_eq(live, mm)) {
+                    ObjectSnapshotClass::Live
+                } else {
+                    ObjectSnapshotClass::Draining
+                },
                 revision: observed.revision,
                 binding: observed.binding,
                 mapping_ids,
@@ -467,6 +568,30 @@ impl Kernel {
                 .map(|zombie| ZombieSnapshotRow { zombie })
                 .collect(),
             threads: thread_rows,
+            task_shared: registry
+                .observed_task_shared
+                .keys()
+                .map(|key| TaskSharedSnapshotRow {
+                    key: *key,
+                    class: if live_task_shared.contains(key) {
+                        ObjectSnapshotClass::Live
+                    } else {
+                        ObjectSnapshotClass::Draining
+                    },
+                })
+                .collect(),
+            thread_resources: registry
+                .observed_thread_resources
+                .keys()
+                .map(|key| ThreadResourcesSnapshotRow {
+                    key: *key,
+                    class: if live_thread_resources.contains(key) {
+                        ObjectSnapshotClass::Live
+                    } else {
+                        ObjectSnapshotClass::Draining
+                    },
+                })
+                .collect(),
             mms,
             vmas,
             frames: frame_inventory.frames,
@@ -570,20 +695,79 @@ impl Kernel {
                 process_groups: record.process_groups.iter().copied().collect(),
             })
             .collect();
-        let mut draining: Vec<_> = state
-            .retired_threads
-            .iter()
-            .map(|retired| (retired.key, retired.task, retired.thread.upgrade()))
-            .collect();
-        draining.extend(state.tasks.values().filter_map(|record| {
-            record
-                .dead_leader
-                .as_ref()
-                .map(|retired| (retired.key, retired.task, retired.thread.upgrade()))
-        }));
-        draining.sort_by_key(|(key, _, _)| *key);
-        if draining.windows(2).any(|rows| rows[0].0 == rows[1].0) {
-            return invariant("duplicate draining thread identity");
+        // Fixed lock order: registry -> weak observation inventory. Upgrading
+        // here only pins objects for this snapshot attempt; it grants no
+        // lifecycle authority and owns no claims.
+        let observations = lock_result(self.observations.try_lock_until(deadline), deadline)?;
+        let mut observed_tasks = BTreeMap::new();
+        for (key, objects) in &observations.tasks {
+            for object in objects.iter().filter_map(Weak::upgrade) {
+                insert_shared(
+                    &mut observed_tasks,
+                    *key,
+                    object,
+                    "pointer-distinct tasks share one stable identity",
+                )?;
+            }
+        }
+        let mut observed_threads = BTreeMap::new();
+        for (key, objects) in &observations.threads {
+            for (task, weak) in objects {
+                let Some(object) = weak.upgrade() else {
+                    continue;
+                };
+                if let Some((existing_task, existing)) = observed_threads.get(key) {
+                    if *existing_task != *task || !Arc::ptr_eq(existing, &object) {
+                        return invariant("pointer-distinct threads share one stable identity");
+                    }
+                } else {
+                    observed_threads.insert(*key, (*task, object));
+                }
+            }
+        }
+        let mut observed_mms = BTreeMap::new();
+        for (key, objects) in &observations.mms {
+            for object in objects.iter().filter_map(Weak::upgrade) {
+                insert_shared(
+                    &mut observed_mms,
+                    *key,
+                    object,
+                    "pointer-distinct mms share one stable identity",
+                )?;
+            }
+        }
+        let mut observed_sighands = BTreeMap::new();
+        for (key, objects) in &observations.sighands {
+            for object in objects.iter().filter_map(Weak::upgrade) {
+                insert_shared(
+                    &mut observed_sighands,
+                    *key,
+                    object,
+                    "pointer-distinct sighands share one stable identity",
+                )?;
+            }
+        }
+        let mut observed_task_shared = BTreeMap::new();
+        for (key, objects) in &observations.task_shared {
+            for object in objects.iter().filter_map(Weak::upgrade) {
+                insert_shared(
+                    &mut observed_task_shared,
+                    *key,
+                    object,
+                    "pointer-distinct task-shared bundles share one observation key",
+                )?;
+            }
+        }
+        let mut observed_thread_resources = BTreeMap::new();
+        for (key, objects) in &observations.thread_resources {
+            for object in objects.iter().filter_map(Weak::upgrade) {
+                insert_shared(
+                    &mut observed_thread_resources,
+                    *key,
+                    object,
+                    "pointer-distinct thread resources share one observation key",
+                )?;
+            }
         }
         Ok(RegistryCopy {
             epoch: state.epoch,
@@ -591,7 +775,12 @@ impl Kernel {
             zombies,
             groups,
             sessions,
-            draining,
+            observed_tasks,
+            observed_threads,
+            observed_mms,
+            observed_sighands,
+            observed_task_shared,
+            observed_thread_resources,
         })
     }
 
@@ -668,6 +857,40 @@ fn insert_shared<K: Ord, V>(
     Ok(())
 }
 
+fn matching_task_shared_key(
+    observations: &BTreeMap<TaskSharedObservationKey, Arc<super::objects::TaskShared>>,
+    task: TaskKey,
+    shared: &Arc<super::objects::TaskShared>,
+) -> Result<TaskSharedObservationKey, AttemptError> {
+    let mut matches = observations.iter().filter_map(|(key, observed)| {
+        (key.task == task && Arc::ptr_eq(observed, shared)).then_some(*key)
+    });
+    let Some(key) = matches.next() else {
+        return invariant("published task-shared association is unobserved");
+    };
+    if matches.next().is_some() {
+        return invariant("task-shared generation has duplicate observation keys");
+    }
+    Ok(key)
+}
+
+fn matching_thread_resources_key(
+    observations: &BTreeMap<ThreadResourcesObservationKey, Arc<super::objects::ThreadResources>>,
+    thread: ThreadKey,
+    resources: &Arc<super::objects::ThreadResources>,
+) -> Result<ThreadResourcesObservationKey, AttemptError> {
+    let mut matches = observations.iter().filter_map(|(key, observed)| {
+        (key.thread == thread && Arc::ptr_eq(observed, resources)).then_some(*key)
+    });
+    let Some(key) = matches.next() else {
+        return invariant("published thread-resources association is unobserved");
+    };
+    if matches.next().is_some() {
+        return invariant("thread-resources generation has duplicate observation keys");
+    }
+    Ok(key)
+}
+
 fn has_duplicates<T: Copy + Ord>(values: &[T]) -> bool {
     values.iter().copied().collect::<BTreeSet<_>>().len() != values.len()
 }
@@ -691,6 +914,8 @@ fn sort_snapshot(snapshot: &mut KernelSnapshotV1) {
     snapshot.tasks.sort_by_key(|row| row.key);
     snapshot.zombies.sort_by_key(|row| row.zombie.key);
     snapshot.threads.sort_by_key(|row| row.key);
+    snapshot.task_shared.sort_by_key(|row| row.key);
+    snapshot.thread_resources.sort_by_key(|row| row.key);
     snapshot.mms.sort_by_key(|row| row.id);
     snapshot
         .vmas
@@ -713,16 +938,33 @@ fn sort_snapshot(snapshot: &mut KernelSnapshotV1) {
 
 fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
     let task_by_key: BTreeMap<_, _> = snapshot.tasks.iter().map(|row| (row.key, row)).collect();
-    let live_tasks: BTreeSet<_> = task_by_key.keys().copied().collect();
+    let observed_tasks: BTreeSet<_> = task_by_key.keys().copied().collect();
+    let live_tasks: BTreeSet<_> = snapshot
+        .tasks
+        .iter()
+        .filter_map(|row| (row.class == ObjectSnapshotClass::Live).then_some(row.key))
+        .collect();
     let zombies: BTreeSet<_> = snapshot.zombies.iter().map(|row| row.zombie.key).collect();
-    if live_tasks.len() != snapshot.tasks.len()
+    if observed_tasks.len() != snapshot.tasks.len()
         || zombies.len() != snapshot.zombies.len()
         || !live_tasks.is_disjoint(&zombies)
     {
-        return invariant("duplicate or overlapping task/zombie key");
+        return invariant("duplicate or overlapping live-task/zombie key");
     }
-    let mm_ids: BTreeSet<_> = snapshot.mms.iter().map(|row| row.id).collect();
-    let sighand_ids: BTreeSet<_> = snapshot.sighands.iter().map(|row| row.id).collect();
+    let mm_by_id: BTreeMap<_, _> = snapshot.mms.iter().map(|row| (row.id, row)).collect();
+    let sighand_by_id: BTreeMap<_, _> = snapshot.sighands.iter().map(|row| (row.id, row)).collect();
+    let mm_ids: BTreeSet<_> = mm_by_id.keys().copied().collect();
+    let sighand_ids: BTreeSet<_> = sighand_by_id.keys().copied().collect();
+    let shared_by_key: BTreeMap<_, _> = snapshot
+        .task_shared
+        .iter()
+        .map(|row| (row.key, row))
+        .collect();
+    let resources_by_key: BTreeMap<_, _> = snapshot
+        .thread_resources
+        .iter()
+        .map(|row| (row.key, row))
+        .collect();
     let group_by_id: BTreeMap<_, _> = snapshot
         .process_groups
         .iter()
@@ -733,6 +975,8 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
     let session_ids: BTreeSet<_> = session_by_id.keys().copied().collect();
     if mm_ids.len() != snapshot.mms.len()
         || sighand_ids.len() != snapshot.sighands.len()
+        || shared_by_key.len() != snapshot.task_shared.len()
+        || resources_by_key.len() != snapshot.thread_resources.len()
         || group_ids.len() != snapshot.process_groups.len()
         || session_ids.len() != snapshot.sessions.len()
     {
@@ -742,42 +986,61 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
         if has_duplicates(&task.children) {
             return invariant("task contains duplicate child keys");
         }
-        if !mm_ids.contains(&task.mm)
+        if task.shared.task != task.key
+            || task.shared.mm != task.mm
+            || task.shared.sighand != task.sighand
+            || !mm_ids.contains(&task.mm)
             || !sighand_ids.contains(&task.sighand)
-            || !group_ids.contains(&task.process_group)
-            || !session_ids.contains(&task.session)
+            || !shared_by_key.contains_key(&task.shared)
         {
-            return invariant("task leaf or identity join is missing");
+            return invariant("task bundle or leaf join is missing");
         }
-        if task.parent.is_some_and(|parent| {
-            task_by_key
-                .get(&parent)
-                .is_none_or(|parent_row| !parent_row.children.contains(&task.key))
-        }) || task.children.iter().any(|child| {
-            task_by_key.get(child).map_or_else(
-                || {
-                    snapshot
-                        .zombies
-                        .iter()
-                        .find(|row| row.zombie.key == *child)
-                        .is_none_or(|row| row.zombie.parent != Some(task.key))
-                },
-                |child_row| child_row.parent != Some(task.key),
-            )
-        }) {
+        if task.class == ObjectSnapshotClass::Live
+            && (task.revision.is_none()
+                || task.diagnostic_name.is_none()
+                || !group_ids.contains(&task.process_group)
+                || !session_ids.contains(&task.session))
+        {
+            return invariant("live task registry join is missing");
+        }
+        if task.class == ObjectSnapshotClass::Draining
+            && (task.revision.is_some() || task.diagnostic_name.is_some())
+        {
+            return invariant("draining task retains registry-only metadata");
+        }
+        if task.class == ObjectSnapshotClass::Live
+            && (task.parent.is_some_and(|parent| {
+                task_by_key
+                    .get(&parent)
+                    .is_none_or(|parent_row| !parent_row.children.contains(&task.key))
+            }) || task.children.iter().any(|child| {
+                task_by_key.get(child).map_or_else(
+                    || {
+                        snapshot
+                            .zombies
+                            .iter()
+                            .find(|row| row.zombie.key == *child)
+                            .is_none_or(|row| row.zombie.parent != Some(task.key))
+                    },
+                    |child_row| child_row.parent != Some(task.key),
+                )
+            }))
+        {
             return invariant("task parent/child backlink is missing");
         }
-        let Some(group) = group_by_id.get(&task.process_group) else {
-            return invariant("task process-group join is missing");
-        };
-        let Some(session_row) = session_by_id.get(&task.session) else {
-            return invariant("task session join is missing");
-        };
-        if group.session != task.session
-            || !group.members.contains(&task.key)
-            || !session_row.process_groups.contains(&task.process_group)
-        {
-            return invariant("task group/session backlink is missing");
+        if task.class == ObjectSnapshotClass::Live {
+            let Some(group) = group_by_id.get(&task.process_group) else {
+                return invariant("task process-group join is missing");
+            };
+            let Some(session_row) = session_by_id.get(&task.session) else {
+                return invariant("task session join is missing");
+            };
+            if group.session != task.session
+                || !group.members.contains(&task.key)
+                || !session_row.process_groups.contains(&task.process_group)
+            {
+                return invariant("task group/session backlink is missing");
+            }
         }
     }
     for zombie in &snapshot.zombies {
@@ -794,7 +1057,9 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
             || !session_ids.contains(&group.session)
             || group.members.iter().any(|member| {
                 task_by_key.get(member).is_none_or(|task| {
-                    task.process_group != group.id || task.session != group.session
+                    task.class != ObjectSnapshotClass::Live
+                        || task.process_group != group.id
+                        || task.session != group.session
                 })
             })
         {
@@ -819,6 +1084,33 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
         }
     }
 
+    let live_shared: BTreeSet<_> = snapshot
+        .tasks
+        .iter()
+        .filter_map(|row| (row.class == ObjectSnapshotClass::Live).then_some(row.shared))
+        .collect();
+    for shared in &snapshot.task_shared {
+        if (shared.class == ObjectSnapshotClass::Live && !observed_tasks.contains(&shared.key.task))
+            || !mm_ids.contains(&shared.key.mm)
+            || !sighand_ids.contains(&shared.key.sighand)
+            || (shared.class == ObjectSnapshotClass::Live) != live_shared.contains(&shared.key)
+        {
+            return invariant("task-shared class or join is inconsistent");
+        }
+    }
+    let reachable_live_mms: BTreeSet<_> = live_shared.iter().map(|key| key.mm).collect();
+    let reachable_live_sighands: BTreeSet<_> = live_shared.iter().map(|key| key.sighand).collect();
+    if snapshot
+        .mms
+        .iter()
+        .any(|row| (row.class == ObjectSnapshotClass::Live) != reachable_live_mms.contains(&row.id))
+        || snapshot.sighands.iter().any(|row| {
+            (row.class == ObjectSnapshotClass::Live) != reachable_live_sighands.contains(&row.id)
+        })
+    {
+        return invariant("mm or sighand class is inconsistent with live reachability");
+    }
+
     let thread_keys: BTreeSet<_> = snapshot.threads.iter().map(|row| row.key).collect();
     if thread_keys.len() != snapshot.threads.len() {
         return invariant("duplicate thread key");
@@ -830,12 +1122,38 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
     {
         return invariant("duplicate file-table or fs-context identity");
     }
-    for thread in &snapshot.threads {
-        if !live_tasks.contains(&thread.task) && !zombies.contains(&thread.task) {
-            return invariant("thread task join is missing");
+    let live_threads: BTreeSet<_> = snapshot
+        .threads
+        .iter()
+        .filter_map(|row| (row.class == ObjectSnapshotClass::Live).then_some(row.key))
+        .collect();
+    let live_resources: BTreeSet<_> = snapshot
+        .threads
+        .iter()
+        .filter_map(|row| (row.class == ObjectSnapshotClass::Live).then_some(row.resources))
+        .collect();
+    for resources in &snapshot.thread_resources {
+        if (resources.class == ObjectSnapshotClass::Live
+            && !thread_keys.contains(&resources.key.thread))
+            || !file_tables.contains(&resources.key.file_table)
+            || !fs_contexts.contains(&resources.key.fs_context)
+            || (resources.class == ObjectSnapshotClass::Live)
+                != live_resources.contains(&resources.key)
+        {
+            return invariant("thread-resources class or join is inconsistent");
         }
-        if thread.class == ThreadSnapshotClass::Live
-            && (thread.file_table.is_none() || thread.fs_context.is_none())
+    }
+    for thread in &snapshot.threads {
+        if !resources_by_key.contains_key(&thread.resources)
+            || thread.resources.thread != thread.key
+        {
+            return invariant("thread task or resources join is missing");
+        }
+        if thread.class == ObjectSnapshotClass::Live
+            && (!observed_tasks.contains(&thread.task)
+                || !live_tasks.contains(&thread.task)
+                || thread.file_table.is_none()
+                || thread.fs_context.is_none())
         {
             return invariant("live thread leaf join is missing");
         }
@@ -865,8 +1183,9 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
     if credential_threads.len() != snapshot.credentials.len()
         || signal_threads.len() != snapshot.thread_signals.len()
         || task_signal_tasks.len() != snapshot.task_signals.len()
-        || credential_threads != leaf_threads
-        || signal_threads != leaf_threads
+        || leaf_threads != thread_keys
+        || credential_threads != live_threads
+        || signal_threads != live_threads
         || task_signal_tasks != live_tasks
     {
         return invariant("thread credential/signal or task-signal coverage is incomplete");
@@ -994,8 +1313,8 @@ mod tests {
 
     use super::*;
     use crate::kernel::{
-        Asid, ClonePlan, KernelContext, MmBackendSnapshot, RootBootstrap, SnapshotError,
-        Stage1Root, VmaSummary,
+        Asid, ClonePlan, KernelContext, LinuxWaitStatus, MmBackendSnapshot, RootBootstrap,
+        SnapshotError, Stage1Root, TaskRusage, VmaSummary, WaitMode, WaitOutcome,
     };
 
     #[derive(Clone, Copy, Debug)]
@@ -1261,6 +1580,313 @@ mod tests {
         let mut missing_signal = snapshot;
         missing_signal.thread_signals.clear();
         assert_corrupt(&missing_signal);
+    }
+
+    #[test]
+    fn pointer_distinct_stable_identity_collision_fails_closed() {
+        let (kernel, root) = bootstrap(TestBackend::new(BackendMode::Good));
+        let mm_id = root.shared().mm().id();
+        let backend: Arc<dyn MmBackend> = TestBackend::new(BackendMode::Good);
+        let collision = Arc::new(crate::kernel::Mm::with_backend(mm_id, backend));
+        kernel
+            .observations
+            .lock()
+            .mms
+            .entry(mm_id)
+            .or_default()
+            .push(Arc::downgrade(&collision));
+        assert!(matches!(
+            kernel.snapshot(deadline()),
+            Err(KernelSnapshotError::InvariantViolation(
+                "pointer-distinct mms share one stable identity"
+            ))
+        ));
+    }
+
+    #[test]
+    fn pointer_distinct_bundle_key_collision_fails_closed() {
+        let (kernel, root) = bootstrap(TestBackend::new(BackendMode::Good));
+        let collision = Arc::new(crate::kernel::TaskShared::new(
+            root.shared().mm(),
+            root.shared().sighand(),
+        ));
+        let key = *kernel
+            .observations
+            .lock()
+            .task_shared
+            .keys()
+            .next()
+            .expect("root task-shared observation");
+        kernel
+            .observations
+            .lock()
+            .task_shared
+            .entry(key)
+            .or_default()
+            .push(Arc::downgrade(&collision));
+        assert!(matches!(
+            kernel.snapshot(deadline()),
+            Err(KernelSnapshotError::InvariantViolation(
+                "pointer-distinct task-shared bundles share one observation key"
+            ))
+        ));
+    }
+
+    #[test]
+    fn retained_exec_context_and_bundles_drain_until_their_own_last_owner() {
+        let (kernel, old_context) = bootstrap(TestBackend::new(BackendMode::Good));
+        let retained_shared = Arc::clone(old_context.shared());
+        let retained_resources = Arc::clone(old_context.resources());
+        let old_thread = old_context.thread().key();
+        let old_mm = old_context.shared().mm().id();
+        let old_sighand = old_context.shared().sighand().id();
+        let prepared = kernel
+            .prepare_exec_with_mm_backend(&old_context, TestBackend::new(BackendMode::Good), None)
+            .expect("prepare exec");
+        let new_context = kernel.commit_exec(prepared, None).expect("commit exec");
+
+        let draining = kernel.snapshot(deadline()).expect("draining snapshot");
+        assert!(
+            draining
+                .threads
+                .iter()
+                .any(|row| row.key == old_thread && row.class == ObjectSnapshotClass::Draining)
+        );
+        assert!(
+            draining
+                .mms
+                .iter()
+                .any(|row| row.id == old_mm && row.class == ObjectSnapshotClass::Draining)
+        );
+        assert!(
+            draining
+                .sighands
+                .iter()
+                .any(|row| row.id == old_sighand && row.class == ObjectSnapshotClass::Draining)
+        );
+        let old_shared = draining
+            .task_shared
+            .iter()
+            .find(|row| row.key.mm == old_mm)
+            .expect("old task-shared row")
+            .key;
+        let old_resources = draining
+            .thread_resources
+            .iter()
+            .find(|row| row.key.thread == old_thread)
+            .expect("old thread-resources row")
+            .key;
+        assert_eq!(
+            draining
+                .task_shared
+                .iter()
+                .find(|row| row.key == old_shared)
+                .expect("old task-shared")
+                .class,
+            ObjectSnapshotClass::Draining
+        );
+        assert_eq!(
+            draining
+                .thread_resources
+                .iter()
+                .find(|row| row.key == old_resources)
+                .expect("old thread resources")
+                .class,
+            ObjectSnapshotClass::Draining
+        );
+
+        drop(draining);
+        drop(old_context);
+        let bundles_only = kernel
+            .snapshot(deadline())
+            .expect("bundle-only draining snapshot");
+        assert!(!bundles_only.threads.iter().any(|row| row.key == old_thread));
+        assert!(
+            bundles_only
+                .task_shared
+                .iter()
+                .any(|row| { row.key == old_shared && row.class == ObjectSnapshotClass::Draining })
+        );
+        assert!(
+            bundles_only.thread_resources.iter().any(|row| {
+                row.key == old_resources && row.class == ObjectSnapshotClass::Draining
+            })
+        );
+        assert!(
+            bundles_only
+                .file_tables
+                .iter()
+                .any(|row| row.id == old_resources.file_table)
+        );
+        assert!(
+            bundles_only
+                .fs_contexts
+                .iter()
+                .any(|row| row.id == old_resources.fs_context)
+        );
+        assert!(bundles_only.mms.iter().any(|row| row.id == old_mm));
+        assert!(
+            bundles_only
+                .sighands
+                .iter()
+                .any(|row| row.id == old_sighand)
+        );
+
+        drop(bundles_only);
+        drop(retained_shared);
+        drop(retained_resources);
+        let swept = kernel
+            .snapshot(deadline())
+            .expect("automatic swept snapshot");
+        assert!(!swept.mms.iter().any(|row| row.id == old_mm));
+        assert!(!swept.sighands.iter().any(|row| row.id == old_sighand));
+        assert!(!swept.task_shared.iter().any(|row| row.key == old_shared));
+        assert!(
+            !swept
+                .thread_resources
+                .iter()
+                .any(|row| row.key == old_resources)
+        );
+        drop(new_context);
+    }
+
+    #[test]
+    fn reaped_zombie_context_and_bundles_drain_independently() {
+        let (kernel, root) = bootstrap(TestBackend::new(BackendMode::Good));
+        let child = kernel
+            .reserve_fork(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                "child".to_owned(),
+                None,
+            )
+            .expect("reserve fork")
+            .prepare_with_mm_backend(
+                TestBackend::new(BackendMode::Good),
+                ThreadId::synthetic_for_tests(7003),
+            )
+            .expect("prepare fork")
+            .commit()
+            .expect("commit fork")
+            .into_parts()
+            .expect("start child")
+            .0;
+        let retained_shared = Arc::clone(child.shared());
+        let retained_resources = Arc::clone(child.resources());
+        let child_key = child.task().key();
+        let child_thread = child.thread().key();
+        let child_mm = child.shared().mm().id();
+        let child_sighand = child.shared().sighand().id();
+        kernel
+            .exit_task(
+                child_key.id,
+                LinuxWaitStatus::from_wait_encoding(0),
+                TaskRusage::default(),
+                None,
+            )
+            .expect("exit child");
+        assert!(matches!(
+            kernel.wait_child(root.task().key().id, Some(child_key.id), WaitMode::Consume),
+            Ok(WaitOutcome::Exited(_))
+        ));
+
+        let draining = kernel.snapshot(deadline()).expect("draining snapshot");
+        assert!(
+            !draining
+                .zombies
+                .iter()
+                .any(|row| row.zombie.key == child_key)
+        );
+        assert!(
+            draining
+                .tasks
+                .iter()
+                .any(|row| { row.key == child_key && row.class == ObjectSnapshotClass::Draining })
+        );
+        assert!(
+            draining.threads.iter().any(|row| {
+                row.key == child_thread && row.class == ObjectSnapshotClass::Draining
+            })
+        );
+        assert!(
+            draining
+                .mms
+                .iter()
+                .any(|row| { row.id == child_mm && row.class == ObjectSnapshotClass::Draining })
+        );
+        assert!(
+            draining.sighands.iter().any(|row| {
+                row.id == child_sighand && row.class == ObjectSnapshotClass::Draining
+            })
+        );
+        assert!(draining.task_shared.iter().any(|row| {
+            row.key.task == child_key && row.class == ObjectSnapshotClass::Draining
+        }));
+        assert!(draining.thread_resources.iter().any(|row| {
+            row.key.thread == child_thread && row.class == ObjectSnapshotClass::Draining
+        }));
+
+        drop(draining);
+        drop(child);
+        let bundles_only = kernel.snapshot(deadline()).expect("bundle-only snapshot");
+        assert!(!bundles_only.tasks.iter().any(|row| row.key == child_key));
+        assert!(
+            !bundles_only
+                .threads
+                .iter()
+                .any(|row| row.key == child_thread)
+        );
+        assert!(bundles_only.task_shared.iter().any(|row| {
+            row.key.task == child_key && row.class == ObjectSnapshotClass::Draining
+        }));
+        let child_resources_key = bundles_only
+            .thread_resources
+            .iter()
+            .find(|row| row.key.thread == child_thread)
+            .expect("child resources row")
+            .key;
+        assert_eq!(
+            bundles_only
+                .thread_resources
+                .iter()
+                .find(|row| row.key == child_resources_key)
+                .expect("child resources class")
+                .class,
+            ObjectSnapshotClass::Draining
+        );
+        assert!(
+            bundles_only
+                .file_tables
+                .iter()
+                .any(|row| row.id == child_resources_key.file_table)
+        );
+        assert!(
+            bundles_only
+                .fs_contexts
+                .iter()
+                .any(|row| row.id == child_resources_key.fs_context)
+        );
+
+        drop(bundles_only);
+        drop(retained_shared);
+        drop(retained_resources);
+        let swept = kernel
+            .snapshot(deadline())
+            .expect("automatic swept snapshot");
+        assert!(!swept.mms.iter().any(|row| row.id == child_mm));
+        assert!(!swept.sighands.iter().any(|row| row.id == child_sighand));
+        assert!(
+            !swept
+                .task_shared
+                .iter()
+                .any(|row| row.key.task == child_key)
+        );
+        assert!(
+            !swept
+                .thread_resources
+                .iter()
+                .any(|row| row.key.thread == child_thread)
+        );
     }
 
     #[test]

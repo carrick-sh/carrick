@@ -331,8 +331,8 @@ impl Kernel {
             }
             if let Some(claim) = record.thread_claims.remove(tid) {
                 retired_threads.push(RetiredThreadRecord {
-                    key: thread.key(),
-                    task: thread.task_key(),
+                    _key: thread.key(),
+                    _task: thread.task_key(),
                     thread: Arc::downgrade(thread),
                     _claim: claim,
                 });
@@ -343,6 +343,13 @@ impl Kernel {
         }
         record.revision = revision;
         record.has_execed = true;
+        self.observe_exec_publication(
+            prepared.task,
+            &prepared.replacement,
+            &prepared.shared,
+            &prepared.resources,
+            revision,
+        );
         let vfork_release = record.vfork_release.take();
         reservations.remove(&prepared.task.id);
         prepared.guard.commit_reservation();
