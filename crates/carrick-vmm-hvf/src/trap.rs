@@ -2725,6 +2725,7 @@ struct InventoryFrameRegistry {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Default)]
 struct HvpatchFrameInventory {
+    initialized: bool,
     extents: std::collections::BTreeMap<(u64, u64), InventoryExtent>,
     frames: std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
     alias_reservation: Option<carrick_hal::FrameInventoryReservation>,
@@ -3366,11 +3367,12 @@ impl HvfVmState {
     }
 
     pub(crate) fn frame_inventory_extent_count(&self) -> usize {
-        self.frame_inventory
-            .lock()
-            .extents
-            .len()
-            .max(self.mappings.len())
+        let inventory = self.frame_inventory.lock();
+        if inventory.initialized {
+            inventory.extents.len()
+        } else {
+            self.mappings.len()
+        }
     }
 
     pub(crate) fn inventory_initial_mappings(
@@ -3392,6 +3394,7 @@ impl HvfVmState {
                 None,
             )?;
         }
+        inventory.initialized = true;
         Ok(reservation.commit(()))
     }
 
@@ -3535,13 +3538,20 @@ impl HvfVmState {
                 .filter(|alias| alias.ipa >= bank_base && alias.ipa < bank_end)
                 .map(|alias| (alias.ipa, alias.size)),
         );
+        let mut physical_mutated = false;
         for &(ipa, size) in &extents {
             let rc = unsafe { inventory_hv_vm_unmap(ipa, size) };
             if rc != 0 {
-                return Err(TrapError::Hypervisor(format!(
+                let error = TrapError::Hypervisor(format!(
                     "retire hvpatch process hv_vm_unmap(ipa=0x{ipa:x}, size={size}) failed: 0x{rc:x}"
-                )));
+                ));
+                if physical_mutated {
+                    eprintln!("carrick: FATAL: partial HVPatch process retirement: {error}");
+                    std::process::abort();
+                }
+                return Err(error);
             }
+            physical_mutated = true;
         }
         alias_registry()
             .lock()
@@ -6412,6 +6422,7 @@ impl HvfVmState {
                     std::process::abort();
                 }
             }
+            inventory.initialized = true;
             inventory.process_commit = Some(reservation.commit(()));
         }
         let state = HvfVmState {
@@ -6470,6 +6481,7 @@ impl HvfVmState {
             extents.extend(self.mappings.iter().map(|m| (m.ipa, m.size)));
             extents.extend(alias_registry().lock().iter().map(|m| (m.ipa, m.size)));
         }
+        let mut physical_mutated = false;
         for (ipa, size) in extents {
             crate::probes::hvpatch_exec_stage2(
                 carrick_observability::probes::HvpatchExecStage2::new(
@@ -6491,10 +6503,16 @@ impl HvfVmState {
                 ),
             );
             if rc != 0 {
-                return Err(TrapError::Hypervisor(format!(
+                let error = TrapError::Hypervisor(format!(
                     "hvpatch exec hv_vm_unmap(ipa=0x{ipa:x}, size={size}) failed: 0x{rc:x}"
-                )));
+                ));
+                if physical_mutated {
+                    eprintln!("carrick: FATAL: partial HVPatch exec unmap: {error}");
+                    std::process::abort();
+                }
+                return Err(error);
             }
+            physical_mutated = true;
         }
         Ok(())
     }
