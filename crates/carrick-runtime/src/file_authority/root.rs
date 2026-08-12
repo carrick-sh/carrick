@@ -1,14 +1,15 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(test)]
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
 
-use super::{AuthorityEpoch, AuthorityFatal, FileAuthorityBinding, FileAuthorityCore};
-#[cfg(test)]
 use super::{
-    ClientId, ClientIdentity, Command, FileAuthorityTransport, ObjectGeneration, Outcome, Request,
-    RequestId,
+    AuthorityEpoch, AuthorityFatal, Command, FileAuthorityBinding, FileAuthorityCore,
+    FileAuthorityTransport, ObjectGeneration, Outcome, Request, RequestId, Response, SlotPageLimit,
 };
+#[cfg(test)]
+use super::{ClientId, ClientIdentity};
 
 #[cfg(not(test))]
 type RunTransport = super::IpcFileAuthority;
@@ -21,8 +22,9 @@ type RunTransport = super::DirectFileAuthority;
 /// families are attached to this root incrementally; until a family is cut
 /// over, this object owns no guest-visible backing from that family.
 pub(crate) struct FileAuthorityRun {
-    _transport: RunTransport,
+    transport: RunTransport,
     binding: FileAuthorityBinding,
+    next_request: AtomicU64,
 }
 
 impl std::fmt::Debug for FileAuthorityRun {
@@ -46,15 +48,53 @@ impl FileAuthorityRun {
         #[cfg(test)]
         let (transport, binding) = direct_root(epoch)?;
 
-        Ok(Arc::new(Self {
-            _transport: transport,
+        let authority = Arc::new(Self {
+            transport,
             binding,
-        }))
+            // Root registration and root-table creation consumed requests 1-2.
+            next_request: AtomicU64::new(3),
+        });
+        let health = authority.execute(
+            Command::ListSlots {
+                table: binding.table,
+                after: None,
+                maximum: SlotPageLimit::bounded(1)
+                    .map_err(|_| AuthorityFatal::InvariantViolation("invalid root health bound"))?,
+            },
+            binding.generation,
+        )?;
+        if !matches!(health.outcome, Outcome::SlotPage { ref slots, .. } if slots.is_empty()) {
+            return Err(AuthorityFatal::InvariantViolation(
+                "FileAuthority root health check was not empty",
+            ));
+        }
+        Ok(authority)
     }
 
-    #[cfg(test)]
     pub(crate) const fn binding(&self) -> FileAuthorityBinding {
         self.binding
+    }
+
+    fn execute(
+        &self,
+        command: Command,
+        expected_generation: ObjectGeneration,
+    ) -> Result<Response, AuthorityFatal> {
+        let sequence = self
+            .next_request
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| AuthorityFatal::IdentityExhausted)?;
+        let request_id = RequestId::from_client_sequence(sequence)
+            .map_err(|_| AuthorityFatal::IdentityExhausted)?;
+        self.transport.execute(Request {
+            epoch: self.binding.epoch,
+            client: self.binding.client,
+            request_id,
+            expected_generation,
+            command,
+        })
     }
 }
 

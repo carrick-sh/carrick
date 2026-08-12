@@ -3276,12 +3276,18 @@ impl SyscallDispatcher {
 
     pub(crate) fn activate_file_authority(
         &self,
-    ) -> Result<(), crate::file_authority::AuthorityFatal> {
+    ) -> Result<crate::file_authority::FileAuthorityBinding, crate::file_authority::AuthorityFatal>
+    {
         let mut authority = self.file_authority.write();
         if authority.is_none() {
             *authority = Some(crate::file_authority::FileAuthorityRun::launch()?);
         }
-        Ok(())
+        authority
+            .as_ref()
+            .map(|authority| authority.binding())
+            .ok_or(crate::file_authority::AuthorityFatal::InvariantViolation(
+                "active FileAuthority root disappeared",
+            ))
     }
 
     #[cfg(test)]
@@ -8724,21 +8730,21 @@ mod routing_tests {
     fn dispatcher_activates_one_authenticated_file_authority_root() {
         let dispatcher = SyscallDispatcher::new();
         assert_eq!(dispatcher.file_authority_binding(), None);
-        dispatcher
+        let binding = dispatcher
             .activate_file_authority()
             .expect("activate FileAuthority");
-        let binding = dispatcher
-            .file_authority_binding()
-            .expect("active FileAuthority binding");
         assert_eq!(binding.epoch.raw(), 1);
         assert_eq!(binding.client.id.raw(), 1);
         assert_eq!(
             binding.generation,
             crate::file_authority::ObjectGeneration::INITIAL
         );
-        dispatcher
-            .activate_file_authority()
-            .expect("idempotent FileAuthority activation");
+        assert_eq!(
+            dispatcher
+                .activate_file_authority()
+                .expect("idempotent FileAuthority activation"),
+            binding
+        );
         assert_eq!(dispatcher.file_authority_binding(), Some(binding));
     }
 
