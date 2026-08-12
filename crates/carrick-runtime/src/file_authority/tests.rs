@@ -205,6 +205,14 @@ fn transport_model_trace(mut harness: Harness) -> Vec<Outcome> {
         }
         other => panic!("unexpected table outcome: {other:?}"),
     };
+    let binding = FileAuthorityBinding {
+        epoch: harness.epoch,
+        client: harness.client,
+        table,
+        generation: ObjectGeneration::INITIAL,
+    };
+    assert_eq!(binding.table, table);
+    assert_eq!(binding.client, harness.client);
     let object = match harness.send(
         Command::CreateVfsFile {
             path: CanonicalPath::absolute("/equivalence").expect("path"),
