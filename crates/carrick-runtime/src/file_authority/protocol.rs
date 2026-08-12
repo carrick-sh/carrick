@@ -257,6 +257,7 @@ fn command_tag(command: &Command) -> u8 {
         Command::EpollRevalidateHostPlan { .. } => 40,
         Command::FinalizeMappingLease { .. } => 41,
         Command::ReleaseMappingAttachment { .. } => 42,
+        Command::ForkCopyMappings { .. } => 43,
     }
 }
 
@@ -567,6 +568,13 @@ fn encode_command(writer: &mut Writer, command: &Command) -> Result<(), Authorit
             writer.u64(source.raw());
             writer.client(*owner);
         }
+        Command::ForkCopyMappings {
+            source_owner,
+            owner,
+        } => {
+            writer.client(*source_owner);
+            writer.client(*owner);
+        }
         Command::ShareTable { table, owner } => {
             writer.u64(table.raw());
             writer.client(*owner);
@@ -811,6 +819,10 @@ fn decode_command(tag: u8, reader: &mut Reader<'_>) -> Result<Command, Authority
         42 => Command::ReleaseMappingAttachment {
             attachment: reader.mapping_attachment_id()?,
             release: reader.mapping_release()?,
+        },
+        43 => Command::ForkCopyMappings {
+            source_owner: reader.client()?,
+            owner: reader.client()?,
         },
         _ => return malformed("unknown operation"),
     })
@@ -1170,6 +1182,18 @@ fn encode_outcome(writer: &mut Writer, outcome: &Outcome) -> Result<(), Authorit
             writer.u64(generation.raw());
             writer.u64(revision.raw());
         }
+        Outcome::MappingAttachmentsCopied {
+            source_owner,
+            owner,
+            attachments,
+            revision,
+        } => {
+            writer.u8(42);
+            writer.client(*source_owner);
+            writer.client(*owner);
+            writer.mapping_attachments(attachments)?;
+            writer.u64(revision.raw());
+        }
         Outcome::TableShared { table, revision } => {
             writer.u8(15);
             writer.u64(table.raw());
@@ -1486,6 +1510,12 @@ fn decode_outcome(reader: &mut Reader<'_>) -> Result<Outcome, AuthorityFatal> {
             object_reclaimed: reader.bool()?,
             revision: reader.revision()?,
         },
+        42 => Outcome::MappingAttachmentsCopied {
+            source_owner: reader.client()?,
+            owner: reader.client()?,
+            attachments: reader.mapping_attachments()?,
+            revision: reader.revision()?,
+        },
         _ => return malformed("unknown response outcome"),
     })
 }
@@ -1722,6 +1752,20 @@ impl Writer {
     fn mapping_range(&mut self, range: MappingRange) {
         self.u64(range.start());
         self.u64(range.length());
+    }
+
+    fn mapping_attachments(
+        &mut self,
+        attachments: &[MappingAttachmentId],
+    ) -> Result<(), AuthorityFatal> {
+        self.u16(
+            u16::try_from(attachments.len())
+                .map_err(|_| AuthorityFatal::EncodingFailure("too many mapping attachments"))?,
+        );
+        for attachment in attachments {
+            self.u64(attachment.raw());
+        }
+        Ok(())
     }
 
     fn mapping_ranges(&mut self, ranges: &[MappingRange]) -> Result<(), AuthorityFatal> {
@@ -2047,6 +2091,15 @@ impl<'a> Reader<'a> {
     fn mapping_range(&mut self) -> Result<MappingRange, AuthorityFatal> {
         MappingRange::bounded(self.u64()?, self.u64()?)
             .map_err(|_| AuthorityFatal::MalformedFrame("invalid mapping range"))
+    }
+
+    fn mapping_attachments(&mut self) -> Result<Vec<MappingAttachmentId>, AuthorityFatal> {
+        let count = usize::from(self.u16()?);
+        let mut attachments = Vec::with_capacity(count);
+        for _ in 0..count {
+            attachments.push(self.mapping_attachment_id()?);
+        }
+        Ok(attachments)
     }
 
     fn mapping_ranges(&mut self) -> Result<Vec<MappingRange>, AuthorityFatal> {
@@ -2520,6 +2573,10 @@ mod tests {
                 source: table,
                 owner: client(),
             },
+            Command::ForkCopyMappings {
+                source_owner: client(),
+                owner: client(),
+            },
             Command::ShareTable {
                 table,
                 owner: client(),
@@ -2758,6 +2815,12 @@ mod tests {
                 table,
                 generation: ObjectGeneration::INITIAL,
                 revision: Revision::from_wire(10),
+            },
+            Outcome::MappingAttachmentsCopied {
+                source_owner: client(),
+                owner: client(),
+                attachments: vec![attachment],
+                revision: Revision::from_wire(11),
             },
             Outcome::TableShared {
                 table,

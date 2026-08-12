@@ -1520,6 +1520,18 @@ fn direct_and_ipc_mapping_attachments_outlive_slots_and_split_on_unmap() {
             } => attachment,
             other => panic!("unexpected mapping commit: {other:?}"),
         };
+        let mut child = harness.peer(2, 1002, 1);
+        let copied = match harness.send(
+            Command::ForkCopyMappings {
+                source_owner: harness.client,
+                owner: child.client,
+            },
+            ObjectGeneration::INITIAL,
+        ) {
+            Outcome::MappingAttachmentsCopied { attachments, .. } => attachments,
+            other => panic!("unexpected mapping copy: {other:?}"),
+        };
+        assert_eq!(copied.len(), 1);
         assert!(matches!(
             harness.send(
                 Command::Close { table, fd: open_fd },
@@ -1555,8 +1567,21 @@ fn direct_and_ipc_mapping_attachments_outlive_slots_and_split_on_unmap() {
                 ObjectGeneration::INITIAL,
             ),
             Outcome::MappingAttachmentReleased {
-                description_reclaimed: true,
+                description_reclaimed: false,
                 object_reclaimed: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            child.send(
+                Command::ReleaseMappingAttachment {
+                    attachment: copied[0],
+                    release: MappingRelease::Whole,
+                },
+                ObjectGeneration::INITIAL,
+            ),
+            Outcome::MappingAttachmentReleased {
+                description_reclaimed: true,
                 ..
             }
         ));
