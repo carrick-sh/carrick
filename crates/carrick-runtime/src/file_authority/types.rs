@@ -85,6 +85,14 @@ pub(crate) struct ClientIdentity {
     pub(crate) process_generation: ProcessGeneration,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FileAuthorityBinding {
+    pub(crate) epoch: AuthorityEpoch,
+    pub(crate) client: ClientIdentity,
+    pub(crate) table: FileTableId,
+    pub(crate) generation: ObjectGeneration,
+}
+
 impl ClientIdentity {
     pub(crate) fn registered(
         id: ClientId,
