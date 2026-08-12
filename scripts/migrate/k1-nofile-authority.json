@@ -1,0 +1,8 @@
+[
+  {
+    "file": "crates/carrick-runtime/src/dispatch/time.rs",
+    "old": "let nofile_soft = this.captured_file_table().nofile_soft.load(std::sync::atomic::Ordering::Relaxed);",
+    "new": "let nofile_soft = this.captured_file_table().nofile_soft();",
+    "count": 2
+  }
+]

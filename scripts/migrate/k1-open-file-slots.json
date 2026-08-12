@@ -1,0 +1,8 @@
+[
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "        let open_file = OpenFile {\n            description: Arc::new(RwLock::new(description)),\n            fd_flags: linux_fd_flags_from_open_flags(flags),\n        };",
+    "new": "        let open_file = OpenFile::new(\n            Arc::new(RwLock::new(description)),\n            linux_fd_flags_from_open_flags(flags),\n        );",
+    "count": 4
+  }
+]

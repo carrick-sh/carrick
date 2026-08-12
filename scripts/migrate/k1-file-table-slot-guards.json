@@ -1,0 +1,62 @@
+[
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "old": ".open_files.read()",
+    "new": ".read_open_files()",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "old": ".open_files.write()",
+    "new": ".write_open_files()",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "old": ".open_files.write()",
+    "new": ".write_open_files()",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": ".open_files.read()",
+    "new": ".read_open_files()",
+    "count": 4
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": ".open_files.write()",
+    "new": ".write_open_files()",
+    "count": 10
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": ".open_files.read()",
+    "new": ".read_open_files()",
+    "count": 13
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": ".open_files.write()",
+    "new": ".write_open_files()",
+    "count": 7
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+    "old": ".open_files.write()",
+    "new": ".write_open_files()",
+    "count": 7
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/fd_helpers.rs",
+    "old": ".open_files.write()",
+    "new": ".write_open_files()",
+    "count": 2
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/stat.rs",
+    "old": ".open_files.write()",
+    "new": ".write_open_files()",
+    "count": 1
+  }
+]

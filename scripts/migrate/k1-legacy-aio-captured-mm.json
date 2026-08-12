@@ -1,0 +1,8 @@
+[
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/legacy_aio.rs",
+    "old": "captured_file_table()",
+    "new": "captured_mm()",
+    "count": 5
+  }
+]

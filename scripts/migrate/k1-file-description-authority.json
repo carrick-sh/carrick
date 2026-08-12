@@ -1,0 +1,8 @@
+[
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+    "old": "OpenDescriptionRef",
+    "new": "Arc<crate::kernel::FileDescription>",
+    "count": 6
+  }
+]

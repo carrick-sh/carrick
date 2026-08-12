@@ -1,0 +1,14 @@
+[
+  {
+    "file": "crates/carrick-runtime/src/native_darwin.rs",
+    "old": "dispatcher.validate_native_reexec_fd_state()",
+    "new": "dispatcher.validate_native_reexec_fd_state(kernel_context)",
+    "count": 2
+  },
+  {
+    "file": "crates/carrick-runtime/src/native_darwin.rs",
+    "old": "dispatcher.native_reexec_fd_state_summary()",
+    "new": "dispatcher.native_reexec_fd_state_summary(kernel_context)",
+    "count": 2
+  }
+]

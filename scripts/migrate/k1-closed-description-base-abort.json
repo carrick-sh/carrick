@@ -1,0 +1,8 @@
+[
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
+    "old": "OpenDescription::Closed { .. } => {\n                panic!(\"closed file description has no functional base\")\n            }",
+    "new": "OpenDescription::Closed { .. } => {\n                tracing::error!(\"closed file description has no functional base\");\n                std::process::abort();\n            }",
+    "count": 2
+  }
+]

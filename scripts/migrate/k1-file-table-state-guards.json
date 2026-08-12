@@ -1,0 +1,68 @@
+[
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "old": ".epoll_fds.write()",
+    "new": ".write_epoll_fds()",
+    "count": 2
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": ".next_fd.lock()",
+    "new": ".lock_next_fd()",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": ".stdio_cloexec.lock()",
+    "new": ".lock_stdio_cloexec()",
+    "count": 5
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": ".closed_stdio.lock()",
+    "new": ".lock_closed_stdio()",
+    "count": 5
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/ioring.rs",
+    "old": ".io_uring_instances.read()",
+    "new": ".read_io_uring_instances()",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": ".stdio_cloexec.lock()",
+    "new": ".lock_stdio_cloexec()",
+    "count": 2
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": ".closed_stdio.lock()",
+    "new": ".lock_closed_stdio()",
+    "count": 2
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": ".fd_open_paths.write()",
+    "new": ".write_fd_open_paths()",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": ".splice_pushback.lock()",
+    "new": ".lock_splice_pushback()",
+    "count": 5
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/fd_helpers.rs",
+    "old": ".next_fd.lock()",
+    "new": ".lock_next_fd()",
+    "count": 3
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/fd_helpers.rs",
+    "old": ".closed_stdio.lock()",
+    "new": ".lock_closed_stdio()",
+    "count": 6
+  }
+]

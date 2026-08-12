@@ -1,0 +1,26 @@
+[
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "source.snapshot_native_reexec_fd_table()",
+    "new": "source.snapshot_native_reexec_fd_table(&context(&source))",
+    "count": 4
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "dispatcher.snapshot_native_reexec_fd_table()",
+    "new": "dispatcher.snapshot_native_reexec_fd_table(&context(&dispatcher))",
+    "count": 2
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "resumed.restore_native_reexec_fd_table(&snapshot)",
+    "new": "resumed.restore_native_reexec_fd_table(&context(&resumed), &snapshot)",
+    "count": 4
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "source.validate_native_reexec_fd_state()",
+    "new": "source.validate_native_reexec_fd_state(&context(&source))",
+    "count": 1
+  }
+]

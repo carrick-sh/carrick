@@ -1,0 +1,230 @@
+[
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "old": "self.io.open_files",
+    "new": "self.captured_file_table().open_files",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "old": "self.io.epoll_fds",
+    "new": "self.captured_file_table().epoll_fds",
+    "count": 2
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "old": "this.io.open_files",
+    "new": "this.captured_file_table().open_files",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "old": "this.io.epoll_fds",
+    "new": "this.captured_file_table().epoll_fds",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "old": "this.io.epoll_wake_registry",
+    "new": "this.captured_file_table().epoll_wake_registry",
+    "count": 2
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "old": "self.io.open_files",
+    "new": "self.captured_file_table().open_files",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/time.rs",
+    "old": "this.io.nofile_soft",
+    "new": "this.captured_file_table().nofile_soft",
+    "count": 2
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "self.io.open_files",
+    "new": "self.captured_file_table().open_files",
+    "count": 5
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "self.io.next_fd",
+    "new": "self.captured_file_table().next_fd",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "self.io.stdio_cloexec",
+    "new": "self.captured_file_table().stdio_cloexec",
+    "count": 2
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "self.io.closed_stdio",
+    "new": "self.captured_file_table().closed_stdio",
+    "count": 3
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "self.io.fd_open_paths",
+    "new": "self.captured_file_table().fd_open_paths",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "self.io.splice_pushback",
+    "new": "self.captured_file_table().splice_pushback",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "self.io.epoll_wake_registry",
+    "new": "self.captured_file_table().epoll_wake_registry",
+    "count": 2
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "dispatcher.io.open_files",
+    "new": "dispatcher.captured_file_table().open_files",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "dispatcher.io.epoll_fds",
+    "new": "dispatcher.captured_file_table().epoll_fds",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "parent.io.open_files",
+    "new": "parent.captured_file_table().open_files",
+    "count": 6
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "child.io.open_files",
+    "new": "child.captured_file_table().open_files",
+    "count": 3
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "source.io.open_files",
+    "new": "source.captured_file_table().open_files",
+    "count": 2
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "source.io.stdio_cloexec",
+    "new": "source.captured_file_table().stdio_cloexec",
+    "count": 2
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "source.io.closed_stdio",
+    "new": "source.captured_file_table().closed_stdio",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "resumed.io.open_files",
+    "new": "resumed.captured_file_table().open_files",
+    "count": 3
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "resumed.io.stdio_cloexec",
+    "new": "resumed.captured_file_table().stdio_cloexec",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "resumed.io.closed_stdio",
+    "new": "resumed.captured_file_table().closed_stdio",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/ioring.rs",
+    "old": "self.io.open_files",
+    "new": "self.captured_file_table().open_files",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/ioring.rs",
+    "old": "self.io.io_uring_instances",
+    "new": "self.captured_file_table().io_uring_instances",
+    "count": 4
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "self.io.open_files",
+    "new": "self.captured_file_table().open_files",
+    "count": 10
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "self.io.closed_stdio",
+    "new": "self.captured_file_table().closed_stdio",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "self.io.fd_open_paths",
+    "new": "self.captured_file_table().fd_open_paths",
+    "count": 3
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "self.io.splice_pushback",
+    "new": "self.captured_file_table().splice_pushback",
+    "count": 3
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "this.io.open_files",
+    "new": "this.captured_file_table().open_files",
+    "count": 10
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "this.io.stdio_cloexec",
+    "new": "this.captured_file_table().stdio_cloexec",
+    "count": 2
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "this.io.closed_stdio",
+    "new": "this.captured_file_table().closed_stdio",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "this.io.splice_pushback",
+    "new": "this.captured_file_table().splice_pushback",
+    "count": 2
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+    "old": "dispatcher.io.open_files",
+    "new": "dispatcher.captured_file_table().open_files",
+    "count": 7
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/legacy_aio.rs",
+    "old": "this.io.legacy_aio_contexts",
+    "new": "this.captured_file_table().legacy_aio_contexts",
+    "count": 4
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
+    "old": "parent.io.open_files",
+    "new": "parent.captured_file_table().open_files",
+    "count": 3
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/stat.rs",
+    "old": "dispatcher.io.open_files",
+    "new": "dispatcher.captured_file_table().open_files",
+    "count": 1
+  }
+]

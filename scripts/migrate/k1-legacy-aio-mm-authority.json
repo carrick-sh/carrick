@@ -1,0 +1,8 @@
+[
+  {
+    "file": "crates/carrick-runtime/src/kernel/objects.rs",
+    "old": "legacy_aio_contexts: RwLock::new(BTreeSet::new()),\n            next_legacy_aio_context: AtomicU64::new(1),\n            ",
+    "new": "",
+    "count": 3
+  }
+]

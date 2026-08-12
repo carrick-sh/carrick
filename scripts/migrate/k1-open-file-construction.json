@@ -1,0 +1,296 @@
+[
+  {
+    "file": "crates/carrick-runtime/src/dispatch/ioring.rs",
+    "old": "        };\n        let open_file = OpenFile::new(std::sync::Arc::new(parking_lot::RwLock::new(desc)), 0);",
+    "new": "        };\n        let open_file = OpenFile::from_open_description(std::sync::Arc::new(parking_lot::RwLock::new(desc)), 0);",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/fd_helpers.rs",
+    "old": "    ) -> DispatchOutcome {\n        let open_file = OpenFile::new(Arc::new(RwLock::new(description)), fd_flags);",
+    "new": "    ) -> DispatchOutcome {\n        let open_file = OpenFile::from_open_description(Arc::new(RwLock::new(description)), fd_flags);",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "                    writable: true,\n                };\n                let open_file = OpenFile::new(",
+    "new": "                    writable: true,\n                };\n                let open_file = OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "                if open_flags.contains(LinuxOpenFlags::PATH) {\n                    let open_file = OpenFile::new(",
+    "new": "                if open_flags.contains(LinuxOpenFlags::PATH) {\n                    let open_file = OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "                    };\n                    let open_file = OpenFile::new(",
+    "new": "                    };\n                    let open_file = OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "        let opened_is_dir = matches!(&description, OpenDescription::Directory { .. });\n        let open_file = OpenFile::new(",
+    "new": "        let opened_is_dir = matches!(&description, OpenDescription::Directory { .. });\n        let open_file = OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "            writable: false,\n        };\n        let open_file = OpenFile::new(",
+    "new": "            writable: false,\n        };\n        let open_file = OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "            trusted_host_dir: Some(trusted),\n        };\n        let open_file = OpenFile::new(",
+    "new": "            trusted_host_dir: Some(trusted),\n        };\n        let open_file = OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "            };\n            let open_file = OpenFile::new(",
+    "new": "            };\n            let open_file = OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "            writable: write,\n        };\n        let open_file = OpenFile::new(",
+    "new": "            writable: write,\n        };\n        let open_file = OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "    ) -> DispatchOutcome {\n        let open_file = OpenFile::new(",
+    "new": "    ) -> DispatchOutcome {\n        let open_file = OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "                    }\n                };\n                let open_file = OpenFile::new(",
+    "new": "                    }\n                };\n                let open_file = OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "            } => {\n                let open_file = OpenFile::new(",
+    "new": "            } => {\n                let open_file = OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "                crate::dispatch::net::set_host_nonblocking(host_fd);\n                let open_file = OpenFile::new(",
+    "new": "                crate::dispatch::net::set_host_nonblocking(host_fd);\n                let open_file = OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "                    size: 0,\n                };\n                let open_file = OpenFile::new(",
+    "new": "                    size: 0,\n                };\n                let open_file = OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "            let pipe_id = host_inode_pipe_id(host_read);\n            let read_open = OpenFile::new(",
+    "new": "            let pipe_id = host_inode_pipe_id(host_read);\n            let read_open = OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "            );\n            let write_open = OpenFile::new(",
+    "new": "            );\n            let write_open = OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "old": "            return DispatchOutcome::errno(errno);\n        }\n        let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };\n        let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };\n        let open_file = OpenFile::new(",
+    "new": "            return DispatchOutcome::errno(errno);\n        }\n        let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };\n        let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };\n        let open_file = OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "old": "        // not close it again.\n        let open_file = OpenFile::new(Arc::new(RwLock::new(description)), fd_flags);",
+    "new": "        // not close it again.\n        let open_file = OpenFile::from_open_description(Arc::new(RwLock::new(description)), fd_flags);",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "old": "            // nonblocking backpressure handle any smaller host buffer.\n        }\n        let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };\n        let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };\n        let open_file = OpenFile::new(",
+    "new": "            // nonblocking backpressure handle any smaller host buffer.\n        }\n        let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };\n        let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };\n        let open_file = OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "old": "            let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };\n            let first = OpenFile::new(",
+    "new": "            let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };\n            let first = OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "old": "            );\n            let second = OpenFile::new(",
+    "new": "            );\n            let second = OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/stat.rs",
+    "old": "    ) -> OpenFile {\n        OpenFile::new(",
+    "new": "    ) -> OpenFile {\n        OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mqueue.rs",
+    "old": "            };\n            let open_file = OpenFile::new(",
+    "new": "            };\n            let open_file = OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "        };\n        OpenFile::new(",
+    "new": "        };\n        OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "        let dispatcher = SyscallDispatcher::new();\n        let read_open = OpenFile::new(",
+    "new": "        let dispatcher = SyscallDispatcher::new();\n        let read_open = OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "                pipe_id: 42,\n                base: OpenDescriptionBase::new(0),\n                pty: None,\n                bidirectional: false,\n                write_kind: HostWriteKind::PipeLike,\n            })),\n            0,\n        );\n        let write_open = OpenFile::new(",
+    "new": "                pipe_id: 42,\n                base: OpenDescriptionBase::new(0),\n                pty: None,\n                bidirectional: false,\n                write_kind: HostWriteKind::PipeLike,\n            })),\n            0,\n        );\n        let write_open = OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "        let dispatcher = SyscallDispatcher::new();\n        let source = OpenFile::new(",
+    "new": "        let dispatcher = SyscallDispatcher::new();\n        let source = OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "        assert_eq!(unsafe { libc::pipe(host_pipe.as_mut_ptr()) }, 0);\n        let read_open = OpenFile::new(",
+    "new": "        assert_eq!(unsafe { libc::pipe(host_pipe.as_mut_ptr()) }, 0);\n        let read_open = OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "                pipe_id: 4242,\n                base: OpenDescriptionBase::new(0),\n                pty: None,\n                bidirectional: false,\n                write_kind: HostWriteKind::PipeLike,\n            })),\n            0,\n        );\n        let write_open = OpenFile::new(",
+    "new": "                pipe_id: 4242,\n                base: OpenDescriptionBase::new(0),\n                pty: None,\n                bidirectional: false,\n                write_kind: HostWriteKind::PipeLike,\n            })),\n            0,\n        );\n        let write_open = OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "        let fd = dispatcher\n            .install_fd_at_or_above(3, OpenFile::new(std::sync::Arc::clone(&description), 0))",
+    "new": "        let fd = dispatcher\n            .install_fd_at_or_above(3, OpenFile::from_open_description(std::sync::Arc::clone(&description), 0))",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+    "old": "            FD,\n            OpenFile::new(",
+    "new": "            FD,\n            OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+    "old": "            20,\n            OpenFile::new(",
+    "new": "            20,\n            OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+    "old": "            21,\n            OpenFile::new(",
+    "new": "            21,\n            OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+    "old": "            22,\n            OpenFile::new(",
+    "new": "            22,\n            OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+    "old": "                fd,\n                OpenFile::new(",
+    "new": "                fd,\n                OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+    "old": "            fd,\n            OpenFile::new(",
+    "new": "            fd,\n            OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+    "old": "            34,\n            OpenFile::new(",
+    "new": "            34,\n            OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "    fn eventfd_open_file(counter: u64) -> OpenFile {\n        OpenFile::new(",
+    "new": "    fn eventfd_open_file(counter: u64) -> OpenFile {\n        OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "        let owner = HostFdRef::new(fds[0]);\n        let open_file = OpenFile::new(",
+    "new": "        let owner = HostFdRef::new(fds[0]);\n        let open_file = OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "        let cloexec_fd = match dispatcher.install_fd_at_or_above(\n            3,\n            OpenFile::new(",
+    "new": "        let cloexec_fd = match dispatcher.install_fd_at_or_above(\n            3,\n            OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "        let parent = SyscallDispatcher::new();\n        parent.io.open_files.write().insert(\n            3,\n            OpenFile::new(",
+    "new": "        let parent = SyscallDispatcher::new();\n        parent.io.open_files.write().insert(\n            3,\n            OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "            4,\n            OpenFile::new(",
+    "new": "            4,\n            OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "        let fd = dispatcher\n            .install_fd_at_or_above(3, OpenFile::new(Arc::clone(&description), 0))",
+    "new": "        let fd = dispatcher\n            .install_fd_at_or_above(3, OpenFile::from_open_description(Arc::clone(&description), 0))",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "            .write()\n            .insert(1, OpenFile::new(std::sync::Arc::clone(&description), 0));",
+    "new": "            .write()\n            .insert(1, OpenFile::from_open_description(std::sync::Arc::clone(&description), 0));",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "            .write()\n            .insert(7, OpenFile::new(std::sync::Arc::clone(&description), 0));",
+    "new": "            .write()\n            .insert(7, OpenFile::from_open_description(std::sync::Arc::clone(&description), 0));",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "            .write()\n            .insert(9, OpenFile::new(std::sync::Arc::clone(&description), 0));",
+    "new": "            .write()\n            .insert(9, OpenFile::from_open_description(std::sync::Arc::clone(&description), 0));",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "            2,\n            OpenFile::new(",
+    "new": "            2,\n            OpenFile::from_open_description(",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": "            0,\n            OpenFile::new(",
+    "new": "            0,\n            OpenFile::from_open_description(",
+    "count": 1
+  }
+]
