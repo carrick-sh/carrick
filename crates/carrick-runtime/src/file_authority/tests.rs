@@ -652,17 +652,35 @@ fn epoll_model(mut harness: Harness) {
         events: carrick_abi::LinuxEpollEvents::IN,
         data: EpollUserData::from_guest(0xfeed),
     };
+    let host_plan = match harness.send(
+        Command::EpollCtlAdd {
+            table,
+            epoll_fd,
+            target_fd: counter_fd,
+            registration,
+        },
+        ObjectGeneration::INITIAL,
+    ) {
+        Outcome::EpollInterestAdded { host_plan, .. } => host_plan,
+        other => panic!("unexpected epoll ADD: {other:?}"),
+    };
     assert!(matches!(
         harness.send(
-            Command::EpollCtlAdd {
-                table,
-                epoll_fd,
-                target_fd: counter_fd,
-                registration,
-            },
+            Command::EpollRevalidateHostPlan { plan: host_plan },
             ObjectGeneration::INITIAL,
         ),
-        Outcome::EpollInterestAdded { .. }
+        Outcome::EpollHostPlanValidated { valid: true, .. }
+    ));
+    let stale_plan = EpollHostPlan {
+        plan_revision: Revision::from_wire(host_plan.plan_revision.raw() + 1),
+        ..host_plan
+    };
+    assert!(matches!(
+        harness.send(
+            Command::EpollRevalidateHostPlan { plan: stale_plan },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::EpollHostPlanValidated { valid: false, .. }
     ));
     assert!(matches!(
         harness.send(

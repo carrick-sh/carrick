@@ -7,11 +7,11 @@ use super::{
     AccessMode, AuthorityEpoch, AuthorityError, AuthorityFatal, ByteCount, CanonicalPath,
     CapabilityLeaseDisposition, CapabilityLeaseId, CapabilityLeasePurpose, ClientIdentity, Command,
     DescriptionBackingSnapshot, DescriptionSnapshot, DescriptorFlags, EpollEventLimit,
-    EpollInterestKey, EpollReadyEvent, EpollRegistration, EpollUserData, FileDescriptionId,
-    FileOffset, FileSlotNumber, FileTableId, HostErrno, InterestGeneration,
-    NofileAllocationCeiling, ObjectGeneration, Outcome, PipeCapacity, PipeEnd, PipeId, Request,
-    RequestId, Response, Revision, SameSlotBehavior, SeekWhence, SlotPageLimit, SlotRangeAction,
-    SlotSnapshot, StatusFlags, VfsObjectId,
+    EpollHostPlan, EpollHostPlanAction, EpollInterestKey, EpollReadyEvent, EpollRegistration,
+    EpollUserData, FileDescriptionId, FileOffset, FileSlotNumber, FileTableId, HostErrno,
+    InterestGeneration, NofileAllocationCeiling, ObjectGeneration, Outcome, PipeCapacity, PipeEnd,
+    PipeId, Request, RequestId, Response, Revision, SameSlotBehavior, SeekWhence, SlotPageLimit,
+    SlotRangeAction, SlotSnapshot, StatusFlags, VfsObjectId,
 };
 
 const MAGIC: u32 = 0x4341_4641;
@@ -253,6 +253,7 @@ fn command_tag(command: &Command) -> u8 {
         Command::EventCounterWrite { .. } => 37,
         Command::CreatePipeAndInstall { .. } => 38,
         Command::SetPipeCapacity { .. } => 39,
+        Command::EpollRevalidateHostPlan { .. } => 40,
     }
 }
 
@@ -463,6 +464,7 @@ fn encode_command(writer: &mut Writer, command: &Command) -> Result<(), Authorit
             writer.i32(epoll_fd.raw());
             writer.i32(target_fd.raw());
         }
+        Command::EpollRevalidateHostPlan { plan } => writer.epoll_host_plan(*plan),
         Command::ObserveReadiness {
             table,
             fd,
@@ -785,6 +787,9 @@ fn decode_command(tag: u8, reader: &mut Reader<'_>) -> Result<Command, Authority
             capacity: PipeCapacity::bounded(reader.u32()?)
                 .map_err(|_| AuthorityFatal::MalformedFrame("invalid pipe capacity"))?,
         },
+        40 => Command::EpollRevalidateHostPlan {
+            plan: reader.epoll_host_plan()?,
+        },
         _ => return malformed("unknown operation"),
     })
 }
@@ -975,29 +980,43 @@ fn encode_outcome(writer: &mut Writer, outcome: &Outcome) -> Result<(), Authorit
             key,
             generation,
             description_revision,
+            host_plan,
         } => {
             writer.u8(27);
             writer.epoll_key(*key);
             writer.u32(generation.raw());
             writer.u64(description_revision.raw());
+            writer.epoll_host_plan(*host_plan);
         }
         Outcome::EpollInterestModified {
             key,
             generation,
             description_revision,
+            host_plan,
         } => {
             writer.u8(28);
             writer.epoll_key(*key);
             writer.u32(generation.raw());
             writer.u64(description_revision.raw());
+            writer.epoll_host_plan(*host_plan);
         }
         Outcome::EpollInterestDeleted {
             key,
             description_revision,
+            host_plan,
         } => {
             writer.u8(29);
             writer.epoll_key(*key);
             writer.u64(description_revision.raw());
+            writer.epoll_host_plan(*host_plan);
+        }
+        Outcome::EpollHostPlanValidated {
+            valid,
+            current_revision,
+        } => {
+            writer.u8(39);
+            writer.bool(*valid);
+            writer.u64(current_revision.raw());
         }
         Outcome::ReadinessObserved {
             description,
@@ -1329,15 +1348,18 @@ fn decode_outcome(reader: &mut Reader<'_>) -> Result<Outcome, AuthorityFatal> {
             key: reader.epoll_key()?,
             generation: reader.interest_generation()?,
             description_revision: reader.revision()?,
+            host_plan: reader.epoll_host_plan()?,
         },
         28 => Outcome::EpollInterestModified {
             key: reader.epoll_key()?,
             generation: reader.interest_generation()?,
             description_revision: reader.revision()?,
+            host_plan: reader.epoll_host_plan()?,
         },
         29 => Outcome::EpollInterestDeleted {
             key: reader.epoll_key()?,
             description_revision: reader.revision()?,
+            host_plan: reader.epoll_host_plan()?,
         },
         30 => Outcome::ReadinessObserved {
             description: reader.description_id()?,
@@ -1389,6 +1411,10 @@ fn decode_outcome(reader: &mut Reader<'_>) -> Result<Outcome, AuthorityFatal> {
                 .map_err(|_| AuthorityFatal::MalformedFrame("invalid byte count"))?,
             description_revision: reader.revision()?,
             stream_revision: reader.revision()?,
+        },
+        39 => Outcome::EpollHostPlanValidated {
+            valid: reader.bool()?,
+            current_revision: reader.revision()?,
         },
         _ => return malformed("unknown response outcome"),
     })
@@ -1615,6 +1641,19 @@ impl Writer {
     fn epoll_registration(&mut self, registration: EpollRegistration) {
         self.u32(registration.events.bits());
         self.u64(registration.data.raw());
+    }
+
+    fn epoll_host_plan(&mut self, plan: EpollHostPlan) {
+        self.u64(plan.epoll_description.raw());
+        self.u64(plan.target_description.raw());
+        self.i32(plan.registered_slot.raw());
+        self.u32(plan.generation.raw());
+        self.u8(match plan.action {
+            EpollHostPlanAction::RegisterOrModify => 0,
+            EpollHostPlanAction::Delete => 1,
+        });
+        self.u32(plan.events.bits());
+        self.u64(plan.plan_revision.raw());
     }
     fn epoll_key(&mut self, key: EpollInterestKey) {
         self.i32(key.registered_slot.raw());
@@ -1867,6 +1906,22 @@ impl<'a> Reader<'a> {
             target_description: self.description_id()?,
         })
     }
+
+    fn epoll_host_plan(&mut self) -> Result<EpollHostPlan, AuthorityFatal> {
+        Ok(EpollHostPlan {
+            epoll_description: self.description_id()?,
+            target_description: self.description_id()?,
+            registered_slot: self.slot()?,
+            generation: self.interest_generation()?,
+            action: match self.u8()? {
+                0 => EpollHostPlanAction::RegisterOrModify,
+                1 => EpollHostPlanAction::Delete,
+                _ => return malformed("invalid epoll host-plan action"),
+            },
+            events: LinuxEpollEvents::from_bits_retain(self.u32()?),
+            plan_revision: self.revision()?,
+        })
+    }
     fn interest_generation(&mut self) -> Result<InterestGeneration, AuthorityFatal> {
         InterestGeneration::from_snapshot(self.u32()?)
             .map_err(|_| AuthorityFatal::MalformedFrame("invalid interest generation"))
@@ -2083,6 +2138,15 @@ mod tests {
             events: LinuxEpollEvents::IN | LinuxEpollEvents::ET,
             data: EpollUserData::from_guest(0x1234),
         };
+        let host_plan = EpollHostPlan {
+            epoll_description: description,
+            target_description: description,
+            registered_slot: FileSlotNumber::for_open_fd(3).expect("fd"),
+            generation: InterestGeneration::from_snapshot(1).expect("generation"),
+            action: EpollHostPlanAction::RegisterOrModify,
+            events: registration.events,
+            plan_revision: Revision::from_wire(8),
+        };
         let commands = vec![
             Command::RegisterClient,
             Command::ExitClient,
@@ -2100,6 +2164,7 @@ mod tests {
                 fd: FileSlotNumber::for_open_fd(3).expect("fd"),
                 capacity: PipeCapacity::bounded(8192).expect("capacity"),
             },
+            Command::EpollRevalidateHostPlan { plan: host_plan },
             Command::CreateEpollAndInstall {
                 table,
                 minimum: FileSlotNumber::for_open_fd(3).expect("fd"),
@@ -2395,6 +2460,7 @@ mod tests {
                 },
                 generation: InterestGeneration::from_snapshot(1).expect("generation"),
                 description_revision: Revision::from_wire(8),
+                host_plan,
             },
             Outcome::EpollInterestModified {
                 key: EpollInterestKey {
@@ -2403,6 +2469,10 @@ mod tests {
                 },
                 generation: InterestGeneration::from_snapshot(1).expect("generation"),
                 description_revision: Revision::from_wire(9),
+                host_plan: EpollHostPlan {
+                    plan_revision: Revision::from_wire(9),
+                    ..host_plan
+                },
             },
             Outcome::EpollInterestDeleted {
                 key: EpollInterestKey {
@@ -2410,6 +2480,16 @@ mod tests {
                     target_description: description,
                 },
                 description_revision: Revision::from_wire(10),
+                host_plan: EpollHostPlan {
+                    action: EpollHostPlanAction::Delete,
+                    events: LinuxEpollEvents::empty(),
+                    plan_revision: Revision::from_wire(10),
+                    ..host_plan
+                },
+            },
+            Outcome::EpollHostPlanValidated {
+                valid: true,
+                current_revision: Revision::from_wire(10),
             },
             Outcome::ReadinessObserved {
                 description,

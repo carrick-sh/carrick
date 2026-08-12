@@ -13,11 +13,11 @@ use super::types::{
     AccessMode, AuthorityCall, AuthorityEpoch, AuthorityError, AuthorityFatal, AuthorityReply,
     ByteCount, CanonicalPath, CapabilityLeaseDisposition, CapabilityLeaseId,
     CapabilityLeasePurpose, ClientId, ClientIdentity, Command, DescriptionSnapshot,
-    DescriptorFlags, EpollEventLimit, EpollInterestKey, EpollRegistration, FileDescriptionId,
-    FileOffset, FileSlotNumber, FileTableId, InterestGeneration, NofileAllocationCeiling,
-    ObjectGeneration, Outcome, PipeCapacity, PipeEnd, PipeId, Request, Response, Revision,
-    SameSlotBehavior, SeekWhence, SlotPageLimit, SlotRangeAction, SlotSnapshot, StatusFlags,
-    VfsObjectId,
+    DescriptorFlags, EpollEventLimit, EpollHostPlan, EpollHostPlanAction, EpollInterestKey,
+    EpollRegistration, FileDescriptionId, FileOffset, FileSlotNumber, FileTableId,
+    InterestGeneration, NofileAllocationCeiling, ObjectGeneration, Outcome, PipeCapacity, PipeEnd,
+    PipeId, Request, Response, Revision, SameSlotBehavior, SeekWhence, SlotPageLimit,
+    SlotRangeAction, SlotSnapshot, StatusFlags, VfsObjectId,
 };
 
 pub(super) const MAX_TERMINAL_DEDUP_ENTRIES: usize = 8_192;
@@ -557,6 +557,9 @@ impl FileAuthorityCore {
                         *epoll_fd,
                         *target_fd,
                     ),
+                    Command::EpollRevalidateHostPlan { plan } => {
+                        self.epoll_revalidate_host_plan(*plan)
+                    }
                     Command::ObserveReadiness {
                         table,
                         fd,
@@ -1750,6 +1753,15 @@ impl FileAuthorityCore {
             key,
             generation,
             description_revision: revision,
+            host_plan: EpollHostPlan {
+                epoll_description,
+                target_description: key.target_description,
+                registered_slot: key.registered_slot,
+                generation,
+                action: EpollHostPlanAction::RegisterOrModify,
+                events: registration.events,
+                plan_revision: revision,
+            },
         })
     }
 
@@ -1790,6 +1802,15 @@ impl FileAuthorityCore {
             key,
             generation,
             description_revision: revision,
+            host_plan: EpollHostPlan {
+                epoll_description,
+                target_description: key.target_description,
+                registered_slot: key.registered_slot,
+                generation,
+                action: EpollHostPlanAction::RegisterOrModify,
+                events: registration.events,
+                plan_revision: revision,
+            },
         })
     }
 
@@ -1807,7 +1828,7 @@ impl FileAuthorityCore {
             return Err(AuthorityError::EpollInterestNotFound);
         }
         let revision = self.publish_mutation();
-        if !self
+        let removed = self
             .epoll_state_mut(epoll_description)
             .unwrap_or_else(|_| {
                 abort_fatal(AuthorityFatal::InvariantViolation(
@@ -1815,11 +1836,11 @@ impl FileAuthorityCore {
                 ))
             })
             .delete(key)
-        {
-            abort_fatal(AuthorityFatal::InvariantViolation(
-                "epoll DEL lost its validated interest",
-            ));
-        }
+            .unwrap_or_else(|| {
+                abort_fatal(AuthorityFatal::InvariantViolation(
+                    "epoll DEL lost its validated interest",
+                ))
+            });
         self.descriptions
             .get_mut(&epoll_description)
             .unwrap_or_else(|| {
@@ -1837,6 +1858,43 @@ impl FileAuthorityCore {
         Ok(Outcome::EpollInterestDeleted {
             key,
             description_revision: revision,
+            host_plan: EpollHostPlan {
+                epoll_description,
+                target_description: key.target_description,
+                registered_slot: key.registered_slot,
+                generation: removed.generation,
+                action: EpollHostPlanAction::Delete,
+                events: LinuxEpollEvents::empty(),
+                plan_revision: revision,
+            },
+        })
+    }
+
+    fn epoll_revalidate_host_plan(&self, plan: EpollHostPlan) -> Result<Outcome, AuthorityError> {
+        let current_revision = self
+            .descriptions
+            .get(&plan.epoll_description)
+            .ok_or(AuthorityError::DescriptionNotFound)?
+            .revision;
+        let current = self
+            .epoll_state(plan.epoll_description)?
+            .interest(EpollInterestKey {
+                registered_slot: plan.registered_slot,
+                target_description: plan.target_description,
+            });
+        let valid = match plan.action {
+            EpollHostPlanAction::RegisterOrModify => current.is_some_and(|interest| {
+                interest.generation == plan.generation
+                    && interest.registration.events == plan.events
+                    && current_revision == plan.plan_revision
+            }),
+            EpollHostPlanAction::Delete => {
+                current.is_none() && current_revision == plan.plan_revision
+            }
+        };
+        Ok(Outcome::EpollHostPlanValidated {
+            valid,
+            current_revision,
         })
     }
 
@@ -3034,7 +3092,7 @@ impl FileAuthorityCore {
                         "reverse epoll index referenced a missing instance",
                     ))
                 });
-                if !state.delete(key) {
+                if state.delete(key).is_none() {
                     abort_fatal(AuthorityFatal::InvariantViolation(
                         "reverse epoll index referenced a missing interest",
                     ));
