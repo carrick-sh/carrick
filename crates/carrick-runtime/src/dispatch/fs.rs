@@ -40,7 +40,7 @@
 //! # Submodules (`fs/`)
 //!
 //! Pure `impl SyscallDispatcher` splits (WS-F3), type-transparent to callers:
-//! `state` (the [`fs::FsState`]/[`fs::IoState`] owned state), `fd_helpers`
+//! `state` (the [`fs::FsState`]/[`fs::RuntimeIo`] owned state), `fd_helpers`
 //! (the lowest-free-fd allocator + `install_fd*` + typed fd-kind accessors),
 //! `pathres` (layered path/symlink resolution across the rootfs layers),
 //! `stat` (fd stat/statx record assembly), `sendfile` (data-movement +
@@ -185,7 +185,8 @@ mod stat;
 mod state;
 mod xattr;
 use state::*;
-pub(super) use state::{FsState, IoState, SplicePushback};
+pub(super) use state::{FsState, RuntimeIo, host_fd_offset};
+pub(crate) use state::{LegacyAioContextId, SplicePushback};
 
 fn get_last_error() -> i32 {
     carrick_portable::errno()
@@ -925,13 +926,18 @@ impl SyscallDispatcher {
     fn record_fd_open_path(&self, fd: i32, path: String) {
         #[cfg(test)]
         FD_OPEN_PATH_INSERTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.io.fd_open_paths.write().insert(fd, path);
+        self.captured_file_table()
+            .write_fd_open_paths()
+            .insert(fd, path);
     }
 
     fn lookup_recorded_fd_open_path(&self, fd: i32) -> Option<String> {
         #[cfg(test)]
         FD_OPEN_PATH_LOOKUPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.io.fd_open_paths.read().get(&fd).cloned()
+        self.captured_file_table()
+            .read_fd_open_paths()
+            .get(&fd)
+            .cloned()
     }
 
     pub fn register_mount(
@@ -1040,7 +1046,7 @@ impl SyscallDispatcher {
             return Vec::new();
         };
         let mut others = Vec::new();
-        for (other_fd, open_file) in self.io.open_files.read().iter() {
+        for (other_fd, open_file) in self.captured_file_table().read_open_files().iter() {
             if *other_fd == fd {
                 continue;
             }
@@ -1133,6 +1139,7 @@ impl SyscallDispatcher {
 
     fn path_stat_record(
         &self,
+        context: &crate::kernel::KernelContext,
         dirfd: u64,
         path: &str,
         flags: u64,
@@ -1195,7 +1202,7 @@ impl SyscallDispatcher {
             return Ok(self.stat_record_with_device(&path, &real));
         }
         if let Some(contents) =
-            crate::vfs::proc::synthetic_file(&path, &self.synthetic_proc_context())
+            crate::vfs::proc::synthetic_file(&path, &self.synthetic_proc_context(context))
         {
             return Ok(StatRecord::synthetic(
                 &path,
@@ -1298,6 +1305,7 @@ impl SyscallDispatcher {
 
     fn truncate(
         &self,
+        context: &crate::kernel::KernelContext,
         pathname: GuestPtr,
         length: u64,
         memory: &impl GuestMemory,
@@ -1311,7 +1319,7 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::errno(LINUX_ENOENT));
         }
         let resolved = self.resolve_at_path(LINUX_AT_FDCWD, &path)?;
-        if crate::vfs::is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
+        if crate::vfs::is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context(context)) {
             return Ok(DispatchOutcome::errno(LINUX_EROFS));
         }
         // Layered metadata (overlay/disk first, then rootfs) — not rootfs-only,
@@ -1354,21 +1362,21 @@ impl SyscallDispatcher {
         }
     }
 
-    fn open_at_path(
+    fn open_at_path<M: GuestMemory>(
         &self,
+        cx: &mut SyscallCtx<'_, M>,
         dirfd: u64,
         pathname: u64,
         flags: u64,
         mode: u64,
-        memory: &impl GuestMemory,
-        reporter: &CompatReporter,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let path = read_guest_c_string(memory, pathname)?;
-        self.open_at_path_string(dirfd, &path, flags, mode, reporter)
+        let path = read_guest_c_string(&*cx.memory, pathname)?;
+        self.open_at_path_string(cx.kernel, dirfd, &path, flags, mode, cx.reporter)
     }
 
     fn open_at_path_string(
         &self,
+        context: &crate::kernel::KernelContext,
         dirfd: u64,
         path: &str,
         flags: u64,
@@ -1385,7 +1393,7 @@ impl SyscallDispatcher {
         // fd-fill tests reach the post-open assertion quickly while
         // descriptor-only duplication can still allocate within RLIMIT_NOFILE.
         if crate::dispatch::fs::state::PATH_OPEN_FD_PRESSURE
-            .is_exhausted_by(self.io.open_files.read().len())
+            .is_exhausted_by(self.captured_file_table().read_open_files().len())
         {
             return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
         }
@@ -1431,7 +1439,7 @@ impl SyscallDispatcher {
                     base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
                     writable: true,
                 };
-                let open_file = OpenFile::new(
+                let open_file = OpenFile::from_open_description(
                     Arc::new(RwLock::new(description)),
                     linux_fd_flags_from_open_flags(flags),
                 );
@@ -1657,8 +1665,8 @@ impl SyscallDispatcher {
                 // it as an O_PATH File carrying the symlink's own lstat metadata;
                 // every I/O op already rejects an O_PATH fd with EBADF.
                 if open_flags.contains(LinuxOpenFlags::PATH) {
-                    let open_file = OpenFile {
-                        description: Arc::new(RwLock::new(OpenDescription::File {
+                    let open_file = OpenFile::from_open_description(
+                        Arc::new(RwLock::new(OpenDescription::File {
                             base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
                             path: path.clone(),
                             metadata: md,
@@ -1666,8 +1674,8 @@ impl SyscallDispatcher {
                             offset: 0,
                             writable: false,
                         })),
-                        fd_flags: linux_fd_flags_from_open_flags(flags),
-                    };
+                        linux_fd_flags_from_open_flags(flags),
+                    );
                     let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
                         return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
                     };
@@ -1742,7 +1750,7 @@ impl SyscallDispatcher {
                 _ => {}
             }
         }
-        let vfs_outcome = self.try_vfs_open(&path, access, flags, vfs_create_mode);
+        let vfs_outcome = self.try_vfs_open(context, &path, access, flags, vfs_create_mode);
         match vfs_outcome {
             VfsOpenAttempt::Installed(fd) => {
                 // VFS mounts return before the overlay/rootfs O_DIRECTORY gate
@@ -1760,8 +1768,8 @@ impl SyscallDispatcher {
                     None
                 };
                 if let Some(errno) = directory_errno {
-                    let removed = self.io.open_files.write().remove(&fd);
-                    self.io.fd_open_paths.write().remove(&fd);
+                    let removed = self.captured_file_table().write_open_files().remove(&fd);
+                    self.captured_file_table().write_fd_open_paths().remove(&fd);
                     if let Some(open_file) = removed {
                         self.close_open_file_and_free_pty(&open_file);
                     }
@@ -1770,7 +1778,7 @@ impl SyscallDispatcher {
                         // Installation reused a deliberately closed stdio slot
                         // and cleared its marker. The rejected open must leave
                         // that slot closed, just as if no open had occurred.
-                        self.io.closed_stdio.lock()[fd as usize] = true;
+                        self.captured_file_table().lock_closed_stdio()[fd as usize] = true;
                     }
                     return Ok(DispatchOutcome::errno(errno));
                 }
@@ -1863,10 +1871,10 @@ impl SyscallDispatcher {
                         bidirectional: access == LINUX_O_RDWR,
                         write_kind: HostWriteKind::PipeLike,
                     };
-                    let open_file = OpenFile {
-                        description: Arc::new(RwLock::new(description)),
-                        fd_flags: linux_fd_flags_from_open_flags(flags),
-                    };
+                    let open_file = OpenFile::from_open_description(
+                        Arc::new(RwLock::new(description)),
+                        linux_fd_flags_from_open_flags(flags),
+                    );
                     let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
                         return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
                     };
@@ -2120,10 +2128,10 @@ impl SyscallDispatcher {
             OpenDescription::File { .. } | OpenDescription::Directory { .. }
         );
         let opened_is_dir = matches!(&description, OpenDescription::Directory { .. });
-        let open_file = OpenFile {
-            description: Arc::new(RwLock::new(description)),
-            fd_flags: linux_fd_flags_from_open_flags(flags),
-        };
+        let open_file = OpenFile::from_open_description(
+            Arc::new(RwLock::new(description)),
+            linux_fd_flags_from_open_flags(flags),
+        );
         let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
             return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
         };
@@ -2153,7 +2161,7 @@ impl SyscallDispatcher {
             self.inotify_self(&record_path, carrick_abi::LINUX_IN_OPEN);
         }
         if inotify_created {
-            self.dnotify_child(&record_path, LinuxDnotifyMask::CREATE);
+            self.dnotify_child(context, &record_path, LinuxDnotifyMask::CREATE);
         }
         Ok(DispatchOutcome::Returned { value: fd as i64 })
     }
@@ -2291,10 +2299,10 @@ impl SyscallDispatcher {
             base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
             writable: false,
         };
-        let open_file = OpenFile {
-            description: Arc::new(RwLock::new(description)),
-            fd_flags: linux_fd_flags_from_open_flags(flags),
-        };
+        let open_file = OpenFile::from_open_description(
+            Arc::new(RwLock::new(description)),
+            linux_fd_flags_from_open_flags(flags),
+        );
         let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
             return Some(DispatchOutcome::errno(linux_errno::EMFILE));
         };
@@ -2377,10 +2385,10 @@ impl SyscallDispatcher {
             base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
             trusted_host_dir: Some(trusted),
         };
-        let open_file = OpenFile {
-            description: Arc::new(RwLock::new(description)),
-            fd_flags: linux_fd_flags_from_open_flags(flags),
-        };
+        let open_file = OpenFile::from_open_description(
+            Arc::new(RwLock::new(description)),
+            linux_fd_flags_from_open_flags(flags),
+        );
         let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
             return Some(DispatchOutcome::errno(linux_errno::EMFILE));
         };
@@ -2529,10 +2537,10 @@ impl SyscallDispatcher {
                     None => TrustedHostDir::new(HostFdRef::new(fd.into_raw_fd())),
                 }),
             };
-            let open_file = OpenFile {
-                description: Arc::new(RwLock::new(description)),
-                fd_flags: linux_fd_flags_from_open_flags(flags),
-            };
+            let open_file = OpenFile::from_open_description(
+                Arc::new(RwLock::new(description)),
+                linux_fd_flags_from_open_flags(flags),
+            );
             let Ok(new_fd) = self.install_fd_at_or_above(0, open_file) else {
                 return Some(DispatchOutcome::errno(linux_errno::EMFILE));
             };
@@ -2591,10 +2599,10 @@ impl SyscallDispatcher {
             base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
             writable: write,
         };
-        let open_file = OpenFile {
-            description: Arc::new(RwLock::new(description)),
-            fd_flags: linux_fd_flags_from_open_flags(flags),
-        };
+        let open_file = OpenFile::from_open_description(
+            Arc::new(RwLock::new(description)),
+            linux_fd_flags_from_open_flags(flags),
+        );
         let Ok(new_fd) = self.install_fd_at_or_above(0, open_file) else {
             return Some(DispatchOutcome::errno(linux_errno::EMFILE));
         };
@@ -2847,7 +2855,8 @@ impl SyscallDispatcher {
     /// a link. The fd is a 0-byte `SyntheticFile` whose recorded `path` is the
     /// magic-link path; `proc_ns_link` recognises it. Keys the `NS_GET_*` ioctls.
     fn fd_ns_link_type(&self, fd: i32) -> Option<String> {
-        let table = self.io.open_files.read();
+        let files = self.captured_file_table();
+        let table = files.read_open_files();
         let open_file = table.get(&fd)?;
         let description = open_file.description.read();
         let path = description.open_path()?;
@@ -2860,7 +2869,7 @@ impl SyscallDispatcher {
         contents: Vec<u8>,
         flags: u64,
     ) -> DispatchOutcome {
-        let open_file = OpenFile::new(
+        let open_file = OpenFile::from_open_description(
             Arc::new(RwLock::new(OpenDescription::SyntheticFile {
                 path: path.to_string(),
                 contents,
@@ -2918,7 +2927,8 @@ impl SyscallDispatcher {
         if !role.is_master {
             return Some(host_fd);
         }
-        let table = self.io.open_files.read();
+        let files = self.captured_file_table();
+        let table = files.read_open_files();
         for of in table.values() {
             if let OpenDescription::HostPipe {
                 host_fd: slave_host_fd,
@@ -2961,7 +2971,7 @@ impl SyscallDispatcher {
                 crate::dispatch::net::set_host_nonblocking(duped);
                 let write_kind = HostWriteKind::for_host_fd(duped);
                 let pty = self.dup_stdio_pty_role(old_fd);
-                Arc::new(RwLock::new(OpenDescription::HostPipe {
+                kernel_file_description(Arc::new(RwLock::new(OpenDescription::HostPipe {
                     // A duped stdio fd has no separate pipe peer to coordinate
                     // a FASYNC arm/trigger with; the host inode is still a
                     // unique id (FASYNC is not exercised on bare stdio).
@@ -2974,14 +2984,11 @@ impl SyscallDispatcher {
                     pty,
                     bidirectional: false,
                     write_kind,
-                }))
+                })))
             }
             None => return DispatchOutcome::errno(LINUX_EBADF),
         };
-        let open_file = OpenFile {
-            description,
-            fd_flags,
-        };
+        let open_file = OpenFile::new(description, fd_flags);
         let new_fd = match self.install_fd_at_or_above(min_fd, open_file) {
             Ok(fd) => fd,
             Err(_) => {
@@ -3032,7 +3039,7 @@ impl SyscallDispatcher {
                 crate::dispatch::net::set_host_nonblocking(duped);
                 let write_kind = HostWriteKind::for_host_fd(duped);
                 let pty = self.dup_stdio_pty_role(old_fd);
-                Arc::new(RwLock::new(OpenDescription::HostPipe {
+                kernel_file_description(Arc::new(RwLock::new(OpenDescription::HostPipe {
                     // A duped stdio fd has no separate pipe peer to coordinate
                     // a FASYNC arm/trigger with; the host inode is still a
                     // unique id (FASYNC is not exercised on bare stdio).
@@ -3045,7 +3052,7 @@ impl SyscallDispatcher {
                     pty,
                     bidirectional: false,
                     write_kind,
-                }))
+                })))
             }
             None => return DispatchOutcome::errno(LINUX_EBADF),
         };
@@ -3062,22 +3069,18 @@ impl SyscallDispatcher {
         // child replaces its numeric slot; only the final logical fd reference
         // is allowed to trigger automatic close-detach.
         self.detach_fd_from_epolls(new_fd);
+        self.discard_splice_pushback_if_final(new_fd);
 
         {
-            let mut table = self.io.open_files.write();
+            let files = self.captured_file_table();
+            let mut table = files.write_open_files();
             if let Some(replaced) = table.remove(&new_fd) {
                 let pid = self.event_ring_guest_pid();
                 self.record_fd_close_owner(new_fd, pid, &replaced);
                 self.close_open_file_and_free_pty(&replaced);
             }
             retain_open_file(&description);
-            table.insert(
-                new_fd,
-                OpenFile {
-                    description,
-                    fd_flags,
-                },
-            );
+            table.insert(new_fd, OpenFile::new(description, fd_flags));
         }
         self.clear_closed_stdio(new_fd);
         DispatchOutcome::Returned {
@@ -3092,6 +3095,7 @@ impl SyscallDispatcher {
     /// caller wraps the legacy lookup chain inside `FallThrough`.
     fn try_vfs_open(
         &self,
+        context: &crate::kernel::KernelContext,
         path: &str,
         access: u64,
         flags: u64,
@@ -3128,7 +3132,7 @@ impl SyscallDispatcher {
         }
         let creds = self.cred_snapshot();
         let groups = self.current_groups();
-        let (sig_ignored, sig_caught, sig_shdpnd) = self.proc_status_signal_masks();
+        let (sig_ignored, sig_caught, sig_shdpnd) = self.proc_status_signal_masks(context);
         let (sig_ignored, sig_caught, sig_shdpnd) =
             (sig_ignored.raw(), sig_caught.raw(), sig_shdpnd.raw());
         let sysvipc_shm = self.sysvipc_shm_table();
@@ -3240,7 +3244,7 @@ impl SyscallDispatcher {
                         write_kind,
                     }
                 };
-                let open_file = OpenFile::new(
+                let open_file = OpenFile::from_open_description(
                     Arc::new(RwLock::new(description)),
                     linux_fd_flags_from_open_flags(flags),
                 );
@@ -3255,7 +3259,7 @@ impl SyscallDispatcher {
                 contents,
                 status_flags,
             } => {
-                let open_file = OpenFile::new(
+                let open_file = OpenFile::from_open_description(
                     Arc::new(RwLock::new(OpenDescription::SyntheticFile {
                         path,
                         contents,
@@ -3279,7 +3283,7 @@ impl SyscallDispatcher {
                 status_flags,
             } => {
                 crate::dispatch::net::set_host_nonblocking(host_fd);
-                let open_file = OpenFile::new(
+                let open_file = OpenFile::from_open_description(
                     Arc::new(RwLock::new(OpenDescription::HostPipe {
                         // A pty end's host inode is a unique id (FASYNC is not
                         // exercised on ptys).
@@ -3345,7 +3349,7 @@ impl SyscallDispatcher {
                     mode: 0o755,
                     size: 0,
                 };
-                let open_file = OpenFile::new(
+                let open_file = OpenFile::from_open_description(
                     Arc::new(RwLock::new(OpenDescription::Directory {
                         path,
                         metadata,
@@ -3447,7 +3451,8 @@ impl SyscallDispatcher {
                 }
                 let pipe_id = *pipe_id;
                 drop(open);
-                let table = self.io.open_files.read();
+                let files = self.captured_file_table();
+                let table = files.read_open_files();
                 for other in table.values() {
                     let other_open = other.description.read();
                     if let OpenDescription::HostPipe {
@@ -3468,7 +3473,8 @@ impl SyscallDispatcher {
     }
 
     fn host_pipe_read_end_for_pipe_id(&self, pipe_id: u64) -> Option<(i32, HostFd)> {
-        let table = self.io.open_files.read();
+        let files = self.captured_file_table();
+        let table = files.read_open_files();
         for (fd, other) in table.iter() {
             let other_open = other.description.read();
             if let OpenDescription::HostPipe {
@@ -3494,7 +3500,8 @@ impl SyscallDispatcher {
         if pipe_id == 0 {
             return None;
         }
-        let table = self.io.open_files.read();
+        let files = self.captured_file_table();
+        let table = files.read_open_files();
         for (_fd, other) in table.iter() {
             let other_open = other.description.read();
             if let OpenDescription::HostPipe {
@@ -3748,8 +3755,9 @@ impl SyscallDispatcher {
     }
 
     fn host_pipe_read_end_buffered_bytes(&self, pipe_id: u64) -> usize {
-        let table = self.io.open_files.read();
-        for (fd, other) in table.iter() {
+        let files = self.captured_file_table();
+        let table = files.read_open_files();
+        for other in table.values() {
             let Some(other_open) = other.description.try_read() else {
                 continue;
             };
@@ -3762,18 +3770,39 @@ impl SyscallDispatcher {
                 && *other_pipe_id == pipe_id
             {
                 return host_pipe_readable_bytes(host_fd.raw()).ok().unwrap_or(0)
-                    + self.staged_splice_pipe_bytes(*fd);
+                    + self.staged_splice_description_bytes(other.description.id());
             }
         }
         0
     }
 
     fn staged_splice_pipe_bytes(&self, guest_fd: i32) -> usize {
-        self.io
-            .splice_pushback
-            .lock()
-            .get(&guest_fd)
-            .map_or(0, SplicePushback::len)
+        self.open_file(guest_fd).map_or(0, |file| {
+            self.staged_splice_description_bytes(file.description.id())
+        })
+    }
+
+    fn staged_splice_description_bytes(
+        &self,
+        description: crate::kernel::FileDescriptionId,
+    ) -> usize {
+        let queue = self
+            .captured_file_table()
+            .lock_splice_pushback()
+            .get(&description)
+            .cloned();
+        queue.map_or(0, |queue| queue.lock().len())
+    }
+
+    pub(in crate::dispatch) fn discard_splice_pushback_if_final(&self, guest_fd: i32) {
+        let Some(description) = self.open_file(guest_fd).map(|file| file.description) else {
+            return;
+        };
+        if description.fd_ref_count() == 1 {
+            self.captured_file_table()
+                .lock_splice_pushback()
+                .remove(&description.id());
+        }
     }
 
     /// Reconcile the fork-coherent FASYNC registry with `fd`'s current
@@ -3833,28 +3862,28 @@ impl SyscallDispatcher {
 
     fn queue_self_sigpoll(
         &self,
+        context: &crate::kernel::KernelContext,
         signum: i32,
         fd: i32,
         target_tid: Option<crate::thread::ThreadId>,
     ) {
         let info = carrick_abi::LinuxSiginfo::sigpoll(signum, carrick_abi::LINUX_POLL_MSG, 0, fd);
-        self.record_pending_siginfo(crate::thread::ThreadId::NONE, signum, info);
-        self.mark_signal_pending(crate::thread::ThreadId::NONE, signum);
-
-        let tid = target_tid
-            .filter(|tid| *tid != crate::thread::ThreadId::NONE)
-            .unwrap_or_else(crate::thread::ThreadId::main_from_host_pid);
-        self.record_pending_siginfo(tid, signum, info);
-        if !self.signal_blocked(tid, signum)
-            && let Some(action) = self.registered_signal_handler(signum)
+        let Some(tid) = target_tid.filter(|tid| *tid != crate::thread::ThreadId::NONE) else {
+            self.mark_process_signal_pending_with_info(context, signum, Some(info));
+            return;
+        };
+        self.record_pending_siginfo(context, tid, signum, info);
+        if !self.signal_blocked(context, tid, signum)
+            && let Some(action) = self.registered_signal_handler(context, signum)
         {
-            self.record_pending_signal_action(tid, signum, action);
+            self.record_pending_signal_action(context, tid, signum, action);
         }
-        self.mark_signal_pending(tid, signum);
+        self.mark_signal_pending(context, tid, signum);
     }
 
     fn send_async_owner_signal(
         &self,
+        context: &crate::kernel::KernelContext,
         owner_type: i32,
         owner_pid: i32,
         sig: i32,
@@ -3868,7 +3897,7 @@ impl SyscallDispatcher {
         if owner_type != LINUX_F_OWNER_PGRP
             && u32::try_from(owner_pid).ok() == Some(crate::namespace::pid::self_ns_pid())
         {
-            self.queue_self_sigpoll(signum, fd, target_tid);
+            self.queue_self_sigpoll(context, signum, fd, target_tid);
             return;
         }
         let ns = owner_pid as u32;
@@ -3882,7 +3911,7 @@ impl SyscallDispatcher {
         if matches!(target, crate::dispatch::signal::SignalTarget::HostProcess(pid) if pid.0 == std::process::id())
             || matches!(target, crate::dispatch::signal::SignalTarget::HostThread(pid) if pid.0 == std::process::id())
         {
-            self.queue_self_sigpoll(signum, fd, target_tid);
+            self.queue_self_sigpoll(context, signum, fd, target_tid);
             return;
         }
         // Kernel-internal SIGIO delivery is not gated by the writer's euid.
@@ -3897,7 +3926,12 @@ impl SyscallDispatcher {
     /// added bytes transitions the reader's fd to readable, which is exactly when
     /// Linux raises the owner's I/O signal. (`written <= 0` — a short/blocked
     /// write that added nothing — is not an edge and delivers nothing.)
-    fn fasync_notify_after_write(&self, fd: i32, written: i64) {
+    fn fasync_notify_after_write(
+        &self,
+        context: &crate::kernel::KernelContext,
+        fd: i32,
+        written: i64,
+    ) {
         if written <= 0 {
             return;
         }
@@ -3915,7 +3949,14 @@ impl SyscallDispatcher {
         // owner_pid is the F_SETOWN value as the guest set it (a PID-namespace id
         // from the owner's getpid()); send_async_owner_signal translates it to a
         // HOST-domain target exactly as the guest kill(2) path does.
-        self.send_async_owner_signal(owner.owner_type, owner.owner_pid, owner.sig, fd, None);
+        self.send_async_owner_signal(
+            context,
+            owner.owner_type,
+            owner.owner_pid,
+            owner.sig,
+            fd,
+            None,
+        );
     }
 
     fn dnotify_register(
@@ -3965,7 +4006,7 @@ impl SyscallDispatcher {
         Ok(())
     }
 
-    fn dnotify_close_fd(&self, fd: i32) {
+    pub(in crate::dispatch) fn dnotify_close_fd(&self, fd: i32) {
         self.fs
             .dnotify_registry
             .lock()
@@ -4002,12 +4043,18 @@ impl SyscallDispatcher {
         watched_canon == event || watched == event_canon || watched_canon == event_canon
     }
 
-    pub(in crate::dispatch) fn dnotify_child(&self, path: &str, mask: LinuxDnotifyMask) {
-        self.dnotify_child_for_tid(path, mask, None);
+    pub(in crate::dispatch) fn dnotify_child(
+        &self,
+        context: &crate::kernel::KernelContext,
+        path: &str,
+        mask: LinuxDnotifyMask,
+    ) {
+        self.dnotify_child_for_tid(context, path, mask, None);
     }
 
     fn dnotify_child_for_tid(
         &self,
+        context: &crate::kernel::KernelContext,
         path: &str,
         mask: LinuxDnotifyMask,
         target_tid: Option<crate::thread::ThreadId>,
@@ -4020,14 +4067,19 @@ impl SyscallDispatcher {
             return;
         };
         let parent = display_rootfs_path(parent);
-        self.dnotify_directory_for_tid(&parent, mask, target_tid);
+        self.dnotify_directory_for_tid(context, &parent, mask, target_tid);
     }
 
-    fn dnotify_attrib(&self, path: &str) {
-        self.dnotify_attrib_for_tid(path, None);
+    fn dnotify_attrib(&self, context: &crate::kernel::KernelContext, path: &str) {
+        self.dnotify_attrib_for_tid(context, path, None);
     }
 
-    fn dnotify_attrib_for_tid(&self, path: &str, target_tid: Option<crate::thread::ThreadId>) {
+    fn dnotify_attrib_for_tid(
+        &self,
+        context: &crate::kernel::KernelContext,
+        path: &str,
+        target_tid: Option<crate::thread::ThreadId>,
+    ) {
         let path = self.normalize_dnotify_path(path);
         let mut candidates = vec![path.clone()];
         if let Some(parent) = Path::new(&path).parent() {
@@ -4036,11 +4088,17 @@ impl SyscallDispatcher {
                 candidates.push(parent);
             }
         }
-        self.dnotify_directories_for_tid(&candidates, LinuxDnotifyMask::ATTRIB, target_tid);
+        self.dnotify_directories_for_tid(
+            context,
+            &candidates,
+            LinuxDnotifyMask::ATTRIB,
+            target_tid,
+        );
     }
 
     fn dnotify_directory_for_tid(
         &self,
+        context: &crate::kernel::KernelContext,
         path: &str,
         mask: LinuxDnotifyMask,
         target_tid: Option<crate::thread::ThreadId>,
@@ -4049,11 +4107,12 @@ impl SyscallDispatcher {
             return;
         }
         let path = self.normalize_dnotify_path(path);
-        self.dnotify_directories_for_tid(&[path], mask, target_tid);
+        self.dnotify_directories_for_tid(context, &[path], mask, target_tid);
     }
 
     fn dnotify_directories_for_tid(
         &self,
+        context: &crate::kernel::KernelContext,
         paths: &[String],
         mask: LinuxDnotifyMask,
         target_tid: Option<crate::thread::ThreadId>,
@@ -4083,6 +4142,7 @@ impl SyscallDispatcher {
                     (owner_type, owner_pid, desc.async_sig())
                 };
                 self.send_async_owner_signal(
+                    context,
                     owner_type,
                     owner_pid,
                     sig,
@@ -4270,19 +4330,22 @@ impl SyscallDispatcher {
         host_fd: HostFd,
         count: usize,
     ) -> Result<Vec<u8>, DispatchError> {
-        let mut buf;
+        let mut buf = Vec::new();
         {
-            let mut staged = self.io.splice_pushback.lock();
-            let empty;
-            (buf, empty) = match staged.get_mut(&guest_fd) {
-                Some(queue) => {
-                    let buf = queue.take_vec(count);
-                    (buf, queue.is_empty())
+            let description = self
+                .open_file(guest_fd)
+                .ok_or(DispatchError::Errno(LINUX_EBADF))?
+                .description;
+            let files = self.captured_file_table();
+            let mut staged = files.lock_splice_pushback();
+            if let Some(queue) = staged.get(&description.id()).cloned() {
+                let mut queue = queue.lock();
+                buf = queue.take_vec(count);
+                let empty = queue.is_empty();
+                drop(queue);
+                if empty {
+                    staged.remove(&description.id());
                 }
-                None => (Vec::new(), false),
-            };
-            if empty {
-                staged.remove(&guest_fd);
             }
         }
         if buf.len() >= count {
@@ -4310,18 +4373,32 @@ impl SyscallDispatcher {
         if bytes.is_empty() {
             return;
         }
-        let mut staged = self.io.splice_pushback.lock();
-        let queue = staged.entry(guest_fd).or_default();
-        queue.push_back_owned(bytes);
+        let Some(description) = self.open_file(guest_fd).map(|file| file.description) else {
+            return;
+        };
+        let files = self.captured_file_table();
+        let queue = files
+            .lock_splice_pushback()
+            .entry(description.id())
+            .or_insert_with(|| Arc::new(Mutex::new(SplicePushback::default())))
+            .clone();
+        queue.lock().push_back_owned(bytes);
     }
 
     fn restore_splice_pipe_bytes(&self, guest_fd: i32, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
-        let mut staged = self.io.splice_pushback.lock();
-        let queue = staged.entry(guest_fd).or_default();
-        queue.push_front(bytes);
+        let Some(description) = self.open_file(guest_fd).map(|file| file.description) else {
+            return;
+        };
+        let files = self.captured_file_table();
+        let queue = files
+            .lock_splice_pushback()
+            .entry(description.id())
+            .or_insert_with(|| Arc::new(Mutex::new(SplicePushback::default())))
+            .clone();
+        queue.lock().push_front(bytes);
     }
 
     fn write_output_fd(
@@ -4649,6 +4726,7 @@ impl SyscallDispatcher {
 
     fn do_renameat(
         &self,
+        context: &crate::kernel::KernelContext,
         request: RenameAtRequest,
         memory: &impl GuestMemory,
     ) -> Result<DispatchOutcome, DispatchError> {
@@ -4669,9 +4747,13 @@ impl SyscallDispatcher {
         }
         let resolved_old = self.resolve_at_path(olddirfd, &old)?;
         let resolved_new = self.resolve_at_path(newdirfd, &new_path)?;
-        if crate::vfs::is_synthetic_virtual_file(&resolved_old, &self.synthetic_proc_context())
-            || crate::vfs::is_synthetic_virtual_file(&resolved_new, &self.synthetic_proc_context())
-        {
+        if crate::vfs::is_synthetic_virtual_file(
+            &resolved_old,
+            &self.synthetic_proc_context(context),
+        ) || crate::vfs::is_synthetic_virtual_file(
+            &resolved_new,
+            &self.synthetic_proc_context(context),
+        ) {
             return Ok(DispatchOutcome::errno(LINUX_EROFS));
         }
         // RENAME_EXCHANGE: atomically swap two EXISTING entries. Both must
@@ -4712,7 +4794,12 @@ impl SyscallDispatcher {
                         self.inotify_move(&resolved_old, &resolved_new, old_is_dir);
                         self.inotify_move(&resolved_new, &resolved_old, new_is_dir);
                     }
-                    self.dnotify_child_for_tid(&resolved_old, LinuxDnotifyMask::RENAME, target_tid);
+                    self.dnotify_child_for_tid(
+                        context,
+                        &resolved_old,
+                        LinuxDnotifyMask::RENAME,
+                        target_tid,
+                    );
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
@@ -4773,7 +4860,12 @@ impl SyscallDispatcher {
                         .rename_path(&resolved_old, &resolved_new);
                 }
                 if moved_is_dir {
-                    self.dnotify_child_for_tid(&resolved_old, LinuxDnotifyMask::RENAME, target_tid);
+                    self.dnotify_child_for_tid(
+                        context,
+                        &resolved_old,
+                        LinuxDnotifyMask::RENAME,
+                        target_tid,
+                    );
                 }
                 // A process whose cwd IS the renamed directory (or sits under it)
                 // must follow the move: Linux's cwd is an inode, but carrick tracks
@@ -5474,6 +5566,7 @@ impl SyscallDispatcher {
     /// the two callers, so it stays in the syscall wrappers.
     fn chmod_at(
         &self,
+        context: &crate::kernel::KernelContext,
         dirfd: u64,
         pathname: u64,
         mode: u64,
@@ -5490,7 +5583,7 @@ impl SyscallDispatcher {
         // AT_SYMLINK_NOFOLLOW stays unmodeled on the disk-authoritative backend;
         // a dangling/failed follow falls back to the link path unchanged.)
         let resolved = self.canonicalize_following(&resolved).unwrap_or(resolved);
-        if crate::vfs::is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
+        if crate::vfs::is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context(context)) {
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
         if let Err(errno) = self.layered_metadata(&resolved) {
@@ -5504,7 +5597,7 @@ impl SyscallDispatcher {
             return match m.vfs.chmod(&m.full_path, mode) {
                 Ok(()) => {
                     self.inotify_attrib(&resolved);
-                    self.dnotify_attrib(&resolved);
+                    self.dnotify_attrib(context, &resolved);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
@@ -5513,7 +5606,7 @@ impl SyscallDispatcher {
         match self.fs.rootfs_vfs.overlay.set_mode(&resolved, mode) {
             Ok(()) | Err(crate::fs_backend::BackendError::Unsupported) => {
                 self.inotify_attrib(&resolved);
-                self.dnotify_attrib(&resolved);
+                self.dnotify_attrib(context, &resolved);
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
             Err(_) => Ok(DispatchOutcome::Returned { value: 0 }),
@@ -5624,7 +5717,13 @@ impl SyscallDispatcher {
     /// on the backend (durable via xattr on `--fs host`). Shared by `fchown` and
     /// `fchownat(..., AT_EMPTY_PATH)` so both record the owner identically.
     /// `fd` must already be validated by the caller.
-    fn fchown_by_fd(&self, fd: i32, uid: Option<u32>, gid: Option<u32>) -> DispatchOutcome {
+    fn fchown_by_fd(
+        &self,
+        context: &crate::kernel::KernelContext,
+        fd: i32,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> DispatchOutcome {
         let path = self
             .open_file(fd)
             .and_then(|of| match &*of.description.read() {
@@ -5651,7 +5750,7 @@ impl SyscallDispatcher {
                 );
             }
             self.clear_setid_on_chown(&path);
-            self.dnotify_attrib(&path);
+            self.dnotify_attrib(context, &path);
         }
         DispatchOutcome::Returned { value: 0 }
     }
@@ -5668,10 +5767,10 @@ impl SyscallDispatcher {
         outcome: DispatchOutcome,
     ) -> DispatchOutcome {
         if matches!(&outcome, DispatchOutcome::Errno { errno } if *errno == LINUX_EPIPE)
-            && !self.signal_is_ignored(LINUX_SIGPIPE)
+            && !self.signal_is_ignored(cx.kernel, LINUX_SIGPIPE)
         {
             let tid = Self::ctx_tid(cx);
-            self.mark_signal_pending(tid, LINUX_SIGPIPE);
+            self.mark_signal_pending(cx.kernel, tid, LINUX_SIGPIPE);
         }
         outcome
     }
@@ -5707,8 +5806,8 @@ impl SyscallDispatcher {
         }
         let limit = self.fsize_soft_limit()?;
         if offset >= limit {
-            if !self.signal_is_ignored(LINUX_SIGXFSZ) {
-                self.mark_signal_pending(Self::ctx_tid(cx), LINUX_SIGXFSZ);
+            if !self.signal_is_ignored(cx.kernel, LINUX_SIGXFSZ) {
+                self.mark_signal_pending(cx.kernel, Self::ctx_tid(cx), LINUX_SIGXFSZ);
             }
             return Some(LINUX_EFBIG);
         }
@@ -5864,13 +5963,13 @@ impl SyscallDispatcher {
             // erroneously reading x3 as flags here, which is whatever uninit
             // register state the caller had — making glibc see EINVAL for normal
             // access(F_OK)-style calls and abort with "stack smashing detected".
-            this.access_at(dirfd, pathname.0, mode, 0, &*cx.memory)
+            this.access_at(cx.kernel, dirfd, pathname.0, mode, 0, &*cx.memory)
 
         }
 
         fn faccessat2(this, cx, dirfd: u64, pathname: GuestPtr, mode: u64, flags: u64) {
 
-            this.access_at(dirfd, pathname.0, mode, flags, &*cx.memory)
+            this.access_at(cx.kernel, dirfd, pathname.0, mode, flags, &*cx.memory)
 
         }
 
@@ -5941,6 +6040,7 @@ impl SyscallDispatcher {
             };
             let open = open_file.description.read();
             Ok(match &*open {
+                OpenDescription::Closed { .. } => DispatchOutcome::errno(LINUX_EBADF),
                 OpenDescription::Directory { metadata, .. } => {
                     let dir_path = display_rootfs_path(&metadata.path);
                     // fchdir(2) requires search (execute) permission on the
@@ -6012,7 +6112,7 @@ impl SyscallDispatcher {
             }
 
             if crate::dispatch::fs::state::HOST_PIPE_FD_PRESSURE
-                .is_exhausted_by(this.io.open_files.read().len())
+                .is_exhausted_by(this.captured_file_table().read_open_files().len())
             {
                 return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
             }
@@ -6058,7 +6158,7 @@ impl SyscallDispatcher {
             // id. BSD gives the two ends DIFFERENT st_ino values, so a per-fd
             // inode key would never match across ends.
             let pipe_id = host_inode_pipe_id(host_read);
-            let read_open = OpenFile::new(
+            let read_open = OpenFile::from_open_description(
                 Arc::new(RwLock::new(OpenDescription::HostPipe {
                     host_fd: HostFdRef::new(host_read),
                     is_read_end: true,
@@ -6070,7 +6170,7 @@ impl SyscallDispatcher {
                 })),
                 fd_flags,
             );
-            let write_open = OpenFile::new(
+            let write_open = OpenFile::from_open_description(
                 Arc::new(RwLock::new(OpenDescription::HostPipe {
                     host_fd: HostFdRef::new(host_write),
                     is_read_end: false,
@@ -6089,7 +6189,8 @@ impl SyscallDispatcher {
             let pair = LinuxFdPair { read_fd, write_fd };
             if write_kernel_struct_raw(memory, address, &pair).is_err() {
                 let removed = {
-                    let mut table = this.io.open_files.write();
+                    let files = this.captured_file_table();
+                    let mut table = files.write_open_files();
                     [table.remove(&read_fd), table.remove(&write_fd)]
                 };
                 for open_file in removed.into_iter().flatten() {
@@ -6266,7 +6367,7 @@ impl SyscallDispatcher {
                     // F_SETFD FD_CLOEXEC must be reflected back. Read the
                     // remembered per-stdio-fd bit.
                     if is_stdio_fd(fd.0) {
-                        let bit = if this.io.stdio_cloexec.lock()[fd.0 as usize] {
+                        let bit = if this.captured_file_table().lock_stdio_cloexec()[fd.0 as usize] {
                             LINUX_FD_CLOEXEC as i64
                         } else {
                             0
@@ -6277,7 +6378,7 @@ impl SyscallDispatcher {
                 }
                 LINUX_F_SETFD => {
                     let fd_flags = LinuxFdFlags::from_bits_truncate(arg);
-                    if let Some(open_file) = this.io.open_files.write().get_mut(&fd.0) {
+                    if let Some(open_file) = this.captured_file_table().write_open_files().get_mut(&fd.0) {
                         open_file.fd_flags = fd_flags.bits();
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
@@ -6290,7 +6391,7 @@ impl SyscallDispatcher {
                     // remember the bit so a subsequent F_GETFD reflects it,
                     // matching real Linux.
                     if is_stdio_fd(fd.0) {
-                        this.io.stdio_cloexec.lock()[fd.0 as usize] =
+                        this.captured_file_table().lock_stdio_cloexec()[fd.0 as usize] =
                             fd_flags.contains(LinuxFdFlags::CLOEXEC);
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
@@ -6700,7 +6801,8 @@ impl SyscallDispatcher {
             // caller is NOT gated and still stops, matching Linux.
             let block_ttou = {
                 let tid = Self::ctx_tid(cx);
-                this.signal_is_ignored(LINUX_SIGTTOU) || this.signal_blocked(tid, LINUX_SIGTTOU)
+                this.signal_is_ignored(cx.kernel, LINUX_SIGTTOU)
+                    || this.signal_blocked(cx.kernel, tid, LINUX_SIGTTOU)
             };
             if !this.fd_is_valid(fd.0) {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
@@ -7060,7 +7162,7 @@ impl SyscallDispatcher {
             }
 
             Ok(match ioctl_request {
-                LINUX_TIOCGWINSZ if fd_is_tty(&this.io.open_files.read(), fd.0) => {
+                LINUX_TIOCGWINSZ if fd_is_tty(&this.captured_file_table().read_open_files(), fd.0) => {
                     // Prefer the live host window size when stdin/stdout/stderr
                     // is a real macOS terminal; fall back to the 80x24 stub so
                     // headless invocations (CI, redirected pipes that we still
@@ -7078,7 +7180,7 @@ impl SyscallDispatcher {
                     if !cx.memory.guest_range_is_writable(arg, LINUX_TERMIO_SIZE) {
                         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
-                    if !fd_is_tty(&this.io.open_files.read(), fd.0) {
+                    if !fd_is_tty(&this.captured_file_table().read_open_files(), fd.0) {
                         DispatchOutcome::errno(LINUX_ENOTTY)
                     } else {
                         let termios = if crate::host_tty::host_isatty(fd.0) {
@@ -7090,7 +7192,7 @@ impl SyscallDispatcher {
                         write_linux_termio(&mut *cx.memory, arg, &termios)
                     }
                 }
-                LINUX_TCGETS | LINUX_TCGETS2 if fd_is_tty(&this.io.open_files.read(), fd.0) => {
+                LINUX_TCGETS | LINUX_TCGETS2 if fd_is_tty(&this.captured_file_table().read_open_files(), fd.0) => {
                     // Mirror the live host terminal modes when available so
                     // `less`, `vi`, and an interactive shell see the actual
                     // ICANON/ECHO state the user has configured.
@@ -7137,7 +7239,7 @@ impl SyscallDispatcher {
                 | LINUX_TCSETS2
                 | LINUX_TCSETSW2
                 | LINUX_TCSETSF2
-                    if fd_is_tty(&this.io.open_files.read(), fd.0) =>
+                    if fd_is_tty(&this.captured_file_table().read_open_files(), fd.0) =>
                 {
                     // Read exactly what the guest provided: 36 bytes for the
                     // legacy TCSETS*, 44 for the termios2 variants. Reading more
@@ -7798,7 +7900,7 @@ impl SyscallDispatcher {
         fn openat(this, cx, dirfd: u64, pathname: GuestPtr, flags: u64, mode: u64) {
 
             let pathname = pathname.0;
-            this.open_at_path(dirfd, pathname, flags, mode, &*cx.memory, cx.reporter)
+            this.open_at_path(cx, dirfd, pathname, flags, mode)
 
         }
 
@@ -7853,7 +7955,7 @@ impl SyscallDispatcher {
                 Ok(path) => path,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
-            this.open_at_path_string(arg0, path.as_ref(), flags, mode, cx.reporter)
+            this.open_at_path_string(cx.kernel, arg0, path.as_ref(), flags, mode, cx.reporter)
 
         }
 
@@ -7863,9 +7965,9 @@ impl SyscallDispatcher {
             // Closing a stdio number (0/1/2) frees it for reuse by the
             // lowest-free-descriptor allocator (a later open()/dup can land there).
             if fd.0 >= 0 && fd.0 < 3 {
-                this.io.closed_stdio.lock()[fd.0 as usize] = true;
+                this.captured_file_table().lock_closed_stdio()[fd.0 as usize] = true;
             }
-            this.io.splice_pushback.lock().remove(&fd.0);
+            this.discard_splice_pushback_if_final(fd.0);
             this.dnotify_close_fd(fd.0);
             // inotify IN_CLOSE_WRITE/IN_CLOSE_NOWRITE for a watched regular file
             // or directory — emitted while the fd is still in the table so its
@@ -7883,7 +7985,7 @@ impl SyscallDispatcher {
             // removal to THIS registration. detach takes only a read lock, so it
             // does not deadlock with the separate write below.
             this.detach_fd_from_epolls(fd.0);
-            let removed = this.io.open_files.write().remove(&fd.0);
+            let removed = this.captured_file_table().write_open_files().remove(&fd.0);
             Ok(
                 if let Some(open_file) = removed {
                     this.record_fd_close_owner(fd.0, cx.tid().raw(), &open_file);
@@ -7930,15 +8032,15 @@ impl SyscallDispatcher {
             // Drain matching fds out of the table so we don't iterate a
             // gigantic [first, last] (callers commonly pass last=u32::MAX).
             let fds: Vec<i32> = this
-                .io
-                .open_files
-                .read()
+                .captured_file_table()
+                .read_open_files()
                 .keys()
                 .copied()
                 .filter(|fd| (*fd as u64) >= first && (*fd as u64) <= last)
                 .collect();
             if cloexec_only {
-                let mut table = this.io.open_files.write();
+                let files = this.captured_file_table();
+                let mut table = files.write_open_files();
                 for fd in fds {
                     if let Some(open_file) = table.get_mut(&fd) {
                         open_file.fd_flags |= LINUX_FD_CLOEXEC;
@@ -7952,9 +8054,9 @@ impl SyscallDispatcher {
                 // separate per fd, so the fd is still in the table — hence not
                 // reallocatable — across its own detach.
                 for fd in fds {
-                    this.io.splice_pushback.lock().remove(&fd);
+                    this.discard_splice_pushback_if_final(fd);
                     this.detach_fd_from_epolls(fd);
-                    if let Some(open_file) = this.io.open_files.write().remove(&fd) {
+                    if let Some(open_file) = this.captured_file_table().write_open_files().remove(&fd) {
                         this.record_fd_close_owner(fd, cx.tid().raw(), &open_file);
                         crate::event_ring::rec(
                             crate::event_ring::FDCLOSE,
@@ -8137,6 +8239,9 @@ impl SyscallDispatcher {
             }
 
             let (current, end) = match &*open {
+                OpenDescription::Closed { .. } => {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                }
                 OpenDescription::File {
                     contents, offset, ..
                 } => (*offset as i64, contents.len() as i64),
@@ -8186,6 +8291,9 @@ impl SyscallDispatcher {
             }
 
             match &mut *open {
+                OpenDescription::Closed { .. } => {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                }
                 OpenDescription::File { offset, .. }
                 | OpenDescription::Directory { offset, .. }
                 | OpenDescription::SyntheticFile { offset, .. } => *offset = next as usize,
@@ -8230,6 +8338,9 @@ impl SyscallDispatcher {
             // An O_PATH descriptor is not open for I/O (open13 → EBADF).
             if this.fd_is_o_path(fd.0) {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
+            if this.io_uring_description(fd.0).is_some() {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let address = buf.0;
             let length =
@@ -8285,6 +8396,9 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
             let (read_len, bytes) = match &mut *open {
+                OpenDescription::Closed { .. } => {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                }
                 OpenDescription::File {
                     contents, offset, ..
                 } => {
@@ -8420,7 +8534,7 @@ impl SyscallDispatcher {
                     drop(open);
                     // Drain pending signals matching the fd's mask into
                     // signalfd_siginfo records (empty → EAGAIN, like inotify).
-                    return Ok(this.read_signalfd(memory, address, length, mask, tid));
+                    return Ok(this.read_signalfd(cx.kernel, memory, address, length, mask, tid));
                 }
                 OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
@@ -8564,6 +8678,9 @@ impl SyscallDispatcher {
                 _ => {}
             }
             let read_len = match &mut *open {
+                OpenDescription::Closed { .. } => {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                }
                 OpenDescription::File {
                     contents, offset, ..
                 } => {
@@ -8648,6 +8765,9 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::Returned { value: n as i64 });
             }
             let bytes = match &*open {
+                OpenDescription::Closed { .. } => {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                }
                 OpenDescription::File { contents, .. } => contents.read_at(offset, length),
                 OpenDescription::SyntheticFile { contents, .. } => contents
                     .get(offset..)
@@ -8797,6 +8917,9 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::Returned { value: total });
             }
             let read_len = match &*open {
+                OpenDescription::Closed { .. } => {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                }
                 OpenDescription::File { contents, .. } => {
                     read_from_file_contents_at(memory, contents, offset, &iovecs)?
                 }
@@ -8961,7 +9084,9 @@ impl SyscallDispatcher {
             }
             let open = open_file.description.read();
             let errno = match &*open {
-                OpenDescription::File { .. } | OpenDescription::SyntheticFile { .. } => LINUX_EBADF,
+                OpenDescription::Closed { .. }
+                | OpenDescription::File { .. }
+                | OpenDescription::SyntheticFile { .. } => LINUX_EBADF,
                 OpenDescription::HostFile { .. } => LINUX_EINVAL,
                 OpenDescription::Directory { .. } => LINUX_EISDIR,
                 OpenDescription::PipeReader { .. }
@@ -9105,7 +9230,9 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::Returned { value: total });
             }
             let errno = match &*open {
-                OpenDescription::File { .. } | OpenDescription::SyntheticFile { .. } => LINUX_EBADF,
+                OpenDescription::Closed { .. }
+                | OpenDescription::File { .. }
+                | OpenDescription::SyntheticFile { .. } => LINUX_EBADF,
                 OpenDescription::HostFile { .. } => LINUX_EINVAL,
                 OpenDescription::Directory { .. } => LINUX_EISDIR,
                 OpenDescription::PipeReader { .. }
@@ -10099,7 +10226,7 @@ impl SyscallDispatcher {
 
         fn sys_truncate(this, cx, path: GuestPtr, length: u64) {
 
-            this.truncate(path, length, &*cx.memory)
+            this.truncate(cx.kernel, path, length, &*cx.memory)
 
         }
 
@@ -10248,6 +10375,9 @@ impl SyscallDispatcher {
             if this.fd_is_o_path(fd) {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
+            if this.io_uring_description(fd).is_some() {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
             let address = buf.0;
             let length =
                 usize::try_from(count).map_err(|_| DispatchError::LengthTooLarge(count))?;
@@ -10363,7 +10493,7 @@ impl SyscallDispatcher {
                             };
                             let key_fd = fd;
                             drop(open);
-                            this.fasync_notify_after_write(key_fd, written);
+                            this.fasync_notify_after_write(cx.kernel, key_fd, written);
                             return Ok(this.raise_sigpipe_on_epipe(cx, out));
                         }
                         OpenDescription::HostSocket { host_fd, .. } => {
@@ -10389,7 +10519,7 @@ impl SyscallDispatcher {
                             };
                             let key_fd = fd;
                             drop(open);
-                            this.fasync_notify_after_write(key_fd, written);
+                            this.fasync_notify_after_write(cx.kernel, key_fd, written);
                             return Ok(out);
                         }
                         OpenDescription::HostFile {
@@ -11012,7 +11142,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_ENOENT));
             }
             let resolved = this.resolve_at_path(dirfd, &path)?;
-            if crate::vfs::is_synthetic_virtual_file(&resolved, &this.synthetic_proc_context()) {
+            if crate::vfs::is_synthetic_virtual_file(&resolved, &this.synthetic_proc_context(cx.kernel)) {
                 return Ok(DispatchOutcome::errno(LINUX_EEXIST));
             }
             // Existence check must consult the layered view (overlay/disk
@@ -11081,7 +11211,7 @@ impl SyscallDispatcher {
                         {
                             Ok(()) => {
                                 this.stamp_new_node_owner(&materialize_path, fifo_mode);
-                                this.dnotify_child(&materialize_path, LinuxDnotifyMask::CREATE);
+                                this.dnotify_child(cx.kernel, &materialize_path, LinuxDnotifyMask::CREATE);
                                 DispatchOutcome::Returned { value: 0 }
                             }
                             Err(crate::fs_backend::BackendError::Unsupported) => {
@@ -11111,7 +11241,7 @@ impl SyscallDispatcher {
                         {
                             Ok(()) => {
                                 this.stamp_new_node_owner(&materialize_path, full_mode);
-                                this.dnotify_child(&materialize_path, LinuxDnotifyMask::CREATE);
+                                this.dnotify_child(cx.kernel, &materialize_path, LinuxDnotifyMask::CREATE);
                                 DispatchOutcome::Returned { value: 0 }
                             }
                             Err(crate::fs_backend::BackendError::Unsupported) => {
@@ -11140,7 +11270,7 @@ impl SyscallDispatcher {
                         {
                             Ok(()) => {
                                 this.stamp_new_node_owner(&materialize_path, sock_mode);
-                                this.dnotify_child(&materialize_path, LinuxDnotifyMask::CREATE);
+                                this.dnotify_child(cx.kernel, &materialize_path, LinuxDnotifyMask::CREATE);
                                 DispatchOutcome::Returned { value: 0 }
                             }
                             Err(crate::fs_backend::BackendError::Unsupported) => {
@@ -11170,7 +11300,7 @@ impl SyscallDispatcher {
                             .set_mode(&materialize_path, mode & 0o7777);
                     }
                     this.stamp_new_node_owner(&materialize_path, mode & 0o7777);
-                    this.dnotify_child(&materialize_path, LinuxDnotifyMask::CREATE);
+                    this.dnotify_child(cx.kernel, &materialize_path, LinuxDnotifyMask::CREATE);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 Err(crate::fs_backend::BackendError::Unsupported) => Ok(DispatchOutcome::errno(LINUX_EROFS)),
@@ -11187,7 +11317,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_ENOENT));
             }
             let resolved = this.resolve_at_path(dirfd, &path)?;
-            if crate::vfs::is_synthetic_virtual_file(&resolved, &this.synthetic_proc_context()) {
+            if crate::vfs::is_synthetic_virtual_file(&resolved, &this.synthetic_proc_context(cx.kernel)) {
                 return Ok(DispatchOutcome::errno(LINUX_EEXIST));
             }
             if let Some(m) = this.fs.vfs_mounts.resolve(&resolved) {
@@ -11203,7 +11333,7 @@ impl SyscallDispatcher {
                         );
                         // inotify IN_CREATE|IN_ISDIR on the parent dir watch.
                         this.inotify_child(&resolved, carrick_abi::LINUX_IN_CREATE, true);
-                        this.dnotify_child(&resolved, LinuxDnotifyMask::CREATE);
+                        this.dnotify_child(cx.kernel, &resolved, LinuxDnotifyMask::CREATE);
                         Ok(DispatchOutcome::Returned { value: 0 })
                     }
                     Err(errno) => Ok(DispatchOutcome::errno(errno)),
@@ -11264,7 +11394,7 @@ impl SyscallDispatcher {
                     }
                     // inotify IN_CREATE|IN_ISDIR on the parent dir watch.
                     this.inotify_child(&resolved, carrick_abi::LINUX_IN_CREATE, true);
-                    this.dnotify_child(&resolved, LinuxDnotifyMask::CREATE);
+                    this.dnotify_child(cx.kernel, &resolved, LinuxDnotifyMask::CREATE);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
@@ -11328,7 +11458,7 @@ impl SyscallDispatcher {
                 }
                 // inotify IN_ATTRIB (chmod is a metadata change).
                 this.inotify_attrib(&path);
-                this.dnotify_attrib_for_tid(&path, Some(cx.tid()));
+                this.dnotify_attrib_for_tid(cx.kernel, &path, Some(cx.tid()));
             }
             Ok(DispatchOutcome::Returned { value: 0 })
 
@@ -11346,7 +11476,7 @@ impl SyscallDispatcher {
             }
             let uid = Self::chown_arg(owner);
             let gid = Self::chown_arg(group);
-            Ok(this.fchown_by_fd(fd.0, uid, gid))
+            Ok(this.fchown_by_fd(cx.kernel, fd.0, uid, gid))
 
         }
 
@@ -11371,7 +11501,7 @@ impl SyscallDispatcher {
                 // fchown (was a silent no-op success that never set_owner'd).
                 let uid = Self::chown_arg(owner);
                 let gid = Self::chown_arg(group);
-                return Ok(this.fchown_by_fd(dirfd as i32, uid, gid));
+                return Ok(this.fchown_by_fd(cx.kernel, dirfd as i32, uid, gid));
             }
             let uid = Self::chown_arg(owner);
             let gid = Self::chown_arg(group);
@@ -11428,7 +11558,7 @@ impl SyscallDispatcher {
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 Err(errno) => {
-                    if crate::vfs::is_synthetic_virtual_file(&resolved, &this.synthetic_proc_context())
+                    if crate::vfs::is_synthetic_virtual_file(&resolved, &this.synthetic_proc_context(cx.kernel))
                     {
                         Ok(DispatchOutcome::Returned { value: 0 })
                     } else {
@@ -11450,7 +11580,7 @@ impl SyscallDispatcher {
             // ("chmod 0644 of file … failed - 201::URIDone"). Only fchmodat2 (452)
             // validates the flags.
             let _ = flags;
-            this.chmod_at(dirfd, pathname.0, mode, &*cx.memory)
+            this.chmod_at(cx.kernel, dirfd, pathname.0, mode, &*cx.memory)
 
         }
 
@@ -11462,7 +11592,7 @@ impl SyscallDispatcher {
             if flags & !LINUX_AT_SYMLINK_NOFOLLOW != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            this.chmod_at(dirfd, pathname.0, mode, &*cx.memory)
+            this.chmod_at(cx.kernel, dirfd, pathname.0, mode, &*cx.memory)
 
         }
 
@@ -11510,7 +11640,7 @@ impl SyscallDispatcher {
             } else {
                 let resolved = this.resolve_at_path(olddirfd, &old)?;
                 let exists =
-                    crate::vfs::is_synthetic_virtual_file(&resolved, &this.synthetic_proc_context())
+                    crate::vfs::is_synthetic_virtual_file(&resolved, &this.synthetic_proc_context(cx.kernel))
                         || this.layered_metadata(&resolved).is_ok()
                         // An anon fd's magic symlink has no layered metadata; its
                         // existence is the live fd, validated below in the
@@ -11523,7 +11653,7 @@ impl SyscallDispatcher {
                 Some(resolved)
             };
             let resolved_new = this.resolve_at_path(newdirfd, &new_path)?;
-            if crate::vfs::is_synthetic_virtual_file(&resolved_new, &this.synthetic_proc_context())
+            if crate::vfs::is_synthetic_virtual_file(&resolved_new, &this.synthetic_proc_context(cx.kernel))
                 || this.layered_metadata(&resolved_new).is_ok()
             {
                 return Ok(DispatchOutcome::errno(LINUX_EEXIST));
@@ -11564,7 +11694,7 @@ impl SyscallDispatcher {
             {
                 return Ok(match result {
                     Ok(()) => {
-                        this.dnotify_child(&resolved_new, LinuxDnotifyMask::CREATE);
+                        this.dnotify_child(cx.kernel, &resolved_new, LinuxDnotifyMask::CREATE);
                         DispatchOutcome::Returned { value: 0 }
                     }
                     Err(errno) => DispatchOutcome::errno(errno),
@@ -11591,7 +11721,7 @@ impl SyscallDispatcher {
             // (/proc, /sys) crosses a device boundary into the rootfs overlay →
             // EXDEV, not the EROFS a failed overlay hard_link would yield
             // (linkat01 case 20 links /proc/cpuinfo into a real dir).
-            if crate::vfs::is_synthetic_virtual_file(&src, &this.synthetic_proc_context())
+            if crate::vfs::is_synthetic_virtual_file(&src, &this.synthetic_proc_context(cx.kernel))
                 && this.fs.vfs_mounts.resolve(&resolved_new).is_none()
             {
                 return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EXDEV));
@@ -11609,7 +11739,7 @@ impl SyscallDispatcher {
             if let Some(mnew) = this.fs.vfs_mounts.resolve(&resolved_new) {
                 return Ok(match mnew.vfs.link(&src, &resolved_new) {
                     Ok(()) => {
-                        this.dnotify_child(&resolved_new, LinuxDnotifyMask::CREATE);
+                        this.dnotify_child(cx.kernel, &resolved_new, LinuxDnotifyMask::CREATE);
                         DispatchOutcome::Returned { value: 0 }
                     }
                     Err(errno) => DispatchOutcome::errno(errno),
@@ -11617,7 +11747,7 @@ impl SyscallDispatcher {
             }
             match this.fs.rootfs_vfs.overlay.hard_link(&src, &resolved_new) {
                 Ok(()) => {
-                    this.dnotify_child(&resolved_new, LinuxDnotifyMask::CREATE);
+                    this.dnotify_child(cx.kernel, &resolved_new, LinuxDnotifyMask::CREATE);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 Err(crate::fs_backend::BackendError::Unsupported) => {
@@ -11643,7 +11773,7 @@ impl SyscallDispatcher {
                         .set_file_contents(&resolved_new, contents)
                     {
                         Ok(()) => {
-                            this.dnotify_child(&resolved_new, LinuxDnotifyMask::CREATE);
+                            this.dnotify_child(cx.kernel, &resolved_new, LinuxDnotifyMask::CREATE);
                             Ok(DispatchOutcome::Returned { value: 0 })
                         }
                         Err(_) => Ok(DispatchOutcome::errno(LINUX_EROFS)),
@@ -11667,7 +11797,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_ENOENT));
             }
             let resolved_link = this.resolve_at_path(newdirfd, &link)?;
-            if crate::vfs::is_synthetic_virtual_file(&resolved_link, &this.synthetic_proc_context()) {
+            if crate::vfs::is_synthetic_virtual_file(&resolved_link, &this.synthetic_proc_context(cx.kernel)) {
                 return Ok(DispatchOutcome::errno(LINUX_EEXIST));
             }
             // If the link path already exists (anywhere in the layered
@@ -11679,7 +11809,7 @@ impl SyscallDispatcher {
             if let Some(m) = this.fs.vfs_mounts.resolve(&resolved_link) {
                 return match m.vfs.symlink(&target_path, &m.full_path) {
                     Ok(()) => {
-                        this.dnotify_child(&resolved_link, LinuxDnotifyMask::CREATE);
+                        this.dnotify_child(cx.kernel, &resolved_link, LinuxDnotifyMask::CREATE);
                         Ok(DispatchOutcome::Returned { value: 0 })
                     }
                     Err(errno) => Ok(DispatchOutcome::errno(errno)),
@@ -11702,7 +11832,7 @@ impl SyscallDispatcher {
                 .symlink(&target_path, &resolved_link)
             {
                 Ok(()) => {
-                    this.dnotify_child(&resolved_link, LinuxDnotifyMask::CREATE);
+                    this.dnotify_child(cx.kernel, &resolved_link, LinuxDnotifyMask::CREATE);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 Err(crate::fs_backend::BackendError::Unsupported) => Ok(DispatchOutcome::errno(LINUX_EROFS)),
@@ -11714,6 +11844,7 @@ impl SyscallDispatcher {
         fn renameat(this, cx, olddirfd: u64, oldpath: GuestPtr, newdirfd: u64, newpath: GuestPtr) {
 
             this.do_renameat(
+                cx.kernel,
                 RenameAtRequest {
                 olddirfd,
                     oldpath: oldpath.0,
@@ -11751,6 +11882,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             this.do_renameat(
+                cx.kernel,
                 RenameAtRequest {
                 olddirfd,
                     oldpath: oldpath.0,
@@ -11866,7 +11998,7 @@ impl SyscallDispatcher {
             let resolved = this.resolve_at_path(dirfd, &path)?;
             let remove_dir = flags & LINUX_AT_REMOVEDIR != 0;
             // Synthetic /proc /sys paths can't be unlinked.
-            if crate::vfs::is_synthetic_virtual_file(&resolved, &this.synthetic_proc_context()) {
+            if crate::vfs::is_synthetic_virtual_file(&resolved, &this.synthetic_proc_context(cx.kernel)) {
                 return Ok(DispatchOutcome::errno(LINUX_EROFS));
             }
             use crate::vfs::Vfs as _;
@@ -11933,7 +12065,7 @@ impl SyscallDispatcher {
             };
             // nlink only matters for the file (non-dir) self-watch sequence.
             let nlink_before = if watching && !unlinked_is_dir {
-                this.path_stat_record(dirfd, &path, 0)
+                this.path_stat_record(cx.kernel, dirfd, &path, 0)
                     .map(|r| r.nlink)
                     .unwrap_or(1)
             } else {
@@ -11954,7 +12086,7 @@ impl SyscallDispatcher {
                         carrick_abi::LINUX_IN_DELETE,
                         unlinked_is_dir,
                     );
-                    this.dnotify_child(&resolved, LinuxDnotifyMask::DELETE);
+                    this.dnotify_child(cx.kernel, &resolved, LinuxDnotifyMask::DELETE);
                     // To a watch ON the entry itself:
                     // - A directory (rmdir) has no link-count subtlety:
                     //   IN_DELETE_SELF → IN_IGNORED.
@@ -12072,7 +12204,7 @@ impl SyscallDispatcher {
             match this.layered_metadata(&path) {
                 Ok(_) => {}
                 Err(errno) => {
-                    if crate::vfs::is_synthetic_virtual_file(&path, &this.synthetic_proc_context()) {
+                    if crate::vfs::is_synthetic_virtual_file(&path, &this.synthetic_proc_context(cx.kernel)) {
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
                     crate::probes::fs_op("utimensat:meta_err", &path, errno.get());
@@ -12140,7 +12272,7 @@ impl SyscallDispatcher {
             let statbuf = statbuf.0;
             let memory = &mut *cx.memory;
             let path = read_guest_c_string(memory, pathname)?;
-            match this.path_stat_record(dirfd, &path, flags) {
+            match this.path_stat_record(cx.kernel, dirfd, &path, flags) {
                 Ok(record) => Ok(write_stat_record(memory, statbuf, &record)),
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
             }
@@ -12153,7 +12285,7 @@ impl SyscallDispatcher {
             let statbuf = statbuf.0;
             let memory = &mut *cx.memory;
             let path = read_guest_c_string(memory, pathname)?;
-            match this.path_stat_record(LINUX_AT_FDCWD, &path, 0) {
+            match this.path_stat_record(cx.kernel, LINUX_AT_FDCWD, &path, 0) {
                 Ok(record) => Ok(write_x8664_stat_record(memory, statbuf, &record)),
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
             }
@@ -12177,7 +12309,12 @@ impl SyscallDispatcher {
             let statbuf = statbuf.0;
             let memory = &mut *cx.memory;
             let path = read_guest_c_string(memory, pathname)?;
-            match this.path_stat_record(LINUX_AT_FDCWD, &path, LINUX_AT_SYMLINK_NOFOLLOW) {
+            match this.path_stat_record(
+                cx.kernel,
+                LINUX_AT_FDCWD,
+                &path,
+                LINUX_AT_SYMLINK_NOFOLLOW,
+            ) {
                 Ok(record) => Ok(write_x8664_stat_record(memory, statbuf, &record)),
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
             }
@@ -12195,7 +12332,7 @@ impl SyscallDispatcher {
             let statbuf = statbuf.0;
             let memory = &mut *cx.memory;
             let path = read_guest_c_string(memory, pathname)?;
-            match this.path_stat_record(dirfd, &path, flags) {
+            match this.path_stat_record(cx.kernel, dirfd, &path, flags) {
                 Ok(record) => Ok(write_x8664_stat_record(memory, statbuf, &record)),
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
             }
@@ -12242,7 +12379,7 @@ impl SyscallDispatcher {
 
             let path = this.resolve_at_path(dirfd, &path)?;
             if let Some(contents) =
-                crate::vfs::proc::synthetic_file(&path, &this.synthetic_proc_context())
+                crate::vfs::proc::synthetic_file(&path, &this.synthetic_proc_context(cx.kernel))
             {
                 return Ok(write_synthetic_statx(
                     memory,
@@ -12568,8 +12705,8 @@ mod tests {
             mode: 0o755,
             size: 0,
         };
-        OpenFile {
-            description: Arc::new(RwLock::new(OpenDescription::Directory {
+        OpenFile::from_open_description(
+            Arc::new(RwLock::new(OpenDescription::Directory {
                 path: path.to_owned(),
                 metadata,
                 entries: Vec::new(),
@@ -12577,8 +12714,8 @@ mod tests {
                 base: OpenDescriptionBase::new(0),
                 trusted_host_dir: None,
             })),
-            fd_flags: 0,
-        }
+            0,
+        )
     }
 
     #[test]
@@ -12944,10 +13081,20 @@ mod tests {
         assert!(root >= 0 && lane_dir_is_trusted(&dispatcher, root));
 
         let fast = dispatcher
-            .path_stat_record(root as u64, "file.txt", LINUX_AT_SYMLINK_NOFOLLOW)
+            .path_stat_record(
+                &dispatcher.exact_signal_context_for_test(),
+                root as u64,
+                "file.txt",
+                LINUX_AT_SYMLINK_NOFOLLOW,
+            )
             .unwrap();
         let slow = dispatcher
-            .path_stat_record(LINUX_AT_FDCWD, "/walk/file.txt", LINUX_AT_SYMLINK_NOFOLLOW)
+            .path_stat_record(
+                &dispatcher.exact_signal_context_for_test(),
+                LINUX_AT_FDCWD,
+                "/walk/file.txt",
+                LINUX_AT_SYMLINK_NOFOLLOW,
+            )
             .unwrap();
         assert_eq!(fast, slow, "trusted lower stat must equal layered stat");
         assert_eq!(fast.mode & 0o7777, 0o4711);
@@ -13099,8 +13246,14 @@ mod tests {
             .unwrap();
 
         for name in ["file.txt", "sub", "link", "fifo", "dev0"] {
-            let fast = dispatcher.path_stat_record(root as u64, name, LINUX_AT_SYMLINK_NOFOLLOW);
+            let fast = dispatcher.path_stat_record(
+                &dispatcher.exact_signal_context_for_test(),
+                root as u64,
+                name,
+                LINUX_AT_SYMLINK_NOFOLLOW,
+            );
             let slow = dispatcher.path_stat_record(
+                &dispatcher.exact_signal_context_for_test(),
                 LINUX_AT_FDCWD,
                 &format!("/walk/{name}"),
                 LINUX_AT_SYMLINK_NOFOLLOW,
@@ -13108,13 +13261,23 @@ mod tests {
             assert_eq!(fast, slow, "fast/slow stat divergence for {name:?}");
         }
         let dev = dispatcher
-            .path_stat_record(root as u64, "dev0", LINUX_AT_SYMLINK_NOFOLLOW)
+            .path_stat_record(
+                &dispatcher.exact_signal_context_for_test(),
+                root as u64,
+                "dev0",
+                LINUX_AT_SYMLINK_NOFOLLOW,
+            )
             .unwrap();
         assert_eq!(dev.mode & LINUX_S_IFMT, LINUX_S_IFCHR);
         assert_eq!(dev.rdev, 0x0103);
         // Missing child: authoritative ENOENT, identical to the slow path.
         assert_eq!(
-            dispatcher.path_stat_record(root as u64, "gone", 0),
+            dispatcher.path_stat_record(
+                &dispatcher.exact_signal_context_for_test(),
+                root as u64,
+                "gone",
+                0
+            ),
             Err(LINUX_ENOENT)
         );
     }
@@ -13257,11 +13420,21 @@ mod tests {
         // The fast STAT lane recovers S_IFSOCK from the marker xattr exactly
         // like the slow path.
         let fast = dispatcher
-            .path_stat_record(root as u64, "sock", LINUX_AT_SYMLINK_NOFOLLOW)
+            .path_stat_record(
+                &dispatcher.exact_signal_context_for_test(),
+                root as u64,
+                "sock",
+                LINUX_AT_SYMLINK_NOFOLLOW,
+            )
             .unwrap();
         assert_eq!(fast.mode & LINUX_S_IFMT, LINUX_S_IFSOCK);
         let slow = dispatcher
-            .path_stat_record(LINUX_AT_FDCWD, "/walk/sock", LINUX_AT_SYMLINK_NOFOLLOW)
+            .path_stat_record(
+                &dispatcher.exact_signal_context_for_test(),
+                LINUX_AT_FDCWD,
+                "/walk/sock",
+                LINUX_AT_SYMLINK_NOFOLLOW,
+            )
             .unwrap();
         assert_eq!(fast, slow);
     }
@@ -13333,7 +13506,11 @@ mod tests {
     #[test]
     fn dnotify_child_attrib_queues_parent_before_child() {
         let dispatcher = SyscallDispatcher::new();
-        let tid = crate::thread::ThreadId::main_from_host_pid();
+        let tid = dispatcher
+            .capture_one_task_context()
+            .unwrap()
+            .thread()
+            .registry_id();
         let signum = 34;
 
         let parent_fd = dispatcher
@@ -13370,14 +13547,25 @@ mod tests {
             )
             .unwrap();
 
-        dispatcher.dnotify_attrib("/watched/child");
+        dispatcher.dnotify_attrib(
+            &dispatcher.exact_signal_context_for_test(),
+            "/watched/child",
+        );
 
         assert_eq!(
-            sigpoll_fd(dispatcher.take_pending_siginfo(tid, signum).unwrap()),
+            sigpoll_fd(
+                dispatcher
+                    .take_pending_siginfo(&dispatcher.exact_signal_context_for_test(), tid, signum)
+                    .unwrap()
+            ),
             parent_fd
         );
         assert_eq!(
-            sigpoll_fd(dispatcher.take_pending_siginfo(tid, signum).unwrap()),
+            sigpoll_fd(
+                dispatcher
+                    .take_pending_siginfo(&dispatcher.exact_signal_context_for_test(), tid, signum)
+                    .unwrap()
+            ),
             child_fd
         );
     }
@@ -13385,7 +13573,11 @@ mod tests {
     #[test]
     fn dnotify_child_attrib_matches_macos_private_tmp_alias() {
         let dispatcher = SyscallDispatcher::new();
-        let tid = crate::thread::ThreadId::main_from_host_pid();
+        let tid = dispatcher
+            .capture_one_task_context()
+            .unwrap()
+            .thread()
+            .registry_id();
         let signum = 34;
 
         let parent_fd = dispatcher
@@ -13406,10 +13598,17 @@ mod tests {
             )
             .unwrap();
 
-        dispatcher.dnotify_attrib("/tmp/watched/child");
+        dispatcher.dnotify_attrib(
+            &dispatcher.exact_signal_context_for_test(),
+            "/tmp/watched/child",
+        );
 
         assert_eq!(
-            sigpoll_fd(dispatcher.take_pending_siginfo(tid, signum).unwrap()),
+            sigpoll_fd(
+                dispatcher
+                    .take_pending_siginfo(&dispatcher.exact_signal_context_for_test(), tid, signum)
+                    .unwrap()
+            ),
             parent_fd
         );
     }
@@ -13420,7 +13619,7 @@ mod tests {
         assert_eq!(unsafe { libc::pipe(host_fds.as_mut_ptr()) }, 0);
 
         let dispatcher = SyscallDispatcher::new();
-        let read_open = OpenFile::new(
+        let read_open = OpenFile::from_open_description(
             Arc::new(RwLock::new(OpenDescription::HostPipe {
                 host_fd: HostFdRef::new(host_fds[0]),
                 is_read_end: true,
@@ -13432,7 +13631,7 @@ mod tests {
             })),
             0,
         );
-        let write_open = OpenFile::new(
+        let write_open = OpenFile::from_open_description(
             Arc::new(RwLock::new(OpenDescription::HostPipe {
                 host_fd: HostFdRef::new(host_fds[1]),
                 is_read_end: false,
@@ -13480,7 +13679,7 @@ mod tests {
         assert!(host_fd >= 0, "open splice source");
 
         let dispatcher = SyscallDispatcher::new();
-        let source = OpenFile::new(
+        let source = OpenFile::from_open_description(
             Arc::new(RwLock::new(OpenDescription::HostFile {
                 host_fd: HostFdRef::new(host_fd),
                 metadata: RootFsMetadata {
@@ -13500,7 +13699,7 @@ mod tests {
 
         let mut host_pipe = [-1; 2];
         assert_eq!(unsafe { libc::pipe(host_pipe.as_mut_ptr()) }, 0);
-        let read_open = OpenFile::new(
+        let read_open = OpenFile::from_open_description(
             Arc::new(RwLock::new(OpenDescription::HostPipe {
                 host_fd: HostFdRef::new(host_pipe[0]),
                 is_read_end: true,
@@ -13512,7 +13711,7 @@ mod tests {
             })),
             0,
         );
-        let write_open = OpenFile::new(
+        let write_open = OpenFile::from_open_description(
             Arc::new(RwLock::new(OpenDescription::HostPipe {
                 host_fd: HostFdRef::new(host_pipe[1]),
                 is_read_end: false,
@@ -13614,7 +13813,13 @@ mod tests {
         fd_helpers::reset_open_fd_numbers_calls();
 
         let dispatcher = SyscallDispatcher::new();
-        let outcome = dispatcher.try_vfs_open("/tmp/not-a-vfs-mount", LINUX_O_RDWR, 0, 0);
+        let outcome = dispatcher.try_vfs_open(
+            &dispatcher.exact_signal_context_for_test(),
+            "/tmp/not-a-vfs-mount",
+            LINUX_O_RDWR,
+            0,
+            0,
+        );
 
         assert_eq!(outcome, VfsOpenAttempt::FallThrough);
         assert_eq!(
@@ -13641,7 +13846,14 @@ mod tests {
             LINUX_O_WRONLY | LINUX_O_TRUNC | LINUX_O_DIRECTORY,
         ] {
             let outcome = dispatcher
-                .open_at_path_string(LINUX_AT_FDCWD, "/bind/target", flags, 0, &reporter)
+                .open_at_path_string(
+                    &dispatcher.exact_signal_context_for_test(),
+                    LINUX_AT_FDCWD,
+                    "/bind/target",
+                    flags,
+                    0,
+                    &reporter,
+                )
                 .unwrap();
             assert_eq!(outcome, DispatchOutcome::errno(LINUX_ENOTDIR));
             assert_eq!(dispatcher.open_fd_numbers(), before);
@@ -13649,6 +13861,7 @@ mod tests {
         }
         let create = dispatcher
             .open_at_path_string(
+                &dispatcher.exact_signal_context_for_test(),
                 LINUX_AT_FDCWD,
                 "/bind/missing",
                 LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_DIRECTORY,
@@ -13662,6 +13875,7 @@ mod tests {
         assert!(matches!(
             dispatcher
                 .open_at_path_string(
+                    &dispatcher.exact_signal_context_for_test(),
                     LINUX_AT_FDCWD,
                     "/bind",
                     crate::linux_abi::LINUX_O_PATH | LINUX_O_DIRECTORY,
@@ -13685,7 +13899,10 @@ mod tests {
             offset: 0,
         }));
         let fd = dispatcher
-            .install_fd_at_or_above(3, OpenFile::new(std::sync::Arc::clone(&description), 0))
+            .install_fd_at_or_above(
+                3,
+                OpenFile::from_open_description(std::sync::Arc::clone(&description), 0),
+            )
             .expect("install sealable fd");
 
         let guard = dispatcher.begin_host_alias_dispatch();

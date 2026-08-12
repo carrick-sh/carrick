@@ -46,8 +46,12 @@ pub(crate) struct PreparedProcessExec {
 }
 
 impl PreparedProcessExec {
-    pub(crate) const fn old_mm_id(&self) -> crate::kernel::MmId {
+    pub(crate) fn old_mm_id(&self) -> crate::kernel::MmId {
         self.kernel.old_mm_id()
+    }
+
+    pub(crate) fn old_file_table(&self) -> std::sync::Arc<crate::kernel::FileTable> {
+        self.kernel.old_file_table()
     }
 
     pub(crate) fn replacement_mm_id(&self) -> crate::kernel::MmId {

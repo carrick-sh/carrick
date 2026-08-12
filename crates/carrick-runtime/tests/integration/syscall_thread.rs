@@ -506,20 +506,38 @@ fn tgkill_to_sibling_emits_signalthread() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
-    let registry = Arc::new(ThreadRegistry::new(test_tid(1000)));
+    let initial = dispatcher.capture_one_task_context().unwrap();
+    let main = initial.thread().registry_id();
+    let registry = Arc::new(ThreadRegistry::new(main));
     let futex = Arc::new(FutexTable::new());
     let sibling = registry.register_child(0);
-    // tgkill(tgid, tid=sibling, SIGUSR1) issued by the main thread (tid 1000).
+    let flags = carrick_abi::LinuxCloneFlags::VM
+        | carrick_abi::LinuxCloneFlags::FS
+        | carrick_abi::LinuxCloneFlags::FILES
+        | carrick_abi::LinuxCloneFlags::SIGHAND
+        | carrick_abi::LinuxCloneFlags::THREAD;
+    let plan = carrick_runtime::kernel::ClonePlan::from_flags(flags).unwrap();
+    let _started = initial
+        .kernel()
+        .reserve_thread_clone(&initial, plan, None)
+        .unwrap()
+        .prepare(sibling)
+        .unwrap()
+        .commit()
+        .unwrap()
+        .start_thread()
+        .unwrap();
+    let context = dispatcher.capture_one_task_context().unwrap();
     let outcome = dispatcher
         .dispatch_threaded(
-            &dispatcher.capture_one_task_context().unwrap(),
+            &context,
             SyscallRequest::new(
                 131,
-                SyscallArgs::from([1000, sibling.raw() as u64, SIGUSR1, 0, 0, 0]),
+                SyscallArgs::from([main.raw() as u64, sibling.raw() as u64, SIGUSR1, 0, 0, 0]),
             ),
             &mut memory,
             &reporter,
-            test_tid(1000),
+            main,
             &registry,
             &futex,
         )
@@ -528,7 +546,7 @@ fn tgkill_to_sibling_emits_signalthread() {
         outcome,
         DispatchOutcome::SignalThread {
             tid: sibling,
-            signum: SIGUSR1 as i32,
+            signum: SIGUSR1 as i32
         }
     );
 }
@@ -538,34 +556,55 @@ fn tgkill_to_sibling_queues_si_tkill_siginfo() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
-    let registry = Arc::new(ThreadRegistry::new(test_tid(1000)));
+    let initial = dispatcher.capture_one_task_context().unwrap();
+    let main = initial.thread().registry_id();
+    let registry = Arc::new(ThreadRegistry::new(main));
     let futex = Arc::new(FutexTable::new());
     let sibling = registry.register_child(0);
-
+    let flags = carrick_abi::LinuxCloneFlags::VM
+        | carrick_abi::LinuxCloneFlags::FS
+        | carrick_abi::LinuxCloneFlags::FILES
+        | carrick_abi::LinuxCloneFlags::SIGHAND
+        | carrick_abi::LinuxCloneFlags::THREAD;
+    let plan = carrick_runtime::kernel::ClonePlan::from_flags(flags).unwrap();
+    let _started = initial
+        .kernel()
+        .reserve_thread_clone(&initial, plan, None)
+        .unwrap()
+        .prepare(sibling)
+        .unwrap()
+        .commit()
+        .unwrap()
+        .start_thread()
+        .unwrap();
+    let context = dispatcher.capture_one_task_context().unwrap();
     let outcome = dispatcher
         .dispatch_threaded(
-            &dispatcher.capture_one_task_context().unwrap(),
+            &context,
             SyscallRequest::new(
                 131,
-                SyscallArgs::from([1000, sibling.raw() as u64, SIGUSR1, 0, 0, 0]),
+                SyscallArgs::from([main.raw() as u64, sibling.raw() as u64, SIGUSR1, 0, 0, 0]),
             ),
             &mut memory,
             &reporter,
-            test_tid(1000),
+            main,
             &registry,
             &futex,
         )
         .unwrap();
-
     assert_eq!(
         outcome,
         DispatchOutcome::SignalThread {
             tid: sibling,
-            signum: SIGUSR1 as i32,
+            signum: SIGUSR1 as i32
         }
     );
     let info = dispatcher
-        .take_pending_siginfo(sibling, SIGUSR1 as i32)
+        .take_pending_siginfo(
+            &dispatcher.capture_one_task_context().unwrap(),
+            sibling,
+            SIGUSR1 as i32,
+        )
         .expect("tgkill should queue SI_TKILL siginfo for the target thread");
     assert_eq!(read_siginfo_i32(&info, 0), SIGUSR1 as i32);
     assert_eq!(read_siginfo_i32(&info, 8), LINUX_SI_TKILL);
@@ -582,17 +621,20 @@ fn tgkill_to_self_raises_locally() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
-    let registry = Arc::new(ThreadRegistry::new(test_tid(1000)));
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let main = context.thread().registry_id();
+    let registry = Arc::new(ThreadRegistry::new(main));
     let futex = Arc::new(FutexTable::new());
-    // Targeting our own tid is a local raise, not a cross-thread kick and not
-    // process-directed: a sibling must not be able to drain it.
     let outcome = dispatcher
         .dispatch_threaded(
-            &dispatcher.capture_one_task_context().unwrap(),
-            SyscallRequest::new(131, SyscallArgs::from([1000, 1000, SIGUSR1, 0, 0, 0])),
+            &context,
+            SyscallRequest::new(
+                131,
+                SyscallArgs::from([main.raw() as u64, main.raw() as u64, SIGUSR1, 0, 0, 0]),
+            ),
             &mut memory,
             &reporter,
-            test_tid(1000),
+            main,
             &registry,
             &futex,
         )
@@ -600,7 +642,7 @@ fn tgkill_to_self_raises_locally() {
     assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
     assert_eq!(carrick_runtime::host_signal::take_pending_for(2000), 0);
     assert_eq!(
-        carrick_runtime::host_signal::take_pending_for(1000),
+        carrick_runtime::host_signal::take_pending_for(main.raw()),
         SIGUSR1 as i32
     );
     assert_eq!(carrick_runtime::host_signal::take_pending(), 0);
@@ -611,9 +653,29 @@ fn tgkill_to_masked_sibling_queues_without_signalthread() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x2000]);
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
-    let registry = Arc::new(ThreadRegistry::new(test_tid(1000)));
+    let initial = dispatcher.capture_one_task_context().unwrap();
+    let main = initial.thread().registry_id();
+    let registry = Arc::new(ThreadRegistry::new(main));
     let futex = Arc::new(FutexTable::new());
     let sibling = registry.register_child(0);
+    let flags = carrick_abi::LinuxCloneFlags::VM
+        | carrick_abi::LinuxCloneFlags::FS
+        | carrick_abi::LinuxCloneFlags::FILES
+        | carrick_abi::LinuxCloneFlags::SIGHAND
+        | carrick_abi::LinuxCloneFlags::THREAD;
+    let plan = carrick_runtime::kernel::ClonePlan::from_flags(flags).unwrap();
+    let sibling_context = initial
+        .kernel()
+        .reserve_thread_clone(&initial, plan, None)
+        .unwrap()
+        .prepare(sibling)
+        .unwrap()
+        .commit()
+        .unwrap()
+        .start_thread()
+        .unwrap()
+        .into_context();
+    let parent_context = dispatcher.capture_one_task_context().unwrap();
 
     memory
         .write_bytes(0x10000, &(1_u64 << (SIGUSR1 as i32 - 1)).to_le_bytes())
@@ -621,7 +683,7 @@ fn tgkill_to_masked_sibling_queues_without_signalthread() {
     assert_eq!(
         dispatcher
             .dispatch_threaded(
-                &dispatcher.capture_one_task_context().unwrap(),
+                &sibling_context,
                 SyscallRequest::new(
                     135,
                     SyscallArgs::from([LINUX_SIG_BLOCK, 0x10000, 0, 8, 0, 0])
@@ -638,27 +700,31 @@ fn tgkill_to_masked_sibling_queues_without_signalthread() {
 
     let outcome = dispatcher
         .dispatch_threaded(
-            &dispatcher.capture_one_task_context().unwrap(),
+            &parent_context,
             SyscallRequest::new(
                 131,
-                SyscallArgs::from([1000, sibling.raw() as u64, SIGUSR1, 0, 0, 0]),
+                SyscallArgs::from([main.raw() as u64, sibling.raw() as u64, SIGUSR1, 0, 0, 0]),
             ),
             &mut memory,
             &reporter,
-            test_tid(1000),
+            main,
             &registry,
             &futex,
         )
         .unwrap();
     assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
-    assert_eq!(dispatcher.take_deliverable_pending(sibling), None);
+    assert_eq!(
+        dispatcher
+            .take_deliverable_pending(&dispatcher.capture_one_task_context().unwrap(), sibling),
+        None
+    );
     assert_eq!(
         dispatcher
             .dispatch_threaded(
-                &dispatcher.capture_one_task_context().unwrap(),
+                &sibling_context,
                 SyscallRequest::new(
                     135,
-                    SyscallArgs::from([LINUX_SIG_UNBLOCK, 0x10000, 0, 8, 0, 0]),
+                    SyscallArgs::from([LINUX_SIG_UNBLOCK, 0x10000, 0, 8, 0, 0])
                 ),
                 &mut memory,
                 &reporter,
@@ -670,7 +736,8 @@ fn tgkill_to_masked_sibling_queues_without_signalthread() {
         DispatchOutcome::Returned { value: 0 }
     );
     assert_eq!(
-        dispatcher.take_deliverable_pending(sibling),
+        dispatcher
+            .take_deliverable_pending(&dispatcher.capture_one_task_context().unwrap(), sibling),
         Some(SIGUSR1 as i32)
     );
 }

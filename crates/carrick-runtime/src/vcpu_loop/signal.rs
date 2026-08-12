@@ -45,6 +45,7 @@ pub(crate) fn signal_wait_remaining(
 
 pub(crate) fn raise_sigpipe_for_blocking_write(
     dispatcher: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
     write: &crate::dispatch::BlockingHostWrite,
     outcome: DispatchOutcome,
 ) -> DispatchOutcome {
@@ -55,9 +56,9 @@ pub(crate) fn raise_sigpipe_for_blocking_write(
                 errno: crate::linux_abi::LINUX_EPIPE
             }
         )
-        && !dispatcher.signal_is_ignored(crate::linux_abi::LINUX_SIGPIPE)
+        && !dispatcher.signal_is_ignored(context, crate::linux_abi::LINUX_SIGPIPE)
     {
-        dispatcher.mark_signal_pending(write.tid(), crate::linux_abi::LINUX_SIGPIPE);
+        dispatcher.mark_signal_pending(context, write.tid(), crate::linux_abi::LINUX_SIGPIPE);
     }
     outcome
 }
@@ -174,6 +175,7 @@ pub(crate) enum FaultSignalDisposition {
 pub(crate) fn inject_fault_signal<T: SyscallTrap>(
     trap: &mut T,
     dispatcher: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
     this_tid: ThreadId,
     signum: i32,
     si_code: i32,
@@ -183,8 +185,8 @@ pub(crate) fn inject_fault_signal<T: SyscallTrap>(
     crate::probes::signal_deliver(this_tid.raw(), signum);
     crate::exec_helpers::stop_for_debug_signal(signum);
 
-    let action = dispatcher.registered_signal_handler(signum);
-    if dispatcher.signal_blocked(this_tid, signum) || action.is_none() {
+    let action = dispatcher.registered_signal_handler(context, signum);
+    if dispatcher.signal_blocked(context, this_tid, signum) || action.is_none() {
         return Ok(FaultSignalDisposition::Terminate(signum));
     }
     // INVARIANT: the `action.is_none()` arm above returned, so this is `Some`.
@@ -196,12 +198,12 @@ pub(crate) fn inject_fault_signal<T: SyscallTrap>(
         0
     };
     let altstack = if action.sa_flags & crate::linux_abi::LINUX_SA_ONSTACK != 0 {
-        dispatcher.signal_altstack(this_tid)
+        dispatcher.signal_altstack(context, this_tid)
     } else {
         None
     };
     let saved_sigmask = dispatcher
-        .enter_signal_handler(this_tid, signum, action)
+        .enter_signal_handler(context, this_tid, signum, action)
         .raw();
     match trap.inject_signal(
         signum,
@@ -234,6 +236,7 @@ pub(crate) fn inject_fault_signal<T: SyscallTrap>(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
     kernel: &Kernel,
+    context: &crate::kernel::KernelContext,
     engine: &mut E,
     this_tid: ThreadId,
     mut signum: i32,
@@ -299,6 +302,7 @@ pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
     match inject_fault_signal(
         engine,
         dispatcher,
+        context,
         this_tid,
         signum,
         si_code,
@@ -356,6 +360,7 @@ pub(crate) fn signal_progress_count() -> u64 {
 pub(crate) fn deliver_pending_signal<T>(
     trap: &mut T,
     dispatcher: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
     last_syscall_retval: Option<i64>,
     tid: ThreadId,
     interrupted_pc: Option<u64>,
@@ -365,27 +370,24 @@ where
 {
     // Drain the cross-process explicit-signal ring into pending state, so the
     // normal delivery below runs each with the sender's identity.
-    dispatcher.drain_xsignals_process_directed();
+    dispatcher.drain_xsignals_process_directed(context);
 
     let pending = crate::host_signal::take_pending_for(tid.raw());
-    // Provenance of the taken signal (see take_pending_in_from): a host-slot
-    // delivery is thread-directed; only a shared-set take may consume the
-    // PROCESS-directed siginfo queue below.
-    let (pending, from_shared) = if pending == 0 {
-        // Nothing newly arrived in the host slot. Deliver the next signal that was
-        // raised while blocked and has since been unblocked.
-        match dispatcher.take_deliverable_pending_from(tid) {
-            Some((s, from_thread)) => (s, !from_thread),
+    // A dispatcher dequeue returns owner and payload atomically. A host-slot
+    // signal remains thread-directed and consumes its per-thread payload below.
+    let (pending, dequeued_siginfo, from_dispatcher) = if pending == 0 {
+        match dispatcher.take_deliverable_pending_from(context, tid) {
+            Some(pending) => (pending.signum, pending.siginfo, true),
             None => return Ok(None),
         }
     } else {
-        (pending, false)
+        (pending, None, false)
     };
     crate::probes::signal_deliver(tid.raw(), pending);
     // A blocked signal must not be delivered — hold it pending until the guest
     // unblocks it.
-    if dispatcher.signal_blocked(tid, pending) {
-        dispatcher.mark_signal_pending(tid, pending);
+    if dispatcher.signal_blocked(context, tid, pending) {
+        dispatcher.mark_signal_pending(context, tid, pending);
         return Ok(Some(PendingSignalAction::ignored()));
     }
     if crate::exec_helpers::stop_for_ptrace_signal(dispatcher, pending) {
@@ -393,9 +395,9 @@ where
     }
     crate::exec_helpers::stop_for_debug_signal(pending);
     let action = dispatcher
-        .take_pending_signal_action(tid, pending)
-        .or_else(|| dispatcher.registered_signal_handler(pending));
-    if action.is_none() && dispatcher.signal_is_ignored(pending) {
+        .take_pending_signal_action(context, tid, pending)
+        .or_else(|| dispatcher.registered_signal_handler(context, pending));
+    if action.is_none() && dispatcher.signal_is_ignored(context, pending) {
         return Ok(Some(PendingSignalAction::ignored()));
     }
     match action {
@@ -413,7 +415,7 @@ where
             // SA_ONSTACK: run the handler on the alternate signal stack if one is
             // installed.
             let altstack = if action.sa_flags & crate::linux_abi::LINUX_SA_ONSTACK != 0 {
-                dispatcher.signal_altstack(tid)
+                dispatcher.signal_altstack(context, tid)
             } else {
                 None
             };
@@ -425,50 +427,52 @@ where
                 && action.sa_flags & crate::linux_abi::LINUX_SA_RESTART != 0
                 && trap.last_syscall_nr().is_some_and(is_restartable_syscall);
             // Wire form for the sigframe build (see the synchronous-fault arm).
-            let saved_sigmask = dispatcher.enter_signal_handler(tid, pending, action).raw();
+            let saved_sigmask = dispatcher
+                .enter_signal_handler(context, tid, pending, action)
+                .raw();
             // If rt_sigqueueinfo queued a caller-supplied siginfo for this (tid,
-            // signum), pop it now and hand it to inject_signal. Failing that,
-            // synthesise an SI_USER siginfo with the sender's ns-pid.
-            // Provenance-gated: a shared-set take reads the PROCESS-directed
-            // queue; a host-slot/per-thread take reads the per-tid queue only.
-            let queued_siginfo = if from_shared {
-                dispatcher.take_process_pending_siginfo(pending)
-            } else {
-                dispatcher.take_pending_siginfo(tid, pending)
-            }
-            .or_else(|| {
-                crate::host_signal::take_child_exit_siginfo(tid.raw(), pending).map(|info| {
-                    const CLD_EXITED: i32 = 1;
-                    let ns_pid =
-                        crate::namespace::pid::host_to_ns_or_self(info.host_pid as u32) as i32;
-                    let linux_status = if info.si_code == CLD_EXITED {
-                        info.host_status
-                    } else {
-                        crate::host_signal::host_to_linux_signum(info.host_status)
-                    };
-                    crate::linux_abi::LinuxSiginfo::child_exit(
-                        pending,
-                        ns_pid,
-                        info.host_uid,
-                        info.si_code,
-                        linux_status,
-                    )
+            // signum), hand it to inject_signal. Dispatcher-owned pending
+            // dequeues already carried the exact payload; host-slot delivery
+            // consumes only the matching per-thread queue.
+            let queued_siginfo = dequeued_siginfo
+                .or_else(|| {
+                    (!from_dispatcher)
+                        .then(|| dispatcher.take_pending_siginfo(context, tid, pending))
+                        .flatten()
                 })
-            })
-            .or_else(|| {
-                let sender_host = crate::host_signal::last_sender_for(pending);
-                (sender_host > 0).then(|| {
-                    let ns_pid =
-                        crate::namespace::pid::host_to_ns_or_self(sender_host as u32) as i32;
-                    let uid = crate::cred_ipc::read_target(sender_host).unwrap_or(0);
-                    crate::linux_abi::LinuxSiginfo::kill(
-                        pending,
-                        crate::linux_abi::LINUX_SI_USER,
-                        ns_pid,
-                        uid,
-                    )
+                .or_else(|| {
+                    crate::host_signal::take_child_exit_siginfo(tid.raw(), pending).map(|info| {
+                        const CLD_EXITED: i32 = 1;
+                        let ns_pid =
+                            crate::namespace::pid::host_to_ns_or_self(info.host_pid as u32) as i32;
+                        let linux_status = if info.si_code == CLD_EXITED {
+                            info.host_status
+                        } else {
+                            crate::host_signal::host_to_linux_signum(info.host_status)
+                        };
+                        crate::linux_abi::LinuxSiginfo::child_exit(
+                            pending,
+                            ns_pid,
+                            info.host_uid,
+                            info.si_code,
+                            linux_status,
+                        )
+                    })
                 })
-            });
+                .or_else(|| {
+                    let sender_host = crate::host_signal::last_sender_for(pending);
+                    (sender_host > 0).then(|| {
+                        let ns_pid =
+                            crate::namespace::pid::host_to_ns_or_self(sender_host as u32) as i32;
+                        let uid = crate::cred_ipc::read_target(sender_host).unwrap_or(0);
+                        crate::linux_abi::LinuxSiginfo::kill(
+                            pending,
+                            crate::linux_abi::LINUX_SI_USER,
+                            ns_pid,
+                            uid,
+                        )
+                    })
+                });
             match trap.inject_signal(
                 pending,
                 action.sa_handler,
@@ -588,9 +592,22 @@ mod tests {
                 unsafe { libc::_exit(70) };
             }
             let tid = ThreadId::main_from_host_pid();
-            dispatcher.mark_signal_pending(tid, crate::linux_abi::LINUX_SIGUSR2);
+            dispatcher.mark_signal_pending(
+                &dispatcher.exact_signal_context_for_test(),
+                tid,
+                crate::linux_abi::LINUX_SIGUSR2,
+            );
             let mut trap = NoopTrap;
-            if deliver_pending_signal(&mut trap, &dispatcher, None, tid, None).is_err() {
+            if deliver_pending_signal(
+                &mut trap,
+                &dispatcher,
+                &dispatcher.exact_signal_context_for_test(),
+                None,
+                tid,
+                None,
+            )
+            .is_err()
+            {
                 unsafe { libc::_exit(71) };
             }
             unsafe { libc::_exit(42) };
@@ -632,9 +649,20 @@ mod tests {
             let dispatcher = SyscallDispatcher::new();
             dispatcher.set_ptrace_traceme_for_test();
             let tid = ThreadId::main_from_host_pid();
-            dispatcher.mark_signal_pending(tid, crate::linux_abi::LINUX_SIGKILL);
+            dispatcher.mark_signal_pending(
+                &dispatcher.exact_signal_context_for_test(),
+                tid,
+                crate::linux_abi::LINUX_SIGKILL,
+            );
             let mut trap = NoopTrap;
-            let _ = deliver_pending_signal(&mut trap, &dispatcher, None, tid, None);
+            let _ = deliver_pending_signal(
+                &mut trap,
+                &dispatcher,
+                &dispatcher.exact_signal_context_for_test(),
+                None,
+                tid,
+                None,
+            );
             unsafe { libc::_exit(70) };
         }
 

@@ -3,14 +3,13 @@
 //! Linux distinguishes two layers: the per-process *fd table* (numbers → open
 //! file descriptions) and the *open file descriptions* themselves (the seekable
 //! cursor, status flags, and backing object that `dup`/`fork`/`fork`+`exec`
-//! share). carrick mirrors that split. The fd table is
-//! `IoState::open_files: HashMap<i32, OpenFile>` (see `fs/state.rs`); each
-//! [`OpenFile`] holds its per-*fd* `FD_CLOEXEC` flag plus an
-//! `Arc<RwLock<OpenDescription>>` — the shared open-file-description. Because the
-//! description is behind an `Arc`, two fds produced by `dup(2)` see one cursor,
-//! one set of status flags, one lease, one async-I/O owner — exactly as the
-//! kernel keeps them on the description, not the fd. `OpenDescriptionBase`
-//! carries that shared per-description state.
+//! share). Carrick mirrors that split in the authoritative Kernel
+//! [`crate::kernel::FileTable`]. Each [`OpenFile`] (`FileSlot`) holds its
+//! per-descriptor flags plus an `Arc<FileDescription>` with stable identity;
+//! that Kernel description owns the opaque dispatch backing containing the
+//! shared cursor, status flags, lease, and async-I/O owner. A draining identity
+//! shell remains snapshot-visible after its last functional backing resource is
+//! closed.
 //!
 //! # `OpenDescription`: one union over every backing object
 //!
@@ -44,11 +43,12 @@
 
 use crate::linux_abi::LinuxErrno;
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::{Condvar, Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::linux_abi::{
     LINUX_EFBIG, LINUX_S_IFCHR, LINUX_S_IFIFO, LINUX_S_IFMT, LINUX_S_IFREG, LINUX_S_IFSOCK,
@@ -65,7 +65,7 @@ pub(super) struct EpollInterest {
     /// tables: the same numeric fd can later name a different description in a
     /// child, whose close must not auto-remove the parent's shared epoll entry.
     /// Bare inherited stdio has no table-backed description and remains `None`.
-    pub(super) target: Option<OpenDescriptionRef>,
+    pub(super) target: Option<Arc<crate::kernel::FileDescription>>,
     pub(super) event: LinuxEpollEvent,
     /// Readiness bits already REPORTED to the guest for this registration. The
     /// software EPOLLET latch: `raw & !last_ready` is the edge. Cleared on
@@ -549,6 +549,7 @@ pub(crate) struct NativeReexecFdV1 {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum NativeReexecDescriptionV1 {
     Pipe {
+        stable_id: u64,
         host_fd: i32,
         original_host_fd_flags: i32,
         host_device: u64,
@@ -562,6 +563,7 @@ pub(crate) enum NativeReexecDescriptionV1 {
         write_kind: HostWriteKind,
     },
     File {
+        stable_id: u64,
         host_fd: i32,
         original_host_fd_flags: i32,
         host_device: u64,
@@ -574,6 +576,7 @@ pub(crate) enum NativeReexecDescriptionV1 {
         writable: bool,
     },
     Socket {
+        stable_id: u64,
         host_fd: i32,
         original_host_fd_flags: i32,
         host_device: u64,
@@ -584,13 +587,35 @@ pub(crate) enum NativeReexecDescriptionV1 {
         type_: i32,
         protocol: i32,
     },
+    IoUring {
+        stable_id: u64,
+        data_fd: i32,
+        data_fd_flags: i32,
+        data_identity: crate::dispatch::ioring::HostBackingIdentity,
+        lock_fd: i32,
+        lock_fd_flags: i32,
+        lock_identity: crate::dispatch::ioring::HostBackingIdentity,
+        layout: crate::dispatch::ioring::IoUringLayoutSnapshot,
+        status_flags: u64,
+    },
+}
+
+impl NativeReexecDescriptionV1 {
+    pub(crate) const fn stable_id(&self) -> u64 {
+        match self {
+            Self::Pipe { stable_id, .. }
+            | Self::File { stable_id, .. }
+            | Self::Socket { stable_id, .. }
+            | Self::IoUring { stable_id, .. } => *stable_id,
+        }
+    }
 }
 
 impl NativeReexecFdTableV1 {
     pub(crate) fn survivor_host_fds(&self) -> Vec<(i32, i32)> {
         self.descriptions
             .iter()
-            .map(|description| match description {
+            .flat_map(|description| match description {
                 NativeReexecDescriptionV1::Pipe {
                     host_fd,
                     original_host_fd_flags,
@@ -605,7 +630,14 @@ impl NativeReexecFdTableV1 {
                     host_fd,
                     original_host_fd_flags,
                     ..
-                } => (*host_fd, *original_host_fd_flags),
+                } => vec![(*host_fd, *original_host_fd_flags)],
+                NativeReexecDescriptionV1::IoUring {
+                    data_fd,
+                    data_fd_flags,
+                    lock_fd,
+                    lock_fd_flags,
+                    ..
+                } => vec![(*data_fd, *data_fd_flags), (*lock_fd, *lock_fd_flags)],
             })
             .collect()
     }
@@ -910,6 +942,10 @@ impl TrustedHostDir {
 
 #[derive(Debug, Clone)]
 pub(super) enum OpenDescription {
+    /// Observable identity shell retained after the last functional fd slot
+    /// closes. All host descriptors and subsystem resources have already been
+    /// dropped; only immutable snapshot classification remains.
+    Closed { was_epoll: bool },
     File {
         base: OpenDescriptionBase,
         path: String,
@@ -1184,18 +1220,31 @@ impl HostFdRef {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct OpenFile {
-    pub(super) description: OpenDescriptionRef,
-    pub(super) fd_flags: u64,
+pub(crate) type OpenFile = crate::kernel::FileSlot;
+
+pub(super) fn kernel_file_description(
+    description: OpenDescriptionRef,
+) -> Arc<crate::kernel::FileDescription> {
+    Arc::new(
+        crate::kernel::FileDescription::concrete(description).unwrap_or_else(|error| {
+            tracing::error!(%error, "file-description identity allocation failed");
+            std::process::abort();
+        }),
+    )
 }
 
-impl OpenFile {
-    pub(super) fn new(description: OpenDescriptionRef, fd_flags: u64) -> Self {
-        Self {
-            description,
-            fd_flags,
-        }
+pub(super) fn restored_kernel_file_description(
+    stable_id: u64,
+    description: OpenDescriptionRef,
+) -> Result<Arc<crate::kernel::FileDescription>, String> {
+    crate::kernel::FileDescription::concrete_restored(stable_id, description)
+        .map(Arc::new)
+        .map_err(|error| format!("restore file-description identity {stable_id}: {error}"))
+}
+
+impl crate::kernel::FileSlot {
+    pub(super) fn from_open_description(description: OpenDescriptionRef, fd_flags: u64) -> Self {
+        Self::new(kernel_file_description(description), fd_flags)
     }
 }
 
@@ -1217,6 +1266,7 @@ impl OpenDescription {
     #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
     pub(super) fn reexec_kind_name(&self) -> &'static str {
         match self {
+            Self::Closed { .. } => "closed",
             Self::File { .. } => "file",
             Self::Directory { .. } => "directory",
             Self::SyntheticFile { .. } => "synthetic_file",
@@ -1263,6 +1313,7 @@ impl OpenDescription {
     /// empty string, breaking 'are we piped?' and fd-introspection heuristics.
     pub(super) fn readlink_target(&self) -> Option<String> {
         let label = match self {
+            OpenDescription::Closed { .. } => return None,
             OpenDescription::File { .. }
             | OpenDescription::Directory { .. }
             | OpenDescription::SyntheticFile { .. }
@@ -1303,6 +1354,206 @@ impl OpenDescription {
 }
 
 pub(super) type OpenDescriptionRef = Arc<RwLock<OpenDescription>>;
+
+impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
+    fn is_epoll(&self) -> bool {
+        matches!(
+            &*self.read(),
+            OpenDescription::Epoll { .. } | OpenDescription::Closed { was_epoll: true }
+        )
+    }
+
+    fn snapshot_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Option<crate::kernel::FileDescriptionBackingSnapshot> {
+        use crate::kernel::FileDescriptionBackingKind as Kind;
+
+        let description = self.try_read_until(deadline)?;
+        let kind = match &*description {
+            OpenDescription::Closed { .. } => Kind::Closed,
+            OpenDescription::File { .. } => Kind::File,
+            OpenDescription::Directory { .. } => Kind::Directory,
+            OpenDescription::SyntheticFile { .. } => Kind::SyntheticFile,
+            OpenDescription::EventFd { .. } => Kind::EventFd,
+            OpenDescription::TimerFd { .. } => Kind::TimerFd,
+            OpenDescription::Epoll { .. } => Kind::Epoll,
+            OpenDescription::Pidfd { .. } => Kind::Pidfd,
+            OpenDescription::PipeReader { .. } => Kind::PipeReader,
+            OpenDescription::PipeWriter { .. } => Kind::PipeWriter,
+            OpenDescription::HostPipe { .. } => Kind::HostPipe,
+            OpenDescription::HostFile { .. } => Kind::HostFile,
+            OpenDescription::HostSocket { .. } => Kind::HostSocket,
+            OpenDescription::Inotify { .. } => Kind::Inotify,
+            OpenDescription::SignalFd { .. } => Kind::SignalFd,
+            OpenDescription::Netlink { .. } => Kind::Netlink,
+            OpenDescription::Mqueue { .. } => Kind::Mqueue,
+        };
+        let status_flags = (!matches!(&*description, OpenDescription::Closed { .. }))
+            .then(|| description.base().status_flags());
+        let offset = match &*description {
+            OpenDescription::File { offset, .. }
+            | OpenDescription::Directory { offset, .. }
+            | OpenDescription::SyntheticFile { offset, .. } => u64::try_from(*offset).ok(),
+            OpenDescription::HostFile { host_fd, .. } => super::fs::host_fd_offset(host_fd.view()),
+            _ => None,
+        };
+        let host_fd = match &*description {
+            OpenDescription::HostPipe { host_fd, .. }
+            | OpenDescription::HostFile { host_fd, .. }
+            | OpenDescription::HostSocket { host_fd, .. } => Some(host_fd.raw()),
+            _ => None,
+        };
+        let path = match &*description {
+            OpenDescription::File { path, .. }
+            | OpenDescription::Directory { path, .. }
+            | OpenDescription::SyntheticFile { path, .. } => Some(path.clone()),
+            OpenDescription::HostFile { metadata, .. } => {
+                Some(metadata.path.to_string_lossy().into_owned())
+            }
+            _ => None,
+        };
+        let pipe_id = match &*description {
+            OpenDescription::HostPipe { pipe_id, .. } => Some(*pipe_id),
+            _ => None,
+        };
+        let mut epoll_interests = match &*description {
+            OpenDescription::Epoll { interest, .. } => interest
+                .values()
+                .filter_map(|slot| slot.target.as_ref().map(|target| target.id()))
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        epoll_interests.sort_unstable();
+        epoll_interests.dedup();
+        Some(crate::kernel::FileDescriptionBackingSnapshot::Open(
+            crate::kernel::OpenDescriptionBackingSnapshot {
+                kind,
+                status_flags,
+                offset,
+                host_fd,
+                path,
+                pipe_id,
+                logical_fd_refs: if matches!(&*description, OpenDescription::Closed { .. }) {
+                    0
+                } else {
+                    description.fd_ref_count()
+                },
+                epoll_interests,
+            },
+        ))
+    }
+
+    fn epoll_wake_fd(&self) -> Option<i32> {
+        let description = self.read();
+        match &*description {
+            OpenDescription::Epoll { kqueue, .. } => Some(kqueue.wake_fd),
+            _ => None,
+        }
+    }
+
+    fn retain_fd_ref(&self) {
+        let description = self.read();
+        description.retain_fd_ref();
+        match &*description {
+            OpenDescription::PipeReader { pipe, .. } => {
+                let mut pipe = pipe.lock();
+                pipe.readers = pipe.readers.saturating_add(1);
+            }
+            OpenDescription::PipeWriter { pipe, .. } => {
+                let mut pipe = pipe.lock();
+                pipe.writers = pipe.writers.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+
+    fn release_fd_ref(&self) {
+        let mut description = self.write();
+        let remaining = description.release_fd_ref();
+        match &*description {
+            OpenDescription::PipeReader { pipe, .. } => {
+                let mut pipe = pipe.lock();
+                pipe.readers = pipe.readers.saturating_sub(1);
+            }
+            OpenDescription::PipeWriter { pipe, .. } => {
+                let mut pipe = pipe.lock();
+                pipe.writers = pipe.writers.saturating_sub(1);
+            }
+            _ => {}
+        }
+        if remaining == 0 {
+            let was_epoll = matches!(&*description, OpenDescription::Epoll { .. });
+            *description = OpenDescription::Closed { was_epoll };
+        }
+    }
+
+    fn fd_ref_count(&self) -> usize {
+        let description = self.read();
+        match &*description {
+            OpenDescription::Closed { .. } => 0,
+            _ => description.fd_ref_count(),
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl crate::kernel::FileDescription {
+    fn open_description(&self) -> &RwLock<OpenDescription> {
+        if let Some(description) = self.concrete_backing::<RwLock<OpenDescription>>() {
+            return description;
+        }
+        if let Some(ring) = self.concrete_backing::<super::ioring::IoUringBacking>() {
+            return ring.open_metadata();
+        }
+        tracing::error!("model-only file description escaped into dispatch");
+        std::process::abort();
+    }
+
+    pub(super) fn read(&self) -> RwLockReadGuard<'_, OpenDescription> {
+        self.open_description().read()
+    }
+
+    pub(super) fn try_read(&self) -> Option<RwLockReadGuard<'_, OpenDescription>> {
+        self.open_description().try_read()
+    }
+
+    pub(super) fn write(&self) -> FileDescriptionWriteGuard<'_> {
+        FileDescriptionWriteGuard {
+            guard: self.open_description().write(),
+            description: self,
+        }
+    }
+}
+
+pub(super) struct FileDescriptionWriteGuard<'a> {
+    guard: RwLockWriteGuard<'a, OpenDescription>,
+    description: &'a crate::kernel::FileDescription,
+}
+
+impl Deref for FileDescriptionWriteGuard<'_> {
+    type Target = OpenDescription;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl DerefMut for FileDescriptionWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for FileDescriptionWriteGuard<'_> {
+    fn drop(&mut self) {
+        self.description.publish_mutation();
+    }
+}
+
 pub(super) type PipeRef = Arc<Mutex<PipeState>>;
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1472,6 +1723,10 @@ pub(super) enum OpenStatSource {
 impl OpenDescription {
     fn base(&self) -> &OpenDescriptionBase {
         match self {
+            OpenDescription::Closed { .. } => {
+                tracing::error!("closed file description has no functional base");
+                std::process::abort();
+            }
             OpenDescription::File { base, .. }
             | OpenDescription::Directory { base, .. }
             | OpenDescription::SyntheticFile { base, .. }
@@ -1493,6 +1748,10 @@ impl OpenDescription {
 
     fn base_mut(&mut self) -> &mut OpenDescriptionBase {
         match self {
+            OpenDescription::Closed { .. } => {
+                tracing::error!("closed file description has no functional base");
+                std::process::abort();
+            }
             OpenDescription::File { base, .. }
             | OpenDescription::Directory { base, .. }
             | OpenDescription::SyntheticFile { base, .. }
@@ -1518,12 +1777,16 @@ impl OpenDescription {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub(super) fn release_fd_ref(&self) {
+    pub(super) fn release_fd_ref(&self) -> usize {
         let previous = self
             .base()
             .fd_refs
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        debug_assert!(previous > 0, "logical fd reference count underflow");
+        if previous == 0 {
+            tracing::error!("logical fd reference count underflow");
+            std::process::abort();
+        }
+        previous - 1
     }
 
     pub(super) fn fd_ref_count(&self) -> usize {
@@ -1600,6 +1863,10 @@ impl OpenDescription {
 
     pub(super) fn stat_source(&self) -> OpenStatSource {
         match self {
+            OpenDescription::Closed { .. } => {
+                tracing::error!("closed file description escaped into fstat");
+                std::process::abort();
+            }
             OpenDescription::File { path, metadata, .. }
             | OpenDescription::Directory { path, metadata, .. } => OpenStatSource::PathRecord {
                 path: path.clone(),

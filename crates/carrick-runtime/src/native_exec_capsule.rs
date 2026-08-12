@@ -10,14 +10,14 @@ use sha2::{Digest, Sha256};
 
 const CAPSULE_MAGIC: [u8; 8] = *b"CRKNEXE\0";
 const CONSUMED_MAGIC: [u8; 8] = [0; 8];
-const CAPSULE_VERSION: u16 = 1;
+const CAPSULE_VERSION: u16 = 2;
 const HEADER_LEN: usize = 68;
 const MAX_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
 const MAX_VECTOR_ITEMS: usize = 4096;
 const MAX_ITEM_LEN: usize = 1024 * 1024;
 const MAX_PATH_LEN: usize = 4096;
 
-/// First schema carried by the native host-self-exec transport.
+/// Current schema carried by the native host-self-exec transport.
 ///
 /// Process, filesystem, and descriptor records are added to this typed payload
 /// as their snapshot APIs land. These launch fields are sufficient to prove the
@@ -204,10 +204,29 @@ pub(crate) struct NativeReexecXsigV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NativeReexecSignalActionV1 {
+    pub(crate) signum: i32,
+    pub(crate) handler: u64,
+    pub(crate) flags: u64,
+    pub(crate) restorer: u64,
+    pub(crate) mask: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NativeReexecPendingSignalV1 {
+    pub(crate) signum: i32,
+    pub(crate) siginfo: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct NativeReexecProcessStateV1 {
     pub(crate) credentials: NativeReexecCredentialsV1,
     pub(crate) supplementary_groups_override: Option<Vec<u32>>,
-    pub(crate) ignored_signals: u64,
+    pub(crate) signal_actions: Vec<NativeReexecSignalActionV1>,
+    pub(crate) thread_blocked_mask: u64,
+    pub(crate) thread_pending_signals: Vec<NativeReexecPendingSignalV1>,
+    pub(crate) thread_routed_siginfos: Vec<NativeReexecPendingSignalV1>,
+    pub(crate) task_pending_signals: Vec<NativeReexecPendingSignalV1>,
     pub(crate) nofile_soft: u64,
     pub(crate) rlimit_overrides: Vec<Option<NativeReexecRlimitV1>>,
     #[serde(default = "native_reexec_unconfined_seccomp_policy")]
@@ -310,6 +329,47 @@ impl NativeGuestExecV1 {
         {
             return Err(NativeExecCapsuleError::InvalidField("guest_exec"));
         }
+        if self.process_state.thread_blocked_mask
+            & (carrick_abi::SigSet::EMPTY
+                .with(crate::linux_abi::LINUX_SIGKILL)
+                .with(crate::linux_abi::LINUX_SIGSTOP)
+                .raw())
+            != 0
+        {
+            return Err(NativeExecCapsuleError::InvalidField("thread_blocked_mask"));
+        }
+        let mut action_signals = std::collections::HashSet::new();
+        for action in &self.process_state.signal_actions {
+            if !(1..=64).contains(&action.signum) || !action_signals.insert(action.signum) {
+                return Err(NativeExecCapsuleError::InvalidField("signal_actions"));
+            }
+        }
+        for pending in self
+            .process_state
+            .thread_pending_signals
+            .iter()
+            .chain(&self.process_state.thread_routed_siginfos)
+            .chain(&self.process_state.task_pending_signals)
+        {
+            if !(1..=64).contains(&pending.signum)
+                || pending
+                    .siginfo
+                    .as_ref()
+                    .is_some_and(|bytes| bytes.len() != carrick_abi::LINUX_SIGINFO_SIZE)
+            {
+                return Err(NativeExecCapsuleError::InvalidField("pending_signals"));
+            }
+        }
+        if self
+            .process_state
+            .thread_routed_siginfos
+            .iter()
+            .any(|pending| pending.siginfo.is_none())
+        {
+            return Err(NativeExecCapsuleError::InvalidField(
+                "thread_routed_siginfos",
+            ));
+        }
         let mut mount_points = std::collections::HashSet::new();
         for mount in &self.bind_mounts {
             if mount.mount_point.is_empty()
@@ -385,7 +445,7 @@ pub(crate) fn begin_guest_exec(
         .map_err(|error| anyhow::anyhow!("native guest exec rootfs is ineligible: {error:?}"))?;
     let lower_rootfs = dispatcher.native_lower_rootfs_reexec_authority();
     let fd_table = dispatcher
-        .snapshot_native_reexec_fd_table()
+        .snapshot_native_reexec_fd_table(kernel_context)
         .map_err(|error| anyhow::anyhow!("native guest exec fd table is ineligible: {error}"))?;
     let xsig = snapshot_xsig()?;
     let process_state = dispatcher.snapshot_native_reexec_process_state(kernel_context);
@@ -1386,7 +1446,17 @@ mod tests {
                         umask: 0o027,
                     },
                     supplementary_groups_override: Some(vec![9, 10]),
-                    ignored_signals: 1 << 12,
+                    signal_actions: vec![super::NativeReexecSignalActionV1 {
+                        signum: 13,
+                        handler: carrick_abi::LINUX_SIG_IGN,
+                        flags: 0,
+                        restorer: 0,
+                        mask: 0,
+                    }],
+                    thread_blocked_mask: 0,
+                    thread_pending_signals: Vec::new(),
+                    thread_routed_siginfos: Vec::new(),
+                    task_pending_signals: Vec::new(),
                     nofile_soft: 1024,
                     rlimit_overrides: vec![None; 16],
                     seccomp_policy: carrick_spec::SeccompPolicy::ContainerDefault,
@@ -1490,6 +1560,7 @@ mod tests {
             description_id: 0,
         }];
         guest.fd_table.descriptions = vec![NativeReexecDescriptionV1::File {
+            stable_id: 7,
             host_fd: survivor.as_raw_fd(),
             original_host_fd_flags: libc::FD_CLOEXEC,
             host_device: survivor_stat.st_dev as u64,
@@ -1984,6 +2055,39 @@ mod tests {
     }
 
     #[test]
+    fn capsule_rejects_invalid_kernel_signal_state() {
+        let mut payload = sample();
+        let process = &mut payload.guest_exec.as_mut().unwrap().process_state;
+        process.thread_blocked_mask = carrick_abi::SigSet::EMPTY
+            .with(crate::linux_abi::LINUX_SIGKILL)
+            .raw();
+        assert!(matches!(
+            payload.validate(),
+            Err(super::NativeExecCapsuleError::InvalidField(
+                "thread_blocked_mask"
+            ))
+        ));
+
+        let mut payload = sample();
+        payload
+            .guest_exec
+            .as_mut()
+            .unwrap()
+            .process_state
+            .thread_routed_siginfos
+            .push(super::NativeReexecPendingSignalV1 {
+                signum: 10,
+                siginfo: None,
+            });
+        assert!(matches!(
+            payload.validate(),
+            Err(super::NativeExecCapsuleError::InvalidField(
+                "thread_routed_siginfos"
+            ))
+        ));
+    }
+
+    #[test]
     fn capsule_rejects_previous_container_cache_translator_abi() {
         let cache = tempfile::tempdir().expect("cache directory");
         let directory = std::fs::File::open(cache.path()).expect("open cache directory");
@@ -2297,7 +2401,7 @@ mod tests {
         let file = tempfile::tempfile().expect("temporary capsule");
         let nonce = [0x5a; 16];
         write_capsule(file.as_raw_fd(), nonce, &sample()).expect("write capsule");
-        file.write_at(&2_u16.to_le_bytes(), 8)
+        file.write_at(&1_u16.to_le_bytes(), 8)
             .expect("replace version");
         assert!(read_capsule_once(file.as_raw_fd(), nonce).is_err());
 

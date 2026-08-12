@@ -45,6 +45,13 @@ impl RuntimePreparedExec {
         }
     }
 
+    fn old_file_table(&self) -> std::sync::Arc<crate::kernel::FileTable> {
+        match self {
+            Self::Hvpatch(prepared) => prepared.old_file_table(),
+            Self::Other(prepared) => prepared.old_file_table(),
+        }
+    }
+
     fn replacement_mm_id(&self) -> crate::kernel::MmId {
         match self {
             Self::Hvpatch(prepared) => prepared.replacement_mm_id(),
@@ -314,7 +321,9 @@ where
                 kernel
                     .dispatcher
                     .set_executable_identity(path.clone(), proc_argv, proc_env);
-                kernel.dispatcher.reset_signal_handlers_on_execve();
+                kernel
+                    .dispatcher
+                    .reset_signal_handlers_on_execve(kernel_context);
                 // Reset + refresh /proc/self/maps and /proc/self/auxv under one
                 // dispatcher memory-authority generation. The historical MM
                 // retains the pre-staging snapshot, but records this deliberate
@@ -331,12 +340,7 @@ where
                     carrick_observability::probes::HvpatchExecRuntimeStagePhase::ProcState,
                     proc_state_started,
                 );
-                let close_cloexec_started = std::time::Instant::now();
-                kernel.dispatcher.close_cloexec_fds();
-                emit_runtime_stage(
-                    carrick_observability::probes::HvpatchExecRuntimeStagePhase::CloseCloexec,
-                    close_cloexec_started,
-                );
+
                 // All hvpatch processes mutate stage-2 in one HVF VM. Keep
                 // process-local thread-group drain separate, but serialize the
                 // actual unmap/remap transaction across concurrent execs.
@@ -390,6 +394,7 @@ where
                         std::process::abort();
                     }
                 }
+                let old_files = prepared_kernel_exec.old_file_table();
                 let committed_context =
                     match (kernel.hvpatch_process.as_ref(), prepared_kernel_exec) {
                         (Some(process), RuntimePreparedExec::Hvpatch(prepared)) => {
@@ -428,6 +433,9 @@ where
                         std::process::abort();
                     }
                 };
+                kernel
+                    .dispatcher
+                    .close_draining_file_table(committed_context.kernel(), &old_files);
                 self.linux_tid = committed_context.thread().key().tid;
                 emit_runtime_stage(
                     carrick_observability::probes::HvpatchExecRuntimeStagePhase::EngineReplace,

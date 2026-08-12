@@ -6,8 +6,8 @@ use super::address::MmBackend;
 use super::core::{Kernel, KernelContext, RetiredThreadRecord, TaskRevision, VforkReleaseReason};
 use super::ids::{LinuxTid, MmId};
 use super::objects::{
-    ExecDrain, Mm, ObjectGraphError, PreparedThreadSet, TaskKey, TaskShared, ThreadKey, ThreadRef,
-    ThreadResources,
+    ExecDrain, FileTable, FileTableExecFreeze, Mm, ObjectGraphError, PreparedThreadSet, TaskKey,
+    TaskShared, ThreadKey, ThreadRef, ThreadResources,
 };
 use super::operations::KernelFailpoint;
 
@@ -79,9 +79,10 @@ pub struct PreparedExec {
     task: TaskKey,
     caller: ThreadKey,
     revision: TaskRevision,
-    old_mm: MmId,
+    old_mm: Arc<Mm>,
     shared: Arc<TaskShared>,
     resources: Arc<ThreadResources>,
+    _file_table_freeze: FileTableExecFreeze,
     old_caller: ThreadRef,
     replacement: ThreadRef,
     thread_set: PreparedThreadSet,
@@ -90,8 +91,12 @@ pub struct PreparedExec {
 impl PreparedExec {
     /// Exact currently published address-space identity captured by this
     /// preparation. Destructive backend retirement must be routed here.
-    pub const fn old_mm_id(&self) -> MmId {
-        self.old_mm
+    pub fn old_mm_id(&self) -> MmId {
+        self.old_mm.id()
+    }
+
+    pub(crate) fn old_file_table(&self) -> Arc<FileTable> {
+        self.old_caller.resources().files()
     }
 
     /// Exact unpublished replacement address-space identity allocated by the
@@ -202,6 +207,16 @@ impl Kernel {
         };
         check_exec_failpoint(failpoint, KernelFailpoint::AfterReserve)?;
 
+        // Stop every sibling before observing the shared file authority. A
+        // distinct task may still share that table through CLONE_FILES, so the
+        // table-wide freeze below supplies the cross-task exec linearization
+        // point and remains held through registry publication.
+        guard.drain = Some(context.task.drain_exec_siblings(context.thread.key()));
+        let caller_files = context.resources.files();
+        let file_table_freeze = caller_files
+            .freeze_for_exec()
+            .ok_or(ExecError::FileTableDraining)?;
+
         // Only the validated caller supplies exec survivors. K1 gives the new
         // image, staged file table, and caught-handler reset fresh identities;
         // fs context, credentials, and pending signals retain caller identity.
@@ -233,17 +248,16 @@ impl Kernel {
             .task
             .prepare_exec_thread_set(Arc::clone(&replacement))?;
         check_exec_failpoint(failpoint, KernelFailpoint::AfterObjects)?;
-
-        guard.drain = Some(context.task.drain_exec_siblings(context.thread.key()));
         check_exec_failpoint(failpoint, KernelFailpoint::AfterBackendPrepare)?;
         Ok(PreparedExec {
             guard,
             task: context.task.key(),
             caller: context.thread.key(),
             revision,
-            old_mm: context.shared.mm().id(),
+            old_mm: context.shared.mm(),
             shared,
             resources,
+            _file_table_freeze: file_table_freeze,
             old_caller: Arc::clone(&context.thread),
             replacement,
             thread_set,
@@ -255,6 +269,7 @@ impl Kernel {
         mut prepared: PreparedExec,
         failpoint: Option<KernelFailpoint>,
     ) -> Result<KernelContext, ExecError> {
+        let old_files = prepared.old_file_table();
         let Some(reservation) = prepared.guard.reservation.as_ref() else {
             return Err(ExecError::ReservationLost);
         };
@@ -359,6 +374,8 @@ impl Kernel {
         prepared.guard.commit_reservation();
         drop(state);
         drop(old_threads);
+        self.retire_file_table_after_exec(&old_files, &prepared.resources.files());
+        self.retire_mm_io_state_if_unreferenced(&prepared.old_mm);
         if let Some(release) = vfork_release {
             release.release(VforkReleaseReason::Exec);
         }
@@ -413,6 +430,8 @@ pub enum ExecError {
     TaskExited,
     #[error("exec reservation invariant was lost after sibling drain")]
     InvariantLostAfterDrain,
+    #[error("exec caller's file table is already draining")]
+    FileTableDraining,
     #[error("exec caller exited before commit")]
     CallerExited,
     #[error("prepared exec targets another task")]
@@ -437,7 +456,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use carrick_abi::{LinuxCloneFlags, SigSet};
+    use carrick_abi::{LinuxCloneFlags, LinuxSigaction, SigSet};
     use carrick_guest_mem::Gpa;
     use carrick_hal::ThreadId;
 
@@ -616,21 +635,27 @@ mod tests {
             .expect("sibling");
         let ignored = LinuxSignal::for_signal_number(2).expect("ignored signal");
         let caught = LinuxSignal::for_signal_number(3).expect("caught signal");
+        let mut ignored_action = LinuxSigaction::empty();
+        ignored_action.sa_handler = crate::linux_abi::LINUX_SIG_IGN;
         leader
             .shared
             .sighand()
-            .set_disposition(ignored, SignalDisposition::Ignore);
+            .install_action(ignored, ignored_action);
+        let mut caught_action = LinuxSigaction::empty();
+        caught_action.sa_handler = 0x3000;
         leader
             .shared
             .sighand()
-            .set_disposition(caught, SignalDisposition::Caught);
+            .install_action(caught, caught_action);
         let caller_signal_state = super::super::objects::ThreadSignalState::new(
             SigSet::EMPTY.with(4),
             SigSet::EMPTY.with(5),
             true,
             2,
         );
-        sibling.thread.replace_signal_state(caller_signal_state);
+        sibling
+            .thread
+            .replace_signal_state(caller_signal_state.clone());
         let surviving_description = Arc::new(FileDescription::regular(
             kernel
                 .object_ids()

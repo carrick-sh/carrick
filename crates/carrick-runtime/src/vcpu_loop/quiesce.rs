@@ -201,6 +201,13 @@ where
                 },
             );
         }
+        if let Some(reason) = crate::dispatch::SyscallDispatcher::host_fork_file_authority_rejection(
+            kernel_context,
+            flags,
+        ) {
+            tracing::warn!(flags, reason, "host-fork file authority rejected clone");
+            return Ok(Some(crate::linux_abi::LINUX_EOPNOTSUPP.guest_retval()));
+        }
         // vfork (CLONE_VM|CLONE_VFORK): the child SHARES the parent's guest RAM
         // (engine.fork_vfork() below) and the parent vCPU is SUSPENDED here until
         // the child execve's or exits (Parent arm below). An ordinary fork keeps
@@ -397,12 +404,11 @@ where
 
         // Drain in-flight EXIT CLEANUPS before forking. An exiting thread drops
         // out of the kicker (so the quiesce above stops counting it) and THEN
-        // mutates process-global state — host_signal::forget_thread and the
-        // dispatcher's forget_thread_signal_state — under process-wide mutexes.
+        // mutates process-global host-signal state under a process-wide mutex.
         // `libc::fork` landing inside that window hands the child a mutex held
         // by a thread that does not exist in it: the child deadlocks on its
         // first touch (observed live on KVM: a vfork child of go-os_exec's
-        // TestConcurrentExec wedged forever in `migrate_thread_signal_state` →
+        // TestConcurrentExec wedged forever in inherited signal-state cleanup →
         // parking_lot `lock_slow`, surfacing as "vfork parent-suspend timed
         // out"). The cleanups are short, straight-line, and NEVER block on fork
         // state (the gate is a plain atomic count), so this wait is microseconds;
@@ -610,282 +616,278 @@ where
             }
         }
 
-        let retval = match fork_outcome {
-            crate::trap::ForkOutcome::Parent { child_pid } => {
-                let runtime_repair_start = std::time::Instant::now();
-                // Publish the rebuilt VM so quiesced siblings recreate their vCPUs
-                // in it, THEN resume them.
-                if quiesced {
-                    engine.publish_vm_for_siblings()?;
-                    fork_barrier().end_quiesce();
-                }
-                fork_barrier().end_fork();
-                let child_exit_needs_signal_pump = kernel
-                    .dispatcher
-                    .child_exit_signal_needs_pump(self.this_tid, exit_signal);
-                kernel.fork.restart_after_parent_fork(
-                    prepared_fork,
-                    &self.kicker,
-                    &self.platform_futex,
-                    child_exit_needs_signal_pump,
-                );
-                // engine.fork() rebuilt this thread's own vCPU, so its old kicker
-                // handle is stale. Re-register the new one (under the topology lock
-                // we still hold).
-                self.register_vcpu(engine);
-                if child_exit_needs_signal_pump {
-                    // Watch the child's exit (EVFILT_PROC/NOTE_EXIT) so the signal
-                    // pump delivers the requested signal to this (parent) tid when
-                    // it exits.
-                    crate::host_signal::register_child_exit_watch(
-                        child_pid,
-                        self.this_tid.raw(),
-                        i32::try_from(exit_signal).unwrap_or(crate::linux_abi::LINUX_SIGCHLD),
-                    );
-                }
-                crate::event_ring::rec(crate::event_ring::FORK, child_pid, 0, 0);
-                // By REF, not via the global stash: end_fork() above released
-                // fork serialization, so another thread's prepare may already
-                // have overwritten the stash (its publish would then stamp OUR
-                // child pid into THAT record — crossed ns-pids).
-                crate::guest_cpu::publish_prepared_child_record_parent_ref(
-                    prepared_child_record,
-                    child_pid as u32,
-                );
-                crate::namespace::pid::notify_child_registered();
-                // Seed the child's published run-state as Booting NOW, from the
-                // parent, before this fork returns — so a parent that polls
-                // /proc/<child>/stat immediately (pauseinterrupt2) sees `R`, not
-                // the child's host boot-ppoll `S`. The table is shared, so this is
-                // the same slot the child later updates to Running/Blocked.
-                crate::run_state::publish_child_booting(child_pid as u32);
-                // CLONE_PIDFD: allocate a pidfd for the new child and write its fd
-                // to the guest pidfd-out pointer.
-                if let Some(addr) = pidfd_out {
-                    let fd = kernel
-                        .dispatcher
-                        .install_child_pidfd(child_pid)
-                        .unwrap_or(-1);
-                    let _ = engine.write_bytes(addr, &fd.to_le_bytes());
-                }
-                // PID namespace: the child's ns-pid was allocated and stored in
-                // its prepared record before fork. Identity when namespaces are off.
-                let retval = i64::from(child_ns_pid.unwrap_or(child_pid as u32));
-                if let Some(addr) = parent_tid_addr {
-                    let tid = (retval as i32).to_le_bytes();
-                    let _ = engine.write_bytes(addr, &tid);
-                }
-                // vfork: SUSPEND this (parent) vCPU thread until the child execve's
-                // (it writes one byte) or exits (the OS closes the child's write
-                // end → our read() returns EOF). We still hold `_topology`, so no
-                // concurrent fork can quiesce us. Retry on EINTR.
-                if let Some((vf_read, _vf_write)) = vfork_pipe {
-                    let vfork_wait_start = std::time::Instant::now();
-                    unsafe { libc::close(_vf_write) }; // parent only reads
-                    // Bounded suspend: the child should execve/_exit within ms, but
-                    // a pathological guest must NOT wedge the parent forever — we
-                    // still hold topology_lock here. Poll with a deadline; on expiry
-                    // resume the parent DEGRADED with a loud diagnostic.
-                    const VFORK_SUSPEND_TIMEOUT: Duration = Duration::from_secs(60);
-                    let deadline = std::time::Instant::now() + VFORK_SUSPEND_TIMEOUT;
-                    let mut byte = [0u8; 1];
-                    loop {
-                        let now = std::time::Instant::now();
-                        if now >= deadline {
-                            tracing::error!(
-                                child_pid,
-                                "vfork parent-suspend timed out (60s) waiting for child \
-                                 execve/_exit; resuming parent degraded"
-                            );
-                            break;
-                        }
-                        let remaining_ms =
-                            (deadline - now).as_millis().min(i32::MAX as u128) as i32;
-                        let mut pfd = libc::pollfd {
-                            fd: vf_read,
-                            events: libc::POLLIN,
-                            revents: 0,
-                        };
-                        let r = unsafe { libc::poll(&mut pfd, 1, remaining_ms) };
-                        if r > 0 {
-                            // Readable: a byte (child execve'd) or EOF (child exited).
-                            let _ = unsafe { libc::read(vf_read, byte.as_mut_ptr().cast(), 1) };
-                            break;
-                        }
-                        if r == 0 {
-                            continue; // deadline re-checked at loop top
-                        }
-                        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-                            break; // unexpected poll error — stop waiting
-                        }
-                        // EINTR → re-poll on the remaining budget.
+        let retval =
+            match fork_outcome {
+                crate::trap::ForkOutcome::Parent { child_pid } => {
+                    let runtime_repair_start = std::time::Instant::now();
+                    // Publish the rebuilt VM so quiesced siblings recreate their vCPUs
+                    // in it, THEN resume them.
+                    if quiesced {
+                        engine.publish_vm_for_siblings()?;
+                        fork_barrier().end_quiesce();
                     }
-                    unsafe { libc::close(vf_read) };
-                    // The child has now execve'd or exited, so the shared window is
-                    // quiescent. Reconcile the child's shared-VM writes back into
-                    // the parent's address space and release the share (KVM's shadow
-                    // copy-back; a no-op for backends that shared the RAM directly).
-                    // Safe to do unconditionally: a non-vfork-shared backend's hook
-                    // is a no-op, and on the pipe-failure degrade path nothing was
-                    // armed.
-                    engine.finish_vfork_parent();
-                    // The vfork child shared the parent's guest RAM until it
-                    // execve'd or exited. Its child-side identity stamp therefore
-                    // overwrote the shared EL1 shim identity page; restore the
-                    // parent's getpid/get*id fast-path values before resuming it.
-                    stamp_identity_page(engine, &kernel.dispatcher, kernel_context);
+                    fork_barrier().end_fork();
+                    let child_exit_needs_signal_pump = kernel
+                        .dispatcher
+                        .child_exit_signal_needs_pump(kernel_context, self.this_tid, exit_signal);
+                    kernel.fork.restart_after_parent_fork(
+                        prepared_fork,
+                        &self.kicker,
+                        &self.platform_futex,
+                        child_exit_needs_signal_pump,
+                    );
+                    // engine.fork() rebuilt this thread's own vCPU, so its old kicker
+                    // handle is stale. Re-register the new one (under the topology lock
+                    // we still hold).
+                    self.register_vcpu(engine);
+                    if child_exit_needs_signal_pump {
+                        // Watch the child's exit (EVFILT_PROC/NOTE_EXIT) so the signal
+                        // pump delivers the requested signal to this (parent) tid when
+                        // it exits.
+                        crate::host_signal::register_child_exit_watch(
+                            child_pid,
+                            self.this_tid.raw(),
+                            i32::try_from(exit_signal).unwrap_or(crate::linux_abi::LINUX_SIGCHLD),
+                        );
+                    }
+                    crate::event_ring::rec(crate::event_ring::FORK, child_pid, 0, 0);
+                    // By REF, not via the global stash: end_fork() above released
+                    // fork serialization, so another thread's prepare may already
+                    // have overwritten the stash (its publish would then stamp OUR
+                    // child pid into THAT record — crossed ns-pids).
+                    crate::guest_cpu::publish_prepared_child_record_parent_ref(
+                        prepared_child_record,
+                        child_pid as u32,
+                    );
+                    crate::namespace::pid::notify_child_registered();
+                    // Seed the child's published run-state as Booting NOW, from the
+                    // parent, before this fork returns — so a parent that polls
+                    // /proc/<child>/stat immediately (pauseinterrupt2) sees `R`, not
+                    // the child's host boot-ppoll `S`. The table is shared, so this is
+                    // the same slot the child later updates to Running/Blocked.
+                    crate::run_state::publish_child_booting(child_pid as u32);
+                    // CLONE_PIDFD: allocate a pidfd for the new child and write its fd
+                    // to the guest pidfd-out pointer.
+                    if let Some(addr) = pidfd_out {
+                        let fd = kernel
+                            .dispatcher
+                            .install_child_pidfd(child_pid)
+                            .unwrap_or(-1);
+                        let _ = engine.write_bytes(addr, &fd.to_le_bytes());
+                    }
+                    // PID namespace: the child's ns-pid was allocated and stored in
+                    // its prepared record before fork. Identity when namespaces are off.
+                    let retval = i64::from(child_ns_pid.unwrap_or(child_pid as u32));
+                    if let Some(addr) = parent_tid_addr {
+                        let tid = (retval as i32).to_le_bytes();
+                        let _ = engine.write_bytes(addr, &tid);
+                    }
+                    // vfork: SUSPEND this (parent) vCPU thread until the child execve's
+                    // (it writes one byte) or exits (the OS closes the child's write
+                    // end → our read() returns EOF). We still hold `_topology`, so no
+                    // concurrent fork can quiesce us. Retry on EINTR.
+                    if let Some((vf_read, _vf_write)) = vfork_pipe {
+                        let vfork_wait_start = std::time::Instant::now();
+                        unsafe { libc::close(_vf_write) }; // parent only reads
+                        // Bounded suspend: the child should execve/_exit within ms, but
+                        // a pathological guest must NOT wedge the parent forever — we
+                        // still hold topology_lock here. Poll with a deadline; on expiry
+                        // resume the parent DEGRADED with a loud diagnostic.
+                        const VFORK_SUSPEND_TIMEOUT: Duration = Duration::from_secs(60);
+                        let deadline = std::time::Instant::now() + VFORK_SUSPEND_TIMEOUT;
+                        let mut byte = [0u8; 1];
+                        loop {
+                            let now = std::time::Instant::now();
+                            if now >= deadline {
+                                tracing::error!(
+                                    child_pid,
+                                    "vfork parent-suspend timed out (60s) waiting for child \
+                                 execve/_exit; resuming parent degraded"
+                                );
+                                break;
+                            }
+                            let remaining_ms =
+                                (deadline - now).as_millis().min(i32::MAX as u128) as i32;
+                            let mut pfd = libc::pollfd {
+                                fd: vf_read,
+                                events: libc::POLLIN,
+                                revents: 0,
+                            };
+                            let r = unsafe { libc::poll(&mut pfd, 1, remaining_ms) };
+                            if r > 0 {
+                                // Readable: a byte (child execve'd) or EOF (child exited).
+                                let _ = unsafe { libc::read(vf_read, byte.as_mut_ptr().cast(), 1) };
+                                break;
+                            }
+                            if r == 0 {
+                                continue; // deadline re-checked at loop top
+                            }
+                            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                                break; // unexpected poll error — stop waiting
+                            }
+                            // EINTR → re-poll on the remaining budget.
+                        }
+                        unsafe { libc::close(vf_read) };
+                        // The child has now execve'd or exited, so the shared window is
+                        // quiescent. Reconcile the child's shared-VM writes back into
+                        // the parent's address space and release the share (KVM's shadow
+                        // copy-back; a no-op for backends that shared the RAM directly).
+                        // Safe to do unconditionally: a non-vfork-shared backend's hook
+                        // is a no-op, and on the pipe-failure degrade path nothing was
+                        // armed.
+                        engine.finish_vfork_parent();
+                        // The vfork child shared the parent's guest RAM until it
+                        // execve'd or exited. Its child-side identity stamp therefore
+                        // overwrote the shared EL1 shim identity page; restore the
+                        // parent's getpid/get*id fast-path values before resuming it.
+                        stamp_identity_page(engine, &kernel.dispatcher, kernel_context);
+                        crate::probes::fork_lifecycle(
+                            0,
+                            9,
+                            elapsed_us(vfork_wait_start),
+                            i64::from(child_pid),
+                            0,
+                        );
+                    }
                     crate::probes::fork_lifecycle(
                         0,
-                        9,
-                        elapsed_us(vfork_wait_start),
+                        7,
+                        elapsed_us(runtime_repair_start),
                         i64::from(child_pid),
                         0,
                     );
+                    retval
                 }
-                crate::probes::fork_lifecycle(
-                    0,
-                    7,
-                    elapsed_us(runtime_repair_start),
-                    i64::from(child_pid),
-                    0,
-                );
-                retval
-            }
-            crate::trap::ForkOutcome::Child => {
-                let runtime_repair_start = std::time::Instant::now();
-                kernel.dispatcher.clear_output_buffers();
-                // A forked child must NOT inherit its PARENT's vfork suspend-pipe
-                // write end (copied across libc::fork). Drop the inherited copy so
-                // only the genuine vfork child holds the writer.
-                if let Some(stale) = self.vfork_release_fd.take() {
-                    unsafe { libc::close(stale) };
+                crate::trap::ForkOutcome::Child => {
+                    let runtime_repair_start = std::time::Instant::now();
+                    kernel.dispatcher.clear_output_buffers();
+                    // A forked child must NOT inherit its PARENT's vfork suspend-pipe
+                    // write end (copied across libc::fork). Drop the inherited copy so
+                    // only the genuine vfork child holds the writer.
+                    if let Some(stale) = self.vfork_release_fd.take() {
+                        unsafe { libc::close(stale) };
+                    }
+                    // vfork: keep the WRITE end of OUR suspend pipe (close the read end
+                    // the parent owns).
+                    if let Some((vf_read, vf_write)) = vfork_pipe {
+                        unsafe { libc::close(vf_read) };
+                        self.vfork_release_fd = Some(vf_write);
+                    }
+                    // An explicit child stack (clone's stack arg != 0, vfork or
+                    // ordinary fork-like clone): run the child on it, exactly as
+                    // the kernel does — glibc/musl's `__clone` stub pops the child
+                    // function off the NEW stack (LTP clone01 crashed on the
+                    // parent's frames without this).
+                    let requested_stack = vfork.unwrap_or(child_stack);
+                    if requested_stack != 0
+                        && let Err(e) = engine.set_guest_sp_el0(requested_stack)
+                    {
+                        tracing::warn!(?e, "clone: failed to set child stack pointer");
+                    }
+                    // Don't inherit the parent's accumulated guest CPU time.
+                    crate::guest_cpu::reset();
+                    self.this_tid = ThreadId::main_from_host_pid();
+                    // Kernel child publication already retained the forking thread's
+                    // exact mask, altstack, and active handler-frame state.
+                    self.registry = Arc::new(ThreadRegistry::new(self.this_tid));
+                    crate::thread::set_current_registry(Arc::clone(&self.registry));
+                    // The other guest threads do not exist in the child (libc::fork
+                    // replicated only the calling thread). Drop their stale bookkeeping:
+                    // a fresh futex table (no phantom waiters), a fresh kicker (only
+                    // this vCPU is registered below), and an empty thread-handle vec.
+                    // The fresh kicker comes from `fresh_fork_kicker()` (object-safe,
+                    // so the loop never names the concrete kicker); the fresh concrete
+                    // private-futex table is built here and the matching `PlatformFutex`
+                    // is derived from it via the threaded-through factory, so the two
+                    // stay over the SAME table (the notify-signal-pending consistency
+                    // invariant) without naming the backend.
+                    let fresh_kicker = engine.fresh_fork_kicker();
+                    self.kicker = fresh_kicker;
+                    self.futex = Arc::new(crate::thread::FutexTable::new());
+                    self.platform_futex = (self.platform_futex_factory)(Arc::clone(&self.futex));
+                    self.threads = Arc::new(parking_lot::Mutex::new(Vec::new()));
+                    // Clear the quiesce + fork flags the child inherited (copied) from
+                    // the parent so the child's single-threaded run loop runs. Also
+                    // reset the inherited parked-thread COUNT: it belongs to PARENT
+                    // threads that do not exist here and nothing would ever decrement
+                    // it, so a child that later goes multithreaded and forks would
+                    // see `wait_quiesced` satisfied by phantom parkers and fork
+                    // UNQUIESCED (siblings running mid-anything).
+                    fork_barrier().end_quiesce();
+                    fork_barrier().end_fork();
+                    fork_barrier().reset_paused_for_child();
+                    // Also clear the inherited PAGE-TABLE-EDIT pause. If the fork
+                    // landed while a parent sibling held `pt_pause` (the editor is
+                    // not in the child), the inherited coordinator/quiescing flags
+                    // would park this child's run loop FOREVER at its first loop
+                    // top (captured live: PtQuiesce bytes coordinator=1/quiescing=1
+                    // in a wedged go-os_exec vfork child). The count-drain predicate
+                    // above makes that window unreachable going forward; this reset
+                    // keeps the child self-healing regardless.
+                    pt_barrier().end();
+                    crate::event_ring::reinit_after_fork();
+                    crate::host_signal::reinit_after_fork();
+                    crate::dispatch::reset_fifo_beacons_after_fork_child();
+                    kernel.dispatcher.epoll_after_fork_child();
+                    // Publish THIS child (new host pid) as Booting in the SHARED
+                    // run-state table, before any post-fork boot work that parks the
+                    // vCPU in the host's internal boot ppoll — so a parent reading
+                    // /proc/<child>/stat sees `R` during boot (as real Linux does),
+                    // not the `S` of that boot park. Republished `Running` when the
+                    // child's vCPU first resumes guest code (run_vcpu_until_exit top).
+                    // Publish the child's host pid on its pre-fork record FIRST:
+                    // the run-state publish right after adopts that record (one
+                    // record per process), which only works once host_pid is set.
+                    crate::guest_cpu::complete_child_record_post_fork_child();
+                    crate::run_state::reinit_booting_after_fork();
+                    // M:N scheduler: the child inherited the parent's pool but has only
+                    // THIS thread, now the child's main (remapped to the child VM's vCPU
+                    // 0). Drop the inherited (parent-slot) lease, reset to a fresh pool,
+                    // and re-acquire slot 0 — otherwise the child's new threads block on
+                    // slots held by parent threads that don't exist here.
+                    carrick_hal::vcpu_sched::take_current_lease();
+                    carrick_hal::vcpu_sched::global().reset_for_fork();
+                    carrick_hal::vcpu_sched::set_current_lease(
+                        carrick_hal::vcpu_sched::global().acquire(self.this_tid.raw() as u64),
+                    );
+                    kernel.dispatcher.proc_after_fork_child();
+                    let child_context = kernel
+                        .dispatcher
+                        .reset_one_task_kernel_binding_for_current_process(
+                            kernel_context,
+                            self.this_tid,
+                        )
+                        .unwrap_or_else(|error| {
+                            tracing::error!(%error, "rebind host-fork child Kernel authority");
+                            std::process::abort();
+                        });
+                    self.linux_tid = child_context.thread().key().tid;
+                    // Re-stamp from the exact child generation published above.
+                    stamp_identity_page(engine, &kernel.dispatcher, &child_context);
+                    if let Some(addr) = parent_tid_addr {
+                        let tid = (crate::namespace::pid::self_ns_pid() as i32).to_le_bytes();
+                        let _ = engine.write_bytes(addr, &tid);
+                    }
+                    if let Some(addr) = child_tid_addr {
+                        let tid = (crate::namespace::pid::self_ns_pid() as i32).to_le_bytes();
+                        let _ = engine.write_bytes(addr, &tid);
+                    }
+                    stamp_guest_tid(engine, self.this_tid, &self.registry);
+                    kernel.dispatcher.sysv_after_fork_child();
+                    self.waiter = crate::io_wait::ThreadWaiter::new(self.this_tid);
+                    let handle: Box<dyn carrick_hal::VcpuKickDyn> = Box::new(engine.kick_handle());
+                    self.kicker.register(self.this_tid, handle);
+                    self.registry
+                        .record_thread_port(self.this_tid, crate::host_proc::current_thread_port());
+                    kernel.fork.restart_after_child_fork(
+                        prepared_fork,
+                        &self.kicker,
+                        &self.platform_futex,
+                    );
+                    crate::probes::fork_lifecycle(1, 8, elapsed_us(runtime_repair_start), 0, 0);
+                    0
                 }
-                // vfork: keep the WRITE end of OUR suspend pipe (close the read end
-                // the parent owns).
-                if let Some((vf_read, vf_write)) = vfork_pipe {
-                    unsafe { libc::close(vf_read) };
-                    self.vfork_release_fd = Some(vf_write);
-                }
-                // An explicit child stack (clone's stack arg != 0, vfork or
-                // ordinary fork-like clone): run the child on it, exactly as
-                // the kernel does — glibc/musl's `__clone` stub pops the child
-                // function off the NEW stack (LTP clone01 crashed on the
-                // parent's frames without this).
-                let requested_stack = vfork.unwrap_or(child_stack);
-                if requested_stack != 0
-                    && let Err(e) = engine.set_guest_sp_el0(requested_stack)
-                {
-                    tracing::warn!(?e, "clone: failed to set child stack pointer");
-                }
-                // Don't inherit the parent's accumulated guest CPU time.
-                crate::guest_cpu::reset();
-                let parent_tid = self.this_tid;
-                self.this_tid = ThreadId::main_from_host_pid();
-                // The child inherits the parent's blocked mask + alternate signal
-                // stack (POSIX) but has a NEW tid; re-key the dispatcher's per-tid
-                // signal state.
-                kernel
-                    .dispatcher
-                    .migrate_thread_signal_state(parent_tid, self.this_tid);
-                self.registry = Arc::new(ThreadRegistry::new(self.this_tid));
-                crate::thread::set_current_registry(Arc::clone(&self.registry));
-                // The other guest threads do not exist in the child (libc::fork
-                // replicated only the calling thread). Drop their stale bookkeeping:
-                // a fresh futex table (no phantom waiters), a fresh kicker (only
-                // this vCPU is registered below), and an empty thread-handle vec.
-                // The fresh kicker comes from `fresh_fork_kicker()` (object-safe,
-                // so the loop never names the concrete kicker); the fresh concrete
-                // private-futex table is built here and the matching `PlatformFutex`
-                // is derived from it via the threaded-through factory, so the two
-                // stay over the SAME table (the notify-signal-pending consistency
-                // invariant) without naming the backend.
-                let fresh_kicker = engine.fresh_fork_kicker();
-                self.kicker = fresh_kicker;
-                self.futex = Arc::new(crate::thread::FutexTable::new());
-                self.platform_futex = (self.platform_futex_factory)(Arc::clone(&self.futex));
-                self.threads = Arc::new(parking_lot::Mutex::new(Vec::new()));
-                // Clear the quiesce + fork flags the child inherited (copied) from
-                // the parent so the child's single-threaded run loop runs. Also
-                // reset the inherited parked-thread COUNT: it belongs to PARENT
-                // threads that do not exist here and nothing would ever decrement
-                // it, so a child that later goes multithreaded and forks would
-                // see `wait_quiesced` satisfied by phantom parkers and fork
-                // UNQUIESCED (siblings running mid-anything).
-                fork_barrier().end_quiesce();
-                fork_barrier().end_fork();
-                fork_barrier().reset_paused_for_child();
-                // Also clear the inherited PAGE-TABLE-EDIT pause. If the fork
-                // landed while a parent sibling held `pt_pause` (the editor is
-                // not in the child), the inherited coordinator/quiescing flags
-                // would park this child's run loop FOREVER at its first loop
-                // top (captured live: PtQuiesce bytes coordinator=1/quiescing=1
-                // in a wedged go-os_exec vfork child). The count-drain predicate
-                // above makes that window unreachable going forward; this reset
-                // keeps the child self-healing regardless.
-                pt_barrier().end();
-                crate::event_ring::reinit_after_fork();
-                crate::host_signal::reinit_after_fork();
-                crate::dispatch::reset_fifo_beacons_after_fork_child();
-                kernel.dispatcher.epoll_after_fork_child();
-                // Publish THIS child (new host pid) as Booting in the SHARED
-                // run-state table, before any post-fork boot work that parks the
-                // vCPU in the host's internal boot ppoll — so a parent reading
-                // /proc/<child>/stat sees `R` during boot (as real Linux does),
-                // not the `S` of that boot park. Republished `Running` when the
-                // child's vCPU first resumes guest code (run_vcpu_until_exit top).
-                // Publish the child's host pid on its pre-fork record FIRST:
-                // the run-state publish right after adopts that record (one
-                // record per process), which only works once host_pid is set.
-                crate::guest_cpu::complete_child_record_post_fork_child();
-                crate::run_state::reinit_booting_after_fork();
-                // M:N scheduler: the child inherited the parent's pool but has only
-                // THIS thread, now the child's main (remapped to the child VM's vCPU
-                // 0). Drop the inherited (parent-slot) lease, reset to a fresh pool,
-                // and re-acquire slot 0 — otherwise the child's new threads block on
-                // slots held by parent threads that don't exist here.
-                carrick_hal::vcpu_sched::take_current_lease();
-                carrick_hal::vcpu_sched::global().reset_for_fork();
-                carrick_hal::vcpu_sched::set_current_lease(
-                    carrick_hal::vcpu_sched::global().acquire(self.this_tid.raw() as u64),
-                );
-                kernel.dispatcher.proc_after_fork_child();
-                let child_context = kernel
-                    .dispatcher
-                    .reset_one_task_kernel_binding_for_current_process(
-                        kernel_context,
-                        self.this_tid,
-                    )
-                    .unwrap_or_else(|error| {
-                        tracing::error!(%error, "rebind host-fork child Kernel authority");
-                        std::process::abort();
-                    });
-                self.linux_tid = child_context.thread().key().tid;
-                // Re-stamp from the exact child generation published above.
-                stamp_identity_page(engine, &kernel.dispatcher, &child_context);
-                if let Some(addr) = parent_tid_addr {
-                    let tid = (crate::namespace::pid::self_ns_pid() as i32).to_le_bytes();
-                    let _ = engine.write_bytes(addr, &tid);
-                }
-                if let Some(addr) = child_tid_addr {
-                    let tid = (crate::namespace::pid::self_ns_pid() as i32).to_le_bytes();
-                    let _ = engine.write_bytes(addr, &tid);
-                }
-                stamp_guest_tid(engine, self.this_tid, &self.registry);
-                kernel.dispatcher.sysv_after_fork_child();
-                self.waiter = crate::io_wait::ThreadWaiter::new(self.this_tid);
-                let handle: Box<dyn carrick_hal::VcpuKickDyn> = Box::new(engine.kick_handle());
-                self.kicker.register(self.this_tid, handle);
-                self.registry
-                    .record_thread_port(self.this_tid, crate::host_proc::current_thread_port());
-                kernel.fork.restart_after_child_fork(
-                    prepared_fork,
-                    &self.kicker,
-                    &self.platform_futex,
-                );
-                crate::probes::fork_lifecycle(1, 8, elapsed_us(runtime_repair_start), 0, 0);
-                0
-            }
-        };
+            };
         Ok(Some(retval))
     }
 

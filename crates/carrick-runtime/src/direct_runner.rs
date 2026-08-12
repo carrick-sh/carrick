@@ -870,7 +870,6 @@ impl DirectRunner {
                 outcome: format!("retire tier-D one-task Kernel thread: {error}"),
             });
         }
-        self.dispatcher.forget_thread_signal_state(tid);
         if last {
             let mut slot = lock(&self.outcome);
             if slot.is_none() {
@@ -2029,6 +2028,7 @@ impl DirectRunner {
     /// the original syscall and replaying its already-written prefix.
     fn service_blocking_host_write(
         &self,
+        context: &crate::kernel::KernelContext,
         syscall: u64,
         mut write: crate::dispatch::BlockingHostWrite,
     ) -> ServiceVerdict {
@@ -2037,6 +2037,7 @@ impl DirectRunner {
                 crate::dispatch::BlockingHostWriteStep::Done(outcome) => break outcome,
                 crate::dispatch::BlockingHostWriteStep::Wait => {
                     match self.wait_on_fds(
+                        context,
                         write.tid(),
                         &[crate::io_wait::WaitFd::raw(write.host_fd(), libc::POLLOUT)],
                         None,
@@ -2060,8 +2061,12 @@ impl DirectRunner {
                 }
             }
         };
-        let outcome =
-            crate::vcpu_loop::raise_sigpipe_for_blocking_write(&self.dispatcher, &write, outcome);
+        let outcome = crate::vcpu_loop::raise_sigpipe_for_blocking_write(
+            &self.dispatcher,
+            context,
+            &write,
+            outcome,
+        );
         match outcome {
             DispatchOutcome::Returned { value } => ServiceVerdict::Resume(value),
             DispatchOutcome::Errno { errno } => ServiceVerdict::Resume(errno.guest_retval()),
@@ -2089,7 +2094,24 @@ impl DirectRunner {
         let number = ctx.syscall_nr();
         let name = crate::syscall::lookup_aarch64(number).map_or("unknown", |syscall| syscall.name);
         let mut service = crate::native_darwin::NativeSyscallServiceSpan::open(number, name);
-        let verdict = self.service_syscall(ctx, number, name);
+        let Some(linux_tid) = self.current_linux_tid() else {
+            self.end_process(DirectRunOutcome::Unsupported {
+                syscall: number,
+                outcome: "missing explicit one-task Linux thread identity".to_string(),
+            });
+            return ServiceVerdict::Leave;
+        };
+        let kernel = match self.dispatcher.capture_kernel_context(linux_tid) {
+            Ok(kernel) => kernel,
+            Err(error) => {
+                self.end_process(DirectRunOutcome::Unsupported {
+                    syscall: number,
+                    outcome: format!("capture one-task kernel context: {error}"),
+                });
+                return ServiceVerdict::Leave;
+            }
+        };
+        let verdict = self.service_syscall(&kernel, ctx, number, name);
         // The flag can rise while dispatch is in flight. Park on every
         // outcome, including ThreadExit: the forker may already have counted
         // this tid, so disappearing without a pause would strand the drain.
@@ -2117,7 +2139,7 @@ impl DirectRunner {
         let closed = service.end(service_outcome);
         debug_assert!(closed, "tier-D syscall service span closed exactly once");
         match verdict {
-            ServiceVerdict::Resume(value) => self.deliver_pending_at_boundary(ctx, value),
+            ServiceVerdict::Resume(value) => self.deliver_pending_at_boundary(&kernel, ctx, value),
             leave => leave,
         }
     }
@@ -2133,6 +2155,7 @@ impl DirectRunner {
     /// the boundary delivers its handler (or restarts, per `SA_RESTART`).
     fn service_syscall(
         &self,
+        kernel: &crate::kernel::KernelContext,
         ctx: &mut GuestContext,
         number: u64,
         name: &'static str,
@@ -2176,30 +2199,13 @@ impl DirectRunner {
         let mut fd_wait_deadline: Option<Instant> = None;
         // The signal-wait (`WaitOnSignals`) overall deadline, same contract.
         let mut signal_wait_deadline: Option<Instant> = None;
-        let Some(linux_tid) = self.current_linux_tid() else {
-            self.end_process(DirectRunOutcome::Unsupported {
-                syscall: number,
-                outcome: "missing explicit one-task Linux thread identity".to_string(),
-            });
-            return ServiceVerdict::Leave;
-        };
-        let kernel = match self.dispatcher.capture_kernel_context(linux_tid) {
-            Ok(kernel) => kernel,
-            Err(error) => {
-                self.end_process(DirectRunOutcome::Unsupported {
-                    syscall: number,
-                    outcome: format!("capture one-task kernel context: {error}"),
-                });
-                return ServiceVerdict::Leave;
-            }
-        };
         loop {
             self.park_for_fork_quiesce();
             if self.exiting.load(Ordering::SeqCst) {
                 return ServiceVerdict::Leave;
             }
             let outcome = self.dispatcher.dispatch_threaded(
-                &kernel,
+                kernel,
                 request,
                 &mut memory,
                 &self.reporter,
@@ -2239,7 +2245,7 @@ impl DirectRunner {
                     return self.service_clone_thread(
                         ctx,
                         tid,
-                        &kernel,
+                        kernel,
                         flags,
                         stack,
                         tls,
@@ -2252,7 +2258,7 @@ impl DirectRunner {
                 // process — identity memory makes the copied address space
                 // the child's guest state by construction (Phase 2 item 2).
                 Ok(DispatchOutcome::Fork {
-                    flags: _,
+                    flags,
                     pidfd_out,
                     clone_parent,
                     parent_tid_addr,
@@ -2261,10 +2267,22 @@ impl DirectRunner {
                     child_stack,
                     vfork,
                 }) => {
+                    if let Some(reason) =
+                        SyscallDispatcher::host_fork_file_authority_rejection(kernel, flags)
+                    {
+                        tracing::warn!(
+                            flags,
+                            reason,
+                            "direct host-fork file authority rejected clone"
+                        );
+                        return ServiceVerdict::Resume(
+                            crate::linux_abi::LINUX_EOPNOTSUPP.guest_retval(),
+                        );
+                    }
                     return self.service_fork(
                         ctx,
                         tid,
-                        &kernel,
+                        kernel,
                         ForkRequest {
                             pidfd_out,
                             clone_parent,
@@ -2303,7 +2321,7 @@ impl DirectRunner {
                     }
                     return match crate::native_darwin::tier_d_service_execve(
                         &self.dispatcher,
-                        &kernel,
+                        kernel,
                         path,
                         argv,
                         env,
@@ -2334,7 +2352,7 @@ impl DirectRunner {
                 // `rt_sigreturn(2)`: pop the frame, chain-deliver, re-enter
                 // at the RESTORED pc (constant resume branches cannot).
                 Ok(DispatchOutcome::SigReturn) => {
-                    return self.service_sigreturn(ctx, tid);
+                    return self.service_sigreturn(kernel, ctx, tid);
                 }
                 // `tkill`/`tgkill` to a sibling guest thread: publish into
                 // its pending state and wake its parks (futex notify + the
@@ -2372,6 +2390,7 @@ impl DirectRunner {
                 }) => {
                     use crate::native_darwin::NativeSignalWaitResult;
                     match self.wait_on_signals(
+                        kernel,
                         tid,
                         wait_set,
                         block_mask,
@@ -2406,6 +2425,7 @@ impl DirectRunner {
                         .wait_prepared_for_thread(wait, timeout, tid, &|| {
                             self.exiting.load(Ordering::SeqCst)
                                 || self.deliverable_wait_signal_pending(
+                                    kernel,
                                     tid,
                                     carrick_abi::WaitSigMask::NONE,
                                 )
@@ -2425,6 +2445,7 @@ impl DirectRunner {
                                 return ServiceVerdict::Leave;
                             }
                             let real_signal = self.deliverable_wait_signal_pending(
+                                kernel,
                                 tid,
                                 carrick_abi::WaitSigMask::NONE,
                             );
@@ -2454,7 +2475,14 @@ impl DirectRunner {
                     else {
                         return ServiceVerdict::Resume(on_timeout);
                     };
-                    match self.wait_on_fds(tid, &fds, remaining, sig_mask, FdWaitKind::Kqueue) {
+                    match self.wait_on_fds(
+                        kernel,
+                        tid,
+                        &fds,
+                        remaining,
+                        sig_mask,
+                        FdWaitKind::Kqueue,
+                    ) {
                         TierDWait::Ready => continue,
                         TierDWait::TimedOut => return ServiceVerdict::Resume(on_timeout),
                         TierDWait::Interrupted => {
@@ -2475,7 +2503,8 @@ impl DirectRunner {
                     else {
                         return ServiceVerdict::Resume(on_timeout);
                     };
-                    match self.wait_on_fds(tid, &fds, remaining, sig_mask, FdWaitKind::Poll) {
+                    match self.wait_on_fds(kernel, tid, &fds, remaining, sig_mask, FdWaitKind::Poll)
+                    {
                         TierDWait::Ready => continue,
                         TierDWait::TimedOut => return ServiceVerdict::Resume(on_timeout),
                         TierDWait::Interrupted => {
@@ -2504,7 +2533,14 @@ impl DirectRunner {
                     else {
                         return timed_out(self);
                     };
-                    match self.wait_on_fds(tid, &fds, remaining, sig_mask, FdWaitKind::Kqueue) {
+                    match self.wait_on_fds(
+                        kernel,
+                        tid,
+                        &fds,
+                        remaining,
+                        sig_mask,
+                        FdWaitKind::Kqueue,
+                    ) {
                         TierDWait::Ready => continue,
                         TierDWait::TimedOut => return timed_out(self),
                         TierDWait::Interrupted => {
@@ -2521,7 +2557,7 @@ impl DirectRunner {
                 // waitid are the kernel's restartable set): the boundary
                 // epilogue restarts or surfaces EINTR per the handler flags.
                 Ok(DispatchOutcome::WaitOnProcExit { pid, sig_mask }) => {
-                    match self.wait_on_proc_exit(tid, pid, sig_mask) {
+                    match self.wait_on_proc_exit(kernel, tid, pid, sig_mask) {
                         TierDWait::Ready | TierDWait::TimedOut => continue,
                         TierDWait::Interrupted => {
                             return ServiceVerdict::Resume(
@@ -2534,7 +2570,7 @@ impl DirectRunner {
                 // Non-terminal child state (WSTOPPED/WCONTINUED): bounded
                 // re-poll, the DSR arm's exact shape.
                 Ok(DispatchOutcome::WaitOnProcState { pid: _, sig_mask }) => {
-                    match self.wait_on_proc_state(tid, sig_mask) {
+                    match self.wait_on_proc_state(kernel, tid, sig_mask) {
                         TierDWait::Ready | TierDWait::TimedOut => continue,
                         TierDWait::Interrupted => {
                             return ServiceVerdict::Resume(
@@ -2552,7 +2588,7 @@ impl DirectRunner {
                     remaining,
                 }) => {
                     let deadline = Instant::now() + duration;
-                    match self.wait_on_sleep(tid, deadline) {
+                    match self.wait_on_sleep(kernel, tid, deadline) {
                         TierDWait::Ready | TierDWait::TimedOut => return ServiceVerdict::Resume(0),
                         TierDWait::Interrupted => {
                             let mut memory = self.memory;
@@ -2586,7 +2622,7 @@ impl DirectRunner {
                     return self.service_blocking_record_lock(number, &lock);
                 }
                 Ok(DispatchOutcome::BlockingHostWrite(write)) => {
-                    return self.service_blocking_host_write(number, write);
+                    return self.service_blocking_host_write(kernel, number, write);
                 }
                 Ok(other) => {
                     self.end_process(DirectRunOutcome::Unsupported {
@@ -2620,7 +2656,7 @@ impl DirectRunner {
     fn service_clone_thread(
         &self,
         ctx: &GuestContext,
-        parent_tid: ThreadId,
+        _parent_tid: ThreadId,
         parent_context: &crate::kernel::KernelContext,
         flags: u64,
         stack: u64,
@@ -2708,7 +2744,6 @@ impl DirectRunner {
                 return ServiceVerdict::Leave;
             }
         };
-        self.dispatcher.inherit_thread_signal_mask(parent_tid, tid);
 
         // A process with two guest threads must have Mach delivery on both
         // before either can publish or execute a process-global MAP_JIT range.
@@ -2830,7 +2865,6 @@ impl DirectRunner {
             }
             Err(_) => {
                 read_lock(&self.registry).exit(tid);
-                self.dispatcher.forget_thread_signal_state(tid);
                 ServiceVerdict::Resume(crate::host_to_linux_errno(libc::EAGAIN).guest_retval())
             }
         }
@@ -3017,11 +3051,7 @@ impl DirectRunner {
             self.forked_child.store(true, Ordering::Release);
             crate::probes::host_process_birth_current();
             crate::native::fork_child::dispatcher_after_fork_child(&self.dispatcher);
-            let child_tid = self.reset_after_fork_child(parent_context);
-            self.dispatcher
-                .retire_sibling_thread_signal_state(parent_tid);
-            self.dispatcher
-                .migrate_thread_signal_state(parent_tid, child_tid);
+            self.reset_after_fork_child(parent_context);
             crate::guest_cpu::reset();
             crate::guest_cpu::complete_child_record_post_fork_child();
             if let Err(error) = self.dispatcher.rlimit_cpu_after_fork_child() {
@@ -3150,13 +3180,14 @@ impl DirectRunner {
     /// `native_wait_block_mask`).
     fn wait_block_mask(
         &self,
+        context: &crate::kernel::KernelContext,
         tid: ThreadId,
         sig_mask: carrick_abi::WaitSigMask,
     ) -> carrick_abi::SigBlockMask {
         let effective = match sig_mask {
             carrick_abi::WaitSigMask::Replace(mask) => mask,
             carrick_abi::WaitSigMask::Additive(mask) => {
-                self.dispatcher.signal_mask_for(tid).union(mask)
+                self.dispatcher.signal_mask_for(context, tid).union(mask)
             }
         };
         carrick_abi::SigBlockMask::blocking_all_of(effective)
@@ -3171,14 +3202,15 @@ impl DirectRunner {
     /// 100%-CPU read spin).
     fn deliverable_wait_signal_pending(
         &self,
+        context: &crate::kernel::KernelContext,
         tid: ThreadId,
         sig_mask: carrick_abi::WaitSigMask,
     ) -> bool {
         self.dispatcher
-            .has_deliverable_dispatch_pending_for_wait(tid, sig_mask)
+            .has_deliverable_dispatch_pending_for_wait(context, tid, sig_mask)
             || crate::host_signal::has_unblocked_pending_for(
                 tid.raw(),
-                self.wait_block_mask(tid, sig_mask),
+                self.wait_block_mask(context, tid, sig_mask),
             )
     }
 
@@ -3190,13 +3222,14 @@ impl DirectRunner {
     /// lane's wait→EINTR→`complete`+`deliver_pending_signal` shape.
     fn classify_wait_interrupt(
         &self,
+        context: &crate::kernel::KernelContext,
         tid: ThreadId,
         sig_mask: carrick_abi::WaitSigMask,
     ) -> Option<TierDWait> {
         if self.exiting.load(Ordering::SeqCst) {
             return Some(TierDWait::Leave);
         }
-        if self.deliverable_wait_signal_pending(tid, sig_mask) {
+        if self.deliverable_wait_signal_pending(context, tid, sig_mask) {
             return Some(TierDWait::Interrupted);
         }
         None
@@ -3205,29 +3238,36 @@ impl DirectRunner {
     /// The wait-interrupt predicate handed to the per-thread waiter: wake
     /// for process end or for a deliverable pending signal (which the caller
     /// then classifies — see [`Self::classify_wait_interrupt`]).
-    fn wait_should_interrupt(&self, tid: ThreadId, sig_mask: carrick_abi::WaitSigMask) -> bool {
-        self.exiting.load(Ordering::SeqCst) || self.deliverable_wait_signal_pending(tid, sig_mask)
+    fn wait_should_interrupt(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: ThreadId,
+        sig_mask: carrick_abi::WaitSigMask,
+    ) -> bool {
+        self.exiting.load(Ordering::SeqCst)
+            || self.deliverable_wait_signal_pending(context, tid, sig_mask)
     }
 
     /// Park on host-fd readiness (`WaitOnFds`/`WaitOnPollFds`/select).
     fn wait_on_fds(
         &self,
+        context: &crate::kernel::KernelContext,
         tid: ThreadId,
         fds: &[crate::io_wait::WaitFd],
         timeout: Option<Duration>,
         sig_mask: carrick_abi::WaitSigMask,
         kind: FdWaitKind,
     ) -> TierDWait {
-        let block_mask = self.wait_block_mask(tid, sig_mask);
+        let block_mask = self.wait_block_mask(context, tid, sig_mask);
         let result = with_thread_waiter(tid, |waiter| match kind {
             FdWaitKind::Kqueue => {
                 waiter.wait_with_dispatch_pending(fds, timeout, block_mask, || {
-                    self.wait_should_interrupt(tid, sig_mask)
+                    self.wait_should_interrupt(context, tid, sig_mask)
                 })
             }
             FdWaitKind::Poll => {
                 waiter.wait_poll_with_dispatch_pending(fds, timeout, block_mask, || {
-                    self.wait_should_interrupt(tid, sig_mask)
+                    self.wait_should_interrupt(context, tid, sig_mask)
                 })
             }
         });
@@ -3240,7 +3280,7 @@ impl DirectRunner {
             // dispatch takes a fresh look. Only a classified interrupt
             // (process end / deliverable signal) breaks the wait.
             crate::io_wait::WaitResult::Interrupted => self
-                .classify_wait_interrupt(tid, sig_mask)
+                .classify_wait_interrupt(context, tid, sig_mask)
                 .unwrap_or(TierDWait::Ready),
             crate::io_wait::WaitResult::Errno(_) => TierDWait::Ready,
         }
@@ -3249,14 +3289,15 @@ impl DirectRunner {
     /// Park until the guest child `pid` is reapable (`WaitOnProcExit`).
     fn wait_on_proc_exit(
         &self,
+        context: &crate::kernel::KernelContext,
         tid: ThreadId,
         pid: i32,
         sig_mask: carrick_abi::WaitSigMask,
     ) -> TierDWait {
-        let block_mask = self.wait_block_mask(tid, sig_mask);
+        let block_mask = self.wait_block_mask(context, tid, sig_mask);
         let result = with_thread_waiter(tid, |waiter| {
             waiter.wait_proc_exit_with_dispatch_pending(pid, block_mask, || {
-                self.wait_should_interrupt(tid, sig_mask)
+                self.wait_should_interrupt(context, tid, sig_mask)
             })
         });
         match result {
@@ -3264,18 +3305,23 @@ impl DirectRunner {
                 TierDWait::Ready
             }
             crate::io_wait::WaitResult::Interrupted => self
-                .classify_wait_interrupt(tid, sig_mask)
+                .classify_wait_interrupt(context, tid, sig_mask)
                 .unwrap_or(TierDWait::Ready),
             crate::io_wait::WaitResult::Errno(_) => TierDWait::Ready,
         }
     }
 
     /// Bounded re-poll for a non-terminal child state (`WaitOnProcState`).
-    fn wait_on_proc_state(&self, tid: ThreadId, sig_mask: carrick_abi::WaitSigMask) -> TierDWait {
-        let block_mask = self.wait_block_mask(tid, sig_mask);
+    fn wait_on_proc_state(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: ThreadId,
+        sig_mask: carrick_abi::WaitSigMask,
+    ) -> TierDWait {
+        let block_mask = self.wait_block_mask(context, tid, sig_mask);
         let result = with_thread_waiter(tid, |waiter| {
             waiter.wait_proc_state_with_dispatch_pending(block_mask, || {
-                self.wait_should_interrupt(tid, sig_mask)
+                self.wait_should_interrupt(context, tid, sig_mask)
             })
         });
         match result {
@@ -3283,7 +3329,7 @@ impl DirectRunner {
                 TierDWait::Ready
             }
             crate::io_wait::WaitResult::Interrupted => self
-                .classify_wait_interrupt(tid, sig_mask)
+                .classify_wait_interrupt(context, tid, sig_mask)
                 .unwrap_or(TierDWait::Ready),
             crate::io_wait::WaitResult::Errno(_) => TierDWait::Ready,
         }
@@ -3291,9 +3337,14 @@ impl DirectRunner {
 
     /// A relative sleep (`WaitOnSleep`), interruptible by process end or a
     /// deliverable pending signal (nanosleep's EINTR).
-    fn wait_on_sleep(&self, tid: ThreadId, deadline: Instant) -> TierDWait {
+    fn wait_on_sleep(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: ThreadId,
+        deadline: Instant,
+    ) -> TierDWait {
         let sig_mask = carrick_abi::WaitSigMask::NONE;
-        let block_mask = self.wait_block_mask(tid, sig_mask);
+        let block_mask = self.wait_block_mask(context, tid, sig_mask);
         loop {
             let now = Instant::now();
             if now >= deadline {
@@ -3306,12 +3357,12 @@ impl DirectRunner {
             let park_for = deadline - now;
             let result = with_thread_waiter(tid, |waiter| {
                 waiter.wait_with_dispatch_pending(&[], Some(park_for), block_mask, || {
-                    self.wait_should_interrupt(tid, sig_mask)
+                    self.wait_should_interrupt(context, tid, sig_mask)
                 })
             });
             match result {
                 crate::io_wait::WaitResult::TimedOut => {
-                    if let Some(interrupt) = self.classify_wait_interrupt(tid, sig_mask) {
+                    if let Some(interrupt) = self.classify_wait_interrupt(context, tid, sig_mask) {
                         return interrupt;
                     }
                     if Instant::now() >= deadline {
@@ -3321,7 +3372,7 @@ impl DirectRunner {
                     // sub-tick remainder, so the loop verifies the clock.
                 }
                 crate::io_wait::WaitResult::Ready | crate::io_wait::WaitResult::Interrupted => {
-                    if let Some(interrupt) = self.classify_wait_interrupt(tid, sig_mask) {
+                    if let Some(interrupt) = self.classify_wait_interrupt(context, tid, sig_mask) {
                         return interrupt;
                     }
                     // A fork quiesce is an internal stop-the-world edge, not
@@ -3342,6 +3393,7 @@ impl DirectRunner {
     /// re-run pending classification on each real publication.
     fn wait_on_signals(
         &self,
+        context: &crate::kernel::KernelContext,
         tid: ThreadId,
         wait_set: SigSet,
         block_mask: carrick_abi::SigBlockMask,
@@ -3363,22 +3415,32 @@ impl DirectRunner {
             };
             let park_timeout = crate::vcpu_loop::signal_wait_remaining(*deadline, timeout);
             if let Some(result) =
-                native_signal_wait_pending(&self.dispatcher, tid, wait_set, block_mask)
+                native_signal_wait_pending(&self.dispatcher, context, tid, wait_set, block_mask)
             {
                 return result;
             }
             let result = with_thread_waiter(tid, |waiter| {
                 waiter.wait_with_dispatch_pending(&[], park_timeout, block_mask, || {
                     self.exiting.load(Ordering::SeqCst)
-                        || native_signal_wait_pending(&self.dispatcher, tid, wait_set, block_mask)
-                            .is_some()
+                        || native_signal_wait_pending(
+                            &self.dispatcher,
+                            context,
+                            tid,
+                            wait_set,
+                            block_mask,
+                        )
+                        .is_some()
                 })
             });
             match result {
                 crate::io_wait::WaitResult::Ready | crate::io_wait::WaitResult::Interrupted => {
-                    if let Some(result) =
-                        native_signal_wait_pending(&self.dispatcher, tid, wait_set, block_mask)
-                    {
+                    if let Some(result) = native_signal_wait_pending(
+                        &self.dispatcher,
+                        context,
+                        tid,
+                        wait_set,
+                        block_mask,
+                    ) {
                         return result;
                     }
                 }
@@ -3402,9 +3464,14 @@ impl DirectRunner {
     /// state and defers the actual `deliver_pending_signal` cycle to
     /// [`reenter_until_final`], which runs on the restored HOST stack after
     /// the island's leave leg (the guest stack is then fully parked).
-    fn deliver_pending_at_boundary(&self, ctx: &mut GuestContext, value: i64) -> ServiceVerdict {
+    fn deliver_pending_at_boundary(
+        &self,
+        context: &crate::kernel::KernelContext,
+        ctx: &mut GuestContext,
+        value: i64,
+    ) -> ServiceVerdict {
         let tid = self.current_tid();
-        if !self.deliverable_signal_is_pending(tid) {
+        if !self.deliverable_signal_is_pending(context, tid) {
             return ServiceVerdict::Resume(value);
         }
         // Park the completed syscall state: retval visible in x0, pc already
@@ -3413,6 +3480,7 @@ impl DirectRunner {
         let orig_x0 = ctx.x[0];
         ctx.set_return(value);
         defer_boundary_delivery(DeferredBoundaryDelivery {
+            kernel: context.retain_exact(),
             retval: value,
             orig_x0,
         });
@@ -3425,9 +3493,13 @@ impl DirectRunner {
     /// exactly the ones the deferred delivery consumes (the xsig ring is
     /// DRAINED into dispatcher pending state here, which is a move between
     /// pending stores, not a delivery).
-    fn deliverable_signal_is_pending(&self, tid: ThreadId) -> bool {
-        self.dispatcher.drain_xsignals_process_directed();
-        self.deliverable_wait_signal_pending(tid, carrick_abi::WaitSigMask::NONE)
+    fn deliverable_signal_is_pending(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: ThreadId,
+    ) -> bool {
+        self.dispatcher.drain_xsignals_process_directed(context);
+        self.deliverable_wait_signal_pending(context, tid, carrick_abi::WaitSigMask::NONE)
     }
 
     /// The deferred half of [`Self::deliver_pending_at_boundary`], run by
@@ -3454,6 +3526,7 @@ impl DirectRunner {
         match crate::vcpu_loop::deliver_pending_signal(
             &mut trap,
             &self.dispatcher,
+            &deferred.kernel,
             Some(deferred.retval),
             tid,
             None,
@@ -3490,7 +3563,12 @@ impl DirectRunner {
     /// signal (Linux delivers every deliverable signal before returning to
     /// the interrupted context), and re-enter the guest at the RESTORED pc
     /// with the frame's FP/NZCV state armed for the parked-entry stub.
-    fn service_sigreturn(&self, ctx: &mut GuestContext, tid: ThreadId) -> ServiceVerdict {
+    fn service_sigreturn(
+        &self,
+        context: &crate::kernel::KernelContext,
+        ctx: &mut GuestContext,
+        tid: ThreadId,
+    ) -> ServiceVerdict {
         let Some(group) = active_group() else {
             self.end_process(DirectRunOutcome::Unsupported {
                 syscall: 139,
@@ -3509,11 +3587,12 @@ impl DirectRunner {
             }
         };
         self.dispatcher
-            .restore_signal_mask(tid, SigSet::from_raw(restored_sigmask));
+            .restore_signal_mask(context, tid, SigSet::from_raw(restored_sigmask));
         let restored_pc = trap.pc();
         match crate::vcpu_loop::deliver_pending_signal(
             &mut trap,
             &self.dispatcher,
+            context,
             None,
             tid,
             Some(restored_pc),
@@ -3922,8 +4001,9 @@ impl SyscallTrap for TierDSignalTrap {
 /// A syscall boundary that observed a deliverable pending signal, parked the
 /// completed syscall and left — the delivery itself runs on the host stack
 /// (see [`DirectRunner::deliver_pending_at_boundary`]'s stack constraint).
-#[derive(Clone, Copy)]
 struct DeferredBoundaryDelivery {
+    /// Exact syscall-entry authority retained across the guest-stack leave.
+    kernel: crate::kernel::KernelContext,
     /// The completed syscall's retval (already written to the parked x0).
     retval: i64,
     /// The syscall's ORIGINAL arg0, for the SA_RESTART re-execution.
@@ -3941,8 +4021,8 @@ thread_local! {
     static REENTER_PARKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// A boundary-observed pending signal whose delivery cycle must run on
     /// the host stack before the next re-entry.
-    static PENDING_BOUNDARY_DELIVERY: std::cell::Cell<Option<DeferredBoundaryDelivery>> =
-        const { std::cell::Cell::new(None) };
+    static PENDING_BOUNDARY_DELIVERY: std::cell::RefCell<Option<DeferredBoundaryDelivery>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn request_reenter() {
@@ -3954,11 +4034,13 @@ fn take_reenter() -> bool {
 }
 
 fn defer_boundary_delivery(deferred: DeferredBoundaryDelivery) {
-    PENDING_BOUNDARY_DELIVERY.with(|cell| cell.set(Some(deferred)));
+    PENDING_BOUNDARY_DELIVERY.with(|cell| {
+        *cell.borrow_mut() = Some(deferred);
+    });
 }
 
 fn take_deferred_boundary_delivery() -> Option<DeferredBoundaryDelivery> {
-    PENDING_BOUNDARY_DELIVERY.with(std::cell::Cell::take)
+    PENDING_BOUNDARY_DELIVERY.with(|cell| cell.borrow_mut().take())
 }
 
 /// Drive the leave/re-enter loop for the guest thread running on THIS host
@@ -4370,7 +4452,11 @@ mod tests {
         let child_runner = Arc::clone(&runner);
         let sleeper = std::thread::spawn(move || {
             parked_tx.send(()).expect("announce wait entry");
-            child_runner.wait_on_sleep(tid, Instant::now() + Duration::from_secs(2))
+            child_runner.wait_on_sleep(
+                &child_runner.dispatcher.exact_signal_context_for_test(),
+                tid,
+                Instant::now() + Duration::from_secs(2),
+            )
         });
         parked_rx.recv().expect("sleeper reached wait path");
         std::thread::sleep(Duration::from_millis(100));
@@ -4432,7 +4518,11 @@ mod tests {
 
         let runner = DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
         assert!(matches!(
-            runner.service_blocking_host_write(64, write),
+            runner.service_blocking_host_write(
+                &runner.dispatcher.exact_signal_context_for_test(),
+                64,
+                write,
+            ),
             ServiceVerdict::Resume(value) if value == expected as i64
         ));
         assert_eq!(reader.join().expect("reader thread"), expected);

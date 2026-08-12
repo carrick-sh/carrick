@@ -7899,7 +7899,6 @@ fn retire_gated_clone_thread(
     slice_off: usize,
 ) {
     shared.registry.exit(child_tid);
-    shared.dispatcher.forget_thread_signal_state(child_tid);
     shared.free_slice(slice_off);
 }
 
@@ -7994,9 +7993,6 @@ fn spawn_clone_thread(
             return Err(CloneThreadSpawnError::Fatal(error.to_string()));
         }
     };
-    shared
-        .dispatcher
-        .inherit_thread_signal_mask(parent_tid, child_tid);
 
     let mut child_snapshot = req.parent_snapshot;
     child_snapshot.gpr[reg::RAX] = 0;
@@ -9957,12 +9953,6 @@ fn run_x86_thread(
                                 // could collide with the child's tid base).
                                 // `forkaltstack`: without this the inherited alt
                                 // stack is lost.
-                                active
-                                    .dispatcher
-                                    .retire_sibling_thread_signal_state(parent_tid);
-                                active
-                                    .dispatcher
-                                    .migrate_thread_signal_state(parent_tid, tid);
                                 if let Err(error) = active.dispatcher.rlimit_cpu_after_fork_child()
                                 {
                                     fault_detail = Some(format!(
@@ -10145,9 +10135,6 @@ fn run_x86_thread(
                                         Some(format!("execve host-thread rekey failed: {error}"));
                                     break;
                                 }
-                                active
-                                    .dispatcher
-                                    .rekey_thread_signal_state_after_exec(prior_tid, exec_tid);
                                 tid = exec_tid;
                                 waiter.rekey_after_exec(tid);
                                 identity_stamp = native_x86_identity_stamp(&active, tid);
@@ -10156,7 +10143,6 @@ fn run_x86_thread(
                                 // default, close O_CLOEXEC fds, new /proc identity.
                                 active.dispatcher.reset_memory_state_on_execve();
                                 active.dispatcher.reset_signal_handlers_on_execve();
-                                active.dispatcher.close_cloexec_fds();
                                 let argv_strings: Vec<String> = argv
                                     .iter()
                                     .map(|a| String::from_utf8_lossy(a).into_owned())
@@ -10843,6 +10829,26 @@ fn service_syscall(
         ));
     }
 
+    let outcome = match outcome {
+        DispatchOutcome::Fork { flags, .. }
+            if SyscallDispatcher::host_fork_file_authority_rejection(&kernel_context, flags)
+                .is_some() =>
+        {
+            let reason =
+                SyscallDispatcher::host_fork_file_authority_rejection(&kernel_context, flags)
+                    .unwrap_or("host-fork file authority rejection");
+            tracing::warn!(
+                flags,
+                reason,
+                "native x86 host-fork file authority rejected clone"
+            );
+            DispatchOutcome::Errno {
+                errno: crate::linux_abi::LINUX_EOPNOTSUPP,
+            }
+        }
+        other => other,
+    };
+
     match outcome {
         // A syscall that returns to the guest: write the retval, then deliver
         // any pending, deliverable signals at this syscall-return safe point
@@ -11207,7 +11213,6 @@ fn service_syscall(
                 return Step::Fault(format!("retire native x86 one-task Kernel thread: {error}"));
             }
             crate::thread::set_current_thread_state(tid, 'Z');
-            dispatcher.forget_thread_signal_state(tid);
             if last {
                 Step::Exit(code)
             } else {

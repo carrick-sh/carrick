@@ -421,6 +421,9 @@ use signal::el0_debug_signal;
 /// the configured child-exit signal.
 struct HvpatchRuntimeEndpoint {
     kernel: Weak<KernelState>,
+    /// Exact parent task generation retained at endpoint publication. Child
+    /// exit notification must not recapture a newer registry association.
+    signal_context: crate::kernel::KernelContext,
     futex: Arc<FutexTable>,
     kicker: Arc<dyn VcpuRegistry>,
 }
@@ -483,11 +486,11 @@ impl HvpatchRuntimeDirectory {
         if let Some(signal) = signal
             && parent_kernel
                 .dispatcher
-                .child_exit_signal_needs_process_pump(signal as u32)
+                .child_exit_signal_needs_process_pump(&endpoint.signal_context, signal as u32)
         {
             parent_kernel
                 .dispatcher
-                .mark_in_process_signal_pending(signal);
+                .mark_in_process_signal_pending(&endpoint.signal_context, signal);
         }
         // Child waitability is independent of SIGCHLD disposition. The Kernel
         // zombie is durable, but a parent can be between its initial wait query
@@ -735,10 +738,17 @@ impl KernelState {
         else {
             return;
         };
+        let binding = process.task_binding();
+        let leader = crate::kernel::LinuxTid::for_task_leader(binding.task_id());
+        let signal_context = binding.capture(leader).unwrap_or_else(|error| {
+            tracing::error!(%error, "cannot retain HVPatch runtime endpoint context");
+            std::process::abort();
+        });
         directory.register(
             process.task_key(),
             HvpatchRuntimeEndpoint {
                 kernel: Arc::downgrade(self),
+                signal_context,
                 futex,
                 kicker,
             },
@@ -1685,6 +1695,11 @@ where
                     "capture mandatory syscall kernel context: {error}"
                 ))
             })?;
+        // Retain the exact entry generation across every blocking continuation
+        // and the post-syscall signal-delivery boundary. Lifecycle outcomes
+        // consume this slot through `take_service_kernel_context`; ordinary
+        // outcomes leave it available to signal delivery below.
+        self.service_kernel_context = Some(kernel_context.retain_exact());
         let sync_shared_file_aliases = engine.needs_shared_file_alias_sync();
         loop {
             if sync_shared_file_aliases && !matches!(frame.number.raw(), 260 | 95) {
@@ -1723,6 +1738,7 @@ where
                             crate::dispatch::BlockingHostWriteStep::Done(outcome) => {
                                 return Ok(raise_sigpipe_for_blocking_write(
                                     &kernel.dispatcher,
+                                    &kernel_context,
                                     &write,
                                     outcome,
                                 ));
@@ -1802,6 +1818,7 @@ where
                             threaded_fd_wait_should_interrupt(
                                 self.fork_is_quiescing(),
                                 kernel.dispatcher.has_deliverable_dispatch_pending_for_wait(
+                                    &kernel_context,
                                     self.this_tid,
                                     sig_mask,
                                 ),
@@ -1864,6 +1881,7 @@ where
                             threaded_fd_wait_should_interrupt(
                                 self.fork_is_quiescing(),
                                 kernel.dispatcher.has_deliverable_dispatch_pending_for_wait(
+                                    &kernel_context,
                                     self.this_tid,
                                     sig_mask,
                                 ),
@@ -1946,6 +1964,7 @@ where
                             threaded_fd_wait_should_interrupt(
                                 self.fork_is_quiescing(),
                                 kernel.dispatcher.has_deliverable_dispatch_pending_for_wait(
+                                    &kernel_context,
                                     self.this_tid,
                                     sig_mask,
                                 ),
@@ -2000,9 +2019,11 @@ where
                             // waitpid carries WaitSigMask::Additive: its set is
                             // `non_interrupting_signal_mask` (a persistent-mask
                             // superset), so the persistent-mask union is a no-op.
-                            kernel
-                                .dispatcher
-                                .has_deliverable_dispatch_pending_for_wait(self.this_tid, sig_mask)
+                            kernel.dispatcher.has_deliverable_dispatch_pending_for_wait(
+                                &kernel_context,
+                                self.this_tid,
+                                sig_mask,
+                            )
                         },
                     );
                     if let Some(outcome) = self.exec_replaced_thread_exit() {
@@ -2036,9 +2057,11 @@ where
                     let wait_result = self.waiter.wait_proc_state_with_dispatch_pending(
                         sig_mask.block_mask(),
                         || {
-                            kernel
-                                .dispatcher
-                                .has_deliverable_dispatch_pending_for_wait(self.this_tid, sig_mask)
+                            kernel.dispatcher.has_deliverable_dispatch_pending_for_wait(
+                                &kernel_context,
+                                self.this_tid,
+                                sig_mask,
+                            )
                         },
                     );
                     if let Some(outcome) = self.exec_replaced_thread_exit() {
@@ -2086,6 +2109,7 @@ where
                             self.fork_is_quiescing()
                                 || !self.registry.is_live(self.this_tid)
                                 || kernel.dispatcher.has_deliverable_dispatch_pending_for_wait(
+                                    &kernel_context,
                                     self.this_tid,
                                     sig_mask,
                                 )
@@ -2176,13 +2200,17 @@ where
                     // still exits as EINTR. Blocked/ignored non-set signals do
                     // not return true, so the inner loop does not spin.
                     let signals_interrupt_pending = || {
-                        kernel.dispatcher.drain_xsignals_process_directed();
+                        kernel
+                            .dispatcher
+                            .drain_xsignals_process_directed(&kernel_context);
                         kernel.dispatcher.has_deliverable_dispatch_pending_for_wait(
+                            &kernel_context,
                             self.this_tid,
                             carrick_abi::WaitSigMask::Replace(carrick_abi::SigSet::from_raw(
                                 block_mask.raw(),
                             )),
                         ) || kernel.dispatcher.signal_wait_should_eintr(
+                            &kernel_context,
                             self.this_tid,
                             wait_set,
                             block_mask,
@@ -2299,6 +2327,7 @@ where
                             // Re-dispatching instead would find nothing in
                             // `wait_set` and re-park forever.
                             if kernel.dispatcher.signal_wait_should_eintr(
+                                &kernel_context,
                                 self.this_tid,
                                 wait_set,
                                 block_mask,
@@ -2328,8 +2357,11 @@ where
                         break Ok(DispatchOutcome::Returned { value: 0 });
                     }
                     let sleep_interrupt_pending = || {
-                        kernel.dispatcher.drain_xsignals_process_directed();
+                        kernel
+                            .dispatcher
+                            .drain_xsignals_process_directed(&kernel_context);
                         kernel.dispatcher.has_deliverable_dispatch_pending_for_wait(
+                            &kernel_context,
                             self.this_tid,
                             carrick_abi::WaitSigMask::Additive(carrick_abi::SigSet::EMPTY),
                         )
@@ -2579,17 +2611,7 @@ where
                         value: va.raw() as i64,
                     });
                 }
-                other => {
-                    if matches!(
-                        other,
-                        DispatchOutcome::Fork { .. }
-                            | DispatchOutcome::CloneThread { .. }
-                            | DispatchOutcome::Execve { .. }
-                    ) {
-                        self.service_kernel_context = Some(kernel_context.retain_exact());
-                    }
-                    break Ok(other);
-                }
+                other => break Ok(other),
             }
         }
     }
@@ -2823,8 +2845,17 @@ where
                     // (hv_vcpus_exit) with no syscall pending — deliver a signal at
                     // the interrupted PC, then resume.
                     let pc = engine.current_pc()?;
+                    let signal_context = kernel
+                        .dispatcher
+                        .capture_kernel_context(state.linux_tid)
+                        .map_err(|error| {
+                            RuntimeError::Configuration(format!(
+                                "capture forced-exit signal context: {error}"
+                            ))
+                        })?;
                     if let Some(outcome) = service_signals_threaded(
                         &kernel,
+                        &signal_context,
                         &mut engine,
                         state.this_tid,
                         None,
@@ -2899,8 +2930,17 @@ where
                         let si_code =
                             signal::upgrade_protection_si_code(&engine, signum, si_code, si_addr);
                         let interrupted_pc = if from_el0_direct { Some(elr) } else { None };
+                        let fault_context = kernel
+                            .dispatcher
+                            .capture_kernel_context(state.linux_tid)
+                            .map_err(|error| {
+                                RuntimeError::Configuration(format!(
+                                    "capture synchronous-fault signal context: {error}"
+                                ))
+                            })?;
                         if let Some(outcome) = deliver_fault_signal(
                             &kernel,
+                            &fault_context,
                             &mut engine,
                             state.this_tid,
                             signum,
@@ -2948,8 +2988,17 @@ where
                     let si_code =
                         signal::upgrade_protection_si_code(&engine, signum, si_code, fault_addr);
                     let interrupted_pc = Some(engine.current_pc()?);
+                    let fault_context = kernel
+                        .dispatcher
+                        .capture_kernel_context(state.linux_tid)
+                        .map_err(|error| {
+                        RuntimeError::Configuration(format!(
+                            "capture guest-fault signal context: {error}"
+                        ))
+                    })?;
                     if let Some(outcome) = deliver_fault_signal(
                         &kernel,
+                        &fault_context,
                         &mut engine,
                         state.this_tid,
                         signum,
@@ -3280,7 +3329,14 @@ where
                         }
                         Err(e) => return Err(e.into()),
                     };
+                    let signal_context =
+                        state.service_kernel_context.as_ref().ok_or_else(|| {
+                            RuntimeError::Configuration(
+                                "sigreturn lost its exact Kernel context".to_owned(),
+                            )
+                        })?;
                     kernel.dispatcher.restore_signal_mask(
+                        signal_context,
                         state.this_tid,
                         carrick_abi::SigSet::from_raw(restored_sigmask),
                     );
@@ -3416,8 +3472,14 @@ where
             // Signal delivery. A signal targeted at THIS tid (guest tgkill/tkill)
             // takes priority; otherwise a process-directed signal in the global
             // slot is deliverable by any thread.
+            let signal_context = state.service_kernel_context.as_ref().ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "post-syscall signal delivery lost its exact Kernel context".to_owned(),
+                )
+            })?;
             if let Some(outcome) = service_signals_threaded(
                 &kernel,
+                signal_context,
                 &mut engine,
                 state.this_tid,
                 last_syscall_retval,
@@ -3492,7 +3554,6 @@ where
             crate::run_state::clear_guest_tid(state.this_tid.raw());
             crate::host_signal::forget_thread(state.this_tid.raw());
             trace_hvpatch_thread_teardown(&kernel, state.this_tid, 4);
-            kernel.dispatcher.forget_thread_signal_state(state.this_tid);
             trace_hvpatch_thread_teardown(&kernel, state.this_tid, 5);
 
             if let Some(process) = kernel.hvpatch_process.as_ref() {
@@ -3553,7 +3614,6 @@ where
                         }
                     }
                 }
-                kernel.dispatcher.retire_hvpatch_process_fds();
                 let current_parent = match process.publish_exit_status(published_exit_code) {
                     Ok(parent) => parent,
                     Err(error) => {
@@ -3565,6 +3625,9 @@ where
                         std::process::abort();
                     }
                 };
+                kernel
+                    .dispatcher
+                    .retire_hvpatch_process_fds(&terminal_context);
                 tracing::trace!(
                     pid = process.pid(),
                     exit_code = published_exit_code,
@@ -3673,7 +3736,6 @@ where
             crate::run_state::clear_guest_tid(state.this_tid.raw());
             crate::host_signal::forget_thread(state.this_tid.raw());
             trace_hvpatch_thread_teardown(&kernel, state.this_tid, 4);
-            kernel.dispatcher.forget_thread_signal_state(state.this_tid);
             trace_hvpatch_thread_teardown(&kernel, state.this_tid, 5);
             engine.destroy_vcpu_on_thread_exit();
             trace_hvpatch_thread_teardown(&kernel, state.this_tid, 6);
@@ -3791,6 +3853,7 @@ pub(super) fn is_default_stop_signal(signum: i32) -> bool {
 /// should end; `None` to keep running.
 fn service_signals_threaded<E: ThreadedEngine>(
     kernel: &Kernel,
+    context: &crate::kernel::KernelContext,
     engine: &mut E,
     this_tid: ThreadId,
     last_syscall_retval: Option<i64>,
@@ -3801,6 +3864,7 @@ fn service_signals_threaded<E: ThreadedEngine>(
         if let Some(action) = deliver_pending_signal(
             engine,
             &kernel.dispatcher,
+            context,
             last_syscall_retval,
             this_tid,
             interrupted_pc,

@@ -6,7 +6,13 @@ use super::*;
 use crate::linux_abi::LinuxErrno;
 
 pub(super) fn event_ring_host_fd(open_file: &OpenFile) -> i32 {
-    match &*open_file.description.read() {
+    let Some(description) = open_file
+        .description
+        .concrete_backing::<RwLock<OpenDescription>>()
+    else {
+        return -1;
+    };
+    match &*description.read() {
         OpenDescription::HostPipe { host_fd, .. }
         | OpenDescription::HostFile { host_fd, .. }
         | OpenDescription::HostSocket { host_fd, .. } => host_fd.raw(),
@@ -47,16 +53,15 @@ impl SyscallDispatcher {
 
     /// The guest's current soft RLIMIT_NOFILE as an i32 fd ceiling.
     pub(in crate::dispatch) fn nofile_limit(&self) -> i32 {
-        self.io
-            .nofile_soft
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.captured_file_table()
+            .nofile_soft()
             .min(i32::MAX as u64) as i32
     }
 
     /// Clear the "closed" flag for a reused stdio fd (it is open again).
     pub(in crate::dispatch) fn clear_closed_stdio(&self, fd: i32) {
         if (0..3).contains(&fd) {
-            self.io.closed_stdio.lock()[fd as usize] = false;
+            self.captured_file_table().lock_closed_stdio()[fd as usize] = false;
         }
     }
 
@@ -82,7 +87,7 @@ impl SyscallDispatcher {
         if self.fd_table_contains(fd) {
             return false;
         }
-        self.io.closed_stdio.lock()[fd as usize]
+        self.captured_file_table().lock_closed_stdio()[fd as usize]
     }
 
     pub(in crate::dispatch) fn install_fd_at_or_above(
@@ -90,12 +95,13 @@ impl SyscallDispatcher {
         min_fd: i32,
         open_file: OpenFile,
     ) -> Result<i32, OpenFile> {
+        let files = self.captured_file_table();
         let limit = self.nofile_limit();
-        let mut table = self.io.open_files.write();
-        let mut next_fd = self.io.next_fd.lock();
+        let mut table = files.write_open_files();
+        let mut next_fd = files.lock_next_fd();
         // Lock order: open_files → closed_stdio (the close path never holds both).
         let fd = {
-            let closed = self.io.closed_stdio.lock();
+            let closed = files.lock_closed_stdio();
             let start = if min_fd <= *next_fd { *next_fd } else { min_fd };
             match Self::first_free_fd(&table, start, None, &closed, limit) {
                 Some(fd) => fd,
@@ -108,7 +114,7 @@ impl SyscallDispatcher {
         crate::event_ring::rec(crate::event_ring::FDOPEN, fd, host_fd, min_fd);
         self.clear_closed_stdio(fd);
         if fd == *next_fd {
-            let closed = self.io.closed_stdio.lock();
+            let closed = files.lock_closed_stdio();
             *next_fd = Self::first_free_fd(&table, fd.saturating_add(1), None, &closed, limit)
                 .unwrap_or(limit);
         }
@@ -121,11 +127,12 @@ impl SyscallDispatcher {
         first: OpenFile,
         second: OpenFile,
     ) -> Result<(i32, i32), (OpenFile, OpenFile)> {
+        let files = self.captured_file_table();
         let limit = self.nofile_limit();
-        let mut table = self.io.open_files.write();
-        let mut next_fd = self.io.next_fd.lock();
+        let mut table = files.write_open_files();
+        let mut next_fd = files.lock_next_fd();
         let (first_fd, second_fd) = {
-            let closed = self.io.closed_stdio.lock();
+            let closed = files.lock_closed_stdio();
             let start = if min_fd <= *next_fd { *next_fd } else { min_fd };
             let Some(first_fd) = Self::first_free_fd(&table, start, None, &closed, limit) else {
                 return Err((first, second));
@@ -152,7 +159,7 @@ impl SyscallDispatcher {
         self.clear_closed_stdio(first_fd);
         self.clear_closed_stdio(second_fd);
         if first_fd == *next_fd {
-            let closed = self.io.closed_stdio.lock();
+            let closed = files.lock_closed_stdio();
             *next_fd =
                 Self::first_free_fd(&table, second_fd.saturating_add(1), None, &closed, limit)
                     .unwrap_or(limit);
@@ -164,7 +171,8 @@ impl SyscallDispatcher {
         if fd < 0 {
             return;
         }
-        let mut next_fd = self.io.next_fd.lock();
+        let files = self.captured_file_table();
+        let mut next_fd = files.lock_next_fd();
         if fd < *next_fd {
             *next_fd = fd;
         }
@@ -175,7 +183,8 @@ impl SyscallDispatcher {
         description: OpenDescription,
         fd_flags: u64,
     ) -> DispatchOutcome {
-        let open_file = OpenFile::new(Arc::new(RwLock::new(description)), fd_flags);
+        let open_file =
+            OpenFile::from_open_description(Arc::new(RwLock::new(description)), fd_flags);
         // POSIX lowest-free-descriptor (min_fd = 0): reuses a stdio number the
         // guest explicitly closed — busybox ash's background-job forkchild does
         // `close(0); open("/dev/null")` and treats anything but fd 0 as an error
@@ -187,11 +196,16 @@ impl SyscallDispatcher {
     }
 
     pub(in crate::dispatch) fn open_file(&self, fd: i32) -> Option<OpenFile> {
-        self.io.open_files.read().get(&fd).cloned()
+        self.captured_file_table()
+            .read_open_files()
+            .get(&fd)
+            .cloned()
     }
 
     pub(in crate::dispatch) fn fd_table_contains(&self, fd: i32) -> bool {
-        self.io.open_files.read().contains_key(&fd)
+        self.captured_file_table()
+            .read_open_files()
+            .contains_key(&fd)
     }
 
     /// The guest's currently-open fd numbers, sorted — for `/proc/self/fd` (and
@@ -201,8 +215,12 @@ impl SyscallDispatcher {
     pub(in crate::dispatch) fn open_fd_numbers(&self) -> Vec<i32> {
         #[cfg(test)]
         OPEN_FD_NUMBERS_CALLS.with(|calls| calls.set(calls.get() + 1));
-        let mut fds: std::collections::BTreeSet<i32> =
-            self.io.open_files.read().keys().copied().collect();
+        let mut fds: std::collections::BTreeSet<i32> = self
+            .captured_file_table()
+            .read_open_files()
+            .keys()
+            .copied()
+            .collect();
         for stdio in 0..3 {
             if !self.stdio_is_closed(stdio) {
                 fds.insert(stdio);

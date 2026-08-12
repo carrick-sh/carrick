@@ -21,15 +21,18 @@
 
 use super::*;
 use crate::linux_abi::{
-    LINUX_IORING_ENTER_EXT_ARG, LINUX_IORING_ENTER_FLAGS_MASK, LINUX_IORING_FEAT_NODROP,
-    LINUX_IORING_FEAT_SINGLE_MMAP, LINUX_IORING_OFF_CQ_RING, LINUX_IORING_OFF_SQ_RING,
-    LINUX_IORING_OFF_SQES, LINUX_IORING_OP_ACCEPT, LINUX_IORING_OP_CLOSE, LINUX_IORING_OP_CONNECT,
-    LINUX_IORING_OP_FSYNC, LINUX_IORING_OP_NOP, LINUX_IORING_OP_POLL_ADD, LINUX_IORING_OP_READ,
-    LINUX_IORING_OP_READV, LINUX_IORING_OP_RECV, LINUX_IORING_OP_RECVMSG, LINUX_IORING_OP_SEND,
-    LINUX_IORING_OP_SENDMSG, LINUX_IORING_OP_WRITE, LINUX_IORING_OP_WRITEV, LinuxIoCqringOffsets,
-    LinuxIoSqringOffsets, LinuxIoUringCqe, LinuxIoUringParams, LinuxIoUringSqe, LinuxIovec,
-    LinuxMsghdr,
+    LINUX_IORING_ENTER_EXT_ARG, LINUX_IORING_ENTER_FLAGS_MASK, LINUX_IORING_FEAT_SINGLE_MMAP,
+    LINUX_IORING_OFF_CQ_RING, LINUX_IORING_OFF_SQ_RING, LINUX_IORING_OFF_SQES,
+    LINUX_IORING_OP_ACCEPT, LINUX_IORING_OP_CLOSE, LINUX_IORING_OP_CONNECT, LINUX_IORING_OP_FSYNC,
+    LINUX_IORING_OP_NOP, LINUX_IORING_OP_POLL_ADD, LINUX_IORING_OP_READ, LINUX_IORING_OP_READV,
+    LINUX_IORING_OP_RECV, LINUX_IORING_OP_RECVMSG, LINUX_IORING_OP_SEND, LINUX_IORING_OP_SENDMSG,
+    LINUX_IORING_OP_WRITE, LINUX_IORING_OP_WRITEV, LinuxIoCqringOffsets, LinuxIoSqringOffsets,
+    LinuxIoUringCqe, LinuxIoUringParams, LinuxIoUringSqe, LinuxIovec, LinuxMsghdr,
 };
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use zerocopy::{FromBytes, IntoBytes};
 
 const U32: u32 = 4;
@@ -117,7 +120,7 @@ impl RingLayout {
     pub(crate) fn fill_params(&self, params: &mut LinuxIoUringParams) {
         params.sq_entries = self.sq_entries;
         params.cq_entries = self.cq_entries;
-        params.features = LINUX_IORING_FEAT_SINGLE_MMAP | LINUX_IORING_FEAT_NODROP;
+        params.features = LINUX_IORING_FEAT_SINGLE_MMAP;
         params.sq_off = self.sq_off;
         params.cq_off = self.cq_off;
     }
@@ -127,18 +130,518 @@ fn align_up_u32(v: u32, align: u32) -> u32 {
     v.div_ceil(align) * align
 }
 
-/// A live io_uring instance, tracked in a side table keyed by the ring fd (so
-/// no `OpenDescription` variant — and its ~24 match sites — is needed). The SQ/
-/// CQ rings and SQE array live in the guest mmap arena at these addresses;
-/// carrick reads/writes them coherently, and the guest maps them via
-/// `mmap(ring_fd, IORING_OFF_*)` which returns these same addresses.
-#[derive(Debug, Clone, Copy)]
-pub(in crate::dispatch) struct IoUringState {
-    pub layout: RingLayout,
-    /// Base of the combined SQ+CQ ring mapping (IORING_OFF_SQ_RING/CQ_RING).
-    pub ring_addr: u64,
-    /// Base of the SQE-array mapping (IORING_OFF_SQES).
-    pub sqes_addr: u64,
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum IoUringRegion {
+    SqCq,
+    Sqes,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IoUringRegionLayout {
+    pub guest_mmap_offset: u64,
+    pub backing_offset: u64,
+    pub required_len: u64,
+    pub mapped_extent: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HostBackingIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct IoUringLayoutSnapshot {
+    pub sq_entries: u32,
+    pub cq_entries: u32,
+    pub ring_bytes: u64,
+    pub sqes_bytes: u64,
+    pub sqes_backing_offset: u64,
+    pub backing_len: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IoUringDescriptionSnapshot {
+    pub layout: IoUringLayoutSnapshot,
+    pub data_identity: HostBackingIdentity,
+    pub lock_identity: HostBackingIdentity,
+    pub backing_len: u64,
+    pub status_flags: u64,
+    pub logical_fd_refs: usize,
+}
+
+struct SharedMapping {
+    ptr: *mut u8,
+    len: usize,
+}
+
+unsafe impl Send for SharedMapping {}
+unsafe impl Sync for SharedMapping {}
+
+impl SharedMapping {
+    fn map(fd: i32, len: usize) -> Result<Self, crate::linux_abi::LinuxErrno> {
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(linux_errno::ENOMEM);
+        }
+        Ok(Self {
+            ptr: ptr.cast(),
+            len,
+        })
+    }
+
+    fn bytes(&self, offset: u64, len: usize) -> Option<&[u8]> {
+        let offset = usize::try_from(offset).ok()?;
+        let end = offset.checked_add(len)?;
+        (end <= self.len).then(|| unsafe { std::slice::from_raw_parts(self.ptr.add(offset), len) })
+    }
+
+    fn write_bytes(&self, offset: u64, bytes: &[u8]) -> Option<()> {
+        let offset = usize::try_from(offset).ok()?;
+        let end = offset.checked_add(bytes.len())?;
+        if end > self.len {
+            return None;
+        }
+        // Queue payload access is serialized by the io_uring backing's local
+        // and cross-process locks. Control words use atomic_u32 instead.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(offset), bytes.len());
+        }
+        Some(())
+    }
+
+    fn atomic_u32(&self, offset: u64) -> Option<&AtomicU32> {
+        let offset = usize::try_from(offset).ok()?;
+        let end = offset.checked_add(core::mem::size_of::<AtomicU32>())?;
+        (end <= self.len && (unsafe { self.ptr.add(offset) } as usize).is_multiple_of(4))
+            .then(|| unsafe { &*self.ptr.add(offset).cast::<AtomicU32>() })
+    }
+}
+
+impl Drop for SharedMapping {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.ptr.cast(), self.len) };
+    }
+}
+
+pub(crate) struct IoUringBacking {
+    layout: RingLayout,
+    regions: [IoUringRegionLayout; 2],
+    data_fd: OwnedFd,
+    data_identity: HostBackingIdentity,
+    control_view: SharedMapping,
+    lock_fd: OwnedFd,
+    lock_identity: HostBackingIdentity,
+    local_enter: parking_lot::Mutex<()>,
+    /// Generic anonymous-inode metadata (status flags, fd-reference count,
+    /// and `/proc/self/fd` label) owned by this typed ring backing. Queue and
+    /// mapping authority never live in this view.
+    open_metadata: parking_lot::RwLock<OpenDescription>,
+}
+
+impl std::fmt::Debug for IoUringBacking {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IoUringBacking")
+            .field("layout", &self.layout)
+            .field("data_identity", &self.data_identity)
+            .field("lock_identity", &self.lock_identity)
+            .finish_non_exhaustive()
+    }
+}
+
+fn host_identity(fd: i32) -> Result<(HostBackingIdentity, u64), crate::linux_abi::LinuxErrno> {
+    let mut stat: libc::stat = unsafe { core::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 || stat.st_size < 0 {
+        return Err(linux_errno::EIO);
+    }
+    Ok((
+        HostBackingIdentity {
+            device: stat.st_dev as u64,
+            inode: stat.st_ino,
+        },
+        stat.st_size as u64,
+    ))
+}
+
+impl IoUringBacking {
+    pub(crate) fn create(
+        entries: u32,
+        page_size: u64,
+    ) -> Result<Arc<Self>, crate::linux_abi::LinuxErrno> {
+        let layout = RingLayout::new(entries);
+        let host_page_size = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+            .ok()
+            .filter(|page| *page != 0)
+            .and_then(|page| u64::try_from(page).ok())
+            .unwrap_or(page_size);
+        let backing_granule = page_size.max(host_page_size);
+        let ring_extent = align_up_u64(layout.ring_bytes as u64, backing_granule)
+            .ok_or(linux_errno::EOVERFLOW)?;
+        let sqes_extent = align_up_u64(layout.sqes_bytes as u64, backing_granule)
+            .ok_or(linux_errno::EOVERFLOW)?;
+        let backing_len = ring_extent
+            .checked_add(sqes_extent)
+            .ok_or(linux_errno::EOVERFLOW)?;
+        let data_file = tempfile::tempfile().map_err(|_| linux_errno::ENOMEM)?;
+        let data_fd: OwnedFd = data_file.into();
+        if unsafe { libc::ftruncate(data_fd.as_raw_fd(), backing_len as libc::off_t) } != 0 {
+            return Err(linux_errno::ENOMEM);
+        }
+        let lock_file = tempfile::tempfile().map_err(|_| linux_errno::ENOMEM)?;
+        let lock_fd: OwnedFd = lock_file.into();
+        if unsafe { libc::ftruncate(lock_fd.as_raw_fd(), 1) } != 0 {
+            return Err(linux_errno::ENOMEM);
+        }
+        for fd in [data_fd.as_raw_fd(), lock_fd.as_raw_fd()] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0
+            {
+                return Err(linux_errno::EIO);
+            }
+        }
+        let (data_identity, actual_len) = host_identity(data_fd.as_raw_fd())?;
+        if actual_len != backing_len {
+            return Err(linux_errno::EIO);
+        }
+        let (lock_identity, lock_len) = host_identity(lock_fd.as_raw_fd())?;
+        if lock_len != 1 || data_identity == lock_identity {
+            return Err(linux_errno::EIO);
+        }
+        let control_view = SharedMapping::map(
+            data_fd.as_raw_fd(),
+            usize::try_from(backing_len).map_err(|_| linux_errno::EOVERFLOW)?,
+        )?;
+        let backing = Arc::new(Self {
+            layout,
+            regions: [
+                IoUringRegionLayout {
+                    guest_mmap_offset: LINUX_IORING_OFF_SQ_RING,
+                    backing_offset: 0,
+                    required_len: layout.ring_bytes as u64,
+                    mapped_extent: ring_extent,
+                },
+                IoUringRegionLayout {
+                    guest_mmap_offset: LINUX_IORING_OFF_SQES,
+                    backing_offset: ring_extent,
+                    required_len: layout.sqes_bytes as u64,
+                    mapped_extent: sqes_extent,
+                },
+            ],
+            data_fd,
+            data_identity,
+            control_view,
+            lock_fd,
+            lock_identity,
+            local_enter: parking_lot::Mutex::new(()),
+            open_metadata: parking_lot::RwLock::new(OpenDescription::SyntheticFile {
+                base: OpenDescriptionBase::new(LINUX_O_RDWR),
+                path: "anon_inode:[io_uring]".to_owned(),
+                contents: Vec::new(),
+                offset: 0,
+            }),
+        });
+        backing.initialize_controls()?;
+        Ok(backing)
+    }
+
+    fn initialize_controls(&self) -> Result<(), crate::linux_abi::LinuxErrno> {
+        for (offset, value) in [
+            (self.layout.sq_off.ring_mask, self.layout.sq_entries - 1),
+            (self.layout.sq_off.ring_entries, self.layout.sq_entries),
+            (self.layout.cq_off.ring_mask, self.layout.cq_entries - 1),
+            (self.layout.cq_off.ring_entries, self.layout.cq_entries),
+        ] {
+            self.control_view
+                .atomic_u32(offset as u64)
+                .ok_or(linux_errno::EIO)?
+                .store(value, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn region(&self, offset: u64) -> Option<(IoUringRegion, IoUringRegionLayout)> {
+        match offset {
+            LINUX_IORING_OFF_SQ_RING | LINUX_IORING_OFF_CQ_RING => {
+                Some((IoUringRegion::SqCq, self.regions[0]))
+            }
+            LINUX_IORING_OFF_SQES => Some((IoUringRegion::Sqes, self.regions[1])),
+            _ => None,
+        }
+    }
+
+    #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
+    pub(crate) fn reexec_fds(&self) -> [(i32, i32, HostBackingIdentity); 2] {
+        let record = |fd: &OwnedFd, identity| {
+            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+            (fd.as_raw_fd(), flags, identity)
+        };
+        [
+            record(&self.data_fd, self.data_identity),
+            record(&self.lock_fd, self.lock_identity),
+        ]
+    }
+
+    #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
+    pub(crate) fn reexec_layout(&self) -> IoUringLayoutSnapshot {
+        self.layout_snapshot()
+    }
+
+    #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
+    pub(crate) fn restore(
+        data_fd: OwnedFd,
+        lock_fd: OwnedFd,
+        expected_data: HostBackingIdentity,
+        expected_lock: HostBackingIdentity,
+        snapshot: IoUringLayoutSnapshot,
+    ) -> Result<Arc<Self>, crate::linux_abi::LinuxErrno> {
+        let layout = RingLayout::new(snapshot.sq_entries);
+        if layout.sq_entries != snapshot.sq_entries
+            || layout.cq_entries != snapshot.cq_entries
+            || layout.ring_bytes as u64 != snapshot.ring_bytes
+            || layout.sqes_bytes as u64 != snapshot.sqes_bytes
+        {
+            return Err(linux_errno::EINVAL);
+        }
+        let (data_identity, backing_len) = host_identity(data_fd.as_raw_fd())?;
+        let (lock_identity, lock_len) = host_identity(lock_fd.as_raw_fd())?;
+        if data_identity != expected_data
+            || lock_identity != expected_lock
+            || backing_len != snapshot.backing_len
+            || lock_len != 1
+            || snapshot.sqes_backing_offset < snapshot.ring_bytes
+            || snapshot
+                .sqes_backing_offset
+                .checked_add(snapshot.sqes_bytes)
+                .is_none_or(|end| end > backing_len)
+        {
+            return Err(linux_errno::EINVAL);
+        }
+        let ring_extent = snapshot.sqes_backing_offset;
+        let sqes_extent = backing_len - ring_extent;
+        let control_view = SharedMapping::map(
+            data_fd.as_raw_fd(),
+            usize::try_from(backing_len).map_err(|_| linux_errno::EOVERFLOW)?,
+        )?;
+        Ok(Arc::new(Self {
+            layout,
+            regions: [
+                IoUringRegionLayout {
+                    guest_mmap_offset: LINUX_IORING_OFF_SQ_RING,
+                    backing_offset: 0,
+                    required_len: snapshot.ring_bytes,
+                    mapped_extent: ring_extent,
+                },
+                IoUringRegionLayout {
+                    guest_mmap_offset: LINUX_IORING_OFF_SQES,
+                    backing_offset: ring_extent,
+                    required_len: snapshot.sqes_bytes,
+                    mapped_extent: sqes_extent,
+                },
+            ],
+            data_fd,
+            data_identity,
+            control_view,
+            lock_fd,
+            lock_identity,
+            local_enter: parking_lot::Mutex::new(()),
+            open_metadata: parking_lot::RwLock::new(OpenDescription::SyntheticFile {
+                base: OpenDescriptionBase::new(LINUX_O_RDWR),
+                path: "anon_inode:[io_uring]".to_owned(),
+                contents: Vec::new(),
+                offset: 0,
+            }),
+        }))
+    }
+
+    pub(in crate::dispatch) fn open_metadata(&self) -> &parking_lot::RwLock<OpenDescription> {
+        &self.open_metadata
+    }
+
+    pub(in crate::dispatch) fn ready_events(&self, requested: u32) -> u32 {
+        let mut ready = requested & LINUX_EPOLLOUT;
+        let cq_head = self.load_u32(self.layout.cq_off.head as u64, Ordering::Acquire);
+        let cq_tail = self.load_u32(self.layout.cq_off.tail as u64, Ordering::Acquire);
+        if cq_head
+            .zip(cq_tail)
+            .is_some_and(|(head, tail)| head != tail)
+        {
+            ready |= requested & LINUX_EPOLLIN;
+        }
+        ready
+    }
+
+    pub(crate) fn dup_data_fd(&self) -> Option<OwnedFd> {
+        let fd = unsafe { libc::dup(self.data_fd.as_raw_fd()) };
+        (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    fn load_u32(&self, offset: u64, ordering: Ordering) -> Option<u32> {
+        self.control_view
+            .atomic_u32(offset)
+            .map(|word| word.load(ordering))
+    }
+
+    fn store_u32(&self, offset: u64, value: u32, ordering: Ordering) -> Option<()> {
+        self.control_view.atomic_u32(offset)?.store(value, ordering);
+        Some(())
+    }
+
+    fn read_value<T: FromBytes + Copy>(&self, offset: u64) -> Option<T> {
+        let bytes = self.control_view.bytes(offset, core::mem::size_of::<T>())?;
+        T::read_from_bytes(bytes).ok()
+    }
+
+    fn write_value<T: IntoBytes + zerocopy::Immutable>(
+        &self,
+        offset: u64,
+        value: &T,
+    ) -> Option<()> {
+        self.control_view.write_bytes(offset, value.as_bytes())
+    }
+
+    fn cross_process_lock(&self) -> Option<CrossProcessLock<'_>> {
+        let mut lock: libc::flock = unsafe { core::mem::zeroed() };
+        lock.l_type = libc::F_WRLCK;
+        lock.l_whence = libc::SEEK_SET as i16;
+        lock.l_start = 0;
+        lock.l_len = 1;
+        loop {
+            if unsafe { libc::fcntl(self.lock_fd.as_raw_fd(), libc::F_SETLKW, &lock) } == 0 {
+                return Some(CrossProcessLock { backing: self });
+            }
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                return None;
+            }
+        }
+    }
+
+    fn layout_snapshot(&self) -> IoUringLayoutSnapshot {
+        IoUringLayoutSnapshot {
+            sq_entries: self.layout.sq_entries,
+            cq_entries: self.layout.cq_entries,
+            ring_bytes: self.layout.ring_bytes as u64,
+            sqes_bytes: self.layout.sqes_bytes as u64,
+            sqes_backing_offset: self.regions[1].backing_offset,
+            backing_len: self.regions[1].backing_offset + self.regions[1].mapped_extent,
+        }
+    }
+}
+
+struct CrossProcessLock<'a> {
+    backing: &'a IoUringBacking,
+}
+
+impl Drop for CrossProcessLock<'_> {
+    fn drop(&mut self) {
+        let mut lock: libc::flock = unsafe { core::mem::zeroed() };
+        lock.l_type = libc::F_UNLCK;
+        lock.l_whence = libc::SEEK_SET as i16;
+        lock.l_start = 0;
+        lock.l_len = 1;
+        if unsafe { libc::fcntl(self.backing.lock_fd.as_raw_fd(), libc::F_SETLK, &lock) } != 0 {
+            std::process::abort();
+        }
+    }
+}
+
+impl crate::kernel::FileDescriptionBacking for IoUringBacking {
+    fn is_epoll(&self) -> bool {
+        false
+    }
+
+    fn snapshot_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Option<crate::kernel::FileDescriptionBackingSnapshot> {
+        let metadata = self.open_metadata.try_read_until(deadline)?;
+        Some(crate::kernel::FileDescriptionBackingSnapshot::IoUring(
+            IoUringDescriptionSnapshot {
+                layout: self.layout_snapshot(),
+                data_identity: self.data_identity,
+                lock_identity: self.lock_identity,
+                backing_len: self.layout_snapshot().backing_len,
+                status_flags: metadata.status_flags(),
+                logical_fd_refs: metadata.fd_ref_count(),
+            },
+        ))
+    }
+
+    fn epoll_wake_fd(&self) -> Option<i32> {
+        None
+    }
+    fn retain_fd_ref(&self) {
+        self.open_metadata.read().retain_fd_ref();
+    }
+    fn release_fd_ref(&self) {
+        self.open_metadata.read().release_fd_ref();
+    }
+    fn fd_ref_count(&self) -> usize {
+        self.open_metadata.read().fd_ref_count()
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct IoUringMapping {
+    pub description: Arc<crate::kernel::FileDescription>,
+    pub region: IoUringRegion,
+    pub start: u64,
+    pub end: u64,
+    pub backing_offset: u64,
+}
+
+impl PartialEq for IoUringMapping {
+    fn eq(&self, other: &Self) -> bool {
+        self.description.id() == other.description.id()
+            && self.region == other.region
+            && self.start == other.start
+            && self.end == other.end
+            && self.backing_offset == other.backing_offset
+    }
+}
+impl Eq for IoUringMapping {}
+
+impl IoUringMapping {
+    pub(crate) fn fragment(&self, start: u64, end: u64) -> Self {
+        Self {
+            description: Arc::clone(&self.description),
+            region: self.region,
+            start,
+            end,
+            backing_offset: self.backing_offset + (start - self.start),
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> IoUringMappingSnapshot {
+        IoUringMappingSnapshot {
+            description: Arc::clone(&self.description),
+            region: self.region,
+            start: self.start,
+            end: self.end,
+            backing_offset: self.backing_offset,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct IoUringMappingSnapshot {
+    pub description: Arc<crate::kernel::FileDescription>,
+    pub region: IoUringRegion,
+    pub start: u64,
+    pub end: u64,
+    pub backing_offset: u64,
 }
 
 /// Outcome of attempting an async (readiness-driven) op: it either completed
@@ -285,10 +788,8 @@ fn scatter_to_iovecs(
 }
 
 impl SyscallDispatcher {
-    /// `io_uring_setup(entries, params)`: allocate the SQ/CQ rings and the SQE
-    /// array in the guest mmap arena, initialise the control words the guest
-    /// reads, fill `params`, install a placeholder fd (so close/stat work), and
-    /// record the instance in the side table. Returns the ring fd.
+    /// `io_uring_setup(entries, params)`: construct one persistent typed open
+    /// file description. Guest virtual mappings are created only by mmap.
     pub(in crate::dispatch) fn io_uring_setup_impl(
         &self,
         memory: &mut impl GuestMemory,
@@ -312,82 +813,37 @@ impl SyscallDispatcher {
         if user_params.flags & !SUPPORTED_SETUP_FLAGS != 0 {
             return DispatchOutcome::errno(LINUX_EINVAL);
         }
-        let layout = RingLayout::new(entries);
-        let prot = LINUX_PROT_READ | LINUX_PROT_WRITE;
-        let (Some((ring_addr, _)), Some((sqes_addr, _))) = (
-            self.next_mmap_address(0, layout.ring_bytes as u64, prot, 0),
-            self.next_mmap_address(0, layout.sqes_bytes as u64, prot, 0),
-        ) else {
-            return DispatchOutcome::errno(LINUX_ENOMEM);
+        let backing = match IoUringBacking::create(entries, self.linux_page_size()) {
+            Ok(backing) => backing,
+            Err(errno) => return DispatchOutcome::errno(errno),
         };
-        if memory
-            .zero_guest_range(ring_addr, layout.ring_bytes)
-            .is_err()
-            || memory
-                .zero_guest_range(sqes_addr, layout.sqes_bytes)
-                .is_err()
-        {
-            return DispatchOutcome::errno(LINUX_EFAULT);
-        }
-        // Control words the guest's ring code reads (mask + entry count).
-        write_ring_u32(
-            memory,
-            ring_addr + layout.sq_off.ring_mask as u64,
-            layout.sq_entries - 1,
-        );
-        write_ring_u32(
-            memory,
-            ring_addr + layout.sq_off.ring_entries as u64,
-            layout.sq_entries,
-        );
-        write_ring_u32(
-            memory,
-            ring_addr + layout.cq_off.ring_mask as u64,
-            layout.cq_entries - 1,
-        );
-        write_ring_u32(
-            memory,
-            ring_addr + layout.cq_off.ring_entries as u64,
-            layout.cq_entries,
-        );
-
         let mut params = LinuxIoUringParams::default();
-        layout.fill_params(&mut params);
+        backing.layout.fill_params(&mut params);
         if memory.write_bytes(params_ptr, params.as_bytes()).is_err() {
             return DispatchOutcome::errno(LINUX_EFAULT);
         }
 
-        let desc = OpenDescription::SyntheticFile {
-            base: OpenDescriptionBase::new(0),
-            path: "[io_uring]".to_owned(),
-            contents: Vec::new(),
-            offset: 0,
-        };
-        let open_file = OpenFile::new(std::sync::Arc::new(parking_lot::RwLock::new(desc)), 0);
-        let Ok(fd) = self.install_fd_at_or_above(3, open_file) else {
+        let description = Arc::new(
+            crate::kernel::FileDescription::concrete(backing).unwrap_or_else(|error| {
+                tracing::error!(%error, "io_uring description identity allocation failed");
+                std::process::abort();
+            }),
+        );
+        let Ok(fd) = self.install_fd_at_or_above(3, OpenFile::new(description, 0)) else {
             return DispatchOutcome::errno(linux_errno::EMFILE);
         };
-        self.io.io_uring_instances.write().insert(
-            fd,
-            IoUringState {
-                layout,
-                ring_addr,
-                sqes_addr,
-            },
-        );
         DispatchOutcome::Returned { value: fd as i64 }
     }
 
-    /// The guest-arena address a `mmap(ring_fd, off)` should resolve to, or
-    /// `None` if `fd` is not an io_uring ring. The ring memory already lives in
-    /// the arena, so mmap just hands back its address.
-    pub(in crate::dispatch) fn io_uring_mmap_addr(&self, fd: i32, off: u64) -> Option<u64> {
-        let table = self.io.io_uring_instances.read();
-        let state = table.get(&fd)?;
-        match off {
-            LINUX_IORING_OFF_SQ_RING | LINUX_IORING_OFF_CQ_RING => Some(state.ring_addr),
-            LINUX_IORING_OFF_SQES => Some(state.sqes_addr),
-            _ => None,
+    pub(in crate::dispatch) fn io_uring_description(
+        &self,
+        fd: i32,
+    ) -> Option<Arc<crate::kernel::FileDescription>> {
+        let description = self.open_file(fd)?.description;
+        if description.concrete_backing::<IoUringBacking>().is_some() {
+            Some(description)
+        } else {
+            None
         }
     }
 
@@ -403,7 +859,10 @@ impl SyscallDispatcher {
         argp: u64,
         argsz: u64,
     ) -> DispatchOutcome {
-        let Some(state) = self.io.io_uring_instances.read().get(&fd).copied() else {
+        let Some(description) = self.io_uring_description(fd) else {
+            return DispatchOutcome::errno(LINUX_EINVAL);
+        };
+        let Some(backing) = description.concrete_backing::<IoUringBacking>() else {
             return DispatchOutcome::errno(LINUX_EINVAL);
         };
         // Reject any flag bit Linux does not define (before consuming the SQ
@@ -418,14 +877,25 @@ impl SyscallDispatcher {
         {
             return DispatchOutcome::errno(LINUX_EINVAL);
         }
-        let layout = state.layout;
-        let ring = state.ring_addr;
+        let _local_enter = backing.local_enter.lock();
+        let Some(_cross_process) = backing.cross_process_lock() else {
+            return DispatchOutcome::errno(linux_errno::EIO);
+        };
+        let layout = backing.layout;
         let sq_mask = layout.sq_entries - 1;
         let cq_mask = layout.cq_entries - 1;
 
-        let sq_tail = read_ring_u32(memory, ring + layout.sq_off.tail as u64);
-        let mut sq_head = read_ring_u32(memory, ring + layout.sq_off.head as u64);
-        let mut cq_tail = read_ring_u32(memory, ring + layout.cq_off.tail as u64);
+        let Some(sq_tail) = backing.load_u32(layout.sq_off.tail as u64, Ordering::Acquire) else {
+            return DispatchOutcome::errno(linux_errno::EIO);
+        };
+        let Some(mut sq_head) = backing.load_u32(layout.sq_off.head as u64, Ordering::Relaxed)
+        else {
+            return DispatchOutcome::errno(linux_errno::EIO);
+        };
+        let Some(mut cq_tail) = backing.load_u32(layout.cq_off.tail as u64, Ordering::Relaxed)
+        else {
+            return DispatchOutcome::errno(linux_errno::EIO);
+        };
         let mut processed: u32 = 0;
 
         // Process submitted SQEs in order. Synchronous ops (and ready async ops)
@@ -436,21 +906,30 @@ impl SyscallDispatcher {
         // the number of SQEs the guest queued (the liburing invariant); ops run in
         // submission order (head-of-line), not Linux's out-of-order async.
         while sq_head != sq_tail && processed < to_submit {
-            let arr_slot = ring + layout.sq_off.array as u64 + ((sq_head & sq_mask) as u64) * 4;
-            let sqe_idx = read_ring_u32(memory, arr_slot);
-            let sqe_addr = state.sqes_addr + (sqe_idx as u64) * 64;
-            let sqe = memory
-                .read_bytes(sqe_addr, core::mem::size_of::<LinuxIoUringSqe>())
-                .ok()
-                .and_then(|b| LinuxIoUringSqe::read_from_prefix(&b).ok().map(|(s, _)| s));
+            let arr_slot = layout.sq_off.array as u64 + ((sq_head & sq_mask) as u64) * 4;
+            let sqe_idx = backing
+                .load_u32(arr_slot, Ordering::Acquire)
+                .unwrap_or(layout.sq_entries);
+            let sqe_offset = backing.regions[1].backing_offset + (sqe_idx as u64) * 64;
+            let sqe = (sqe_idx < layout.sq_entries)
+                .then(|| backing.read_value::<LinuxIoUringSqe>(sqe_offset))
+                .flatten();
             let res = match &sqe {
                 Some(sqe) if is_async_op(sqe.opcode) => match self.try_async_op(memory, sqe) {
                     AsyncOutcome::Ready(res) => res,
                     AsyncOutcome::Block(host_fd, events) => {
                         // Persist progress and wait on readiness; the runtime
                         // re-dispatches io_uring_enter, which resumes here.
-                        write_ring_u32(memory, ring + layout.sq_off.head as u64, sq_head);
-                        write_ring_u32(memory, ring + layout.cq_off.tail as u64, cq_tail);
+                        let _ = backing.store_u32(
+                            layout.sq_off.head as u64,
+                            sq_head,
+                            Ordering::Release,
+                        );
+                        let _ = backing.store_u32(
+                            layout.cq_off.tail as u64,
+                            cq_tail,
+                            Ordering::Release,
+                        );
                         return DispatchOutcome::WaitOnFds {
                             fds: WaitFds::raw_one(host_fd, events),
                             timeout: None,
@@ -467,15 +946,28 @@ impl SyscallDispatcher {
                 res,
                 flags: 0,
             };
-            let cqe_addr = ring + layout.cq_off.cqes as u64 + ((cq_tail & cq_mask) as u64) * 16;
-            let _ = memory.write_bytes(cqe_addr, cqe.as_bytes());
-            cq_tail = cq_tail.wrapping_add(1);
+            let cq_head = backing
+                .load_u32(layout.cq_off.head as u64, Ordering::Acquire)
+                .unwrap_or(cq_tail);
+            if cq_tail.wrapping_sub(cq_head) < layout.cq_entries {
+                let cqe_offset = layout.cq_off.cqes as u64 + ((cq_tail & cq_mask) as u64) * 16;
+                let _ = backing.write_value(cqe_offset, &cqe);
+                cq_tail = cq_tail.wrapping_add(1);
+            } else if let Some(overflow) =
+                backing.load_u32(layout.cq_off.overflow as u64, Ordering::Relaxed)
+            {
+                let _ = backing.store_u32(
+                    layout.cq_off.overflow as u64,
+                    overflow.wrapping_add(1),
+                    Ordering::Release,
+                );
+            }
             sq_head = sq_head.wrapping_add(1);
             processed = processed.wrapping_add(1);
         }
         // Publish the consumed SQ head and the produced CQ tail back to the guest.
-        write_ring_u32(memory, ring + layout.sq_off.head as u64, sq_head);
-        write_ring_u32(memory, ring + layout.cq_off.tail as u64, cq_tail);
+        let _ = backing.store_u32(layout.sq_off.head as u64, sq_head, Ordering::Release);
+        let _ = backing.store_u32(layout.cq_off.tail as u64, cq_tail, Ordering::Release);
         // Number of SQEs this call submitted (bounded by to_submit; correct
         // across a WaitOnFds re-dispatch, which recounts only still-pending SQEs).
         DispatchOutcome::Returned {
@@ -612,11 +1104,13 @@ impl SyscallDispatcher {
                 // instantly reusable, and a detach-after-free would rip out a
                 // sibling's reused-fd interest).
                 self.detach_fd_from_epolls(sqe.fd);
-                let removed = self.io.open_files.write().remove(&sqe.fd);
+                let removed = self
+                    .captured_file_table()
+                    .write_open_files()
+                    .remove(&sqe.fd);
                 match removed {
                     Some(open_file) => {
                         self.close_open_file_and_free_pty(&open_file);
-                        self.io.io_uring_instances.write().remove(&sqe.fd);
                         self.note_fd_closed(sqe.fd);
                         0
                     }
@@ -818,6 +1312,131 @@ mod tests {
             splice_fd_in: 0,
             pad2: [0; 2],
         }
+    }
+
+    fn test_description() -> (Arc<crate::kernel::FileDescription>, Arc<IoUringBacking>) {
+        let backing = IoUringBacking::create(8, 4096).expect("ring backing");
+        let description = Arc::new(
+            crate::kernel::FileDescription::concrete(Arc::clone(&backing))
+                .expect("ring description"),
+        );
+        (description, backing)
+    }
+
+    fn test_mapping(
+        description: &Arc<crate::kernel::FileDescription>,
+        start: u64,
+        end: u64,
+    ) -> IoUringMapping {
+        IoUringMapping {
+            description: Arc::clone(description),
+            region: IoUringRegion::SqCq,
+            start,
+            end,
+            backing_offset: 0,
+        }
+    }
+
+    #[test]
+    fn mapping_attachment_splits_and_keeps_backing_after_final_fd_close() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mm = context.shared().mm();
+        let (description, backing) = test_description();
+        let weak = Arc::downgrade(&backing);
+        description.retain_fd_ref();
+        mm.replace_io_uring_mappings(
+            0x1000,
+            0x3000,
+            Some(test_mapping(&description, 0x1000, 0x4000)),
+        );
+        description.release_fd_ref();
+        drop(backing);
+        assert!(weak.upgrade().is_some(), "mapping must retain backing");
+
+        mm.replace_io_uring_mappings(0x2000, 0x1000, None);
+        let mappings = mm.read_io_uring_mappings();
+        assert_eq!(mappings.len(), 2);
+        assert_eq!((mappings[0].start, mappings[0].end), (0x1000, 0x2000));
+        assert_eq!((mappings[1].start, mappings[1].end), (0x3000, 0x4000));
+        assert_eq!(mappings[1].backing_offset, 0x2000);
+        drop(mappings);
+        mm.replace_io_uring_mappings(0x1000, 0x3000, None);
+        drop(description);
+        assert!(weak.upgrade().is_none(), "final unmap releases backing");
+    }
+
+    #[test]
+    fn copied_mm_clones_exact_attachments_and_clone_vm_shares_mm() {
+        let dispatcher = SyscallDispatcher::new();
+        let parent = dispatcher.capture_one_task_context().unwrap();
+        let (description, _backing) = test_description();
+        parent.shared().mm().replace_io_uring_mappings(
+            0x5000,
+            0x1000,
+            Some(test_mapping(&description, 0x5000, 0x6000)),
+        );
+        let rebound = dispatcher
+            .reset_one_task_kernel_binding_for_current_process(
+                &parent,
+                crate::thread::ThreadId::synthetic_for_tests(0x7701),
+            )
+            .unwrap();
+        assert!(!Arc::ptr_eq(&parent.shared().mm(), &rebound.shared().mm()));
+        let child_mm = rebound.shared().mm();
+        let child_rows = child_mm.read_io_uring_mappings();
+        assert_eq!(child_rows.len(), 1);
+        assert!(Arc::ptr_eq(&child_rows[0].description, &description));
+    }
+
+    #[test]
+    fn host_fork_observes_shared_queue_bytes() {
+        let (_description, backing) = test_description();
+        let tail = backing.layout.sq_off.tail as u64;
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let _ = backing.store_u32(tail, 0x51, Ordering::Release);
+            unsafe { libc::_exit(0) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert_eq!(backing.load_u32(tail, Ordering::Acquire), Some(0x51));
+    }
+
+    #[test]
+    fn exec_survivor_keeps_description_but_new_mm_has_no_attachments() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let (description, _backing) = test_description();
+        let fd = dispatcher
+            .install_fd_at_or_above(3, OpenFile::new(Arc::clone(&description), 0))
+            .unwrap();
+        context.shared().mm().replace_io_uring_mappings(
+            0x3000,
+            0x1000,
+            Some(test_mapping(&description, 0x3000, 0x4000)),
+        );
+        let prepared = dispatcher.prepare_one_task_kernel_exec(&context).unwrap();
+        let replacement = dispatcher.commit_one_task_kernel_exec(prepared).unwrap();
+        assert!(
+            replacement
+                .shared()
+                .mm()
+                .read_io_uring_mappings()
+                .is_empty()
+        );
+        let slot = replacement
+            .resources()
+            .files()
+            .slot(crate::kernel::FileSlotNumber::for_open_fd(fd).unwrap())
+            .expect("surviving ring fd");
+        assert!(Arc::ptr_eq(&slot.description, &description));
+        assert!(
+            slot.description
+                .concrete_backing::<IoUringBacking>()
+                .is_some()
+        );
     }
 
     #[test]

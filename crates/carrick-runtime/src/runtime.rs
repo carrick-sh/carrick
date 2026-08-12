@@ -1046,9 +1046,19 @@ where
                 // Forced out of the guest by a kick (process-directed signal
                 // pump). Deliver at the interrupted PC, then resume.
                 let pc = runtime.current_pc()?;
-                if let Some(action) =
-                    deliver_pending_signal(runtime, &dispatcher, None, this_tid, Some(pc))?
-                {
+                let signal_context = dispatcher.capture_one_task_context().map_err(|error| {
+                    RuntimeError::Configuration(format!(
+                        "capture forced-exit signal Kernel context: {error}"
+                    ))
+                })?;
+                if let Some(action) = deliver_pending_signal(
+                    runtime,
+                    &dispatcher,
+                    &signal_context,
+                    None,
+                    this_tid,
+                    Some(pc),
+                )? {
                     if let Some(signum) = action.stop_signal {
                         stop_by_signal(signum);
                         continue;
@@ -1165,7 +1175,7 @@ where
                 last_syscall_retval = Some(value);
             }
             DispatchOutcome::Fork {
-                flags: _,
+                flags,
                 pidfd_out,
                 clone_parent,
                 parent_tid_addr,
@@ -1174,6 +1184,22 @@ where
                 child_stack: _,
                 vfork,
             } => 'fork_arm: {
+                if let Some(reason) =
+                    crate::dispatch::SyscallDispatcher::host_fork_file_authority_rejection(
+                        &kernel_context,
+                        flags,
+                    )
+                {
+                    tracing::warn!(
+                        flags,
+                        reason,
+                        "single-thread host-fork file authority rejected clone"
+                    );
+                    let value = crate::linux_abi::LINUX_EOPNOTSUPP.guest_retval();
+                    runtime.complete_syscall(value)?;
+                    last_syscall_retval = Some(value);
+                    break 'fork_arm;
+                }
                 // The single-threaded loop (run-elf) keeps the ordinary CoW fork
                 // even for a vfork clone: it has no sibling threads, and Go / the
                 // conformance gate exercise the THREADED loop
@@ -1339,16 +1365,21 @@ where
                             new_image.initial_stack_pointer().unwrap_or(0),
                             new_image.regions().len() as u64,
                         );
+                        let prepared_kernel_exec = dispatcher
+                            .prepare_one_task_kernel_exec(&kernel_context)
+                            .map_err(RuntimeError::Configuration)?;
                         dispatcher.set_executable_identity(path.clone(), proc_argv, proc_env);
-                        dispatcher.reset_signal_handlers_on_execve();
+                        dispatcher.reset_signal_handlers_on_execve(&kernel_context);
                         // Reset and refresh memory proc state as one VMA generation.
                         apply_exec_image_proc_state(&dispatcher, &new_image);
-                        dispatcher.close_cloexec_fds();
                         runtime.execve_into(&new_image)?;
+                        let exec_context = dispatcher
+                            .commit_one_task_kernel_exec(prepared_kernel_exec)
+                            .map_err(RuntimeError::Configuration)?;
                         crate::namespace::pid::mark_self_execed();
                         // execve_into rebuilt a fresh (zeroed) identity page;
                         // exec retains the caller's captured credential values.
-                        stamp_identity_page(runtime, &dispatcher, &kernel_context);
+                        stamp_identity_page(runtime, &dispatcher, &exec_context);
                         stop_after_traced_exec(&dispatcher);
                     }
                     Err(errno) => {
@@ -1364,8 +1395,11 @@ where
                 // the restored x0 IS the syscall return value the
                 // pre-empted caller observes.
                 let restored_sigmask = runtime.restore_from_sigframe()?;
-                dispatcher
-                    .restore_signal_mask(this_tid, carrick_abi::SigSet::from_raw(restored_sigmask));
+                dispatcher.restore_signal_mask(
+                    &kernel_context,
+                    this_tid,
+                    carrick_abi::SigSet::from_raw(restored_sigmask),
+                );
                 // Deliver the NEXT pending signal (if any) before resuming the
                 // restored context — the kernel delivers all deliverable pending
                 // signals back-to-back before returning to userspace. The just-
@@ -1568,6 +1602,7 @@ where
         if let Some(action) = deliver_pending_signal(
             runtime,
             &dispatcher,
+            &kernel_context,
             last_syscall_retval,
             this_tid,
             signal_interrupted_pc,
@@ -1638,7 +1673,10 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                     match crate::dispatch::drive_blocking_host_write(&mut write) {
                         crate::dispatch::BlockingHostWriteStep::Done(outcome) => {
                             return Ok(raise_sigpipe_for_blocking_write(
-                                dispatcher, &write, outcome,
+                                dispatcher,
+                                kernel_context,
+                                &write,
+                                outcome,
                             ));
                         }
                         crate::dispatch::BlockingHostWriteStep::Wait => {
@@ -1834,7 +1872,12 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                         // EINTR the wait (its handler is delivered by the run
                         // loop's tail); a wait-set signal re-dispatches so the
                         // dispatcher dequeues it and returns the signum.
-                        if dispatcher.signal_wait_should_eintr(waiter.tid(), wait_set, block_mask) {
+                        if dispatcher.signal_wait_should_eintr(
+                            kernel_context,
+                            waiter.tid(),
+                            wait_set,
+                            block_mask,
+                        ) {
                             return Ok(DispatchOutcome::Errno {
                                 errno: crate::linux_abi::LINUX_EINTR,
                             });
@@ -1870,8 +1913,9 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                 }
                 let waiter_tid = waiter.tid();
                 let sleep_interrupt_pending = || {
-                    dispatcher.drain_xsignals_process_directed();
+                    dispatcher.drain_xsignals_process_directed(kernel_context);
                     dispatcher.has_deliverable_dispatch_pending_for_wait(
+                        kernel_context,
                         waiter_tid,
                         carrick_abi::WaitSigMask::Additive(carrick_abi::SigSet::EMPTY),
                     )

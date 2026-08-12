@@ -193,9 +193,22 @@ struct TimedDispatchOutcome {
     blocked: NativeBlockedSpan,
 }
 
+#[derive(Clone, Copy)]
 struct NativeDispatchAuthority<'a> {
     dispatcher: &'a SyscallDispatcher,
     kernel_context: &'a crate::kernel::KernelContext,
+}
+
+impl<'a> NativeDispatchAuthority<'a> {
+    const fn new(
+        dispatcher: &'a SyscallDispatcher,
+        kernel_context: &'a crate::kernel::KernelContext,
+    ) -> Self {
+        Self {
+            dispatcher,
+            kernel_context,
+        }
+    }
 }
 
 struct NativeForkRequest {
@@ -1149,13 +1162,14 @@ fn run_direct_in_current_process(
                         }
                     };
                 runner.dispatcher().reset_memory_state_on_execve();
-                runner.dispatcher().reset_signal_handlers_on_execve();
+                runner
+                    .dispatcher()
+                    .reset_signal_handlers_on_execve(&exec_context);
                 runner.dispatcher().set_executable_identity(
                     next_resolved.clone(),
                     proc_argv,
                     proc_env,
                 );
-                runner.dispatcher().close_cloexec_fds();
                 crate::namespace::pid::mark_self_execed();
                 crate::dispatch::set_host_process_name(process_title.as_bytes());
                 runner.commit_in_process_exec(&exec_context);
@@ -1193,14 +1207,20 @@ pub(crate) enum TierDExecFlow {
 /// Prepare an eligible Tier-D replacement completely before disturbing the
 /// outgoing guest. A refusal is not an exec error: it tells the caller to use
 /// the existing capsule, whose post-reexec tier decision can fall back to DSR.
-fn prepare_tier_d_exec_replacement(
+struct TierDExecCandidate {
+    group: carrick_native_darwin::direct::DirectLoadGroup,
+    stack: crate::direct_runner::DirectStack,
+    resolved: String,
+    argv: Vec<Vec<u8>>,
+    env: Vec<Vec<u8>>,
+}
+
+fn load_tier_d_exec_candidate(
     dispatcher: &SyscallDispatcher,
-    kernel_context: &crate::kernel::KernelContext,
-    replacement_registry_id: crate::thread::ThreadId,
     path: &str,
     argv: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
-) -> Result<Option<crate::direct_runner::DirectExecReplacement>, crate::linux_abi::LinuxErrno> {
+) -> Result<Option<TierDExecCandidate>, crate::linux_abi::LinuxErrno> {
     use crate::direct_runner as dr;
 
     let argv = if argv.is_empty() {
@@ -1256,20 +1276,43 @@ fn prepare_tier_d_exec_replacement(
             return Ok(None);
         }
     };
+    native_tier_census("scan-direct", &resolved, "exec-in-process");
+    Ok(Some(TierDExecCandidate {
+        group,
+        stack,
+        resolved,
+        argv,
+        env,
+    }))
+}
+
+fn prepare_tier_d_exec_replacement(
+    dispatcher: &SyscallDispatcher,
+    kernel_context: &crate::kernel::KernelContext,
+    replacement_registry_id: crate::thread::ThreadId,
+    path: &str,
+    argv: Vec<Vec<u8>>,
+    env: Vec<Vec<u8>>,
+) -> Result<Option<crate::direct_runner::DirectExecReplacement>, crate::linux_abi::LinuxErrno> {
+    let Some(candidate) = dispatcher.with_kernel_credentials(kernel_context, || {
+        load_tier_d_exec_candidate(dispatcher, path, argv, env)
+    })?
+    else {
+        return Ok(None);
+    };
     let kernel_exec = dispatcher
         .prepare_one_task_kernel_exec_with_registry_id(kernel_context, replacement_registry_id)
         .map_err(|error| {
             tracing::warn!(%error, "tier D Kernel exec preparation failed");
             crate::linux_abi::LINUX_EAGAIN
         })?;
-    native_tier_census("scan-direct", &resolved, "exec-in-process");
-    Ok(Some(dr::DirectExecReplacement {
-        group,
-        stack,
+    Ok(Some(crate::direct_runner::DirectExecReplacement {
+        group: candidate.group,
+        stack: candidate.stack,
         kernel_exec,
-        resolved,
-        argv,
-        env,
+        resolved: candidate.resolved,
+        argv: candidate.argv,
+        env: candidate.env,
     }))
 }
 
@@ -1288,16 +1331,14 @@ pub(crate) fn tier_d_service_execve(
     services: &crate::direct_runner::DirectExecServices,
 ) -> TierDExecFlow {
     crate::probes::execve_argv(&path, &argv);
-    let direct_replacement = dispatcher.with_kernel_credentials(kernel_context, || {
-        prepare_tier_d_exec_replacement(
-            dispatcher,
-            kernel_context,
-            replacement_registry_id,
-            &path,
-            argv.clone(),
-            env.clone(),
-        )
-    });
+    let direct_replacement = prepare_tier_d_exec_replacement(
+        dispatcher,
+        kernel_context,
+        replacement_registry_id,
+        &path,
+        argv.clone(),
+        env.clone(),
+    );
     match direct_replacement {
         Ok(Some(replacement)) => return TierDExecFlow::Replace(Box::new(replacement)),
         Ok(None) => {}
@@ -1320,10 +1361,10 @@ pub(crate) fn tier_d_service_execve(
             Ok(loaded) => loaded,
             Err(errno) => return TierDExecFlow::Resume(errno.guest_retval()),
         };
-    if let Err(reason) = dispatcher.validate_native_reexec_fd_state() {
+    if let Err(reason) = dispatcher.validate_native_reexec_fd_state(kernel_context) {
         tracing::warn!(
             %reason,
-            descriptors = ?dispatcher.native_reexec_fd_state_summary(),
+            descriptors = ?dispatcher.native_reexec_fd_state_summary(kernel_context),
             "tier D execve rejected unsupported fd state"
         );
         return TierDExecFlow::Resume(crate::linux_abi::LINUX_EOPNOTSUPP.guest_retval());
@@ -1806,7 +1847,7 @@ pub(crate) fn resume_guest_from_capsule(
         anyhow::bail!("native self-reexec ptrace state disagrees with the inherited kernel arena");
     }
     dispatcher
-        .restore_native_reexec_fd_table(&guest.fd_table)
+        .restore_native_reexec_fd_table(&restored_context, &guest.fd_table)
         .map_err(|error| anyhow::anyhow!("restore native guest fd table: {error}"))?;
     native_reexec_lifecycle(
         carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecDispatcherReady,
@@ -1843,7 +1884,7 @@ pub(crate) fn resume_guest_from_capsule(
                 }
                 // The execve resets the DSR path also applies, in its order.
                 dispatcher.reset_memory_state_on_execve();
-                dispatcher.reset_signal_handlers_on_execve();
+                dispatcher.reset_signal_handlers_on_execve(&restored_context);
                 dispatcher.set_executable_identity(
                     guest.resolved_path.clone(),
                     argv.iter()
@@ -1928,7 +1969,7 @@ pub(crate) fn resume_guest_from_capsule(
     let resolved = guest_image.resolved_path.as_str().to_owned();
     native_reexec_lifecycle(carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecResetBegin);
     dispatcher.reset_memory_state_on_execve();
-    dispatcher.reset_signal_handlers_on_execve();
+    dispatcher.reset_signal_handlers_on_execve(&restored_context);
     dispatcher.set_executable_identity(
         resolved,
         argv.iter()
@@ -4192,8 +4233,16 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         snapshot.pc
                     )));
                 }
+                let fault_context = dispatcher
+                    .capture_kernel_context(thread_runtime.linux_tid())
+                    .map_err(|error| {
+                        RuntimeError::Configuration(format!(
+                            "capture native fault signal context: {error}"
+                        ))
+                    })?;
                 snapshot = lower_dsr_fault(
                     &dispatcher,
+                    &fault_context,
                     &memory,
                     snapshot,
                     thread_runtime.tid(),
@@ -4207,8 +4256,15 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
             }
             dsr::ThreadExit::Kick => {
                 let interrupted_pc = snapshot.pc;
+                let signal_context = dispatcher
+                    .capture_kernel_context(thread_runtime.linux_tid())
+                    .map_err(|error| {
+                        RuntimeError::Configuration(format!(
+                            "capture native kick signal context: {error}"
+                        ))
+                    })?;
                 snapshot = deliver_dsr_pending_signal(
-                    &dispatcher,
+                    NativeDispatchAuthority::new(&dispatcher, &signal_context),
                     &memory,
                     snapshot,
                     thread_runtime.tid(),
@@ -4313,6 +4369,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
             DispatchOutcome::Returned { value } => {
                 snapshot = complete_dsr_syscall(
                     &dispatcher,
+                    &kernel_context,
                     &memory,
                     snapshot,
                     thread_runtime.tid(),
@@ -4329,6 +4386,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
             DispatchOutcome::Errno { errno } => {
                 snapshot = complete_dsr_syscall(
                     &dispatcher,
+                    &kernel_context,
                     &memory,
                     snapshot,
                     thread_runtime.tid(),
@@ -4345,6 +4403,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
             DispatchOutcome::SigReturn => {
                 snapshot = complete_dsr_sigreturn(
                     &dispatcher,
+                    &kernel_context,
                     &memory,
                     snapshot,
                     thread_runtime.tid(),
@@ -4438,6 +4497,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     ));
                     snapshot = complete_dsr_syscall(
                         &dispatcher,
+                        &kernel_context,
                         &memory,
                         snapshot,
                         thread_runtime.tid(),
@@ -4483,6 +4543,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                 };
                 snapshot = complete_dsr_syscall(
                     &dispatcher,
+                    &kernel_context,
                     &memory,
                     snapshot,
                     thread_runtime.tid(),
@@ -4497,7 +4558,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                 )?;
             }
             DispatchOutcome::Fork {
-                flags: _,
+                flags,
                 pidfd_out,
                 clone_parent,
                 parent_tid_addr,
@@ -4506,6 +4567,31 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                 child_stack,
                 vfork,
             } => {
+                if let Some(reason) =
+                    SyscallDispatcher::host_fork_file_authority_rejection(&kernel_context, flags)
+                {
+                    tracing::warn!(
+                        flags,
+                        reason,
+                        "native host-fork file authority rejected clone"
+                    );
+                    snapshot = complete_dsr_syscall(
+                        &dispatcher,
+                        &kernel_context,
+                        &memory,
+                        snapshot,
+                        thread_runtime.tid(),
+                        request.number.raw(),
+                        crate::linux_abi::LINUX_EOPNOTSUPP.guest_retval(),
+                        resume,
+                        &mut translator,
+                    )?;
+                    require_native_syscall_service_transition(
+                        service.end(NativeSyscallServiceOutcome::Resume),
+                        "rejected CLONE_FILES resume end",
+                    )?;
+                    continue;
+                }
                 let vfork_rejection = vfork
                     .is_some()
                     .then(|| memory.read().native16k_vfork_rejection())
@@ -4524,6 +4610,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     ));
                     snapshot = complete_dsr_syscall(
                         &dispatcher,
+                        &kernel_context,
                         &memory,
                         snapshot,
                         thread_runtime.tid(),
@@ -4580,6 +4667,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         }
                         snapshot = complete_dsr_syscall(
                             &dispatcher,
+                            &kernel_context,
                             &memory,
                             snapshot,
                             thread_runtime.tid(),
@@ -4672,14 +4760,17 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         let forked_child_self_reexec =
                             forked_child_self_reexec && !crate::ablation::EXEC_CHAIN.enabled();
                         if forked_child_self_reexec {
-                            if let Err(reason) = dispatcher.validate_native_reexec_fd_state() {
+                            if let Err(reason) =
+                                dispatcher.validate_native_reexec_fd_state(&kernel_context)
+                            {
                                 tracing::warn!(
                                     %reason,
-                                    descriptors = ?dispatcher.native_reexec_fd_state_summary(),
+                                    descriptors = ?dispatcher.native_reexec_fd_state_summary(&kernel_context),
                                     "native fork-child host self-reexec rejected unsupported fd state"
                                 );
                                 snapshot = complete_dsr_syscall(
                                     &dispatcher,
+                                    &kernel_context,
                                     &memory,
                                     snapshot,
                                     thread_runtime.tid(),
@@ -4736,6 +4827,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                                 );
                                 snapshot = complete_dsr_syscall(
                                     &dispatcher,
+                                    &kernel_context,
                                     &memory,
                                     snapshot,
                                     thread_runtime.tid(),
@@ -4776,6 +4868,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         let Some(initial_sp) = image.initial_stack_pointer() else {
                             snapshot = complete_dsr_syscall(
                                 &dispatcher,
+                                &kernel_context,
                                 &memory,
                                 snapshot,
                                 thread_runtime.tid(),
@@ -4808,6 +4901,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                                 );
                                 snapshot = complete_dsr_syscall(
                                     &dispatcher,
+                                    &kernel_context,
                                     &memory,
                                     snapshot,
                                     thread_runtime.tid(),
@@ -4930,14 +5024,13 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         thread_runtime.linux_tid = exec_context.thread().key().tid;
                         thread_runtime.kernel_thread_live = true;
                         dispatcher.reset_memory_state_on_execve();
-                        dispatcher.reset_signal_handlers_on_execve();
+                        dispatcher.reset_signal_handlers_on_execve(&exec_context);
                         dispatcher.set_executable_identity(
                             dispatcher_resolved_path,
                             proc_argv,
                             proc_env,
                         );
                         crate::vcpu_loop::apply_image_proc_state(&dispatcher, &image);
-                        dispatcher.close_cloexec_fds();
                         translator.begin_exec_reset();
                         translator.begin_exec_handoff();
                         let next_process = memory.read().dsr_process_translator()?;
@@ -4969,6 +5062,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     Err(errno) => {
                         snapshot = complete_dsr_syscall(
                             &dispatcher,
+                            &kernel_context,
                             &memory,
                             snapshot,
                             thread_runtime.tid(),
@@ -5007,6 +5101,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                 let value = thread_runtime.signal_thread(target, signum);
                 snapshot = complete_dsr_syscall(
                     &dispatcher,
+                    &kernel_context,
                     &memory,
                     snapshot,
                     thread_runtime.tid(),
@@ -5037,7 +5132,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
 }
 
 fn deliver_dsr_pending_signal(
-    dispatcher: &SyscallDispatcher,
+    authority: NativeDispatchAuthority<'_>,
     memory: &SharedNativeMemory,
     snapshot: NativeUcontextSnapshot,
     tid: crate::thread::ThreadId,
@@ -5045,11 +5140,16 @@ fn deliver_dsr_pending_signal(
     interrupted_pc: Option<u64>,
     translator: &mut dsr::ThreadTranslator,
 ) -> Result<NativeUcontextSnapshot, RuntimeError> {
+    let NativeDispatchAuthority {
+        dispatcher,
+        kernel_context,
+    } = authority;
     let memory = memory.read();
     let mut trap = NativeSignalTrap::new(&memory, snapshot, None);
     let action = crate::vcpu_loop::deliver_pending_signal(
         &mut trap,
         dispatcher,
+        kernel_context,
         return_value,
         tid,
         interrupted_pc,
@@ -5068,6 +5168,7 @@ fn deliver_dsr_pending_signal(
 #[allow(clippy::too_many_arguments)]
 fn complete_dsr_syscall(
     dispatcher: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
     memory: &SharedNativeMemory,
     snapshot: NativeUcontextSnapshot,
     tid: crate::thread::ThreadId,
@@ -5083,6 +5184,7 @@ fn complete_dsr_syscall(
     let action = crate::vcpu_loop::deliver_pending_signal(
         &mut trap,
         dispatcher,
+        context,
         Some(return_value),
         tid,
         None,
@@ -5100,6 +5202,7 @@ fn complete_dsr_syscall(
 
 fn complete_dsr_sigreturn(
     dispatcher: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
     memory: &SharedNativeMemory,
     snapshot: NativeUcontextSnapshot,
     tid: crate::thread::ThreadId,
@@ -5107,7 +5210,7 @@ fn complete_dsr_sigreturn(
 ) -> Result<NativeUcontextSnapshot, RuntimeError> {
     let memory = memory.read();
     let mut trap = NativeSignalTrap::new(&memory, snapshot, None);
-    let action = sigreturn_restore_and_deliver(dispatcher, &mut trap, tid)?;
+    let action = sigreturn_restore_and_deliver(dispatcher, context, &mut trap, tid)?;
     if let Some(action) = action {
         if let Some(signum) = action.stop_signal {
             crate::exec_helpers::stop_by_signal(signum);
@@ -5122,6 +5225,7 @@ fn complete_dsr_sigreturn(
 #[allow(clippy::too_many_arguments)]
 fn lower_dsr_fault(
     dispatcher: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
     memory: &SharedNativeMemory,
     mut snapshot: NativeUcontextSnapshot,
     tid: crate::thread::ThreadId,
@@ -5257,6 +5361,7 @@ fn lower_dsr_fault(
     let disposition = crate::vcpu_loop::inject_fault_signal(
         &mut trap,
         dispatcher,
+        context,
         tid,
         signum,
         si_code,
@@ -5315,13 +5420,25 @@ fn native_die_by_signal(
 /// syscall boundary, so no retval is applied and SA_RESTART stays off).
 fn sigreturn_restore_and_deliver(
     dispatcher: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
     trap: &mut NativeSignalTrap<'_>,
     tid: crate::thread::ThreadId,
 ) -> Result<Option<crate::vcpu_loop::PendingSignalAction>, RuntimeError> {
     let restored_sigmask = trap.restore_from_sigframe()?;
-    dispatcher.restore_signal_mask(tid, carrick_abi::SigSet::from_raw(restored_sigmask));
+    dispatcher.restore_signal_mask(
+        context,
+        tid,
+        carrick_abi::SigSet::from_raw(restored_sigmask),
+    );
     let restored_pc = trap.pc();
-    crate::vcpu_loop::deliver_pending_signal(trap, dispatcher, None, tid, Some(restored_pc))
+    crate::vcpu_loop::deliver_pending_signal(
+        trap,
+        dispatcher,
+        context,
+        None,
+        tid,
+        Some(restored_pc),
+    )
 }
 
 struct NativeSignalTrap<'a> {
@@ -5631,7 +5748,6 @@ impl NativeThreadRuntime {
                 return Err(RuntimeError::Configuration(error.to_string()));
             }
         };
-        dispatcher.inherit_thread_signal_mask(self.tid, tid);
 
         let (context, guest_tpidr_el0) = native_clone_child_context(
             request.context,
@@ -5741,7 +5857,6 @@ impl NativeThreadRuntime {
                 let _cleanup_gate = crate::fork_quiesce::begin_exit_cleanup();
                 self.registry.exit(tid);
                 crate::host_signal::forget_thread(tid.raw());
-                dispatcher.forget_thread_signal_state(tid);
                 tracing::debug!(%err, "spawn native Darwin guest thread failed");
                 return Ok(NativeCloneThreadSpawn::Errno(
                     crate::linux_abi::LINUX_EAGAIN,
@@ -5867,7 +5982,6 @@ impl NativeThreadRuntime {
         }
         crate::run_state::clear_guest_tid(self.tid.raw());
         crate::host_signal::forget_thread(self.tid.raw());
-        dispatcher.forget_thread_signal_state(self.tid);
         last
     }
 
@@ -6826,7 +6940,14 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
                     return Ok(DispatchOutcome::Returned { value: on_timeout });
                 };
                 match measure_native_blocked::<PROFILE, _>(blocked_ns, || {
-                    wait_native_fds(dispatcher, thread_runtime, &fds, timeout, sig_mask)
+                    wait_native_fds(
+                        dispatcher,
+                        kernel_context,
+                        thread_runtime,
+                        &fds,
+                        timeout,
+                        sig_mask,
+                    )
                 })? {
                     Ok(NativeWaitResult::Ready) => continue,
                     Ok(NativeWaitResult::TimedOut) => {
@@ -6837,6 +6958,7 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
                             && measure_native_blocked::<PROFILE, _>(blocked_ns, || {
                                 native_wait_park_if_quiesce_nudge(
                                     dispatcher,
+                                    kernel_context,
                                     thread_runtime,
                                     sig_mask,
                                 )
@@ -6860,7 +6982,14 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
                     return Ok(DispatchOutcome::Returned { value: on_timeout });
                 };
                 match measure_native_blocked::<PROFILE, _>(blocked_ns, || {
-                    wait_native_poll_fds(dispatcher, thread_runtime, &fds, timeout, sig_mask)
+                    wait_native_poll_fds(
+                        dispatcher,
+                        kernel_context,
+                        thread_runtime,
+                        &fds,
+                        timeout,
+                        sig_mask,
+                    )
                 })? {
                     Ok(NativeWaitResult::Ready) => continue,
                     Ok(NativeWaitResult::TimedOut) => {
@@ -6871,6 +7000,7 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
                             && measure_native_blocked::<PROFILE, _>(blocked_ns, || {
                                 native_wait_park_if_quiesce_nudge(
                                     dispatcher,
+                                    kernel_context,
                                     thread_runtime,
                                     sig_mask,
                                 )
@@ -6897,7 +7027,14 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 };
                 match measure_native_blocked::<PROFILE, _>(blocked_ns, || {
-                    wait_native_fds(dispatcher, thread_runtime, &fds, timeout, sig_mask)
+                    wait_native_fds(
+                        dispatcher,
+                        kernel_context,
+                        thread_runtime,
+                        &fds,
+                        timeout,
+                        sig_mask,
+                    )
                 })? {
                     Ok(NativeWaitResult::Ready) => continue,
                     Ok(NativeWaitResult::TimedOut) => {
@@ -6911,6 +7048,7 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
                             && measure_native_blocked::<PROFILE, _>(blocked_ns, || {
                                 native_wait_park_if_quiesce_nudge(
                                     dispatcher,
+                                    kernel_context,
                                     thread_runtime,
                                     sig_mask,
                                 )
@@ -6929,6 +7067,7 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
             } => match measure_native_blocked::<PROFILE, _>(blocked_ns, || {
                 wait_native_signals(
                     dispatcher,
+                    kernel_context,
                     thread_runtime,
                     wait_set,
                     block_mask,
@@ -6950,7 +7089,7 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
             },
             DispatchOutcome::FutexWait { wait, timeout } => {
                 let value = measure_native_blocked::<PROFILE, _>(blocked_ns, || {
-                    wait_native_futex(dispatcher, thread_runtime, wait, timeout, 0)
+                    wait_native_futex(dispatcher, kernel_context, thread_runtime, wait, timeout, 0)
                 })?;
                 // A pure fork-quiesce nudge: park, then RE-DISPATCH the
                 // syscall (revalidating the futex word — Linux syscall
@@ -6959,6 +7098,7 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
                     && measure_native_blocked::<PROFILE, _>(blocked_ns, || {
                         native_wait_park_if_quiesce_nudge(
                             dispatcher,
+                            kernel_context,
                             thread_runtime,
                             carrick_abi::WaitSigMask::NONE,
                         )
@@ -6974,12 +7114,20 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
                 index,
             } => {
                 let value = measure_native_blocked::<PROFILE, _>(blocked_ns, || {
-                    wait_native_futex(dispatcher, thread_runtime, wait, timeout, index)
+                    wait_native_futex(
+                        dispatcher,
+                        kernel_context,
+                        thread_runtime,
+                        wait,
+                        timeout,
+                        index,
+                    )
                 })?;
                 if value == crate::linux_abi::LINUX_EINTR.guest_retval()
                     && measure_native_blocked::<PROFILE, _>(blocked_ns, || {
                         native_wait_park_if_quiesce_nudge(
                             dispatcher,
+                            kernel_context,
                             thread_runtime,
                             carrick_abi::WaitSigMask::NONE,
                         )
@@ -6997,7 +7145,7 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
             } => {
                 let retval = measure_native_blocked::<PROFILE, _>(blocked_ns, || {
                     wait_native_shared_futex(
-                        dispatcher,
+                        NativeDispatchAuthority::new(dispatcher, kernel_context),
                         thread_runtime,
                         location,
                         waiter_key,
@@ -7010,6 +7158,7 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
                     && measure_native_blocked::<PROFILE, _>(blocked_ns, || {
                         native_wait_park_if_quiesce_nudge(
                             dispatcher,
+                            kernel_context,
                             thread_runtime,
                             carrick_abi::WaitSigMask::NONE,
                         )
@@ -7028,7 +7177,7 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
             } => {
                 let retval = measure_native_blocked::<PROFILE, _>(blocked_ns, || {
                     wait_native_shared_futex(
-                        dispatcher,
+                        NativeDispatchAuthority::new(dispatcher, kernel_context),
                         thread_runtime,
                         location,
                         waiter_key,
@@ -7041,6 +7190,7 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
                     && measure_native_blocked::<PROFILE, _>(blocked_ns, || {
                         native_wait_park_if_quiesce_nudge(
                             dispatcher,
+                            kernel_context,
                             thread_runtime,
                             carrick_abi::WaitSigMask::NONE,
                         )
@@ -7057,7 +7207,7 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
             } => {
                 let retval = measure_native_blocked::<PROFILE, _>(blocked_ns, || {
                     wait_native_shared_futex(
-                        dispatcher,
+                        NativeDispatchAuthority::new(dispatcher, kernel_context),
                         thread_runtime,
                         location,
                         waiter_key,
@@ -7070,6 +7220,7 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
                     if measure_native_blocked::<PROFILE, _>(blocked_ns, || {
                         native_wait_park_if_quiesce_nudge(
                             dispatcher,
+                            kernel_context,
                             thread_runtime,
                             carrick_abi::WaitSigMask::NONE,
                         )
@@ -7111,13 +7262,17 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
                 match crate::dispatch::drive_blocking_host_write(&mut write) {
                     crate::dispatch::BlockingHostWriteStep::Done(outcome) => {
                         return Ok(crate::vcpu_loop::raise_sigpipe_for_blocking_write(
-                            dispatcher, &write, outcome,
+                            dispatcher,
+                            kernel_context,
+                            &write,
+                            outcome,
                         ));
                     }
                     crate::dispatch::BlockingHostWriteStep::Wait => {
                         match measure_native_blocked::<PROFILE, _>(blocked_ns, || {
                             wait_native_fds(
                                 dispatcher,
+                                kernel_context,
                                 thread_runtime,
                                 &[crate::io_wait::WaitFd::raw(write.host_fd(), libc::POLLOUT)],
                                 None,
@@ -7138,6 +7293,7 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
                                     && measure_native_blocked::<PROFILE, _>(blocked_ns, || {
                                         native_wait_park_if_quiesce_nudge(
                                             dispatcher,
+                                            kernel_context,
                                             thread_runtime,
                                             carrick_abi::WaitSigMask::NONE,
                                         )
@@ -7167,7 +7323,7 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
             }
             DispatchOutcome::WaitOnProcExit { pid, sig_mask } => {
                 match measure_native_blocked::<PROFILE, _>(blocked_ns, || {
-                    wait_native_proc_exit(dispatcher, thread_runtime, pid, sig_mask)
+                    wait_native_proc_exit(dispatcher, kernel_context, thread_runtime, pid, sig_mask)
                 })? {
                     Ok(NativeWaitResult::Ready) | Ok(NativeWaitResult::TimedOut) => continue,
                     Err(errno) => {
@@ -7175,6 +7331,7 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
                             && measure_native_blocked::<PROFILE, _>(blocked_ns, || {
                                 native_wait_park_if_quiesce_nudge(
                                     dispatcher,
+                                    kernel_context,
                                     thread_runtime,
                                     sig_mask,
                                 )
@@ -7188,7 +7345,7 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
             }
             DispatchOutcome::WaitOnProcState { sig_mask, .. } => {
                 match measure_native_blocked::<PROFILE, _>(blocked_ns, || {
-                    wait_native_proc_state(dispatcher, thread_runtime, sig_mask)
+                    wait_native_proc_state(dispatcher, kernel_context, thread_runtime, sig_mask)
                 })? {
                     Ok(NativeWaitResult::Ready) | Ok(NativeWaitResult::TimedOut) => continue,
                     Err(errno) => {
@@ -7196,6 +7353,7 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
                             && measure_native_blocked::<PROFILE, _>(blocked_ns, || {
                                 native_wait_park_if_quiesce_nudge(
                                     dispatcher,
+                                    kernel_context,
                                     thread_runtime,
                                     sig_mask,
                                 )
@@ -7213,7 +7371,7 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
             } => {
                 let deadline = Instant::now() + duration;
                 match measure_native_blocked::<PROFILE, _>(blocked_ns, || {
-                    wait_native_sleep_until(dispatcher, thread_runtime, deadline)
+                    wait_native_sleep_until(dispatcher, kernel_context, thread_runtime, deadline)
                 })? {
                     Ok(()) => return Ok(DispatchOutcome::Returned { value: 0 }),
                     Err(crate::linux_abi::LINUX_EINTR) => {
@@ -7323,6 +7481,7 @@ fn remaining_native_wait_timeout(
 
 fn wait_native_futex(
     dispatcher: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
     thread_runtime: &NativeThreadRuntime,
     wait: crate::thread::FutexWait,
     timeout: Option<Duration>,
@@ -7336,6 +7495,7 @@ fn wait_native_futex(
             .wait_prepared_for_thread(wait, timeout, thread_runtime.tid(), &|| {
                 native_wait_interrupt_or_stw(
                     dispatcher,
+                    context,
                     thread_runtime.tid(),
                     carrick_abi::WaitSigMask::NONE,
                 )
@@ -7353,7 +7513,7 @@ fn wait_native_futex(
 }
 
 fn wait_native_shared_futex(
-    dispatcher: &SyscallDispatcher,
+    authority: NativeDispatchAuthority<'_>,
     thread_runtime: &NativeThreadRuntime,
     location: carrick_guest_mem::SharedFutexLocation,
     waiter_key: usize,
@@ -7361,9 +7521,14 @@ fn wait_native_shared_futex(
     timeout: Option<Duration>,
     woken_value: i64,
 ) -> i64 {
+    let NativeDispatchAuthority {
+        dispatcher,
+        kernel_context,
+    } = authority;
     let interrupted = || {
         native_wait_interrupt_or_stw(
             dispatcher,
+            kernel_context,
             thread_runtime.tid(),
             carrick_abi::WaitSigMask::NONE,
         )
@@ -7384,6 +7549,7 @@ fn wait_native_shared_futex(
 
 fn wait_native_signals(
     dispatcher: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
     thread_runtime: &NativeThreadRuntime,
     wait_set: carrick_abi::SigSet,
     block_mask: carrick_abi::SigBlockMask,
@@ -7404,7 +7570,9 @@ fn wait_native_signals(
         let Some(slice) = crate::vcpu_loop::signal_wait_slice(deadline, timeout) else {
             return NativeSignalWaitResult::TimedOut;
         };
-        if let Some(result) = native_signal_wait_pending(dispatcher, tid, wait_set, block_mask) {
+        if let Some(result) =
+            native_signal_wait_pending(dispatcher, context, tid, wait_set, block_mask)
+        {
             return result;
         }
         let wait_state = NativeWaitState::new(thread_runtime);
@@ -7413,13 +7581,14 @@ fn wait_native_signals(
             thread_runtime
                 .waiter
                 .wait_with_dispatch_pending(&[], Some(slice), block_mask, || {
-                    native_signal_wait_pending(dispatcher, tid, wait_set, block_mask).is_some()
+                    native_signal_wait_pending(dispatcher, context, tid, wait_set, block_mask)
+                        .is_some()
                 });
         drop(wait_state);
         match result {
             crate::io_wait::WaitResult::Ready | crate::io_wait::WaitResult::Interrupted => {
                 if let Some(result) =
-                    native_signal_wait_pending(dispatcher, tid, wait_set, block_mask)
+                    native_signal_wait_pending(dispatcher, context, tid, wait_set, block_mask)
                 {
                     return result;
                 }
@@ -7435,12 +7604,13 @@ fn wait_native_signals(
 
 pub(crate) fn native_signal_wait_pending(
     dispatcher: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
     tid: crate::thread::ThreadId,
     wait_set: carrick_abi::SigSet,
     block_mask: carrick_abi::SigBlockMask,
 ) -> Option<NativeSignalWaitResult> {
     native_poll_child_exit_watches();
-    dispatcher.drain_xsignals_process_directed();
+    dispatcher.drain_xsignals_process_directed(context);
     if crate::host_signal::has_unblocked_pending_for(
         tid.raw(),
         carrick_abi::SigBlockMask::blocking_all_of(wait_set.complement()),
@@ -7463,10 +7633,11 @@ pub(crate) fn native_signal_wait_pending(
     // pendings returned Ready above) — the HVF WaitOnSignals arm makes the
     // same distinction by consulting `signal_wait_should_eintr` on its
     // Interrupted wake before re-dispatching.
-    if dispatcher.signal_wait_should_eintr(tid, wait_set, block_mask) {
+    if dispatcher.signal_wait_should_eintr(context, tid, wait_set, block_mask) {
         return Some(NativeSignalWaitResult::Interrupted);
     }
     if dispatcher.has_deliverable_dispatch_pending_for_wait(
+        context,
         tid,
         carrick_abi::WaitSigMask::Replace(carrick_abi::SigSet::from_raw(block_mask.raw())),
     ) {
@@ -7477,19 +7648,20 @@ pub(crate) fn native_signal_wait_pending(
 
 fn wait_native_fds(
     dispatcher: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
     thread_runtime: &NativeThreadRuntime,
     fds: &[crate::io_wait::WaitFd],
     timeout: Option<Duration>,
     sig_mask: carrick_abi::WaitSigMask,
 ) -> Result<NativeWaitResult, crate::linux_abi::LinuxErrno> {
     let tid = thread_runtime.tid();
-    let block_mask = native_wait_block_mask(dispatcher, tid, sig_mask);
+    let block_mask = native_wait_block_mask(dispatcher, context, tid, sig_mask);
     let wait_state = NativeWaitState::new(thread_runtime);
     wait_state.enroll();
     let result = thread_runtime
         .waiter
         .wait_with_dispatch_pending(fds, timeout, block_mask, || {
-            native_wait_should_interrupt(dispatcher, tid, sig_mask)
+            native_wait_should_interrupt(dispatcher, context, tid, sig_mask)
         });
     drop(wait_state);
     match result {
@@ -7502,20 +7674,21 @@ fn wait_native_fds(
 
 fn wait_native_poll_fds(
     dispatcher: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
     thread_runtime: &NativeThreadRuntime,
     fds: &[crate::io_wait::WaitFd],
     timeout: Option<Duration>,
     sig_mask: carrick_abi::WaitSigMask,
 ) -> Result<NativeWaitResult, crate::linux_abi::LinuxErrno> {
     let tid = thread_runtime.tid();
-    let block_mask = native_wait_block_mask(dispatcher, tid, sig_mask);
+    let block_mask = native_wait_block_mask(dispatcher, context, tid, sig_mask);
     let wait_state = NativeWaitState::new(thread_runtime);
     wait_state.enroll();
     let result =
         thread_runtime
             .waiter
             .wait_poll_with_dispatch_pending(fds, timeout, block_mask, || {
-                native_wait_should_interrupt(dispatcher, tid, sig_mask)
+                native_wait_should_interrupt(dispatcher, context, tid, sig_mask)
             });
     drop(wait_state);
     match result {
@@ -7528,19 +7701,20 @@ fn wait_native_poll_fds(
 
 fn wait_native_proc_exit(
     dispatcher: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
     thread_runtime: &NativeThreadRuntime,
     pid: i32,
     sig_mask: carrick_abi::WaitSigMask,
 ) -> Result<NativeWaitResult, crate::linux_abi::LinuxErrno> {
     let tid = thread_runtime.tid();
-    let block_mask = native_wait_block_mask(dispatcher, tid, sig_mask);
+    let block_mask = native_wait_block_mask(dispatcher, context, tid, sig_mask);
     let wait_state = NativeWaitState::new(thread_runtime);
     wait_state.enroll();
     let result =
         thread_runtime
             .waiter
             .wait_proc_exit_with_dispatch_pending(pid, block_mask, || {
-                native_wait_should_interrupt(dispatcher, tid, sig_mask)
+                native_wait_should_interrupt(dispatcher, context, tid, sig_mask)
             });
     drop(wait_state);
     match result {
@@ -7553,17 +7727,18 @@ fn wait_native_proc_exit(
 
 fn wait_native_proc_state(
     dispatcher: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
     thread_runtime: &NativeThreadRuntime,
     sig_mask: carrick_abi::WaitSigMask,
 ) -> Result<NativeWaitResult, crate::linux_abi::LinuxErrno> {
     let tid = thread_runtime.tid();
-    let block_mask = native_wait_block_mask(dispatcher, tid, sig_mask);
+    let block_mask = native_wait_block_mask(dispatcher, context, tid, sig_mask);
     let wait_state = NativeWaitState::new(thread_runtime);
     wait_state.enroll();
     let result = thread_runtime
         .waiter
         .wait_proc_state_with_dispatch_pending(block_mask, || {
-            native_wait_should_interrupt(dispatcher, tid, sig_mask)
+            native_wait_should_interrupt(dispatcher, context, tid, sig_mask)
         });
     drop(wait_state);
     match result {
@@ -7576,14 +7751,15 @@ fn wait_native_proc_state(
 
 fn wait_native_sleep_until(
     dispatcher: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
     thread_runtime: &NativeThreadRuntime,
     deadline: Instant,
 ) -> Result<(), crate::linux_abi::LinuxErrno> {
     let tid = thread_runtime.tid();
     let sig_mask = carrick_abi::WaitSigMask::NONE;
-    let block_mask = native_wait_block_mask(dispatcher, tid, sig_mask);
+    let block_mask = native_wait_block_mask(dispatcher, context, tid, sig_mask);
     loop {
-        if native_wait_should_interrupt(dispatcher, tid, sig_mask) {
+        if native_wait_should_interrupt(dispatcher, context, tid, sig_mask) {
             return Err(crate::linux_abi::LINUX_EINTR);
         }
         let now = Instant::now();
@@ -7596,14 +7772,14 @@ fn wait_native_sleep_until(
             &[],
             Some(deadline - now),
             block_mask,
-            || native_wait_should_interrupt(dispatcher, tid, sig_mask),
+            || native_wait_should_interrupt(dispatcher, context, tid, sig_mask),
         );
         drop(wait_state);
         match result {
             crate::io_wait::WaitResult::Ready => {}
             crate::io_wait::WaitResult::TimedOut => return Ok(()),
             crate::io_wait::WaitResult::Interrupted => {
-                if native_wait_should_interrupt(dispatcher, tid, sig_mask) {
+                if native_wait_should_interrupt(dispatcher, context, tid, sig_mask) {
                     return Err(crate::linux_abi::LINUX_EINTR);
                 }
                 // A fork-quiesce nudge: park HERE (the loop re-blocks on the
@@ -7624,14 +7800,15 @@ fn wait_native_sleep_until(
 
 fn native_wait_should_interrupt(
     dispatcher: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
     tid: crate::thread::ThreadId,
     sig_mask: carrick_abi::WaitSigMask,
 ) -> bool {
     native_poll_child_exit_watches();
-    dispatcher.drain_xsignals_process_directed();
-    let block_mask = native_wait_block_mask(dispatcher, tid, sig_mask);
+    dispatcher.drain_xsignals_process_directed(context);
+    let block_mask = native_wait_block_mask(dispatcher, context, tid, sig_mask);
     crate::host_signal::has_unblocked_pending_for(tid.raw(), block_mask)
-        || dispatcher.has_deliverable_dispatch_pending_for_wait(tid, sig_mask)
+        || dispatcher.has_deliverable_dispatch_pending_for_wait(context, tid, sig_mask)
 }
 
 /// Blocking-wait interrupt predicate INCLUDING the stop-the-world edges: a
@@ -7643,10 +7820,11 @@ fn native_wait_should_interrupt(
 /// nudge never reaches the guest as EINTR.
 fn native_wait_interrupt_or_stw(
     dispatcher: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
     tid: crate::thread::ThreadId,
     sig_mask: carrick_abi::WaitSigMask,
 ) -> bool {
-    native_wait_should_interrupt(dispatcher, tid, sig_mask)
+    native_wait_should_interrupt(dispatcher, context, tid, sig_mask)
         || crate::fork_quiesce::is_quiescing()
         || crate::fork_quiesce::exec_replacing_other_thread(tid)
 }
@@ -7660,11 +7838,12 @@ fn native_wait_interrupt_or_stw(
 /// quiesce already ended all return false and take the normal EINTR path.
 fn native_wait_park_if_quiesce_nudge(
     dispatcher: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
     thread_runtime: &NativeThreadRuntime,
     sig_mask: carrick_abi::WaitSigMask,
 ) -> bool {
     let tid = thread_runtime.tid();
-    if native_wait_should_interrupt(dispatcher, tid, sig_mask)
+    if native_wait_should_interrupt(dispatcher, context, tid, sig_mask)
         || crate::fork_quiesce::exec_replacing_other_thread(tid)
         || !crate::fork_quiesce::is_quiescing()
     {
@@ -7676,12 +7855,15 @@ fn native_wait_park_if_quiesce_nudge(
 
 fn native_wait_block_mask(
     dispatcher: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
     tid: crate::thread::ThreadId,
     sig_mask: carrick_abi::WaitSigMask,
 ) -> carrick_abi::SigBlockMask {
     let effective = match sig_mask {
         carrick_abi::WaitSigMask::Replace(mask) => mask,
-        carrick_abi::WaitSigMask::Additive(mask) => dispatcher.signal_mask_for(tid).union(mask),
+        carrick_abi::WaitSigMask::Additive(mask) => {
+            dispatcher.signal_mask_for(context, tid).union(mask)
+        }
     };
     carrick_abi::SigBlockMask::blocking_all_of(effective)
 }
@@ -7970,7 +8152,6 @@ fn handle_native_fork(
     } else {
         None
     };
-    let parent_tid = thread_runtime.tid();
     let child_parent = std::process::id();
     let child_subreaper = dispatcher.subreaper_for_fork_child();
     let child_ns_pid = crate::namespace::pid::allocate_child_ns_pid_pre_fork();
@@ -8134,8 +8315,6 @@ fn handle_native_fork(
         // fresh registry allocates tids that can collide with a dead parent
         // sibling's entry (regression:
         // fork_child_retires_sibling_thread_signal_state).
-        dispatcher.retire_sibling_thread_signal_state(parent_tid);
-        dispatcher.migrate_thread_signal_state(parent_tid, thread_runtime.tid());
         thread_runtime.prepare_kick_target()?;
         thread_runtime.start_signal_wake_pump();
         native_trace_fork_phase("child-thread-runtime-reset");
@@ -8292,7 +8471,7 @@ fn handle_native_fork(
 /// Runs AFTER the replacement image loaded successfully — a failed execve
 /// must leave the thread group intact (Linux's point of no return).
 fn native_terminate_siblings_for_exec(
-    dispatcher: &SyscallDispatcher,
+    _dispatcher: &SyscallDispatcher,
     memory: &SharedNativeMemory,
     thread_runtime: &mut NativeThreadRuntime,
 ) -> Result<NativeExecTeardownFlow, RuntimeError> {
@@ -8379,7 +8558,6 @@ fn native_terminate_siblings_for_exec(
         thread_runtime.kicker.unregister(tid);
         crate::run_state::clear_guest_tid(tid.raw());
         crate::host_signal::forget_thread(tid.raw());
-        dispatcher.forget_thread_signal_state(tid);
     }
     // Join the sibling HOST threads so none is mid-unwind while the image is
     // replaced. Skip self when the exec came from a spawned thread (joining
@@ -12435,17 +12613,27 @@ mod tests {
     #[test]
     fn native_signal_wait_classifies_nonset_caught_signal_as_interrupted() {
         let dispatcher = SyscallDispatcher::new();
-        let tid = crate::thread::ThreadId::synthetic_for_tests(0x4e53); // "NS"
+        let tid = dispatcher
+            .capture_one_task_context()
+            .unwrap()
+            .thread()
+            .registry_id();
         let usr1 = crate::linux_abi::LINUX_SIGUSR1;
-        dispatcher.mark_signal_pending(tid, usr1);
+        dispatcher.mark_signal_pending(&dispatcher.exact_signal_context_for_test(), tid, usr1);
         let wait_set = carrick_abi::SigSet::EMPTY;
         let block_mask = carrick_abi::SigBlockMask::for_signal_wait(
             wait_set,
-            dispatcher.signal_mask_for(tid),
-            dispatcher.wait_ignored_disposition_mask(),
+            dispatcher.signal_mask_for(&dispatcher.exact_signal_context_for_test(), tid),
+            dispatcher.wait_ignored_disposition_mask(&dispatcher.exact_signal_context_for_test()),
         );
         assert_eq!(
-            native_signal_wait_pending(&dispatcher, tid, wait_set, block_mask),
+            native_signal_wait_pending(
+                &dispatcher,
+                &dispatcher.exact_signal_context_for_test(),
+                tid,
+                wait_set,
+                block_mask
+            ),
             Some(NativeSignalWaitResult::Interrupted),
         );
     }
@@ -12457,17 +12645,27 @@ mod tests {
     #[test]
     fn native_signal_wait_classifies_wait_set_dispatch_pending_as_ready() {
         let dispatcher = SyscallDispatcher::new();
-        let tid = crate::thread::ThreadId::synthetic_for_tests(0x4e54);
+        let tid = dispatcher
+            .capture_one_task_context()
+            .unwrap()
+            .thread()
+            .registry_id();
         let usr1 = crate::linux_abi::LINUX_SIGUSR1;
-        dispatcher.mark_signal_pending(tid, usr1);
+        dispatcher.mark_signal_pending(&dispatcher.exact_signal_context_for_test(), tid, usr1);
         let wait_set = carrick_abi::SigSet::EMPTY.with(usr1);
         let block_mask = carrick_abi::SigBlockMask::for_signal_wait(
             wait_set,
-            dispatcher.signal_mask_for(tid),
-            dispatcher.wait_ignored_disposition_mask(),
+            dispatcher.signal_mask_for(&dispatcher.exact_signal_context_for_test(), tid),
+            dispatcher.wait_ignored_disposition_mask(&dispatcher.exact_signal_context_for_test()),
         );
         assert_eq!(
-            native_signal_wait_pending(&dispatcher, tid, wait_set, block_mask),
+            native_signal_wait_pending(
+                &dispatcher,
+                &dispatcher.exact_signal_context_for_test(),
+                tid,
+                wait_set,
+                block_mask
+            ),
             Some(NativeSignalWaitResult::Ready),
         );
     }
@@ -12520,7 +12718,11 @@ mod tests {
             ..NativeUcontextSnapshot::default()
         };
         let dispatcher = SyscallDispatcher::new();
-        let tid = crate::thread::ThreadId::synthetic_for_tests(0x5347); // "SG"
+        let tid = dispatcher
+            .capture_one_task_context()
+            .unwrap()
+            .thread()
+            .registry_id();
 
         // First instance delivered: handler frame is live, guest runs at the
         // handler. (saved_sigmask = 0: the interrupted context blocked nothing.)
@@ -12547,13 +12749,23 @@ mod tests {
             sa_restorer: 0,
             sa_mask: [0; carrick_abi::LINUX_SIGSET_WORDS],
         };
-        dispatcher.record_pending_signal_action(tid, sig, action);
-        dispatcher.mark_signal_pending(tid, sig);
+        dispatcher.record_pending_signal_action(
+            &dispatcher.exact_signal_context_for_test(),
+            tid,
+            sig,
+            action,
+        );
+        dispatcher.mark_signal_pending(&dispatcher.exact_signal_context_for_test(), tid, sig);
 
         // The handler returns: rt_sigreturn must chain into the next handler
         // at the restored PC, not resume the interrupted context.
-        let outcome = sigreturn_restore_and_deliver(&dispatcher, &mut trap, tid)
-            .expect("sigreturn restore and deliver");
+        let outcome = sigreturn_restore_and_deliver(
+            &dispatcher,
+            &dispatcher.exact_signal_context_for_test(),
+            &mut trap,
+            tid,
+        )
+        .expect("sigreturn restore and deliver");
         if let Some(outcome) = &outcome {
             assert_eq!(outcome.term_signal, None);
             assert_eq!(outcome.stop_signal, None);
@@ -12569,8 +12781,10 @@ mod tests {
         trap.restore_from_sigframe()
             .expect("restore chained native handler frame");
         assert_eq!(trap.pc(), INTERRUPTED_PC);
-        assert_eq!(dispatcher.take_deliverable_pending(tid), None);
-        dispatcher.forget_thread_signal_state(tid);
+        assert_eq!(
+            dispatcher.take_deliverable_pending(&dispatcher.exact_signal_context_for_test(), tid),
+            None
+        );
     }
 
     #[test]
@@ -12965,6 +13179,7 @@ mod tests {
             let wait = sibling.futex.prepare_wait(0x9000);
             wait_native_futex(
                 &dispatcher,
+                &dispatcher.exact_signal_context_for_test(),
                 &sibling,
                 wait,
                 Some(Duration::from_secs(10)),
@@ -15242,6 +15457,7 @@ mod tests {
             &|| {
                 let observed = native_wait_interrupt_or_stw(
                     &dispatcher,
+                    &dispatcher.exact_signal_context_for_test(),
                     runtime.tid(),
                     carrick_abi::WaitSigMask::NONE,
                 );
@@ -15259,6 +15475,7 @@ mod tests {
         assert_eq!(outcome, crate::thread::FutexWaitOutcome::Interrupted);
         assert!(native_wait_interrupt_or_stw(
             &dispatcher,
+            &dispatcher.exact_signal_context_for_test(),
             runtime.tid(),
             carrick_abi::WaitSigMask::NONE,
         ));
@@ -15488,6 +15705,7 @@ mod tests {
         assert_eq!(outcome, crate::thread::FutexWaitOutcome::Interrupted);
         assert!(native_wait_interrupt_or_stw(
             &dispatcher,
+            &dispatcher.exact_signal_context_for_test(),
             runtime.tid(),
             carrick_abi::WaitSigMask::NONE,
         ));

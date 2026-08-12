@@ -715,7 +715,6 @@ where
                                 cleanup_registry.exit(tid);
                                 cleanup_kicker.unregister(tid);
                                 crate::host_signal::forget_thread(tid.raw());
-                                cleanup_kernel.dispatcher.forget_thread_signal_state(tid);
                                 let _ = cleanup_kernel
                                     .dispatcher
                                     .exit_one_task_thread(linux_tid);
@@ -846,9 +845,6 @@ where
             self.registry
                 .register_child_with_tid(tid, clear_child_tid_addr);
         }
-        kernel
-            .dispatcher
-            .inherit_thread_signal_mask(self.this_tid, tid);
         // Make the host child visible to every exit/exec census before opening
         // its start gate. Once Kernel publication and runtime registration are
         // authoritative, a vanished receiver is an internal invariant breach,
@@ -978,11 +974,11 @@ where
     ) -> VcpuLoopOutcome {
         // Exit-cleanup gate: the moment `kicker.unregister` below runs, a
         // concurrent fork's quiesce stops counting this thread — but the
-        // cleanup that follows (host_signal::forget_thread, the dispatcher's
-        // forget_thread_signal_state) takes process-global mutexes. If
+        // cleanup that follows (`host_signal::forget_thread`) takes a
+        // process-global mutex. If
         // `libc::fork` lands while one is held, the CHILD inherits it locked
         // forever (the deterministic go-os_exec TestConcurrentExec wedge: the
-        // vfork child deadlocked in migrate_thread_signal_state). The guard is
+        // vfork child deadlocked in inherited signal-state cleanup). The guard is
         // a non-blocking atomic count; `handle_fork` waits for it to drain
         // (bounded) after the quiesce and before forking.
         let _cleanup_gate = crate::fork_quiesce::begin_exit_cleanup();
@@ -1029,7 +1025,6 @@ where
         trace_hvpatch_thread_teardown(kernel, self.this_tid, 3);
         crate::host_signal::forget_thread(self.this_tid.raw());
         trace_hvpatch_thread_teardown(kernel, self.this_tid, 4);
-        kernel.dispatcher.forget_thread_signal_state(self.this_tid);
         trace_hvpatch_thread_teardown(kernel, self.this_tid, 5);
         if last {
             let result = assemble_run_result(kernel, code, traps, false);
@@ -1168,7 +1163,6 @@ where
         for tid in removed {
             self.kicker.unregister(tid);
             crate::host_signal::forget_thread(tid.raw());
-            kernel.dispatcher.forget_thread_signal_state(tid);
         }
         kernel.end_exec_replacement();
         Ok(())

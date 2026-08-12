@@ -23,34 +23,17 @@
 //!     handlers return [`DispatchOutcome`] values (e.g. `SignalThread`,
 //!     `SigReturn`) that the runtime turns into frame builds and vCPU kicks.
 //!
-//! ## The state machine ([`SignalState`])
+//! ## Kernel-owned state machine
 //!
-//! The hard part of Linux signals is that masks, pending sets, and alternate
-//! stacks are **per-thread**, while handlers and one shared pending set are
-//! **per-process (thread-group)**. Getting this wrong is not a crash — it is a
-//! lost or misrouted signal, the worst kind of bug to chase. Several fields
-//! here exist specifically because a process-global shortcut once stranded a
-//! signal:
-//!
-//!   - `masks`, `pendings`, `altstack`, `handler_frames` are keyed by
-//!     [`crate::thread::ThreadId`]. A process-global mask let one thread's
-//!     `rt_sigprocmask` block a signal for a sibling; a process-global alt
-//!     stack made concurrent SIGURG frames overlap and corrupt goroutine
-//!     stacks. Both were real (the field docstrings cite the cases).
-//!   - `process_pending` / `process_rt_pending_counts` are the SHARED
-//!     thread-group pending set for a process-directed signal that no thread
-//!     can take immediately (every thread blocks it). `take_pending_in_from`
-//!     considers it alongside the per-thread set so ANY thread that next
-//!     unblocks — or that calls `rt_sigtimedwait`/`sigwait` — can consume it.
-//!   - `rt_pending_counts` gives real-time signals (SIGRTMIN..=SIGRTMAX) POSIX
-//!     queuing: N sends while blocked yield N deliveries on unblock, whereas a
-//!     standard signal coalesces to one. The pending BIT only clears when the
-//!     last queued instance drains.
-//!   - `restore_masks` implements Linux's `set_restore_sigmask`: a syscall that
-//!     temporarily swaps the mask for the duration of a wait (`sigsuspend`,
-//!     `pselect`/`ppoll` with a sigmask) arms the mask that the NEXT handler's
-//!     `rt_sigreturn` must restore — so the handler runs under the temporary
-//!     mask and the original returns afterward.
+//! Linux thread-group actions live in the exact Kernel [`crate::kernel::Sighand`],
+//! process-directed pending signals in [`crate::kernel::TaskPendingSignals`],
+//! and masks, thread-directed queues, alternate stacks, handler frames, restore
+//! masks, siginfo, and action snapshots in each exact
+//! [`crate::kernel::ThreadSignalState`]. The dispatcher retains only an exact
+//! `Sighand` binding; it owns no mutable signal semantics. Standard signals
+//! coalesce, real-time signals retain FIFO instances, and an atomic dequeue
+//! selects thread-directed state before task-directed state on a same-signum
+//! tie.
 //!
 //! ## Delivery cycle and EINTR
 //!
@@ -94,164 +77,12 @@ syscall_table! {
 }
 use crate::linux_abi::LinuxSiginfo;
 use carrick_abi::{SigBlockMask, SigSet};
-use std::collections::VecDeque;
 
-/// Owned signal-subsystem state. Split out of `SyscallDispatcher` so the
-/// signal handlers borrow only what they touch instead of the whole
-/// dispatcher. Field semantics are unchanged from the former loose
-/// fields (`signal_handlers`/`signal_mask`/`pending_signals`/`sig_altstack`).
-#[derive(Clone)]
-pub(super) struct SignalState {
-    /// Installed signal handlers per signum (1..=64). When the guest
-    /// calls `rt_sigaction(signum, new, old, 8)` we record `new` here
-    /// and return whatever was previously stored via `old`.
-    pub handlers: HashMap<i32, LinuxSigaction>,
-    /// Guest's blocked-signal mask (bit `signum-1`), PER GUEST THREAD. The
-    /// signal mask is per-thread in Linux; a process-global mask let one
-    /// thread's `rt_sigprocmask` (e.g. musl's pthread_create block/restore
-    /// dance) block a signal for ANOTHER thread → a cross-thread signal was
-    /// "blocked" at the target and never delivered (found via `carrick trace`
-    /// signal-publish/deliver probes). Default (absent key) = empty mask.
-    pub masks: HashMap<crate::thread::ThreadId, SigSet>,
-    /// Signals raised while blocked, awaiting unblock or a synchronous wait
-    /// (`rt_sigtimedwait`), PER GUEST THREAD (bit `signum-1`). For a standard
-    /// signal the bit is presence only (multiple sends coalesce, matching
-    /// Linux). For a real-time signal (SIGRTMIN..=SIGRTMAX) the COUNT of queued
-    /// instances lives in `rt_pending_counts`; the bit here just mirrors
-    /// "count > 0".
-    pub pendings: HashMap<crate::thread::ThreadId, SigSet>,
-    /// Queue depth for pending REAL-TIME signals, keyed by `(tid, signum)`.
-    /// RT signals must deliver once per send (POSIX queuing), unlike standard
-    /// signals which coalesce — so N `rt_sigqueueinfo`/`kill` of an RT signal
-    /// while blocked must yield N deliveries on unblock. `take_pending_in_from`
-    /// decrements this and only clears the pending bit when it hits 0.
-    pub rt_pending_counts: HashMap<(crate::thread::ThreadId, i32), u32>,
-    /// SHARED (process-level) pending set (bit `signum-1`) for PROCESS-directed
-    /// signals (`kill(getpid(), sig)`) that no thread can take immediately
-    /// because EVERY thread blocks `sig`. Linux holds such a signal in the
-    /// thread group's shared pending set, deliverable to whichever thread next
-    /// unblocks it (`rt_sigprocmask` -> `take_deliverable_pending`) OR dequeues
-    /// it synchronously (`rt_sigtimedwait`/sigwait). Pinning it to the SENDER's
-    /// per-thread set instead stranded a SIBLING's `sigwait` forever (CPython
-    /// test_sigwait_thread). `take_pending_in_from` considers this alongside the
-    /// per-thread set so any thread can consume it.
-    pub process_pending: SigSet,
-    /// Queue depth for SHARED pending REAL-TIME signals, keyed by `signum`
-    /// (the process-level analogue of `rt_pending_counts`).
-    pub process_rt_pending_counts: HashMap<i32, u32>,
-    /// Installed alternate signal stack (`sigaltstack`), PER GUEST THREAD.
-    /// `sigaltstack` is per-thread in Linux (each thread/M registers its own
-    /// signal stack), so this MUST be keyed by tid: a process-global slot made
-    /// every thread's SIGURG (Go async-preempt) frame land on the last-set
-    /// stack → concurrent frames overlapped → goroutine-stack corruption →
-    /// the c>=20 EL0 faults (found via `carrick trace` on the `signal-inject`
-    /// probe: identical `new_sp` across threads). Signal HANDLERS stay global
-    /// (Linux shares them across threads); only the alt stack is per-thread.
-    pub altstack: HashMap<crate::thread::ThreadId, LinuxSigaltstack>,
-    /// Per-thread stack of currently-active signal-handler frames; each `bool`
-    /// records whether THAT frame is executing on the alternate signal stack
-    /// (SA_ONSTACK + an alt stack was configured). `enter_signal_handler` pushes
-    /// on delivery, `rt_sigreturn` pops on return. A thread "is on the alt
-    /// stack" iff any active frame's bool is true — used so `sigaltstack(NULL,
-    /// &old)` reports SS_ONSTACK and a `sigaltstack(SET)` while on it returns
-    /// EPERM (Linux semantics). (audit M13)
-    pub handler_frames: HashMap<crate::thread::ThreadId, Vec<bool>>,
-    /// Linux's `set_restore_sigmask()` shadow: when a syscall (sigsuspend,
-    /// pselect, ppoll with a sigmask) temporarily replaced the thread's
-    /// signal mask, this records the mask to restore AFTER the next signal
-    /// handler runs — NOT immediately on syscall return. The handler runs
-    /// under the temporary mask (so a now-deliverable pending signal can
-    /// actually be delivered), and `rt_sigreturn` then pops THIS mask off
-    /// the sigframe. `enter_signal_handler` consumes the entry the first
-    /// time a handler runs after it's armed.
-    pub restore_masks: HashMap<crate::thread::ThreadId, SigSet>,
-    /// Caller-supplied `siginfo_t` queued for delivery, keyed by `(tid,
-    /// signum)`. `rt_sigqueueinfo` pushes the user's siginfo here so the
-    /// SA_SIGINFO handler sees the original `si_value` payload instead of
-    /// a synthesised SI_USER. RT signals (32..=64) queue multiple entries
-    /// (POSIX queuing); standard signals overwrite the head. Each delivery
-    /// pops the front entry.
-    pub pending_siginfos: HashMap<(crate::thread::ThreadId, i32), VecDeque<LinuxSiginfo>>,
-    /// PROCESS-directed analogue of `pending_siginfos`, keyed by `signum`:
-    /// caller-supplied siginfo for a signal held in the SHARED pending set
-    /// (`process_pending`). The cross-process xsignal-ring drain records here —
-    /// a ring entry is always process-directed (the ring carries no target
-    /// tid) — so WHICHEVER thread consumes the shared-set signal receives the
-    /// sender's identity/payload. `take_pending_siginfo` falls back to this
-    /// queue when the consuming thread's per-tid queue is empty.
-    pub process_pending_siginfos: HashMap<i32, VecDeque<LinuxSiginfo>>,
-    /// Handler action snapshots for unblocked thread-directed signals. The
-    /// backend pending slot stores only a signum; without this, delayed delivery
-    /// can observe a later `sigaction(SIG_IGN)` and drop a signal that was
-    /// generated while a real handler was installed.
-    pub pending_actions: HashMap<(crate::thread::ThreadId, i32), VecDeque<LinuxSigaction>>,
-}
-
-impl SignalState {
-    pub(super) fn new() -> Self {
-        Self {
-            handlers: HashMap::new(),
-            masks: HashMap::new(),
-            pendings: HashMap::new(),
-            rt_pending_counts: HashMap::new(),
-            process_pending: SigSet::EMPTY,
-            process_rt_pending_counts: HashMap::new(),
-            altstack: HashMap::new(),
-            handler_frames: HashMap::new(),
-            restore_masks: HashMap::new(),
-            pending_siginfos: HashMap::new(),
-            process_pending_siginfos: HashMap::new(),
-            pending_actions: HashMap::new(),
-        }
-    }
-
-    pub(super) fn fork_clone(
-        &self,
-        parent_tid: crate::thread::ThreadId,
-        child_tid: crate::thread::ThreadId,
-    ) -> Self {
-        Self {
-            handlers: self.handlers.clone(),
-            masks: self
-                .masks
-                .get(&parent_tid)
-                .copied()
-                .map(|value| HashMap::from([(child_tid, value)]))
-                .unwrap_or_default(),
-            // Pending signals are not inherited across fork.
-            pendings: HashMap::new(),
-            rt_pending_counts: HashMap::new(),
-            process_pending: SigSet::EMPTY,
-            process_rt_pending_counts: HashMap::new(),
-            altstack: self
-                .altstack
-                .get(&parent_tid)
-                .copied()
-                .map(|value| HashMap::from([(child_tid, value)]))
-                .unwrap_or_default(),
-            // A fork from inside a handler resumes inside that same handler in
-            // the child, so preserve only the calling thread's frame stack.
-            handler_frames: self
-                .handler_frames
-                .get(&parent_tid)
-                .cloned()
-                .map(|value| HashMap::from([(child_tid, value)]))
-                .unwrap_or_default(),
-            restore_masks: self
-                .restore_masks
-                .get(&parent_tid)
-                .copied()
-                .map(|value| HashMap::from([(child_tid, value)]))
-                .unwrap_or_default(),
-            pending_siginfos: HashMap::new(),
-            process_pending_siginfos: HashMap::new(),
-            pending_actions: HashMap::new(),
-        }
-    }
-
-    fn mask_for(&self, tid: crate::thread::ThreadId) -> SigSet {
-        self.masks.get(&tid).copied().unwrap_or(SigSet::EMPTY)
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DispatchPendingSignal {
+    pub(crate) signum: i32,
+    pub(crate) owner: crate::kernel::SignalPendingOwner,
+    pub(crate) siginfo: Option<LinuxSiginfo>,
 }
 
 /// Real-time signals (`SIGRTMIN`..=`SIGRTMAX`, kernel numbers 32..=64) queue
@@ -334,18 +165,102 @@ fn should_route_specific_xsig(target_host_pid: i32, signum: i32) -> bool {
     crate::namespace::pid::host_to_ns_or_self(target_host_pid as u32) != 0
 }
 
-fn sanitize_signal_mask(mask: SigSet) -> SigSet {
+pub(super) fn sanitize_signal_mask(mask: SigSet) -> SigSet {
     mask.without(LINUX_SIGKILL).without(LINUX_SIGSTOP)
 }
 
 impl SyscallDispatcher {
-    /// Look up the currently-installed handler for `signum`. Returns
-    /// `None` when no handler has been recorded via `rt_sigaction`, or
-    /// when the recorded handler is `SIG_DFL` / `SIG_IGN`. The runtime
-    /// uses this to decide whether to inject a guest frame (handler is
-    /// `Some`) or apply the host-side default (handler is `None`).
-    pub fn registered_signal_handler(&self, signum: i32) -> Option<LinuxSigaction> {
-        let action = self.signal.lock().handlers.get(&signum).copied()?;
+    #[cfg(test)]
+    pub(crate) fn exact_signal_context_for_test(&self) -> crate::kernel::KernelContext {
+        self.capture_one_task_context()
+            .expect("capture exact test signal context")
+    }
+
+    fn signal_action_entry(
+        context: &crate::kernel::KernelContext,
+        signum: i32,
+    ) -> Option<LinuxSigaction> {
+        let signal = crate::kernel::LinuxSignal::for_signal_number(signum).ok()?;
+        context.shared().sighand().action_entry(signal)
+    }
+
+    fn signal_action(context: &crate::kernel::KernelContext, signum: i32) -> LinuxSigaction {
+        crate::kernel::LinuxSignal::for_signal_number(signum)
+            .ok()
+            .map(|signal| context.shared().sighand().action(signal))
+            .unwrap_or_else(LinuxSigaction::empty)
+    }
+
+    fn install_signal_action(
+        context: &crate::kernel::KernelContext,
+        signum: i32,
+        action: LinuxSigaction,
+    ) {
+        let signal =
+            crate::kernel::LinuxSignal::for_signal_number(signum).unwrap_or_else(|error| {
+                tracing::error!(%error, signum, "invalid signal reached Kernel Sighand install");
+                std::process::abort();
+            });
+        context.shared().sighand().install_action(signal, action);
+    }
+
+    fn signal_actions(context: &crate::kernel::KernelContext) -> Vec<(i32, LinuxSigaction)> {
+        context
+            .shared()
+            .sighand()
+            .actions()
+            .into_iter()
+            .map(|(signal, action)| (signal.raw(), action))
+            .collect()
+    }
+
+    fn signal_thread(
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+    ) -> Option<crate::kernel::ThreadRef> {
+        context.task().thread_by_registry_id(tid)
+    }
+
+    fn required_signal_thread(
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+    ) -> crate::kernel::ThreadRef {
+        Self::signal_thread(context, tid).unwrap_or_else(|| {
+            tracing::error!(
+                ?tid,
+                task = ?context.task().key(),
+                "signal operation escaped its captured KernelContext"
+            );
+            std::process::abort();
+        })
+    }
+
+    fn signal_authority_for(
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+    ) -> crate::kernel::SignalAuthority {
+        crate::kernel::SignalAuthority::new(
+            context.shared().sighand(),
+            context.shared().pending_signals(),
+            Self::required_signal_thread(context, tid),
+        )
+    }
+
+    fn any_signal_thread_blocks(context: &crate::kernel::KernelContext, signum: i32) -> bool {
+        context
+            .task()
+            .threads()
+            .into_iter()
+            .any(|thread| thread.signal_state().blocked().contains(signum))
+    }
+
+    /// Look up the currently-installed handler from the exact captured Sighand.
+    pub fn registered_signal_handler(
+        &self,
+        context: &crate::kernel::KernelContext,
+        signum: i32,
+    ) -> Option<LinuxSigaction> {
+        let action = Self::signal_action_entry(context, signum)?;
         let handler = action.sa_handler;
         if handler == crate::linux_abi::LINUX_SIG_DFL || handler == crate::linux_abi::LINUX_SIG_IGN
         {
@@ -355,59 +270,48 @@ impl SyscallDispatcher {
         }
     }
 
-    /// The currently-installed alternate signal stack as `(ss_sp, ss_size)`,
-    /// or `None` when no alt stack is set. The runtime uses this to place the
-    /// signal frame on the alt stack when a handler is registered `SA_ONSTACK`.
-    pub fn signal_altstack(&self, tid: crate::thread::ThreadId) -> Option<(u64, u64)> {
-        self.signal
-            .lock()
-            .altstack
-            .get(&tid)
-            .map(|a| (a.ss_sp, a.ss_size))
+    pub fn signal_altstack(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+    ) -> Option<(u64, u64)> {
+        Self::signal_thread(context, tid)
+            .and_then(|thread| thread.signal_state().altstack())
+            .map(|altstack| (altstack.ss_sp, altstack.ss_size))
     }
 
-    /// True iff the guest installed `SIG_IGN` for `signum`. Lets the
-    /// runtime drop a pending signal without injecting it.
-    pub fn signal_is_ignored(&self, signum: i32) -> bool {
-        self.signal
-            .lock()
-            .handlers
-            .get(&signum)
-            .map(|a| a.sa_handler == crate::linux_abi::LINUX_SIG_IGN)
-            .unwrap_or(false)
+    pub fn signal_is_ignored(&self, context: &crate::kernel::KernelContext, signum: i32) -> bool {
+        Self::signal_action_entry(context, signum)
+            .is_some_and(|action| action.sa_handler == crate::linux_abi::LINUX_SIG_IGN)
     }
 
-    /// `(SigIgn, SigCgt, ShdPnd)` masks (bit `signum-1`) for a
-    /// `/proc/<pid>/status` render: the process-global ignored set, the caught
-    /// (real-handler) set, and the shared process pending set. SigBlk/SigPnd are
-    /// per-thread and rendered separately (currently 0 — not yet wired to a
-    /// target tid). CPython test_subprocess.test_restore_signals compares the
-    /// SigIgn line across two children, so it must reflect real dispositions.
-    pub fn proc_status_signal_masks(&self) -> (SigSet, SigSet, SigSet) {
-        let signal = self.signal.lock();
+    pub fn proc_status_signal_masks(
+        &self,
+        context: &crate::kernel::KernelContext,
+    ) -> (SigSet, SigSet, SigSet) {
         let mut ignored = SigSet::EMPTY;
         let mut caught = SigSet::EMPTY;
-        for (&signum, action) in signal.handlers.iter() {
+        for (signum, action) in Self::signal_actions(context) {
             if sigmask_bit(signum).is_none() {
                 continue;
             }
-            let h = action.sa_handler;
-            if h == crate::linux_abi::LINUX_SIG_IGN {
+            let handler = action.sa_handler;
+            if handler == crate::linux_abi::LINUX_SIG_IGN {
                 ignored = ignored.with(signum);
-            } else if h != crate::linux_abi::LINUX_SIG_DFL {
+            } else if handler != crate::linux_abi::LINUX_SIG_DFL {
                 caught = caught.with(signum);
             }
         }
-        (ignored, caught, signal.process_pending)
+        (
+            ignored,
+            caught,
+            context.shared().pending_signals().present(),
+        )
     }
 
-    /// True when a fork-style child exit must be observed asynchronously by the
-    /// signal pump. A default, unblocked SIGCHLD is inert for signal delivery
-    /// and a later wait4/waitid can reap through its own wait path, so it does
-    /// not need a per-child EVFILT_PROC watch. Caught handlers, blocked signals
-    /// (sigtimedwait/sigwait), and non-ignored default dispositions do.
     pub fn child_exit_signal_needs_pump(
         &self,
+        context: &crate::kernel::KernelContext,
         tid: crate::thread::ThreadId,
         exit_signal: u32,
     ) -> bool {
@@ -421,22 +325,25 @@ impl SyscallDispatcher {
         if sigmask_bit(signum).is_none() {
             return false;
         }
-        let signal = self.signal.lock();
-        match signal.handlers.get(&signum).map(|a| a.sa_handler) {
-            Some(h) if h == crate::linux_abi::LINUX_SIG_IGN => false,
-            Some(h) if h == crate::linux_abi::LINUX_SIG_DFL => {
-                signal.mask_for(tid).contains(signum) || !is_default_ignore_signum(signum)
+        match Self::signal_action_entry(context, signum).map(|action| action.sa_handler) {
+            Some(handler) if handler == crate::linux_abi::LINUX_SIG_IGN => false,
+            Some(handler) if handler == crate::linux_abi::LINUX_SIG_DFL => {
+                self.signal_mask_for(context, tid).contains(signum)
+                    || !is_default_ignore_signum(signum)
             }
             Some(_) => true,
-            None => signal.mask_for(tid).contains(signum) || !is_default_ignore_signum(signum),
+            None => {
+                self.signal_mask_for(context, tid).contains(signum)
+                    || !is_default_ignore_signum(signum)
+            }
         }
     }
 
-    /// Process-directed child-exit delivery must not retain the thread that
-    /// happened to create the runtime endpoint. A blocked default-ignored
-    /// SIGCHLD remains waitable when any surviving thread blocks it for
-    /// sigwait, while an explicitly ignored signal remains discarded.
-    pub fn child_exit_signal_needs_process_pump(&self, exit_signal: u32) -> bool {
+    pub fn child_exit_signal_needs_process_pump(
+        &self,
+        context: &crate::kernel::KernelContext,
+        exit_signal: u32,
+    ) -> bool {
         let signum = if exit_signal == 0 {
             return false;
         } else if (1..=64).contains(&exit_signal) {
@@ -447,46 +354,33 @@ impl SyscallDispatcher {
         if sigmask_bit(signum).is_none() {
             return false;
         }
-        let signal = self.signal.lock();
-        match signal.handlers.get(&signum).map(|action| action.sa_handler) {
+        match Self::signal_action_entry(context, signum).map(|action| action.sa_handler) {
             Some(handler) if handler == crate::linux_abi::LINUX_SIG_IGN => false,
             Some(handler) if handler == crate::linux_abi::LINUX_SIG_DFL => {
-                signal.masks.values().any(|mask| mask.contains(signum))
-                    || !is_default_ignore_signum(signum)
+                Self::any_signal_thread_blocks(context, signum) || !is_default_ignore_signum(signum)
             }
             Some(_) => true,
             None => {
-                signal.masks.values().any(|mask| mask.contains(signum))
-                    || !is_default_ignore_signum(signum)
+                Self::any_signal_thread_blocks(context, signum) || !is_default_ignore_signum(signum)
             }
         }
     }
 
-    /// The set of signals that must NOT interrupt a blocking,
-    /// restartable syscall (wait4/waitid) for `tid`. On Linux a syscall is
-    /// interrupted only by a signal that is both unblocked AND has an effect:
-    /// a signal that is blocked, explicitly `SIG_IGN`, or `SIG_DFL` with a
-    /// default action of "ignore" (SIGCHLD/SIGURG/SIGWINCH) is delivered-and-
-    /// dropped without interrupting. carrick previously interrupted the wait
-    /// for ANY pending signal, so a sibling child's default-ignored SIGCHLD
-    /// spuriously EINTR'd a `waitpid(other_child)` (LTP futex_cmp_requeue01's
-    /// `SAFE_WAITPID` then TBROKed). Folding the ignored set into the wait's
-    /// block mask makes those pending-but-inert signals leave the wait running.
-    pub fn non_interrupting_signal_mask(&self, tid: crate::thread::ThreadId) -> SigSet {
-        let signal = self.signal.lock();
-        // Start from the thread's blocked set.
-        let mut mask = signal.mask_for(tid);
+    pub fn non_interrupting_signal_mask(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+    ) -> SigSet {
+        let mut mask = self.signal_mask_for(context, tid);
         for signum in 1..=64i32 {
-            let disposition = signal.handlers.get(&signum).map(|a| a.sa_handler);
+            let disposition =
+                Self::signal_action_entry(context, signum).map(|action| action.sa_handler);
             let ignored = match disposition {
-                Some(h) if h == crate::linux_abi::LINUX_SIG_IGN => true,
-                // No recorded handler, or SIG_DFL: inert only when the DEFAULT
-                // action is ignore (SIGCHLD/SIGURG/SIGWINCH). Every other
-                // SIG_DFL signal (terminate/core/stop) still interrupts.
+                Some(handler) if handler == crate::linux_abi::LINUX_SIG_IGN => true,
                 None => is_default_ignore_signum(signum),
-                Some(h) if h == crate::linux_abi::LINUX_SIG_DFL => is_default_ignore_signum(signum),
-                // A real handler is installed → the signal interrupts (then
-                // SA_RESTART decides whether the syscall restarts).
+                Some(handler) if handler == crate::linux_abi::LINUX_SIG_DFL => {
+                    is_default_ignore_signum(signum)
+                }
                 Some(_) => false,
             };
             if ignored {
@@ -496,310 +390,67 @@ impl SyscallDispatcher {
         mask
     }
 
-    /// True iff `signum` is currently blocked by the guest's signal mask.
-    /// SIGKILL/SIGSTOP can never be blocked, matching the kernel.
-    pub fn signal_blocked(&self, tid: crate::thread::ThreadId, signum: i32) -> bool {
+    pub fn signal_blocked(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        signum: i32,
+    ) -> bool {
         if signum == LINUX_SIGKILL || signum == LINUX_SIGSTOP {
             return false;
         }
-        self.signal.lock().mask_for(tid).contains(signum)
+        self.signal_mask_for(context, tid).contains(signum)
     }
 
-    pub fn signal_mask_for(&self, tid: crate::thread::ThreadId) -> SigSet {
-        self.signal.lock().mask_for(tid)
-    }
-
-    /// Record a (blocked) signal as pending for `tid`. It stays queued until the
-    /// thread unblocks it or dequeues it via `rt_sigtimedwait`. Real-time
-    /// signals queue (each send adds a deliverable instance); standard signals
-    /// coalesce (the bit is set-once), matching Linux.
-    pub fn mark_signal_pending(&self, tid: crate::thread::ThreadId, signum: i32) {
-        if sigmask_bit(signum).is_some() {
-            let mut s = self.signal.lock();
-            let pending = s.pendings.entry(tid).or_insert(SigSet::EMPTY);
-            *pending = pending.with(signum);
-            if is_rt_signal(signum) {
-                *s.rt_pending_counts.entry((tid, signum)).or_insert(0) += 1;
-            }
-            self.refresh_signal_pending_hints(&s);
-        }
-    }
-
-    /// Refresh the dispatcher's lock-free pending hints from the locked state
-    /// (see the field docs on [`super::SyscallDispatcher`]). MUST be called
-    /// with the `signal` lock held (the `&SignalState` argument proves it)
-    /// after EVERY mutation of `pendings` / `process_pending`, so a clear hint
-    /// always proves emptiness and the delivery cycle's lock-free fast path
-    /// can never hide a pending signal.
-    pub(super) fn refresh_signal_pending_hints(&self, s: &SignalState) {
-        let mut tids = 0u64;
-        for (tid, set) in &s.pendings {
-            if !set.is_empty() {
-                tids |= 1u64 << ((tid.raw() as u32) & 63);
-            }
-        }
-        self.signal_tid_pending_hint
-            .store(tids, std::sync::atomic::Ordering::SeqCst);
-        self.signal_process_pending_hint
-            .store(s.process_pending.raw(), std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// Lock-free "may anything be pending for `tid` (or the shared process
-    /// set)?" peek over the hints. `false` PROVES emptiness (the hints are
-    /// exact mirrors maintained under the signal lock); `true` may be a
-    /// `tid % 64` collision and merely means "take the lock and look".
-    fn signal_dispatch_pending_possible(&self, tid: crate::thread::ThreadId) -> bool {
-        self.signal_tid_pending_hint
-            .load(std::sync::atomic::Ordering::SeqCst)
-            & (1u64 << ((tid.raw() as u32) & 63))
-            != 0
-            || self
-                .signal_process_pending_hint
-                .load(std::sync::atomic::Ordering::SeqCst)
-                != 0
-    }
-
-    /// Drop a thread's per-thread signal state (mask/pending/alt stack) when it
-    /// exits, so the maps don't grow unbounded over a long run and a recycled
-    /// tid starts clean. Signal handlers are process-global and untouched.
-    pub fn forget_thread_signal_state(&self, tid: crate::thread::ThreadId) {
-        let mut s = self.signal.lock();
-        s.masks.remove(&tid);
-        s.pendings.remove(&tid);
-        s.rt_pending_counts.retain(|(t, _), _| *t != tid);
-        s.pending_actions.retain(|(t, _), _| *t != tid);
-        s.altstack.remove(&tid);
-        s.handler_frames.remove(&tid);
-        s.restore_masks.remove(&tid);
-        self.refresh_signal_pending_hints(&s);
-    }
-
-    /// Re-key a thread's per-thread signal state from `old` to `new` across
-    /// fork(2): the child gets a NEW tid (its own pid) but INHERITS the
-    /// parent's blocked mask, alternate signal stack, and any active
-    /// signal-frame bookkeeping (POSIX fork clones the forking thread's user
-    /// state exactly). The pending set is NOT migrated — fork clears the
-    /// child's pending signals. Without this, the child's per-tid lookups miss
-    /// (the state stays orphaned under the parent's tid) and an inherited
-    /// SA_ONSTACK alt stack or in-handler SS_ONSTACK state is silently lost.
-    /// (audit M2; probe forkaltstack)
-    pub fn migrate_thread_signal_state(
+    pub fn signal_mask_for(
         &self,
-        old: crate::thread::ThreadId,
-        new: crate::thread::ThreadId,
-    ) {
-        let mut s = self.signal.lock();
-        if old != new {
-            if let Some(mask) = s.masks.remove(&old) {
-                s.masks.insert(new, mask);
-            }
-            if let Some(alt) = s.altstack.remove(&old) {
-                s.altstack.insert(new, alt);
-            }
-            if let Some(frames) = s.handler_frames.remove(&old) {
-                s.handler_frames.insert(new, frames);
-            }
-            if let Some(rm) = s.restore_masks.remove(&old) {
-                s.restore_masks.insert(new, rm);
-            }
-        }
-        // fork clears the child's pending set copied under the OLD forking tid
-        // as well as any stale entry already keyed by the child's NEW tid. The
-        // tids can be equal on host-pid-stable lanes, so pending clearing must
-        // not be hidden behind the state-rekey fast path.
-        s.pendings.retain(|tid, _| *tid != old && *tid != new);
-        s.rt_pending_counts
-            .retain(|(tid, _), _| *tid != old && *tid != new);
-        s.pending_actions
-            .retain(|(tid, _), _| *tid != old && *tid != new);
-        s.pending_siginfos
-            .retain(|(tid, _), _| *tid != old && *tid != new);
-        // fork ALSO clears the inherited (copied) shared process pending set —
-        // a process-directed signal pending in the parent is not pending in the
-        // new child (POSIX). This runs only in the post-fork child (a separate
-        // host process), so it never affects the parent's shared set.
-        s.process_pending = SigSet::EMPTY;
-        s.process_rt_pending_counts.clear();
-        s.process_pending_siginfos.clear();
-        self.refresh_signal_pending_hints(&s);
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+    ) -> SigSet {
+        Self::signal_thread(context, tid)
+            .map(|thread| thread.signal_state().blocked())
+            .unwrap_or(SigSet::EMPTY)
     }
 
-    /// Retire EVERY per-thread signal entry except `keep`'s, in a fork CHILD
-    /// of a multithreaded parent (before `migrate_thread_signal_state` re-keys
-    /// `keep` to the child's new main tid). fork(2) clones only the calling
-    /// thread: the sibling tids' masks/altstacks/pendings are records of
-    /// threads that do not exist in the child — and the child's fresh registry
-    /// allocates tids from its own host-pid-anchored base, which can COLLIDE
-    /// with a dead parent sibling's tid, silently resurrecting its blocked
-    /// mask or SA_ONSTACK stack for an unrelated new thread. Process-level
-    /// (thread-group shared) state is deliberately untouched: the fork-clear
-    /// of the shared pending set is `migrate_thread_signal_state`'s job, and
-    /// handlers are process-global (inherited across fork per POSIX).
-    pub fn retire_sibling_thread_signal_state(&self, keep: crate::thread::ThreadId) {
-        let mut s = self.signal.lock();
-        s.masks.retain(|t, _| *t == keep);
-        s.pendings.retain(|t, _| *t == keep);
-        s.rt_pending_counts.retain(|(t, _), _| *t == keep);
-        s.pending_actions.retain(|(t, _), _| *t == keep);
-        s.pending_siginfos.retain(|(t, _), _| *t == keep);
-        s.altstack.retain(|t, _| *t == keep);
-        s.handler_frames.retain(|t, _| *t == keep);
-        s.restore_masks.retain(|t, _| *t == keep);
-        self.refresh_signal_pending_hints(&s);
-    }
-
-    /// Initialize a new `CLONE_THREAD` task's per-thread signal state. Linux
-    /// threads inherit the creator's blocked-signal mask at clone time, while
-    /// pending signals and alternate signal stacks are not inherited by the new
-    /// thread.
-    pub fn inherit_thread_signal_mask(
+    pub fn mark_signal_pending(
         &self,
-        parent: crate::thread::ThreadId,
-        child: crate::thread::ThreadId,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        signum: i32,
     ) {
-        if parent == child {
+        let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signum) else {
             return;
-        }
-        let mut s = self.signal.lock();
-        let mask = s.mask_for(parent);
-        if mask.is_empty() {
-            s.masks.remove(&child);
+        };
+        let authority = Self::signal_authority_for(context, tid);
+        if is_rt_signal(signum) {
+            authority.enqueue_thread_realtime(signal, None);
         } else {
-            s.masks.insert(child, mask);
+            authority.enqueue_thread_standard(signal, None);
         }
-        s.pendings.remove(&child);
-        s.rt_pending_counts.retain(|(t, _), _| *t != child);
-        s.pending_actions.retain(|(t, _), _| *t != child);
-        s.altstack.remove(&child);
-        s.handler_frames.remove(&child);
-        s.restore_masks.remove(&child);
-        self.refresh_signal_pending_hints(&s);
     }
 
-    /// Rekey the sole surviving exec caller from a nonleader tid to the
-    /// process-leader tid. The survivor keeps its blocked mask and pending
-    /// signals, including queued RT payload/action state. Every retired sibling
-    /// record is discarded, while old-image altstack/frame/temporary-mask state
-    /// is reset as required by exec.
-    pub fn rekey_thread_signal_state_after_exec(
-        &self,
-        old: crate::thread::ThreadId,
-        new: crate::thread::ThreadId,
-    ) {
-        let mut s = self.signal.lock();
-        let mask = s.masks.remove(&old);
-        let pending = s.pendings.remove(&old);
-        let mut rt_pending = Vec::new();
-        let mut pending_actions = Vec::new();
-        let mut pending_siginfos = Vec::new();
-        for signum in 1..=64 {
-            if let Some(count) = s.rt_pending_counts.remove(&(old, signum)) {
-                rt_pending.push((signum, count));
-            }
-            if let Some(actions) = s.pending_actions.remove(&(old, signum)) {
-                pending_actions.push((signum, actions));
-            }
-            if let Some(infos) = s.pending_siginfos.remove(&(old, signum)) {
-                pending_siginfos.push((signum, infos));
-            }
-        }
-
-        s.masks.clear();
-        s.pendings.clear();
-        s.rt_pending_counts.clear();
-        s.pending_actions.clear();
-        s.pending_siginfos.clear();
-        s.altstack.clear();
-        s.handler_frames.clear();
-        s.restore_masks.clear();
-        if let Some(mask) = mask
-            && !mask.is_empty()
-        {
-            s.masks.insert(new, mask);
-        }
-        if let Some(pending) = pending
-            && !pending.is_empty()
-        {
-            s.pendings.insert(new, pending);
-        }
-        for (signum, count) in rt_pending {
-            s.rt_pending_counts.insert((new, signum), count);
-        }
-        for (signum, actions) in pending_actions {
-            s.pending_actions.insert((new, signum), actions);
-        }
-        for (signum, infos) in pending_siginfos {
-            s.pending_siginfos.insert((new, signum), infos);
-        }
-        self.refresh_signal_pending_hints(&s);
+    fn signal_dispatch_pending_possible(
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+    ) -> bool {
+        Self::signal_thread(context, tid)
+            .is_some_and(|thread| !thread.signal_state().pending().is_empty())
+            || context.shared().pending_signals().may_be_nonempty()
     }
 
-    /// Reset signal dispositions across `execve(2)`, matching the kernel: every
-    /// CAUGHT signal (a handler installed) is reset to `SIG_DFL`; `SIG_IGN`
-    /// dispositions are PRESERVED; the blocked mask and pending signals are
-    /// preserved (the new image inherits them). The alternate signal stack is
-    /// cleared. Without this, a process that installed handlers and then execs
-    /// (e.g. a shell `exec`ing — or `/bin/sh -c CMD` fork+exec'ing — a program)
-    /// leaks the OLD image's handler ADDRESSES into the new image; a later
-    /// signal then jumps to a stale address that is unrelated code in the new
-    /// binary and crashes (the `/bin/sh -c <ltp-test>` mass segfaults: dash's
-    /// SIGCHLD handler addr, invoked in the test's address space when its child
-    /// exited). Handlers are process-global, so this resets for the process.
-    pub fn reset_signal_handlers_on_execve(&self) {
-        let mut s = self.signal.lock();
-        let ignored = s
-            .handlers
-            .iter()
-            .filter(|&(&_signum, action)| action.sa_handler == crate::linux_abi::LINUX_SIG_IGN)
-            .fold(carrick_abi::SigSet::EMPTY, |set, (&signum, _)| {
+    pub fn reset_signal_handlers_on_execve(&self, context: &crate::kernel::KernelContext) {
+        let ignored = Self::signal_actions(context)
+            .into_iter()
+            .filter(|(_, action)| action.sa_handler == crate::linux_abi::LINUX_SIG_IGN)
+            .fold(carrick_abi::SigSet::EMPTY, |set, (signum, _)| {
                 set.with(signum)
             });
-        // Keep only SIG_IGN dispositions; a caught handler → default (absent).
-        s.handlers
-            .retain(|_, a| a.sa_handler == crate::linux_abi::LINUX_SIG_IGN);
-        s.pending_actions.clear();
-        // execve disestablishes any alternate signal stack for the process and
-        // discards active user signal frames from the old image. The blocked
-        // mask and pending sets survive, but handler-frame bookkeeping and
-        // temporary restore masks are tied to the replaced user stack.
-        s.altstack.clear();
-        s.handler_frames.clear();
-        s.restore_masks.clear();
-        drop(s);
-        crate::host_signal::reset_routed_handlers_after_execve(ignored);
-    }
-
-    // Only called from `snapshot_native_reexec_process_state`/
-    // `restore_native_reexec_process_state` (`dispatch/mod.rs`), which carry
-    // the identical `#[cfg(any(test, ...))]` gate — kept in lockstep so this
-    // helper never outlives (or is outlived by) its sole caller.
-    #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
-    pub(super) fn native_reexec_ignored_signals(&self) -> carrick_abi::SigSet {
-        self.signal
-            .lock()
-            .handlers
-            .iter()
-            .filter(|&(_, action)| action.sa_handler == crate::linux_abi::LINUX_SIG_IGN)
-            .fold(carrick_abi::SigSet::EMPTY, |set, (&signum, _)| {
-                set.with(signum)
-            })
-    }
-
-    #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
-    pub(super) fn restore_native_reexec_ignored_signals(&self, ignored: carrick_abi::SigSet) {
-        let mut signal = self.signal.lock();
-        signal.handlers.clear();
-        for signum in 1..=64 {
-            if ignored.contains(signum) {
-                signal.handlers.insert(
-                    signum,
-                    LinuxSigaction {
-                        sa_handler: crate::linux_abi::LINUX_SIG_IGN,
-                        ..LinuxSigaction::empty()
-                    },
-                );
-            }
+        for thread in context.task().threads() {
+            thread.update_signal_state(|state| {
+                *state = crate::kernel::ThreadSignalState::for_exec(state);
+            });
         }
+        crate::host_signal::reset_routed_handlers_after_execve(ignored);
     }
 
     /// Apply Linux handler-time masking for `signum`, returning the mask that
@@ -813,113 +464,123 @@ impl SyscallDispatcher {
     /// the original mask comes back. We consume the entry on first use.
     pub fn enter_signal_handler(
         &self,
+        context: &crate::kernel::KernelContext,
         tid: crate::thread::ThreadId,
         signum: i32,
         action: LinuxSigaction,
     ) -> SigSet {
-        let mut signal = self.signal.lock();
-        let saved = signal
-            .restore_masks
-            .remove(&tid)
-            .unwrap_or_else(|| signal.mask_for(tid));
-        // SA_NODEFER: leave the signal being delivered UNblocked during its own
-        // handler (the kernel default is to block it, preventing re-entry). With
-        // it unblocked, a signal re-raised from inside the handler is delivered
-        // synchronously to whatever handler is installed AT THAT MOMENT — which
-        // is exactly how CPython faulthandler's `chain=True` re-raise reaches the
-        // restored previous handler instead of re-entering faulthandler forever.
-        let delivered = if action.sa_flags & crate::linux_abi::LINUX_SA_NODEFER != 0 {
-            SigSet::EMPTY
-        } else {
-            SigSet::EMPTY.with(signum)
-        };
-        let current = signal.mask_for(tid);
-        // `sa_mask` holds the guest sigaction's wire sigset_t word.
-        let handler_mask = sanitize_signal_mask(
-            current
-                .union(delivered)
-                .union(SigSet::from_raw(action.sa_mask[0])),
-        );
-        signal.masks.insert(tid, handler_mask);
-        // SA_RESETHAND (one-shot): the disposition is reset to SIG_DFL *before*
-        // the handler runs, so a second occurrence of the signal takes the
-        // default action. Keep the action record with the reset disposition
-        // rather than deleting it outright: Linux still reports metadata such
-        // as SA_SIGINFO to an in-handler sigaction(SIG, NULL, &old) query.
+        let thread = Self::required_signal_thread(context, tid);
+        let saved = thread.update_signal_state(|state| {
+            let saved = state
+                .take_armed_restore_mask()
+                .unwrap_or_else(|| state.blocked());
+            let delivered = if action.sa_flags & crate::linux_abi::LINUX_SA_NODEFER != 0 {
+                SigSet::EMPTY
+            } else {
+                SigSet::EMPTY.with(signum)
+            };
+            let handler_mask = sanitize_signal_mask(
+                state
+                    .blocked()
+                    .union(delivered)
+                    .union(SigSet::from_raw(action.sa_mask[0])),
+            );
+            state.set_blocked(handler_mask);
+            let on_altstack = action.sa_flags & crate::linux_abi::LINUX_SA_ONSTACK != 0
+                && state.altstack().is_some();
+            state.push_handler_frame(crate::kernel::HandlerFrameState {
+                on_altstack,
+                restore_mask: None,
+            });
+            saved
+        });
+        // Change the shared disposition only after releasing the thread leaf.
         if action.sa_flags & crate::linux_abi::LINUX_SA_RESETHAND != 0 {
             let mut reset = action;
             reset.sa_handler = crate::linux_abi::LINUX_SIG_DFL;
-            signal.handlers.insert(signum, reset);
+            Self::install_signal_action(context, signum, reset);
         }
-        // Record whether this handler runs on the alt stack (SA_ONSTACK + an
-        // alt stack is configured), so sigaltstack queries report SS_ONSTACK and
-        // a reconfigure-while-active returns EPERM. Popped by rt_sigreturn.
-        // (audit M13)
-        let on_alt = action.sa_flags & crate::linux_abi::LINUX_SA_ONSTACK != 0
-            && signal.altstack.contains_key(&tid);
-        signal.handler_frames.entry(tid).or_default().push(on_alt);
         saved
     }
 
     /// True iff `tid` is currently executing a signal handler ON its alternate
     /// signal stack (any active SA_ONSTACK frame). (audit M13)
-    fn is_on_altstack(&self, tid: crate::thread::ThreadId, current_guest_sp: Option<u64>) -> bool {
-        let mut signal = self.signal.lock();
-        let frame_says_on_alt = signal
-            .handler_frames
-            .get(&tid)
-            .is_some_and(|frames| frames.iter().any(|&on_alt| on_alt));
-        if !frame_says_on_alt {
+    fn is_on_altstack(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        current_guest_sp: Option<u64>,
+    ) -> bool {
+        let thread = Self::required_signal_thread(context, tid);
+        let state = thread.signal_state();
+        if !state.has_altstack_handler_frame() {
             return false;
         }
         let Some(sp) = current_guest_sp else {
             return true;
         };
-        let sp_on_alt = signal
-            .altstack
-            .get(&tid)
-            .is_some_and(|stack| altstack_contains_guest_sp(*stack, sp));
+        let sp_on_alt = state
+            .altstack()
+            .is_some_and(|stack| altstack_contains_guest_sp(stack, sp));
         if !sp_on_alt {
-            signal.handler_frames.remove(&tid);
+            thread.update_signal_state(crate::kernel::ThreadSignalState::clear_handler_frames);
         }
         sp_on_alt
     }
 
     /// Pop the returning handler frame's alt-stack record (rt_sigreturn).
-    fn pop_handler_frame(&self, tid: crate::thread::ThreadId) {
-        let mut signal = self.signal.lock();
-        if let Some(frames) = signal.handler_frames.get_mut(&tid) {
-            frames.pop();
-            if frames.is_empty() {
-                signal.handler_frames.remove(&tid);
-            }
-        }
+    pub fn pop_handler_frame(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+    ) {
+        Self::required_signal_thread(context, tid).update_signal_state(|state| {
+            state.pop_handler_frame();
+        });
     }
 
     /// Arm a "restore this mask after the next handler runs" override (Linux's
     /// `set_restore_sigmask`). The next `enter_signal_handler` for `tid`
     /// returns `mask` as the sigframe's saved mask and clears the arm.
-    pub fn arm_restore_mask(&self, tid: crate::thread::ThreadId, mask: SigSet) {
-        let mut signal = self.signal.lock();
-        signal.restore_masks.insert(tid, sanitize_signal_mask(mask));
+    pub fn arm_restore_mask(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        mask: SigSet,
+    ) {
+        Self::required_signal_thread(context, tid).update_signal_state(|state| {
+            state.arm_restore_mask(Some(sanitize_signal_mask(mask)));
+        });
     }
 
-    fn begin_sigsuspend(&self, tid: crate::thread::ThreadId, suspend_mask: SigSet) -> SigSet {
-        let mut signal = self.signal.lock();
-        let original = signal
-            .restore_masks
-            .get(&tid)
-            .copied()
-            .unwrap_or_else(|| signal.mask_for(tid));
-        signal.restore_masks.entry(tid).or_insert(original);
-        signal.masks.insert(tid, sanitize_signal_mask(suspend_mask));
-        original
+    fn begin_sigsuspend(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        suspend_mask: SigSet,
+    ) -> SigSet {
+        Self::required_signal_thread(context, tid).update_signal_state(|state| {
+            let original = state
+                .armed_restore_mask()
+                .unwrap_or_else(|| state.blocked());
+            if state.armed_restore_mask().is_none() {
+                state.arm_restore_mask(Some(original));
+            }
+            state.set_blocked(sanitize_signal_mask(suspend_mask));
+            original
+        })
     }
 
-    fn cancel_sigsuspend(&self, tid: crate::thread::ThreadId, original: SigSet) {
-        let mut signal = self.signal.lock();
-        signal.restore_masks.remove(&tid);
-        signal.masks.insert(tid, sanitize_signal_mask(original));
+    fn cancel_sigsuspend(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        original: SigSet,
+    ) {
+        Self::required_signal_thread(context, tid).update_signal_state(|state| {
+            state.arm_restore_mask(None);
+            state.set_blocked(sanitize_signal_mask(original));
+        });
     }
 
     /// True if a signal deliverable under `suspend_mask` (per-thread pending or
@@ -933,24 +594,21 @@ impl SyscallDispatcher {
     /// temporary mask. (audit M1)
     fn sigsuspend_caught_handler_deliverable(
         &self,
+        context: &crate::kernel::KernelContext,
         tid: crate::thread::ThreadId,
         suspend_mask: SigSet,
     ) -> bool {
-        let deliverable = {
-            let signal = self.signal.lock();
-            signal
-                .pendings
-                .get(&tid)
-                .copied()
-                .unwrap_or(SigSet::EMPTY)
-                .union(signal.process_pending)
-                .difference(suspend_mask)
-        };
+        let deliverable = Self::required_signal_thread(context, tid)
+            .signal_state()
+            .pending()
+            .union(context.shared().pending_signals().present())
+            .difference(suspend_mask);
         if deliverable.is_empty() {
             return false;
         }
-        (1..=64i32)
-            .any(|sig| deliverable.contains(sig) && self.registered_signal_handler(sig).is_some())
+        (1..=64i32).any(|sig| {
+            deliverable.contains(sig) && self.registered_signal_handler(context, sig).is_some()
+        })
     }
 
     /// Queue a caller-supplied `siginfo_t` for the next delivery of
@@ -959,16 +617,16 @@ impl SyscallDispatcher {
     /// pops the front.
     pub fn record_pending_siginfo(
         &self,
+        context: &crate::kernel::KernelContext,
         tid: crate::thread::ThreadId,
         signum: i32,
         info: LinuxSiginfo,
     ) {
-        let mut signal = self.signal.lock();
-        let entry = signal.pending_siginfos.entry((tid, signum)).or_default();
-        if !is_rt_signal(signum) {
-            entry.clear();
-        }
-        entry.push_back(info);
+        let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signum) else {
+            return;
+        };
+        Self::required_signal_thread(context, tid)
+            .update_signal_state(|state| state.record_routed_siginfo(signal, info));
     }
 
     /// Pop the next queued `siginfo_t` for `(tid, signum)`, if any. Returned to
@@ -978,33 +636,13 @@ impl SyscallDispatcher {
     /// queued (the normal raise/kill case — synthesised SI_USER is correct).
     pub fn take_pending_siginfo(
         &self,
+        context: &crate::kernel::KernelContext,
         tid: crate::thread::ThreadId,
         signum: i32,
     ) -> Option<LinuxSiginfo> {
-        let mut signal = self.signal.lock();
-        let queue = signal.pending_siginfos.get_mut(&(tid, signum))?;
-        let front = queue.pop_front();
-        if queue.is_empty() {
-            signal.pending_siginfos.remove(&(tid, signum));
-        }
-        front
-    }
-
-    /// Pop the next queued `siginfo_t` for a PROCESS-directed `signum` consumed
-    /// from the SHARED pending set (e.g. a cross-process kill drained from the
-    /// xsignal ring). Provenance-gated companion of [`Self::take_pending_siginfo`]:
-    /// call this ONLY when the take reported a shared-set origin
-    /// (`take_pending_in_from` → `from_thread == false`), so a same-signum
-    /// per-thread/host-slot delivery can never steal a queued process-directed
-    /// payload while the shared bit is still set.
-    pub(crate) fn take_process_pending_siginfo(&self, signum: i32) -> Option<LinuxSiginfo> {
-        let mut signal = self.signal.lock();
-        let queue = signal.process_pending_siginfos.get_mut(&signum)?;
-        let front = queue.pop_front();
-        if queue.is_empty() {
-            signal.process_pending_siginfos.remove(&signum);
-        }
-        front
+        let signal = crate::kernel::LinuxSignal::for_signal_number(signum).ok()?;
+        Self::required_signal_thread(context, tid)
+            .update_signal_state(|state| state.take_routed_siginfo(signal))
     }
 
     /// Snapshot the current caught handler for a thread-directed signal that is
@@ -1014,16 +652,15 @@ impl SyscallDispatcher {
     /// signal catchable.
     pub fn record_pending_signal_action(
         &self,
+        context: &crate::kernel::KernelContext,
         tid: crate::thread::ThreadId,
         signum: i32,
         action: LinuxSigaction,
     ) {
-        let mut signal = self.signal.lock();
-        let entry = signal.pending_actions.entry((tid, signum)).or_default();
-        if !is_rt_signal(signum) {
-            entry.clear();
-        }
-        entry.push_back(action);
+        let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signum) else {
+            return;
+        };
+        Self::signal_authority_for(context, tid).record_pending_action(signal, action);
     }
 
     /// Pop the handler action snapshotted for a generated thread-directed
@@ -1031,19 +668,20 @@ impl SyscallDispatcher {
     /// disposition.
     pub fn take_pending_signal_action(
         &self,
+        context: &crate::kernel::KernelContext,
         tid: crate::thread::ThreadId,
         signum: i32,
     ) -> Option<LinuxSigaction> {
-        let mut signal = self.signal.lock();
-        let queue = signal.pending_actions.get_mut(&(tid, signum))?;
-        let front = queue.pop_front();
-        if queue.is_empty() {
-            signal.pending_actions.remove(&(tid, signum));
-        }
-        front
+        let signal = crate::kernel::LinuxSignal::for_signal_number(signum).ok()?;
+        Self::signal_authority_for(context, tid).take_pending_action(signal)
     }
 
-    fn record_tkill_siginfo(&self, tid: crate::thread::ThreadId, signum: i32) {
+    fn record_tkill_siginfo(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        signum: i32,
+    ) {
         if signum == 0 {
             return;
         }
@@ -1053,7 +691,7 @@ impl SyscallDispatcher {
             crate::namespace::pid::self_ns_pid() as i32,
             self.cred_snapshot().ruid,
         );
-        self.record_pending_siginfo(tid, signum, info);
+        self.record_pending_siginfo(context, tid, signum, info);
     }
 
     /// Drain cross-process explicit signals queued for this host process,
@@ -1064,7 +702,7 @@ impl SyscallDispatcher {
     /// async delivery and synchronous waits (`rt_sigtimedwait`/sigwait) both
     /// use this so an xsignal can be consumed by either path — any thread may
     /// run the drain.
-    pub(crate) fn drain_xsignals_process_directed(&self) {
+    pub(crate) fn drain_xsignals_process_directed(&self, context: &crate::kernel::KernelContext) {
         // Ring-authoritative gate (`SigBlockMask::NONE` => "any entry targets
         // this process"),
         // NOT the losable process-local `XSIG_DIRTY` hint: a dropped host nudge
@@ -1093,19 +731,11 @@ impl SyscallDispatcher {
                 // forever when the drain race was won by a thread that blocks
                 // `signum` (the procladder_mt pause()-sibling):
                 // `take_pending_in_from(main, set)` only consults
-                // `pendings[main] ∪ process_pending`, so the sigwait-ing main
+                // exact thread queue ∪ task-directed queue, so the sigwait-ing main
                 // thread never saw it — the whole-process silent stall. Same
                 // bug class as the process_pending doc's CPython
                 // test_sigwait_thread precedent, one layer down.
-                {
-                    let mut signal = self.signal.lock();
-                    let entry = signal.process_pending_siginfos.entry(signum).or_default();
-                    if !is_rt_signal(signum) {
-                        entry.clear();
-                    }
-                    entry.push_back(info);
-                }
-                self.mark_process_signal_pending(signum);
+                self.mark_process_signal_pending_with_info(context, signum, Some(info));
                 continue;
             }
             // Thread-directed: resolve the guest ns tid to a live local thread
@@ -1120,15 +750,15 @@ impl SyscallDispatcher {
                 // ring entry is simply dropped.
                 continue;
             };
-            self.record_pending_siginfo(target, signum, info);
-            if self.signal_blocked(target, signum) {
+            self.record_pending_siginfo(context, target, signum, info);
+            if self.signal_blocked(context, target, signum) {
                 // Held pending until the target unblocks it or a sigwait
                 // dequeues it — exactly `route_thread_signal`'s blocked
                 // branch, no host-slot publish (nothing to wake yet).
-                self.mark_signal_pending(target, signum);
+                self.mark_signal_pending(context, target, signum);
             } else {
-                if let Some(action) = self.registered_signal_handler(signum) {
-                    self.record_pending_signal_action(target, signum, action);
+                if let Some(action) = self.registered_signal_handler(context, signum) {
+                    self.record_pending_signal_action(context, target, signum, action);
                 }
                 // The host-level per-tid slot `deliver_pending_signal` checks
                 // first for `target`'s own vCPU loop iteration — the same
@@ -1142,11 +772,14 @@ impl SyscallDispatcher {
         }
     }
 
-    pub fn restore_signal_mask(&self, tid: crate::thread::ThreadId, mask: SigSet) {
-        self.signal
-            .lock()
-            .masks
-            .insert(tid, sanitize_signal_mask(mask));
+    pub fn restore_signal_mask(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        mask: SigSet,
+    ) {
+        Self::required_signal_thread(context, tid)
+            .update_signal_state(|state| state.set_blocked(sanitize_signal_mask(mask)));
     }
 
     /// Lowest-numbered pending signal that is NOT currently blocked, cleared
@@ -1155,28 +788,27 @@ impl SyscallDispatcher {
     /// — one per cycle so each handler runs (and returns via rt_sigreturn)
     /// before the next is injected, matching the kernel's deliver-all-pending-
     /// before-returning-to-userspace behaviour. None when none remain.
-    pub fn take_deliverable_pending(&self, tid: crate::thread::ThreadId) -> Option<i32> {
-        self.take_deliverable_pending_from(tid).map(|(s, _)| s)
+    pub fn take_deliverable_pending(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+    ) -> Option<i32> {
+        self.take_deliverable_pending_from(context, tid)
+            .map(|pending| pending.signum)
     }
 
-    /// [`Self::take_deliverable_pending`] with provenance (`from_thread`), so
-    /// the delivery path can fetch the queued siginfo from the matching store
-    /// (see [`Self::take_pending_in_from`]).
+    /// [`Self::take_deliverable_pending`] with owner and payload from the same
+    /// dequeue transaction.
     pub(crate) fn take_deliverable_pending_from(
         &self,
+        context: &crate::kernel::KernelContext,
         tid: crate::thread::ThreadId,
-    ) -> Option<(i32, bool)> {
-        // Lock-free empty fast path: this runs on EVERY syscall return / kick
-        // / sigreturn delivery cycle; the hints prove emptiness without the
-        // signal lock (see `refresh_signal_pending_hints`).
-        if !self.signal_dispatch_pending_possible(tid) {
+    ) -> Option<DispatchPendingSignal> {
+        if !Self::signal_dispatch_pending_possible(context, tid) {
             return None;
         }
-        // ONE lock acquisition for mask + take (previously two: a mask read
-        // then a separate locked take).
-        let mut signal = self.signal.lock();
-        let set = signal.mask_for(tid).complement();
-        self.take_pending_in_locked(&mut signal, tid, set)
+        let set = self.signal_mask_for(context, tid).complement();
+        self.take_pending_in_from(context, tid, set)
     }
 
     /// True iff dispatcher-owned signal state has a pending signal deliverable
@@ -1197,27 +829,23 @@ impl SyscallDispatcher {
     /// travels with the outcome as the enum variant.
     pub(crate) fn has_deliverable_dispatch_pending_for_wait(
         &self,
+        context: &crate::kernel::KernelContext,
         tid: crate::thread::ThreadId,
         sig_mask: carrick_abi::WaitSigMask,
     ) -> bool {
         use carrick_abi::WaitSigMask;
-        // Lock-free empty fast path: an empty pending union intersects to
-        // empty under ANY mask policy (see `refresh_signal_pending_hints`).
-        if !self.signal_dispatch_pending_possible(tid) {
+        if !Self::signal_dispatch_pending_possible(context, tid) {
             return false;
         }
         let always_deliverable = SigSet::EMPTY.with(LINUX_SIGKILL).with(LINUX_SIGSTOP);
-        let signal = self.signal.lock();
         let effective_block_mask = match sig_mask {
             WaitSigMask::Replace(s) => s,
-            WaitSigMask::Additive(s) => signal.mask_for(tid).union(s),
+            WaitSigMask::Additive(s) => self.signal_mask_for(context, tid).union(s),
         };
-        let pending = signal
-            .pendings
-            .get(&tid)
-            .copied()
-            .unwrap_or(SigSet::EMPTY)
-            .union(signal.process_pending);
+        let pending = Self::required_signal_thread(context, tid)
+            .signal_state()
+            .pending()
+            .union(context.shared().pending_signals().present());
         !pending
             .intersect(effective_block_mask.complement().union(always_deliverable))
             .is_empty()
@@ -1231,13 +859,15 @@ impl SyscallDispatcher {
     /// handler runs → no EINTR) nor may it busy-wake the park (nothing consumes
     /// it until the run-loop tail) — the classic case is the SIGCHLD a reaped
     /// child sends a handler-less parent mid-`sigtimedwait`.
-    pub(crate) fn wait_ignored_disposition_mask(&self) -> SigSet {
-        let signal = self.signal.lock();
+    pub(crate) fn wait_ignored_disposition_mask(
+        &self,
+        context: &crate::kernel::KernelContext,
+    ) -> SigSet {
         let mut mask = SigSet::EMPTY;
         for signum in 1..=64i32 {
-            let ignored = match signal.handlers.get(&signum) {
-                Some(a) if a.sa_handler == crate::linux_abi::LINUX_SIG_IGN => true,
-                Some(a) if a.sa_handler == crate::linux_abi::LINUX_SIG_DFL => {
+            let ignored = match Self::signal_action_entry(context, signum) {
+                Some(action) if action.sa_handler == crate::linux_abi::LINUX_SIG_IGN => true,
+                Some(action) if action.sa_handler == crate::linux_abi::LINUX_SIG_DFL => {
                     crate::vcpu_loop::is_default_ignore_signal(signum)
                 }
                 Some(_) => false,
@@ -1262,6 +892,7 @@ impl SyscallDispatcher {
     /// completes with the signum.
     pub(crate) fn signal_wait_should_eintr(
         &self,
+        context: &crate::kernel::KernelContext,
         tid: crate::thread::ThreadId,
         wait_set: carrick_abi::SigSet,
         block_mask: carrick_abi::SigBlockMask,
@@ -1276,98 +907,38 @@ impl SyscallDispatcher {
         crate::host_signal::has_unblocked_pending_for(tid.raw(), non_eintr_block)
             || carrick_signal_core::xsig::xsig_has_unblocked_for_self(non_eintr_block)
             || self.has_deliverable_dispatch_pending_for_wait(
+                context,
                 tid,
                 carrick_abi::WaitSigMask::Replace(non_eintr),
             )
     }
 
-    /// Provenance-less convenience over [`Self::take_pending_in_from`] for the
-    /// dispatcher tests, which assert on which signum is taken, not its store.
+    /// Convenience for tests that assert only the selected signum.
     #[cfg(test)]
-    fn take_pending_in(&self, tid: crate::thread::ThreadId, set: SigSet) -> Option<i32> {
-        self.take_pending_in_from(tid, set)
-            .map(|(signum, _)| signum)
+    fn take_pending_in(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        set: SigSet,
+    ) -> Option<i32> {
+        self.take_pending_in_from(context, tid, set)
+            .map(|pending| pending.signum)
     }
 
-    /// Lowest-numbered pending signal for `tid` that intersects `set`, cleared
-    /// from that thread's pending set OR the shared process pending set, with
-    /// PROVENANCE: the `bool` is true when the signal came from the thread's
-    /// own pending set, false when it was a process-directed signal consumed
-    /// from the shared set (`process_pending` — the union matches Linux's
-    /// thread-group shared pending). Used by `rt_sigtimedwait`/sigwait and
-    /// `take_deliverable_pending`. The caller must fetch the matching queued
-    /// siginfo from the SAME store (`take_pending_siginfo` vs
-    /// `take_process_pending_siginfo`): pairing a per-thread take with the
-    /// shared queue (or vice versa) lets two same-signum instances swap
-    /// payloads (e.g. a host-slot delivery stealing an adopted-child SIGCHLD's
-    /// si_pid or an SI_QUEUE si_value while the shared pending bit stays set).
+    /// Choose and dequeue the lowest pending signal with its owner and siginfo
+    /// in one transaction. Thread-directed state wins a same-signum tie.
     fn take_pending_in_from(
         &self,
+        context: &crate::kernel::KernelContext,
         tid: crate::thread::ThreadId,
         set: SigSet,
-    ) -> Option<(i32, bool)> {
-        let mut signal = self.signal.lock();
-        self.take_pending_in_locked(&mut signal, tid, set)
-    }
-
-    /// [`Self::take_pending_in_from`]'s body under an already-held `signal`
-    /// lock, so `take_deliverable_pending_from` can read the mask and take in
-    /// ONE acquisition. Every mutating exit refreshes the lock-free pending
-    /// hints (the bit may stay set — RT queue depth — or clear).
-    fn take_pending_in_locked(
-        &self,
-        signal: &mut SignalState,
-        tid: crate::thread::ThreadId,
-        set: SigSet,
-    ) -> Option<(i32, bool)> {
-        let per_thread = signal.pendings.get(&tid).copied().unwrap_or(SigSet::EMPTY);
-        let shared = signal.process_pending;
-        let candidates = per_thread.union(shared).intersect(set);
-        let signum = candidates.lowest_signum()?;
-        // A signal pending on THIS thread is taken from its per-thread queue;
-        // otherwise it's a process-directed signal from the shared set.
-        let from_thread = per_thread.contains(signum);
-        // RT signals queue: take one instance, and only clear the pending bit
-        // once the last queued instance is drained (so N sends → N deliveries).
-        if is_rt_signal(signum) {
-            if from_thread {
-                let key = (tid, signum);
-                let remaining = signal
-                    .rt_pending_counts
-                    .get(&key)
-                    .copied()
-                    .unwrap_or(0)
-                    .saturating_sub(1);
-                if remaining > 0 {
-                    signal.rt_pending_counts.insert(key, remaining);
-                    return Some((signum, from_thread)); // more queued — leave the bit set
-                }
-                signal.rt_pending_counts.remove(&key);
-                signal.pendings.insert(tid, per_thread.without(signum));
-            } else {
-                let remaining = signal
-                    .process_rt_pending_counts
-                    .get(&signum)
-                    .copied()
-                    .unwrap_or(0)
-                    .saturating_sub(1);
-                if remaining > 0 {
-                    signal.process_rt_pending_counts.insert(signum, remaining);
-                    return Some((signum, from_thread)); // more queued — leave the bit set
-                }
-                signal.process_rt_pending_counts.remove(&signum);
-                signal.process_pending = signal.process_pending.without(signum);
-            }
-            self.refresh_signal_pending_hints(signal);
-            return Some((signum, from_thread));
-        }
-        if from_thread {
-            signal.pendings.insert(tid, per_thread.without(signum));
-        } else {
-            signal.process_pending = signal.process_pending.without(signum);
-        }
-        self.refresh_signal_pending_hints(signal);
-        Some((signum, from_thread))
+    ) -> Option<DispatchPendingSignal> {
+        let dequeued = Self::signal_authority_for(context, tid).take_lowest_in(set)?;
+        Some(DispatchPendingSignal {
+            signum: dequeued.pending.signal.raw(),
+            owner: dequeued.owner,
+            siginfo: dequeued.pending.siginfo,
+        })
     }
 
     /// `read(2)` on a signalfd: drain pending signals matching the fd's `mask`
@@ -1380,6 +951,7 @@ impl SyscallDispatcher {
     /// follow-up). (audit H4)
     pub fn read_signalfd<M: GuestMemory>(
         &self,
+        context: &crate::kernel::KernelContext,
         memory: &mut M,
         address: u64,
         length: usize,
@@ -1393,22 +965,14 @@ impl SyscallDispatcher {
         let max = length / SIGINFO_LEN;
         let mut out: Vec<u8> = Vec::new();
         for _ in 0..max {
-            let Some((signum, from_thread)) = self.take_pending_in_from(tid, mask) else {
+            let Some(pending) = self.take_pending_in_from(context, tid, mask) else {
                 break;
             };
             let mut rec = [0u8; SIGINFO_LEN];
             // ssi_signo @0.
-            rec[0..4].copy_from_slice(&(signum as u32).to_le_bytes());
-            // Carry a queued rt_sigqueueinfo payload's code/pid/uid if present.
-            // LinuxSiginfo packs si_pid (low 32) and si_uid (high 32) into
-            // si_addr (see LinuxSiginfo::kill). Provenance-gated (see
-            // take_pending_in_from).
-            let queued = if from_thread {
-                self.take_pending_siginfo(tid, signum)
-            } else {
-                self.take_process_pending_siginfo(signum)
-            };
-            if let Some(info) = queued {
+            rec[0..4].copy_from_slice(&(pending.signum as u32).to_le_bytes());
+            // Payload and pending owner were dequeued together.
+            if let Some(info) = pending.siginfo {
                 rec[8..12].copy_from_slice(&info.si_code.to_le_bytes()); // ssi_code @8
                 let pid = (info.si_addr & 0xffff_ffff) as u32;
                 let uid = (info.si_addr >> 32) as u32;
@@ -1431,14 +995,24 @@ impl SyscallDispatcher {
     /// Record a PROCESS-directed signal in the SHARED pending set (no thread
     /// could take it because every thread blocks it). Deliverable to whichever
     /// thread next unblocks or `sigwait`s it. RT signals queue per POSIX.
-    fn mark_process_signal_pending(&self, signum: i32) {
-        if sigmask_bit(signum).is_some() {
-            let mut s = self.signal.lock();
-            s.process_pending = s.process_pending.with(signum);
-            self.refresh_signal_pending_hints(&s);
-            if is_rt_signal(signum) {
-                *s.process_rt_pending_counts.entry(signum).or_insert(0) += 1;
-            }
+    pub fn mark_process_signal_pending(&self, context: &crate::kernel::KernelContext, signum: i32) {
+        self.mark_process_signal_pending_with_info(context, signum, None);
+    }
+
+    pub(in crate::dispatch) fn mark_process_signal_pending_with_info(
+        &self,
+        context: &crate::kernel::KernelContext,
+        signum: i32,
+        siginfo: Option<LinuxSiginfo>,
+    ) {
+        let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signum) else {
+            return;
+        };
+        let task_pending = context.shared().pending_signals();
+        if is_rt_signal(signum) {
+            task_pending.enqueue_realtime(signal, siginfo);
+        } else {
+            task_pending.enqueue_standard(signal, siginfo);
         }
     }
 
@@ -1446,40 +1020,21 @@ impl SyscallDispatcher {
     /// inside the same hvpatch host process. The caller owns wakeup/kick routing;
     /// this method only records the signal in this dispatcher's process-private
     /// pending set, avoiding host-global signal slots.
-    pub(crate) fn mark_in_process_signal_pending(&self, signum: i32) {
-        self.mark_process_signal_pending(signum);
+    pub(crate) fn mark_in_process_signal_pending(
+        &self,
+        context: &crate::kernel::KernelContext,
+        signum: i32,
+    ) {
+        self.mark_process_signal_pending(context, signum);
     }
 
     /// Raise a process-directed `signum` against the guest itself
     /// (`kill(getpid(), sig)`). If the signal is blocked it is held pending;
     /// otherwise it is handed to the runtime's process-directed delivery slot.
     /// signum 0 is the null probe and a no-op success.
-    fn raise_self(&self, tid: crate::thread::ThreadId, signum: u64) -> DispatchOutcome {
-        if signum == 0 {
-            return DispatchOutcome::Returned { value: 0 };
-        }
-        let s = signum as i32;
-        if crate::exec_helpers::stop_for_ptrace_signal(self, s) {
-            return DispatchOutcome::Returned { value: 0 };
-        }
-        if s == LINUX_SIGSTOP {
-            stop_self_by_signal(s);
-            return DispatchOutcome::Returned { value: 0 };
-        }
-        if self.signal_blocked(tid, s) {
-            self.mark_signal_pending(tid, s);
-        } else {
-            crate::host_signal::raise_for_self(s);
-        }
-        DispatchOutcome::Returned { value: 0 }
-    }
-
-    /// Raise a thread-directed signal at the calling thread (`tkill/tgkill`
-    /// self). This must use the per-thread pending slot: publishing into the
-    /// process-directed slot lets a sibling consume the signal, which breaks
-    /// Linux's `tgkill(getpid(), gettid(), sig)` contract.
-    fn raise_thread_directed_self(
+    fn raise_self(
         &self,
+        context: &crate::kernel::KernelContext,
         tid: crate::thread::ThreadId,
         signum: u64,
     ) -> DispatchOutcome {
@@ -1494,11 +1049,40 @@ impl SyscallDispatcher {
             stop_self_by_signal(s);
             return DispatchOutcome::Returned { value: 0 };
         }
-        if self.signal_blocked(tid, s) {
-            self.mark_signal_pending(tid, s);
+        if self.signal_blocked(context, tid, s) {
+            self.mark_signal_pending(context, tid, s);
         } else {
-            if let Some(action) = self.registered_signal_handler(s) {
-                self.record_pending_signal_action(tid, s, action);
+            crate::host_signal::raise_for_self(s);
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    /// Raise a thread-directed signal at the calling thread (`tkill/tgkill`
+    /// self). This must use the per-thread pending slot: publishing into the
+    /// process-directed slot lets a sibling consume the signal, which breaks
+    /// Linux's `tgkill(getpid(), gettid(), sig)` contract.
+    fn raise_thread_directed_self(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        signum: u64,
+    ) -> DispatchOutcome {
+        if signum == 0 {
+            return DispatchOutcome::Returned { value: 0 };
+        }
+        let s = signum as i32;
+        if crate::exec_helpers::stop_for_ptrace_signal(self, s) {
+            return DispatchOutcome::Returned { value: 0 };
+        }
+        if s == LINUX_SIGSTOP {
+            stop_self_by_signal(s);
+            return DispatchOutcome::Returned { value: 0 };
+        }
+        if self.signal_blocked(context, tid, s) {
+            self.mark_signal_pending(context, tid, s);
+        } else {
+            if let Some(action) = self.registered_signal_handler(context, s) {
+                self.record_pending_signal_action(context, tid, s, action);
             }
             crate::host_signal::publish_pending_for(tid.raw(), s);
         }
@@ -1509,8 +1093,8 @@ impl SyscallDispatcher {
     pub(crate) fn ctx_tid<M: GuestMemory>(ctx: &SyscallCtx<M>) -> crate::thread::ThreadId {
         ctx.thread
             .as_ref()
-            .map(|t| t.tid)
-            .unwrap_or(crate::thread::ThreadId::NONE)
+            .map(|thread| thread.tid)
+            .unwrap_or_else(|| ctx.kernel.thread().registry_id())
     }
 
     /// Deliver a PROCESS-directed signal (`kill(getpid(), sig)`), honoring the
@@ -1537,8 +1121,8 @@ impl SyscallDispatcher {
         }
         let s = signum as i32;
         // Fast path: the calling thread can take it.
-        if !self.signal_blocked(caller_tid, s) {
-            return self.raise_self(caller_tid, signum);
+        if !self.signal_blocked(ctx.kernel, caller_tid, s) {
+            return self.raise_self(ctx.kernel, caller_tid, signum);
         }
         // Caller blocks it — find a sibling that doesn't. Lowest tid for
         // determinism.
@@ -1549,7 +1133,7 @@ impl SyscallDispatcher {
                 if tid == caller_tid {
                     continue;
                 }
-                if !self.signal_blocked(tid, s) {
+                if !self.signal_blocked(ctx.kernel, tid, s) {
                     return DispatchOutcome::SignalThread { tid, signum: s };
                 }
             }
@@ -1559,7 +1143,7 @@ impl SyscallDispatcher {
         // synchronously (sigwait/rt_sigtimedwait) consumes it. Pinning it to
         // the (blocked) caller stranded a SIBLING thread's sigwait forever
         // (CPython test_sigwait_thread; probe sigwaitthread).
-        self.mark_process_signal_pending(s);
+        self.mark_process_signal_pending(ctx.kernel, s);
         DispatchOutcome::Returned { value: 0 }
     }
 
@@ -1620,8 +1204,8 @@ impl SyscallDispatcher {
             if signum != 0
                 && pid == LINUX_BOOTSTRAP_PID as i64
                 && crate::namespace::pid::is_init_protected_default_signal(signum as i32)
-                && this.registered_signal_handler(signum as i32).is_none()
-                && !this.signal_is_ignored(signum as i32)
+                && this.registered_signal_handler(cx.kernel, signum as i32).is_none()
+                && !this.signal_is_ignored(cx.kernel, signum as i32)
             {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
@@ -1649,7 +1233,7 @@ impl SyscallDispatcher {
                         crate::namespace::pid::self_ns_pid() as i32,
                         this.cred_snapshot().ruid,
                     );
-                    this.record_pending_siginfo(tid, signum as i32, info);
+                    this.record_pending_siginfo(cx.kernel, tid, signum as i32, info);
                 }
                 return Ok(this.raise_process_directed(cx, tid, signum));
             }
@@ -1742,12 +1326,8 @@ impl SyscallDispatcher {
             // would send the ns-pid to a nonexistent host tid → ESRCH). Mirrors
             // tgkill below (LTP tkill01).
             if names_self_pid(tid) {
-                let self_tid = cx
-                    .thread
-                    .as_ref()
-                    .map(|t| t.tid)
-                    .unwrap_or(crate::thread::ThreadId::NONE);
-                return Ok(this.raise_self(self_tid, signum));
+                let self_tid = Self::ctx_tid(cx);
+                return Ok(this.raise_self(cx.kernel, self_tid, signum));
             }
             Ok(bootstrap_signal_send(
                 SignalTarget::GuestTid(NsPid(tid as i32)),
@@ -1788,33 +1368,22 @@ impl SyscallDispatcher {
             if !valid_self {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
-            let self_tid = cx
-                .thread
-                .as_ref()
-                .map(|t| t.tid)
-                .unwrap_or(crate::thread::ThreadId::NONE);
-            Ok(this.raise_self(self_tid, signum))
+            let self_tid = Self::ctx_tid(cx);
+            Ok(this.raise_self(cx.kernel, self_tid, signum))
         }
 
         /// sigaltstack(ss, old_ss): set/query alternate signal stack.
         fn sigaltstack(this, cx, ss: GuestPtr, old_ss: GuestPtr) {
             let ss = ss.0;
             let old_ss = old_ss.0;
-            let tid = cx
-                .thread
-                .as_ref()
-                .map(|t| t.tid)
-                .unwrap_or(crate::thread::ThreadId::NONE);
+            let tid = Self::ctx_tid(cx);
             let memory = &mut *cx.memory;
 
-            let on_altstack = this.is_on_altstack(tid, cx.request.current_guest_sp);
+            let on_altstack = this.is_on_altstack(cx.kernel, tid, cx.request.current_guest_sp);
             if old_ss != 0 {
-                let mut current = this
-                    .signal
-                    .lock()
-                    .altstack
-                    .get(&tid)
-                    .copied()
+                let mut current = Self::required_signal_thread(cx.kernel, tid)
+                    .signal_state()
+                    .altstack()
                     .unwrap_or_else(LinuxSigaltstack::disabled);
                 // Report SS_ONSTACK while a handler is executing on the alt stack
                 // (Linux: the query reflects the current execution state). (M13)
@@ -1846,15 +1415,17 @@ impl SyscallDispatcher {
                 if flags & !LINUX_SS_DISABLE != 0 {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
-                if flags & LINUX_SS_DISABLE != 0 {
-                    this.signal.lock().altstack.remove(&tid);
+                let replacement = if flags & LINUX_SS_DISABLE != 0 {
+                    None
                 } else {
                     let size = new_stack.ss_size;
                     if size < LINUX_MINSIGSTKSZ {
                         return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     }
-                    this.signal.lock().altstack.insert(tid, new_stack);
-                }
+                    Some(new_stack)
+                };
+                Self::required_signal_thread(cx.kernel, tid)
+                    .update_signal_state(|state| state.set_altstack(replacement));
             }
 
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -1876,17 +1447,12 @@ impl SyscallDispatcher {
             // run loop's wait/re-dispatch cycle. Blocking here would retain the
             // caller's guest-memory borrow and starve the sibling that must
             // dispatch tgkill/tkill to wake us.
-            let original = this.begin_sigsuspend(tid, suspend_mask);
-            let dispatcher_pending = {
-                let signal = this.signal.lock();
-                signal
-                    .pendings
-                    .get(&tid)
-                    .copied()
-                    .unwrap_or(SigSet::EMPTY)
-                    .union(signal.process_pending)
-                    .difference(suspend_mask)
-            };
+            let original = this.begin_sigsuspend(cx.kernel, tid, suspend_mask);
+            let dispatcher_pending = Self::required_signal_thread(cx.kernel, tid)
+                .signal_state()
+                .pending()
+                .union(cx.kernel.shared().pending_signals().present())
+                .difference(suspend_mask);
             let block_mask = SigBlockMask::blocking_all_of(suspend_mask);
             let host_pending = crate::host_signal::has_unblocked_pending_for(
                 tid.raw(),
@@ -1907,13 +1473,13 @@ impl SyscallDispatcher {
             // `rt_sigreturn`), restore `original` HERE — otherwise the thread is
             // stranded running under `suspend_mask`. A cross-thread host-pending
             // wake re-raised above, so a handler will run there too. (audit M1)
-            if this.sigsuspend_caught_handler_deliverable(tid, suspend_mask)
+            if this.sigsuspend_caught_handler_deliverable(cx.kernel, tid, suspend_mask)
                 || host_pending
             {
                 // `begin_sigsuspend` already armed `original`; handler entry
                 // consumes it into the Linux sigframe.
             } else {
-                this.cancel_sigsuspend(tid, original);
+                this.cancel_sigsuspend(cx.kernel, tid, original);
             }
             Ok(DispatchOutcome::errno(LINUX_EINTR))
         }
@@ -1961,19 +1527,13 @@ impl SyscallDispatcher {
                 None
             };
             if old_action != 0 {
-                let prev = this
-                    .signal
-                    .lock()
-                    .handlers
-                    .get(&signum)
-                    .copied()
-                    .unwrap_or_else(LinuxSigaction::empty);
+                let prev = Self::signal_action(cx.kernel, signum);
                 if write_kernel_struct_raw(memory, old_action, &prev).is_err() {
                     return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
             }
             if let Some(sa) = new_sa {
-                this.signal.lock().handlers.insert(signum, sa);
+                Self::install_signal_action(cx.kernel, signum, sa);
                 let h = sa.sa_handler;
                 let real_handler =
                     h != crate::linux_abi::LINUX_SIG_DFL && h != crate::linux_abi::LINUX_SIG_IGN;
@@ -2018,7 +1578,7 @@ impl SyscallDispatcher {
             if sigset_size != LINUX_RT_SIGSET_SIZE {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let previous_mask = this.signal.lock().mask_for(tid);
+            let previous_mask = this.signal_mask_for(cx.kernel, tid);
             if old_set != 0
                 && memory
                     .write_bytes(old_set, &previous_mask.raw().to_le_bytes())
@@ -2042,10 +1602,7 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
                 };
-                this.signal
-                    .lock()
-                    .masks
-                    .insert(tid, sanitize_signal_mask(mask));
+                this.restore_signal_mask(cx.kernel, tid, mask);
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -2058,16 +1615,12 @@ impl SyscallDispatcher {
             if sigset_size != LINUX_RT_SIGSET_SIZE {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let signal = this.signal.lock();
-            // Pending = this thread's per-thread set UNION the shared process
-            // pending set (Linux sigpending reports both).
-            let pending = signal
-                .pendings
-                .get(&tid)
-                .copied()
-                .unwrap_or(SigSet::EMPTY)
-                .union(signal.process_pending);
-            drop(signal);
+            // Pending = this exact Kernel thread queue UNION the shared task
+            // queue (Linux sigpending reports both).
+            let pending = Self::required_signal_thread(cx.kernel, tid)
+                .signal_state()
+                .pending()
+                .union(cx.kernel.shared().pending_signals().present());
             if set_ptr != 0
                 && memory
                     .write_bytes(set_ptr, &pending.raw().to_le_bytes())
@@ -2107,24 +1660,20 @@ impl SyscallDispatcher {
                 timeout = Some(Duration::new(tv_sec as u64, tv_nsec as u32));
             }
 
-            this.drain_xsignals_process_directed();
+            this.drain_xsignals_process_directed(cx.kernel);
             let memory = &mut *cx.memory;
-            if let Some((signum, from_thread)) = this.take_pending_in_from(tid, wait_set) {
-                // Carry any queued rt_sigqueueinfo payload (si_code/pid/uid/value)
-                // into the caller's siginfo, not just si_signo. (audit M9)
-                // Provenance-gated: a per-thread take must not steal a queued
-                // PROCESS-directed payload (and vice versa).
-                let queued = if from_thread {
-                    this.take_pending_siginfo(tid, signum)
-                } else {
-                    this.take_process_pending_siginfo(signum)
-                };
-                return Ok(rt_sigtimedwait_deliver(memory, info_ptr, signum, queued));
+            if let Some(pending) = this.take_pending_in_from(cx.kernel, tid, wait_set) {
+                return Ok(rt_sigtimedwait_deliver(
+                    memory,
+                    info_ptr,
+                    pending.signum,
+                    pending.siginfo,
+                ));
             }
             let signum = crate::host_signal::take_pending_in_for(tid.raw(), wait_set);
             if signum != crate::host_signal::NO_PENDING_SIGNAL {
                 // A host-delivered signal carries no carrick-queued payload.
-                let queued = this.take_pending_siginfo(tid, signum);
+                let queued = this.take_pending_siginfo(cx.kernel, tid, signum);
                 return Ok(rt_sigtimedwait_deliver(memory, info_ptr, signum, queued));
             }
             install_host_handlers_for_wait_set(wait_set);
@@ -2138,8 +1687,8 @@ impl SyscallDispatcher {
                     // (e.g. handler-less SIGCHLD) do neither.
                     block_mask: SigBlockMask::for_signal_wait(
                         wait_set,
-                        this.signal_mask_for(tid),
-                        this.wait_ignored_disposition_mask(),
+                        this.signal_mask_for(cx.kernel, tid),
+                        this.wait_ignored_disposition_mask(cx.kernel),
                     ),
                     timeout,
                 }),
@@ -2190,7 +1739,7 @@ impl SyscallDispatcher {
         /// rt_sigreturn(): pop signal frame and restore registers.
         fn rt_sigreturn(this, cx) {
             // Pop this handler frame's alt-stack record (audit M13).
-            this.pop_handler_frame(Self::ctx_tid(cx));
+            this.pop_handler_frame(cx.kernel, Self::ctx_tid(cx));
             Ok(DispatchOutcome::SigReturn)
         }
     }
@@ -2199,31 +1748,19 @@ impl SyscallDispatcher {
     /// per-process analogue of the Linux per-user `sigpending` count that
     /// `RLIMIT_SIGPENDING` bounds. Standard signals (1..=31) coalesce, so each
     /// pending standard signum is one slot; real-time signals queue per POSIX,
-    /// so each queued instance counts (`rt_pending_counts`). Linux's limit is
-    /// per-user across the user's processes; carrick approximates it per-process
-    /// (one user per guest here), which is exact for the single-process case.
-    fn pending_signal_count(&self) -> u64 {
-        // Standard signals occupy the low 31 bits of a sigset; RT signal bits
-        // (32..=64) are excluded here and counted from the RT queue-depth maps
-        // to avoid double-counting the mirror bit.
-        const STANDARD_MASK: u64 = (1u64 << 31) - 1;
-        let s = self.signal.lock();
-        let mut total: u64 = 0;
-        for set in s.pendings.values() {
-            total += u64::from((set.raw() & STANDARD_MASK).count_ones());
-        }
-        total += u64::from((s.process_pending.raw() & STANDARD_MASK).count_ones());
-        total += s
-            .rt_pending_counts
-            .values()
-            .map(|&c| u64::from(c))
-            .sum::<u64>();
-        total += s
-            .process_rt_pending_counts
-            .values()
-            .map(|&c| u64::from(c))
-            .sum::<u64>();
-        total
+    /// so each queued instance counts. Linux's limit is per-user across the
+    /// user's processes; carrick approximates it per-process (one user per
+    /// guest here), which is exact for the single-process case.
+    fn pending_signal_count(&self, context: &crate::kernel::KernelContext) -> u64 {
+        let thread_total = context
+            .task()
+            .threads()
+            .into_iter()
+            .map(|thread| u64::try_from(thread.signal_state().pending_count()).unwrap_or(u64::MAX))
+            .fold(0u64, u64::saturating_add);
+        thread_total.saturating_add(
+            u64::try_from(context.shared().pending_signals().pending_count()).unwrap_or(u64::MAX),
+        )
     }
 
     /// True when queuing one more signal would exceed this process's effective
@@ -2231,14 +1768,14 @@ impl SyscallDispatcher {
     /// never does). Linux allows a queue alloc iff `count + 1 <= limit`; the
     /// send fails with `EAGAIN` otherwise (LTP tgkill02: a blocked SIGRTMIN with
     /// `RLIMIT_SIGPENDING = {0, 0}`).
-    fn sigpending_limit_exceeded(&self) -> bool {
+    fn sigpending_limit_exceeded(&self, context: &crate::kernel::KernelContext) -> bool {
         let limit = self
             .effective_resource_limit(crate::linux_abi::LINUX_RLIMIT_SIGPENDING)
             .rlim_cur;
         if limit == LINUX_RLIM_INFINITY {
             return false;
         }
-        self.pending_signal_count() >= limit
+        self.pending_signal_count(context) >= limit
     }
 
     /// Shared tgkill/tkill routing for the multi-threaded path. Returns
@@ -2274,9 +1811,12 @@ impl SyscallDispatcher {
             // for an RT signal (record_pending_siginfo appends for RT) — take()
             // pops the front, so the queued si_value would be lost.
             if record_synthetic {
-                self.record_tkill_siginfo(t.tid, signum as i32);
+                self.record_tkill_siginfo(ctx.kernel, t.tid, signum as i32);
             }
-            return Some((self.raise_thread_directed_self(t.tid, signum), target));
+            return Some((
+                self.raise_thread_directed_self(ctx.kernel, t.tid, signum),
+                target,
+            ));
         }
         if t.registry.is_live(target) {
             let signum_i32 = signum as i32;
@@ -2285,18 +1825,18 @@ impl SyscallDispatcher {
             // BEFORE anything is recorded (LTP tgkill02: a sibling with SIGRTMIN
             // blocked and RLIMIT_SIGPENDING={0,0}). Standard signals coalesce and
             // are not bounded per-entry, so they are unaffected.
-            if is_rt_signal(signum_i32) && self.sigpending_limit_exceeded() {
+            if is_rt_signal(signum_i32) && self.sigpending_limit_exceeded(ctx.kernel) {
                 return Some((DispatchOutcome::errno(LINUX_EAGAIN), target));
             }
             if record_synthetic {
-                self.record_tkill_siginfo(target, signum_i32);
+                self.record_tkill_siginfo(ctx.kernel, target, signum_i32);
             }
-            if self.signal_blocked(target, signum_i32) {
-                self.mark_signal_pending(target, signum_i32);
+            if self.signal_blocked(ctx.kernel, target, signum_i32) {
+                self.mark_signal_pending(ctx.kernel, target, signum_i32);
                 return Some((DispatchOutcome::Returned { value: 0 }, target));
             }
-            if let Some(action) = self.registered_signal_handler(signum_i32) {
-                self.record_pending_signal_action(target, signum_i32, action);
+            if let Some(action) = self.registered_signal_handler(ctx.kernel, signum_i32) {
+                self.record_pending_signal_action(ctx.kernel, target, signum_i32, action);
             }
             return Some((
                 DispatchOutcome::SignalThread {
@@ -2365,7 +1905,7 @@ impl SyscallDispatcher {
             if !matches!(routed, DispatchOutcome::Errno { .. })
                 && let Some(info) = user_info
             {
-                self.record_pending_siginfo(target_tid, s, info);
+                self.record_pending_siginfo(ctx.kernel, target_tid, s, info);
             }
             return routed;
         }
@@ -2446,9 +1986,9 @@ impl SyscallDispatcher {
         // against the caller's tid so delivery pairs with the same frame.
         let tid = Self::ctx_tid(ctx);
         if let Some(info) = user_info {
-            self.record_pending_siginfo(tid, s, info);
+            self.record_pending_siginfo(ctx.kernel, tid, s, info);
         }
-        self.mark_signal_pending(tid, s);
+        self.mark_signal_pending(ctx.kernel, tid, s);
         DispatchOutcome::Returned { value: 0 }
     }
 }
@@ -2786,6 +2326,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dispatcher_action_binding_is_the_captured_kernel_sighand() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().expect("context");
+        let signal = crate::kernel::LinuxSignal::for_signal_number(10).expect("signal");
+        let action = LinuxSigaction {
+            sa_handler: 0x1234_0000,
+            sa_flags: crate::linux_abi::LINUX_SA_SIGINFO,
+            sa_restorer: 0x5678_0000,
+            sa_mask: [0x55],
+        };
+
+        SyscallDispatcher::install_signal_action(
+            &dispatcher.exact_signal_context_for_test(),
+            signal.raw(),
+            action,
+        );
+
+        assert_eq!(context.shared().sighand().action(signal), action);
+        assert_eq!(
+            dispatcher.registered_signal_handler(
+                &dispatcher.exact_signal_context_for_test(),
+                signal.raw()
+            ),
+            Some(action)
+        );
+    }
+
+    #[test]
     fn cross_process_xsig_policy_routes_unhostable_signals() {
         // SIGPIPE: both backends keep a process-wide host SIG_IGN for it (and
         // never mirror a guest disposition onto host SIGPIPE), so a plain host
@@ -2829,210 +2397,148 @@ mod tests {
     #[test]
     fn fork_child_clears_old_and_new_pending_signal_state() {
         let d = SyscallDispatcher::new();
-        let old = crate::thread::ThreadId::synthetic_for_tests(90);
-        let new = crate::thread::ThreadId::synthetic_for_tests(91);
+        let parent = d.capture_one_task_context().expect("context");
+        let old = parent.thread().registry_id();
+        let new = crate::thread::ThreadId::synthetic_for_tests(old.raw() + 1);
         let mask = SigSet::EMPTY.with(12);
         let restore = SigSet::EMPTY.with(14);
-        let altstack = carrick_abi::LinuxSigaltstack::empty();
-        let handler_frames = vec![true, false, true];
-        {
-            let mut s = d.signal.lock();
-            s.masks.insert(old, mask);
-            s.altstack.insert(old, altstack);
-            s.handler_frames.insert(old, handler_frames.clone());
-            s.restore_masks.insert(old, restore);
-            for tid in [old, new] {
-                s.pendings.insert(tid, SigSet::EMPTY.with(10).with(34));
-                s.rt_pending_counts.insert((tid, 34), 2);
-                s.pending_actions.insert((tid, 10), VecDeque::new());
-                s.pending_actions.insert((tid, 34), VecDeque::new());
-                s.pending_siginfos
-                    .entry((tid, 10))
-                    .or_default()
-                    .push_back(LinuxSiginfo::kill(
-                        10,
-                        crate::linux_abi::LINUX_SI_USER,
-                        1,
-                        0,
-                    ));
-                s.pending_siginfos
-                    .entry((tid, 34))
-                    .or_default()
-                    .push_back(LinuxSiginfo::rt_queue(34, 1, 0, 7));
-            }
-            s.process_pending = SigSet::EMPTY.with(10).with(34);
-            s.process_rt_pending_counts.insert(34, 2);
-            s.process_pending_siginfos
-                .entry(34)
-                .or_default()
-                .push_back(LinuxSiginfo::rt_queue(34, 1, 0, 9));
-        }
-
-        d.migrate_thread_signal_state(old, new);
-
-        let s = d.signal.lock();
-        assert!(!s.masks.contains_key(&old));
-        assert_eq!(s.mask_for(new), mask);
-        assert_eq!(s.altstack.get(&new), Some(&altstack));
-        assert_eq!(s.handler_frames.get(&new), Some(&handler_frames));
-        assert_eq!(s.restore_masks.get(&new), Some(&restore));
-        for tid in [old, new] {
-            assert!(!s.pendings.contains_key(&tid));
-            assert!(!s.rt_pending_counts.keys().any(|(t, _)| *t == tid));
-            assert!(!s.pending_actions.keys().any(|(t, _)| *t == tid));
-            assert!(!s.pending_siginfos.keys().any(|(t, _)| *t == tid));
-        }
-        assert!(s.process_pending.is_empty());
-        assert!(s.process_rt_pending_counts.is_empty());
-        assert!(s.process_pending_siginfos.is_empty());
-        drop(s);
-
-        // A lane whose namespace tid remains stable must still clear copied
-        // standard and RT pending state while preserving inherited state.
-        {
-            let mut s = d.signal.lock();
-            s.pendings.insert(new, SigSet::EMPTY.with(10).with(34));
-            s.rt_pending_counts.insert((new, 34), 1);
-            s.pending_actions.insert((new, 34), VecDeque::new());
-            s.pending_siginfos.insert((new, 34), VecDeque::new());
-            s.process_pending = SigSet::EMPTY.with(10);
-        }
-        d.migrate_thread_signal_state(new, new);
-        let s = d.signal.lock();
-        assert_eq!(s.mask_for(new), mask);
-        assert_eq!(s.altstack.get(&new), Some(&altstack));
-        assert_eq!(s.handler_frames.get(&new), Some(&handler_frames));
-        assert_eq!(s.restore_masks.get(&new), Some(&restore));
-        assert!(!s.pendings.contains_key(&new));
-        assert!(!s.rt_pending_counts.keys().any(|(t, _)| *t == new));
-        assert!(!s.pending_actions.keys().any(|(t, _)| *t == new));
-        assert!(!s.pending_siginfos.keys().any(|(t, _)| *t == new));
-        assert!(s.process_pending.is_empty());
+        d.restore_signal_mask(&d.exact_signal_context_for_test(), old, mask);
+        parent.thread().update_signal_state(|state| {
+            state.set_altstack(Some(carrick_abi::LinuxSigaltstack::empty()));
+            state.push_handler_frame(crate::kernel::HandlerFrameState {
+                on_altstack: true,
+                restore_mask: None,
+            });
+            state.arm_restore_mask(Some(restore));
+        });
+        d.mark_signal_pending(&d.exact_signal_context_for_test(), old, 10);
+        d.mark_process_signal_pending(&d.exact_signal_context_for_test(), 10);
+        let plan =
+            crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty()).unwrap();
+        let child = parent
+            .kernel()
+            .reserve_fork(&parent, plan, "signal-pending-fork".to_owned(), None)
+            .unwrap()
+            .prepare_reference(new)
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_parts()
+            .unwrap()
+            .0;
+        let state = child.thread().signal_state();
+        assert_eq!(state.blocked(), mask);
+        assert!(state.altstack_enabled());
+        assert_eq!(state.handler_frame_depth(), 1);
+        assert_eq!(state.armed_restore_mask(), Some(restore));
+        assert!(state.pending().is_empty());
+        assert!(!child.signal_authority().may_have_task_pending());
+        assert!(parent.signal_authority().may_have_task_pending());
     }
 
     #[test]
     fn fork_child_retires_sibling_thread_signal_state() {
-        // MT fork: the child inherits the parent's per-tid signal maps, but
-        // only the forking thread survives. Sibling entries must be retired
-        // BEFORE `migrate_thread_signal_state` — the child's fresh registry
-        // re-allocates tids from its own (host-pid-anchored) base, which can
-        // collide with a dead parent sibling's tid and resurrect its
-        // mask/altstack. Process-level (thread-group) state is migrate's job
-        // and must be untouched here.
         let d = SyscallDispatcher::new();
-        let keeper = crate::thread::ThreadId::synthetic_for_tests(100);
-        let sib_a = crate::thread::ThreadId::synthetic_for_tests(101);
-        let sib_b = crate::thread::ThreadId::synthetic_for_tests(102);
-        {
-            let mut s = d.signal.lock();
-            for tid in [keeper, sib_a, sib_b] {
-                s.masks.insert(tid, SigSet::from_raw(1 << 9));
-                s.pendings.insert(tid, SigSet::from_raw(1 << 11));
-                s.rt_pending_counts.insert((tid, 34), 2);
-                s.pending_actions.insert((tid, 34), VecDeque::new());
-                s.pending_siginfos.insert((tid, 34), VecDeque::new());
-                s.altstack
-                    .insert(tid, carrick_abi::LinuxSigaltstack::empty());
-                s.handler_frames.insert(tid, vec![true]);
-                s.restore_masks.insert(tid, SigSet::from_raw(1));
-            }
-            s.process_pending = SigSet::from_raw(1 << 14);
-        }
-
-        d.retire_sibling_thread_signal_state(keeper);
-
-        let s = d.signal.lock();
-        for tid in [sib_a, sib_b] {
-            assert!(!s.masks.contains_key(&tid), "sibling mask retired");
-            assert!(!s.pendings.contains_key(&tid), "sibling pending retired");
-            assert!(!s.altstack.contains_key(&tid), "sibling altstack retired");
-            assert!(
-                !s.handler_frames.contains_key(&tid),
-                "sibling handler frames retired"
-            );
-            assert!(
-                !s.restore_masks.contains_key(&tid),
-                "sibling restore mask retired"
-            );
-            assert!(
-                !s.rt_pending_counts.keys().any(|(t, _)| *t == tid),
-                "sibling rt pending counts retired"
-            );
-            assert!(
-                !s.pending_actions.keys().any(|(t, _)| *t == tid),
-                "sibling pending actions retired"
-            );
-            assert!(
-                !s.pending_siginfos.keys().any(|(t, _)| *t == tid),
-                "sibling pending siginfos retired"
-            );
-        }
-        assert_eq!(s.mask_for(keeper), SigSet::from_raw(1 << 9));
-        assert!(s.altstack.contains_key(&keeper), "keeper altstack intact");
-        assert!(
-            s.rt_pending_counts.contains_key(&(keeper, 34)),
-            "keeper rt counts intact"
-        );
-        assert_eq!(
-            s.process_pending,
-            SigSet::from_raw(1 << 14),
-            "process-level pending untouched (fork-clear is migrate's job)"
-        );
+        let parent = d.capture_one_task_context().unwrap();
+        let keeper = parent.thread().registry_id();
+        let sibling = crate::thread::ThreadId::synthetic_for_tests(keeper.raw() + 1);
+        d.register_one_task_thread(&parent, sibling).unwrap();
+        let parent = d.capture_kernel_context(parent.thread().key().tid).unwrap();
+        d.mark_signal_pending(&d.exact_signal_context_for_test(), keeper, 10);
+        d.mark_signal_pending(&d.exact_signal_context_for_test(), sibling, 12);
+        let child_tid = crate::thread::ThreadId::synthetic_for_tests(keeper.raw() + 2);
+        let plan =
+            crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty()).unwrap();
+        let child = parent
+            .kernel()
+            .reserve_fork(&parent, plan, "signal-sibling-fork".to_owned(), None)
+            .unwrap()
+            .prepare_reference(child_tid)
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_parts()
+            .unwrap()
+            .0;
+        assert_eq!(child.task().threads().len(), 1);
+        assert!(child.thread().signal_state().pending().is_empty());
+        assert!(parent.task().thread_by_registry_id(sibling).is_some());
     }
 
-    /// The lock-free pending hints must never hide a pending signal from the
-    /// delivery cycle's `take_deliverable_pending_from` fast path — across
-    /// per-tid marks, shared process marks, RT queue depth (the dnotify
-    /// two-instance chain shape), drains, unblocks, and sibling retirement.
     #[test]
     fn pending_hints_never_hide_deliverable_signals() {
         let d = SyscallDispatcher::new();
-        let tid = crate::thread::ThreadId::synthetic_for_tests(9001);
-        let sibling = crate::thread::ThreadId::synthetic_for_tests(9002);
+        let context = d.capture_one_task_context().unwrap();
+        let tid = context.thread().registry_id();
+        let sibling = crate::thread::ThreadId::synthetic_for_tests(tid.raw() + 1);
+        let sibling_tid = d.register_one_task_thread(&context, sibling).unwrap();
+        let take = |target| {
+            d.take_deliverable_pending_from(&d.exact_signal_context_for_test(), target)
+                .map(|pending| (pending.signum, pending.owner))
+        };
 
         // Empty state: the fast path proves emptiness.
-        assert_eq!(d.take_deliverable_pending_from(tid), None);
+        assert_eq!(take(tid), None);
 
         // Per-tid mark → deliverable through the fast path; drained → empty.
-        d.mark_signal_pending(tid, 10);
-        assert_eq!(d.take_deliverable_pending_from(tid), Some((10, true)));
-        assert_eq!(d.take_deliverable_pending_from(tid), None);
+        d.mark_signal_pending(&d.exact_signal_context_for_test(), tid, 10);
+        assert_eq!(
+            take(tid),
+            Some((10, crate::kernel::SignalPendingOwner::Thread))
+        );
+        assert_eq!(take(tid), None);
 
         // RT double-queue (dnotify chain shape): two instances, two takes.
-        d.mark_signal_pending(tid, 34);
-        d.mark_signal_pending(tid, 34);
-        assert_eq!(d.take_deliverable_pending_from(tid), Some((34, true)));
+        d.mark_signal_pending(&d.exact_signal_context_for_test(), tid, 34);
+        d.mark_signal_pending(&d.exact_signal_context_for_test(), tid, 34);
         assert_eq!(
-            d.take_deliverable_pending_from(tid),
-            Some((34, true)),
+            take(tid),
+            Some((34, crate::kernel::SignalPendingOwner::Thread))
+        );
+        assert_eq!(
+            take(tid),
+            Some((34, crate::kernel::SignalPendingOwner::Thread)),
             "second queued RT instance must chain (hint must stay set)"
         );
-        assert_eq!(d.take_deliverable_pending_from(tid), None);
+        assert_eq!(take(tid), None);
 
         // Shared process-directed mark: ANY tid may take it.
-        d.mark_process_signal_pending(15);
-        assert_eq!(d.take_deliverable_pending_from(sibling), Some((15, false)));
-        assert_eq!(d.take_deliverable_pending_from(sibling), None);
+        d.mark_process_signal_pending(&d.exact_signal_context_for_test(), 15);
+        assert_eq!(
+            take(sibling),
+            Some((15, crate::kernel::SignalPendingOwner::Task))
+        );
+        assert_eq!(take(sibling), None);
 
         // A blocked-then-unblocked signal: pending while blocked (no take),
         // deliverable after the mask restore — no new mark bumps the hint, so
         // a stale-clear hint would strand it forever.
-        d.restore_signal_mask(tid, SigSet::EMPTY.with(12));
-        d.mark_signal_pending(tid, 12);
-        assert_eq!(
-            d.take_deliverable_pending_from(tid),
-            None,
-            "blocked signal must stay pending"
+        d.restore_signal_mask(
+            &d.exact_signal_context_for_test(),
+            tid,
+            SigSet::EMPTY.with(12),
         );
-        d.restore_signal_mask(tid, SigSet::EMPTY);
-        assert_eq!(d.take_deliverable_pending_from(tid), Some((12, true)));
+        d.mark_signal_pending(&d.exact_signal_context_for_test(), tid, 12);
+        assert_eq!(take(tid), None, "blocked signal must stay pending");
+        d.restore_signal_mask(&d.exact_signal_context_for_test(), tid, SigSet::EMPTY);
+        assert_eq!(
+            take(tid),
+            Some((12, crate::kernel::SignalPendingOwner::Thread))
+        );
 
         // Sibling retirement refreshes hints without dropping the keeper's.
-        d.mark_signal_pending(tid, 10);
-        d.mark_signal_pending(sibling, 10);
-        d.retire_sibling_thread_signal_state(tid);
-        assert_eq!(d.take_deliverable_pending_from(tid), Some((10, true)));
-        assert_eq!(d.take_deliverable_pending_from(sibling), None);
+        d.mark_signal_pending(&d.exact_signal_context_for_test(), tid, 10);
+        d.mark_signal_pending(&d.exact_signal_context_for_test(), sibling, 10);
+        let sibling_context = d.capture_kernel_context(sibling_tid).unwrap();
+        sibling_context
+            .kernel()
+            .exit_thread(&sibling_context, None)
+            .unwrap();
+        assert_eq!(
+            take(tid),
+            Some((10, crate::kernel::SignalPendingOwner::Thread))
+        );
+        assert_eq!(take(sibling), None);
     }
 
     #[test]
@@ -3294,37 +2800,62 @@ mod tests {
     #[test]
     fn rt_signals_queue_while_standard_signals_coalesce() {
         let d = SyscallDispatcher::new();
-        let tid = crate::thread::ThreadId::synthetic_for_tests(1);
+        let tid = d.capture_one_task_context().unwrap().thread().registry_id();
 
         // A standard signal (10) sent 3× while pending coalesces to one delivery.
-        d.mark_signal_pending(tid, 10);
-        d.mark_signal_pending(tid, 10);
-        d.mark_signal_pending(tid, 10);
-        assert_eq!(d.take_deliverable_pending(tid), Some(10));
-        assert_eq!(d.take_deliverable_pending(tid), None);
+        d.mark_signal_pending(&d.exact_signal_context_for_test(), tid, 10);
+        d.mark_signal_pending(&d.exact_signal_context_for_test(), tid, 10);
+        d.mark_signal_pending(&d.exact_signal_context_for_test(), tid, 10);
+        assert_eq!(
+            d.take_deliverable_pending(&d.exact_signal_context_for_test(), tid),
+            Some(10)
+        );
+        assert_eq!(
+            d.take_deliverable_pending(&d.exact_signal_context_for_test(), tid),
+            None
+        );
 
         // A real-time signal (34) sent 3× delivers 3× (POSIX queuing).
-        d.mark_signal_pending(tid, 34);
-        d.mark_signal_pending(tid, 34);
-        d.mark_signal_pending(tid, 34);
-        assert_eq!(d.take_deliverable_pending(tid), Some(34));
-        assert_eq!(d.take_deliverable_pending(tid), Some(34));
-        assert_eq!(d.take_deliverable_pending(tid), Some(34));
-        assert_eq!(d.take_deliverable_pending(tid), None);
+        d.mark_signal_pending(&d.exact_signal_context_for_test(), tid, 34);
+        d.mark_signal_pending(&d.exact_signal_context_for_test(), tid, 34);
+        d.mark_signal_pending(&d.exact_signal_context_for_test(), tid, 34);
+        assert_eq!(
+            d.take_deliverable_pending(&d.exact_signal_context_for_test(), tid),
+            Some(34)
+        );
+        assert_eq!(
+            d.take_deliverable_pending(&d.exact_signal_context_for_test(), tid),
+            Some(34)
+        );
+        assert_eq!(
+            d.take_deliverable_pending(&d.exact_signal_context_for_test(), tid),
+            Some(34)
+        );
+        assert_eq!(
+            d.take_deliverable_pending(&d.exact_signal_context_for_test(), tid),
+            None
+        );
 
         // Mixed: the lowest deliverable comes first, then the RT queue drains.
-        d.mark_signal_pending(tid, 34);
-        d.mark_signal_pending(tid, 34);
-        d.mark_signal_pending(tid, 10);
-        assert_eq!(d.take_deliverable_pending(tid), Some(10));
-        assert_eq!(d.take_deliverable_pending(tid), Some(34));
-        assert_eq!(d.take_deliverable_pending(tid), Some(34));
-        assert_eq!(d.take_deliverable_pending(tid), None);
-
-        // Thread teardown clears the RT queue too (no leak into a recycled tid).
-        d.mark_signal_pending(tid, 34);
-        d.forget_thread_signal_state(tid);
-        assert_eq!(d.take_deliverable_pending(tid), None);
+        d.mark_signal_pending(&d.exact_signal_context_for_test(), tid, 34);
+        d.mark_signal_pending(&d.exact_signal_context_for_test(), tid, 34);
+        d.mark_signal_pending(&d.exact_signal_context_for_test(), tid, 10);
+        assert_eq!(
+            d.take_deliverable_pending(&d.exact_signal_context_for_test(), tid),
+            Some(10)
+        );
+        assert_eq!(
+            d.take_deliverable_pending(&d.exact_signal_context_for_test(), tid),
+            Some(34)
+        );
+        assert_eq!(
+            d.take_deliverable_pending(&d.exact_signal_context_for_test(), tid),
+            Some(34)
+        );
+        assert_eq!(
+            d.take_deliverable_pending(&d.exact_signal_context_for_test(), tid),
+            None
+        );
     }
 
     #[test]
@@ -3340,31 +2871,59 @@ mod tests {
         let waiter = crate::thread::ThreadId::synthetic_for_tests(42);
         let usr1 = 10i32;
         let set = SigSet::EMPTY.with(usr1);
+        install_kernel_signal_threads(&d, &[sender, waiter]);
 
-        d.mark_process_signal_pending(usr1);
+        d.mark_process_signal_pending(&d.exact_signal_context_for_test(), usr1);
         // A sigwait whose set does NOT include SIGUSR1 must not dequeue it.
         let other = SigSet::EMPTY.with(12); // SIGUSR2 (12), not SIGUSR1
-        assert_eq!(d.take_pending_in(waiter, other), None);
+        assert_eq!(
+            d.take_pending_in(&d.exact_signal_context_for_test(), waiter, other),
+            None
+        );
         // The SIBLING (a thread other than the sender) parked in sigwait
         // selecting SIGUSR1 dequeues the shared signal — the core fix.
-        assert_eq!(d.take_pending_in(waiter, set), Some(usr1));
+        assert_eq!(
+            d.take_pending_in(&d.exact_signal_context_for_test(), waiter, set),
+            Some(usr1)
+        );
         // Consumed exactly once — no second thread can also take it.
-        assert_eq!(d.take_pending_in(sender, set), None);
-        assert_eq!(d.take_pending_in(waiter, set), None);
+        assert_eq!(
+            d.take_pending_in(&d.exact_signal_context_for_test(), sender, set),
+            None
+        );
+        assert_eq!(
+            d.take_pending_in(&d.exact_signal_context_for_test(), waiter, set),
+            None
+        );
 
         // The deliver-on-unblock path (take_deliverable_pending) also drains the
         // shared set, for a thread that unblocks the signal without sigwait.
-        d.mark_process_signal_pending(usr1);
-        assert_eq!(d.take_deliverable_pending(waiter), Some(usr1));
-        assert_eq!(d.take_deliverable_pending(sender), None);
+        d.mark_process_signal_pending(&d.exact_signal_context_for_test(), usr1);
+        assert_eq!(
+            d.take_deliverable_pending(&d.exact_signal_context_for_test(), waiter),
+            Some(usr1)
+        );
+        assert_eq!(
+            d.take_deliverable_pending(&d.exact_signal_context_for_test(), sender),
+            None
+        );
 
         // Shared RT signals queue per POSIX (N sends → N deliveries), independent
         // of which thread drains them.
-        d.mark_process_signal_pending(34);
-        d.mark_process_signal_pending(34);
-        assert_eq!(d.take_deliverable_pending(waiter), Some(34));
-        assert_eq!(d.take_deliverable_pending(sender), Some(34));
-        assert_eq!(d.take_deliverable_pending(waiter), None);
+        d.mark_process_signal_pending(&d.exact_signal_context_for_test(), 34);
+        d.mark_process_signal_pending(&d.exact_signal_context_for_test(), 34);
+        assert_eq!(
+            d.take_deliverable_pending(&d.exact_signal_context_for_test(), waiter),
+            Some(34)
+        );
+        assert_eq!(
+            d.take_deliverable_pending(&d.exact_signal_context_for_test(), sender),
+            Some(34)
+        );
+        assert_eq!(
+            d.take_deliverable_pending(&d.exact_signal_context_for_test(), waiter),
+            None
+        );
     }
 
     #[test]
@@ -3377,14 +2936,26 @@ mod tests {
             ..LinuxSigaction::empty()
         };
 
-        d.mark_signal_pending(tid, signum);
-        d.mark_signal_pending(tid, signum);
-        assert_eq!(d.take_deliverable_pending(tid), Some(signum));
-        let saved = d.enter_signal_handler(tid, signum, action);
-        assert_eq!(d.take_deliverable_pending(tid), None);
-        d.restore_signal_mask(tid, saved);
-        assert_eq!(d.take_deliverable_pending(tid), Some(signum));
-        assert_eq!(d.take_deliverable_pending(tid), None);
+        d.mark_signal_pending(&d.exact_signal_context_for_test(), tid, signum);
+        d.mark_signal_pending(&d.exact_signal_context_for_test(), tid, signum);
+        assert_eq!(
+            d.take_deliverable_pending(&d.exact_signal_context_for_test(), tid),
+            Some(signum)
+        );
+        let saved = d.enter_signal_handler(&d.exact_signal_context_for_test(), tid, signum, action);
+        assert_eq!(
+            d.take_deliverable_pending(&d.exact_signal_context_for_test(), tid),
+            None
+        );
+        d.restore_signal_mask(&d.exact_signal_context_for_test(), tid, saved);
+        assert_eq!(
+            d.take_deliverable_pending(&d.exact_signal_context_for_test(), tid),
+            Some(signum)
+        );
+        assert_eq!(
+            d.take_deliverable_pending(&d.exact_signal_context_for_test(), tid),
+            None
+        );
     }
 
     #[test]
@@ -3392,29 +2963,43 @@ mod tests {
         use carrick_abi::WaitSigMask;
 
         let d = SyscallDispatcher::new();
-        let tid = crate::thread::ThreadId::synthetic_for_tests(42);
+        let tid = d.capture_one_task_context().unwrap().thread().registry_id();
         let usr1 = 10;
         let blocked = SigSet::EMPTY.with(usr1);
 
-        d.mark_process_signal_pending(usr1);
+        d.mark_process_signal_pending(&d.exact_signal_context_for_test(), usr1);
 
         // Additive (read/recv, empty extra set): an UNBLOCKED pending signal is
         // deliverable and interrupts the wait.
-        assert!(d.has_deliverable_dispatch_pending_for_wait(tid, WaitSigMask::NONE));
+        assert!(d.has_deliverable_dispatch_pending_for_wait(
+            &d.exact_signal_context_for_test(),
+            tid,
+            WaitSigMask::NONE
+        ));
         // Replace (ppoll/pselect/epoll_pwait): a signal the temp mask BLOCKS does
         // not interrupt.
-        assert!(!d.has_deliverable_dispatch_pending_for_wait(tid, WaitSigMask::Replace(blocked)));
-        d.restore_signal_mask(tid, blocked);
+        assert!(!d.has_deliverable_dispatch_pending_for_wait(
+            &d.exact_signal_context_for_test(),
+            tid,
+            WaitSigMask::Replace(blocked)
+        ));
+        d.restore_signal_mask(&d.exact_signal_context_for_test(), tid, blocked);
         // Additive: a signal blocked by the thread's PERSISTENT mask must NOT
         // interrupt a plain read — this is the `maskfork` invariant.
-        assert!(!d.has_deliverable_dispatch_pending_for_wait(tid, WaitSigMask::NONE));
+        assert!(!d.has_deliverable_dispatch_pending_for_wait(
+            &d.exact_signal_context_for_test(),
+            tid,
+            WaitSigMask::NONE
+        ));
         // Replace: an EMPTY temp mask UNBLOCKS that persistently-blocked pending
         // signal, so it MUST be deliverable — POSIX ppoll/pselect replace
         // semantics. Unioning the persistent mask would wrongly suppress it; this
         // guards the `ppollunblock` regression.
-        assert!(
-            d.has_deliverable_dispatch_pending_for_wait(tid, WaitSigMask::Replace(SigSet::EMPTY))
-        );
+        assert!(d.has_deliverable_dispatch_pending_for_wait(
+            &d.exact_signal_context_for_test(),
+            tid,
+            WaitSigMask::Replace(SigSet::EMPTY)
+        ));
     }
 
     /// Pins the procladder_mt silent-stall root cause: a PROCESS-directed
@@ -3436,6 +3021,18 @@ mod tests {
     /// tests for the identical reason.
     static XSIG_RING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    fn install_kernel_signal_threads(
+        dispatcher: &SyscallDispatcher,
+        registry_ids: &[crate::thread::ThreadId],
+    ) {
+        let parent = dispatcher.capture_one_task_context().unwrap();
+        for registry_id in registry_ids {
+            dispatcher
+                .register_one_task_thread(&parent, *registry_id)
+                .unwrap();
+        }
+    }
+
     #[test]
     fn ring_drain_publishes_process_directed_signal_visible_to_non_drainer() {
         let _g = XSIG_RING_TEST_LOCK
@@ -3445,10 +3042,19 @@ mod tests {
         let main = crate::thread::ThreadId::synthetic_for_tests(6001);
         let sibling = crate::thread::ThreadId::synthetic_for_tests(6002);
         let usr1 = crate::linux_abi::LINUX_SIGUSR1;
+        install_kernel_signal_threads(&d, &[main, sibling]);
         // Probe shape: BOTH threads block SIGUSR1 (main consumes via sigwait,
         // the sibling can never take delivery).
-        d.restore_signal_mask(main, SigSet::EMPTY.with(usr1));
-        d.restore_signal_mask(sibling, SigSet::EMPTY.with(usr1));
+        d.restore_signal_mask(
+            &d.exact_signal_context_for_test(),
+            main,
+            SigSet::EMPTY.with(usr1),
+        );
+        d.restore_signal_mask(
+            &d.exact_signal_context_for_test(),
+            sibling,
+            SigSet::EMPTY.with(usr1),
+        );
 
         carrick_signal_core::xsig::xsig_init();
         assert!(
@@ -3464,23 +3070,24 @@ mod tests {
             "ring slot available"
         );
         // The SIBLING wins the drain race (the hang's interleaving).
-        d.drain_xsignals_process_directed();
+        d.drain_xsignals_process_directed(&d.exact_signal_context_for_test());
 
         // Nothing may be pinned to the drainer…
         assert!(
-            d.take_pending_siginfo(sibling, usr1).is_none(),
+            d.take_pending_siginfo(&d.exact_signal_context_for_test(), sibling, usr1)
+                .is_none(),
             "drain must not pin the payload to the drainer tid"
         );
         // …the MAIN thread's sigwait take must find it in the shared set…
         let set = SigSet::EMPTY.with(usr1);
-        let (signum, from_thread) = d
-            .take_pending_in_from(main, set)
+        let pending = d
+            .take_pending_in_from(&d.exact_signal_context_for_test(), main, set)
             .expect("process-directed signal must be visible to the non-drainer's sigwait");
-        assert_eq!(signum, usr1);
-        assert!(!from_thread, "consumed from the SHARED set");
+        assert_eq!(pending.signum, usr1);
+        assert_eq!(pending.owner, crate::kernel::SignalPendingOwner::Task);
         // …with the sender's identity travelling alongside.
-        let info = d
-            .take_process_pending_siginfo(usr1)
+        let info = pending
+            .siginfo
             .expect("siginfo payload follows the shared set");
         assert_eq!(
             (info.si_addr & 0xffff_ffff) as i32,
@@ -3488,7 +3095,10 @@ mod tests {
             "sender ns-pid survives the drain"
         );
         // Exactly-once: nothing left for a second take.
-        assert_eq!(d.take_pending_in(main, set), None);
+        assert_eq!(
+            d.take_pending_in(&d.exact_signal_context_for_test(), main, set),
+            None
+        );
     }
 
     /// Provenance gate: a per-tid (host-slot-style) delivery of the SAME
@@ -3501,54 +3111,51 @@ mod tests {
         let main = crate::thread::ThreadId::synthetic_for_tests(6003);
         let chld = crate::linux_abi::LINUX_SIGCHLD;
         let set = SigSet::EMPTY.with(chld);
+        install_kernel_signal_threads(&d, &[main]);
 
         // Shared-set instance with payload (the ring-drain shape).
-        d.signal
-            .lock()
-            .process_pending_siginfos
-            .entry(chld)
-            .or_default()
-            .push_back(LinuxSiginfo::kill(
+        d.mark_process_signal_pending_with_info(
+            &d.exact_signal_context_for_test(),
+            chld,
+            Some(LinuxSiginfo::kill(
                 chld,
                 crate::linux_abi::LINUX_SI_USER,
                 7777,
                 0,
-            ));
-        d.mark_process_signal_pending(chld);
+            )),
+        );
 
         // Host-slot-style per-tid fetch (per-tid queue EMPTY): must NOT
         // consume the shared queue (an ungated fallback returned 7777 here,
         // swapping payloads between two same-signum instances).
         assert!(
-            d.take_pending_siginfo(main, chld).is_none(),
+            d.take_pending_siginfo(&d.exact_signal_context_for_test(), main, chld)
+                .is_none(),
             "per-tid siginfo fetch must not consume the process-directed queue"
         );
 
         // With a per-tid instance ALSO queued: the per-thread take pairs with
         // the per-tid payload…
-        d.mark_signal_pending(main, chld);
+        d.mark_signal_pending(&d.exact_signal_context_for_test(), main, chld);
         d.record_pending_siginfo(
+            &d.exact_signal_context_for_test(),
             main,
             chld,
             LinuxSiginfo::kill(chld, crate::linux_abi::LINUX_SI_USER, 1111, 0),
         );
-        let (s1, from_thread1) = d.take_pending_in_from(main, set).unwrap();
-        assert_eq!(
-            (s1, from_thread1),
-            (chld, true),
-            "per-thread instance first"
-        );
-        assert_eq!(
-            (d.take_pending_siginfo(main, chld).unwrap().si_addr & 0xffff_ffff) as i32,
-            1111
-        );
+        let first = d
+            .take_pending_in_from(&d.exact_signal_context_for_test(), main, set)
+            .unwrap();
+        assert_eq!(first.signum, chld);
+        assert_eq!(first.owner, crate::kernel::SignalPendingOwner::Thread);
+        assert_eq!((first.siginfo.unwrap().si_addr & 0xffff_ffff) as i32, 1111);
         // …and the shared instance + payload remain intact for the shared take.
-        let (s2, from_thread2) = d.take_pending_in_from(main, set).unwrap();
-        assert_eq!((s2, from_thread2), (chld, false));
-        assert_eq!(
-            (d.take_process_pending_siginfo(chld).unwrap().si_addr & 0xffff_ffff) as i32,
-            7777
-        );
+        let second = d
+            .take_pending_in_from(&d.exact_signal_context_for_test(), main, set)
+            .unwrap();
+        assert_eq!(second.signum, chld);
+        assert_eq!(second.owner, crate::kernel::SignalPendingOwner::Task);
+        assert_eq!((second.siginfo.unwrap().si_addr & 0xffff_ffff) as i32, 7777);
     }
 
     /// Set up a live registry (main + one sibling) and publish it as the
@@ -3587,13 +3194,22 @@ mod tests {
         let main = crate::thread::ThreadId::synthetic_for_tests(6101);
         let sibling = crate::thread::ThreadId::synthetic_for_tests(6102);
         let usr1 = crate::linux_abi::LINUX_SIGUSR1;
+        install_kernel_signal_threads(&d, &[main, sibling]);
         // Probe shape: BOTH threads block SIGUSR1 (mirrors
         // ring_drain_publishes_process_directed_signal_visible_to_non_drainer),
         // so nothing here is deliverable by the fast "unblocked" path — the
         // resolution must come from the target_ns_tid itself, not a blocked-mask
         // side effect.
-        d.restore_signal_mask(main, SigSet::EMPTY.with(usr1));
-        d.restore_signal_mask(sibling, SigSet::EMPTY.with(usr1));
+        d.restore_signal_mask(
+            &d.exact_signal_context_for_test(),
+            main,
+            SigSet::EMPTY.with(usr1),
+        );
+        d.restore_signal_mask(
+            &d.exact_signal_context_for_test(),
+            sibling,
+            SigSet::EMPTY.with(usr1),
+        );
         install_test_registry(main, sibling);
 
         carrick_signal_core::xsig::xsig_init();
@@ -3611,27 +3227,31 @@ mod tests {
         );
         // The SIBLING wins the drain race (the same interleaving the
         // process-directed pinning test guards against).
-        d.drain_xsignals_process_directed();
+        d.drain_xsignals_process_directed(&d.exact_signal_context_for_test());
 
         // NOT pinned to the drainer.
         assert!(
-            d.take_pending_siginfo(sibling, usr1).is_none(),
+            d.take_pending_siginfo(&d.exact_signal_context_for_test(), sibling, usr1)
+                .is_none(),
             "thread-directed drain must not pin the payload to the drainer tid"
         );
         // NOT process-directed: the shared set must stay untouched.
         assert!(
-            d.take_process_pending_siginfo(usr1).is_none(),
+            !d.exact_signal_context_for_test()
+                .shared()
+                .pending_signals()
+                .may_be_nonempty(),
             "thread-directed drain must not land in the shared process-pending set"
         );
         // Visible to MAIN per-thread, carrying the sender identity + SI_TKILL.
         let set = SigSet::EMPTY.with(usr1);
-        let (signum, from_thread) = d
-            .take_pending_in_from(main, set)
+        let pending = d
+            .take_pending_in_from(&d.exact_signal_context_for_test(), main, set)
             .expect("thread-directed signal must be visible to its named target");
-        assert_eq!(signum, usr1);
-        assert!(from_thread, "consumed from the per-thread set, not shared");
-        let info = d
-            .take_pending_siginfo(main, usr1)
+        assert_eq!(pending.signum, usr1);
+        assert_eq!(pending.owner, crate::kernel::SignalPendingOwner::Thread);
+        let info = pending
+            .siginfo
             .expect("siginfo payload follows the per-thread store");
         assert_eq!(
             (info.si_addr & 0xffff_ffff) as i32,
@@ -3640,7 +3260,10 @@ mod tests {
         );
         assert_eq!({ info.si_code }, crate::linux_abi::LINUX_SI_TKILL);
         // Exactly-once: nothing left for a second take.
-        assert_eq!(d.take_pending_in(main, set), None);
+        assert_eq!(
+            d.take_pending_in(&d.exact_signal_context_for_test(), main, set),
+            None
+        );
     }
 
     /// `target_ns_tid == 0` must keep TODAY's process-directed contract
@@ -3657,8 +3280,17 @@ mod tests {
         let main = crate::thread::ThreadId::synthetic_for_tests(6201);
         let sibling = crate::thread::ThreadId::synthetic_for_tests(6202);
         let usr1 = crate::linux_abi::LINUX_SIGUSR1;
-        d.restore_signal_mask(main, SigSet::EMPTY.with(usr1));
-        d.restore_signal_mask(sibling, SigSet::EMPTY.with(usr1));
+        install_kernel_signal_threads(&d, &[main, sibling]);
+        d.restore_signal_mask(
+            &d.exact_signal_context_for_test(),
+            main,
+            SigSet::EMPTY.with(usr1),
+        );
+        d.restore_signal_mask(
+            &d.exact_signal_context_for_test(),
+            sibling,
+            SigSet::EMPTY.with(usr1),
+        );
 
         carrick_signal_core::xsig::xsig_init();
         assert!(
@@ -3673,27 +3305,31 @@ mod tests {
             ),
             "ring slot available"
         );
-        d.drain_xsignals_process_directed();
+        d.drain_xsignals_process_directed(&d.exact_signal_context_for_test());
 
         assert!(
-            d.take_pending_siginfo(sibling, usr1).is_none(),
+            d.take_pending_siginfo(&d.exact_signal_context_for_test(), sibling, usr1)
+                .is_none(),
             "drain must not pin the payload to the drainer tid"
         );
         let set = SigSet::EMPTY.with(usr1);
-        let (signum, from_thread) = d
-            .take_pending_in_from(main, set)
+        let pending = d
+            .take_pending_in_from(&d.exact_signal_context_for_test(), main, set)
             .expect("process-directed signal must be visible to the non-drainer's sigwait");
-        assert_eq!(signum, usr1);
-        assert!(!from_thread, "consumed from the SHARED set");
-        let info = d
-            .take_process_pending_siginfo(usr1)
+        assert_eq!(pending.signum, usr1);
+        assert_eq!(pending.owner, crate::kernel::SignalPendingOwner::Task);
+        let info = pending
+            .siginfo
             .expect("siginfo payload follows the shared set");
         assert_eq!(
             (info.si_addr & 0xffff_ffff) as i32,
             4242,
             "sender ns-pid survives the drain"
         );
-        assert_eq!(d.take_pending_in(main, set), None);
+        assert_eq!(
+            d.take_pending_in(&d.exact_signal_context_for_test(), main, set),
+            None
+        );
     }
 
     /// A thread-directed ring entry whose `target_ns_tid` matches NO live
@@ -3710,6 +3346,7 @@ mod tests {
         let sibling = crate::thread::ThreadId::synthetic_for_tests(6302);
         let exited = crate::thread::ThreadId::synthetic_for_tests(6399);
         let usr1 = crate::linux_abi::LINUX_SIGUSR1;
+        install_kernel_signal_threads(&d, &[main, sibling]);
         install_test_registry(main, sibling);
 
         carrick_signal_core::xsig::xsig_init();
@@ -3722,59 +3359,92 @@ mod tests {
             0,
             exited.raw(),
         ));
-        d.drain_xsignals_process_directed();
+        d.drain_xsignals_process_directed(&d.exact_signal_context_for_test());
 
         let set = SigSet::EMPTY.with(usr1);
-        assert!(d.take_pending_in(main, set).is_none());
-        assert!(d.take_pending_in(sibling, set).is_none());
-        assert!(d.take_process_pending_siginfo(usr1).is_none());
+        assert!(
+            d.take_pending_in(&d.exact_signal_context_for_test(), main, set)
+                .is_none()
+        );
+        assert!(
+            d.take_pending_in(&d.exact_signal_context_for_test(), sibling, set)
+                .is_none()
+        );
+        assert!(
+            !d.exact_signal_context_for_test()
+                .shared()
+                .pending_signals()
+                .may_be_nonempty()
+        );
     }
 
     #[test]
     fn child_exit_signal_pump_predicate_tracks_observable_dispositions() {
         let d = SyscallDispatcher::new();
-        let tid = crate::thread::ThreadId::synthetic_for_tests(7);
+        let tid = d.capture_one_task_context().unwrap().thread().registry_id();
 
         assert!(
-            !d.child_exit_signal_needs_pump(tid, crate::linux_abi::LINUX_SIGCHLD as u32),
+            !d.child_exit_signal_needs_pump(
+                &d.exact_signal_context_for_test(),
+                tid,
+                crate::linux_abi::LINUX_SIGCHLD as u32
+            ),
             "default unblocked SIGCHLD is inert; wait4 owns the reap path"
         );
         assert!(
-            d.child_exit_signal_needs_pump(tid, crate::linux_abi::LINUX_SIGUSR1 as u32),
+            d.child_exit_signal_needs_pump(
+                &d.exact_signal_context_for_test(),
+                tid,
+                crate::linux_abi::LINUX_SIGUSR1 as u32
+            ),
             "non-ignored default exit signals can terminate the parent"
         );
 
         let chld_set = SigSet::EMPTY.with(crate::linux_abi::LINUX_SIGCHLD);
-        d.signal.lock().masks.insert(tid, chld_set);
+        d.restore_signal_mask(&d.exact_signal_context_for_test(), tid, chld_set);
         assert!(
-            d.child_exit_signal_needs_pump(tid, crate::linux_abi::LINUX_SIGCHLD as u32),
+            d.child_exit_signal_needs_pump(
+                &d.exact_signal_context_for_test(),
+                tid,
+                crate::linux_abi::LINUX_SIGCHLD as u32
+            ),
             "blocked SIGCHLD must become pending for sigwait/sigtimedwait"
         );
 
         let mut ign = LinuxSigaction::empty();
         ign.sa_handler = crate::linux_abi::LINUX_SIG_IGN;
-        d.signal
-            .lock()
-            .handlers
-            .insert(crate::linux_abi::LINUX_SIGCHLD, ign);
+        SyscallDispatcher::install_signal_action(
+            &d.exact_signal_context_for_test(),
+            crate::linux_abi::LINUX_SIGCHLD,
+            ign,
+        );
         assert!(
-            !d.child_exit_signal_needs_pump(tid, crate::linux_abi::LINUX_SIGCHLD as u32),
+            !d.child_exit_signal_needs_pump(
+                &d.exact_signal_context_for_test(),
+                tid,
+                crate::linux_abi::LINUX_SIGCHLD as u32
+            ),
             "explicit SIG_IGN suppresses the async notification even if the mask contains SIGCHLD"
         );
 
         let mut caught = LinuxSigaction::empty();
         caught.sa_handler = 0x4000;
-        d.signal
-            .lock()
-            .handlers
-            .insert(crate::linux_abi::LINUX_SIGCHLD, caught);
+        SyscallDispatcher::install_signal_action(
+            &d.exact_signal_context_for_test(),
+            crate::linux_abi::LINUX_SIGCHLD,
+            caught,
+        );
         assert!(
-            d.child_exit_signal_needs_pump(tid, crate::linux_abi::LINUX_SIGCHLD as u32),
+            d.child_exit_signal_needs_pump(
+                &d.exact_signal_context_for_test(),
+                tid,
+                crate::linux_abi::LINUX_SIGCHLD as u32
+            ),
             "caught SIGCHLD needs the pump so a spinning parent observes the handler"
         );
 
         assert!(
-            !d.child_exit_signal_needs_pump(tid, 0),
+            !d.child_exit_signal_needs_pump(&d.exact_signal_context_for_test(), tid, 0),
             "clone exit_signal 0 requests no signal"
         );
     }
@@ -3782,100 +3452,122 @@ mod tests {
     #[test]
     fn process_child_exit_predicate_follows_surviving_thread_masks() {
         let d = SyscallDispatcher::new();
-        let retired_leader = crate::thread::ThreadId::synthetic_for_tests(8);
-        let survivor = crate::thread::ThreadId::synthetic_for_tests(9);
+        let survivor = d.capture_one_task_context().unwrap().thread().registry_id();
+        let retired_leader = crate::thread::ThreadId::synthetic_for_tests(survivor.raw() + 100);
         let chld = crate::linux_abi::LINUX_SIGCHLD;
-        d.signal
-            .lock()
-            .masks
-            .insert(survivor, SigSet::EMPTY.with(chld));
+        d.restore_signal_mask(
+            &d.exact_signal_context_for_test(),
+            survivor,
+            SigSet::EMPTY.with(chld),
+        );
 
-        assert!(d.child_exit_signal_needs_process_pump(chld as u32));
         assert!(
-            !d.child_exit_signal_needs_pump(retired_leader, chld as u32),
+            d.child_exit_signal_needs_process_pump(&d.exact_signal_context_for_test(), chld as u32)
+        );
+        assert!(
+            !d.child_exit_signal_needs_pump(
+                &d.exact_signal_context_for_test(),
+                retired_leader,
+                chld as u32
+            ),
             "a fixed retired leader would miss the surviving sigwait mask"
         );
 
         let mut ignored = LinuxSigaction::empty();
         ignored.sa_handler = crate::linux_abi::LINUX_SIG_IGN;
-        d.signal.lock().handlers.insert(chld, ignored);
-        assert!(!d.child_exit_signal_needs_process_pump(chld as u32));
+        SyscallDispatcher::install_signal_action(&d.exact_signal_context_for_test(), chld, ignored);
+        assert!(
+            !d.child_exit_signal_needs_process_pump(
+                &d.exact_signal_context_for_test(),
+                chld as u32
+            )
+        );
     }
 
     #[test]
     fn execve_resets_caught_handlers_preserves_sig_ign_and_clears_altstack() {
         let d = SyscallDispatcher::new();
-        let tid = crate::thread::ThreadId::synthetic_for_tests(1);
-        {
-            let mut s = d.signal.lock();
-            // A CAUGHT SIGCHLD handler (a real address) — must reset to default.
-            let mut chld = LinuxSigaction::empty();
-            chld.sa_handler = 0x1000133c0;
-            s.handlers.insert(crate::linux_abi::LINUX_SIGCHLD, chld);
-            // SIG_IGN for SIGUSR1 (10) — must be PRESERVED across execve.
-            let mut ign = LinuxSigaction::empty();
-            ign.sa_handler = crate::linux_abi::LINUX_SIG_IGN;
-            s.handlers.insert(10, ign);
-            // An installed alternate signal stack — execve disestablishes it.
-            s.altstack.insert(
-                tid,
-                LinuxSigaltstack {
-                    ss_sp: 0x4000,
-                    ss_flags: 0,
-                    __pad: 0,
-                    ss_size: 0x2000,
-                },
-            );
-            // Active handler-frame and restore-mask state belongs to the old
-            // user image's signal frame; it must not poison the exec'd image's
-            // first sigaltstack() call.
-            s.handler_frames.insert(tid, vec![true]);
-            s.restore_masks.insert(tid, SigSet::from_raw(0x1234));
-        }
+        let context = d.capture_one_task_context().unwrap();
+        let tid = context.thread().registry_id();
+        // A CAUGHT SIGCHLD handler (a real address) — must reset to default.
+        let mut chld = LinuxSigaction::empty();
+        chld.sa_handler = 0x1000133c0;
+        SyscallDispatcher::install_signal_action(
+            &d.exact_signal_context_for_test(),
+            crate::linux_abi::LINUX_SIGCHLD,
+            chld,
+        );
+        // SIG_IGN for SIGUSR1 (10) — must be PRESERVED across execve.
+        let mut ign = LinuxSigaction::empty();
+        ign.sa_handler = crate::linux_abi::LINUX_SIG_IGN;
+        SyscallDispatcher::install_signal_action(&d.exact_signal_context_for_test(), 10, ign);
+        context.thread().update_signal_state(|state| {
+            state.set_altstack(Some(LinuxSigaltstack {
+                ss_sp: 0x4000,
+                ss_flags: 0,
+                __pad: 0,
+                ss_size: 0x2000,
+            }));
+            state.push_handler_frame(crate::kernel::HandlerFrameState {
+                on_altstack: true,
+                restore_mask: None,
+            });
+            state.arm_restore_mask(Some(SigSet::from_raw(0x1234)));
+        });
         // Pre-execve: the caught handler is live.
         assert!(
-            d.registered_signal_handler(crate::linux_abi::LINUX_SIGCHLD)
-                .is_some()
+            d.registered_signal_handler(
+                &d.exact_signal_context_for_test(),
+                crate::linux_abi::LINUX_SIGCHLD
+            )
+            .is_some()
         );
 
-        d.reset_signal_handlers_on_execve();
+        let prepared = d.prepare_one_task_kernel_exec(&context).unwrap();
+        d.reset_signal_handlers_on_execve(&context);
+        let exec_context = d.commit_one_task_kernel_exec(prepared).unwrap();
 
         // The caught SIGCHLD handler is reset to default (no leak of the old
         // image's handler address — the bug that crashed shell-launched tests).
         assert!(
-            d.registered_signal_handler(crate::linux_abi::LINUX_SIGCHLD)
+            d.registered_signal_handler(&exec_context, crate::linux_abi::LINUX_SIGCHLD)
                 .is_none()
         );
         // SIG_IGN survives execve (Linux semantics).
-        assert!(d.signal_is_ignored(10));
+        assert!(d.signal_is_ignored(&exec_context, 10));
         // The alternate signal stack is cleared.
-        assert!(d.signal_altstack(tid).is_none());
-        let signal = d.signal.lock();
-        assert!(signal.handler_frames.is_empty());
-        assert!(signal.restore_masks.is_empty());
+        assert!(d.signal_altstack(&exec_context, tid).is_none());
+        let thread_state = exec_context.thread().signal_state();
+        assert_eq!(thread_state.handler_frame_depth(), 0);
+        assert_eq!(thread_state.armed_restore_mask(), None);
     }
 
     #[test]
     fn sa_resethand_resets_disposition_to_default_on_handler_entry() {
         let d = SyscallDispatcher::new();
-        let tid = crate::thread::ThreadId::synthetic_for_tests(1);
+        let tid = d.capture_one_task_context().unwrap().thread().registry_id();
 
         // A one-shot (SA_RESETHAND) handler for SIGUSR1 (10).
         let mut oneshot = LinuxSigaction::empty();
         oneshot.sa_handler = 0x4000;
         oneshot.sa_flags =
             crate::linux_abi::LINUX_SA_RESETHAND | crate::linux_abi::LINUX_SA_SIGINFO;
-        d.signal.lock().handlers.insert(10, oneshot);
-        assert!(d.registered_signal_handler(10).is_some());
+        SyscallDispatcher::install_signal_action(&d.exact_signal_context_for_test(), 10, oneshot);
+        assert!(
+            d.registered_signal_handler(&d.exact_signal_context_for_test(), 10)
+                .is_some()
+        );
 
         // Entering the handler resets the disposition to SIG_DFL (Linux's
         // one-shot semantics): a second occurrence takes the default action.
-        d.enter_signal_handler(tid, 10, oneshot);
+        d.enter_signal_handler(&d.exact_signal_context_for_test(), tid, 10, oneshot);
         assert!(
-            d.registered_signal_handler(10).is_none(),
+            d.registered_signal_handler(&d.exact_signal_context_for_test(), 10)
+                .is_none(),
             "SA_RESETHAND handler must reset to SIG_DFL on entry"
         );
-        let reset = d.signal.lock().handlers.get(&10).copied().unwrap();
+        let reset =
+            SyscallDispatcher::signal_action_entry(&d.exact_signal_context_for_test(), 10).unwrap();
         let reset_handler = reset.sa_handler;
         let reset_flags = reset.sa_flags;
         assert_eq!(reset_handler, crate::linux_abi::LINUX_SIG_DFL);
@@ -3888,10 +3580,11 @@ mod tests {
         // Control: a handler WITHOUT SA_RESETHAND persists across entry.
         let mut sticky = LinuxSigaction::empty();
         sticky.sa_handler = 0x5000;
-        d.signal.lock().handlers.insert(11, sticky);
-        d.enter_signal_handler(tid, 11, sticky);
+        SyscallDispatcher::install_signal_action(&d.exact_signal_context_for_test(), 11, sticky);
+        d.enter_signal_handler(&d.exact_signal_context_for_test(), tid, 11, sticky);
         assert!(
-            d.registered_signal_handler(11).is_some(),
+            d.registered_signal_handler(&d.exact_signal_context_for_test(), 11)
+                .is_some(),
             "a non-RESETHAND handler must persist across entry"
         );
     }
@@ -3899,41 +3592,54 @@ mod tests {
     #[test]
     fn thread_directed_pending_action_survives_later_ignore_disposition() {
         let d = SyscallDispatcher::new();
-        let tid = crate::thread::ThreadId::synthetic_for_tests(1);
+        let tid = d.capture_one_task_context().unwrap().thread().registry_id();
         let signum = 34;
 
         let mut caught = LinuxSigaction::empty();
         caught.sa_handler = 0x4000;
         caught.sa_flags = crate::linux_abi::LINUX_SA_RESTORER;
         caught.sa_restorer = 0x5000;
-        d.record_pending_signal_action(tid, signum, caught);
+        d.record_pending_signal_action(&d.exact_signal_context_for_test(), tid, signum, caught);
 
         let mut ignored = LinuxSigaction::empty();
         ignored.sa_handler = crate::linux_abi::LINUX_SIG_IGN;
-        d.signal.lock().handlers.insert(signum, ignored);
-        assert!(d.registered_signal_handler(signum).is_none());
-        assert!(d.signal_is_ignored(signum));
+        SyscallDispatcher::install_signal_action(
+            &d.exact_signal_context_for_test(),
+            signum,
+            ignored,
+        );
+        assert!(
+            d.registered_signal_handler(&d.exact_signal_context_for_test(), signum)
+                .is_none()
+        );
+        assert!(d.signal_is_ignored(&d.exact_signal_context_for_test(), signum));
 
-        let delivered = d.take_pending_signal_action(tid, signum).unwrap();
+        let delivered = d
+            .take_pending_signal_action(&d.exact_signal_context_for_test(), tid, signum)
+            .unwrap();
         let delivered_handler = delivered.sa_handler;
         let delivered_restorer = delivered.sa_restorer;
         let caught_handler = caught.sa_handler;
         let caught_restorer = caught.sa_restorer;
         assert_eq!(delivered_handler, caught_handler);
         assert_eq!(delivered_restorer, caught_restorer);
-        assert!(d.take_pending_signal_action(tid, signum).is_none());
+        assert!(
+            d.take_pending_signal_action(&d.exact_signal_context_for_test(), tid, signum)
+                .is_none()
+        );
     }
 
     #[test]
     fn sibling_thread_signal_snapshots_current_handler_action() {
         let d = SyscallDispatcher::new();
-        let caller = crate::thread::ThreadId::synthetic_for_tests(1000);
+        let kernel = d.capture_one_task_context().unwrap();
+        let caller = kernel.thread().registry_id();
         let registry = crate::thread::ThreadRegistry::new(caller);
         let target = registry.register_child(0);
+        d.register_one_task_thread(&kernel, target).unwrap();
         let futex = crate::thread::FutexTable::new();
         let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
         let reporter = crate::compat::CompatReporter::default();
-        let kernel = d.capture_one_task_context().unwrap();
         let cx = crate::dispatch::SyscallCtx {
             kernel: &kernel,
             request: crate::dispatch::SyscallRequest::new(
@@ -3948,45 +3654,36 @@ mod tests {
                 futex: &futex,
             }),
         };
-
         let mut caught = LinuxSigaction::empty();
         caught.sa_handler = 0x4000;
         caught.sa_flags = crate::linux_abi::LINUX_SA_RESTORER;
         caught.sa_restorer = 0x5000;
-        d.signal.lock().handlers.insert(34, caught);
-
+        SyscallDispatcher::install_signal_action(&d.exact_signal_context_for_test(), 34, caught);
         let routed = d.route_thread_signal(&cx, i64::from(target.raw()), 34, true);
-        assert!(matches!(
-            routed,
-            Some((crate::dispatch::DispatchOutcome::SignalThread { tid, signum }, resolved))
-                if tid == target && signum == 34 && resolved == target
-        ));
-
+        assert!(
+            matches!(routed, Some((crate::dispatch::DispatchOutcome::SignalThread { tid, signum }, resolved)) if tid == target && signum == 34 && resolved == target)
+        );
         let mut ignored = LinuxSigaction::empty();
         ignored.sa_handler = crate::linux_abi::LINUX_SIG_IGN;
-        d.signal.lock().handlers.insert(34, ignored);
-        assert!(d.signal_is_ignored(34));
-
-        let delivered = d.take_pending_signal_action(target, 34).unwrap();
-        let delivered_handler = delivered.sa_handler;
-        let delivered_restorer = delivered.sa_restorer;
-        let caught_handler = caught.sa_handler;
-        let caught_restorer = caught.sa_restorer;
-        assert_eq!(delivered_handler, caught_handler);
-        assert_eq!(delivered_restorer, caught_restorer);
+        SyscallDispatcher::install_signal_action(&d.exact_signal_context_for_test(), 34, ignored);
+        let delivered = d
+            .take_pending_signal_action(&d.exact_signal_context_for_test(), target, 34)
+            .unwrap();
+        assert_eq!(delivered, caught);
     }
 
     #[test]
     fn thread_signal_to_guest_main_tid_routes_to_registry_main_thread() {
         let d = SyscallDispatcher::new();
-        let main = crate::thread::ThreadId::synthetic_for_tests(1000);
+        let kernel = d.capture_one_task_context().unwrap();
+        let main = kernel.thread().registry_id();
         let registry = crate::thread::ThreadRegistry::new(main);
         let caller = registry.register_child(0);
+        d.register_one_task_thread(&kernel, caller).unwrap();
         let futex = crate::thread::FutexTable::new();
         let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
         let reporter = crate::compat::CompatReporter::default();
         let guest_main_tid = i64::from(std::process::id());
-        let kernel = d.capture_one_task_context().unwrap();
         let cx = crate::dispatch::SyscallCtx {
             kernel: &kernel,
             request: crate::dispatch::SyscallRequest::new(
@@ -4001,37 +3698,36 @@ mod tests {
                 futex: &futex,
             }),
         };
-
         let mut caught = LinuxSigaction::empty();
         caught.sa_handler = 0x4000;
         caught.sa_flags = crate::linux_abi::LINUX_SA_RESTORER;
         caught.sa_restorer = 0x5000;
-        d.signal.lock().handlers.insert(34, caught);
-
+        SyscallDispatcher::install_signal_action(&d.exact_signal_context_for_test(), 34, caught);
         let routed = d.route_thread_signal(&cx, guest_main_tid, 34, true);
-        assert!(matches!(
-            routed,
-            Some((crate::dispatch::DispatchOutcome::SignalThread { tid, signum }, resolved))
-                if tid == main && signum == 34 && resolved == main
-        ));
-        assert!(d.take_pending_signal_action(main, 34).is_some());
+        assert!(
+            matches!(routed, Some((crate::dispatch::DispatchOutcome::SignalThread { tid, signum }, resolved)) if tid == main && signum == 34 && resolved == main)
+        );
+        assert!(
+            d.take_pending_signal_action(&d.exact_signal_context_for_test(), main, 34)
+                .is_some()
+        );
     }
 
     #[test]
     fn sigqueueinfo_payload_uses_resolved_guest_main_thread_key() {
         use zerocopy::IntoBytes;
-
         let d = SyscallDispatcher::new();
-        let main = crate::thread::ThreadId::synthetic_for_tests(1000);
+        let kernel = d.capture_one_task_context().unwrap();
+        let main = kernel.thread().registry_id();
         let registry = crate::thread::ThreadRegistry::new(main);
         let caller = registry.register_child(0);
+        d.register_one_task_thread(&kernel, caller).unwrap();
         let futex = crate::thread::FutexTable::new();
         let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
         let reporter = crate::compat::CompatReporter::default();
         let guest_main_tid = i64::from(std::process::id());
         let siginfo = LinuxSiginfo::rt_queue(34, 1234, 0, 0x00ca_fe42);
         memory.write_bytes(0x400, siginfo.as_bytes()).unwrap();
-        let kernel = d.capture_one_task_context().unwrap();
         let cx = crate::dispatch::SyscallCtx {
             kernel: &kernel,
             request: crate::dispatch::SyscallRequest::new(
@@ -4046,7 +3742,6 @@ mod tests {
                 futex: &futex,
             }),
         };
-
         let routed = d.sigqueueinfo_common(
             &cx,
             guest_main_tid,
@@ -4055,193 +3750,192 @@ mod tests {
             GuestPtr(0x400),
             false,
         );
-        assert!(matches!(
-            routed,
-            crate::dispatch::DispatchOutcome::SignalThread { tid, signum }
-                if tid == main && signum == 34
-        ));
         assert!(
-            d.take_pending_siginfo(
-                crate::thread::ThreadId::from_guest_supplied_tid(guest_main_tid as i32),
-                34
-            )
-            .is_none()
+            matches!(routed, crate::dispatch::DispatchOutcome::SignalThread { tid, signum } if tid == main && signum == 34)
         );
-        let queued = d.take_pending_siginfo(main, 34).unwrap();
+        let queued = d
+            .take_pending_siginfo(&d.exact_signal_context_for_test(), main, 34)
+            .unwrap();
         assert_eq!(queued._pad[0..8], siginfo._pad[0..8]);
     }
 
     #[test]
     fn clone_thread_inherits_signal_mask_without_pending_or_altstack() {
         let d = SyscallDispatcher::new();
-        let parent = crate::thread::ThreadId::synthetic_for_tests(1);
-        let child = crate::thread::ThreadId::synthetic_for_tests(2);
+        let parent_context = d.capture_one_task_context().unwrap();
+        let parent = parent_context.thread().registry_id();
+        let child = crate::thread::ThreadId::synthetic_for_tests(parent.raw() + 1);
         let blocked = SigSet::EMPTY.with(10).with(34);
+        d.restore_signal_mask(&d.exact_signal_context_for_test(), parent, blocked);
+        let child_tid = d.register_one_task_thread(&parent_context, child).unwrap();
+        let child_context = d.capture_kernel_context(child_tid).unwrap();
 
-        d.restore_signal_mask(parent, blocked);
-        d.mark_signal_pending(child, 34);
-        d.signal.lock().altstack.insert(
-            child,
-            LinuxSigaltstack {
-                ss_sp: 0x4000,
-                ss_flags: 0,
-                __pad: 0,
-                ss_size: 0x2000,
-            },
+        assert_eq!(
+            d.signal_mask_for(&d.exact_signal_context_for_test(), child),
+            blocked
         );
-
-        d.inherit_thread_signal_mask(parent, child);
-
-        assert_eq!(d.signal_mask_for(child), blocked);
-        assert_eq!(d.take_deliverable_pending(child), None);
-        assert!(d.signal_altstack(child).is_none());
+        assert_eq!(child_context.thread().signal_state().blocked(), blocked);
+        assert_eq!(
+            d.take_deliverable_pending(&d.exact_signal_context_for_test(), child),
+            None
+        );
+        assert!(
+            d.signal_altstack(&d.exact_signal_context_for_test(), child)
+                .is_none()
+        );
     }
 
     #[test]
     fn exec_rekey_preserves_survivor_mask_and_pending_but_retires_siblings() {
         let d = SyscallDispatcher::new();
-        let old = crate::thread::ThreadId::synthetic_for_tests(10);
-        let new = crate::thread::ThreadId::synthetic_for_tests(1);
-        let sibling = crate::thread::ThreadId::synthetic_for_tests(11);
+        let context = d.capture_one_task_context().unwrap();
+        let old = context.thread().registry_id();
+        let new = old;
         let blocked = SigSet::EMPTY.with(10).with(34);
-        d.restore_signal_mask(old, blocked);
-        d.restore_signal_mask(sibling, SigSet::EMPTY.with(12));
-        d.mark_signal_pending(old, 10);
-        d.mark_signal_pending(old, 34);
-        d.mark_signal_pending(old, 34);
-        {
-            let mut signal = d.signal.lock();
-            signal.altstack.insert(
-                old,
-                LinuxSigaltstack {
+        d.restore_signal_mask(&d.exact_signal_context_for_test(), old, blocked);
+        d.mark_signal_pending(&d.exact_signal_context_for_test(), old, 10);
+        d.mark_signal_pending(&d.exact_signal_context_for_test(), old, 34);
+        d.mark_signal_pending(&d.exact_signal_context_for_test(), old, 34);
+        SyscallDispatcher::required_signal_thread(&d.exact_signal_context_for_test(), old)
+            .update_signal_state(|state| {
+                state.set_altstack(Some(LinuxSigaltstack {
                     ss_sp: 0x4000,
                     ss_flags: 0,
                     __pad: 0,
                     ss_size: 0x2000,
-                },
-            );
-            signal.restore_masks.insert(old, SigSet::EMPTY.with(2));
-        }
+                }));
+                state.arm_restore_mask(Some(SigSet::EMPTY.with(2)));
+            });
 
-        d.rekey_thread_signal_state_after_exec(old, new);
-
-        let signal = d.signal.lock();
-        assert_eq!(signal.mask_for(new), blocked);
-        let pending = signal.pendings.get(&new).copied().unwrap_or(SigSet::EMPTY);
-        assert!(pending.contains(10));
-        assert!(pending.contains(34));
-        assert_eq!(signal.rt_pending_counts.get(&(new, 34)), Some(&2));
-        assert!(!signal.masks.contains_key(&old));
-        assert!(!signal.masks.contains_key(&sibling));
-        assert!(signal.altstack.is_empty());
-        assert!(signal.handler_frames.is_empty());
-        assert!(signal.restore_masks.is_empty());
+        assert_eq!(
+            d.signal_mask_for(&d.exact_signal_context_for_test(), new),
+            blocked
+        );
+        let state = context.thread().signal_state();
+        assert!(state.pending().contains(10));
+        assert!(state.pending().contains(34));
+        assert_eq!(state.pending_count(), 3);
+        let state = context.thread().signal_state();
+        assert_eq!(state.blocked(), blocked);
+        assert!(state.altstack_enabled());
     }
 
     #[test]
     fn sigaltstack_reports_ss_onstack_and_rejects_reconfigure_while_on_stack() {
         let d = SyscallDispatcher::new();
-        let tid = crate::thread::ThreadId::synthetic_for_tests(1);
+        let tid = d.capture_one_task_context().unwrap().thread().registry_id();
 
         // Configure an alt stack for the thread.
-        d.signal.lock().altstack.insert(
-            tid,
-            LinuxSigaltstack {
-                ss_sp: 0x4000,
-                ss_flags: 0,
-                __pad: 0,
-                ss_size: 0x4000,
-            },
-        );
+        SyscallDispatcher::required_signal_thread(&d.exact_signal_context_for_test(), tid)
+            .update_signal_state(|state| {
+                state.set_altstack(Some(LinuxSigaltstack {
+                    ss_sp: 0x4000,
+                    ss_flags: 0,
+                    __pad: 0,
+                    ss_size: 0x4000,
+                }));
+            });
         // Not in a handler yet → not on the alt stack.
-        assert!(!d.is_on_altstack(tid, None));
+        assert!(!d.is_on_altstack(&d.exact_signal_context_for_test(), tid, None));
 
         // Enter an SA_ONSTACK handler → now executing on the alt stack.
         let mut on = LinuxSigaction::empty();
         on.sa_handler = 0x9000;
         on.sa_flags = crate::linux_abi::LINUX_SA_ONSTACK;
-        d.enter_signal_handler(tid, 10, on);
+        d.enter_signal_handler(&d.exact_signal_context_for_test(), tid, 10, on);
         assert!(
-            d.is_on_altstack(tid, None),
+            d.is_on_altstack(&d.exact_signal_context_for_test(), tid, None),
             "SA_ONSTACK handler marks the thread on-stack"
         );
 
         // rt_sigreturn pops the frame → back off the alt stack.
-        d.pop_handler_frame(tid);
-        assert!(!d.is_on_altstack(tid, None));
+        d.pop_handler_frame(&d.exact_signal_context_for_test(), tid);
+        assert!(!d.is_on_altstack(&d.exact_signal_context_for_test(), tid, None));
 
         // A handler WITHOUT SA_ONSTACK does not mark the thread on-stack.
         let mut off = LinuxSigaction::empty();
         off.sa_handler = 0x9000;
-        d.enter_signal_handler(tid, 11, off);
+        d.enter_signal_handler(&d.exact_signal_context_for_test(), tid, 11, off);
         assert!(
-            !d.is_on_altstack(tid, None),
+            !d.is_on_altstack(&d.exact_signal_context_for_test(), tid, None),
             "a non-SA_ONSTACK handler is not on the alt stack"
         );
-        d.pop_handler_frame(tid);
+        d.pop_handler_frame(&d.exact_signal_context_for_test(), tid);
     }
 
     #[test]
     fn fork_child_rekeys_active_handler_frames_for_ss_onstack() {
-        let d = SyscallDispatcher::new();
-        let old = crate::thread::ThreadId::synthetic_for_tests(1);
-        let new = crate::thread::ThreadId::synthetic_for_tests(2);
-
-        d.signal.lock().altstack.insert(
-            old,
-            LinuxSigaltstack {
-                ss_sp: 0x4000,
-                ss_flags: 0,
-                __pad: 0,
-                ss_size: 0x4000,
-            },
-        );
+        let parent = SyscallDispatcher::new();
+        let parent_context = parent.capture_one_task_context().unwrap();
+        let old = parent_context.thread().registry_id();
+        let new = crate::thread::ThreadId::synthetic_for_tests(old.raw() + 1);
+        SyscallDispatcher::required_signal_thread(&parent.exact_signal_context_for_test(), old)
+            .update_signal_state(|state| {
+                state.set_altstack(Some(LinuxSigaltstack {
+                    ss_sp: 0x4000,
+                    ss_flags: 0,
+                    __pad: 0,
+                    ss_size: 0x4000,
+                }));
+            });
         let mut on = LinuxSigaction::empty();
         on.sa_handler = 0x9000;
         on.sa_flags = crate::linux_abi::LINUX_SA_ONSTACK;
-        d.enter_signal_handler(old, 10, on);
+        parent.enter_signal_handler(&parent.exact_signal_context_for_test(), old, 10, on);
 
-        d.migrate_thread_signal_state(old, new);
+        let plan =
+            crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty()).unwrap();
+        let child_context = parent_context
+            .kernel()
+            .reserve_fork(&parent_context, plan, "signal-fork-test".to_owned(), None)
+            .unwrap()
+            .prepare_reference(new)
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_parts()
+            .unwrap()
+            .0;
+        let child = parent.fork_clone_in_process(old, new, old.raw() as u32, new.raw() as u32);
 
-        assert!(
-            !d.is_on_altstack(old, None),
-            "the parent tid must not retain fork-child handler bookkeeping"
-        );
-        assert!(
-            d.is_on_altstack(new, None),
-            "the child tid must keep SS_ONSTACK state for an active handler"
-        );
-
-        d.pop_handler_frame(new);
-        assert!(!d.is_on_altstack(new, None));
+        assert!(parent.is_on_altstack(&parent.exact_signal_context_for_test(), old, None));
+        assert!(child.is_on_altstack(&child_context, new, None));
+        child.pop_handler_frame(&child_context, new);
+        assert!(!child.is_on_altstack(&child_context, new, None));
     }
 
     #[test]
     fn siglongjmp_stale_altstack_frame_is_reconciled_from_guest_sp() {
         let d = SyscallDispatcher::new();
-        let tid = crate::thread::ThreadId::synthetic_for_tests(1);
+        let tid = d.capture_one_task_context().unwrap().thread().registry_id();
 
-        d.signal.lock().altstack.insert(
-            tid,
-            LinuxSigaltstack {
-                ss_sp: 0x4000,
-                ss_flags: 0,
-                __pad: 0,
-                ss_size: 0x4000,
-            },
-        );
-        d.signal.lock().handler_frames.insert(tid, vec![true]);
+        SyscallDispatcher::required_signal_thread(&d.exact_signal_context_for_test(), tid)
+            .update_signal_state(|state| {
+                state.set_altstack(Some(LinuxSigaltstack {
+                    ss_sp: 0x4000,
+                    ss_flags: 0,
+                    __pad: 0,
+                    ss_size: 0x4000,
+                }));
+                state.push_handler_frame(crate::kernel::HandlerFrameState {
+                    on_altstack: true,
+                    restore_mask: None,
+                });
+            });
 
         assert!(
-            d.is_on_altstack(tid, Some(0x7000)),
+            d.is_on_altstack(&d.exact_signal_context_for_test(), tid, Some(0x7000)),
             "live SP inside altstack keeps SS_ONSTACK state"
         );
         assert!(
-            !d.is_on_altstack(tid, Some(0x9000)),
+            !d.is_on_altstack(&d.exact_signal_context_for_test(), tid, Some(0x9000)),
             "SP outside altstack means siglongjmp escaped the handler frame"
         );
-        assert!(
-            !d.signal.lock().handler_frames.contains_key(&tid),
+        assert_eq!(
+            SyscallDispatcher::required_signal_thread(&d.exact_signal_context_for_test(), tid)
+                .signal_state()
+                .handler_frame_depth(),
+            0,
             "stale handler-frame bookkeeping should be cleared"
         );
     }
@@ -4249,35 +3943,52 @@ mod tests {
     #[test]
     fn rt_sigsuspend_keeps_temp_mask_only_when_a_caught_handler_will_run() {
         let d = SyscallDispatcher::new();
-        let tid = crate::thread::ThreadId::synthetic_for_tests(1);
+        let tid = d.capture_one_task_context().unwrap().thread().registry_id();
         let unblock_all = SigSet::EMPTY;
 
         // Spurious / timeout wake: nothing pending → DON'T keep the temp mask
         // (rt_sigsuspend must restore the saved mask, not strand the thread).
-        assert!(!d.sigsuspend_caught_handler_deliverable(tid, unblock_all));
+        assert!(!d.sigsuspend_caught_handler_deliverable(
+            &d.exact_signal_context_for_test(),
+            tid,
+            unblock_all
+        ));
 
         // A deliverable signal with NO caught handler (default disposition):
         // no handler runs, so still restore.
-        d.mark_signal_pending(tid, 10);
-        assert!(!d.sigsuspend_caught_handler_deliverable(tid, unblock_all));
+        d.mark_signal_pending(&d.exact_signal_context_for_test(), tid, 10);
+        assert!(!d.sigsuspend_caught_handler_deliverable(
+            &d.exact_signal_context_for_test(),
+            tid,
+            unblock_all
+        ));
 
         // Install a caught handler for SIGUSR1 (10): now a handler WILL run, so
         // the temp mask is kept and the post-handler restore is armed.
         let mut h = LinuxSigaction::empty();
         h.sa_handler = 0x4000;
-        d.signal.lock().handlers.insert(10, h);
-        assert!(d.sigsuspend_caught_handler_deliverable(tid, unblock_all));
+        SyscallDispatcher::install_signal_action(&d.exact_signal_context_for_test(), 10, h);
+        assert!(d.sigsuspend_caught_handler_deliverable(
+            &d.exact_signal_context_for_test(),
+            tid,
+            unblock_all
+        ));
 
         // The same signal BLOCKED by suspend_mask is not deliverable → restore.
         let block_10 = SigSet::EMPTY.with(10);
-        assert!(!d.sigsuspend_caught_handler_deliverable(tid, block_10));
+        assert!(!d.sigsuspend_caught_handler_deliverable(
+            &d.exact_signal_context_for_test(),
+            tid,
+            block_10
+        ));
     }
 
     #[test]
     fn rt_sigsuspend_releases_dispatch_before_waiting() {
         const MASK_PTR: u64 = 0x1000;
         let d = SyscallDispatcher::new();
-        let tid = crate::thread::ThreadId::synthetic_for_tests(1000);
+        let context = d.capture_one_task_context().unwrap();
+        let tid = context.thread().registry_id();
         let registry = crate::thread::ThreadRegistry::new(tid);
         let futex = crate::thread::FutexTable::new();
         let reporter = crate::compat::CompatReporter::default();
@@ -4286,12 +3997,12 @@ mod tests {
             .write_bytes(MASK_PTR, &SigSet::EMPTY.raw().to_le_bytes())
             .expect("write suspend mask");
         let original = SigSet::EMPTY.with(crate::linux_abi::LINUX_SIGUSR1);
-        d.restore_signal_mask(tid, original);
+        d.restore_signal_mask(&d.exact_signal_context_for_test(), tid, original);
 
         let started = Instant::now();
         let outcome = d
             .dispatch_threaded(
-                &d.capture_one_task_context().unwrap(),
+                &context,
                 SyscallRequest::new(
                     133,
                     SyscallArgs::from([MASK_PTR, LINUX_RT_SIGSET_SIZE, 0, 0, 0, 0]),
@@ -4317,7 +4028,13 @@ mod tests {
             } if wait_set == SigSet::EMPTY.complement()
                 && block_mask == SigBlockMask::blocking_all_of(SigSet::EMPTY)
         ));
-        assert_eq!(d.signal_mask_for(tid), SigSet::EMPTY);
-        assert_eq!(d.signal.lock().restore_masks.get(&tid), Some(&original));
+        assert_eq!(
+            d.signal_mask_for(&d.exact_signal_context_for_test(), tid),
+            SigSet::EMPTY
+        );
+        assert_eq!(
+            context.thread().signal_state().armed_restore_mask(),
+            Some(original)
+        );
     }
 }

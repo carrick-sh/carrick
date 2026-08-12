@@ -430,6 +430,13 @@ impl SyscallDispatcher {
         let Some(open_file) = self.open_file(fd) else {
             return false;
         };
+        if open_file
+            .description
+            .concrete_backing::<crate::dispatch::ioring::IoUringBacking>()
+            .is_some()
+        {
+            return true;
+        }
         let open = open_file.description.read();
         match &*open {
             OpenDescription::File { .. }
@@ -565,6 +572,7 @@ impl SyscallDispatcher {
         interest: &HashMap<i32, EpollInterest>,
         host_fd: HostFd,
         reason: u32,
+        excluded_survivor_fd: Option<i32>,
     ) {
         let mut survivor: Option<(i32, u32)> = None;
         let mut union_events = 0u32;
@@ -574,7 +582,9 @@ impl SyscallDispatcher {
             if self.host_fd_for_poll(other) != Some(host_fd) {
                 continue;
             }
-            survivor.get_or_insert((other, slot.reg_gen));
+            if Some(other) != excluded_survivor_fd {
+                survivor.get_or_insert((other, slot.reg_gen));
+            }
             union_events |= slot.event.events;
             let effective = self.epoll_effective_interest(
                 other,
@@ -628,6 +638,12 @@ impl SyscallDispatcher {
         let Some(open_file) = self.open_file(fd) else {
             return 0;
         };
+        if let Some(ring) = open_file
+            .description
+            .concrete_backing::<crate::dispatch::ioring::IoUringBacking>()
+        {
+            return ring.ready_events(requested_events);
+        }
         let open = open_file.description.read();
         match &*open {
             OpenDescription::EventFd { state, .. }
@@ -885,7 +901,12 @@ impl SyscallDispatcher {
         // Snapshot the registered epoll fds and DROP the set lock before
         // touching any description lock (epoll_ctl registers while holding no
         // description lock either, keeping the order acyclic).
-        let epfds: Vec<i32> = self.io.epoll_fds.read().iter().copied().collect();
+        let epfds: Vec<i32> = self
+            .captured_file_table()
+            .read_epoll_fds()
+            .iter()
+            .copied()
+            .collect();
         for epfd in epfds {
             let stale = match self.open_file(epfd) {
                 None => true,
@@ -1013,6 +1034,7 @@ impl SyscallDispatcher {
                                     interest,
                                     HostFd(host_fd),
                                     EPOLL_REBIND_REASON_IO_REARM,
+                                    None,
                                 );
                             }
                         }
@@ -1031,7 +1053,7 @@ impl SyscallDispatcher {
             };
             // Lazy prune: the fd was closed or recycled as a non-epoll.
             if stale {
-                self.io.epoll_fds.write().remove(&epfd);
+                self.captured_file_table().write_epoll_fds().remove(&epfd);
             }
         }
     }
@@ -1148,34 +1170,58 @@ impl SyscallDispatcher {
     /// keeps the host fd alive within the SAME epoll is the rarer
     /// `EPOLL_CTL_DEL`-covered survivor-rebind case. MUST be called with NO
     /// `open_files` lock held — it takes a read lock to snapshot the instances.
+    fn detach_description_from_all_epolls(
+        &self,
+        target: &Arc<crate::kernel::FileDescription>,
+        detached_host_fd: Option<HostFd>,
+    ) {
+        for (owner, registration_fd) in target.take_epoll_owners() {
+            let mut guard = owner.write();
+            let OpenDescription::Epoll {
+                interest,
+                pending_ready,
+                kqueue,
+                ..
+            } = &mut *guard
+            else {
+                continue;
+            };
+            let registered_target = interest
+                .get(&registration_fd)
+                .and_then(|slot| slot.target.as_ref());
+            if !registered_target.is_some_and(|registered| Arc::ptr_eq(registered, target)) {
+                continue;
+            }
+            interest.remove(&registration_fd);
+            clear_pending_epoll_ready(pending_ready, registration_fd);
+            if let Some(host_fd) = detached_host_fd {
+                kqueue.with_mux(|mux| {
+                    let _ = mux.deregister(host_fd.get());
+                });
+            }
+            kqueue.wake_parked();
+        }
+    }
+
     pub(in crate::dispatch) fn detach_fd_from_epolls(&self, fd: i32) {
         let detached_host_fd = self.host_fd_for_poll(fd);
         let (detached_description, descriptions, should_auto_detach) = {
-            let table = self.io.open_files.read();
+            let files = self.captured_file_table();
+            let table = files.read_open_files();
             let detached_description = table.get(&fd).map(|file| file.description.clone());
-            let (local_aliases, logical_refs) = detached_description
+            let logical_refs = detached_description
                 .as_ref()
-                .map(|target| {
-                    let local_aliases = table
-                        .values()
-                        .filter(|file| Arc::ptr_eq(&file.description, target))
-                        .count();
-                    let logical_refs = target.read().fd_ref_count();
-                    (local_aliases, logical_refs)
-                })
-                .unwrap_or((1, 1));
-            let descriptions: Vec<OpenDescriptionRef> =
+                .map_or(1, |target| target.read().fd_ref_count());
+            let descriptions: Vec<Arc<crate::kernel::FileDescription>> =
                 table.values().map(|of| of.description.clone()).collect();
-            // A lone local fd with additional logical owners means forked
-            // process tables still hold this SAME description. Closing one
-            // process's inherited numeric slot must not remove the shared
-            // registration. A same-process dup, however, has another local
-            // alias and must preserve Carrick's established close/rebind
-            // behavior for separately-added dup registrations.
-            let should_auto_detach = logical_refs == 1 || local_aliases > 1;
+            // Linux retains every registration for an open description until
+            // its final fd slot closes, including registrations installed
+            // through a dup alias whose numeric slot closed earlier.
+            let should_auto_detach = logical_refs == 1;
             (detached_description, descriptions, should_auto_detach)
         };
-        if !should_auto_detach {
+        if should_auto_detach && let Some(target) = &detached_description {
+            self.detach_description_from_all_epolls(target, detached_host_fd);
             return;
         }
         for description in descriptions {
@@ -1186,16 +1232,27 @@ impl SyscallDispatcher {
                 kqueue,
                 ..
             } = &mut *guard
-                && interest.get(&fd).is_some_and(|slot| {
-                    match (&slot.target, &detached_description) {
-                        (Some(registered), Some(closing)) => Arc::ptr_eq(registered, closing),
-                        (None, None) => true,
-                        _ => false,
-                    }
-                })
             {
-                interest.remove(&fd);
-                clear_pending_epoll_ready(pending_ready, fd);
+                let matching_fds = interest
+                    .iter()
+                    .filter_map(|(registered_fd, slot)| {
+                        let matches = match (&slot.target, &detached_description) {
+                            (Some(registered), Some(closing)) => Arc::ptr_eq(registered, closing),
+                            (None, None) => *registered_fd == fd,
+                            _ => false,
+                        };
+                        matches.then_some(*registered_fd)
+                    })
+                    .collect::<Vec<_>>();
+                if matching_fds.is_empty() {
+                    continue;
+                }
+                if should_auto_detach {
+                    for registered_fd in matching_fds {
+                        interest.remove(&registered_fd);
+                        clear_pending_epoll_ready(pending_ready, registered_fd);
+                    }
+                }
                 if let Some(host_fd) = detached_host_fd {
                     #[cfg(any(
                         feature = "platform-macos",
@@ -1207,6 +1264,7 @@ impl SyscallDispatcher {
                         interest,
                         host_fd,
                         EPOLL_REBIND_REASON_CLOSE_DETACH,
+                        Some(fd),
                     );
                     #[cfg(not(any(
                         feature = "platform-macos",
@@ -1217,7 +1275,7 @@ impl SyscallDispatcher {
                         let mut survivor: Option<(i32, u32)> = None;
                         let mut union_events: u32 = 0;
                         for (&other, slot) in interest.iter() {
-                            if self.host_fd_for_poll(other) == Some(host_fd) {
+                            if other != fd && self.host_fd_for_poll(other) == Some(host_fd) {
                                 survivor.get_or_insert((other, slot.reg_gen));
                                 union_events |= slot.event.events;
                             }
@@ -1367,9 +1425,16 @@ impl SyscallDispatcher {
                 LINUX_POLLNVAL
             };
         };
+        if let Some(ring) = open_file
+            .description
+            .concrete_backing::<crate::dispatch::ioring::IoUringBacking>()
+        {
+            return ring.ready_events(requested_events as u32) as i16;
+        }
         let open = open_file.description.read();
         let mut ready = 0;
         match &*open {
+            OpenDescription::Closed { .. } => ready |= LINUX_POLLNVAL,
             OpenDescription::File { .. } | OpenDescription::SyntheticFile { .. } => {
                 if requested_events & LINUX_POLLIN != 0 {
                     ready |= LINUX_POLLIN;
@@ -1672,7 +1737,7 @@ impl SyscallDispatcher {
         }
         let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
-        let open_file = OpenFile::new(
+        let open_file = OpenFile::from_open_description(
             Arc::new(RwLock::new(OpenDescription::HostSocket {
                 host_fd: HostFdRef::new(host_fd),
                 family,
@@ -1795,7 +1860,8 @@ impl SyscallDispatcher {
         // On an install failure (EMFILE) the dropped OpenFile's description —
         // the fd's ONE owner — closes the received host fd; the caller must
         // not close it again.
-        let open_file = OpenFile::new(Arc::new(RwLock::new(description)), fd_flags);
+        let open_file =
+            OpenFile::from_open_description(Arc::new(RwLock::new(description)), fd_flags);
         self.install_fd_at_or_above(3, open_file).ok()
     }
 
@@ -2408,7 +2474,7 @@ impl SyscallDispatcher {
         }
         let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
-        let open_file = OpenFile::new(
+        let open_file = OpenFile::from_open_description(
             Arc::new(RwLock::new(OpenDescription::HostSocket {
                 host_fd: HostFdRef::new(new_host),
                 family,
@@ -3589,6 +3655,7 @@ impl SyscallDispatcher {
                                 interest,
                                 HostFd(host_fd),
                                 EPOLL_REBIND_REASON_WAIT_SAMPLE,
+                                None,
                             );
                         }
                     }
@@ -3748,7 +3815,10 @@ impl SyscallDispatcher {
                     Err(_) => return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EMFILE)),
                 };
                 let _ = mux.register_user(0);
-                crate::dispatch::EpollKqueue::new(mux, this.io.epoll_wake_registry.clone())
+                crate::dispatch::EpollKqueue::new(
+                    mux,
+                    Arc::clone(this.captured_file_table().epoll_wake_registry()),
+                )
             };
             let description = OpenDescription::Epoll {
                 interest: HashMap::new(),
@@ -3774,7 +3844,10 @@ impl SyscallDispatcher {
                     Err(_) => return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EMFILE)),
                 };
                 let _ = mux.register_user(0);
-                crate::dispatch::EpollKqueue::new(mux, this.io.epoll_wake_registry.clone())
+                crate::dispatch::EpollKqueue::new(
+                    mux,
+                    Arc::clone(this.captured_file_table().epoll_wake_registry()),
+                )
             };
             let description = OpenDescription::Epoll {
                 interest: HashMap::new(),
@@ -3809,6 +3882,7 @@ impl SyscallDispatcher {
                     LINUX_EBADF
                 }));
             };
+            let epoll_description = Arc::clone(&open_file.description);
             // The host fd backing this target (sockets/pipes/ptys); `None` for an
             // in-memory eventfd/pipe/timerfd, whose readiness is recomputed each
             // `epoll_wait` rather than registered on the kqueue. Computed before
@@ -3822,7 +3896,7 @@ impl SyscallDispatcher {
             // locks descriptions — registering here keeps the lock order
             // acyclic). A non-epoll epfd inserted on the error path below is
             // harmless: the re-arm prunes it lazily.
-            this.io.epoll_fds.write().insert(epfd);
+            this.captured_file_table().write_epoll_fds().insert(epfd);
 
             let mut open = open_file.description.write();
             let OpenDescription::Epoll {
@@ -3883,6 +3957,9 @@ impl SyscallDispatcher {
                             host_fd.get(),
                             ev_events as i32,
                         );
+                    }
+                    if let Some(target) = &target_description {
+                        target.register_epoll_owner(&epoll_description, fd);
                     }
                     interest.insert(
                         fd,
@@ -3948,8 +4025,11 @@ impl SyscallDispatcher {
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 LINUX_EPOLL_CTL_DEL => {
-                    if interest.remove(&fd).is_none() {
+                    let Some(removed) = interest.remove(&fd) else {
                         return Ok(DispatchOutcome::errno(LINUX_ENOENT));
+                    };
+                    if let Some(target) = removed.target {
+                        target.unregister_epoll_owner(&epoll_description, fd);
                     }
                     if let Some(host_fd) = host_fd {
                         // Other guest fds in THIS epoll instance can be dups of the
@@ -3982,6 +4062,7 @@ impl SyscallDispatcher {
                             interest,
                             host_fd,
                             EPOLL_REBIND_REASON_CTL_DEL,
+                            None,
                         );
                         #[cfg(not(any(
                             feature = "platform-macos",
@@ -4874,7 +4955,7 @@ impl SyscallDispatcher {
             set_host_nonblocking(host_fds[1]);
             let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };
             let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
-            let first = OpenFile::new(
+            let first = OpenFile::from_open_description(
                 Arc::new(RwLock::new(OpenDescription::HostSocket {
                     host_fd: HostFdRef::new(host_fds[0]),
                     family,
@@ -4886,7 +4967,7 @@ impl SyscallDispatcher {
                 })),
                 fd_flags,
             );
-            let second = OpenFile::new(
+            let second = OpenFile::from_open_description(
                 Arc::new(RwLock::new(OpenDescription::HostSocket {
                     host_fd: HostFdRef::new(host_fds[1]),
                     family,
@@ -4907,7 +4988,8 @@ impl SyscallDispatcher {
             let pair = LinuxFdPair { read_fd, write_fd };
             if write_kernel_struct_raw(memory, sv_addr, &pair).is_err() {
                 let removed = {
-                    let mut table = this.io.open_files.write();
+                    let files = this.captured_file_table();
+                    let mut table = files.write_open_files();
                     [table.remove(&read_fd), table.remove(&write_fd)]
                 };
                 for open_file in removed.into_iter().flatten() {

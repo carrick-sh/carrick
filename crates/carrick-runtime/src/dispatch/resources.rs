@@ -11,6 +11,8 @@ use std::sync::Arc;
 pub(super) struct CapturedResources {
     credentials: Arc<crate::kernel::Credentials>,
     fs_context: Arc<crate::kernel::FsContext>,
+    files: Arc<crate::kernel::FileTable>,
+    mm: Arc<crate::kernel::Mm>,
 }
 
 impl CapturedResources {
@@ -18,6 +20,8 @@ impl CapturedResources {
         Self {
             credentials: context.resources().credentials(),
             fs_context: context.resources().fs_context(),
+            files: context.resources().files(),
+            mm: context.shared().mm(),
         }
     }
 
@@ -28,10 +32,20 @@ impl CapturedResources {
     pub(super) fn fs_context(&self) -> Arc<crate::kernel::FsContext> {
         Arc::clone(&self.fs_context)
     }
+
+    pub(super) fn files(&self) -> Arc<crate::kernel::FileTable> {
+        Arc::clone(&self.files)
+    }
+
+    pub(super) fn mm(&self) -> Arc<crate::kernel::Mm> {
+        Arc::clone(&self.mm)
+    }
 }
 
 thread_local! {
     static CAPTURED_RESOURCES: RefCell<Vec<CapturedResources>> =
+        const { RefCell::new(Vec::new()) };
+    static RETIRING_FILE_TABLES: RefCell<Vec<Arc<crate::kernel::FileTable>>> =
         const { RefCell::new(Vec::new()) };
 }
 
@@ -43,6 +57,16 @@ pub(super) fn with_captured_resources<R>(
 }
 
 pub(super) fn with_resources<R>(resources: CapturedResources, operation: impl FnOnce() -> R) -> R {
+    let _file_table_lease = resources
+        .files
+        .acquire_functional_lease()
+        .unwrap_or_else(|| {
+            tracing::error!(
+                file_table = ?resources.files.id(),
+                "captured operation reached a draining FileTable generation"
+            );
+            std::process::abort();
+        });
     struct Pop;
 
     impl Drop for Pop {
@@ -58,10 +82,41 @@ pub(super) fn with_resources<R>(resources: CapturedResources, operation: impl Fn
     operation()
 }
 
+pub(super) fn with_retiring_file_table<R>(
+    files: Arc<crate::kernel::FileTable>,
+    operation: impl FnOnce() -> R,
+) -> R {
+    struct Pop;
+
+    impl Drop for Pop {
+        fn drop(&mut self) {
+            RETIRING_FILE_TABLES.with(|stack| {
+                stack.borrow_mut().pop();
+            });
+        }
+    }
+
+    RETIRING_FILE_TABLES.with(|stack| stack.borrow_mut().push(files));
+    let _pop = Pop;
+    operation()
+}
+
 pub(super) fn credentials() -> Option<Arc<crate::kernel::Credentials>> {
     CAPTURED_RESOURCES.with(|stack| stack.borrow().last().map(CapturedResources::credentials))
 }
 
 pub(super) fn fs_context() -> Option<Arc<crate::kernel::FsContext>> {
     CAPTURED_RESOURCES.with(|stack| stack.borrow().last().map(CapturedResources::fs_context))
+}
+
+pub(super) fn files() -> Option<Arc<crate::kernel::FileTable>> {
+    RETIRING_FILE_TABLES
+        .with(|stack| stack.borrow().last().cloned())
+        .or_else(|| {
+            CAPTURED_RESOURCES.with(|stack| stack.borrow().last().map(CapturedResources::files))
+        })
+}
+
+pub(super) fn mm() -> Option<Arc<crate::kernel::Mm>> {
+    CAPTURED_RESOURCES.with(|stack| stack.borrow().last().map(CapturedResources::mm))
 }
