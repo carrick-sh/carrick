@@ -35,6 +35,9 @@ pub(super) enum AuthorityBacking {
         counter: u64,
         semaphore: bool,
     },
+    SignalFd {
+        mask: carrick_abi::SigSet,
+    },
     Timer {
         interval_ns: u64,
         initial_ns: u64,
@@ -72,6 +75,7 @@ impl AuthorityBacking {
                 counter: *counter,
                 semaphore: *semaphore,
             },
+            Self::SignalFd { mask } => DescriptionBackingSnapshot::SignalFd { mask: *mask },
             Self::Timer {
                 interval_ns,
                 initial_ns,
@@ -97,6 +101,7 @@ impl AuthorityBacking {
             | Self::Epoll(_)
             | Self::EventCounter { .. }
             | Self::Timer { .. }
+            | Self::SignalFd { .. }
             | Self::PipeEnd { .. } => None,
             Self::Vfs { object } => Some(*object),
         }
