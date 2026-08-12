@@ -147,6 +147,10 @@ impl DescriptorFlags {
     pub(crate) const fn close_on_exec(self) -> bool {
         self.0 & Self::CLOSE_ON_EXEC.0 != 0
     }
+
+    pub(crate) const fn with_close_on_exec(self) -> Self {
+        Self(self.0 | Self::CLOSE_ON_EXEC.0)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -247,6 +251,37 @@ pub(crate) enum SeekWhence {
     Start,
     Current,
     End,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SameSlotBehavior {
+    ReturnUnchanged,
+    Reject,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SlotRangeAction {
+    Close,
+    SetCloseOnExec,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub(crate) struct SlotPageLimit(u16);
+
+impl SlotPageLimit {
+    pub(crate) const MAX: u16 = 256;
+
+    pub(crate) fn bounded(raw: u16) -> Result<Self, AuthorityError> {
+        if raw == 0 || raw > Self::MAX {
+            return Err(AuthorityError::InvalidPageLimit);
+        }
+        Ok(Self(raw))
+    }
+
+    pub(crate) const fn raw(self) -> u16 {
+        self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -360,6 +395,30 @@ pub(crate) enum Command {
         table: FileTableId,
         fd: FileSlotNumber,
     },
+    ListSlots {
+        table: FileTableId,
+        after: Option<FileSlotNumber>,
+        maximum: SlotPageLimit,
+    },
+    SetDescriptorFlags {
+        table: FileTableId,
+        fd: FileSlotNumber,
+        flags: DescriptorFlags,
+    },
+    ReplaceSlot {
+        table: FileTableId,
+        source: FileSlotNumber,
+        target: FileSlotNumber,
+        ceiling: NofileAllocationCeiling,
+        flags: DescriptorFlags,
+        same_slot: SameSlotBehavior,
+    },
+    MutateSlotRange {
+        table: FileTableId,
+        first: FileSlotNumber,
+        last: FileSlotNumber,
+        action: SlotRangeAction,
+    },
     Read {
         table: FileTableId,
         fd: FileSlotNumber,
@@ -464,6 +523,33 @@ pub(crate) enum Outcome {
         description_revision: Revision,
     },
     Slot(SlotSnapshot),
+    SlotPage {
+        table: FileTableId,
+        slots: Vec<SlotSnapshot>,
+        next_after: Option<FileSlotNumber>,
+        table_revision: Revision,
+    },
+    DescriptorFlagsSet {
+        table: FileTableId,
+        fd: FileSlotNumber,
+        flags: DescriptorFlags,
+        table_revision: Revision,
+    },
+    SlotReplaced {
+        table: FileTableId,
+        source: FileSlotNumber,
+        target: FileSlotNumber,
+        replaced_description: Option<FileDescriptionId>,
+        description_reclaimed: bool,
+        object_reclaimed: bool,
+        table_revision: Revision,
+    },
+    SlotRangeMutated {
+        table: FileTableId,
+        action: SlotRangeAction,
+        affected: u32,
+        table_revision: Revision,
+    },
     Bytes {
         bytes: Vec<u8>,
         offset: FileOffset,
@@ -610,6 +696,12 @@ pub(crate) enum AuthorityError {
     HostAccessMismatch,
     #[error("host file backing is read-only")]
     BackingReadOnly,
+    #[error("slot page limit is zero or exceeds its protocol bound")]
+    InvalidPageLimit,
+    #[error("operation rejects identical source and target slots")]
+    SameSlotRejected,
+    #[error("file descriptor slot range is inverted")]
+    InvalidSlotRange,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
