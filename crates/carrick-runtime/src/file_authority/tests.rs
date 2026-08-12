@@ -448,6 +448,179 @@ fn host_capability_lease_model(mut harness: Harness, disposition: CapabilityLeas
     );
 }
 
+fn bounded_table_mutation_model(mut harness: Harness) {
+    let table = harness.create_table();
+    let mut descriptions = Vec::new();
+    for (fd_raw, contents) in [(3, b"three".as_slice()), (4, b"four"), (5, b"five")] {
+        match harness.send(
+            Command::CreateSyntheticAndInstall {
+                table,
+                contents: contents.to_vec(),
+                minimum: fd(fd_raw),
+                ceiling: NofileAllocationCeiling::from_captured_soft_limit(fd_raw as u32 + 1),
+                descriptor_flags: DescriptorFlags::NONE,
+                access_mode: AccessMode::ReadWrite,
+                status_flags: StatusFlags::default(),
+                path: None,
+            },
+            ObjectGeneration::INITIAL,
+        ) {
+            Outcome::Installed { description, .. } => descriptions.push(description),
+            other => panic!("unexpected install outcome: {other:?}"),
+        }
+    }
+    assert!(matches!(
+        harness.send(
+            Command::SetDescriptorFlags {
+                table,
+                fd: fd(3),
+                flags: DescriptorFlags::CLOSE_ON_EXEC,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::DescriptorFlagsSet {
+            flags: DescriptorFlags::CLOSE_ON_EXEC,
+            ..
+        }
+    ));
+    let next_after = match harness.send(
+        Command::ListSlots {
+            table,
+            after: None,
+            maximum: SlotPageLimit::bounded(2).expect("page limit"),
+        },
+        ObjectGeneration::INITIAL,
+    ) {
+        Outcome::SlotPage {
+            slots, next_after, ..
+        } => {
+            assert_eq!(
+                slots.iter().map(|slot| slot.fd).collect::<Vec<_>>(),
+                vec![fd(3), fd(4)]
+            );
+            next_after
+        }
+        other => panic!("unexpected slot page: {other:?}"),
+    };
+    assert_eq!(next_after, Some(fd(4)));
+    assert!(matches!(
+        harness.send(
+            Command::ListSlots {
+                table,
+                after: next_after,
+                maximum: SlotPageLimit::bounded(2).expect("page limit"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::SlotPage { slots, next_after: None, .. }
+            if slots.iter().map(|slot| slot.fd).collect::<Vec<_>>() == vec![fd(5)]
+    ));
+
+    assert!(matches!(
+        harness.send(
+            Command::ReplaceSlot {
+                table,
+                source: fd(3),
+                target: fd(4),
+                ceiling: NofileAllocationCeiling::from_captured_soft_limit(6),
+                flags: DescriptorFlags::NONE,
+                same_slot: SameSlotBehavior::Reject,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::SlotReplaced {
+            replaced_description: Some(replaced),
+            description_reclaimed: true,
+            ..
+        } if replaced == descriptions[1]
+    ));
+    assert_eq!(
+        harness.send(
+            Command::InspectDescription {
+                description: descriptions[1],
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Rejected(AuthorityError::DescriptionNotFound)
+    );
+    let revision = harness.revision;
+    assert!(matches!(
+        harness.send(
+            Command::ReplaceSlot {
+                table,
+                source: fd(3),
+                target: fd(3),
+                ceiling: NofileAllocationCeiling::from_captured_soft_limit(6),
+                flags: DescriptorFlags::NONE,
+                same_slot: SameSlotBehavior::ReturnUnchanged,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::SlotReplaced {
+            replaced_description: None,
+            ..
+        }
+    ));
+    assert_eq!(harness.revision, revision);
+    assert_eq!(
+        harness.send(
+            Command::ReplaceSlot {
+                table,
+                source: fd(3),
+                target: fd(3),
+                ceiling: NofileAllocationCeiling::from_captured_soft_limit(6),
+                flags: DescriptorFlags::NONE,
+                same_slot: SameSlotBehavior::Reject,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Rejected(AuthorityError::SameSlotRejected)
+    );
+    assert_eq!(harness.revision, revision);
+    assert!(matches!(
+        harness.send(
+            Command::MutateSlotRange {
+                table,
+                first: fd(3),
+                last: fd(5),
+                action: SlotRangeAction::SetCloseOnExec,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::SlotRangeMutated { affected: 3, .. }
+    ));
+    assert!(matches!(
+        harness.send(
+            Command::MutateSlotRange {
+                table,
+                first: fd(4),
+                last: fd(5),
+                action: SlotRangeAction::Close,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::SlotRangeMutated { affected: 2, .. }
+    ));
+    assert!(matches!(
+        harness.send(
+            Command::InspectDescription {
+                description: descriptions[0],
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Description(DescriptionSnapshot {
+            logical_slot_refs: 1,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn direct_and_ipc_transports_match_bounded_table_mutations() {
+    bounded_table_mutation_model(Harness::new());
+    bounded_table_mutation_model(Harness::new_ipc());
+}
+
 #[test]
 fn direct_and_ipc_transports_transfer_scoped_host_capability_leases() {
     host_capability_lease_model(Harness::new(), CapabilityLeaseDisposition::Commit);

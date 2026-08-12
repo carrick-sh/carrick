@@ -10,8 +10,9 @@ use super::types::{
     ByteCount, CanonicalPath, CapabilityLeaseDisposition, CapabilityLeaseId,
     CapabilityLeasePurpose, ClientId, ClientIdentity, Command, DescriptionSnapshot,
     DescriptorFlags, FileDescriptionId, FileOffset, FileSlotNumber, FileTableId,
-    NofileAllocationCeiling, ObjectGeneration, Outcome, Request, Response, Revision, SeekWhence,
-    SlotSnapshot, StatusFlags, VfsObjectId,
+    NofileAllocationCeiling, ObjectGeneration, Outcome, Request, Response, Revision,
+    SameSlotBehavior, SeekWhence, SlotPageLimit, SlotRangeAction, SlotSnapshot, StatusFlags,
+    VfsObjectId,
 };
 
 pub(super) const MAX_TERMINAL_DEDUP_ENTRIES: usize = 8_192;
@@ -395,6 +396,54 @@ impl FileAuthorityCore {
                     Command::ResolveSlot { table, fd } => {
                         self.resolve_slot(request.client, *table, request.expected_generation, *fd)
                     }
+                    Command::ListSlots {
+                        table,
+                        after,
+                        maximum,
+                    } => self.list_slots(
+                        request.client,
+                        *table,
+                        request.expected_generation,
+                        *after,
+                        *maximum,
+                    ),
+                    Command::SetDescriptorFlags { table, fd, flags } => self.set_descriptor_flags(
+                        request.client,
+                        *table,
+                        request.expected_generation,
+                        *fd,
+                        *flags,
+                    ),
+                    Command::ReplaceSlot {
+                        table,
+                        source,
+                        target,
+                        ceiling,
+                        flags,
+                        same_slot,
+                    } => self.replace_slot(
+                        request.client,
+                        *table,
+                        request.expected_generation,
+                        *source,
+                        *target,
+                        *ceiling,
+                        *flags,
+                        *same_slot,
+                    ),
+                    Command::MutateSlotRange {
+                        table,
+                        first,
+                        last,
+                        action,
+                    } => self.mutate_slot_range(
+                        request.client,
+                        *table,
+                        request.expected_generation,
+                        *first,
+                        *last,
+                        *action,
+                    ),
                     Command::Read { table, fd, maximum } => self.read(
                         request.client,
                         *table,
@@ -1061,6 +1110,229 @@ impl FileAuthorityCore {
         let table = self.bound_table(client, table, expected)?;
         let slot = table.slots.get(&fd).ok_or(AuthorityError::SlotNotFound)?;
         Ok(Outcome::Slot(slot.snapshot(fd)))
+    }
+
+    fn list_slots(
+        &self,
+        client: ClientIdentity,
+        table: FileTableId,
+        expected: ObjectGeneration,
+        after: Option<FileSlotNumber>,
+        maximum: SlotPageLimit,
+    ) -> Result<Outcome, AuthorityError> {
+        let state = self.bound_table(client, table, expected)?;
+        let maximum = usize::from(maximum.raw());
+        let mut slots: Vec<SlotSnapshot> = state
+            .slots
+            .iter()
+            .filter(|(fd, _)| after.is_none_or(|after| **fd > after))
+            .take(maximum + 1)
+            .map(|(fd, slot)| slot.snapshot(*fd))
+            .collect();
+        let has_more = slots.len() > maximum;
+        if has_more {
+            slots.pop();
+        }
+        let next_after = has_more.then(|| slots.last().map(|slot| slot.fd)).flatten();
+        Ok(Outcome::SlotPage {
+            table,
+            slots,
+            next_after,
+            table_revision: state.revision,
+        })
+    }
+
+    fn set_descriptor_flags(
+        &mut self,
+        client: ClientIdentity,
+        table: FileTableId,
+        expected: ObjectGeneration,
+        fd: FileSlotNumber,
+        flags: DescriptorFlags,
+    ) -> Result<Outcome, AuthorityError> {
+        self.slot(client, table, expected, fd)?;
+        let revision = self.publish_mutation();
+        let table_state = self.tables.get_mut(&table).unwrap_or_else(|| {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "descriptor-flag mutation lost its validated table",
+            ))
+        });
+        let slot = table_state.slots.get_mut(&fd).unwrap_or_else(|| {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "descriptor-flag mutation lost its validated slot",
+            ))
+        });
+        slot.flags = flags;
+        table_state.revision = revision;
+        Ok(Outcome::DescriptorFlagsSet {
+            table,
+            fd,
+            flags,
+            table_revision: revision,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn replace_slot(
+        &mut self,
+        client: ClientIdentity,
+        table: FileTableId,
+        expected: ObjectGeneration,
+        source: FileSlotNumber,
+        target: FileSlotNumber,
+        ceiling: NofileAllocationCeiling,
+        flags: DescriptorFlags,
+        same_slot: SameSlotBehavior,
+    ) -> Result<Outcome, AuthorityError> {
+        let source_slot = self.slot(client, table, expected, source)?.clone();
+        let target_raw = u32::try_from(target.raw()).map_err(|_| AuthorityError::NofileExceeded)?;
+        if target_raw >= ceiling.raw() {
+            return Err(AuthorityError::NofileExceeded);
+        }
+        let table_state = self.bound_table(client, table, expected)?;
+        if source == target {
+            if same_slot == SameSlotBehavior::Reject {
+                return Err(AuthorityError::SameSlotRejected);
+            }
+            return Ok(Outcome::SlotReplaced {
+                table,
+                source,
+                target,
+                replaced_description: None,
+                description_reclaimed: false,
+                object_reclaimed: false,
+                table_revision: table_state.revision,
+            });
+        }
+        let replaced = table_state.slots.get(&target).cloned();
+        let needs_ref_increment = replaced
+            .as_ref()
+            .is_none_or(|slot| slot.description != source_slot.description);
+        let source_refs = needs_ref_increment.then(|| {
+            self.descriptions
+                .get(&source_slot.description)
+                .unwrap_or_else(|| {
+                    abort_fatal(AuthorityFatal::InvariantViolation(
+                        "source slot referenced a missing description",
+                    ))
+                })
+                .logical_slot_refs
+                .checked_add(1)
+                .unwrap_or_else(|| {
+                    abort_fatal(AuthorityFatal::InvariantViolation(
+                        "slot replacement reference overflow",
+                    ))
+                })
+        });
+        let revision = self.publish_mutation();
+        let table_state = self.tables.get_mut(&table).unwrap_or_else(|| {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "slot replacement lost its validated table",
+            ))
+        });
+        table_state.slots.insert(
+            target,
+            FileSlotState {
+                flags,
+                ..source_slot.clone()
+            },
+        );
+        table_state.revision = revision;
+        if let Some(source_refs) = source_refs {
+            let description = self
+                .descriptions
+                .get_mut(&source_slot.description)
+                .unwrap_or_else(|| {
+                    abort_fatal(AuthorityFatal::InvariantViolation(
+                        "slot replacement lost its source description",
+                    ))
+                });
+            description.logical_slot_refs = source_refs;
+            description.revision = revision;
+        }
+        let (description_reclaimed, object_reclaimed) = replaced
+            .as_ref()
+            .filter(|slot| slot.description != source_slot.description)
+            .map_or((false, false), |slot| {
+                self.release_description_ref(slot.description, revision)
+            });
+        Ok(Outcome::SlotReplaced {
+            table,
+            source,
+            target,
+            replaced_description: replaced.map(|slot| slot.description),
+            description_reclaimed,
+            object_reclaimed,
+            table_revision: revision,
+        })
+    }
+
+    fn mutate_slot_range(
+        &mut self,
+        client: ClientIdentity,
+        table: FileTableId,
+        expected: ObjectGeneration,
+        first: FileSlotNumber,
+        last: FileSlotNumber,
+        action: SlotRangeAction,
+    ) -> Result<Outcome, AuthorityError> {
+        if first > last {
+            return Err(AuthorityError::InvalidSlotRange);
+        }
+        let state = self.bound_table(client, table, expected)?;
+        let fds: Vec<FileSlotNumber> = state.slots.range(first..=last).map(|(fd, _)| *fd).collect();
+        let affected = u32::try_from(fds.len()).unwrap_or_else(|_| {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "slot range population exceeded u32",
+            ))
+        });
+        if fds.is_empty() {
+            return Ok(Outcome::SlotRangeMutated {
+                table,
+                action,
+                affected,
+                table_revision: state.revision,
+            });
+        }
+        let revision = self.publish_mutation();
+        let mut released = Vec::new();
+        let table_state = self.tables.get_mut(&table).unwrap_or_else(|| {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "slot range mutation lost its validated table",
+            ))
+        });
+        match action {
+            SlotRangeAction::Close => {
+                for fd in fds {
+                    let slot = table_state.slots.remove(&fd).unwrap_or_else(|| {
+                        abort_fatal(AuthorityFatal::InvariantViolation(
+                            "slot range close lost a validated slot",
+                        ))
+                    });
+                    released.push(slot.description);
+                }
+            }
+            SlotRangeAction::SetCloseOnExec => {
+                for fd in fds {
+                    let slot = table_state.slots.get_mut(&fd).unwrap_or_else(|| {
+                        abort_fatal(AuthorityFatal::InvariantViolation(
+                            "slot range flag mutation lost a validated slot",
+                        ))
+                    });
+                    slot.flags = slot.flags.with_close_on_exec();
+                }
+            }
+        }
+        table_state.revision = revision;
+        for description in released {
+            self.release_description_ref(description, revision);
+        }
+        Ok(Outcome::SlotRangeMutated {
+            table,
+            action,
+            affected,
+            table_revision: revision,
+        })
     }
 
     fn read(

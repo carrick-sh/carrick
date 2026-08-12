@@ -7,8 +7,8 @@ use super::{
     CapabilityLeaseDisposition, CapabilityLeaseId, CapabilityLeasePurpose, ClientIdentity, Command,
     DescriptionBackingSnapshot, DescriptionSnapshot, DescriptorFlags, FileDescriptionId,
     FileOffset, FileSlotNumber, FileTableId, HostErrno, NofileAllocationCeiling, ObjectGeneration,
-    Outcome, Request, RequestId, Response, Revision, SeekWhence, SlotSnapshot, StatusFlags,
-    VfsObjectId,
+    Outcome, Request, RequestId, Response, Revision, SameSlotBehavior, SeekWhence, SlotPageLimit,
+    SlotRangeAction, SlotSnapshot, StatusFlags, VfsObjectId,
 };
 
 const MAGIC: u32 = 0x4341_4641;
@@ -234,6 +234,10 @@ fn command_tag(command: &Command) -> u8 {
         Command::AdoptHostFileAndInstall { .. } => 21,
         Command::AcquireCapabilityLease { .. } => 22,
         Command::ReleaseCapabilityLease { .. } => 23,
+        Command::ListSlots { .. } => 24,
+        Command::SetDescriptorFlags { .. } => 25,
+        Command::ReplaceSlot { .. } => 26,
+        Command::MutateSlotRange { .. } => 27,
     }
 }
 
@@ -325,6 +329,46 @@ fn encode_command(writer: &mut Writer, command: &Command) -> Result<(), Authorit
         Command::ReleaseCapabilityLease { lease, disposition } => {
             writer.u64(lease.raw());
             writer.u8(capability_disposition_tag(*disposition));
+        }
+        Command::ListSlots {
+            table,
+            after,
+            maximum,
+        } => {
+            writer.u64(table.raw());
+            writer.optional_slot(*after);
+            writer.u16(maximum.raw());
+        }
+        Command::SetDescriptorFlags { table, fd, flags } => {
+            writer.u64(table.raw());
+            writer.i32(fd.raw());
+            writer.u32(flags.raw());
+        }
+        Command::ReplaceSlot {
+            table,
+            source,
+            target,
+            ceiling,
+            flags,
+            same_slot,
+        } => {
+            writer.u64(table.raw());
+            writer.i32(source.raw());
+            writer.i32(target.raw());
+            writer.u32(ceiling.raw());
+            writer.u32(flags.raw());
+            writer.u8(same_slot_tag(*same_slot));
+        }
+        Command::MutateSlotRange {
+            table,
+            first,
+            last,
+            action,
+        } => {
+            writer.u64(table.raw());
+            writer.i32(first.raw());
+            writer.i32(last.raw());
+            writer.u8(slot_range_action_tag(*action));
         }
         Command::ResolveSlot { table, fd } | Command::Close { table, fd } => {
             writer.u64(table.raw());
@@ -501,6 +545,33 @@ fn decode_command(tag: u8, reader: &mut Reader<'_>) -> Result<Command, Authority
             lease: reader.capability_lease_id()?,
             disposition: reader.capability_disposition()?,
         },
+        24 => Command::ListSlots {
+            table: reader.table_id()?,
+            after: reader.optional_slot()?,
+            maximum: SlotPageLimit::bounded(reader.u16()?)
+                .map_err(|_| AuthorityFatal::MalformedFrame("invalid slot page limit"))?,
+        },
+        25 => Command::SetDescriptorFlags {
+            table: reader.table_id()?,
+            fd: reader.slot()?,
+            flags: DescriptorFlags::from_linux_bits(reader.u32()?)
+                .map_err(|_| AuthorityFatal::MalformedFrame("invalid descriptor flags"))?,
+        },
+        26 => Command::ReplaceSlot {
+            table: reader.table_id()?,
+            source: reader.slot()?,
+            target: reader.slot()?,
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(reader.u32()?),
+            flags: DescriptorFlags::from_linux_bits(reader.u32()?)
+                .map_err(|_| AuthorityFatal::MalformedFrame("invalid descriptor flags"))?,
+            same_slot: reader.same_slot_behavior()?,
+        },
+        27 => Command::MutateSlotRange {
+            table: reader.table_id()?,
+            first: reader.slot()?,
+            last: reader.slot()?,
+            action: reader.slot_range_action()?,
+        },
         _ => return malformed("unknown operation"),
     })
 }
@@ -568,6 +639,60 @@ fn encode_outcome(writer: &mut Writer, outcome: &Outcome) -> Result<(), Authorit
         Outcome::Slot(slot) => {
             writer.u8(8);
             writer.slot_snapshot(slot)?;
+        }
+        Outcome::SlotPage {
+            table,
+            slots,
+            next_after,
+            table_revision,
+        } => {
+            writer.u8(21);
+            writer.u64(table.raw());
+            writer.slot_snapshots(slots)?;
+            writer.optional_slot(*next_after);
+            writer.u64(table_revision.raw());
+        }
+        Outcome::DescriptorFlagsSet {
+            table,
+            fd,
+            flags,
+            table_revision,
+        } => {
+            writer.u8(22);
+            writer.u64(table.raw());
+            writer.i32(fd.raw());
+            writer.u32(flags.raw());
+            writer.u64(table_revision.raw());
+        }
+        Outcome::SlotReplaced {
+            table,
+            source,
+            target,
+            replaced_description,
+            description_reclaimed,
+            object_reclaimed,
+            table_revision,
+        } => {
+            writer.u8(23);
+            writer.u64(table.raw());
+            writer.i32(source.raw());
+            writer.i32(target.raw());
+            writer.optional_description(*replaced_description);
+            writer.bool(*description_reclaimed);
+            writer.bool(*object_reclaimed);
+            writer.u64(table_revision.raw());
+        }
+        Outcome::SlotRangeMutated {
+            table,
+            action,
+            affected,
+            table_revision,
+        } => {
+            writer.u8(24);
+            writer.u64(table.raw());
+            writer.u8(slot_range_action_tag(*action));
+            writer.u32(*affected);
+            writer.u64(table_revision.raw());
         }
         Outcome::Bytes {
             bytes,
@@ -785,6 +910,34 @@ fn decode_outcome(reader: &mut Reader<'_>) -> Result<Outcome, AuthorityFatal> {
             object_reclaimed: reader.bool()?,
             revision: reader.revision()?,
         },
+        21 => Outcome::SlotPage {
+            table: reader.table_id()?,
+            slots: reader.slot_snapshots()?,
+            next_after: reader.optional_slot()?,
+            table_revision: reader.revision()?,
+        },
+        22 => Outcome::DescriptorFlagsSet {
+            table: reader.table_id()?,
+            fd: reader.slot()?,
+            flags: DescriptorFlags::from_linux_bits(reader.u32()?)
+                .map_err(|_| AuthorityFatal::MalformedFrame("invalid descriptor flags"))?,
+            table_revision: reader.revision()?,
+        },
+        23 => Outcome::SlotReplaced {
+            table: reader.table_id()?,
+            source: reader.slot()?,
+            target: reader.slot()?,
+            replaced_description: reader.optional_description()?,
+            description_reclaimed: reader.bool()?,
+            object_reclaimed: reader.bool()?,
+            table_revision: reader.revision()?,
+        },
+        24 => Outcome::SlotRangeMutated {
+            table: reader.table_id()?,
+            action: reader.slot_range_action()?,
+            affected: reader.u32()?,
+            table_revision: reader.revision()?,
+        },
         _ => return malformed("unknown response outcome"),
     })
 }
@@ -824,6 +977,9 @@ fn encode_error(writer: &mut Writer, error: &AuthorityError) {
         AuthorityError::BackingReadOnly => writer.u8(24),
         AuthorityError::HostBackingTypeMismatch => writer.u8(25),
         AuthorityError::HostAccessMismatch => writer.u8(26),
+        AuthorityError::InvalidPageLimit => writer.u8(27),
+        AuthorityError::SameSlotRejected => writer.u8(28),
+        AuthorityError::InvalidSlotRange => writer.u8(29),
     }
 }
 
@@ -862,6 +1018,9 @@ fn decode_error(reader: &mut Reader<'_>) -> Result<AuthorityError, AuthorityFata
         24 => AuthorityError::BackingReadOnly,
         25 => AuthorityError::HostBackingTypeMismatch,
         26 => AuthorityError::HostAccessMismatch,
+        27 => AuthorityError::InvalidPageLimit,
+        28 => AuthorityError::SameSlotRejected,
+        29 => AuthorityError::InvalidSlotRange,
         _ => return malformed("unknown authority error"),
     })
 }
@@ -872,6 +1031,20 @@ const fn access_mode_tag(mode: AccessMode) -> u8 {
         AccessMode::WriteOnly => 1,
         AccessMode::ReadWrite => 2,
         AccessMode::PathOnly => 3,
+    }
+}
+
+const fn same_slot_tag(behavior: SameSlotBehavior) -> u8 {
+    match behavior {
+        SameSlotBehavior::ReturnUnchanged => 0,
+        SameSlotBehavior::Reject => 1,
+    }
+}
+
+const fn slot_range_action_tag(action: SlotRangeAction) -> u8 {
+    match action {
+        SlotRangeAction::Close => 0,
+        SlotRangeAction::SetCloseOnExec => 1,
     }
 }
 
@@ -959,6 +1132,24 @@ impl Writer {
         self.u32(client.host_pid.raw());
         self.u32(client.process_generation.raw());
     }
+    fn optional_slot(&mut self, slot: Option<FileSlotNumber>) {
+        match slot {
+            Some(slot) => {
+                self.bool(true);
+                self.i32(slot.raw());
+            }
+            None => self.bool(false),
+        }
+    }
+    fn optional_description(&mut self, description: Option<FileDescriptionId>) {
+        match description {
+            Some(description) => {
+                self.bool(true);
+                self.u64(description.raw());
+            }
+            None => self.bool(false),
+        }
+    }
     fn optional_revision(&mut self, revision: Option<Revision>) {
         match revision {
             Some(revision) => {
@@ -975,6 +1166,16 @@ impl Writer {
         );
         for slot in slots {
             self.i32(slot.raw());
+        }
+        Ok(())
+    }
+    fn slot_snapshots(&mut self, slots: &[SlotSnapshot]) -> Result<(), AuthorityFatal> {
+        self.u16(
+            u16::try_from(slots.len())
+                .map_err(|_| AuthorityFatal::EncodingFailure("slot snapshot count overflow"))?,
+        );
+        for slot in slots {
+            self.slot_snapshot(slot)?;
         }
         Ok(())
     }
@@ -1133,6 +1334,20 @@ impl<'a> Reader<'a> {
         FileSlotNumber::for_open_fd(self.i32()?)
             .map_err(|_| AuthorityFatal::MalformedFrame("invalid file slot"))
     }
+    fn optional_slot(&mut self) -> Result<Option<FileSlotNumber>, AuthorityFatal> {
+        if self.bool()? {
+            Ok(Some(self.slot()?))
+        } else {
+            Ok(None)
+        }
+    }
+    fn optional_description(&mut self) -> Result<Option<FileDescriptionId>, AuthorityFatal> {
+        if self.bool()? {
+            Ok(Some(self.description_id()?))
+        } else {
+            Ok(None)
+        }
+    }
     fn access_mode(&mut self) -> Result<AccessMode, AuthorityFatal> {
         match self.u8()? {
             0 => Ok(AccessMode::ReadOnly),
@@ -1140,6 +1355,20 @@ impl<'a> Reader<'a> {
             2 => Ok(AccessMode::ReadWrite),
             3 => Ok(AccessMode::PathOnly),
             _ => malformed("invalid access mode"),
+        }
+    }
+    fn same_slot_behavior(&mut self) -> Result<SameSlotBehavior, AuthorityFatal> {
+        match self.u8()? {
+            0 => Ok(SameSlotBehavior::ReturnUnchanged),
+            1 => Ok(SameSlotBehavior::Reject),
+            _ => malformed("invalid same-slot behavior"),
+        }
+    }
+    fn slot_range_action(&mut self) -> Result<SlotRangeAction, AuthorityFatal> {
+        match self.u8()? {
+            0 => Ok(SlotRangeAction::Close),
+            1 => Ok(SlotRangeAction::SetCloseOnExec),
+            _ => malformed("invalid slot range action"),
         }
     }
     fn capability_purpose(&mut self) -> Result<CapabilityLeasePurpose, AuthorityFatal> {
@@ -1177,6 +1406,13 @@ impl<'a> Reader<'a> {
             return malformed("slot vector exceeds frame");
         }
         (0..count).map(|_| self.slot()).collect()
+    }
+    fn slot_snapshots(&mut self) -> Result<Vec<SlotSnapshot>, AuthorityFatal> {
+        let count = usize::from(self.u16()?);
+        if count > usize::from(SlotPageLimit::MAX) {
+            return malformed("slot snapshot page exceeds bound");
+        }
+        (0..count).map(|_| self.slot_snapshot()).collect()
     }
     fn slot_snapshot(&mut self) -> Result<SlotSnapshot, AuthorityFatal> {
         Ok(SlotSnapshot {
@@ -1335,6 +1571,30 @@ mod tests {
                 lease,
                 disposition: CapabilityLeaseDisposition::Abort,
             },
+            Command::ListSlots {
+                table,
+                after: Some(FileSlotNumber::for_open_fd(3).expect("fd")),
+                maximum: SlotPageLimit::bounded(8).expect("page"),
+            },
+            Command::SetDescriptorFlags {
+                table,
+                fd: FileSlotNumber::for_open_fd(3).expect("fd"),
+                flags: DescriptorFlags::CLOSE_ON_EXEC,
+            },
+            Command::ReplaceSlot {
+                table,
+                source: FileSlotNumber::for_open_fd(3).expect("fd"),
+                target: FileSlotNumber::for_open_fd(5).expect("fd"),
+                ceiling: NofileAllocationCeiling::from_captured_soft_limit(9),
+                flags: DescriptorFlags::NONE,
+                same_slot: SameSlotBehavior::Reject,
+            },
+            Command::MutateSlotRange {
+                table,
+                first: FileSlotNumber::for_open_fd(3).expect("fd"),
+                last: FileSlotNumber::for_open_fd(8).expect("fd"),
+                action: SlotRangeAction::SetCloseOnExec,
+            },
             Command::ResolveSlot {
                 table,
                 fd: FileSlotNumber::for_open_fd(3).expect("fd"),
@@ -1436,6 +1696,39 @@ mod tests {
                 flags: DescriptorFlags::CLOSE_ON_EXEC,
                 path: Some(path.clone()),
             }),
+            Outcome::SlotPage {
+                table,
+                slots: vec![SlotSnapshot {
+                    fd: slot,
+                    description,
+                    description_generation: ObjectGeneration::INITIAL,
+                    flags: DescriptorFlags::NONE,
+                    path: None,
+                }],
+                next_after: Some(slot),
+                table_revision: Revision::from_wire(4),
+            },
+            Outcome::DescriptorFlagsSet {
+                table,
+                fd: slot,
+                flags: DescriptorFlags::CLOSE_ON_EXEC,
+                table_revision: Revision::from_wire(5),
+            },
+            Outcome::SlotReplaced {
+                table,
+                source: slot,
+                target: FileSlotNumber::for_open_fd(4).expect("fd"),
+                replaced_description: Some(description),
+                description_reclaimed: true,
+                object_reclaimed: false,
+                table_revision: Revision::from_wire(6),
+            },
+            Outcome::SlotRangeMutated {
+                table,
+                action: SlotRangeAction::Close,
+                affected: 2,
+                table_revision: Revision::from_wire(7),
+            },
             Outcome::Bytes {
                 bytes: b"bytes".to_vec(),
                 offset: FileOffset::from_start(5),
@@ -1554,6 +1847,9 @@ mod tests {
             Outcome::Rejected(AuthorityError::BackingReadOnly),
             Outcome::Rejected(AuthorityError::HostBackingTypeMismatch),
             Outcome::Rejected(AuthorityError::HostAccessMismatch),
+            Outcome::Rejected(AuthorityError::InvalidPageLimit),
+            Outcome::Rejected(AuthorityError::SameSlotRejected),
+            Outcome::Rejected(AuthorityError::InvalidSlotRange),
         ];
         let request = Request {
             epoch: AuthorityEpoch::for_run(7).expect("epoch"),
