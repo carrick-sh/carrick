@@ -615,6 +615,695 @@ fn bounded_table_mutation_model(mut harness: Harness) {
     ));
 }
 
+fn epoll_model(mut harness: Harness) {
+    let table = harness.create_table();
+    let (epoll_fd, epoll_description) = match harness.send(
+        Command::CreateEpollAndInstall {
+            table,
+            minimum: fd(3),
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(16),
+            descriptor_flags: DescriptorFlags::NONE,
+        },
+        ObjectGeneration::INITIAL,
+    ) {
+        Outcome::EpollCreated {
+            fd, description, ..
+        } => (fd, description),
+        other => panic!("unexpected epoll creation: {other:?}"),
+    };
+    let (counter_fd, counter_description) = match harness.send(
+        Command::CreateEventCounterAndInstall {
+            table,
+            initial: 0,
+            semaphore: false,
+            minimum: fd(4),
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(16),
+            descriptor_flags: DescriptorFlags::NONE,
+            status_flags: StatusFlags::default(),
+        },
+        ObjectGeneration::INITIAL,
+    ) {
+        Outcome::EventCounterCreated {
+            fd, description, ..
+        } => (fd, description),
+        other => panic!("unexpected event-counter creation: {other:?}"),
+    };
+    let registration = EpollRegistration {
+        events: carrick_abi::LinuxEpollEvents::IN,
+        data: EpollUserData::from_guest(0xfeed),
+    };
+    assert!(matches!(
+        harness.send(
+            Command::EpollCtlAdd {
+                table,
+                epoll_fd,
+                target_fd: counter_fd,
+                registration,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::EpollInterestAdded { .. }
+    ));
+    assert!(matches!(
+        harness.send(
+            Command::EpollCollect {
+                table,
+                epoll_fd,
+                maximum: EpollEventLimit::bounded(4).expect("event limit"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::EpollEvents { events, .. } if events.is_empty()
+    ));
+    assert!(matches!(
+        harness.send(
+            Command::EventCounterWrite {
+                table,
+                fd: counter_fd,
+                value: 1,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::EventCounterWritten { counter: 1, .. }
+    ));
+    for _ in 0..2 {
+        assert!(matches!(
+            harness.send(
+                Command::EpollCollect {
+                    table,
+                    epoll_fd,
+                    maximum: EpollEventLimit::bounded(4).expect("event limit"),
+                },
+                ObjectGeneration::INITIAL,
+            ),
+            Outcome::EpollEvents { events, .. }
+                if events == vec![EpollReadyEvent {
+                    events: carrick_abi::LinuxEpollEvents::IN,
+                    data: EpollUserData::from_guest(0xfeed),
+                }]
+        ));
+    }
+
+    let edge = EpollRegistration {
+        events: carrick_abi::LinuxEpollEvents::IN | carrick_abi::LinuxEpollEvents::ET,
+        data: EpollUserData::from_guest(0xed9e),
+    };
+    assert!(matches!(
+        harness.send(
+            Command::EpollCtlModify {
+                table,
+                epoll_fd,
+                target_fd: counter_fd,
+                registration: edge,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::EpollInterestModified { .. }
+    ));
+    assert!(matches!(
+        harness.send(
+            Command::EpollCollect {
+                table,
+                epoll_fd,
+                maximum: EpollEventLimit::bounded(4).expect("event limit"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::EpollEvents { events, .. } if events.len() == 1
+    ));
+    assert!(matches!(
+        harness.send(
+            Command::EpollCollect {
+                table,
+                epoll_fd,
+                maximum: EpollEventLimit::bounded(4).expect("event limit"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::EpollEvents { events, .. } if events.is_empty()
+    ));
+    assert!(matches!(
+        harness.send(
+            Command::EventCounterRead {
+                table,
+                fd: counter_fd,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::EventCounterRead { value: 1, .. }
+    ));
+    assert!(matches!(
+        harness.send(
+            Command::EventCounterWrite {
+                table,
+                fd: counter_fd,
+                value: 2,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::EventCounterWritten { counter: 2, .. }
+    ));
+    assert!(matches!(
+        harness.send(
+            Command::EpollCollect {
+                table,
+                epoll_fd,
+                maximum: EpollEventLimit::bounded(4).expect("event limit"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::EpollEvents { events, .. } if events.len() == 1
+    ));
+
+    let oneshot = EpollRegistration {
+        events: carrick_abi::LinuxEpollEvents::IN | carrick_abi::LinuxEpollEvents::ONESHOT,
+        data: EpollUserData::from_guest(0x1),
+    };
+    assert!(matches!(
+        harness.send(
+            Command::EpollCtlModify {
+                table,
+                epoll_fd,
+                target_fd: counter_fd,
+                registration: oneshot,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::EpollInterestModified { .. }
+    ));
+    assert!(matches!(
+        harness.send(
+            Command::EpollCollect {
+                table,
+                epoll_fd,
+                maximum: EpollEventLimit::bounded(1).expect("event limit"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::EpollEvents { events, .. } if events.len() == 1
+    ));
+    assert!(matches!(
+        harness.send(
+            Command::EpollCollect {
+                table,
+                epoll_fd,
+                maximum: EpollEventLimit::bounded(1).expect("event limit"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::EpollEvents { events, .. } if events.is_empty()
+    ));
+
+    let (nested_fd, _) = match harness.send(
+        Command::CreateEpollAndInstall {
+            table,
+            minimum: fd(5),
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(16),
+            descriptor_flags: DescriptorFlags::NONE,
+        },
+        ObjectGeneration::INITIAL,
+    ) {
+        Outcome::EpollCreated {
+            fd, description, ..
+        } => (fd, description),
+        other => panic!("unexpected nested epoll creation: {other:?}"),
+    };
+    assert!(matches!(
+        harness.send(
+            Command::EpollCtlAdd {
+                table,
+                epoll_fd,
+                target_fd: nested_fd,
+                registration,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::EpollInterestAdded { .. }
+    ));
+    assert_eq!(
+        harness.send(
+            Command::EpollCtlAdd {
+                table,
+                epoll_fd: nested_fd,
+                target_fd: epoll_fd,
+                registration,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Rejected(AuthorityError::EpollLoop)
+    );
+    assert_eq!(
+        harness.send(
+            Command::EpollCtlAdd {
+                table,
+                epoll_fd,
+                target_fd: epoll_fd,
+                registration,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Rejected(AuthorityError::EpollLoop)
+    );
+
+    assert!(matches!(
+        harness.send(
+            Command::Close {
+                table,
+                fd: counter_fd,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Closed {
+            description: closed,
+            description_reclaimed: true,
+            ..
+        } if closed == counter_description
+    ));
+    assert!(matches!(
+        harness.send(
+            Command::InspectDescription {
+                description: epoll_description,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Description(DescriptionSnapshot {
+            backing: DescriptionBackingSnapshot::Epoll { interests: 1 },
+            ..
+        })
+    ));
+    assert!(matches!(
+        harness.send(
+            Command::Close {
+                table,
+                fd: nested_fd,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Closed {
+            description_reclaimed: true,
+            ..
+        }
+    ));
+    assert!(matches!(
+        harness.send(
+            Command::InspectDescription {
+                description: epoll_description,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Description(DescriptionSnapshot {
+            backing: DescriptionBackingSnapshot::Epoll { interests: 0 },
+            ..
+        })
+    ));
+}
+
+fn event_counter_saturation_model(mut harness: Harness) {
+    let table = harness.create_table();
+    let (epoll_fd, _) = match harness.send(
+        Command::CreateEpollAndInstall {
+            table,
+            minimum: fd(3),
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(16),
+            descriptor_flags: DescriptorFlags::NONE,
+        },
+        ObjectGeneration::INITIAL,
+    ) {
+        Outcome::EpollCreated {
+            fd, description, ..
+        } => (fd, description),
+        other => panic!("unexpected epoll create: {other:?}"),
+    };
+    let counter_fd = match harness.send(
+        Command::CreateEventCounterAndInstall {
+            table,
+            initial: u64::MAX - 2,
+            semaphore: false,
+            minimum: fd(4),
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(16),
+            descriptor_flags: DescriptorFlags::NONE,
+            status_flags: StatusFlags::default(),
+        },
+        ObjectGeneration::INITIAL,
+    ) {
+        Outcome::EventCounterCreated { fd, .. } => fd,
+        other => panic!("unexpected counter create: {other:?}"),
+    };
+    assert!(matches!(
+        harness.send(
+            Command::EpollCtlAdd {
+                table,
+                epoll_fd,
+                target_fd: counter_fd,
+                registration: EpollRegistration {
+                    events: carrick_abi::LinuxEpollEvents::OUT,
+                    data: EpollUserData::default(),
+                },
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::EpollInterestAdded { .. }
+    ));
+    assert!(matches!(
+        harness.send(
+            Command::EpollCollect {
+                table,
+                epoll_fd,
+                maximum: EpollEventLimit::bounded(1).expect("limit"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::EpollEvents { events, .. }
+            if events.first().is_some_and(|event| event.events.contains(carrick_abi::LinuxEpollEvents::OUT))
+    ));
+    assert!(matches!(
+        harness.send(
+            Command::EventCounterWrite {
+                table,
+                fd: counter_fd,
+                value: 1,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::EventCounterWritten { counter, .. } if counter == u64::MAX - 1
+    ));
+    assert!(matches!(
+        harness.send(
+            Command::EpollCollect {
+                table,
+                epoll_fd,
+                maximum: EpollEventLimit::bounded(1).expect("limit"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::EpollEvents { events, .. } if events.is_empty()
+    ));
+    assert!(matches!(
+        harness.send(
+            Command::EventCounterWrite {
+                table,
+                fd: counter_fd,
+                value: 0,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::EventCounterWritten { counter, .. } if counter == u64::MAX - 1
+    ));
+    assert_eq!(
+        harness.send(
+            Command::EventCounterWrite {
+                table,
+                fd: counter_fd,
+                value: 1,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Rejected(AuthorityError::WouldBlock)
+    );
+}
+
+#[test]
+fn direct_and_ipc_event_counter_saturation_matches_linux() {
+    event_counter_saturation_model(Harness::new());
+    event_counter_saturation_model(Harness::new_ipc());
+}
+
+#[test]
+fn direct_and_ipc_transports_match_epoll_model() {
+    epoll_model(Harness::new());
+    epoll_model(Harness::new_ipc());
+}
+
+fn epoll_lifecycle_model(mut parent: Harness) {
+    let mut child = parent.peer(2, 1002, 1);
+    let table = parent.create_table();
+    let (epoll_fd, epoll_description) = match parent.send(
+        Command::CreateEpollAndInstall {
+            table,
+            minimum: fd(3),
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(16),
+            descriptor_flags: DescriptorFlags::NONE,
+        },
+        ObjectGeneration::INITIAL,
+    ) {
+        Outcome::EpollCreated {
+            fd, description, ..
+        } => (fd, description),
+        other => panic!("unexpected epoll create: {other:?}"),
+    };
+    let (counter_fd, counter_description) = match parent.send(
+        Command::CreateEventCounterAndInstall {
+            table,
+            initial: 0,
+            semaphore: false,
+            minimum: fd(4),
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(16),
+            descriptor_flags: DescriptorFlags::NONE,
+            status_flags: StatusFlags::default(),
+        },
+        ObjectGeneration::INITIAL,
+    ) {
+        Outcome::EventCounterCreated {
+            fd, description, ..
+        } => (fd, description),
+        other => panic!("unexpected counter create: {other:?}"),
+    };
+    let child_table = match parent.send(
+        Command::ForkCopy {
+            source: table,
+            owner: child.client,
+        },
+        ObjectGeneration::INITIAL,
+    ) {
+        Outcome::ForkCopied { table, .. } => table,
+        other => panic!("unexpected fork copy: {other:?}"),
+    };
+    assert!(matches!(
+        child.send(
+            Command::EpollCtlAdd {
+                table: child_table,
+                epoll_fd,
+                target_fd: counter_fd,
+                registration: EpollRegistration {
+                    events: carrick_abi::LinuxEpollEvents::IN,
+                    data: EpollUserData::from_guest(0xc11d),
+                },
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::EpollInterestAdded { .. }
+    ));
+    assert!(matches!(
+        parent.send(
+            Command::EventCounterWrite {
+                table,
+                fd: counter_fd,
+                value: 1,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::EventCounterWritten { .. }
+    ));
+    assert!(matches!(
+        parent.send(
+            Command::EpollCollect {
+                table,
+                epoll_fd,
+                maximum: EpollEventLimit::bounded(1).expect("limit"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::EpollEvents { events, .. } if events.len() == 1
+    ));
+    assert!(matches!(
+        parent.send(
+            Command::Close {
+                table,
+                fd: counter_fd,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Closed {
+            description_reclaimed: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        child.send(
+            Command::InspectDescription {
+                description: epoll_description,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Description(DescriptionSnapshot {
+            backing: DescriptionBackingSnapshot::Epoll { interests: 1 },
+            ..
+        })
+    ));
+    assert!(matches!(
+        child.send(
+            Command::Close {
+                table: child_table,
+                fd: counter_fd,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Closed {
+            description: closed,
+            description_reclaimed: true,
+            ..
+        } if closed == counter_description
+    ));
+    assert!(matches!(
+        child.send(
+            Command::InspectDescription {
+                description: epoll_description,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Description(DescriptionSnapshot {
+            backing: DescriptionBackingSnapshot::Epoll { interests: 0 },
+            ..
+        })
+    ));
+}
+
+fn epoll_duplicate_registration_model(mut harness: Harness) {
+    let table = harness.create_table();
+    let epoll_fd = match harness.send(
+        Command::CreateEpollAndInstall {
+            table,
+            minimum: fd(3),
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(16),
+            descriptor_flags: DescriptorFlags::NONE,
+        },
+        ObjectGeneration::INITIAL,
+    ) {
+        Outcome::EpollCreated { fd, .. } => fd,
+        other => panic!("unexpected epoll create: {other:?}"),
+    };
+    let (counter_fd, counter_description) = match harness.send(
+        Command::CreateEventCounterAndInstall {
+            table,
+            initial: 1,
+            semaphore: false,
+            minimum: fd(4),
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(16),
+            descriptor_flags: DescriptorFlags::NONE,
+            status_flags: StatusFlags::default(),
+        },
+        ObjectGeneration::INITIAL,
+    ) {
+        Outcome::EventCounterCreated {
+            fd, description, ..
+        } => (fd, description),
+        other => panic!("unexpected counter create: {other:?}"),
+    };
+    let duplicate_fd = match harness.send(
+        Command::Dup {
+            table,
+            source: counter_fd,
+            minimum: fd(5),
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(16),
+            flags: DescriptorFlags::NONE,
+        },
+        ObjectGeneration::INITIAL,
+    ) {
+        Outcome::Duplicated { fd, .. } => fd,
+        other => panic!("unexpected dup: {other:?}"),
+    };
+    for (slot, data) in [(counter_fd, 1), (duplicate_fd, 2)] {
+        assert!(matches!(
+            harness.send(
+                Command::EpollCtlAdd {
+                    table,
+                    epoll_fd,
+                    target_fd: slot,
+                    registration: EpollRegistration {
+                        events: carrick_abi::LinuxEpollEvents::IN,
+                        data: EpollUserData::from_guest(data),
+                    },
+                },
+                ObjectGeneration::INITIAL,
+            ),
+            Outcome::EpollInterestAdded { .. }
+        ));
+    }
+    assert!(matches!(
+        harness.send(
+            Command::EpollCollect {
+                table,
+                epoll_fd,
+                maximum: EpollEventLimit::bounded(4).expect("limit"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::EpollEvents { events, .. }
+            if events.iter().map(|event| event.data.raw()).collect::<Vec<_>>() == vec![1, 2]
+    ));
+    assert!(matches!(
+        harness.send(
+            Command::Close {
+                table,
+                fd: counter_fd,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Closed {
+            description_reclaimed: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        harness.send(
+            Command::EpollCollect {
+                table,
+                epoll_fd,
+                maximum: EpollEventLimit::bounded(4).expect("limit"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::EpollEvents { events, .. } if events.len() == 2
+    ));
+    assert!(matches!(
+        harness.send(
+            Command::Close {
+                table,
+                fd: duplicate_fd,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Closed {
+            description: closed,
+            description_reclaimed: true,
+            ..
+        } if closed == counter_description
+    ));
+    assert!(matches!(
+        harness.send(
+            Command::EpollCollect {
+                table,
+                epoll_fd,
+                maximum: EpollEventLimit::bounded(4).expect("limit"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::EpollEvents { events, .. } if events.is_empty()
+    ));
+}
+
+#[test]
+fn direct_and_ipc_epoll_allows_duplicate_descriptor_registrations() {
+    epoll_duplicate_registration_model(Harness::new());
+    epoll_duplicate_registration_model(Harness::new_ipc());
+}
+
+#[test]
+fn direct_and_ipc_epoll_lifecycle_tracks_forked_tables() {
+    epoll_lifecycle_model(Harness::new());
+    epoll_lifecycle_model(Harness::new_ipc());
+}
+
 #[test]
 fn direct_and_ipc_transports_match_bounded_table_mutations() {
     bounded_table_mutation_model(Harness::new());
