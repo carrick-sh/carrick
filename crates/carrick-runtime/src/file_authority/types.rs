@@ -173,6 +173,7 @@ impl NofileAllocationCeiling {
 pub(crate) struct DescriptorFlags(u32);
 
 impl DescriptorFlags {
+    #[cfg(test)]
     pub(crate) const NONE: Self = Self(0);
     pub(crate) const CLOSE_ON_EXEC: Self = Self(1);
 

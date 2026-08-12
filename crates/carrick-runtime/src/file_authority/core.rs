@@ -172,10 +172,12 @@ impl FileAuthorityCore {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn epoch(&self) -> AuthorityEpoch {
         self.epoch
     }
 
+    #[cfg(test)]
     pub(crate) const fn revision(&self) -> Revision {
         self.revision
     }

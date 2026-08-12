@@ -13,7 +13,6 @@ ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "crates/carrick-runtime/src"
 INVENTORY = ROOT / "scripts/migrate/k1-file-authority-operation-inventory.json"
 FILE_AUTHORITY_MODULE = SOURCE / "file_authority"
-FILE_AUTHORITY_GATE = "#[cfg(test)]\npub(crate) mod file_authority;"
 PATTERNS = {
     "table_guard": re.compile(
         r"\b(read_open_files|write_open_files|lock_next_fd|lock_stdio_cloexec|"
@@ -41,12 +40,12 @@ PATTERNS = {
 
 def generate() -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
-    authority_is_test_only = FILE_AUTHORITY_GATE in (SOURCE / "lib.rs").read_text()
     for path in sorted(SOURCE.rglob("*.rs")):
-        if authority_is_test_only and path.is_relative_to(FILE_AUTHORITY_MODULE):
-            # The disconnected replacement model is intentionally outside the
-            # production-escape inventory until its cfg(test) gate is deleted
-            # by the atomic cutover. Once enabled, it is scanned automatically.
+        if path.is_relative_to(FILE_AUTHORITY_MODULE):
+            # Inventory the legacy authority escapes that production cutover
+            # must delete, not the replacement authority's closed internal
+            # implementation. The replacement is production-visible now, so a
+            # cfg(test)-string sentinel can no longer define this boundary.
             continue
         relative = str(path.relative_to(ROOT))
         for number, line in enumerate(path.read_text().splitlines(), 1):
@@ -110,7 +109,11 @@ def main(argv: list[str]) -> int:
         )
         return 2
 
-    expected = json.loads(INVENTORY.read_text())
+    try:
+        expected = json.loads(INVENTORY.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"cannot read K1 FileAuthority inventory: {error}", file=sys.stderr)
+        return 1
     if actual == expected:
         return 0
     print("K1 FileAuthority operation inventory drifted", file=sys.stderr)

@@ -2224,6 +2224,12 @@ pub struct SyscallDispatcher {
     /// context at each backend dispatch boundary. HVPatch replaces the initial
     /// one-task binding when its root/child task is published.
     kernel_binding: RwLock<crate::kernel::KernelTaskBinding>,
+    /// One helper-backed FileAuthority root for this run. Run-loop entry
+    /// activates it before any guest host fork; constructors remain side-effect
+    /// free so library fixtures never fork from a test-harness worker thread.
+    /// It remains dormant for a syscall family until that family's complete
+    /// legacy state is replaced and deleted.
+    file_authority: RwLock<Option<Arc<crate::file_authority::FileAuthorityRun>>>,
     /// Process-local output buffering/streaming only. Linux descriptor state is
     /// owned exclusively by each captured Kernel [`crate::kernel::FileTable`].
     io: fs::RuntimeIo,
@@ -2994,6 +3000,7 @@ impl SyscallDispatcher {
         let _vma_snapshot = self.begin_host_alias_dispatch();
         Self {
             kernel_binding: RwLock::new(self.kernel_binding.read().clone()),
+            file_authority: RwLock::new(self.file_authority.read().clone()),
             io: self.io.fork_clone(),
             mem: self.mem.fork_private(),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
@@ -3106,6 +3113,7 @@ impl SyscallDispatcher {
     pub fn new() -> Self {
         Self {
             kernel_binding: RwLock::new(bootstrap_one_task_binding()),
+            file_authority: RwLock::new(None),
             io: fs::RuntimeIo::new(),
             mem: Arc::new(mem::MemAuthority::new(mem::MemState::new())),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
@@ -3264,6 +3272,26 @@ impl SyscallDispatcher {
 
     pub(crate) fn execution_backend(&self) -> crate::page_profile::ExecutionBackend {
         self.execution_backend
+    }
+
+    pub(crate) fn activate_file_authority(
+        &self,
+    ) -> Result<(), crate::file_authority::AuthorityFatal> {
+        let mut authority = self.file_authority.write();
+        if authority.is_none() {
+            *authority = Some(crate::file_authority::FileAuthorityRun::launch()?);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn file_authority_binding(
+        &self,
+    ) -> Option<crate::file_authority::FileAuthorityBinding> {
+        self.file_authority
+            .read()
+            .as_ref()
+            .map(|authority| authority.binding())
     }
 
     pub(crate) fn async_signal_wake_owner(&self) -> AsyncSignalWakeOwner {
@@ -8691,6 +8719,28 @@ mod routing_tests {
         196,
         197,
     ];
+
+    #[test]
+    fn dispatcher_activates_one_authenticated_file_authority_root() {
+        let dispatcher = SyscallDispatcher::new();
+        assert_eq!(dispatcher.file_authority_binding(), None);
+        dispatcher
+            .activate_file_authority()
+            .expect("activate FileAuthority");
+        let binding = dispatcher
+            .file_authority_binding()
+            .expect("active FileAuthority binding");
+        assert_eq!(binding.epoch.raw(), 1);
+        assert_eq!(binding.client.id.raw(), 1);
+        assert_eq!(
+            binding.generation,
+            crate::file_authority::ObjectGeneration::INITIAL
+        );
+        dispatcher
+            .activate_file_authority()
+            .expect("idempotent FileAuthority activation");
+        assert_eq!(dispatcher.file_authority_binding(), Some(binding));
+    }
 
     #[test]
     fn every_routed_number_resolves() {

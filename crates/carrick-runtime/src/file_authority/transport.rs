@@ -1,10 +1,12 @@
+#[cfg(test)]
 use std::sync::Arc;
 
+#[cfg(test)]
 use parking_lot::Mutex;
 
-use super::{
-    AuthorityCall, AuthorityFatal, AuthorityReply, Command, FileAuthorityCore, Request, Response,
-};
+#[cfg(test)]
+use super::FileAuthorityCore;
+use super::{AuthorityCall, AuthorityFatal, AuthorityReply, Command, Request, Response};
 
 pub(crate) trait FileAuthorityTransport: Send + Sync {
     fn transact(&self, call: AuthorityCall) -> Result<AuthorityReply, AuthorityFatal>;
@@ -26,11 +28,13 @@ pub(crate) trait FileAuthorityTransport: Send + Sync {
 /// The mutex is the transport serialization point only. The same request and
 /// response values are later encoded by the datagram client; callers never get
 /// access to the core, its leases, or its backing objects.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct DirectFileAuthority {
     core: Arc<Mutex<FileAuthorityCore>>,
 }
 
+#[cfg(test)]
 impl DirectFileAuthority {
     pub(crate) fn for_run(core: FileAuthorityCore) -> Self {
         Self {
@@ -39,6 +43,7 @@ impl DirectFileAuthority {
     }
 }
 
+#[cfg(test)]
 impl FileAuthorityTransport for DirectFileAuthority {
     fn transact(&self, call: AuthorityCall) -> Result<AuthorityReply, AuthorityFatal> {
         self.core.lock().execute_call(call)

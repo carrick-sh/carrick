@@ -2061,7 +2061,11 @@ fn native_reexec_successor_endpoint_is_authenticated_and_cloexec() {
         .prepare_single_use_reexec_successor(0xfeed)
         .expect("prepare successor");
     assert_eq!(successor.nonce(), 0xfeed);
-    for fd in [successor.socket_fd(), successor.process_lock_fd()] {
+    for fd in [
+        successor.socket_fd(),
+        successor.process_lock_fd(),
+        successor.lifetime_write_fd(),
+    ] {
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
         assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
     }

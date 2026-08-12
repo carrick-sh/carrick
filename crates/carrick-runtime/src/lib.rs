@@ -3445,5 +3445,4 @@ mod rosetta_detection_tests {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod file_authority; // Merge atomically: helper startup + all callers + old state deletion.
+pub(crate) mod file_authority;

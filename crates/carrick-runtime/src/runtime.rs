@@ -781,6 +781,9 @@ fn run_address_space_with_hvf_and_dispatcher(
     if let SupervisorRole::Parent(result) = role {
         return Ok(result);
     }
+    dispatcher.activate_file_authority().map_err(|error| {
+        RuntimeError::Configuration(format!("activate per-run FileAuthority: {error}"))
+    })?;
     let forked_init = matches!(role, SupervisorRole::ForkedInit);
     // Run the guest. In the forked guest-init, errors must NOT unwind (see below),
     // so capture the fallible tail in a closure and branch on the role.
