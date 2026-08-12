@@ -20,6 +20,10 @@ pub(super) enum AuthorityBacking {
         fd: OwnedFd,
         writable: bool,
     },
+    HostStream {
+        fd: OwnedFd,
+        kind: super::HostStreamKind,
+    },
     IoUring {
         data_fd: OwnedFd,
         lock_fd: OwnedFd,
@@ -47,6 +51,7 @@ impl AuthorityBacking {
             Self::Host { writable, .. } => DescriptionBackingSnapshot::HostFile {
                 writable: *writable,
             },
+            Self::HostStream { kind, .. } => DescriptionBackingSnapshot::HostStream { kind: *kind },
             Self::IoUring {
                 entries,
                 data_length,
@@ -74,6 +79,7 @@ impl AuthorityBacking {
             Self::Synthetic { .. }
             | Self::Host { .. }
             | Self::IoUring { .. }
+            | Self::HostStream { .. }
             | Self::Epoll(_)
             | Self::EventCounter { .. }
             | Self::PipeEnd { .. } => None,
@@ -84,6 +90,9 @@ impl AuthorityBacking {
     pub(super) fn host_fd(&self, purpose: super::CapabilityLeasePurpose) -> Option<RawFd> {
         match (self, purpose) {
             (Self::Host { fd, .. }, super::CapabilityLeasePurpose::MappingSource) => {
+                Some(fd.as_raw_fd())
+            }
+            (Self::HostStream { fd, .. }, super::CapabilityLeasePurpose::PollSource) => {
                 Some(fd.as_raw_fd())
             }
             (Self::IoUring { data_fd, .. }, super::CapabilityLeasePurpose::IoUringData) => {

@@ -1,5 +1,5 @@
 use std::io::{Seek as _, Write as _};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd as _, OwnedFd};
 use std::sync::Arc;
 
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
@@ -1454,6 +1454,87 @@ fn direct_and_ipc_epoll_lifecycle_tracks_forked_tables() {
 fn direct_and_ipc_transports_match_bounded_table_mutations() {
     bounded_table_mutation_model(Harness::new());
     bounded_table_mutation_model(Harness::new_ipc());
+}
+
+#[test]
+fn direct_and_ipc_host_streams_own_io_and_poll_capabilities() {
+    for ipc in [false, true] {
+        let mut harness = if ipc {
+            Harness::new_ipc()
+        } else {
+            Harness::new()
+        };
+        let table = harness.create_table();
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        for fd in fds {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert!(flags >= 0);
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+                0
+            );
+        }
+        let reader = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let writer = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let request = harness.request(
+            Command::AdoptHostStreamAndInstall {
+                table,
+                minimum: fd(3),
+                ceiling: NofileAllocationCeiling::from_captured_soft_limit(16),
+                descriptor_flags: DescriptorFlags::NONE,
+                access_mode: AccessMode::ReadOnly,
+                status_flags: StatusFlags::default(),
+                kind: HostStreamKind::Pipe {
+                    end: PipeEnd::Reader,
+                    bidirectional: false,
+                },
+                path: None,
+            },
+            ObjectGeneration::INITIAL,
+        );
+        let reply = harness
+            .transact(request, vec![reader])
+            .expect("adopt host stream");
+        let (read_fd, description) = match reply.response.outcome {
+            Outcome::HostStreamCreated {
+                fd, description, ..
+            } => (fd, description),
+            other => panic!("unexpected host stream: {other:?}"),
+        };
+        assert_eq!(
+            unsafe { libc::write(writer.as_raw_fd(), b"xy".as_ptr().cast(), 2) },
+            2
+        );
+        assert_eq!(harness.read(table, read_fd, 2), b"xy");
+        let poll_request = harness.request(
+            Command::AcquireCapabilityLease {
+                table,
+                fd: read_fd,
+                purpose: CapabilityLeasePurpose::PollSource,
+            },
+            ObjectGeneration::INITIAL,
+        );
+        let poll = harness
+            .transact(poll_request, Vec::new())
+            .expect("poll lease");
+        assert_eq!(poll.capabilities.len(), 1);
+        assert!(matches!(
+            harness.send(
+                Command::InspectDescription { description },
+                ObjectGeneration::INITIAL,
+            ),
+            Outcome::Description(DescriptionSnapshot {
+                backing: DescriptionBackingSnapshot::HostStream {
+                    kind: HostStreamKind::Pipe {
+                        end: PipeEnd::Reader,
+                        bidirectional: false,
+                    },
+                },
+                ..
+            })
+        ));
+    }
 }
 
 #[test]

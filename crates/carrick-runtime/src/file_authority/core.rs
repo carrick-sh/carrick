@@ -15,10 +15,10 @@ use super::types::{
     CapabilityLeasePurpose, ClientId, ClientIdentity, Command, DescriptionSnapshot,
     DescriptorFlags, EpollEventLimit, EpollHostPlan, EpollHostPlanAction, EpollInterestKey,
     EpollRegistration, FileDescriptionId, FileOffset, FileSlotNumber, FileTableId, HostErrno,
-    InterestGeneration, MappingAttachmentId, MappingLeaseDisposition, MappingRange, MappingRelease,
-    NofileAllocationCeiling, ObjectGeneration, Outcome, PipeCapacity, PipeEnd, PipeId, Request,
-    Response, Revision, SameSlotBehavior, SeekWhence, SlotPageLimit, SlotRangeAction, SlotSnapshot,
-    StatusFlags, VfsObjectId,
+    HostStreamKind, InterestGeneration, MappingAttachmentId, MappingLeaseDisposition, MappingRange,
+    MappingRelease, NofileAllocationCeiling, ObjectGeneration, Outcome, PipeCapacity, PipeEnd,
+    PipeId, Request, Response, Revision, SameSlotBehavior, SeekWhence, SlotPageLimit,
+    SlotRangeAction, SlotSnapshot, StatusFlags, VfsObjectId,
 };
 
 pub(super) const MAX_TERMINAL_DEDUP_ENTRIES: usize = 8_192;
@@ -447,6 +447,28 @@ impl FileAuthorityCore {
                         *access_mode,
                         *status_flags,
                         path.clone(),
+                    ),
+                    Command::AdoptHostStreamAndInstall {
+                        table,
+                        minimum,
+                        ceiling,
+                        descriptor_flags,
+                        access_mode,
+                        status_flags,
+                        kind,
+                        path,
+                    } => self.adopt_host_stream_and_install(
+                        request.client,
+                        *table,
+                        request.expected_generation,
+                        *minimum,
+                        *ceiling,
+                        *descriptor_flags,
+                        *access_mode,
+                        *status_flags,
+                        *kind,
+                        path.clone(),
+                        capabilities,
                     ),
                     Command::AdoptIoUringAndInstall {
                         table,
@@ -1371,6 +1393,60 @@ impl FileAuthorityCore {
             },
             None,
         ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn adopt_host_stream_and_install(
+        &mut self,
+        client: ClientIdentity,
+        table: FileTableId,
+        table_generation: ObjectGeneration,
+        minimum: FileSlotNumber,
+        ceiling: NofileAllocationCeiling,
+        descriptor_flags: DescriptorFlags,
+        access_mode: AccessMode,
+        status_flags: StatusFlags,
+        kind: HostStreamKind,
+        path: Option<CanonicalPath>,
+        capabilities: &mut Vec<OwnedFd>,
+    ) -> Result<Outcome, AuthorityError> {
+        self.require_bound_table(client, table, table_generation)?;
+        let fd = self.allocate_lowest(table, minimum, ceiling)?;
+        let host_fd = capabilities
+            .pop()
+            .ok_or(AuthorityError::HostBackingTypeMismatch)?;
+        validate_host_stream(host_fd.as_raw_fd(), access_mode, kind)?;
+        let description = self.allocate_description();
+        let outcome = self.commit_new_description_install(
+            table,
+            fd,
+            description,
+            descriptor_flags,
+            access_mode,
+            status_flags,
+            path,
+            AuthorityBacking::HostStream { fd: host_fd, kind },
+            None,
+        );
+        let Outcome::Installed {
+            table_revision,
+            description_revision,
+            ..
+        } = outcome
+        else {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "host stream install returned an unexpected outcome",
+            ));
+        };
+        Ok(Outcome::HostStreamCreated {
+            table,
+            fd,
+            description,
+            generation: ObjectGeneration::INITIAL,
+            kind,
+            table_revision,
+            description_revision,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2552,6 +2628,85 @@ impl FileAuthorityCore {
         })
     }
 
+    fn read_host_stream_description(
+        &mut self,
+        description: FileDescriptionId,
+        maximum: ByteCount,
+    ) -> Result<Outcome, AuthorityError> {
+        let fd = match &self
+            .descriptions
+            .get(&description)
+            .ok_or(AuthorityError::DescriptionNotFound)?
+            .backing
+        {
+            AuthorityBacking::HostStream { fd, .. } => fd.as_raw_fd(),
+            _ => return Err(AuthorityError::WrongOperationFamily),
+        };
+        let mut bytes = vec![0; usize::try_from(maximum.raw()).unwrap_or(usize::MAX)];
+        let read = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+        if read < 0 {
+            let error = HostErrno::last();
+            if error.raw() == libc::EAGAIN {
+                return Err(AuthorityError::WouldBlock);
+            }
+            return Err(AuthorityError::HostIo(error));
+        }
+        bytes.truncate(usize::try_from(read).map_err(|_| AuthorityError::InvalidOffset)?);
+        let revision = self.publish_mutation();
+        let state = self.descriptions.get_mut(&description).unwrap_or_else(|| {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "host-stream read lost its description",
+            ))
+        });
+        state.revision = revision;
+        Ok(Outcome::Bytes {
+            bytes,
+            offset: state.offset,
+            description_revision: revision,
+        })
+    }
+
+    fn write_host_stream_description(
+        &mut self,
+        description: FileDescriptionId,
+        bytes: &[u8],
+    ) -> Result<Outcome, AuthorityError> {
+        self.validate_payload(bytes)?;
+        let fd = match &self
+            .descriptions
+            .get(&description)
+            .ok_or(AuthorityError::DescriptionNotFound)?
+            .backing
+        {
+            AuthorityBacking::HostStream { fd, .. } => fd.as_raw_fd(),
+            _ => return Err(AuthorityError::WrongOperationFamily),
+        };
+        let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        if written < 0 {
+            let error = HostErrno::last();
+            if error.raw() == libc::EAGAIN {
+                return Err(AuthorityError::WouldBlock);
+            }
+            return Err(AuthorityError::HostIo(error));
+        }
+        let count = ByteCount::bounded(
+            u32::try_from(written).map_err(|_| AuthorityError::PayloadTooLarge)?,
+        )?;
+        let revision = self.publish_mutation();
+        let state = self.descriptions.get_mut(&description).unwrap_or_else(|| {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "host-stream write lost its description",
+            ))
+        });
+        state.revision = revision;
+        Ok(Outcome::Written {
+            count,
+            offset: state.offset,
+            description_revision: revision,
+            object_revision: None,
+        })
+    }
+
     fn pipe_for_slot(
         &self,
         client: ClientIdentity,
@@ -2634,6 +2789,9 @@ impl FileAuthorityCore {
         if matches!(description.backing, AuthorityBacking::PipeEnd { .. }) {
             return self.read_pipe_description(slot.description, maximum);
         }
+        if matches!(description.backing, AuthorityBacking::HostStream { .. }) {
+            return self.read_host_stream_description(slot.description, maximum);
+        }
         let offset = description.offset;
         let start = usize::try_from(offset.raw()).map_err(|_| AuthorityError::InvalidOffset)?;
         let maximum =
@@ -2675,7 +2833,8 @@ impl FileAuthorityCore {
             AuthorityBacking::Epoll(_)
             | AuthorityBacking::EventCounter { .. }
             | AuthorityBacking::PipeEnd { .. }
-            | AuthorityBacking::IoUring { .. } => {
+            | AuthorityBacking::IoUring { .. }
+            | AuthorityBacking::HostStream { .. } => {
                 return Err(AuthorityError::WrongOperationFamily);
             }
         };
@@ -2721,6 +2880,9 @@ impl FileAuthorityCore {
         if matches!(description.backing, AuthorityBacking::PipeEnd { .. }) {
             return self.write_pipe_description(slot.description, bytes);
         }
+        if matches!(description.backing, AuthorityBacking::HostStream { .. }) {
+            return self.write_host_stream_description(slot.description, bytes);
+        }
         let start =
             usize::try_from(description.offset.raw()).map_err(|_| AuthorityError::InvalidOffset)?;
         let object = description.backing.vfs_object();
@@ -2752,7 +2914,8 @@ impl FileAuthorityCore {
             AuthorityBacking::Epoll(_)
             | AuthorityBacking::EventCounter { .. }
             | AuthorityBacking::PipeEnd { .. }
-            | AuthorityBacking::IoUring { .. } => {
+            | AuthorityBacking::IoUring { .. }
+            | AuthorityBacking::HostStream { .. } => {
                 return Err(AuthorityError::WrongOperationFamily);
             }
         };
@@ -2798,7 +2961,8 @@ impl FileAuthorityCore {
                 AuthorityBacking::Epoll(_)
                 | AuthorityBacking::EventCounter { .. }
                 | AuthorityBacking::PipeEnd { .. }
-                | AuthorityBacking::IoUring { .. } => {
+                | AuthorityBacking::IoUring { .. }
+                | AuthorityBacking::HostStream { .. } => {
                     abort_fatal(AuthorityFatal::InvariantViolation(
                         "generic write reached a typed-operation backing",
                     ));
@@ -3476,7 +3640,8 @@ impl FileAuthorityCore {
             AuthorityBacking::Epoll(_)
             | AuthorityBacking::EventCounter { .. }
             | AuthorityBacking::PipeEnd { .. }
-            | AuthorityBacking::IoUring { .. } => Err(AuthorityError::NotSeekable),
+            | AuthorityBacking::IoUring { .. }
+            | AuthorityBacking::HostStream { .. } => Err(AuthorityError::NotSeekable),
         }
     }
 
@@ -3645,10 +3810,41 @@ fn release_mapping_ranges(
 
 fn expected_request_capabilities(command: &Command) -> usize {
     match command {
-        Command::AdoptHostFileAndInstall { .. } => 1,
+        Command::AdoptHostFileAndInstall { .. } | Command::AdoptHostStreamAndInstall { .. } => 1,
         Command::AdoptIoUringAndInstall { .. } => 2,
         _ => 0,
     }
+}
+
+fn validate_host_stream(
+    fd: i32,
+    access_mode: AccessMode,
+    kind: HostStreamKind,
+) -> Result<(), AuthorityError> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return Err(AuthorityError::HostIo(HostErrno::last()));
+    }
+    let host_kind = stat.st_mode & libc::S_IFMT;
+    let kind_matches = match kind {
+        HostStreamKind::Pipe { .. } => host_kind == libc::S_IFIFO,
+        HostStreamKind::Pty(_) | HostStreamKind::CharacterDevice => host_kind == libc::S_IFCHR,
+        HostStreamKind::Socket { .. } => host_kind == libc::S_IFSOCK,
+    };
+    if !kind_matches {
+        return Err(AuthorityError::HostBackingTypeMismatch);
+    }
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(AuthorityError::HostIo(HostErrno::last()));
+    }
+    let host_access = flags & libc::O_ACCMODE;
+    if (access_mode.readable() && host_access == libc::O_WRONLY)
+        || (access_mode.writable() && host_access == libc::O_RDONLY)
+    {
+        return Err(AuthorityError::HostAccessMismatch);
+    }
+    Ok(())
 }
 
 fn validate_regular_file_length(fd: i32, minimum: u64) -> Result<(), AuthorityError> {

@@ -9,10 +9,10 @@ use super::{
     DescriptionBackingSnapshot, DescriptionSnapshot, DescriptorFlags, EpollEventLimit,
     EpollHostPlan, EpollHostPlanAction, EpollInterestKey, EpollReadyEvent, EpollRegistration,
     EpollUserData, FileDescriptionId, FileOffset, FileSlotNumber, FileTableId, HostErrno,
-    InterestGeneration, MappingAttachmentId, MappingLeaseDisposition, MappingRange, MappingRelease,
-    NofileAllocationCeiling, ObjectGeneration, Outcome, PipeCapacity, PipeEnd, PipeId, Request,
-    RequestId, Response, Revision, SameSlotBehavior, SeekWhence, SlotPageLimit, SlotRangeAction,
-    SlotSnapshot, StatusFlags, VfsObjectId,
+    HostStreamKind, InterestGeneration, MappingAttachmentId, MappingLeaseDisposition, MappingRange,
+    MappingRelease, NofileAllocationCeiling, ObjectGeneration, Outcome, PipeCapacity, PipeEnd,
+    PipeId, Request, RequestId, Response, Revision, SameSlotBehavior, SeekWhence, SlotPageLimit,
+    SlotRangeAction, SlotSnapshot, StatusFlags, VfsObjectId,
 };
 
 const MAGIC: u32 = 0x4341_4641;
@@ -259,6 +259,7 @@ fn command_tag(command: &Command) -> u8 {
         Command::ReleaseMappingAttachment { .. } => 42,
         Command::ForkCopyMappings { .. } => 43,
         Command::AdoptIoUringAndInstall { .. } => 44,
+        Command::AdoptHostStreamAndInstall { .. } => 45,
     }
 }
 
@@ -373,6 +374,25 @@ fn encode_command(writer: &mut Writer, command: &Command) -> Result<(), Authorit
             writer.u32(descriptor_flags.raw());
             writer.u8(access_mode_tag(*access_mode));
             writer.u64(status_flags.raw());
+            writer.optional_path(path.as_ref())?;
+        }
+        Command::AdoptHostStreamAndInstall {
+            table,
+            minimum,
+            ceiling,
+            descriptor_flags,
+            access_mode,
+            status_flags,
+            kind,
+            path,
+        } => {
+            writer.u64(table.raw());
+            writer.i32(minimum.raw());
+            writer.u32(ceiling.raw());
+            writer.u32(descriptor_flags.raw());
+            writer.u8(access_mode_tag(*access_mode));
+            writer.u64(status_flags.raw());
+            writer.host_stream_kind(*kind);
             writer.optional_path(path.as_ref())?;
         }
         Command::AdoptIoUringAndInstall {
@@ -852,6 +872,17 @@ fn decode_command(tag: u8, reader: &mut Reader<'_>) -> Result<Command, Authority
             entries: reader.u32()?,
             data_length: reader.u64()?,
         },
+        45 => Command::AdoptHostStreamAndInstall {
+            table: reader.table_id()?,
+            minimum: reader.slot()?,
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(reader.u32()?),
+            descriptor_flags: DescriptorFlags::from_linux_bits(reader.u32()?)
+                .map_err(|_| AuthorityFatal::MalformedFrame("invalid descriptor flags"))?,
+            access_mode: reader.access_mode()?,
+            status_flags: StatusFlags::from_linux_bits(reader.u64()?),
+            kind: reader.host_stream_kind()?,
+            path: reader.optional_path()?,
+        },
         _ => return malformed("unknown operation"),
     })
 }
@@ -901,6 +932,24 @@ fn encode_outcome(writer: &mut Writer, outcome: &Outcome) -> Result<(), Authorit
             writer.u64(pipe.raw());
             writer.u32(capacity.raw());
             writer.u64(stream_revision.raw());
+        }
+        Outcome::HostStreamCreated {
+            table,
+            fd,
+            description,
+            generation,
+            kind,
+            table_revision,
+            description_revision,
+        } => {
+            writer.u8(44);
+            writer.u64(table.raw());
+            writer.i32(fd.raw());
+            writer.u64(description.raw());
+            writer.u64(generation.raw());
+            writer.host_stream_kind(*kind);
+            writer.u64(table_revision.raw());
+            writer.u64(description_revision.raw());
         }
         Outcome::IoUringCreated {
             table,
@@ -1574,6 +1623,15 @@ fn decode_outcome(reader: &mut Reader<'_>) -> Result<Outcome, AuthorityFatal> {
             table_revision: reader.revision()?,
             description_revision: reader.revision()?,
         },
+        44 => Outcome::HostStreamCreated {
+            table: reader.table_id()?,
+            fd: reader.slot()?,
+            description: reader.description_id()?,
+            generation: reader.generation()?,
+            kind: reader.host_stream_kind()?,
+            table_revision: reader.revision()?,
+            description_revision: reader.revision()?,
+        },
         _ => return malformed("unknown response outcome"),
     })
 }
@@ -1721,8 +1779,9 @@ const fn slot_range_action_tag(action: SlotRangeAction) -> u8 {
 const fn capability_purpose_tag(purpose: CapabilityLeasePurpose) -> u8 {
     match purpose {
         CapabilityLeasePurpose::MappingSource => 0,
-        CapabilityLeasePurpose::IoUringData => 1,
-        CapabilityLeasePurpose::IoUringLock => 2,
+        CapabilityLeasePurpose::PollSource => 1,
+        CapabilityLeasePurpose::IoUringData => 2,
+        CapabilityLeasePurpose::IoUringLock => 3,
     }
 }
 
@@ -1807,6 +1866,37 @@ impl Writer {
     fn epoll_registration(&mut self, registration: EpollRegistration) {
         self.u32(registration.events.bits());
         self.u64(registration.data.raw());
+    }
+
+    fn host_stream_kind(&mut self, kind: HostStreamKind) {
+        match kind {
+            HostStreamKind::Pipe { end, bidirectional } => {
+                self.u8(0);
+                self.u8(match end {
+                    PipeEnd::Reader => 0,
+                    PipeEnd::Writer => 1,
+                });
+                self.bool(bidirectional);
+            }
+            HostStreamKind::Pty(role) => {
+                self.u8(1);
+                self.u8(match role {
+                    super::PtyRole::Master => 0,
+                    super::PtyRole::Slave => 1,
+                });
+            }
+            HostStreamKind::Socket {
+                family,
+                socket_type,
+                protocol,
+            } => {
+                self.u8(2);
+                self.i32(family);
+                self.i32(socket_type);
+                self.i32(protocol);
+            }
+            HostStreamKind::CharacterDevice => self.u8(3),
+        }
     }
 
     fn mapping_range(&mut self, range: MappingRange) {
@@ -1996,6 +2086,10 @@ impl Writer {
                 self.u32(*entries);
                 self.u64(*data_length);
             }
+            DescriptionBackingSnapshot::HostStream { kind } => {
+                self.u8(7);
+                self.host_stream_kind(*kind);
+            }
         }
         Ok(())
     }
@@ -2141,6 +2235,31 @@ impl<'a> Reader<'a> {
         })
     }
 
+    fn host_stream_kind(&mut self) -> Result<HostStreamKind, AuthorityFatal> {
+        match self.u8()? {
+            0 => Ok(HostStreamKind::Pipe {
+                end: match self.u8()? {
+                    0 => PipeEnd::Reader,
+                    1 => PipeEnd::Writer,
+                    _ => return malformed("invalid host pipe end"),
+                },
+                bidirectional: self.bool()?,
+            }),
+            1 => Ok(HostStreamKind::Pty(match self.u8()? {
+                0 => super::PtyRole::Master,
+                1 => super::PtyRole::Slave,
+                _ => return malformed("invalid pty role"),
+            })),
+            2 => Ok(HostStreamKind::Socket {
+                family: self.i32()?,
+                socket_type: self.i32()?,
+                protocol: self.i32()?,
+            }),
+            3 => Ok(HostStreamKind::CharacterDevice),
+            _ => malformed("invalid host stream kind"),
+        }
+    }
+
     fn mapping_attachment_id(&mut self) -> Result<MappingAttachmentId, AuthorityFatal> {
         MappingAttachmentId::from_snapshot(self.u64()?)
             .map_err(|_| AuthorityFatal::MalformedFrame("invalid mapping attachment id"))
@@ -2270,8 +2389,9 @@ impl<'a> Reader<'a> {
     fn capability_purpose(&mut self) -> Result<CapabilityLeasePurpose, AuthorityFatal> {
         match self.u8()? {
             0 => Ok(CapabilityLeasePurpose::MappingSource),
-            1 => Ok(CapabilityLeasePurpose::IoUringData),
-            2 => Ok(CapabilityLeasePurpose::IoUringLock),
+            1 => Ok(CapabilityLeasePurpose::PollSource),
+            2 => Ok(CapabilityLeasePurpose::IoUringData),
+            3 => Ok(CapabilityLeasePurpose::IoUringLock),
             _ => malformed("invalid capability lease purpose"),
         }
     }
@@ -2358,6 +2478,9 @@ impl<'a> Reader<'a> {
             6 => DescriptionBackingSnapshot::IoUring {
                 entries: self.u32()?,
                 data_length: self.u64()?,
+            },
+            7 => DescriptionBackingSnapshot::HostStream {
+                kind: self.host_stream_kind()?,
             },
             _ => return malformed("invalid description backing"),
         };
@@ -2523,6 +2646,20 @@ mod tests {
                 descriptor_flags: DescriptorFlags::NONE,
                 access_mode: AccessMode::WriteOnly,
                 status_flags: StatusFlags::default(),
+                path: None,
+            },
+            Command::AdoptHostStreamAndInstall {
+                table,
+                minimum: FileSlotNumber::for_open_fd(3).expect("fd"),
+                ceiling: NofileAllocationCeiling::from_captured_soft_limit(9),
+                descriptor_flags: DescriptorFlags::CLOSE_ON_EXEC,
+                access_mode: AccessMode::ReadWrite,
+                status_flags: StatusFlags::default(),
+                kind: HostStreamKind::Socket {
+                    family: 2,
+                    socket_type: 1,
+                    protocol: 6,
+                },
                 path: None,
             },
             Command::AdoptIoUringAndInstall {
@@ -2695,6 +2832,19 @@ mod tests {
                 table,
                 generation: ObjectGeneration::INITIAL,
                 revision: Revision::from_wire(1),
+            },
+            Outcome::HostStreamCreated {
+                table,
+                fd: slot,
+                description,
+                generation: ObjectGeneration::INITIAL,
+                kind: HostStreamKind::Socket {
+                    family: 2,
+                    socket_type: 1,
+                    protocol: 6,
+                },
+                table_revision: Revision::from_wire(7),
+                description_revision: Revision::from_wire(7),
             },
             Outcome::IoUringCreated {
                 table,

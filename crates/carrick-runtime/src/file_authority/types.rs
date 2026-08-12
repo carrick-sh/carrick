@@ -354,6 +354,27 @@ pub(crate) enum PipeEnd {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PtyRole {
+    Master,
+    Slave,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostStreamKind {
+    Pipe {
+        end: PipeEnd,
+        bidirectional: bool,
+    },
+    Pty(PtyRole),
+    Socket {
+        family: i32,
+        socket_type: i32,
+        protocol: i32,
+    },
+    CharacterDevice,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(transparent)]
 pub(crate) struct PipeCapacity(u32);
 
@@ -406,6 +427,7 @@ impl SlotPageLimit {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CapabilityLeasePurpose {
     MappingSource,
+    PollSource,
     IoUringData,
     IoUringLock,
 }
@@ -581,6 +603,16 @@ pub(crate) enum Command {
         access_mode: AccessMode,
         status_flags: StatusFlags,
         writable: bool,
+        path: Option<CanonicalPath>,
+    },
+    AdoptHostStreamAndInstall {
+        table: FileTableId,
+        minimum: FileSlotNumber,
+        ceiling: NofileAllocationCeiling,
+        descriptor_flags: DescriptorFlags,
+        access_mode: AccessMode,
+        status_flags: StatusFlags,
+        kind: HostStreamKind,
         path: Option<CanonicalPath>,
     },
     AdoptIoUringAndInstall {
@@ -783,6 +815,15 @@ pub(crate) enum Outcome {
         pipe: PipeId,
         capacity: PipeCapacity,
         stream_revision: Revision,
+    },
+    HostStreamCreated {
+        table: FileTableId,
+        fd: FileSlotNumber,
+        description: FileDescriptionId,
+        generation: ObjectGeneration,
+        kind: HostStreamKind,
+        table_revision: Revision,
+        description_revision: Revision,
     },
     IoUringCreated {
         table: FileTableId,
@@ -1028,6 +1069,7 @@ pub(crate) enum DescriptionBackingSnapshot {
     EventCounter { counter: u64, semaphore: bool },
     PipeEnd { pipe: PipeId, end: PipeEnd },
     IoUring { entries: u32, data_length: u64 },
+    HostStream { kind: HostStreamKind },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
