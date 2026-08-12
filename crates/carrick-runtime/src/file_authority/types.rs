@@ -546,6 +546,24 @@ pub(crate) enum Command {
         ceiling: NofileAllocationCeiling,
         descriptor_flags: DescriptorFlags,
     },
+    CreateTimerAndInstall {
+        table: FileTableId,
+        minimum: FileSlotNumber,
+        ceiling: NofileAllocationCeiling,
+        descriptor_flags: DescriptorFlags,
+        status_flags: StatusFlags,
+    },
+    SetTimer {
+        table: FileTableId,
+        fd: FileSlotNumber,
+        interval_ns: u64,
+        initial_ns: u64,
+    },
+    ExpireTimer {
+        table: FileTableId,
+        fd: FileSlotNumber,
+        expirations: u64,
+    },
     CreateEventCounterAndInstall {
         table: FileTableId,
         initial: u64,
@@ -843,6 +861,26 @@ pub(crate) enum Outcome {
         table_revision: Revision,
         description_revision: Revision,
     },
+    TimerCreated {
+        table: FileTableId,
+        fd: FileSlotNumber,
+        description: FileDescriptionId,
+        generation: ObjectGeneration,
+        table_revision: Revision,
+        description_revision: Revision,
+    },
+    TimerSet {
+        description: FileDescriptionId,
+        interval_ns: u64,
+        initial_ns: u64,
+        description_revision: Revision,
+    },
+    TimerExpired {
+        description: FileDescriptionId,
+        expirations: u64,
+        pending: u64,
+        description_revision: Revision,
+    },
     EventCounterCreated {
         table: FileTableId,
         fd: FileSlotNumber,
@@ -1062,14 +1100,38 @@ pub(crate) struct DescriptionSnapshot {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DescriptionBackingSnapshot {
-    Synthetic { length: u64 },
-    VfsFile { object: VfsObjectId },
-    HostFile { writable: bool },
-    Epoll { interests: u32 },
-    EventCounter { counter: u64, semaphore: bool },
-    PipeEnd { pipe: PipeId, end: PipeEnd },
-    IoUring { entries: u32, data_length: u64 },
-    HostStream { kind: HostStreamKind },
+    Synthetic {
+        length: u64,
+    },
+    VfsFile {
+        object: VfsObjectId,
+    },
+    HostFile {
+        writable: bool,
+    },
+    Epoll {
+        interests: u32,
+    },
+    EventCounter {
+        counter: u64,
+        semaphore: bool,
+    },
+    Timer {
+        interval_ns: u64,
+        initial_ns: u64,
+        pending: u64,
+    },
+    PipeEnd {
+        pipe: PipeId,
+        end: PipeEnd,
+    },
+    IoUring {
+        entries: u32,
+        data_length: u64,
+    },
+    HostStream {
+        kind: HostStreamKind,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -1149,6 +1211,8 @@ pub(crate) enum AuthorityError {
     InvalidEpollEventLimit,
     #[error("description is not an event counter")]
     NotEventCounter,
+    #[error("description is not a timer")]
+    NotTimer,
     #[error("event-counter operation would block")]
     WouldBlock,
     #[error("event-counter write value is invalid or would overflow")]

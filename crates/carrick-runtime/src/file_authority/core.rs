@@ -369,6 +369,45 @@ impl FileAuthorityCore {
                         *ceiling,
                         *descriptor_flags,
                     ),
+                    Command::CreateTimerAndInstall {
+                        table,
+                        minimum,
+                        ceiling,
+                        descriptor_flags,
+                        status_flags,
+                    } => self.create_timer_and_install(
+                        request.client,
+                        *table,
+                        request.expected_generation,
+                        *minimum,
+                        *ceiling,
+                        *descriptor_flags,
+                        *status_flags,
+                    ),
+                    Command::SetTimer {
+                        table,
+                        fd,
+                        interval_ns,
+                        initial_ns,
+                    } => self.set_timer(
+                        request.client,
+                        *table,
+                        request.expected_generation,
+                        *fd,
+                        *interval_ns,
+                        *initial_ns,
+                    ),
+                    Command::ExpireTimer {
+                        table,
+                        fd,
+                        expirations,
+                    } => self.expire_timer(
+                        request.client,
+                        *table,
+                        request.expected_generation,
+                        *fd,
+                        *expirations,
+                    ),
                     Command::CreateEventCounterAndInstall {
                         table,
                         initial,
@@ -996,6 +1035,146 @@ impl FileAuthorityCore {
             generation: ObjectGeneration::INITIAL,
             table_revision,
             description_revision,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_timer_and_install(
+        &mut self,
+        client: ClientIdentity,
+        table: FileTableId,
+        table_generation: ObjectGeneration,
+        minimum: FileSlotNumber,
+        ceiling: NofileAllocationCeiling,
+        descriptor_flags: DescriptorFlags,
+        status_flags: StatusFlags,
+    ) -> Result<Outcome, AuthorityError> {
+        self.require_bound_table(client, table, table_generation)?;
+        let fd = self.allocate_lowest(table, minimum, ceiling)?;
+        let description = self.allocate_description();
+        let outcome = self.commit_new_description_install(
+            table,
+            fd,
+            description,
+            descriptor_flags,
+            AccessMode::ReadOnly,
+            status_flags,
+            None,
+            AuthorityBacking::Timer {
+                interval_ns: 0,
+                initial_ns: 0,
+                pending: 0,
+            },
+            None,
+        );
+        let Outcome::Installed {
+            table_revision,
+            description_revision,
+            ..
+        } = outcome
+        else {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "timer install returned an unexpected outcome",
+            ));
+        };
+        Ok(Outcome::TimerCreated {
+            table,
+            fd,
+            description,
+            generation: ObjectGeneration::INITIAL,
+            table_revision,
+            description_revision,
+        })
+    }
+
+    fn set_timer(
+        &mut self,
+        client: ClientIdentity,
+        table: FileTableId,
+        expected: ObjectGeneration,
+        fd: FileSlotNumber,
+        interval_ns: u64,
+        initial_ns: u64,
+    ) -> Result<Outcome, AuthorityError> {
+        let description = self.slot(client, table, expected, fd)?.description;
+        let state = self
+            .descriptions
+            .get(&description)
+            .ok_or(AuthorityError::DescriptionNotFound)?;
+        if !matches!(state.backing, AuthorityBacking::Timer { .. }) {
+            return Err(AuthorityError::NotTimer);
+        }
+        let revision = self.publish_mutation();
+        let state = self.descriptions.get_mut(&description).unwrap_or_else(|| {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "timer set lost its description",
+            ))
+        });
+        state.backing = AuthorityBacking::Timer {
+            interval_ns,
+            initial_ns,
+            pending: 0,
+        };
+        state.readiness = ReadinessSnapshot {
+            ready: LinuxEpollEvents::empty(),
+            read_available: 0,
+        };
+        state.revision = revision;
+        Ok(Outcome::TimerSet {
+            description,
+            interval_ns,
+            initial_ns,
+            description_revision: revision,
+        })
+    }
+
+    fn expire_timer(
+        &mut self,
+        client: ClientIdentity,
+        table: FileTableId,
+        expected: ObjectGeneration,
+        fd: FileSlotNumber,
+        expirations: u64,
+    ) -> Result<Outcome, AuthorityError> {
+        let description = self.slot(client, table, expected, fd)?.description;
+        let pending = match self
+            .descriptions
+            .get(&description)
+            .ok_or(AuthorityError::DescriptionNotFound)?
+            .backing
+        {
+            AuthorityBacking::Timer { pending, .. } => {
+                pending.checked_add(expirations).unwrap_or_else(|| {
+                    abort_fatal(AuthorityFatal::InvariantViolation(
+                        "timer expiration overflow",
+                    ))
+                })
+            }
+            _ => return Err(AuthorityError::NotTimer),
+        };
+        let revision = self.publish_mutation();
+        let state = self.descriptions.get_mut(&description).unwrap_or_else(|| {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "timer expiration lost its description",
+            ))
+        });
+        let AuthorityBacking::Timer {
+            pending: stored, ..
+        } = &mut state.backing
+        else {
+            abort_fatal(AuthorityFatal::InvariantViolation("timer backing changed"));
+        };
+        *stored = pending;
+        state.readiness = ReadinessSnapshot {
+            ready: LinuxEpollEvents::IN,
+            read_available: 8,
+        };
+        state.revision = revision;
+        Ok(Outcome::TimerExpired {
+            description,
+            expirations,
+            pending,
+            description_revision: revision,
         })
     }
 
@@ -2628,6 +2807,49 @@ impl FileAuthorityCore {
         })
     }
 
+    fn read_timer_description(
+        &mut self,
+        description: FileDescriptionId,
+        maximum: ByteCount,
+    ) -> Result<Outcome, AuthorityError> {
+        if maximum.raw() < 8 {
+            return Err(AuthorityError::InvalidOffset);
+        }
+        let pending = match self
+            .descriptions
+            .get(&description)
+            .ok_or(AuthorityError::DescriptionNotFound)?
+            .backing
+        {
+            AuthorityBacking::Timer { pending, .. } if pending > 0 => pending,
+            AuthorityBacking::Timer { .. } => return Err(AuthorityError::WouldBlock),
+            _ => return Err(AuthorityError::NotTimer),
+        };
+        let revision = self.publish_mutation();
+        let state = self.descriptions.get_mut(&description).unwrap_or_else(|| {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "timer read lost its description",
+            ))
+        });
+        let AuthorityBacking::Timer {
+            pending: stored, ..
+        } = &mut state.backing
+        else {
+            abort_fatal(AuthorityFatal::InvariantViolation("timer backing changed"));
+        };
+        *stored = 0;
+        state.readiness = ReadinessSnapshot {
+            ready: LinuxEpollEvents::empty(),
+            read_available: 0,
+        };
+        state.revision = revision;
+        Ok(Outcome::Bytes {
+            bytes: pending.to_ne_bytes().to_vec(),
+            offset: state.offset,
+            description_revision: revision,
+        })
+    }
+
     fn read_host_stream_description(
         &mut self,
         description: FileDescriptionId,
@@ -2792,6 +3014,9 @@ impl FileAuthorityCore {
         if matches!(description.backing, AuthorityBacking::HostStream { .. }) {
             return self.read_host_stream_description(slot.description, maximum);
         }
+        if matches!(description.backing, AuthorityBacking::Timer { .. }) {
+            return self.read_timer_description(slot.description, maximum);
+        }
         let offset = description.offset;
         let start = usize::try_from(offset.raw()).map_err(|_| AuthorityError::InvalidOffset)?;
         let maximum =
@@ -2834,7 +3059,8 @@ impl FileAuthorityCore {
             | AuthorityBacking::EventCounter { .. }
             | AuthorityBacking::PipeEnd { .. }
             | AuthorityBacking::IoUring { .. }
-            | AuthorityBacking::HostStream { .. } => {
+            | AuthorityBacking::HostStream { .. }
+            | AuthorityBacking::Timer { .. } => {
                 return Err(AuthorityError::WrongOperationFamily);
             }
         };
@@ -2915,7 +3141,8 @@ impl FileAuthorityCore {
             | AuthorityBacking::EventCounter { .. }
             | AuthorityBacking::PipeEnd { .. }
             | AuthorityBacking::IoUring { .. }
-            | AuthorityBacking::HostStream { .. } => {
+            | AuthorityBacking::HostStream { .. }
+            | AuthorityBacking::Timer { .. } => {
                 return Err(AuthorityError::WrongOperationFamily);
             }
         };
@@ -2962,7 +3189,8 @@ impl FileAuthorityCore {
                 | AuthorityBacking::EventCounter { .. }
                 | AuthorityBacking::PipeEnd { .. }
                 | AuthorityBacking::IoUring { .. }
-                | AuthorityBacking::HostStream { .. } => {
+                | AuthorityBacking::HostStream { .. }
+                | AuthorityBacking::Timer { .. } => {
                     abort_fatal(AuthorityFatal::InvariantViolation(
                         "generic write reached a typed-operation backing",
                     ));
@@ -3641,7 +3869,8 @@ impl FileAuthorityCore {
             | AuthorityBacking::EventCounter { .. }
             | AuthorityBacking::PipeEnd { .. }
             | AuthorityBacking::IoUring { .. }
-            | AuthorityBacking::HostStream { .. } => Err(AuthorityError::NotSeekable),
+            | AuthorityBacking::HostStream { .. }
+            | AuthorityBacking::Timer { .. } => Err(AuthorityError::NotSeekable),
         }
     }
 
