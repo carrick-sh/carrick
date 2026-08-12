@@ -7,6 +7,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "crates/carrick-runtime/src"
@@ -36,8 +37,8 @@ PATTERNS = {
 }
 
 
-def generate() -> dict[str, object]:
-    entries: list[dict[str, object]] = []
+def generate() -> dict[str, Any]:
+    entries: list[dict[str, Any]] = []
     for path in sorted(SOURCE.rglob("*.rs")):
         relative = str(path.relative_to(ROOT))
         for number, line in enumerate(path.read_text().splitlines(), 1):
