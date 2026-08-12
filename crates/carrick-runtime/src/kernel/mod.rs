@@ -37,10 +37,13 @@ pub use ids::{
     InvalidLinuxSignal, LinuxSignal, LinuxTid, MmId, ObjectIdError, ObjectIdRegistry,
     ProcessGroupId, SessionId, SighandId, TaskId, TaskSerial, ThreadSerial,
 };
+pub(crate) use objects::FileDescriptionBacking;
 pub use objects::{
-    Credentials, FileDescription, FileSlot, FileTable, FsContext, LinuxWaitStatus, Mm,
-    ObjectGraphError, PidfdTarget, ProcessGroup, RunnerDirective, Session, Sighand,
-    SignalDisposition, Task, TaskKey, TaskLifecycle, TaskPendingSignals, TaskRef, TaskRusage,
+    Credentials, FileDescription, FileDescriptionBackingKind, FileDescriptionBackingSnapshot,
+    FileSlot, FileTable, FsContext, HandlerFrameState, LinuxWaitStatus, Mm, ObjectGraphError,
+    OpenDescriptionBackingSnapshot, PendingQueue, PendingSignal, PidfdTarget, ProcessGroup,
+    RunnerDirective, Session, Sighand, SignalAuthority, SignalDequeue, SignalDisposition,
+    SignalPendingOwner, Task, TaskKey, TaskLifecycle, TaskPendingSignals, TaskRef, TaskRusage,
     TaskShared, TaskSharedCloneError, Thread, ThreadKey, ThreadRef, ThreadResources, ThreadRunner,
     ThreadSignalState, Zombie,
 };

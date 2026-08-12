@@ -148,6 +148,7 @@ impl SyscallDispatcher {
         };
         let open = in_file.description.read();
         match &*open {
+            OpenDescription::Closed { .. } => Ok(Err(LINUX_EBADF)),
             OpenDescription::File { offset, .. }
             | OpenDescription::SyntheticFile { offset, .. } => Ok(Ok(*offset)),
             // HostFile: current offset is the kernel's; query via lseek.
@@ -207,6 +208,7 @@ impl SyscallDispatcher {
             return Ok(buf);
         }
         let bytes = match &*open {
+            OpenDescription::Closed { .. } => return Err(LINUX_EBADF),
             OpenDescription::File { contents, .. } => contents.read_at(offset, count),
             OpenDescription::SyntheticFile { contents, .. } => {
                 let available = contents.get(offset..).unwrap_or_default();

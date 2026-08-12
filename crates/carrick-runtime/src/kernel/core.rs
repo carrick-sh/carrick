@@ -6,10 +6,13 @@ use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::address::MmBackend;
 use super::frame_inventory::{FrameInventoryAuthority, FrameInventoryReserveError};
-use super::ids::{LinuxTid, ObjectIdError, ObjectIdRegistry, ProcessGroupId, SessionId, TaskId};
+use super::ids::{
+    FileTableId, LinuxTid, ObjectIdError, ObjectIdRegistry, ProcessGroupId, SessionId, TaskId,
+};
 use super::objects::{
-    Credentials, FileTable, FsContext, Mm, ObjectGraphError, ProcessGroup, Session, Sighand, Task,
-    TaskKey, TaskRef, TaskShared, Thread, ThreadKey, ThreadRef, ThreadResources, Zombie,
+    Credentials, FileSlot, FileTable, FsContext, Mm, ObjectGraphError, ProcessGroup, Session,
+    Sighand, Task, TaskKey, TaskRef, TaskShared, Thread, ThreadKey, ThreadRef, ThreadResources,
+    Zombie,
 };
 use super::registry::{IdError, IdRegistry, TaskClaim, ThreadClaim};
 
@@ -49,6 +52,14 @@ impl KernelContext {
 
     pub const fn revision(&self) -> TaskRevision {
         self.revision
+    }
+
+    pub fn signal_authority(&self) -> super::objects::SignalAuthority {
+        super::objects::SignalAuthority::new(
+            self.shared.sighand(),
+            self.shared.pending_signals(),
+            Arc::clone(&self.thread),
+        )
     }
 
     /// Retain this exact captured generation for a lifecycle handoff. This is
@@ -214,7 +225,22 @@ pub struct Kernel {
     frame_inventory: FrameInventoryAuthority,
     pub(super) observations: Mutex<ObservationInventory>,
     pub(super) exit_subscribers: TaskExitSubscribers,
+    pub(super) pending_file_closes: Mutex<Vec<FileCloseEvent>>,
     reservation_gate: ReservationGate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FileCloseDisposition {
+    Closed,
+    Transferred,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FileCloseEvent {
+    pub(crate) table: FileTableId,
+    pub(crate) fd: i32,
+    pub(crate) slot: FileSlot,
+    pub(crate) disposition: FileCloseDisposition,
 }
 
 /// Kernel-owned, non-authoritative index of successfully published K1 object
@@ -601,6 +627,7 @@ impl Kernel {
             frame_inventory: FrameInventoryAuthority::new(),
             observations: Mutex::new(observations),
             exit_subscribers: TaskExitSubscribers::default(),
+            pending_file_closes: Mutex::new(Vec::new()),
             reservation_gate: ReservationGate::default(),
         });
         let context = KernelContext::capture(kernel.clone(), task, leader, TaskRevision::INITIAL);

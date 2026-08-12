@@ -2652,7 +2652,7 @@ impl SyscallDispatcher {
                         if flags.contains(MsgOpFlags::NOWAIT) {
                             return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
                         }
-                        if sysv_msg_wait_interrupted(this, tid) {
+                        if sysv_msg_wait_interrupted(this, cx.kernel, tid) {
                             return Ok(DispatchOutcome::errno(LINUX_EINTR));
                         }
                         if let Ok(token) = MsgQueueWaitToken::for_queue(msqid) {
@@ -2662,7 +2662,7 @@ impl SyscallDispatcher {
                                     return Ok(DispatchOutcome::Returned { value: 0 });
                                 }
                                 Ok(false) => {
-                                    if sysv_msg_wait_interrupted(this, tid) {
+                                    if sysv_msg_wait_interrupted(this, cx.kernel, tid) {
                                         return Ok(DispatchOutcome::errno(LINUX_EINTR));
                                     }
                                     return Ok(token.wait_outcome());
@@ -2728,7 +2728,7 @@ impl SyscallDispatcher {
                         if flags.contains(MsgOpFlags::NOWAIT) {
                             return Ok(DispatchOutcome::errno(LINUX_ENOMSG));
                         }
-                        if sysv_msg_wait_interrupted(this, tid) {
+                        if sysv_msg_wait_interrupted(this, cx.kernel, tid) {
                             return Ok(DispatchOutcome::errno(LINUX_EINTR));
                         }
                         if let Ok(token) = MsgQueueWaitToken::for_queue(msqid) {
@@ -2741,7 +2741,7 @@ impl SyscallDispatcher {
                                     });
                                 }
                                 Ok(None) => {
-                                    if sysv_msg_wait_interrupted(this, tid) {
+                                    if sysv_msg_wait_interrupted(this, cx.kernel, tid) {
                                         return Ok(DispatchOutcome::errno(LINUX_EINTR));
                                     }
                                     return Ok(token.wait_outcome());
@@ -3339,8 +3339,12 @@ fn sysv_msgctl<M: GuestMemory>(
     }
 }
 
-fn sysv_msg_wait_interrupted(this: &SyscallDispatcher, tid: crate::thread::ThreadId) -> bool {
-    this.has_deliverable_dispatch_pending_for_wait(tid, carrick_abi::WaitSigMask::NONE)
+fn sysv_msg_wait_interrupted(
+    this: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
+    tid: crate::thread::ThreadId,
+) -> bool {
+    this.has_deliverable_dispatch_pending_for_wait(context, tid, carrick_abi::WaitSigMask::NONE)
         || carrick_signal_core::xsig::xsig_has_unblocked_for_self(carrick_abi::SigBlockMask::NONE)
         || carrick_signal_core::has_pending_for(tid.raw())
 }
@@ -3571,7 +3575,11 @@ impl SyscallDispatcher {
             crate::host_signal::has_unblocked_pending_for(
                 tid.raw(),
                 carrick_abi::SigBlockMask::NONE,
-            ) || self.has_deliverable_dispatch_pending_for_wait(tid, carrick_abi::WaitSigMask::NONE)
+            ) || self.has_deliverable_dispatch_pending_for_wait(
+                cx.kernel,
+                tid,
+                carrick_abi::WaitSigMask::NONE,
+            )
         })
     }
 
@@ -4183,13 +4191,14 @@ mod ipc_set_tests {
         dispatcher.sysv.lock().attachments.insert(addr, shmid);
         let range = crate::vfs::GuestMemoryRange::new(GuestVa(addr), GuestVa(addr + len))
             .expect("shmat metadata range");
-        let writable_memfd =
-            std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
+        let writable_memfd = kernel_file_description(std::sync::Arc::new(
+            parking_lot::RwLock::new(OpenDescription::SyntheticFile {
                 base: OpenDescriptionBase::new(0),
                 path: "memfd:shmdt-test".into(),
                 contents: Vec::new(),
                 offset: 0,
-            }));
+            }),
+        ));
         dispatcher.commit_host_alias_mmap(crate::dispatch::mem::HostAliasMmapCommit {
             start: addr,
             len,

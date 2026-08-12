@@ -1,13 +1,13 @@
 //! Coherent, owned K1 kernel-object snapshots.
 //!
 //! This module projects only the typed kernel graph. It deliberately never
-//! reads dispatcher `FsState`, `IoState`, or `SignalState` as fallback state.
+//! reads dispatcher filesystem, I/O, or signal bindings as fallback state.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
-use carrick_abi::SigSet;
+use carrick_abi::{LinuxSigaction, LinuxSigaltstack, LinuxSiginfo, SigSet};
 use carrick_hal::{FrameId, MappingId, ThreadId};
 
 use super::address::{MmBackend, MmBinding, SnapshotError, SnapshotTable};
@@ -18,11 +18,11 @@ use super::ids::{
     ProcessGroupId, SessionId, SighandId,
 };
 use super::objects::{
-    FileDescription, FileTable, FsContext, Sighand, SignalDisposition, TaskKey, TaskLifecycle,
-    TaskRef, ThreadKey, ThreadRef, ThreadSignalState, Zombie,
+    FileDescription, FileTable, FsContext, HandlerFrameState, PendingSignal, Sighand, TaskKey,
+    TaskLifecycle, TaskPendingSignals, TaskRef, ThreadKey, ThreadRef, ThreadSignalState, Zombie,
 };
 
-pub const KERNEL_SNAPSHOT_V1_SCHEMA: u16 = 3;
+pub const KERNEL_SNAPSHOT_V1_SCHEMA: u16 = 6;
 const MAX_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -127,6 +127,18 @@ pub struct MmSnapshotRow {
     pub revision: u64,
     pub binding: MmBinding,
     pub mapping_ids: Vec<MappingId>,
+    pub io_uring_mappings: Vec<IoUringMappingSnapshotRow>,
+    pub legacy_aio_context_count: usize,
+    pub next_legacy_aio_context: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IoUringMappingSnapshotRow {
+    pub description: FileDescriptionId,
+    pub region: crate::dispatch::ioring::IoUringRegion,
+    pub start: u64,
+    pub end: u64,
+    pub backing_offset: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,18 +148,27 @@ pub struct VmaSnapshotRow {
     pub end: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileTableSnapshotRow {
     pub id: FileTableId,
+    pub class: ObjectSnapshotClass,
     pub revision: u64,
+    pub functional_refs_active: bool,
+    pub next_fd: i32,
+    pub stdio_cloexec: [bool; 3],
+    pub closed_stdio: [bool; 3],
+    pub splice_pushback_description_ids: Vec<FileDescriptionId>,
+    pub nofile_soft: u64,
+    pub epoll_index_fds: Vec<FileSlotNumber>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileSlotSnapshotRow {
     pub table: FileTableId,
     pub number: FileSlotNumber,
     pub description: FileDescriptionId,
     pub close_on_exec: bool,
+    pub open_path: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,9 +180,12 @@ pub enum FileDescriptionSnapshotKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileDescriptionSnapshotRow {
     pub id: FileDescriptionId,
+    pub class: ObjectSnapshotClass,
     pub revision: u64,
     pub kind: FileDescriptionSnapshotKind,
+    pub backing: Option<super::objects::FileDescriptionBackingSnapshot>,
     pub epoll_interests: Vec<FileDescriptionId>,
+    pub epoll_owners: Vec<(FileDescriptionId, i32)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -209,23 +233,29 @@ pub struct SighandSnapshotRow {
     pub id: SighandId,
     pub class: ObjectSnapshotClass,
     pub revision: u64,
-    pub dispositions: Vec<(LinuxSignal, SignalDisposition)>,
+    pub actions: Vec<(LinuxSignal, LinuxSigaction)>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskSignalSnapshotRow {
     pub task: TaskKey,
-    pub pending_count: usize,
+    pub class: ObjectSnapshotClass,
+    pub revision: u64,
+    pub pending: Vec<PendingSignal>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ThreadSignalSnapshotRow {
     pub thread: ThreadKey,
+    pub class: ObjectSnapshotClass,
     pub revision: u64,
     pub blocked: SigSet,
-    pub pending: SigSet,
-    pub altstack_enabled: bool,
-    pub handler_frame_depth: usize,
+    pub pending: Vec<PendingSignal>,
+    pub altstack: Option<LinuxSigaltstack>,
+    pub handler_frames: Vec<HandlerFrameState>,
+    pub armed_restore_mask: Option<SigSet>,
+    pub routed_siginfos: Vec<(LinuxSignal, LinuxSiginfo)>,
+    pub pending_actions: Vec<(LinuxSignal, LinuxSigaction)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -264,9 +294,11 @@ struct RegistryCopy {
 struct LeafChecks {
     threads: Vec<(ThreadRef, u64)>,
     sighands: Vec<(Arc<Sighand>, u64)>,
+    task_pending: Vec<(Arc<TaskPendingSignals>, u64)>,
     file_tables: Vec<(Arc<FileTable>, u64)>,
     fs_contexts: Vec<(Arc<FsContext>, u64)>,
     descriptions: Vec<(Arc<FileDescription>, u64)>,
+    mms: Vec<(Arc<super::objects::Mm>, u64)>,
     backends: Vec<(Arc<dyn MmBackend>, u64)>,
     vma_revisions: Vec<(Arc<dyn MmBackend>, super::VmaRevision)>,
     frame_inventory_revisions: Vec<u64>,
@@ -385,9 +417,11 @@ impl Kernel {
         let mut checks = LeafChecks {
             threads: Vec::new(),
             sighands: Vec::new(),
+            task_pending: Vec::new(),
             file_tables: Vec::new(),
             fs_contexts: Vec::new(),
             descriptions: Vec::new(),
+            mms: Vec::new(),
             backends: Vec::new(),
             vma_revisions: Vec::new(),
             frame_inventory_revisions: Vec::new(),
@@ -397,15 +431,17 @@ impl Kernel {
         let mut file_table_by_id = BTreeMap::new();
         let mut fs_context_by_id = BTreeMap::<FsContextId, Arc<FsContext>>::new();
         let mut credentials_by_id = BTreeMap::new();
+        let mut live_file_tables = BTreeSet::new();
         let mut live_fs_contexts = BTreeSet::new();
         let mut live_credentials = BTreeSet::new();
         for (key, resources) in &registry.observed_thread_resources {
             let files = resources.files();
+            let file_table_id = files.id();
             let fs = resources.fs_context();
             let credentials = resources.credentials();
             insert_shared(
                 &mut file_table_by_id,
-                files.id(),
+                file_table_id,
                 files,
                 "duplicate file-table identity",
             )?;
@@ -422,6 +458,7 @@ impl Kernel {
                 "duplicate credentials identity",
             )?;
             if live_thread_resources.contains(key) {
+                live_file_tables.insert(file_table_id);
                 live_fs_contexts.insert(fs.id());
                 live_credentials.insert(credentials.id());
             }
@@ -490,9 +527,7 @@ impl Kernel {
             let thread_credentials = resources.credentials();
             let (revision, signal) = lock_result(thread.snapshot_signal_until(deadline), deadline)?;
             checks.threads.push((Arc::clone(thread), revision));
-            if class == ObjectSnapshotClass::Live {
-                thread_signals.push(thread_signal_row(*key, revision, signal));
-            }
+            thread_signals.push(thread_signal_row(*key, class, revision, signal));
             thread_rows.push(ThreadSnapshotRow {
                 key: *key,
                 task: *task_key,
@@ -508,7 +543,7 @@ impl Kernel {
 
         let mut sighands = Vec::new();
         for (id, sighand) in &registry.observed_sighands {
-            let (revision, dispositions) = lock_result(sighand.snapshot_until(deadline), deadline)?;
+            let (revision, actions) = lock_result(sighand.snapshot_until(deadline), deadline)?;
             checks.sighands.push((Arc::clone(sighand), revision));
             sighands.push(SighandSnapshotRow {
                 id: *id,
@@ -521,21 +556,41 @@ impl Kernel {
                     ObjectSnapshotClass::Draining
                 },
                 revision,
-                dispositions,
+                actions,
             });
         }
 
         let mut file_tables = Vec::new();
         let mut file_slots = Vec::new();
         let mut description_by_id = BTreeMap::new();
+        let mut live_descriptions = BTreeSet::new();
         for (_, table) in file_table_by_id {
-            let (revision, slots) = lock_result(table.snapshot_until(deadline), deadline)?;
-            checks.file_tables.push((Arc::clone(&table), revision));
+            let observed = lock_result(table.snapshot_until(deadline), deadline)?;
+            checks
+                .file_tables
+                .push((Arc::clone(&table), observed.revision));
+            let class = if live_file_tables.contains(&table.id()) {
+                ObjectSnapshotClass::Live
+            } else {
+                ObjectSnapshotClass::Draining
+            };
+            if observed.functional_refs_active != (class == ObjectSnapshotClass::Live) {
+                return invariant("file-table functional state disagrees with live classification");
+            }
+            let mut open_paths: BTreeMap<_, _> = observed.fd_open_paths.into_iter().collect();
             file_tables.push(FileTableSnapshotRow {
                 id: table.id(),
-                revision,
+                class,
+                revision: observed.revision,
+                functional_refs_active: observed.functional_refs_active,
+                next_fd: observed.next_fd,
+                stdio_cloexec: observed.stdio_cloexec,
+                closed_stdio: observed.closed_stdio,
+                splice_pushback_description_ids: observed.splice_pushback_description_ids,
+                nofile_soft: observed.nofile_soft,
+                epoll_index_fds: observed.epoll_fds,
             });
-            for (number, slot) in slots {
+            for (number, slot) in observed.slots {
                 let description = slot.description();
                 insert_shared(
                     &mut description_by_id,
@@ -543,31 +598,30 @@ impl Kernel {
                     Arc::clone(&description),
                     "duplicate file-description identity",
                 )?;
+                if class == ObjectSnapshotClass::Live {
+                    live_descriptions.insert(description.id());
+                }
                 file_slots.push(FileSlotSnapshotRow {
                     table: table.id(),
                     number,
                     description: description.id(),
                     close_on_exec: slot.close_on_exec(),
+                    open_path: open_paths.remove(&number),
                 });
             }
+            if !open_paths.is_empty() {
+                return invariant("file-table open-path index names no live slot");
+            }
         }
-        let mut file_descriptions = Vec::new();
-        for (_, description) in description_by_id {
-            let (revision, epoll, interests) =
-                lock_result(description.snapshot_until(deadline), deadline)?;
-            checks
-                .descriptions
-                .push((Arc::clone(&description), revision));
-            file_descriptions.push(FileDescriptionSnapshotRow {
-                id: description.id(),
-                revision,
-                kind: if epoll {
-                    FileDescriptionSnapshotKind::Epoll
-                } else {
-                    FileDescriptionSnapshotKind::Regular
-                },
-                epoll_interests: interests,
-            });
+        let functional_tables: BTreeSet<_> = file_tables
+            .iter()
+            .filter_map(|table| table.functional_refs_active.then_some(table.id))
+            .collect();
+        let mut logical_slot_refs = BTreeMap::<FileDescriptionId, usize>::new();
+        for slot in &file_slots {
+            if functional_tables.contains(&slot.table) {
+                *logical_slot_refs.entry(slot.description).or_default() += 1;
+            }
         }
 
         let mut mms = Vec::new();
@@ -604,17 +658,83 @@ impl Kernel {
             checks
                 .backends
                 .push((Arc::clone(&backend), observed.revision));
+            let io_state = lock_result(mm.io_state_snapshot_until(deadline), deadline)?;
+            let mm_class = if live_mms.get(id).is_some_and(|live| Arc::ptr_eq(live, mm)) {
+                ObjectSnapshotClass::Live
+            } else {
+                ObjectSnapshotClass::Draining
+            };
+            for mapping in &io_state.io_uring_mappings {
+                let description = &mapping.description;
+                insert_shared(
+                    &mut description_by_id,
+                    description.id(),
+                    Arc::clone(description),
+                    "duplicate file-description identity",
+                )?;
+                if mm_class == ObjectSnapshotClass::Live {
+                    live_descriptions.insert(description.id());
+                }
+            }
+            let io_uring_mappings = io_state
+                .io_uring_mappings
+                .into_iter()
+                .map(|mapping| IoUringMappingSnapshotRow {
+                    description: mapping.description.id(),
+                    region: mapping.region,
+                    start: mapping.start,
+                    end: mapping.end,
+                    backing_offset: mapping.backing_offset,
+                })
+                .collect();
+            checks.mms.push((Arc::clone(mm), io_state.revision));
             mms.push(MmSnapshotRow {
                 id: *id,
-                class: if live_mms.get(id).is_some_and(|live| Arc::ptr_eq(live, mm)) {
+                class: mm_class,
+                revision: observed.revision,
+                binding: observed.binding,
+                mapping_ids,
+                io_uring_mappings,
+                legacy_aio_context_count: io_state.legacy_aio_context_count,
+                next_legacy_aio_context: io_state.next_legacy_aio_context,
+            });
+        }
+
+        let mut file_descriptions = Vec::new();
+        for description in description_by_id.into_values() {
+            let (revision, epoll, interests, backing, owners) =
+                lock_result(description.snapshot_until(deadline), deadline)?;
+            checks
+                .descriptions
+                .push((Arc::clone(&description), revision));
+            file_descriptions.push(FileDescriptionSnapshotRow {
+                id: description.id(),
+                class: if live_descriptions.contains(&description.id()) {
                     ObjectSnapshotClass::Live
                 } else {
                     ObjectSnapshotClass::Draining
                 },
-                revision: observed.revision,
-                binding: observed.binding,
-                mapping_ids,
+                revision,
+                kind: if epoll {
+                    FileDescriptionSnapshotKind::Epoll
+                } else {
+                    FileDescriptionSnapshotKind::Regular
+                },
+                backing,
+                epoll_interests: interests,
+                epoll_owners: owners,
             });
+        }
+        if file_descriptions.iter().any(|description| {
+            description.backing.as_ref().is_some_and(|backing| {
+                backing.logical_fd_refs()
+                    != logical_slot_refs
+                        .get(&description.id)
+                        .copied()
+                        .unwrap_or_default()
+            })
+        }) {
+            return Err(AttemptError::Race);
         }
 
         let frame_inventory =
@@ -676,11 +796,26 @@ impl Kernel {
             sessions: registry.sessions.clone(),
             sighands,
             task_signals: registry
-                .tasks
+                .observed_tasks
                 .iter()
-                .map(|record| TaskSignalSnapshotRow {
-                    task: record.task.key(),
-                    pending_count: record.task.shared().pending_signals().pending_count(),
+                .map(|(key, task)| {
+                    let pending = task.shared().pending_signals();
+                    let revision = pending.revision();
+                    let entries = pending.snapshot_entries();
+                    checks.task_pending.push((Arc::clone(&pending), revision));
+                    TaskSignalSnapshotRow {
+                        task: *key,
+                        class: if live_task_by_key
+                            .get(key)
+                            .is_some_and(|record| Arc::ptr_eq(&record.task, task))
+                        {
+                            ObjectSnapshotClass::Live
+                        } else {
+                            ObjectSnapshotClass::Draining
+                        },
+                        revision,
+                        pending: entries,
+                    }
                 })
                 .collect(),
             thread_signals,
@@ -698,6 +833,11 @@ impl Kernel {
                 return Err(AttemptError::Race);
             }
         }
+        for (pending, revision) in checks.task_pending {
+            if pending.revision() != revision {
+                return Err(AttemptError::Race);
+            }
+        }
         for (table, revision) in checks.file_tables {
             if table.revision() != revision {
                 return Err(AttemptError::Race);
@@ -710,6 +850,11 @@ impl Kernel {
         }
         for (description, revision) in checks.descriptions {
             if description.revision() != revision {
+                return Err(AttemptError::Race);
+            }
+        }
+        for (mm, revision) in checks.mms {
+            if mm.revision() != revision {
                 return Err(AttemptError::Race);
             }
         }
@@ -970,16 +1115,21 @@ fn has_duplicates<T: Copy + Ord>(values: &[T]) -> bool {
 
 fn thread_signal_row(
     thread: ThreadKey,
+    class: ObjectSnapshotClass,
     revision: u64,
     state: ThreadSignalState,
 ) -> ThreadSignalSnapshotRow {
     ThreadSignalSnapshotRow {
         thread,
+        class,
         revision,
         blocked: state.blocked(),
-        pending: state.pending(),
-        altstack_enabled: state.altstack_enabled(),
-        handler_frame_depth: state.handler_frame_depth(),
+        pending: state.snapshot_pending_entries(),
+        altstack: state.altstack(),
+        handler_frames: state.handler_frames(),
+        armed_restore_mask: state.armed_restore_mask(),
+        routed_siginfos: state.routed_siginfos(),
+        pending_actions: state.pending_actions(),
     }
 }
 
@@ -1185,6 +1335,11 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
     }
 
     let thread_keys: BTreeSet<_> = snapshot.threads.iter().map(|row| row.key).collect();
+    let thread_class_by_key: BTreeMap<_, _> = snapshot
+        .threads
+        .iter()
+        .map(|row| (row.key, row.class))
+        .collect();
     if thread_keys.len() != snapshot.threads.len() {
         return invariant("duplicate thread key");
     }
@@ -1195,11 +1350,6 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
     {
         return invariant("duplicate file-table or fs-context identity");
     }
-    let live_threads: BTreeSet<_> = snapshot
-        .threads
-        .iter()
-        .filter_map(|row| (row.class == ObjectSnapshotClass::Live).then_some(row.key))
-        .collect();
     let live_resources: BTreeSet<_> = snapshot
         .threads
         .iter()
@@ -1275,8 +1425,16 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
         || task_signal_tasks.len() != snapshot.task_signals.len()
         || leaf_threads != thread_keys
         || thread_credential_ids != live_credential_ids
-        || signal_threads != live_threads
-        || task_signal_tasks != live_tasks
+        || signal_threads != thread_keys
+        || task_signal_tasks != observed_tasks
+        || snapshot
+            .thread_signals
+            .iter()
+            .any(|row| thread_class_by_key.get(&row.thread).copied() != Some(row.class))
+        || snapshot
+            .task_signals
+            .iter()
+            .any(|row| task_by_key.get(&row.task).map(|task| task.class) != Some(row.class))
     {
         return invariant("thread credential/signal or task-signal coverage is incomplete");
     }
@@ -1301,6 +1459,93 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
             return invariant("file slot join is missing");
         }
     }
+    let description_rows = snapshot
+        .file_descriptions
+        .iter()
+        .map(|row| (row.id, row))
+        .collect::<BTreeMap<_, _>>();
+    for mm in &snapshot.mms {
+        let mapping_keys = mm
+            .io_uring_mappings
+            .iter()
+            .map(|mapping| {
+                (
+                    mapping.description,
+                    mapping.region,
+                    mapping.start,
+                    mapping.end,
+                    mapping.backing_offset,
+                )
+            })
+            .collect::<Vec<_>>();
+        if has_duplicates(&mapping_keys) {
+            return invariant("duplicate mm io_uring mapping identity");
+        }
+        let mut extents = mm
+            .io_uring_mappings
+            .iter()
+            .map(|mapping| (mapping.start, mapping.end))
+            .collect::<Vec<_>>();
+        extents.sort_unstable();
+        if extents.windows(2).any(|window| window[0].1 > window[1].0) {
+            return invariant("overlapping mm io_uring mapping extents");
+        }
+        for mapping in &mm.io_uring_mappings {
+            let Some(description) = description_rows.get(&mapping.description) else {
+                return invariant("mm io_uring description join is missing");
+            };
+            let Some(super::objects::FileDescriptionBackingSnapshot::IoUring(ring)) =
+                description.backing.as_ref()
+            else {
+                return invariant("mm io_uring mapping targets a non-ring description");
+            };
+            let length = mapping.end.checked_sub(mapping.start);
+            let region_fits = match mapping.region {
+                crate::dispatch::ioring::IoUringRegion::SqCq => length.is_some_and(|length| {
+                    mapping.backing_offset < ring.layout.sqes_backing_offset
+                        && mapping
+                            .backing_offset
+                            .checked_add(length)
+                            .is_some_and(|end| end <= ring.layout.sqes_backing_offset)
+                }),
+                crate::dispatch::ioring::IoUringRegion::Sqes => length.is_some_and(|length| {
+                    mapping.backing_offset >= ring.layout.sqes_backing_offset
+                        && mapping
+                            .backing_offset
+                            .checked_add(length)
+                            .is_some_and(|end| end <= ring.layout.backing_len)
+                }),
+            };
+            let vma_covers_mapping = snapshot
+                .vmas
+                .iter()
+                .any(|vma| vma.mm == mm.id && vma.start <= mapping.start && mapping.end <= vma.end);
+            if mapping.start >= mapping.end
+                || !mapping.start.is_multiple_of(4096)
+                || !mapping.end.is_multiple_of(4096)
+                || !mapping.backing_offset.is_multiple_of(4096)
+                || !region_fits
+                || !vma_covers_mapping
+            {
+                return invariant("mm io_uring mapping layout or VMA join is invalid");
+            }
+        }
+    }
+    for table in &snapshot.file_tables {
+        if has_duplicates(&table.splice_pushback_description_ids)
+            || table
+                .splice_pushback_description_ids
+                .iter()
+                .any(|description| !descriptions.contains(description))
+        {
+            return invariant("file-table subordinate description join is missing");
+        }
+    }
+    let epoll_interests_by_description = snapshot
+        .file_descriptions
+        .iter()
+        .map(|description| (description.id, &description.epoll_interests))
+        .collect::<BTreeMap<_, _>>();
     for description in &snapshot.file_descriptions {
         if has_duplicates(&description.epoll_interests)
             || description
@@ -1309,6 +1554,20 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
                 .any(|target| !descriptions.contains(target))
         {
             return invariant("epoll description join is missing");
+        }
+        if has_duplicates(&description.epoll_owners)
+            || description.epoll_owners.iter().any(|(owner, _)| {
+                !epoll_interests_by_description
+                    .get(owner)
+                    .is_some_and(|interests| interests.contains(&description.id))
+            })
+        {
+            return invariant("reverse epoll-owner join is missing");
+        }
+        if let Some(backing) = &description.backing
+            && backing.epoll_interests() != description.epoll_interests
+        {
+            return invariant("file-description backing summary is inconsistent");
         }
     }
 
@@ -1410,6 +1669,7 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum BackendMode {
         Good,
+        IoUring,
         Unavailable,
         MalformedVma,
         BrokenMappingJoin,
@@ -1514,13 +1774,26 @@ mod tests {
                         frame_inventory_revision: None,
                     })
                 }
-                BackendMode::Good => Ok(MmBackendSnapshot {
+                BackendMode::Good | BackendMode::IoUring => Ok(MmBackendSnapshot {
                     revision: self.revision(),
                     binding: self.binding,
-                    vmas: vec![VmaSummary {
-                        start: GuestVa(0x1000),
-                        end: GuestVa(0x2000),
-                    }],
+                    vmas: if matches!(self.mode, BackendMode::IoUring) {
+                        vec![
+                            VmaSummary {
+                                start: GuestVa(0x1000),
+                                end: GuestVa(0x2000),
+                            },
+                            VmaSummary {
+                                start: GuestVa(0x3000),
+                                end: GuestVa(0x4000),
+                            },
+                        ]
+                    } else {
+                        vec![VmaSummary {
+                            start: GuestVa(0x1000),
+                            end: GuestVa(0x2000),
+                        }]
+                    },
                     vma_revision: None,
                     mapping_ids: Vec::new(),
                     frame_inventory_revision: None,
@@ -1572,11 +1845,39 @@ mod tests {
             .resources()
             .fs_context()
             .set_chroot_root(Some("/snapshot/root".to_owned()));
-        let _context = kernel
+        let context = kernel
             .update_credentials(&context, |credentials| {
                 credentials.set_supplementary_groups(vec![9, 10]);
             })
             .expect("publish credential snapshot values");
+        let usr1 = LinuxSignal::for_signal_number(10).unwrap();
+        let rt = LinuxSignal::for_signal_number(34).unwrap();
+        let authority = context.signal_authority();
+        authority.install_action(
+            usr1,
+            LinuxSigaction {
+                sa_handler: 0x1234,
+                ..LinuxSigaction::empty()
+            },
+        );
+        authority.set_blocked(SigSet::EMPTY.with(10));
+        authority.enqueue_task_standard(usr1, None);
+        authority.enqueue_thread_realtime(rt, Some(LinuxSiginfo::rt_queue(34, 7, 8, 9)));
+        context.thread().update_signal_state(|state| {
+            state.set_altstack(Some(LinuxSigaltstack {
+                ss_sp: 0x4000,
+                ss_flags: 0,
+                __pad: 0,
+                ss_size: 0x2000,
+            }));
+            state.push_handler_frame(HandlerFrameState {
+                on_altstack: true,
+                restore_mask: Some(SigSet::EMPTY.with(12)),
+            });
+            state.arm_restore_mask(Some(SigSet::EMPTY.with(14)));
+            state.record_routed_siginfo(usr1, LinuxSiginfo::kill(10, 0, 7, 8));
+            state.record_pending_action(usr1, LinuxSigaction::empty());
+        });
         let first = kernel.snapshot(deadline()).expect("snapshot");
         let second = kernel.snapshot(deadline()).expect("snapshot");
         assert_eq!(first, second);
@@ -1615,6 +1916,70 @@ mod tests {
         );
         assert!(live_fs_context.revision > 1);
         assert!(first.frames.is_empty() && first.mappings.is_empty());
+        assert_eq!(first.task_signals.len(), 1);
+        assert_eq!(first.task_signals[0].class, ObjectSnapshotClass::Live);
+        assert_eq!(first.task_signals[0].pending.len(), 1);
+        assert!(first.task_signals[0].revision > 1);
+        assert_eq!(first.thread_signals.len(), 1);
+        let signal = &first.thread_signals[0];
+        assert_eq!(signal.class, ObjectSnapshotClass::Live);
+        assert_eq!(signal.blocked, SigSet::EMPTY.with(10));
+        assert_eq!(signal.pending.len(), 1);
+        let altstack_sp = signal.altstack.unwrap().ss_sp;
+        assert_eq!(altstack_sp, 0x4000);
+        assert_eq!(signal.handler_frames.len(), 1);
+        assert_eq!(signal.armed_restore_mask, Some(SigSet::EMPTY.with(14)));
+        assert_eq!(signal.routed_siginfos.len(), 1);
+        assert_eq!(signal.pending_actions.len(), 1);
+        assert_eq!(first.sighands[0].actions.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_joins_multiple_ring_mappings_and_mapping_owned_description() {
+        let (kernel, context) = bootstrap(TestBackend::new(BackendMode::IoUring));
+        let backing =
+            crate::dispatch::ioring::IoUringBacking::create(8, 4096).expect("ring backing");
+        let layout = backing.reexec_layout();
+        let description =
+            Arc::new(FileDescription::concrete(backing).expect("ring description identity"));
+        let mm = context.shared().mm();
+        for (start, region, backing_offset) in [
+            (0x1000, crate::dispatch::ioring::IoUringRegion::SqCq, 0),
+            (
+                0x3000,
+                crate::dispatch::ioring::IoUringRegion::Sqes,
+                layout.sqes_backing_offset,
+            ),
+        ] {
+            mm.replace_io_uring_mappings(
+                start,
+                0x1000,
+                Some(crate::dispatch::ioring::IoUringMapping {
+                    description: Arc::clone(&description),
+                    region,
+                    start,
+                    end: start + 0x1000,
+                    backing_offset,
+                }),
+            );
+        }
+
+        let snapshot = kernel.snapshot(deadline()).expect("ring snapshot");
+        let row = snapshot
+            .mms
+            .iter()
+            .find(|row| row.id == mm.id())
+            .expect("mm row");
+        assert_eq!(row.io_uring_mappings.len(), 2);
+        let description_row = snapshot
+            .file_descriptions
+            .iter()
+            .find(|row| row.id == description.id())
+            .expect("mapping-owned description row");
+        assert!(matches!(
+            description_row.backing,
+            Some(crate::kernel::objects::FileDescriptionBackingSnapshot::IoUring(_))
+        ));
     }
 
     #[test]
@@ -1770,6 +2135,18 @@ mod tests {
         let old_thread = old_context.thread().key();
         let old_mm = old_context.shared().mm().id();
         let old_sighand = old_context.shared().sighand().id();
+        let old_file_table = old_context.resources().files();
+        let old_file_table_id = old_file_table.id();
+        let description = Arc::new(crate::kernel::FileDescription::regular(
+            kernel.object_ids().file_description_id().unwrap(),
+        ));
+        let description_id = description.id();
+        let slot_number = FileSlotNumber::for_open_fd(7).unwrap();
+        assert!(
+            old_file_table
+                .install(slot_number, description, true)
+                .is_none()
+        );
         let prepared = kernel
             .prepare_exec_with_mm_backend(&old_context, TestBackend::new(BackendMode::Good), None)
             .expect("prepare exec");
@@ -1793,6 +2170,20 @@ mod tests {
                 .sighands
                 .iter()
                 .any(|row| row.id == old_sighand && row.class == ObjectSnapshotClass::Draining)
+        );
+        assert!(draining.file_tables.iter().any(|row| {
+            row.id == old_file_table_id && row.class == ObjectSnapshotClass::Draining
+        }));
+        assert!(draining.file_slots.iter().any(|row| {
+            row.table == old_file_table_id
+                && row.number == slot_number
+                && row.description == description_id
+                && row.close_on_exec
+        }));
+        assert!(
+            draining.file_descriptions.iter().any(|row| {
+                row.id == description_id && row.class == ObjectSnapshotClass::Draining
+            })
         );
         let old_shared = draining
             .task_shared
@@ -1842,12 +2233,9 @@ mod tests {
                 row.key == old_resources && row.class == ObjectSnapshotClass::Draining
             })
         );
-        assert!(
-            bundles_only
-                .file_tables
-                .iter()
-                .any(|row| row.id == old_resources.file_table)
-        );
+        assert!(bundles_only.file_tables.iter().any(|row| {
+            row.id == old_resources.file_table && row.class == ObjectSnapshotClass::Draining
+        }));
         assert!(bundles_only.fs_contexts.iter().any(|row| {
             row.id == old_resources.fs_context && row.class == ObjectSnapshotClass::Live
         }));

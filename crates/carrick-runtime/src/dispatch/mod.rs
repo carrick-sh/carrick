@@ -151,6 +151,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::compat::{CompatEvent, CompatReporter, SyscallArgs};
 use crate::fs_backend::FsBackend;
+#[cfg(test)]
+use crate::linux_abi::LINUX_MAP_ANONYMOUS;
 use crate::linux_abi::{
     KernelAbi,
     LINUX_ADJ_OFFSET_SINGLESHOT_FLAG_ONLY,
@@ -348,7 +350,6 @@ use crate::linux_abi::{
     LINUX_MADV_RANDOM,
     LINUX_MADV_SEQUENTIAL,
     LINUX_MADV_WILLNEED,
-    LINUX_MAP_ANONYMOUS,
     LINUX_MAP_FIXED,
     LINUX_MAP_FIXED_NOREPLACE,
     LINUX_MAX_SIGNUM,
@@ -698,9 +699,10 @@ pub(crate) use epoll_shim::{
 pub(crate) use fifo_beacon::after_fork_child as reset_fifo_beacons_after_fork_child;
 pub(crate) mod fd_table;
 mod fifo_beacon;
-mod ioring;
+pub(crate) mod ioring;
 #[macro_use]
 mod fs;
+pub(crate) use fs::{LegacyAioContextId, SplicePushback};
 #[macro_use]
 mod mem;
 // This specific re-export path (`crate::dispatch::MemoryLayout`, as opposed
@@ -1930,6 +1932,8 @@ impl AsyncSignalWakeOwner {
 
 pub(crate) struct HostAliasCommit {
     mmap: Option<mem::HostAliasMmapCommit>,
+    io_uring_mapping: Option<ioring::IoUringMapping>,
+    io_uring_mm: Option<Arc<crate::kernel::Mm>>,
     shmat: Option<sysv::HostAliasShmatCommit>,
 }
 
@@ -1937,6 +1941,21 @@ impl HostAliasCommit {
     pub(crate) fn mmap(mmap: mem::HostAliasMmapCommit) -> Self {
         Self {
             mmap: Some(mmap),
+            io_uring_mapping: None,
+            io_uring_mm: None,
+            shmat: None,
+        }
+    }
+
+    pub(crate) fn io_uring_mmap(
+        mmap: mem::HostAliasMmapCommit,
+        mapping: ioring::IoUringMapping,
+        mm: Arc<crate::kernel::Mm>,
+    ) -> Self {
+        Self {
+            mmap: Some(mmap),
+            io_uring_mapping: Some(mapping),
+            io_uring_mm: Some(mm),
             shmat: None,
         }
     }
@@ -1944,6 +1963,8 @@ impl HostAliasCommit {
     pub(crate) fn shmat(mmap: mem::HostAliasMmapCommit, shmat: sysv::HostAliasShmatCommit) -> Self {
         Self {
             mmap: Some(mmap),
+            io_uring_mapping: None,
+            io_uring_mm: None,
             shmat: Some(shmat),
         }
     }
@@ -2203,10 +2224,9 @@ pub struct SyscallDispatcher {
     /// context at each backend dispatch boundary. HVPatch replaces the initial
     /// one-task binding when its root/child task is published.
     kernel_binding: RwLock<crate::kernel::KernelTaskBinding>,
-    /// Transitional I/O state: runtime output plus fd-table authority awaiting
-    /// the FileTable cutover. Cwd/chroot authority is already exclusive to the
-    /// captured Kernel [`crate::kernel::FsContext`]. See [`fs::IoState`].
-    io: fs::IoState,
+    /// Process-local output buffering/streaming only. Linux descriptor state is
+    /// owned exclusively by each captured Kernel [`crate::kernel::FileTable`].
+    io: fs::RuntimeIo,
     /// Owned memory subsystem state (brk, mmap arena, shared-file IPA
     /// window + live maps, and the captured address-space regions for
     /// `/proc/self/maps`). See [`mem::MemState`].
@@ -2230,25 +2250,6 @@ pub struct SyscallDispatcher {
     /// Owned process subsystem state (executable path, personality,
     /// dumpable flag, task comm name). See [`proc::ProcState`].
     proc: Mutex<proc::ProcState>,
-    /// Owned signal subsystem state (handlers, mask, pending set, alt
-    /// stack). See [`signal::SignalState`]. This is internally locked so
-    /// signal syscalls and runtime delivery can run through shared threaded
-    /// dispatch without the legacy dispatcher lock.
-    signal: Mutex<signal::SignalState>,
-    /// Lock-free MAY-HAVE-PENDING hints mirroring `signal`'s pending stores,
-    /// so the per-dispatch delivery cycle (every syscall return / kick /
-    /// sigreturn) can prove "nothing pending" without taking the signal lock.
-    /// `signal_tid_pending_hint` carries bit `tid % 64` for every tid with a
-    /// nonzero `pendings` set (collisions only cost a locked fallback);
-    /// `signal_process_pending_hint` mirrors `process_pending.raw()`. Both are
-    /// EXACT MIRRORS: every mutation of the underlying stores happens with the
-    /// `signal` lock held and refreshes them before release
-    /// (`signal::SyscallDispatcher::refresh_signal_pending_hints`). A reader
-    /// racing a marker mid-critical-section linearizes before the mark; the
-    /// marker's kick/unblock boundary runs a fresh delivery cycle that sees
-    /// the refreshed hint.
-    signal_tid_pending_hint: std::sync::atomic::AtomicU64,
-    signal_process_pending_hint: std::sync::atomic::AtomicU64,
     /// Owned filesystem subsystem state (unified VFS mount table plus
     /// the `/` rootfs + writable overlay). See [`fs::FsState`]. Handlers
     /// that touch only fs state borrow `self.fs` narrowly.
@@ -2595,6 +2596,22 @@ mod kernel_context_tests {
             .resources()
             .fs_context()
             .set_chroot_root(Some("/inherited/root".to_owned()));
+        let description =
+            kernel_file_description(Arc::new(RwLock::new(OpenDescription::SyntheticFile {
+                base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
+                path: "/inherited/file".to_owned(),
+                contents: Vec::new(),
+                offset: 0,
+            })));
+        let inherited_fd = dispatcher
+            .install_fd_at_or_above(3, OpenFile::new(Arc::clone(&description), LINUX_FD_CLOEXEC))
+            .unwrap();
+        original
+            .resources()
+            .files()
+            .write_fd_open_paths()
+            .insert(inherited_fd, "/inherited/file".to_owned());
+        original.resources().files().set_nofile_soft(4096);
         let original = original
             .kernel()
             .update_credentials(&original, |credentials| {
@@ -2614,8 +2631,34 @@ mod kernel_context_tests {
             )
             .expect("rebind one-task authority");
         let credentials = rebound.resources().credentials();
+        let rebound_files = rebound.resources().files();
 
         assert!(!Arc::ptr_eq(&old_kernel, rebound.kernel()));
+        assert!(!Arc::ptr_eq(&original.resources().files(), &rebound_files));
+        let rebound_slot = rebound_files
+            .read_open_files()
+            .get(&inherited_fd)
+            .cloned()
+            .expect("inherited fd slot");
+        assert!(Arc::ptr_eq(&description, &rebound_slot.description));
+        assert_eq!(rebound_slot.fd_flags, LINUX_FD_CLOEXEC);
+        assert_eq!(
+            rebound_files
+                .read_fd_open_paths()
+                .get(&inherited_fd)
+                .map(String::as_str),
+            Some("/inherited/file")
+        );
+        assert_eq!(rebound_files.nofile_soft(), 4096);
+        let post_fork_description =
+            kernel_file_description(Arc::new(RwLock::new(OpenDescription::SyntheticFile {
+                base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
+                path: "/post-fork/file".to_owned(),
+                contents: Vec::new(),
+                offset: 0,
+            })));
+        assert_ne!(description.id(), post_fork_description.id());
+        assert!(description.id() < post_fork_description.id());
         assert_eq!((credentials.ruid(), credentials.rgid()), (1001, 2001));
         assert_eq!((credentials.fsuid(), credentials.fsgid()), (1002, 2002));
         assert_eq!(credentials.umask(), 0o077);
@@ -2739,13 +2782,56 @@ impl SyscallDispatcher {
         &self,
         prepared: crate::kernel::PreparedExec,
     ) -> Result<crate::kernel::KernelContext, String> {
+        let old_files = prepared.old_file_table();
         let kernel = Arc::clone(self.kernel_binding.read().kernel());
         let context = kernel
             .commit_exec(prepared, None)
             .map_err(|error| error.to_string())?;
         *self.kernel_binding.write() = context.task_binding();
         self.publish_external_credential_projection(&context, &context.resources().credentials());
+        self.close_draining_file_table(&kernel, &old_files);
         Ok(context)
+    }
+
+    pub(crate) fn close_draining_file_table(
+        &self,
+        kernel: &Arc<crate::kernel::Kernel>,
+        files: &Arc<crate::kernel::FileTable>,
+    ) {
+        kernel.retire_file_table_if_unreferenced(files);
+        let pid = self.event_ring_guest_pid();
+        let events = kernel.take_file_close_events(files.id());
+        resources::with_retiring_file_table(Arc::clone(files), || {
+            for event in events {
+                match event.disposition {
+                    crate::kernel::core::FileCloseDisposition::Closed => {
+                        self.dnotify_close_fd(event.fd);
+                        self.inotify_close_for_fd(event.fd);
+                        self.detach_fd_from_epolls(event.fd);
+                        self.record_fd_close_owner(event.fd, pid, &event.slot);
+                        self.close_open_file_and_free_pty(&event.slot);
+                    }
+                    crate::kernel::core::FileCloseDisposition::Transferred => {
+                        close_open_file(&event.slot);
+                    }
+                }
+            }
+        });
+    }
+
+    pub(crate) fn host_fork_file_authority_rejection(
+        context: &crate::kernel::KernelContext,
+        flags: u64,
+    ) -> Option<&'static str> {
+        if carrick_abi::LinuxCloneFlags::from_bits_retain(flags)
+            .contains(carrick_abi::LinuxCloneFlags::FILES)
+        {
+            return Some("cross-process CLONE_FILES needs fork-coherent fd-table authority");
+        }
+        if context.resources().files().has_splice_pushback() {
+            return Some("staged splice bytes cannot be copied across a host fork");
+        }
+        None
     }
 
     pub(crate) fn reset_one_task_kernel_binding_for_current_process(
@@ -2757,6 +2843,8 @@ impl SyscallDispatcher {
             .map_err(|_| "host PID does not fit Linux task identity".to_owned())?;
         let inherited_credentials = inherited.resources().credentials();
         let inherited_fs_context = inherited.resources().fs_context();
+        let inherited_files = inherited.resources().files();
+        let inherited_mm = inherited.shared().mm();
         let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
             observed_pid,
             registry_id,
@@ -2765,6 +2853,13 @@ impl SyscallDispatcher {
         .map_err(|error| error.to_string())?;
         let (kernel, context) =
             crate::kernel::Kernel::bootstrap_root(bootstrap).map_err(|error| error.to_string())?;
+        let context = kernel
+            .copy_file_table_for_host_fork(&context, &inherited_files)
+            .map_err(|error| error.to_string())?;
+        context
+            .shared()
+            .mm()
+            .copy_io_uring_mappings_for_host_fork(&inherited_mm);
         let replacement_fs_context = context.resources().fs_context();
         replacement_fs_context.set_cwd(inherited_fs_context.cwd());
         replacement_fs_context.set_chroot_root(inherited_fs_context.chroot_root());
@@ -2773,6 +2868,10 @@ impl SyscallDispatcher {
                 credentials.copy_values_from(&inherited_credentials);
             })
             .map_err(|error| error.to_string())?;
+        context
+            .shared()
+            .sighand()
+            .replace_actions(inherited.shared().sighand().actions());
         *self.kernel_binding.write() = context.task_binding();
         self.publish_external_credential_projection(&context, &context.resources().credentials());
         Ok(context)
@@ -2824,7 +2923,10 @@ impl SyscallDispatcher {
         loop {
             let observed = binding.kernel().reservation_epoch();
             match binding.kernel().exit_thread(&context, None) {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    self.close_draining_file_table(context.kernel(), &context.resources().files());
+                    return Ok(());
+                }
                 Err(crate::kernel::KernelOperationError::TaskBusy(_)) => {
                     binding.kernel().wait_for_reservation_change(observed);
                 }
@@ -2855,8 +2957,8 @@ impl SyscallDispatcher {
     #[allow(dead_code)]
     pub(crate) fn fork_clone_in_process(
         &self,
-        parent_tid: crate::thread::ThreadId,
-        child_tid: crate::thread::ThreadId,
+        _parent_tid: crate::thread::ThreadId,
+        _child_tid: crate::thread::ThreadId,
         parent_guest_pid: u32,
         child_guest_pid: u32,
     ) -> Self {
@@ -2871,9 +2973,6 @@ impl SyscallDispatcher {
                     .lock()
                     .fork_clone(parent_guest_pid, child_guest_pid),
             ),
-            signal: Mutex::new(self.signal.lock().fork_clone(parent_tid, child_tid)),
-            signal_tid_pending_hint: std::sync::atomic::AtomicU64::new(0),
-            signal_process_pending_hint: std::sync::atomic::AtomicU64::new(0),
             fs: self.fs.fork_clone(),
             seccomp: self.seccomp.fork_clone(),
             container_policy: self.container_policy.clone(),
@@ -2890,18 +2989,12 @@ impl SyscallDispatcher {
     /// Apply Linux's process-exit fd lifetime at the HvPatch process boundary.
     ///
     /// HvPatch multiplexes Linux processes inside one host process, so host fd
-    /// lifetime cannot rely on host `_exit`. Drain this process's descriptor
-    /// table before publishing its zombie; otherwise a retained pipe writer
-    /// suppresses EOF in the parent and leaves `os/exec` stuck in `IO wait`.
-    pub(crate) fn retire_hvpatch_process_fds(&self) {
-        let files = std::mem::take(&mut *self.io.open_files.write());
-        for (fd, open_file) in files {
-            let pid = self.event_ring_guest_pid();
-            self.record_fd_close_owner(fd, pid, &open_file);
-            crate::event_ring::rec(crate::event_ring::FDCLOSE, fd, -1, 0);
-            self.close_open_file_and_free_pty(&open_file);
-            self.note_fd_closed(fd);
-        }
+    /// lifetime cannot rely on host `_exit`. After Kernel exit publication has
+    /// made this exact table generation draining, consume its typed close
+    /// events without erasing the rows retained for coherent snapshots.
+    pub(crate) fn retire_hvpatch_process_fds(&self, context: &crate::kernel::KernelContext) {
+        let files = self.file_table_for_context(context);
+        self.close_draining_file_table(context.kernel(), &files);
     }
 
     fn event_ring_guest_pid(&self) -> i32 {
@@ -2984,13 +3077,10 @@ impl SyscallDispatcher {
     pub fn new() -> Self {
         Self {
             kernel_binding: RwLock::new(bootstrap_one_task_binding()),
-            io: fs::IoState::new(),
+            io: fs::RuntimeIo::new(),
             mem: Arc::new(mem::MemAuthority::new(mem::MemState::new())),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
             proc: Mutex::new(proc::ProcState::new()),
-            signal: Mutex::new(signal::SignalState::new()),
-            signal_tid_pending_hint: std::sync::atomic::AtomicU64::new(0),
-            signal_process_pending_hint: std::sync::atomic::AtomicU64::new(0),
             fs: fs::FsState::new(),
             seccomp: crate::seccomp::SeccompState::default(),
             // Unconfined until a frontend applies a policy: bare run-elf boots
@@ -3085,7 +3175,14 @@ impl SyscallDispatcher {
         };
 
         if let Some(mmap) = commit.mmap {
+            let start = mmap.start;
+            let len = mmap.len;
             self.commit_host_alias_mmap_observed(mmap);
+            if let Some(mm) = commit.io_uring_mm {
+                mm.replace_io_uring_mappings(start, len, commit.io_uring_mapping);
+            } else if commit.io_uring_mapping.is_some() {
+                std::process::abort();
+            }
         }
         if let Some(shmat) = commit.shmat {
             self.commit_host_alias_shmat(shmat);
@@ -3166,11 +3263,13 @@ impl SyscallDispatcher {
     }
 
     pub(crate) fn notify_inmem_epoll(&self) {
-        notify_inmem_epoll(&self.io.epoll_wake_registry);
+        notify_inmem_epoll(self.captured_file_table().epoll_wake_registry());
     }
 
     pub(crate) fn epoll_after_fork_child(&self) {
-        reset_epoll_wake_registry_after_fork_child(&self.io.epoll_wake_registry);
+        reset_epoll_wake_registry_after_fork_child(
+            self.captured_file_table().epoll_wake_registry(),
+        );
     }
 
     pub fn set_guest_hostname(&self, hostname: impl Into<String>) {
@@ -3618,7 +3717,11 @@ impl SyscallDispatcher {
     /// while a Tier-D refusal needs enough evidence to distinguish a missing fd
     /// from an in-memory rootfs file or a synthetic descriptor.
     pub(crate) fn describe_fd_for_diagnostic(&self, fd: i32) -> String {
-        let recorded_path = self.io.fd_open_paths.read().get(&fd).cloned();
+        let recorded_path = self
+            .captured_file_table()
+            .read_fd_open_paths()
+            .get(&fd)
+            .cloned();
         let Some(open_file) = self.open_file(fd) else {
             return format!("missing path={recorded_path:?}");
         };
@@ -3661,15 +3764,22 @@ impl SyscallDispatcher {
     /// Capsule version 1 initially carries only bare stdio. Reject every richer
     /// fd-table shape before host exec until typed descriptor snapshots land.
     #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
-    pub(crate) fn validate_native_reexec_fd_state(&self) -> Result<(), String> {
-        self.snapshot_native_reexec_fd_table().map(|_| ())
+    pub(crate) fn validate_native_reexec_fd_state(
+        &self,
+        context: &crate::kernel::KernelContext,
+    ) -> Result<(), String> {
+        self.snapshot_native_reexec_fd_table(context).map(|_| ())
     }
 
     // Diagnostic-only helper for `native_darwin.rs`'s self-reexec failure log
     // (its only caller); no test calls it directly, unlike its neighbors above.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub(crate) fn native_reexec_fd_state_summary(&self) -> Vec<String> {
-        let table = self.io.open_files.read();
+    pub(crate) fn native_reexec_fd_state_summary(
+        &self,
+        context: &crate::kernel::KernelContext,
+    ) -> Vec<String> {
+        let files = self.file_table_for_context(context);
+        let table = files.read_open_files();
         let mut summary = table
             .iter()
             .map(|(fd, open_file)| {
@@ -3691,6 +3801,7 @@ impl SyscallDispatcher {
         context: &crate::kernel::KernelContext,
     ) -> crate::native_exec_capsule::NativeReexecProcessStateV1 {
         let credentials = self.credentials_from_context(context);
+        let thread_signal = context.thread().signal_state();
         let rlimit_overrides = self
             .proc
             .lock()
@@ -3718,11 +3829,55 @@ impl SyscallDispatcher {
             supplementary_groups_override: credentials
                 .supplementary_groups_override()
                 .map(<[u32]>::to_vec),
-            ignored_signals: self.native_reexec_ignored_signals().raw(),
-            nofile_soft: self
-                .io
-                .nofile_soft
-                .load(std::sync::atomic::Ordering::Relaxed),
+            signal_actions: context
+                .shared()
+                .sighand()
+                .actions()
+                .into_iter()
+                .map(
+                    |(signal, action)| crate::native_exec_capsule::NativeReexecSignalActionV1 {
+                        signum: signal.raw(),
+                        handler: action.sa_handler,
+                        flags: action.sa_flags,
+                        restorer: action.sa_restorer,
+                        mask: action.sa_mask[0],
+                    },
+                )
+                .collect(),
+            thread_blocked_mask: thread_signal.blocked().raw(),
+            thread_pending_signals: thread_signal
+                .snapshot_pending_entries()
+                .into_iter()
+                .map(
+                    |pending| crate::native_exec_capsule::NativeReexecPendingSignalV1 {
+                        signum: pending.signal.raw(),
+                        siginfo: pending.siginfo.map(|info| info.as_bytes().to_vec()),
+                    },
+                )
+                .collect(),
+            thread_routed_siginfos: thread_signal
+                .routed_siginfos()
+                .into_iter()
+                .map(
+                    |(signal, siginfo)| crate::native_exec_capsule::NativeReexecPendingSignalV1 {
+                        signum: signal.raw(),
+                        siginfo: Some(siginfo.as_bytes().to_vec()),
+                    },
+                )
+                .collect(),
+            task_pending_signals: context
+                .shared()
+                .pending_signals()
+                .snapshot_entries()
+                .into_iter()
+                .map(
+                    |pending| crate::native_exec_capsule::NativeReexecPendingSignalV1 {
+                        signum: pending.signal.raw(),
+                        siginfo: pending.siginfo.map(|info| info.as_bytes().to_vec()),
+                    },
+                )
+                .collect(),
+            nofile_soft: context.resources().files().nofile_soft(),
             rlimit_overrides,
             seccomp_policy: if self.container_policy.is_some() {
                 carrick_spec::SeccompPolicy::ContainerDefault
@@ -3767,9 +3922,10 @@ impl SyscallDispatcher {
                 tracing::error!(%error, "restore native reexec Kernel credentials");
                 std::process::abort();
             });
-        self.io
-            .nofile_soft
-            .store(state.nofile_soft, std::sync::atomic::Ordering::Relaxed);
+        restored_context
+            .resources()
+            .files()
+            .set_nofile_soft(state.nofile_soft);
         let mut process = self.proc.lock();
         process.ptrace_traceme = state.ptrace_traceme;
         for (slot, limit) in process
@@ -3781,9 +3937,104 @@ impl SyscallDispatcher {
                 limit.map(|limit| crate::linux_abi::LinuxRlimit::new(limit.current, limit.maximum));
         }
         drop(process);
-        self.restore_native_reexec_ignored_signals(carrick_abi::SigSet::from_raw(
-            state.ignored_signals,
-        ));
+        let actions = state
+            .signal_actions
+            .iter()
+            .map(|action| {
+                let signal = crate::kernel::LinuxSignal::for_signal_number(action.signum)
+                    .unwrap_or_else(|error| {
+                        tracing::error!(%error, signum = action.signum, "restore native reexec Sighand");
+                        std::process::abort();
+                    });
+                (
+                    signal,
+                    carrick_abi::LinuxSigaction {
+                        sa_handler: action.handler,
+                        sa_flags: action.flags,
+                        sa_restorer: action.restorer,
+                        sa_mask: [action.mask],
+                    },
+                )
+            })
+            .collect();
+        restored_context.shared().sighand().replace_actions(actions);
+        let task_pending = state
+            .task_pending_signals
+            .iter()
+            .map(|pending| {
+                let signal = crate::kernel::LinuxSignal::for_signal_number(pending.signum)
+                    .unwrap_or_else(|error| {
+                        tracing::error!(%error, signum = pending.signum, "restore native reexec task pending signal");
+                        std::process::abort();
+                    });
+                let siginfo = pending.siginfo.as_ref().map(|bytes| {
+                    carrick_abi::LinuxSiginfo::ref_from_bytes(bytes)
+                        .copied()
+                        .unwrap_or_else(|error| {
+                            tracing::error!(%error, "restore native reexec task siginfo");
+                            std::process::abort();
+                        })
+                });
+                crate::kernel::PendingSignal { signal, siginfo }
+            })
+            .collect::<Vec<_>>();
+        restored_context
+            .shared()
+            .pending_signals()
+            .replace_entries(&task_pending);
+        let thread_pending = state
+            .thread_pending_signals
+            .iter()
+            .map(|pending| {
+                let signal = crate::kernel::LinuxSignal::for_signal_number(pending.signum)
+                    .unwrap_or_else(|error| {
+                        tracing::error!(%error, signum = pending.signum, "restore native reexec thread pending signal");
+                        std::process::abort();
+                    });
+                let siginfo = pending.siginfo.as_ref().map(|bytes| {
+                    carrick_abi::LinuxSiginfo::ref_from_bytes(bytes)
+                        .copied()
+                        .unwrap_or_else(|error| {
+                            tracing::error!(%error, "restore native reexec thread siginfo");
+                            std::process::abort();
+                        })
+                });
+                crate::kernel::PendingSignal { signal, siginfo }
+            })
+            .collect::<Vec<_>>();
+        let thread_routed = state
+            .thread_routed_siginfos
+            .iter()
+            .map(|pending| {
+                let signal = crate::kernel::LinuxSignal::for_signal_number(pending.signum)
+                    .unwrap_or_else(|error| {
+                        tracing::error!(%error, signum = pending.signum, "restore native reexec routed thread signal");
+                        std::process::abort();
+                    });
+                let siginfo = pending
+                    .siginfo
+                    .as_ref()
+                    .and_then(|bytes| carrick_abi::LinuxSiginfo::ref_from_bytes(bytes).ok())
+                    .copied()
+                    .unwrap_or_else(|| {
+                        tracing::error!(signum = pending.signum, "restore native reexec routed siginfo");
+                        std::process::abort();
+                    });
+                (signal, siginfo)
+            })
+            .collect::<Vec<_>>();
+        restored_context.thread().update_signal_state(|thread| {
+            thread.set_blocked(signal::sanitize_signal_mask(carrick_abi::SigSet::from_raw(
+                state.thread_blocked_mask,
+            )));
+            thread.replace_pending_entries(&thread_pending);
+            for (signal, siginfo) in &thread_routed {
+                thread.record_routed_siginfo(*signal, *siginfo);
+            }
+            thread.set_altstack(None);
+            thread.clear_handler_frames();
+            thread.arm_restore_mask(None);
+        });
         self.publish_external_credential_projection(
             &restored_context,
             &restored_context.resources().credentials(),
@@ -3792,10 +4043,14 @@ impl SyscallDispatcher {
     }
 
     #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
-    pub(crate) fn snapshot_native_reexec_fd_table(&self) -> Result<NativeReexecFdTableV1, String> {
-        let table = self.io.open_files.read();
-        let stdio_cloexec = *self.io.stdio_cloexec.lock();
-        let closed_stdio = *self.io.closed_stdio.lock();
+    pub(crate) fn snapshot_native_reexec_fd_table(
+        &self,
+        context: &crate::kernel::KernelContext,
+    ) -> Result<NativeReexecFdTableV1, String> {
+        let files = self.file_table_for_context(context);
+        let table = files.read_open_files();
+        let stdio_cloexec = *files.lock_stdio_cloexec();
+        let closed_stdio = *files.lock_closed_stdio();
         let closed_stdio = std::array::from_fn(|index| {
             let fd = index as i32;
             table
@@ -3818,9 +4073,15 @@ impl SyscallDispatcher {
         let mut survivor_host_fds = std::collections::HashSet::new();
 
         for (_, open_file) in &entries {
-            if open_file.fd_flags & crate::linux_abi::LINUX_FD_CLOEXEC != 0
-                && let Some(host_fd) = open_file.description.read().reexec_host_fd()
+            if open_file.fd_flags & crate::linux_abi::LINUX_FD_CLOEXEC == 0 {
+                continue;
+            }
+            if let Some(backing) = open_file
+                .description
+                .concrete_backing::<crate::dispatch::ioring::IoUringBacking>()
             {
+                close_on_exec_host_fds.extend(backing.reexec_fds().map(|(fd, _, _)| fd));
+            } else if let Some(host_fd) = open_file.description.read().reexec_host_fd() {
                 close_on_exec_host_fds.push(host_fd);
             }
         }
@@ -3833,136 +4094,168 @@ impl SyscallDispatcher {
             let description_id = if let Some(id) = description_ids.get(&key) {
                 *id
             } else {
-                let description = open_file.description.read();
-                let record = match &*description {
-                    OpenDescription::HostPipe {
-                        base,
-                        host_fd,
-                        is_read_end,
-                        pipe_id,
-                        pty: None,
-                        bidirectional,
-                        write_kind,
-                    } => {
-                        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-                        if unsafe { libc::fstat(host_fd.raw(), stat.as_mut_ptr()) } < 0 {
-                            return Err(format!(
-                                "fstat host pipe for guest fd {guest_fd}: {}",
-                                std::io::Error::last_os_error()
-                            ));
-                        }
-                        let stat = unsafe { stat.assume_init() };
-                        let host_fd_flags = unsafe { libc::fcntl(host_fd.raw(), libc::F_GETFD) };
-                        if host_fd_flags < 0 {
-                            return Err(format!(
-                                "F_GETFD host pipe for guest fd {guest_fd}: {}",
-                                std::io::Error::last_os_error()
-                            ));
-                        }
-                        survivor_host_fds.insert(host_fd.raw());
-                        NativeReexecDescriptionV1::Pipe {
-                            host_fd: host_fd.raw(),
-                            original_host_fd_flags: host_fd_flags,
-                            host_device: stat.st_dev as u64,
-                            host_inode: stat.st_ino,
-                            host_mode: stat.st_mode as u32,
-                            status_flags: base.status_flags(),
-                            pipe_capacity: base.pipe_capacity(),
-                            is_read_end: *is_read_end,
-                            pipe_id: *pipe_id,
-                            bidirectional: *bidirectional,
-                            write_kind: *write_kind,
-                        }
+                let record = if let Some(backing) = open_file
+                    .description
+                    .concrete_backing::<crate::dispatch::ioring::IoUringBacking>(
+                ) {
+                    let [
+                        (data_fd, data_fd_flags, data_identity),
+                        (lock_fd, lock_fd_flags, lock_identity),
+                    ] = backing.reexec_fds();
+                    if data_fd_flags < 0 || lock_fd_flags < 0 {
+                        return Err(format!("F_GETFD io_uring backing for guest fd {guest_fd}"));
                     }
-                    OpenDescription::HostFile {
-                        base,
-                        host_fd,
-                        metadata,
-                        writable,
-                    } => {
-                        if metadata.kind != RootFsEntryKind::File {
-                            return Err(format!(
-                                "host file metadata is not regular at guest fd {guest_fd}"
-                            ));
-                        }
-                        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-                        if unsafe { libc::fstat(host_fd.raw(), stat.as_mut_ptr()) } < 0 {
-                            return Err(format!(
-                                "fstat host file for guest fd {guest_fd}: {}",
-                                std::io::Error::last_os_error()
-                            ));
-                        }
-                        let stat = unsafe { stat.assume_init() };
-                        let host_fd_flags = unsafe { libc::fcntl(host_fd.raw(), libc::F_GETFD) };
-                        if host_fd_flags < 0 {
-                            return Err(format!(
-                                "F_GETFD host file for guest fd {guest_fd}: {}",
-                                std::io::Error::last_os_error()
-                            ));
-                        }
-                        survivor_host_fds.insert(host_fd.raw());
-                        NativeReexecDescriptionV1::File {
-                            host_fd: host_fd.raw(),
-                            original_host_fd_flags: host_fd_flags,
-                            host_device: stat.st_dev as u64,
-                            host_inode: stat.st_ino,
-                            host_mode: stat.st_mode as u32,
-                            status_flags: base.status_flags(),
-                            guest_path: metadata.path.as_os_str().as_bytes().to_vec(),
-                            guest_mode: metadata.mode,
-                            guest_size: u64::try_from(metadata.size).map_err(|_| {
-                                format!("host file size is too large at guest fd {guest_fd}")
-                            })?,
-                            writable: *writable,
-                        }
+                    survivor_host_fds.insert(data_fd);
+                    survivor_host_fds.insert(lock_fd);
+                    NativeReexecDescriptionV1::IoUring {
+                        stable_id: open_file.description.id().raw(),
+                        data_fd,
+                        data_fd_flags,
+                        data_identity,
+                        lock_fd,
+                        lock_fd_flags,
+                        lock_identity,
+                        layout: backing.reexec_layout(),
+                        status_flags: backing.open_metadata().read().status_flags(),
                     }
-                    OpenDescription::HostSocket {
-                        base,
-                        host_fd,
-                        family,
-                        type_,
-                        protocol,
-                        mcast_memberships,
-                        synthetic_recv,
-                    } => {
-                        if !mcast_memberships.is_empty() || !synthetic_recv.is_empty() {
+                } else {
+                    let description = open_file.description.read();
+                    match &*description {
+                        OpenDescription::HostPipe {
+                            base,
+                            host_fd,
+                            is_read_end,
+                            pipe_id,
+                            pty: None,
+                            bidirectional,
+                            write_kind,
+                        } => {
+                            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                            if unsafe { libc::fstat(host_fd.raw(), stat.as_mut_ptr()) } < 0 {
+                                return Err(format!(
+                                    "fstat host pipe for guest fd {guest_fd}: {}",
+                                    std::io::Error::last_os_error()
+                                ));
+                            }
+                            let stat = unsafe { stat.assume_init() };
+                            let host_fd_flags =
+                                unsafe { libc::fcntl(host_fd.raw(), libc::F_GETFD) };
+                            if host_fd_flags < 0 {
+                                return Err(format!(
+                                    "F_GETFD host pipe for guest fd {guest_fd}: {}",
+                                    std::io::Error::last_os_error()
+                                ));
+                            }
+                            survivor_host_fds.insert(host_fd.raw());
+                            NativeReexecDescriptionV1::Pipe {
+                                stable_id: open_file.description.id().raw(),
+                                host_fd: host_fd.raw(),
+                                original_host_fd_flags: host_fd_flags,
+                                host_device: stat.st_dev as u64,
+                                host_inode: stat.st_ino,
+                                host_mode: stat.st_mode as u32,
+                                status_flags: base.status_flags(),
+                                pipe_capacity: base.pipe_capacity(),
+                                is_read_end: *is_read_end,
+                                pipe_id: *pipe_id,
+                                bidirectional: *bidirectional,
+                                write_kind: *write_kind,
+                            }
+                        }
+                        OpenDescription::HostFile {
+                            base,
+                            host_fd,
+                            metadata,
+                            writable,
+                        } => {
+                            if metadata.kind != RootFsEntryKind::File {
+                                return Err(format!(
+                                    "host file metadata is not regular at guest fd {guest_fd}"
+                                ));
+                            }
+                            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                            if unsafe { libc::fstat(host_fd.raw(), stat.as_mut_ptr()) } < 0 {
+                                return Err(format!(
+                                    "fstat host file for guest fd {guest_fd}: {}",
+                                    std::io::Error::last_os_error()
+                                ));
+                            }
+                            let stat = unsafe { stat.assume_init() };
+                            let host_fd_flags =
+                                unsafe { libc::fcntl(host_fd.raw(), libc::F_GETFD) };
+                            if host_fd_flags < 0 {
+                                return Err(format!(
+                                    "F_GETFD host file for guest fd {guest_fd}: {}",
+                                    std::io::Error::last_os_error()
+                                ));
+                            }
+                            survivor_host_fds.insert(host_fd.raw());
+                            NativeReexecDescriptionV1::File {
+                                stable_id: open_file.description.id().raw(),
+                                host_fd: host_fd.raw(),
+                                original_host_fd_flags: host_fd_flags,
+                                host_device: stat.st_dev as u64,
+                                host_inode: stat.st_ino,
+                                host_mode: stat.st_mode as u32,
+                                status_flags: base.status_flags(),
+                                guest_path: metadata.path.as_os_str().as_bytes().to_vec(),
+                                guest_mode: metadata.mode,
+                                guest_size: u64::try_from(metadata.size).map_err(|_| {
+                                    format!("host file size is too large at guest fd {guest_fd}")
+                                })?,
+                                writable: *writable,
+                            }
+                        }
+                        OpenDescription::HostSocket {
+                            base,
+                            host_fd,
+                            family,
+                            type_,
+                            protocol,
+                            mcast_memberships,
+                            synthetic_recv,
+                        } => {
+                            if !mcast_memberships.is_empty() || !synthetic_recv.is_empty() {
+                                return Err(format!(
+                                    "host socket has queued synthetic state at guest fd {guest_fd}"
+                                ));
+                            }
+                            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                            if unsafe { libc::fstat(host_fd.raw(), stat.as_mut_ptr()) } < 0 {
+                                return Err(format!(
+                                    "fstat host socket for guest fd {guest_fd}: {}",
+                                    std::io::Error::last_os_error()
+                                ));
+                            }
+                            let stat = unsafe { stat.assume_init() };
+                            let host_fd_flags =
+                                unsafe { libc::fcntl(host_fd.raw(), libc::F_GETFD) };
+                            if host_fd_flags < 0 {
+                                return Err(format!(
+                                    "F_GETFD host socket for guest fd {guest_fd}: {}",
+                                    std::io::Error::last_os_error()
+                                ));
+                            }
+                            survivor_host_fds.insert(host_fd.raw());
+                            NativeReexecDescriptionV1::Socket {
+                                stable_id: open_file.description.id().raw(),
+                                host_fd: host_fd.raw(),
+                                original_host_fd_flags: host_fd_flags,
+                                host_device: stat.st_dev as u64,
+                                host_inode: stat.st_ino,
+                                host_mode: stat.st_mode as u32,
+                                status_flags: base.status_flags(),
+                                family: *family,
+                                type_: *type_,
+                                protocol: *protocol,
+                            }
+                        }
+                        other => {
                             return Err(format!(
-                                "host socket has queued synthetic state at guest fd {guest_fd}"
+                                "unsupported surviving descriptor kind {} at guest fd {guest_fd}",
+                                other.reexec_kind_name()
                             ));
                         }
-                        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-                        if unsafe { libc::fstat(host_fd.raw(), stat.as_mut_ptr()) } < 0 {
-                            return Err(format!(
-                                "fstat host socket for guest fd {guest_fd}: {}",
-                                std::io::Error::last_os_error()
-                            ));
-                        }
-                        let stat = unsafe { stat.assume_init() };
-                        let host_fd_flags = unsafe { libc::fcntl(host_fd.raw(), libc::F_GETFD) };
-                        if host_fd_flags < 0 {
-                            return Err(format!(
-                                "F_GETFD host socket for guest fd {guest_fd}: {}",
-                                std::io::Error::last_os_error()
-                            ));
-                        }
-                        survivor_host_fds.insert(host_fd.raw());
-                        NativeReexecDescriptionV1::Socket {
-                            host_fd: host_fd.raw(),
-                            original_host_fd_flags: host_fd_flags,
-                            host_device: stat.st_dev as u64,
-                            host_inode: stat.st_ino,
-                            host_mode: stat.st_mode as u32,
-                            status_flags: base.status_flags(),
-                            family: *family,
-                            type_: *type_,
-                            protocol: *protocol,
-                        }
-                    }
-                    other => {
-                        return Err(format!(
-                            "unsupported surviving descriptor kind {} at guest fd {guest_fd}",
-                            other.reexec_kind_name()
-                        ));
                     }
                 };
                 let id = u32::try_from(descriptions.len())
@@ -3991,12 +4284,59 @@ impl SyscallDispatcher {
     #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
     pub(crate) fn restore_native_reexec_fd_table(
         &self,
+        context: &crate::kernel::KernelContext,
         snapshot: &NativeReexecFdTableV1,
     ) -> Result<(), String> {
         let mut descriptions = Vec::with_capacity(snapshot.descriptions.len());
+        let mut stable_ids = std::collections::HashSet::new();
         for record in &snapshot.descriptions {
+            let stable_id = record.stable_id();
+            if !stable_ids.insert(stable_id) {
+                return Err(format!(
+                    "duplicate native reexec file-description identity {stable_id}"
+                ));
+            }
+            if let NativeReexecDescriptionV1::IoUring {
+                data_fd,
+                data_fd_flags,
+                data_identity,
+                lock_fd,
+                lock_fd_flags,
+                lock_identity,
+                layout,
+                status_flags,
+                ..
+            } = record
+            {
+                for (fd, flags) in [(*data_fd, *data_fd_flags), (*lock_fd, *lock_fd_flags)] {
+                    if fd < 0 || flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags) } < 0 {
+                        return Err(format!("restore inherited io_uring backing fd {fd}"));
+                    }
+                }
+                let backing = crate::dispatch::ioring::IoUringBacking::restore(
+                    unsafe { OwnedFd::from_raw_fd(*data_fd) },
+                    unsafe { OwnedFd::from_raw_fd(*lock_fd) },
+                    *data_identity,
+                    *lock_identity,
+                    *layout,
+                )
+                .map_err(|errno| format!("restore io_uring backing: {errno:?}"))?;
+                backing
+                    .open_metadata()
+                    .write()
+                    .set_status_flags(*status_flags);
+                let description =
+                    crate::kernel::FileDescription::concrete_restored(stable_id, backing)
+                        .map(Arc::new)
+                        .map_err(|error| {
+                            format!("restore io_uring identity {stable_id}: {error}")
+                        })?;
+                descriptions.push(description);
+                continue;
+            }
             let description = match record {
                 NativeReexecDescriptionV1::Pipe {
+                    stable_id: _,
                     host_fd,
                     original_host_fd_flags,
                     host_device,
@@ -4043,6 +4383,7 @@ impl SyscallDispatcher {
                     }
                 }
                 NativeReexecDescriptionV1::File {
+                    stable_id: _,
                     host_fd,
                     original_host_fd_flags,
                     host_device,
@@ -4092,6 +4433,7 @@ impl SyscallDispatcher {
                     }
                 }
                 NativeReexecDescriptionV1::Socket {
+                    stable_id: _,
                     host_fd,
                     original_host_fd_flags,
                     host_device: _,
@@ -4156,13 +4498,22 @@ impl SyscallDispatcher {
                         synthetic_recv: VecDeque::new(),
                     }
                 }
+                NativeReexecDescriptionV1::IoUring { .. } => {
+                    return Err(
+                        "classified io_uring record reached open-description restore".to_owned(),
+                    );
+                }
             };
-            descriptions.push(std::sync::Arc::new(RwLock::new(description)));
+            descriptions.push(restored_kernel_file_description(
+                stable_id,
+                std::sync::Arc::new(RwLock::new(description)),
+            )?);
         }
 
-        *self.io.closed_stdio.lock() = snapshot.closed_stdio;
-        *self.io.stdio_cloexec.lock() = [false; 3];
-        let mut table = self.io.open_files.write();
+        let files = self.file_table_for_context(context);
+        *files.lock_closed_stdio() = snapshot.closed_stdio;
+        *files.lock_stdio_cloexec() = [false; 3];
+        let mut table = files.write_open_files();
         for file in &snapshot.files {
             if file.guest_fd < 0
                 || file.fd_flags & crate::linux_abi::LINUX_FD_CLOEXEC != 0
@@ -4182,10 +4533,10 @@ impl SyscallDispatcher {
                 OpenFile::new(std::sync::Arc::clone(description), file.fd_flags),
             );
             if (0..=2).contains(&file.guest_fd) {
-                self.io.closed_stdio.lock()[file.guest_fd as usize] = false;
+                files.lock_closed_stdio()[file.guest_fd as usize] = false;
             }
         }
-        *self.io.next_fd.lock() = 3;
+        *files.lock_next_fd() = 3;
         Ok(())
     }
 
@@ -4207,46 +4558,9 @@ impl SyscallDispatcher {
         self.proc.lock().itimers = [None, None, None];
     }
 
-    /// Linux execve(2) closes every fd that had FD_CLOEXEC set. Our
-    /// dispatcher previously preserved every fd across execve, which
-    /// meant a forked-then-exec'd child kept holding read-end references
-    /// to all of its parent's pipes — even ones it had marked CLOEXEC.
-    /// apt's http method sets CLOEXEC on fd 3..1023, un-sets it on
-    /// 0/1/2, then execve's, expecting the kernel to drop the inherited
-    /// pipe ends. Without that drop, the host kernel pipe stays in a
-    /// state where the parent's POLLIN never fires reliably.
-    ///
-    /// Walk open_files; for each fd whose fd_flags include FD_CLOEXEC,
-    /// remove it and run close_open_file (which honours the Rc-count
-    /// guard, so we don't close a host fd a sibling fd still aliases).
-    pub fn close_cloexec_fds(&self) {
-        let cloexec_fds: Vec<i32> = self
-            .io
-            .open_files
-            .read()
-            .iter()
-            .filter_map(|(fd, of)| (of.fd_flags & LINUX_FD_CLOEXEC != 0).then_some(*fd))
-            .collect();
-
-        for fd in cloexec_fds {
-            // The fd must still be in the table while detach resolves its host
-            // identity. detach itself distinguishes same-process aliases from
-            // surviving forked-process owners of the description.
-            self.detach_fd_from_epolls(fd);
-            let Some(open_file) = self.io.open_files.write().remove(&fd) else {
-                continue;
-            };
-            self.io.splice_pushback.lock().remove(&fd);
-            let pid = self.event_ring_guest_pid();
-            self.record_fd_close_owner(fd, pid, &open_file);
-            self.close_open_file_and_free_pty(&open_file);
-            self.note_fd_closed(fd);
-        }
-    }
-
     /// Close `open_file`'s backing host fd AND, if it was the last reference
     /// to a pty master this process owns, drop its `/dev/pts` entry. Use this
-    /// on every fd-close path (close, close_range, exec CLOEXEC sweep) so the
+    /// on every fd-close path (including exec generation retirement) so the
     /// PtyTable never desyncs from the real fd lifetime.
     pub(in crate::dispatch) fn close_open_file_and_free_pty(&self, open_file: &OpenFile) {
         // Linux classic POSIX record locks are process-associated, and closing
@@ -4257,9 +4571,17 @@ impl SyscallDispatcher {
         // duplicate to trigger the host kernel's process-lock release without
         // shortening the shared description's actual fd lifetime. OFD locks are
         // tied to the open file description and survive a non-final dup close.
-        let classic_lock_release_fd = match &*open_file.description.read() {
-            OpenDescription::HostFile { host_fd, .. } => Some(host_fd.raw()),
-            _ => None,
+        let classic_lock_release_fd = if open_file
+            .description
+            .concrete_backing::<crate::dispatch::ioring::IoUringBacking>()
+            .is_some()
+        {
+            None
+        } else {
+            match &*open_file.description.read() {
+                OpenDescription::HostFile { host_fd, .. } => Some(host_fd.raw()),
+                _ => None,
+            }
         };
         if let Some(host_fd) = classic_lock_release_fd {
             let duped = unsafe { libc::dup(host_fd) };
@@ -4272,11 +4594,16 @@ impl SyscallDispatcher {
 
         // Only act when THIS is the last reference (the host fd is actually
         // closing) — a dup'd fd sharing the Arc keeps the writer/pty alive.
-        let last_ref = Arc::strong_count(&open_file.description) == 1;
+        let last_ref = open_file.description.fd_ref_count() == 1;
         let mut pty_master_index = None;
         let mut fifo_host_fd = None;
         let mut closing_inotify = None;
-        if last_ref {
+        if last_ref
+            && open_file
+                .description
+                .concrete_backing::<crate::dispatch::ioring::IoUringBacking>()
+                .is_none()
+        {
             match &*open_file.description.read() {
                 OpenDescription::HostPipe { pty, host_fd, .. } => {
                     fifo_host_fd = Some(host_fd.raw());
@@ -4316,6 +4643,49 @@ impl SyscallDispatcher {
 
     pub fn stderr(&self) -> Vec<u8> {
         self.io.stderr.lock().clone()
+    }
+
+    fn captured_mm(&self) -> Arc<crate::kernel::Mm> {
+        if let Some(mm) = resources::mm() {
+            return mm;
+        }
+        #[cfg(test)]
+        {
+            self.capture_one_task_context()
+                .expect("test mm context")
+                .shared()
+                .mm()
+        }
+        #[cfg(not(test))]
+        {
+            tracing::error!("mm access escaped its captured KernelContext scope");
+            std::process::abort();
+        }
+    }
+
+    fn captured_file_table(&self) -> Arc<crate::kernel::FileTable> {
+        if let Some(files) = resources::files() {
+            return files;
+        }
+        #[cfg(test)]
+        {
+            self.capture_one_task_context()
+                .expect("test file-table context")
+                .resources()
+                .files()
+        }
+        #[cfg(not(test))]
+        {
+            tracing::error!("file-table access escaped its captured KernelContext scope");
+            std::process::abort();
+        }
+    }
+
+    pub(crate) fn file_table_for_context(
+        &self,
+        context: &crate::kernel::KernelContext,
+    ) -> Arc<crate::kernel::FileTable> {
+        context.resources().files()
     }
 
     fn captured_fs_context(&self) -> Arc<crate::kernel::FsContext> {
@@ -4648,7 +5018,11 @@ impl SyscallDispatcher {
             return Some(result);
         }
 
-        if request.number.raw() == 64 && !self.write_shared_supported(request.args.0[0] as i32) {
+        if request.number.raw() == 64
+            && !resources::with_captured_resources(kernel, || {
+                self.write_shared_supported(request.args.0[0] as i32)
+            })
+        {
             return None;
         }
 
@@ -4709,7 +5083,9 @@ impl SyscallDispatcher {
         // assertion is delivered (the Linux-lane lost-edge wedge — see
         // `epoll_rearm_after_io`). Outcome matters: an EAGAIN write did not
         // consume writable capacity and must not synthesize another OUT edge.
-        self.epoll_rearm_after_io(&request, &outcome);
+        resources::with_captured_resources(kernel, || {
+            self.epoll_rearm_after_io(&request, &outcome);
+        });
         let (retval, errno) = outcome.retval_errno();
         reporter.record(CompatEvent::SyscallReturn {
             number: request.number.raw(),
@@ -4932,7 +5308,9 @@ impl SyscallDispatcher {
         if let Some(result) = self.dispatch_normalized(kernel, request, memory, reporter, thread) {
             let outcome = lower_handler_result(result)?;
             // Consumption-based EPOLLET re-arm (see `epoll_rearm_after_io`).
-            self.epoll_rearm_after_io(&request, &outcome);
+            resources::with_captured_resources(kernel, || {
+                self.epoll_rearm_after_io(&request, &outcome);
+            });
             let (retval, errno) = outcome.retval_errno();
             reporter.record(CompatEvent::SyscallReturn {
                 number: request.number.raw(),
@@ -5905,41 +6283,17 @@ fn fd_is_tty(open_files: &HashMap<i32, OpenFile>, fd: i32) -> bool {
     !open_files.contains_key(&fd) && crate::host_tty::host_isatty(fd)
 }
 
-fn retain_open_file(description: &OpenDescriptionRef) {
-    let description = description.read();
+fn retain_open_file(description: &Arc<crate::kernel::FileDescription>) {
     description.retain_fd_ref();
-    match &*description {
-        OpenDescription::PipeReader { pipe, .. } => {
-            let mut pipe = pipe.lock();
-            pipe.readers = pipe.readers.saturating_add(1);
-        }
-        OpenDescription::PipeWriter { pipe, .. } => {
-            let mut pipe = pipe.lock();
-            pipe.writers = pipe.writers.saturating_add(1);
-        }
-        _ => {}
-    }
 }
 
 fn close_open_file(open_file: &OpenFile) {
-    let description = open_file.description.read();
-    description.release_fd_ref();
-    match &*description {
-        OpenDescription::PipeReader { pipe, .. } => {
-            let mut pipe = pipe.lock();
-            pipe.readers = pipe.readers.saturating_sub(1);
-        }
-        OpenDescription::PipeWriter { pipe, .. } => {
-            let mut pipe = pipe.lock();
-            pipe.writers = pipe.writers.saturating_sub(1);
-        }
-        _ => {}
-    }
+    open_file.description.release_fd_ref();
 }
 
 #[cfg(test)]
 fn is_last_open_file_ref(open_file: &OpenFile) -> bool {
-    open_file.description.read().fd_ref_count() == 1
+    open_file.description.fd_ref_count() == 1
 }
 
 fn linux_min_fd(value: u64) -> Result<i32, LinuxErrno> {
@@ -6473,14 +6827,17 @@ impl SyscallDispatcher {
         self.mem.lock().clone()
     }
 
-    fn synthetic_proc_context(&self) -> crate::vfs::SyntheticProcContext {
+    fn synthetic_proc_context(
+        &self,
+        context: &crate::kernel::KernelContext,
+    ) -> crate::vfs::SyntheticProcContext {
         // Acquire before signal/proc/sysv/memory locks: callers may need to wait
         // for an installing alias, and `/proc/*maps` must snapshot one coherent
         // host+dispatcher address-space generation.
         let _host_alias_dispatch = self.begin_host_alias_dispatch();
         // /proc/<pid>/status renders hex words; escape the typed sets at the
         // render boundary.
-        let (sig_ignored, sig_caught, sig_shdpnd) = self.proc_status_signal_masks();
+        let (sig_ignored, sig_caught, sig_shdpnd) = self.proc_status_signal_masks(context);
         let (sig_ignored, sig_caught, sig_shdpnd) =
             (sig_ignored.raw(), sig_caught.raw(), sig_shdpnd.raw());
         let proc = self.proc.lock();
@@ -8341,7 +8698,7 @@ mod overlay_dispatch_tests {
     const O_RDONLY: u64 = 0;
 
     fn eventfd_open_file(counter: u64) -> OpenFile {
-        OpenFile::new(
+        OpenFile::from_open_description(
             Arc::new(RwLock::new(OpenDescription::EventFd {
                 state: Arc::new(EventFdState::new(counter)),
                 semaphore: false,
@@ -8590,7 +8947,7 @@ mod overlay_dispatch_tests {
         let mut fds = [-1; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         let owner = HostFdRef::new(fds[0]);
-        let open_file = OpenFile::new(
+        let open_file = OpenFile::from_open_description(
             Arc::new(RwLock::new(OpenDescription::HostPipe {
                 base: OpenDescriptionBase::new(0),
                 host_fd: owner.clone(),
@@ -8655,8 +9012,23 @@ mod overlay_dispatch_tests {
         assert!(write.sigpipe_on_epipe());
     }
 
+    fn child_can_acquire_classic_write_lock(host_fd: i32) -> bool {
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork lock observer");
+        if child == 0 {
+            let mut lock = unsafe { std::mem::zeroed::<libc::flock>() };
+            lock.l_type = libc::F_WRLCK as _;
+            lock.l_whence = libc::SEEK_SET as _;
+            let result = unsafe { libc::fcntl(host_fd, libc::F_SETLK, &raw mut lock) };
+            unsafe { libc::_exit(i32::from(result < 0)) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &raw mut status, 0) }, child);
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+    }
+
     #[test]
-    fn close_cloexec_fds_removes_marked_descriptors_only() {
+    fn kernel_exec_publication_filters_cloexec_descriptors() {
         let dispatcher = SyscallDispatcher::new();
         let keep_fd = match dispatcher.install_fd_at_or_above(3, eventfd_open_file(1)) {
             Ok(fd) => fd,
@@ -8664,7 +9036,7 @@ mod overlay_dispatch_tests {
         };
         let cloexec_fd = match dispatcher.install_fd_at_or_above(
             3,
-            OpenFile::new(
+            OpenFile::from_open_description(
                 Arc::new(RwLock::new(OpenDescription::EventFd {
                     state: Arc::new(EventFdState::new(2)),
                     semaphore: false,
@@ -8677,10 +9049,137 @@ mod overlay_dispatch_tests {
             Err(_) => panic!("expected cloexec fd install to succeed"),
         };
 
-        dispatcher.close_cloexec_fds();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let prepared = dispatcher.prepare_one_task_kernel_exec(&context).unwrap();
+        dispatcher.commit_one_task_kernel_exec(prepared).unwrap();
 
         assert!(dispatcher.fd_is_valid(keep_fd));
         assert!(!dispatcher.fd_is_valid(cloexec_fd));
+    }
+
+    #[test]
+    fn non_cloexec_classic_record_lock_survives_exec_transfer() {
+        let dispatcher = SyscallDispatcher::new();
+        let named = tempfile::NamedTempFile::new().unwrap();
+        let host_fd = std::os::fd::IntoRawFd::into_raw_fd(named.reopen().unwrap());
+        let observer_fd = std::os::fd::IntoRawFd::into_raw_fd(named.reopen().unwrap());
+        let mut lock = unsafe { std::mem::zeroed::<libc::flock>() };
+        lock.l_type = libc::F_WRLCK as _;
+        lock.l_whence = libc::SEEK_SET as _;
+        assert_eq!(
+            unsafe { libc::fcntl(host_fd, libc::F_SETLK, &raw mut lock) },
+            0
+        );
+        let description =
+            kernel_file_description(Arc::new(RwLock::new(OpenDescription::HostFile {
+                base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
+                host_fd: HostFdRef::new(host_fd),
+                metadata: RootFsMetadata {
+                    path: std::path::PathBuf::from("/tmp/exec-lock"),
+                    kind: RootFsEntryKind::File,
+                    mode: 0o600,
+                    size: 0,
+                },
+                writable: true,
+            })));
+        let fd = dispatcher
+            .install_fd_at_or_above(3, OpenFile::new(Arc::clone(&description), 0))
+            .unwrap();
+        assert!(!child_can_acquire_classic_write_lock(observer_fd));
+
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let prepared = dispatcher.prepare_one_task_kernel_exec(&context).unwrap();
+        dispatcher.commit_one_task_kernel_exec(prepared).unwrap();
+        assert!(!child_can_acquire_classic_write_lock(observer_fd));
+
+        let removed = dispatcher
+            .captured_file_table()
+            .write_open_files()
+            .remove(&fd)
+            .expect("surviving lock fd");
+        dispatcher.close_open_file_and_free_pty(&removed);
+        assert!(child_can_acquire_classic_write_lock(observer_fd));
+        unsafe { libc::close(observer_fd) };
+    }
+
+    #[test]
+    fn dropping_drained_exec_generation_does_not_release_surviving_slot_twice() {
+        let dispatcher = SyscallDispatcher::new();
+        let description =
+            kernel_file_description(Arc::new(RwLock::new(OpenDescription::EventFd {
+                state: Arc::new(EventFdState::new(1)),
+                semaphore: false,
+                base: OpenDescriptionBase::new(0),
+            })));
+        let fd = dispatcher
+            .install_fd_at_or_above(3, OpenFile::new(Arc::clone(&description), 0))
+            .unwrap();
+        let old_context = dispatcher.capture_one_task_context().unwrap();
+        let old_files = old_context.resources().files();
+        let prepared = dispatcher
+            .prepare_one_task_kernel_exec(&old_context)
+            .unwrap();
+        dispatcher.commit_one_task_kernel_exec(prepared).unwrap();
+
+        assert_eq!(description.fd_ref_count(), 1);
+        assert!(!old_files.functional_refs_active());
+        drop(old_context);
+        drop(old_files);
+        assert_eq!(description.fd_ref_count(), 1);
+        assert!(dispatcher.fd_is_valid(fd));
+
+        let removed = dispatcher
+            .captured_file_table()
+            .write_open_files()
+            .remove(&fd)
+            .expect("surviving slot");
+        dispatcher.close_open_file_and_free_pty(&removed);
+        assert_eq!(description.fd_ref_count(), 0);
+        assert!(matches!(
+            &*description.read(),
+            OpenDescription::Closed { .. }
+        ));
+    }
+
+    #[test]
+    fn retained_exec_generation_does_not_keep_cloexec_pipe_writer_alive() {
+        let dispatcher = SyscallDispatcher::new();
+        let mut host_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(host_fds.as_mut_ptr()) }, 0);
+        let read_host_fd = host_fds[0];
+        let writer = kernel_file_description(Arc::new(RwLock::new(OpenDescription::HostPipe {
+            host_fd: HostFdRef::new(host_fds[1]),
+            is_read_end: false,
+            pipe_id: 0x51,
+            base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_WRONLY),
+            pty: None,
+            bidirectional: false,
+            write_kind: HostWriteKind::PipeLike,
+        })));
+        let writer_fd = dispatcher
+            .install_fd_at_or_above(3, OpenFile::new(Arc::clone(&writer), LINUX_FD_CLOEXEC))
+            .unwrap();
+        let old_context = dispatcher.capture_one_task_context().unwrap();
+        let old_files = old_context.resources().files();
+        let prepared = dispatcher
+            .prepare_one_task_kernel_exec(&old_context)
+            .unwrap();
+        let replacement = dispatcher.commit_one_task_kernel_exec(prepared).unwrap();
+
+        assert!(!old_files.functional_refs_active());
+        assert!(old_files.read_open_files().contains_key(&writer_fd));
+        assert!(replacement.resources().files().slot_count() == 0);
+        assert!(matches!(&*writer.read(), OpenDescription::Closed { .. }));
+
+        let mut pollfd = libc::pollfd {
+            fd: read_host_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 1);
+        assert_ne!(pollfd.revents & libc::POLLHUP, 0);
+
+        unsafe { libc::close(read_host_fd) };
     }
 
     #[test]
@@ -9193,6 +9692,76 @@ mod overlay_dispatch_tests {
     }
 
     #[test]
+    fn io_uring_fd_generic_operations_match_linux_anonymous_inode_semantics() {
+        let mut h = Harness::new();
+        let params = h.reserve(core::mem::size_of::<crate::linux_abi::LinuxIoUringParams>());
+        let ring_fd = returned(h.call(425, [8, params, 0, 0, 0, 0])) as i32;
+
+        let stat = h.reserve(core::mem::size_of::<crate::linux_abi::LinuxStat>());
+        assert_eq!(returned(h.call(80, [ring_fd as u64, stat, 0, 0, 0, 0])), 0);
+        assert_eq!(
+            returned(h.call(25, [ring_fd as u64, LINUX_F_GETFL, 0, 0, 0, 0])),
+            LINUX_O_RDWR as i64
+        );
+        let byte = h.put_bytes(&[0]);
+        assert_eq!(
+            errno(h.call(63, [ring_fd as u64, byte, 1, 0, 0, 0])),
+            LINUX_EINVAL.get()
+        );
+        assert_eq!(
+            errno(h.call(64, [ring_fd as u64, byte, 1, 0, 0, 0])),
+            LINUX_EINVAL.get()
+        );
+
+        let path = h.put_str(&format!("/proc/self/fd/{ring_fd}"));
+        let link = h.reserve(64);
+        let link_len = returned(h.call(78, [LINUX_AT_FDCWD, path, link, 64, 0, 0])) as usize;
+        assert_eq!(
+            h.memory.read_bytes(link, link_len).unwrap(),
+            b"anon_inode:[io_uring]"
+        );
+
+        let pollfd = h.put_bytes(
+            &[
+                (ring_fd as u32).to_le_bytes().as_slice(),
+                LINUX_POLLOUT.to_le_bytes().as_slice(),
+                0_i16.to_le_bytes().as_slice(),
+            ]
+            .concat(),
+        );
+        assert_eq!(returned(h.call(73, [pollfd, 1, 0, 0, 0, 0])), 1);
+        let observed = h.memory.read_bytes(pollfd, 8).unwrap();
+        assert_ne!(
+            i16::from_le_bytes(observed[6..8].try_into().unwrap()) & LINUX_POLLOUT,
+            0
+        );
+
+        let epfd = returned(h.call(20, [0, 0, 0, 0, 0, 0])) as i32;
+        let event = h.put_bytes(
+            &[
+                LINUX_EPOLLIN.to_le_bytes().as_slice(),
+                0_u32.to_le_bytes().as_slice(),
+                1_u64.to_le_bytes().as_slice(),
+            ]
+            .concat(),
+        );
+        assert_eq!(
+            returned(h.call(
+                21,
+                [
+                    epfd as u64,
+                    LINUX_EPOLL_CTL_ADD,
+                    ring_fd as u64,
+                    event,
+                    0,
+                    0,
+                ],
+            )),
+            0
+        );
+    }
+
+    #[test]
     fn epoll_et_read_via_dup_rearms_registered_sibling() {
         let mut h = Harness::new();
         let epfd = returned(h.call(20, [0, 0, 0, 0, 0, 0])) as u64;
@@ -9241,6 +9810,28 @@ mod overlay_dispatch_tests {
             )),
             0
         );
+        let epoll_description = h
+            .dispatcher
+            .open_file(epfd as i32)
+            .expect("epoll description")
+            .description;
+        let target_description = h
+            .dispatcher
+            .open_file(registered_reader)
+            .expect("registered description")
+            .description;
+        let (_, is_epoll, interests, backing, owners) = epoll_description
+            .snapshot_for_test(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .expect("concrete epoll snapshot");
+        assert!(is_epoll);
+        assert_eq!(interests, vec![target_description.id()]);
+        assert!(owners.is_empty());
+        let backing = backing.expect("concrete backing summary");
+        assert_eq!(
+            backing.kind(),
+            crate::kernel::FileDescriptionBackingKind::Epoll
+        );
+        assert_eq!(backing.epoll_interests(), interests);
 
         let out_addr = h.reserve(16);
         let first_addr = h.put_bytes(b"a");
@@ -9267,7 +9858,10 @@ mod overlay_dispatch_tests {
             DispatchOutcome::Returned { value: 1 }
         ));
         assert!(
-            h.dispatcher.io.epoll_fds.read().contains(&(epfd as i32)),
+            h.dispatcher
+                .captured_file_table()
+                .read_epoll_fds()
+                .contains(&(epfd as i32)),
             "epoll fd should be tracked for rearm"
         );
         h.dispatcher
@@ -9792,6 +10386,18 @@ mod overlay_dispatch_tests {
         );
 
         assert_eq!(returned(h.call(57, [closing_dup as u64, 0, 0, 0, 0, 0])), 0);
+        {
+            let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
+            let open = epoll_open.description.read();
+            let OpenDescription::Epoll { interest, .. } = &*open else {
+                panic!("epfd should be an epoll description");
+            };
+            assert!(interest.contains_key(&survivor));
+            assert!(
+                interest.contains_key(&closing_dup),
+                "Linux retains a dup-keyed registration until the description's final fd closes"
+            );
+        }
 
         let byte_addr = h.put_bytes(b"x");
         assert_eq!(
@@ -9823,6 +10429,14 @@ mod overlay_dispatch_tests {
             delivered_guest_fd, survivor,
             "close of a dup must rebind the shared host-fd registration to a surviving guest fd"
         );
+        assert_eq!(returned(h.call(57, [survivor as u64, 0, 0, 0, 0, 0])), 0);
+        let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
+        let open = epoll_open.description.read();
+        let OpenDescription::Epoll { interest, .. } = &*open else {
+            panic!("epfd should be an epoll description");
+        };
+        assert!(!interest.contains_key(&survivor));
+        assert!(!interest.contains_key(&closing_dup));
     }
 
     #[test]
@@ -11382,49 +11996,92 @@ mod rosetta_handshake_tests {
 mod hvpatch_in_process_fork_tests {
     use super::*;
 
+    fn fork_dispatcher(
+        parent: &SyscallDispatcher,
+        parent_tid: crate::thread::ThreadId,
+        child_tid: crate::thread::ThreadId,
+        parent_guest_pid: u32,
+        child_guest_pid: u32,
+    ) -> (SyscallDispatcher, crate::kernel::KernelContext) {
+        let parent_context = parent.capture_one_task_context().unwrap();
+        let plan =
+            crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty()).unwrap();
+        let child_context = parent_context
+            .kernel()
+            .reserve_fork(
+                &parent_context,
+                plan,
+                "dispatcher-fork-test".to_owned(),
+                None,
+            )
+            .unwrap()
+            .prepare_reference(child_tid)
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_parts()
+            .unwrap()
+            .0;
+        let child =
+            parent.fork_clone_in_process(parent_tid, child_tid, parent_guest_pid, child_guest_pid);
+        *child.kernel_binding.write() = child_context.task_binding();
+        (child, child_context)
+    }
+
     #[test]
     fn dispatcher_fork_clone_splits_process_state_without_duping_descriptions() {
-        let parent_tid = crate::thread::ThreadId::synthetic_for_tests(4100);
         let child_tid = crate::thread::ThreadId::synthetic_for_tests(4101);
         let parent = SyscallDispatcher::new();
-        let description = Arc::new(RwLock::new(OpenDescription::SyntheticFile {
-            base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
-            path: "/fork-clone".to_owned(),
-            contents: b"payload".to_vec(),
-            offset: 2,
-        }));
-        parent.io.open_files.write().insert(
+        let parent_context = parent.capture_one_task_context().unwrap();
+        let parent_tid = parent_context.thread().registry_id();
+        let description =
+            kernel_file_description(Arc::new(RwLock::new(OpenDescription::SyntheticFile {
+                base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
+                path: "/fork-clone".to_owned(),
+                contents: b"payload".to_vec(),
+                offset: 2,
+            })));
+        parent.captured_file_table().write_open_files().insert(
             3,
             OpenFile::new(Arc::clone(&description), crate::linux_abi::LINUX_FD_CLOEXEC),
         );
-        parent
-            .signal
-            .lock()
-            .masks
-            .insert(parent_tid, carrick_abi::SigSet::EMPTY.with(12));
-        parent
-            .signal
-            .lock()
-            .pendings
-            .insert(parent_tid, carrick_abi::SigSet::EMPTY.with(15));
+        parent.restore_signal_mask(
+            &parent_context,
+            parent_tid,
+            carrick_abi::SigSet::EMPTY.with(12),
+        );
+        parent.mark_signal_pending(&parent_context, parent_tid, 15);
         parent.proc.lock().pdeathsig = 9;
         parent.proc.lock().membarrier_ready = u64::MAX;
         parent.mem.lock().brk_current = 0x1234_0000;
 
-        let child = parent.fork_clone_in_process(parent_tid, child_tid, 41, 42);
+        let (child, child_context) = fork_dispatcher(&parent, parent_tid, child_tid, 41, 42);
 
-        let child_file = child.io.open_files.read().get(&3).cloned().unwrap();
+        let child_file = child
+            .captured_file_table()
+            .read_open_files()
+            .get(&3)
+            .cloned()
+            .unwrap();
         assert!(Arc::ptr_eq(&description, &child_file.description));
         assert_eq!(child_file.fd_flags, crate::linux_abi::LINUX_FD_CLOEXEC);
-        assert_eq!(child.signal_mask_for(child_tid).raw(), 1 << 11);
-        assert!(child.signal.lock().pendings.is_empty());
+        assert_eq!(
+            child.signal_mask_for(&child_context, child_tid).raw(),
+            1 << 11
+        );
+        assert!(child_context.thread().signal_state().pending().is_empty());
         assert_eq!(child.proc.lock().pdeathsig, 0);
         assert_eq!(child.proc.lock().membarrier_ready, 0);
         assert_eq!(child.mem.lock().brk_current, 0x1234_0000);
 
-        child.io.open_files.write().remove(&3);
+        child.captured_file_table().write_open_files().remove(&3);
         child.mem.lock().brk_current = 0x5678_0000;
-        assert!(parent.io.open_files.read().contains_key(&3));
+        assert!(
+            parent
+                .captured_file_table()
+                .read_open_files()
+                .contains_key(&3)
+        );
         assert_eq!(parent.mem.lock().brk_current, 0x1234_0000);
     }
 
@@ -11436,9 +12093,9 @@ mod hvpatch_in_process_fork_tests {
         let write_host_fd = host_fds[1];
 
         let parent = SyscallDispatcher::new();
-        parent.io.open_files.write().insert(
+        parent.captured_file_table().write_open_files().insert(
             3,
-            OpenFile::new(
+            OpenFile::from_open_description(
                 Arc::new(RwLock::new(OpenDescription::HostPipe {
                     host_fd: HostFdRef::new(read_host_fd),
                     is_read_end: true,
@@ -11451,9 +12108,9 @@ mod hvpatch_in_process_fork_tests {
                 0,
             ),
         );
-        parent.io.open_files.write().insert(
+        parent.captured_file_table().write_open_files().insert(
             4,
-            OpenFile::new(
+            OpenFile::from_open_description(
                 Arc::new(RwLock::new(OpenDescription::HostPipe {
                     host_fd: HostFdRef::new(write_host_fd),
                     is_read_end: false,
@@ -11466,14 +12123,18 @@ mod hvpatch_in_process_fork_tests {
                 0,
             ),
         );
-        for open_file in parent.io.open_files.read().values() {
+        for open_file in parent.captured_file_table().read_open_files().values() {
             retain_open_file(&open_file.description);
         }
 
         let parent_tid = crate::thread::ThreadId::synthetic_for_tests(5100);
         let child_tid = crate::thread::ThreadId::synthetic_for_tests(5101);
-        let child = parent.fork_clone_in_process(parent_tid, child_tid, 51, 52);
-        let parent_writer = parent.io.open_files.write().remove(&4).unwrap();
+        let (child, child_context) = fork_dispatcher(&parent, parent_tid, child_tid, 51, 52);
+        let parent_writer = parent
+            .captured_file_table()
+            .write_open_files()
+            .remove(&4)
+            .unwrap();
         parent.close_open_file_and_free_pty(&parent_writer);
         drop(parent_writer);
 
@@ -11484,7 +12145,16 @@ mod hvpatch_in_process_fork_tests {
         };
         assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 0);
 
-        child.retire_hvpatch_process_fds();
+        child_context
+            .kernel()
+            .exit_task(
+                child_context.task().key().id,
+                crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                crate::kernel::TaskRusage::default(),
+                None,
+            )
+            .unwrap();
+        child.retire_hvpatch_process_fds(&child_context);
 
         pollfd.revents = 0;
         assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 1);
@@ -11501,17 +12171,24 @@ mod hvpatch_in_process_fork_tests {
             offset: 0,
         }));
         let fd = dispatcher
-            .install_fd_at_or_above(3, OpenFile::new(Arc::clone(&description), 0))
+            .install_fd_at_or_above(
+                3,
+                OpenFile::from_open_description(Arc::clone(&description), 0),
+            )
             .unwrap();
         let parent_tid = crate::thread::ThreadId::synthetic_for_tests(5200);
         let child_tid = crate::thread::ThreadId::synthetic_for_tests(5201);
-        let child = dispatcher.fork_clone_in_process(parent_tid, child_tid, 61, 62);
+        let (child, _) = fork_dispatcher(&dispatcher, parent_tid, child_tid, 61, 62);
 
         let child_file = child.open_file(fd).unwrap();
         assert_eq!(description.read().fd_ref_count(), 2);
         assert!(!is_last_open_file_ref(&child_file));
 
-        let child_file = child.io.open_files.write().remove(&fd).unwrap();
+        let child_file = child
+            .captured_file_table()
+            .write_open_files()
+            .remove(&fd)
+            .unwrap();
         child.close_open_file_and_free_pty(&child_file);
         assert_eq!(description.read().fd_ref_count(), 1);
         let parent_file = dispatcher.open_file(fd).unwrap();
@@ -11529,6 +12206,112 @@ mod hvpatch_in_process_fork_tests {
     /// shuffle replaced an inherited pipe slot and Carrick detached the shared
     /// epoll interest by guest-fd number after installing the replacement.
     #[cfg(unix)]
+    #[test]
+    fn final_target_close_detaches_epoll_owner_from_another_file_table() {
+        const MEM_BASE: u64 = 0x5210_0000;
+        const MEM_LEN: usize = 0x1000;
+
+        let parent = SyscallDispatcher::new();
+        let reporter = crate::compat::CompatReporter::default();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(5400));
+        let futex = crate::thread::FutexTable::new();
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0; MEM_LEN]);
+        let tid = crate::thread::ThreadId::synthetic_for_tests(5401);
+        let call = |dispatcher: &SyscallDispatcher,
+                    memory: &mut LinearMemory,
+                    number: u64,
+                    args: [u64; 6]| {
+            dispatcher
+                .dispatch_threaded(
+                    &dispatcher.capture_one_task_context().unwrap(),
+                    SyscallRequest::new(number, SyscallArgs::from(args)),
+                    memory,
+                    &reporter,
+                    tid,
+                    &registry,
+                    &futex,
+                )
+                .expect("dispatch")
+        };
+
+        let epfd = match call(&parent, &mut memory, 20, [0; 6]) {
+            DispatchOutcome::Returned { value } => value as i32,
+            other => panic!("epoll_create1 failed: {other:?}"),
+        };
+        let pipe_addr = MEM_BASE + 0x100;
+        assert_eq!(
+            call(&parent, &mut memory, 59, [pipe_addr, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let pipe_fds = memory.read_bytes(pipe_addr, 8).unwrap();
+        let read_fd = i32::from_le_bytes(pipe_fds[0..4].try_into().unwrap());
+        let event_addr = MEM_BASE + 0x120;
+        let mut event = [0_u8; 16];
+        event[0..4].copy_from_slice(&LINUX_EPOLLIN.to_le_bytes());
+        memory.write_bytes(event_addr, &event).unwrap();
+        assert_eq!(
+            call(
+                &parent,
+                &mut memory,
+                21,
+                [
+                    epfd as u64,
+                    LINUX_EPOLL_CTL_ADD,
+                    read_fd as u64,
+                    event_addr,
+                    0,
+                    0
+                ],
+            ),
+            DispatchOutcome::Returned { value: 0 }
+        );
+
+        let target_description = parent
+            .open_file(read_fd)
+            .expect("parent target fd")
+            .description;
+        let epoll_description = parent.open_file(epfd).expect("parent epoll fd").description;
+        let (_, _, _, _, owners) = target_description
+            .snapshot_for_test(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .expect("target reverse epoll snapshot");
+        assert_eq!(owners, vec![(epoll_description.id(), read_fd)]);
+
+        let (child, _) = fork_dispatcher(
+            &parent,
+            crate::thread::ThreadId::synthetic_for_tests(5401),
+            crate::thread::ThreadId::synthetic_for_tests(5402),
+            81,
+            82,
+        );
+        assert_eq!(
+            call(&child, &mut memory, 57, [epfd as u64, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(
+            call(&parent, &mut memory, 57, [read_fd as u64, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(
+            call(&child, &mut memory, 57, [read_fd as u64, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+
+        let (_, _, _, _, owners) = target_description
+            .snapshot_for_test(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .expect("detached target snapshot");
+        assert!(owners.is_empty());
+        let epoll = parent.open_file(epfd).expect("parent epoll fd");
+        let epoll = epoll.description.read();
+        let OpenDescription::Epoll { interest, .. } = &*epoll else {
+            panic!("epoll fd changed description kind");
+        };
+        assert!(
+            !interest.contains_key(&read_fd),
+            "final target close did not detach the epoll owner in another table"
+        );
+    }
+
     #[test]
     fn hvpatch_child_dup3_does_not_detach_parent_epoll_interest() {
         const MEM_BASE: u64 = 0x5200_0000;
@@ -11587,7 +12370,8 @@ mod hvpatch_in_process_fork_tests {
             DispatchOutcome::Returned { value: 0 }
         );
 
-        let child = parent.fork_clone_in_process(
+        let (child, _) = fork_dispatcher(
+            &parent,
             crate::thread::ThreadId::synthetic_for_tests(5301),
             crate::thread::ThreadId::synthetic_for_tests(5302),
             71,
@@ -11653,8 +12437,12 @@ mod native_reexec_fd_tests {
     use std::io::{Seek, Write};
     use std::os::fd::IntoRawFd;
 
+    fn context(dispatcher: &SyscallDispatcher) -> crate::kernel::KernelContext {
+        dispatcher.capture_one_task_context().unwrap()
+    }
+
     #[test]
-    fn process_state_round_trip_preserves_credentials_groups_umask_and_ignored_signals() {
+    fn process_state_round_trip_preserves_credentials_actions_and_task_pending() {
         let state = crate::native_exec_capsule::NativeReexecProcessStateV1 {
             credentials: crate::native_exec_capsule::NativeReexecCredentialsV1 {
                 ruid: 1001,
@@ -11668,9 +12456,65 @@ mod native_reexec_fd_tests {
                 umask: 0o027,
             },
             supplementary_groups_override: Some(vec![50, 2002, 65534]),
-            ignored_signals: carrick_abi::SigSet::EMPTY
-                .with(crate::linux_abi::LINUX_SIGPIPE)
+            signal_actions: vec![crate::native_exec_capsule::NativeReexecSignalActionV1 {
+                signum: crate::linux_abi::LINUX_SIGPIPE,
+                handler: crate::linux_abi::LINUX_SIG_IGN,
+                flags: 0x4000_0000,
+                restorer: 0x1234_0000,
+                mask: 0x55,
+            }],
+            thread_blocked_mask: carrick_abi::SigSet::EMPTY
+                .with(crate::linux_abi::LINUX_SIGUSR2)
                 .raw(),
+            thread_pending_signals: vec![
+                crate::native_exec_capsule::NativeReexecPendingSignalV1 {
+                    signum: crate::linux_abi::LINUX_SIGUSR2,
+                    siginfo: None,
+                },
+                crate::native_exec_capsule::NativeReexecPendingSignalV1 {
+                    signum: 34,
+                    siginfo: Some(
+                        carrick_abi::LinuxSiginfo::rt_queue(34, 701, 801, 901)
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                },
+                crate::native_exec_capsule::NativeReexecPendingSignalV1 {
+                    signum: 34,
+                    siginfo: Some(
+                        carrick_abi::LinuxSiginfo::rt_queue(34, 703, 803, 903)
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                },
+            ],
+            thread_routed_siginfos: vec![crate::native_exec_capsule::NativeReexecPendingSignalV1 {
+                signum: crate::linux_abi::LINUX_SIGUSR1,
+                siginfo: Some(
+                    carrick_abi::LinuxSiginfo::rt_queue(
+                        crate::linux_abi::LINUX_SIGUSR1,
+                        702,
+                        802,
+                        902,
+                    )
+                    .as_bytes()
+                    .to_vec(),
+                ),
+            }],
+            task_pending_signals: vec![
+                crate::native_exec_capsule::NativeReexecPendingSignalV1 {
+                    signum: crate::linux_abi::LINUX_SIGUSR1,
+                    siginfo: None,
+                },
+                crate::native_exec_capsule::NativeReexecPendingSignalV1 {
+                    signum: 34,
+                    siginfo: Some(
+                        carrick_abi::LinuxSiginfo::rt_queue(34, 700, 800, 900)
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                },
+            ],
             nofile_soft: 1024,
             rlimit_overrides: (0..16)
                 .map(|index| {
@@ -11719,56 +12563,73 @@ mod native_reexec_fd_tests {
     #[test]
     fn stdio_closed_or_cloexec_before_exec_restores_closed() {
         let source = SyscallDispatcher::new();
-        source.io.closed_stdio.lock()[0] = true;
-        source.io.stdio_cloexec.lock()[1] = true;
-        let snapshot = source.snapshot_native_reexec_fd_table().unwrap();
+        source.captured_file_table().lock_closed_stdio()[0] = true;
+        source.captured_file_table().lock_stdio_cloexec()[1] = true;
+        let snapshot = source
+            .snapshot_native_reexec_fd_table(&context(&source))
+            .unwrap();
         assert_eq!(snapshot.closed_stdio, [true, true, false]);
 
         let resumed = SyscallDispatcher::new();
-        resumed.restore_native_reexec_fd_table(&snapshot).unwrap();
-        assert_eq!(*resumed.io.closed_stdio.lock(), [true, true, false]);
-        assert_eq!(*resumed.io.stdio_cloexec.lock(), [false; 3]);
+        resumed
+            .restore_native_reexec_fd_table(&context(&resumed), &snapshot)
+            .unwrap();
+        assert_eq!(
+            *resumed.captured_file_table().lock_closed_stdio(),
+            [true, true, false]
+        );
+        assert_eq!(
+            *resumed.captured_file_table().lock_stdio_cloexec(),
+            [false; 3]
+        );
     }
 
     #[test]
     fn host_pipe_snapshot_restores_guest_aliases_and_kernel_identity() {
         let mut pipe_fds = [-1; 2];
         assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let description = std::sync::Arc::new(RwLock::new(OpenDescription::HostPipe {
-            base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_WRONLY),
-            host_fd: HostFdRef::new(pipe_fds[1]),
-            is_read_end: false,
-            pipe_id: 91,
-            pty: None,
-            bidirectional: false,
-            write_kind: HostWriteKind::PipeLike,
-        }));
+        let description = kernel_file_description(std::sync::Arc::new(RwLock::new(
+            OpenDescription::HostPipe {
+                base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_WRONLY),
+                host_fd: HostFdRef::new(pipe_fds[1]),
+                is_read_end: false,
+                pipe_id: 91,
+                pty: None,
+                bidirectional: false,
+                write_kind: HostWriteKind::PipeLike,
+            },
+        )));
         let source = SyscallDispatcher::new();
         source
-            .io
-            .open_files
-            .write()
+            .captured_file_table()
+            .write_open_files()
             .insert(1, OpenFile::new(std::sync::Arc::clone(&description), 0));
         source
-            .io
-            .open_files
-            .write()
+            .captured_file_table()
+            .write_open_files()
             .insert(7, OpenFile::new(std::sync::Arc::clone(&description), 0));
-        let snapshot = source.snapshot_native_reexec_fd_table().unwrap();
+        let stable_id = description.id();
+        let snapshot = source
+            .snapshot_native_reexec_fd_table(&context(&source))
+            .unwrap();
         assert_eq!(snapshot.files.len(), 2);
         assert_eq!(snapshot.descriptions.len(), 1);
         std::mem::forget(source);
         drop(description);
 
         let resumed = SyscallDispatcher::new();
-        resumed.restore_native_reexec_fd_table(&snapshot).unwrap();
-        let table = resumed.io.open_files.read();
+        resumed
+            .restore_native_reexec_fd_table(&context(&resumed), &snapshot)
+            .unwrap();
+        let resumed_files = resumed.captured_file_table();
+        let table = resumed_files.read_open_files();
         let first = table.get(&1).unwrap();
         let alias = table.get(&7).unwrap();
         assert!(std::sync::Arc::ptr_eq(
             &first.description,
             &alias.description
         ));
+        assert_eq!(first.description.id(), stable_id);
         let raw = match &*first.description.read() {
             OpenDescription::HostPipe { host_fd, .. } => host_fd.raw(),
             other => panic!("restored wrong description: {other:?}"),
@@ -11785,6 +12646,53 @@ mod native_reexec_fd_tests {
     }
 
     #[test]
+    fn io_uring_snapshot_restores_aliases_identity_and_status_flags() {
+        let source = SyscallDispatcher::new();
+        let backing =
+            crate::dispatch::ioring::IoUringBacking::create(8, 4096).expect("ring backing");
+        backing
+            .open_metadata()
+            .write()
+            .set_status_flags(LINUX_O_RDWR | LINUX_O_NONBLOCK);
+        let description =
+            Arc::new(crate::kernel::FileDescription::concrete(backing).expect("ring description"));
+        let stable_id = description.id();
+        let first = source
+            .install_fd_at_or_above(3, OpenFile::new(Arc::clone(&description), 0))
+            .expect("first ring fd");
+        let alias = source
+            .install_fd_at_or_above(first + 1, OpenFile::new(description, 0))
+            .expect("ring alias");
+        let snapshot = source
+            .snapshot_native_reexec_fd_table(&context(&source))
+            .expect("ring snapshot");
+        std::mem::forget(source);
+
+        let resumed = SyscallDispatcher::new();
+        resumed
+            .restore_native_reexec_fd_table(&context(&resumed), &snapshot)
+            .expect("ring restore");
+        let files = resumed.captured_file_table();
+        let table = files.read_open_files();
+        let first = table.get(&first).expect("restored first ring fd");
+        let alias = table.get(&alias).expect("restored ring alias");
+        assert!(Arc::ptr_eq(&first.description, &alias.description));
+        assert_eq!(first.description.id(), stable_id);
+        let backing = first
+            .description
+            .concrete_backing::<crate::dispatch::ioring::IoUringBacking>()
+            .expect("restored typed ring backing");
+        assert_eq!(
+            backing.open_metadata().read().status_flags(),
+            LINUX_O_RDWR | LINUX_O_NONBLOCK
+        );
+        assert!(
+            resumed.captured_mm().read_io_uring_mappings().is_empty(),
+            "native reexec must not restore old-mm mapping attachments"
+        );
+    }
+
+    #[test]
     fn unsupported_survivor_is_rejected_but_cloexec_is_omitted() {
         let dispatcher = SyscallDispatcher::new();
         let description = std::sync::Arc::new(RwLock::new(OpenDescription::SyntheticFile {
@@ -11793,20 +12701,24 @@ mod native_reexec_fd_tests {
             contents: Vec::new(),
             offset: 0,
         }));
+        dispatcher.captured_file_table().write_open_files().insert(
+            9,
+            OpenFile::from_open_description(std::sync::Arc::clone(&description), 0),
+        );
+        assert!(
+            dispatcher
+                .snapshot_native_reexec_fd_table(&context(&dispatcher))
+                .is_err()
+        );
         dispatcher
-            .io
-            .open_files
-            .write()
-            .insert(9, OpenFile::new(std::sync::Arc::clone(&description), 0));
-        assert!(dispatcher.snapshot_native_reexec_fd_table().is_err());
-        dispatcher
-            .io
-            .open_files
-            .write()
+            .captured_file_table()
+            .write_open_files()
             .get_mut(&9)
             .unwrap()
             .fd_flags = crate::linux_abi::LINUX_FD_CLOEXEC;
-        let snapshot = dispatcher.snapshot_native_reexec_fd_table().unwrap();
+        let snapshot = dispatcher
+            .snapshot_native_reexec_fd_table(&context(&dispatcher))
+            .unwrap();
         assert!(snapshot.files.is_empty());
         assert!(snapshot.descriptions.is_empty());
     }
@@ -11818,9 +12730,9 @@ mod native_reexec_fd_tests {
         file.seek(std::io::SeekFrom::Start(3)).unwrap();
         let host_fd = file.into_raw_fd();
         let source = SyscallDispatcher::new();
-        source.io.open_files.write().insert(
+        source.captured_file_table().write_open_files().insert(
             2,
-            OpenFile::new(
+            OpenFile::from_open_description(
                 std::sync::Arc::new(RwLock::new(OpenDescription::HostFile {
                     base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
                     host_fd: HostFdRef::new(host_fd),
@@ -11835,14 +12747,39 @@ mod native_reexec_fd_tests {
                 0,
             ),
         );
-        source.io.stdio_cloexec.lock()[2] = true;
-        assert!(source.validate_native_reexec_fd_state().is_ok());
-        let snapshot = source.snapshot_native_reexec_fd_table().unwrap();
+        source.captured_file_table().lock_stdio_cloexec()[2] = true;
+        let description = source.open_file(2).expect("host file fd").description;
+        let (_, _, _, backing, owners) = description
+            .snapshot_for_test(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .expect("host file backing snapshot");
+        assert_eq!(
+            backing.and_then(|backing| match backing {
+                crate::kernel::FileDescriptionBackingSnapshot::Open(open) => open.offset,
+                crate::kernel::FileDescriptionBackingSnapshot::IoUring(_) => None,
+            }),
+            Some(3)
+        );
+        assert!(owners.is_empty());
+        assert!(
+            source
+                .validate_native_reexec_fd_state(&context(&source))
+                .is_ok()
+        );
+        let snapshot = source
+            .snapshot_native_reexec_fd_table(&context(&source))
+            .unwrap();
         std::mem::forget(source);
 
         let resumed = SyscallDispatcher::new();
-        resumed.restore_native_reexec_fd_table(&snapshot).unwrap();
-        let open_file = resumed.io.open_files.read().get(&2).unwrap().clone();
+        resumed
+            .restore_native_reexec_fd_table(&context(&resumed), &snapshot)
+            .unwrap();
+        let open_file = resumed
+            .captured_file_table()
+            .read_open_files()
+            .get(&2)
+            .unwrap()
+            .clone();
         let raw = match &*open_file.description.read() {
             OpenDescription::HostFile { host_fd, .. } => host_fd.raw(),
             other => panic!("restored wrong description: {other:?}"),
@@ -11858,9 +12795,9 @@ mod native_reexec_fd_tests {
             0
         );
         let source = SyscallDispatcher::new();
-        source.io.open_files.write().insert(
+        source.captured_file_table().write_open_files().insert(
             0,
-            OpenFile::new(
+            OpenFile::from_open_description(
                 std::sync::Arc::new(RwLock::new(OpenDescription::HostSocket {
                     base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
                     host_fd: HostFdRef::new(sockets[0]),
@@ -11873,12 +12810,21 @@ mod native_reexec_fd_tests {
                 0,
             ),
         );
-        let snapshot = source.snapshot_native_reexec_fd_table().unwrap();
+        let snapshot = source
+            .snapshot_native_reexec_fd_table(&context(&source))
+            .unwrap();
         std::mem::forget(source);
 
         let resumed = SyscallDispatcher::new();
-        resumed.restore_native_reexec_fd_table(&snapshot).unwrap();
-        let open_file = resumed.io.open_files.read().get(&0).unwrap().clone();
+        resumed
+            .restore_native_reexec_fd_table(&context(&resumed), &snapshot)
+            .unwrap();
+        let open_file = resumed
+            .captured_file_table()
+            .read_open_files()
+            .get(&0)
+            .unwrap()
+            .clone();
         let raw = match &*open_file.description.read() {
             OpenDescription::HostSocket { host_fd, .. } => host_fd.raw(),
             other => panic!("restored wrong description: {other:?}"),
@@ -12036,7 +12982,7 @@ mod container_policy_dispatch_tests {
         // policy must survive those resets — like a Linux seccomp filter
         // surviving execve.
         let mut dispatcher = confined_dispatcher();
-        dispatcher.reset_signal_handlers_on_execve();
+        dispatcher.reset_signal_handlers_on_execve(&dispatcher.exact_signal_context_for_test());
         dispatcher.set_executable_path("/replaced/image".to_string());
         assert_eq!(
             dispatch_one(&mut dispatcher, SYS_ADD_KEY),

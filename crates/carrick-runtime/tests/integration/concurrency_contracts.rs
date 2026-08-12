@@ -178,18 +178,40 @@ fn shared_dispatcher_services_thread_registry_and_futex_syscalls() {
 fn shared_dispatcher_routes_sibling_thread_signals() {
     let dispatcher = Arc::new(SyscallDispatcher::new());
     let reporter = CompatReporter::default();
-    let registry = ThreadRegistry::new(t(10));
+    let initial = dispatcher.capture_one_task_context().unwrap();
+    let main = initial.thread().registry_id();
+    let registry = ThreadRegistry::new(main);
+    let target = registry.register_child(0);
     let futex = FutexTable::new();
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
-    assert_eq!(registry.register_child(0), t(11));
+    let flags = carrick_abi::LinuxCloneFlags::VM
+        | carrick_abi::LinuxCloneFlags::FS
+        | carrick_abi::LinuxCloneFlags::FILES
+        | carrick_abi::LinuxCloneFlags::SIGHAND
+        | carrick_abi::LinuxCloneFlags::THREAD;
+    let plan = carrick_runtime::kernel::ClonePlan::from_flags(flags).unwrap();
+    let _started = initial
+        .kernel()
+        .reserve_thread_clone(&initial, plan, None)
+        .unwrap()
+        .prepare(target)
+        .unwrap()
+        .commit()
+        .unwrap()
+        .start_thread()
+        .unwrap();
+    let context = dispatcher.capture_one_task_context().unwrap();
 
     let routed = dispatcher
         .dispatch_threaded(
-            &dispatcher.capture_one_task_context().unwrap(),
-            SyscallRequest::new(131, SyscallArgs::from([10, 11, 10, 0, 0, 0])),
+            &context,
+            SyscallRequest::new(
+                131,
+                SyscallArgs::from([main.raw() as u64, target.raw() as u64, 10, 0, 0, 0]),
+            ),
             &mut memory,
             &reporter,
-            t(10),
+            main,
             &registry,
             &futex,
         )
@@ -197,7 +219,7 @@ fn shared_dispatcher_routes_sibling_thread_signals() {
     assert_eq!(
         routed,
         DispatchOutcome::SignalThread {
-            tid: t(11),
+            tid: target,
             signum: 10
         }
     );

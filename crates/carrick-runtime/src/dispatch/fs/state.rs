@@ -2,7 +2,6 @@
 
 use super::super::*;
 use crate::linux_abi::{LinuxDnotifyMask, LinuxErrno};
-use std::sync::atomic::AtomicU64;
 
 /// Guest-visible fd allocation pressure caused by host-backed path opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -42,14 +41,14 @@ pub(in crate::dispatch) struct DnotifyRegistration {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(in crate::dispatch) struct LegacyAioContextId(u64);
+pub(crate) struct LegacyAioContextId(u64);
 
 impl LegacyAioContextId {
     pub(in crate::dispatch) fn from_guest(raw: u64) -> Option<Self> {
         if raw == 0 { None } else { Some(Self(raw)) }
     }
 
-    pub(in crate::dispatch) fn allocated_from(raw: u64) -> Self {
+    pub(crate) fn allocated_from(raw: u64) -> Self {
         Self(raw)
     }
 
@@ -59,7 +58,7 @@ impl LegacyAioContextId {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(in crate::dispatch) struct SplicePushback {
+pub(crate) struct SplicePushback {
     chunks: VecDeque<SplicePushbackChunk>,
     len: usize,
 }
@@ -204,140 +203,32 @@ pub(in crate::dispatch) struct FsState {
         std::sync::Arc<parking_lot::Mutex<HashMap<String, crate::memory::AddressSpace>>>,
 }
 
-/// Owned I/O-subsystem state. Split out of `SyscallDispatcher` so the I/O
-/// handlers borrow only the fd/stdio state they touch. Field semantics are
-/// unchanged from the former loose fields (`stdout`/`stderr`/`stream_stdio`/
-/// `open_files`/`next_fd`). Cwd and chroot authority live exclusively in
-/// [`crate::kernel::FsContext`].
-pub(in crate::dispatch) struct IoState {
+/// Process-local output transport. Linux fd-table authority lives exclusively
+/// in the captured Kernel [`crate::kernel::FileTable`].
+pub(in crate::dispatch) struct RuntimeIo {
     pub stdout: Mutex<Vec<u8>>,
     pub stderr: Mutex<Vec<u8>>,
-    /// When true, writes to fd 1/2 stream directly to host fds 1/2
-    /// instead of buffering into `stdout`/`stderr`. Set by `--raw`/the
-    /// interactive runtime so the user sees the guest's prompt and
-    /// output in real time, instead of after exit.
+    /// When true, writes to fd 1/2 stream directly to host fds 1/2 instead of
+    /// buffering into `stdout`/`stderr`.
     pub stream_stdio: Mutex<bool>,
-    pub open_files: RwLock<HashMap<i32, OpenFile>>,
-    pub next_fd: Mutex<i32>,
-    /// FD_CLOEXEC state for bare stdio fds (0/1/2) that have no
-    /// `OpenDescription` in `open_files`. Linux lets `fcntl(F_SETFD,
-    /// FD_CLOEXEC)` on stdio and a subsequent `F_GETFD` reflects the bit;
-    /// without persisting it here, F_GETFD always read back 0 (diverging
-    /// from real Linux on the fcntlstdio conformance probe).
-    pub stdio_cloexec: Mutex<[bool; 3]>,
-    /// Which bare stdio fds (0/1/2) the guest has explicitly `close`d. A closed
-    /// stdio number becomes free for reuse by the lowest-free-descriptor
-    /// allocator (POSIX): busybox ash's background-job `forkchild` does
-    /// `close(0); open("/dev/null")` and treats a non-zero return as an error.
-    /// Without honoring this, the open got fd 3 and ash printed "can't open
-    /// /dev/null". Cleared when a fd is installed at that number again.
-    pub closed_stdio: Mutex<[bool; 3]>,
-    /// Guest path each open fd was opened at, regardless of backend (host-fd
-    /// backed `OpenDescription`s carry no path of their own). Serves
-    /// `readlink(/proc/self/fd/N)` — Apple Rosetta readlinks its main-binary fd
-    /// to recover the binary path. Best-effort: populated on open, cleared on
-    /// close (a stale entry for a recycled fd is overwritten by the next open).
-    pub fd_open_paths: RwLock<HashMap<i32, String>>,
-    /// Bytes pulled from a host pipe by splice but not accepted by the
-    /// destination yet. Linux does not consume pipe bytes when splice returns
-    /// EAGAIN on the output side; host pipes have no peek API, so Carrick stages
-    /// the bytes here and retries them before reading more from the host pipe.
-    pub splice_pushback: Mutex<HashMap<i32, SplicePushback>>,
-    /// Live io_uring instances keyed by ring fd (WS-H4-B1). Side table rather
-    /// than an `OpenDescription` variant so io_uring needs no new arm across the
-    /// ~24 fd match sites; `mmap`/`io_uring_enter` look the ring up here.
-    pub io_uring_instances: RwLock<HashMap<i32, crate::dispatch::ioring::IoUringState>>,
-    /// Minimal legacy Linux AIO contexts (`io_setup`/`io_destroy`/`io_submit`).
-    /// Carrick services the currently covered AIO contract synchronously, but
-    /// still needs a real context namespace so invalid-context checks match
-    /// Linux instead of degrading to ENOSYS/TCONF.
-    pub legacy_aio_contexts: RwLock<std::collections::BTreeSet<LegacyAioContextId>>,
-    /// Raw allocation counter. It is wrapped into `LegacyAioContextId` before
-    /// entering the guest-visible context namespace.
-    pub next_legacy_aio_context: AtomicU64,
-    /// Guest soft RLIMIT_NOFILE: the highest fd the allocator hands out
-    /// (`fd < nofile_soft`). The default mirrors Docker's LTP oracle and
-    /// carrick's exposed `nr_open` ceiling; a guest may lower/raise it via
-    /// setrlimit/prlimit64 (libuv's TEST_FILE_LIMIT does). Lock-free so the fd
-    /// allocator can read it while holding open_files (never the proc lock).
-    pub nofile_soft: AtomicU64,
-    /// Guest fds that have hosted an epoll interest set (recorded at
-    /// `epoll_ctl`). Lets the Linux lane's consumption-based EPOLLET re-arm
-    /// ([`crate::dispatch::SyscallDispatcher::epoll_rearm_after_io`]) find the
-    /// epoll instances possibly watching an fd without scanning the whole fd
-    /// table on every guest read/write. Entries are pruned lazily: a stale fd
-    /// (closed / recycled as a non-epoll) is removed when the re-arm next
-    /// visits it.
-    pub epoll_fds: RwLock<std::collections::BTreeSet<i32>>,
-    /// User-wake fds for epoll instances owned by this dispatcher. In-memory
-    /// readiness changes broadcast only within this registry, not to unrelated
-    /// dispatcher instances sharing the same host test process.
-    pub epoll_wake_registry: crate::dispatch::EpollWakeRegistry,
 }
 
-/// Default soft RLIMIT_NOFILE. Docker's LTP oracle starts processes with the
-/// soft cap raised to the Linux `nr_open` ceiling; matching that avoids a
-/// guest-visible split between `getrlimit(RLIMIT_NOFILE)`,
-/// `/proc/sys/fs/nr_open`, and fd allocation.
-pub(in crate::dispatch) const DEFAULT_NOFILE_SOFT: u64 = 1024 * 1024;
-
-impl IoState {
+impl RuntimeIo {
     pub(in crate::dispatch) fn new() -> Self {
         Self {
             stdout: Mutex::new(Vec::new()),
             stderr: Mutex::new(Vec::new()),
             stream_stdio: Mutex::new(false),
-            open_files: RwLock::new(HashMap::new()),
-            next_fd: Mutex::new(3),
-            stdio_cloexec: Mutex::new([false; 3]),
-            closed_stdio: Mutex::new([false; 3]),
-            fd_open_paths: RwLock::new(HashMap::new()),
-            splice_pushback: Mutex::new(HashMap::new()),
-            io_uring_instances: RwLock::new(HashMap::new()),
-            legacy_aio_contexts: RwLock::new(std::collections::BTreeSet::new()),
-            next_legacy_aio_context: AtomicU64::new(1),
-            nofile_soft: AtomicU64::new(DEFAULT_NOFILE_SOFT),
-            epoll_fds: RwLock::new(std::collections::BTreeSet::new()),
-            epoll_wake_registry: crate::dispatch::new_epoll_wake_registry(),
         }
     }
 
-    /// Clone the Linux fd namespace for an in-process fork. Guest fd numbers
-    /// and descriptor flags become independent, while every `OpenFile` keeps
-    /// the same `Arc<OpenDescription>` so offsets/status flags retain Linux's
-    /// shared-open-file-description semantics.
     pub(in crate::dispatch) fn fork_clone(&self) -> Self {
-        let open_files = self.open_files.read().clone();
-        for file in open_files.values() {
-            retain_open_file(&file.description);
-        }
-        let epoll_wake_registry = crate::dispatch::new_epoll_wake_registry();
-        for file in open_files.values() {
-            if let OpenDescription::Epoll { kqueue, .. } = &*file.description.read() {
-                crate::dispatch::register_epoll_kqueue(&epoll_wake_registry, kqueue.wake_fd);
-            }
-        }
         Self {
             // The host-fork child clears inherited buffered output before it
             // resumes. An in-process child starts with the same clean boundary.
             stdout: Mutex::new(Vec::new()),
             stderr: Mutex::new(Vec::new()),
             stream_stdio: Mutex::new(*self.stream_stdio.lock()),
-            open_files: RwLock::new(open_files),
-            next_fd: Mutex::new(*self.next_fd.lock()),
-            stdio_cloexec: Mutex::new(*self.stdio_cloexec.lock()),
-            closed_stdio: Mutex::new(*self.closed_stdio.lock()),
-            fd_open_paths: RwLock::new(self.fd_open_paths.read().clone()),
-            splice_pushback: Mutex::new(self.splice_pushback.lock().clone()),
-            io_uring_instances: RwLock::new(self.io_uring_instances.read().clone()),
-            // Linux AIO contexts are not inherited by fork children.
-            legacy_aio_contexts: RwLock::new(std::collections::BTreeSet::new()),
-            next_legacy_aio_context: AtomicU64::new(1),
-            nofile_soft: AtomicU64::new(
-                self.nofile_soft.load(std::sync::atomic::Ordering::Relaxed),
-            ),
-            epoll_fds: RwLock::new(self.epoll_fds.read().clone()),
-            epoll_wake_registry,
         }
     }
 }
@@ -364,7 +255,7 @@ pub(super) struct HostFileCopyInfo {
     pub(super) writable: bool,
 }
 
-pub(super) fn host_fd_offset(host_fd: crate::dispatch::HostFd) -> Option<u64> {
+pub(in crate::dispatch) fn host_fd_offset(host_fd: crate::dispatch::HostFd) -> Option<u64> {
     let offset = unsafe { libc::lseek(host_fd.get(), 0, libc::SEEK_CUR) };
     if offset < 0 {
         return None;
@@ -490,26 +381,16 @@ mod fork_clone_tests {
     use super::*;
 
     #[test]
-    fn forked_io_has_independent_fd_namespace_and_shared_open_description() {
-        let parent = SyscallDispatcher::new();
-        let description = Arc::new(RwLock::new(OpenDescription::SyntheticFile {
-            base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
-            path: "/fork-shared".to_owned(),
-            contents: b"abc".to_vec(),
-            offset: 0,
-        }));
-        parent.io.open_files.write().insert(
-            3,
-            OpenFile::new(Arc::clone(&description), crate::linux_abi::LINUX_FD_CLOEXEC),
-        );
-        let child = parent.io.fork_clone();
+    fn forked_runtime_io_starts_with_clean_output_and_preserves_stream_mode() {
+        let parent = RuntimeIo::new();
+        parent.stdout.lock().extend_from_slice(b"parent");
+        *parent.stream_stdio.lock() = true;
 
-        let child_file = child.open_files.read().get(&3).cloned().unwrap();
-        assert!(Arc::ptr_eq(&description, &child_file.description));
-        assert_eq!(child_file.fd_flags, crate::linux_abi::LINUX_FD_CLOEXEC);
+        let child = parent.fork_clone();
 
-        parent.io.open_files.write().remove(&3);
-        assert!(!parent.io.open_files.read().contains_key(&3));
-        assert!(child.open_files.read().contains_key(&3));
+        assert!(child.stdout.lock().is_empty());
+        assert!(child.stderr.lock().is_empty());
+        assert!(*child.stream_stdio.lock());
+        assert_eq!(&*parent.stdout.lock(), b"parent");
     }
 }

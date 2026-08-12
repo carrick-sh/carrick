@@ -1,12 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::any::Any;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use carrick_abi::SigSet;
+use carrick_abi::{LinuxSigaction, LinuxSigaltstack, LinuxSiginfo, SigSet};
 use carrick_hal::ThreadId;
-use parking_lot::{Condvar, Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::linux_abi::LINUX_DEFAULT_UMASK;
 
@@ -59,24 +61,177 @@ pub struct ThreadKey {
     pub serial: ThreadSerial,
 }
 
+pub(super) struct MmIoStateSnapshot {
+    pub(super) revision: u64,
+    pub(super) io_uring_mappings: Vec<crate::dispatch::ioring::IoUringMappingSnapshot>,
+    pub(super) legacy_aio_context_count: usize,
+    pub(super) next_legacy_aio_context: u64,
+}
+
 pub struct Mm {
     id: MmId,
     backend: Option<Arc<dyn MmBackend>>,
+    io_uring_mappings: RwLock<Vec<crate::dispatch::ioring::IoUringMapping>>,
+    legacy_aio_contexts: RwLock<BTreeSet<crate::dispatch::LegacyAioContextId>>,
+    next_legacy_aio_context: AtomicU64,
+    revision: ObjectRevision,
 }
 
 impl Mm {
     /// Identity-only constructor for the in-crate K1 reference model. Runtime
     /// adapters must use `with_backend`; callers outside `kernel` cannot create
     /// an observation-less mm.
-    pub(super) const fn new_reference(id: MmId) -> Self {
-        Self { id, backend: None }
+    pub(super) fn new_reference(id: MmId) -> Self {
+        Self {
+            id,
+            backend: None,
+            io_uring_mappings: RwLock::new(Vec::new()),
+            legacy_aio_contexts: RwLock::new(BTreeSet::new()),
+            next_legacy_aio_context: AtomicU64::new(1),
+            revision: ObjectRevision::new(),
+        }
     }
 
     pub fn with_backend(id: MmId, backend: Arc<dyn MmBackend>) -> Self {
         Self {
             id,
             backend: Some(backend),
+            io_uring_mappings: RwLock::new(Vec::new()),
+            legacy_aio_contexts: RwLock::new(BTreeSet::new()),
+            next_legacy_aio_context: AtomicU64::new(1),
+            revision: ObjectRevision::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_reference_for_fork(id: MmId, parent: &Self) -> Self {
+        Self {
+            id,
+            backend: None,
+            io_uring_mappings: RwLock::new(parent.io_uring_mappings.read().clone()),
+            legacy_aio_contexts: RwLock::new(BTreeSet::new()),
+            next_legacy_aio_context: AtomicU64::new(1),
+            revision: ObjectRevision::new(),
+        }
+    }
+
+    pub fn with_backend_for_fork(id: MmId, backend: Arc<dyn MmBackend>, parent: &Self) -> Self {
+        Self {
+            id,
+            backend: Some(backend),
+            io_uring_mappings: RwLock::new(parent.io_uring_mappings.read().clone()),
+            legacy_aio_contexts: RwLock::new(BTreeSet::new()),
+            next_legacy_aio_context: AtomicU64::new(1),
+            revision: ObjectRevision::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_io_uring_mappings(
+        &self,
+    ) -> RwLockReadGuard<'_, Vec<crate::dispatch::ioring::IoUringMapping>> {
+        self.io_uring_mappings.read()
+    }
+
+    pub(crate) fn replace_io_uring_mappings(
+        &self,
+        start: u64,
+        len: u64,
+        replacement: Option<crate::dispatch::ioring::IoUringMapping>,
+    ) {
+        let Some(end) = start.checked_add(len) else {
+            std::process::abort();
+        };
+        let mut mappings = self.io_uring_mappings.write();
+        let mut retained = Vec::with_capacity(mappings.len().saturating_add(2));
+        for mapping in mappings.drain(..) {
+            let mapping_start = mapping.start;
+            let mapping_end = mapping.end;
+            if mapping_start >= end || mapping_end <= start {
+                retained.push(mapping);
+                continue;
+            }
+            if mapping_start < start {
+                retained.push(mapping.fragment(mapping_start, start));
+            }
+            if end < mapping_end {
+                retained.push(mapping.fragment(end, mapping_end));
+            }
+        }
+        if let Some(replacement) = replacement {
+            retained.push(replacement);
+        }
+        retained.sort_unstable_by_key(|mapping| mapping.start);
+        if *mappings != retained {
+            *mappings = retained;
+            self.revision.publish();
+        }
+    }
+
+    pub(crate) fn io_uring_mapping_overlaps(&self, start: u64, len: u64) -> bool {
+        let end = start.saturating_add(len);
+        self.io_uring_mappings
+            .read()
+            .iter()
+            .any(|mapping| mapping.start < end && start < mapping.end)
+    }
+
+    pub(crate) fn copy_io_uring_mappings_for_host_fork(&self, inherited: &Self) {
+        let mut mappings = self.io_uring_mappings.write();
+        if !mappings.is_empty() {
+            tracing::error!(mm = ?self.id, "host-fork mm io state replacement was not empty");
+            std::process::abort();
+        }
+        mappings.clone_from(&inherited.io_uring_mappings.read());
+        if !mappings.is_empty() {
+            self.revision.publish();
+        }
+    }
+
+    pub(super) fn clear_io_uring_mappings(&self) {
+        let mut mappings = self.io_uring_mappings.write();
+        if !mappings.is_empty() {
+            mappings.clear();
+            self.revision.publish();
+        }
+    }
+
+    pub(crate) fn read_legacy_aio_contexts(
+        &self,
+    ) -> RwLockReadGuard<'_, BTreeSet<crate::dispatch::LegacyAioContextId>> {
+        self.legacy_aio_contexts.read()
+    }
+
+    pub(crate) fn write_legacy_aio_contexts(&self) -> MmLegacyAioWriteGuard<'_> {
+        MmLegacyAioWriteGuard {
+            guard: self.legacy_aio_contexts.write(),
+            revision: &self.revision,
+        }
+    }
+
+    pub(crate) fn allocate_legacy_aio_context(&self) -> u64 {
+        let raw = self.next_legacy_aio_context.fetch_add(1, Ordering::Relaxed);
+        self.revision.publish();
+        raw
+    }
+
+    pub(super) fn io_state_snapshot_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Option<MmIoStateSnapshot> {
+        let mappings = self.io_uring_mappings.try_read_until(deadline)?;
+        let contexts = self.legacy_aio_contexts.try_read_until(deadline)?;
+        let mut io_uring_mappings = mappings
+            .iter()
+            .map(crate::dispatch::ioring::IoUringMapping::snapshot)
+            .collect::<Vec<_>>();
+        io_uring_mappings.sort_unstable_by_key(|mapping| mapping.start);
+        Some(MmIoStateSnapshot {
+            revision: self.revision.load(),
+            io_uring_mappings,
+            legacy_aio_context_count: contexts.len(),
+            next_legacy_aio_context: self.next_legacy_aio_context.load(Ordering::Relaxed),
+        })
     }
 
     pub const fn id(&self) -> MmId {
@@ -86,6 +241,10 @@ impl Mm {
     pub fn backend(&self) -> Option<&Arc<dyn MmBackend>> {
         self.backend.as_ref()
     }
+
+    pub(super) fn revision(&self) -> u64 {
+        self.revision.load()
+    }
 }
 
 impl std::fmt::Debug for Mm {
@@ -94,7 +253,36 @@ impl std::fmt::Debug for Mm {
             .debug_struct("Mm")
             .field("id", &self.id)
             .field("has_backend", &self.backend.is_some())
+            .field(
+                "legacy_aio_contexts",
+                &self.legacy_aio_contexts.read().len(),
+            )
             .finish()
+    }
+}
+
+pub(crate) struct MmLegacyAioWriteGuard<'a> {
+    guard: RwLockWriteGuard<'a, BTreeSet<crate::dispatch::LegacyAioContextId>>,
+    revision: &'a ObjectRevision,
+}
+
+impl Deref for MmLegacyAioWriteGuard<'_> {
+    type Target = BTreeSet<crate::dispatch::LegacyAioContextId>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl DerefMut for MmLegacyAioWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for MmLegacyAioWriteGuard<'_> {
+    fn drop(&mut self) {
+        self.revision.publish();
     }
 }
 
@@ -105,10 +293,13 @@ pub enum SignalDisposition {
     Caught,
 }
 
+/// Complete Linux signal-action authority shared according to
+/// `CLONE_SIGHAND`. An absent entry is `SIG_DFL`; stored records retain every
+/// guest-visible field needed for delivery and `rt_sigaction` round trips.
 #[derive(Debug)]
 pub struct Sighand {
     id: SighandId,
-    dispositions: Mutex<BTreeMap<LinuxSignal, SignalDisposition>>,
+    actions: Mutex<BTreeMap<LinuxSignal, LinuxSigaction>>,
     revision: ObjectRevision,
 }
 
@@ -116,7 +307,7 @@ impl Sighand {
     pub fn new(id: SighandId) -> Self {
         Self {
             id,
-            dispositions: Mutex::new(BTreeMap::new()),
+            actions: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
         }
     }
@@ -124,23 +315,23 @@ impl Sighand {
     fn for_fork_copy(id: SighandId, parent: &Self) -> Self {
         Self {
             id,
-            dispositions: Mutex::new(parent.dispositions.lock().clone()),
+            actions: Mutex::new(parent.actions.lock().clone()),
             revision: ObjectRevision::new(),
         }
     }
 
-    fn for_exec(id: SighandId, caller: &Self) -> Self {
-        let dispositions = caller
-            .dispositions
+    pub(crate) fn for_exec(id: SighandId, caller: &Self) -> Self {
+        let actions = caller
+            .actions
             .lock()
             .iter()
-            .filter_map(|(signal, disposition)| {
-                (*disposition == SignalDisposition::Ignore).then_some((*signal, *disposition))
+            .filter_map(|(signal, action)| {
+                (action.sa_handler == crate::linux_abi::LINUX_SIG_IGN).then_some((*signal, *action))
             })
             .collect();
         Self {
             id,
-            dispositions: Mutex::new(dispositions),
+            actions: Mutex::new(actions),
             revision: ObjectRevision::new(),
         }
     }
@@ -149,32 +340,60 @@ impl Sighand {
         self.id
     }
 
-    pub fn set_disposition(&self, signal: LinuxSignal, disposition: SignalDisposition) {
-        let mut dispositions = self.dispositions.lock();
-        if disposition == SignalDisposition::Default {
-            dispositions.remove(&signal);
-        } else {
-            dispositions.insert(signal, disposition);
+    /// Install one complete Linux action. Explicit `SIG_DFL` records retain
+    /// their flags, mask, and restorer for exact `rt_sigaction` round trips.
+    pub fn install_action(&self, signal: LinuxSignal, action: LinuxSigaction) {
+        let mut actions = self.actions.lock();
+        if actions.insert(signal, action) != Some(action) {
+            self.revision.publish();
         }
-        self.revision.publish();
+    }
+
+    pub fn action(&self, signal: LinuxSignal) -> LinuxSigaction {
+        self.action_entry(signal)
+            .unwrap_or_else(LinuxSigaction::empty)
+    }
+
+    pub fn action_entry(&self, signal: LinuxSignal) -> Option<LinuxSigaction> {
+        self.actions.lock().get(&signal).copied()
+    }
+
+    pub fn actions(&self) -> Vec<(LinuxSignal, LinuxSigaction)> {
+        self.actions
+            .lock()
+            .iter()
+            .map(|(signal, action)| (*signal, *action))
+            .collect()
+    }
+
+    pub fn replace_actions(&self, replacement: Vec<(LinuxSignal, LinuxSigaction)>) {
+        let replacement = replacement.into_iter().collect::<BTreeMap<_, _>>();
+        let mut actions = self.actions.lock();
+        if *actions != replacement {
+            *actions = replacement;
+            self.revision.publish();
+        }
     }
 
     pub fn disposition(&self, signal: LinuxSignal) -> SignalDisposition {
-        self.dispositions
-            .lock()
-            .get(&signal)
-            .copied()
-            .unwrap_or(SignalDisposition::Default)
+        match self.action(signal).sa_handler {
+            crate::linux_abi::LINUX_SIG_DFL => SignalDisposition::Default,
+            crate::linux_abi::LINUX_SIG_IGN => SignalDisposition::Ignore,
+            _ => SignalDisposition::Caught,
+        }
     }
 
     pub(super) fn snapshot_until(
         &self,
         deadline: std::time::Instant,
-    ) -> Option<(u64, Vec<(LinuxSignal, SignalDisposition)>)> {
-        let values = self.dispositions.try_lock_until(deadline)?;
+    ) -> Option<(u64, Vec<(LinuxSignal, LinuxSigaction)>)> {
+        let actions = self.actions.try_lock_until(deadline)?;
         Some((
             self.revision.load(),
-            values.iter().map(|(k, v)| (*k, *v)).collect(),
+            actions
+                .iter()
+                .map(|(signal, action)| (*signal, *action))
+                .collect(),
         ))
     }
 
@@ -183,26 +402,170 @@ impl Sighand {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileDescriptionBackingKind {
+    Closed,
+    File,
+    Directory,
+    SyntheticFile,
+    EventFd,
+    TimerFd,
+    Epoll,
+    Pidfd,
+    PipeReader,
+    PipeWriter,
+    HostPipe,
+    HostFile,
+    HostSocket,
+    Inotify,
+    SignalFd,
+    Netlink,
+    Mqueue,
+    IoUring,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenDescriptionBackingSnapshot {
+    pub kind: FileDescriptionBackingKind,
+    pub status_flags: Option<u64>,
+    pub offset: Option<u64>,
+    pub host_fd: Option<i32>,
+    pub path: Option<String>,
+    pub pipe_id: Option<u64>,
+    pub logical_fd_refs: usize,
+    pub epoll_interests: Vec<FileDescriptionId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FileDescriptionBackingSnapshot {
+    Open(OpenDescriptionBackingSnapshot),
+    IoUring(crate::dispatch::ioring::IoUringDescriptionSnapshot),
+}
+
+impl FileDescriptionBackingSnapshot {
+    pub(crate) const fn kind(&self) -> FileDescriptionBackingKind {
+        match self {
+            Self::Open(snapshot) => snapshot.kind,
+            Self::IoUring(_) => FileDescriptionBackingKind::IoUring,
+        }
+    }
+
+    pub(crate) const fn logical_fd_refs(&self) -> usize {
+        match self {
+            Self::Open(snapshot) => snapshot.logical_fd_refs,
+            Self::IoUring(snapshot) => snapshot.logical_fd_refs,
+        }
+    }
+
+    pub(crate) fn epoll_interests(&self) -> &[FileDescriptionId] {
+        match self {
+            Self::Open(snapshot) => &snapshot.epoll_interests,
+            Self::IoUring(_) => &[],
+        }
+    }
+}
+
+pub(crate) trait FileDescriptionBacking: Any + Send + Sync {
+    fn is_epoll(&self) -> bool;
+
+    fn snapshot_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Option<FileDescriptionBackingSnapshot>;
+
+    fn epoll_wake_fd(&self) -> Option<i32>;
+
+    fn retain_fd_ref(&self);
+
+    fn release_fd_ref(&self);
+
+    fn fd_ref_count(&self) -> usize;
+
+    fn as_any(&self) -> &dyn Any;
+}
+
+struct OpaqueFileDescriptionBacking(Arc<dyn FileDescriptionBacking>);
+
+impl OpaqueFileDescriptionBacking {
+    fn new<T>(backing: Arc<T>) -> Self
+    where
+        T: FileDescriptionBacking,
+    {
+        Self(backing)
+    }
+
+    fn downcast_ref<T>(&self) -> Option<&T>
+    where
+        T: FileDescriptionBacking,
+    {
+        self.0.as_any().downcast_ref()
+    }
+}
+
+impl std::fmt::Debug for OpaqueFileDescriptionBacking {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OpaqueFileDescriptionBacking")
+    }
+}
+
 #[derive(Debug)]
 enum FileDescriptionKind {
+    Concrete(OpaqueFileDescriptionBacking),
     Regular,
     Epoll(Mutex<BTreeMap<FileDescriptionId, Weak<FileDescription>>>),
 }
 
 /// Open-file-description identity. Epoll edges are weak and stable-keyed so
 /// descriptor graphs cannot create ownership cycles.
+type FileDescriptionObservation = (
+    u64,
+    bool,
+    Vec<FileDescriptionId>,
+    Option<FileDescriptionBackingSnapshot>,
+    Vec<(FileDescriptionId, i32)>,
+);
+
 #[derive(Debug)]
 pub struct FileDescription {
     id: FileDescriptionId,
     kind: FileDescriptionKind,
+    epoll_registrations: Mutex<BTreeMap<(FileDescriptionId, i32), Weak<FileDescription>>>,
     revision: ObjectRevision,
 }
 
 impl FileDescription {
+    pub(crate) fn concrete<T>(backing: Arc<T>) -> Result<Self, ObjectIdError>
+    where
+        T: FileDescriptionBacking,
+    {
+        Ok(Self {
+            id: super::ids::allocate_file_description_id()?,
+            kind: FileDescriptionKind::Concrete(OpaqueFileDescriptionBacking::new(backing)),
+            epoll_registrations: Mutex::new(BTreeMap::new()),
+            revision: ObjectRevision::new(),
+        })
+    }
+
+    pub(crate) fn concrete_restored<T>(
+        stable_id: u64,
+        backing: Arc<T>,
+    ) -> Result<Self, ObjectIdError>
+    where
+        T: FileDescriptionBacking,
+    {
+        Ok(Self {
+            id: super::ids::restore_file_description_id(stable_id)?,
+            kind: FileDescriptionKind::Concrete(OpaqueFileDescriptionBacking::new(backing)),
+            epoll_registrations: Mutex::new(BTreeMap::new()),
+            revision: ObjectRevision::new(),
+        })
+    }
+
     pub const fn regular(id: FileDescriptionId) -> Self {
         Self {
             id,
             kind: FileDescriptionKind::Regular,
+            epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
         }
     }
@@ -211,6 +574,7 @@ impl FileDescription {
         Self {
             id,
             kind: FileDescriptionKind::Epoll(Mutex::new(BTreeMap::new())),
+            epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
         }
     }
@@ -219,8 +583,85 @@ impl FileDescription {
         self.id
     }
 
-    pub const fn is_epoll(&self) -> bool {
-        matches!(&self.kind, FileDescriptionKind::Epoll(_))
+    pub fn is_epoll(&self) -> bool {
+        match &self.kind {
+            FileDescriptionKind::Concrete(backing) => backing.0.is_epoll(),
+            FileDescriptionKind::Regular => false,
+            FileDescriptionKind::Epoll(_) => true,
+        }
+    }
+
+    pub(crate) fn register_epoll_owner(self: &Arc<Self>, owner: &Arc<Self>, registration_fd: i32) {
+        self.epoll_registrations
+            .lock()
+            .insert((owner.id(), registration_fd), Arc::downgrade(owner));
+        self.revision.publish();
+    }
+
+    pub(crate) fn unregister_epoll_owner(&self, owner: &Arc<Self>, registration_fd: i32) {
+        if self
+            .epoll_registrations
+            .lock()
+            .remove(&(owner.id(), registration_fd))
+            .is_some()
+        {
+            self.revision.publish();
+        }
+    }
+
+    pub(crate) fn take_epoll_owners(&self) -> Vec<(Arc<Self>, i32)> {
+        let registrations = std::mem::take(&mut *self.epoll_registrations.lock());
+        if !registrations.is_empty() {
+            self.revision.publish();
+        }
+        registrations
+            .into_iter()
+            .filter_map(|((_, fd), owner)| owner.upgrade().map(|owner| (owner, fd)))
+            .collect()
+    }
+
+    pub(crate) fn concrete_backing<T>(&self) -> Option<&T>
+    where
+        T: FileDescriptionBacking,
+    {
+        let FileDescriptionKind::Concrete(backing) = &self.kind else {
+            return None;
+        };
+        backing.downcast_ref()
+    }
+
+    pub(crate) fn publish_mutation(&self) {
+        self.revision.publish();
+    }
+
+    pub(crate) fn epoll_wake_fd(&self) -> Option<i32> {
+        let FileDescriptionKind::Concrete(backing) = &self.kind else {
+            return None;
+        };
+        backing.0.epoll_wake_fd()
+    }
+
+    pub(crate) fn retain_fd_ref(&self) {
+        let FileDescriptionKind::Concrete(backing) = &self.kind else {
+            return;
+        };
+        backing.0.retain_fd_ref();
+        self.revision.publish();
+    }
+
+    pub(crate) fn release_fd_ref(&self) {
+        let FileDescriptionKind::Concrete(backing) = &self.kind else {
+            return;
+        };
+        backing.0.release_fd_ref();
+        self.revision.publish();
+    }
+
+    pub(crate) fn fd_ref_count(&self) -> usize {
+        let FileDescriptionKind::Concrete(backing) = &self.kind else {
+            return 0;
+        };
+        backing.0.fd_ref_count()
     }
 
     pub fn add_epoll_interest(
@@ -258,9 +699,29 @@ impl FileDescription {
     pub(super) fn snapshot_until(
         &self,
         deadline: std::time::Instant,
-    ) -> Option<(u64, bool, Vec<FileDescriptionId>)> {
+    ) -> Option<FileDescriptionObservation> {
+        let owners = self.epoll_registrations.try_lock_until(deadline)?;
+        let mut owners = owners
+            .iter()
+            .filter_map(|(&(owner, fd), weak)| (weak.strong_count() != 0).then_some((owner, fd)))
+            .collect::<Vec<_>>();
+        owners.sort_unstable();
         match &self.kind {
-            FileDescriptionKind::Regular => Some((self.revision.load(), false, Vec::new())),
+            FileDescriptionKind::Concrete(backing) => {
+                let state = backing.0.snapshot_until(deadline)?;
+                let is_epoll = state.kind() == FileDescriptionBackingKind::Epoll;
+                let interests = state.epoll_interests().to_vec();
+                Some((
+                    self.revision.load(),
+                    is_epoll,
+                    interests,
+                    Some(state),
+                    owners,
+                ))
+            }
+            FileDescriptionKind::Regular => {
+                Some((self.revision.load(), false, Vec::new(), None, owners))
+            }
             FileDescriptionKind::Epoll(interests) => {
                 let interests = interests.try_lock_until(deadline)?;
                 Some((
@@ -270,6 +731,8 @@ impl FileDescription {
                         .iter()
                         .filter_map(|(id, target)| (target.strong_count() != 0).then_some(*id))
                         .collect(),
+                    None,
+                    owners,
                 ))
             }
         }
@@ -278,28 +741,203 @@ impl FileDescription {
     pub(super) fn revision(&self) -> u64 {
         self.revision.load()
     }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot_for_test(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Option<FileDescriptionObservation> {
+        self.snapshot_until(deadline)
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct FileSlot {
-    description: Arc<FileDescription>,
-    close_on_exec: bool,
+    pub(crate) description: Arc<FileDescription>,
+    pub(crate) fd_flags: u64,
 }
 
 impl FileSlot {
+    pub(crate) fn new(description: Arc<FileDescription>, fd_flags: u64) -> Self {
+        Self {
+            description,
+            fd_flags,
+        }
+    }
+
     pub fn description(&self) -> Arc<FileDescription> {
         Arc::clone(&self.description)
     }
 
     pub const fn close_on_exec(&self) -> bool {
-        self.close_on_exec
+        self.fd_flags & crate::linux_abi::LINUX_FD_CLOEXEC != 0
+    }
+}
+
+pub(super) struct FileTableStateSnapshot {
+    pub(super) revision: u64,
+    pub(super) functional_refs_active: bool,
+    pub(super) slots: Vec<(FileSlotNumber, FileSlot)>,
+    pub(super) next_fd: i32,
+    pub(super) stdio_cloexec: [bool; 3],
+    pub(super) closed_stdio: [bool; 3],
+    pub(super) fd_open_paths: Vec<(FileSlotNumber, String)>,
+    pub(super) splice_pushback_description_ids: Vec<FileDescriptionId>,
+    pub(super) nofile_soft: u64,
+    pub(super) epoll_fds: Vec<FileSlotNumber>,
+}
+
+#[derive(Debug, Default)]
+struct FileTableFunctionalState {
+    accepting: bool,
+    frozen: bool,
+    active_uses: usize,
+    active_mutations: usize,
+}
+
+#[derive(Debug)]
+struct FileTableFunctionalGate {
+    state: Mutex<FileTableFunctionalState>,
+    changed: Condvar,
+}
+
+impl FileTableFunctionalGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(FileTableFunctionalState {
+                accepting: true,
+                ..FileTableFunctionalState::default()
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn acquire_use(self: &Arc<Self>) -> Option<FileTableFunctionalLease> {
+        let mut state = self.state.lock();
+        while state.accepting && state.frozen {
+            self.changed.wait(&mut state);
+        }
+        if !state.accepting {
+            return None;
+        }
+        state.active_uses = state.active_uses.checked_add(1)?;
+        Some(FileTableFunctionalLease {
+            gate: Arc::clone(self),
+        })
+    }
+
+    fn acquire_mutation(self: &Arc<Self>) -> Option<FileTableMutationLease> {
+        let mut state = self.state.lock();
+        while state.accepting && state.frozen {
+            self.changed.wait(&mut state);
+        }
+        if !state.accepting {
+            return None;
+        }
+        state.active_mutations = state.active_mutations.checked_add(1)?;
+        Some(FileTableMutationLease {
+            gate: Arc::clone(self),
+        })
+    }
+
+    fn freeze(self: &Arc<Self>) -> Option<FileTableExecFreeze> {
+        let mut state = self.state.lock();
+        while state.accepting && state.frozen {
+            self.changed.wait(&mut state);
+        }
+        if !state.accepting {
+            return None;
+        }
+        state.frozen = true;
+        while state.active_uses != 0 || state.active_mutations != 0 {
+            self.changed.wait(&mut state);
+        }
+        Some(FileTableExecFreeze {
+            gate: Arc::clone(self),
+            active: true,
+        })
+    }
+
+    #[cfg(test)]
+    fn is_frozen(&self) -> bool {
+        self.state.lock().frozen
+    }
+
+    fn retire(&self) -> bool {
+        let mut state = self.state.lock();
+        if !state.accepting {
+            return false;
+        }
+        state.accepting = false;
+        self.changed.notify_all();
+        while state.active_uses != 0 || state.active_mutations != 0 {
+            self.changed.wait(&mut state);
+        }
+        true
+    }
+}
+
+pub(crate) struct FileTableFunctionalLease {
+    gate: Arc<FileTableFunctionalGate>,
+}
+
+impl Drop for FileTableFunctionalLease {
+    fn drop(&mut self) {
+        let mut state = self.gate.state.lock();
+        state.active_uses = state.active_uses.checked_sub(1).unwrap_or_else(|| {
+            tracing::error!("FileTable functional lease underflow");
+            std::process::abort();
+        });
+        self.gate.changed.notify_all();
+    }
+}
+
+struct FileTableMutationLease {
+    gate: Arc<FileTableFunctionalGate>,
+}
+
+impl Drop for FileTableMutationLease {
+    fn drop(&mut self) {
+        let mut state = self.gate.state.lock();
+        state.active_mutations = state.active_mutations.checked_sub(1).unwrap_or_else(|| {
+            tracing::error!("FileTable mutation lease underflow");
+            std::process::abort();
+        });
+        self.gate.changed.notify_all();
+    }
+}
+
+pub(super) struct FileTableExecFreeze {
+    gate: Arc<FileTableFunctionalGate>,
+    active: bool,
+}
+
+impl Drop for FileTableExecFreeze {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = self.gate.state.lock();
+        state.frozen = false;
+        self.gate.changed.notify_all();
+        self.active = false;
     }
 }
 
 #[derive(Debug)]
 pub struct FileTable {
     id: FileTableId,
-    slots: Mutex<BTreeMap<FileSlotNumber, FileSlot>>,
+    open_files: RwLock<HashMap<i32, FileSlot>>,
+    next_fd: Mutex<i32>,
+    stdio_cloexec: Mutex<[bool; 3]>,
+    closed_stdio: Mutex<[bool; 3]>,
+    fd_open_paths: RwLock<HashMap<i32, String>>,
+    splice_pushback: Mutex<HashMap<FileDescriptionId, Arc<Mutex<crate::dispatch::SplicePushback>>>>,
+    nofile_soft: AtomicU64,
+    epoll_fds: RwLock<BTreeSet<i32>>,
+    epoll_wake_registry: crate::dispatch::EpollWakeRegistry,
+    functional_gate: Arc<FileTableFunctionalGate>,
+    functional_refs_active: AtomicBool,
     revision: ObjectRevision,
 }
 
@@ -307,29 +945,113 @@ impl FileTable {
     pub fn new(id: FileTableId) -> Self {
         Self {
             id,
-            slots: Mutex::new(BTreeMap::new()),
+            open_files: RwLock::new(HashMap::new()),
+            next_fd: Mutex::new(3),
+            stdio_cloexec: Mutex::new([false; 3]),
+            closed_stdio: Mutex::new([false; 3]),
+            fd_open_paths: RwLock::new(HashMap::new()),
+            splice_pushback: Mutex::new(HashMap::new()),
+            nofile_soft: AtomicU64::new(1024 * 1024),
+            epoll_fds: RwLock::new(BTreeSet::new()),
+            epoll_wake_registry: crate::dispatch::new_epoll_wake_registry(),
+            functional_gate: Arc::new(FileTableFunctionalGate::new()),
+            functional_refs_active: AtomicBool::new(true),
             revision: ObjectRevision::new(),
         }
     }
 
-    fn for_fork_copy(id: FileTableId, parent: &Self) -> Self {
+    pub(super) fn for_fork_copy(id: FileTableId, parent: &Self) -> Self {
+        let open_files = parent.open_files.read().clone();
+        for slot in open_files.values() {
+            slot.description.retain_fd_ref();
+        }
+        let epoll_wake_registry = crate::dispatch::new_epoll_wake_registry();
+        for slot in open_files.values() {
+            if let Some(wake_fd) = slot.description.epoll_wake_fd() {
+                crate::dispatch::register_epoll_kqueue(&epoll_wake_registry, wake_fd);
+            }
+        }
         Self {
             id,
-            slots: Mutex::new(parent.slots.lock().clone()),
+            open_files: RwLock::new(open_files),
+            next_fd: Mutex::new(*parent.next_fd.lock()),
+            stdio_cloexec: Mutex::new(*parent.stdio_cloexec.lock()),
+            closed_stdio: Mutex::new(*parent.closed_stdio.lock()),
+            fd_open_paths: RwLock::new(parent.fd_open_paths.read().clone()),
+            splice_pushback: Mutex::new(parent.splice_pushback.lock().clone()),
+            nofile_soft: AtomicU64::new(parent.nofile_soft.load(Ordering::Relaxed)),
+            epoll_fds: RwLock::new(parent.epoll_fds.read().clone()),
+            epoll_wake_registry,
+            functional_gate: Arc::new(FileTableFunctionalGate::new()),
+            functional_refs_active: AtomicBool::new(true),
             revision: ObjectRevision::new(),
         }
     }
 
     fn for_exec(id: FileTableId, caller: &Self) -> Self {
-        let slots = caller
-            .slots
+        let open_files: HashMap<_, _> = caller
+            .open_files
+            .read()
+            .iter()
+            .filter_map(|(number, slot)| (!slot.close_on_exec()).then_some((*number, slot.clone())))
+            .collect();
+        for slot in open_files.values() {
+            slot.description.retain_fd_ref();
+        }
+        let mut closed_stdio = *caller.closed_stdio.lock();
+        for (closed, close_on_exec) in closed_stdio
+            .iter_mut()
+            .zip(caller.stdio_cloexec.lock().iter())
+        {
+            *closed |= *close_on_exec;
+        }
+        let epoll_wake_registry = crate::dispatch::new_epoll_wake_registry();
+        for slot in open_files.values() {
+            if let Some(wake_fd) = slot.description.epoll_wake_fd() {
+                crate::dispatch::register_epoll_kqueue(&epoll_wake_registry, wake_fd);
+            }
+        }
+        let next_fd = *caller.next_fd.lock();
+        let fd_open_paths = caller
+            .fd_open_paths
+            .read()
+            .iter()
+            .filter_map(|(fd, path)| open_files.contains_key(fd).then_some((*fd, path.clone())))
+            .collect();
+        let surviving_descriptions = open_files
+            .values()
+            .map(|slot| slot.description.id())
+            .collect::<BTreeSet<_>>();
+        let splice_pushback = caller
+            .splice_pushback
             .lock()
             .iter()
-            .filter_map(|(number, slot)| (!slot.close_on_exec).then_some((*number, slot.clone())))
+            .filter_map(|(description, pushback)| {
+                surviving_descriptions
+                    .contains(description)
+                    .then_some((*description, Arc::clone(pushback)))
+            })
+            .collect();
+        let epoll_fds = caller
+            .epoll_fds
+            .read()
+            .iter()
+            .filter(|fd| open_files.contains_key(fd))
+            .copied()
             .collect();
         Self {
             id,
-            slots: Mutex::new(slots),
+            open_files: RwLock::new(open_files),
+            next_fd: Mutex::new(next_fd),
+            stdio_cloexec: Mutex::new([false; 3]),
+            closed_stdio: Mutex::new(closed_stdio),
+            fd_open_paths: RwLock::new(fd_open_paths),
+            splice_pushback: Mutex::new(splice_pushback),
+            nofile_soft: AtomicU64::new(caller.nofile_soft.load(Ordering::Relaxed)),
+            epoll_fds: RwLock::new(epoll_fds),
+            epoll_wake_registry,
+            functional_gate: Arc::new(FileTableFunctionalGate::new()),
+            functional_refs_active: AtomicBool::new(true),
             revision: ObjectRevision::new(),
         }
     }
@@ -344,39 +1066,295 @@ impl FileTable {
         description: Arc<FileDescription>,
         close_on_exec: bool,
     ) -> Option<FileSlot> {
-        let mut slots = self.slots.lock();
-        let replaced = slots.insert(
-            number,
-            FileSlot {
+        let _mutation = self.mutation_lease();
+        let mut open_files = self.open_files.write();
+        let replaced = open_files.insert(
+            number.raw(),
+            FileSlot::new(
                 description,
-                close_on_exec,
-            },
+                u64::from(close_on_exec) * crate::linux_abi::LINUX_FD_CLOEXEC,
+            ),
         );
         self.revision.publish();
         replaced
     }
 
     pub fn slot(&self, number: FileSlotNumber) -> Option<FileSlot> {
-        self.slots.lock().get(&number).cloned()
+        self.open_files.read().get(&number.raw()).cloned()
     }
 
     pub fn slot_count(&self) -> usize {
-        self.slots.lock().len()
+        self.open_files.read().len()
+    }
+
+    pub(crate) fn read_open_files(&self) -> RwLockReadGuard<'_, HashMap<i32, FileSlot>> {
+        self.open_files.read()
+    }
+
+    pub(crate) fn write_open_files(&self) -> FileTableWriteGuard<'_> {
+        let mutation = self.mutation_lease();
+        FileTableWriteGuard {
+            guard: self.open_files.write(),
+            _mutation: mutation,
+            revision: &self.revision,
+        }
+    }
+
+    pub(crate) fn lock_next_fd(&self) -> FileTableMutexGuard<'_, i32> {
+        self.mutex_write(&self.next_fd)
+    }
+
+    pub(crate) fn lock_stdio_cloexec(&self) -> FileTableMutexGuard<'_, [bool; 3]> {
+        self.mutex_write(&self.stdio_cloexec)
+    }
+
+    pub(crate) fn lock_closed_stdio(&self) -> FileTableMutexGuard<'_, [bool; 3]> {
+        self.mutex_write(&self.closed_stdio)
+    }
+
+    pub(crate) fn read_fd_open_paths(&self) -> RwLockReadGuard<'_, HashMap<i32, String>> {
+        self.fd_open_paths.read()
+    }
+
+    pub(crate) fn write_fd_open_paths(&self) -> FileTableRwWriteGuard<'_, HashMap<i32, String>> {
+        self.rw_write(&self.fd_open_paths)
+    }
+
+    pub(crate) fn lock_splice_pushback(
+        &self,
+    ) -> FileTableMutexGuard<
+        '_,
+        HashMap<FileDescriptionId, Arc<Mutex<crate::dispatch::SplicePushback>>>,
+    > {
+        self.mutex_write(&self.splice_pushback)
+    }
+
+    pub(crate) fn has_splice_pushback(&self) -> bool {
+        !self.splice_pushback.lock().is_empty()
+    }
+
+    pub(crate) fn nofile_soft(&self) -> u64 {
+        self.nofile_soft.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_nofile_soft(&self, value: u64) {
+        let _mutation = self.mutation_lease();
+        self.nofile_soft.store(value, Ordering::Relaxed);
+        self.revision.publish();
+    }
+
+    pub(crate) fn read_epoll_fds(&self) -> RwLockReadGuard<'_, BTreeSet<i32>> {
+        self.epoll_fds.read()
+    }
+
+    pub(crate) fn write_epoll_fds(&self) -> FileTableRwWriteGuard<'_, BTreeSet<i32>> {
+        self.rw_write(&self.epoll_fds)
+    }
+
+    pub(crate) fn epoll_wake_registry(&self) -> &crate::dispatch::EpollWakeRegistry {
+        &self.epoll_wake_registry
+    }
+
+    pub(crate) fn functional_refs_active(&self) -> bool {
+        self.functional_refs_active.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn acquire_functional_lease(self: &Arc<Self>) -> Option<FileTableFunctionalLease> {
+        self.functional_gate.acquire_use()
+    }
+
+    pub(super) fn freeze_for_exec(self: &Arc<Self>) -> Option<FileTableExecFreeze> {
+        self.functional_gate.freeze()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn functional_gate_is_frozen(&self) -> bool {
+        self.functional_gate.is_frozen()
+    }
+
+    pub(crate) fn drain_functional_refs(&self) -> Vec<(i32, FileSlot)> {
+        if !self.functional_gate.retire() {
+            return Vec::new();
+        }
+        self.functional_refs_active.store(false, Ordering::Release);
+        let slots = self
+            .open_files
+            .read()
+            .iter()
+            .map(|(fd, slot)| (*fd, slot.clone()))
+            .collect();
+        self.revision.publish();
+        slots
+    }
+
+    fn mutation_lease(&self) -> FileTableMutationLease {
+        self.functional_gate.acquire_mutation().unwrap_or_else(|| {
+            tracing::error!(file_table = ?self.id, "mutation reached a draining FileTable generation");
+            std::process::abort();
+        })
+    }
+
+    fn mutex_write<'a, T>(&'a self, lock: &'a Mutex<T>) -> FileTableMutexGuard<'a, T> {
+        let mutation = self.mutation_lease();
+        FileTableMutexGuard {
+            guard: lock.lock(),
+            _mutation: mutation,
+            revision: &self.revision,
+        }
+    }
+
+    fn rw_write<'a, T>(&'a self, lock: &'a RwLock<T>) -> FileTableRwWriteGuard<'a, T> {
+        let mutation = self.mutation_lease();
+        FileTableRwWriteGuard {
+            guard: lock.write(),
+            _mutation: mutation,
+            revision: &self.revision,
+        }
     }
 
     pub(super) fn snapshot_until(
         &self,
         deadline: std::time::Instant,
-    ) -> Option<(u64, Vec<(FileSlotNumber, FileSlot)>)> {
-        let slots = self.slots.try_lock_until(deadline)?;
-        Some((
-            self.revision.load(),
-            slots.iter().map(|(k, v)| (*k, v.clone())).collect(),
-        ))
+    ) -> Option<FileTableStateSnapshot> {
+        let revision = self.revision.load();
+        let open_files = self.open_files.try_read_until(deadline)?;
+        let next_fd = *self.next_fd.try_lock_until(deadline)?;
+        let stdio_cloexec = *self.stdio_cloexec.try_lock_until(deadline)?;
+        let closed_stdio = *self.closed_stdio.try_lock_until(deadline)?;
+        let fd_open_paths = self.fd_open_paths.try_read_until(deadline)?;
+        let splice_pushback = self.splice_pushback.try_lock_until(deadline)?;
+        let epoll_fds = self.epoll_fds.try_read_until(deadline)?;
+
+        let to_number = |fd| FileSlotNumber::for_open_fd(fd).ok();
+        let mut slots = open_files
+            .iter()
+            .map(|(fd, slot)| Some((to_number(*fd)?, slot.clone())))
+            .collect::<Option<Vec<_>>>()?;
+        slots.sort_by_key(|(number, _)| *number);
+        let mut paths = fd_open_paths
+            .iter()
+            .map(|(fd, path)| Some((to_number(*fd)?, path.clone())))
+            .collect::<Option<Vec<_>>>()?;
+        paths.sort_by_key(|(number, _)| *number);
+        let sorted_numbers = |fds: Vec<i32>| {
+            let mut numbers = fds.into_iter().map(to_number).collect::<Option<Vec<_>>>()?;
+            numbers.sort_unstable();
+            Some(numbers)
+        };
+        let mut splice_pushback_description_ids =
+            splice_pushback.keys().copied().collect::<Vec<_>>();
+        splice_pushback_description_ids.sort_unstable();
+
+        Some(FileTableStateSnapshot {
+            revision,
+            functional_refs_active: self.functional_refs_active(),
+            slots,
+            next_fd,
+            stdio_cloexec,
+            closed_stdio,
+            fd_open_paths: paths,
+            splice_pushback_description_ids,
+            nofile_soft: self.nofile_soft(),
+            epoll_fds: sorted_numbers(epoll_fds.iter().copied().collect())?,
+        })
     }
 
     pub(super) fn revision(&self) -> u64 {
         self.revision.load()
+    }
+}
+
+impl Drop for FileTable {
+    fn drop(&mut self) {
+        if !self.functional_gate.retire() {
+            return;
+        }
+        self.functional_refs_active.store(false, Ordering::Release);
+        for slot in self.open_files.get_mut().values() {
+            // Model-only descriptions and tests that install observational
+            // slots directly carry no functional dispatch reference.
+            if slot.description.fd_ref_count() != 0 {
+                slot.description.release_fd_ref();
+            }
+        }
+    }
+}
+
+pub(crate) struct FileTableWriteGuard<'a> {
+    guard: RwLockWriteGuard<'a, HashMap<i32, FileSlot>>,
+    _mutation: FileTableMutationLease,
+    revision: &'a ObjectRevision,
+}
+
+impl Deref for FileTableWriteGuard<'_> {
+    type Target = HashMap<i32, FileSlot>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl DerefMut for FileTableWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for FileTableWriteGuard<'_> {
+    fn drop(&mut self) {
+        self.revision.publish();
+    }
+}
+
+pub(crate) struct FileTableMutexGuard<'a, T> {
+    guard: MutexGuard<'a, T>,
+    _mutation: FileTableMutationLease,
+    revision: &'a ObjectRevision,
+}
+
+impl<T> Deref for FileTableMutexGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl<T> DerefMut for FileTableMutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl<T> Drop for FileTableMutexGuard<'_, T> {
+    fn drop(&mut self) {
+        self.revision.publish();
+    }
+}
+
+pub(crate) struct FileTableRwWriteGuard<'a, T> {
+    guard: RwLockWriteGuard<'a, T>,
+    _mutation: FileTableMutationLease,
+    revision: &'a ObjectRevision,
+}
+
+impl<T> Deref for FileTableRwWriteGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl<T> DerefMut for FileTableRwWriteGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl<T> Drop for FileTableRwWriteGuard<'_, T> {
+    fn drop(&mut self) {
+        self.revision.publish();
     }
 }
 
@@ -619,22 +1597,213 @@ impl Credentials {
     }
 }
 
-/// Task-directed pending-signal ownership. Signal queue details remain in the
-/// signal subsystem; this object supplies the required task-level lifetime.
+/// One dequeued signal and its provenance-preserving optional payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingSignal {
+    pub signal: LinuxSignal,
+    pub siginfo: Option<LinuxSiginfo>,
+}
+
+/// Typed standard/real-time pending queue used by task- and thread-directed
+/// owners. Standard signals coalesce to one presence bit. Real-time signals
+/// retain one FIFO entry per send, including an explicit no-payload entry so a
+/// later queued `siginfo` can never attach to the wrong delivery.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PendingQueue {
+    present: SigSet,
+    standard_siginfos: BTreeMap<LinuxSignal, LinuxSiginfo>,
+    realtime: BTreeMap<LinuxSignal, VecDeque<Option<LinuxSiginfo>>>,
+}
+
+impl PendingQueue {
+    pub const fn present(&self) -> SigSet {
+        self.present
+    }
+
+    pub fn pending_count(&self) -> usize {
+        let realtime = self.realtime.values().map(VecDeque::len).sum::<usize>();
+        let realtime_signals = self.realtime.len();
+        let distinct = self.present.raw().count_ones() as usize;
+        distinct.saturating_sub(realtime_signals) + realtime
+    }
+
+    pub fn enqueue_standard(&mut self, signal: LinuxSignal, siginfo: Option<LinuxSiginfo>) {
+        if signal.raw() >= 32 {
+            tracing::error!(
+                signal = signal.raw(),
+                "real-time signal entered standard queue"
+            );
+            std::process::abort();
+        }
+        self.present = self.present.with(signal.raw());
+        if let Some(siginfo) = siginfo {
+            // Standard signals coalesce, but the existing Carrick/Linux-facing
+            // contract retains the most recently supplied queued payload.
+            self.standard_siginfos.insert(signal, siginfo);
+        }
+        self.assert_invariants();
+    }
+
+    pub fn enqueue_realtime(&mut self, signal: LinuxSignal, siginfo: Option<LinuxSiginfo>) {
+        if signal.raw() < 32 {
+            tracing::error!(
+                signal = signal.raw(),
+                "standard signal entered real-time queue"
+            );
+            std::process::abort();
+        }
+        self.realtime.entry(signal).or_default().push_back(siginfo);
+        self.present = self.present.with(signal.raw());
+        self.assert_invariants();
+    }
+
+    pub fn entries(&self) -> Vec<PendingSignal> {
+        let mut entries = Vec::new();
+        for raw in 1..=64 {
+            if !self.present.contains(raw) {
+                continue;
+            }
+            let Ok(signal) = LinuxSignal::for_signal_number(raw) else {
+                std::process::abort();
+            };
+            if let Some(realtime) = self.realtime.get(&signal) {
+                entries.extend(
+                    realtime
+                        .iter()
+                        .copied()
+                        .map(|siginfo| PendingSignal { signal, siginfo }),
+                );
+            } else {
+                entries.push(PendingSignal {
+                    signal,
+                    siginfo: self.standard_siginfos.get(&signal).copied(),
+                });
+            }
+        }
+        entries
+    }
+
+    pub fn from_entries(entries: &[PendingSignal]) -> Self {
+        let mut queue = Self::default();
+        for entry in entries {
+            if entry.signal.raw() >= 32 {
+                queue.enqueue_realtime(entry.signal, entry.siginfo);
+            } else {
+                queue.enqueue_standard(entry.signal, entry.siginfo);
+            }
+        }
+        queue
+    }
+
+    pub fn take_lowest_in(&mut self, wanted: SigSet) -> Option<PendingSignal> {
+        let raw = self.present.intersect(wanted).lowest_signum()?;
+        let signal = LinuxSignal::for_signal_number(raw).ok()?;
+        let siginfo = if let Some(instances) = self.realtime.get_mut(&signal) {
+            let siginfo = instances.pop_front().flatten();
+            if instances.is_empty() {
+                self.realtime.remove(&signal);
+                self.present = self.present.without(raw);
+            }
+            siginfo
+        } else {
+            self.present = self.present.without(raw);
+            self.standard_siginfos.remove(&signal)
+        };
+        self.assert_invariants();
+        Some(PendingSignal { signal, siginfo })
+    }
+
+    fn assert_invariants(&self) {
+        debug_assert!(self.realtime.iter().all(
+            |(signal, instances)| !instances.is_empty() && self.present.contains(signal.raw())
+        ));
+        debug_assert!(
+            self.standard_siginfos
+                .keys()
+                .all(|signal| self.present.contains(signal.raw()))
+        );
+    }
+}
+
+/// Task-directed pending-signal authority. The hint is an index published from
+/// the queue while locked; `false` proves empty and `true` requires locked
+/// revalidation.
 #[derive(Debug, Default)]
 pub struct TaskPendingSignals {
-    pending_count: AtomicUsize,
+    queue: Mutex<PendingQueue>,
+    pending_hint: AtomicU64,
+    revision: ObjectRevision,
 }
 
 impl TaskPendingSignals {
     pub const fn new() -> Self {
         Self {
-            pending_count: AtomicUsize::new(0),
+            queue: Mutex::new(PendingQueue {
+                present: SigSet::EMPTY,
+                standard_siginfos: BTreeMap::new(),
+                realtime: BTreeMap::new(),
+            }),
+            pending_hint: AtomicU64::new(0),
+            revision: ObjectRevision::new(),
         }
     }
 
     pub fn pending_count(&self) -> usize {
-        self.pending_count.load(Ordering::Acquire)
+        self.queue.lock().pending_count()
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision.load()
+    }
+
+    pub fn may_be_nonempty(&self) -> bool {
+        self.pending_hint.load(Ordering::Acquire) != 0
+    }
+
+    pub fn present(&self) -> SigSet {
+        self.queue.lock().present()
+    }
+
+    pub fn enqueue_standard(&self, signal: LinuxSignal, siginfo: Option<LinuxSiginfo>) {
+        let mut queue = self.queue.lock();
+        queue.enqueue_standard(signal, siginfo);
+        self.publish_queue(&queue);
+    }
+
+    pub fn enqueue_realtime(&self, signal: LinuxSignal, siginfo: Option<LinuxSiginfo>) {
+        let mut queue = self.queue.lock();
+        queue.enqueue_realtime(signal, siginfo);
+        self.publish_queue(&queue);
+    }
+
+    pub fn take_lowest_in(&self, wanted: SigSet) -> Option<PendingSignal> {
+        let mut queue = self.queue.lock();
+        let pending = queue.take_lowest_in(wanted)?;
+        self.publish_queue(&queue);
+        Some(pending)
+    }
+
+    pub fn snapshot_entries(&self) -> Vec<PendingSignal> {
+        self.queue.lock().entries()
+    }
+
+    pub fn replace_entries(&self, entries: &[PendingSignal]) {
+        let replacement = PendingQueue::from_entries(entries);
+        let mut queue = self.queue.lock();
+        if *queue != replacement {
+            *queue = replacement;
+            self.publish_queue(&queue);
+        }
+    }
+
+    fn publish_queue(&self, queue: &PendingQueue) {
+        self.pending_hint
+            .store(queue.present().raw(), Ordering::Release);
+        self.revision.publish();
+        debug_assert_eq!(
+            self.pending_hint.load(Ordering::Relaxed),
+            queue.present().raw()
+        );
     }
 }
 
@@ -687,7 +1856,11 @@ impl TaskShared {
         ids: &ObjectIdRegistry,
     ) -> Result<Self, TaskSharedCloneError> {
         let copied_mm = (plan.mm() == CloneObjectMode::Copy)
-            .then(|| ids.mm_id().map(Mm::new_reference).map(Arc::new))
+            .then(|| {
+                ids.mm_id()
+                    .map(|id| Mm::new_reference_for_fork(id, &parent.mm))
+                    .map(Arc::new)
+            })
             .transpose()?;
         Self::for_new_task_with_mm(parent, plan, ids, copied_mm)
     }
@@ -720,69 +1893,228 @@ impl TaskShared {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HandlerFrameState {
+    pub on_altstack: bool,
+    pub restore_mask: Option<SigSet>,
+}
+
+/// Complete per-thread Linux signal state. The containing Kernel `Thread`
+/// serializes mutations; no field is process-global or keyed by a reusable raw
+/// backend TID.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ThreadSignalState {
     blocked: SigSet,
-    pending: SigSet,
-    altstack_enabled: bool,
-    handler_frame_depth: usize,
+    pending: PendingQueue,
+    altstack: Option<LinuxSigaltstack>,
+    handler_frames: Vec<HandlerFrameState>,
+    armed_restore_mask: Option<SigSet>,
+    routed_siginfos: BTreeMap<LinuxSignal, VecDeque<LinuxSiginfo>>,
+    pending_actions: BTreeMap<LinuxSignal, VecDeque<LinuxSigaction>>,
 }
 
 impl ThreadSignalState {
-    pub const fn new(
+    /// Summary-shaped constructor retained for existing Kernel model tests.
+    /// Production signal publication uses the typed queue/altstack methods.
+    pub fn new(
         blocked: SigSet,
         pending: SigSet,
         altstack_enabled: bool,
         handler_frame_depth: usize,
     ) -> Self {
+        let mut pending_queue = PendingQueue::default();
+        for raw in 1..=64 {
+            if pending.contains(raw)
+                && let Ok(signal) = LinuxSignal::for_signal_number(raw)
+            {
+                if raw >= 32 {
+                    pending_queue.enqueue_realtime(signal, None);
+                } else {
+                    pending_queue.enqueue_standard(signal, None);
+                }
+            }
+        }
         Self {
             blocked,
-            pending,
-            altstack_enabled,
-            handler_frame_depth,
+            pending: pending_queue,
+            altstack: altstack_enabled.then(LinuxSigaltstack::empty),
+            handler_frames: vec![
+                HandlerFrameState {
+                    on_altstack: false,
+                    restore_mask: None,
+                };
+                handler_frame_depth
+            ],
+            armed_restore_mask: None,
+            routed_siginfos: BTreeMap::new(),
+            pending_actions: BTreeMap::new(),
         }
     }
 
-    const fn for_fork(caller: Self) -> Self {
+    fn for_fork(caller: &Self) -> Self {
         Self {
             blocked: caller.blocked,
-            pending: SigSet::EMPTY,
-            altstack_enabled: caller.altstack_enabled,
-            handler_frame_depth: caller.handler_frame_depth,
+            pending: PendingQueue::default(),
+            altstack: caller.altstack,
+            handler_frames: caller.handler_frames.clone(),
+            armed_restore_mask: caller.armed_restore_mask,
+            routed_siginfos: BTreeMap::new(),
+            pending_actions: BTreeMap::new(),
         }
     }
 
-    const fn for_clone_thread(caller: Self) -> Self {
+    pub(crate) fn for_clone_thread(caller: &Self) -> Self {
         Self {
             blocked: caller.blocked,
-            pending: SigSet::EMPTY,
-            altstack_enabled: false,
-            handler_frame_depth: 0,
+            pending: PendingQueue::default(),
+            altstack: None,
+            handler_frames: Vec::new(),
+            armed_restore_mask: None,
+            routed_siginfos: BTreeMap::new(),
+            pending_actions: BTreeMap::new(),
         }
     }
 
-    const fn for_exec(caller: Self) -> Self {
+    pub(crate) fn for_exec(caller: &Self) -> Self {
         Self {
             blocked: caller.blocked,
-            pending: caller.pending,
-            altstack_enabled: false,
-            handler_frame_depth: 0,
+            pending: caller.pending.clone(),
+            altstack: None,
+            handler_frames: Vec::new(),
+            armed_restore_mask: None,
+            routed_siginfos: caller.routed_siginfos.clone(),
+            pending_actions: BTreeMap::new(),
         }
     }
 
-    pub const fn blocked(self) -> SigSet {
+    pub const fn blocked(&self) -> SigSet {
         self.blocked
     }
 
-    pub const fn pending(self) -> SigSet {
-        self.pending
+    pub fn set_blocked(&mut self, blocked: SigSet) {
+        self.blocked = blocked;
     }
 
-    pub const fn altstack_enabled(self) -> bool {
-        self.altstack_enabled
+    pub const fn pending(&self) -> SigSet {
+        self.pending.present()
     }
 
-    pub const fn handler_frame_depth(self) -> usize {
-        self.handler_frame_depth
+    pub fn pending_count(&self) -> usize {
+        self.pending.pending_count()
+    }
+
+    pub fn snapshot_pending_entries(&self) -> Vec<PendingSignal> {
+        self.pending.entries()
+    }
+
+    pub fn replace_pending_entries(&mut self, entries: &[PendingSignal]) {
+        self.pending = PendingQueue::from_entries(entries);
+    }
+
+    pub fn enqueue_standard(&mut self, signal: LinuxSignal, siginfo: Option<LinuxSiginfo>) {
+        self.pending.enqueue_standard(signal, siginfo);
+    }
+
+    pub fn enqueue_realtime(&mut self, signal: LinuxSignal, siginfo: Option<LinuxSiginfo>) {
+        self.pending.enqueue_realtime(signal, siginfo);
+    }
+
+    pub fn take_lowest_in(&mut self, wanted: SigSet) -> Option<PendingSignal> {
+        self.pending.take_lowest_in(wanted)
+    }
+
+    pub const fn altstack(&self) -> Option<LinuxSigaltstack> {
+        self.altstack
+    }
+
+    pub fn set_altstack(&mut self, altstack: Option<LinuxSigaltstack>) {
+        self.altstack = altstack;
+    }
+
+    pub const fn altstack_enabled(&self) -> bool {
+        self.altstack.is_some()
+    }
+
+    pub fn handler_frame_depth(&self) -> usize {
+        self.handler_frames.len()
+    }
+
+    pub fn handler_frames(&self) -> Vec<HandlerFrameState> {
+        self.handler_frames.clone()
+    }
+
+    pub fn has_altstack_handler_frame(&self) -> bool {
+        self.handler_frames.iter().any(|frame| frame.on_altstack)
+    }
+
+    pub fn clear_handler_frames(&mut self) {
+        self.handler_frames.clear();
+    }
+
+    pub fn push_handler_frame(&mut self, frame: HandlerFrameState) {
+        self.handler_frames.push(frame);
+    }
+
+    pub fn pop_handler_frame(&mut self) -> Option<HandlerFrameState> {
+        self.handler_frames.pop()
+    }
+
+    pub const fn armed_restore_mask(&self) -> Option<SigSet> {
+        self.armed_restore_mask
+    }
+
+    pub fn take_armed_restore_mask(&mut self) -> Option<SigSet> {
+        self.armed_restore_mask.take()
+    }
+
+    pub fn arm_restore_mask(&mut self, restore_mask: Option<SigSet>) {
+        self.armed_restore_mask = restore_mask;
+    }
+
+    pub fn record_routed_siginfo(&mut self, signal: LinuxSignal, siginfo: LinuxSiginfo) {
+        let entries = self.routed_siginfos.entry(signal).or_default();
+        if signal.raw() < 32 {
+            entries.clear();
+        }
+        entries.push_back(siginfo);
+    }
+
+    pub fn take_routed_siginfo(&mut self, signal: LinuxSignal) -> Option<LinuxSiginfo> {
+        let entries = self.routed_siginfos.get_mut(&signal)?;
+        let siginfo = entries.pop_front();
+        if entries.is_empty() {
+            self.routed_siginfos.remove(&signal);
+        }
+        siginfo
+    }
+
+    pub fn record_pending_action(&mut self, signal: LinuxSignal, action: LinuxSigaction) {
+        self.pending_actions
+            .entry(signal)
+            .or_default()
+            .push_back(action);
+    }
+
+    pub fn take_pending_action(&mut self, signal: LinuxSignal) -> Option<LinuxSigaction> {
+        let actions = self.pending_actions.get_mut(&signal)?;
+        let action = actions.pop_front();
+        if actions.is_empty() {
+            self.pending_actions.remove(&signal);
+        }
+        action
+    }
+
+    pub fn routed_siginfos(&self) -> Vec<(LinuxSignal, LinuxSiginfo)> {
+        self.routed_siginfos
+            .iter()
+            .flat_map(|(signal, entries)| entries.iter().map(|info| (*signal, *info)))
+            .collect()
+    }
+
+    pub fn pending_actions(&self) -> Vec<(LinuxSignal, LinuxSigaction)> {
+        self.pending_actions
+            .iter()
+            .flat_map(|(signal, entries)| entries.iter().map(|action| (*signal, *action)))
+            .collect()
     }
 }
 
@@ -859,6 +2191,14 @@ impl ThreadResources {
 
     pub fn credentials(&self) -> Arc<Credentials> {
         Arc::clone(&self.credentials)
+    }
+
+    pub(super) fn with_files(&self, files: Arc<FileTable>) -> Self {
+        Self::new(
+            files,
+            Arc::clone(&self.fs_context),
+            Arc::clone(&self.credentials),
+        )
     }
 
     pub(super) fn with_credentials(&self, credentials: Arc<Credentials>) -> Self {
@@ -1001,6 +2341,7 @@ impl Task {
             task: Arc::downgrade(self),
             resources: ArcSwap::new(resources),
             signal_state: Mutex::new(ThreadSignalState::default()),
+            signal_pending_hint: AtomicU64::new(0),
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
         })
@@ -1019,7 +2360,8 @@ impl Task {
             task_key: self.key,
             task: Arc::downgrade(self),
             resources: ArcSwap::new(resources),
-            signal_state: Mutex::new(ThreadSignalState::for_clone_thread(caller_signal_state)),
+            signal_state: Mutex::new(ThreadSignalState::for_clone_thread(&caller_signal_state)),
+            signal_pending_hint: AtomicU64::new(0),
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
         })
@@ -1038,7 +2380,8 @@ impl Task {
             task_key: self.key,
             task: Arc::downgrade(self),
             resources: ArcSwap::new(resources),
-            signal_state: Mutex::new(ThreadSignalState::for_fork(caller_signal_state)),
+            signal_state: Mutex::new(ThreadSignalState::for_fork(&caller_signal_state)),
+            signal_pending_hint: AtomicU64::new(0),
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
         })
@@ -1057,7 +2400,8 @@ impl Task {
             task_key: self.key,
             task: Arc::downgrade(self),
             resources: ArcSwap::new(resources),
-            signal_state: Mutex::new(ThreadSignalState::for_exec(caller.signal_state())),
+            signal_state: Mutex::new(ThreadSignalState::for_exec(&caller.signal_state())),
+            signal_pending_hint: AtomicU64::new(caller.signal_pending_hint.load(Ordering::Acquire)),
             revision: ObjectRevision::new(),
             runner_gate: Arc::clone(&caller.runner_gate),
         })
@@ -1156,6 +2500,20 @@ impl Task {
             .lock()
             .get(&tid)
             .map(|(_, thread)| Arc::clone(thread))
+    }
+
+    pub(crate) fn thread_by_registry_id(&self, registry_id: ThreadId) -> Option<ThreadRef> {
+        self.threads.lock().values().find_map(|(_, thread)| {
+            (thread.registry_id() == registry_id).then(|| Arc::clone(thread))
+        })
+    }
+
+    pub(crate) fn threads(&self) -> Vec<ThreadRef> {
+        self.threads
+            .lock()
+            .values()
+            .map(|(_, thread)| Arc::clone(thread))
+            .collect()
     }
 
     pub(super) fn retire_thread(&self, key: ThreadKey) -> Option<ThreadRef> {
@@ -1426,6 +2784,7 @@ pub struct Thread {
     task: Weak<Task>,
     resources: ArcSwap<ThreadResources>,
     signal_state: Mutex<ThreadSignalState>,
+    signal_pending_hint: AtomicU64,
     revision: ObjectRevision,
     runner_gate: Arc<RunnerGate>,
 }
@@ -1444,13 +2803,39 @@ impl Thread {
     }
 
     pub fn signal_state(&self) -> ThreadSignalState {
-        *self.signal_state.lock()
+        self.signal_state.lock().clone()
+    }
+
+    pub fn may_have_pending_signals(&self) -> bool {
+        self.signal_pending_hint.load(Ordering::Acquire) != 0
     }
 
     pub fn replace_signal_state(&self, replacement: ThreadSignalState) {
         let mut state = self.signal_state.lock();
+        self.signal_pending_hint
+            .store(replacement.pending().raw(), Ordering::Release);
         *state = replacement;
         self.revision.publish();
+    }
+
+    pub(crate) fn update_signal_state<R>(
+        &self,
+        operation: impl FnOnce(&mut ThreadSignalState) -> R,
+    ) -> R {
+        let mut state = self.signal_state.lock();
+        let result = operation(&mut state);
+        self.publish_signal_state(&state);
+        result
+    }
+
+    fn publish_signal_state(&self, state: &ThreadSignalState) {
+        self.signal_pending_hint
+            .store(state.pending().raw(), Ordering::Release);
+        self.revision.publish();
+        debug_assert_eq!(
+            self.signal_pending_hint.load(Ordering::Relaxed),
+            state.pending().raw()
+        );
     }
 
     pub fn bind_runner(self: &Arc<Self>) -> Result<ThreadRunner, ObjectGraphError> {
@@ -1475,7 +2860,7 @@ impl Thread {
         deadline: std::time::Instant,
     ) -> Option<(u64, ThreadSignalState)> {
         let state = self.signal_state.try_lock_until(deadline)?;
-        Some((self.revision.load(), *state))
+        Some((self.revision.load(), state.clone()))
     }
 
     pub(super) fn revision(&self) -> u64 {
@@ -1489,6 +2874,186 @@ impl Thread {
         let previous = self.resources.swap(replacement);
         self.revision.publish();
         previous
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignalPendingOwner {
+    Thread,
+    Task,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SignalDequeue {
+    pub owner: SignalPendingOwner,
+    pub pending: PendingSignal,
+}
+
+/// Exact signal leaf bundle captured from one [`super::core::KernelContext`].
+/// The facade contains operations only; all state and revisions remain in the
+/// referenced Kernel objects.
+#[derive(Clone, Debug)]
+pub struct SignalAuthority {
+    sighand: Arc<Sighand>,
+    task_pending: Arc<TaskPendingSignals>,
+    thread: ThreadRef,
+}
+
+impl SignalAuthority {
+    pub(crate) fn new(
+        sighand: Arc<Sighand>,
+        task_pending: Arc<TaskPendingSignals>,
+        thread: ThreadRef,
+    ) -> Self {
+        Self {
+            sighand,
+            task_pending,
+            thread,
+        }
+    }
+
+    pub fn sighand_id(&self) -> SighandId {
+        self.sighand.id()
+    }
+
+    pub fn action(&self, signal: LinuxSignal) -> LinuxSigaction {
+        self.sighand.action(signal)
+    }
+
+    pub fn install_action(&self, signal: LinuxSignal, action: LinuxSigaction) {
+        self.sighand.install_action(signal, action);
+    }
+
+    pub fn blocked(&self) -> SigSet {
+        self.thread.signal_state.lock().blocked()
+    }
+
+    pub fn set_blocked(&self, blocked: SigSet) {
+        let mut state = self.thread.signal_state.lock();
+        state.set_blocked(blocked);
+        self.thread.publish_signal_state(&state);
+    }
+
+    pub fn thread_pending(&self) -> SigSet {
+        self.thread.signal_state.lock().pending()
+    }
+
+    pub fn task_pending(&self) -> SigSet {
+        self.task_pending.present()
+    }
+
+    pub fn may_have_thread_pending(&self) -> bool {
+        self.thread.may_have_pending_signals()
+    }
+
+    pub fn may_have_task_pending(&self) -> bool {
+        self.task_pending.may_be_nonempty()
+    }
+
+    pub fn enqueue_thread_standard(&self, signal: LinuxSignal, siginfo: Option<LinuxSiginfo>) {
+        let mut state = self.thread.signal_state.lock();
+        state.enqueue_standard(signal, siginfo);
+        self.thread.publish_signal_state(&state);
+    }
+
+    pub fn enqueue_thread_realtime(&self, signal: LinuxSignal, siginfo: Option<LinuxSiginfo>) {
+        let mut state = self.thread.signal_state.lock();
+        state.enqueue_realtime(signal, siginfo);
+        self.thread.publish_signal_state(&state);
+    }
+
+    pub fn enqueue_task_standard(&self, signal: LinuxSignal, siginfo: Option<LinuxSiginfo>) {
+        self.task_pending.enqueue_standard(signal, siginfo);
+    }
+
+    pub fn enqueue_task_realtime(&self, signal: LinuxSignal, siginfo: Option<LinuxSiginfo>) {
+        self.task_pending.enqueue_realtime(signal, siginfo);
+    }
+
+    /// Choose and dequeue one candidate under the canonical thread-then-task
+    /// lock order. A same-signum tie is thread-directed, preserving provenance.
+    pub fn take_lowest_in(&self, wanted: SigSet) -> Option<SignalDequeue> {
+        let mut thread = self.thread.signal_state.lock();
+        let mut task = self.task_pending.queue.lock();
+        let thread_signal = thread.pending().intersect(wanted).lowest_signum();
+        let task_signal = task.present().intersect(wanted).lowest_signum();
+        let owner = match (thread_signal, task_signal) {
+            (None, None) => return None,
+            (Some(_), None) => SignalPendingOwner::Thread,
+            (None, Some(_)) => SignalPendingOwner::Task,
+            (Some(thread), Some(task)) if thread <= task => SignalPendingOwner::Thread,
+            (Some(_), Some(_)) => SignalPendingOwner::Task,
+        };
+        let pending = match owner {
+            SignalPendingOwner::Thread => {
+                let mut pending = thread.take_lowest_in(wanted)?;
+                if pending.siginfo.is_none() {
+                    pending.siginfo = thread.take_routed_siginfo(pending.signal);
+                }
+                self.thread.publish_signal_state(&thread);
+                pending
+            }
+            SignalPendingOwner::Task => {
+                let pending = task.take_lowest_in(wanted)?;
+                self.task_pending.publish_queue(&task);
+                pending
+            }
+        };
+        Some(SignalDequeue { owner, pending })
+    }
+
+    pub fn altstack(&self) -> Option<LinuxSigaltstack> {
+        self.thread.signal_state.lock().altstack()
+    }
+
+    pub fn set_altstack(&self, altstack: Option<LinuxSigaltstack>) {
+        let mut state = self.thread.signal_state.lock();
+        state.set_altstack(altstack);
+        self.thread.publish_signal_state(&state);
+    }
+
+    pub fn handler_frame_depth(&self) -> usize {
+        self.thread.signal_state.lock().handler_frame_depth()
+    }
+
+    pub fn push_handler_frame(&self, frame: HandlerFrameState) {
+        let mut state = self.thread.signal_state.lock();
+        state.push_handler_frame(frame);
+        self.thread.publish_signal_state(&state);
+    }
+
+    pub fn pop_handler_frame(&self) -> Option<HandlerFrameState> {
+        let mut state = self.thread.signal_state.lock();
+        let frame = state.pop_handler_frame();
+        if frame.is_some() {
+            self.thread.publish_signal_state(&state);
+        }
+        frame
+    }
+
+    pub fn armed_restore_mask(&self) -> Option<SigSet> {
+        self.thread.signal_state.lock().armed_restore_mask()
+    }
+
+    pub fn arm_restore_mask(&self, restore_mask: Option<SigSet>) {
+        let mut state = self.thread.signal_state.lock();
+        state.arm_restore_mask(restore_mask);
+        self.thread.publish_signal_state(&state);
+    }
+
+    pub fn record_pending_action(&self, signal: LinuxSignal, action: LinuxSigaction) {
+        let mut state = self.thread.signal_state.lock();
+        state.record_pending_action(signal, action);
+        self.thread.publish_signal_state(&state);
+    }
+
+    pub fn take_pending_action(&self, signal: LinuxSignal) -> Option<LinuxSigaction> {
+        let mut state = self.thread.signal_state.lock();
+        let action = state.take_pending_action(signal);
+        if action.is_some() {
+            self.thread.publish_signal_state(&state);
+        }
+        action
     }
 }
 
@@ -1718,6 +3283,178 @@ mod tests {
         }
     }
 
+    fn siginfo(signal: LinuxSignal, payload: i32) -> LinuxSiginfo {
+        let mut info: LinuxSiginfo = unsafe { std::mem::zeroed() };
+        info.si_signo = signal.raw();
+        info.si_code = crate::linux_abi::LINUX_SI_QUEUE;
+        info._pad[..4].copy_from_slice(&payload.to_ne_bytes());
+        info
+    }
+
+    #[test]
+    fn sighand_retains_full_actions_and_exec_preserves_only_ignore() {
+        let ids = ObjectIdRegistry::new();
+        let source = Sighand::new(ids.sighand_id().expect("source sighand"));
+        let ignored = LinuxSignal::for_signal_number(10).expect("ignored signal");
+        let caught = LinuxSignal::for_signal_number(12).expect("caught signal");
+        let mut ignored_action = LinuxSigaction::empty();
+        ignored_action.sa_handler = crate::linux_abi::LINUX_SIG_IGN;
+        ignored_action.sa_flags = 0x4000_0000;
+        ignored_action.sa_mask = [0x55];
+        let caught_action = LinuxSigaction {
+            sa_handler: 0x1234_5000,
+            sa_flags: 0x0800_0004,
+            sa_restorer: 0x7777_0000,
+            sa_mask: [0xaa],
+        };
+        source.install_action(ignored, ignored_action);
+        source.install_action(caught, caught_action);
+
+        let copied = Sighand::for_fork_copy(ids.sighand_id().expect("copy sighand"), &source);
+        assert_eq!(copied.action(ignored), ignored_action);
+        assert_eq!(copied.action(caught), caught_action);
+
+        let exec = Sighand::for_exec(ids.sighand_id().expect("exec sighand"), &source);
+        assert_eq!(exec.action(ignored), ignored_action);
+        assert_eq!(exec.action(caught), LinuxSigaction::empty());
+    }
+
+    #[test]
+    fn pending_queue_coalesces_standard_and_preserves_realtime_fifo_payloads() {
+        let standard = LinuxSignal::for_signal_number(10).expect("standard signal");
+        let realtime = LinuxSignal::for_signal_number(34).expect("realtime signal");
+        let first_standard = siginfo(standard, 1);
+        let latest_standard = siginfo(standard, 2);
+        let first_rt = siginfo(realtime, 3);
+        let second_rt = siginfo(realtime, 4);
+        let mut queue = PendingQueue::default();
+
+        queue.enqueue_standard(standard, Some(first_standard));
+        queue.enqueue_standard(standard, Some(latest_standard));
+        queue.enqueue_realtime(realtime, Some(first_rt));
+        queue.enqueue_realtime(realtime, Some(second_rt));
+
+        assert_eq!(queue.pending_count(), 3);
+        assert_eq!(
+            queue.take_lowest_in(SigSet::from_raw(u64::MAX)),
+            Some(PendingSignal {
+                signal: standard,
+                siginfo: Some(latest_standard),
+            })
+        );
+        assert_eq!(
+            queue.take_lowest_in(SigSet::from_raw(u64::MAX)),
+            Some(PendingSignal {
+                signal: realtime,
+                siginfo: Some(first_rt),
+            })
+        );
+        assert!(queue.present().contains(realtime.raw()));
+        assert_eq!(
+            queue.take_lowest_in(SigSet::from_raw(u64::MAX)),
+            Some(PendingSignal {
+                signal: realtime,
+                siginfo: Some(second_rt),
+            })
+        );
+        assert!(queue.present().is_empty());
+    }
+
+    #[test]
+    fn task_pending_hint_never_hides_authoritative_queue_state() {
+        let pending = TaskPendingSignals::new();
+        let signal = LinuxSignal::for_signal_number(17).expect("signal");
+        assert!(!pending.may_be_nonempty());
+
+        pending.enqueue_standard(signal, Some(siginfo(signal, 9)));
+        assert!(pending.may_be_nonempty());
+        assert!(pending.present().contains(signal.raw()));
+
+        let delivered = pending.take_lowest_in(SigSet::EMPTY.with(signal.raw()));
+        assert_eq!(delivered.map(|entry| entry.signal), Some(signal));
+        assert!(!pending.may_be_nonempty());
+        assert!(pending.present().is_empty());
+    }
+
+    #[test]
+    fn thread_signal_lifecycle_transforms_preserve_linux_owners() {
+        let blocked = SigSet::EMPTY.with(10);
+        let thread_pending = LinuxSignal::for_signal_number(12).expect("pending signal");
+        let mut caller = ThreadSignalState::default();
+        caller.set_blocked(blocked);
+        caller.enqueue_standard(thread_pending, Some(siginfo(thread_pending, 7)));
+        caller.set_altstack(Some(LinuxSigaltstack {
+            ss_sp: 0x4000,
+            ss_flags: 0,
+            __pad: 0,
+            ss_size: 0x2000,
+        }));
+        caller.push_handler_frame(HandlerFrameState {
+            on_altstack: true,
+            restore_mask: Some(SigSet::EMPTY.with(2)),
+        });
+        caller.arm_restore_mask(Some(SigSet::EMPTY.with(3)));
+
+        let forked = ThreadSignalState::for_fork(&caller);
+        assert_eq!(forked.blocked(), blocked);
+        assert!(forked.pending().is_empty());
+        assert!(forked.altstack_enabled());
+        assert_eq!(forked.handler_frame_depth(), 1);
+
+        let cloned = ThreadSignalState::for_clone_thread(&caller);
+        assert_eq!(cloned.blocked(), blocked);
+        assert!(cloned.pending().is_empty());
+        assert!(!cloned.altstack_enabled());
+        assert_eq!(cloned.handler_frame_depth(), 0);
+
+        let exec = ThreadSignalState::for_exec(&caller);
+        assert_eq!(exec.blocked(), blocked);
+        assert!(exec.pending().contains(thread_pending.raw()));
+        assert!(!exec.altstack_enabled());
+        assert_eq!(exec.handler_frame_depth(), 0);
+        assert_eq!(exec.armed_restore_mask(), None);
+    }
+
+    #[test]
+    fn signal_authority_preserves_thread_first_same_signum_provenance() {
+        let fixture = Fixture::new();
+        let shared = fixture.task.shared();
+        let authority = SignalAuthority::new(
+            shared.sighand(),
+            shared.pending_signals(),
+            Arc::clone(&fixture.leader),
+        );
+        let signal = LinuxSignal::for_signal_number(34).expect("realtime signal");
+        let thread_info = siginfo(signal, 11);
+        let task_info = siginfo(signal, 22);
+        authority.enqueue_task_realtime(signal, Some(task_info));
+        authority.enqueue_thread_realtime(signal, Some(thread_info));
+
+        let wanted = SigSet::EMPTY.with(signal.raw());
+        assert_eq!(
+            authority.take_lowest_in(wanted),
+            Some(SignalDequeue {
+                owner: SignalPendingOwner::Thread,
+                pending: PendingSignal {
+                    signal,
+                    siginfo: Some(thread_info),
+                },
+            })
+        );
+        assert_eq!(
+            authority.take_lowest_in(wanted),
+            Some(SignalDequeue {
+                owner: SignalPendingOwner::Task,
+                pending: PendingSignal {
+                    signal,
+                    siginfo: Some(task_info),
+                },
+            })
+        );
+        assert!(!authority.may_have_thread_pending());
+        assert!(!authority.may_have_task_pending());
+    }
+
     #[test]
     fn legal_thread_clone_can_copy_files_and_fs_independently() {
         let fixture = Fixture::new();
@@ -1885,6 +3622,86 @@ mod tests {
         ));
         drop(owner_task_claim);
         drop(foreign_task_claim);
+    }
+
+    #[test]
+    fn fork_copies_splice_index_while_sharing_description_pushback_cell() {
+        let ids = ObjectIdRegistry::new();
+        let parent = FileTable::new(ids.file_table_id().expect("parent table ID"));
+        let description = Arc::new(FileDescription::regular(
+            ids.file_description_id().expect("description ID"),
+        ));
+        parent.install(
+            FileSlotNumber::for_open_fd(3).expect("fd"),
+            Arc::clone(&description),
+            false,
+        );
+        let queue = Arc::new(Mutex::new(crate::dispatch::SplicePushback::default()));
+        parent
+            .splice_pushback
+            .lock()
+            .insert(description.id(), Arc::clone(&queue));
+
+        let child = FileTable::for_fork_copy(ids.file_table_id().expect("child table ID"), &parent);
+        let child_queue = child
+            .splice_pushback
+            .lock()
+            .get(&description.id())
+            .cloned()
+            .expect("child pushback cell");
+        assert!(Arc::ptr_eq(&queue, &child_queue));
+    }
+
+    #[test]
+    fn file_table_retirement_waits_for_admitted_functional_use() {
+        let ids = ObjectIdRegistry::new();
+        let table = Arc::new(FileTable::new(ids.file_table_id().expect("table ID")));
+        let lease = table
+            .acquire_functional_lease()
+            .expect("active table lease");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let retiring = Arc::clone(&table);
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).expect("retirement started");
+            let drained = retiring.drain_functional_refs();
+            done_tx.send(drained).expect("retirement complete");
+        });
+
+        started_rx.recv().expect("retirement entered");
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(25)).is_err(),
+            "retirement completed while a functional lease was admitted"
+        );
+        drop(lease);
+        assert!(done_rx.recv().expect("retirement released").is_empty());
+        worker.join().expect("retirement worker");
+        assert!(!table.functional_refs_active());
+    }
+
+    #[test]
+    fn exec_freeze_blocks_table_mutation_until_publication_boundary() {
+        let ids = ObjectIdRegistry::new();
+        let table = Arc::new(FileTable::new(ids.file_table_id().expect("table ID")));
+        let freeze = table.freeze_for_exec().expect("exec freeze");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mutating = Arc::clone(&table);
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).expect("mutation started");
+            mutating.set_nofile_soft(4096);
+            done_tx.send(()).expect("mutation complete");
+        });
+
+        started_rx.recv().expect("mutation entered");
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(25)).is_err(),
+            "mutation crossed the exec freeze"
+        );
+        drop(freeze);
+        done_rx.recv().expect("mutation released");
+        worker.join().expect("mutation worker");
+        assert_eq!(table.nofile_soft(), 4096);
     }
 
     #[test]

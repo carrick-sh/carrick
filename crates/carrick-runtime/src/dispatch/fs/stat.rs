@@ -70,6 +70,13 @@ impl SyscallDispatcher {
             }
             return Err(LINUX_EBADF);
         };
+        if open_file
+            .description
+            .concrete_backing::<crate::dispatch::ioring::IoUringBacking>()
+            .is_some()
+        {
+            return Ok(StatRecord::synthetic("anon_inode:[io_uring]", 0, 0o600));
+        }
         let open = open_file.description.read();
         // A named FIFO opened by path is modelled as a `HostPipe` (no pty),
         // whose `stat_source` hands back a SYNTHETIC record (hashed inode,
@@ -208,7 +215,7 @@ mod tests {
         is_read_end: bool,
         write_kind: HostWriteKind,
     ) -> OpenFile {
-        OpenFile::new(
+        OpenFile::from_open_description(
             Arc::new(RwLock::new(OpenDescription::HostPipe {
                 base: OpenDescriptionBase::new(if is_read_end {
                     LINUX_O_RDONLY
@@ -241,7 +248,8 @@ mod tests {
         assert_ne!(pipe_identity, 0);
         assert_ne!(null_identity, 0);
         {
-            let mut files = dispatcher.io.open_files.write();
+            let file_table = dispatcher.captured_file_table();
+            let mut files = file_table.write_open_files();
             files.insert(
                 20,
                 host_stream_file(pipe_fds[0], pipe_identity, true, HostWriteKind::PipeLike),

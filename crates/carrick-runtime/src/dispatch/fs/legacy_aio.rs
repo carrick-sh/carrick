@@ -120,7 +120,7 @@ impl LegacyAioIocb {
 }
 
 fn legacy_aio_context_exists(this: &SyscallDispatcher, ctx: LegacyAioContextId) -> bool {
-    this.io.legacy_aio_contexts.read().contains(&ctx)
+    this.captured_mm().read_legacy_aio_contexts().contains(&ctx)
 }
 
 fn legacy_aio_iocb_errno(this: &SyscallDispatcher, iocb: LegacyAioIocb) -> Option<LinuxErrno> {
@@ -164,18 +164,19 @@ pub(super) fn io_setup<M: GuestMemory>(
     if current != 0 {
         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
     }
-    let raw = this
-        .io
-        .next_legacy_aio_context
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let raw = this.captured_mm().allocate_legacy_aio_context();
     let ctx_id = LegacyAioContextId::allocated_from(raw);
-    this.io.legacy_aio_contexts.write().insert(ctx_id);
+    this.captured_mm()
+        .write_legacy_aio_contexts()
+        .insert(ctx_id);
     if cx
         .memory
         .write_bytes(ctxp.0, &ctx_id.get().to_le_bytes())
         .is_err()
     {
-        this.io.legacy_aio_contexts.write().remove(&ctx_id);
+        this.captured_mm()
+            .write_legacy_aio_contexts()
+            .remove(&ctx_id);
         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
     }
     Ok(DispatchOutcome::Returned { value: 0 })
@@ -188,7 +189,7 @@ pub(super) fn io_destroy(
     let Some(ctx) = LegacyAioContextId::from_guest(raw_ctx) else {
         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
     };
-    if this.io.legacy_aio_contexts.write().remove(&ctx) {
+    if this.captured_mm().write_legacy_aio_contexts().remove(&ctx) {
         Ok(DispatchOutcome::Returned { value: 0 })
     } else {
         Ok(DispatchOutcome::errno(LINUX_EINVAL))

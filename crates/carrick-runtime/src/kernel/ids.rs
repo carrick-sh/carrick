@@ -3,6 +3,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use carrick_hal::{FrameId, KernelTransactionId, MappingId};
 
+/// File descriptions may be created deep in dispatch helpers after the exact
+/// KernelContext has selected a table. A process-global monotonic source keeps
+/// their stable identities collision-free across every Kernel generation and
+/// independently copied table without recapturing registry state.
+static NEXT_FILE_DESCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
+
 macro_rules! linux_i32_id {
     ($name:ident) => {
         #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -190,8 +196,7 @@ impl ObjectIdRegistry {
     }
 
     pub fn file_description_id(&self) -> Result<FileDescriptionId, ObjectIdError> {
-        self.allocate()
-            .map(FileDescriptionId::from_registry_allocation)
+        allocate_file_description_id()
     }
 
     pub fn fs_context_id(&self) -> Result<FsContextId, ObjectIdError> {
@@ -226,6 +231,24 @@ pub enum ObjectIdError {
     Exhausted,
 }
 
+pub(crate) fn restore_file_description_id(raw: u64) -> Result<FileDescriptionId, ObjectIdError> {
+    let value = NonZeroU64::new(raw).ok_or(ObjectIdError::Exhausted)?;
+    let next = raw.checked_add(1).ok_or(ObjectIdError::Exhausted)?;
+    NEXT_FILE_DESCRIPTION_ID.fetch_max(next, Ordering::Relaxed);
+    Ok(FileDescriptionId::from_registry_allocation(value))
+}
+
+pub(crate) fn allocate_file_description_id() -> Result<FileDescriptionId, ObjectIdError> {
+    let raw = NEXT_FILE_DESCRIPTION_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| ObjectIdError::Exhausted)?;
+    NonZeroU64::new(raw)
+        .map(FileDescriptionId::from_registry_allocation)
+        .ok_or(ObjectIdError::Exhausted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,6 +274,21 @@ mod tests {
         assert_eq!(LinuxTid::for_task_leader(leader).raw(), 42);
         assert_eq!(ProcessGroupId::from_leader(leader).raw(), 42);
         assert_eq!(SessionId::from_leader(leader).raw(), 42);
+    }
+
+    #[test]
+    fn restored_file_description_ids_advance_the_process_wide_allocator() {
+        let before = allocate_file_description_id().expect("description ID");
+        let restored_raw = before.raw().max(1_u64 << 62);
+        let restored = restore_file_description_id(restored_raw).expect("restored ID");
+        let after = allocate_file_description_id().expect("post-restore ID");
+
+        assert_eq!(restored.raw(), restored_raw);
+        assert!(after.raw() > restored.raw());
+        assert_eq!(
+            restore_file_description_id(0),
+            Err(ObjectIdError::Exhausted)
+        );
     }
 
     #[test]

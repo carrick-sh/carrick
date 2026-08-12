@@ -15,9 +15,9 @@ use super::core::{
 };
 use super::ids::{LinuxTid, MmId, ObjectIdError, ProcessGroupId, SessionId, TaskId};
 use super::objects::{
-    Credentials, LinuxWaitStatus, Mm, ObjectGraphError, ProcessGroup, Session, Task, TaskKey,
-    TaskLifecycle, TaskRef, TaskRusage, TaskShared, TaskSharedCloneError, ThreadKey, ThreadRef,
-    ThreadResources, Zombie,
+    Credentials, FileTable, LinuxWaitStatus, Mm, ObjectGraphError, ProcessGroup, Session, Task,
+    TaskKey, TaskLifecycle, TaskRef, TaskRusage, TaskShared, TaskSharedCloneError, ThreadKey,
+    ThreadRef, ThreadResources, Zombie,
 };
 use super::registry::{IdError, TaskReservation, ThreadClaim, ThreadReservation};
 
@@ -384,8 +384,14 @@ impl ForkReservation {
         if self.plan.mm() != CloneObjectMode::Copy {
             return Err(KernelOperationError::UnexpectedForkMmBackend);
         }
-        let mm = Arc::new(Mm::with_backend(self.kernel.object_ids().mm_id()?, backend));
-        self.prepare(Some(mm), child_registry_id)
+        let file_table_freeze = self.freeze_files_for_copied_state()?;
+        let parent_mm = self.caller_shared.mm();
+        let mm = Arc::new(Mm::with_backend_for_fork(
+            self.kernel.object_ids().mm_id()?,
+            backend,
+            &parent_mm,
+        ));
+        self.prepare(Some(mm), child_registry_id, file_table_freeze)
     }
 
     pub fn prepare_shared_mm(
@@ -395,31 +401,50 @@ impl ForkReservation {
         if self.plan.mm() != CloneObjectMode::Share {
             return Err(KernelOperationError::MissingForkMmBackend);
         }
-        self.prepare(None, child_registry_id)
+        self.prepare(None, child_registry_id, None)
     }
 
     #[cfg(test)]
-    fn prepare_reference(
+    pub(crate) fn prepare_reference(
         self,
         child_registry_id: ThreadId,
     ) -> Result<PreparedFork, KernelOperationError> {
+        let file_table_freeze = self.freeze_files_for_copied_state()?;
         let copied_mm = (self.plan.mm() == CloneObjectMode::Copy)
             .then(|| {
                 self.kernel
                     .object_ids()
                     .mm_id()
-                    .map(Mm::new_reference)
+                    .map(|id| Mm::new_reference_for_fork(id, &self.caller_shared.mm()))
                     .map(Arc::new)
             })
             .transpose()?;
-        self.prepare(copied_mm, child_registry_id)
+        self.prepare(copied_mm, child_registry_id, file_table_freeze)
+    }
+
+    fn freeze_files_for_copied_state(
+        &self,
+    ) -> Result<Option<super::objects::FileTableExecFreeze>, KernelOperationError> {
+        if self.plan.mm() == CloneObjectMode::Copy || self.plan.files() == CloneObjectMode::Copy {
+            self.caller_resources
+                .files()
+                .freeze_for_exec()
+                .map(Some)
+                .ok_or(KernelOperationError::FileTableDraining)
+        } else {
+            Ok(None)
+        }
     }
 
     fn prepare(
         self,
         copied_mm: Option<Arc<Mm>>,
         child_registry_id: ThreadId,
+        mut file_table_freeze: Option<super::objects::FileTableExecFreeze>,
     ) -> Result<PreparedFork, KernelOperationError> {
+        if file_table_freeze.is_none() {
+            file_table_freeze = self.freeze_files_for_copied_state()?;
+        }
         let child_shared = Arc::new(TaskShared::for_new_task_with_mm(
             &self.caller_shared,
             self.plan,
@@ -431,6 +456,7 @@ impl ForkReservation {
             self.plan,
             self.kernel.object_ids(),
         )?);
+        drop(file_table_freeze);
         let child_key = TaskKey {
             id: self.child_id,
             serial: self.kernel.object_ids().task_serial()?,
@@ -911,6 +937,92 @@ impl Kernel {
         self.registry().state.read().tasks.contains_key(&task_id)
     }
 
+    pub(super) fn retire_mm_io_state_if_unreferenced(&self, target: &Arc<Mm>) {
+        let live = self
+            .registry()
+            .state
+            .read()
+            .tasks
+            .values()
+            .any(|record| Arc::ptr_eq(&record.task.shared().mm(), target));
+        if !live {
+            target.clear_io_uring_mappings();
+        }
+    }
+
+    pub(crate) fn file_table_is_live_exact(&self, target: &Arc<FileTable>) -> bool {
+        let state = self.registry().state.read();
+        state.tasks.values().any(|record| {
+            record.task.thread_keys().into_iter().any(|thread_key| {
+                record
+                    .task
+                    .thread(thread_key.tid)
+                    .is_some_and(|thread| Arc::ptr_eq(&thread.resources().files(), target))
+            })
+        })
+    }
+
+    pub(crate) fn retire_file_table_if_unreferenced(&self, target: &Arc<FileTable>) {
+        self.retire_file_table_generation(target, None);
+    }
+
+    pub(super) fn retire_file_table_after_exec(
+        &self,
+        target: &Arc<FileTable>,
+        successor: &Arc<FileTable>,
+    ) {
+        self.retire_file_table_generation(target, Some(successor));
+    }
+
+    fn retire_file_table_generation(
+        &self,
+        target: &Arc<FileTable>,
+        successor: Option<&Arc<FileTable>>,
+    ) {
+        if self.file_table_is_live_exact(target) {
+            return;
+        }
+        let events = target.drain_functional_refs();
+        if events.is_empty() {
+            return;
+        }
+        let successor_slots = successor.map(|table| table.read_open_files());
+        self.pending_file_closes
+            .lock()
+            .extend(events.into_iter().map(|(fd, slot)| {
+                let disposition = successor_slots
+                    .as_ref()
+                    .and_then(|slots| slots.get(&fd))
+                    .filter(|survivor| Arc::ptr_eq(&survivor.description, &slot.description))
+                    .map_or(super::core::FileCloseDisposition::Closed, |_| {
+                        super::core::FileCloseDisposition::Transferred
+                    });
+                super::core::FileCloseEvent {
+                    table: target.id(),
+                    fd,
+                    slot,
+                    disposition,
+                }
+            }));
+    }
+
+    pub(crate) fn take_file_close_events(
+        &self,
+        table: super::ids::FileTableId,
+    ) -> Vec<super::core::FileCloseEvent> {
+        let mut pending = self.pending_file_closes.lock();
+        let mut selected = Vec::new();
+        let mut index = 0;
+        while index < pending.len() {
+            if pending[index].table == table {
+                selected.push(pending.swap_remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        selected
+    }
+
     pub fn task_key_is_live(&self, task: TaskKey) -> bool {
         self.registry()
             .state
@@ -1164,6 +1276,7 @@ impl Kernel {
         check_failpoint(failpoint, KernelFailpoint::AfterObjects)?;
         check_failpoint(failpoint, KernelFailpoint::AfterBackendPrepare)?;
 
+        let files = context.resources.files();
         let mut state = self.registry().state.write();
         ensure_task_unreserved(&state, context.task.key().id)?;
         let record = state
@@ -1222,7 +1335,70 @@ impl Kernel {
                     _claim: claim,
                 });
         }
+        drop(state);
+        self.retire_file_table_if_unreferenced(&files);
         Ok(next)
+    }
+
+    /// Replace the fresh one-task adapter's empty table with an exact value
+    /// copy of the inherited host-fork table. The new host process owns an
+    /// independent fd namespace while every slot keeps the same open-description
+    /// identity and host-fd backing inherited by `fork(2)`.
+    pub fn copy_file_table_for_host_fork(
+        self: &Arc<Self>,
+        context: &KernelContext,
+        inherited: &Arc<FileTable>,
+    ) -> Result<KernelContext, KernelOperationError> {
+        if !Arc::ptr_eq(self, &context.kernel) {
+            return Err(KernelOperationError::ForeignContext);
+        }
+        let task_id = context.task.key().id;
+        loop {
+            let observed = self.reservation_epoch();
+            let state = self.registry().state.write();
+            if let Err(KernelOperationError::TaskBusy(_)) = ensure_task_unreserved(&state, task_id)
+            {
+                drop(state);
+                self.wait_for_reservation_change(observed);
+                continue;
+            }
+            ensure_task_unreserved(&state, task_id)?;
+            let record = state
+                .tasks
+                .get(&task_id)
+                .ok_or(KernelOperationError::ParentExited)?;
+            let thread = record.task.thread(context.thread.key().tid).ok_or(
+                KernelOperationError::UnknownThread(context.thread.key().tid),
+            )?;
+            if record.task.key() != context.task.key()
+                || thread.key() != context.thread.key()
+                || !Arc::ptr_eq(&thread, &context.thread)
+                || !Arc::ptr_eq(&thread.resources(), &context.resources)
+            {
+                return Err(KernelOperationError::StaleContext);
+            }
+
+            let old_files = context.resources.files();
+            let files = Arc::new(FileTable::for_fork_copy(
+                self.object_ids().file_table_id()?,
+                inherited,
+            ));
+            let resources = Arc::new(context.resources.with_files(files));
+            let revision = record.revision;
+            let task = Arc::clone(&record.task);
+            thread.replace_resources(Arc::clone(&resources));
+            self.observe_thread_publication(&thread, &resources, revision);
+            drop(state);
+            self.retire_file_table_if_unreferenced(&old_files);
+            return Ok(KernelContext::from_parts(
+                self.clone(),
+                task,
+                thread,
+                Arc::clone(&context.shared),
+                resources,
+                revision,
+            ));
+        }
     }
 
     /// Publish an immutable credential COW for exactly the calling thread.
@@ -1830,6 +2006,18 @@ impl Kernel {
         if !exiting_record.task.begin_exit() {
             return Err(KernelOperationError::AlreadyExiting(prepared.task.id));
         }
+        let mut exiting_file_tables = Vec::new();
+        for thread_key in exiting_record.task.thread_keys() {
+            if let Some(thread) = exiting_record.task.thread(thread_key.tid) {
+                let files = thread.resources().files();
+                if !exiting_file_tables
+                    .iter()
+                    .any(|observed| Arc::ptr_eq(observed, &files))
+                {
+                    exiting_file_tables.push(files);
+                }
+            }
+        }
 
         let record = state
             .tasks
@@ -1897,6 +2085,9 @@ impl Kernel {
         // mistaken for this exit.
         let subscribers = self.exit_subscribers.take(prepared.task);
         drop(state);
+        for files in &exiting_file_tables {
+            self.retire_file_table_if_unreferenced(files);
+        }
         if let Some(release) = vfork_release {
             release.release(VforkReleaseReason::Exit);
         }
@@ -2115,6 +2306,8 @@ pub enum KernelOperationError {
     ExpectedThreadGroup,
     #[error("copied-mm fork requires a prepared backend")]
     MissingForkMmBackend,
+    #[error("fork caller's file table is already draining")]
+    FileTableDraining,
     #[error("shared-mm fork cannot accept a replacement backend")]
     UnexpectedForkMmBackend,
     #[error("task {0:?} has no parent to inherit for CLONE_PARENT")]
@@ -2190,7 +2383,7 @@ mod tests {
     use std::num::NonZeroU16;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use carrick_abi::{LinuxCloneFlags, SigSet};
+    use carrick_abi::{LinuxCloneFlags, LinuxSigaction, SigSet};
     use carrick_guest_mem::Gpa;
     use proptest::prelude::*;
 
@@ -2421,15 +2614,17 @@ mod tests {
         let (kernel, root) = bootstrap(100);
         let ignored = LinuxSignal::for_signal_number(2).expect("ignored signal");
         let caught = LinuxSignal::for_signal_number(3).expect("caught signal");
+        let mut ignored_action = LinuxSigaction::empty();
+        ignored_action.sa_handler = crate::linux_abi::LINUX_SIG_IGN;
         root.shared
             .sighand()
-            .set_disposition(ignored, SignalDisposition::Ignore);
-        root.shared
-            .sighand()
-            .set_disposition(caught, SignalDisposition::Caught);
+            .install_action(ignored, ignored_action);
+        let mut caught_action = LinuxSigaction::empty();
+        caught_action.sa_handler = 0x3000;
+        root.shared.sighand().install_action(caught, caught_action);
         let parent_signals =
             ThreadSignalState::new(SigSet::EMPTY.with(4), SigSet::EMPTY.with(5), true, 2);
-        root.thread.replace_signal_state(parent_signals);
+        root.thread.replace_signal_state(parent_signals.clone());
         let slot = FileSlotNumber::for_open_fd(3).expect("file slot");
         let description = Arc::new(FileDescription::regular(
             kernel
@@ -2614,6 +2809,77 @@ mod tests {
     }
 
     #[test]
+    fn copied_mm_fork_freezes_dispatch_before_capturing_ring_attachments() {
+        let (kernel, root) = bootstrap(149);
+        let files = root.resources().files();
+        let active_dispatch = files
+            .acquire_functional_lease()
+            .expect("active dispatch lease");
+        let backing =
+            crate::dispatch::ioring::IoUringBacking::create(8, 4096).expect("ring backing");
+        let description =
+            Arc::new(FileDescription::concrete(backing).expect("ring description identity"));
+        let parent_mm = root.shared().mm();
+        parent_mm.replace_io_uring_mappings(
+            0x1000,
+            0x1000,
+            Some(crate::dispatch::ioring::IoUringMapping {
+                description: Arc::clone(&description),
+                region: crate::dispatch::ioring::IoUringRegion::SqCq,
+                start: 0x1000,
+                end: 0x2000,
+                backing_offset: 0,
+            }),
+        );
+        let reservation = kernel
+            .reserve_fork(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                "ring-race child".to_owned(),
+                None,
+            )
+            .expect("fork reservation");
+        let prepare = std::thread::spawn(move || {
+            reservation.prepare_reference(ThreadId::synthetic_for_tests(1491))
+        });
+        for _ in 0..100_000 {
+            if files.functional_gate_is_frozen() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            files.functional_gate_is_frozen(),
+            "fork did not freeze dispatch before copying mm state"
+        );
+
+        parent_mm.replace_io_uring_mappings(0x1000, 0x1000, None);
+        parent_mm.replace_io_uring_mappings(
+            0x3000,
+            0x1000,
+            Some(crate::dispatch::ioring::IoUringMapping {
+                description,
+                region: crate::dispatch::ioring::IoUringRegion::Sqes,
+                start: 0x3000,
+                end: 0x4000,
+                backing_offset: 0x1000,
+            }),
+        );
+        drop(active_dispatch);
+        let prepared = prepare
+            .join()
+            .expect("join fork preparation")
+            .expect("prepare fork");
+        let child_mm = prepared.child_shared.mm();
+        let child_mappings = child_mm.read_io_uring_mappings();
+        assert_eq!(child_mappings.len(), 1);
+        assert_eq!(
+            (child_mappings[0].start, child_mappings[0].end),
+            (0x3000, 0x4000)
+        );
+    }
+
+    #[test]
     fn fork_reservation_stays_undiscoverable_until_backend_commit() {
         let (kernel, root) = bootstrap(150);
         let plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
@@ -2661,6 +2927,52 @@ mod tests {
             test_binding()
         );
         assert_ne!(kernel.ids().counts(), before);
+    }
+
+    #[test]
+    fn legacy_aio_authority_follows_mm_sharing_not_file_table_sharing() {
+        let (kernel, root) = bootstrap(159);
+        let aio = crate::dispatch::LegacyAioContextId::allocated_from(
+            root.shared().mm().allocate_legacy_aio_context(),
+        );
+        root.shared().mm().write_legacy_aio_contexts().insert(aio);
+
+        let copied = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::FILES).expect("copied-mm plan"),
+                ThreadId::synthetic_for_tests(1591),
+                "copied-mm child".to_owned(),
+                None,
+            )
+            .expect("copied-mm fork");
+        assert!(!Arc::ptr_eq(&copied.shared().mm(), &root.shared().mm()));
+        assert!(copied.shared().mm().read_legacy_aio_contexts().is_empty());
+        assert!(Arc::ptr_eq(
+            &copied.resources().files(),
+            &root.resources().files()
+        ));
+
+        let current_root = kernel
+            .context(root.task().key().id, root.thread().key().tid)
+            .expect("current root after copied-mm fork");
+        let shared = kernel
+            .fork_task(
+                &current_root,
+                ClonePlan::from_flags(LinuxCloneFlags::VM).expect("shared-mm plan"),
+                ThreadId::synthetic_for_tests(1592),
+                "shared-mm child".to_owned(),
+                None,
+            )
+            .expect("shared-mm fork");
+        assert!(Arc::ptr_eq(&shared.shared().mm(), &root.shared().mm()));
+        assert!(
+            shared
+                .shared()
+                .mm()
+                .read_legacy_aio_contexts()
+                .contains(&aio)
+        );
     }
 
     #[test]

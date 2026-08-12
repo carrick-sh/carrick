@@ -245,7 +245,10 @@ pub(super) struct MemState {
     /// Active MAP_SHARED, PROT_WRITE mappings of a (sealable) memfd, paired with
     /// the backing open-file description. While one is live, `F_ADD_SEALS`
     /// F_SEAL_WRITE on that memfd must fail EBUSY (memfd_create01 test_share_mmap).
-    writable_memfd_maps: Vec<(crate::vfs::GuestMemoryRange, OpenDescriptionRef)>,
+    writable_memfd_maps: Vec<(
+        crate::vfs::GuestMemoryRange,
+        Arc<crate::kernel::FileDescription>,
+    )>,
     /// The exact serialized ELF auxiliary vector written to the guest stack at
     /// exec, captured from the `AddressSpace` via
     /// [`SyscallDispatcher::set_auxv_image`]. Mirrored to `/proc/self/auxv`.
@@ -722,7 +725,7 @@ pub(crate) struct HostAliasMmapCommit {
     pub(super) resident: bool,
     pub(super) bus_fault: Option<(u64, u64)>,
     pub(super) write_sealed_shared: bool,
-    pub(super) writable_memfd: Option<OpenDescriptionRef>,
+    pub(super) writable_memfd: Option<Arc<crate::kernel::FileDescription>>,
 }
 
 fn prot_to_proc_perms(prot: LinuxProtFlags) -> (bool, bool, bool) {
@@ -734,7 +737,10 @@ fn prot_to_proc_perms(prot: LinuxProtFlags) -> (bool, bool, bool) {
 }
 
 fn trim_writable_memfd_maps_for_range(
-    maps: &mut Vec<(crate::vfs::GuestMemoryRange, OpenDescriptionRef)>,
+    maps: &mut Vec<(
+        crate::vfs::GuestMemoryRange,
+        Arc<crate::kernel::FileDescription>,
+    )>,
     start: u64,
     len: u64,
 ) {
@@ -1371,7 +1377,12 @@ impl SyscallDispatcher {
             .any(|r| ranges_overlap(start, len, r.start().raw(), r.end().raw()))
     }
 
-    fn record_writable_memfd_map(&self, start: u64, len: u64, description: OpenDescriptionRef) {
+    fn record_writable_memfd_map(
+        &self,
+        start: u64,
+        len: u64,
+        description: Arc<crate::kernel::FileDescription>,
+    ) {
         if let Some(range) =
             crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
         {
@@ -1391,13 +1402,15 @@ impl SyscallDispatcher {
     /// state before it removes the attachment and decrements `nattch`.
     pub(super) fn remove_mapping_metadata(&self, start: u64, len: u64) {
         remove_mapping_metadata_locked(&mut self.mem.lock(), start, len);
+        self.captured_mm()
+            .replace_io_uring_mappings(start, len, None);
     }
 
     /// True iff a live MAP_SHARED, PROT_WRITE mapping backed by `description`
     /// exists — used to reject `F_ADD_SEALS` F_SEAL_WRITE with EBUSY.
     pub(in crate::dispatch) fn memfd_has_writable_shared_map(
         &self,
-        description: &OpenDescriptionRef,
+        description: &Arc<crate::kernel::FileDescription>,
     ) -> bool {
         self.mem
             .lock()
@@ -1925,16 +1938,6 @@ impl SyscallDispatcher {
             let requested_raw = requested.0;
             let requested = GuestPtr(requested.0 & 0x0000_FFFF_FFFF_FFFF);
 
-            // io_uring ring mapping: the SQ/CQ rings and SQE array already live
-            // in the guest arena (allocated by io_uring_setup); the guest maps
-            // them off the ring fd with offset = IORING_OFF_*. Hand back the
-            // address carrick placed them at, so guest and runtime share the
-            // same coherent ring memory.
-            if flags & LINUX_MAP_ANONYMOUS == 0 && fd.0 >= 0
-                && let Some(addr) = this.io_uring_mmap_addr(fd.0, offset) {
-                    return Ok(DispatchOutcome::Returned { value: addr as i64 });
-                }
-
             let fixed_noreplace = flags & LINUX_MAP_FIXED_NOREPLACE != 0;
             if fixed_noreplace {
                 flags |= LINUX_MAP_FIXED;
@@ -2002,6 +2005,91 @@ impl SyscallDispatcher {
             };
             let length_usize =
                 usize::try_from(length).map_err(|_| DispatchError::LengthTooLarge(length))?;
+
+            // io_uring mappings are ordinary MAP_SHARED host aliases. The file
+            // description owns the persistent bytes; this mm receives only an
+            // attachment after the runtime has installed the alias successfully.
+            if let Some(description) = this.io_uring_description(fd.0) {
+                let Some(backing) = description
+                    .concrete_backing::<crate::dispatch::ioring::IoUringBacking>()
+                else {
+                    std::process::abort();
+                };
+                let Some((region, region_layout)) = backing.region(offset) else {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                };
+                if map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+                    || map_sharing != MmapSharing::Shared
+                    || length < region_layout.required_len
+                    || length > region_layout.mapped_extent
+                {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                if fixed_noreplace && this.dynamic_mapping_overlaps(requested.0, length) {
+                    return Ok(DispatchOutcome::errno(linux_errno::EEXIST));
+                }
+                let Some(owned_fd) = backing.dup_data_fd() else {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                };
+                let Some(ipa) = crate::memory::alloc_alias_ipa(length) else {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                };
+                let address = if map_flags.contains(LinuxMmapFlags::FIXED) {
+                    requested.0
+                } else {
+                    crate::memory::LINUX_HIGH_VA_THRESHOLD
+                        + (ipa - crate::memory::LINUX_ALIAS_IPA_BASE)
+                };
+                let Some(end) = address.checked_add(length) else {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                };
+                let mut host_prot = 0;
+                if prot_flags.intersects(LinuxProtFlags::READ | LinuxProtFlags::EXEC) {
+                    host_prot |= libc::PROT_READ;
+                }
+                if prot_flags.contains(LinuxProtFlags::WRITE) {
+                    host_prot |= libc::PROT_WRITE;
+                }
+                let mapping = crate::dispatch::ioring::IoUringMapping {
+                    description,
+                    region,
+                    start: address,
+                    end,
+                    backing_offset: region_layout.backing_offset,
+                };
+                let mm = this.captured_mm();
+                let transaction = host_alias_dispatch.publish(HostAliasCommit::io_uring_mmap(
+                    HostAliasMmapCommit {
+                        start: address,
+                        len: length,
+                        prot: prot_flags,
+                        sharing: ProcMapSharing::Shared,
+                        path: "anon_inode:[io_uring]".to_owned(),
+                        locked: this.prepare_mmap_locked_range(map_flags, address, length)?,
+                        resident: true,
+                        bus_fault: None,
+                        write_sealed_shared: false,
+                        writable_memfd: None,
+                    },
+                    mapping,
+                    mm,
+                ));
+                return Ok(DispatchOutcome::MapHostAlias {
+                    transaction,
+                    va: GuestVa(address),
+                    ipa: Gpa(ipa),
+                    len: length,
+                    payload: Vec::new(),
+                    file: Some((
+                        HostAliasOwnedFd(owned_fd),
+                        region_layout.backing_offset as libc::off_t,
+                        host_prot,
+                    )),
+                    shared: true,
+                    prot,
+                    prot_none: prot_flags.is_empty(),
+                });
+            }
 
             // An O_PATH descriptor is not open for I/O — mmap on it returns
             // EBADF (LTP open13 maps an O_PATH fd and expects failure).
@@ -2652,7 +2740,7 @@ impl SyscallDispatcher {
             // A live MAP_SHARED, PROT_WRITE mapping of an (unsealed) memfd — its
             // backing description is recorded so F_ADD_SEALS F_SEAL_WRITE can
             // EBUSY while it is mapped.
-            let mut writable_memfd_desc: Option<OpenDescriptionRef> = None;
+            let mut writable_memfd_desc: Option<Arc<crate::kernel::FileDescription>> = None;
             // Move-3 E1: an eligible MAP_PRIVATE file mmap lowers to ONE host
             // file-backed `MAP_PRIVATE|MAP_FIXED` mapping (demand-paged from
             // the unified buffer cache) instead of the eager full-length
@@ -3455,6 +3543,15 @@ impl SyscallDispatcher {
             }
             if dontunmap && new_size != old_size {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            if this
+                .captured_mm()
+                .io_uring_mapping_overlaps(old_address.0, old_size)
+            {
+                // Moving or resizing a ring attachment without a matching host
+                // alias transaction would stale the mm join. Fail before any
+                // page-table, allocator, or VMA mutation.
+                return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
             }
             if move_fixed || dontunmap {
                 // Only now — once the request has passed every
@@ -5298,9 +5395,9 @@ mod tests {
 
         let mut file_bytes = vec![0x7d; LINUX_PAGE_SIZE as usize];
         file_bytes.extend_from_slice(&[0x90, 0xc3, 0x4a]);
-        dispatcher.io.open_files.write().insert(
+        dispatcher.captured_file_table().write_open_files().insert(
             FD,
-            OpenFile::new(
+            OpenFile::from_open_description(
                 std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
                     base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
                     path: "private-replacement".into(),
@@ -5457,9 +5554,9 @@ mod tests {
         };
         let mut memfd_base = OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR);
         memfd_base.set_seals(Some(0));
-        dispatcher.io.open_files.write().insert(
+        dispatcher.captured_file_table().write_open_files().insert(
             20,
-            OpenFile::new(
+            OpenFile::from_open_description(
                 std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::File {
                     base: memfd_base,
                     path: "/memfd:private-eof".into(),
@@ -5471,9 +5568,9 @@ mod tests {
                 0,
             ),
         );
-        dispatcher.io.open_files.write().insert(
+        dispatcher.captured_file_table().write_open_files().insert(
             21,
-            OpenFile::new(
+            OpenFile::from_open_description(
                 std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
                     base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
                     path: "/synthetic-private-eof".into(),
@@ -5495,9 +5592,9 @@ mod tests {
             },
             payload.len() as isize
         );
-        dispatcher.io.open_files.write().insert(
+        dispatcher.captured_file_table().write_open_files().insert(
             22,
-            OpenFile::new(
+            OpenFile::from_open_description(
                 std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::HostFile {
                     base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
                     host_fd: HostFdRef::new(host_file.into_raw_fd()),
@@ -5544,9 +5641,9 @@ mod tests {
             .set_file_contents(PATH, Vec::new())
             .expect("create shared overlay inode");
         let install_snapshot = |fd| {
-            dispatcher.io.open_files.write().insert(
+            dispatcher.captured_file_table().write_open_files().insert(
                 fd,
-                OpenFile::new(
+                OpenFile::from_open_description(
                     std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::File {
                         base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
                         path: PATH.into(),
@@ -5719,9 +5816,9 @@ mod tests {
             },
             payload.len() as isize
         );
-        dispatcher.io.open_files.write().insert(
+        dispatcher.captured_file_table().write_open_files().insert(
             fd,
-            OpenFile::new(
+            OpenFile::from_open_description(
                 std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::HostFile {
                     base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
                     host_fd: HostFdRef::new(host_file.into_raw_fd()),
@@ -5853,9 +5950,9 @@ mod tests {
         let dead = unsafe { libc::dup(0) };
         assert!(dead >= 0);
         assert_eq!(unsafe { libc::close(dead) }, 0);
-        dispatcher.io.open_files.write().insert(
+        dispatcher.captured_file_table().write_open_files().insert(
             34,
-            OpenFile::new(
+            OpenFile::from_open_description(
                 std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::HostFile {
                     base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
                     host_fd: HostFdRef::new(dead),
@@ -9653,13 +9750,14 @@ mod tests {
         let len = 2 * LINUX_PAGE_SIZE;
         let range = crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start + len))
             .expect("metadata range");
-        let writable_memfd =
-            std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
+        let writable_memfd = kernel_file_description(std::sync::Arc::new(
+            parking_lot::RwLock::new(OpenDescription::SyntheticFile {
                 base: OpenDescriptionBase::new(0),
                 path: "memfd:metadata-remove".into(),
                 contents: Vec::new(),
                 offset: 0,
-            }));
+            }),
+        ));
         dispatcher.record_dynamic_mapping(
             start,
             len,
@@ -9697,13 +9795,14 @@ mod tests {
         let middle = start + page;
         let whole = crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start + len))
             .expect("whole predecessor range");
-        let writable_memfd =
-            std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
+        let writable_memfd = kernel_file_description(std::sync::Arc::new(
+            parking_lot::RwLock::new(OpenDescription::SyntheticFile {
                 base: OpenDescriptionBase::new(0),
                 path: "memfd:split-predecessor".into(),
                 contents: Vec::new(),
                 offset: 0,
-            }));
+            }),
+        ));
         dispatcher.record_dynamic_mapping(
             start,
             len,
@@ -9810,13 +9909,14 @@ mod tests {
             ProcMapSharing::Private,
             "prior".to_string(),
         );
-        let writable_memfd =
-            std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
+        let writable_memfd = kernel_file_description(std::sync::Arc::new(
+            parking_lot::RwLock::new(OpenDescription::SyntheticFile {
                 base: OpenDescriptionBase::new(0),
                 path: "memfd:test".into(),
                 contents: Vec::new(),
                 offset: 0,
-            }));
+            }),
+        ));
         {
             let mut mem = dispatcher.mem.lock();
             locked_ranges_insert(&mut mem.locked_ranges, replacement);

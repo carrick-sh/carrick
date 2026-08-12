@@ -564,7 +564,7 @@ impl SyscallDispatcher {
                 msg_size: msgsize as usize,
                 max_msg: maxmsg as usize,
             };
-            let open_file = OpenFile::new(
+            let open_file = OpenFile::from_open_description(
                 std::sync::Arc::new(parking_lot::RwLock::new(description)),
                 linux_fd_flags_from_open_flags(oflag),
             );
@@ -654,7 +654,7 @@ impl SyscallDispatcher {
             // when a deliverable signal arrives (mq_timedsend01 entry 14).
             let tid = cx.tid();
             loop {
-                match mq_try_send(this, tid, &mq, prio as u32, &payload) {
+                match mq_try_send(this, cx.kernel, tid, &mq, prio as u32, &payload) {
                     Ok(true) => return Ok(DispatchOutcome::Returned { value: 0 }),
                     Ok(false) => {
                         // Full.
@@ -666,7 +666,7 @@ impl SyscallDispatcher {
                         }
                         // A deliverable signal interrupts the block (carrick does
                         // not auto-restart). It wins over the deadline.
-                        if mq_wait_interrupted(this, tid) {
+                        if mq_wait_interrupted(this, cx.kernel, tid) {
                             return Ok(DispatchOutcome::errno(LINUX_EINTR));
                         }
                         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -734,7 +734,7 @@ impl SyscallDispatcher {
                         }
                         // A deliverable signal interrupts the block (carrick does
                         // not auto-restart). It wins over the deadline.
-                        if mq_wait_interrupted(this, tid) {
+                        if mq_wait_interrupted(this, cx.kernel, tid) {
                             return Ok(DispatchOutcome::errno(LINUX_EINTR));
                         }
                         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -763,7 +763,7 @@ impl SyscallDispatcher {
                 return Ok(match mq_clear_notify(&mq, me) {
                     Ok(delivery) => {
                         if let Some(delivery) = delivery {
-                            deliver_notify(this, cx.tid(), delivery);
+                            deliver_notify(this, cx.kernel, cx.tid(), delivery);
                         }
                         DispatchOutcome::Returned { value: 0 }
                     }
@@ -912,6 +912,7 @@ fn read_queue_owner(path: &str) -> Option<u32> {
 
 fn deliver_notify(
     this: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
     tid: crate::thread::ThreadId,
     delivery: NotifyDelivery,
 ) {
@@ -924,8 +925,8 @@ fn deliver_notify(
                 value,
             );
             if pid == std::process::id() as i32 {
-                this.record_pending_siginfo(tid, signo, info);
-                this.mark_signal_pending(tid, signo);
+                this.record_pending_siginfo(context, tid, signo, info);
+                this.mark_signal_pending(context, tid, signo);
                 crate::host_signal::raise_for_self(signo);
             } else if crate::host_signal::xsig_enqueue(
                 pid,
@@ -959,8 +960,12 @@ fn deliver_notify(
 /// xsignal ring (where a `kill` from another guest process lands), and
 /// signal-core's process/thread pending (the KVM cross-process path). carrick
 /// does not auto-restart, so a deliverable pending signal -> EINTR.
-fn mq_wait_interrupted(this: &SyscallDispatcher, tid: crate::thread::ThreadId) -> bool {
-    this.has_deliverable_dispatch_pending_for_wait(tid, carrick_abi::WaitSigMask::NONE)
+fn mq_wait_interrupted(
+    this: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
+    tid: crate::thread::ThreadId,
+) -> bool {
+    this.has_deliverable_dispatch_pending_for_wait(context, tid, carrick_abi::WaitSigMask::NONE)
         || carrick_signal_core::xsig::xsig_has_unblocked_for_self(carrick_abi::SigBlockMask::NONE)
         || carrick_signal_core::has_pending_for(tid.raw())
 }
@@ -1003,6 +1008,7 @@ fn deadline_expired(deadline: Option<(i64, i64)>) -> bool {
 /// `mq_notify` registration on the empty→non-empty transition.
 fn mq_try_send(
     this: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
     tid: crate::thread::ThreadId,
     mq: &MqFd,
     prio: u32,
@@ -1067,7 +1073,7 @@ fn mq_try_send(
     // Deliver the notification AFTER releasing the lock (signal/netlink delivery
     // may re-enter fd/signal state and must never hold the file lock).
     if let Some(delivery) = notify {
-        deliver_notify(this, tid, delivery);
+        deliver_notify(this, context, tid, delivery);
     }
     Ok(true)
 }

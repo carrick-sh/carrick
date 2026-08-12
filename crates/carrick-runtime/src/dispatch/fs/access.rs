@@ -8,6 +8,7 @@ use super::*;
 impl SyscallDispatcher {
     pub(super) fn access_at(
         &self,
+        context: &crate::kernel::KernelContext,
         dirfd: u64,
         pathname: u64,
         mode: u64,
@@ -27,9 +28,9 @@ impl SyscallDispatcher {
             }
             if dirfd == LINUX_AT_FDCWD {
                 let cwd = self.captured_fs_context().cwd();
-                return Ok(self.access_resolved_path(&cwd, mode, flags));
+                return Ok(self.access_resolved_path(context, &cwd, mode, flags));
             }
-            return Ok(self.fd_access(dirfd as i32, mode));
+            return Ok(self.fd_access(context, dirfd as i32, mode));
         }
 
         if let Some(outcome) = self.fast_root_f_ok_absolute(dirfd, &path, mode, flags) {
@@ -41,7 +42,7 @@ impl SyscallDispatcher {
         }
 
         let path = self.resolve_at_path(dirfd, &path)?;
-        Ok(self.access_resolved_path(&path, mode, flags))
+        Ok(self.access_resolved_path(context, &path, mode, flags))
     }
 
     /// Trusted-dirfd sibling of [`Self::fast_root_f_ok_absolute`]: a root
@@ -121,10 +122,16 @@ impl SyscallDispatcher {
             .map(|_| DispatchOutcome::Returned { value: 0 })
     }
 
-    fn access_resolved_path(&self, path: &str, mode: u64, flags: u64) -> DispatchOutcome {
+    fn access_resolved_path(
+        &self,
+        context: &crate::kernel::KernelContext,
+        path: &str,
+        mode: u64,
+        flags: u64,
+    ) -> DispatchOutcome {
         // Synthetic /proc /sys paths bypass the rootfs/overlay
         // layered view: they have their own permission model.
-        if let Some(outcome) = self.synthetic_access(path, mode) {
+        if let Some(outcome) = self.synthetic_access(context, path, mode) {
             return outcome;
         }
         // VFS mounts (e.g. /dev/shm BindVfs) own their lookup — consult them
@@ -350,17 +357,23 @@ impl SyscallDispatcher {
         None
     }
 
-    fn fd_access(&self, fd: i32, mode: u64) -> DispatchOutcome {
+    fn fd_access(
+        &self,
+        context: &crate::kernel::KernelContext,
+        fd: i32,
+        mode: u64,
+    ) -> DispatchOutcome {
         let Some(open_file) = self.open_file(fd) else {
             return DispatchOutcome::errno(LINUX_EBADF);
         };
         let open = open_file.description.read();
         match &*open {
+            OpenDescription::Closed { .. } => DispatchOutcome::errno(LINUX_EBADF),
             OpenDescription::File { metadata, .. }
             | OpenDescription::HostFile { metadata, .. }
             | OpenDescription::Directory { metadata, .. } => access_metadata(metadata, mode),
             OpenDescription::SyntheticFile { path, .. } => self
-                .synthetic_access(path, mode)
+                .synthetic_access(context, path, mode)
                 .unwrap_or(DispatchOutcome::errno(LINUX_ENOENT)),
             OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
@@ -377,8 +390,13 @@ impl SyscallDispatcher {
         }
     }
 
-    fn synthetic_access(&self, path: &str, mode: u64) -> Option<DispatchOutcome> {
-        if !crate::vfs::is_synthetic_virtual_file(path, &self.synthetic_proc_context()) {
+    fn synthetic_access(
+        &self,
+        context: &crate::kernel::KernelContext,
+        path: &str,
+        mode: u64,
+    ) -> Option<DispatchOutcome> {
+        if !crate::vfs::is_synthetic_virtual_file(path, &self.synthetic_proc_context(context)) {
             return None;
         }
         Some(synthetic_readonly_access_for_path(path, mode))

@@ -102,10 +102,7 @@ fn build_itimerspec_ns(spec: TimerSpecNs) -> LinuxItimerspec {
 
 impl SyscallDispatcher {
     pub(crate) fn effective_resource_limit(&self, resource: u64) -> LinuxRlimit {
-        let nofile_soft = self
-            .io
-            .nofile_soft
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let nofile_soft = self.captured_file_table().nofile_soft();
         effective_rlimit(resource, nofile_soft, &self.proc.lock().rlimit_overrides)
     }
 
@@ -126,12 +123,7 @@ impl SyscallDispatcher {
     ) -> Result<RlimitCpuChildRearm, std::io::Error> {
         let inherited = self.proc.lock().rlimit_overrides[LINUX_RLIMIT_CPU as usize];
         let limit = inherited.unwrap_or_else(|| {
-            rlimit_for_resource(
-                LINUX_RLIMIT_CPU,
-                self.io
-                    .nofile_soft
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            )
+            rlimit_for_resource(LINUX_RLIMIT_CPU, self.captured_file_table().nofile_soft())
         });
         arm_rlimit_cpu(limit, self.async_signal_wake_owner())
     }
@@ -800,7 +792,7 @@ impl SyscallDispatcher {
             if resource >= LINUX_RLIM_NLIMITS {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let nofile_soft = this.io.nofile_soft.load(std::sync::atomic::Ordering::Relaxed);
+            let nofile_soft = this.captured_file_table().nofile_soft();
             let limit = effective_rlimit(resource, nofile_soft, &this.proc.lock().rlimit_overrides);
             let memory = &mut *cx.memory;
             if rlimit.0 != 0 && write_kernel_struct_raw(memory, rlimit.0, &limit).is_err() {
@@ -844,7 +836,7 @@ impl SyscallDispatcher {
             if resource >= LINUX_RLIM_NLIMITS {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let nofile_soft = this.io.nofile_soft.load(std::sync::atomic::Ordering::Relaxed);
+            let nofile_soft = this.captured_file_table().nofile_soft();
             // The old (current) limit is reported BEFORE the new one is applied.
             let old = effective_rlimit(resource, nofile_soft, &this.proc.lock().rlimit_overrides);
             if old_limit.0 != 0 && write_kernel_struct_raw(memory, old_limit.0, &old).is_err() {
@@ -893,9 +885,7 @@ impl SyscallDispatcher {
                     // (first_free_fd) and dup3's range check read this. RLIM_
                     // INFINITY soft is clamped to the hard cap.
                     let soft = rlim_cur.min(1024 * 1024);
-                    this.io
-                        .nofile_soft
-                        .store(soft, std::sync::atomic::Ordering::Relaxed);
+                    this.captured_file_table().set_nofile_soft(soft);
                     // Back the guest's fd soft limit with real host descriptors.
                     // Host-backed opens (regular files, /dev/null and other char
                     // devices, sockets, pipes) each consume a native_run fd, so a

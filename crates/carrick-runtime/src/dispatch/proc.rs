@@ -1210,7 +1210,7 @@ impl SyscallDispatcher {
 
     fn remove_pidfd(&self, fd: i32) -> bool {
         self.detach_fd_from_epolls(fd);
-        let removed = self.io.open_files.write().remove(&fd);
+        let removed = self.captured_file_table().write_open_files().remove(&fd);
         if let Some(open_file) = removed {
             self.close_open_file_and_free_pty(&open_file);
             self.note_fd_closed(fd);
@@ -2804,7 +2804,7 @@ impl SyscallDispatcher {
                             return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
                         }
                         let tid = Self::ctx_tid(cx);
-                        let non_interrupting = this.non_interrupting_signal_mask(tid);
+                        let non_interrupting = this.non_interrupting_signal_mask(cx.kernel, tid);
                         return Ok(DispatchOutcome::WaitOnHvpatchChild {
                             target,
                             sig_mask: carrick_abi::WaitSigMask::Additive(non_interrupting),
@@ -2927,7 +2927,7 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
                     }
                     let tid = Self::ctx_tid(cx);
-                    let non_interrupting = this.non_interrupting_signal_mask(tid);
+                    let non_interrupting = this.non_interrupting_signal_mask(cx.kernel, tid);
                     let sig_mask = carrick_abi::WaitSigMask::Additive(non_interrupting);
                     return Ok(if options.intersects(
                         LinuxWaitOptions::WSTOPPED | LinuxWaitOptions::WCONTINUED,
@@ -3033,7 +3033,7 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
                     };
                     let tid = Self::ctx_tid(cx);
-                    let non_interrupting = this.non_interrupting_signal_mask(tid);
+                    let non_interrupting = this.non_interrupting_signal_mask(cx.kernel, tid);
                     let sig_mask = carrick_abi::WaitSigMask::Additive(non_interrupting);
                     return Ok(if options.intersects(
                         LinuxWaitOptions::WSTOPPED | LinuxWaitOptions::WCONTINUED,
@@ -3055,7 +3055,7 @@ impl SyscallDispatcher {
                     // Park on the HOST pid (host_id), not the guest ns-pid —
                     // WaitOnProcExit watches the real host process (§5.3).
                     let tid = Self::ctx_tid(cx);
-                    let non_interrupting = this.non_interrupting_signal_mask(tid);
+                    let non_interrupting = this.non_interrupting_signal_mask(cx.kernel, tid);
                     return Ok(DispatchOutcome::WaitOnProcExit {
                         pid: host_id as i32,
                         sig_mask: carrick_abi::WaitSigMask::Additive(non_interrupting),
@@ -3191,7 +3191,7 @@ impl SyscallDispatcher {
                             return Ok(DispatchOutcome::Returned { value: 0 });
                         }
                         let tid = Self::ctx_tid(cx);
-                        let non_interrupting = this.non_interrupting_signal_mask(tid);
+                        let non_interrupting = this.non_interrupting_signal_mask(cx.kernel, tid);
                         return Ok(DispatchOutcome::WaitOnHvpatchChild {
                             target,
                             sig_mask: carrick_abi::WaitSigMask::Additive(non_interrupting),
@@ -3341,7 +3341,7 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
                     let tid = Self::ctx_tid(cx);
-                    let non_interrupting = this.non_interrupting_signal_mask(tid);
+                    let non_interrupting = this.non_interrupting_signal_mask(cx.kernel, tid);
                     let sig_mask = carrick_abi::WaitSigMask::Additive(non_interrupting);
                     return Ok(if options.intersects(
                         LinuxWaitOptions::WUNTRACED | LinuxWaitOptions::WCONTINUED,
@@ -3413,7 +3413,7 @@ impl SyscallDispatcher {
                         // multi-child reap. A real handler still interrupts
                         // (then SA_RESTART restarts wait4).
                         let tid = Self::ctx_tid(cx);
-                        let non_interrupting = this.non_interrupting_signal_mask(tid);
+                        let non_interrupting = this.non_interrupting_signal_mask(cx.kernel, tid);
                         let Some(wait_pid) = wait_proc_exit_pid() else {
                             return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
                         };
@@ -3478,7 +3478,7 @@ impl SyscallDispatcher {
                         // reapable record) — drain it now so the signal is
                         // pending before this wait4 completes, not whenever the
                         // async nudge lands.
-                        this.drain_xsignals_process_directed();
+                        this.drain_xsignals_process_directed(cx.kernel);
                         // Adopted reap: this process was never the host parent,
                         // so there is no host rusage — the published channel is
                         // the only source under every provider.
@@ -3519,7 +3519,7 @@ impl SyscallDispatcher {
                         && let Some(crate::guest_cpu::AdoptedChildWait::Pending(pid)) = adopted
                     {
                         let tid = Self::ctx_tid(cx);
-                        let non_interrupting = this.non_interrupting_signal_mask(tid);
+                        let non_interrupting = this.non_interrupting_signal_mask(cx.kernel, tid);
                         return Ok(DispatchOutcome::WaitOnProcExit {
                             pid: pid as i32,
                             sig_mask: carrick_abi::WaitSigMask::Additive(non_interrupting),
@@ -3556,7 +3556,7 @@ impl SyscallDispatcher {
             }
             if result == 0 {
                 let tid = Self::ctx_tid(cx);
-                let non_interrupting = this.non_interrupting_signal_mask(tid);
+                let non_interrupting = this.non_interrupting_signal_mask(cx.kernel, tid);
                 let Some(wait_pid) = wait_proc_exit_pid() else {
                     return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
                 };
@@ -3648,7 +3648,7 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
                 let tid = Self::ctx_tid(cx);
-                let non_interrupting = this.non_interrupting_signal_mask(tid);
+                let non_interrupting = this.non_interrupting_signal_mask(cx.kernel, tid);
                 return Ok(DispatchOutcome::WaitOnProcExit {
                     pid: host_target,
                     sig_mask: carrick_abi::WaitSigMask::Additive(non_interrupting),
