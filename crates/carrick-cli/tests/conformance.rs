@@ -2810,6 +2810,15 @@ fn probe_campaign_dir(target: &str, exec_backend: Option<&str>) -> PathBuf {
 /// under the injection transport it would fork/exec ITSELF at `/tmp/p`.
 const PROBE_HELPERS: &[&str] = &["probeinit"];
 
+/// Raw `clone(CLONE_FILES)` is blocked by Docker's default seccomp profile.
+/// These probes intentionally exercise that Linux contract, so both Carrick
+/// and the Docker oracle must run them without the container policy.
+const UNCONFINED_PROBES: &[&str] = &["clonefileshare", "clonefilesexec"];
+
+fn probe_needs_unconfined(name: &str) -> bool {
+    UNCONFINED_PROBES.contains(&name)
+}
+
 fn probe_source_names() -> BTreeSet<String> {
     let src_dir = repo_path("conformance-probes/src/bin");
     let Ok(entries) = std::fs::read_dir(src_dir) else {
@@ -2878,7 +2887,24 @@ fn run_carrick_probe_with_deadline(
     stdin_bytes: &[u8],
     deadline: Duration,
 ) -> String {
-    run_carrick_probe_with_backend_env(bin, lane, stdin_bytes, deadline, None)
+    run_carrick_probe_with_policy(bin, lane, stdin_bytes, deadline, None, false)
+}
+
+fn run_carrick_probe_with_deadline_named(
+    bin: &PathBuf,
+    lane: Lane,
+    stdin_bytes: &[u8],
+    deadline: Duration,
+    name: &str,
+) -> String {
+    run_carrick_probe_with_policy(
+        bin,
+        lane,
+        stdin_bytes,
+        deadline,
+        None,
+        probe_needs_unconfined(name),
+    )
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2890,36 +2916,31 @@ fn run_carrick_probe_with_backend(
     exec_backend: &'static str,
     native_page_profile: &'static str,
 ) -> String {
-    run_carrick_probe_with_backend_env(
+    run_carrick_probe_with_policy(
         bin,
         lane,
         stdin_bytes,
         deadline,
         Some((exec_backend, native_page_profile)),
+        false,
     )
 }
 
-fn run_carrick_probe_with_backend_env(
+fn run_carrick_probe_with_policy(
     bin: &PathBuf,
     lane: Lane,
     stdin_bytes: &[u8],
     deadline: Duration,
     backend_env: Option<(&'static str, &'static str)>,
+    unconfined: bool,
 ) -> String {
     let mut command = Command::new(bin);
+    command.args(["run", "--platform", lane.platform, "--raw", "--fs", "host"]);
+    if unconfined {
+        command.args(["--security-opt", "seccomp=unconfined"]);
+    }
     command
-        .args([
-            "run",
-            "--platform",
-            lane.platform,
-            "--raw",
-            "--fs",
-            "host",
-            lane.image,
-            "/bin/sh",
-            "-c",
-            PROBE_SNIPPET,
-        ])
+        .args([lane.image, "/bin/sh", "-c", PROBE_SNIPPET])
         .env(
             "CARRICK_ACCEPT_ROSETTA_TERMS",
             if lane.platform == "linux/amd64" {
@@ -2943,8 +2964,21 @@ fn run_carrick_probe_with_backend_env(
 /// child (`pidnsroot` reads getppid()==1). Executing the probe directly as
 /// the container command made it ns-pid 1 itself — a topology no injection
 /// oracle ever exhibits.
-fn run_carrick_bound_probe(bin: &PathBuf, lane: Lane, probe: &Path, deadline: Duration) -> String {
-    run_carrick_bound_probe_with_backend_env(bin, lane, probe, deadline, None)
+fn run_carrick_bound_probe_named(
+    bin: &PathBuf,
+    lane: Lane,
+    probe: &Path,
+    deadline: Duration,
+    name: &str,
+) -> String {
+    run_carrick_bound_probe_with_policy(
+        bin,
+        lane,
+        probe,
+        deadline,
+        None,
+        probe_needs_unconfined(name),
+    )
 }
 
 fn run_carrick_bound_probe_with_backend_env(
@@ -2953,6 +2987,17 @@ fn run_carrick_bound_probe_with_backend_env(
     probe: &Path,
     deadline: Duration,
     backend_env: Option<(&'static str, &'static str)>,
+) -> String {
+    run_carrick_bound_probe_with_policy(bin, lane, probe, deadline, backend_env, false)
+}
+
+fn run_carrick_bound_probe_with_policy(
+    bin: &PathBuf,
+    lane: Lane,
+    probe: &Path,
+    deadline: Duration,
+    backend_env: Option<(&'static str, &'static str)>,
+    unconfined: bool,
 ) -> String {
     let init = probe
         .parent()
@@ -2978,7 +3023,11 @@ fn run_carrick_bound_probe_with_backend_env(
         ])
         .arg(probe_volume)
         .arg("--volume")
-        .arg(init_volume)
+        .arg(init_volume);
+    if unconfined {
+        command.args(["--security-opt", "seccomp=unconfined"]);
+    }
+    command
         .arg(lane.image)
         .arg("/tmp/carrick-init")
         .env("CARRICK_ACCEPT_ROSETTA_TERMS", "0");
@@ -3261,19 +3310,26 @@ fn run_native_run_elf_with_run_id(
 /// than bollard because bollard stdin-attach is awkward; the shell-case path
 /// keeps using `run_docker` (bollard) unchanged.
 fn run_docker_probe(lane: Lane, stdin_bytes: &[u8]) -> std::io::Result<String> {
+    run_docker_probe_with_policy(lane, stdin_bytes, false)
+}
+
+fn run_docker_probe_named(lane: Lane, name: &str, stdin_bytes: &[u8]) -> std::io::Result<String> {
+    run_docker_probe_with_policy(lane, stdin_bytes, probe_needs_unconfined(name))
+}
+
+fn run_docker_probe_with_policy(
+    lane: Lane,
+    stdin_bytes: &[u8],
+    unconfined: bool,
+) -> std::io::Result<String> {
     use std::io::Write;
-    let mut child = Command::new("docker")
-        .args([
-            "run",
-            "-i",
-            "--rm",
-            "--platform",
-            lane.platform,
-            lane.image,
-            "/bin/sh",
-            "-c",
-            PROBE_SNIPPET,
-        ])
+    let mut command = Command::new("docker");
+    command.args(["run", "-i", "--rm", "--platform", lane.platform]);
+    if unconfined {
+        command.args(["--security-opt", "seccomp=unconfined"]);
+    }
+    let mut child = command
+        .args([lane.image, "/bin/sh", "-c", PROBE_SNIPPET])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -3449,11 +3505,13 @@ fn run_one_probe(
     };
     let carrick_out = match transport {
         ProbeTransport::ContainerInjection => {
-            run_carrick_probe_with_deadline(bin, lane, &encoded, deadline)
+            run_carrick_probe_with_deadline_named(bin, lane, &encoded, deadline, &name)
         }
-        ProbeTransport::DirectElf => run_carrick_bound_probe(bin, lane, probe, deadline),
+        ProbeTransport::DirectElf => {
+            run_carrick_bound_probe_named(bin, lane, probe, deadline, &name)
+        }
     };
-    let docker_out = run_docker_probe(lane, &encoded);
+    let docker_out = run_docker_probe_named(lane, &name, &encoded);
     classify_probe(name, lane.label, &carrick_out, docker_out)
 }
 
@@ -3781,10 +3839,20 @@ fn conformance_probes() {
             // Phase 1 — carrick only.
             let carrick_outs: Vec<Option<String>> = fan_out_indexed(jobs.len(), n_workers, |i| {
                 jobs[i].1.as_ref().ok().map(|enc| match transport {
-                    ProbeTransport::ContainerInjection => run_carrick_probe(&bin, *lane, enc),
-                    ProbeTransport::DirectElf => {
-                        run_carrick_bound_probe(&bin, *lane, &parallel[i], CASE_DEADLINE)
-                    }
+                    ProbeTransport::ContainerInjection => run_carrick_probe_with_deadline_named(
+                        &bin,
+                        *lane,
+                        enc,
+                        CASE_DEADLINE,
+                        &jobs[i].0,
+                    ),
+                    ProbeTransport::DirectElf => run_carrick_bound_probe_named(
+                        &bin,
+                        *lane,
+                        &parallel[i],
+                        CASE_DEADLINE,
+                        &jobs[i].0,
+                    ),
                 })
             });
             // Phase 2 — oracle, strictly after phase 1 (carrick and Docker never
@@ -3797,7 +3865,7 @@ fn conformance_probes() {
                         if let Some(cached) = cached_probe_oracle(lane.label, set.libc, name) {
                             OracleSource::Cached(cached)
                         } else if docker_available {
-                            OracleSource::Live(run_docker_probe(*lane, enc))
+                            OracleSource::Live(run_docker_probe_named(*lane, name, enc))
                         } else {
                             OracleSource::Unblessed
                         }
@@ -4636,7 +4704,7 @@ fn bless_probe_oracle() {
                     continue;
                 };
                 let encoded = engine.encode(&raw).into_bytes();
-                match run_docker_probe(*lane, &encoded) {
+                match run_docker_probe_named(*lane, &name, &encoded) {
                     Ok(out) => {
                         write_probe_oracle(lane.label, set.libc, &name, &out)
                             .expect("write probe oracle");
@@ -4766,6 +4834,14 @@ fn native_probe_campaign_uses_pie_artifacts() {
         probe_campaign_dir("aarch64-unknown-linux-musl", None)
             .ends_with("conformance-probes/target/aarch64-unknown-linux-musl/release")
     );
+}
+
+#[test]
+fn clone_files_probes_run_without_container_seccomp() {
+    assert!(probe_needs_unconfined("clonefileshare"));
+    assert!(probe_needs_unconfined("clonefilesexec"));
+    assert!(!probe_needs_unconfined("forkfiletable"));
+    assert!(!probe_needs_unconfined("forksplicestage"));
 }
 
 #[test]
