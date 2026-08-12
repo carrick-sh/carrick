@@ -20,6 +20,7 @@ Create one `FileAuthorityCore` per Carrick run.
 - Native and VMM host-process callers use versioned typed IPC to the same core.
 - The core exclusively owns every `FileTable`, reachable `FileDescription`,
   mutable open-description state, epoll subordinate state, splice stream state,
+  writable in-memory VFS object/content identity and namespace mutations,
   stable ID allocator, logical slot references, and revisions.
 - The process resource-limit domain remains outside FileAuthority:
   `RLIMIT_NOFILE` follows process fork/exec semantics, not `CLONE_FILES` table
@@ -52,6 +53,14 @@ IDs. mmap, io_uring, waits, signal cancellation, and guest-memory publication
 cross file, MM, thread, and signal domains. Nested guest-memory callbacks move
 rather than reduce the typed protocol and introduce partial-commit ambiguity.
 
+Pathname parsing, credential/capability decisions, exact-context selection, and
+guest-memory work stay in the client. The authority nevertheless owns the
+canonical mutable `--fs memory` VFS objects and applies typed lookup/create/
+link/unlink/rename/metadata/content transactions. Leaving the writable overlay
+inside process-local `FsState` would preserve fd sharing while parent and child
+reopen different fork-local namespace copies, which is another authority and
+is forbidden.
+
 ### Permanent client capabilities
 
 An fd received through `SCM_RIGHTS` is not semantic authority. Permanent
@@ -70,6 +79,8 @@ FileAuthorityCore
   ├─ tables: FileTableId -> FileTableState
   ├─ descriptions: FileDescriptionId -> FileDescriptionState
   ├─ streams: PipeId -> PipeStreamState
+  ├─ vfs_objects: VfsObjectId -> VfsObjectState
+  ├─ vfs_namespace: canonical path/link/tombstone index
   ├─ mmap_leases: MappingLeaseId -> MappingLease
   ├─ clients: (HostPid, ProcessGeneration) -> ClientState
   ├─ dedup: (ClientId, RequestId) -> TerminalResponse
@@ -97,6 +108,7 @@ payloads contain values and typed IDs only.
 | I/O attempt | Byte/value input produces `Complete`, `WouldBlock(WaitToken)`, or `Retry`; guest pointers never cross the boundary. |
 | epoll | Create, ctl, collect readiness, acknowledge delivery, and close cleanup as multi-description transactions. |
 | Stream transfer | Read/readv/splice/tee/sendfile consume one `PipeStreamState` keyed by stable `PipeId`, with exact partial-commit results. |
+| VFS objects | Typed lookup, create, link, unlink, rename, truncate, metadata/xattr, directory enumeration, and bounded content operations over canonical `VfsObjectId`s. Clients supply already-decided credentials/policy inputs; the authority returns values and revisions, never guest pointers. |
 | mmap | Resolve and pin a mapping source; return one `SCM_RIGHTS` capability plus lease ID; commit or abort against the caller's exact MM transaction. |
 | io_uring | Own backing/layout/SQ-CQ state; parse guest data in the client; execute typed fd operations; publish CQ outside authority locks. |
 | Lifecycle | Fork-copy table, share table, exec-unshare/CLOEXEC, drain generation, client exit, snapshot, restore, and native reexec adoption. |
@@ -116,7 +128,8 @@ Canonical order:
 2. tables by ascending `FileTableId`;
 3. descriptions by ascending `FileDescriptionId`;
 4. streams by ascending `PipeId`;
-5. lease and dedup ledgers.
+5. VFS objects by ascending `VfsObjectId` after the namespace index;
+6. lease and dedup ledgers.
 
 Never hold authority locks across guest-memory access, host waits, signal
 wake/cancellation, backend mapping work, registry operations, or IPC send.
@@ -218,7 +231,10 @@ native-reexec capsule; they are not serialized with the file table. Child task
 publication waits for authority binding acknowledgement.
 
 Move splice pushback to `PipeStreamState`. Route ordinary read/readv and every
-splice/tee/sendfile consumer through it.
+splice/tee/sendfile consumer through it. Move the writable `--fs memory`
+namespace and file contents out of process-local `FsState`; immutable OCI
+rootfs and pathname policy may remain client-side, but every mutable object and
+namespace commit resolves through the authority.
 
 ### Wave 5 — deletion and enablement
 
@@ -229,6 +245,7 @@ Delete:
 - guard-returning table and description APIs;
 - descendant-local shared-object ID allocation;
 - per-table splice pushback;
+- process-local writable in-memory overlay objects/namespace state;
 - backend host-fork table copies and local epoll/synthetic mutable mirrors.
 
 The new authority is always on. There is no opt-in flag or compatibility path.
@@ -269,7 +286,7 @@ The FileAuthority cutover is complete only when:
 - one run has one mutable file authority in every backend;
 - all sharing, fork, exec, offset, flag, CLOEXEC, epoll, splice, mmap, and
   io_uring differentials match Linux;
-- snapshots join table, description, stream, and lease revisions coherently;
+- snapshots join table, description, stream, VFS-object/namespace, and lease revisions coherently;
 - authority/client death tests prove bounded failure without loss or replay;
 - direct and IPC model tests are identical;
 - signed HVPatch, native, and VMM demonstrations pass;
