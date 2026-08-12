@@ -31,6 +31,7 @@ nonzero_domain!(ClientId, for_process_client);
 nonzero_domain!(RequestId, from_client_sequence);
 nonzero_domain!(VfsObjectId, from_snapshot);
 nonzero_domain!(CapabilityLeaseId, from_snapshot);
+nonzero_domain!(PipeId, from_snapshot);
 
 impl VfsObjectId {
     pub(super) const fn from_authority_allocation(raw: NonZeroU64) -> Self {
@@ -39,6 +40,12 @@ impl VfsObjectId {
 }
 
 impl CapabilityLeaseId {
+    pub(super) const fn from_authority_allocation(raw: NonZeroU64) -> Self {
+        Self(raw)
+    }
+}
+
+impl PipeId {
     pub(super) const fn from_authority_allocation(raw: NonZeroU64) -> Self {
         Self(raw)
     }
@@ -326,6 +333,31 @@ impl EpollEventLimit {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PipeEnd {
+    Reader,
+    Writer,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub(crate) struct PipeCapacity(u32);
+
+impl PipeCapacity {
+    pub(crate) const MAX: u32 = 1024 * 1024;
+
+    pub(crate) fn bounded(raw: u32) -> Result<Self, AuthorityError> {
+        if raw == 0 || raw > Self::MAX {
+            return Err(AuthorityError::InvalidPipeCapacity);
+        }
+        Ok(Self(raw))
+    }
+
+    pub(crate) const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SameSlotBehavior {
     ReturnUnchanged,
     Reject,
@@ -404,6 +436,19 @@ pub(crate) enum Command {
     RegisterClient,
     ExitClient,
     CreateTable,
+    CreatePipeAndInstall {
+        table: FileTableId,
+        minimum: FileSlotNumber,
+        ceiling: NofileAllocationCeiling,
+        descriptor_flags: DescriptorFlags,
+        status_flags: StatusFlags,
+        capacity: PipeCapacity,
+    },
+    SetPipeCapacity {
+        table: FileTableId,
+        fd: FileSlotNumber,
+        capacity: PipeCapacity,
+    },
     CreateEpollAndInstall {
         table: FileTableId,
         minimum: FileSlotNumber,
@@ -630,6 +675,22 @@ pub(crate) enum Outcome {
         generation: ObjectGeneration,
         revision: Revision,
     },
+    PipeCreated {
+        table: FileTableId,
+        pipe: PipeId,
+        read_fd: FileSlotNumber,
+        write_fd: FileSlotNumber,
+        read_description: FileDescriptionId,
+        write_description: FileDescriptionId,
+        generation: ObjectGeneration,
+        table_revision: Revision,
+        stream_revision: Revision,
+    },
+    PipeCapacitySet {
+        pipe: PipeId,
+        capacity: PipeCapacity,
+        stream_revision: Revision,
+    },
     EpollCreated {
         table: FileTableId,
         fd: FileSlotNumber,
@@ -732,6 +793,18 @@ pub(crate) enum Outcome {
         counter: u64,
         description_revision: Revision,
     },
+    StreamBytes {
+        pipe: PipeId,
+        bytes: Vec<u8>,
+        description_revision: Revision,
+        stream_revision: Revision,
+    },
+    StreamWritten {
+        pipe: PipeId,
+        count: ByteCount,
+        description_revision: Revision,
+        stream_revision: Revision,
+    },
     Bytes {
         bytes: Vec<u8>,
         offset: FileOffset,
@@ -821,6 +894,7 @@ pub(crate) enum DescriptionBackingSnapshot {
     HostFile { writable: bool },
     Epoll { interests: u32 },
     EventCounter { counter: u64, semaphore: bool },
+    PipeEnd { pipe: PipeId, end: PipeEnd },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -906,6 +980,14 @@ pub(crate) enum AuthorityError {
     InvalidEventCounterValue,
     #[error("description requires a different typed operation family")]
     WrongOperationFamily,
+    #[error("description is not a pipe end")]
+    NotPipe,
+    #[error("pipe capacity is zero or exceeds its protocol bound")]
+    InvalidPipeCapacity,
+    #[error("pipe has no readers")]
+    BrokenPipe,
+    #[error("file descriptor table has no room for an atomic pair")]
+    PairAllocationFailed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]

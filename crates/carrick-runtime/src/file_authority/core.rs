@@ -8,14 +8,16 @@ use crate::kernel::ObjectIdRegistry;
 
 use super::backing::AuthorityBacking;
 use super::epoll::{EpollState, ReadinessSnapshot};
+use super::stream::PipeStreamState;
 use super::types::{
     AccessMode, AuthorityCall, AuthorityEpoch, AuthorityError, AuthorityFatal, AuthorityReply,
     ByteCount, CanonicalPath, CapabilityLeaseDisposition, CapabilityLeaseId,
     CapabilityLeasePurpose, ClientId, ClientIdentity, Command, DescriptionSnapshot,
     DescriptorFlags, EpollEventLimit, EpollInterestKey, EpollRegistration, FileDescriptionId,
     FileOffset, FileSlotNumber, FileTableId, InterestGeneration, NofileAllocationCeiling,
-    ObjectGeneration, Outcome, Request, Response, Revision, SameSlotBehavior, SeekWhence,
-    SlotPageLimit, SlotRangeAction, SlotSnapshot, StatusFlags, VfsObjectId,
+    ObjectGeneration, Outcome, PipeCapacity, PipeEnd, PipeId, Request, Response, Revision,
+    SameSlotBehavior, SeekWhence, SlotPageLimit, SlotRangeAction, SlotSnapshot, StatusFlags,
+    VfsObjectId,
 };
 
 pub(super) const MAX_TERMINAL_DEDUP_ENTRIES: usize = 8_192;
@@ -116,6 +118,7 @@ pub(crate) struct FileAuthorityCore {
     next_vfs_object: u64,
     next_capability_lease: u64,
     next_interest_generation: u32,
+    next_pipe: u64,
     revision: Revision,
     namespace_revision: Revision,
     clients: HashMap<ClientId, ClientIdentity>,
@@ -125,6 +128,8 @@ pub(crate) struct FileAuthorityCore {
     vfs_objects: BTreeMap<VfsObjectId, VfsObjectState>,
     capability_leases: BTreeMap<CapabilityLeaseId, CapabilityLeaseState>,
     epoll_watchers: BTreeMap<FileDescriptionId, BTreeSet<(FileDescriptionId, EpollInterestKey)>>,
+    streams: BTreeMap<PipeId, PipeStreamState>,
+    stream_revisions: BTreeMap<PipeId, Revision>,
     // Each authenticated client may have exactly one outstanding request. A
     // later request from that client therefore acknowledges the prior terminal
     // response and replaces this entry; a same-id retry replays it verbatim.
@@ -139,6 +144,7 @@ impl FileAuthorityCore {
             next_vfs_object: 1,
             next_capability_lease: 1,
             next_interest_generation: 1,
+            next_pipe: 1,
             revision: Revision::ZERO,
             namespace_revision: Revision::ZERO,
             clients: HashMap::new(),
@@ -148,6 +154,8 @@ impl FileAuthorityCore {
             vfs_objects: BTreeMap::new(),
             capability_leases: BTreeMap::new(),
             epoll_watchers: BTreeMap::new(),
+            streams: BTreeMap::new(),
+            stream_revisions: BTreeMap::new(),
             dedup: HashMap::new(),
         }
     }
@@ -308,6 +316,34 @@ impl FileAuthorityCore {
                     Command::RegisterClient => unreachable!(),
                     Command::ExitClient => self.exit_client(request.client),
                     Command::CreateTable => self.create_table(request.client),
+                    Command::CreatePipeAndInstall {
+                        table,
+                        minimum,
+                        ceiling,
+                        descriptor_flags,
+                        status_flags,
+                        capacity,
+                    } => self.create_pipe_and_install(
+                        request.client,
+                        *table,
+                        request.expected_generation,
+                        *minimum,
+                        *ceiling,
+                        *descriptor_flags,
+                        *status_flags,
+                        *capacity,
+                    ),
+                    Command::SetPipeCapacity {
+                        table,
+                        fd,
+                        capacity,
+                    } => self.set_pipe_capacity(
+                        request.client,
+                        *table,
+                        request.expected_generation,
+                        *fd,
+                        *capacity,
+                    ),
                     Command::CreateEpollAndInstall {
                         table,
                         minimum,
@@ -733,6 +769,106 @@ impl FileAuthorityCore {
             table,
             generation: ObjectGeneration::INITIAL,
             revision,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_pipe_and_install(
+        &mut self,
+        client: ClientIdentity,
+        table: FileTableId,
+        table_generation: ObjectGeneration,
+        minimum: FileSlotNumber,
+        ceiling: NofileAllocationCeiling,
+        descriptor_flags: DescriptorFlags,
+        status_flags: StatusFlags,
+        capacity: PipeCapacity,
+    ) -> Result<Outcome, AuthorityError> {
+        self.require_bound_table(client, table, table_generation)?;
+        let (read_fd, write_fd) = self.allocate_pair(table, minimum, ceiling)?;
+        let pipe = self.allocate_pipe();
+        let read_description = self.allocate_description();
+        let write_description = self.allocate_description();
+        let revision = self.publish_mutation();
+        self.streams.insert(pipe, PipeStreamState::new(capacity));
+        self.stream_revisions.insert(pipe, revision);
+        for (description, end, access_mode) in [
+            (read_description, PipeEnd::Reader, AccessMode::ReadOnly),
+            (write_description, PipeEnd::Writer, AccessMode::WriteOnly),
+        ] {
+            self.descriptions.insert(
+                description,
+                FileDescriptionState {
+                    generation: ObjectGeneration::INITIAL,
+                    revision,
+                    logical_slot_refs: 1,
+                    capability_lease_refs: 0,
+                    offset: FileOffset::default(),
+                    access_mode,
+                    status_flags,
+                    readiness: self.pipe_readiness(pipe, end),
+                    backing: AuthorityBacking::PipeEnd { pipe, end },
+                },
+            );
+        }
+        let table_state = self.tables.get_mut(&table).unwrap_or_else(|| {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "pipe creation lost its validated file table",
+            ))
+        });
+        for (fd, description) in [(read_fd, read_description), (write_fd, write_description)] {
+            table_state.slots.insert(
+                fd,
+                FileSlotState {
+                    description,
+                    description_generation: ObjectGeneration::INITIAL,
+                    flags: descriptor_flags,
+                    path: None,
+                },
+            );
+        }
+        table_state.revision = revision;
+        Ok(Outcome::PipeCreated {
+            table,
+            pipe,
+            read_fd,
+            write_fd,
+            read_description,
+            write_description,
+            generation: ObjectGeneration::INITIAL,
+            table_revision: revision,
+            stream_revision: revision,
+        })
+    }
+
+    fn set_pipe_capacity(
+        &mut self,
+        client: ClientIdentity,
+        table: FileTableId,
+        expected: ObjectGeneration,
+        fd: FileSlotNumber,
+        capacity: PipeCapacity,
+    ) -> Result<Outcome, AuthorityError> {
+        let (pipe, _) = self.pipe_for_slot(client, table, expected, fd)?;
+        self.streams
+            .get(&pipe)
+            .ok_or(AuthorityError::NotPipe)?
+            .capacity();
+        let mut prepared = self.streams.remove(&pipe).unwrap_or_else(|| {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "pipe capacity mutation lost its stream",
+            ))
+        });
+        let result = prepared.set_capacity(capacity);
+        self.streams.insert(pipe, prepared);
+        result?;
+        let revision = self.publish_mutation();
+        self.stream_revisions.insert(pipe, revision);
+        self.refresh_pipe_descriptions(pipe, revision);
+        Ok(Outcome::PipeCapacitySet {
+            pipe,
+            capacity,
+            stream_revision: revision,
         })
     }
 
@@ -2047,6 +2183,132 @@ impl FileAuthorityCore {
         }
     }
 
+    fn read_pipe_description(
+        &mut self,
+        description: FileDescriptionId,
+        maximum: ByteCount,
+    ) -> Result<Outcome, AuthorityError> {
+        let (pipe, end) = self.pipe_for_description(description)?;
+        if end != PipeEnd::Reader {
+            return Err(AuthorityError::NotReadable);
+        }
+        let bytes = self
+            .streams
+            .get_mut(&pipe)
+            .ok_or(AuthorityError::NotPipe)?
+            .read(usize::try_from(maximum.raw()).map_err(|_| AuthorityError::PayloadTooLarge)?)?;
+        let revision = self.publish_mutation();
+        self.stream_revisions.insert(pipe, revision);
+        self.refresh_pipe_descriptions(pipe, revision);
+        self.acknowledge_epolls_without_publish(
+            description,
+            LinuxEpollEvents::IN,
+            self.descriptions
+                .get(&description)
+                .map_or(0, |state| state.readiness.read_available),
+            false,
+            revision,
+        );
+        Ok(Outcome::StreamBytes {
+            pipe,
+            bytes,
+            description_revision: revision,
+            stream_revision: revision,
+        })
+    }
+
+    fn write_pipe_description(
+        &mut self,
+        description: FileDescriptionId,
+        bytes: &[u8],
+    ) -> Result<Outcome, AuthorityError> {
+        self.validate_payload(bytes)?;
+        let (pipe, end) = self.pipe_for_description(description)?;
+        if end != PipeEnd::Writer {
+            return Err(AuthorityError::NotWritable);
+        }
+        let written = self
+            .streams
+            .get_mut(&pipe)
+            .ok_or(AuthorityError::NotPipe)?
+            .write(bytes)?;
+        let count = ByteCount::bounded(
+            u32::try_from(written).map_err(|_| AuthorityError::PayloadTooLarge)?,
+        )?;
+        let revision = self.publish_mutation();
+        self.stream_revisions.insert(pipe, revision);
+        self.refresh_pipe_descriptions(pipe, revision);
+        Ok(Outcome::StreamWritten {
+            pipe,
+            count,
+            description_revision: revision,
+            stream_revision: revision,
+        })
+    }
+
+    fn pipe_for_slot(
+        &self,
+        client: ClientIdentity,
+        table: FileTableId,
+        expected: ObjectGeneration,
+        fd: FileSlotNumber,
+    ) -> Result<(PipeId, PipeEnd), AuthorityError> {
+        let description = self.slot(client, table, expected, fd)?.description;
+        self.pipe_for_description(description)
+    }
+
+    fn pipe_for_description(
+        &self,
+        description: FileDescriptionId,
+    ) -> Result<(PipeId, PipeEnd), AuthorityError> {
+        let state = self
+            .descriptions
+            .get(&description)
+            .ok_or(AuthorityError::DescriptionNotFound)?;
+        match state.backing {
+            AuthorityBacking::PipeEnd { pipe, end } => Ok((pipe, end)),
+            _ => Err(AuthorityError::NotPipe),
+        }
+    }
+
+    fn pipe_readiness(&self, pipe: PipeId, end: PipeEnd) -> ReadinessSnapshot {
+        let stream = self.streams.get(&pipe).unwrap_or_else(|| {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "pipe description referenced a missing stream",
+            ))
+        });
+        ReadinessSnapshot {
+            ready: stream.readiness(end),
+            read_available: if end == PipeEnd::Reader {
+                stream.readable_bytes()
+            } else {
+                0
+            },
+        }
+    }
+
+    fn refresh_pipe_descriptions(&mut self, pipe: PipeId, revision: Revision) {
+        let updates: Vec<(FileDescriptionId, PipeEnd, ReadinessSnapshot)> = self
+            .descriptions
+            .iter()
+            .filter_map(|(description, state)| match state.backing {
+                AuthorityBacking::PipeEnd { pipe: current, end } if current == pipe => {
+                    Some((*description, end, self.pipe_readiness(pipe, end)))
+                }
+                _ => None,
+            })
+            .collect();
+        for (description, _, readiness) in updates {
+            let state = self.descriptions.get_mut(&description).unwrap_or_else(|| {
+                abort_fatal(AuthorityFatal::InvariantViolation(
+                    "pipe readiness refresh lost a description",
+                ))
+            });
+            state.readiness = readiness;
+            state.revision = revision;
+        }
+    }
+
     fn read(
         &mut self,
         client: ClientIdentity,
@@ -2062,6 +2324,9 @@ impl FileAuthorityCore {
             .ok_or(AuthorityError::DescriptionNotFound)?;
         if !description.access_mode.readable() {
             return Err(AuthorityError::NotReadable);
+        }
+        if matches!(description.backing, AuthorityBacking::PipeEnd { .. }) {
+            return self.read_pipe_description(slot.description, maximum);
         }
         let offset = description.offset;
         let start = usize::try_from(offset.raw()).map_err(|_| AuthorityError::InvalidOffset)?;
@@ -2101,7 +2366,9 @@ impl FileAuthorityCore {
                 bytes.truncate(usize::try_from(read).map_err(|_| AuthorityError::InvalidOffset)?);
                 bytes
             }
-            AuthorityBacking::Epoll(_) | AuthorityBacking::EventCounter { .. } => {
+            AuthorityBacking::Epoll(_)
+            | AuthorityBacking::EventCounter { .. }
+            | AuthorityBacking::PipeEnd { .. } => {
                 return Err(AuthorityError::WrongOperationFamily);
             }
         };
@@ -2144,6 +2411,9 @@ impl FileAuthorityCore {
         if !description.access_mode.writable() {
             return Err(AuthorityError::NotWritable);
         }
+        if matches!(description.backing, AuthorityBacking::PipeEnd { .. }) {
+            return self.write_pipe_description(slot.description, bytes);
+        }
         let start =
             usize::try_from(description.offset.raw()).map_err(|_| AuthorityError::InvalidOffset)?;
         let object = description.backing.vfs_object();
@@ -2172,7 +2442,9 @@ impl FileAuthorityCore {
                 usize::try_from(written).map_err(|_| AuthorityError::InvalidOffset)?
             }
             AuthorityBacking::Synthetic { .. } | AuthorityBacking::Vfs { .. } => bytes.len(),
-            AuthorityBacking::Epoll(_) | AuthorityBacking::EventCounter { .. } => {
+            AuthorityBacking::Epoll(_)
+            | AuthorityBacking::EventCounter { .. }
+            | AuthorityBacking::PipeEnd { .. } => {
                 return Err(AuthorityError::WrongOperationFamily);
             }
         };
@@ -2215,7 +2487,9 @@ impl FileAuthorityCore {
                 }
                 AuthorityBacking::Host { .. } => {}
                 AuthorityBacking::Vfs { .. } => unreachable!(),
-                AuthorityBacking::Epoll(_) | AuthorityBacking::EventCounter { .. } => {
+                AuthorityBacking::Epoll(_)
+                | AuthorityBacking::EventCounter { .. }
+                | AuthorityBacking::PipeEnd { .. } => {
                     abort_fatal(AuthorityFatal::InvariantViolation(
                         "generic write reached a typed-operation backing",
                     ));
@@ -2559,6 +2833,26 @@ impl FileAuthorityCore {
         self.bound_table(client, table, expected).map(|_| ())
     }
 
+    fn allocate_pair(
+        &self,
+        table: FileTableId,
+        minimum: FileSlotNumber,
+        ceiling: NofileAllocationCeiling,
+    ) -> Result<(FileSlotNumber, FileSlotNumber), AuthorityError> {
+        let first = self.allocate_lowest(table, minimum, ceiling)?;
+        let next_raw = first
+            .raw()
+            .checked_add(1)
+            .ok_or(AuthorityError::PairAllocationFailed)?;
+        let next = FileSlotNumber::for_open_fd(next_raw)
+            .map_err(|_| AuthorityError::PairAllocationFailed)?;
+        let second = self.allocate_lowest(table, next, ceiling)?;
+        if second == first {
+            return Err(AuthorityError::PairAllocationFailed);
+        }
+        Ok((first, second))
+    }
+
     fn allocate_lowest(
         &self,
         table: FileTableId,
@@ -2673,11 +2967,39 @@ impl FileAuthorityCore {
             return (false, false);
         }
         self.detach_reclaimed_description_from_epolls(description, revision);
+        let pipe_end = self
+            .descriptions
+            .get(&description)
+            .and_then(|state| match state.backing {
+                AuthorityBacking::PipeEnd { pipe, end } => Some((pipe, end)),
+                _ => None,
+            });
+        if let Some((pipe, end)) = pipe_end {
+            let stream = self.streams.get_mut(&pipe).unwrap_or_else(|| {
+                abort_fatal(AuthorityFatal::InvariantViolation(
+                    "reclaimed pipe description referenced a missing stream",
+                ))
+            });
+            stream.release(end);
+        }
         let state = self.descriptions.remove(&description).unwrap_or_else(|| {
             abort_fatal(AuthorityFatal::InvariantViolation(
                 "reclaim lost its unreferenced description",
             ))
         });
+        if let Some((pipe, _)) = pipe_end {
+            if self
+                .streams
+                .get(&pipe)
+                .is_some_and(PipeStreamState::is_unreferenced)
+            {
+                self.streams.remove(&pipe);
+                self.stream_revisions.remove(&pipe);
+            } else {
+                self.stream_revisions.insert(pipe, revision);
+                self.refresh_pipe_descriptions(pipe, revision);
+            }
+        }
         let Some(object) = state.backing.vfs_object() else {
             return (true, false);
         };
@@ -2776,9 +3098,9 @@ impl FileAuthorityCore {
                 let stat = unsafe { stat.assume_init() };
                 u64::try_from(stat.st_size).map_err(|_| AuthorityError::InvalidOffset)
             }
-            AuthorityBacking::Epoll(_) | AuthorityBacking::EventCounter { .. } => {
-                Err(AuthorityError::NotSeekable)
-            }
+            AuthorityBacking::Epoll(_)
+            | AuthorityBacking::EventCounter { .. }
+            | AuthorityBacking::PipeEnd { .. } => Err(AuthorityError::NotSeekable),
         }
     }
 
@@ -2813,6 +3135,16 @@ impl FileAuthorityCore {
         self.ids
             .file_description_id()
             .unwrap_or_else(|_| abort_fatal(AuthorityFatal::IdentityExhausted))
+    }
+
+    fn allocate_pipe(&mut self) -> PipeId {
+        let raw = NonZeroU64::new(self.next_pipe)
+            .unwrap_or_else(|| abort_fatal(AuthorityFatal::IdentityExhausted));
+        self.next_pipe = self
+            .next_pipe
+            .checked_add(1)
+            .unwrap_or_else(|| abort_fatal(AuthorityFatal::IdentityExhausted));
+        PipeId::from_authority_allocation(raw)
     }
 
     fn allocate_interest_generation(&mut self) -> InterestGeneration {
@@ -2875,7 +3207,9 @@ fn event_counter_readiness(counter: u64) -> ReadinessSnapshot {
 fn is_epollable(backing: &AuthorityBacking) -> bool {
     matches!(
         backing,
-        AuthorityBacking::Epoll(_) | AuthorityBacking::EventCounter { .. }
+        AuthorityBacking::Epoll(_)
+            | AuthorityBacking::EventCounter { .. }
+            | AuthorityBacking::PipeEnd { .. }
     )
 }
 

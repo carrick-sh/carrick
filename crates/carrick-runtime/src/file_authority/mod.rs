@@ -10,6 +10,7 @@ mod core;
 mod epoll;
 mod ipc;
 mod protocol;
+mod stream;
 mod transport;
 mod types;
 

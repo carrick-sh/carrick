@@ -9,9 +9,9 @@ use super::{
     DescriptionBackingSnapshot, DescriptionSnapshot, DescriptorFlags, EpollEventLimit,
     EpollInterestKey, EpollReadyEvent, EpollRegistration, EpollUserData, FileDescriptionId,
     FileOffset, FileSlotNumber, FileTableId, HostErrno, InterestGeneration,
-    NofileAllocationCeiling, ObjectGeneration, Outcome, Request, RequestId, Response, Revision,
-    SameSlotBehavior, SeekWhence, SlotPageLimit, SlotRangeAction, SlotSnapshot, StatusFlags,
-    VfsObjectId,
+    NofileAllocationCeiling, ObjectGeneration, Outcome, PipeCapacity, PipeEnd, PipeId, Request,
+    RequestId, Response, Revision, SameSlotBehavior, SeekWhence, SlotPageLimit, SlotRangeAction,
+    SlotSnapshot, StatusFlags, VfsObjectId,
 };
 
 const MAGIC: u32 = 0x4341_4641;
@@ -251,12 +251,38 @@ fn command_tag(command: &Command) -> u8 {
         Command::EpollAcknowledgeIo { .. } => 35,
         Command::EventCounterRead { .. } => 36,
         Command::EventCounterWrite { .. } => 37,
+        Command::CreatePipeAndInstall { .. } => 38,
+        Command::SetPipeCapacity { .. } => 39,
     }
 }
 
 fn encode_command(writer: &mut Writer, command: &Command) -> Result<(), AuthorityFatal> {
     match command {
         Command::RegisterClient | Command::ExitClient | Command::CreateTable => {}
+        Command::CreatePipeAndInstall {
+            table,
+            minimum,
+            ceiling,
+            descriptor_flags,
+            status_flags,
+            capacity,
+        } => {
+            writer.u64(table.raw());
+            writer.i32(minimum.raw());
+            writer.u32(ceiling.raw());
+            writer.u32(descriptor_flags.raw());
+            writer.u64(status_flags.raw());
+            writer.u32(capacity.raw());
+        }
+        Command::SetPipeCapacity {
+            table,
+            fd,
+            capacity,
+        } => {
+            writer.u64(table.raw());
+            writer.i32(fd.raw());
+            writer.u32(capacity.raw());
+        }
         Command::CreateEpollAndInstall {
             table,
             minimum,
@@ -743,6 +769,22 @@ fn decode_command(tag: u8, reader: &mut Reader<'_>) -> Result<Command, Authority
             fd: reader.slot()?,
             value: reader.u64()?,
         },
+        38 => Command::CreatePipeAndInstall {
+            table: reader.table_id()?,
+            minimum: reader.slot()?,
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(reader.u32()?),
+            descriptor_flags: DescriptorFlags::from_linux_bits(reader.u32()?)
+                .map_err(|_| AuthorityFatal::MalformedFrame("invalid descriptor flags"))?,
+            status_flags: StatusFlags::from_linux_bits(reader.u64()?),
+            capacity: PipeCapacity::bounded(reader.u32()?)
+                .map_err(|_| AuthorityFatal::MalformedFrame("invalid pipe capacity"))?,
+        },
+        39 => Command::SetPipeCapacity {
+            table: reader.table_id()?,
+            fd: reader.slot()?,
+            capacity: PipeCapacity::bounded(reader.u32()?)
+                .map_err(|_| AuthorityFatal::MalformedFrame("invalid pipe capacity"))?,
+        },
         _ => return malformed("unknown operation"),
     })
 }
@@ -760,6 +802,38 @@ fn encode_outcome(writer: &mut Writer, outcome: &Outcome) -> Result<(), Authorit
             writer.u64(table.raw());
             writer.u64(generation.raw());
             writer.u64(revision.raw());
+        }
+        Outcome::PipeCreated {
+            table,
+            pipe,
+            read_fd,
+            write_fd,
+            read_description,
+            write_description,
+            generation,
+            table_revision,
+            stream_revision,
+        } => {
+            writer.u8(35);
+            writer.u64(table.raw());
+            writer.u64(pipe.raw());
+            writer.i32(read_fd.raw());
+            writer.i32(write_fd.raw());
+            writer.u64(read_description.raw());
+            writer.u64(write_description.raw());
+            writer.u64(generation.raw());
+            writer.u64(table_revision.raw());
+            writer.u64(stream_revision.raw());
+        }
+        Outcome::PipeCapacitySet {
+            pipe,
+            capacity,
+            stream_revision,
+        } => {
+            writer.u8(36);
+            writer.u64(pipe.raw());
+            writer.u32(capacity.raw());
+            writer.u64(stream_revision.raw());
         }
         Outcome::EpollCreated {
             table,
@@ -966,6 +1040,30 @@ fn encode_outcome(writer: &mut Writer, outcome: &Outcome) -> Result<(), Authorit
             writer.u64(*value);
             writer.u64(*counter);
             writer.u64(description_revision.raw());
+        }
+        Outcome::StreamBytes {
+            pipe,
+            bytes,
+            description_revision,
+            stream_revision,
+        } => {
+            writer.u8(37);
+            writer.u64(pipe.raw());
+            writer.blob(bytes)?;
+            writer.u64(description_revision.raw());
+            writer.u64(stream_revision.raw());
+        }
+        Outcome::StreamWritten {
+            pipe,
+            count,
+            description_revision,
+            stream_revision,
+        } => {
+            writer.u8(38);
+            writer.u64(pipe.raw());
+            writer.u32(count.raw());
+            writer.u64(description_revision.raw());
+            writer.u64(stream_revision.raw());
         }
         Outcome::Bytes {
             bytes,
@@ -1262,6 +1360,36 @@ fn decode_outcome(reader: &mut Reader<'_>) -> Result<Outcome, AuthorityFatal> {
             counter: reader.u64()?,
             description_revision: reader.revision()?,
         },
+        35 => Outcome::PipeCreated {
+            table: reader.table_id()?,
+            pipe: reader.pipe_id()?,
+            read_fd: reader.slot()?,
+            write_fd: reader.slot()?,
+            read_description: reader.description_id()?,
+            write_description: reader.description_id()?,
+            generation: reader.generation()?,
+            table_revision: reader.revision()?,
+            stream_revision: reader.revision()?,
+        },
+        36 => Outcome::PipeCapacitySet {
+            pipe: reader.pipe_id()?,
+            capacity: PipeCapacity::bounded(reader.u32()?)
+                .map_err(|_| AuthorityFatal::MalformedFrame("invalid pipe capacity"))?,
+            stream_revision: reader.revision()?,
+        },
+        37 => Outcome::StreamBytes {
+            pipe: reader.pipe_id()?,
+            bytes: reader.blob()?,
+            description_revision: reader.revision()?,
+            stream_revision: reader.revision()?,
+        },
+        38 => Outcome::StreamWritten {
+            pipe: reader.pipe_id()?,
+            count: ByteCount::bounded(reader.u32()?)
+                .map_err(|_| AuthorityFatal::MalformedFrame("invalid byte count"))?,
+            description_revision: reader.revision()?,
+            stream_revision: reader.revision()?,
+        },
         _ => return malformed("unknown response outcome"),
     })
 }
@@ -1314,6 +1442,10 @@ fn encode_error(writer: &mut Writer, error: &AuthorityError) {
         AuthorityError::WouldBlock => writer.u8(37),
         AuthorityError::InvalidEventCounterValue => writer.u8(38),
         AuthorityError::WrongOperationFamily => writer.u8(39),
+        AuthorityError::NotPipe => writer.u8(40),
+        AuthorityError::InvalidPipeCapacity => writer.u8(41),
+        AuthorityError::BrokenPipe => writer.u8(42),
+        AuthorityError::PairAllocationFailed => writer.u8(43),
     }
 }
 
@@ -1365,6 +1497,10 @@ fn decode_error(reader: &mut Reader<'_>) -> Result<AuthorityError, AuthorityFata
         37 => AuthorityError::WouldBlock,
         38 => AuthorityError::InvalidEventCounterValue,
         39 => AuthorityError::WrongOperationFamily,
+        40 => AuthorityError::NotPipe,
+        41 => AuthorityError::InvalidPipeCapacity,
+        42 => AuthorityError::BrokenPipe,
+        43 => AuthorityError::PairAllocationFailed,
         _ => return malformed("unknown authority error"),
     })
 }
@@ -1579,6 +1715,14 @@ impl Writer {
                 self.u64(*counter);
                 self.bool(*semaphore);
             }
+            DescriptionBackingSnapshot::PipeEnd { pipe, end } => {
+                self.u8(5);
+                self.u64(pipe.raw());
+                self.u8(match end {
+                    PipeEnd::Reader => 0,
+                    PipeEnd::Writer => 1,
+                });
+            }
         }
         Ok(())
     }
@@ -1698,6 +1842,11 @@ impl<'a> Reader<'a> {
         VfsObjectId::from_snapshot(self.u64()?)
             .map_err(|_| AuthorityFatal::MalformedFrame("invalid VFS object id"))
     }
+    fn pipe_id(&mut self) -> Result<PipeId, AuthorityFatal> {
+        PipeId::from_snapshot(self.u64()?)
+            .map_err(|_| AuthorityFatal::MalformedFrame("invalid pipe id"))
+    }
+
     fn capability_lease_id(&mut self) -> Result<CapabilityLeaseId, AuthorityFatal> {
         CapabilityLeaseId::from_snapshot(self.u64()?)
             .map_err(|_| AuthorityFatal::MalformedFrame("invalid capability lease id"))
@@ -1851,6 +2000,14 @@ impl<'a> Reader<'a> {
                 counter: self.u64()?,
                 semaphore: self.bool()?,
             },
+            5 => DescriptionBackingSnapshot::PipeEnd {
+                pipe: self.pipe_id()?,
+                end: match self.u8()? {
+                    0 => PipeEnd::Reader,
+                    1 => PipeEnd::Writer,
+                    _ => return malformed("invalid pipe end"),
+                },
+            },
             _ => return malformed("invalid description backing"),
         };
         Ok(DescriptionSnapshot {
@@ -1920,6 +2077,7 @@ mod tests {
             FileDescriptionId::from_registry_allocation(NonZeroU64::new(3).expect("description"));
         let object = VfsObjectId::from_snapshot(4).expect("object");
         let lease = CapabilityLeaseId::from_snapshot(5).expect("lease");
+        let pipe = PipeId::from_snapshot(6).expect("pipe");
         let path = CanonicalPath::absolute("/all-variants").expect("path");
         let registration = EpollRegistration {
             events: LinuxEpollEvents::IN | LinuxEpollEvents::ET,
@@ -1929,6 +2087,19 @@ mod tests {
             Command::RegisterClient,
             Command::ExitClient,
             Command::CreateTable,
+            Command::CreatePipeAndInstall {
+                table,
+                minimum: FileSlotNumber::for_open_fd(3).expect("fd"),
+                ceiling: NofileAllocationCeiling::from_captured_soft_limit(9),
+                descriptor_flags: DescriptorFlags::CLOSE_ON_EXEC,
+                status_flags: StatusFlags::from_linux_bits(0x800),
+                capacity: PipeCapacity::bounded(4096).expect("capacity"),
+            },
+            Command::SetPipeCapacity {
+                table,
+                fd: FileSlotNumber::for_open_fd(3).expect("fd"),
+                capacity: PipeCapacity::bounded(8192).expect("capacity"),
+            },
             Command::CreateEpollAndInstall {
                 table,
                 minimum: FileSlotNumber::for_open_fd(3).expect("fd"),
@@ -2259,10 +2430,40 @@ mod tests {
                 value: 7,
                 description_revision: Revision::from_wire(14),
             },
+            Outcome::PipeCreated {
+                table,
+                pipe,
+                read_fd: slot,
+                write_fd: FileSlotNumber::for_open_fd(4).expect("fd"),
+                read_description: description,
+                write_description: FileDescriptionId::from_registry_allocation(
+                    NonZeroU64::new(7).expect("description"),
+                ),
+                generation: ObjectGeneration::INITIAL,
+                table_revision: Revision::from_wire(14),
+                stream_revision: Revision::from_wire(15),
+            },
+            Outcome::PipeCapacitySet {
+                pipe,
+                capacity: PipeCapacity::bounded(8192).expect("capacity"),
+                stream_revision: Revision::from_wire(16),
+            },
+            Outcome::StreamBytes {
+                pipe,
+                bytes: b"abc".to_vec(),
+                description_revision: Revision::from_wire(17),
+                stream_revision: Revision::from_wire(18),
+            },
+            Outcome::StreamWritten {
+                pipe,
+                count: ByteCount::bounded(3).expect("count"),
+                description_revision: Revision::from_wire(19),
+                stream_revision: Revision::from_wire(20),
+            },
             Outcome::EventCounterWritten {
                 value: 3,
                 counter: 10,
-                description_revision: Revision::from_wire(15),
+                description_revision: Revision::from_wire(21),
             },
             Outcome::Bytes {
                 bytes: b"bytes".to_vec(),
