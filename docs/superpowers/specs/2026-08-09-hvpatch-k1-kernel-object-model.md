@@ -23,6 +23,15 @@ through a typed interface, but it cannot duplicate state or accept writes. When
 an authority is extracted, its former field and adapter are deleted in the same
 commit.
 
+**Re-baselined 2026-08-12.** That rule was read as requiring the complete
+FileAuthority production cutover inside K1. `hybrid.md` does not ask this phase
+for it. K1 there introduces typed interfaces "while adapting the working one-VM
+prototype behind them"; K3 owns "file-description sharing" and K4's gate owns
+CLOEXEC and exec commit. The move-once rule therefore binds authorities that K1
+itself extracts. Binding FileAuthority to fork/share/exec/exit, migrating the
+361 classified legacy call sites, and deleting `ThreadResources.files` are K3
+deliverables and do not gate K1 GO. See "Phase ownership of the file authority".
+
 ## Invariants
 
 1. One `Kernel` object graph describes one HVPatch VM.
@@ -237,6 +246,31 @@ field. `KernelContext` is threaded through all dispatch entry points before any
 field moves. Each authority is then cut over and its old field deleted in the
 same commit.
 
+### Phase ownership of the file authority
+
+The FileAuthority work splits across three phases. Recording the split here
+prevents the K1 gate from absorbing K3 and K4 deliverables again.
+
+| Deliverable | Phase | Basis in `hybrid.md` |
+| --- | --- | --- |
+| Typed file/description/table interfaces and identity | K1 | "Introduce typed task/thread/mm/files/signal/frame interfaces" |
+| Coherent snapshot rows for fd/description state | K1 | K1 gate's live debug tables |
+| Kernel transaction binding fork/share/exit to FileAuthority | **K3** | K3: "fork/clone/vfork-compatible task creation … including file-description sharing" |
+| Exec binding, CLOEXEC staging, successor table | **K4** | K4 gate: "multithreaded exec, CLOEXEC, signals, credentials … match Docker" |
+| Migrating the 361 classified legacy call sites | **K3** | not named in K1; K1 adapts the prototype "behind" the interfaces |
+| Deleting `ThreadResources.files`, guard-returning APIs, writable local VFS, mirrors | **K3** | lands with the cutover that replaces them |
+
+K1 snapshots join whichever authority currently owns file state. When K3 moves
+that authority, the snapshot source moves with it. One authority followed by its
+snapshot is not a second authority, so this does not create a compatibility
+path and the coherent-snapshot deliverable is not blocked on the cutover.
+
+**Accepted risk.** The production FileAuthority root activates at real run
+boundaries today but owns no table, so it is a live mechanism doing nothing —
+the shape this project treats as abandoned. It is accepted only as K3 staging.
+If the K3 file slice does not proceed, the root is deleted rather than left
+dark; `git` retains it.
+
 ## Signal authority
 
 The current signal state splits into:
@@ -423,5 +457,11 @@ K1 is GO only when:
   that terminal);
 - `just ci` passes on the exact implementation commit;
 - durable K1 evidence reports both GO scope and remaining K2–K5 RED gates.
+
+K1 GO explicitly does **not** require FileAuthority to be the sole mutable file
+authority, the 361 classified legacy call sites to be migrated, or legacy file
+state to be deleted. Those are K3 deliverables per "Phase ownership of the file
+authority", and K1 evidence must name them as remaining RED rather than claim
+them.
 
 No performance claim is required for K1.

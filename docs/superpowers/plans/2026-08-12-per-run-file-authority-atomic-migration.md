@@ -1,7 +1,12 @@
 # Per-run FileAuthority atomic migration
 
-**Status:** approved architecture; implementation required before K1 file
-cutover can be committed.
+**Status:** approved architecture. **Re-baselined 2026-08-12 as a K3
+deliverable, not a K1 prerequisite.** Waves 1–3 (characterize, direct core,
+helper/IPC equivalence) are committed. Waves 4–5 (lifecycle/backends, deletion
+and enablement) implement `hybrid.md` K3's "file-description sharing" and K4's
+CLOEXEC/exec commit for the file domain; they do not gate K1 GO. See "Phase
+ownership of the file authority" in
+[`2026-08-09-hvpatch-k1-kernel-object-model.md`](../specs/2026-08-09-hvpatch-k1-kernel-object-model.md).
 
 **Reason for existence:** Carrick's host-process fallback lanes cannot preserve
 Linux `CLONE_FILES`, post-fork open-file-description state, or staged pipe
