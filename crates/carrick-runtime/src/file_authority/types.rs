@@ -394,6 +394,23 @@ pub(crate) enum CapabilityLeasePurpose {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EpollHostPlanAction {
+    RegisterOrModify,
+    Delete,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EpollHostPlan {
+    pub(crate) epoll_description: FileDescriptionId,
+    pub(crate) target_description: FileDescriptionId,
+    pub(crate) registered_slot: FileSlotNumber,
+    pub(crate) generation: InterestGeneration,
+    pub(crate) action: EpollHostPlanAction,
+    pub(crate) events: carrick_abi::LinuxEpollEvents,
+    pub(crate) plan_revision: Revision,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(transparent)]
 pub(crate) struct HostErrno(NonZeroI32);
 
@@ -567,6 +584,9 @@ pub(crate) enum Command {
         table: FileTableId,
         epoll_fd: FileSlotNumber,
         target_fd: FileSlotNumber,
+    },
+    EpollRevalidateHostPlan {
+        plan: EpollHostPlan,
     },
     ObserveReadiness {
         table: FileTableId,
@@ -762,15 +782,22 @@ pub(crate) enum Outcome {
         key: EpollInterestKey,
         generation: InterestGeneration,
         description_revision: Revision,
+        host_plan: EpollHostPlan,
     },
     EpollInterestModified {
         key: EpollInterestKey,
         generation: InterestGeneration,
         description_revision: Revision,
+        host_plan: EpollHostPlan,
     },
     EpollInterestDeleted {
         key: EpollInterestKey,
         description_revision: Revision,
+        host_plan: EpollHostPlan,
+    },
+    EpollHostPlanValidated {
+        valid: bool,
+        current_revision: Revision,
     },
     ReadinessObserved {
         description: FileDescriptionId,

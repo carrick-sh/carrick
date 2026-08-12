@@ -36,6 +36,10 @@ impl EpollState {
         self.interests.contains_key(&key)
     }
 
+    pub(super) fn interest(&self, key: EpollInterestKey) -> Option<&EpollInterestState> {
+        self.interests.get(&key)
+    }
+
     pub(super) fn target_descriptions(
         &self,
     ) -> impl Iterator<Item = super::FileDescriptionId> + '_ {
@@ -79,8 +83,8 @@ impl EpollState {
         Some(state.generation)
     }
 
-    pub(super) fn delete(&mut self, key: EpollInterestKey) -> bool {
-        self.interests.remove(&key).is_some()
+    pub(super) fn delete(&mut self, key: EpollInterestKey) -> Option<EpollInterestState> {
+        self.interests.remove(&key)
     }
 
     pub(super) fn acknowledge_io(
