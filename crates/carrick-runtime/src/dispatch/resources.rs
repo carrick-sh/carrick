@@ -4,7 +4,7 @@
 //! allowed to recapture the dispatcher binding. The outer boundary installs the
 //! caller's already captured objects here for the duration of the operation.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -45,6 +45,8 @@ impl CapturedResources {
 thread_local! {
     static CAPTURED_RESOURCES: RefCell<Vec<CapturedResources>> =
         const { RefCell::new(Vec::new()) };
+    static ACTIVE_CONTEXT: Cell<*const crate::kernel::KernelContext> =
+        const { Cell::new(std::ptr::null()) };
     static RETIRING_FILE_TABLES: RefCell<Vec<Arc<crate::kernel::FileTable>>> =
         const { RefCell::new(Vec::new()) };
 }
@@ -53,6 +55,20 @@ pub(super) fn with_captured_resources<R>(
     context: &crate::kernel::KernelContext,
     operation: impl FnOnce() -> R,
 ) -> R {
+    if ACTIVE_CONTEXT.with(|active| std::ptr::eq(active.get(), context)) {
+        return operation();
+    }
+
+    struct Restore(*const crate::kernel::KernelContext);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ACTIVE_CONTEXT.with(|active| active.set(self.0));
+        }
+    }
+
+    let previous = ACTIVE_CONTEXT.with(|active| active.replace(context));
+    let _restore = Restore(previous);
     with_resources(CapturedResources::from_context(context), operation)
 }
 

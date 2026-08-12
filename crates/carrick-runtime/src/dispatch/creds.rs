@@ -282,22 +282,13 @@ impl SyscallDispatcher {
         }
     }
 
-    fn update_fs_umask(
-        &self,
-        kernel: &crate::kernel::KernelContext,
-        umask: u32,
-    ) -> Result<(), LinuxErrno> {
+    fn update_fs_umask(&self, kernel: &crate::kernel::KernelContext, umask: u32) -> u32 {
         match kernel.kernel().update_fs_umask(kernel, umask) {
-            Ok(_) => Ok(()),
-            Err(
-                crate::kernel::KernelOperationError::StaleContext
-                | crate::kernel::KernelOperationError::ParentExited
-                | crate::kernel::KernelOperationError::UnknownThread(_),
-            ) => Err(crate::linux_abi::LINUX_EINTR),
-            Err(crate::kernel::KernelOperationError::TaskBusy(_)) => {
-                Err(crate::linux_abi::LINUX_EAGAIN)
-            }
+            Ok((_, previous)) => previous,
             Err(error) => {
+                // umask(2) has no error return. Reservation contention is
+                // retried inside Kernel; any remaining failure means the exact
+                // dispatch context violated its authority boundary.
                 tracing::error!(%error, "CLONE_FS umask publication invariant failed");
                 std::process::abort();
             }
@@ -513,8 +504,7 @@ impl SyscallDispatcher {
 
         fn umask(this, cx, new: u64) {
             let new = new as u32 & 0o777;
-            let previous = this.cred_snapshot().umask;
-            this.update_fs_umask(cx.kernel, new)?;
+            let previous = this.update_fs_umask(cx.kernel, new);
             Ok(DispatchOutcome::Returned { value: previous as i64 })
         }
 

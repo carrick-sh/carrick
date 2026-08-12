@@ -808,7 +808,7 @@ impl std::ops::Deref for WaitFds {
 const MAX_GUEST_PATH: usize = 4096;
 
 fn threaded_independent_dispatch_supports(number: u64) -> bool {
-    matches!(number, 96 | 98 | 99 | 124 | 178 | 449)
+    matches!(number, 96 | 98 | 99 | 124 | 172 | 178 | 449)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -4997,6 +4997,27 @@ impl SyscallDispatcher {
         if let Some(outcome) = self.seccomp_precheck(&request) {
             return Ok(outcome);
         }
+        if let Some(result) = Self::dispatch_threaded_independent(
+            kernel, request, memory, reporter, tid, registry, futex,
+        ) {
+            return result;
+        }
+        resources::with_captured_resources(kernel, || {
+            self.dispatch_threaded_captured(kernel, request, memory, reporter, tid, registry, futex)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_threaded_captured(
+        &self,
+        kernel: &crate::kernel::KernelContext,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+        reporter: &CompatReporter,
+        tid: crate::thread::ThreadId,
+        registry: &crate::thread::ThreadRegistry,
+        futex: &crate::thread::FutexTable,
+    ) -> Result<DispatchOutcome, DispatchError> {
         if let Some(result) =
             self.dispatch_threaded_shared(kernel, request, memory, reporter, tid, registry, futex)
         {
@@ -5046,12 +5067,6 @@ impl SyscallDispatcher {
         registry: &crate::thread::ThreadRegistry,
         futex: &crate::thread::FutexTable,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        if let Some(result) = Self::dispatch_threaded_independent(
-            kernel, request, memory, reporter, tid, registry, futex,
-        ) {
-            return Some(result);
-        }
-
         if request.number.raw() == 64
             && !resources::with_captured_resources(kernel, || {
                 self.write_shared_supported(request.args.0[0] as i32)
@@ -5208,6 +5223,14 @@ impl SyscallDispatcher {
             124 => {
                 std::thread::yield_now();
                 DispatchOutcome::Returned { value: 0 }
+            }
+            172 => {
+                let Some(pid) = guest_visible_tid(registry.main_tid(), registry) else {
+                    return Some(Ok(DispatchOutcome::errno(LINUX_EINVAL)));
+                };
+                DispatchOutcome::Returned {
+                    value: i64::from(pid),
+                }
             }
             130 => {
                 let target =
@@ -9223,7 +9246,7 @@ mod overlay_dispatch_tests {
             .filter(|syscall| threaded_independent_dispatch_supports(syscall.number))
             .map(|syscall| syscall.number)
             .collect();
-        assert_eq!(supported, vec![96, 98, 99, 124, 178, 449]);
+        assert_eq!(supported, vec![96, 98, 99, 124, 172, 178, 449]);
 
         for syscall in crate::syscall::aarch64_table() {
             if syscall.handler == crate::syscall::SyscallHandler::ThreadLocal {
@@ -12560,12 +12583,14 @@ mod native_reexec_fd_tests {
             seccomp_policy: carrick_spec::SeccompPolicy::ContainerDefault,
             seccomp_state: {
                 let seccomp = crate::seccomp::SeccompState::default();
-                seccomp.install(vec![crate::seccomp::SockFilter {
-                    code: 0x06,
-                    jt: 0,
-                    jf: 0,
-                    k: crate::seccomp::SECCOMP_RET_ERRNO | 1,
-                }]);
+                seccomp
+                    .install(vec![crate::seccomp::SockFilter {
+                        code: 0x06,
+                        jt: 0,
+                        jf: 0,
+                        k: crate::seccomp::SECCOMP_RET_ERRNO | 1,
+                    }])
+                    .expect("install capsule test filter");
                 seccomp.snapshot()
             },
             no_new_privs: true,
@@ -13066,7 +13091,15 @@ mod container_policy_dispatch_tests {
         let dispatcher = confined_dispatcher();
         assert!(dispatcher.identity_fast_path_enabled());
         // A guest seccomp filter still disables it, policy or not.
-        dispatcher.seccomp.install(vec![]);
+        dispatcher
+            .seccomp
+            .install(vec![crate::seccomp::SockFilter {
+                code: 0x06,
+                jt: 0,
+                jf: 0,
+                k: crate::seccomp::SECCOMP_RET_ALLOW,
+            }])
+            .expect("install guest seccomp filter");
         assert!(!dispatcher.identity_fast_path_enabled());
     }
 }

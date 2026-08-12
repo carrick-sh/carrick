@@ -276,7 +276,27 @@ fn load_operand(ins: &SockFilter, data: &SeccompData) -> u32 {
 }
 
 const MAX_FILTER_INSNS: usize = 4096;
+// seccomp(2) limits the complete attached path to 32,768 instructions and
+// charges four instructions of overhead for every already attached filter.
 const MAX_FILTER_PATH_INSNS: usize = 32_768;
+const FILTER_PATH_OVERHEAD_INSNS: usize = 4;
+
+fn filter_path_insns(filters: &[Vec<SockFilter>]) -> Option<usize> {
+    let program_insns = filters
+        .iter()
+        .try_fold(0usize, |total, program| total.checked_add(program.len()))?;
+    let overhead = filters
+        .len()
+        .saturating_sub(1)
+        .checked_mul(FILTER_PATH_OVERHEAD_INSNS)?;
+    program_insns.checked_add(overhead)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SeccompInstallError {
+    InvalidProgram,
+    PathTooLong,
+}
 
 /// Complete guest-installed seccomp state retained across native host
 /// self-reexec. The launch-time container policy remains a separate host
@@ -293,11 +313,7 @@ impl SeccompSnapshot {
             .filters
             .iter()
             .any(|program| program.is_empty() || program.len() > MAX_FILTER_INSNS)
-            && self
-                .filters
-                .iter()
-                .try_fold(0usize, |total, program| total.checked_add(program.len()))
-                .is_some_and(|total| total <= MAX_FILTER_PATH_INSNS)
+            && filter_path_insns(&self.filters).is_some_and(|total| total <= MAX_FILTER_PATH_INSNS)
     }
 }
 
@@ -349,10 +365,25 @@ impl SeccompState {
     }
 
     /// Install a parsed filter program (appended to the stack).
-    pub(crate) fn install(&self, prog: Vec<SockFilter>) {
+    pub(crate) fn install(&self, prog: Vec<SockFilter>) -> Result<(), SeccompInstallError> {
+        if prog.is_empty() || prog.len() > MAX_FILTER_INSNS {
+            return Err(SeccompInstallError::InvalidProgram);
+        }
         let mut programs = self.programs.lock();
+        let path_insns = filter_path_insns(&programs.filters)
+            .and_then(|total| total.checked_add(prog.len()))
+            .and_then(|total| {
+                (!programs.filters.is_empty())
+                    .then_some(FILTER_PATH_OVERHEAD_INSNS)
+                    .map_or(Some(total), |overhead| total.checked_add(overhead))
+            })
+            .ok_or(SeccompInstallError::PathTooLong)?;
+        if path_insns > MAX_FILTER_PATH_INSNS {
+            return Err(SeccompInstallError::PathTooLong);
+        }
         self.identity_fast_path_allowed.store(0, Ordering::Release);
         programs.filters.push(prog);
+        Ok(())
     }
 
     pub(crate) fn install_strict(&self) {
@@ -427,8 +458,42 @@ mod tests {
     fn installing_a_filter_closes_the_live_identity_gate() {
         let state = SeccompState::default();
         assert_eq!(state.identity_fast_path_word().load(Ordering::Acquire), 1);
-        state.install(Vec::new());
+        state
+            .install(deny_nr_filter(101, 1))
+            .expect("install valid filter");
         assert_eq!(state.identity_fast_path_word().load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn install_enforces_the_complete_filter_path_and_overhead() {
+        let state = SeccompState::default();
+        let mut maximal = vec![
+            SockFilter {
+                code: BPF_LD,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            };
+            MAX_FILTER_INSNS - 1
+        ];
+        maximal.push(SockFilter {
+            code: BPF_RET,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ALLOW,
+        });
+        for _ in 0..7 {
+            state
+                .install(maximal.clone())
+                .expect("seven maximal filters fit the path bound");
+        }
+        assert_eq!(
+            state.install(maximal),
+            Err(SeccompInstallError::PathTooLong)
+        );
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.filters.len(), 7);
+        assert!(snapshot.validate());
     }
 
     /// Build the canonical "deny one syscall number with EPERM, allow the rest"
@@ -627,8 +692,12 @@ mod tests {
         let state = SeccompState::default();
         assert!(!state.is_active());
         assert_eq!(state.check(&data_for(101)), SECCOMP_RET_ALLOW);
-        state.install(deny_nr_filter(101, 1));
-        state.install(deny_nr_filter(202, 1));
+        state
+            .install(deny_nr_filter(101, 1))
+            .expect("install first filter");
+        state
+            .install(deny_nr_filter(202, 1))
+            .expect("install second filter");
         assert!(state.is_active());
         // 101 denied by the first filter, allowed by the second -> ERRNO wins.
         assert_eq!(
@@ -664,24 +733,28 @@ mod tests {
         // filter (and the libseccomp/Docker default arch-mismatch KILL) survived
         // every syscall. The most-severe action must win.
         let state = SeccompState::default();
-        state.install(vec![SockFilter {
-            code: BPF_RET,
-            jt: 0,
-            jf: 0,
-            k: SECCOMP_RET_KILL_PROCESS,
-        }]);
+        state
+            .install(vec![SockFilter {
+                code: BPF_RET,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_KILL_PROCESS,
+            }])
+            .expect("install kill filter");
         assert_eq!(
             state.check(&data_for(172)) & SECCOMP_RET_ACTION_FULL,
             SECCOMP_RET_KILL_PROCESS,
             "an unconditional KILL_PROCESS filter must KILL, not be ignored"
         );
         // Stacked with an allow-all filter, KILL_PROCESS (most severe) still wins.
-        state.install(vec![SockFilter {
-            code: BPF_RET,
-            jt: 0,
-            jf: 0,
-            k: SECCOMP_RET_ALLOW,
-        }]);
+        state
+            .install(vec![SockFilter {
+                code: BPF_RET,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_ALLOW,
+            }])
+            .expect("install allow filter");
         assert_eq!(
             state.check(&data_for(172)) & SECCOMP_RET_ACTION_FULL,
             SECCOMP_RET_KILL_PROCESS
