@@ -14,7 +14,7 @@ use super::types::{
     ByteCount, CanonicalPath, CapabilityLeaseDisposition, CapabilityLeaseId,
     CapabilityLeasePurpose, ClientId, ClientIdentity, Command, DescriptionSnapshot,
     DescriptorFlags, EpollEventLimit, EpollHostPlan, EpollHostPlanAction, EpollInterestKey,
-    EpollRegistration, FileDescriptionId, FileOffset, FileSlotNumber, FileTableId,
+    EpollRegistration, FileDescriptionId, FileOffset, FileSlotNumber, FileTableId, HostErrno,
     InterestGeneration, MappingAttachmentId, MappingLeaseDisposition, MappingRange, MappingRelease,
     NofileAllocationCeiling, ObjectGeneration, Outcome, PipeCapacity, PipeEnd, PipeId, Request,
     Response, Revision, SameSlotBehavior, SeekWhence, SlotPageLimit, SlotRangeAction, SlotSnapshot,
@@ -234,7 +234,7 @@ impl FileAuthorityCore {
         let fd = self
             .descriptions
             .get(description)
-            .and_then(|state| state.backing.host_fd())
+            .and_then(|state| state.backing.host_fd(*purpose))
             .ok_or(AuthorityFatal::InvariantViolation(
                 "capability lease lost its host descriptor backing",
             ))?;
@@ -447,6 +447,26 @@ impl FileAuthorityCore {
                         *access_mode,
                         *status_flags,
                         path.clone(),
+                    ),
+                    Command::AdoptIoUringAndInstall {
+                        table,
+                        minimum,
+                        ceiling,
+                        descriptor_flags,
+                        status_flags,
+                        entries,
+                        data_length,
+                    } => self.adopt_io_uring_and_install(
+                        request.client,
+                        *table,
+                        request.expected_generation,
+                        *minimum,
+                        *ceiling,
+                        *descriptor_flags,
+                        *status_flags,
+                        *entries,
+                        *data_length,
+                        capabilities,
                     ),
                     Command::AdoptHostFileAndInstall {
                         table,
@@ -1353,6 +1373,72 @@ impl FileAuthorityCore {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn adopt_io_uring_and_install(
+        &mut self,
+        client: ClientIdentity,
+        table: FileTableId,
+        table_generation: ObjectGeneration,
+        minimum: FileSlotNumber,
+        ceiling: NofileAllocationCeiling,
+        descriptor_flags: DescriptorFlags,
+        status_flags: StatusFlags,
+        entries: u32,
+        data_length: u64,
+        capabilities: &mut Vec<OwnedFd>,
+    ) -> Result<Outcome, AuthorityError> {
+        self.require_bound_table(client, table, table_generation)?;
+        if entries == 0 || data_length == 0 {
+            return Err(AuthorityError::InvalidMappingRange);
+        }
+        let fd = self.allocate_lowest(table, minimum, ceiling)?;
+        let data_fd = capabilities
+            .pop()
+            .ok_or(AuthorityError::HostBackingTypeMismatch)?;
+        let lock_fd = capabilities
+            .pop()
+            .ok_or(AuthorityError::HostBackingTypeMismatch)?;
+        validate_regular_file_length(data_fd.as_raw_fd(), data_length)?;
+        validate_regular_file_length(lock_fd.as_raw_fd(), 1)?;
+        let description = self.allocate_description();
+        let outcome = self.commit_new_description_install(
+            table,
+            fd,
+            description,
+            descriptor_flags,
+            AccessMode::ReadWrite,
+            status_flags,
+            None,
+            AuthorityBacking::IoUring {
+                data_fd,
+                lock_fd,
+                entries,
+                data_length,
+            },
+            None,
+        );
+        let Outcome::Installed {
+            table_revision,
+            description_revision,
+            ..
+        } = outcome
+        else {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "io_uring install returned an unexpected outcome",
+            ));
+        };
+        Ok(Outcome::IoUringCreated {
+            table,
+            fd,
+            description,
+            generation: ObjectGeneration::INITIAL,
+            entries,
+            data_length,
+            table_revision,
+            description_revision,
+        })
+    }
+
     fn acquire_capability_lease(
         &mut self,
         client: ClientIdentity,
@@ -1366,7 +1452,7 @@ impl FileAuthorityCore {
             .descriptions
             .get(&slot.description)
             .ok_or(AuthorityError::DescriptionNotFound)?;
-        if state.backing.host_fd().is_none() {
+        if state.backing.host_fd(purpose).is_none() {
             return Err(AuthorityError::NotHostBacked);
         }
         let capability_lease_refs =
@@ -2588,7 +2674,8 @@ impl FileAuthorityCore {
             }
             AuthorityBacking::Epoll(_)
             | AuthorityBacking::EventCounter { .. }
-            | AuthorityBacking::PipeEnd { .. } => {
+            | AuthorityBacking::PipeEnd { .. }
+            | AuthorityBacking::IoUring { .. } => {
                 return Err(AuthorityError::WrongOperationFamily);
             }
         };
@@ -2664,7 +2751,8 @@ impl FileAuthorityCore {
             AuthorityBacking::Synthetic { .. } | AuthorityBacking::Vfs { .. } => bytes.len(),
             AuthorityBacking::Epoll(_)
             | AuthorityBacking::EventCounter { .. }
-            | AuthorityBacking::PipeEnd { .. } => {
+            | AuthorityBacking::PipeEnd { .. }
+            | AuthorityBacking::IoUring { .. } => {
                 return Err(AuthorityError::WrongOperationFamily);
             }
         };
@@ -2709,7 +2797,8 @@ impl FileAuthorityCore {
                 AuthorityBacking::Vfs { .. } => unreachable!(),
                 AuthorityBacking::Epoll(_)
                 | AuthorityBacking::EventCounter { .. }
-                | AuthorityBacking::PipeEnd { .. } => {
+                | AuthorityBacking::PipeEnd { .. }
+                | AuthorityBacking::IoUring { .. } => {
                     abort_fatal(AuthorityFatal::InvariantViolation(
                         "generic write reached a typed-operation backing",
                     ));
@@ -3386,7 +3475,8 @@ impl FileAuthorityCore {
             }
             AuthorityBacking::Epoll(_)
             | AuthorityBacking::EventCounter { .. }
-            | AuthorityBacking::PipeEnd { .. } => Err(AuthorityError::NotSeekable),
+            | AuthorityBacking::PipeEnd { .. }
+            | AuthorityBacking::IoUring { .. } => Err(AuthorityError::NotSeekable),
         }
     }
 
@@ -3554,7 +3644,25 @@ fn release_mapping_ranges(
 }
 
 fn expected_request_capabilities(command: &Command) -> usize {
-    usize::from(matches!(command, Command::AdoptHostFileAndInstall { .. }))
+    match command {
+        Command::AdoptHostFileAndInstall { .. } => 1,
+        Command::AdoptIoUringAndInstall { .. } => 2,
+        _ => 0,
+    }
+}
+
+fn validate_regular_file_length(fd: i32, minimum: u64) -> Result<(), AuthorityError> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return Err(AuthorityError::HostIo(HostErrno::last()));
+    }
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+        || stat.st_size < 0
+        || u64::try_from(stat.st_size).map_or(true, |length| length < minimum)
+    {
+        return Err(AuthorityError::HostBackingTypeMismatch);
+    }
+    Ok(())
 }
 
 fn validate_host_file(fd: i32, access_mode: AccessMode) -> Result<(), AuthorityError> {

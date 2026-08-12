@@ -1457,6 +1457,75 @@ fn direct_and_ipc_transports_match_bounded_table_mutations() {
 }
 
 #[test]
+fn direct_and_ipc_io_uring_owns_both_backing_capabilities() {
+    for ipc in [false, true] {
+        let mut harness = if ipc {
+            Harness::new_ipc()
+        } else {
+            Harness::new()
+        };
+        let table = harness.create_table();
+        let data = tempfile::tempfile().expect("data file");
+        data.set_len(4096).expect("size data");
+        let lock = tempfile::tempfile().expect("lock file");
+        lock.set_len(1).expect("size lock");
+        let request = harness.request(
+            Command::AdoptIoUringAndInstall {
+                table,
+                minimum: fd(3),
+                ceiling: NofileAllocationCeiling::from_captured_soft_limit(16),
+                descriptor_flags: DescriptorFlags::CLOSE_ON_EXEC,
+                status_flags: StatusFlags::default(),
+                entries: 8,
+                data_length: 4096,
+            },
+            ObjectGeneration::INITIAL,
+        );
+        let reply = harness
+            .transact(request, vec![lock.into(), data.into()])
+            .expect("adopt ring");
+        let (ring_fd, description) = match reply.response.outcome {
+            Outcome::IoUringCreated {
+                fd,
+                description,
+                entries: 8,
+                data_length: 4096,
+                ..
+            } => (fd, description),
+            other => panic!("unexpected ring creation: {other:?}"),
+        };
+        for purpose in [
+            CapabilityLeasePurpose::IoUringData,
+            CapabilityLeasePurpose::IoUringLock,
+        ] {
+            let request = harness.request(
+                Command::AcquireCapabilityLease {
+                    table,
+                    fd: ring_fd,
+                    purpose,
+                },
+                ObjectGeneration::INITIAL,
+            );
+            let lease = harness.transact(request, Vec::new()).expect("ring lease");
+            assert_eq!(lease.capabilities.len(), 1);
+        }
+        assert!(matches!(
+            harness.send(
+                Command::InspectDescription { description },
+                ObjectGeneration::INITIAL,
+            ),
+            Outcome::Description(DescriptionSnapshot {
+                backing: DescriptionBackingSnapshot::IoUring {
+                    entries: 8,
+                    data_length: 4096,
+                },
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
 fn direct_and_ipc_mapping_attachments_outlive_slots_and_split_on_unmap() {
     for ipc in [false, true] {
         let mut harness = if ipc {
