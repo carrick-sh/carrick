@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 const CAPSULE_MAGIC: [u8; 8] = *b"CRKNEXE\0";
 const CONSUMED_MAGIC: [u8; 8] = [0; 8];
-const CAPSULE_VERSION: u16 = 2;
+const CAPSULE_VERSION: u16 = 3;
 const HEADER_LEN: usize = 68;
 const MAX_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
 const MAX_VECTOR_ITEMS: usize = 4096;
@@ -227,18 +227,11 @@ pub(crate) struct NativeReexecProcessStateV1 {
     pub(crate) thread_pending_signals: Vec<NativeReexecPendingSignalV1>,
     pub(crate) thread_routed_siginfos: Vec<NativeReexecPendingSignalV1>,
     pub(crate) task_pending_signals: Vec<NativeReexecPendingSignalV1>,
-    pub(crate) nofile_soft: u64,
     pub(crate) rlimit_overrides: Vec<Option<NativeReexecRlimitV1>>,
-    #[serde(default = "native_reexec_unconfined_seccomp_policy")]
     pub(crate) seccomp_policy: carrick_spec::SeccompPolicy,
-    #[serde(default)]
+    pub(crate) seccomp_state: crate::seccomp::SeccompSnapshot,
+    pub(crate) no_new_privs: bool,
     pub(crate) ptrace_traceme: bool,
-}
-
-fn native_reexec_unconfined_seccomp_policy() -> carrick_spec::SeccompPolicy {
-    // Prior V1 capsules did not carry launch policy. Preserve their historical
-    // decode meaning instead of silently enabling the container default.
-    carrick_spec::SeccompPolicy::Unconfined
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,6 +319,7 @@ impl NativeGuestExecV1 {
                 .is_some_and(|groups| groups.len() > 65_536)
             || self.process_state.credentials.umask & !0o777 != 0
             || self.process_state.rlimit_overrides.len() != 16
+            || !self.process_state.seccomp_state.validate()
         {
             return Err(NativeExecCapsuleError::InvalidField("guest_exec"));
         }
@@ -1457,9 +1451,10 @@ mod tests {
                     thread_pending_signals: Vec::new(),
                     thread_routed_siginfos: Vec::new(),
                     task_pending_signals: Vec::new(),
-                    nofile_soft: 1024,
                     rlimit_overrides: vec![None; 16],
                     seccomp_policy: carrick_spec::SeccompPolicy::ContainerDefault,
+                    seccomp_state: crate::seccomp::SeccompSnapshot::default(),
+                    no_new_privs: true,
                     ptrace_traceme: false,
                 },
                 prepared_image: None,
@@ -1723,25 +1718,22 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v1_process_state_defaults_to_unconfined_and_untraced() {
-        let payload = sample();
-        let mut value = serde_json::to_value(payload).expect("serialize capsule");
-        let process_state = value
-            .get_mut("guest_exec")
-            .and_then(|guest| guest.get_mut("process_state"))
-            .and_then(serde_json::Value::as_object_mut)
-            .expect("process state");
-        process_state.remove("seccomp_policy");
-        process_state.remove("ptrace_traceme");
+    fn capsule_rejects_missing_seccomp_authority_state() {
+        let value = serde_json::to_value(sample()).expect("serialize capsule");
+        for field in ["seccomp_policy", "seccomp_state", "no_new_privs"] {
+            let mut incomplete = value.clone();
+            incomplete
+                .get_mut("guest_exec")
+                .and_then(|guest| guest.get_mut("process_state"))
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("process state")
+                .remove(field);
 
-        let decoded: NativeExecCapsuleV1 =
-            serde_json::from_value(value).expect("decode prior V1 payload");
-        let process_state = decoded.guest_exec.expect("guest payload").process_state;
-        assert_eq!(
-            process_state.seccomp_policy,
-            carrick_spec::SeccompPolicy::Unconfined
-        );
-        assert!(!process_state.ptrace_traceme);
+            assert!(
+                serde_json::from_value::<NativeExecCapsuleV1>(incomplete).is_err(),
+                "missing {field} must fail closed"
+            );
+        }
     }
 
     #[test]

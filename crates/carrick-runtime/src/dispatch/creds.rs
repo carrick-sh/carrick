@@ -282,6 +282,28 @@ impl SyscallDispatcher {
         }
     }
 
+    fn update_fs_umask(
+        &self,
+        kernel: &crate::kernel::KernelContext,
+        umask: u32,
+    ) -> Result<(), LinuxErrno> {
+        match kernel.kernel().update_fs_umask(kernel, umask) {
+            Ok(_) => Ok(()),
+            Err(
+                crate::kernel::KernelOperationError::StaleContext
+                | crate::kernel::KernelOperationError::ParentExited
+                | crate::kernel::KernelOperationError::UnknownThread(_),
+            ) => Err(crate::linux_abi::LINUX_EINTR),
+            Err(crate::kernel::KernelOperationError::TaskBusy(_)) => {
+                Err(crate::linux_abi::LINUX_EAGAIN)
+            }
+            Err(error) => {
+                tracing::error!(%error, "CLONE_FS umask publication invariant failed");
+                std::process::abort();
+            }
+        }
+    }
+
     /// Capture the per-process identity fast-path value at an explicit Kernel
     /// boundary. The context parameter prevents lifecycle callers from silently
     /// reintroducing registry recapture even though PID itself is process-wide.
@@ -492,7 +514,7 @@ impl SyscallDispatcher {
         fn umask(this, cx, new: u64) {
             let new = new as u32 & 0o777;
             let previous = this.cred_snapshot().umask;
-            this.update_credentials(cx.kernel, |creds| creds.set_umask(new))?;
+            this.update_fs_umask(cx.kernel, new)?;
             Ok(DispatchOutcome::Returned { value: previous as i64 })
         }
 

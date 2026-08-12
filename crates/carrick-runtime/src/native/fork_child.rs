@@ -31,44 +31,48 @@
 //! rather than folded into [`AFTER_FORK_CHILD_STEPS`] or gated behind a flag
 //! parameter here.
 use crate::dispatch::SyscallDispatcher;
+use crate::kernel::KernelContext;
 
 /// One named fork-child hook: its documented name (for the order test/report)
-/// paired with the function pointer that runs it.
-type AfterForkChildStep = (&'static str, fn(&SyscallDispatcher));
+/// paired with the function pointer that runs it. The exact pre-fork context
+/// remains valid in the COW child until the fresh child Kernel is published;
+/// authority-dependent repair consumes it explicitly rather than consulting a
+/// process-local TLS scope.
+type AfterForkChildStep = (&'static str, fn(&SyscallDispatcher, &KernelContext));
 
-fn step_clear_output_buffers(d: &SyscallDispatcher) {
+fn step_clear_output_buffers(d: &SyscallDispatcher, _context: &KernelContext) {
     d.clear_output_buffers();
 }
 
-fn step_reinit_event_ring(_d: &SyscallDispatcher) {
+fn step_reinit_event_ring(_d: &SyscallDispatcher, _context: &KernelContext) {
     crate::event_ring::reinit_after_fork();
 }
 
-fn step_reinit_host_signal(_d: &SyscallDispatcher) {
+fn step_reinit_host_signal(_d: &SyscallDispatcher, _context: &KernelContext) {
     crate::host_signal::reinit_after_fork();
 }
 
-fn step_reset_fifo_beacons(_d: &SyscallDispatcher) {
+fn step_reset_fifo_beacons(_d: &SyscallDispatcher, _context: &KernelContext) {
     crate::dispatch::reset_fifo_beacons_after_fork_child();
 }
 
-fn step_network_after_fork_child(d: &SyscallDispatcher) {
+fn step_network_after_fork_child(d: &SyscallDispatcher, _context: &KernelContext) {
     d.network_after_fork_child();
 }
 
-fn step_epoll_after_fork_child(d: &SyscallDispatcher) {
-    d.epoll_after_fork_child();
+fn step_epoll_after_fork_child(d: &SyscallDispatcher, context: &KernelContext) {
+    d.epoll_after_fork_child(context);
 }
 
-fn step_proc_after_fork_child(d: &SyscallDispatcher) {
+fn step_proc_after_fork_child(d: &SyscallDispatcher, _context: &KernelContext) {
     d.proc_after_fork_child();
 }
 
-fn step_mem_after_fork_child(d: &SyscallDispatcher) {
+fn step_mem_after_fork_child(d: &SyscallDispatcher, _context: &KernelContext) {
     d.mem_after_fork_child();
 }
 
-fn step_sysv_after_fork_child(d: &SyscallDispatcher) {
+fn step_sysv_after_fork_child(d: &SyscallDispatcher, _context: &KernelContext) {
     d.sysv_after_fork_child();
 }
 
@@ -105,10 +109,19 @@ pub(crate) fn after_fork_child_steps() -> &'static [AfterForkChildStep] {
 /// this (FreeBSD keeping its one lane-specific extra step inline at the call
 /// site — see the module doc's Step 1 divergence note). Mirrors the two
 /// former bodies byte-for-byte: same nine hooks, same order.
-pub(crate) fn dispatcher_after_fork_child(dispatcher: &SyscallDispatcher) {
-    for &(_name, step) in after_fork_child_steps() {
-        step(dispatcher);
-    }
+pub(crate) fn dispatcher_after_fork_child(
+    dispatcher: &SyscallDispatcher,
+    inherited_context: &KernelContext,
+) {
+    // The inherited exact generation remains authoritative until the child
+    // publishes its fresh one-task Kernel. Several reset hooks still traverse
+    // concrete file-backed runtime state, so install that exact scope for the
+    // whole ordered reset rather than letting any hook recapture by host PID.
+    dispatcher.with_kernel_credentials(inherited_context, || {
+        for &(_name, step) in after_fork_child_steps() {
+            step(dispatcher, inherited_context);
+        }
+    });
 }
 
 #[cfg(test)]

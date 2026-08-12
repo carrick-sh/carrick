@@ -1469,6 +1469,118 @@ impl Kernel {
         }
     }
 
+    /// Publish one Linux umask change across every live thread that shares the
+    /// caller's exact `FsContext`. Umask remains a typed `Credentials` value,
+    /// but `CLONE_FS` defines its sharing domain; each affected thread receives
+    /// a fresh credential register file preserving that thread's independent
+    /// uid/gid state.
+    pub fn update_fs_umask(
+        self: &Arc<Self>,
+        context: &KernelContext,
+        umask: u32,
+    ) -> Result<KernelContext, KernelOperationError> {
+        if !Arc::ptr_eq(self, &context.kernel) {
+            return Err(KernelOperationError::ForeignContext);
+        }
+        let task_id = context.task.key().id;
+        loop {
+            let observed = self.reservation_epoch();
+            let state = self.registry().state.write();
+            if let Err(KernelOperationError::TaskBusy(_)) = ensure_task_unreserved(&state, task_id)
+            {
+                drop(state);
+                self.wait_for_reservation_change(observed);
+                continue;
+            }
+            ensure_task_unreserved(&state, task_id)?;
+            let caller_record = state
+                .tasks
+                .get(&task_id)
+                .ok_or(KernelOperationError::ParentExited)?;
+            if caller_record.task.key() != context.task.key() {
+                return Err(KernelOperationError::ParentExited);
+            }
+            let caller_thread = caller_record.task.thread(context.thread.key().tid).ok_or(
+                KernelOperationError::UnknownThread(context.thread.key().tid),
+            )?;
+            if caller_thread.key() != context.thread.key()
+                || !Arc::ptr_eq(&caller_thread, &context.thread)
+                || !Arc::ptr_eq(&caller_thread.resources(), &context.resources)
+            {
+                return Err(KernelOperationError::StaleContext);
+            }
+
+            let fs_context = context.resources.fs_context();
+            let mut affected = Vec::new();
+            for record in state.tasks.values() {
+                if record.task.lifecycle() != TaskLifecycle::Live {
+                    continue;
+                }
+                for thread in record.task.threads() {
+                    let resources = thread.resources();
+                    if Arc::ptr_eq(&resources.fs_context(), &fs_context) {
+                        affected.push((
+                            record.task.key().id,
+                            record.revision,
+                            Arc::clone(&record.task),
+                            thread,
+                            resources,
+                        ));
+                    }
+                }
+            }
+
+            if let Some(busy) = affected.iter().find_map(|(affected_task, ..)| {
+                ensure_task_unreserved(&state, *affected_task).err()
+            }) {
+                if matches!(busy, KernelOperationError::TaskBusy(_)) {
+                    drop(state);
+                    self.wait_for_reservation_change(observed);
+                    continue;
+                }
+                return Err(busy);
+            }
+
+            let mut prepared = Vec::with_capacity(affected.len());
+            for (_, revision, task, thread, resources) in affected {
+                let mut credentials = Credentials::for_copy(
+                    self.object_ids().credentials_id()?,
+                    &resources.credentials(),
+                );
+                credentials.set_umask(umask);
+                let replacement = Arc::new(resources.with_credentials(Arc::new(credentials)));
+                prepared.push((revision, task, thread, replacement));
+            }
+
+            if !prepared
+                .iter()
+                .any(|(_, _, thread, _)| thread.key() == context.thread.key())
+            {
+                return Err(KernelOperationError::StaleContext);
+            }
+            let mut caller_publication = None;
+            for (revision, task, thread, replacement) in prepared {
+                thread.replace_resources(Arc::clone(&replacement));
+                self.observe_thread_publication(&thread, &replacement, revision);
+                if thread.key() == context.thread.key() {
+                    caller_publication = Some((revision, task, thread, replacement));
+                }
+            }
+            let Some((revision, task, thread, resources)) = caller_publication else {
+                tracing::error!("umask publication lost its already-validated caller");
+                std::process::abort();
+            };
+            return Ok(KernelContext::from_parts(
+                self.clone(),
+                task,
+                thread,
+                Arc::clone(&context.shared),
+                resources,
+                revision,
+            ));
+        }
+    }
+
     /// Test registry-locked association publication without invoking the exec
     /// backend stop/drain protocol.
     #[cfg(test)]
@@ -1895,7 +2007,25 @@ impl Kernel {
         let task = Arc::clone(&task_record.task);
         let task_revision = task_record.revision;
         let diagnostic_name = task_record.diagnostic_name.clone();
-        let adopter = (task_key != state.root).then_some(state.root);
+        // The run's root task is the reparenting authority only while that
+        // exact generation is live. HVPatch process threads are joined by the
+        // outer runtime after individual process finalizers, so root teardown
+        // can race a descendant's final Kernel publication. Once root has
+        // already become a zombie, the descendant is an orphan with no live
+        // adopter; targeting the retired root would make terminal cleanup fail
+        // closed after the guest process has already exited.
+        let adopter = (task_key != state.root)
+            .then(|| {
+                state
+                    .tasks
+                    .get(&state.root.id)
+                    .filter(|record| {
+                        record.task.key() == state.root
+                            && record.task.lifecycle() == TaskLifecycle::Live
+                    })
+                    .map(|record| record.task.key())
+            })
+            .flatten();
         let mut children = task.children();
         children.sort_by_key(|child| child.serial);
 
@@ -2607,6 +2737,95 @@ mod tests {
             .expect("child exit");
         assert_eq!(zombie.parent, Some(root.task().key()));
         assert_ne!(zombie.parent, Some(parent.task().key()));
+    }
+
+    #[test]
+    fn root_exit_before_descendant_exit_allows_orphan_teardown() {
+        let (kernel, root) = bootstrap(78);
+        let child = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(9_080),
+                "root-orphan".to_string(),
+                None,
+            )
+            .expect("child");
+
+        let root_zombie = kernel
+            .exit_task_key_eventually(
+                root.task().key(),
+                LinuxWaitStatus::from_wait_encoding(0),
+                TaskRusage::default(),
+            )
+            .expect("root exit");
+        assert_eq!(root_zombie.parent, None);
+        assert_eq!(child.task().parent(), None);
+
+        let child_zombie = kernel
+            .exit_task_key_eventually(
+                child.task().key(),
+                LinuxWaitStatus::from_wait_encoding(0),
+                TaskRusage::default(),
+            )
+            .expect("orphan exit after root");
+        assert_eq!(child_zombie.parent, None);
+    }
+
+    #[test]
+    fn umask_updates_every_live_clone_fs_peer_without_sharing_identity() {
+        let (kernel, root) = bootstrap(79);
+        let shared = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::FS).expect("CLONE_FS plan"),
+                ThreadId::synthetic_for_tests(9_081),
+                "shared-fs".to_string(),
+                None,
+            )
+            .expect("shared-FS child");
+        let root_after_shared_fork = root
+            .task_binding()
+            .capture(root.thread().key().tid)
+            .expect("root after shared-FS fork");
+        let private = kernel
+            .fork_task(
+                &root_after_shared_fork,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(9_082),
+                "private-fs".to_string(),
+                None,
+            )
+            .expect("private-FS child");
+        let shared = kernel
+            .update_credentials(&shared, |credentials| {
+                credentials.seed_identity(1001, 2001);
+            })
+            .expect("independent child identity");
+        let root_context = root
+            .task_binding()
+            .capture(root.thread().key().tid)
+            .expect("fresh root context");
+        kernel
+            .update_fs_umask(&root_context, 0o077)
+            .expect("publish shared umask");
+
+        let root_after = root
+            .task_binding()
+            .capture(root.thread().key().tid)
+            .expect("root after umask");
+        let shared_after = shared
+            .task_binding()
+            .capture(shared.thread().key().tid)
+            .expect("shared peer after umask");
+        let private_after = private
+            .task_binding()
+            .capture(private.thread().key().tid)
+            .expect("private peer after umask");
+        assert_eq!(root_after.resources().credentials().umask(), 0o077);
+        assert_eq!(shared_after.resources().credentials().umask(), 0o077);
+        assert_eq!(shared_after.resources().credentials().euid(), 1001);
+        assert_eq!(private_after.resources().credentials().umask(), 0o022);
     }
 
     #[test]

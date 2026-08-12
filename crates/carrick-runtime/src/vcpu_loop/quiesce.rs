@@ -828,7 +828,7 @@ where
                     crate::event_ring::reinit_after_fork();
                     crate::host_signal::reinit_after_fork();
                     crate::dispatch::reset_fifo_beacons_after_fork_child();
-                    kernel.dispatcher.epoll_after_fork_child();
+                    kernel.dispatcher.epoll_after_fork_child(kernel_context);
                     // Publish THIS child (new host pid) as Booting in the SHARED
                     // run-state table, before any post-fork boot work that parks the
                     // vCPU in the host's internal boot ppoll — so a parent reading
@@ -862,6 +862,11 @@ where
                             std::process::abort();
                         });
                     self.linux_tid = child_context.thread().key().tid;
+                    // `libc::fork` changed the execution owner. Replace the
+                    // syscall-entry parent context before the common signal
+                    // boundary so child delivery cannot use or recapture the
+                    // retired parent generation.
+                    self.service_kernel_context = Some(child_context.retain_exact());
                     // Re-stamp from the exact child generation published above.
                     stamp_identity_page(engine, &kernel.dispatcher, &child_context);
                     if let Some(addr) = parent_tid_addr {

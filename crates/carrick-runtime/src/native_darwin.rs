@@ -8299,7 +8299,7 @@ fn handle_native_fork(
             0,
         );
         child_phase_start = Instant::now();
-        native_after_fork_child(dispatcher);
+        native_after_fork_child(dispatcher, parent_context);
         native_trace_fork_phase("child-dispatcher-reset");
         crate::probes::native_fork_lifecycle(
             NativeForkPhase::ChildDispatcherReset,
@@ -8753,8 +8753,11 @@ pub(crate) fn native_poll_child_exit_watches() {
 /// `crate::native::fork_child` for the ordered hook list and the Task 5
 /// Step 1 divergence note (Darwin has no lane-specific extra step; this is a
 /// bare call).
-fn native_after_fork_child(dispatcher: &SyscallDispatcher) {
-    crate::native::fork_child::dispatcher_after_fork_child(dispatcher);
+fn native_after_fork_child(
+    dispatcher: &SyscallDispatcher,
+    inherited_context: &crate::kernel::KernelContext,
+) {
+    crate::native::fork_child::dispatcher_after_fork_child(dispatcher, inherited_context);
 }
 
 fn pipe_pair() -> Result<(RawFd, RawFd), RuntimeError> {
