@@ -42,6 +42,7 @@ pub(crate) struct IpcFileAuthority {
 struct IpcInner {
     socket: Mutex<UnixDatagram>,
     process_lock: OwnedFd,
+    _lifetime_write: OwnedFd,
     server: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -65,21 +66,57 @@ impl IpcFileAuthority {
     ) -> Result<(Self, FileAuthorityBinding), AuthorityFatal> {
         let (client, server) = cloexec_datagram_pair()?;
         let process_lock = cloexec_process_lock()?;
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
+        let (lifetime_read, lifetime_write) = cloexec_pipe()?;
+        let inherited_fd_limit = inherited_fd_scan_limit()?;
+        // Double-fork so the authority is not a long-lived zombie after its
+        // final inherited endpoint closes. The intermediate child is reaped
+        // synchronously before this constructor returns; host init owns and
+        // reaps the detached authority process. Both forks happen at the run
+        // root, before guest threads exist.
+        let launcher = unsafe { libc::fork() };
+        if launcher < 0 {
             return Err(AuthorityFatal::TransportUnavailable);
         }
-        if pid == 0 {
+        if launcher == 0 {
             drop(client);
-            serve(server, core);
+            drop(lifetime_write);
+            let helper = unsafe { libc::fork() };
+            if helper < 0 {
+                unsafe { libc::_exit(1) };
+            }
+            if helper == 0 {
+                close_unrelated_helper_fds(
+                    server.as_raw_fd(),
+                    lifetime_read.as_raw_fd(),
+                    inherited_fd_limit,
+                );
+                serve(server, lifetime_read, core);
+                unsafe { libc::_exit(0) };
+            }
             unsafe { libc::_exit(0) };
         }
         drop(server);
+        drop(lifetime_read);
+        let mut launcher_status = 0;
+        loop {
+            let waited = unsafe { libc::waitpid(launcher, &raw mut launcher_status, 0) };
+            if waited == launcher {
+                break;
+            }
+            if waited < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(AuthorityFatal::TransportUnavailable);
+        }
+        if !libc::WIFEXITED(launcher_status) || libc::WEXITSTATUS(launcher_status) != 0 {
+            return Err(AuthorityFatal::TransportUnavailable);
+        }
         configure_client(&client)?;
         let transport = Self {
             inner: Arc::new(IpcInner {
                 socket: Mutex::new(client),
                 process_lock,
+                _lifetime_write: lifetime_write,
                 server: Mutex::new(None),
             }),
         };
@@ -132,6 +169,7 @@ impl IpcFileAuthority {
         ))
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare_single_use_reexec_successor(
         &self,
         nonce: u64,
@@ -144,9 +182,11 @@ impl IpcFileAuthority {
         let socket = self.inner.socket.lock();
         let socket_fd = duplicate_cloexec(socket.as_raw_fd())?;
         let process_lock_fd = duplicate_cloexec(self.inner.process_lock.as_raw_fd())?;
+        let lifetime_write_fd = duplicate_cloexec(self.inner._lifetime_write.as_raw_fd())?;
         Ok(ReexecSuccessorEndpoint {
             socket_fd,
             process_lock_fd,
+            lifetime_write_fd,
             nonce,
         })
     }
@@ -158,15 +198,17 @@ impl IpcFileAuthority {
     pub(super) fn for_model_tests(core: FileAuthorityCore) -> Result<Self, AuthorityFatal> {
         let (client, server) = cloexec_datagram_pair()?;
         let process_lock = cloexec_process_lock()?;
+        let (lifetime_read, lifetime_write) = cloexec_pipe()?;
         configure_client(&client)?;
         let server_thread = std::thread::Builder::new()
             .name("carrick-file-authority-model".to_owned())
-            .spawn(move || serve(server, core))
+            .spawn(move || serve(server, lifetime_read, core))
             .map_err(|_| AuthorityFatal::TransportUnavailable)?;
         Ok(Self {
             inner: Arc::new(IpcInner {
                 socket: Mutex::new(client),
                 process_lock,
+                _lifetime_write: lifetime_write,
                 server: Mutex::new(Some(server_thread)),
             }),
         })
@@ -199,12 +241,15 @@ impl FileAuthorityTransport for IpcFileAuthority {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct ReexecSuccessorEndpoint {
     socket_fd: OwnedFd,
     process_lock_fd: OwnedFd,
+    lifetime_write_fd: OwnedFd,
     nonce: u64,
 }
 
+#[cfg(test)]
 impl ReexecSuccessorEndpoint {
     pub(crate) const fn nonce(&self) -> u64 {
         self.nonce
@@ -218,6 +263,10 @@ impl ReexecSuccessorEndpoint {
         self.process_lock_fd.as_raw_fd()
     }
 
+    pub(crate) fn lifetime_write_fd(&self) -> RawFd {
+        self.lifetime_write_fd.as_raw_fd()
+    }
+
     pub(crate) fn adopt(self, nonce: u64) -> Result<IpcFileAuthority, AuthorityFatal> {
         if nonce != self.nonce {
             return Err(AuthorityFatal::InvariantViolation(
@@ -226,11 +275,13 @@ impl ReexecSuccessorEndpoint {
         }
         ensure_cloexec(self.socket_fd.as_raw_fd())?;
         ensure_cloexec(self.process_lock_fd.as_raw_fd())?;
+        ensure_cloexec(self.lifetime_write_fd.as_raw_fd())?;
         configure_client_fd(self.socket_fd.as_raw_fd())?;
         Ok(IpcFileAuthority {
             inner: Arc::new(IpcInner {
                 socket: Mutex::new(UnixDatagram::from(self.socket_fd)),
                 process_lock: self.process_lock_fd,
+                _lifetime_write: self.lifetime_write_fd,
                 server: Mutex::new(None),
             }),
         })
@@ -251,8 +302,124 @@ impl Drop for IpcInner {
     }
 }
 
-fn serve(socket: UnixDatagram, mut core: FileAuthorityCore) {
-    while let Ok(received) = recv_frame(&socket) {
+fn inherited_fd_scan_limit() -> Result<libc::c_int, AuthorityFatal> {
+    #[cfg(target_os = "macos")]
+    {
+        // libproc reports the exact live descriptor set. Return one past its
+        // maximum so helper cleanup is proportional to inherited state rather
+        // than to macOS's commonly million-entry RLIMIT_NOFILE.
+        let bytes = unsafe {
+            libc::proc_pidinfo(
+                libc::getpid(),
+                libc::PROC_PIDLISTFDS,
+                0,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if bytes < 0 {
+            return Err(AuthorityFatal::TransportUnavailable);
+        }
+        let count = usize::try_from(bytes)
+            .ok()
+            .and_then(|value| value.checked_div(std::mem::size_of::<libc::proc_fdinfo>()))
+            .ok_or(AuthorityFatal::TransportUnavailable)?;
+        let mut descriptors = Vec::<libc::proc_fdinfo>::new();
+        descriptors
+            .try_reserve_exact(count)
+            .map_err(|_| AuthorityFatal::TransportUnavailable)?;
+        let capacity = count
+            .checked_mul(std::mem::size_of::<libc::proc_fdinfo>())
+            .and_then(|value| libc::c_int::try_from(value).ok())
+            .ok_or(AuthorityFatal::TransportUnavailable)?;
+        let written = unsafe {
+            libc::proc_pidinfo(
+                libc::getpid(),
+                libc::PROC_PIDLISTFDS,
+                0,
+                descriptors.as_mut_ptr().cast(),
+                capacity,
+            )
+        };
+        if written < 0 {
+            return Err(AuthorityFatal::TransportUnavailable);
+        }
+        let written_count = usize::try_from(written)
+            .ok()
+            .and_then(|value| value.checked_div(std::mem::size_of::<libc::proc_fdinfo>()))
+            .ok_or(AuthorityFatal::TransportUnavailable)?;
+        if written_count > count {
+            return Err(AuthorityFatal::TransportUnavailable);
+        }
+        unsafe {
+            descriptors.set_len(written_count);
+        }
+        descriptors
+            .into_iter()
+            .map(|descriptor| descriptor.proc_fd)
+            .max()
+            .unwrap_or(2)
+            .checked_add(1)
+            .ok_or(AuthorityFatal::TransportUnavailable)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
+            return Err(AuthorityFatal::TransportUnavailable);
+        }
+        libc::c_int::try_from(limit.rlim_cur).map_err(|_| AuthorityFatal::TransportUnavailable)
+    }
+}
+
+fn close_unrelated_helper_fds(
+    server_fd: RawFd,
+    lifetime_read_fd: RawFd,
+    inherited_fd_limit: libc::c_int,
+) {
+    for fd in 0..inherited_fd_limit {
+        if fd != server_fd && fd != lifetime_read_fd {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+}
+
+fn serve(socket: UnixDatagram, lifetime_read: OwnedFd, mut core: FileAuthorityCore) {
+    loop {
+        let mut fds = [
+            libc::pollfd {
+                fd: socket.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: lifetime_read.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break;
+        }
+        if fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            break;
+        }
+        if fds[0].revents & libc::POLLIN == 0 {
+            if fds[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                break;
+            }
+            continue;
+        }
+        let received = match recv_frame(&socket) {
+            Ok(received) => received,
+            Err(_) => break,
+        };
         let request = match decode_request(&received.bytes, received.descriptors.len()) {
             Ok(request) => request,
             Err(_) => break,
@@ -287,7 +454,12 @@ impl ProcessTransactionLock {
         let mut lock: libc::flock = unsafe { std::mem::zeroed() };
         lock.l_type = libc::F_WRLCK as _;
         lock.l_whence = libc::SEEK_SET as _;
-        let rc = unsafe { libc::fcntl(fd, libc::F_OFD_SETLKW, &lock) };
+        // POSIX record locks are associated with the calling process, so an
+        // inherited lock fd serializes parent and child. OFD locks would not:
+        // both processes inherit the same open-file description and would be
+        // treated as one owner, allowing interleaved datagram request/reply
+        // pairs on the shared endpoint.
+        let rc = unsafe { libc::fcntl(fd, libc::F_SETLKW, &lock) };
         if rc < 0 {
             return Err(AuthorityFatal::TransportUnavailable);
         }
@@ -300,7 +472,7 @@ impl Drop for ProcessTransactionLock {
         let mut lock: libc::flock = unsafe { std::mem::zeroed() };
         lock.l_type = libc::F_UNLCK as _;
         lock.l_whence = libc::SEEK_SET as _;
-        if unsafe { libc::fcntl(self.fd, libc::F_OFD_SETLK, &lock) } < 0 {
+        if unsafe { libc::fcntl(self.fd, libc::F_SETLK, &lock) } < 0 {
             std::process::abort();
         }
     }
@@ -366,6 +538,7 @@ fn configure_client_fd(fd: RawFd) -> Result<(), AuthorityFatal> {
     Ok(())
 }
 
+#[cfg(test)]
 fn duplicate_cloexec(fd: RawFd) -> Result<OwnedFd, AuthorityFatal> {
     let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
     if duplicated < 0 {
@@ -374,12 +547,25 @@ fn duplicate_cloexec(fd: RawFd) -> Result<OwnedFd, AuthorityFatal> {
     Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
 }
 
+#[cfg(test)]
 fn ensure_cloexec(fd: RawFd) -> Result<(), AuthorityFatal> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     if flags < 0 || flags & libc::FD_CLOEXEC == 0 {
         return Err(AuthorityFatal::TransportUnavailable);
     }
     Ok(())
+}
+
+fn cloexec_pipe() -> Result<(OwnedFd, OwnedFd), AuthorityFatal> {
+    let mut fds = [-1; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(AuthorityFatal::TransportUnavailable);
+    }
+    let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    set_cloexec(read.as_raw_fd())?;
+    set_cloexec(write.as_raw_fd())?;
+    Ok((read, write))
 }
 
 fn cloexec_datagram_pair() -> Result<(UnixDatagram, UnixDatagram), AuthorityFatal> {

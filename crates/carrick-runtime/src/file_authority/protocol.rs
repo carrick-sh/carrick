@@ -36,6 +36,7 @@ struct Header {
     expected_generation: u64,
 }
 
+#[cfg(test)]
 pub(super) fn encode_request(request: &Request) -> Result<Vec<u8>, AuthorityFatal> {
     encode_request_with_fd_count(request, 0)
 }
@@ -94,6 +95,7 @@ pub(super) fn decode_request(
     })
 }
 
+#[cfg(test)]
 pub(super) fn encode_response(
     request: &Request,
     response: &Response,
@@ -2338,7 +2340,9 @@ impl<'a> Reader<'a> {
             .get(self.offset..end)
             .ok_or(AuthorityFatal::MalformedFrame("truncated frame"))?;
         self.offset = end;
-        Ok(slice.try_into().expect("fixed-size frame field"))
+        slice
+            .try_into()
+            .map_err(|_| AuthorityFatal::MalformedFrame("fixed-size frame field mismatch"))
     }
     fn u8(&mut self) -> Result<u8, AuthorityFatal> {
         Ok(self.take::<1>()?[0])

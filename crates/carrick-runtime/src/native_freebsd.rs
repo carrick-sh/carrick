@@ -8345,6 +8345,9 @@ pub(crate) fn run_static_x86_elf_bytes(
     env: Vec<Vec<u8>>,
     max_traps: usize,
 ) -> Result<RunResult, RuntimeError> {
+    dispatcher.activate_file_authority().map_err(|error| {
+        RuntimeError::Configuration(format!("activate per-run FileAuthority: {error}"))
+    })?;
     // Held for the whole run: the fixed arenas and the process-wide fault
     // shim cannot be shared across concurrent in-process runs.
     let _run_guard = RUN_LOCK.lock().unwrap_or_else(|p| p.into_inner());

@@ -184,6 +184,9 @@ where
     E::SiblingSpec: 'static,
     H: HostBackend,
 {
+    dispatcher.activate_file_authority().map_err(|error| {
+        RuntimeError::Configuration(format!("activate per-run FileAuthority: {error}"))
+    })?;
     use crate::thread::{FutexTable, ThreadId, ThreadRegistry};
     use crate::vcpu_loop::{
         KernelState, PlatformFutexFactory, VcpuLoopOutcome, run_vcpu_until_exit,

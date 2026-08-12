@@ -2665,6 +2665,10 @@ fn run_image_in_child(
         child_dup2_or_exit(stderr_pipe.1, libc::STDERR_FILENO);
         close_fd(stdout_pipe.1);
         close_fd(stderr_pipe.1);
+        if let Err(error) = dispatcher.activate_file_authority() {
+            child_write_stderr(format!("activate per-run FileAuthority: {error}\n").as_bytes());
+            unsafe { libc::_exit(125) };
+        }
 
         // The launch-owned CLI is the DTrace `$target`, but THIS fork child is
         // the first native translator owner. Publish its checked Darwin birth
