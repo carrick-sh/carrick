@@ -1,0 +1,8 @@
+[
+  {
+    "file": "crates/carrick-runtime/src/kernel/objects.rs",
+    "old": "epoll_wake_registry,\n            functional_refs_active: AtomicBool::new(true),",
+    "new": "epoll_wake_registry,\n            functional_gate: Arc::new(FileTableFunctionalGate::new()),\n            functional_refs_active: AtomicBool::new(true),",
+    "count": 2
+  }
+]

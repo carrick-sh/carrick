@@ -1,0 +1,8 @@
+[
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "old": "crate::dispatch::EpollKqueue::new(mux, this.captured_file_table().epoll_wake_registry.clone())",
+    "new": "crate::dispatch::EpollKqueue::new(\n                    mux,\n                    Arc::clone(this.captured_file_table().epoll_wake_registry()),\n                )",
+    "count": 2
+  }
+]

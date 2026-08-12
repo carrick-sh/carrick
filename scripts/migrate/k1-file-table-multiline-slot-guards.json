@@ -1,0 +1,38 @@
+[
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": ".open_files\n            .read()",
+    "new": ".read_open_files()",
+    "count": 4
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": ".open_files\n            .write()",
+    "new": ".write_open_files()",
+    "count": 5
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "old": ".open_files\n                .read()",
+    "new": ".read_open_files()",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/ioring.rs",
+    "old": ".open_files\n                    .write()",
+    "new": ".write_open_files()",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": ".open_files\n                .read()",
+    "new": ".read_open_files()",
+    "count": 1
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/fd_helpers.rs",
+    "old": ".open_files\n            .read()",
+    "new": ".read_open_files()",
+    "count": 3
+  }
+]

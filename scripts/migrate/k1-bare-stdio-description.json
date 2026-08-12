@@ -1,0 +1,14 @@
+[
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "                let pty = self.dup_stdio_pty_role(old_fd);\n                Arc::new(RwLock::new(OpenDescription::HostPipe {",
+    "new": "                let pty = self.dup_stdio_pty_role(old_fd);\n                kernel_file_description(Arc::new(RwLock::new(OpenDescription::HostPipe {",
+    "count": 2
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "                    write_kind,\n                }))\n            }\n            None => return DispatchOutcome::errno(LINUX_EBADF),",
+    "new": "                    write_kind,\n                })))\n            }\n            None => return DispatchOutcome::errno(LINUX_EBADF),",
+    "count": 2
+  }
+]

@@ -1,0 +1,8 @@
+[
+  {
+    "file": "crates/carrick-runtime/src/kernel/objects.rs",
+    "old": "            epoll_wake_registry,\n            revision: ObjectRevision::new(),",
+    "new": "            epoll_wake_registry,\n            functional_refs_active: AtomicBool::new(true),\n            revision: ObjectRevision::new(),",
+    "count": 2
+  }
+]

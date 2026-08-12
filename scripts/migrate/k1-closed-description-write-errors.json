@@ -1,0 +1,8 @@
+[
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "old": "            let errno = match &*open {\n                OpenDescription::File { .. } | OpenDescription::SyntheticFile { .. } => LINUX_EBADF,",
+    "new": "            let errno = match &*open {\n                OpenDescription::Closed { .. }\n                | OpenDescription::File { .. }\n                | OpenDescription::SyntheticFile { .. } => LINUX_EBADF,",
+    "count": 2
+  }
+]
