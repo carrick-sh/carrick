@@ -1,3 +1,5 @@
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+
 use super::types::{DescriptionBackingSnapshot, VfsObjectId};
 
 /// Actual authority-owned payload for an open file description.
@@ -7,24 +9,35 @@ use super::types::{DescriptionBackingSnapshot, VfsObjectId};
 /// added here as their operation families move behind the same closed API.
 #[derive(Debug)]
 pub(super) enum AuthorityBacking {
-    SyntheticFile { contents: Vec<u8> },
-    VfsFile { object: VfsObjectId },
+    Synthetic { contents: Vec<u8> },
+    Vfs { object: VfsObjectId },
+    Host { fd: OwnedFd, writable: bool },
 }
 
 impl AuthorityBacking {
     pub(super) fn snapshot(&self) -> DescriptionBackingSnapshot {
         match self {
-            Self::SyntheticFile { contents } => DescriptionBackingSnapshot::Synthetic {
+            Self::Synthetic { contents } => DescriptionBackingSnapshot::Synthetic {
                 length: u64::try_from(contents.len()).unwrap_or(u64::MAX),
             },
-            Self::VfsFile { object } => DescriptionBackingSnapshot::VfsFile { object: *object },
+            Self::Vfs { object } => DescriptionBackingSnapshot::VfsFile { object: *object },
+            Self::Host { writable, .. } => DescriptionBackingSnapshot::HostFile {
+                writable: *writable,
+            },
         }
     }
 
     pub(super) const fn vfs_object(&self) -> Option<VfsObjectId> {
         match self {
-            Self::SyntheticFile { .. } => None,
-            Self::VfsFile { object } => Some(*object),
+            Self::Synthetic { .. } | Self::Host { .. } => None,
+            Self::Vfs { object } => Some(*object),
+        }
+    }
+
+    pub(super) fn host_fd(&self) -> Option<RawFd> {
+        match self {
+            Self::Host { fd, .. } => Some(fd.as_raw_fd()),
+            Self::Synthetic { .. } | Self::Vfs { .. } => None,
         }
     }
 }

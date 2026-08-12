@@ -1,14 +1,17 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroU64;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use crate::kernel::ObjectIdRegistry;
 
 use super::backing::AuthorityBacking;
 use super::types::{
-    AccessMode, AuthorityEpoch, AuthorityError, AuthorityFatal, ByteCount, CanonicalPath, ClientId,
-    ClientIdentity, Command, DescriptionSnapshot, DescriptorFlags, FileDescriptionId, FileOffset,
-    FileSlotNumber, FileTableId, NofileAllocationCeiling, ObjectGeneration, Outcome, Request,
-    Response, Revision, SeekWhence, SlotSnapshot, StatusFlags, VfsObjectId,
+    AccessMode, AuthorityCall, AuthorityEpoch, AuthorityError, AuthorityFatal, AuthorityReply,
+    ByteCount, CanonicalPath, CapabilityLeaseDisposition, CapabilityLeaseId,
+    CapabilityLeasePurpose, ClientId, ClientIdentity, Command, DescriptionSnapshot,
+    DescriptorFlags, FileDescriptionId, FileOffset, FileSlotNumber, FileTableId,
+    NofileAllocationCeiling, ObjectGeneration, Outcome, Request, Response, Revision, SeekWhence,
+    SlotSnapshot, StatusFlags, VfsObjectId,
 };
 
 pub(super) const MAX_TERMINAL_DEDUP_ENTRIES: usize = 8_192;
@@ -48,6 +51,7 @@ struct FileDescriptionState {
     /// Reachable fd-table slots across every table, not transient operations,
     /// client bindings, namespace links, or Rust ownership handles.
     logical_slot_refs: u64,
+    capability_lease_refs: u64,
     offset: FileOffset,
     access_mode: AccessMode,
     status_flags: StatusFlags,
@@ -88,6 +92,14 @@ struct TerminalDedupEntry {
     response: Response,
 }
 
+#[derive(Debug)]
+struct CapabilityLeaseState {
+    owner: ClientIdentity,
+    description: FileDescriptionId,
+    description_generation: ObjectGeneration,
+    purpose: CapabilityLeasePurpose,
+}
+
 /// One run's mutable file and writable-memory-VFS authority.
 ///
 /// `execute` is the sole mutation boundary used by both direct and IPC
@@ -97,6 +109,7 @@ pub(crate) struct FileAuthorityCore {
     epoch: AuthorityEpoch,
     ids: ObjectIdRegistry,
     next_vfs_object: u64,
+    next_capability_lease: u64,
     revision: Revision,
     namespace_revision: Revision,
     clients: HashMap<ClientId, ClientIdentity>,
@@ -104,6 +117,7 @@ pub(crate) struct FileAuthorityCore {
     descriptions: BTreeMap<FileDescriptionId, FileDescriptionState>,
     namespace: BTreeMap<CanonicalPath, VfsObjectId>,
     vfs_objects: BTreeMap<VfsObjectId, VfsObjectState>,
+    capability_leases: BTreeMap<CapabilityLeaseId, CapabilityLeaseState>,
     // Each authenticated client may have exactly one outstanding request. A
     // later request from that client therefore acknowledges the prior terminal
     // response and replaces this entry; a same-id retry replays it verbatim.
@@ -116,6 +130,7 @@ impl FileAuthorityCore {
             epoch,
             ids: ObjectIdRegistry::new(),
             next_vfs_object: 1,
+            next_capability_lease: 1,
             revision: Revision::ZERO,
             namespace_revision: Revision::ZERO,
             clients: HashMap::new(),
@@ -123,6 +138,7 @@ impl FileAuthorityCore {
             descriptions: BTreeMap::new(),
             namespace: BTreeMap::new(),
             vfs_objects: BTreeMap::new(),
+            capability_leases: BTreeMap::new(),
             dedup: HashMap::new(),
         }
     }
@@ -135,8 +151,78 @@ impl FileAuthorityCore {
         self.revision
     }
 
-    pub(crate) fn execute(&mut self, request: Request) -> Result<Response, AuthorityFatal> {
+    pub(crate) fn execute_call(
+        &mut self,
+        mut call: AuthorityCall,
+    ) -> Result<AuthorityReply, AuthorityFatal> {
+        if call.capabilities.len() != expected_request_capabilities(&call.request.command) {
+            return Err(AuthorityFatal::CapabilityMismatch);
+        }
+        for capability in &call.capabilities {
+            ensure_cloexec(capability.as_raw_fd())?;
+        }
+        let response = self.execute_record(call.request, &mut call.capabilities)?;
+        if !call.capabilities.is_empty() {
+            return Err(AuthorityFatal::InvariantViolation(
+                "fresh authority request left inbound capabilities unconsumed",
+            ));
+        }
+        let capabilities = self.materialize_response_capabilities(&response)?;
+        Ok(AuthorityReply {
+            response,
+            capabilities,
+        })
+    }
+
+    fn materialize_response_capabilities(
+        &self,
+        response: &Response,
+    ) -> Result<Vec<OwnedFd>, AuthorityFatal> {
+        let Outcome::CapabilityLeaseGranted {
+            lease,
+            description,
+            description_generation,
+            purpose,
+            ..
+        } = &response.outcome
+        else {
+            return Ok(Vec::new());
+        };
+        let lease_state =
+            self.capability_leases
+                .get(lease)
+                .ok_or(AuthorityFatal::InvariantViolation(
+                    "terminal response referenced a missing lease",
+                ))?;
+        if lease_state.description != *description
+            || lease_state.description_generation != *description_generation
+            || lease_state.purpose != *purpose
+        {
+            return Err(AuthorityFatal::InvariantViolation(
+                "terminal response disagreed with its capability lease",
+            ));
+        }
+        let fd = self
+            .descriptions
+            .get(description)
+            .and_then(|state| state.backing.host_fd())
+            .ok_or(AuthorityFatal::InvariantViolation(
+                "capability lease lost its host descriptor backing",
+            ))?;
+        let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if duplicated < 0 {
+            return Err(AuthorityFatal::TransportUnavailable);
+        }
+        Ok(vec![unsafe { OwnedFd::from_raw_fd(duplicated) }])
+    }
+
+    fn execute_record(
+        &mut self,
+        request: Request,
+        capabilities: &mut Vec<OwnedFd>,
+    ) -> Result<Response, AuthorityFatal> {
         if request.epoch != self.epoch {
+            capabilities.clear();
             return Ok(Response {
                 request_id: request.request_id,
                 authority_revision: self.revision,
@@ -149,6 +235,7 @@ impl FileAuthorityCore {
         if let Some(prior) = self.dedup.get(&request.client) {
             if prior.request.request_id == request.request_id {
                 if prior.request == request {
+                    capabilities.clear();
                     return Ok(prior.response.clone());
                 }
                 return Err(AuthorityFatal::RequestConflict);
@@ -169,10 +256,13 @@ impl FileAuthorityCore {
             return Err(AuthorityFatal::DedupExhausted);
         }
 
-        let outcome = match self.execute_fresh(&request) {
+        let outcome = match self.execute_fresh(&request, capabilities) {
             Ok(outcome) => outcome,
             Err(error) => Outcome::Rejected(error),
         };
+        // Rejections and duplicate terminal requests must close any transferred
+        // rights that the operation did not adopt.
+        capabilities.clear();
         self.finish(request, outcome)
     }
 
@@ -196,7 +286,11 @@ impl FileAuthorityCore {
         Ok(response)
     }
 
-    fn execute_fresh(&mut self, request: &Request) -> Result<Outcome, AuthorityError> {
+    fn execute_fresh(
+        &mut self,
+        request: &Request,
+        capabilities: &mut Vec<OwnedFd>,
+    ) -> Result<Outcome, AuthorityError> {
         match &request.command {
             Command::RegisterClient => self.register_client(request),
             _ => {
@@ -265,6 +359,39 @@ impl FileAuthorityCore {
                         *status_flags,
                         path.clone(),
                     ),
+                    Command::AdoptHostFileAndInstall {
+                        table,
+                        minimum,
+                        ceiling,
+                        descriptor_flags,
+                        access_mode,
+                        status_flags,
+                        writable,
+                        path,
+                    } => self.adopt_host_file_and_install(
+                        request.client,
+                        *table,
+                        request.expected_generation,
+                        *minimum,
+                        *ceiling,
+                        *descriptor_flags,
+                        *access_mode,
+                        *status_flags,
+                        *writable,
+                        path.clone(),
+                        capabilities,
+                    ),
+                    Command::AcquireCapabilityLease { table, fd, purpose } => self
+                        .acquire_capability_lease(
+                            request.client,
+                            *table,
+                            request.expected_generation,
+                            *fd,
+                            *purpose,
+                        ),
+                    Command::ReleaseCapabilityLease { lease, disposition } => {
+                        self.release_capability_lease(request.client, *lease, *disposition)
+                    }
                     Command::ResolveSlot { table, fd } => {
                         self.resolve_slot(request.client, *table, request.expected_generation, *fd)
                     }
@@ -373,6 +500,11 @@ impl FileAuthorityCore {
                     .is_some_and(|table| table.bindings.len() == 1)
             })
             .collect();
+        let owned_leases: Vec<CapabilityLeaseId> = self
+            .capability_leases
+            .iter()
+            .filter_map(|(lease, state)| (state.owner == identity).then_some(*lease))
+            .collect();
         let revision = self.publish_mutation();
         for table_id in &affected {
             let table = self.tables.get_mut(table_id).unwrap_or_else(|| {
@@ -394,6 +526,14 @@ impl FileAuthorityCore {
         }
         for description in released {
             self.release_description_ref(description, revision);
+        }
+        for lease in owned_leases {
+            let state = self.capability_leases.remove(&lease).unwrap_or_else(|| {
+                abort_fatal(AuthorityFatal::InvariantViolation(
+                    "client exit lost an owned capability lease",
+                ))
+            });
+            self.release_capability_lease_ref(state.description, revision);
         }
         self.clients.remove(&identity.id);
         Ok(Outcome::ClientExited)
@@ -671,7 +811,7 @@ impl FileAuthorityCore {
             access_mode,
             status_flags,
             path,
-            AuthorityBacking::VfsFile { object },
+            AuthorityBacking::Vfs { object },
             Some(open_description_refs),
         ))
     }
@@ -702,9 +842,143 @@ impl FileAuthorityCore {
             access_mode,
             status_flags,
             path,
-            AuthorityBacking::SyntheticFile { contents },
+            AuthorityBacking::Synthetic { contents },
             None,
         ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn adopt_host_file_and_install(
+        &mut self,
+        client: ClientIdentity,
+        table: FileTableId,
+        table_generation: ObjectGeneration,
+        minimum: FileSlotNumber,
+        ceiling: NofileAllocationCeiling,
+        descriptor_flags: DescriptorFlags,
+        access_mode: AccessMode,
+        status_flags: StatusFlags,
+        writable: bool,
+        path: Option<CanonicalPath>,
+        capabilities: &mut Vec<OwnedFd>,
+    ) -> Result<Outcome, AuthorityError> {
+        self.require_bound_table(client, table, table_generation)?;
+        if access_mode.writable() && !writable {
+            return Err(AuthorityError::BackingReadOnly);
+        }
+        let host_fd = capabilities.first().unwrap_or_else(|| {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "host-file adoption lost its validated descriptor",
+            ))
+        });
+        validate_host_file(host_fd.as_raw_fd(), access_mode)?;
+        let fd = self.allocate_lowest(table, minimum, ceiling)?;
+        let description = self.allocate_description();
+        let host_fd = capabilities.pop().unwrap_or_else(|| {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "host-file adoption lost its prepared descriptor",
+            ))
+        });
+        Ok(self.commit_new_description_install(
+            table,
+            fd,
+            description,
+            descriptor_flags,
+            access_mode,
+            status_flags,
+            path,
+            AuthorityBacking::Host {
+                fd: host_fd,
+                writable,
+            },
+            None,
+        ))
+    }
+
+    fn acquire_capability_lease(
+        &mut self,
+        client: ClientIdentity,
+        table: FileTableId,
+        expected: ObjectGeneration,
+        fd: FileSlotNumber,
+        purpose: CapabilityLeasePurpose,
+    ) -> Result<Outcome, AuthorityError> {
+        let slot = self.slot(client, table, expected, fd)?.clone();
+        let state = self
+            .descriptions
+            .get(&slot.description)
+            .ok_or(AuthorityError::DescriptionNotFound)?;
+        if state.backing.host_fd().is_none() {
+            return Err(AuthorityError::NotHostBacked);
+        }
+        let capability_lease_refs =
+            state
+                .capability_lease_refs
+                .checked_add(1)
+                .unwrap_or_else(|| {
+                    abort_fatal(AuthorityFatal::InvariantViolation(
+                        "capability lease reference overflow",
+                    ))
+                });
+        let lease = self.allocate_capability_lease();
+        let revision = self.publish_mutation();
+        let state = self
+            .descriptions
+            .get_mut(&slot.description)
+            .unwrap_or_else(|| {
+                abort_fatal(AuthorityFatal::InvariantViolation(
+                    "capability lease lost its validated description",
+                ))
+            });
+        state.capability_lease_refs = capability_lease_refs;
+        state.revision = revision;
+        self.capability_leases.insert(
+            lease,
+            CapabilityLeaseState {
+                owner: client,
+                description: slot.description,
+                description_generation: slot.description_generation,
+                purpose,
+            },
+        );
+        Ok(Outcome::CapabilityLeaseGranted {
+            lease,
+            description: slot.description,
+            description_generation: slot.description_generation,
+            purpose,
+            revision,
+        })
+    }
+
+    fn release_capability_lease(
+        &mut self,
+        client: ClientIdentity,
+        lease: CapabilityLeaseId,
+        disposition: CapabilityLeaseDisposition,
+    ) -> Result<Outcome, AuthorityError> {
+        let lease_state = self
+            .capability_leases
+            .get(&lease)
+            .ok_or(AuthorityError::CapabilityLeaseNotFound)?;
+        if lease_state.owner != client {
+            return Err(AuthorityError::CapabilityLeaseNotFound);
+        }
+        let description = lease_state.description;
+        let revision = self.publish_mutation();
+        self.capability_leases.remove(&lease).unwrap_or_else(|| {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "capability release lost its validated lease",
+            ))
+        });
+        let (description_reclaimed, object_reclaimed) =
+            self.release_capability_lease_ref(description, revision);
+        Ok(Outcome::CapabilityLeaseReleased {
+            lease,
+            disposition,
+            description_reclaimed,
+            object_reclaimed,
+            revision,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -745,6 +1019,7 @@ impl FileAuthorityCore {
                 generation: ObjectGeneration::INITIAL,
                 revision,
                 logical_slot_refs: 1,
+                capability_lease_refs: 0,
                 offset: FileOffset::default(),
                 access_mode,
                 status_flags,
@@ -808,17 +1083,11 @@ impl FileAuthorityCore {
         let start = usize::try_from(offset.raw()).map_err(|_| AuthorityError::InvalidOffset)?;
         let maximum =
             usize::try_from(maximum.raw()).map_err(|_| AuthorityError::PayloadTooLarge)?;
-        let bytes: Vec<u8> = match self
-            .descriptions
-            .get(&slot.description)
-            .ok_or(AuthorityError::DescriptionNotFound)?
-            .backing
-            .vfs_object()
-        {
-            Some(object) => {
+        let bytes: Vec<u8> = match &description.backing {
+            AuthorityBacking::Vfs { object } => {
                 let object = self
                     .vfs_objects
-                    .get(&object)
+                    .get(object)
                     .ok_or(AuthorityError::VfsNotFound)?;
                 object.contents[start.min(object.contents.len())..]
                     .iter()
@@ -826,20 +1095,28 @@ impl FileAuthorityCore {
                     .copied()
                     .collect()
             }
-            None => match &self
-                .descriptions
-                .get(&slot.description)
-                .ok_or(AuthorityError::DescriptionNotFound)?
-                .backing
-            {
-                AuthorityBacking::SyntheticFile { contents } => contents
-                    [start.min(contents.len())..]
-                    .iter()
-                    .take(maximum)
-                    .copied()
-                    .collect(),
-                AuthorityBacking::VfsFile { .. } => unreachable!(),
-            },
+            AuthorityBacking::Synthetic { contents } => contents[start.min(contents.len())..]
+                .iter()
+                .take(maximum)
+                .copied()
+                .collect(),
+            AuthorityBacking::Host { fd, .. } => {
+                let mut bytes = vec![0; maximum];
+                let read = unsafe {
+                    libc::pread(
+                        fd.as_raw_fd(),
+                        bytes.as_mut_ptr().cast(),
+                        bytes.len(),
+                        libc::off_t::try_from(offset.raw())
+                            .map_err(|_| AuthorityError::InvalidOffset)?,
+                    )
+                };
+                if read < 0 {
+                    return Err(AuthorityError::HostIo(super::HostErrno::last()));
+                }
+                bytes.truncate(usize::try_from(read).map_err(|_| AuthorityError::InvalidOffset)?);
+                bytes
+            }
         };
         let next = offset
             .raw()
@@ -872,9 +1149,6 @@ impl FileAuthorityCore {
         bytes: &[u8],
     ) -> Result<Outcome, AuthorityError> {
         self.validate_payload(bytes)?;
-        let count = ByteCount::bounded(
-            u32::try_from(bytes.len()).map_err(|_| AuthorityError::PayloadTooLarge)?,
-        )?;
         let slot = self.slot(client, table, expected, fd)?.clone();
         let description = self
             .descriptions
@@ -885,15 +1159,39 @@ impl FileAuthorityCore {
         }
         let start =
             usize::try_from(description.offset.raw()).map_err(|_| AuthorityError::InvalidOffset)?;
-        let end = start
-            .checked_add(bytes.len())
-            .ok_or(AuthorityError::InvalidOffset)?;
         let object = description.backing.vfs_object();
         if object.is_some_and(|object| !self.vfs_objects.contains_key(&object)) {
             abort_fatal(AuthorityFatal::InvariantViolation(
                 "write description referenced a missing VFS object",
             ));
         }
+        let written = match &description.backing {
+            AuthorityBacking::Host { fd, writable } => {
+                if !writable {
+                    return Err(AuthorityError::BackingReadOnly);
+                }
+                let written = unsafe {
+                    libc::pwrite(
+                        fd.as_raw_fd(),
+                        bytes.as_ptr().cast(),
+                        bytes.len(),
+                        libc::off_t::try_from(description.offset.raw())
+                            .map_err(|_| AuthorityError::InvalidOffset)?,
+                    )
+                };
+                if written < 0 {
+                    return Err(AuthorityError::HostIo(super::HostErrno::last()));
+                }
+                usize::try_from(written).map_err(|_| AuthorityError::InvalidOffset)?
+            }
+            AuthorityBacking::Synthetic { .. } | AuthorityBacking::Vfs { .. } => bytes.len(),
+        };
+        let count = ByteCount::bounded(
+            u32::try_from(written).map_err(|_| AuthorityError::PayloadTooLarge)?,
+        )?;
+        let end = start
+            .checked_add(written)
+            .ok_or(AuthorityError::InvalidOffset)?;
         let end_offset = u64::try_from(end).map_err(|_| AuthorityError::InvalidOffset)?;
         let revision = self.publish_mutation();
         match object {
@@ -906,7 +1204,7 @@ impl FileAuthorityCore {
                 if state.contents.len() < end {
                     state.contents.resize(end, 0);
                 }
-                state.contents[start..end].copy_from_slice(bytes);
+                state.contents[start..end].copy_from_slice(&bytes[..written]);
                 state.revision = revision;
             }
             None => match &mut self
@@ -914,18 +1212,19 @@ impl FileAuthorityCore {
                 .get_mut(&slot.description)
                 .unwrap_or_else(|| {
                     abort_fatal(AuthorityFatal::InvariantViolation(
-                        "write lost its validated synthetic description",
+                        "write lost its validated description backing",
                     ))
                 })
                 .backing
             {
-                AuthorityBacking::SyntheticFile { contents } => {
+                AuthorityBacking::Synthetic { contents } => {
                     if contents.len() < end {
                         contents.resize(end, 0);
                     }
-                    contents[start..end].copy_from_slice(bytes);
+                    contents[start..end].copy_from_slice(&bytes[..written]);
                 }
-                AuthorityBacking::VfsFile { .. } => unreachable!(),
+                AuthorityBacking::Host { .. } => {}
+                AuthorityBacking::Vfs { .. } => unreachable!(),
             },
         }
         let description = self
@@ -1339,13 +1638,48 @@ impl FileAuthorityCore {
                 "logical slot reference underflow",
             ))
         });
-        if state.logical_slot_refs != 0 {
-            state.revision = revision;
+        state.revision = revision;
+        self.reclaim_description_if_unreferenced(description, revision)
+    }
+
+    fn release_capability_lease_ref(
+        &mut self,
+        description: FileDescriptionId,
+        revision: Revision,
+    ) -> (bool, bool) {
+        let state = self.descriptions.get_mut(&description).unwrap_or_else(|| {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "capability lease referenced a missing description",
+            ))
+        });
+        state.capability_lease_refs =
+            state
+                .capability_lease_refs
+                .checked_sub(1)
+                .unwrap_or_else(|| {
+                    abort_fatal(AuthorityFatal::InvariantViolation(
+                        "capability lease reference underflow",
+                    ))
+                });
+        state.revision = revision;
+        self.reclaim_description_if_unreferenced(description, revision)
+    }
+
+    fn reclaim_description_if_unreferenced(
+        &mut self,
+        description: FileDescriptionId,
+        revision: Revision,
+    ) -> (bool, bool) {
+        let reclaim = self
+            .descriptions
+            .get(&description)
+            .is_some_and(|state| state.logical_slot_refs == 0 && state.capability_lease_refs == 0);
+        if !reclaim {
             return (false, false);
         }
         let state = self.descriptions.remove(&description).unwrap_or_else(|| {
             abort_fatal(AuthorityFatal::InvariantViolation(
-                "reclaim lost its zero-reference description",
+                "reclaim lost its unreferenced description",
             ))
         });
         let Some(object) = state.backing.vfs_object() else {
@@ -1381,16 +1715,26 @@ impl FileAuthorityCore {
 
     fn backing_len(&self, backing: &AuthorityBacking) -> Result<u64, AuthorityError> {
         match backing {
-            AuthorityBacking::SyntheticFile { contents } => {
+            AuthorityBacking::Synthetic { contents } => {
                 u64::try_from(contents.len()).map_err(|_| AuthorityError::InvalidOffset)
             }
-            AuthorityBacking::VfsFile { object } => self
+            AuthorityBacking::Vfs { object } => self
                 .vfs_objects
                 .get(object)
                 .ok_or(AuthorityError::VfsNotFound)
                 .and_then(|state| {
                     u64::try_from(state.contents.len()).map_err(|_| AuthorityError::InvalidOffset)
                 }),
+            AuthorityBacking::Host { fd, .. } => {
+                // This is an authority-side metadata attempt, not client MM or
+                // guest-memory work. It stays bounded to one nonblocking fstat.
+                let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+                    return Err(AuthorityError::HostIo(super::HostErrno::last()));
+                }
+                let stat = unsafe { stat.assume_init() };
+                u64::try_from(stat.st_size).map_err(|_| AuthorityError::InvalidOffset)
+            }
         }
     }
 
@@ -1427,6 +1771,16 @@ impl FileAuthorityCore {
             .unwrap_or_else(|_| abort_fatal(AuthorityFatal::IdentityExhausted))
     }
 
+    fn allocate_capability_lease(&mut self) -> CapabilityLeaseId {
+        let raw = NonZeroU64::new(self.next_capability_lease)
+            .unwrap_or_else(|| abort_fatal(AuthorityFatal::IdentityExhausted));
+        self.next_capability_lease = self
+            .next_capability_lease
+            .checked_add(1)
+            .unwrap_or_else(|| abort_fatal(AuthorityFatal::IdentityExhausted));
+        CapabilityLeaseId::from_authority_allocation(raw)
+    }
+
     fn allocate_vfs_object(&mut self) -> VfsObjectId {
         let raw = NonZeroU64::new(self.next_vfs_object)
             .unwrap_or_else(|| abort_fatal(AuthorityFatal::IdentityExhausted));
@@ -1445,6 +1799,44 @@ impl FileAuthorityCore {
         self.revision = next;
         next
     }
+}
+
+fn expected_request_capabilities(command: &Command) -> usize {
+    usize::from(matches!(command, Command::AdoptHostFileAndInstall { .. }))
+}
+
+fn validate_host_file(fd: i32, access_mode: AccessMode) -> Result<(), AuthorityError> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return Err(AuthorityError::HostIo(super::HostErrno::last()));
+    }
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(AuthorityError::HostBackingTypeMismatch);
+    }
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(AuthorityError::HostIo(super::HostErrno::last()));
+    }
+    let actual = flags & libc::O_ACCMODE;
+    let matches = match access_mode {
+        AccessMode::ReadOnly => actual == libc::O_RDONLY || actual == libc::O_RDWR,
+        AccessMode::WriteOnly => actual == libc::O_WRONLY || actual == libc::O_RDWR,
+        AccessMode::ReadWrite => actual == libc::O_RDWR,
+        AccessMode::PathOnly => true,
+    };
+    if !matches {
+        return Err(AuthorityError::HostAccessMismatch);
+    }
+    Ok(())
+}
+
+fn ensure_cloexec(fd: i32) -> Result<(), AuthorityFatal> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(AuthorityFatal::TransportUnavailable);
+    }
+    Ok(())
 }
 
 fn abort_fatal(error: AuthorityFatal) -> ! {

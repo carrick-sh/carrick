@@ -1,3 +1,5 @@
+use std::io::{Seek as _, Write as _};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
@@ -75,6 +77,19 @@ impl Harness {
         };
         self.next_request += 1;
         request
+    }
+
+    fn transact(
+        &mut self,
+        request: Request,
+        capabilities: Vec<OwnedFd>,
+    ) -> Result<AuthorityReply, AuthorityFatal> {
+        let reply = self.transport.transact(AuthorityCall {
+            request,
+            capabilities,
+        })?;
+        self.revision = reply.response.authority_revision;
+        Ok(reply)
     }
 
     fn execute(&mut self, request: Request) -> Result<Response, AuthorityFatal> {
@@ -307,6 +322,246 @@ fn direct_and_ipc_transports_produce_identical_model_trace() {
     normalize_trace_description_ids(&mut direct);
     normalize_trace_description_ids(&mut ipc);
     assert_eq!(direct, ipc);
+}
+
+fn host_capability_lease_model(mut harness: Harness, disposition: CapabilityLeaseDisposition) {
+    let table = harness.create_table();
+    let mut file = tempfile::NamedTempFile::new().expect("temporary host file");
+    file.write_all(b"host-bytes").expect("seed host file");
+    file.as_file_mut()
+        .seek(std::io::SeekFrom::Start(0))
+        .expect("rewind");
+    let owned: OwnedFd = file.into_file().into();
+    let retry_owned = owned.try_clone().expect("duplicate adoption capability");
+    let adopt_request = harness.request(
+        Command::AdoptHostFileAndInstall {
+            table,
+            minimum: fd(3),
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(16),
+            descriptor_flags: DescriptorFlags::NONE,
+            access_mode: AccessMode::ReadWrite,
+            status_flags: StatusFlags::default(),
+            writable: true,
+            path: Some(CanonicalPath::absolute("/host-file").expect("path")),
+        },
+        ObjectGeneration::INITIAL,
+    );
+    let adopted = harness
+        .transact(adopt_request.clone(), vec![owned])
+        .expect("adopt host capability");
+    assert!(adopted.capabilities.is_empty());
+    let replayed_adoption = harness
+        .transact(adopt_request, vec![retry_owned])
+        .expect("replay host adoption");
+    assert_eq!(replayed_adoption.response, adopted.response);
+    assert!(replayed_adoption.capabilities.is_empty());
+    let (open_fd, description) = match adopted.response.outcome {
+        Outcome::Installed {
+            fd, description, ..
+        } => (fd, description),
+        other => panic!("unexpected adopt outcome: {other:?}"),
+    };
+    assert_eq!(harness.read(table, open_fd, 4), b"host");
+
+    let acquire_request = harness.request(
+        Command::AcquireCapabilityLease {
+            table,
+            fd: open_fd,
+            purpose: CapabilityLeasePurpose::MappingSource,
+        },
+        ObjectGeneration::INITIAL,
+    );
+    let first = harness
+        .transact(acquire_request.clone(), Vec::new())
+        .expect("acquire capability lease");
+    let lease = match first.response.outcome {
+        Outcome::CapabilityLeaseGranted {
+            lease,
+            description: leased,
+            purpose: CapabilityLeasePurpose::MappingSource,
+            ..
+        } if leased == description => lease,
+        other => panic!("unexpected lease outcome: {other:?}"),
+    };
+    assert_eq!(first.capabilities.len(), 1);
+    let leased_fd = &first.capabilities[0];
+    let flags = unsafe { libc::fcntl(leased_fd.as_raw_fd(), libc::F_GETFD) };
+    assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
+    let mut leased_bytes = [0_u8; 10];
+    let read = unsafe {
+        libc::pread(
+            leased_fd.as_raw_fd(),
+            leased_bytes.as_mut_ptr().cast(),
+            leased_bytes.len(),
+            0,
+        )
+    };
+    assert_eq!(read, 10);
+    assert_eq!(&leased_bytes, b"host-bytes");
+
+    let replay = harness
+        .transact(acquire_request, Vec::new())
+        .expect("replay lease response");
+    assert_eq!(replay.response, first.response);
+    assert_eq!(replay.capabilities.len(), 1);
+    assert_ne!(
+        replay.capabilities[0].as_raw_fd(),
+        first.capabilities[0].as_raw_fd()
+    );
+
+    assert!(matches!(
+        harness.send(
+            Command::Close { table, fd: open_fd },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Closed {
+            description_reclaimed: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        harness.send(
+            Command::InspectDescription { description },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Description(DescriptionSnapshot {
+            logical_slot_refs: 0,
+            backing: DescriptionBackingSnapshot::HostFile { writable: true },
+            ..
+        })
+    ));
+    assert!(matches!(
+        harness.send(
+            Command::ReleaseCapabilityLease { lease, disposition },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::CapabilityLeaseReleased {
+            description_reclaimed: true,
+            object_reclaimed: false,
+            ..
+        }
+    ));
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    assert_eq!(
+        unsafe { libc::fstat(leased_fd.as_raw_fd(), stat.as_mut_ptr()) },
+        0
+    );
+}
+
+#[test]
+fn direct_and_ipc_transports_transfer_scoped_host_capability_leases() {
+    host_capability_lease_model(Harness::new(), CapabilityLeaseDisposition::Commit);
+    host_capability_lease_model(Harness::new_ipc(), CapabilityLeaseDisposition::Abort);
+}
+
+fn rejected_host_adoption_closes_transferred_capability(mut harness: Harness) {
+    let table = harness.create_table();
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let owned: OwnedFd = std::fs::File::open(directory.path())
+        .expect("open directory")
+        .into();
+    let raw = owned.as_raw_fd();
+    let request = harness.request(
+        Command::AdoptHostFileAndInstall {
+            table,
+            minimum: fd(3),
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(16),
+            descriptor_flags: DescriptorFlags::NONE,
+            access_mode: AccessMode::ReadOnly,
+            status_flags: StatusFlags::default(),
+            writable: false,
+            path: None,
+        },
+        ObjectGeneration::INITIAL,
+    );
+    let reply = harness
+        .transact(request, vec![owned])
+        .expect("rejected adoption response");
+    assert_eq!(
+        reply.response.outcome,
+        Outcome::Rejected(AuthorityError::HostBackingTypeMismatch)
+    );
+    assert!(reply.capabilities.is_empty());
+    assert_eq!(unsafe { libc::fcntl(raw, libc::F_GETFD) }, -1);
+}
+
+#[test]
+fn rejected_direct_and_ipc_adoptions_close_transferred_capabilities() {
+    rejected_host_adoption_closes_transferred_capability(Harness::new());
+    rejected_host_adoption_closes_transferred_capability(Harness::new_ipc());
+}
+
+fn client_exit_reclaims_owned_capability_leases(mut owner: Harness) {
+    let mut observer = owner.peer(2, 1002, 1);
+    let table = owner.create_table();
+    let file = tempfile::tempfile().expect("temporary host file");
+    let owned: OwnedFd = file.into();
+    let request = owner.request(
+        Command::AdoptHostFileAndInstall {
+            table,
+            minimum: fd(3),
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(16),
+            descriptor_flags: DescriptorFlags::NONE,
+            access_mode: AccessMode::ReadOnly,
+            status_flags: StatusFlags::default(),
+            writable: false,
+            path: None,
+        },
+        ObjectGeneration::INITIAL,
+    );
+    let reply = owner
+        .transact(request, vec![owned])
+        .expect("adopt host file");
+    let (open_fd, description) = match reply.response.outcome {
+        Outcome::Installed {
+            fd, description, ..
+        } => (fd, description),
+        other => panic!("unexpected install outcome: {other:?}"),
+    };
+    let lease_request = owner.request(
+        Command::AcquireCapabilityLease {
+            table,
+            fd: open_fd,
+            purpose: CapabilityLeasePurpose::MappingSource,
+        },
+        ObjectGeneration::INITIAL,
+    );
+    let lease = match owner
+        .transact(lease_request, Vec::new())
+        .expect("lease")
+        .response
+        .outcome
+    {
+        Outcome::CapabilityLeaseGranted { lease, .. } => lease,
+        other => panic!("unexpected lease outcome: {other:?}"),
+    };
+    assert_eq!(
+        observer.send(
+            Command::ReleaseCapabilityLease {
+                lease,
+                disposition: CapabilityLeaseDisposition::Abort,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Rejected(AuthorityError::CapabilityLeaseNotFound)
+    );
+    assert_eq!(
+        owner.send(Command::ExitClient, ObjectGeneration::INITIAL),
+        Outcome::ClientExited
+    );
+    assert_eq!(
+        observer.send(
+            Command::InspectDescription { description },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Rejected(AuthorityError::DescriptionNotFound)
+    );
+}
+
+#[test]
+fn client_exit_reclaims_direct_and_ipc_capability_leases() {
+    client_exit_reclaims_owned_capability_leases(Harness::new());
+    client_exit_reclaims_owned_capability_leases(Harness::new_ipc());
 }
 
 #[test]

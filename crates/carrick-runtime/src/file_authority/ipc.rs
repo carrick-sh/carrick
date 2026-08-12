@@ -8,9 +8,12 @@ use std::time::Duration;
 use parking_lot::Mutex;
 
 use super::protocol::{
-    MAX_FRAME_LEN, decode_request, decode_response, encode_request, encode_response,
+    MAX_FRAME_LEN, decode_request, decode_response, encode_request_with_fd_count,
+    encode_response_with_fd_count,
 };
-use super::{AuthorityFatal, FileAuthorityCore, FileAuthorityTransport, Request, Response};
+use super::{
+    AuthorityCall, AuthorityFatal, AuthorityReply, FileAuthorityCore, FileAuthorityTransport,
+};
 
 const TRANSPORT_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_BYTES: usize = 256;
@@ -84,12 +87,16 @@ impl IpcFileAuthority {
 }
 
 impl FileAuthorityTransport for IpcFileAuthority {
-    fn execute(&self, request: Request) -> Result<Response, AuthorityFatal> {
-        let frame = encode_request(&request)?;
+    fn transact(&self, call: AuthorityCall) -> Result<AuthorityReply, AuthorityFatal> {
+        let frame = encode_request_with_fd_count(&call.request, call.capabilities.len())?;
         let socket = self.inner.socket.lock();
-        send_frame(&socket, &frame)?;
+        send_frame(&socket, &frame, &call.capabilities)?;
         let received = recv_frame(&socket)?;
-        decode_response(&request, &received.bytes, received.descriptors.len())
+        let response = decode_response(&call.request, &received.bytes, received.descriptors.len())?;
+        Ok(AuthorityReply {
+            response,
+            capabilities: received.descriptors,
+        })
     }
 }
 
@@ -111,15 +118,22 @@ fn serve(socket: UnixDatagram, mut core: FileAuthorityCore) {
             Ok(request) => request,
             Err(_) => break,
         };
-        let response = match core.execute(request.clone()) {
+        let reply = match core.execute_call(AuthorityCall {
+            request: request.clone(),
+            capabilities: received.descriptors,
+        }) {
+            Ok(reply) => reply,
+            Err(_) => break,
+        };
+        let response = match encode_response_with_fd_count(
+            &request,
+            &reply.response,
+            reply.capabilities.len(),
+        ) {
             Ok(response) => response,
             Err(_) => break,
         };
-        let response = match encode_response(&request, &response) {
-            Ok(response) => response,
-            Err(_) => break,
-        };
-        if send_frame(&socket, &response).is_err() {
+        if send_frame(&socket, &response, &reply.capabilities).is_err() {
             break;
         }
     }
@@ -146,15 +160,62 @@ fn set_cloexec(fd: RawFd) -> Result<(), AuthorityFatal> {
     Ok(())
 }
 
-fn send_frame(socket: &UnixDatagram, frame: &[u8]) -> Result<(), AuthorityFatal> {
+fn send_frame(
+    socket: &UnixDatagram,
+    frame: &[u8],
+    descriptors: &[OwnedFd],
+) -> Result<(), AuthorityFatal> {
     if frame.len() > MAX_FRAME_LEN {
         return Err(AuthorityFatal::MalformedFrame(
             "outbound frame exceeds bound",
         ));
     }
-    match socket.send(frame) {
-        Ok(written) if written == frame.len() => Ok(()),
-        _ => Err(AuthorityFatal::TransportUnavailable),
+    if descriptors.is_empty() {
+        return match socket.send(frame) {
+            Ok(written) if written == frame.len() => Ok(()),
+            _ => Err(AuthorityFatal::TransportUnavailable),
+        };
+    }
+    let descriptor_bytes = descriptors
+        .len()
+        .checked_mul(std::mem::size_of::<RawFd>())
+        .ok_or(AuthorityFatal::CapabilityMismatch)?;
+    let descriptor_bytes =
+        libc::c_uint::try_from(descriptor_bytes).map_err(|_| AuthorityFatal::CapabilityMismatch)?;
+    let control_len = unsafe { libc::CMSG_SPACE(descriptor_bytes) } as usize;
+    if control_len > CONTROL_BYTES {
+        return Err(AuthorityFatal::CapabilityMismatch);
+    }
+    let mut control = AlignedControl([0; CONTROL_BYTES]);
+    let mut iov = libc::iovec {
+        iov_base: frame.as_ptr().cast_mut().cast(),
+        iov_len: frame.len(),
+    };
+    let mut message = unsafe { MaybeUninit::<libc::msghdr>::zeroed().assume_init() };
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.0.as_mut_ptr().cast();
+    message.msg_controllen = control_len
+        .try_into()
+        .map_err(|_| AuthorityFatal::CapabilityMismatch)?;
+    let header = unsafe { libc::CMSG_FIRSTHDR(&message) };
+    if header.is_null() {
+        return Err(AuthorityFatal::CapabilityMismatch);
+    }
+    unsafe {
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN(descriptor_bytes) as _;
+        let data = libc::CMSG_DATA(header).cast::<RawFd>();
+        for (index, descriptor) in descriptors.iter().enumerate() {
+            data.add(index).write_unaligned(descriptor.as_raw_fd());
+        }
+    }
+    let written = unsafe { libc::sendmsg(socket.as_raw_fd(), &message, 0) };
+    if written == frame.len() as isize {
+        Ok(())
+    } else {
+        Err(AuthorityFatal::TransportUnavailable)
     }
 }
 
@@ -171,7 +232,11 @@ fn recv_frame(socket: &UnixDatagram) -> Result<ReceivedFrame, AuthorityFatal> {
         message.msg_iov = &mut iov;
         message.msg_iovlen = 1;
         message.msg_control = control.0.as_mut_ptr().cast();
-        message.msg_controllen = control.0.len() as _;
+        message.msg_controllen = control
+            .0
+            .len()
+            .try_into()
+            .map_err(|_| AuthorityFatal::CapabilityMismatch)?;
         message
     };
     let received = unsafe { libc::recvmsg(socket.as_raw_fd(), message, 0) };

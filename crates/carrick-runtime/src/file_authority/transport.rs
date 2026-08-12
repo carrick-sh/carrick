@@ -2,10 +2,23 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use super::{AuthorityFatal, FileAuthorityCore, Request, Response};
+use super::{
+    AuthorityCall, AuthorityFatal, AuthorityReply, Command, FileAuthorityCore, Request, Response,
+};
 
 pub(crate) trait FileAuthorityTransport: Send + Sync {
-    fn execute(&self, request: Request) -> Result<Response, AuthorityFatal>;
+    fn transact(&self, call: AuthorityCall) -> Result<AuthorityReply, AuthorityFatal>;
+
+    fn execute(&self, request: Request) -> Result<Response, AuthorityFatal> {
+        if matches!(request.command, Command::AcquireCapabilityLease { .. }) {
+            return Err(AuthorityFatal::CapabilityMismatch);
+        }
+        let reply = self.transact(AuthorityCall::without_capabilities(request))?;
+        if !reply.capabilities.is_empty() {
+            return Err(AuthorityFatal::CapabilityMismatch);
+        }
+        Ok(reply.response)
+    }
 }
 
 /// Direct client for the no-host-fork authority lane.
@@ -27,7 +40,7 @@ impl DirectFileAuthority {
 }
 
 impl FileAuthorityTransport for DirectFileAuthority {
-    fn execute(&self, request: Request) -> Result<Response, AuthorityFatal> {
-        self.core.lock().execute(request)
+    fn transact(&self, call: AuthorityCall) -> Result<AuthorityReply, AuthorityFatal> {
+        self.core.lock().execute_call(call)
     }
 }
