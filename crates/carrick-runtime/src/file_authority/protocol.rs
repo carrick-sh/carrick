@@ -1,13 +1,14 @@
-use std::num::NonZeroU64;
+use std::num::{NonZeroI32, NonZeroU64};
 
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
 
 use super::{
     AccessMode, AuthorityEpoch, AuthorityError, AuthorityFatal, ByteCount, CanonicalPath,
-    ClientIdentity, Command, DescriptionBackingSnapshot, DescriptionSnapshot, DescriptorFlags,
-    FileDescriptionId, FileOffset, FileSlotNumber, FileTableId, NofileAllocationCeiling,
-    ObjectGeneration, Outcome, Request, RequestId, Response, Revision, SeekWhence, SlotSnapshot,
-    StatusFlags, VfsObjectId,
+    CapabilityLeaseDisposition, CapabilityLeaseId, CapabilityLeasePurpose, ClientIdentity, Command,
+    DescriptionBackingSnapshot, DescriptionSnapshot, DescriptorFlags, FileDescriptionId,
+    FileOffset, FileSlotNumber, FileTableId, HostErrno, NofileAllocationCeiling, ObjectGeneration,
+    Outcome, Request, RequestId, Response, Revision, SeekWhence, SlotSnapshot, StatusFlags,
+    VfsObjectId,
 };
 
 const MAGIC: u32 = 0x4341_4641;
@@ -32,6 +33,13 @@ struct Header {
 }
 
 pub(super) fn encode_request(request: &Request) -> Result<Vec<u8>, AuthorityFatal> {
+    encode_request_with_fd_count(request, 0)
+}
+
+pub(super) fn encode_request_with_fd_count(
+    request: &Request,
+    fd_count: usize,
+) -> Result<Vec<u8>, AuthorityFatal> {
     let operation = command_tag(&request.command);
     let mut payload = Writer::default();
     encode_command(&mut payload, &request.command)?;
@@ -40,7 +48,7 @@ pub(super) fn encode_request(request: &Request) -> Result<Vec<u8>, AuthorityFata
             kind: REQUEST_KIND,
             operation,
             payload_len: payload.len_u32()?,
-            fd_count: 0,
+            fd_count: u16::try_from(fd_count).map_err(|_| AuthorityFatal::CapabilityMismatch)?,
             epoch: request.epoch.raw(),
             client_id: request.client.id.raw(),
             host_pid: request.client.host_pid.raw(),
@@ -86,6 +94,14 @@ pub(super) fn encode_response(
     request: &Request,
     response: &Response,
 ) -> Result<Vec<u8>, AuthorityFatal> {
+    encode_response_with_fd_count(request, response, 0)
+}
+
+pub(super) fn encode_response_with_fd_count(
+    request: &Request,
+    response: &Response,
+    fd_count: usize,
+) -> Result<Vec<u8>, AuthorityFatal> {
     let mut payload = Writer::default();
     payload.u64(response.authority_revision.raw());
     encode_outcome(&mut payload, &response.outcome)?;
@@ -94,7 +110,7 @@ pub(super) fn encode_response(
             kind: RESPONSE_KIND,
             operation: command_tag(&request.command),
             payload_len: payload.len_u32()?,
-            fd_count: 0,
+            fd_count: u16::try_from(fd_count).map_err(|_| AuthorityFatal::CapabilityMismatch)?,
             epoch: request.epoch.raw(),
             client_id: request.client.id.raw(),
             host_pid: request.client.host_pid.raw(),
@@ -135,10 +151,13 @@ pub(super) fn decode_response(
 }
 
 fn encode_frame(header: Header, payload: Vec<u8>) -> Result<Vec<u8>, AuthorityFatal> {
-    if payload.len() != header.payload_len as usize || HEADER_LEN + payload.len() > MAX_FRAME_LEN {
-        return malformed("frame exceeds its bound");
+    let frame_len = HEADER_LEN
+        .checked_add(payload.len())
+        .ok_or(AuthorityFatal::EncodingFailure("frame length overflow"))?;
+    if payload.len() != header.payload_len as usize || frame_len > MAX_FRAME_LEN {
+        return Err(AuthorityFatal::EncodingFailure("frame exceeds its bound"));
     }
-    let mut writer = Writer::with_capacity(HEADER_LEN + payload.len());
+    let mut writer = Writer::with_capacity(frame_len);
     writer.u32(MAGIC);
     writer.u16(VERSION);
     writer.u8(header.kind);
@@ -212,6 +231,9 @@ fn command_tag(command: &Command) -> u8 {
         Command::ShareTable { .. } => 18,
         Command::ExecSuccessor { .. } => 19,
         Command::InspectDescription { .. } => 20,
+        Command::AdoptHostFileAndInstall { .. } => 21,
+        Command::AcquireCapabilityLease { .. } => 22,
+        Command::ReleaseCapabilityLease { .. } => 23,
     }
 }
 
@@ -275,6 +297,34 @@ fn encode_command(writer: &mut Writer, command: &Command) -> Result<(), Authorit
             writer.u8(access_mode_tag(*access_mode));
             writer.u64(status_flags.raw());
             writer.optional_path(path.as_ref())?;
+        }
+        Command::AdoptHostFileAndInstall {
+            table,
+            minimum,
+            ceiling,
+            descriptor_flags,
+            access_mode,
+            status_flags,
+            writable,
+            path,
+        } => {
+            writer.u64(table.raw());
+            writer.i32(minimum.raw());
+            writer.u32(ceiling.raw());
+            writer.u32(descriptor_flags.raw());
+            writer.u8(access_mode_tag(*access_mode));
+            writer.u64(status_flags.raw());
+            writer.bool(*writable);
+            writer.optional_path(path.as_ref())?;
+        }
+        Command::AcquireCapabilityLease { table, fd, purpose } => {
+            writer.u64(table.raw());
+            writer.i32(fd.raw());
+            writer.u8(capability_purpose_tag(*purpose));
+        }
+        Command::ReleaseCapabilityLease { lease, disposition } => {
+            writer.u64(lease.raw());
+            writer.u8(capability_disposition_tag(*disposition));
         }
         Command::ResolveSlot { table, fd } | Command::Close { table, fd } => {
             writer.u64(table.raw());
@@ -431,6 +481,26 @@ fn decode_command(tag: u8, reader: &mut Reader<'_>) -> Result<Command, Authority
         20 => Command::InspectDescription {
             description: reader.description_id()?,
         },
+        21 => Command::AdoptHostFileAndInstall {
+            table: reader.table_id()?,
+            minimum: reader.slot()?,
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(reader.u32()?),
+            descriptor_flags: DescriptorFlags::from_linux_bits(reader.u32()?)
+                .map_err(|_| AuthorityFatal::MalformedFrame("invalid descriptor flags"))?,
+            access_mode: reader.access_mode()?,
+            status_flags: StatusFlags::from_linux_bits(reader.u64()?),
+            writable: reader.bool()?,
+            path: reader.optional_path()?,
+        },
+        22 => Command::AcquireCapabilityLease {
+            table: reader.table_id()?,
+            fd: reader.slot()?,
+            purpose: reader.capability_purpose()?,
+        },
+        23 => Command::ReleaseCapabilityLease {
+            lease: reader.capability_lease_id()?,
+            disposition: reader.capability_disposition()?,
+        },
         _ => return malformed("unknown operation"),
     })
 }
@@ -586,6 +656,34 @@ fn encode_outcome(writer: &mut Writer, outcome: &Outcome) -> Result<(), Authorit
             writer.u8(17);
             writer.description_snapshot(description)?;
         }
+        Outcome::CapabilityLeaseGranted {
+            lease,
+            description,
+            description_generation,
+            purpose,
+            revision,
+        } => {
+            writer.u8(19);
+            writer.u64(lease.raw());
+            writer.u64(description.raw());
+            writer.u64(description_generation.raw());
+            writer.u8(capability_purpose_tag(*purpose));
+            writer.u64(revision.raw());
+        }
+        Outcome::CapabilityLeaseReleased {
+            lease,
+            disposition,
+            description_reclaimed,
+            object_reclaimed,
+            revision,
+        } => {
+            writer.u8(20);
+            writer.u64(lease.raw());
+            writer.u8(capability_disposition_tag(*disposition));
+            writer.bool(*description_reclaimed);
+            writer.bool(*object_reclaimed);
+            writer.u64(revision.raw());
+        }
         Outcome::Rejected(error) => {
             writer.u8(18);
             encode_error(writer, error);
@@ -673,6 +771,20 @@ fn decode_outcome(reader: &mut Reader<'_>) -> Result<Outcome, AuthorityFatal> {
         },
         17 => Outcome::Description(reader.description_snapshot()?),
         18 => Outcome::Rejected(decode_error(reader)?),
+        19 => Outcome::CapabilityLeaseGranted {
+            lease: reader.capability_lease_id()?,
+            description: reader.description_id()?,
+            description_generation: reader.generation()?,
+            purpose: reader.capability_purpose()?,
+            revision: reader.revision()?,
+        },
+        20 => Outcome::CapabilityLeaseReleased {
+            lease: reader.capability_lease_id()?,
+            disposition: reader.capability_disposition()?,
+            description_reclaimed: reader.bool()?,
+            object_reclaimed: reader.bool()?,
+            revision: reader.revision()?,
+        },
         _ => return malformed("unknown response outcome"),
     })
 }
@@ -703,6 +815,15 @@ fn encode_error(writer: &mut Writer, error: &AuthorityError) {
         AuthorityError::NotReadable => writer.u8(18),
         AuthorityError::NotWritable => writer.u8(19),
         AuthorityError::NotSeekable => writer.u8(20),
+        AuthorityError::NotHostBacked => writer.u8(21),
+        AuthorityError::CapabilityLeaseNotFound => writer.u8(22),
+        AuthorityError::HostIo(errno) => {
+            writer.u8(23);
+            writer.i32(errno.raw());
+        }
+        AuthorityError::BackingReadOnly => writer.u8(24),
+        AuthorityError::HostBackingTypeMismatch => writer.u8(25),
+        AuthorityError::HostAccessMismatch => writer.u8(26),
     }
 }
 
@@ -731,6 +852,16 @@ fn decode_error(reader: &mut Reader<'_>) -> Result<AuthorityError, AuthorityFata
         18 => AuthorityError::NotReadable,
         19 => AuthorityError::NotWritable,
         20 => AuthorityError::NotSeekable,
+        21 => AuthorityError::NotHostBacked,
+        22 => AuthorityError::CapabilityLeaseNotFound,
+        23 => AuthorityError::HostIo(HostErrno::from_host(
+            NonZeroI32::new(reader.i32()?)
+                .filter(|errno| errno.get() > 0)
+                .ok_or(AuthorityFatal::MalformedFrame("invalid host errno"))?,
+        )),
+        24 => AuthorityError::BackingReadOnly,
+        25 => AuthorityError::HostBackingTypeMismatch,
+        26 => AuthorityError::HostAccessMismatch,
         _ => return malformed("unknown authority error"),
     })
 }
@@ -741,6 +872,19 @@ const fn access_mode_tag(mode: AccessMode) -> u8 {
         AccessMode::WriteOnly => 1,
         AccessMode::ReadWrite => 2,
         AccessMode::PathOnly => 3,
+    }
+}
+
+const fn capability_purpose_tag(purpose: CapabilityLeasePurpose) -> u8 {
+    match purpose {
+        CapabilityLeasePurpose::MappingSource => 0,
+    }
+}
+
+const fn capability_disposition_tag(disposition: CapabilityLeaseDisposition) -> u8 {
+    match disposition {
+        CapabilityLeaseDisposition::Commit => 0,
+        CapabilityLeaseDisposition::Abort => 1,
     }
 }
 
@@ -764,7 +908,7 @@ impl Writer {
     }
     fn len_u32(&self) -> Result<u32, AuthorityFatal> {
         u32::try_from(self.bytes.len())
-            .map_err(|_| AuthorityFatal::MalformedFrame("payload length overflow"))
+            .map_err(|_| AuthorityFatal::EncodingFailure("payload length overflow"))
     }
     fn u8(&mut self, value: u8) {
         self.bytes.push(value);
@@ -790,7 +934,7 @@ impl Writer {
     fn blob(&mut self, value: &[u8]) -> Result<(), AuthorityFatal> {
         self.u32(
             u32::try_from(value.len())
-                .map_err(|_| AuthorityFatal::MalformedFrame("blob length overflow"))?,
+                .map_err(|_| AuthorityFatal::EncodingFailure("blob length overflow"))?,
         );
         self.bytes.extend_from_slice(value);
         Ok(())
@@ -827,7 +971,7 @@ impl Writer {
     fn slots(&mut self, slots: &[FileSlotNumber]) -> Result<(), AuthorityFatal> {
         self.u32(
             u32::try_from(slots.len())
-                .map_err(|_| AuthorityFatal::MalformedFrame("slot count overflow"))?,
+                .map_err(|_| AuthorityFatal::EncodingFailure("slot count overflow"))?,
         );
         for slot in slots {
             self.i32(slot.raw());
@@ -857,6 +1001,10 @@ impl Writer {
             DescriptionBackingSnapshot::VfsFile { object } => {
                 self.u8(1);
                 self.u64(object.raw());
+            }
+            DescriptionBackingSnapshot::HostFile { writable } => {
+                self.u8(2);
+                self.bool(*writable);
             }
         }
         Ok(())
@@ -977,6 +1125,10 @@ impl<'a> Reader<'a> {
         VfsObjectId::from_snapshot(self.u64()?)
             .map_err(|_| AuthorityFatal::MalformedFrame("invalid VFS object id"))
     }
+    fn capability_lease_id(&mut self) -> Result<CapabilityLeaseId, AuthorityFatal> {
+        CapabilityLeaseId::from_snapshot(self.u64()?)
+            .map_err(|_| AuthorityFatal::MalformedFrame("invalid capability lease id"))
+    }
     fn slot(&mut self) -> Result<FileSlotNumber, AuthorityFatal> {
         FileSlotNumber::for_open_fd(self.i32()?)
             .map_err(|_| AuthorityFatal::MalformedFrame("invalid file slot"))
@@ -988,6 +1140,19 @@ impl<'a> Reader<'a> {
             2 => Ok(AccessMode::ReadWrite),
             3 => Ok(AccessMode::PathOnly),
             _ => malformed("invalid access mode"),
+        }
+    }
+    fn capability_purpose(&mut self) -> Result<CapabilityLeasePurpose, AuthorityFatal> {
+        match self.u8()? {
+            0 => Ok(CapabilityLeasePurpose::MappingSource),
+            _ => malformed("invalid capability lease purpose"),
+        }
+    }
+    fn capability_disposition(&mut self) -> Result<CapabilityLeaseDisposition, AuthorityFatal> {
+        match self.u8()? {
+            0 => Ok(CapabilityLeaseDisposition::Commit),
+            1 => Ok(CapabilityLeaseDisposition::Abort),
+            _ => malformed("invalid capability lease disposition"),
         }
     }
     fn client(&mut self) -> Result<ClientIdentity, AuthorityFatal> {
@@ -1037,6 +1202,9 @@ impl<'a> Reader<'a> {
             },
             1 => DescriptionBackingSnapshot::VfsFile {
                 object: self.vfs_object()?,
+            },
+            2 => DescriptionBackingSnapshot::HostFile {
+                writable: self.bool()?,
             },
             _ => return malformed("invalid description backing"),
         };
@@ -1106,6 +1274,7 @@ mod tests {
         let description =
             FileDescriptionId::from_registry_allocation(NonZeroU64::new(3).expect("description"));
         let object = VfsObjectId::from_snapshot(4).expect("object");
+        let lease = CapabilityLeaseId::from_snapshot(5).expect("lease");
         let path = CanonicalPath::absolute("/all-variants").expect("path");
         let commands = vec![
             Command::RegisterClient,
@@ -1146,6 +1315,25 @@ mod tests {
                 access_mode: AccessMode::WriteOnly,
                 status_flags: StatusFlags::default(),
                 path: None,
+            },
+            Command::AdoptHostFileAndInstall {
+                table,
+                minimum: FileSlotNumber::for_open_fd(4).expect("fd"),
+                ceiling: NofileAllocationCeiling::from_captured_soft_limit(9),
+                descriptor_flags: DescriptorFlags::NONE,
+                access_mode: AccessMode::ReadWrite,
+                status_flags: StatusFlags::default(),
+                writable: true,
+                path: Some(path.clone()),
+            },
+            Command::AcquireCapabilityLease {
+                table,
+                fd: FileSlotNumber::for_open_fd(3).expect("fd"),
+                purpose: CapabilityLeasePurpose::MappingSource,
+            },
+            Command::ReleaseCapabilityLease {
+                lease,
+                disposition: CapabilityLeaseDisposition::Abort,
             },
             Command::ResolveSlot {
                 table,
@@ -1198,9 +1386,13 @@ mod tests {
                 expected_generation: ObjectGeneration::INITIAL,
                 command,
             };
-            let encoded = encode_request(&request).expect("encode request");
+            let fd_count = usize::from(matches!(
+                request.command,
+                Command::AdoptHostFileAndInstall { .. }
+            ));
+            let encoded = encode_request_with_fd_count(&request, fd_count).expect("encode request");
             assert_eq!(
-                decode_request(&encoded, 0).expect("decode request"),
+                decode_request(&encoded, fd_count).expect("decode request"),
                 request
             );
         }
@@ -1307,6 +1499,30 @@ mod tests {
                 logical_slot_refs: 2,
                 backing: DescriptionBackingSnapshot::VfsFile { object },
             }),
+            Outcome::Description(DescriptionSnapshot {
+                description,
+                generation: ObjectGeneration::INITIAL,
+                revision: Revision::from_wire(13),
+                offset: FileOffset::from_start(3),
+                access_mode: AccessMode::ReadOnly,
+                status_flags: StatusFlags::from_linux_bits(1),
+                logical_slot_refs: 1,
+                backing: DescriptionBackingSnapshot::HostFile { writable: false },
+            }),
+            Outcome::CapabilityLeaseGranted {
+                lease,
+                description,
+                description_generation: ObjectGeneration::INITIAL,
+                purpose: CapabilityLeasePurpose::MappingSource,
+                revision: Revision::from_wire(14),
+            },
+            Outcome::CapabilityLeaseReleased {
+                lease,
+                disposition: CapabilityLeaseDisposition::Commit,
+                description_reclaimed: true,
+                object_reclaimed: false,
+                revision: Revision::from_wire(15),
+            },
             Outcome::Rejected(AuthorityError::StaleEpoch {
                 expected: AuthorityEpoch::for_run(7).expect("epoch"),
                 actual: AuthorityEpoch::for_run(8).expect("epoch"),
@@ -1330,6 +1546,14 @@ mod tests {
             Outcome::Rejected(AuthorityError::NotReadable),
             Outcome::Rejected(AuthorityError::NotWritable),
             Outcome::Rejected(AuthorityError::NotSeekable),
+            Outcome::Rejected(AuthorityError::NotHostBacked),
+            Outcome::Rejected(AuthorityError::CapabilityLeaseNotFound),
+            Outcome::Rejected(AuthorityError::HostIo(HostErrno::from_host(
+                NonZeroI32::new(libc::EIO).expect("errno"),
+            ))),
+            Outcome::Rejected(AuthorityError::BackingReadOnly),
+            Outcome::Rejected(AuthorityError::HostBackingTypeMismatch),
+            Outcome::Rejected(AuthorityError::HostAccessMismatch),
         ];
         let request = Request {
             epoch: AuthorityEpoch::for_run(7).expect("epoch"),
@@ -1344,9 +1568,14 @@ mod tests {
                 authority_revision: Revision::from_wire(20),
                 outcome,
             };
-            let encoded = encode_response(&request, &response).expect("encode response");
+            let fd_count = usize::from(matches!(
+                &response.outcome,
+                Outcome::CapabilityLeaseGranted { .. }
+            ));
+            let encoded = encode_response_with_fd_count(&request, &response, fd_count)
+                .expect("encode response");
             assert_eq!(
-                decode_response(&request, &encoded, 0).expect("decode response"),
+                decode_response(&request, &encoded, fd_count).expect("decode response"),
                 response
             );
         }

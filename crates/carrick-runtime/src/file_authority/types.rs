@@ -1,4 +1,5 @@
-use std::num::NonZeroU64;
+use std::num::{NonZeroI32, NonZeroU64};
+use std::os::fd::OwnedFd;
 
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
 
@@ -28,8 +29,15 @@ nonzero_domain!(AuthorityEpoch, for_run);
 nonzero_domain!(ClientId, for_process_client);
 nonzero_domain!(RequestId, from_client_sequence);
 nonzero_domain!(VfsObjectId, from_snapshot);
+nonzero_domain!(CapabilityLeaseId, from_snapshot);
 
 impl VfsObjectId {
+    pub(super) const fn from_authority_allocation(raw: NonZeroU64) -> Self {
+        Self(raw)
+    }
+}
+
+impl CapabilityLeaseId {
     pub(super) const fn from_authority_allocation(raw: NonZeroU64) -> Self {
         Self(raw)
     }
@@ -241,6 +249,40 @@ pub(crate) enum SeekWhence {
     End,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CapabilityLeasePurpose {
+    MappingSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub(crate) struct HostErrno(NonZeroI32);
+
+impl HostErrno {
+    pub(super) fn last() -> Self {
+        let raw = std::io::Error::last_os_error()
+            .raw_os_error()
+            .filter(|raw| *raw > 0)
+            .and_then(NonZeroI32::new)
+            .unwrap_or_else(|| NonZeroI32::new(libc::EIO).unwrap_or(NonZeroI32::MIN));
+        Self(raw)
+    }
+
+    pub(crate) const fn from_host(raw: NonZeroI32) -> Self {
+        Self(raw)
+    }
+
+    pub(crate) const fn raw(self) -> i32 {
+        self.0.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CapabilityLeaseDisposition {
+    Commit,
+    Abort,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Request {
     pub(crate) epoch: AuthorityEpoch,
@@ -295,6 +337,25 @@ pub(crate) enum Command {
         status_flags: StatusFlags,
         path: Option<CanonicalPath>,
     },
+    AdoptHostFileAndInstall {
+        table: FileTableId,
+        minimum: FileSlotNumber,
+        ceiling: NofileAllocationCeiling,
+        descriptor_flags: DescriptorFlags,
+        access_mode: AccessMode,
+        status_flags: StatusFlags,
+        writable: bool,
+        path: Option<CanonicalPath>,
+    },
+    AcquireCapabilityLease {
+        table: FileTableId,
+        fd: FileSlotNumber,
+        purpose: CapabilityLeasePurpose,
+    },
+    ReleaseCapabilityLease {
+        lease: CapabilityLeaseId,
+        disposition: CapabilityLeaseDisposition,
+    },
     ResolveSlot {
         table: FileTableId,
         fd: FileSlotNumber,
@@ -340,6 +401,27 @@ pub(crate) enum Command {
     InspectDescription {
         description: FileDescriptionId,
     },
+}
+
+#[derive(Debug)]
+pub(crate) struct AuthorityCall {
+    pub(crate) request: Request,
+    pub(crate) capabilities: Vec<OwnedFd>,
+}
+
+impl AuthorityCall {
+    pub(crate) fn without_capabilities(request: Request) -> Self {
+        Self {
+            request,
+            capabilities: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct AuthorityReply {
+    pub(crate) response: Response,
+    pub(crate) capabilities: Vec<OwnedFd>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -425,6 +507,20 @@ pub(crate) enum Outcome {
         closed_on_exec: Vec<FileSlotNumber>,
         revision: Revision,
     },
+    CapabilityLeaseGranted {
+        lease: CapabilityLeaseId,
+        description: FileDescriptionId,
+        description_generation: ObjectGeneration,
+        purpose: CapabilityLeasePurpose,
+        revision: Revision,
+    },
+    CapabilityLeaseReleased {
+        lease: CapabilityLeaseId,
+        disposition: CapabilityLeaseDisposition,
+        description_reclaimed: bool,
+        object_reclaimed: bool,
+        revision: Revision,
+    },
     Description(DescriptionSnapshot),
     Rejected(AuthorityError),
 }
@@ -454,6 +550,7 @@ pub(crate) struct DescriptionSnapshot {
 pub(crate) enum DescriptionBackingSnapshot {
     Synthetic { length: u64 },
     VfsFile { object: VfsObjectId },
+    HostFile { writable: bool },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -501,6 +598,18 @@ pub(crate) enum AuthorityError {
     NotWritable,
     #[error("description is not seekable")]
     NotSeekable,
+    #[error("description does not have a host descriptor backing")]
+    NotHostBacked,
+    #[error("capability lease was not found")]
+    CapabilityLeaseNotFound,
+    #[error("host operation failed with errno {0:?}")]
+    HostIo(HostErrno),
+    #[error("host descriptor is not a regular-file backing")]
+    HostBackingTypeMismatch,
+    #[error("declared access mode does not match the host descriptor")]
+    HostAccessMismatch,
+    #[error("host file backing is read-only")]
+    BackingReadOnly,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -517,12 +626,16 @@ pub(crate) enum AuthorityFatal {
     IdentityExhausted,
     #[error("file authority invariant was violated: {0}")]
     InvariantViolation(&'static str),
+    #[error("file authority could not encode a protocol frame: {0}")]
+    EncodingFailure(&'static str),
     #[error("file authority protocol frame is malformed: {0}")]
     MalformedFrame(&'static str),
     #[error("file authority transport is unavailable")]
     TransportUnavailable,
     #[error("file authority response does not match its request")]
     ResponseMismatch,
+    #[error("file authority capability count does not match the operation")]
+    CapabilityMismatch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
