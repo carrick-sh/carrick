@@ -15,9 +15,10 @@ use super::types::{
     CapabilityLeasePurpose, ClientId, ClientIdentity, Command, DescriptionSnapshot,
     DescriptorFlags, EpollEventLimit, EpollHostPlan, EpollHostPlanAction, EpollInterestKey,
     EpollRegistration, FileDescriptionId, FileOffset, FileSlotNumber, FileTableId,
-    InterestGeneration, NofileAllocationCeiling, ObjectGeneration, Outcome, PipeCapacity, PipeEnd,
-    PipeId, Request, Response, Revision, SameSlotBehavior, SeekWhence, SlotPageLimit,
-    SlotRangeAction, SlotSnapshot, StatusFlags, VfsObjectId,
+    InterestGeneration, MappingAttachmentId, MappingLeaseDisposition, MappingRange, MappingRelease,
+    NofileAllocationCeiling, ObjectGeneration, Outcome, PipeCapacity, PipeEnd, PipeId, Request,
+    Response, Revision, SameSlotBehavior, SeekWhence, SlotPageLimit, SlotRangeAction, SlotSnapshot,
+    StatusFlags, VfsObjectId,
 };
 
 pub(super) const MAX_TERMINAL_DEDUP_ENTRIES: usize = 8_192;
@@ -107,6 +108,13 @@ struct CapabilityLeaseState {
     purpose: CapabilityLeasePurpose,
 }
 
+#[derive(Debug)]
+struct MappingAttachmentState {
+    owner: ClientIdentity,
+    description: FileDescriptionId,
+    ranges: Vec<MappingRange>,
+}
+
 /// One run's mutable file and writable-memory-VFS authority.
 ///
 /// `execute` is the sole mutation boundary used by both direct and IPC
@@ -117,6 +125,7 @@ pub(crate) struct FileAuthorityCore {
     ids: ObjectIdRegistry,
     next_vfs_object: u64,
     next_capability_lease: u64,
+    next_mapping_attachment: u64,
     next_interest_generation: u32,
     next_pipe: u64,
     revision: Revision,
@@ -127,6 +136,7 @@ pub(crate) struct FileAuthorityCore {
     namespace: BTreeMap<CanonicalPath, VfsObjectId>,
     vfs_objects: BTreeMap<VfsObjectId, VfsObjectState>,
     capability_leases: BTreeMap<CapabilityLeaseId, CapabilityLeaseState>,
+    mapping_attachments: BTreeMap<MappingAttachmentId, MappingAttachmentState>,
     epoll_watchers: BTreeMap<FileDescriptionId, BTreeSet<(FileDescriptionId, EpollInterestKey)>>,
     streams: BTreeMap<PipeId, PipeStreamState>,
     stream_revisions: BTreeMap<PipeId, Revision>,
@@ -143,6 +153,7 @@ impl FileAuthorityCore {
             ids: ObjectIdRegistry::new(),
             next_vfs_object: 1,
             next_capability_lease: 1,
+            next_mapping_attachment: 1,
             next_interest_generation: 1,
             next_pipe: 1,
             revision: Revision::ZERO,
@@ -153,6 +164,7 @@ impl FileAuthorityCore {
             namespace: BTreeMap::new(),
             vfs_objects: BTreeMap::new(),
             capability_leases: BTreeMap::new(),
+            mapping_attachments: BTreeMap::new(),
             epoll_watchers: BTreeMap::new(),
             streams: BTreeMap::new(),
             stream_revisions: BTreeMap::new(),
@@ -469,6 +481,13 @@ impl FileAuthorityCore {
                     Command::ReleaseCapabilityLease { lease, disposition } => {
                         self.release_capability_lease(request.client, *lease, *disposition)
                     }
+                    Command::FinalizeMappingLease { lease, disposition } => {
+                        self.finalize_mapping_lease(request.client, *lease, *disposition)
+                    }
+                    Command::ReleaseMappingAttachment {
+                        attachment,
+                        release,
+                    } => self.release_mapping_attachment(request.client, *attachment, *release),
                     Command::ResolveSlot { table, fd } => {
                         self.resolve_slot(request.client, *table, request.expected_generation, *fd)
                     }
@@ -722,6 +741,11 @@ impl FileAuthorityCore {
             .iter()
             .filter_map(|(lease, state)| (state.owner == identity).then_some(*lease))
             .collect();
+        let owned_attachments: Vec<MappingAttachmentId> = self
+            .mapping_attachments
+            .iter()
+            .filter_map(|(attachment, state)| (state.owner == identity).then_some(*attachment))
+            .collect();
         let revision = self.publish_mutation();
         for table_id in &affected {
             let table = self.tables.get_mut(table_id).unwrap_or_else(|| {
@@ -750,6 +774,17 @@ impl FileAuthorityCore {
                     "client exit lost an owned capability lease",
                 ))
             });
+            self.release_capability_lease_ref(state.description, revision);
+        }
+        for attachment in owned_attachments {
+            let state = self
+                .mapping_attachments
+                .remove(&attachment)
+                .unwrap_or_else(|| {
+                    abort_fatal(AuthorityFatal::InvariantViolation(
+                        "client exit lost an owned mapping attachment",
+                    ))
+                });
             self.release_capability_lease_ref(state.description, revision);
         }
         self.clients.remove(&identity.id);
@@ -1396,6 +1431,129 @@ impl FileAuthorityCore {
             disposition,
             description_reclaimed,
             object_reclaimed,
+            revision,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_mapping_lease(
+        &mut self,
+        client: ClientIdentity,
+        lease: CapabilityLeaseId,
+        disposition: MappingLeaseDisposition,
+    ) -> Result<Outcome, AuthorityError> {
+        let lease_state = self
+            .capability_leases
+            .get(&lease)
+            .ok_or(AuthorityError::CapabilityLeaseNotFound)?;
+        if lease_state.owner != client
+            || lease_state.purpose != CapabilityLeasePurpose::MappingSource
+        {
+            return Err(AuthorityError::CapabilityLeaseNotFound);
+        }
+        let description = lease_state.description;
+        let attachment = match disposition {
+            MappingLeaseDisposition::Commit { .. } => Some(self.allocate_mapping_attachment()),
+            MappingLeaseDisposition::Abort => None,
+        };
+        let revision = self.publish_mutation();
+        self.capability_leases.remove(&lease).unwrap_or_else(|| {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "mapping lease finalization lost its validated lease",
+            ))
+        });
+        let (description_reclaimed, object_reclaimed) = match (attachment, disposition) {
+            (Some(attachment), MappingLeaseDisposition::Commit { range }) => {
+                self.mapping_attachments.insert(
+                    attachment,
+                    MappingAttachmentState {
+                        owner: client,
+                        description,
+                        ranges: vec![range],
+                    },
+                );
+                let state = self.descriptions.get_mut(&description).unwrap_or_else(|| {
+                    abort_fatal(AuthorityFatal::InvariantViolation(
+                        "mapping attachment lost its leased description",
+                    ))
+                });
+                state.revision = revision;
+                (false, false)
+            }
+            (None, MappingLeaseDisposition::Abort) => {
+                self.release_capability_lease_ref(description, revision)
+            }
+            _ => abort_fatal(AuthorityFatal::InvariantViolation(
+                "mapping lease disposition and attachment disagree",
+            )),
+        };
+        Ok(Outcome::MappingLeaseFinalized {
+            lease,
+            attachment,
+            description,
+            disposition,
+            description_reclaimed,
+            object_reclaimed,
+            revision,
+        })
+    }
+
+    fn release_mapping_attachment(
+        &mut self,
+        client: ClientIdentity,
+        attachment: MappingAttachmentId,
+        release: MappingRelease,
+    ) -> Result<Outcome, AuthorityError> {
+        let state = self
+            .mapping_attachments
+            .get(&attachment)
+            .ok_or(AuthorityError::MappingAttachmentNotFound)?;
+        if state.owner != client {
+            return Err(AuthorityError::MappingAttachmentNotFound);
+        }
+        let remaining = release_mapping_ranges(&state.ranges, release)?;
+        let description = state.description;
+        let revision = self.publish_mutation();
+        if remaining.is_empty() {
+            self.mapping_attachments
+                .remove(&attachment)
+                .unwrap_or_else(|| {
+                    abort_fatal(AuthorityFatal::InvariantViolation(
+                        "mapping release lost its validated attachment",
+                    ))
+                });
+            let (description_reclaimed, object_reclaimed) =
+                self.release_capability_lease_ref(description, revision);
+            return Ok(Outcome::MappingAttachmentReleased {
+                attachment,
+                remaining,
+                description_reclaimed,
+                object_reclaimed,
+                revision,
+            });
+        }
+        let state = self
+            .mapping_attachments
+            .get_mut(&attachment)
+            .unwrap_or_else(|| {
+                abort_fatal(AuthorityFatal::InvariantViolation(
+                    "partial mapping release lost its attachment",
+                ))
+            });
+        state.ranges = remaining.clone();
+        self.descriptions
+            .get_mut(&description)
+            .unwrap_or_else(|| {
+                abort_fatal(AuthorityFatal::InvariantViolation(
+                    "partial mapping release lost its description",
+                ))
+            })
+            .revision = revision;
+        Ok(Outcome::MappingAttachmentReleased {
+            attachment,
+            remaining,
+            description_reclaimed: false,
+            object_reclaimed: false,
             revision,
         })
     }
@@ -3215,6 +3373,16 @@ impl FileAuthorityCore {
         InterestGeneration::from_authority_allocation(raw)
     }
 
+    fn allocate_mapping_attachment(&mut self) -> MappingAttachmentId {
+        let raw = NonZeroU64::new(self.next_mapping_attachment)
+            .unwrap_or_else(|| abort_fatal(AuthorityFatal::IdentityExhausted));
+        self.next_mapping_attachment = self
+            .next_mapping_attachment
+            .checked_add(1)
+            .unwrap_or_else(|| abort_fatal(AuthorityFatal::IdentityExhausted));
+        MappingAttachmentId::from_authority_allocation(raw)
+    }
+
     fn allocate_capability_lease(&mut self) -> CapabilityLeaseId {
         let raw = NonZeroU64::new(self.next_capability_lease)
             .unwrap_or_else(|| abort_fatal(AuthorityFatal::IdentityExhausted));
@@ -3269,6 +3437,50 @@ fn is_epollable(backing: &AuthorityBacking) -> bool {
             | AuthorityBacking::EventCounter { .. }
             | AuthorityBacking::PipeEnd { .. }
     )
+}
+
+fn release_mapping_ranges(
+    ranges: &[MappingRange],
+    release: MappingRelease,
+) -> Result<Vec<MappingRange>, AuthorityError> {
+    if matches!(release, MappingRelease::Whole) {
+        return Ok(Vec::new());
+    }
+    let MappingRelease::Range(release) = release else {
+        return Ok(Vec::new());
+    };
+    let release_end = release
+        .start()
+        .checked_add(release.length())
+        .ok_or(AuthorityError::InvalidMappingRange)?;
+    let mut overlapped = false;
+    let mut remaining = Vec::with_capacity(ranges.len().saturating_add(1));
+    for range in ranges {
+        let range_end = range
+            .start()
+            .checked_add(range.length())
+            .ok_or(AuthorityError::InvalidMappingRange)?;
+        let overlap_start = range.start().max(release.start());
+        let overlap_end = range_end.min(release_end);
+        if overlap_start >= overlap_end {
+            remaining.push(*range);
+            continue;
+        }
+        overlapped = true;
+        if range.start() < overlap_start {
+            remaining.push(MappingRange::bounded(
+                range.start(),
+                overlap_start - range.start(),
+            )?);
+        }
+        if overlap_end < range_end {
+            remaining.push(MappingRange::bounded(overlap_end, range_end - overlap_end)?);
+        }
+    }
+    if !overlapped {
+        return Err(AuthorityError::MappingReleaseOutsideAttachment);
+    }
+    Ok(remaining)
 }
 
 fn expected_request_capabilities(command: &Command) -> usize {

@@ -1449,6 +1449,120 @@ fn direct_and_ipc_transports_match_bounded_table_mutations() {
 }
 
 #[test]
+fn direct_and_ipc_mapping_attachments_outlive_slots_and_split_on_unmap() {
+    for ipc in [false, true] {
+        let mut harness = if ipc {
+            Harness::new_ipc()
+        } else {
+            Harness::new()
+        };
+        let table = harness.create_table();
+        let file = tempfile::NamedTempFile::new().expect("temporary host file");
+        let owned: OwnedFd = file.into_file().into();
+        let adopt_request = harness.request(
+            Command::AdoptHostFileAndInstall {
+                table,
+                minimum: fd(3),
+                ceiling: NofileAllocationCeiling::from_captured_soft_limit(16),
+                descriptor_flags: DescriptorFlags::NONE,
+                access_mode: AccessMode::ReadWrite,
+                status_flags: StatusFlags::default(),
+                writable: true,
+                path: None,
+            },
+            ObjectGeneration::INITIAL,
+        );
+        let adopted = harness
+            .transact(adopt_request, vec![owned])
+            .expect("adopt host file");
+        let (open_fd, description) = match adopted.response.outcome {
+            Outcome::Installed {
+                fd, description, ..
+            } => (fd, description),
+            other => panic!("unexpected adoption: {other:?}"),
+        };
+        let lease_request = harness.request(
+            Command::AcquireCapabilityLease {
+                table,
+                fd: open_fd,
+                purpose: CapabilityLeasePurpose::MappingSource,
+            },
+            ObjectGeneration::INITIAL,
+        );
+        let lease_reply = harness
+            .transact(lease_request, Vec::new())
+            .expect("acquire mapping lease");
+        let lease = match lease_reply.response.outcome {
+            Outcome::CapabilityLeaseGranted { lease, .. } => lease,
+            other => panic!("unexpected lease: {other:?}"),
+        };
+        assert_eq!(lease_reply.capabilities.len(), 1);
+        let attachment = match harness.send(
+            Command::FinalizeMappingLease {
+                lease,
+                disposition: MappingLeaseDisposition::Commit {
+                    range: MappingRange::bounded(0x1000, 0x3000).expect("range"),
+                },
+            },
+            ObjectGeneration::INITIAL,
+        ) {
+            Outcome::MappingLeaseFinalized {
+                attachment: Some(attachment),
+                ..
+            } => attachment,
+            other => panic!("unexpected mapping commit: {other:?}"),
+        };
+        assert!(matches!(
+            harness.send(
+                Command::Close { table, fd: open_fd },
+                ObjectGeneration::INITIAL,
+            ),
+            Outcome::Closed {
+                description_reclaimed: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            harness.send(
+                Command::ReleaseMappingAttachment {
+                    attachment,
+                    release: MappingRelease::Range(
+                        MappingRange::bounded(0x2000, 0x1000).expect("range"),
+                    ),
+                },
+                ObjectGeneration::INITIAL,
+            ),
+            Outcome::MappingAttachmentReleased { remaining, .. }
+                if remaining == vec![
+                    MappingRange::bounded(0x1000, 0x1000).expect("range"),
+                    MappingRange::bounded(0x3000, 0x1000).expect("range"),
+                ]
+        ));
+        assert!(matches!(
+            harness.send(
+                Command::ReleaseMappingAttachment {
+                    attachment,
+                    release: MappingRelease::Whole,
+                },
+                ObjectGeneration::INITIAL,
+            ),
+            Outcome::MappingAttachmentReleased {
+                description_reclaimed: true,
+                object_reclaimed: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            harness.send(
+                Command::InspectDescription { description },
+                ObjectGeneration::INITIAL,
+            ),
+            Outcome::Rejected(AuthorityError::DescriptionNotFound)
+        ));
+    }
+}
+
+#[test]
 fn direct_and_ipc_transports_transfer_scoped_host_capability_leases() {
     host_capability_lease_model(Harness::new(), CapabilityLeaseDisposition::Commit);
     host_capability_lease_model(Harness::new_ipc(), CapabilityLeaseDisposition::Abort);
