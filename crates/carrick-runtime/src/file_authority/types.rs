@@ -406,6 +406,8 @@ impl SlotPageLimit {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CapabilityLeasePurpose {
     MappingSource,
+    IoUringData,
+    IoUringLock,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -580,6 +582,15 @@ pub(crate) enum Command {
         status_flags: StatusFlags,
         writable: bool,
         path: Option<CanonicalPath>,
+    },
+    AdoptIoUringAndInstall {
+        table: FileTableId,
+        minimum: FileSlotNumber,
+        ceiling: NofileAllocationCeiling,
+        descriptor_flags: DescriptorFlags,
+        status_flags: StatusFlags,
+        entries: u32,
+        data_length: u64,
     },
     AcquireCapabilityLease {
         table: FileTableId,
@@ -772,6 +783,16 @@ pub(crate) enum Outcome {
         pipe: PipeId,
         capacity: PipeCapacity,
         stream_revision: Revision,
+    },
+    IoUringCreated {
+        table: FileTableId,
+        fd: FileSlotNumber,
+        description: FileDescriptionId,
+        generation: ObjectGeneration,
+        entries: u32,
+        data_length: u64,
+        table_revision: Revision,
+        description_revision: Revision,
     },
     EpollCreated {
         table: FileTableId,
@@ -1006,6 +1027,7 @@ pub(crate) enum DescriptionBackingSnapshot {
     Epoll { interests: u32 },
     EventCounter { counter: u64, semaphore: bool },
     PipeEnd { pipe: PipeId, end: PipeEnd },
+    IoUring { entries: u32, data_length: u64 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]

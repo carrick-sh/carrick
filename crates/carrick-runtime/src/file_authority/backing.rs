@@ -20,6 +20,12 @@ pub(super) enum AuthorityBacking {
         fd: OwnedFd,
         writable: bool,
     },
+    IoUring {
+        data_fd: OwnedFd,
+        lock_fd: OwnedFd,
+        entries: u32,
+        data_length: u64,
+    },
     Epoll(EpollState),
     EventCounter {
         counter: u64,
@@ -41,6 +47,14 @@ impl AuthorityBacking {
             Self::Host { writable, .. } => DescriptionBackingSnapshot::HostFile {
                 writable: *writable,
             },
+            Self::IoUring {
+                entries,
+                data_length,
+                ..
+            } => DescriptionBackingSnapshot::IoUring {
+                entries: *entries,
+                data_length: *data_length,
+            },
             Self::Epoll(state) => DescriptionBackingSnapshot::Epoll {
                 interests: u32::try_from(state.len()).unwrap_or(u32::MAX),
             },
@@ -59,6 +73,7 @@ impl AuthorityBacking {
         match self {
             Self::Synthetic { .. }
             | Self::Host { .. }
+            | Self::IoUring { .. }
             | Self::Epoll(_)
             | Self::EventCounter { .. }
             | Self::PipeEnd { .. } => None,
@@ -66,14 +81,18 @@ impl AuthorityBacking {
         }
     }
 
-    pub(super) fn host_fd(&self) -> Option<RawFd> {
-        match self {
-            Self::Host { fd, .. } => Some(fd.as_raw_fd()),
-            Self::Synthetic { .. }
-            | Self::Vfs { .. }
-            | Self::Epoll(_)
-            | Self::EventCounter { .. }
-            | Self::PipeEnd { .. } => None,
+    pub(super) fn host_fd(&self, purpose: super::CapabilityLeasePurpose) -> Option<RawFd> {
+        match (self, purpose) {
+            (Self::Host { fd, .. }, super::CapabilityLeasePurpose::MappingSource) => {
+                Some(fd.as_raw_fd())
+            }
+            (Self::IoUring { data_fd, .. }, super::CapabilityLeasePurpose::IoUringData) => {
+                Some(data_fd.as_raw_fd())
+            }
+            (Self::IoUring { lock_fd, .. }, super::CapabilityLeasePurpose::IoUringLock) => {
+                Some(lock_fd.as_raw_fd())
+            }
+            _ => None,
         }
     }
 }

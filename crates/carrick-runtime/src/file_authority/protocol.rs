@@ -258,6 +258,7 @@ fn command_tag(command: &Command) -> u8 {
         Command::FinalizeMappingLease { .. } => 41,
         Command::ReleaseMappingAttachment { .. } => 42,
         Command::ForkCopyMappings { .. } => 43,
+        Command::AdoptIoUringAndInstall { .. } => 44,
     }
 }
 
@@ -373,6 +374,23 @@ fn encode_command(writer: &mut Writer, command: &Command) -> Result<(), Authorit
             writer.u8(access_mode_tag(*access_mode));
             writer.u64(status_flags.raw());
             writer.optional_path(path.as_ref())?;
+        }
+        Command::AdoptIoUringAndInstall {
+            table,
+            minimum,
+            ceiling,
+            descriptor_flags,
+            status_flags,
+            entries,
+            data_length,
+        } => {
+            writer.u64(table.raw());
+            writer.i32(minimum.raw());
+            writer.u32(ceiling.raw());
+            writer.u32(descriptor_flags.raw());
+            writer.u64(status_flags.raw());
+            writer.u32(*entries);
+            writer.u64(*data_length);
         }
         Command::AdoptHostFileAndInstall {
             table,
@@ -824,6 +842,16 @@ fn decode_command(tag: u8, reader: &mut Reader<'_>) -> Result<Command, Authority
             source_owner: reader.client()?,
             owner: reader.client()?,
         },
+        44 => Command::AdoptIoUringAndInstall {
+            table: reader.table_id()?,
+            minimum: reader.slot()?,
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(reader.u32()?),
+            descriptor_flags: DescriptorFlags::from_linux_bits(reader.u32()?)
+                .map_err(|_| AuthorityFatal::MalformedFrame("invalid descriptor flags"))?,
+            status_flags: StatusFlags::from_linux_bits(reader.u64()?),
+            entries: reader.u32()?,
+            data_length: reader.u64()?,
+        },
         _ => return malformed("unknown operation"),
     })
 }
@@ -873,6 +901,26 @@ fn encode_outcome(writer: &mut Writer, outcome: &Outcome) -> Result<(), Authorit
             writer.u64(pipe.raw());
             writer.u32(capacity.raw());
             writer.u64(stream_revision.raw());
+        }
+        Outcome::IoUringCreated {
+            table,
+            fd,
+            description,
+            generation,
+            entries,
+            data_length,
+            table_revision,
+            description_revision,
+        } => {
+            writer.u8(43);
+            writer.u64(table.raw());
+            writer.i32(fd.raw());
+            writer.u64(description.raw());
+            writer.u64(generation.raw());
+            writer.u32(*entries);
+            writer.u64(*data_length);
+            writer.u64(table_revision.raw());
+            writer.u64(description_revision.raw());
         }
         Outcome::EpollCreated {
             table,
@@ -1516,6 +1564,16 @@ fn decode_outcome(reader: &mut Reader<'_>) -> Result<Outcome, AuthorityFatal> {
             attachments: reader.mapping_attachments()?,
             revision: reader.revision()?,
         },
+        43 => Outcome::IoUringCreated {
+            table: reader.table_id()?,
+            fd: reader.slot()?,
+            description: reader.description_id()?,
+            generation: reader.generation()?,
+            entries: reader.u32()?,
+            data_length: reader.u64()?,
+            table_revision: reader.revision()?,
+            description_revision: reader.revision()?,
+        },
         _ => return malformed("unknown response outcome"),
     })
 }
@@ -1663,6 +1721,8 @@ const fn slot_range_action_tag(action: SlotRangeAction) -> u8 {
 const fn capability_purpose_tag(purpose: CapabilityLeasePurpose) -> u8 {
     match purpose {
         CapabilityLeasePurpose::MappingSource => 0,
+        CapabilityLeasePurpose::IoUringData => 1,
+        CapabilityLeasePurpose::IoUringLock => 2,
     }
 }
 
@@ -1927,6 +1987,14 @@ impl Writer {
                     PipeEnd::Reader => 0,
                     PipeEnd::Writer => 1,
                 });
+            }
+            DescriptionBackingSnapshot::IoUring {
+                entries,
+                data_length,
+            } => {
+                self.u8(6);
+                self.u32(*entries);
+                self.u64(*data_length);
             }
         }
         Ok(())
@@ -2202,6 +2270,8 @@ impl<'a> Reader<'a> {
     fn capability_purpose(&mut self) -> Result<CapabilityLeasePurpose, AuthorityFatal> {
         match self.u8()? {
             0 => Ok(CapabilityLeasePurpose::MappingSource),
+            1 => Ok(CapabilityLeasePurpose::IoUringData),
+            2 => Ok(CapabilityLeasePurpose::IoUringLock),
             _ => malformed("invalid capability lease purpose"),
         }
     }
@@ -2284,6 +2354,10 @@ impl<'a> Reader<'a> {
                     1 => PipeEnd::Writer,
                     _ => return malformed("invalid pipe end"),
                 },
+            },
+            6 => DescriptionBackingSnapshot::IoUring {
+                entries: self.u32()?,
+                data_length: self.u64()?,
             },
             _ => return malformed("invalid description backing"),
         };
@@ -2451,6 +2525,15 @@ mod tests {
                 status_flags: StatusFlags::default(),
                 path: None,
             },
+            Command::AdoptIoUringAndInstall {
+                table,
+                minimum: FileSlotNumber::for_open_fd(3).expect("fd"),
+                ceiling: NofileAllocationCeiling::from_captured_soft_limit(9),
+                descriptor_flags: DescriptorFlags::CLOSE_ON_EXEC,
+                status_flags: StatusFlags::default(),
+                entries: 8,
+                data_length: 4096,
+            },
             Command::AdoptHostFileAndInstall {
                 table,
                 minimum: FileSlotNumber::for_open_fd(4).expect("fd"),
@@ -2612,6 +2695,16 @@ mod tests {
                 table,
                 generation: ObjectGeneration::INITIAL,
                 revision: Revision::from_wire(1),
+            },
+            Outcome::IoUringCreated {
+                table,
+                fd: slot,
+                description,
+                generation: ObjectGeneration::INITIAL,
+                entries: 8,
+                data_length: 4096,
+                table_revision: Revision::from_wire(7),
+                description_revision: Revision::from_wire(7),
             },
             Outcome::EpollCreated {
                 table,
