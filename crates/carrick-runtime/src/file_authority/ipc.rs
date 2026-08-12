@@ -132,6 +132,25 @@ impl IpcFileAuthority {
         ))
     }
 
+    pub(crate) fn prepare_single_use_reexec_successor(
+        &self,
+        nonce: u64,
+    ) -> Result<ReexecSuccessorEndpoint, AuthorityFatal> {
+        if nonce == 0 {
+            return Err(AuthorityFatal::InvariantViolation(
+                "native reexec successor nonce cannot be zero",
+            ));
+        }
+        let socket = self.inner.socket.lock();
+        let socket_fd = duplicate_cloexec(socket.as_raw_fd())?;
+        let process_lock_fd = duplicate_cloexec(self.inner.process_lock.as_raw_fd())?;
+        Ok(ReexecSuccessorEndpoint {
+            socket_fd,
+            process_lock_fd,
+            nonce,
+        })
+    }
+
     /// Run the exact datagram protocol against a dedicated server thread.
     /// Production helper startup replaces only this launcher; the socket,
     /// protocol, server loop, and core transaction boundary remain identical.
@@ -176,6 +195,44 @@ impl FileAuthorityTransport for IpcFileAuthority {
         Ok(AuthorityReply {
             response,
             capabilities: received.descriptors,
+        })
+    }
+}
+
+pub(crate) struct ReexecSuccessorEndpoint {
+    socket_fd: OwnedFd,
+    process_lock_fd: OwnedFd,
+    nonce: u64,
+}
+
+impl ReexecSuccessorEndpoint {
+    pub(crate) const fn nonce(&self) -> u64 {
+        self.nonce
+    }
+
+    pub(crate) fn socket_fd(&self) -> RawFd {
+        self.socket_fd.as_raw_fd()
+    }
+
+    pub(crate) fn process_lock_fd(&self) -> RawFd {
+        self.process_lock_fd.as_raw_fd()
+    }
+
+    pub(crate) fn adopt(self, nonce: u64) -> Result<IpcFileAuthority, AuthorityFatal> {
+        if nonce != self.nonce {
+            return Err(AuthorityFatal::InvariantViolation(
+                "native reexec successor nonce mismatch",
+            ));
+        }
+        ensure_cloexec(self.socket_fd.as_raw_fd())?;
+        ensure_cloexec(self.process_lock_fd.as_raw_fd())?;
+        configure_client_fd(self.socket_fd.as_raw_fd())?;
+        Ok(IpcFileAuthority {
+            inner: Arc::new(IpcInner {
+                socket: Mutex::new(UnixDatagram::from(self.socket_fd)),
+                process_lock: self.process_lock_fd,
+                server: Mutex::new(None),
+            }),
         })
     }
 }
@@ -271,12 +328,45 @@ fn cloexec_process_lock() -> Result<OwnedFd, AuthorityFatal> {
 }
 
 fn configure_client(client: &UnixDatagram) -> Result<(), AuthorityFatal> {
-    client
-        .set_read_timeout(Some(TRANSPORT_TIMEOUT))
-        .map_err(|_| AuthorityFatal::TransportUnavailable)?;
-    client
-        .set_write_timeout(Some(TRANSPORT_TIMEOUT))
-        .map_err(|_| AuthorityFatal::TransportUnavailable)
+    configure_client_fd(client.as_raw_fd())
+}
+
+fn configure_client_fd(fd: RawFd) -> Result<(), AuthorityFatal> {
+    let timeout = libc::timeval {
+        tv_sec: TRANSPORT_TIMEOUT.as_secs() as _,
+        tv_usec: 0,
+    };
+    for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                (&raw const timeout).cast(),
+                std::mem::size_of::<libc::timeval>() as _,
+            )
+        };
+        if rc < 0 {
+            return Err(AuthorityFatal::TransportUnavailable);
+        }
+    }
+    Ok(())
+}
+
+fn duplicate_cloexec(fd: RawFd) -> Result<OwnedFd, AuthorityFatal> {
+    let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicated < 0 {
+        return Err(AuthorityFatal::TransportUnavailable);
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
+}
+
+fn ensure_cloexec(fd: RawFd) -> Result<(), AuthorityFatal> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 || flags & libc::FD_CLOEXEC == 0 {
+        return Err(AuthorityFatal::TransportUnavailable);
+    }
+    Ok(())
 }
 
 fn cloexec_datagram_pair() -> Result<(UnixDatagram, UnixDatagram), AuthorityFatal> {

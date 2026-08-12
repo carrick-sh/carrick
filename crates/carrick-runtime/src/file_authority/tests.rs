@@ -1712,6 +1712,41 @@ fn client_exit_reclaims_direct_and_ipc_capability_leases() {
 }
 
 #[test]
+fn native_reexec_successor_endpoint_is_authenticated_and_cloexec() {
+    let epoch = AuthorityEpoch::for_run(25).expect("epoch");
+    let (transport, binding) =
+        IpcFileAuthority::spawn_per_run(FileAuthorityCore::for_run(epoch), epoch)
+            .expect("spawn per-run helper");
+    let successor = transport
+        .prepare_single_use_reexec_successor(0xfeed)
+        .expect("prepare successor");
+    assert_eq!(successor.nonce(), 0xfeed);
+    for fd in [successor.socket_fd(), successor.process_lock_fd()] {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
+    }
+    let successor = successor.adopt(0xfeed).expect("adopt successor");
+    let request = Request {
+        epoch,
+        client: binding.client,
+        request_id: RequestId::from_client_sequence(3).expect("request"),
+        expected_generation: binding.generation,
+        command: Command::ListSlots {
+            table: binding.table,
+            after: None,
+            maximum: SlotPageLimit::bounded(1).expect("limit"),
+        },
+    };
+    assert!(matches!(
+        successor
+            .execute(request)
+            .expect("successor request")
+            .outcome,
+        Outcome::SlotPage { .. }
+    ));
+}
+
+#[test]
 fn inherited_helper_endpoint_serializes_cross_process_requests() {
     let epoch = AuthorityEpoch::for_run(24).expect("epoch");
     let (transport, binding) =
