@@ -10,11 +10,25 @@ use super::types::{DescriptionBackingSnapshot, VfsObjectId};
 /// added here as their operation families move behind the same closed API.
 #[derive(Debug)]
 pub(super) enum AuthorityBacking {
-    Synthetic { contents: Vec<u8> },
-    Vfs { object: VfsObjectId },
-    Host { fd: OwnedFd, writable: bool },
+    Synthetic {
+        contents: Vec<u8>,
+    },
+    Vfs {
+        object: VfsObjectId,
+    },
+    Host {
+        fd: OwnedFd,
+        writable: bool,
+    },
     Epoll(EpollState),
-    EventCounter { counter: u64, semaphore: bool },
+    EventCounter {
+        counter: u64,
+        semaphore: bool,
+    },
+    PipeEnd {
+        pipe: super::PipeId,
+        end: super::PipeEnd,
+    },
 }
 
 impl AuthorityBacking {
@@ -34,6 +48,10 @@ impl AuthorityBacking {
                 counter: *counter,
                 semaphore: *semaphore,
             },
+            Self::PipeEnd { pipe, end } => DescriptionBackingSnapshot::PipeEnd {
+                pipe: *pipe,
+                end: *end,
+            },
         }
     }
 
@@ -42,7 +60,8 @@ impl AuthorityBacking {
             Self::Synthetic { .. }
             | Self::Host { .. }
             | Self::Epoll(_)
-            | Self::EventCounter { .. } => None,
+            | Self::EventCounter { .. }
+            | Self::PipeEnd { .. } => None,
             Self::Vfs { object } => Some(*object),
         }
     }
@@ -53,7 +72,8 @@ impl AuthorityBacking {
             Self::Synthetic { .. }
             | Self::Vfs { .. }
             | Self::Epoll(_)
-            | Self::EventCounter { .. } => None,
+            | Self::EventCounter { .. }
+            | Self::PipeEnd { .. } => None,
         }
     }
 }

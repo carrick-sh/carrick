@@ -1023,6 +1023,126 @@ fn event_counter_saturation_model(mut harness: Harness) {
 }
 
 #[test]
+fn direct_and_ipc_pipe_streams_preserve_shared_state_and_endpoint_lifetime() {
+    for ipc in [false, true] {
+        let mut harness = if ipc {
+            Harness::new_ipc()
+        } else {
+            Harness::new()
+        };
+        let table = harness.create_table();
+        let (pipe, read_fd, write_fd, write_description) = match harness.send(
+            Command::CreatePipeAndInstall {
+                table,
+                minimum: fd(3),
+                ceiling: NofileAllocationCeiling::from_captured_soft_limit(32),
+                descriptor_flags: DescriptorFlags::NONE,
+                status_flags: StatusFlags::from_linux_bits(0x800),
+                capacity: PipeCapacity::bounded(8).expect("capacity"),
+            },
+            ObjectGeneration::INITIAL,
+        ) {
+            Outcome::PipeCreated {
+                pipe,
+                read_fd,
+                write_fd,
+                write_description,
+                ..
+            } => (pipe, read_fd, write_fd, write_description),
+            other => panic!("unexpected pipe creation: {other:?}"),
+        };
+        assert!(matches!(
+            harness.send(
+                Command::Read {
+                    table,
+                    fd: read_fd,
+                    maximum: ByteCount::bounded(8).expect("count"),
+                },
+                ObjectGeneration::INITIAL,
+            ),
+            Outcome::Rejected(AuthorityError::WouldBlock)
+        ));
+        assert!(matches!(
+            harness.send(
+                Command::Write {
+                    table,
+                    fd: write_fd,
+                    bytes: b"abcdefghij".to_vec(),
+                },
+                ObjectGeneration::INITIAL,
+            ),
+            Outcome::StreamWritten { pipe: actual, count, .. }
+                if actual == pipe && count.raw() == 8
+        ));
+        assert!(matches!(
+            harness.send(
+                Command::Write {
+                    table,
+                    fd: write_fd,
+                    bytes: b"x".to_vec(),
+                },
+                ObjectGeneration::INITIAL,
+            ),
+            Outcome::Rejected(AuthorityError::WouldBlock)
+        ));
+        assert!(matches!(
+            harness.send(
+                Command::Read {
+                    table,
+                    fd: read_fd,
+                    maximum: ByteCount::bounded(3).expect("count"),
+                },
+                ObjectGeneration::INITIAL,
+            ),
+            Outcome::StreamBytes { bytes, .. } if bytes == b"abc"
+        ));
+        assert!(matches!(
+            harness.send(
+                Command::SetPipeCapacity {
+                    table,
+                    fd: read_fd,
+                    capacity: PipeCapacity::bounded(4).expect("capacity"),
+                },
+                ObjectGeneration::INITIAL,
+            ),
+            Outcome::Rejected(AuthorityError::InvalidPipeCapacity)
+        ));
+        assert!(matches!(
+            harness.send(
+                Command::Close { table, fd: read_fd },
+                ObjectGeneration::INITIAL,
+            ),
+            Outcome::Closed { .. }
+        ));
+        assert!(matches!(
+            harness.send(
+                Command::Write {
+                    table,
+                    fd: write_fd,
+                    bytes: b"x".to_vec(),
+                },
+                ObjectGeneration::INITIAL,
+            ),
+            Outcome::Rejected(AuthorityError::BrokenPipe)
+        ));
+        assert!(matches!(
+            harness.send(
+                Command::Close {
+                    table,
+                    fd: write_fd,
+                },
+                ObjectGeneration::INITIAL,
+            ),
+            Outcome::Closed {
+                description: actual,
+                description_reclaimed: true,
+                ..
+            } if actual == write_description
+        ));
+    }
+}
+
+#[test]
 fn direct_and_ipc_event_counter_saturation_matches_linux() {
     event_counter_saturation_model(Harness::new());
     event_counter_saturation_model(Harness::new_ipc());
