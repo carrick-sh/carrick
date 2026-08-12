@@ -9,9 +9,10 @@ use super::{
     DescriptionBackingSnapshot, DescriptionSnapshot, DescriptorFlags, EpollEventLimit,
     EpollHostPlan, EpollHostPlanAction, EpollInterestKey, EpollReadyEvent, EpollRegistration,
     EpollUserData, FileDescriptionId, FileOffset, FileSlotNumber, FileTableId, HostErrno,
-    InterestGeneration, NofileAllocationCeiling, ObjectGeneration, Outcome, PipeCapacity, PipeEnd,
-    PipeId, Request, RequestId, Response, Revision, SameSlotBehavior, SeekWhence, SlotPageLimit,
-    SlotRangeAction, SlotSnapshot, StatusFlags, VfsObjectId,
+    InterestGeneration, MappingAttachmentId, MappingLeaseDisposition, MappingRange, MappingRelease,
+    NofileAllocationCeiling, ObjectGeneration, Outcome, PipeCapacity, PipeEnd, PipeId, Request,
+    RequestId, Response, Revision, SameSlotBehavior, SeekWhence, SlotPageLimit, SlotRangeAction,
+    SlotSnapshot, StatusFlags, VfsObjectId,
 };
 
 const MAGIC: u32 = 0x4341_4641;
@@ -254,6 +255,8 @@ fn command_tag(command: &Command) -> u8 {
         Command::CreatePipeAndInstall { .. } => 38,
         Command::SetPipeCapacity { .. } => 39,
         Command::EpollRevalidateHostPlan { .. } => 40,
+        Command::FinalizeMappingLease { .. } => 41,
+        Command::ReleaseMappingAttachment { .. } => 42,
     }
 }
 
@@ -397,6 +400,17 @@ fn encode_command(writer: &mut Writer, command: &Command) -> Result<(), Authorit
         Command::ReleaseCapabilityLease { lease, disposition } => {
             writer.u64(lease.raw());
             writer.u8(capability_disposition_tag(*disposition));
+        }
+        Command::FinalizeMappingLease { lease, disposition } => {
+            writer.u64(lease.raw());
+            writer.mapping_lease_disposition(*disposition);
+        }
+        Command::ReleaseMappingAttachment {
+            attachment,
+            release,
+        } => {
+            writer.u64(attachment.raw());
+            writer.mapping_release(*release);
         }
         Command::ListSlots {
             table,
@@ -789,6 +803,14 @@ fn decode_command(tag: u8, reader: &mut Reader<'_>) -> Result<Command, Authority
         },
         40 => Command::EpollRevalidateHostPlan {
             plan: reader.epoll_host_plan()?,
+        },
+        41 => Command::FinalizeMappingLease {
+            lease: reader.capability_lease_id()?,
+            disposition: reader.mapping_lease_disposition()?,
+        },
+        42 => Command::ReleaseMappingAttachment {
+            attachment: reader.mapping_attachment_id()?,
+            release: reader.mapping_release()?,
         },
         _ => return malformed("unknown operation"),
     })
@@ -1199,6 +1221,38 @@ fn encode_outcome(writer: &mut Writer, outcome: &Outcome) -> Result<(), Authorit
             writer.bool(*object_reclaimed);
             writer.u64(revision.raw());
         }
+        Outcome::MappingLeaseFinalized {
+            lease,
+            attachment,
+            description,
+            disposition,
+            description_reclaimed,
+            object_reclaimed,
+            revision,
+        } => {
+            writer.u8(40);
+            writer.u64(lease.raw());
+            writer.optional_mapping_attachment(*attachment);
+            writer.u64(description.raw());
+            writer.mapping_lease_disposition(*disposition);
+            writer.bool(*description_reclaimed);
+            writer.bool(*object_reclaimed);
+            writer.u64(revision.raw());
+        }
+        Outcome::MappingAttachmentReleased {
+            attachment,
+            remaining,
+            description_reclaimed,
+            object_reclaimed,
+            revision,
+        } => {
+            writer.u8(41);
+            writer.u64(attachment.raw());
+            writer.mapping_ranges(remaining)?;
+            writer.bool(*description_reclaimed);
+            writer.bool(*object_reclaimed);
+            writer.u64(revision.raw());
+        }
         Outcome::Rejected(error) => {
             writer.u8(18);
             encode_error(writer, error);
@@ -1416,6 +1470,22 @@ fn decode_outcome(reader: &mut Reader<'_>) -> Result<Outcome, AuthorityFatal> {
             valid: reader.bool()?,
             current_revision: reader.revision()?,
         },
+        40 => Outcome::MappingLeaseFinalized {
+            lease: reader.capability_lease_id()?,
+            attachment: reader.optional_mapping_attachment()?,
+            description: reader.description_id()?,
+            disposition: reader.mapping_lease_disposition()?,
+            description_reclaimed: reader.bool()?,
+            object_reclaimed: reader.bool()?,
+            revision: reader.revision()?,
+        },
+        41 => Outcome::MappingAttachmentReleased {
+            attachment: reader.mapping_attachment_id()?,
+            remaining: reader.mapping_ranges()?,
+            description_reclaimed: reader.bool()?,
+            object_reclaimed: reader.bool()?,
+            revision: reader.revision()?,
+        },
         _ => return malformed("unknown response outcome"),
     })
 }
@@ -1472,6 +1542,9 @@ fn encode_error(writer: &mut Writer, error: &AuthorityError) {
         AuthorityError::InvalidPipeCapacity => writer.u8(41),
         AuthorityError::BrokenPipe => writer.u8(42),
         AuthorityError::PairAllocationFailed => writer.u8(43),
+        AuthorityError::InvalidMappingRange => writer.u8(44),
+        AuthorityError::MappingAttachmentNotFound => writer.u8(45),
+        AuthorityError::MappingReleaseOutsideAttachment => writer.u8(46),
     }
 }
 
@@ -1527,6 +1600,9 @@ fn decode_error(reader: &mut Reader<'_>) -> Result<AuthorityError, AuthorityFata
         41 => AuthorityError::InvalidPipeCapacity,
         42 => AuthorityError::BrokenPipe,
         43 => AuthorityError::PairAllocationFailed,
+        44 => AuthorityError::InvalidMappingRange,
+        45 => AuthorityError::MappingAttachmentNotFound,
+        46 => AuthorityError::MappingReleaseOutsideAttachment,
         _ => return malformed("unknown authority error"),
     })
 }
@@ -1641,6 +1717,52 @@ impl Writer {
     fn epoll_registration(&mut self, registration: EpollRegistration) {
         self.u32(registration.events.bits());
         self.u64(registration.data.raw());
+    }
+
+    fn mapping_range(&mut self, range: MappingRange) {
+        self.u64(range.start());
+        self.u64(range.length());
+    }
+
+    fn mapping_ranges(&mut self, ranges: &[MappingRange]) -> Result<(), AuthorityFatal> {
+        self.u16(
+            u16::try_from(ranges.len())
+                .map_err(|_| AuthorityFatal::EncodingFailure("too many mapping fragments"))?,
+        );
+        for range in ranges {
+            self.mapping_range(*range);
+        }
+        Ok(())
+    }
+
+    fn mapping_lease_disposition(&mut self, disposition: MappingLeaseDisposition) {
+        match disposition {
+            MappingLeaseDisposition::Commit { range } => {
+                self.u8(0);
+                self.mapping_range(range);
+            }
+            MappingLeaseDisposition::Abort => self.u8(1),
+        }
+    }
+
+    fn mapping_release(&mut self, release: MappingRelease) {
+        match release {
+            MappingRelease::Whole => self.u8(0),
+            MappingRelease::Range(range) => {
+                self.u8(1);
+                self.mapping_range(range);
+            }
+        }
+    }
+
+    fn optional_mapping_attachment(&mut self, attachment: Option<MappingAttachmentId>) {
+        match attachment {
+            Some(attachment) => {
+                self.bool(true);
+                self.u64(attachment.raw());
+            }
+            None => self.bool(false),
+        }
     }
 
     fn epoll_host_plan(&mut self, plan: EpollHostPlan) {
@@ -1907,6 +2029,53 @@ impl<'a> Reader<'a> {
         })
     }
 
+    fn mapping_attachment_id(&mut self) -> Result<MappingAttachmentId, AuthorityFatal> {
+        MappingAttachmentId::from_snapshot(self.u64()?)
+            .map_err(|_| AuthorityFatal::MalformedFrame("invalid mapping attachment id"))
+    }
+
+    fn optional_mapping_attachment(
+        &mut self,
+    ) -> Result<Option<MappingAttachmentId>, AuthorityFatal> {
+        if self.bool()? {
+            self.mapping_attachment_id().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn mapping_range(&mut self) -> Result<MappingRange, AuthorityFatal> {
+        MappingRange::bounded(self.u64()?, self.u64()?)
+            .map_err(|_| AuthorityFatal::MalformedFrame("invalid mapping range"))
+    }
+
+    fn mapping_ranges(&mut self) -> Result<Vec<MappingRange>, AuthorityFatal> {
+        let count = usize::from(self.u16()?);
+        let mut ranges = Vec::with_capacity(count);
+        for _ in 0..count {
+            ranges.push(self.mapping_range()?);
+        }
+        Ok(ranges)
+    }
+
+    fn mapping_lease_disposition(&mut self) -> Result<MappingLeaseDisposition, AuthorityFatal> {
+        match self.u8()? {
+            0 => Ok(MappingLeaseDisposition::Commit {
+                range: self.mapping_range()?,
+            }),
+            1 => Ok(MappingLeaseDisposition::Abort),
+            _ => malformed("invalid mapping lease disposition"),
+        }
+    }
+
+    fn mapping_release(&mut self) -> Result<MappingRelease, AuthorityFatal> {
+        match self.u8()? {
+            0 => Ok(MappingRelease::Whole),
+            1 => self.mapping_range().map(MappingRelease::Range),
+            _ => malformed("invalid mapping release"),
+        }
+    }
+
     fn epoll_host_plan(&mut self) -> Result<EpollHostPlan, AuthorityFatal> {
         Ok(EpollHostPlan {
             epoll_description: self.description_id()?,
@@ -2132,7 +2301,8 @@ mod tests {
             FileDescriptionId::from_registry_allocation(NonZeroU64::new(3).expect("description"));
         let object = VfsObjectId::from_snapshot(4).expect("object");
         let lease = CapabilityLeaseId::from_snapshot(5).expect("lease");
-        let pipe = PipeId::from_snapshot(6).expect("pipe");
+        let attachment = MappingAttachmentId::from_snapshot(6).expect("attachment");
+        let pipe = PipeId::from_snapshot(7).expect("pipe");
         let path = CanonicalPath::absolute("/all-variants").expect("path");
         let registration = EpollRegistration {
             events: LinuxEpollEvents::IN | LinuxEpollEvents::ET,
@@ -2165,6 +2335,18 @@ mod tests {
                 capacity: PipeCapacity::bounded(8192).expect("capacity"),
             },
             Command::EpollRevalidateHostPlan { plan: host_plan },
+            Command::FinalizeMappingLease {
+                lease,
+                disposition: MappingLeaseDisposition::Commit {
+                    range: MappingRange::bounded(0x1000, 0x3000).expect("range"),
+                },
+            },
+            Command::ReleaseMappingAttachment {
+                attachment,
+                release: MappingRelease::Range(
+                    MappingRange::bounded(0x2000, 0x1000).expect("range"),
+                ),
+            },
             Command::CreateEpollAndInstall {
                 table,
                 minimum: FileSlotNumber::for_open_fd(3).expect("fd"),
@@ -2654,6 +2836,27 @@ mod tests {
                 description_reclaimed: true,
                 object_reclaimed: false,
                 revision: Revision::from_wire(15),
+            },
+            Outcome::MappingLeaseFinalized {
+                lease,
+                attachment: Some(attachment),
+                description,
+                disposition: MappingLeaseDisposition::Commit {
+                    range: MappingRange::bounded(0x1000, 0x3000).expect("range"),
+                },
+                description_reclaimed: false,
+                object_reclaimed: false,
+                revision: Revision::from_wire(16),
+            },
+            Outcome::MappingAttachmentReleased {
+                attachment,
+                remaining: vec![
+                    MappingRange::bounded(0x1000, 0x1000).expect("range"),
+                    MappingRange::bounded(0x3000, 0x1000).expect("range"),
+                ],
+                description_reclaimed: false,
+                object_reclaimed: false,
+                revision: Revision::from_wire(17),
             },
             Outcome::Rejected(AuthorityError::StaleEpoch {
                 expected: AuthorityEpoch::for_run(7).expect("epoch"),

@@ -31,6 +31,7 @@ nonzero_domain!(ClientId, for_process_client);
 nonzero_domain!(RequestId, from_client_sequence);
 nonzero_domain!(VfsObjectId, from_snapshot);
 nonzero_domain!(CapabilityLeaseId, from_snapshot);
+nonzero_domain!(MappingAttachmentId, from_snapshot);
 nonzero_domain!(PipeId, from_snapshot);
 
 impl VfsObjectId {
@@ -40,6 +41,12 @@ impl VfsObjectId {
 }
 
 impl CapabilityLeaseId {
+    pub(super) const fn from_authority_allocation(raw: NonZeroU64) -> Self {
+        Self(raw)
+    }
+}
+
+impl MappingAttachmentId {
     pub(super) const fn from_authority_allocation(raw: NonZeroU64) -> Self {
         Self(raw)
     }
@@ -439,6 +446,41 @@ pub(crate) enum CapabilityLeaseDisposition {
     Abort,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MappingRange {
+    start: u64,
+    length: u64,
+}
+
+impl MappingRange {
+    pub(crate) fn bounded(start: u64, length: u64) -> Result<Self, AuthorityError> {
+        if length == 0 || start.checked_add(length).is_none() {
+            return Err(AuthorityError::InvalidMappingRange);
+        }
+        Ok(Self { start, length })
+    }
+
+    pub(crate) const fn start(self) -> u64 {
+        self.start
+    }
+
+    pub(crate) const fn length(self) -> u64 {
+        self.length
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MappingLeaseDisposition {
+    Commit { range: MappingRange },
+    Abort,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MappingRelease {
+    Whole,
+    Range(MappingRange),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Request {
     pub(crate) epoch: AuthorityEpoch,
@@ -539,6 +581,14 @@ pub(crate) enum Command {
     ReleaseCapabilityLease {
         lease: CapabilityLeaseId,
         disposition: CapabilityLeaseDisposition,
+    },
+    FinalizeMappingLease {
+        lease: CapabilityLeaseId,
+        disposition: MappingLeaseDisposition,
+    },
+    ReleaseMappingAttachment {
+        attachment: MappingAttachmentId,
+        release: MappingRelease,
     },
     ResolveSlot {
         table: FileTableId,
@@ -889,6 +939,22 @@ pub(crate) enum Outcome {
         object_reclaimed: bool,
         revision: Revision,
     },
+    MappingLeaseFinalized {
+        lease: CapabilityLeaseId,
+        attachment: Option<MappingAttachmentId>,
+        description: FileDescriptionId,
+        disposition: MappingLeaseDisposition,
+        description_reclaimed: bool,
+        object_reclaimed: bool,
+        revision: Revision,
+    },
+    MappingAttachmentReleased {
+        attachment: MappingAttachmentId,
+        remaining: Vec<MappingRange>,
+        description_reclaimed: bool,
+        object_reclaimed: bool,
+        revision: Revision,
+    },
     Description(DescriptionSnapshot),
     Rejected(AuthorityError),
 }
@@ -1015,6 +1081,12 @@ pub(crate) enum AuthorityError {
     BrokenPipe,
     #[error("file descriptor table has no room for an atomic pair")]
     PairAllocationFailed,
+    #[error("mapping range is empty or overflows the guest address domain")]
+    InvalidMappingRange,
+    #[error("mapping attachment is unknown to this client")]
+    MappingAttachmentNotFound,
+    #[error("mapping release does not overlap the attachment")]
+    MappingReleaseOutsideAttachment,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
