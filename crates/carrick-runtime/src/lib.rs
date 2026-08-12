@@ -3444,3 +3444,6 @@ mod rosetta_detection_tests {
         assert_eq!(parse_binfmt_interpreter(""), None);
     }
 }
+
+#[cfg(test)]
+pub(crate) mod file_authority; // Merge atomically: helper startup + all callers + old state deletion.

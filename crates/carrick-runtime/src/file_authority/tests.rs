@@ -1,0 +1,820 @@
+use carrick_kernel::domains::{HostPid, ProcessGeneration};
+
+use super::*;
+
+#[derive(Clone)]
+struct Harness {
+    transport: DirectFileAuthority,
+    epoch: AuthorityEpoch,
+    client: ClientIdentity,
+    next_request: u64,
+}
+
+impl Harness {
+    fn new() -> Self {
+        let epoch = AuthorityEpoch::for_run(7).expect("authority epoch");
+        let transport = DirectFileAuthority::for_run(FileAuthorityCore::for_run(epoch));
+        let client = client(1, 1001, 1);
+        let mut harness = Self {
+            transport,
+            epoch,
+            client,
+            next_request: 1,
+        };
+        assert!(matches!(
+            harness.send(Command::RegisterClient, ObjectGeneration::INITIAL),
+            Outcome::ClientRegistered
+        ));
+        harness
+    }
+
+    fn peer(&self, id: u64, host_pid: u32, generation: u32) -> Self {
+        let mut peer = Self {
+            transport: self.transport.clone(),
+            epoch: self.epoch,
+            client: client(id, host_pid, generation),
+            next_request: 1,
+        };
+        assert!(matches!(
+            peer.send(Command::RegisterClient, ObjectGeneration::INITIAL),
+            Outcome::ClientRegistered
+        ));
+        peer
+    }
+
+    fn request(&mut self, command: Command, expected: ObjectGeneration) -> Request {
+        let request = Request {
+            epoch: self.epoch,
+            client: self.client,
+            request_id: RequestId::from_client_sequence(self.next_request).expect("request id"),
+            expected_generation: expected,
+            command,
+        };
+        self.next_request += 1;
+        request
+    }
+
+    fn send(&mut self, command: Command, expected: ObjectGeneration) -> Outcome {
+        let request = self.request(command, expected);
+        self.transport
+            .execute(request)
+            .expect("authority request")
+            .outcome
+    }
+
+    fn create_table(&mut self) -> FileTableId {
+        match self.send(Command::CreateTable, ObjectGeneration::INITIAL) {
+            Outcome::TableCreated { table, .. } => table,
+            other => panic!("unexpected create-table outcome: {other:?}"),
+        }
+    }
+
+    fn create_vfs_file(&mut self, path: &str, contents: &[u8]) -> VfsObjectId {
+        match self.send(
+            Command::CreateVfsFile {
+                path: CanonicalPath::absolute(path).expect("canonical path"),
+                mode: 0o644,
+                contents: contents.to_vec(),
+            },
+            ObjectGeneration::INITIAL,
+        ) {
+            Outcome::VfsObjectCreated { object, .. } => object,
+            other => panic!("unexpected VFS create outcome: {other:?}"),
+        }
+    }
+
+    fn open_vfs(
+        &mut self,
+        table: FileTableId,
+        object: VfsObjectId,
+        minimum: i32,
+        cloexec: bool,
+    ) -> (FileSlotNumber, FileDescriptionId) {
+        self.open_vfs_with_mode(table, object, minimum, cloexec, AccessMode::ReadWrite)
+    }
+
+    fn open_vfs_with_mode(
+        &mut self,
+        table: FileTableId,
+        object: VfsObjectId,
+        minimum: i32,
+        cloexec: bool,
+        access_mode: AccessMode,
+    ) -> (FileSlotNumber, FileDescriptionId) {
+        let descriptor_flags = if cloexec {
+            DescriptorFlags::CLOSE_ON_EXEC
+        } else {
+            DescriptorFlags::NONE
+        };
+        match self.send(
+            Command::OpenVfsAndInstall {
+                table,
+                object,
+                object_generation: ObjectGeneration::INITIAL,
+                minimum: fd(minimum),
+                ceiling: NofileAllocationCeiling::from_captured_soft_limit(1024),
+                descriptor_flags,
+                access_mode,
+                status_flags: StatusFlags::default(),
+                path: None,
+            },
+            ObjectGeneration::INITIAL,
+        ) {
+            Outcome::Installed {
+                fd, description, ..
+            } => (fd, description),
+            other => panic!("unexpected open outcome: {other:?}"),
+        }
+    }
+
+    fn read(&mut self, table: FileTableId, fd: FileSlotNumber, maximum: u32) -> Vec<u8> {
+        match self.send(
+            Command::Read {
+                table,
+                fd,
+                maximum: ByteCount::bounded(maximum).expect("bounded read"),
+            },
+            ObjectGeneration::INITIAL,
+        ) {
+            Outcome::Bytes { bytes, .. } => bytes,
+            other => panic!("unexpected read outcome: {other:?}"),
+        }
+    }
+}
+
+fn client(id: u64, host_pid: u32, generation: u32) -> ClientIdentity {
+    ClientIdentity::registered(
+        ClientId::for_process_client(id).expect("client id"),
+        HostPid::new(host_pid),
+        ProcessGeneration::new(generation),
+    )
+    .expect("client identity")
+}
+
+fn fd(raw: i32) -> FileSlotNumber {
+    FileSlotNumber::for_open_fd(raw).expect("fd")
+}
+
+#[test]
+fn authority_domains_round_trip_only_through_named_constructors() {
+    let epoch = AuthorityEpoch::for_run(9).expect("epoch");
+    let client_id = ClientId::for_process_client(10).expect("client");
+    let request_id = RequestId::from_client_sequence(11).expect("request");
+    let object = VfsObjectId::from_snapshot(12).expect("object");
+    let generation = ObjectGeneration::from_snapshot(13).expect("generation");
+    let descriptor_flags = DescriptorFlags::from_linux_bits(DescriptorFlags::CLOSE_ON_EXEC.raw())
+        .expect("descriptor flags");
+    let status_flags = StatusFlags::from_linux_bits(0x800);
+
+    assert_eq!(epoch.raw(), 9);
+    assert_eq!(client_id.raw(), 10);
+    assert_eq!(request_id.raw(), 11);
+    assert_eq!(object.raw(), 12);
+    assert_eq!(generation.raw(), 13);
+    assert!(descriptor_flags.close_on_exec());
+    assert_eq!(status_flags.raw(), 0x800);
+    assert_eq!(
+        DescriptorFlags::from_linux_bits(2),
+        Err(AuthorityError::InvalidDescriptorFlags)
+    );
+
+    let core = FileAuthorityCore::for_run(epoch);
+    assert_eq!(core.epoch(), epoch);
+    assert_eq!(core.revision().raw(), 0);
+}
+
+#[test]
+fn direct_transport_replays_terminal_mutation_without_reapplying_it() {
+    let mut harness = Harness::new();
+    let request = harness.request(Command::CreateTable, ObjectGeneration::INITIAL);
+    let first = harness
+        .transport
+        .execute(request.clone())
+        .expect("first request");
+    let revision = harness.transport.revision();
+    let replay = harness.transport.execute(request).expect("dedup replay");
+
+    assert_eq!(first, replay);
+    assert_eq!(harness.transport.revision(), revision);
+}
+
+#[test]
+fn conflicting_duplicate_request_is_run_fatal() {
+    let mut harness = Harness::new();
+    let request = harness.request(Command::CreateTable, ObjectGeneration::INITIAL);
+    harness
+        .transport
+        .execute(request.clone())
+        .expect("first request");
+    let conflict = Request {
+        command: Command::ExitClient,
+        ..request
+    };
+    assert_eq!(
+        harness.transport.execute(conflict),
+        Err(AuthorityFatal::RequestConflict)
+    );
+}
+
+#[test]
+fn fork_copies_slots_but_shares_authority_owned_offset_and_vfs_bytes() {
+    let mut parent = Harness::new();
+    let mut child = parent.peer(2, 1002, 1);
+    let table = parent.create_table();
+    let object = parent.create_vfs_file("/shared", b"abcdef");
+    let (parent_fd, description) = parent.open_vfs(table, object, 3, false);
+    let child_table = match parent.send(
+        Command::ForkCopy {
+            source: table,
+            owner: child.client,
+        },
+        ObjectGeneration::INITIAL,
+    ) {
+        Outcome::ForkCopied { table, .. } => table,
+        other => panic!("unexpected fork outcome: {other:?}"),
+    };
+
+    assert_eq!(parent.read(table, parent_fd, 3), b"abc");
+    assert_eq!(child.read(child_table, parent_fd, 3), b"def");
+    assert!(matches!(
+        parent.send(
+            Command::InspectDescription { description },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Description(DescriptionSnapshot {
+            logical_slot_refs: 2,
+            offset,
+            ..
+        }) if offset.raw() == 6
+    ));
+
+    assert!(matches!(
+        child.send(
+            Command::Seek {
+                table: child_table,
+                fd: parent_fd,
+                offset: -6,
+                whence: SeekWhence::Current,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Seeked { .. }
+    ));
+    assert!(matches!(
+        child.send(
+            Command::Write {
+                table: child_table,
+                fd: parent_fd,
+                bytes: b"XYZ".to_vec(),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Written { .. }
+    ));
+    assert!(matches!(
+        parent.send(
+            Command::Seek {
+                table,
+                fd: parent_fd,
+                offset: -6,
+                whence: SeekWhence::End,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Seeked { .. }
+    ));
+    assert_eq!(parent.read(table, parent_fd, 6), b"XYZdef");
+}
+
+#[test]
+fn shared_table_uses_each_callers_process_domain_nofile_ceiling() {
+    let mut first = Harness::new();
+    let mut second = first.peer(2, 1102, 1);
+    let table = first.create_table();
+    assert!(matches!(
+        first.send(
+            Command::ShareTable {
+                table,
+                owner: second.client,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::TableShared { .. }
+    ));
+
+    let rejected = first.send(
+        Command::CreateSyntheticAndInstall {
+            table,
+            contents: b"first".to_vec(),
+            minimum: fd(3),
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(3),
+            descriptor_flags: DescriptorFlags::NONE,
+            access_mode: AccessMode::ReadWrite,
+            status_flags: StatusFlags::default(),
+            path: None,
+        },
+        ObjectGeneration::INITIAL,
+    );
+    assert_eq!(rejected, Outcome::Rejected(AuthorityError::NofileExceeded));
+
+    let installed = second.send(
+        Command::CreateSyntheticAndInstall {
+            table,
+            contents: b"second".to_vec(),
+            minimum: fd(3),
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(4),
+            descriptor_flags: DescriptorFlags::NONE,
+            access_mode: AccessMode::ReadWrite,
+            status_flags: StatusFlags::default(),
+            path: None,
+        },
+        ObjectGeneration::INITIAL,
+    );
+    assert!(matches!(installed, Outcome::Installed { fd: installed, .. } if installed == fd(3)));
+    assert_eq!(first.read(table, fd(3), 6), b"second");
+}
+
+#[test]
+fn dup_and_hardlink_preserve_distinct_slot_and_namespace_reference_domains() {
+    let mut harness = Harness::new();
+    let table = harness.create_table();
+    let object = harness.create_vfs_file("/original", b"bytes");
+    let (original_fd, description) = harness.open_vfs(table, object, 3, false);
+    let duplicate_fd = match harness.send(
+        Command::Dup {
+            table,
+            source: original_fd,
+            minimum: fd(4),
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(5),
+            flags: DescriptorFlags::NONE,
+        },
+        ObjectGeneration::INITIAL,
+    ) {
+        Outcome::Duplicated { fd, .. } => fd,
+        other => panic!("unexpected dup outcome: {other:?}"),
+    };
+    assert!(matches!(
+        harness.send(
+            Command::LinkVfs {
+                object,
+                path: CanonicalPath::absolute("/alias").expect("alias"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::VfsNamespaceChanged { object: linked, .. } if linked == object
+    ));
+    assert!(matches!(
+        harness.send(
+            Command::InspectDescription { description },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Description(DescriptionSnapshot {
+            logical_slot_refs: 2,
+            ..
+        })
+    ));
+    assert_eq!(harness.read(table, original_fd, 2), b"by");
+    assert_eq!(harness.read(table, duplicate_fd, 3), b"tes");
+    assert!(matches!(
+        harness.send(
+            Command::Seek {
+                table,
+                fd: original_fd,
+                offset: 0,
+                whence: SeekWhence::Start,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Seeked { .. }
+    ));
+    assert_eq!(harness.read(table, duplicate_fd, 5), b"bytes");
+    assert!(matches!(
+        harness.send(
+            Command::ResolveVfs {
+                path: CanonicalPath::absolute("/alias").expect("alias"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::VfsObjectResolved {
+            object: resolved,
+            mode: 0o644,
+            ..
+        } if resolved == object
+    ));
+}
+
+#[test]
+fn exec_successor_unshares_table_and_drops_only_cloexec_slots() {
+    let mut harness = Harness::new();
+    let table = harness.create_table();
+    let keep = harness.create_vfs_file("/keep", b"keep");
+    let drop = harness.create_vfs_file("/drop", b"drop");
+    let (keep_fd, keep_description) = harness.open_vfs(table, keep, 3, false);
+    let (drop_fd, drop_description) = harness.open_vfs(table, drop, 4, true);
+
+    let successor = match harness.send(
+        Command::ExecSuccessor { source: table },
+        ObjectGeneration::INITIAL,
+    ) {
+        Outcome::ExecSucceeded {
+            table,
+            closed_on_exec,
+            ..
+        } => {
+            assert_eq!(closed_on_exec, vec![drop_fd]);
+            table
+        }
+        other => panic!("unexpected exec outcome: {other:?}"),
+    };
+    assert!(matches!(
+        harness.send(
+            Command::ResolveSlot {
+                table: successor,
+                fd: keep_fd,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Slot(_)
+    ));
+    assert_eq!(
+        harness.send(
+            Command::ResolveSlot {
+                table: successor,
+                fd: drop_fd,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Rejected(AuthorityError::SlotNotFound)
+    );
+    assert!(matches!(
+        harness.send(
+            Command::InspectDescription {
+                description: keep_description,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Description(DescriptionSnapshot {
+            logical_slot_refs: 1,
+            ..
+        })
+    ));
+    assert_eq!(
+        harness.send(
+            Command::InspectDescription {
+                description: drop_description,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Rejected(AuthorityError::DescriptionNotFound)
+    );
+}
+
+#[test]
+fn exec_of_shared_table_leaves_other_sharers_cloexec_slots_reachable() {
+    let mut harness = Harness::new();
+    let mut peer = harness.peer(2, 1002, 1);
+    let table = harness.create_table();
+    let keep = harness.create_vfs_file("/shared-keep", b"keep");
+    let drop = harness.create_vfs_file("/shared-drop", b"drop");
+    let (keep_fd, keep_description) = harness.open_vfs(table, keep, 3, false);
+    let (drop_fd, drop_description) = harness.open_vfs(table, drop, 4, true);
+    assert!(matches!(
+        harness.send(
+            Command::ShareTable {
+                table,
+                owner: peer.client,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::TableShared { .. }
+    ));
+
+    let successor = match harness.send(
+        Command::ExecSuccessor { source: table },
+        ObjectGeneration::INITIAL,
+    ) {
+        Outcome::ExecSucceeded { table, .. } => table,
+        other => panic!("unexpected exec outcome: {other:?}"),
+    };
+    assert_eq!(
+        harness.send(
+            Command::ResolveSlot { table, fd: keep_fd },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Rejected(AuthorityError::TableNotBound)
+    );
+    for fd in [keep_fd, drop_fd] {
+        assert!(matches!(
+            peer.send(
+                Command::ResolveSlot { table, fd },
+                ObjectGeneration::INITIAL,
+            ),
+            Outcome::Slot(_)
+        ));
+    }
+    assert!(matches!(
+        harness.send(
+            Command::ResolveSlot {
+                table: successor,
+                fd: keep_fd,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Slot(_)
+    ));
+    assert_eq!(
+        harness.send(
+            Command::ResolveSlot {
+                table: successor,
+                fd: drop_fd,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Rejected(AuthorityError::SlotNotFound)
+    );
+    assert!(matches!(
+        peer.send(
+            Command::InspectDescription {
+                description: keep_description,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Description(DescriptionSnapshot {
+            logical_slot_refs: 2,
+            ..
+        })
+    ));
+    assert!(matches!(
+        peer.send(
+            Command::InspectDescription {
+                description: drop_description,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Description(DescriptionSnapshot {
+            logical_slot_refs: 1,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn exiting_one_shared_table_client_preserves_slots_for_the_other() {
+    let mut harness = Harness::new();
+    let mut peer = harness.peer(2, 1002, 1);
+    let table = harness.create_table();
+    let object = harness.create_vfs_file("/exit-shared", b"payload");
+    let (open_fd, description) = harness.open_vfs(table, object, 3, false);
+    assert!(matches!(
+        harness.send(
+            Command::ShareTable {
+                table,
+                owner: peer.client,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::TableShared { .. }
+    ));
+    assert_eq!(
+        harness.send(Command::ExitClient, ObjectGeneration::INITIAL),
+        Outcome::ClientExited
+    );
+
+    assert!(matches!(
+        peer.send(
+            Command::ResolveSlot { table, fd: open_fd },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Slot(_)
+    ));
+    assert!(matches!(
+        peer.send(
+            Command::InspectDescription { description },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Description(DescriptionSnapshot {
+            logical_slot_refs: 1,
+            ..
+        })
+    ));
+    assert!(matches!(
+        peer.send(
+            Command::Close { table, fd: open_fd },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Closed {
+            description_reclaimed: true,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn unlink_keeps_open_vfs_object_alive_until_last_description_closes() {
+    let mut harness = Harness::new();
+    let table = harness.create_table();
+    let object = harness.create_vfs_file("/live", b"payload");
+    let (open_fd, description) = harness.open_vfs(table, object, 3, false);
+
+    assert!(matches!(
+        harness.send(
+            Command::UnlinkVfs {
+                path: CanonicalPath::absolute("/live").expect("path"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::VfsNamespaceChanged {
+            object_reclaimed: false,
+            ..
+        }
+    ));
+    assert_eq!(
+        harness.send(
+            Command::ResolveVfs {
+                path: CanonicalPath::absolute("/live").expect("path"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Rejected(AuthorityError::VfsNotFound)
+    );
+    assert_eq!(harness.read(table, open_fd, 7), b"payload");
+    assert!(matches!(
+        harness.send(
+            Command::Close { table, fd: open_fd },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Closed {
+            description: closed,
+            description_reclaimed: true,
+            object_reclaimed: true,
+            ..
+        } if closed == description
+    ));
+}
+
+#[test]
+fn rename_replaces_namespace_target_without_destroying_open_target() {
+    let mut harness = Harness::new();
+    let table = harness.create_table();
+    let source = harness.create_vfs_file("/source", b"source");
+    let target = harness.create_vfs_file("/target", b"target");
+    let (target_fd, _) = harness.open_vfs(table, target, 3, false);
+
+    assert!(matches!(
+        harness.send(
+            Command::RenameVfs {
+                from: CanonicalPath::absolute("/source").expect("source"),
+                to: CanonicalPath::absolute("/target").expect("target"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::VfsNamespaceChanged { object, .. } if object == source
+    ));
+    assert_eq!(harness.read(table, target_fd, 6), b"target");
+    assert!(matches!(
+        harness.send(
+            Command::ResolveVfs {
+                path: CanonicalPath::absolute("/target").expect("target"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::VfsObjectResolved { object, .. } if object == source
+    ));
+}
+
+#[test]
+fn rename_between_hardlinks_to_the_same_object_is_a_noop() {
+    let mut harness = Harness::new();
+    let object = harness.create_vfs_file("/first-link", b"payload");
+    assert!(matches!(
+        harness.send(
+            Command::LinkVfs {
+                object,
+                path: CanonicalPath::absolute("/second-link").expect("second link"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::VfsNamespaceChanged { .. }
+    ));
+    let revision = harness.transport.revision();
+    assert!(matches!(
+        harness.send(
+            Command::RenameVfs {
+                from: CanonicalPath::absolute("/first-link").expect("first link"),
+                to: CanonicalPath::absolute("/second-link").expect("second link"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::VfsNamespaceChanged {
+            object: renamed,
+            namespace_revision,
+            object_reclaimed: false,
+        } if renamed == object && namespace_revision == revision
+    ));
+    assert_eq!(harness.transport.revision(), revision);
+    for path in ["/first-link", "/second-link"] {
+        assert!(matches!(
+            harness.send(
+                Command::ResolveVfs {
+                    path: CanonicalPath::absolute(path).expect("hard link"),
+                },
+                ObjectGeneration::INITIAL,
+            ),
+            Outcome::VfsObjectResolved { object: resolved, .. } if resolved == object
+        ));
+    }
+}
+
+#[test]
+fn access_modes_reject_disallowed_io_without_publishing_a_revision() {
+    let mut harness = Harness::new();
+    let table = harness.create_table();
+    let object = harness.create_vfs_file("/access", b"payload");
+    let (read_only, _) = harness.open_vfs_with_mode(table, object, 3, false, AccessMode::ReadOnly);
+    let (write_only, _) =
+        harness.open_vfs_with_mode(table, object, 4, false, AccessMode::WriteOnly);
+    let (path_only, _) = harness.open_vfs_with_mode(table, object, 5, false, AccessMode::PathOnly);
+    let revision = harness.transport.revision();
+
+    assert_eq!(
+        harness.send(
+            Command::Write {
+                table,
+                fd: read_only,
+                bytes: b"x".to_vec(),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Rejected(AuthorityError::NotWritable)
+    );
+    assert_eq!(
+        harness.send(
+            Command::Read {
+                table,
+                fd: write_only,
+                maximum: ByteCount::bounded(1).expect("bounded read"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Rejected(AuthorityError::NotReadable)
+    );
+    assert_eq!(
+        harness.send(
+            Command::Seek {
+                table,
+                fd: path_only,
+                offset: 0,
+                whence: SeekWhence::Start,
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Rejected(AuthorityError::NotSeekable)
+    );
+    assert_eq!(harness.transport.revision(), revision);
+}
+
+#[test]
+fn serialized_client_requests_replace_prior_dedup_entries() {
+    let mut harness = Harness::new();
+    let missing = CanonicalPath::absolute("/missing").expect("canonical path");
+    for _ in 0..(super::core::MAX_TERMINAL_DEDUP_ENTRIES + 1) {
+        assert_eq!(
+            harness.send(
+                Command::ResolveVfs {
+                    path: missing.clone(),
+                },
+                ObjectGeneration::INITIAL,
+            ),
+            Outcome::Rejected(AuthorityError::VfsNotFound)
+        );
+    }
+
+    let old = Request {
+        epoch: harness.epoch,
+        client: harness.client,
+        request_id: RequestId::from_client_sequence(1).expect("old request id"),
+        expected_generation: ObjectGeneration::INITIAL,
+        command: Command::RegisterClient,
+    };
+    assert_eq!(
+        harness.transport.execute(old),
+        Err(AuthorityFatal::RequestOutOfOrder)
+    );
+}
+
+#[test]
+fn canonical_paths_reject_ambiguous_spellings() {
+    for invalid in [
+        "relative",
+        "/trailing/",
+        "/double//slash",
+        "/dot/./name",
+        "/up/../name",
+    ] {
+        assert_eq!(
+            CanonicalPath::absolute(invalid),
+            Err(AuthorityError::InvalidCanonicalPath)
+        );
+    }
+    assert_eq!(CanonicalPath::absolute("/").expect("root").as_str(), "/");
+}
