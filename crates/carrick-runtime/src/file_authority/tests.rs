@@ -1169,6 +1169,82 @@ fn direct_and_ipc_pipe_streams_preserve_shared_state_and_endpoint_lifetime() {
 }
 
 #[test]
+fn direct_and_ipc_timer_expiration_is_authority_owned() {
+    for ipc in [false, true] {
+        let mut harness = if ipc {
+            Harness::new_ipc()
+        } else {
+            Harness::new()
+        };
+        let table = harness.create_table();
+        let (timer_fd, description) = match harness.send(
+            Command::CreateTimerAndInstall {
+                table,
+                minimum: fd(3),
+                ceiling: NofileAllocationCeiling::from_captured_soft_limit(16),
+                descriptor_flags: DescriptorFlags::NONE,
+                status_flags: StatusFlags::default(),
+            },
+            ObjectGeneration::INITIAL,
+        ) {
+            Outcome::TimerCreated {
+                fd, description, ..
+            } => (fd, description),
+            other => panic!("unexpected timer create: {other:?}"),
+        };
+        assert!(matches!(
+            harness.send(
+                Command::SetTimer {
+                    table,
+                    fd: timer_fd,
+                    interval_ns: 10,
+                    initial_ns: 20,
+                },
+                ObjectGeneration::INITIAL,
+            ),
+            Outcome::TimerSet { .. }
+        ));
+        assert!(matches!(
+            harness.send(
+                Command::ExpireTimer {
+                    table,
+                    fd: timer_fd,
+                    expirations: 3,
+                },
+                ObjectGeneration::INITIAL,
+            ),
+            Outcome::TimerExpired { pending: 3, .. }
+        ));
+        assert_eq!(harness.read(table, timer_fd, 8), 3_u64.to_ne_bytes());
+        assert!(matches!(
+            harness.send(
+                Command::Read {
+                    table,
+                    fd: timer_fd,
+                    maximum: ByteCount::bounded(8).expect("count"),
+                },
+                ObjectGeneration::INITIAL,
+            ),
+            Outcome::Rejected(AuthorityError::WouldBlock)
+        ));
+        assert!(matches!(
+            harness.send(
+                Command::InspectDescription { description },
+                ObjectGeneration::INITIAL,
+            ),
+            Outcome::Description(DescriptionSnapshot {
+                backing: DescriptionBackingSnapshot::Timer {
+                    interval_ns: 10,
+                    initial_ns: 20,
+                    pending: 0,
+                },
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
 fn direct_and_ipc_event_counter_saturation_matches_linux() {
     event_counter_saturation_model(Harness::new());
     event_counter_saturation_model(Harness::new_ipc());

@@ -260,6 +260,9 @@ fn command_tag(command: &Command) -> u8 {
         Command::ForkCopyMappings { .. } => 43,
         Command::AdoptIoUringAndInstall { .. } => 44,
         Command::AdoptHostStreamAndInstall { .. } => 45,
+        Command::CreateTimerAndInstall { .. } => 46,
+        Command::SetTimer { .. } => 47,
+        Command::ExpireTimer { .. } => 48,
     }
 }
 
@@ -300,6 +303,39 @@ fn encode_command(writer: &mut Writer, command: &Command) -> Result<(), Authorit
             writer.i32(minimum.raw());
             writer.u32(ceiling.raw());
             writer.u32(descriptor_flags.raw());
+        }
+        Command::CreateTimerAndInstall {
+            table,
+            minimum,
+            ceiling,
+            descriptor_flags,
+            status_flags,
+        } => {
+            writer.u64(table.raw());
+            writer.i32(minimum.raw());
+            writer.u32(ceiling.raw());
+            writer.u32(descriptor_flags.raw());
+            writer.u64(status_flags.raw());
+        }
+        Command::SetTimer {
+            table,
+            fd,
+            interval_ns,
+            initial_ns,
+        } => {
+            writer.u64(table.raw());
+            writer.i32(fd.raw());
+            writer.u64(*interval_ns);
+            writer.u64(*initial_ns);
+        }
+        Command::ExpireTimer {
+            table,
+            fd,
+            expirations,
+        } => {
+            writer.u64(table.raw());
+            writer.i32(fd.raw());
+            writer.u64(*expirations);
         }
         Command::CreateEventCounterAndInstall {
             table,
@@ -883,6 +919,25 @@ fn decode_command(tag: u8, reader: &mut Reader<'_>) -> Result<Command, Authority
             kind: reader.host_stream_kind()?,
             path: reader.optional_path()?,
         },
+        46 => Command::CreateTimerAndInstall {
+            table: reader.table_id()?,
+            minimum: reader.slot()?,
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(reader.u32()?),
+            descriptor_flags: DescriptorFlags::from_linux_bits(reader.u32()?)
+                .map_err(|_| AuthorityFatal::MalformedFrame("invalid descriptor flags"))?,
+            status_flags: StatusFlags::from_linux_bits(reader.u64()?),
+        },
+        47 => Command::SetTimer {
+            table: reader.table_id()?,
+            fd: reader.slot()?,
+            interval_ns: reader.u64()?,
+            initial_ns: reader.u64()?,
+        },
+        48 => Command::ExpireTimer {
+            table: reader.table_id()?,
+            fd: reader.slot()?,
+            expirations: reader.u64()?,
+        },
         _ => return malformed("unknown operation"),
     })
 }
@@ -985,6 +1040,46 @@ fn encode_outcome(writer: &mut Writer, outcome: &Outcome) -> Result<(), Authorit
             writer.u64(description.raw());
             writer.u64(generation.raw());
             writer.u64(table_revision.raw());
+            writer.u64(description_revision.raw());
+        }
+        Outcome::TimerCreated {
+            table,
+            fd,
+            description,
+            generation,
+            table_revision,
+            description_revision,
+        } => {
+            writer.u8(45);
+            writer.u64(table.raw());
+            writer.i32(fd.raw());
+            writer.u64(description.raw());
+            writer.u64(generation.raw());
+            writer.u64(table_revision.raw());
+            writer.u64(description_revision.raw());
+        }
+        Outcome::TimerSet {
+            description,
+            interval_ns,
+            initial_ns,
+            description_revision,
+        } => {
+            writer.u8(46);
+            writer.u64(description.raw());
+            writer.u64(*interval_ns);
+            writer.u64(*initial_ns);
+            writer.u64(description_revision.raw());
+        }
+        Outcome::TimerExpired {
+            description,
+            expirations,
+            pending,
+            description_revision,
+        } => {
+            writer.u8(47);
+            writer.u64(description.raw());
+            writer.u64(*expirations);
+            writer.u64(*pending);
             writer.u64(description_revision.raw());
         }
         Outcome::EventCounterCreated {
@@ -1632,6 +1727,26 @@ fn decode_outcome(reader: &mut Reader<'_>) -> Result<Outcome, AuthorityFatal> {
             table_revision: reader.revision()?,
             description_revision: reader.revision()?,
         },
+        45 => Outcome::TimerCreated {
+            table: reader.table_id()?,
+            fd: reader.slot()?,
+            description: reader.description_id()?,
+            generation: reader.generation()?,
+            table_revision: reader.revision()?,
+            description_revision: reader.revision()?,
+        },
+        46 => Outcome::TimerSet {
+            description: reader.description_id()?,
+            interval_ns: reader.u64()?,
+            initial_ns: reader.u64()?,
+            description_revision: reader.revision()?,
+        },
+        47 => Outcome::TimerExpired {
+            description: reader.description_id()?,
+            expirations: reader.u64()?,
+            pending: reader.u64()?,
+            description_revision: reader.revision()?,
+        },
         _ => return malformed("unknown response outcome"),
     })
 }
@@ -1691,6 +1806,7 @@ fn encode_error(writer: &mut Writer, error: &AuthorityError) {
         AuthorityError::InvalidMappingRange => writer.u8(44),
         AuthorityError::MappingAttachmentNotFound => writer.u8(45),
         AuthorityError::MappingReleaseOutsideAttachment => writer.u8(46),
+        AuthorityError::NotTimer => writer.u8(47),
     }
 }
 
@@ -1749,6 +1865,7 @@ fn decode_error(reader: &mut Reader<'_>) -> Result<AuthorityError, AuthorityFata
         44 => AuthorityError::InvalidMappingRange,
         45 => AuthorityError::MappingAttachmentNotFound,
         46 => AuthorityError::MappingReleaseOutsideAttachment,
+        47 => AuthorityError::NotTimer,
         _ => return malformed("unknown authority error"),
     })
 }
@@ -2089,6 +2206,16 @@ impl Writer {
             DescriptionBackingSnapshot::HostStream { kind } => {
                 self.u8(7);
                 self.host_stream_kind(*kind);
+            }
+            DescriptionBackingSnapshot::Timer {
+                interval_ns,
+                initial_ns,
+                pending,
+            } => {
+                self.u8(8);
+                self.u64(*interval_ns);
+                self.u64(*initial_ns);
+                self.u64(*pending);
             }
         }
         Ok(())
@@ -2482,6 +2609,11 @@ impl<'a> Reader<'a> {
             7 => DescriptionBackingSnapshot::HostStream {
                 kind: self.host_stream_kind()?,
             },
+            8 => DescriptionBackingSnapshot::Timer {
+                interval_ns: self.u64()?,
+                initial_ns: self.u64()?,
+                pending: self.u64()?,
+            },
             _ => return malformed("invalid description backing"),
         };
         Ok(DescriptionSnapshot {
@@ -2602,6 +2734,24 @@ mod tests {
                 minimum: FileSlotNumber::for_open_fd(3).expect("fd"),
                 ceiling: NofileAllocationCeiling::from_captured_soft_limit(9),
                 descriptor_flags: DescriptorFlags::CLOSE_ON_EXEC,
+            },
+            Command::CreateTimerAndInstall {
+                table,
+                minimum: FileSlotNumber::for_open_fd(3).expect("fd"),
+                ceiling: NofileAllocationCeiling::from_captured_soft_limit(9),
+                descriptor_flags: DescriptorFlags::NONE,
+                status_flags: StatusFlags::default(),
+            },
+            Command::SetTimer {
+                table,
+                fd: FileSlotNumber::for_open_fd(3).expect("fd"),
+                interval_ns: 10,
+                initial_ns: 20,
+            },
+            Command::ExpireTimer {
+                table,
+                fd: FileSlotNumber::for_open_fd(3).expect("fd"),
+                expirations: 2,
             },
             Command::CreateEventCounterAndInstall {
                 table,
@@ -2863,6 +3013,26 @@ mod tests {
                 generation: ObjectGeneration::INITIAL,
                 table_revision: Revision::from_wire(2),
                 description_revision: Revision::from_wire(2),
+            },
+            Outcome::TimerCreated {
+                table,
+                fd: slot,
+                description,
+                generation: ObjectGeneration::INITIAL,
+                table_revision: Revision::from_wire(6),
+                description_revision: Revision::from_wire(6),
+            },
+            Outcome::TimerSet {
+                description,
+                interval_ns: 10,
+                initial_ns: 20,
+                description_revision: Revision::from_wire(7),
+            },
+            Outcome::TimerExpired {
+                description,
+                expirations: 2,
+                pending: 2,
+                description_revision: Revision::from_wire(8),
             },
             Outcome::EventCounterCreated {
                 table,

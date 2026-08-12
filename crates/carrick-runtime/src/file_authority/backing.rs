@@ -35,6 +35,11 @@ pub(super) enum AuthorityBacking {
         counter: u64,
         semaphore: bool,
     },
+    Timer {
+        interval_ns: u64,
+        initial_ns: u64,
+        pending: u64,
+    },
     PipeEnd {
         pipe: super::PipeId,
         end: super::PipeEnd,
@@ -67,6 +72,15 @@ impl AuthorityBacking {
                 counter: *counter,
                 semaphore: *semaphore,
             },
+            Self::Timer {
+                interval_ns,
+                initial_ns,
+                pending,
+            } => DescriptionBackingSnapshot::Timer {
+                interval_ns: *interval_ns,
+                initial_ns: *initial_ns,
+                pending: *pending,
+            },
             Self::PipeEnd { pipe, end } => DescriptionBackingSnapshot::PipeEnd {
                 pipe: *pipe,
                 end: *end,
@@ -82,6 +96,7 @@ impl AuthorityBacking {
             | Self::HostStream { .. }
             | Self::Epoll(_)
             | Self::EventCounter { .. }
+            | Self::Timer { .. }
             | Self::PipeEnd { .. } => None,
             Self::Vfs { object } => Some(*object),
         }
