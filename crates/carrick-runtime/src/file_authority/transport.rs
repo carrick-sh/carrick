@@ -25,7 +25,7 @@ pub(crate) trait FileAuthorityTransport: Send + Sync {
 ///
 /// The mutex is the transport serialization point only. The same request and
 /// response values are later encoded by the datagram client; callers never get
-/// access to the core or its backing objects.
+/// access to the core, its leases, or its backing objects.
 #[derive(Debug, Clone)]
 pub(crate) struct DirectFileAuthority {
     core: Arc<Mutex<FileAuthorityCore>>,

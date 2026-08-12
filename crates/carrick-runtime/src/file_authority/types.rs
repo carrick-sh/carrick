@@ -1,6 +1,7 @@
 use std::num::{NonZeroI32, NonZeroU64};
 use std::os::fd::OwnedFd;
 
+use carrick_abi::LinuxEpollEvents;
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
 
 pub(crate) use crate::kernel::{FileDescriptionId, FileSlotNumber, FileTableId};
@@ -40,6 +41,26 @@ impl VfsObjectId {
 impl CapabilityLeaseId {
     pub(super) const fn from_authority_allocation(raw: NonZeroU64) -> Self {
         Self(raw)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub(crate) struct InterestGeneration(std::num::NonZeroU32);
+
+impl InterestGeneration {
+    pub(super) const fn from_authority_allocation(raw: std::num::NonZeroU32) -> Self {
+        Self(raw)
+    }
+
+    pub(crate) fn from_snapshot(raw: u32) -> Result<Self, InvalidAuthorityDomain> {
+        std::num::NonZeroU32::new(raw)
+            .map(Self)
+            .ok_or(InvalidAuthorityDomain::Zero("InterestGeneration"))
+    }
+
+    pub(crate) const fn raw(self) -> u32 {
+        self.0.get()
     }
 }
 
@@ -253,6 +274,57 @@ pub(crate) enum SeekWhence {
     End,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct EpollInterestKey {
+    pub(crate) registered_slot: FileSlotNumber,
+    pub(crate) target_description: FileDescriptionId,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(transparent)]
+pub(crate) struct EpollUserData(u64);
+
+impl EpollUserData {
+    pub(crate) const fn from_guest(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub(crate) const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EpollRegistration {
+    pub(crate) events: LinuxEpollEvents,
+    pub(crate) data: EpollUserData,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EpollReadyEvent {
+    pub(crate) events: LinuxEpollEvents,
+    pub(crate) data: EpollUserData,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub(crate) struct EpollEventLimit(u16);
+
+impl EpollEventLimit {
+    pub(crate) const MAX: u16 = 256;
+
+    pub(crate) fn bounded(raw: u16) -> Result<Self, AuthorityError> {
+        if raw == 0 || raw > Self::MAX {
+            return Err(AuthorityError::InvalidEpollEventLimit);
+        }
+        Ok(Self(raw))
+    }
+
+    pub(crate) const fn raw(self) -> u16 {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SameSlotBehavior {
     ReturnUnchanged,
@@ -332,6 +404,21 @@ pub(crate) enum Command {
     RegisterClient,
     ExitClient,
     CreateTable,
+    CreateEpollAndInstall {
+        table: FileTableId,
+        minimum: FileSlotNumber,
+        ceiling: NofileAllocationCeiling,
+        descriptor_flags: DescriptorFlags,
+    },
+    CreateEventCounterAndInstall {
+        table: FileTableId,
+        initial: u64,
+        semaphore: bool,
+        minimum: FileSlotNumber,
+        ceiling: NofileAllocationCeiling,
+        descriptor_flags: DescriptorFlags,
+        status_flags: StatusFlags,
+    },
     CreateVfsFile {
         path: CanonicalPath,
         mode: u32,
@@ -419,6 +506,50 @@ pub(crate) enum Command {
         last: FileSlotNumber,
         action: SlotRangeAction,
     },
+    EpollCtlAdd {
+        table: FileTableId,
+        epoll_fd: FileSlotNumber,
+        target_fd: FileSlotNumber,
+        registration: EpollRegistration,
+    },
+    EpollCtlModify {
+        table: FileTableId,
+        epoll_fd: FileSlotNumber,
+        target_fd: FileSlotNumber,
+        registration: EpollRegistration,
+    },
+    EpollCtlDelete {
+        table: FileTableId,
+        epoll_fd: FileSlotNumber,
+        target_fd: FileSlotNumber,
+    },
+    ObserveReadiness {
+        table: FileTableId,
+        fd: FileSlotNumber,
+        ready: LinuxEpollEvents,
+        read_available: u64,
+    },
+    EpollCollect {
+        table: FileTableId,
+        epoll_fd: FileSlotNumber,
+        maximum: EpollEventLimit,
+    },
+    EpollAcknowledgeIo {
+        table: FileTableId,
+        fd: FileSlotNumber,
+        consumed: LinuxEpollEvents,
+        read_available: u64,
+        write_backpressured: bool,
+    },
+    EventCounterRead {
+        table: FileTableId,
+        fd: FileSlotNumber,
+    },
+    EventCounterWrite {
+        table: FileTableId,
+        fd: FileSlotNumber,
+        value: u64,
+    },
     Read {
         table: FileTableId,
         fd: FileSlotNumber,
@@ -499,6 +630,22 @@ pub(crate) enum Outcome {
         generation: ObjectGeneration,
         revision: Revision,
     },
+    EpollCreated {
+        table: FileTableId,
+        fd: FileSlotNumber,
+        description: FileDescriptionId,
+        generation: ObjectGeneration,
+        table_revision: Revision,
+        description_revision: Revision,
+    },
+    EventCounterCreated {
+        table: FileTableId,
+        fd: FileSlotNumber,
+        description: FileDescriptionId,
+        generation: ObjectGeneration,
+        table_revision: Revision,
+        description_revision: Revision,
+    },
     VfsObjectCreated {
         object: VfsObjectId,
         namespace_revision: Revision,
@@ -549,6 +696,41 @@ pub(crate) enum Outcome {
         action: SlotRangeAction,
         affected: u32,
         table_revision: Revision,
+    },
+    EpollInterestAdded {
+        key: EpollInterestKey,
+        generation: InterestGeneration,
+        description_revision: Revision,
+    },
+    EpollInterestModified {
+        key: EpollInterestKey,
+        generation: InterestGeneration,
+        description_revision: Revision,
+    },
+    EpollInterestDeleted {
+        key: EpollInterestKey,
+        description_revision: Revision,
+    },
+    ReadinessObserved {
+        description: FileDescriptionId,
+        description_revision: Revision,
+    },
+    EpollEvents {
+        events: Vec<EpollReadyEvent>,
+        description_revision: Revision,
+    },
+    EpollIoAcknowledged {
+        description: FileDescriptionId,
+        description_revision: Revision,
+    },
+    EventCounterRead {
+        value: u64,
+        description_revision: Revision,
+    },
+    EventCounterWritten {
+        value: u64,
+        counter: u64,
+        description_revision: Revision,
     },
     Bytes {
         bytes: Vec<u8>,
@@ -637,6 +819,8 @@ pub(crate) enum DescriptionBackingSnapshot {
     Synthetic { length: u64 },
     VfsFile { object: VfsObjectId },
     HostFile { writable: bool },
+    Epoll { interests: u32 },
+    EventCounter { counter: u64, semaphore: bool },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -702,6 +886,26 @@ pub(crate) enum AuthorityError {
     SameSlotRejected,
     #[error("file descriptor slot range is inverted")]
     InvalidSlotRange,
+    #[error("description is not an epoll instance")]
+    NotEpoll,
+    #[error("target description does not support readiness")]
+    NotEpollable,
+    #[error("epoll interest already exists")]
+    EpollInterestExists,
+    #[error("epoll interest was not found")]
+    EpollInterestNotFound,
+    #[error("epoll interest would create a cycle or exceed nesting depth")]
+    EpollLoop,
+    #[error("epoll event limit is zero or exceeds its protocol bound")]
+    InvalidEpollEventLimit,
+    #[error("description is not an event counter")]
+    NotEventCounter,
+    #[error("event-counter operation would block")]
+    WouldBlock,
+    #[error("event-counter write value is invalid or would overflow")]
+    InvalidEventCounterValue,
+    #[error("description requires a different typed operation family")]
+    WrongOperationFamily,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]

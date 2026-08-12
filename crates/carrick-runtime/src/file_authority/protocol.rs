@@ -1,14 +1,17 @@
 use std::num::{NonZeroI32, NonZeroU64};
 
+use carrick_abi::LinuxEpollEvents;
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
 
 use super::{
     AccessMode, AuthorityEpoch, AuthorityError, AuthorityFatal, ByteCount, CanonicalPath,
     CapabilityLeaseDisposition, CapabilityLeaseId, CapabilityLeasePurpose, ClientIdentity, Command,
-    DescriptionBackingSnapshot, DescriptionSnapshot, DescriptorFlags, FileDescriptionId,
-    FileOffset, FileSlotNumber, FileTableId, HostErrno, NofileAllocationCeiling, ObjectGeneration,
-    Outcome, Request, RequestId, Response, Revision, SameSlotBehavior, SeekWhence, SlotPageLimit,
-    SlotRangeAction, SlotSnapshot, StatusFlags, VfsObjectId,
+    DescriptionBackingSnapshot, DescriptionSnapshot, DescriptorFlags, EpollEventLimit,
+    EpollInterestKey, EpollReadyEvent, EpollRegistration, EpollUserData, FileDescriptionId,
+    FileOffset, FileSlotNumber, FileTableId, HostErrno, InterestGeneration,
+    NofileAllocationCeiling, ObjectGeneration, Outcome, Request, RequestId, Response, Revision,
+    SameSlotBehavior, SeekWhence, SlotPageLimit, SlotRangeAction, SlotSnapshot, StatusFlags,
+    VfsObjectId,
 };
 
 const MAGIC: u32 = 0x4341_4641;
@@ -238,12 +241,50 @@ fn command_tag(command: &Command) -> u8 {
         Command::SetDescriptorFlags { .. } => 25,
         Command::ReplaceSlot { .. } => 26,
         Command::MutateSlotRange { .. } => 27,
+        Command::CreateEpollAndInstall { .. } => 28,
+        Command::CreateEventCounterAndInstall { .. } => 29,
+        Command::EpollCtlAdd { .. } => 30,
+        Command::EpollCtlModify { .. } => 31,
+        Command::EpollCtlDelete { .. } => 32,
+        Command::ObserveReadiness { .. } => 33,
+        Command::EpollCollect { .. } => 34,
+        Command::EpollAcknowledgeIo { .. } => 35,
+        Command::EventCounterRead { .. } => 36,
+        Command::EventCounterWrite { .. } => 37,
     }
 }
 
 fn encode_command(writer: &mut Writer, command: &Command) -> Result<(), AuthorityFatal> {
     match command {
         Command::RegisterClient | Command::ExitClient | Command::CreateTable => {}
+        Command::CreateEpollAndInstall {
+            table,
+            minimum,
+            ceiling,
+            descriptor_flags,
+        } => {
+            writer.u64(table.raw());
+            writer.i32(minimum.raw());
+            writer.u32(ceiling.raw());
+            writer.u32(descriptor_flags.raw());
+        }
+        Command::CreateEventCounterAndInstall {
+            table,
+            initial,
+            semaphore,
+            minimum,
+            ceiling,
+            descriptor_flags,
+            status_flags,
+        } => {
+            writer.u64(table.raw());
+            writer.u64(*initial);
+            writer.bool(*semaphore);
+            writer.i32(minimum.raw());
+            writer.u32(ceiling.raw());
+            writer.u32(descriptor_flags.raw());
+            writer.u64(status_flags.raw());
+        }
         Command::CreateVfsFile {
             path,
             mode,
@@ -369,6 +410,74 @@ fn encode_command(writer: &mut Writer, command: &Command) -> Result<(), Authorit
             writer.i32(first.raw());
             writer.i32(last.raw());
             writer.u8(slot_range_action_tag(*action));
+        }
+        Command::EpollCtlAdd {
+            table,
+            epoll_fd,
+            target_fd,
+            registration,
+        }
+        | Command::EpollCtlModify {
+            table,
+            epoll_fd,
+            target_fd,
+            registration,
+        } => {
+            writer.u64(table.raw());
+            writer.i32(epoll_fd.raw());
+            writer.i32(target_fd.raw());
+            writer.epoll_registration(*registration);
+        }
+        Command::EpollCtlDelete {
+            table,
+            epoll_fd,
+            target_fd,
+        } => {
+            writer.u64(table.raw());
+            writer.i32(epoll_fd.raw());
+            writer.i32(target_fd.raw());
+        }
+        Command::ObserveReadiness {
+            table,
+            fd,
+            ready,
+            read_available,
+        } => {
+            writer.u64(table.raw());
+            writer.i32(fd.raw());
+            writer.u32(ready.bits());
+            writer.u64(*read_available);
+        }
+        Command::EpollCollect {
+            table,
+            epoll_fd,
+            maximum,
+        } => {
+            writer.u64(table.raw());
+            writer.i32(epoll_fd.raw());
+            writer.u16(maximum.raw());
+        }
+        Command::EpollAcknowledgeIo {
+            table,
+            fd,
+            consumed,
+            read_available,
+            write_backpressured,
+        } => {
+            writer.u64(table.raw());
+            writer.i32(fd.raw());
+            writer.u32(consumed.bits());
+            writer.u64(*read_available);
+            writer.bool(*write_backpressured);
+        }
+        Command::EventCounterRead { table, fd } => {
+            writer.u64(table.raw());
+            writer.i32(fd.raw());
+        }
+        Command::EventCounterWrite { table, fd, value } => {
+            writer.u64(table.raw());
+            writer.i32(fd.raw());
+            writer.u64(*value);
         }
         Command::ResolveSlot { table, fd } | Command::Close { table, fd } => {
             writer.u64(table.raw());
@@ -572,6 +681,68 @@ fn decode_command(tag: u8, reader: &mut Reader<'_>) -> Result<Command, Authority
             last: reader.slot()?,
             action: reader.slot_range_action()?,
         },
+        28 => Command::CreateEpollAndInstall {
+            table: reader.table_id()?,
+            minimum: reader.slot()?,
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(reader.u32()?),
+            descriptor_flags: DescriptorFlags::from_linux_bits(reader.u32()?)
+                .map_err(|_| AuthorityFatal::MalformedFrame("invalid descriptor flags"))?,
+        },
+        29 => Command::CreateEventCounterAndInstall {
+            table: reader.table_id()?,
+            initial: reader.u64()?,
+            semaphore: reader.bool()?,
+            minimum: reader.slot()?,
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(reader.u32()?),
+            descriptor_flags: DescriptorFlags::from_linux_bits(reader.u32()?)
+                .map_err(|_| AuthorityFatal::MalformedFrame("invalid descriptor flags"))?,
+            status_flags: StatusFlags::from_linux_bits(reader.u64()?),
+        },
+        30 => Command::EpollCtlAdd {
+            table: reader.table_id()?,
+            epoll_fd: reader.slot()?,
+            target_fd: reader.slot()?,
+            registration: reader.epoll_registration()?,
+        },
+        31 => Command::EpollCtlModify {
+            table: reader.table_id()?,
+            epoll_fd: reader.slot()?,
+            target_fd: reader.slot()?,
+            registration: reader.epoll_registration()?,
+        },
+        32 => Command::EpollCtlDelete {
+            table: reader.table_id()?,
+            epoll_fd: reader.slot()?,
+            target_fd: reader.slot()?,
+        },
+        33 => Command::ObserveReadiness {
+            table: reader.table_id()?,
+            fd: reader.slot()?,
+            ready: LinuxEpollEvents::from_bits_retain(reader.u32()?),
+            read_available: reader.u64()?,
+        },
+        34 => Command::EpollCollect {
+            table: reader.table_id()?,
+            epoll_fd: reader.slot()?,
+            maximum: EpollEventLimit::bounded(reader.u16()?)
+                .map_err(|_| AuthorityFatal::MalformedFrame("invalid epoll event limit"))?,
+        },
+        35 => Command::EpollAcknowledgeIo {
+            table: reader.table_id()?,
+            fd: reader.slot()?,
+            consumed: LinuxEpollEvents::from_bits_retain(reader.u32()?),
+            read_available: reader.u64()?,
+            write_backpressured: reader.bool()?,
+        },
+        36 => Command::EventCounterRead {
+            table: reader.table_id()?,
+            fd: reader.slot()?,
+        },
+        37 => Command::EventCounterWrite {
+            table: reader.table_id()?,
+            fd: reader.slot()?,
+            value: reader.u64()?,
+        },
         _ => return malformed("unknown operation"),
     })
 }
@@ -589,6 +760,38 @@ fn encode_outcome(writer: &mut Writer, outcome: &Outcome) -> Result<(), Authorit
             writer.u64(table.raw());
             writer.u64(generation.raw());
             writer.u64(revision.raw());
+        }
+        Outcome::EpollCreated {
+            table,
+            fd,
+            description,
+            generation,
+            table_revision,
+            description_revision,
+        } => {
+            writer.u8(25);
+            writer.u64(table.raw());
+            writer.i32(fd.raw());
+            writer.u64(description.raw());
+            writer.u64(generation.raw());
+            writer.u64(table_revision.raw());
+            writer.u64(description_revision.raw());
+        }
+        Outcome::EventCounterCreated {
+            table,
+            fd,
+            description,
+            generation,
+            table_revision,
+            description_revision,
+        } => {
+            writer.u8(26);
+            writer.u64(table.raw());
+            writer.i32(fd.raw());
+            writer.u64(description.raw());
+            writer.u64(generation.raw());
+            writer.u64(table_revision.raw());
+            writer.u64(description_revision.raw());
         }
         Outcome::VfsObjectCreated {
             object,
@@ -693,6 +896,76 @@ fn encode_outcome(writer: &mut Writer, outcome: &Outcome) -> Result<(), Authorit
             writer.u8(slot_range_action_tag(*action));
             writer.u32(*affected);
             writer.u64(table_revision.raw());
+        }
+        Outcome::EpollInterestAdded {
+            key,
+            generation,
+            description_revision,
+        } => {
+            writer.u8(27);
+            writer.epoll_key(*key);
+            writer.u32(generation.raw());
+            writer.u64(description_revision.raw());
+        }
+        Outcome::EpollInterestModified {
+            key,
+            generation,
+            description_revision,
+        } => {
+            writer.u8(28);
+            writer.epoll_key(*key);
+            writer.u32(generation.raw());
+            writer.u64(description_revision.raw());
+        }
+        Outcome::EpollInterestDeleted {
+            key,
+            description_revision,
+        } => {
+            writer.u8(29);
+            writer.epoll_key(*key);
+            writer.u64(description_revision.raw());
+        }
+        Outcome::ReadinessObserved {
+            description,
+            description_revision,
+        } => {
+            writer.u8(30);
+            writer.u64(description.raw());
+            writer.u64(description_revision.raw());
+        }
+        Outcome::EpollEvents {
+            events,
+            description_revision,
+        } => {
+            writer.u8(31);
+            writer.epoll_events(events)?;
+            writer.u64(description_revision.raw());
+        }
+        Outcome::EpollIoAcknowledged {
+            description,
+            description_revision,
+        } => {
+            writer.u8(32);
+            writer.u64(description.raw());
+            writer.u64(description_revision.raw());
+        }
+        Outcome::EventCounterRead {
+            value,
+            description_revision,
+        } => {
+            writer.u8(33);
+            writer.u64(*value);
+            writer.u64(description_revision.raw());
+        }
+        Outcome::EventCounterWritten {
+            value,
+            counter,
+            description_revision,
+        } => {
+            writer.u8(34);
+            writer.u64(*value);
+            writer.u64(*counter);
+            writer.u64(description_revision.raw());
         }
         Outcome::Bytes {
             bytes,
@@ -938,6 +1211,57 @@ fn decode_outcome(reader: &mut Reader<'_>) -> Result<Outcome, AuthorityFatal> {
             affected: reader.u32()?,
             table_revision: reader.revision()?,
         },
+        25 => Outcome::EpollCreated {
+            table: reader.table_id()?,
+            fd: reader.slot()?,
+            description: reader.description_id()?,
+            generation: reader.generation()?,
+            table_revision: reader.revision()?,
+            description_revision: reader.revision()?,
+        },
+        26 => Outcome::EventCounterCreated {
+            table: reader.table_id()?,
+            fd: reader.slot()?,
+            description: reader.description_id()?,
+            generation: reader.generation()?,
+            table_revision: reader.revision()?,
+            description_revision: reader.revision()?,
+        },
+        27 => Outcome::EpollInterestAdded {
+            key: reader.epoll_key()?,
+            generation: reader.interest_generation()?,
+            description_revision: reader.revision()?,
+        },
+        28 => Outcome::EpollInterestModified {
+            key: reader.epoll_key()?,
+            generation: reader.interest_generation()?,
+            description_revision: reader.revision()?,
+        },
+        29 => Outcome::EpollInterestDeleted {
+            key: reader.epoll_key()?,
+            description_revision: reader.revision()?,
+        },
+        30 => Outcome::ReadinessObserved {
+            description: reader.description_id()?,
+            description_revision: reader.revision()?,
+        },
+        31 => Outcome::EpollEvents {
+            events: reader.epoll_events()?,
+            description_revision: reader.revision()?,
+        },
+        32 => Outcome::EpollIoAcknowledged {
+            description: reader.description_id()?,
+            description_revision: reader.revision()?,
+        },
+        33 => Outcome::EventCounterRead {
+            value: reader.u64()?,
+            description_revision: reader.revision()?,
+        },
+        34 => Outcome::EventCounterWritten {
+            value: reader.u64()?,
+            counter: reader.u64()?,
+            description_revision: reader.revision()?,
+        },
         _ => return malformed("unknown response outcome"),
     })
 }
@@ -980,6 +1304,16 @@ fn encode_error(writer: &mut Writer, error: &AuthorityError) {
         AuthorityError::InvalidPageLimit => writer.u8(27),
         AuthorityError::SameSlotRejected => writer.u8(28),
         AuthorityError::InvalidSlotRange => writer.u8(29),
+        AuthorityError::NotEpoll => writer.u8(30),
+        AuthorityError::NotEpollable => writer.u8(31),
+        AuthorityError::EpollInterestExists => writer.u8(32),
+        AuthorityError::EpollInterestNotFound => writer.u8(33),
+        AuthorityError::EpollLoop => writer.u8(34),
+        AuthorityError::InvalidEpollEventLimit => writer.u8(35),
+        AuthorityError::NotEventCounter => writer.u8(36),
+        AuthorityError::WouldBlock => writer.u8(37),
+        AuthorityError::InvalidEventCounterValue => writer.u8(38),
+        AuthorityError::WrongOperationFamily => writer.u8(39),
     }
 }
 
@@ -1021,6 +1355,16 @@ fn decode_error(reader: &mut Reader<'_>) -> Result<AuthorityError, AuthorityFata
         27 => AuthorityError::InvalidPageLimit,
         28 => AuthorityError::SameSlotRejected,
         29 => AuthorityError::InvalidSlotRange,
+        30 => AuthorityError::NotEpoll,
+        31 => AuthorityError::NotEpollable,
+        32 => AuthorityError::EpollInterestExists,
+        33 => AuthorityError::EpollInterestNotFound,
+        34 => AuthorityError::EpollLoop,
+        35 => AuthorityError::InvalidEpollEventLimit,
+        36 => AuthorityError::NotEventCounter,
+        37 => AuthorityError::WouldBlock,
+        38 => AuthorityError::InvalidEventCounterValue,
+        39 => AuthorityError::WrongOperationFamily,
         _ => return malformed("unknown authority error"),
     })
 }
@@ -1132,6 +1476,25 @@ impl Writer {
         self.u32(client.host_pid.raw());
         self.u32(client.process_generation.raw());
     }
+    fn epoll_registration(&mut self, registration: EpollRegistration) {
+        self.u32(registration.events.bits());
+        self.u64(registration.data.raw());
+    }
+    fn epoll_key(&mut self, key: EpollInterestKey) {
+        self.i32(key.registered_slot.raw());
+        self.u64(key.target_description.raw());
+    }
+    fn epoll_events(&mut self, events: &[EpollReadyEvent]) -> Result<(), AuthorityFatal> {
+        self.u16(
+            u16::try_from(events.len())
+                .map_err(|_| AuthorityFatal::EncodingFailure("epoll event count overflow"))?,
+        );
+        for event in events {
+            self.u32(event.events.bits());
+            self.u64(event.data.raw());
+        }
+        Ok(())
+    }
     fn optional_slot(&mut self, slot: Option<FileSlotNumber>) {
         match slot {
             Some(slot) => {
@@ -1206,6 +1569,15 @@ impl Writer {
             DescriptionBackingSnapshot::HostFile { writable } => {
                 self.u8(2);
                 self.bool(*writable);
+            }
+            DescriptionBackingSnapshot::Epoll { interests } => {
+                self.u8(3);
+                self.u32(*interests);
+            }
+            DescriptionBackingSnapshot::EventCounter { counter, semaphore } => {
+                self.u8(4);
+                self.u64(*counter);
+                self.bool(*semaphore);
             }
         }
         Ok(())
@@ -1334,6 +1706,36 @@ impl<'a> Reader<'a> {
         FileSlotNumber::for_open_fd(self.i32()?)
             .map_err(|_| AuthorityFatal::MalformedFrame("invalid file slot"))
     }
+    fn epoll_registration(&mut self) -> Result<EpollRegistration, AuthorityFatal> {
+        Ok(EpollRegistration {
+            events: LinuxEpollEvents::from_bits_retain(self.u32()?),
+            data: EpollUserData::from_guest(self.u64()?),
+        })
+    }
+    fn epoll_key(&mut self) -> Result<EpollInterestKey, AuthorityFatal> {
+        Ok(EpollInterestKey {
+            registered_slot: self.slot()?,
+            target_description: self.description_id()?,
+        })
+    }
+    fn interest_generation(&mut self) -> Result<InterestGeneration, AuthorityFatal> {
+        InterestGeneration::from_snapshot(self.u32()?)
+            .map_err(|_| AuthorityFatal::MalformedFrame("invalid interest generation"))
+    }
+    fn epoll_events(&mut self) -> Result<Vec<EpollReadyEvent>, AuthorityFatal> {
+        let count = usize::from(self.u16()?);
+        if count > usize::from(EpollEventLimit::MAX) {
+            return malformed("epoll event vector exceeds bound");
+        }
+        (0..count)
+            .map(|_| {
+                Ok(EpollReadyEvent {
+                    events: LinuxEpollEvents::from_bits_retain(self.u32()?),
+                    data: EpollUserData::from_guest(self.u64()?),
+                })
+            })
+            .collect()
+    }
     fn optional_slot(&mut self) -> Result<Option<FileSlotNumber>, AuthorityFatal> {
         if self.bool()? {
             Ok(Some(self.slot()?))
@@ -1442,6 +1844,13 @@ impl<'a> Reader<'a> {
             2 => DescriptionBackingSnapshot::HostFile {
                 writable: self.bool()?,
             },
+            3 => DescriptionBackingSnapshot::Epoll {
+                interests: self.u32()?,
+            },
+            4 => DescriptionBackingSnapshot::EventCounter {
+                counter: self.u64()?,
+                semaphore: self.bool()?,
+            },
             _ => return malformed("invalid description backing"),
         };
         Ok(DescriptionSnapshot {
@@ -1512,10 +1921,29 @@ mod tests {
         let object = VfsObjectId::from_snapshot(4).expect("object");
         let lease = CapabilityLeaseId::from_snapshot(5).expect("lease");
         let path = CanonicalPath::absolute("/all-variants").expect("path");
+        let registration = EpollRegistration {
+            events: LinuxEpollEvents::IN | LinuxEpollEvents::ET,
+            data: EpollUserData::from_guest(0x1234),
+        };
         let commands = vec![
             Command::RegisterClient,
             Command::ExitClient,
             Command::CreateTable,
+            Command::CreateEpollAndInstall {
+                table,
+                minimum: FileSlotNumber::for_open_fd(3).expect("fd"),
+                ceiling: NofileAllocationCeiling::from_captured_soft_limit(9),
+                descriptor_flags: DescriptorFlags::CLOSE_ON_EXEC,
+            },
+            Command::CreateEventCounterAndInstall {
+                table,
+                initial: 7,
+                semaphore: true,
+                minimum: FileSlotNumber::for_open_fd(4).expect("fd"),
+                ceiling: NofileAllocationCeiling::from_captured_soft_limit(9),
+                descriptor_flags: DescriptorFlags::NONE,
+                status_flags: StatusFlags::from_linux_bits(0x800),
+            },
             Command::CreateVfsFile {
                 path: path.clone(),
                 mode: 0o600,
@@ -1595,6 +2023,50 @@ mod tests {
                 last: FileSlotNumber::for_open_fd(8).expect("fd"),
                 action: SlotRangeAction::SetCloseOnExec,
             },
+            Command::EpollCtlAdd {
+                table,
+                epoll_fd: FileSlotNumber::for_open_fd(3).expect("fd"),
+                target_fd: FileSlotNumber::for_open_fd(4).expect("fd"),
+                registration,
+            },
+            Command::EpollCtlModify {
+                table,
+                epoll_fd: FileSlotNumber::for_open_fd(3).expect("fd"),
+                target_fd: FileSlotNumber::for_open_fd(4).expect("fd"),
+                registration,
+            },
+            Command::EpollCtlDelete {
+                table,
+                epoll_fd: FileSlotNumber::for_open_fd(3).expect("fd"),
+                target_fd: FileSlotNumber::for_open_fd(4).expect("fd"),
+            },
+            Command::ObserveReadiness {
+                table,
+                fd: FileSlotNumber::for_open_fd(4).expect("fd"),
+                ready: LinuxEpollEvents::IN,
+                read_available: 8,
+            },
+            Command::EpollCollect {
+                table,
+                epoll_fd: FileSlotNumber::for_open_fd(3).expect("fd"),
+                maximum: EpollEventLimit::bounded(4).expect("event limit"),
+            },
+            Command::EpollAcknowledgeIo {
+                table,
+                fd: FileSlotNumber::for_open_fd(4).expect("fd"),
+                consumed: LinuxEpollEvents::IN,
+                read_available: 0,
+                write_backpressured: true,
+            },
+            Command::EventCounterRead {
+                table,
+                fd: FileSlotNumber::for_open_fd(4).expect("fd"),
+            },
+            Command::EventCounterWrite {
+                table,
+                fd: FileSlotNumber::for_open_fd(4).expect("fd"),
+                value: 9,
+            },
             Command::ResolveSlot {
                 table,
                 fd: FileSlotNumber::for_open_fd(3).expect("fd"),
@@ -1666,6 +2138,22 @@ mod tests {
                 generation: ObjectGeneration::INITIAL,
                 revision: Revision::from_wire(1),
             },
+            Outcome::EpollCreated {
+                table,
+                fd: slot,
+                description,
+                generation: ObjectGeneration::INITIAL,
+                table_revision: Revision::from_wire(2),
+                description_revision: Revision::from_wire(2),
+            },
+            Outcome::EventCounterCreated {
+                table,
+                fd: slot,
+                description,
+                generation: ObjectGeneration::INITIAL,
+                table_revision: Revision::from_wire(2),
+                description_revision: Revision::from_wire(2),
+            },
             Outcome::VfsObjectCreated {
                 object,
                 namespace_revision: Revision::from_wire(2),
@@ -1728,6 +2216,53 @@ mod tests {
                 action: SlotRangeAction::Close,
                 affected: 2,
                 table_revision: Revision::from_wire(7),
+            },
+            Outcome::EpollInterestAdded {
+                key: EpollInterestKey {
+                    registered_slot: slot,
+                    target_description: description,
+                },
+                generation: InterestGeneration::from_snapshot(1).expect("generation"),
+                description_revision: Revision::from_wire(8),
+            },
+            Outcome::EpollInterestModified {
+                key: EpollInterestKey {
+                    registered_slot: slot,
+                    target_description: description,
+                },
+                generation: InterestGeneration::from_snapshot(1).expect("generation"),
+                description_revision: Revision::from_wire(9),
+            },
+            Outcome::EpollInterestDeleted {
+                key: EpollInterestKey {
+                    registered_slot: slot,
+                    target_description: description,
+                },
+                description_revision: Revision::from_wire(10),
+            },
+            Outcome::ReadinessObserved {
+                description,
+                description_revision: Revision::from_wire(11),
+            },
+            Outcome::EpollEvents {
+                events: vec![EpollReadyEvent {
+                    events: LinuxEpollEvents::IN,
+                    data: EpollUserData::from_guest(0x1234),
+                }],
+                description_revision: Revision::from_wire(12),
+            },
+            Outcome::EpollIoAcknowledged {
+                description,
+                description_revision: Revision::from_wire(13),
+            },
+            Outcome::EventCounterRead {
+                value: 7,
+                description_revision: Revision::from_wire(14),
+            },
+            Outcome::EventCounterWritten {
+                value: 3,
+                counter: 10,
+                description_revision: Revision::from_wire(15),
             },
             Outcome::Bytes {
                 bytes: b"bytes".to_vec(),
@@ -1802,6 +2337,29 @@ mod tests {
                 logical_slot_refs: 1,
                 backing: DescriptionBackingSnapshot::HostFile { writable: false },
             }),
+            Outcome::Description(DescriptionSnapshot {
+                description,
+                generation: ObjectGeneration::INITIAL,
+                revision: Revision::from_wire(13),
+                offset: FileOffset::from_start(0),
+                access_mode: AccessMode::PathOnly,
+                status_flags: StatusFlags::default(),
+                logical_slot_refs: 1,
+                backing: DescriptionBackingSnapshot::Epoll { interests: 2 },
+            }),
+            Outcome::Description(DescriptionSnapshot {
+                description,
+                generation: ObjectGeneration::INITIAL,
+                revision: Revision::from_wire(13),
+                offset: FileOffset::from_start(0),
+                access_mode: AccessMode::ReadWrite,
+                status_flags: StatusFlags::default(),
+                logical_slot_refs: 1,
+                backing: DescriptionBackingSnapshot::EventCounter {
+                    counter: 7,
+                    semaphore: true,
+                },
+            }),
             Outcome::CapabilityLeaseGranted {
                 lease,
                 description,
@@ -1850,6 +2408,16 @@ mod tests {
             Outcome::Rejected(AuthorityError::InvalidPageLimit),
             Outcome::Rejected(AuthorityError::SameSlotRejected),
             Outcome::Rejected(AuthorityError::InvalidSlotRange),
+            Outcome::Rejected(AuthorityError::NotEpoll),
+            Outcome::Rejected(AuthorityError::NotEpollable),
+            Outcome::Rejected(AuthorityError::EpollInterestExists),
+            Outcome::Rejected(AuthorityError::EpollInterestNotFound),
+            Outcome::Rejected(AuthorityError::EpollLoop),
+            Outcome::Rejected(AuthorityError::InvalidEpollEventLimit),
+            Outcome::Rejected(AuthorityError::NotEventCounter),
+            Outcome::Rejected(AuthorityError::WouldBlock),
+            Outcome::Rejected(AuthorityError::InvalidEventCounterValue),
+            Outcome::Rejected(AuthorityError::WrongOperationFamily),
         ];
         let request = Request {
             epoch: AuthorityEpoch::for_run(7).expect("epoch"),

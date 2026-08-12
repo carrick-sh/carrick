@@ -7,6 +7,7 @@
 
 mod backing;
 mod core;
+mod epoll;
 mod ipc;
 mod protocol;
 mod transport;

@@ -1,18 +1,21 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::num::NonZeroU64;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::num::{NonZeroU32, NonZeroU64};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+use carrick_abi::LinuxEpollEvents;
 
 use crate::kernel::ObjectIdRegistry;
 
 use super::backing::AuthorityBacking;
+use super::epoll::{EpollState, ReadinessSnapshot};
 use super::types::{
     AccessMode, AuthorityCall, AuthorityEpoch, AuthorityError, AuthorityFatal, AuthorityReply,
     ByteCount, CanonicalPath, CapabilityLeaseDisposition, CapabilityLeaseId,
     CapabilityLeasePurpose, ClientId, ClientIdentity, Command, DescriptionSnapshot,
-    DescriptorFlags, FileDescriptionId, FileOffset, FileSlotNumber, FileTableId,
-    NofileAllocationCeiling, ObjectGeneration, Outcome, Request, Response, Revision,
-    SameSlotBehavior, SeekWhence, SlotPageLimit, SlotRangeAction, SlotSnapshot, StatusFlags,
-    VfsObjectId,
+    DescriptorFlags, EpollEventLimit, EpollInterestKey, EpollRegistration, FileDescriptionId,
+    FileOffset, FileSlotNumber, FileTableId, InterestGeneration, NofileAllocationCeiling,
+    ObjectGeneration, Outcome, Request, Response, Revision, SameSlotBehavior, SeekWhence,
+    SlotPageLimit, SlotRangeAction, SlotSnapshot, StatusFlags, VfsObjectId,
 };
 
 pub(super) const MAX_TERMINAL_DEDUP_ENTRIES: usize = 8_192;
@@ -56,6 +59,7 @@ struct FileDescriptionState {
     offset: FileOffset,
     access_mode: AccessMode,
     status_flags: StatusFlags,
+    readiness: ReadinessSnapshot,
     backing: AuthorityBacking,
 }
 
@@ -111,6 +115,7 @@ pub(crate) struct FileAuthorityCore {
     ids: ObjectIdRegistry,
     next_vfs_object: u64,
     next_capability_lease: u64,
+    next_interest_generation: u32,
     revision: Revision,
     namespace_revision: Revision,
     clients: HashMap<ClientId, ClientIdentity>,
@@ -119,6 +124,7 @@ pub(crate) struct FileAuthorityCore {
     namespace: BTreeMap<CanonicalPath, VfsObjectId>,
     vfs_objects: BTreeMap<VfsObjectId, VfsObjectState>,
     capability_leases: BTreeMap<CapabilityLeaseId, CapabilityLeaseState>,
+    epoll_watchers: BTreeMap<FileDescriptionId, BTreeSet<(FileDescriptionId, EpollInterestKey)>>,
     // Each authenticated client may have exactly one outstanding request. A
     // later request from that client therefore acknowledges the prior terminal
     // response and replaces this entry; a same-id retry replays it verbatim.
@@ -132,6 +138,7 @@ impl FileAuthorityCore {
             ids: ObjectIdRegistry::new(),
             next_vfs_object: 1,
             next_capability_lease: 1,
+            next_interest_generation: 1,
             revision: Revision::ZERO,
             namespace_revision: Revision::ZERO,
             clients: HashMap::new(),
@@ -140,6 +147,7 @@ impl FileAuthorityCore {
             namespace: BTreeMap::new(),
             vfs_objects: BTreeMap::new(),
             capability_leases: BTreeMap::new(),
+            epoll_watchers: BTreeMap::new(),
             dedup: HashMap::new(),
         }
     }
@@ -300,6 +308,38 @@ impl FileAuthorityCore {
                     Command::RegisterClient => unreachable!(),
                     Command::ExitClient => self.exit_client(request.client),
                     Command::CreateTable => self.create_table(request.client),
+                    Command::CreateEpollAndInstall {
+                        table,
+                        minimum,
+                        ceiling,
+                        descriptor_flags,
+                    } => self.create_epoll_and_install(
+                        request.client,
+                        *table,
+                        request.expected_generation,
+                        *minimum,
+                        *ceiling,
+                        *descriptor_flags,
+                    ),
+                    Command::CreateEventCounterAndInstall {
+                        table,
+                        initial,
+                        semaphore,
+                        minimum,
+                        ceiling,
+                        descriptor_flags,
+                        status_flags,
+                    } => self.create_event_counter_and_install(
+                        request.client,
+                        *table,
+                        request.expected_generation,
+                        *initial,
+                        *semaphore,
+                        *minimum,
+                        *ceiling,
+                        *descriptor_flags,
+                        *status_flags,
+                    ),
                     Command::CreateVfsFile {
                         path,
                         mode,
@@ -443,6 +483,95 @@ impl FileAuthorityCore {
                         *first,
                         *last,
                         *action,
+                    ),
+                    Command::EpollCtlAdd {
+                        table,
+                        epoll_fd,
+                        target_fd,
+                        registration,
+                    } => self.epoll_ctl_add(
+                        request.client,
+                        *table,
+                        request.expected_generation,
+                        *epoll_fd,
+                        *target_fd,
+                        *registration,
+                    ),
+                    Command::EpollCtlModify {
+                        table,
+                        epoll_fd,
+                        target_fd,
+                        registration,
+                    } => self.epoll_ctl_modify(
+                        request.client,
+                        *table,
+                        request.expected_generation,
+                        *epoll_fd,
+                        *target_fd,
+                        *registration,
+                    ),
+                    Command::EpollCtlDelete {
+                        table,
+                        epoll_fd,
+                        target_fd,
+                    } => self.epoll_ctl_delete(
+                        request.client,
+                        *table,
+                        request.expected_generation,
+                        *epoll_fd,
+                        *target_fd,
+                    ),
+                    Command::ObserveReadiness {
+                        table,
+                        fd,
+                        ready,
+                        read_available,
+                    } => self.observe_readiness(
+                        request.client,
+                        *table,
+                        request.expected_generation,
+                        *fd,
+                        *ready,
+                        *read_available,
+                    ),
+                    Command::EpollCollect {
+                        table,
+                        epoll_fd,
+                        maximum,
+                    } => self.epoll_collect(
+                        request.client,
+                        *table,
+                        request.expected_generation,
+                        *epoll_fd,
+                        *maximum,
+                    ),
+                    Command::EpollAcknowledgeIo {
+                        table,
+                        fd,
+                        consumed,
+                        read_available,
+                        write_backpressured,
+                    } => self.epoll_acknowledge_io(
+                        request.client,
+                        *table,
+                        request.expected_generation,
+                        *fd,
+                        *consumed,
+                        *read_available,
+                        *write_backpressured,
+                    ),
+                    Command::EventCounterRead { table, fd } => self.event_counter_read(
+                        request.client,
+                        *table,
+                        request.expected_generation,
+                        *fd,
+                    ),
+                    Command::EventCounterWrite { table, fd, value } => self.event_counter_write(
+                        request.client,
+                        *table,
+                        request.expected_generation,
+                        *fd,
+                        *value,
                     ),
                     Command::Read { table, fd, maximum } => self.read(
                         request.client,
@@ -604,6 +733,108 @@ impl FileAuthorityCore {
             table,
             generation: ObjectGeneration::INITIAL,
             revision,
+        })
+    }
+
+    fn create_epoll_and_install(
+        &mut self,
+        client: ClientIdentity,
+        table: FileTableId,
+        table_generation: ObjectGeneration,
+        minimum: FileSlotNumber,
+        ceiling: NofileAllocationCeiling,
+        descriptor_flags: DescriptorFlags,
+    ) -> Result<Outcome, AuthorityError> {
+        self.require_bound_table(client, table, table_generation)?;
+        let fd = self.allocate_lowest(table, minimum, ceiling)?;
+        let description = self.allocate_description();
+        let outcome = self.commit_new_description_install(
+            table,
+            fd,
+            description,
+            descriptor_flags,
+            AccessMode::PathOnly,
+            StatusFlags::default(),
+            None,
+            AuthorityBacking::Epoll(EpollState::default()),
+            None,
+        );
+        let Outcome::Installed {
+            table_revision,
+            description_revision,
+            ..
+        } = outcome
+        else {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "epoll creation returned a non-install outcome",
+            ));
+        };
+        Ok(Outcome::EpollCreated {
+            table,
+            fd,
+            description,
+            generation: ObjectGeneration::INITIAL,
+            table_revision,
+            description_revision,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_event_counter_and_install(
+        &mut self,
+        client: ClientIdentity,
+        table: FileTableId,
+        table_generation: ObjectGeneration,
+        initial: u64,
+        semaphore: bool,
+        minimum: FileSlotNumber,
+        ceiling: NofileAllocationCeiling,
+        descriptor_flags: DescriptorFlags,
+        status_flags: StatusFlags,
+    ) -> Result<Outcome, AuthorityError> {
+        if initial == u64::MAX {
+            return Err(AuthorityError::InvalidEventCounterValue);
+        }
+        self.require_bound_table(client, table, table_generation)?;
+        let fd = self.allocate_lowest(table, minimum, ceiling)?;
+        let description = self.allocate_description();
+        let outcome = self.commit_new_description_install(
+            table,
+            fd,
+            description,
+            descriptor_flags,
+            AccessMode::ReadWrite,
+            status_flags,
+            None,
+            AuthorityBacking::EventCounter {
+                counter: initial,
+                semaphore,
+            },
+            None,
+        );
+        let Outcome::Installed {
+            table_revision,
+            description_revision,
+            ..
+        } = outcome
+        else {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "event-counter creation returned a non-install outcome",
+            ));
+        };
+        let state = self.descriptions.get_mut(&description).unwrap_or_else(|| {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "event-counter creation lost its description",
+            ))
+        });
+        state.readiness = event_counter_readiness(initial);
+        Ok(Outcome::EventCounterCreated {
+            table,
+            fd,
+            description,
+            generation: ObjectGeneration::INITIAL,
+            table_revision,
+            description_revision,
         })
     }
 
@@ -1072,6 +1303,10 @@ impl FileAuthorityCore {
                 offset: FileOffset::default(),
                 access_mode,
                 status_flags,
+                readiness: ReadinessSnapshot {
+                    ready: LinuxEpollEvents::empty(),
+                    read_available: 0,
+                },
                 backing,
             },
         );
@@ -1335,6 +1570,483 @@ impl FileAuthorityCore {
         })
     }
 
+    fn epoll_ctl_add(
+        &mut self,
+        client: ClientIdentity,
+        table: FileTableId,
+        expected: ObjectGeneration,
+        epoll_fd: FileSlotNumber,
+        target_fd: FileSlotNumber,
+        registration: EpollRegistration,
+    ) -> Result<Outcome, AuthorityError> {
+        let (epoll_description, key) =
+            self.epoll_interest_key(client, table, expected, epoll_fd, target_fd)?;
+        if self.epoll_state(epoll_description)?.contains(key) {
+            return Err(AuthorityError::EpollInterestExists);
+        }
+        if epoll_description == key.target_description
+            || self.epoll_path_reaches(key.target_description, epoll_description, 1)
+        {
+            return Err(AuthorityError::EpollLoop);
+        }
+        let generation = self.allocate_interest_generation();
+        let revision = self.publish_mutation();
+        let state = self.epoll_state_mut(epoll_description).unwrap_or_else(|_| {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "epoll ADD lost its validated instance",
+            ))
+        });
+        state.add(key, registration, generation);
+        let description = self
+            .descriptions
+            .get_mut(&epoll_description)
+            .unwrap_or_else(|| {
+                abort_fatal(AuthorityFatal::InvariantViolation(
+                    "epoll ADD lost its description",
+                ))
+            });
+        description.revision = revision;
+        self.epoll_watchers
+            .entry(key.target_description)
+            .or_default()
+            .insert((epoll_description, key));
+        Ok(Outcome::EpollInterestAdded {
+            key,
+            generation,
+            description_revision: revision,
+        })
+    }
+
+    fn epoll_ctl_modify(
+        &mut self,
+        client: ClientIdentity,
+        table: FileTableId,
+        expected: ObjectGeneration,
+        epoll_fd: FileSlotNumber,
+        target_fd: FileSlotNumber,
+        registration: EpollRegistration,
+    ) -> Result<Outcome, AuthorityError> {
+        let (epoll_description, key) =
+            self.epoll_interest_key(client, table, expected, epoll_fd, target_fd)?;
+        if !self.epoll_state(epoll_description)?.contains(key) {
+            return Err(AuthorityError::EpollInterestNotFound);
+        }
+        let revision = self.publish_mutation();
+        let state = self.epoll_state_mut(epoll_description).unwrap_or_else(|_| {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "epoll MOD lost its validated instance",
+            ))
+        });
+        let generation = state.modify(key, registration).unwrap_or_else(|| {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "epoll MOD lost its validated interest",
+            ))
+        });
+        self.descriptions
+            .get_mut(&epoll_description)
+            .unwrap_or_else(|| {
+                abort_fatal(AuthorityFatal::InvariantViolation(
+                    "epoll MOD lost its description",
+                ))
+            })
+            .revision = revision;
+        Ok(Outcome::EpollInterestModified {
+            key,
+            generation,
+            description_revision: revision,
+        })
+    }
+
+    fn epoll_ctl_delete(
+        &mut self,
+        client: ClientIdentity,
+        table: FileTableId,
+        expected: ObjectGeneration,
+        epoll_fd: FileSlotNumber,
+        target_fd: FileSlotNumber,
+    ) -> Result<Outcome, AuthorityError> {
+        let (epoll_description, key) =
+            self.epoll_interest_key(client, table, expected, epoll_fd, target_fd)?;
+        if !self.epoll_state(epoll_description)?.contains(key) {
+            return Err(AuthorityError::EpollInterestNotFound);
+        }
+        let revision = self.publish_mutation();
+        if !self
+            .epoll_state_mut(epoll_description)
+            .unwrap_or_else(|_| {
+                abort_fatal(AuthorityFatal::InvariantViolation(
+                    "epoll DEL lost its validated instance",
+                ))
+            })
+            .delete(key)
+        {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "epoll DEL lost its validated interest",
+            ));
+        }
+        self.descriptions
+            .get_mut(&epoll_description)
+            .unwrap_or_else(|| {
+                abort_fatal(AuthorityFatal::InvariantViolation(
+                    "epoll DEL lost its description",
+                ))
+            })
+            .revision = revision;
+        if let Some(watchers) = self.epoll_watchers.get_mut(&key.target_description) {
+            watchers.remove(&(epoll_description, key));
+            if watchers.is_empty() {
+                self.epoll_watchers.remove(&key.target_description);
+            }
+        }
+        Ok(Outcome::EpollInterestDeleted {
+            key,
+            description_revision: revision,
+        })
+    }
+
+    fn observe_readiness(
+        &mut self,
+        client: ClientIdentity,
+        table: FileTableId,
+        expected: ObjectGeneration,
+        fd: FileSlotNumber,
+        ready: LinuxEpollEvents,
+        read_available: u64,
+    ) -> Result<Outcome, AuthorityError> {
+        let description = self.slot(client, table, expected, fd)?.description;
+        let state = self
+            .descriptions
+            .get(&description)
+            .ok_or(AuthorityError::DescriptionNotFound)?;
+        if !is_epollable(&state.backing) {
+            return Err(AuthorityError::NotEpollable);
+        }
+        let revision = self.publish_mutation();
+        let state = self.descriptions.get_mut(&description).unwrap_or_else(|| {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "readiness observation lost its description",
+            ))
+        });
+        state.readiness = ReadinessSnapshot {
+            ready,
+            read_available,
+        };
+        state.revision = revision;
+        Ok(Outcome::ReadinessObserved {
+            description,
+            description_revision: revision,
+        })
+    }
+
+    fn epoll_collect(
+        &mut self,
+        client: ClientIdentity,
+        table: FileTableId,
+        expected: ObjectGeneration,
+        epoll_fd: FileSlotNumber,
+        maximum: EpollEventLimit,
+    ) -> Result<Outcome, AuthorityError> {
+        let epoll_description = self.slot(client, table, expected, epoll_fd)?.description;
+        let current = self.epoll_state(epoll_description)?.clone();
+        let readiness: BTreeMap<FileDescriptionId, ReadinessSnapshot> = current
+            .target_descriptions()
+            .filter_map(|description| {
+                self.descriptions
+                    .get(&description)
+                    .map(|state| (description, state.readiness))
+            })
+            .collect();
+        let mut prepared = current.clone();
+        let events = prepared.collect(&readiness, maximum);
+        let changed = prepared != current;
+        let revision = if changed {
+            self.publish_mutation()
+        } else {
+            self.descriptions
+                .get(&epoll_description)
+                .ok_or(AuthorityError::DescriptionNotFound)?
+                .revision
+        };
+        if changed {
+            let description = self
+                .descriptions
+                .get_mut(&epoll_description)
+                .unwrap_or_else(|| {
+                    abort_fatal(AuthorityFatal::InvariantViolation(
+                        "epoll collect lost its description",
+                    ))
+                });
+            let AuthorityBacking::Epoll(state) = &mut description.backing else {
+                abort_fatal(AuthorityFatal::InvariantViolation(
+                    "epoll collect backing changed after preparation",
+                ));
+            };
+            *state = prepared;
+            description.revision = revision;
+        }
+        Ok(Outcome::EpollEvents {
+            events,
+            description_revision: revision,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn epoll_acknowledge_io(
+        &mut self,
+        client: ClientIdentity,
+        table: FileTableId,
+        expected: ObjectGeneration,
+        fd: FileSlotNumber,
+        consumed: LinuxEpollEvents,
+        read_available: u64,
+        write_backpressured: bool,
+    ) -> Result<Outcome, AuthorityError> {
+        let description = self.slot(client, table, expected, fd)?.description;
+        self.descriptions
+            .get(&description)
+            .ok_or(AuthorityError::DescriptionNotFound)?;
+        let epolls: Vec<FileDescriptionId> = self
+            .epoll_watchers
+            .get(&description)
+            .into_iter()
+            .flat_map(|watchers| watchers.iter().map(|(epoll, _)| *epoll))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        for epoll in &epolls {
+            self.epoll_state(*epoll)?;
+        }
+        let revision = self.publish_mutation();
+        for epoll in epolls {
+            let state = self.epoll_state_mut(epoll).unwrap_or_else(|_| {
+                abort_fatal(AuthorityFatal::InvariantViolation(
+                    "epoll I/O acknowledgement lost a watcher",
+                ))
+            });
+            if state.acknowledge_io(description, consumed, read_available, write_backpressured) {
+                self.descriptions
+                    .get_mut(&epoll)
+                    .unwrap_or_else(|| {
+                        abort_fatal(AuthorityFatal::InvariantViolation(
+                            "epoll I/O acknowledgement lost a description",
+                        ))
+                    })
+                    .revision = revision;
+            }
+        }
+        let target = self.descriptions.get_mut(&description).unwrap_or_else(|| {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "epoll I/O acknowledgement lost its target",
+            ))
+        });
+        target.readiness.read_available = read_available;
+        target.revision = revision;
+        Ok(Outcome::EpollIoAcknowledged {
+            description,
+            description_revision: revision,
+        })
+    }
+
+    fn event_counter_read(
+        &mut self,
+        client: ClientIdentity,
+        table: FileTableId,
+        expected: ObjectGeneration,
+        fd: FileSlotNumber,
+    ) -> Result<Outcome, AuthorityError> {
+        let description = self.slot(client, table, expected, fd)?.description;
+        let state = self
+            .descriptions
+            .get(&description)
+            .ok_or(AuthorityError::DescriptionNotFound)?;
+        let AuthorityBacking::EventCounter { counter, semaphore } = &state.backing else {
+            return Err(AuthorityError::NotEventCounter);
+        };
+        if *counter == 0 {
+            return Err(AuthorityError::WouldBlock);
+        }
+        let value = if *semaphore { 1 } else { *counter };
+        let next = if *semaphore { counter - 1 } else { 0 };
+        let revision = self.publish_mutation();
+        let state = self.descriptions.get_mut(&description).unwrap_or_else(|| {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "event-counter read lost its description",
+            ))
+        });
+        let AuthorityBacking::EventCounter { counter, .. } = &mut state.backing else {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "event-counter read backing changed after preparation",
+            ));
+        };
+        *counter = next;
+        let readiness = event_counter_readiness(next);
+        state.readiness = readiness;
+        state.revision = revision;
+        self.acknowledge_epolls_without_publish(
+            description,
+            LinuxEpollEvents::IN,
+            readiness.read_available,
+            false,
+            revision,
+        );
+        Ok(Outcome::EventCounterRead {
+            value,
+            description_revision: revision,
+        })
+    }
+
+    fn event_counter_write(
+        &mut self,
+        client: ClientIdentity,
+        table: FileTableId,
+        expected: ObjectGeneration,
+        fd: FileSlotNumber,
+        value: u64,
+    ) -> Result<Outcome, AuthorityError> {
+        if value == u64::MAX {
+            return Err(AuthorityError::InvalidEventCounterValue);
+        }
+        let description = self.slot(client, table, expected, fd)?.description;
+        let state = self
+            .descriptions
+            .get(&description)
+            .ok_or(AuthorityError::DescriptionNotFound)?;
+        let AuthorityBacking::EventCounter { counter, .. } = &state.backing else {
+            return Err(AuthorityError::NotEventCounter);
+        };
+        let next = counter
+            .checked_add(value)
+            .filter(|next| *next < u64::MAX)
+            .ok_or(AuthorityError::WouldBlock)?;
+        let revision = self.publish_mutation();
+        let state = self.descriptions.get_mut(&description).unwrap_or_else(|| {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "event-counter write lost its description",
+            ))
+        });
+        let AuthorityBacking::EventCounter { counter, .. } = &mut state.backing else {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "event-counter write backing changed after preparation",
+            ));
+        };
+        *counter = next;
+        state.readiness = event_counter_readiness(next);
+        state.revision = revision;
+        Ok(Outcome::EventCounterWritten {
+            value,
+            counter: next,
+            description_revision: revision,
+        })
+    }
+
+    fn epoll_interest_key(
+        &self,
+        client: ClientIdentity,
+        table: FileTableId,
+        expected: ObjectGeneration,
+        epoll_fd: FileSlotNumber,
+        target_fd: FileSlotNumber,
+    ) -> Result<(FileDescriptionId, EpollInterestKey), AuthorityError> {
+        let epoll_description = self.slot(client, table, expected, epoll_fd)?.description;
+        self.epoll_state(epoll_description)?;
+        let target_description = self.slot(client, table, expected, target_fd)?.description;
+        let target = self
+            .descriptions
+            .get(&target_description)
+            .ok_or(AuthorityError::DescriptionNotFound)?;
+        if !is_epollable(&target.backing) {
+            return Err(AuthorityError::NotEpollable);
+        }
+        Ok((
+            epoll_description,
+            EpollInterestKey {
+                registered_slot: target_fd,
+                target_description,
+            },
+        ))
+    }
+
+    fn epoll_state(&self, description: FileDescriptionId) -> Result<&EpollState, AuthorityError> {
+        let state = self
+            .descriptions
+            .get(&description)
+            .ok_or(AuthorityError::DescriptionNotFound)?;
+        match &state.backing {
+            AuthorityBacking::Epoll(epoll) => Ok(epoll),
+            _ => Err(AuthorityError::NotEpoll),
+        }
+    }
+
+    fn epoll_state_mut(
+        &mut self,
+        description: FileDescriptionId,
+    ) -> Result<&mut EpollState, AuthorityError> {
+        let state = self
+            .descriptions
+            .get_mut(&description)
+            .ok_or(AuthorityError::DescriptionNotFound)?;
+        match &mut state.backing {
+            AuthorityBacking::Epoll(epoll) => Ok(epoll),
+            _ => Err(AuthorityError::NotEpoll),
+        }
+    }
+
+    fn epoll_path_reaches(
+        &self,
+        current: FileDescriptionId,
+        goal: FileDescriptionId,
+        depth: usize,
+    ) -> bool {
+        if current == goal {
+            return true;
+        }
+        let Ok(state) = self.epoll_state(current) else {
+            return false;
+        };
+        if depth >= 5 {
+            return state.target_descriptions().next().is_some();
+        }
+        state
+            .target_descriptions()
+            .any(|target| self.epoll_path_reaches(target, goal, depth + 1))
+    }
+
+    fn acknowledge_epolls_without_publish(
+        &mut self,
+        description: FileDescriptionId,
+        consumed: LinuxEpollEvents,
+        read_available: u64,
+        write_backpressured: bool,
+        revision: Revision,
+    ) {
+        let epolls: BTreeSet<FileDescriptionId> = self
+            .epoll_watchers
+            .get(&description)
+            .into_iter()
+            .flat_map(|watchers| watchers.iter().map(|(epoll, _)| *epoll))
+            .collect();
+        for epoll in epolls {
+            let changed = self
+                .epoll_state_mut(epoll)
+                .unwrap_or_else(|_| {
+                    abort_fatal(AuthorityFatal::InvariantViolation(
+                        "epoll acknowledgement lost an indexed watcher",
+                    ))
+                })
+                .acknowledge_io(description, consumed, read_available, write_backpressured);
+            if changed {
+                self.descriptions
+                    .get_mut(&epoll)
+                    .unwrap_or_else(|| {
+                        abort_fatal(AuthorityFatal::InvariantViolation(
+                            "epoll acknowledgement lost an indexed description",
+                        ))
+                    })
+                    .revision = revision;
+            }
+        }
+    }
+
     fn read(
         &mut self,
         client: ClientIdentity,
@@ -1388,6 +2100,9 @@ impl FileAuthorityCore {
                 }
                 bytes.truncate(usize::try_from(read).map_err(|_| AuthorityError::InvalidOffset)?);
                 bytes
+            }
+            AuthorityBacking::Epoll(_) | AuthorityBacking::EventCounter { .. } => {
+                return Err(AuthorityError::WrongOperationFamily);
             }
         };
         let next = offset
@@ -1457,6 +2172,9 @@ impl FileAuthorityCore {
                 usize::try_from(written).map_err(|_| AuthorityError::InvalidOffset)?
             }
             AuthorityBacking::Synthetic { .. } | AuthorityBacking::Vfs { .. } => bytes.len(),
+            AuthorityBacking::Epoll(_) | AuthorityBacking::EventCounter { .. } => {
+                return Err(AuthorityError::WrongOperationFamily);
+            }
         };
         let count = ByteCount::bounded(
             u32::try_from(written).map_err(|_| AuthorityError::PayloadTooLarge)?,
@@ -1497,6 +2215,11 @@ impl FileAuthorityCore {
                 }
                 AuthorityBacking::Host { .. } => {}
                 AuthorityBacking::Vfs { .. } => unreachable!(),
+                AuthorityBacking::Epoll(_) | AuthorityBacking::EventCounter { .. } => {
+                    abort_fatal(AuthorityFatal::InvariantViolation(
+                        "generic write reached a typed-operation backing",
+                    ));
+                }
             },
         }
         let description = self
@@ -1949,6 +2672,7 @@ impl FileAuthorityCore {
         if !reclaim {
             return (false, false);
         }
+        self.detach_reclaimed_description_from_epolls(description, revision);
         let state = self.descriptions.remove(&description).unwrap_or_else(|| {
             abort_fatal(AuthorityFatal::InvariantViolation(
                 "reclaim lost its unreferenced description",
@@ -1972,6 +2696,51 @@ impl FileAuthorityCore {
                 ))
             });
         (true, self.maybe_reclaim_vfs_object(object))
+    }
+
+    fn detach_reclaimed_description_from_epolls(
+        &mut self,
+        description: FileDescriptionId,
+        revision: Revision,
+    ) {
+        if let Some(watchers) = self.epoll_watchers.remove(&description) {
+            let epolls: BTreeSet<FileDescriptionId> =
+                watchers.iter().map(|(epoll, _)| *epoll).collect();
+            for (epoll, key) in watchers {
+                let state = self.epoll_state_mut(epoll).unwrap_or_else(|_| {
+                    abort_fatal(AuthorityFatal::InvariantViolation(
+                        "reverse epoll index referenced a missing instance",
+                    ))
+                });
+                if !state.delete(key) {
+                    abort_fatal(AuthorityFatal::InvariantViolation(
+                        "reverse epoll index referenced a missing interest",
+                    ));
+                }
+            }
+            for epoll in epolls {
+                self.descriptions
+                    .get_mut(&epoll)
+                    .unwrap_or_else(|| {
+                        abort_fatal(AuthorityFatal::InvariantViolation(
+                            "epoll auto-detach lost an instance description",
+                        ))
+                    })
+                    .revision = revision;
+            }
+        }
+        let epoll_keys: Vec<EpollInterestKey> = self
+            .epoll_state(description)
+            .map(|state| state.keys().collect())
+            .unwrap_or_default();
+        for key in epoll_keys {
+            if let Some(watchers) = self.epoll_watchers.get_mut(&key.target_description) {
+                watchers.remove(&(description, key));
+                if watchers.is_empty() {
+                    self.epoll_watchers.remove(&key.target_description);
+                }
+            }
+        }
     }
 
     fn maybe_reclaim_vfs_object(&mut self, object: VfsObjectId) -> bool {
@@ -2006,6 +2775,9 @@ impl FileAuthorityCore {
                 }
                 let stat = unsafe { stat.assume_init() };
                 u64::try_from(stat.st_size).map_err(|_| AuthorityError::InvalidOffset)
+            }
+            AuthorityBacking::Epoll(_) | AuthorityBacking::EventCounter { .. } => {
+                Err(AuthorityError::NotSeekable)
             }
         }
     }
@@ -2043,6 +2815,16 @@ impl FileAuthorityCore {
             .unwrap_or_else(|_| abort_fatal(AuthorityFatal::IdentityExhausted))
     }
 
+    fn allocate_interest_generation(&mut self) -> InterestGeneration {
+        let raw = NonZeroU32::new(self.next_interest_generation)
+            .unwrap_or_else(|| abort_fatal(AuthorityFatal::IdentityExhausted));
+        self.next_interest_generation = self
+            .next_interest_generation
+            .checked_add(1)
+            .unwrap_or_else(|| abort_fatal(AuthorityFatal::IdentityExhausted));
+        InterestGeneration::from_authority_allocation(raw)
+    }
+
     fn allocate_capability_lease(&mut self) -> CapabilityLeaseId {
         let raw = NonZeroU64::new(self.next_capability_lease)
             .unwrap_or_else(|| abort_fatal(AuthorityFatal::IdentityExhausted));
@@ -2071,6 +2853,30 @@ impl FileAuthorityCore {
         self.revision = next;
         next
     }
+}
+
+fn event_counter_readiness(counter: u64) -> ReadinessSnapshot {
+    // eventfd(2): the stored maximum is UINT64_MAX-1 and POLLOUT means
+    // at least an increment of one can succeed. Therefore only that exact
+    // saturated value suppresses write readiness; a write of zero is valid.
+    let mut ready = LinuxEpollEvents::OUT;
+    if counter > 0 {
+        ready |= LinuxEpollEvents::IN;
+    }
+    if counter == u64::MAX - 1 {
+        ready.remove(LinuxEpollEvents::OUT);
+    }
+    ReadinessSnapshot {
+        ready,
+        read_available: u64::from(counter > 0) * 8,
+    }
+}
+
+fn is_epollable(backing: &AuthorityBacking) -> bool {
+    matches!(
+        backing,
+        AuthorityBacking::Epoll(_) | AuthorityBacking::EventCounter { .. }
+    )
 }
 
 fn expected_request_capabilities(command: &Command) -> usize {

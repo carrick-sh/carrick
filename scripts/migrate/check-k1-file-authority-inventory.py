@@ -12,6 +12,8 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "crates/carrick-runtime/src"
 INVENTORY = ROOT / "scripts/migrate/k1-file-authority-operation-inventory.json"
+FILE_AUTHORITY_MODULE = SOURCE / "file_authority"
+FILE_AUTHORITY_GATE = "#[cfg(test)]\npub(crate) mod file_authority;"
 PATTERNS = {
     "table_guard": re.compile(
         r"\b(read_open_files|write_open_files|lock_next_fd|lock_stdio_cloexec|"
@@ -39,7 +41,13 @@ PATTERNS = {
 
 def generate() -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
+    authority_is_test_only = FILE_AUTHORITY_GATE in (SOURCE / "lib.rs").read_text()
     for path in sorted(SOURCE.rglob("*.rs")):
+        if authority_is_test_only and path.is_relative_to(FILE_AUTHORITY_MODULE):
+            # The disconnected replacement model is intentionally outside the
+            # production-escape inventory until its cfg(test) gate is deleted
+            # by the atomic cutover. Once enabled, it is scanned automatically.
+            continue
         relative = str(path.relative_to(ROOT))
         for number, line in enumerate(path.read_text().splitlines(), 1):
             categories = [name for name, pattern in PATTERNS.items() if pattern.search(line)]
