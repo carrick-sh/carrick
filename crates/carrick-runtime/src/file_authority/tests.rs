@@ -1,25 +1,46 @@
+use std::sync::Arc;
+
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
 
 use super::*;
 
 #[derive(Clone)]
 struct Harness {
-    transport: DirectFileAuthority,
+    transport: Arc<dyn FileAuthorityTransport>,
+    ipc: Option<IpcFileAuthority>,
     epoch: AuthorityEpoch,
     client: ClientIdentity,
     next_request: u64,
+    revision: Revision,
 }
 
 impl Harness {
     fn new() -> Self {
         let epoch = AuthorityEpoch::for_run(7).expect("authority epoch");
         let transport = DirectFileAuthority::for_run(FileAuthorityCore::for_run(epoch));
+        Self::with_transport(epoch, Arc::new(transport), None)
+    }
+
+    fn new_ipc() -> Self {
+        let epoch = AuthorityEpoch::for_run(8).expect("authority epoch");
+        let transport = IpcFileAuthority::for_model_tests(FileAuthorityCore::for_run(epoch))
+            .expect("IPC authority");
+        Self::with_transport(epoch, Arc::new(transport.clone()), Some(transport))
+    }
+
+    fn with_transport(
+        epoch: AuthorityEpoch,
+        transport: Arc<dyn FileAuthorityTransport>,
+        ipc: Option<IpcFileAuthority>,
+    ) -> Self {
         let client = client(1, 1001, 1);
         let mut harness = Self {
             transport,
+            ipc,
             epoch,
             client,
             next_request: 1,
+            revision: Revision::ZERO,
         };
         assert!(matches!(
             harness.send(Command::RegisterClient, ObjectGeneration::INITIAL),
@@ -31,9 +52,11 @@ impl Harness {
     fn peer(&self, id: u64, host_pid: u32, generation: u32) -> Self {
         let mut peer = Self {
             transport: self.transport.clone(),
+            ipc: self.ipc.clone(),
             epoch: self.epoch,
             client: client(id, host_pid, generation),
             next_request: 1,
+            revision: self.revision,
         };
         assert!(matches!(
             peer.send(Command::RegisterClient, ObjectGeneration::INITIAL),
@@ -54,12 +77,15 @@ impl Harness {
         request
     }
 
+    fn execute(&mut self, request: Request) -> Result<Response, AuthorityFatal> {
+        let response = self.transport.execute(request)?;
+        self.revision = response.authority_revision;
+        Ok(response)
+    }
+
     fn send(&mut self, command: Command, expected: ObjectGeneration) -> Outcome {
         let request = self.request(command, expected);
-        self.transport
-            .execute(request)
-            .expect("authority request")
-            .outcome
+        self.execute(request).expect("authority request").outcome
     }
 
     fn create_table(&mut self) -> FileTableId {
@@ -155,6 +181,149 @@ fn fd(raw: i32) -> FileSlotNumber {
     FileSlotNumber::for_open_fd(raw).expect("fd")
 }
 
+fn transport_model_trace(mut harness: Harness) -> Vec<Outcome> {
+    let mut outcomes = Vec::new();
+    let table = match harness.send(Command::CreateTable, ObjectGeneration::INITIAL) {
+        outcome @ Outcome::TableCreated { table, .. } => {
+            outcomes.push(outcome);
+            table
+        }
+        other => panic!("unexpected table outcome: {other:?}"),
+    };
+    let object = match harness.send(
+        Command::CreateVfsFile {
+            path: CanonicalPath::absolute("/equivalence").expect("path"),
+            mode: 0o640,
+            contents: b"abc".to_vec(),
+        },
+        ObjectGeneration::INITIAL,
+    ) {
+        outcome @ Outcome::VfsObjectCreated { object, .. } => {
+            outcomes.push(outcome);
+            object
+        }
+        other => panic!("unexpected create outcome: {other:?}"),
+    };
+    let installed = harness.send(
+        Command::OpenVfsAndInstall {
+            table,
+            object,
+            object_generation: ObjectGeneration::INITIAL,
+            minimum: fd(3),
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(16),
+            descriptor_flags: DescriptorFlags::NONE,
+            access_mode: AccessMode::ReadWrite,
+            status_flags: StatusFlags::default(),
+            path: Some(CanonicalPath::absolute("/equivalence").expect("path")),
+        },
+        ObjectGeneration::INITIAL,
+    );
+    let (open_fd, description) = match installed {
+        Outcome::Installed {
+            fd, description, ..
+        } => (fd, description),
+        ref other => panic!("unexpected install outcome: {other:?}"),
+    };
+    outcomes.push(installed);
+    outcomes.push(harness.send(
+        Command::Write {
+            table,
+            fd: open_fd,
+            bytes: b"XY".to_vec(),
+        },
+        ObjectGeneration::INITIAL,
+    ));
+    outcomes.push(harness.send(
+        Command::Seek {
+            table,
+            fd: open_fd,
+            offset: 0,
+            whence: SeekWhence::Start,
+        },
+        ObjectGeneration::INITIAL,
+    ));
+    outcomes.push(harness.send(
+        Command::Read {
+            table,
+            fd: open_fd,
+            maximum: ByteCount::bounded(3).expect("bounded read"),
+        },
+        ObjectGeneration::INITIAL,
+    ));
+    outcomes.push(harness.send(
+        Command::Dup {
+            table,
+            source: open_fd,
+            minimum: fd(4),
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(16),
+            flags: DescriptorFlags::CLOSE_ON_EXEC,
+        },
+        ObjectGeneration::INITIAL,
+    ));
+    outcomes.push(harness.send(
+        Command::InspectDescription { description },
+        ObjectGeneration::INITIAL,
+    ));
+    outcomes.push(harness.send(
+        Command::RenameVfs {
+            from: CanonicalPath::absolute("/equivalence").expect("source"),
+            to: CanonicalPath::absolute("/renamed").expect("target"),
+        },
+        ObjectGeneration::INITIAL,
+    ));
+    outcomes.push(harness.send(
+        Command::UnlinkVfs {
+            path: CanonicalPath::absolute("/renamed").expect("path"),
+        },
+        ObjectGeneration::INITIAL,
+    ));
+    outcomes.push(harness.send(
+        Command::ExecSuccessor { source: table },
+        ObjectGeneration::INITIAL,
+    ));
+    outcomes
+}
+
+fn normalize_trace_description_ids(trace: &mut [Outcome]) {
+    let canonical = FileDescriptionId::from_registry_allocation(std::num::NonZeroU64::MIN);
+    for outcome in trace {
+        match outcome {
+            Outcome::Installed { description, .. } | Outcome::Closed { description, .. } => {
+                *description = canonical
+            }
+            Outcome::Slot(slot) => slot.description = canonical,
+            Outcome::Description(description) => description.description = canonical,
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn direct_and_ipc_transports_produce_identical_model_trace() {
+    let mut direct = transport_model_trace(Harness::new());
+    let mut ipc = transport_model_trace(Harness::new_ipc());
+    // Separate per-run cores allocate globally collision-free description IDs;
+    // compare relational semantics rather than unrelated absolute identities.
+    normalize_trace_description_ids(&mut direct);
+    normalize_trace_description_ids(&mut ipc);
+    assert_eq!(direct, ipc);
+}
+
+#[test]
+fn ipc_authority_death_fails_closed() {
+    let mut harness = Harness::new_ipc();
+    harness
+        .ipc
+        .as_ref()
+        .expect("IPC transport")
+        .terminate_model_server();
+    let request = harness.request(Command::CreateTable, ObjectGeneration::INITIAL);
+    assert_eq!(
+        harness.execute(request),
+        Err(AuthorityFatal::TransportUnavailable)
+    );
+}
+
 #[test]
 fn authority_domains_round_trip_only_through_named_constructors() {
     let epoch = AuthorityEpoch::for_run(9).expect("epoch");
@@ -187,31 +356,25 @@ fn authority_domains_round_trip_only_through_named_constructors() {
 fn direct_transport_replays_terminal_mutation_without_reapplying_it() {
     let mut harness = Harness::new();
     let request = harness.request(Command::CreateTable, ObjectGeneration::INITIAL);
-    let first = harness
-        .transport
-        .execute(request.clone())
-        .expect("first request");
-    let revision = harness.transport.revision();
-    let replay = harness.transport.execute(request).expect("dedup replay");
+    let first = harness.execute(request.clone()).expect("first request");
+    let revision = harness.revision;
+    let replay = harness.execute(request).expect("dedup replay");
 
     assert_eq!(first, replay);
-    assert_eq!(harness.transport.revision(), revision);
+    assert_eq!(harness.revision, revision);
 }
 
 #[test]
 fn conflicting_duplicate_request_is_run_fatal() {
     let mut harness = Harness::new();
     let request = harness.request(Command::CreateTable, ObjectGeneration::INITIAL);
-    harness
-        .transport
-        .execute(request.clone())
-        .expect("first request");
+    harness.execute(request.clone()).expect("first request");
     let conflict = Request {
         command: Command::ExitClient,
         ..request
     };
     assert_eq!(
-        harness.transport.execute(conflict),
+        harness.execute(conflict),
         Err(AuthorityFatal::RequestConflict)
     );
 }
@@ -696,7 +859,7 @@ fn rename_between_hardlinks_to_the_same_object_is_a_noop() {
         ),
         Outcome::VfsNamespaceChanged { .. }
     ));
-    let revision = harness.transport.revision();
+    let revision = harness.revision;
     assert!(matches!(
         harness.send(
             Command::RenameVfs {
@@ -711,7 +874,7 @@ fn rename_between_hardlinks_to_the_same_object_is_a_noop() {
             object_reclaimed: false,
         } if renamed == object && namespace_revision == revision
     ));
-    assert_eq!(harness.transport.revision(), revision);
+    assert_eq!(harness.revision, revision);
     for path in ["/first-link", "/second-link"] {
         assert!(matches!(
             harness.send(
@@ -734,7 +897,7 @@ fn access_modes_reject_disallowed_io_without_publishing_a_revision() {
     let (write_only, _) =
         harness.open_vfs_with_mode(table, object, 4, false, AccessMode::WriteOnly);
     let (path_only, _) = harness.open_vfs_with_mode(table, object, 5, false, AccessMode::PathOnly);
-    let revision = harness.transport.revision();
+    let revision = harness.revision;
 
     assert_eq!(
         harness.send(
@@ -770,7 +933,7 @@ fn access_modes_reject_disallowed_io_without_publishing_a_revision() {
         ),
         Outcome::Rejected(AuthorityError::NotSeekable)
     );
-    assert_eq!(harness.transport.revision(), revision);
+    assert_eq!(harness.revision, revision);
 }
 
 #[test]
@@ -796,10 +959,7 @@ fn serialized_client_requests_replace_prior_dedup_entries() {
         expected_generation: ObjectGeneration::INITIAL,
         command: Command::RegisterClient,
     };
-    assert_eq!(
-        harness.transport.execute(old),
-        Err(AuthorityFatal::RequestOutOfOrder)
-    );
+    assert_eq!(harness.execute(old), Err(AuthorityFatal::RequestOutOfOrder));
 }
 
 #[test]

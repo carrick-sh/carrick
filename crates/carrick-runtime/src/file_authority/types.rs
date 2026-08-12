@@ -87,6 +87,10 @@ pub(crate) struct Revision(u64);
 impl Revision {
     pub(crate) const ZERO: Self = Self(0);
 
+    pub(super) const fn from_wire(raw: u64) -> Self {
+        Self(raw)
+    }
+
     pub(crate) const fn raw(self) -> u64 {
         self.0
     }
@@ -513,6 +517,12 @@ pub(crate) enum AuthorityFatal {
     IdentityExhausted,
     #[error("file authority invariant was violated: {0}")]
     InvariantViolation(&'static str),
+    #[error("file authority protocol frame is malformed: {0}")]
+    MalformedFrame(&'static str),
+    #[error("file authority transport is unavailable")]
+    TransportUnavailable,
+    #[error("file authority response does not match its request")]
+    ResponseMismatch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]

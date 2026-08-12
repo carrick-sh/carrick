@@ -24,11 +24,6 @@ impl DirectFileAuthority {
             core: Arc::new(Mutex::new(core)),
         }
     }
-
-    #[cfg(test)]
-    pub(super) fn revision(&self) -> super::Revision {
-        self.core.lock().revision()
-    }
 }
 
 impl FileAuthorityTransport for DirectFileAuthority {
