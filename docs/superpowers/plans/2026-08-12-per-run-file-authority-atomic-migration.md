@@ -21,9 +21,14 @@ Create one `FileAuthorityCore` per Carrick run.
 - The core exclusively owns every `FileTable`, reachable `FileDescription`,
   mutable open-description state, epoll subordinate state, splice stream state,
   stable ID allocator, logical slot references, and revisions.
-- Clients own exact `KernelContext` and mixed-domain orchestration. They retain
-  typed IDs, request handles, and bounded capability leases only. They never
-  retain a slot map, mutable description snapshot, or fallback authority.
+- The process resource-limit domain remains outside FileAuthority:
+  `RLIMIT_NOFILE` follows process fork/exec semantics, not `CLONE_FILES` table
+  sharing. Allocation requests carry the caller's already captured typed soft
+  limit and the authority applies it atomically while choosing a slot.
+- Clients own exact `KernelContext`, process resource limits, and mixed-domain
+  orchestration. They retain typed IDs, request handles, and bounded capability
+  leases only. They never retain a slot map, mutable description snapshot, or
+  fallback authority.
 - Authority death terminates the run. A client never reconnects, promotes a
   cache, or retries an operation whose terminal commit state is unknown.
 
@@ -95,12 +100,13 @@ payloads contain values and typed IDs only.
 | mmap | Resolve and pin a mapping source; return one `SCM_RIGHTS` capability plus lease ID; commit or abort against the caller's exact MM transaction. |
 | io_uring | Own backing/layout/SQ-CQ state; parse guest data in the client; execute typed fd operations; publish CQ outside authority locks. |
 | Lifecycle | Fork-copy table, share table, exec-unshare/CLOEXEC, drain generation, client exit, snapshot, restore, and native reexec adoption. |
-| Limits | Read/set `RLIMIT_NOFILE` and reject allocation atomically against the same table revision. |
+| Allocation constraint | Reserve/install operations accept a typed `NofileAllocationCeiling` captured from the caller's process resource-limit state and reject slot selection at or above it in the same table transaction. FileAuthority never reads, writes, snapshots, or inherits `RLIMIT_NOFILE`. |
 
 Every request contains authority epoch, client `(HostPid,
 ProcessGeneration)`, monotonic request ID, target typed ID, and expected object
-generation. Every mutation publishes one monotonic revision after all fields
-commit.
+generation. Allocation requests additionally contain the typed caller limit;
+this is an immutable operation input, not a mirrored limit. Every mutation
+publishes one monotonic revision after all fields commit.
 
 ## Locking and blocking
 
@@ -207,7 +213,9 @@ both direct and IPC transports from the same test vector.
 Route Kernel fork-copy, in-process `CLONE_FILES`, host-process `CLONE_FILES`,
 exec-unshare/CLOEXEC, draining generations, native reexec, VMM, native Darwin,
 native x86, DirectRunner, and HVPatch through authority lifecycle operations.
-Child task publication waits for authority binding acknowledgement.
+Process resource limits remain in their independent fork/exec authority and
+native-reexec capsule; they are not serialized with the file table. Child task
+publication waits for authority binding acknowledgement.
 
 Move splice pushback to `PipeStreamState`. Route ordinary read/readv and every
 splice/tee/sendfile consumer through it.
