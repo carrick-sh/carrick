@@ -12,8 +12,11 @@ use super::protocol::{
     encode_response_with_fd_count,
 };
 use super::{
-    AuthorityCall, AuthorityFatal, AuthorityReply, FileAuthorityCore, FileAuthorityTransport,
+    AuthorityCall, AuthorityEpoch, AuthorityFatal, AuthorityReply, ClientId, ClientIdentity,
+    FileAuthorityBinding, FileAuthorityCore, FileAuthorityTransport, ObjectGeneration, Outcome,
+    Request, RequestId,
 };
+use carrick_kernel::domains::{HostPid, ProcessGeneration};
 
 const TRANSPORT_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_BYTES: usize = 256;
@@ -50,18 +53,89 @@ impl std::fmt::Debug for IpcFileAuthority {
 }
 
 impl IpcFileAuthority {
+    /// Start a dedicated per-run authority helper before any guest host fork.
+    ///
+    /// The parent returns one CLOEXEC endpoint. The helper owns the only core
+    /// and never returns; all later guest processes inherit or receive client
+    /// endpoints, never mutable authority state.
+    pub(crate) fn spawn_per_run(
+        core: FileAuthorityCore,
+        epoch: AuthorityEpoch,
+    ) -> Result<(Self, FileAuthorityBinding), AuthorityFatal> {
+        let (client, server) = cloexec_datagram_pair()?;
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(AuthorityFatal::TransportUnavailable);
+        }
+        if pid == 0 {
+            drop(client);
+            serve(server, core);
+            unsafe { libc::_exit(0) };
+        }
+        drop(server);
+        configure_client(&client)?;
+        let transport = Self {
+            inner: Arc::new(IpcInner {
+                socket: Mutex::new(client),
+                server: Mutex::new(None),
+            }),
+        };
+        let client_identity = ClientIdentity::registered(
+            ClientId::for_process_client(1).map_err(|_| AuthorityFatal::IdentityExhausted)?,
+            HostPid::new(std::process::id()),
+            ProcessGeneration::new(1),
+        )
+        .map_err(|_| AuthorityFatal::IdentityExhausted)?;
+        let register = Request {
+            epoch,
+            client: client_identity,
+            request_id: RequestId::from_client_sequence(1)
+                .map_err(|_| AuthorityFatal::IdentityExhausted)?,
+            expected_generation: ObjectGeneration::INITIAL,
+            command: super::Command::RegisterClient,
+        };
+        let registered = transport.execute(register)?;
+        if !matches!(registered.outcome, Outcome::ClientRegistered) {
+            return Err(AuthorityFatal::InvariantViolation(
+                "per-run authority rejected its root client",
+            ));
+        }
+        let create = Request {
+            epoch,
+            client: client_identity,
+            request_id: RequestId::from_client_sequence(2)
+                .map_err(|_| AuthorityFatal::IdentityExhausted)?,
+            expected_generation: ObjectGeneration::INITIAL,
+            command: super::Command::CreateTable,
+        };
+        let table = match transport.execute(create)?.outcome {
+            Outcome::TableCreated {
+                table, generation, ..
+            } => (table, generation),
+            _ => {
+                return Err(AuthorityFatal::InvariantViolation(
+                    "per-run authority failed to create its root table",
+                ));
+            }
+        };
+        Ok((
+            transport,
+            FileAuthorityBinding {
+                epoch,
+                client: client_identity,
+                table: table.0,
+                generation: table.1,
+            },
+        ))
+    }
+
     /// Run the exact datagram protocol against a dedicated server thread.
     /// Production helper startup replaces only this launcher; the socket,
     /// protocol, server loop, and core transaction boundary remain identical.
     #[cfg(test)]
     pub(super) fn for_model_tests(core: FileAuthorityCore) -> Result<Self, AuthorityFatal> {
         let (client, server) = cloexec_datagram_pair()?;
-        client
-            .set_read_timeout(Some(TRANSPORT_TIMEOUT))
-            .map_err(|_| AuthorityFatal::TransportUnavailable)?;
-        client
-            .set_write_timeout(Some(TRANSPORT_TIMEOUT))
-            .map_err(|_| AuthorityFatal::TransportUnavailable)?;
+        configure_client(&client)?;
         let server_thread = std::thread::Builder::new()
             .name("carrick-file-authority-model".to_owned())
             .spawn(move || serve(server, core))
@@ -137,6 +211,15 @@ fn serve(socket: UnixDatagram, mut core: FileAuthorityCore) {
             break;
         }
     }
+}
+
+fn configure_client(client: &UnixDatagram) -> Result<(), AuthorityFatal> {
+    client
+        .set_read_timeout(Some(TRANSPORT_TIMEOUT))
+        .map_err(|_| AuthorityFatal::TransportUnavailable)?;
+    client
+        .set_write_timeout(Some(TRANSPORT_TIMEOUT))
+        .map_err(|_| AuthorityFatal::TransportUnavailable)
 }
 
 fn cloexec_datagram_pair() -> Result<(UnixDatagram, UnixDatagram), AuthorityFatal> {
