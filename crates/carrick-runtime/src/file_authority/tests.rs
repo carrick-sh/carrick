@@ -1712,6 +1712,30 @@ fn client_exit_reclaims_direct_and_ipc_capability_leases() {
 }
 
 #[test]
+fn per_run_helper_bootstraps_authenticated_root_binding() {
+    let epoch = AuthorityEpoch::for_run(23).expect("epoch");
+    let (transport, binding) =
+        IpcFileAuthority::spawn_per_run(FileAuthorityCore::for_run(epoch), epoch)
+            .expect("spawn per-run helper");
+    assert_eq!(binding.epoch, epoch);
+    let request = Request {
+        epoch,
+        client: binding.client,
+        request_id: RequestId::from_client_sequence(3).expect("request"),
+        expected_generation: binding.generation,
+        command: Command::ListSlots {
+            table: binding.table,
+            after: None,
+            maximum: SlotPageLimit::bounded(1).expect("limit"),
+        },
+    };
+    assert!(matches!(
+        transport.execute(request).expect("list root table").outcome,
+        Outcome::SlotPage { slots, .. } if slots.is_empty()
+    ));
+}
+
+#[test]
 fn ipc_authority_death_fails_closed() {
     let mut harness = Harness::new_ipc();
     harness
