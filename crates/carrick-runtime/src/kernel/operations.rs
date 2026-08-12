@@ -1478,7 +1478,7 @@ impl Kernel {
         self: &Arc<Self>,
         context: &KernelContext,
         umask: u32,
-    ) -> Result<KernelContext, KernelOperationError> {
+    ) -> Result<(KernelContext, u32), KernelOperationError> {
         if !Arc::ptr_eq(self, &context.kernel) {
             return Err(KernelOperationError::ForeignContext);
         }
@@ -1486,13 +1486,15 @@ impl Kernel {
         loop {
             let observed = self.reservation_epoch();
             let state = self.registry().state.write();
-            if let Err(KernelOperationError::TaskBusy(_)) = ensure_task_unreserved(&state, task_id)
-            {
-                drop(state);
-                self.wait_for_reservation_change(observed);
-                continue;
+            match ensure_task_unreserved(&state, task_id) {
+                Ok(()) => {}
+                Err(KernelOperationError::TaskBusy(_)) => {
+                    drop(state);
+                    self.wait_for_reservation_change(observed);
+                    continue;
+                }
+                Err(error) => return Err(error),
             }
-            ensure_task_unreserved(&state, task_id)?;
             let caller_record = state
                 .tasks
                 .get(&task_id)
@@ -1505,12 +1507,22 @@ impl Kernel {
             )?;
             if caller_thread.key() != context.thread.key()
                 || !Arc::ptr_eq(&caller_thread, &context.thread)
-                || !Arc::ptr_eq(&caller_thread.resources(), &context.resources)
             {
                 return Err(KernelOperationError::StaleContext);
             }
 
+            // A concurrent CLONE_FS peer may have published a newer resource
+            // generation after syscall entry. Retry from that authoritative
+            // generation while the registry is locked, but only while the
+            // exact caller still belongs to the captured FS domain. Copying
+            // each thread's current credentials below preserves unrelated
+            // concurrent credential changes rather than overwriting them.
             let fs_context = context.resources.fs_context();
+            let caller_resources = caller_thread.resources();
+            if !Arc::ptr_eq(&caller_resources.fs_context(), &fs_context) {
+                return Err(KernelOperationError::StaleContext);
+            }
+            let previous_umask = caller_resources.credentials().umask();
             let mut affected = Vec::new();
             for record in state.tasks.values() {
                 if record.task.lifecycle() != TaskLifecycle::Live {
@@ -1570,13 +1582,16 @@ impl Kernel {
                 tracing::error!("umask publication lost its already-validated caller");
                 std::process::abort();
             };
-            return Ok(KernelContext::from_parts(
-                self.clone(),
-                task,
-                thread,
-                Arc::clone(&context.shared),
-                resources,
-                revision,
+            return Ok((
+                KernelContext::from_parts(
+                    self.clone(),
+                    task,
+                    thread,
+                    Arc::clone(&context.shared),
+                    resources,
+                    revision,
+                ),
+                previous_umask,
             ));
         }
     }
@@ -2806,9 +2821,17 @@ mod tests {
             .task_binding()
             .capture(root.thread().key().tid)
             .expect("fresh root context");
-        kernel
+        let (_, previous) = kernel
             .update_fs_umask(&root_context, 0o077)
             .expect("publish shared umask");
+        assert_eq!(previous, 0o022);
+        // The exact syscall-entry context is now a stale resource generation.
+        // A serialized CLONE_FS peer update must retry against the current
+        // authoritative generation and return that generation's previous mask.
+        let (_, previous) = kernel
+            .update_fs_umask(&root_context, 0o027)
+            .expect("retry stale shared-FS generation");
+        assert_eq!(previous, 0o077);
 
         let root_after = root
             .task_binding()
@@ -2822,8 +2845,8 @@ mod tests {
             .task_binding()
             .capture(private.thread().key().tid)
             .expect("private peer after umask");
-        assert_eq!(root_after.resources().credentials().umask(), 0o077);
-        assert_eq!(shared_after.resources().credentials().umask(), 0o077);
+        assert_eq!(root_after.resources().credentials().umask(), 0o027);
+        assert_eq!(shared_after.resources().credentials().umask(), 0o027);
         assert_eq!(shared_after.resources().credentials().euid(), 1001);
         assert_eq!(private_after.resources().credentials().umask(), 0o022);
     }

@@ -1060,9 +1060,18 @@ impl SyscallDispatcher {
         {
             return DispatchOutcome::errno(LINUX_EACCES);
         }
-        self.seccomp.install(prog);
-        self.disable_identity_syscall_shim(memory);
-        DispatchOutcome::Returned { value: 0 }
+        match self.seccomp.install(prog) {
+            Ok(()) => {
+                self.disable_identity_syscall_shim(memory);
+                DispatchOutcome::Returned { value: 0 }
+            }
+            Err(crate::seccomp::SeccompInstallError::InvalidProgram) => {
+                DispatchOutcome::errno(LINUX_EINVAL)
+            }
+            Err(crate::seccomp::SeccompInstallError::PathTooLong) => {
+                DispatchOutcome::errno(LINUX_ENOMEM)
+            }
+        }
     }
 
     fn disable_identity_syscall_shim<M: GuestMemory>(&self, memory: &mut M) {
