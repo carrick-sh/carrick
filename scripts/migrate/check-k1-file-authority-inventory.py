@@ -89,20 +89,30 @@ def generate() -> dict[str, object]:
     }
 
 
-def main() -> int:
-    expected = json.loads(INVENTORY.read_text())
+def main(argv: list[str]) -> int:
     actual = generate()
+    if argv == ["--write"]:
+        INVENTORY.write_text(json.dumps(actual, indent=2) + "\n")
+        return 0
+    if argv:
+        print(
+            f"usage: {Path(sys.argv[0]).name} [--write]",
+            file=sys.stderr,
+        )
+        return 2
+
+    expected = json.loads(INVENTORY.read_text())
     if actual == expected:
         return 0
     print("K1 FileAuthority operation inventory drifted", file=sys.stderr)
     print(f"expected counts: {expected['counts']}", file=sys.stderr)
     print(f"actual counts:   {actual['counts']}", file=sys.stderr)
     print(
-        "Regenerate only after classifying and migrating every changed site.",
+        "Regenerate with --write only after classifying and migrating every changed site.",
         file=sys.stderr,
     )
     return 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))
