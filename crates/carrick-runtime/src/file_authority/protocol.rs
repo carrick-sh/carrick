@@ -263,6 +263,8 @@ fn command_tag(command: &Command) -> u8 {
         Command::CreateTimerAndInstall { .. } => 46,
         Command::SetTimer { .. } => 47,
         Command::ExpireTimer { .. } => 48,
+        Command::CreateSignalFdAndInstall { .. } => 49,
+        Command::SetSignalFdMask { .. } => 50,
     }
 }
 
@@ -303,6 +305,26 @@ fn encode_command(writer: &mut Writer, command: &Command) -> Result<(), Authorit
             writer.i32(minimum.raw());
             writer.u32(ceiling.raw());
             writer.u32(descriptor_flags.raw());
+        }
+        Command::CreateSignalFdAndInstall {
+            table,
+            minimum,
+            ceiling,
+            descriptor_flags,
+            status_flags,
+            mask,
+        } => {
+            writer.u64(table.raw());
+            writer.i32(minimum.raw());
+            writer.u32(ceiling.raw());
+            writer.u32(descriptor_flags.raw());
+            writer.u64(status_flags.raw());
+            writer.u64(mask.raw());
+        }
+        Command::SetSignalFdMask { table, fd, mask } => {
+            writer.u64(table.raw());
+            writer.i32(fd.raw());
+            writer.u64(mask.raw());
         }
         Command::CreateTimerAndInstall {
             table,
@@ -938,6 +960,20 @@ fn decode_command(tag: u8, reader: &mut Reader<'_>) -> Result<Command, Authority
             fd: reader.slot()?,
             expirations: reader.u64()?,
         },
+        49 => Command::CreateSignalFdAndInstall {
+            table: reader.table_id()?,
+            minimum: reader.slot()?,
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(reader.u32()?),
+            descriptor_flags: DescriptorFlags::from_linux_bits(reader.u32()?)
+                .map_err(|_| AuthorityFatal::MalformedFrame("invalid descriptor flags"))?,
+            status_flags: StatusFlags::from_linux_bits(reader.u64()?),
+            mask: carrick_abi::SigSet::from_raw(reader.u64()?),
+        },
+        50 => Command::SetSignalFdMask {
+            table: reader.table_id()?,
+            fd: reader.slot()?,
+            mask: carrick_abi::SigSet::from_raw(reader.u64()?),
+        },
         _ => return malformed("unknown operation"),
     })
 }
@@ -1040,6 +1076,34 @@ fn encode_outcome(writer: &mut Writer, outcome: &Outcome) -> Result<(), Authorit
             writer.u64(description.raw());
             writer.u64(generation.raw());
             writer.u64(table_revision.raw());
+            writer.u64(description_revision.raw());
+        }
+        Outcome::SignalFdCreated {
+            table,
+            fd,
+            description,
+            generation,
+            mask,
+            table_revision,
+            description_revision,
+        } => {
+            writer.u8(48);
+            writer.u64(table.raw());
+            writer.i32(fd.raw());
+            writer.u64(description.raw());
+            writer.u64(generation.raw());
+            writer.u64(mask.raw());
+            writer.u64(table_revision.raw());
+            writer.u64(description_revision.raw());
+        }
+        Outcome::SignalFdMaskSet {
+            description,
+            mask,
+            description_revision,
+        } => {
+            writer.u8(49);
+            writer.u64(description.raw());
+            writer.u64(mask.raw());
             writer.u64(description_revision.raw());
         }
         Outcome::TimerCreated {
@@ -1747,6 +1811,20 @@ fn decode_outcome(reader: &mut Reader<'_>) -> Result<Outcome, AuthorityFatal> {
             pending: reader.u64()?,
             description_revision: reader.revision()?,
         },
+        48 => Outcome::SignalFdCreated {
+            table: reader.table_id()?,
+            fd: reader.slot()?,
+            description: reader.description_id()?,
+            generation: reader.generation()?,
+            mask: carrick_abi::SigSet::from_raw(reader.u64()?),
+            table_revision: reader.revision()?,
+            description_revision: reader.revision()?,
+        },
+        49 => Outcome::SignalFdMaskSet {
+            description: reader.description_id()?,
+            mask: carrick_abi::SigSet::from_raw(reader.u64()?),
+            description_revision: reader.revision()?,
+        },
         _ => return malformed("unknown response outcome"),
     })
 }
@@ -1807,6 +1885,7 @@ fn encode_error(writer: &mut Writer, error: &AuthorityError) {
         AuthorityError::MappingAttachmentNotFound => writer.u8(45),
         AuthorityError::MappingReleaseOutsideAttachment => writer.u8(46),
         AuthorityError::NotTimer => writer.u8(47),
+        AuthorityError::NotSignalFd => writer.u8(48),
     }
 }
 
@@ -1866,6 +1945,7 @@ fn decode_error(reader: &mut Reader<'_>) -> Result<AuthorityError, AuthorityFata
         45 => AuthorityError::MappingAttachmentNotFound,
         46 => AuthorityError::MappingReleaseOutsideAttachment,
         47 => AuthorityError::NotTimer,
+        48 => AuthorityError::NotSignalFd,
         _ => return malformed("unknown authority error"),
     })
 }
@@ -2206,6 +2286,10 @@ impl Writer {
             DescriptionBackingSnapshot::HostStream { kind } => {
                 self.u8(7);
                 self.host_stream_kind(*kind);
+            }
+            DescriptionBackingSnapshot::SignalFd { mask } => {
+                self.u8(9);
+                self.u64(mask.raw());
             }
             DescriptionBackingSnapshot::Timer {
                 interval_ns,
@@ -2614,6 +2698,9 @@ impl<'a> Reader<'a> {
                 initial_ns: self.u64()?,
                 pending: self.u64()?,
             },
+            9 => DescriptionBackingSnapshot::SignalFd {
+                mask: carrick_abi::SigSet::from_raw(self.u64()?),
+            },
             _ => return malformed("invalid description backing"),
         };
         Ok(DescriptionSnapshot {
@@ -2734,6 +2821,19 @@ mod tests {
                 minimum: FileSlotNumber::for_open_fd(3).expect("fd"),
                 ceiling: NofileAllocationCeiling::from_captured_soft_limit(9),
                 descriptor_flags: DescriptorFlags::CLOSE_ON_EXEC,
+            },
+            Command::CreateSignalFdAndInstall {
+                table,
+                minimum: FileSlotNumber::for_open_fd(3).expect("fd"),
+                ceiling: NofileAllocationCeiling::from_captured_soft_limit(9),
+                descriptor_flags: DescriptorFlags::NONE,
+                status_flags: StatusFlags::default(),
+                mask: carrick_abi::SigSet::from_raw(0x12),
+            },
+            Command::SetSignalFdMask {
+                table,
+                fd: FileSlotNumber::for_open_fd(3).expect("fd"),
+                mask: carrick_abi::SigSet::from_raw(0x24),
             },
             Command::CreateTimerAndInstall {
                 table,
@@ -3013,6 +3113,20 @@ mod tests {
                 generation: ObjectGeneration::INITIAL,
                 table_revision: Revision::from_wire(2),
                 description_revision: Revision::from_wire(2),
+            },
+            Outcome::SignalFdCreated {
+                table,
+                fd: slot,
+                description,
+                generation: ObjectGeneration::INITIAL,
+                mask: carrick_abi::SigSet::from_raw(0x12),
+                table_revision: Revision::from_wire(5),
+                description_revision: Revision::from_wire(5),
+            },
+            Outcome::SignalFdMaskSet {
+                description,
+                mask: carrick_abi::SigSet::from_raw(0x24),
+                description_revision: Revision::from_wire(6),
             },
             Outcome::TimerCreated {
                 table,

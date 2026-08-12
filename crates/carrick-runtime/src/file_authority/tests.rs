@@ -1169,6 +1169,60 @@ fn direct_and_ipc_pipe_streams_preserve_shared_state_and_endpoint_lifetime() {
 }
 
 #[test]
+fn direct_and_ipc_signalfd_masks_are_authority_owned() {
+    for ipc in [false, true] {
+        let mut harness = if ipc {
+            Harness::new_ipc()
+        } else {
+            Harness::new()
+        };
+        let table = harness.create_table();
+        let initial = carrick_abi::SigSet::from_raw(0x12);
+        let updated = carrick_abi::SigSet::from_raw(0x24);
+        let (signal_fd, description) = match harness.send(
+            Command::CreateSignalFdAndInstall {
+                table,
+                minimum: fd(3),
+                ceiling: NofileAllocationCeiling::from_captured_soft_limit(16),
+                descriptor_flags: DescriptorFlags::NONE,
+                status_flags: StatusFlags::default(),
+                mask: initial,
+            },
+            ObjectGeneration::INITIAL,
+        ) {
+            Outcome::SignalFdCreated {
+                fd,
+                description,
+                mask,
+                ..
+            } if mask == initial => (fd, description),
+            other => panic!("unexpected signalfd create: {other:?}"),
+        };
+        assert!(matches!(
+            harness.send(
+                Command::SetSignalFdMask {
+                    table,
+                    fd: signal_fd,
+                    mask: updated,
+                },
+                ObjectGeneration::INITIAL,
+            ),
+            Outcome::SignalFdMaskSet { mask, .. } if mask == updated
+        ));
+        assert!(matches!(
+            harness.send(
+                Command::InspectDescription { description },
+                ObjectGeneration::INITIAL,
+            ),
+            Outcome::Description(DescriptionSnapshot {
+                backing: DescriptionBackingSnapshot::SignalFd { mask },
+                ..
+            }) if mask == updated
+        ));
+    }
+}
+
+#[test]
 fn direct_and_ipc_timer_expiration_is_authority_owned() {
     for ipc in [false, true] {
         let mut harness = if ipc {

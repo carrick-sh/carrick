@@ -546,6 +546,19 @@ pub(crate) enum Command {
         ceiling: NofileAllocationCeiling,
         descriptor_flags: DescriptorFlags,
     },
+    CreateSignalFdAndInstall {
+        table: FileTableId,
+        minimum: FileSlotNumber,
+        ceiling: NofileAllocationCeiling,
+        descriptor_flags: DescriptorFlags,
+        status_flags: StatusFlags,
+        mask: carrick_abi::SigSet,
+    },
+    SetSignalFdMask {
+        table: FileTableId,
+        fd: FileSlotNumber,
+        mask: carrick_abi::SigSet,
+    },
     CreateTimerAndInstall {
         table: FileTableId,
         minimum: FileSlotNumber,
@@ -861,6 +874,20 @@ pub(crate) enum Outcome {
         table_revision: Revision,
         description_revision: Revision,
     },
+    SignalFdCreated {
+        table: FileTableId,
+        fd: FileSlotNumber,
+        description: FileDescriptionId,
+        generation: ObjectGeneration,
+        mask: carrick_abi::SigSet,
+        table_revision: Revision,
+        description_revision: Revision,
+    },
+    SignalFdMaskSet {
+        description: FileDescriptionId,
+        mask: carrick_abi::SigSet,
+        description_revision: Revision,
+    },
     TimerCreated {
         table: FileTableId,
         fd: FileSlotNumber,
@@ -1116,6 +1143,9 @@ pub(crate) enum DescriptionBackingSnapshot {
         counter: u64,
         semaphore: bool,
     },
+    SignalFd {
+        mask: carrick_abi::SigSet,
+    },
     Timer {
         interval_ns: u64,
         initial_ns: u64,
@@ -1213,6 +1243,8 @@ pub(crate) enum AuthorityError {
     NotEventCounter,
     #[error("description is not a timer")]
     NotTimer,
+    #[error("description is not a signalfd")]
+    NotSignalFd,
     #[error("event-counter operation would block")]
     WouldBlock,
     #[error("event-counter write value is invalid or would overflow")]

@@ -369,6 +369,30 @@ impl FileAuthorityCore {
                         *ceiling,
                         *descriptor_flags,
                     ),
+                    Command::CreateSignalFdAndInstall {
+                        table,
+                        minimum,
+                        ceiling,
+                        descriptor_flags,
+                        status_flags,
+                        mask,
+                    } => self.create_signalfd_and_install(
+                        request.client,
+                        *table,
+                        request.expected_generation,
+                        *minimum,
+                        *ceiling,
+                        *descriptor_flags,
+                        *status_flags,
+                        *mask,
+                    ),
+                    Command::SetSignalFdMask { table, fd, mask } => self.set_signalfd_mask(
+                        request.client,
+                        *table,
+                        request.expected_generation,
+                        *fd,
+                        *mask,
+                    ),
                     Command::CreateTimerAndInstall {
                         table,
                         minimum,
@@ -1035,6 +1059,86 @@ impl FileAuthorityCore {
             generation: ObjectGeneration::INITIAL,
             table_revision,
             description_revision,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_signalfd_and_install(
+        &mut self,
+        client: ClientIdentity,
+        table: FileTableId,
+        table_generation: ObjectGeneration,
+        minimum: FileSlotNumber,
+        ceiling: NofileAllocationCeiling,
+        descriptor_flags: DescriptorFlags,
+        status_flags: StatusFlags,
+        mask: carrick_abi::SigSet,
+    ) -> Result<Outcome, AuthorityError> {
+        self.require_bound_table(client, table, table_generation)?;
+        let fd = self.allocate_lowest(table, minimum, ceiling)?;
+        let description = self.allocate_description();
+        let outcome = self.commit_new_description_install(
+            table,
+            fd,
+            description,
+            descriptor_flags,
+            AccessMode::ReadOnly,
+            status_flags,
+            None,
+            AuthorityBacking::SignalFd { mask },
+            None,
+        );
+        let Outcome::Installed {
+            table_revision,
+            description_revision,
+            ..
+        } = outcome
+        else {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "signalfd install returned an unexpected outcome",
+            ));
+        };
+        Ok(Outcome::SignalFdCreated {
+            table,
+            fd,
+            description,
+            generation: ObjectGeneration::INITIAL,
+            mask,
+            table_revision,
+            description_revision,
+        })
+    }
+
+    fn set_signalfd_mask(
+        &mut self,
+        client: ClientIdentity,
+        table: FileTableId,
+        expected: ObjectGeneration,
+        fd: FileSlotNumber,
+        mask: carrick_abi::SigSet,
+    ) -> Result<Outcome, AuthorityError> {
+        let description = self.slot(client, table, expected, fd)?.description;
+        if !matches!(
+            self.descriptions
+                .get(&description)
+                .ok_or(AuthorityError::DescriptionNotFound)?
+                .backing,
+            AuthorityBacking::SignalFd { .. }
+        ) {
+            return Err(AuthorityError::NotSignalFd);
+        }
+        let revision = self.publish_mutation();
+        let state = self.descriptions.get_mut(&description).unwrap_or_else(|| {
+            abort_fatal(AuthorityFatal::InvariantViolation(
+                "signalfd mask update lost its description",
+            ))
+        });
+        state.backing = AuthorityBacking::SignalFd { mask };
+        state.revision = revision;
+        Ok(Outcome::SignalFdMaskSet {
+            description,
+            mask,
+            description_revision: revision,
         })
     }
 
@@ -3060,7 +3164,8 @@ impl FileAuthorityCore {
             | AuthorityBacking::PipeEnd { .. }
             | AuthorityBacking::IoUring { .. }
             | AuthorityBacking::HostStream { .. }
-            | AuthorityBacking::Timer { .. } => {
+            | AuthorityBacking::Timer { .. }
+            | AuthorityBacking::SignalFd { .. } => {
                 return Err(AuthorityError::WrongOperationFamily);
             }
         };
@@ -3142,7 +3247,8 @@ impl FileAuthorityCore {
             | AuthorityBacking::PipeEnd { .. }
             | AuthorityBacking::IoUring { .. }
             | AuthorityBacking::HostStream { .. }
-            | AuthorityBacking::Timer { .. } => {
+            | AuthorityBacking::Timer { .. }
+            | AuthorityBacking::SignalFd { .. } => {
                 return Err(AuthorityError::WrongOperationFamily);
             }
         };
@@ -3190,7 +3296,8 @@ impl FileAuthorityCore {
                 | AuthorityBacking::PipeEnd { .. }
                 | AuthorityBacking::IoUring { .. }
                 | AuthorityBacking::HostStream { .. }
-                | AuthorityBacking::Timer { .. } => {
+                | AuthorityBacking::Timer { .. }
+                | AuthorityBacking::SignalFd { .. } => {
                     abort_fatal(AuthorityFatal::InvariantViolation(
                         "generic write reached a typed-operation backing",
                     ));
@@ -3870,7 +3977,8 @@ impl FileAuthorityCore {
             | AuthorityBacking::PipeEnd { .. }
             | AuthorityBacking::IoUring { .. }
             | AuthorityBacking::HostStream { .. }
-            | AuthorityBacking::Timer { .. } => Err(AuthorityError::NotSeekable),
+            | AuthorityBacking::Timer { .. }
+            | AuthorityBacking::SignalFd { .. } => Err(AuthorityError::NotSeekable),
         }
     }
 

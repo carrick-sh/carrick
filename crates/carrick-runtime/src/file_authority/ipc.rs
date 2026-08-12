@@ -320,6 +320,19 @@ fn cloexec_process_lock() -> Result<OwnedFd, AuthorityFatal> {
         .write(true)
         .create_new(true)
         .open(&path)
+        .or_else(|error| {
+            (error.kind() == std::io::ErrorKind::AlreadyExists)
+                .then(|| {
+                    let _ = std::fs::remove_file(&path);
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)
+                })
+                .transpose()
+                .and_then(|retry| retry.ok_or(error))
+        })
         .map_err(|_| AuthorityFatal::TransportUnavailable)?;
     let _ = std::fs::remove_file(path);
     let fd: OwnedFd = file.into();
