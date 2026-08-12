@@ -1,5 +1,6 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+
+use parking_lot::Mutex;
 
 #[cfg(test)]
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
@@ -11,20 +12,15 @@ use super::{
 #[cfg(test)]
 use super::{ClientId, ClientIdentity};
 
-#[cfg(not(test))]
-type RunTransport = super::IpcFileAuthority;
-#[cfg(test)]
-type RunTransport = super::DirectFileAuthority;
-
 /// The one authenticated FileAuthority endpoint retained by a dispatcher run.
 ///
 /// The helper and root table are live before any guest host fork. Syscall
 /// families are attached to this root incrementally; until a family is cut
 /// over, this object owns no guest-visible backing from that family.
 pub(crate) struct FileAuthorityRun {
-    transport: RunTransport,
+    transport: Arc<dyn FileAuthorityTransport>,
     binding: FileAuthorityBinding,
-    next_request: AtomicU64,
+    next_request: Mutex<u64>,
 }
 
 impl std::fmt::Debug for FileAuthorityRun {
@@ -43,17 +39,25 @@ impl FileAuthorityRun {
     pub(crate) fn launch() -> Result<Arc<Self>, AuthorityFatal> {
         let epoch = run_epoch()?;
         #[cfg(not(test))]
-        let (transport, binding) =
-            super::IpcFileAuthority::spawn_per_run(FileAuthorityCore::for_run(epoch), epoch)?;
+        let (transport, binding) = {
+            let (transport, binding) =
+                super::IpcFileAuthority::spawn_per_run(FileAuthorityCore::for_run(epoch), epoch)?;
+            (
+                Arc::new(transport) as Arc<dyn FileAuthorityTransport>,
+                binding,
+            )
+        };
         #[cfg(test)]
-        let (transport, binding) = direct_root(epoch)?;
+        let (transport, binding) = {
+            let (transport, binding) = direct_root(epoch)?;
+            (
+                Arc::new(transport) as Arc<dyn FileAuthorityTransport>,
+                binding,
+            )
+        };
 
-        let authority = Arc::new(Self {
-            transport,
-            binding,
-            // Root registration and root-table creation consumed requests 1-2.
-            next_request: AtomicU64::new(3),
-        });
+        // Root registration and root-table creation consumed requests 1-2.
+        let authority = Self::with_transport(transport, binding, 3);
         let health = authority.execute(
             Command::ListSlots {
                 table: binding.table,
@@ -71,6 +75,18 @@ impl FileAuthorityRun {
         Ok(authority)
     }
 
+    fn with_transport(
+        transport: Arc<dyn FileAuthorityTransport>,
+        binding: FileAuthorityBinding,
+        next_request: u64,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            transport,
+            binding,
+            next_request: Mutex::new(next_request),
+        })
+    }
+
     pub(crate) const fn binding(&self) -> FileAuthorityBinding {
         self.binding
     }
@@ -80,12 +96,19 @@ impl FileAuthorityRun {
         command: Command,
         expected_generation: ObjectGeneration,
     ) -> Result<Response, AuthorityFatal> {
-        let sequence = self
-            .next_request
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .map_err(|_| AuthorityFatal::IdentityExhausted)?;
+        // Allocation and the complete round trip are one critical section. An
+        // atomic counter lets request N+1 reach the authority while N is still
+        // in flight, which the core rejects as `RequestOutOfOrder` — and an
+        // authority rejection terminates the run, so this is not recoverable.
+        // The guard is a client transport lock, never a kernel-object lock, so
+        // holding it across the round trip does not enter the object lock order.
+        let mut next_request = self.next_request.lock();
+        let sequence = *next_request;
+        // Consume the sequence before the round trip: there is no retry path, so
+        // an identity must never be reused after a request is issued.
+        *next_request = sequence
+            .checked_add(1)
+            .ok_or(AuthorityFatal::IdentityExhausted)?;
         let request_id = RequestId::from_client_sequence(sequence)
             .map_err(|_| AuthorityFatal::IdentityExhausted)?;
         self.transport.execute(Request {
@@ -115,7 +138,7 @@ fn run_epoch() -> Result<AuthorityEpoch, AuthorityFatal> {
 #[cfg(test)]
 fn direct_root(
     epoch: AuthorityEpoch,
-) -> Result<(RunTransport, FileAuthorityBinding), AuthorityFatal> {
+) -> Result<(super::DirectFileAuthority, FileAuthorityBinding), AuthorityFatal> {
     let transport = super::DirectFileAuthority::for_run(FileAuthorityCore::for_run(epoch));
     let client = ClientIdentity::registered(
         ClientId::for_process_client(1).map_err(|_| AuthorityFatal::IdentityExhausted)?,
@@ -161,4 +184,91 @@ fn direct_root(
             generation,
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use super::super::{AuthorityCall, AuthorityReply};
+    use super::*;
+
+    /// Transport that reports the peak number of same-client requests observed
+    /// inside one round trip.
+    struct OverlapProbe {
+        inner: super::super::DirectFileAuthority,
+        in_flight: AtomicUsize,
+        peak_in_flight: AtomicUsize,
+        arrivals: AtomicUsize,
+    }
+
+    impl OverlapProbe {
+        fn wrapping(inner: super::super::DirectFileAuthority) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                in_flight: AtomicUsize::new(0),
+                peak_in_flight: AtomicUsize::new(0),
+                arrivals: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl FileAuthorityTransport for OverlapProbe {
+        fn transact(&self, call: AuthorityCall) -> Result<AuthorityReply, AuthorityFatal> {
+            let depth = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak_in_flight.fetch_max(depth, Ordering::SeqCst);
+            // Hold the first arrival open. A second caller can only be seen here
+            // if allocation and the round trip are not one critical section.
+            if self.arrivals.fetch_add(1, Ordering::SeqCst) == 0 {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            let reply = self.inner.transact(call);
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            reply
+        }
+    }
+
+    /// K3 task #41 contract: per-client request allocation and the complete
+    /// transport round trip are one serialized critical section, so request N+1
+    /// cannot overtake N.
+    #[test]
+    fn same_client_requests_cannot_overtake_an_in_flight_round_trip() {
+        let epoch = AuthorityEpoch::for_run(11).expect("authority epoch");
+        let (inner, binding) = direct_root(epoch).expect("direct root");
+        let probe = OverlapProbe::wrapping(inner);
+        let run = FileAuthorityRun::with_transport(probe.clone(), binding, 3);
+
+        let health = move || Command::ListSlots {
+            table: binding.table,
+            after: None,
+            maximum: SlotPageLimit::bounded(1).expect("root health bound"),
+        };
+
+        let first = {
+            let run = Arc::clone(&run);
+            std::thread::spawn(move || run.execute(health(), binding.generation))
+        };
+        let second = {
+            let run = Arc::clone(&run);
+            std::thread::spawn(move || run.execute(health(), binding.generation))
+        };
+
+        first.join().expect("first thread").expect("first request");
+        second
+            .join()
+            .expect("second thread")
+            .expect("second request");
+
+        assert_eq!(
+            probe.arrivals.load(Ordering::SeqCst),
+            2,
+            "both requests must reach the transport"
+        );
+        assert_eq!(
+            probe.peak_in_flight.load(Ordering::SeqCst),
+            1,
+            "a same-client request reached the authority while another was in flight"
+        );
+    }
 }
