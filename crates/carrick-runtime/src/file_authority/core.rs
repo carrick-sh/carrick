@@ -679,6 +679,10 @@ impl FileAuthorityCore {
                     Command::ForkCopy { source, owner } => {
                         self.fork_copy(request.client, *source, request.expected_generation, *owner)
                     }
+                    Command::ForkCopyMappings {
+                        source_owner,
+                        owner,
+                    } => self.fork_copy_mappings(request.client, *source_owner, *owner),
                     Command::ShareTable { table, owner } => self.share_table(
                         request.client,
                         *table,
@@ -2902,6 +2906,72 @@ impl FileAuthorityCore {
             source,
             table,
             generation: ObjectGeneration::INITIAL,
+            revision,
+        })
+    }
+
+    fn fork_copy_mappings(
+        &mut self,
+        client: ClientIdentity,
+        source_owner: ClientIdentity,
+        owner: ClientIdentity,
+    ) -> Result<Outcome, AuthorityError> {
+        if client != source_owner {
+            return Err(AuthorityError::StaleClientGeneration);
+        }
+        self.require_registered(owner)?;
+        let source: Vec<(FileDescriptionId, Vec<MappingRange>)> = self
+            .mapping_attachments
+            .values()
+            .filter_map(|state| {
+                (state.owner == source_owner).then_some((state.description, state.ranges.clone()))
+            })
+            .collect();
+        let mut prepared_refs = HashMap::new();
+        for (description, _) in &source {
+            let count = prepared_refs.entry(*description).or_insert_with(|| {
+                self.descriptions
+                    .get(description)
+                    .unwrap_or_else(|| {
+                        abort_fatal(AuthorityFatal::InvariantViolation(
+                            "mapping copy referenced a missing description",
+                        ))
+                    })
+                    .capability_lease_refs
+            });
+            *count = count.checked_add(1).unwrap_or_else(|| {
+                abort_fatal(AuthorityFatal::InvariantViolation(
+                    "mapping copy reference overflow",
+                ))
+            });
+        }
+        let attachments: Vec<MappingAttachmentId> = (0..source.len())
+            .map(|_| self.allocate_mapping_attachment())
+            .collect();
+        let revision = self.publish_mutation();
+        for (description, refs) in prepared_refs {
+            let state = self.descriptions.get_mut(&description).unwrap_or_else(|| {
+                abort_fatal(AuthorityFatal::InvariantViolation(
+                    "mapping copy lost its description",
+                ))
+            });
+            state.capability_lease_refs = refs;
+            state.revision = revision;
+        }
+        for (attachment, (description, ranges)) in attachments.iter().copied().zip(source) {
+            self.mapping_attachments.insert(
+                attachment,
+                MappingAttachmentState {
+                    owner,
+                    description,
+                    ranges,
+                },
+            );
+        }
+        Ok(Outcome::MappingAttachmentsCopied {
+            source_owner,
+            owner,
+            attachments,
             revision,
         })
     }

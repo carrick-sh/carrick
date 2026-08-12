@@ -704,6 +704,10 @@ pub(crate) enum Command {
         source: FileTableId,
         owner: ClientIdentity,
     },
+    ForkCopyMappings {
+        source_owner: ClientIdentity,
+        owner: ClientIdentity,
+    },
     ShareTable {
         table: FileTableId,
         owner: ClientIdentity,
@@ -920,6 +924,12 @@ pub(crate) enum Outcome {
         source: FileTableId,
         table: FileTableId,
         generation: ObjectGeneration,
+        revision: Revision,
+    },
+    MappingAttachmentsCopied {
+        source_owner: ClientIdentity,
+        owner: ClientIdentity,
+        attachments: Vec<MappingAttachmentId>,
         revision: Revision,
     },
     TableShared {
