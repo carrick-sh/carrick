@@ -1569,6 +1569,66 @@ fn epoll_duplicate_registration_model(mut harness: Harness) {
 }
 
 #[test]
+fn direct_and_ipc_epoll_rejects_sixth_nesting_level() {
+    for ipc in [false, true] {
+        let mut harness = if ipc {
+            Harness::new_ipc()
+        } else {
+            Harness::new()
+        };
+        let table = harness.create_table();
+        let mut epolls = Vec::new();
+        for minimum in 3..=9 {
+            let epoll = match harness.send(
+                Command::CreateEpollAndInstall {
+                    table,
+                    minimum: fd(minimum),
+                    ceiling: NofileAllocationCeiling::from_captured_soft_limit(16),
+                    descriptor_flags: DescriptorFlags::NONE,
+                },
+                ObjectGeneration::INITIAL,
+            ) {
+                Outcome::EpollCreated { fd, .. } => fd,
+                other => panic!("unexpected epoll create: {other:?}"),
+            };
+            epolls.push(epoll);
+        }
+        for pair in epolls[1..].windows(2).rev() {
+            assert!(matches!(
+                harness.send(
+                    Command::EpollCtlAdd {
+                        table,
+                        epoll_fd: pair[0],
+                        target_fd: pair[1],
+                        registration: EpollRegistration {
+                            events: carrick_abi::LinuxEpollEvents::IN,
+                            data: EpollUserData::default(),
+                        },
+                    },
+                    ObjectGeneration::INITIAL,
+                ),
+                Outcome::EpollInterestAdded { .. }
+            ));
+        }
+        assert!(matches!(
+            harness.send(
+                Command::EpollCtlAdd {
+                    table,
+                    epoll_fd: epolls[0],
+                    target_fd: epolls[1],
+                    registration: EpollRegistration {
+                        events: carrick_abi::LinuxEpollEvents::IN,
+                        data: EpollUserData::default(),
+                    },
+                },
+                ObjectGeneration::INITIAL,
+            ),
+            Outcome::Rejected(AuthorityError::EpollLoop)
+        ));
+    }
+}
+
+#[test]
 fn direct_and_ipc_epoll_allows_duplicate_descriptor_registrations() {
     epoll_duplicate_registration_model(Harness::new());
     epoll_duplicate_registration_model(Harness::new_ipc());

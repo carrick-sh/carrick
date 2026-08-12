@@ -2804,6 +2804,9 @@ impl FileAuthorityCore {
         let Ok(state) = self.epoll_state(current) else {
             return false;
         };
+        // epoll_ctl(2) rejects a resulting nesting depth greater than five.
+        // Reaching the fifth epoll with another outgoing epoll edge means the
+        // proposed ADD would create a sixth level, even when it is acyclic.
         if depth >= 5 {
             return state.target_descriptions().next().is_some();
         }
