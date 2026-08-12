@@ -41,6 +41,7 @@ pub(crate) struct IpcFileAuthority {
 
 struct IpcInner {
     socket: Mutex<UnixDatagram>,
+    process_lock: OwnedFd,
     server: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -63,6 +64,7 @@ impl IpcFileAuthority {
         epoch: AuthorityEpoch,
     ) -> Result<(Self, FileAuthorityBinding), AuthorityFatal> {
         let (client, server) = cloexec_datagram_pair()?;
+        let process_lock = cloexec_process_lock()?;
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             return Err(AuthorityFatal::TransportUnavailable);
@@ -77,6 +79,7 @@ impl IpcFileAuthority {
         let transport = Self {
             inner: Arc::new(IpcInner {
                 socket: Mutex::new(client),
+                process_lock,
                 server: Mutex::new(None),
             }),
         };
@@ -135,6 +138,7 @@ impl IpcFileAuthority {
     #[cfg(test)]
     pub(super) fn for_model_tests(core: FileAuthorityCore) -> Result<Self, AuthorityFatal> {
         let (client, server) = cloexec_datagram_pair()?;
+        let process_lock = cloexec_process_lock()?;
         configure_client(&client)?;
         let server_thread = std::thread::Builder::new()
             .name("carrick-file-authority-model".to_owned())
@@ -143,6 +147,7 @@ impl IpcFileAuthority {
         Ok(Self {
             inner: Arc::new(IpcInner {
                 socket: Mutex::new(client),
+                process_lock,
                 server: Mutex::new(Some(server_thread)),
             }),
         })
@@ -164,6 +169,7 @@ impl FileAuthorityTransport for IpcFileAuthority {
     fn transact(&self, call: AuthorityCall) -> Result<AuthorityReply, AuthorityFatal> {
         let frame = encode_request_with_fd_count(&call.request, call.capabilities.len())?;
         let socket = self.inner.socket.lock();
+        let _process = ProcessTransactionLock::acquire(self.inner.process_lock.as_raw_fd())?;
         send_frame(&socket, &frame, &call.capabilities)?;
         let received = recv_frame(&socket)?;
         let response = decode_response(&call.request, &received.bytes, received.descriptors.len())?;
@@ -177,10 +183,12 @@ impl FileAuthorityTransport for IpcFileAuthority {
 impl Drop for IpcInner {
     fn drop(&mut self) {
         let socket = self.socket.get_mut();
-        // A zero-length private datagram cannot decode as a protocol frame and
-        // wakes the server from recvmsg so its loop terminates before join.
-        let _ = socket.send(&[]);
         if let Some(server) = self.server.get_mut().take() {
+            // The thread-backed model server has no independent process
+            // lifetime, so wake it before join. A production helper exits only
+            // after every inherited peer endpoint closes; one process dropping
+            // its local handle must never terminate authority for its siblings.
+            let _ = socket.send(&[]);
             let _ = server.join();
         }
     }
@@ -211,6 +219,55 @@ fn serve(socket: UnixDatagram, mut core: FileAuthorityCore) {
             break;
         }
     }
+}
+
+struct ProcessTransactionLock {
+    fd: RawFd,
+}
+
+impl ProcessTransactionLock {
+    fn acquire(fd: RawFd) -> Result<Self, AuthorityFatal> {
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        lock.l_type = libc::F_WRLCK as _;
+        lock.l_whence = libc::SEEK_SET as _;
+        let rc = unsafe { libc::fcntl(fd, libc::F_OFD_SETLKW, &lock) };
+        if rc < 0 {
+            return Err(AuthorityFatal::TransportUnavailable);
+        }
+        Ok(Self { fd })
+    }
+}
+
+impl Drop for ProcessTransactionLock {
+    fn drop(&mut self) {
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        lock.l_type = libc::F_UNLCK as _;
+        lock.l_whence = libc::SEEK_SET as _;
+        if unsafe { libc::fcntl(self.fd, libc::F_OFD_SETLK, &lock) } < 0 {
+            std::process::abort();
+        }
+    }
+}
+
+fn cloexec_process_lock() -> Result<OwnedFd, AuthorityFatal> {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        ".carrick-file-authority-lock-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos())
+    ));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|_| AuthorityFatal::TransportUnavailable)?;
+    let _ = std::fs::remove_file(path);
+    let fd: OwnedFd = file.into();
+    set_cloexec(fd.as_raw_fd())?;
+    Ok(fd)
 }
 
 fn configure_client(client: &UnixDatagram) -> Result<(), AuthorityFatal> {

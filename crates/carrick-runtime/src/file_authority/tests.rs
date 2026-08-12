@@ -1712,6 +1712,52 @@ fn client_exit_reclaims_direct_and_ipc_capability_leases() {
 }
 
 #[test]
+fn inherited_helper_endpoint_serializes_cross_process_requests() {
+    let epoch = AuthorityEpoch::for_run(24).expect("epoch");
+    let (transport, binding) =
+        IpcFileAuthority::spawn_per_run(FileAuthorityCore::for_run(epoch), epoch)
+            .expect("spawn per-run helper");
+    let shared = transport.clone();
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0);
+    if child == 0 {
+        let request = Request {
+            epoch,
+            client: binding.client,
+            request_id: RequestId::from_client_sequence(4).expect("request"),
+            expected_generation: binding.generation,
+            command: Command::ListSlots {
+                table: binding.table,
+                after: None,
+                maximum: SlotPageLimit::bounded(1).expect("limit"),
+            },
+        };
+        let ok = shared
+            .execute(request)
+            .is_ok_and(|response| matches!(response.outcome, Outcome::SlotPage { .. }));
+        unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+    }
+    let request = Request {
+        epoch,
+        client: binding.client,
+        request_id: RequestId::from_client_sequence(3).expect("request"),
+        expected_generation: binding.generation,
+        command: Command::ListSlots {
+            table: binding.table,
+            after: None,
+            maximum: SlotPageLimit::bounded(1).expect("limit"),
+        },
+    };
+    assert!(matches!(
+        transport.execute(request).expect("parent request").outcome,
+        Outcome::SlotPage { .. }
+    ));
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(child, &raw mut status, 0) }, child);
+    assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+}
+
+#[test]
 fn per_run_helper_bootstraps_authenticated_root_binding() {
     let epoch = AuthorityEpoch::for_run(23).expect("epoch");
     let (transport, binding) =
