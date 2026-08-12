@@ -309,10 +309,9 @@ pub(crate) struct SeccompSnapshot {
 
 impl SeccompSnapshot {
     pub(crate) fn validate(&self) -> bool {
-        !self
-            .filters
+        self.filters
             .iter()
-            .any(|program| program.is_empty() || program.len() > MAX_FILTER_INSNS)
+            .all(|program| !program.is_empty() && program.len() <= MAX_FILTER_INSNS)
             && filter_path_insns(&self.filters).is_some_and(|total| total <= MAX_FILTER_PATH_INSNS)
     }
 }

@@ -9246,6 +9246,9 @@ mod overlay_dispatch_tests {
             .filter(|syscall| threaded_independent_dispatch_supports(syscall.number))
             .map(|syscall| syscall.number)
             .collect();
+        // Exact equality gates every independent entry, including the
+        // deliberate Process/Deferred exceptions (getpid and futex_waitv),
+        // while the loop below proves every ThreadLocal entry is included.
         assert_eq!(supported, vec![96, 98, 99, 124, 172, 178, 449]);
 
         for syscall in crate::syscall::aarch64_table() {

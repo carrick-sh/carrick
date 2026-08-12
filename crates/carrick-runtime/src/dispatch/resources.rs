@@ -55,6 +55,9 @@ pub(super) fn with_captured_resources<R>(
     context: &crate::kernel::KernelContext,
     operation: impl FnOnce() -> R,
 ) -> R {
+    // Pointer identity is sufficient because the marker exists only for this
+    // dynamic borrow: that KernelContext cannot be dropped or replaced at the
+    // same address until the scope unwinds and Restore clears the marker.
     if ACTIVE_CONTEXT.with(|active| std::ptr::eq(active.get(), context)) {
         return operation();
     }
