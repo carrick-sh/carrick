@@ -238,7 +238,7 @@ The new authority is always on. There is no opt-in flag or compatibility path.
 Structural gate:
 
 ```bash
-rg -n 'host_fork_file_authority_rejection|read_open_files|write_open_files|read_splice_pushback|write_splice_pushback' crates/carrick-runtime/src
+rg -n 'host_fork_file_authority_rejection|read_open_files|write_open_files|lock_splice_pushback|read_splice_pushback|write_splice_pushback' crates/carrick-runtime/src
 rg -n 'Arc<FileTable>|RwLock(Read|Write)Guard.*OpenDescription' crates/carrick-runtime/src/dispatch crates/carrick-runtime/src/kernel
 ```
 
