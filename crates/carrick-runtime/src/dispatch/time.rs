@@ -102,8 +102,7 @@ fn build_itimerspec_ns(spec: TimerSpecNs) -> LinuxItimerspec {
 
 impl SyscallDispatcher {
     pub(crate) fn effective_resource_limit(&self, resource: u64) -> LinuxRlimit {
-        let nofile_soft = self.captured_file_table().nofile_soft();
-        effective_rlimit(resource, nofile_soft, &self.proc.lock().rlimit_overrides)
+        effective_rlimit(resource, &self.proc.lock().rlimit_overrides)
     }
 
     /// A host fork discards the parent's unregistered enforcement pthread.
@@ -122,9 +121,7 @@ impl SyscallDispatcher {
         &self,
     ) -> Result<RlimitCpuChildRearm, std::io::Error> {
         let inherited = self.proc.lock().rlimit_overrides[LINUX_RLIMIT_CPU as usize];
-        let limit = inherited.unwrap_or_else(|| {
-            rlimit_for_resource(LINUX_RLIMIT_CPU, self.captured_file_table().nofile_soft())
-        });
+        let limit = inherited.unwrap_or_else(|| rlimit_for_resource(LINUX_RLIMIT_CPU));
         arm_rlimit_cpu(limit, self.async_signal_wake_owner())
     }
 
@@ -792,8 +789,7 @@ impl SyscallDispatcher {
             if resource >= LINUX_RLIM_NLIMITS {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let nofile_soft = this.captured_file_table().nofile_soft();
-            let limit = effective_rlimit(resource, nofile_soft, &this.proc.lock().rlimit_overrides);
+            let limit = effective_rlimit(resource, &this.proc.lock().rlimit_overrides);
             let memory = &mut *cx.memory;
             if rlimit.0 != 0 && write_kernel_struct_raw(memory, rlimit.0, &limit).is_err() {
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
@@ -836,9 +832,8 @@ impl SyscallDispatcher {
             if resource >= LINUX_RLIM_NLIMITS {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let nofile_soft = this.captured_file_table().nofile_soft();
             // The old (current) limit is reported BEFORE the new one is applied.
-            let old = effective_rlimit(resource, nofile_soft, &this.proc.lock().rlimit_overrides);
+            let old = effective_rlimit(resource, &this.proc.lock().rlimit_overrides);
             if old_limit.0 != 0 && write_kernel_struct_raw(memory, old_limit.0, &old).is_err() {
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
@@ -880,12 +875,13 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::errno(LINUX_EPERM));
                 }
                 if resource == LINUX_RLIMIT_NOFILE {
-                    // Honor the guest raising (or lowering) its fd soft limit,
-                    // clamped to the hard limit we expose. The fd allocator
-                    // (first_free_fd) and dup3's range check read this. RLIM_
-                    // INFINITY soft is clamped to the hard cap.
+                    // Rlimits are process/thread-group state, independent of
+                    // CLONE_FILES. Keep the complete guest limit in the same
+                    // per-process table as every other resource; fd allocation
+                    // reads this authority rather than the descriptor table.
                     let soft = rlim_cur.min(1024 * 1024);
-                    this.captured_file_table().set_nofile_soft(soft);
+                    this.proc.lock().rlimit_overrides[LINUX_RLIMIT_NOFILE as usize] =
+                        Some(LinuxRlimit::new(soft, rlim_max));
                     // Back the guest's fd soft limit with real host descriptors.
                     // Host-backed opens (regular files, /dev/null and other char
                     // devices, sockets, pipes) each consume a native_run fd, so a
@@ -1108,33 +1104,20 @@ pub(crate) fn publish_rlimit_cpu_signal(
     wake_owner.publish_process_signal(signum);
 }
 
-/// The resource limit carrick reports for `getrlimit`/`prlimit64`, honoring any
-/// `setrlimit` override. NOFILE is always derived from `nofile_soft` (so it
-/// stays consistent with the fd allocator), so it is never stored in the
-/// per-resource override table; every other resource returns its stored
-/// override if one was set, else the carrick default.
-fn effective_rlimit(
-    resource: u64,
-    nofile_soft: u64,
-    overrides: &[Option<LinuxRlimit>; 16],
-) -> LinuxRlimit {
-    // RLIMIT_NOFILE's soft cap is authoritative in io.nofile_soft.
-    if resource != LINUX_RLIMIT_NOFILE
-        && let Some(Some(limit)) = overrides.get(resource as usize)
-    {
+/// The resource limit carrick reports for `getrlimit`/`prlimit64`, honoring the
+/// process/thread-group override table independently of descriptor sharing.
+fn effective_rlimit(resource: u64, overrides: &[Option<LinuxRlimit>; 16]) -> LinuxRlimit {
+    if let Some(Some(limit)) = overrides.get(resource as usize) {
         return *limit;
     }
-    rlimit_for_resource(resource, nofile_soft)
+    rlimit_for_resource(resource)
 }
 
-/// The DEFAULT resource limit carrick reports for a resource with no override.
-/// Shared so the old 2-arg and new 4-arg forms agree. `nofile_soft` is threaded
-/// in because RLIMIT_NOFILE's soft cap is dynamic (set via setrlimit).
-fn rlimit_for_resource(resource: u64, nofile_soft: u64) -> LinuxRlimit {
-    // The fd hard cap carrick exposes; mirrors fs::state::NOFILE_HARD (private).
-    const NOFILE_HARD: u64 = 1024 * 1024;
+/// The default resource limit carrick reports for a resource with no override.
+fn rlimit_for_resource(resource: u64) -> LinuxRlimit {
+    const NOFILE_DEFAULT: u64 = 1024 * 1024;
     match resource {
-        LINUX_RLIMIT_NOFILE => LinuxRlimit::new(nofile_soft, NOFILE_HARD),
+        LINUX_RLIMIT_NOFILE => LinuxRlimit::new(NOFILE_DEFAULT, NOFILE_DEFAULT),
         LINUX_RLIMIT_NPROC => LinuxRlimit::new(8192, 8192),
         LINUX_RLIMIT_STACK => {
             // Linux's default 8 MiB soft RLIMIT_STACK, unlimited hard limit.
@@ -1257,8 +1240,10 @@ mod rlimit_tests {
 
     static RLIMIT_CPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     #[test]
-    fn nofile_uses_dynamic_soft_cap() {
-        let r = rlimit_for_resource(7, 2048); // RLIMIT_NOFILE
+    fn nofile_uses_process_override() {
+        let mut overrides = [None; 16];
+        overrides[LINUX_RLIMIT_NOFILE as usize] = Some(LinuxRlimit::new(2048, 1024 * 1024));
+        let r = effective_rlimit(LINUX_RLIMIT_NOFILE, &overrides);
         // `LinuxRlimit` is `#[repr(C, packed)]`, so copy the fields to locals
         // before asserting to avoid taking references to unaligned fields.
         let (cur, max) = (r.rlim_cur, r.rlim_max);
@@ -1267,7 +1252,7 @@ mod rlimit_tests {
     }
     #[test]
     fn unknown_resource_is_infinity() {
-        let r = rlimit_for_resource(99, 1024);
+        let r = rlimit_for_resource(99);
         let cur = r.rlim_cur;
         assert_eq!(cur, LINUX_RLIM_INFINITY);
     }

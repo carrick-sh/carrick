@@ -437,6 +437,11 @@ where
                     .dispatcher
                     .close_draining_file_table(committed_context.kernel(), &old_files);
                 self.linux_tid = committed_context.thread().key().tid;
+                // The common run-loop signal boundary must consume the exact
+                // replacement generation, never the pre-exec context retained
+                // at syscall entry. A failed exec leaves that entry context in
+                // place; only a committed image replacement publishes here.
+                self.service_kernel_context = Some(committed_context.retain_exact());
                 emit_runtime_stage(
                     carrick_observability::probes::HvpatchExecRuntimeStagePhase::EngineReplace,
                     engine_replace_started,

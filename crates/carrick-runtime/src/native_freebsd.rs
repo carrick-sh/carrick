@@ -4296,6 +4296,9 @@ mod executable_epoch_tests {
                 |_| {},
             )
             .expect("proc holder released and parked");
+        let inherited_context = dispatcher
+            .capture_one_task_context()
+            .expect("capture inherited fork context");
         let signal_locks = crate::host_signal::try_hold_signal_locks_for_fork_until(
             std::time::Instant::now() + Duration::from_secs(1),
         )
@@ -4313,7 +4316,7 @@ mod executable_epoch_tests {
             let _fresh_registration = fresh
                 .register_current()
                 .unwrap_or_else(|_| unsafe { libc::_exit(121) });
-            native_after_fork_child(&dispatcher);
+            native_after_fork_child(&dispatcher, &inherited_context);
             unsafe { libc::_exit(0) };
         }
         drop(host_fork);
@@ -4408,7 +4411,11 @@ mod executable_epoch_tests {
                 child_kicker as Arc<dyn carrick_hal::VcpuRegistry>,
                 child_tid,
             );
-            native_after_fork_child(&SyscallDispatcher::new());
+            let dispatcher = SyscallDispatcher::new();
+            let inherited_context = dispatcher
+                .capture_one_task_context()
+                .expect("capture inherited fork context");
+            native_after_fork_child(&dispatcher, &inherited_context);
             unsafe { libc::_exit(0) };
         }
         drop(host_fork);
@@ -8294,14 +8301,17 @@ fn fork_child_rebuild(parent: &Arc<SharedRun>) -> Result<Arc<SharedRun>, String>
 /// itimers/membarrier registration (`procprctlview`, `childsubreaper`,
 /// `forkaltstack`, `forkexecpthread`); `mem`/`sysv`/`epoll` drop inherited
 /// mm/SysV/epoll fork state.
-fn native_after_fork_child(dispatcher: &SyscallDispatcher) {
+fn native_after_fork_child(
+    dispatcher: &SyscallDispatcher,
+    inherited_context: &crate::kernel::KernelContext,
+) {
     // FreeBSD-only lane-specific step, kept inline (Task 5 Step 1: this has
     // no Darwin equivalent at all — Darwin's child-exit-watch mechanism is
     // an entirely different poll over `child_watch::tracked_pids()`, not
     // part of the shared fork-child reset). Clear this lane's SIGCHLD
     // dirty-flag before the shared reset, matching the previous ordering.
     NATIVE_CHILD_EXIT_DIRTY.store(false, std::sync::atomic::Ordering::Release);
-    crate::native::fork_child::dispatcher_after_fork_child(dispatcher);
+    crate::native::fork_child::dispatcher_after_fork_child(dispatcher, inherited_context);
 }
 
 /// Run a static x86_64 Linux ELF natively on FreeBSD/amd64 through the shared
@@ -9885,13 +9895,13 @@ fn run_x86_thread(
                             Ok(child) => {
                                 active = child;
                                 tid = active.registry.main_tid();
-                                linux_tid = match active
+                                let child_context = match active
                                     .dispatcher
                                     .reset_one_task_kernel_binding_for_current_process(
                                         &parent_context,
                                         tid,
                                     ) {
-                                    Ok(context) => context.thread().key().tid,
+                                    Ok(context) => context,
                                     Err(error) => {
                                         fault_detail = Some(format!(
                                             "fork child: rebind one-task Kernel context: {error}"
@@ -9899,7 +9909,7 @@ fn run_x86_thread(
                                         break;
                                     }
                                 };
-                                drop(parent_context);
+                                linux_tid = child_context.thread().key().tid;
                                 identity_stamp = native_x86_identity_stamp(&active, tid);
                                 host_registration.rebind_after_fork(&active, tid);
                                 if let Err(error) = executable_registration
@@ -9944,7 +9954,8 @@ fn run_x86_thread(
                                 // subreaper-ancestor / itimers / membarrier and
                                 // the empty pending-signal set, so the child does
                                 // not observe the parent's inherited proc state.
-                                native_after_fork_child(&active.dispatcher);
+                                native_after_fork_child(&active.dispatcher, &parent_context);
+                                drop(parent_context);
                                 // Re-key the forking thread's own signal state to
                                 // the child's new main tid (fork inherits the
                                 // sigaltstack + blocked mask per POSIX), after

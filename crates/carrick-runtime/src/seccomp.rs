@@ -69,6 +69,7 @@
 //! is exact; see the `tests` module for the canonical libseccomp shape.
 
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 // Linux AUDIT_ARCH for the guest. Filters compare seccomp_data.arch against
@@ -97,7 +98,7 @@ pub(crate) const SECCOMP_SET_MODE_STRICT: u32 = 0;
 pub(crate) const SECCOMP_SET_MODE_FILTER: u32 = 1;
 
 /// A cBPF instruction (`struct sock_filter`), 8 bytes on the wire.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SockFilter {
     pub(crate) code: u16,
     pub(crate) jt: u8,
@@ -274,13 +275,38 @@ fn load_operand(ins: &SockFilter, data: &SeccompData) -> u32 {
     }
 }
 
+const MAX_FILTER_INSNS: usize = 4096;
+const MAX_FILTER_PATH_INSNS: usize = 32_768;
+
+/// Complete guest-installed seccomp state retained across native host
+/// self-reexec. The launch-time container policy remains a separate host
+/// boundary; this snapshot is only the irreversible Linux process state.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SeccompSnapshot {
+    filters: Vec<Vec<SockFilter>>,
+    strict: bool,
+}
+
+impl SeccompSnapshot {
+    pub(crate) fn validate(&self) -> bool {
+        !self
+            .filters
+            .iter()
+            .any(|program| program.is_empty() || program.len() > MAX_FILTER_INSNS)
+            && self
+                .filters
+                .iter()
+                .try_fold(0usize, |total, program| total.checked_add(program.len()))
+                .is_some_and(|total| total <= MAX_FILTER_PATH_INSNS)
+    }
+}
+
 /// Per-process installed seccomp filters. Filters stack (each `seccomp` /
 /// `prctl(PR_SET_SECCOMP)` call adds one); a syscall is checked against all of
 /// them and the most restrictive action wins.
 #[derive(Debug)]
 pub(crate) struct SeccompState {
-    filters: Mutex<Vec<Vec<SockFilter>>>,
-    strict: Mutex<bool>,
+    programs: Mutex<SeccompSnapshot>,
     /// Live JIT gate: 1 only while no guest-installed filter exists. Emitted
     /// identity code reads this aligned atomic word directly with acquire-safe
     /// x86 load semantics, so a sibling's seccomp install disables every active
@@ -291,36 +317,48 @@ pub(crate) struct SeccompState {
 impl Default for SeccompState {
     fn default() -> Self {
         Self {
-            filters: Mutex::new(Vec::new()),
-            strict: Mutex::new(false),
+            programs: Mutex::new(SeccompSnapshot::default()),
             identity_fast_path_allowed: AtomicU32::new(1),
         }
     }
 }
 
 impl SeccompState {
+    pub(crate) fn snapshot(&self) -> SeccompSnapshot {
+        self.programs.lock().clone()
+    }
+
+    pub(crate) fn restore(&self, snapshot: &SeccompSnapshot) -> Result<(), &'static str> {
+        if !snapshot.validate() {
+            return Err("invalid seccomp snapshot");
+        }
+        let active = snapshot.strict || !snapshot.filters.is_empty();
+        *self.programs.lock() = snapshot.clone();
+        self.identity_fast_path_allowed
+            .store(u32::from(!active), Ordering::Release);
+        Ok(())
+    }
+
     pub(crate) fn fork_clone(&self) -> Self {
-        let filters = self.filters.lock().clone();
-        let strict = *self.strict.lock();
-        let active = strict || !filters.is_empty();
+        let programs = self.snapshot();
+        let active = programs.strict || !programs.filters.is_empty();
         Self {
-            filters: Mutex::new(filters),
-            strict: Mutex::new(strict),
+            programs: Mutex::new(programs),
             identity_fast_path_allowed: AtomicU32::new(u32::from(!active)),
         }
     }
 
     /// Install a parsed filter program (appended to the stack).
     pub(crate) fn install(&self, prog: Vec<SockFilter>) {
-        let mut filters = self.filters.lock();
+        let mut programs = self.programs.lock();
         self.identity_fast_path_allowed.store(0, Ordering::Release);
-        filters.push(prog);
+        programs.filters.push(prog);
     }
 
     pub(crate) fn install_strict(&self) {
-        let mut strict = self.strict.lock();
+        let mut programs = self.programs.lock();
         self.identity_fast_path_allowed.store(0, Ordering::Release);
-        *strict = true;
+        programs.strict = true;
     }
 
     pub(crate) fn identity_fast_path_word(&self) -> &AtomicU32 {
@@ -328,18 +366,19 @@ impl SeccompState {
     }
 
     pub(crate) fn is_active(&self) -> bool {
-        *self.strict.lock() || !self.filters.lock().is_empty()
+        let programs = self.programs.lock();
+        programs.strict || !programs.filters.is_empty()
     }
 
     /// Evaluate all installed filters against `data` and return the winning
     /// (most restrictive) cBPF value, or `SECCOMP_RET_ALLOW` if none installed.
     pub(crate) fn check(&self, data: &SeccompData) -> u32 {
         let mut result = SECCOMP_RET_ALLOW;
-        if *self.strict.lock() && !strict_mode_allows(data) {
+        let programs = self.programs.lock();
+        if programs.strict && !strict_mode_allows(data) {
             result = SECCOMP_RET_KILL_PROCESS;
         }
-        let filters = self.filters.lock();
-        for prog in filters.iter() {
+        for prog in &programs.filters {
             let ret = eval_filter(prog, data);
             if action_severity(ret) < action_severity(result) {
                 result = ret;
@@ -601,6 +640,20 @@ mod tests {
             SECCOMP_RET_ERRNO
         );
         assert_eq!(state.check(&data_for(63)), SECCOMP_RET_ALLOW);
+
+        let snapshot = state.snapshot();
+        assert!(snapshot.validate());
+        let restored = SeccompState::default();
+        restored.restore(&snapshot).expect("restore seccomp state");
+        assert_eq!(restored.snapshot(), snapshot);
+        assert_eq!(
+            restored.check(&data_for(101)) & SECCOMP_RET_ACTION_FULL,
+            SECCOMP_RET_ERRNO
+        );
+        assert_eq!(
+            restored.identity_fast_path_word().load(Ordering::Acquire),
+            0
+        );
     }
 
     #[test]

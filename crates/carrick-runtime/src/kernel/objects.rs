@@ -783,7 +783,6 @@ pub(super) struct FileTableStateSnapshot {
     pub(super) closed_stdio: [bool; 3],
     pub(super) fd_open_paths: Vec<(FileSlotNumber, String)>,
     pub(super) splice_pushback_description_ids: Vec<FileDescriptionId>,
-    pub(super) nofile_soft: u64,
     pub(super) epoll_fds: Vec<FileSlotNumber>,
 }
 
@@ -933,7 +932,6 @@ pub struct FileTable {
     closed_stdio: Mutex<[bool; 3]>,
     fd_open_paths: RwLock<HashMap<i32, String>>,
     splice_pushback: Mutex<HashMap<FileDescriptionId, Arc<Mutex<crate::dispatch::SplicePushback>>>>,
-    nofile_soft: AtomicU64,
     epoll_fds: RwLock<BTreeSet<i32>>,
     epoll_wake_registry: crate::dispatch::EpollWakeRegistry,
     functional_gate: Arc<FileTableFunctionalGate>,
@@ -951,7 +949,6 @@ impl FileTable {
             closed_stdio: Mutex::new([false; 3]),
             fd_open_paths: RwLock::new(HashMap::new()),
             splice_pushback: Mutex::new(HashMap::new()),
-            nofile_soft: AtomicU64::new(1024 * 1024),
             epoll_fds: RwLock::new(BTreeSet::new()),
             epoll_wake_registry: crate::dispatch::new_epoll_wake_registry(),
             functional_gate: Arc::new(FileTableFunctionalGate::new()),
@@ -979,7 +976,6 @@ impl FileTable {
             closed_stdio: Mutex::new(*parent.closed_stdio.lock()),
             fd_open_paths: RwLock::new(parent.fd_open_paths.read().clone()),
             splice_pushback: Mutex::new(parent.splice_pushback.lock().clone()),
-            nofile_soft: AtomicU64::new(parent.nofile_soft.load(Ordering::Relaxed)),
             epoll_fds: RwLock::new(parent.epoll_fds.read().clone()),
             epoll_wake_registry,
             functional_gate: Arc::new(FileTableFunctionalGate::new()),
@@ -1047,7 +1043,6 @@ impl FileTable {
             closed_stdio: Mutex::new(closed_stdio),
             fd_open_paths: RwLock::new(fd_open_paths),
             splice_pushback: Mutex::new(splice_pushback),
-            nofile_soft: AtomicU64::new(caller.nofile_soft.load(Ordering::Relaxed)),
             epoll_fds: RwLock::new(epoll_fds),
             epoll_wake_registry,
             functional_gate: Arc::new(FileTableFunctionalGate::new()),
@@ -1131,16 +1126,6 @@ impl FileTable {
 
     pub(crate) fn has_splice_pushback(&self) -> bool {
         !self.splice_pushback.lock().is_empty()
-    }
-
-    pub(crate) fn nofile_soft(&self) -> u64 {
-        self.nofile_soft.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn set_nofile_soft(&self, value: u64) {
-        let _mutation = self.mutation_lease();
-        self.nofile_soft.store(value, Ordering::Relaxed);
-        self.revision.publish();
     }
 
     pub(crate) fn read_epoll_fds(&self) -> RwLockReadGuard<'_, BTreeSet<i32>> {
@@ -1254,7 +1239,6 @@ impl FileTable {
             closed_stdio,
             fd_open_paths: paths,
             splice_pushback_description_ids,
-            nofile_soft: self.nofile_soft(),
             epoll_fds: sorted_numbers(epoll_fds.iter().copied().collect())?,
         })
     }
@@ -1635,10 +1619,12 @@ impl PendingQueue {
             );
             std::process::abort();
         }
+        let already_pending = self.present.contains(signal.raw());
         self.present = self.present.with(signal.raw());
-        if let Some(siginfo) = siginfo {
-            // Standard signals coalesce, but the existing Carrick/Linux-facing
-            // contract retains the most recently supplied queued payload.
+        if !already_pending && let Some(siginfo) = siginfo {
+            // Standard signals coalesce into the first pending instance. Later
+            // generations neither add nor replace siginfo until that instance
+            // is dequeued.
             self.standard_siginfos.insert(signal, siginfo);
         }
         self.assert_invariants();
@@ -1950,7 +1936,7 @@ impl ThreadSignalState {
         }
     }
 
-    fn for_fork(caller: &Self) -> Self {
+    pub(crate) fn for_fork(caller: &Self) -> Self {
         Self {
             blocked: caller.blocked,
             pending: PendingQueue::default(),
@@ -3324,13 +3310,13 @@ mod tests {
         let standard = LinuxSignal::for_signal_number(10).expect("standard signal");
         let realtime = LinuxSignal::for_signal_number(34).expect("realtime signal");
         let first_standard = siginfo(standard, 1);
-        let latest_standard = siginfo(standard, 2);
+        let coalesced_standard = siginfo(standard, 2);
         let first_rt = siginfo(realtime, 3);
         let second_rt = siginfo(realtime, 4);
         let mut queue = PendingQueue::default();
 
         queue.enqueue_standard(standard, Some(first_standard));
-        queue.enqueue_standard(standard, Some(latest_standard));
+        queue.enqueue_standard(standard, Some(coalesced_standard));
         queue.enqueue_realtime(realtime, Some(first_rt));
         queue.enqueue_realtime(realtime, Some(second_rt));
 
@@ -3339,7 +3325,7 @@ mod tests {
             queue.take_lowest_in(SigSet::from_raw(u64::MAX)),
             Some(PendingSignal {
                 signal: standard,
-                siginfo: Some(latest_standard),
+                siginfo: Some(first_standard),
             })
         );
         assert_eq!(
@@ -3689,7 +3675,7 @@ mod tests {
         let mutating = Arc::clone(&table);
         let worker = std::thread::spawn(move || {
             started_tx.send(()).expect("mutation started");
-            mutating.set_nofile_soft(4096);
+            *mutating.lock_next_fd() = 4096;
             done_tx.send(()).expect("mutation complete");
         });
 
@@ -3701,7 +3687,7 @@ mod tests {
         drop(freeze);
         done_rx.recv().expect("mutation released");
         worker.join().expect("mutation worker");
-        assert_eq!(table.nofile_soft(), 4096);
+        assert_eq!(*table.lock_next_fd(), 4096);
     }
 
     #[test]

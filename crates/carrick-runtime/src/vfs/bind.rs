@@ -58,9 +58,16 @@ impl BindVfs {
         host_path: impl Into<PathBuf>,
         readonly: bool,
     ) -> Self {
+        let host_path = host_path.into();
+        // Bind authority is fixed at mount creation. A relative source must
+        // not be reinterpreted against a later host cwd (notably after native
+        // self-reexec), and the authenticated capsule accepts only absolute
+        // host paths. Preserve a failing path verbatim so ordinary VFS access
+        // reports its real host error; capsule validation then fails closed.
+        let host_path = std::path::absolute(&host_path).unwrap_or(host_path);
         Self {
             mount_point: mount_point.into(),
-            host_path: host_path.into(),
+            host_path,
             readonly,
         }
     }
@@ -826,6 +833,14 @@ mod tests {
         assert_eq!(vfs.rmdir("/workspace"), Err(LINUX_EROFS));
         assert_eq!(vfs.unlink("/workspace/x"), Err(LINUX_EROFS));
         let _ = std::fs::remove_dir_all(&src);
+    }
+
+    #[test]
+    fn relative_host_source_is_frozen_as_absolute_authority() {
+        let vfs = BindVfs::new("/workspace", ".", true);
+        let snapshot = vfs.native_reexec_bind_mount().expect("bind snapshot");
+        assert!(snapshot.host_path.is_absolute());
+        assert_eq!(snapshot.mount_point, "/workspace");
     }
 
     #[test]

@@ -6403,6 +6403,28 @@ impl SyscallDispatcher {
                         // Report only file STATUS flags; creation-only flags are
                         // consumed by open() and must not be reported. (audit M8)
                         let mut flags = reportable_status_flags(open.status_flags());
+                        // A regular host file's open-description flags are
+                        // already fork-coherent in the host kernel. Overlay the
+                        // mutable bits from that authority so a parent's
+                        // F_GETFL observes a child's F_SETFL after real host
+                        // fork even though the Rust description shell is COW.
+                        if let OpenDescription::HostFile { host_fd, .. } = &*open {
+                            let host_flags = match (unsafe {
+                                libc::fcntl(host_fd.raw(), libc::F_GETFL, 0)
+                            })
+                            .host_syscall_errno()
+                            {
+                                Ok(value) => value,
+                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                            };
+                            flags &= !(LINUX_O_APPEND | LINUX_O_NONBLOCK);
+                            if host_flags & libc::O_APPEND != 0 {
+                                flags |= LINUX_O_APPEND;
+                            }
+                            if host_flags & libc::O_NONBLOCK != 0 {
+                                flags |= LINUX_O_NONBLOCK;
+                            }
+                        }
                         // A pty end is bidirectional (opened O_RDWR); report the
                         // O_RDWR access mode rather than the default O_RDONLY (0),
                         // so libc/readline see a read-write terminal.
@@ -6478,16 +6500,43 @@ impl SyscallDispatcher {
                     let open = open_file.description.read();
                     let next_flags =
                         (open.status_flags() & LINUX_O_ACCMODE) | (arg & LINUX_F_SETFL_MUTABLE);
-                    // Host-backed descriptors stay O_NONBLOCK independent of
-                    // the Linux-visible status flag. Without this invariant,
-                    // clearing guest O_NONBLOCK would let a later read/write
-                    // block under dispatcher locks.
-                    if let Some(host_fd) = match &*open {
+                    // Regular host files delegate O_APPEND/O_NONBLOCK to the
+                    // shared host open description, which is the only mutable
+                    // state that remains coherent across a real host fork.
+                    // Pipes/sockets stay host-nonblocking regardless of their
+                    // Linux-visible flag so dispatcher operations cannot block
+                    // while holding runtime locks.
+                    match &*open {
+                        OpenDescription::HostFile { host_fd, .. } => {
+                            let current = match (unsafe {
+                                libc::fcntl(host_fd.raw(), libc::F_GETFL, 0)
+                            })
+                            .host_syscall_errno()
+                            {
+                                Ok(value) => value,
+                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                            };
+                            let mut next = current & !(libc::O_APPEND | libc::O_NONBLOCK);
+                            if next_flags & LINUX_O_APPEND != 0 {
+                                next |= libc::O_APPEND;
+                            }
+                            if next_flags & LINUX_O_NONBLOCK != 0 {
+                                next |= libc::O_NONBLOCK;
+                            }
+                            if next != current
+                                && let Err(errno) = (unsafe {
+                                    libc::fcntl(host_fd.raw(), libc::F_SETFL, next)
+                                })
+                                .host_syscall_errno()
+                            {
+                                return Ok(DispatchOutcome::errno(errno));
+                            }
+                        }
                         OpenDescription::HostPipe { host_fd, .. }
-                        | OpenDescription::HostSocket { host_fd, .. } => Some(host_fd.raw()),
-                        _ => None,
-                    } {
-                        crate::dispatch::net::set_host_nonblocking(host_fd);
+                        | OpenDescription::HostSocket { host_fd, .. } => {
+                            crate::dispatch::net::set_host_nonblocking(host_fd.raw());
+                        }
+                        _ => {}
                     }
                     drop(open);
                     open_file.description.write().set_status_flags(next_flags);

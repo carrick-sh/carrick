@@ -33,8 +33,8 @@ impl SyscallDispatcher {
         closed_stdio: &[bool; 3],
         limit: i32,
     ) -> Option<i32> {
-        // Cap at the guest's soft RLIMIT_NOFILE (`limit`, from io.nofile_soft;
-        // default 1024, raisable via setrlimit): descriptors run 0..limit, so
+        // Cap at the guest process's soft RLIMIT_NOFILE (`limit`): descriptors
+        // run 0..limit, so
         // the first free slot at or above it means the table is full. `None` =>
         // the caller returns EMFILE, matching Linux fd exhaustion.
         let mut fd = min_fd.max(0);
@@ -53,8 +53,8 @@ impl SyscallDispatcher {
 
     /// The guest's current soft RLIMIT_NOFILE as an i32 fd ceiling.
     pub(in crate::dispatch) fn nofile_limit(&self) -> i32 {
-        self.captured_file_table()
-            .nofile_soft()
+        self.effective_resource_limit(crate::linux_abi::LINUX_RLIMIT_NOFILE)
+            .rlim_cur
             .min(i32::MAX as u64) as i32
     }
 

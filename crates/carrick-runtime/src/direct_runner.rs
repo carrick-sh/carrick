@@ -3050,7 +3050,10 @@ impl DirectRunner {
             NATIVE_FORKED_GUEST_CHILD.store(true, Ordering::Release);
             self.forked_child.store(true, Ordering::Release);
             crate::probes::host_process_birth_current();
-            crate::native::fork_child::dispatcher_after_fork_child(&self.dispatcher);
+            crate::native::fork_child::dispatcher_after_fork_child(
+                &self.dispatcher,
+                parent_context,
+            );
             self.reset_after_fork_child(parent_context);
             crate::guest_cpu::reset();
             crate::guest_cpu::complete_child_record_post_fork_child();

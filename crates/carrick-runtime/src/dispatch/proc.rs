@@ -640,10 +640,9 @@ pub(super) struct ProcState {
     /// child a default equal to the parent's current slack at fork time.
     pub timerslack_default: u64,
     /// Per-resource `setrlimit`/`prlimit64` overrides, indexed by the Linux
-    /// resource number (0..16). `None` = use the carrick default from
-    /// `rlimit_for_resource`. RLIMIT_NOFILE is NOT stored here — its soft cap is
-    /// authoritative in `io.nofile_soft` (the fd allocator reads it); every other
-    /// resource round-trips through this table so a set is read back by get.
+    /// resource number (0..16). `None` uses the Carrick default from
+    /// `rlimit_for_resource`. This process/thread-group authority is independent
+    /// of CLONE_FILES; the fd allocator reads RLIMIT_NOFILE from the same table.
     pub rlimit_overrides: [Option<crate::linux_abi::LinuxRlimit>; 16],
     /// Host pid of the ROOT guest process, captured at construction — before
     /// any guest `fork(2)`. Carrick forks each guest process as a real host

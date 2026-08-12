@@ -158,7 +158,6 @@ pub struct FileTableSnapshotRow {
     pub stdio_cloexec: [bool; 3],
     pub closed_stdio: [bool; 3],
     pub splice_pushback_description_ids: Vec<FileDescriptionId>,
-    pub nofile_soft: u64,
     pub epoll_index_fds: Vec<FileSlotNumber>,
 }
 
@@ -587,7 +586,6 @@ impl Kernel {
                 stdio_cloexec: observed.stdio_cloexec,
                 closed_stdio: observed.closed_stdio,
                 splice_pushback_description_ids: observed.splice_pushback_description_ids,
-                nofile_soft: observed.nofile_soft,
                 epoll_index_fds: observed.epoll_fds,
             });
             for (number, slot) in observed.slots {

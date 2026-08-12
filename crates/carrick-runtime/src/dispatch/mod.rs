@@ -2611,7 +2611,18 @@ mod kernel_context_tests {
             .files()
             .write_fd_open_paths()
             .insert(inherited_fd, "/inherited/file".to_owned());
-        original.resources().files().set_nofile_soft(4096);
+        original
+            .thread()
+            .replace_signal_state(crate::kernel::ThreadSignalState::new(
+                carrick_abi::SigSet::EMPTY.with(2),
+                carrick_abi::SigSet::EMPTY.with(3),
+                true,
+                1,
+            ));
+        original.shared().pending_signals().enqueue_standard(
+            crate::kernel::LinuxSignal::for_signal_number(4).expect("task signal"),
+            None,
+        );
         let original = original
             .kernel()
             .update_credentials(&original, |credentials| {
@@ -2632,6 +2643,7 @@ mod kernel_context_tests {
             .expect("rebind one-task authority");
         let credentials = rebound.resources().credentials();
         let rebound_files = rebound.resources().files();
+        let rebound_signals = rebound.thread().signal_state();
 
         assert!(!Arc::ptr_eq(&old_kernel, rebound.kernel()));
         assert!(!Arc::ptr_eq(&original.resources().files(), &rebound_files));
@@ -2649,7 +2661,14 @@ mod kernel_context_tests {
                 .map(String::as_str),
             Some("/inherited/file")
         );
-        assert_eq!(rebound_files.nofile_soft(), 4096);
+        assert_eq!(
+            rebound_signals.blocked(),
+            carrick_abi::SigSet::EMPTY.with(2)
+        );
+        assert_eq!(rebound_signals.pending(), carrick_abi::SigSet::EMPTY);
+        assert!(rebound_signals.altstack_enabled());
+        assert_eq!(rebound_signals.handler_frame_depth(), 1);
+        assert_eq!(rebound.shared().pending_signals().pending_count(), 0);
         let post_fork_description =
             kernel_file_description(Arc::new(RwLock::new(OpenDescription::SyntheticFile {
                 base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
@@ -2845,6 +2864,7 @@ impl SyscallDispatcher {
         let inherited_fs_context = inherited.resources().fs_context();
         let inherited_files = inherited.resources().files();
         let inherited_mm = inherited.shared().mm();
+        let inherited_signal_state = inherited.thread().signal_state();
         let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
             observed_pid,
             registry_id,
@@ -2872,6 +2892,15 @@ impl SyscallDispatcher {
             .shared()
             .sighand()
             .replace_actions(inherited.shared().sighand().actions());
+        // A host fork copies only the calling thread. Preserve its blocked
+        // mask, altstack and active handler-frame restoration state while
+        // clearing both task- and thread-directed pending signals, exactly as
+        // `Kernel::reserve_fork` does for an in-process child.
+        context
+            .thread()
+            .replace_signal_state(crate::kernel::ThreadSignalState::for_fork(
+                &inherited_signal_state,
+            ));
         *self.kernel_binding.write() = context.task_binding();
         self.publish_external_credential_projection(&context, &context.resources().credentials());
         Ok(context)
@@ -3266,9 +3295,9 @@ impl SyscallDispatcher {
         notify_inmem_epoll(self.captured_file_table().epoll_wake_registry());
     }
 
-    pub(crate) fn epoll_after_fork_child(&self) {
+    pub(crate) fn epoll_after_fork_child(&self, context: &crate::kernel::KernelContext) {
         reset_epoll_wake_registry_after_fork_child(
-            self.captured_file_table().epoll_wake_registry(),
+            context.resources().files().epoll_wake_registry(),
         );
     }
 
@@ -3802,9 +3831,8 @@ impl SyscallDispatcher {
     ) -> crate::native_exec_capsule::NativeReexecProcessStateV1 {
         let credentials = self.credentials_from_context(context);
         let thread_signal = context.thread().signal_state();
-        let rlimit_overrides = self
-            .proc
-            .lock()
+        let process = self.proc.lock();
+        let rlimit_overrides = process
             .rlimit_overrides
             .iter()
             .map(|limit| {
@@ -3814,6 +3842,8 @@ impl SyscallDispatcher {
                 })
             })
             .collect();
+        let no_new_privs = process.no_new_privs;
+        drop(process);
         crate::native_exec_capsule::NativeReexecProcessStateV1 {
             credentials: crate::native_exec_capsule::NativeReexecCredentialsV1 {
                 ruid: credentials.ruid,
@@ -3877,13 +3907,14 @@ impl SyscallDispatcher {
                     },
                 )
                 .collect(),
-            nofile_soft: context.resources().files().nofile_soft(),
             rlimit_overrides,
             seccomp_policy: if self.container_policy.is_some() {
                 carrick_spec::SeccompPolicy::ContainerDefault
             } else {
                 carrick_spec::SeccompPolicy::Unconfined
             },
+            seccomp_state: self.seccomp.snapshot(),
+            no_new_privs,
             ptrace_traceme: self.is_ptrace_traceme(),
         }
     }
@@ -3897,6 +3928,12 @@ impl SyscallDispatcher {
         // These affect the very next syscall/exec boundary, so restore them
         // before any other reconstructed process state can be observed.
         self.apply_seccomp_policy(state.seccomp_policy);
+        self.seccomp
+            .restore(&state.seccomp_state)
+            .unwrap_or_else(|error| {
+                tracing::error!(error, "restore native reexec seccomp authority");
+                std::process::abort();
+            });
         let credentials = state.credentials;
         let restored_context = context
             .kernel()
@@ -3922,11 +3959,8 @@ impl SyscallDispatcher {
                 tracing::error!(%error, "restore native reexec Kernel credentials");
                 std::process::abort();
             });
-        restored_context
-            .resources()
-            .files()
-            .set_nofile_soft(state.nofile_soft);
         let mut process = self.proc.lock();
+        process.no_new_privs = state.no_new_privs;
         process.ptrace_traceme = state.ptrace_traceme;
         for (slot, limit) in process
             .rlimit_overrides
@@ -12515,7 +12549,6 @@ mod native_reexec_fd_tests {
                     ),
                 },
             ],
-            nofile_soft: 1024,
             rlimit_overrides: (0..16)
                 .map(|index| {
                     (index == 3).then_some(crate::native_exec_capsule::NativeReexecRlimitV1 {
@@ -12525,6 +12558,17 @@ mod native_reexec_fd_tests {
                 })
                 .collect(),
             seccomp_policy: carrick_spec::SeccompPolicy::ContainerDefault,
+            seccomp_state: {
+                let seccomp = crate::seccomp::SeccompState::default();
+                seccomp.install(vec![crate::seccomp::SockFilter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: crate::seccomp::SECCOMP_RET_ERRNO | 1,
+                }]);
+                seccomp.snapshot()
+            },
+            no_new_privs: true,
             ptrace_traceme: true,
         };
         let mut resumed = SyscallDispatcher::new();

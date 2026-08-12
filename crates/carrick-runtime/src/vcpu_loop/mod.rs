@@ -2616,17 +2616,6 @@ where
         }
     }
 
-    fn take_service_kernel_context(
-        &mut self,
-        operation: &'static str,
-    ) -> Result<crate::kernel::KernelContext, RuntimeError> {
-        self.service_kernel_context.take().ok_or_else(|| {
-            RuntimeError::Configuration(format!(
-                "{operation} outcome lost its captured Kernel context"
-            ))
-        })
-    }
-
     pub(super) fn complete_returned(
         &self,
         engine: &mut E,
@@ -3274,7 +3263,15 @@ where
                     child_tid_addr,
                     clear_child_tid_addr,
                 } => {
-                    let kernel_context = state.take_service_kernel_context("clone-thread")?;
+                    let kernel_context = state
+                        .service_kernel_context
+                        .as_ref()
+                        .ok_or_else(|| {
+                            RuntimeError::Configuration(
+                                "clone-thread lost its exact Kernel context".to_owned(),
+                            )
+                        })?
+                        .retain_exact();
                     let tid = state.spawn_clone_thread(
                         &kernel,
                         &kernel_context,
@@ -3307,7 +3304,15 @@ where
                 }
                 DispatchOutcome::Execve { path, argv, env } => {
                     crate::event_ring::rec(crate::event_ring::EXEC, 1, 0, 0);
-                    let kernel_context = state.take_service_kernel_context("execve")?;
+                    let kernel_context = state
+                        .service_kernel_context
+                        .as_ref()
+                        .ok_or_else(|| {
+                            RuntimeError::Configuration(
+                                "execve lost its exact Kernel context".to_owned(),
+                            )
+                        })?
+                        .retain_exact();
                     state.handle_execve(&kernel, &kernel_context, &mut engine, path, argv, env)?;
                 }
                 DispatchOutcome::SigReturn => {
@@ -3357,7 +3362,15 @@ where
                     child_stack,
                     vfork,
                 } => {
-                    let kernel_context = state.take_service_kernel_context("fork")?;
+                    let kernel_context = state
+                        .service_kernel_context
+                        .as_ref()
+                        .ok_or_else(|| {
+                            RuntimeError::Configuration(
+                                "fork lost its exact Kernel context".to_owned(),
+                            )
+                        })?
+                        .retain_exact();
                     match state.handle_fork(
                         &kernel,
                         &kernel_context,
