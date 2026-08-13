@@ -6438,10 +6438,35 @@ impl SyscallDispatcher {
                                 Ok(value) => value,
                                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                             };
-                            flags &= !(LINUX_O_APPEND | LINUX_O_NONBLOCK);
-                            if host_flags & libc::O_APPEND != 0 {
-                                flags |= LINUX_O_APPEND;
+                            // The host fd is only a truthful authority for a
+                            // flag it actually carries. Carrick never opens an
+                            // overlay/scratch host file with O_APPEND — the
+                            // backend's `open_raw_fd` has no append parameter —
+                            // so trusting the host bit unconditionally REPORTED
+                            // O_APPEND AS ABSENT for every guest that opened
+                            // with it, and the guest then wrote that answer
+                            // back via the standard F_SETFL read-modify-write,
+                            // destroying the flag for good. Go does exactly
+                            // that in `syscall.SetNonblock`, which `os.OpenFile`
+                            // runs on every file, and `cmd/go` opens archives
+                            // with `O_WRONLY|O_APPEND`: the append branch in
+                            // `write` then went dead and the member header
+                            // landed at offset 0, corrupting the archive.
+                            //
+                            // Keep the host as the fork-coherent authority by
+                            // making it TRUE rather than by believing it: push
+                            // the description's O_APPEND down to the host fd,
+                            // and only then read the flag back.
+                            if flags & LINUX_O_APPEND != 0 && host_flags & libc::O_APPEND == 0 {
+                                unsafe {
+                                    libc::fcntl(
+                                        host_fd.raw(),
+                                        libc::F_SETFL,
+                                        host_flags | libc::O_APPEND,
+                                    )
+                                };
                             }
+                            flags &= !LINUX_O_NONBLOCK;
                             if host_flags & libc::O_NONBLOCK != 0 {
                                 flags |= LINUX_O_NONBLOCK;
                             }
