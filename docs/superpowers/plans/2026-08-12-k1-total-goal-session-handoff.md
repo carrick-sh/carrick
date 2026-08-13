@@ -249,6 +249,14 @@ append write goes to the end, and still appends after an explicit
 `lseek(0, SEEK_SET)`, which is exact Linux semantics. So the defect is not
 the flag's basic implementation.
 
+**The detector is VALIDATED, not a false positive.** A worry worth checking
+was that `O_APPEND` legitimately leaves the file offset at 0 until the first
+write (confirmed directly: an `O_APPEND` open reports offset 0), which would
+make "member header at offset 0" fire on healthy appends. It does not. Across
+runs the detector fires **8 times on every corrupting run and 0 times on a
+clean run** — a perfect correlation with the actual archive error. Treat its
+firings as real.
+
 **The O_APPEND atomicity fix (`bc70d999d`) did NOT fix this — measured.**
 Appending was emulated as `lseek(SEEK_END)` then a separate `write`, which
 is a real Linux-semantics defect (Linux does both atomically) and was fixed
