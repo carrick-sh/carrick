@@ -272,17 +272,25 @@ architecture, and KP has no baseline.
 
 **Two things are next, and both are single, well-located changes.**
 
-1. **Seed the kernel's task-id space at 1, not at the host pid.**
-   `IdRegistry::with_root` starts allocating at `root + 1`, and the root is
-   `TaskId::for_root_bootstrap(std::process::id())` — the HOST process
-   (`dispatch/mod.rs:2475`, `kernel/core.rs:222`, `kernel/registry.rs:31`). So
-   guest processes get 55233, 55234, 55235 where Linux gives 1, 2, 3. It is the
-   fourth instance of the host-identity substitution and the point where
-   identity is CREATED, so it is upstream of the other three — and of the
-   largest failing probe cluster, of `/proc/self` answering 1 for every
-   process, and of `kill(getpid())` returning ESRCH. Wide blast radius (pidfds,
-   process groups, sessions, `/proc`, `wait4`, every signal target), so it
-   needs its own pass and its own kernel-lane gate run.
+1. **Guest pid identity — and it is NOT the one-line fix it looks like.**
+   The kernel's id space is seeded from the host pid
+   (`dispatch/mod.rs:2475`, `kernel/core.rs:222`, `kernel/registry.rs:31`), so
+   guest processes get 55233, 55234, 55235 where Linux gives 1, 2, 3.
+   Two designs for reseeding at 1 were built and **both refuted**
+   ([evidence](docs/perf-results/2026-08-13-hvpatch-guest-pid-identity-design.md)):
+   - **FATAL** — native and vmm run TWO id allocators that agree today only
+     because both derive from the host pid; reseeding moves one and silently
+     breaks thread identity on both must-not-regress lanes.
+   - **MAJOR** — `LINUX_BOOTSTRAP_PID` (1) is an unconditional self-alias in
+     six live comparators, harmless today only because no task ever holds id 1.
+   - **MAJOR** — it would not even fix `kill(getpid())`: `kill` returns ESRCH
+     from the ns translation at `signal.rs:1172-1180` before the self-target
+     test at `:1193` is reached.
+   - **HAZARD, which fixes the ORDER** — today a leaked guest pid matches
+     nothing and ESRCHs; at 1..N it names real host processes, and pid 1 on
+     macOS is `launchd`. **Close the host-pid comparators FIRST**, as their own
+     commit: they are correct at either seed, which is what makes that ordering
+     safe.
 2. **The per-thread register file** — step 1 of KD (a core with wrong
    registers is worse than none) and step 2 of KS. Two phases converge on it.
    Note the KD spec calls this "the one genuinely missing input" and that is no
