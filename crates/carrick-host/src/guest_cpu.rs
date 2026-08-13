@@ -240,6 +240,41 @@ pub fn this_thread_slot() -> usize {
     MY_SLOT.with(|&slot| slot)
 }
 
+/// This host thread's own CPU time in nanoseconds — the KERNEL-side
+/// counterpart to the vCPU exec slots above.
+///
+/// The slots measure time inside `hv_vcpu_run`, i.e. the guest executing its
+/// own instructions, which is Linux's USER time. A guest's SYSTEM time is the
+/// CPU carrick burns servicing that guest's syscalls, which happens on this
+/// host thread OUTSIDE `hv_vcpu_run` and is therefore invisible to the slots.
+/// Bracketing a syscall service window with this is what supplies `tms_stime`
+/// and `ru_stime`.
+///
+/// It must be CPU time, not wall time: a guest that blocks in `wait4` or
+/// `epoll_wait` for a second accrues no kernel CPU on Linux, and charging the
+/// elapsed wall clock would report a second of system time for an idle task.
+/// `CLOCK_THREAD_CPUTIME_ID` advances only while this thread is on-CPU.
+///
+/// Cost, measured on this host: 157.6 ns/call, against `mach_absolute_time`'s
+/// 6.9 ns. Two calls per guest syscall is ~23 ms on a cold `go build`'s 74k
+/// syscalls (~0.6%). That is the price of a guest-visible Linux semantic that
+/// is otherwise simply wrong, which this tree does not trade away.
+pub fn this_thread_cpu_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `clock_gettime` writes exactly one `timespec` through the
+    // pointer. CLOCK_THREAD_CPUTIME_ID is available on macOS 10.12+ and on
+    // every other platform carrick builds for.
+    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) } != 0 {
+        return 0;
+    }
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64)
+}
+
 /// Accumulated guest CPU (µs) for a slot claimed by any thread, including an
 /// in-flight run. Same arithmetic as [`this_thread_us`], addressed by slot
 /// rather than by TLS. Out-of-range slots report zero.

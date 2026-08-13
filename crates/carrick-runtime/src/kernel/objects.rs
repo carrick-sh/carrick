@@ -2238,6 +2238,11 @@ struct TaskCpu {
     /// totalled on demand from their `guest_cpu` slots; this is the part that
     /// would otherwise be lost when a slot is released.
     exited_threads_us: AtomicU64,
+    /// SYSTEM CPU of this task's exited threads, the counterpart to
+    /// `exited_threads_us`. Kept separate rather than summed because Linux
+    /// reports the two independently and a caller that conflates them cannot
+    /// be corrected later.
+    exited_threads_system_us: AtomicU64,
     /// User CPU of reaped children, including the children's own reaped
     /// children — Linux folds a reaped child's `cutime` into its parent's.
     children_user_us: AtomicU64,
@@ -2281,12 +2286,30 @@ impl Task {
         live.saturating_add(self.cpu.exited_threads_us.load(Ordering::Acquire))
     }
 
+    /// This task's own SYSTEM CPU (µs): carrick's CPU spent servicing this
+    /// task's syscalls, across its live threads plus the ones that have exited.
+    /// The counterpart to [`Self::self_cpu_us`], which is user time.
+    pub fn self_system_cpu_us(&self) -> u64 {
+        let live: u64 = self
+            .threads
+            .lock()
+            .values()
+            .map(|(_, thread)| thread.system_cpu_us())
+            .fold(0_u64, u64::saturating_add);
+        live.saturating_add(self.cpu.exited_threads_system_us.load(Ordering::Acquire))
+    }
+
     /// Fold a departing thread's CPU into the task before its slot is released,
-    /// so a process's own history survives its threads.
+    /// so a process's own history survives its threads. BOTH ledgers — a thread
+    /// that exits after servicing syscalls has system time that would otherwise
+    /// vanish with it.
     pub fn retain_exited_thread_cpu(&self, thread: &Thread) {
         self.cpu
             .exited_threads_us
             .fetch_add(thread.cpu_us(), Ordering::AcqRel);
+        self.cpu
+            .exited_threads_system_us
+            .fetch_add(thread.system_cpu_us(), Ordering::AcqRel);
     }
 
     /// Charge a reaped child's CPU to this task's CHILDREN ledger. Linux
@@ -2398,6 +2421,7 @@ impl Task {
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
             cpu_slot: AtomicUsize::new(CPU_SLOT_UNBOUND),
+            system_ns: AtomicU64::new(0),
         })
     }
 
@@ -2419,6 +2443,7 @@ impl Task {
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
             cpu_slot: AtomicUsize::new(CPU_SLOT_UNBOUND),
+            system_ns: AtomicU64::new(0),
         })
     }
 
@@ -2440,6 +2465,7 @@ impl Task {
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
             cpu_slot: AtomicUsize::new(CPU_SLOT_UNBOUND),
+            system_ns: AtomicU64::new(0),
         })
     }
 
@@ -2461,6 +2487,7 @@ impl Task {
             revision: ObjectRevision::new(),
             runner_gate: Arc::clone(&caller.runner_gate),
             cpu_slot: AtomicUsize::new(CPU_SLOT_UNBOUND),
+            system_ns: AtomicU64::new(0),
         })
     }
 
@@ -2859,6 +2886,19 @@ pub struct Thread {
     /// counters describe every guest process at once and cannot answer
     /// "how much CPU has *this* Linux process used".
     cpu_slot: AtomicUsize,
+    /// Guest SYSTEM time for this thread, in nanoseconds: the CPU carrick has
+    /// burned servicing THIS thread's syscalls.
+    ///
+    /// The `cpu_slot` above measures time inside `hv_vcpu_run` — the guest
+    /// executing its own instructions, which is Linux's USER time. Service
+    /// time happens on the host thread outside that call and is invisible to
+    /// the slot, which is why `times`/`getrusage` reported system time as zero
+    /// even after per-task user accounting landed. Accumulated at the one
+    /// dispatch boundary that reliably runs on the guest thread
+    /// (`dispatch::resources::with_captured_resources`), from
+    /// `CLOCK_THREAD_CPUTIME_ID` so a BLOCKED syscall — `wait4`, `epoll_wait` —
+    /// contributes nothing, exactly as on Linux.
+    system_ns: AtomicU64,
 }
 
 /// A thread that has not yet run guest code and so owns no `guest_cpu` slot.
@@ -2882,11 +2922,27 @@ impl Thread {
         }
     }
 
-    /// Guest CPU (µs) this thread has accumulated, or zero before it has run.
+    /// Guest USER CPU (µs) this thread has accumulated, or zero before it has
+    /// run — time spent executing guest instructions.
     pub fn cpu_us(&self) -> u64 {
         match self.cpu_slot.load(Ordering::Acquire) {
             CPU_SLOT_UNBOUND => 0,
             slot => carrick_host::guest_cpu::slot_us(slot),
+        }
+    }
+
+    /// Guest SYSTEM CPU (µs) this thread has accumulated — carrick's own CPU
+    /// spent servicing this thread's syscalls. See [`Self::system_ns`].
+    pub fn system_cpu_us(&self) -> u64 {
+        self.system_ns.load(Ordering::Acquire) / 1000
+    }
+
+    /// Charge `delta_ns` of syscall-service CPU to this thread. Called once per
+    /// guest syscall from the dispatch boundary, with the delta measured on the
+    /// host thread's own CPU clock so blocked time is excluded.
+    pub fn charge_system_ns(&self, delta_ns: u64) {
+        if delta_ns != 0 {
+            self.system_ns.fetch_add(delta_ns, Ordering::AcqRel);
         }
     }
 
@@ -3263,7 +3319,7 @@ impl Zombie {
             status,
             rusage: TaskRusage {
                 user_time: Duration::from_micros(task.self_cpu_us()),
-                system_time: Duration::ZERO,
+                system_time: Duration::from_micros(task.self_system_cpu_us()),
             },
             children_rusage: TaskRusage {
                 user_time: Duration::from_micros(children_user_us),
