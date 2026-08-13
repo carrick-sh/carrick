@@ -58,10 +58,34 @@ pub(super) fn with_captured_resources<R>(
     // Pointer identity is sufficient because the marker exists only for this
     // dynamic borrow: that KernelContext cannot be dropped or replaced at the
     // same address until the scope unwinds and Restore clears the marker.
+    // The dispatch boundary is the one place that reliably runs ON the guest
+    // thread with its kernel object in hand, so it is where the thread claims
+    // the `guest_cpu` slot its Task later totals for RUSAGE_SELF.
+    context.thread().bind_own_cpu_slot();
     if ACTIVE_CONTEXT.with(|active| std::ptr::eq(active.get(), context)) {
         return operation();
     }
     with_resource_scope(CapturedResources::from_context(context), context, operation)
+}
+
+/// Run `operation` against the kernel context whose dispatch scope is active
+/// on this thread, if any. Syscalls that must answer *about the calling Linux
+/// process* — rather than about the host process, which under HVPatch holds
+/// every Linux process at once — read the calling task through here.
+///
+/// Returns `None` outside any dispatch scope, which is the honest answer: the
+/// caller then has no task to describe and must say so rather than substitute
+/// some other process's numbers.
+pub(crate) fn with_active_context<R>(
+    operation: impl FnOnce(&crate::kernel::KernelContext) -> R,
+) -> Option<R> {
+    ACTIVE_CONTEXT.with(|active| {
+        let context = active.get();
+        // SAFETY: the scope guard that publishes this pointer keeps the
+        // referent borrowed for as long as it is non-null here, and restores
+        // the previous value on both return and unwind.
+        (!context.is_null()).then(|| operation(unsafe { &*context }))
+    })
 }
 
 pub(super) fn with_resources<R>(resources: CapturedResources, operation: impl FnOnce() -> R) -> R {

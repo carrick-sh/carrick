@@ -1705,7 +1705,7 @@ mod tests {
     use super::*;
     use crate::kernel::{
         Asid, ClonePlan, KernelContext, LinuxWaitStatus, MmBackendSnapshot, RootBootstrap,
-        SnapshotError, Stage1Root, TaskRusage, VmaSummary, WaitMode, WaitOutcome,
+        SnapshotError, Stage1Root, VmaSummary, WaitMode, WaitOutcome,
     };
 
     #[derive(Clone, Copy, Debug)]
@@ -2335,12 +2335,7 @@ mod tests {
         let child_mm = child.shared().mm().id();
         let child_sighand = child.shared().sighand().id();
         kernel
-            .exit_task(
-                child_key.id,
-                LinuxWaitStatus::from_wait_encoding(0),
-                TaskRusage::default(),
-                None,
-            )
+            .exit_task(child_key.id, LinuxWaitStatus::from_wait_encoding(0), None)
             .expect("exit child");
         assert!(matches!(
             kernel.wait_child(root.task().key().id, Some(child_key.id), WaitMode::Consume),

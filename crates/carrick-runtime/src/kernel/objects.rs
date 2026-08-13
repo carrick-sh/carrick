@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -2220,6 +2220,28 @@ pub struct Task {
     lifecycle: Mutex<TaskLifecycle>,
     shared: ArcSwap<TaskShared>,
     threads: Mutex<BTreeMap<LinuxTid, (ThreadKey, ThreadRef)>>,
+    cpu: TaskCpu,
+}
+
+/// The two CPU ledgers Linux keeps for every process, owned by the kernel
+/// rather than read back out of the host.
+///
+/// `times(2)` reports the process's own CPU in `tms_utime`/`tms_stime` and the
+/// summed CPU of its *reaped* children in `tms_cutime`/`tms_cstime`;
+/// `getrusage(2)` spells the same split `RUSAGE_SELF` versus
+/// `RUSAGE_CHILDREN`. Sourcing either from the host process is wrong under
+/// HVPatch by construction: all Linux processes are threads of one host
+/// process, so a host per-process counter is the sum over every guest at once.
+#[derive(Debug, Default)]
+struct TaskCpu {
+    /// CPU of this task's threads that have already exited. Live threads are
+    /// totalled on demand from their `guest_cpu` slots; this is the part that
+    /// would otherwise be lost when a slot is released.
+    exited_threads_us: AtomicU64,
+    /// User CPU of reaped children, including the children's own reaped
+    /// children — Linux folds a reaped child's `cutime` into its parent's.
+    children_user_us: AtomicU64,
+    children_system_us: AtomicU64,
 }
 
 impl Task {
@@ -2241,7 +2263,52 @@ impl Task {
             lifecycle: Mutex::new(TaskLifecycle::Live),
             shared: ArcSwap::new(shared),
             threads: Mutex::new(BTreeMap::new()),
+            cpu: TaskCpu::default(),
         }
+    }
+
+    /// This task's own CPU (µs): its live threads plus the threads it has
+    /// already retired. This is `RUSAGE_SELF` / `times`' `tms_utime`, and it
+    /// deliberately does NOT consult the host process — under HVPatch that
+    /// would return every guest process's CPU summed together.
+    pub fn self_cpu_us(&self) -> u64 {
+        let live: u64 = self
+            .threads
+            .lock()
+            .values()
+            .map(|(_, thread)| thread.cpu_us())
+            .fold(0_u64, u64::saturating_add);
+        live.saturating_add(self.cpu.exited_threads_us.load(Ordering::Acquire))
+    }
+
+    /// Fold a departing thread's CPU into the task before its slot is released,
+    /// so a process's own history survives its threads.
+    pub fn retain_exited_thread_cpu(&self, thread: &Thread) {
+        self.cpu
+            .exited_threads_us
+            .fetch_add(thread.cpu_us(), Ordering::AcqRel);
+    }
+
+    /// Charge a reaped child's CPU to this task's CHILDREN ledger. Linux
+    /// credits the child's own time *and* the time the child had already
+    /// accumulated from its own reaped children.
+    pub fn charge_reaped_child(&self, rusage: TaskRusage) {
+        self.cpu.children_user_us.fetch_add(
+            u64::try_from(rusage.user_time.as_micros()).unwrap_or(u64::MAX),
+            Ordering::AcqRel,
+        );
+        self.cpu.children_system_us.fetch_add(
+            u64::try_from(rusage.system_time.as_micros()).unwrap_or(u64::MAX),
+            Ordering::AcqRel,
+        );
+    }
+
+    /// This task's CHILDREN ledger as (user µs, system µs).
+    pub fn children_cpu_us(&self) -> (u64, u64) {
+        (
+            self.cpu.children_user_us.load(Ordering::Acquire),
+            self.cpu.children_system_us.load(Ordering::Acquire),
+        )
     }
 
     pub const fn key(&self) -> TaskKey {
@@ -2330,6 +2397,7 @@ impl Task {
             signal_pending_hint: AtomicU64::new(0),
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
+            cpu_slot: AtomicUsize::new(CPU_SLOT_UNBOUND),
         })
     }
 
@@ -2350,6 +2418,7 @@ impl Task {
             signal_pending_hint: AtomicU64::new(0),
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
+            cpu_slot: AtomicUsize::new(CPU_SLOT_UNBOUND),
         })
     }
 
@@ -2370,6 +2439,7 @@ impl Task {
             signal_pending_hint: AtomicU64::new(0),
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
+            cpu_slot: AtomicUsize::new(CPU_SLOT_UNBOUND),
         })
     }
 
@@ -2390,6 +2460,7 @@ impl Task {
             signal_pending_hint: AtomicU64::new(caller.signal_pending_hint.load(Ordering::Acquire)),
             revision: ObjectRevision::new(),
             runner_gate: Arc::clone(&caller.runner_gate),
+            cpu_slot: AtomicUsize::new(CPU_SLOT_UNBOUND),
         })
     }
 
@@ -2510,7 +2581,15 @@ impl Task {
         {
             return None;
         }
-        threads.remove(&key.tid).map(|(_, thread)| thread)
+        let retired = threads.remove(&key.tid).map(|(_, thread)| thread);
+        // Retain the departing thread's CPU before it leaves the task's live
+        // set: its `guest_cpu` slot is recycled by the next thread to claim
+        // one, so a process that has retired threads would otherwise appear to
+        // lose the CPU they burned.
+        if let Some(thread) = retired.as_ref() {
+            self.retain_exited_thread_cpu(thread);
+        }
+        retired
     }
 
     pub(super) fn live_thread_count(&self) -> usize {
@@ -2773,11 +2852,42 @@ pub struct Thread {
     signal_pending_hint: AtomicU64,
     revision: ObjectRevision,
     runner_gate: Arc<RunnerGate>,
+    /// This thread's `guest_cpu` slot, claimed the first time it runs guest
+    /// code, or [`CPU_SLOT_UNBOUND`] before then. Recording it here is what
+    /// lets the owning [`Task`] total its own threads' CPU: under HVPatch every
+    /// Linux process is a thread of ONE host process, so the host's per-process
+    /// counters describe every guest process at once and cannot answer
+    /// "how much CPU has *this* Linux process used".
+    cpu_slot: AtomicUsize,
 }
+
+/// A thread that has not yet run guest code and so owns no `guest_cpu` slot.
+pub const CPU_SLOT_UNBOUND: usize = usize::MAX;
 
 impl Thread {
     pub const fn key(&self) -> ThreadKey {
         self.key
+    }
+
+    /// Record the `guest_cpu` slot this thread runs on. Must be called BY the
+    /// thread itself — the slot comes from its own thread-local claim — which
+    /// is why it is bound at the syscall dispatch boundary rather than by
+    /// whichever thread happens to create the object.
+    pub fn bind_own_cpu_slot(&self) {
+        if self.cpu_slot.load(Ordering::Relaxed) == CPU_SLOT_UNBOUND {
+            self.cpu_slot.store(
+                carrick_host::guest_cpu::this_thread_slot(),
+                Ordering::Release,
+            );
+        }
+    }
+
+    /// Guest CPU (µs) this thread has accumulated, or zero before it has run.
+    pub fn cpu_us(&self) -> u64 {
+        match self.cpu_slot.load(Ordering::Acquire) {
+            CPU_SLOT_UNBOUND => 0,
+            slot => carrick_host::guest_cpu::slot_us(slot),
+        }
     }
 
     pub const fn registry_id(&self) -> ThreadId {
@@ -3129,24 +3239,45 @@ pub struct Zombie {
     pub session: SessionId,
     pub status: LinuxWaitStatus,
     pub rusage: TaskRusage,
+    /// What this task had itself accumulated from reaping its own children.
+    /// Kept separate from `rusage` so `wait4` can report the child's own CPU
+    /// while the reaper still charges the whole subtree to its children ledger.
+    pub children_rusage: TaskRusage,
     pub diagnostic_name: String,
 }
 
 impl Zombie {
-    pub fn from_task(
-        task: &Task,
-        status: LinuxWaitStatus,
-        rusage: TaskRusage,
-        diagnostic_name: String,
-    ) -> Self {
+    /// Capture the exiting task's two CPU ledgers at the moment it becomes a
+    /// zombie. Both are read from the kernel's own accounting: `rusage` is the
+    /// child's own CPU, which `wait4` reports through its `rusage` argument,
+    /// and `children_rusage` is what the child had already accumulated from
+    /// reaping its own children. Linux charges a reaper BOTH, which is how
+    /// `tms_cutime` totals a whole process subtree.
+    pub fn from_task(task: &Task, status: LinuxWaitStatus, diagnostic_name: String) -> Self {
+        let (children_user_us, children_system_us) = task.children_cpu_us();
         Self {
             key: task.key(),
             parent: task.parent(),
             process_group: task.process_group(),
             session: task.session(),
             status,
-            rusage,
+            rusage: TaskRusage {
+                user_time: Duration::from_micros(task.self_cpu_us()),
+                system_time: Duration::ZERO,
+            },
+            children_rusage: TaskRusage {
+                user_time: Duration::from_micros(children_user_us),
+                system_time: Duration::from_micros(children_system_us),
+            },
             diagnostic_name,
+        }
+    }
+
+    /// Everything a reaper must add to its own CHILDREN ledger for this child.
+    pub fn total_charge_to_reaper(&self) -> TaskRusage {
+        TaskRusage {
+            user_time: self.rusage.user_time + self.children_rusage.user_time,
+            system_time: self.rusage.system_time + self.children_rusage.system_time,
         }
     }
 }
@@ -3577,7 +3708,6 @@ mod tests {
         let zombie = Zombie::from_task(
             &fixture.task,
             LinuxWaitStatus::from_wait_encoding(0),
-            TaskRusage::default(),
             "fixture".to_string(),
         );
         drop(mm);

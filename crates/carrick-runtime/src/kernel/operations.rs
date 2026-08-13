@@ -16,8 +16,8 @@ use super::core::{
 use super::ids::{LinuxTid, MmId, ObjectIdError, ProcessGroupId, SessionId, TaskId};
 use super::objects::{
     Credentials, FileTable, LinuxWaitStatus, Mm, ObjectGraphError, ProcessGroup, Session, Task,
-    TaskKey, TaskLifecycle, TaskRef, TaskRusage, TaskShared, TaskSharedCloneError, ThreadKey,
-    ThreadRef, ThreadResources, Zombie,
+    TaskKey, TaskLifecycle, TaskRef, TaskShared, TaskSharedCloneError, ThreadKey, ThreadRef,
+    ThreadResources, Zombie,
 };
 use super::registry::{IdError, TaskReservation, ThreadClaim, ThreadReservation};
 
@@ -2007,7 +2007,6 @@ impl Kernel {
         self: &Arc<Self>,
         task_id: TaskId,
         status: LinuxWaitStatus,
-        rusage: TaskRusage,
         failpoint: Option<KernelFailpoint>,
     ) -> Result<PreparedTaskExit, KernelOperationError> {
         let task = self
@@ -2018,14 +2017,13 @@ impl Kernel {
             .get(&task_id)
             .map(|record| record.task.key())
             .ok_or(KernelOperationError::UnknownTask(task_id))?;
-        self.prepare_task_exit_key(task, status, rusage, failpoint)
+        self.prepare_task_exit_key(task, status, failpoint)
     }
 
     pub fn prepare_task_exit_key(
         self: &Arc<Self>,
         task_key: TaskKey,
         status: LinuxWaitStatus,
-        rusage: TaskRusage,
         failpoint: Option<KernelFailpoint>,
     ) -> Result<PreparedTaskExit, KernelOperationError> {
         self.sweep_retired_threads();
@@ -2113,7 +2111,7 @@ impl Kernel {
             None
         };
 
-        let registry_zombie = Zombie::from_task(&task, status, rusage, diagnostic_name);
+        let registry_zombie = Zombie::from_task(&task, status, diagnostic_name);
         let result_zombie = registry_zombie.clone();
         let task_ids: Vec<_> = reserved_ids.into_iter().collect();
         let reservation = TaskSetReservation::acquired(self, &mut state, task_ids, transaction)?;
@@ -2277,11 +2275,9 @@ impl Kernel {
         self: &Arc<Self>,
         task_id: TaskId,
         status: LinuxWaitStatus,
-        rusage: TaskRusage,
         failpoint: Option<KernelFailpoint>,
     ) -> Result<Zombie, KernelOperationError> {
-        self.prepare_task_exit(task_id, status, rusage, failpoint)?
-            .commit()
+        self.prepare_task_exit(task_id, status, failpoint)?.commit()
     }
 
     /// Publish terminal state for one exact task generation, waiting on the
@@ -2292,11 +2288,10 @@ impl Kernel {
         self: &Arc<Self>,
         task: TaskKey,
         status: LinuxWaitStatus,
-        rusage: TaskRusage,
     ) -> Result<Zombie, KernelOperationError> {
         loop {
             let observed = self.reservation_epoch();
-            match self.prepare_task_exit_key(task, status, rusage, None) {
+            match self.prepare_task_exit_key(task, status, None) {
                 Ok(prepared) => return prepared.commit(),
                 Err(KernelOperationError::TaskBusy(_)) => {
                     self.wait_for_reservation_change(observed);
@@ -2384,6 +2379,14 @@ impl Kernel {
                 state.zombies.remove(&id);
                 if let Some(parent_record) = state.tasks.get_mut(&parent_id) {
                     parent_record.task.remove_child(zombie.key);
+                    // Reaping is the moment Linux moves a child's CPU into the
+                    // parent's CHILDREN ledger — the child's own time plus what
+                    // it had already reaped from its own children. Doing it here
+                    // means only a CONSUMING wait charges it, so a WNOHANG poll
+                    // or a WNOWAIT peek cannot double-count.
+                    parent_record
+                        .task
+                        .charge_reaped_child(zombie.total_charge_to_reaper());
                     parent_record.revision = parent_revision;
                 }
             }
@@ -2637,12 +2640,7 @@ mod tests {
         assert_eq!(live.0.load(Ordering::Acquire), 0);
 
         kernel
-            .exit_task(
-                child_id,
-                LinuxWaitStatus::from_wait_encoding(0),
-                TaskRusage::default(),
-                None,
-            )
+            .exit_task(child_id, LinuxWaitStatus::from_wait_encoding(0), None)
             .expect("child exit");
         assert!(!kernel.task_is_live(child_id));
         assert!(kernel.task_exists(child_id));
@@ -2684,11 +2682,7 @@ mod tests {
             Some(child_a_key)
         );
         kernel
-            .exit_task_key_eventually(
-                child_a_key,
-                LinuxWaitStatus::from_wait_encoding(0),
-                TaskRusage::default(),
-            )
+            .exit_task_key_eventually(child_a_key, LinuxWaitStatus::from_wait_encoding(0))
             .expect("exit child A");
         assert_eq!(pidfd_watch.0.load(Ordering::Acquire), 1);
         drop(child_a);
@@ -2725,11 +2719,7 @@ mod tests {
         );
 
         kernel
-            .exit_task_key_eventually(
-                child_b.task().key(),
-                LinuxWaitStatus::from_wait_encoding(0),
-                TaskRusage::default(),
-            )
+            .exit_task_key_eventually(child_b.task().key(), LinuxWaitStatus::from_wait_encoding(0))
             .expect("exit child B");
         assert_eq!(pidfd_watch.0.load(Ordering::Acquire), 1);
     }
@@ -2759,18 +2749,14 @@ mod tests {
             .prepare_task_exit_key(
                 parent.task().key(),
                 LinuxWaitStatus::from_wait_encoding(0),
-                TaskRusage::default(),
                 None,
             )
             .expect("prepare parent exit");
         let exiting_kernel = Arc::clone(&kernel);
         let child_key = child.task().key();
         let child_exit = std::thread::spawn(move || {
-            exiting_kernel.exit_task_key_eventually(
-                child_key,
-                LinuxWaitStatus::from_wait_encoding(0),
-                TaskRusage::default(),
-            )
+            exiting_kernel
+                .exit_task_key_eventually(child_key, LinuxWaitStatus::from_wait_encoding(0))
         });
         prepared_parent.commit().expect("commit parent exit");
         let zombie = child_exit
@@ -2795,21 +2781,13 @@ mod tests {
             .expect("child");
 
         let root_zombie = kernel
-            .exit_task_key_eventually(
-                root.task().key(),
-                LinuxWaitStatus::from_wait_encoding(0),
-                TaskRusage::default(),
-            )
+            .exit_task_key_eventually(root.task().key(), LinuxWaitStatus::from_wait_encoding(0))
             .expect("root exit");
         assert_eq!(root_zombie.parent, None);
         assert_eq!(child.task().parent(), None);
 
         let child_zombie = kernel
-            .exit_task_key_eventually(
-                child.task().key(),
-                LinuxWaitStatus::from_wait_encoding(0),
-                TaskRusage::default(),
-            )
+            .exit_task_key_eventually(child.task().key(), LinuxWaitStatus::from_wait_encoding(0))
             .expect("orphan exit after root");
         assert_eq!(child_zombie.parent, None);
     }
@@ -3069,12 +3047,7 @@ mod tests {
         );
         assert!(kernel.task_is_live(child_id));
         kernel
-            .exit_task(
-                child_id,
-                LinuxWaitStatus::from_wait_encoding(0),
-                TaskRusage::default(),
-                None,
-            )
+            .exit_task(child_id, LinuxWaitStatus::from_wait_encoding(0), None)
             .expect("retire fail-safe child");
     }
 
@@ -3369,7 +3342,6 @@ mod tests {
             .exit_task(
                 child.task.key().id,
                 LinuxWaitStatus::from_wait_encoding(0),
-                TaskRusage::default(),
                 None,
             )
             .expect("exit execed child");
@@ -3393,7 +3365,6 @@ mod tests {
             .exit_task(
                 exiting_child.task.key().id,
                 LinuxWaitStatus::from_wait_encoding(0),
-                TaskRusage::default(),
                 None,
             )
             .expect("exit vfork child");
@@ -3442,7 +3413,6 @@ mod tests {
             .exit_task(
                 child.context().task().key().id,
                 LinuxWaitStatus::from_wait_encoding(0),
-                TaskRusage::default(),
                 None,
             )
             .expect("exit pidfd child");
@@ -3763,12 +3733,7 @@ mod tests {
             .exit_thread(&dead_leader, None)
             .expect("leader thread exit");
         kernel
-            .exit_task(
-                child_id,
-                LinuxWaitStatus::from_wait_encoding(0),
-                TaskRusage::default(),
-                None,
-            )
+            .exit_task(child_id, LinuxWaitStatus::from_wait_encoding(0), None)
             .expect("task exit");
 
         drop(child);
@@ -4138,7 +4103,6 @@ mod tests {
             let exit_result = kernel.exit_task(
                 child_id,
                 LinuxWaitStatus::from_wait_encoding(0),
-                TaskRusage::default(),
                 Some(point),
             );
             assert!(matches!(exit_result, Err(KernelOperationError::Injected(p)) if p == point));
@@ -4172,7 +4136,6 @@ mod tests {
             kernel.prepare_task_exit(
                 root.task.key().id,
                 LinuxWaitStatus::from_wait_encoding(0),
-                TaskRusage::default(),
                 None,
             ),
             Err(KernelOperationError::TaskBusy(id)) if id == root.task.key().id
@@ -4188,7 +4151,6 @@ mod tests {
             .prepare_task_exit(
                 root.task.key().id,
                 LinuxWaitStatus::from_wait_encoding(0),
-                TaskRusage::default(),
                 None,
             )
             .expect("thread preparation does not reserve the task");
@@ -4202,7 +4164,6 @@ mod tests {
             .prepare_task_exit(
                 root.task.key().id,
                 LinuxWaitStatus::from_wait_encoding(0),
-                TaskRusage::default(),
                 None,
             )
             .expect("prepare exit");
@@ -4275,7 +4236,6 @@ mod tests {
             .prepare_task_exit(
                 root.task.key().id,
                 LinuxWaitStatus::from_wait_encoding(0),
-                TaskRusage::default(),
                 None,
             )
             .expect("reserve overlapping exit");
@@ -4317,11 +4277,8 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
         let exiting = Arc::clone(&kernel);
         let handle = std::thread::spawn(move || {
-            let result = exiting.exit_task_key_eventually(
-                task,
-                LinuxWaitStatus::from_wait_encoding(17 << 8),
-                TaskRusage::default(),
-            );
+            let result = exiting
+                .exit_task_key_eventually(task, LinuxWaitStatus::from_wait_encoding(17 << 8));
             done_tx.send(result).unwrap();
         });
         kernel.wait_for_reservation_waiter_for_tests();
@@ -4340,11 +4297,7 @@ mod tests {
         assert_eq!(zombie.status.raw(), 17 << 8);
 
         let repeated = kernel
-            .exit_task_key_eventually(
-                task,
-                LinuxWaitStatus::from_wait_encoding(99 << 8),
-                TaskRusage::default(),
-            )
+            .exit_task_key_eventually(task, LinuxWaitStatus::from_wait_encoding(99 << 8))
             .expect("exact zombie makes repeated cleanup idempotent");
         assert_eq!(repeated.key, task);
         assert_eq!(repeated.status.raw(), 17 << 8);
@@ -4388,7 +4341,6 @@ mod tests {
             .exit_task(
                 zombie_child.task.key().id,
                 LinuxWaitStatus::from_wait_encoding(0),
-                TaskRusage::default(),
                 None,
             )
             .expect("zombie child exit");
@@ -4397,7 +4349,6 @@ mod tests {
             .prepare_task_exit(
                 parent.task.key().id,
                 LinuxWaitStatus::from_wait_encoding(7 << 8),
-                TaskRusage::default(),
                 None,
             )
             .expect("prepare parent exit");
@@ -4469,7 +4420,6 @@ mod tests {
             .prepare_task_exit(
                 parent.task.key().id,
                 LinuxWaitStatus::from_wait_encoding(9 << 8),
-                TaskRusage::default(),
                 None,
             )
             .expect("prepare parent exit");
@@ -4743,20 +4693,10 @@ mod tests {
         drop(grandchild);
 
         kernel
-            .exit_task(
-                grandchild_id,
-                LinuxWaitStatus::from_wait_encoding(0),
-                TaskRusage::default(),
-                None,
-            )
+            .exit_task(grandchild_id, LinuxWaitStatus::from_wait_encoding(0), None)
             .expect("grandchild exit");
         kernel
-            .exit_task(
-                parent_id,
-                LinuxWaitStatus::from_wait_encoding(0),
-                TaskRusage::default(),
-                None,
-            )
+            .exit_task(parent_id, LinuxWaitStatus::from_wait_encoding(0), None)
             .expect("parent exit");
 
         let zombie = kernel
@@ -4834,7 +4774,6 @@ mod tests {
                         let _ = kernel.exit_task(
                             selected,
                             LinuxWaitStatus::from_wait_encoding(0),
-                            TaskRusage::default(),
                             None,
                         );
                     }
@@ -4880,12 +4819,7 @@ mod tests {
             Ok(WaitOutcome::StillRunning)
         ));
         kernel
-            .exit_task(
-                child_id,
-                LinuxWaitStatus::from_wait_encoding(7 << 8),
-                TaskRusage::default(),
-                None,
-            )
+            .exit_task(child_id, LinuxWaitStatus::from_wait_encoding(7 << 8), None)
             .expect("exit");
         assert!(kernel.ids().is_reserved_number(child_id.raw()));
         assert!(matches!(
