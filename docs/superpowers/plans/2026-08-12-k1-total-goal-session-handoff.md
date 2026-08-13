@@ -199,13 +199,39 @@ file-write record carrying an offset**. `EFDWRITE` is an *eventfd* record
 (`hfd/before/after` counter values), not a file write; the file records are
 `FDOPEN`/`FDCLOSE` only.
 
-So the next step is to add one ring record for file writes carrying host fd
-and starting offset. Keep it genuinely low-perturbation: the ring write
-itself is lock-free and cheap, but resolving the offset costs an `lseek`, so
-gate that on a cheap predicate (e.g. only when the buffer's first bytes look
-like an `ar` boundary) rather than paying it on every write — which is
-exactly the cost that made `trace-io` hide the bug. Then run WITHOUT
-`trace-io`, reproduce, and read the ring from the failing process.
+**That record now exists** (`91d295587`): `ARWRITE`, ring kind 40 — host fd,
+start offset, length — emitted when a write's payload begins at an `ar`
+MEMBER header rather than the magic, which is correct at a nonzero offset
+and corrupt at 0. The `lseek` that resolves the offset is paid ONLY when a
+cheap byte predicate matches, so it does not perturb: the fixture reproduced
+the corruption **3 of 3** with the detector active and `trace-io` off,
+against 0 of 4 under `trace-io`.
+
+**But it has NOT yet caught the bug, and the blocker is the dump plumbing.**
+With `CARRICK_EVENTRING` set and `--features event-ring-dump`:
+
+- a short `ubuntu:24.04` guest writes `carrick-ring.<pid>` correctly;
+- a go-build run that ended in the start-gate abort also wrote one;
+- **three consecutive go-build runs that DID corrupt the archive wrote no
+  ring file at all**, so `ARWRITE` has never actually been observed.
+
+That correlation — dumps appear for runs that do not corrupt and vanish for
+runs that do — is itself a lead worth chasing rather than an annoyance.
+Resolve it before trusting any negative `ARWRITE` result. Likely candidates:
+the 1 Hz watchdog thread not running in whichever host process holds the
+interesting ring under HVPatch's re-exec, or the failing run tearing down
+before a tick. Reading the ring directly from the process with
+`carrick-lldb` sidesteps the dump entirely and is the more reliable route.
+
+Note also that a healthy run is EXPECTED to emit zero `ARWRITE` records: Go
+writes members inside magic-prefixed buffers, so the predicate deliberately
+does not fire there. Zero records therefore only means something once the
+dump is known to be working for a corrupting run.
+
+One earlier inference is also retracted: buffers seen beginning with
+`cpu.o` in the `trace-io` log are NOT necessarily shifted archive content —
+plain-text object lists in the build cache start the same way, and the
+strict `ar` predicate correctly does not classify them as member headers.
 
 Other untested suspects: the generic `copy_file_range` read-then-write body
 (`sendfile_bytes` + `write_output_fd`) under siblings sharing a host file
