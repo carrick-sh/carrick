@@ -49,8 +49,11 @@ The K0…K6 sequence encoded an ordering the evidence has since refuted, and
 | K2 — frames and address spaces | **KM — kernel memory** + **KF — kernel page lifecycle** | re-ranked below |
 | K3 — fork/clone/wait | **KL — kernel lifecycle** | partly landed |
 | K4 — transactional exec | **KX — kernel exec** | not started |
-| K5 — scheduler, sync, lowering | **KS — kernel scheduler** + **KN — kernel namei** | designed / next |
-| K6 — cores, conformance, proof | **KD — kernel diagnostics** + **KP — shipped proof** | KD largely landed |
+| K5 — scheduler, sync, lowering | **KS — kernel scheduler** + **KN — kernel namei** | KN partial; KS designed |
+| K6 — cores, conformance, proof | **KD — kernel diagnostics** + **KP — shipped proof** | KD partial; KP not started |
+
+See the **phase status table** below for what each one has actually landed and
+what unblocks it next.
 
 **3. The ranking is inverted: path resolution and scheduling come first,
 memory second.** This is the substantive change, and it is measured, not
@@ -63,17 +66,18 @@ argued. See below.
 Measured at and after the K1 boundary, all on the signed binary, never
 concurrent with Docker.
 
-| Quantity | Value | Source |
-|---|---:|---|
-| Carrick host CPU, cold `go build` | **4.29 s** | [guest-vs-host](docs/perf-results/2026-08-13-hvpatch-guest-vs-host-cost.md) |
-| Docker guest-intrinsic CPU, same build | **2.32 s** | same |
-| Overhead ratio | **1.85x** | same |
-| Workload-window ratio | **2.574x** | [K1 boundary](docs/perf-results/2026-08-13-hvpatch-k1-boundary-number.md) |
-| Guest-perceived ratio (independent instrument) | **2.58x** | [guest-vs-host](docs/perf-results/2026-08-13-hvpatch-guest-vs-host-cost.md) |
-| Overhead to remove to reach the bar | **~1.97 CPU-s** | derived |
+| Quantity | at K1 boundary | **now** | Source |
+|---|---:|---:|---|
+| Carrick host CPU, cold `go build` | 4.29 s | **3.803 s** | [KF ceiling](docs/perf-results/2026-08-13-hvpatch-kf-scrub-ceiling.md) |
+| Workload window | 2,129 ms | **1,828 ms** | same |
+| Docker guest-intrinsic CPU, same build | 2.32 s | 2.32 s | [guest-vs-host](docs/perf-results/2026-08-13-hvpatch-guest-vs-host-cost.md) |
+| Overhead ratio | 1.85x | **~1.64x** | derived |
+| Overhead still to remove | ~1.97 CPU-s | **~1.5 CPU-s** | derived |
 
 For scale: the historical `native` default was 10.1806x on this workload. The
-kernel lane is already roughly 4x better than the backend Carrick ships today.
+kernel lane is already several times better than the backend Carrick ships
+today. **Roughly a quarter of the overhead the goal must remove has been
+removed**, by KN and KF's first step; the rest is not yet designed.
 
 **The bar is approximately 1.01x the workload's own intrinsic cost.** Docker
 needs 2.32 CPU-s of guest work to do this build and the bar is 2.3 CPU-s
@@ -142,9 +146,11 @@ running. The native lane fixed exactly this shape on 2026-08-07 (in-window
 `zfod` 553k → ~723); **that work was never carried to the kernel lane**, and it
 does not port directly because the arena is `hv_vm_map`'d into stage-2.
 
-The mechanism is not yet named — the three `zero_backing` sites account for 29
-of those faults, so the scrub is not the source — and naming it is the next
-measurement, not the next guess.
+**Both of those numbers have since moved and the mechanism is named.** The
+scrub was the arena watermark being raised on ALLOCATION rather than on
+writability; fixing that (KF step C, `3d45b1a98`) took whole-build `zfod` to
+**86,721** and in-window `zfod` to **2,858**. The table above is retained as
+the census that found the term, not as the current state — see KF below.
 
 ### The one-sentence diagnosis
 
