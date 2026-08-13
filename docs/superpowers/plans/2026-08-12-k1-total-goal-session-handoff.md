@@ -167,11 +167,33 @@ produce a corrupt archive (`archive-magic` on run 1, then `start-gate-abort`
 escape, and it is the instrument for attributing any future
 `copy_file_range` corruption.
 
-Remaining suspects for the corrupt cache archive, none yet tested: the
-generic `copy_file_range` read-then-write body (`sendfile_bytes` plus
-`write_output_fd`) under concurrent siblings sharing a host file offset;
-Go's cache writing via `os.Link`/rename rather than a copy at all; and a
-short write reported as complete somewhere in that path.
+**Where the trail currently ends, and the one instrument that is missing.**
+Running with `--features trace-io` shows both guest (`WRDBG`) and host
+(`IODBG`) traffic. In a failing run there ARE buffers beginning with the
+member header `cpu.o` (`63 70 75 2e 6f`): a host `READ host_fd=92` at
+n=4096 and n=32768, a `WRITE host_fd=114 n=32768`, and a guest
+`guest_fd=6 → host_fd=92 n=3140`.
+
+That is suggestive but **not yet conclusive**, and it must not be
+over-read: Go legitimately writes an archive as two writes to one fd — the
+magic-plus-padding block (`n=68`, seen 24 times) and then the member
+starting with `cpu.o`. So a buffer beginning `cpu.o` is normal at a nonzero
+offset and corrupt only at offset 0.
+
+`WRDBG`/`IODBG` print fd and length but **not the file offset**, which is
+precisely the field that separates the two cases — and separates "a read
+started 8 bytes in" from "the file being read was already shifted". Adding
+the offset to those two trace lines is the single cheapest next step, and
+it is a durable improvement rather than scratch instrumentation. With
+offsets in hand the question resolves in one run: if the corrupt cache
+entry's `WRITE` begins at offset 0 with `cpu.o`, the producing `READ` is
+the defect; if the `READ` is at offset 8 of a good file, it is an fd-offset
+bug on a shared/duplicated description.
+
+Other untested suspects: the generic `copy_file_range` read-then-write body
+(`sendfile_bytes` + `write_output_fd`) under siblings sharing a host file
+offset; Go's cache using `os.Link`/rename rather than a copy; and a short
+write reported as complete.
 
 **The start-gate abort is the other 1-in-4 mode; classify it before changing
 it.** The start gate is a
