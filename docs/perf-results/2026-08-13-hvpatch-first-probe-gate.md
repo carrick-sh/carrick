@@ -210,3 +210,33 @@ feed pidfds, process groups, sessions, `/proc`, `wait4` and every signal
 target, so it needs its own careful pass and its own gate run, not a
 drive-by. It is the highest-value single fix available on this lane: it is
 upstream of the largest failing cluster and of two clusters beyond it.
+
+
+---
+
+## The gate itself has flaky members — repeat before believing a small delta
+
+**Recorded 2026-08-13.** Comparing two kernel-lane gate runs across one
+narrow change showed 304/90 -> 306/88, with four probes flipping to PASS and
+two to FAIL. Re-running the flipped four twice settled it:
+
+| probe | gate run | re-run 1 | re-run 2 |
+| --- | --- | --- | --- |
+| `forkfpreclaim` | FAIL | PASS | PASS |
+| `seccompexec` | FAIL | PASS | PASS |
+| `pauseeintr` | PASS | FAIL | PASS |
+| `posixtimers` | PASS | PASS | FAIL |
+
+So both "new failures" were flakes rather than regressions, and two of the
+"new passes" are unstable in their own right. **A single-run delta of ±2 on
+this lane means nothing.**
+
+Two consequences for how this gate is used:
+
+- Any claim that a change moved the kernel lane needs the flipped probes
+  re-run, not just the totals compared. `CARRICK_PROBE_FILTER` makes that
+  cheap — it runs a named subset in seconds instead of the full ~10 minutes.
+- **The flaky members must be identified before `baseline.hvpatch.jsonl` is
+  blessed.** Blessing a flaky probe records whichever outcome that run
+  happened to produce, which then either excuses a real regression forever or
+  fails the gate at random. That is a prerequisite for KP, not a detail.
