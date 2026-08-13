@@ -131,20 +131,35 @@ with `!<arch>\n`, and exactly ONE missing it**: a 95,486-byte entry whose
 content begins at the `ar` member header `cpu.o`. So writing archives works;
 one file in ten loses precisely its leading 8 bytes.
 
-That shape is specific. The magic is not overwritten — it is absent and the
-remainder is shifted down, which means the first `write(fd, "!<arch>\n", 8)`
-**reported success but neither landed nor advanced the file offset**, so the
-next write began at 0. A successful-but-lost small write whose offset does
-not advance points at the write landing on a different open file
-description than the one the guest believes it holds — i.e. a
-description-sharing or fd-table race around `fork`/`exec`, which is the same
-machinery two bugs were already found in this session
-(`ce369be39`, `f4cdea7a6`). It is NOT a generic write/seek defect: those
-paths are proven exact above.
+**CORRECTION — the "lost 8-byte write" reading is WRONG.** A commit earlier
+in this session (`7a19fed1e`) inferred that a standalone
+`write(fd, "!<arch>\n", 8)` was reported successful but never landed. The
+runtime's own `trace-io` instrument disproves it: build with
+`just build --features trace-io` and the guest **never issues an 8-byte
+magic write at all**. Every write beginning with `21 3c 61 72 63 68 3e 0a`
+is a larger buffered write — `n=68` (a stub archive: magic plus 60 zero
+bytes), `n=7667`, `n=32768` — 67 of them in one build. Go buffers the magic
+together with the following data.
 
-Next concrete step: instrument the guest `write` path for this file (the
-`internal/cpu` compile subprocess) and confirm which host fd / description
-the 8-byte write is routed to, versus the following large writes.
+So the corruption is a large write that begins with the magic losing
+precisely its first 8 bytes, not a small write going missing. Do not spend
+time on lost-small-write theories.
+
+**Prime suspect: the build-cache COPY, not the compile.** Go stores an
+archive in `GOCACHE` by copying the compiler's output, and 9 of 10 archives
+land correctly — a per-file race, not a systematic offset error. That copy
+reaches `copy_file_range` (canonical 285), which on macOS has a whole-file
+fast path, `try_darwin_copyfile_range_fast_path` →
+`darwin_fs::copyfile_clone_or_data` (`dispatch/fs/sendfile.rs`).
+
+Its guards require `in_offset == 0`, both NULL guest offset pointers, an
+empty destination, and `count >= input.size`, and it reads the two HOST fd
+offsets with `lseek(SEEK_CUR)` before cloning. Those host offsets are shared
+across forked guest processes, so the check is a TOCTOU against a concurrent
+sibling — which fits a 1-in-10 failure under a parallel `go build`. Note the
+fast path has **no `=0` escape hatch**, so it cannot currently be ablated to
+test this; adding one is the cheapest next experiment, and its absence is
+itself a violation of the opt-out rule.
 
 **The start-gate abort is the other 1-in-4 mode; classify it before changing
 it.** The start gate is a
