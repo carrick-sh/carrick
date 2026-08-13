@@ -47,10 +47,16 @@ const SOCKET_NAME: &str = "snapshot.sock";
 /// Hex characters of the run digest kept in the path. 32 hex = 128 bits.
 const RUN_TOKEN_HEX: usize = 32;
 
-/// Usable `sockaddr_un.sun_path` bytes, excluding the terminating NUL. macOS
-/// and the BSDs give 104 bytes; Linux gives 108. Taking the smaller value
-/// everywhere keeps one path layout valid on every host we build for.
-const MAX_SUN_PATH: usize = 103;
+/// Capacity of `sockaddr_un.sun_path`, derived from the platform's own struct
+/// rather than written down. The value differs per platform (macOS and the
+/// BSDs give 104, Linux 108), and a hardcoded number here would silently
+/// become wrong on a host whose ABI disagrees — the failure mode being a
+/// `bind` that returns a bare `EINVAL`.
+const SUN_PATH_CAPACITY: usize =
+    size_of::<libc::sockaddr_un>() - std::mem::offset_of!(libc::sockaddr_un, sun_path);
+
+/// Usable path bytes, reserving the terminating NUL.
+const MAX_SUN_PATH: usize = SUN_PATH_CAPACITY - 1;
 
 /// Override for the rendezvous base. Both the runtime and the client read it,
 /// so a caller that sets it must set it for both.
