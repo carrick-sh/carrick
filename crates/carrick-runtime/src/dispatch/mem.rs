@@ -21,11 +21,11 @@
 //!    while reused free regions get zeroed. That breaks when `munmap` lowers
 //!    `mmap_next` back over pages the guest already dirtied — a later bump
 //!    allocation would hand back STALE bytes instead of the zeroed anon memory
-//!    Linux guarantees. `mmap_dirty_high` is the fix: a MONOTONIC high-water
+//!    Linux guarantees. `mmap_writable_high` is the fix: a MONOTONIC high-water
 //!    that `munmap` never lowers, so the mmap handler can zero exactly the
 //!    re-handed-out (below-high-water) ranges and leave the genuinely-fresh
 //!    tail lazily zero. (This is the CPython `test_subprocess` SEGV root cause —
-//!    see the `mmap_dirty_high` field doc and the project memory.)
+//!    see the `mmap_writable_high` field doc and the project memory.)
 //! 2. **The shared aperture** (`shared`). A single region `hv_vm_map`'d ONCE at
 //!    boot; `MAP_SHARED` mmaps (including SysV `shmat`) carve sub-ranges out of
 //!    it, so no stage-2 mutation happens at mmap time.
@@ -173,19 +173,38 @@ pub(super) struct MemState {
     pub brk_current: u64,
     /// Bump cursor for the anonymous mmap arena.
     pub mmap_next: u64,
-    /// MONOTONIC high-water of the arena: the highest address ever handed out by
-    /// the bump allocator, which `munmap` NEVER lowers (unlike `mmap_next`).
+    /// MONOTONIC high-water of the arena: the highest address the guest could
+    /// EVER have stored a non-zero byte into. `munmap` NEVER lowers it (unlike
+    /// `mmap_next`).
     ///
     /// The bump path assumes `[mmap_next, ...)` is pristine (lazily zero-filled
     /// guest RAM), so it skips the zero-fill that reused `free_regions` get. That
     /// invariant breaks when `munmap` frees the TOP region and LOWERS `mmap_next`
     /// back over pages the guest already dirtied: a later bump allocation at the
     /// lowered cursor would return that STALE data instead of the zeroed anon
-    /// memory Linux guarantees. Tracking the true dirty high-water lets the mmap
-    /// handler zero exactly the re-handed-out (below-high-water) ranges and keep
-    /// the genuinely-fresh tail lazily zero. (CPython test_subprocess SEGV:
+    /// memory Linux guarantees. Tracking the high-water lets the mmap handler
+    /// zero exactly the re-handed-out (below-high-water) ranges and keep the
+    /// genuinely-fresh tail lazily zero. (CPython test_subprocess SEGV:
     /// pymalloc got 'x'-filled stderr-buffer pages back from a post-munmap mmap.)
-    pub mmap_dirty_high: u64,
+    ///
+    /// **It is raised by WRITABILITY, not by allocation, and the distinction is
+    /// the whole point of the name.** It was previously raised at every
+    /// hand-out regardless of protection, so a `PROT_NONE` reservation — memory
+    /// the guest cannot store into by definition — pushed the watermark past
+    /// itself and forced every later allocation below it to be scrubbed. Go's
+    /// allocator reserves enormous `PROT_NONE` regions and commits sub-ranges,
+    /// so that over-approximation is the dominant shape on a build: measured at
+    /// 145,453 zero-fill faults inside guest `mmap` service windows, against a
+    /// workload whose real touched set is ~10.5x smaller
+    /// (`docs/perf-results/2026-08-13-hvpatch-kf-scrub-ceiling.md`).
+    ///
+    /// SOUNDNESS: a page can only hold a non-zero byte if the guest could write
+    /// it, and there are exactly two ways a guest range becomes writable — the
+    /// `mmap` that creates it, and an `mprotect` that adds `PROT_WRITE`. BOTH
+    /// raise this watermark. Anything that cannot prove non-writability raises
+    /// it too, so the error direction is always "scrub something already zero",
+    /// never "hand back stale bytes".
+    pub mmap_writable_high: u64,
     /// Sub-allocator for the boot-mapped shared aperture. Guest `MAP_SHARED`
     /// mmaps carve sub-ranges here; the aperture itself is `hv_vm_map`'d once
     /// at boot, so no stage-2 mutation happens at mmap time.
@@ -278,7 +297,7 @@ impl MemState {
             layout,
             brk_current: layout.heap_base,
             mmap_next: layout.mmap_base,
-            mmap_dirty_high: layout.mmap_base,
+            mmap_writable_high: layout.mmap_base,
             shared: crate::shared_aperture::SharedAperture::new(),
             overlay: crate::shared_aperture::SharedAperture::with_window(
                 crate::memory::LINUX_PRIVATE_OVERLAY_BASE,
@@ -1620,14 +1639,38 @@ impl SyscallDispatcher {
         &self,
         requested: u64,
         length: u64,
-        _prot: u64,
+        prot: u64,
         flags: u64,
     ) -> Option<(u64, bool)> {
+        // Only a WRITABLE hand-out can ever leave a non-zero byte behind, so
+        // only a writable hand-out raises the watermark. A `PROT_NONE` reserve
+        // — Go's allocator makes them by the gigabyte — cannot be stored into,
+        // and raising the watermark past it forced every later allocation below
+        // it to be scrubbed for nothing. `mprotect` is the other mark point;
+        // see `mmap_writable_high`.
+        let writable = prot & LINUX_PROT_WRITE != 0;
         let page_size = self.linux_page_size();
         let layout = self.mem.lock().layout;
         if flags & LINUX_MAP_FIXED != 0 {
             if requested == 0 || !requested.is_multiple_of(page_size) {
                 return None;
+            }
+            // THE THIRD MARK POINT, and it closes a hole that predates the
+            // writability gate. `MAP_FIXED` returns early without consulting or
+            // raising the watermark, so a writable fixed mapping that the guest
+            // then wrote to left no trace: a later bump allocation landing on
+            // that span would compare against a watermark that never covered it
+            // and skip the scrub. It was masked because the scrub site also
+            // fires on `fixed_anonymous`, which only protects the FIXED mapping
+            // itself — not the plain bump that inherits its pages afterwards.
+            // Raising it here is cheap and keeps the invariant whole: every way
+            // a range becomes writable raises the watermark.
+            if prot & LINUX_PROT_WRITE != 0
+                && range_within(requested, length, layout.mmap_base, layout.mmap_size)
+                && let Some(end) = requested.checked_add(length)
+            {
+                let mut mem = self.mem.lock();
+                mem.mmap_writable_high = mem.mmap_writable_high.max(end);
             }
             return Some((requested, false));
         }
@@ -1645,8 +1688,10 @@ impl SyscallDispatcher {
                     // the guest already dirtied below the monotonic dirty high-
                     // water (mmap_next was lowered by a prior munmap). Above the
                     // high-water it's pristine guest RAM — keep it lazily zero.
-                    let stale = requested < mem.mmap_dirty_high;
-                    mem.mmap_dirty_high = mem.mmap_dirty_high.max(end);
+                    let stale = requested < mem.mmap_writable_high;
+                    if writable {
+                        mem.mmap_writable_high = mem.mmap_writable_high.max(end);
+                    }
                     return Some((requested, stale));
                 }
             }
@@ -1676,8 +1721,10 @@ impl SyscallDispatcher {
         // Same dirty-high-water discipline as the hint path: a bump allocation
         // that dips below the high-water (because munmap lowered mmap_next over
         // already-touched pages) must be zeroed, not returned with stale bytes.
-        let stale = address < mem.mmap_dirty_high;
-        mem.mmap_dirty_high = mem.mmap_dirty_high.max(end);
+        let stale = address < mem.mmap_writable_high;
+        if writable {
+            mem.mmap_writable_high = mem.mmap_writable_high.max(end);
+        }
         Some((address, stale))
     }
 
@@ -3800,7 +3847,7 @@ impl SyscallDispatcher {
                         mem.mmap_next = new_end;
                         // The dirty high-water stays monotonic so a later
                         // munmap+rebump cannot expose bytes dirtied in this tail.
-                        mem.mmap_dirty_high = mem.mmap_dirty_high.max(new_end);
+                        mem.mmap_writable_high = mem.mmap_writable_high.max(new_end);
                     }
                     this.record_dynamic_mapping(
                         old_address.0,
@@ -4055,6 +4102,19 @@ impl SyscallDispatcher {
             if range_within(address.0, length, layout.mmap_base, layout.mmap_size) {
                 if cx.memory.protect_range(address.0, len, prot).is_err() {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                }
+                // THE SECOND MARK POINT. `mmap` is the first: together they are
+                // the only two ways an arena range becomes guest-writable, and
+                // the watermark is only sound because BOTH raise it. A
+                // `PROT_NONE` reserve that is later committed RW here must push
+                // the watermark past itself, or a post-`munmap` bump could hand
+                // those written pages back unscrubbed. See
+                // `mmap_writable_high`.
+                if prot_flags.contains(LinuxProtFlags::WRITE)
+                    && let Some(end) = address.0.checked_add(length)
+                {
+                    let mut mem = this.mem.lock();
+                    mem.mmap_writable_high = mem.mmap_writable_high.max(end);
                 }
             } else if mprotect_range_in_identity_image(address.0, length, layout) {
                 if cx.memory.protect_range(address.0, len, prot).is_err()
@@ -9581,6 +9641,72 @@ mod tests {
         assert!(dispatcher.mem.lock().free_regions.is_empty());
     }
 
+    /// A `PROT_NONE` reservation cannot hold a guest-written byte, so it must
+    /// NOT raise the writable watermark — and a later allocation that lands
+    /// under it must therefore be handed back WITHOUT a scrub.
+    ///
+    /// This is the dominant shape on a build: Go's allocator reserves by the
+    /// gigabyte and commits sub-ranges, and raising the watermark on every
+    /// hand-out regardless of protection is what made carrick memset 2.38 GB
+    /// for a workload whose real touched set is ~226 MB
+    /// (`docs/perf-results/2026-08-13-hvpatch-kf-scrub-ceiling.md`).
+    #[test]
+    fn a_prot_none_reserve_does_not_raise_the_writable_watermark() {
+        let dispatcher = SyscallDispatcher::new();
+        let base = dispatcher.mem.lock().mmap_writable_high;
+
+        // A large PROT_NONE reserve: allocated, never writable.
+        let reserve = dispatcher
+            .next_mmap_address(0, 16 * LINUX_PAGE_SIZE, 0, 0)
+            .expect("reserve");
+        assert!(!reserve.1, "a fresh bump allocation is never reused");
+        assert_eq!(
+            dispatcher.mem.lock().mmap_writable_high,
+            base,
+            "a PROT_NONE reservation must not move the writable watermark"
+        );
+
+        // Rewind the cursor the way `munmap` of the top region does, then take
+        // the same span again. Nothing could have written it, so no scrub.
+        dispatcher.mem.lock().mmap_next = reserve.0;
+        let again = dispatcher
+            .next_mmap_address(0, 16 * LINUX_PAGE_SIZE, 0, 0)
+            .expect("re-allocate");
+        assert_eq!(again.0, reserve.0);
+        assert!(
+            !again.1,
+            "re-handing out never-writable memory must not force a scrub"
+        );
+    }
+
+    /// The other half of the same invariant: a WRITABLE hand-out does raise the
+    /// watermark, so re-handing that span out later DOES force a scrub. Without
+    /// this the previous test would be satisfied by never raising it at all,
+    /// which is the stale-bytes bug the watermark exists to prevent.
+    #[test]
+    fn a_writable_mapping_raises_the_watermark_and_forces_a_later_scrub() {
+        let dispatcher = SyscallDispatcher::new();
+
+        let writable = dispatcher
+            .next_mmap_address(0, 16 * LINUX_PAGE_SIZE, LINUX_PROT_WRITE, 0)
+            .expect("writable mapping");
+        assert!(!writable.1, "a fresh bump allocation is never reused");
+        assert!(
+            dispatcher.mem.lock().mmap_writable_high >= writable.0 + 16 * LINUX_PAGE_SIZE,
+            "a writable hand-out must move the watermark past its end"
+        );
+
+        dispatcher.mem.lock().mmap_next = writable.0;
+        let again = dispatcher
+            .next_mmap_address(0, 16 * LINUX_PAGE_SIZE, LINUX_PROT_WRITE, 0)
+            .expect("re-allocate");
+        assert_eq!(again.0, writable.0);
+        assert!(
+            again.1,
+            "re-handing out memory the guest could have written MUST force a scrub"
+        );
+    }
+
     #[test]
     fn reset_memory_state_on_execve_resets_arenas_and_preserves_auxv_snapshot() {
         let dispatcher = SyscallDispatcher::new();
@@ -9589,7 +9715,7 @@ mod tests {
             let mut mem = dispatcher.mem.lock();
             mem.brk_current = LINUX_HEAP_BASE + 0x21000;
             mem.mmap_next = LINUX_MMAP_BASE + 0x8000;
-            mem.mmap_dirty_high = LINUX_MMAP_BASE + 0x9000;
+            mem.mmap_writable_high = LINUX_MMAP_BASE + 0x9000;
             free_regions_insert(&mut mem.free_regions, LINUX_MMAP_BASE + 0x1000, 0x1000);
         }
 
@@ -9599,7 +9725,7 @@ mod tests {
             let mem = dispatcher.mem.lock();
             assert_eq!(mem.brk_current, LINUX_HEAP_BASE);
             assert_eq!(mem.mmap_next, LINUX_MMAP_BASE);
-            assert_eq!(mem.mmap_dirty_high, LINUX_MMAP_BASE);
+            assert_eq!(mem.mmap_writable_high, LINUX_MMAP_BASE);
             assert!(mem.free_regions.is_empty());
             assert_eq!(mem.linux_auxv_image, vec![1, 2, 3, 4]);
         }
