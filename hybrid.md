@@ -242,6 +242,36 @@ files, credentials and cancellation/signal state.
 
 ---
 
+## Phase status at a glance
+
+**Updated 2026-08-13.** Every phase, what is actually done, and the ONE thing
+that unblocks the next step. This table is the answer to "where are we"; the
+sections below carry the reasoning.
+
+| phase | status | landed | next concrete step |
+|---|---|---|---|
+| **KN** kernel namei | **partial, retained** | dcache + `at()` resolves against a cached parent; −3.1% CPU; cross-process stat staleness closed | finish the walk: `openat` is 17.75x against a ≤2.0 gate |
+| **KF** page lifecycle | **step C landed, retained** | watermark raised by writability; −6.9% CPU, −12.2% sys; whole-build `zfod` −62.3% | re-census, then mechanism A or B for the residue |
+| **KL** lifecycle | **partial** | per-task user AND system CPU, both oracle-matched; `CLONE_PIDFD` scoping; concurrent sibling fork | `ru_maxrss`/`ru_majflt` still host-sourced |
+| **KD** diagnostics | **partial** | ELF core writer + `carrick debug core`; crash now reports as signal death, oracle-matched | write the core: needs the per-thread register file (shared with KS) |
+| **KS** scheduler | **designed, not built** | M:N executor design decided | step 1 is the same register file KD needs — build it once |
+| **KM** kernel memory | **not started** | — | no guest-visible COW exists; child stage-1 leaves are built read-write |
+| **KX** kernel exec | **not started** | — | exec still unmaps/remaps 32 GiB per call |
+| **KP** shipped proof | **not started** | — | `baseline.hvpatch.jsonl` does not exist; Node.js aborts in V8 startup |
+
+**Measured position:** cold `go build` **3.803 CPU-s**, window **1,828 ms**
+(from 4.223 / 2,051 at the K1 boundary). The bar is **2.3 CPU-s**, so roughly
+**1.5 CPU-s remain**. Nothing here is finished; KM and KX are untouched
+architecture, and KP has no baseline.
+
+**The one thing to build next is the per-thread register file.** It is step 1
+of KD (a core with wrong registers is worse than none) and step 2 of KS ("make
+the `Thread` register file the authority"). Two phases converge on it, and
+neither can proceed without it — so it should be built once, deliberately,
+rather than twice in parallel.
+
+---
+
 ## Phases
 
 Ordered by measured leverage. Each phase publishes a durable evidence
@@ -469,12 +499,23 @@ sharing, signal and credential rules, pidfds, parent/TID stores, exit, wait,
 groups, sessions — and per-task accounting. Replace stop-the-world polling
 with a minimal generation/permission barrier whose scope is proven by tests.
 
-Partly landed: per-task CPU ledgers now source `times`/`getrusage` from
-`Task` rather than from the host process
+Partly landed: per-task CPU ledgers source `times`/`getrusage` from `Task`
+rather than from the host process
 ([evidence](docs/perf-results/2026-08-13-hvpatch-per-task-cpu-ledgers.md)),
 `CLONE_PIDFD` installs are scoped to the forking parent, and sibling threads
-fork concurrently. **Known open:** per-task *system* time is still reported as
-zero, and `ru_maxrss`/`ru_majflt` remain host-sourced.
+fork concurrently.
+
+**Per-task SYSTEM time landed at `f850336c5`** and closed the gap this section
+used to record as open. The vCPU exec slots only see time inside
+`hv_vcpu_run` — the guest running its own instructions, i.e. USER time — so
+the CPU carrick spends SERVICING syscalls was counted nowhere and `stime` read
+zero. `Thread` now charges it at the dispatch boundary from
+`CLOCK_THREAD_CPUTIME_ID`, so a task blocked in `wait4` accrues none, as on
+Linux. Red-first against the oracle, and it cost nothing measurable (−0.2%,
+within noise).
+
+**Known open:** `ru_maxrss` and `ru_majflt` remain host-sourced — they
+describe the address space, which is not yet accounted per task.
 
 **Gate:** Docker-oracle probes and relevant LTP cases match; the canonical
 build retains 68 forks / 67 execs / 69 processes; mean fork critical path
@@ -502,9 +543,26 @@ navigates guest tasks, threads, mappings, frames, fds, signals and the event
 ring from live state or a core without treating host pointers as guest virtual
 addresses.
 
-Largely landed (`96dcc3179`, `b26187d93`). **Known open:** the crash-path
-wiring and one named live divergence, specified in
+The writer and validator are landed (`96dcc3179`, `b26187d93`) and externally
+validated; the wiring spec is
 [`docs/superpowers/specs/2026-08-13-core-dump-wiring.md`](docs/superpowers/specs/2026-08-13-core-dump-wiring.md).
+
+**A worse divergence than that spec assumed was found and fixed
+(`1aa5db553`).** The spec expected `core_dumped_si_code` to set `CLD_DUMPED`
+without producing a file. In fact a guest that dereferenced NULL was not
+reported as signal-terminated AT ALL — `RunResult.exit_code` carried both "the
+guest called exit(N)" and "a signal killed it" folded into `128 + signum`,
+which is byte-identical to a real `exit(139)`. That was harmless while a Linux
+process was a host process (the host child genuinely died of the signal); under
+the kernel lane it is a thread, so the distinction had to be in the value and
+was not. `RunResult` now carries `terminating_signal` and owns the encoding in
+one place. `child_was_signaled`, `child_exited_normally` and
+`child_died_of_sigsegv` now all match the oracle.
+
+**Known open, and deliberately left red:** `wcoredump_set` still diverges —
+carrick writes no core. `conformance-probes/src/bin/coredumpfile.rs` is the
+gate. **The blocker is the per-thread register file**, which is also KS's step
+1; see the status table.
 
 **Gate:** a guest that faults produces a core that `carrick debug core`
 validates and LLDB navigates, from the crash path and not only on demand;
