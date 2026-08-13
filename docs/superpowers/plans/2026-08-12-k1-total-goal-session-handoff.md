@@ -180,15 +180,32 @@ magic-plus-padding block (`n=68`, seen 24 times) and then the member
 starting with `cpu.o`. So a buffer beginning `cpu.o` is normal at a nonzero
 offset and corrupt only at offset 0.
 
-`WRDBG`/`IODBG` print fd and length but **not the file offset**, which is
-precisely the field that separates the two cases — and separates "a read
-started 8 bytes in" from "the file being read was already shifted". Adding
-the offset to those two trace lines is the single cheapest next step, and
-it is a durable improvement rather than scratch instrumentation. With
-offsets in hand the question resolves in one run: if the corrupt cache
-entry's `WRITE` begins at offset 0 with `cpu.o`, the producing `READ` is
-the defect; if the `READ` is at offset 8 of a good file, it is an fd-offset
-bug on a shared/duplicated description.
+`WRDBG`/`IODBG` printed fd and length but not the file offset, which is
+precisely the field that separates those cases. **Offsets were added**
+(`1530d1def`): reads report their start, writes the offset captured before
+advancing.
+
+**But `trace-io` PERTURBS THE BUG AWAY — measured, not assumed.** With the
+feature enabled the corruption did not reproduce in **4 of 4** runs, against
+a base rate of 3 in 4 without it. P(0 of 4 | p=0.75) ≈ 0.4%, so this is a
+genuine Heisenbug and `trace-io` cannot be the instrument that catches it.
+Do not spend another cycle re-running the fixture under `trace-io` and
+concluding the bug is fixed.
+
+**The gap that blocks the next step.** The project's answer to a
+tracing-perturbed Heisenbug is the always-on lock-free event ring read via
+`carrick-lldb`, and the ring is the right tool here — but it has **no
+file-write record carrying an offset**. `EFDWRITE` is an *eventfd* record
+(`hfd/before/after` counter values), not a file write; the file records are
+`FDOPEN`/`FDCLOSE` only.
+
+So the next step is to add one ring record for file writes carrying host fd
+and starting offset. Keep it genuinely low-perturbation: the ring write
+itself is lock-free and cheap, but resolving the offset costs an `lseek`, so
+gate that on a cheap predicate (e.g. only when the buffer's first bytes look
+like an `ar` boundary) rather than paying it on every write — which is
+exactly the cost that made `trace-io` hide the bug. Then run WITHOUT
+`trace-io`, reproduce, and read the ring from the failing process.
 
 Other untested suspects: the generic `copy_file_range` read-then-write body
 (`sendfile_bytes` + `write_output_fd`) under siblings sharing a host file
