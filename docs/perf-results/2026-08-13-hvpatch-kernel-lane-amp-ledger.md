@@ -1,0 +1,148 @@
+# The kernel lane's first AMP1 ledger — and it moves the target off syscalls
+
+**Recorded 2026-08-13**, immediately after KN
+([evidence](2026-08-13-hvpatch-kernel-namei.md)). This is the first
+amplification ledger ever taken of the `hvpatch` backend: AMP1 previously
+refused any target that did not name `--exec-backend native`, so the lane this
+tree is measured against had never been censused by the tree's own instrument.
+That refusal is fixed (`8b2f751dc`); this is the result.
+
+## Provenance
+
+| Field | Value |
+| --- | --- |
+| Commit | `8b2f751dc` (tree clean) |
+| Signed binary SHA-256 | `a197837fcfde2e10c1799c591aa42db868c0338d1a59183bc607cce1423d43e4` |
+| Host | macOS 27.0 `26A5406e`, Darwin 27.0.0 arm64, Apple M4, 10 logical (4P + 6E) |
+| Image | `localhost:5005/carrick-go-conformance@sha256:357a08793e683c6a174d3955c704a5194e825f38fcdcb91d1d4ee2bccd6b188b` |
+| Backend | `--exec-backend hvpatch` |
+| Artifact | `target/perf/kn-amp/kn-after-2.ledger.json`, schema `carrick.amplification-ledger.v1` |
+| Result | `BUILD_OK`, exit 0 |
+
+**Authenticated and closed.** Every per-op sum equals the capture's independent
+total (`closure` section), `inherited_service_ends` is 0, and the reader refuses
+a stream that cannot prove itself. `probable_instrument` is zero, so no
+libdtrace `kdebug_trace*` traffic contaminated the census.
+
+**Traced.** Counts are what this measures. The CPU-ns figures are `vtimestamp`
+sums — on-CPU time inside the host call — which is a same-instrument quantity
+and is used only for ranking, never as an absolute against an untraced budget.
+
+## Headline
+
+| | value |
+| --- | ---: |
+| guest Linux syscalls | 73,747 |
+| host macOS syscalls | 242,171 |
+| **overall amplification** | **3.28x** |
+| host syscall CPU | 1.014 s |
+| mach traps | 42,284 (0.091 s) |
+| `as_fault` | **279,987** |
+| `zfod` | **230,298** |
+| `cow_fault` | 8,350 |
+
+For comparison, the pre-KN census
+([ledger](2026-08-13-hvpatch-build-amplification-ledger.md)) reported 4.71x
+overall. Guest counts match almost exactly across the two captures (3,272 vs
+3,268 `openat`; 3,961 vs 3,967 `newfstatat`; 282 vs 283 `mkdirat`), so the same
+workload was measured — but they are DIFFERENT PROGRAMS
+(`syscall-amplification.d` vs AMP1), so read the improvement as indicative,
+not as a controlled before/after.
+
+## KN's gate, answered
+
+| guest op | guest calls | host calls | amplification | pre-KN | gate |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `openat` | 3,272 | 58,074 | **17.75** | 32.78 | ≤ 2.0 |
+| `newfstatat` | 3,961 | 28,015 | **7.07** | 13.84 | ≤ 2.0 |
+| `mkdirat` | 282 | 12,741 | **45.18** | 90.96 | ≤ 2.0 |
+| `unlinkat` | 156 | 7,693 | **49.31** | — | ≤ 2.0 |
+| overall | 73,747 | 242,171 | **3.28x** | 4.71x | ≤ 2.0x |
+
+**KN roughly halved every path-op ratio and did not meet its gate.** Recorded
+as a partial: the mechanism is right and the remaining factor is real. The
+dominant host call inside `openat`, `newfstatat`, `mkdirat` and `unlinkat`
+service windows is still `openat` itself, so cap-std is still walking something
+— the leaf, the fallback cases, or a prefix the cache could not serve.
+
+Path operations cost **384 ms** of the 1,014 ms of host-syscall CPU (37.8%).
+Driving them to the gate would recover at most ~326 ms — on a build whose
+untraced total is ~4.1 CPU-s, that is **under 8%**. The gate is worth meeting
+for its own sake; it is not worth mistaking for the goal.
+
+## The finding: faults, not syscalls
+
+The census puts **279,987 `as_fault` and 230,298 `zfod`** on this build. At the
+6.42 µs single-threaded fault cost this tree measured on 2026-08-01, 280k
+faults is **~1.8 CPU-s** — which is, to within its own error, the ENTIRE
+overhead the goal requires removing (~1.97 CPU-s).
+
+Attributed by the guest operation being serviced:
+
+| guest op | guest calls | host calls | `as_fault` | `zfod` | host CPU |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **`mmap`** | 1,966 | 2,045 | **151,375** | **150,749** | 5 ms |
+| **`execve`** | 68 | 8,306 | **45,815** | **45,430** | 36 ms |
+| `clone` | 358 | 6,993 | 2,102 | 1,749 | 9 ms |
+| `carrick-only` | 28,890 | — | 70,678 | 30,896 | 404 ms |
+| `madvise` | 381 | 15 | 511 | 29 | 0 ms |
+| `munmap` / `mprotect` / `brk` | 92 | 5 | 27 | 0 | 0 ms |
+
+Read the `mmap` row carefully, because it inverts the usual shape:
+
+> **`mmap` costs 1.04 host syscalls per guest call and 76.7 zero-fill faults.**
+> The syscall side is already essentially perfect. The cost is 150,749 pages —
+> **2.36 GiB at 16 KiB pages** — being zero-filled per build, INSIDE the
+> service window, which is carrick's own host-side touching, not the guest
+> running.
+
+`execve` shows the same shape at 668 `zfod` per exec.
+
+This is the same class of finding the native lane resolved on 2026-08-07, where
+a whole-range anonymous scrub was replaced kernel-side and in-window `zfod`
+collapsed 553k → ~723
+([anon-reuse-remap](2026-08-07-anon-reuse-remap.md)). **That work was never
+carried to the kernel lane.** Note the native fix does not port directly:
+`CARRICK_DSR_ZERO_REMAP` lives in `carrick-dsr-aarch64::mapped_memory`, and the
+HVF lane's `HvfInner::zero_guest_backing` (`carrick-vmm-hvf/src/trap.rs:4795`)
+is a plain `write_bytes` memset with no remap path. Remapping is not
+straightforwardly available there either — the arena is `hv_vm_map`'d into
+stage-2, so replacing the host pages beneath a live IPA would leave the guest
+looking at the old physical pages.
+
+### What is NOT established
+
+**The mechanism behind the `mmap` faults is an open question, and this document
+does not guess at it.** The three `zero_backing` call sites in
+`dispatch/mem.rs` are `brk` shrink, `mremap` reuse and `MADV_DONTNEED` — and
+the census shows `brk`, `mremap` and `madvise` producing 29 `zfod` between
+them, so **the scrub is not the source.** Anonymous `mmap` allocates no eager
+buffer (`bytes = Vec::new()`), and the private-file lowering is already on. So
+something else in the mmap service path touches 76.7 fresh pages per call, and
+naming it requires the fault-attribution instrument
+(`scripts/dtrace/native-fault-attribution.d`) rather than more code reading.
+
+Also not established: the 6.42 µs per-fault cost was measured on the native
+lane in a different context, so the ~1.8 CPU-s figure is an order-of-magnitude
+estimate, not a measurement. It is strong enough to RANK the work and not
+strong enough to bank.
+
+## Two smaller corrections this census forces
+
+- **`carrick-only` is 11.9% of host calls here, not 30.1%.** Its 404 ms of CPU
+  is dominated by **`clonefileat`: 319 ms in 21 calls** — the rootfs COW seed,
+  a one-time container setup cost, not per-syscall runtime overhead. Steady-state
+  `carrick-only` is closer to 85 ms. The earlier 30.1% figure came from a
+  different program and should not be quoted against this one.
+- **`nanosleep` is called 13,629 times** by the guest for 28 ms of host CPU at
+  1.34x. Cheap per call, but that population is worth understanding — it is the
+  second-largest guest syscall count in the run.
+
+## Next
+
+1. Attribute the `mmap`-window faults to their exact host-side origin. Until
+   that is named, the largest term in the build is unexplained.
+2. Then decide the lowering. The native lane's answer — let Darwin's zero-fill
+   deliver a pre-zeroed page instead of writing one — is the right shape, and
+   the stage-2 constraint means the kernel lane needs its own expression of it.
+3. Path amplification stays on the list, honestly sized at under 8%.
