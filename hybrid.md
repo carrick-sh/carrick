@@ -270,7 +270,7 @@ parked set. Every row names the ONE thing that unblocks its next step.
 
 | phase | status | landed | next concrete step |
 |---|---|---|---|
-| **KI** kernel identity *(new)* | **in progress** | `guest_pid_is_live` routes 3 of 4 liveness probes to the task registry; duplicate root-tid derivation removed | the six `LINUX_BOOTSTRAP_PID` self-aliases, then the two-allocator problem, then the reseed |
+| **KI** kernel identity *(new)* | **in progress; mechanism SETTLED by measurement** | `guest_pid_is_live` routes 3 of 4 liveness probes to the task registry; duplicate root-tid derivation removed | close the remaining comparators, then seed the root at 1 in `hvpatch/mod.rs:626` — the FATAL objection does not apply to a lane-scoped reseed |
 | **KP** conformance proof | **started** | kernel lane added to the harness; first gate: **304 PASS / 90 FAIL**, 26 kernel-lane-specific | bless `baseline.hvpatch.jsonl`; close the 26, largest cluster first |
 | **KD** diagnostics | **partial** | ELF core writer + validator; crash reports as signal death, oracle-matched | build a `CoreDump` from live state — a correct first slice needs NO memory plumbing |
 | **KL** lifecycle | **partial** | per-task user AND system CPU, oracle-matched; `CLONE_PIDFD` scoping; concurrent sibling fork | `ru_maxrss`/`ru_majflt` still host-sourced; per-task `/proc` authority |
@@ -320,6 +320,24 @@ floor — do not make it dramatically worse — and is no longer a gate.
      macOS is `launchd`. **Close the host-pid comparators FIRST**, as their own
      commit: they are correct at either seed, which is what makes that ordering
      safe.
+
+   **The mechanism is now SETTLED by measurement, not inference**
+   ([evidence](docs/perf-results/2026-08-13-hvpatch-id-mechanism-settled.md)).
+   `carrick debug hvpatch-kernel` on a live run with a forked child says the
+   root task id IS the host pid (70828, `hvpatch-root`), children are allocated
+   at root+1 (70829, 70830), and a child's `getpid()` is EXACTLY its task id —
+   so there is one authority per child and the number is wrong because the ID
+   is wrong. The root alone is mapped to 1, which is why a parent and its child
+   answer from different schemes. `process_group` and `session` are 70828 for
+   every task, and the guest sees it: a child's `/proc/self/stat` reports
+   `pgrp=70954 sid=70954` where Docker reports `1` and `1` — so job control is
+   broken too, which is what the `waitpgid`/`setpgidparentgroup` failures are.
+
+   **This retires the FATAL objection for a LANE-SCOPED reseed.**
+   `initialize_root_process` returns early for non-hvpatch lanes
+   (`hvpatch/mod.rs:619-621`), so seeding the root at 1 THERE cannot reach
+   native or vmm, which bootstrap through `bootstrap_one_task_binding`
+   instead. The two MAJOR objections survive and are still the work.
 
    **Step 1 started (`f6bf85701`).** Three of the four `kill(pid, 0)` liveness
    probes now ask carrick's kernel through `guest_pid_is_live`, which returns
