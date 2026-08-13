@@ -249,6 +249,19 @@ append write goes to the end, and still appends after an explicit
 `lseek(0, SEEK_SET)`, which is exact Linux semantics. So the defect is not
 the flag's basic implementation.
 
+**CAVEAT on the `prior_magic` field: it is UNRELIABLE, the offset-0 detection
+is not.** The detector also reports whether that host fd previously received
+an archive-magic write. That map is keyed by host fd number and is never
+cleared on close, and host fd numbers are recycled heavily within one build,
+so a `Some(...)` may be stale from a completely different file. Observed
+directly: under load the same run reports a mix of
+`prior_magic=None`, `Some((68, 2))`, `Some((22985, 8))` and
+`Some((12013, 11))` — the larger lengths are previous files' magic writes on
+a recycled fd number. Do not conclude "the magic reached this fd" from a
+`Some`. Fix by clearing the entry when the host fd closes, or by keying on
+file identity rather than fd number. The offset-0 member-header detection
+itself is unaffected and remains validated below.
+
 **The detector is VALIDATED, not a false positive.** A worry worth checking
 was that `O_APPEND` legitimately leaves the file offset at 0 until the first
 write (confirmed directly: an `O_APPEND` open reports offset 0), which would
