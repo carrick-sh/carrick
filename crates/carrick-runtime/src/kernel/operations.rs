@@ -1093,7 +1093,24 @@ impl Kernel {
             if caller_record.task.key() != parent.task.key() {
                 return Err(KernelOperationError::ParentExited);
             }
-            if caller_record.revision != parent.revision {
+            // Compare the PARENT ASSOCIATION, not the revision.
+            //
+            // A task's revision advances whenever any thread publishes a
+            // child, so requiring equality here made two threads of one Linux
+            // process unable to fork concurrently: the first commit advanced
+            // the shared parent's revision and the sibling was refused with
+            // `StaleContext`, which the guest sees as `EAGAIN`. Linux has no
+            // such rule, and the Go toolchain forks concurrently from several
+            // threads — that is why a cold `go build` reported
+            // "fork/exec ...: resource temporarily unavailable".
+            //
+            // What the revision check was really protecting is reparenting: a
+            // context captured before this task's parent exited must not fork,
+            // or the child attaches to the wrong parent. That is exactly the
+            // association, so compare it directly and let the benign advance
+            // through. Thread/resource/shared identity is still proven by the
+            // pointer checks below.
+            if caller_record.task.parent() != parent.parent_at_capture {
                 return Err(KernelOperationError::StaleContext);
             }
             let caller_thread = caller_record
@@ -3886,29 +3903,48 @@ mod tests {
         writer.join().expect("writer thread");
     }
 
+    /// Two threads of one Linux process must both be able to fork.
+    ///
+    /// This replaces an earlier `stale_context_cannot_commit_a_fork`, which
+    /// asserted the opposite: that a second fork from the same captured
+    /// context is refused as `StaleContext`. That contract is not Linux's.
+    /// Committing a child advances the PARENT's revision (it gains a child),
+    /// so any sibling holding a context captured beforehand was refused and
+    /// the guest received `EAGAIN`. The Go toolchain forks concurrently from
+    /// several threads, which is why a cold `go build` under HVPatch failed
+    /// with "fork/exec ...: resource temporarily unavailable".
+    ///
+    /// The invariant that check was really protecting — a context captured
+    /// before the task was REPARENTED must not fork — is now enforced
+    /// directly against the parent association and is covered by
+    /// `exiting_parent_reparents_live_and_zombie_children_to_root`.
     #[test]
-    fn stale_context_cannot_commit_a_fork() {
+    fn sibling_publication_does_not_stale_a_fork_context() {
         let (kernel, root) = bootstrap(275);
-        let child = kernel
+        let plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
+        let first = kernel
             .fork_task(
                 &root,
-                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                plan,
                 ThreadId::synthetic_for_tests(276),
                 "first child".to_string(),
                 None,
             )
             .expect("first fork");
-        drop(child);
-        let result = kernel.fork_task(
-            &root,
-            ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
-            ThreadId::synthetic_for_tests(277),
-            "stale child".to_string(),
-            None,
-        );
+        let second = kernel
+            .fork_task(
+                &root,
+                plan,
+                ThreadId::synthetic_for_tests(277),
+                "sibling child".to_string(),
+                None,
+            )
+            .expect("a sibling fork must not be staled by the first child's publication");
 
-        assert!(matches!(result, Err(KernelOperationError::StaleContext)));
-        assert_eq!(kernel.registry().task_count(), 2);
+        assert_ne!(first.task.key(), second.task.key());
+        assert_eq!(first.task.parent(), Some(root.task.key()));
+        assert_eq!(second.task.parent(), Some(root.task.key()));
+        assert_eq!(kernel.registry().task_count(), 3);
     }
 
     #[test]

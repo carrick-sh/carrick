@@ -27,6 +27,15 @@ pub struct KernelContext {
     pub(super) shared: Arc<TaskShared>,
     pub(super) resources: Arc<ThreadResources>,
     pub(super) revision: TaskRevision,
+    /// Parent association observed at capture.
+    ///
+    /// A task's `revision` advances for any observable change, including
+    /// simply gaining a child, so it cannot separate "a sibling forked"
+    /// (benign for this caller) from "this task was reparented" (which must
+    /// invalidate a fork, or the child attaches to the wrong parent).
+    /// Recording the association itself keeps the dangerous case detectable
+    /// without making the benign one fatal.
+    pub(super) parent_at_capture: Option<TaskKey>,
 }
 
 impl KernelContext {
@@ -73,6 +82,7 @@ impl KernelContext {
             shared: Arc::clone(&self.shared),
             resources: Arc::clone(&self.resources),
             revision: self.revision,
+            parent_at_capture: self.parent_at_capture,
         }
     }
 
@@ -110,6 +120,7 @@ impl KernelContext {
         resources: Arc<ThreadResources>,
         revision: TaskRevision,
     ) -> Self {
+        let parent_at_capture = task.parent();
         Self {
             kernel,
             task,
@@ -117,6 +128,7 @@ impl KernelContext {
             shared,
             resources,
             revision,
+            parent_at_capture,
         }
     }
 }
