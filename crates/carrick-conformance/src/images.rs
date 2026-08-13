@@ -59,9 +59,11 @@ pub fn is_stale(registry_digest: Option<&str>, last_pulled: Option<&str>) -> boo
 /// have their own stores. A refresh of one store says nothing about another.
 fn sidecar_path(lane: &crate::lane::Lane) -> PathBuf {
     match lane {
-        crate::lane::Lane::Hvf | crate::lane::Lane::MacosNativeDsr(_) => {
-            PathBuf::from("target/conformance/image-digests.json")
-        }
+        // All three local Darwin lanes share ONE macOS Carrick image store, so
+        // they share its sidecar: a refresh by any of them is a refresh for all.
+        crate::lane::Lane::Hvf
+        | crate::lane::Lane::MacosNativeDsr(_)
+        | crate::lane::Lane::Hvpatch(_) => PathBuf::from("target/conformance/image-digests.json"),
         crate::lane::Lane::Kvm(_) => PathBuf::from("target/conformance/image-digests.kvm.json"),
         crate::lane::Lane::KvmLocal(_) => {
             PathBuf::from("target/conformance/image-digests.kvm-local.json")
@@ -156,6 +158,7 @@ pub fn refresh_stale_images(
         let ok = match lane {
             crate::lane::Lane::Hvf
             | crate::lane::Lane::MacosNativeDsr(_)
+            | crate::lane::Lane::Hvpatch(_)
             | crate::lane::Lane::KvmLocal(_)
             | crate::lane::Lane::BhyveLocal(_)
             | crate::lane::Lane::NvmmLocal(_) => {

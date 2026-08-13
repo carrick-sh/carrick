@@ -35,6 +35,14 @@ pub struct NativeDsrConfig {
     pub timeout_scale: f64,
 }
 
+/// Kernel-lane configuration. Separate from `NativeDsrConfig` rather than
+/// reused so the two lanes' deadlines can diverge without one silently
+/// inheriting the other's — they are different backends with different costs.
+#[derive(Clone, Debug)]
+pub struct HvpatchConfig {
+    pub timeout_scale: f64,
+}
+
 /// Direct Linux/KVM lane configuration. The timeout scale is kept separate from
 /// Lima: a native x86_64 KVM host should be faster than nested Lima by default,
 /// but the operator can still stretch deadlines for loaded hosts.
@@ -78,6 +86,12 @@ impl DockerPlatform {
 pub enum Lane {
     Hvf,
     MacosNativeDsr(NativeDsrConfig),
+    /// The KERNEL lane: the same local signed binary run with
+    /// `--exec-backend hvpatch`, where every Linux process is a thread of one
+    /// host process inside one HVF VM. It is a local Darwin lane exactly like
+    /// `MacosNativeDsr`, so it shares that lane's registry, platform and
+    /// timeout handling and differs only in the backend flag it injects.
+    Hvpatch(HvpatchConfig),
     Kvm(LimaConfig),
     KvmLocal(LocalKvmConfig),
     BhyveLocal(LocalBhyveConfig),
@@ -94,6 +108,7 @@ impl Lane {
             self,
             Lane::Hvf
                 | Lane::MacosNativeDsr(_)
+                | Lane::Hvpatch(_)
                 | Lane::KvmLocal(_)
                 | Lane::BhyveLocal(_)
                 | Lane::NvmmLocal(_)
@@ -102,7 +117,9 @@ impl Lane {
 
     pub fn docker_platform(&self) -> DockerPlatform {
         match self {
-            Lane::Hvf | Lane::MacosNativeDsr(_) | Lane::Kvm(_) => DockerPlatform::LinuxArm64,
+            Lane::Hvf | Lane::MacosNativeDsr(_) | Lane::Hvpatch(_) | Lane::Kvm(_) => {
+                DockerPlatform::LinuxArm64
+            }
             Lane::KvmLocal(_) | Lane::BhyveLocal(_) | Lane::NvmmLocal(_) => {
                 DockerPlatform::LinuxAmd64
             }
@@ -116,6 +133,7 @@ impl Lane {
         match self {
             Lane::Hvf => timeout_s,
             Lane::MacosNativeDsr(cfg) => (timeout_s as f64 * cfg.timeout_scale).ceil() as u64,
+            Lane::Hvpatch(cfg) => (timeout_s as f64 * cfg.timeout_scale).ceil() as u64,
             Lane::Kvm(cfg) => (timeout_s as f64 * cfg.timeout_scale).ceil() as u64,
             Lane::KvmLocal(cfg) => (timeout_s as f64 * cfg.timeout_scale).ceil() as u64,
             Lane::BhyveLocal(cfg) => (timeout_s as f64 * cfg.timeout_scale).ceil() as u64,
@@ -167,6 +185,7 @@ pub fn carrick_invocation_argv(
     match lane {
         Lane::Hvf => carrick_argv_with_exec_backend(base, &suite.image, "vmm"),
         Lane::MacosNativeDsr(_) => carrick_argv_with_native_dsr(base, &suite.image),
+        Lane::Hvpatch(_) => carrick_argv_with_exec_backend(base, &suite.image, "hvpatch"),
         Lane::KvmLocal(_) | Lane::BhyveLocal(_) | Lane::NvmmLocal(_) => {
             let base = carrick_argv_with_exec_backend(base, &suite.image, "vmm");
             carrick_argv_with_platform(base, &suite.image, DockerPlatform::LinuxAmd64)
@@ -323,6 +342,9 @@ pub fn lane_from_args(
     local_timeout_scale: f64,
 ) -> Lane {
     match lane {
+        "hvpatch" | "macos-hvpatch" => Lane::Hvpatch(HvpatchConfig {
+            timeout_scale: native_timeout_scale,
+        }),
         "macos-native-dsr" | "native-dsr" => Lane::MacosNativeDsr(NativeDsrConfig {
             timeout_scale: native_timeout_scale,
         }),
@@ -418,6 +440,43 @@ mod tests {
         assert!(argv.contains(&"localhost:5005/carrick-go-conformance:1.24".to_string()));
         assert!(!argv.contains(&"limactl".to_string()));
         assert_explicit_backend_before_image(&argv, &s.image, "vmm");
+    }
+
+    /// The KERNEL lane must be a local Darwin invocation carrying
+    /// `--exec-backend hvpatch` BEFORE the image, and must NOT carry the
+    /// native lane's page-profile flag — that flag selects a DSR page geometry
+    /// which means nothing under HVF, and inheriting it silently would make
+    /// the lane measure something other than what it claims.
+    #[test]
+    fn hvpatch_invocation_is_local_and_injects_only_the_kernel_backend() {
+        let s = demo_suite();
+        let lane = lane_from_args("hvpatch", "carrick", "host.lima.internal", 2.0, 5.0, 1.0);
+        let argv = carrick_invocation_argv(&s, "target/release/carrick", "conf-1-2", &lane);
+
+        assert!(matches!(lane, Lane::Hvpatch(_)));
+        assert_eq!(lane.docker_platform(), DockerPlatform::LinuxArm64);
+        assert_eq!(lane.scaled_timeout(s.timeout_s), s.timeout_s * 5);
+        assert!(lane.needs_local_registry_env());
+        assert_eq!(argv[0], "target/release/carrick");
+        assert_eq!(argv[1], "run");
+        assert!(!argv.contains(&"limactl".to_string()));
+        assert_explicit_backend_before_image(&argv, &s.image, "hvpatch");
+        assert!(
+            !argv.iter().any(|tok| tok == "--native-page-profile"),
+            "the kernel lane must not inherit the DSR page-profile flag: {argv:?}"
+        );
+        // `macos-hvpatch` is the same lane under its long name.
+        assert!(matches!(
+            lane_from_args(
+                "macos-hvpatch",
+                "carrick",
+                "host.lima.internal",
+                2.0,
+                5.0,
+                1.0
+            ),
+            Lane::Hvpatch(_)
+        ));
     }
 
     #[test]
