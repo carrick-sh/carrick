@@ -115,6 +115,24 @@ correctness constraint is the shipped fast-path errno rule — only `ENOENT` is
 authoritative on a contained fast path, and errnos carrick synthesises from
 its own flags (`O_NOFOLLOW` → `ENOTDIR` on symlinked dirs) must fall back.
 
+### Negative result: `open_raw_fd` is NOT the hot cap-std caller
+
+Routing `HostFsBackend::open_raw_fd`'s non-create, non-truncate case through
+`fast_open_for_guest` (carrick's own one-`openat` + `F_GETPATH` contained open)
+before falling back to cap-std produced **no measurable reduction**: host
+syscalls per guest syscall went 4.644 → 4.560 and `linux:openat` stayed flat at
+~104.4k, inside run-to-run variation. The change was reverted rather than kept
+as an unproven second path.
+
+So the 47.5% arrives through some OTHER route into cap-std — the metadata and
+lookup variants (`open_raw_fd_with_metadata`, `lookup`/`lookup_kind`,
+`real_stat`) and `validate_parents_fast` are the remaining candidates, and
+`rootfs.rs`'s `open_for_dispatch` calls those directly. **Identify the exact
+caller before widening anything else**: the caller-stack aggregation above
+collapses on the first Carrick frame, so re-run it aggregating on the first
+frame BELOW `open_unchecked` to name cap-std's callers rather than its
+callees.
+
 ## The `carrick-only` bucket
 
 30.1% of host syscalls are issued with **no guest work in flight** — carrick's
