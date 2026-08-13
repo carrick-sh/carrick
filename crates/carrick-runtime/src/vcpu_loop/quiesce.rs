@@ -1169,7 +1169,7 @@ where
         let installed_pidfd = if request.pidfd_out.is_some() {
             match kernel
                 .dispatcher
-                .install_reserved_hvpatch_child_pidfd(&mut prepared_fork)
+                .install_reserved_hvpatch_child_pidfd(parent_context, &mut prepared_fork)
             {
                 Ok(fd) => Some(fd),
                 Err(errno) => {
@@ -1185,9 +1185,11 @@ where
         };
         let rollback_pidfd = |fd: Option<i32>| {
             if let Some(fd) = fd {
-                let _ = kernel
-                    .dispatcher
-                    .remove_installed_hvpatch_child_pidfd(fd, child_key);
+                let _ = kernel.dispatcher.remove_installed_hvpatch_child_pidfd(
+                    parent_context,
+                    fd,
+                    child_key,
+                );
             }
         };
         emit_fork_runtime_stage(

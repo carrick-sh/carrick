@@ -1168,8 +1168,18 @@ impl SyscallDispatcher {
     /// Reserve and install a pidfd while its HVPatch child is still
     /// undiscoverable. The watch is armed by `PreparedFork::commit` in the
     /// same registry transaction that publishes the child.
+    ///
+    /// The pidfd lands in the FORKING PARENT's table, so the caller passes the
+    /// exact parent `KernelContext` it already captured and this establishes
+    /// the resource scope for the install. The HVPatch fork path runs on the
+    /// vCPU loop OUTSIDE any dispatch boundary, so the fd helpers' ambient
+    /// `captured_file_table()` has nothing installed there — it aborted the
+    /// process rather than guess a table. Threading the context is also what
+    /// K1 requires: a lifecycle operation acts on the exact captured
+    /// references, never on a recaptured or ambient binding.
     pub(crate) fn install_reserved_hvpatch_child_pidfd(
         &self,
+        context: &crate::kernel::KernelContext,
         prepared: &mut crate::kernel::PreparedFork,
     ) -> Result<i32, crate::linux_abi::LinuxErrno> {
         let mut mux = crate::event_mux::make_event_multiplexer()
@@ -1185,7 +1195,9 @@ impl SyscallDispatcher {
             kqueue: watch,
             base: OpenDescriptionBase::new(0),
         };
-        match self.install_fd(description, LINUX_FD_CLOEXEC) {
+        match super::resources::with_captured_resources(context, || {
+            self.install_fd(description, LINUX_FD_CLOEXEC)
+        }) {
             DispatchOutcome::Returned { value } => {
                 i32::try_from(value).map_err(|_| crate::linux_abi::LINUX_EMFILE)
             }
@@ -1205,15 +1217,20 @@ impl SyscallDispatcher {
     }
 
     /// Roll back a pidfd installed before an HvPatch child was materialized.
+    /// Roll back an installed child pidfd. Runs on the same out-of-dispatch
+    /// fork path as the install, so it takes the same exact parent context.
     pub(crate) fn remove_installed_hvpatch_child_pidfd(
         &self,
+        context: &crate::kernel::KernelContext,
         fd: i32,
         child: crate::kernel::TaskKey,
     ) -> bool {
-        if self.pidfd_target(fd) != Some(PidfdTarget::Hvpatch(child)) {
-            return false;
-        }
-        self.remove_pidfd(fd)
+        super::resources::with_captured_resources(context, || {
+            if self.pidfd_target(fd) != Some(PidfdTarget::Hvpatch(child)) {
+                return false;
+            }
+            self.remove_pidfd(fd)
+        })
     }
 
     fn remove_pidfd(&self, fd: i32) -> bool {
