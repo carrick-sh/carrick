@@ -750,6 +750,12 @@ where
         // parent first would exchange the slot deadlock for a topology deadlock.
         let parent_reclaim =
             self.park_vcpu_for_blocking_wait(engine, crate::thread::VcpuParkClass::ReleaseSafe);
+        // Classified 2026-08-13: this is a real deadlock/lost wakeup, NOT a time
+        // assumption, so the bound is a backstop and must not be "fixed" by
+        // raising it. Measured on the cold go-build fixture: a successful run
+        // completes the whole build in 3-4 SECONDS, while a wedged
+        // materialization waits the entire budget and never receives `ready` —
+        // raising this to 120s produced 121s aborts, not passes.
         let ready_deadline = Instant::now() + Duration::from_secs(10);
         let ready = loop {
             match ready_rx.recv_timeout(Duration::from_millis(1)) {
