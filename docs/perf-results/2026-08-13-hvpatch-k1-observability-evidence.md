@@ -1,8 +1,88 @@
-# HVPatch K1 — observability contract landed, GO withheld
+# HVPatch K1 — observability contract landed
 
-**Decision: NO-GO for K1**, but for a different and much narrower reason
-than when this document was first written. See "Update — the blocker is
-fixed" immediately below.
+# DECISION: GO for K1
+
+Recorded 2026-08-13 at commit `1cc8ba0d2699a16f16a254495dff58db59cfe39a`.
+
+Every K1 gate criterion is met on the exact signed binary, and the lifecycle
+receipt is now **reproducible rather than lucky**: the strict Rust validator
+passes **5 of 5** consecutive captures, and the cold `go build` completes
+**10 of 10** runs.
+
+| Field | Value |
+| --- | --- |
+| Commit | `1cc8ba0d2699a16f16a254495dff58db59cfe39a` |
+| Signed binary SHA-256 | `ce951408709fc5c4231d697e23b6419c9a31fe89d4fc90466eb46399dc523257` |
+| Signed binary LC_UUID | `C453BDAC-0F9F-343F-86D5-478AA8852A78` |
+| Entitlement | `com.apple.security.hypervisor` (built via `just build`) |
+| Host | macOS 27.0 `26A5406e`, Darwin 27.0.0 arm64, Apple M4 (4P+6E) |
+| Toolchain | `rustc 1.96.0 (ac68faa20 2026-05-25)` |
+| Image | `localhost:5005/carrick-go-conformance@sha256:357a08793e683c6a174d3955c704a5194e825f38fcdcb91d1d4ee2bccd6b188b` |
+| `just ci` | **exit 0** |
+
+Five consecutive validator-passing captures, byte-identical in counts:
+
+```
+HVPATCHK1|end|version=2|roots=1|forks=68|execs=67|exits=69|births=69
+              |live=0|bounded=0|errors=0|target_exit_seen=1|target_exit_code=0
+```
+
+| Capture | SHA-256 |
+| --- | --- |
+| 1 | `f801488194ead0673ccc069b92a2b58df07da96c9131cabf8ee3618ba062b586` |
+| 2 | `239f3a308080cd3effca2f23e056a4ac116219461d0ffa712ef4020d9ee7ae13` |
+| 3 | `704dd35934c601794ebac32ab2a4e887c4d92169eb41ab52e2fc901ea25e87a4` |
+| 4 | `65f4456e1afbf8af169ca5e31cafa09b8db4c5aadf108550c11d6543c0ed2d85` |
+| 5 | `32ec13b872a3093638dd438087d145e9e79a2b91ce6ce8cda512e4695b69bed7` |
+
+**68 forks, 67 execs, 69 unique births, zero live residue, zero DTrace
+errors, exactly one VM create and one VM destroy, guest exit 0.** 69 Linux
+processes multiplexed inside a single HVF VM.
+
+## What GO covers, and what it explicitly does not
+
+GO covers the K1 scope only: typed kernel object model, mandatory exact
+`KernelContext`, coherent snapshots, the live debug protocol, typed
+lifecycle identity, the HAL frame inventory, and this lifecycle receipt with
+`just ci` green.
+
+**Still RED, and NOT claimed by this GO** (per the 2026-08-12 re-baseline):
+
+- File lifecycle binding to FileAuthority — **K3** (task #41).
+- Sole file/VFS authority; 0 of 361 classified call sites migrated — **K3**.
+- Legacy file state deletion (`ThreadResources.files`, writable VFS,
+  mirrors, host-fork rejection) — **K3**.
+- ASID/backing retirement still self-acknowledges; `TlbRetirementProof` is
+  defined but unused — **K3**.
+- Exec remains destructive rather than transactional — **K4**.
+- No performance claim. K1 requires none, but the shipped number must be
+  re-measured at K2's boundary and must not stay absent.
+
+## The three defects that stood between here and GO
+
+All three were found this session, and each is a genuine Linux-semantics or
+concurrency defect rather than a tuning knob:
+
+1. **`fcntl(F_GETFL)` destroyed a description's `O_APPEND`** (`90e833cc1`).
+   It overlaid the host fd's mutable bits, but carrick never opens an
+   overlay file with `O_APPEND`, so the flag read back absent and the guest
+   wrote that answer back through the standard read-modify-write. Go's
+   `os.OpenFile` does exactly that on every file, and `cmd/go` opens
+   archives `O_WRONLY|O_APPEND`, so the append branch died and archive
+   member headers landed at offset 0 — corrupting the build cache in 60-75%
+   of runs.
+2. **The guest `wait4` arm never parked its vCPU** (`1cc8ba0d2`). The
+   scheduler pool is ten slots for the whole host process; four `wait4`
+   threads pinned slots awaiting children whose sibling materializers were
+   starving for those same slots. A closed cycle with no runnable slot
+   holder — proven by a wedged-process backtrace, and by raising the
+   start-gate bound to 120 s and getting 121 s aborts rather than passes.
+3. **The topology lock was held across the sibling start handshake**
+   (`7fca3c0e5`). A real violation of this tree's rule against holding
+   object locks across a blocking wait, though measurement showed it was not
+   the cause of the wedge.
+
+Superseded analysis is retained below for attribution.
 
 ## Update — the blocker is fixed; the gate's constants are now the issue
 
