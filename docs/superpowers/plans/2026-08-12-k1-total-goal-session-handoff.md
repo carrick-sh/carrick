@@ -249,6 +249,15 @@ append write goes to the end, and still appends after an explicit
 `lseek(0, SEEK_SET)`, which is exact Linux semantics. So the defect is not
 the flag's basic implementation.
 
+**The O_APPEND atomicity fix (`bc70d999d`) did NOT fix this — measured.**
+Appending was emulated as `lseek(SEEK_END)` then a separate `write`, which
+is a real Linux-semantics defect (Linux does both atomically) and was fixed
+by letting the host kernel append. But it does not change the corruption
+rate: 6 of 10 runs still corrupt afterwards (1 of 4, then 5 of 6), against
+3 of 4 before. Statistically indistinguishable — the initial 1-of-4 reading
+was noise, and a 4-run sample was too small to act on. Keep the fix on its
+own correctness merits; do not treat the append race as the cause.
+
 That leaves two specific candidates, in priority order:
 
 1. the append POSITION being computed from a stale or cached file size — a
