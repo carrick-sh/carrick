@@ -302,11 +302,46 @@ reused scrubs turns one syscall into ~1,500 avoided faults, and a conservative
 size threshold captures most of the term while leaving the many small scrubs
 and their correctness surface alone.
 
-**The one genuinely open question is the HVF constraint** — whether host pages
-can be replaced under a live `hv_vm_map`'d IPA, and at what cost. Establish
-that empirically first; everything else follows from it. **Invariant 9 is
-binding either way:** anonymous `mmap` returning zeroed pages is not tradeable,
-so the lever must remove the work, not the guarantee.
+**The ceiling is measured, from the oracle.** Docker's Linux already does what
+KF proposes — demand-zero on first touch, nothing pre-scrubbed — so its
+minor-fault count IS the memory the workload genuinely needs: **55,126 faults ×
+4 KiB = ~226 MB**, against the **~2.38 GB carrick scrubs**. carrick touches
+**~10.5x more memory than the guest needs**, so the standing objection that
+"removing the scrub just moves the fault to first touch" is quantitatively
+wrong here. Ceiling: **62–90% of the term, ~15–20% of the build**
+([evidence](docs/perf-results/2026-08-13-hvpatch-kf-scrub-ceiling.md)).
+
+**Three designs were built and all three adversarially refuted** — the
+`MAP_FIXED|MAP_ANON` port (fatal: destroys the host VM entry `hv_vm_map`
+registered, which `carrick-mem/src/memory.rs:549-566` forbids because revoking
+it needs EL2-only `TLBI IPAS2E1`), `madvise(MADV_ZERO)` (fatal: two unverified
+XNU properties, plus a concrete stale-read sequence), and a provenance ledger
+(fatal twice: `MADV_DONTNEED` clears it over still-writable ranges with no store
+hook, and `CLONE_VFORK`'s `VM_INHERIT_SHARE` breaks per-process marks). Read
+those before proposing a fourth.
+
+**Two mechanisms survive, both already shipped in this tree:**
+
+- **`hv_vm_unmap` then `hv_vm_map` at the same IPA** is not hypothetical — the
+  hvpatch `execve` path does it 67 times per build inside a live VM on a
+  running vCPU (`trap.rs:6612`, `:7044-7053`), and at ~7 µs per call against
+  ~6.42 µs per avoided fault, one pair replacing a 1,500-fault scrub is a
+  ~1000x trade. Blocked on two checkable things: no precedent for unmapping a
+  SUB-RANGE of the single 32 GiB arena extent, and no evidence the swap is
+  coherent for other live vCPUs.
+- **Stage-1 re-pointing to a fresh IPA** (`repoint_private`-style) avoids
+  stage-2 entirely, using the EL1 TLBI carrick already owns. Its finite
+  alias-IPA budget makes it a fit for exactly the 66 large mappings and not the
+  long tail — which is the shape the measurement found.
+
+**Do the smallest safe step first:** `mmap_dirty_high` is a bug on its own
+terms — a watermark named "dirty" raised on ALLOCATION rather than on
+writability (`dispatch/mem.rs:1649`, `:1680`, `:3803`), so a `PROT_NONE`
+reserve the guest can never store to poisons it. Fixing what it measures needs
+no Darwin primitive and no HVF qualification. Then re-measure, then take the
+large tail. **Invariant 9 is binding throughout:** anonymous `mmap` returning
+zeroed pages is not tradeable, so the lever must remove the work, not the
+guarantee.
 
 **Gate:** in-window `zfod` on the cold build **below 10,000** (from 150,749);
 total `as_fault` **below 60,000** (from 279,987); the anonymous-zero guarantee
