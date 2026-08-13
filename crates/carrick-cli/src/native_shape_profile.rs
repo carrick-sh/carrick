@@ -47,7 +47,29 @@ pub(crate) struct NativeShapeTarget {
 }
 
 impl NativeShapeTarget {
+    /// Parse a target that must name the `native` backend. `native-shape`
+    /// censuses DSR translation shapes, which only that backend produces.
     pub(crate) fn parse(label: &str, command: &[String]) -> Result<Self> {
+        Self::parse_for_backends(label, command, &[ExecBackendRequest::Native])
+    }
+
+    /// Parse a target for a profile that can measure more than one backend.
+    ///
+    /// The AMP1 ledger is the case that needs this: it measures how much Darwin
+    /// kernel work one guest operation costs, which is a question about every
+    /// lane, and the kernel (`hvpatch`) lane is the one this tree is measured
+    /// against. Restricting it to `native` left the primary backend
+    /// unmeasurable by the tree's own primary instrument.
+    ///
+    /// The backend still has to be given EXPLICITLY on the command line —
+    /// inheriting a default would let a capture silently measure a different
+    /// lane than the one a comparison believes it holds fixed.
+    pub(crate) fn parse_for_backends(
+        label: &str,
+        command: &[String],
+        allowed: &[ExecBackendRequest],
+    ) -> Result<Self> {
+        debug_assert!(!allowed.is_empty(), "a target must permit some backend");
         if command.is_empty() {
             bail!("{label} target command is empty");
         }
@@ -65,7 +87,10 @@ impl NativeShapeTarget {
             bail!("{label} target must be a run subcommand");
         }
         if run_matches.value_source("exec_backend") != Some(ValueSource::CommandLine) {
-            bail!("{label} target requires explicit command-line --exec-backend native");
+            bail!(
+                "{label} target requires an explicit command-line --exec-backend ({})",
+                backend_list(allowed)
+            );
         }
 
         let parsed =
@@ -79,8 +104,11 @@ impl NativeShapeTarget {
         else {
             bail!("{label} target must be a run subcommand");
         };
-        if exec_backend != ExecBackendRequest::Native {
-            bail!("{label} target requires explicit command-line --exec-backend native");
+        if !allowed.contains(&exec_backend) {
+            bail!(
+                "{label} target requires an explicit command-line --exec-backend ({})",
+                backend_list(allowed)
+            );
         }
         if target_command.is_empty() {
             bail!("{label} run target command is empty");
@@ -118,6 +146,20 @@ impl NativeShapeTarget {
         }
         Ok(())
     }
+}
+
+/// Render the permitted backends the way the user would spell them, so the
+/// refusal names the fix rather than a Rust identifier.
+fn backend_list(allowed: &[ExecBackendRequest]) -> String {
+    allowed
+        .iter()
+        .map(|backend| match backend {
+            ExecBackendRequest::Native => "native",
+            ExecBackendRequest::Vmm => "vmm",
+            ExecBackendRequest::HvPatch => "hvpatch",
+        })
+        .collect::<Vec<_>>()
+        .join(" or ")
 }
 
 fn validate_image_digest(digest: &str) -> Result<()> {
