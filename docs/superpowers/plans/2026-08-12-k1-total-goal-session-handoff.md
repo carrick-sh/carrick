@@ -1,7 +1,88 @@
 # K1 total-goal session handoff
 
 **Status:** K1 remains RED and the active goal is paused at a safe committed
-boundary on 2026-08-12. **Re-baselined 2026-08-12** — see "Phase re-baseline".
+boundary. **Re-baselined 2026-08-12** — see "Phase re-baseline".
+**Updated 2026-08-13** — see "2026-08-13 session" below; the three
+observability deliverables are now GREEN and the K1 blocker has changed.
+
+## 2026-08-13 session
+
+Committed HEAD is now `cf5fc732b`. Evidence document:
+[`docs/perf-results/2026-08-13-hvpatch-k1-observability-evidence.md`](../../perf-results/2026-08-13-hvpatch-k1-observability-evidence.md),
+which records **NO-GO** for K1 with full provenance.
+
+**Now GREEN, all live-verified on the signed binary (not tests alone):**
+
+- **#26 live debug protocol** — `carrick debug hvpatch-kernel --run-id <id>
+  [--table ...]` reads one coherent snapshot from a running guest over a
+  per-run uid-authenticated `AF_UNIX` socket. Returned 12,667 bytes of
+  validated canonical JSON against a live `ubuntu:24.04 /bin/sleep`.
+- **#25 coherent file snapshots** — proven by that same live capture. The
+  Kernel `FileTable` is already the production authority (`IoState` is
+  gone). `RuntimeIo` is deliberately excluded: it is process-local output
+  transport with no guest-visible Linux semantics.
+- **#27 typed lifecycle identity** — records carry `task_serial`,
+  `parent_serial` and `mm`; new `hvpatch-guest-lifecycle-identity` USDT
+  companion probe; `hvpatch-k1-lifecycle.d` at protocol version 2; the
+  strict reader rejects a zero/duplicate serial and an exec naming an
+  unborn serial.
+
+**The K1 blocker has MOVED.** It is no longer the four deliverables — it is
+that the `68 fork / 67 exec / 69 process` receipt **cannot be produced on
+any commit tested**. A cold `go build` under `--exec-backend hvpatch` fails
+identically on a signed binary built from `25f67f1fa`, so this predates the
+observability work. Attributed, not assumed.
+
+- Layer 1, **FIXED** (`ce369be39`): `handle_in_process_fork` installed the
+  child pidfd through the ambient `captured_file_table()`, which has nothing
+  installed on the vCPU-loop thread and therefore called
+  `std::process::abort()`. Any `CLONE_PIDFD` fork killed the runtime.
+- Layer 2, **RED, next task**: with the abort gone the run reports
+  `kernel context revision is stale` (fork reservation returns `EAGAIN`)
+  and then `kernel context is foreign or internally inconsistent` (child
+  exec). This is the fork/exec transaction contract — K3/K4 territory.
+
+Simple fork/exec guests are fine; the defect needs Go's concurrent
+`CLONE_PIDFD` fork/exec pattern.
+
+**Two incidental correctness fixes**, both found by the new protocol on its
+first live use against a guest:
+
+- `b72d11142` — `close(2)` never retired the descriptor's `fd_open_paths`
+  entry on most close paths, so a freed fd number kept claiming a filename
+  for the lifetime of the table. Fixed at the `note_fd_closed` funnel with a
+  red-first test.
+- `3db419d5e` — `validate_snapshot` ran *before* every revision check, so a
+  concurrent mutation was reported as `InvariantViolation`, i.e. a healthy
+  run was called corrupt. Revisions and the registry epoch are now verified
+  first.
+
+**Recorded design correction.** The spec's
+`$TMPDIR/carrick-kernel/<uid>/<sha256>/snapshot.sock` is not bindable on
+macOS: 146 bytes against a 104-byte `sun_path`. Shipped a fixed
+`/tmp/carrick-kernel` base and a 32-hex token (70 bytes), with an over-long
+path refused by name. Isolation is unchanged.
+
+**Housekeeping.** ~280 orphaned processes were cleaned: 192 from this tree's
+`target/debug/carrick`, 26 from the stale
+`/private/tmp/carrick-k1-file-authority-cutover` tree, plus test children
+and 5-hour-old guest leftovers. Several were 5–7 hours old and may have
+perturbed earlier measurements. Kill by **exact absolute binary path**,
+never a bare `pkill -f carrick`.
+
+**Dropped uncommitted work.** The tree carried an uncommitted K3 #41 test,
+`host_fork_descendants_receive_collision_free_client_identities`, which did
+not compile — it calls `FileAuthorityRun::reserve_host_fork_child`, which
+does not exist. It was removed so the tree could be gated. Its intent is
+already recorded below as red test 2 ("Parent and host-fork descendants
+receive collision-free identities"); rewrite it with the API when the K3
+file slice is built.
+
+**Next single task:** diagnose why the parent's captured `KernelContext`
+goes stale across the HVPatch fork reservation and why the child's context
+then reads as foreign to the exec transaction. Everything else in K1 is
+done; that one question gates the K1 receipt and every later phase's
+baseline.
 
 **Reason for existence:** the next session must resume the complete K1 objective,
 not mistake the immediate FileAuthority blocker for the goal itself. This is the
