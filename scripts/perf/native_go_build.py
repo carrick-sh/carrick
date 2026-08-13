@@ -22,9 +22,15 @@ import time
 from collections.abc import Sequence
 
 
-SCHEMA = "carrick.native-go-build.v3"
+SCHEMA = "carrick.native-go-build.v4"
 DEFAULT_IMAGE = "localhost:5005/carrick-go-conformance:1.24"
 DEFAULT_TIMEOUT_SECONDS = 180
+# The kernel-first lane is the one this tree is measured against; `native` and
+# `vmm` are reference backends. Every argv this module builds — including the
+# ABBA arm verifier's reconstruction — reads this one value, so a campaign
+# cannot silently compare two different backends.
+EXEC_BACKENDS = ("hvpatch", "native", "vmm")
+EXEC_BACKEND = "hvpatch"
 ENGINE_CARRICK = "carrick"
 ENGINE_DOCKER = "docker"
 ENGINE_BOTH = "both"
@@ -218,7 +224,7 @@ def build_command(
             str(carrick),
             "run",
             "--exec-backend",
-            "native",
+            EXEC_BACKEND,
             *_registry_forward_args(registry_transport),
             "-e",
             f"CARRICK_RUN_ID={run_id}",
@@ -1226,6 +1232,15 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument("--samples", type=int, default=5)
     parser.add_argument(
+        "--exec-backend",
+        choices=EXEC_BACKENDS,
+        default=EXEC_BACKEND,
+        help=(
+            "Carrick execution backend under measurement; recorded in the "
+            "artifact so two arms cannot be compared across backends"
+        ),
+    )
+    parser.add_argument(
         "--variant",
         choices=(VARIANT_DEFAULT, VARIANT_PRECURSOR, VARIANT_CANDIDATE, VARIANT_SHARED),
         default=VARIANT_DEFAULT,
@@ -1267,6 +1282,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    # Bind the backend before any argv is built: `build_command` and the ABBA
+    # arm verifier both read the module global, so setting it here is what keeps
+    # the executed argv and the reconstructed-expected argv identical.
+    global EXEC_BACKEND
+    EXEC_BACKEND = args.exec_backend
     if args.samples <= 0:
         raise SystemExit("--samples must be positive")
     if args.timeout_seconds <= 0:
@@ -1313,6 +1333,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "git_dirty": bool(dirty_lines),
         "git_status": dirty_lines,
         "image": DEFAULT_IMAGE,
+        "exec_backend": EXEC_BACKEND,
         "host": {
             "platform": platform.platform(),
             "machine": platform.machine(),
