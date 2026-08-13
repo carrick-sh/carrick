@@ -2754,12 +2754,6 @@ impl HostFsBackend {
         // resurrect it via a raw open.
         let rel = Self::rel_path(&normalized)?;
         let (dir, at_rel) = self.at(rel).ok()?;
-        if create
-            && let Some(parent) = at_rel.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            dir.create_dir_all(parent).ok()?;
-        }
         let mut opts = cap_std::fs::OpenOptions::new();
         opts.read(true);
         if write {
@@ -2777,7 +2771,23 @@ impl HostFsBackend {
                 .or_else(|_| dir.open_with(&at_rel, &opts))
                 .ok()?
         } else {
-            dir.open_with(&at_rel, &opts).ok()?
+            match dir.open_with(&at_rel, &opts) {
+                Ok(file) => file,
+                // A create-open only needs its ancestors materialised when one
+                // is genuinely missing. Walking them up front cost a full
+                // cap-std ancestor re-open on EVERY create-open, which is the
+                // dominant term in the 32.78 host syscalls a guest `openat`
+                // costs on a cold `go build`; the parent almost always exists.
+                Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
+                    if let Some(parent) = at_rel.parent()
+                        && !parent.as_os_str().is_empty()
+                    {
+                        dir.create_dir_all(parent).ok()?;
+                    }
+                    dir.open_with(&at_rel, &opts).ok()?
+                }
+                Err(_) => return None,
+            }
         };
         // Hand the kernel fd to the caller. `into_raw_fd` consumes the
         // cap-std File without closing it, so the dispatcher owns the
@@ -4534,17 +4544,33 @@ impl FsBackend for HostFsBackend {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
         let (dir, at_rel) = self.at(rel).map_err(|_| BackendError::Io)?;
-        // Create all parent dirs in the scratch tree so the guest's
-        // mkdir-deep paths "just work" (apt does
-        // mkdir(/var/lib/apt/lists/partial) without checking parents).
-        if let Some(parent) = at_rel.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            dir.create_dir_all(parent).map_err(|_| BackendError::Io)?;
-        }
+        // Try the directory itself FIRST. Parents are still created on demand
+        // below so the guest's mkdir-deep paths keep working (apt does
+        // mkdir(/var/lib/apt/lists/partial) without checking parents), but
+        // only when they are actually missing.
+        //
+        // Doing the `create_dir_all(parent)` walk unconditionally cost ~31
+        // host syscalls per guest `mkdirat` on a cold `go build` — cap-std
+        // re-opens every ancestor component, with O_NOFOLLOW containment, on
+        // every call, and the parent almost always already exists. That made
+        // `mkdirat` the worst per-operation ratio in the run at 90.96 host
+        // syscalls per guest call.
         match dir.create_dir(&at_rel) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Only now pay for the ancestor walk, then retry once.
+                if let Some(parent) = at_rel.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    dir.create_dir_all(parent).map_err(|_| BackendError::Io)?;
+                }
+                match dir.create_dir(&at_rel) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(_) => return Err(BackendError::Io),
+                }
+            }
             Err(_) => return Err(BackendError::Io),
         }
         self.clear_whiteout_normalized(&normalized);
@@ -4555,15 +4581,23 @@ impl FsBackend for HostFsBackend {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
         let (dir, at_rel) = self.at(rel).map_err(|_| BackendError::Io)?;
-        if let Some(parent) = at_rel.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            dir.create_dir_all(parent).map_err(|_| BackendError::Io)?;
-        }
         let mut opts = cap_std::fs::OpenOptions::new();
         opts.create(true).write(true).truncate(false);
-        dir.open_with(&at_rel, &opts)
-            .map_err(|_| BackendError::Io)?;
+        // Optimistic first, ancestor walk only on a genuinely missing parent —
+        // the same reason as `make_dir` above: cap-std re-opens every ancestor
+        // component on every call, and the parent almost always exists.
+        if let Err(error) = dir.open_with(&at_rel, &opts) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(BackendError::Io);
+            }
+            if let Some(parent) = at_rel.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                dir.create_dir_all(parent).map_err(|_| BackendError::Io)?;
+            }
+            dir.open_with(&at_rel, &opts)
+                .map_err(|_| BackendError::Io)?;
+        }
         self.clear_whiteout_normalized(&normalized);
         Ok(())
     }
