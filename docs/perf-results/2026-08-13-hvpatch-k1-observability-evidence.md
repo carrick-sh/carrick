@@ -128,9 +128,9 @@ requires a nonzero serial and mm on every birth, rejects a duplicate
 and `just test` (41 suites, including the 1,536-test sequential
 `carrick-runtime` library suite) all pass at the evidence commit.
 
-`just ci` was **not** run end-to-end at this commit; `test-integration`,
-`doc`, `deny`, `check-matrix` and `lint-domains` remain unverified here.
-That is a gap in this document, not a claim.
+**`just ci` passes end-to-end, exit 0**, at commit `e9d787931` — the full
+gate: `fmt-check → clippy → lint-domains → deny → check-matrix → check →
+doc → test → test-integration`.
 
 ## The blocker: no 68/67/69 receipt
 
@@ -296,7 +296,7 @@ the absolute deadline still bounds the loop.
 | Live `carrick debug` protocol (#26) | GREEN — live-verified |
 | Typed lifecycle/CTF identity (#27) | GREEN — live-verified |
 | 68/67/69 lifecycle receipt | **RED — cannot be produced; blocker above** |
-| `just ci` end-to-end | RED — not run at this commit |
+| `just ci` end-to-end | GREEN — exit 0 at `e9d787931` |
 | Durable K1 GO evidence (#29) | this document; records NO-GO |
 | File lifecycle binding (K3, task #41) | RED — unchanged, still K3 |
 | Sole file/VFS authority (K3) | RED — 0 of 361 call sites migrated |
