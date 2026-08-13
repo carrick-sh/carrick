@@ -78,11 +78,31 @@ already recorded below as red test 2 ("Parent and host-fork descendants
 receive collision-free identities"); rewrite it with the API when the K3
 file slice is built.
 
-**Next single task:** diagnose why the parent's captured `KernelContext`
-goes stale across the HVPatch fork reservation and why the child's context
-then reads as foreign to the exec transaction. Everything else in K1 is
-done; that one question gates the K1 receipt and every later phase's
-baseline.
+**Next single task — now diagnosed, needs the fix.** Concurrent sibling
+forks cannot both succeed. `PublishedFork::commit` bumps the **parent's**
+task revision because committing a child calls `add_child`
+(`operations.rs:623`, `:634`), and `reserve_fork` refuses any caller whose
+captured `parent.revision` no longer matches the registry record
+(`operations.rs:1097`). Thread A's fork therefore invalidates thread B's
+in-flight fork, and the guest gets `EAGAIN`. Go forks concurrently from
+several threads, which is exactly the observed
+`fork/exec .../compile: resource temporarily unavailable`. Linux requires
+both to succeed, so this is a semantic defect, not load.
+
+Relaxing only the reserve-time check moves the failure to commit: for
+`ForkParentMode::Caller` the reservation records
+`child_parent_revision = caller_revision` and commit re-checks it
+(`ForkParentChanged`).
+
+Fix shape: gaining a child must not invalidate a sibling's in-flight fork.
+Commit already holds the registry write lock, so it can read the parent's
+current revision and advance from it atomically; the captured revision
+should only prove the parent *task generation* is unchanged, which the
+`task.key()` comparison already does. **Write red tests for concurrent
+sibling forks (and a fork racing a sibling's exec) before touching the
+transaction contract.** Then re-run the go fixture for the 68/67/69 receipt
+and re-measure the cold build, which has had no product-visible number since
+the ~4.27 CPU-s reading of 2026-08-09.
 
 **Reason for existence:** the next session must resume the complete K1 objective,
 not mistake the immediate FileAuthority blocker for the goal itself. This is the
