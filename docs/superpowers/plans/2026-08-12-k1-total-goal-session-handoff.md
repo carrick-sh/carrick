@@ -121,7 +121,33 @@ writers and mis-sequenced thread/fork start gates under this workload's
 load. Sample repeatedly — with nondeterminism, one green or red run proves
 nothing.
 
-**Start there, and classify it before changing it.** The start gate is a
+**Sampled failure distribution** (4 identical runs, current signed binary):
+`archive-magic` 3, `start-gate-abort` 1, `BUILD_OK` 0. Archive corruption is
+the dominant mode; attack it first.
+
+**The archive defect is localised — this is the strongest lead.** Dumping the
+build cache on disk after a failing run shows **9 archives written correctly
+with `!<arch>\n`, and exactly ONE missing it**: a 95,486-byte entry whose
+content begins at the `ar` member header `cpu.o`. So writing archives works;
+one file in ten loses precisely its leading 8 bytes.
+
+That shape is specific. The magic is not overwritten — it is absent and the
+remainder is shifted down, which means the first `write(fd, "!<arch>\n", 8)`
+**reported success but neither landed nor advanced the file offset**, so the
+next write began at 0. A successful-but-lost small write whose offset does
+not advance points at the write landing on a different open file
+description than the one the guest believes it holds — i.e. a
+description-sharing or fd-table race around `fork`/`exec`, which is the same
+machinery two bugs were already found in this session
+(`ce369be39`, `f4cdea7a6`). It is NOT a generic write/seek defect: those
+paths are proven exact above.
+
+Next concrete step: instrument the guest `write` path for this file (the
+`internal/cpu` compile subprocess) and confirm which host fd / description
+the 8-byte write is routed to, versus the following large writes.
+
+**The start-gate abort is the other 1-in-4 mode; classify it before changing
+it.** The start gate is a
 **10-second wall-clock deadline that calls `std::process::abort()`**
 (`vcpu_loop/threads.rs`, `ready_deadline = Instant::now() +
 Duration::from_secs(10)`, polling `recv_timeout(1ms)`). It fired with
