@@ -261,8 +261,8 @@ sections below carry the reasoning.
 | **KL** lifecycle | **partial** | per-task user AND system CPU, both oracle-matched; `CLONE_PIDFD` scoping; concurrent sibling fork | `ru_maxrss`/`ru_majflt` still host-sourced |
 | **KD** diagnostics | **partial** | ELF core writer + `carrick debug core`; crash now reports as signal death, oracle-matched | write the core: needs the per-thread register file (shared with KS) |
 | **KS** scheduler | **designed, not built** | M:N executor design decided | step 1 is the same register file KD needs — build it once |
-| **KM** kernel memory | **not started** | — | no guest-visible COW exists; child stage-1 leaves are built read-write |
-| **KX** kernel exec | **not started** | — | exec still unmaps/remaps 32 GiB per call |
+| **KM** kernel memory | **not started; RE-CLASSIFIED** | — | it is a PERFORMANCE phase, not correctness: `forkcow`/`forkshared` PASS on this lane |
+| **KX** kernel exec | **partly built, not "not started"** | Kernel two-phase exec transaction is LIVE; all three image caches exist, default-on | the ADDRESS-SPACE half: build outside the lock, atomic commit, deferred teardown |
 | **KP** shipped proof | **started** | first-ever kernel-lane probe gate: **304 PASS / 90 FAIL**, 26 kernel-lane-specific; root cause of the largest cluster found | **seed the kernel id space at 1, not the host pid** — upstream of 3 clusters |
 
 **Measured position:** cold `go build` **3.803 CPU-s**, window **1,828 ms**
@@ -505,13 +505,31 @@ nothing measurable at `ba26307a5`). Inside fork, attack `PrivateSnapshot` —
 the per-mapping `mach_vm_remap(copy=TRUE)` whose size argument names a 32 GiB
 arena — and nothing else.
 
+> [!IMPORTANT]
+> **RE-CLASSIFIED 2026-08-13: KM is a PERFORMANCE-and-STRUCTURE phase, not a
+> correctness phase.** The observation above — that the child's stage-1 leaves
+> are built read-write and the parent's tables are never write-protected —
+> remains factually true at `trap.rs:6312-6317`. The inference drawn from it
+> did not: fork isolation is provided instead by `mach_vm_remap(copy=TRUE)`
+> (`carrick-host/src/host_mapping.rs:96-137`), invoked per private mapping by
+> carrick itself — and NOT by Darwin's fork COW, because the kernel lane never
+> `libc::fork`s for a guest fork; it spawns a thread (`quiesce.rs:1270-1276`).
+> **It works:** `forkcow` and `forkshared` both PASS on this lane, on musl and
+> gnu, while the native lane FAILs `forkcow`. No probe in the gate shows a
+> COW-semantics divergence.
+>
+> So KM must be justified as **cost and structure**, and retained on a **CPU**
+> gate with correctness held constant — not sold as fixing a correctness bug it
+> does not have. The cost is real: `PrivateSnapshot` is 70.6% of fork's
+> process-spec work and still passes a literal 32 GiB `size` argument
+> (`trap.rs:6265-6267`), plus an unmeasured 34 GiB child-side `hv_vm_map`.
+
 **Gate:** differential probes for anonymous/file/private/shared mappings,
 fork-write divergence, truncation/SIGBUS, `mprotect`, `munmap`, `brk`,
-concurrent faults. Fork work scales with writable table paths and touched
-frames, not virtual span. No whole-span remap and no flat page-table
-publication remains in the fork path. **Correctness gate, not a CPU gate** —
-this phase is retained on semantics, and is only additionally required not to
-regress the build.
+concurrent faults must all stay green (they are green today — this phase must
+not lose them). Fork work scales with writable table paths and touched frames,
+not virtual span. No whole-span remap remains in the fork path. **Retention is
+a measured CPU win on the cold build**, since correctness is already held.
 
 ### KL — kernel lifecycle
 
@@ -544,6 +562,23 @@ below 0.5 ms, p95 below 1 ms; no work proportional to sparse virtual extent;
 per-task user *and* system time both correct against the oracle.
 
 ### KX — kernel exec
+
+> **Status 2026-08-13: "not started" was wrong — two of the five remit clauses
+> are already built.** The Kernel-object two-phase exec transaction is LIVE
+> (`kernel/exec.rs:159` prepare, `:267` commit, reached from
+> `hvpatch/mod.rs:299`), and all three image caches exist and are default-on.
+> What is genuinely absent is the **address-space half**: build outside the
+> lock, atomic commit, deferred teardown, and independent concurrent
+> preparation.
+>
+> **Do this first, before any KX measurement:** the exec runtime-stage
+> instrument is broken and fails closed.
+> `carrick-observability/src/probes.rs:734` declares `CloseCloexec = 1` but
+> nothing has emitted it since `78bfa986c`, so
+> `scripts/dtrace/hvpatch-phase4-exec-runtime-stages.d:102`'s
+> `events == completes * 6` assertion can never hold. Either re-emit it around
+> `exec.rs:436-438` or delete the ordinal and renumber. Nothing else in this
+> phase can be judged until that reports.
 
 **Remit:** build replacement address spaces outside lifecycle locks, cache
 immutable image objects and patch manifests by authenticated provenance,
