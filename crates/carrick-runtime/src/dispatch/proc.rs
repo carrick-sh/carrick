@@ -1868,9 +1868,13 @@ impl SyscallDispatcher {
                 // robust list of any task that ISN'T us is inaccessible without
                 // ptrace privilege → EPERM; a nonexistent task → ESRCH.
                 if pid > 0 && pid <= i32::MAX as i64 {
-                    let rc = unsafe { libc::kill(pid as i32, 0) };
-                    let exists = rc == 0
-                        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+                    let exists = if let Some(live) = this.guest_pid_is_live(pid as i32) {
+                        live
+                    } else {
+                        let rc = unsafe { libc::kill(pid as i32, 0) };
+                        rc == 0
+                            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+                    };
                     return Ok(DispatchOutcome::errno(if exists { LINUX_EPERM } else { LINUX_ESRCH }));
                 }
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
@@ -2479,7 +2483,13 @@ impl SyscallDispatcher {
                     crate::host_signal::linux_to_host_signum(linux_signal)
                 }
             };
+            // Ask carrick's own kernel first; fall back to the host probe on
+            // the lanes where a Linux process IS a host process. See
+            // `SyscallDispatcher::guest_pid_is_live`.
             let target_exists = |host: i32| -> bool {
+                if let Some(live) = this.guest_pid_is_live(host) {
+                    return live;
+                }
                 (unsafe { libc::kill(host, 0) == 0 })
                     || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
             };
