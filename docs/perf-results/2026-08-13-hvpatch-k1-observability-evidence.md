@@ -187,7 +187,37 @@ ERROR hvpatch child loop failed child_pid=34456
 The parent's captured `KernelContext` goes stale across the fork
 reservation, and children then fail the exec transaction's context
 authenticity check. This is K3/K4 territory — the fork reservation and exec
-prepare/commit contracts — and is the next architectural question.
+prepare/commit contracts.
+
+**Diagnosed, not yet fixed.** `PublishedFork::commit` bumps the **parent's**
+task revision, because committing a child calls `add_child` and the
+children set is observable state the revision covers
+(`operations.rs:623`, `:634`). `reserve_fork` then rejects any caller whose
+captured `parent.revision` no longer equals the registry's current record
+revision (`operations.rs:1097`).
+
+So two threads of one Linux process forking concurrently cannot both
+succeed: thread A's commit advances the shared parent's revision, and
+thread B — which captured its context before that — is refused with
+`StaleContext` and the guest receives `EAGAIN`. The Go toolchain forks
+concurrently from several threads, which is exactly why it reports
+`fork/exec .../compile: resource temporarily unavailable`. **Linux requires
+both forks to succeed**, so this is a semantic defect, not a load
+condition.
+
+The same reasoning applies one layer down: for `ForkParentMode::Caller` the
+reservation records `child_parent_revision = caller_revision`, and commit
+re-checks it (`child_parent_record.revision != child_parent_revision` →
+`ForkParentChanged`), so relaxing only the reserve-time check would move the
+failure to commit rather than remove it.
+
+The shape of the fix — deliberately not applied here without room to test it
+properly — is that gaining a child must not invalidate a sibling's in-flight
+fork. Commit already holds the registry write lock, so it can read the
+parent's current revision and advance from it atomically; the captured
+revision should only prove the parent *task generation* is unchanged, which
+the `task.key()` comparison already does. Changing a lifecycle transaction
+contract needs red tests for concurrent sibling forks first.
 
 Simple fork/exec guests are unaffected: `sh -c 'echo a; /bin/true; echo b'`,
 a three-iteration `/bin/true` loop, and `ls /` all exit 0 under HVPatch. The
