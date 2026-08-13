@@ -96,6 +96,22 @@ One cold build, `dtrace -Z`, proportions only (the capture perturbs heavily):
 Per guest call: `openat` **32.78x**, `newfstatat` **13.84x**, `mkdirat`
 **90.96x**. `read` and `fcntl` are 1.07x and are not a problem.
 
+> [!CAUTION]
+> **Host-syscall COUNT is not CPU, and this table overstates its own lever.**
+> KN removed a large share of the path-resolution calls and bought **12.7% of
+> system time and 3.1% of total CPU**
+> ([evidence](docs/perf-results/2026-08-13-hvpatch-kernel-namei.md)). The
+> arithmetic says why: 1.864 s of `sys` over ~360,000 host syscalls would be
+> 5.2 µs per call, far above what a macOS syscall costs — so **`sys` is not
+> mostly syscalls.** Under HVF the guest runs inside `hv_vcpu_run`, a kernel
+> call, and faults and VM work land in `sys` too. Driving every remaining
+> path-resolution syscall to zero is worth single digits, not a multiple.
+>
+> **Rank by measured CPU, never by syscall count.** A count-based ledger says
+> where the calls are, not where the time is. This table keeps its place
+> because it correctly identifies *mechanisms* worth replacing; it does not
+> size them.
+
 And the fork memory path — the entire remit of the old K2 — is **109.61 ms
 across all 68 forks** ([fork stage
 split](docs/perf-results/2026-08-13-hvpatch-fork-stage-split.md)), of which
@@ -197,7 +213,17 @@ Ordered by measured leverage. Each phase publishes a durable evidence
 document at its boundary (see the protocol at the end) and each gate is
 stated so it can fail.
 
-### KN — kernel namei  ·  *next, and the largest single lever*
+### KN — kernel namei  ·  *landed; a retained win, and smaller than predicted*
+
+> **Status 2026-08-13:** landed at `8d6696a94`. Measured **−3.1% CPU, −5.1%
+> workload window, −12.7% system time**, non-overlapping distributions, five
+> samples per arm
+> ([evidence](docs/perf-results/2026-08-13-hvpatch-kernel-namei.md)). Retained.
+> It also closed a shipped cross-process staleness bug in the stat cache and
+> removed cap-std from the hot path, which invariant 13 requires. **The gate's
+> syscall-ratio clause is still open** — it needs a traced re-measure at HEAD.
+> The phase is what forced the CAUTION above: it was ranked first on syscall
+> count and is worth single digits of CPU.
 
 **Remit:** Carrick owns path resolution. A `DirCache` of containment-proven
 directory fds turns every path operation into *at most one* host `*at` call on

@@ -1625,7 +1625,14 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 let amplification_target = if profile
                     == Some(crate::trace_profile::TraceProfileKind::NativeAmplification)
                 {
-                    Some(NativeShapeTarget::parse("native-amplification", &command)?)
+                    Some(NativeShapeTarget::parse_for_backends(
+                        "native-amplification",
+                        &command,
+                        &[
+                            carrick_spec::ExecBackendRequest::Native,
+                            carrick_spec::ExecBackendRequest::HvPatch,
+                        ],
+                    )?)
                 } else {
                     None
                 };

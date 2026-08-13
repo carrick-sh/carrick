@@ -321,6 +321,48 @@ carrick*:::native-syscall-service-end
 }
 
 /*
+ * THE SAME WINDOW ON THE KERNEL (hvpatch) LANE.
+ *
+ * The kernel lane brackets a guest syscall with a different probe pair, so
+ * without these two clauses every host call on the backend this tree is
+ * measured against lands in `carrick-only` and the ledger reports a shape that
+ * is true of nothing. The two lanes cannot both be live in one capture -- a
+ * run names exactly one `--exec-backend` -- so sharing `service_slot` is safe
+ * and is what lets one Rust reader decode either stream.
+ *
+ * PROVIDER ABI, qualified from the probe definitions rather than assumed:
+ * `hvpatch_syscall_service_begin` publishes (pid, tid, asid, number) and
+ * `hvpatch_syscall_service_clear` publishes (pid, tid, asid, number)
+ * (`crates/carrick-observability/src/probes.rs:4622` and `:4658`), so the
+ * canonical syscall number is arg3 on BOTH -- not arg0, which is the guest pid.
+ * Reading arg0 here would encode a pid as a syscall number and silently
+ * produce a plausible, wrong ledger.
+ *
+ * `begin` is the identity-bearing probe and only publishes when it fired, so a
+ * `clear` with no prior `begin` is the same inherited-span class the native
+ * arm documents above and is counted, never dropped.
+ */
+carrick*:::hvpatch-syscall-service-begin
+/tracked[pid]/
+{
+	@drop_service_reentry =
+	    sum(service_slot[pid, tid] > (uint64_t)1 ? 1 : 0);
+	service_slot[pid, tid] = (uint64_t)arg3 + (uint64_t)2;
+	@guest_by_slot[(uint64_t)arg3 + (uint64_t)2] = sum(1);
+	@guest_total = sum(1);
+}
+
+carrick*:::hvpatch-syscall-service-clear
+/tracked[pid]/
+{
+	@window_inherited_end =
+	    sum(service_slot[pid, tid] == (uint64_t)0 ? 1 : 0);
+	@drop_service_unmatched =
+	    sum(service_slot[pid, tid] == (uint64_t)1 ? 1 : 0);
+	service_slot[pid, tid] = (uint64_t)1;
+}
+
+/*
  * A TERMINAL HANDOFF emits no `-end` at all: `terminal_handoff()`
  * (`native_darwin.rs:3214`) moves the span to a state `Drop` deliberately does
  * not close, because the handoff can still FAIL and reopen
