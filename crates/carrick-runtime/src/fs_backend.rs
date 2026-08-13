@@ -1443,52 +1443,55 @@ pub struct HostFsBackend {
     /// eviction. Validated regression-free across the full conformance matrix.
     /// See docs/fs-host-capstd-amplification.md.
     stat_cache: parking_lot::Mutex<std::collections::HashMap<PathBuf, StatCacheEntry>>,
-    /// Interned CONTAINED parent directory fds for [`Self::stat_cache`], keyed
-    /// by the cache-relative parent path and held WEAKLY.
+    /// **The kernel directory cache** — carrick's own `dcache`, keyed by the
+    /// sandbox-relative directory path and holding a CONTAINMENT-PROVEN host
+    /// dirfd for each.
     ///
-    /// Every cached leaf used to open its OWN parent dirfd, so N cached
-    /// children of one directory pinned N identical host dirfds. On the cold
-    /// `go build` lane that was 1,138 open dirfds across just 44 distinct
-    /// directories — 759 of them the same `go/src/runtime` — and the
-    /// clear-on-fork in [`Self::stat_cache_get_or_fill`] then closed all 1,138
-    /// one at a time in EVERY fork child, because a fork child's first stat is
-    /// the `check_exec_target` of the `execve` it was forked to perform. That
-    /// was 74,253 host `close(2)` on the build, 7.4% of every host syscall it
-    /// made and the largest count lever in the 2026-08-06 amplification ledger.
+    /// This is the state behind [`Self::dir_fd_for`] and [`Self::namei_leaf`].
+    /// Its purpose is that a guest path operation costs ONE host `*at` call on
+    /// an already-open parent instead of a resolution of the whole path. The
+    /// walk it replaces was the single largest host-syscall source in the
+    /// kernel lane: cap-std's `manually::open` opens every component of every
+    /// path on every call with no reuse between calls, and on the cold
+    /// `go build` that was 47.5% of all host opens
+    /// (`docs/perf-results/2026-08-13-hvpatch-build-amplification-ledger.md`).
     ///
-    /// Weak, not strong, so this changes only how many host fds back N cached
-    /// leaves — never how long any of them lives: an anchor still dies with the
-    /// last `stat_cache` entry that trusts it, and a dead `Weak` simply misses
-    /// and re-opens. Reuse is therefore only ever of an fd some live cached
-    /// entry is ALREADY using as its anchor (exactly what the revalidation hit
-    /// path at the top of `stat_cache_get_or_fill` does), so the staleness
-    /// exposure is the hit path's and not a wider one.
+    /// **Why an entry may be trusted.** Containment is structural, not audited:
+    /// every entry is reached by opening ONE component at a time with
+    /// `O_NOFOLLOW | O_DIRECTORY`, starting at the sandbox root, so no symlink
+    /// is ever traversed and no resolution can leave the root. Given such a
+    /// parent, `openat(parent, leaf, O_NOFOLLOW)` is contained by the same
+    /// argument, which is why the hot path issues no `F_GETPATH` at all — that
+    /// check exists to audit a traversal, and there is none to audit.
     ///
-    /// That equivalence holds ONLY because every clear of `stat_cache` also
-    /// unpublishes here — [`Self::drop_stat_cache_after_rename`] for the
-    /// rename/exchange sites and the pid check in
-    /// [`Self::stat_cache_get_or_fill`] for fork. A clear that dropped the
-    /// entries but left the `Weak`s would be worse than no interning at all:
-    /// the fill path publishes before it does its unlocked `fstatat`/`openat`
-    /// work, so an in-flight fill keeps its anchor alive across the clear, and
-    /// a surviving `Weak` would then serve that stale anchor to every
-    /// subsequent fill under the path instead of stranding one entry.
+    /// **Why an entry may go stale, and what catches it.** A dirfd names an
+    /// INODE, not a path: rename the directory and the fd silently follows it,
+    /// so a cached entry would serve a path that no longer exists. Every entry
+    /// is therefore stamped with
+    /// [`crate::fs_resolve_cache::current_dir_generation`] and served only
+    /// while it still matches. That generation is bumped by directory renames,
+    /// exchanges and removals ONLY — not by file creation or unlink — which is
+    /// what lets the cache survive a build that creates thousands of files.
+    /// Because the counter lives in a `MAP_SHARED` page, a rename in ANY
+    /// carrick process invalidates every process's cache; this is a real
+    /// coherence improvement over the in-process clear it replaces.
     ///
-    /// Dead `Weak`s are pruned ONLY by the `len() >= 4096` retain on insert
-    /// below — the clears above drop whole maps, and ordinary eviction
-    /// (`stat_cache.remove`) leaves a dead key behind. That is bounded by the
-    /// number of distinct parent directories ever stat'd (44 on a cold
-    /// `go build`) and each dead key is one `PathBuf`, so it is a memory
-    /// footnote, not a leak — but it is why a lookup must always treat
-    /// `upgrade()` returning `None` as a normal miss.
+    /// Strong `Arc`s, not `Weak`: the cache owns the fds and is bounded
+    /// explicitly (`DIR_CACHE_MAX_ENTRIES`), so a directory's fd survives
+    /// between the operations that share it rather than dying with whichever
+    /// stat entry happened to hold it.
     ///
-    /// Benign race: two threads filling different leaves of one directory can
-    /// both miss and both open an anchor; the later `insert` unpublishes the
-    /// earlier. Both are valid, contained and independently owned, so the only
-    /// effect is a transient second fd on that directory.
-    parent_fds: parking_lot::Mutex<
-        std::collections::HashMap<PathBuf, std::sync::Weak<std::os::fd::OwnedFd>>,
-    >,
+    /// Benign race: two threads may both miss on one directory and both open
+    /// it; the later `insert` replaces the earlier. Both are valid, contained
+    /// and independently owned, so the only effect is a transient second fd.
+    dir_cache: parking_lot::Mutex<std::collections::HashMap<PathBuf, DirCacheEntry>>,
+    /// The pid that owns the current [`Self::dir_cache`] fds. carrick's
+    /// `native`/`vmm` lanes COW-fork the host process for guest `clone(2)`, so
+    /// a child inherits both the map and the dup'd fds; the first use after a
+    /// pid change drops the inherited entries and adopts the cache for this
+    /// process. Under the kernel (`hvpatch`) lane there is exactly one host
+    /// process and this never fires. `0` forces the first use to adopt.
+    dir_cache_pid: std::sync::atomic::AtomicU32,
     /// The pid that owns the current `stat_cache` contents. carrick COW-forks for
     /// guest `clone`/`fork` (and for the default private-PID-namespace guest
     /// init), so a child inherits the map + dup'd parent fds. On the first cache
@@ -1573,11 +1576,37 @@ pub struct HostFsBackend {
 #[cfg(target_os = "macos")]
 struct StatCacheEntry {
     parent_fd: std::sync::Arc<std::os::fd::OwnedFd>,
+    /// Directory-topology generation the `parent_fd` was proven at. A dirfd
+    /// follows its inode through a rename, so without this a cached leaf under
+    /// a renamed directory would keep revalidating successfully — same inode,
+    /// same ctime — for a path that no longer exists. The in-process clear this
+    /// supersedes could not see a rename performed by a SIBLING process; the
+    /// generation lives in a `MAP_SHARED` word and can.
+    dir_generation: u64,
     ino: u64,
     ctime: (i64, i64),
     mtime: (i64, i64),
     size: i64,
     real: RealStat,
+}
+
+/// One directory in [`HostFsBackend::dir_cache`]: a containment-proven host
+/// dirfd plus the directory-topology generation it was proven at.
+#[cfg(target_os = "macos")]
+struct DirCacheEntry {
+    fd: std::sync::Arc<std::os::fd::OwnedFd>,
+    dir_generation: u64,
+}
+
+/// Non-macOS placeholder so the `dir_cache` field type is well-formed; the
+/// kernel directory cache is macOS-only for now, because its containment proof
+/// is `F_GETPATH`-based. A Linux/BSD implementation would prove containment
+/// with `openat2(RESOLVE_BENEATH)` / `O_RESOLVE_BENEATH` instead.
+#[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
+struct DirCacheEntry {
+    fd: std::sync::Arc<std::os::fd::OwnedFd>,
+    dir_generation: u64,
 }
 
 /// Non-macOS placeholder so the `stat_cache` field type is well-formed; the
@@ -1975,7 +2004,8 @@ impl HostFsBackend {
             fast_fs,
             sparse_upper_fast_miss: false,
             stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            parent_fds: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            dir_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            dir_cache_pid: std::sync::atomic::AtomicU32::new(0),
             cache_pid: std::sync::atomic::AtomicU32::new(0),
             use_stat_cache: stat_cache_enabled(),
             overlay_mount: None,
@@ -2036,7 +2066,8 @@ impl HostFsBackend {
             fast_fs,
             sparse_upper_fast_miss: false,
             stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            parent_fds: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            dir_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            dir_cache_pid: std::sync::atomic::AtomicU32::new(0),
             cache_pid: std::sync::atomic::AtomicU32::new(0),
             use_stat_cache: stat_cache_enabled(),
             overlay_mount: None,
@@ -2127,7 +2158,8 @@ impl HostFsBackend {
             fast_fs: fast_fs_enabled(),
             sparse_upper_fast_miss: authority.sparse_upper_fast_miss,
             stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            parent_fds: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            dir_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            dir_cache_pid: std::sync::atomic::AtomicU32::new(0),
             cache_pid: std::sync::atomic::AtomicU32::new(0),
             use_stat_cache: stat_cache_enabled(),
             overlay_mount: None,
@@ -2145,6 +2177,247 @@ impl HostFsBackend {
             symlink_absent_gen: std::sync::atomic::AtomicU64::new(0),
         })
     }
+
+    /// Serve `dir`'s containment-proven host dirfd from the kernel directory
+    /// cache, opening and proving it on a miss. `dir` must be a NORMALIZED,
+    /// sandbox-relative directory path — [`normalize`] has already collapsed
+    /// `.` and resolved `..` lexically, and returns `None` rather than a path
+    /// that climbs out of the root, so no component here can be `..`.
+    ///
+    /// This is the lower half of carrick's namei. See [`Self::dir_cache`] for
+    /// why an entry may be trusted and what invalidates it.
+    ///
+    /// Cost: zero host syscalls on a hit; otherwise ONE `openat` per component
+    /// not already cached — so a sequential walk into a tree pays one call per
+    /// NEW directory and nothing thereafter.
+    ///
+    /// **Containment is structural and total.** The descent starts at the
+    /// sandbox root and opens exactly one component at a time with
+    /// `O_NOFOLLOW | O_DIRECTORY`, so no symlink is ever traversed and no
+    /// resolution can leave the root. That is precisely the property cap-std's
+    /// manual walk provides — this keeps it and caches the result, which is the
+    /// whole difference. Nothing here calls `F_GETPATH`: there is no traversal
+    /// to audit after the fact.
+    ///
+    /// It also means a cached entry can never have been reached THROUGH a
+    /// symlink, so re-pointing a symlink cannot invalidate one — which is why
+    /// the invalidation set is only rename, exchange and directory removal. A
+    /// genuinely symlinked directory simply fails here (`ELOOP`) and the caller
+    /// keeps its exact existing fallback, which re-roots absolute targets under
+    /// the guest root.
+    #[cfg(target_os = "macos")]
+    fn dir_fd_for(&self, dir: &Path) -> Option<std::sync::Arc<std::os::fd::OwnedFd>> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::sync::atomic::Ordering::Relaxed;
+
+        if !self.fast_fs {
+            return None;
+        }
+        let generation = crate::fs_resolve_cache::current_dir_generation();
+        let me = unsafe { libc::getpid() } as u32;
+
+        // Adopt-and-clear if we crossed a host fork: a child must not trust
+        // dirfds it inherited from a parent that may since have moved them.
+        {
+            let mut cache = self.dir_cache.lock();
+            if self.dir_cache_pid.load(Relaxed) != me {
+                cache.clear();
+                self.dir_cache_pid.store(me, Relaxed);
+            }
+            if let Some(entry) = cache.get(dir)
+                && entry.dir_generation == generation
+            {
+                return Some(entry.fd.clone());
+            }
+        }
+
+        // The sandbox root itself is contained by definition. Cache a dup so
+        // the cache owns a lifetime independent of `self.dir`.
+        let root = {
+            let cached = {
+                let cache = self.dir_cache.lock();
+                cache
+                    .get(Path::new(""))
+                    .filter(|entry| entry.dir_generation == generation)
+                    .map(|entry| entry.fd.clone())
+            };
+            match cached {
+                Some(fd) => fd,
+                None => {
+                    let raw = unsafe { libc::dup(self.dir.as_raw_fd()) };
+                    if raw < 0 {
+                        return None;
+                    }
+                    // SAFETY: `raw` is a freshly-dup'd owned fd.
+                    let fd = std::sync::Arc::new(unsafe { OwnedFd::from_raw_fd(raw) });
+                    self.publish_dir_fd(Path::new(""), &fd, generation);
+                    fd
+                }
+            }
+        };
+        if dir.as_os_str().is_empty() {
+            return Some(root);
+        }
+
+        // Start from the deepest cached ancestor. `ancestors()` yields
+        // longest-first, so the first hit is the deepest.
+        let mut current = root;
+        let mut walked = PathBuf::new();
+        let mut remaining: Vec<&std::ffi::OsStr> = Vec::new();
+        {
+            let cache = self.dir_cache.lock();
+            let mut found = false;
+            for ancestor in dir.ancestors().skip(1) {
+                if let Some(entry) = cache.get(ancestor)
+                    && entry.dir_generation == generation
+                    && let Ok(rest) = dir.strip_prefix(ancestor)
+                {
+                    current = entry.fd.clone();
+                    walked = ancestor.to_path_buf();
+                    remaining = rest.iter().collect();
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                remaining = dir.iter().collect();
+            }
+        }
+
+        let flags = libc::O_RDONLY
+            | libc::O_DIRECTORY
+            | libc::O_CLOEXEC
+            | libc::O_NONBLOCK
+            | libc::O_NOFOLLOW;
+        for component in remaining {
+            walked.push(component);
+            let component_c = cstring_from_osstr(component)?;
+            let raw = unsafe { libc::openat(current.as_raw_fd(), component_c.as_ptr(), flags, 0) };
+            if raw < 0 {
+                // A cache must never become a guest-visible failure. If the
+                // descriptor table is full, the fds this cache holds are the
+                // likeliest reason, so reclaim and retry once — the move a
+                // kernel makes when a cache exhausts its resource. Everything
+                // else (ENOENT, ENOTDIR, ELOOP on a symlinked directory) is a
+                // normal "not servable from here": the caller falls back.
+                let out_of_fds = matches!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EMFILE) | Some(libc::ENFILE)
+                );
+                if !out_of_fds {
+                    return None;
+                }
+                self.drop_dir_cache();
+                // The reclaim dropped every anchor including `current`, so the
+                // descent cannot be resumed; re-enter from the root, which now
+                // sees an empty cache and rebuilds only what this path needs.
+                return self.dir_fd_for_after_reclaim(dir, generation);
+            }
+            // SAFETY: `raw` is a freshly-opened owned fd.
+            let fd = std::sync::Arc::new(unsafe { OwnedFd::from_raw_fd(raw) });
+            self.publish_dir_fd(&walked, &fd, generation);
+            current = fd;
+        }
+        Some(current)
+    }
+
+    /// One non-recursing retry of [`Self::dir_fd_for`] after an fd reclaim.
+    /// Separated so the reclaim path cannot loop: this walk opens fds into a
+    /// just-emptied cache, and if it still cannot get one there is nothing left
+    /// to reclaim and the caller must fall back.
+    #[cfg(target_os = "macos")]
+    fn dir_fd_for_after_reclaim(
+        &self,
+        dir: &Path,
+        generation: u64,
+    ) -> Option<std::sync::Arc<std::os::fd::OwnedFd>> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        let raw = unsafe { libc::dup(self.dir.as_raw_fd()) };
+        if raw < 0 {
+            return None;
+        }
+        // SAFETY: `raw` is a freshly-dup'd owned fd.
+        let mut current = std::sync::Arc::new(unsafe { OwnedFd::from_raw_fd(raw) });
+        self.publish_dir_fd(Path::new(""), &current, generation);
+        let flags = libc::O_RDONLY
+            | libc::O_DIRECTORY
+            | libc::O_CLOEXEC
+            | libc::O_NONBLOCK
+            | libc::O_NOFOLLOW;
+        let mut walked = PathBuf::new();
+        for component in dir.iter() {
+            walked.push(component);
+            let component_c = cstring_from_osstr(component)?;
+            let raw = unsafe { libc::openat(current.as_raw_fd(), component_c.as_ptr(), flags, 0) };
+            if raw < 0 {
+                return None;
+            }
+            // SAFETY: `raw` is a freshly-opened owned fd.
+            let fd = std::sync::Arc::new(unsafe { OwnedFd::from_raw_fd(raw) });
+            self.publish_dir_fd(&walked, &fd, generation);
+            current = fd;
+        }
+        Some(current)
+    }
+
+    /// Publish a proven dirfd. Bounded: a path-diverse workload just resets the
+    /// cache, which costs re-opens and never correctness — every served entry
+    /// is independently generation-checked.
+    #[cfg(target_os = "macos")]
+    fn publish_dir_fd(
+        &self,
+        dir: &Path,
+        fd: &std::sync::Arc<std::os::fd::OwnedFd>,
+        generation: u64,
+    ) {
+        const DIR_CACHE_MAX_ENTRIES: usize = 4096;
+        let mut cache = self.dir_cache.lock();
+        if cache.len() >= DIR_CACHE_MAX_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(
+            dir.to_path_buf(),
+            DirCacheEntry {
+                fd: fd.clone(),
+                dir_generation: generation,
+            },
+        );
+    }
+
+    /// The upper half of carrick's namei: turn a normalized sandbox-relative
+    /// path into the two things a host `*at` syscall needs — a
+    /// containment-proven parent dirfd and the leaf's NUL-terminated name.
+    ///
+    /// Every path-taking operation that reaches the host should go through
+    /// here, so that resolution is paid once per directory instead of once per
+    /// call. `None` means "this path is not servable from the cache" (an
+    /// intermediate symlink, an escape, a missing parent, a non-UTF-8-safe
+    /// name, or the fast path disabled) and the caller must keep its exact
+    /// existing fallback — the fast-path errno rule applies: only `ENOENT` is
+    /// authoritative here.
+    #[cfg(target_os = "macos")]
+    fn namei_leaf(
+        &self,
+        rel: &Path,
+    ) -> Option<(std::sync::Arc<std::os::fd::OwnedFd>, std::ffi::CString)> {
+        let name = rel.file_name()?;
+        let name_c = cstring_from_osstr(name)?;
+        let parent = rel.parent().unwrap_or_else(|| Path::new(""));
+        let parent_fd = self.dir_fd_for(parent)?;
+        Some((parent_fd, name_c))
+    }
+
+    /// Drop every cached dirfd. Used where this process has just changed
+    /// directory topology and must not serve its own stale view before the
+    /// shared generation is observed.
+    #[cfg(target_os = "macos")]
+    fn drop_dir_cache(&self) {
+        self.dir_cache.lock().clear();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn drop_dir_cache(&self) {}
 
     /// Fast `real_stat` for the common regular-file / directory case on
     /// `--fs host`: one `fstatat` (kernel resolves the whole path) instead of
@@ -2186,8 +2459,6 @@ impl HostFsBackend {
             return None;
         }
         let root_prefix = self.root_prefix.as_deref()?;
-        let rel_c = std::ffi::CString::new(rel.as_os_str().as_bytes()).ok()?;
-        let dir_fd = self.dir.as_raw_fd();
 
         // ONE open. O_EVTONLY: event-monitoring open — fstat/F_GETPATH/fgetxattr
         // all work but the kernel records no access, so atime is untouched (this
@@ -2202,7 +2473,37 @@ impl HostFsBackend {
         if !follow {
             oflags |= libc::O_NOFOLLOW;
         }
-        let raw = unsafe { libc::openat(dir_fd, rel_c.as_ptr(), oflags, 0) };
+
+        // Resolve the parent through the kernel directory cache and open the
+        // LEAF against it. Two things follow, and both are the point of the
+        // cache:
+        //
+        //  - the directory chain is resolved once per directory instead of once
+        //    per call, so the kernel walks one component here, not the path;
+        //  - on the `!follow` arm the open is a single component `O_NOFOLLOW`
+        //    beneath an already-proven dirfd, which cannot traverse a symlink
+        //    and therefore cannot leave the sandbox. Containment is structural
+        //    and the `F_GETPATH` is not issued at all — it was 6.43 host
+        //    `fcntl`s per guest `openat` on the cold build.
+        //
+        // The `follow` arm still proves containment explicitly: the leaf symlink
+        // IS traversed there and its target may be anywhere.
+        let (raw, proven) = match self.namei_leaf(rel) {
+            Some((parent_fd, name_c)) => {
+                let raw =
+                    unsafe { libc::openat(parent_fd.as_raw_fd(), name_c.as_ptr(), oflags, 0) };
+                (raw, !follow)
+            }
+            None => {
+                // No cached resolution (an intermediate symlink, a missing
+                // parent, the cache disabled): fall back to letting the kernel
+                // resolve the whole path from the sandbox root, which must then
+                // be proven contained.
+                let rel_c = std::ffi::CString::new(rel.as_os_str().as_bytes()).ok()?;
+                let raw = unsafe { libc::openat(self.dir.as_raw_fd(), rel_c.as_ptr(), oflags, 0) };
+                (raw, false)
+            }
+        };
         if raw < 0 {
             return None; // symlink leaf (O_NOFOLLOW→ELOOP), ENOENT, … → cap-std
         }
@@ -2232,7 +2533,9 @@ impl HostFsBackend {
         // symlink the kernel resolved out of the root. Nothing was read or
         // created, so a failed check is a clean reject (drop the fd → close, fall
         // back to cap-std, which re-roots absolute symlink targets correctly).
-        if !fd_contained_under(raw, root_prefix) {
+        // Skipped only where containment is already structural — see the open
+        // above for why.
+        if !proven && !fd_contained_under(raw, root_prefix) {
             return None;
         }
         Some((fd, st, kind))
@@ -2307,7 +2610,17 @@ impl HostFsBackend {
         let Ok(rel_c) = std::ffi::CString::new(rel.as_os_str().as_bytes()) else {
             return FastGuestOpen::Fallback;
         };
-        let dir_fd = self.dir.as_raw_fd();
+        // Resolve the parent through the kernel directory cache and open the
+        // leaf against it. Every open on this path is `O_NOFOLLOW`, so a single
+        // component beneath an already-proven dirfd cannot traverse a symlink
+        // and containment is structural — the `F_GETPATH` below is then not
+        // issued at all. Without a cached parent, the kernel resolves the whole
+        // path from the sandbox root and containment must be proven explicitly.
+        let namei = self.namei_leaf(rel);
+        let (dir_fd, rel_c, proven) = match &namei {
+            Some((parent_fd, name_c)) => (parent_fd.as_raw_fd(), name_c, true),
+            None => (self.dir.as_raw_fd(), &rel_c, false),
+        };
         // O_NONBLOCK: a racing FIFO at the leaf must never block this open
         // (the FIFO-never-blocks-the-dispatcher rule); cleared again below
         // before the fd is served. O_NOFOLLOW: a symlink leaf is the typed
@@ -2359,8 +2672,9 @@ impl HostFsBackend {
         // Containment BEFORE anything is served: the opened inode's real host
         // path must live under the sandbox root, or an intermediate symlink
         // escaped and the fd must be dropped unread (never serve bytes from
-        // an uncontained fd).
-        if !fd_contained_under(raw, root_prefix) {
+        // an uncontained fd). Skipped only where containment is already
+        // structural — see the resolution above.
+        if !proven && !fd_contained_under(raw, root_prefix) {
             return FastGuestOpen::Fallback;
         }
         // Byte-exact leaf-name guard against macOS's normalizing VFS, exactly
@@ -2860,25 +3174,23 @@ impl HostFsBackend {
         None
     }
 
-    /// Drop the whole stat cache AND every interned parent anchor after an
-    /// in-process rename/exchange. Both halves are required.
+    /// Drop this process's cached stat entries and dirfds after a rename or
+    /// exchange it performed itself.
     ///
-    /// Clearing `stat_cache` alone is NOT sufficient once anchors are interned.
-    /// The fill path publishes an anchor's `Weak` into `parent_fds` and then
-    /// does its `fstatat`/`openat`/xattr work UNLOCKED before inserting the
-    /// entry, and nothing serializes a rename against a stat. A rename landing
-    /// in that window used to strand exactly ONE entry (the in-flight fill's
-    /// own); with a live `Weak` still published it would instead hand the
-    /// moved-directory anchor to EVERY later fill under that path, until the
-    /// next fork or rename. Unpublishing here restores the pre-intern exposure:
-    /// at most the one in-flight entry, never a reusable anchor.
+    /// The DURABLE invalidation is the shared directory-topology generation
+    /// (`fs_resolve_cache::bump_dir_generation`), which every process observes
+    /// and which the caller bumps. This clear is the local half: it stops this
+    /// process from serving its own in-flight entries between the mutation and
+    /// its next generation read, and it releases the dirfds immediately rather
+    /// than leaving them to be evicted lazily.
     ///
-    /// LOCK ORDER `stat_cache` -> `parent_fds`, matching
-    /// [`Self::stat_cache_get_or_fill`]; `parent_fds` is never taken first.
+    /// LOCK ORDER `stat_cache` -> `dir_cache`; `dir_cache` is never taken
+    /// first, so [`Self::dir_fd_for`] must never be called while holding
+    /// `stat_cache`.
     fn drop_stat_cache_after_rename(&self) {
         let mut map = self.stat_cache.lock();
         map.clear();
-        self.parent_fds.lock().clear();
+        self.drop_dir_cache();
     }
 
     /// The stat cache may be consulted: enabled (default ON) and the `--fs host`
@@ -2904,26 +3216,32 @@ impl HostFsBackend {
 
         let name = rel.file_name()?; // leaf is always a single component here
         let name_c = std::ffi::CString::new(name.as_bytes()).ok()?;
+        let dir_generation = crate::fs_resolve_cache::current_dir_generation();
 
         // --- Revalidate an existing entry: ONE fstatat through the cached,
         //     already-contained parent fd (no path walk, no openat). Clone the
         //     needed bits out from under the lock so the syscall runs unlocked.
         //     Under the same lock, adopt-and-clear if we crossed a fork (a child
         //     must not trust the parent's inherited fds).
+        //
+        //     An entry whose parent dirfd was proven at an older directory
+        //     generation is NOT served: a rename in this or any other process
+        //     may have moved the directory the fd names, and identity
+        //     revalidation cannot see that — the inode, ctime and size are all
+        //     unchanged at the new location.
         let me = unsafe { libc::getpid() } as u32;
         let cached = {
             use std::sync::atomic::Ordering::Relaxed;
             let mut map = self.stat_cache.lock();
             if self.cache_pid.load(Relaxed) != me {
                 map.clear();
-                // LOCK ORDER `stat_cache` -> `parent_fds`; this is the only
-                // site that holds both, and `parent_fds` is never taken first.
-                // Dropping the anchors above already killed every `Weak`, so
-                // keeping them would only make a later fill upgrade-and-miss.
-                self.parent_fds.lock().clear();
+                // LOCK ORDER `stat_cache` -> `dir_cache`; this is the only site
+                // that holds both, and `dir_cache` is never taken first.
+                self.drop_dir_cache();
                 self.cache_pid.store(me, Relaxed);
             }
             map.get(rel)
+                .filter(|e| e.dir_generation == dir_generation)
                 .map(|e| (e.parent_fd.clone(), e.ino, e.ctime, e.mtime, e.size, e.real))
         };
         if let Some((parent_fd, ino, ctime, mtime, size, real)) = cached {
@@ -2961,61 +3279,16 @@ impl HostFsBackend {
             self.stat_cache.lock().remove(rel);
         }
 
-        // --- Fill: open the CONTAINED parent (the trusted anchor for all future
-        //     revalidations), lstat the leaf, read its metadata, then cache.
-        let root_prefix = self.root_prefix.as_deref()?;
-        let dir_fd = self.dir.as_raw_fd();
+        // --- Fill: resolve the parent through the kernel directory cache (zero
+        //     host syscalls once that directory is known), lstat the leaf, read
+        //     its metadata, then cache. Sibling leaves of one directory are the
+        //     overwhelming case — a package dir, a `bin/` — so this is where the
+        //     per-directory resolution is amortised away.
+        //
+        //     Called with NO lock held: LOCK ORDER is `stat_cache` ->
+        //     `dir_cache`, and `dir_fd_for` takes `dir_cache`.
         let parent = rel.parent().unwrap_or_else(|| Path::new(""));
-        // Reuse this directory's existing anchor when one is still alive. The
-        // sibling leaves of one directory are the overwhelming case (a package
-        // dir, a `bin/`), and opening a private dirfd for each of them is what
-        // put 1,138 host dirfds on 44 directories — see `parent_fds`.
-        let interned = self
-            .parent_fds
-            .lock()
-            .get(parent)
-            .and_then(std::sync::Weak::upgrade);
-        let parent_fd: std::sync::Arc<OwnedFd> = if let Some(anchor) = interned {
-            anchor
-        } else {
-            let opened: OwnedFd = if parent.as_os_str().is_empty() {
-                // Leaf directly under the sandbox root — dup the root dir fd so
-                // the cache owns an independent lifetime. The root is contained
-                // by definition.
-                let raw = unsafe { libc::dup(dir_fd) };
-                if raw < 0 {
-                    return None;
-                }
-                unsafe { OwnedFd::from_raw_fd(raw) }
-            } else {
-                let parent_c = std::ffi::CString::new(parent.as_os_str().as_bytes()).ok()?;
-                let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NONBLOCK;
-                let raw = unsafe { libc::openat(dir_fd, parent_c.as_ptr(), flags, 0) };
-                if raw < 0 {
-                    return None; // ENOTDIR / ENOENT / … → not cacheable
-                }
-                let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-                // The parent's real path must be under the sandbox root (an
-                // intermediate symlink the kernel followed out is rejected
-                // here). Only a PROVEN fd is ever published for reuse.
-                if !fd_contained_under(fd.as_raw_fd(), root_prefix) {
-                    return None;
-                }
-                fd
-            };
-            let anchor = std::sync::Arc::new(opened);
-            let mut parents = self.parent_fds.lock();
-            // Bounded like `stat_cache` itself, and by dropping only entries
-            // whose anchor is already gone: a live anchor is never unpublished,
-            // so the invariant "one live host dirfd per directory" holds even
-            // at the cap. This is also the ONLY place dead keys are reaped —
-            // see the `parent_fds` field doc.
-            if parents.len() >= 4096 {
-                parents.retain(|_, weak| weak.strong_count() > 0);
-            }
-            parents.insert(parent.to_path_buf(), std::sync::Arc::downgrade(&anchor));
-            anchor
-        };
+        let parent_fd = self.dir_fd_for(parent)?;
 
         // lstat the leaf relative to the contained parent — a single component
         // under a trusted anchor cannot escape it (AT_SYMLINK_NOFOLLOW: a symlink
@@ -3083,6 +3356,7 @@ impl HostFsBackend {
             rel.to_path_buf(),
             StatCacheEntry {
                 parent_fd,
+                dir_generation,
                 ino: st.st_ino,
                 ctime: (st.st_ctime, carrick_portable::stat_ctime_nsec(&st)),
                 mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(&st)),
@@ -4884,7 +5158,17 @@ impl FsBackend for HostFsBackend {
         let Ok((dir, at_rel)) = self.at(rel) else {
             return false;
         };
-        let removed = dir.remove_file(&at_rel).is_ok() || dir.remove_dir(&at_rel).is_ok();
+        // Discriminate file from directory rather than testing `is_ok()` on
+        // either: only a DIRECTORY removal can invalidate a cached dirfd, and
+        // charging the directory generation for every file unlink would flush
+        // the cache thousands of times on a build for no reason.
+        let removed_file = dir.remove_file(&at_rel).is_ok();
+        let removed_dir = !removed_file && dir.remove_dir(&at_rel).is_ok();
+        if removed_dir {
+            crate::fs_resolve_cache::bump_dir_generation();
+            self.drop_dir_cache();
+        }
+        let removed = removed_file || removed_dir;
         // Clean up any per-symlink xattr sidecars (non-macOS owner store) so a
         // later entry that reuses the name does not inherit a stale owner.
         #[cfg(not(target_os = "macos"))]
@@ -4901,8 +5185,13 @@ impl FsBackend for HostFsBackend {
         if let Some(rel) = Self::rel_path(&normalized)
             && let Ok((dir, at_rel)) = self.at(rel)
         {
-            let _ = dir.remove_file(&at_rel);
-            let _ = dir.remove_dir(&at_rel);
+            let removed_file = dir.remove_file(&at_rel).is_ok();
+            // Only the directory case invalidates cached dirfds; see
+            // `remove_entry`.
+            if !removed_file && dir.remove_dir(&at_rel).is_ok() {
+                crate::fs_resolve_cache::bump_dir_generation();
+                self.drop_dir_cache();
+            }
         }
         self.write_whiteout_normalized(&normalized)
     }
@@ -5059,12 +5348,15 @@ impl FsBackend for HostFsBackend {
                 }
             }
         }
-        // A rename can move a directory that the stat cache holds as a parent
-        // anchor; a cached fd silently follows the inode to its new location, so
-        // a later stat by the OLD path would wrongly resolve under the new one
-        // (the single case the per-hit revalidation can't detect, since
-        // ino/ctime are unchanged). Renames are rare relative to stats — drop
-        // the whole cache. No-op when the cache is disabled/empty.
+        // A rename can move a directory that the kernel directory cache holds
+        // an fd for; a cached fd silently follows the inode to its new
+        // location, so a later resolution of the OLD path would wrongly land
+        // under the new one — the single case per-hit identity revalidation
+        // cannot detect, since ino/ctime are unchanged. Bump the shared
+        // directory-topology generation so EVERY process re-resolves, then drop
+        // this process's own entries so it cannot serve them in the meantime.
+        crate::fs_resolve_cache::bump_dir_generation();
+        self.drop_dir_cache();
         if self.use_stat_cache {
             self.drop_stat_cache_after_rename();
         }
@@ -5150,6 +5442,10 @@ impl FsBackend for HostFsBackend {
                 return Err(BackendError::Io);
             }
         }
+        // Same reasoning as `rename_overlay_entry`: an exchange re-points both
+        // paths, so every process must re-resolve them.
+        crate::fs_resolve_cache::bump_dir_generation();
+        self.drop_dir_cache();
         if self.use_stat_cache {
             self.drop_stat_cache_after_rename();
         }
@@ -7019,111 +7315,135 @@ mod tests {
         );
     }
 
-    /// The intern map must hold anchors WEAKLY: dropping the cache entries must
-    /// drop the anchor, and the next fill must open a fresh one rather than
-    /// resurrect the old. A strong intern map passes the duplication assertion
-    /// above but fails here — it would keep the anchor alive past its last
-    /// entry, which is what widens the replaced-directory staleness window
-    /// beyond the revalidation hit path's.
+    /// A directory is resolved ONCE and then reused: the whole point of the
+    /// kernel directory cache. Repeated `dir_fd_for` on the same directory must
+    /// hand back the same host fd, and a nested directory must be reachable
+    /// through it.
     #[cfg(target_os = "macos")]
     #[test]
-    fn stat_cache_parent_anchor_dies_with_its_last_entry() {
+    fn dir_cache_resolves_a_directory_once_and_reuses_it() {
         use std::os::fd::AsRawFd;
 
         let scratch_root = tempfile::TempDir::new().unwrap();
         let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
-        assert!(b.stat_cache_active());
         b.dir.create_dir("pkg").unwrap();
-        b.dir.write("pkg/a", b"x").unwrap();
-        b.dir.write("pkg/b", b"x").unwrap();
-        assert!(b.stat_cache_lookup("/pkg/a").is_some());
-        assert!(b.stat_cache_lookup("/pkg/b").is_some());
+        b.dir.create_dir("pkg/inner").unwrap();
 
-        let first_anchor = b
-            .stat_cache
-            .lock()
-            .get(Path::new("pkg/a"))
-            .expect("leaf a cached")
-            .parent_fd
-            .as_raw_fd();
-
-        // Evict every entry under the directory; nothing else holds the anchor.
-        b.stat_cache.lock().clear();
-        let published = b.parent_fds.lock().get(Path::new("pkg")).cloned();
-        let published = published.expect("the anchor's key is still published");
-        assert!(
-            published.upgrade().is_none(),
-            "a Weak anchor must NOT survive its last stat_cache entry; a strong \
-             intern map would keep it alive here"
+        let first = b.dir_fd_for(Path::new("pkg")).expect("pkg resolves");
+        let again = b.dir_fd_for(Path::new("pkg")).expect("pkg resolves again");
+        assert_eq!(
+            first.as_raw_fd(),
+            again.as_raw_fd(),
+            "a repeat resolution must reuse the cached dirfd, not open a second"
         );
 
-        // The dead Weak must read as a plain MISS, not poison the path: the
-        // re-fill has to succeed and republish a live anchor.
-        //
-        // Deliberately NOT asserted by comparing raw fd numbers before and
-        // after: the kernel is free to hand the fresh open the number the
-        // dropped anchor just released, so that comparison fails at random.
-        // `upgrade()` returning None above already proves nothing was
-        // resurrected -- there was no live anchor left to resurrect.
-        let _ = first_anchor;
-        assert!(b.stat_cache_lookup("/pkg/a").is_some());
-        assert!(
-            b.parent_fds
-                .lock()
-                .get(Path::new("pkg"))
-                .and_then(std::sync::Weak::upgrade)
-                .is_some(),
-            "the re-fill must republish a live anchor for the directory"
+        let inner = b
+            .dir_fd_for(Path::new("pkg/inner"))
+            .expect("nested dir resolves");
+        assert_ne!(inner.as_raw_fd(), first.as_raw_fd());
+        // Descending stored both levels, so the parent is still the same fd.
+        assert_eq!(
+            b.dir_fd_for(Path::new("pkg")).unwrap().as_raw_fd(),
+            first.as_raw_fd()
         );
     }
 
-    /// A rename must leave no UPGRADEABLE anchor for the moved directory.
+    /// The load-bearing property that makes the cache viable on a build:
+    /// creating and unlinking FILES must not invalidate a directory's fd.
     ///
-    /// `rename_overlay_entry` clears `stat_cache` because a cached dirfd
-    /// silently follows the inode — the one case per-hit revalidation cannot
-    /// detect. Clearing `stat_cache` alone is not enough once anchors are
-    /// interned: the fill path publishes the `Weak` and then works unlocked
-    /// before inserting its entry, and nothing serializes a rename against a
-    /// stat, so an in-flight fill keeps its anchor alive across the clear. With
-    /// the `Weak` still published that stale anchor would be served to every
-    /// later fill under the path instead of stranding the one in-flight entry.
-    /// The live `Arc` below stands in for that in-flight fill deterministically.
+    /// A single generation counter shared with the path-resolution cache would
+    /// fail this — `go build` creates thousands of files, every one of which
+    /// bumps that counter, so the dirfds would be flushed continuously and the
+    /// walk they replace would be repaid on every call.
     #[cfg(target_os = "macos")]
     #[test]
-    fn rename_leaves_no_upgradeable_parent_anchor() {
+    fn dir_cache_survives_a_file_create_and_unlink_storm() {
+        use std::os::fd::AsRawFd;
+
+        let scratch_root = tempfile::TempDir::new().unwrap();
+        let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+        b.dir.create_dir("pkg").unwrap();
+        let before = b.dir_fd_for(Path::new("pkg")).unwrap().as_raw_fd();
+
+        for index in 0..64 {
+            b.create_file(&format!("/pkg/f{index}")).unwrap();
+            assert!(b.remove_entry(&format!("/pkg/f{index}")));
+        }
+
+        assert_eq!(
+            b.dir_fd_for(Path::new("pkg")).unwrap().as_raw_fd(),
+            before,
+            "file churn must not invalidate the directory cache"
+        );
+    }
+
+    /// A cached dirfd names an INODE, so a rename of the directory would make
+    /// it silently serve a path that no longer exists — identity revalidation
+    /// cannot catch it, because the inode, ctime and size are all unchanged at
+    /// the new location. The directory-topology generation must.
+    ///
+    /// This asserts the guest-visible outcome rather than a cache internal: a
+    /// stat of the OLD path after the rename must fail, and the new path must
+    /// work.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rename_stops_the_old_directory_path_from_resolving() {
         let scratch_root = tempfile::TempDir::new().unwrap();
         let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
         assert!(b.stat_cache_active());
         b.dir.create_dir("pkg").unwrap();
         b.dir.write("pkg/a", b"x").unwrap();
-        assert!(b.stat_cache_lookup("/pkg/a").is_some());
 
-        // Stand in for a fill that has published its anchor but not yet
-        // inserted its entry: the Arc is alive, so the clear cannot kill it.
-        // ONE lock acquisition: `parking_lot::Mutex` is not reentrant, and a
-        // second `b.stat_cache.lock()` inside an `.or_else` on the same
-        // expression deadlocks against the first guard, which lives to the end
-        // of the statement. (It did; the test hung for 12 minutes.)
-        let inflight = {
-            let map = b.stat_cache.lock();
-            map.get(Path::new("pkg/a"))
-                .map(|entry| entry.parent_fd.clone())
-                .expect("an anchor must be live before the rename")
-        };
+        // Warm both caches on the pre-rename topology.
+        assert!(b.stat_cache_lookup("/pkg/a").is_some());
+        assert!(b.dir_fd_for(Path::new("pkg")).is_some());
 
         assert!(b.rename_overlay_entry("/pkg", "/moved").unwrap());
 
-        let upgradeable = b
-            .parent_fds
-            .lock()
-            .get(Path::new("pkg"))
-            .and_then(std::sync::Weak::upgrade);
         assert!(
-            upgradeable.is_none(),
-            "a rename must leave no upgradeable anchor for the OLD parent path; \
-             a later fill would otherwise resolve under the moved directory"
+            b.dir_fd_for(Path::new("pkg")).is_none(),
+            "the old directory path must not resolve after its rename"
         );
-        drop(inflight);
+        assert!(
+            b.stat_cache_lookup("/pkg/a").is_none(),
+            "a leaf under the renamed directory must not be served from cache"
+        );
+        assert!(
+            b.stat_cache_lookup("/moved/a").is_some(),
+            "the leaf must be reachable at its new path"
+        );
+    }
+
+    /// Containment, the invariant the whole cache rests on. A symlink is never
+    /// published as a directory, and a path THROUGH a symlink that leaves the
+    /// sandbox is refused rather than cached — the caller then keeps its exact
+    /// existing fallback, which re-roots absolute targets at the guest root.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dir_cache_refuses_a_symlink_that_escapes_the_sandbox() {
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(outside.path().join("target")).unwrap();
+        let scratch_root = tempfile::TempDir::new().unwrap();
+        let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+
+        // An absolute symlink pointing clean out of the sandbox.
+        std::os::unix::fs::symlink(outside.path(), scratch_root.path().join("escape")).unwrap();
+
+        assert!(
+            b.dir_fd_for(Path::new("escape")).is_none(),
+            "a symlink leaf must not be resolved as a directory (O_NOFOLLOW)"
+        );
+        assert!(
+            b.dir_fd_for(Path::new("escape/target")).is_none(),
+            "a path through a symlink out of the sandbox must be refused"
+        );
+        let cache = b.dir_cache.lock();
+        assert!(
+            !cache.contains_key(Path::new("escape"))
+                && !cache.contains_key(Path::new("escape/target")),
+            "nothing reached through a symlink may be published, got {:?}",
+            cache.keys().collect::<Vec<_>>()
+        );
     }
 
     #[cfg(target_os = "macos")]

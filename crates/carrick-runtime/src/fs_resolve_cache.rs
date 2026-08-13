@@ -26,11 +26,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 
-/// The one `MAP_SHARED` generation word, shared with every host-forked
-/// descendant so a mutation in any process invalidates every process's cache.
-fn generation_word() -> &'static AtomicU64 {
+/// Index of the path-resolution generation within the shared page.
+const PATH_GENERATION_SLOT: usize = 0;
+/// Index of the directory-topology generation within the shared page. Kept in
+/// the SAME page as the path generation so one `mmap` serves both and both are
+/// equally fork-shared.
+const DIR_GENERATION_SLOT: usize = 1;
+
+/// The shared generation words, one `MAP_SHARED` page, shared with every
+/// host-forked descendant so a mutation in any process invalidates every
+/// process's caches.
+fn generation_word_at(slot: usize) -> &'static AtomicU64 {
     static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let addr = *CELL.get_or_init(|| {
+    let base = *CELL.get_or_init(|| {
         // SAFETY: a fresh anonymous shared page owned for the process lifetime.
         let p = unsafe {
             libc::mmap(
@@ -44,19 +52,28 @@ fn generation_word() -> &'static AtomicU64 {
         };
         if p == libc::MAP_FAILED {
             // mmap failing at boot means the host is already OOM; fall back to a
-            // leaked process-local atomic (cross-fork coherence lost, but the
+            // leaked process-local array (cross-fork coherence lost, but the
             // run is failing anyway).
-            return Box::into_raw(Box::new(AtomicU64::new(1))) as usize;
+            let fallback: Box<[AtomicU64; 2]> = Box::new([AtomicU64::new(1), AtomicU64::new(1)]);
+            return Box::into_raw(fallback) as usize;
         }
-        // SAFETY: `p` is a writable 4 KiB page; an AtomicU64 fits at its start.
+        // SAFETY: `p` is a writable 4 KiB page; two AtomicU64 fit at its start.
         // Start at 1 so a freshly-stamped entry (gen 1) is valid until the first
         // mutation; 0 is reserved as "never stamped".
-        unsafe { (*(p as *mut AtomicU64)).store(1, Ordering::SeqCst) };
+        unsafe {
+            (*(p as *mut AtomicU64).add(PATH_GENERATION_SLOT)).store(1, Ordering::SeqCst);
+            (*(p as *mut AtomicU64).add(DIR_GENERATION_SLOT)).store(1, Ordering::SeqCst);
+        }
         p as usize
     });
-    // SAFETY: `addr` is a live AtomicU64 valid for the whole process; MAP_SHARED
-    // makes it the SAME physical word in every host-forked descendant.
-    unsafe { &*(addr as *const AtomicU64) }
+    // SAFETY: `base` points at a live [AtomicU64; 2] valid for the whole
+    // process; MAP_SHARED makes it the SAME physical memory in every
+    // host-forked descendant. `slot` is one of the two module constants.
+    unsafe { &*(base as *const AtomicU64).add(slot) }
+}
+
+fn generation_word() -> &'static AtomicU64 {
+    generation_word_at(PATH_GENERATION_SLOT)
 }
 
 /// Force the shared generation word into existence in the ROOT process, BEFORE
@@ -77,6 +94,33 @@ pub fn current_generation() -> u64 {
 /// unlink/mknod/create), NOT from content writes.
 pub fn bump_generation() {
     generation_word().fetch_add(1, Ordering::SeqCst);
+}
+
+/// Current DIRECTORY-TOPOLOGY generation — the one the kernel's directory
+/// cache stamps its open dirfds with.
+///
+/// This is deliberately a SECOND, much slower-moving counter than
+/// [`current_generation`]. A cached dirfd names an *inode*, so it is only
+/// invalidated by an operation that can change which inode an existing
+/// directory PATH names: a rename or exchange involving a directory, and a
+/// directory removal. Creating a file, writing one, unlinking one, or creating
+/// a new directory cannot — a new name cannot re-point an existing one.
+///
+/// That distinction is what makes a directory cache viable on a build
+/// workload. A cold `go build` performs thousands of file creations and
+/// unlinks, every one of which bumps the path generation and so flushes the
+/// resolve cache; almost none of them touch directory topology, so the dirfds
+/// survive and the walk they replace is never repaid.
+pub fn current_dir_generation() -> u64 {
+    generation_word_at(DIR_GENERATION_SLOT).load(Ordering::SeqCst)
+}
+
+/// Invalidate every process's directory cache. Call ONLY from an operation
+/// that can re-point an existing directory path — rename/exchange where either
+/// side is a directory, and directory removal (including a whiteout that hides
+/// one). See [`current_dir_generation`] for why the set is this narrow.
+pub fn bump_dir_generation() {
+    generation_word_at(DIR_GENERATION_SLOT).fetch_add(1, Ordering::SeqCst);
 }
 
 /// Per-process resolve cache, validated against the shared generation. The map
@@ -176,5 +220,28 @@ mod tests {
         let a = current_generation();
         bump_generation();
         assert!(current_generation() > a);
+    }
+
+    #[test]
+    fn dir_generation_advances_monotonically() {
+        let a = current_dir_generation();
+        bump_dir_generation();
+        assert!(current_dir_generation() > a);
+    }
+
+    #[test]
+    fn path_and_dir_generations_are_independent_words() {
+        // The whole point of the second counter: a file create/unlink storm
+        // must NOT flush the directory cache. Bumping the path generation
+        // leaves the dir generation exactly where it was.
+        //
+        // Only the dir side is asserted stable — another test bumping the path
+        // generation concurrently is harmless, but a concurrent
+        // `bump_dir_generation` would be a real aliasing bug, and this test
+        // would catch it.
+        let dir_before = current_dir_generation();
+        bump_generation();
+        bump_generation();
+        assert_eq!(current_dir_generation(), dir_before);
     }
 }

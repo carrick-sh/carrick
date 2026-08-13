@@ -23,6 +23,10 @@ BIN=target/release/carrick
 OUT=${CARRICK_AMP_OUT:-target/perf/amp1}
 IMAGE=${CARRICK_AMP_IMAGE:?set CARRICK_AMP_IMAGE to a digest-pinned image}
 BOUND=${CARRICK_AMP_BOUND_SECONDS:-3600}
+# The kernel lane is what this tree is measured against; `native` and `vmm` are
+# reference lanes. Stamped into the arm banner so a ledger can never be read as
+# a before/after of a backend it did not measure.
+BACKEND=${CARRICK_AMP_BACKEND:-hvpatch}
 GUEST=${CARRICK_AMP_GUEST:-'set -eu; cd /tmp; rm -rf gc-w; printf "package main\nfunc main(){println(\"ok\")}\n" > h.go; GOCACHE=/tmp/gc-w /usr/local/go/bin/go build -o h ./h.go; ./h; echo BUILD_OK'}
 
 TAG=${1:?usage: amplification-capture.sh <arm-tag> [ENV=VAL ...]}
@@ -37,6 +41,7 @@ say "binary: $(shasum -a 256 $BIN | cut -d' ' -f1)"
 say "source: $(git rev-parse HEAD) tree-clean=$([ -z "$(git status --porcelain)" ] && echo yes || echo no)"
 say "host:   $(sw_vers -productVersion) $(sysctl -n machdep.cpu.brand_string)"
 say "image:  $IMAGE"
+say "backend:$BACKEND"
 say "=========================================================="
 
 export CARRICK_RUN_ID="amp1${TAG}$$"
@@ -46,7 +51,7 @@ RAW="$OUT/$TAG.raw"
 t0=$(date +%s)
 env "$@" "$BIN" trace --profile native-amplification --preflight-quiet-host \
     --profile-bound-seconds "$BOUND" -o "$RAW" \
-    -- run --exec-backend native "$IMAGE" /bin/sh -c "$GUEST" \
+    -- run --exec-backend "$BACKEND" "$IMAGE" /bin/sh -c "$GUEST" \
     > "$OUT/$TAG.out" 2> "$OUT/$TAG.err"
 rc=$?
 say "$TAG RESULT: exit=$rc wall_s=$(( $(date +%s) - t0 )) out=[$(tr '\n' ' ' < "$OUT/$TAG.out")]"
