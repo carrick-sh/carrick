@@ -2728,8 +2728,23 @@ fn resolve_handler<M: GuestMemory>(number: u64) -> Option<SyscallHandler<M>> {
         .or_else(|| mqueue::dispatch_mqueue(number))
 }
 
+/// True once the kernel lane's first process has bound. On that lane a Linux
+/// process is a THREAD of this host process, so a guest pid is NOT a host pid
+/// and must never be handed to a host call that takes one.
+///
+/// A process-global flag, following the precedent of
+/// `guest_cpu::set_native_darwin_provider`: the free functions that need this
+/// fact (the signal send path) hold no dispatcher, and threading one through
+/// every caller would be a larger change than the fact warrants.
+static HVPATCH_LANE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn hvpatch_lane_active() -> bool {
+    HVPATCH_LANE.load(std::sync::atomic::Ordering::Acquire)
+}
+
 impl SyscallDispatcher {
     pub(crate) fn bind_hvpatch_process(&self, process: crate::hvpatch::ProcessContext) {
+        HVPATCH_LANE.store(true, std::sync::atomic::Ordering::Release);
         process.bind_vma_source(self.vma_snapshot_source());
         *self.kernel_binding.write() = process.task_binding();
         // HVPatch multiplexes Linux tasks inside one host PID, so the mature
