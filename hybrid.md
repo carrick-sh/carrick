@@ -270,7 +270,7 @@ parked set. Every row names the ONE thing that unblocks its next step.
 
 | phase | status | landed | next concrete step |
 |---|---|---|---|
-| **KI** kernel identity *(new)* | **in progress; mechanism SETTLED by measurement** | `guest_pid_is_live` routes 3 of 4 liveness probes to the task registry; duplicate root-tid derivation removed | close the remaining comparators, then seed the root at 1 in `hvpatch/mod.rs:626` — the FATAL objection does not apply to a lane-scoped reseed |
+| **KI** kernel identity *(new)* | **step 1 DONE; mechanism settled by measurement** | every host-pid comparator closed, incl. the live `libc::kill` hazard; canonical self-check now resolves the caller | **step 2: seed the root at 1** in `hvpatch/mod.rs:626` — pgid/sid follow for free |
 | **KP** conformance proof | **started** | kernel lane added to the harness; first gate: **304 PASS / 90 FAIL**, 26 kernel-lane-specific | bless `baseline.hvpatch.jsonl`; close the 26, largest cluster first |
 | **KD** diagnostics | **partial** | ELF core writer + validator; crash reports as signal death, oracle-matched | build a `CoreDump` from live state — a correct first slice needs NO memory plumbing |
 | **KL** lifecycle | **partial** | per-task user AND system CPU, oracle-matched; `CLONE_PIDFD` scoping; concurrent sibling fork | `ru_maxrss`/`ru_majflt` still host-sourced; per-task `/proc` authority |
@@ -339,16 +339,30 @@ floor — do not make it dramatically worse — and is no longer a gate.
    native or vmm, which bootstrap through `bootstrap_one_task_binding`
    instead. The two MAJOR objections survive and are still the work.
 
-   **Step 1 started (`f6bf85701`).** Three of the four `kill(pid, 0)` liveness
-   probes now ask carrick's kernel through `guest_pid_is_live`, which returns
-   `None` on lanes with no task registry so the reference lanes keep their host
-   probe unchanged. The fourth probes a process GROUP and needs a group
-   authority the kernel does not expose yet. `threaded_loop.rs`'s duplicate
-   derivation of the root leader tid from `std::process::id()` is gone.
-   **Still open in step 1:** the six `LINUX_BOOTSTRAP_PID` self-aliases
-   (`abi_args.rs:62`, `creds.rs:415`, `:459`, `signal.rs:1193`, `:1934`,
-   `:2223`), `libc::kill` at `signal.rs:2326`, `cred_ipc::read_target` at
-   `signal.rs:2269`, and the group probe at `proc.rs:3585`.
+   **STEP 1 IS DONE.** The comparators that made a guest pid reach the host
+   are closed, and each is correct at either seed:
+   - `guest_pid_is_live` routes the task-liveness probes to the kernel's
+     registry, returning `None` where there is no registry so the reference
+     lanes are untouched (`f6bf85701`);
+   - `NsPid::names_self` resolves the CALLER and narrows the
+     `LINUX_BOOTSTRAP_PID` alias to callers with no distinct identity, so a
+     child no longer treats the init's pid as its own (`1be237fdf`);
+   - `capget`/`capset` are consolidated onto that canonical check instead of
+     two more hand-rolled copies (`fee9cc54c`);
+   - **the host `kill(2)` fall-through is guarded** (`6eba05339`) — the live
+     hazard, since guest ids are `host_pid + k` and can already hit unrelated
+     host processes;
+   - `threaded_loop.rs`'s duplicate root-tid derivation is gone.
+
+   Two deliberately NOT closed, with reasons recorded in place:
+   `cred_ipc::read_target` is already inert on this lane (`cred_ipc` is
+   unpublished at bind), so it is a missing permission check rather than a
+   hazard; and the `waitpid` process-group probe uses signal 0, which SENDS
+   nothing, so a guest pgid there is a wrong answer rather than a wrong
+   action. Both want the kernel's own credential and process-group tables.
+
+   **Step 2 is the reseed** at `hvpatch/mod.rs:626`, with pgid and sid
+   following for free.
 2. **The per-thread register file** — step 1 of KD (a core with wrong
    registers is worse than none) and step 2 of KS. Two phases converge on it.
    Note the KD spec calls this "the one genuinely missing input" and that is no
