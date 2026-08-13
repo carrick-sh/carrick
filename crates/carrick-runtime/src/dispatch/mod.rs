@@ -8152,6 +8152,19 @@ fn write_host_pipe_payload(
             offset.map_or(-1, |offset| offset as u32 as i32),
             payload.as_slice().len() as u32 as i32,
         );
+        // Offset 0 means the archive magic is being skipped: the file will not
+        // be a valid `ar` archive. Report it once, at the moment it happens.
+        // This is a genuine data-corruption event, not trace output — it fires
+        // at most a handful of times in a whole build, so it cannot perturb
+        // timing the way a per-I/O log does.
+        if offset == Some(0) {
+            tracing::error!(
+                target: "carrick::dispatch::fs",
+                host_fd,
+                length = payload.as_slice().len(),
+                "ar member header written at offset 0; the archive will lack its magic"
+            );
+        }
     }
 
     #[cfg(feature = "trace-io")]
