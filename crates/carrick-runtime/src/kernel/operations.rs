@@ -43,9 +43,18 @@ pub enum WaitOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Observable identity of one exact task generation.
+///
+/// Keys, not bare numbers. A Linux TGID is reused within a run and an ASID is
+/// recycled on exit, so `(pid, asid)` cannot distinguish two generations that
+/// share a number — the ambiguity K1's observability contract forbids. The
+/// `TaskSerial` inside each key is never reused by one Kernel, so a consumer
+/// joining lifecycle records can always tell "the same task again" from "a
+/// different task wearing the same pid".
 pub struct TaskIdentity {
-    pub task_id: TaskId,
-    pub parent: Option<TaskId>,
+    pub task: TaskKey,
+    pub parent: Option<TaskKey>,
+    pub mm: MmId,
     pub process_group: ProcessGroupId,
     pub session: SessionId,
 }
@@ -910,8 +919,9 @@ impl Kernel {
             .get(&task_id)
             .ok_or(KernelOperationError::UnknownTask(task_id))?;
         Ok(TaskIdentity {
-            task_id,
-            parent: record.task.parent().map(|parent| parent.id),
+            task: record.task.key(),
+            parent: record.task.parent(),
+            mm: record.task.shared().mm().id(),
             process_group: record.task.process_group(),
             session: record.task.session(),
         })
@@ -2898,8 +2908,9 @@ mod tests {
                 .task_identity(child.task.key().id)
                 .expect("child identity"),
             TaskIdentity {
-                task_id: child.task.key().id,
-                parent: Some(root.task.key().id),
+                task: child.task.key(),
+                parent: Some(root.task.key()),
+                mm: child.shared.mm().id(),
                 process_group: root.task.process_group(),
                 session: root.task.session(),
             }
@@ -4438,7 +4449,7 @@ mod tests {
                 .task_identity(child.task.key().id)
                 .expect("reparented child")
                 .parent,
-            Some(root.task.key().id)
+            Some(root.task.key())
         );
         assert!(matches!(
             kernel.wait_child(

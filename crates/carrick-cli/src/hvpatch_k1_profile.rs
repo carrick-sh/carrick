@@ -14,7 +14,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::trace_profile::ProfileCaptureStatus;
 
 const PREFIX: &str = "HVPATCHK1";
-const VERSION: u64 = 1;
+const VERSION: u64 = 2;
 const EXPECTED_ROOTS: u64 = 1;
 const EXPECTED_FORKS: u64 = 68;
 const EXPECTED_EXECS: u64 = 67;
@@ -229,6 +229,10 @@ impl HvpatchK1LifecycleSummary {
         let mut header_seen = false;
         let mut end = None;
         let mut births = BTreeMap::<ProcessKey, Birth>::new();
+        // Serials seen across births, and the serials execs claimed. Every
+        // exec must name a task that was actually born in this capture.
+        let mut birth_serials = BTreeSet::<u64>::new();
+        let mut exec_serials = Vec::<u64>::new();
         let mut birth_pids = BTreeSet::new();
         let mut execs = BTreeMap::<ProcessKey, (i32, u64)>::new();
         let mut terminals = BTreeMap::<ProcessKey, (i32, i64, u64)>::new();
@@ -262,7 +266,17 @@ impl HvpatchK1LifecycleSummary {
                     header_seen = true;
                 }
                 "birth" => {
-                    record.exact_fields(&["asid", "count", "kind", "pid", "ppid", "tid"])?;
+                    record.exact_fields(&[
+                        "asid",
+                        "count",
+                        "kind",
+                        "mm",
+                        "parent_serial",
+                        "pid",
+                        "ppid",
+                        "task_serial",
+                        "tid",
+                    ])?;
                     let kind = match record.u64("kind")? {
                         0 => BirthKind::Root,
                         1 => BirthKind::Fork,
@@ -279,12 +293,34 @@ impl HvpatchK1LifecycleSummary {
                     if !birth_pids.insert(key.pid) {
                         bail!("duplicate HVPatch K1 guest pid {}", key.pid);
                     }
+                    // The serial is what makes an identity unambiguous: a pid
+                    // and an ASID are both recycled within a run, so neither
+                    // can prove two births are different tasks. A `TaskSerial`
+                    // is never reused by one Kernel, so a repeat means the
+                    // capture conflated two generations.
+                    let task_serial = record.u64("task_serial")?;
+                    let parent_serial = record.u64("parent_serial")?;
+                    if task_serial == 0 || record.u64("mm")? == 0 {
+                        bail!("HVPatch K1 birth identity must carry a task serial and an mm");
+                    }
+                    if (ppid == 0) != (parent_serial == 0) {
+                        bail!(
+                            "HVPatch K1 birth parent pid and parent serial disagree about a parent"
+                        );
+                    }
+                    if !birth_serials.insert(task_serial) {
+                        bail!("duplicate HVPatch K1 task serial {task_serial}");
+                    }
                     if births.insert(key, Birth { kind, ppid, tid }).is_some() {
                         bail!("duplicate HVPatch K1 birth identity");
                     }
                 }
                 "exec" => {
-                    record.exact_fields(&["asid", "count", "pid", "tid"])?;
+                    record.exact_fields(&["asid", "count", "mm", "pid", "task_serial", "tid"])?;
+                    if record.u64("task_serial")? == 0 || record.u64("mm")? == 0 {
+                        bail!("HVPatch K1 exec identity must carry a task serial and an mm");
+                    }
+                    exec_serials.push(record.u64("task_serial")?);
                     let count = record.u64("count")?;
                     if count == 0 {
                         bail!("HVPatch K1 exec count must be positive");
@@ -360,6 +396,14 @@ impl HvpatchK1LifecycleSummary {
             bail!("HVPatch K1 stream is missing its header");
         }
         let end = end.ok_or_else(|| anyhow!("HVPatch K1 stream is missing its end record"))?;
+        // Every exec must name a task generation this capture actually saw
+        // born. Joining on pid alone could not catch an exec attributed to a
+        // recycled number; the serial can.
+        for serial in &exec_serials {
+            if !birth_serials.contains(serial) {
+                bail!("HVPatch K1 exec names task serial {serial}, which no birth record declares");
+            }
+        }
         validate_capture(&births, &execs, &terminals, &vm, end)
     }
 
@@ -561,17 +605,23 @@ mod tests {
     use super::*;
 
     fn valid_stream() -> String {
-        let mut lines = vec!["HVPATCHK1|header|version=1".to_owned()];
-        lines.push("HVPATCHK1|birth|kind=0|pid=100|ppid=0|tid=100|asid=1|count=1".to_owned());
+        let mut lines = vec!["HVPATCHK1|header|version=2".to_owned()];
+        // Serial 1 is the root; each fork takes the next serial. Serials are
+        // deliberately independent of the recycled pid/ASID numbering.
+        lines.push(
+            "HVPATCHK1|birth|kind=0|pid=100|ppid=0|tid=100|asid=1|task_serial=1|parent_serial=0|mm=1|count=1"
+                .to_owned(),
+        );
         for index in 0..68 {
             let pid = 101 + index;
+            let serial = index + 2;
             lines.push(format!(
-                "HVPATCHK1|birth|kind=1|pid={pid}|ppid=100|tid={pid}|asid={}|count=1",
+                "HVPATCHK1|birth|kind=1|pid={pid}|ppid=100|tid={pid}|asid={}|task_serial={serial}|parent_serial=1|mm={serial}|count=1",
                 index + 2
             ));
             if index < 67 {
                 lines.push(format!(
-                    "HVPATCHK1|exec|pid={pid}|tid={pid}|asid={}|count=1",
+                    "HVPATCHK1|exec|pid={pid}|tid={pid}|asid={}|task_serial={serial}|mm={serial}|count=1",
                     index + 2
                 ));
             }
@@ -587,7 +637,7 @@ mod tests {
                 "HVPATCHK1|vm|operation={operation}|admission={admission}|count=1"
             ));
         }
-        lines.push("HVPATCHK1|end|version=1|roots=1|forks=68|execs=67|exits=69|births=69|live=0|bounded=0|errors=0|target_exit_seen=1|target_exit_code=0|target_exit_reason=1".to_owned());
+        lines.push("HVPATCHK1|end|version=2|roots=1|forks=68|execs=67|exits=69|births=69|live=0|bounded=0|errors=0|target_exit_seen=1|target_exit_code=0|target_exit_reason=1".to_owned());
         lines.join("\n")
     }
 
@@ -603,15 +653,17 @@ mod tests {
             carrick_runtime::dtrace_consumer::BUNDLED_HVPATCH_K1_LIFECYCLE_D
         );
         for required in [
-            "HVPATCHK1|header|version=1",
+            "HVPATCHK1|header|version=2",
             "carrick*:::hvpatch-guest-lifecycle",
+            "carrick*:::hvpatch-guest-lifecycle-identity",
+            "task_serial",
             "carrick*:::hvpatch-guest-exit",
             "carrick*:::vm-lifecycle",
             "syscall::exit:entry",
             "target_exit_code",
             "dtrace:::ERROR",
             "profile:::tick-1sec",
-            "HVPATCHK1|end|version=1",
+            "HVPATCHK1|end|version=2",
         ] {
             assert!(
                 source.contains(required),
@@ -640,9 +692,9 @@ mod tests {
     #[test]
     fn rejects_unknown_fields_and_versions() {
         for corrupt in [
-            valid_stream().replace("version=1\n", "version=1|extra=1\n"),
-            valid_stream().replacen("version=1", "version=2", 1),
-            valid_stream().replacen("version=1", "version=01", 1),
+            valid_stream().replace("version=2\n", "version=2|extra=1\n"),
+            valid_stream().replacen("version=2", "version=3", 1),
+            valid_stream().replacen("version=2", "version=02", 1),
             format!(" {}", valid_stream()),
         ] {
             assert!(
