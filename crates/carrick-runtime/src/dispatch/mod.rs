@@ -8114,6 +8114,27 @@ impl<'a> HostWritePayload<'a> {
 }
 
 /// write(2) on a host-backed fd. Same lockless discipline as `read_host_pipe`.
+/// Host fds that have received an `ar` archive magic write, with the length
+/// written and a monotonic sequence number.
+///
+/// Only touched on the two rare archive predicates (roughly 67 magic writes in
+/// a whole cold `go build`), never on the ordinary write path. Its sole
+/// purpose is to answer, when a member header is caught being written at
+/// offset 0, whether that same description had previously received the magic.
+static AR_MAGIC_WRITES: std::sync::LazyLock<parking_lot::Mutex<HashMap<i32, (usize, u64)>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+static AR_MAGIC_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_ar_magic_write(host_fd: i32, length: usize) {
+    let seq = AR_MAGIC_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    AR_MAGIC_WRITES.lock().insert(host_fd, (length, seq));
+}
+
+/// `(length, sequence)` of the last magic write seen on `host_fd`, if any.
+fn prior_ar_magic_write(host_fd: i32) -> Option<(usize, u64)> {
+    AR_MAGIC_WRITES.lock().get(&host_fd).copied()
+}
+
 fn write_host_pipe(bytes: &[u8], target: HostPipeWriteTarget) -> DispatchOutcome {
     write_host_pipe_payload(HostWritePayload::Borrowed(bytes), target)
 }
@@ -8152,12 +8173,14 @@ fn write_host_pipe_payload(
     // would be debug spam on a healthy run, and the per-write cost is what
     // made `trace-io` perturb this bug out of existence.
     if crate::event_ring::payload_starts_at_ar_magic(payload.as_slice()) {
+        let offset = fs::host_fd_offset(HostFd(host_fd)).map_or(-1, |offset| offset as u32 as i32);
         crate::event_ring::rec(
             crate::event_ring::ARMAGIC,
             host_fd,
-            fs::host_fd_offset(HostFd(host_fd)).map_or(-1, |offset| offset as u32 as i32),
+            offset,
             payload.as_slice().len() as u32 as i32,
         );
+        note_ar_magic_write(host_fd, payload.as_slice().len());
     }
     if crate::event_ring::payload_starts_at_ar_member_header(payload.as_slice()) {
         let offset = fs::host_fd_offset(HostFd(host_fd));
@@ -8173,10 +8196,16 @@ fn write_host_pipe_payload(
         // at most a handful of times in a whole build, so it cannot perturb
         // timing the way a per-I/O log does.
         if offset == Some(0) {
+            // Did THIS description ever receive the magic? The answer picks the
+            // fix: "never" means the magic write went to a different host fd,
+            // i.e. the description was swapped underneath the guest; "yes"
+            // means it reached this fd and the offset was then lost or rewound.
+            let prior_magic = prior_ar_magic_write(host_fd);
             tracing::error!(
                 target: "carrick::dispatch::fs",
                 host_fd,
                 length = payload.as_slice().len(),
+                ?prior_magic,
                 "ar member header written at offset 0; the archive will lack its magic"
             );
         }
