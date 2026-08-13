@@ -167,11 +167,28 @@ impl SyscallDispatcher {
         Ok((first_fd, second_fd))
     }
 
+    /// Record that `fd` is free again: rewind the allocator cursor and drop the
+    /// descriptor's `fd_open_paths` entry.
+    ///
+    /// Every close path funnels through here (`close`, `close_range`, pidfd
+    /// release, pipe teardown, io_uring), which is why the path index is
+    /// retired here rather than at each caller. Only one caller used to clear
+    /// it, so an fd whose file was opened by path and then closed left a stale
+    /// entry behind for the lifetime of the table — a freed fd number that
+    /// still claimed a filename. A cold `sleep` under HVPatch reproduces it:
+    /// glibc opens `/usr/lib/locale/C.utf8/LC_CTYPE` on fd 3, maps it, closes
+    /// it, and the index kept fd 3 forever. The K1 coherent snapshot refuses
+    /// such a table ("open-path index names no live slot"), which is how this
+    /// was found; the stale entry could also mislabel a later reuse of that
+    /// number in `/proc/self/fd` and in fd-close diagnostics.
     pub(in crate::dispatch) fn note_fd_closed(&self, fd: i32) {
         if fd < 0 {
             return;
         }
         let files = self.captured_file_table();
+        // Separate lock, taken and released before `next_fd`: these two are
+        // independent leaf locks and must never nest.
+        files.write_fd_open_paths().remove(&fd);
         let mut next_fd = files.lock_next_fd();
         if fd < *next_fd {
             *next_fd = fd;
