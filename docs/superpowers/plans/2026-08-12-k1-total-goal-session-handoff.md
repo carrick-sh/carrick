@@ -223,6 +223,42 @@ interesting ring under HVPatch's re-exec, or the failing run tearing down
 before a tick. Reading the ring directly from the process with
 `carrick-lldb` sidesteps the dump entirely and is the more reliable route.
 
+**The detector now catches the bug, and the diagnosis is close.** Reporting
+the corrupt condition where it is detected — rather than through the ring
+dump — works and does not perturb: 6 occurrences per corrupting run, 3 of 3
+runs (`9d5ad2f9e`). Correlating it against which host fds received an
+archive magic (`a3a9b7be9`) gives the decisive shape:
+
+```
+host_fd=95  length=2046  prior_magic=None
+host_fd=123 length=32768 prior_magic=None
+host_fd=104 length=32768 prior_magic=Some((68, 8))
+```
+
+Most offset-0 member writes land on a host fd that NEVER received the magic;
+a minority land on one that did. That is the signature of an **append
+landing at offset 0**: the magic is written, the file is opened again as a
+fresh description, and the member write that should extend the file
+overwrites the start instead. It explains what earlier theories could not —
+why the file begins at a member header, why only some archives are hit (only
+those written through a second description), why single-threaded
+write/lseek/pwrite/mmap probes are all exact, and why it is timing-dependent.
+
+`O_APPEND` itself is **correct single-threaded**, verified under HVPatch: an
+append write goes to the end, and still appends after an explicit
+`lseek(0, SEEK_SET)`, which is exact Linux semantics. So the defect is not
+the flag's basic implementation.
+
+That leaves two specific candidates, in priority order:
+
+1. the append POSITION being computed from a stale or cached file size — a
+   size read as 0 would place the write at 0, and this tree has a stat cache
+   in the path;
+2. the `O_APPEND` flag being lost on a description copied across fork/exec,
+   so the second writer appends without append semantics.
+
+Both are testable by instrumenting where the append offset is resolved.
+
 Note also that a healthy run is EXPECTED to emit zero `ARWRITE` records: Go
 writes members inside magic-prefixed buffers, so the predicate deliberately
 does not fire there. Zero records therefore only means something once the
