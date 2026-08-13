@@ -1,0 +1,765 @@
+{
+  "schema": "carrick.kernel-debug-snapshot.v1",
+  "snapshot_schema_version": 6,
+  "registry_epoch": 1,
+  "tasks": [
+    {
+      "key": {
+        "id": 25365,
+        "serial": 6
+      },
+      "class": "live",
+      "parent": null,
+      "children": [],
+      "process_group": 25365,
+      "session": 25365,
+      "lifecycle": "live",
+      "mm": 1,
+      "sighand": 2,
+      "revision": 1,
+      "diagnostic_name": "hvpatch-root"
+    }
+  ],
+  "zombies": [],
+  "threads": [
+    {
+      "key": {
+        "tid": 25365,
+        "serial": 7
+      },
+      "task": {
+        "id": 25365,
+        "serial": 6
+      },
+      "registry_id": 25365,
+      "class": "live",
+      "file_table": 3,
+      "fs_context": 4,
+      "credentials": 5
+    }
+  ],
+  "task_shared": [
+    {
+      "task": {
+        "id": 25365,
+        "serial": 6
+      },
+      "publication": 1,
+      "mm": 1,
+      "sighand": 2,
+      "class": "live"
+    }
+  ],
+  "thread_resources": [
+    {
+      "thread": {
+        "tid": 25365,
+        "serial": 7
+      },
+      "publication": 1,
+      "file_table": 3,
+      "fs_context": 4,
+      "credentials": 5,
+      "class": "live"
+    }
+  ],
+  "mms": [
+    {
+      "id": 1,
+      "class": "live",
+      "revision": 3,
+      "asid": 1,
+      "stage1_root_gpa": 193273659392,
+      "ttbr0": 281668250370048,
+      "mapping_ids": [
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        49
+      ],
+      "legacy_aio_context_count": 0,
+      "next_legacy_aio_context": 1
+    }
+  ],
+  "vmas": [
+    {
+      "mm": 1,
+      "start": 4294967296,
+      "end": 4295094272
+    },
+    {
+      "mm": 1,
+      "start": 4295094272,
+      "end": 4295098368
+    },
+    {
+      "mm": 1,
+      "start": 4295098368,
+      "end": 4295098888
+    },
+    {
+      "mm": 1,
+      "start": 193273462784,
+      "end": 193273466880
+    },
+    {
+      "mm": 1,
+      "start": 193273528320,
+      "end": 193273544704
+    },
+    {
+      "mm": 1,
+      "start": 193273593856,
+      "end": 193273610240
+    },
+    {
+      "mm": 1,
+      "start": 193273659392,
+      "end": 193275494400
+    },
+    {
+      "mm": 1,
+      "start": 193275494400,
+      "end": 193275510784
+    },
+    {
+      "mm": 1,
+      "start": 193275510784,
+      "end": 193275527168
+    },
+    {
+      "mm": 1,
+      "start": 193275527168,
+      "end": 193275592704
+    },
+    {
+      "mm": 1,
+      "start": 197568495616,
+      "end": 197568499712
+    },
+    {
+      "mm": 1,
+      "start": 197568561152,
+      "end": 197568565248
+    },
+    {
+      "mm": 1,
+      "start": 206158430208,
+      "end": 206158446592
+    },
+    {
+      "mm": 1,
+      "start": 206158446592,
+      "end": 206158450688
+    },
+    {
+      "mm": 1,
+      "start": 274877906944,
+      "end": 274878042112
+    },
+    {
+      "mm": 1,
+      "start": 412316860416,
+      "end": 412316868608
+    },
+    {
+      "mm": 1,
+      "start": 412316868608,
+      "end": 412316872704
+    },
+    {
+      "mm": 1,
+      "start": 412316872704,
+      "end": 412316876800
+    },
+    {
+      "mm": 1,
+      "start": 412316876800,
+      "end": 412316880896
+    },
+    {
+      "mm": 1,
+      "start": 412316880896,
+      "end": 412316884992
+    },
+    {
+      "mm": 1,
+      "start": 412316884992,
+      "end": 412316889088
+    },
+    {
+      "mm": 1,
+      "start": 412316889088,
+      "end": 412316893184
+    },
+    {
+      "mm": 1,
+      "start": 412316893184,
+      "end": 412316897280
+    },
+    {
+      "mm": 1,
+      "start": 412316897280,
+      "end": 412316901376
+    },
+    {
+      "mm": 1,
+      "start": 412316901376,
+      "end": 412316905472
+    },
+    {
+      "mm": 1,
+      "start": 412316905472,
+      "end": 412316909568
+    },
+    {
+      "mm": 1,
+      "start": 412316909568,
+      "end": 412316913664
+    },
+    {
+      "mm": 1,
+      "start": 412316925952,
+      "end": 412318605312
+    },
+    {
+      "mm": 1,
+      "start": 412318605312,
+      "end": 412318683136
+    },
+    {
+      "mm": 1,
+      "start": 412318683136,
+      "end": 412318695424
+    },
+    {
+      "mm": 1,
+      "start": 412318695424,
+      "end": 412318703616
+    },
+    {
+      "mm": 1,
+      "start": 412318703616,
+      "end": 412318752768
+    },
+    {
+      "mm": 1,
+      "start": 412318752768,
+      "end": 412319117312
+    },
+    {
+      "mm": 1,
+      "start": 549755813888,
+      "end": 549756067840
+    },
+    {
+      "mm": 1,
+      "start": 549756067840,
+      "end": 549756076032
+    },
+    {
+      "mm": 1,
+      "start": 549756076032,
+      "end": 549756080968
+    },
+    {
+      "mm": 1,
+      "start": 549756092416,
+      "end": 549756096512
+    },
+    {
+      "mm": 1,
+      "start": 1099503173632,
+      "end": 1099511562240
+    },
+    {
+      "mm": 1,
+      "start": 1099511627776,
+      "end": 1099511656448
+    }
+  ],
+  "frames": [
+    {
+      "frame": 9,
+      "length": 147456,
+      "mappings": [
+        28
+      ]
+    },
+    {
+      "frame": 10,
+      "length": 16384,
+      "mappings": [
+        29
+      ]
+    },
+    {
+      "frame": 11,
+      "length": 16384,
+      "mappings": [
+        30
+      ]
+    },
+    {
+      "frame": 12,
+      "length": 16384,
+      "mappings": [
+        31
+      ]
+    },
+    {
+      "frame": 13,
+      "length": 1835008,
+      "mappings": [
+        32
+      ]
+    },
+    {
+      "frame": 14,
+      "length": 16384,
+      "mappings": [
+        33
+      ]
+    },
+    {
+      "frame": 15,
+      "length": 16384,
+      "mappings": [
+        34
+      ]
+    },
+    {
+      "frame": 16,
+      "length": 65536,
+      "mappings": [
+        35
+      ]
+    },
+    {
+      "frame": 17,
+      "length": 16384,
+      "mappings": [
+        36
+      ]
+    },
+    {
+      "frame": 18,
+      "length": 16384,
+      "mappings": [
+        37
+      ]
+    },
+    {
+      "frame": 19,
+      "length": 16384,
+      "mappings": [
+        38
+      ]
+    },
+    {
+      "frame": 20,
+      "length": 16384,
+      "mappings": [
+        39
+      ]
+    },
+    {
+      "frame": 21,
+      "length": 134217728,
+      "mappings": [
+        40
+      ]
+    },
+    {
+      "frame": 22,
+      "length": 34359738368,
+      "mappings": [
+        41
+      ]
+    },
+    {
+      "frame": 23,
+      "length": 278528,
+      "mappings": [
+        42
+      ]
+    },
+    {
+      "frame": 24,
+      "length": 16384,
+      "mappings": [
+        43
+      ]
+    },
+    {
+      "frame": 25,
+      "length": 2147483648,
+      "mappings": [
+        44
+      ]
+    },
+    {
+      "frame": 26,
+      "length": 2147483648,
+      "mappings": [
+        45
+      ]
+    },
+    {
+      "frame": 27,
+      "length": 8388608,
+      "mappings": [
+        46
+      ]
+    },
+    {
+      "frame": 48,
+      "length": 32768,
+      "mappings": [
+        49
+      ]
+    }
+  ],
+  "mappings": [
+    {
+      "mapping": 28,
+      "frame": 9,
+      "mm": 1,
+      "generation": 1,
+      "gpa": 4294967296,
+      "length": 147456,
+      "read": true,
+      "write": true,
+      "exec": true
+    },
+    {
+      "mapping": 29,
+      "frame": 10,
+      "mm": 1,
+      "generation": 1,
+      "gpa": 193273462784,
+      "length": 16384,
+      "read": true,
+      "write": true,
+      "exec": true
+    },
+    {
+      "mapping": 30,
+      "frame": 11,
+      "mm": 1,
+      "generation": 1,
+      "gpa": 193273528320,
+      "length": 16384,
+      "read": true,
+      "write": false,
+      "exec": true
+    },
+    {
+      "mapping": 31,
+      "frame": 12,
+      "mm": 1,
+      "generation": 1,
+      "gpa": 193273593856,
+      "length": 16384,
+      "read": true,
+      "write": false,
+      "exec": true
+    },
+    {
+      "mapping": 32,
+      "frame": 13,
+      "mm": 1,
+      "generation": 1,
+      "gpa": 193273659392,
+      "length": 1835008,
+      "read": true,
+      "write": false,
+      "exec": false
+    },
+    {
+      "mapping": 33,
+      "frame": 14,
+      "mm": 1,
+      "generation": 1,
+      "gpa": 193275494400,
+      "length": 16384,
+      "read": true,
+      "write": false,
+      "exec": true
+    },
+    {
+      "mapping": 34,
+      "frame": 15,
+      "mm": 1,
+      "generation": 1,
+      "gpa": 193275510784,
+      "length": 16384,
+      "read": true,
+      "write": true,
+      "exec": true
+    },
+    {
+      "mapping": 35,
+      "frame": 16,
+      "mm": 1,
+      "generation": 1,
+      "gpa": 193275527168,
+      "length": 65536,
+      "read": true,
+      "write": true,
+      "exec": true
+    },
+    {
+      "mapping": 36,
+      "frame": 17,
+      "mm": 1,
+      "generation": 1,
+      "gpa": 197568495616,
+      "length": 16384,
+      "read": true,
+      "write": false,
+      "exec": false
+    },
+    {
+      "mapping": 37,
+      "frame": 18,
+      "mm": 1,
+      "generation": 1,
+      "gpa": 197568561152,
+      "length": 16384,
+      "read": true,
+      "write": false,
+      "exec": true
+    },
+    {
+      "mapping": 38,
+      "frame": 19,
+      "mm": 1,
+      "generation": 1,
+      "gpa": 206158430208,
+      "length": 16384,
+      "read": true,
+      "write": false,
+      "exec": true
+    },
+    {
+      "mapping": 39,
+      "frame": 20,
+      "mm": 1,
+      "generation": 1,
+      "gpa": 206158446592,
+      "length": 16384,
+      "read": true,
+      "write": false,
+      "exec": true
+    },
+    {
+      "mapping": 40,
+      "frame": 21,
+      "mm": 1,
+      "generation": 1,
+      "gpa": 274877906944,
+      "length": 134217728,
+      "read": true,
+      "write": true,
+      "exec": true
+    },
+    {
+      "mapping": 41,
+      "frame": 22,
+      "mm": 1,
+      "generation": 1,
+      "gpa": 412316860416,
+      "length": 34359738368,
+      "read": true,
+      "write": true,
+      "exec": true
+    },
+    {
+      "mapping": 42,
+      "frame": 23,
+      "mm": 1,
+      "generation": 1,
+      "gpa": 549755813888,
+      "length": 278528,
+      "read": true,
+      "write": true,
+      "exec": true
+    },
+    {
+      "mapping": 43,
+      "frame": 24,
+      "mm": 1,
+      "generation": 1,
+      "gpa": 549756092416,
+      "length": 16384,
+      "read": true,
+      "write": false,
+      "exec": true
+    },
+    {
+      "mapping": 44,
+      "frame": 25,
+      "mm": 1,
+      "generation": 1,
+      "gpa": 618475290624,
+      "length": 2147483648,
+      "read": true,
+      "write": true,
+      "exec": true
+    },
+    {
+      "mapping": 45,
+      "frame": 26,
+      "mm": 1,
+      "generation": 1,
+      "gpa": 652835028992,
+      "length": 2147483648,
+      "read": true,
+      "write": true,
+      "exec": true
+    },
+    {
+      "mapping": 46,
+      "frame": 27,
+      "mm": 1,
+      "generation": 1,
+      "gpa": 1099503173632,
+      "length": 8388608,
+      "read": true,
+      "write": true,
+      "exec": true
+    },
+    {
+      "mapping": 49,
+      "frame": 48,
+      "mm": 1,
+      "generation": 1,
+      "gpa": 103079215104,
+      "length": 32768,
+      "read": true,
+      "write": true,
+      "exec": true
+    }
+  ],
+  "file_tables": [
+    {
+      "id": 3,
+      "class": "live",
+      "revision": 147,
+      "functional_refs_active": true,
+      "next_fd": 3,
+      "stdio_cloexec": [
+        false,
+        false,
+        false
+      ],
+      "closed_stdio": [
+        false,
+        false,
+        false
+      ],
+      "splice_pushback_description_ids": [],
+      "epoll_index_fds": []
+    }
+  ],
+  "file_slots": [],
+  "file_descriptions": [],
+  "fs_contexts": [
+    {
+      "id": 4,
+      "class": "live",
+      "revision": 1,
+      "cwd": "/",
+      "chroot_root": null
+    }
+  ],
+  "credentials": [
+    {
+      "id": 5,
+      "class": "live",
+      "ruid": 0,
+      "euid": 0,
+      "suid": 0,
+      "rgid": 0,
+      "egid": 0,
+      "sgid": 0,
+      "fsuid": 0,
+      "fsgid": 0,
+      "umask": 18,
+      "supplementary_groups_override": null
+    }
+  ],
+  "process_groups": [
+    {
+      "id": 25365,
+      "session": 25365,
+      "members": [
+        {
+          "id": 25365,
+          "serial": 6
+        }
+      ]
+    }
+  ],
+  "sessions": [
+    {
+      "id": 25365,
+      "process_groups": [
+        25365
+      ]
+    }
+  ],
+  "sighands": [
+    {
+      "id": 2,
+      "class": "live",
+      "revision": 1,
+      "actions": []
+    }
+  ],
+  "task_signals": [
+    {
+      "task": {
+        "id": 25365,
+        "serial": 6
+      },
+      "class": "live",
+      "revision": 1,
+      "pending": []
+    }
+  ],
+  "thread_signals": [
+    {
+      "thread": {
+        "tid": 25365,
+        "serial": 7
+      },
+      "class": "live",
+      "revision": 1,
+      "blocked": 0,
+      "pending": [],
+      "altstack": null,
+      "handler_frame_depth": 0,
+      "armed_restore_mask": null,
+      "routed_siginfo_signals": [],
+      "pending_action_signals": []
+    }
+  ]
+}
