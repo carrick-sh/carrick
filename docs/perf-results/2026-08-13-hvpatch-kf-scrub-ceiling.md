@@ -157,6 +157,81 @@ interaction, and no HVF qualification.
 **Sequence: C first (it is a correctness bug and free), then measure what is
 left, then B for the large tail if the term survives.**
 
+---
+
+## RESULT — step C landed, and it took most of the term
+
+Implemented at `3d45b1a98`: the watermark is renamed `mmap_writable_high` and
+raised by **writability** rather than allocation, at all three points where an
+arena range can become guest-writable — the `mmap` that creates it, a
+`MAP_FIXED` mapping placed over it, and an `mprotect` that adds `PROT_WRITE`.
+The `MAP_FIXED` site was a hole that predated the change and is closed with it,
+because lowering the watermark would have widened it.
+
+### Measured
+
+Faults, cold `go build`, signed binary, `BUILD_OK`:
+
+| | before | after | change |
+| --- | ---: | ---: | ---: |
+| in-window `zfod`, `anon/private/RW-` | 145,453 | **1,592** | **−98.9%** |
+| in-window `zfod`, all shapes | 148,758 | **2,858** | **−98.1%** |
+| **whole-build `zfod`** | 230,298 | **86,721** | **−62.3%** |
+| whole-build `cow_fault` | 8,350 | 8,570 | flat |
+
+CPU, five samples per arm, untraced on the signed binary — the retention
+authority:
+
+| arm | user | sys | CPU | window |
+| --- | ---: | ---: | ---: | ---: |
+| before (`f850336c5`) | 2.474 | 1.652 | 4.087 | 1,938 ms |
+| **after (`3d45b1a98`)** | 2.370 | **1.450** | **3.803** | **1,828 ms** |
+| change | −4.2% | **−12.2%** | **−6.9%** | **−5.7%** |
+
+Windows do not overlap: before `[1920, 1929, 1938, 2004, 2026]`, after
+`[1791, 1818, 1828, 1846, 1853]`. **Retained.**
+
+### The refutation was right, and so was the oracle
+
+Both predictions held, which is the useful part:
+
+- **Faults did partly move.** In-window `zfod` fell 98.1% but whole-build
+  `zfod` fell only 62.3%, so ~84,000 faults reappeared outside the service
+  windows — the guest taking its own first touches, exactly the mechanism every
+  skeptic named.
+- **Most of them genuinely disappeared.** The oracle put the workload's real
+  touched set at ~226 MB, i.e. ~14k–55k faults at 16 KiB pages; the residue
+  outside execve and `carrick-only` lands in that band. The scrub really was
+  doing ~10x more work than the workload needs.
+
+Neither number alone would have shown this. The in-window census alone would
+have claimed a 98% win that the whole-build count does not support; the
+whole-build count alone would have hidden where the win came from.
+
+### Gates
+
+- `just ci`: **green, exit 0, 3,886 tests passed, 0 failed.**
+- Probe gate: **the arm64:musl failure SET is byte-identical to the pre-KN
+  baseline** (123 = 123, `comm` diff empty in both directions) — no new
+  failures. Every memory-invariant probe passes on both libcs:
+  `mmapzerofill`, `mmapreuse`, `mmaprecl`, `mmapmunmap`, `mmapcage`, `memmap`,
+  `brkheapgrow`, `mremapgrow`, `protnonesyscall`.
+- Two new unit tests pin both halves of the invariant, because either alone is
+  satisfiable by a wrong implementation: a `PROT_NONE` reserve must not raise
+  the watermark and must not force a scrub when re-handed out, and a writable
+  mapping must raise it and must force one. A watermark that is simply never
+  raised passes the first test and fails the second.
+
+### Still open for KF
+
+The gate asked for whole-build `as_fault` below 60,000. `zfod` reached 86,721
+and `as_fault` was not captured post-change — the AMP1 reader refused the
+follow-up capture with a named internal-consistency error (`host CPU maximum
+for guest op getegid's "thread_selfusage" exceeds its own sum`), which is an
+instrument defect to fix before the next ledger. Mechanisms **A** and **B**
+above remain available for the residue, and the 66 large mappings are no longer
+the population they were — that census should be re-run before either is built.
+
 ## What is NOT established
 
 - Whether the 66 large commits actually land below `mmap_dirty_high` because of
