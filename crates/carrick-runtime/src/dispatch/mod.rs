@@ -8144,6 +8144,21 @@ fn write_host_pipe_payload(
     // Always-on, near-zero-cost detector for archive corruption. The predicate
     // is a byte compare on the payload head; only a match pays the `lseek`.
     // See `event_ring::ARWRITE` for why this is not in the `trace-io` log.
+    // Correlate the magic write with the member write that should follow it on
+    // the same description: if both land on one host fd the magic write was
+    // lost or rewound, and if they land on different fds the description was
+    // swapped underneath the guest. This is NORMAL traffic — roughly 67 writes
+    // per cold `go build` — so it goes to the lock-free ring only. Logging it
+    // would be debug spam on a healthy run, and the per-write cost is what
+    // made `trace-io` perturb this bug out of existence.
+    if crate::event_ring::payload_starts_at_ar_magic(payload.as_slice()) {
+        crate::event_ring::rec(
+            crate::event_ring::ARMAGIC,
+            host_fd,
+            fs::host_fd_offset(HostFd(host_fd)).map_or(-1, |offset| offset as u32 as i32),
+            payload.as_slice().len() as u32 as i32,
+        );
+    }
     if crate::event_ring::payload_starts_at_ar_member_header(payload.as_slice()) {
         let offset = fs::host_fd_offset(HostFd(host_fd));
         crate::event_ring::rec(
