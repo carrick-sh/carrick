@@ -632,6 +632,11 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
     let (kernel, root) = crate::kernel::Kernel::bootstrap_root(bootstrap)
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
     mm_backend.bind_inventory(&kernel, root.shared().mm().id());
+    // Publish the live kernel debug endpoint for this run. Default ON;
+    // `CARRICK_KERNEL_DEBUG=0` opts out. The socket is how `carrick debug
+    // hvpatch-kernel` reads a coherent snapshot of the object graph while the
+    // guest is running.
+    crate::kernel::KernelDebugServer::install(std::sync::Arc::clone(&kernel));
     table
         .publish_root(root.task().key())
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;

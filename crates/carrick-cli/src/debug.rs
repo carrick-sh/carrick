@@ -98,6 +98,13 @@ pub(crate) fn run_debug(command: DebugCommand) -> anyhow::Result<()> {
                 }))?
             );
         }
+        DebugCommand::HvpatchKernel {
+            run_id,
+            tables,
+            list_tables,
+        } => {
+            run_hvpatch_kernel_snapshot(run_id.as_deref(), &tables, list_tables)?;
+        }
         DebugCommand::NativeX86Layout => {
             println!(
                 "{}",
@@ -809,6 +816,47 @@ fn decode_esr_el1(value: u64) -> serde_json::Value {
         "iss": format!("0x{:x}", iss),
         "iss_detail": iss_detail,
     })
+}
+
+/// Read one coherent kernel snapshot from a live run and print it.
+///
+/// Every failure mode is named: an unknown table, a run that is not listening,
+/// a wedged runtime (timeout), a refusal from the runtime, or a response that
+/// fails schema/join/frame validation.
+fn run_hvpatch_kernel_snapshot(
+    run_id: Option<&str>,
+    tables: &[String],
+    list_tables: bool,
+) -> anyhow::Result<()> {
+    use carrick_runtime::kernel::KernelDebugTable;
+
+    if list_tables {
+        for table in KernelDebugTable::ALL {
+            println!("{}", table.wire_name());
+        }
+        return Ok(());
+    }
+    let Some(run_id) = run_id else {
+        bail!("--run-id is required unless --list-tables is given");
+    };
+
+    let selected = if tables.is_empty() {
+        None
+    } else {
+        let mut parsed = Vec::with_capacity(tables.len());
+        for name in tables {
+            parsed.push(
+                KernelDebugTable::parse(name)
+                    .map_err(|error| anyhow::anyhow!("{error}; run with --list-tables"))?,
+            );
+        }
+        Some(parsed)
+    };
+
+    let snapshot = carrick_runtime::kernel::kernel_debug_fetch(run_id, selected)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    println!("{}", serde_json::to_string_pretty(&snapshot)?);
+    Ok(())
 }
 
 #[cfg(test)]

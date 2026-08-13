@@ -6,6 +6,7 @@
 pub mod address;
 pub mod clone_plan;
 pub mod core;
+pub mod debug;
 pub mod exec;
 pub mod frame_inventory;
 pub mod ids;
@@ -26,6 +27,13 @@ pub use clone_plan::{
 pub use core::{
     Kernel, KernelContext, KernelError, KernelTaskBinding, Registry, RegistryInvariantError,
     RootBootstrap, TaskExitSubscriber, TaskRevision, VforkParentWait, VforkReleaseReason,
+};
+pub use debug::{
+    ClientError as KernelDebugClientError, DebugEndpoint,
+    EndpointError as KernelDebugEndpointError, KernelDebugDtoError, KernelDebugRequest,
+    KernelDebugServer, KernelDebugSnapshot, KernelDebugTable,
+    ServerError as KernelDebugServerError, UnknownTable as UnknownKernelTable,
+    fetch as kernel_debug_fetch,
 };
 pub use exec::{ExecError, PreparedExec};
 pub use frame_inventory::{

@@ -953,6 +953,27 @@ pub(crate) enum DebugCommand {
         #[arg(long)]
         command_sha256: String,
     },
+    /// Read one coherent snapshot of a LIVE run's kernel object graph over the
+    /// run's authenticated debug socket, and print it as canonical JSON.
+    ///
+    /// Fails by name on an unknown schema, a missing requested table, a
+    /// duplicate ID, a broken join, a partial frame, trailing bytes, or a
+    /// deadline expiry — a wedged runtime reports a timeout, never a hang.
+    HvpatchKernel {
+        /// Exact external run identity the run was started with as
+        /// `CARRICK_RUN_ID`. The socket path carries only its digest.
+        /// Required unless `--list-tables` is given.
+        #[arg(long)]
+        run_id: Option<String>,
+        /// Restrict the snapshot to these tables. Repeat the flag or pass a
+        /// comma-separated list. Omit for every table. Unknown names are
+        /// refused rather than ignored.
+        #[arg(long = "table", value_delimiter = ',')]
+        tables: Vec<String>,
+        /// List the selectable table names and exit.
+        #[arg(long)]
+        list_tables: bool,
+    },
     /// Print the versioned native-x86 DSR context layout consumed by
     /// `scripts/native-x86-profile.py`. The running process's matching Carrick
     /// binary is authoritative; do not hardcode these offsets in D scripts.

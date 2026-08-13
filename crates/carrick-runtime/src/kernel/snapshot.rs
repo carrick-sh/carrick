@@ -608,6 +608,32 @@ impl Kernel {
                 });
             }
             if !open_paths.is_empty() {
+                // `snapshot_until` acquires `open_files` and `fd_open_paths`
+                // sequentially, so a concurrent `close(2)` that removes the
+                // slot before we take the first guard and drops the path entry
+                // after we take the second is observed as "path present, slot
+                // absent". That is a transient cross-lock skew, not corruption,
+                // and it is exactly what the revision counter exists to
+                // classify: every mutation bumps it.
+                //
+                // Only a table whose revision did NOT move can be genuinely
+                // inconsistent. Retrying on a moved revision keeps the
+                // corruption detector intact instead of weakening it — the
+                // alternative (deleting the check) would let a real stale index
+                // through, and reporting it as corruption made `carrick debug
+                // hvpatch-kernel` fail on a healthy live run.
+                if table.revision() != observed.revision {
+                    return Err(AttemptError::Race);
+                }
+                tracing::error!(
+                    target: "carrick::kernel::snapshot",
+                    file_table = observed.revision,
+                    orphans = ?open_paths
+                        .iter()
+                        .map(|(number, path)| (number.raw(), path.as_str()))
+                        .collect::<Vec<_>>(),
+                    "file-table open-path index names no live slot"
+                );
                 return invariant("file-table open-path index names no live slot");
             }
         }
@@ -819,8 +845,22 @@ impl Kernel {
             thread_signals,
         };
         sort_snapshot(&mut snapshot);
-        validate_snapshot(&snapshot)?;
 
+        // Verify every revision BEFORE validating joins.
+        //
+        // Collection reads each object under its own short-lived guard, so a
+        // mutation that lands between two guards leaves the collected tables
+        // mutually stale — a slot removed after its table row was copied, a
+        // description closed after a slot referenced it. Validating first
+        // reported that ordinary liveness as `InvariantViolation`, i.e. told
+        // the operator a healthy run was corrupt. This was not theoretical: a
+        // live `carrick debug hvpatch-kernel` against a running guest hit it
+        // on the file-table open-path index.
+        //
+        // Ordering the checks this way strengthens both halves. A moved
+        // revision means the data is stale, so it is retried and never
+        // validated; an unmoved revision means the data is coherent, so any
+        // join failure that survives is genuine corruption rather than a race.
         for (thread, revision) in checks.threads {
             if thread.revision() != revision {
                 return Err(AttemptError::Race);
@@ -875,6 +915,10 @@ impl Kernel {
         // snapshot combines an old task association with new signal/resource
         // state.
         self.verify_registry(&registry, deadline)?;
+
+        // Every revision and the registry epoch held, so these tables are one
+        // coherent observation. Any invariant that fails now is real.
+        validate_snapshot(&snapshot)?;
         Ok(snapshot)
     }
 
