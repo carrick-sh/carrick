@@ -46,6 +46,39 @@ reserve/commit (`mmap(PROT_NONE, MAP_FIXED)` to reserve, `MADV_FREE_REUSABLE`
 /`REUSE` to decommit/recommit) and carrick's job is to translate the guest's
 INTENT, not re-issue the Linux mechanism.
 
+## Narrowed by experiment
+
+Three follow-ups, all on the signed binary and the same image:
+
+| invocation | result |
+| --- | --- |
+| `node --version` | **works** — prints `v22.23.2` |
+| `node --max-old-space-size=64 -e ...` | same abort |
+| `node --no-node-snapshot -e ...` | same abort |
+
+This is decisive about where the fault is NOT. The binary loads, relocates and
+executes host-native code correctly — `--version` runs to completion — so this
+is not ELF loading, not the dynamic linker, and not general execution. And the
+abort is **independent of heap size** and survives disabling Node's own
+startup snapshot, so it is not a budget being exceeded and not Node's snapshot
+format: it is the FIRST `MemoryChunk` allocation failing.
+
+That signature points at V8's large aligned virtual reservation. With pointer
+compression, V8 reserves a multi-GiB region with a hard ALIGNMENT requirement
+(the cage), maps it `PROT_NONE`, and then commits sub-ranges inside it. The
+question to answer next is therefore narrow and testable in isolation, without
+Node in the picture:
+
+1. Can a guest reserve a multi-GiB `PROT_NONE` region under HVPatch at all?
+2. Is the returned address aligned as requested when the guest asks for
+   alignment by over-reserving and trimming — i.e. does `munmap` of a
+   sub-range of a live reservation behave?
+3. Can it then commit a sub-range with `mmap(MAP_FIXED)` over the reservation?
+
+Each is a probe-sized question, and the `--fs`-independent answer belongs in a
+conformance probe rather than in a Node run. Note carrick's 32 GiB arena and
+the `CARRICK_DSR_ZERO_REMAP` anon-reuse path are both in this area.
+
 ## Status of the workload criterion
 
 - **Node.js — blocked.** Must run before it can be timed.
