@@ -6365,7 +6365,12 @@ impl HvfVmState {
         );
 
         let stage_started = std::time::Instant::now();
-        let table_bytes = page_tables.clone().into_bytes();
+        // Borrow the table image; do NOT clone it. The region is
+        // `LINUX_PAGE_TABLES_SIZE` = 1.75 MiB, and this runs once per fork, so
+        // the clone was 1.75 MiB of allocation plus memcpy on top of the copy
+        // into the child's backing below — roughly 238 MiB of pointless copying
+        // across the 68 forks of a cold `go build`.
+        let table_bytes = page_tables.as_bytes();
         let table_bytes_len = table_bytes.len() as u64;
         let table = mappings
             .iter_mut()

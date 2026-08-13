@@ -293,6 +293,17 @@ impl PageTableManager {
         }
     }
 
+    /// Borrow the (possibly edited) table-region bytes.
+    ///
+    /// Prefer this to `clone().into_bytes()` on any path that only needs to
+    /// READ the image. The table region is `LINUX_PAGE_TABLES_SIZE` = 1.75 MiB,
+    /// so a clone there is 1.75 MiB of allocation and memcpy per call — and the
+    /// HVPatch fork path did exactly that once per fork, on top of the copy
+    /// into the child's backing.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
     /// Consume the manager, returning the (possibly edited) table-region bytes.
     /// Used by the boot-time ELF read-only-span pass, which edits the pristine
     /// `stage1_identity_page_tables` image before it is mapped into the guest.
