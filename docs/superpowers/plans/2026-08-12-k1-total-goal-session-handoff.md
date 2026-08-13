@@ -155,11 +155,23 @@ fast path, `try_darwin_copyfile_range_fast_path` →
 Its guards require `in_offset == 0`, both NULL guest offset pointers, an
 empty destination, and `count >= input.size`, and it reads the two HOST fd
 offsets with `lseek(SEEK_CUR)` before cloning. Those host offsets are shared
-across forked guest processes, so the check is a TOCTOU against a concurrent
-sibling — which fits a 1-in-10 failure under a parallel `go build`. Note the
-fast path has **no `=0` escape hatch**, so it cannot currently be ablated to
-test this; adding one is the cheapest next experiment, and its absence is
-itself a violation of the opt-out rule.
+across forked guest processes, so the check looked like a TOCTOU against a
+concurrent sibling.
+
+**REFUTED — do not retest.** The fast path now has an exact ablation hatch,
+`CARRICK_DARWIN_COPYFILE_FAST_PATH=0` (added because a fast path with no way
+to turn it off cannot be attributed). Four ablated runs of the fixture still
+produce a corrupt archive (`archive-magic` on run 1, then `start-gate-abort`
+×2 and one other mode), so the Darwin `copyfile`/`fclonefileat` fast path is
+**not** the cause. The hatch is retained: it is default-ON with an `=0`
+escape, and it is the instrument for attributing any future
+`copy_file_range` corruption.
+
+Remaining suspects for the corrupt cache archive, none yet tested: the
+generic `copy_file_range` read-then-write body (`sendfile_bytes` plus
+`write_output_fd`) under concurrent siblings sharing a host file offset;
+Go's cache writing via `os.Link`/rename rather than a copy at all; and a
+short write reported as complete somewhere in that path.
 
 **The start-gate abort is the other 1-in-4 mode; classify it before changing
 it.** The start gate is a
