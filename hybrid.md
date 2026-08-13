@@ -19,9 +19,21 @@ Darwin primitive.** Mach, HVF and Darwin's VFS are execution, physical-memory
 and storage HALs. They are not the source of Carrick's process, address-space,
 path, fork, exec, scheduler, fd, signal or crash-dump semantics.
 
-**Shipped proof:** a cold `go build` below **2.3 CPU-s** against
-native-arm64 Docker, with Linux behaviour preserved and CPython, Node.js and
-Rust workloads within 2x.
+**Shipped proof — RE-AIMED 2026-08-13, on direction:** *finish the kernel*.
+The criterion is **correctness and completeness**, not the CPU bar:
+
+1. every Linux semantic the kernel lane owns is sourced from carrick's own
+   kernel objects rather than from the host process it happens to run in;
+2. `baseline.hvpatch.jsonl` blessed, with the kernel lane's conformance gaps
+   closed rather than excused;
+3. CPython, Node.js and Rust workloads **run correctly** — Node currently
+   aborts in V8 startup, which is a completeness bug, not a slow one.
+
+**Performance is explicitly NOT the gate.** The 2.3 CPU-s target and the
+`native`-lane comparison are retained below as historical context and as a
+regression floor — work must not make the build dramatically worse — but no
+phase is scheduled, ranked or retained on a CPU number any more. A phase whose
+only claim is speed is off the critical path until the kernel is finished.
 
 ## What changed in this revision, and why
 
@@ -250,27 +262,44 @@ files, credentials and cancellation/signal state.
 
 ## Phase status at a glance
 
-**Updated 2026-08-13.** Every phase, what is actually done, and the ONE thing
-that unblocks the next step. This table is the answer to "where are we"; the
-sections below carry the reasoning.
+**Updated 2026-08-13, re-ranked for KERNEL COMPLETENESS.** Performance is no
+longer a scheduling criterion, so the phases split into a critical path and a
+parked set. Every row names the ONE thing that unblocks its next step.
+
+### The critical path — finishing the kernel
 
 | phase | status | landed | next concrete step |
 |---|---|---|---|
-| **KN** kernel namei | **partial, retained** | dcache + `at()` resolves against a cached parent; −3.1% CPU; cross-process stat staleness closed | finish the walk: `openat` is 17.75x against a ≤2.0 gate |
-| **KF** page lifecycle | **step C landed, retained** | watermark raised by writability; −6.9% CPU, −12.2% sys; whole-build `zfod` −62.3% | re-census, then mechanism A or B for the residue |
-| **KL** lifecycle | **partial** | per-task user AND system CPU, both oracle-matched; `CLONE_PIDFD` scoping; concurrent sibling fork | `ru_maxrss`/`ru_majflt` still host-sourced |
-| **KD** diagnostics | **partial** | ELF core writer + `carrick debug core`; crash now reports as signal death, oracle-matched | write the core: needs the per-thread register file (shared with KS) |
-| **KS** scheduler | **designed, not built** | M:N executor design decided | step 1 is the same register file KD needs — build it once |
-| **KM** kernel memory | **not started; RE-CLASSIFIED** | — | it is a PERFORMANCE phase, not correctness: `forkcow`/`forkshared` PASS on this lane |
-| **KX** kernel exec | **partly built, not "not started"** | Kernel two-phase exec transaction is LIVE; all three image caches exist, default-on | the ADDRESS-SPACE half: build outside the lock, atomic commit, deferred teardown |
-| **KP** shipped proof | **started** | first-ever kernel-lane probe gate: **304 PASS / 90 FAIL**, 26 kernel-lane-specific; root cause of the largest cluster found | **seed the kernel id space at 1, not the host pid** — upstream of 3 clusters |
+| **KI** kernel identity *(new)* | **in progress** | `guest_pid_is_live` routes 3 of 4 liveness probes to the task registry; duplicate root-tid derivation removed | the six `LINUX_BOOTSTRAP_PID` self-aliases, then the two-allocator problem, then the reseed |
+| **KP** conformance proof | **started** | kernel lane added to the harness; first gate: **304 PASS / 90 FAIL**, 26 kernel-lane-specific | bless `baseline.hvpatch.jsonl`; close the 26, largest cluster first |
+| **KD** diagnostics | **partial** | ELF core writer + validator; crash reports as signal death, oracle-matched | build a `CoreDump` from live state — a correct first slice needs NO memory plumbing |
+| **KL** lifecycle | **partial** | per-task user AND system CPU, oracle-matched; `CLONE_PIDFD` scoping; concurrent sibling fork | `ru_maxrss`/`ru_majflt` still host-sourced; per-task `/proc` authority |
+| **KX** kernel exec | **partly built** | Kernel two-phase exec transaction LIVE; three image caches default-on | **correctness half only**: does exec failure leave the old image valid? |
 
-**Measured position:** cold `go build` **3.803 CPU-s**, window **1,828 ms**
-(from 4.223 / 2,051 at the K1 boundary). The bar is **2.3 CPU-s**, so roughly
-**1.5 CPU-s remain**. Nothing here is finished; KM and KX are untouched
-architecture, and KP has no baseline.
+### Parked — performance-only, off the critical path
 
-**Two things are next, and both are single, well-located changes.**
+| phase | why parked |
+|---|---|
+| **KM** kernel memory | RE-CLASSIFIED as performance: `forkcow`/`forkshared` PASS on this lane; no probe shows a COW divergence |
+| **KF** page lifecycle residue | step C landed; the remainder is fault-count reduction, i.e. pure CPU |
+| **KN** namei ratio gate | the dcache landed and is correct; driving `openat` 17.75x → ≤2.0 is a CPU claim |
+| **KS** scheduler | its correctness argument (slot-starvation deadlock) is real, so it re-enters the path if that deadlock recurs; its CPU argument does not schedule it |
+
+**KI is new and is not a renaming.** The identity work was spread across KL, KP
+and the signal cluster, and treating it as one phase is what made its ordering
+constraint visible: the host-pid comparators must close BEFORE the id space is
+reseeded, because they are correct at either seed while the reverse order
+points a signal at `launchd`.
+
+**Where completeness stands.** The kernel lane fails **90** of 394 line-exact
+probes, **26** of them kernel-lane-specific, and has **no blessed baseline**.
+Node.js does not run at all. Those are the numbers that schedule work now.
+
+**Performance, for context only:** cold `go build` is **3.803 CPU-s** / **1,828
+ms** (from 4.223 / 2,051 at the K1 boundary). It is recorded as a regression
+floor — do not make it dramatically worse — and is no longer a gate.
+
+**Next, in order, and both serve kernel completeness rather than speed.**
 
 1. **Guest pid identity — and it is NOT the one-line fix it looks like.**
    The kernel's id space is seeded from the host pid
