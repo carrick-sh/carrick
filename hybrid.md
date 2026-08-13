@@ -46,7 +46,7 @@ The K0…K6 sequence encoded an ordering the evidence has since refuted, and
 |---|---|---|
 | K0 — HAL probes | — | **GO**, `docs/perf-results/2026-08-08-hvpatch-phase0-decisive-probes.md` |
 | K1 — object model + observability | — | **GO** at `7b808b6cf` |
-| K2 — frames and address spaces | **KM — kernel memory** | re-ranked below |
+| K2 — frames and address spaces | **KM — kernel memory** + **KF — kernel page lifecycle** | re-ranked below |
 | K3 — fork/clone/wait | **KL — kernel lifecycle** | partly landed |
 | K4 — transactional exec | **KX — kernel exec** | not started |
 | K5 — scheduler, sync, lowering | **KS — kernel scheduler** + **KN — kernel namei** | designed / next |
@@ -119,9 +119,38 @@ split](docs/perf-results/2026-08-13-hvpatch-fork-stage-split.md)), of which
 against a 4.29 CPU-s build, replacing the fork memory model cannot remove
 1.97 CPU-s. It is necessary structural work. It is not the lever.
 
+### Where the overhead REALLY is — measured 2026-08-13, and it is faults
+
+The first AMP1 census ever taken of the kernel lane
+([ledger](docs/perf-results/2026-08-13-hvpatch-kernel-lane-amp-ledger.md);
+AMP1 previously refused any target that was not `--exec-backend native`, which
+is why this had never been measured) puts the build at **279,987 `as_fault`
+and 230,298 `zfod`**. At the 6.42 µs per-fault cost this tree measured on
+2026-08-01, that is **~1.8 CPU-s — the entire overhead the goal must remove.**
+
+| serviced guest op | guest calls | host syscalls | `zfod` |
+|---|---:|---:|---:|
+| **`mmap`** | 1,966 | 2,045 (**1.04x**) | **150,749** |
+| **`execve`** | 68 | 8,306 | **45,430** |
+| `carrick-only` | — | 28,890 | 30,896 |
+| `brk` + `mremap` + `madvise` | 387 | 20 | **29** |
+
+`mmap`'s *syscall* side is already essentially perfect. Its cost is **76.7
+zero-fill faults per guest call — 2.36 GiB of pages touched per build**, inside
+the service window, which is Carrick's own host-side work and not the guest
+running. The native lane fixed exactly this shape on 2026-08-07 (in-window
+`zfod` 553k → ~723); **that work was never carried to the kernel lane**, and it
+does not port directly because the arena is `hv_vm_map`'d into stage-2.
+
+The mechanism is not yet named — the three `zero_backing` sites account for 29
+of those faults, so the scrub is not the source — and naming it is the next
+measurement, not the next guess.
+
 ### The one-sentence diagnosis
 
-**Both dominant buckets are Carrick declining to be a kernel.**
+Ranked by host syscall *count*, both dominant buckets are Carrick declining to
+be a kernel. Ranked by CPU, the fault term dwarfs both. Both readings are
+useful and they answer different questions:
 
 - Path resolution is 55% of host syscalls because Carrick delegates `namei`
   to cap-std, whose containment walk opens *every component of every path on
@@ -129,11 +158,17 @@ against a 4.29 CPU-s build, replacing the fork memory model cannot remove
   function, `cap_primitives::fs::manually::open::Context::normal`, reached
   from five separate Carrick call sites. In a `go build` nearly every path
   shares a long prefix, and none of it is retained.
-- The `carrick-only` 30% is `kevent`, `ulock_wake`, `ulock_wait2` and
+- The `carrick-only` bucket is `kevent`, `ulock_wake`, `ulock_wait2` and
   `psynch_cvwait`: Carrick delegating thread scheduling to Darwin and then
-  arbitrating the result through a ten-slot vCPU pool.
+  arbitrating the result through a ten-slot vCPU pool. (AMP1 sizes it at 11.9%
+  of host calls on the kernel lane, not the 30.1% a different program
+  reported, and most of its CPU is one-time `clonefileat` container setup.)
+- **And the fault term, which is larger than either**: Carrick touching 2.36 GiB
+  of pages per build while servicing the guest's `mmap` calls, on a lane whose
+  `mmap` already costs 1.04 host syscalls.
 
-A kernel owns its dcache and it owns its run queue. That is the work.
+A kernel owns its dcache, its run queue, and — above all — its page
+lifecycle. That is the work, in that order of size.
 
 ---
 
@@ -213,16 +248,62 @@ Ordered by measured leverage. Each phase publishes a durable evidence
 document at its boundary (see the protocol at the end) and each gate is
 stated so it can fail.
 
-### KN — kernel namei  ·  *landed; a retained win, and smaller than predicted*
+### KF — kernel page lifecycle  ·  *next, and the only phase sized like the goal*
+
+**Remit:** stop Carrick touching pages it does not need to touch. One cold
+build takes 279,987 `as_fault` and 230,298 `zfod`; 150,749 of those land inside
+`mmap` service windows at **76.7 zero-fill faults per guest `mmap`**, while
+`mmap`'s host-syscall amplification is already 1.04x. At this tree's measured
+per-fault cost that term is on the order of the whole ~1.97 CPU-s the goal must
+remove. Nothing else measured on this lane is that size.
+
+**First step is a measurement, not a change.** The mechanism is NOT yet named:
+the three `zero_backing` call sites account for 29 of those faults between
+them, anonymous `mmap` allocates no eager buffer, and the private-file lowering
+is already on — so something else in the mmap service path is touching 2.36 GiB
+per build. Attribute it with `scripts/dtrace/native-fault-attribution.d` before
+choosing a lowering.
+
+The shape of the answer is known even if the mechanism is not: the native lane
+collapsed in-window `zfod` 553k → ~723 on 2026-08-07 by letting Darwin's
+zero-fill deliver a pre-zeroed page instead of writing one
+([anon-reuse-remap](docs/perf-results/2026-08-07-anon-reuse-remap.md)). That fix
+does **not** port directly — it lives in `carrick-dsr-aarch64::mapped_memory`,
+and the kernel lane's `HvfInner::zero_guest_backing`
+(`carrick-vmm-hvf/src/trap.rs:4795`) is a plain memset whose arena is
+`hv_vm_map`'d into stage-2, so replacing the host pages under a live IPA would
+leave the guest reading the old ones. The kernel lane needs its own expression
+of the same intent. **Invariant 9 is binding here:** anonymous `mmap` returning
+zeroed pages is not tradeable, so the lever must remove the work, not the
+guarantee.
+
+**Gate:** in-window `zfod` on the cold build **below 10,000** (from 150,749);
+total `as_fault` **below 60,000** (from 279,987); the anonymous-zero guarantee
+proved by differential probe, not by argument; `just ci` and `conformance-quick`
+green; a retained untraced ABBA. This is the phase that must move the ratio —
+if it lands and the ratio does not move, the goal's arithmetic is wrong and
+that finding is the deliverable.
+
+### KN — kernel namei  ·  *landed partial; retained win, gate not met*
 
 > **Status 2026-08-13:** landed at `8d6696a94`. Measured **−3.1% CPU, −5.1%
 > workload window, −12.7% system time**, non-overlapping distributions, five
 > samples per arm
 > ([evidence](docs/perf-results/2026-08-13-hvpatch-kernel-namei.md)). Retained.
 > It also closed a shipped cross-process staleness bug in the stat cache and
-> removed cap-std from the hot path, which invariant 13 requires. **The gate's
-> syscall-ratio clause is still open** — it needs a traced re-measure at HEAD.
-> The phase is what forced the CAUTION above: it was ranked first on syscall
+> removed cap-std from the hot path, which invariant 13 requires.
+>
+> **The syscall-ratio gate was measured and NOT met.** `openat` 32.78 →
+> **17.75**, `newfstatat` 13.84 → **7.07**, `mkdirat` 90.96 → **45.18**,
+> overall 4.71x → **3.28x** — roughly halved, against a gate of ≤ 2.0
+> ([ledger](docs/perf-results/2026-08-13-hvpatch-kernel-lane-amp-ledger.md)).
+> The dominant host call inside every path-op window is still `openat`, so
+> something is still walking: the leaf, the fallback cases, or a prefix the
+> cache could not serve. Finishing it is real work, honestly sized at **under
+> 8%** of the build (all path ops together are 384 ms of 1,014 ms of
+> host-syscall CPU).
+>
+> This phase is what forced the CAUTION above: it was ranked first on syscall
 > count and is worth single digits of CPU.
 
 **Remit:** Carrick owns path resolution. A `DirCache` of containment-proven

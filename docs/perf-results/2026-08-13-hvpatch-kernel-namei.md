@@ -125,14 +125,31 @@ creation — thousands per build — and repaid the walk every time.
 - `fsescapeguard`, the existing security invariant for this fast path, is
   unchanged and remains the regression guard for containment.
 
-## What is NOT established here
+## The gate's syscall clause: measured, and NOT met
 
-- **No traced attribution.** The typed amplification ledger needs `dtrace`,
-  which needs sudo credentials this session did not have, so the per-guest-call
-  amplification numbers KN's gate is stated against
-  (`openat` ≤ 2.0, overall ≤ 2.0x) are **not yet re-measured at HEAD**. The
-  CPU result above stands on its own as retention authority; the gate's
-  syscall-ratio clause remains open.
+Taken after this document was first written, once AMP1 was taught to measure
+the kernel lane at all
+([ledger](2026-08-13-hvpatch-kernel-lane-amp-ledger.md)):
+
+| guest op | pre-KN | post-KN | gate |
+| --- | ---: | ---: | ---: |
+| `openat` | 32.78 | **17.75** | ≤ 2.0 |
+| `newfstatat` | 13.84 | **7.07** | ≤ 2.0 |
+| `mkdirat` | 90.96 | **45.18** | ≤ 2.0 |
+| overall | 4.71x | **3.28x** | ≤ 2.0x |
+
+**Roughly halved, gate not met.** KN is recorded as a partial: the mechanism is
+right, the CPU win is retained, and the remaining factor is real work still to
+do. The dominant host call inside every path-op window is still `openat`, so
+something is still walking — the leaf, the fallback cases, or a prefix the
+cache could not serve.
+
+That ledger also priced the clause honestly: all path operations together cost
+384 ms of the 1,014 ms of host-syscall CPU, so meeting the gate exactly is
+worth **under 8%** of the build. It confirms the correction above from a second
+instrument.
+
+## What is NOT established here
 - **No claim about the remaining walk.** How often `at` still falls back —
   a symlinked intermediate, a missing parent, a probe of a non-existent
   directory — is unmeasured. Negative results are deliberately not cached, so
@@ -141,11 +158,16 @@ creation — thousands per build — and repaid the walk every time.
   this change. Node remains blocked on hvpatch for an unrelated reason
   ([node blocker](2026-08-13-hvpatch-node-blocker.md)).
 
-## Next architectural question
+## Next architectural question — answered, by the ledger
 
-If `sys` is dominated by guest execution inside `hv_vcpu_run` and by fault
-handling rather than by host syscalls, then the instrument this tree still
-lacks is one that **separates guest execution from host service inside the
-kernel bucket** — the same instrument the fork-stage document asked for and
-did not build. Until it exists, every CPU ranking on this backend is inferred.
-Building it should precede choosing the next lever.
+The question this document closed on was whether `sys` is dominated by host
+syscalls or by something else. The AMP1 census answers it: **faults.** 279,987
+`as_fault` and 230,298 `zfod` on one build, of which 150,749 land inside
+`mmap` service windows at 76.7 zero-fill faults per guest `mmap` — while
+`mmap`'s host-syscall amplification is already 1.04x. At this tree's own
+measured per-fault cost that is on the order of the entire overhead the goal
+must remove.
+
+The next lever is therefore fault reduction on the kernel lane, and the first
+step is naming what touches those pages. See
+[the ledger](2026-08-13-hvpatch-kernel-lane-amp-ledger.md).
