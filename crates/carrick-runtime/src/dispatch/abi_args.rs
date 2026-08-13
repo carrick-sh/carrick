@@ -42,6 +42,20 @@ pub struct HostPid(pub u32);
 /// `Pid`; it IS an ns value. New/converted code uses the explicit `NsPid`.
 pub type Pid = NsPid;
 
+/// The calling task's own Linux pid, from carrick's kernel when a dispatch
+/// scope is active, else the host process.
+///
+/// Measured on the kernel lane (`carrick debug hvpatch-kernel` against a live
+/// run): the root task's id IS the host pid and a child's id IS the pid the
+/// child's `getpid(2)` returns. So this single value distinguishes the two
+/// cases the bootstrap-pid alias has to tell apart — a root, whose id equals
+/// the host pid, from a child, whose id does not — without needing to know
+/// which lane it is running on.
+fn caller_task_pid() -> i32 {
+    super::resources::with_active_context(|context| context.task().key().id.raw())
+        .unwrap_or_else(|| std::process::id() as i32)
+}
+
 impl NsPid {
     /// The raw ns value the guest passed (for sentinel/sign checks like `-1`,
     /// or `0`/negative whole-group targets the caller interprets itself).
@@ -57,9 +71,30 @@ impl NsPid {
     /// threads (resolve those through the thread registry); callers that want
     /// either add them explicitly. The ONE canonical self-check — the drift
     /// between four ad-hoc copies caused the tkill01 / sched ns-pid bugs.
+    /// "Is this target me?" cannot be decided without knowing who is asking,
+    /// so this resolves the caller from the active dispatch context rather
+    /// than assuming the host process is the answer. See [`caller_task_pid`].
     pub fn names_self(self) -> bool {
         let host = std::process::id();
-        if self.0 == host as i32 || self.0 == carrick_abi::LINUX_BOOTSTRAP_PID as i32 {
+        let caller = caller_task_pid();
+        // The precise case: the target IS the caller's own task id.
+        if self.0 == caller {
+            return true;
+        }
+        if self.0 == host as i32 {
+            return true;
+        }
+        // The bootstrap-pid alias, NARROWED. It exists because on the
+        // non-namespaced OCI path the guest init presents itself as pid 1 while
+        // carrick has no distinct identity to offer it, so `caller` is the host
+        // pid and a `kill(1)` from it really is a self-target.
+        //
+        // On the kernel lane that is no longer true: a Linux process is a
+        // thread, `caller` is its own guest pid, and pid 1 is a DIFFERENT
+        // process — the container init. Applying the alias there made every
+        // child treat `kill(1, …)` as suicide. Gating it on `caller` having no
+        // distinct identity keeps the original case and drops the wrong one.
+        if self.0 == carrick_abi::LINUX_BOOTSTRAP_PID as i32 && caller == host as i32 {
             return true;
         }
         if self.0 > 0 && crate::namespace::pid::enabled() {
