@@ -1,11 +1,64 @@
 # HVPatch K1 — observability contract landed, GO withheld
 
-**Decision: NO-GO for K1.** Three of the four remaining K1 deliverables are
-GREEN and live-verified. The fourth — the exact `68 fork / 67 exec / 69
-process` lifecycle receipt — **cannot be produced on any commit tested**,
-including the commit this session started from. The blocker is a
-pre-existing HVPatch fork/exec lifecycle defect, newly attributed here, not
-a regression from this work.
+**Decision: NO-GO for K1**, but for a different and much narrower reason
+than when this document was first written. See "Update — the blocker is
+fixed" immediately below.
+
+## Update — the blocker is fixed; the gate's constants are now the issue
+
+The cold `go build` under `--exec-backend hvpatch` **now completes.** The
+root cause of the archive corruption was found and fixed in `90e833cc1`:
+`fcntl(F_GETFL)` on a host-backed description overlaid the mutable status
+bits from the host fd, but carrick never opens an overlay file with
+`O_APPEND`, so F_GETFL reported the flag absent. Go's `syscall.SetNonblock`
+— which `os.OpenFile` runs on every file — wrote that answer back through
+the standard `F_GETFL`/`F_SETFL` read-modify-write, destroying `O_APPEND`
+permanently. `cmd/go` opens archives `O_WRONLY|O_APPEND`, so the append
+branch went dead and the member header landed at offset 0, leaving the
+archive without its `!<arch>\n`. The fix pushes the description's `O_APPEND`
+down to the host fd rather than believing the host's answer.
+
+Measured on the signed binary after the fix: BUILD_OK in 3 of 4 plain runs,
+**zero** archive errors and **zero** offset-0 detector firings, against a
+60-75% corruption rate before.
+
+Two complete lifecycle captures under the K1 profile, both with the guest
+build succeeding (`BUILD_OK`, CLI exit 0, zero DTrace errors):
+
+| Capture | roots | forks | execs | births | exits | live | VM create/destroy |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 1 | 71 | 70 | 72 | 72 | 0 | 1 / 1 |
+| 2 | 1 | 70 | 69 | 71 | 71 | 1 | 1 / 1 |
+
+**The one-VM invariant is demonstrated**: exactly one create-attempt, one
+create-success, one destroy-attempt and one destroy-success per run, with
+70+ Linux processes multiplexed inside it. Guest workload window: 2.12 s.
+
+**Why K1 is still NO-GO.** The gate asks for the exact counts
+`68 forks / 67 execs / 69 processes`, and the current fixture measures
+70-71 / 69-70 / 71-72 — and varies run to run, with one capture leaving
+`live=1`. The strict reader therefore exits non-zero. Two things must be
+settled before GO, and neither may be done by quietly editing a constant:
+
+1. whether the historical 68/67/69 is simply stale against today's Go
+   toolchain image and fixture, in which case the gate is re-baselined
+   explicitly and recorded, per the discipline rule that a phase gate is a
+   contract;
+2. why the process count is not deterministic run to run, and what the
+   `live=1` residue in capture 2 is. A lifecycle receipt that varies is not
+   a receipt.
+
+Everything below this section predates the fix and is retained for
+attribution.
+
+---
+
+**Original decision (superseded above): NO-GO for K1.** Three of the four
+remaining K1 deliverables are GREEN and live-verified. The fourth — the exact
+`68 fork / 67 exec / 69 process` lifecycle receipt — **cannot be produced on
+any commit tested**, including the commit this session started from. The
+blocker is a pre-existing HVPatch fork/exec lifecycle defect, newly
+attributed here, not a regression from this work.
 
 This document exists because the K1 gate is a contract. The observability
 work is done and demonstrable; claiming GO without the lifecycle receipt is
