@@ -1,0 +1,776 @@
+//! Linux ELF core files, written by carrick's kernel rather than by Darwin.
+//!
+//! A crash dump is process semantics: which threads existed, what their
+//! registers held, which signal killed the process, what its address space and
+//! file mappings were. Under HVPatch every Linux process is a thread of ONE
+//! host process, so a Mach core of that host process describes all of them at
+//! once and none of them correctly — the same structural reason `times`/
+//! `getrusage` could not be sourced from `proc_pid_rusage`. carrick therefore
+//! writes the Linux format itself, from its own kernel objects.
+//!
+//! # Where the ABI came from
+//!
+//! Clean-room, from the differential oracle: a real `aarch64` Linux core was
+//! produced under native arm64 Docker and its structure read back with
+//! `readelf -h/-l/-n`. That run is the authority for every size and ordering
+//! decision below, and re-running it is how a suspected layout bug is settled:
+//!
+//! ```text
+//! Elf file type is CORE, 20 program headers, starting at offset 64
+//!   NOTE  offset 0x4a0  filesz 0xc04  align 0x4
+//!   LOAD  ... R E / R / RW, align 0x1000
+//! Notes, owner "CORE", in this order:
+//!   NT_PRSTATUS 0x188 (392)   NT_PRPSINFO 0x88 (136)
+//!   NT_SIGINFO  0x80  (128)   NT_AUXV     0x150
+//!   NT_FILE     0x251        (count, page_size, triples, then names)
+//! ```
+//!
+//! No Linux kernel source was consulted, per the project's clean-room rule.
+
+/// ELF note types. `NT_SIGINFO`/`NT_FILE` spell their own names in ASCII.
+const NT_PRSTATUS: u32 = 1;
+const NT_PRPSINFO: u32 = 3;
+const NT_AUXV: u32 = 6;
+const NT_SIGINFO: u32 = 0x5349_4749;
+const NT_FILE: u32 = 0x4649_4c45;
+
+/// Every note in a core file belongs to the `CORE` owner.
+const NOTE_OWNER: &[u8] = b"CORE\0";
+
+/// `readelf` reported `align 0x4` on the oracle's PT_NOTE: note fields are
+/// 4-byte aligned even in a 64-bit core.
+const NOTE_ALIGN: usize = 4;
+
+const ELF_CLASS64: u8 = 2;
+const ELF_DATA_LSB: u8 = 1;
+const ELF_VERSION_CURRENT: u8 = 1;
+const ET_CORE: u16 = 4;
+const EM_AARCH64: u16 = 183;
+const PT_LOAD: u32 = 1;
+const PT_NOTE: u32 = 4;
+const PF_X: u32 = 1;
+const PF_W: u32 = 2;
+const PF_R: u32 = 4;
+
+/// Note payload sizes the oracle core reported (`readelf -n`). They are the
+/// ABI authority the `wire` structs are checked against at compile time.
+const ORACLE_PRSTATUS_SIZE: usize = 0x188;
+const ORACLE_PRPSINFO_SIZE: usize = 0x88;
+const ORACLE_SIGINFO_SIZE: usize = 0x80;
+
+const EHDR_SIZE: u16 = 64;
+const PHDR_SIZE: u16 = 56;
+
+/// Guest page size recorded in `NT_FILE`. The oracle reported 4096; carrick's
+/// guests are 4 KiB-paged Linux regardless of the host's 16 KiB pages, and this
+/// field describes the GUEST's mapping granularity.
+const NT_FILE_PAGE_SIZE: u64 = GUEST_PAGE as u64;
+
+/// Guest page granularity: carrick's guests are 4 KiB-paged Linux regardless
+/// of the host's 16 KiB pages, and both `PT_LOAD` alignment and `NT_FILE`'s
+/// page size describe the GUEST.
+const GUEST_PAGE: usize = 4096;
+
+/// `elf_gregset_t` on aarch64: x0-x30, sp, pc, pstate.
+pub const AARCH64_GREGS: usize = 34;
+
+/// One thread's register file, in the order `NT_PRSTATUS` stores it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ThreadRegisters {
+    /// `x0`-`x30`, then `sp`, `pc`, `pstate`.
+    pub gregs: [u64; AARCH64_GREGS],
+}
+
+impl Default for ThreadRegisters {
+    fn default() -> Self {
+        Self {
+            gregs: [0; AARCH64_GREGS],
+        }
+    }
+}
+
+/// Per-thread note contents. Linux writes one `NT_PRSTATUS` per thread, the
+/// crashing thread first, so a reader attributes the fault to the right one.
+#[derive(Clone, Copy, Debug)]
+pub struct ThreadState {
+    pub tid: i32,
+    pub registers: ThreadRegisters,
+    /// The signal being delivered to this thread, or 0.
+    pub current_signal: i32,
+}
+
+/// Process identity for `NT_PRPSINFO`, plus the signal identity every core
+/// needs to be interpretable.
+#[derive(Clone, Debug)]
+pub struct ProcessIdentity {
+    pub pid: i32,
+    pub ppid: i32,
+    pub pgrp: i32,
+    pub session: i32,
+    /// Short command name (`pr_fname`, 16 bytes including NUL).
+    pub comm: String,
+    /// Argument-list prefix (`pr_psargs`, 80 bytes including NUL).
+    pub psargs: String,
+}
+
+/// The `siginfo_t` fields a core needs, for `NT_SIGINFO`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SignalInfo {
+    pub signo: i32,
+    pub code: i32,
+    pub errno: i32,
+    /// Faulting address for SIGSEGV/SIGBUS (`si_addr`).
+    pub addr: u64,
+}
+
+/// One `PT_LOAD` region: guest memory to be written into the core.
+pub struct MemoryRegion<'a> {
+    pub start: u64,
+    /// Permissions as `PF_*`.
+    pub flags: u32,
+    /// Contents. An empty slice records the mapping with `p_filesz = 0` —
+    /// which is exactly what Linux does for a region it does not dump (the
+    /// oracle's first `LOAD` had `filesz 0`, `memsz 0x20000`).
+    pub bytes: &'a [u8],
+    /// Size of the mapping in the address space, which may exceed `bytes`.
+    pub size: u64,
+}
+
+/// One `NT_FILE` entry: a file-backed mapping.
+#[derive(Clone, Debug)]
+pub struct FileMapping {
+    pub start: u64,
+    pub end: u64,
+    /// Offset within the file, in PAGES (the oracle's third column).
+    pub file_page_offset: u64,
+    pub path: String,
+}
+
+/// Everything needed to write one core file.
+pub struct CoreDump<'a> {
+    pub identity: ProcessIdentity,
+    pub signal: SignalInfo,
+    /// Crashing thread FIRST.
+    pub threads: Vec<ThreadState>,
+    pub auxv: Vec<(u64, u64)>,
+    pub mappings: Vec<FileMapping>,
+    pub regions: Vec<MemoryRegion<'a>>,
+}
+
+fn align_up(value: usize, align: usize) -> usize {
+    value.div_ceil(align) * align
+}
+
+/// Append one ELF note: `namesz`, `descsz`, `type`, padded name, padded desc.
+fn push_note(out: &mut Vec<u8>, note_type: u32, desc: &[u8]) {
+    let header = wire::NoteHeader {
+        n_namesz: NOTE_OWNER.len() as u32,
+        n_descsz: desc.len() as u32,
+        n_type: note_type,
+    };
+    out.extend_from_slice(as_bytes(&header));
+    out.extend_from_slice(NOTE_OWNER);
+    out.resize(align_up(out.len(), NOTE_ALIGN), 0);
+    out.extend_from_slice(desc);
+    out.resize(align_up(out.len(), NOTE_ALIGN), 0);
+}
+
+/// Wire structs for the note payloads.
+///
+/// Every field is explicit, including padding, so the type has NO implicit
+/// padding and its byte image is fully initialised — which is what makes
+/// [`as_bytes`] sound and lets `size_of` be the authority on layout instead of
+/// a hand-counted offset.
+mod wire {
+    /// `struct elf_siginfo` — the three-int summary embedded in prstatus.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub(super) struct ElfSiginfo {
+        pub si_signo: i32,
+        pub si_code: i32,
+        pub si_errno: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub(super) struct Timeval {
+        pub tv_sec: i64,
+        pub tv_usec: i64,
+    }
+
+    /// `struct elf_prstatus`. `pr_pid` carries the THREAD id — that is how a
+    /// reader tells threads apart — while the rest describe the process.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub(super) struct ElfPrStatus {
+        pub pr_info: ElfSiginfo,
+        pub pr_cursig: i16,
+        pub _pad0: u16,
+        pub pr_sigpend: u64,
+        pub pr_sighold: u64,
+        pub pr_pid: i32,
+        pub pr_ppid: i32,
+        pub pr_pgrp: i32,
+        pub pr_sid: i32,
+        /// Left zero: per-thread CPU is not split finely enough to fill these
+        /// honestly, and a fabricated duration is worse than an absent one.
+        pub pr_utime: Timeval,
+        pub pr_stime: Timeval,
+        pub pr_cutime: Timeval,
+        pub pr_cstime: Timeval,
+        pub pr_reg: [u64; super::AARCH64_GREGS],
+        pub pr_fpvalid: i32,
+        pub _pad1: u32,
+    }
+
+    /// `struct elf_prpsinfo` — process identity.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub(super) struct ElfPrPsInfo {
+        pub pr_state: u8,
+        pub pr_sname: u8,
+        pub pr_zomb: u8,
+        pub pr_nice: i8,
+        pub _pad0: u32,
+        pub pr_flag: u64,
+        pub pr_uid: u32,
+        pub pr_gid: u32,
+        pub pr_pid: i32,
+        pub pr_ppid: i32,
+        pub pr_pgrp: i32,
+        pub pr_sid: i32,
+        pub pr_fname: [u8; super::PR_FNAME_LEN],
+        pub pr_psargs: [u8; super::PR_PSARGS_LEN],
+    }
+
+    /// `siginfo_t` as a core records it: the common header plus the
+    /// SIGSEGV/SIGBUS arm of the union, which leads with `si_addr`.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub(super) struct SigInfo {
+        pub si_signo: i32,
+        pub si_errno: i32,
+        pub si_code: i32,
+        pub _pad0: u32,
+        pub si_addr: u64,
+        pub _union_tail: [u8; super::SIGINFO_UNION_TAIL],
+    }
+
+    /// The ELF file header.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub(super) struct Elf64Ehdr {
+        pub e_ident: [u8; 16],
+        pub e_type: u16,
+        pub e_machine: u16,
+        pub e_version: u32,
+        pub e_entry: u64,
+        pub e_phoff: u64,
+        pub e_shoff: u64,
+        pub e_flags: u32,
+        pub e_ehsize: u16,
+        pub e_phentsize: u16,
+        pub e_phnum: u16,
+        pub e_shentsize: u16,
+        pub e_shnum: u16,
+        pub e_shstrndx: u16,
+    }
+
+    /// One program header.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub(super) struct Elf64Phdr {
+        pub p_type: u32,
+        pub p_flags: u32,
+        pub p_offset: u64,
+        pub p_vaddr: u64,
+        pub p_paddr: u64,
+        pub p_filesz: u64,
+        pub p_memsz: u64,
+        pub p_align: u64,
+    }
+
+    /// The fixed head of an ELF note, before the padded name and descriptor.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub(super) struct NoteHeader {
+        pub n_namesz: u32,
+        pub n_descsz: u32,
+        pub n_type: u32,
+    }
+}
+
+/// `pr_fname` width, including its NUL.
+const PR_FNAME_LEN: usize = 16;
+/// `pr_psargs` width, including its NUL.
+const PR_PSARGS_LEN: usize = 80;
+/// Bytes of `siginfo_t` after `si_addr`.
+const SIGINFO_UNION_TAIL: usize = ORACLE_SIGINFO_SIZE - 24;
+
+// The oracle's reported note payload sizes are the ABI authority (see the
+// module docs). Checking the STRUCTS against them at compile time is what
+// turns a layout mistake into a build failure instead of an unreadable core.
+const _: () = assert!(size_of::<wire::ElfPrStatus>() == ORACLE_PRSTATUS_SIZE);
+const _: () = assert!(size_of::<wire::ElfPrPsInfo>() == ORACLE_PRPSINFO_SIZE);
+const _: () = assert!(size_of::<wire::SigInfo>() == ORACLE_SIGINFO_SIZE);
+const _: () = assert!(size_of::<wire::Elf64Ehdr>() == EHDR_SIZE as usize);
+const _: () = assert!(size_of::<wire::Elf64Phdr>() == PHDR_SIZE as usize);
+
+/// Byte image of a wire struct.
+///
+/// SAFETY-relevant by construction: every `wire` type is `#[repr(C)]` with
+/// explicit padding fields, so it contains no uninitialised padding and its
+/// whole size is readable as bytes.
+fn as_bytes<T: Copy>(value: &T) -> &[u8] {
+    // SAFETY: `T` is a `repr(C)` POD from `wire` with no implicit padding, and
+    // the slice borrows `value` for its own lifetime.
+    unsafe { std::slice::from_raw_parts(std::ptr::from_ref(value).cast::<u8>(), size_of::<T>()) }
+}
+
+/// Copy a `&str` into a fixed-width NUL-terminated field.
+fn fixed_field<const N: usize>(value: &str) -> [u8; N] {
+    let mut field = [0_u8; N];
+    let bytes = value.as_bytes();
+    let keep = bytes.len().min(N - 1);
+    field[..keep].copy_from_slice(&bytes[..keep]);
+    field
+}
+
+fn prstatus_note(dump: &CoreDump<'_>, thread: &ThreadState) -> wire::ElfPrStatus {
+    wire::ElfPrStatus {
+        pr_info: wire::ElfSiginfo {
+            si_signo: dump.signal.signo,
+            si_code: dump.signal.code,
+            si_errno: dump.signal.errno,
+        },
+        pr_cursig: thread.current_signal as i16,
+        _pad0: 0,
+        pr_sigpend: 0,
+        pr_sighold: 0,
+        pr_pid: thread.tid,
+        pr_ppid: dump.identity.ppid,
+        pr_pgrp: dump.identity.pgrp,
+        pr_sid: dump.identity.session,
+        pr_utime: wire::Timeval::default(),
+        pr_stime: wire::Timeval::default(),
+        pr_cutime: wire::Timeval::default(),
+        pr_cstime: wire::Timeval::default(),
+        pr_reg: thread.registers.gregs,
+        pr_fpvalid: 0,
+        _pad1: 0,
+    }
+}
+
+fn prpsinfo_note(identity: &ProcessIdentity) -> wire::ElfPrPsInfo {
+    wire::ElfPrPsInfo {
+        pr_state: 0,
+        pr_sname: b'R',
+        pr_zomb: 0,
+        pr_nice: 0,
+        _pad0: 0,
+        pr_flag: 0,
+        pr_uid: 0,
+        pr_gid: 0,
+        pr_pid: identity.pid,
+        pr_ppid: identity.ppid,
+        pr_pgrp: identity.pgrp,
+        pr_sid: identity.session,
+        pr_fname: fixed_field(&identity.comm),
+        pr_psargs: fixed_field(&identity.psargs),
+    }
+}
+
+fn siginfo_note(signal: &SignalInfo) -> wire::SigInfo {
+    wire::SigInfo {
+        si_signo: signal.signo,
+        si_errno: signal.errno,
+        si_code: signal.code,
+        _pad0: 0,
+        si_addr: signal.addr,
+        _union_tail: [0; SIGINFO_UNION_TAIL],
+    }
+}
+
+fn auxv_note(auxv: &[(u64, u64)]) -> Vec<u8> {
+    let mut note = Vec::with_capacity((auxv.len() + 1) * 16);
+    for (key, value) in auxv {
+        note.extend_from_slice(&key.to_le_bytes());
+        note.extend_from_slice(&value.to_le_bytes());
+    }
+    // AT_NULL terminator.
+    note.extend_from_slice(&0_u64.to_le_bytes());
+    note.extend_from_slice(&0_u64.to_le_bytes());
+    note
+}
+
+/// `NT_FILE`: count, page size, then one (start, end, file page offset) triple
+/// per mapping, then the NUL-terminated paths in the same order.
+fn file_note(mappings: &[FileMapping]) -> Vec<u8> {
+    let mut note = Vec::new();
+    note.extend_from_slice(&(mappings.len() as u64).to_le_bytes());
+    note.extend_from_slice(&NT_FILE_PAGE_SIZE.to_le_bytes());
+    for mapping in mappings {
+        note.extend_from_slice(&mapping.start.to_le_bytes());
+        note.extend_from_slice(&mapping.end.to_le_bytes());
+        note.extend_from_slice(&mapping.file_page_offset.to_le_bytes());
+    }
+    for mapping in mappings {
+        note.extend_from_slice(mapping.path.as_bytes());
+        note.push(0);
+    }
+    note
+}
+
+impl CoreDump<'_> {
+    /// Serialise the whole core file.
+    ///
+    /// Layout follows the oracle: ELF header, then the program header table,
+    /// then `PT_NOTE`'s contents, then each `PT_LOAD`'s bytes page-aligned.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut notes = Vec::new();
+        // Crashing thread first — `self.threads` is documented to be ordered.
+        for thread in &self.threads {
+            push_note(
+                &mut notes,
+                NT_PRSTATUS,
+                as_bytes(&prstatus_note(self, thread)),
+            );
+        }
+        push_note(
+            &mut notes,
+            NT_PRPSINFO,
+            as_bytes(&prpsinfo_note(&self.identity)),
+        );
+        push_note(
+            &mut notes,
+            NT_SIGINFO,
+            as_bytes(&siginfo_note(&self.signal)),
+        );
+        push_note(&mut notes, NT_AUXV, &auxv_note(&self.auxv));
+        push_note(&mut notes, NT_FILE, &file_note(&self.mappings));
+
+        let phnum = 1 + self.regions.len();
+        let phoff = usize::from(EHDR_SIZE);
+        let notes_offset = phoff + phnum * usize::from(PHDR_SIZE);
+        let mut data_offset = align_up(notes_offset + notes.len(), GUEST_PAGE);
+
+        let mut ident = [0_u8; 16];
+        ident[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        ident[4] = ELF_CLASS64;
+        ident[5] = ELF_DATA_LSB;
+        ident[6] = ELF_VERSION_CURRENT;
+        let header = wire::Elf64Ehdr {
+            e_ident: ident,
+            e_type: ET_CORE,
+            e_machine: EM_AARCH64,
+            e_version: 1,
+            e_phoff: phoff as u64,
+            e_ehsize: EHDR_SIZE,
+            e_phentsize: PHDR_SIZE,
+            e_phnum: phnum as u16,
+            ..wire::Elf64Ehdr::default()
+        };
+        let mut out = Vec::new();
+        out.extend_from_slice(as_bytes(&header));
+
+        out.extend_from_slice(as_bytes(&wire::Elf64Phdr {
+            p_type: PT_NOTE,
+            p_offset: notes_offset as u64,
+            p_filesz: notes.len() as u64,
+            p_align: NOTE_ALIGN as u64,
+            ..wire::Elf64Phdr::default()
+        }));
+        for region in &self.regions {
+            let filesz = region.bytes.len() as u64;
+            out.extend_from_slice(as_bytes(&wire::Elf64Phdr {
+                p_type: PT_LOAD,
+                p_flags: region.flags,
+                p_offset: if filesz == 0 { 0 } else { data_offset as u64 },
+                p_vaddr: region.start,
+                p_filesz: filesz,
+                p_memsz: region.size,
+                p_align: GUEST_PAGE as u64,
+                ..wire::Elf64Phdr::default()
+            }));
+            data_offset += align_up(region.bytes.len(), GUEST_PAGE);
+        }
+        debug_assert_eq!(out.len(), notes_offset);
+
+        out.extend_from_slice(&notes);
+        for region in &self.regions {
+            if region.bytes.is_empty() {
+                continue;
+            }
+            out.resize(align_up(out.len(), GUEST_PAGE), 0);
+            out.extend_from_slice(region.bytes);
+        }
+        out
+    }
+}
+
+/// The `PF_*` flags for a region, from readable/writable/executable.
+pub const fn region_flags(read: bool, write: bool, execute: bool) -> u32 {
+    let mut flags = 0;
+    if read {
+        flags |= PF_R;
+    }
+    if write {
+        flags |= PF_W;
+    }
+    if execute {
+        flags |= PF_X;
+    }
+    flags
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> CoreDump<'static> {
+        CoreDump {
+            identity: ProcessIdentity {
+                pid: 42,
+                ppid: 7,
+                pgrp: 42,
+                session: 1,
+                comm: "crasher".to_string(),
+                psargs: "crasher --flag".to_string(),
+            },
+            signal: SignalInfo {
+                signo: 11,
+                code: 1,
+                errno: 0,
+                addr: 0xdead_0000,
+            },
+            threads: vec![
+                ThreadState {
+                    tid: 42,
+                    registers: ThreadRegisters {
+                        gregs: [0x1111; AARCH64_GREGS],
+                    },
+                    current_signal: 11,
+                },
+                ThreadState {
+                    tid: 43,
+                    registers: ThreadRegisters::default(),
+                    current_signal: 0,
+                },
+            ],
+            auxv: vec![(3, 0x4000_0040), (6, 4096)],
+            mappings: vec![FileMapping {
+                start: 0xaaaa_0000,
+                end: 0xaaaa_2000,
+                file_page_offset: 0,
+                path: "/usr/bin/crasher".to_string(),
+            }],
+            regions: Vec::new(),
+        }
+    }
+
+    /// The note payload sizes are the oracle's, and a mismatch means the ABI
+    /// drifted — the one thing a reader cannot recover from.
+    #[test]
+    fn note_payloads_match_the_oracle_sizes() {
+        let dump = sample();
+        assert_eq!(
+            as_bytes(&prstatus_note(&dump, &dump.threads[0])).len(),
+            ORACLE_PRSTATUS_SIZE
+        );
+        assert_eq!(
+            as_bytes(&prpsinfo_note(&dump.identity)).len(),
+            ORACLE_PRPSINFO_SIZE
+        );
+        assert_eq!(
+            as_bytes(&siginfo_note(&dump.signal)).len(),
+            ORACLE_SIGINFO_SIZE
+        );
+    }
+
+    #[test]
+    fn header_declares_an_aarch64_core() {
+        let bytes = sample().to_bytes();
+        let field = |name: usize, width: usize| &bytes[name..name + width];
+        assert_eq!(&bytes[..4], b"\x7fELF");
+        assert_eq!(bytes[4], ELF_CLASS64);
+        let ty = std::mem::offset_of!(wire::Elf64Ehdr, e_type);
+        assert_eq!(
+            u16::from_le_bytes(field(ty, 2).try_into().unwrap()),
+            ET_CORE
+        );
+        let machine = std::mem::offset_of!(wire::Elf64Ehdr, e_machine);
+        assert_eq!(
+            u16::from_le_bytes(field(machine, 2).try_into().unwrap()),
+            EM_AARCH64
+        );
+        // The program header table follows the header, as the oracle's did.
+        let phoff = std::mem::offset_of!(wire::Elf64Ehdr, e_phoff);
+        assert_eq!(
+            u64::from_le_bytes(field(phoff, 8).try_into().unwrap()),
+            u64::from(EHDR_SIZE)
+        );
+    }
+
+    /// Linux writes one NT_PRSTATUS per thread; a reader counts threads by
+    /// counting them, so dropping one silently loses a thread.
+    #[test]
+    fn every_thread_gets_a_prstatus_note() {
+        let dump = sample();
+        let bytes = dump.to_bytes();
+        let found = bytes
+            .windows(4)
+            .filter(|window| *window == NT_PRSTATUS.to_le_bytes())
+            .count();
+        assert!(
+            found >= dump.threads.len(),
+            "expected one NT_PRSTATUS per thread, found {found}"
+        );
+    }
+
+    /// The crashing thread must come first so a reader attributes the fault
+    /// to the right thread.
+    #[test]
+    fn crashing_thread_is_written_first() {
+        let dump = sample();
+        let note = prstatus_note(&dump, &dump.threads[0]);
+        assert_eq!(note.pr_pid, 42);
+        // And it lands where a reader looks for it, by the struct's own offset
+        // rather than a counted one.
+        let bytes = as_bytes(&note);
+        let at = std::mem::offset_of!(wire::ElfPrStatus, pr_pid);
+        assert_eq!(
+            i32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()),
+            42
+        );
+    }
+
+    #[test]
+    fn file_note_carries_triples_then_paths() {
+        let dump = sample();
+        let note = file_note(&dump.mappings);
+        assert_eq!(u64::from_le_bytes(note[0..8].try_into().unwrap()), 1);
+        assert_eq!(
+            u64::from_le_bytes(note[8..16].try_into().unwrap()),
+            NT_FILE_PAGE_SIZE
+        );
+        assert_eq!(
+            u64::from_le_bytes(note[16..24].try_into().unwrap()),
+            0xaaaa_0000
+        );
+        assert!(note.ends_with(b"/usr/bin/crasher\0"));
+    }
+
+    /// A region with no dumped bytes still records its mapping, exactly as the
+    /// oracle's first PT_LOAD did (filesz 0, memsz 0x20000).
+    #[test]
+    fn undumped_region_keeps_its_mapping() {
+        let mut dump = sample();
+        dump.regions.push(MemoryRegion {
+            start: 0xaaaa_0000,
+            flags: region_flags(true, false, true),
+            bytes: &[],
+            size: 0x20000,
+        });
+        let bytes = dump.to_bytes();
+        // Second program header: the PT_NOTE comes first.
+        let phdr = size_of::<wire::Elf64Ehdr>() + size_of::<wire::Elf64Phdr>();
+        let at = |field: usize| phdr + field;
+        let kind = at(std::mem::offset_of!(wire::Elf64Phdr, p_type));
+        assert_eq!(
+            u32::from_le_bytes(bytes[kind..kind + 4].try_into().unwrap()),
+            PT_LOAD
+        );
+        let filesz = at(std::mem::offset_of!(wire::Elf64Phdr, p_filesz));
+        assert_eq!(
+            u64::from_le_bytes(bytes[filesz..filesz + 8].try_into().unwrap()),
+            0,
+            "p_filesz"
+        );
+        let memsz = at(std::mem::offset_of!(wire::Elf64Phdr, p_memsz));
+        assert_eq!(
+            u64::from_le_bytes(bytes[memsz..memsz + 8].try_into().unwrap()),
+            0x20000,
+            "p_memsz"
+        );
+    }
+}
+
+#[cfg(test)]
+mod oracle_validation {
+    use super::*;
+
+    /// Emit a core to `CARRICK_CORE_EMIT_PATH` so an INDEPENDENT reader can be
+    /// pointed at it. Self-consistency proves nothing about a wire format; the
+    /// gate is whether `readelf` — which knows nothing about carrick — parses
+    /// the header, the program headers, and every note.
+    #[test]
+    fn emit_core_for_an_independent_reader() {
+        let Ok(path) = std::env::var("CARRICK_CORE_EMIT_PATH") else {
+            return;
+        };
+        let dump = CoreDump {
+            identity: ProcessIdentity {
+                pid: 1234,
+                ppid: 1,
+                pgrp: 1234,
+                session: 1,
+                comm: "carrickcore".to_string(),
+                psargs: "carrickcore --emit".to_string(),
+            },
+            signal: SignalInfo {
+                signo: 11,
+                code: 1,
+                errno: 0,
+                addr: 0x0000_dead_beef_0000,
+            },
+            threads: vec![
+                ThreadState {
+                    tid: 1234,
+                    registers: ThreadRegisters {
+                        gregs: [0x4142_4344_4546_4748; AARCH64_GREGS],
+                    },
+                    current_signal: 11,
+                },
+                ThreadState {
+                    tid: 1235,
+                    registers: ThreadRegisters::default(),
+                    current_signal: 0,
+                },
+            ],
+            auxv: vec![
+                (3, 0x0000_aaaa_0000_0040),
+                (6, 4096),
+                (25, 0x0000_ffff_0000_0000),
+            ],
+            mappings: vec![
+                FileMapping {
+                    start: 0x0000_aaaa_0000_0000,
+                    end: 0x0000_aaaa_0002_0000,
+                    file_page_offset: 0,
+                    path: "/usr/bin/carrickcore".to_string(),
+                },
+                FileMapping {
+                    start: 0x0000_ffff_a000_0000,
+                    end: 0x0000_ffff_a019_c000,
+                    file_page_offset: 0,
+                    path: "/usr/lib/aarch64-linux-gnu/libc.so.6".to_string(),
+                },
+            ],
+            regions: vec![
+                MemoryRegion {
+                    start: 0x0000_aaaa_0000_0000,
+                    flags: region_flags(true, false, true),
+                    bytes: &[],
+                    size: 0x20000,
+                },
+                MemoryRegion {
+                    start: 0x0000_aaaa_0002_0000,
+                    flags: region_flags(true, true, false),
+                    bytes: &[0x5a; 0x1000],
+                    size: 0x1000,
+                },
+            ],
+        };
+        std::fs::write(&path, dump.to_bytes()).expect("emit core");
+    }
+}
