@@ -59,6 +59,46 @@ use crate::trap::{SyscallTrap, TrapError};
 const SIGNAL_WAIT_SLICE: Duration = Duration::from_millis(50);
 const SHORT_TIMED_WAIT_RECLAIM_CUTOFF: Duration = Duration::from_millis(250);
 
+/// vCPU reclaim census.
+///
+/// The M:N scheduler design removes the destroy/recreate reclaim path
+/// entirely, and the rule is that the win must be measured before the path is
+/// deleted rather than assumed. A cutoff sweep only bounds the reclaims the
+/// 250 ms cutoff currently SUPPRESSES (measured at ~+9% CPU); it cannot say
+/// what today's reclaims actually cost. These counters can.
+///
+/// Three relaxed atomics on a path that already destroys and recreates an HVF
+/// vCPU are not measurable overhead.
+pub(crate) static VCPU_RECLAIMS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static VCPU_RECLAIM_PARK_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static VCPU_RECLAIM_RESUME_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Accumulates resume time on every exit path, including the early return
+/// when there was no reclaim (which contributes zero and costs one branch).
+struct ResumeCensusGuard(std::time::Instant);
+
+impl Drop for ResumeCensusGuard {
+    fn drop(&mut self) {
+        VCPU_RECLAIM_RESUME_NS.fetch_add(
+            u64::try_from(self.0.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+/// Totals for this process: (reclaims, park ns, resume ns).
+pub(crate) fn vcpu_reclaim_census() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        VCPU_RECLAIMS.load(Relaxed),
+        VCPU_RECLAIM_PARK_NS.load(Relaxed),
+        VCPU_RECLAIM_RESUME_NS.load(Relaxed),
+    )
+}
+
 fn should_reclaim_vcpu_for_timed_wait(timeout: Option<Duration>) -> bool {
     match timeout {
         None => true,
@@ -1289,6 +1329,7 @@ where
         if !engine.reclaims() {
             return None;
         }
+        let park_started = std::time::Instant::now();
         // A one-thread Linux process does not necessarily own the VM: hvpatch
         // multiplexes several process registries in one persistent HVF VM.
         // Whole-VM park/rebuild is therefore legal only on the legacy
@@ -1340,6 +1381,14 @@ where
         }
         if engine.reclaim_refreshes_kicker() {
             self.kicker.unregister(self.this_tid);
+        }
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            VCPU_RECLAIMS.fetch_add(1, Relaxed);
+            VCPU_RECLAIM_PARK_NS.fetch_add(
+                u64::try_from(park_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                Relaxed,
+            );
         }
         Some(BlockingWaitReclaim {
             state,
@@ -1496,6 +1545,11 @@ where
         engine: &mut E,
         reclaim: Option<BlockingWaitReclaim>,
     ) -> Result<(), RuntimeError> {
+        // Timed from entry so the census captures the whole resume, including
+        // any wait for a free slot — which is exactly the cost the executor
+        // model removes, since an executor never gives its vCPU up.
+        let resume_started = std::time::Instant::now();
+        let _resume_census = ResumeCensusGuard(resume_started);
         let Some(reclaim) = reclaim else {
             return Ok(());
         };
