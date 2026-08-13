@@ -248,7 +248,23 @@ Ordered by measured leverage. Each phase publishes a durable evidence
 document at its boundary (see the protocol at the end) and each gate is
 stated so it can fail.
 
-### KF — kernel page lifecycle  ·  *next, and the only phase sized like the goal*
+### KF — kernel page lifecycle  ·  *first step landed and retained; residue remains*
+
+> **Status 2026-08-13:** step C landed at `3d45b1a98`. The arena watermark is
+> raised by **writability** rather than by allocation, at all three points where
+> a range can become guest-writable. Measured, five samples per arm, untraced:
+> **−6.9% CPU, −12.2% system, −5.7% window, non-overlapping distributions.**
+> Faults: in-window `zfod` **148,758 → 2,858** (−98.1%), whole-build `zfod`
+> **230,298 → 86,721** (−62.3%).
+> `just ci` green (3,886 tests); probe-gate failure set byte-identical to
+> baseline; every memory-invariant probe passes
+> ([evidence](docs/perf-results/2026-08-13-hvpatch-kf-scrub-ceiling.md)).
+>
+> Both standing predictions held: faults DID partly move to the guest's own
+> first touch (in-window −98% but whole-build −62%), and most of them genuinely
+> disappeared, landing in the band the oracle predicted. **Mechanisms A and B
+> below are still available for the residue** — re-census first, because the 66
+> large mappings are no longer the population they were.
 
 **Remit:** stop Carrick touching pages it does not need to touch. One cold
 build takes 279,987 `as_fault` and 230,298 `zfod`; 150,749 of those land inside
