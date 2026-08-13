@@ -54,7 +54,7 @@
 //! the same zero-fill guarantee the dispatcher's mmap bump arena depends on (a
 //! `mmap`'d anon page MUST read as zero); the guest-visible failure mode when it
 //! is violated is stale-page reuse (a `0x78`-fill SEGV that only shows up under
-//! accumulation — see the `mmap_dirty_high` watermark in the runtime).
+//! accumulation — see the `mmap_writable_high` watermark in the runtime).
 //!
 //! ## Crate boundary
 //!
