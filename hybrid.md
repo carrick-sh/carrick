@@ -263,18 +263,33 @@ sections below carry the reasoning.
 | **KS** scheduler | **designed, not built** | M:N executor design decided | step 1 is the same register file KD needs — build it once |
 | **KM** kernel memory | **not started** | — | no guest-visible COW exists; child stage-1 leaves are built read-write |
 | **KX** kernel exec | **not started** | — | exec still unmaps/remaps 32 GiB per call |
-| **KP** shipped proof | **started** | first-ever kernel-lane probe gate: **304 PASS / 90 FAIL**, with 26 failures kernel-lane-specific | bless `baseline.hvpatch.jsonl`; take the signal cluster (10 of the 26) |
+| **KP** shipped proof | **started** | first-ever kernel-lane probe gate: **304 PASS / 90 FAIL**, 26 kernel-lane-specific; root cause of the largest cluster found | **seed the kernel id space at 1, not the host pid** — upstream of 3 clusters |
 
 **Measured position:** cold `go build` **3.803 CPU-s**, window **1,828 ms**
 (from 4.223 / 2,051 at the K1 boundary). The bar is **2.3 CPU-s**, so roughly
 **1.5 CPU-s remain**. Nothing here is finished; KM and KX are untouched
 architecture, and KP has no baseline.
 
-**The one thing to build next is the per-thread register file.** It is step 1
-of KD (a core with wrong registers is worse than none) and step 2 of KS ("make
-the `Thread` register file the authority"). Two phases converge on it, and
-neither can proceed without it — so it should be built once, deliberately,
-rather than twice in parallel.
+**Two things are next, and both are single, well-located changes.**
+
+1. **Seed the kernel's task-id space at 1, not at the host pid.**
+   `IdRegistry::with_root` starts allocating at `root + 1`, and the root is
+   `TaskId::for_root_bootstrap(std::process::id())` — the HOST process
+   (`dispatch/mod.rs:2475`, `kernel/core.rs:222`, `kernel/registry.rs:31`). So
+   guest processes get 55233, 55234, 55235 where Linux gives 1, 2, 3. It is the
+   fourth instance of the host-identity substitution and the point where
+   identity is CREATED, so it is upstream of the other three — and of the
+   largest failing probe cluster, of `/proc/self` answering 1 for every
+   process, and of `kill(getpid())` returning ESRCH. Wide blast radius (pidfds,
+   process groups, sessions, `/proc`, `wait4`, every signal target), so it
+   needs its own pass and its own kernel-lane gate run.
+2. **The per-thread register file** — step 1 of KD (a core with wrong
+   registers is worse than none) and step 2 of KS. Two phases converge on it.
+   Note the KD spec calls this "the one genuinely missing input" and that is no
+   longer true: `Aarch64VcpuSnapshot` already carries GPRs, PC, PSTATE, SP_EL0,
+   TPIDR_EL0, V0–V31 and FPSR/FPCR, and the fork path proves it correct. What
+   is missing is that nothing BUILDS a `CoreDump` from live state — the writer
+   has no callers outside its own module.
 
 ---
 
