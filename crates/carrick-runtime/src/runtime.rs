@@ -1281,7 +1281,9 @@ where
                         );
                         // CLONE_PIDFD: hand the parent a pidfd for the new child.
                         if let Some(addr) = pidfd_out {
-                            let fd = dispatcher.install_child_pidfd(child_pid).unwrap_or(-1);
+                            let fd = dispatcher
+                                .install_child_pidfd(&kernel_context, child_pid)
+                                .unwrap_or(-1);
                             let _ = runtime.write_bytes(addr, &fd.to_le_bytes());
                         }
                         // PID namespace: the child's ns-pid was allocated and

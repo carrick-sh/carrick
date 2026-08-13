@@ -671,7 +671,7 @@ where
                     if let Some(addr) = pidfd_out {
                         let fd = kernel
                             .dispatcher
-                            .install_child_pidfd(child_pid)
+                            .install_child_pidfd(kernel_context, child_pid)
                             .unwrap_or(-1);
                         let _ = engine.write_bytes(addr, &fd.to_le_bytes());
                     }

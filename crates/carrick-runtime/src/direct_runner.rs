@@ -3125,7 +3125,10 @@ impl DirectRunner {
         crate::run_state::publish_child_booting(child as u32);
         let mut memory = self.memory;
         if let Some(addr) = request.pidfd_out {
-            let fd = self.dispatcher.install_child_pidfd(child).unwrap_or(-1);
+            let fd = self
+                .dispatcher
+                .install_child_pidfd(parent_context, child)
+                .unwrap_or(-1);
             let _ = memory.write_bytes_raw(addr, &fd.to_le_bytes());
         }
         let guest_child_pid = child_ns_pid.unwrap_or(child as u32) as i32;

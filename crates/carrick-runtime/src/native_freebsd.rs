@@ -12715,7 +12715,7 @@ fn service_fork(
             unsafe { libc::close(read_fd) };
         }
         let installed_pidfd = if request.pidfd_out.is_some() {
-            match dispatcher.install_child_pidfd(pid) {
+            match dispatcher.install_child_pidfd(parent_context, pid) {
                 Ok(fd) => Some(fd),
                 Err(errno) => {
                     // The child is still behind the private gate. Remove it and

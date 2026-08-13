@@ -1155,8 +1155,22 @@ impl SyscallDispatcher {
     /// runtime's `CLONE_PIDFD` parent setup before releasing the child. Preserve
     /// the allocation/watch errno so clone can fail atomically rather than
     /// returning a child with an invalid pidfd output.
-    pub fn install_child_pidfd(&self, child_pid: i32) -> Result<i32, crate::linux_abi::LinuxErrno> {
-        match self.open_pidfd(child_pid, 0) {
+    /// Install a CLONE_PIDFD descriptor for a freshly forked host child.
+    ///
+    /// The pidfd lands in the FORKING PARENT's table, so the caller passes the
+    /// exact parent `KernelContext` it already captured and this establishes
+    /// the resource scope. Several fork paths (the VMM quiesce path among
+    /// them) run on the vCPU loop OUTSIDE any dispatch boundary, where the fd
+    /// helpers' ambient `captured_file_table()` has nothing installed and
+    /// aborts rather than guess a table. Re-establishing a scope that is
+    /// already active is free — `with_captured_resources` short-circuits on
+    /// pointer identity.
+    pub fn install_child_pidfd(
+        &self,
+        context: &crate::kernel::KernelContext,
+        child_pid: i32,
+    ) -> Result<i32, crate::linux_abi::LinuxErrno> {
+        match super::resources::with_captured_resources(context, || self.open_pidfd(child_pid, 0)) {
             DispatchOutcome::Returned { value } => {
                 i32::try_from(value).map_err(|_| crate::linux_abi::LINUX_EMFILE)
             }
