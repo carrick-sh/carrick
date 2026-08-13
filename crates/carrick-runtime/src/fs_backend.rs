@@ -4069,6 +4069,29 @@ impl std::ops::Deref for DirAt<'_> {
 }
 
 impl FsBackend for HostFsBackend {
+    /// Answer "is this path whiteed out" without resolving the path when the
+    /// sandbox holds NO whiteouts at all.
+    ///
+    /// The trait default goes straight to `lookup_kind`, which resolves the
+    /// whole path through cap-std's component-by-component walk. On a cold
+    /// `go build` that cost 3,472 host `openat`s — a deletion check walking
+    /// every path that the caller is about to walk again to do the real work,
+    /// on a rootfs where nothing had been deleted.
+    ///
+    /// `may_have_whiteouts` is the existing durable answer to the prior
+    /// question: it reads the root's whiteout xattr, caches the negative
+    /// against the resolve-cache generation so a deletion elsewhere
+    /// invalidates it, and FAILS CLOSED (`RootMarker::Unknown` → `true`) on a
+    /// filesystem that cannot carry the marker. So a `false` here means no
+    /// whiteout exists to find, and skipping the walk cannot change the
+    /// answer — this removes work, it does not weaken the check.
+    fn is_deleted(&self, path: &str) -> bool {
+        if !self.may_have_whiteouts() {
+            return false;
+        }
+        matches!(self.lookup_kind(path), Some(OverlayEntryKind::Deleted))
+    }
+
     fn native_reexec_authority(&self) -> Result<HostFsReexecAuthority, BackendError> {
         #[cfg(target_os = "macos")]
         {
