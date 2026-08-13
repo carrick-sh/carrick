@@ -5,8 +5,21 @@
  * Provider ABI qualified from carrick-observability on macOS 26.0.1 arm64:
  * carrick*:::hvpatch-guest-lifecycle carries
  * (uint32_t phase, int32_t pid, int32_t ppid, int32_t tid, uint32_t asid),
- * where phase 0=root, 1=fork, 2=exec, and 5=process-exit. The companion
- * hvpatch-guest-exit carries (pid, tid, asid, status). carrick*:::vm-lifecycle
+ * where phase 0=root, 1=fork, 2=exec, and 5=process-exit.
+ *
+ * carrick*:::hvpatch-guest-lifecycle-identity carries
+ * (int32_t pid, uint64_t task_serial, uint64_t parent_serial, uint64_t mm) and
+ * fires IMMEDIATELY BEFORE its lifecycle record on the same thread. It exists
+ * because a Linux TGID and an ASID are both recycled within a run, so
+ * (pid, asid) cannot distinguish two task generations that share a number;
+ * TaskSerial is never reused by one Kernel. The pair is split across two
+ * probes because the lifecycle probe is already at macOS's five-reliable-
+ * argument limit. This script stashes the identity in thread-locals and joins
+ * it into the birth and exec aggregations, so a consumer never has to guess
+ * which generation a pid referred to.
+ *
+ * The companion hvpatch-guest-exit carries (pid, tid, asid, status).
+ * carrick*:::vm-lifecycle
  * carries (operation, admission), where operations 0/1/2/3 are create-attempt,
  * create-success, destroy-attempt, and destroy-success.
  *
@@ -20,7 +33,8 @@
 
 #pragma D option quiet
 
-/* HVPATCHK1 protocol version 1. Append fields only by defining version 2. */
+/* HVPATCHK1 protocol version 2: birth/exec rows carry task/parent
+ * serials and the mm id. Append fields only by defining version 3. */
 dtrace:::BEGIN
 {
     started = timestamp;
@@ -35,7 +49,15 @@ dtrace:::BEGIN
     target_exit_seen = 0;
     target_exit_code = -1;
     target_exit_reason = 0;
-    printf("HVPATCHK1|header|version=1\n");
+    printf("HVPATCHK1|header|version=2\n");
+}
+
+carrick*:::hvpatch-guest-lifecycle-identity
+/pid == $target || progenyof($target)/
+{
+    self->task_serial = (uint64_t)arg1;
+    self->parent_serial = (uint64_t)arg2;
+    self->mm = (uint64_t)arg3;
 }
 
 carrick*:::hvpatch-guest-lifecycle
@@ -44,7 +66,8 @@ carrick*:::hvpatch-guest-lifecycle
     roots++;
     births++;
     live++;
-    @birth[0, (int)arg1, (int)arg2, (int)arg3, (uint32_t)arg4] = count();
+    @birth[0, (int)arg1, (int)arg2, (int)arg3, (uint32_t)arg4,
+        self->task_serial, self->parent_serial, self->mm] = count();
 }
 
 carrick*:::hvpatch-guest-lifecycle
@@ -53,14 +76,15 @@ carrick*:::hvpatch-guest-lifecycle
     forks++;
     births++;
     live++;
-    @birth[1, (int)arg1, (int)arg2, (int)arg3, (uint32_t)arg4] = count();
+    @birth[1, (int)arg1, (int)arg2, (int)arg3, (uint32_t)arg4,
+        self->task_serial, self->parent_serial, self->mm] = count();
 }
 
 carrick*:::hvpatch-guest-lifecycle
 /(pid == $target || progenyof($target)) && arg0 == 2/
 {
     execs++;
-    @exec[(int)arg1, (int)arg3, (uint32_t)arg4] = count();
+    @exec[(int)arg1, (int)arg3, (uint32_t)arg4, self->task_serial, self->mm] = count();
 }
 
 carrick*:::hvpatch-guest-lifecycle
@@ -115,11 +139,11 @@ profile:::tick-1sec
 
 dtrace:::END
 {
-    printa("HVPATCHK1|birth|kind=%d|pid=%d|ppid=%d|tid=%d|asid=%u|count=%@d\n", @birth);
-    printa("HVPATCHK1|exec|pid=%d|tid=%d|asid=%u|count=%@d\n", @exec);
+    printa("HVPATCHK1|birth|kind=%d|pid=%d|ppid=%d|tid=%d|asid=%u|task_serial=%u|parent_serial=%u|mm=%u|count=%@d\n", @birth);
+    printa("HVPATCHK1|exec|pid=%d|tid=%d|asid=%u|task_serial=%u|mm=%u|count=%@d\n", @exec);
     printa("HVPATCHK1|terminal|pid=%d|tid=%d|asid=%u|status=%d|count=%@d\n", @terminal);
     printa("HVPATCHK1|vm|operation=%u|admission=%d|count=%@d\n", @vm);
-    printf("HVPATCHK1|end|version=1|roots=%d|forks=%d|execs=%d|exits=%d|births=%d|live=%d|bounded=%d|errors=%d|target_exit_seen=%d|target_exit_code=%d|target_exit_reason=%d\n",
+    printf("HVPATCHK1|end|version=2|roots=%d|forks=%d|execs=%d|exits=%d|births=%d|live=%d|bounded=%d|errors=%d|target_exit_seen=%d|target_exit_code=%d|target_exit_reason=%d\n",
         roots, forks, execs, exits, births, live, bounded, errors,
         target_exit_seen, target_exit_code, target_exit_reason);
 }

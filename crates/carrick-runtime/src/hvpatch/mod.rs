@@ -170,7 +170,7 @@ impl ProcessContext {
     pub(crate) fn syscall_trace_identity(&self) -> Option<(i32, u32)> {
         let identity = self.kernel_graph().task_identity(self.task_id()).ok()?;
         let binding = self.mm_binding()?;
-        Some((identity.task_id.raw(), u32::from(binding.asid.raw())))
+        Some((identity.task.id.raw(), u32::from(binding.asid.raw())))
     }
 
     pub(crate) fn register_pidfd_watch(
@@ -216,10 +216,13 @@ impl ProcessContext {
         };
         match carrick_observability::probes::HvpatchGuestLifecycle::new(
             phase,
-            identity.task_id.raw(),
-            identity.parent.map_or(0, crate::kernel::TaskId::raw),
+            identity.task.id.raw(),
+            identity.parent.map_or(0, |parent| parent.id.raw()),
             tid.raw(),
             u32::from(binding.asid.raw()),
+            identity.task.serial.raw(),
+            identity.parent.map_or(0, |parent| parent.serial.raw()),
+            identity.mm.raw(),
             detail,
         ) {
             Ok(event) => Some((event, binding)),

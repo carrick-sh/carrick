@@ -250,6 +250,18 @@ pub struct HvpatchGuestLifecycle {
     ppid: i32,
     tid: i32,
     asid: u32,
+    /// `TaskSerial` of this exact task generation. Never reused by one Kernel.
+    ///
+    /// `pid` and `asid` are both recycled within a run, so the pair cannot
+    /// distinguish two generations that share a number. K1's observability
+    /// contract requires unambiguous identity, so every lifecycle record
+    /// carries the serial that disambiguates it.
+    task_serial: u64,
+    /// `TaskSerial` of the parent generation, or zero for a root with no
+    /// parent. Zero is unambiguous: serials start at one.
+    parent_serial: u64,
+    /// `MmId` of the address space this task was using at the event.
+    mm: u64,
     detail: i64,
 }
 
@@ -261,6 +273,10 @@ pub enum HvpatchGuestLifecycleError {
     InvalidParentIdentity,
     #[error("hvpatch guest ASID must be nonzero")]
     InvalidAsid,
+    #[error(
+        "hvpatch guest lifecycle identity is ambiguous: task serial, mm, and parent presence must all be exact"
+    )]
+    AmbiguousIdentity,
     #[error("hvpatch guest process bank must be nonempty")]
     InvalidBank,
     #[error("hvpatch TTBR0 does not encode the event ASID and bank root")]
@@ -268,12 +284,16 @@ pub enum HvpatchGuestLifecycleError {
 }
 
 impl HvpatchGuestLifecycle {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         phase: HvpatchGuestLifecyclePhase,
         pid: i32,
         ppid: i32,
         tid: i32,
         asid: u32,
+        task_serial: u64,
+        parent_serial: u64,
+        mm: u64,
         detail: i64,
     ) -> Result<Self, HvpatchGuestLifecycleError> {
         if pid <= 0 || tid <= 0 {
@@ -285,12 +305,24 @@ impl HvpatchGuestLifecycle {
         if asid == 0 {
             return Err(HvpatchGuestLifecycleError::InvalidAsid);
         }
+        // An identity-bearing record with no serial is worse than no record:
+        // a consumer would silently join two generations that share a pid.
+        if task_serial == 0 || mm == 0 {
+            return Err(HvpatchGuestLifecycleError::AmbiguousIdentity);
+        }
+        // A parent pid and a parent serial must agree about existing.
+        if (ppid == 0) != (parent_serial == 0) {
+            return Err(HvpatchGuestLifecycleError::AmbiguousIdentity);
+        }
         Ok(Self {
             phase,
             pid,
             ppid,
             tid,
             asid,
+            task_serial,
+            parent_serial,
+            mm,
             detail,
         })
     }
@@ -313,6 +345,18 @@ impl HvpatchGuestLifecycle {
 
     pub const fn asid(self) -> u32 {
         self.asid
+    }
+
+    pub const fn task_serial(self) -> u64 {
+        self.task_serial
+    }
+
+    pub const fn parent_serial(self) -> u64 {
+        self.parent_serial
+    }
+
+    pub const fn mm(self) -> u64 {
+        self.mm
     }
 
     pub const fn detail(self) -> i64 {
@@ -1279,15 +1323,108 @@ mod hvpatch_guest_probe_abi {
 
     #[test]
     fn lifecycle_event_keeps_guest_identity_and_phase_typed() {
-        let event =
-            HvpatchGuestLifecycle::new(HvpatchGuestLifecyclePhase::Fork, 123, 100, 123, 7, 0)
-                .expect("valid guest lifecycle event");
+        let event = HvpatchGuestLifecycle::new(
+            HvpatchGuestLifecyclePhase::Fork,
+            123,
+            100,
+            123,
+            7,
+            42,
+            41,
+            9,
+            0,
+        )
+        .expect("valid guest lifecycle event");
         assert_eq!(event.phase(), HvpatchGuestLifecyclePhase::Fork);
         assert_eq!(event.pid(), 123);
         assert_eq!(event.ppid(), 100);
         assert_eq!(event.tid(), 123);
         assert_eq!(event.asid(), 7);
+        assert_eq!(event.task_serial(), 42);
+        assert_eq!(event.parent_serial(), 41);
+        assert_eq!(event.mm(), 9);
         assert_eq!(event.detail(), 0);
+    }
+
+    /// A lifecycle record without a serial or an mm would let a consumer join
+    /// two generations that share a recycled pid. Refuse it at construction.
+    #[test]
+    fn lifecycle_event_rejects_ambiguous_identity() {
+        // No task serial.
+        assert!(
+            HvpatchGuestLifecycle::new(
+                HvpatchGuestLifecyclePhase::Fork,
+                123,
+                100,
+                123,
+                7,
+                0,
+                41,
+                9,
+                0,
+            )
+            .is_err()
+        );
+        // No mm.
+        assert!(
+            HvpatchGuestLifecycle::new(
+                HvpatchGuestLifecyclePhase::Fork,
+                123,
+                100,
+                123,
+                7,
+                42,
+                41,
+                0,
+                0,
+            )
+            .is_err()
+        );
+        // A parent pid with no parent serial, and the reverse: the two must
+        // agree about whether a parent exists.
+        assert!(
+            HvpatchGuestLifecycle::new(
+                HvpatchGuestLifecyclePhase::Fork,
+                123,
+                100,
+                123,
+                7,
+                42,
+                0,
+                9,
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            HvpatchGuestLifecycle::new(
+                HvpatchGuestLifecyclePhase::Root,
+                123,
+                0,
+                123,
+                7,
+                42,
+                41,
+                9,
+                0,
+            )
+            .is_err()
+        );
+        // A root with neither is exact.
+        assert!(
+            HvpatchGuestLifecycle::new(
+                HvpatchGuestLifecyclePhase::Root,
+                123,
+                0,
+                123,
+                7,
+                42,
+                0,
+                9,
+                0,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1304,14 +1441,26 @@ mod hvpatch_guest_probe_abi {
     #[test]
     fn lifecycle_event_rejects_non_linux_identity_values() {
         assert!(
-            HvpatchGuestLifecycle::new(HvpatchGuestLifecyclePhase::Root, 0, 0, 1, 1, 0,).is_err()
-        );
-        assert!(
-            HvpatchGuestLifecycle::new(HvpatchGuestLifecyclePhase::ThreadStart, 1, 0, 0, 1, 0,)
+            HvpatchGuestLifecycle::new(HvpatchGuestLifecyclePhase::Root, 0, 0, 1, 1, 1, 0, 1, 0,)
                 .is_err()
         );
         assert!(
-            HvpatchGuestLifecycle::new(HvpatchGuestLifecyclePhase::Exec, 1, 0, 1, 0, 0,).is_err()
+            HvpatchGuestLifecycle::new(
+                HvpatchGuestLifecyclePhase::ThreadStart,
+                1,
+                0,
+                0,
+                1,
+                1,
+                0,
+                1,
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            HvpatchGuestLifecycle::new(HvpatchGuestLifecyclePhase::Exec, 1, 0, 1, 0, 1, 0, 1, 0,)
+                .is_err()
         );
     }
 
@@ -1320,6 +1469,7 @@ mod hvpatch_guest_probe_abi {
         let source = include_str!("probes.rs");
         for declaration in [
             "fn hvpatch__guest__lifecycle(_: u32, _: i32, _: i32, _: i32, _: u32) {}",
+            "fn hvpatch__guest__lifecycle__identity(_: i32, _: u64, _: u64, _: u64) {}",
             "fn hvpatch__guest__exit(_: i32, _: i32, _: u32, _: i64) {}",
             "stub!(hvpatch_guest_lifecycle(event: super::HvpatchGuestLifecycle));",
             "fn hvpatch__guest__fault(_: u64, _: u64, _: u64, _: i32, _: i32) {}",
@@ -3536,6 +3686,15 @@ mod real {
         /// Darwin host PIDs. Args: phase, pid, ppid, tid, ASID. The process-exit
         /// detail is a companion probe because macOS zeros a sixth USDT arg.
         fn hvpatch__guest__lifecycle(_: u32, _: i32, _: i32, _: i32, _: u32) {}
+        /// Companion unambiguous identity for `hvpatch__guest__lifecycle`:
+        /// guest PID, this generation's `TaskSerial`, the parent generation's
+        /// `TaskSerial` (0 when there is no parent), and the `MmId`.
+        ///
+        /// Split into its own probe because a Linux TGID and an ASID are both
+        /// recycled within a run, so `(pid, asid)` cannot tell two generations
+        /// apart, and the lifecycle probe is already at macOS's five-reliable-
+        /// argument limit. Consumers join the two on PID within one firing.
+        fn hvpatch__guest__lifecycle__identity(_: i32, _: u64, _: u64, _: u64) {}
         /// Terminal process detail. Args: guest PID, guest TID, ASID, exit code.
         fn hvpatch__guest__exit(_: i32, _: i32, _: u32, _: i64) {}
         /// AArch64 guest fault with Linux process/thread identity and stage-1
@@ -4411,6 +4570,14 @@ mod real {
 
     #[inline(never)]
     pub fn hvpatch_guest_lifecycle(event: super::HvpatchGuestLifecycle) {
+        // Identity first: a consumer that sees the lifecycle record is then
+        // guaranteed to have already seen the serials that disambiguate it.
+        carrick_usdt::hvpatch__guest__lifecycle__identity!(|| (
+            event.pid(),
+            event.task_serial(),
+            event.parent_serial(),
+            event.mm()
+        ));
         carrick_usdt::hvpatch__guest__lifecycle!(|| (
             event.phase().raw(),
             event.pid(),
