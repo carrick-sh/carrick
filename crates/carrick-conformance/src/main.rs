@@ -58,6 +58,7 @@ struct Args {
     tier: String,
     /// Execution lane: `hvf` (local signed binary, default), `kvm` (carrick in
     /// the lima guest), `kvm-local` (direct platform-linux carrick on this host),
+    /// `hvpatch` (local Darwin KERNEL lane — one host process, one HVF VM),
     /// `macos-native-dsr` (local Darwin-native native16k DSR),
     /// `bhyve-local` (direct platform-freebsd carrick on this host), or
     /// `nvmm-local` (direct platform-netbsd carrick on this host).
@@ -1738,6 +1739,11 @@ fn load_baseline(path: &Path) -> Baseline {
 fn lane_overlay_key(lane: &str) -> Option<&'static str> {
     match lane {
         "macos-native-dsr" | "native-dsr" => Some("native-dsr"),
+        // The kernel lane carries its OWN overlay: it is a different backend
+        // from `native-dsr` with a different failure set (measured: 90 probe
+        // failures against native's 124, of which only 64 are shared), so one
+        // lane's bless must never excuse the other's regressions.
+        "hvpatch" | "macos-hvpatch" => Some("hvpatch"),
         "kvm-local" | "linux-kvm" => Some("kvm"),
         "kvm" => Some("kvm-arm64"),
         "bhyve-local" | "freebsd-bhyve" => Some("bhyve"),

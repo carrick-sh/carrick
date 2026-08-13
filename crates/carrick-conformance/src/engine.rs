@@ -406,7 +406,11 @@ enum CarrickCleanup {
 impl CarrickCleanup {
     fn from_lane(lane: &crate::lane::Lane) -> Self {
         match lane {
-            crate::lane::Lane::Hvf | crate::lane::Lane::MacosNativeDsr(_) => CarrickCleanup::Hvf,
+            // The kernel lane is the same local signed binary under HVF, so it
+            // is reaped exactly like the other two Darwin lanes.
+            crate::lane::Lane::Hvf
+            | crate::lane::Lane::MacosNativeDsr(_)
+            | crate::lane::Lane::Hvpatch(_) => CarrickCleanup::Hvf,
             crate::lane::Lane::Kvm(cfg) => CarrickCleanup::KvmLima(cfg.clone()),
             crate::lane::Lane::KvmLocal(_) => CarrickCleanup::KvmLocal,
             crate::lane::Lane::BhyveLocal(_) => CarrickCleanup::BhyveLocal,
