@@ -53,6 +53,37 @@ measures 4.410 CPU-s. Those are not meaningfully different, and nothing in
 K1 targeted CPU — K1 was correctness and observability. Do not read the
 K1 work as a performance regression or improvement; it is neither.
 
+## User/system split — where K2 should aim
+
+The same three runs, decomposed:
+
+| | mean | share of CPU |
+| --- | ---: | ---: |
+| user | 2.387 s | 54.1% |
+| sys | 2.023 s | **45.9%** |
+| real | 2.830 s | — |
+| CPU / wall | 1.56 | — |
+
+Per run: 2.33/1.73, 2.44/2.16, 2.39/2.18 (user/sys).
+
+**Nearly half of carrick's CPU is host KERNEL time.** That is the bucket K2's
+memory-model replacement is positioned to attack directly — stage-2 mapping
+calls, page faults, and any per-fork work proportional to virtual span all
+land in `sys`. It is also the tree's standing framing: the cost of lowering a
+Linux operation onto Darwin primitives shows up on both sides of the syscall
+boundary, and should be ranked by the amplification factor of a single guest
+operation rather than by a CPU percentage.
+
+The low CPU/wall ratio of 1.56 is worth noting separately: on a 10-core host
+running a build that Go parallelises, carrick is not achieving much
+concurrency. Whether that is the guest's own serialisation, the ten-slot vCPU
+pool, or lock contention is unmeasured and is a K5 scheduler question, not
+K2's — but it bounds how much wall-clock any CPU reduction can buy.
+
+This split is untraced (`/usr/bin/time` on the CLI process tree). Attributing
+the `sys` half to specific host calls needs the amplification-ledger
+instrumentation this tree already has, and that is K2's opening measurement.
+
 ## What this is not
 
 - Not a claim about CPython, Node.js or Rust workloads — unmeasured.
