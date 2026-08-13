@@ -20,7 +20,9 @@ pub const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// Both sides use the same two-second budget.
 pub const DEADLINE: Duration = Duration::from_secs(2);
 
-const LENGTH_PREFIX_BYTES: usize = 4;
+/// Frame length prefix, sized from the type actually encoded rather than
+/// written down, so the reader and writer cannot drift apart.
+const LENGTH_PREFIX_BYTES: usize = size_of::<u32>();
 
 #[derive(Debug, thiserror::Error)]
 pub enum WireError {
