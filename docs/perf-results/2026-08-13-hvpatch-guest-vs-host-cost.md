@@ -63,6 +63,36 @@ guest that uses `times(2)` or `getrusage(RUSAGE_CHILDREN)` to attribute work —
 It is not a K2 item; it belongs with the syscall-correctness work, and it
 needs its own differential probe against the Docker oracle.
 
+### Root cause of Finding 2 — it is structural, not a units bug
+
+`times(2)` sources `tms_utime`/`tms_stime` from
+`crate::host_proc::self_resource_usage()` (`dispatch/time.rs:726-728`), which
+on macOS is `proc_pid_rusage` — **the whole HOST process's CPU**.
+
+Under HVPatch that is exactly wrong by construction. All 69 Linux processes
+are threads inside ONE host process, so `proc_pid_rusage` returns the summed
+CPU of every guest process, and each guest reads that total as its own
+`RUSAGE_SELF`. Both symptoms follow directly:
+
+- the ~40% over-report is the shell being charged for work done by the Go
+  compiler processes it forked, plus every unrelated sibling;
+- the self-versus-children mis-attribution is not an attribution choice at
+  all — the children's CPU is *inside* the same host process, so it lands in
+  SELF before any accounting decision is made.
+
+This is the accounting analogue of the bug class this whole backend exists to
+solve: an identity that the host process boundary used to provide for free,
+which the one-VM design must now supply itself. The Kernel object model
+already has the right home for it — `TaskRusage { user_time, system_time }`
+in `kernel/objects.rs`, already carried on `Zombie` records for `wait4` — so
+the fix is to source guest `times`/`getrusage` from per-task Kernel
+accounting rather than from the host process, and to keep it maintained for
+LIVE tasks rather than only at exit.
+
+That is a genuine K3 item (task lifecycle owns per-task rusage), not K2, and
+it needs a differential probe: run `times` in a shell that forks a known
+amount of work and compare the self/children split against the Docker oracle.
+
 ## What to do next
 
 1. Fix the `times`/`getrusage` self-versus-children attribution. It is a
