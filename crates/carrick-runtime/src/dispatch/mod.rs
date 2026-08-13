@@ -8025,8 +8025,14 @@ fn read_host_pipe_into(
     let n_usize = n as usize;
     #[cfg(feature = "trace-io")]
     if n_usize > 0 {
+        // Offset the read STARTED at. Without it a buffer beginning with an
+        // `ar` member header is ambiguous: normal at a nonzero offset, corrupt
+        // at 0. The read has already advanced the description, so subtract.
+        let start = fs::host_fd_offset(HostFd(host_fd))
+            .map(|end| end.saturating_sub(n_usize as u64))
+            .map_or_else(|| "?".to_owned(), |start| start.to_string());
         eprintln!(
-            "[IODBG] READ host_fd={host_fd} n={n_usize} bytes={:02x?}",
+            "[IODBG] READ host_fd={host_fd} off={start} n={n_usize} bytes={:02x?}",
             &buf[..n_usize.min(64)]
         );
     }
@@ -8138,8 +8144,13 @@ fn write_host_pipe_payload(
     #[cfg(feature = "trace-io")]
     if !payload.as_slice().is_empty() {
         let bytes = payload.as_slice();
+        // Offset the write will START at, captured before it advances the
+        // description. A buffer beginning with an `ar` member header is normal
+        // at a nonzero offset and corrupt at 0.
+        let start = fs::host_fd_offset(HostFd(host_fd))
+            .map_or_else(|| "?".to_owned(), |start| start.to_string());
         eprintln!(
-            "[IODBG] WRITE host_fd={host_fd} n={} bytes={:02x?}",
+            "[IODBG] WRITE host_fd={host_fd} off={start} n={} bytes={:02x?}",
             bytes.len(),
             &bytes[..bytes.len().min(64)]
         );
