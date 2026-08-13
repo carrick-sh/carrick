@@ -34,19 +34,56 @@ build succeeding (`BUILD_OK`, CLI exit 0, zero DTrace errors):
 create-success, one destroy-attempt and one destroy-success per run, with
 70+ Linux processes multiplexed inside it. Guest workload window: 2.12 s.
 
-**Why K1 is still NO-GO.** The gate asks for the exact counts
-`68 forks / 67 execs / 69 processes`, and the current fixture measures
-70-71 / 69-70 / 71-72 — and varies run to run, with one capture leaving
-`live=1`. The strict reader therefore exits non-zero. Two things must be
-settled before GO, and neither may be done by quietly editing a constant:
+### The 68/67/69 receipt — OBTAINED
 
-1. whether the historical 68/67/69 is simply stale against today's Go
-   toolchain image and fixture, in which case the gate is re-baselined
-   explicitly and recorded, per the discipline rule that a phase gate is a
-   contract;
-2. why the process count is not deterministic run to run, and what the
-   `live=1` residue in capture 2 is. A lifecycle receipt that varies is not
-   a receipt.
+The constants were never stale. The earlier 70-71/69-70/71-72 readings came
+from **my own instrumentation**: the fixture variant used to measure
+`WORKLOAD_NS` wraps the build in two `$(date +%s%N)` subshells, and each is
+one fork plus one exec — exactly the +2 observed. Running the fixture
+without the timing wrapper reproduces the gate's counts exactly.
+
+Two consecutive captures, each with the strict Rust validator **passing**
+(`carrick trace --profile hvpatch-k1-lifecycle` exit 0):
+
+```
+HVPATCHK1|end|version=2|roots=1|forks=68|execs=67|exits=69|births=69
+              |live=0|bounded=0|errors=0|target_exit_seen=1|target_exit_code=0
+```
+
+with the guest printing `BUILD_OK` and the VM ledger showing exactly one of
+each operation:
+
+```
+HVPATCHK1|vm|operation=0|admission=0|count=1     create-attempt
+HVPATCHK1|vm|operation=1|admission=0|count=1     create-success
+HVPATCHK1|vm|operation=2|admission=-1|count=1    destroy-attempt
+HVPATCHK1|vm|operation=3|admission=-1|count=1    destroy-success
+```
+
+**68 forks, 67 execs, 69 unique births, zero live residue, zero DTrace
+errors, one VM, guest exit 0.**
+
+| Field | Value |
+| --- | --- |
+| Commit | `ee57579c3ffef7c2ffcbef5254163172aa1af0d6` |
+| Signed binary SHA-256 | `d2809cd941fd874e535ef9591ff982fbcacab522d3fbb2d23d7ef59ed3d81094` |
+| Signed binary LC_UUID | `A58FE351-1579-3111-9663-B90AEF299D74` |
+| Capture 1 SHA-256 | `957a59ba241efa38e2785c225ab0a5e8f3c64adf8be8972642f2faae55eb5fe1` (17,522 B) |
+| Capture 2 SHA-256 | `e1b6ed8a72ca37e2c95d596ef16f2d56f99121cd6347ff422654ab918df395a7` (17,522 B) |
+| Fixture | `scripts/perf/native_go_build.py` `guest_script()` **without** the `WORKLOAD_NS` timing wrapper |
+| Retained artifact | `docs/perf-results/2026-08-13-hvpatch-k1-lifecycle-68-67-69.raw` |
+
+**Why K1 is nevertheless still NO-GO: reliability.** The receipt is
+obtainable but not dependable — a third capture in the same batch aborted at
+`sibling materialization start gate timed out` (exit 134) after 38 forks,
+and the earlier broader sample put success near two runs in three. A gate
+that passes two runs in three is not a gate. The remaining K1 work is
+therefore the start-gate abort, already characterised as a candidate
+**time assumption**: a 10-second wall-clock deadline in
+`vcpu_loop/threads.rs` that calls `std::process::abort()`, observed firing
+with `process_exiting=false` and `clone_cancelled=false` on a loaded host.
+Classify it with a core before changing it — `sample`/`SIGQUIT` have
+mislabelled fork-quiesce deadlocks in this tree before.
 
 Everything below this section predates the fix and is retained for
 attribution.
