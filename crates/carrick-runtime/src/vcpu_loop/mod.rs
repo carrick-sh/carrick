@@ -1329,6 +1329,25 @@ where
         if !engine.reclaims() {
             return None;
         }
+        // KEEP the vCPU when the pool is uncontended.
+        //
+        // `has_waiters`/`has_spare_capacity` were written for exactly this and
+        // then never called from anywhere in the workspace, so every blocking
+        // wait paid a full HVF destroy/recreate even with the pool almost
+        // entirely free. Wiring them makes the common case the no-reclaim path,
+        // which an ABBA measured as CPU-neutral and 13x more consistent
+        // run-to-run (`2026-08-13-hvpatch-noreclaim-abba.md`), while keeping
+        // reclaim as the safety valve under real contention.
+        //
+        // Both conditions are needed and the asymmetry is deliberate. Keeping
+        // the vCPU requires a slot to be FREE, not merely that nobody is
+        // waiting yet: a thread parked at a barrier it can only leave once some
+        // future waiter runs would otherwise deadlock that waiter. And an
+        // existing waiter means release now, spare capacity or not.
+        let scheduler = carrick_hal::vcpu_sched::global();
+        if scheduler.has_spare_capacity() && !scheduler.has_waiters() {
+            return None;
+        }
         let park_started = std::time::Instant::now();
         // A one-thread Linux process does not necessarily own the VM: hvpatch
         // multiplexes several process registries in one persistent HVF VM.
