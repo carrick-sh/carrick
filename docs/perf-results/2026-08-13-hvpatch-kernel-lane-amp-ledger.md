@@ -110,17 +110,56 @@ straightforwardly available there either — the arena is `hv_vm_map`'d into
 stage-2, so replacing the host pages beneath a live IPA would leave the guest
 looking at the old physical pages.
 
-### What is NOT established
+### The mechanism, named
 
-**The mechanism behind the `mmap` faults is an open question, and this document
-does not guess at it.** The three `zero_backing` call sites in
-`dispatch/mem.rs` are `brk` shrink, `mremap` reuse and `MADV_DONTNEED` — and
-the census shows `brk`, `mremap` and `madvise` producing 29 `zfod` between
-them, so **the scrub is not the source.** Anonymous `mmap` allocates no eager
-buffer (`bytes = Vec::new()`), and the private-file lowering is already on. So
-something else in the mmap service path touches 76.7 fresh pages per call, and
-naming it requires the fault-attribution instrument
-(`scripts/dtrace/native-fault-attribution.d`) rather than more code reading.
+Not left open. A `vminfo:::zfod` aggregation screened on the `mmap` service
+window (`hvpatch-syscall-service-begin` arg3 == 222) and keyed on the faulting
+user PC, printed on a tick while the process was still alive — symbolication at
+`END` runs after the traced child has exited and yields raw addresses:
+
+| faulting symbol | in-window `zfod` |
+| --- | ---: |
+| **`libsystem_platform.dylib`__bzero`** | **145,966** |
+| `_platform_memset` | 301 |
+| `HvfVmState::write_guest_bytes` | 232 |
+| everything else | ~32 |
+| total | 146,531 |
+
+With `ustack(7)`, **145,429 of them have exactly one caller**:
+
+```text
+libsystem_platform.dylib`__bzero+0x40
+carrick`carrick_runtime::dispatch::mem::…::mmap+0xda0
+carrick`…::dispatch_threaded_captured
+```
+
+That is `let mut bytes = vec![0; length_usize];` (`dispatch/mem.rs:2792`) — the
+**eager snapshot buffer** carrick allocates for a file mapping it did not lower
+to a host file mapping, which is then filled by
+`bytes[..available.len()].copy_from_slice(&available)` or a `pread`.
+
+**The three `zero_backing` sites are NOT the source** — the census shows `brk`,
+`mremap` and `madvise` producing 29 `zfod` between them — and neither is the
+guest touching its own memory: this is inside carrick's own service window.
+
+### A consequence that changes the fix
+
+The buffer is zeroed and then immediately overwritten, so the obvious
+micro-fix is to stop double-writing. **That would not remove the faults.** The
+page is faulted on FIRST touch either way; skipping the `bzero` only means the
+`copy_from_slice` takes the fault instead. It halves memory traffic and leaves
+the 150,749 faults exactly where they are.
+
+The fault only disappears if the buffer is never materialized — i.e. if the
+mapping is lowered to a host file mapping and Darwin demand-pages it. That
+lowering already exists (`mmap_file_backed_lowering_enabled`, default on) and
+is refused here by its own guards, of which the load-bearing one is
+`!prot_flags.contains(PROT_EXEC)`: program text is exactly the large,
+frequently-mapped case, and it is excluded because "executable content must
+flow through the write path's W^X/translation-invalidation metadata"
+(`dispatch/mem.rs:2755`). Whether that reason still applies on the kernel lane
+— which patches static text rather than translating it — is KF's first design
+question, and it is a correctness question, not a performance one.
 
 Also not established: the 6.42 µs per-fault cost was measured on the native
 lane in a different context, so the ~1.8 CPU-s figure is an order-of-magnitude

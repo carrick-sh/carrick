@@ -257,25 +257,37 @@ build takes 279,987 `as_fault` and 230,298 `zfod`; 150,749 of those land inside
 per-fault cost that term is on the order of the whole ~1.97 CPU-s the goal must
 remove. Nothing else measured on this lane is that size.
 
-**First step is a measurement, not a change.** The mechanism is NOT yet named:
-the three `zero_backing` call sites account for 29 of those faults between
-them, anonymous `mmap` allocates no eager buffer, and the private-file lowering
-is already on — so something else in the mmap service path is touching 2.36 GiB
-per build. Attribute it with `scripts/dtrace/native-fault-attribution.d` before
-choosing a lowering.
+**The mechanism is named.** 145,429 of 146,531 in-window `zfod` have exactly
+one caller: `__bzero` from `dispatch/mem.rs:2792`,
+`let mut bytes = vec![0; length_usize]` — the **eager snapshot buffer** carrick
+allocates for a file mapping it did not lower to a host file mapping, then
+immediately overwrites. Not the `zero_backing` scrub (29 faults across `brk`,
+`mremap` and `madvise` combined), and not the guest touching its own memory.
 
-The shape of the answer is known even if the mechanism is not: the native lane
-collapsed in-window `zfod` 553k → ~723 on 2026-08-07 by letting Darwin's
-zero-fill deliver a pre-zeroed page instead of writing one
-([anon-reuse-remap](docs/perf-results/2026-08-07-anon-reuse-remap.md)). That fix
-does **not** port directly — it lives in `carrick-dsr-aarch64::mapped_memory`,
-and the kernel lane's `HvfInner::zero_guest_backing`
-(`carrick-vmm-hvf/src/trap.rs:4795`) is a plain memset whose arena is
-`hv_vm_map`'d into stage-2, so replacing the host pages under a live IPA would
-leave the guest reading the old ones. The kernel lane needs its own expression
-of the same intent. **Invariant 9 is binding here:** anonymous `mmap` returning
-zeroed pages is not tradeable, so the lever must remove the work, not the
-guarantee.
+**And the obvious fix is the wrong one.** Removing the double-write does not
+remove a single fault — the page is faulted on first touch either way, so
+skipping the `bzero` just moves the fault to the `copy_from_slice`. The fault
+disappears only if the buffer is never materialized, i.e. if the mapping is
+lowered to a host file mapping and Darwin demand-pages it.
+
+That lowering exists and is default-on; it refuses these mappings on its own
+guards, the load-bearing one being `!PROT_EXEC`. Program text is exactly the
+large, frequently-mapped case, excluded because "executable content must flow
+through the write path's W^X/translation-invalidation metadata"
+(`dispatch/mem.rs:2755`). **Whether that reason still holds on a lane that
+PATCHES static text rather than translating it is KF's first design question,
+and it is a correctness question, not a performance one.** Answer it before
+writing code.
+
+The native lane's 2026-08-07 result (in-window `zfod` 553k → ~723,
+[anon-reuse-remap](docs/perf-results/2026-08-07-anon-reuse-remap.md)) is the
+right shape but does **not** port: it lives in
+`carrick-dsr-aarch64::mapped_memory`, and the kernel lane's
+`HvfInner::zero_guest_backing` (`carrick-vmm-hvf/src/trap.rs:4795`) is a plain
+memset whose arena is `hv_vm_map`'d into stage-2, so replacing host pages under
+a live IPA would leave the guest reading the old ones. **Invariant 9 is binding:**
+anonymous `mmap` returning zeroed pages is not tradeable, so the lever must
+remove the work, not the guarantee.
 
 **Gate:** in-window `zfod` on the cold build **below 10,000** (from 150,749);
 total `as_fault` **below 60,000** (from 279,987); the anonymous-zero guarantee
