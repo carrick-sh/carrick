@@ -102,3 +102,67 @@ They cluster, and the clusters name the work:
 3. Re-run this gate on the kernel lane, not the native one, whenever a change
    touches the kernel lane. Every probe-gate receipt in this tree before today
    is a native-lane receipt.
+
+---
+
+## Root cause of the signal cluster, found: forked guest processes have no pid
+
+**Recorded the same day.** Reducing the signal cluster gave one shared symptom
+across `siginfo`, `signals`, `killtarget`, `procsignalmask` and others:
+**`kill(getpid(), sig)` returns ESRCH.**
+
+The reduction:
+
+```text
+carrick hvpatch:   shell_pid=1   ppid=0   child_pid=52111
+Docker:            shell_pid=1   ppid=0   child_pid=6
+```
+
+**The container init gets pid 1 correctly. A FORKED CHILD reports a HOST pid.**
+`kill(getpid(), 0)` from that child then fails, because no host process has
+that id — the guest is signalling a pid that does not exist.
+
+`identity_pid()` (`dispatch/creds.rs`), which is what `getpid(2)` answers from,
+reads `proc.virtual_pid` and falls back to `namespace::pid::self_ns_pid()`.
+`virtual_pid` is set by `bind_hvpatch_process`
+(`dispatch/mod.rs:2739`) — but it is **dispatcher state, and under this lane
+ONE dispatcher serves every Linux process**. The init binds and gets its pid; a
+forked child never does, falls through to `self_ns_pid()`, and reads the host
+process that all 69 guest processes share.
+
+This is the same failure mode as the two accounting bugs already fixed — an
+identity the host process boundary used to supply for free, which the one-VM
+design must now supply itself — and it is the third instance, which makes it a
+pattern rather than a coincidence:
+
+| symptom | authority that was wrong | fixed |
+| --- | --- | --- |
+| `times`/`getrusage` self vs children | `proc_pid_rusage` (host process) | `ad5845c56` |
+| `stime` reported as zero | vCPU exec clock only sees guest execution | `f850336c5` |
+| **forked child's `getpid`** | **`proc.virtual_pid` / host pid** | **open** |
+
+**Why this gates the whole cluster.** The conformance harness runs each probe
+as a CHILD of a `probeinit` shim, precisely so the process topology matches the
+oracle's. So every probe in the gate runs in the topology where the pid is
+wrong — which is why the same probe passes when run as the container command
+and fails under the gate.
+
+### What was fixed, and what it does not fix
+
+`kill`'s self-target test compared the target against `std::process::id()` —
+the HOST process — which under this lane can never match a guest's own Linux
+pid. It now also accepts a target equal to `identity_pid()`, the same authority
+`getpid(2)` answers from. Verified: `siginfo` goes from 0/5 to **5/5**, and
+`killtarget`, `signals` and `procsignalmask` all improve, **when the probe is
+the container's init**.
+
+It does **not** move the gate, and the reason is exactly the bug above: in the
+child topology `identity_pid()` itself returns a host pid, so there is nothing
+correct for the self-test to match. **The fix is necessary and not sufficient**;
+the pid authority has to be corrected first.
+
+An attempt to route `identity_pid()` through the active kernel context's task
+id was written and **reverted**: it did not change the observed child pid, and
+this tree does not keep an unproven path that changes nothing measurable. The
+next step is to find why the child's dispatch does not reach a bound kernel
+context — not to add another fallback.

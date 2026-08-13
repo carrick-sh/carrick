@@ -1161,6 +1161,14 @@ impl SyscallDispatcher {
             //    getpgid now report ns-pgids, so the guest negates an ns-pgid).
             //  - pid == 0 (caller's group) and pid == -1 (every process) pass
             //    through to the host unchanged.
+            // The pid the GUEST asked for, before any ns→host translation. The
+            // self-target test below needs it: under the kernel (`hvpatch`)
+            // lane a Linux process is a THREAD of one host process, so its own
+            // Linux pid is nothing like `std::process::id()` and the
+            // host-identity test can never fire. `identity_pid()` is the same
+            // authority `getpid(2)` answers from, so "the guest asked to signal
+            // the pid it believes it has" is exactly a self-target.
+            let requested_pid = i64::from(pid.0);
             // Identity when namespaces are off.
             let pid = if crate::namespace::pid::enabled() {
                 if pid.0 > 0 {
@@ -1181,6 +1189,7 @@ impl SyscallDispatcher {
                 i64::from(pid.0)
             };
             let signal_target_names_self = pid == std::process::id() as i64
+                || requested_pid == i64::from(this.identity_pid())
                 || (!crate::namespace::pid::enabled() && pid == LINUX_BOOTSTRAP_PID as i64);
             // pid-1 protection on the NON-namespaced OCI path (§5.4,
             // pid_namespaces(7)). The guest's init presents itself as bootstrap
