@@ -1081,7 +1081,7 @@ where
         trace_hvpatch_thread_teardown(kernel, self.this_tid, 4);
         trace_hvpatch_thread_teardown(kernel, self.this_tid, 5);
         if last {
-            let result = assemble_run_result(kernel, code, traps, false);
+            let result = assemble_run_result(kernel, code, None, traps, false);
             VcpuLoopOutcome::ProcessExit(Box::new(result))
         } else {
             // A sibling thread is going away but the process lives on: destroy

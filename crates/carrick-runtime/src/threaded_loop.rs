@@ -382,6 +382,7 @@ where
                 let report = kernel.reporter.snapshot();
                 RunResult {
                     exit_code: 0,
+                    terminating_signal: None,
                     stdout: kernel.dispatcher.stdout(),
                     stderr: kernel.dispatcher.stderr(),
                     traps: 0,

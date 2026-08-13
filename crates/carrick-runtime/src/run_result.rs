@@ -77,10 +77,48 @@ impl From<carrick_dsr::native_error::NativeMemoryError> for RuntimeError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunResult {
     pub exit_code: i32,
+    /// The signal that KILLED this process, if one did.
+    ///
+    /// `exit_code` alone cannot carry this. A process killed by SIGSEGV gets
+    /// the shell's `128 + signum` convention, which is byte-identical to a
+    /// program that legitimately called `exit(139)` — two domains sharing one
+    /// integer, the exact bug shape this tree bans from semantic boundaries.
+    ///
+    /// It was harmless while every Linux process was its own HOST process:
+    /// `forked_child_die_by_signal` made the host child genuinely die of the
+    /// signal, so the host `waitpid` reported `WIFSIGNALED` and the guest
+    /// parent's `wait4` translated it. Under the kernel (`hvpatch`) lane there
+    /// is no host child to die — a Linux process is a thread — so the exit is
+    /// published from this value alone, and the distinction has to be IN the
+    /// value. Without it a guest crash was reported as a normal exit with
+    /// status 139: `WIFSIGNALED` false, `WTERMSIG` never consulted, every
+    /// shell and test harness misreading the crash
+    /// (`conformance-probes/src/bin/coredumpfile.rs`).
+    ///
+    /// `None` means the process exited of its own accord.
+    #[serde(default)]
+    pub terminating_signal: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub traps: usize,
     pub report: CompatReport,
     #[serde(default)]
     pub trap_limit_hit: bool,
+}
+
+impl RunResult {
+    /// The Linux `wait(2)` status word for this outcome — the one place the
+    /// two domains are encoded, so a caller cannot pick the wrong form.
+    ///
+    /// Signal death is `signum & 0x7f`, with `0x80` set when a core was
+    /// produced; a normal exit is `(code & 0xff) << 8`. Encoding a signal
+    /// death in the exit form is what made `WIFSIGNALED` false for a guest
+    /// SIGSEGV.
+    #[must_use]
+    pub fn wait_status_encoding(&self, core_dumped: bool) -> i32 {
+        match self.terminating_signal {
+            Some(signum) => (signum & 0x7f) | if core_dumped { 0x80 } else { 0 },
+            None => (self.exit_code & 0xff) << 8,
+        }
+    }
 }
