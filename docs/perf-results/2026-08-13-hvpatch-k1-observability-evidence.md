@@ -211,28 +211,51 @@ re-checks it (`child_parent_record.revision != child_parent_revision` →
 `ForkParentChanged`), so relaxing only the reserve-time check would move the
 failure to commit rather than remove it.
 
-**The obvious fix was attempted and rejected by the suite.** Dropping the
-reserve-time revision equality and advancing from the parent's current
-revision at commit — the pattern `PreparedThreadClone::commit` already
-uses — does let concurrent sibling forks through, but breaks two real
-invariants:
+**FIXED in `f4cdea7a6`.** The first attempt — simply dropping the revision
+equality and advancing from the current revision, the pattern
+`PreparedThreadClone::commit` uses — was implemented and reverted, because
+the suite proved it wrong: it broke
+`exiting_parent_reparents_live_and_zombie_children_to_root`, where a context
+captured before the task was **reparented** must not fork or the child
+attaches to the wrong parent. One counter cannot separate the benign advance
+("a sibling forked") from the dangerous one ("my parent changed").
 
-- `stale_context_cannot_commit_a_fork`: a reused context must stay refused;
-- `exiting_parent_reparents_live_and_zombie_children_to_root`: a context
-  captured before the task was **reparented** must not fork, or the child
-  attaches to the wrong parent.
+The shipped fix records the association instead. `KernelContext` captures
+`parent_at_capture` in its single constructor and `reserve_fork` compares
+that against the caller's current parent. Both invariants hold: the
+reparenting test stays green and concurrent sibling forks now commit.
+`stale_context_cannot_commit_a_fork` asserted the contract this corrects and
+was replaced by `sibling_publication_does_not_stale_a_fork_context`.
 
-The task revision is therefore load-bearing for detecting reparenting and
-association changes, not merely "gained a child", and one counter cannot
-separate the benign advance from the dangerous one. The change was reverted;
-the tree at this commit is green.
+### 3. Go archive writes are corrupt — RED, next blocker
 
-The real fix needs a signal that distinguishes "children set changed" from
-"parent association changed" — most directly, `KernelContext` carrying the
-captured parent `TaskKey` so `reserve_fork` compares parent association
-exactly instead of leaning on revision equality. That is a lifecycle
-contract change and needs red tests for concurrent sibling forks while
-keeping both invariants above green.
+With sibling forks working, the cold `go build` runs dozens of compile
+processes and fails further along:
+
+```
+internal/bytealg/bytealg.go:8:2: could not import internal/cpu
+  (not the start of an archive file
+   ("cpu.o           0           0     0     644     262       `\n"))
+```
+
+The `.a` archives are missing their leading `!<arch>\n`: the reader finds an
+`ar` member header where the 8-byte magic belongs, so an 8-byte write lands
+wrong or a read starts at the wrong offset.
+
+Two hypotheses were tested and **refuted** on the signed binary under
+HVPatch, so neither is the cause:
+
+- plain write/read round-trip is byte-exact (`printf` → `wc`/`od`, plus `cp`
+  and `cat` copies of a file beginning with `!<arch>\n`);
+- `lseek(SEEK_SET)` and `pwrite` are exact — writing the magic, seeking back
+  to offset 8, rewriting, and a `pwrite` at 12 produce
+  `!<arch>\nBBBBCCCC` with the file offset correctly at 16.
+
+So the defect is narrower than "seek or write is broken". Remaining
+suspects, untested: the `go tool buildid -w` in-place rewrite, concurrent
+writers to one archive, or truncate/rename behaviour on the build-cache
+path. A run-scoped cold `GOCACHE` is already used, so a stale cache entry is
+excluded.
 
 Simple fork/exec guests are unaffected: `sh -c 'echo a; /bin/true; echo b'`,
 a three-iteration `/bin/true` loop, and `ls /` all exit 0 under HVPatch. The

@@ -94,7 +94,27 @@ Relaxing only the reserve-time check moves the failure to commit: for
 `child_parent_revision = caller_revision` and commit re-checks it
 (`ForkParentChanged`).
 
-**The obvious fix was tried and is WRONG — do not repeat it.** Dropping the
+**UPDATE — layer 2 is FIXED in `f4cdea7a6`.** `KernelContext` now captures
+`parent_at_capture` and `reserve_fork` compares the parent association
+instead of the task revision, so concurrent sibling forks commit while
+reparenting stays detected. The cold `go build` no longer reports
+stale/foreign contexts or `EAGAIN` and now runs dozens of compile
+processes.
+
+**Layer 3, the current blocker:** Go's `.a` archives are missing their
+leading `!<arch>\n` — the reader finds an `ar` member header where the
+8-byte magic belongs ("not the start of an archive file"). Two hypotheses
+are already **refuted** on the signed binary, so do not retest them: plain
+write/read/`cp`/`cat` round-trips are byte-exact, and `lseek(SEEK_SET)` plus
+`pwrite` are exact (magic, seek back to 8, rewrite, `pwrite` at 12 yields
+`!<arch>\nBBBBCCCC` with the offset at 16). Untested suspects: the
+`go tool buildid -w` in-place rewrite, concurrent writers to one archive,
+and truncate/rename on the build-cache path. `GOCACHE` is already
+run-scoped and cold, so a stale cache entry is excluded.
+
+The history below is retained because the rejected approach is instructive.
+
+**The first fix attempt was WRONG — do not repeat it.** Dropping the
 `caller_record.revision != parent.revision` check in `reserve_fork` (and the
 matching `ForkParentChanged` check in commit, advancing from the current
 revision as `PreparedThreadClone::commit` does) makes concurrent sibling
