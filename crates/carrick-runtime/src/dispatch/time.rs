@@ -810,7 +810,9 @@ impl SyscallDispatcher {
                 if pid != 0 && pid != self_pid {
                     let exists = pid > 0
                         && pid <= i32::MAX as i64
-                        && {
+                        && if let Some(live) = this.guest_pid_is_live(pid as i32) {
+                            live
+                        } else {
                             let rc = unsafe { libc::kill(pid as i32, 0) };
                             rc == 0
                                 || std::io::Error::last_os_error().raw_os_error()

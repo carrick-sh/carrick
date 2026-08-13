@@ -290,13 +290,11 @@ where
     let root_linux_tid = if let Some(process) = hvpatch_process.as_ref() {
         crate::kernel::LinuxTid::for_task_leader(process.task_id())
     } else {
-        let task_id = crate::kernel::TaskId::for_root_bootstrap(
-            i32::try_from(std::process::id()).map_err(|_| {
-                RuntimeError::Configuration("host pid does not fit Linux task identity".to_owned())
-            })?,
-        )
-        .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-        crate::kernel::LinuxTid::for_task_leader(task_id)
+        // Read the root's leader tid from the kernel binding rather than
+        // recomputing it from the host pid: the two agree today only because
+        // the kernel's root task id is seeded from that same host pid, which is
+        // a coincidence this must not depend on.
+        dispatcher.root_leader_linux_tid()
     };
     let kernel = Arc::new(KernelState::new(
         dispatcher,
