@@ -138,6 +138,21 @@ pub const FDOWNER: u8 = 38;
 /// fd, and `c` the logical reference count immediately before removal. It lets
 /// a core/live LLDB session find the process clone that retained a pipe writer.
 pub const FDREF: u8 = 39;
+/// A file write whose payload begins at an `ar` archive boundary. `a` is the
+/// host fd, `b` the file offset the write starts at (`-1` when the fd is not
+/// seekable), and `c` the payload length.
+///
+/// Deliberately narrow. An `ar` archive is magic (`!<arch>\n`) followed by
+/// member headers, so a payload starting with a member header is correct at a
+/// nonzero offset and CORRUPT at offset 0 — `b == 0` with a member-header
+/// payload is the defect, recorded at the moment it happens. The predicate is
+/// a byte compare on the payload head, and only a match pays the `lseek` that
+/// resolves the offset, so the hot write path is untouched. That cost matters:
+/// paying it per write via the `trace-io` log perturbed the intermittent Go
+/// build-cache corruption out of existence (0 of 4 reproductions against a
+/// 3-in-4 base rate), which is why this lives in the always-on lock-free ring
+/// instead.
+pub const ARWRITE: u8 = 40;
 
 const HVPWAIT_ID_MASK: u32 = 0x00ff_ffff;
 
@@ -209,6 +224,33 @@ fn write_reserved(slot: &Slot, logical_index: u64, lo: u64, hi: u64) -> bool {
 /// Append one event. ALWAYS records with no lock, syscall, or allocation so a
 /// core/live LLDB read has trustworthy history without pre-arming diagnostics.
 #[inline]
+/// True when `payload` begins with an `ar` MEMBER header rather than the
+/// archive magic.
+///
+/// An `ar` member header is a 16-byte name, then decimal mtime/uid/gid/mode,
+/// a 10-byte decimal size, and the two-byte terminator `` `\n `` at offset 58.
+/// Keying on that terminator plus a plausible name byte is a cheap, specific
+/// test: it does not fire on the magic (`!<arch>\n`), and it does not fire on
+/// ordinary data, so the caller's `lseek` stays off the hot path.
+///
+/// This is the write-side half of the archive-corruption detector: a member
+/// header is correct at a nonzero file offset and corrupt at offset 0.
+pub fn payload_starts_at_ar_member_header(payload: &[u8]) -> bool {
+    const AR_MEMBER_HEADER_LEN: usize = 60;
+    const TERMINATOR_OFFSET: usize = 58;
+    const AR_MAGIC: &[u8] = b"!<arch>\n";
+
+    if payload.len() < AR_MEMBER_HEADER_LEN || payload.starts_with(AR_MAGIC) {
+        return false;
+    }
+    // The fixed terminator is what makes this specific.
+    if &payload[TERMINATOR_OFFSET..AR_MEMBER_HEADER_LEN] != b"`\n" {
+        return false;
+    }
+    // A member name starts with a printable, non-space byte.
+    payload[0].is_ascii_graphic()
+}
+
 pub fn rec(kind: u8, a: i32, b: i32, c: i32) {
     let lo = (a as u32 as u64) | ((b as u32 as u64) << 32);
     let hi = (c as u32 as u64) | ((kind as u64) << 32);
@@ -581,6 +623,14 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
         FORK => format!("FORK     child_pid={a}"),
         EXEC => format!("EXEC     path_present={a}"),
         FDOPEN => format!("FDOPEN   gfd={a} hfd={b} minfd={c}"),
+        ARWRITE => format!(
+            "ARWRITE  hfd={a} off={b} n={c}{}",
+            if b == 0 {
+                "  <-- ar member header at offset 0: CORRUPT"
+            } else {
+                ""
+            }
+        ),
         FDCLOSE => format!("FDCLOSE  gfd={a} hfd={b}"),
         ACCEPTERR => format!("ACCEPTER listener_hfd={a} accepted_hfd={b} errno={c}"),
         EPWFD => format!("EPWFD    fd={a} events={b:#x} timeout={c}"),
@@ -772,6 +822,57 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    /// A 60-byte `ar` member header for `name`, as `ar(5)` lays it out.
+    fn ar_member_header(name: &str, size: usize) -> Vec<u8> {
+        let mut header = vec![b' '; 60];
+        header[..name.len()].copy_from_slice(name.as_bytes());
+        let size = size.to_string();
+        header[48..48 + size.len()].copy_from_slice(size.as_bytes());
+        header[58..60].copy_from_slice(b"`\n");
+        header
+    }
+
+    #[test]
+    fn ar_member_header_payload_is_detected() {
+        let header = ar_member_header("cpu.o", 262);
+        assert!(payload_starts_at_ar_member_header(&header));
+    }
+
+    /// The magic is the CORRECT start of an archive, so it must not fire —
+    /// otherwise every well-formed archive write would be reported.
+    #[test]
+    fn archive_magic_payload_is_not_a_member_header() {
+        let mut payload = b"!<arch>\n".to_vec();
+        payload.extend_from_slice(&ar_member_header("cpu.o", 262));
+        assert!(!payload_starts_at_ar_member_header(&payload));
+    }
+
+    #[test]
+    fn ordinary_and_short_payloads_do_not_fire() {
+        assert!(!payload_starts_at_ar_member_header(b""));
+        assert!(!payload_starts_at_ar_member_header(b"cpu.o"));
+        assert!(!payload_starts_at_ar_member_header(&[0_u8; 64]));
+        assert!(!payload_starts_at_ar_member_header(&[b'x'; 64]));
+    }
+
+    /// The terminator is what makes the predicate specific: a 60-byte buffer
+    /// that merely starts with a plausible name must not fire.
+    #[test]
+    fn a_plausible_name_without_the_terminator_does_not_fire() {
+        let mut header = ar_member_header("cpu.o", 262);
+        header[58] = b' ';
+        assert!(!payload_starts_at_ar_member_header(&header));
+    }
+
+    /// The decoder only exists under the dump feature, which is also the only
+    /// configuration that renders records to text.
+    #[cfg(feature = "event-ring-dump")]
+    #[test]
+    fn the_arwrite_record_flags_offset_zero_as_corrupt() {
+        assert!(decode(ARWRITE, 92, 0, 32768).contains("CORRUPT"));
+        assert!(!decode(ARWRITE, 92, 68, 32768).contains("CORRUPT"));
+    }
 
     fn empty_slot() -> Slot {
         Slot {
