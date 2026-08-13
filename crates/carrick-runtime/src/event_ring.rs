@@ -153,6 +153,15 @@ pub const FDREF: u8 = 39;
 /// 3-in-4 base rate), which is why this lives in the always-on lock-free ring
 /// instead.
 pub const ARWRITE: u8 = 40;
+/// A file write whose payload begins with the `ar` archive MAGIC — the correct
+/// start of an archive. `a` is the host fd, `b` the starting offset (`-1` when
+/// not seekable), `c` the payload length.
+///
+/// Normal traffic, recorded so the magic write can be correlated with the
+/// member write that should follow it on the same description. Note host fd
+/// numbers are recycled heavily within one build, so correlate by adjacency in
+/// the ring rather than by fd number alone.
+pub const ARMAGIC: u8 = 41;
 
 const HVPWAIT_ID_MASK: u32 = 0x00ff_ffff;
 
@@ -235,6 +244,13 @@ fn write_reserved(slot: &Slot, logical_index: u64, lo: u64, hi: u64) -> bool {
 ///
 /// This is the write-side half of the archive-corruption detector: a member
 /// header is correct at a nonzero file offset and corrupt at offset 0.
+/// True when `payload` begins with the `ar` archive magic — the CORRECT start
+/// of an archive. Paired with [`payload_starts_at_ar_member_header`] so a
+/// caller can correlate the two writes that build one archive.
+pub fn payload_starts_at_ar_magic(payload: &[u8]) -> bool {
+    payload.starts_with(b"!<arch>\n")
+}
+
 pub fn payload_starts_at_ar_member_header(payload: &[u8]) -> bool {
     const AR_MEMBER_HEADER_LEN: usize = 60;
     const TERMINATOR_OFFSET: usize = 58;
@@ -623,6 +639,7 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
         FORK => format!("FORK     child_pid={a}"),
         EXEC => format!("EXEC     path_present={a}"),
         FDOPEN => format!("FDOPEN   gfd={a} hfd={b} minfd={c}"),
+        ARMAGIC => format!("ARMAGIC  hfd={a} off={b} n={c}"),
         ARWRITE => format!(
             "ARWRITE  hfd={a} off={b} n={c}{}",
             if b == 0 {
