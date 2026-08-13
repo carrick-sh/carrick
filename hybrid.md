@@ -292,13 +292,21 @@ all**. The kernel lane takes the memset default and pays 145,453 faults for it.
   reading the old ones. Whether HVF actually behaves that way is the phase's
   first thing to establish, not assume.
 
-**The open question that picks the design:** the arena skips zero-fill above
-its high-water mark and scrubs below it, yet ~77% of requested anonymous bytes
-are being touched. Either the reuse is genuine, or the high-water heuristic is
-being defeated by the guest's allocator pattern. That decides whether KF makes
-the scrub cheap or removes the need for it. **Invariant 9 is binding either
-way:** anonymous `mmap` returning zeroed pages is not tradeable, so the lever
-must remove the work, not the guarantee.
+**And the per-call shape makes KF small.** Faults per individual `mmap` are
+extremely skewed: 272 of 1,274 anonymous RW calls are already free (the arena's
+high-water bump path working), most of the rest cost a handful of pages, and
+**66 calls carry ~90% of the whole term** at ~1,500–2,000 faults each — single
+16–32 MB mappings memset whole, the Go runtime's heap-arena commits. So this is
+not "redesign the arena": a whole-range replacement applied only to LARGE
+reused scrubs turns one syscall into ~1,500 avoided faults, and a conservative
+size threshold captures most of the term while leaving the many small scrubs
+and their correctness surface alone.
+
+**The one genuinely open question is the HVF constraint** — whether host pages
+can be replaced under a live `hv_vm_map`'d IPA, and at what cost. Establish
+that empirically first; everything else follows from it. **Invariant 9 is
+binding either way:** anonymous `mmap` returning zeroed pages is not tradeable,
+so the lever must remove the work, not the guarantee.
 
 **Gate:** in-window `zfod` on the cold build **below 10,000** (from 150,749);
 total `as_fault` **below 60,000** (from 279,987); the anonymous-zero guarantee

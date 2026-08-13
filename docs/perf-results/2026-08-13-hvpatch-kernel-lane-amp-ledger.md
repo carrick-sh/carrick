@@ -193,11 +193,45 @@ The three `zero_backing` call sites in `dispatch/mem.rs` (`brk` shrink,
 `mremap` reuse, `MADV_DONTNEED`) remain confirmed non-sources — those three
 guest ops produce 29 `zfod` between them.
 
-**How much of that 3.11 GB genuinely needs scrubbing is a separate open
-question.** The arena skips zero-fill above its high-water mark and scrubs
-below it; ~77% of the requested anonymous bytes are being touched, so either
-the reuse is real or the high-water heuristic is being defeated. Answering that
-decides whether KF should make the scrub cheap or remove the need for it.
+### The per-call shape — and it makes KF small
+
+The aggregate ratio (~77% of requested anonymous bytes touched) cannot
+distinguish "the arena's high-water heuristic works and only some handouts are
+reused" from "it is defeated and nearly everything is scrubbed". Those imply
+opposite fixes, so the census also records **faults per individual call**.
+
+For `anon/private/RW-` — 1,274 calls, 192,561 pages requested, 147,408 faulted,
+1,002 calls faulting and 272 completely clean:
+
+| faults in the call | calls |
+| ---: | ---: |
+| **0** | **272** |
+| 1 | 302 |
+| 2–3 | 147 |
+| 4–7 | 106 |
+| 8–15 | 150 |
+| 16–31 | 133 |
+| 32–63 | 10 |
+| 64–127 | 88 |
+| **1024–2047** | **66** |
+
+**The heuristic is not broken — the distribution is extremely skewed.** 272
+calls (21%) are already free, most of the rest cost a handful of pages, and
+**66 calls carry roughly 90% of the entire term** at ~1,500–2,000 faults each:
+single mappings of ~16–32 MB being memset whole. Those are the Go runtime's
+heap-arena commits — the same workload reserves 83.7 GB `PROT_NONE` across 525
+calls for **four** faults total, then commits sub-ranges as anonymous RW.
+
+That is a far smaller and safer target than "redesign the arena". **A
+whole-range replacement applied only to large reused scrubs turns one syscall
+into ~1,500 avoided page faults**, and even a conservative size threshold
+captures ~90% of the term while leaving the many small scrubs — and their
+correctness surface — untouched. It is also exactly the shape the native lane's
+`replace_anonymous_reuse` already implements.
+
+What remains genuinely open is the HVF constraint: whether host pages can be
+replaced under a live `hv_vm_map`'d IPA, and at what cost. That is the one
+thing KF must establish empirically before building.
 
 ### A consequence that changes the fix
 
