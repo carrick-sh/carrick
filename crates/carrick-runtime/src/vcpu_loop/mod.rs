@@ -2101,6 +2101,29 @@ where
                         }
                         hvpatch_child_wait_trace = Some((target, trace));
                     }
+                    // Release this thread's vCPU slot for the duration of the
+                    // guest's wait.
+                    //
+                    // `wait4` is an INDEFINITE guest block that merely happens
+                    // to be implemented as a 10 ms poll loop, so the slice
+                    // length must not decide reclaim: `park_vcpu_for_timed_wait`
+                    // would consult `should_reclaim_vcpu_for_timed_wait`, see
+                    // 10 ms < the 250 ms cutoff, and keep the slot forever.
+                    //
+                    // Holding it deadlocked the VM. The scheduler pool is TEN
+                    // slots for the whole host process, shared by every guest
+                    // process hvpatch multiplexes, and this arm was the only
+                    // blocking outcome in this loop with no park at all. A
+                    // wedged cold `go build` core showed four `wait4` threads
+                    // pinning slots while awaiting children whose sibling
+                    // materializers were simultaneously starving for those very
+                    // slots — a closed cycle with no runnable slot holder, which
+                    // is why raising the start-gate bound to 120 s produced
+                    // 121 s aborts rather than passes.
+                    let wait_reclaim = self.park_vcpu_for_blocking_wait(
+                        engine,
+                        crate::thread::VcpuParkClass::ReleaseSafe,
+                    );
                     let wait_result = self.waiter.wait_with_dispatch_pending(
                         &[],
                         Some(Duration::from_millis(10)),
@@ -2115,6 +2138,7 @@ where
                                 )
                         },
                     );
+                    self.resume_vcpu_after_blocking_wait(engine, wait_reclaim)?;
                     if let Some(outcome) = self.exec_replaced_thread_exit() {
                         if let Some((_, trace)) = hvpatch_child_wait_trace.take() {
                             trace_hvpatch_wait_end(kernel, self.this_tid, 6, 4, 0, trace);
