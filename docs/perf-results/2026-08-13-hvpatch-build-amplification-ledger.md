@@ -77,6 +77,44 @@ for `openat` is 16-31 host syscalls per guest call (2,365 of 3,268 instances),
 with 413 instances above 64. `mkdirat`'s entire population sits in the 64-127
 bucket.
 
+## Which code issues those opens
+
+`scripts/dtrace/hvpatch-phase4-openat-callers.d` (also `-Z`) joins every host
+`openat` to its Carrick user stack inside the guest `openat`/`newfstatat`
+service windows. It reproduces the counts above exactly — 3,268 guest `openat`
+→ 34,458 host, 3,967 guest `newfstatat` → 18,266 host — and attributes them:
+
+| caller | host opens | share |
+| --- | ---: | ---: |
+| `cap_primitives::rustix::fs::open_unchecked` | 25,034 | **47.5%** |
+| `HostFsBackend::fast_open_contained` | 16,744 | 31.8% |
+| `HostFsBackend::stat_cache_get_or_fill` | 3,528 | 6.7% |
+| `HostFsBackend::validate_parents_fast` | 3,297 | 6.3% |
+| `HostFsBackend::fast_open_for_guest` | 2,224 | 4.2% |
+| `HostFsBackend::root_marker_xattr` | 264 | 0.5% |
+| `cap_primitives::…::ReadDirInner::new` | 257 | 0.5% |
+
+**Nearly half of all host opens are cap-std's**, and this is the default OCI
+rootfs path, not `--fs host`. `open_unchecked` is reached through cap-std's
+containment walk, which resolves a path by opening EVERY component with
+`O_NOFOLLOW` so a symlink cannot escape the root — which is exactly the
+open/fcntl/fstat/close-per-component signature the bucket shows, and the same
+mechanism already documented for the `--fs host` backend in
+[`../fs-host-capstd-amplification.md`](../fs-host-capstd-amplification.md).
+
+Carrick's own contained fast path (`fast_open_contained`) already handles
+31.8%, so the fast path exists and simply does not cover enough: the remaining
+half still falls back to a full cap-std re-walk on every call, with no reuse
+between calls that share a prefix — and in a `go build` nearly every path
+shares a long prefix.
+
+That makes the lever specific rather than architectural: widen the contained
+fast path to cover the fallback cases and give it a resolved-prefix cache, so
+repeated resolution of the same directory chain stops re-opening it. The
+correctness constraint is the shipped fast-path errno rule — only `ENOENT` is
+authoritative on a contained fast path, and errnos carrick synthesises from
+its own flags (`O_NOFOLLOW` → `ENOTDIR` on symlinked dirs) must fall back.
+
 ## The `carrick-only` bucket
 
 30.1% of host syscalls are issued with **no guest work in flight** — carrick's
@@ -102,12 +140,12 @@ correctness and determinism arguments recorded there.
 
 ## Ranking
 
-1. **Path resolution (55% of host syscalls).** The single largest lever by a
-   wide margin, and it is one mechanism, not five: a resolved-path/dirfd cache
-   that survives across calls collapses `openat`, `newfstatat`, `mkdirat` and
-   `unlinkat` together. Note the correctness constraint from the shipped
-   fast-path rule — only `ENOENT` is authoritative on a contained fast path,
-   and errnos carrick synthesises from its own flags must fall back.
+1. **Path resolution (55% of host syscalls), and specifically cap-std's
+   containment walk (47.5% of host opens).** The single largest lever by a wide
+   margin, and it is one mechanism, not five: the same walk serves `openat`,
+   `newfstatat`, `mkdirat` and `unlinkat`. Carrick's own `fast_open_contained`
+   already covers a third of it, so this is widening an existing path and
+   giving it prefix reuse — not new architecture.
 2. **`carrick-only` (30%).** Scheduler/futex/pump traffic, addressed by the
    executor model rather than by syscall tuning.
 3. Everything else is under 3% each and cannot move a double-digit ratio.
