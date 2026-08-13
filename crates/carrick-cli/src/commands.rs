@@ -1353,6 +1353,8 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             feature = "platform-netbsd"
         ))]
         Commands::Debug { command } => match command {
+            // Parses a file only, so it is available wherever the binary is.
+            DebugCommand::Core { core } => crate::debug_core::run_debug_core(&core)?,
             DebugCommand::NativeX86Layout => {
                 println!(
                     "{}",
