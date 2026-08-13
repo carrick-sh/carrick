@@ -5,6 +5,18 @@
 use super::*;
 use crate::linux_abi::LinuxErrno;
 
+/// `CARRICK_DARWIN_COPYFILE_FAST_PATH=0` disables the whole-file
+/// `copyfile`/`fclonefileat` fast path in `copy_file_range`, falling back to
+/// the ordinary read-then-write body. Default ON; the hatch exists so the
+/// fast path can be ablated when attributing a data-corruption bug.
+#[cfg(target_os = "macos")]
+fn darwin_copyfile_fast_path_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var_os("CARRICK_DARWIN_COPYFILE_FAST_PATH").is_some_and(|value| value == "0")
+    })
+}
+
 impl SyscallDispatcher {
     /// copy_file_range(2): like sendfile but file-to-file with independent
     /// in/out offset pointers. coreutils `cat`/`cp` and apt/dpkg use it for
@@ -22,6 +34,14 @@ impl SyscallDispatcher {
         count: usize,
     ) -> Result<Option<DispatchOutcome>, DispatchError> {
         if off_in_addr != 0 || off_out_addr != 0 || in_offset != 0 {
+            return Ok(None);
+        }
+        // Exact ablation hatch. This fast path validates its preconditions by
+        // reading both HOST fd offsets, which forked guest processes share, so
+        // it is the leading suspect for the 1-in-10 corrupt Go build-cache
+        // archive. Shipping ON, with `=0` to bisect it, is the rule; a fast
+        // path with no way to turn it off cannot be attributed.
+        if darwin_copyfile_fast_path_disabled() {
             return Ok(None);
         }
 
