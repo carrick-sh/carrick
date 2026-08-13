@@ -133,6 +133,43 @@ collapses on the first Carrick frame, so re-run it aggregating on the first
 frame BELOW `open_unchecked` to name cap-std's callers rather than its
 callees.
 
+### Answered: which carrick code reaches cap-std
+
+Re-aggregating the SAME capture on the frame below `open_unchecked` (rather
+than on the first Carrick frame, which named callees) settles it. All 25,034
+cap-std opens come from ONE resolver:
+
+```text
+25034  cap_primitives::fs::manually::open::Context::normal
+```
+
+That is cap-std's **manual component-by-component walk** — it opens each path
+component in turn with `O_NOFOLLOW` so a symlink cannot escape the root. The
+carrick entry points into it, by host opens:
+
+| carrick caller | host opens |
+| --- | ---: |
+| `RootFsVfs::lookup_nofollow` | 6,207 |
+| `path_stat_record` | 3,520 |
+| `FsBackend::is_deleted` | 3,472 |
+| `resolve_at_path` | 3,297 |
+| `open_at_path_string` | 2,912 |
+| `stat_cache_get_or_fill` | 3,528 |
+
+(`fast_open_contained`'s 16,744 are its own single `openat` each, NOT cap-std
+walks — it is already the cheap path.)
+
+Two things this makes obvious that the earlier aggregation hid:
+
+- **There is no single hot caller to fix.** Five separate call sites each pay
+  a full walk, which is why routing just `open_raw_fd` through the fast path
+  changed nothing. The fix has to be at the RESOLVER, shared by all of them —
+  a resolved-prefix cache under `at()`/`lookup`, not a per-call-site fast path.
+- **`FsBackend::is_deleted` costs 3,472 host opens.** That is an overlay
+  whiteout check walking the entire path on operations that then walk it AGAIN
+  to do the real work. It is the clearest single piece of pure duplication in
+  the ledger and does not need the general fix to be addressed.
+
 ## The `carrick-only` bucket
 
 30.1% of host syscalls are issued with **no guest work in flight** — carrick's
