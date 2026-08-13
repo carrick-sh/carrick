@@ -63,9 +63,23 @@ pub(super) fn with_captured_resources<R>(
     // the `guest_cpu` slot its Task later totals for RUSAGE_SELF.
     context.thread().bind_own_cpu_slot();
     if ACTIVE_CONTEXT.with(|active| std::ptr::eq(active.get(), context)) {
+        // Already inside this context's dispatch scope: a nested call is part
+        // of the window the OUTER frame is already charging, so it must not
+        // charge again.
         return operation();
     }
-    with_resource_scope(CapturedResources::from_context(context), context, operation)
+    // The outermost dispatch scope is exactly one guest syscall's service
+    // window, and it runs on the guest thread — so it is where that thread's
+    // SYSTEM time comes from. Measured on the host thread's own CPU clock, not
+    // the wall clock, so a syscall that BLOCKS (`wait4`, `epoll_wait`,
+    // `futex`) contributes nothing, matching Linux: a blocked task accrues no
+    // kernel CPU. See `Thread::system_ns`.
+    let started_ns = carrick_host::guest_cpu::this_thread_cpu_ns();
+    let result = with_resource_scope(CapturedResources::from_context(context), context, operation);
+    context
+        .thread()
+        .charge_system_ns(carrick_host::guest_cpu::this_thread_cpu_ns().saturating_sub(started_ns));
+    result
 }
 
 /// Run `operation` against the kernel context whose dispatch scope is active

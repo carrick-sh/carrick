@@ -30,8 +30,45 @@
 //!
 //! The probe reports only orderings and signs, never durations, so it is
 //! line-exact across machines of different speeds.
+//!
+//! ## The USER/SYSTEM split, and why summing them hid a second bug
+//!
+//! The assertions above sum `tms_cutime + tms_cstime`, which made them blind to
+//! a runtime that reports the whole child burn as USER and zero SYSTEM. carrick
+//! did exactly that: its per-vCPU exec clock measures time inside
+//! `hv_vcpu_run`, i.e. the guest executing its own instructions, and the CPU
+//! carrick spends SERVICING the guest's syscalls happens outside that call and
+//! was counted nowhere. On a cold `go build` the guest read
+//! `0m2.090000s 0m0.000000s` where Docker read `0m2.28s 0m0.24s` — plausible
+//! enough to pass a summed check and wrong for anything that reads `stime`.
+//!
+//! So the second child below burns SYSTEM time deliberately, with a storm of a
+//! real syscall (`getpid` via `syscall(2)`, which is not vDSO-accelerated and
+//! which glibc does not cache), and the probe asserts the children SYSTEM
+//! ledger advanced across it — a claim summing cannot make.
 
 use conformance_probes::report;
+
+/// Issue `count` real syscalls. `getpid` is chosen because it is the cheapest
+/// syscall that genuinely enters the kernel on aarch64 Linux: not vDSO-served,
+/// no fd or memory state, and nothing for a compiler to elide. Called through
+/// `syscall(2)` so glibc's `getpid` caching cannot turn it into a memory read.
+fn burn_system(count: u64) {
+    for _ in 0..count {
+        unsafe { libc::syscall(libc::SYS_getpid) };
+    }
+}
+
+fn children_split_us() -> (i64, i64) {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut usage) } != 0 {
+        return (-1, -1);
+    }
+    (
+        usage.ru_utime.tv_sec as i64 * 1_000_000 + usage.ru_utime.tv_usec as i64,
+        usage.ru_stime.tv_sec as i64 * 1_000_000 + usage.ru_stime.tv_usec as i64,
+    )
+}
 
 /// Spin until `ms` milliseconds of wall time have elapsed. The loop never
 /// sleeps or blocks, so wall time is CPU time and the burn is attributable.
@@ -99,6 +136,19 @@ fn main() {
         let child_ticks = tms.tms_cutime as i64 + tms.tms_cstime as i64;
         let self_ticks = tms.tms_utime as i64 + tms.tms_stime as i64;
 
+        // --- Second child: burn SYSTEM time, so the children ledger's system
+        //     half is exercised on its own rather than hidden inside a sum.
+        let (_, system_before_us) = children_split_us();
+        let syscall_child = libc::fork();
+        if syscall_child == 0 {
+            burn_system(400_000);
+            libc::_exit(0);
+        }
+        let mut syscall_status: libc::c_int = 0;
+        let reaped_syscall_child = syscall_child > 0
+            && libc::waitpid(syscall_child, &mut syscall_status, 0) == syscall_child;
+        let (_, system_after_us) = children_split_us();
+
         report!(
             fork_ok = child > 0,
             reaped_the_child = reaped == child,
@@ -115,6 +165,16 @@ fn main() {
             rusage_children_nonzero = children_us > 0,
             // Linux: true. RUSAGE_SELF must not absorb the child's burn.
             rusage_self_delta_below_children = self_delta_us < children_us,
+            // Linux: true. The syscall-storm child was reaped.
+            reaped_syscall_child = reaped_syscall_child,
+            // Linux: true. 400k real syscalls is tens of milliseconds of kernel
+            // CPU, so the children SYSTEM ledger must advance on its own. A
+            // runtime that reports every child burn as USER — which summing
+            // user+system cannot detect — reports false here.
+            children_system_advanced = system_after_us > system_before_us,
+            // Linux: true. The system half is a real, separately-tracked
+            // quantity, not a copy of the user half.
+            children_system_nonzero = system_after_us > 0,
         );
     }
 }

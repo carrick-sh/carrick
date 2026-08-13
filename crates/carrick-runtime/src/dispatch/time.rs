@@ -1192,11 +1192,18 @@ fn timeval_from_duration(d: std::time::Duration) -> crate::linux_abi::LinuxTimev
 /// host process that had spent 4.29) while the compiler processes it forked
 /// showed none.
 ///
-/// System time is not yet split per task, so it is reported as zero rather
-/// than filled in with a host number that belongs to every process at once.
+/// USER time is the guest executing its own instructions, measured by the
+/// per-vCPU exec slots. SYSTEM time is carrick's own CPU spent servicing this
+/// task's syscalls, accumulated at the dispatch boundary on the host thread's
+/// own CPU clock — so a task blocked in `wait4` accrues neither, exactly as on
+/// Linux. Both come from the kernel's task objects, never from a host
+/// per-process counter, which under HVPatch would describe every guest at once.
 fn task_self_cpu_us() -> (u64, u64) {
-    let per_task = super::resources::with_active_context(|context| context.task().self_cpu_us());
-    (per_task.unwrap_or(0), 0)
+    super::resources::with_active_context(|context| {
+        let task = context.task();
+        (task.self_cpu_us(), task.self_system_cpu_us())
+    })
+    .unwrap_or((0, 0))
 }
 
 /// The calling Linux process's CHILDREN ledger as (user µs, system µs) — the
