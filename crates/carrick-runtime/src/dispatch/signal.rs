@@ -2319,6 +2319,29 @@ pub(crate) fn bootstrap_signal_send_as(
         }
         // Ring full / unavailable: fall through to the host kill below.
     }
+    // THE KERNEL LANE MUST NOT REACH THE HOST WITH A GUEST PID.
+    //
+    // Everything below assumes `target` is a host pid, which it is on `native`
+    // and `vmm` where a Linux process IS a host process. On the kernel lane a
+    // Linux process is a THREAD of this host process and its pid is a
+    // carrick-kernel task id, so handing it to `libc::kill` signals whatever
+    // host process happens to own that number.
+    //
+    // That is not a future hazard, it is a live one: guest task ids are
+    // allocated from `host_pid + 1` upward
+    // (`docs/perf-results/2026-08-13-hvpatch-id-mechanism-settled.md`), and
+    // host pids in that range belong to real, unrelated processes started
+    // around the same time. It gets categorically worse once the id space is
+    // seeded at 1, where pid 1 on macOS is `launchd` — which is why this guard
+    // is a PREREQUISITE for that change rather than a consequence of it.
+    //
+    // ESRCH is the honest answer while cross-process guest signal delivery
+    // still goes through the kernel's own queues rather than the host's: it is
+    // what the host call already returns for a guest pid that matches nothing,
+    // minus the chance of hitting one that does.
+    if crate::dispatch::hvpatch_lane_active() && target > 0 {
+        return DispatchOutcome::errno(LINUX_ESRCH);
+    }
     // Translate the Linux signum to the host's numbering: the target is a real
     // host process, and Linux/macOS disagree on several numbers (e.g. SIGUSR1
     // 10 vs 30). `wait4` translates the resulting status back to Linux.
