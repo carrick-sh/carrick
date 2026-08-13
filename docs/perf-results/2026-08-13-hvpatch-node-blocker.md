@@ -79,6 +79,23 @@ Each is a probe-sized question, and the `--fs`-independent answer belongs in a
 conformance probe rather than in a Node run. Note carrick's 32 GiB arena and
 the `CARRICK_DSR_ZERO_REMAP` anon-reuse path are both in this area.
 
+### Answered, and the hypothesis is REFUTED
+
+`conformance-probes/src/bin/mmapcage.rs` asks exactly those three questions:
+over-reserve `PROT_NONE`, `munmap` the head and the tail to trim to alignment,
+then commit a window with `MAP_FIXED` and check it reads zero and is writable.
+
+**carrick MATCHES the Docker oracle on all six assertions, at 256 MiB
+alignment AND at V8's real 4 GiB alignment (an 8 GiB over-reservation).**
+
+So the aligned-cage reservation is not the bug. Whatever breaks Node is
+downstream of it, and the remaining candidates are narrower: the number or
+rate of separate `MemoryChunk` mappings rather than their size or alignment,
+the `MAP_NORESERVE`-less variants V8 also uses, permission changes on an
+already-committed sub-range, or a limit (`RLIMIT_AS`, a VMA count cap) that a
+single large reservation does not reach. The probe stays as the record that
+this ground is covered, so the next investigation starts past it.
+
 ## Status of the workload criterion
 
 - **Node.js — blocked.** Must run before it can be timed.
