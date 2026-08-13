@@ -936,6 +936,17 @@ pub(crate) enum VolumeCommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum DebugCommand {
+    /// Validate a Linux ELF core file and print a summary as JSON.
+    ///
+    /// Parses the core the way an external debugger would and fails BY NAME on
+    /// a bad magic, a non-core or non-aarch64 header, a truncated program
+    /// header table, a missing or truncated PT_NOTE, a note with the wrong
+    /// owner or payload size, a PT_LOAD whose contents run past the file, or a
+    /// core with no thread notes at all.
+    Core {
+        /// Core file to validate.
+        core: PathBuf,
+    },
     /// Validate an authenticated HVPatch process-wide VM lifecycle artifact.
     /// Refuses unknown schema/fields, digest drift, malformed transitions,
     /// multiple VM serials, incomplete teardown, and a missing run terminal.

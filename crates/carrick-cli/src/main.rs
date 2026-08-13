@@ -141,6 +141,7 @@ mod debug;
 mod debug_alloc_owner;
 mod debug_amplification;
 mod debug_census;
+mod debug_core;
 mod debug_exec_stamps;
 mod debug_jit_shape;
 mod debug_layout;

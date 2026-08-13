@@ -37,6 +37,9 @@ use crate::debug_layout::native_x86_layout_json;
 
 pub(crate) fn run_debug(command: DebugCommand) -> anyhow::Result<()> {
     match command {
+        DebugCommand::Core { core } => {
+            crate::debug_core::run_debug_core(&core).map_err(|error| anyhow::anyhow!("{error}"))?;
+        }
         DebugCommand::HvpatchVmLedger {
             artifact,
             run_id,

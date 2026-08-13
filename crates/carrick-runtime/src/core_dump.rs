@@ -28,35 +28,35 @@
 //! No Linux kernel source was consulted, per the project's clean-room rule.
 
 /// ELF note types. `NT_SIGINFO`/`NT_FILE` spell their own names in ASCII.
-const NT_PRSTATUS: u32 = 1;
-const NT_PRPSINFO: u32 = 3;
-const NT_AUXV: u32 = 6;
-const NT_SIGINFO: u32 = 0x5349_4749;
-const NT_FILE: u32 = 0x4649_4c45;
+pub const NT_PRSTATUS: u32 = 1;
+pub const NT_PRPSINFO: u32 = 3;
+pub const NT_AUXV: u32 = 6;
+pub const NT_SIGINFO: u32 = 0x5349_4749;
+pub const NT_FILE: u32 = 0x4649_4c45;
 
 /// Every note in a core file belongs to the `CORE` owner.
-const NOTE_OWNER: &[u8] = b"CORE\0";
+pub const NOTE_OWNER: &[u8] = b"CORE\0";
 
 /// `readelf` reported `align 0x4` on the oracle's PT_NOTE: note fields are
 /// 4-byte aligned even in a 64-bit core.
-const NOTE_ALIGN: usize = 4;
+pub const NOTE_ALIGN: usize = 4;
 
-const ELF_CLASS64: u8 = 2;
+pub const ELF_CLASS64: u8 = 2;
 const ELF_DATA_LSB: u8 = 1;
 const ELF_VERSION_CURRENT: u8 = 1;
-const ET_CORE: u16 = 4;
-const EM_AARCH64: u16 = 183;
-const PT_LOAD: u32 = 1;
-const PT_NOTE: u32 = 4;
+pub const ET_CORE: u16 = 4;
+pub const EM_AARCH64: u16 = 183;
+pub const PT_LOAD: u32 = 1;
+pub const PT_NOTE: u32 = 4;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
 
 /// Note payload sizes the oracle core reported (`readelf -n`). They are the
 /// ABI authority the `wire` structs are checked against at compile time.
-const ORACLE_PRSTATUS_SIZE: usize = 0x188;
-const ORACLE_PRPSINFO_SIZE: usize = 0x88;
-const ORACLE_SIGINFO_SIZE: usize = 0x80;
+pub const ORACLE_PRSTATUS_SIZE: usize = 0x188;
+pub const ORACLE_PRPSINFO_SIZE: usize = 0x88;
+pub const ORACLE_SIGINFO_SIZE: usize = 0x80;
 
 const EHDR_SIZE: u16 = 64;
 const PHDR_SIZE: u16 = 56;
@@ -69,7 +69,7 @@ const NT_FILE_PAGE_SIZE: u64 = GUEST_PAGE as u64;
 /// Guest page granularity: carrick's guests are 4 KiB-paged Linux regardless
 /// of the host's 16 KiB pages, and both `PT_LOAD` alignment and `NT_FILE`'s
 /// page size describe the GUEST.
-const GUEST_PAGE: usize = 4096;
+pub const GUEST_PAGE: usize = 4096;
 
 /// `elf_gregset_t` on aarch64: x0-x30, sp, pc, pstate.
 pub const AARCH64_GREGS: usize = 34;
@@ -181,11 +181,11 @@ fn push_note(out: &mut Vec<u8>, note_type: u32, desc: &[u8]) {
 /// padding and its byte image is fully initialised — which is what makes
 /// [`as_bytes`] sound and lets `size_of` be the authority on layout instead of
 /// a hand-counted offset.
-mod wire {
+pub mod wire {
     /// `struct elf_siginfo` — the three-int summary embedded in prstatus.
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
-    pub(super) struct ElfSiginfo {
+    pub struct ElfSiginfo {
         pub si_signo: i32,
         pub si_code: i32,
         pub si_errno: i32,
@@ -193,7 +193,7 @@ mod wire {
 
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
-    pub(super) struct Timeval {
+    pub struct Timeval {
         pub tv_sec: i64,
         pub tv_usec: i64,
     }
@@ -202,7 +202,7 @@ mod wire {
     /// reader tells threads apart — while the rest describe the process.
     #[repr(C)]
     #[derive(Clone, Copy)]
-    pub(super) struct ElfPrStatus {
+    pub struct ElfPrStatus {
         pub pr_info: ElfSiginfo,
         pub pr_cursig: i16,
         pub _pad0: u16,
@@ -226,7 +226,7 @@ mod wire {
     /// `struct elf_prpsinfo` — process identity.
     #[repr(C)]
     #[derive(Clone, Copy)]
-    pub(super) struct ElfPrPsInfo {
+    pub struct ElfPrPsInfo {
         pub pr_state: u8,
         pub pr_sname: u8,
         pub pr_zomb: u8,
@@ -247,7 +247,7 @@ mod wire {
     /// SIGSEGV/SIGBUS arm of the union, which leads with `si_addr`.
     #[repr(C)]
     #[derive(Clone, Copy)]
-    pub(super) struct SigInfo {
+    pub struct SigInfo {
         pub si_signo: i32,
         pub si_errno: i32,
         pub si_code: i32,
@@ -259,7 +259,7 @@ mod wire {
     /// The ELF file header.
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
-    pub(super) struct Elf64Ehdr {
+    pub struct Elf64Ehdr {
         pub e_ident: [u8; 16],
         pub e_type: u16,
         pub e_machine: u16,
@@ -279,7 +279,7 @@ mod wire {
     /// One program header.
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
-    pub(super) struct Elf64Phdr {
+    pub struct Elf64Phdr {
         pub p_type: u32,
         pub p_flags: u32,
         pub p_offset: u64,
@@ -293,7 +293,7 @@ mod wire {
     /// The fixed head of an ELF note, before the padded name and descriptor.
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
-    pub(super) struct NoteHeader {
+    pub struct NoteHeader {
         pub n_namesz: u32,
         pub n_descsz: u32,
         pub n_type: u32,
