@@ -64,3 +64,39 @@ goal.
 
 What is safe to conclude today: **inside the fork path, attack
 `PrivateSnapshot`, and nothing else.**
+
+## Follow-up: whole-run CPU attribution (same day)
+
+A `profile-997` sample over the same fixture, screened on the target and its
+progeny and **excluding the profiler's own pid** (the 2026-08-02 lesson), with
+kernel and user PCs counted separately:
+
+| | samples | share |
+| --- | ---: | ---: |
+| kernel PC | 3,590 | 88.7% |
+| user PC | 456 | 11.3% |
+
+User time by module (top): `carrick` 228, `libsystem_malloc` 70,
+`libsystem_platform` 66, `libsystem_kernel` 33, `Hypervisor` 28.
+
+**Read this carefully — 88.7% "kernel" is NOT 88.7% overhead.** Under HVF the
+guest executes inside `hv_vcpu_run`, which is a kernel call, so guest
+execution is sampled as kernel PC. This bucket therefore mixes the guest's own
+useful work with carrick's host-side syscall service and fault handling, and
+the two cannot be separated by this instrument.
+
+Note also that it does not agree with the `/usr/bin/time` split of 54% user /
+46% sys on the untraced run, which is expected for the same reason: `time`
+attributes hypervisor-entered guest execution differently from a PC sampler.
+Neither is wrong; they answer different questions. Do not quote 88.7% as an
+overhead figure.
+
+The measurement that would actually separate them is a sampler that
+distinguishes samples taken inside `hv_vcpu_run` from those outside it — i.e.
+guest execution versus host service. That is the next instrument to build, and
+it is the precondition for judging whether K2's fork-path remit can reach the
+2.3 CPU-s bar or whether the remaining CPU is in the syscall path and exec.
+
+What survives from user-side attribution: carrick's own text is about half of
+user time and malloc about 15%, so host-side allocation is a real but
+second-order bucket.
