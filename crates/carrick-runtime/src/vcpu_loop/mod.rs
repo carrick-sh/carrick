@@ -3053,7 +3053,13 @@ where
                             kernel.dispatcher.cleanup_sysv_ipc_on_process_exit();
                             forked_child_die_by_signal(11, &out, &err);
                         }
-                        let result = assemble_run_result(&kernel, 128 + 11, traps, false);
+                        let result = assemble_run_result(
+                            &kernel,
+                            128 + 11,
+                            Some(crate::linux_abi::LINUX_SIGSEGV),
+                            traps,
+                            false,
+                        );
                         return Ok(VcpuLoopOutcome::ProcessExit(Box::new(result)));
                     }
                     continue;
@@ -3187,7 +3193,7 @@ where
                         kernel.dispatcher.cleanup_sysv_ipc_on_process_exit();
                         unsafe { libc::_exit(code) };
                     }
-                    let result = assemble_run_result(&kernel, code, traps, false);
+                    let result = assemble_run_result(&kernel, code, None, traps, false);
                     return Ok(VcpuLoopOutcome::ProcessExit(Box::new(result)));
                 }
                 DispatchOutcome::SignalDeath { signum } => {
@@ -3231,7 +3237,7 @@ where
                         kernel.dispatcher.cleanup_sysv_ipc_on_process_exit();
                         unsafe { libc::_exit(code) };
                     }
-                    let result = assemble_run_result(&kernel, code, traps, false);
+                    let result = assemble_run_result(&kernel, code, None, traps, false);
                     return Ok(VcpuLoopOutcome::ProcessExit(Box::new(result)));
                 }
                 DispatchOutcome::Returned { value } => {
@@ -3426,7 +3432,13 @@ where
                                 kernel.dispatcher.cleanup_sysv_ipc_on_process_exit();
                                 forked_child_die_by_signal(11, &out, &err);
                             }
-                            let result = assemble_run_result(&kernel, 128 + 11, traps, false);
+                            let result = assemble_run_result(
+                                &kernel,
+                                128 + 11,
+                                Some(crate::linux_abi::LINUX_SIGSEGV),
+                                traps,
+                                false,
+                            );
                             return Ok(VcpuLoopOutcome::ProcessExit(Box::new(result)));
                         }
                         Err(e) => return Err(e.into()),
@@ -3600,7 +3612,7 @@ where
             }
         }
 
-        let result = assemble_run_result(&kernel, -1, state.max_traps, true);
+        let result = assemble_run_result(&kernel, -1, None, state.max_traps, true);
         Ok(VcpuLoopOutcome::TrapLimit(Box::new(result)))
     })();
     // Every terminal HVPatch process transition (root or in-process child)
@@ -3643,7 +3655,7 @@ where
                 Ok(VcpuLoopOutcome::ProcessExit(run) | VcpuLoopOutcome::TrapLimit(run)) => {
                     (**run).clone()
                 }
-                Err(_) => assemble_run_result(&kernel, 127, 0, false),
+                Err(_) => assemble_run_result(&kernel, 127, None, 0, false),
                 Ok(VcpuLoopOutcome::ThreadDone) => unreachable!("non-terminal outcome"),
             };
             final_result.stdout = kernel.dispatcher.stdout();
@@ -3724,7 +3736,17 @@ where
                         }
                     }
                 }
-                let current_parent = match process.publish_exit_status(published_exit_code) {
+                // The wait status is built from the RunResult, which knows
+                // whether a signal killed this process. `core_dumped` is false
+                // until the crash path writes an actual ELF core — setting the
+                // bit without producing a file is the divergence
+                // `conformance-probes/src/bin/coredumpfile.rs` exists to gate,
+                // and it is decided HERE so the bit and the file can only ever
+                // be decided together.
+                let published_status = crate::kernel::LinuxWaitStatus::from_wait_encoding(
+                    final_result.wait_status_encoding(false),
+                );
+                let current_parent = match process.publish_exit_status(published_status) {
                     Ok(parent) => parent,
                     Err(error) => {
                         tracing::error!(
@@ -3894,6 +3916,7 @@ fn write_hvpatch_child_output(fd: i32, mut bytes: &[u8]) -> std::io::Result<()> 
 pub(crate) fn assemble_run_result(
     kernel: &Kernel,
     exit_code: i32,
+    terminating_signal: Option<i32>,
     traps: usize,
     trap_limit_hit: bool,
 ) -> RunResult {
@@ -3902,6 +3925,7 @@ pub(crate) fn assemble_run_result(
     let report = kernel.reporter.snapshot();
     RunResult {
         exit_code,
+        terminating_signal,
         stdout: kernel.dispatcher.stdout(),
         stderr: kernel.dispatcher.stderr(),
         traps,
@@ -3993,7 +4017,7 @@ fn service_signals_threaded<E: ThreadedEngine>(
                     let err = kernel.dispatcher.stderr();
                     forked_child_die_by_signal(signum, &out, &err);
                 }
-                let result = assemble_run_result(kernel, 128 + signum, traps, false);
+                let result = assemble_run_result(kernel, 128 + signum, Some(signum), traps, false);
                 return Ok(Some(VcpuLoopOutcome::ProcessExit(Box::new(result))));
             }
         }

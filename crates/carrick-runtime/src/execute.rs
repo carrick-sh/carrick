@@ -32,6 +32,7 @@ fn is_entrypoint_not_found(e: &RuntimeError) -> bool {
 fn entrypoint_not_found_result() -> RunResult {
     RunResult {
         exit_code: 127,
+        terminating_signal: None,
         stdout: Vec::new(),
         stderr: Vec::new(),
         traps: 0,
@@ -63,6 +64,7 @@ fn is_entrypoint_not_executable(e: &RuntimeError) -> bool {
 fn entrypoint_not_executable_result() -> RunResult {
     RunResult {
         exit_code: 126,
+        terminating_signal: None,
         stdout: Vec::new(),
         stderr: Vec::new(),
         traps: 0,
@@ -387,6 +389,7 @@ impl Runtime {
                     })?;
                     return Ok(RunResult {
                         exit_code: code,
+                        terminating_signal: None,
                         stdout: Vec::new(),
                         stderr: Vec::new(),
                         traps: 0,
@@ -507,6 +510,7 @@ impl Runtime {
                     })?;
                     return Ok(RunResult {
                         exit_code: code,
+                        terminating_signal: None,
                         stdout: Vec::new(),
                         stderr: Vec::new(),
                         traps: 0,

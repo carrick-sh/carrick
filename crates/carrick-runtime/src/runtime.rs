@@ -722,6 +722,7 @@ fn maybe_fork_ns_supervisor() -> Result<SupervisorRole, RuntimeError> {
     }
     Ok(SupervisorRole::Parent(RunResult {
         exit_code: code,
+        terminating_signal: None,
         stdout: Vec::new(),
         stderr: Vec::new(),
         traps: 0,
@@ -1076,6 +1077,7 @@ where
                         }
                         return Ok(RunResult {
                             exit_code: 128 + signum,
+                            terminating_signal: Some(signum),
                             stdout: dispatcher.stdout().to_vec(),
                             stderr: dispatcher.stderr().to_vec(),
                             traps,
@@ -1146,6 +1148,7 @@ where
                 dispatcher.cleanup_sysv_ipc_on_process_exit();
                 return Ok(RunResult {
                     exit_code: code,
+                    terminating_signal: None,
                     stdout: dispatcher.stdout().to_vec(),
                     stderr: dispatcher.stderr().to_vec(),
                     traps,
@@ -1161,6 +1164,7 @@ where
                 dispatcher.cleanup_sysv_ipc_on_process_exit();
                 return Ok(RunResult {
                     exit_code: 128 + signum,
+                    terminating_signal: Some(signum),
                     stdout: dispatcher.stdout().to_vec(),
                     stderr: dispatcher.stderr().to_vec(),
                     traps,
@@ -1624,6 +1628,7 @@ where
                 dispatcher.cleanup_sysv_ipc_on_process_exit();
                 return Ok(RunResult {
                     exit_code: 128 + signum,
+                    terminating_signal: Some(signum),
                     stdout: dispatcher.stdout().to_vec(),
                     stderr: dispatcher.stderr().to_vec(),
                     traps,
@@ -1636,6 +1641,7 @@ where
 
     Ok(RunResult {
         exit_code: -1,
+        terminating_signal: None,
         stdout: dispatcher.stdout().to_vec(),
         stderr: dispatcher.stderr().to_vec(),
         traps: max_traps,

@@ -385,15 +385,21 @@ impl ProcessContext {
     /// Bank/ASID retirement is deliberately separate so the runtime can order
     /// output and fd finalization first, then publish the zombie/pidfd wake,
     /// then serialize backend retirement under the topology lock.
+    /// `status` is the Linux `wait(2)` encoding, built by
+    /// [`crate::run_result::RunResult::wait_status_encoding`] so that signal death and
+    /// normal exit cannot be confused. This used to take a bare exit code and
+    /// encode `(code & 0xff) << 8` unconditionally, which reported every guest
+    /// crash as a NORMAL exit with status `128 + signum`: `WIFSIGNALED` false,
+    /// `WTERMSIG` never consulted. Under the VMM/native lanes the host child
+    /// genuinely died of the signal and the host `waitpid` carried the truth;
+    /// here a Linux process is a thread, so this is the only place the truth
+    /// can come from.
     pub(crate) fn publish_exit_status(
         &self,
-        exit_code: i32,
+        status: crate::kernel::LinuxWaitStatus,
     ) -> Result<Option<crate::kernel::TaskKey>, String> {
         self.kernel_graph()
-            .exit_task_key_eventually(
-                self.task_key(),
-                crate::kernel::LinuxWaitStatus::from_wait_encoding((exit_code & 0xff) << 8),
-            )
+            .exit_task_key_eventually(self.task_key(), status)
             .map(|zombie| zombie.parent)
             .map_err(|error| error.to_string())
     }
@@ -996,7 +1002,11 @@ mod tests {
 
     fn finalize_test_child(process: &ProcessContext, exit_code: i32, tid: crate::thread::ThreadId) {
         let event = process.record_process_exit_begin(exit_code, tid);
-        let _ = process.publish_exit_status(exit_code).unwrap();
+        let _ = process
+            .publish_exit_status(crate::kernel::LinuxWaitStatus::from_wait_encoding(
+                (exit_code & 0xff) << 8,
+            ))
+            .unwrap();
         process.retire_address_space(exit_code, tid).unwrap();
         process.record_process_exit_commit(event);
     }

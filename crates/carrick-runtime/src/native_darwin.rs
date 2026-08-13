@@ -2745,16 +2745,22 @@ fn run_image_in_child(
     let stdout = join_reader(stdout_reader, "stdout")?;
     let stderr = join_reader(stderr_reader, "stderr")?;
 
+    // The host child's wait status still knows which domain this is; keep that
+    // rather than collapsing both into `128 + n`, which cannot be told apart
+    // from a guest that called `exit(139)`.
+    let terminating_signal = libc::WIFSIGNALED(status)
+        .then(|| crate::host_signal::host_to_linux_signum(libc::WTERMSIG(status)));
     let exit_code = if libc::WIFEXITED(status) {
         libc::WEXITSTATUS(status)
-    } else if libc::WIFSIGNALED(status) {
-        128 + crate::host_signal::host_to_linux_signum(libc::WTERMSIG(status))
+    } else if let Some(signum) = terminating_signal {
+        128 + signum
     } else {
         125
     };
 
     Ok(RunResult {
         exit_code,
+        terminating_signal,
         stdout,
         stderr,
         traps: 0,
