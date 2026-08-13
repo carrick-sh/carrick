@@ -133,14 +133,71 @@ carrick`carrick_runtime::dispatch::mem::…::mmap+0xda0
 carrick`…::dispatch_threaded_captured
 ```
 
-That is `let mut bytes = vec![0; length_usize];` (`dispatch/mem.rs:2792`) — the
-**eager snapshot buffer** carrick allocates for a file mapping it did not lower
-to a host file mapping, which is then filled by
-`bytes[..available.len()].copy_from_slice(&available)` or a `pread`.
+**Neither is the guest touching its own memory:** this is inside carrick's own
+service window, with the guest stopped.
 
-**The three `zero_backing` sites are NOT the source** — the census shows `brk`,
-`mremap` and `madvise` producing 29 `zfod` between them — and neither is the
-guest touching its own memory: this is inside carrick's own service window.
+### CORRECTION — the first attribution of that `__bzero` was wrong
+
+This document originally named `let mut bytes = vec![0; length_usize]`
+(`dispatch/mem.rs:2792`), the eager snapshot buffer for a *file* mapping, and
+concluded that the file-backed lowering's `!PROT_EXEC` guard was the blocker.
+**That was inferred from code reading and is refuted by measurement.** The
+inference was: the anonymous branch allocates `Vec::new()`, so a `bzero` inside
+`mmap` must come from the file branch. It does not — the anonymous path zeroes
+through a *different* call that inlines into the same function.
+
+`scripts/dtrace/hvpatch-mmap-shape-census.d` buckets every guest `mmap` by
+(anonymous?, sharing, prot) and attributes each bucket's in-window faults:
+
+| mmap shape | calls | bytes requested | in-window `zfod` |
+| --- | ---: | ---: | ---: |
+| **anon / private / RW-** | 1,261 | **3.11 GB** | **145,453** |
+| file / shared / R-- | 56 | 15.3 MB | 890 |
+| file / private / R-X | 2 | 3.5 MB | 433 |
+| anon / private / `---` (PROT_NONE reserve) | 525 | **83.7 GB** | **4** |
+| file / private / R-- | 14 | 380 KB | 27 |
+| everything else | 70 | 4.3 MB | 2 |
+| total | 1,928 | — | 146,809 |
+
+**99.1% of the faults are ANONYMOUS private read-write mappings.** All file
+mappings together contribute ~1,350, so the file-backed lowering and its
+`PROT_EXEC` guard are a **red herring for this term** — a whole phase would
+have been aimed at 0.9% of it.
+
+Note also that **PROT_NONE reserves are already correctly lazy**: 525 calls
+reserving 83.7 GB take *four* faults between them. Reservation is not the
+problem; commitment is.
+
+### The real chain, exactly
+
+```text
+dispatch/mem.rs  mmap  →  GuestMemory::zero_anonymous_reuse
+                             (DEFAULT impl, carrick-guest-mem/src/lib.rs:456)
+                          →  zero_backing
+                          →  HvfVmState::zero_guest_backing
+                             (carrick-vmm-hvf/src/trap.rs:4795)
+                          →  core::ptr::write_bytes(…, 0, length)  →  __bzero
+```
+
+The whole chain inlines into `mmap`, which is why the stack shows `__bzero`
+called directly from it.
+
+**The gap is now a single sentence.** `zero_anonymous_reuse` is a trait method
+with a memset default. The native lane **overrides** it
+(`carrick-dsr-aarch64/src/mapped_memory.rs:4252`) with the 2026-08-07 remap
+that collapsed its in-window `zfod` 553k → ~723. **The HVF backend does not
+override it at all**, so the kernel lane takes the memset default and pays
+145,453 faults for it.
+
+The three `zero_backing` call sites in `dispatch/mem.rs` (`brk` shrink,
+`mremap` reuse, `MADV_DONTNEED`) remain confirmed non-sources — those three
+guest ops produce 29 `zfod` between them.
+
+**How much of that 3.11 GB genuinely needs scrubbing is a separate open
+question.** The arena skips zero-fill above its high-water mark and scrubs
+below it; ~77% of the requested anonymous bytes are being touched, so either
+the reuse is real or the high-water heuristic is being defeated. Answering that
+decides whether KF should make the scrub cheap or remove the need for it.
 
 ### A consequence that changes the fix
 

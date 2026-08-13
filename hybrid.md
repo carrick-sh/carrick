@@ -257,37 +257,48 @@ build takes 279,987 `as_fault` and 230,298 `zfod`; 150,749 of those land inside
 per-fault cost that term is on the order of the whole ~1.97 CPU-s the goal must
 remove. Nothing else measured on this lane is that size.
 
-**The mechanism is named.** 145,429 of 146,531 in-window `zfod` have exactly
-one caller: `__bzero` from `dispatch/mem.rs:2792`,
-`let mut bytes = vec![0; length_usize]` — the **eager snapshot buffer** carrick
-allocates for a file mapping it did not lower to a host file mapping, then
-immediately overwrites. Not the `zero_backing` scrub (29 faults across `brk`,
-`mremap` and `madvise` combined), and not the guest touching its own memory.
+**The mechanism is named, and the gap is one sentence.** Bucketing every guest
+`mmap` by shape shows **99.1% of the faults are ANONYMOUS / private /
+read-write mappings** — 1,261 calls, 3.11 GB, 145,453 faults. All file mappings
+together contribute ~1,350. PROT_NONE reserves are already correctly lazy: 525
+calls reserving 83.7 GB take *four* faults between them. The chain is
 
-**And the obvious fix is the wrong one.** Removing the double-write does not
-remove a single fault — the page is faulted on first touch either way, so
-skipping the `bzero` just moves the fault to the `copy_from_slice`. The fault
-disappears only if the buffer is never materialized, i.e. if the mapping is
-lowered to a host file mapping and Darwin demand-pages it.
+```text
+mmap → GuestMemory::zero_anonymous_reuse   (DEFAULT impl, memset)
+     → zero_backing → HvfVmState::zero_guest_backing → __bzero
+```
 
-That lowering exists and is default-on; it refuses these mappings on its own
-guards, the load-bearing one being `!PROT_EXEC`. Program text is exactly the
-large, frequently-mapped case, excluded because "executable content must flow
-through the write path's W^X/translation-invalidation metadata"
-(`dispatch/mem.rs:2755`). **Whether that reason still holds on a lane that
-PATCHES static text rather than translating it is KF's first design question,
-and it is a correctness question, not a performance one.** Answer it before
-writing code.
+and `zero_anonymous_reuse` is a trait method the **native lane overrides**
+(`carrick-dsr-aarch64/src/mapped_memory.rs:4252`, the 2026-08-07 remap that
+took its in-window `zfod` 553k → ~723) and the **HVF lane does not override at
+all**. The kernel lane takes the memset default and pays 145,453 faults for it.
 
-The native lane's 2026-08-07 result (in-window `zfod` 553k → ~723,
-[anon-reuse-remap](docs/perf-results/2026-08-07-anon-reuse-remap.md)) is the
-right shape but does **not** port: it lives in
-`carrick-dsr-aarch64::mapped_memory`, and the kernel lane's
-`HvfInner::zero_guest_backing` (`carrick-vmm-hvf/src/trap.rs:4795`) is a plain
-memset whose arena is `hv_vm_map`'d into stage-2, so replacing host pages under
-a live IPA would leave the guest reading the old ones. **Invariant 9 is binding:**
-anonymous `mmap` returning zeroed pages is not tradeable, so the lever must
-remove the work, not the guarantee.
+> [!WARNING]
+> **An earlier revision of this section blamed the file-mapping eager buffer
+> and the `!PROT_EXEC` lowering guard. That was code reading, and measurement
+> refuted it** — it would have aimed a whole phase at 0.9% of the term. The
+> record is corrected in
+> [the ledger](docs/perf-results/2026-08-13-hvpatch-kernel-lane-amp-ledger.md).
+> Two rules earned this the hard way, in one afternoon: *verify diagnoses
+> empirically*, and *rank by measured CPU, never by inference.*
+
+**Two traps already found, so KF does not re-pay them:**
+
+- Removing the zero-then-overwrite double-write removes **no** faults. The page
+  faults on first touch either way; skipping the `bzero` moves the fault, it
+  does not delete it.
+- The native fix does not port as-is: the kernel lane's arena is `hv_vm_map`'d
+  into stage-2, so replacing host pages under a live IPA may leave the guest
+  reading the old ones. Whether HVF actually behaves that way is the phase's
+  first thing to establish, not assume.
+
+**The open question that picks the design:** the arena skips zero-fill above
+its high-water mark and scrubs below it, yet ~77% of requested anonymous bytes
+are being touched. Either the reuse is genuine, or the high-water heuristic is
+being defeated by the guest's allocator pattern. That decides whether KF makes
+the scrub cheap or removes the need for it. **Invariant 9 is binding either
+way:** anonymous `mmap` returning zeroed pages is not tradeable, so the lever
+must remove the work, not the guarantee.
 
 **Gate:** in-window `zfod` on the cold build **below 10,000** (from 150,749);
 total `as_fault` **below 60,000** (from 279,987); the anonymous-zero guarantee
