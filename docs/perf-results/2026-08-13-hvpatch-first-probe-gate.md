@@ -166,3 +166,47 @@ id was written and **reverted**: it did not change the observed child pid, and
 this tree does not keep an unproven path that changes nothing measurable. The
 next step is to find why the child's dispatch does not reach a bound kernel
 context — not to add another fallback.
+
+### The root, one level deeper: the kernel's id space is seeded from the HOST pid
+
+Following the child's pid to its source settles it. Three observations from one
+forked child on the kernel lane:
+
+```text
+$$ (getpid)              55234
+/proc/self               1          <- wrong: says every process is init
+/proc/self/stat field 1  55233
+kill -0 1                ok         <- init IS reachable at pid 1
+```
+
+Host-magnitude, consecutive, and one apart. The allocator explains both:
+
+```text
+dispatch/mod.rs:2475   let observed_pid = i32::try_from(std::process::id())   <- HOST pid
+kernel/core.rs:222     task_id: TaskId::for_root_bootstrap(observed_pid)
+kernel/core.rs:546     IdRegistry::with_root(bootstrap.task_id)
+kernel/registry.rs:31  let next = root.raw().checked_add(1)                   <- allocate from root+1
+```
+
+**The kernel's task-id registry is seeded from `std::process::id()`.** The root
+task takes the host pid, and every guest process is allocated from `host_pid +
+1` upward. Linux starts at 1 and hands out small sequential pids; carrick hands
+out 55233, 55234, 55235.
+
+The container init escapes it only because `virtual_pid` is separately forced
+to 1 for the bootstrap process, which masks the problem for exactly one
+process — the one most tests look at first.
+
+**This is the fourth instance of one pattern, and it is the root of the other
+three.** `times`/`getrusage`, `stime`, and the forked child's `getpid` were all
+symptoms of the host process standing in for guest identity; this is that
+substitution at the point where identity is CREATED. It is also why
+`/proc/self` answers 1 for every process, which is a fifth symptom of the same
+thing.
+
+**The fix is to seed the kernel's id space at 1** — Linux's init is pid 1 — so
+children get 2, 3, 4. It is a small change with a wide blast radius: task ids
+feed pidfds, process groups, sessions, `/proc`, `wait4` and every signal
+target, so it needs its own careful pass and its own gate run, not a
+drive-by. It is the highest-value single fix available on this lane: it is
+upstream of the largest failing cluster and of two clusters beyond it.
