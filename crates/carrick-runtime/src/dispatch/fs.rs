@@ -14144,6 +14144,72 @@ mod tests {
         assert!(reporter.finish().unhandled_syscalls.is_empty());
     }
 
+    /// `close(2)` must retire the descriptor's `fd_open_paths` entry.
+    ///
+    /// Only one close path used to clear it, so a path-opened descriptor left
+    /// a permanent entry claiming a freed fd number. The K1 coherent snapshot
+    /// refuses such a table, which is how this surfaced: a live
+    /// `carrick debug hvpatch-kernel` against `sleep` under HVPatch reported
+    /// "file-table open-path index names no live slot" with the orphan
+    /// `(3, "/usr/lib/locale/C.utf8/LC_CTYPE")` — glibc's locale file, opened,
+    /// mapped, and closed during startup.
+    #[test]
+    fn close_retires_the_fd_open_path_entry() {
+        let scratch = tempfile::tempdir().unwrap();
+        let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
+            .unwrap();
+        let backend = crate::fs_backend::HostFsBackend::from_existing_dir(dir);
+        backend
+            .set_file_contents("/locale.bin", b"payload".to_vec())
+            .unwrap();
+
+        let reporter = CompatReporter::default();
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(backend));
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+        memory.write_bytes(0x4000, b"/locale.bin\0").unwrap();
+
+        let context = dispatcher.capture_one_task_context().unwrap();
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        56,
+                        SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, 0, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 3 }
+        );
+        assert!(
+            context
+                .resources()
+                .files()
+                .read_fd_open_paths()
+                .contains_key(&3),
+            "a path-opened host descriptor must record its open path"
+        );
+
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(57, SyscallArgs::from([3, 0, 0, 0, 0, 0])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert!(
+            context.resources().files().read_fd_open_paths().is_empty(),
+            "close must retire the open-path entry; a freed fd cannot own a path"
+        );
+    }
+
     #[test]
     fn openat2_resolve_no_symlinks_rejects_link_path() {
         let scratch = tempfile::tempdir().unwrap();
