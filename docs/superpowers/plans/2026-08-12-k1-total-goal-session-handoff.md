@@ -94,15 +94,40 @@ Relaxing only the reserve-time check moves the failure to commit: for
 `child_parent_revision = caller_revision` and commit re-checks it
 (`ForkParentChanged`).
 
-Fix shape: gaining a child must not invalidate a sibling's in-flight fork.
-Commit already holds the registry write lock, so it can read the parent's
-current revision and advance from it atomically; the captured revision
-should only prove the parent *task generation* is unchanged, which the
-`task.key()` comparison already does. **Write red tests for concurrent
-sibling forks (and a fork racing a sibling's exec) before touching the
-transaction contract.** Then re-run the go fixture for the 68/67/69 receipt
-and re-measure the cold build, which has had no product-visible number since
-the ~4.27 CPU-s reading of 2026-08-09.
+**The obvious fix was tried and is WRONG — do not repeat it.** Dropping the
+`caller_record.revision != parent.revision` check in `reserve_fork` (and the
+matching `ForkParentChanged` check in commit, advancing from the current
+revision as `PreparedThreadClone::commit` does) makes concurrent sibling
+forks pass, but the suite catches two regressions:
+
+- `stale_context_cannot_commit_a_fork` — a reused context must still be
+  refused;
+- `exiting_parent_reparents_live_and_zombie_children_to_root` — **a context
+  captured before the task was REPARENTED must not fork**, or the child
+  attaches to the wrong parent.
+
+The revision is therefore load-bearing: it detects reparenting and
+association changes, not merely "gained a child". One counter cannot
+distinguish the benign advance (a sibling published a child) from the
+dangerous one (this task's parent association changed), so the two cases
+need separate signals.
+
+Fix shape, restated: give the fork path a signal that distinguishes
+"children set changed" from "parent association changed". The most direct
+option is for `KernelContext` to carry the captured parent `TaskKey` so
+`reserve_fork` can compare parent association exactly and stop leaning on
+revision equality; a separate association revision would also work.
+`PreparedThreadClone::commit` is the reference for the identity-checks-then-
+advance-from-current pattern. **Write red tests for concurrent sibling forks
+AND keep the two tests above green** — they encode real invariants. Then
+re-run the go fixture for the 68/67/69 receipt and re-measure the cold
+build, which has had no product-visible number since the ~4.27 CPU-s
+reading of 2026-08-09.
+
+The unit-level red test that proves the sibling bug is a two-fork sequence
+from one captured context, which fails with `StaleContext`; note that it
+does not perfectly model production, where each syscall captures a fresh
+context and the race is capture → sibling commits → reserve.
 
 **Reason for existence:** the next session must resume the complete K1 objective,
 not mistake the immediate FileAuthority blocker for the goal itself. This is the

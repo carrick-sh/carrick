@@ -211,13 +211,28 @@ re-checks it (`child_parent_record.revision != child_parent_revision` →
 `ForkParentChanged`), so relaxing only the reserve-time check would move the
 failure to commit rather than remove it.
 
-The shape of the fix — deliberately not applied here without room to test it
-properly — is that gaining a child must not invalidate a sibling's in-flight
-fork. Commit already holds the registry write lock, so it can read the
-parent's current revision and advance from it atomically; the captured
-revision should only prove the parent *task generation* is unchanged, which
-the `task.key()` comparison already does. Changing a lifecycle transaction
-contract needs red tests for concurrent sibling forks first.
+**The obvious fix was attempted and rejected by the suite.** Dropping the
+reserve-time revision equality and advancing from the parent's current
+revision at commit — the pattern `PreparedThreadClone::commit` already
+uses — does let concurrent sibling forks through, but breaks two real
+invariants:
+
+- `stale_context_cannot_commit_a_fork`: a reused context must stay refused;
+- `exiting_parent_reparents_live_and_zombie_children_to_root`: a context
+  captured before the task was **reparented** must not fork, or the child
+  attaches to the wrong parent.
+
+The task revision is therefore load-bearing for detecting reparenting and
+association changes, not merely "gained a child", and one counter cannot
+separate the benign advance from the dangerous one. The change was reverted;
+the tree at this commit is green.
+
+The real fix needs a signal that distinguishes "children set changed" from
+"parent association changed" — most directly, `KernelContext` carrying the
+captured parent `TaskKey` so `reserve_fork` compares parent association
+exactly instead of leaning on revision equality. That is a lifecycle
+contract change and needs red tests for concurrent sibling forks while
+keeping both invariants above green.
 
 Simple fork/exec guests are unaffected: `sh -c 'echo a; /bin/true; echo b'`,
 a three-iteration `/bin/true` loop, and `ls /` all exit 0 under HVPatch. The
