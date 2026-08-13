@@ -1575,7 +1575,7 @@ pub struct HostFsBackend {
 /// single component cannot escape it. See [`HostFsBackend::stat_cache`].
 #[cfg(target_os = "macos")]
 struct StatCacheEntry {
-    parent_fd: std::sync::Arc<std::os::fd::OwnedFd>,
+    parent_fd: std::sync::Arc<cap_std::fs::Dir>,
     /// Directory-topology generation the `parent_fd` was proven at. A dirfd
     /// follows its inode through a rename, so without this a cached leaf under
     /// a renamed directory would keep revalidating successfully — same inode,
@@ -1594,7 +1594,7 @@ struct StatCacheEntry {
 /// dirfd plus the directory-topology generation it was proven at.
 #[cfg(target_os = "macos")]
 struct DirCacheEntry {
-    fd: std::sync::Arc<std::os::fd::OwnedFd>,
+    fd: std::sync::Arc<cap_std::fs::Dir>,
     dir_generation: u64,
 }
 
@@ -1605,7 +1605,7 @@ struct DirCacheEntry {
 #[cfg(not(target_os = "macos"))]
 #[allow(dead_code)]
 struct DirCacheEntry {
-    fd: std::sync::Arc<std::os::fd::OwnedFd>,
+    fd: std::sync::Arc<cap_std::fs::Dir>,
     dir_generation: u64,
 }
 
@@ -2206,8 +2206,8 @@ impl HostFsBackend {
     /// keeps its exact existing fallback, which re-roots absolute targets under
     /// the guest root.
     #[cfg(target_os = "macos")]
-    fn dir_fd_for(&self, dir: &Path) -> Option<std::sync::Arc<std::os::fd::OwnedFd>> {
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    fn dir_fd_for(&self, dir: &Path) -> Option<std::sync::Arc<cap_std::fs::Dir>> {
+        use std::os::fd::AsRawFd;
         use std::sync::atomic::Ordering::Relaxed;
 
         if !self.fast_fs {
@@ -2248,8 +2248,9 @@ impl HostFsBackend {
                     if raw < 0 {
                         return None;
                     }
-                    // SAFETY: `raw` is a freshly-dup'd owned fd.
-                    let fd = std::sync::Arc::new(unsafe { OwnedFd::from_raw_fd(raw) });
+                    // SAFETY: `raw` is a freshly-dup'd owned dir fd; `Dir` takes
+                    // ownership and closes it on drop.
+                    let fd = std::sync::Arc::new(dir_from_raw_fd(raw));
                     self.publish_dir_fd(Path::new(""), &fd, generation);
                     fd
                 }
@@ -2313,8 +2314,8 @@ impl HostFsBackend {
                 // sees an empty cache and rebuilds only what this path needs.
                 return self.dir_fd_for_after_reclaim(dir, generation);
             }
-            // SAFETY: `raw` is a freshly-opened owned fd.
-            let fd = std::sync::Arc::new(unsafe { OwnedFd::from_raw_fd(raw) });
+            // SAFETY: `raw` is a freshly-opened owned dir fd.
+            let fd = std::sync::Arc::new(dir_from_raw_fd(raw));
             self.publish_dir_fd(&walked, &fd, generation);
             current = fd;
         }
@@ -2330,15 +2331,15 @@ impl HostFsBackend {
         &self,
         dir: &Path,
         generation: u64,
-    ) -> Option<std::sync::Arc<std::os::fd::OwnedFd>> {
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    ) -> Option<std::sync::Arc<cap_std::fs::Dir>> {
+        use std::os::fd::AsRawFd;
 
         let raw = unsafe { libc::dup(self.dir.as_raw_fd()) };
         if raw < 0 {
             return None;
         }
-        // SAFETY: `raw` is a freshly-dup'd owned fd.
-        let mut current = std::sync::Arc::new(unsafe { OwnedFd::from_raw_fd(raw) });
+        // SAFETY: `raw` is a freshly-dup'd owned dir fd.
+        let mut current = std::sync::Arc::new(dir_from_raw_fd(raw));
         self.publish_dir_fd(Path::new(""), &current, generation);
         let flags = libc::O_RDONLY
             | libc::O_DIRECTORY
@@ -2353,8 +2354,8 @@ impl HostFsBackend {
             if raw < 0 {
                 return None;
             }
-            // SAFETY: `raw` is a freshly-opened owned fd.
-            let fd = std::sync::Arc::new(unsafe { OwnedFd::from_raw_fd(raw) });
+            // SAFETY: `raw` is a freshly-opened owned dir fd.
+            let fd = std::sync::Arc::new(dir_from_raw_fd(raw));
             self.publish_dir_fd(&walked, &fd, generation);
             current = fd;
         }
@@ -2365,12 +2366,7 @@ impl HostFsBackend {
     /// cache, which costs re-opens and never correctness — every served entry
     /// is independently generation-checked.
     #[cfg(target_os = "macos")]
-    fn publish_dir_fd(
-        &self,
-        dir: &Path,
-        fd: &std::sync::Arc<std::os::fd::OwnedFd>,
-        generation: u64,
-    ) {
+    fn publish_dir_fd(&self, dir: &Path, fd: &std::sync::Arc<cap_std::fs::Dir>, generation: u64) {
         const DIR_CACHE_MAX_ENTRIES: usize = 4096;
         let mut cache = self.dir_cache.lock();
         if cache.len() >= DIR_CACHE_MAX_ENTRIES {
@@ -2400,7 +2396,7 @@ impl HostFsBackend {
     fn namei_leaf(
         &self,
         rel: &Path,
-    ) -> Option<(std::sync::Arc<std::os::fd::OwnedFd>, std::ffi::CString)> {
+    ) -> Option<(std::sync::Arc<cap_std::fs::Dir>, std::ffi::CString)> {
         let name = rel.file_name()?;
         let name_c = cstring_from_osstr(name)?;
         let parent = rel.parent().unwrap_or_else(|| Path::new(""));
@@ -3478,6 +3474,24 @@ impl HostFsBackend {
         {
             return Ok((DirAt::Anchor(anchor), std::borrow::Cow::Owned(tail)));
         }
+        // Serve the parent from the kernel directory cache and hand the caller
+        // a SINGLE-component path. This is the one change that reaches every
+        // cap-std call site at once: cap-std resolves what it is given
+        // component by component, so given one component it makes one syscall,
+        // and the prefix it used to re-walk on every call is already open.
+        //
+        // Only worthwhile once the path has a parent to amortise — a
+        // single-component path is already one component against the root.
+        #[cfg(target_os = "macos")]
+        if rel.parent().is_some_and(|p| !p.as_os_str().is_empty())
+            && let Some(leaf) = rel.file_name()
+            && let Some(parent) = self.dir_fd_for(rel.parent().unwrap_or_else(|| Path::new("")))
+        {
+            return Ok((
+                DirAt::Cached(parent),
+                std::borrow::Cow::Borrowed(Path::new(leaf)),
+            ));
+        }
         Ok((DirAt::Root(&self.dir), std::borrow::Cow::Borrowed(rel)))
     }
 
@@ -4325,6 +4339,11 @@ const DEEP_PATH_CHUNK: usize = 512;
 enum DirAt<'a> {
     /// Short path: the sandbox root itself, no extra handle opened.
     Root(&'a cap_std::fs::Dir),
+    /// The path's parent, served from the kernel directory cache, with the
+    /// operation running on the single remaining leaf component. This is the
+    /// case that stops cap-std re-walking a path it has already resolved.
+    #[cfg(target_os = "macos")]
+    Cached(std::sync::Arc<cap_std::fs::Dir>),
     /// Deep path (Linux / FreeBSD): an intermediate directory opened by chunked
     /// descent; operations run on the short tail relative to it.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -4336,10 +4355,30 @@ impl std::ops::Deref for DirAt<'_> {
     fn deref(&self) -> &cap_std::fs::Dir {
         match self {
             DirAt::Root(dir) => dir,
+            #[cfg(target_os = "macos")]
+            DirAt::Cached(dir) => dir,
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             DirAt::Anchor(dir) => dir,
         }
     }
+}
+
+/// Adopt a freshly-opened directory fd as a cap-std `Dir`.
+///
+/// The fd's containment is the CALLER's proof obligation: `Dir` is an
+/// authority handle, and cap-std will resolve beneath whatever it is given.
+/// Every construction site here is a single `O_NOFOLLOW | O_DIRECTORY`
+/// component opened beneath an already-proven directory, starting at the
+/// sandbox root — see [`HostFsBackend::dir_cache`].
+///
+/// # Safety
+/// `raw` must be a freshly-opened, owned directory fd that nothing else
+/// closes; the returned `Dir` takes ownership.
+#[cfg(target_os = "macos")]
+fn dir_from_raw_fd(raw: i32) -> cap_std::fs::Dir {
+    use std::os::fd::FromRawFd;
+    // SAFETY: by this function's contract `raw` is owned and not aliased.
+    cap_std::fs::Dir::from_std_file(unsafe { std::fs::File::from_raw_fd(raw) })
 }
 
 impl FsBackend for HostFsBackend {
