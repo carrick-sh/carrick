@@ -641,7 +641,55 @@ where
                 }
                 match E::materialize_sibling(spec) {
                     Ok(mut child_engine) => {
+                        // Release the topology lock BEFORE the start handshake.
+                        //
+                        // `start_rx.recv()` is a blocking wait on the parent,
+                        // and the parent does real work between observing
+                        // `ready` and sending `start` — it installs the child's
+                        // pidfd and publishes the child. Holding the process-
+                        // wide topology lock across that wait deadlocks the
+                        // whole VM: any thread that needs the lock to make
+                        // progress blocks, the parent can then never reach its
+                        // `start` send, and the child never releases. That is
+                        // the "sibling materialization start gate timed out"
+                        // abort, and it is why raising the 10 s bound to 120 s
+                        // produced 121 s aborts instead of passes.
+                        //
+                        // It is also the general rule this tree already states:
+                        // object-lock guards are never held across a blocking
+                        // wait, thread creation, or a callback into another
+                        // subsystem.
+                        drop(topo);
                         if ready_tx.send(Ok(())).is_err() || start_rx.recv() != Ok(true) {
+                            let topo = crate::fork_quiesce::acquire_topology_lock(
+                                carrick_observability::probes::HvpatchTopologyOperation::SiblingMaterialize,
+                                child_kernel
+                                    .hvpatch_process
+                                    .as_ref()
+                                    .map_or(0, crate::hvpatch::ProcessContext::pid),
+                                tid.raw(),
+                            );
+                            child_engine.destroy_vcpu_on_thread_exit();
+                            drop(topo);
+                            return;
+                        }
+                        // Re-acquire for the kicker registration, which must
+                        // still be atomic with respect to a fork's VM teardown.
+                        // Re-check liveness under the retaken lock: the world
+                        // can have changed while we were waiting, and
+                        // registering a vCPU into a torn-down VM is exactly
+                        // what the lock exists to prevent.
+                        let topo = crate::fork_quiesce::acquire_topology_lock(
+                            carrick_observability::probes::HvpatchTopologyOperation::SiblingMaterialize,
+                            child_kernel
+                                .hvpatch_process
+                                .as_ref()
+                                .map_or(0, crate::hvpatch::ProcessContext::pid),
+                            tid.raw(),
+                        );
+                        if child_kernel.process_exiting()
+                            || child_kernel.clone_admission_cancelled()
+                        {
                             child_engine.destroy_vcpu_on_thread_exit();
                             drop(topo);
                             return;
