@@ -23,6 +23,40 @@ strips the `com.apple.security.hypervisor` entitlement, so every run dies with
 
 ---
 
+## Known flake: `carrick-native-darwin`'s `direct::tests` under `just ci`
+
+**Recorded 2026-08-13.** `just ci` intermittently fails in
+`carrick-native-darwin --lib` with a **different test each time** and one of
+two signatures:
+
+```text
+promote reservation to MAP_JIT: … "dynamic mapping relocated fixed guest
+range 0x101b80000 to 0x101b84000"
+process didn't exit successfully: … (signal: 11, SIGSEGV)
+```
+
+Observed three times in one session on `dynamic_x18_is_patched_synchronously_at_publication`,
+`pristine_dynamic_exec_discard_skips_zero_and_icache_publication`, and as a
+bare SIGSEGV. **The crate passes 126/126 standalone**, repeatedly — six clean
+runs against three `just ci` failures.
+
+The signature is address-space dependent: these tests reserve a FIXED guest
+range and promote it to `MAP_JIT`, and whether that range is free depends on
+what else the test process has mapped. Under `just ci` the crate runs
+alongside others; standalone it does not.
+
+**Attribution matters here** because it looks like a regression and is not one:
+it moves between tests run to run, and it reproduces on a tree whose only
+changes are in `carrick-runtime`, which these tests do not link. Before
+blaming a change for it, re-run the crate standalone — if it passes, this is
+the flake.
+
+It is a REAL defect, not just noise: a test that needs a fixed address should
+either reserve it deterministically or skip when it cannot. It lives on the
+`native` lane, which the controlling plan treats as a reference rather than a
+parity obligation, which is why it is recorded here rather than fixed in
+passing.
+
 ## 1. `carrick trace` — in-process libdtrace tracer
 
 ```sh
