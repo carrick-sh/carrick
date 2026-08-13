@@ -4523,7 +4523,28 @@ impl SyscallDispatcher {
                             return DispatchOutcome::errno(LINUX_EBADF);
                         }
                         if base.status_flags() & LINUX_O_APPEND != 0 {
-                            unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_END) };
+                            // Let the HOST kernel perform the append. Linux's
+                            // O_APPEND seeks to end and writes as ONE atomic
+                            // operation; emulating it as `lseek(SEEK_END)` then
+                            // a separate `write` is a race, because anything
+                            // touching the shared open description in between
+                            // moves the write. A concurrent reader that seeks
+                            // to the start sends the append to offset 0, which
+                            // is how Go build-cache archives lost their
+                            // `!<arch>\n` magic under a parallel `go build`.
+                            // Darwin honours O_APPEND natively, so ensure the
+                            // description carries it rather than approximating
+                            // the offset ourselves.
+                            let current = unsafe { libc::fcntl(host_fd.raw(), libc::F_GETFL, 0) };
+                            if current >= 0 && current & libc::O_APPEND == 0 {
+                                unsafe {
+                                    libc::fcntl(
+                                        host_fd.raw(),
+                                        libc::F_SETFL,
+                                        current | libc::O_APPEND,
+                                    )
+                                };
+                            }
                         }
                         return write_host_pipe(
                             bytes,
