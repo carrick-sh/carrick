@@ -112,8 +112,20 @@ creation — thousands per build — and repaid the walk every time.
 
 ### Gates
 
+- **`just ci` green**, exit 0, **3,884 tests passed, 0 failed** (full log
+  retained at `target/perf/ci-kn.log` — never `tail`ed into a pipe, which
+  masks the exit status).
 - `carrick-runtime` lib tests: **1,551 passed, 0 failed** (serially, per the
   `just test` recipe).
+- **Probe gate, with attribution.** `dirrenamecache` **PASSes on both gating
+  lanes** (`arm64:musl`, `arm64:gnu`) against the Docker oracle. The gate as a
+  whole FAILS on 123 `arm64:musl` probes — but that is **pre-existing and not
+  KN's**: rebuilding with only `fs_backend.rs` and `fs_resolve_cache.rs`
+  reverted to the pre-KN baseline (`53c5e2d1f`) and re-running the same gate
+  gives the **identical 123**. The failures are the `native` DSR backend
+  refusing static musl ELFs (`DSR could not read guest instruction …
+  cache-contains=false`), which is the reference lane, not the kernel lane.
+  Recorded here so a later reader does not attribute it to this change.
 - Cold `go build` completes on the signed binary, `BUILD_OK`, exit 0, on every
   sample of both arms.
 - New unit tests: reuse, the create/unlink storm, rename invalidation, and
