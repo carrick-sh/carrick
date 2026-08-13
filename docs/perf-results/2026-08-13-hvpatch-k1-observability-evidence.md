@@ -251,11 +251,32 @@ HVPatch, so neither is the cause:
   to offset 8, rewriting, and a `pwrite` at 12 produce
   `!<arch>\nBBBBCCCC` with the file offset correctly at 16.
 
-So the defect is narrower than "seek or write is broken". Remaining
-suspects, untested: the `go tool buildid -w` in-place rewrite, concurrent
-writers to one archive, or truncate/rename behaviour on the build-cache
-path. A run-scoped cold `GOCACHE` is already used, so a stale cache entry is
-excluded.
+So the defect is narrower than "seek or write is broken".
+
+A third hypothesis is also **refuted**: this is not the file-backed `mmap`
+lowering. Re-running with `CARRICK_MMAP_FILE_BACKED=0` reproduces the same
+four `could not import` errors with identical member names and sizes.
+
+**The failure is NONDETERMINISTIC, which reframes the blocker.** A
+subsequent identical run did not corrupt archives at all — it aborted with
+
+```
+ERROR carrick_runtime::vcpu_loop::threads: sibling materialization start
+gate timed out linux_tid=46808 process_exiting=false clone_cancelled=false
+```
+
+and exit 134, having never reached the compile stage. So the HVPatch
+prototype has at least one *concurrency* defect in thread materialization
+under this workload's load, and the archive corruption is plausibly a second
+symptom of the same class (a racing writer or a mis-sequenced start gate)
+rather than an independent I/O offset bug.
+
+The next session should therefore attack this as a concurrency problem, not
+as a filesystem problem: the refuted I/O hypotheses above already show
+single-threaded write/seek/pwrite/mmap paths are exact. Note also that each
+iteration costs a signed rebuild plus a multi-minute run, and that the
+nondeterminism means a single green or red run proves nothing — sample
+repeatedly, as this project's own load-sensitivity rule requires.
 
 Simple fork/exec guests are unaffected: `sh -c 'echo a; /bin/true; echo b'`,
 a three-iteration `/bin/true` loop, and `ls /` all exit 0 under HVPatch. The

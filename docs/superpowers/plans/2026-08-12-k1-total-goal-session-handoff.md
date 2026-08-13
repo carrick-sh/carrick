@@ -107,10 +107,19 @@ leading `!<arch>\n` — the reader finds an `ar` member header where the
 are already **refuted** on the signed binary, so do not retest them: plain
 write/read/`cp`/`cat` round-trips are byte-exact, and `lseek(SEEK_SET)` plus
 `pwrite` are exact (magic, seek back to 8, rewrite, `pwrite` at 12 yields
-`!<arch>\nBBBBCCCC` with the offset at 16). Untested suspects: the
-`go tool buildid -w` in-place rewrite, concurrent writers to one archive,
-and truncate/rename on the build-cache path. `GOCACHE` is already
-run-scoped and cold, so a stale cache entry is excluded.
+`!<arch>\nBBBBCCCC` with the offset at 16), and it is not the file-backed
+mmap lowering (`CARRICK_MMAP_FILE_BACKED=0` reproduces identically).
+`GOCACHE` is run-scoped and cold, so a stale cache entry is excluded.
+
+**Attack it as a CONCURRENCY problem, not a filesystem one.** The failure is
+nondeterministic: an identical rerun did not corrupt any archive and instead
+aborted with `sibling materialization start gate timed out`
+(`vcpu_loop::threads`, `process_exiting=false clone_cancelled=false`, exit
+134) before reaching the compile stage. Single-threaded write/seek/pwrite/
+mmap paths are all proven exact, so the remaining suspects are racing
+writers and mis-sequenced thread/fork start gates under this workload's
+load. Sample repeatedly — with nondeterminism, one green or red run proves
+nothing.
 
 The history below is retained because the rejected approach is instructive.
 
