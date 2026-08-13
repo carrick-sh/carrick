@@ -291,6 +291,17 @@ architecture, and KP has no baseline.
      macOS is `launchd`. **Close the host-pid comparators FIRST**, as their own
      commit: they are correct at either seed, which is what makes that ordering
      safe.
+
+   **Step 1 started (`f6bf85701`).** Three of the four `kill(pid, 0)` liveness
+   probes now ask carrick's kernel through `guest_pid_is_live`, which returns
+   `None` on lanes with no task registry so the reference lanes keep their host
+   probe unchanged. The fourth probes a process GROUP and needs a group
+   authority the kernel does not expose yet. `threaded_loop.rs`'s duplicate
+   derivation of the root leader tid from `std::process::id()` is gone.
+   **Still open in step 1:** the six `LINUX_BOOTSTRAP_PID` self-aliases
+   (`abi_args.rs:62`, `creds.rs:415`, `:459`, `signal.rs:1193`, `:1934`,
+   `:2223`), `libc::kill` at `signal.rs:2326`, `cred_ipc::read_target` at
+   `signal.rs:2269`, and the group probe at `proc.rs:3585`.
 2. **The per-thread register file** — step 1 of KD (a core with wrong
    registers is worse than none) and step 2 of KS. Two phases converge on it.
    Note the KD spec calls this "the one genuinely missing input" and that is no
