@@ -393,7 +393,6 @@ impl ProcessContext {
             .exit_task_key_eventually(
                 self.task_key(),
                 crate::kernel::LinuxWaitStatus::from_wait_encoding((exit_code & 0xff) << 8),
-                crate::kernel::TaskRusage::default(),
             )
             .map(|zombie| zombie.parent)
             .map_err(|error| error.to_string())
@@ -1032,7 +1031,6 @@ mod tests {
             .prepare_task_exit_key(
                 child_key,
                 crate::kernel::LinuxWaitStatus::from_wait_encoding(7 << 8),
-                crate::kernel::TaskRusage::default(),
                 None,
             )
             .unwrap();

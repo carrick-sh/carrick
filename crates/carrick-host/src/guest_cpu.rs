@@ -231,6 +231,32 @@ pub fn total_us() -> u64 {
 /// Native provider: the dispatch likewise runs on the guest's own host thread,
 /// and that thread's Darwin user time IS the guest thread's user CPU (system
 /// time is reported separately by the getrusage reader).
+/// This vCPU thread's slot index, so a kernel `Thread` object can record it
+/// once and its `Task` can later total its threads' CPU *without running on
+/// them*. Reading a slot is what makes per-task accounting possible under
+/// HVPatch, where every Linux process is a thread of one host process and the
+/// host's own per-process counters therefore describe all of them at once.
+pub fn this_thread_slot() -> usize {
+    MY_SLOT.with(|&slot| slot)
+}
+
+/// Accumulated guest CPU (µs) for a slot claimed by any thread, including an
+/// in-flight run. Same arithmetic as [`this_thread_us`], addressed by slot
+/// rather than by TLS. Out-of-range slots report zero.
+pub fn slot_us(slot: usize) -> u64 {
+    if slot >= MAX_VCPUS {
+        return 0;
+    }
+    let committed = EXEC_SLOTS[slot].load(Ordering::Relaxed);
+    let start = ACTIVE_START_NS[slot].load(Ordering::Acquire);
+    let ns = if start == 0 {
+        committed
+    } else {
+        committed.saturating_add(monotonic_ns().saturating_sub(start))
+    };
+    ns / 1000
+}
+
 pub fn this_thread_us() -> u64 {
     #[cfg(target_os = "macos")]
     if native_darwin_provider()

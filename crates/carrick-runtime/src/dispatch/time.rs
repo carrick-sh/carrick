@@ -716,21 +716,19 @@ impl SyscallDispatcher {
                 .ok()
                 .and_then(|s| s.checked_mul(LINUX_CLK_TCK))
                 .unwrap_or(i64::MAX);
-            // On macOS, `self_resource_usage` sources guest CPU from
-            // `proc_pid_rusage` + HVF exec-time correction (see host_proc.rs).
-            // On Linux/KVM, it returns `None` because Darwin libproc is
-            // unavailable; fall back to the cross-platform
-            // `guest_cpu::total_us()` table that is now populated by the
-            // `begin_active`/`finish_active` wrap around KVM_RUN.
-            let (user_us, system_us) = crate::host_proc::self_resource_usage()
-                .map(|h| (h.user_us, h.system_us))
-                .unwrap_or_else(|| (crate::guest_cpu::total_us(), 0));
+            // Both ledgers come from the kernel's own per-task accounting, not
+            // from the host process. Under HVPatch every Linux process is a
+            // THREAD of one host process, so `proc_pid_rusage` answers for all
+            // of them at once — it reported a shell that had burned the whole
+            // build's CPU and children that had burned none.
+            let (user_us, system_us) = task_self_cpu_us();
+            let (child_user_us, child_system_us) = task_children_cpu_us();
             let to_ticks = |us: u64| (us as i64).saturating_mul(LINUX_CLK_TCK) / 1_000_000;
             let tms = LinuxTms {
                 tms_utime: to_ticks(user_us),
                 tms_stime: to_ticks(system_us),
-                tms_cutime: to_ticks(crate::guest_cpu::child_user_us()),
-                tms_cstime: to_ticks(crate::guest_cpu::child_system_us()),
+                tms_cutime: to_ticks(child_user_us),
+                tms_cstime: to_ticks(child_system_us),
             };
             if buf.0 != 0 && memory.write_bytes(buf.0, tms.abi_bytes()).is_err() {
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
@@ -750,15 +748,11 @@ impl SyscallDispatcher {
             if usage.0 == 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
+            // `maxrss`/`majflt` remain host-sourced: they describe the address
+            // space, which carrick does not yet account per task. The CPU
+            // fields must NOT come from here — see `times` above.
             let host = crate::host_proc::self_resource_usage().unwrap_or_default();
-            // On Linux/KVM, `self_resource_usage` is a no-op stub; source the
-            // guest's user CPU from the cross-platform `guest_cpu` table instead
-            // (populated by begin_active/finish_active around KVM_RUN).
-            let self_user_us = if host.user_us > 0 {
-                host.user_us
-            } else {
-                crate::guest_cpu::total_us()
-            };
+            let (self_user_us, self_system_us) = task_self_cpu_us();
             let rusage = match who {
                 LINUX_RUSAGE_THREAD => {
                     // Per-thread guest CPU: the guest's getrusage traps out and runs
@@ -771,13 +765,16 @@ impl SyscallDispatcher {
                     let user_us = crate::guest_cpu::this_thread_us().max(host_user);
                     rusage_from(user_us, system_us, host.maxrss_bytes, host.majflt)
                 }
-                LINUX_RUSAGE_CHILDREN => rusage_from(
-                    crate::guest_cpu::child_user_us(),
-                    crate::guest_cpu::child_system_us(),
+                LINUX_RUSAGE_CHILDREN => {
+                    let (user_us, system_us) = task_children_cpu_us();
+                    rusage_from(user_us, system_us, host.maxrss_bytes, 0)
+                }
+                _ => rusage_from(
+                    self_user_us,
+                    self_system_us,
                     host.maxrss_bytes,
-                    0,
+                    host.majflt,
                 ),
-                _ => rusage_from(self_user_us, host.system_us, host.maxrss_bytes, host.majflt),
             };
             memory.write_bytes(usage.0, rusage.abi_bytes())?;
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -1185,6 +1182,31 @@ fn timeval_from_duration(d: std::time::Duration) -> crate::linux_abi::LinuxTimev
 /// Build a `LinuxRusage` from CPU times (microseconds), peak RSS (bytes), and a
 /// major-fault count. `ru_maxrss` is reported in KiB, as Linux does. Fields we
 /// do not yet account (ixrss/idrss/swaps/blocks/context switches) stay zero.
+/// The calling Linux process's OWN CPU as (user µs, system µs).
+///
+/// Sourced from the kernel's per-task accounting, which totals the task's live
+/// threads and the threads it has retired. The host process is deliberately
+/// not consulted: under HVPatch every Linux process is a thread of one host
+/// process, so `proc_pid_rusage` describes all of them at once — it reported a
+/// guest shell as having burned a whole `go build`'s CPU (5.98 CPU-s against a
+/// host process that had spent 4.29) while the compiler processes it forked
+/// showed none.
+///
+/// System time is not yet split per task, so it is reported as zero rather
+/// than filled in with a host number that belongs to every process at once.
+fn task_self_cpu_us() -> (u64, u64) {
+    let per_task = super::resources::with_active_context(|context| context.task().self_cpu_us());
+    (per_task.unwrap_or(0), 0)
+}
+
+/// The calling Linux process's CHILDREN ledger as (user µs, system µs) — the
+/// summed CPU of every child it has reaped, including those children's own
+/// reaped children.
+fn task_children_cpu_us() -> (u64, u64) {
+    super::resources::with_active_context(|context| context.task().children_cpu_us())
+        .unwrap_or((0, 0))
+}
+
 fn rusage_from(user_us: u64, system_us: u64, maxrss_bytes: u64, majflt: u64) -> LinuxRusage {
     let timeval = |us: u64| crate::linux_abi::LinuxTimeval {
         tv_sec: (us / 1_000_000) as i64,

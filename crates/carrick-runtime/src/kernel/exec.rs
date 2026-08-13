@@ -464,7 +464,6 @@ mod tests {
     use crate::kernel::{
         Asid, ClonePlan, FileDescription, FileSlotNumber, LinuxSignal, LinuxWaitStatus,
         MmBackendSnapshot, MmBinding, RootBootstrap, SignalDisposition, SnapshotError, Stage1Root,
-        TaskRusage,
     };
 
     #[derive(Debug)]
@@ -927,7 +926,6 @@ mod tests {
             kernel.exit_task(
                 parent.task.key().id,
                 LinuxWaitStatus::from_wait_encoding(0),
-                TaskRusage::default(),
                 None,
             ),
             Err(super::super::operations::KernelOperationError::TaskBusy(id))

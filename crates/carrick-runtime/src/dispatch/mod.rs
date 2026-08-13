@@ -12347,7 +12347,6 @@ mod hvpatch_in_process_fork_tests {
             .exit_task(
                 child_context.task().key().id,
                 crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
-                crate::kernel::TaskRusage::default(),
                 None,
             )
             .unwrap();
