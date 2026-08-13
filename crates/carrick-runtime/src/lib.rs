@@ -131,6 +131,7 @@ pub mod cred_ipc;
 // of the per-platform copies in `runtime/exec.rs` (macOS) and
 // `vcpu_loop::macos_helper_stubs` (Linux). No cfg gate: the functions are
 // portable libc + `crate::...` path helpers that resolve per-platform.
+pub mod core_dump;
 #[cfg(target_os = "macos")]
 pub(crate) mod darwin_fs;
 pub mod deadlock_watchdog;
