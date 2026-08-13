@@ -90,6 +90,10 @@ carrick*:::hvpatch-syscall-args
 	    self->anon, "/"), self->share), "/"),
 	    strjoin(strjoin(self->read, self->write), self->exec)), "");
 	self->len = arg2;
+	/* Declared here, textually before the clauses that read it: D infers a
+	   thread-local's type at its first ASSIGNMENT, and a later clause that
+	   only reads it fails to compile. */
+	self->win_zfod = 0;
 	@shape[self->shape] = count();
 	@bytes[self->shape] = sum(arg2);
 	@len_by_shape[self->shape] = quantize(arg2);
@@ -102,10 +106,31 @@ carrick*:::hvpatch-syscall-service-begin
 	self->in_mmap = 1;
 }
 
+/*
+ * Close the window and record THIS call's fault count. The per-call
+ * distribution is what distinguishes "the arena's high-water heuristic is
+ * working and only some handouts are reused" (bimodal: a spike at 0 plus a
+ * spike at len/16KiB) from "it is defeated and nearly every handout is
+ * scrubbed" (one spike, no zero bucket). Aggregate counts alone cannot tell
+ * those apart, and they imply opposite fixes.
+ */
+carrick*:::hvpatch-syscall-service-clear
+/self->in_mmap && self->shape != NULL/
+{
+	@zfod_per_call[self->shape] = quantize(self->win_zfod);
+	@calls_with_faults[self->shape] = sum(self->win_zfod > 0 ? 1 : 0);
+	@calls_clean[self->shape] = sum(self->win_zfod == 0 ? 1 : 0);
+	/* Pages faulted vs pages requested: 1.0 means the whole mapping was
+	   touched, which is the signature of a whole-range scrub. */
+	@pages_faulted[self->shape] = sum(self->win_zfod);
+	@pages_requested[self->shape] = sum(self->len / 16384);
+}
+
 carrick*:::hvpatch-syscall-service-clear
 {
 	self->in_mmap = 0;
 	self->shape = 0;
+	self->win_zfod = 0;
 }
 
 vminfo:::zfod
@@ -113,6 +138,7 @@ vminfo:::zfod
 {
 	@zfod_by_shape[self->shape] = count();
 	@zfod_total = count();
+	self->win_zfod++;
 }
 
 vminfo:::zfod
@@ -138,6 +164,11 @@ dtrace:::END
 	printa("MMAP_SHAPE      %-24s %@8d\n", @shape);
 	printa("MMAP_BYTES      %-24s %@12d\n", @bytes);
 	printa("ZFOD_BY_SHAPE   %-24s %@8d\n", @zfod_by_shape);
+	printa("CALLS_FAULTING  %-24s %@8d\n", @calls_with_faults);
+	printa("CALLS_CLEAN     %-24s %@8d\n", @calls_clean);
+	printa("PAGES_FAULTED   %-24s %@10d\n", @pages_faulted);
+	printa("PAGES_REQUESTED %-24s %@10d\n", @pages_requested);
+	printa("ZFOD_PER_CALL   %-24s %@d\n", @zfod_per_call);
 	printa("LEN_BY_SHAPE    %-24s %@d\n", @len_by_shape);
 	printa("MMAP_CALLS %@d\n", @calls);
 	printa("INWINDOW_ZFOD %@d\n", @zfod_total);
