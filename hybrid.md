@@ -50,7 +50,7 @@ The K0…K6 sequence encoded an ordering the evidence has since refuted, and
 | K3 — fork/clone/wait | **KL — kernel lifecycle** | partly landed |
 | K4 — transactional exec | **KX — kernel exec** | not started |
 | K5 — scheduler, sync, lowering | **KS — kernel scheduler** + **KN — kernel namei** | KN partial; KS designed |
-| K6 — cores, conformance, proof | **KD — kernel diagnostics** + **KP — shipped proof** | KD partial; KP not started |
+| K6 — cores, conformance, proof | **KD — kernel diagnostics** + **KP — shipped proof** | both partial |
 
 See the **phase status table** below for what each one has actually landed and
 what unblocks it next.
@@ -263,7 +263,7 @@ sections below carry the reasoning.
 | **KS** scheduler | **designed, not built** | M:N executor design decided | step 1 is the same register file KD needs — build it once |
 | **KM** kernel memory | **not started** | — | no guest-visible COW exists; child stage-1 leaves are built read-write |
 | **KX** kernel exec | **not started** | — | exec still unmaps/remaps 32 GiB per call |
-| **KP** shipped proof | **not started** | — | `baseline.hvpatch.jsonl` does not exist; Node.js aborts in V8 startup |
+| **KP** shipped proof | **started** | first-ever kernel-lane probe gate: **304 PASS / 90 FAIL**, with 26 failures kernel-lane-specific | bless `baseline.hvpatch.jsonl`; take the signal cluster (10 of the 26) |
 
 **Measured position:** cold `go build` **3.803 CPU-s**, window **1,828 ms**
 (from 4.223 / 2,051 at the K1 boundary). The bar is **2.3 CPU-s**, so roughly
@@ -575,6 +575,18 @@ validates and LLDB navigates, from the crash path and not only on demand;
 every capture fails closed on missing identity or events.
 
 ### KP — shipped proof
+
+> **Status 2026-08-13:** the line-exact probe gate had **never been run on
+> this lane** — `conformance.rs` reads `CARRICK_EXEC_BACKEND` and, unset, uses
+> the shipped `native` default, so every probe receipt in this tree's history
+> is a NATIVE-lane receipt. Run against `hvpatch` for the first time it gives
+> **304 PASS / 90 FAIL** on `arm64:musl`, where the native lane fails 124 at
+> the same commit. 64 failures are shared with native (dispatcher-level), 60
+> are native-only and out of scope, and **26 are kernel-lane specific** — the
+> KP work list. Ten of those 26 are one cluster: signal delivery and its
+> targeting identity, which is the same one-host-process identity problem the
+> per-task accounting fixes solved twice
+> ([evidence](docs/perf-results/2026-08-13-hvpatch-first-probe-gate.md)).
 
 **Remit:** establish `baseline.hvpatch.jsonl`, close the gaps that the kernel
 lane's own conformance run exposes, and **make `hvpatch` the default
