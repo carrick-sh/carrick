@@ -121,6 +121,24 @@ writers and mis-sequenced thread/fork start gates under this workload's
 load. Sample repeatedly — with nondeterminism, one green or red run proves
 nothing.
 
+**Start there, and classify it before changing it.** The start gate is a
+**10-second wall-clock deadline that calls `std::process::abort()`**
+(`vcpu_loop/threads.rs`, `ready_deadline = Instant::now() +
+Duration::from_secs(10)`, polling `recv_timeout(1ms)`). It fired with
+`process_exiting=false` and `clone_cancelled=false`, i.e. nothing was
+shutting down, on a host that was simultaneously running builds and had
+been carrying ~280 orphaned processes.
+
+That makes it a candidate **time assumption** rather than a deadlock
+detector — precisely the distinction this project's load-sensitivity rule
+exists to force. Do not simply raise the bound: first determine whether the
+child materializer is genuinely wedged (take a core and `bt all`, per the
+debugging rules — `sample`/`SIGQUIT` have mislabelled fork-quiesce
+deadlocks before) or merely slow under load. If it is a time assumption,
+an arbitrary wall-clock abort in the thread-creation path is the wrong
+mechanism and should be replaced by a progress-aware condition, the way the
+trap watchdog already was.
+
 The history below is retained because the rejected approach is instructive.
 
 **The first fix attempt was WRONG — do not repeat it.** Dropping the
