@@ -3590,6 +3590,14 @@ impl SyscallDispatcher {
                     // reports ESRCH only for a nonexistent group, so probe with
                     // it and remap only that case — every valid-group ECHILD
                     // passes through unchanged.
+                    // NOTE: `host_target` is a GUEST pgid on the kernel lane,
+                    // so this probes the host's groups with a number that means
+                    // something else there. It is deliberately NOT guarded:
+                    // signal 0 SENDS nothing, so the exposure is a wrong answer
+                    // rather than a wrong action, and guarding it measurably
+                    // regressed `waitpgid`'s INT_MIN assertion from true to
+                    // false. Answering from the kernel's own process-group
+                    // table is the real fix.
                     if host_target < -1
                         && errno == crate::linux_abi::LINUX_ECHILD
                         && unsafe { libc::kill(host_target, 0) } == -1

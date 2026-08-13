@@ -409,11 +409,13 @@ impl SyscallDispatcher {
             if header.pid < 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if header.pid > 0
-                && header.pid != crate::namespace::pid::self_ns_pid() as i32
-                && header.pid != std::process::id() as i32
-                && header.pid != LINUX_BOOTSTRAP_PID as i32
-            {
+            // Consolidated onto the canonical self-check rather than a fourth
+            // hand-rolled copy — its own doc records that exactly this drift
+            // caused the tkill01/sched ns-pid bugs. It also carries the NARROWED
+            // bootstrap-pid arm: on the kernel lane pid 1 is the container init,
+            // a DIFFERENT process from the caller, and this copy would have let
+            // any child read the init's capabilities as if they were its own.
+            if header.pid > 0 && !NsPid(header.pid).names_self() {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             if data_address.0 == 0 {
@@ -453,11 +455,10 @@ impl SyscallDispatcher {
             // capset (unlike capget) can only modify the CALLING process: a
             // nonzero pid that isn't the caller is EPERM, even for root
             // (capset03). The guest sees NS-pids, so match against self_ns_pid().
-            if header.pid > 0
-                && header.pid != crate::namespace::pid::self_ns_pid() as i32
-                && header.pid != std::process::id() as i32
-                && header.pid != LINUX_BOOTSTRAP_PID as i32
-            {
+            // Same consolidation as capget above. capset is the sharper case:
+            // it MODIFIES the named process, so treating the init's pid as self
+            // let a child's capset silently act as though it were the init.
+            if header.pid > 0 && !NsPid(header.pid).names_self() {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
             let words = linux_capability_data_words(header.version);
