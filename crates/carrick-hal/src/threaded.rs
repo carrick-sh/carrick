@@ -683,6 +683,9 @@ pub trait FrameCowAuthority: Send + Sync {
 
     fn reserve(
         &self,
+        frame_candidates: usize,
+        mapping_candidates: usize,
+        event_count: usize,
     ) -> Result<crate::FrameInventoryReservation, Box<dyn std::error::Error + Send + Sync>>;
 
     fn apply(

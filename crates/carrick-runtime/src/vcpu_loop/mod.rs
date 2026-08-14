@@ -141,7 +141,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         &self,
     ) -> Result<Box<dyn carrick_hal::FrameCowQuiesce>, Box<dyn std::error::Error + Send + Sync>>
     {
-        if self.kicker.count() <= 1 {
+        if self.kicker.count() <= 1 || quiesce::current_thread_holds_pt_pause() {
             return Ok(Box::new(()));
         }
         quiesce::acquire_pt_pause(
@@ -160,11 +160,14 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
 
     fn reserve(
         &self,
+        frame_candidates: usize,
+        mapping_candidates: usize,
+        event_count: usize,
     ) -> Result<carrick_hal::FrameInventoryReservation, Box<dyn std::error::Error + Send + Sync>>
     {
-        let capacity = carrick_hal::FrameEventCapacity::for_event_count(2)?;
+        let capacity = carrick_hal::FrameEventCapacity::for_event_count(event_count)?;
         self.kernel
-            .reserve_frame_inventory(1, 1, capacity)
+            .reserve_frame_inventory(frame_candidates, mapping_candidates, capacity)
             .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
     }
 
@@ -3189,6 +3192,15 @@ where
                         instruction.map_or(u64::MAX, u64::from),
                         base_register,
                         base_value,
+                    );
+                    let fault_x0 = engine.get_reg(carrick_hal::Reg::X(0)).unwrap_or(0);
+                    crate::probes::vcpu_fault_gprs(
+                        fault_x0,
+                        engine.get_reg(carrick_hal::Reg::X(1)).unwrap_or(0),
+                        engine.get_reg(carrick_hal::Reg::X(2)).unwrap_or(0),
+                        engine.get_reg(carrick_hal::Reg::X(3)).unwrap_or(0),
+                        engine.get_reg(carrick_hal::Reg::X(4)).unwrap_or(0),
+                        engine.get_reg(carrick_hal::Reg::X(5)).unwrap_or(0),
                     );
                     if let Some((ttbr, descriptors)) = engine.diagnostic_fault_page_tables(far) {
                         crate::probes::pt_fault_walk(

@@ -394,7 +394,10 @@ fn apply_event(
             let frame_entry = state
                 .frame_mut(frame)
                 .ok_or(FrameInventoryError::RetiredFrame(frame))?;
-            if frame_entry.length != length {
+            // A FrameId names the complete physical backing. Exact per-mm
+            // mappings may cover smaller subranges after a 16 KiB COW/munmap
+            // split; they must never claim more bytes than that backing.
+            if length.raw() > frame_entry.length.raw() {
                 return Err(FrameInventoryError::FrameLengthMismatch {
                     frame,
                     expected: frame_entry.length,
@@ -1356,6 +1359,55 @@ mod tests {
             Err(FrameInventoryError::DuplicateMapping(mapping))
         );
         assert!(fixture.authority.snapshot().mappings.is_empty());
+    }
+
+    #[test]
+    fn published_mapping_can_split_into_exact_subranges_of_the_same_frame() {
+        let fixture = Fixture::new();
+        let mut original = None;
+        let publish = fixture.batch(2, |transaction, reservation| {
+            let frame = reservation.claim_frame().expect("frame");
+            let mapping = reservation.claim_mapping().expect("mapping");
+            original = Some((frame, mapping));
+            prepare_publish(reservation, transaction, frame, mapping, 0x10000, 0x10000);
+        });
+        fixture
+            .authority
+            .apply(fixture.mm1, publish)
+            .expect("publish original");
+        let (frame, mapping) = original.expect("original IDs");
+
+        let split = fixture.batch(5, |transaction, reservation| {
+            reservation
+                .push(FrameInventoryEvent::UnmapMapping {
+                    transaction,
+                    mapping,
+                    generation: generation(2),
+                })
+                .expect("unmap original");
+            for (gpa, len) in [(0x10000, 0x4000), (0x18000, 0x8000)] {
+                let fragment = reservation.claim_mapping().expect("fragment mapping");
+                prepare_publish(reservation, transaction, frame, fragment, gpa, len);
+            }
+        });
+        fixture
+            .authority
+            .apply(fixture.mm1, split)
+            .expect("apply split");
+
+        let snapshot = fixture.authority.snapshot_for_mm(fixture.mm1);
+        assert_eq!(snapshot.frames.len(), 1);
+        assert_eq!(snapshot.frames[0].frame, frame);
+        assert_eq!(snapshot.frames[0].length.raw(), 0x10000);
+        assert_eq!(snapshot.mappings.len(), 2);
+        assert_eq!(
+            snapshot
+                .mappings
+                .iter()
+                .map(|mapping| (mapping.gpa.0, mapping.length.raw()))
+                .collect::<Vec<_>>(),
+            vec![(0x10000, 0x4000), (0x18000, 0x8000)]
+        );
     }
 
     #[test]

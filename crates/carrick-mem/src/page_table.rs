@@ -36,6 +36,21 @@ const UXN: u64 = 1 << 54;
 const PA_MASK_1GIB: u64 = 0x0000_FFFF_C000_0000;
 const PA_MASK_2MIB: u64 = 0x0000_FFFF_FFE0_0000;
 const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
+
+/// Return the descriptor that terminates a serialized AArch64 stage-1 walk.
+///
+/// A live mapping can terminate at an L1/L2 block; indexing `walk[3]` is only
+/// correct after an L3 split. Structural receipts use this helper so a coarse
+/// live block is not misreported as an invalid page merely because the unused
+/// later walk slots are zero.
+pub fn terminal_descriptor(walk: [u64; 4]) -> u64 {
+    for (level, descriptor) in walk.into_iter().enumerate() {
+        if descriptor & VALID == 0 || level == 3 || descriptor & TYPE_BITS != TYPE_TABLE_OR_PAGE {
+            return descriptor;
+        }
+    }
+    0
+}
 const PA_MASK_TABLE: u64 = 0x0000_FFFF_FFFF_F000; // next-level table PA (bits 47:12)
 
 // User leaf flags (must match memory.rs USER_BLOCK_FLAGS / USER_PAGE_FLAGS).
@@ -1281,6 +1296,18 @@ mod tests {
         let i = indices(LINUX_MMAP_BASE); // 0x60_0000_0000
         assert_eq!(i[0], 0);
         assert_eq!(i[1], (LINUX_MMAP_BASE >> 30 & 0x1ff) as usize);
+    }
+
+    #[test]
+    fn terminal_descriptor_selects_block_page_and_invalid_leaf() {
+        let table = VALID | TYPE_TABLE_OR_PAGE;
+        let block = VALID | TYPE_BLOCK | 0x2000_0000;
+        let page = VALID | TYPE_TABLE_OR_PAGE | 0x1234_5000;
+        let invalid = 0x4567_8000;
+
+        assert_eq!(terminal_descriptor([table, block, 0, 0]), block);
+        assert_eq!(terminal_descriptor([table, table, table, page]), page);
+        assert_eq!(terminal_descriptor([table, table, table, invalid]), invalid);
     }
 
     #[test]

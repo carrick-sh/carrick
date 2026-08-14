@@ -489,6 +489,11 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
 
     fn arm_frame_cow_ranges(&mut self, _ranges: &[ForkCowRange]) {}
 
+    /// Undo an unpublished fork-COW arm. HVPatch uses this only while every
+    /// vCPU in the mm remains quiesced and the parent stage-1 snapshot is being
+    /// restored after a prepare/publication failure.
+    fn disarm_frame_cow_ranges(&mut self, _ranges: &[ForkCowRange]) {}
+
     fn armed_frame_cow_ranges(&self, _va: u64, _len: usize) -> Vec<ForkCowRange> {
         Vec::new()
     }
@@ -504,6 +509,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         &mut self,
         _syndrome: u64,
         _far: u64,
+        _ttbr0: u64,
         _flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
     ) -> Result<bool, TrapError> {
         Ok(false)
@@ -608,7 +614,9 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// backend's process-shared alias index (HVF's `alias_registry`) intact and
     /// consistent with its still-owned backing. KVM has no such index; default
     /// no-op.
-    fn on_unmap(&mut self, _va: u64, _len: usize) {}
+    fn on_unmap(&mut self, _va: u64, _len: usize) -> Result<(), TrapError> {
+        Ok(())
+    }
 
     /// Whether the engine saves/restores guest FP/SIMD across signal delivery (the
     /// `InjectParams::fpsimd_enabled` flag for inject + restore). HVF gates this on
@@ -851,6 +859,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         _root_slot_base: u64,
         _root_slot_size: u64,
         _page_tables: &mut carrick_mem::page_table::PageTableManager,
+        _cow_ranges: &[ForkCowRange],
         _child_pid: i32,
         _forking_tid: i32,
     ) -> Result<Self::ProcessBuilder, TrapError> {
