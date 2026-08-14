@@ -98,7 +98,7 @@ pub use etc_services::EtcServicesVfs;
 pub use mount::VfsMounts;
 pub use proc::{
     GuestMemoryRange, GuestReportedArch, ProcMapSharing, ProcMapsEntry, ProcVfs,
-    SyntheticProcContext,
+    SyntheticProcContext, SyntheticProcIdentity,
 };
 pub use resolvconf::ResolvConfVfs;
 pub use rootfs::RootFsVfs;
@@ -318,6 +318,7 @@ pub struct OpenContext<'a> {
     pub sig_ignored: u64,
     pub sig_caught: u64,
     pub sig_shdpnd: u64,
+    pub identity: Option<SyntheticProcIdentity>,
     pub sysvipc_shm: Option<&'a str>,
     pub sysvipc_sem: Option<&'a str>,
     pub sysvipc_msg: Option<&'a str>,

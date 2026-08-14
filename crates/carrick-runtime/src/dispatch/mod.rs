@@ -5090,9 +5090,9 @@ impl SyscallDispatcher {
         if let Some(outcome) = self.seccomp_precheck(&request) {
             return Ok(outcome);
         }
-        if let Some(result) = Self::dispatch_threaded_independent(
-            kernel, request, memory, reporter, tid, registry, futex,
-        ) {
+        if let Some(result) = self
+            .dispatch_threaded_independent(kernel, request, memory, reporter, tid, registry, futex)
+        {
             return result;
         }
         resources::with_captured_resources(kernel, || {
@@ -5245,7 +5245,8 @@ impl SyscallDispatcher {
     /// the dispatcher-wide lock.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_threaded_independent(
-        _kernel: &crate::kernel::KernelContext,
+        &self,
+        kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
         memory: &mut impl GuestMemory,
         reporter: &CompatReporter,
@@ -5296,7 +5297,11 @@ impl SyscallDispatcher {
                 // always Some; worker tids (> main_tid) are per-process and not
                 // ns-translated. Identity when namespaces are off.
                 let visible =
-                    guest_visible_tid(tid, registry).map_or(i64::from(tid.raw()), i64::from);
+                    if self.execution_backend() == crate::page_profile::ExecutionBackend::HvPatch {
+                        i64::from(kernel.thread().key().tid.raw())
+                    } else {
+                        guest_visible_tid(tid, registry).map_or(i64::from(tid.raw()), i64::from)
+                    };
                 DispatchOutcome::Returned { value: visible }
             }
             98 => dispatch_threaded_futex(request, memory, reporter, futex, tid, registry),
@@ -5318,11 +5323,17 @@ impl SyscallDispatcher {
                 DispatchOutcome::Returned { value: 0 }
             }
             172 => {
-                let Some(pid) = guest_visible_tid(registry.main_tid(), registry) else {
-                    return Some(Ok(DispatchOutcome::errno(LINUX_EINVAL)));
-                };
-                DispatchOutcome::Returned {
-                    value: i64::from(pid),
+                if self.execution_backend() == crate::page_profile::ExecutionBackend::HvPatch {
+                    DispatchOutcome::Returned {
+                        value: i64::from(kernel.task().key().id.raw()),
+                    }
+                } else {
+                    let Some(pid) = guest_visible_tid(registry.main_tid(), registry) else {
+                        return Some(Ok(DispatchOutcome::errno(LINUX_EINVAL)));
+                    };
+                    DispatchOutcome::Returned {
+                        value: i64::from(pid),
+                    }
                 }
             }
             130 => {
@@ -5338,17 +5349,23 @@ impl SyscallDispatcher {
                 dispatch_threaded_signal_route(tid, registry, target, signum)?
             }
             178 => {
-                // gettid: the MAIN thread's tid equals the process host pid, so
-                // in a PID namespace it must read as the process's ns-pid; a
-                // single-threaded process reports its ns getpid. Worker tids
-                // (> main_tid) are per-process and not ns-translated (§5.3).
-                // Mirrors the `gettid` macro handler (proc.rs). Identity when
-                // namespaces are off.
-                let Some(tid) = guest_visible_tid(tid, registry) else {
-                    return Some(Ok(DispatchOutcome::errno(LINUX_EINVAL)));
-                };
-                DispatchOutcome::Returned {
-                    value: i64::from(tid),
+                if self.execution_backend() == crate::page_profile::ExecutionBackend::HvPatch {
+                    DispatchOutcome::Returned {
+                        value: i64::from(kernel.thread().key().tid.raw()),
+                    }
+                } else {
+                    // gettid: the MAIN thread's tid equals the process host pid, so
+                    // in a PID namespace it must read as the process's ns-pid; a
+                    // single-threaded process reports its ns getpid. Worker tids
+                    // (> main_tid) are per-process and not ns-translated (§5.3).
+                    // Mirrors the `gettid` macro handler (proc.rs). Identity when
+                    // namespaces are off.
+                    let Some(tid) = guest_visible_tid(tid, registry) else {
+                        return Some(Ok(DispatchOutcome::errno(LINUX_EINVAL)));
+                    };
+                    DispatchOutcome::Returned {
+                        value: i64::from(tid),
+                    }
                 }
             }
             449 => dispatch_futex_waitv_args(
@@ -6973,6 +6990,25 @@ fn write_synthetic_statx_mode(
 }
 
 impl SyscallDispatcher {
+    fn synthetic_proc_identity(
+        &self,
+        context: &crate::kernel::KernelContext,
+    ) -> Option<crate::vfs::SyntheticProcIdentity> {
+        (self.execution_backend == crate::page_profile::ExecutionBackend::HvPatch)
+            .then_some(())
+            .and_then(|()| {
+                let task = context.task();
+                let identity = context.kernel().task_identity(task.key().id).ok()?;
+                Some(crate::vfs::SyntheticProcIdentity {
+                    pid: identity.task.id.raw() as u32,
+                    tid: context.thread().key().tid.raw() as u32,
+                    ppid: identity.parent.map_or(0, |parent| parent.id.raw() as u32),
+                    pgrp: identity.process_group.raw() as u32,
+                    session: identity.session.raw() as u32,
+                })
+            })
+    }
+
     fn mem_snapshot(&self) -> mem::MemState {
         self.mem.lock().clone()
     }
@@ -7028,6 +7064,7 @@ impl SyscallDispatcher {
             sig_ignored,
             sig_caught,
             sig_shdpnd,
+            identity: self.synthetic_proc_identity(context),
             sysvipc_shm: self.sysvipc_shm_table(),
             sysvipc_sem: self.sysvipc_sem_table(),
             sysvipc_msg: self.sysvipc_msg_table(),

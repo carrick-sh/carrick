@@ -1168,7 +1168,7 @@ impl SyscallDispatcher {
         let info = crate::linux_abi::LinuxSiginfo::kill(
             signum as i32,
             crate::linux_abi::LINUX_SI_USER,
-            crate::namespace::pid::self_ns_pid() as i32,
+            caller.key().id.raw(),
             creds.ruid,
         );
         let mut delivered = 0_usize;
@@ -1182,6 +1182,88 @@ impl SyscallDispatcher {
             return Some(DispatchOutcome::errno(LINUX_ESRCH));
         }
         Some(DispatchOutcome::Returned { value: 0 })
+    }
+
+    /// Route one positive, non-self HVPatch task target through the kernel.
+    /// `None` leaves self/reference-lane behavior to the established paths.
+    fn hvpatch_specific_process_signal<M: GuestMemory>(
+        &self,
+        ctx: &SyscallCtx<M>,
+        pid: i32,
+        signum: u64,
+        siginfo: Option<LinuxSiginfo>,
+    ) -> Option<DispatchOutcome> {
+        if !crate::dispatch::hvpatch_lane_active() || pid <= 0 {
+            return None;
+        }
+        let target = match crate::kernel::TaskId::from_abi_positive(pid) {
+            Ok(target) => target,
+            Err(_) => return Some(DispatchOutcome::errno(LINUX_ESRCH)),
+        };
+        if target == ctx.kernel.task().key().id {
+            return None;
+        }
+        let kernel = ctx.kernel.kernel();
+        if signum == 0 {
+            return Some(if kernel.task_is_signalable(target) {
+                DispatchOutcome::Returned { value: 0 }
+            } else {
+                DispatchOutcome::errno(LINUX_ESRCH)
+            });
+        }
+        let signal = match crate::kernel::LinuxSignal::for_signal_number(signum as i32) {
+            Ok(signal) => signal,
+            Err(_) => return Some(DispatchOutcome::errno(LINUX_EINVAL)),
+        };
+        Some(if kernel.post_signal_to_task(target, signal, siginfo) {
+            DispatchOutcome::Returned { value: 0 }
+        } else {
+            DispatchOutcome::errno(LINUX_ESRCH)
+        })
+    }
+
+    /// Route a HVPatch thread target by Linux `(tgid, tid)` identity. With no
+    /// tgid this is `tkill`'s globally unique tid lookup.
+    fn hvpatch_specific_thread_signal<M: GuestMemory>(
+        &self,
+        ctx: &SyscallCtx<M>,
+        tgid: Option<i32>,
+        tid: i32,
+        signum: u64,
+        siginfo: Option<LinuxSiginfo>,
+    ) -> Option<DispatchOutcome> {
+        if !crate::dispatch::hvpatch_lane_active() {
+            return None;
+        }
+        let tid = match crate::kernel::LinuxTid::from_abi_positive(tid) {
+            Ok(tid) => tid,
+            Err(_) => return Some(DispatchOutcome::errno(LINUX_ESRCH)),
+        };
+        let required_task = match tgid {
+            Some(raw) => match crate::kernel::TaskId::from_abi_positive(raw) {
+                Ok(task) => Some(task),
+                Err(_) => return Some(DispatchOutcome::errno(LINUX_ESRCH)),
+            },
+            None => None,
+        };
+        let kernel = ctx.kernel.kernel();
+        let Some(target_task) = kernel.live_task_for_thread(required_task, tid) else {
+            return Some(DispatchOutcome::errno(LINUX_ESRCH));
+        };
+        if signum == 0 {
+            return Some(DispatchOutcome::Returned { value: 0 });
+        }
+        let signal = match crate::kernel::LinuxSignal::for_signal_number(signum as i32) {
+            Ok(signal) => signal,
+            Err(_) => return Some(DispatchOutcome::errno(LINUX_EINVAL)),
+        };
+        Some(
+            if kernel.post_signal_to_thread(target_task, tid, signal, siginfo) {
+                DispatchOutcome::Returned { value: 0 }
+            } else {
+                DispatchOutcome::errno(LINUX_ESRCH)
+            },
+        )
     }
 
     fn raise_process_directed<M: GuestMemory>(
@@ -1250,6 +1332,19 @@ impl SyscallDispatcher {
             // meaningless and handing the result to `libc::kill` aims at the
             // host. Positive pids fall through and are handled as before.
             if let Some(outcome) = this.hvpatch_group_signal(cx, pid.0, signum) {
+                return Ok(outcome);
+            }
+            let kill_info = (signum != 0).then(|| {
+                crate::linux_abi::LinuxSiginfo::kill(
+                    signum as i32,
+                    crate::linux_abi::LINUX_SI_USER,
+                    cx.kernel.task().key().id.raw(),
+                    this.cred_snapshot().ruid,
+                )
+            });
+            if let Some(outcome) =
+                this.hvpatch_specific_process_signal(cx, pid.0, signum, kill_info)
+            {
                 return Ok(outcome);
             }
             // Identity when namespaces are off.
@@ -1421,6 +1516,19 @@ impl SyscallDispatcher {
                 let self_tid = Self::ctx_tid(cx);
                 return Ok(this.raise_self(cx.kernel, self_tid, signum));
             }
+            let info = (signum != 0).then(|| {
+                crate::linux_abi::LinuxSiginfo::kill(
+                    signum as i32,
+                    crate::linux_abi::LINUX_SI_TKILL,
+                    cx.kernel.task().key().id.raw(),
+                    this.cred_snapshot().ruid,
+                )
+            });
+            if let Some(outcome) =
+                this.hvpatch_specific_thread_signal(cx, None, tid as i32, signum, info)
+            {
+                return Ok(outcome);
+            }
             Ok(bootstrap_signal_send(
                 SignalTarget::GuestTid(NsPid(tid as i32)),
                 signum,
@@ -1437,6 +1545,27 @@ impl SyscallDispatcher {
             }
             if !is_valid_signum(signum) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            if crate::dispatch::hvpatch_lane_active()
+                && tgid != i64::from(cx.kernel.task().key().id.raw())
+            {
+                let info = (signum != 0).then(|| {
+                    crate::linux_abi::LinuxSiginfo::kill(
+                        signum as i32,
+                        crate::linux_abi::LINUX_SI_TKILL,
+                        cx.kernel.task().key().id.raw(),
+                        this.cred_snapshot().ruid,
+                    )
+                });
+                if let Some(outcome) = this.hvpatch_specific_thread_signal(
+                    cx,
+                    Some(tgid as i32),
+                    tid as i32,
+                    signum,
+                    info,
+                ) {
+                    return Ok(outcome);
+                }
             }
             // tgid-membership: `tid` must belong to thread group `tgid`. A guest
             // process is one host process whose threads all share tgid == the
@@ -2002,6 +2131,25 @@ impl SyscallDispatcher {
             return routed;
         }
 
+        if crate::dispatch::hvpatch_lane_active()
+            && ns_target != i64::from(ctx.kernel.task().key().id.raw())
+        {
+            let outcome = if tid_directed {
+                self.hvpatch_specific_thread_signal(
+                    ctx,
+                    Some(ns_target as i32),
+                    route_target as i32,
+                    signum,
+                    user_info,
+                )
+            } else {
+                self.hvpatch_specific_process_signal(ctx, ns_target as i32, signum, user_info)
+            };
+            if let Some(outcome) = outcome {
+                return outcome;
+            }
+        }
+
         // PID namespace (§5.3): translate the ns-pid thread-group to its host pid
         // for the self/cross-process decision. Foreign ns-pid → ESRCH; identity
         // when ns is off.
@@ -2270,6 +2418,10 @@ impl SignalTarget {
     }
 }
 
+fn host_signal_transport_allowed(hvpatch_lane: bool, _target: SignalTarget) -> bool {
+    !hvpatch_lane
+}
+
 pub(crate) fn bootstrap_signal_send(target: SignalTarget, signum: u64) -> DispatchOutcome {
     bootstrap_signal_send_as(target, signum, /*caller_euid=*/ None)
 }
@@ -2295,6 +2447,8 @@ pub(crate) fn bootstrap_signal_send_as(
         SignalTarget::GuestTid(t) => t.0,
         _ => 0,
     };
+    let host_transport_allowed =
+        host_signal_transport_allowed(crate::dispatch::hvpatch_lane_active(), target);
     // The raw kill(2) value this target denotes: every sign/sentinel test
     // below and the final host kill read this single escape.
     let target = target.host_kill_encoding();
@@ -2324,6 +2478,9 @@ pub(crate) fn bootstrap_signal_send_as(
         // applies the default action (terminate with 128 + signum).
         crate::host_signal::raise_for_self(signum as i32);
         return DispatchOutcome::Returned { value: 0 };
+    }
+    if !host_transport_allowed {
+        return DispatchOutcome::errno(LINUX_ESRCH);
     }
     // kill(0) = the caller's process group. Fanning it out via a host group-kill
     // is safe ONLY when carrick leads its own process group (so the group holds
@@ -2439,6 +2596,28 @@ pub(crate) fn bootstrap_signal_send_as(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hvpatch_blocks_every_guest_selector_before_xsig_or_host_kill() {
+        let guest_one = HostPid(carrick_abi::LINUX_BOOTSTRAP_PID as u32);
+        for target in [
+            SignalTarget::HostProcess(guest_one),
+            SignalTarget::HostProcessGroup(guest_one),
+            SignalTarget::CallerProcessGroup,
+            SignalTarget::Broadcast,
+            SignalTarget::HostThread(guest_one),
+            SignalTarget::GuestTid(NsPid(carrick_abi::LINUX_BOOTSTRAP_PID as i32)),
+        ] {
+            assert!(
+                !host_signal_transport_allowed(true, target),
+                "HVPatch guest selector {target:?} must not become an xsig key or Darwin kill target",
+            );
+            assert!(
+                host_signal_transport_allowed(false, target),
+                "reference lanes must retain their host-process transport for {target:?}",
+            );
+        }
+    }
 
     #[test]
     fn dispatcher_action_binding_is_the_captured_kernel_sighand() {

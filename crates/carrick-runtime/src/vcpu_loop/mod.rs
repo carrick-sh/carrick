@@ -1145,11 +1145,15 @@ pub(crate) fn stamp_guest_tid<E: ThreadedEngine>(
     engine: &E,
     this_tid: ThreadId,
     registry: &ThreadRegistry,
+    hvpatch_linux_tid: Option<crate::kernel::LinuxTid>,
 ) {
     if !crate::syscall_shim_enabled() {
         return;
     }
-    if let Some(tid) = crate::dispatch::guest_visible_tid(this_tid, registry) {
+    let tid = hvpatch_linux_tid
+        .and_then(|tid| u32::try_from(tid.raw()).ok())
+        .or_else(|| crate::dispatch::guest_visible_tid(this_tid, registry));
+    if let Some(tid) = tid {
         let _ = engine.set_guest_thread_id(u64::from(tid));
     }
 }
@@ -2891,7 +2895,12 @@ where
     state.register_vcpu(&engine);
     // Stamp this thread's tid into TPIDR_EL1 for the EL1 gettid fast path (main
     // thread at boot; each worker at spawn). Re-stamped after fork/exec below.
-    stamp_guest_tid(&engine, state.this_tid, &state.registry);
+    stamp_guest_tid(
+        &engine,
+        state.this_tid,
+        &state.registry,
+        kernel.hvpatch_process.as_ref().map(|_| state.linux_tid),
+    );
     // Run the vCPU loop in a closure so we can run vCPU cleanup on EVERY exit
     // path — `?` errors, early returns, and the trap-limit fall-through alike.
     let mut result: Result<VcpuLoopOutcome, RuntimeError> = (|| {

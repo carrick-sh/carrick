@@ -173,6 +173,18 @@ where
     }
 }
 
+fn main_registry_id_for_backend(
+    backend: crate::page_profile::ExecutionBackend,
+    host_pid: i32,
+) -> crate::thread::ThreadId {
+    let tid = if backend == crate::page_profile::ExecutionBackend::HvPatch {
+        carrick_abi::LINUX_BOOTSTRAP_PID as i32
+    } else {
+        host_pid
+    };
+    crate::thread::ThreadId::from_guest_supplied_tid(tid)
+}
+
 pub fn run_threaded_loop<E, H>(
     mut engine: E,
     dispatcher: SyscallDispatcher,
@@ -197,7 +209,11 @@ where
     // handlers + a termios-restore guard); the guard is held for the loop.
     let _loop_guard = host.pre_loop_setup();
 
-    let main_tid: ThreadId = ThreadId::main_from_host_pid();
+    let backend = dispatcher.execution_backend();
+    let host_pid = i32::try_from(std::process::id()).map_err(|_| {
+        RuntimeError::Configuration("host PID does not fit Linux thread identity".to_owned())
+    })?;
+    let main_tid: ThreadId = main_registry_id_for_backend(backend, host_pid);
     let registry = Arc::new(ThreadRegistry::new(main_tid));
     // Publish for /proc/<tid>/stat + /proc/<pid>/task/ synthesis.
     crate::thread::set_current_registry(Arc::clone(&registry));
@@ -261,7 +277,6 @@ where
     // vCPU + nudge the futex; HVF supplies its kqueue-pump wake.
     let signal_arrival: Arc<dyn carrick_hal::SignalArrival> =
         host_for_factory.make_signal_arrival(&kicker, &platform_futex);
-    let backend = dispatcher.execution_backend();
     let setup = crate::hvpatch::initialize_root_process(&mut engine, &dispatcher);
     let hvpatch_process = resolve_hvpatch_setup(backend, setup, || {
         // The outer HVPatch owner destroys the VM and records the terminal.
@@ -320,7 +335,8 @@ where
     }
     kernel.register_hvpatch_runtime_endpoint(Arc::clone(&futex), Arc::clone(&kicker));
     debug_assert!(kernel.hvpatch_process.as_ref().is_none_or(|process| {
-        process.pid() == std::process::id() as i32 && process.live_process_count() == 1
+        process.pid() == carrick_abi::LINUX_BOOTSTRAP_PID as i32
+            && process.live_process_count() == 1
     }));
     // Track spawned sibling threads so the process doesn't tear down while a
     // worker is mid-flight; joined after the main thread finishes.
@@ -399,6 +415,26 @@ mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
     use std::num::NonZeroU64;
+
+    #[test]
+    fn hvpatch_main_registry_id_is_linux_init_while_reference_lanes_keep_host_identity() {
+        let host_pid = 67_000;
+        assert_eq!(
+            main_registry_id_for_backend(crate::page_profile::ExecutionBackend::HvPatch, host_pid,)
+                .raw(),
+            carrick_abi::LINUX_BOOTSTRAP_PID as i32,
+        );
+        for backend in [
+            crate::page_profile::ExecutionBackend::Native,
+            crate::page_profile::ExecutionBackend::Vmm,
+        ] {
+            assert_eq!(
+                main_registry_id_for_backend(backend, host_pid).raw(),
+                host_pid,
+                "{backend:?} bootstrap identity must stay host-derived",
+            );
+        }
+    }
 
     fn root_context(pid: i32) -> crate::kernel::KernelContext {
         let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
