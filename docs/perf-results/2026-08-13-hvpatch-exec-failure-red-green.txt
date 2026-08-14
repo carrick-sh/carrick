@@ -152,3 +152,43 @@ Review-fix live six-stage receipt:
   exitstatus127_probe_sha256=0f5d2a2ac64d02f6e6000e2cabc5a06eb5afd56d43dda7b11e80b1a4e7654fbb
   entitlements=com.apple.security.hypervisor=true
   dof_section=__dof_carrick
+
+Review fix round 2 (implementation 87f4bb74c75984e3e8c86c3685d74102e3d03dbf):
+  hypothesis: begin-inventory injection could cross engine identity because the
+    one-shot bit lived in the Arc<Mutex<HvpatchFrameInventory>> ledger shared by
+    sibling HVPatch engines. Arming and beginning were separate ledger locks.
+  ruling: confirmed by ownership inspection. The mapping ledger remains shared,
+    but the diagnostic bit now lives in an individual non-clonable
+    HvpatchFrameInventoryState handle embedded in HvfVmState. Fresh thread and
+    process engine construction receives a fresh false bit while reusing only
+    the authoritative ledger Arc.
+
+  RED:
+    RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf begin_exec_injection_is_owned_and_consumed_by_only_the_armed_engine_state -- --nocapture
+    E0433: no per-engine HvpatchFrameInventoryState existed; the only state was
+    the shared ledger field.
+
+  GREEN:
+    same command: 1 passed
+    two engine states share one ledger; B begin succeeds after only A is armed;
+    A then receives the injected error exactly once; A's subsequent begin
+    succeeds normally.
+    just check: PASS
+
+  signed selected-target proof:
+    CARRICK_EXEC_BACKEND=hvpatch CARRICK_HVPATCH_EXEC_INVENTORY_FAILURE='begin-inventory@/bin/true' scripts/run-probe.sh execfatalstatus
+    run_id=cr-80115-20739 cleanup=0
+    child_exited=false child_exit_status=-1 child_signaled=true child_signal=11
+
+  strict-parser control:
+    CARRICK_EXEC_BACKEND=hvpatch CARRICK_HVPATCH_EXEC_INVENTORY_FAILURE='begin-inventory' scripts/run-probe.sh execfatalstatus
+    run_id=cr-80179-2934 cleanup=0 result=MATCH
+    child_exited=true child_exit_status=0 child_signaled=false child_signal=0
+
+  refreshed provenance:
+    signed_binary_sha256=d65499af45d1e889173c82ab96e5412af6812cff4422f598b23f33626065e069
+    execfatalstatus_probe_sha256=4782c72b1c23584ed5f14599f2b5ca404fa734fa369b39b20afe0740dd4583b3
+    retained_raw_trace_sha256=ce9fca17064d48cf23bb24e77b7dfbd0a78f7be0408a3500874c5d7e93554cab
+    retained_d_program_sha256=2ad15ce50c6b48e78494ad876b9fd3679423489d913d742a893b27b3f05216b9
+    entitlements=com.apple.security.hypervisor=true
+    dof_section=__dof_carrick
