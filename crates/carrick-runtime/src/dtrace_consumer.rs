@@ -92,6 +92,9 @@ pub const BUNDLED_DSR_FORK_D: &str = include_str!("../../../scripts/dtrace/dsr-f
 /// Complete-workload HVPatch K1 VM and guest-process lifecycle profile.
 pub const BUNDLED_HVPATCH_K1_LIFECYCLE_D: &str =
     include_str!("../../../scripts/dtrace/hvpatch-k1-lifecycle.d");
+/// Strict six-stage HVPatch exec transaction profile.
+pub const BUNDLED_HVPATCH_EXEC_RUNTIME_STAGES_D: &str =
+    include_str!("../../../scripts/dtrace/hvpatch-phase4-exec-runtime-stages.d");
 pub const BUNDLED_NATIVE_WALL_D: &str = include_str!("../../../scripts/dtrace/native-wall.d");
 pub const BUNDLED_NATIVE_SHAPE_D: &str =
     include_str!("../../../scripts/dtrace/native-shape-census.d");

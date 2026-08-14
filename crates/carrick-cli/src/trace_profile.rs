@@ -540,6 +540,7 @@ impl V2ProfileAuthority {
             TraceProfileKind::Dsr
             | TraceProfileKind::DsrFork
             | TraceProfileKind::DsrIndirect
+            | TraceProfileKind::HvpatchExecRuntimeStages
             | TraceProfileKind::HvpatchK1Lifecycle
             | TraceProfileKind::NativeShape => {
                 bail!("non-native profile cannot construct V2ProfileAuthority")
@@ -2225,6 +2226,7 @@ pub(crate) enum TraceProfileKind {
     Dsr,
     DsrIndirect,
     DsrFork,
+    HvpatchExecRuntimeStages,
     HvpatchK1Lifecycle,
     NativeAmplification,
     NativeFault,
@@ -2238,6 +2240,7 @@ impl TraceProfileKind {
             Self::Dsr => "dsr",
             Self::DsrIndirect => "dsr-indirect",
             Self::DsrFork => "dsr-fork",
+            Self::HvpatchExecRuntimeStages => "hvpatch-exec-runtime-stages",
             Self::HvpatchK1Lifecycle => "hvpatch-k1-lifecycle",
             Self::NativeAmplification => "native-amplification",
             Self::NativeFault => "native-fault",
@@ -2275,6 +2278,7 @@ impl TraceProfileKind {
             Self::Dsr
             | Self::DsrIndirect
             | Self::DsrFork
+            | Self::HvpatchExecRuntimeStages
             | Self::HvpatchK1Lifecycle
             | Self::NativeFault
             | Self::NativeShape => None,
@@ -2287,6 +2291,9 @@ impl TraceProfileKind {
             Self::Dsr => carrick_runtime::dtrace_consumer::BUNDLED_DSR_PROFILE_D,
             Self::DsrIndirect => carrick_runtime::dtrace_consumer::BUNDLED_DSR_INDIRECT_D,
             Self::DsrFork => carrick_runtime::dtrace_consumer::BUNDLED_DSR_FORK_D,
+            Self::HvpatchExecRuntimeStages => {
+                carrick_runtime::dtrace_consumer::BUNDLED_HVPATCH_EXEC_RUNTIME_STAGES_D
+            }
             Self::HvpatchK1Lifecycle => {
                 carrick_runtime::dtrace_consumer::BUNDLED_HVPATCH_K1_LIFECYCLE_D
             }
@@ -2304,6 +2311,7 @@ impl TraceProfileKind {
             "dsr" => Ok(Self::Dsr),
             "dsr-indirect" => Ok(Self::DsrIndirect),
             "dsr-fork" => Ok(Self::DsrFork),
+            "hvpatch-exec-runtime-stages" => Ok(Self::HvpatchExecRuntimeStages),
             "hvpatch-k1-lifecycle" => Ok(Self::HvpatchK1Lifecycle),
             "native-amplification" => Ok(Self::NativeAmplification),
             "native-fault" => Ok(Self::NativeFault),

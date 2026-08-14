@@ -112,6 +112,8 @@ use crate::debug_layout::native_x86_layout_json;
 #[cfg(feature = "platform-macos")]
 use crate::fs_setup::install_fs_backend;
 #[cfg(target_os = "macos")]
+use crate::hvpatch_exec_runtime_profile::HvpatchExecRuntimeSummary;
+#[cfg(target_os = "macos")]
 use crate::hvpatch_k1_profile::HvpatchK1LifecycleSummary;
 #[cfg(target_os = "macos")]
 use crate::native_fault_profile::NativeFaultSummary;
@@ -1507,6 +1509,11 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     if profile == Some(crate::trace_profile::TraceProfileKind::HvpatchK1Lifecycle) {
                         bail!("hvpatch-k1-lifecycle requires a Darwin/HVF host");
                     }
+                    if profile
+                        == Some(crate::trace_profile::TraceProfileKind::HvpatchExecRuntimeStages)
+                    {
+                        bail!("hvpatch-exec-runtime-stages requires a Darwin/HVF host");
+                    }
                 }
                 if profile.is_some_and(|kind| kind.requires_runtime_profile()) {
                     // The broad profile's prepare/run probes are const-specialized
@@ -1721,6 +1728,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                             crate::trace_profile::TraceProfileKind::Dsr
                             | crate::trace_profile::TraceProfileKind::DsrFork
                             | crate::trace_profile::TraceProfileKind::DsrIndirect
+                            | crate::trace_profile::TraceProfileKind::HvpatchExecRuntimeStages
                             | crate::trace_profile::TraceProfileKind::HvpatchK1Lifecycle => {
                                 unreachable!("non-native profile requested native qualification")
                             }
@@ -1898,6 +1906,17 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                                     .unwrap_or_default(),
                                 capture.joins,
                             );
+                        } else if requested_profile
+                            == crate::trace_profile::TraceProfileKind::HvpatchExecRuntimeStages
+                        {
+                            if summary_jsonl.is_some() {
+                                bail!(
+                                    "the HVPatch exec runtime-stage profile has no JSON ledger schema; use its strict raw stream and CLI summary"
+                                );
+                            }
+                            let summary =
+                                HvpatchExecRuntimeSummary::from_path(raw_path, capture_status)?;
+                            eprintln!("{}", summary.render_human());
                         } else if requested_profile
                             == crate::trace_profile::TraceProfileKind::HvpatchK1Lifecycle
                         {
