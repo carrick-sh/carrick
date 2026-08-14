@@ -2680,6 +2680,8 @@ pub const LINUX_AT_REMOVEDIR: u64 = 0x200;
 pub const LINUX_AT_NO_AUTOMOUNT: u64 = 0x800;
 pub const LINUX_AT_STATX_FORCE_SYNC: u64 = 0x2000;
 pub const LINUX_AT_STATX_DONT_SYNC: u64 = 0x4000;
+/// Owner name of Linux-specific ELF notes, including AArch64 `NT_ARM_TLS`.
+pub const LINUX_ELF_NOTE_OWNER: &[u8] = b"LINUX\0";
 pub const LINUX_UTIME_NOW: i64 = (1 << 30) - 1;
 pub const LINUX_UTIME_OMIT: i64 = (1 << 30) - 2;
 pub const LINUX_R_OK: u64 = 4;
