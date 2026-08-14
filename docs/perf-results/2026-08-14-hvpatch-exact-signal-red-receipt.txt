@@ -1,0 +1,32 @@
+HVPATCH_TASK3_EXACT_SIGNAL_RED_V1
+pre_fix_source_commit=dfb9431c75e634371018646bb3b979b33833f6e1
+
+[multi_dequeue_generation]
+command=RUST_MIN_STACK=8388608 RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib kernel::operations::tests::sigcont_cancels_every_stop_dequeued_before_its_default_action -- --exact --nocapture
+result=FAILED: SIGCONT must invalidate every earlier dequeued default-stop action
+raw_sha256=6447e9a8d09be76fec37a76e98de2cb0f3bd50fd71910944c31d04bb56f012e2
+diagnosis=the scalar Cancelled state was consumed by the first stale default-stop action; another stop dequeued before SIGCONT could still stop the task afterward
+
+[exact_generation_ticket]
+command=RUST_MIN_STACK=8388608 RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib kernel::operations::tests::authorized_signal_ticket_does_not_follow_reused_task_id -- --exact --nocapture
+result=COMPILE RED: authorize_signal_target_exact, post_signal_to_authorized_target, and ExactSignalTargetAuthorization did not exist
+raw_sha256=1831805c4e2226c0c39817c8833d8dec6c38eab6618550a7981262c87f1b09b0
+diagnosis=authorization and publication were separate bare-TaskId operations, so reap and PID reuse could redirect a previously authorized send to a new generation
+
+[signed_self_job_control]
+source_commit=dfb9431c75e634371018646bb3b979b33833f6e1
+signed_binary_sha256=4dc69e180efb9ad76d40d9db9ee65a19cd602e33273b78b4d893011e51775776
+probe_sha256=48364d5473c643d67a105951748fe64ff7fadd306961c2ec297605e483f7f75d
+command=CARRICK_RUN_ID=task3-self-stop-old-red CARRICK_EXEC_BACKEND=hvpatch CARRICK_PROBE_EXEC_AS_INIT=1 scripts/run-probe.sh kernelidentity
+result=the 57 preexisting relationships were true; all seven self SIGSTOP/SIGCONT relationships were false
+self_job_control_stop_send_succeeded=false
+self_job_control_wait_reported_sigstop=false
+self_job_control_parent_remained_runnable=false
+self_job_control_continue_send_succeeded=false
+self_job_control_wait_reported_continued=false
+self_job_control_child_resumed=false
+self_job_control_child_exited_zero=false
+raw_sha256=87186a531364d9ab44b475e2a6e4309e0084f046053808367f65d2c9d9a4bdb1
+cleanup=remaining carrick procs (run-id task3-self-stop-old-red) = 0
+cleanup_sha256=3b7e4c86920b1f9980e6a3192dc2fadce7a4af6cafb82119c938862997ec87cd
+diagnosis=HVPatch self and same-task signal routes bypassed the kernel task queues and opposing-signal generation, falling through to legacy host-carrier or global pending behavior
