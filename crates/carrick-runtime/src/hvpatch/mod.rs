@@ -543,6 +543,44 @@ impl ProcessContext {
         }
     }
 
+    pub(crate) fn wait_child_in_process_group(&self, group: i32, nowait: bool) -> WaitResult {
+        let Ok(group) = crate::kernel::ProcessGroupId::from_abi_positive(group) else {
+            return WaitResult::NoChild;
+        };
+        let mode = if nowait {
+            crate::kernel::WaitMode::Observe
+        } else {
+            crate::kernel::WaitMode::Consume
+        };
+        loop {
+            let observed = self.kernel_graph().reservation_epoch();
+            match self
+                .kernel_graph()
+                .wait_child_in_process_group(self.task_id(), group, mode)
+            {
+                Ok(crate::kernel::WaitOutcome::Exited(zombie)) => {
+                    break WaitResult::Exited(ChildExit {
+                        pid: zombie.key.id,
+                        status: zombie.status.raw(),
+                    });
+                }
+                Ok(crate::kernel::WaitOutcome::StillRunning) => {
+                    break WaitResult::StillRunning;
+                }
+                Ok(crate::kernel::WaitOutcome::NoChild) => {
+                    break WaitResult::NoChild;
+                }
+                Err(crate::kernel::KernelOperationError::TaskBusy(_)) => {
+                    self.kernel_graph().wait_for_reservation_change(observed);
+                }
+                Err(error) => {
+                    tracing::error!(pid = self.pid(), %error, "authoritative process-group child wait failed");
+                    break WaitResult::NoChild;
+                }
+            }
+        }
+    }
+
     pub(crate) fn process_group(
         &self,
         target: Option<i32>,
@@ -610,6 +648,19 @@ fn identity_operation_errno(
     }
 }
 
+struct RootBootstrapIdentity {
+    pid: i32,
+    tid: crate::thread::ThreadId,
+}
+
+fn root_bootstrap_identity(_host_pid: u32) -> Result<RootBootstrapIdentity, RuntimeError> {
+    let pid = carrick_abi::LINUX_BOOTSTRAP_PID as i32;
+    Ok(RootBootstrapIdentity {
+        pid,
+        tid: crate::thread::ThreadId::from_guest_supplied_tid(pid),
+    })
+}
+
 /// Install the root in-process guest's nonzero ASID before its first entry.
 /// All other backends return `None` and retain their existing register values.
 pub(crate) fn initialize_root_process<E: ThreadedEngine>(
@@ -623,13 +674,12 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
     let stage1_root = engine.get_sys_reg(SysReg::Ttbr0).map_err(|error| {
         RuntimeError::Trap(crate::trap::TrapError::Hypervisor(error.to_string()))
     })? & TTBR_ROOT_MASK;
-    let pid = i32::try_from(std::process::id()).map_err(|_| {
-        RuntimeError::Configuration("host PID does not fit Linux task identity".to_owned())
-    })?;
+    let identity = root_bootstrap_identity(std::process::id())?;
+    let pid = identity.pid;
     let (table, mm_backend) = BankResources::new_root(stage1_root)
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
     let table = std::sync::Arc::new(table);
-    let root_tid = crate::thread::ThreadId::from_guest_supplied_tid(pid);
+    let root_tid = identity.tid;
     let bootstrap = crate::kernel::RootBootstrap::with_mm_backend(
         pid,
         root_tid,
@@ -970,6 +1020,13 @@ mod tests {
         write: false,
         execute: true,
     };
+
+    #[test]
+    fn hvpatch_root_bootstrap_identity_is_linux_init() {
+        let identity = root_bootstrap_identity(67_000).expect("root identity");
+        assert_eq!(identity.pid, carrick_abi::LINUX_BOOTSTRAP_PID as i32);
+        assert_eq!(identity.tid.raw(), carrick_abi::LINUX_BOOTSTRAP_PID as i32);
+    }
 
     fn text(words: &[u32]) -> Vec<u8> {
         words.iter().flat_map(|word| word.to_le_bytes()).collect()

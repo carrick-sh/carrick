@@ -948,6 +948,15 @@ impl Kernel {
         self.registry().state.read().tasks.contains_key(&task_id)
     }
 
+    pub fn task_is_signalable(&self, task_id: TaskId) -> bool {
+        self.registry()
+            .state
+            .read()
+            .tasks
+            .get(&task_id)
+            .is_some_and(|record| record.task.lifecycle() == TaskLifecycle::Live)
+    }
+
     /// Every LIVE task in `group`, lowest id first.
     ///
     /// This is the authority a `killpg(2)` must use. The HOST's process groups
@@ -1044,6 +1053,61 @@ impl Kernel {
         } else {
             pending.enqueue_standard(signal, siginfo);
         }
+        task.wake();
+        true
+    }
+
+    /// Resolve one live Linux tid to its owning task, optionally requiring an
+    /// exact tgid. Kernel-lane `tkill` uses the global form; `tgkill` supplies
+    /// the tgid so a live tid from a different thread group is still ESRCH.
+    pub fn live_task_for_thread(
+        &self,
+        required_task: Option<TaskId>,
+        tid: LinuxTid,
+    ) -> Option<TaskId> {
+        let state = self.registry().state.read();
+        if let Some(task_id) = required_task {
+            let record = state.tasks.get(&task_id)?;
+            return (record.task.lifecycle() == TaskLifecycle::Live
+                && record.task.thread(tid).is_some())
+            .then_some(task_id);
+        }
+        state.tasks.iter().find_map(|(task_id, record)| {
+            (record.task.lifecycle() == TaskLifecycle::Live && record.task.thread(tid).is_some())
+                .then_some(*task_id)
+        })
+    }
+
+    /// Post one thread-directed signal to an exact live `(tgid, tid)` pair.
+    /// The pending queue is published before the task wake, matching the
+    /// process-directed ordering in [`Self::post_signal_to_task`].
+    pub fn post_signal_to_thread(
+        &self,
+        target_task: TaskId,
+        target_tid: LinuxTid,
+        signal: LinuxSignal,
+        siginfo: Option<LinuxSiginfo>,
+    ) -> bool {
+        let (thread, task) = {
+            let state = self.registry().state.read();
+            let Some(record) = state.tasks.get(&target_task) else {
+                return false;
+            };
+            if record.task.lifecycle() != TaskLifecycle::Live {
+                return false;
+            }
+            let Some(thread) = record.task.thread(target_tid) else {
+                return false;
+            };
+            (thread, Arc::clone(&record.task))
+        };
+        thread.update_signal_state(|pending| {
+            if signal.is_realtime() {
+                pending.enqueue_realtime(signal, siginfo);
+            } else {
+                pending.enqueue_standard(signal, siginfo);
+            }
+        });
         task.wake();
         true
     }
@@ -2430,7 +2494,7 @@ impl Kernel {
         target: Option<TaskId>,
         mode: WaitMode,
     ) -> Result<WaitOutcome, KernelOperationError> {
-        self.wait_child_matching(parent_id, target, None, mode)
+        self.wait_child_matching(parent_id, target, None, None, mode)
     }
 
     pub fn wait_child_key(
@@ -2439,7 +2503,16 @@ impl Kernel {
         target: TaskKey,
         mode: WaitMode,
     ) -> Result<WaitOutcome, KernelOperationError> {
-        self.wait_child_matching(parent_id, Some(target.id), Some(target), mode)
+        self.wait_child_matching(parent_id, Some(target.id), Some(target), None, mode)
+    }
+
+    pub fn wait_child_in_process_group(
+        &self,
+        parent_id: TaskId,
+        process_group: ProcessGroupId,
+        mode: WaitMode,
+    ) -> Result<WaitOutcome, KernelOperationError> {
+        self.wait_child_matching(parent_id, None, None, Some(process_group), mode)
     }
 
     fn wait_child_matching(
@@ -2447,6 +2520,7 @@ impl Kernel {
         parent_id: TaskId,
         target: Option<TaskId>,
         exact_target: Option<TaskKey>,
+        process_group: Option<ProcessGroupId>,
         mode: WaitMode,
     ) -> Result<WaitOutcome, KernelOperationError> {
         self.sweep_retired_threads();
@@ -2462,6 +2536,7 @@ impl Kernel {
             .iter()
             .find(|(id, record)| {
                 record.zombie.parent == Some(parent)
+                    && process_group.is_none_or(|group| record.zombie.process_group == group)
                     && exact_target.map_or_else(
                         || target.is_none_or(|target| target == **id),
                         |target| target == record.zombie.key,
@@ -2496,6 +2571,7 @@ impl Kernel {
 
         let live_child = state.tasks.iter().any(|(id, record)| {
             record.task.parent() == Some(parent)
+                && process_group.is_none_or(|group| record.task.process_group() == group)
                 && exact_target.map_or_else(
                     || target.is_none_or(|target| target == *id),
                     |target| target == record.task.key(),
@@ -3169,6 +3245,27 @@ mod tests {
         assert_eq!(kernel.tasks_in_process_group(group), vec![root_id]);
     }
 
+    #[test]
+    fn wait_child_can_select_an_authoritative_guest_process_group() {
+        let (kernel, root) = bootstrap(1);
+        let root_id = root.task().key().id;
+        let child_id = fork_child(&kernel, &root, "wait group child", 702);
+        let group = kernel
+            .create_process_group(child_id, None)
+            .expect("child process group");
+        kernel
+            .exit_task(child_id, LinuxWaitStatus::from_wait_encoding(0), None)
+            .expect("retire child");
+
+        let outcome = kernel
+            .wait_child_in_process_group(root_id, group, WaitMode::Consume)
+            .expect("wait child group");
+        assert!(
+            matches!(outcome, WaitOutcome::Exited(ref zombie) if zombie.key.id == child_id),
+            "wait must select the child from its guest process group: {outcome:?}",
+        );
+    }
+
     /// The pending queue of `id`, read the way the task's own drain reads it.
     fn pending_of(
         kernel: &Arc<Kernel>,
@@ -3232,6 +3329,47 @@ mod tests {
             !pending_of(&kernel, root_id).present().contains(15),
             "the sender must not have signalled itself"
         );
+
+        kernel
+            .exit_task(child_id, LinuxWaitStatus::from_wait_encoding(0), None)
+            .expect("retire child");
+    }
+
+    #[test]
+    fn a_thread_directed_signal_requires_exact_task_membership_and_lands_on_that_thread() {
+        let (kernel, root) = bootstrap(1);
+        let root_id = root.task().key().id;
+        let child_id = fork_child(&kernel, &root, "thread signal target", 714);
+        let child_tid = LinuxTid::for_task_leader(child_id);
+        let sigusr1 = LinuxSignal::for_signal_number(10).expect("SIGUSR1");
+
+        assert_eq!(kernel.live_task_for_thread(None, child_tid), Some(child_id));
+        assert_eq!(
+            kernel.live_task_for_thread(Some(root_id), child_tid),
+            None,
+            "tgkill must reject a tid from another thread group",
+        );
+        assert!(kernel.post_signal_to_thread(
+            child_id,
+            child_tid,
+            sigusr1,
+            Some(LinuxSiginfo::kill(10, carrick_abi::LINUX_SI_TKILL, 1, 0)),
+        ));
+
+        let child = {
+            let state = kernel.registry().state.read();
+            state.tasks.get(&child_id).unwrap().task.clone()
+        };
+        assert!(
+            child
+                .thread(child_tid)
+                .unwrap()
+                .signal_state()
+                .pending()
+                .contains(10),
+            "thread-directed delivery must not fall into the task-wide queue",
+        );
+        assert!(!pending_of(&kernel, child_id).present().contains(10));
 
         kernel
             .exit_task(child_id, LinuxWaitStatus::from_wait_encoding(0), None)

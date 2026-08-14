@@ -512,6 +512,12 @@ fn ptrace_wait_park_pid(target: PtraceWaitTarget) -> Option<i32> {
     }
 }
 
+fn hvpatch_reported_tid(hvpatch_lane: bool, kernel_tid: i32) -> Option<u32> {
+    hvpatch_lane
+        .then(|| u32::try_from(kernel_tid).ok())
+        .flatten()
+}
+
 fn virtual_ptrace_stop_status(linux_signum: i32) -> i32 {
     (linux_signum << 8) | 0x7f
 }
@@ -1765,6 +1771,14 @@ impl SyscallDispatcher {
         }
 
         fn gettid(this, cx) {
+            if let Some(tid) = hvpatch_reported_tid(
+                this.execution_backend() == crate::page_profile::ExecutionBackend::HvPatch,
+                cx.kernel.thread().key().tid.raw(),
+            ) {
+                return Ok(DispatchOutcome::Returned {
+                    value: i64::from(tid),
+                });
+            }
             if let Some(t) = cx.thread
                 && t.registry.live_count() > 1 {
                     // Multi-threaded: report the per-thread tid. The MAIN
@@ -3211,18 +3225,22 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if let Some(process) = this.hvpatch_process() {
-                let target = match pid.0 {
-                    -1 => None,
-                    value if value > 0 => Some(value),
-                    // Process-group selection needs the shared guest pgid
-                    // registry. Do not ask Darwin about a host-child relation
-                    // that intentionally does not exist.
-                    _ => {
-                        return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
-                    }
+                let waited = match pid.0 {
+                    -1 => process.wait_child(None, true, false),
+                    value if value > 0 => process.wait_child(Some(value), true, false),
+                    0 => match process.process_group(None) {
+                        Ok(group) => process.wait_child_in_process_group(group, false),
+                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    },
+                    value => match value.checked_abs() {
+                        Some(group) => process.wait_child_in_process_group(group, false),
+                        None => {
+                            return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ESRCH));
+                        }
+                    },
                 };
                 let guest_nohang = options.contains(LinuxWaitOptions::WNOHANG);
-                match process.wait_child(target, true, false) {
+                match waited {
                     crate::hvpatch::WaitResult::Exited(exit) => {
                         if wstatus_addr.0 != 0 {
                             memory.write_bytes(wstatus_addr.0, &exit.status().to_ne_bytes())?;
@@ -3242,7 +3260,7 @@ impl SyscallDispatcher {
                         let tid = Self::ctx_tid(cx);
                         let non_interrupting = this.non_interrupting_signal_mask(cx.kernel, tid);
                         return Ok(DispatchOutcome::WaitOnHvpatchChild {
-                            target,
+                            target: (pid.0 != -1).then_some(pid.0),
                             sig_mask: carrick_abi::WaitSigMask::Additive(non_interrupting),
                         });
                     }
@@ -4516,6 +4534,17 @@ fn build_linux_sigchld_siginfo(
     buf[20..24].copy_from_slice(&si_uid.to_ne_bytes());
     buf[24..28].copy_from_slice(&linux_status.to_ne_bytes());
     buf
+}
+
+#[cfg(test)]
+mod hvpatch_identity_tests {
+    use super::hvpatch_reported_tid;
+
+    #[test]
+    fn hvpatch_gettid_uses_the_kernel_thread_identity_only_on_that_lane() {
+        assert_eq!(hvpatch_reported_tid(true, 7), Some(7));
+        assert_eq!(hvpatch_reported_tid(false, 7), None);
+    }
 }
 
 #[cfg(test)]

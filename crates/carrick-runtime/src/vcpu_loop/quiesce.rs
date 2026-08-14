@@ -877,7 +877,7 @@ where
                         let tid = (crate::namespace::pid::self_ns_pid() as i32).to_le_bytes();
                         let _ = engine.write_bytes(addr, &tid);
                     }
-                    stamp_guest_tid(engine, self.this_tid, &self.registry);
+                    stamp_guest_tid(engine, self.this_tid, &self.registry, None);
                     kernel.dispatcher.sysv_after_fork_child();
                     self.waiter = crate::io_wait::ThreadWaiter::new(self.this_tid);
                     let handle: Box<dyn carrick_hal::VcpuKickDyn> = Box::new(engine.kick_handle());
@@ -1309,8 +1309,14 @@ where
                     &child_kernel.dispatcher,
                     &child_context,
                 );
+                let child_linux_tid = child_context.thread().key().tid;
                 drop(child_context);
-                stamp_guest_tid(&child_engine, child_tid, &child_registry);
+                stamp_guest_tid(
+                    &child_engine,
+                    child_tid,
+                    &child_registry,
+                    Some(child_linux_tid),
+                );
                 match run_vcpu_until_exit(
                     Arc::clone(&child_kernel),
                     child_engine,

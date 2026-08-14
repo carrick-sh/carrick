@@ -147,6 +147,15 @@ impl GuestMemoryRange {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyntheticProcIdentity {
+    pub pid: u32,
+    pub tid: u32,
+    pub ppid: u32,
+    pub pgrp: u32,
+    pub session: u32,
+}
+
 /// Minimal live state needed by synthetic `/proc` renderers.
 #[derive(Debug, Clone, Default)]
 pub struct SyntheticProcContext {
@@ -193,6 +202,9 @@ pub struct SyntheticProcContext {
     pub sig_ignored: u64,
     pub sig_caught: u64,
     pub sig_shdpnd: u64,
+    /// Exact task identity for the in-process HVPatch kernel lane. `None`
+    /// preserves mature native/VMM host-process rendering byte-for-byte.
+    pub identity: Option<SyntheticProcIdentity>,
     pub sysvipc_shm: String,
     pub sysvipc_sem: String,
     pub sysvipc_msg: String,
@@ -779,7 +791,7 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
         "/proc/self/schedstat" => Some(b"0 0 1\n".to_vec()),
         "/proc/self/smaps" => Some(synthetic_proc_smaps(ctx).into_bytes()),
         "/proc/self/smaps_rollup" => Some(synthetic_proc_smaps_rollup(ctx).into_bytes()),
-        "/proc/self/stat" => Some(synthetic_proc_self_stat(&ctx.executable_path).into_bytes()),
+        "/proc/self/stat" => Some(synthetic_proc_self_stat(ctx).into_bytes()),
         "/proc/self/statm" => Some(synthetic_proc_self_statm()),
         "/proc/self/status" => Some(synthetic_proc_self_status(ctx).into_bytes()),
         // A running/on-CPU task: syscall reports "running", wchan 0 (no newline).
@@ -1966,6 +1978,7 @@ impl Vfs for ProcVfs {
             sig_ignored: ctx.sig_ignored,
             sig_caught: ctx.sig_caught,
             sig_shdpnd: ctx.sig_shdpnd,
+            identity: ctx.identity,
             sysvipc_shm: ctx.sysvipc_shm.unwrap_or("").to_owned(),
             sysvipc_sem: ctx.sysvipc_sem.unwrap_or("").to_owned(),
             sysvipc_msg: ctx.sysvipc_msg.unwrap_or("").to_owned(),
@@ -2410,7 +2423,9 @@ fn synthetic_proc_self_status(ctx: &SyntheticProcContext) -> String {
     // that is the ns-local pid (1 for the container init), not the host pid;
     // identity otherwise. LTP gettid01 reads "Pid:" and asserts it equals
     // getpid(). A single-threaded process has Pid == Tgid.
-    let pid = crate::namespace::pid::self_ns_pid();
+    let pid = ctx
+        .identity
+        .map_or_else(crate::namespace::pid::self_ns_pid, |identity| identity.pid);
     // PPid is the ns-translated parent: 0 for the init, the parent's ns-pid for
     // others (was hardcoded 0, which diverged from Docker for non-init members).
     // Preserve the historical `PPid: 0` for non-namespaced runs (run-elf) so
@@ -2418,11 +2433,16 @@ fn synthetic_proc_self_status(ctx: &SyntheticProcContext) -> String {
     // intentionally omitted — NSpgid/NSsid need pgid/sid translation that stays
     // host-level in Phase 2, so a partial quartet would diverge worse than its
     // absence (§5.3, §6.6).
-    let ppid = if crate::namespace::pid::enabled() {
-        crate::namespace::pid::self_ns_ppid()
-    } else {
-        0
-    };
+    let ppid = ctx.identity.map_or_else(
+        || {
+            if crate::namespace::pid::enabled() {
+                crate::namespace::pid::self_ns_ppid()
+            } else {
+                0
+            }
+        },
+        |identity| identity.ppid,
+    );
     let groups = if ctx.groups.is_empty() {
         String::new()
     } else {
@@ -2545,10 +2565,16 @@ fn synthetic_proc_self_comm(ctx: &SyntheticProcContext) -> String {
     comm
 }
 
-fn synthetic_proc_self_stat(executable_path: &str) -> String {
-    let comm = process_short_name(executable_path);
-    let pid = std::process::id();
-    let ppid = unsafe { libc::getppid() } as u32;
+fn synthetic_proc_self_stat(ctx: &SyntheticProcContext) -> String {
+    let comm = process_short_name(&ctx.executable_path);
+    let identity = ctx.identity;
+    let pid = identity.map_or_else(std::process::id, |identity| identity.pid);
+    let ppid = identity.map_or_else(
+        || unsafe { libc::getppid() } as u32,
+        |identity| identity.ppid,
+    );
+    let pgrp = identity.map_or(pid, |identity| identity.pgrp);
+    let session = identity.map_or(pid, |identity| identity.session);
     let thread_states = crate::current_thread_states();
     let nthreads = thread_states.len().max(1);
     let state = proc_self_stat_state_from_threads(
@@ -2561,8 +2587,8 @@ fn synthetic_proc_self_stat(executable_path: &str) -> String {
         &comm,
         state,
         ppid,
-        pid,
-        pid,
+        pgrp,
+        session,
         nthreads,
         self_utime_ticks(),
     )
@@ -3555,6 +3581,25 @@ mod tests {
             String::from_utf8(synthetic_file("/proc/self/stat", &demo_ctx()).unwrap()).unwrap();
         let n = line.trim_end().split(' ').count();
         assert_eq!(n, 52, "stat must have 52 fields: {line:?}");
+    }
+
+    #[test]
+    fn self_stat_uses_explicit_kernel_identity_when_present() {
+        let mut context = demo_ctx();
+        context.identity = Some(SyntheticProcIdentity {
+            pid: 2,
+            tid: 2,
+            ppid: 1,
+            pgrp: 2,
+            session: 1,
+        });
+
+        let line = String::from_utf8(synthetic_file("/proc/self/stat", &context).unwrap()).unwrap();
+        let fields: Vec<&str> = line.trim_end().split(' ').collect();
+        assert_eq!(fields[0], "2", "pid: {line}");
+        assert_eq!(fields[3], "1", "ppid: {line}");
+        assert_eq!(fields[4], "2", "pgrp: {line}");
+        assert_eq!(fields[5], "1", "session: {line}");
     }
 
     #[test]

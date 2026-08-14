@@ -3165,6 +3165,7 @@ impl SyscallDispatcher {
             sig_ignored,
             sig_caught,
             sig_shdpnd,
+            identity: self.synthetic_proc_identity(context),
             sysvipc_shm: Some(sysvipc_shm.as_str()),
             sysvipc_sem: Some(sysvipc_sem.as_str()),
             sysvipc_msg: Some(sysvipc_msg.as_str()),
