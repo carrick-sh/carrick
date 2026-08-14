@@ -1298,6 +1298,70 @@ fn bundled_profile_scripts_emit_one_versioned_completion() {
 }
 
 #[test]
+fn hvpatch_alias_sharing_trace_fails_closed() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/dtrace/hvpatch-alias-sharing.d");
+    let script = std::fs::read_to_string(path).unwrap();
+
+    assert!(script.contains("walks = 0;"));
+    assert!(script.contains("fault_walks = 0;"));
+    assert!(script.contains("fault_ttbrs = 0;"));
+    assert!(
+        script.contains("exit(3);"),
+        "provider errors must fail immediately"
+    );
+    assert!(
+        script.contains("exit(4);"),
+        "timeouts must fail immediately"
+    );
+    assert!(
+        script.contains("maps && faults && walks && fault_walks && fault_ttbrs && !errors"),
+        "target exit must require a complete companion capture"
+    );
+}
+
+#[test]
+fn hvpatch_alias_sharing_saved_capture_validator_fails_closed() {
+    let validator = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/dtrace/validate-hvpatch-alias-sharing.sh");
+    let temp = tempfile::tempdir().unwrap();
+    let cases = [
+        (
+            "ok",
+            "HVPATCHALIAS|end|maps=1|faults=1|walks=1|fault_walks=1|fault_ttbrs=1|bounded=0|errors=0\n",
+            0,
+        ),
+        (
+            "zero",
+            "HVPATCHALIAS|end|maps=0|faults=0|walks=0|fault_walks=0|fault_ttbrs=0|bounded=0|errors=0\n",
+            2,
+        ),
+        ("incomplete", "HVPATCHALIAS|map|ipa=1\n", 2),
+        (
+            "provider-error",
+            "HVPATCHALIAS|error|fault=1\nHVPATCHALIAS|end|maps=1|faults=1|walks=1|fault_walks=1|fault_ttbrs=1|bounded=0|errors=1\n",
+            3,
+        ),
+        (
+            "timeout",
+            "HVPATCHALIAS|end|maps=1|faults=1|walks=1|fault_walks=1|fault_ttbrs=1|bounded=1|errors=0\n",
+            4,
+        ),
+    ];
+
+    for (name, capture, expected) in cases {
+        let path = temp.path().join(name);
+        std::fs::write(&path, capture).unwrap();
+        let status = std::process::Command::new("sh")
+            .arg(&validator)
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(expected), "fixture {name}");
+    }
+}
+
+#[test]
 fn native_wall_profile_emits_categorized_completion_contract() {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/dtrace/native-wall.d");
