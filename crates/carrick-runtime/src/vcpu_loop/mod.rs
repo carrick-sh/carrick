@@ -466,7 +466,7 @@ struct HvpatchRuntimeEndpoint {
     signal_context: crate::kernel::KernelContext,
 }
 
-/// The kernel lane's [`TaskWaker`]: the three vehicles a guest task on this
+/// The kernel lane's [`TaskWaker`](crate::kernel::TaskWaker): the three vehicles a guest task on this
 /// lane can be parked on, kicked together.
 ///
 /// A parked guest is waiting on one of them and the kernel cannot tell which,
