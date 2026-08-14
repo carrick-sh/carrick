@@ -1,0 +1,23 @@
+Final signed binary fail-closed matrix
+command shape: CARRICK_CORE_FAILPOINT=<name> target/release/carrick run --exec-backend hvpatch ... /tmp/p --expect-no-core
+common result per row: guest status=0, wcoredump_clear=true, no_published_core=true, no_temporary_core=true, scoped cleanup=0
+
+capture-timeout          task5-evidence-fp-capture-timeout-86783          PASS
+capture-interrupted      task5-evidence-fp-capture-interrupted-86783      PASS
+capture-registers        task5-evidence-fp-capture-registers-86783        PASS
+register-generation      task5-evidence-fp-register-generation-86783      PASS (generation 1 missing tid 5; bounded 10 s)
+missing-thread           task5-evidence-fp-missing-thread-86783           PASS
+capture-mm               task5-evidence-fp-capture-mm-86783               PASS
+missing-auxv             task5-evidence-fp-missing-auxv-86783             PASS
+missing-vma              task5-evidence-fp-missing-vma-86783              PASS
+memory-read              task5-evidence-fp-memory-read-86783              PASS
+missing-file-identity    task5-evidence-fp-missing-file-identity-86783    PASS
+validator                task5-evidence-fp-validator-86783                PASS
+before-create            task5-evidence-fp-before-create-86783            PASS
+unwritable-path          task5-evidence-fp-unwritable-path-86783          PASS
+short-write              task5-evidence-fp-short-write-86783              PASS
+fsync                    task5-evidence-fp-fsync-86783                    PASS
+rename                   task5-evidence-fp-rename-86783                   PASS
+post-publication         task5-evidence-fp-post-publication-86783         PASS
+
+17/17 PASS; all 17 cleanup receipts reported remaining carrick procs = 0.

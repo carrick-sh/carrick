@@ -1,0 +1,8 @@
+CARRICK_PROBE_RUN_ID=cr-69318-28387
+CARRICK_PROBE_CLEANUP_RUN_ID=cr-69318-28387
+remaining carrick procs (run-id cr-69318-28387) = 0
+DIFF coredumpfile (- linux  + carrick)
+  9c9
+  < wcoredump_set=true
+  ---
+  > wcoredump_set=false
