@@ -344,8 +344,8 @@ acceptance criteria.
 
 | task | status | accepted commit / evidence |
 | --- | --- | --- |
-| 1 — lazy high-VA sharing | **IN PROGRESS** | isolated branch `codex/hybrid-kernel`; baseline `just test` GREEN (runtime 1,561 passed, 5 ignored) |
-| 2 — KX fatal errors and evidence | queued | — |
+| 1 — lazy high-VA sharing | **COMPLETE** | `f457295ee`; [evidence](docs/perf-results/2026-08-13-hvpatch-lazy-high-va-shared-anonymous.md); signed advisory-hint MATCH, `just ci` GREEN |
+| 2 — KX fatal errors and evidence | **IN PROGRESS** | deterministic post-teardown failure injection and six-stage receipt next |
 | 3 — KI identity reseed | queued | — |
 | 4 — global frames and stage-1 COW | queued | — |
 | 5 — live-state crash artifacts | queued | — |
@@ -357,6 +357,13 @@ retention gate. The ordered resume sequence and invariants 4–6 are
 authoritative; CPU is a regression signal, not permission to retain the old
 process-bank architecture.
 
+**Task 1 ruling:** `OwnedHostMapping::guest_shared` cannot remain the authority
+for both host backing inheritance and HVPatch shared-file/global-IPA ownership.
+The high-VA shared-anonymous RED proves those are distinct Linux semantics.
+Introduce an explicit anonymous fork-sharing invariant through alias inventory
+and child mapping reuse; do not downgrade to private backing or borrow
+shared-file/futex identity.
+
 ### Task 1 — preserve sharing across lazy high-VA commitment
 
 **Files:**
@@ -364,19 +371,19 @@ process-bank architecture.
 `crates/carrick-runtime/src/dispatch/mem.rs`, and
 `crates/carrick-vmm-hvf/src/trap.rs`.
 
-- [ ] Extend `mmaptrimprotect` with a high-hint
+- [x] Extend `mmaptrimprotect` with a high-hint
   `MAP_SHARED|MAP_ANONYMOUS|PROT_NONE` mapping. `mprotect` it writable, write a
   sentinel, fork, mutate the same page in the child, and require the parent to
   observe the child value. Keep the existing private-anonymous V8-shaped case.
-- [ ] Build probes and the signed binary, then run
+- [x] Build probes and the signed binary, then run
   `CARRICK_EXEC_BACKEND=hvpatch scripts/run-probe.sh mmaptrimprotect` from the
   repo root. Capture the current Carrick/Docker **DIFF** before changing the
   runtime; never run the two arms concurrently.
-- [ ] Carry the reservation's original `ProcMapSharing` and retained VMA
+- [x] Carry the reservation's original `ProcMapSharing` and retained VMA
   attributes into `HostAliasMmapCommit`. Set `DispatchOutcome::MapHostAlias`
   `shared` from that value, and allocate `HostMappingKind::SharedAnon` rather
   than `PrivateAnon` for the shared anonymous transaction.
-- [ ] Rerun the same differential probe and require **MATCH**, then run the
+- [x] Rerun the same differential probe and require **MATCH**, then run the
   relevant host tests and `just ci`. Publish the red/green commands, signed
   binary identity, and exact commit in a durable evidence document.
 
