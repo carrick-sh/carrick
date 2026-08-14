@@ -345,8 +345,8 @@ acceptance criteria.
 | task | status | accepted commit / evidence |
 | --- | --- | --- |
 | 1 — lazy high-VA sharing | **COMPLETE** | `f457295ee`; [evidence](docs/perf-results/2026-08-13-hvpatch-lazy-high-va-shared-anonymous.md); signed advisory-hint MATCH, `just ci` GREEN |
-| 2 — KX fatal errors and evidence | **IN PROGRESS** | deterministic post-teardown failure injection and six-stage receipt next |
-| 3 — KI identity reseed | queued | — |
+| 2 — KX fatal errors and evidence | **COMPLETE** | `12ed17b5f`; [fatal-path evidence](docs/perf-results/2026-08-13-hvpatch-exec-failure-red-green.txt) and [six-stage trace](docs/perf-results/2026-08-13-hvpatch-exec-runtime-stages.raw); four signed post-PONR failpoints signal-shaped, genuine exit 127 preserved, exact-six live trace, `just ci` GREEN |
+| 3 — KI identity reseed | **IN PROGRESS** | reseed blockers and lane-scoped root identity audit next |
 | 4 — global frames and stage-1 COW | queued | — |
 | 5 — live-state crash artifacts | queued | — |
 | 6 — KP shipped proof | queued | — |
@@ -394,16 +394,16 @@ shared-file/futex identity.
 `scripts/dtrace/hvpatch-phase4-exec-runtime-stages.d`, and the exec-failure
 conformance probes.
 
-- [ ] Add deterministic failure injection for old/replacement inventory
+- [x] Add deterministic failure injection for old/replacement inventory
   capacity, reservation, and `begin_exec_inventory` after sibling teardown.
   The red assertion is that none may publish a normal exit status 127.
-- [ ] Route every fallible operation after the documented point of no return
+- [x] Route every fallible operation after the documented point of no return
   through `exec_failed_past_no_return`; alternatively move it wholly before
   sibling teardown and return a Linux errno without mutating the old image.
-- [ ] Emit `HvpatchExecRuntimeStagePhase::CloseCloexec` around the committed
+- [x] Emit `HvpatchExecRuntimeStagePhase::CloseCloexec` around the committed
   CLOEXEC close. Preserve all six existing ordinals; this is an append-only
   observability ABI, so deleting or renumbering the phase is not permitted.
-- [ ] Require the exec-failure differential probes to match Docker and
+- [x] Require the exec-failure differential probes to match Docker and
   `hvpatch-phase4-exec-runtime-stages.d` to finish with exactly six stage
   events per completed exec. An empty or incomplete capture is RED.
 
