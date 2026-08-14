@@ -3602,7 +3602,7 @@ impl SyscallDispatcher {
             .map_err(|error| CorePublicationError::KernelIdentity(error.to_string()))?;
         let proc = self.proc.lock();
         let mem = self.mem.lock();
-        if mem.linux_auxv_image.len() % 16 != 0 {
+        if !mem.linux_auxv_image.len().is_multiple_of(16) {
             return Err(CorePublicationError::MalformedAuxv);
         }
         let mut auxv = Vec::with_capacity(mem.linux_auxv_image.len() / 16);
