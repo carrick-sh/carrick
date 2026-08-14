@@ -1,0 +1,10 @@
+HVPATCH4RUNTIME|header|version=1
+HVPATCH4RUNTIME|begin|host_pid=67894|host_tid=15421075|guest_pid=67894|guest_tid=67894|asid=1
+HVPATCH4RUNTIME|stage|host_pid=67894|host_tid=15421075|guest_pid=67894|guest_tid=67894|asid=1|phase=4|elapsed_ns=1851417|regions=19|mapped_bytes=38799713248
+HVPATCH4RUNTIME|stage|host_pid=67894|host_tid=15421075|guest_pid=67894|guest_tid=67894|asid=1|phase=1|elapsed_ns=917|regions=19|mapped_bytes=38799713248
+HVPATCH4RUNTIME|stage|host_pid=67894|host_tid=15421075|guest_pid=67894|guest_tid=67894|asid=1|phase=5|elapsed_ns=1250|regions=19|mapped_bytes=38799713248
+HVPATCH4RUNTIME|complete|host_pid=67894|host_tid=15421075|guest_pid=67894|guest_tid=67894|asid=1
+HVPATCH4RUNTIME|stage|host_pid=67894|host_tid=15421075|guest_pid=67894|guest_tid=67894|asid=1|phase=2|elapsed_ns=13625|regions=19|mapped_bytes=38799713248
+HVPATCH4RUNTIME|stage|host_pid=67894|host_tid=15421075|guest_pid=67894|guest_tid=67894|asid=1|phase=0|elapsed_ns=4458|regions=19|mapped_bytes=38799713248
+HVPATCH4RUNTIME|stage|host_pid=67894|host_tid=15421075|guest_pid=67894|guest_tid=67894|asid=1|phase=3|elapsed_ns=542|regions=19|mapped_bytes=38799713248
+HVPATCH4RUNTIME|summary|status=ok|begins=1|completes=1|events=6|phase0=1|phase1=1|phase2=1|phase3=1|phase4=1|phase5=1|join_errors=0|phase_errors=0|duplicate_errors=0|completion_errors=0|lifecycle_errors=0|empty=0|bounded=0|errors=0|drops=0|target_exited=1|target_exit_seen=1|target_exit_code=0|target_exit_reason=1

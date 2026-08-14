@@ -1,0 +1,88 @@
+HVPatch exec fatal-shape RED/GREEN receipt
+date=2026-08-13 America/Los_Angeles
+task_base=212df9e2
+implementation_commit=0650cbe9b
+probe_sha256=4782c72b1c23584ed5f14599f2b5ca404fa734fa369b39b20afe0740dd4583b3
+signed_binary_sha256=3da910e7886b4e413c425559f85918c516b44800d517e060cec24612416c9870
+
+RED commands (signed pre-fix binary; each command was run serially):
+  CARRICK_EXEC_BACKEND=hvpatch CARRICK_HVPATCH_EXEC_INVENTORY_FAILURE='old-capacity@/bin/true' scripts/run-probe.sh execfatalstatus
+  CARRICK_EXEC_BACKEND=hvpatch CARRICK_HVPATCH_EXEC_INVENTORY_FAILURE='replacement-reservation@/bin/true' scripts/run-probe.sh execfatalstatus
+  CARRICK_EXEC_BACKEND=hvpatch CARRICK_HVPATCH_EXEC_INVENTORY_FAILURE='begin-inventory@/bin/true' scripts/run-probe.sh execfatalstatus
+
+RED results:
+  old-capacity run_id=cr-65726-21517
+  replacement-reservation run_id=cr-65918-23161
+  begin-inventory run_id=cr-65984-26737
+  all three Carrick observations:
+    child_exited=true
+    child_exit_status=127
+    child_signaled=false
+    child_signal=0
+  assertion: RED because an internal post-teardown exec failure was published
+  as a normal WIFEXITED status 127.
+
+GREEN commands (signed final binary; same three commands, serial):
+  old-capacity run_id=cr-68889-13208 cleanup=0
+  replacement-reservation run_id=cr-68935-18176 cleanup=0
+  begin-inventory run_id=cr-68979-22236 cleanup=0
+  all three Carrick observations:
+    child_exited=false
+    child_exit_status=-1
+    child_signaled=true
+    child_signal=11
+  assertion: GREEN because every injected post-point-of-no-return failure is
+  distinguishable from a real guest exit(127) at wait(2).
+
+Ordinary differential controls (signed final binary, serial):
+  CARRICK_EXEC_BACKEND=hvpatch scripts/run-probe.sh execfatalstatus
+  run_id=cr-69023-26296 cleanup=0 result=MATCH
+    reaped=true
+    child_exited=true
+    child_exit_status=0
+    child_signaled=false
+    child_signal=0
+
+  CARRICK_EXEC_BACKEND=hvpatch scripts/run-probe.sh execfailsurvive
+  run_id=cr-68879-10482 cleanup=0 result=MATCH
+    enoent_errno=2 image_intact=true
+    eacces_errno=13 image_intact=true
+    enoexec_errno=8 image_intact=true
+    eisdir_errno=13 image_intact=true
+    enotdir_errno=20 image_intact=true
+    enametoolong_errno=36 image_intact=true
+    eloop_errno=40 image_intact=true
+    survived_all=true
+    final_image_intact=true
+
+Six-stage live receipt (signed final binary):
+  CARRICK_RUN_ID=task2-final-trace-20260813 target/release/carrick trace --profile hvpatch-exec-runtime-stages --trace-out docs/perf-results/2026-08-13-hvpatch-exec-runtime-stages.raw -- run --exec-backend hvpatch ubuntu:24.04 /bin/sh -c 'exec /bin/true'
+  result=accepted completed_execs=1 events=6 events_per_exec=6 cleanup=0
+  program_sha256=bad668a8fb2b872ebd14d29314559334d410f99553b6c42d9da2cb6d9ac60289
+  raw_sha256=6b7f50362fb51dfd0c474f53dfd78c8a1993f8b6bc21fe57c460aa66d0f6b159
+  summary=status=ok begins=1 completes=1 events=6 phase0=1 phase1=1 phase2=1 phase3=1 phase4=1 phase5=1 join_errors=0 phase_errors=0 duplicate_errors=0 completion_errors=0 lifecycle_errors=0 empty=0 bounded=0 errors=0 drops=0 target_exited=1 target_exit_seen=1 target_exit_code=0
+
+Strict-consumer live RED receipts retained:
+  2026-08-13-hvpatch-exec-runtime-stages-consumer-red.raw
+    sha256=b2d8fefb2bb45ed78b03a151c75b77efd365cb3bbc5599f9997ca21517784f1d
+    rejected producer completion_errors=1
+  2026-08-13-hvpatch-exec-runtime-stages-order-red.raw
+    sha256=25e9e713e7fd5381ab0d72a0e7b1d29e33655b686ab7240c49f33006222a4143
+    rejected order-sensitive consumer after DTrace buffer reordering exposed a
+    complete record before three of the six stage records
+
+Focused tests:
+  cargo test -p carrick-observability exec_runtime_stage_event_keeps_outer_runtime_cost_typed -- --nocapture
+    1 passed
+  RUST_MIN_STACK=8388608 cargo test -p carrick-cli hvpatch_exec_runtime -- --nocapture
+    5 passed
+  cargo test -p carrick-runtime --lib exec_image_verification_tests -- --nocapture
+    3 passed
+
+Full gate:
+  RUST_TEST_THREADS=1 CARRICK_RUN_ID=task2-ci2-20260813 just ci
+  result=PASS
+  runtime unit result=1564 passed, 5 ignored
+  runtime integration result=296 passed
+  carrick-cli unit result=358 passed
+  trace-profile integration result=41 passed
