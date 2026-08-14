@@ -2894,7 +2894,6 @@ struct HvpatchFrameInventory {
         carrick_hal::FrameInventoryCommit<()>,
         carrick_hal::FrameInventoryCommit<()>,
     )>,
-    fail_next_begin_exec_inventory: bool,
     retirement_reservation: Option<carrick_hal::FrameInventoryReservation>,
     retirement_commit: Option<carrick_hal::FrameInventoryCommit<()>>,
 }
@@ -2906,6 +2905,63 @@ impl HvpatchFrameInventory {
             frames,
             ..Self::default()
         }
+    }
+}
+
+/// One engine state's handle onto the process-shared frame ledger.
+///
+/// The diagnostic arm is deliberately local to this handle. Sibling engines
+/// share the authoritative mapping ledger but cannot consume one another's
+/// selected-target failure injection.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct HvpatchFrameInventoryState {
+    ledger: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
+    fail_next_begin_exec_inventory: bool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvpatchFrameInventoryState {
+    fn new(ledger: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>) -> Self {
+        Self {
+            ledger,
+            fail_next_begin_exec_inventory: false,
+        }
+    }
+
+    fn lock(&self) -> parking_lot::MutexGuard<'_, HvpatchFrameInventory> {
+        self.ledger.lock()
+    }
+
+    fn shared_ledger(&self) -> std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>> {
+        std::sync::Arc::clone(&self.ledger)
+    }
+
+    fn inject_next_begin_exec_inventory_failure(&mut self) {
+        self.fail_next_begin_exec_inventory = true;
+    }
+
+    fn begin_exec_inventory(
+        &mut self,
+        retired: carrick_hal::FrameInventoryReservation,
+        replacement: carrick_hal::FrameInventoryReservation,
+    ) -> Result<(), TrapError> {
+        if std::mem::take(&mut self.fail_next_begin_exec_inventory) {
+            return Err(TrapError::Hypervisor(
+                "injected HVPatch begin_exec_inventory failure".to_owned(),
+            ));
+        }
+        let mut inventory = self.ledger.lock();
+        if inventory.retired_reservation.is_some()
+            || inventory.replacement_reservation.is_some()
+            || inventory.exec_commits.is_some()
+        {
+            return Err(TrapError::Hypervisor(
+                "overlapping HVPatch exec inventory transaction".to_owned(),
+            ));
+        }
+        inventory.retired_reservation = Some(retired);
+        inventory.replacement_reservation = Some(replacement);
+        Ok(())
     }
 }
 
@@ -3033,7 +3089,7 @@ pub(crate) struct HvfVmState {
     /// HVPatch-only exact sparse-extent inventory. Sibling vCPUs share this
     /// ledger; VM/vCPU recreation reuses it and therefore emits no logical
     /// mapping events.
-    frame_inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
+    frame_inventory: HvpatchFrameInventoryState,
 }
 
 /// Thread/process exit must LEAK the per-thread host backings, never `munmap`
@@ -3718,27 +3774,13 @@ impl HvfVmState {
         retired: carrick_hal::FrameInventoryReservation,
         replacement: carrick_hal::FrameInventoryReservation,
     ) -> Result<(), TrapError> {
-        let mut inventory = self.frame_inventory.lock();
-        if std::mem::take(&mut inventory.fail_next_begin_exec_inventory) {
-            return Err(TrapError::Hypervisor(
-                "injected HVPatch begin_exec_inventory failure".to_owned(),
-            ));
-        }
-        if inventory.retired_reservation.is_some()
-            || inventory.replacement_reservation.is_some()
-            || inventory.exec_commits.is_some()
-        {
-            return Err(TrapError::Hypervisor(
-                "overlapping HVPatch exec inventory transaction".to_owned(),
-            ));
-        }
-        inventory.retired_reservation = Some(retired);
-        inventory.replacement_reservation = Some(replacement);
-        Ok(())
+        self.frame_inventory
+            .begin_exec_inventory(retired, replacement)
     }
 
     pub(crate) fn inject_next_begin_exec_inventory_failure(&mut self) {
-        self.frame_inventory.lock().fail_next_begin_exec_inventory = true;
+        self.frame_inventory
+            .inject_next_begin_exec_inventory_failure();
     }
 
     pub(crate) fn frame_inventory_exec_extent_counts(
@@ -3933,8 +3975,8 @@ impl HvfVmState {
             fork_mapping_descs: Vec::new(),
             fork_child_descs: Vec::new(),
             persistent_vm_lifecycle: false,
-            frame_inventory: std::sync::Arc::new(parking_lot::Mutex::new(
-                HvpatchFrameInventory::default(),
+            frame_inventory: HvpatchFrameInventoryState::new(std::sync::Arc::new(
+                parking_lot::Mutex::new(HvpatchFrameInventory::default()),
             )),
         };
         state.seed_readonly_spans_from_plan(plan);
@@ -6325,7 +6367,7 @@ impl HvfVmState {
             persistent_vm_lifecycle: self.persistent_vm_lifecycle,
             process_bank: self.process_bank,
             process_alias_next: self.process_alias_next.clone(),
-            frame_inventory: std::sync::Arc::clone(&self.frame_inventory),
+            frame_inventory: self.frame_inventory.shared_ledger(),
         })
     }
 
@@ -6383,7 +6425,7 @@ impl HvfVmState {
             fork_mapping_descs: Vec::new(),
             fork_child_descs: Vec::new(),
             persistent_vm_lifecycle,
-            frame_inventory,
+            frame_inventory: HvpatchFrameInventoryState::new(frame_inventory),
         };
 
         for mapping in mappings {
@@ -6919,7 +6961,7 @@ impl HvfVmState {
             fork_mapping_descs: Vec::new(),
             fork_child_descs: Vec::new(),
             persistent_vm_lifecycle: spec.persistent_vm_lifecycle,
-            frame_inventory: spec.frame_inventory,
+            frame_inventory: HvpatchFrameInventoryState::new(spec.frame_inventory),
         };
         let mailbox = state.allocate_mailbox_for_vcpu(&vcpu)?;
         // The child address space, frame inventory, and mailbox are now fully
@@ -9314,6 +9356,63 @@ mod frame_inventory_backend_tests {
 
     fn id(raw: u64) -> std::num::NonZeroU64 {
         std::num::NonZeroU64::new(raw).unwrap()
+    }
+
+    fn empty_inventory_reservation(raw: u64) -> carrick_hal::FrameInventoryReservation {
+        let transaction = carrick_hal::KernelTransactionId::from_kernel_allocation(id(raw));
+        let capacity = carrick_hal::FrameEventCapacity::for_event_count(1).unwrap();
+        carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+            carrick_hal::FrameInventoryProvenance::from_kernel_entropy([raw as u8; 32]),
+            carrick_hal::FrameInventoryBatch::prepare(transaction, capacity).unwrap(),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    fn inventory_pair(
+        raw: u64,
+    ) -> (
+        carrick_hal::FrameInventoryReservation,
+        carrick_hal::FrameInventoryReservation,
+    ) {
+        (
+            empty_inventory_reservation(raw),
+            empty_inventory_reservation(raw + 1),
+        )
+    }
+
+    #[test]
+    fn begin_exec_injection_is_owned_and_consumed_by_only_the_armed_engine_state() {
+        let ledger = std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
+        let mut engine_a = HvpatchFrameInventoryState::new(std::sync::Arc::clone(&ledger));
+        let mut engine_b = HvpatchFrameInventoryState::new(std::sync::Arc::clone(&ledger));
+
+        engine_a.inject_next_begin_exec_inventory_failure();
+
+        let (b_retired, b_replacement) = inventory_pair(1);
+        engine_b
+            .begin_exec_inventory(b_retired, b_replacement)
+            .expect("unarmed engine B must not consume engine A's injection");
+        {
+            let mut ledger = ledger.lock();
+            drop(ledger.retired_reservation.take());
+            drop(ledger.replacement_reservation.take());
+        }
+
+        let (a_retired, a_replacement) = inventory_pair(3);
+        let error = engine_a
+            .begin_exec_inventory(a_retired, a_replacement)
+            .expect_err("armed engine A must receive its own injected error");
+        assert!(
+            error
+                .to_string()
+                .contains("injected HVPatch begin_exec_inventory failure")
+        );
+
+        let (retry_retired, retry_replacement) = inventory_pair(5);
+        engine_a
+            .begin_exec_inventory(retry_retired, retry_replacement)
+            .expect("engine A injection must be consumed exactly once");
     }
 
     #[test]
