@@ -1,0 +1,8 @@
+HVPATCH_TASK3_REVIEW_RED_V1
+source_commit=277ff71fb174d71628e33c68dae0c2cdc5e5b583
+signed_binary_sha256=ced6d5a3fbc1ea9d51f72eb696c1a5f9ca2718216b797c484ca2048918c45c8e
+probe=kernelidentity reviewer-strengthened SIGTSTP/SIGSTOP/SIGCONT/leader-exit variant
+command=CARRICK_EXEC_BACKEND=hvpatch CARRICK_PROBE_EXEC_AS_INIT=1 timeout -k 5 15 scripts/run-probe.sh kernelidentity
+CARRICK_PROBE_RUN_ID=cr-10120-22509
+result=outer hard timeout after the shared Darwin carrier was stopped; no relationship stream
+cleanup=remaining carrick procs (run-id cr-10120-22509) = 0

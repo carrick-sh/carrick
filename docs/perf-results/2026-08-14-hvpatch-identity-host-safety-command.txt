@@ -1,4 +1,4 @@
-2026-08-14T08:04:16.564766Z  WARN carrick::commands: carrick trace: not root; re-executing under sudo
+2026-08-14T08:44:58.687206Z  WARN carrick::commands: carrick trace: not root; re-executing under sudo
 TRACECHILD1|euid=501|egid=20|groups=12,20,33,61,79,80,81,98,100,204,250,395,398,399,400,701
 root_exact_linux_init=true
 root_leader_tid_matches=true
@@ -15,9 +15,25 @@ pid_one_default_signal_immunity=true
 pid_one_handler_installed=true
 pid_one_handled_send_succeeded=true
 pid_one_handled_signal_delivered=true
+pid_one_terminal_stop_immunity=true
+job_control_stop_send_succeeded=true
+job_control_wait_reported_sigstop=true
+job_control_sender_remained_runnable=true
+job_control_continue_send_succeeded=true
+job_control_wait_reported_continued=true
+job_control_child_resumed=true
+job_control_child_exited_zero=true
 credential_positive_signal_zero_denied=true
 credential_tgkill_signal_zero_denied=true
 credential_group_signal_zero_denied=true
+leader_exit_setup_ready=true
+leader_exit_observed=true
+leader_exit_positive_signal_zero_succeeded=true
+leader_exit_group_signal_zero_succeeded=true
+leader_exit_positive_signal_succeeded=true
+leader_exit_group_signal_succeeded=true
+leader_exit_sibling_received_signals=true
+leader_exit_child_exited_zero=true
 child_setup_ready=true
 child_id_is_linux_shaped=true
 child_tid_ppid_match=true
@@ -40,4 +56,4 @@ exec_group_session_persist=true
 exec_proc_identity_matches=true
 exec_signal_dispositions_reset_and_preserve=true
 exec_child_exited_zero=true
-HVPatch identity host safety: guest_kills=14, low_guest_id_host_kills=0
+HVPatch identity host safety: guest_kills=22, guest_sigstops=1, guest_sigconts=1, low_guest_id_host_kills=0
