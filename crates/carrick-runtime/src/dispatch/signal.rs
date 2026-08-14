@@ -1110,6 +1110,80 @@ impl SyscallDispatcher {
     /// main thread and then `kill(getpid(), SIGUSR1)`, expecting a worker thread
     /// to run the (process-wide) handler. Always delivering to the blocked
     /// caller stranded the signal pending and hung the process.
+    /// `kill(2)`'s group and broadcast targets on the KERNEL lane, resolved and
+    /// delivered inside the kernel. `None` means "not mine" — another lane, or
+    /// a positive pid, which names one process and is not handled here.
+    ///
+    /// The host cannot answer these. On this lane every Linux process is a
+    /// thread of one host process, so they all share ONE host process group: a
+    /// guest pgid means nothing to `libc::kill`, and `killpg` would either hit
+    /// every guest at once or, once the id space is seeded at 1, negate to
+    /// `kill(-1, …)` — the host BROADCAST sentinel, aimed at everything the
+    /// user can signal. The kernel's own `process_group` table is the only
+    /// authority that describes the guest.
+    ///
+    /// Linux returns success if at least one process was signalled and ESRCH if
+    /// none matched, so an empty group is ESRCH rather than a silent success.
+    /// signum 0 is the null probe: it resolves membership and reports whether
+    /// anything is there WITHOUT delivering, which is what `kill(pgid, 0)`
+    /// liveness checks depend on.
+    fn hvpatch_group_signal<M: GuestMemory>(
+        &self,
+        ctx: &SyscallCtx<M>,
+        pid: i32,
+        signum: u64,
+    ) -> Option<DispatchOutcome> {
+        if !crate::dispatch::hvpatch_lane_active() || pid > 0 {
+            return None;
+        }
+        let kernel = ctx.kernel.kernel();
+        let caller = ctx.kernel.task();
+        let targets = if pid == -1 {
+            kernel.tasks_for_broadcast(caller.key().id)
+        } else {
+            // pid == 0 is the caller's own group; pid < -1 names `-pid`.
+            let group = if pid == 0 {
+                caller.process_group()
+            } else {
+                match crate::kernel::ProcessGroupId::from_abi_positive(-pid) {
+                    Ok(group) => group,
+                    Err(_) => return Some(DispatchOutcome::errno(LINUX_ESRCH)),
+                }
+            };
+            kernel.tasks_in_process_group(group)
+        };
+        if targets.is_empty() {
+            return Some(DispatchOutcome::errno(LINUX_ESRCH));
+        }
+        if signum == 0 {
+            return Some(DispatchOutcome::Returned { value: 0 });
+        }
+        let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signum as i32) else {
+            return Some(DispatchOutcome::errno(LINUX_EINVAL));
+        };
+        // Linux fills si_pid/si_uid with the SENDER's identity for a
+        // kill(2)-delivered signal, so an SA_SIGINFO handler in the target can
+        // tell who signalled it rather than seeing an all-zero SI_USER.
+        let creds = self.cred_snapshot();
+        let info = crate::linux_abi::LinuxSiginfo::kill(
+            signum as i32,
+            crate::linux_abi::LINUX_SI_USER,
+            crate::namespace::pid::self_ns_pid() as i32,
+            creds.ruid,
+        );
+        let mut delivered = 0_usize;
+        for target in targets {
+            if kernel.post_signal_to_task(target, signal, Some(info)) {
+                delivered += 1;
+            }
+        }
+        // Every member may have exited between enumeration and delivery.
+        if delivered == 0 {
+            return Some(DispatchOutcome::errno(LINUX_ESRCH));
+        }
+        Some(DispatchOutcome::Returned { value: 0 })
+    }
+
     fn raise_process_directed<M: GuestMemory>(
         &self,
         ctx: &SyscallCtx<M>,
@@ -1169,6 +1243,15 @@ impl SyscallDispatcher {
             // authority `getpid(2)` answers from, so "the guest asked to signal
             // the pid it believes it has" is exactly a self-target.
             let requested_pid = i64::from(pid.0);
+            // KERNEL LANE: group (`0`, `< -1`) and broadcast (`-1`) targets are
+            // resolved and delivered inside the kernel. This must come BEFORE
+            // the ns→host translation below: a guest pgid is a kernel
+            // `ProcessGroupId`, not a host pgid, so translating it is
+            // meaningless and handing the result to `libc::kill` aims at the
+            // host. Positive pids fall through and are handled as before.
+            if let Some(outcome) = this.hvpatch_group_signal(cx, pid.0, signum) {
+                return Ok(outcome);
+            }
             // Identity when namespaces are off.
             let pid = if crate::namespace::pid::enabled() {
                 if pid.0 > 0 {

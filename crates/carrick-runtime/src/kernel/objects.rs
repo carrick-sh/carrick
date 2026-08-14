@@ -2413,7 +2413,9 @@ impl Task {
         *self.children.lock() = children;
     }
 
-    pub(super) fn process_group(&self) -> ProcessGroupId {
+    /// This task's process group — the value `getpgrp(2)` reports, and the
+    /// membership key `killpg(2)` resolves against.
+    pub fn process_group(&self) -> ProcessGroupId {
         self.identity.lock().process_group
     }
 
