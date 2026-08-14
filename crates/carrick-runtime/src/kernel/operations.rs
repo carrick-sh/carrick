@@ -1010,10 +1010,10 @@ impl Kernel {
     /// [`take_lowest_in`]: super::objects::TaskPendingSignals::take_lowest_in
     ///
     /// The signal is made pending and then the target is WOKEN through its
-    /// lane-supplied [`TaskWaker`], because enqueuing alone reaches only a task
-    /// that gets back to a syscall or trap boundary — one parked in a host wait
-    /// watches pipes, futexes and kqueues, none of which observe the kernel's
-    /// queues. A task with no waker published is not an error: it still notices
+    /// lane-supplied [`TaskWaker`](super::objects::TaskWaker), because enqueuing
+    /// alone reaches only a task that gets back to a syscall or trap boundary —
+    /// one parked in a host wait watches pipes, futexes and kqueues, none of
+    /// which observe the kernel's queues. A task with no waker published is not an error: it still notices
     /// at its next boundary, just not while parked.
     ///
     /// The wake happens strictly AFTER the enqueue and outside the registry
