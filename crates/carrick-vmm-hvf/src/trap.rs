@@ -842,6 +842,8 @@ struct AliasBacking {
     start: u64,
     ipa: u64,
     host_addr: usize,
+    /// Exact guest-visible VA/IPA extent. This deliberately excludes any
+    /// host/HVF granule padding retained by `physical_size` below.
     size: usize,
     /// The whole HVF-granular stage-2 extent retained behind this semantic
     /// fragment. Partial Linux unmaps split only the live fields above; VM
@@ -858,6 +860,11 @@ struct AliasBacking {
     inventory_backing: InventoryBackingIdentity,
     shared_key_base: u64,
     shared_key_offset: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn semantic_extent_size(start: u64, end: u64) -> usize {
+    usize::try_from(end.saturating_sub(start)).unwrap_or(usize::MAX)
 }
 
 // Futex-word keying for `MAP_SHARED` file mappings lives in
@@ -1068,7 +1075,7 @@ fn mapping_is_current_for_process_fork(
                 && alias.start == mapping.start
                 && alias.ipa == mapping.ipa
                 && alias.host_addr == mapping.host_addr as usize
-                && alias.size == mapping.size
+                && alias.size == semantic_extent_size(mapping.start, mapping.end)
         })
 }
 
@@ -3221,7 +3228,7 @@ impl ThreadMappingDesc {
             ipa: region.ipa,
             end: region.end,
             host_addr: region.host_addr,
-            size: region.size,
+            size: semantic_extent_size(region.start, region.end),
             physical_ipa: region.ipa,
             physical_host_addr: region.host_addr,
             physical_size: region.size,
@@ -3270,7 +3277,7 @@ impl ThreadMappingDesc {
             ipa: self.ipa,
             end: self.end,
             host_addr: self.host_addr,
-            size: self.size,
+            size: self.physical_size,
             perms: self.perms,
             memory: None,
             host_mapping: None,
@@ -3839,7 +3846,7 @@ impl HvfVmState {
         }
         alias_registry()
             .lock()
-            .retain(|alias| !extents.contains(&(alias.ipa, alias.size)));
+            .retain(|alias| !extents.contains(&(alias.physical_ipa, alias.physical_size)));
 
         // A retained shared extent still points at its original host allocation.
         // Reclaim only exact extents removed above and preserve the remaining
@@ -4465,8 +4472,8 @@ impl HvfVmState {
         let rc = unsafe { inventory_hv_vm_map_replay(b) };
         crate::probes::hv_vm_map_alias(
             va,
-            b.ipa,
-            b.size as u64,
+            b.physical_ipa,
+            b.physical_size as u64,
             rc as i32,
             self.forked_no_exec as i32,
         );
@@ -4553,7 +4560,13 @@ impl HvfVmState {
         // fetches/reads to the wrong IPA — the amd64 Rosetta JIT undefined-
         // instruction bug).
         let hvf_len = align_up(len, HVF_PAGE_SIZE)?;
-        let size = usize::try_from(hvf_len).map_err(|_| TrapError::MappingTooLarge(len))?;
+        let guest_size = usize::try_from(len).map_err(|_| TrapError::MappingTooLarge(len))?;
+        let requested_physical_size =
+            usize::try_from(hvf_len).map_err(|_| TrapError::MappingTooLarge(len))?;
+        let guest_end = va.checked_add(len).ok_or(TrapError::MappingOverflow {
+            guest_start: va,
+            mapped_size: len,
+        })?;
         // The host page is mapped at the guest's actual prot (map_shared_file),
         // so a PROT_READ file alias has a read-only host backing. Track the
         // guest-intended writability so the syscall write-path returns EFAULT
@@ -4577,31 +4590,35 @@ impl HvfVmState {
             Some((fd, offset, prot)) => crate::host_mapping::OwnedHostMapping::map_shared_file(
                 fd.as_raw_fd(),
                 *offset,
-                size,
+                requested_physical_size,
                 *prot,
             )
             .map_err(|e| {
                 TrapError::Hypervisor(format!(
-                    "alias MAP_SHARED file (fd={} off={offset} size={size} prot={prot}) failed: {e}",
+                    "alias MAP_SHARED file (fd={} off={offset} size={requested_physical_size} prot={prot}) failed: {e}",
                     fd.as_raw_fd()
                 ))
             })?,
             None => crate::host_mapping::OwnedHostMapping::map_shared_anon(
-                size,
+                requested_physical_size,
                 if sharing.shares_across_fork() {
                     crate::host_mapping::HostMappingKind::SharedAnon
                 } else {
                     crate::host_mapping::HostMappingKind::PrivateAnon
                 },
             )
-            .map_err(|e| TrapError::Hypervisor(format!("alias mmap (size={size}) failed: {e}")))?,
+            .map_err(|e| {
+                TrapError::Hypervisor(format!(
+                    "alias mmap (size={requested_physical_size}) failed: {e}"
+                ))
+            })?,
         };
         let host = host_mapping.as_ptr();
-        let size = host_mapping.len();
+        let physical_size = host_mapping.len();
         // Seed the file content (empty for anon — the anon mapping is zeroed; a
         // live MAP_SHARED file mapping is already backed by the page cache).
         if file.is_none() && !payload.is_empty() {
-            let n = payload.len().min(size);
+            let n = payload.len().min(guest_size);
             unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), host, n) };
         }
         // Alias mappings keep permissive stage-2 rights; guest-visible
@@ -4613,16 +4630,22 @@ impl HvfVmState {
         });
         let ipa = reserve_process_alias_ipa(
             ipa,
-            size as u64,
+            physical_size as u64,
             sharing,
             self.process_bank,
             self.process_alias_next.as_deref(),
         )?;
-        let r = unsafe { inventory_hv_vm_map(host.cast(), ipa, size, u64::from(perms)) };
-        crate::probes::hv_vm_map_alias(va, ipa, size as u64, r as i32, self.forked_no_exec as i32);
+        let r = unsafe { inventory_hv_vm_map(host.cast(), ipa, physical_size, u64::from(perms)) };
+        crate::probes::hv_vm_map_alias(
+            va,
+            ipa,
+            physical_size as u64,
+            r as i32,
+            self.forked_no_exec as i32,
+        );
         if r != 0 {
             return Err(TrapError::Hypervisor(format!(
-                "hv_vm_map alias va=0x{va:x} ipa=0x{ipa:x} size={size} failed: 0x{r:x}"
+                "hv_vm_map alias va=0x{va:x} ipa=0x{ipa:x} size={physical_size} failed: 0x{r:x}"
             )));
         }
         // Register EVERY alias (MAP_SHARED file AND private anon — Go's high-VA
@@ -4638,10 +4661,10 @@ impl HvfVmState {
             start: va,
             ipa,
             host_addr: host as usize,
-            size,
+            size: guest_size,
             physical_ipa: ipa,
             physical_host_addr: host as usize,
-            physical_size: size,
+            physical_size,
             perms: u64::from(perms),
             guest_writable: alias_guest_writable,
             sharing,
@@ -4653,9 +4676,9 @@ impl HvfVmState {
         self.mappings.push(HvfMappedRegion {
             start: va,
             ipa,
-            end: va + size as u64,
+            end: guest_end,
             host_addr: host,
-            size,
+            size: physical_size,
             perms,
             memory: None,
             host_mapping: Some(host_mapping),
@@ -4677,7 +4700,7 @@ impl HvfVmState {
                 &mut inventory,
                 &mut reservation,
                 ipa,
-                size as u64,
+                physical_size as u64,
                 carrick_hal::MemPerms {
                     read: true,
                     write: true,
@@ -5586,7 +5609,7 @@ impl HvfVmState {
                             && alias.start == mapping.start
                             && alias.ipa == mapping.ipa
                             && alias.host_addr == mapping.host_addr as usize
-                            && alias.size == mapping.size
+                            && alias.size == semantic_extent_size(mapping.start, mapping.end)
                     })
                 })
                 .flatten();
@@ -6180,7 +6203,7 @@ impl HvfVmState {
                             && alias.start == sm.start
                             && alias.ipa == sm.ipa
                             && alias.host_addr == sm.host_addr
-                            && alias.size == sm.size
+                            && alias.size == semantic_extent_size(sm.start, sm.end)
                     })
                 {
                     continue;
@@ -6415,7 +6438,7 @@ impl HvfVmState {
                             && alias.start == mapping.start
                             && alias.ipa == mapping.ipa
                             && alias.host_addr == mapping.host_addr as usize
-                            && alias.size == mapping.size
+                            && alias.size == semantic_extent_size(mapping.start, mapping.end)
                     })
                     .copied()
                     .and_then(ThreadMappingDesc::from_alias)
@@ -6475,7 +6498,7 @@ impl HvfVmState {
                     start: mapping.start,
                     ipa: mapping.ipa,
                     end: mapping.end,
-                    host: ForkMappingHost::Borrowed(mapping.host_addr),
+                    host: ForkMappingHost::Borrowed(mapping.physical_host_addr),
                     size: mapping.size,
                     physical_ipa: mapping.physical_ipa,
                     physical_host_addr: mapping.physical_host_addr,
@@ -6493,16 +6516,17 @@ impl HvfVmState {
             }
 
             const TWO_MIB: u64 = 2 * 1024 * 1024;
-            let packing_alignment =
-                if mapping.start.is_multiple_of(TWO_MIB) && (mapping.size as u64) >= TWO_MIB {
-                    TWO_MIB
-                } else {
-                    STAGE2_PAGE
-                };
+            let packing_alignment = if mapping.start.is_multiple_of(TWO_MIB)
+                && (mapping.physical_size as u64) >= TWO_MIB
+            {
+                TWO_MIB
+            } else {
+                STAGE2_PAGE
+            };
             cursor = align_up(cursor, packing_alignment)?;
-            let ipa = cursor;
+            let physical_ipa = cursor;
             cursor = cursor
-                .checked_add(mapping.size as u64)
+                .checked_add(mapping.physical_size as u64)
                 .ok_or_else(|| TrapError::Hypervisor("hvpatch child bank overflow".to_owned()))?;
             if cursor > bank_end {
                 return Err(TrapError::Hypervisor(format!(
@@ -6513,18 +6537,36 @@ impl HvfVmState {
             let snapshot_started = std::time::Instant::now();
             let remap = unsafe {
                 crate::host_mapping::OwnedHostMapping::remap_copy(
-                    mapping.host_addr,
-                    mapping.size,
+                    mapping.physical_host_addr,
+                    mapping.physical_size,
                     crate::host_mapping::HostMappingKind::ChildPrivateSnapshot,
                 )
             };
             let (host, snapshot_method) = match remap {
                 Ok(host) => (host, HvpatchForkPrivateSnapshotMethod::MachCowRemap),
                 Err(_) => (
-                    clone_region_for_child(mapping.host_addr, mapping.size, mapping.start)?,
+                    clone_region_for_child(
+                        mapping.physical_host_addr,
+                        mapping.physical_size,
+                        mapping.start,
+                    )?,
                     HvpatchForkPrivateSnapshotMethod::SparseCopyFallback,
                 ),
             };
+            let semantic_physical_offset = mapping
+                .ipa
+                .checked_sub(mapping.physical_ipa)
+                .ok_or_else(|| {
+                    TrapError::Hypervisor(format!(
+                        "HVPatch alias IPA 0x{:x} precedes physical IPA 0x{:x}",
+                        mapping.ipa, mapping.physical_ipa
+                    ))
+                })?;
+            let ipa = physical_ipa
+                .checked_add(semantic_physical_offset)
+                .ok_or_else(|| {
+                    TrapError::Hypervisor("hvpatch child alias IPA overflow".to_owned())
+                })?;
             let snapshot_elapsed_ns = snapshot_started
                 .elapsed()
                 .as_nanos()
@@ -6536,7 +6578,7 @@ impl HvfVmState {
                     child_pid,
                     forking_tid,
                     mapping.start,
-                    mapping.size as u64,
+                    mapping.physical_size as u64,
                     snapshot_elapsed_ns,
                 ));
                 crate::probes::hvpatch_fork_private_snapshot_outcome(
@@ -6579,9 +6621,9 @@ impl HvfVmState {
                 end: mapping.end,
                 host: ForkMappingHost::Owned(host),
                 size: mapping.size,
-                physical_ipa: ipa,
+                physical_ipa,
                 physical_host_addr,
-                physical_size: mapping.size,
+                physical_size: mapping.physical_size,
                 inventory_backing: Self::private_backing_identity(),
                 perms: mapping.perms,
                 is_dynamic_alias: mapping.is_dynamic_alias,
@@ -6723,20 +6765,38 @@ impl HvfVmState {
         let mut aliases_to_publish = Vec::new();
         let mut physical_mutated = false;
         for mapping in spec.mappings {
+            let semantic_physical_offset = mapping
+                .ipa
+                .checked_sub(mapping.physical_ipa)
+                .and_then(|offset| usize::try_from(offset).ok())
+                .filter(|offset| {
+                    offset
+                        .checked_add(mapping.size)
+                        .is_some_and(|end| end <= mapping.physical_size)
+                })
+                .ok_or_else(|| {
+                    TrapError::Hypervisor(format!(
+                        "HVPatch semantic alias IPA 0x{:x} size {} escapes physical IPA 0x{:x} size {}",
+                        mapping.ipa, mapping.size, mapping.physical_ipa, mapping.physical_size
+                    ))
+                })?;
+            let host_addr = mapping
+                .physical_host_addr
+                .wrapping_add(semantic_physical_offset);
             if !mapping.sharing.shares_across_fork() {
                 let rc = unsafe {
                     inventory_hv_vm_map(
-                        mapping.host.ptr().cast(),
-                        mapping.ipa,
-                        mapping.size,
+                        mapping.physical_host_addr.cast(),
+                        mapping.physical_ipa,
+                        mapping.physical_size,
                         u64::from(mapping.perms),
                     )
                 };
                 if rc != 0 {
                     let error = TrapError::ChildMapFailed {
-                        host_addr: mapping.host.ptr() as u64,
-                        guest_start: mapping.ipa,
-                        size: mapping.size,
+                        host_addr: mapping.physical_host_addr as u64,
+                        guest_start: mapping.physical_ipa,
+                        size: mapping.physical_size,
                         code: rc as u32,
                     };
                     if physical_mutated {
@@ -6764,7 +6824,6 @@ impl HvfVmState {
                     mapping.inventory_backing,
                 ));
             }
-            let host_addr = mapping.host.ptr();
             if mapping.is_dynamic_alias {
                 let alias = AliasBacking {
                     start: mapping.start,
@@ -6793,7 +6852,7 @@ impl HvfVmState {
                 ipa: mapping.ipa,
                 end: mapping.end,
                 host_addr,
-                size: mapping.size,
+                size: mapping.physical_size,
                 perms: mapping.perms,
                 guest_writable: mapping.guest_writable,
                 memory: None,
@@ -7244,9 +7303,9 @@ impl HvfVmState {
         // final logical references retired above.
         let alias_cleanup_started = std::time::Instant::now();
         if self.persistent_vm_lifecycle {
-            alias_registry()
-                .lock()
-                .retain(|alias| !retired_physical_extents.contains(&(alias.ipa, alias.size)));
+            alias_registry().lock().retain(|alias| {
+                !retired_physical_extents.contains(&(alias.physical_ipa, alias.physical_size))
+            });
         } else {
             alias_registry().lock().clear();
         }
@@ -7720,22 +7779,22 @@ impl HvfInner {
                         .wrapping_add(crate::memory::LINUX_ALIAS_IPA_BASE)
                 };
                 if let Some(b) = lookup_shared_alias(fault_ipa)
-                    && alias_remap_limiter.allow(b.ipa)
+                    && alias_remap_limiter.allow(b.physical_ipa)
                 {
                     // SAFETY: `host_addr` is a live MAP_SHARED mmap registered
                     // by add_alias. Only rc=0 proves replay installation.
                     let rc = unsafe { inventory_hv_vm_map_replay(b) };
                     crate::probes::hv_vm_map_alias(
                         exit.exception.virtual_address,
-                        b.ipa,
-                        b.size as u64,
+                        b.physical_ipa,
+                        b.physical_size as u64,
                         rc as i32,
                         0,
                     );
                     if rc != 0 {
                         return Err(TrapError::Hypervisor(format!(
                             "lazy alias replay hv_vm_map(ipa=0x{:x}, size={}) failed: 0x{rc:x}",
-                            b.ipa, b.size
+                            b.physical_ipa, b.physical_size
                         )));
                     }
                     // Diagnostic-only alias-remap counter+dump, gated behind
@@ -7745,7 +7804,7 @@ impl HvfInner {
                         let n =
                             ALIAS_REMAP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if n.is_multiple_of(256) {
-                            eprintln!("ALIAS_REMAP n={n} ipa=0x{:x}", b.ipa);
+                            eprintln!("ALIAS_REMAP n={n} ipa=0x{:x}", b.physical_ipa);
                         }
                     }
                     continue;
@@ -10098,9 +10157,10 @@ pub(crate) fn hvf_set_sys_reg(
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 mod tag_strip_tests {
     use super::{
-        AliasBacking, AliasOwnershipScope, GuestMappingPlan, GuestMappingSharing, HvfMappedRegion,
-        InventoryBackingIdentity, alias_matches_process_scope, alias_registry,
-        exec_bank_layout_key, inherited_fork_inventory_extent, mapping_is_current_for_process_fork,
+        AliasBacking, AliasOwnershipScope, GuestMappingPlan, GuestMappingSharing, HVF_PAGE_SIZE,
+        HvfMappedRegion, InventoryBackingIdentity, ThreadMappingDesc, alias_matches_process_scope,
+        alias_registry, exec_bank_layout_key, forget_replay_extent,
+        inherited_fork_inventory_extent, lookup_shared_alias, mapping_is_current_for_process_fork,
         missing_process_aliases, rebind_inherited_alias_to_process, register_shared_alias,
         reserve_process_alias_ipa, strip_pointer_tag, unregister_alias,
     };
@@ -10811,6 +10871,86 @@ mod tag_strip_tests {
             "the exact prefix must remain forkable through the retained physical extent",
         );
         unregister_alias(va, 0xc000, None);
+    }
+
+    #[test]
+    fn alias_registry_full_semantic_unmap_rejects_hvf_padding() {
+        let va = 0x1383_3000_0000;
+        let ipa = carrick_mem::memory::LINUX_ALIAS_IPA_BASE + 0x7a00_0000;
+        let guest_size = 0x1000;
+        let physical_size = HVF_PAGE_SIZE as usize;
+        let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            physical_size,
+            crate::host_mapping::HostMappingKind::SharedAnon,
+        )
+        .expect("16-KiB physical alias backing");
+        let region = HvfMappedRegion {
+            start: va,
+            ipa,
+            end: va + guest_size as u64,
+            host_addr: host_mapping.as_ptr(),
+            size: host_mapping.len(),
+            perms: applevisor::memory::MemPerms::ReadWrite,
+            memory: None,
+            host_mapping: None,
+            is_dynamic_alias: true,
+            sharing: GuestMappingSharing::ForkSharedAnonymous,
+            guest_writable: true,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+        };
+        let desc = ThreadMappingDesc::from_region(&region);
+        assert_eq!(desc.size, guest_size, "thread/fork semantics stay exact");
+        assert_eq!(
+            desc.physical_size, physical_size,
+            "the whole HVF granule remains the replay/lifetime extent"
+        );
+        let alias = AliasBacking {
+            start: desc.start,
+            ipa: desc.ipa,
+            host_addr: desc.host_addr as usize,
+            size: desc.size,
+            physical_ipa: desc.physical_ipa,
+            physical_host_addr: desc.physical_host_addr as usize,
+            physical_size: desc.physical_size,
+            perms: u64::from(desc.perms),
+            guest_writable: desc.guest_writable,
+            sharing: desc.sharing,
+            ownership_scope: AliasOwnershipScope::Root,
+            inventory_backing: InventoryBackingIdentity::SharedAnon(46),
+            shared_key_base: 0,
+            shared_key_offset: 0,
+        };
+        register_shared_alias(alias);
+
+        unregister_alias(va, guest_size, None);
+        let fragments: Vec<_> = alias_registry()
+            .lock()
+            .iter()
+            .copied()
+            .filter(|entry| entry.physical_ipa == ipa)
+            .collect();
+        let padding_replay_candidate = lookup_shared_alias(ipa + guest_size as u64);
+        let fork_candidates =
+            missing_process_aliases(&std::collections::HashSet::new(), &fragments, None);
+
+        alias_registry()
+            .lock()
+            .retain(|entry| entry.physical_ipa != ipa);
+        forget_replay_extent(ipa, physical_size);
+
+        assert!(
+            fragments.is_empty(),
+            "fully unmapping the 4-KiB guest extent must not retain 12 KiB of HVF padding"
+        );
+        assert!(
+            padding_replay_candidate.is_none(),
+            "physical padding must not resolve into a lazy replay authority"
+        );
+        assert!(
+            fork_candidates.is_empty(),
+            "physical padding must not enter a descendant's semantic inventory"
+        );
     }
 
     #[test]
