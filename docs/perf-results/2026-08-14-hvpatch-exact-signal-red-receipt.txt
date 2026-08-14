@@ -42,3 +42,16 @@ pre_fix_source_commit=437f28af6f90276bbb626197aca22dc735d68594
 command=RUST_MIN_STACK=8388608 RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib kernel::operations::tests::authorized_sigcont_wakes_the_parent_current_at_publication -- --exact --nocapture
 result=FAILED: WCONTINUED publication must wake the target's current parent; left 0, right 1; 1592 filtered out; exit 101
 diagnosis=authorization captured a weak reference to the then-current parent, so reparenting before publication could wake only the stale parent and strand a waiter on the new parent
+
+[sigkill_dequeued_stop_invalidation]
+pre_fix_source_commit=77caa63fd838393e6edd892ab428f87c79c15ca0
+command=RUST_MIN_STACK=8388608 RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib kernel::operations::tests::sigkill_invalidates_a_stop_dequeued_before_fatal_delivery -- --exact --nocapture
+result=FAILED: fatal delivery must invalidate every earlier dequeued stop action; 1595 filtered out; exit 101
+diagnosis=SIGKILL resumed a stopped task but did not advance the epoch carried by already-dequeued stop actions, so a stale stop could re-park the task after the one KILL wake was spent
+
+[sigkill_no_false_wcontinued]
+pre_fix_source_commit=77caa63fd838393e6edd892ab428f87c79c15ca0
+command=RUST_MIN_STACK=8388608 RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib kernel::operations::tests::sigkill_resumes_a_stopped_task_without_wcontinued -- --exact --nocapture
+result=FAILED: SIGKILL must not manufacture a WCONTINUED transition; left Continued { task: TaskId(2) }, right StillRunning; 1595 filtered out; exit 101
+oracle=native arm64 Docker, 100 stopped-child SIGKILL iterations, continued=0
+diagnosis=SIGKILL shared continue_from_job_control with SIGCONT, so fatal resume incorrectly published the same pending_continue wait event

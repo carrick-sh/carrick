@@ -1,0 +1,35 @@
+HVPATCH_SIGKILL_WCONTINUED_ORACLE_V1
+
+command:
+docker run --rm -i --platform linux/arm64 gcc:14-bookworm \
+  sh -c 'cc -x c -O2 -Wall -Werror -o /tmp/w - && /tmp/w' <<'EOF'
+#include <sys/wait.h>
+#include <signal.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+int main(void) {
+  int continued = 0;
+  for (int i=0; i<100; i++) {
+    pid_t p=fork(); if(p<0) return 2;
+    if(p==0){ kill(getpid(),SIGSTOP); for(;;) pause(); }
+    int s=0; if(waitpid(p,&s,WUNTRACED)!=p || !WIFSTOPPED(s)) return 3;
+    if(kill(p,SIGKILL)) return 4;
+    pid_t w=waitpid(p,&s,WCONTINUED|WNOHANG);
+    if(w==p && WIFCONTINUED(s)) { continued++; waitpid(p,&s,0); }
+    else if(w==0) { if(waitpid(p,&s,0)!=p) return 5; }
+    else if(w==p && !WIFSIGNALED(s)) return 6;
+  }
+  printf("continued=%d\n",continued);
+  return continued != 0;
+}
+EOF
+
+output:
+continued=0
+
+provenance:
+image_id=sha256:5e927c284bf55a7dc796262e311a0703344f62f41f5621eb56843111b1d37e15
+os=linux arch=arm64
+repo_digest=gcc@sha256:5e927c284bf55a7dc796262e311a0703344f62f41f5621eb56843111b1d37e15
+server_os=linux server_arch=aarch64
