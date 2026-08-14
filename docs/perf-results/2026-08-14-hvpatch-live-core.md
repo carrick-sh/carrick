@@ -1,8 +1,8 @@
 # HVPatch live crash core: implementation and evidence
 
-Date: 2026-08-14  
-Base: `ec55da029009821215bb6ecb1c3b846364b7ca05`  
-Implementation: `2a84f4cb5a5f318f129aab761ea5d763c8b6f93e`  
+Date: 2026-08-14
+Base: `ec55da029009821215bb6ecb1c3b846364b7ca05`
+Implementation: `2a84f4cb5a5f318f129aab761ea5d763c8b6f93e`
 Validated code HEAD: `0b076654c1ad66624657268d3c7d2541514e6d31`
 Lane: signed macOS/arm64 HVPatch, native-arm64 Docker oracle serialized after Carrick
 
