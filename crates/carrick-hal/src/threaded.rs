@@ -717,6 +717,14 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
         None
     }
 
+    /// Best-effort fault-time walk of the live stage-1 backing. The returned
+    /// scalar is the exact TTBR root+ASID observed at the fault; descriptors are
+    /// L0..L3 for `far`. Backends without host-editable guest page tables keep
+    /// the default absence.
+    fn diagnostic_fault_page_tables(&self, _far: u64) -> Option<(u64, [u64; 4])> {
+        None
+    }
+
     /// Select a backend lifecycle in which guest exec/fork operations retain
     /// one host VM and replace only per-process address-space state. Backends
     /// without shared-VM process support keep the default no-op; callers still

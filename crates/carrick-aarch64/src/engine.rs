@@ -302,13 +302,10 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// live backing on first use (the boot image already wrote
     /// `stage1_identity_page_tables` there). Returns whether the edit CHANGED any
     /// descriptor (so the caller can skip a pointless flush on a no-op edit).
-    ///
-    /// This is the no-flush primitive: callers that map a BRAND-NEW VA (no stale
-    /// TLB entry, so the guest's first access walks the just-written tables) — e.g.
-    /// [`Self::map_host_alias`]'s fresh alias — use [`Self::pt_edit`] directly.
-    /// Callers that may RE-protect an already-walked VA route through
+    /// Callers that publish a guest-visible translation route through
     /// [`Self::pt_edit_and_flush`], which runs [`Self::run_el1_maintenance`]
-    /// afterwards so the stale stage-1 TLB entry is invalidated.
+    /// afterwards so a cached invalid walk or stale leaf cannot survive the
+    /// publication.
     fn pt_edit_locked(
         &mut self,
         edit: impl FnOnce(&mut PageTableManager) -> Result<bool, PageTableError>,
@@ -394,10 +391,8 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         Ok(changed)
     }
 
-    /// Edit the stage-1 tables WITHOUT a TLB flush. For BRAND-NEW VAs only (no
-    /// stale TLB entry): the guest's first access walks the just-written tables.
-    /// Used by [`Self::map_host_alias`]'s fresh alias mapping — re-protecting an
-    /// already-walked VA must instead go through [`Self::pt_edit_and_flush`].
+    /// Edit the stage-1 tables WITHOUT a TLB flush. Reserved for changes that do
+    /// not publish a new guest-visible translation.
     fn pt_edit(
         &mut self,
         edit: impl FnOnce(&mut PageTableManager) -> Result<bool, PageTableError>,
@@ -433,6 +428,39 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         }
         self.run_el1_maintenance()
             .map_err(|e| MemoryError::HostMap(format!("stage-1 TLBI failed: {e}")))
+    }
+
+    /// Diagnostic walk of the authoritative host backing after publication.
+    /// Unlike [`PageTableManager::debug_walk`], this reads the descriptors the
+    /// hardware MMU sees. Kept off the syscall hot path; high-VA alias installs
+    /// use it to fire the existing `pt-alias-walk` USDT receipt.
+    fn live_pt_debug_walk(&self, va: u64) -> Result<[u64; 4], MemoryError> {
+        const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
+        let pt_base = self
+            .vcpu
+            .get_sys_reg(SysReg::Ttbr0)
+            .map_err(|error| MemoryError::HostMap(format!("read TTBR0_EL1: {error}")))?
+            & TTBR_ROOT_MASK;
+        let size = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
+        let host = self
+            .vm
+            .host_ptr(pt_base, size)
+            .ok_or_else(|| MemoryError::HostMap("page-table region not mapped".to_owned()))?;
+        let guard = self.page_tables.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(manager) = guard.as_ref() else {
+            return Err(MemoryError::HostMap(
+                "page-table manager unexpectedly absent".to_owned(),
+            ));
+        };
+        if manager.base() != pt_base {
+            return Err(MemoryError::HostMap(format!(
+                "page-table manager root 0x{:x} does not match TTBR0 root 0x{pt_base:x}",
+                manager.base()
+            )));
+        }
+        // SAFETY: `host_ptr` resolved the complete live page-table mapping at
+        // `pt_base`, and the manager's base/length were checked above.
+        Ok(unsafe { manager.debug_walk_host(host.cast_const(), va) })
     }
 
     /// Flush the stale stage-1 TLB after a host page-descriptor edit by running the
@@ -1306,22 +1334,50 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         payload: &[u8],
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(), TrapError> {
-        // Back a dynamic alias mapping: the backend mmaps the host file/anon backing
-        // and registers a fresh stage-2 alias slot, returning the (gpa, writable);
-        // the engine then builds the VA→gpa stage-1 path via the SHARED
-        // `map_aliased`. The dispatcher ALREADY allocated `ipa` from the global alias
-        // IPA arena (`crate::memory::alloc_alias_ipa`) and tracks it for the matching
-        // `munmap`; HVF MUST map at that exact IPA (re-allocating would double-consume
-        // the arena and desync the dispatcher's VA→IPA bookkeeping). KVM IGNORES `ipa`
-        // and derives the gpa from the VA inside its <1 TiB arena. No TLBI: the alias
-        // VA is brand-new (no stale TLB entry), so the guest's first access walks the
-        // just-written tables — the same fresh-page argument as `protect_range`.
-        let (gpa, writable) = self.vm.add_alias(va.raw(), ipa.raw(), len, payload, file)?;
-        if let Err(error) = self.pt_edit(|mgr| mgr.map_aliased(va.raw(), gpa, len, writable)) {
-            // `map_aliased` may allocate/edit several leaves before reporting
-            // exhaustion. Run the backend/page-table teardown even though the
-            // public install returns Err; if teardown itself cannot complete,
-            // continuing would expose a partially owned alias.
+        self.map_host_alias_with_sharing(va, ipa, len, payload, file, false)
+    }
+
+    fn map_host_alias_with_sharing(
+        &mut self,
+        va: GuestVa,
+        ipa: Gpa,
+        len: u64,
+        payload: &[u8],
+        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+        shared: bool,
+    ) -> Result<(), TrapError> {
+        // Back a dynamic alias mapping and return the authoritative GPA, then
+        // install the guest VA -> GPA stage-1 PTE. HVPatch uses `shared` to
+        // distinguish anonymous fork sharing from its VM-global shared-file
+        // namespace; backends without that distinction retain `add_alias`.
+        //
+        // Alias VAs are not necessarily fresh: deferred commitment replaces a
+        // PROT_NONE reservation, and MAP_FIXED can replace an older alias. The
+        // vCPU may therefore retain an invalid walk-cache entry or a stale leaf.
+        // Publish through the same edit + TLBI path as mprotect/munmap before the
+        // guest resumes; a successful stage-2 hv_vm_map alone is not sufficient.
+        let (gpa, writable) =
+            self.vm
+                .add_alias_with_sharing(va.raw(), ipa.raw(), len, payload, file, shared)?;
+        let mut descriptors = [0_u64; 4];
+        let page_table_result = self.pt_edit_and_flush(|mgr| {
+            let changed = mgr.map_aliased(va.raw(), gpa, len, writable)?;
+            descriptors = mgr.debug_walk(va.raw());
+            Ok(changed)
+        });
+        let walk_flags =
+            i32::from(self.is_forked_child) | (i32::from(page_table_result.is_err()) << 1);
+        carrick_observability::probes::pt_alias_walk(va.raw(), descriptors, walk_flags);
+        if page_table_result.is_ok() {
+            let live_descriptors = self.live_pt_debug_walk(va.raw());
+            let live_flags = walk_flags | (1 << 2) | (i32::from(live_descriptors.is_err()) << 1);
+            carrick_observability::probes::pt_alias_walk(
+                va.raw(),
+                live_descriptors.unwrap_or([0_u64; 4]),
+                live_flags,
+            );
+        }
+        if let Err(error) = page_table_result {
             let cleanup_len = usize::try_from(len).unwrap_or_else(|_| std::process::abort());
             if self.unmap_alias_range(va.raw(), cleanup_len).is_err() {
                 std::process::abort();
@@ -1521,6 +1577,20 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             sp: self.vcpu.get_reg(Reg::Sp).ok()?,
             lr: self.vcpu.get_reg(Reg::X(30)).ok()?,
         })
+    }
+
+    fn diagnostic_fault_page_tables(&self, far: u64) -> Option<(u64, [u64; 4])> {
+        const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
+        let ttbr = self.vcpu.get_sys_reg(SysReg::Ttbr0).ok()?;
+        let root = ttbr & TTBR_ROOT_MASK;
+        let bytes = self
+            .vm
+            .read_gpa(root, carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize)
+            .ok()?;
+        Some((
+            ttbr,
+            carrick_mem::page_table::walk_descriptors(&bytes, root, far),
+        ))
     }
 
     fn set_persistent_vm_lifecycle(&mut self, enabled: bool) {

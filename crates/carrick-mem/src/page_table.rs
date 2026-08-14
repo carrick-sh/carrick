@@ -415,6 +415,51 @@ impl PageTableManager {
         out
     }
 
+    /// Read-only descriptor walk over the LIVE host backing that the hardware
+    /// MMU walks, rather than this manager's shadow bytes. Descriptor loads are
+    /// atomic acquire operations, matching [`Self::sync_to_host`]'s atomic
+    /// release publication. This is diagnostic-only and lets `carrick trace`
+    /// distinguish a correctly edited shadow from publication to the wrong
+    /// backing.
+    ///
+    /// # Safety
+    /// `host` must point to a readable mapping of at least `self.bytes.len()`
+    /// bytes whose byte offset zero represents `self.base`.
+    pub unsafe fn debug_walk_host(&self, host: *const u8, va: u64) -> [u64; 4] {
+        use core::sync::atomic::{AtomicU64, Ordering};
+
+        let idx = indices(va);
+        let mut out = [0_u64; 4];
+        let mut table_off = 0_usize;
+        #[allow(clippy::needless_range_loop)]
+        for level in 0..4_usize {
+            let off = table_off + idx[level] * 8;
+            if off + 8 > self.bytes.len() {
+                break;
+            }
+            // SAFETY: upheld by this method's caller contract; every descriptor
+            // offset is 8-byte aligned and remains within the supplied mapping.
+            let desc = unsafe {
+                let slot = host.add(off).cast::<AtomicU64>();
+                (*slot).load(Ordering::Acquire)
+            };
+            out[level] = desc;
+            if level == 3 {
+                break;
+            }
+            let valid = desc & VALID != 0;
+            let is_table = desc & TYPE_BITS == TYPE_TABLE_OR_PAGE;
+            if !(valid && is_table) {
+                break;
+            }
+            match self.pa_to_off(desc & PA_MASK_TABLE) {
+                Ok(offset) => table_off = offset,
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
     /// Translate a guest VA to its stage-1 output address (the IPA carrick handed
     /// `hv_vm_map`), walking this manager's live descriptors exactly as the MMU
     /// would. Returns `None` if any level is invalid/out-of-range. Handles L3

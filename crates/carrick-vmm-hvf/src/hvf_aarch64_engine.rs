@@ -589,6 +589,19 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.add_alias(va, ipa, len, payload, file)
     }
 
+    fn add_alias_with_sharing(
+        &mut self,
+        va: u64,
+        ipa: u64,
+        len: u64,
+        payload: &[u8],
+        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+        shared: bool,
+    ) -> Result<(u64, bool), TrapError> {
+        self.state
+            .add_alias_with_sharing(va, ipa, len, payload, file, shared)
+    }
+
     // ── vCPU lifecycle ──
 
     fn add_vcpu(&mut self) -> Result<Self::Vcpu, TrapError> {

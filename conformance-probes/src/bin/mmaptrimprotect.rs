@@ -237,12 +237,90 @@ unsafe fn hinted_high_live_mprotect(hint: usize) -> i32 {
     }
 }
 
+/// Commit a high-hinted shared anonymous reservation, then verify that a
+/// post-fork child write is visible to the parent.  Linux keeps MAP_SHARED
+/// identity across a PROT_NONE -> writable `mprotect`; this specifically
+/// catches a lazy alias commit that accidentally reclassifies the reservation
+/// as private.
+///
+/// Return zero only when the parent observes the child's sentinel.  Negative
+/// values distinguish setup, fork/wait, and visibility failures so the
+/// differential oracle pinpoints the semantic break rather than a harness
+/// problem.
+unsafe fn hinted_high_shared_fork_visibility(hint: usize) -> i32 {
+    const PARENT_SENTINEL: u64 = 0x5eed_5eed_5eed_5eed;
+    const CHILD_SENTINEL: u64 = 0xc1a0_c1a0_c1a0_c1a0;
+
+    unsafe {
+        let base = libc::mmap(
+            hint as *mut c_void,
+            COMMIT,
+            libc::PROT_NONE,
+            libc::MAP_SHARED | libc::MAP_ANONYMOUS | MAP_NORESERVE | libc::MAP_FIXED,
+            -1,
+            0,
+        );
+        if base == libc::MAP_FAILED {
+            return -1;
+        }
+        if (base as usize) >> 32 != hint >> 32 {
+            libc::munmap(base, COMMIT);
+            return -2;
+        }
+        if libc::mprotect(base, COMMIT, libc::PROT_READ | libc::PROT_WRITE) != 0 {
+            let errno = *libc::__errno_location();
+            libc::munmap(base, COMMIT);
+            return 1000 + errno;
+        }
+        // These stage receipts make a backend crash attributable: the first
+        // proves lazy mprotect returned, the second proves the committed alias
+        // is writable before the fork-visibility assertion begins.
+        println!("hinted_high_shared_mprotect=ok");
+
+        let cell = base as *mut u64;
+        cell.write_volatile(PARENT_SENTINEL);
+        if cell.read_volatile() != PARENT_SENTINEL {
+            libc::munmap(base, COMMIT);
+            return -6;
+        }
+        println!("hinted_high_shared_parent_seeded=ok");
+        let pid = libc::fork();
+        if pid < 0 {
+            libc::munmap(base, COMMIT);
+            return -3;
+        }
+        if pid == 0 {
+            cell.write_volatile(CHILD_SENTINEL);
+            if cell.read_volatile() != CHILD_SENTINEL {
+                libc::_exit(1);
+            }
+            libc::_exit(0);
+        }
+
+        let mut status = 0;
+        if libc::waitpid(pid, &mut status, 0) != pid || !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+            libc::munmap(base, COMMIT);
+            return -4;
+        }
+        let observed = cell.read_volatile();
+        libc::munmap(base, COMMIT);
+        if observed == CHILD_SENTINEL { 0 } else { -5 }
+    }
+}
+
 fn main() {
     // The address V8 actually asked for, from the trace.
     report!(hinted_high_result = unsafe { hinted_high_commit_result(0x1382_8ed0_0000) });
     // A second high hint, to show the answer is about the REGION and not that
     // one magic number.
     report!(hinted_high2_result = unsafe { hinted_high_commit_result(0x2000_0000_0000) });
+
+    // The same lazy high-VA commit shape, but MAP_SHARED. A child mutation must
+    // remain visible to the parent after fork; this guards against fabricating
+    // a private backing during the deferred alias install.
+    report!(hinted_high_shared_fork_visibility = unsafe {
+        hinted_high_shared_fork_visibility(0x1382_8ed0_0000)
+    });
 
 
     // The tidied-up geometry, kept because it is the shape most people would

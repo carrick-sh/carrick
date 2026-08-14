@@ -740,22 +740,50 @@ fn rebuilt_vm_cell() -> &'static parking_lot::Mutex<Option<SharedVm>> {
     CELL.get_or_init(|| parking_lot::Mutex::new(None))
 }
 
-/// Process-global registry of dynamic MAP_SHARED-file alias mappings, so a vCPU
-/// can re-establish one in ITS shared VM after fork dropped it.
+/// How guest-visible sharing maps onto the host and HVPatch's one VM.
+///
+/// `ForkSharedAnonymous` deliberately shares only the host backing and explicit
+/// fork-child descriptor. It stays in the owning mm's IPA scope and does not
+/// acquire shared-file futex identity. `GlobalShared` is the existing shared
+/// aperture / MAP_SHARED-file behavior whose IPA is VM-global.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GuestMappingSharing {
+    Private,
+    ForkSharedAnonymous,
+    GlobalShared,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl GuestMappingSharing {
+    fn shares_across_fork(self) -> bool {
+        self != Self::Private
+    }
+
+    fn uses_global_ipa(self) -> bool {
+        self == Self::GlobalShared
+    }
+
+    fn has_shared_futex_identity(self) -> bool {
+        self == Self::GlobalShared
+    }
+}
+
+/// Process-global registry of dynamic alias mappings, so a vCPU can
+/// re-establish one in ITS shared VM after fork dropped it.
 ///
 /// Threads share ONE hv_vm, but `fork()` tears that VM down and rebuilds it from
 /// ONLY the forking thread's per-thread `mappings` list (see `HvfInner::fork`).
-/// A `guest_shared` alias mapped by a SIBLING thread is therefore lost from the
+/// A global-shared alias mapped by a SIBLING thread is therefore lost from the
 /// rebuilt VM, and any later access stage-2-faults (the go-build telemetry
 /// counter: a counter file `mmap(MAP_SHARED)`'d on one thread, read via LDAR on
 /// another after `go` forks `compile`). arm64 HVF has no stage-2 TLB shootdown,
 /// so we cannot push the map to siblings eagerly; instead each vCPU LAZILY
 /// re-maps on the fault, keyed off this registry.
 ///
-/// Only `guest_shared` (MAP_SHARED-file) aliases are registered: their host
-/// backing is a `MAP_SHARED` mmap that stays valid across fork and threads, so
-/// re-`hv_vm_map`'ing the SAME host address is coherent. Private/anon aliases
-/// are per-thread-snapshotted by the fork path and must NOT be re-shared here.
+/// Every alias is registered for thread fallback. The sharing classification
+/// decides whether its IPA is process-scoped or global and whether fork reuses
+/// the backing; those decisions must not be inferred from host `MAP_SHARED`.
 /// A high-VA alias's IPA window → host backing, registered PROCESS-GLOBALLY. Two
 /// roles: (1) the stage-2 lazy on-fault re-map (a vCPU whose forked VM lost an
 /// alias re-establishes it), and (2) the SYSCALL-PATH cross-thread fallback —
@@ -780,11 +808,7 @@ struct AliasBacking {
     /// Whether the guest may WRITE the alias (a PROT_READ MAP_SHARED file alias
     /// must EFAULT a syscall write, not SIGBUS the host through the raw pointer).
     guest_writable: bool,
-    /// True for a genuine guest `MAP_SHARED` FILE alias (cross-process coherent).
-    /// Gates `shared_futex_host_addr`: only a guest_shared alias is a valid
-    /// cross-process futex word — an anon arena alias resolved via the same index
-    /// must NOT be treated as one.
-    guest_shared: bool,
+    sharing: GuestMappingSharing,
     shared_key_base: u64,
     shared_key_offset: u64,
 }
@@ -948,10 +972,10 @@ fn lookup_shared_alias(ipa: u64) -> Option<AliasBacking> {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn alias_matches_process_scope(
     ipa: u64,
-    guest_shared: bool,
+    sharing: GuestMappingSharing,
     process_bank: Option<(u64, u64)>,
 ) -> bool {
-    if guest_shared {
+    if sharing.uses_global_ipa() {
         return true;
     }
     if let Some((bank_base, bank_size)) = process_bank {
@@ -983,30 +1007,50 @@ fn missing_process_aliases(
         .copied()
         .filter(|alias| {
             !local_ipas.contains(&alias.ipa)
-                && alias_matches_process_scope(alias.ipa, alias.guest_shared, process_bank)
+                && alias_matches_process_scope(alias.ipa, alias.sharing, process_bank)
         })
         .collect()
+}
+
+/// Whether a per-vCPU mapping row belongs in a new process's address-space
+/// inventory. Boot mappings are structural. Dynamic aliases are lifetime
+/// owners as well as lookup rows, so a retired row may remain in `mappings`
+/// after munmap; only an exact live-registry publication makes it semantic.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn mapping_is_current_for_process_fork(
+    mapping: &HvfMappedRegion,
+    aliases: &[AliasBacking],
+    process_bank: Option<(u64, u64)>,
+) -> bool {
+    !mapping.is_dynamic_alias
+        || aliases.iter().any(|alias| {
+            alias_matches_process_scope(alias.ipa, alias.sharing, process_bank)
+                && alias.start == mapping.start
+                && alias.ipa == mapping.ipa
+                && alias.host_addr == mapping.host_addr as usize
+                && alias.size == mapping.size
+        })
 }
 
 /// Select the stage-2 IPA for a newly-created dynamic alias.
 ///
 /// The dispatcher reserves a globally unique IPA because mature VMM backends
-/// use that value directly. An in-process hvpatch child instead needs private
-/// aliases inside its ASID-owned process bank. Keep MAP_SHARED mappings at the
-/// global IPA so fork descendants can continue to reference the same stage-2
-/// backing after either process bank is retired.
+/// use that value directly. An in-process hvpatch mm instead needs private and
+/// fork-shared-anonymous aliases inside its ASID-owned process bank. Only the
+/// shared-file/global class retains the requested VM-global IPA; an inherited
+/// shared-anonymous child descriptor reuses its parent's bank IPA and frame.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn reserve_process_alias_ipa(
     requested_ipa: u64,
     size: u64,
-    guest_shared: bool,
+    sharing: GuestMappingSharing,
     process_bank: Option<(u64, u64)>,
     process_alias_next: Option<&std::sync::atomic::AtomicU64>,
 ) -> Result<u64, TrapError> {
     let Some((bank_base, bank_size)) = process_bank else {
         return Ok(requested_ipa);
     };
-    if guest_shared {
+    if sharing.uses_global_ipa() {
         return Ok(requested_ipa);
     }
     let cursor = process_alias_next.ok_or_else(|| {
@@ -1055,7 +1099,7 @@ fn lookup_shared_alias_by_va(
         .iter()
         .rev()
         .find(|e| {
-            alias_matches_process_scope(e.ipa, e.guest_shared, process_bank)
+            alias_matches_process_scope(e.ipa, e.sharing, process_bank)
                 && va >= e.start
                 && end <= e.start.saturating_add(e.size as u64)
                 // Reject an entry whose backing is not mapped in THIS process
@@ -1079,7 +1123,7 @@ fn lookup_shared_alias_by_va(
 fn unregister_alias(va: u64, len: usize, process_bank: Option<(u64, u64)>) {
     let end = va.saturating_add(len as u64);
     alias_registry().lock().retain(|e| {
-        !alias_matches_process_scope(e.ipa, e.guest_shared, process_bank)
+        !alias_matches_process_scope(e.ipa, e.sharing, process_bank)
             || e.start.saturating_add(e.size as u64) <= va
             || e.start >= end
     });
@@ -1132,7 +1176,8 @@ struct SiblingForkMapping {
     host_addr: usize,
     size: usize,
     perms: u64,
-    guest_shared: bool,
+    is_dynamic_alias: bool,
+    sharing: GuestMappingSharing,
     guest_writable: bool,
     shared_key_base: u64,
     shared_key_offset: u64,
@@ -1169,7 +1214,8 @@ fn publish_sibling_fork_mappings(regions: &[HvfMappedRegion]) {
             host_addr: m.host_addr as usize,
             size: m.size,
             perms: u64::from(m.perms),
-            guest_shared: m.guest_shared,
+            is_dynamic_alias: m.is_dynamic_alias,
+            sharing: m.sharing,
             guest_writable: m.guest_writable,
             shared_key_base: m.shared_key_base,
             shared_key_offset: m.shared_key_offset,
@@ -2731,6 +2777,11 @@ pub fn dump_kick_stats() {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum InventoryBackingIdentity {
     Private(u64),
+    /// One unique anonymous object whose host mapping is inherited through an
+    /// explicit fork-child descriptor. Unlike `SharedFile`, this identity is
+    /// never looked up globally or deduplicated across independently-created
+    /// mappings.
+    SharedAnon(u64),
     SharedFile {
         device: u64,
         inode: u64,
@@ -2992,15 +3043,15 @@ pub(crate) struct HvfMappedRegion {
     memory: Option<applevisor::memory::Memory>,
     #[allow(dead_code)]
     host_mapping: Option<crate::host_mapping::OwnedHostMapping>,
-    /// True for a genuine guest `MAP_SHARED` file mapping (`map_shared_file`).
-    /// Guest memory is host-`MAP_SHARED` for HVF coherence, so fork(2) does
-    /// NOT COW-isolate it; the `fork` path takes an explicit private snapshot
-    /// of every region EXCEPT these — a guest `MAP_SHARED` file mapping must
-    /// stay shared across guest fork (POSIX), so parent and child keep mapping
-    /// the SAME host buffer. (LTP's test framework relies on this: the test
-    /// runs in a forked child that writes pass/fail counts to a `MAP_SHARED`
-    /// results file the parent then reads.)
-    guest_shared: bool,
+    /// True only for a post-boot alias published through `add_alias`. Retired
+    /// aliases deliberately remain in `mappings` to keep their host/stage-2
+    /// owners alive, but the live alias registry decides whether they enter a
+    /// fork child's address-space inventory.
+    is_dynamic_alias: bool,
+    /// Separates host/fork visibility from VM-global IPA and futex identity.
+    /// Both shared variants keep one host backing across guest fork, while only
+    /// `GlobalShared` participates in the historical global alias namespace.
+    sharing: GuestMappingSharing,
     /// The guest's INTENDED writability (Linux PROT_WRITE), tracked separately
     /// from `perms` — alias regions force `perms` to RWX for the HVF stage-2
     /// translation quirk, so it cannot be used to detect a read-only mapping.
@@ -3015,7 +3066,7 @@ pub(crate) struct HvfMappedRegion {
 
 /// A copyable projection of the scalar fields of an [`HvfMappedRegion`] that the
 /// syscall-path accessors actually read (`start`/`end`/`ipa`/`host_addr`/`size`/
-/// `guest_writable`/`guest_shared`). [`HvfInner::mapping_for_range`] returns this
+/// `guest_writable`/sharing). [`HvfInner::mapping_for_range`] returns this
 /// by value instead of `&HvfMappedRegion` so a lookup that resolves through the
 /// PROCESS-SHARED `alias_registry` fallback (a high-VA alias another thread
 /// mapped, absent from THIS thread's per-thread `mappings`) can synthesize a view
@@ -3031,7 +3082,7 @@ struct MappingView {
     ipa: u64,
     host_addr: *mut u8,
     guest_writable: bool,
-    guest_shared: bool,
+    sharing: GuestMappingSharing,
     shared_key_base: u64,
     shared_key_offset: u64,
 }
@@ -3084,7 +3135,8 @@ struct ThreadMappingDesc {
     host_addr: *mut u8,
     size: usize,
     perms: applevisor::memory::MemPerms,
-    guest_shared: bool,
+    is_dynamic_alias: bool,
+    sharing: GuestMappingSharing,
     guest_writable: bool,
     shared_key_base: u64,
     shared_key_offset: u64,
@@ -3103,7 +3155,8 @@ impl ThreadMappingDesc {
             host_addr: region.host_addr,
             size: region.size,
             perms: region.perms,
-            guest_shared: region.guest_shared,
+            is_dynamic_alias: region.is_dynamic_alias,
+            sharing: region.sharing,
             guest_writable: region.guest_writable,
             shared_key_base: region.shared_key_base,
             shared_key_offset: region.shared_key_offset,
@@ -3129,7 +3182,8 @@ impl ThreadMappingDesc {
             host_addr: alias.host_addr as *mut u8,
             size: alias.size,
             perms,
-            guest_shared: alias.guest_shared,
+            is_dynamic_alias: true,
+            sharing: alias.sharing,
             guest_writable: alias.guest_writable,
             shared_key_base: alias.shared_key_base,
             shared_key_offset: alias.shared_key_offset,
@@ -3146,7 +3200,8 @@ impl ThreadMappingDesc {
             perms: self.perms,
             memory: None,
             host_mapping: None,
-            guest_shared: self.guest_shared,
+            is_dynamic_alias: self.is_dynamic_alias,
+            sharing: self.sharing,
             guest_writable: self.guest_writable,
             shared_key_base: self.shared_key_base,
             shared_key_offset: self.shared_key_offset,
@@ -3162,7 +3217,8 @@ struct ForkMappingDesc {
     host: ForkMappingHost,
     size: usize,
     perms: applevisor::memory::MemPerms,
-    guest_shared: bool,
+    is_dynamic_alias: bool,
+    sharing: GuestMappingSharing,
     guest_writable: bool,
     shared_key_base: u64,
     shared_key_offset: u64,
@@ -3224,7 +3280,8 @@ struct ProcessMappingDesc {
     host: ForkMappingHost,
     size: usize,
     perms: applevisor::memory::MemPerms,
-    guest_shared: bool,
+    is_dynamic_alias: bool,
+    sharing: GuestMappingSharing,
     guest_writable: bool,
     shared_key_base: u64,
     shared_key_offset: u64,
@@ -3232,9 +3289,31 @@ struct ProcessMappingDesc {
     inherited_backing: Option<InventoryBackingIdentity>,
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn inherited_fork_inventory_extent(
+    mapping: &ThreadMappingDesc,
+    parent_inventory: &std::collections::BTreeMap<(u64, u64), InventoryExtent>,
+) -> Result<Option<InventoryExtent>, TrapError> {
+    if !mapping.sharing.shares_across_fork() {
+        return Ok(None);
+    }
+    parent_inventory
+        .get(&(mapping.ipa, mapping.size as u64))
+        .copied()
+        .map(Some)
+        .ok_or_else(|| {
+            TrapError::Hypervisor(format!(
+                "HVPatch shared child extent IPA 0x{:x} size {} lacks parent inventory",
+                mapping.ipa, mapping.size
+            ))
+        })
+}
+
 /// A fork child address space waiting for vCPU materialization on its owning
 /// host thread. Private mappings already carry COW host clones and distinct
-/// bank IPAs; guest-shared mappings retain their existing VM-global IPA.
+/// bank IPAs; guest-shared mappings retain their existing IPA and frame. For a
+/// shared-anonymous alias that IPA remains mm-bank-scoped; only shared-file
+/// mappings use the VM-global alias namespace.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub struct ProcessSpec {
     vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
@@ -3284,6 +3363,16 @@ impl HvfVmState {
             std::process::abort();
         }
         InventoryBackingIdentity::Private(serial)
+    }
+
+    fn shared_anon_backing_identity() -> InventoryBackingIdentity {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if serial == 0 {
+            eprintln!("carrick: FATAL: HVPatch shared-anonymous backing identity exhausted");
+            std::process::abort();
+        }
+        InventoryBackingIdentity::SharedAnon(serial)
     }
 
     fn region_permissions(region: &HvfMappedRegion) -> carrick_hal::MemPerms {
@@ -4094,7 +4183,11 @@ impl HvfVmState {
         carrick_observability::probes::with_fork_footprint_class_probe(|| {
             let mut classes = [ForkFootprintClassSample::default(); 10];
             for m in &self.mappings {
-                let class_id = fork_footprint_class_id(m.start, m.guest_shared, m.guest_writable);
+                let class_id = fork_footprint_class_id(
+                    m.start,
+                    m.sharing.shares_across_fork(),
+                    m.guest_writable,
+                );
                 let Ok(index) = usize::try_from(class_id) else {
                     continue;
                 };
@@ -4273,7 +4366,7 @@ impl HvfVmState {
     }
 
     /// The HVF-only lazy high-VA alias re-map: a forked child rebuilt its VM
-    /// from only the forking thread's mappings, dropping a `guest_shared` alias a
+    /// from only the forking thread's mappings, dropping a global-shared alias a
     /// sibling thread mapped; re-`hv_vm_map` the registered host backing into
     /// THIS VM so the faulting instruction re-executes cleanly. Returns true iff
     /// it remapped. (The engine's `next_syscall` already runs the bounded in-loop
@@ -4321,10 +4414,30 @@ impl HvfVmState {
         payload: &[u8],
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(u64, bool), TrapError> {
+        self.add_alias_with_sharing(va, ipa, len, payload, file, false)
+    }
+
+    /// Back a high-VA alias with the anonymous sharing mode carried by the
+    /// original VMA. A deferred `mprotect` commit must preserve MAP_SHARED
+    /// across host fork rather than silently substituting private COW backing.
+    pub(crate) fn add_alias_with_sharing(
+        &mut self,
+        va: u64,
+        ipa: u64,
+        len: u64,
+        payload: &[u8],
+        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+        shared: bool,
+    ) -> Result<(u64, bool), TrapError> {
         let file = file.map(|(fd, offset, prot)| {
             // SAFETY: dispatcher-to-backend alias setup transfers this dup.
             (unsafe { OwnedFd::from_raw_fd(fd) }, offset, prot)
         });
+        let sharing = match (file.as_ref(), shared) {
+            (Some(_), _) => GuestMappingSharing::GlobalShared,
+            (None, true) => GuestMappingSharing::ForkSharedAnonymous,
+            (None, false) => GuestMappingSharing::Private,
+        };
         let inventory_backing = match file.as_ref() {
             Some((fd, offset, _)) => {
                 let mut stat: libc::stat = unsafe { std::mem::zeroed() };
@@ -4346,12 +4459,15 @@ impl HvfVmState {
                     length: len,
                 }
             }
+            None if sharing == GuestMappingSharing::ForkSharedAnonymous => {
+                Self::shared_anon_backing_identity()
+            }
             None => Self::private_backing_identity(),
         };
         // Mature VMM/root uses the IPA the dispatcher allocated from the global
-        // alias arena. An in-process hvpatch child relocates PRIVATE aliases into
-        // its own process bank; the returned GPA is authoritative for stage-1,
-        // while dispatcher VMA metadata remains keyed by VA and needs no IPA.
+        // alias arena. An in-process hvpatch mm relocates non-global aliases into
+        // its process bank; the returned GPA is authoritative for stage-1, while
+        // dispatcher VMA metadata remains keyed by VA and needs no IPA.
         // hv_vm_map requires a 16 KiB-granular size; round the HOST mapping up
         // to the HVF granule. The stage-1 `map_aliased` (the engine, on the exact
         // `len`) below still maps only the guest's page-aligned request, so a
@@ -4395,7 +4511,11 @@ impl HvfVmState {
             })?,
             None => crate::host_mapping::OwnedHostMapping::map_shared_anon(
                 size,
-                crate::host_mapping::HostMappingKind::PrivateAnon,
+                if sharing.shares_across_fork() {
+                    crate::host_mapping::HostMappingKind::SharedAnon
+                } else {
+                    crate::host_mapping::HostMappingKind::PrivateAnon
+                },
             )
             .map_err(|e| TrapError::Hypervisor(format!("alias mmap (size={size}) failed: {e}")))?,
         };
@@ -4414,11 +4534,10 @@ impl HvfVmState {
             write: true,
             execute: true,
         });
-        let guest_shared = host_mapping.guest_shared();
         let ipa = reserve_process_alias_ipa(
             ipa,
             size as u64,
-            guest_shared,
+            sharing,
             self.process_bank,
             self.process_alias_next.as_deref(),
         )?;
@@ -4445,7 +4564,7 @@ impl HvfVmState {
             size,
             perms: u64::from(perms),
             guest_writable: alias_guest_writable,
-            guest_shared,
+            sharing,
             shared_key_base,
             shared_key_offset,
         });
@@ -4458,7 +4577,8 @@ impl HvfVmState {
             perms,
             memory: None,
             host_mapping: Some(host_mapping),
-            guest_shared,
+            is_dynamic_alias: true,
+            sharing,
             guest_writable: alias_guest_writable,
             shared_key_base,
             shared_key_offset,
@@ -5405,7 +5525,7 @@ impl HvfVmState {
                     size: mapping.size,
                     perms: u64::from(mapping.perms),
                     guest_writable: mapping.guest_writable,
-                    guest_shared: mapping.guest_shared,
+                    sharing: mapping.sharing,
                     shared_key_base: mapping.shared_key_base,
                     shared_key_offset: mapping.shared_key_offset,
                 });
@@ -5567,7 +5687,7 @@ impl HvfVmState {
         if self.vfork_share {
             for m in &self.mappings {
                 let is_pt = m.start == crate::memory::LINUX_PAGE_TABLES_BASE;
-                if m.guest_writable && !m.guest_shared && !is_pt {
+                if m.guest_writable && !m.sharing.shares_across_fork() && !is_pt {
                     set_region_fork_inheritance(m.host_addr, m.size, VM_INHERIT_SHARE);
                 }
             }
@@ -5581,9 +5701,13 @@ impl HvfVmState {
         );
 
         let phase_start = std::time::Instant::now();
+        let aliases = alias_registry().lock().clone();
         let mapping_descs: Vec<ForkMappingDesc> = self
             .mappings
             .iter()
+            .filter(|mapping| {
+                mapping_is_current_for_process_fork(mapping, &aliases, self.process_bank)
+            })
             .map(|m| ForkMappingDesc {
                 start: m.start,
                 ipa: m.ipa,
@@ -5591,7 +5715,8 @@ impl HvfVmState {
                 host: ForkMappingHost::Borrowed(m.host_addr),
                 size: m.size,
                 perms: m.perms,
-                guest_shared: m.guest_shared,
+                is_dynamic_alias: m.is_dynamic_alias,
+                sharing: m.sharing,
                 guest_writable: m.guest_writable,
                 shared_key_base: m.shared_key_base,
                 shared_key_offset: m.shared_key_offset,
@@ -5622,22 +5747,23 @@ impl HvfVmState {
             // COW/shared PT desyncs the guest VA->PA walk under HVF (breaks
             // cross-process futex/tst_checkpoint + clone05). Tiny region, ~free.
             let is_page_table_region = desc.start == crate::memory::LINUX_PAGE_TABLES_BASE;
-            let child_host = if (share_vm && !is_page_table_region) || desc.guest_shared {
-                ForkMappingHost::Borrowed(desc.host.ptr()) // shared mapping: child maps the SAME buffer
-            } else if is_page_table_region {
-                ForkMappingHost::Owned(clone_region_for_child(
-                    desc.host.ptr(),
-                    desc.size,
-                    desc.start,
-                )?)
-            } else {
-                // Bulk private guest RAM (data/bss/heap/stack/mmap arena) is
-                // host-MAP_PRIVATE, so libc::fork already COW-isolates it: the
-                // child re-maps its OWN COW view of the same VA, skipping the
-                // eager mincore+copy snapshot (the dominant per-fork cost — the
-                // epoll-ltp ~50x win).
-                ForkMappingHost::Borrowed(desc.host.ptr())
-            };
+            let child_host =
+                if (share_vm && !is_page_table_region) || desc.sharing.shares_across_fork() {
+                    ForkMappingHost::Borrowed(desc.host.ptr()) // shared mapping: child maps the SAME buffer
+                } else if is_page_table_region {
+                    ForkMappingHost::Owned(clone_region_for_child(
+                        desc.host.ptr(),
+                        desc.size,
+                        desc.start,
+                    )?)
+                } else {
+                    // Bulk private guest RAM (data/bss/heap/stack/mmap arena) is
+                    // host-MAP_PRIVATE, so libc::fork already COW-isolates it: the
+                    // child re-maps its OWN COW view of the same VA, skipping the
+                    // eager mincore+copy snapshot (the dominant per-fork cost — the
+                    // epoll-ltp ~50x win).
+                    ForkMappingHost::Borrowed(desc.host.ptr())
+                };
             child_descs.push(ForkMappingDesc {
                 start: desc.start,
                 ipa: desc.ipa,
@@ -5645,7 +5771,8 @@ impl HvfVmState {
                 host: child_host,
                 size: desc.size,
                 perms: desc.perms,
-                guest_shared: desc.guest_shared,
+                is_dynamic_alias: desc.is_dynamic_alias,
+                sharing: desc.sharing,
                 guest_writable: desc.guest_writable,
                 shared_key_base: desc.shared_key_base,
                 shared_key_offset: desc.shared_key_offset,
@@ -5869,7 +5996,7 @@ impl HvfVmState {
             // corruption) instead of its own copy. For the parent it's idempotent
             // (same host_addr). Low-VA boot regions are not aliases (every thread
             // has them) and are never in the index.
-            if crate::memory::is_high_va(desc.start) {
+            if desc.is_dynamic_alias {
                 register_shared_alias(AliasBacking {
                     start: desc.start,
                     ipa: desc.ipa,
@@ -5877,7 +6004,7 @@ impl HvfVmState {
                     size: desc.size,
                     perms: perms_raw,
                     guest_writable: desc.guest_writable,
-                    guest_shared: desc.guest_shared,
+                    sharing: desc.sharing,
                     shared_key_base: desc.shared_key_base,
                     shared_key_offset: desc.shared_key_offset,
                 });
@@ -5896,7 +6023,8 @@ impl HvfVmState {
                 // entries in one shot.
                 memory: None,
                 host_mapping: desc.host.into_owned(),
-                guest_shared: desc.guest_shared,
+                is_dynamic_alias: desc.is_dynamic_alias,
+                sharing: desc.sharing,
                 shared_key_base: desc.shared_key_base,
                 shared_key_offset: desc.shared_key_offset,
             });
@@ -5912,7 +6040,7 @@ impl HvfVmState {
             let phase_start = std::time::Instant::now();
             for m in &self.mappings {
                 let is_pt = m.start == crate::memory::LINUX_PAGE_TABLES_BASE;
-                if m.guest_writable && !m.guest_shared && !is_pt {
+                if m.guest_writable && !m.sharing.shares_across_fork() && !is_pt {
                     set_region_fork_inheritance(m.host_addr, m.size, VM_INHERIT_COPY);
                 }
             }
@@ -5945,9 +6073,21 @@ impl HvfVmState {
             let mut mapped_ipas: std::collections::HashSet<u64> =
                 self.mappings.iter().map(|m| m.ipa).collect();
             let siblings = sibling_fork_mappings().lock().clone();
+            let aliases = alias_registry().lock().clone();
             let sibling_count = siblings.len() as u64;
             let sibling_map_start = std::time::Instant::now();
             for sm in siblings {
+                if sm.is_dynamic_alias
+                    && !aliases.iter().any(|alias| {
+                        alias_matches_process_scope(alias.ipa, alias.sharing, self.process_bank)
+                            && alias.start == sm.start
+                            && alias.ipa == sm.ipa
+                            && alias.host_addr == sm.host_addr
+                            && alias.size == sm.size
+                    })
+                {
+                    continue;
+                }
                 if !mapped_ipas.insert(sm.ipa) {
                     continue;
                 }
@@ -5978,7 +6118,8 @@ impl HvfVmState {
                     guest_writable: sm.guest_writable,
                     memory: None,
                     host_mapping: None,
-                    guest_shared: sm.guest_shared,
+                    is_dynamic_alias: sm.is_dynamic_alias,
+                    sharing: sm.sharing,
                     shared_key_base: sm.shared_key_base,
                     shared_key_offset: sm.shared_key_offset,
                 });
@@ -6162,15 +6303,18 @@ impl HvfVmState {
             TrapError::Hypervisor("hvpatch child process bank overflow".to_owned())
         })?;
         let mut cursor = bank_base;
+        let aliases = alias_registry().lock().clone();
         let mut source_mappings: Vec<ThreadMappingDesc> = self
             .mappings
             .iter()
+            .filter(|mapping| {
+                mapping_is_current_for_process_fork(mapping, &aliases, self.process_bank)
+            })
             .map(ThreadMappingDesc::from_region)
             .collect();
         let local_regions = source_mappings.len() as u64;
         let local_ipas: std::collections::HashSet<u64> =
             source_mappings.iter().map(|mapping| mapping.ipa).collect();
-        let aliases = alias_registry().lock().clone();
         let missing = missing_process_aliases(&local_ipas, &aliases, self.process_bank);
         let candidate_regions = missing.len() as u64;
         let mut added_regions = 0_u64;
@@ -6179,18 +6323,17 @@ impl HvfVmState {
         let mut shared_added_regions = 0_u64;
         let mut largest_added_bytes = 0_u64;
         for alias in missing {
-            // The registry is process-global. Scope by bank above, then require
-            // this address space's current page table to select this exact IPA;
-            // this excludes stale/overlaid entries and unrelated MAP_SHARED
-            // aliases from another process.
-            if page_tables.translate(alias.start) == Some(alias.ipa)
-                && alias_backing_is_live(alias.host_addr)
+            // The registry is the authoritative live-alias inventory. Scope by
+            // mm bank above and require its retained host owner to be live, but
+            // do not require a valid stage-1 leaf: a live PROT_NONE alias is
+            // intentionally invalid in stage-1 and still must survive fork.
+            if alias_backing_is_live(alias.host_addr)
                 && let Some(mapping) = ThreadMappingDesc::from_alias(alias)
             {
                 added_regions = added_regions.saturating_add(1);
                 added_bytes = added_bytes.saturating_add(mapping.size as u64);
                 largest_added_bytes = largest_added_bytes.max(mapping.size as u64);
-                if mapping.guest_shared {
+                if mapping.sharing.shares_across_fork() {
                     shared_added_regions = shared_added_regions.saturating_add(1);
                 } else {
                     private_added_regions = private_added_regions.saturating_add(1);
@@ -6216,15 +6359,9 @@ impl HvfVmState {
         });
         for index in order {
             let mapping = &source_mappings[index];
-            if mapping.guest_shared {
-                let parent_extent = parent_inventory
-                    .get(&(mapping.ipa, mapping.size as u64))
-                    .ok_or_else(|| {
-                        TrapError::Hypervisor(format!(
-                            "HVPatch shared child extent IPA 0x{:x} size {} lacks parent inventory",
-                            mapping.ipa, mapping.size
-                        ))
-                    })?;
+            if let Some(parent_extent) =
+                inherited_fork_inventory_extent(mapping, &parent_inventory)?
+            {
                 mappings.push(ProcessMappingDesc {
                     start: mapping.start,
                     ipa: mapping.ipa,
@@ -6232,7 +6369,8 @@ impl HvfVmState {
                     host: ForkMappingHost::Borrowed(mapping.host_addr),
                     size: mapping.size,
                     perms: mapping.perms,
-                    guest_shared: true,
+                    is_dynamic_alias: mapping.is_dynamic_alias,
+                    sharing: mapping.sharing,
                     guest_writable: mapping.guest_writable,
                     shared_key_base: mapping.shared_key_base,
                     shared_key_offset: mapping.shared_key_offset,
@@ -6329,7 +6467,8 @@ impl HvfVmState {
                 host: ForkMappingHost::Owned(host),
                 size: mapping.size,
                 perms: mapping.perms,
-                guest_shared: false,
+                is_dynamic_alias: mapping.is_dynamic_alias,
+                sharing: GuestMappingSharing::Private,
                 guest_writable: mapping.guest_writable,
                 shared_key_base: mapping.shared_key_base,
                 shared_key_offset: mapping.shared_key_offset,
@@ -6466,7 +6605,7 @@ impl HvfVmState {
         let mut inventory_mappings = Vec::with_capacity(spec.mappings.len());
         let mut physical_mutated = false;
         for mapping in spec.mappings {
-            if !mapping.guest_shared {
+            if !mapping.sharing.shares_across_fork() {
                 let rc = unsafe {
                     inventory_hv_vm_map(
                         mapping.host.ptr().cast(),
@@ -6515,7 +6654,8 @@ impl HvfVmState {
                 guest_writable: mapping.guest_writable,
                 memory: None,
                 host_mapping: mapping.host.into_owned(),
-                guest_shared: mapping.guest_shared,
+                is_dynamic_alias: mapping.is_dynamic_alias,
+                sharing: mapping.sharing,
                 shared_key_base: mapping.shared_key_base,
                 shared_key_offset: mapping.shared_key_offset,
             });
@@ -7378,7 +7518,7 @@ impl HvfInner {
         static FIRST_RUN: std::sync::Once = std::sync::Once::new();
         FIRST_RUN.call_once(|| crate::probes::lifecycle(crate::probes::phase::FIRST_VCPU_RUN));
 
-        // Bounds lazy re-mapping of dropped guest_shared aliases so a
+        // Bounds lazy re-mapping of dropped aliases so a
         // genuinely-unmappable backing still terminates instead of spinning.
         let mut alias_remap_limiter = AliasRemapLimiter::default();
         loop {
@@ -7415,7 +7555,7 @@ impl HvfInner {
             }
             // A direct EL0 abort on a high-VA alias address that THIS vCPU's
             // shared VM is missing: a `fork()` rebuilt the shared VM from only the
-            // forking thread's mappings, dropping a `guest_shared` alias mapped by
+            // forking thread's mappings, dropping an alias mapped by
             // a sibling thread (the go-build telemetry counter). arm64 HVF has no
             // stage-2 TLB shootdown, so re-running alone never fixes it — but the
             // host backing is a MAP_SHARED mmap still live at the registered host
@@ -7697,7 +7837,7 @@ impl HvfMappedRegion {
             ipa: self.ipa,
             host_addr: self.host_addr,
             guest_writable: self.guest_writable,
-            guest_shared: self.guest_shared,
+            sharing: self.sharing,
             shared_key_base: self.shared_key_base,
             shared_key_offset: self.shared_key_offset,
         }
@@ -7717,10 +7857,7 @@ impl MappingView {
             ipa: b.ipa,
             host_addr: b.host_addr as *mut u8,
             guest_writable: b.guest_writable,
-            // Preserve guest_shared so a MAP_SHARED-file alias resolved via this
-            // fallback is still recognized as a cross-process futex word by
-            // shared_futex_host_addr (an anon arena alias must NOT be).
-            guest_shared: b.guest_shared,
+            sharing: b.sharing,
             shared_key_base: b.shared_key_base,
             shared_key_offset: b.shared_key_offset,
         }
@@ -7730,7 +7867,7 @@ impl MappingView {
         &self,
         address: u64,
     ) -> Option<carrick_guest_mem::SharedFutexLocation> {
-        if !self.guest_shared {
+        if !self.sharing.has_shared_futex_identity() {
             return None;
         }
         let offset = (address - self.start) as usize;
@@ -7921,8 +8058,8 @@ struct ForkFootprintClassSample {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn fork_footprint_class_id(start: u64, guest_shared: bool, guest_writable: bool) -> i32 {
-    if guest_shared {
+fn fork_footprint_class_id(start: u64, fork_shared: bool, guest_writable: bool) -> i32 {
+    if fork_shared {
         if start == crate::memory::LINUX_SHARED_FILE_BASE {
             return FORK_FOOTPRINT_CLASS_SHARED_APERTURE;
         }
@@ -7953,7 +8090,7 @@ fn fork_footprint_class_id(start: u64, guest_shared: bool, guest_writable: bool)
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn fork_footprint_flags(m: &HvfMappedRegion) -> u64 {
     let mut flags = FORK_FOOTPRINT_FLAG_CHILD_OBSERVES;
-    if m.guest_shared {
+    if m.sharing.shares_across_fork() {
         flags |= FORK_FOOTPRINT_FLAG_PARENT_SHARED;
     } else if m.start == crate::memory::LINUX_PAGE_TABLES_BASE {
         flags |= FORK_FOOTPRINT_FLAG_CHILD_SNAPSHOT;
@@ -8184,7 +8321,11 @@ fn map_region_raw(
                 guest_start: mapping.guest_start,
                 mapped_size: mapping.mapped_size,
             })?;
-    let guest_shared = host_mapping.guest_shared();
+    let sharing = if mapping.shared {
+        GuestMappingSharing::GlobalShared
+    } else {
+        GuestMappingSharing::Private
+    };
     Ok(HvfMappedRegion {
         start: mapping.guest_start,
         ipa: mapping.ipa_start,
@@ -8194,8 +8335,9 @@ fn map_region_raw(
         perms,
         memory: None,
         host_mapping: Some(host_mapping),
+        is_dynamic_alias: false,
         // Private guest RAM (data/bss/heap/stack/MAP_PRIVATE): fork snapshots it.
-        guest_shared,
+        sharing,
         // Boot regions carry their true guest write-intent (image=RX, page
         // tables=RO -> not writable; heap/stack/data=RW -> writable).
         guest_writable: mapping.perms.write,
@@ -9020,6 +9162,57 @@ mod frame_inventory_backend_tests {
             std::collections::BTreeSet::from([(0x4000, 0x4000), (0x8000, 0x4000)])
         );
     }
+
+    #[test]
+    fn fork_inherits_shared_anon_frame_but_private_mapping_requests_a_copy() {
+        let frame = carrick_hal::FrameId::from_kernel_allocation(id(11));
+        let backing = InventoryBackingIdentity::SharedAnon(17);
+        let extent = InventoryExtent {
+            frame,
+            mapping: carrick_hal::MappingId::from_kernel_allocation(id(12)),
+            backing,
+        };
+        let ipa = carrick_mem::memory::LINUX_PROCESS_BANK_BASE + 0x20_0000;
+        let size = 0x4000;
+        let parent_inventory = std::collections::BTreeMap::from([((ipa, size), extent)]);
+        let mapping = |sharing| ThreadMappingDesc {
+            start: 0x1382_8ed0_0000,
+            ipa,
+            end: 0x1382_8ed0_0000 + size,
+            host_addr: 0x1000usize as *mut u8,
+            size: size as usize,
+            perms: applevisor::memory::MemPerms::ReadWrite,
+            is_dynamic_alias: true,
+            sharing,
+            guest_writable: true,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+        };
+
+        let inherited = inherited_fork_inventory_extent(
+            &mapping(GuestMappingSharing::ForkSharedAnonymous),
+            &parent_inventory,
+        )
+        .expect("shared-anonymous fork inventory")
+        .expect("shared-anonymous mapping reuses the parent extent");
+        assert_eq!(inherited.frame, frame);
+        assert_eq!(inherited.backing, backing);
+
+        assert!(
+            inherited_fork_inventory_extent(
+                &mapping(GuestMappingSharing::Private),
+                &parent_inventory,
+            )
+            .expect("private fork inventory decision")
+            .is_none(),
+            "a private mapping must receive a distinct child snapshot/frame"
+        );
+        assert_ne!(
+            HvfVmState::shared_anon_backing_identity(),
+            HvfVmState::shared_anon_backing_identity(),
+            "independent shared-anonymous mappings must never deduplicate globally"
+        );
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -9036,7 +9229,7 @@ mod alias_remap_limiter_tests {
             size: HVF_PAGE_SIZE as usize,
             perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
             guest_writable: true,
-            guest_shared: false,
+            sharing: GuestMappingSharing::Private,
             shared_key_base: 0,
             shared_key_offset: 0,
         };
@@ -9072,7 +9265,7 @@ mod alias_remap_limiter_tests {
             size: HVF_PAGE_SIZE as usize,
             perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
             guest_writable: true,
-            guest_shared: false,
+            sharing: GuestMappingSharing::Private,
             shared_key_base: 0,
             shared_key_offset: 0,
         };
@@ -9245,7 +9438,8 @@ mod thread_sibling_tests {
             host_addr: 0x7000usize as *mut u8,
             size: 0x4000,
             perms: applevisor::memory::MemPerms::ReadWrite,
-            guest_shared: true,
+            is_dynamic_alias: true,
+            sharing: GuestMappingSharing::GlobalShared,
             guest_writable: true,
             shared_key_base: 0,
             shared_key_offset: 0,
@@ -9260,7 +9454,7 @@ mod thread_sibling_tests {
         assert_eq!(copied.perms, applevisor::memory::MemPerms::ReadWrite);
         assert!(copied.memory.is_none());
         assert!(copied.host_mapping.is_none());
-        assert!(copied.guest_shared);
+        assert_eq!(copied.sharing, GuestMappingSharing::GlobalShared);
     }
 
     fn mapped_region(start: u64, end: u64, ipa: u64) -> HvfMappedRegion {
@@ -9273,7 +9467,8 @@ mod thread_sibling_tests {
             perms: applevisor::memory::MemPerms::ReadWrite,
             memory: None,
             host_mapping: None,
-            guest_shared: false,
+            is_dynamic_alias: false,
+            sharing: GuestMappingSharing::Private,
             guest_writable: true,
             shared_key_base: 0,
             shared_key_offset: 0,
@@ -9745,7 +9940,8 @@ pub(crate) fn hvf_set_sys_reg(
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 mod tag_strip_tests {
     use super::{
-        AliasBacking, GuestMappingPlan, alias_matches_process_scope, exec_bank_layout_key,
+        AliasBacking, GuestMappingPlan, GuestMappingSharing, HvfMappedRegion,
+        alias_matches_process_scope, exec_bank_layout_key, mapping_is_current_for_process_fork,
         missing_process_aliases, reserve_process_alias_ipa, strip_pointer_tag,
     };
 
@@ -10019,12 +10215,36 @@ mod tag_strip_tests {
         let aux_child_ipa = carrick_mem::memory::LINUX_PROCESS_AUX_BANK_BASE + 0x4000;
         let root_ipa = carrick_mem::memory::LINUX_ALIAS_IPA_BASE + 0x4000;
 
-        assert!(alias_matches_process_scope(child_ipa, false, Some(bank)));
-        assert!(!alias_matches_process_scope(root_ipa, false, Some(bank)));
-        assert!(alias_matches_process_scope(root_ipa, false, None));
-        assert!(!alias_matches_process_scope(child_ipa, false, None));
-        assert!(!alias_matches_process_scope(aux_child_ipa, false, None));
-        assert!(alias_matches_process_scope(root_ipa, true, Some(bank)));
+        assert!(alias_matches_process_scope(
+            child_ipa,
+            GuestMappingSharing::Private,
+            Some(bank)
+        ));
+        assert!(!alias_matches_process_scope(
+            root_ipa,
+            GuestMappingSharing::Private,
+            Some(bank)
+        ));
+        assert!(alias_matches_process_scope(
+            root_ipa,
+            GuestMappingSharing::Private,
+            None
+        ));
+        assert!(!alias_matches_process_scope(
+            child_ipa,
+            GuestMappingSharing::Private,
+            None
+        ));
+        assert!(!alias_matches_process_scope(
+            aux_child_ipa,
+            GuestMappingSharing::Private,
+            None
+        ));
+        assert!(alias_matches_process_scope(
+            root_ipa,
+            GuestMappingSharing::GlobalShared,
+            Some(bank)
+        ));
     }
 
     #[test]
@@ -10037,12 +10257,18 @@ mod tag_strip_tests {
         let cursor = std::sync::atomic::AtomicU64::new(first_dynamic);
         let requested = carrick_mem::memory::LINUX_ALIAS_IPA_BASE;
 
-        let first = reserve_process_alias_ipa(requested, 0x4000, false, Some(bank), Some(&cursor))
-            .expect("first private alias");
+        let first = reserve_process_alias_ipa(
+            requested,
+            0x4000,
+            GuestMappingSharing::Private,
+            Some(bank),
+            Some(&cursor),
+        )
+        .expect("first private alias");
         let second = reserve_process_alias_ipa(
             requested + 0x20_0000,
             0x30_0000,
-            false,
+            GuestMappingSharing::Private,
             Some(bank),
             Some(&cursor),
         )
@@ -10055,13 +10281,130 @@ mod tag_strip_tests {
             bank.0 + 0x80_0000
         );
         assert_eq!(
-            reserve_process_alias_ipa(requested, 0x4000, true, Some(bank), Some(&cursor))
-                .expect("shared alias"),
+            reserve_process_alias_ipa(
+                requested,
+                0x4000,
+                GuestMappingSharing::GlobalShared,
+                Some(bank),
+                Some(&cursor),
+            )
+            .expect("shared alias"),
             requested
         );
         assert_eq!(
-            reserve_process_alias_ipa(requested, 0x4000, false, None, None).expect("root alias"),
+            reserve_process_alias_ipa(requested, 0x4000, GuestMappingSharing::Private, None, None,)
+                .expect("root alias"),
             requested
+        );
+    }
+
+    #[test]
+    fn fork_shared_anonymous_alias_stays_process_scoped() {
+        let parent_bank = (
+            carrick_mem::memory::LINUX_PROCESS_BANK_BASE,
+            40 * 1024 * 1024 * 1024,
+        );
+        let foreign_bank = (parent_bank.0 + parent_bank.1, parent_bank.1);
+        let cursor = std::sync::atomic::AtomicU64::new(parent_bank.0 + 0x12_3456);
+        let requested = carrick_mem::memory::LINUX_ALIAS_IPA_BASE;
+        let sharing = GuestMappingSharing::ForkSharedAnonymous;
+        assert!(sharing.shares_across_fork());
+        assert!(!sharing.uses_global_ipa());
+        assert!(!sharing.has_shared_futex_identity());
+
+        // A MAP_SHARED anonymous alias needs a host-fork-shared backing, but
+        // that does not make it a VM-global shared-file alias. It must consume
+        // the owning mm's bank so only an explicitly inherited child mapping
+        // can reuse the physical backing.
+        let ipa =
+            reserve_process_alias_ipa(requested, 0x4000, sharing, Some(parent_bank), Some(&cursor))
+                .expect("fork-shared anonymous alias");
+        assert_eq!(ipa, parent_bank.0 + 0x20_0000);
+
+        let alias = AliasBacking {
+            start: 0x1400_0000_0000,
+            ipa,
+            host_addr: 0x1000,
+            size: 0x4000,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+            guest_writable: true,
+            sharing,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+        };
+        assert_eq!(
+            missing_process_aliases(
+                &std::collections::HashSet::new(),
+                &[alias],
+                Some(parent_bank)
+            )
+            .len(),
+            1,
+            "the owning mm must inventory its sibling-owned alias"
+        );
+        assert!(
+            missing_process_aliases(
+                &std::collections::HashSet::new(),
+                &[alias],
+                Some(foreign_bank)
+            )
+            .is_empty(),
+            "an unrelated mm must not acquire anonymous backing through global alias scope"
+        );
+    }
+
+    #[test]
+    fn fork_source_uses_live_alias_inventory_not_retired_mapping_owners() {
+        let bank = (
+            carrick_mem::memory::LINUX_PROCESS_BANK_BASE,
+            40 * 1024 * 1024 * 1024,
+        );
+        let va = 0x1382_8ed0_0000;
+        let retired_ipa = bank.0 + 0x20_0000;
+        let live_ipa = bank.0 + 0x40_0000;
+        let mapping = |ipa, host_addr, is_dynamic_alias| HvfMappedRegion {
+            start: va,
+            ipa,
+            end: va + 0x4000,
+            host_addr: host_addr as *mut u8,
+            size: 0x4000,
+            perms: applevisor::memory::MemPerms::ReadWrite,
+            memory: None,
+            host_mapping: None,
+            is_dynamic_alias,
+            sharing: GuestMappingSharing::Private,
+            guest_writable: true,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+        };
+        let live_alias = AliasBacking {
+            start: va,
+            ipa: live_ipa,
+            host_addr: 0x3000,
+            size: 0x4000,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+            guest_writable: true,
+            sharing: GuestMappingSharing::ForkSharedAnonymous,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+        };
+
+        assert!(
+            !mapping_is_current_for_process_fork(
+                &mapping(retired_ipa, 0x2000, true),
+                &[live_alias],
+                Some(bank),
+            ),
+            "a retained stage-2 lifetime owner is not a live child mapping"
+        );
+        assert!(mapping_is_current_for_process_fork(
+            &mapping(live_ipa, 0x3000, true),
+            &[live_alias],
+            Some(bank),
+        ));
+        assert!(
+            mapping_is_current_for_process_fork(&mapping(bank.0, 0x4000, false), &[], Some(bank),),
+            "structural boot mappings do not depend on the dynamic alias registry"
         );
     }
 
@@ -10081,7 +10424,7 @@ mod tag_strip_tests {
             size: 0x4000,
             perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
             guest_writable: true,
-            guest_shared: false,
+            sharing: GuestMappingSharing::Private,
             shared_key_base: 0,
             shared_key_offset: 0,
         };

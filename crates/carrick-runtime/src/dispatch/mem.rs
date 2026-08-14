@@ -230,6 +230,12 @@ pub(super) struct MemState {
     /// VMAs Linux would have installed inside those arenas with their actual
     /// permissions and private/shared bit.
     pub dynamic_maps: Vec<ProcMapsEntry>,
+    /// Guest-VA ranges whose post-boot host alias backing has been physically
+    /// installed and committed. This is deliberately separate from
+    /// `dynamic_maps`: a lazy anonymous `PROT_NONE` reservation owns a Linux VMA
+    /// before it owns host/stage-2 backing. Fork clones both inventories;
+    /// munmap/MAP_FIXED replacement trims both atomically.
+    host_alias_backed_ranges: Vec<crate::vfs::GuestMemoryRange>,
     /// Original bytes for mappings that have used remap_file_pages(2). Carrick's
     /// low fixed MAP_SHARED path is byte-backed guest memory rather than a live
     /// nonlinear VM object, so remap_file_pages copies windows from this stable
@@ -306,6 +312,7 @@ impl MemState {
             free_regions: Vec::new(),
             address_space_regions: None,
             dynamic_maps: Vec::new(),
+            host_alias_backed_ranges: Vec::new(),
             remap_snapshots: std::collections::HashMap::new(),
             bus_fault_ranges: Vec::new(),
             locked_ranges: Vec::new(),
@@ -946,6 +953,7 @@ fn remove_mapping_metadata_locked(mem: &mut MemState, start: u64, len: u64) {
     locked_ranges_remove(&mut mem.resident_tracked_ranges, remove);
     remove_fault_range(&mut mem.resident_fault_ranges, remove);
     locked_ranges_remove(&mut mem.write_sealed_shared_maps, remove);
+    locked_ranges_remove(&mut mem.host_alias_backed_ranges, remove);
 }
 
 fn shared_file_bus_offset(file_len: u64, offset: u64, length: u64, page_size: u64) -> Option<u64> {
@@ -1135,6 +1143,7 @@ impl SyscallDispatcher {
         if let Some(description) = commit.writable_memfd {
             mem.writable_memfd_maps.push((replacement, description));
         }
+        locked_ranges_insert(&mut mem.host_alias_backed_ranges, replacement);
         let entry = ProcMapsEntry {
             start: commit.start,
             end,
@@ -1471,6 +1480,20 @@ impl SyscallDispatcher {
         trim_dynamic_maps_for_range(&mut mem.dynamic_maps, start, len);
         let idx = mem.dynamic_maps.partition_point(|map| map.start < start);
         mem.dynamic_maps.insert(idx, entry);
+    }
+
+    /// Whether one committed host-alias extent fully backs this guest-VA range.
+    /// VMA presence alone is insufficient: lazy anonymous `PROT_NONE` reserves
+    /// the address now and installs physical backing only on first commit.
+    fn range_has_host_alias_backing(&self, start: u64, len: u64) -> bool {
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        self.mem
+            .lock()
+            .host_alias_backed_ranges
+            .iter()
+            .any(|range| range.start().raw() <= start && range.end().raw() >= end)
     }
 
     /// Recover the one source VMA `mremap` is allowed to transform. Combining
@@ -4039,9 +4062,26 @@ impl SyscallDispatcher {
                 .memory
                 .protections()
                 .is_some_and(|p| p.range_unmapped(address.0, len));
-            let needs_backing_probe = !cx.memory.has_complete_mapping_metadata();
+            let layout = this.mem.lock().layout;
+            // Complete VMA metadata answers whether the Linux address range is
+            // mapped; it does NOT answer whether a deliberately-lazy anonymous
+            // high-VA reservation has acquired physical alias backing. The
+            // dispatcher's committed-alias inventory is authoritative for that
+            // second fact: a raw host-pointer read can succeed through a stale
+            // post-unmap view even after this mm's stage-1/stage-2 translations
+            // were retired. Only a successful host-alias transaction publishes
+            // the range, and unmap/replacement trims it with the VMA metadata.
+            let lazy_alias_reservation = (!metadata_says_unmapped
+                && !prot_flags.is_empty()
+                && mmap_address_uses_alias(address.0, length, layout)
+                && !this.range_has_host_alias_backing(address.0, length))
+            .then(|| this.mremap_mapping_metadata(cx.memory, address.0, length).ok())
+            .flatten();
+            let incomplete_backend_says_unmapped = !cx.memory.has_complete_mapping_metadata()
+                && cx.memory.read_bytes_raw(address.0, 1).is_err();
             if metadata_says_unmapped
-                || (needs_backing_probe && cx.memory.read_bytes_raw(address.0, 1).is_err())
+                || lazy_alias_reservation.is_some()
+                || incomplete_backend_says_unmapped
             {
                 // LAZY ALIAS COMMIT. An anonymous PROT_NONE reservation in the
                 // alias window is deliberately given no backing at `mmap` time
@@ -4062,19 +4102,30 @@ impl SyscallDispatcher {
                 // `metadata_says_unmapped` still wins: a range explicitly
                 // munmapped is a real hole, and NULL and genuine holes keep
                 // answering ENOMEM (LTP mprotect01).
-                let layout = this.mem.lock().layout;
                 if !metadata_says_unmapped
                     && !prot_flags.is_empty()
                     && mmap_address_uses_alias(address.0, length, layout)
                     && let Some(ipa) = crate::memory::alloc_alias_ipa(length)
                 {
+                    // The reservation's VMA is the source of truth. `mprotect`
+                    // replaces only its committed subrange; it must not
+                    // manufacture MAP_PRIVATE metadata for a MAP_SHARED
+                    // anonymous reservation merely because the backing is being
+                    // created late.
+                    let Some(reservation) = lazy_alias_reservation.or_else(|| {
+                        this.mremap_mapping_metadata(cx.memory, address.0, length)
+                            .ok()
+                    }) else {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    };
+                    let shared = reservation.sharing == ProcMapSharing::Shared;
                     let transaction =
                         host_alias_dispatch.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
                             start: address.0,
                             len: length,
                             prot: prot_flags,
-                            sharing: crate::vfs::proc::ProcMapSharing::Private,
-                            path: String::new(),
+                            sharing: reservation.sharing,
+                            path: reservation.path,
                             locked: None,
                             resident: false,
                             bus_fault: None,
@@ -4090,7 +4141,7 @@ impl SyscallDispatcher {
                         len: length,
                         payload: Vec::new(),
                         file: None,
-                        shared: false,
+                        shared,
                         prot,
                         prot_none: false,
                     });
@@ -4473,6 +4524,7 @@ impl SyscallDispatcher {
                 .writable_memfd_maps
                 .iter()
                 .any(|(range, _)| overlaps(range))
+            || mem.host_alias_backed_ranges.iter().any(overlaps)
     }
 
     fn mark_range_resident(&self, start: u64, len: u64) {
@@ -8622,13 +8674,21 @@ mod tests {
         let address = crate::memory::LINUX_HIGH_VA_THRESHOLD;
 
         let dispatcher = native16k_dispatcher();
-        dispatcher.record_dynamic_mapping(
-            address,
-            PAGE_SIZE,
-            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
-            ProcMapSharing::Private,
-            String::new(),
-        );
+        // Model a completed high-VA alias transaction, not merely a reserved
+        // VMA.  The authoritative backing inventory is published only at
+        // commit, after the backend mapping has succeeded.
+        dispatcher.commit_host_alias_mmap(HostAliasMmapCommit {
+            start: address,
+            len: PAGE_SIZE,
+            prot: LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            sharing: ProcMapSharing::Private,
+            path: String::new(),
+            locked: None,
+            resident: false,
+            bus_fault: None,
+            write_sealed_shared: false,
+            writable_memfd: None,
+        });
         let registry =
             crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1160));
         let reporter = CompatReporter::default();
@@ -8814,13 +8874,21 @@ mod tests {
         let address = crate::memory::LINUX_HIGH_VA_THRESHOLD;
 
         let dispatcher = native16k_dispatcher();
-        dispatcher.record_dynamic_mapping(
-            address,
-            PAGE_SIZE,
-            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
-            ProcMapSharing::Private,
-            String::new(),
-        );
+        // Model a completed high-VA alias transaction, not merely a reserved
+        // VMA.  The authoritative backing inventory is published only at
+        // commit, after the backend mapping has succeeded.
+        dispatcher.commit_host_alias_mmap(HostAliasMmapCommit {
+            start: address,
+            len: PAGE_SIZE,
+            prot: LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            sharing: ProcMapSharing::Private,
+            path: String::new(),
+            locked: None,
+            resident: false,
+            bus_fault: None,
+            write_sealed_shared: false,
+            writable_memfd: None,
+        });
         let registry =
             crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1187));
         registry.register_child(0);
@@ -10077,6 +10145,61 @@ mod tests {
     }
 
     #[test]
+    fn host_alias_inventory_commits_trims_and_fork_clones_exact_ranges() {
+        let parent = SyscallDispatcher::new();
+        let start = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+        let page = LINUX_PAGE_SIZE;
+        let len = 3 * page;
+        let guard = parent.begin_host_alias_dispatch();
+        let transaction = guard.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
+            start,
+            len,
+            prot: LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            sharing: ProcMapSharing::Shared,
+            path: String::new(),
+            locked: None,
+            resident: false,
+            bus_fault: None,
+            write_sealed_shared: false,
+            writable_memfd: None,
+        }));
+        assert!(
+            !parent.range_has_host_alias_backing(start, len),
+            "a pending transaction must not predict physical backing"
+        );
+        let install = transaction.claim().expect("claim host-alias install");
+        assert!(
+            !parent.range_has_host_alias_backing(start, len),
+            "an installing transaction must not publish before backend success"
+        );
+        parent
+            .commit_host_alias_install(install)
+            .expect("publish successful host-alias install");
+        assert!(parent.range_has_host_alias_backing(start, len));
+
+        let child = parent.fork_clone_in_process(
+            crate::thread::ThreadId::synthetic_for_tests(73),
+            crate::thread::ThreadId::synthetic_for_tests(74),
+            73,
+            74,
+        );
+        assert!(
+            child.range_has_host_alias_backing(start, len),
+            "fork inherits the fact that its explicit child descriptor reuses the alias backing"
+        );
+
+        parent.remove_mapping_metadata(start + page, page);
+        assert!(parent.range_has_host_alias_backing(start, page));
+        assert!(!parent.range_has_host_alias_backing(start, len));
+        assert!(!parent.range_has_host_alias_backing(start + page, page));
+        assert!(parent.range_has_host_alias_backing(start + 2 * page, page));
+        assert!(
+            child.range_has_host_alias_backing(start, len),
+            "the child's copied inventory is not mutated by a parent-only unmap"
+        );
+    }
+
+    #[test]
     fn host_alias_abort_preserves_replaced_vma_lock_residency_bus_and_seal_metadata() {
         let dispatcher = SyscallDispatcher::new();
         let start = crate::memory::LINUX_HIGH_VA_THRESHOLD;
@@ -10109,6 +10232,7 @@ mod tests {
                 .push((start + LINUX_PAGE_SIZE, LINUX_PAGE_SIZE));
         }
         let before = dispatcher.mem.lock().clone();
+        assert!(!dispatcher.range_has_host_alias_backing(start, len));
         let vma_source = dispatcher.vma_snapshot_source();
         let guard = dispatcher.begin_host_alias_dispatch();
         let transaction = guard.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
@@ -10129,6 +10253,7 @@ mod tests {
             Err(crate::kernel::SnapshotError::TimedOut)
         );
         let pending = dispatcher.mem.lock().clone();
+        assert!(!dispatcher.range_has_host_alias_backing(start, len));
         assert_eq!(pending.dynamic_maps, before.dynamic_maps);
         assert_eq!(pending.locked_ranges, before.locked_ranges);
         assert_eq!(pending.resident_ranges, before.resident_ranges);
@@ -10148,6 +10273,10 @@ mod tests {
         drop(install);
 
         let after = dispatcher.mem.lock().clone();
+        assert!(
+            !dispatcher.range_has_host_alias_backing(start, len),
+            "an aborted backend install must not publish backing presence"
+        );
         assert_eq!(after.dynamic_maps, before.dynamic_maps);
         assert_eq!(after.locked_ranges, before.locked_ranges);
         assert_eq!(after.resident_ranges, before.resident_ranges);
@@ -10528,5 +10657,71 @@ mod tests {
             Some((LINUX_MMAP_BASE, false)),
             "alias-window advisory aliases must not consume the low mmap arena"
         );
+    }
+
+    #[test]
+    fn lazy_high_va_commit_preserves_shared_reservation_provenance() {
+        const SYS_MPROTECT: u64 = 226;
+        let address = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+        let mut dispatcher = SyscallDispatcher::new();
+        // HVPatch advertises complete VMA metadata even though a PROT_NONE
+        // high-VA reservation deliberately has no alias backing yet. Model that
+        // exact split: metadata is complete, while the only readable backing is
+        // the unrelated low mmap arena.
+        let mut memory = ProtectionTrackingMemory::new(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize);
+        let reporter = CompatReporter::default();
+
+        // Model the original high-VA MAP_SHARED|MAP_ANONYMOUS|PROT_NONE
+        // reservation. Its backing is absent until mprotect commits it, but
+        // its VMA sharing classification is already authoritative.
+        dispatcher.record_dynamic_mapping(
+            address,
+            LINUX_PAGE_SIZE,
+            LinuxProtFlags::empty(),
+            ProcMapSharing::Shared,
+            String::new(),
+        );
+        let outcome = dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    SYS_MPROTECT,
+                    SyscallArgs([
+                        address,
+                        LINUX_PAGE_SIZE,
+                        LINUX_PROT_READ | LINUX_PROT_WRITE,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("mprotect dispatch should complete");
+
+        let DispatchOutcome::MapHostAlias {
+            success_retval,
+            shared,
+            transaction,
+            ..
+        } = outcome
+        else {
+            panic!("shared high-VA reservation must commit through MapHostAlias: {outcome:?}");
+        };
+        assert_eq!(
+            success_retval, 0,
+            "mprotect must return success, not an address"
+        );
+        assert!(shared, "lazy commit must retain MAP_SHARED provenance");
+        assert!(
+            !dispatcher.range_has_host_alias_backing(address, LINUX_PAGE_SIZE),
+            "dispatch alone must not predict backend publication"
+        );
+        let install = transaction.claim().expect("claim lazy host-alias install");
+        dispatcher
+            .commit_host_alias_install(install)
+            .expect("publish successful lazy host-alias install");
+        assert!(dispatcher.range_has_host_alias_backing(address, LINUX_PAGE_SIZE));
     }
 }
