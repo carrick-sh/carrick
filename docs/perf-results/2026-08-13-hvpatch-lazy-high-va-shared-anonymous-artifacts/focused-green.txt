@@ -1,3 +1,5 @@
+SOURCE: c707d7c55f46521a2aa622d8d580b91c8d32b0a2
+
 COMMAND: RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf --lib
     Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
      Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-89014486320444c6)
@@ -136,7 +138,55 @@ test vcpu_permit_reaper::tests::note_exit_on_reused_pid_does_not_free_live_gener
 test vcpu_permit_reaper::tests::note_exit_reclaims_owner_slot ... ok
 test vcpu_permit_reaper::tests::register_after_exit_reclaims_via_readiness_check ... ok
 
-test result: ok. 132 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.77s
+test result: ok. 132 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.73s
+
+
+COMMAND: RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf alias_registry_ -- --nocapture
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-89014486320444c6)
+
+running 3 tests
+test trap::tag_strip_tests::alias_registry_partial_unmap_preserves_exact_live_fragments ... ok
+test trap::tag_strip_tests::alias_registry_prefix_unmap_preserves_exact_suffix ... ok
+test trap::tag_strip_tests::alias_registry_suffix_unmap_preserves_exact_prefix ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 129 filtered out; finished in 0.00s
+
+     Running unittests src/bin/hvf_bl_exit_free_probe.rs (target/debug/deps/hvf_bl_exit_free_probe-f9da13f40fd23f4b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running unittests src/bin/hvf_compute_baseline_probe.rs (target/debug/deps/hvf_compute_baseline_probe-1f828b1394d493a3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running unittests src/bin/hvf_fork_probe.rs (target/debug/deps/hvf_fork_probe-f8b305748124f44e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/hvf_info_load_probe.rs (target/debug/deps/hvf_info_load_probe-d6004cffba7a854d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running unittests src/bin/hvf_kernel_memory_probe.rs (target/debug/deps/hvf_kernel_memory_probe-b1c69a3ce52976ec)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running unittests src/bin/hvf_svc_tax_probe.rs (target/debug/deps/hvf_svc_tax_probe-dc2cc800add805f9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
 
 COMMAND: RUST_TEST_THREADS=1 cargo test -p carrick-runtime shared_anonymous_high_advisory_hint_is_selected_then_committed_lazily -- --nocapture

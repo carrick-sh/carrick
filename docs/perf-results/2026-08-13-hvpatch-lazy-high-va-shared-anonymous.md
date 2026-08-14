@@ -297,6 +297,9 @@ The HVPatch suite includes the grandchild identity/scope test, prefix/middle/
 suffix split tests, and the middle-fragment forkability test through the same
 physical frame. The committed raw focused output is
 `2026-08-13-hvpatch-lazy-high-va-shared-anonymous-artifacts/focused-green.txt`.
+Test-only follow-up `c707d7c55f46521a2aa622d8d580b91c8d32b0a2` also asserts that the
+prefix-unmap suffix and suffix-unmap prefix each remain forkable through their
+retained physical extent; the refreshed raw output is sourced from that commit.
 
 The DTrace program now requires alias maps, guest faults, alias walks, fault
 walks, and fault TTBR companions. Provider errors exit 3, incomplete target
@@ -367,9 +370,9 @@ The committed raw artifacts and SHA-256 hashes are:
 ```text
 ff5e007e817cc98724dd45d459a99b71b2e69cf695cf550d320f89cc2bad3ab3  binary-identity.txt
 6343858f6a98b9e28e628ef958b6f24af15a804bdb31ede57d763aaa7582d427  cleanup-receipt.txt
-c637e85f35a41437031b589380928b92f12865d0b5885b0334eaac20c334eb45  focused-green.txt
+319f87d3b39f1d7807fbac19ef8179fa9a25d34e1cb7af562c9a96c502593bfc  focused-green.txt
 160a03dbc9bbed14a0545a58f61e915da46ba21f016571432367cd766ef45936  just-ci-initial-native-x18-flake.log
-00a521979724adb0dea3369e30eb7efb84016c71570bc52bcc52a0f7d779b07d  just-ci.log
+d9ddd417814e5b1ec1d8ea8dd14ac591d27f28225a4cc417d5cadd13736dbf09  just-ci.log
 2334c79a9ed066ce2e957cca85976e56263953060606ef15a9d6c67ec6a48f55  native-x18-resample.txt
 0e5f20979147015d74b6f7b3583e36b9e8a3ef2792823438598db3c6f801b6a6  probe-build.txt
 64ad458a192c4316bf2b0567e2f6fd16176a0bb4baa29154ed7e2b76489f2517  probe-match.txt
