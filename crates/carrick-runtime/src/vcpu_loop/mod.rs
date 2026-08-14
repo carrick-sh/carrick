@@ -464,8 +464,42 @@ struct HvpatchRuntimeEndpoint {
     /// Exact parent task generation retained at endpoint publication. Child
     /// exit notification must not recapture a newer registry association.
     signal_context: crate::kernel::KernelContext,
+}
+
+/// The kernel lane's [`TaskWaker`]: the three vehicles a guest task on this
+/// lane can be parked on, kicked together.
+///
+/// A parked guest is waiting on one of them and the kernel cannot tell which,
+/// so all three fire. Each is a hint — the woken thread re-reads the
+/// authoritative pending queue — which is what makes kicking all three safe
+/// rather than merely wasteful.
+///
+/// These are the SAME objects child-exit notification has always used; routing
+/// both through one waker is what keeps a single answer to "how is a task on
+/// this lane woken".
+struct HvpatchTaskWaker {
+    /// Unparks a `FUTEX_WAIT`, and the futex-backed waits layered on it.
     futex: Arc<FutexTable>,
+    /// Forces the vCPU out of `hv_vcpu_run` so a RUNNING guest reaches a
+    /// boundary where it polls. Process-scoped, which is correct here: the
+    /// waker is registered per Linux process with that process's own kicker.
     kicker: Arc<dyn VcpuRegistry>,
+    /// Writes the wake pipes every parked `ThreadWaiter` kqueue watches.
+    signal_arrival: Arc<dyn carrick_hal::SignalArrival>,
+}
+
+impl std::fmt::Debug for HvpatchTaskWaker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HvpatchTaskWaker")
+    }
+}
+
+impl crate::kernel::TaskWaker for HvpatchTaskWaker {
+    fn wake_task(&self) {
+        self.futex.notify_signal_pending();
+        self.signal_arrival.wake_all_waiters();
+        self.kicker.kick_all();
+    }
 }
 
 #[derive(Default)]
@@ -537,9 +571,7 @@ impl HvpatchRuntimeDirectory {
         // and host-wait enrollment when publication occurs; always nudge every
         // wait vehicle so it rechecks the authoritative graph even when SIGCHLD
         // is ignored or blocked.
-        endpoint.futex.notify_signal_pending();
-        parent_kernel.signal_arrival.wake_all_waiters();
-        endpoint.kicker.kick_all();
+        endpoint.signal_context.task().wake();
     }
 }
 
@@ -784,13 +816,18 @@ impl KernelState {
             tracing::error!(%error, "cannot retain HVPatch runtime endpoint context");
             std::process::abort();
         });
+        // The kernel wakes a task through this; cross-process signal delivery
+        // reaches a PARKED guest only because of it.
+        signal_context.task().set_waker(Arc::new(HvpatchTaskWaker {
+            futex,
+            kicker,
+            signal_arrival: Arc::clone(&self.signal_arrival),
+        }));
         directory.register(
             process.task_key(),
             HvpatchRuntimeEndpoint {
                 kernel: Arc::downgrade(self),
                 signal_context,
-                futex,
-                kicker,
             },
         );
     }

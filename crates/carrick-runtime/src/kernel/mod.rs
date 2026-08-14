@@ -52,8 +52,8 @@ pub use objects::{
     OpenDescriptionBackingSnapshot, PendingQueue, PendingSignal, PidfdTarget, ProcessGroup,
     RunnerDirective, Session, Sighand, SignalAuthority, SignalDequeue, SignalDisposition,
     SignalPendingOwner, Task, TaskKey, TaskLifecycle, TaskPendingSignals, TaskRef, TaskRusage,
-    TaskShared, TaskSharedCloneError, Thread, ThreadKey, ThreadRef, ThreadResources, ThreadRunner,
-    ThreadSignalState, Zombie,
+    TaskShared, TaskSharedCloneError, TaskWaker, Thread, ThreadKey, ThreadRef, ThreadResources,
+    ThreadRunner, ThreadSignalState, Zombie,
 };
 pub use operations::{
     ChildStartOutcome, ChildStartWait, ForkReservation, KernelFailpoint, KernelOperationError,
