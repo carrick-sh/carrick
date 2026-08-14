@@ -1,0 +1,31 @@
+COMMAND: for attempt in 1 2 3; do RUST_TEST_THREADS=1 cargo test -p carrick-native-darwin dynamic_x18_publication_is_veneered_and_executes_against_the_thread_slot -- --nocapture; done
+
+ATTEMPT 1
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running unittests src/lib.rs (target/debug/deps/carrick_native_darwin-0131f12d6e8ef9f5)
+
+running 1 test
+test direct::tests::dynamic_x18_publication_is_veneered_and_executes_against_the_thread_slot ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 125 filtered out; finished in 0.00s
+
+
+ATTEMPT 2
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/carrick_native_darwin-0131f12d6e8ef9f5)
+
+running 1 test
+test direct::tests::dynamic_x18_publication_is_veneered_and_executes_against_the_thread_slot ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 125 filtered out; finished in 0.00s
+
+
+ATTEMPT 3
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running unittests src/lib.rs (target/debug/deps/carrick_native_darwin-0131f12d6e8ef9f5)
+
+running 1 test
+test direct::tests::dynamic_x18_publication_is_veneered_and_executes_against_the_thread_slot ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 125 filtered out; finished in 0.00s
+

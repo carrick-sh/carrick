@@ -1,0 +1,50 @@
+SOURCE PROVENANCE
+commit=a5a940eff47b529936a02b1ba9a1d2904f9cbaa7
+parent=4e8b2f297d3bb62fa8850a5a2d5b98b23259f0e7
+author_date=2026-08-13T21:26:16-07:00
+subject=fix(hvpatch): retain fork-shared alias lineage
+
+BINARY SHA256
+bcac19722f8b134261129fe655087d30d514df20d30a83b3bba60b317ddc0430  target/release/carrick
+
+MACH-O LC_UUID
+054205DD-A5A1-3C31-B959-05D4895C5EC5
+
+CODESIGN DETAILS
+Executable=/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/target/release/carrick
+Identifier=carrick.tmp.48368
+Format=Mach-O thin (arm64)
+CodeDirectory v=20400 size=61962 flags=0x2(adhoc) hashes=1926+7 location=embedded
+VersionPlatform=1
+VersionMin=720896
+VersionSDK=786432
+Hash type=sha256 size=32
+CandidateCDHash sha256=706d6158ea7eca92d77aa7b563e9acedfabf0c1a
+CandidateCDHashFull sha256=706d6158ea7eca92d77aa7b563e9acedfabf0c1ae6f676ce41baed5b77d59ce9
+Hash choices=sha256
+CMSDigest=706d6158ea7eca92d77aa7b563e9acedfabf0c1ae6f676ce41baed5b77d59ce9
+CMSDigestType=2
+Executable Segment base=0
+Executable Segment limit=22151168
+Executable Segment flags=0x1
+Page size=16384
+CDHash=706d6158ea7eca92d77aa7b563e9acedfabf0c1a
+Signature=adhoc
+Info.plist=not bound
+TeamIdentifier=not set
+Sealed Resources=none
+Internal requirements count=0 size=12
+Total signatures=1
+Chosen signature=1
+
+ENTITLEMENTS
+Executable=/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/target/release/carrick
+warning: Specifying ':' in the path is deprecated and will not work in a future release
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.security.hypervisor</key><true/></dict></plist>
+
+DTRACE DOF SECTION
+Section
+  sectname __dof_carrick
+   segname __TEXT
+      addr 0x00000001012a573c
+      size 0x000000000000b8ee

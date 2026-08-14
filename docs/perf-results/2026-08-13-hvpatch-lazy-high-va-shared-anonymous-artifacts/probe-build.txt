@@ -1,0 +1,10 @@
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded miniz_oxide v0.8.9
+  Downloaded cfg-if v1.0.4
+  Downloaded crc32fast v1.5.0
+  Downloaded simd-adler32 v0.3.10
+  Downloaded adler2 v2.0.1
+  Downloaded flate2 v1.1.9
+  Downloaded libc v0.2.186
+    Finished `release` profile [optimized] target(s) in 0.29s

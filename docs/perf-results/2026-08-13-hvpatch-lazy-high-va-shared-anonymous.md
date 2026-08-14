@@ -216,3 +216,167 @@ fork mappings still request a distinct snapshot/frame; shared anonymous fork
 mappings inherit the parent frame and unique anonymous backing identity. The
 controller-owned `hybrid.md` change was neither edited nor committed by this
 task.
+
+## Review-fix addendum: advisory hint, descendant ownership, exact fragments
+
+This addendum supersedes the original final-probe and cleanup receipts above.
+Review found that the first probe used `MAP_FIXED`, that the backend alias
+scope was still inferred from the current process bank, and that the backend
+registry deleted whole alias entries on an overlapping unmap. Those were real
+gaps even though the one-generation differential matched.
+
+The corrected probe now passes the high address as a genuine Linux advisory
+hint. Its flag word is only `MAP_SHARED | MAP_ANONYMOUS | MAP_NORESERVE`; it
+does not contain `MAP_FIXED`. Carrick honors the same selection path for the
+high shared-anonymous `PROT_NONE` reservation and commits it lazily on
+`mprotect`. The existing private high-hint cases remain alongside it.
+
+### Corrected ownership model
+
+The live backend registry now represents ownership explicitly as one of:
+
+- `Root`, for root-address-space aliases;
+- `ProcessBank { base, size }`, for one Linux process address-space lineage;
+- `Global`, only for existing VM-global shared mappings.
+
+A child fork inventory is assembled from the parent's authoritative aliases,
+then inherited non-global aliases are rebound to the child's bank only after
+all fallible child setup succeeds. A grandchild therefore discovers the
+child-published alias, reuses the same `SharedAnon` backing identity and
+physical extent, and remains invisible to unrelated banks. This is lineage
+reuse, not VM-global identity.
+
+The registry also separates each live semantic fragment
+`(VA, IPA, host address, size)` from its backing's full physical extent.
+Prefix, middle, and suffix unmaps split exact live fragments. A suffix advances
+VA, IPA, host address, and shared-file offset as appropriate; both survivors
+retain the same physical extent and inventory identity. Fork materialization
+therefore deduplicates and maps that full physical extent once while the
+semantic inventory remains exact.
+
+### Review TDD RED
+
+The focused tests were added before their production fixes and failed for the
+reviewed reasons:
+
+```text
+RUST_TEST_THREADS=1 cargo test -p carrick-runtime shared_anonymous_high_advisory_hint_is_selected_then_committed_lazily -- --nocapture
+FAILED: returned 618475290624, expected advisory hint 21451462672384
+
+RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf fork_shared_anonymous_alias_survives_a_second_fork_without_global_scope -- --nocapture
+FAILED: left 0, right 1
+
+RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf alias_registry_partial_unmap_preserves_exact_live_fragments -- --nocapture
+FAILED: left 0, right 2
+
+cargo test -p carrick-cli --test trace_profile hvpatch_alias_sharing_ -- --nocapture
+FAILED: hvpatch_alias_sharing_trace_fails_closed asserted that `walks = 0;` was absent
+```
+
+The first failure proves the runtime selected its shared aperture instead of
+the requested high advisory address. The second proves an inherited alias was
+lost at the child-to-grandchild boundary. The third proves an overlapping
+unmap removed the whole backend registry entry instead of preserving two exact
+fragments. The fourth proves the original DTrace program did not even inventory
+the required companion walk, so its completion contract was incomplete.
+
+### Review focused GREEN
+
+```text
+RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf --lib
+132 passed; 0 failed
+
+RUST_TEST_THREADS=1 cargo test -p carrick-runtime shared_anonymous_high_advisory_hint_is_selected_then_committed_lazily -- --nocapture
+1 passed; 0 failed
+
+cargo test -p carrick-cli --test trace_profile hvpatch_alias_sharing_ -- --nocapture
+2 passed; 0 failed
+```
+
+The HVPatch suite includes the grandchild identity/scope test, prefix/middle/
+suffix split tests, and the middle-fragment forkability test through the same
+physical frame. The committed raw focused output is
+`2026-08-13-hvpatch-lazy-high-va-shared-anonymous-artifacts/focused-green.txt`.
+
+The DTrace program now requires alias maps, guest faults, alias walks, fault
+walks, and fault TTBR companions. Provider errors exit 3, incomplete target
+exit exits 2, and timeout exits 4. The saved-capture validator rejects zero,
+incomplete, provider-error, timeout, malformed, and missing-completion
+captures. Its focused CLI test exercises each case. A live zero-event launch
+was attempted with the verified `sudo -n /usr/sbin/dtrace` path, but this host
+refused both DTrace `-c` execution and `-p` attach (`Operation not permitted` /
+`failed to grab pid`); that host policy does not replace the executable
+consumer fixture gate.
+
+### Corrected signed differential and generated cleanup receipt
+
+The signed release binary was built from review-fix implementation commit
+`a5a940eff47b529936a02b1ba9a1d2904f9cbaa7`:
+
+```text
+SHA256 bcac19722f8b134261129fe655087d30d514df20d30a83b3bba60b317ddc0430
+LC_UUID 054205DD-A5A1-3C31-B959-05D4895C5EC5
+codesign com.apple.security.hypervisor=true
+Mach-O __TEXT,__dof_carrick present
+```
+
+Exact serialized command:
+
+```text
+docker run --rm --platform linux/arm64 -v "$PWD/conformance-probes:/p" -w /p rust:alpine sh -ec 'rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1 || true; cargo build --release --target aarch64-unknown-linux-musl --bin mmaptrimprotect'
+probe SHA256 26e9ddb43520cceb6a839e02f14fac3ed2326e494133eaaea051703373dc6a77
+CARRICK_EXEC_BACKEND=hvpatch CARRICK_PROBE_RECEIPT=/tmp/hybrid-task1-fix-evidence-cleanup.txt scripts/run-probe.sh mmaptrimprotect
+```
+
+Exact output:
+
+```text
+CARRICK_PROBE_RUN_ID=cr-53745-28369
+CARRICK_PROBE_CLEANUP_RUN_ID=cr-53745-28369
+remaining carrick procs (run-id cr-53745-28369) = 0
+MATCH mmaptrimprotect
+  hinted_high_result=0
+  hinted_high2_result=0
+  hinted_high_shared_mprotect=ok
+  hinted_high_shared_parent_seeded=ok
+  hinted_high_shared_fork_visibility=0
+  v8_readonly_page_errno=0
+  tail_trim_only_errno=0
+  large_reserve_errno=0
+  untrimmed_control_errno=0
+  hinted_high_live_mprotect_errno=0
+  hinted_high_rw_roundtrip=0
+```
+
+The generated harness ID and cleanup ID are identical. The receipt is no
+longer bound to a caller label that the harness replaces.
+
+### Full gate and raw artifact manifest
+
+The first review-fix `RUST_TEST_THREADS=1 just ci` attempt reached the native
+Darwin suite and failed once in the unrelated existing test
+`dynamic_x18_publication_is_veneered_and_executes_against_the_thread_slot`
+(`left: 0`, `right: 335544320`). No native-Darwin code changed in this task.
+The exact test passed three consecutive serial resamples. A fresh complete
+`RUST_TEST_THREADS=1 just ci` then returned zero, including runtime lib
+`1564 passed; 0 failed; 5 ignored` and runtime integration
+`296 passed; 0 failed`.
+
+The committed raw artifacts and SHA-256 hashes are:
+
+```text
+ff5e007e817cc98724dd45d459a99b71b2e69cf695cf550d320f89cc2bad3ab3  binary-identity.txt
+6343858f6a98b9e28e628ef958b6f24af15a804bdb31ede57d763aaa7582d427  cleanup-receipt.txt
+c637e85f35a41437031b589380928b92f12865d0b5885b0334eaac20c334eb45  focused-green.txt
+160a03dbc9bbed14a0545a58f61e915da46ba21f016571432367cd766ef45936  just-ci-initial-native-x18-flake.log
+00a521979724adb0dea3369e30eb7efb84016c71570bc52bcc52a0f7d779b07d  just-ci.log
+2334c79a9ed066ce2e957cca85976e56263953060606ef15a9d6c67ec6a48f55  native-x18-resample.txt
+0e5f20979147015d74b6f7b3583e36b9e8a3ef2792823438598db3c6f801b6a6  probe-build.txt
+64ad458a192c4316bf2b0567e2f6fd16176a0bb4baa29154ed7e2b76489f2517  probe-match.txt
+```
+
+All paths are under
+`docs/perf-results/2026-08-13-hvpatch-lazy-high-va-shared-anonymous-artifacts/`.
+The raw binary receipt includes the source commit and parent, full codesign
+details, entitlement XML, LC_UUID, SHA-256, and DTrace DOF section. The raw
+probe output and cleanup receipt carry the actual generated `cr-*` run ID.
