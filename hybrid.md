@@ -9,6 +9,12 @@ history; the durable measurements they produced live under
 [`docs/perf-results/`](docs/perf-results/) and remain authoritative as
 evidence.
 
+**Resume checkpoint:** `main` at `53f5da3f5` (`fix(runtime): commit a high-VA
+reservation lazily, so Node.js starts`). The worktree was clean when this
+checkpoint was written. The source audit behind this checkpoint was static:
+the last durable probe/ecosystem receipts remain authoritative until the gates
+named below are rerun on a freshly signed binary.
+
 ---
 
 ## The goal, in one sentence
@@ -32,15 +38,16 @@ ecosystems exercise threads, mmap, signals, epoll, exec and `/proc`
 *simultaneously*, which is the combination no probe covers. This goal cannot be
 satisfied one subsystem at a time.
 
-**Measured ground truth, 2026-08-13** (`carrick run --exec-backend hvpatch`,
-smoke level — this CORRECTS the earlier "Node.js does not run at all" framing,
-which was true of node and implied things about go/cpython that are not):
+**Last measured ecosystem ground truth plus current startup smoke, 2026-08-13**
+(`carrick run --exec-backend hvpatch`). The Go and CPython rows are durable
+pre-checkpoint smoke receipts; the Node row is the signed-binary validation
+recorded by `53f5da3f5`, not a full ecosystem gate:
 
 | ecosystem | kernel lane | note |
 | --- | --- | --- |
 | Go | **runs** — `go version go1.23.12 linux/arm64` | cold `go build` also completes |
 | CPython | **runs** — `PY_OK 3.12.13` | |
-| Node.js | **FAILS** in V8 startup, before any JavaScript | root cause isolated, below |
+| Node.js | **startup smoke passes** — `node --version` reaches userspace | full Node ecosystem gate has not been rerun |
 
 The harness for all three already exists: 194 Go suites, 438 CPython suites and
 3 Node suites are registered in `scripts/conformance/suites.toml`, run with
@@ -54,21 +61,29 @@ new breakage:
 - The CPython image lives on a registry (`localhost:5050`) that is not currently
   served, so those suites will fail to pull before they fail to run.
 
-### Node's blocker, isolated 2026-08-13
+### Node's startup blocker: isolated and closed 2026-08-13
 
-`mprotect` on a mapping carrick placed at a **high hint address** returns
-ENOMEM where Linux returns 0
+`mprotect` on a mapping carrick placed at a **high hint address** returned
+ENOMEM where Linux returned 0
 (`conformance-probes/src/bin/mmaptrimprotect.rs`; carrick **1012**, Docker
 **0**). V8's `MemoryAllocator::AllocateAlignedMemory` hints an address around
-21 TiB, carrick honours the hint and reports success, then does not recognise
-its own mapping.
+21 TiB; carrick honoured the hint, reported success, and then did not recognise
+its own mapping. `53f5da3f5` closes that private-anonymous case by reserving the
+range in the guest VMA table and committing host/HVF backing lazily when
+`mprotect` makes it accessible.
 
 It is **not** kernel-lane-specific: `vmm`, the mature reference lane, fails
-identically, so node has never run on carrick on any lane. (`native` fails
-earlier and differently — the DSR JIT cannot emit `LDG`.) The probe's controls
-hold trimming, `MAP_NORESERVE`, `MADV_DONTFORK` and geometry constant and all
-pass, which is what isolates the hint — and which is why the earlier
-aligned-cage hypothesis was correctly refuted by `mmapcage`.
+identically. (`native` fails earlier and differently — the DSR JIT cannot emit
+`LDG`.) The probe's controls hold trimming, `MAP_NORESERVE`, `MADV_DONTFORK`
+and geometry constant and all pass, which is what isolated the hint — and why
+the earlier aligned-cage hypothesis was correctly refuted by `mmapcage`.
+
+**The closure introduced one un-gated correctness hazard that is now the first
+resume task:** the reservation accepts `MAP_SHARED|MAP_ANONYMOUS`, but lazy
+commit currently republishes it as `ProcMapSharing::Private`, returns
+`shared: false`, and asks HVF for `PrivateAnon` backing. A high-hint shared
+mapping can therefore become private at `mprotect`, breaking fork-visible
+Linux semantics. No current high-hint probe covers that combination.
 
 ---
 
@@ -79,8 +94,8 @@ The criterion is **correctness and completeness**, not the CPU bar:
    kernel objects rather than from the host process it happens to run in;
 2. `baseline.hvpatch.jsonl` blessed, with the kernel lane's conformance gaps
    closed rather than excused;
-3. CPython, Node.js and Rust workloads **run correctly** — Node currently
-   aborts in V8 startup, which is a completeness bug, not a slow one.
+3. Go, CPython and Node.js workloads **run correctly** on full ecosystem gates;
+   a startup/version smoke is evidence for a blocker closure, not completion.
 
 **Performance is explicitly NOT the gate.** The 2.3 CPU-s target and the
 `native`-lane comparison are retained below as historical context and as a
@@ -113,16 +128,17 @@ The K0…K6 sequence encoded an ordering the evidence has since refuted, and
 | K1 — object model + observability | — | **GO** at `7b808b6cf` |
 | K2 — frames and address spaces | **KM — kernel memory** + **KF — kernel page lifecycle** | re-ranked below |
 | K3 — fork/clone/wait | **KL — kernel lifecycle** | partly landed |
-| K4 — transactional exec | **KX — kernel exec** | not started |
+| K4 — transactional exec | **KX — kernel exec** | partly built; fatal-error and evidence gaps remain |
 | K5 — scheduler, sync, lowering | **KS — kernel scheduler** + **KN — kernel namei** | KN partial; KS designed |
 | K6 — cores, conformance, proof | **KD — kernel diagnostics** + **KP — shipped proof** | both partial |
 
 See the **phase status table** below for what each one has actually landed and
 what unblocks it next.
 
-**3. The ranking is inverted: path resolution and scheduling come first,
-memory second.** This is the substantive change, and it is measured, not
-argued. See below.
+**3. The ranking is correctness-first.** Path-resolution and scheduler work
+remain measured performance opportunities, but neither schedules work while
+known mmap, exec, identity, memory-architecture, diagnostics, or ecosystem
+correctness gaps remain. See the resume sequence below.
 
 ---
 
@@ -144,11 +160,11 @@ kernel lane is already several times better than the backend Carrick ships
 today. **Roughly a quarter of the overhead the goal must remove has been
 removed**, by KN and KF's first step; the rest is not yet designed.
 
-**The bar is approximately 1.01x the workload's own intrinsic cost.** Docker
-needs 2.32 CPU-s of guest work to do this build and the bar is 2.3 CPU-s
-total. "Below 2.3 CPU-s" therefore does not mean "reduce overhead
-substantially" — it means **overhead must approach zero**. Every phase below
-is judged against that.
+**Historical performance bar:** approximately 1.01x the workload's own
+intrinsic cost. Docker needs 2.32 CPU-s of guest work to do this build, so the
+old 2.3 CPU-s target effectively required overhead to approach zero. That
+target is retained only as historical context and a regression signal; it is
+not a phase-retention or completion gate in this revision.
 
 ### Where the overhead is
 
@@ -313,6 +329,125 @@ files, credentials and cancellation/signal state.
 
 ---
 
+## Resume here — ordered critical path at `53f5da3f5`
+
+Do not begin by blessing the baseline or running all 635 ecosystem suites. The
+current tree has two source-proven correctness/evidence defects that make a
+large green run non-authoritative. Work in this order, one narrow commit per
+task, and preserve red-first receipts under `docs/perf-results/`.
+
+### Active execution progress
+
+This table is the durable campaign checkpoint. Update it with each accepted
+task commit and evidence receipt; the detailed checkboxes below remain the
+acceptance criteria.
+
+| task | status | accepted commit / evidence |
+| --- | --- | --- |
+| 1 — lazy high-VA sharing | **IN PROGRESS** | isolated branch `codex/hybrid-kernel`; baseline `just test` GREEN (runtime 1,561 passed, 5 ignored) |
+| 2 — KX fatal errors and evidence | queued | — |
+| 3 — KI identity reseed | queued | — |
+| 4 — global frames and stage-1 COW | queued | — |
+| 5 — live-state crash artifacts | queued | — |
+| 6 — KP shipped proof | queued | — |
+
+**Execution ruling:** Task 4 is mandatory on the structural invariants and KP
+completion gate even though the inherited KM detail later describes a CPU
+retention gate. The ordered resume sequence and invariants 4–6 are
+authoritative; CPU is a regression signal, not permission to retain the old
+process-bank architecture.
+
+### Task 1 — preserve sharing across lazy high-VA commitment
+
+**Files:**
+`conformance-probes/src/bin/mmaptrimprotect.rs`,
+`crates/carrick-runtime/src/dispatch/mem.rs`, and
+`crates/carrick-vmm-hvf/src/trap.rs`.
+
+- [ ] Extend `mmaptrimprotect` with a high-hint
+  `MAP_SHARED|MAP_ANONYMOUS|PROT_NONE` mapping. `mprotect` it writable, write a
+  sentinel, fork, mutate the same page in the child, and require the parent to
+  observe the child value. Keep the existing private-anonymous V8-shaped case.
+- [ ] Build probes and the signed binary, then run
+  `CARRICK_EXEC_BACKEND=hvpatch scripts/run-probe.sh mmaptrimprotect` from the
+  repo root. Capture the current Carrick/Docker **DIFF** before changing the
+  runtime; never run the two arms concurrently.
+- [ ] Carry the reservation's original `ProcMapSharing` and retained VMA
+  attributes into `HostAliasMmapCommit`. Set `DispatchOutcome::MapHostAlias`
+  `shared` from that value, and allocate `HostMappingKind::SharedAnon` rather
+  than `PrivateAnon` for the shared anonymous transaction.
+- [ ] Rerun the same differential probe and require **MATCH**, then run the
+  relevant host tests and `just ci`. Publish the red/green commands, signed
+  binary identity, and exact commit in a durable evidence document.
+
+### Task 2 — close KX's remaining fatal-error and evidence holes
+
+**Files:** `crates/carrick-runtime/src/vcpu_loop/exec.rs`,
+`crates/carrick-observability/src/probes.rs`,
+`scripts/dtrace/hvpatch-phase4-exec-runtime-stages.d`, and the exec-failure
+conformance probes.
+
+- [ ] Add deterministic failure injection for old/replacement inventory
+  capacity, reservation, and `begin_exec_inventory` after sibling teardown.
+  The red assertion is that none may publish a normal exit status 127.
+- [ ] Route every fallible operation after the documented point of no return
+  through `exec_failed_past_no_return`; alternatively move it wholly before
+  sibling teardown and return a Linux errno without mutating the old image.
+- [ ] Emit `HvpatchExecRuntimeStagePhase::CloseCloexec` around the committed
+  CLOEXEC close. Preserve all six existing ordinals; this is an append-only
+  observability ABI, so deleting or renumbering the phase is not permitted.
+- [ ] Require the exec-failure differential probes to match Docker and
+  `hvpatch-phase4-exec-runtime-stages.d` to finish with exactly six stage
+  events per completed exec. An empty or incomplete capture is RED.
+
+### Task 3 — finish KI identity reseeding
+
+- [ ] Remove or satisfy the two recorded reseed blockers: the remaining
+  host-derived identity `debug_assert` and the xsig nudge.
+- [ ] Seed only the HVPatch root task at Linux PID/TGID/PGID/SID 1. Do not
+  alter `native` or `vmm` bootstrap identity.
+- [ ] Differentially gate `getpid`, `gettid`, `/proc/self/stat`, `kill`/`tgkill`,
+  `waitpid`/process groups, sessions, fork, and exec before accepting the
+  reseed. Prove no guest PID can reach a Darwin process operation.
+
+### Task 4 — complete the mandatory kernel architecture
+
+- [ ] Keep KM on the critical path. Replace fixed process-bank ownership with
+  stable global frame IPAs and implement writable fork state through stage-1
+  read-only sharing plus permission-fault COW, as invariants 4–6 require.
+- [ ] Add structural observability that proves parent and child initially name
+  the same frame, only the writer acquires a new frame, and stage-2 never holds
+  per-process duplicate banks. Existing `forkcow`/`forkshared` semantic probes
+  remain necessary but are not sufficient evidence for these invariants.
+
+### Task 5 — wire KD crash artifacts to live guest state
+
+- [ ] Capture every guest thread's authoritative register file at the crash
+  boundary and construct the already-defined `CoreDump` from kernel task, mm,
+  mapping, auxv, signal, and file-map state.
+- [ ] Wire KD's existing `CoreDump` writer to live crash state after the
+  register snapshot is complete. Require `coredumpfile` and
+  `carrick debug core` to validate an artifact produced by the crash path, not
+  a module test or on-demand synthetic writer.
+- [ ] Fail closed when any required thread, register, identity, mapping, or
+  note is missing; do not publish a partial core as successful.
+
+### Task 6 — refresh KP and ship only from current evidence
+
+- [ ] Restore or replace the unavailable CPython registry source without
+  changing the declared suite semantics.
+- [ ] On one exact signed binary, rerun the line-exact HVPatch probe gate and
+  record a fresh count. The historical **304 PASS / 90 FAIL** result is not a
+  current count after the identity, exec, and mmap commits.
+- [ ] Close kernel-lane gaps rather than copying them into a baseline as
+  excuses. Then bless `scripts/conformance/baseline.hvpatch.jsonl` from the
+  canonical machine and make HVPatch the default backend.
+- [ ] Run all Go, CPython, and Node ecosystem suites in Carrick and Docker
+  phases, never concurrently, and publish the differential receipt plus
+  topology, isolation, bounded-failure, and crash-recovery evidence.
+
+---
+
 ## Phase status at a glance
 
 **Updated 2026-08-13, re-ranked for KERNEL COMPLETENESS.** Performance is no
@@ -324,19 +459,22 @@ parked set. Every row names the ONE thing that unblocks its next step.
 | phase | status | landed | next concrete step |
 |---|---|---|---|
 | **KI** kernel identity *(new)* | **step 1 DONE; blocker 2 of 3 CLEARED** | comparators closed; **cross-process signal delivery now runs through the kernel** — `killpg`/broadcast never reach the host | clear the remaining two reseed blockers (the `debug_assert`, the xsig nudge), then **seed the root at 1** |
-| **KP** conformance proof | **started** | kernel lane added to the harness; first gate: **304 PASS / 90 FAIL**, 26 kernel-lane-specific | bless `baseline.hvpatch.jsonl`; close the 26, largest cluster first |
+| **KP** conformance proof | **started; current count unknown** | kernel lane added to the harness; historical first gate: **304 PASS / 90 FAIL**, 26 kernel-lane-specific | finish Tasks 1–5, rerun the gate, close current kernel-lane gaps, then bless `baseline.hvpatch.jsonl` |
 | **KD** diagnostics | **partial** | ELF core writer + validator; crash reports as signal death, oracle-matched | build a `CoreDump` from live state — a correct first slice needs NO memory plumbing |
 | **KL** lifecycle | **partial** | per-task user AND system CPU, oracle-matched; `CLONE_PIDFD` scoping; concurrent sibling fork | `ru_maxrss`/`ru_majflt` still host-sourced; per-task `/proc` authority |
-| **KX** kernel exec | **partly built; correctness clause now ANSWERED** | Kernel two-phase exec transaction LIVE; three image caches default-on | **fix B1–B6**: six pre-commit failures kill the caller with exit 127 instead of returning an errno ([audit](docs/perf-results/2026-08-13-exec-failure-atomicity-audit.md)) |
+| **KX** kernel exec | **partly built; B4 and evidence ABI open** | Kernel two-phase exec transaction LIVE; three image caches default-on; ordinary lookup/open/loader failures now return errno or die signalled | convert post-teardown inventory failures from `RuntimeError`→127 to signal-shaped death; restore the six-stage runtime receipt |
+| **KM** kernel memory | **critical: architecture incomplete** | `forkcow`/`forkshared` semantic probes pass through Mach-level COW | replace process banks and writable child leaves with global frames plus real stage-1 COW, or explicitly revise invariants 4–6 before implementation |
 
 ### Parked — performance-only, off the critical path
 
 | phase | why parked |
 |---|---|
-| **KM** kernel memory | RE-CLASSIFIED as performance: `forkcow`/`forkshared` PASS on this lane; no probe shows a COW divergence |
 | **KF** page lifecycle residue | step C landed; the remainder is fault-count reduction, i.e. pure CPU |
 | **KN** namei ratio gate | the dcache landed and is correct; driving `openat` 17.75x → ≤2.0 is a CPU claim |
 | **KS** scheduler | its correctness argument (slot-starvation deadlock) is real, so it re-enters the path if that deadlock recurs; its CPU argument does not schedule it |
+
+Only KM's **performance residue** may be parked after its frame-ownership and
+stage-1-COW invariants are satisfied.
 
 **KI is new and is not a renaming.** The identity work was spread across KL, KP
 and the signal cluster, and treating it as one phase is what made its ordering
@@ -344,15 +482,20 @@ constraint visible: the host-pid comparators must close BEFORE the id space is
 reseeded, because they are correct at either seed while the reverse order
 points a signal at `launchd`.
 
-**Where completeness stands.** The kernel lane fails **90** of 394 line-exact
-probes, **26** of them kernel-lane-specific, and has **no blessed baseline**.
-Node.js does not run at all. Those are the numbers that schedule work now.
+**Where completeness stands.** The last authoritative kernel-lane run failed
+**90** of 394 line-exact probes, **26** of them kernel-lane-specific. That count
+predates the latest signal, exec, and mmap work and must not be quoted as HEAD.
+The lane still has **no blessed baseline**. Node's version/startup smoke now
+passes, but no post-fix Node ecosystem receipt exists. Tasks 1–6 above, not the
+historical count, schedule work now.
 
 **Performance, for context only:** cold `go build` is **3.803 CPU-s** / **1,828
 ms** (from 4.223 / 2,051 at the K1 boundary). It is recorded as a regression
 floor — do not make it dramatically worse — and is no longer a gate.
 
-**Next, in order, and both serve kernel completeness rather than speed.**
+**Detailed design notes retained for resume Tasks 3 and 5.** The authoritative
+execution order is the checkbox sequence above; these notes preserve why the
+identity and register/core tasks are not one-line changes.
 
 1. **Guest pid identity — and it is NOT the one-line fix it looks like.**
    The kernel's id space is seeded from the host pid
@@ -428,9 +571,13 @@ floor — do not make it dramatically worse — and is no longer a gate.
 
 ## Phases
 
-Ordered by measured leverage. Each phase publishes a durable evidence
-document at its boundary (see the protocol at the end) and each gate is
-stated so it can fail.
+The order in this inherited detail section is historical; the **Resume here**
+checkboxes are authoritative. Each phase publishes a durable evidence document
+at its boundary (see the protocol at the end). Correctness, isolation,
+completeness, and fail-closed observability clauses remain gates. Numeric CPU,
+wall-time, syscall-count, fault-count, and latency clauses are measurement
+targets only; they do not retain, order, or complete a phase unless the resume
+sequence or KP gate explicitly promotes them again.
 
 ### KF — kernel page lifecycle  ·  *first step landed and retained; residue remains*
 
@@ -710,8 +857,16 @@ per-task user *and* system time both correct against the oracle.
 > nothing has emitted it since `78bfa986c`, so
 > `scripts/dtrace/hvpatch-phase4-exec-runtime-stages.d:102`'s
 > `events == completes * 6` assertion can never hold. Either re-emit it around
-> `exec.rs:436-438` or delete the ordinal and renumber. Nothing else in this
-> phase can be judged until that reports.
+> the committed CLOEXEC close or revise every producer and consumer without
+> renumbering the existing append-only ordinals. Nothing else in this phase
+> can be judged until that reports.
+
+**Failure-shaping update at `efdccf6eb`:** ordinary lookup, open, interpreter,
+and loader failures now return a Linux errno before the point of no return or
+die signal-shaped after it. B4 remains live: inventory capacity calculation,
+frame-inventory reservation, and `begin_exec_inventory` still return
+`RuntimeError` after sibling teardown, and the outer HVPatch loop publishes
+that error as normal exit 127. Task 2 above is the authoritative closure.
 
 **Remit:** build replacement address spaces outside lifecycle locks, cache
 immutable image objects and patch manifests by authenticated provenance,
@@ -776,19 +931,25 @@ lane's own conformance run exposes, and **make `hvpatch` the default
 backend** — the reference lanes stay available and stop being parity
 obligations. Validate the shipped claims on the shipped signed binary.
 
-**Known blocker, already found:** Node.js does not run — every `node:22-slim`
-start aborts in V8 startup-snapshot deserialization, which points at Carrick's
-`mmap` hint/reserve/commit lowering rather than anything Node-specific
-([evidence](docs/perf-results/2026-08-13-hvpatch-node-blocker.md)). This is a
-KM/lowering item and it gates KP.
+**Node startup blocker closed, ecosystem gate still open:**
+`53f5da3f5` makes the isolated high-hint private-anonymous case and
+`node --version` work. Task 1 must close the shared-anonymous regression before
+that lowering can be accepted, and the three declared Node suites must then be
+run differentially. The original isolation remains documented in
+[`2026-08-13-hvpatch-node-blocker.md`](docs/perf-results/2026-08-13-hvpatch-node-blocker.md).
 
 **Gate — the goal completes only when all of these are measured on the exact
 shipped binary:**
-- cold `go build` **below 2.3 CPU-s** against serialized native-arm64 Docker;
-- CPython, Node.js and Rust workloads **within 2x** Docker;
-- conformance gates green on the kernel lane, with its own blessed baseline;
-- one-VM topology, isolation stress, bounded failure and crash-tool recovery
-  demonstrated.
+- all declared Go, CPython, and Node ecosystem suites are green against
+  serialized native-arm64 Docker;
+- conformance gates are green on the kernel lane, with its own blessed
+  baseline and no kernel-lane gap excused merely to make the gate pass;
+- HVPatch is the default backend on the exact signed binary under test;
+- one-VM topology, Linux isolation, bounded failure, transactional exec,
+  guest-view crash-tool recovery, global-frame ownership, and stage-1 COW are
+  demonstrated by complete fail-closed receipts;
+- cold `go build` is remeasured as a regression signal. The historical 2.3
+  CPU-s and 2x numbers are reported but are not pass/fail criteria.
 
 Green CI, a projected speedup, or an intermediate prototype is not completion.
 
