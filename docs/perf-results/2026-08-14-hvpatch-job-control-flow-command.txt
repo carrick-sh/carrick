@@ -1,4 +1,4 @@
-2026-08-14T09:44:35.732850Z  WARN carrick::commands: carrick trace: not root; re-executing under sudo
+2026-08-14T10:20:42.212698Z  WARN carrick::commands: carrick trace: not root; re-executing under sudo
 TRACECHILD1|euid=501|egid=20|groups=12,20,33,61,79,80,81,98,100,204,250,395,398,399,400,701
 root_exact_linux_init=true
 root_leader_tid_matches=true
