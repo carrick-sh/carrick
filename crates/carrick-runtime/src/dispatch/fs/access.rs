@@ -299,10 +299,36 @@ impl SyscallDispatcher {
         if exists {
             return self.exec_access_errno(path).map_or(Ok(()), Err);
         }
-        // Missing/unreadable: resolve_at_path distinguishes ENOTDIR (a
-        // non-directory path component), ELOOP (a symlink cycle) and
-        // ENAMETOOLONG (an over-long path/component). A path that resolves but
-        // whose leaf is simply absent is ENOENT.
+        // "Unreadable as a file" is NOT the same as "absent", and two of the
+        // cases that land here resolve perfectly well — `read_exec_file_head`
+        // simply cannot produce a file head for either:
+        //   * a DIRECTORY is EACCES on Linux. It exists and resolves; it is
+        //     just not an executable image. (Note this is EACCES even for a
+        //     mode-0755 directory, so it cannot come from the X_OK DAC check
+        //     above, where search permission would pass.)
+        //   * a symlink CYCLE is ELOOP, bounded at 40 links as Linux bounds it.
+        //     `resolve_at_path` has no cycle detection, so the self-referential
+        //     link resolved to "no such entry".
+        // Reporting ENOENT for either told the guest the path did not exist.
+        // Found by `conformance-probes/src/bin/execfailsurvive.rs`, which
+        // diffed carrick's 2/2 against Docker's 13/40.
+        match self.canonicalize_following(path) {
+            Err(errno) if errno == crate::linux_abi::LINUX_ELOOP => {
+                return Err(crate::linux_abi::LINUX_ELOOP);
+            }
+            Ok(resolved) => {
+                if self
+                    .layered_lstat(&resolved)
+                    .is_ok_and(|md| md.kind == RootFsEntryKind::Directory)
+                {
+                    return Err(crate::linux_abi::LINUX_EACCES);
+                }
+            }
+            Err(_) => {}
+        }
+        // Otherwise: resolve_at_path distinguishes ENOTDIR (a non-directory
+        // path component) and ENAMETOOLONG (an over-long path/component). A
+        // path that resolves but whose leaf is simply absent is ENOENT.
         match self.resolve_at_path(LINUX_AT_FDCWD, path) {
             Ok(_) => Err(LINUX_ENOENT),
             Err(errno) => Err(errno),
