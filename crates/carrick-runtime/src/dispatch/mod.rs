@@ -2315,6 +2315,44 @@ pub struct SyscallDispatcher {
     exec_host_fs_fallback: bool,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct CoreProcessSnapshot {
+    pub identity: crate::core_dump::ProcessIdentity,
+    pub auxv: Vec<(u64, u64)>,
+    pub maps: Vec<ProcMapsEntry>,
+    pub executable_path: String,
+    pub cwd: String,
+    pub rlimit_core: u64,
+    pub dumpable: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CorePublication {
+    pub path: String,
+    pub bytes: usize,
+    pub generation: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CorePublicationError {
+    #[error("core snapshot lacks authoritative Kernel identity: {0}")]
+    KernelIdentity(String),
+    #[error("core snapshot auxv is not a sequence of 16-byte entries")]
+    MalformedAuxv,
+    #[error("core publication failpoint {0}")]
+    Failpoint(&'static str),
+    #[error("core backend {operation} failed for {path}: {error:?}")]
+    Backend {
+        operation: &'static str,
+        path: String,
+        error: crate::fs_backend::BackendError,
+    },
+    #[error("core backend did not rename {from} to {to}")]
+    RenameMissing { from: String, to: String },
+    #[error("core fsync failed for {path}: {errno}")]
+    Fsync { path: String, errno: i32 },
+}
+
 /// Owns an epoll instance's kqueue and keeps it in the in-memory-wake registry
 /// for its lifetime (deregistered on drop). Derefs to the inner `Kqueue` so the
 /// epoll handlers use it transparently.
@@ -2503,6 +2541,122 @@ fn bootstrap_one_task_binding() -> crate::kernel::KernelTaskBinding {
 impl Default for SyscallDispatcher {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod core_publication_tests {
+    use super::*;
+
+    fn snapshot() -> CoreProcessSnapshot {
+        CoreProcessSnapshot {
+            identity: crate::core_dump::ProcessIdentity {
+                pid: 91,
+                ppid: 1,
+                pgrp: 91,
+                session: 91,
+                comm: "coretest".to_owned(),
+                psargs: "coretest".to_owned(),
+            },
+            auxv: vec![(6, 4096)],
+            maps: Vec::new(),
+            executable_path: "/bin/coretest".to_owned(),
+            cwd: "/tmp/coretest".to_owned(),
+            rlimit_core: 4096,
+            dumpable: true,
+        }
+    }
+
+    #[test]
+    fn atomic_core_publication_has_one_success_edge() {
+        let dispatcher = SyscallDispatcher::new();
+        let snapshot = snapshot();
+        let publication = dispatcher
+            .publish_core_atomic_with_failpoint(&snapshot, 7, b"complete".to_vec(), None)
+            .expect("publish");
+        assert_eq!(publication.path, "/tmp/coretest/core");
+        assert_eq!(publication.bytes, 8);
+        assert_eq!(
+            dispatcher
+                .fs
+                .rootfs_vfs
+                .overlay
+                .file_contents(&publication.path),
+            Some(b"complete".to_vec())
+        );
+        assert!(
+            dispatcher
+                .fs
+                .rootfs_vfs
+                .overlay
+                .file_contents("/tmp/coretest/core.carrick-tmp-91-7")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn every_publication_failpoint_leaves_no_final_or_temporary_file() {
+        for failpoint in [
+            "before-create",
+            "unwritable-path",
+            "short-write",
+            "fsync",
+            "rename",
+            "post-publication",
+        ] {
+            let dispatcher = SyscallDispatcher::new();
+            let snapshot = snapshot();
+            dispatcher
+                .publish_core_atomic_with_failpoint(
+                    &snapshot,
+                    9,
+                    b"must-not-publish".to_vec(),
+                    Some(failpoint),
+                )
+                .expect_err(failpoint);
+            assert!(
+                dispatcher
+                    .fs
+                    .rootfs_vfs
+                    .overlay
+                    .file_contents("/tmp/coretest/core")
+                    .is_none(),
+                "final file after {failpoint}"
+            );
+            assert!(
+                dispatcher
+                    .fs
+                    .rootfs_vfs
+                    .overlay
+                    .file_contents("/tmp/coretest/core.carrick-tmp-91-9")
+                    .is_none(),
+                "temporary file after {failpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn crash_register_authority_is_generation_exact() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().expect("context");
+        let mut registers = carrick_hal::Aarch64CoreRegisters::default();
+        registers.gprs[19] = 0x1919;
+        context.thread().publish_crash_registers(41, registers);
+        assert_eq!(
+            context.thread().crash_registers(41),
+            Some(registers),
+            "matching generation"
+        );
+        assert_eq!(
+            context.thread().crash_registers(40),
+            None,
+            "stale generation"
+        );
+        assert_eq!(
+            context.thread().crash_registers(42),
+            None,
+            "future generation"
+        );
     }
 }
 
@@ -3436,6 +3590,160 @@ impl SyscallDispatcher {
     /// at boot and on each successful `execve`.
     pub fn set_auxv_image(&self, auxv: Vec<u8>) {
         self.mem.lock().linux_auxv_image = auxv;
+    }
+
+    pub(crate) fn core_process_snapshot(
+        &self,
+        context: &crate::kernel::KernelContext,
+    ) -> Result<CoreProcessSnapshot, CorePublicationError> {
+        let identity = context
+            .kernel()
+            .task_identity(context.task().key().id)
+            .map_err(|error| CorePublicationError::KernelIdentity(error.to_string()))?;
+        let proc = self.proc.lock();
+        let mem = self.mem.lock();
+        if mem.linux_auxv_image.len() % 16 != 0 {
+            return Err(CorePublicationError::MalformedAuxv);
+        }
+        let mut auxv = Vec::with_capacity(mem.linux_auxv_image.len() / 16);
+        for entry in mem.linux_auxv_image.chunks_exact(16) {
+            let key = u64::from_le_bytes(entry[..8].try_into().unwrap_or([0; 8]));
+            let value = u64::from_le_bytes(entry[8..].try_into().unwrap_or([0; 8]));
+            if key == 0 {
+                break;
+            }
+            auxv.push((key, value));
+        }
+        let comm = linux_task_name_to_string(&proc.task_name);
+        let psargs = proc.argv.join(" ");
+        let executable_path = proc.executable_path.clone();
+        let dumpable = proc.dumpable != 0;
+        let maps = mem::project_core_maps(&mem);
+        let cwd = context.resources().fs_context().cwd();
+        drop(mem);
+        drop(proc);
+        let rlimit_core = self
+            .effective_resource_limit(crate::linux_abi::LINUX_RLIMIT_CORE)
+            .rlim_cur;
+        Ok(CoreProcessSnapshot {
+            identity: crate::core_dump::ProcessIdentity {
+                pid: identity.task.id.raw(),
+                ppid: identity.parent.map_or(0, |parent| parent.id.raw()),
+                pgrp: identity.process_group.raw(),
+                session: identity.session.raw(),
+                comm: comm.clone(),
+                psargs,
+            },
+            auxv,
+            maps,
+            executable_path,
+            cwd,
+            rlimit_core,
+            dumpable,
+        })
+    }
+
+    /// Publish an already-bounded core in the guest filesystem namespace.
+    /// The same-directory temporary is never a valid final artifact: every
+    /// error removes it, and the only success edge is one atomic rename.
+    pub(crate) fn publish_core_atomic(
+        &self,
+        snapshot: &CoreProcessSnapshot,
+        generation: u64,
+        bytes: Vec<u8>,
+    ) -> Result<CorePublication, CorePublicationError> {
+        let failpoint = std::env::var("CARRICK_CORE_FAILPOINT").ok();
+        self.publish_core_atomic_with_failpoint(snapshot, generation, bytes, failpoint.as_deref())
+    }
+
+    fn publish_core_atomic_with_failpoint(
+        &self,
+        snapshot: &CoreProcessSnapshot,
+        generation: u64,
+        bytes: Vec<u8>,
+        failpoint: Option<&str>,
+    ) -> Result<CorePublication, CorePublicationError> {
+        let final_path = if snapshot.cwd == "/" {
+            "/core".to_owned()
+        } else {
+            format!("{}/core", snapshot.cwd.trim_end_matches('/'))
+        };
+        let temp_path = format!(
+            "{}.carrick-tmp-{}-{generation}",
+            final_path, snapshot.identity.pid
+        );
+        let backend = &self.fs.rootfs_vfs.overlay;
+        let _ = backend.remove_entry(&temp_path);
+        if failpoint == Some("before-create") {
+            return Err(CorePublicationError::Failpoint("before-create"));
+        }
+        if failpoint == Some("unwritable-path") {
+            return Err(CorePublicationError::Failpoint("unwritable-path"));
+        }
+        backend
+            .create_file(&temp_path)
+            .map_err(|error| CorePublicationError::Backend {
+                operation: "create",
+                path: temp_path.clone(),
+                error,
+            })?;
+        let publication = (|| {
+            if failpoint == Some("short-write") {
+                return Err(CorePublicationError::Failpoint("short-write"));
+            }
+            let bytes_written = bytes.len();
+            backend
+                .set_file_contents(&temp_path, bytes)
+                .map_err(|error| CorePublicationError::Backend {
+                    operation: "write",
+                    path: temp_path.clone(),
+                    error,
+                })?;
+            if failpoint == Some("fsync") {
+                return Err(CorePublicationError::Failpoint("fsync"));
+            }
+            if let Some(fd) = backend.open_raw_fd(&temp_path, true, false, false) {
+                let result = unsafe { libc::fsync(fd) };
+                let errno = (result < 0)
+                    .then(|| std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+                unsafe { libc::close(fd) };
+                if let Some(errno) = errno {
+                    return Err(CorePublicationError::Fsync {
+                        path: temp_path.clone(),
+                        errno,
+                    });
+                }
+            }
+            if failpoint == Some("rename") {
+                return Err(CorePublicationError::Failpoint("rename"));
+            }
+            let renamed = backend
+                .rename_overlay_entry(&temp_path, &final_path)
+                .map_err(|error| CorePublicationError::Backend {
+                    operation: "rename",
+                    path: final_path.clone(),
+                    error,
+                })?;
+            if !renamed {
+                return Err(CorePublicationError::RenameMissing {
+                    from: temp_path.clone(),
+                    to: final_path.clone(),
+                });
+            }
+            if failpoint == Some("post-publication") {
+                let _ = backend.remove_entry(&final_path);
+                return Err(CorePublicationError::Failpoint("post-publication"));
+            }
+            Ok(CorePublication {
+                path: final_path.clone(),
+                bytes: bytes_written,
+                generation,
+            })
+        })();
+        if publication.is_err() {
+            let _ = backend.remove_entry(&temp_path);
+        }
+        publication
     }
 
     /// High-water mark (bump cursor) of the anonymous mmap arena: the guest has

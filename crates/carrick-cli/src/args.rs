@@ -1380,6 +1380,26 @@ mod tests {
     }
 
     #[test]
+    fn hvpatch_core_lifecycle_profile_is_cli_selectable() {
+        let cli = Cli::try_parse_from([
+            "carrick",
+            "trace",
+            "--profile",
+            "hvpatch-core-lifecycle",
+            "--trace-out",
+            "/tmp/hvpatch-core.raw",
+            "--",
+            "run",
+            "fixture",
+        ])
+        .expect("HVPatch core lifecycle profile should parse");
+        let Commands::Trace { profile, .. } = cli.command else {
+            panic!("expected trace command");
+        };
+        assert_eq!(profile, Some(TraceProfileKind::HvpatchCoreLifecycle));
+    }
+
+    #[test]
     fn hvpatch_identity_host_safety_profile_is_cli_selectable() {
         let cli = Cli::try_parse_from([
             "carrick",

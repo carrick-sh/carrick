@@ -4135,6 +4135,19 @@ mod real {
         /// lets DTrace consumers read and then clear thread-local join state
         /// without relying on action ordering within one probe clause.
         fn hvpatch__syscall__service__clear(_: i32, _: i32, _: u32, _: u64) {}
+        /// Fail-closed Linux core lifecycle. Args: phase, Linux PID/TID,
+        /// task-local capture generation, outcome (0=in progress/success,
+        /// nonzero=failed at this phase).
+        fn hvpatch__core__lifecycle(_: u32, _: i32, _: i32, _: u64, _: u32) {}
+        /// Crash authority joined by generation: exact mm, ASID, required
+        /// thread count and collected thread count.
+        fn hvpatch__core__context(_: u64, _: u64, _: u32, _: u64, _: u64) {}
+        /// Complete artifact census joined by generation: mapping, ELF-note,
+        /// PT_LOAD, and serialized-byte counts.
+        fn hvpatch__core__census(_: u64, _: u64, _: u64, _: u64, _: u64) {}
+        /// SHA-256 of the exact bytes offered to the atomic publisher, carried
+        /// as four big-endian u64 words and joined by generation.
+        fn hvpatch__core__hash(_: u64, _: u64, _: u64, _: u64, _: u64) {}
         /// Fork snapshot timing anchor. Args: child guest PID and the guest TID
         /// that issued clone/fork. Consumers key `timestamp` by child PID and
         /// subtract it from `hvpatch__fork__snapshot__end`.
@@ -5182,6 +5195,38 @@ mod real {
             event.asid(),
             event.number()
         ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_core_lifecycle(phase: u32, pid: i32, tid: i32, generation: u64, outcome: u32) {
+        carrick_usdt::hvpatch__core__lifecycle!(|| (phase, pid, tid, generation, outcome));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_core_census(generation: u64, mappings: u64, notes: u64, loads: u64, bytes: u64) {
+        carrick_usdt::hvpatch__core__census!(|| (generation, mappings, notes, loads, bytes));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_core_context(
+        generation: u64,
+        mm: u64,
+        asid: u32,
+        required_threads: u64,
+        collected_threads: u64,
+    ) {
+        carrick_usdt::hvpatch__core__context!(|| (
+            generation,
+            mm,
+            asid,
+            required_threads,
+            collected_threads
+        ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_core_hash(generation: u64, words: [u64; 4]) {
+        carrick_usdt::hvpatch__core__hash!(|| (generation, words[0], words[1], words[2], words[3]));
     }
 
     #[inline(never)]
@@ -6744,6 +6789,10 @@ mod stub {
     stub!(hvpatch_syscall_service_begin(event: super::HvpatchSyscallService, args: [u64; 6]) -> Option<std::time::Instant> => None);
     stub!(hvpatch_syscall_service(event: super::HvpatchSyscallService));
     stub!(hvpatch_syscall_service_clear(event: super::HvpatchSyscallService));
+    stub!(hvpatch_core_lifecycle(phase: u32, pid: i32, tid: i32, generation: u64, outcome: u32));
+    stub!(hvpatch_core_context(generation: u64, mm: u64, asid: u32, required_threads: u64, collected_threads: u64));
+    stub!(hvpatch_core_census(generation: u64, mappings: u64, notes: u64, loads: u64, bytes: u64));
+    stub!(hvpatch_core_hash(generation: u64, words: [u64; 4]));
     stub!(hvpatch_fork_snapshot_begin(child_pid: i32, forking_tid: i32));
     stub!(hvpatch_fork_snapshot_end(child_pid: i32, local_regions: u64, candidate_regions: u64, added_regions: u64, added_bytes: u64));
     stub!(hvpatch_fork_snapshot_shape(child_pid: i32, private_added_regions: u64, shared_added_regions: u64, largest_added_bytes: u64, root_slot_used_bytes: u64));

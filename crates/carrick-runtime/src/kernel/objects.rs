@@ -2762,6 +2762,7 @@ impl Task {
             runner_gate: Arc::new(RunnerGate::new(key)),
             cpu_slot: AtomicUsize::new(CPU_SLOT_UNBOUND),
             system_ns: AtomicU64::new(0),
+            crash_registers: Mutex::new(None),
         })
     }
 
@@ -2784,6 +2785,7 @@ impl Task {
             runner_gate: Arc::new(RunnerGate::new(key)),
             cpu_slot: AtomicUsize::new(CPU_SLOT_UNBOUND),
             system_ns: AtomicU64::new(0),
+            crash_registers: Mutex::new(None),
         })
     }
 
@@ -2806,6 +2808,7 @@ impl Task {
             runner_gate: Arc::new(RunnerGate::new(key)),
             cpu_slot: AtomicUsize::new(CPU_SLOT_UNBOUND),
             system_ns: AtomicU64::new(0),
+            crash_registers: Mutex::new(None),
         })
     }
 
@@ -2828,6 +2831,7 @@ impl Task {
             runner_gate: Arc::clone(&caller.runner_gate),
             cpu_slot: AtomicUsize::new(CPU_SLOT_UNBOUND),
             system_ns: AtomicU64::new(0),
+            crash_registers: Mutex::new(None),
         })
     }
 
@@ -3239,6 +3243,10 @@ pub struct Thread {
     /// `CLOCK_THREAD_CPUTIME_ID` so a BLOCKED syscall — `wait4`, `epoll_wait` —
     /// contributes nothing, exactly as on Linux.
     system_ns: AtomicU64,
+    /// Exact architectural state published at a task-local crash safe point.
+    /// The generation prevents a delayed sibling from contaminating a later
+    /// capture attempt and makes incomplete/racing snapshots detectable.
+    crash_registers: Mutex<Option<(u64, carrick_hal::Aarch64CoreRegisters)>>,
 }
 
 /// A thread that has not yet run guest code and so owns no `guest_cpu` slot.
@@ -3247,6 +3255,26 @@ pub const CPU_SLOT_UNBOUND: usize = usize::MAX;
 impl Thread {
     pub const fn key(&self) -> ThreadKey {
         self.key
+    }
+
+    pub(crate) fn publish_crash_registers(
+        &self,
+        generation: u64,
+        registers: carrick_hal::Aarch64CoreRegisters,
+    ) {
+        *self.crash_registers.lock() = Some((generation, registers));
+        self.revision.publish();
+    }
+
+    pub(crate) fn crash_registers(
+        &self,
+        generation: u64,
+    ) -> Option<carrick_hal::Aarch64CoreRegisters> {
+        self.crash_registers
+            .lock()
+            .as_ref()
+            .filter(|(published, _)| *published == generation)
+            .map(|(_, registers)| *registers)
     }
 
     /// Record the `guest_cpu` slot this thread runs on. Must be called BY the

@@ -542,6 +542,7 @@ impl V2ProfileAuthority {
             | TraceProfileKind::DsrIndirect
             | TraceProfileKind::HvpatchFrameCow
             | TraceProfileKind::HvpatchExecRuntimeStages
+            | TraceProfileKind::HvpatchCoreLifecycle
             | TraceProfileKind::HvpatchIdentityHostSafety
             | TraceProfileKind::HvpatchK1Lifecycle
             | TraceProfileKind::NativeShape => {
@@ -2230,6 +2231,7 @@ pub(crate) enum TraceProfileKind {
     DsrFork,
     HvpatchFrameCow,
     HvpatchExecRuntimeStages,
+    HvpatchCoreLifecycle,
     HvpatchIdentityHostSafety,
     HvpatchK1Lifecycle,
     NativeAmplification,
@@ -2246,6 +2248,7 @@ impl TraceProfileKind {
             Self::DsrFork => "dsr-fork",
             Self::HvpatchFrameCow => "hvpatch-frame-cow",
             Self::HvpatchExecRuntimeStages => "hvpatch-exec-runtime-stages",
+            Self::HvpatchCoreLifecycle => "hvpatch-core-lifecycle",
             Self::HvpatchIdentityHostSafety => "hvpatch-identity-host-safety",
             Self::HvpatchK1Lifecycle => "hvpatch-k1-lifecycle",
             Self::NativeAmplification => "native-amplification",
@@ -2286,6 +2289,7 @@ impl TraceProfileKind {
             | Self::DsrFork
             | Self::HvpatchFrameCow
             | Self::HvpatchExecRuntimeStages
+            | Self::HvpatchCoreLifecycle
             | Self::HvpatchIdentityHostSafety
             | Self::HvpatchK1Lifecycle
             | Self::NativeFault
@@ -2302,6 +2306,9 @@ impl TraceProfileKind {
             Self::HvpatchFrameCow => carrick_runtime::dtrace_consumer::BUNDLED_HVPATCH_FRAME_COW_D,
             Self::HvpatchExecRuntimeStages => {
                 carrick_runtime::dtrace_consumer::BUNDLED_HVPATCH_EXEC_RUNTIME_STAGES_D
+            }
+            Self::HvpatchCoreLifecycle => {
+                carrick_runtime::dtrace_consumer::BUNDLED_HVPATCH_CORE_LIFECYCLE_D
             }
             Self::HvpatchIdentityHostSafety => {
                 carrick_runtime::dtrace_consumer::BUNDLED_HVPATCH_IDENTITY_HOST_SAFETY_D
@@ -2325,6 +2332,7 @@ impl TraceProfileKind {
             "dsr-fork" => Ok(Self::DsrFork),
             "hvpatch-frame-cow" => Ok(Self::HvpatchFrameCow),
             "hvpatch-exec-runtime-stages" => Ok(Self::HvpatchExecRuntimeStages),
+            "hvpatch-core-lifecycle" => Ok(Self::HvpatchCoreLifecycle),
             "hvpatch-identity-host-safety" => Ok(Self::HvpatchIdentityHostSafety),
             "hvpatch-k1-lifecycle" => Ok(Self::HvpatchK1Lifecycle),
             "native-amplification" => Ok(Self::NativeAmplification),

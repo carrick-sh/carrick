@@ -669,6 +669,23 @@ pub struct GuestWaitRegisters {
     pub lr: u64,
 }
 
+/// Complete AArch64 EL0 architectural state captured at a crash-generation
+/// safe point.  This is intentionally separate from the best-effort wait
+/// diagnostic above: a core publisher must fail closed if any field is absent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Aarch64CoreRegisters {
+    pub gprs: [u64; 31],
+    pub sp_el0: u64,
+    pub pc: u64,
+    pub pstate: u64,
+    pub elr_el1: u64,
+    pub spsr_el1: u64,
+    pub tpidr_el0: u64,
+    pub vregs: [u128; 32],
+    pub fpsr: u32,
+    pub fpcr: u32,
+}
+
 /// Runtime authority used by a backend when a private stage-1 write fault (or
 /// a kernel copy-to-user into the same page) must publish one new physical
 /// frame. The backend owns physical allocation/mapping; the runtime owns the
@@ -779,6 +796,32 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
     /// diagnostics only and never changes guest behavior.
     fn diagnostic_wait_registers(&self) -> Option<GuestWaitRegisters> {
         None
+    }
+
+    /// Exact core-dump register authority.  A backend that cannot provide the
+    /// complete shape returns an error/absence and no core may be published.
+    fn aarch64_core_registers(&self) -> Result<Option<Aarch64CoreRegisters>, TrapError> {
+        Ok(None)
+    }
+
+    /// Prepare a coherent backend memory view for live core capture. Backends
+    /// whose ordinary guest-memory view is always current keep the no-op;
+    /// HVPatch uses this at the all-thread safe point to load its software
+    /// stage-1 observer from the live hardware table backing without editing it.
+    fn prepare_core_snapshot(&mut self) -> Result<(), TrapError> {
+        Ok(())
+    }
+
+    /// Read bytes from a VMA already authenticated as readable by the coherent
+    /// core snapshot. The default preserves ordinary checked guest-memory
+    /// semantics; AArch64 HVPatch bypasses only its syscall-path PROT_NONE
+    /// reservation gate so a live `brk` prefix can be captured from backing.
+    fn read_core_bytes(
+        &self,
+        address: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+        self.read_bytes(address, length)
     }
 
     /// Best-effort fault-time walk of the live stage-1 backing. The returned

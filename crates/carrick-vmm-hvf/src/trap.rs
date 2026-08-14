@@ -898,6 +898,26 @@ fn global_frame_host_owner_matches(ipa: u64, length: u64, host_addr: usize) -> b
     matches
 }
 
+/// Copy through the exact currently-owned reusable frame selected by a live
+/// stage-1 leaf. The owner lock pins both the host mapping and its generation
+/// for the duration of the copy; absence is authoritative failure, never a
+/// reason to dereference a retired per-vCPU descriptor.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn copy_from_global_frame_owner(ipa: u64, dst: &mut [u8]) -> Option<(u64, u64)> {
+    let length = u64::try_from(dst.len()).ok()?;
+    let end = ipa.checked_add(length)?;
+    let owners = global_frame_host_owners().lock();
+    let (&(owner_ipa, owner_length), owner) = owners
+        .iter()
+        .find(|((base, size), _)| ipa >= *base && end <= base.saturating_add(*size))?;
+    let offset = usize::try_from(ipa.checked_sub(owner_ipa)?).ok()?;
+    let host = owner._mapping.as_ptr();
+    unsafe {
+        volatile_copy_from_guest(host.add(offset), dst.as_mut_ptr(), dst.len());
+    }
+    Some((owner_ipa, owner_ipa.saturating_add(owner_length)))
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn is_reusable_global_frame_extent(ipa: u64, length: u64) -> bool {
     let base = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE;
@@ -5541,6 +5561,47 @@ fn strip_pointer_tag(address: u64) -> u64 {
     address & 0x0000_FFFF_FFFF_FFFF
 }
 
+/// Resolve a syscall/core copy through the descriptor key preferred by the
+/// translated private-overlay path, then through the Linux semantic VA used by
+/// boot mappings whose stage-1 leaf now names a global frame.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn resolve_guest_copy_mapping<T>(
+    translated: u64,
+    semantic: u64,
+    mut resolve: impl FnMut(u64) -> Option<T>,
+) -> Option<(u64, T)> {
+    resolve(translated)
+        .map(|mapping| (translated, mapping))
+        .or_else(|| {
+            (translated != semantic)
+                .then(|| resolve(semantic).map(|mapping| (semantic, mapping)))?
+        })
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod guest_copy_mapping_tests {
+    use super::resolve_guest_copy_mapping;
+
+    #[test]
+    fn translated_descriptor_wins_and_semantic_va_is_the_exact_fallback() {
+        let mut translated_calls = Vec::new();
+        let translated = resolve_guest_copy_mapping(0x9000, 0x4000, |key| {
+            translated_calls.push(key);
+            (key == 0x9000).then_some("overlay")
+        });
+        assert_eq!(translated, Some((0x9000, "overlay")));
+        assert_eq!(translated_calls, vec![0x9000]);
+
+        let mut semantic_calls = Vec::new();
+        let semantic = resolve_guest_copy_mapping(0x9000, 0x4000, |key| {
+            semantic_calls.push(key);
+            (key == 0x4000).then_some("boot-heap")
+        });
+        assert_eq!(semantic, Some((0x4000, "boot-heap")));
+        assert_eq!(semantic_calls, vec![0x9000, 0x4000]);
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfVmState {
     /// The process-wide PROT_NONE bookkeeping (the engine's EFAULT gate).
@@ -7485,12 +7546,67 @@ impl HvfVmState {
             // For a `repoint_private` overlay VA the region+offset are keyed on the
             // translated overlay IPA, not the VA (see `syscall_buffer_lookup_addr`).
             // Identity otherwise — no walk. PROT_NONE was already gated on the VA.
-            let lookup_address = self.syscall_buffer_lookup_addr(chunk_address, chunk_len);
-            let (mapping_start, mapping_end, mapping_ipa, host_addr) = {
-                let Some(mapping) = self.mapping_for_range(lookup_address, chunk_len) else {
-                    return Err(MemoryError::OutOfBounds { address, length });
+            let translated_lookup = self.syscall_buffer_lookup_addr(chunk_address, chunk_len);
+            let (lookup_address, mapping_start, mapping_end, mapping_ipa, host_addr) = {
+                // Private-overlay descriptors are keyed by their translated
+                // IPA, while a boot brk descriptor remains keyed by Linux VA
+                // even after HVPatch repoints its stage-1 leaf to a reusable
+                // global frame. Keep translated-first ordering for the former,
+                // but join the latter through mapping_for_range's authoritative
+                // VA -> stage-1 IPA -> live global-owner path when the direct
+                // IPA lookup has no descriptor.
+                let resolved =
+                    resolve_guest_copy_mapping(translated_lookup, chunk_address, |lookup| {
+                        self.mapping_for_range(lookup, chunk_len)
+                    });
+                let Some((lookup_address, mapping)) = resolved else {
+                    // `syscall_buffer_lookup_addr` deliberately stays identity
+                    // for the common heap/stack hot path. Core capture has
+                    // loaded the live software observer, so use its exact leaf
+                    // output—not that shortcut—to join a descriptorless exec
+                    // heap to the current global-frame owner.
+                    let stage1_lookup = self
+                        .translate_va(chunk_address)
+                        .unwrap_or(translated_lookup);
+                    let Some((mapping_start, mapping_end)) = copy_from_global_frame_owner(
+                        stage1_lookup,
+                        &mut dst[copied..copied + chunk_len],
+                    ) else {
+                        let stage1 = self.translate_va(chunk_address);
+                        let semantic_mapping = self
+                            .mappings
+                            .iter()
+                            .any(|mapping| mapping.contains_range(chunk_address, chunk_len));
+                        let stage1_mapping = stage1.is_some_and(|ipa| {
+                            self.mappings
+                                .iter()
+                                .any(|mapping| Self::region_owns_ipa(mapping, ipa))
+                        });
+                        let owner_count = global_frame_host_owners().lock().len();
+                        return Err(MemoryError::HostMap(format!(
+                            "live core read has no current backing: va=0x{chunk_address:x} len={chunk_len} hot_lookup=0x{translated_lookup:x} stage1={stage1:x?} mappings={} semantic_mapping={semantic_mapping} stage1_mapping={stage1_mapping} global_owners={owner_count} persistent={}",
+                            self.mappings.len(),
+                            self.persistent_vm_lifecycle
+                        )));
+                    };
+                    self.emit_guest_mem_copy_decision(
+                        crate::probes::guest_mem_dir::READ_GUEST,
+                        chunk_address,
+                        chunk_len,
+                        mapping_start,
+                        mapping_end,
+                        stage1_lookup,
+                    );
+                    copied += chunk_len;
+                    continue;
                 };
-                (mapping.start, mapping.end, mapping.ipa, mapping.host_addr)
+                (
+                    lookup_address,
+                    mapping.start,
+                    mapping.end,
+                    mapping.ipa,
+                    mapping.host_addr,
+                )
             };
             self.emit_guest_mem_copy_decision(
                 crate::probes::guest_mem_dir::READ_GUEST,

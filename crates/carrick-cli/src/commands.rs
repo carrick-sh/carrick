@@ -112,6 +112,8 @@ use crate::debug_layout::native_x86_layout_json;
 #[cfg(feature = "platform-macos")]
 use crate::fs_setup::install_fs_backend;
 #[cfg(target_os = "macos")]
+use crate::hvpatch_core_profile::HvpatchCoreSummary;
+#[cfg(target_os = "macos")]
 use crate::hvpatch_exec_runtime_profile::HvpatchExecRuntimeSummary;
 #[cfg(target_os = "macos")]
 use crate::hvpatch_identity_host_safety_profile::HvpatchIdentityHostSafetySummary;
@@ -1511,6 +1513,10 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     if profile == Some(crate::trace_profile::TraceProfileKind::HvpatchK1Lifecycle) {
                         bail!("hvpatch-k1-lifecycle requires a Darwin/HVF host");
                     }
+                    if profile == Some(crate::trace_profile::TraceProfileKind::HvpatchCoreLifecycle)
+                    {
+                        bail!("hvpatch-core-lifecycle requires a Darwin/HVF host");
+                    }
                     if profile == Some(crate::trace_profile::TraceProfileKind::HvpatchFrameCow) {
                         bail!("hvpatch-frame-cow requires a Darwin/HVF host");
                     }
@@ -1740,6 +1746,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                             | crate::trace_profile::TraceProfileKind::DsrIndirect
                             | crate::trace_profile::TraceProfileKind::HvpatchFrameCow
                             | crate::trace_profile::TraceProfileKind::HvpatchExecRuntimeStages
+                            | crate::trace_profile::TraceProfileKind::HvpatchCoreLifecycle
                             | crate::trace_profile::TraceProfileKind::HvpatchIdentityHostSafety
                             | crate::trace_profile::TraceProfileKind::HvpatchK1Lifecycle => {
                                 unreachable!("non-native profile requested native qualification")
@@ -1960,6 +1967,16 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                             }
                             let summary =
                                 HvpatchK1LifecycleSummary::from_path(raw_path, capture_status)?;
+                            eprintln!("{}", summary.render_human());
+                        } else if requested_profile
+                            == crate::trace_profile::TraceProfileKind::HvpatchCoreLifecycle
+                        {
+                            if summary_jsonl.is_some() {
+                                bail!(
+                                    "the HVPatch core lifecycle profile has no JSON ledger schema; use its strict raw stream and CLI summary"
+                                );
+                            }
+                            let summary = HvpatchCoreSummary::from_path(raw_path, capture_status)?;
                             eprintln!("{}", summary.render_human());
                         } else if requested_profile
                             == crate::trace_profile::TraceProfileKind::HvpatchIdentityHostSafety

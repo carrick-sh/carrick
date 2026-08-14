@@ -786,6 +786,22 @@ struct ExecCloneAdmission<'a> {
     generation: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FatalSignalRecord {
+    tid: crate::kernel::LinuxTid,
+    signo: i32,
+    code: i32,
+    addr: u64,
+}
+
+fn fatal_for_terminal_owner(
+    recorded: Option<FatalSignalRecord>,
+    owner: crate::kernel::LinuxTid,
+    terminating_signal: Option<i32>,
+) -> Option<FatalSignalRecord> {
+    recorded.filter(|fatal| fatal.tid == owner && terminating_signal == Some(fatal.signo))
+}
+
 impl Drop for ExecCloneAdmission<'_> {
     fn drop(&mut self) {
         let mut state = self.gate.state.lock();
@@ -825,6 +841,10 @@ pub(crate) struct KernelState {
     /// Per-Linux-process fork pause for the shared-VM backend. The legacy
     /// barrier is host-process-global because it assumed one process per VM.
     process_fork_barrier: Option<Arc<crate::fork_quiesce::QuiesceBarrier>>,
+    /// Non-zero while a fatal owner is collecting one task-local register
+    /// generation. Sibling loops observe it at their quiesce safe point.
+    crash_capture_generation: Option<Arc<std::sync::atomic::AtomicU64>>,
+    next_crash_capture_generation: std::sync::atomic::AtomicU64,
     /// Number of host vCPU loops still alive for this Linux process.
     process_vcpu_live: std::sync::atomic::AtomicUsize,
     /// Cross-layer thread-clone admission spans Kernel reservation through
@@ -840,6 +860,7 @@ pub(crate) struct KernelState {
     /// teardown. The main loop consumes it after sibling-driven exit_group.
     process_terminal: Mutex<Option<Result<RunResult, ()>>>,
     process_terminal_ready: Condvar,
+    fatal_signal: Mutex<Option<FatalSignalRecord>>,
 }
 
 impl KernelState {
@@ -854,6 +875,9 @@ impl KernelState {
         let process_fork_barrier = hvpatch_process
             .as_ref()
             .map(|_| Arc::new(crate::fork_quiesce::QuiesceBarrier::new()));
+        let crash_capture_generation = hvpatch_process
+            .as_ref()
+            .map(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
         let hvpatch_runtime = hvpatch_process.as_ref().map(|_| {
             inherited_hvpatch_runtime
                 .unwrap_or_else(|| Arc::new(HvpatchRuntimeDirectory::default()))
@@ -866,12 +890,22 @@ impl KernelState {
             hvpatch_process,
             process_exiting: std::sync::atomic::AtomicBool::new(false),
             process_fork_barrier,
+            crash_capture_generation,
+            next_crash_capture_generation: std::sync::atomic::AtomicU64::new(0),
             process_vcpu_live: std::sync::atomic::AtomicUsize::new(0),
             clone_admission: CloneAdmissionGate::default(),
             hvpatch_runtime,
             child_exit_signal,
             process_terminal: Mutex::new(None),
             process_terminal_ready: Condvar::new(),
+            fatal_signal: Mutex::new(None),
+        }
+    }
+
+    fn record_fatal_signal(&self, record: FatalSignalRecord) {
+        let mut fatal = self.fatal_signal.lock();
+        if fatal.is_none() {
+            *fatal = Some(record);
         }
     }
 
@@ -1278,6 +1312,8 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     platform_futex_factory: PlatformFutexFactory,
     /// `Some` only for a process multiplexed in the shared HvPatch VM.
     process_fork_barrier: Option<Arc<crate::fork_quiesce::QuiesceBarrier>>,
+    crash_capture_generation: Option<Arc<std::sync::atomic::AtomicU64>>,
+    kernel_thread: Option<crate::kernel::ThreadRef>,
     /// Guest-visible identity allocated in the kernel namespace. It is never
     /// inferred from the backend-local thread registry key.
     linux_tid: crate::kernel::LinuxTid,
@@ -1393,6 +1429,8 @@ where
         platform_futex: Arc<dyn PlatformFutex>,
         platform_futex_factory: PlatformFutexFactory,
         process_fork_barrier: Option<Arc<crate::fork_quiesce::QuiesceBarrier>>,
+        crash_capture_generation: Option<Arc<std::sync::atomic::AtomicU64>>,
+        kernel_thread: Option<crate::kernel::ThreadRef>,
         linux_tid: crate::kernel::LinuxTid,
         this_tid: ThreadId,
         threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
@@ -1406,6 +1444,8 @@ where
             platform_futex,
             platform_futex_factory,
             process_fork_barrier,
+            crash_capture_generation,
+            kernel_thread,
             linux_tid,
             service_kernel_context: None,
             this_tid,
@@ -1426,6 +1466,410 @@ where
             .map_or_else(crate::fork_quiesce::is_quiescing, |barrier| {
                 barrier.is_quiescing()
             })
+    }
+
+    fn publish_crash_registers_if_requested(&self, engine: &E) -> Result<(), RuntimeError> {
+        let Some(generation) = self.crash_capture_generation.as_ref() else {
+            return Ok(());
+        };
+        let mut generation = generation.load(std::sync::atomic::Ordering::Acquire);
+        if generation == 0 {
+            return Ok(());
+        }
+        if std::env::var_os("CARRICK_CORE_FAILPOINT")
+            .is_some_and(|value| value == "register-generation")
+        {
+            generation = generation.saturating_add(1);
+        }
+        let registers = engine.aarch64_core_registers()?.ok_or_else(|| {
+            RuntimeError::Configuration(
+                "HVPatch crash capture lacks complete AArch64 register authority".to_owned(),
+            )
+        })?;
+        let thread = self.kernel_thread.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration(
+                "HVPatch crash capture lacks authoritative Kernel thread".to_owned(),
+            )
+        })?;
+        thread.publish_crash_registers(generation, registers);
+        Ok(())
+    }
+
+    fn capture_and_publish_core(
+        &self,
+        kernel: &Kernel,
+        engine: &mut E,
+        fatal: FatalSignalRecord,
+    ) -> Result<Option<crate::dispatch::CorePublication>, RuntimeError> {
+        // Linux default actions that carry a core. Other fatal signals still
+        // publish a signal wait status, but never set WCOREDUMP.
+        if !matches!(fatal.signo, 3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31) {
+            return Ok(None);
+        }
+        let context = kernel
+            .dispatcher
+            .capture_kernel_context(self.linux_tid)
+            .map_err(|error| {
+                RuntimeError::Configuration(format!("capture core Kernel context: {error}"))
+            })?;
+        let process_pid = kernel
+            .hvpatch_process
+            .as_ref()
+            .map(crate::hvpatch::ProcessContext::pid)
+            .ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "HVPatch crash capture lacks process identity authority".to_owned(),
+                )
+            })?;
+        let barrier = kernel.process_fork_barrier.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration("HVPatch crash capture lacks task-local barrier".to_owned())
+        })?;
+        let advertised = kernel.crash_capture_generation.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration(
+                "HVPatch crash capture lacks generation authority".to_owned(),
+            )
+        })?;
+        let generation = kernel
+            .next_crash_capture_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            .checked_add(1)
+            .ok_or_else(|| {
+                RuntimeError::Configuration("HVPatch crash generation exhausted".to_owned())
+            })?;
+        let lifecycle = |phase, outcome| {
+            crate::probes::hvpatch_core_lifecycle(
+                phase,
+                process_pid,
+                fatal.tid.raw(),
+                generation,
+                outcome,
+            );
+        };
+        lifecycle(0, 0);
+        if std::env::var_os("CARRICK_CORE_FAILPOINT")
+            .is_some_and(|value| value == "capture-timeout")
+        {
+            lifecycle(6, 1);
+            return Err(RuntimeError::Configuration(
+                "core publication failpoint capture-timeout".to_owned(),
+            ));
+        }
+        if std::env::var_os("CARRICK_CORE_FAILPOINT")
+            .is_some_and(|value| value == "capture-interrupted")
+        {
+            lifecycle(6, 1);
+            return Err(RuntimeError::Configuration(
+                "core publication failpoint capture-interrupted".to_owned(),
+            ));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !barrier.try_begin_fork() {
+            if std::time::Instant::now() >= deadline {
+                lifecycle(6, 1);
+                return Err(RuntimeError::Configuration(
+                    "HVPatch crash capture timed out behind fork/exec quiesce".to_owned(),
+                ));
+            }
+            std::thread::yield_now();
+        }
+        advertised.store(generation, std::sync::atomic::Ordering::Release);
+        let mut quiesced = false;
+        let result = (|| {
+            if std::env::var_os("CARRICK_CORE_FAILPOINT")
+                .is_some_and(|value| value == "capture-registers")
+            {
+                return Err(RuntimeError::Configuration(
+                    "core publication failpoint capture-registers".to_owned(),
+                ));
+            }
+            self.publish_crash_registers_if_requested(engine)?;
+            if self.kicker.count() > 1 {
+                barrier.set_quiescing();
+                quiesced = true;
+                self.kicker.kick_all_except(self.this_tid);
+                self.futex.notify_signal_pending();
+                self.platform_futex.notify_signal_pending();
+                kernel.signal_arrival.wake_all_waiters();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while self.kicker.count() > 1 {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(RuntimeError::Configuration(format!(
+                            "HVPatch crash generation {generation} timed out: {} sibling vCPUs remain",
+                            self.kicker.count().saturating_sub(1)
+                        )));
+                    }
+                    self.kicker.kick_all_except(self.this_tid);
+                    self.futex.notify_signal_pending();
+                    self.platform_futex.notify_signal_pending();
+                    kernel.signal_arrival.wake_all_waiters();
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+            }
+            lifecycle(1, 0);
+
+            engine.prepare_core_snapshot().map_err(|error| {
+                RuntimeError::Trap(TrapError::Hypervisor(format!(
+                    "prepare coherent core memory snapshot: {error}"
+                )))
+            })?;
+
+            // Identity, auxv, VMAs, file provenance, cwd and RLIMIT belong to
+            // the same all-thread safe point as the register files. Taking
+            // this before raising the barrier would admit a concurrent
+            // mmap/exec mutation between the two halves of the core.
+            let process = kernel
+                .dispatcher
+                .core_process_snapshot(&context)
+                .map_err(|error| {
+                    RuntimeError::FsBackend(anyhow::anyhow!(
+                        "capture quiesced core process state: {error}"
+                    ))
+                })?;
+            if !process.dumpable || process.rlimit_core == 0 {
+                return Ok(None);
+            }
+
+            let task_threads = context.task().threads();
+            let required_threads = u64::try_from(task_threads.len()).unwrap_or(u64::MAX);
+            if std::env::var_os("CARRICK_CORE_FAILPOINT")
+                .is_some_and(|value| value == "missing-thread")
+            {
+                return Err(RuntimeError::Configuration(
+                    "core publication failpoint missing-thread".to_owned(),
+                ));
+            }
+            let collect_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut threads = loop {
+                let mut collected = Vec::with_capacity(task_threads.len());
+                let mut missing_tid = None;
+                for thread in &task_threads {
+                    let Some(registers) = thread.crash_registers(generation) else {
+                        missing_tid = Some(thread.key().tid.raw());
+                        break;
+                    };
+                    let mut gregs = [0_u64; crate::core_dump::AARCH64_GREGS];
+                    gregs[..31].copy_from_slice(&registers.gprs);
+                    gregs[31] = registers.sp_el0;
+                    // ELR/SPSR are the authoritative EL0 resume pair at a trap;
+                    // retain PC/PSTATE separately in Kernel authority above.
+                    gregs[32] = registers.elr_el1;
+                    gregs[33] = registers.spsr_el1;
+                    collected.push(crate::core_dump::ThreadState {
+                        tid: thread.key().tid.raw(),
+                        registers: crate::core_dump::ThreadRegisters {
+                            gregs,
+                            tpidr_el0: registers.tpidr_el0,
+                            vregs: registers.vregs,
+                            fpsr: registers.fpsr,
+                            fpcr: registers.fpcr,
+                        },
+                        current_signal: if thread.key().tid == fatal.tid {
+                            fatal.signo
+                        } else {
+                            0
+                        },
+                    });
+                }
+                if missing_tid.is_none() {
+                    break collected;
+                }
+                if std::time::Instant::now() >= collect_deadline {
+                    return Err(RuntimeError::Configuration(format!(
+                        "core generation {generation} missing registers for tid {}",
+                        missing_tid.unwrap_or_default()
+                    )));
+                }
+                self.kicker.kick_all_except(self.this_tid);
+                self.futex.notify_signal_pending();
+                self.platform_futex.notify_signal_pending();
+                kernel.signal_arrival.wake_all_waiters();
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            };
+            threads.sort_by_key(|thread| (thread.tid != fatal.tid.raw(), thread.tid));
+            if std::env::var_os("CARRICK_CORE_FAILPOINT").is_some_and(|value| value == "capture-mm")
+            {
+                return Err(RuntimeError::Configuration(
+                    "core publication failpoint capture-mm".to_owned(),
+                ));
+            }
+            if process.auxv.is_empty()
+                || std::env::var_os("CARRICK_CORE_FAILPOINT")
+                    .is_some_and(|value| value == "missing-auxv")
+            {
+                return Err(RuntimeError::Configuration(
+                    "core capture missing authoritative auxv".to_owned(),
+                ));
+            }
+            if process.maps.is_empty()
+                || std::env::var_os("CARRICK_CORE_FAILPOINT")
+                    .is_some_and(|value| value == "missing-vma")
+            {
+                return Err(RuntimeError::Configuration(
+                    "core capture missing authoritative VMA state".to_owned(),
+                ));
+            }
+            let readable_bytes = process
+                .maps
+                .iter()
+                .filter(|map| map.read)
+                .try_fold(0_u64, |total, map| {
+                    total.checked_add(map.end.saturating_sub(map.start))
+                })
+                .ok_or_else(|| {
+                    RuntimeError::Configuration(
+                        "core readable-region byte count overflowed".to_owned(),
+                    )
+                })?;
+            if readable_bytes > process.rlimit_core {
+                return Err(RuntimeError::Configuration(format!(
+                    "core readable regions require at least {readable_bytes} bytes, exceeding RLIMIT_CORE {}",
+                    process.rlimit_core
+                )));
+            }
+            let mut region_bytes = Vec::with_capacity(process.maps.len());
+            for map in &process.maps {
+                if !map.read {
+                    region_bytes.push(Vec::new());
+                    continue;
+                }
+                if std::env::var_os("CARRICK_CORE_FAILPOINT")
+                    .is_some_and(|value| value == "memory-read")
+                {
+                    return Err(RuntimeError::Configuration(
+                        "core publication failpoint memory-read".to_owned(),
+                    ));
+                }
+                let length = usize::try_from(map.end.saturating_sub(map.start)).map_err(|_| {
+                    RuntimeError::Configuration(format!(
+                        "core region length does not fit host usize at {:#x}",
+                        map.start
+                    ))
+                })?;
+                region_bytes.push(engine.read_core_bytes(map.start, length).map_err(|error| {
+                    RuntimeError::Trap(TrapError::Hypervisor(format!(
+                        "read core region {:#x}..{:#x}: {error}",
+                        map.start, map.end
+                    )))
+                })?);
+            }
+            let regions = process
+                .maps
+                .iter()
+                .zip(&region_bytes)
+                .map(|(map, bytes)| crate::core_dump::MemoryRegion {
+                    start: map.start,
+                    flags: crate::core_dump::region_flags(map.read, map.write, map.execute),
+                    bytes: bytes.as_slice(),
+                    size: map.end.saturating_sub(map.start),
+                })
+                .collect::<Vec<_>>();
+            let mappings = process
+                .maps
+                .iter()
+                .filter_map(|map| {
+                    let path = if !map.path.is_empty() {
+                        map.path.clone()
+                    } else if map.execute {
+                        process.executable_path.clone()
+                    } else {
+                        return None;
+                    };
+                    Some(crate::core_dump::FileMapping {
+                        start: map.start,
+                        end: map.end,
+                        file_page_offset: 0,
+                        path,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let thread_count = u64::try_from(threads.len()).unwrap_or(u64::MAX);
+            let mapping_count = u64::try_from(mappings.len()).unwrap_or(u64::MAX);
+            let region_count = u64::try_from(regions.len()).unwrap_or(u64::MAX);
+            if std::env::var_os("CARRICK_CORE_FAILPOINT")
+                .is_some_and(|value| value == "missing-file-identity")
+            {
+                return Err(RuntimeError::Configuration(
+                    "core capture missing file mapping identity".to_owned(),
+                ));
+            }
+            let mm = context.shared().mm().id().raw();
+            let asid = kernel
+                .hvpatch_process
+                .as_ref()
+                .and_then(crate::hvpatch::ProcessContext::mm_binding)
+                .map(|binding| u32::from(binding.asid.raw()))
+                .ok_or_else(|| {
+                    RuntimeError::Configuration(
+                        "core capture missing HVPatch ASID authority".to_owned(),
+                    )
+                })?;
+            crate::probes::hvpatch_core_context(
+                generation,
+                mm,
+                asid,
+                required_threads,
+                thread_count,
+            );
+            lifecycle(2, 0);
+            let dump = crate::core_dump::CoreDump {
+                identity: process.identity.clone(),
+                signal: crate::core_dump::SignalInfo {
+                    signo: fatal.signo,
+                    code: fatal.code,
+                    errno: 0,
+                    addr: fatal.addr,
+                },
+                threads,
+                auxv: process.auxv.clone(),
+                mappings,
+                regions,
+            };
+            let bytes = dump
+                .to_bytes_bounded(process.rlimit_core)
+                .map_err(|error| {
+                    RuntimeError::FsBackend(anyhow::anyhow!("serialise bounded core: {error}"))
+                })?;
+            if std::env::var_os("CARRICK_CORE_FAILPOINT").is_some_and(|value| value == "validator")
+            {
+                return Err(RuntimeError::Configuration(
+                    "core publication failpoint validator".to_owned(),
+                ));
+            }
+            use sha2::Digest as _;
+            let digest: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+            let hash_words = [
+                u64::from_be_bytes(digest[0..8].try_into().expect("SHA-256 word")),
+                u64::from_be_bytes(digest[8..16].try_into().expect("SHA-256 word")),
+                u64::from_be_bytes(digest[16..24].try_into().expect("SHA-256 word")),
+                u64::from_be_bytes(digest[24..32].try_into().expect("SHA-256 word")),
+            ];
+            crate::probes::hvpatch_core_census(
+                generation,
+                mapping_count,
+                4_u64.saturating_add(thread_count.saturating_mul(3)),
+                region_count,
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            );
+            crate::probes::hvpatch_core_hash(generation, hash_words);
+            lifecycle(3, 0);
+            let publication = kernel
+                .dispatcher
+                .publish_core_atomic(&process, generation, bytes)
+                .map_err(|error| {
+                    RuntimeError::FsBackend(anyhow::anyhow!("publish core: {error}"))
+                })?;
+            lifecycle(4, 0);
+            Ok(Some(publication))
+        })();
+        if result.is_err() || matches!(&result, Ok(None)) {
+            lifecycle(6, if result.is_err() { 1 } else { 2 });
+        }
+        advertised.store(0, std::sync::atomic::Ordering::Release);
+        if quiesced {
+            barrier.end_quiesce();
+        }
+        barrier.end_fork();
+        result
     }
 
     fn park_if_fork_quiescing(&self) {
@@ -2955,12 +3399,29 @@ where
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         ProcessVcpuLiveGuard(&kernel.process_vcpu_live)
     });
+    let kernel_thread = if kernel.hvpatch_process.is_some() {
+        Some(Arc::clone(
+            kernel
+                .dispatcher
+                .capture_kernel_context(linux_tid)
+                .map_err(|error| {
+                    RuntimeError::Configuration(format!(
+                        "bind HVPatch crash-register authority: {error}"
+                    ))
+                })?
+                .thread(),
+        ))
+    } else {
+        None
+    };
     let mut state = ThreadRuntimeState::new(
         registry,
         futex,
         platform_futex,
         platform_futex_factory,
         kernel.process_fork_barrier.clone(),
+        kernel.crash_capture_generation.clone(),
+        kernel_thread,
         linux_tid,
         this_tid,
         threads,
@@ -3273,6 +3734,12 @@ where
                             kernel.dispatcher.cleanup_sysv_ipc_on_process_exit();
                             forked_child_die_by_signal(11, &out, &err);
                         }
+                        kernel.record_fatal_signal(FatalSignalRecord {
+                            tid: state.linux_tid,
+                            signo: crate::linux_abi::LINUX_SIGSEGV,
+                            code: 0,
+                            addr: far,
+                        });
                         let result = assemble_run_result(
                             &kernel,
                             128 + 11,
@@ -3880,6 +4347,53 @@ where
                 Ok(VcpuLoopOutcome::ThreadDone) => unreachable!("non-terminal outcome"),
             };
 
+            // A losing fatal thread may race another terminal transition up to
+            // clone-admission close. Never attach its crash authority to the
+            // winning owner's normal exit (or to a different fatal owner): an
+            // ambiguous race is an honest no-core outcome.
+            let terminating_signal = match &result {
+                Ok(VcpuLoopOutcome::ProcessExit(run)) => run.terminating_signal,
+                Ok(VcpuLoopOutcome::TrapLimit(_) | VcpuLoopOutcome::ThreadDone) | Err(_) => None,
+            };
+            let fatal_signal = fatal_for_terminal_owner(
+                *kernel.fatal_signal.lock(),
+                state.linux_tid,
+                terminating_signal,
+            );
+            let core_publication = match fatal_signal {
+                Some(fatal) => match state.capture_and_publish_core(&kernel, &mut engine, fatal) {
+                    Ok(publication) => publication,
+                    Err(error) => {
+                        // Core publication is fail-closed but cannot turn a
+                        // guest signal death into a host/runtime abort. The
+                        // parent receives the original signal with WCOREDUMP
+                        // clear, and no final-path artifact survives.
+                        tracing::warn!(
+                            pid = kernel
+                                .hvpatch_process
+                                .as_ref()
+                                .map_or(0, crate::hvpatch::ProcessContext::pid),
+                            %error,
+                            "HVPatch core publication failed closed"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+            let core_dumped = core_publication.is_some();
+            if let Some(publication) = &core_publication {
+                tracing::info!(
+                    pid = kernel
+                        .hvpatch_process
+                        .as_ref()
+                        .map_or(0, crate::hvpatch::ProcessContext::pid),
+                    path = %publication.path,
+                    bytes = publication.bytes,
+                    "published HVPatch Linux core"
+                );
+            }
+
             if let Err(error) = state.terminate_siblings_for_process_exit(&kernel) {
                 tracing::error!(%error, "terminal owner could not drain sibling vCPUs");
                 std::process::abort();
@@ -3974,15 +4488,10 @@ where
                         }
                     }
                 }
-                // The wait status is built from the RunResult, which knows
-                // whether a signal killed this process. `core_dumped` is false
-                // until the crash path writes an actual ELF core — setting the
-                // bit without producing a file is the divergence
-                // `conformance-probes/src/bin/coredumpfile.rs` exists to gate,
-                // and it is decided HERE so the bit and the file can only ever
-                // be decided together.
+                // Publication and the wait bit share the same value. A failed
+                // capture/write/rename therefore cannot leave WCOREDUMP set.
                 let published_status = crate::kernel::LinuxWaitStatus::from_wait_encoding(
-                    final_result.wait_status_encoding(false),
+                    final_result.wait_status_encoding(core_dumped),
                 );
                 let current_parent = match process.publish_exit_status(published_status) {
                     Ok(parent) => parent,
@@ -3995,6 +4504,15 @@ where
                         std::process::abort();
                     }
                 };
+                if let Some(publication) = &core_publication {
+                    crate::probes::hvpatch_core_lifecycle(
+                        5,
+                        process.pid(),
+                        fatal_signal.map_or(state.this_tid.raw(), |fatal| fatal.tid.raw()),
+                        publication.generation,
+                        0,
+                    );
+                }
                 kernel
                     .dispatcher
                     .retire_hvpatch_process_fds(&terminal_context);
@@ -4282,6 +4800,12 @@ fn service_signals_threaded<E: ThreadedEngine>(
                     let err = kernel.dispatcher.stderr();
                     forked_child_die_by_signal(signum, &out, &err);
                 }
+                kernel.record_fatal_signal(FatalSignalRecord {
+                    tid: context.thread().key().tid,
+                    signo: signum,
+                    code: 0,
+                    addr: 0,
+                });
                 let result = assemble_run_result(kernel, 128 + signum, Some(signum), traps, false);
                 return Ok(Some(VcpuLoopOutcome::ProcessExit(Box::new(result))));
             }
@@ -4319,6 +4843,30 @@ mod tests {
         crate::kernel::Kernel::bootstrap_root(bootstrap)
             .expect("root kernel")
             .1
+    }
+
+    #[test]
+    fn fatal_core_authority_belongs_only_to_the_matching_terminal_owner() {
+        let context = alias_context(67_104);
+        let owner = context.thread().key().tid;
+        let fatal = FatalSignalRecord {
+            tid: owner,
+            signo: 11,
+            code: 1,
+            addr: 0,
+        };
+        assert_eq!(
+            fatal_for_terminal_owner(Some(fatal), owner, Some(11)),
+            Some(fatal)
+        );
+        assert_eq!(fatal_for_terminal_owner(Some(fatal), owner, None), None);
+
+        let other = alias_context(67_105).thread().key().tid;
+        assert_eq!(
+            fatal_for_terminal_owner(Some(fatal), other, Some(11)),
+            None,
+            "a losing fatal thread cannot core-dump the winning owner"
+        );
     }
 
     fn mock_alias_commit(

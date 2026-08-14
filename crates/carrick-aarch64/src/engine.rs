@@ -1717,6 +1717,50 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         })
     }
 
+    fn aarch64_core_registers(
+        &self,
+    ) -> Result<Option<carrick_hal::Aarch64CoreRegisters>, TrapError> {
+        let snapshot = self.vcpu.snapshot()?;
+        Ok(Some(carrick_hal::Aarch64CoreRegisters {
+            gprs: snapshot.gprs,
+            sp_el0: snapshot.sp_el0,
+            pc: snapshot.pc,
+            pstate: snapshot.pstate,
+            elr_el1: snapshot.elr_el1,
+            spsr_el1: snapshot.spsr_el1,
+            tpidr_el0: snapshot.tpidr_el0,
+            vregs: snapshot.vregs,
+            fpsr: snapshot.fpsr,
+            fpcr: snapshot.fpcr,
+        }))
+    }
+
+    fn prepare_core_snapshot(&mut self) -> Result<(), TrapError> {
+        if self.page_tables.lock().is_none() {
+            // Persistent exec intentionally defers the software observer until
+            // the first edit. Core capture needs a read-only live walk even if
+            // this process never called mmap/mprotect after exec. The no-op
+            // edit initializes from TTBR backing, writes nothing, and performs
+            // no TLBI.
+            self.pt_edit(|_| Ok(false)).map_err(|error| {
+                TrapError::Hypervisor(format!("load live page tables for core snapshot: {error}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn read_core_bytes(
+        &self,
+        address: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+        // `capture_and_publish_core` has already joined this range to a
+        // quiesced, readable Linux VMA. Use the backing-only path so the
+        // syscall EFAULT metadata for the larger hidden heap reservation does
+        // not reject its live `[heap_base, brk)` prefix.
+        <Self as GuestMemory>::read_bytes_raw(self, address, length)
+    }
+
     fn diagnostic_fault_page_tables(&self, far: u64) -> Option<(u64, [u64; 4])> {
         const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
         let ttbr = self.vcpu.get_sys_reg(SysReg::Ttbr0).ok()?;
