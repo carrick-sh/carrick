@@ -270,11 +270,11 @@ parked set. Every row names the ONE thing that unblocks its next step.
 
 | phase | status | landed | next concrete step |
 |---|---|---|---|
-| **KI** kernel identity *(new)* | **step 1 DONE; mechanism settled by measurement** | every host-pid comparator closed, incl. the live `libc::kill` hazard; canonical self-check now resolves the caller | **step 2: seed the root at 1** in `hvpatch/mod.rs:626` — pgid/sid follow for free |
+| **KI** kernel identity *(new)* | **step 1 DONE; blocker 2 of 3 CLEARED** | comparators closed; **cross-process signal delivery now runs through the kernel** — `killpg`/broadcast never reach the host | clear the remaining two reseed blockers (the `debug_assert`, the xsig nudge), then **seed the root at 1** |
 | **KP** conformance proof | **started** | kernel lane added to the harness; first gate: **304 PASS / 90 FAIL**, 26 kernel-lane-specific | bless `baseline.hvpatch.jsonl`; close the 26, largest cluster first |
 | **KD** diagnostics | **partial** | ELF core writer + validator; crash reports as signal death, oracle-matched | build a `CoreDump` from live state — a correct first slice needs NO memory plumbing |
 | **KL** lifecycle | **partial** | per-task user AND system CPU, oracle-matched; `CLONE_PIDFD` scoping; concurrent sibling fork | `ru_maxrss`/`ru_majflt` still host-sourced; per-task `/proc` authority |
-| **KX** kernel exec | **partly built** | Kernel two-phase exec transaction LIVE; three image caches default-on | **correctness half only**: does exec failure leave the old image valid? |
+| **KX** kernel exec | **partly built; correctness clause now ANSWERED** | Kernel two-phase exec transaction LIVE; three image caches default-on | **fix B1–B6**: six pre-commit failures kill the caller with exit 127 instead of returning an errno ([audit](docs/perf-results/2026-08-13-exec-failure-atomicity-audit.md)) |
 
 ### Parked — performance-only, off the critical path
 
