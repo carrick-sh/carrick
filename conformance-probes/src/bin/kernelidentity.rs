@@ -204,15 +204,15 @@ fn pid_one_terminal_stop_immunity_case(parent_pid: i32) -> bool {
         && child_sends_parent_terminal_stop(parent_pid, true)
 }
 
-fn job_control_case(parent_pid: i32) -> [bool; 7] {
+fn job_control_case(parent_pid: i32) -> [bool; 8] {
     let Some(ready) = make_pipe() else {
-        return [false; 7];
+        return [false; 8];
     };
     let Some(release) = make_pipe() else {
-        return [false; 7];
+        return [false; 8];
     };
     let Some(resumed) = make_pipe() else {
-        return [false; 7];
+        return [false; 8];
     };
     let child = unsafe { libc::fork() };
     if child == 0 {
@@ -232,7 +232,7 @@ fn job_control_case(parent_pid: i32) -> [bool; 7] {
         libc::close(resumed[1]);
     }
     if child <= 0 || exact_read(ready[0]) != Some(1) {
-        return [false; 7];
+        return [false; 8];
     }
 
     let stop_sent = unsafe { libc::kill(child, libc::SIGSTOP) } == 0;
@@ -242,7 +242,12 @@ fn job_control_case(parent_pid: i32) -> [bool; 7] {
     // Reaching this exact task identity after the child stopped proves the
     // sender stayed runnable; a host-process SIGSTOP would park both tasks.
     let parent_runnable = stopped && unsafe { libc::getpid() } == parent_pid;
-    let continue_sent = parent_runnable && unsafe { libc::kill(child, libc::SIGCONT) } == 0;
+    // Linux discards this second pending stop when SIGCONT is generated. If it
+    // survives in Carrick, the child immediately stops again after WCONTINUED
+    // and never acknowledges the release pipe below.
+    let repeated_stop_sent =
+        parent_runnable && unsafe { libc::kill(child, libc::SIGSTOP) } == 0;
+    let continue_sent = repeated_stop_sent && unsafe { libc::kill(child, libc::SIGCONT) } == 0;
     let continued = continue_sent
         && wait_status(child, libc::WCONTINUED).is_some_and(|status| libc::WIFCONTINUED(status));
     let released = continued && exact_write(release[1], 1);
@@ -252,6 +257,7 @@ fn job_control_case(parent_pid: i32) -> [bool; 7] {
         stop_sent,
         stopped,
         parent_runnable,
+        repeated_stop_sent,
         continue_sent,
         continued,
         child_resumed,
@@ -637,10 +643,11 @@ fn main() {
         job_control_stop_send_succeeded = job_control[0],
         job_control_wait_reported_sigstop = job_control[1],
         job_control_sender_remained_runnable = job_control[2],
-        job_control_continue_send_succeeded = job_control[3],
-        job_control_wait_reported_continued = job_control[4],
-        job_control_child_resumed = job_control[5],
-        job_control_child_exited_zero = job_control[6],
+        job_control_repeated_stop_send_succeeded = job_control[3],
+        job_control_continue_send_succeeded = job_control[4],
+        job_control_wait_reported_continued = job_control[5],
+        job_control_child_resumed = job_control[6],
+        job_control_child_exited_zero = job_control[7],
         credential_positive_signal_zero_denied = credential_results[0],
         credential_tgkill_signal_zero_denied = credential_results[1],
         credential_group_signal_zero_denied = credential_results[2],

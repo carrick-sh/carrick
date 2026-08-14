@@ -1643,6 +1643,25 @@ impl PendingQueue {
         self.assert_invariants();
     }
 
+    /// Discard every pending instance whose signal is in `signals`.
+    ///
+    /// Linux job-control generation uses this for its task-wide cancellation
+    /// rule: generating SIGCONT discards every pending stop signal, while
+    /// generating a stop signal discards every pending SIGCONT.
+    pub fn discard(&mut self, signals: SigSet) -> bool {
+        let discarded = !self.present.intersect(signals).is_empty();
+        if !discarded {
+            return false;
+        }
+        self.present = self.present.difference(signals);
+        self.standard_siginfos
+            .retain(|signal, _| !signals.contains(signal.raw()));
+        self.realtime
+            .retain(|signal, _| !signals.contains(signal.raw()));
+        self.assert_invariants();
+        true
+    }
+
     pub fn entries(&self) -> Vec<PendingSignal> {
         let mut entries = Vec::new();
         for raw in 1..=64 {
@@ -1778,6 +1797,13 @@ impl TaskPendingSignals {
         let mut queue = self.queue.lock();
         if *queue != replacement {
             *queue = replacement;
+            self.publish_queue(&queue);
+        }
+    }
+
+    pub(super) fn discard(&self, signals: SigSet) {
+        let mut queue = self.queue.lock();
+        if queue.discard(signals) {
             self.publish_queue(&queue);
         }
     }
@@ -2008,6 +2034,15 @@ impl ThreadSignalState {
         self.pending.take_lowest_in(wanted)
     }
 
+    pub(super) fn discard_pending(&mut self, signals: SigSet) {
+        if self.pending.discard(signals) {
+            self.routed_siginfos
+                .retain(|signal, _| !signals.contains(signal.raw()));
+            self.pending_actions
+                .retain(|signal, _| !signals.contains(signal.raw()));
+        }
+    }
+
     pub const fn altstack(&self) -> Option<LinuxSigaltstack> {
         self.altstack
     }
@@ -2211,11 +2246,20 @@ struct TaskIdentity {
     session: SessionId,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum DefaultStopGeneration {
+    #[default]
+    None,
+    Pending,
+    Cancelled,
+}
+
 #[derive(Debug, Default)]
 struct TaskJobControl {
     stopped_by: Option<LinuxSignal>,
     pending_stop: Option<LinuxSignal>,
     pending_continue: bool,
+    default_stop_generation: DefaultStopGeneration,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2257,6 +2301,7 @@ pub struct Task {
     process_credentials: ArcSwap<Credentials>,
     /// Guest job-control state is task scoped. HVPatch cannot lower it to host
     /// SIGSTOP/SIGCONT because all guest tasks share one Darwin process.
+    signal_generation: Mutex<()>,
     job_control: Mutex<TaskJobControl>,
     job_control_changed: Condvar,
     shared: ArcSwap<TaskShared>,
@@ -2313,6 +2358,7 @@ impl Task {
             }),
             lifecycle: Mutex::new(TaskLifecycle::Live),
             process_credentials: ArcSwap::new(process_credentials),
+            signal_generation: Mutex::new(()),
             job_control: Mutex::new(TaskJobControl::default()),
             job_control_changed: Condvar::new(),
             shared: ArcSwap::new(shared),
@@ -2473,6 +2519,67 @@ impl Task {
         self.job_control.lock().stopped_by.is_some()
     }
 
+    /// Serialize Linux job-control generation and delivery-state transitions
+    /// for this task. The guard is deliberately task-local: distinct Linux
+    /// processes in HVPatch remain independent even though they share one host
+    /// carrier.
+    pub(super) fn lock_signal_generation(&self) -> MutexGuard<'_, ()> {
+        self.signal_generation.lock()
+    }
+
+    /// Apply Linux's task-wide job-control pending-set cancellation rule while
+    /// the caller holds [`Self::lock_signal_generation`]. Both the shared
+    /// process queue and every live thread queue participate regardless of
+    /// whether the newly generated signal itself is process- or thread-directed.
+    pub(super) fn discard_opposing_job_control_signals(&self, signal: LinuxSignal) {
+        let signals = if signal.raw() == carrick_abi::LINUX_SIGCONT {
+            SigSet::EMPTY
+                .with(carrick_abi::LINUX_SIGSTOP)
+                .with(carrick_abi::LINUX_SIGTSTP)
+                .with(carrick_abi::LINUX_SIGTTIN)
+                .with(carrick_abi::LINUX_SIGTTOU)
+        } else if matches!(
+            signal.raw(),
+            carrick_abi::LINUX_SIGSTOP
+                | carrick_abi::LINUX_SIGTSTP
+                | carrick_abi::LINUX_SIGTTIN
+                | carrick_abi::LINUX_SIGTTOU
+        ) {
+            SigSet::EMPTY.with(carrick_abi::LINUX_SIGCONT)
+        } else {
+            SigSet::EMPTY
+        };
+        if signals.is_empty() {
+            return;
+        }
+        self.shared().pending_signals().discard(signals);
+        for thread in self.threads() {
+            thread.update_signal_state(|state| state.discard_pending(signals));
+        }
+    }
+
+    /// Record generation ordering for the narrow dequeue-to-default-action
+    /// window. A SIGCONT can race after a vCPU removes a stop signal from its
+    /// pending queue but before that vCPU applies the default stop. Remembering
+    /// the cancellation lets the later action fail closed instead of re-stopping
+    /// a task after the continue.
+    pub(super) fn record_job_control_signal_generation(&self, signal: LinuxSignal) {
+        let mut state = self.job_control.lock();
+        if matches!(
+            signal.raw(),
+            carrick_abi::LINUX_SIGSTOP
+                | carrick_abi::LINUX_SIGTSTP
+                | carrick_abi::LINUX_SIGTTIN
+                | carrick_abi::LINUX_SIGTTOU
+        ) {
+            state.default_stop_generation = DefaultStopGeneration::Pending;
+        } else if signal.raw() == carrick_abi::LINUX_SIGCONT
+            && state.default_stop_generation == DefaultStopGeneration::Pending
+        {
+            state.default_stop_generation = DefaultStopGeneration::Cancelled;
+        }
+    }
+
     /// Publish one default-stop transition and a waitable child-state event.
     /// Repeated stop signals while already stopped do not manufacture another
     /// WUNTRACED report.
@@ -2485,6 +2592,16 @@ impl Task {
             return false;
         }
         let mut state = self.job_control.lock();
+        match state.default_stop_generation {
+            DefaultStopGeneration::Cancelled => {
+                state.default_stop_generation = DefaultStopGeneration::None;
+                return true;
+            }
+            DefaultStopGeneration::Pending => {
+                state.default_stop_generation = DefaultStopGeneration::None;
+            }
+            DefaultStopGeneration::None => {}
+        }
         if state.stopped_by.is_some() {
             return true;
         }
@@ -2540,6 +2657,7 @@ impl Task {
     }
 
     pub(super) fn begin_exit(&self) -> bool {
+        let _generation = self.signal_generation.lock();
         {
             let mut lifecycle = self.lifecycle.lock();
             if *lifecycle == TaskLifecycle::Exiting {
