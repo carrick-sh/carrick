@@ -76,6 +76,39 @@ fn should_update_host_process_title(is_hvpatch: bool) -> bool {
     !is_hvpatch
 }
 
+/// Diagnostic-only deterministic failures for the three fallible inventory
+/// steps that follow HVPatch sibling teardown. The optional `@PATH` suffix
+/// limits injection to one guest exec target, so a container launcher can
+/// reach the probe before its child crosses the failure point.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HvpatchExecInventoryFailureInjection {
+    OldCapacity,
+    ReplacementReservation,
+    BeginInventory,
+}
+
+fn hvpatch_exec_inventory_failure_injection(
+    path: &str,
+) -> Option<HvpatchExecInventoryFailureInjection> {
+    let configured = std::env::var("CARRICK_HVPATCH_EXEC_INVENTORY_FAILURE").ok()?;
+    let (name, target) = configured
+        .split_once('@')
+        .map_or((configured.as_str(), None), |(name, target)| {
+            (name, Some(target))
+        });
+    if target.is_some_and(|target| target != path) {
+        return None;
+    }
+    match name {
+        "old-capacity" => Some(HvpatchExecInventoryFailureInjection::OldCapacity),
+        "replacement-reservation" => {
+            Some(HvpatchExecInventoryFailureInjection::ReplacementReservation)
+        }
+        "begin-inventory" => Some(HvpatchExecInventoryFailureInjection::BeginInventory),
+        _ => None,
+    }
+}
+
 /// Fail-closed, opt-in proof that the image Carrick prepared for `execve` is
 /// the image its freshly rebuilt engine exposes before the vCPU re-enters the
 /// guest.  This deliberately reads through `ThreadedEngine::read_bytes`, the
@@ -200,7 +233,12 @@ where
         );
         let sigsegv = crate::linux_abi::LINUX_SIGSEGV;
         if super::requires_no_unwind_host_exit(kernel, engine.is_forked_child()) {
-            engine.process_exit_cleanup()?;
+            if let Err(error) = engine.process_exit_cleanup() {
+                tracing::error!(
+                    %error,
+                    "post-exec-failure engine cleanup failed; preserving SIGSEGV terminal shape"
+                );
+            }
             let out = kernel.dispatcher.stdout();
             let err = kernel.dispatcher.stderr();
             crate::exec_helpers::forked_child_die_by_signal(sigsegv, &out, &err);
@@ -254,6 +292,10 @@ where
             });
         match loaded {
             Ok(img) => {
+                let inventory_failure_injection = kernel
+                    .hvpatch_process
+                    .as_ref()
+                    .and_then(|_| hvpatch_exec_inventory_failure_injection(&path));
                 // Close thread-clone admission across the full destructive
                 // exec transaction. Every pre-existing permit must either
                 // publish a handle-visible started child or roll back before
@@ -359,24 +401,65 @@ where
                 // any pre-replacement failure abandons both runtime records and
                 // dropping `prepared_kernel_exec` rolls back Kernel preparation.
                 let _inventory_abandon = if let Some(process) = kernel.hvpatch_process.as_ref() {
-                    let (old_extent_count, replacement_extent_count) =
+                    let (mut old_extent_count, replacement_extent_count) =
                         engine.frame_inventory_exec_extent_counts(&img);
+                    if inventory_failure_injection
+                        == Some(HvpatchExecInventoryFailureInjection::OldCapacity)
+                    {
+                        old_extent_count =
+                            carrick_hal::MAX_FRAME_INVENTORY_EVENTS_PER_BATCH / 2 + 1;
+                    }
                     let old_capacity =
-                        super::quiesce::inventory_capacity_for_extents(old_extent_count)?;
-                    let replacement_capacity =
-                        super::quiesce::inventory_capacity_for_extents(replacement_extent_count)?;
-                    let retired = process
-                        .kernel_graph()
-                        .reserve_frame_inventory(0, 0, old_capacity)
-                        .map_err(|error| {
-                            RuntimeError::Configuration(format!(
-                                "reserve HVPatch exec retirement inventory: {error}"
-                            ))
-                        })?;
+                        match super::quiesce::inventory_capacity_for_extents(old_extent_count) {
+                            Ok(capacity) => capacity,
+                            Err(error) => {
+                                return Self::exec_failed_past_no_return(
+                                    kernel,
+                                    engine,
+                                    &format!("size HVPatch exec retirement inventory: {error}"),
+                                )
+                                .map(Some);
+                            }
+                        };
+                    let replacement_capacity = match super::quiesce::inventory_capacity_for_extents(
+                        replacement_extent_count,
+                    ) {
+                        Ok(capacity) => capacity,
+                        Err(error) => {
+                            return Self::exec_failed_past_no_return(
+                                kernel,
+                                engine,
+                                &format!("size HVPatch exec replacement inventory: {error}"),
+                            )
+                            .map(Some);
+                        }
+                    };
+                    let retired =
+                        match process
+                            .kernel_graph()
+                            .reserve_frame_inventory(0, 0, old_capacity)
+                        {
+                            Ok(reservation) => reservation,
+                            Err(error) => {
+                                return Self::exec_failed_past_no_return(
+                                    kernel,
+                                    engine,
+                                    &format!("reserve HVPatch exec retirement inventory: {error}"),
+                                )
+                                .map(Some);
+                            }
+                        };
                     let retired_transaction = retired.transaction();
+                    let replacement_candidate_count = if inventory_failure_injection
+                        == Some(HvpatchExecInventoryFailureInjection::ReplacementReservation)
+                    {
+                        replacement_capacity.get() + 1
+                    } else {
+                        replacement_extent_count
+                    };
                     let replacement = match process.kernel_graph().reserve_frame_inventory(
-                        replacement_extent_count,
-                        replacement_extent_count,
+                        replacement_candidate_count,
+                        replacement_candidate_count,
                         replacement_capacity,
                     ) {
                         Ok(reservation) => reservation,
@@ -385,9 +468,12 @@ where
                                 .kernel_graph()
                                 .frame_inventory()
                                 .abandon(retired_transaction);
-                            return Err(RuntimeError::Configuration(format!(
-                                "reserve HVPatch exec replacement inventory: {error}"
-                            )));
+                            return Self::exec_failed_past_no_return(
+                                kernel,
+                                engine,
+                                &format!("reserve HVPatch exec replacement inventory: {error}"),
+                            )
+                            .map(Some);
                         }
                     };
                     let replacement_transaction = replacement.transaction();
@@ -395,9 +481,25 @@ where
                         process.kernel_graph().frame_inventory(),
                         [retired_transaction, replacement_transaction],
                     );
-                    engine
-                        .begin_exec_inventory(retired, replacement)
-                        .map_err(RuntimeError::Trap)?;
+                    if inventory_failure_injection
+                        == Some(HvpatchExecInventoryFailureInjection::BeginInventory)
+                    {
+                        drop((retired, replacement));
+                        return Self::exec_failed_past_no_return(
+                            kernel,
+                            engine,
+                            "injected HVPatch begin_exec_inventory failure",
+                        )
+                        .map(Some);
+                    }
+                    if let Err(error) = engine.begin_exec_inventory(retired, replacement) {
+                        return Self::exec_failed_past_no_return(
+                            kernel,
+                            engine,
+                            &format!("arm HVPatch exec frame inventory: {error}"),
+                        )
+                        .map(Some);
+                    }
                     Some(abandon)
                 } else {
                     None
@@ -459,15 +561,15 @@ where
                 // frame-inventory authority lock.
                 drop(_hvpatch_topology);
                 if let Some(process) = kernel.hvpatch_process.as_ref() {
-                    let (retired_commit, replacement_commit) =
-                        engine.take_exec_inventory().unwrap_or_else(|| {
-                            tracing::error!(
-                                ?old_mm_id,
-                                ?replacement_mm_id,
-                                "HVPatch destructive exec produced no frame inventory commits"
-                            );
-                            std::process::abort();
-                        });
+                    let Some((retired_commit, replacement_commit)) = engine.take_exec_inventory()
+                    else {
+                        return Self::exec_failed_past_no_return(
+                            kernel,
+                            engine,
+                            "HVPatch destructive exec produced no frame inventory commits",
+                        )
+                        .map(Some);
+                    };
                     if let Err(error) = apply_exec_inventory(
                         old_mm_id,
                         replacement_mm_id,
@@ -481,13 +583,14 @@ where
                                 .map(|_| ())
                         },
                     ) {
-                        tracing::error!(
-                            ?old_mm_id,
-                            ?replacement_mm_id,
-                            %error,
-                            "apply HVPatch exec frame inventory"
-                        );
-                        std::process::abort();
+                        return Self::exec_failed_past_no_return(
+                            kernel,
+                            engine,
+                            &format!(
+                                "apply HVPatch exec frame inventory for old mm {old_mm_id:?} and replacement mm {replacement_mm_id:?}: {error}"
+                            ),
+                        )
+                        .map(Some);
                     }
                 }
                 let old_files = prepared_kernel_exec.old_file_table();
@@ -498,11 +601,14 @@ where
                             let stage1_root = match engine.get_sys_reg(carrick_hal::SysReg::Ttbr0) {
                                 Ok(root) => root & TTBR_ROOT_MASK,
                                 Err(error) => {
-                                    tracing::error!(
-                                        %error,
-                                        "read HVPatch stage-1 root after destructive exec"
-                                    );
-                                    std::process::abort();
+                                    return Self::exec_failed_past_no_return(
+                                    kernel,
+                                    engine,
+                                    &format!(
+                                        "read HVPatch stage-1 root after destructive exec: {error}"
+                                    ),
+                                )
+                                .map(Some);
                                 }
                             };
                             process.commit_exec(
@@ -525,38 +631,57 @@ where
                         // The engine now runs the replacement image. Returning a
                         // guest-visible exec failure or resuming the old Kernel
                         // graph would create split lifecycle authority.
-                        tracing::error!(%error, "commit Kernel exec after image replacement");
-                        std::process::abort();
+                        return Self::exec_failed_past_no_return(
+                            kernel,
+                            engine,
+                            &format!("commit Kernel exec after image replacement: {error}"),
+                        )
+                        .map(Some);
                     }
                 };
+                emit_runtime_stage(
+                    carrick_observability::probes::HvpatchExecRuntimeStagePhase::EngineReplace,
+                    engine_replace_started,
+                );
+                let close_cloexec_started = std::time::Instant::now();
                 kernel
                     .dispatcher
                     .close_draining_file_table(committed_context.kernel(), &old_files);
+                emit_runtime_stage(
+                    carrick_observability::probes::HvpatchExecRuntimeStagePhase::CloseCloexec,
+                    close_cloexec_started,
+                );
                 self.linux_tid = committed_context.thread().key().tid;
                 // The common run-loop signal boundary must consume the exact
                 // replacement generation, never the pre-exec context retained
                 // at syscall entry. A failed exec leaves that entry context in
                 // place; only a committed image replacement publishes here.
                 self.service_kernel_context = Some(committed_context.retain_exact());
-                emit_runtime_stage(
-                    carrick_observability::probes::HvpatchExecRuntimeStagePhase::EngineReplace,
-                    engine_replace_started,
-                );
                 let publication_started = std::time::Instant::now();
                 if kernel.hvpatch_process.is_some()
                     && std::env::var_os("CARRICK_HVPATCH_VERIFY_EXEC_CODE").is_some()
                 {
-                    verify_published_exec_image(engine, &img, &path)?;
+                    if let Err(error) = verify_published_exec_image(engine, &img, &path) {
+                        return Self::exec_failed_past_no_return(
+                            kernel,
+                            engine,
+                            &format!("verify published HVPatch exec image: {error}"),
+                        )
+                        .map(Some);
+                    }
                 }
                 crate::namespace::pid::mark_self_execed();
                 // execve_into rebuilt a fresh vCPU: re-stamp the identity page
                 // (zeroed) and TPIDR_EL1 (reset) for the same thread/tid.
                 stamp_identity_page(engine, &kernel.dispatcher, &committed_context);
-                engine
-                    .set_guest_thread_id(self.linux_tid.raw() as u64)
-                    .map_err(|error| {
-                        RuntimeError::Trap(TrapError::Hypervisor(error.to_string()))
-                    })?;
+                if let Err(error) = engine.set_guest_thread_id(self.linux_tid.raw() as u64) {
+                    return Self::exec_failed_past_no_return(
+                        kernel,
+                        engine,
+                        &format!("publish HVPatch guest thread identity: {error}"),
+                    )
+                    .map(Some);
+                }
                 emit_runtime_stage(
                     carrick_observability::probes::HvpatchExecRuntimeStagePhase::Publication,
                     publication_started,
@@ -571,8 +696,8 @@ where
                 // vfork: the execve SUCCEEDED and we now have our own private VM.
                 // Release the suspended parent by writing one byte to the
                 // inherited pipe, then close it. A FAILED execve returns above via
-                // `?` WITHOUT releasing — the child then `_exit`s and the parent's
-                // `read()` gets EOF instead.
+                // a failure branch WITHOUT releasing — the child then `_exit`s
+                // and the parent's `read()` gets EOF instead.
                 if let Some(fd) = self.vfork_release_fd.take() {
                     let _ = unsafe { libc::write(fd, [0u8; 1].as_ptr().cast(), 1) };
                     unsafe { libc::close(fd) };

@@ -1360,6 +1360,26 @@ mod tests {
     }
 
     #[test]
+    fn hvpatch_exec_runtime_stages_profile_is_cli_selectable() {
+        let cli = Cli::try_parse_from([
+            "carrick",
+            "trace",
+            "--profile",
+            "hvpatch-exec-runtime-stages",
+            "--trace-out",
+            "/tmp/hvpatch-exec-runtime-stages.raw",
+            "--",
+            "run",
+            "fixture",
+        ])
+        .expect("HVPatch exec runtime-stage profile should parse");
+        let Commands::Trace { profile, .. } = cli.command else {
+            panic!("expected trace command");
+        };
+        assert_eq!(profile, Some(TraceProfileKind::HvpatchExecRuntimeStages));
+    }
+
+    #[test]
     fn native_shape_profile_parses_with_all_dedicated_outputs() {
         let cli = Cli::try_parse_from([
             "carrick",
