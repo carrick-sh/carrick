@@ -1426,6 +1426,7 @@ where
                 last_syscall_retval = Some(0);
             }
             DispatchOutcome::MapHostAlias {
+                success_retval,
                 transaction,
                 va,
                 ipa,
@@ -1496,7 +1497,7 @@ where
                         if dispatcher.commit_host_alias_install(install).is_err() {
                             std::process::abort();
                         }
-                        va.raw() as i64
+                        success_retval
                     }
                 };
                 runtime.complete_syscall(retval)?;

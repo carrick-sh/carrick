@@ -1446,6 +1446,11 @@ pub enum DispatchOutcome {
         va: GuestVa,
         ipa: Gpa,
         len: u64,
+        /// Value the syscall returns on success. `mmap` answers with the
+        /// mapped address; `mprotect`, which installs an alias lazily when it
+        /// commits a reservation that never had backing, must answer 0 — a
+        /// nonzero return there reads as failure to every libc wrapper.
+        success_retval: i64,
         /// Bytes to copy into the freshly-mapped region at offset 0 (the file
         /// content for a file-backed mmap; empty for anonymous, which the host
         /// anon mapping already zeroes). Ignored when `file` is `Some` — a live

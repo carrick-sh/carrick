@@ -2339,6 +2339,7 @@ impl SyscallDispatcher {
             ));
 
             Ok(DispatchOutcome::MapHostAlias {
+                success_retval: va as i64,
                 transaction,
                 va: GuestVa(va),
                 ipa: Gpa(ipa),

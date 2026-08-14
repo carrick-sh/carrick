@@ -10791,6 +10791,7 @@ fn service_syscall(
     };
     let outcome = match outcome {
         DispatchOutcome::MapHostAlias {
+            success_retval,
             transaction,
             va,
             len,
@@ -14255,6 +14256,7 @@ mod tests {
             )
             .expect("dispatch fixed host alias");
         let DispatchOutcome::MapHostAlias {
+            success_retval,
             transaction,
             va,
             len: mapped_len,

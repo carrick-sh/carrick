@@ -2639,6 +2639,7 @@ where
                     }
                 },
                 DispatchOutcome::MapHostAlias {
+                    success_retval,
                     transaction,
                     va,
                     ipa,
@@ -2742,7 +2743,7 @@ where
                         std::process::abort();
                     }
                     break Ok(DispatchOutcome::Returned {
-                        value: va.raw() as i64,
+                        value: success_retval,
                     });
                 }
                 other => break Ok(other),
@@ -3560,6 +3561,7 @@ where
                     last_syscall_retval = Some(state.complete_returned(&mut engine, 0)?);
                 }
                 DispatchOutcome::MapHostAlias {
+                    success_retval,
                     transaction,
                     va,
                     ipa,
@@ -3626,7 +3628,7 @@ where
                             {
                                 std::process::abort();
                             }
-                            va.raw() as i64
+                            success_retval
                         }
                     };
                     last_syscall_retval = Some(state.complete_returned(&mut engine, retval)?);
