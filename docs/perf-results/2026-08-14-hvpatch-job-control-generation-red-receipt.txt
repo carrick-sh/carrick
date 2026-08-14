@@ -1,0 +1,9 @@
+HVPATCH_TASK3_GENERATION_RED_V1
+source_commit=10e8a15bf65497cdf884bcd6ab3b072f3b02d9d1
+signed_binary_sha256=f7d56db370fe2873ddecd9030864279339c6760d506da98108bdb9f86dfaf061
+probe_sha256=9d9236ac5359426dea72f4e579b3f77ee20c9901c4d37ebbb7fcf5d37cc02ff1
+probe=kernelidentity reviewer-strengthened duplicate-SIGSTOP-before-SIGCONT variant
+command=CARRICK_EXEC_BACKEND=hvpatch CARRICK_PROBE_EXEC_AS_INIT=1 timeout -k 5 20 scripts/run-probe.sh kernelidentity
+CARRICK_PROBE_RUN_ID=cr-18213-27118
+result=outer hard timeout during the duplicate-SIGSTOP/SIGCONT sequence; no relationship stream; focused REDs independently exposed the stale pending stop and dequeue/action race
+cleanup=pass 1 killed 3 scoped processes; remaining carrick procs (run-id cr-18213-27118) = 0
