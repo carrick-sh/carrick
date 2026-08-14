@@ -158,6 +158,85 @@ unsafe fn hinted_high_commit_result(hint: usize) -> i32 {
     }
 }
 
+/// Does a high-hinted mapping actually WORK, even where `mprotect` calls it
+/// unmapped? Map it read-write directly — no trimming, no protection change —
+/// and round-trip a value through it.
+///
+/// This separates the two possible faults, which need different fixes:
+///   * `0` — the mapping is REAL and only carrick's bookkeeping is missing, so
+///     `mprotect` is consulting metadata that was never written;
+///   * a SIGSEGV — the address was handed out without being mapped at all.
+///
+/// Run last, because the second outcome kills the probe.
+unsafe fn hinted_high_rw_roundtrip(hint: usize) -> i32 {
+    unsafe {
+        let base = libc::mmap(
+            hint as *mut c_void,
+            COMMIT,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if base == libc::MAP_FAILED {
+            return -1;
+        }
+        if (base as usize) >> 32 != hint >> 32 {
+            libc::munmap(base, COMMIT);
+            return -3;
+        }
+        let cell = base as *mut u64;
+        let was_zero = cell.read_volatile() == 0;
+        cell.write_volatile(0xfeed_face_feed_face);
+        let ok = cell.read_volatile() == 0xfeed_face_feed_face;
+        libc::munmap(base, COMMIT);
+        if !was_zero {
+            -4
+        } else if ok {
+            0
+        } else {
+            -2
+        }
+    }
+}
+
+/// `mprotect` a high-hinted mapping that is DEFINITELY live: mapped read-write
+/// and proven writable a moment earlier. No trimming, no `PROT_NONE`.
+///
+/// If even this returns ENOMEM, the fault is not about trimming or about the
+/// mapping being absent — carrick's backing probe simply cannot see a high-VA
+/// mapping that the guest is demonstrably using.
+unsafe fn hinted_high_live_mprotect(hint: usize) -> i32 {
+    unsafe {
+        let base = libc::mmap(
+            hint as *mut c_void,
+            COMMIT,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if base == libc::MAP_FAILED {
+            return -1;
+        }
+        if (base as usize) >> 32 != hint >> 32 {
+            libc::munmap(base, COMMIT);
+            return -3;
+        }
+        // Prove it is live before asking to re-protect it.
+        let cell = base as *mut u64;
+        cell.write_volatile(0x1234);
+        if cell.read_volatile() != 0x1234 {
+            libc::munmap(base, COMMIT);
+            return -2;
+        }
+        let rc = libc::mprotect(base, COMMIT, libc::PROT_READ);
+        let out = if rc == 0 { 0 } else { *libc::__errno_location() };
+        libc::munmap(base, COMMIT);
+        out
+    }
+}
+
 fn main() {
     // The address V8 actually asked for, from the trace.
     report!(hinted_high_result = unsafe { hinted_high_commit_result(0x1382_8ed0_0000) });
@@ -209,4 +288,8 @@ fn main() {
         }
     };
     report!(untrimmed_control_errno = untrimmed);
+
+    report!(hinted_high_live_mprotect_errno = unsafe { hinted_high_live_mprotect(0x1382_8ed0_0000) });
+    // LAST: this faults if the address was never really mapped.
+    report!(hinted_high_rw_roundtrip = unsafe { hinted_high_rw_roundtrip(0x1382_8ed0_0000) });
 }

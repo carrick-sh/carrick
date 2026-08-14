@@ -2122,6 +2122,7 @@ impl SyscallDispatcher {
                     mm,
                 ));
                 return Ok(DispatchOutcome::MapHostAlias {
+                    success_retval: address as i64,
                     transaction,
                     va: GuestVa(address),
                     ipa: Gpa(ipa),
@@ -2498,6 +2499,7 @@ impl SyscallDispatcher {
                         },
                     ));
                     return Ok(DispatchOutcome::MapHostAlias {
+                        success_retval: va as i64,
                         transaction,
                         va: GuestVa(va),
                         ipa: Gpa(ipa),
@@ -3053,6 +3055,7 @@ impl SyscallDispatcher {
                     },
                 ));
                 return Ok(DispatchOutcome::MapHostAlias {
+                    success_retval: address as i64,
                     transaction,
                     va: GuestVa(address),
                     ipa: Gpa(ipa),
@@ -4040,6 +4043,58 @@ impl SyscallDispatcher {
             if metadata_says_unmapped
                 || (needs_backing_probe && cx.memory.read_bytes_raw(address.0, 1).is_err())
             {
+                // LAZY ALIAS COMMIT. An anonymous PROT_NONE reservation in the
+                // alias window is deliberately given no backing at `mmap` time
+                // — it is address space, not memory, and eagerly aliasing every
+                // reservation exhausts the 64 GiB alias IPA arena, which is
+                // never reused because arm64 HVF cannot flush stage-2 TLB.
+                // (Measured: eagerly aliasing them breaks `go build` with a
+                // child stage-1 VA→IPA mismatch.)
+                //
+                // So the backing is installed HERE, when the guest actually
+                // commits part of the reservation — which is what `mprotect`
+                // means. Only the committed subrange costs IPA. This is V8's
+                // `AllocateAlignedMemory` shape, and without it Node.js 22 dies
+                // in startup-snapshot deserialization: carrick's backing probe
+                // sees no backing, reads that as "no mapping", and answers
+                // ENOMEM where Linux commits and returns 0.
+                //
+                // `metadata_says_unmapped` still wins: a range explicitly
+                // munmapped is a real hole, and NULL and genuine holes keep
+                // answering ENOMEM (LTP mprotect01).
+                let layout = this.mem.lock().layout;
+                if !metadata_says_unmapped
+                    && !prot_flags.is_empty()
+                    && mmap_address_uses_alias(address.0, length, layout)
+                    && let Some(ipa) = crate::memory::alloc_alias_ipa(length)
+                {
+                    let transaction =
+                        host_alias_dispatch.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
+                            start: address.0,
+                            len: length,
+                            prot: prot_flags,
+                            sharing: crate::vfs::proc::ProcMapSharing::Private,
+                            path: String::new(),
+                            locked: None,
+                            resident: false,
+                            bus_fault: None,
+                            write_sealed_shared: false,
+                            writable_memfd: None,
+                        }));
+                    return Ok(DispatchOutcome::MapHostAlias {
+                        // mprotect answers 0, not the address.
+                        success_retval: 0,
+                        transaction,
+                        va: GuestVa(address.0),
+                        ipa: Gpa(ipa),
+                        len: length,
+                        payload: Vec::new(),
+                        file: None,
+                        shared: false,
+                        prot,
+                        prot_none: false,
+                    });
+                }
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
             // A shared mapping of a F_SEAL_WRITE memfd cannot be upgraded to
@@ -10170,6 +10225,7 @@ mod tests {
         assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
         let read_fd = pipe[0];
         let outcome = DispatchOutcome::MapHostAlias {
+            success_retval: 0,
             transaction,
             va: GuestVa(crate::memory::LINUX_HIGH_VA_THRESHOLD),
             ipa: Gpa(crate::memory::LINUX_ALIAS_IPA_BASE),

@@ -6765,6 +6765,7 @@ impl GuestMemory for NativeDispatchMemory<'_> {
 /// installs, moved out of the outcome so the install can be handed to
 /// [`install_native_host_alias`] as one value.
 struct NativeHostAliasInstall {
+    success_retval: i64,
     transaction: crate::dispatch::HostAliasTransaction,
     va: crate::dispatch::GuestVa,
     len: u64,
@@ -6791,6 +6792,7 @@ fn install_native_host_alias(
     install: NativeHostAliasInstall,
 ) -> i64 {
     let NativeHostAliasInstall {
+        success_retval,
         transaction,
         va,
         len,
@@ -6831,7 +6833,7 @@ fn install_native_host_alias(
             if dispatcher.commit_host_alias_install(install).is_err() {
                 std::process::abort();
             }
-            va.raw() as i64
+            success_retval
         }
     }
 }
@@ -6887,6 +6889,7 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
                 // guard and the cycle cannot form.
                 match outcome {
                     DispatchOutcome::MapHostAlias {
+                        success_retval,
                         transaction,
                         va,
                         ipa: _,
@@ -6900,6 +6903,7 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
                             dispatcher,
                             &mut memory,
                             NativeHostAliasInstall {
+                                success_retval,
                                 transaction,
                                 va,
                                 len,
