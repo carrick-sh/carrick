@@ -3453,7 +3453,20 @@ where
                             )
                         })?
                         .retain_exact();
-                    state.handle_execve(&kernel, &kernel_context, &mut engine, path, argv, env)?;
+                    // `Some` means the exec failed past its point of no return
+                    // and this Linux process is terminating; it must NOT be
+                    // discarded, or the loop would run on with a destroyed
+                    // thread group.
+                    if let Some(outcome) = state.handle_execve(
+                        &kernel,
+                        &kernel_context,
+                        &mut engine,
+                        path,
+                        argv,
+                        env,
+                    )? {
+                        return Ok(outcome);
+                    }
                 }
                 DispatchOutcome::SigReturn => {
                     let restored_sigmask = match engine.restore_from_sigframe() {

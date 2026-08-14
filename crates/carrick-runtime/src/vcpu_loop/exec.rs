@@ -175,6 +175,53 @@ impl<E: ThreadedEngine + 'static> ThreadRuntimeState<E>
 where
     E::SiblingSpec: 'static,
 {
+    /// Kill THIS guest process after an exec failure past the point of no
+    /// return, the way Linux's `force_sigsegv` does: WIFSIGNALED by SIGSEGV.
+    ///
+    /// Never `exit(127)`. 127 is WIFEXITED, so `wait(2)` reports a *normal*
+    /// exit and the parent cannot tell an internal carrick failure from a
+    /// program that chose to exit 127 — and 127 is precisely what a shell
+    /// reports for "command not found", so an exec that died inside carrick
+    /// was indistinguishable from a missing binary. Every caller here has
+    /// already destroyed the thread group, so returning to the guest is not an
+    /// option; dying with the right *shape* is.
+    ///
+    /// Kills only this Linux process, never the whole runtime: on the kernel
+    /// lane a host `abort()` would take down every other guest sharing the host
+    /// process.
+    fn exec_failed_past_no_return(
+        kernel: &Kernel,
+        engine: &mut E,
+        cause: &str,
+    ) -> Result<VcpuLoopOutcome, RuntimeError> {
+        tracing::error!(
+            cause,
+            "execve failed after the point of no return; killing the guest process by SIGSEGV"
+        );
+        let sigsegv = crate::linux_abi::LINUX_SIGSEGV;
+        if super::requires_no_unwind_host_exit(kernel, engine.is_forked_child()) {
+            engine.process_exit_cleanup()?;
+            let out = kernel.dispatcher.stdout();
+            let err = kernel.dispatcher.stderr();
+            crate::exec_helpers::forked_child_die_by_signal(sigsegv, &out, &err);
+        }
+        let result = super::assemble_run_result(kernel, 128 + sigsegv, Some(sigsegv), 0, false);
+        Ok(VcpuLoopOutcome::ProcessExit(Box::new(result)))
+    }
+
+    /// Fail the `execve` syscall itself, leaving the caller running its old
+    /// image. Only correct BEFORE the point of no return.
+    fn exec_failed_with_errno(
+        engine: &mut E,
+        errno: crate::linux_abi::LinuxErrno,
+    ) -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
+        engine.complete_syscall(errno.guest_retval())?;
+        Ok(None)
+    }
+
+    /// `Ok(None)` means the syscall finished — the image was replaced, or the
+    /// exec failed with an errno and the caller is still running its old
+    /// image. `Ok(Some(outcome))` means the process is terminating.
     pub(super) fn handle_execve(
         &mut self,
         kernel: &Kernel,
@@ -183,7 +230,7 @@ where
         path: String,
         argv: Vec<Vec<u8>>,
         env: Vec<Vec<u8>>,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
         if let Some(process) = kernel.hvpatch_process.as_ref() {
             process.trace_lifecycle(
                 carrick_observability::probes::HvpatchGuestLifecyclePhase::ExecBegin,
@@ -212,7 +259,29 @@ where
                 // publish a handle-visible started child or roll back before
                 // sibling census and VM replacement; Drop reopens only if a
                 // concurrent process exit did not promote the gate to Exit.
-                let _clone_admission = kernel.close_clone_admission_for_exec(self.this_tid)?;
+                let _clone_admission = match kernel.close_clone_admission_for_exec(self.this_tid) {
+                    Ok(admission) => admission,
+                    // BEFORE the point of no return: nothing has been destroyed
+                    // yet, so this is a syscall failure, not a dead process.
+                    // The drain is bounded by a wall-clock timeout, so this is
+                    // reachable under load — and it used to kill the caller.
+                    //
+                    // DIVERGENCE, stated plainly: Linux has no such drain and
+                    // would never fail `execve` here, so there is no faithful
+                    // errno. EAGAIN is the honest approximation — "resource
+                    // temporarily unavailable", which is retryable and which a
+                    // caller can act on. A dead process is not.
+                    Err(error) => {
+                        tracing::error!(
+                            %error,
+                            "execve clone-admission drain failed before the point of no return"
+                        );
+                        return Self::exec_failed_with_errno(
+                            engine,
+                            crate::linux_abi::LINUX_EAGAIN,
+                        );
+                    }
+                };
                 crate::probes::execve_loaded(
                     &path,
                     img.entry(),
@@ -238,8 +307,21 @@ where
                         }
                     };
                 let sibling_drain_started = std::time::Instant::now();
-                if self.registry.live_count() > 1 {
-                    self.terminate_siblings_for_exec(kernel, engine)?;
+                // THE POINT OF NO RETURN. Destroying the thread group cannot
+                // be undone, so from here `execve` must never return to the
+                // guest — the same place Linux puts it (`de_thread` inside
+                // `begin_new_exec`, after which Linux uses `force_sigsegv`).
+                // A partial drain leaves a half-dead thread group, so even this
+                // step's OWN failure is past the line.
+                if self.registry.live_count() > 1
+                    && let Err(error) = self.terminate_siblings_for_exec(kernel, engine)
+                {
+                    return Self::exec_failed_past_no_return(
+                        kernel,
+                        engine,
+                        &format!("terminate siblings for exec: {error}"),
+                    )
+                    .map(Some);
                 }
                 emit_runtime_stage(
                     carrick_observability::probes::HvpatchExecRuntimeStagePhase::SiblingDrain,
@@ -250,7 +332,7 @@ where
                 // precedes every destructive image, CLOEXEC, and proc-state
                 // mutation. From here, the prepared exec transaction is the
                 // sole owner of nonleader promotion and replacement Mm state.
-                let mut prepared_kernel_exec = match kernel.hvpatch_process.as_ref() {
+                let prepared_kernel_exec = match kernel.hvpatch_process.as_ref() {
                     Some(process) => process
                         .prepare_exec(kernel_context)
                         .map(RuntimePreparedExec::Hvpatch),
@@ -258,12 +340,18 @@ where
                         .dispatcher
                         .prepare_one_task_kernel_exec(kernel_context)
                         .map(RuntimePreparedExec::Other),
-                }
-                .map_err(|error| {
-                    RuntimeError::Configuration(format!(
-                        "prepare authoritative Kernel exec: {error}"
-                    ))
-                })?;
+                };
+                let mut prepared_kernel_exec = match prepared_kernel_exec {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        return Self::exec_failed_past_no_return(
+                            kernel,
+                            engine,
+                            &format!("prepare authoritative Kernel exec: {error}"),
+                        )
+                        .map(Some);
+                    }
+                };
                 let old_mm_id = prepared_kernel_exec.old_mm_id();
                 let replacement_mm_id = prepared_kernel_exec.replacement_mm_id();
                 // Allocate both complete transaction envelopes before proc-state
@@ -329,13 +417,14 @@ where
                 // retains the pre-staging snapshot, but records this deliberate
                 // source revision so commit can reject any later mutation.
                 apply_exec_image_proc_state(&kernel.dispatcher, &img);
-                prepared_kernel_exec
-                    .acknowledge_staged_vma_revision()
-                    .map_err(|error| {
-                        RuntimeError::Configuration(format!(
-                            "acknowledge staged exec VMA revision: {error}"
-                        ))
-                    })?;
+                if let Err(error) = prepared_kernel_exec.acknowledge_staged_vma_revision() {
+                    return Self::exec_failed_past_no_return(
+                        kernel,
+                        engine,
+                        &format!("acknowledge staged exec VMA revision: {error}"),
+                    )
+                    .map(Some);
+                }
                 emit_runtime_stage(
                     carrick_observability::probes::HvpatchExecRuntimeStagePhase::ProcState,
                     proc_state_started,
@@ -357,7 +446,14 @@ where
                     topology_lock_started,
                 );
                 let engine_replace_started = std::time::Instant::now();
-                engine.execve_into(&img)?;
+                if let Err(error) = engine.execve_into(&img) {
+                    return Self::exec_failed_past_no_return(
+                        kernel,
+                        engine,
+                        &format!("replace guest image: {error}"),
+                    )
+                    .map(Some);
+                }
                 // `execve_into` has released every stage-2/frame lock. Topology
                 // serialization must also be released before runtime takes its
                 // frame-inventory authority lock.
@@ -482,7 +578,7 @@ where
                     unsafe { libc::close(fd) };
                 }
                 stop_after_traced_exec(&kernel.dispatcher);
-                Ok(())
+                Ok(None)
             }
             Err(errno) => {
                 if std::env::var_os("CARRICK_FAULT_DEBUG").is_some() {
@@ -492,9 +588,7 @@ where
                         errno.get()
                     );
                 }
-                let retval = errno.guest_retval();
-                engine.complete_syscall(retval)?;
-                Ok(())
+                Self::exec_failed_with_errno(engine, errno)
             }
         }
     }
