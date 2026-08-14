@@ -2,9 +2,9 @@
 
 Date: 2026-08-14
 
-Status: **GO — ready for spec and quality review**
+Status: **GO — review findings closed; ready for independent re-review**
 
-Implementation source: `f2075a2aaa1d384360273850e88c8f7b035ee0a0`
+Implementation source: `277ff71fb174d71628e33c68dae0c2cdc5e5b583`
 
 Required base: `a609e43cc4630cb917588e873792af6ef4dab989`
 
@@ -16,9 +16,10 @@ kernel authority. Native and VMM retain their established host-derived
 bootstrap identities.
 
 HVPatch signal selectors are resolved against kernel tasks, threads, process
-groups, and pending queues. Any selector that is not handled by that kernel
-path fails closed before the mature-lane xsig or Darwin `kill(2)` transport.
-The reference lanes retain that transport.
+groups, credentials, sessions, signal dispositions, and pending queues. Any
+selector that is not handled by that kernel path fails closed before the
+mature-lane xsig or Darwin `kill(2)` transport. The reference lanes retain that
+transport.
 
 ## RED observations and attribution
 
@@ -33,6 +34,7 @@ were never concurrent.
 | `cr-86407-7096` | Root/kernel signal routing was fixed; `/proc`, child TID/PPID, cross-task signals, session, and exec `/proc` remained red. | HVPatch `/proc` had no exact `KernelContext` identity, and `tgkill` still met the mature current-host-thread-group guard. |
 | `cr-87708-23278` | Remaining failures narrowed to child TID/PPID, cross-call aggregation, and group wait. | `gettid` still used the legacy host/single-thread `ThreadRegistry` fallback; `wait4` had no authoritative guest-PGID selector. |
 | `cr-88429-23318` | Only the child TID relationship remained red. | The threaded-independent `gettid` fast path still bypassed the exact HVPatch kernel thread ID. |
+| `cr-730-7073` | The strengthened reviewer probe terminated before producing Carrick relationships when a descendant sent default-lethal `SIGTERM` to PID 1; Docker produced all 38 then-current relationships. | The new kernel signal route returned before the mature PID-1 default-action immunity check. The same review also found that kernel-routed targets had bypassed credential authorization and that group/broadcast enumeration retained exiting tasks. |
 
 The former `debug_assert` encoded host-PID coincidence rather than a kernel
 invariant. It now asserts the real invariant: the attached HVPatch root is task
@@ -52,6 +54,15 @@ lane test proves native and VMM still return 67000.
 - Positive process targets, `tkill`/`tgkill` thread targets, and process-group
   targets use kernel task/group lookup and kernel pending queues. Signal zero
   uses kernel liveness.
+- Every selected HVPatch target is authorized from the caller and target's
+  exact kernel credential objects. Root privilege, real/effective versus
+  real/saved-ID matching, and the same-session `SIGCONT` exception are decided
+  in the kernel graph before liveness success or queue publication.
+- PID 1 drops default-action signals while retaining caught-signal delivery;
+  `SIGKILL` and `SIGSTOP` keep their Linux exceptions. The decision reads the
+  target's authoritative kernel `Sighand` rather than caller-local state.
+- Process-group and broadcast enumerators admit only `TaskLifecycle::Live`
+  targets, so signal-zero cannot race-success solely against exiting members.
 - Kernel wait selection now supports an exact authoritative process group for
   both live children and group-stamped zombies.
 - The mature xsig/host transport snapshots the typed selector before lowering,
@@ -63,17 +74,24 @@ Exact command:
 
 ```sh
 CARRICK_EXEC_BACKEND=hvpatch \
+  CARRICK_PROBE_EXEC_AS_INIT=1 \
   CARRICK_PROBE_RECEIPT=docs/perf-results/2026-08-14-hvpatch-kernelidentity-cleanup.txt \
   scripts/run-probe.sh kernelidentity 2>&1 \
   | tee docs/perf-results/2026-08-14-hvpatch-kernelidentity-differential.txt
 ```
 
-Final run `cr-92732-27150` was `MATCH kernelidentity`; scoped cleanup reported
-`remaining carrick procs (run-id cr-92732-27150) = 0`. All 31 relationships
+Final run `cr-2046-7558` was `MATCH kernelidentity`; scoped cleanup reported
+`remaining carrick procs (run-id cr-2046-7558) = 0`. All 40 relationships
 matched native arm64 Docker:
 
-- root getpid/gettid, PGID/SID, `/proc`, PID 1 and selector-zero liveness;
+- exact root getpid/gettid 1, PGID/SID, `/proc`, PID 1 and selector-zero
+  liveness;
 - broadcast `-1` and negative PGID 1 liveness;
+- nonzero self `kill` and `tgkill` delivery;
+- PID-1 immunity to a default-lethal signal and delivery to an installed
+  handler;
+- positive-process, thread-directed, and negative-group signal-zero `EPERM`
+  across distinct non-root credentials;
 - child PID/TID/PPID, process group/session, and `/proc` identity;
 - cross-task kill, tgkill, group signal, and former early-xsig SIGCHLD shape;
 - `waitpid(-child_pgid)`;
@@ -98,37 +116,40 @@ target exit, duplicate/truncated records, or a lossy consumer capture.
 Exact command shape (the static probe bytes were piped on stdin):
 
 ```sh
-CARRICK_RUN_ID=task3-identity-host-safety-final \
+CARRICK_RUN_ID=task3-identity-host-safety-final2 \
   target/release/carrick trace \
   --profile hvpatch-identity-host-safety \
   --trace-out docs/perf-results/2026-08-14-hvpatch-identity-host-safety.raw \
   run ubuntu:24.04 --exec-backend hvpatch --raw --fs host \
-  /bin/sh -c 'base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p'
-sudo -n scripts/sudo/kill.sh task3-identity-host-safety-final
+  /bin/sh -c 'base64 -d > /tmp/p && chmod +x /tmp/p && exec /tmp/p'
+sudo -n scripts/sudo/kill.sh task3-identity-host-safety-final2
 ```
 
 Authenticated terminal record:
 
 ```text
-HVPATCHIDENTITY1|summary|status=ok|guest_kills=8|positive_one=1|zero=1|broadcast=2|negative_group=1|tgkills=2|xsig_shapes=1|host_low_kills=0|bounded=0|errors=0|drops=0|target_exited=1|target_exit_seen=1|target_exit_code=0|target_exit_reason=1
+HVPATCHIDENTITY1|summary|status=ok|guest_kills=14|positive_one=4|zero=2|broadcast=2|negative_group=2|tgkills=4|xsig_shapes=1|host_low_kills=0|bounded=0|errors=0|drops=0|target_exited=1|target_exit_seen=1|target_exit_code=0|target_exit_reason=1
 ```
 
-The consumer accepted it as `guest_kills=8,
+The consumer accepted it as `guest_kills=14,
 low_guest_id_host_kills=0`. Scoped cleanup reported
-`remaining carrick procs (run-id task3-identity-host-safety-final) = 0`.
+`remaining carrick procs (run-id task3-identity-host-safety-final2) = 0`.
 
 ## Focused and full gates
 
-Focused runtime tests were run serially with this command shape and passed
-1/1 each:
+Focused runtime tests were run serially and passed 35/35 for dispatch signal
+policy and 57/57 for kernel operations:
 
 ```sh
-RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib <exact-test-name>
+RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib dispatch::signal::tests
+RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib kernel::operations
 ```
 
 The exact tests covered root seed, native/VMM preservation, exact HVPatch
 gettid, explicit `/proc` fields, pre-xsig/host-kill selector blocking,
-authoritative process-group wait, and exact thread-directed signal membership.
+authoritative process-group wait, exact thread-directed signal membership,
+credential and session authorization, PID-1 disposition policy, and exiting
+target exclusion.
 
 The CLI/profile tests passed 3/3 under the repository-required CLI stack:
 
@@ -141,7 +162,7 @@ They cover CLI selection, acceptance of a complete lossless stream, and
 rejection of host escape, a missing selector, and capture loss.
 
 The exact post-commit gate was then run at implementation HEAD
-`f2075a2aaa1d384360273850e88c8f7b035ee0a0`:
+`277ff71fb174d71628e33c68dae0c2cdc5e5b583`:
 
 ```sh
 RUST_TEST_THREADS=1 just ci
@@ -149,7 +170,7 @@ RUST_TEST_THREADS=1 just ci
 
 Result: exit 0. This includes fmt-check, clippy with warnings denied,
 typed-domain lint, deny, matrix drift, check, rustdoc, host tests, and integration
-tests. The runtime library result was 1,573 passed / 0 failed / 5 ignored; the
+tests. The runtime library result was 1,575 passed / 0 failed / 5 ignored; the
 runtime integration suite was 296 passed / 0 failed.
 
 ## Signed artifact provenance
@@ -159,23 +180,23 @@ implementation commit and before both final captures.
 
 | Property | Value |
 |---|---|
-| Source commit | `f2075a2aaa1d384360273850e88c8f7b035ee0a0` |
-| Carrick SHA256 | `63da900981baa68a64c214a8dd0bbd26e372f0e4b246d4681229e059e450952d` |
-| Probe SHA256 | `fa20f136d6c1ffe90e6095a374af6a6ff825ded88a85ce960aabfb9961a46fd6` |
-| LC_UUID | `B5A15CBA-6A5C-364C-9DAB-30582F84DA0E` |
-| Signature | ad hoc; CDHash `c832a6a0151d683593b5b456ff91cbf6afbde0b6` |
+| Source commit | `277ff71fb174d71628e33c68dae0c2cdc5e5b583` |
+| Carrick SHA256 | `ced6d5a3fbc1ea9d51f72eb696c1a5f9ca2718216b797c484ca2048918c45c8e` |
+| Probe SHA256 | `b9818d4cae6b601b1d4a69051daa81086c99c4ce59f9b1883c1ed8089b6615dd` |
+| LC_UUID | `61D9C95D-9AEB-3A86-ACF5-3EC60C38EC20` |
+| Signature | ad hoc; CDHash `40a6d2950566cf06cd9eed07a4c1bd9cd5c73c` |
 | Entitlement | `com.apple.security.hypervisor = true` |
-| DOF | `__TEXT,__dof_carrick` present (address `0x00000001012b3e7f`) |
+| DOF | `__TEXT,__dof_carrick` present (address `0x00000001012b4e7f`) |
 
 Raw receipt hashes:
 
 | Receipt | SHA256 |
 |---|---|
-| `2026-08-14-hvpatch-kernelidentity-differential.txt` | `a29d8eeb15a3111b1eab49b4a01ff1d5a7bdafa0f8538d093e307286205dd510` |
-| `2026-08-14-hvpatch-kernelidentity-cleanup.txt` | `e75dd3ce93da7eb5944e8e15b88012057d54755c2d101d12e16a561fa2c772a5` |
-| `2026-08-14-hvpatch-identity-host-safety.raw` | `6c4a7a17c35cab637140fa4edb5affd55b8df02611b7817b8cafbe88d3d96095` |
-| `2026-08-14-hvpatch-identity-host-safety-command.txt` | `7c595b9205c95d69c28e8d2e622f2287844ff3735ce682139e27a6cf755f2e4` |
-| `2026-08-14-hvpatch-identity-host-safety-cleanup.txt` | `f13dbb0aeb8331f07ba4522e23e0d4cd058e448fe5d7a6198cf20d5998651d59` |
+| `2026-08-14-hvpatch-kernelidentity-differential.txt` | `2eeffddae3c8b99f12058dff3107f7c1a30c7374d13476748fa7f96d72df4a20` |
+| `2026-08-14-hvpatch-kernelidentity-cleanup.txt` | `2aae86b9589851f6bcb02a8bab54ab87ad967f4b3dd03d7d97fe40f9f4aa8409` |
+| `2026-08-14-hvpatch-identity-host-safety.raw` | `6f61ffbf815b5d56b25fa155c83a240e7d3959e6f90b05dbc23b3acdbd7b38f5` |
+| `2026-08-14-hvpatch-identity-host-safety-command.txt` | `e6c9dbc32013a60ad2fae68ea3f21969d615c76a02a3ff48987cfbcfe67dce61` |
+| `2026-08-14-hvpatch-identity-host-safety-cleanup.txt` | `ce25e1e30ff7325267969dc4753f15ea649f4e7b79b5f8dd63e173202701bf8b` |
 
 ## Remaining concerns
 

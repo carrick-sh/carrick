@@ -1,8 +1,8 @@
-CARRICK_PROBE_RUN_ID=cr-92732-27150
-CARRICK_PROBE_CLEANUP_RUN_ID=cr-92732-27150
-remaining carrick procs (run-id cr-92732-27150) = 0
+CARRICK_PROBE_RUN_ID=cr-2046-7558
+CARRICK_PROBE_CLEANUP_RUN_ID=cr-2046-7558
+remaining carrick procs (run-id cr-2046-7558) = 0
 MATCH kernelidentity
-  root_low_linux_id=true
+  root_exact_linux_init=true
   root_leader_tid_matches=true
   root_group_and_session_are_init=true
   root_proc_identity_matches=true
@@ -11,6 +11,15 @@ MATCH kernelidentity
   broadcast_live=true
   negative_pgid_one_live=true
   selector_errno_nonnegative=true
+  self_kill_signal_delivered=true
+  self_tgkill_signal_delivered=true
+  pid_one_default_signal_immunity=true
+  pid_one_handler_installed=true
+  pid_one_handled_send_succeeded=true
+  pid_one_handled_signal_delivered=true
+  credential_positive_signal_zero_denied=true
+  credential_tgkill_signal_zero_denied=true
+  credential_group_signal_zero_denied=true
   child_setup_ready=true
   child_id_is_linux_shaped=true
   child_tid_ppid_match=true
