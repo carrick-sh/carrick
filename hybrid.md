@@ -346,7 +346,7 @@ acceptance criteria.
 | --- | --- | --- |
 | 1 — lazy high-VA sharing | **COMPLETE** | `f457295ee`; [evidence](docs/perf-results/2026-08-13-hvpatch-lazy-high-va-shared-anonymous.md); signed advisory-hint MATCH, `just ci` GREEN |
 | 2 — KX fatal errors and evidence | **COMPLETE** | `12ed17b5f`; [fatal-path evidence](docs/perf-results/2026-08-13-hvpatch-exec-failure-red-green.txt) and [six-stage trace](docs/perf-results/2026-08-13-hvpatch-exec-runtime-stages.raw); four signed post-PONR failpoints signal-shaped, genuine exit 127 preserved, exact-six live trace, `just ci` GREEN |
-| 3 — KI identity reseed | **IN REVIEW — FIX 1/5** | initial implementation/evidence `629588f4`; open: signal permission checks, PID-1 default-lethal immunity, nonzero self kill/tgkill proof, and a possible signal-0 enumeration race |
+| 3 — KI identity reseed | **IN REVIEW — FIX 2/5** | first review findings fixed at `40ff398be`; remaining: HVPatch default SIGCONT/SIGSTOP actions can terminate or stop the entire host runtime instead of applying guest-kernel lifecycle semantics |
 | 4 — global frames and stage-1 COW | queued | — |
 | 5 — live-state crash artifacts | queued | — |
 | 6 — KP shipped proof | queued | — |
