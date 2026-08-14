@@ -3696,10 +3696,12 @@ fn unarmed_permission_fault_route(
     any_arms: bool,
     live_leaf_is_writable: bool,
 ) -> UnarmedPermissionFaultRoute {
-    if !private_writable_mapping || write_denied || !any_arms {
+    if !private_writable_mapping || write_denied {
         UnarmedPermissionFaultRoute::NotCow
     } else if live_leaf_is_writable {
         UnarmedPermissionFaultRoute::RetryCommittedWinner
+    } else if !any_arms {
+        UnarmedPermissionFaultRoute::NotCow
     } else {
         UnarmedPermissionFaultRoute::MissingArm
     }
@@ -12863,6 +12865,11 @@ mod frame_inventory_backend_tests {
             unarmed_permission_fault_route(true, false, true, true),
             UnarmedPermissionFaultRoute::RetryCommittedWinner,
             "a sibling winner removes the arm before the losing vCPU resumes"
+        );
+        assert_eq!(
+            unarmed_permission_fault_route(true, false, false, true),
+            UnarmedPermissionFaultRoute::RetryCommittedWinner,
+            "the last armed page may be removed by the winner before the loser resumes"
         );
         assert_eq!(
             unarmed_permission_fault_route(true, false, true, false),
