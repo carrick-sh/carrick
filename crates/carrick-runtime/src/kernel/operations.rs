@@ -1133,7 +1133,7 @@ impl Kernel {
         &self,
         target: TaskId,
         signal: LinuxSignal,
-        action_generation: Option<super::objects::JobControlContinueGeneration>,
+        action_generation: Option<super::objects::JobControlStopInvalidationGeneration>,
     ) -> bool {
         let task = {
             let state = self.registry().state.read();
@@ -1311,11 +1311,11 @@ impl Kernel {
                 pending.enqueue_standard(signal, siginfo);
             }
         }
-        let continued = if matches!(
-            signal.raw(),
-            carrick_abi::LINUX_SIGCONT | carrick_abi::LINUX_SIGKILL
-        ) {
+        let continued = if signal.raw() == carrick_abi::LINUX_SIGCONT {
             task.continue_from_job_control()
+        } else if signal.raw() == carrick_abi::LINUX_SIGKILL {
+            task.resume_from_job_control_for_fatal_signal();
+            false
         } else {
             false
         };
@@ -1404,11 +1404,11 @@ impl Kernel {
         // Queue before resume. A stopped task cannot consume the signal yet,
         // and once SIGCONT/SIGKILL releases it the pending action must already
         // be visible so delivery cannot race behind guest execution or exit.
-        let continued = if matches!(
-            signal.raw(),
-            carrick_abi::LINUX_SIGCONT | carrick_abi::LINUX_SIGKILL
-        ) {
+        let continued = if signal.raw() == carrick_abi::LINUX_SIGCONT {
             task.continue_from_job_control()
+        } else if signal.raw() == carrick_abi::LINUX_SIGKILL {
+            task.resume_from_job_control_for_fatal_signal();
+            false
         } else {
             false
         };
@@ -1498,11 +1498,11 @@ impl Kernel {
                 pending.enqueue_standard(signal, siginfo);
             }
         });
-        let continued = if matches!(
-            signal.raw(),
-            carrick_abi::LINUX_SIGCONT | carrick_abi::LINUX_SIGKILL
-        ) {
+        let continued = if signal.raw() == carrick_abi::LINUX_SIGCONT {
             task.continue_from_job_control()
+        } else if signal.raw() == carrick_abi::LINUX_SIGKILL {
+            task.resume_from_job_control_for_fatal_signal();
+            false
         } else {
             false
         };
@@ -4285,6 +4285,84 @@ mod tests {
                 signal: sigstop,
             },
             "only an intervening SIGCONT invalidates dequeued stop work",
+        );
+    }
+
+    #[test]
+    fn sigkill_invalidates_a_stop_dequeued_before_fatal_delivery() {
+        let (kernel, root) = bootstrap(1);
+        let child_id = fork_child(&kernel, &root, "kill dequeue race child", 726);
+        let child_context = kernel
+            .context(child_id, LinuxTid::for_task_leader(child_id))
+            .expect("child context");
+        let sigstop = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGSTOP).expect("SIGSTOP");
+        let sigkill = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGKILL).expect("SIGKILL");
+
+        assert!(kernel.post_signal_to_task(child_id, sigstop, None));
+        let stale = child_context
+            .signal_authority()
+            .take_lowest_in(SigSet::EMPTY.with(sigstop.raw()))
+            .expect("dequeue stop before fatal signal generation");
+        let ticket = match kernel.authorize_signal_target_exact(
+            &root,
+            child_context.task().key(),
+            None,
+            Some(sigkill),
+        ) {
+            ExactSignalTargetAuthorization::Allowed(ticket) => ticket,
+            other => panic!("SIGKILL must authorize: {other:?}"),
+        };
+        assert!(kernel.post_signal_to_authorized_target(&ticket, sigkill, None));
+
+        assert!(kernel.stop_task_for_job_control(child_id, sigstop, stale.job_control_generation,));
+        assert!(
+            !kernel.task_is_job_control_stopped(child_id),
+            "fatal delivery must invalidate every earlier dequeued stop action",
+        );
+        assert!(
+            pending_of(&kernel, child_id)
+                .present()
+                .contains(sigkill.raw()),
+            "the fatal signal must remain queued for the resumed vCPU",
+        );
+    }
+
+    #[test]
+    fn sigkill_resumes_a_stopped_task_without_wcontinued() {
+        let (kernel, root) = bootstrap(1);
+        let child_id = fork_child(&kernel, &root, "kill stopped child", 727);
+        let child_context = kernel
+            .context(child_id, LinuxTid::for_task_leader(child_id))
+            .expect("child context");
+        let sigstop = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGSTOP).expect("SIGSTOP");
+        let sigkill = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGKILL).expect("SIGKILL");
+
+        assert!(kernel.stop_task_for_job_control(child_id, sigstop, None));
+        assert!(kernel.task_is_job_control_stopped(child_id));
+        let ticket = match kernel.authorize_signal_target_exact(
+            &root,
+            child_context.task().key(),
+            None,
+            Some(sigkill),
+        ) {
+            ExactSignalTargetAuthorization::Allowed(ticket) => ticket,
+            other => panic!("SIGKILL must authorize: {other:?}"),
+        };
+        assert!(kernel.post_signal_to_authorized_target(&ticket, sigkill, None));
+
+        assert!(!kernel.task_is_job_control_stopped(child_id));
+        assert_eq!(
+            kernel
+                .wait_child_with_job_control(
+                    root.task().key().id,
+                    Some(child_id),
+                    false,
+                    true,
+                    WaitMode::Consume,
+                )
+                .expect("wait after fatal resume"),
+            WaitOutcome::StillRunning,
+            "SIGKILL must not manufacture a WCONTINUED transition",
         );
     }
 

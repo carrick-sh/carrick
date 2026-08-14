@@ -83,7 +83,7 @@ pub(crate) struct DispatchPendingSignal {
     pub(crate) signum: i32,
     pub(crate) owner: crate::kernel::SignalPendingOwner,
     pub(crate) siginfo: Option<LinuxSiginfo>,
-    pub(crate) job_control_generation: Option<crate::kernel::JobControlContinueGeneration>,
+    pub(crate) job_control_generation: Option<crate::kernel::JobControlStopInvalidationGeneration>,
 }
 
 /// Real-time signals (`SIGRTMIN`..=`SIGRTMAX`, kernel numbers 32..=64) queue

@@ -54,7 +54,7 @@ pub use objects::{
     TaskShared, TaskSharedCloneError, TaskWaker, Thread, ThreadKey, ThreadRef, ThreadResources,
     ThreadRunner, ThreadSignalState, Zombie,
 };
-pub(crate) use objects::{FileDescriptionBacking, JobControlContinueGeneration};
+pub(crate) use objects::{FileDescriptionBacking, JobControlStopInvalidationGeneration};
 pub(crate) use operations::ExactSignalTargetAuthorization;
 pub use operations::{
     ChildStartOutcome, ChildStartWait, ForkReservation, KernelFailpoint, KernelOperationError,
