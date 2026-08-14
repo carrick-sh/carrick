@@ -1,6 +1,15 @@
-CARRICK_PROBE_RUN_ID=cr-53745-28369
-CARRICK_PROBE_CLEANUP_RUN_ID=cr-53745-28369
-remaining carrick procs (run-id cr-53745-28369) = 0
+SOURCE COMMIT
+5545ba4b6563e4f68571795b9c51ea435d0a12d5
+
+SIGNED BINARY SHA256
+bed51c6f27749116907221703e5459278f4d9cd1e28081d47b70906716547525  target/release/carrick
+
+COMMAND
+CARRICK_EXEC_BACKEND=hvpatch CARRICK_PROBE_RECEIPT=/tmp/hybrid-task1-round2-cleanup-receipt.txt scripts/run-probe.sh mmaptrimprotect
+
+CARRICK_PROBE_RUN_ID=cr-63665-30195
+CARRICK_PROBE_CLEANUP_RUN_ID=cr-63665-30195
+remaining carrick procs (run-id cr-63665-30195) = 0
 MATCH mmaptrimprotect
   hinted_high_result=0
   hinted_high2_result=0
