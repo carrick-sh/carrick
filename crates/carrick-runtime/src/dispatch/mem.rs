@@ -2549,6 +2549,12 @@ impl SyscallDispatcher {
             if map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                 && map_sharing == MmapSharing::Shared
                 && !map_flags.contains(LinuxMmapFlags::FIXED)
+                // Linux treats a usable non-fixed address as an advisory hint.
+                // Keep high canonical hints on the alias path so a later
+                // PROT_NONE -> writable commit can install the exact hinted VA
+                // while preserving the original MAP_SHARED provenance.
+                && (requested.0 == 0
+                    || !mmap_address_uses_alias(requested.0, length, this.mem.lock().layout))
             {
                 let map_len = align_up_u64(length, hvf_page).unwrap_or(length);
                 let alloc = {
@@ -10723,5 +10729,65 @@ mod tests {
             .commit_host_alias_install(install)
             .expect("publish successful lazy host-alias install");
         assert!(dispatcher.range_has_host_alias_backing(address, LINUX_PAGE_SIZE));
+    }
+
+    #[test]
+    fn shared_anonymous_high_advisory_hint_is_selected_then_committed_lazily() {
+        const SYS_MMAP: u64 = 222;
+        const SYS_MPROTECT: u64 = 226;
+        let address = 0x1382_8ed0_0000;
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = ProtectionTrackingMemory::new(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize);
+        let reporter = CompatReporter::default();
+        let context = dispatcher.capture_one_task_context().unwrap();
+
+        let reserve = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_MMAP,
+                    SyscallArgs([
+                        address,
+                        LINUX_PAGE_SIZE,
+                        0,
+                        LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+                        u64::MAX,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("high advisory reservation");
+        assert_eq!(
+            reserve,
+            DispatchOutcome::Returned {
+                value: address as i64
+            }
+        );
+
+        let commit = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_MPROTECT,
+                    SyscallArgs([
+                        address,
+                        LINUX_PAGE_SIZE,
+                        LINUX_PROT_READ | LINUX_PROT_WRITE,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("lazy high advisory commit");
+        let DispatchOutcome::MapHostAlias { va, shared, .. } = commit else {
+            panic!("shared high advisory hint must commit through a host alias: {commit:?}");
+        };
+        assert_eq!(va, GuestVa(address));
+        assert!(shared);
     }
 }

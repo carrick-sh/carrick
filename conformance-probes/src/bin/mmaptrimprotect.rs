@@ -256,7 +256,7 @@ unsafe fn hinted_high_shared_fork_visibility(hint: usize) -> i32 {
             hint as *mut c_void,
             COMMIT,
             libc::PROT_NONE,
-            libc::MAP_SHARED | libc::MAP_ANONYMOUS | MAP_NORESERVE | libc::MAP_FIXED,
+            libc::MAP_SHARED | libc::MAP_ANONYMOUS | MAP_NORESERVE,
             -1,
             0,
         );

@@ -28,15 +28,32 @@ export CARRICK_INSECURE_REGISTRIES="${CARRICK_INSECURE_REGISTRIES:-localhost:505
 # concurrently (parallel probe iteration) without lanes killing each other.
 RUN_ID="cr-$$-${RANDOM}"
 export CARRICK_RUN_ID="$RUN_ID"
+echo "CARRICK_PROBE_RUN_ID=$RUN_ID" >&2
 kill_guests() {
     sudo -n "$repo/scripts/sudo/kill.sh" "$RUN_ID" >/dev/null 2>&1 \
         || pkill -9 -f "carrick:$RUN_ID:" 2>/dev/null  # trailing ':' anchors the id
 }
 
+cleanup_with_receipt() {
+    cleanup_output=$(sudo -n "$repo/scripts/sudo/kill.sh" "$RUN_ID" 2>&1)
+    cleanup_status=$?
+    if [ "$cleanup_status" -ne 0 ]; then
+        pkill -9 -f "carrick:$RUN_ID:" 2>/dev/null || true
+        cleanup_output="$cleanup_output
+fallback scoped pkill issued"
+    fi
+    printf 'CARRICK_PROBE_CLEANUP_RUN_ID=%s\n%s\n' "$RUN_ID" "$cleanup_output" >&2
+    if [ -n "${CARRICK_PROBE_RECEIPT:-}" ]; then
+        printf 'CARRICK_PROBE_RUN_ID=%s\nCARRICK_PROBE_CLEANUP_RUN_ID=%s\n%s\n' \
+            "$RUN_ID" "$RUN_ID" "$cleanup_output" >"$CARRICK_PROBE_RECEIPT"
+    fi
+    return "$cleanup_status"
+}
+
 kill_guests; sleep 0.3
 c=$(base64 -i "$bin" | timeout 60 "$carrick" run "$image" --raw --fs host /bin/sh -c "$snippet" 2>/dev/null \
     | grep -vE 'case-insensitive|Pass .--fs')
-kill_guests
+cleanup_with_receipt || exit 3
 d=$(base64 -i "$bin" | docker run --rm -i --platform linux/arm64 "$image" /bin/sh -c "$snippet" 2>/dev/null)
 
 if [ "$c" = "$d" ]; then

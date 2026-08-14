@@ -797,18 +797,65 @@ impl GuestMappingSharing {
 /// the owning thread's `mappings` Vec and this entry is removed on `munmap`
 /// (`unregister_alias`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AliasOwnershipScope {
+    /// Alias belongs to the original/root address space in this host process.
+    Root,
+    /// Alias belongs to exactly one HVPatch address space.  The scope is
+    /// rebound in the forked host child when an inherited shared-anonymous
+    /// frame is materialized into that child's new bank.
+    ProcessBank { base: u64, size: u64 },
+    /// Shared-file aliases use the historical VM-global IPA namespace.
+    Global,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn alias_ownership_scope(
+    sharing: GuestMappingSharing,
+    process_bank: Option<(u64, u64)>,
+) -> AliasOwnershipScope {
+    if sharing.uses_global_ipa() {
+        AliasOwnershipScope::Global
+    } else if let Some((base, size)) = process_bank {
+        AliasOwnershipScope::ProcessBank { base, size }
+    } else {
+        AliasOwnershipScope::Root
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn rebind_inherited_alias_to_process(
+    mut alias: AliasBacking,
+    process_bank: (u64, u64),
+) -> AliasBacking {
+    alias.ownership_scope = AliasOwnershipScope::ProcessBank {
+        base: process_bank.0,
+        size: process_bank.1,
+    };
+    alias
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AliasBacking {
     /// Guest VIRTUAL start of the alias (the syscall-path region key).
     start: u64,
     ipa: u64,
     host_addr: usize,
     size: usize,
+    /// The whole HVF-granular stage-2 extent retained behind this semantic
+    /// fragment. Partial Linux unmaps split only the live fields above; VM
+    /// rebuild and frame inventory continue to use this exact physical extent.
+    physical_ipa: u64,
+    physical_host_addr: usize,
+    physical_size: usize,
     perms: u64,
     /// Whether the guest may WRITE the alias (a PROT_READ MAP_SHARED file alias
     /// must EFAULT a syscall write, not SIGBUS the host through the raw pointer).
     guest_writable: bool,
     sharing: GuestMappingSharing,
+    ownership_scope: AliasOwnershipScope,
+    inventory_backing: InventoryBackingIdentity,
     shared_key_base: u64,
     shared_key_offset: u64,
 }
@@ -840,7 +887,12 @@ fn replay_mappings() -> &'static parking_lot::Mutex<std::collections::BTreeSet<R
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn replay_mapping_key(backing: AliasBacking) -> ReplayMappingKey {
-    (backing.ipa, backing.size, backing.host_addr, backing.perms)
+    (
+        backing.physical_ipa,
+        backing.physical_size,
+        backing.physical_host_addr,
+        backing.perms,
+    )
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -867,7 +919,7 @@ pub static ALIAS_REMAP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn register_shared_alias(b: AliasBacking) {
     let mut replay = replay_mappings().lock();
-    replay.retain(|(ipa, _, _, _)| *ipa != b.ipa);
+    replay.retain(|(ipa, _, _, _)| *ipa != b.physical_ipa);
     replay.insert(replay_mapping_key(b));
     drop(replay);
     let mut reg = alias_registry().lock();
@@ -971,26 +1023,14 @@ fn lookup_shared_alias(ipa: u64) -> Option<AliasBacking> {
 /// (uncommitted) EFAULTs even though the reservation entry would contain its VA.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn alias_matches_process_scope(
-    ipa: u64,
-    sharing: GuestMappingSharing,
+    ownership_scope: AliasOwnershipScope,
     process_bank: Option<(u64, u64)>,
 ) -> bool {
-    if sharing.uses_global_ipa() {
-        return true;
+    match ownership_scope {
+        AliasOwnershipScope::Global => true,
+        AliasOwnershipScope::Root => process_bank.is_none(),
+        AliasOwnershipScope::ProcessBank { base, size } => process_bank == Some((base, size)),
     }
-    if let Some((bank_base, bank_size)) = process_bank {
-        return ipa >= bank_base && ipa < bank_base.saturating_add(bank_size);
-    }
-    // The root hvpatch process keeps the ordinary alias-IPA arena. Child
-    // private aliases are relocated into the reserved process-bank aperture,
-    // so exclude that whole aperture when resolving a root-process VA.
-    !(carrick_mem::memory::LINUX_PROCESS_AUX_BANK_BASE
-        ..carrick_mem::memory::LINUX_PROCESS_AUX_BANK_BASE
-            + carrick_mem::memory::LINUX_PROCESS_AUX_BANK_SIZE)
-        .contains(&ipa)
-        && !(carrick_mem::memory::LINUX_PROCESS_BANK_BASE
-            ..carrick_mem::memory::LINUX_PROCESS_BANK_END)
-            .contains(&ipa)
 }
 
 /// Alias-registry entries owned by sibling vCPUs but absent from the forking
@@ -1007,7 +1047,7 @@ fn missing_process_aliases(
         .copied()
         .filter(|alias| {
             !local_ipas.contains(&alias.ipa)
-                && alias_matches_process_scope(alias.ipa, alias.sharing, process_bank)
+                && alias_matches_process_scope(alias.ownership_scope, process_bank)
         })
         .collect()
 }
@@ -1024,7 +1064,7 @@ fn mapping_is_current_for_process_fork(
 ) -> bool {
     !mapping.is_dynamic_alias
         || aliases.iter().any(|alias| {
-            alias_matches_process_scope(alias.ipa, alias.sharing, process_bank)
+            alias_matches_process_scope(alias.ownership_scope, process_bank)
                 && alias.start == mapping.start
                 && alias.ipa == mapping.ipa
                 && alias.host_addr == mapping.host_addr as usize
@@ -1099,7 +1139,7 @@ fn lookup_shared_alias_by_va(
         .iter()
         .rev()
         .find(|e| {
-            alias_matches_process_scope(e.ipa, e.sharing, process_bank)
+            alias_matches_process_scope(e.ownership_scope, process_bank)
                 && va >= e.start
                 && end <= e.start.saturating_add(e.size as u64)
                 // Reject an entry whose backing is not mapped in THIS process
@@ -1122,11 +1162,36 @@ fn lookup_shared_alias_by_va(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn unregister_alias(va: u64, len: usize, process_bank: Option<(u64, u64)>) {
     let end = va.saturating_add(len as u64);
-    alias_registry().lock().retain(|e| {
-        !alias_matches_process_scope(e.ipa, e.sharing, process_bank)
-            || e.start.saturating_add(e.size as u64) <= va
-            || e.start >= end
-    });
+    let mut registry = alias_registry().lock();
+    let mut replacement = Vec::with_capacity(registry.len().saturating_add(1));
+    for entry in registry.drain(..) {
+        let entry_end = entry.start.saturating_add(entry.size as u64);
+        if !alias_matches_process_scope(entry.ownership_scope, process_bank)
+            || entry_end <= va
+            || entry.start >= end
+        {
+            replacement.push(entry);
+            continue;
+        }
+        if entry.start < va {
+            replacement.push(AliasBacking {
+                size: usize::try_from(va - entry.start).unwrap_or_default(),
+                ..entry
+            });
+        }
+        if entry_end > end {
+            let delta = end.saturating_sub(entry.start);
+            replacement.push(AliasBacking {
+                start: end,
+                ipa: entry.ipa.saturating_add(delta),
+                host_addr: entry.host_addr.saturating_add(delta as usize),
+                size: usize::try_from(entry_end - end).unwrap_or_default(),
+                shared_key_offset: entry.shared_key_offset.saturating_add(delta),
+                ..entry
+            });
+        }
+    }
+    *registry = replacement;
 }
 
 /// Bounds lazy alias remaps per backing IPA, not per guest-run interval.
@@ -3134,6 +3199,9 @@ struct ThreadMappingDesc {
     end: u64,
     host_addr: *mut u8,
     size: usize,
+    physical_ipa: u64,
+    physical_host_addr: *mut u8,
+    physical_size: usize,
     perms: applevisor::memory::MemPerms,
     is_dynamic_alias: bool,
     sharing: GuestMappingSharing,
@@ -3154,6 +3222,9 @@ impl ThreadMappingDesc {
             end: region.end,
             host_addr: region.host_addr,
             size: region.size,
+            physical_ipa: region.ipa,
+            physical_host_addr: region.host_addr,
+            physical_size: region.size,
             perms: region.perms,
             is_dynamic_alias: region.is_dynamic_alias,
             sharing: region.sharing,
@@ -3181,6 +3252,9 @@ impl ThreadMappingDesc {
             end: alias.start.saturating_add(alias.size as u64),
             host_addr: alias.host_addr as *mut u8,
             size: alias.size,
+            physical_ipa: alias.physical_ipa,
+            physical_host_addr: alias.physical_host_addr as *mut u8,
+            physical_size: alias.physical_size,
             perms,
             is_dynamic_alias: true,
             sharing: alias.sharing,
@@ -3279,6 +3353,10 @@ struct ProcessMappingDesc {
     end: u64,
     host: ForkMappingHost,
     size: usize,
+    physical_ipa: u64,
+    physical_host_addr: *mut u8,
+    physical_size: usize,
+    inventory_backing: InventoryBackingIdentity,
     perms: applevisor::memory::MemPerms,
     is_dynamic_alias: bool,
     sharing: GuestMappingSharing,
@@ -3286,7 +3364,6 @@ struct ProcessMappingDesc {
     shared_key_base: u64,
     shared_key_offset: u64,
     inherited_frame: Option<carrick_hal::FrameId>,
-    inherited_backing: Option<InventoryBackingIdentity>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3298,13 +3375,13 @@ fn inherited_fork_inventory_extent(
         return Ok(None);
     }
     parent_inventory
-        .get(&(mapping.ipa, mapping.size as u64))
+        .get(&(mapping.physical_ipa, mapping.physical_size as u64))
         .copied()
         .map(Some)
         .ok_or_else(|| {
             TrapError::Hypervisor(format!(
                 "HVPatch shared child extent IPA 0x{:x} size {} lacks parent inventory",
-                mapping.ipa, mapping.size
+                mapping.physical_ipa, mapping.physical_size
             ))
         })
 }
@@ -4562,9 +4639,14 @@ impl HvfVmState {
             ipa,
             host_addr: host as usize,
             size,
+            physical_ipa: ipa,
+            physical_host_addr: host as usize,
+            physical_size: size,
             perms: u64::from(perms),
             guest_writable: alias_guest_writable,
             sharing,
+            ownership_scope: alias_ownership_scope(sharing, self.process_bank),
+            inventory_backing,
             shared_key_base,
             shared_key_offset,
         });
@@ -5488,73 +5570,82 @@ impl HvfVmState {
         // resolve to a freed backing. Registration is creation-complete
         // (every `add_alias` registers; removal happens only on munmap /
         // execve-clear), so absence here means "gone on purpose".
-        let registered_ipas: std::collections::HashSet<u64> =
-            alias_registry().lock().iter().map(|e| e.ipa).collect();
+        let registered_aliases = alias_registry().lock().clone();
+        let mut mapped_extents = std::collections::HashSet::new();
         for mapping in &self.mappings {
             // Skip a sibling-munmap'd stale high-VA entry ENTIRELY (absence
             // from the registry = gone on purpose, mirroring the union loop
             // below): hv_vm_map'ing it would map a freed host VA
             // (ChildMapFailed → wake fatal) or squat a dead IPA a later mmap
             // collides with.
-            let live_high_va_alias =
-                crate::memory::is_high_va(mapping.start) && registered_ipas.contains(&mapping.ipa);
-            if crate::memory::is_high_va(mapping.start) && !live_high_va_alias {
+            let live_alias = mapping
+                .is_dynamic_alias
+                .then(|| {
+                    registered_aliases.iter().find(|alias| {
+                        alias_matches_process_scope(alias.ownership_scope, self.process_bank)
+                            && alias.start == mapping.start
+                            && alias.ipa == mapping.ipa
+                            && alias.host_addr == mapping.host_addr as usize
+                            && alias.size == mapping.size
+                    })
+                })
+                .flatten();
+            if mapping.is_dynamic_alias && live_alias.is_none() {
                 continue;
             }
-            let r = unsafe {
-                inventory_hv_vm_map(
-                    mapping.host_addr.cast(),
+            let (host_addr, ipa, size, perms) = live_alias.map_or(
+                (
+                    mapping.host_addr,
                     mapping.ipa,
                     mapping.size,
                     u64::from(mapping.perms),
-                )
-            };
+                ),
+                |alias| {
+                    (
+                        alias.physical_host_addr as *mut u8,
+                        alias.physical_ipa,
+                        alias.physical_size,
+                        alias.perms,
+                    )
+                },
+            );
+            if !mapped_extents.insert((ipa, size)) {
+                continue;
+            }
+            let r = unsafe { inventory_hv_vm_map(host_addr.cast(), ipa, size, perms) };
             if r != 0 {
                 return Err(TrapError::ChildMapFailed {
-                    host_addr: mapping.host_addr as u64,
-                    guest_start: mapping.ipa,
-                    size: mapping.size,
+                    host_addr: host_addr as u64,
+                    guest_start: ipa,
+                    size,
                     code: r as u32,
-                });
-            }
-            if live_high_va_alias {
-                register_shared_alias(AliasBacking {
-                    start: mapping.start,
-                    ipa: mapping.ipa,
-                    host_addr: mapping.host_addr as usize,
-                    size: mapping.size,
-                    perms: u64::from(mapping.perms),
-                    guest_writable: mapping.guest_writable,
-                    sharing: mapping.sharing,
-                    shared_key_base: mapping.shared_key_base,
-                    shared_key_offset: mapping.shared_key_offset,
                 });
             }
         }
 
-        if replay_alias_union {
-            let mapped_ipas: std::collections::HashSet<u64> =
-                self.mappings.iter().map(|m| m.ipa).collect();
+        if replay_alias_union || self.mappings.iter().any(|mapping| mapping.is_dynamic_alias) {
             // Copy the entries out so the registry mutex isn't held across the
             // hv_vm_map syscalls (`AliasBacking` is `Copy`).
-            let union: Vec<AliasBacking> = alias_registry().lock().clone();
-            for b in union {
-                if mapped_ipas.contains(&b.ipa) || !alias_backing_is_live(b.host_addr) {
+            for b in registered_aliases {
+                if !alias_matches_process_scope(b.ownership_scope, self.process_bank)
+                    || !mapped_extents.insert((b.physical_ipa, b.physical_size))
+                    || !alias_backing_is_live(b.host_addr)
+                {
                     continue;
                 }
                 let r = unsafe {
                     inventory_hv_vm_map(
-                        b.host_addr as *mut std::ffi::c_void,
-                        b.ipa,
-                        b.size,
+                        b.physical_host_addr as *mut std::ffi::c_void,
+                        b.physical_ipa,
+                        b.physical_size,
                         b.perms,
                     )
                 };
                 if r != 0 {
                     return Err(TrapError::ChildMapFailed {
                         host_addr: b.host_addr as u64,
-                        guest_start: b.ipa,
-                        size: b.size,
+                        guest_start: b.physical_ipa,
+                        size: b.physical_size,
                         code: r as u32,
                     });
                 }
@@ -5997,17 +6088,23 @@ impl HvfVmState {
             // (same host_addr). Low-VA boot regions are not aliases (every thread
             // has them) and are never in the index.
             if desc.is_dynamic_alias {
-                register_shared_alias(AliasBacking {
-                    start: desc.start,
-                    ipa: desc.ipa,
-                    host_addr: host_addr as usize,
-                    size: desc.size,
-                    perms: perms_raw,
-                    guest_writable: desc.guest_writable,
-                    sharing: desc.sharing,
-                    shared_key_base: desc.shared_key_base,
-                    shared_key_offset: desc.shared_key_offset,
-                });
+                if let Some(previous) = alias_registry()
+                    .lock()
+                    .iter()
+                    .find(|alias| alias.start == desc.start && alias.ipa == desc.ipa)
+                    .copied()
+                {
+                    register_shared_alias(AliasBacking {
+                        host_addr: host_addr as usize,
+                        physical_host_addr: if previous.physical_host_addr == previous.host_addr {
+                            host_addr as usize
+                        } else {
+                            previous.physical_host_addr
+                        },
+                        ownership_scope: alias_ownership_scope(desc.sharing, self.process_bank),
+                        ..previous
+                    });
+                }
             }
             self.mappings.push(HvfMappedRegion {
                 start: desc.start,
@@ -6079,7 +6176,7 @@ impl HvfVmState {
             for sm in siblings {
                 if sm.is_dynamic_alias
                     && !aliases.iter().any(|alias| {
-                        alias_matches_process_scope(alias.ipa, alias.sharing, self.process_bank)
+                        alias_matches_process_scope(alias.ownership_scope, self.process_bank)
                             && alias.start == sm.start
                             && alias.ipa == sm.ipa
                             && alias.host_addr == sm.host_addr
@@ -6307,10 +6404,22 @@ impl HvfVmState {
         let mut source_mappings: Vec<ThreadMappingDesc> = self
             .mappings
             .iter()
-            .filter(|mapping| {
-                mapping_is_current_for_process_fork(mapping, &aliases, self.process_bank)
+            .filter_map(|mapping| {
+                if !mapping.is_dynamic_alias {
+                    return Some(ThreadMappingDesc::from_region(mapping));
+                }
+                aliases
+                    .iter()
+                    .find(|alias| {
+                        alias_matches_process_scope(alias.ownership_scope, self.process_bank)
+                            && alias.start == mapping.start
+                            && alias.ipa == mapping.ipa
+                            && alias.host_addr == mapping.host_addr as usize
+                            && alias.size == mapping.size
+                    })
+                    .copied()
+                    .and_then(ThreadMappingDesc::from_alias)
             })
-            .map(ThreadMappingDesc::from_region)
             .collect();
         let local_regions = source_mappings.len() as u64;
         let local_ipas: std::collections::HashSet<u64> =
@@ -6368,6 +6477,10 @@ impl HvfVmState {
                     end: mapping.end,
                     host: ForkMappingHost::Borrowed(mapping.host_addr),
                     size: mapping.size,
+                    physical_ipa: mapping.physical_ipa,
+                    physical_host_addr: mapping.physical_host_addr,
+                    physical_size: mapping.physical_size,
+                    inventory_backing: parent_extent.backing,
                     perms: mapping.perms,
                     is_dynamic_alias: mapping.is_dynamic_alias,
                     sharing: mapping.sharing,
@@ -6375,7 +6488,6 @@ impl HvfVmState {
                     shared_key_base: mapping.shared_key_base,
                     shared_key_offset: mapping.shared_key_offset,
                     inherited_frame: Some(parent_extent.frame),
-                    inherited_backing: Some(parent_extent.backing),
                 });
                 continue;
             }
@@ -6460,12 +6572,17 @@ impl HvfVmState {
                     mapping.start
                 ))
             })?;
+            let physical_host_addr = host.as_ptr();
             mappings.push(ProcessMappingDesc {
                 start: mapping.start,
                 ipa,
                 end: mapping.end,
                 host: ForkMappingHost::Owned(host),
                 size: mapping.size,
+                physical_ipa: ipa,
+                physical_host_addr,
+                physical_size: mapping.size,
+                inventory_backing: Self::private_backing_identity(),
                 perms: mapping.perms,
                 is_dynamic_alias: mapping.is_dynamic_alias,
                 sharing: GuestMappingSharing::Private,
@@ -6473,7 +6590,6 @@ impl HvfVmState {
                 shared_key_base: mapping.shared_key_base,
                 shared_key_offset: mapping.shared_key_offset,
                 inherited_frame: None,
-                inherited_backing: None,
             });
         }
         emit_stage(
@@ -6603,6 +6719,8 @@ impl HvfVmState {
         enable_el0_counter_access(vcpu.id());
         let mut mapped = Vec::with_capacity(spec.mappings.len());
         let mut inventory_mappings = Vec::with_capacity(spec.mappings.len());
+        let mut inventory_extent_keys = std::collections::BTreeSet::new();
+        let mut aliases_to_publish = Vec::new();
         let mut physical_mutated = false;
         for mapping in spec.mappings {
             if !mapping.sharing.shares_across_fork() {
@@ -6629,21 +6747,47 @@ impl HvfVmState {
                 }
                 physical_mutated = true;
             }
-            inventory_mappings.push((
-                mapping.ipa,
-                mapping.size as u64,
-                {
-                    let raw = u64::from(mapping.perms);
-                    carrick_hal::MemPerms {
-                        read: raw & 1 != 0,
-                        write: raw & 2 != 0,
-                        exec: raw & 4 != 0,
-                    }
-                },
-                mapping.inherited_frame,
-                mapping.inherited_backing,
-            ));
+            let inventory_key = (mapping.physical_ipa, mapping.physical_size as u64);
+            if inventory_extent_keys.insert(inventory_key) {
+                inventory_mappings.push((
+                    mapping.physical_ipa,
+                    mapping.physical_size as u64,
+                    {
+                        let raw = u64::from(mapping.perms);
+                        carrick_hal::MemPerms {
+                            read: raw & 1 != 0,
+                            write: raw & 2 != 0,
+                            exec: raw & 4 != 0,
+                        }
+                    },
+                    mapping.inherited_frame,
+                    mapping.inventory_backing,
+                ));
+            }
             let host_addr = mapping.host.ptr();
+            if mapping.is_dynamic_alias {
+                let alias = AliasBacking {
+                    start: mapping.start,
+                    ipa: mapping.ipa,
+                    host_addr: host_addr as usize,
+                    size: mapping.size,
+                    physical_ipa: mapping.physical_ipa,
+                    physical_host_addr: mapping.physical_host_addr as usize,
+                    physical_size: mapping.physical_size,
+                    perms: u64::from(mapping.perms),
+                    guest_writable: mapping.guest_writable,
+                    sharing: mapping.sharing,
+                    ownership_scope: alias_ownership_scope(mapping.sharing, None),
+                    inventory_backing: mapping.inventory_backing,
+                    shared_key_base: mapping.shared_key_base,
+                    shared_key_offset: mapping.shared_key_offset,
+                };
+                aliases_to_publish.push(if mapping.sharing.uses_global_ipa() {
+                    alias
+                } else {
+                    rebind_inherited_alias_to_process(alias, spec.process_bank)
+                });
+            }
             mapped.push(HvfMappedRegion {
                 start: mapping.start,
                 ipa: mapping.ipa,
@@ -6667,18 +6811,7 @@ impl HvfVmState {
                     "HVPatch child materialized without frame inventory reservation".to_owned(),
                 )
             })?;
-            for (gpa, length, permissions, inherited_frame, inherited_backing) in inventory_mappings
-            {
-                let backing = match (inherited_frame, inherited_backing) {
-                    (Some(_), Some(backing)) => backing,
-                    (None, None) => Self::private_backing_identity(),
-                    _ => {
-                        eprintln!(
-                            "carrick: FATAL: HVPatch child frame/backing inheritance mismatch"
-                        );
-                        std::process::abort();
-                    }
-                };
+            for (gpa, length, permissions, inherited_frame, backing) in inventory_mappings {
                 if let Err(error) = Self::stage_mapping(
                     &mut inventory,
                     &mut reservation,
@@ -6720,6 +6853,14 @@ impl HvfVmState {
             frame_inventory: spec.frame_inventory,
         };
         let mailbox = state.allocate_mailbox_for_vcpu(&vcpu)?;
+        // The child address space, frame inventory, and mailbox are now fully
+        // committed. Publish semantic alias fragments only after every
+        // fallible installation step so an aborted child cannot advertise
+        // backing presence. This host process is the fork child, so rebinding
+        // a shared-anonymous alias to the new bank cannot affect its parent.
+        for alias in aliases_to_publish {
+            register_shared_alias(alias);
+        }
         Ok((state, vcpu, mailbox))
     }
 
@@ -7936,9 +8077,9 @@ unsafe fn inventory_hv_vm_map_replay(backing: AliasBacking) -> applevisor_sys::h
     }
     let result = unsafe {
         inventory_hv_vm_map(
-            backing.host_addr as *mut std::ffi::c_void,
-            backing.ipa,
-            backing.size,
+            backing.physical_host_addr as *mut std::ffi::c_void,
+            backing.physical_ipa,
+            backing.physical_size,
             backing.perms,
         )
     };
@@ -9181,6 +9322,9 @@ mod frame_inventory_backend_tests {
             end: 0x1382_8ed0_0000 + size,
             host_addr: 0x1000usize as *mut u8,
             size: size as usize,
+            physical_ipa: ipa,
+            physical_host_addr: 0x1000usize as *mut u8,
+            physical_size: size as usize,
             perms: applevisor::memory::MemPerms::ReadWrite,
             is_dynamic_alias: true,
             sharing,
@@ -9227,9 +9371,14 @@ mod alias_remap_limiter_tests {
             ipa: crate::memory::LINUX_ALIAS_IPA_BASE + 0x7f00_0000,
             host_addr: 0x1234_0000,
             size: HVF_PAGE_SIZE as usize,
+            physical_ipa: crate::memory::LINUX_ALIAS_IPA_BASE + 0x7f00_0000,
+            physical_host_addr: 0x1234_0000,
+            physical_size: HVF_PAGE_SIZE as usize,
             perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
             guest_writable: true,
             sharing: GuestMappingSharing::Private,
+            ownership_scope: AliasOwnershipScope::Root,
+            inventory_backing: InventoryBackingIdentity::Private(1),
             shared_key_base: 0,
             shared_key_offset: 0,
         };
@@ -9263,14 +9412,20 @@ mod alias_remap_limiter_tests {
             ipa: crate::memory::LINUX_ALIAS_IPA_BASE + 0x7e00_0000,
             host_addr: 0x1234_0000,
             size: HVF_PAGE_SIZE as usize,
+            physical_ipa: crate::memory::LINUX_ALIAS_IPA_BASE + 0x7e00_0000,
+            physical_host_addr: 0x1234_0000,
+            physical_size: HVF_PAGE_SIZE as usize,
             perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
             guest_writable: true,
             sharing: GuestMappingSharing::Private,
+            ownership_scope: AliasOwnershipScope::Root,
+            inventory_backing: InventoryBackingIdentity::Private(2),
             shared_key_base: 0,
             shared_key_offset: 0,
         };
         let replacement = AliasBacking {
             host_addr: 0x5678_0000,
+            physical_host_addr: 0x5678_0000,
             ..original
         };
         register_shared_alias(original);
@@ -9437,6 +9592,9 @@ mod thread_sibling_tests {
             end: 0x5000,
             host_addr: 0x7000usize as *mut u8,
             size: 0x4000,
+            physical_ipa: 0x1000,
+            physical_host_addr: 0x7000usize as *mut u8,
+            physical_size: 0x4000,
             perms: applevisor::memory::MemPerms::ReadWrite,
             is_dynamic_alias: true,
             sharing: GuestMappingSharing::GlobalShared,
@@ -9940,9 +10098,11 @@ pub(crate) fn hvf_set_sys_reg(
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 mod tag_strip_tests {
     use super::{
-        AliasBacking, GuestMappingPlan, GuestMappingSharing, HvfMappedRegion,
-        alias_matches_process_scope, exec_bank_layout_key, mapping_is_current_for_process_fork,
-        missing_process_aliases, reserve_process_alias_ipa, strip_pointer_tag,
+        AliasBacking, AliasOwnershipScope, GuestMappingPlan, GuestMappingSharing, HvfMappedRegion,
+        InventoryBackingIdentity, alias_matches_process_scope, alias_registry,
+        exec_bank_layout_key, inherited_fork_inventory_extent, mapping_is_current_for_process_fork,
+        missing_process_aliases, rebind_inherited_alias_to_process, register_shared_alias,
+        reserve_process_alias_ipa, strip_pointer_tag, unregister_alias,
     };
 
     #[test]
@@ -10211,38 +10371,34 @@ mod tag_strip_tests {
             carrick_mem::memory::LINUX_PROCESS_BANK_BASE,
             40 * 1024 * 1024 * 1024,
         );
-        let child_ipa = bank.0 + 0x4000;
-        let aux_child_ipa = carrick_mem::memory::LINUX_PROCESS_AUX_BANK_BASE + 0x4000;
-        let root_ipa = carrick_mem::memory::LINUX_ALIAS_IPA_BASE + 0x4000;
-
         assert!(alias_matches_process_scope(
-            child_ipa,
-            GuestMappingSharing::Private,
+            AliasOwnershipScope::ProcessBank {
+                base: bank.0,
+                size: bank.1
+            },
             Some(bank)
         ));
         assert!(!alias_matches_process_scope(
-            root_ipa,
-            GuestMappingSharing::Private,
+            AliasOwnershipScope::Root,
+            Some(bank)
+        ));
+        assert!(alias_matches_process_scope(AliasOwnershipScope::Root, None));
+        assert!(!alias_matches_process_scope(
+            AliasOwnershipScope::ProcessBank {
+                base: bank.0,
+                size: bank.1
+            },
+            None
+        ));
+        assert!(!alias_matches_process_scope(
+            AliasOwnershipScope::ProcessBank {
+                base: bank.0 + bank.1,
+                size: bank.1
+            },
             Some(bank)
         ));
         assert!(alias_matches_process_scope(
-            root_ipa,
-            GuestMappingSharing::Private,
-            None
-        ));
-        assert!(!alias_matches_process_scope(
-            child_ipa,
-            GuestMappingSharing::Private,
-            None
-        ));
-        assert!(!alias_matches_process_scope(
-            aux_child_ipa,
-            GuestMappingSharing::Private,
-            None
-        ));
-        assert!(alias_matches_process_scope(
-            root_ipa,
-            GuestMappingSharing::GlobalShared,
+            AliasOwnershipScope::Global,
             Some(bank)
         ));
     }
@@ -10326,9 +10482,17 @@ mod tag_strip_tests {
             ipa,
             host_addr: 0x1000,
             size: 0x4000,
+            physical_ipa: ipa,
+            physical_host_addr: 0x1000,
+            physical_size: 0x4000,
             perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
             guest_writable: true,
             sharing,
+            ownership_scope: AliasOwnershipScope::ProcessBank {
+                base: parent_bank.0,
+                size: parent_bank.1,
+            },
+            inventory_backing: InventoryBackingIdentity::SharedAnon(41),
             shared_key_base: 0,
             shared_key_offset: 0,
         };
@@ -10351,6 +10515,256 @@ mod tag_strip_tests {
             .is_empty(),
             "an unrelated mm must not acquire anonymous backing through global alias scope"
         );
+    }
+
+    #[test]
+    fn fork_shared_anonymous_alias_survives_a_second_fork_without_global_scope() {
+        let parent_bank = (
+            carrick_mem::memory::LINUX_PROCESS_BANK_BASE,
+            40 * 1024 * 1024 * 1024,
+        );
+        let child_bank = (parent_bank.0 + parent_bank.1, parent_bank.1);
+        let grandchild_bank = (child_bank.0 + child_bank.1, child_bank.1);
+        let unrelated_bank = (grandchild_bank.0 + grandchild_bank.1, grandchild_bank.1);
+        let alias = rebind_inherited_alias_to_process(
+            AliasBacking {
+                start: 0x1382_8ed0_0000,
+                ipa: parent_bank.0 + 0x20_0000,
+                host_addr: 0x1000,
+                size: 0x4000,
+                physical_ipa: parent_bank.0 + 0x20_0000,
+                physical_host_addr: 0x1000,
+                physical_size: 0x4000,
+                perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+                guest_writable: true,
+                sharing: GuestMappingSharing::ForkSharedAnonymous,
+                ownership_scope: AliasOwnershipScope::ProcessBank {
+                    base: parent_bank.0,
+                    size: parent_bank.1,
+                },
+                inventory_backing: InventoryBackingIdentity::SharedAnon(42),
+                shared_key_base: 0,
+                shared_key_offset: 0,
+            },
+            child_bank,
+        );
+
+        assert_eq!(
+            missing_process_aliases(
+                &std::collections::HashSet::new(),
+                &[alias],
+                Some(child_bank),
+            )
+            .len(),
+            1,
+            "a child forking a grandchild must retain its inherited anonymous frame"
+        );
+        assert_eq!(
+            missing_process_aliases(
+                &std::collections::HashSet::new(),
+                &[alias],
+                Some(child_bank),
+            )[0]
+            .inventory_backing,
+            InventoryBackingIdentity::SharedAnon(42),
+            "scope rebinding must not mint a new backing identity",
+        );
+        let frame =
+            carrick_hal::FrameId::from_kernel_allocation(std::num::NonZeroU64::new(9101).unwrap());
+        let inventory = std::collections::BTreeMap::from([(
+            (alias.physical_ipa, alias.physical_size as u64),
+            super::InventoryExtent {
+                frame,
+                mapping: carrick_hal::MappingId::from_kernel_allocation(
+                    std::num::NonZeroU64::new(9102).unwrap(),
+                ),
+                backing: alias.inventory_backing,
+            },
+        )]);
+        let child_source = super::ThreadMappingDesc::from_alias(alias).unwrap();
+        let grandchild_extent = inherited_fork_inventory_extent(&child_source, &inventory)
+            .unwrap()
+            .unwrap();
+        assert_eq!(grandchild_extent.frame, frame);
+        assert_eq!(grandchild_extent.backing, alias.inventory_backing);
+
+        let grandchild_alias = rebind_inherited_alias_to_process(alias, grandchild_bank);
+        assert_eq!(
+            missing_process_aliases(
+                &std::collections::HashSet::new(),
+                &[grandchild_alias],
+                Some(grandchild_bank),
+            )[0]
+            .inventory_backing,
+            alias.inventory_backing,
+            "grandchild publication must retain the inherited frame identity",
+        );
+        assert!(
+            missing_process_aliases(
+                &std::collections::HashSet::new(),
+                &[grandchild_alias],
+                Some(unrelated_bank),
+            )
+            .is_empty(),
+            "an unrelated mm must not gain the inherited frame"
+        );
+    }
+
+    #[test]
+    fn alias_registry_partial_unmap_preserves_exact_live_fragments() {
+        let va = 0x1383_0000_0000;
+        let ipa = carrick_mem::memory::LINUX_ALIAS_IPA_BASE + 0x7d00_0000;
+        let alias = AliasBacking {
+            start: va,
+            ipa,
+            host_addr: 0x1234_0000,
+            size: 0xc000,
+            physical_ipa: ipa,
+            physical_host_addr: 0x1234_0000,
+            physical_size: 0xc000,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+            guest_writable: true,
+            sharing: GuestMappingSharing::GlobalShared,
+            ownership_scope: AliasOwnershipScope::Global,
+            inventory_backing: InventoryBackingIdentity::SharedFile {
+                device: 1,
+                inode: 2,
+                offset: 0x8000,
+                length: 0xc000,
+            },
+            shared_key_base: 7,
+            shared_key_offset: 0x8000,
+        };
+        register_shared_alias(alias);
+
+        unregister_alias(va + 0x4000, 0x4000, None);
+        let mut fragments: Vec<_> = alias_registry()
+            .lock()
+            .iter()
+            .copied()
+            .filter(|entry| entry.start >= va && entry.start < va + 0xc000)
+            .collect();
+        fragments.sort_by_key(|entry| entry.start);
+
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(
+            (fragments[0].start, fragments[0].ipa, fragments[0].size),
+            (va, ipa, 0x4000)
+        );
+        assert_eq!(
+            (fragments[1].start, fragments[1].ipa, fragments[1].size),
+            (va + 0x8000, ipa + 0x8000, 0x4000),
+        );
+        assert_eq!(fragments[1].host_addr, alias.host_addr + 0x8000);
+        assert_eq!(
+            fragments[1].shared_key_offset,
+            alias.shared_key_offset + 0x8000
+        );
+
+        let physical_extent = super::InventoryExtent {
+            frame: carrick_hal::FrameId::from_kernel_allocation(
+                std::num::NonZeroU64::new(9001).unwrap(),
+            ),
+            mapping: carrick_hal::MappingId::from_kernel_allocation(
+                std::num::NonZeroU64::new(9002).unwrap(),
+            ),
+            backing: alias.inventory_backing,
+        };
+        let inventory = std::collections::BTreeMap::from([(
+            (alias.physical_ipa, alias.physical_size as u64),
+            physical_extent,
+        )]);
+        for fragment in fragments {
+            let desc = super::ThreadMappingDesc::from_alias(fragment).unwrap();
+            assert_eq!(
+                inherited_fork_inventory_extent(&desc, &inventory)
+                    .unwrap()
+                    .unwrap()
+                    .frame,
+                physical_extent.frame,
+                "each exact semantic fragment must remain forkable through the whole physical extent",
+            );
+        }
+
+        unregister_alias(va, 0xc000, None);
+    }
+
+    #[test]
+    fn alias_registry_prefix_unmap_preserves_exact_suffix() {
+        let va = 0x1383_1000_0000;
+        let ipa = carrick_mem::memory::LINUX_ALIAS_IPA_BASE + 0x7c00_0000;
+        let alias = AliasBacking {
+            start: va,
+            ipa,
+            host_addr: 0x2234_0000,
+            size: 0xc000,
+            physical_ipa: ipa,
+            physical_host_addr: 0x2234_0000,
+            physical_size: 0xc000,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+            guest_writable: true,
+            sharing: GuestMappingSharing::ForkSharedAnonymous,
+            ownership_scope: AliasOwnershipScope::Root,
+            inventory_backing: InventoryBackingIdentity::SharedAnon(44),
+            shared_key_base: 0,
+            shared_key_offset: 0,
+        };
+        register_shared_alias(alias);
+        unregister_alias(va, 0x4000, None);
+        let fragment = alias_registry()
+            .lock()
+            .iter()
+            .find(|entry| entry.start == va + 0x4000)
+            .copied()
+            .expect("suffix fragment");
+        assert_eq!(
+            (fragment.ipa, fragment.host_addr, fragment.size),
+            (ipa + 0x4000, alias.host_addr + 0x4000, 0x8000)
+        );
+        assert_eq!(
+            (fragment.physical_ipa, fragment.physical_size),
+            (ipa, 0xc000)
+        );
+        unregister_alias(va, 0xc000, None);
+    }
+
+    #[test]
+    fn alias_registry_suffix_unmap_preserves_exact_prefix() {
+        let va = 0x1383_2000_0000;
+        let ipa = carrick_mem::memory::LINUX_ALIAS_IPA_BASE + 0x7b00_0000;
+        let alias = AliasBacking {
+            start: va,
+            ipa,
+            host_addr: 0x3234_0000,
+            size: 0xc000,
+            physical_ipa: ipa,
+            physical_host_addr: 0x3234_0000,
+            physical_size: 0xc000,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+            guest_writable: true,
+            sharing: GuestMappingSharing::ForkSharedAnonymous,
+            ownership_scope: AliasOwnershipScope::Root,
+            inventory_backing: InventoryBackingIdentity::SharedAnon(45),
+            shared_key_base: 0,
+            shared_key_offset: 0,
+        };
+        register_shared_alias(alias);
+        unregister_alias(va + 0x8000, 0x4000, None);
+        let fragment = alias_registry()
+            .lock()
+            .iter()
+            .find(|entry| entry.start == va)
+            .copied()
+            .expect("prefix fragment");
+        assert_eq!(
+            (fragment.ipa, fragment.host_addr, fragment.size),
+            (ipa, alias.host_addr, 0x8000)
+        );
+        assert_eq!(
+            (fragment.physical_ipa, fragment.physical_size),
+            (ipa, 0xc000)
+        );
+        unregister_alias(va, 0xc000, None);
     }
 
     #[test]
@@ -10382,9 +10796,17 @@ mod tag_strip_tests {
             ipa: live_ipa,
             host_addr: 0x3000,
             size: 0x4000,
+            physical_ipa: live_ipa,
+            physical_host_addr: 0x3000,
+            physical_size: 0x4000,
             perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
             guest_writable: true,
             sharing: GuestMappingSharing::ForkSharedAnonymous,
+            ownership_scope: AliasOwnershipScope::ProcessBank {
+                base: bank.0,
+                size: bank.1,
+            },
+            inventory_backing: InventoryBackingIdentity::SharedAnon(43),
             shared_key_base: 0,
             shared_key_offset: 0,
         };
@@ -10422,9 +10844,24 @@ mod tag_strip_tests {
             ipa,
             host_addr: 0x1000,
             size: 0x4000,
+            physical_ipa: ipa,
+            physical_host_addr: 0x1000,
+            physical_size: 0x4000,
             perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
             guest_writable: true,
             sharing: GuestMappingSharing::Private,
+            ownership_scope: if ipa < bank.0 + bank.1 {
+                AliasOwnershipScope::ProcessBank {
+                    base: bank.0,
+                    size: bank.1,
+                }
+            } else {
+                AliasOwnershipScope::ProcessBank {
+                    base: bank.0 + bank.1,
+                    size: bank.1,
+                }
+            },
+            inventory_backing: InventoryBackingIdentity::Private(ipa),
             shared_key_base: 0,
             shared_key_offset: 0,
         };

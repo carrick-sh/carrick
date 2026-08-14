@@ -29,6 +29,9 @@ dtrace:::BEGIN
     started = timestamp;
     maps = 0;
     faults = 0;
+    walks = 0;
+    fault_walks = 0;
+    fault_ttbrs = 0;
     errors = 0;
     bounded = 0;
 }
@@ -59,6 +62,7 @@ carrick*:::hv-vm-map-alias
 carrick*:::pt-alias-walk
 /pid == $target || progenyof($target)/
 {
+    walks++;
     printf("HVPATCHALIAS|walk|ns=%llu|host_pid=%d|va=0x%llx|l0=0x%llx|l1=0x%llx|l2=0x%llx|l3=0x%llx|flag=%d\n",
         timestamp, pid, arg0, arg1, arg2, arg3, arg4, (int)arg5);
 }
@@ -66,6 +70,7 @@ carrick*:::pt-alias-walk
 carrick*:::pt-fault-walk
 /pid == $target || progenyof($target)/
 {
+    fault_walks++;
     printf("HVPATCHALIAS|fault_walk|ns=%llu|host_pid=%d|far=0x%llx|l0=0x%llx|l1=0x%llx|l2=0x%llx|l3=0x%llx\n",
         timestamp, pid, arg0, arg1, arg2, arg3, arg4);
 }
@@ -73,6 +78,7 @@ carrick*:::pt-fault-walk
 carrick*:::pt-fault-ttbr
 /pid == $target || progenyof($target)/
 {
+    fault_ttbrs++;
     printf("HVPATCHALIAS|fault_ttbr|ns=%llu|host_pid=%d|far=0x%llx|ttbr0=0x%llx\n",
         timestamp, pid, arg0, arg1);
 }
@@ -88,23 +94,26 @@ carrick*:::vcpu-fault-regs
 dtrace:::ERROR
 {
     errors++;
+    printf("HVPATCHALIAS|error|epid=%d|action=%d|offset=%d|fault=%d|value=%#x\n",
+        arg1, arg2, arg3, arg4, arg5);
+    exit(3);
 }
 
 proc:::exit
 /pid == $target/
 {
-    exit(0);
+    exit(maps && faults && walks && fault_walks && fault_ttbrs && !errors ? 0 : 2);
 }
 
 profile:::tick-1sec
 /timestamp - started > 90 * 1000000000/
 {
     bounded = 1;
-    exit(0);
+    exit(4);
 }
 
 dtrace:::END
 {
-    printf("HVPATCHALIAS|end|maps=%d|faults=%d|bounded=%d|errors=%d\n",
-        maps, faults, bounded, errors);
+    printf("HVPATCHALIAS|end|maps=%d|faults=%d|walks=%d|fault_walks=%d|fault_ttbrs=%d|bounded=%d|errors=%d\n",
+        maps, faults, walks, fault_walks, fault_ttbrs, bounded, errors);
 }
