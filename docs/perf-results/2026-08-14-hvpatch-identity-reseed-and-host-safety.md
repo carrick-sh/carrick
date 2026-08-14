@@ -2,9 +2,9 @@
 
 Date: 2026-08-14
 
-Status: **GO — fifth review findings closed; ready for final independent re-review**
+Status: **GO — final independent review clean; review-ready**
 
-Implementation source: `8ba49e13909ad4d53efb9fbef3008fb79b3c32fb`
+Implementation source: `1b154315442e2f0e732dd6b765d2f3b8b8dd3337`
 
 Required base: `a609e43cc4630cb917588e873792af6ef4dab989`
 
@@ -72,6 +72,16 @@ only that stale parent and could strand a waiter on the new parent. Both exact
 RED commands and failure text are appended to
 `2026-08-14-hvpatch-exact-signal-red-receipt.txt`.
 
+The final semantic pass found that SIGKILL shared the SIGCONT resume helper but
+did not advance the stop-action epoch. Two exact REDs proved both failures: a
+stop dequeued before SIGKILL could re-park the task after the one fatal wake,
+and killing an already-stopped task manufactured a WCONTINUED event. A native
+arm64 Docker oracle ran 100 stopped-child SIGKILL iterations and reported
+`continued=0`. The commands/failures are appended to the exact-signal RED
+receipt; the complete oracle program, output, image digest, and server
+architecture are retained in
+`2026-08-14-hvpatch-sigkill-wcontinued-oracle.txt`.
+
 The former `debug_assert` encoded host-PID coincidence rather than a kernel
 invariant. It now asserts the real invariant: the attached HVPatch root is task
 1 and is initially the only live process. A unit test passes an unrelated host
@@ -125,11 +135,16 @@ lane test proves native and VMM still return 67000.
   thread queue before enqueueing and resuming; generating any of those stop
   signals discards pending SIGCONT from all of the same queues. Queue hints,
   siginfo, and pending-action snapshots are updated in the same transaction.
-  Dequeue snapshots a typed monotonic SIGCONT epoch under that same task
-  transaction, and the later default-stop action must present the unchanged
-  epoch. Thus every stop dequeued before a continue is stale even if a newer
-  stop is generated afterward; a newer stop without an intervening continue
-  does not incorrectly cancel an older still-valid dequeued stop.
+  Dequeue snapshots a typed monotonic stop-invalidation epoch under that same
+  task transaction, and the later default-stop action must present the
+  unchanged epoch. SIGCONT and SIGKILL both advance it, so neither can be
+  defeated by a stop action already between dequeue and default delivery. A
+  newer stop without an intervening invalidator does not incorrectly cancel an
+  older still-valid dequeued stop.
+- SIGKILL releases a stopped task so its vCPU can consume the queued fatal
+  signal, but unlike SIGCONT it does not publish `pending_continue` or wake the
+  parent for WCONTINUED. The eventual signal death remains the only new wait
+  event.
 - Signal-event publication resolves the target's exact current parent only
   after the stopped/continued state is published. Reparenting between
   authorization and publication therefore wakes the parent that can currently
@@ -144,12 +159,12 @@ Exact command:
 ```sh
 CARRICK_EXEC_BACKEND=hvpatch \
   CARRICK_PROBE_EXEC_AS_INIT=1 \
-  CARRICK_PROBE_RECEIPT=target/task3/kernelidentity-epochfix-cleanup.txt \
+  CARRICK_PROBE_RECEIPT=target/task3/kernelidentity-fatalfix-cleanup.txt \
   scripts/run-probe.sh kernelidentity
 ```
 
-Final run `cr-44131-29073` was `MATCH kernelidentity`; scoped cleanup reported
-`remaining carrick procs (run-id cr-44131-29073) = 0`. All 64 relationships
+Final run `cr-55401-7431` was `MATCH kernelidentity`; scoped cleanup reported
+`remaining carrick procs (run-id cr-55401-7431) = 0`. All 64 relationships
 matched native arm64 Docker:
 
 - exact root getpid/gettid 1, PGID/SID, `/proc`, PID 1 and selector-zero
@@ -198,13 +213,13 @@ target exit, duplicate/truncated records, or a lossy consumer capture.
 Exact command shape (the static probe bytes were piped on stdin):
 
 ```sh
-CARRICK_RUN_ID=task3-identity-host-safety-epochfix \
+CARRICK_RUN_ID=task3-identity-host-safety-fatalfix \
   target/release/carrick trace \
   --profile hvpatch-identity-host-safety \
-  --trace-out target/task3/hvpatch-identity-host-safety-epochfix.raw \
+  --trace-out target/task3/hvpatch-identity-host-safety-fatalfix.raw \
   run ubuntu:24.04 --exec-backend hvpatch --raw --fs host \
   /bin/sh -c 'base64 -d > /tmp/p && chmod +x /tmp/p && exec /tmp/p'
-sudo -n scripts/sudo/kill.sh task3-identity-host-safety-epochfix
+sudo -n scripts/sudo/kill.sh task3-identity-host-safety-fatalfix
 ```
 
 Authenticated terminal record:
@@ -215,7 +230,7 @@ HVPATCHIDENTITY1|summary|status=ok|guest_kills=25|positive_one=5|zero=3|broadcas
 
 The consumer accepted it as `guest_kills=25, guest_sigstops=3,
 guest_sigconts=2, low_guest_id_host_kills=0`. Scoped cleanup reported
-`remaining carrick procs (run-id task3-identity-host-safety-epochfix) = 0`.
+`remaining carrick procs (run-id task3-identity-host-safety-fatalfix) = 0`.
 
 The durable diagnostic `hvpatch-job-control-flow.d` independently observed all
 29 guest signal-generation events and terminated with
@@ -223,11 +238,13 @@ The durable diagnostic `hvpatch-job-control-flow.d` independently observed all
 per-vCPU DTrace buffers may flush counter records out of order, so this capture
 is cited only for exact population and liveness, never timing. Both durable raw
 files compare byte-identically with their original `target/task3` captures.
+The diagnostic run ID was `task3-job-control-flow-fatalfix`; scoped cleanup was
+zero.
 
 ## Focused and full gates
 
 Focused runtime tests were run serially and passed 35/35 for dispatch signal
-policy, 78/78 for kernel operations, and 19/19 for the HVPatch adapter:
+policy, 80/80 for kernel operations, and 19/19 for the HVPatch adapter:
 
 ```sh
 RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib dispatch::signal::tests
@@ -250,6 +267,9 @@ between authorization and publication. The fifth review tests cover the exact
 `A dequeued → SIGCONT → B generated → stale A action` sequence, prove that B
 without an intervening SIGCONT does not invalidate A, and prove that a
 publication after reparent wakes the exact current parent.
+The final two regressions prove that SIGKILL invalidates pre-dequeued stop work,
+leaves the fatal signal queued for the resumed vCPU, and never publishes a
+WCONTINUED event when releasing an already-stopped task.
 
 The CLI/profile tests passed 3/3 under the repository-required CLI stack:
 
@@ -262,7 +282,7 @@ They cover CLI selection, acceptance of a complete lossless stream, and
 rejection of host escape, a missing selector, and capture loss.
 
 The exact post-commit gate was then run at implementation HEAD
-`8ba49e13909ad4d53efb9fbef3008fb79b3c32fb`:
+`1b154315442e2f0e732dd6b765d2f3b8b8dd3337`:
 
 ```sh
 RUST_TEST_THREADS=1 just ci
@@ -270,7 +290,7 @@ RUST_TEST_THREADS=1 just ci
 
 Result: exit 0. This includes fmt-check, clippy with warnings denied,
 typed-domain lint, deny, matrix drift, check, rustdoc, host tests, and integration
-tests. The runtime library ran 1,594 cases with 0 failures (5 ignored); the
+tests. The runtime library ran 1,596 cases with 0 failures (5 ignored); the
 runtime integration suite was 296 passed / 0 failed.
 
 ## Signed artifact provenance
@@ -280,13 +300,13 @@ implementation commit and before both final captures.
 
 | Property | Value |
 |---|---|
-| Source commit | `8ba49e13909ad4d53efb9fbef3008fb79b3c32fb` |
-| Carrick SHA256 | `ded16f5b73c8ce462e33dcf7ae0fb92b22c0d239774c3410f0bc95bc3f974a83` |
+| Source commit | `1b154315442e2f0e732dd6b765d2f3b8b8dd3337` |
+| Carrick SHA256 | `6a17d2a09e8c00a30b6ae6c2a85a47c491abbe6fe3324649b4e7d8b04db099c1` |
 | Probe SHA256 | `48364d5473c643d67a105951748fe64ff7fadd306961c2ec297605e483f7f75d` |
-| LC_UUID | `FD55EB04-7182-333A-A439-447B948B74CA` |
-| Signature | ad hoc; CDHash `b342a5534560fdb3e9c5e6012ae0ea97c886b9f0` |
+| LC_UUID | `57241FE9-0AFD-3E21-B133-11105C2A97CA` |
+| Signature | ad hoc; CDHash `81b91fb182e2edfd7c26b3f392873e03e7cd5b85` |
 | Entitlement | `com.apple.security.hypervisor = true` |
-| DOF | `__TEXT,__dof_carrick` present (address `0x00000001012b7d8a`, size `0xb8e2`) |
+| DOF | `__TEXT,__dof_carrick` present (address `0x00000001012b7d8e`, size `0xb8e8`) |
 
 Raw receipt hashes:
 
@@ -294,15 +314,16 @@ Raw receipt hashes:
 |---|---|
 | `2026-08-14-hvpatch-job-control-red-receipt.txt` | `2e34f499469af0ef2bf4842d832ce0cf34835e901553df22a6a123402dfaa3cb` |
 | `2026-08-14-hvpatch-job-control-generation-red-receipt.txt` | `0765976b427678b6fdbb956f7239b27b552d5e8bfb6946e4ef5f14b67a68ffd3` |
-| `2026-08-14-hvpatch-exact-signal-red-receipt.txt` | `9a8d232642a7484e89f73b085fdb3de0832b4a5b73bb32515c9925cdffe95b92` |
-| `2026-08-14-hvpatch-kernelidentity-differential.txt` | `cca40cafeb04820b0765e1760ee4977bb3ec3b01f0c7eee2c47232874fb5bf07` |
-| `2026-08-14-hvpatch-kernelidentity-cleanup.txt` | `edae2c0ff3bfaa42a47bde1e21afd59c8d677efd05281bd2d5a18be5cec01392` |
+| `2026-08-14-hvpatch-exact-signal-red-receipt.txt` | `6e0c7ff12ba3888643b618d4cfb8057c40f12f5b7a22ed512ecfe525bd3e895a` |
+| `2026-08-14-hvpatch-sigkill-wcontinued-oracle.txt` | `ce2cdfff71fc8b0446d4184864723932e26c7f1654c2104686d27e3cc4f9bf0c` |
+| `2026-08-14-hvpatch-kernelidentity-differential.txt` | `f1a56206450db00cf1d6d7f6dd18fba42ea3f48e3c3692610568780ac973b7e2` |
+| `2026-08-14-hvpatch-kernelidentity-cleanup.txt` | `2f8e2b9f327e34dd24c4f56bee1c7b7f57b7e1107d349beee7905b2e36be89ed` |
 | `2026-08-14-hvpatch-identity-host-safety.raw` | `495b9d48d66b0e002847c2f9f2c31b683cf1bf4daed1d0327b62b056ad5836cc` |
-| `2026-08-14-hvpatch-identity-host-safety-command.txt` | `71c15997b243802baa28c4f83db573c585a830d1501d00809f5397649ba7f75b` |
-| `2026-08-14-hvpatch-identity-host-safety-cleanup.txt` | `f458bda6d85a19cdf8f1185e09b4fcac3b6f09b3f9da4c353ce8526bd8c0224a` |
-| `2026-08-14-hvpatch-job-control-flow.raw` | `1fce0141785d3aed66d59e5b1b316576ba7ee4991279584b5824f2a1aa19e290` |
-| `2026-08-14-hvpatch-job-control-flow-command.txt` | `44861896aed49d455b36d1b609e1cefdf9258e6b949b095ae210faa942377d72` |
-| `2026-08-14-hvpatch-job-control-flow-cleanup.txt` | `54fff2b6eb01a8736c79aacf216727fa91b5b5980ba24f82c7fd1a2b80304c23` |
+| `2026-08-14-hvpatch-identity-host-safety-command.txt` | `bc23dde02c1224c00dbbb58bc7a19f269e9395383759fadd240aa96a33ef6a9d` |
+| `2026-08-14-hvpatch-identity-host-safety-cleanup.txt` | `25152a265b5c8c4e53ad52136bb11daf2b3190f9082ceb9ddcef6acc05a09823` |
+| `2026-08-14-hvpatch-job-control-flow.raw` | `cd6bd41b46b16ba8d99d8a4cf8dd449ae4391f629731bd636d01dae192be2634` |
+| `2026-08-14-hvpatch-job-control-flow-command.txt` | `f1fd7c5193248cba057f84ff2f801756b7d779e36c702b2edf49af32efda8a1f` |
+| `2026-08-14-hvpatch-job-control-flow-cleanup.txt` | `8b59b94543e8dc75b15a7adb9df7cab46579c31f8f7856b72f191bd49775872f` |
 
 ## Remaining concerns
 
