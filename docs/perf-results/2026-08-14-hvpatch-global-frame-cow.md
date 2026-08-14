@@ -291,6 +291,11 @@ joined only to a broad inherited FrameId extent rather than the exact source
 compound. Commit `573dceaa75f413c85bfcae40fdc8e1e5fdbe5b82` closes both with
 the last-arm retry and effective descriptor-IPA interval check above.
 
+Final independent re-review of evidence HEAD `1f0dae875` returned YES with no
+Critical or Important findings. The reviewer independently matched the binary
+provenance, live receipt hash/counts, 21/21 validator suite, and 153/153
+HVPatch suite, and found the branch ready to merge.
+
 The final focused routing tests, 12 consecutive signed `mtforkcorrupt` runs,
 15-probe signed differential batch, live v5 structural receipt, and full CI
 were all run after the last correction.
