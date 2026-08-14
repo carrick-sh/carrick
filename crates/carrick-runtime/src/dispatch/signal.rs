@@ -83,6 +83,7 @@ pub(crate) struct DispatchPendingSignal {
     pub(crate) signum: i32,
     pub(crate) owner: crate::kernel::SignalPendingOwner,
     pub(crate) siginfo: Option<LinuxSiginfo>,
+    pub(crate) job_control_generation: Option<crate::kernel::JobControlContinueGeneration>,
 }
 
 /// Real-time signals (`SIGRTMIN`..=`SIGRTMAX`, kernel numbers 32..=64) queue
@@ -242,6 +243,7 @@ impl SyscallDispatcher {
         crate::kernel::SignalAuthority::new(
             context.shared().sighand(),
             context.shared().pending_signals(),
+            Arc::clone(context.task()),
             Self::required_signal_thread(context, tid),
         )
     }
@@ -938,6 +940,7 @@ impl SyscallDispatcher {
             signum: dequeued.pending.signal.raw(),
             owner: dequeued.owner,
             siginfo: dequeued.pending.siginfo,
+            job_control_generation: dequeued.job_control_generation,
         })
     }
 

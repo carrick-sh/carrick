@@ -1757,7 +1757,7 @@ mod tests {
         assert!(
             parent
                 .kernel_graph()
-                .stop_task_for_job_control(child.task_id(), sigstop)
+                .stop_task_for_job_control(child.task_id(), sigstop, None)
         );
         let WaitResult::StateChanged(stopped) =
             parent.wait_child_with_job_control(Some(child.pid()), true, false, true, false)

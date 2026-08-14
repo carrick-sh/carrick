@@ -4041,6 +4041,7 @@ pub(crate) fn assemble_run_result(
 pub(crate) struct PendingSignalAction {
     pub(crate) term_signal: Option<i32>,
     pub(crate) stop_signal: Option<i32>,
+    pub(crate) stop_generation: Option<crate::kernel::JobControlContinueGeneration>,
 }
 
 impl PendingSignalAction {
@@ -4048,6 +4049,7 @@ impl PendingSignalAction {
         Self {
             term_signal: None,
             stop_signal: None,
+            stop_generation: None,
         }
     }
 
@@ -4055,13 +4057,18 @@ impl PendingSignalAction {
         Self {
             term_signal: Some(signum),
             stop_signal: None,
+            stop_generation: None,
         }
     }
 
-    pub(super) fn stop(signum: i32) -> Self {
+    pub(super) fn stop(
+        signum: i32,
+        generation: Option<crate::kernel::JobControlContinueGeneration>,
+    ) -> Self {
         Self {
             term_signal: None,
             stop_signal: Some(signum),
+            stop_generation: generation,
         }
     }
 }
@@ -4110,10 +4117,11 @@ fn service_signals_threaded<E: ThreadedEngine>(
                 if kernel.hvpatch_process.is_some() {
                     let signal = crate::kernel::LinuxSignal::for_signal_number(signum)
                         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-                    if !context
-                        .kernel()
-                        .stop_task_for_job_control(context.task().key().id, signal)
-                    {
+                    if !context.kernel().stop_task_for_job_control(
+                        context.task().key().id,
+                        signal,
+                        action.stop_generation,
+                    ) {
                         return Err(RuntimeError::Configuration(format!(
                             "HVPatch default-stop lost live task {}",
                             context.task().key().id.raw()
