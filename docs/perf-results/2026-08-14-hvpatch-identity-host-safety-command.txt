@@ -1,0 +1,34 @@
+2026-08-14T07:32:41.275964Z  WARN carrick::commands: carrick trace: not root; re-executing under sudo
+TRACECHILD1|euid=501|egid=20|groups=12,20,33,61,79,80,81,98,100,204,250,395,398,399,400,701
+root_low_linux_id=true
+root_leader_tid_matches=true
+root_group_and_session_are_init=true
+root_proc_identity_matches=true
+positive_pid_one_live=true
+target_zero_live=true
+broadcast_live=true
+negative_pgid_one_live=true
+selector_errno_nonnegative=true
+child_setup_ready=true
+child_id_is_linux_shaped=true
+child_tid_ppid_match=true
+child_tid_matches_pid=true
+child_ppid_matches_parent=true
+child_process_group_session_match=true
+child_proc_identity_matches=true
+child_received_kill_tgkill_group_and_xsig_shape=true
+kill_child_zero_succeeded=true
+kill_child_signal_succeeded=true
+tgkill_child_zero_succeeded=true
+tgkill_child_signal_succeeded=true
+kill_child_group_succeeded=true
+kill_child_xsig_shape_succeeded=true
+waitpid_child_group_succeeded=true
+cross_signal_calls_succeeded=true
+session_identity_matches=true
+exec_pid_tid_persist=true
+exec_group_session_persist=true
+exec_proc_identity_matches=true
+exec_signal_dispositions_reset_and_preserve=true
+exec_child_exited_zero=true
+HVPatch identity host safety: guest_kills=8, low_guest_id_host_kills=0
