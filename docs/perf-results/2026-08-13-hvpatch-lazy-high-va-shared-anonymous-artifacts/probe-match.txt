@@ -1,0 +1,15 @@
+CARRICK_PROBE_RUN_ID=cr-53745-28369
+CARRICK_PROBE_CLEANUP_RUN_ID=cr-53745-28369
+remaining carrick procs (run-id cr-53745-28369) = 0
+MATCH mmaptrimprotect
+  hinted_high_result=0
+  hinted_high2_result=0
+  hinted_high_shared_mprotect=ok
+  hinted_high_shared_parent_seeded=ok
+  hinted_high_shared_fork_visibility=0
+  v8_readonly_page_errno=0
+  tail_trim_only_errno=0
+  large_reserve_errno=0
+  untrimmed_control_errno=0
+  hinted_high_live_mprotect_errno=0
+  hinted_high_rw_roundtrip=0
