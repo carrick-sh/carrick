@@ -3682,6 +3682,30 @@ enum FrameCowWriteRoute {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnarmedPermissionFaultRoute {
+    NotCow,
+    RetryCommittedWinner,
+    MissingArm,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn unarmed_permission_fault_route(
+    private_writable_mapping: bool,
+    write_denied: bool,
+    any_arms: bool,
+    live_leaf_is_writable: bool,
+) -> UnarmedPermissionFaultRoute {
+    if !private_writable_mapping || write_denied || !any_arms {
+        UnarmedPermissionFaultRoute::NotCow
+    } else if live_leaf_is_writable {
+        UnarmedPermissionFaultRoute::RetryCommittedWinner
+    } else {
+        UnarmedPermissionFaultRoute::MissingArm
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn frame_cow_write_route(
     intent: carrick_aarch64::vmm::FrameCowWriteIntent,
     armed: bool,
@@ -6170,6 +6194,52 @@ impl HvfVmState {
         Ok(Some(span_end))
     }
 
+    fn live_stage1_names_writable_private_mapping(
+        &self,
+        fault_va: u64,
+        mapping: MappingView,
+    ) -> Result<bool, TrapError> {
+        const VALID_PAGE: u64 = 0b11;
+        const NON_GLOBAL: u64 = 1 << 11;
+        const AP_MASK: u64 = 0b11 << 6;
+        const AP_USER_RW: u64 = 0b01 << 6;
+        const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
+        const PAGE_SIZE: u64 = 4 * 1024;
+
+        let page_va = align_down(fault_va, PAGE_SIZE);
+        let expected_ipa = mapping
+            .ipa
+            .checked_add(page_va.checked_sub(mapping.start).ok_or_else(|| {
+                TrapError::Hypervisor("HVPatch winner PTE precedes mapping start".to_owned())
+            })?)
+            .ok_or_else(|| TrapError::Hypervisor("HVPatch winner PTE IPA overflow".to_owned()))?;
+        let page_table_host = self
+            .mapping_for_range(
+                crate::memory::LINUX_PAGE_TABLES_BASE,
+                carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+            )
+            .map(|mapping| mapping.host_addr)
+            .ok_or_else(|| {
+                TrapError::Hypervisor("HVPatch winner PTE page-table backing is absent".to_owned())
+            })?;
+        let page_tables = self.page_tables.lock();
+        let manager = page_tables.as_ref().ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch winner PTE manager is absent".to_owned())
+        })?;
+        let shadow = manager.debug_walk(page_va);
+        let live = unsafe { manager.debug_walk_host(page_table_host.cast_const(), page_va) };
+        if shadow != live {
+            return Err(TrapError::Hypervisor(format!(
+                "HVPatch winner PTE shadow/live mismatch at VA 0x{page_va:x}: shadow={shadow:x?} live={live:x?}"
+            )));
+        }
+        let leaf = live[3];
+        Ok(leaf & VALID_PAGE == VALID_PAGE
+            && leaf & NON_GLOBAL != 0
+            && leaf & AP_MASK == AP_USER_RW
+            && leaf & PA_MASK_4KIB == expected_ipa & PA_MASK_4KIB)
+    }
+
     fn perform_frame_cow(
         &mut self,
         fault_va: u64,
@@ -6195,8 +6265,52 @@ impl HvfVmState {
         );
 
         // Another vCPU of this mm may have won while we waited for topology.
-        let Some(span) = self.cow_armed.lock().span_for(fault_va) else {
-            return Ok(false);
+        let (span, armed) = {
+            let cow_armed = self.cow_armed.lock();
+            (cow_armed.span_for(fault_va), cow_armed.ranges.clone())
+        };
+        let Some(span) = span else {
+            let mapping = self.mapping_for_range(fault_va, 1);
+            let write_denied = self.protections.range_write_denied(fault_va, 1);
+            let private_writable_mapping = mapping.is_some_and(|mapping| {
+                mapping.guest_writable && mapping.sharing == GuestMappingSharing::Private
+            });
+            let live_leaf_is_writable = match mapping {
+                Some(mapping) if private_writable_mapping && !write_denied => {
+                    self.live_stage1_names_writable_private_mapping(fault_va, mapping)?
+                }
+                _ => false,
+            };
+            match unarmed_permission_fault_route(
+                private_writable_mapping,
+                write_denied,
+                !armed.is_empty(),
+                live_leaf_is_writable,
+            ) {
+                UnarmedPermissionFaultRoute::NotCow => return Ok(false),
+                UnarmedPermissionFaultRoute::RetryCommittedWinner => {
+                    // The exact live descriptor is already writable and names
+                    // the current private mapping: a sibling won this COW while
+                    // this vCPU was parking. Flush the losing vCPU's stale RO
+                    // translation and retry the faulting instruction.
+                    flush_stage1()?;
+                    return Ok(true);
+                }
+                UnarmedPermissionFaultRoute::MissingArm => {
+                    let mapping_shape = mapping.map(|mapping| {
+                        (
+                            mapping.start,
+                            mapping.end,
+                            mapping.ipa,
+                            mapping.guest_writable,
+                            mapping.sharing,
+                        )
+                    });
+                    return Err(TrapError::Hypervisor(format!(
+                        "HVPatch private writable permission fault at VA 0x{fault_va:x} has no COW arm; mapping={mapping_shape:?} write_denied={write_denied} armed={armed:?}"
+                    )));
+                }
+            }
         };
         // COW allocation is physical at the 16 KiB host compound, but guest
         // access authority is semantic at the exact fault byte. A compound can
@@ -6653,29 +6767,6 @@ impl HvfVmState {
             return Ok(false);
         }
         let fault_va = strip_pointer_tag(far);
-        let armed = self.cow_armed.lock().ranges.clone();
-        let mapping = self.mapping_for_range(fault_va, 1);
-        let write_denied = self.protections.range_write_denied(fault_va, 1);
-        let missing_private_arm = mapping.is_some_and(|mapping| {
-            mapping.guest_writable && mapping.sharing == GuestMappingSharing::Private
-        });
-        if self.cow_armed.lock().span_for(fault_va).is_none()
-            && missing_private_arm
-            && !armed.is_empty()
-        {
-            let mapping_shape = mapping.map(|mapping| {
-                (
-                    mapping.start,
-                    mapping.end,
-                    mapping.ipa,
-                    mapping.guest_writable,
-                    mapping.sharing,
-                )
-            });
-            return Err(TrapError::Hypervisor(format!(
-                "HVPatch private writable permission fault at VA 0x{fault_va:x} has no COW arm; mapping={mapping_shape:?} write_denied={write_denied} armed={armed:?}"
-            )));
-        }
         self.perform_frame_cow(
             fault_va,
             carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible,
@@ -12763,6 +12854,30 @@ mod frame_inventory_backend_tests {
         assert!(
             !frame_cow_write_is_denied(true, FrameCowWriteIntent::PrivilegedInternal),
             "a Carrick-owned unchecked write must split without changing guest permissions",
+        );
+    }
+
+    #[test]
+    fn concurrent_cow_loser_retries_only_an_exact_live_writable_winner() {
+        assert_eq!(
+            unarmed_permission_fault_route(true, false, true, true),
+            UnarmedPermissionFaultRoute::RetryCommittedWinner,
+            "a sibling winner removes the arm before the losing vCPU resumes"
+        );
+        assert_eq!(
+            unarmed_permission_fault_route(true, false, true, false),
+            UnarmedPermissionFaultRoute::MissingArm,
+            "a still-read-only private leaf without its arm is structural corruption"
+        );
+        assert_eq!(
+            unarmed_permission_fault_route(true, true, true, false),
+            UnarmedPermissionFaultRoute::NotCow,
+            "mprotect-denied writes remain ordinary guest faults"
+        );
+        assert_eq!(
+            unarmed_permission_fault_route(true, false, false, false),
+            UnarmedPermissionFaultRoute::NotCow,
+            "an address space with no fork arms is not routed into COW"
         );
     }
 
