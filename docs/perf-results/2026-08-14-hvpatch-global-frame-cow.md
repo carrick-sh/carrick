@@ -7,7 +7,8 @@ Base: `b103d8ba04fa632682192d2eba1042dd7c1c7464`
 Implementation: `ad0a945bb728737db969f921b70c5b95b22ee27b`, exact-lifetime
 closure `0d686ce7a0f74ed22ab15bed9430c6bf5a5059e4`, publication/receipt
 closure `265ff2f024bfd3368ad23b73877572ae03bc7b54`, and concurrent-winner
-retry `799b6b4b78a563ef8df3fbc6f98b392bee2c7216`
+retry `799b6b4b78a563ef8df3fbc6f98b392bee2c7216`, with exact final-arm and
+fault-compound authentication in `573dceaa75f413c85bfcae40fdc8e1e5fdbe5b82`
 
 Lane: Darwin/arm64, signed `--exec-backend hvpatch`
 
@@ -155,8 +156,9 @@ When two same-mm writers race on one armed page, the missing-arm decision is
 made only after COW quiesce and topology exclusion. A loser retries only when
 the shadow and live walks agree on an exact valid L3 private leaf whose nG,
 RW AP, and PA prove that the winner already committed; it receives a scoped
-TLBI first. A still-read-only or otherwise mismatched missing arm remains a
-fatal structural error.
+TLBI first, even if the winner removed the final arm. A still-read-only missing
+arm remains a fatal structural error when other fork arms prove active COW
+authority; without any fork authority it remains an ordinary guest fault.
 
 `mprotect`, partial `munmap`, retained invalid leaves, `brk` reuse, lazy high-VA
 commitment, exec replacement, descendant fork, and shared-file `SIGBUS`
@@ -178,19 +180,19 @@ Command shape (issued from the repository root with the probe bytes on stdin):
 ```sh
 base64 -i conformance-probes/target/aarch64-unknown-linux-musl/release/forkheapalloc \
   | target/release/carrick trace --profile hvpatch-frame-cow \
-      --trace-out /tmp/hybrid-task4-final-799b6b4b-20260814.raw \
-      --forward-env CARRICK_RUN_ID=hybrid-task4-final-799b6b4b-20260814 \
+      --trace-out /tmp/hybrid-task4-final-573dceaa-20260814.raw \
+      --forward-env CARRICK_RUN_ID=hybrid-task4-final-573dceaa-20260814 \
       run --exec-backend hvpatch ubuntu:24.04 --raw --fs host \
       /bin/sh -c 'base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p'
 python3 scripts/validate-hvpatch-frame-cow.py --require-shared \
-  /tmp/hybrid-task4-final-799b6b4b-20260814.raw
-sudo -n scripts/sudo/kill.sh hybrid-task4-final-799b6b4b-20260814
+  /tmp/hybrid-task4-final-573dceaa-20260814.raw
+sudo -n scripts/sudo/kill.sh hybrid-task4-final-573dceaa-20260814
 ```
 
 Validated receipt:
 
 ```json
-{"backing_maintenance_transactions":1,"cow_transactions":29,"guest_visible_transactions":28,"private_fork_frames":39,"privileged_internal_transactions":0,"pte_receipts":136,"raw_sha256":"1aee49a4e5632b2f176f1bc530b6dc48e777e791de0323ae1c14a89a0ff53368","schema":"carrick.hvpatch-frame-cow-receipt.v5","shared_fork_frames":4,"stage2_maps":118,"stage2_unmaps":118,"status":"validated"}
+{"backing_maintenance_transactions":1,"cow_transactions":29,"guest_visible_transactions":28,"private_fork_frames":39,"privileged_internal_transactions":0,"pte_receipts":136,"raw_sha256":"42c70d93389c6b07759310ac19c14c95db5b7df6c82b0a915988e8d2ec26e992","schema":"carrick.hvpatch-frame-cow-receipt.v5","shared_fork_frames":4,"stage2_maps":118,"stage2_unmaps":118,"status":"validated"}
 ```
 
 The serialized terminal record also reported `events=87`, `identities=87`,
@@ -208,10 +210,13 @@ stage-2 coverage, overlapping/unbalanced extents, nonzero drops/errors,
 interruption, timeout, or an unobserved target exit. It walks terminal AArch64
 L1/L2 block descriptors as well as L3 page descriptors, requires an exact typed
 fault-sequence/PTE/TTBR consuming join for every guest-visible permission COW,
-and rejects one host extent mapped at disjoint IPAs. Nineteen mutation/unit
+computes the effective IPA named by L1/L2 blocks or L3 pages at the exact fault
+VA, requires that IPA inside the transaction's exact 16 KiB source compound,
+and rejects one host extent mapped at disjoint IPAs. Twenty-one mutation/unit
 tests exercise those rejection paths, including stale timestamps, substituted
-or reused sequence numbers, summary-only evidence, and removal of all fault
-records from an otherwise well-formed receipt.
+or reused sequence numbers, same-FrameId/different-compound substitution,
+summary-only evidence, and removal of all fault records from an otherwise
+well-formed receipt.
 
 ## Signed differential behavior
 
@@ -221,33 +226,33 @@ and Docker serially, reported `MATCH`, and scoped cleanup to its unique run ID.
 
 | Probe | Run ID | Required edge | Cleanup |
 |---|---|---|---:|
-| `forkcow` | `cr-57999-15173` | data/BSS/heap/private-mmap isolation | 0 |
-| `forkshared` | `cr-58043-19233` | shared anonymous descendant visibility | 0 |
-| `forkheapalloc` | `cr-58085-22384` | post-fork heap allocation/reuse | 0 |
-| `mtforkcorrupt` | `cr-58129-26443` | multithreaded fork canaries | 0 |
-| `mmapfileforkwriteback` | `cr-58172-13665` | shared-file writeback across fork | 0 |
-| `mmaptrimprotect` | `cr-58215-886` | partial unmap, high VA, `mprotect` | 0 |
-| `mmapprivfile` | `cr-58257-4038` | private file COW, truncation, `SIGBUS` | 0 |
-| `mmapmunmap` | `cr-58299-7189` | map/unmap validation | 0 |
-| `brkheapgrow` | `cr-58341-10340` | grow/shrink/regrow zero-fill | 0 |
-| `forkhighva` | `cr-58384-30329` | lazy high-VA fork survival | 0 |
-| `mapfixedfork` | `cr-58426-16642` | fixed private replacement/isolation | 0 |
-| `forksnapshot` | `cr-58468-19793` | stack/private mmap byte parity | 0 |
-| `rosharedbus` | `cr-58510-22945` | read-only shared syscall access | 0 |
-| `mmapfileshare_mt` | `cr-58554-27004` | multithreaded shared-file readers | 0 |
-| `forkfault` | `cr-58596-30156` | private protection-fault delivery | 0 |
+| `forkcow` | `cr-64300-7639` | data/BSS/heap/private-mmap isolation | 0 |
+| `forkshared` | `cr-64344-11699` | shared anonymous descendant visibility | 0 |
+| `forkheapalloc` | `cr-64386-14850` | post-fork heap allocation/reuse | 0 |
+| `mtforkcorrupt` | `cr-64428-18001` | multithreaded fork canaries | 0 |
+| `mmapfileforkwriteback` | `cr-64470-21152` | shared-file writeback across fork | 0 |
+| `mmaptrimprotect` | `cr-64514-25212` | partial unmap, high VA, `mprotect` | 0 |
+| `mmapprivfile` | `cr-64556-28363` | private file COW, truncation, `SIGBUS` | 0 |
+| `mmapmunmap` | `cr-64600-15585` | map/unmap validation | 0 |
+| `brkheapgrow` | `cr-64642-18736` | grow/shrink/regrow zero-fill | 0 |
+| `forkhighva` | `cr-64684-21887` | lazy high-VA fork survival | 0 |
+| `mapfixedfork` | `cr-64726-25038` | fixed private replacement/isolation | 0 |
+| `forksnapshot` | `cr-64769-12260` | stack/private mmap byte parity | 0 |
+| `rosharedbus` | `cr-64811-15411` | read-only shared syscall access | 0 |
+| `mmapfileshare_mt` | `cr-64855-19471` | multithreaded shared-file readers | 0 |
+| `forkfault` | `cr-64897-22622` | private protection-fault delivery | 0 |
 
 ## Binary provenance
 
-- SHA-256: `d3fa92902bbe7f9674771404ec563ddd52c9dc4bf66a83b740e20df9478c8e77`
-- LC_UUID: `F28DC017-8C76-3829-9961-44169BA6E1F1` (`arm64`)
+- SHA-256: `8203c7900155f3af4588dc700c147bc6851650f8782bcfff7e3c073ac61ebce4`
+- LC_UUID: `6AC5AA25-40A9-3A26-A0BF-B1A35B6BE02F` (`arm64`)
 - Entitlement: `com.apple.security.hypervisor = true`
-- DOF: `__TEXT,__dof_carrick`, size `0xc49e`
+- DOF: `__TEXT,__dof_carrick`, size `0xc498`
 
 ## Host gates
 
 - `cargo test -p carrick-vmm-hvf --lib`: 153 passed.
-- `python3 -m unittest scripts/test_validate_hvpatch_frame_cow.py`: 19 passed.
+- `python3 -m unittest scripts/test_validate_hvpatch_frame_cow.py`: 21 passed.
 - `RUST_TEST_THREADS=1 cargo test -p carrick-runtime hvpatch_fixed_va_aliases_do_not_consume_the_legacy_monotonic_ipa_cursor`:
   passed 40,000 fixed HVPatch publications without calling the legacy cursor.
 - `cargo test -p carrick-mem retained_output_resolves_invalidated_private_alias_without_revalidating_it`: passed.
@@ -279,6 +284,12 @@ parent publication, child reservation, backend materialization, exec fail-stop,
 fixed-VA monotonic-cursor, and exact consuming receipt-join gaps described
 above. Commit `799b6b4b78a563ef8df3fbc6f98b392bee2c7216` then closes the
 independently discovered concurrent-winner stale-fault race.
+
+Review of `ee3ed0293` found two remaining Important edges: the winning writer
+could remove the last arm before the losing fault resumed, and a fault PTE was
+joined only to a broad inherited FrameId extent rather than the exact source
+compound. Commit `573dceaa75f413c85bfcae40fdc8e1e5fdbe5b82` closes both with
+the last-arm retry and effective descriptor-IPA interval check above.
 
 The final focused routing tests, 12 consecutive signed `mtforkcorrupt` runs,
 15-probe signed differential batch, live v5 structural receipt, and full CI
