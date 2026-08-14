@@ -375,13 +375,18 @@ where
     let pending = crate::host_signal::take_pending_for(tid.raw());
     // A dispatcher dequeue returns owner and payload atomically. A host-slot
     // signal remains thread-directed and consumes its per-thread payload below.
-    let (pending, dequeued_siginfo, from_dispatcher) = if pending == 0 {
+    let (pending, dequeued_siginfo, from_dispatcher, job_control_generation) = if pending == 0 {
         match dispatcher.take_deliverable_pending_from(context, tid) {
-            Some(pending) => (pending.signum, pending.siginfo, true),
+            Some(pending) => (
+                pending.signum,
+                pending.siginfo,
+                true,
+                pending.job_control_generation,
+            ),
             None => return Ok(None),
         }
     } else {
-        (pending, None, false)
+        (pending, None, false, None)
     };
     crate::probes::signal_deliver(tid.raw(), pending);
     // A blocked signal must not be delivered — hold it pending until the guest
@@ -503,7 +508,10 @@ where
             Ok(Some(PendingSignalAction::ignored()))
         }
         None if is_default_ignore_signal(pending) => Ok(Some(PendingSignalAction::ignored())),
-        None if is_default_stop_signal(pending) => Ok(Some(PendingSignalAction::stop(pending))),
+        None if is_default_stop_signal(pending) => Ok(Some(PendingSignalAction::stop(
+            pending,
+            job_control_generation,
+        ))),
         None => Ok(Some(PendingSignalAction::terminate(pending))),
     }
 }

@@ -2246,6 +2246,9 @@ struct TaskIdentity {
     session: SessionId,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct JobControlContinueGeneration(u64);
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum DefaultStopGeneration {
     #[default]
@@ -2259,7 +2262,16 @@ struct TaskJobControl {
     stopped_by: Option<LinuxSignal>,
     pending_stop: Option<LinuxSignal>,
     pending_continue: bool,
+    continue_generation: u64,
     default_stop_generation: DefaultStopGeneration,
+}
+
+fn advance_job_control_continue_generation(state: &mut TaskJobControl) {
+    let Some(next) = state.continue_generation.checked_add(1) else {
+        tracing::error!("job-control continue generation exhausted");
+        std::process::abort();
+    };
+    state.continue_generation = next;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2573,17 +2585,45 @@ impl Task {
                 | carrick_abi::LINUX_SIGTTOU
         ) {
             state.default_stop_generation = DefaultStopGeneration::Pending;
-        } else if signal.raw() == carrick_abi::LINUX_SIGCONT
-            && state.default_stop_generation == DefaultStopGeneration::Pending
-        {
+        } else if signal.raw() == carrick_abi::LINUX_SIGCONT {
+            advance_job_control_continue_generation(&mut state);
             state.default_stop_generation = DefaultStopGeneration::Cancelled;
+        }
+    }
+
+    /// Snapshot the exact SIGCONT epoch in which a stop left a pending queue.
+    /// The caller holds [`Self::lock_signal_generation`] across dequeue and this
+    /// read, so SIGCONT cannot create an ABA window.
+    fn job_control_generation_for_dequeue(
+        &self,
+        signal: LinuxSignal,
+    ) -> Option<JobControlContinueGeneration> {
+        if !matches!(
+            signal.raw(),
+            carrick_abi::LINUX_SIGSTOP
+                | carrick_abi::LINUX_SIGTSTP
+                | carrick_abi::LINUX_SIGTTIN
+                | carrick_abi::LINUX_SIGTTOU
+        ) {
+            return None;
+        }
+        let state = self.job_control.lock();
+        match state.default_stop_generation {
+            DefaultStopGeneration::Pending => {
+                Some(JobControlContinueGeneration(state.continue_generation))
+            }
+            DefaultStopGeneration::None | DefaultStopGeneration::Cancelled => None,
         }
     }
 
     /// Publish one default-stop transition and a waitable child-state event.
     /// Repeated stop signals while already stopped do not manufacture another
     /// WUNTRACED report.
-    pub(super) fn stop_for_job_control(&self, signal: LinuxSignal) -> bool {
+    pub(super) fn stop_for_job_control(
+        &self,
+        signal: LinuxSignal,
+        action_generation: Option<JobControlContinueGeneration>,
+    ) -> bool {
         // Keep the lifecycle lock through publication. Otherwise exit could
         // clear job control between this check and the state write, leaving a
         // retired task stopped forever with nobody left to resume it.
@@ -2592,21 +2632,20 @@ impl Task {
             return false;
         }
         let mut state = self.job_control.lock();
-        match state.default_stop_generation {
-            DefaultStopGeneration::Cancelled => {
-                // Cancellation is the latest task-wide generation, not a
-                // one-shot token. More than one vCPU may already have dequeued
-                // a stop signal when SIGCONT is generated; every one of those
-                // delayed default actions must remain stale until a NEW stop
-                // generation replaces this state.
+        match action_generation {
+            Some(generation)
+                if generation != JobControlContinueGeneration(state.continue_generation) =>
+            {
+                // Every dequeued stop action is tied to the SIGCONT epoch in
+                // which it left pending state. A newer stop does not invalidate
+                // it, but any intervening SIGCONT does, even if another stop
+                // has since made the aggregate state Pending again.
                 return true;
             }
-            // Retain the pending generation after the first action too. A
-            // second vCPU may have dequeued another stop before this one
-            // published the group stop; a later SIGCONT must still be able to
-            // invalidate that second action.
-            DefaultStopGeneration::Pending => {}
-            DefaultStopGeneration::None => {}
+            None if state.default_stop_generation == DefaultStopGeneration::Cancelled => {
+                return true;
+            }
+            Some(_) | None => {}
         }
         if state.stopped_by.is_some() {
             return true;
@@ -3320,6 +3359,7 @@ pub enum SignalPendingOwner {
 pub struct SignalDequeue {
     pub owner: SignalPendingOwner,
     pub pending: PendingSignal,
+    pub(crate) job_control_generation: Option<JobControlContinueGeneration>,
 }
 
 /// Exact signal leaf bundle captured from one [`super::core::KernelContext`].
@@ -3329,6 +3369,7 @@ pub struct SignalDequeue {
 pub struct SignalAuthority {
     sighand: Arc<Sighand>,
     task_pending: Arc<TaskPendingSignals>,
+    task: TaskRef,
     thread: ThreadRef,
 }
 
@@ -3336,11 +3377,13 @@ impl SignalAuthority {
     pub(crate) fn new(
         sighand: Arc<Sighand>,
         task_pending: Arc<TaskPendingSignals>,
+        task: TaskRef,
         thread: ThreadRef,
     ) -> Self {
         Self {
             sighand,
             task_pending,
+            task,
             thread,
         }
     }
@@ -3405,7 +3448,10 @@ impl SignalAuthority {
 
     /// Choose and dequeue one candidate under the canonical thread-then-task
     /// lock order. A same-signum tie is thread-directed, preserving provenance.
+    /// Job-control generation stays locked through dequeue so a later default
+    /// action carries the exact SIGCONT epoch in which it left pending state.
     pub fn take_lowest_in(&self, wanted: SigSet) -> Option<SignalDequeue> {
+        let generation_guard = self.task.lock_signal_generation();
         let mut thread = self.thread.signal_state.lock();
         let mut task = self.task_pending.queue.lock();
         let thread_signal = thread.pending().intersect(wanted).lowest_signum();
@@ -3432,7 +3478,15 @@ impl SignalAuthority {
                 pending
             }
         };
-        Some(SignalDequeue { owner, pending })
+        drop(thread);
+        drop(task);
+        let job_control_generation = self.task.job_control_generation_for_dequeue(pending.signal);
+        drop(generation_guard);
+        Some(SignalDequeue {
+            owner,
+            pending,
+            job_control_generation,
+        })
     }
 
     pub fn altstack(&self) -> Option<LinuxSigaltstack> {
@@ -3877,6 +3931,7 @@ mod tests {
         let authority = SignalAuthority::new(
             shared.sighand(),
             shared.pending_signals(),
+            Arc::clone(&fixture.task),
             Arc::clone(&fixture.leader),
         );
         let signal = LinuxSignal::for_signal_number(34).expect("realtime signal");
@@ -3894,6 +3949,7 @@ mod tests {
                     signal,
                     siginfo: Some(thread_info),
                 },
+                job_control_generation: None,
             })
         );
         assert_eq!(
@@ -3904,6 +3960,7 @@ mod tests {
                     signal,
                     siginfo: Some(task_info),
                 },
+                job_control_generation: None,
             })
         );
         assert!(!authority.may_have_thread_pending());

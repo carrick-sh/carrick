@@ -45,7 +45,6 @@ pub use ids::{
     InvalidLinuxSignal, LinuxSignal, LinuxTid, MmId, ObjectIdError, ObjectIdRegistry,
     ProcessGroupId, SessionId, SighandId, TaskId, TaskSerial, ThreadSerial,
 };
-pub(crate) use objects::FileDescriptionBacking;
 pub use objects::{
     Credentials, FileDescription, FileDescriptionBackingKind, FileDescriptionBackingSnapshot,
     FileSlot, FileTable, FsContext, HandlerFrameState, LinuxWaitStatus, Mm, ObjectGraphError,
@@ -55,6 +54,7 @@ pub use objects::{
     TaskShared, TaskSharedCloneError, TaskWaker, Thread, ThreadKey, ThreadRef, ThreadResources,
     ThreadRunner, ThreadSignalState, Zombie,
 };
+pub(crate) use objects::{FileDescriptionBacking, JobControlContinueGeneration};
 pub(crate) use operations::ExactSignalTargetAuthorization;
 pub use operations::{
     ChildStartOutcome, ChildStartWait, ForkReservation, KernelFailpoint, KernelOperationError,

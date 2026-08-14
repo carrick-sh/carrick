@@ -67,6 +67,7 @@ impl KernelContext {
         super::objects::SignalAuthority::new(
             self.shared.sighand(),
             self.shared.pending_signals(),
+            Arc::clone(&self.task),
             Arc::clone(&self.thread),
         )
     }

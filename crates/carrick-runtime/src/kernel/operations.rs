@@ -84,7 +84,6 @@ pub(crate) struct AuthorizedSignalTarget {
     domain: Arc<KernelDomain>,
     task: Weak<Task>,
     thread: Option<Weak<super::objects::Thread>>,
-    parent: Option<Weak<Task>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1000,6 +999,17 @@ impl Kernel {
         })
     }
 
+    /// Resolve a task's exact parent at the moment a waitable state change has
+    /// already been published. The registry lock is released before callers
+    /// invoke the lane waker.
+    fn current_parent_task(&self, task: &Task) -> Option<TaskRef> {
+        let state = self.registry().state.read();
+        task.parent()
+            .and_then(|key| state.tasks.get(&key.id).map(|record| (key, record)))
+            .filter(|(key, record)| record.task.key() == *key)
+            .map(|(_, record)| Arc::clone(&record.task))
+    }
+
     /// Authorize a process- or thread-directed Linux signal without consulting
     /// host process identity. `target_thread == None` uses the task's retained
     /// leader credential authority; thread-directed calls name the exact target
@@ -1051,7 +1061,7 @@ impl Kernel {
         if !std::ptr::eq(self, caller.kernel().as_ref()) {
             return ExactSignalTargetAuthorization::Missing;
         }
-        let (target, thread, parent, target_credentials, target_session, target_sighand) = {
+        let (target, thread, target_credentials, target_session, target_sighand) = {
             let state = self.registry().state.read();
             let Some(record) = state.tasks.get(&target_task.id) else {
                 return ExactSignalTargetAuthorization::Missing;
@@ -1071,16 +1081,9 @@ impl Kernel {
                 }
                 None => (record.task.process_credentials(), None),
             };
-            let parent = record
-                .task
-                .parent()
-                .and_then(|key| state.tasks.get(&key.id).map(|record| (key, record)))
-                .filter(|(key, record)| record.task.key() == *key)
-                .map(|(_, record)| Arc::clone(&record.task));
             (
                 Arc::clone(&record.task),
                 thread,
-                parent,
                 credentials,
                 record.task.session(),
                 record.task.shared().sighand(),
@@ -1120,15 +1123,19 @@ impl Kernel {
             domain: Arc::clone(self.domain()),
             task: Arc::downgrade(&target),
             thread: thread.as_ref().map(Arc::downgrade),
-            parent: parent.as_ref().map(Arc::downgrade),
         })
     }
 
     /// Apply a default-stop action to one live Linux task without signaling
     /// the host carrier process. The target's vCPU threads and its parent wait
     /// vehicle are woken only after the task-scoped state is published.
-    pub fn stop_task_for_job_control(&self, target: TaskId, signal: LinuxSignal) -> bool {
-        let (task, parent) = {
+    pub(crate) fn stop_task_for_job_control(
+        &self,
+        target: TaskId,
+        signal: LinuxSignal,
+        action_generation: Option<super::objects::JobControlContinueGeneration>,
+    ) -> bool {
+        let task = {
             let state = self.registry().state.read();
             let Some(record) = state.tasks.get(&target) else {
                 return false;
@@ -1136,17 +1143,14 @@ impl Kernel {
             if record.task.lifecycle() != TaskLifecycle::Live {
                 return false;
             }
-            let parent_key = record.task.parent();
-            let parent = parent_key
-                .and_then(|key| state.tasks.get(&key.id).map(|record| (key, record)))
-                .filter(|(key, record)| record.task.key() == *key)
-                .map(|(_, record)| Arc::clone(&record.task));
-            (Arc::clone(&record.task), parent)
+            Arc::clone(&record.task)
         };
-        let _generation = task.lock_signal_generation();
-        if !task.stop_for_job_control(signal) {
+        let generation = task.lock_signal_generation();
+        if !task.stop_for_job_control(signal, action_generation) {
             return false;
         }
+        drop(generation);
+        let parent = self.current_parent_task(&task);
         task.wake();
         if let Some(parent) = parent {
             parent.wake();
@@ -1158,7 +1162,7 @@ impl Kernel {
     /// but already running (or absent); SIGCONT delivery itself may still
     /// succeed and may still invoke a caught handler.
     pub fn continue_task_from_job_control(&self, target: TaskId) -> bool {
-        let (task, parent) = {
+        let task = {
             let state = self.registry().state.read();
             let Some(record) = state.tasks.get(&target) else {
                 return false;
@@ -1166,17 +1170,14 @@ impl Kernel {
             if record.task.lifecycle() != TaskLifecycle::Live {
                 return false;
             }
-            let parent_key = record.task.parent();
-            let parent = parent_key
-                .and_then(|key| state.tasks.get(&key.id).map(|record| (key, record)))
-                .filter(|(key, record)| record.task.key() == *key)
-                .map(|(_, record)| Arc::clone(&record.task));
-            (Arc::clone(&record.task), parent)
+            Arc::clone(&record.task)
         };
-        let _generation = task.lock_signal_generation();
+        let generation = task.lock_signal_generation();
         if !task.continue_from_job_control() {
             return false;
         }
+        drop(generation);
+        let parent = self.current_parent_task(&task);
         task.wake();
         if let Some(parent) = parent {
             parent.wake();
@@ -1319,8 +1320,17 @@ impl Kernel {
             false
         };
         drop(generation);
+        // WCONTINUED belongs to the parent CURRENT at publication, not the
+        // parent observed when authorization began. Resolve the exact current
+        // TaskKey after publishing the event, then release the registry lock
+        // before calling the lane waker.
+        let parent = if continued {
+            self.current_parent_task(&task)
+        } else {
+            None
+        };
         task.wake();
-        if continued && let Some(parent) = target.parent.as_ref().and_then(Weak::upgrade) {
+        if let Some(parent) = parent {
             parent.wake();
         }
         true
@@ -4019,7 +4029,7 @@ mod tests {
         let child_id = fork_child(&kernel, &root, "job-control child", 708);
         let sigstop = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGSTOP).expect("SIGSTOP");
 
-        assert!(kernel.stop_task_for_job_control(child_id, sigstop));
+        assert!(kernel.stop_task_for_job_control(child_id, sigstop, None));
         assert!(kernel.task_is_job_control_stopped(child_id));
         assert_eq!(
             kernel
@@ -4063,7 +4073,7 @@ mod tests {
         let sigtstp = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGTSTP).expect("SIGTSTP");
         let sigcont = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGCONT).expect("SIGCONT");
 
-        assert!(kernel.stop_task_for_job_control(child_id, sigstop));
+        assert!(kernel.stop_task_for_job_control(child_id, sigstop, None));
         assert!(kernel.post_signal_to_task(child_id, sigstop, None));
         assert!(kernel.post_signal_to_thread(child_id, child_tid, sigtstp, None));
         assert!(kernel.post_signal_to_task(child_id, sigcont, None));
@@ -4134,7 +4144,7 @@ mod tests {
             "model a vCPU that dequeued STOP before applying its default action",
         );
         assert!(kernel.post_signal_to_task(child_id, sigcont, None));
-        assert!(kernel.stop_task_for_job_control(child_id, sigstop));
+        assert!(kernel.stop_task_for_job_control(child_id, sigstop, None));
         assert!(
             !kernel.task_is_job_control_stopped(child_id),
             "the later SIGCONT generation must cancel the stale default-stop action",
@@ -4175,8 +4185,8 @@ mod tests {
         );
 
         assert!(kernel.post_signal_to_task(child_id, sigcont, None));
-        assert!(kernel.stop_task_for_job_control(child_id, sigstop));
-        assert!(kernel.stop_task_for_job_control(child_id, sigtstp));
+        assert!(kernel.stop_task_for_job_control(child_id, sigstop, None));
+        assert!(kernel.stop_task_for_job_control(child_id, sigtstp, None));
         assert!(
             !kernel.task_is_job_control_stopped(child_id),
             "SIGCONT must invalidate every earlier dequeued default-stop action",
@@ -4188,10 +4198,93 @@ mod tests {
                 .take_lowest_in(SigSet::EMPTY.with(sigstop.raw()))
                 .is_some()
         );
-        assert!(kernel.stop_task_for_job_control(child_id, sigstop));
+        assert!(kernel.stop_task_for_job_control(child_id, sigstop, None));
         assert!(
             kernel.task_is_job_control_stopped(child_id),
             "a stop generated after SIGCONT must replace the cancellation generation",
+        );
+    }
+
+    #[test]
+    fn stale_stop_action_cannot_borrow_a_newer_stop_generation() {
+        let (kernel, root) = bootstrap(1);
+        let child_id = fork_child(&kernel, &root, "epoch-bound stop child", 724);
+        let child_context = kernel
+            .context(child_id, LinuxTid::for_task_leader(child_id))
+            .expect("child context");
+        let sigstop = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGSTOP).expect("SIGSTOP");
+        let sigtstp = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGTSTP).expect("SIGTSTP");
+        let sigcont = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGCONT).expect("SIGCONT");
+
+        assert!(kernel.post_signal_to_task(child_id, sigstop, None));
+        let stale = child_context
+            .signal_authority()
+            .take_lowest_in(SigSet::EMPTY.with(sigstop.raw()));
+        assert!(
+            stale.is_some(),
+            "model default-stop A dequeued before its action",
+        );
+        assert!(kernel.post_signal_to_task(child_id, sigcont, None));
+        assert!(kernel.post_signal_to_task(child_id, sigtstp, None));
+
+        assert!(kernel.stop_task_for_job_control(
+            child_id,
+            sigstop,
+            stale.and_then(|dequeue| dequeue.job_control_generation),
+        ));
+        assert!(
+            !kernel.task_is_job_control_stopped(child_id),
+            "stale A must not run under the newer stop B generation",
+        );
+
+        let current = child_context
+            .signal_authority()
+            .take_lowest_in(SigSet::EMPTY.with(sigtstp.raw()))
+            .expect("dequeue new stop B");
+        assert!(kernel.stop_task_for_job_control(
+            child_id,
+            sigtstp,
+            current.job_control_generation,
+        ));
+        assert!(
+            kernel.task_is_job_control_stopped(child_id),
+            "the new stop generation must still apply its own default action",
+        );
+    }
+
+    #[test]
+    fn newer_stop_without_sigcont_does_not_cancel_dequeued_stop() {
+        let (kernel, root) = bootstrap(1);
+        let child_id = fork_child(&kernel, &root, "same continue epoch child", 725);
+        let child_context = kernel
+            .context(child_id, LinuxTid::for_task_leader(child_id))
+            .expect("child context");
+        let sigstop = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGSTOP).expect("SIGSTOP");
+        let sigtstp = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGTSTP).expect("SIGTSTP");
+
+        assert!(kernel.post_signal_to_task(child_id, sigstop, None));
+        let first = child_context
+            .signal_authority()
+            .take_lowest_in(SigSet::EMPTY.with(sigstop.raw()))
+            .expect("dequeue first stop");
+        assert!(kernel.post_signal_to_task(child_id, sigtstp, None));
+
+        assert!(kernel.stop_task_for_job_control(child_id, sigstop, first.job_control_generation,));
+        assert_eq!(
+            kernel
+                .wait_child_with_job_control(
+                    root.task().key().id,
+                    Some(child_id),
+                    true,
+                    false,
+                    WaitMode::Consume,
+                )
+                .expect("wait first stop"),
+            WaitOutcome::Stopped {
+                task: child_id,
+                signal: sigstop,
+            },
+            "only an intervening SIGCONT invalidates dequeued stop work",
         );
     }
 
@@ -4224,11 +4317,11 @@ mod tests {
                     .is_some())
         );
 
-        assert!(kernel.stop_task_for_job_control(child_id, sigstop));
+        assert!(kernel.stop_task_for_job_control(child_id, sigstop, None));
         assert!(kernel.task_is_job_control_stopped(child_id));
         assert!(kernel.post_signal_to_task(child_id, sigcont, None));
         assert!(!kernel.task_is_job_control_stopped(child_id));
-        assert!(kernel.stop_task_for_job_control(child_id, sigtstp));
+        assert!(kernel.stop_task_for_job_control(child_id, sigtstp, None));
         assert!(
             !kernel.task_is_job_control_stopped(child_id),
             "SIGCONT must invalidate another stop dequeued before the first group stop",
@@ -4480,6 +4573,74 @@ mod tests {
                 .exit_task(id, LinuxWaitStatus::from_wait_encoding(0), None)
                 .expect("retire child");
         }
+    }
+
+    #[test]
+    fn authorized_sigcont_wakes_the_parent_current_at_publication() {
+        let (kernel, root) = bootstrap(1);
+        let parent = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(7_150),
+                "old signal parent".to_string(),
+                None,
+            )
+            .expect("old parent");
+        let target = kernel
+            .fork_task(
+                &parent,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(7_151),
+                "reparented signal target".to_string(),
+                None,
+            )
+            .expect("target");
+        let parent_id = parent.task().key().id;
+        let target_key = target.task().key();
+        let sigstop = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGSTOP).expect("SIGSTOP");
+        let sigcont = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGCONT).expect("SIGCONT");
+        assert!(kernel.stop_task_for_job_control(target_key.id, sigstop, None));
+        let ticket =
+            match kernel.authorize_signal_target_exact(&root, target_key, None, Some(sigcont)) {
+                ExactSignalTargetAuthorization::Allowed(ticket) => ticket,
+                other => panic!("SIGCONT must authorize before reparenting: {other:?}"),
+            };
+
+        let root_waker = Arc::new(RecordingWaker {
+            wakes: AtomicUsize::new(0),
+            queue: root.shared().pending_signals(),
+            pending_when_woken: AtomicUsize::new(0),
+        });
+        let old_parent_waker = Arc::new(RecordingWaker {
+            wakes: AtomicUsize::new(0),
+            queue: parent.shared().pending_signals(),
+            pending_when_woken: AtomicUsize::new(0),
+        });
+        root.task()
+            .set_waker(Arc::clone(&root_waker) as Arc<dyn super::super::objects::TaskWaker>);
+        parent
+            .task()
+            .set_waker(Arc::clone(&old_parent_waker) as Arc<dyn super::super::objects::TaskWaker>);
+
+        kernel
+            .exit_task(parent_id, LinuxWaitStatus::from_wait_encoding(0), None)
+            .expect("exit old parent");
+        assert_eq!(target.task().parent(), Some(root.task().key()));
+        let root_wakes_before = root_waker.wakes.load(Ordering::SeqCst);
+        let old_parent_wakes_before = old_parent_waker.wakes.load(Ordering::SeqCst);
+
+        assert!(kernel.post_signal_to_authorized_target(&ticket, sigcont, None));
+        assert_eq!(
+            root_waker.wakes.load(Ordering::SeqCst),
+            root_wakes_before + 1,
+            "WCONTINUED publication must wake the target's current parent",
+        );
+        assert_eq!(
+            old_parent_waker.wakes.load(Ordering::SeqCst),
+            old_parent_wakes_before,
+            "a stale authorization-time parent must not receive the wait wake",
+        );
     }
 
     /// An unknown or already-exiting task reports no delivery. For a specific
