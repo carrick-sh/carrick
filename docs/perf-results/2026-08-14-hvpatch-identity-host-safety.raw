@@ -1,2 +1,2 @@
 HVPATCHIDENTITY1|header|version=1
-HVPATCHIDENTITY1|summary|status=ok|guest_kills=22|positive_one=5|zero=3|broadcast=2|negative_group=4|tgkills=4|xsig_shapes=1|stop_signals=1|continue_signals=1|host_low_kills=0|bounded=0|errors=0|drops=0|target_exited=1|target_exit_seen=1|target_exit_code=0|target_exit_reason=1
+HVPATCHIDENTITY1|summary|status=ok|guest_kills=23|positive_one=5|zero=3|broadcast=2|negative_group=4|tgkills=4|xsig_shapes=1|stop_signals=2|continue_signals=1|host_low_kills=0|bounded=0|errors=0|drops=0|target_exited=1|target_exit_seen=1|target_exit_code=0|target_exit_reason=1

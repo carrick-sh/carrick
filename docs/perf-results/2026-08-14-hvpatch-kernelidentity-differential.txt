@@ -1,6 +1,3 @@
-CARRICK_PROBE_RUN_ID=cr-11504-5266
-CARRICK_PROBE_CLEANUP_RUN_ID=cr-11504-5266
-remaining carrick procs (run-id cr-11504-5266) = 0
 MATCH kernelidentity
   root_exact_linux_init=true
   root_leader_tid_matches=true
@@ -21,6 +18,7 @@ MATCH kernelidentity
   job_control_stop_send_succeeded=true
   job_control_wait_reported_sigstop=true
   job_control_sender_remained_runnable=true
+  job_control_repeated_stop_send_succeeded=true
   job_control_continue_send_succeeded=true
   job_control_wait_reported_continued=true
   job_control_child_resumed=true
