@@ -2101,10 +2101,15 @@ impl SyscallDispatcher {
                 let Some(owned_fd) = backing.dup_data_fd() else {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
-                let Some(ipa) = crate::memory::alloc_alias_ipa(length) else {
+                let fixed_va = map_flags.contains(LinuxMmapFlags::FIXED);
+                let Some(ipa) = alloc_alias_ipa_for_publication(
+                    this.execution_backend(),
+                    length,
+                    fixed_va,
+                ) else {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
-                let address = if map_flags.contains(LinuxMmapFlags::FIXED) {
+                let address = if fixed_va {
                     requested.0
                 } else {
                     crate::memory::LINUX_HIGH_VA_THRESHOLD
@@ -3045,15 +3050,15 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
                 let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
-                // Reserve a FRESH alias IPA (2 MiB-block-aligned). Process-tree-
-                // global + monotonic, NEVER reused — the shared `hv_vm`'s stage-2
-                // TLB can't be flushed on arm64, so a reused IPA reads a stale
-                // page. NOTE: the stage-1 mapping must cover EXACTLY the guest's
-                // page-aligned `length`, NOT the 2 MiB block — a sub-16 KiB mmap
-                // rounded up would map extra 4 KiB guest pages and clobber the next
-                // region's page-table entries. hv_vm_map's own 16 KiB IPA-size
-                // requirement is satisfied separately inside map_host_alias.
-                let Some(ipa) = crate::memory::alloc_alias_ipa(length) else {
+                // The guest VA is final. Mature VMM consumes a fresh monotonic
+                // alias IPA; HVPatch supplies a sentinel that its reusable
+                // GlobalFrameStage2Lease replaces before stage-2 publication.
+                // Stage-1 still covers exactly the guest page-aligned length.
+                let Some(ipa) = alloc_alias_ipa_for_publication(
+                    this.execution_backend(),
+                    length,
+                    true,
+                ) else {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
                 // Alias VMA/lock/residency/bus/seal state is a pending commit:
@@ -4108,7 +4113,11 @@ impl SyscallDispatcher {
                 if !metadata_says_unmapped
                     && !prot_flags.is_empty()
                     && mmap_address_uses_alias(address.0, length, layout)
-                    && let Some(ipa) = crate::memory::alloc_alias_ipa(length)
+                    && let Some(ipa) = alloc_alias_ipa_for_publication(
+                        this.execution_backend(),
+                        length,
+                        true,
+                    )
                 {
                     // The reservation's VMA is the source of truth. `mprotect`
                     // replaces only its committed subrange; it must not
@@ -4899,6 +4908,42 @@ fn mmap_address_uses_alias(address: u64, length: u64, layout: MemoryLayout) -> b
     range_within(address, length, alias_low_base, stack_base - alias_low_base)
 }
 
+/// Select the legacy dispatcher IPA token for an alias publication.
+///
+/// HVPatch assigns the real, reusable global frame IPA in its backend after
+/// the guest VA is already fixed. Consuming the old process-tree-global,
+/// monotonic alias cursor in that case would leave a dead allocator as a
+/// 32,768-publication lifetime limit. Other backends still use the supplied
+/// IPA, and HVPatch still needs the legacy cursor when its offset selects a
+/// fresh guest VA.
+pub(super) fn alloc_alias_ipa_for_publication(
+    backend: crate::page_profile::ExecutionBackend,
+    length: u64,
+    guest_va_already_selected: bool,
+) -> Option<u64> {
+    alloc_alias_ipa_for_publication_with(
+        backend,
+        length,
+        guest_va_already_selected,
+        crate::memory::alloc_alias_ipa,
+    )
+}
+
+fn alloc_alias_ipa_for_publication_with(
+    backend: crate::page_profile::ExecutionBackend,
+    length: u64,
+    guest_va_already_selected: bool,
+    allocate: impl FnOnce(u64) -> Option<u64>,
+) -> Option<u64> {
+    if backend == crate::page_profile::ExecutionBackend::HvPatch && guest_va_already_selected {
+        // A deliberately non-authoritative, aligned sentinel. HVPatch replaces
+        // it with its GlobalFrameStage2Lease before calling hv_vm_map.
+        Some(crate::memory::LINUX_ALIAS_IPA_BASE)
+    } else {
+        allocate(length)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4913,6 +4958,52 @@ mod tests {
         write_bytes_total: Cell<usize>,
         zero_backing_calls: Cell<usize>,
         protect_calls: Cell<usize>,
+    }
+
+    #[test]
+    fn hvpatch_fixed_va_aliases_do_not_consume_the_legacy_monotonic_ipa_cursor() {
+        let allocations = Cell::new(0_u64);
+        for _ in 0..40_000 {
+            let ipa = alloc_alias_ipa_for_publication_with(
+                crate::page_profile::ExecutionBackend::HvPatch,
+                LINUX_PAGE_SIZE,
+                true,
+                |_| {
+                    allocations.set(allocations.get() + 1);
+                    None
+                },
+            );
+            assert_eq!(ipa, Some(crate::memory::LINUX_ALIAS_IPA_BASE));
+        }
+        assert_eq!(allocations.get(), 0);
+
+        assert_eq!(
+            alloc_alias_ipa_for_publication_with(
+                crate::page_profile::ExecutionBackend::HvPatch,
+                LINUX_PAGE_SIZE,
+                false,
+                |_| {
+                    allocations.set(allocations.get() + 1);
+                    Some(0x1234_0000)
+                },
+            ),
+            Some(0x1234_0000)
+        );
+        assert_eq!(allocations.get(), 1);
+
+        assert_eq!(
+            alloc_alias_ipa_for_publication_with(
+                crate::page_profile::ExecutionBackend::Vmm,
+                LINUX_PAGE_SIZE,
+                true,
+                |_| {
+                    allocations.set(allocations.get() + 1);
+                    Some(0x5678_0000)
+                },
+            ),
+            Some(0x5678_0000)
+        );
+        assert_eq!(allocations.get(), 2);
     }
 
     #[test]

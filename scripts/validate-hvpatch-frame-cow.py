@@ -10,7 +10,7 @@ import pathlib
 import sys
 from collections import Counter, defaultdict
 
-PREFIX = "HVPATCHFRAMECOW4|"
+PREFIX = "HVPATCHFRAMECOW5|"
 PA_MASK_4K = 0x0000_FFFF_FFFF_F000
 AP_MASK = 0b11 << 6
 COMPOUND_MASK = ~((16 * 1024) - 1)
@@ -29,7 +29,7 @@ def parse_number(value: str, *, hexadecimal: bool = False) -> int:
 
 def parse_record(line: str) -> tuple[str, dict[str, str]]:
     fields = line.rstrip("\n").split("|")
-    if len(fields) < 3 or fields[0] != "HVPATCHFRAMECOW4":
+    if len(fields) < 3 or fields[0] != "HVPATCHFRAMECOW5":
         raise ReceiptError(f"malformed receipt record: {line.rstrip()!r}")
     values: dict[str, str] = {}
     for field in fields[2:]:
@@ -79,7 +79,7 @@ def validate(
 
     header = next(values for kind, values in records if kind == "header")
     require_keys("header", header, {"version"})
-    if header["version"] != "4":
+    if header["version"] != "5":
         raise ReceiptError(f"unsupported receipt version {header['version']!r}")
 
     summary = next(values for kind, values in records if kind == "summary")
@@ -97,7 +97,7 @@ def validate(
         "vm_events",
         "ptes",
         "copies",
-        "faults",
+        "fault_sequences",
         "fault_ptes",
         "fault_ttbrs",
         "errors",
@@ -125,8 +125,6 @@ def validate(
         raise ReceiptError("summary VM-lifecycle count does not match serialized records")
     if counts["triggers"] != kinds["trigger"]:
         raise ReceiptError("summary trigger count does not match serialized records")
-    if counts["faults"] != kinds["fault"]:
-        raise ReceiptError("summary fault count does not match serialized records")
     if counts["fault_ptes"] != kinds["fault_pte"]:
         raise ReceiptError("summary fault-PTE count does not match serialized records")
     if counts["fault_ttbrs"] != kinds["fault_ttbr"]:
@@ -139,6 +137,13 @@ def validate(
         raise ReceiptError("fork-frame identity/data probes are missing or unbalanced")
     if counts["trigger_identities"] != counts["triggers"]:
         raise ReceiptError("COW trigger identity/data probes are missing or unbalanced")
+    if not (
+        counts["fault_sequences"]
+        == counts["fault_ptes"]
+        == counts["fault_ttbrs"]
+        == counts["permission_triggers"]
+    ):
+        raise ReceiptError("permission-fault sequence/PTE/TTBR counts are unbalanced")
     if (
         not kinds["event"]
         or not kinds["fork_frame"]
@@ -318,39 +323,18 @@ def validate(
     if require_shared and shared_count == 0:
         raise ReceiptError("no inherited Linux-shared frame was observed")
 
-    fault_keys = {
-        "ts",
-        "host_pid",
-        "host_tid",
-        "esr",
-        "elr",
-        "far",
-        "insn",
-        "rn",
-        "xrn",
-    }
-    for kind, values in records:
-        if kind != "fault":
-            continue
-        require_keys(kind, values, fault_keys)
-        parse_number(values["ts"])
-        if parse_number(values["host_pid"]) <= 0 or parse_number(values["host_tid"]) <= 0:
-            raise ReceiptError("fault record lacks host execution identity")
-        for key in ("esr", "elr", "far", "insn", "xrn"):
-            parse_number(values[key], hexadecimal=True)
-        parse_number(values["rn"])
-
     fault_pte_keys = {
         "ts",
         "host_pid",
         "host_tid",
+        "seq",
         "va",
         "l0",
         "l1",
         "l2",
         "l3",
     }
-    fault_ptes: list[tuple[int, int, int, int, int, int]] = []
+    fault_ptes: dict[tuple[int, int, int], tuple[int, int, int, int]] = {}
     for kind, values in records:
         if kind != "fault_pte":
             continue
@@ -358,18 +342,24 @@ def validate(
         timestamp = parse_number(values["ts"])
         host_pid = parse_number(values["host_pid"])
         host_tid = parse_number(values["host_tid"])
+        sequence = parse_number(values["seq"])
         va = parse_number(values["va"], hexadecimal=True)
         descriptors = tuple(
             parse_number(values[key], hexadecimal=True)
             for key in ("l0", "l1", "l2", "l3")
         )
         leaf, terminal_level = terminal_descriptor(descriptors)
-        if min(host_pid, host_tid) <= 0:
+        if min(host_pid, host_tid, sequence) <= 0:
             raise ReceiptError("fault-PTE record lacks host execution identity")
-        fault_ptes.append((timestamp, host_pid, host_tid, va, leaf, terminal_level))
+        key = (host_pid, host_tid, sequence)
+        if key in fault_ptes:
+            raise ReceiptError("duplicate fault-PTE attempt sequence")
+        if not stage2_contains(timestamp, host_pid, leaf & PA_MASK_4K, 4 * 1024):
+            raise ReceiptError("fault-PTE leaf lacks a live stage-2 lifetime")
+        fault_ptes[key] = (timestamp, va, leaf, terminal_level)
 
-    fault_ttbr_keys = {"ts", "host_pid", "host_tid", "va", "ttbr0"}
-    fault_ttbrs: list[tuple[int, int, int, int, int]] = []
+    fault_ttbr_keys = {"ts", "host_pid", "host_tid", "seq", "va", "ttbr0"}
+    fault_ttbrs: dict[tuple[int, int, int], tuple[int, int, int]] = {}
     for kind, values in records:
         if kind != "fault_ttbr":
             continue
@@ -377,11 +367,15 @@ def validate(
         timestamp = parse_number(values["ts"])
         host_pid = parse_number(values["host_pid"])
         host_tid = parse_number(values["host_tid"])
+        sequence = parse_number(values["seq"])
         va = parse_number(values["va"], hexadecimal=True)
         ttbr0 = parse_number(values["ttbr0"], hexadecimal=True)
-        if min(host_pid, host_tid) <= 0 or ttbr0 == 0:
+        if min(host_pid, host_tid, sequence) <= 0 or ttbr0 == 0:
             raise ReceiptError("fault-TTBR record lacks host execution identity or TTBR0")
-        fault_ttbrs.append((timestamp, host_pid, host_tid, va, ttbr0))
+        key = (host_pid, host_tid, sequence)
+        if key in fault_ttbrs:
+            raise ReceiptError("duplicate fault-TTBR attempt sequence")
+        fault_ttbrs[key] = (timestamp, va, ttbr0)
 
     trigger_keys = {
         "ts",
@@ -392,6 +386,7 @@ def validate(
         "mm",
         "asid",
         "class",
+        "fault_seq",
         "va",
         "syndrome",
         "far",
@@ -413,6 +408,7 @@ def validate(
             "mm": parse_number(values["mm"]),
             "asid": parse_number(values["asid"]),
             "class": parse_number(values["class"]),
+            "fault_seq": parse_number(values["fault_seq"]),
             "va": parse_number(values["va"], hexadecimal=True),
             "syndrome": parse_number(values["syndrome"], hexadecimal=True),
             "far": parse_number(values["far"], hexadecimal=True),
@@ -436,6 +432,8 @@ def validate(
             raise ReceiptError("unknown COW trigger class")
         if trigger["class"] == 0:
             permission_trigger_count += 1
+            if trigger["fault_seq"] <= 0:
+                raise ReceiptError("permission COW trigger lacks a fault attempt sequence")
             syndrome = trigger["syndrome"]
             exception_class = (syndrome >> 26) & 0x3F
             fault_status = syndrome & 0x3F
@@ -450,30 +448,23 @@ def validate(
                 raise ReceiptError("COW permission trigger VA does not match FAR")
             if trigger["ttbr0"] >> 48 != trigger["asid"]:
                 raise ReceiptError("COW permission trigger TTBR0 does not encode its ASID")
-            matching_ttbr = [
-                record
-                for record in fault_ttbrs
-                if record[0] <= trigger["ts"]
-                and record[1] == trigger["host_pid"]
-                and record[2] == trigger["host_tid"]
-                and record[3] == trigger["far"]
-                and record[4] == trigger["ttbr0"]
-            ]
-            matching_pte = [
-                record
-                for record in fault_ptes
-                if record[0] <= trigger["ts"]
-                and record[1] == trigger["host_pid"]
-                and record[2] == trigger["host_tid"]
-                and record[3] == trigger["far"]
-            ]
-            if not matching_ttbr or not matching_pte:
-                raise ReceiptError(
-                    "COW permission trigger lacks same-thread FAR/TTBR/PTE fault records"
-                )
-            matching_leaf = max(matching_pte)
-            leaf = matching_leaf[4]
-            terminal_level = matching_leaf[5]
+            fault_key = (
+                trigger["host_pid"],
+                trigger["host_tid"],
+                trigger["fault_seq"],
+            )
+            matching_pte = fault_ptes.get(fault_key)
+            matching_ttbr = fault_ttbrs.get(fault_key)
+            if matching_pte is None or matching_ttbr is None:
+                raise ReceiptError("COW permission trigger lacks its exact fault sequence")
+            pte_ts, pte_va, leaf, terminal_level = matching_pte
+            ttbr_ts, ttbr_va, fault_ttbr = matching_ttbr
+            if not pte_ts <= ttbr_ts <= trigger["ts"]:
+                raise ReceiptError("COW fault sequence is temporally out of order")
+            if pte_va != trigger["far"] or ttbr_va != trigger["far"]:
+                raise ReceiptError("COW fault sequence VA does not match trigger FAR")
+            if fault_ttbr != trigger["ttbr0"]:
+                raise ReceiptError("COW fault sequence TTBR does not match trigger TTBR")
             valid_terminal = (
                 terminal_level == 3 and leaf & 0b11 == 0b11
             ) or (
@@ -487,13 +478,23 @@ def validate(
                 raise ReceiptError(
                     "COW permission trigger PTE is not a valid non-global read-only leaf"
                 )
-        elif trigger["syndrome"] or trigger["ttbr0"]:
+            trigger["fault_leaf"] = leaf
+        elif trigger["fault_seq"] or trigger["syndrome"] or trigger["ttbr0"]:
             raise ReceiptError("non-fault COW trigger carries fault-only provenance")
         triggers.append(trigger)
     if require_permission_fault and permission_trigger_count == 0:
         raise ReceiptError("no guest stage-1 permission-fault COW trigger was observed")
     if counts["permission_triggers"] != permission_trigger_count:
         raise ReceiptError("summary permission-trigger count does not match records")
+    consumed_faults = {
+        (trigger["host_pid"], trigger["host_tid"], trigger["fault_seq"])
+        for trigger in triggers
+        if trigger["class"] == 0
+    }
+    if len(consumed_faults) != permission_trigger_count:
+        raise ReceiptError("a fault attempt sequence was consumed by multiple triggers")
+    if consumed_faults != set(fault_ptes) or consumed_faults != set(fault_ttbrs):
+        raise ReceiptError("fault PTE/TTBR records were not consumed one-for-one")
 
     event_keys = {
         "ts",
@@ -600,15 +601,7 @@ def validate(
         transaction = matches[0]
         triggered_transactions[transaction] += 1
         if trigger["class"] == 0:
-            matching_pte = max(
-                record
-                for record in fault_ptes
-                if record[0] <= trigger["ts"]
-                and record[1] == trigger["host_pid"]
-                and record[2] == trigger["host_tid"]
-                and record[3] == trigger["far"]
-            )
-            leaf_ipa = matching_pte[4] & PA_MASK_4K
+            leaf_ipa = trigger["fault_leaf"] & PA_MASK_4K
             if not any(
                 frame == transaction[6] and start <= leaf_ipa < end
                 for frame, start, end in private_frame_extents
@@ -747,7 +740,7 @@ def validate(
                 )
 
     return {
-        "schema": "carrick.hvpatch-frame-cow-receipt.v4",
+        "schema": "carrick.hvpatch-frame-cow-receipt.v5",
         "raw_sha256": hashlib.sha256(raw).hexdigest(),
         "cow_transactions": len(transactions),
         "guest_visible_transactions": guest_visible_transactions,

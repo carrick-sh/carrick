@@ -415,6 +415,13 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         ))
     }
 
+    /// Cancel a child-inventory reservation that never reached the backend
+    /// process builder. The kernel-side transaction remains owned by the
+    /// runtime's abandon guard; this releases only the backend's operation slot.
+    fn cancel_process_inventory(&mut self) -> bool {
+        false
+    }
+
     fn take_process_inventory(&mut self) -> Option<carrick_hal::FrameInventoryCommit<()>> {
         None
     }
@@ -489,10 +496,14 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
 
     fn arm_frame_cow_ranges(&mut self, _ranges: &[ForkCowRange]) {}
 
-    /// Undo an unpublished fork-COW arm. HVPatch uses this only while every
-    /// vCPU in the mm remains quiesced and the parent stage-1 snapshot is being
-    /// restored after a prepare/publication failure.
-    fn disarm_frame_cow_ranges(&mut self, _ranges: &[ForkCowRange]) {}
+    /// Exact pre-fork arm metadata. A failed fork must restore this vector,
+    /// rather than subtracting the newly requested ranges (which destroys
+    /// overlapping pre-existing arms).
+    fn frame_cow_arm_snapshot(&self) -> Vec<ForkCowRange> {
+        Vec::new()
+    }
+
+    fn restore_frame_cow_arm_snapshot(&mut self, _snapshot: Vec<ForkCowRange>) {}
 
     fn armed_frame_cow_ranges(&self, _va: u64, _len: usize) -> Vec<ForkCowRange> {
         Vec::new()
@@ -874,6 +885,19 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         Err(TrapError::Hypervisor(
             "aarch64 backend does not support in-process fork".to_owned(),
         ))
+    }
+
+    /// Publish backend metadata that must not become globally visible until
+    /// the fresh vCPU register file has been restored successfully.
+    fn commit_process_materialization(&mut self) -> Result<(), TrapError> {
+        Ok(())
+    }
+
+    /// Undo a backend process materialization whose fresh-vCPU restore failed.
+    /// The default backend has no persistent stage-2/alias publication.
+    fn abort_process_materialization(&mut self, vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {
+        self.destroy_vcpu_on_thread_exit(vcpu);
+        Ok(())
     }
 
     /// Set SP_EL0 on a vfork child given an explicit `child_stack`, through

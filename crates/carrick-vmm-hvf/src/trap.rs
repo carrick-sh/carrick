@@ -3125,6 +3125,14 @@ impl CowArmedRanges {
         self.ranges.dedup();
     }
 
+    fn snapshot(&self) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
+        self.ranges.clone()
+    }
+
+    fn restore(&mut self, snapshot: Vec<carrick_aarch64::vmm::ForkCowRange>) {
+        self.ranges = snapshot;
+    }
+
     fn span_for(&self, va: u64) -> Option<CowArmedSpan> {
         let compound_start = va & !(Self::COMPOUND_SIZE - 1);
         let compound_end = compound_start.checked_add(Self::COMPOUND_SIZE)?;
@@ -3206,6 +3214,7 @@ impl CowArmedRanges {
             .collect()
     }
 
+    #[cfg(test)]
     fn disarm_ranges(&mut self, ranges: &[carrick_aarch64::vmm::ForkCowRange]) {
         for range in ranges {
             self.disarm(CowArmedSpan {
@@ -3237,6 +3246,24 @@ impl HvpatchFrameInventoryState {
 
     fn inject_next_begin_exec_inventory_failure(&mut self) {
         self.fail_next_begin_exec_inventory = true;
+    }
+
+    fn begin_process_inventory(
+        &mut self,
+        reservation: carrick_hal::FrameInventoryReservation,
+    ) -> Result<(), TrapError> {
+        let mut inventory = self.ledger.lock();
+        if inventory.process_reservation.is_some() || inventory.process_commit.is_some() {
+            return Err(TrapError::Hypervisor(
+                "overlapping HVPatch child inventory transaction".to_owned(),
+            ));
+        }
+        inventory.process_reservation = Some(reservation);
+        Ok(())
+    }
+
+    fn cancel_process_inventory(&mut self) -> bool {
+        self.ledger.lock().process_reservation.take().is_some()
     }
 
     fn begin_exec_inventory(
@@ -3400,6 +3427,8 @@ pub(crate) struct HvfVmState {
     cow_armed: std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>,
     cow_deferred_publications: std::sync::Arc<parking_lot::Mutex<Vec<PendingFrameCowPublication>>>,
     pending_fork_frame_receipts: Vec<PendingForkFrameReceipt>,
+    /// Child aliases withheld until fresh-vCPU register restoration succeeds.
+    pending_process_aliases: Vec<AliasBacking>,
 }
 
 /// Thread/process exit must LEAK the per-thread host backings, never `munmap`
@@ -4966,20 +4995,52 @@ impl HvfVmState {
         &mut self,
         reservation: carrick_hal::FrameInventoryReservation,
     ) -> Result<(), TrapError> {
-        let mut inventory = self.frame_inventory.lock();
-        if inventory.process_reservation.is_some() {
-            return Err(TrapError::Hypervisor(
-                "overlapping HVPatch child inventory transaction".to_owned(),
-            ));
-        }
-        inventory.process_reservation = Some(reservation);
-        Ok(())
+        self.frame_inventory.begin_process_inventory(reservation)
+    }
+
+    pub(crate) fn cancel_process_inventory(&mut self) -> bool {
+        self.frame_inventory.cancel_process_inventory()
     }
 
     pub(crate) fn take_process_inventory(
         &mut self,
     ) -> Option<carrick_hal::FrameInventoryCommit<()>> {
         self.frame_inventory.lock().process_commit.take()
+    }
+
+    pub(crate) fn commit_process_materialization(&mut self) -> Result<(), TrapError> {
+        if self.frame_inventory.lock().process_commit.is_none() {
+            return Err(TrapError::Hypervisor(
+                "HVPatch process materialization has no inventory commit".to_owned(),
+            ));
+        }
+        // Register only after the fresh vCPU register restore succeeds. Until
+        // this point the aliases remain an owned, unpublished vector.
+        for alias in self.pending_process_aliases.drain(..) {
+            register_shared_alias(alias);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn abort_process_materialization(&mut self) -> Result<(), TrapError> {
+        self.pending_process_aliases.clear();
+        self.pending_fork_frame_receipts.clear();
+        {
+            let mut inventory = self.frame_inventory.lock();
+            let staged: Vec<_> = inventory
+                .extents
+                .iter()
+                .map(|(&key, &extent)| (key, extent))
+                .collect();
+            Self::rollback_unpublished_mappings(&mut inventory, &staged)?;
+            drop(inventory.process_commit.take());
+        }
+        // Fresh per-mm mappings own their stage-2 leases; inherited mappings
+        // are non-owning. Dropping this vector therefore unmaps/releases only
+        // unpublished child-local extents.
+        drop(std::mem::take(&mut self.mappings));
+        self.mm_root_slot = None;
+        Ok(())
     }
 
     pub(crate) fn begin_retirement_inventory(
@@ -5139,6 +5200,7 @@ impl HvfVmState {
             cow_armed: std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
             cow_deferred_publications: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
             pending_fork_frame_receipts: Vec::new(),
+            pending_process_aliases: Vec::new(),
         };
         state.seed_readonly_spans_from_plan(plan);
 
@@ -5568,11 +5630,15 @@ impl HvfVmState {
         self.cow_armed.lock().arm(ranges);
     }
 
-    pub(crate) fn disarm_frame_cow_ranges(
+    pub(crate) fn frame_cow_arm_snapshot(&self) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
+        self.cow_armed.lock().snapshot()
+    }
+
+    pub(crate) fn restore_frame_cow_arm_snapshot(
         &mut self,
-        ranges: &[carrick_aarch64::vmm::ForkCowRange],
+        snapshot: Vec<carrick_aarch64::vmm::ForkCowRange>,
     ) {
-        self.cow_armed.lock().disarm_ranges(ranges);
+        self.cow_armed.lock().restore(snapshot);
     }
 
     pub(crate) fn armed_frame_cow_ranges(
@@ -9145,6 +9211,7 @@ impl HvfVmState {
             cow_armed,
             cow_deferred_publications,
             pending_fork_frame_receipts: Vec::new(),
+            pending_process_aliases: Vec::new(),
         };
 
         for mapping in mappings {
@@ -9804,6 +9871,7 @@ impl HvfVmState {
             cow_armed: spec.cow_armed,
             cow_deferred_publications: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
             pending_fork_frame_receipts: Vec::new(),
+            pending_process_aliases: aliases_to_publish,
         };
         let mailbox = match state.allocate_mailbox_for_vcpu(&vcpu) {
             Ok(mailbox) => mailbox,
@@ -9872,14 +9940,6 @@ impl HvfVmState {
             inventory.process_commit = Some(process_reservation.commit(()));
         }
         state.pending_fork_frame_receipts = pending_fork_frame_receipts;
-        // The child address space, frame inventory, and mailbox are now fully
-        // committed. Publish semantic alias fragments only after every
-        // fallible installation step so an aborted child cannot advertise
-        // backing presence. This host process is the fork child, so rebinding
-        // a shared-anonymous alias to the new mm root scope cannot affect its parent.
-        for alias in aliases_to_publish {
-            register_shared_alias(alias);
-        }
         Ok((state, vcpu, mailbox))
     }
 
@@ -10339,83 +10399,95 @@ impl HvfVmState {
         // registers clear except for SP and PC. Without this, musl's _start in the
         // new image inherits the previous process's x8 which can decode as a bogus
         // syscall number on the first svc.
-        let registers_started = std::time::Instant::now();
-        for reg in GPR_TABLE {
-            vcpu.set_reg(reg, 0).map_err(hvf_error)?;
-        }
+        let post_publication = (|| -> std::result::Result<MailboxBinding, TrapError> {
+            let registers_started = std::time::Instant::now();
+            for reg in GPR_TABLE {
+                vcpu.set_reg(reg, 0).map_err(hvf_error)?;
+            }
 
-        let initial_pc = plan.el0_trampoline_entry.unwrap_or(plan.entry);
-        vcpu.set_reg(Reg::PC, initial_pc).map_err(hvf_error)?;
-        const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
-        vcpu.set_reg(Reg::CPSR, AARCH64_PSTATE_EL1H_DAIF_MASKED)
-            .map_err(hvf_error)?;
-        if let Some(_trampoline) = plan.el0_trampoline_entry {
-            const AARCH64_PSTATE_EL0T_DAIF_MASKED: u64 = 0x3c0;
-            vcpu.set_sys_reg(SysReg::SPSR_EL1, AARCH64_PSTATE_EL0T_DAIF_MASKED)
+            let initial_pc = plan.el0_trampoline_entry.unwrap_or(plan.entry);
+            vcpu.set_reg(Reg::PC, initial_pc).map_err(hvf_error)?;
+            const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
+            vcpu.set_reg(Reg::CPSR, AARCH64_PSTATE_EL1H_DAIF_MASKED)
                 .map_err(hvf_error)?;
-            vcpu.set_sys_reg(SysReg::ELR_EL1, plan.entry)
+            if let Some(_trampoline) = plan.el0_trampoline_entry {
+                const AARCH64_PSTATE_EL0T_DAIF_MASKED: u64 = 0x3c0;
+                vcpu.set_sys_reg(SysReg::SPSR_EL1, AARCH64_PSTATE_EL0T_DAIF_MASKED)
+                    .map_err(hvf_error)?;
+                vcpu.set_sys_reg(SysReg::ELR_EL1, plan.entry)
+                    .map_err(hvf_error)?;
+            }
+            // C=1, I=1, UCI=1 (bit 26), UCT=1 (bit 15), DZE=1 (bit 14) — EL0 cache-
+            // maintenance ops + CTR_EL0/DCZID_EL0 reads + DC ZVA, matching Linux.
+            // See the matching comment at the initial-bringup site; glibc 2.41 reads
+            // CTR_EL0 at startup, which traps to EL1 (fatal) without UCT.
+            // Shared bootstrap SCTLR (via GuestArch; canonical rationale in
+            // carrick_mem::arch_sysregs) carries M=1 (stage-1 on); HVF enables M
+            // only when stage-1 tables exist (below), so start from the value with
+            // M cleared and OR M back in there. HVF leaves SPAN(23) CLEAR and
+            // forces PSTATE.PAN=1 (FEAT_PAN3) — SPAN is KVM glue, NOT part of the
+            // shared value.
+            use carrick_hal::GuestArch as _;
+            let boot = <HvfTrapEngine as carrick_hal::ThreadedEngine>::Arch::bootstrap_sysregs();
+            let mut sctlr_el1: u64 = boot.sctlr_el1 & !1;
+            if let Some(pt_base) = plan.stage1_page_tables_base {
+                vcpu.set_sys_reg(SysReg::MAIR_EL1, boot.mair_el1)
+                    .map_err(hvf_error)?;
+                // 48-bit VA, TTBR0 + TTBR1 both active sharing one root. MUST stay
+                // identical to the canonical TCR comment/value in new_with_plan.
+                // boot.tcr_el1 is the shared bootstrap value via GuestArch
+                // (canonical rationale in carrick_mem::arch_sysregs).
+                vcpu.set_sys_reg(SysReg::TCR_EL1, boot.tcr_el1)
+                    .map_err(hvf_error)?;
+                vcpu.set_sys_reg(SysReg::TTBR0_EL1, pt_base)
+                    .map_err(hvf_error)?;
+                // TTBR1 shares the same root (see the TCR comment above).
+                vcpu.set_sys_reg(SysReg::TTBR1_EL1, pt_base)
+                    .map_err(hvf_error)?;
+                sctlr_el1 |= 1;
+            }
+            vcpu.set_sys_reg(SysReg::SCTLR_EL1, sctlr_el1)
                 .map_err(hvf_error)?;
-        }
-        // C=1, I=1, UCI=1 (bit 26), UCT=1 (bit 15), DZE=1 (bit 14) — EL0 cache-
-        // maintenance ops + CTR_EL0/DCZID_EL0 reads + DC ZVA, matching Linux.
-        // See the matching comment at the initial-bringup site; glibc 2.41 reads
-        // CTR_EL0 at startup, which traps to EL1 (fatal) without UCT.
-        // Shared bootstrap SCTLR (via GuestArch; canonical rationale in
-        // carrick_mem::arch_sysregs) carries M=1 (stage-1 on); HVF enables M
-        // only when stage-1 tables exist (below), so start from the value with
-        // M cleared and OR M back in there. HVF leaves SPAN(23) CLEAR and
-        // forces PSTATE.PAN=1 (FEAT_PAN3) — SPAN is KVM glue, NOT part of the
-        // shared value.
-        use carrick_hal::GuestArch as _;
-        let boot = <HvfTrapEngine as carrick_hal::ThreadedEngine>::Arch::bootstrap_sysregs();
-        let mut sctlr_el1: u64 = boot.sctlr_el1 & !1;
-        if let Some(pt_base) = plan.stage1_page_tables_base {
-            vcpu.set_sys_reg(SysReg::MAIR_EL1, boot.mair_el1)
+            // boot.cpacr_el1 (FPEN=0b11, no FP/SIMD trap at EL0) is shared.
+            vcpu.set_sys_reg(SysReg::CPACR_EL1, boot.cpacr_el1)
                 .map_err(hvf_error)?;
-            // 48-bit VA, TTBR0 + TTBR1 both active sharing one root. MUST stay
-            // identical to the canonical TCR comment/value in new_with_plan.
-            // boot.tcr_el1 is the shared bootstrap value via GuestArch
-            // (canonical rationale in carrick_mem::arch_sysregs).
-            vcpu.set_sys_reg(SysReg::TCR_EL1, boot.tcr_el1)
-                .map_err(hvf_error)?;
-            vcpu.set_sys_reg(SysReg::TTBR0_EL1, pt_base)
-                .map_err(hvf_error)?;
-            // TTBR1 shares the same root (see the TCR comment above).
-            vcpu.set_sys_reg(SysReg::TTBR1_EL1, pt_base)
-                .map_err(hvf_error)?;
-            sctlr_el1 |= 1;
-        }
-        vcpu.set_sys_reg(SysReg::SCTLR_EL1, sctlr_el1)
-            .map_err(hvf_error)?;
-        // boot.cpacr_el1 (FPEN=0b11, no FP/SIMD trap at EL0) is shared.
-        vcpu.set_sys_reg(SysReg::CPACR_EL1, boot.cpacr_el1)
-            .map_err(hvf_error)?;
-        if let Some(vectors_base) = plan.el1_vectors_base {
-            vcpu.set_sys_reg(SysReg::VBAR_EL1, vectors_base)
-                .map_err(hvf_error)?;
-        }
-        if let Some(stack_pointer) = plan.initial_stack_pointer {
-            vcpu.set_sys_reg(SysReg::SP_EL0, stack_pointer)
-                .map_err(hvf_error)?;
-        }
-        // execve resets TPIDR_EL0 — the new image's musl init will call
-        // set_thread_area to initialise it.
-        vcpu.set_sys_reg(SysReg::TPIDR_EL0, 0).map_err(hvf_error)?;
+            if let Some(vectors_base) = plan.el1_vectors_base {
+                vcpu.set_sys_reg(SysReg::VBAR_EL1, vectors_base)
+                    .map_err(hvf_error)?;
+            }
+            if let Some(stack_pointer) = plan.initial_stack_pointer {
+                vcpu.set_sys_reg(SysReg::SP_EL0, stack_pointer)
+                    .map_err(hvf_error)?;
+            }
+            // execve resets TPIDR_EL0 — the new image's musl init will call
+            // set_thread_area to initialise it.
+            vcpu.set_sys_reg(SysReg::TPIDR_EL0, 0).map_err(hvf_error)?;
 
-        // Verify post-execve sysreg state through dtrace. If stage-1 isn't on or
-        // TTBR0 doesn't point at the new tables, the new process will fault on the
-        // first LDAXR.
-        let actual_sctlr = vcpu.get_sys_reg(SysReg::SCTLR_EL1).unwrap_or(0);
-        let actual_ttbr0 = vcpu.get_sys_reg(SysReg::TTBR0_EL1).unwrap_or(0);
-        let actual_mair = vcpu.get_sys_reg(SysReg::MAIR_EL1).unwrap_or(0);
-        emit_replace_stage(
-            carrick_observability::probes::HvpatchExecReplaceStagePhase::Registers,
-            registers_started,
-        );
-        crate::probes::execve_sysregs(actual_sctlr, actual_ttbr0, actual_mair);
+            // Verify post-execve sysreg state through dtrace. If stage-1 isn't on or
+            // TTBR0 doesn't point at the new tables, the new process will fault on the
+            // first LDAXR.
+            let actual_sctlr = vcpu.get_sys_reg(SysReg::SCTLR_EL1).unwrap_or(0);
+            let actual_ttbr0 = vcpu.get_sys_reg(SysReg::TTBR0_EL1).unwrap_or(0);
+            let actual_mair = vcpu.get_sys_reg(SysReg::MAIR_EL1).unwrap_or(0);
+            emit_replace_stage(
+                carrick_observability::probes::HvpatchExecReplaceStagePhase::Registers,
+                registers_started,
+            );
+            crate::probes::execve_sysregs(actual_sctlr, actual_ttbr0, actual_mair);
+            self.populate_vdso_data_page();
+            self.allocate_mailbox_for_vcpu(vcpu)
+        })();
         let mailbox_started = std::time::Instant::now();
-        self.populate_vdso_data_page();
-        *mailbox = self.allocate_mailbox_for_vcpu(vcpu)?;
+        *mailbox = post_publication.unwrap_or_else(|error| {
+            // Backend inventory and non-owning mapping rows already name these
+            // frames. Returning would let `owner_rollback` retire their leases
+            // while leaving those authorities published, so the only sound
+            // outcome after this indeterminate boundary is process fail-stop.
+            eprintln!(
+                "carrick: FATAL: HVPatch exec post-publication register/mailbox failure: {error}"
+            );
+            std::process::abort();
+        });
         owner_rollback.commit();
         emit_replace_stage(
             carrick_observability::probes::HvpatchExecReplaceStagePhase::Mailbox,
@@ -12250,6 +12322,51 @@ mod frame_inventory_backend_tests {
             empty_inventory_reservation(raw),
             empty_inventory_reservation(raw + 1),
         )
+    }
+
+    #[test]
+    fn cancelled_process_inventory_does_not_poison_the_next_fork() {
+        let ledger = std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
+        let mut state = HvpatchFrameInventoryState::new(std::sync::Arc::clone(&ledger));
+
+        state
+            .begin_process_inventory(empty_inventory_reservation(91))
+            .expect("first reservation");
+        assert!(state.cancel_process_inventory());
+        state
+            .begin_process_inventory(empty_inventory_reservation(92))
+            .expect("retry after an EFAULT/build/spawn failure");
+        assert!(state.cancel_process_inventory());
+        assert!(ledger.lock().process_reservation.is_none());
+    }
+
+    #[test]
+    fn parent_arm_rollback_restores_preexisting_overlapping_ranges_exactly() {
+        let broad = carrick_aarch64::vmm::ForkCowRange {
+            va: 0x4000_0000,
+            len: 0x20_000,
+            executable: false,
+            kernel_only: false,
+        };
+        let exact = carrick_aarch64::vmm::ForkCowRange {
+            va: 0x4000_8000,
+            len: 0x4000,
+            executable: false,
+            kernel_only: false,
+        };
+        let mut armed = CowArmedRanges::default();
+        armed.arm(&[broad]);
+        let before = armed.snapshot();
+
+        armed.arm(&[exact]);
+        armed.disarm_ranges(&[exact]);
+        assert_ne!(
+            armed.ranges, before,
+            "the old range-subtraction rollback is lossy"
+        );
+
+        armed.restore(before.clone());
+        assert_eq!(armed.ranges, before);
     }
 
     #[test]
