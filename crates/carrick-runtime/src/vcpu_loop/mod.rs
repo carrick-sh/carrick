@@ -1837,12 +1837,12 @@ where
             }
             use sha2::Digest as _;
             let digest: [u8; 32] = sha2::Sha256::digest(&bytes).into();
-            let hash_words = [
-                u64::from_be_bytes(digest[0..8].try_into().expect("SHA-256 word")),
-                u64::from_be_bytes(digest[8..16].try_into().expect("SHA-256 word")),
-                u64::from_be_bytes(digest[16..24].try_into().expect("SHA-256 word")),
-                u64::from_be_bytes(digest[24..32].try_into().expect("SHA-256 word")),
-            ];
+            let mut hash_words = [0_u64; 4];
+            for (word, octets) in hash_words.iter_mut().zip(digest.chunks_exact(8)) {
+                let mut octet_array = [0_u8; 8];
+                octet_array.copy_from_slice(octets);
+                *word = u64::from_be_bytes(octet_array);
+            }
             crate::probes::hvpatch_core_census(
                 generation,
                 mapping_count,
