@@ -1,10 +1,16 @@
+SOURCE COMMIT
+5545ba4b6563e4f68571795b9c51ea435d0a12d5
+
+COMMAND
+RUST_TEST_THREADS=1 just ci
+
 frame pointers: enforced
 cargo fmt --all -- --check
     Checking carrick-vmm-hvf v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/crates/carrick-vmm-hvf)
     Checking carrick-runtime v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/crates/carrick-runtime)
     Checking carrick-engine v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/crates/carrick-engine)
     Checking carrick-cli v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/crates/carrick-cli)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 11.87s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 11.90s
 cargo deny check licenses bans sources
 warning[duplicate]: found 2 duplicate entries for crate 'base64'
    ┌─ /Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/Cargo.lock:19:1
@@ -2180,7 +2186,7 @@ cargo build -p carrick-cli  --workspace
    Compiling carrick-runtime v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/crates/carrick-runtime)
    Compiling carrick-engine v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/crates/carrick-engine)
    Compiling carrick-cli v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/crates/carrick-cli)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 18.02s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 18.34s
     Checking carrick-vmm-hvf v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/crates/carrick-vmm-hvf)
  Documenting carrick-vmm-hvf v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/crates/carrick-vmm-hvf)
     Checking carrick-runtime v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/crates/carrick-runtime)
@@ -2188,12 +2194,12 @@ cargo build -p carrick-cli  --workspace
     Checking carrick-engine v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/crates/carrick-engine)
  Documenting carrick-engine v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/crates/carrick-engine)
  Documenting carrick-cli v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/crates/carrick-cli)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 11.61s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.74s
    Generated /Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/target/doc/carrick_aarch64/index.html and 37 other files
    Compiling carrick-runtime v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/crates/carrick-runtime)
    Compiling carrick-vmm-hvf v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/crates/carrick-vmm-hvf)
    Compiling carrick-engine v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/crates/carrick-engine)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.80s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.76s
      Running unittests src/lib.rs (target/debug/deps/carrick_aarch64-4c3ab7cc1fad0b08)
 
 running 14 tests
@@ -2356,7 +2362,7 @@ test verdict::tests::overlay_baseline_suppresses_kvm_only_divergence ... ok
 test verdict::tests::unchanged_baseline_diff_is_green ... ok
 test verdict::tests::unexcused_diff_against_baseline_is_regression ... ok
 
-test result: ok. 108 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.88s
+test result: ok. 108 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.87s
 
      Running unittests src/lib.rs (target/debug/deps/carrick_dsr-34af58a65010e8b5)
 
@@ -2470,7 +2476,7 @@ test test_hooks::tests::prepared_mapping_failpoint_fires_once_at_matching_site_o
 test test_hooks::tests::reexec_lifecycle_capture_records_and_drains ... ok
 test test_hooks::tests::vvar_words_and_supplemental_rollbacks_round_trip ... ok
 
-test result: ok. 108 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.80s
+test result: ok. 108 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.87s
 
      Running unittests src/lib.rs (target/debug/deps/carrick_dsr_aarch64-cb465e9a9896b0b6)
 
@@ -3013,7 +3019,7 @@ test x8664_arch::tests::syscall_table_unknown_number_is_unknown ... ok
 test x8664_arch::tests::vdso_bytes_exports_x86_clock_symbols ... ok
 test x8664_arch::tests::x8664_guest_arch_satisfies_the_seam ... ok
 
-test result: ok. 97 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+test result: ok. 97 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
 
      Running unittests src/lib.rs (target/debug/deps/carrick_host-808feb08b9724578)
 
@@ -3181,7 +3187,7 @@ test process::tests::virtual_ptrace_control_round_trips_owner_and_state ... ok
 test wait::tests::spin_yield_returns_value_changed_when_word_moves ... ok
 test wait::tests::spin_yield_times_out_when_word_holds ... ok
 
-test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
 
      Running unittests src/lib.rs (target/debug/deps/carrick_mem-178a76fde38bf1a6)
 
@@ -3459,7 +3465,7 @@ test jit::tests::map_code_cache_round_trips_on_apple_silicon ... ok
 test jit::tests::supported_reports_a_typed_result ... ok
 test tests::darwin_host_name_and_jit_are_wired ... ok
 
-test result: ok. 126 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s
+test result: ok. 126 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s
 
      Running unittests src/lib.rs (target/debug/deps/carrick_native_freebsd-31ba15b4d110d182)
 
@@ -3695,7 +3701,7 @@ test thread::tests::signal_wake_targets_only_matching_waiter_tid ... ok
 test thread::tests::tracks_guest_visible_thread_state ... ok
 test thread::tests::unpark_claims_vm_rebuild_exactly_once ... ok
 
-test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.71s
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.73s
 
      Running unittests src/lib.rs (target/debug/deps/carrick_timer_core-c8fa429a0521a081)
 
@@ -3741,7 +3747,7 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
      Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-23f4e3ce7b0ee911)
 
-running 132 tests
+running 133 tests
 test fork_coord::tests::child_restarts_only_inherited_signal_pump ... ok
 test fork_coord::tests::host_fork_preparation_stops_and_restarts_signal_pump ... ok
 test fork_coord::tests::parent_can_skip_absent_signal_pump_until_child_exit_needs_it ... ok
@@ -3810,6 +3816,7 @@ test trap::memory_protection_tests::cloned_protection_metadata_shares_updates_ac
 test trap::memory_protection_tests::exec_level_classifies_el0_as_guest_el1_as_kernel ... ok
 test trap::memory_protection_tests::protection_ranges_are_sorted_coalesced_and_split_on_clear ... ok
 test trap::raw_hvf_stage2_calls_are_inventory_gated ... ok
+test trap::tag_strip_tests::alias_registry_full_semantic_unmap_rejects_hvf_padding ... ok
 test trap::tag_strip_tests::alias_registry_partial_unmap_preserves_exact_live_fragments ... ok
 test trap::tag_strip_tests::alias_registry_prefix_unmap_preserves_exact_suffix ... ok
 test trap::tag_strip_tests::alias_registry_suffix_unmap_preserves_exact_prefix ... ok
@@ -3875,7 +3882,7 @@ test vcpu_permit_reaper::tests::note_exit_on_reused_pid_does_not_free_live_gener
 test vcpu_permit_reaper::tests::note_exit_reclaims_owner_slot ... ok
 test vcpu_permit_reaper::tests::register_after_exit_reclaims_via_readiness_check ... ok
 
-test result: ok. 132 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.74s
+test result: ok. 133 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.75s
 
      Running unittests src/bin/hvf_bl_exit_free_probe.rs (target/debug/deps/hvf_bl_exit_free_probe-4eb982d464a83719)
 
@@ -4009,7 +4016,7 @@ test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
    Compiling carrick-runtime v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/crates/carrick-runtime)
    Compiling carrick-engine v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/crates/carrick-engine)
    Compiling carrick-cli v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/crates/carrick-cli)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 17.19s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 17.11s
      Running unittests src/main.rs (target/debug/deps/carrick-98b3598b062515c8)
 
 running 353 tests
@@ -4367,10 +4374,10 @@ test trace_profile::tests::signaled_target_exit_cannot_complete_a_profile ... ok
 test trace_profile::tests::translation_subphase_aggregates_fail_closed_when_truncated ... ok
 test trace_profile::tests::writes_provenance_rich_jsonl_atomically ... ok
 
-test result: ok. 353 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.41s
+test result: ok. 353 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.39s
 
    Compiling carrick-runtime v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/crates/carrick-runtime)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 17.55s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 17.47s
      Running unittests src/lib.rs (target/debug/deps/carrick_runtime-29408ad887d994b7)
 
 running 1569 tests
@@ -5391,8 +5398,8 @@ test native_darwin::dsr::tests::dsr_cache_exhaustion_is_a_typed_error ... ok
 test native_darwin::dsr::tests::dsr_cache_published_code_is_fork_inherited ... ok
 test native_darwin::dsr::tests::dsr_cache_publishes_executable_aarch64_code ... ok
 test native_darwin::dsr::tests::dsr_cache_second_publication_executes_new_instructions ... ok
-test native_darwin::dsr::tests::dsr_cache_write_and_execute_phases_are_disjoint ... native Darwin fatal signal 10 pc=0x00000001089e4000 sp=0x000000016dc423c0 lr=0x0000000103ba1e3c x0=0x00000001089e4000 esr=0x000000008200000f far=0x00000001089e4000 addr=0x00000001089e4000 tpidr=0x0000000000000009 saved_host_tpidr=0x0000000000000000 image_base=0x00000001023c4000
-native Darwin fatal signal 10 pc=0x00000001041f9a98 sp=0x000000016dc42310 lr=0x00000001041f9a8c x0=0x0000000000000001 esr=0x000000009200004f far=0x00000001089e4000 addr=0x00000001089e4000 tpidr=0x0000000000001006 saved_host_tpidr=0x0000000000000000 image_base=0x00000001023c4000
+test native_darwin::dsr::tests::dsr_cache_write_and_execute_phases_are_disjoint ... native Darwin fatal signal 10 pc=0x000000010a8b8000 sp=0x000000016bd6e3c0 lr=0x0000000105a75e3c x0=0x000000010a8b8000 esr=0x000000008200000f far=0x000000010a8b8000 addr=0x000000010a8b8000 tpidr=0x0000000000001006 saved_host_tpidr=0x0000000000000000 image_base=0x0000000104298000
+native Darwin fatal signal 10 pc=0x0000000106092950 sp=0x000000016bd6e310 lr=0x0000000106092944 x0=0x0000000000000001 esr=0x000000009200004f far=0x000000010a8b8000 addr=0x000000010a8b8000 tpidr=0x0000000000001007 saved_host_tpidr=0x0000000000000000 image_base=0x0000000104298000
 ok
 test native_darwin::dsr::tests::dsr_counter_register_reads_execute_directly ... ok
 test native_darwin::dsr::tests::dsr_exec_switch_keeps_retiring_translator_metadata_alive ... ok
@@ -5951,7 +5958,7 @@ test vfs::sys::tests::sys_registry_renders_kernel_random_files ... ok
 test result: ok. 1564 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 9.84s
 
    Compiling carrick-runtime v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/crates/carrick-runtime)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.80s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.81s
      Running tests/integration/main.rs (target/debug/deps/integration-6eff014e489d95c3)
 
 running 296 tests
@@ -6252,7 +6259,7 @@ test syscall_time::sysinfo_reports_uptime_not_epoch_time ... ok
 test syscall_time::timer_create_rejects_thread_cpu_sigev_thread_id ... ok
 test syscall_time::times_bootstrap_writes_tms_and_returns_monotonic_clock ... ok
 
-test result: ok. 296 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.63s
+test result: ok. 296 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.56s
 
    Compiling carrick-runtime v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/crates/carrick-runtime)
     Finished `test` profile [unoptimized + debuginfo] target(s) in 0.56s
@@ -6280,7 +6287,7 @@ test waitid_wexited_ignores_stopped_child ... ok
 test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
 
    Compiling carrick-cli v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/crates/carrick-cli)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.46s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.48s
      Running tests/trace_profile.rs (target/debug/deps/trace_profile-c9af10bf9afeffe1)
 
 running 41 tests
@@ -6331,12 +6338,12 @@ test native_wall_profile_uses_single_sample_and_offcpu_stack_authorities ... ok
 test trace_profile_argument_relationships_are_enforced ... ok
 test trace_profile_keeps_raw_and_summary_outputs_distinct ... ok
 
-test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.81s
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.78s
 
    Compiling carrick-vmm-hvf v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/crates/carrick-vmm-hvf)
    Compiling carrick-runtime v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/crates/carrick-runtime)
    Compiling carrick-engine v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/crates/carrick-engine)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.13s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.09s
      Running unittests src/lib.rs (target/debug/deps/carrick_engine-642ca141a43524bd)
 
 running 25 tests
@@ -6366,7 +6373,7 @@ test tests::user_absent_defaults_root ... ok
 test tests::user_numeric_uid_and_gid ... ok
 test tests::user_numeric_uid_defaults_gid_zero ... ok
 
-test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 
    Doc-tests carrick_engine
 
@@ -6420,3 +6427,6 @@ running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
+
+EXIT STATUS
+0

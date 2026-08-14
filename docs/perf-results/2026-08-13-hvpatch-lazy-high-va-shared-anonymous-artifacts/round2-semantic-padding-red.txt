@@ -1,0 +1,31 @@
+PRODUCTION BASE
+90eb231c9b3660669592964608c0a2f908574e02
+
+STATE
+The focused test was added in the worktree; production code remained at the base above.
+
+COMMAND
+RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf alias_registry_full_semantic_unmap_rejects_hvf_padding -- --nocapture
+
+   Compiling carrick-vmm-hvf v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/crates/carrick-vmm-hvf)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.16s
+     Running unittests src/lib.rs (target/debug/deps/carrick_vmm_hvf-89014486320444c6)
+
+running 1 test
+test trap::tag_strip_tests::alias_registry_full_semantic_unmap_rejects_hvf_padding ... 
+thread 'trap::tag_strip_tests::alias_registry_full_semantic_unmap_rejects_hvf_padding' (15356393) panicked at crates/carrick-vmm-hvf/src/trap.rs:10881:9:
+fully unmapping the 4-KiB guest extent must not retain 12 KiB of HVF padding
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    trap::tag_strip_tests::alias_registry_full_semantic_unmap_rejects_hvf_padding
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 132 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-vmm-hvf --lib`
+
+EXIT STATUS
+101

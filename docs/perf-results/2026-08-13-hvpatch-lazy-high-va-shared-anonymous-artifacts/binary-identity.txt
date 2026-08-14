@@ -1,34 +1,34 @@
 SOURCE PROVENANCE
-commit=a5a940eff47b529936a02b1ba9a1d2904f9cbaa7
-parent=4e8b2f297d3bb62fa8850a5a2d5b98b23259f0e7
-author_date=2026-08-13T21:26:16-07:00
-subject=fix(hvpatch): retain fork-shared alias lineage
+commit=5545ba4b6563e4f68571795b9c51ea435d0a12d5
+parent=90eb231c9b3660669592964608c0a2f908574e02
+author_date=2026-08-13T22:02:05-07:00
+subject=fix(hvpatch): separate semantic alias extents
 
 BINARY SHA256
-bcac19722f8b134261129fe655087d30d514df20d30a83b3bba60b317ddc0430  target/release/carrick
+bed51c6f27749116907221703e5459278f4d9cd1e28081d47b70906716547525  target/release/carrick
 
 MACH-O LC_UUID
-054205DD-A5A1-3C31-B959-05D4895C5EC5
+C2EF9382-6754-3E6E-936A-4BF24571B872
 
 CODESIGN DETAILS
 Executable=/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/target/release/carrick
-Identifier=carrick.tmp.48368
+Identifier=carrick.tmp.63409
 Format=Mach-O thin (arm64)
 CodeDirectory v=20400 size=61962 flags=0x2(adhoc) hashes=1926+7 location=embedded
 VersionPlatform=1
 VersionMin=720896
 VersionSDK=786432
 Hash type=sha256 size=32
-CandidateCDHash sha256=706d6158ea7eca92d77aa7b563e9acedfabf0c1a
-CandidateCDHashFull sha256=706d6158ea7eca92d77aa7b563e9acedfabf0c1ae6f676ce41baed5b77d59ce9
+CandidateCDHash sha256=d620947ef524a71cebaa065c81044168f24e2cfb
+CandidateCDHashFull sha256=d620947ef524a71cebaa065c81044168f24e2cfb4eef6e55c90f094c2e44d3fa
 Hash choices=sha256
-CMSDigest=706d6158ea7eca92d77aa7b563e9acedfabf0c1ae6f676ce41baed5b77d59ce9
+CMSDigest=d620947ef524a71cebaa065c81044168f24e2cfb4eef6e55c90f094c2e44d3fa
 CMSDigestType=2
 Executable Segment base=0
 Executable Segment limit=22151168
 Executable Segment flags=0x1
 Page size=16384
-CDHash=706d6158ea7eca92d77aa7b563e9acedfabf0c1a
+CDHash=d620947ef524a71cebaa065c81044168f24e2cfb
 Signature=adhoc
 Info.plist=not bound
 TeamIdentifier=not set
@@ -43,8 +43,7 @@ warning: Specifying ':' in the path is deprecated and will not work in a future 
 <?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.security.hypervisor</key><true/></dict></plist>
 
 DTRACE DOF SECTION
-Section
   sectname __dof_carrick
    segname __TEXT
-      addr 0x00000001012a573c
-      size 0x000000000000b8ee
+      addr 0x00000001012a57b8
+      size 0x000000000000b8e8

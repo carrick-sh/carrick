@@ -383,3 +383,142 @@ All paths are under
 The raw binary receipt includes the source commit and parent, full codesign
 details, entitlement XML, LC_UUID, SHA-256, and DTrace DOF section. The raw
 probe output and cleanup receipt carry the actual generated `cr-*` run ID.
+
+## Review-fix round 2: semantic extent versus HVF padding
+
+This addendum supersedes the binary, focused-test, full-CI, differential, cleanup,
+and artifact-manifest receipts above. Review found one remaining conflation: a
+4-KiB Linux alias is backed by a 16-KiB host/HVF extent, and initial alias
+publication had recorded the rounded physical size as semantic VA/IPA authority.
+Fully unmapping the 4-KiB mapping therefore split out a phantom 12-KiB live suffix.
+
+Implementation commit:
+
+```text
+5545ba4b6563e4f68571795b9c51ea435d0a12d5
+parent 90eb231c9b3660669592964608c0a2f908574e02
+fix(hvpatch): separate semantic alias extents
+```
+
+`AliasBacking.size`, `HvfMappedRegion.end`, and the semantic size carried by
+thread/process fork descriptors now use the exact guest length. The retained
+`physical_ipa`, `physical_host_addr`, and `physical_size` continue to name the
+whole HVF-granular stage-2 extent for mapping, replay, frame inventory, and
+lifetime. Exact-live row checks compare registry size with `end - start`, while
+replay and retirement use only the physical tuple. Child private snapshots copy
+and map the physical extent, then derive the exact semantic IPA/host offset and
+validate that it is contained within that extent. Physical padding is therefore
+never promoted to VA/IPA lookup, split, replay-selection, or fork authority.
+
+The earlier genuine prefix, middle, and suffix fragment behavior is unchanged:
+each surviving semantic fragment retains the same physical frame identity, and
+fork materialization uses the retained physical tuple.
+
+### Round-2 TDD RED and GREEN
+
+The test was added while production remained at `90eb231c9`; exact command:
+
+```text
+RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf alias_registry_full_semantic_unmap_rejects_hvf_padding -- --nocapture
+```
+
+RED output:
+
+```text
+running 1 test
+test trap::tag_strip_tests::alias_registry_full_semantic_unmap_rejects_hvf_padding ... FAILED
+fully unmapping the 4-KiB guest extent must not retain 12 KiB of HVF padding
+test result: FAILED. 0 passed; 1 failed; 132 filtered out
+exit status 101
+```
+
+The committed raw RED receipt is
+`2026-08-13-hvpatch-lazy-high-va-shared-anonymous-artifacts/round2-semantic-padding-red.txt`.
+It binds the production base, test-only worktree state, command, output, and exit
+status.
+
+Focused GREEN commands and results on `5545ba4b`:
+
+```text
+RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf alias_registry_ -- --nocapture
+4 passed; 0 failed
+
+RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf --lib
+133 passed; 0 failed
+
+RUST_TEST_THREADS=1 cargo test -p carrick-runtime shared_anonymous_high_advisory_hint_is_selected_then_committed_lazily -- --nocapture
+1 passed; 0 failed
+
+cargo test -p carrick-cli --test trace_profile hvpatch_alias_sharing_ -- --nocapture
+2 passed; 0 failed
+```
+
+The four alias tests cover the new 4-KiB semantic/16-KiB physical full-unmap
+case plus the existing genuine prefix/middle/suffix fragments. The new test
+requires zero registry fragments, no padding lookup/lazy-replay candidate, no
+fork candidate, and a retained 16-KiB physical frame extent. The full HVPatch
+suite also includes the multi-generation shared-anonymous lineage test.
+
+### Round-2 current-HEAD CI and signed differential
+
+Exact full gate:
+
+```text
+RUST_TEST_THREADS=1 just ci
+exit status 0
+```
+
+Notable counts were HVPatch `133 passed; 0 failed`, runtime lib `1564 passed;
+0 failed; 5 ignored`, runtime integration `296 passed; 0 failed`, and CLI trace
+profile `41 passed; 0 failed`. The raw log starts with the source commit and
+command and ends with exit status zero.
+
+The signed release binary built by `just build` from `5545ba4b` is:
+
+```text
+SHA256 bed51c6f27749116907221703e5459278f4d9cd1e28081d47b70906716547525
+LC_UUID C2EF9382-6754-3E6E-936A-4BF24571B872
+Signature adhoc
+com.apple.security.hypervisor=true
+Mach-O __TEXT,__dof_carrick present
+```
+
+The unchanged AArch64 probe SHA-256 remains
+`26e9ddb43520cceb6a839e02f14fac3ed2326e494133eaaea051703373dc6a77`.
+The serialized differential command was:
+
+```text
+CARRICK_EXEC_BACKEND=hvpatch CARRICK_PROBE_RECEIPT=/tmp/hybrid-task1-round2-cleanup-receipt.txt scripts/run-probe.sh mmaptrimprotect
+```
+
+It returned line-exact `MATCH mmaptrimprotect`, including
+`hinted_high_shared_mprotect=ok`, `hinted_high_shared_parent_seeded=ok`, and
+`hinted_high_shared_fork_visibility=0`. The harness generated and cleaned the
+same real run ID:
+
+```text
+CARRICK_PROBE_RUN_ID=cr-63665-30195
+CARRICK_PROBE_CLEANUP_RUN_ID=cr-63665-30195
+remaining carrick procs (run-id cr-63665-30195) = 0
+```
+
+The harness ran Carrick and native-arm64 Docker serially.
+
+### Round-2 raw artifact manifest
+
+```text
+0e0c3164a8076140a67b343b46765ca6b74b3ce8cbc590524c6a5897c3e23bf9  binary-identity.txt
+70e576180aa658ad35239567644050c39283b962e98a70768a202459f6b47744  cleanup-receipt.txt
+12b2cd8a5f11cbd2e1798aeb948b15ee162e2df7888d2e058289cadd845bad1f  focused-green.txt
+160a03dbc9bbed14a0545a58f61e915da46ba21f016571432367cd766ef45936  just-ci-initial-native-x18-flake.log
+183b9e364a286c44af8cb1c4763d1b1db9e9537c62f3cd99a0bcbf779d7bbcd8  just-ci.log
+2334c79a9ed066ce2e957cca85976e56263953060606ef15a9d6c67ec6a48f55  native-x18-resample.txt
+0e5f20979147015d74b6f7b3583e36b9e8a3ef2792823438598db3c6f801b6a6  probe-build.txt
+dce79fd6e0bcf50327ff341b759da064d441e2367d9396be70c29343cc7ce14f  probe-match.txt
+0db74412b4a93d6857304670618921f60de7de2619443c02a268a1ae5e28d602  round2-semantic-padding-red.txt
+```
+
+All files are under
+`docs/perf-results/2026-08-13-hvpatch-lazy-high-va-shared-anonymous-artifacts/`.
+The earlier native-x18 flake and resample remain historical review-fix receipts;
+round 2 itself completed `just ci` on the first invocation.
