@@ -19,7 +19,60 @@ Darwin primitive.** Mach, HVF and Darwin's VFS are execution, physical-memory
 and storage HALs. They are not the source of Carrick's process, address-space,
 path, fork, exec, scheduler, fd, signal or crash-dump semantics.
 
-**Shipped proof — RE-AIMED 2026-08-13, on direction:** *finish the kernel*.
+## THE GOAL — re-aimed 2026-08-13: run the real ecosystems
+
+**Go, CPython and Node.js all green on the kernel lane, differentially
+verified against the native arm64 Docker oracle.**
+
+Why this and not a longer punch-list: a probe suite can be fully green while
+whole classes of breakage remain, because probes are small. The tree already
+paid for that lesson — no LTP case pushes `brk` past 4 MiB, so a bug that
+killed **100% of cpython** hid behind a healthy ~70% LTP score for weeks. Real
+ecosystems exercise threads, mmap, signals, epoll, exec and `/proc`
+*simultaneously*, which is the combination no probe covers. This goal cannot be
+satisfied one subsystem at a time.
+
+**Measured ground truth, 2026-08-13** (`carrick run --exec-backend hvpatch`,
+smoke level — this CORRECTS the earlier "Node.js does not run at all" framing,
+which was true of node and implied things about go/cpython that are not):
+
+| ecosystem | kernel lane | note |
+| --- | --- | --- |
+| Go | **runs** — `go version go1.23.12 linux/arm64` | cold `go build` also completes |
+| CPython | **runs** — `PY_OK 3.12.13` | |
+| Node.js | **FAILS** in V8 startup, before any JavaScript | root cause isolated, below |
+
+The harness for all three already exists: 194 Go suites, 438 CPython suites and
+3 Node suites are registered in `scripts/conformance/suites.toml`, run with
+`cargo run -p carrick-conformance -- --lane hvpatch --ecosystem <go|cpython|node>`.
+Two facts about what that will report on day one, both structural rather than
+new breakage:
+
+- `baseline.hvpatch.jsonl` is **empty**, so the effective baseline is the shared
+  hvf one. Any suite that behaves differently here classifies as a **gating
+  REGRESSION**, not `NEW` — there is no "unmeasured" state to fall back on.
+- The CPython image lives on a registry (`localhost:5050`) that is not currently
+  served, so those suites will fail to pull before they fail to run.
+
+### Node's blocker, isolated 2026-08-13
+
+`mprotect` on a mapping carrick placed at a **high hint address** returns
+ENOMEM where Linux returns 0
+(`conformance-probes/src/bin/mmaptrimprotect.rs`; carrick **1012**, Docker
+**0**). V8's `MemoryAllocator::AllocateAlignedMemory` hints an address around
+21 TiB, carrick honours the hint and reports success, then does not recognise
+its own mapping.
+
+It is **not** kernel-lane-specific: `vmm`, the mature reference lane, fails
+identically, so node has never run on carrick on any lane. (`native` fails
+earlier and differently — the DSR JIT cannot emit `LDG`.) The probe's controls
+hold trimming, `MAP_NORESERVE`, `MADV_DONTFORK` and geometry constant and all
+pass, which is what isolates the hint — and which is why the earlier
+aligned-cage hypothesis was correctly refuted by `mmapcage`.
+
+---
+
+**Prior framing, retained for context:** *finish the kernel*.
 The criterion is **correctness and completeness**, not the CPU bar:
 
 1. every Linux semantic the kernel lane owns is sourced from carrick's own
