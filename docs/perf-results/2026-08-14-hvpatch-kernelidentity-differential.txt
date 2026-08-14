@@ -1,3 +1,6 @@
+CARRICK_PROBE_RUN_ID=cr-29791-6307
+CARRICK_PROBE_CLEANUP_RUN_ID=cr-29791-6307
+remaining carrick procs (run-id cr-29791-6307) = 0
 MATCH kernelidentity
   root_exact_linux_init=true
   root_leader_tid_matches=true
@@ -23,6 +26,13 @@ MATCH kernelidentity
   job_control_wait_reported_continued=true
   job_control_child_resumed=true
   job_control_child_exited_zero=true
+  self_job_control_stop_send_succeeded=true
+  self_job_control_wait_reported_sigstop=true
+  self_job_control_parent_remained_runnable=true
+  self_job_control_continue_send_succeeded=true
+  self_job_control_wait_reported_continued=true
+  self_job_control_child_resumed=true
+  self_job_control_child_exited_zero=true
   credential_positive_signal_zero_denied=true
   credential_tgkill_signal_zero_denied=true
   credential_group_signal_zero_denied=true
