@@ -6,13 +6,15 @@
 //! is the difference between "we wrote a file" and "the file is a core".
 //!
 //! Layout facts (note sizes, note types, the `CORE` owner, header sizes) come
-//! from [`carrick_runtime::core_dump`], so writer and validator cannot drift:
-//! there is exactly one definition of the format in the tree.
+//! from [`carrick_runtime::core_dump`], including the architecture-note owner
+//! whose ABI definition the writer re-exports, so writer and validator cannot
+//! drift.
 
 use carrick_runtime::core_dump::{
-    AARCH64_FPREGSET_SIZE, AARCH64_TLS_SIZE, ELF_CLASS64, EM_AARCH64, ET_CORE, NOTE_ALIGN,
-    NOTE_OWNER, NT_ARM_TLS, NT_AUXV, NT_FILE, NT_FPREGSET, NT_PRPSINFO, NT_PRSTATUS, NT_SIGINFO,
-    ORACLE_PRPSINFO_SIZE, ORACLE_PRSTATUS_SIZE, ORACLE_SIGINFO_SIZE, PT_LOAD, PT_NOTE, wire,
+    AARCH64_FPREGSET_SIZE, AARCH64_TLS_SIZE, ELF_CLASS64, EM_AARCH64, ET_CORE,
+    LINUX_ELF_NOTE_OWNER, NOTE_ALIGN, NOTE_OWNER, NT_ARM_TLS, NT_AUXV, NT_FILE, NT_FPREGSET,
+    NT_PRPSINFO, NT_PRSTATUS, NT_SIGINFO, ORACLE_PRPSINFO_SIZE, ORACLE_PRSTATUS_SIZE,
+    ORACLE_SIGINFO_SIZE, PT_LOAD, PT_NOTE, wire,
 };
 use std::path::Path;
 
@@ -289,8 +291,7 @@ pub(crate) fn validate_bytes(bytes: &[u8], path: &str) -> Result<CoreSummary, Co
         // rejecting them made this validator refuse a genuine core at byte
         // 2236. Only `CORE` notes are interpreted; the rest are counted and
         // skipped, which is what any conforming reader does.
-        const LINUX_NOTE_OWNER: &[u8] = b"LINUX\0";
-        if owner != NOTE_OWNER && owner != LINUX_NOTE_OWNER {
+        if owner != NOTE_OWNER && owner != LINUX_ELF_NOTE_OWNER {
             foreign_notes += 1;
             at = align_up(desc_at + descsz, NOTE_ALIGN);
             continue;

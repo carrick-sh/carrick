@@ -27,6 +27,8 @@
 //!
 //! No Linux kernel source was consulted, per the project's clean-room rule.
 
+pub use carrick_abi::LINUX_ELF_NOTE_OWNER;
+
 /// ELF note types. `NT_SIGINFO`/`NT_FILE` spell their own names in ASCII.
 pub const NT_PRSTATUS: u32 = 1;
 pub const NT_FPREGSET: u32 = 2;
@@ -40,7 +42,6 @@ pub const NT_FILE: u32 = 0x4649_4c45;
 /// Standard process/thread notes use `CORE`; AArch64 TLS uses Linux's
 /// architecture-note `LINUX` owner.
 pub const NOTE_OWNER: &[u8] = b"CORE\0";
-pub const LINUX_NOTE_OWNER: &[u8] = b"LINUX\0";
 
 /// `readelf` reported `align 0x4` on the oracle's PT_NOTE: note fields are
 /// 4-byte aligned even in a 64-bit core.
@@ -229,7 +230,7 @@ fn push_thread_arch_notes(out: &mut Vec<u8>, thread: &ThreadState) {
     tls[..8].copy_from_slice(&thread.registers.tpidr_el0.to_le_bytes());
     // The second word is TPIDR2_EL0. Carrick does not expose SME today, so the
     // architecturally absent register is zero rather than synthesized state.
-    push_note_owned(out, LINUX_NOTE_OWNER, NT_ARM_TLS, &tls);
+    push_note_owned(out, LINUX_ELF_NOTE_OWNER, NT_ARM_TLS, &tls);
 }
 
 /// Wire structs for the note payloads.
