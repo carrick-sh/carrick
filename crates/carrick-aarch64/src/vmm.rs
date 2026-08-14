@@ -479,6 +479,20 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(u64, bool), TrapError>;
 
+    /// Install an alias using the dispatcher-provided anonymous sharing mode.
+    /// Backends without a host-fork distinction preserve their existing path.
+    fn add_alias_with_sharing(
+        &mut self,
+        va: u64,
+        ipa: u64,
+        len: u64,
+        payload: &[u8],
+        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+        _shared: bool,
+    ) -> Result<(u64, bool), TrapError> {
+        self.add_alias(va, ipa, len, payload, file)
+    }
+
     /// Called by the engine's `unmap_range`/`unmap_alias_range` only AFTER the
     /// checked stage-1 edit and TLBI complete, so an edit failure leaves a
     /// backend's process-shared alias index (HVF's `alias_registry`) intact and

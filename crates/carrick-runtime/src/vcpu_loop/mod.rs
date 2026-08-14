@@ -2687,12 +2687,13 @@ where
                     }
 
                     if engine
-                        .map_host_alias(
+                        .map_host_alias_with_sharing(
                             va,
                             ipa,
                             len,
                             &payload,
                             file.map(|(fd, offset, prot)| (fd.into_raw_fd(), offset, prot)),
+                            shared,
                         )
                         .is_err()
                     {
@@ -3018,6 +3019,16 @@ where
                         base_register,
                         base_value,
                     );
+                    if let Some((ttbr, descriptors)) = engine.diagnostic_fault_page_tables(far) {
+                        crate::probes::pt_fault_walk(
+                            far,
+                            descriptors[0],
+                            descriptors[1],
+                            descriptors[2],
+                            descriptors[3],
+                        );
+                        crate::probes::pt_fault_ttbr(far, ttbr);
+                    }
                     if let Some(process) = kernel.hvpatch_process.as_ref() {
                         process.trace_fault(syndrome, elr, far, state.this_tid);
                     }
@@ -3580,12 +3591,13 @@ where
                         }
                         Some(install) => {
                             if engine
-                                .map_host_alias(
+                                .map_host_alias_with_sharing(
                                     va,
                                     ipa,
                                     len,
                                     &payload,
                                     file.map(|(fd, offset, prot)| (fd.into_raw_fd(), offset, prot)),
+                                    shared,
                                 )
                                 .is_err()
                             {

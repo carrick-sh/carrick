@@ -216,7 +216,12 @@ impl OwnedHostMapping {
         self.len == 0
     }
 
-    pub fn guest_shared(&self) -> bool {
+    /// Whether a real host `fork(2)` keeps both processes on the same backing.
+    ///
+    /// This says nothing about guest-physical identity: HVPatch may keep a
+    /// shared anonymous mapping process-scoped while a shared file mapping uses
+    /// a VM-global IPA. Callers must make that policy decision separately.
+    pub fn shares_across_host_fork(&self) -> bool {
         matches!(
             self.kind,
             HostMappingKind::SharedAnon | HostMappingKind::SharedFile
@@ -501,7 +506,7 @@ mod tests {
 
         assert_eq!(snapshot.len(), len);
         assert!(
-            !snapshot.guest_shared(),
+            !snapshot.shares_across_host_fork(),
             "child private snapshots must not be treated as guest-shared"
         );
         assert_eq!(unsafe { snapshot.as_ptr().read_volatile() }, 0x41);

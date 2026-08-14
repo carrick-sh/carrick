@@ -4100,6 +4100,9 @@ mod real {
         /// proves the PTE is wrong IN MEMORY (logic bug); a valid RW leaf proves the
         /// memory is fine and the faulting vCPU's TLB was stale (coherence bug).
         fn pt__fault__walk(_: u64, _: u64, _: u64, _: u64, _: u64) {}
+        /// Exact TTBR0_EL1 observed alongside `pt-fault-walk`; includes the ASID
+        /// in bits 63:48 and root IPA in bits 47:0.
+        fn pt__fault__ttbr(_: u64, _: u64) {}
         /// Guest-memory copy mapping decision. `dir`: 0=guest->host read,
         /// 1=host->guest internal write, 2=host->guest syscall checked write.
         /// `addr`/`len` are the guest VA range. `stage1_ipa` is the live stage-1
@@ -5500,6 +5503,10 @@ mod real {
         carrick_usdt::pt__fault__walk!(|| (far, l0, l1, l2, l3));
     }
 
+    pub fn pt_fault_ttbr(far: u64, ttbr: u64) {
+        carrick_usdt::pt__fault__ttbr!(|| (far, ttbr));
+    }
+
     pub mod guest_mem_dir {
         pub const READ_GUEST: u32 = 0;
         pub const WRITE_GUEST: u32 = 1;
@@ -5823,7 +5830,8 @@ mod real {
     }
 
     /// Emit a high-VA alias page-table walk. See `pt__alias__walk`. `flag` bit0 =
-    /// forked child, bit1 = the page-table build failed.
+    /// forked child, bit1 = the page-table build/read failed, bit2 = descriptors
+    /// were read from the authoritative host backing rather than manager shadow.
     pub fn pt_alias_walk(va: u64, descs: [u64; 4], flag: i32) {
         carrick_usdt::pt__alias__walk!(|| (va, descs[0], descs[1], descs[2], descs[3], flag));
     }
@@ -6271,6 +6279,7 @@ mod stub {
     stub!(pt_pause_end(tid: i32));
     stub!(pt_pool(in_use: u32, free_list: u32, capacity: u32, changed: i32));
     stub!(pt_fault_walk(far: u64, l0: u64, l1: u64, l2: u64, l3: u64));
+    stub!(pt_fault_ttbr(far: u64, ttbr: u64));
     stub!(guest_mem_bytes(direction: u32, address: u64, bytes: &[u8]));
     stub!(vcpu_trap(regs: &crate::compat::GuestRegs));
     stub!(execve_loaded(path: &str, entry: u64, initial_sp: u64, mapping_count: u64));

@@ -266,6 +266,21 @@ pub trait SyscallTrap {
         );
         std::process::abort()
     }
+
+    /// As [`Self::map_host_alias`], with the dispatcher's authoritative
+    /// anonymous-mapping sharing classification. Backends that do not have a
+    /// host-fork distinction retain the historical implementation.
+    fn map_host_alias_with_sharing(
+        &mut self,
+        va: GuestVa,
+        ipa: Gpa,
+        len: u64,
+        payload: &[u8],
+        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+        _shared: bool,
+    ) -> Result<(), TrapError> {
+        self.map_host_alias(va, ipa, len, payload, file)
+    }
 }
 
 #[derive(Debug, Error)]
