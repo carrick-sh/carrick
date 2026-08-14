@@ -87,6 +87,21 @@ impl LinuxSignal {
     pub const fn raw(self) -> i32 {
         self.0.get()
     }
+
+    /// Whether this is a POSIX realtime signal (`SIGRTMIN..=SIGRTMAX`, 32..=64
+    /// on Linux/aarch64).
+    ///
+    /// The distinction is not cosmetic: realtime signals QUEUE — every send is
+    /// delivered, with its own siginfo, in send order — while a standard signal
+    /// collapses to one pending bit no matter how many times it is sent. The
+    /// pending queue picks `enqueue_realtime` vs `enqueue_standard` from this,
+    /// so a wrong answer silently drops or duplicates deliveries.
+    ///
+    /// This is THE authority for the question; callers holding a raw signum go
+    /// through [`Self::for_signal_number`] rather than re-testing the range.
+    pub const fn is_realtime(self) -> bool {
+        self.0.get() >= 32
+    }
 }
 
 serial_id!(TaskSerial);
