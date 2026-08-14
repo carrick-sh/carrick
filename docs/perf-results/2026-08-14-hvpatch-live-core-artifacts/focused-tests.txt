@@ -8,3 +8,11 @@ RUST_TEST_THREADS=1 cargo test -p carrick-runtime fatal_core_authority --lib: 1 
 cargo test -p carrick-vmm-hvf guest_copy_mapping --lib: 1 passed
 
 All commands exited 0.
+
+Final VMA-authority RED/green at validated HEAD 0b076654:
+
+RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib dispatch::mem::tests::guest_vma_occupancy_excludes_hidden_arenas_but_includes_live_ranges -- --exact: RED 0 passed, 1 failed; GREEN 1 passed
+RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib vma_: 11 passed
+RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib mem_authority_: 3 passed
+
+Fresh RUST_TEST_THREADS=1 just ci exited 0 at validated HEAD.

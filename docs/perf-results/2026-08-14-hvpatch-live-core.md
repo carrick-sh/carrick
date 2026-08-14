@@ -3,6 +3,7 @@
 Date: 2026-08-14  
 Base: `ec55da029009821215bb6ecb1c3b846364b7ca05`  
 Implementation: `2a84f4cb5a5f318f129aab761ea5d763c8b6f93e`  
+Validated code HEAD: `0b076654c1ad66624657268d3c7d2541514e6d31`
 Lane: signed macOS/arm64 HVPatch, native-arm64 Docker oracle serialized after Carrick
 
 ## Result
@@ -100,8 +101,8 @@ all clear the advertised generation and release the barrier; none set WCOREDUMP.
 The final signed binary provenance is in
 `2026-08-14-hvpatch-live-core-artifacts/signed-provenance.txt`:
 
-- binary SHA-256 `a6dbc645df68a614b94058d1c1562d83f7eb0565dbb90eaaddfb5a9c61f9fa52`
-- Mach-O UUID `66E363AE-0845-3B92-B15C-FCA812137C0D`
+- binary SHA-256 `a59a2e711c47eb127f5aacece202181ea96228770ef1106b967e1608812144e8`
+- Mach-O UUID `2440CE07-746B-378A-8CAA-533E393176F9`
 - `com.apple.security.hypervisor=true`, valid codesign, and
   `__TEXT,__dof_carrick` present
 - expanded probe SHA-256
@@ -111,7 +112,7 @@ Final signed serialized differential:
 
 ```
 CARRICK_EXEC_BACKEND=hvpatch scripts/run-probe.sh coredumpfile
-CARRICK_PROBE_RUN_ID=cr-86615-16149
+CARRICK_PROBE_RUN_ID=cr-96830-1620
 MATCH coredumpfile                    # all 28 observations
 remaining carrick procs = 0
 ```
@@ -125,14 +126,14 @@ there is no Carrick validator in the oracle half.
 The archived actual core and raw receipt are:
 
 - `coredumpfile.core`: SHA-256
-  `f01a69d6e16b1333f0d2bc958026884afdbccdfc38a7def52b2f523227427b0b`
+  `a643fbc2d3d258fa6db99abd5ff3dda85dbcd2effa3c309f9d376a1c7aa8c7ef`
 - `hvpatch-core-lifecycle.raw`: SHA-256
-  `ce90a975542a85d94e65777b5ff90cc99bcb5d786c055328fd39b0bd78a4162d`
+  `abec059e3a82e1a2aede6248409433ad8555f629c22e12af1e2e9661c94ce188`
 - receipt `sha256=`:
-  `f01a69d6e16b1333f0d2bc958026884afdbccdfc38a7def52b2f523227427b0b`
+  `a643fbc2d3d258fa6db99abd5ff3dda85dbcd2effa3c309f9d376a1c7aa8c7ef`
 
 `carrick trace --profile hvpatch-core-lifecycle` exited 0 and its strict reader
-reported generation 1, PID/TID 5, mm 492, ASID 5, required/collected threads
+reported generation 1, PID/TID 5, mm 495, ASID 5, required/collected threads
 3/3, mappings/notes/loads 9/13/26, size 11,341,824, all six lifecycle phases,
 and zero failed, drift, bounded, DTrace-error, and drop counts. The durable D
 script states its provider ABI and its fixed nine-event-per-crash perturbation.
@@ -161,10 +162,10 @@ artifact because 11,332,377 readable bytes already exceeded the bound.
 
 Final serialized Docker differentials were also MATCH with cleanup zero:
 
-- `coredumpbit`, run `cr-87308-15511`
-- `waitidspec`, run `cr-87352-19571`
-- `sigchld`, run `cr-87395-6793`
-- `signalexit`, run `cr-87298-28715`
+- `coredumpbit`, run `cr-96876-6588`
+- `waitidspec`, run `cr-96924-12465`
+- `sigchld`, run `cr-96968-16525`
+- `signalexit`, run `cr-96820-31662`
 
 ## Tests and review fixes
 
@@ -184,6 +185,22 @@ The final audit fixed four issues before the implementation commit:
 - made core/profile readers reject duplicate per-thread architecture notes,
   missing/duplicate record classes, non-final summaries, generation drift,
   incomplete census, producer failure, loss, errors, drops, and bounds.
+
+The exact-HEAD full gate then exposed that the VMA-authority projection still
+retained the complete hidden heap reservation before unioning the live brk
+prefix. The isolated test was RED 0/1. Commit `0b076654` excludes every hidden
+reservation from the VMA summary and adds only `[heap_base, brk_current)`; the
+exact test then passed 1/1, the VMA family 11/11, and memory-authority tests 3/3.
+Because that authority gates core memory reads, all signed receipt/core,
+validator, readelf, LLDB, failpoint, RLIMIT, and Docker differential evidence
+above was recaptured after the fix on the validated HEAD.
+
+Fresh `RUST_TEST_THREADS=1 just ci` at the validated HEAD exited 0. A preceding
+full sample reached the unrelated probabilistic native-DSR kick oracle and
+missed its microarchitectural exclusive-store landing class; the test's own
+contract identifies that shape as coverage sampling rather than recovery
+failure. Its exact retry passed 3/3, and the subsequent complete gate passed it
+in-suite before finishing green.
 
 ## Known limitations
 
