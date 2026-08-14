@@ -98,6 +98,9 @@ pub const BUNDLED_HVPATCH_EXEC_RUNTIME_STAGES_D: &str =
 /// HVPatch guest-identity to Darwin-process-operation safety profile.
 pub const BUNDLED_HVPATCH_IDENTITY_HOST_SAFETY_D: &str =
     include_str!("../../../scripts/dtrace/hvpatch-identity-host-safety.d");
+/// Authenticated HVPatch global-frame fork/COW structural receipt.
+pub const BUNDLED_HVPATCH_FRAME_COW_D: &str =
+    include_str!("../../../scripts/dtrace/hvpatch-frame-cow.d");
 pub const BUNDLED_NATIVE_WALL_D: &str = include_str!("../../../scripts/dtrace/native-wall.d");
 pub const BUNDLED_NATIVE_SHAPE_D: &str =
     include_str!("../../../scripts/dtrace/native-shape-census.d");

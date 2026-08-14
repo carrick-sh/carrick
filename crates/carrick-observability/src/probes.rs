@@ -277,10 +277,12 @@ pub enum HvpatchGuestLifecycleError {
         "hvpatch guest lifecycle identity is ambiguous: task serial, mm, and parent presence must all be exact"
     )]
     AmbiguousIdentity,
-    #[error("hvpatch guest process bank must be nonempty")]
-    InvalidBank,
-    #[error("hvpatch TTBR0 does not encode the event ASID and bank root")]
+    #[error("hvpatch guest stage-1 root slot must be nonempty")]
+    InvalidRootSlot,
+    #[error("hvpatch TTBR0 does not encode the event ASID and stage-1 root")]
     InvalidTtbr0,
+    #[error("hvpatch structural frame receipt contains a zero identity")]
+    InvalidFrameReceipt,
 }
 
 impl HvpatchGuestLifecycle {
@@ -482,82 +484,307 @@ impl HvpatchGuestFault {
     }
 }
 
-/// Process-bank provenance for one Linux guest address space in the shared VM.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HvpatchGuestAddressSpace {
-    pid: i32,
-    asid: u32,
-    bank_base: u64,
-    bank_size: u64,
-    ttbr0: u64,
-}
-
-/// Result of preparing the stage-1 page-table layout for one hvpatch process
-/// bank. These ordinals are part of the DTrace provider ABI; append only.
+/// Ordered publication states for one exact 16 KiB HVPatch frame COW.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
-pub enum HvpatchExecBankLayoutPhase {
-    CacheMiss = 0,
-    CacheHit = 1,
+pub enum HvpatchFrameCowPhase {
+    Stage2Mapped = 0,
+    Stage1Published = 1,
+    Committed = 2,
 }
 
-impl HvpatchExecBankLayoutPhase {
+/// Authority under which a frame-COW split was requested. Append only: these
+/// ordinals are part of the signed structural-receipt ABI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchFrameCowIntent {
+    GuestVisible = 0,
+    BackingMaintenance = 1,
+    PrivilegedInternal = 2,
+}
+
+impl HvpatchFrameCowIntent {
     pub const fn raw(self) -> u32 {
         self as u32
     }
 }
 
-/// Typed source record for `hvpatch-exec-bank-layout`.
-///
-/// `bank_base` joins this low-level engine event to
-/// `hvpatch-guest-address-space`, which supplies the Linux PID and ASID without
-/// relying on Darwin's host process namespace. `elapsed_ns` covers lookup plus
-/// a cache miss's complete page-table rebase/remap construction.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HvpatchExecBankLayout {
-    phase: HvpatchExecBankLayoutPhase,
-    bank_base: u64,
-    mapping_count: u64,
-    cache_entries: u64,
-    elapsed_ns: u64,
+impl HvpatchFrameCowPhase {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
 }
 
-impl HvpatchExecBankLayout {
-    pub const fn new(
-        phase: HvpatchExecBankLayoutPhase,
-        bank_base: u64,
-        mapping_count: u64,
-        cache_entries: u64,
-        elapsed_ns: u64,
-    ) -> Self {
-        Self {
-            phase,
-            bank_base,
-            mapping_count,
-            cache_entries,
-            elapsed_ns,
+/// Authenticated structural receipt for a writer-only frame split.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchFrameCow {
+    phase: HvpatchFrameCowPhase,
+    intent: HvpatchFrameCowIntent,
+    pid: i32,
+    tid: i32,
+    mm: u64,
+    asid: u32,
+    va: u64,
+    old_frame: u64,
+    new_frame: u64,
+    old_ipa: u64,
+    new_ipa: u64,
+}
+
+impl HvpatchFrameCow {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        phase: HvpatchFrameCowPhase,
+        intent: HvpatchFrameCowIntent,
+        pid: i32,
+        tid: i32,
+        mm: u64,
+        asid: u32,
+        va: u64,
+        old_frame: u64,
+        new_frame: u64,
+        old_ipa: u64,
+        new_ipa: u64,
+    ) -> Result<Self, HvpatchGuestLifecycleError> {
+        if pid <= 0 || tid <= 0 {
+            return Err(HvpatchGuestLifecycleError::InvalidTaskIdentity);
         }
+        if asid == 0 {
+            return Err(HvpatchGuestLifecycleError::InvalidAsid);
+        }
+        Ok(Self {
+            phase,
+            intent,
+            pid,
+            tid,
+            mm,
+            asid,
+            va,
+            old_frame,
+            new_frame,
+            old_ipa,
+            new_ipa,
+        })
     }
 
-    pub const fn phase(self) -> HvpatchExecBankLayoutPhase {
+    pub const fn phase(self) -> HvpatchFrameCowPhase {
         self.phase
     }
+    pub const fn intent(self) -> HvpatchFrameCowIntent {
+        self.intent
+    }
+    pub const fn pid(self) -> i32 {
+        self.pid
+    }
+    pub const fn tid(self) -> i32 {
+        self.tid
+    }
+    pub const fn mm(self) -> u64 {
+        self.mm
+    }
+    pub const fn asid(self) -> u32 {
+        self.asid
+    }
+    pub const fn va(self) -> u64 {
+        self.va
+    }
+    pub const fn old_frame(self) -> u64 {
+        self.old_frame
+    }
+    pub const fn new_frame(self) -> u64 {
+        self.new_frame
+    }
+    pub const fn old_ipa(self) -> u64 {
+        self.old_ipa
+    }
+    pub const fn new_ipa(self) -> u64 {
+        self.new_ipa
+    }
+}
 
-    pub const fn bank_base(self) -> u64 {
-        self.bank_base
+/// Fork-time sharing class for one inherited frame mapping. Append only: these
+/// ordinals are part of the signed structural-receipt ABI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchForkFrameKind {
+    PrivateCow = 0,
+    Shared = 1,
+}
+
+impl HvpatchForkFrameKind {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Authenticated fork-time proof that a child mapping initially names its
+/// parent's exact frame and global IPA. The provider emits this as two adjacent
+/// five-argument probes so macOS DTrace never loses a sixth scalar.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchForkFrameShare {
+    pid: i32,
+    tid: i32,
+    mm: u64,
+    asid: u32,
+    kind: HvpatchForkFrameKind,
+    parent_mapping: u64,
+    child_mapping: u64,
+    frame: u64,
+    ipa: u64,
+    length: u64,
+}
+
+impl HvpatchForkFrameShare {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        pid: i32,
+        tid: i32,
+        mm: u64,
+        asid: u32,
+        kind: HvpatchForkFrameKind,
+        parent_mapping: u64,
+        child_mapping: u64,
+        frame: u64,
+        ipa: u64,
+        length: u64,
+    ) -> Result<Self, HvpatchGuestLifecycleError> {
+        if pid <= 0 || tid <= 0 {
+            return Err(HvpatchGuestLifecycleError::InvalidTaskIdentity);
+        }
+        if asid == 0 {
+            return Err(HvpatchGuestLifecycleError::InvalidAsid);
+        }
+        if mm == 0
+            || parent_mapping == 0
+            || child_mapping == 0
+            || frame == 0
+            || ipa == 0
+            || length == 0
+        {
+            return Err(HvpatchGuestLifecycleError::InvalidFrameReceipt);
+        }
+        Ok(Self {
+            pid,
+            tid,
+            mm,
+            asid,
+            kind,
+            parent_mapping,
+            child_mapping,
+            frame,
+            ipa,
+            length,
+        })
     }
 
-    pub const fn mapping_count(self) -> u64 {
-        self.mapping_count
+    pub const fn pid(self) -> i32 {
+        self.pid
+    }
+    pub const fn tid(self) -> i32 {
+        self.tid
+    }
+    pub const fn mm(self) -> u64 {
+        self.mm
+    }
+    pub const fn asid(self) -> u32 {
+        self.asid
+    }
+    pub const fn kind(self) -> HvpatchForkFrameKind {
+        self.kind
+    }
+    pub const fn parent_mapping(self) -> u64 {
+        self.parent_mapping
+    }
+    pub const fn child_mapping(self) -> u64 {
+        self.child_mapping
+    }
+    pub const fn frame(self) -> u64 {
+        self.frame
+    }
+    pub const fn ipa(self) -> u64 {
+        self.ipa
+    }
+    pub const fn length(self) -> u64 {
+        self.length
+    }
+}
+
+/// Physical stage-2 lifetime transition for one global-frame IPA extent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchGlobalFrameStage2Phase {
+    Mapped = 0,
+    Unmapped = 1,
+}
+
+impl HvpatchGlobalFrameStage2Phase {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Exact stage-2 map/unmap receipt used to reject overlapping live global IPAs
+/// and reuse before successful physical retirement. `host_addr` and
+/// `permissions` are nonzero map provenance and zero for an unmap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchGlobalFrameStage2 {
+    phase: HvpatchGlobalFrameStage2Phase,
+    ipa: u64,
+    length: u64,
+    host_addr: u64,
+    permissions: u64,
+}
+
+impl HvpatchGlobalFrameStage2 {
+    pub fn new(
+        phase: HvpatchGlobalFrameStage2Phase,
+        ipa: u64,
+        length: u64,
+        host_addr: u64,
+        permissions: u64,
+    ) -> Result<Self, HvpatchGuestLifecycleError> {
+        if ipa == 0
+            || length == 0
+            || (phase == HvpatchGlobalFrameStage2Phase::Mapped && host_addr == 0)
+            || (phase == HvpatchGlobalFrameStage2Phase::Unmapped
+                && (host_addr != 0 || permissions != 0))
+        {
+            return Err(HvpatchGuestLifecycleError::InvalidFrameReceipt);
+        }
+        Ok(Self {
+            phase,
+            ipa,
+            length,
+            host_addr,
+            permissions,
+        })
     }
 
-    pub const fn cache_entries(self) -> u64 {
-        self.cache_entries
+    pub const fn phase(self) -> HvpatchGlobalFrameStage2Phase {
+        self.phase
     }
+    pub const fn ipa(self) -> u64 {
+        self.ipa
+    }
+    pub const fn length(self) -> u64 {
+        self.length
+    }
+    pub const fn host_addr(self) -> u64 {
+        self.host_addr
+    }
+    pub const fn permissions(self) -> u64 {
+        self.permissions
+    }
+}
 
-    pub const fn elapsed_ns(self) -> u64 {
-        self.elapsed_ns
-    }
+/// ASID and stage-1-root provenance for one Linux guest address space.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchGuestAddressSpace {
+    pid: i32,
+    asid: u32,
+    root_slot_base: u64,
+    root_slot_size: u64,
+    ttbr0: u64,
 }
 
 /// Result of materializing one exec-image host backing. Append-only DTrace ABI
@@ -664,9 +891,9 @@ pub enum HvpatchExecReplaceStagePhase {
     Registers = 4,
     Mailbox = 5,
     PrivateFileArtifacts = 6,
-    /// Rebase or retrieve the complete stage-1 mapping plan for this process
-    /// bank. This happens before every other replacement stage.
-    BankPlan = 7,
+    /// Assign stable global frame IPAs and prepare the replacement mm's complete
+    /// stage-1 mapping plan. This happens before every other replacement stage.
+    FramePlan = 7,
     /// Remove the predecessor image's stage-2 address space (or rebuild the VM
     /// on the mature non-persistent path).
     AddressSpaceTeardown = 8,
@@ -799,6 +1026,7 @@ pub enum HvpatchTopologyOperation {
     LegacyFork = 6,
     ProcessRetire = 7,
     AliasMap = 8,
+    FrameCow = 9,
 }
 
 impl HvpatchTopologyOperation {
@@ -957,7 +1185,7 @@ pub enum HvpatchForkProcessSpecStagePhase {
     ParentPageTablesClone = 2,
     PageTablesRebase = 3,
     AliasUnion = 4,
-    PrivateSnapshot = 5,
+    FramePlan = 5,
     Validation = 6,
     TablePublish = 7,
     BackendProtections = 8,
@@ -975,9 +1203,9 @@ impl HvpatchForkProcessSpecStagePhase {
 /// Typed source record for `hvpatch-fork-process-spec-stage`.
 ///
 /// `units` is stage-specific supporting shape: a boolean load flag for parent
-/// table load; bytes for page-table clone, rebase, publication, and backend
-/// finalization; packed bank span for private snapshot; mapping count for alias
-/// union and validation; zero where no useful cardinality exists.
+/// table load; bytes for page-table clone, rebase, publication, frame planning,
+/// and backend finalization; mapping count for alias union and validation; zero
+/// where no useful cardinality exists.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HvpatchForkProcessSpecStage {
     phase: HvpatchForkProcessSpecStagePhase,
@@ -1270,8 +1498,8 @@ impl HvpatchGuestAddressSpace {
     pub fn new(
         pid: i32,
         asid: u32,
-        bank_base: u64,
-        bank_size: u64,
+        root_slot_base: u64,
+        root_slot_size: u64,
         ttbr0: u64,
     ) -> Result<Self, HvpatchGuestLifecycleError> {
         if pid <= 0 {
@@ -1280,18 +1508,18 @@ impl HvpatchGuestAddressSpace {
         if asid == 0 || asid > u32::from(u16::MAX) {
             return Err(HvpatchGuestLifecycleError::InvalidAsid);
         }
-        if bank_size == 0 {
-            return Err(HvpatchGuestLifecycleError::InvalidBank);
+        if root_slot_size == 0 {
+            return Err(HvpatchGuestLifecycleError::InvalidRootSlot);
         }
         const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
-        if (ttbr0 >> 48) != u64::from(asid) || (ttbr0 & TTBR_ROOT_MASK) != bank_base {
+        if (ttbr0 >> 48) != u64::from(asid) || (ttbr0 & TTBR_ROOT_MASK) != root_slot_base {
             return Err(HvpatchGuestLifecycleError::InvalidTtbr0);
         }
         Ok(Self {
             pid,
             asid,
-            bank_base,
-            bank_size,
+            root_slot_base,
+            root_slot_size,
             ttbr0,
         })
     }
@@ -1304,12 +1532,12 @@ impl HvpatchGuestAddressSpace {
         self.asid
     }
 
-    pub const fn bank_base(self) -> u64 {
-        self.bank_base
+    pub const fn root_slot_base(self) -> u64 {
+        self.root_slot_base
     }
 
-    pub const fn bank_size(self) -> u64 {
-        self.bank_size
+    pub const fn root_slot_size(self) -> u64 {
+        self.root_slot_size
     }
 
     pub const fn ttbr0(self) -> u64 {
@@ -1494,7 +1722,7 @@ mod hvpatch_guest_probe_abi {
             "fn hvpatch__fork__snapshot__shape(_: i32, _: u64, _: u64, _: u64, _: u64) {}",
             "stub!(hvpatch_fork_snapshot_begin(child_pid: i32, forking_tid: i32));",
             "stub!(hvpatch_fork_snapshot_end(child_pid: i32, local_regions: u64, candidate_regions: u64, added_regions: u64, added_bytes: u64));",
-            "stub!(hvpatch_fork_snapshot_shape(child_pid: i32, private_added_regions: u64, shared_added_regions: u64, largest_added_bytes: u64, bank_used_bytes: u64));",
+            "stub!(hvpatch_fork_snapshot_shape(child_pid: i32, private_added_regions: u64, shared_added_regions: u64, largest_added_bytes: u64, root_slot_used_bytes: u64));",
         ] {
             assert!(
                 source.matches(declaration).count() >= 2,
@@ -1504,15 +1732,15 @@ mod hvpatch_guest_probe_abi {
     }
 
     #[test]
-    fn exec_bank_layout_provider_and_stub_keep_the_same_typed_shape() {
+    fn global_frame_stage2_provider_and_stub_keep_five_scalar_shape() {
         let source = include_str!("probes.rs");
         for declaration in [
-            "fn hvpatch__exec__bank__layout(_: u32, _: u64, _: u64, _: u64, _: u64) {}",
-            "stub!(hvpatch_exec_bank_layout(event: super::HvpatchExecBankLayout));",
+            "fn hvpatch__global__frame__stage2(_: u32, _: u64, _: u64, _: u64, _: u64) {}",
+            "stub!(hvpatch_global_frame_stage2(event: super::HvpatchGlobalFrameStage2));",
         ] {
             assert!(
                 source.matches(declaration).count() >= 2,
-                "missing exec bank layout ABI declaration {declaration}"
+                "missing global frame stage-2 ABI declaration {declaration}"
             );
         }
     }
@@ -1572,38 +1800,100 @@ mod hvpatch_guest_probe_abi {
     }
 
     #[test]
-    fn address_space_event_keeps_bank_and_ttbr_provenance_together() {
+    fn fork_frame_receipt_keeps_mapping_frame_and_mm_identity_together() {
+        let event = HvpatchForkFrameShare::new(
+            123,
+            100,
+            9,
+            7,
+            HvpatchForkFrameKind::PrivateCow,
+            41,
+            42,
+            17,
+            0xa0_0000_0000,
+            0x4000,
+        )
+        .expect("complete fork-frame receipt");
+        assert_eq!(event.pid(), 123);
+        assert_eq!(event.tid(), 100);
+        assert_eq!(event.mm(), 9);
+        assert_eq!(event.asid(), 7);
+        assert_eq!(event.kind(), HvpatchForkFrameKind::PrivateCow);
+        assert_eq!(event.parent_mapping(), 41);
+        assert_eq!(event.child_mapping(), 42);
+        assert_eq!(event.frame(), 17);
+        assert_eq!(event.ipa(), 0xa0_0000_0000);
+        assert_eq!(event.length(), 0x4000);
+        assert!(
+            HvpatchForkFrameShare::new(
+                123,
+                100,
+                0,
+                7,
+                HvpatchForkFrameKind::PrivateCow,
+                41,
+                42,
+                17,
+                0xa0_0000_0000,
+                0x4000,
+            )
+            .is_err(),
+            "a zero mm must fail closed rather than serialize ambiguous proof"
+        );
+    }
+
+    #[test]
+    fn global_frame_stage2_receipt_rejects_incomplete_lifetime_edges() {
+        let mapped = HvpatchGlobalFrameStage2::new(
+            HvpatchGlobalFrameStage2Phase::Mapped,
+            0xa0_0000_0000,
+            0x4000,
+            0x1234_0000,
+            7,
+        )
+        .expect("complete global-frame map receipt");
+        assert_eq!(mapped.phase(), HvpatchGlobalFrameStage2Phase::Mapped);
+        assert_eq!(mapped.ipa(), 0xa0_0000_0000);
+        assert_eq!(mapped.length(), 0x4000);
+        assert_eq!(mapped.host_addr(), 0x1234_0000);
+        assert_eq!(mapped.permissions(), 7);
+        assert!(
+            HvpatchGlobalFrameStage2::new(
+                HvpatchGlobalFrameStage2Phase::Mapped,
+                0xa0_0000_0000,
+                0x4000,
+                0,
+                7,
+            )
+            .is_err()
+        );
+        assert!(
+            HvpatchGlobalFrameStage2::new(
+                HvpatchGlobalFrameStage2Phase::Unmapped,
+                0xa0_0000_0000,
+                0x4000,
+                1,
+                0,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn address_space_event_keeps_root_slot_and_ttbr_provenance_together() {
         let event = HvpatchGuestAddressSpace::new(
             123,
             7,
             0x9a_0000_0000,
-            40 * 1024 * 1024 * 1024,
+            2 * 1024 * 1024,
             0x0007_009a_0000_0000,
         )
         .expect("valid guest address-space event");
         assert_eq!(event.pid(), 123);
         assert_eq!(event.asid(), 7);
-        assert_eq!(event.bank_base(), 0x9a_0000_0000);
-        assert_eq!(event.bank_size(), 40 * 1024 * 1024 * 1024);
+        assert_eq!(event.root_slot_base(), 0x9a_0000_0000);
+        assert_eq!(event.root_slot_size(), 2 * 1024 * 1024);
         assert_eq!(event.ttbr0(), 0x0007_009a_0000_0000);
-    }
-
-    #[test]
-    fn exec_bank_layout_event_keeps_join_and_cost_fields_typed() {
-        let event = HvpatchExecBankLayout::new(
-            HvpatchExecBankLayoutPhase::CacheHit,
-            0x9a_0000_0000,
-            17,
-            6,
-            42_000,
-        );
-        assert_eq!(event.phase(), HvpatchExecBankLayoutPhase::CacheHit);
-        assert_eq!(HvpatchExecBankLayoutPhase::CacheMiss.raw(), 0);
-        assert_eq!(HvpatchExecBankLayoutPhase::CacheHit.raw(), 1);
-        assert_eq!(event.bank_base(), 0x9a_0000_0000);
-        assert_eq!(event.mapping_count(), 17);
-        assert_eq!(event.cache_entries(), 6);
-        assert_eq!(event.elapsed_ns(), 42_000);
     }
 
     #[test]
@@ -1660,7 +1950,7 @@ mod hvpatch_guest_probe_abi {
         assert_eq!(HvpatchExecReplaceStagePhase::Registers.raw(), 4);
         assert_eq!(HvpatchExecReplaceStagePhase::Mailbox.raw(), 5);
         assert_eq!(HvpatchExecReplaceStagePhase::PrivateFileArtifacts.raw(), 6);
-        assert_eq!(HvpatchExecReplaceStagePhase::BankPlan.raw(), 7);
+        assert_eq!(HvpatchExecReplaceStagePhase::FramePlan.raw(), 7);
         assert_eq!(HvpatchExecReplaceStagePhase::AddressSpaceTeardown.raw(), 8);
         assert_eq!(event.phase(), HvpatchExecReplaceStagePhase::MapBackings);
         assert_eq!(event.elapsed_ns(), 825_000);
@@ -1791,7 +2081,7 @@ mod hvpatch_guest_probe_abi {
         );
         assert_eq!(HvpatchForkProcessSpecStagePhase::PageTablesRebase.raw(), 3);
         assert_eq!(HvpatchForkProcessSpecStagePhase::AliasUnion.raw(), 4);
-        assert_eq!(HvpatchForkProcessSpecStagePhase::PrivateSnapshot.raw(), 5);
+        assert_eq!(HvpatchForkProcessSpecStagePhase::FramePlan.raw(), 5);
         assert_eq!(HvpatchForkProcessSpecStagePhase::Validation.raw(), 6);
         assert_eq!(HvpatchForkProcessSpecStagePhase::TablePublish.raw(), 7);
         assert_eq!(
@@ -3703,7 +3993,27 @@ mod real {
         fn hvpatch__guest__fault(_: u64, _: u64, _: u64, _: i32, _: i32) {}
         /// Companion identity for `hvpatch__guest__fault`: PID, TID, ASID.
         fn hvpatch__guest__fault__asid(_: i32, _: i32, _: u32) {}
-        /// Address-space provenance: guest PID, ASID, bank base, bank size,
+        /// HVPatch frame-COW intent. Emitted immediately before identity/data.
+        /// Args: 0 guest-visible, 1 backing maintenance, 2 privileged internal.
+        fn hvpatch__frame__cow__intent(_: u32) {}
+        /// HVPatch frame-COW identity. Args: PID, TID, mm serial, ASID, phase.
+        fn hvpatch__frame__cow__identity(_: i32, _: i32, _: u64, _: u32, _: u32) {}
+        /// HVPatch frame-COW transition. Args: VA, old/new FrameId, old/new IPA.
+        fn hvpatch__frame__cow(_: u64, _: u64, _: u64, _: u64, _: u64) {}
+        /// Byte-copy authentication computed only when this probe is enabled.
+        /// Args: old FrameId/IPA, source/destination FNV-1a, exact byte length.
+        fn hvpatch__frame__cow__copy(_: u64, _: u64, _: u64, _: u64, _: u64) {}
+        /// Fork-time shared-frame identity: child PID, forking TID, child mm,
+        /// child ASID, and sharing kind (0=private COW, 1=Linux shared).
+        fn hvpatch__fork__frame__identity(_: i32, _: i32, _: u64, _: u32, _: u32) {}
+        /// Fork-time shared-frame mapping: parent/child MappingId, FrameId,
+        /// stable global IPA, and exact physical length.
+        fn hvpatch__fork__frame(_: u64, _: u64, _: u64, _: u64, _: u64) {}
+        /// Successful physical stage-2 edge for a global-frame extent. Args:
+        /// phase (0=map, 1=unmap), IPA, length, host VA, permissions. Host VA
+        /// and permissions are zero on unmap.
+        fn hvpatch__global__frame__stage2(_: u32, _: u64, _: u64, _: u64, _: u64) {}
+        /// Address-space provenance: guest PID, ASID, root-slot base and size,
         /// TTBR0. Five scalars keep the complete record reliable on macOS.
         fn hvpatch__guest__address__space(_: i32, _: u32, _: u64, _: u64, _: u64) {}
         /// Completed Linux syscall service. Args: Linux guest PID, Linux guest
@@ -3729,16 +4039,11 @@ mod real {
         fn hvpatch__fork__snapshot__end(_: i32, _: u64, _: u64, _: u64, _: u64) {}
         /// Fork snapshot shape companion. Args: child PID, selected private
         /// regions, selected shared regions, largest selected extent, and bytes
-        /// consumed in the child's private stage-2 bank.
+        /// consumed in the child's stage-1 root slot.
         fn hvpatch__fork__snapshot__shape(_: i32, _: u64, _: u64, _: u64, _: u64) {}
-        /// Exec bank-layout cache result. Args: phase (0=miss, 1=hit), process
-        /// bank base, mapping count, bounded process-wide cache entries, and
-        /// lookup plus construction elapsed nanoseconds. Join bank base to
-        /// `hvpatch__guest__address__space` for guest PID and ASID.
-        fn hvpatch__exec__bank__layout(_: u32, _: u64, _: u64, _: u64, _: u64) {}
         /// Exec-image host backing result. Args: phase (0=materialized,
         /// 1=reused, 2=fresh MAP_PRIVATE view of a cached patched artifact),
-        /// Linux guest VA, process-bank IPA, mapped bytes, and lookup plus
+        /// Linux guest VA, global-frame IPA, mapped bytes, and lookup plus
         /// allocation/copy elapsed nanoseconds.
         fn hvpatch__exec__backing(_: u32, _: u64, _: u64, _: u64, _: u64) {}
         /// Raw stage-2 exec transition. Args: phase (0=unmap begin, 1=unmap
@@ -3748,7 +4053,7 @@ mod real {
         /// Coarse persistent-VM exec replacement stage. Args: phase
         /// (0=alias cleanup, 1=drop old backings, 2=page-table manager,
         /// 3=map new backings, 4=registers, 5=mailbox, 6=private-file
-        /// artifacts, 7=bank plan, 8=old address-space teardown), elapsed
+        /// artifacts, 7=global-frame/stage-1 plan, 8=old address-space teardown), elapsed
         /// nanoseconds, replacement mapping count, and total mapped bytes.
         fn hvpatch__exec__replace__stage(_: u32, _: u64, _: u64, _: u64) {}
         /// Outer successful exec runtime stage. Args: phase (0=proc state,
@@ -3857,6 +4162,9 @@ mod real {
         /// else nonzero). Diagnoses why a forked child's alias mapping diverges from
         /// the parent's. Fires only on this path (no hot-path cost).
         fn pt__alias__walk(_: u64, _: u64, _: u64, _: u64, _: u64, _: i32) {}
+        /// Reliable five-argument stage-1 leaf receipt: VA, live leaf,
+        /// expected IPA, expected AP bits, and phase flags.
+        fn pt__alias__receipt(_: u64, _: u64, _: u64, _: u64, _: u32) {}
         /// Fires from `map_host_alias` right after the stage-2 `hv_vm_map` with the
         /// alias VA/IPA/size and the raw `hv_return_t` (`rc`: 0 ok). Diagnoses an
         /// hv_vm_map failure in a forked child (the stage-2 coherence wall) before
@@ -4611,12 +4919,80 @@ mod real {
     }
 
     #[inline(never)]
+    pub fn hvpatch_frame_cow(event: super::HvpatchFrameCow) {
+        carrick_usdt::hvpatch__frame__cow__intent!(|| event.intent().raw());
+        carrick_usdt::hvpatch__frame__cow__identity!(|| (
+            event.pid(),
+            event.tid(),
+            event.mm(),
+            event.asid(),
+            event.phase().raw()
+        ));
+        carrick_usdt::hvpatch__frame__cow!(|| (
+            event.va(),
+            event.old_frame(),
+            event.new_frame(),
+            event.old_ipa(),
+            event.new_ipa()
+        ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_frame_cow_copy(old_frame: u64, old_ipa: u64, source: &[u8], dest: &[u8]) {
+        fn fnv1a(bytes: &[u8]) -> u64 {
+            bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+            })
+        }
+
+        // The generated macro evaluates this closure only while a DTrace
+        // consumer has enabled the probe. Ordinary COW pays only the disabled
+        // USDT branch and never scans the copied compound.
+        carrick_usdt::hvpatch__frame__cow__copy!(|| (
+            old_frame,
+            old_ipa,
+            fnv1a(source),
+            fnv1a(dest),
+            source.len() as u64
+        ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_fork_frame_share(event: super::HvpatchForkFrameShare) {
+        carrick_usdt::hvpatch__fork__frame__identity!(|| (
+            event.pid(),
+            event.tid(),
+            event.mm(),
+            event.asid(),
+            event.kind().raw()
+        ));
+        carrick_usdt::hvpatch__fork__frame!(|| (
+            event.parent_mapping(),
+            event.child_mapping(),
+            event.frame(),
+            event.ipa(),
+            event.length()
+        ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_global_frame_stage2(event: super::HvpatchGlobalFrameStage2) {
+        carrick_usdt::hvpatch__global__frame__stage2!(|| (
+            event.phase().raw(),
+            event.ipa(),
+            event.length(),
+            event.host_addr(),
+            event.permissions()
+        ));
+    }
+
+    #[inline(never)]
     pub fn hvpatch_guest_address_space(event: super::HvpatchGuestAddressSpace) {
         carrick_usdt::hvpatch__guest__address__space!(|| (
             event.pid(),
             event.asid(),
-            event.bank_base(),
-            event.bank_size(),
+            event.root_slot_base(),
+            event.root_slot_size(),
             event.ttbr0()
         ));
     }
@@ -4695,25 +5071,14 @@ mod real {
         private_added_regions: u64,
         shared_added_regions: u64,
         largest_added_bytes: u64,
-        bank_used_bytes: u64,
+        root_slot_used_bytes: u64,
     ) {
         carrick_usdt::hvpatch__fork__snapshot__shape!(|| (
             child_pid,
             private_added_regions,
             shared_added_regions,
             largest_added_bytes,
-            bank_used_bytes
-        ));
-    }
-
-    #[inline(never)]
-    pub fn hvpatch_exec_bank_layout(event: super::HvpatchExecBankLayout) {
-        carrick_usdt::hvpatch__exec__bank__layout!(|| (
-            event.phase().raw(),
-            event.bank_base(),
-            event.mapping_count(),
-            event.cache_entries(),
-            event.elapsed_ns()
+            root_slot_used_bytes
         ));
     }
 
@@ -5831,9 +6196,17 @@ mod real {
 
     /// Emit a high-VA alias page-table walk. See `pt__alias__walk`. `flag` bit0 =
     /// forked child, bit1 = the page-table build/read failed, bit2 = descriptors
-    /// were read from the authoritative host backing rather than manager shadow.
+    /// were read from the authoritative host backing rather than manager shadow;
+    /// bit3 = authenticated HVPatch frame-COW publication; bit4 = live
+    /// pre-write HVPatch fork-COW arming receipt.
     pub fn pt_alias_walk(va: u64, descs: [u64; 4], flag: i32) {
         carrick_usdt::pt__alias__walk!(|| (va, descs[0], descs[1], descs[2], descs[3], flag));
+    }
+
+    /// Emit a reliable exact stage-1 leaf receipt. Unlike `pt_alias_walk`, this
+    /// stays within macOS DTrace's five-argument limit.
+    pub fn pt_alias_receipt(va: u64, leaf: u64, expected_ipa: u64, expected_ap: u64, phase: u32) {
+        carrick_usdt::pt__alias__receipt!(|| (va, leaf, expected_ipa, expected_ap, phase));
     }
 
     /// Emit the stage-2 `hv_vm_map` result for an alias mapping. See
@@ -6213,14 +6586,17 @@ mod stub {
     stub!(lifecycle(phase: u32));
     stub!(hvpatch_guest_lifecycle(event: super::HvpatchGuestLifecycle));
     stub!(hvpatch_guest_fault(event: super::HvpatchGuestFault));
+    stub!(hvpatch_frame_cow(event: super::HvpatchFrameCow));
+    stub!(hvpatch_frame_cow_copy(old_frame: u64, old_ipa: u64, source: &[u8], dest: &[u8]));
+    stub!(hvpatch_fork_frame_share(event: super::HvpatchForkFrameShare));
+    stub!(hvpatch_global_frame_stage2(event: super::HvpatchGlobalFrameStage2));
     stub!(hvpatch_guest_address_space(event: super::HvpatchGuestAddressSpace));
     stub!(hvpatch_syscall_service_begin(event: super::HvpatchSyscallService, args: [u64; 6]) -> Option<std::time::Instant> => None);
     stub!(hvpatch_syscall_service(event: super::HvpatchSyscallService));
     stub!(hvpatch_syscall_service_clear(event: super::HvpatchSyscallService));
     stub!(hvpatch_fork_snapshot_begin(child_pid: i32, forking_tid: i32));
     stub!(hvpatch_fork_snapshot_end(child_pid: i32, local_regions: u64, candidate_regions: u64, added_regions: u64, added_bytes: u64));
-    stub!(hvpatch_fork_snapshot_shape(child_pid: i32, private_added_regions: u64, shared_added_regions: u64, largest_added_bytes: u64, bank_used_bytes: u64));
-    stub!(hvpatch_exec_bank_layout(event: super::HvpatchExecBankLayout));
+    stub!(hvpatch_fork_snapshot_shape(child_pid: i32, private_added_regions: u64, shared_added_regions: u64, largest_added_bytes: u64, root_slot_used_bytes: u64));
     stub!(hvpatch_exec_backing(event: super::HvpatchExecBacking));
     stub!(hvpatch_exec_stage2(event: super::HvpatchExecStage2));
     stub!(hvpatch_exec_replace_stage(event: super::HvpatchExecReplaceStage));
@@ -6287,6 +6663,7 @@ mod stub {
     stub!(vcpu_fault(esr: u64, elr: u64, far: u64, x30: u64, sp: u64, tid: i32));
     stub!(vcpu_fault_regs(esr: u64, elr: u64, far: u64, insn: u64, rn: u32, xrn: u64));
     stub!(pt_alias_walk(va: u64, descs: [u64; 4], flag: i32));
+    stub!(pt_alias_receipt(va: u64, leaf: u64, expected_ipa: u64, expected_ap: u64, phase: u32));
     stub!(hv_vm_map_alias(va: u64, ipa: u64, size: u64, rc: i32, forked: i32));
     stub!(signal_publish(target_tid: i32, signum: i32, kind: i32));
     stub!(signal_deliver(tid: i32, pending: i32));

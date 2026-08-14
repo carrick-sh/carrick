@@ -21,7 +21,7 @@
 //! consumes it — so the engine carries no `sysret_resume` analogue, which makes
 //! this core SMALLER than `X86EngineCore`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use carrick_abi::LinuxSiginfo;
 use carrick_guest_mem::protections::MemoryProtections;
@@ -36,27 +36,26 @@ use carrick_hal::{
 };
 use carrick_mem::memory::AddressSpace;
 use carrick_mem::page_table::{PageTableError, PageTableManager};
+use parking_lot::Mutex;
 
-use crate::vmm::{Aarch64Exit, Aarch64Vcpu, Aarch64VcpuSnapshot, Aarch64Vmm, ForkRamStrategy};
+use crate::vmm::{
+    Aarch64Exit, Aarch64Vcpu, Aarch64VcpuSnapshot, Aarch64Vmm, ForkRamStrategy, FrameCowWriteIntent,
+};
 
-/// Remove Carrick's two reserved process-bank apertures from an AArch64
+/// Remove Carrick's HVPatch root/global-frame aperture from an AArch64
 /// stage-1 image before it is published for an HvPatch process.
 ///
 /// The operation is deterministic for an exec layout, so the HVF backend can
-/// bake it into its bank-layout cache. Initial root bring-up still applies it
+/// bake it into its stage-1 layout. Initial root bring-up still applies it
 /// through the live editor before the first ASID is installed.
 pub fn reserve_hvpatch_process_apertures(
     manager: &mut PageTableManager,
 ) -> Result<bool, PageTableError> {
-    let aux_changed = manager.invalidate(
-        carrick_mem::memory::LINUX_PROCESS_AUX_BANK_BASE,
-        carrick_mem::memory::LINUX_PROCESS_AUX_BANK_SIZE as usize,
-    )?;
-    let bank_changed = manager.invalidate(
-        carrick_mem::memory::LINUX_PROCESS_BANK_BASE,
-        carrick_mem::memory::LINUX_PROCESS_BANK_SIZE as usize,
-    )?;
-    Ok(aux_changed || bank_changed)
+    manager.invalidate(
+        carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE,
+        (carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_ARENA_SIZE
+            + carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_SIZE) as usize,
+    )
 }
 
 /// The generic aarch64 trap engine. Owns the VM, the (one) vCPU, the
@@ -141,7 +140,9 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// fresh page-table editor and an empty PROT_NONE set. Siblings instead SHARE
     /// the spawning thread's `page_tables`/`protections` via the (later) sibling
     /// constructor.
-    pub fn from_parts(vm: V, vcpu: V::Vcpu) -> Self {
+    pub fn from_parts(mut vm: V, vcpu: V::Vcpu) -> Self {
+        let page_tables = Arc::new(Mutex::new(None));
+        vm.bind_stage1_page_tables(Arc::clone(&page_tables));
         Self {
             vm,
             vcpu,
@@ -152,7 +153,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             last_exit_class: 0,
             is_forked_child: false,
             process_asid: None,
-            page_tables: Arc::new(Mutex::new(None)),
+            page_tables,
             protections: Arc::new(MemoryProtections::default()),
             reclaim_snapshot: None,
             fork_arena_high_water: u64::MAX,
@@ -219,6 +220,15 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         &self.page_tables
     }
 
+    /// Replace this mm's stage-1 manager without splitting the engine/backend
+    /// authority.  The HVPatch backend resolves permission faults itself, so
+    /// every fresh `Arc` must be rebound before the stopped vCPU can resume.
+    fn replace_page_tables(&mut self, manager: Option<PageTableManager>) {
+        let page_tables = Arc::new(Mutex::new(manager));
+        self.vm.bind_stage1_page_tables(Arc::clone(&page_tables));
+        self.page_tables = page_tables;
+    }
+
     /// The shared PROT_NONE EFAULT gate (cloned across `CLONE_THREAD` siblings,
     /// COW'd on fork).
     pub fn protections(&self) -> &Arc<MemoryProtections> {
@@ -237,11 +247,12 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// the backend `GuestRam` (shared via `from_shared_windows`), so this `Arc`
     /// is the engine-side mirror; the page-table `Arc` is the load-bearing share.
     pub fn from_parts_with_shared(
-        vm: V,
+        mut vm: V,
         vcpu: V::Vcpu,
         page_tables: Arc<Mutex<Option<PageTableManager>>>,
         protections: Arc<MemoryProtections>,
     ) -> Self {
+        vm.bind_stage1_page_tables(Arc::clone(&page_tables));
         Self {
             vm,
             vcpu,
@@ -343,7 +354,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         // exhausted"). `strong_count(&self.page_tables)` == the live engine count.
         let unsafe_to_coalesce = Arc::strong_count(&self.page_tables) > 1;
         let pt = Arc::clone(&self.page_tables);
-        let mut guard = pt.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = pt.lock();
         if guard.is_none() {
             // Build from the live guest backing (the boot tables) on first edit —
             // nothing else writes the tables before this, so it matches the image.
@@ -446,7 +457,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             .vm
             .host_ptr(pt_base, size)
             .ok_or_else(|| MemoryError::HostMap("page-table region not mapped".to_owned()))?;
-        let guard = self.page_tables.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = self.page_tables.lock();
         let Some(manager) = guard.as_ref() else {
             return Err(MemoryError::HostMap(
                 "page-table manager unexpectedly absent".to_owned(),
@@ -475,7 +486,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// SPSR_EL1 — AND the two GPRs the trampoline clobbers (x8 the store value, x9
     /// the sentinel-address scratch). With those restored, the in-flight syscall
     /// resumes exactly as before. Mirrors HVF's `run_el1_maintenance`.
-    fn run_el1_maintenance(&mut self) -> Result<(), TrapError> {
+    fn run_el1_maintenance_on(vcpu: &mut V::Vcpu) -> Result<(), TrapError> {
         // M[3:0]=0b0101 EL1h (SP_EL1) + DAIF masked, PAN(bit22)=0 — the SAME PSTATE
         // boot uses to run the EL0-entry trampoline at EL1 (program_sysregs sets
         // `PSTATE_M_EL1H | DAIF_MASKED`). The maintenance trampoline issues no
@@ -483,19 +494,19 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         // matching boot keeps the EL1 entry conditions identical.
         const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
 
-        let g = |this: &Self, r: Reg| this.vcpu.get_reg(r);
+        let g = |vcpu: &V::Vcpu, r: Reg| vcpu.get_reg(r);
         // Save the interrupted EL1-vector state + the two scratch GPRs the
         // trampoline clobbers.
-        let saved_pc = g(self, Reg::Pc)?;
-        let saved_pstate = g(self, Reg::Pstate)?;
-        let saved_elr = g(self, Reg::ElrEl1)?;
-        let saved_spsr = g(self, Reg::SpsrEl1)?;
-        let saved_x8 = g(self, Reg::X(8))?;
-        let saved_x9 = g(self, Reg::X(9))?;
+        let saved_pc = g(vcpu, Reg::Pc)?;
+        let saved_pstate = g(vcpu, Reg::Pstate)?;
+        let saved_elr = g(vcpu, Reg::ElrEl1)?;
+        let saved_spsr = g(vcpu, Reg::SpsrEl1)?;
+        let saved_x8 = g(vcpu, Reg::X(8))?;
+        let saved_x9 = g(vcpu, Reg::X(9))?;
 
-        let s = |this: &mut Self, r: Reg, v: u64| this.vcpu.set_reg(r, v);
-        s(self, Reg::Pc, carrick_mem::memory::LINUX_EL1_MAINT_BASE)?;
-        s(self, Reg::Pstate, AARCH64_PSTATE_EL1H_DAIF_MASKED)?;
+        let s = |vcpu: &mut V::Vcpu, r: Reg, v: u64| vcpu.set_reg(r, v);
+        s(vcpu, Reg::Pc, carrick_mem::memory::LINUX_EL1_MAINT_BASE)?;
+        s(vcpu, Reg::Pstate, AARCH64_PSTATE_EL1H_DAIF_MASKED)?;
 
         // Run the trampoline to its completion vehicle. A cross-thread kick
         // (`Aarch64Exit::Kicked`) can land mid-flush; the trampoline is tiny and
@@ -503,7 +514,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         // trust guest memory visibility) — surface it. (No guest_cpu accounting:
         // this is a host-driven flush, not guest execution time.)
         let result = loop {
-            match self.vcpu.run() {
+            match vcpu.run() {
                 Ok(Aarch64Exit::MaintenanceDone) => {
                     if std::env::var_os("CARRICK_MAINT_DEBUG").is_some() {
                         eprintln!("[MAINTDBG tid={}] stage-1 TLBI completed", debug_tid());
@@ -525,13 +536,30 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
 
         // Restore the interrupted EL1-vector state + scratch GPRs on EVERY path so
         // the parked syscall resumes unperturbed even if the flush errored.
-        s(self, Reg::Pc, saved_pc)?;
-        s(self, Reg::Pstate, saved_pstate)?;
-        s(self, Reg::ElrEl1, saved_elr)?;
-        s(self, Reg::SpsrEl1, saved_spsr)?;
-        s(self, Reg::X(8), saved_x8)?;
-        s(self, Reg::X(9), saved_x9)?;
+        s(vcpu, Reg::Pc, saved_pc)?;
+        s(vcpu, Reg::Pstate, saved_pstate)?;
+        s(vcpu, Reg::ElrEl1, saved_elr)?;
+        s(vcpu, Reg::SpsrEl1, saved_spsr)?;
+        s(vcpu, Reg::X(8), saved_x8)?;
+        s(vcpu, Reg::X(9), saved_x9)?;
         result
+    }
+
+    fn run_el1_maintenance(&mut self) -> Result<(), TrapError> {
+        Self::run_el1_maintenance_on(&mut self.vcpu)
+    }
+
+    fn ensure_frame_cow_write(
+        &mut self,
+        va: u64,
+        len: usize,
+        intent: FrameCowWriteIntent,
+    ) -> Result<(), MemoryError> {
+        let vm = &mut self.vm;
+        let vcpu = &mut self.vcpu;
+        let mut flush = || Self::run_el1_maintenance_on(vcpu);
+        vm.ensure_frame_cow_write(va, len, intent, &mut flush)
+            .map_err(|error| MemoryError::HostMap(format!("HVPatch frame COW: {error}")))
     }
 
     /// The IPA a syscall buffer at guest VA `va` resolves to. Identity (`va`) for
@@ -549,7 +577,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         if !carrick_mem::memory::needs_stage1_translation(raw, len as u64) {
             return Some(Gpa(raw));
         }
-        let guard = self.page_tables.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = self.page_tables.lock();
         guard.as_ref()?.translate(raw).map(Gpa)
     }
 
@@ -590,6 +618,7 @@ fn exit_variant_name(exit: &Aarch64Exit) -> &'static str {
     match exit {
         Aarch64Exit::Syscall { .. } => "Syscall",
         Aarch64Exit::EL0Fault { .. } => "EL0Fault",
+        Aarch64Exit::Stage1CowFault { .. } => "Stage1CowFault",
         Aarch64Exit::Sys64Read { .. } => "Sys64Read",
         Aarch64Exit::MaintenanceDone => "MaintenanceDone",
         Aarch64Exit::Halt => "Halt",
@@ -693,6 +722,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         let mut copied = 0usize;
         while copied < length {
             let (va, ipa, chunk_len) = self.syscall_buffer_chunk(address, copied, length)?;
+            self.ensure_frame_cow_write(va, chunk_len, FrameCowWriteIntent::GuestVisible)?;
             self.vm
                 .translated_write(va, ipa.raw(), &bytes[copied..copied + chunk_len])?;
             copied += chunk_len;
@@ -710,6 +740,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         let mut copied = 0usize;
         while copied < length {
             let (va, ipa, chunk_len) = self.syscall_buffer_chunk(address, copied, length)?;
+            self.ensure_frame_cow_write(va, chunk_len, FrameCowWriteIntent::PrivilegedInternal)?;
             self.vm.translated_write_unchecked(
                 va,
                 ipa.raw(),
@@ -733,6 +764,8 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     }
 
     fn host_ptr_for_write(&mut self, address: u64, len: usize) -> Option<*mut u8> {
+        self.ensure_frame_cow_write(address, len, FrameCowWriteIntent::GuestVisible)
+            .ok()?;
         self.vm.host_ptr_for_write(address, len)
     }
 
@@ -793,6 +826,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     /// PROT_NONE check — used to clear a reused/`munmap`'d region whose stale bytes
     /// must never resurface after a later `mprotect` makes it readable.
     fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.ensure_frame_cow_write(address, len, FrameCowWriteIntent::BackingMaintenance)?;
         self.vm.zero_backing(address, len)
     }
 
@@ -827,18 +861,34 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
         use carrick_abi::{LINUX_PROT_EXEC, LINUX_PROT_READ, LINUX_PROT_WRITE};
         let exec = prot & LINUX_PROT_EXEC != 0;
+        let armed_cow = if prot & LINUX_PROT_WRITE != 0 {
+            self.vm.armed_frame_cow_ranges(address, len)
+        } else {
+            Vec::new()
+        };
         // pt_edit_AND_FLUSH: a guest can `mprotect` an ALREADY-TOUCHED page (e.g.
         // RELRO RW→RO), so the stale stage-1 TLB entry must be invalidated for the
         // new protection to take effect.
         self.pt_edit_and_flush(|mgr| {
-            if prot & LINUX_PROT_WRITE != 0 {
-                mgr.set_rw(address, len, exec)
+            let mut changed = if prot & LINUX_PROT_WRITE != 0 {
+                mgr.set_rw(address, len, exec)?
             } else if prot & (LINUX_PROT_READ | LINUX_PROT_EXEC) != 0 {
-                mgr.set_readonly(address, len, exec)
+                mgr.set_readonly(address, len, exec)?
             } else {
-                mgr.set_prot_none(address, len)
+                mgr.set_prot_none(address, len)?
+            };
+            for range in &armed_cow {
+                changed |= mgr.set_readonly(range.va, range.len, range.executable)?;
             }
-        })
+            Ok(changed)
+        })?;
+        self.vm
+            .observe_frame_cow_protection(address, len, prot)
+            .map_err(|error| {
+                MemoryError::HostMap(format!(
+                    "authenticate deferred HVPatch COW protection: {error}"
+                ))
+            })
     }
 
     /// `munmap`: invalidate the stage-1 descriptors for `[address, address+len)` so
@@ -893,7 +943,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     fn repoint_private(
         &mut self,
         va: u64,
-        overlay_ipa: u64,
+        overlay_slot_va: u64,
         len: usize,
         content: &[u8],
     ) -> Result<(), RepointPrivateError> {
@@ -906,6 +956,23 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // 1. Resolve the overlay slot's host backing pointer (the same resolver the
         //    live page-table editor's `sync_to_host` uses). `len.max(1)` so a
         //    zero-length repoint still resolves the start page.
+        // The overlay allocator returns its semantic slot VA. Initial boot is
+        // identity-mapped, but an HVPatch exec replacement assigns that same
+        // physical frame a stable global IPA. Resolve through the current mm's
+        // stage-1 graph before touching backing or publishing the replacement
+        // leaf; treating the slot VA as an IPA made post-exec MAP_FIXED fail
+        // with ENOMEM despite the frame being live.
+        let overlay_ipa = self
+            .page_tables
+            .lock()
+            .as_ref()
+            .and_then(|manager| manager.translate(overlay_slot_va))
+            .ok_or_else(|| {
+                RepointPrivateError::clean(MemoryError::OutOfBounds {
+                    address: overlay_slot_va,
+                    length: len,
+                })
+            })?;
         let dst = self.vm.host_ptr(overlay_ipa, len.max(1)).ok_or_else(|| {
             RepointPrivateError::clean(MemoryError::OutOfBounds {
                 address: overlay_ipa,
@@ -937,7 +1004,14 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         if !changed {
             return Ok(());
         }
-        classify_private_repoint_tlbi(self.run_el1_maintenance())
+        classify_private_repoint_tlbi(self.run_el1_maintenance())?;
+        self.vm
+            .publish_private_repoint(va, overlay_ipa, len)
+            .map_err(|error| {
+                RepointPrivateError::indeterminate(MemoryError::HostMap(format!(
+                    "publish private repoint frame ownership: {error}"
+                )))
+            })
     }
 }
 
@@ -1109,6 +1183,15 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
                         from_el0_direct,
                     ));
                 }
+                Aarch64Exit::Stage1CowFault { syndrome, far } => {
+                    self.last_fault_esr = syndrome;
+                    return Err(TrapError::Stage1CowFault {
+                        syndrome,
+                        far,
+                        elr: self.vcpu.get_reg(Reg::Pc).unwrap_or(0),
+                        spsr: self.vcpu.get_reg(Reg::Pstate).unwrap_or(0),
+                    });
+                }
                 Aarch64Exit::Sys64Read { esr: _ } => {
                     // An EL0 `MRS` of an emulated ID/timer/cache register (Rosetta
                     // x86-on-arm + HVF). KVM's config never traps `MRS`, so this
@@ -1230,11 +1313,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // COW table backing == the parent's synced manager bytes, so the clone is
         // exactly what a lazy rebuild from the child's backing would produce.
         let phase_start = std::time::Instant::now();
-        let cloned_pt = self
-            .page_tables
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let cloned_pt = self.page_tables.lock().clone();
         carrick_observability::probes::fork_lifecycle(2, 2, elapsed_us(phase_start), 0, 0);
 
         // 2. Real host fork.
@@ -1303,7 +1382,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // parent's CLONE_THREAD siblings still share (so a later child pt_edit can
         // never reach back into the parent's manager). Seeded with the clone taken
         // above (the child's COW table backing == the parent's synced bytes).
-        self.page_tables = Arc::new(Mutex::new(cloned_pt));
+        self.replace_page_tables(cloned_pt);
         carrick_observability::probes::fork_lifecycle(3, 6, elapsed_us(phase_start), 0, 0);
         Ok(ForkOutcome::Child)
     }
@@ -1317,8 +1396,8 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         self.vm.execve_rebuild(&mut self.vcpu, new_image)?;
         // `execve_rebuild` installed a fresh table image. Drop the manager for
         // the old image before the hvpatch ASID configuration reserves its
-        // private-bank aperture in the NEW tables.
-        self.page_tables = Arc::new(Mutex::new(self.vm.exec_page_tables()));
+        // per-mm root-slot aperture in the NEW tables.
+        self.replace_page_tables(self.vm.exec_page_tables());
         if let Some(asid) = self.process_asid {
             <Self as ThreadedEngine>::configure_process_asid(self, asid)?;
         }
@@ -1536,6 +1615,39 @@ fn seed_sibling_snapshot(
 }
 
 impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
+    fn bind_frame_cow(
+        &mut self,
+        authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
+        identity: carrick_hal::FrameCowIdentity,
+    ) {
+        self.vm.bind_frame_cow(authority, identity);
+    }
+
+    fn resolve_frame_cow_fault(&mut self, syndrome: u64, far: u64) -> Result<bool, TrapError> {
+        // Serialize the actual hardware root/ASID and live descriptors for every
+        // attempted COW, including the fast EL0-abort route that never reaches
+        // the runtime's generic fault diagnostic arm. This is structural proof
+        // that an identity-bearing COW event edited the graph the vCPU walked.
+        if let Some((ttbr, descriptors)) = self.diagnostic_fault_page_tables(far) {
+            carrick_observability::probes::pt_fault_walk(
+                far,
+                descriptors[0],
+                descriptors[1],
+                descriptors[2],
+                descriptors[3],
+            );
+            carrick_observability::probes::pt_fault_ttbr(far, ttbr);
+        }
+        let vm = &mut self.vm;
+        let vcpu = &mut self.vcpu;
+        let mut flush = || Self::run_el1_maintenance_on(vcpu);
+        let handled = vm.resolve_frame_cow_fault(syndrome, far, &mut flush)?;
+        if handled {
+            self.last_fault_esr = 0;
+        }
+        Ok(handled)
+    }
+
     fn begin_process_inventory(
         &mut self,
         reservation: carrick_hal::FrameInventoryReservation,
@@ -1609,29 +1721,29 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         }
         const TCR_AS: u64 = 1 << 36;
         const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
-        let aux_bank_len = usize::try_from(carrick_mem::memory::LINUX_PROCESS_AUX_BANK_SIZE)
-            .map_err(|_| {
-                TrapError::Hypervisor("hvpatch auxiliary process-bank size overflow".to_owned())
-            })?;
-        let bank_len = usize::try_from(carrick_mem::memory::LINUX_PROCESS_BANK_SIZE)
-            .map_err(|_| TrapError::Hypervisor("hvpatch process-bank size overflow".to_owned()))?;
+        let reserved_len = usize::try_from(
+            carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_ARENA_SIZE
+                + carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_SIZE,
+        )
+        .map_err(|_| TrapError::Hypervisor("hvpatch reserved IPA size overflow".to_owned()))?;
         // Root bring-up starts from the generic identity tables and must carve
-        // these apertures live. Exec replacement receives a banked image with
+        // these apertures live. Exec replacement receives a global-frame image with
         // the same deterministic invalidations already baked into the cached
         // table bytes, so repeating the edit would rebuild/copy the complete
         // software manager solely to rediscover two no-ops.
         if self.process_asid.is_none() {
             self.pt_edit_and_flush(reserve_hvpatch_process_apertures)
                 .map_err(|error| {
-                    TrapError::Hypervisor(format!("reserve hvpatch process-bank aperture: {error}"))
+                    TrapError::Hypervisor(format!(
+                        "reserve hvpatch root-slot/global-frame apertures: {error}"
+                    ))
                 })?;
         }
         self.set_unmapped(
-            carrick_mem::memory::LINUX_PROCESS_AUX_BANK_BASE,
-            aux_bank_len,
+            carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE,
+            reserved_len,
             true,
         );
-        self.set_unmapped(carrick_mem::memory::LINUX_PROCESS_BANK_BASE, bank_len, true);
         let tcr = self.vcpu.get_sys_reg(SysReg::Tcr)?;
         let root = self.vcpu.get_sys_reg(SysReg::Ttbr0)? & TTBR_ROOT_MASK;
         let ttbr = (u64::from(asid) << 48) | root;
@@ -1665,8 +1777,8 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         &mut self,
         entry: GuestEntryRegs,
         child_ttbr0: u64,
-        bank_base: u64,
-        bank_size: u64,
+        root_slot_base: u64,
+        root_slot_size: u64,
         child_tid: ThreadId,
         forking_tid: ThreadId,
     ) -> Result<Self::ProcessSpec, TrapError> {
@@ -1695,11 +1807,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // no mmap/mprotect edit has already done so. The no-op edit publishes
         // nothing and performs no TLBI.
         let stage_started = std::time::Instant::now();
-        let page_tables_absent = self
-            .page_tables
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .is_none();
+        let page_tables_absent = self.page_tables.lock().is_none();
         if page_tables_absent {
             self.pt_edit(|_| Ok(false)).map_err(|error| {
                 TrapError::Hypervisor(format!(
@@ -1712,6 +1820,82 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             stage_started,
             u64::from(page_tables_absent),
         );
+
+        // Arm every private writable guest leaf before the child can exist.
+        // The parent manager is shared by its sibling vCPUs; the maintenance
+        // trampoline's inner-shareable TLBI closes all stale writable entries
+        // before the child clones the graph below.
+        let cow_ranges = self.vm.fork_cow_ranges();
+        if !cow_ranges.is_empty() {
+            self.vm.arm_frame_cow_ranges(&cow_ranges);
+            self.pt_edit_and_flush(|manager| {
+                let mut changed = false;
+                for range in &cow_ranges {
+                    changed |= if range.kernel_only {
+                        manager.set_kernel_readonly(range.va, range.len, range.executable)?
+                    } else {
+                        manager.set_fork_readonly(range.va, range.len, range.executable)?
+                    };
+                }
+                Ok(changed)
+            })
+            .map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "arm hvpatch parent private fork leaves read-only: {error}"
+                ))
+            })?;
+            // Durable pre-write structural receipt: one live-backing walk per
+            // armed semantic range.  bit4 distinguishes fork-COW arming from
+            // bit2's ordinary alias publication and bit3's post-COW leaf
+            // authentication.
+            for range in &cow_ranges {
+                match self.live_pt_debug_walk(range.va) {
+                    Ok(walk) => {
+                        carrick_observability::probes::pt_alias_walk(range.va, walk, 1 << 4);
+                        const VALID: u64 = 1;
+                        const NON_GLOBAL: u64 = 1 << 11;
+                        const AP_MASK: u64 = 0b11 << 6;
+                        const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
+                        const AP_USER_RO: u64 = 0b11 << 6;
+                        const AP_PRIV_RO: u64 = 0b10 << 6;
+                        let expected_ipa = self
+                            .page_tables
+                            .lock()
+                            .as_ref()
+                            .and_then(|manager| manager.translate(range.va))
+                            .unwrap_or(0);
+                        if walk[3] & VALID != 0 && expected_ipa != 0 {
+                            let expected_ap = if range.kernel_only {
+                                AP_PRIV_RO
+                            } else {
+                                AP_USER_RO
+                            };
+                            if walk[3] & PA_MASK_4KIB != expected_ipa & PA_MASK_4KIB
+                                || walk[3] & AP_MASK != expected_ap
+                                || (!range.kernel_only && walk[3] & NON_GLOBAL == 0)
+                            {
+                                return Err(TrapError::Hypervisor(format!(
+                                    "HVPatch parent fork-COW arm authentication failed at VA 0x{:x}: leaf=0x{:x} expected_ipa=0x{expected_ipa:x} expected_ap=0x{expected_ap:x}",
+                                    range.va, walk[3]
+                                )));
+                            }
+                            carrick_observability::probes::pt_alias_receipt(
+                                range.va,
+                                walk[3],
+                                expected_ipa,
+                                expected_ap,
+                                0,
+                            );
+                        }
+                    }
+                    Err(_) => carrick_observability::probes::pt_alias_walk(
+                        range.va,
+                        [0_u64; 4],
+                        (1 << 4) | (1 << 1),
+                    ),
+                }
+            }
+        }
 
         let stage_started = std::time::Instant::now();
         let parent = self.vcpu.snapshot()?;
@@ -1735,14 +1919,9 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         );
 
         let stage_started = std::time::Instant::now();
-        let mut page_tables = self
-            .page_tables
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone()
-            .ok_or_else(|| {
-                TrapError::Hypervisor("hvpatch parent page tables are absent".to_owned())
-            })?;
+        let mut page_tables = self.page_tables.lock().clone().ok_or_else(|| {
+            TrapError::Hypervisor("hvpatch parent page tables are absent".to_owned())
+        })?;
         emit_stage(
             HvpatchForkProcessSpecStagePhase::ParentPageTablesClone,
             stage_started,
@@ -1760,8 +1939,8 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             carrick_mem::memory::LINUX_PAGE_TABLES_SIZE,
         );
         let builder = self.vm.build_process_builder(
-            bank_base,
-            bank_size,
+            root_slot_base,
+            root_slot_size,
             &mut page_tables,
             child_tid.raw(),
             forking_tid.raw(),
@@ -2275,22 +2454,22 @@ mod tests {
         let mut manager = PageTableManager::new(bytes, carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
         assert!(
             manager
-                .translate(carrick_mem::memory::LINUX_PROCESS_AUX_BANK_BASE)
+                .translate(carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE)
                 .is_some()
         );
         assert!(
             manager
-                .translate(carrick_mem::memory::LINUX_PROCESS_BANK_BASE)
+                .translate(carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE)
                 .is_some()
         );
 
         assert!(reserve_hvpatch_process_apertures(&mut manager).expect("reserve apertures"));
         assert_eq!(
-            manager.translate(carrick_mem::memory::LINUX_PROCESS_AUX_BANK_BASE),
+            manager.translate(carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE),
             None
         );
         assert_eq!(
-            manager.translate(carrick_mem::memory::LINUX_PROCESS_BANK_BASE),
+            manager.translate(carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE),
             None
         );
     }

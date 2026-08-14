@@ -540,6 +540,7 @@ impl V2ProfileAuthority {
             TraceProfileKind::Dsr
             | TraceProfileKind::DsrFork
             | TraceProfileKind::DsrIndirect
+            | TraceProfileKind::HvpatchFrameCow
             | TraceProfileKind::HvpatchExecRuntimeStages
             | TraceProfileKind::HvpatchIdentityHostSafety
             | TraceProfileKind::HvpatchK1Lifecycle
@@ -2227,6 +2228,7 @@ pub(crate) enum TraceProfileKind {
     Dsr,
     DsrIndirect,
     DsrFork,
+    HvpatchFrameCow,
     HvpatchExecRuntimeStages,
     HvpatchIdentityHostSafety,
     HvpatchK1Lifecycle,
@@ -2242,6 +2244,7 @@ impl TraceProfileKind {
             Self::Dsr => "dsr",
             Self::DsrIndirect => "dsr-indirect",
             Self::DsrFork => "dsr-fork",
+            Self::HvpatchFrameCow => "hvpatch-frame-cow",
             Self::HvpatchExecRuntimeStages => "hvpatch-exec-runtime-stages",
             Self::HvpatchIdentityHostSafety => "hvpatch-identity-host-safety",
             Self::HvpatchK1Lifecycle => "hvpatch-k1-lifecycle",
@@ -2281,6 +2284,7 @@ impl TraceProfileKind {
             Self::Dsr
             | Self::DsrIndirect
             | Self::DsrFork
+            | Self::HvpatchFrameCow
             | Self::HvpatchExecRuntimeStages
             | Self::HvpatchIdentityHostSafety
             | Self::HvpatchK1Lifecycle
@@ -2295,6 +2299,7 @@ impl TraceProfileKind {
             Self::Dsr => carrick_runtime::dtrace_consumer::BUNDLED_DSR_PROFILE_D,
             Self::DsrIndirect => carrick_runtime::dtrace_consumer::BUNDLED_DSR_INDIRECT_D,
             Self::DsrFork => carrick_runtime::dtrace_consumer::BUNDLED_DSR_FORK_D,
+            Self::HvpatchFrameCow => carrick_runtime::dtrace_consumer::BUNDLED_HVPATCH_FRAME_COW_D,
             Self::HvpatchExecRuntimeStages => {
                 carrick_runtime::dtrace_consumer::BUNDLED_HVPATCH_EXEC_RUNTIME_STAGES_D
             }
@@ -2318,6 +2323,7 @@ impl TraceProfileKind {
             "dsr" => Ok(Self::Dsr),
             "dsr-indirect" => Ok(Self::DsrIndirect),
             "dsr-fork" => Ok(Self::DsrFork),
+            "hvpatch-frame-cow" => Ok(Self::HvpatchFrameCow),
             "hvpatch-exec-runtime-stages" => Ok(Self::HvpatchExecRuntimeStages),
             "hvpatch-identity-host-safety" => Ok(Self::HvpatchIdentityHostSafety),
             "hvpatch-k1-lifecycle" => Ok(Self::HvpatchK1Lifecycle),

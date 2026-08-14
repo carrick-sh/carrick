@@ -40,6 +40,12 @@ fn main() {
             0,
         );
         let fixed_ok = q == p;
+        let fixed_failed = q == libc::MAP_FAILED;
+        let fixed_errno = if fixed_failed {
+            *libc::__errno_location()
+        } else {
+            0
+        };
         if fixed_ok {
             *cell = 0xBB;
         }
@@ -82,6 +88,8 @@ fn main() {
         report!(
             setup_ok = true,
             fixed_ok = fixed_ok,
+            fixed_failed = fixed_failed,
+            fixed_errno = fixed_errno,
             // Child inherited the parent's pre-fork private value.
             child_inherited_private = child_saw[0] == 0xBB,
             // Child's write did not leak into the parent.

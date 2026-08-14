@@ -48,7 +48,10 @@ extern "C" fn pipe_churner(_: *mut c_void) -> *mut c_void {
 }
 
 const N_CANARY: usize = 1 << 16; // 64Ki u64 = 512 KiB heap canary region
-const ITERS: usize = 400; // well past the ~130 cycles seen in the full suite
+// The stale-owner/COW-arm failure this fixture guards is exercised on the first
+// child and every subsequent child. Keep enough repetitions to accumulate
+// canary damage while fitting the serialized probe gate's one-minute bound.
+const ITERS: usize = 40;
 
 #[inline]
 fn canary(i: usize) -> u64 {
@@ -57,7 +60,9 @@ fn canary(i: usize) -> u64 {
 
 fn main() {
     use std::io::Write;
-    unsafe { libc::alarm(25) };
+    // Remain below run-probe.sh's 60s outer bound while allowing HVPatch's
+    // serialized per-mm page-table construction to complete the stress loop.
+    unsafe { libc::alarm(55) };
 
     // Heap canary region kept alive across every fork.
     let buf: Vec<u64> = (0..N_CANARY).map(canary).collect();

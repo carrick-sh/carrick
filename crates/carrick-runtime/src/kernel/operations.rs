@@ -1671,13 +1671,17 @@ impl Kernel {
             // threads — that is why a cold `go build` reported
             // "fork/exec ...: resource temporarily unavailable".
             //
-            // What the revision check was really protecting is reparenting: a
-            // context captured before this task's parent exited must not fork,
-            // or the child attaches to the wrong parent. That is exactly the
-            // association, so compare it directly and let the benign advance
-            // through. Thread/resource/shared identity is still proven by the
-            // pointer checks below.
-            if caller_record.task.parent() != parent.parent_at_capture {
+            // Reparenting matters only to CLONE_PARENT, because that operation
+            // inherits the caller's parent association.  An ordinary fork
+            // attaches its child to the exact caller task and remains valid if
+            // the caller itself was reparented while a blocking backend
+            // transaction quiesced its siblings.  Keep rejecting a stale
+            // CLONE_PARENT context rather than silently selecting a different
+            // parent generation. Thread/resource/shared identity is still
+            // proven by the pointer checks below for every plan.
+            if plan.fork_parent() == ForkParentMode::InheritCallerParent
+                && caller_record.task.parent() != parent.parent_at_capture
+            {
                 return Err(KernelOperationError::StaleContext);
             }
             let caller_thread = caller_record
@@ -6469,12 +6473,22 @@ mod tests {
             .expect("reparented zombie");
         assert_eq!(zombie.parent, Some(root.task.key()));
         assert_eq!(live_grandchild.task.parent(), Some(root.task.key()));
-        assert!(matches!(
-            kernel.fork_task(
+        let descendant = kernel
+            .fork_task(
                 &live_grandchild,
                 ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
                 ThreadId::synthetic_for_tests(399),
-                "stale descendant".to_string(),
+                "reparented descendant".to_string(),
+                None,
+            )
+            .expect("ordinary fork does not inherit the caller's parent association");
+        assert_eq!(descendant.task.parent(), Some(live_grandchild.task.key()));
+        assert!(matches!(
+            kernel.fork_task(
+                &live_grandchild,
+                ClonePlan::from_flags(LinuxCloneFlags::PARENT).expect("CLONE_PARENT plan"),
+                ThreadId::synthetic_for_tests(400),
+                "stale CLONE_PARENT descendant".to_string(),
                 None,
             ),
             Err(KernelOperationError::StaleContext)

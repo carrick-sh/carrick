@@ -744,7 +744,7 @@ impl Kernel {
         Ok(removed)
     }
 
-    /// Sole runtime authority for applied frame/mapping inventory. `BankedMm`
+    /// Sole runtime authority for applied frame/mapping inventory. `Stage1Mm`
     /// remains only an mm-binding seam during K1 and does not write this state.
     pub const fn frame_inventory(&self) -> &FrameInventoryAuthority {
         &self.frame_inventory

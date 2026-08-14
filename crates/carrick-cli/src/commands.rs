@@ -1511,6 +1511,9 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     if profile == Some(crate::trace_profile::TraceProfileKind::HvpatchK1Lifecycle) {
                         bail!("hvpatch-k1-lifecycle requires a Darwin/HVF host");
                     }
+                    if profile == Some(crate::trace_profile::TraceProfileKind::HvpatchFrameCow) {
+                        bail!("hvpatch-frame-cow requires a Darwin/HVF host");
+                    }
                     if profile
                         == Some(crate::trace_profile::TraceProfileKind::HvpatchExecRuntimeStages)
                     {
@@ -1735,6 +1738,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                             crate::trace_profile::TraceProfileKind::Dsr
                             | crate::trace_profile::TraceProfileKind::DsrFork
                             | crate::trace_profile::TraceProfileKind::DsrIndirect
+                            | crate::trace_profile::TraceProfileKind::HvpatchFrameCow
                             | crate::trace_profile::TraceProfileKind::HvpatchExecRuntimeStages
                             | crate::trace_profile::TraceProfileKind::HvpatchIdentityHostSafety
                             | crate::trace_profile::TraceProfileKind::HvpatchK1Lifecycle => {
@@ -1913,6 +1917,27 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                                     .copied()
                                     .unwrap_or_default(),
                                 capture.joins,
+                            );
+                        } else if requested_profile
+                            == crate::trace_profile::TraceProfileKind::HvpatchFrameCow
+                        {
+                            if summary_jsonl.is_some() {
+                                bail!(
+                                    "the HVPatch frame-COW profile emits a strict raw receipt; validate it with scripts/validate-hvpatch-frame-cow.py"
+                                );
+                            }
+                            if capture_status.principal_drops != 0
+                                || capture_status.aggregation_drops != 0
+                                || capture_status.dynamic_drops != 0
+                                || capture_status.dynamic_rinse_drops != 0
+                                || capture_status.dynamic_dirty_drops != 0
+                                || capture_status.other_drops != 0
+                                || capture_status.interrupted
+                            {
+                                bail!("the HVPatch frame-COW capture was lossy or interrupted");
+                            }
+                            eprintln!(
+                                "HVPatch frame-COW raw receipt captured; strict structural validation is required"
                             );
                         } else if requested_profile
                             == crate::trace_profile::TraceProfileKind::HvpatchExecRuntimeStages

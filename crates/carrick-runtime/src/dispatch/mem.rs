@@ -2909,8 +2909,7 @@ impl SyscallDispatcher {
                         path,
                         ..
                     } => {
-                        if map_sharing == MmapSharing::Shared
-                            && let Some(bus_offset) = shared_file_bus_offset(
+                        if let Some(bus_offset) = shared_file_bus_offset(
                                 contents.len() as u64,
                                 offset,
                                 length,
@@ -2942,8 +2941,7 @@ impl SyscallDispatcher {
                         bytes[..available.len()].copy_from_slice(&available);
                     }
                     OpenDescription::SyntheticFile { contents, path, .. } => {
-                        if map_sharing == MmapSharing::Shared
-                            && let Some(bus_offset) = shared_file_bus_offset(
+                        if let Some(bus_offset) = shared_file_bus_offset(
                                 contents.len() as u64,
                                 offset,
                                 length,
@@ -2963,8 +2961,7 @@ impl SyscallDispatcher {
                         }
                     }
                     OpenDescription::HostFile { host_fd, .. } => {
-                        if map_sharing == MmapSharing::Shared
-                            && let Some(file_len) = host_fd_file_len(host_fd.raw())
+                        if let Some(file_len) = host_fd_file_len(host_fd.raw())
                             && let Some(bus_offset) =
                                 shared_file_bus_offset(file_len, offset, length, page_size)
                         {
@@ -3108,9 +3105,9 @@ impl SyscallDispatcher {
             // here: by this point the address/scrub steps have already run, so
             // a fresh failure would break mmap's failure atomicity exactly
             // where the eager path never failed (it read best-effort and
-            // succeeded). It also keeps the legacy arena contract — no
-            // private BUS tail on ineligible shapes (the VMM lanes share this
-            // path); only a LOWERED mapping publishes beyond-EOF BUS_ADRERR.
+            // succeeded). A known map-time EOF still publishes BUS_ADRERR for
+            // every whole page beyond it: snapshot materialization changes the
+            // backing primitive, not Linux's private-file fault contract.
             let mut bytes = bytes;
             let mut lowered_file_backed = false;
             if lowering_candidate {
@@ -3124,6 +3121,15 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
                 if let Some(file_len) = host_fd_file_len(host_fd.raw()) {
+                    bus_fault_offset =
+                        shared_file_bus_offset(file_len, offset, length, page_size);
+                    if bus_fault_offset.is_some() {
+                        bus_fault_debug = Some(format!(
+                            "host path={:?} file_len={file_len} desc=HostFile host_fd={}",
+                            carrick_portable::fd_abs_path(host_fd.raw()),
+                            host_fd.raw()
+                        ));
+                    }
                     // SAFETY: the description read guard (`open`) keeps the
                     // owning `HostFdRef` alive across the borrow.
                     let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(host_fd.raw()) };
@@ -3132,15 +3138,6 @@ impl SyscallDispatcher {
                         Ok(true)
                     ) {
                         lowered_file_backed = true;
-                        bus_fault_offset =
-                            shared_file_bus_offset(file_len, offset, length, page_size);
-                        if bus_fault_offset.is_some() {
-                            bus_fault_debug = Some(format!(
-                                "host path={:?} file_len={file_len} desc=HostFile host_fd={}",
-                                carrick_portable::fd_abs_path(host_fd.raw()),
-                                host_fd.raw()
-                            ));
-                        }
                     }
                 }
                 if !lowered_file_backed {
@@ -6104,8 +6101,10 @@ mod tests {
             vec![0x51u8; 64],
             "fallback content must be the file bytes"
         );
-        // Legacy arena contract on the fallback: no private BUS tail.
-        assert!(!dispatcher.mmap_fault_is_sigbus(address + PAGE_SIZE));
+        assert!(
+            dispatcher.mmap_fault_is_sigbus(address + PAGE_SIZE),
+            "a private eager snapshot still faults on pages wholly beyond map-time EOF"
+        );
     }
 
     #[test]

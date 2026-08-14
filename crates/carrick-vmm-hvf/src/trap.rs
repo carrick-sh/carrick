@@ -77,12 +77,12 @@
 //!   not fork-safe, so the parent tears down its vCPU+VM via the *raw* API
 //!   BEFORE forking (a live VM at fork time leaves the child unable to
 //!   `hv_vm_create`); both sides then rebuild a fresh VM and re-`hv_vm_map` the
-//!   same host buffers. Guest RAM is host-`MAP_SHARED` (required for HVF
-//!   coherence), so `fork(2)` does NOT COW-isolate it — the parent therefore
-//!   takes an explicit private snapshot of each PRIVATE region pre-fork (while
-//!   the vCPU is suspended, hence race-free) via `clone_region_for_child`, and
-//!   the child maps those copies. Genuine guest `MAP_SHARED` file mappings are
-//!   deliberately *not* snapshotted (POSIX: they stay shared across fork).
+//!   same host buffers. The legacy VMM path gets private-buffer isolation from
+//!   host `MAP_PRIVATE` fork COW and clones only the child's independently
+//!   editable stage-1 table backing. HVPatch instead shares stable global
+//!   frames read-only across distinct per-mm stage-1 graphs and copies only the
+//!   first writer's affected compound frame. Genuine guest `MAP_SHARED`
+//!   mappings remain shared on either path.
 //! - **Thread clone** (`HvfInner::build_thread_spec` / `from_thread_spec`)
 //!   keeps ONE process VM and gives each guest thread its own vCPU in it. The
 //!   stage-2 mappings are VM-global, so a sibling only re-materialises local
@@ -338,60 +338,10 @@ struct ExecPrivateFileCache {
     mapped_bytes: usize,
 }
 
-/// Structural input to the per-bank stage-1 layout. Payload bytes do not
-/// participate: the stack and writable image data change on every exec, while
-/// the page-table result depends only on VA extents and permissions.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct ExecBankMappingShape {
-    guest_start: u64,
-    mapped_size: u64,
-    perms: u8,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct ExecBankLayoutKey {
-    bank_base: u64,
-    bank_size: u64,
-    old_root: u64,
-    table_index: usize,
-    source_table_hash: u64,
-    source_table_len: usize,
-    mappings: Vec<ExecBankMappingShape>,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone)]
-struct CachedExecBankLayout {
-    /// Retained for collision-safe validation of `source_table_hash`.
-    source_table: std::sync::Arc<Vec<u8>>,
-    ipa_starts: std::sync::Arc<[u64]>,
-    banked_table: std::sync::Arc<Vec<u8>>,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const EXEC_BANK_LAYOUT_CACHE_CAPACITY: usize = 128;
-
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const EXEC_PRIVATE_FILE_CACHE_CAPACITY: usize = 64;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const EXEC_PRIVATE_FILE_CACHE_BYTES: usize = 256 * 1024 * 1024;
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn exec_bank_layout_cache()
--> &'static parking_lot::Mutex<HashMap<ExecBankLayoutKey, CachedExecBankLayout>> {
-    static CACHE: std::sync::OnceLock<
-        parking_lot::Mutex<HashMap<ExecBankLayoutKey, CachedExecBankLayout>>,
-    > = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn exec_bank_layout_cache_enabled() -> bool {
-    std::env::var_os("CARRICK_HVPATCH_EXEC_BANK_CACHE").as_deref()
-        != Some(std::ffi::OsStr::new("0"))
-}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn exec_private_file_cache_enabled() -> bool {
@@ -530,40 +480,6 @@ fn attach_exec_private_file_backings(plan: &mut GuestMappingPlan) -> Result<(), 
 fn lazy_exec_page_tables_enabled() -> bool {
     std::env::var_os("CARRICK_HVPATCH_LAZY_EXEC_PAGE_TABLES").as_deref()
         != Some(std::ffi::OsStr::new("0"))
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn exec_bank_layout_key(
-    plan: &GuestMappingPlan,
-    bank_base: u64,
-    bank_size: u64,
-    old_root: u64,
-    table_index: usize,
-) -> ExecBankLayoutKey {
-    use std::hash::{Hash, Hasher};
-
-    let source_table = &plan.mappings[table_index].image;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    source_table.hash(&mut hasher);
-    ExecBankLayoutKey {
-        bank_base,
-        bank_size,
-        old_root,
-        table_index,
-        source_table_hash: hasher.finish(),
-        source_table_len: source_table.len(),
-        mappings: plan
-            .mappings
-            .iter()
-            .map(|mapping| ExecBankMappingShape {
-                guest_start: mapping.guest_start,
-                mapped_size: mapping.mapped_size,
-                perms: u8::from(mapping.perms.read)
-                    | (u8::from(mapping.perms.write) << 1)
-                    | (u8::from(mapping.perms.execute) << 2),
-            })
-            .collect(),
-    }
 }
 
 impl GuestMappingPlan {
@@ -803,8 +719,9 @@ enum AliasOwnershipScope {
     Root,
     /// Alias belongs to exactly one HVPatch address space.  The scope is
     /// rebound in the forked host child when an inherited shared-anonymous
-    /// frame is materialized into that child's new bank.
-    ProcessBank { base: u64, size: u64 },
+    /// frame is materialized into that child's new mm. The stage-1 root slot
+    /// tuple is an ownership token only; guest frames use global IPAs.
+    MmRootSlot { base: u64, size: u64 },
     /// Shared-file aliases use the historical VM-global IPA namespace.
     Global,
 }
@@ -812,12 +729,12 @@ enum AliasOwnershipScope {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn alias_ownership_scope(
     sharing: GuestMappingSharing,
-    process_bank: Option<(u64, u64)>,
+    mm_root_slot: Option<(u64, u64)>,
 ) -> AliasOwnershipScope {
     if sharing.uses_global_ipa() {
         AliasOwnershipScope::Global
-    } else if let Some((base, size)) = process_bank {
-        AliasOwnershipScope::ProcessBank { base, size }
+    } else if let Some((base, size)) = mm_root_slot {
+        AliasOwnershipScope::MmRootSlot { base, size }
     } else {
         AliasOwnershipScope::Root
     }
@@ -826,11 +743,11 @@ fn alias_ownership_scope(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn rebind_inherited_alias_to_process(
     mut alias: AliasBacking,
-    process_bank: (u64, u64),
+    mm_root_slot: (u64, u64),
 ) -> AliasBacking {
-    alias.ownership_scope = AliasOwnershipScope::ProcessBank {
-        base: process_bank.0,
-        size: process_bank.1,
+    alias.ownership_scope = AliasOwnershipScope::MmRootSlot {
+        base: mm_root_slot.0,
+        size: mm_root_slot.1,
     };
     alias
 }
@@ -865,6 +782,15 @@ struct AliasBacking {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn semantic_extent_size(start: u64, end: u64) -> usize {
     usize::try_from(end.saturating_sub(start)).unwrap_or(usize::MAX)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn is_kernel_only_stage1_range(start: u64, len: usize) -> bool {
+    let end = start.saturating_add(len as u64);
+    start >= crate::memory::LINUX_KERNEL_REGION_BASE
+        && end
+            <= crate::memory::LINUX_KERNEL_REGION_BASE
+                .saturating_add(carrick_mem::memory::LINUX_KERNEL_REGION_SIZE)
 }
 
 // Futex-word keying for `MAP_SHARED` file mappings lives in
@@ -930,7 +856,10 @@ fn register_shared_alias(b: AliasBacking) {
     replay.insert(replay_mapping_key(b));
     drop(replay);
     let mut reg = alias_registry().lock();
-    if let Some(e) = reg.iter_mut().find(|e| e.ipa == b.ipa) {
+    if let Some(e) = reg
+        .iter_mut()
+        .find(|e| e.ipa == b.ipa && e.ownership_scope == b.ownership_scope)
+    {
         *e = b;
     } else {
         reg.push(b);
@@ -1031,12 +960,31 @@ fn lookup_shared_alias(ipa: u64) -> Option<AliasBacking> {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn alias_matches_process_scope(
     ownership_scope: AliasOwnershipScope,
-    process_bank: Option<(u64, u64)>,
+    mm_root_slot: Option<(u64, u64)>,
 ) -> bool {
     match ownership_scope {
         AliasOwnershipScope::Global => true,
-        AliasOwnershipScope::Root => process_bank.is_none(),
-        AliasOwnershipScope::ProcessBank { base, size } => process_bank == Some((base, size)),
+        AliasOwnershipScope::Root => mm_root_slot.is_none(),
+        AliasOwnershipScope::MmRootSlot { base, size } => mm_root_slot == Some((base, size)),
+    }
+}
+
+/// Whether an alias is private to the address space being replaced/retired.
+/// Global aliases may still be referenced by another mm and are removed only
+/// when their physical extent reaches its final reference.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn alias_is_owned_by_process(
+    ownership_scope: AliasOwnershipScope,
+    mm_root_slot: Option<(u64, u64)>,
+) -> bool {
+    match (ownership_scope, mm_root_slot) {
+        (AliasOwnershipScope::Root, None) => true,
+        (AliasOwnershipScope::MmRootSlot { base, size }, Some(root_slot)) => {
+            (base, size) == root_slot
+        }
+        (AliasOwnershipScope::Global, _)
+        | (AliasOwnershipScope::Root, Some(_))
+        | (AliasOwnershipScope::MmRootSlot { .. }, None) => false,
     }
 }
 
@@ -1047,14 +995,14 @@ fn alias_matches_process_scope(
 fn missing_process_aliases(
     local_ipas: &std::collections::HashSet<u64>,
     aliases: &[AliasBacking],
-    process_bank: Option<(u64, u64)>,
+    mm_root_slot: Option<(u64, u64)>,
 ) -> Vec<AliasBacking> {
     aliases
         .iter()
         .copied()
         .filter(|alias| {
             !local_ipas.contains(&alias.ipa)
-                && alias_matches_process_scope(alias.ownership_scope, process_bank)
+                && alias_matches_process_scope(alias.ownership_scope, mm_root_slot)
         })
         .collect()
 }
@@ -1067,11 +1015,11 @@ fn missing_process_aliases(
 fn mapping_is_current_for_process_fork(
     mapping: &HvfMappedRegion,
     aliases: &[AliasBacking],
-    process_bank: Option<(u64, u64)>,
+    mm_root_slot: Option<(u64, u64)>,
 ) -> bool {
     !mapping.is_dynamic_alias
         || aliases.iter().any(|alias| {
-            alias_matches_process_scope(alias.ownership_scope, process_bank)
+            alias_matches_process_scope(alias.ownership_scope, mm_root_slot)
                 && alias.start == mapping.start
                 && alias.ipa == mapping.ipa
                 && alias.host_addr == mapping.host_addr as usize
@@ -1079,66 +1027,27 @@ fn mapping_is_current_for_process_fork(
         })
 }
 
-/// Select the stage-2 IPA for a newly-created dynamic alias.
-///
-/// The dispatcher reserves a globally unique IPA because mature VMM backends
-/// use that value directly. An in-process hvpatch mm instead needs private and
-/// fork-shared-anonymous aliases inside its ASID-owned process bank. Only the
-/// shared-file/global class retains the requested VM-global IPA; an inherited
-/// shared-anonymous child descriptor reuses its parent's bank IPA and frame.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn reserve_process_alias_ipa(
-    requested_ipa: u64,
-    size: u64,
-    sharing: GuestMappingSharing,
-    process_bank: Option<(u64, u64)>,
-    process_alias_next: Option<&std::sync::atomic::AtomicU64>,
-) -> Result<u64, TrapError> {
-    let Some((bank_base, bank_size)) = process_bank else {
-        return Ok(requested_ipa);
-    };
-    if sharing.uses_global_ipa() {
-        return Ok(requested_ipa);
-    }
-    let cursor = process_alias_next.ok_or_else(|| {
-        TrapError::Hypervisor("hvpatch process bank has no alias allocator".to_owned())
-    })?;
-    let bank_end = bank_base
-        .checked_add(bank_size)
-        .ok_or_else(|| TrapError::Hypervisor("hvpatch process-bank overflow".to_owned()))?;
-    const ALIAS_BLOCK: u64 = 2 * 1024 * 1024;
-    let reserved = align_up(size, ALIAS_BLOCK)?.max(ALIAS_BLOCK);
-    loop {
-        let current = cursor.load(std::sync::atomic::Ordering::SeqCst);
-        let base = align_up(current, ALIAS_BLOCK)?;
-        let next = base
-            .checked_add(reserved)
-            .ok_or_else(|| TrapError::Hypervisor("hvpatch alias-bank overflow".to_owned()))?;
-        if next > bank_end {
-            return Err(TrapError::Hypervisor(format!(
-                "hvpatch dynamic aliases exhausted {} GiB process bank",
-                bank_size >> 30
-            )));
-        }
-        if cursor
-            .compare_exchange(
-                current,
-                next,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            )
-            .is_ok()
-        {
-            return Ok(base);
-        }
-    }
+fn current_dynamic_alias_ipas(
+    mappings: &[HvfMappedRegion],
+    aliases: &[AliasBacking],
+    mm_root_slot: Option<(u64, u64)>,
+) -> std::collections::HashSet<u64> {
+    mappings
+        .iter()
+        .filter(|mapping| {
+            mapping.is_dynamic_alias
+                && mapping_is_current_for_process_fork(mapping, aliases, mm_root_slot)
+        })
+        .map(|mapping| mapping.ipa)
+        .collect()
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn lookup_shared_alias_by_va(
     va: u64,
     len: usize,
-    process_bank: Option<(u64, u64)>,
+    mm_root_slot: Option<(u64, u64)>,
 ) -> Option<AliasBacking> {
     let end = va.saturating_add(len as u64);
     alias_registry()
@@ -1146,7 +1055,7 @@ fn lookup_shared_alias_by_va(
         .iter()
         .rev()
         .find(|e| {
-            alias_matches_process_scope(e.ownership_scope, process_bank)
+            alias_matches_process_scope(e.ownership_scope, mm_root_slot)
                 && va >= e.start
                 && end <= e.start.saturating_add(e.size as u64)
                 // Reject an entry whose backing is not mapped in THIS process
@@ -1167,13 +1076,13 @@ fn lookup_shared_alias_by_va(
 /// `munmap` it, since the buffer is shared with sibling threads + this registry.
 /// Keyed on the VA `start` because `munmap` supplies a VA.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn unregister_alias(va: u64, len: usize, process_bank: Option<(u64, u64)>) {
+fn unregister_alias(va: u64, len: usize, mm_root_slot: Option<(u64, u64)>) {
     let end = va.saturating_add(len as u64);
     let mut registry = alias_registry().lock();
     let mut replacement = Vec::with_capacity(registry.len().saturating_add(1));
     for entry in registry.drain(..) {
         let entry_end = entry.start.saturating_add(entry.size as u64);
-        if !alias_matches_process_scope(entry.ownership_scope, process_bank)
+        if !alias_matches_process_scope(entry.ownership_scope, mm_root_slot)
             || entry_end <= va
             || entry.start >= end
         {
@@ -1244,9 +1153,11 @@ impl AliasRemapLimiter {
 struct SiblingForkMapping {
     start: u64,
     ipa: u64,
+    physical_ipa: u64,
     end: u64,
     host_addr: usize,
     size: usize,
+    physical_size: usize,
     perms: u64,
     is_dynamic_alias: bool,
     sharing: GuestMappingSharing,
@@ -1282,9 +1193,11 @@ fn publish_sibling_fork_mappings(regions: &[HvfMappedRegion]) {
         reg.push(SiblingForkMapping {
             start: m.start,
             ipa: m.ipa,
+            physical_ipa: m.physical_ipa,
             end: m.end,
             host_addr: m.host_addr as usize,
             size: m.size,
+            physical_size: m.physical_size,
             perms: u64::from(m.perms),
             is_dynamic_alias: m.is_dynamic_alias,
             sharing: m.sharing,
@@ -2783,22 +2696,6 @@ pub static EL1_KICK_RESUMED: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 pub static INJECT_AT_EL1: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static KICK_PATH_INJECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Guest mmap-arena high-water mark (the dispatcher's `mmap_next`), published by
-/// `handle_fork` just before forking. `clone_region_for_child` reads it to bound
-/// the per-fork resident-page `mincore` scan of the 32 GiB arena window to the
-/// used prefix `[LINUX_MMAP_BASE, this)` instead of scanning all 2M pages — the
-/// dominant per-fork cost (a `mincore` over the full window measured ~470 ms).
-/// `u64::MAX` (the default) means "unknown, scan the full region" so non-fork
-/// callers and tests keep the original, always-correct behaviour.
-pub static GUEST_ARENA_HIGH_WATER: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(u64::MAX);
-
-/// Publish the arena high-water for the next fork's snapshot scan. Called by
-/// `handle_fork` with `SyscallDispatcher::mmap_arena_high_water()`.
-pub fn set_guest_arena_high_water(addr: u64) {
-    GUEST_ARENA_HIGH_WATER.store(addr, std::sync::atomic::Ordering::SeqCst);
-}
-
 /// Whether to save/restore guest FP/SIMD across signal handlers (default on;
 /// `CARRICK_NO_FPSIMD` disables it for differential measurement). Cached after
 /// the first read so the signal hot path doesn't hit the environment.
@@ -2920,6 +2817,98 @@ struct HvpatchFrameInventoryState {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CowArmedSpan {
+    va: u64,
+    len: usize,
+    executable: bool,
+    kernel_only: bool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Debug, Default)]
+struct CowArmedRanges {
+    ranges: Vec<carrick_aarch64::vmm::ForkCowRange>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl CowArmedRanges {
+    const COMPOUND_SIZE: u64 = 16 * 1024;
+
+    fn arm(&mut self, ranges: &[carrick_aarch64::vmm::ForkCowRange]) {
+        self.ranges.extend_from_slice(ranges);
+        self.ranges.sort_by_key(|range| (range.va, range.len));
+        self.ranges.dedup();
+    }
+
+    fn span_for(&self, va: u64) -> Option<CowArmedSpan> {
+        let compound_start = va & !(Self::COMPOUND_SIZE - 1);
+        let compound_end = compound_start.checked_add(Self::COMPOUND_SIZE)?;
+        self.ranges.iter().find_map(|range| {
+            let range_end = range.va.checked_add(range.len as u64)?;
+            if va < range.va || va >= range_end {
+                return None;
+            }
+            let start = range.va.max(compound_start);
+            let end = range_end.min(compound_end);
+            Some(CowArmedSpan {
+                va: start,
+                len: usize::try_from(end.checked_sub(start)?).ok()?,
+                executable: range.executable,
+                kernel_only: range.kernel_only,
+            })
+        })
+    }
+
+    fn disarm(&mut self, span: CowArmedSpan) {
+        let span_end = span.va.saturating_add(span.len as u64);
+        let mut replacement = Vec::with_capacity(self.ranges.len().saturating_add(1));
+        for range in self.ranges.drain(..) {
+            let range_end = range.va.saturating_add(range.len as u64);
+            if range_end <= span.va || range.va >= span_end {
+                replacement.push(range);
+                continue;
+            }
+            if range.va < span.va {
+                replacement.push(carrick_aarch64::vmm::ForkCowRange {
+                    va: range.va,
+                    len: usize::try_from(span.va - range.va).unwrap_or_default(),
+                    executable: range.executable,
+                    kernel_only: range.kernel_only,
+                });
+            }
+            if range_end > span_end {
+                replacement.push(carrick_aarch64::vmm::ForkCowRange {
+                    va: span_end,
+                    len: usize::try_from(range_end - span_end).unwrap_or_default(),
+                    executable: range.executable,
+                    kernel_only: range.kernel_only,
+                });
+            }
+        }
+        self.ranges = replacement;
+    }
+
+    fn overlapping(&self, va: u64, len: usize) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
+        let end = va.saturating_add(len as u64);
+        self.ranges
+            .iter()
+            .filter_map(|range| {
+                let range_end = range.va.saturating_add(range.len as u64);
+                let start = range.va.max(va);
+                let overlap_end = range_end.min(end);
+                (start < overlap_end).then(|| carrick_aarch64::vmm::ForkCowRange {
+                    va: start,
+                    len: usize::try_from(overlap_end - start).unwrap_or_default(),
+                    executable: range.executable,
+                    kernel_only: range.kernel_only,
+                })
+            })
+            .collect()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvpatchFrameInventoryState {
     fn new(ledger: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>) -> Self {
         Self {
@@ -2993,15 +2982,10 @@ pub(crate) struct HvfVmState {
     _vm:
         std::mem::ManuallyDrop<applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>>,
     mappings: Vec<HvfMappedRegion>,
-    /// Private stage-2 IPA bank for an in-process hvpatch child. Root process
-    /// and ordinary VMM engines use identity/alias IPAs and leave this unset.
-    process_bank: Option<(u64, u64)>,
-    /// Monotonic dynamic-alias cursor shared by every vCPU in this Linux
-    /// process. Private aliases must live in the process bank too: leaving
-    /// post-fork Go arenas in the root/global alias aperture makes the child's
-    /// scoped syscall-memory lookup reject them (and lets processes collide at
-    /// stage 2). Genuine MAP_SHARED aliases retain their globally unique IPA.
-    process_alias_next: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// Per-mm stage-1 root-table slot. It contains page-table/control backing
+    /// only; guest data frames live at stable global IPAs outside the slot.
+    /// Ordinary VMM engines leave this unset.
+    mm_root_slot: Option<(u64, u64)>,
     /// Per-thread snapshot stashed by the M:N reclaim between `reclaim_park`
     /// (snapshot + destroy this vCPU at a block point) and `reclaim_resume`
     /// (recreate + restore on wake). The SAME host thread saves then restores, so
@@ -3090,6 +3074,13 @@ pub(crate) struct HvfVmState {
     /// ledger; VM/vCPU recreation reuses it and therefore emits no logical
     /// mapping events.
     frame_inventory: HvpatchFrameInventoryState,
+    /// Per-engine runtime authority. Sibling vCPUs bind their own Linux TID;
+    /// the underlying mm/frame inventory remains shared.
+    cow_authority: Option<std::sync::Arc<dyn carrick_hal::FrameCowAuthority>>,
+    cow_identity: Option<carrick_hal::FrameCowIdentity>,
+    cow_armed: std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>,
+    cow_deferred_publications: std::sync::Arc<parking_lot::Mutex<Vec<PendingFrameCowPublication>>>,
+    pending_fork_frame_receipts: Vec<PendingForkFrameReceipt>,
 }
 
 /// Thread/process exit must LEAK the per-thread host backings, never `munmap`
@@ -3146,6 +3137,11 @@ pub(crate) struct HvfMappedRegion {
     /// IPA this region was `hv_vm_map`'d at — needed to re-map across fork(2).
     /// Identity (== `start`) for every region but the Rosetta window.
     ipa: u64,
+    /// Exact HVF stage-2 extent. `ipa`/`size` are the live semantic projection;
+    /// a partial 4 KiB Linux mapping can retain a 16 KiB physical owner whose
+    /// base precedes that projection. Lifetime decisions must use this tuple.
+    physical_ipa: u64,
+    physical_size: usize,
     /// Host VA of the buffer backing this guest-physical mapping. We
     /// record this explicitly so the fork(2) path can re-issue
     /// `hv_vm_map` in the child against the same (COW'd) host pages
@@ -3275,6 +3271,181 @@ struct ThreadMappingDesc {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForkMappingDisposition {
+    /// Parent and child keep the same frame and the same writable permissions.
+    SharedFrameWritable,
+    /// Parent and child name the same private frame, with both stage-1 leaves
+    /// armed read-only until one mm takes the write-permission COW fault.
+    SharedFrameReadOnly,
+    /// Carrick-owned stage-1 tables are per-mm mutable kernel state, so the
+    /// child receives an independent table frame before publication.
+    IndependentPageTables,
+    /// Carrick-owned EL1 identity/mailbox state is never guest-accessible and
+    /// must be writable before the exception vector can run.  Give the child a
+    /// fresh per-mm frame before entry rather than depending on recovery from a
+    /// current-EL write-permission fault.
+    IndependentKernelState,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn fork_mapping_disposition(mapping: &ThreadMappingDesc) -> ForkMappingDisposition {
+    if mapping.sharing.shares_across_fork() {
+        ForkMappingDisposition::SharedFrameWritable
+    } else if mapping.start == crate::memory::LINUX_PAGE_TABLES_BASE {
+        ForkMappingDisposition::IndependentPageTables
+    } else if mapping.guest_writable && is_kernel_only_stage1_range(mapping.start, mapping.size) {
+        ForkMappingDisposition::IndependentKernelState
+    } else {
+        ForkMappingDisposition::SharedFrameReadOnly
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn is_stage1_cow_write_fault(syndrome: u64) -> bool {
+    const EXCEPTION_CLASS_MASK: u64 = 0x3f;
+    const DATA_ABORT_LOWER_EL: u64 = 0x24;
+    const WRITE_NOT_READ: u64 = 1 << 6;
+    const FAULT_STATUS_MASK: u64 = 0x3f;
+    let exception_class = (syndrome >> 26) & EXCEPTION_CLASS_MASK;
+    let fault_status = syndrome & FAULT_STATUS_MASK;
+    matches!(exception_class, DATA_ABORT_LOWER_EL | 0x25)
+        && syndrome & WRITE_NOT_READ != 0
+        && matches!(fault_status, 0x0d..=0x0f)
+}
+
+fn frame_cow_write_is_denied(
+    write_denied: bool,
+    intent: carrick_aarch64::vmm::FrameCowWriteIntent,
+) -> bool {
+    write_denied && intent == carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn reserve_global_frame_ipa(length: u64) -> Result<u64, TrapError> {
+    reserve_global_frame_ipa_aligned(length, CowArmedRanges::COMPOUND_SIZE)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct GlobalFrameIpaAllocator {
+    next: u64,
+    free: Vec<(u64, u64)>,
+    live: std::collections::BTreeMap<u64, u64>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl GlobalFrameIpaAllocator {
+    fn new() -> Self {
+        Self {
+            next: carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE,
+            free: Vec::new(),
+            live: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn allocate(&mut self, length: u64, alignment: u64) -> Result<u64, TrapError> {
+        let length = align_up(length, CowArmedRanges::COMPOUND_SIZE)?;
+        if length == 0 {
+            return Err(TrapError::Hypervisor(
+                "cannot reserve an empty global frame IPA extent".to_owned(),
+            ));
+        }
+        for index in 0..self.free.len() {
+            let (free_base, free_len) = self.free[index];
+            let base = align_up(free_base, alignment)?;
+            let Some(end) = base.checked_add(length) else {
+                continue;
+            };
+            let free_end = free_base.saturating_add(free_len);
+            if end > free_end {
+                continue;
+            }
+            self.free.swap_remove(index);
+            if base > free_base {
+                self.free.push((free_base, base - free_base));
+            }
+            if end < free_end {
+                self.free.push((end, free_end - end));
+            }
+            self.live.insert(base, length);
+            return Ok(base);
+        }
+
+        let base = align_up(self.next, alignment)?;
+        let end = base
+            .checked_add(length)
+            .ok_or_else(|| TrapError::Hypervisor("global frame IPA overflow".to_owned()))?;
+        let limit = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE
+            .checked_add(carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_SIZE)
+            .ok_or_else(|| TrapError::Hypervisor("global frame IPA limit overflow".to_owned()))?;
+        if end > limit {
+            return Err(TrapError::Hypervisor(
+                "global frame IPA arena exhausted".to_owned(),
+            ));
+        }
+        self.next = end;
+        self.live.insert(base, length);
+        Ok(base)
+    }
+
+    fn release(&mut self, base: u64, length: u64) -> Result<(), TrapError> {
+        let arena_base = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE;
+        let arena_end =
+            arena_base.saturating_add(carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_SIZE);
+        let length = length.next_multiple_of(CowArmedRanges::COMPOUND_SIZE);
+        let end = base.saturating_add(length);
+        if length == 0 || base < arena_base || end > arena_end {
+            return Ok(());
+        }
+        if self.live.get(&base).copied() != Some(length) {
+            return Err(TrapError::Hypervisor(format!(
+                "global frame IPA release does not match a live exact extent: base=0x{base:x} length=0x{length:x}"
+            )));
+        }
+        self.live.remove(&base);
+        self.free.push((base, length));
+        self.free.sort_unstable_by_key(|extent| extent.0);
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.free.len());
+        for (extent_base, extent_len) in self.free.drain(..) {
+            if let Some((last_base, last_len)) = merged.last_mut()
+                && last_base.saturating_add(*last_len) == extent_base
+            {
+                *last_len = last_len.saturating_add(extent_len);
+            } else {
+                merged.push((extent_base, extent_len));
+            }
+        }
+        self.free = merged;
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn global_frame_ipa_allocator() -> &'static parking_lot::Mutex<GlobalFrameIpaAllocator> {
+    static ALLOCATOR: std::sync::OnceLock<parking_lot::Mutex<GlobalFrameIpaAllocator>> =
+        std::sync::OnceLock::new();
+    ALLOCATOR.get_or_init(|| parking_lot::Mutex::new(GlobalFrameIpaAllocator::new()))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn reserve_global_frame_ipa_aligned(length: u64, alignment: u64) -> Result<u64, TrapError> {
+    global_frame_ipa_allocator()
+        .lock()
+        .allocate(length, alignment)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn release_global_frame_ipa(base: u64, length: u64) -> Result<(), TrapError> {
+    global_frame_ipa_allocator().lock().release(base, length)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn reserve_global_frame_cow_ipa() -> Result<u64, TrapError> {
+    reserve_global_frame_ipa(CowArmedRanges::COMPOUND_SIZE)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl ThreadMappingDesc {
     /// Project a live region into a `Send`-safe descriptor for a `ThreadSpec` (the
     /// sibling thread mirrors it as an UNOWNED `HvfMappedRegion`). Called by
@@ -3286,9 +3457,9 @@ impl ThreadMappingDesc {
             end: region.end,
             host_addr: region.host_addr,
             size: semantic_extent_size(region.start, region.end),
-            physical_ipa: region.ipa,
+            physical_ipa: region.physical_ipa,
             physical_host_addr: region.host_addr,
-            physical_size: region.size,
+            physical_size: region.physical_size,
             perms: region.perms,
             is_dynamic_alias: region.is_dynamic_alias,
             sharing: region.sharing,
@@ -3332,9 +3503,11 @@ impl ThreadMappingDesc {
         HvfMappedRegion {
             start: self.start,
             ipa: self.ipa,
+            physical_ipa: self.physical_ipa,
             end: self.end,
             host_addr: self.host_addr,
             size: self.physical_size,
+            physical_size: self.physical_size,
             perms: self.perms,
             memory: None,
             host_mapping: None,
@@ -3351,9 +3524,11 @@ impl ThreadMappingDesc {
 struct ForkMappingDesc {
     start: u64,
     ipa: u64,
+    physical_ipa: u64,
     end: u64,
     host: ForkMappingHost,
     size: usize,
+    physical_size: usize,
     perms: applevisor::memory::MemPerms,
     is_dynamic_alias: bool,
     sharing: GuestMappingSharing,
@@ -3405,9 +3580,12 @@ pub struct ThreadSpec {
     mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
     syscall_transport: HvfSyscallTransport,
     persistent_vm_lifecycle: bool,
-    process_bank: Option<(u64, u64)>,
-    process_alias_next: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    mm_root_slot: Option<(u64, u64)>,
     frame_inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
+    cow_authority: Option<std::sync::Arc<dyn carrick_hal::FrameCowAuthority>>,
+    cow_identity: Option<carrick_hal::FrameCowIdentity>,
+    cow_armed: std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>,
+    cow_deferred_publications: std::sync::Arc<parking_lot::Mutex<Vec<PendingFrameCowPublication>>>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3428,6 +3606,43 @@ struct ProcessMappingDesc {
     shared_key_base: u64,
     shared_key_offset: u64,
     inherited_frame: Option<carrick_hal::FrameId>,
+    inherited_mapping: Option<carrick_hal::MappingId>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn fork_translation_has_overlay_owner(
+    mappings: &[ProcessMappingDesc],
+    candidate_index: usize,
+    va: u64,
+    translated: u64,
+) -> bool {
+    mappings.iter().enumerate().any(|(index, overlay)| {
+        index != candidate_index
+            && va >= overlay.start
+            && va < overlay.end
+            && overlay
+                .ipa
+                .checked_add(va - overlay.start)
+                .is_some_and(|ipa| ipa == translated)
+    })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug)]
+struct PendingForkFrameReceipt {
+    kind: carrick_observability::probes::HvpatchForkFrameKind,
+    parent_mapping: carrick_hal::MappingId,
+    child_mapping: carrick_hal::MappingId,
+    frame: carrick_hal::FrameId,
+    ipa: u64,
+    length: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingFrameCowPublication {
+    va: u64,
+    expected_ipa: u64,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3435,9 +3650,11 @@ fn inherited_fork_inventory_extent(
     mapping: &ThreadMappingDesc,
     parent_inventory: &std::collections::BTreeMap<(u64, u64), InventoryExtent>,
 ) -> Result<Option<InventoryExtent>, TrapError> {
-    if !mapping.sharing.shares_across_fork() {
-        return Ok(None);
-    }
+    // A private Linux mapping is shared physically at fork just like a shared
+    // mapping; the distinction is that its writable stage-1 leaves are armed
+    // read-only and a later permission fault replaces only the writer's frame.
+    // Carrick-owned page-table backing is handled separately by the process
+    // builder because each mm needs an independently editable graph.
     parent_inventory
         .get(&(mapping.physical_ipa, mapping.physical_size as u64))
         .copied()
@@ -3450,11 +3667,17 @@ fn inherited_fork_inventory_extent(
         })
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn process_mapping_needs_stage2_install(inherited_frame: Option<carrick_hal::FrameId>) -> bool {
+    inherited_frame.is_none()
+}
+
 /// A fork child address space waiting for vCPU materialization on its owning
-/// host thread. Private mappings already carry COW host clones and distinct
-/// bank IPAs; guest-shared mappings retain their existing IPA and frame. For a
-/// shared-anonymous alias that IPA remains mm-bank-scoped; only shared-file
-/// mappings use the VM-global alias namespace.
+/// host thread. Private mappings initially retain the parent's FrameId/global
+/// IPA and are read-only in each mm's independent stage-1 graph; the first
+/// writer receives a new compound frame. Guest-shared mappings retain their
+/// existing IPA and frame without entering private COW. Shared-anonymous aliases
+/// remain mm-scoped; only shared-file mappings use the VM-global alias namespace.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub struct ProcessSpec {
     vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
@@ -3464,9 +3687,9 @@ pub struct ProcessSpec {
     mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
     syscall_transport: HvfSyscallTransport,
     persistent_vm_lifecycle: bool,
-    process_bank: (u64, u64),
-    process_alias_next: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    mm_root_slot: (u64, u64),
     frame_inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
+    cow_armed: std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3537,7 +3760,7 @@ impl HvfVmState {
         permissions: carrick_hal::MemPerms,
         backing: InventoryBackingIdentity,
         inherited_frame: Option<carrick_hal::FrameId>,
-    ) -> Result<(), TrapError> {
+    ) -> Result<InventoryExtent, TrapError> {
         if inventory.extents.contains_key(&(gpa, length)) {
             return Err(TrapError::Hypervisor(format!(
                 "HVPatch inventory extent IPA 0x{gpa:x} size {length} is duplicated"
@@ -3614,15 +3837,13 @@ impl HvfVmState {
             frames.shared.entry(backing).or_insert(frame);
         }
         drop(frames);
-        inventory.extents.insert(
-            (gpa, length),
-            InventoryExtent {
-                frame,
-                mapping,
-                backing,
-            },
-        );
-        Ok(())
+        let extent = InventoryExtent {
+            frame,
+            mapping,
+            backing,
+        };
+        inventory.extents.insert((gpa, length), extent);
+        Ok(extent)
     }
 
     fn stage_retirement(
@@ -3850,6 +4071,15 @@ impl HvfVmState {
         self.page_tables.lock().clone()
     }
 
+    pub(crate) fn bind_stage1_page_tables(
+        &mut self,
+        page_tables: std::sync::Arc<
+            parking_lot::Mutex<Option<crate::page_table::PageTableManager>>,
+        >,
+    ) {
+        self.page_tables = page_tables;
+    }
+
     pub(crate) fn retire_process_mappings(&mut self) -> Result<(), TrapError> {
         // Mature VMM processes own a private VM and retain the historical
         // teardown path; only the persistent single-VM HVPatch lane publishes
@@ -3860,8 +4090,8 @@ impl HvfVmState {
         // The runtime holds the process-wide HVPatch topology lock across this
         // method. Select exact extents whose final logical owner is this mm;
         // global shared aliases are therefore retired by their actual last
-        // owner rather than being omitted merely because they sit outside a
-        // child's private IPA bank.
+        // owner rather than being omitted merely because they are globally
+        // addressed outside this mm's stage-1 root slot.
         let extents = {
             let inventory = self.frame_inventory.lock();
             if inventory.extents.is_empty() {
@@ -3894,26 +4124,32 @@ impl HvfVmState {
                 }
                 return Err(error);
             }
+            if let Err(error) = release_global_frame_ipa(ipa, size as u64) {
+                eprintln!(
+                    "carrick: FATAL: retired HVPatch frame has inconsistent global IPA lifetime: {error}"
+                );
+                std::process::abort();
+            }
             physical_mutated = true;
         }
-        alias_registry()
-            .lock()
-            .retain(|alias| !extents.contains(&(alias.physical_ipa, alias.physical_size)));
+        alias_registry().lock().retain(|alias| {
+            !alias_is_owned_by_process(alias.ownership_scope, self.mm_root_slot)
+                && !extents.contains(&(alias.physical_ipa, alias.physical_size))
+        });
 
         // A retained shared extent still points at its original host allocation.
         // Reclaim only exact extents removed above and preserve the remaining
         // backing until the single VM is finally destroyed.
         let mut retained_backings = Vec::new();
         for mapping in std::mem::take(&mut self.mappings) {
-            if extents.contains(&(mapping.ipa, mapping.size)) {
+            if extents.contains(&(mapping.physical_ipa, mapping.physical_size)) {
                 drop(mapping);
             } else {
                 retained_backings.push(mapping);
             }
         }
         std::mem::forget(retained_backings);
-        self.process_bank = None;
-        self.process_alias_next = None;
+        self.mm_root_slot = None;
 
         let mut inventory = self.frame_inventory.lock();
         let mut reservation = inventory.retirement_reservation.take().unwrap_or_else(|| {
@@ -3956,8 +4192,7 @@ impl HvfVmState {
         let mut state = HvfVmState {
             _vm: std::mem::ManuallyDrop::new(vm),
             mappings: Vec::new(),
-            process_bank: None,
-            process_alias_next: None,
+            mm_root_slot: None,
             reclaim_snapshot: None,
             last_exit_class: 0,
             last_fault_esr: 0,
@@ -3978,6 +4213,11 @@ impl HvfVmState {
             frame_inventory: HvpatchFrameInventoryState::new(std::sync::Arc::new(
                 parking_lot::Mutex::new(HvpatchFrameInventory::default()),
             )),
+            cow_authority: None,
+            cow_identity: None,
+            cow_armed: std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+            cow_deferred_publications: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            pending_fork_frame_receipts: Vec::new(),
         };
         state.seed_readonly_spans_from_plan(plan);
 
@@ -4354,6 +4594,858 @@ impl HvfVmState {
         });
     }
 
+    /// Live private semantic mappings that a process fork must arm read-only in
+    /// both stage-1 graphs. This includes a currently-read-only or PROT_NONE
+    /// mapping: a later mprotect-to-write must still take frame COW rather than
+    /// silently sharing the parent's frame. The alias registry supplies mappings
+    /// installed by sibling vCPUs and filters retired lifetime-owner rows.
+    pub(crate) fn fork_cow_ranges(&self) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
+        let aliases = alias_registry().lock().clone();
+        let mut ranges: Vec<_> = self
+            .mappings
+            .iter()
+            .filter(|mapping| {
+                mapping.sharing == GuestMappingSharing::Private
+                    && mapping.start != crate::memory::LINUX_PAGE_TABLES_BASE
+                    && !is_kernel_only_stage1_range(
+                        mapping.start,
+                        semantic_extent_size(mapping.start, mapping.end),
+                    )
+                    && mapping_is_current_for_process_fork(mapping, &aliases, self.mm_root_slot)
+            })
+            .map(|mapping| carrick_aarch64::vmm::ForkCowRange {
+                va: mapping.start,
+                len: semantic_extent_size(mapping.start, mapping.end),
+                executable: u64::from(mapping.perms) & 4 != 0,
+                kernel_only: is_kernel_only_stage1_range(
+                    mapping.start,
+                    semantic_extent_size(mapping.start, mapping.end),
+                ),
+            })
+            .collect();
+        let local_ipas = current_dynamic_alias_ipas(&self.mappings, &aliases, self.mm_root_slot);
+        ranges.extend(
+            missing_process_aliases(&local_ipas, &aliases, self.mm_root_slot)
+                .into_iter()
+                .filter(|mapping| {
+                    mapping.sharing == GuestMappingSharing::Private
+                        && !is_kernel_only_stage1_range(mapping.start, mapping.size)
+                })
+                .map(|mapping| carrick_aarch64::vmm::ForkCowRange {
+                    va: mapping.start,
+                    len: mapping.size,
+                    executable: mapping.perms & 4 != 0,
+                    kernel_only: is_kernel_only_stage1_range(mapping.start, mapping.size),
+                }),
+        );
+        ranges.sort_by_key(|range| (range.va, range.len));
+        ranges.dedup_by_key(|range| (range.va, range.len));
+        ranges
+    }
+
+    pub(crate) fn arm_frame_cow_ranges(&mut self, ranges: &[carrick_aarch64::vmm::ForkCowRange]) {
+        self.cow_armed.lock().arm(ranges);
+    }
+
+    pub(crate) fn armed_frame_cow_ranges(
+        &self,
+        va: u64,
+        len: usize,
+    ) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
+        self.cow_armed.lock().overlapping(va, len)
+    }
+
+    pub(crate) fn publish_private_repoint(
+        &mut self,
+        va: u64,
+        overlay_ipa: u64,
+        len: usize,
+    ) -> Result<(), TrapError> {
+        let overlay_end = overlay_ipa.checked_add(len as u64).ok_or_else(|| {
+            TrapError::Hypervisor("private repoint semantic IPA overflow".to_owned())
+        })?;
+        let (mapping_ipa, physical_ipa, mapping_host, physical_size, perms) = self
+            .mappings
+            .iter()
+            .rev()
+            .find(|mapping| {
+                overlay_ipa >= mapping.ipa
+                    && mapping
+                        .ipa
+                        .checked_add(mapping.size as u64)
+                        .is_some_and(|end| overlay_end <= end)
+            })
+            .map(|mapping| {
+                (
+                    mapping.ipa,
+                    mapping.physical_ipa,
+                    mapping.host_addr as usize,
+                    mapping.physical_size,
+                    mapping.perms,
+                )
+            })
+            .ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "private repoint IPA 0x{overlay_ipa:x} size {len} has no physical owner"
+                ))
+            })?;
+        let semantic_offset = overlay_ipa.checked_sub(physical_ipa).ok_or_else(|| {
+            TrapError::Hypervisor("private repoint precedes its physical extent".to_owned())
+        })?;
+        let physical_host_addr = mapping_host
+            .checked_sub(mapping_ipa.checked_sub(physical_ipa).ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "private repoint mapping precedes its physical extent".to_owned(),
+                )
+            })? as usize)
+            .ok_or_else(|| {
+                TrapError::Hypervisor("private repoint physical host underflow".to_owned())
+            })?;
+        let host_addr = physical_host_addr
+            .checked_add(semantic_offset as usize)
+            .ok_or_else(|| {
+                TrapError::Hypervisor("private repoint semantic host overflow".to_owned())
+            })?;
+        let inventory_backing = self
+            .frame_inventory
+            .lock()
+            .extents
+            .get(&(physical_ipa, physical_size as u64))
+            .map(|extent| extent.backing)
+            .or_else(|| (!self.persistent_vm_lifecycle).then(Self::private_backing_identity))
+            .ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "private repoint physical IPA 0x{:x} size {} lacks frame inventory",
+                    physical_ipa, physical_size
+                ))
+            })?;
+        let sharing = GuestMappingSharing::Private;
+        register_shared_alias(AliasBacking {
+            start: va,
+            ipa: overlay_ipa,
+            host_addr,
+            size: len,
+            physical_ipa,
+            physical_host_addr,
+            physical_size,
+            perms: u64::from(perms),
+            guest_writable: true,
+            sharing,
+            ownership_scope: alias_ownership_scope(sharing, self.mm_root_slot),
+            inventory_backing,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn bind_frame_cow(
+        &mut self,
+        authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
+        identity: carrick_hal::FrameCowIdentity,
+    ) {
+        for receipt in std::mem::take(&mut self.pending_fork_frame_receipts) {
+            let length = carrick_hal::FrameLength::from_mapping_extent(
+                std::num::NonZeroU64::new(receipt.length).unwrap_or_else(|| {
+                    eprintln!("carrick: FATAL: pending fork-frame receipt has zero length");
+                    std::process::abort();
+                }),
+            );
+            match authority.mapping_is_live(
+                receipt.child_mapping,
+                receipt.frame,
+                carrick_guest_mem::Gpa(receipt.ipa),
+                length,
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    eprintln!(
+                        "carrick: FATAL: fork-frame receipt child mapping {:?} is not live",
+                        receipt.child_mapping
+                    );
+                    std::process::abort();
+                }
+                Err(error) => {
+                    eprintln!(
+                        "carrick: FATAL: authenticate fork-frame receipt mapping {:?}: {error}",
+                        receipt.child_mapping
+                    );
+                    std::process::abort();
+                }
+            }
+            let event = carrick_observability::probes::HvpatchForkFrameShare::new(
+                identity.linux_pid,
+                identity.linux_tid,
+                identity.mm,
+                u32::from(identity.asid),
+                receipt.kind,
+                receipt.parent_mapping.raw(),
+                receipt.child_mapping.raw(),
+                receipt.frame.raw(),
+                receipt.ipa,
+                receipt.length,
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("carrick: FATAL: construct authenticated fork-frame receipt: {error}");
+                std::process::abort();
+            });
+            crate::probes::hvpatch_fork_frame_share(event);
+        }
+        self.cow_authority = Some(authority);
+        self.cow_identity = Some(identity);
+    }
+
+    fn physical_cow_source(&self, ipa: u64) -> Option<(*mut u8, u64)> {
+        let physical_ipa = align_down(ipa, CowArmedRanges::COMPOUND_SIZE);
+        let physical_end = physical_ipa.checked_add(CowArmedRanges::COMPOUND_SIZE)?;
+        if let Some(alias) = alias_registry().lock().iter().rev().find(|alias| {
+            alias_matches_process_scope(alias.ownership_scope, self.mm_root_slot)
+                && physical_ipa >= alias.physical_ipa
+                && physical_end
+                    <= alias
+                        .physical_ipa
+                        .saturating_add(alias.physical_size as u64)
+                && alias_backing_is_live(alias.physical_host_addr)
+        }) {
+            let offset = usize::try_from(physical_ipa - alias.physical_ipa).ok()?;
+            return Some((
+                unsafe { (alias.physical_host_addr as *mut u8).add(offset) },
+                physical_ipa,
+            ));
+        }
+        let mapping = Self::mapping_for_ipa_range(
+            &self.mappings,
+            physical_ipa,
+            CowArmedRanges::COMPOUND_SIZE as usize,
+        )?;
+        let offset = usize::try_from(physical_ipa - mapping.ipa).ok()?;
+        Some((unsafe { mapping.host_addr.add(offset) }, physical_ipa))
+    }
+
+    fn rollback_cow_inventory_extent(&mut self, ipa: u64, length: u64) {
+        let mut inventory = self.frame_inventory.lock();
+        let Some(extent) = inventory.extents.remove(&(ipa, length)) else {
+            return;
+        };
+        let mut frames = inventory.frames.lock();
+        if let Some(references) = frames.references.get_mut(&extent.frame) {
+            *references = references.saturating_sub(1);
+            if *references == 0 {
+                frames.references.remove(&extent.frame);
+            }
+        }
+        let key = (extent.frame, ipa, length);
+        if let Some(references) = frames.extent_references.get_mut(&key) {
+            *references = references.saturating_sub(1);
+            if *references == 0 {
+                frames.extent_references.remove(&key);
+            }
+        }
+    }
+
+    fn perform_frame_cow(
+        &mut self,
+        fault_va: u64,
+        intent: carrick_aarch64::vmm::FrameCowWriteIntent,
+        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+    ) -> Result<bool, TrapError> {
+        let identity = self.cow_identity.ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch frame COW has no bound mm identity".to_owned())
+        })?;
+        let authority = self.cow_authority.clone().ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch frame COW has no inventory authority".to_owned())
+        })?;
+        // Lock order matches every runtime page-table editor: pause sibling
+        // walkers first, then serialize shared HVF stage-2/alias topology.
+        let _quiesce = authority.quiesce().map_err(|error| {
+            TrapError::Hypervisor(format!("quiesce HVPatch frame COW: {error}"))
+        })?;
+        let _topology = crate::fork_quiesce::acquire_topology_lock(
+            carrick_observability::probes::HvpatchTopologyOperation::FrameCow,
+            identity.linux_pid,
+            identity.linux_tid,
+        );
+
+        // Another vCPU of this mm may have won while we waited for topology.
+        let Some(span) = self.cow_armed.lock().span_for(fault_va) else {
+            return Ok(false);
+        };
+        // COW allocation is physical at the 16 KiB host compound, but guest
+        // access authority is semantic at the exact fault byte. A compound can
+        // cross the current `brk`, mprotect, or partial-unmap edge; rejecting
+        // the whole span incorrectly SIGSEGVs a writable byte merely because an
+        // adjacent page is denied. Internal backing maintenance is distinct:
+        // mmap must zero a reclaimed, currently-unmapped page BEFORE publishing
+        // its fresh VMA permission. It still splits/repoints the frame, while
+        // the page-table publication below deliberately preserves the denied
+        // descriptor until mmap's later `protect_range` commit.
+        if frame_cow_write_is_denied(self.protections.range_write_denied(fault_va, 1), intent) {
+            return Ok(false);
+        }
+        // `span.va` can name the host-granule prefix of a semantic fragment
+        // whose first live Linux leaf begins at `fault_va` (Task 1 deliberately
+        // keeps semantic and physical extents separate). A guest fault proves
+        // that the exact byte translated; backing maintenance may intentionally
+        // start from an invalid munmap descriptor, so the mapping-metadata
+        // fallback is authoritative for that pre-publication transaction.
+        let old_fault_ipa = self.translate_va(fault_va).or_else(|| {
+            let mapping = self.mapping_for_range(fault_va, 1)?;
+            mapping
+                .ipa
+                .checked_add(fault_va.checked_sub(mapping.start)?)
+        });
+        let semantic_offset = fault_va.checked_sub(span.va).ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch COW fault precedes its armed span".to_owned())
+        })?;
+        let old_ipa = old_fault_ipa
+            .and_then(|ipa| ipa.checked_sub(semantic_offset))
+            .ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "HVPatch COW VA 0x{:x} (fault 0x{fault_va:x}) has no stage-1 or mapping translation",
+                    span.va
+                ))
+            })?;
+        let (old_host, old_physical_ipa) = self.physical_cow_source(old_ipa).ok_or_else(|| {
+            TrapError::Hypervisor(format!(
+                "HVPatch COW IPA 0x{old_ipa:x} has no 16 KiB physical backing"
+            ))
+        })?;
+        let old_frame = self
+            .frame_inventory
+            .lock()
+            .extents
+            .iter()
+            .find(|((base, length), _)| {
+                old_physical_ipa >= *base
+                    && old_physical_ipa.saturating_add(CowArmedRanges::COMPOUND_SIZE)
+                        <= base.saturating_add(*length)
+            })
+            .map(|(_, extent)| extent.frame)
+            .ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "HVPatch COW old IPA 0x{old_physical_ipa:x} has no frame inventory owner"
+                ))
+            })?;
+        let old_offset = old_ipa.checked_sub(old_physical_ipa).ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch COW physical offset underflow".to_owned())
+        })?;
+        // Resolve every authority needed for stage-1 publication before the
+        // first physical/staged-inventory mutation.  A fork-time response can
+        // run while the engine's mapping metadata is being rebuilt; failing
+        // here must leave no staged MappingId for terminal retirement to see.
+        let page_table_host = self
+            .mapping_for_range(
+                crate::memory::LINUX_PAGE_TABLES_BASE,
+                carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+            )
+            .map(|mapping| mapping.host_addr)
+            .ok_or_else(|| {
+                TrapError::Hypervisor("HVPatch COW page-table backing is absent".to_owned())
+            })?;
+
+        // Reserve every kernel identity/event slot before physical mutation.
+        let mut reservation = authority.reserve().map_err(|error| {
+            TrapError::Hypervisor(format!("reserve frame COW inventory: {error}"))
+        })?;
+        let new_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            CowArmedRanges::COMPOUND_SIZE as usize,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .map_err(|error| TrapError::Hypervisor(format!("allocate frame COW backing: {error}")))?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                old_host,
+                new_host.as_ptr(),
+                CowArmedRanges::COMPOUND_SIZE as usize,
+            );
+        }
+        let source = unsafe {
+            std::slice::from_raw_parts(
+                old_host.cast_const(),
+                CowArmedRanges::COMPOUND_SIZE as usize,
+            )
+        };
+        let destination = unsafe {
+            std::slice::from_raw_parts(
+                new_host.as_ptr().cast_const(),
+                CowArmedRanges::COMPOUND_SIZE as usize,
+            )
+        };
+        crate::probes::hvpatch_frame_cow_copy(
+            old_frame.raw(),
+            old_physical_ipa,
+            source,
+            destination,
+        );
+        let new_physical_ipa = reserve_global_frame_cow_ipa()?;
+        let new_ipa = new_physical_ipa
+            .checked_add(old_offset)
+            .ok_or_else(|| TrapError::Hypervisor("HVPatch COW semantic IPA overflow".to_owned()))?;
+        let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
+        let map_result = unsafe {
+            inventory_hv_vm_map(
+                new_host.as_ptr().cast(),
+                new_physical_ipa,
+                CowArmedRanges::COMPOUND_SIZE as usize,
+                u64::from(stage2_perms),
+            )
+        };
+        if map_result != 0 {
+            release_global_frame_ipa(new_physical_ipa, CowArmedRanges::COMPOUND_SIZE)?;
+            return Err(TrapError::Hypervisor(format!(
+                "map frame COW IPA 0x{new_physical_ipa:x}: 0x{map_result:x}"
+            )));
+        }
+
+        let backing = Self::private_backing_identity();
+        {
+            let mut inventory = self.frame_inventory.lock();
+            if let Err(error) = Self::stage_mapping(
+                &mut inventory,
+                &mut reservation,
+                new_physical_ipa,
+                CowArmedRanges::COMPOUND_SIZE,
+                carrick_hal::MemPerms {
+                    read: true,
+                    write: true,
+                    exec: true,
+                },
+                backing,
+                None,
+            ) {
+                let unmap_result = unsafe {
+                    inventory_hv_vm_unmap(new_physical_ipa, CowArmedRanges::COMPOUND_SIZE as usize)
+                };
+                if unmap_result != 0 {
+                    eprintln!(
+                        "carrick: FATAL: rollback HVPatch COW stage-2 map failed: 0x{unmap_result:x}"
+                    );
+                    std::process::abort();
+                }
+                release_global_frame_ipa(new_physical_ipa, CowArmedRanges::COMPOUND_SIZE)?;
+                return Err(error);
+            }
+        }
+        let (new_frame, new_mapping) = self
+            .frame_inventory
+            .lock()
+            .extents
+            .get(&(new_physical_ipa, CowArmedRanges::COMPOUND_SIZE))
+            .map(|extent| (extent.frame, extent.mapping))
+            .ok_or_else(|| {
+                TrapError::Hypervisor("HVPatch COW staged frame disappeared".to_owned())
+            })?;
+        const PAGE_SIZE: u64 = 4 * 1024;
+        let receipt_va = align_down(fault_va, PAGE_SIZE);
+        let receipt_intent = match intent {
+            carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible => {
+                carrick_observability::probes::HvpatchFrameCowIntent::GuestVisible
+            }
+            carrick_aarch64::vmm::FrameCowWriteIntent::BackingMaintenance => {
+                carrick_observability::probes::HvpatchFrameCowIntent::BackingMaintenance
+            }
+            carrick_aarch64::vmm::FrameCowWriteIntent::PrivilegedInternal => {
+                carrick_observability::probes::HvpatchFrameCowIntent::PrivilegedInternal
+            }
+        };
+        let emit_cow = |phase| {
+            let event = carrick_observability::probes::HvpatchFrameCow::new(
+                phase,
+                receipt_intent,
+                identity.linux_pid,
+                identity.linux_tid,
+                identity.mm,
+                u32::from(identity.asid),
+                receipt_va,
+                old_frame.raw(),
+                new_frame.raw(),
+                old_physical_ipa,
+                new_physical_ipa,
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("carrick: FATAL: construct HVPatch frame-COW receipt: {error}");
+                std::process::abort();
+            });
+            crate::probes::hvpatch_frame_cow(event);
+        };
+        emit_cow(carrick_observability::probes::HvpatchFrameCowPhase::Stage2Mapped);
+        let mut rollback_page_tables = None;
+        let mut preserved_denied_receipt = None;
+        let page_table_result = (|| {
+            const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
+            const AP_MASK: u64 = 0b11 << 6;
+            const AP_USER_RW: u64 = 0b01 << 6;
+            const VALID: u64 = 1;
+            const TYPE_TABLE_OR_PAGE: u64 = 0b11;
+            const NON_GLOBAL: u64 = 1 << 11;
+            let mut page_tables = self.page_tables.lock();
+            let manager = page_tables.as_mut().ok_or_else(|| {
+                TrapError::Hypervisor("HVPatch COW page-table manager is absent".to_owned())
+            })?;
+            // The transaction can fail after one or more descriptors were
+            // written to both the manager shadow and live backing.  Preserve a
+            // complete pre-edit image: a cloned manager's dirty list alone is
+            // not a rollback log, because `sync_to_host` drains the NEW edits.
+            rollback_page_tables = Some(manager.clone());
+            if span.kernel_only {
+                manager
+                    .map_kernel_aliased(span.va, new_ipa, span.len as u64)
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "publish kernel-only HVPatch COW stage-1 leaf: {error:?}"
+                        ))
+                    })?;
+            } else {
+                manager
+                    .repoint_preserving_attributes(span.va, new_ipa, span.len as u64)
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "repoint HVPatch COW stage-1 compound: {error:?}"
+                        ))
+                    })?;
+                let span_end = span.va.saturating_add(span.len as u64);
+                let mut page_va = span.va & !(PAGE_SIZE - 1);
+                while page_va < span_end {
+                    if !self.protections.range_write_denied(page_va, 1) {
+                        manager
+                            .set_writable_preserving_attributes(page_va, PAGE_SIZE as usize)
+                            .map_err(|error| {
+                                TrapError::Hypervisor(format!(
+                                    "grant HVPatch COW semantic page write: {error:?}"
+                                ))
+                            })?;
+                    }
+                    page_va = page_va.saturating_add(PAGE_SIZE);
+                }
+            }
+            unsafe { manager.sync_to_host(page_table_host) };
+
+            // A semantic fork result is not structural proof.  Before the
+            // stage-1 TLBI publishes this transaction, authenticate the exact
+            // descriptors the hardware walker will consume: the manager shadow
+            // and live backing must agree, every 4 KiB leaf in this 16 KiB COW
+            // compound must name the new global frame IPA, and its AP bits must
+            // match the EL1-only/user regime.  Fail closed while the old armed
+            // range and inventory reservation are still intact.
+            let expected_ap = if span.kernel_only { 0 } else { AP_USER_RW };
+            let span_end = span.va.checked_add(span.len as u64).ok_or_else(|| {
+                TrapError::Hypervisor("HVPatch COW stage-1 span overflow".to_owned())
+            })?;
+            let mut page_va = span.va;
+            while page_va < span_end {
+                let shadow = manager.debug_walk(page_va);
+                let live =
+                    unsafe { manager.debug_walk_host(page_table_host.cast_const(), page_va) };
+                if shadow != live {
+                    return Err(TrapError::Hypervisor(format!(
+                        "HVPatch COW stage-1 shadow/live mismatch at VA 0x{page_va:x}: shadow={shadow:x?} live={live:x?}"
+                    )));
+                }
+                let leaf = live[3];
+                let expected_ipa = new_ipa
+                    .checked_add(page_va.checked_sub(span.va).ok_or_else(|| {
+                        TrapError::Hypervisor("HVPatch COW page offset underflow".to_owned())
+                    })?)
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor("HVPatch COW leaf IPA overflow".to_owned())
+                    })?;
+                let page_is_writable =
+                    span.kernel_only || !self.protections.range_write_denied(page_va, 1);
+                if leaf & PA_MASK_4KIB != expected_ipa & PA_MASK_4KIB
+                    || (page_is_writable
+                        && (leaf & VALID == 0
+                            || leaf & 0b11 != TYPE_TABLE_OR_PAGE
+                            || leaf & AP_MASK != expected_ap
+                            || (!span.kernel_only && leaf & NON_GLOBAL == 0)))
+                {
+                    return Err(TrapError::Hypervisor(format!(
+                        "HVPatch COW stage-1 leaf authentication failed at VA 0x{page_va:x}: leaf=0x{leaf:x} expected_ipa=0x{expected_ipa:x} expected_ap=0x{expected_ap:x}"
+                    )));
+                }
+                if page_is_writable && page_va == receipt_va {
+                    crate::probes::pt_alias_receipt(page_va, leaf, expected_ipa, expected_ap, 2);
+                } else if page_va == receipt_va {
+                    preserved_denied_receipt = Some((page_va, leaf, expected_ipa, leaf & AP_MASK));
+                }
+                // Reuse the durable descriptor-walk probe so a signed live
+                // capture can bind the COW receipt to the exact published PTE.
+                crate::probes::pt_alias_walk(page_va, live, 1 << 3);
+                page_va = page_va.saturating_add(PAGE_SIZE);
+            }
+            Ok::<(), TrapError>(())
+        })();
+        if let Err(error) = page_table_result {
+            if let Some(snapshot) = rollback_page_tables {
+                {
+                    let mut page_tables = self.page_tables.lock();
+                    // SAFETY: the COW quiesce and topology guards remain held;
+                    // no vCPU can walk or edit this mm while the complete
+                    // pre-transaction image replaces its live backing.
+                    unsafe { snapshot.restore_quiesced_snapshot_to_host(page_table_host) };
+                    *page_tables = Some(snapshot);
+                }
+                if let Err(flush_error) = flush_stage1() {
+                    eprintln!(
+                        "carrick: FATAL: HVPatch COW rollback stage-1 TLBI failed: {flush_error}"
+                    );
+                    std::process::abort();
+                }
+            }
+            let unmap_result = unsafe {
+                inventory_hv_vm_unmap(new_physical_ipa, CowArmedRanges::COMPOUND_SIZE as usize)
+            };
+            if unmap_result != 0 {
+                eprintln!(
+                    "carrick: FATAL: rollback HVPatch COW stage-2 map failed: 0x{unmap_result:x}"
+                );
+                std::process::abort();
+            }
+            self.rollback_cow_inventory_extent(new_physical_ipa, CowArmedRanges::COMPOUND_SIZE);
+            release_global_frame_ipa(new_physical_ipa, CowArmedRanges::COMPOUND_SIZE)?;
+            return Err(error);
+        }
+        if let Err(error) = flush_stage1() {
+            eprintln!("carrick: FATAL: HVPatch COW stage-1 TLBI failed: {error}");
+            std::process::abort();
+        }
+        emit_cow(carrick_observability::probes::HvpatchFrameCowPhase::Stage1Published);
+        if let Err(error) = authority.apply(reservation.commit(())) {
+            eprintln!("carrick: FATAL: HVPatch COW inventory commit failed: {error}");
+            std::process::abort();
+        }
+        let Some(cow_extent) = std::num::NonZeroU64::new(CowArmedRanges::COMPOUND_SIZE) else {
+            eprintln!("carrick: FATAL: HVPatch COW compound extent is zero");
+            std::process::abort();
+        };
+        let cow_length = carrick_hal::FrameLength::from_mapping_extent(cow_extent);
+        match authority.mapping_is_live(
+            new_mapping,
+            new_frame,
+            carrick_guest_mem::Gpa(new_physical_ipa),
+            cow_length,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!(
+                    "carrick: FATAL: authenticated HVPatch COW mapping {new_mapping:?} \
+                     was absent immediately after commit"
+                );
+                std::process::abort();
+            }
+            Err(error) => {
+                eprintln!(
+                    "carrick: FATAL: authenticate HVPatch COW mapping {new_mapping:?}: {error}"
+                );
+                std::process::abort();
+            }
+        }
+        emit_cow(carrick_observability::probes::HvpatchFrameCowPhase::Committed);
+        if let Some((va, leaf, expected_ipa, expected_ap)) = preserved_denied_receipt {
+            crate::probes::pt_alias_receipt(va, leaf, expected_ipa, expected_ap, 3);
+            if intent == carrick_aarch64::vmm::FrameCowWriteIntent::BackingMaintenance {
+                self.cow_deferred_publications
+                    .lock()
+                    .push(PendingFrameCowPublication { va, expected_ipa });
+            }
+        }
+
+        let semantic_host = unsafe { new_host.as_ptr().add(old_offset as usize) };
+        let alias = AliasBacking {
+            start: span.va,
+            ipa: new_ipa,
+            host_addr: semantic_host as usize,
+            size: span.len,
+            physical_ipa: new_physical_ipa,
+            physical_host_addr: new_host.as_ptr() as usize,
+            physical_size: CowArmedRanges::COMPOUND_SIZE as usize,
+            perms: u64::from(stage2_perms),
+            guest_writable: true,
+            sharing: GuestMappingSharing::Private,
+            ownership_scope: alias_ownership_scope(GuestMappingSharing::Private, self.mm_root_slot),
+            inventory_backing: backing,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+        };
+        register_shared_alias(alias);
+        self.mappings.push(HvfMappedRegion {
+            start: span.va,
+            ipa: new_ipa,
+            physical_ipa: new_physical_ipa,
+            end: span.va.saturating_add(span.len as u64),
+            host_addr: semantic_host,
+            size: CowArmedRanges::COMPOUND_SIZE as usize,
+            physical_size: CowArmedRanges::COMPOUND_SIZE as usize,
+            perms: stage2_perms,
+            memory: None,
+            host_mapping: Some(new_host),
+            is_dynamic_alias: true,
+            sharing: GuestMappingSharing::Private,
+            guest_writable: true,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+        });
+        self.cow_armed.lock().disarm(span);
+        Ok(true)
+    }
+
+    pub(crate) fn resolve_frame_cow_fault(
+        &mut self,
+        syndrome: u64,
+        far: u64,
+        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+    ) -> Result<bool, TrapError> {
+        if !is_stage1_cow_write_fault(syndrome) {
+            return Ok(false);
+        }
+        let fault_va = strip_pointer_tag(far);
+        let armed = self.cow_armed.lock().ranges.clone();
+        let mapping = self.mapping_for_range(fault_va, 1);
+        let write_denied = self.protections.range_write_denied(fault_va, 1);
+        let missing_private_arm = mapping.is_some_and(|mapping| {
+            mapping.guest_writable && mapping.sharing == GuestMappingSharing::Private
+        });
+        if self.cow_armed.lock().span_for(fault_va).is_none()
+            && missing_private_arm
+            && !armed.is_empty()
+        {
+            let mapping_shape = mapping.map(|mapping| {
+                (
+                    mapping.start,
+                    mapping.end,
+                    mapping.ipa,
+                    mapping.guest_writable,
+                    mapping.sharing,
+                )
+            });
+            return Err(TrapError::Hypervisor(format!(
+                "HVPatch private writable permission fault at VA 0x{fault_va:x} has no COW arm; mapping={mapping_shape:?} write_denied={write_denied} armed={armed:?}"
+            )));
+        }
+        self.perform_frame_cow(
+            fault_va,
+            carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible,
+            flush_stage1,
+        )
+    }
+
+    pub(crate) fn ensure_frame_cow_write(
+        &mut self,
+        va: u64,
+        len: usize,
+        intent: carrick_aarch64::vmm::FrameCowWriteIntent,
+        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+    ) -> Result<(), TrapError> {
+        if len == 0 {
+            return Ok(());
+        }
+        let start = strip_pointer_tag(va);
+        let end = start
+            .checked_add(len as u64)
+            .ok_or_else(|| TrapError::Hypervisor("HVPatch COW write range overflow".to_owned()))?;
+        let mut current = start;
+        while current < end {
+            if self.cow_armed.lock().span_for(current).is_some() {
+                if !self.perform_frame_cow(current, intent, flush_stage1)? {
+                    return Err(TrapError::Hypervisor(format!(
+                        "HVPatch COW write at 0x{current:x} remained armed"
+                    )));
+                }
+            }
+            let next = align_down(current, CowArmedRanges::COMPOUND_SIZE)
+                .saturating_add(CowArmedRanges::COMPOUND_SIZE);
+            current = next.min(end);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn observe_frame_cow_protection(
+        &mut self,
+        va: u64,
+        len: usize,
+        prot: u64,
+    ) -> Result<(), TrapError> {
+        const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
+        const AP_MASK: u64 = 0b11 << 6;
+        const AP_USER_RW: u64 = 0b01 << 6;
+        const AP_USER_RO: u64 = 0b11 << 6;
+        const VALID_PAGE: u64 = 0b11;
+        const NON_GLOBAL: u64 = 1 << 11;
+
+        if len == 0 {
+            return Ok(());
+        }
+        let end = va.checked_add(len as u64).ok_or_else(|| {
+            TrapError::Hypervisor("deferred COW protection range overflow".to_owned())
+        })?;
+        let pending: Vec<_> = self
+            .cow_deferred_publications
+            .lock()
+            .iter()
+            .copied()
+            .filter(|receipt| receipt.va >= va && receipt.va < end)
+            .collect();
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let page_table_host = self
+            .mapping_for_range(
+                crate::memory::LINUX_PAGE_TABLES_BASE,
+                carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+            )
+            .map(|mapping| mapping.host_addr)
+            .ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "deferred COW protection has no page-table backing".to_owned(),
+                )
+            })?;
+        let (expected_ap, phase, must_be_valid) = if prot & crate::linux_abi::LINUX_PROT_WRITE != 0
+        {
+            (AP_USER_RW, 4, true)
+        } else if prot & (crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_EXEC)
+            != 0
+        {
+            (AP_USER_RO, 5, true)
+        } else {
+            (AP_USER_RO, 6, false)
+        };
+
+        let page_tables = self.page_tables.lock();
+        let manager = page_tables.as_ref().ok_or_else(|| {
+            TrapError::Hypervisor("deferred COW protection has no page-table manager".to_owned())
+        })?;
+        let mut authenticated = Vec::with_capacity(pending.len());
+        for receipt in pending {
+            let live = unsafe { manager.debug_walk_host(page_table_host.cast_const(), receipt.va) };
+            let leaf = live[3];
+            let access_is_valid = leaf & VALID_PAGE == VALID_PAGE;
+            if leaf & PA_MASK_4KIB != receipt.expected_ipa & PA_MASK_4KIB
+                || leaf & NON_GLOBAL == 0
+                || leaf & AP_MASK != expected_ap
+                || access_is_valid != must_be_valid
+            {
+                return Err(TrapError::Hypervisor(format!(
+                    "deferred COW protection authentication failed at VA 0x{:x}: leaf=0x{leaf:x} expected_ipa=0x{:x} expected_ap=0x{expected_ap:x} valid={must_be_valid}",
+                    receipt.va, receipt.expected_ipa
+                )));
+            }
+            crate::probes::pt_alias_receipt(
+                receipt.va,
+                leaf,
+                receipt.expected_ipa,
+                expected_ap,
+                phase,
+            );
+            authenticated.push(receipt);
+        }
+        drop(page_tables);
+
+        self.cow_deferred_publications
+            .lock()
+            .retain(|receipt| !authenticated.contains(receipt));
+        Ok(())
+    }
+
     /// Create a fresh vCPU bound to this VM (the boot/clone/fork/reclaim
     /// vcpu_create; admission is the bounded scheduler's job, NOT this path).
     pub(crate) fn add_vcpu(
@@ -4380,7 +5472,7 @@ impl HvfVmState {
             // manager until the first real edit. The mailbox lives in a static
             // boot mapping whose guest-VA extent is unambiguous, so resolve that
             // mapping directly instead of paying a 1.8 MiB table clone solely to
-            // recover the process-bank IPA during publication.
+            // recover the root-slot/global-frame IPA during publication.
             .or_else(|| {
                 let mapping = self.mapping_for_range(address, size)?;
                 let offset = usize::try_from(address.checked_sub(mapping.start)?).ok()?;
@@ -4602,7 +5694,7 @@ impl HvfVmState {
         };
         // Mature VMM/root uses the IPA the dispatcher allocated from the global
         // alias arena. An in-process hvpatch mm relocates non-global aliases into
-        // its process bank; the returned GPA is authoritative for stage-1, while
+        // its mm scope; the returned GPA is authoritative for stage-1, while
         // dispatcher VMA metadata remains keyed by VA and needs no IPA.
         // hv_vm_map requires a 16 KiB-granular size; round the HOST mapping up
         // to the HVF granule. The stage-1 `map_aliased` (the engine, on the exact
@@ -4680,13 +5772,6 @@ impl HvfVmState {
             write: true,
             execute: true,
         });
-        let ipa = reserve_process_alias_ipa(
-            ipa,
-            physical_size as u64,
-            sharing,
-            self.process_bank,
-            self.process_alias_next.as_deref(),
-        )?;
         let r = unsafe { inventory_hv_vm_map(host.cast(), ipa, physical_size, u64::from(perms)) };
         crate::probes::hv_vm_map_alias(
             va,
@@ -4720,7 +5805,7 @@ impl HvfVmState {
             perms: u64::from(perms),
             guest_writable: alias_guest_writable,
             sharing,
-            ownership_scope: alias_ownership_scope(sharing, self.process_bank),
+            ownership_scope: alias_ownership_scope(sharing, self.mm_root_slot),
             inventory_backing,
             shared_key_base,
             shared_key_offset,
@@ -4728,9 +5813,11 @@ impl HvfVmState {
         self.mappings.push(HvfMappedRegion {
             start: va,
             ipa,
+            physical_ipa: ipa,
             end: guest_end,
             host_addr: host,
             size: physical_size,
+            physical_size,
             perms,
             memory: None,
             host_mapping: Some(host_mapping),
@@ -5074,12 +6161,45 @@ impl HvfVmState {
         address: u64,
         length: usize,
     ) -> Result<(), MemoryError> {
-        let Some(mapping) = self.mapping_for_range_mut(address, length) else {
-            return Err(MemoryError::OutOfBounds { address, length });
-        };
-        let offset = (address - mapping.start) as usize;
-        unsafe {
-            core::ptr::write_bytes(mapping.host_addr.add(offset), 0u8, length);
+        let address = strip_pointer_tag(address);
+        let mut cleared = 0usize;
+        while cleared < length {
+            let (chunk_va, chunk_len) = Self::guest_copy_chunk(address, cleared, length)?;
+            // munmap invalidates the leaf but intentionally preserves its PA.
+            // Backing maintenance runs before the replacement VMA is made
+            // guest-visible, so an ordinary hardware-valid translation cannot
+            // identify a retained private-COW fragment here. Resolve that PA
+            // through the typed invalid-leaf seam and scrub each page-bounded
+            // physical fragment independently.
+            let retained_ipa = self
+                .page_tables
+                .lock()
+                .as_ref()
+                .and_then(|manager| manager.translate_retained_output(chunk_va));
+            let target = retained_ipa
+                .and_then(|ipa| {
+                    Self::mapping_for_ipa_range(&self.mappings, ipa, chunk_len)
+                        .or_else(|| lookup_shared_alias(ipa).map(|b| MappingView::from_alias(&b)))
+                        .and_then(|mapping| {
+                            let offset = usize::try_from(ipa.checked_sub(mapping.ipa)?).ok()?;
+                            Some(unsafe { mapping.host_addr.add(offset) })
+                        })
+                })
+                .or_else(|| {
+                    self.mapping_for_range_mut(chunk_va, chunk_len)
+                        .and_then(|mapping| {
+                            let offset =
+                                usize::try_from(chunk_va.checked_sub(mapping.start)?).ok()?;
+                            Some(unsafe { mapping.host_addr.add(offset) })
+                        })
+                });
+            let Some(target) = target else {
+                return Err(MemoryError::OutOfBounds { address, length });
+            };
+            unsafe {
+                core::ptr::write_bytes(target, 0u8, chunk_len);
+            }
+            cleared += chunk_len;
         }
         Ok(())
     }
@@ -5322,7 +6442,13 @@ impl HvfVmState {
     }
 
     pub(crate) fn unregister_process_alias(&mut self, va: u64, len: usize) {
-        unregister_alias(va, len, self.process_bank);
+        self.cow_armed.lock().disarm(CowArmedSpan {
+            va,
+            len,
+            executable: false,
+            kernel_only: false,
+        });
+        unregister_alias(va, len, self.mm_root_slot);
     }
 
     /// Resolve a guest VA range to a [`MappingView`] (host pointer + bounds +
@@ -5340,22 +6466,25 @@ impl HvfVmState {
     /// resolve identically — no accessor mutates the region itself.
     fn mapping_for_range(&self, address: u64, length: usize) -> Option<MappingView> {
         let address = strip_pointer_tag(address);
-        let stage1_ipa = crate::memory::is_high_va(address)
-            .then(|| self.translate_va(address))
-            .flatten();
-        if let Some(idx) =
-            Self::mapping_index_for_range(&self.mappings, address, length, stage1_ipa)
-        {
-            return Some(self.mappings[idx].view());
-        }
-        // Cross-thread fallback (high-VA aliases only — low-VA regions are all
-        // boot-mapped into every thread's list). Key on the guest's OWN stage-1
-        // IPA so an overlapping MAP_FIXED alias resolves to the backing the guest
-        // actually sees.
+        let stage1_ipa = self.translate_va(address);
+        // First honor the exact output address in the authoritative stage-1
+        // graph. This is required for low-VA fork-COW overlays as well as the
+        // historical high-VA aliases: a sibling vCPU may not carry the overlay
+        // in its local metadata Vec even though it shares this mm's tables.
         if let Some(ipa) = stage1_ipa {
+            if let Some((_, mapping)) =
+                self.mappings.iter().enumerate().rev().find(|(_, mapping)| {
+                    Self::region_owns_ipa(mapping, ipa) && mapping.contains_range(address, length)
+                })
+            {
+                return Some(mapping.view());
+            }
             if let Some(b) = lookup_shared_alias(ipa) {
                 return Some(MappingView::from_alias(&b));
             }
+        }
+        if let Some(idx) = Self::mapping_index_for_range(&self.mappings, address, length, None) {
+            return Some(self.mappings[idx].view());
         }
         // VA-keyed fallback for when the IPA key is unavailable. `translate_va`
         // reads THIS thread's software stage-1 model, which can lack a high-VA
@@ -5368,7 +6497,7 @@ impl HvfVmState {
         // and picks newest-first, so it never resolves a partial or stale backing.
         // This closes the intermittent Go "read/write: bad address" EFAULT.
         if !self.range_no_access(address, length) {
-            if let Some(b) = lookup_shared_alias_by_va(address, length, self.process_bank) {
+            if let Some(b) = lookup_shared_alias_by_va(address, length, self.mm_root_slot) {
                 return Some(MappingView::from_alias(&b));
             }
         }
@@ -5436,9 +6565,9 @@ impl HvfVmState {
     }
 
     /// Resolve a raw stage-2 IPA without treating it as a guest virtual
-    /// address. Process-bank mappings deliberately have `start != ipa`; using
-    /// the VA lookup here would select no mapping (or, worse, a root-process
-    /// mapping at the same VA) when editing a child page-table backing.
+    /// address. Global-frame aliases deliberately have `start != ipa`; using
+    /// the VA lookup here could select no mapping (or an unrelated mapping at
+    /// the same VA) when editing a non-identity backing.
     fn mapping_for_ipa_range(
         mappings: &[HvfMappedRegion],
         ipa: u64,
@@ -5657,7 +6786,7 @@ impl HvfVmState {
                 .is_dynamic_alias
                 .then(|| {
                     registered_aliases.iter().find(|alias| {
-                        alias_matches_process_scope(alias.ownership_scope, self.process_bank)
+                        alias_matches_process_scope(alias.ownership_scope, self.mm_root_slot)
                             && alias.start == mapping.start
                             && alias.ipa == mapping.ipa
                             && alias.host_addr == mapping.host_addr as usize
@@ -5702,7 +6831,7 @@ impl HvfVmState {
             // Copy the entries out so the registry mutex isn't held across the
             // hv_vm_map syscalls (`AliasBacking` is `Copy`).
             for b in registered_aliases {
-                if !alias_matches_process_scope(b.ownership_scope, self.process_bank)
+                if !alias_matches_process_scope(b.ownership_scope, self.mm_root_slot)
                     || !mapped_extents.insert((b.physical_ipa, b.physical_size))
                     || !alias_backing_is_live(b.host_addr)
                 {
@@ -5814,14 +6943,15 @@ impl HvfVmState {
         }
     }
 
-    /// Multithreaded fork — PRE-`libc::fork` half (the forking thread, single
-    /// process). Snapshot every PRIVATE region into a child-private copy (guest
-    /// RAM is host-MAP_SHARED, so fork doesn't isolate it), capture the mapping
-    /// descriptors, and tear down the HVF VM via the raw API (a live VM at fork
-    /// time makes the child's `hv_vm_create` fail). Both sides then rebuild from
-    /// the stashed descriptors in `fork_rebuild`. Does NOT call `libc::fork` (the
-    /// shared engine does that) and does NOT snapshot the vCPU registers (the
-    /// engine snapshots separately and passes them into `fork_rebuild`).
+    /// Multithreaded legacy-VMM fork — PRE-`libc::fork` half (the forking
+    /// thread, single process). Capture mapping descriptors, clone only the
+    /// child's independently editable page-table/control backing, and tear down
+    /// the HVF VM via the raw API (a live VM at fork time makes the child's
+    /// `hv_vm_create` fail). Host-MAP_PRIVATE guest buffers receive ordinary
+    /// fork COW. Both sides then rebuild from the stashed descriptors in
+    /// `fork_rebuild`. Does NOT call `libc::fork` (the shared engine does that)
+    /// and does NOT snapshot the vCPU registers (the engine snapshots separately
+    /// and passes them into `fork_rebuild`).
     pub(crate) fn fork_prepare_and_teardown(&mut self) -> Result<(), TrapError> {
         let elapsed_us = |start: std::time::Instant| -> u64 {
             let micros = start.elapsed().as_micros();
@@ -5872,14 +7002,16 @@ impl HvfVmState {
             .mappings
             .iter()
             .filter(|mapping| {
-                mapping_is_current_for_process_fork(mapping, &aliases, self.process_bank)
+                mapping_is_current_for_process_fork(mapping, &aliases, self.mm_root_slot)
             })
             .map(|m| ForkMappingDesc {
                 start: m.start,
                 ipa: m.ipa,
+                physical_ipa: m.physical_ipa,
                 end: m.end,
                 host: ForkMappingHost::Borrowed(m.host_addr),
                 size: m.size,
+                physical_size: m.physical_size,
                 perms: m.perms,
                 is_dynamic_alias: m.is_dynamic_alias,
                 sharing: m.sharing,
@@ -5917,11 +7049,7 @@ impl HvfVmState {
                 if (share_vm && !is_page_table_region) || desc.sharing.shares_across_fork() {
                     ForkMappingHost::Borrowed(desc.host.ptr()) // shared mapping: child maps the SAME buffer
                 } else if is_page_table_region {
-                    ForkMappingHost::Owned(clone_region_for_child(
-                        desc.host.ptr(),
-                        desc.size,
-                        desc.start,
-                    )?)
+                    ForkMappingHost::Owned(clone_page_tables_for_child(desc.host.ptr(), desc.size)?)
                 } else {
                     // Bulk private guest RAM (data/bss/heap/stack/mmap arena) is
                     // host-MAP_PRIVATE, so libc::fork already COW-isolates it: the
@@ -5933,9 +7061,11 @@ impl HvfVmState {
             child_descs.push(ForkMappingDesc {
                 start: desc.start,
                 ipa: desc.ipa,
+                physical_ipa: desc.physical_ipa,
                 end: desc.end,
                 host: child_host,
                 size: desc.size,
+                physical_size: desc.physical_size,
                 perms: desc.perms,
                 is_dynamic_alias: desc.is_dynamic_alias,
                 sharing: desc.sharing,
@@ -6155,13 +7285,11 @@ impl HvfVmState {
             local_maps = local_maps.saturating_add(1);
             // Re-register every high-VA alias into the process-shared index with
             // THIS rebuild's host_addr. Critical for the CHILD: the index is
-            // COW-inherited from the parent pointing at the PARENT's backings, but
-            // a PRIVATE alias was just re-snapshotted to a NEW child buffer
-            // (child_descs / clone_region_for_child) — without this overwrite a
-            // child syscall would read/write the parent's backing (cross-process
-            // corruption) instead of its own copy. For the parent it's idempotent
-            // (same host_addr). Low-VA boot regions are not aliases (every thread
-            // has them) and are never in the index.
+            // COW-inherited from the parent. A PRIVATE alias names the same host
+            // VA in the child process but its host-MAP_PRIVATE fork view; this
+            // overwrite rebinds the process-local registry to that view. For the
+            // parent it is idempotent. Low-VA boot regions are not aliases (every
+            // thread has them) and are never in the index.
             if desc.is_dynamic_alias {
                 if let Some(previous) = alias_registry()
                     .lock()
@@ -6176,7 +7304,7 @@ impl HvfVmState {
                         } else {
                             previous.physical_host_addr
                         },
-                        ownership_scope: alias_ownership_scope(desc.sharing, self.process_bank),
+                        ownership_scope: alias_ownership_scope(desc.sharing, self.mm_root_slot),
                         ..previous
                     });
                 }
@@ -6184,9 +7312,11 @@ impl HvfVmState {
             self.mappings.push(HvfMappedRegion {
                 start: desc.start,
                 ipa: desc.ipa,
+                physical_ipa: desc.physical_ipa,
                 end: desc.end,
                 host_addr,
                 size: desc.size,
+                physical_size: desc.physical_size,
                 perms: desc.perms,
                 guest_writable: desc.guest_writable,
                 // No Memory object — the host buffer is either an inherited
@@ -6251,7 +7381,7 @@ impl HvfVmState {
             for sm in siblings {
                 if sm.is_dynamic_alias
                     && !aliases.iter().any(|alias| {
-                        alias_matches_process_scope(alias.ownership_scope, self.process_bank)
+                        alias_matches_process_scope(alias.ownership_scope, self.mm_root_slot)
                             && alias.start == sm.start
                             && alias.ipa == sm.ipa
                             && alias.host_addr == sm.host_addr
@@ -6283,9 +7413,11 @@ impl HvfVmState {
                 self.mappings.push(HvfMappedRegion {
                     start: sm.start,
                     ipa: sm.ipa,
+                    physical_ipa: sm.physical_ipa,
                     end: sm.end,
                     host_addr: sm.host_addr as *mut u8,
                     size: sm.size,
+                    physical_size: sm.physical_size,
                     perms: applevisor::memory::MemPerms::from(sm.perms),
                     guest_writable: sm.guest_writable,
                     memory: None,
@@ -6365,9 +7497,12 @@ impl HvfVmState {
             mailbox_slots: std::sync::Arc::clone(&self.mailbox_slots),
             syscall_transport: self.syscall_transport,
             persistent_vm_lifecycle: self.persistent_vm_lifecycle,
-            process_bank: self.process_bank,
-            process_alias_next: self.process_alias_next.clone(),
+            mm_root_slot: self.mm_root_slot,
             frame_inventory: self.frame_inventory.shared_ledger(),
+            cow_authority: self.cow_authority.clone(),
+            cow_identity: self.cow_identity,
+            cow_armed: std::sync::Arc::clone(&self.cow_armed),
+            cow_deferred_publications: std::sync::Arc::clone(&self.cow_deferred_publications),
         })
     }
 
@@ -6387,9 +7522,12 @@ impl HvfVmState {
             mailbox_slots,
             syscall_transport,
             persistent_vm_lifecycle,
-            process_bank,
-            process_alias_next,
+            mm_root_slot,
             frame_inventory,
+            cow_authority,
+            cow_identity,
+            cow_armed,
+            cow_deferred_publications,
         } = spec;
 
         // The spec captured `vm` at clone time. If a fork rebuilt the VM since
@@ -6406,8 +7544,7 @@ impl HvfVmState {
         let mut state = HvfVmState {
             _vm: std::mem::ManuallyDrop::new(vm),
             mappings: Vec::with_capacity(mappings.len()),
-            process_bank,
-            process_alias_next,
+            mm_root_slot,
             reclaim_snapshot: None,
             last_exit_class: 0,
             last_fault_esr: 0,
@@ -6426,6 +7563,11 @@ impl HvfVmState {
             fork_child_descs: Vec::new(),
             persistent_vm_lifecycle,
             frame_inventory: HvpatchFrameInventoryState::new(frame_inventory),
+            cow_authority,
+            cow_identity,
+            cow_armed,
+            cow_deferred_publications,
+            pending_fork_frame_receipts: Vec::new(),
         };
 
         for mapping in mappings {
@@ -6444,15 +7586,13 @@ impl HvfVmState {
 
     pub(crate) fn build_process_spec(
         &self,
-        bank_base: u64,
-        bank_size: u64,
+        root_slot_base: u64,
+        root_slot_size: u64,
         page_tables: &mut crate::page_table::PageTableManager,
         child_pid: i32,
         forking_tid: i32,
     ) -> Result<ProcessSpec, TrapError> {
         use carrick_observability::probes::{
-            HvpatchForkPrivateSnapshot, HvpatchForkPrivateSnapshotMethod,
-            HvpatchForkPrivateSnapshotOutcome, HvpatchForkPrivateSnapshotRole,
             HvpatchForkProcessSpecStage, HvpatchForkProcessSpecStagePhase,
         };
 
@@ -6471,10 +7611,10 @@ impl HvfVmState {
         crate::probes::hvpatch_fork_snapshot_begin(child_pid, forking_tid);
         let stage_started = std::time::Instant::now();
         const STAGE2_PAGE: u64 = 16 * 1024;
-        let bank_end = bank_base.checked_add(bank_size).ok_or_else(|| {
-            TrapError::Hypervisor("hvpatch child process bank overflow".to_owned())
+        let root_slot_end = root_slot_base.checked_add(root_slot_size).ok_or_else(|| {
+            TrapError::Hypervisor("hvpatch child stage-1 root slot overflow".to_owned())
         })?;
-        let mut cursor = bank_base;
+        let mut cursor = root_slot_base;
         let aliases = alias_registry().lock().clone();
         let mut source_mappings: Vec<ThreadMappingDesc> = self
             .mappings
@@ -6486,7 +7626,7 @@ impl HvfVmState {
                 aliases
                     .iter()
                     .find(|alias| {
-                        alias_matches_process_scope(alias.ownership_scope, self.process_bank)
+                        alias_matches_process_scope(alias.ownership_scope, self.mm_root_slot)
                             && alias.start == mapping.start
                             && alias.ipa == mapping.ipa
                             && alias.host_addr == mapping.host_addr as usize
@@ -6497,9 +7637,17 @@ impl HvfVmState {
             })
             .collect();
         let local_regions = source_mappings.len() as u64;
-        let local_ipas: std::collections::HashSet<u64> =
-            source_mappings.iter().map(|mapping| mapping.ipa).collect();
-        let missing = missing_process_aliases(&local_ipas, &aliases, self.process_bank);
+        // A structural boot mapping can physically contain a narrower semantic
+        // alias at the same IPA (the private-overlay aperture is the canonical
+        // case). Only an exact dynamic publication suppresses a registry row;
+        // keying every local descriptor by IPA hid MAP_FIXED private ownership
+        // from fork even though stage-1 already selected it.
+        let local_ipas: std::collections::HashSet<u64> = source_mappings
+            .iter()
+            .filter(|mapping| mapping.is_dynamic_alias)
+            .map(|mapping| mapping.ipa)
+            .collect();
+        let missing = missing_process_aliases(&local_ipas, &aliases, self.mm_root_slot);
         let candidate_regions = missing.len() as u64;
         let mut added_regions = 0_u64;
         let mut added_bytes = 0_u64;
@@ -6508,7 +7656,7 @@ impl HvfVmState {
         let mut largest_added_bytes = 0_u64;
         for alias in missing {
             // The registry is the authoritative live-alias inventory. Scope by
-            // mm bank above and require its retained host owner to be live, but
+            // mm root-slot scope above and require its retained host owner to be live, but
             // do not require a valid stage-1 leaf: a live PROT_NONE alias is
             // intentionally invalid in stage-1 and still must survive fork.
             if alias_backing_is_live(alias.host_addr)
@@ -6535,17 +7683,27 @@ impl HvfVmState {
         let mut mappings = Vec::with_capacity(source_mappings.len());
         let parent_inventory = self.frame_inventory.lock().extents.clone();
 
-        // Put the stage-1 backing at the bank root promised by TTBR, regardless
-        // of the boot-plan mapping order. Everything else follows compactly.
+        // Put the stage-1 backing at the root slot promised by TTBR. Guest
+        // frames retain their stable global IPAs and never enter this slot.
         let mut order: Vec<usize> = (0..source_mappings.len()).collect();
         order.sort_by_key(|&index| {
             u8::from(source_mappings[index].start != crate::memory::LINUX_PAGE_TABLES_BASE)
         });
         for index in order {
             let mapping = &source_mappings[index];
-            if let Some(parent_extent) =
-                inherited_fork_inventory_extent(mapping, &parent_inventory)?
-            {
+            let disposition = fork_mapping_disposition(mapping);
+            if matches!(
+                disposition,
+                ForkMappingDisposition::SharedFrameWritable
+                    | ForkMappingDisposition::SharedFrameReadOnly
+            ) {
+                let parent_extent = inherited_fork_inventory_extent(mapping, &parent_inventory)?
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor(format!(
+                            "HVPatch shared child extent IPA 0x{:x} size {} lacks parent inventory",
+                            mapping.physical_ipa, mapping.physical_size
+                        ))
+                    })?;
                 mappings.push(ProcessMappingDesc {
                     start: mapping.start,
                     ipa: mapping.ipa,
@@ -6563,48 +7721,87 @@ impl HvfVmState {
                     shared_key_base: mapping.shared_key_base,
                     shared_key_offset: mapping.shared_key_offset,
                     inherited_frame: Some(parent_extent.frame),
+                    inherited_mapping: Some(parent_extent.mapping),
                 });
                 continue;
             }
 
             const TWO_MIB: u64 = 2 * 1024 * 1024;
-            let packing_alignment = if mapping.start.is_multiple_of(TWO_MIB)
-                && (mapping.physical_size as u64) >= TWO_MIB
-            {
-                TWO_MIB
-            } else {
-                STAGE2_PAGE
+            let physical_ipa = match disposition {
+                ForkMappingDisposition::IndependentPageTables => {
+                    let packing_alignment = if mapping.start.is_multiple_of(TWO_MIB)
+                        && (mapping.physical_size as u64) >= TWO_MIB
+                    {
+                        TWO_MIB
+                    } else {
+                        STAGE2_PAGE
+                    };
+                    cursor = align_up(cursor, packing_alignment)?;
+                    let physical_ipa = cursor;
+                    cursor = cursor
+                        .checked_add(mapping.physical_size as u64)
+                        .ok_or_else(|| {
+                            TrapError::Hypervisor(
+                                "hvpatch child page-table root overflow".to_owned(),
+                            )
+                        })?;
+                    if cursor > root_slot_end {
+                        return Err(TrapError::Hypervisor(format!(
+                            "hvpatch child page tables need more than {}-byte root slot",
+                            root_slot_size
+                        )));
+                    }
+                    physical_ipa
+                }
+                ForkMappingDisposition::IndependentKernelState => {
+                    reserve_global_frame_ipa(mapping.physical_size as u64)?
+                }
+                ForkMappingDisposition::SharedFrameWritable
+                | ForkMappingDisposition::SharedFrameReadOnly => {
+                    return Err(TrapError::Hypervisor(
+                        "shared fork mapping escaped inherited-frame branch".to_owned(),
+                    ));
+                }
             };
-            cursor = align_up(cursor, packing_alignment)?;
-            let physical_ipa = cursor;
-            cursor = cursor
-                .checked_add(mapping.physical_size as u64)
-                .ok_or_else(|| TrapError::Hypervisor("hvpatch child bank overflow".to_owned()))?;
-            if cursor > bank_end {
-                return Err(TrapError::Hypervisor(format!(
-                    "hvpatch child address space needs more than {} GiB bank",
-                    bank_size >> 30
-                )));
-            }
-            let snapshot_started = std::time::Instant::now();
-            let remap = unsafe {
-                crate::host_mapping::OwnedHostMapping::remap_copy(
-                    mapping.physical_host_addr,
-                    mapping.physical_size,
-                    crate::host_mapping::HostMappingKind::ChildPrivateSnapshot,
-                )
+            // Per-mm page tables and EL1 control state are the only fresh fork
+            // frames.  Both are Carrick kernel state, not the guest-private
+            // mappings governed by permission-fault COW.
+            let host_kind = match disposition {
+                ForkMappingDisposition::IndependentPageTables => {
+                    crate::host_mapping::HostMappingKind::PrivateAnon
+                }
+                ForkMappingDisposition::IndependentKernelState => {
+                    crate::host_mapping::HostMappingKind::PerMmKernelState
+                }
+                ForkMappingDisposition::SharedFrameWritable
+                | ForkMappingDisposition::SharedFrameReadOnly => {
+                    return Err(TrapError::Hypervisor(
+                        "shared fork mapping escaped inherited-frame branch".to_owned(),
+                    ));
+                }
             };
-            let (host, snapshot_method) = match remap {
-                Ok(host) => (host, HvpatchForkPrivateSnapshotMethod::MachCowRemap),
-                Err(_) => (
-                    clone_region_for_child(
+            let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                mapping.physical_size,
+                host_kind,
+            )
+            .map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "allocate HVPatch child per-mm kernel backing: {error}"
+                ))
+            })?;
+            if disposition == ForkMappingDisposition::IndependentKernelState {
+                // Preserve the fork boundary's coherent control-state image;
+                // child identity/mailbox rebinding mutates this independent
+                // frame before entry.  This is a bounded Carrick-kernel copy,
+                // never a guest private whole-mapping snapshot.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
                         mapping.physical_host_addr,
+                        host.as_ptr(),
                         mapping.physical_size,
-                        mapping.start,
-                    )?,
-                    HvpatchForkPrivateSnapshotMethod::SparseCopyFallback,
-                ),
-            };
+                    );
+                }
+            }
             let semantic_physical_offset = mapping
                 .ipa
                 .checked_sub(mapping.physical_ipa)
@@ -6619,30 +7816,6 @@ impl HvfVmState {
                 .ok_or_else(|| {
                     TrapError::Hypervisor("hvpatch child alias IPA overflow".to_owned())
                 })?;
-            let snapshot_elapsed_ns = snapshot_started
-                .elapsed()
-                .as_nanos()
-                .min(u128::from(u64::MAX)) as u64;
-            if let Some(snapshot_role) = HvpatchForkPrivateSnapshotRole::from_footprint_class(
-                fork_footprint_class_id(mapping.start, false, mapping.guest_writable),
-            ) {
-                crate::probes::hvpatch_fork_private_snapshot(HvpatchForkPrivateSnapshot::new(
-                    child_pid,
-                    forking_tid,
-                    mapping.start,
-                    mapping.physical_size as u64,
-                    snapshot_elapsed_ns,
-                ));
-                crate::probes::hvpatch_fork_private_snapshot_outcome(
-                    HvpatchForkPrivateSnapshotOutcome::new(
-                        child_pid,
-                        forking_tid,
-                        mapping.start,
-                        snapshot_role,
-                        snapshot_method,
-                    ),
-                );
-            }
             let mapped = if (crate::memory::LINUX_KERNEL_REGION_BASE
                 ..crate::memory::LINUX_KERNEL_REGION_BASE + TWO_MIB)
                 .contains(&mapping.start)
@@ -6662,7 +7835,7 @@ impl HvfVmState {
             };
             mapped.map_err(|error| {
                 TrapError::Hypervisor(format!(
-                    "map hvpatch child VA 0x{:x} to bank IPA 0x{ipa:x}: {error:?}",
+                    "map hvpatch child VA 0x{:x} to global/root-slot IPA 0x{ipa:x}: {error:?}",
                     mapping.start
                 ))
             })?;
@@ -6684,27 +7857,76 @@ impl HvfVmState {
                 shared_key_base: mapping.shared_key_base,
                 shared_key_offset: mapping.shared_key_offset,
                 inherited_frame: None,
+                inherited_mapping: None,
             });
         }
         emit_stage(
-            HvpatchForkProcessSpecStagePhase::PrivateSnapshot,
+            HvpatchForkProcessSpecStagePhase::FramePlan,
             stage_started,
-            cursor.saturating_sub(bank_base),
+            cursor.saturating_sub(root_slot_base),
         );
 
         let stage_started = std::time::Instant::now();
-        for mapping in &mappings {
+        let mut child_pte_receipts = Vec::new();
+        for (index, mapping) in mappings.iter().enumerate() {
             let Some(translated) = page_tables.translate(mapping.start) else {
+                // A live PROT_NONE reservation or post-munmap physical owner
+                // intentionally has no valid stage-1 translation. It still
+                // belongs in the child's physical/frame inventory and COW-arm
+                // registry so a later mprotect/remap cannot expose the parent's
+                // frame, but there is no live PTE to authenticate at fork.
+                if self.protections.range_no_access(mapping.start, 1) {
+                    continue;
+                }
                 return Err(TrapError::Hypervisor(format!(
                     "hvpatch child stage-1 has no translation for VA 0x{:x}",
                     mapping.start
                 )));
             };
-            if translated != mapping.ipa {
+            // A completed COW is an overlay on the original physical extent:
+            // the old extent must remain in the child inventory for its
+            // unaffected leaves, while the newer 16 KiB descriptor owns this
+            // particular VA.  Validate against the last applicable overlay,
+            // matching the reverse-order syscall-memory lookup authority.
+            // Thread-local descriptor vectors and the process alias registry
+            // can contribute COW overlays in different orders. The shared
+            // stage-1 graph is authoritative, so authenticate its translation
+            // against any other exact overlay owner rather than assuming the
+            // winning overlay was appended after this descriptor.
+            let overlay_matches =
+                fork_translation_has_overlay_owner(&mappings, index, mapping.start, translated);
+            if translated != mapping.ipa && !overlay_matches {
                 return Err(TrapError::Hypervisor(format!(
                     "hvpatch child stage-1 VA 0x{:x} resolves to IPA 0x{translated:x}, expected 0x{:x}",
                     mapping.start, mapping.ipa
                 )));
+            }
+            if mapping.inherited_frame.is_some()
+                && mapping.sharing == GuestMappingSharing::Private
+                && !is_kernel_only_stage1_range(mapping.start, mapping.size)
+                && !overlay_matches
+            {
+                const VALID: u64 = 1;
+                const NON_GLOBAL: u64 = 1 << 11;
+                const AP_MASK: u64 = 0b11 << 6;
+                const AP_USER_RW: u64 = 0b01 << 6;
+                const AP_USER_RO: u64 = 0b11 << 6;
+                let leaf = page_tables.debug_walk(mapping.start)[3];
+                if leaf & VALID != 0 {
+                    let expected_ap =
+                        if mapping.guest_writable && mapping.sharing.shares_across_fork() {
+                            AP_USER_RW
+                        } else {
+                            AP_USER_RO
+                        };
+                    if leaf & AP_MASK != expected_ap || leaf & NON_GLOBAL == 0 {
+                        return Err(TrapError::Hypervisor(format!(
+                            "hvpatch child inherited stage-1 AP mismatch at VA 0x{:x}: leaf=0x{leaf:x} expected_ap=0x{expected_ap:x}",
+                            mapping.start
+                        )));
+                    }
+                    child_pte_receipts.push((mapping.start, mapping.ipa, expected_ap));
+                }
             }
         }
         emit_stage(
@@ -6727,9 +7949,9 @@ impl HvfVmState {
             .ok_or_else(|| {
                 TrapError::Hypervisor("hvpatch child page-table mapping absent".to_owned())
             })?;
-        if table.ipa != bank_base || table_bytes.len() > table.size {
+        if table.ipa != root_slot_base || table_bytes.len() > table.size {
             return Err(TrapError::Hypervisor(
-                "hvpatch child page-table bank layout mismatch".to_owned(),
+                "hvpatch child page-table root-slot layout mismatch".to_owned(),
             ));
         }
         unsafe {
@@ -6738,6 +7960,20 @@ impl HvfVmState {
                 table.host.ptr(),
                 table_bytes.len(),
             );
+        }
+        for (va, expected_ipa, expected_ap) in child_pte_receipts {
+            let shadow = page_tables.debug_walk(va);
+            let live = unsafe { page_tables.debug_walk_host(table.host.ptr().cast_const(), va) };
+            if shadow != live
+                || live[3] & 0x0000_FFFF_FFFF_F000 != expected_ipa & 0x0000_FFFF_FFFF_F000
+                || live[3] & (0b11 << 6) != expected_ap
+                || live[3] & (1 << 11) == 0
+            {
+                return Err(TrapError::Hypervisor(format!(
+                    "hvpatch child live stage-1 receipt mismatch at VA 0x{va:x}: shadow={shadow:x?} live={live:x?} expected_ipa=0x{expected_ipa:x} expected_ap=0x{expected_ap:x}"
+                )));
+            }
+            crate::probes::pt_alias_receipt(va, live[3], expected_ipa, expected_ap, 1);
         }
         emit_stage(
             HvpatchForkProcessSpecStagePhase::TablePublish,
@@ -6757,7 +7993,7 @@ impl HvfVmState {
             private_added_regions,
             shared_added_regions,
             largest_added_bytes,
-            cursor.saturating_sub(bank_base),
+            cursor.saturating_sub(root_slot_base),
         );
 
         let stage_started = std::time::Instant::now();
@@ -6791,12 +8027,9 @@ impl HvfVmState {
             mailbox_slots: std::sync::Arc::clone(&self.mailbox_slots),
             syscall_transport: self.syscall_transport,
             persistent_vm_lifecycle: self.persistent_vm_lifecycle,
-            process_bank: (bank_base, bank_size),
-            process_alias_next: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(align_up(
-                cursor,
-                2 * 1024 * 1024,
-            )?)),
+            mm_root_slot: (root_slot_base, root_slot_size),
             frame_inventory,
+            cow_armed: std::sync::Arc::new(parking_lot::Mutex::new(self.cow_armed.lock().clone())),
         };
         emit_stage(
             HvpatchForkProcessSpecStagePhase::BackendSpecFinalize,
@@ -6815,6 +8048,7 @@ impl HvfVmState {
         let mut inventory_mappings = Vec::with_capacity(spec.mappings.len());
         let mut inventory_extent_keys = std::collections::BTreeSet::new();
         let mut aliases_to_publish = Vec::new();
+        let mut pending_fork_frame_receipts = Vec::new();
         let mut physical_mutated = false;
         for mapping in spec.mappings {
             let semantic_physical_offset = mapping
@@ -6835,7 +8069,7 @@ impl HvfVmState {
             let host_addr = mapping
                 .physical_host_addr
                 .wrapping_add(semantic_physical_offset);
-            if !mapping.sharing.shares_across_fork() {
+            if process_mapping_needs_stage2_install(mapping.inherited_frame) {
                 let rc = unsafe {
                     inventory_hv_vm_map(
                         mapping.physical_host_addr.cast(),
@@ -6873,7 +8107,10 @@ impl HvfVmState {
                         }
                     },
                     mapping.inherited_frame,
+                    mapping.inherited_mapping,
                     mapping.inventory_backing,
+                    mapping.sharing,
+                    mapping.guest_writable,
                 ));
             }
             if mapping.is_dynamic_alias {
@@ -6896,15 +8133,17 @@ impl HvfVmState {
                 aliases_to_publish.push(if mapping.sharing.uses_global_ipa() {
                     alias
                 } else {
-                    rebind_inherited_alias_to_process(alias, spec.process_bank)
+                    rebind_inherited_alias_to_process(alias, spec.mm_root_slot)
                 });
             }
             mapped.push(HvfMappedRegion {
                 start: mapping.start,
                 ipa: mapping.ipa,
+                physical_ipa: mapping.physical_ipa,
                 end: mapping.end,
                 host_addr,
                 size: mapping.physical_size,
+                physical_size: mapping.physical_size,
                 perms: mapping.perms,
                 guest_writable: mapping.guest_writable,
                 memory: None,
@@ -6922,8 +8161,18 @@ impl HvfVmState {
                     "HVPatch child materialized without frame inventory reservation".to_owned(),
                 )
             })?;
-            for (gpa, length, permissions, inherited_frame, backing) in inventory_mappings {
-                if let Err(error) = Self::stage_mapping(
+            for (
+                gpa,
+                length,
+                permissions,
+                inherited_frame,
+                inherited_mapping,
+                backing,
+                sharing,
+                guest_writable,
+            ) in inventory_mappings
+            {
+                let staged = match Self::stage_mapping(
                     &mut inventory,
                     &mut reservation,
                     gpa,
@@ -6932,8 +8181,30 @@ impl HvfVmState {
                     backing,
                     inherited_frame,
                 ) {
-                    eprintln!("carrick: FATAL: stage inventory after HVPatch child map: {error}");
-                    std::process::abort();
+                    Ok(staged) => staged,
+                    Err(error) => {
+                        eprintln!(
+                            "carrick: FATAL: stage inventory after HVPatch child map: {error}"
+                        );
+                        std::process::abort();
+                    }
+                };
+                if let (Some(parent_mapping), Some(frame)) = (inherited_mapping, inherited_frame)
+                    && (guest_writable || sharing.shares_across_fork())
+                {
+                    let kind = if sharing.shares_across_fork() {
+                        carrick_observability::probes::HvpatchForkFrameKind::Shared
+                    } else {
+                        carrick_observability::probes::HvpatchForkFrameKind::PrivateCow
+                    };
+                    pending_fork_frame_receipts.push(PendingForkFrameReceipt {
+                        kind,
+                        parent_mapping,
+                        child_mapping: staged.mapping,
+                        frame,
+                        ipa: gpa,
+                        length,
+                    });
                 }
             }
             inventory.initialized = true;
@@ -6942,8 +8213,7 @@ impl HvfVmState {
         let state = HvfVmState {
             _vm: std::mem::ManuallyDrop::new(spec.vm),
             mappings: mapped,
-            process_bank: Some(spec.process_bank),
-            process_alias_next: Some(spec.process_alias_next),
+            mm_root_slot: Some(spec.mm_root_slot),
             reclaim_snapshot: None,
             last_exit_class: 0,
             last_fault_esr: 0,
@@ -6962,13 +8232,18 @@ impl HvfVmState {
             fork_child_descs: Vec::new(),
             persistent_vm_lifecycle: spec.persistent_vm_lifecycle,
             frame_inventory: HvpatchFrameInventoryState::new(spec.frame_inventory),
+            cow_authority: None,
+            cow_identity: None,
+            cow_armed: spec.cow_armed,
+            cow_deferred_publications: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            pending_fork_frame_receipts,
         };
         let mailbox = state.allocate_mailbox_for_vcpu(&vcpu)?;
         // The child address space, frame inventory, and mailbox are now fully
         // committed. Publish semantic alias fragments only after every
         // fallible installation step so an aborted child cannot advertise
         // backing presence. This host process is the fork child, so rebinding
-        // a shared-anonymous alias to the new bank cannot affect its parent.
+        // a shared-anonymous alias to the new mm root scope cannot affect its parent.
         for alias in aliases_to_publish {
             register_shared_alias(alias);
         }
@@ -7021,16 +8296,24 @@ impl HvfVmState {
                 }
                 return Err(error);
             }
+            if let Err(error) = release_global_frame_ipa(ipa, size as u64) {
+                eprintln!(
+                    "carrick: FATAL: exec-retired HVPatch frame has inconsistent global IPA lifetime: {error}"
+                );
+                std::process::abort();
+            }
             physical_mutated = true;
         }
         Ok(extents)
     }
 
-    fn bank_exec_plan(&self, plan: &GuestMappingPlan) -> Result<GuestMappingPlan, TrapError> {
-        let Some((bank_base, bank_size)) = self.process_bank else {
+    fn global_frame_exec_plan(
+        &self,
+        plan: &GuestMappingPlan,
+    ) -> Result<GuestMappingPlan, TrapError> {
+        let Some((root_slot_base, root_slot_size)) = self.mm_root_slot else {
             return Ok(plan.clone());
         };
-        let started = std::time::Instant::now();
         let old_root = plan.stage1_page_tables_base.ok_or_else(|| {
             TrapError::Hypervisor("hvpatch exec image has no stage-1 tables".to_owned())
         })?;
@@ -7041,82 +8324,46 @@ impl HvfVmState {
             .ok_or_else(|| {
                 TrapError::Hypervisor("hvpatch exec page-table mapping absent".to_owned())
             })?;
-        let cache_enabled = exec_bank_layout_cache_enabled();
-        let cache_key = exec_bank_layout_key(plan, bank_base, bank_size, old_root, table_index);
-        if cache_enabled {
-            let source_table = &plan.mappings[table_index].image;
-            let (cached, cache_entries) = {
-                let cache = exec_bank_layout_cache().lock();
-                (
-                    cache
-                        .get(&cache_key)
-                        .filter(|cached| {
-                            cached.source_table.as_slice() == source_table.as_slice()
-                                && cached.ipa_starts.len() == plan.mappings.len()
-                        })
-                        .cloned(),
-                    cache.len() as u64,
-                )
-            };
-            if let Some(cached) = cached {
-                let mut banked = plan.clone();
-                for (mapping, ipa_start) in banked.mappings.iter_mut().zip(cached.ipa_starts.iter())
-                {
-                    mapping.ipa_start = *ipa_start;
-                }
-                let table = &mut banked.mappings[table_index];
-                table.image = cached.banked_table;
-                table.payload_size = table.image.len() as u64;
-                banked.stage1_page_tables_base = Some(bank_base);
-                let elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-                crate::probes::hvpatch_exec_bank_layout(
-                    carrick_observability::probes::HvpatchExecBankLayout::new(
-                        carrick_observability::probes::HvpatchExecBankLayoutPhase::CacheHit,
-                        bank_base,
-                        banked.mappings.len() as u64,
-                        cache_entries,
-                        elapsed_ns,
-                    ),
-                );
-                return Ok(banked);
-            }
-        }
-        let mut banked = plan.clone();
+        let mut global = plan.clone();
         let mut page_tables = crate::page_table::PageTableManager::new(
-            banked.mappings[table_index].image.as_ref().clone(),
+            global.mappings[table_index].image.as_ref().clone(),
             old_root,
         );
-        page_tables.rebase(bank_base).map_err(|error| {
+        page_tables.rebase(root_slot_base).map_err(|error| {
             TrapError::Hypervisor(format!("rebase hvpatch exec page tables: {error:?}"))
         })?;
 
-        let bank_end = bank_base.checked_add(bank_size).ok_or_else(|| {
-            TrapError::Hypervisor("hvpatch exec process-bank overflow".to_owned())
-        })?;
-        let mut order: Vec<usize> = (0..banked.mappings.len()).collect();
+        let mut order: Vec<usize> = (0..global.mappings.len()).collect();
         order.sort_by_key(|index| u8::from(*index != table_index));
-        let mut cursor = bank_base;
         const TWO_MIB: u64 = 2 * 1024 * 1024;
         for index in order {
-            let mapping = &mut banked.mappings[index];
-            let alignment =
-                if mapping.guest_start.is_multiple_of(TWO_MIB) && mapping.mapped_size >= TWO_MIB {
+            let mapping = &mut global.mappings[index];
+            let ipa = if index == table_index {
+                if mapping.mapped_size > root_slot_size {
+                    return Err(TrapError::Hypervisor(format!(
+                        "hvpatch stage-1 root needs {} bytes, slot has {root_slot_size}",
+                        mapping.mapped_size
+                    )));
+                }
+                root_slot_base
+            } else {
+                let alignment = if mapping.guest_start.is_multiple_of(TWO_MIB)
+                    && mapping.mapped_size >= TWO_MIB
+                {
                     TWO_MIB
                 } else {
                     HVF_PAGE_SIZE
                 };
-            cursor = align_up(cursor, alignment)?;
-            let ipa = cursor;
-            cursor = cursor
-                .checked_add(mapping.mapped_size)
-                .ok_or(TrapError::MappingOverflow {
-                    guest_start: mapping.guest_start,
-                    mapped_size: mapping.mapped_size,
-                })?;
-            if cursor > bank_end {
+                reserve_global_frame_ipa_aligned(mapping.mapped_size, alignment)?
+            };
+            if index == table_index
+                && ipa
+                    .checked_add(mapping.mapped_size)
+                    .is_none_or(|end| end > root_slot_base.saturating_add(root_slot_size))
+            {
                 return Err(TrapError::Hypervisor(format!(
-                    "hvpatch exec image needs more than {} GiB bank",
-                    bank_size >> 30
+                    "hvpatch stage-1 root mapping escapes slot 0x{root_slot_base:x}..0x{:x}",
+                    root_slot_base.saturating_add(root_slot_size)
                 )));
             }
             mapping.ipa_start = ipa;
@@ -7135,12 +8382,12 @@ impl HvfVmState {
             };
             remap.map_err(|error| {
                 TrapError::Hypervisor(format!(
-                    "bank hvpatch exec VA 0x{:x}: {error:?}",
+                    "plan global-frame HVPatch exec VA 0x{:x}: {error:?}",
                     mapping.guest_start
                 ))
             })?;
         }
-        for mapping in &banked.mappings {
+        for mapping in &global.mappings {
             if page_tables.translate(mapping.guest_start) != Some(mapping.ipa_start) {
                 return Err(TrapError::Hypervisor(format!(
                     "hvpatch exec translation mismatch for VA 0x{:x}",
@@ -7151,57 +8398,23 @@ impl HvfVmState {
         carrick_aarch64::engine::reserve_hvpatch_process_apertures(&mut page_tables).map_err(
             |error| {
                 TrapError::Hypervisor(format!(
-                    "reserve hvpatch exec process-bank apertures: {error:?}"
+                    "reserve hvpatch exec root-slot/global-frame apertures: {error:?}"
                 ))
             },
         )?;
         let table_bytes = page_tables.into_bytes();
-        let banked_table = {
-            let table = &mut banked.mappings[table_index];
-            if table.ipa_start != bank_base || table_bytes.len() > table.mapped_size as usize {
+        {
+            let table = &mut global.mappings[table_index];
+            if table.ipa_start != root_slot_base || table_bytes.len() > table.mapped_size as usize {
                 return Err(TrapError::Hypervisor(
-                    "hvpatch exec page-table bank layout mismatch".to_owned(),
+                    "hvpatch exec page-table root-slot layout mismatch".to_owned(),
                 ));
             }
             table.image = table_bytes.into();
             table.payload_size = table.image.len() as u64;
-            std::sync::Arc::clone(&table.image)
-        };
-        banked.stage1_page_tables_base = Some(bank_base);
-        let cache_entries = if cache_enabled {
-            let cached = CachedExecBankLayout {
-                source_table: std::sync::Arc::clone(&plan.mappings[table_index].image),
-                ipa_starts: banked
-                    .mappings
-                    .iter()
-                    .map(|mapping| mapping.ipa_start)
-                    .collect::<Vec<_>>()
-                    .into(),
-                banked_table,
-            };
-            let mut cache = exec_bank_layout_cache().lock();
-            if cache.len() >= EXEC_BANK_LAYOUT_CACHE_CAPACITY
-                && !cache.contains_key(&cache_key)
-                && let Some(victim) = cache.keys().next().cloned()
-            {
-                cache.remove(&victim);
-            }
-            cache.insert(cache_key, cached);
-            cache.len() as u64
-        } else {
-            0
-        };
-        let elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-        crate::probes::hvpatch_exec_bank_layout(
-            carrick_observability::probes::HvpatchExecBankLayout::new(
-                carrick_observability::probes::HvpatchExecBankLayoutPhase::CacheMiss,
-                bank_base,
-                banked.mappings.len() as u64,
-                cache_entries,
-                elapsed_ns,
-            ),
-        );
-        Ok(banked)
+        }
+        global.stage1_page_tables_base = Some(root_slot_base);
+        Ok(global)
     }
 
     /// `execve(2)` image replacement. Ordinary VMM tears down and rebuilds the
@@ -7233,35 +8446,35 @@ impl HvfVmState {
         } else {
             None
         };
-        let bank_plan_started = std::time::Instant::now();
-        let mut banked_plan = self.bank_exec_plan(plan)?;
-        let bank_plan_elapsed_ns = bank_plan_started
+        let frame_plan_started = std::time::Instant::now();
+        let mut global_plan = self.global_frame_exec_plan(plan)?;
+        let frame_plan_elapsed_ns = frame_plan_started
             .elapsed()
             .as_nanos()
             .min(u128::from(u64::MAX)) as u64;
-        let replacement_mapping_count = banked_plan.mappings.len() as u64;
-        let replacement_mapped_bytes = banked_plan
+        let replacement_mapping_count = global_plan.mappings.len() as u64;
+        let replacement_mapped_bytes = global_plan
             .mappings
             .iter()
             .map(|mapping| mapping.mapped_size)
             .sum::<u64>();
         crate::probes::hvpatch_exec_replace_stage(
             carrick_observability::probes::HvpatchExecReplaceStage::new(
-                carrick_observability::probes::HvpatchExecReplaceStagePhase::BankPlan,
-                bank_plan_elapsed_ns,
+                carrick_observability::probes::HvpatchExecReplaceStagePhase::FramePlan,
+                frame_plan_elapsed_ns,
                 replacement_mapping_count,
                 replacement_mapped_bytes,
             ),
         );
         let private_file_artifacts_started = std::time::Instant::now();
         if self.persistent_vm_lifecycle {
-            attach_exec_private_file_backings(&mut banked_plan)?;
+            attach_exec_private_file_backings(&mut global_plan)?;
         }
         let private_file_artifacts_elapsed_ns = private_file_artifacts_started
             .elapsed()
             .as_nanos()
             .min(u128::from(u64::MAX)) as u64;
-        let plan = &banked_plan;
+        let plan = &global_plan;
         let emit_replace_stage =
             |phase: carrick_observability::probes::HvpatchExecReplaceStagePhase,
              started: std::time::Instant| {
@@ -7283,25 +8496,6 @@ impl HvfVmState {
                 replacement_mapped_bytes,
             ),
         );
-        let process_alias_next = self
-            .process_bank
-            .map(|(bank_base, bank_size)| {
-                let bank_end = bank_base.checked_add(bank_size).ok_or_else(|| {
-                    TrapError::Hypervisor("hvpatch exec process-bank overflow".to_owned())
-                })?;
-                let static_end = plan
-                    .mappings
-                    .iter()
-                    .filter(|mapping| {
-                        mapping.ipa_start >= bank_base && mapping.ipa_start < bank_end
-                    })
-                    .filter_map(|mapping| mapping.ipa_start.checked_add(mapping.mapped_size))
-                    .max()
-                    .unwrap_or(bank_base);
-                align_up(static_end, 2 * 1024 * 1024)
-            })
-            .transpose()?;
-
         // Preserve `is_forked_child` across execve. A process that descended from
         // the original `carrick run` invocation should keep using the
         // `_exit`-without-JSON shutdown path even after it execve's into a
@@ -7356,7 +8550,9 @@ impl HvfVmState {
         let alias_cleanup_started = std::time::Instant::now();
         if self.persistent_vm_lifecycle {
             alias_registry().lock().retain(|alias| {
-                !retired_physical_extents.contains(&(alias.physical_ipa, alias.physical_size))
+                !alias_is_owned_by_process(alias.ownership_scope, self.mm_root_slot)
+                    && !retired_physical_extents
+                        .contains(&(alias.physical_ipa, alias.physical_size))
             });
         } else {
             alias_registry().lock().clear();
@@ -7372,7 +8568,8 @@ impl HvfVmState {
             // this host allocation, so preserve that backing until VM teardown.
             let mut retained_backings = Vec::new();
             for mapping in std::mem::take(&mut self.mappings) {
-                if retired_physical_extents.contains(&(mapping.ipa, mapping.size)) {
+                if retired_physical_extents.contains(&(mapping.physical_ipa, mapping.physical_size))
+                {
                     drop(mapping);
                 } else {
                     retained_backings.push(mapping);
@@ -7398,9 +8595,15 @@ impl HvfVmState {
         // execve replaces the address space; any prior PROT_NONE ranges are gone.
         self.protections = std::sync::Arc::new(MemoryProtections::default());
         self.seed_readonly_spans_from_plan(plan);
+        // Exec replaces the complete address space.  Fork-COW arming belongs
+        // to the retired image and can overlap unrelated VAs in the new one;
+        // retaining it turns ordinary loader writes into COW transactions
+        // against the replacement mm.
+        self.cow_armed = std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default()));
+        self.cow_deferred_publications = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
         // The shared AArch64 engine already builds this editor lazily from the
         // live page-table backing on its first real edit. Keeping an eager
-        // manager here cloned the complete 1.8 MiB banked table on every exec,
+        // manager here cloned the complete 1.8 MiB root-slot table on every exec,
         // even for short-lived compiler children that never mmap/mprotect.
         // Mailbox publication resolves its static boot mapping directly; an
         // in-process fork below explicitly materializes the manager on demand.
@@ -7408,7 +8611,7 @@ impl HvfVmState {
         let exec_page_tables = if lazy_exec_page_tables_enabled() {
             None
         } else {
-            self.process_bank.and_then(|_| {
+            self.mm_root_slot.and_then(|_| {
                 let root = plan.stage1_page_tables_base?;
                 let table = plan
                     .mappings
@@ -7421,8 +8624,6 @@ impl HvfVmState {
             })
         };
         self.page_tables = std::sync::Arc::new(parking_lot::Mutex::new(exec_page_tables));
-        self.process_alias_next = process_alias_next
-            .map(|next| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(next)));
         // execve is a fresh single-threaded image. Give it a fresh allocator and
         // lease so no pre-exec logical-vCPU ownership can leak into the new VM.
         self.mailbox_slots = std::sync::Arc::new(MailboxSlotAllocator::new());
@@ -7915,6 +9116,14 @@ impl HvfInner {
                 let elr_el1 = vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
                 let far_el1 = vcpu.get_sys_reg(SysReg::FAR_EL1).unwrap_or(0);
                 let spsr_el1 = vcpu.get_sys_reg(SysReg::SPSR_EL1).unwrap_or(0);
+                if is_stage1_cow_write_fault(esr_el1) {
+                    vcpu.set_reg(Reg::PC, elr_el1).map_err(hvf_error)?;
+                    vcpu.set_reg(Reg::CPSR, spsr_el1).map_err(hvf_error)?;
+                    return Ok(Aarch64Exit::Stage1CowFault {
+                        syndrome: esr_el1,
+                        far: far_el1,
+                    });
+                }
                 let ec = (esr_el1 >> 26) & 0x3f;
                 let mailbox_diagnostics = mailbox.diagnostics();
                 eprintln!(
@@ -8173,7 +9382,39 @@ unsafe fn inventory_hv_vm_map(
     size: usize,
     permissions: u64,
 ) -> applevisor_sys::hv_return_t {
-    unsafe { applevisor_sys::hv_vm_map(host, ipa, size, permissions) }
+    let result = unsafe { applevisor_sys::hv_vm_map(host, ipa, size, permissions) };
+    if result == 0 {
+        emit_global_frame_stage2(
+            carrick_observability::probes::HvpatchGlobalFrameStage2Phase::Mapped,
+            ipa,
+            size,
+            host as u64,
+            permissions,
+        );
+    }
+    result
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn emit_global_frame_stage2(
+    phase: carrick_observability::probes::HvpatchGlobalFrameStage2Phase,
+    ipa: u64,
+    size: usize,
+    host_addr: u64,
+    permissions: u64,
+) {
+    let event = carrick_observability::probes::HvpatchGlobalFrameStage2::new(
+        phase,
+        ipa,
+        size as u64,
+        host_addr,
+        permissions,
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("carrick: FATAL: construct global-frame stage-2 receipt: {error}");
+        std::process::abort();
+    });
+    crate::probes::hvpatch_global_frame_stage2(event);
 }
 
 /// Serialize lazy replay and make a sibling that lost the race observe the
@@ -8206,6 +9447,13 @@ unsafe fn inventory_hv_vm_unmap(ipa: u64, size: usize) -> applevisor_sys::hv_ret
     let result = unsafe { applevisor_sys::hv_vm_unmap(ipa, size) };
     if result == 0 {
         forget_replay_extent(ipa, size);
+        emit_global_frame_stage2(
+            carrick_observability::probes::HvpatchGlobalFrameStage2Phase::Unmapped,
+            ipa,
+            size,
+            0,
+            0,
+        );
     }
     result
 }
@@ -8298,7 +9546,7 @@ const FORK_FOOTPRINT_FLAG_COW_COPY: u64 = 1 << 2;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const FORK_FOOTPRINT_FLAG_GUEST_WRITABLE: u64 = 1 << 3;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const FORK_FOOTPRINT_FLAG_CHILD_SNAPSHOT: u64 = 1 << 4;
+const FORK_FOOTPRINT_FLAG_INDEPENDENT_STAGE1: u64 = 1 << 4;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Clone, Copy, Default)]
@@ -8345,7 +9593,7 @@ fn fork_footprint_flags(m: &HvfMappedRegion) -> u64 {
     if m.sharing.shares_across_fork() {
         flags |= FORK_FOOTPRINT_FLAG_PARENT_SHARED;
     } else if m.start == crate::memory::LINUX_PAGE_TABLES_BASE {
-        flags |= FORK_FOOTPRINT_FLAG_CHILD_SNAPSHOT;
+        flags |= FORK_FOOTPRINT_FLAG_INDEPENDENT_STAGE1;
     } else {
         flags |= FORK_FOOTPRINT_FLAG_COW_COPY;
     }
@@ -8425,18 +9673,18 @@ fn set_region_fork_inheritance(host_addr: *mut u8, size: usize, inherit: libc::c
     let _ = rc;
 }
 
-/// same pages. Called pre-fork while the guest vCPU is suspended (atomic, no
-/// race). Only resident pages are copied (mincore-gated) so the snapshot is
-/// sparse; on mincore failure we fall back to a full copy (correct, slower).
+/// Create the independent stage-1 table backing required by a legacy VMM fork.
+/// Called pre-fork while the guest vCPU is suspended (atomic, no race). This is
+/// page-table/control state, never an alternate private guest-frame snapshot
+/// authority.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn clone_region_for_child(
+fn clone_page_tables_for_child(
     src: *mut u8,
     size: usize,
-    guest_start: u64,
 ) -> Result<crate::host_mapping::OwnedHostMapping, TrapError> {
     let dst = crate::host_mapping::OwnedHostMapping::map_shared_anon(
         size,
-        crate::host_mapping::HostMappingKind::ChildPrivateSnapshot,
+        crate::host_mapping::HostMappingKind::PerMmKernelState,
     )
     .map_err(|error| {
         TrapError::Hypervisor(format!(
@@ -8444,51 +9692,7 @@ fn clone_region_for_child(
         ))
     })?;
     let dst_ptr = dst.as_ptr();
-    let page = {
-        let p = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        if p <= 0 { 16 * 1024 } else { p as usize }
-    };
-    // Bound the residency scan to the region's used prefix. The 32 GiB mmap
-    // arena is mapped once but the guest only bump-allocates a sliver from its
-    // base; `mincore` over the full window walks all ~2M pages (~470 ms/fork —
-    // the dominant cost of any subprocess-spawning guest). The dispatcher's
-    // arena high-water (published into GUEST_ARENA_HIGH_WATER by handle_fork)
-    // says the guest has only touched `[LINUX_MMAP_BASE, hw)`; pages past it are
-    // untouched in the parent too, so the child's freshly-zeroed snapshot needs
-    // no copy there. Other regions (heap, stack, trampolines) keep the full
-    // scan. `u64::MAX` default ⇒ full scan (non-fork callers / tests).
-    let scan_size = if guest_start == crate::memory::LINUX_MMAP_BASE {
-        let hw = GUEST_ARENA_HIGH_WATER.load(std::sync::atomic::Ordering::SeqCst);
-        hw.saturating_sub(guest_start)
-            .try_into()
-            .unwrap_or(size)
-            .min(size)
-    } else {
-        size
-    };
-    if scan_size == 0 {
-        return Ok(dst); // nothing resident to copy; dst stays lazily zero
-    }
-    let n_pages = scan_size.div_ceil(page);
-    let mut resident = vec![0u8; n_pages];
-    let rc = unsafe {
-        libc::mincore(
-            src as *mut libc::c_void,
-            scan_size,
-            resident.as_mut_ptr() as *mut libc::c_char,
-        )
-    };
-    if rc != 0 {
-        unsafe { std::ptr::copy_nonoverlapping(src, dst_ptr, size) };
-        return Ok(dst);
-    }
-    for (i, &flag) in resident.iter().enumerate() {
-        if flag & 1 != 0 {
-            let off = i * page;
-            let len = page.min(size - off);
-            unsafe { std::ptr::copy_nonoverlapping(src.add(off), dst_ptr.add(off), len) };
-        }
-    }
+    unsafe { std::ptr::copy_nonoverlapping(src, dst_ptr, size) };
     Ok(dst)
 }
 
@@ -8504,8 +9708,9 @@ fn map_region_raw(
     // and a later guest load observe different memory (the "PROT_REA" wild-PC
     // crash: a dynamic binary's GOT slot that ld.so resolved reads back stale).
     // MAP_SHARED anon is HVF-coherent (same as `map_shared_file`). The cost:
-    // fork(2) no longer COW-isolates these pages, so `HvfInner::fork` takes an
-    // explicit private snapshot for the child (see `clone_region_for_child`).
+    // fork(2) no longer COW-isolates these pages. HVPatch isolates them with
+    // per-mm stage-1 COW; the legacy VMM fork path separately clones only its
+    // page-table/control backing (`clone_page_tables_for_child`).
     // The aperture region is host-MAP_SHARED so it stays shared across fork(2)
     // (never snapshotted); all other regions are private guest RAM.
     let backing_started = std::time::Instant::now();
@@ -8581,14 +9786,17 @@ fn map_region_raw(
     Ok(HvfMappedRegion {
         start: mapping.guest_start,
         ipa: mapping.ipa_start,
+        physical_ipa: mapping.ipa_start,
         end,
         host_addr: host,
         size,
+        physical_size: size,
         perms,
         memory: None,
         host_mapping: Some(host_mapping),
         is_dynamic_alias: false,
-        // Private guest RAM (data/bss/heap/stack/MAP_PRIVATE): fork snapshots it.
+        // Private guest RAM (data/bss/heap/stack/MAP_PRIVATE): HVPatch fork
+        // shares the global frame read-only until the writer COWs it.
         sharing,
         // Boot regions carry their true guest write-intent (image=RX, page
         // tables=RO -> not writable; heap/stack/data=RW -> writable).
@@ -9382,6 +10590,54 @@ mod frame_inventory_backend_tests {
     }
 
     #[test]
+    fn global_frame_allocator_reuses_only_released_exact_extents() {
+        let mut allocator = GlobalFrameIpaAllocator::new();
+        let first = allocator.allocate(0x4000, 0x4000).unwrap();
+        let second = allocator.allocate(0x4000, 0x4000).unwrap();
+        assert_ne!(first, second, "live frame IPAs must remain globally unique");
+
+        allocator.release(first, 0x4000).unwrap();
+        assert_eq!(
+            allocator.allocate(0x4000, 0x4000).unwrap(),
+            first,
+            "an IPA becomes reusable only after its exact frame extent retires"
+        );
+    }
+
+    #[test]
+    fn global_frame_allocator_coalesces_adjacent_retired_extents() {
+        let mut allocator = GlobalFrameIpaAllocator::new();
+        let first = allocator.allocate(0x4000, 0x4000).unwrap();
+        let second = allocator.allocate(0x4000, 0x4000).unwrap();
+        allocator.release(second, 0x4000).unwrap();
+        allocator.release(first, 0x4000).unwrap();
+
+        assert_eq!(
+            allocator.allocate(0x8000, 0x4000).unwrap(),
+            first,
+            "adjacent retired global IPA extents must form reusable capacity"
+        );
+    }
+
+    #[test]
+    fn global_frame_allocator_rejects_duplicate_or_partial_release() {
+        let mut allocator = GlobalFrameIpaAllocator::new();
+        let frame = allocator.allocate(0x8000, 0x4000).unwrap();
+        assert!(allocator.release(frame, 0x4000).is_err());
+        allocator.release(frame, 0x8000).unwrap();
+        assert!(allocator.release(frame, 0x8000).is_err());
+    }
+
+    #[test]
+    fn global_frame_allocator_honors_large_frame_alignment() {
+        const TWO_MIB: u64 = 2 * 1024 * 1024;
+        let mut allocator = GlobalFrameIpaAllocator::new();
+        let _prefix = allocator.allocate(0x4000, 0x4000).unwrap();
+        let large = allocator.allocate(TWO_MIB, TWO_MIB).unwrap();
+        assert_eq!(large % TWO_MIB, 0);
+    }
+
+    #[test]
     fn begin_exec_injection_is_owned_and_consumed_by_only_the_armed_engine_state() {
         let ledger = std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
         let mut engine_a = HvpatchFrameInventoryState::new(std::sync::Arc::clone(&ledger));
@@ -9473,7 +10729,7 @@ mod frame_inventory_backend_tests {
     }
 
     #[test]
-    fn fork_inherits_shared_anon_frame_but_private_mapping_requests_a_copy() {
+    fn fork_inherits_private_and_shared_frames_before_any_write() {
         let frame = carrick_hal::FrameId::from_kernel_allocation(id(11));
         let backing = InventoryBackingIdentity::SharedAnon(17);
         let extent = InventoryExtent {
@@ -9481,7 +10737,7 @@ mod frame_inventory_backend_tests {
             mapping: carrick_hal::MappingId::from_kernel_allocation(id(12)),
             backing,
         };
-        let ipa = carrick_mem::memory::LINUX_PROCESS_BANK_BASE + 0x20_0000;
+        let ipa = carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE + 0x20_0000;
         let size = 0x4000;
         let parent_inventory = std::collections::BTreeMap::from([((ipa, size), extent)]);
         let mapping = |sharing| ThreadMappingDesc {
@@ -9510,20 +10766,153 @@ mod frame_inventory_backend_tests {
         assert_eq!(inherited.frame, frame);
         assert_eq!(inherited.backing, backing);
 
-        assert!(
-            inherited_fork_inventory_extent(
-                &mapping(GuestMappingSharing::Private),
-                &parent_inventory,
-            )
-            .expect("private fork inventory decision")
-            .is_none(),
-            "a private mapping must receive a distinct child snapshot/frame"
+        assert_eq!(
+            fork_mapping_disposition(&mapping(GuestMappingSharing::Private)),
+            ForkMappingDisposition::SharedFrameReadOnly,
+            "private fork mappings must not take an eager writable snapshot",
         );
+        let mut kernel_state = mapping(GuestMappingSharing::Private);
+        kernel_state.start = crate::memory::LINUX_SYSCALL_MAILBOX_BASE;
+        kernel_state.end = kernel_state.start + size;
+        assert_ne!(
+            fork_mapping_disposition(&kernel_state),
+            ForkMappingDisposition::SharedFrameReadOnly,
+            "EL1-only per-mm control state must not enter fault-driven guest COW",
+        );
+        let inherited_private = inherited_fork_inventory_extent(
+            &mapping(GuestMappingSharing::Private),
+            &parent_inventory,
+        )
+        .expect("private fork inventory decision")
+        .expect("private fork mapping must initially reuse the parent frame read-only");
+        assert_eq!(inherited_private.frame, frame);
+        assert_eq!(inherited_private.backing, backing);
         assert_ne!(
             HvfVmState::shared_anon_backing_identity(),
             HvfVmState::shared_anon_backing_identity(),
             "independent shared-anonymous mappings must never deduplicate globally"
         );
+    }
+
+    #[test]
+    fn cow_fault_classifier_accepts_only_el0_write_permission_aborts() {
+        const DATA_ABORT_LOWER_EL: u64 = 0x24 << 26;
+        const WRITE: u64 = 1 << 6;
+        for permission_level in [0x0d_u64, 0x0e, 0x0f] {
+            assert!(is_stage1_cow_write_fault(
+                DATA_ABORT_LOWER_EL | WRITE | permission_level
+            ));
+        }
+        assert!(!is_stage1_cow_write_fault(DATA_ABORT_LOWER_EL | 0x0f));
+        assert!(!is_stage1_cow_write_fault(
+            DATA_ABORT_LOWER_EL | WRITE | 0x07
+        ));
+        assert!(is_stage1_cow_write_fault((0x25 << 26) | WRITE | 0x0f));
+        assert!(!is_stage1_cow_write_fault((0x21 << 26) | WRITE | 0x0f));
+    }
+
+    #[test]
+    fn backing_maintenance_cow_bypasses_stale_unmapped_permission() {
+        use carrick_aarch64::vmm::FrameCowWriteIntent;
+
+        assert!(frame_cow_write_is_denied(
+            true,
+            FrameCowWriteIntent::GuestVisible,
+        ));
+        assert!(
+            !frame_cow_write_is_denied(true, FrameCowWriteIntent::BackingMaintenance),
+            "an internal zero scrub must split the frame before mmap publishes the new VMA permission",
+        );
+        assert!(
+            !frame_cow_write_is_denied(true, FrameCowWriteIntent::PrivilegedInternal),
+            "a Carrick-owned unchecked write must split without changing guest permissions",
+        );
+    }
+
+    #[test]
+    fn cow_armed_ranges_split_one_compound_and_leave_peers_armed() {
+        let base = 0x4000_0000;
+        let mut armed = CowArmedRanges::default();
+        armed.arm(&[carrick_aarch64::vmm::ForkCowRange {
+            va: base,
+            len: 4 * CowArmedRanges::COMPOUND_SIZE as usize,
+            executable: false,
+            kernel_only: false,
+        }]);
+        let writer = armed
+            .span_for(base + CowArmedRanges::COMPOUND_SIZE + 8)
+            .expect("second compound is armed");
+        assert_eq!(writer.va, base + CowArmedRanges::COMPOUND_SIZE);
+        assert_eq!(writer.len, CowArmedRanges::COMPOUND_SIZE as usize);
+        armed.disarm(writer);
+        assert!(armed.span_for(writer.va).is_none());
+        assert!(armed.span_for(base).is_some());
+        assert!(
+            armed
+                .span_for(base + 2 * CowArmedRanges::COMPOUND_SIZE)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn cow_armed_ranges_disjoint_overlap_query_is_empty() {
+        let base = 0x4000_0000;
+        let mut armed = CowArmedRanges::default();
+        armed.arm(&[carrick_aarch64::vmm::ForkCowRange {
+            va: base,
+            len: CowArmedRanges::COMPOUND_SIZE as usize,
+            executable: false,
+            kernel_only: false,
+        }]);
+
+        assert!(
+            armed
+                .overlapping(base + 2 * CowArmedRanges::COMPOUND_SIZE, 0x1000)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn inherited_private_frame_skips_duplicate_stage2_install() {
+        let inherited = carrick_hal::FrameId::from_kernel_allocation(id(99));
+        assert!(!process_mapping_needs_stage2_install(Some(inherited)));
+        assert!(process_mapping_needs_stage2_install(None));
+    }
+
+    #[test]
+    fn fork_translation_accepts_winning_overlay_independent_of_descriptor_order() {
+        let mapping = |ipa, host| ProcessMappingDesc {
+            start: 0x4000_0000,
+            ipa,
+            end: 0x4000_4000,
+            host: ForkMappingHost::Borrowed(host as *mut u8),
+            size: 0x4000,
+            physical_ipa: ipa,
+            physical_host_addr: host as *mut u8,
+            physical_size: 0x4000,
+            inventory_backing: InventoryBackingIdentity::Private(ipa),
+            perms: applevisor::memory::MemPerms::ReadWrite,
+            is_dynamic_alias: true,
+            sharing: GuestMappingSharing::Private,
+            guest_writable: true,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            inherited_frame: None,
+            inherited_mapping: None,
+        };
+        let winning_ipa = 0x9b00_028000;
+        let stale_ipa = 0x9b00_008000;
+        let mappings = vec![
+            mapping(winning_ipa, 0x2000_0000),
+            mapping(stale_ipa, 0x3000_0000),
+        ];
+
+        assert!(fork_translation_has_overlay_owner(
+            &mappings,
+            1,
+            0x4000_0000,
+            winning_ipa,
+        ));
     }
 }
 
@@ -9787,9 +11176,11 @@ mod thread_sibling_tests {
         HvfMappedRegion {
             start,
             ipa,
+            physical_ipa: ipa,
             end,
             host_addr: std::ptr::null_mut(),
             size: usize::try_from(end - start).unwrap(),
+            physical_size: usize::try_from(end - start).unwrap(),
             perms: applevisor::memory::MemPerms::ReadWrite,
             memory: None,
             host_mapping: None,
@@ -10132,20 +11523,20 @@ mod thread_sibling_tests {
     }
 
     #[test]
-    fn raw_ipa_lookup_selects_rebased_process_bank_backing() {
+    fn raw_ipa_lookup_selects_rebased_mm_global_frame_backing() {
         let guest_va = crate::memory::LINUX_PAGE_TABLES_BASE;
-        let bank_ipa = crate::memory::LINUX_PROCESS_BANK_BASE;
+        let root_slot_ipa = crate::memory::LINUX_HVPATCH_ROOT_SLOT_BASE;
         let mappings = vec![mapped_region(
             guest_va,
             guest_va + crate::memory::LINUX_PAGE_TABLES_SIZE,
-            bank_ipa,
+            root_slot_ipa,
         )];
 
-        let mapping = HvfVmState::mapping_for_ipa_range(&mappings, bank_ipa + 0x4000, 8)
+        let mapping = HvfVmState::mapping_for_ipa_range(&mappings, root_slot_ipa + 0x4000, 8)
             .expect("rebased page-table IPA must resolve by IPA, not guest VA");
 
         assert_eq!(mapping.start, guest_va);
-        assert_eq!(mapping.ipa, bank_ipa);
+        assert_eq!(mapping.ipa, root_slot_ipa);
         assert!(
             HvfVmState::mapping_for_ipa_range(&mappings, guest_va + 0x4000, 8).is_none(),
             "raw GPA access must not silently select a VA-only match"
@@ -10267,11 +11658,12 @@ pub(crate) fn hvf_set_sys_reg(
 mod tag_strip_tests {
     use super::{
         AliasBacking, AliasOwnershipScope, GuestMappingPlan, GuestMappingSharing, HVF_PAGE_SIZE,
-        HvfMappedRegion, InventoryBackingIdentity, ThreadMappingDesc, alias_matches_process_scope,
-        alias_registry, exec_bank_layout_key, forget_replay_extent,
-        inherited_fork_inventory_extent, lookup_shared_alias, mapping_is_current_for_process_fork,
-        missing_process_aliases, rebind_inherited_alias_to_process, register_shared_alias,
-        reserve_process_alias_ipa, strip_pointer_tag, unregister_alias,
+        HvfMappedRegion, InventoryBackingIdentity, ThreadMappingDesc, alias_is_owned_by_process,
+        alias_matches_process_scope, alias_registry, current_dynamic_alias_ipas,
+        forget_replay_extent, inherited_fork_inventory_extent, lookup_shared_alias,
+        mapping_is_current_for_process_fork, missing_process_aliases,
+        rebind_inherited_alias_to_process, register_shared_alias, strip_pointer_tag,
+        unregister_alias,
     };
 
     #[test]
@@ -10381,68 +11773,6 @@ mod tag_strip_tests {
     }
 
     #[test]
-    fn exec_bank_layout_key_tracks_bank_shape_and_source_tables_not_payload() {
-        let perms = carrick_mem::elf::SegmentPerms {
-            read: true,
-            write: false,
-            execute: true,
-        };
-        let image = carrick_mem::memory::AddressSpace::from_segments(
-            0x1_0000,
-            [(0x1_0000, perms, vec![0xaa; 0x4000], 0x4000)],
-        )
-        .expect("one valid region")
-        .with_stage1_page_tables()
-        .expect("stage-1 tables");
-        let plan = GuestMappingPlan::from_address_space(&image).expect("mapping plan");
-        let old_root = plan.stage1_page_tables_base.expect("stage-1 root");
-        let table_index = plan
-            .mappings
-            .iter()
-            .position(|mapping| mapping.guest_start == old_root)
-            .expect("stage-1 mapping");
-        let bank_size = 40 * 1024 * 1024 * 1024;
-        let original =
-            exec_bank_layout_key(&plan, 0x9a_0000_0000, bank_size, old_root, table_index);
-
-        let other_bank =
-            exec_bank_layout_key(&plan, 0xa4_0000_0000, bank_size, old_root, table_index);
-        assert_ne!(
-            original, other_bank,
-            "bank-specific IPA layouts must not alias"
-        );
-
-        let mut payload_changed = plan.clone();
-        let payload_index = usize::from(table_index == 0);
-        std::sync::Arc::make_mut(&mut payload_changed.mappings[payload_index].image)[0] ^= 0xff;
-        let payload_key = exec_bank_layout_key(
-            &payload_changed,
-            0x9a_0000_0000,
-            bank_size,
-            old_root,
-            table_index,
-        );
-        assert_eq!(
-            original, payload_key,
-            "stack and executable payload bytes do not change page-table layout"
-        );
-
-        let mut tables_changed = plan.clone();
-        std::sync::Arc::make_mut(&mut tables_changed.mappings[table_index].image)[0] ^= 0xff;
-        let table_key = exec_bank_layout_key(
-            &tables_changed,
-            0x9a_0000_0000,
-            bank_size,
-            old_root,
-            table_index,
-        );
-        assert_ne!(
-            original, table_key,
-            "different source page tables require a fresh validated layout"
-        );
-    }
-
-    #[test]
     fn private_exec_file_artifact_reuses_bytes_but_each_mapping_is_cow() {
         use std::os::fd::AsRawFd;
 
@@ -10535,116 +11865,62 @@ mod tag_strip_tests {
     }
 
     #[test]
-    fn private_alias_scope_separates_root_and_process_banks() {
-        let bank = (
-            carrick_mem::memory::LINUX_PROCESS_BANK_BASE,
-            40 * 1024 * 1024 * 1024,
+    fn private_alias_scope_separates_root_and_child_mm_root_slots() {
+        let root_slot = (
+            carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE,
+            2 * 1024 * 1024,
         );
         assert!(alias_matches_process_scope(
-            AliasOwnershipScope::ProcessBank {
-                base: bank.0,
-                size: bank.1
+            AliasOwnershipScope::MmRootSlot {
+                base: root_slot.0,
+                size: root_slot.1
             },
-            Some(bank)
+            Some(root_slot)
         ));
         assert!(!alias_matches_process_scope(
             AliasOwnershipScope::Root,
-            Some(bank)
+            Some(root_slot)
         ));
         assert!(alias_matches_process_scope(AliasOwnershipScope::Root, None));
         assert!(!alias_matches_process_scope(
-            AliasOwnershipScope::ProcessBank {
-                base: bank.0,
-                size: bank.1
+            AliasOwnershipScope::MmRootSlot {
+                base: root_slot.0,
+                size: root_slot.1
             },
             None
         ));
         assert!(!alias_matches_process_scope(
-            AliasOwnershipScope::ProcessBank {
-                base: bank.0 + bank.1,
-                size: bank.1
+            AliasOwnershipScope::MmRootSlot {
+                base: root_slot.0 + root_slot.1,
+                size: root_slot.1
             },
-            Some(bank)
+            Some(root_slot)
         ));
         assert!(alias_matches_process_scope(
             AliasOwnershipScope::Global,
-            Some(bank)
+            Some(root_slot)
         ));
-    }
-
-    #[test]
-    fn private_dynamic_aliases_are_allocated_inside_the_process_bank() {
-        let bank = (
-            carrick_mem::memory::LINUX_PROCESS_BANK_BASE,
-            40 * 1024 * 1024 * 1024,
-        );
-        let first_dynamic = bank.0 + 0x12_3456;
-        let cursor = std::sync::atomic::AtomicU64::new(first_dynamic);
-        let requested = carrick_mem::memory::LINUX_ALIAS_IPA_BASE;
-
-        let first = reserve_process_alias_ipa(
-            requested,
-            0x4000,
-            GuestMappingSharing::Private,
-            Some(bank),
-            Some(&cursor),
-        )
-        .expect("first private alias");
-        let second = reserve_process_alias_ipa(
-            requested + 0x20_0000,
-            0x30_0000,
-            GuestMappingSharing::Private,
-            Some(bank),
-            Some(&cursor),
-        )
-        .expect("second private alias");
-
-        assert_eq!(first, bank.0 + 0x20_0000);
-        assert_eq!(second, bank.0 + 0x40_0000);
-        assert_eq!(
-            cursor.load(std::sync::atomic::Ordering::SeqCst),
-            bank.0 + 0x80_0000
-        );
-        assert_eq!(
-            reserve_process_alias_ipa(
-                requested,
-                0x4000,
-                GuestMappingSharing::GlobalShared,
-                Some(bank),
-                Some(&cursor),
-            )
-            .expect("shared alias"),
-            requested
-        );
-        assert_eq!(
-            reserve_process_alias_ipa(requested, 0x4000, GuestMappingSharing::Private, None, None,)
-                .expect("root alias"),
-            requested
-        );
     }
 
     #[test]
     fn fork_shared_anonymous_alias_stays_process_scoped() {
-        let parent_bank = (
-            carrick_mem::memory::LINUX_PROCESS_BANK_BASE,
-            40 * 1024 * 1024 * 1024,
+        let parent_root_slot = (
+            carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE,
+            2 * 1024 * 1024,
         );
-        let foreign_bank = (parent_bank.0 + parent_bank.1, parent_bank.1);
-        let cursor = std::sync::atomic::AtomicU64::new(parent_bank.0 + 0x12_3456);
+        let foreign_root_slot = (parent_root_slot.0 + parent_root_slot.1, parent_root_slot.1);
         let requested = carrick_mem::memory::LINUX_ALIAS_IPA_BASE;
         let sharing = GuestMappingSharing::ForkSharedAnonymous;
         assert!(sharing.shares_across_fork());
         assert!(!sharing.uses_global_ipa());
         assert!(!sharing.has_shared_futex_identity());
 
-        // A MAP_SHARED anonymous alias needs a host-fork-shared backing, but
-        // that does not make it a VM-global shared-file alias. It must consume
-        // the owning mm's bank so only an explicitly inherited child mapping
-        // can reuse the physical backing.
-        let ipa =
-            reserve_process_alias_ipa(requested, 0x4000, sharing, Some(parent_bank), Some(&cursor))
-                .expect("fork-shared anonymous alias");
-        assert_eq!(ipa, parent_bank.0 + 0x20_0000);
+        // A MAP_SHARED anonymous alias needs a fork-shared backing, but that
+        // does not make it a shared-file/futex identity. Its physical frame
+        // still owns one stable global IPA; semantic visibility remains scoped
+        // to the owning mm and explicitly inherited descendants.
+        let ipa = requested;
+        assert_eq!(ipa, requested);
 
         let alias = AliasBacking {
             start: 0x1400_0000_0000,
@@ -10657,9 +11933,9 @@ mod tag_strip_tests {
             perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
             guest_writable: true,
             sharing,
-            ownership_scope: AliasOwnershipScope::ProcessBank {
-                base: parent_bank.0,
-                size: parent_bank.1,
+            ownership_scope: AliasOwnershipScope::MmRootSlot {
+                base: parent_root_slot.0,
+                size: parent_root_slot.1,
             },
             inventory_backing: InventoryBackingIdentity::SharedAnon(41),
             shared_key_base: 0,
@@ -10669,7 +11945,7 @@ mod tag_strip_tests {
             missing_process_aliases(
                 &std::collections::HashSet::new(),
                 &[alias],
-                Some(parent_bank)
+                Some(parent_root_slot)
             )
             .len(),
             1,
@@ -10679,7 +11955,7 @@ mod tag_strip_tests {
             missing_process_aliases(
                 &std::collections::HashSet::new(),
                 &[alias],
-                Some(foreign_bank)
+                Some(foreign_root_slot)
             )
             .is_empty(),
             "an unrelated mm must not acquire anonymous backing through global alias scope"
@@ -10687,42 +11963,74 @@ mod tag_strip_tests {
     }
 
     #[test]
+    fn address_space_replacement_drops_only_its_private_alias_scope() {
+        let root_slot = (0x9000_0000, 0x20_0000);
+        assert!(alias_is_owned_by_process(AliasOwnershipScope::Root, None));
+        assert!(!alias_is_owned_by_process(
+            AliasOwnershipScope::Root,
+            Some(root_slot)
+        ));
+        assert!(alias_is_owned_by_process(
+            AliasOwnershipScope::MmRootSlot {
+                base: root_slot.0,
+                size: root_slot.1,
+            },
+            Some(root_slot)
+        ));
+        assert!(!alias_is_owned_by_process(
+            AliasOwnershipScope::MmRootSlot {
+                base: root_slot.0 + root_slot.1,
+                size: root_slot.1,
+            },
+            Some(root_slot)
+        ));
+        assert!(!alias_is_owned_by_process(
+            AliasOwnershipScope::Global,
+            Some(root_slot)
+        ));
+    }
+
+    #[test]
     fn fork_shared_anonymous_alias_survives_a_second_fork_without_global_scope() {
-        let parent_bank = (
-            carrick_mem::memory::LINUX_PROCESS_BANK_BASE,
-            40 * 1024 * 1024 * 1024,
+        let parent_root_slot = (
+            carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE,
+            2 * 1024 * 1024,
         );
-        let child_bank = (parent_bank.0 + parent_bank.1, parent_bank.1);
-        let grandchild_bank = (child_bank.0 + child_bank.1, child_bank.1);
-        let unrelated_bank = (grandchild_bank.0 + grandchild_bank.1, grandchild_bank.1);
+        let child_root_slot = (parent_root_slot.0 + parent_root_slot.1, parent_root_slot.1);
+        let grandchild_root_slot = (child_root_slot.0 + child_root_slot.1, child_root_slot.1);
+        let unrelated_root_slot = (
+            grandchild_root_slot.0 + grandchild_root_slot.1,
+            grandchild_root_slot.1,
+        );
+        let frame_ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x20_0000;
         let alias = rebind_inherited_alias_to_process(
             AliasBacking {
                 start: 0x1382_8ed0_0000,
-                ipa: parent_bank.0 + 0x20_0000,
+                ipa: frame_ipa,
                 host_addr: 0x1000,
                 size: 0x4000,
-                physical_ipa: parent_bank.0 + 0x20_0000,
+                physical_ipa: frame_ipa,
                 physical_host_addr: 0x1000,
                 physical_size: 0x4000,
                 perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
                 guest_writable: true,
                 sharing: GuestMappingSharing::ForkSharedAnonymous,
-                ownership_scope: AliasOwnershipScope::ProcessBank {
-                    base: parent_bank.0,
-                    size: parent_bank.1,
+                ownership_scope: AliasOwnershipScope::MmRootSlot {
+                    base: parent_root_slot.0,
+                    size: parent_root_slot.1,
                 },
                 inventory_backing: InventoryBackingIdentity::SharedAnon(42),
                 shared_key_base: 0,
                 shared_key_offset: 0,
             },
-            child_bank,
+            child_root_slot,
         );
 
         assert_eq!(
             missing_process_aliases(
                 &std::collections::HashSet::new(),
                 &[alias],
-                Some(child_bank),
+                Some(child_root_slot),
             )
             .len(),
             1,
@@ -10732,7 +12040,7 @@ mod tag_strip_tests {
             missing_process_aliases(
                 &std::collections::HashSet::new(),
                 &[alias],
-                Some(child_bank),
+                Some(child_root_slot),
             )[0]
             .inventory_backing,
             InventoryBackingIdentity::SharedAnon(42),
@@ -10757,12 +12065,12 @@ mod tag_strip_tests {
         assert_eq!(grandchild_extent.frame, frame);
         assert_eq!(grandchild_extent.backing, alias.inventory_backing);
 
-        let grandchild_alias = rebind_inherited_alias_to_process(alias, grandchild_bank);
+        let grandchild_alias = rebind_inherited_alias_to_process(alias, grandchild_root_slot);
         assert_eq!(
             missing_process_aliases(
                 &std::collections::HashSet::new(),
                 &[grandchild_alias],
-                Some(grandchild_bank),
+                Some(grandchild_root_slot),
             )[0]
             .inventory_backing,
             alias.inventory_backing,
@@ -10772,7 +12080,7 @@ mod tag_strip_tests {
             missing_process_aliases(
                 &std::collections::HashSet::new(),
                 &[grandchild_alias],
-                Some(unrelated_bank),
+                Some(unrelated_root_slot),
             )
             .is_empty(),
             "an unrelated mm must not gain the inherited frame"
@@ -10996,9 +12304,11 @@ mod tag_strip_tests {
         let region = HvfMappedRegion {
             start: va,
             ipa,
+            physical_ipa: ipa,
             end: va + guest_size as u64,
             host_addr: host_mapping.as_ptr(),
             size: host_mapping.len(),
+            physical_size,
             perms: applevisor::memory::MemPerms::ReadWrite,
             memory: None,
             host_mapping: None,
@@ -11064,19 +12374,21 @@ mod tag_strip_tests {
 
     #[test]
     fn fork_source_uses_live_alias_inventory_not_retired_mapping_owners() {
-        let bank = (
-            carrick_mem::memory::LINUX_PROCESS_BANK_BASE,
-            40 * 1024 * 1024 * 1024,
+        let root_slot = (
+            carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE,
+            2 * 1024 * 1024,
         );
         let va = 0x1382_8ed0_0000;
-        let retired_ipa = bank.0 + 0x20_0000;
-        let live_ipa = bank.0 + 0x40_0000;
+        let retired_ipa = root_slot.0 + 0x20_0000;
+        let live_ipa = root_slot.0 + 0x40_0000;
         let mapping = |ipa, host_addr, is_dynamic_alias| HvfMappedRegion {
             start: va,
             ipa,
+            physical_ipa: ipa,
             end: va + 0x4000,
             host_addr: host_addr as *mut u8,
             size: 0x4000,
+            physical_size: 0x4000,
             perms: applevisor::memory::MemPerms::ReadWrite,
             memory: None,
             host_mapping: None,
@@ -11097,9 +12409,9 @@ mod tag_strip_tests {
             perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
             guest_writable: true,
             sharing: GuestMappingSharing::ForkSharedAnonymous,
-            ownership_scope: AliasOwnershipScope::ProcessBank {
-                base: bank.0,
-                size: bank.1,
+            ownership_scope: AliasOwnershipScope::MmRootSlot {
+                base: root_slot.0,
+                size: root_slot.1,
             },
             inventory_backing: InventoryBackingIdentity::SharedAnon(43),
             shared_key_base: 0,
@@ -11110,31 +12422,35 @@ mod tag_strip_tests {
             !mapping_is_current_for_process_fork(
                 &mapping(retired_ipa, 0x2000, true),
                 &[live_alias],
-                Some(bank),
+                Some(root_slot),
             ),
             "a retained stage-2 lifetime owner is not a live child mapping"
         );
         assert!(mapping_is_current_for_process_fork(
             &mapping(live_ipa, 0x3000, true),
             &[live_alias],
-            Some(bank),
+            Some(root_slot),
         ));
         assert!(
-            mapping_is_current_for_process_fork(&mapping(bank.0, 0x4000, false), &[], Some(bank),),
+            mapping_is_current_for_process_fork(
+                &mapping(root_slot.0, 0x4000, false),
+                &[],
+                Some(root_slot),
+            ),
             "structural boot mappings do not depend on the dynamic alias registry"
         );
     }
 
     #[test]
     fn process_fork_includes_sibling_owned_private_aliases() {
-        let bank = (
-            carrick_mem::memory::LINUX_PROCESS_BANK_BASE,
-            40 * 1024 * 1024 * 1024,
+        let root_slot = (
+            carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE,
+            2 * 1024 * 1024,
         );
-        let local_ipa = bank.0 + 0x20_0000;
-        let sibling_ipa = bank.0 + 0x40_0000;
-        let foreign_ipa = bank.0 + bank.1 + 0x20_0000;
-        let alias = |ipa| AliasBacking {
+        let local_ipa = root_slot.0 + 0x20_0000;
+        let sibling_ipa = root_slot.0 + 0x40_0000;
+        let foreign_ipa = root_slot.0 + root_slot.1 + 0x20_0000;
+        let alias = |ipa, ownership_scope| AliasBacking {
             start: 0x1400_0000_0000 + ipa,
             ipa,
             host_addr: 0x1000,
@@ -11145,27 +12461,83 @@ mod tag_strip_tests {
             perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
             guest_writable: true,
             sharing: GuestMappingSharing::Private,
-            ownership_scope: if ipa < bank.0 + bank.1 {
-                AliasOwnershipScope::ProcessBank {
-                    base: bank.0,
-                    size: bank.1,
-                }
-            } else {
-                AliasOwnershipScope::ProcessBank {
-                    base: bank.0 + bank.1,
-                    size: bank.1,
-                }
-            },
+            ownership_scope,
             inventory_backing: InventoryBackingIdentity::Private(ipa),
             shared_key_base: 0,
             shared_key_offset: 0,
         };
         let local_ipas = std::collections::HashSet::from([local_ipa]);
-        let aliases = [alias(local_ipa), alias(sibling_ipa), alias(foreign_ipa)];
+        let local_scope = AliasOwnershipScope::MmRootSlot {
+            base: root_slot.0,
+            size: root_slot.1,
+        };
+        let aliases = [
+            alias(local_ipa, local_scope),
+            alias(sibling_ipa, local_scope),
+            alias(
+                foreign_ipa,
+                AliasOwnershipScope::MmRootSlot {
+                    base: root_slot.0 + root_slot.1,
+                    size: root_slot.1,
+                },
+            ),
+        ];
 
-        let missing = missing_process_aliases(&local_ipas, &aliases, Some(bank));
+        let missing = missing_process_aliases(&local_ipas, &aliases, Some(root_slot));
 
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].ipa, sibling_ipa);
+    }
+
+    #[test]
+    fn retired_local_alias_row_does_not_mask_live_fragment_at_same_ipa() {
+        let root_slot = (0x9000_0000, 0x20_0000);
+        let va = 0x0060_000a_8000;
+        let ipa = 0x009b_0033_8000;
+        let mapping = HvfMappedRegion {
+            start: va,
+            ipa,
+            physical_ipa: ipa,
+            end: va + 0x4000,
+            host_addr: 0x2000 as *mut u8,
+            size: 0x4000,
+            physical_size: 0x4000,
+            perms: applevisor::memory::MemPerms::ReadWrite,
+            memory: None,
+            host_mapping: None,
+            is_dynamic_alias: true,
+            sharing: GuestMappingSharing::Private,
+            guest_writable: true,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+        };
+        let live_fragment = AliasBacking {
+            start: va + 0x2000,
+            ipa: ipa + 0x2000,
+            host_addr: 0x4000,
+            size: 0x2000,
+            physical_ipa: ipa,
+            physical_host_addr: 0x2000,
+            physical_size: 0x4000,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+            guest_writable: true,
+            sharing: GuestMappingSharing::Private,
+            ownership_scope: AliasOwnershipScope::MmRootSlot {
+                base: root_slot.0,
+                size: root_slot.1,
+            },
+            inventory_backing: InventoryBackingIdentity::Private(44),
+            shared_key_base: 0,
+            shared_key_offset: 0,
+        };
+        let aliases = [live_fragment];
+
+        let current = current_dynamic_alias_ipas(&[mapping], &aliases, Some(root_slot));
+        assert!(current.is_empty(), "the unsplit local owner is retired");
+        assert_eq!(
+            missing_process_aliases(&current, &aliases, Some(root_slot)),
+            vec![live_fragment],
+            "the retired row must not suppress the live suffix from fork arming",
+        );
     }
 }

@@ -61,7 +61,7 @@ pub(super) enum PtPauseError {
     TimedOut,
 }
 
-fn acquire_pt_pause(
+pub(super) fn acquire_pt_pause(
     barrier: &'static crate::fork_quiesce::PtQuiesce,
     kicker: &dyn carrick_hal::VcpuRegistry,
     tid: ThreadId,
@@ -439,13 +439,10 @@ where
 
         let phase_start = std::time::Instant::now();
         let subphase_start = std::time::Instant::now();
-        // Publish the arena high-water so the child snapshot's mincore scan is
-        // bounded to the guest's used prefix, not all 32 GiB. The HVF child
-        // snapshot reads the process-global (trap::set_guest_arena_high_water); a
-        // shared-VM backend (KVM vfork) reads it off the engine via the hook (a
-        // no-op elsewhere) so its per-window residency scan is bounded too.
+        // A shared-VM backend (KVM vfork) uses the arena high-water to bound its
+        // per-window residency scan. HVPatch no longer has a whole-arena child
+        // snapshot path.
         let arena_high_water = kernel.dispatcher.mmap_arena_high_water();
-        crate::trap::set_guest_arena_high_water(arena_high_water);
         engine.set_vfork_arena_high_water(arena_high_water);
         crate::probes::fork_lifecycle(
             0,
@@ -1006,7 +1003,6 @@ where
         );
 
         fork_stage_started = Instant::now();
-        crate::trap::set_guest_arena_high_water(kernel.dispatcher.mmap_arena_high_water());
         let clone_flags = carrick_abi::LinuxCloneFlags::from_bits_retain(request.flags);
         let clone_plan = match crate::kernel::ClonePlan::from_flags(clone_flags) {
             Ok(plan) => plan,
@@ -1037,32 +1033,32 @@ where
         };
         let child_id = reservation.child_id();
         let child_pid = child_id.raw();
-        let prepared_mm = match parent_process.bank_resources().prepare_child() {
+        let prepared_mm = match parent_process.mm_resources().prepare_child() {
             Ok(prepared) => prepared,
             Err(error) => {
                 if quiesced {
                     process_barrier.end_quiesce();
                 }
                 process_barrier.end_fork();
-                tracing::warn!(%error, "hvpatch process bank preparation failed; fork(2) = EAGAIN");
+                tracing::warn!(%error, "hvpatch stage-1 root-slot preparation failed; fork(2) = EAGAIN");
                 return Ok(Some(crate::linux_abi::LINUX_EAGAIN.guest_retval()));
             }
         };
         let child_binding = prepared_mm.binding();
-        let Some(bank) = prepared_mm.bank() else {
+        let Some(root_slot) = prepared_mm.root_slot() else {
             if quiesced {
                 process_barrier.end_quiesce();
             }
             process_barrier.end_fork();
             return Err(RuntimeError::Configuration(
-                "hvpatch prepared child has no process bank".to_owned(),
+                "hvpatch prepared child has no stage-1 root slot".to_owned(),
             ));
         };
         let child_tid = ThreadId::from_guest_supplied_tid(child_pid);
         // The kernel mm association follows Linux clone semantics even while
-        // the K1 execution adapter still prepares a bank for the prototype
+        // the K1 execution adapter still prepares a stage-1 root slot for the
         // vCPU. CLONE_VM (including vfork) shares the exact parent `Mm`; plain
-        // fork publishes the prepared bank backend as the child's copied mm.
+        // fork publishes the prepared root-slot backend as the child's copied mm.
         let prepared_result = if clone_plan.mm() == crate::kernel::CloneObjectMode::Share {
             reservation.prepare_shared_mm(child_tid)
         } else {
@@ -1206,8 +1202,8 @@ where
                 tls: None,
             },
             child_binding.ttbr0.raw(),
-            bank.base(),
-            bank.size(),
+            root_slot.base(),
+            root_slot.size(),
             child_tid,
             self.this_tid,
         ) {
@@ -1288,19 +1284,44 @@ where
                         );
                         std::process::abort();
                     });
+                if ready_tx.send(Ok(child_inventory_commit)).is_err() {
+                    return;
+                }
+                let Ok(Some((child_kernel, child_process, child_context))) = start_rx.recv() else {
+                    child_engine.destroy_vcpu_on_thread_exit();
+                    return;
+                };
+                let child_binding = child_process.mm_binding().unwrap_or_else(|| {
+                    tracing::error!(child_pid, "published HVPatch child has no mm binding");
+                    std::process::abort();
+                });
+                let child_mm = child_context.shared().mm().id();
+                let authority: Arc<dyn carrick_hal::FrameCowAuthority> =
+                    Arc::new(KernelFrameCowAuthority {
+                        kernel: Arc::clone(child_context.kernel()),
+                        mm: child_mm,
+                        kicker: child_kicker.clone(),
+                        tid: child_tid,
+                    });
+                child_engine.bind_frame_cow(
+                    authority,
+                    carrick_hal::FrameCowIdentity {
+                        linux_pid: child_process.pid(),
+                        linux_tid: child_tid.raw(),
+                        mm: child_mm.raw(),
+                        asid: child_binding.asid.raw(),
+                    },
+                );
+                // The child inventory is authoritative before this first
+                // kernel-originated write. If the address lies in a fork-COW
+                // frame, the copyout now splits only the child instead of
+                // corrupting the parent's still-shared frame.
                 if let Some(address) = child_tid_addr
                     && let Err(error) = child_engine.write_bytes(address, &child_pid.to_le_bytes())
                 {
                     tracing::error!(child_pid, %error, "materialized child TID copyout diverged from preflight");
                     std::process::abort();
                 }
-                if ready_tx.send(Ok(child_inventory_commit)).is_err() {
-                    return;
-                }
-                let Ok(Some((child_kernel, _child_process, child_context))) = start_rx.recv() else {
-                    child_engine.destroy_vcpu_on_thread_exit();
-                    return;
-                };
                 let handle: Box<dyn carrick_hal::VcpuKickDyn> =
                     Box::new(child_engine.kick_handle());
                 child_kicker.register(child_tid, handle);
@@ -1479,15 +1500,15 @@ where
             }
         };
         let child_backend = match parent_process
-            .bank_resources()
+            .mm_resources()
             .publish_child(child_context.task().key(), prepared_mm)
         {
             Ok(backend) => backend,
             Err(error) => {
-                // Kernel publication is already authoritative; a backend-bank
+                // Kernel publication is already authoritative; a backend root-slot
                 // collision now means internal generation accounting is corrupt
                 // and cannot be represented as a failed guest fork.
-                tracing::error!(child_pid, %error, "publish hvpatch child bank failed");
+                tracing::error!(child_pid, %error, "publish hvpatch child root slot failed");
                 std::process::abort();
             }
         };

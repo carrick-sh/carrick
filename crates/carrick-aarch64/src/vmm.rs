@@ -25,6 +25,7 @@ use carrick_hal::{
     VcpuRegistry,
 };
 use carrick_mem::memory::AddressSpace;
+use carrick_mem::page_table::PageTableManager;
 
 /// COW-inherit vs eager full-RAM copy at `fork(2)`. Re-exported from
 /// [`carrick_hal`] (the single canonical definition, shared with the x86 lane) so
@@ -72,6 +73,12 @@ pub enum Aarch64Exit {
         sp: u64,
         from_el0_direct: bool,
     },
+
+    /// A write-permission abort taken while Carrick's EL1 vector was copying
+    /// state to a fork-COW user frame. The backend has restored the interrupted
+    /// EL1 PC/PSTATE so resolving the frame and re-entering retries exactly the
+    /// faulting vector instruction.
+    Stage1CowFault { syndrome: u64, far: u64 },
 
     /// An EL0 `MRS` of an emulated ID/timer/cache register that trapped (Rosetta
     /// x86-on-arm + HVF). The engine's shared `emulate_el0_sys64_read` services
@@ -282,6 +289,33 @@ pub trait Aarch64Vcpu {
     }
 }
 
+/// One live guest-private writable range that fork must share read-only until
+/// a stage-1 permission fault gives the writer a new frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ForkCowRange {
+    pub va: u64,
+    pub len: usize,
+    pub executable: bool,
+    /// The leaf is Carrick-owned EL1 state (AP=00), not an EL0 mapping. Fork
+    /// arming must use AP=10 and COW publication must restore AP=00; using the
+    /// ordinary user AP bits makes PSTATE.PAN reject the EL1 syscall vector's
+    /// mailbox stores.
+    pub kernel_only: bool,
+}
+
+/// Why Carrick is about to modify a fork-COW-backed byte.
+///
+/// Guest-visible writes must respect the process's current VMA permission.
+/// Backing maintenance (for example zeroing a freshly reallocated anonymous
+/// page) runs before the new VMA permission is published, so it must split the
+/// physical frame without granting the guest write access to the old mapping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrameCowWriteIntent {
+    GuestVisible,
+    BackingMaintenance,
+    PrivilegedInternal,
+}
+
 /// VM-level memory + lifecycle. One per guest process. This is where the
 /// GENUINELY-backend-specific divergence lives: fork VM rebuild, execve remap,
 /// sibling spawn, host memory windows + stage-2 mapping, and the HVF-only
@@ -303,6 +337,16 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// hvpatch lane overrides this; ordinary VMM and non-HVF backends preserve
     /// their established rebuild behavior.
     fn set_persistent_vm_lifecycle(&mut self, _enabled: bool) {}
+
+    /// Bind the one stage-1 editor shared by the neutral engine and backend
+    /// translation/physical-COW paths.  A backend retaining a second optional
+    /// manager can otherwise publish through stale/absent authority immediately
+    /// after fork.
+    fn bind_stage1_page_tables(
+        &mut self,
+        _page_tables: Arc<parking_lot::Mutex<Option<PageTableManager>>>,
+    ) {
+    }
 
     // HVPatch-only K1 frame-inventory transaction seam. Defaults preserve the
     // mature HVF VMM and KVM lanes exactly: they report no inventory authority
@@ -435,6 +479,70 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// set (KVM in `GuestRam`, shared across siblings) so a sibling thread's
     /// `mprotect(PROT_NONE)` is observed here.
     fn protections(&self) -> Option<&MemoryProtections>;
+
+    /// Exact private writable ranges owned by this mm. HVPatch consumes this
+    /// before cloning the stage-1 graph; reference backends retain the empty
+    /// default because their host VM mechanism supplies fork COW.
+    fn fork_cow_ranges(&self) -> Vec<ForkCowRange> {
+        Vec::new()
+    }
+
+    fn arm_frame_cow_ranges(&mut self, _ranges: &[ForkCowRange]) {}
+
+    fn armed_frame_cow_ranges(&self, _va: u64, _len: usize) -> Vec<ForkCowRange> {
+        Vec::new()
+    }
+
+    fn bind_frame_cow(
+        &mut self,
+        _authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
+        _identity: carrick_hal::FrameCowIdentity,
+    ) {
+    }
+
+    fn resolve_frame_cow_fault(
+        &mut self,
+        _syndrome: u64,
+        _far: u64,
+        _flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+    ) -> Result<bool, TrapError> {
+        Ok(false)
+    }
+
+    fn ensure_frame_cow_write(
+        &mut self,
+        _va: u64,
+        _len: usize,
+        _intent: FrameCowWriteIntent,
+        _flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+    ) -> Result<(), TrapError> {
+        Ok(())
+    }
+
+    /// Authenticate the final stage-1 protection published after a backing-
+    /// maintenance COW. HVPatch uses this to close the signed structural
+    /// transaction; reference backends have no deferred COW receipt.
+    fn observe_frame_cow_protection(
+        &mut self,
+        _va: u64,
+        _len: usize,
+        _prot: u64,
+    ) -> Result<(), TrapError> {
+        Ok(())
+    }
+
+    /// Publish semantic VA ownership after `MAP_FIXED|MAP_PRIVATE` repoints a
+    /// live stage-1 leaf into an existing private-overlay frame. The stage-2
+    /// extent already exists; HVPatch records only the VA→global-frame edge so
+    /// later fork arming and inventory use the translated owner.
+    fn publish_private_repoint(
+        &mut self,
+        _va: u64,
+        _overlay_ipa: u64,
+        _len: usize,
+    ) -> Result<(), TrapError> {
+        Ok(())
+    }
 
     /// Backing READ of `[va, va+len)` whose stage-1 translation is `ipa`. The
     /// engine already ran the PROT_NONE gate (on `va`); this does the IPA-translated
@@ -740,8 +848,8 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
 
     fn build_process_builder(
         &self,
-        _bank_base: u64,
-        _bank_size: u64,
+        _root_slot_base: u64,
+        _root_slot_size: u64,
         _page_tables: &mut carrick_mem::page_table::PageTableManager,
         _child_pid: i32,
         _forking_tid: i32,

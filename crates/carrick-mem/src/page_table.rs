@@ -20,6 +20,11 @@ const TYPE_BLOCK: u64 = 0b01; // L1/L2 block descriptor
 const AP_MASK: u64 = 0b11 << 6; // AP[2:1]
 const AP_RW: u64 = 0b01 << 6; // RW at EL0+EL1
 const AP_RO: u64 = 0b11 << 6; // RO at EL0+EL1
+// nG (not Global), bit 11. A forked HVPatch mm has its own stage-1 graph and
+// ASID, so every private same-VA translation must set this bit. Otherwise the
+// architecture is permitted to reuse one mm's global TLB entry in another mm
+// regardless of ASID, defeating permission-fault COW isolation.
+const NON_GLOBAL: u64 = 1 << 11;
 // UXN (Unprivileged eXecute Never), bit 54: when set, EL0 instruction fetch
 // from the page faults (instruction abort → SIGSEGV). USER_*_FLAGS leave it
 // CLEAR (executable) because the boot image identity-maps code; guest `mmap`/
@@ -36,6 +41,9 @@ const PA_MASK_TABLE: u64 = 0x0000_FFFF_FFFF_F000; // next-level table PA (bits 4
 // User leaf flags (must match memory.rs USER_BLOCK_FLAGS / USER_PAGE_FLAGS).
 const USER_BLOCK_FLAGS: u64 = (1u64 << 53) | (1 << 10) | (0b11 << 8) | (0b01 << 6) | 0b01;
 const USER_PAGE_FLAGS: u64 = USER_BLOCK_FLAGS | 0b10;
+const KERNEL_BLOCK_FLAGS: u64 = (1u64 << 54) | (1 << 10) | (0b11 << 8) | 0b01;
+const KERNEL_PAGE_FLAGS: u64 = KERNEL_BLOCK_FLAGS | 0b10;
+const AP_PRIV_RO: u64 = 0b10 << 6;
 
 const PT_PAGE: u64 = 0x1000; // stage-1 table page size (4 KiB granule)
 // The boot image lays out eight tables in the first eight 4 KiB pages:
@@ -51,8 +59,15 @@ enum PtOp {
     Invalidate,
     /// Valid, AP=read-only. `exec` clears UXN (PROT_EXEC); else UXN set (NX).
     ReadOnly { exec: bool },
+    /// Fork-COW read-only plus nG. Unlike an ordinary protection edit this must
+    /// not treat an already-RO global descriptor as satisfied.
+    ForkReadOnly { exec: bool },
     /// Valid, AP=read-write. `exec` clears UXN (PROT_EXEC); else UXN set (NX).
     ReadWrite { exec: bool },
+    /// Valid, EL1 read-only and inaccessible to EL0 (AP=10).  Fork COW uses
+    /// this for Carrick's identity/mailbox pages so PSTATE.PAN never turns the
+    /// EL1 vector's own access into a false second fault.
+    KernelReadOnly { exec: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -362,6 +377,28 @@ impl PageTableManager {
         fence(Ordering::SeqCst);
     }
 
+    /// Restore an entire previously cloned table image into live backing.
+    ///
+    /// This is deliberately distinct from [`Self::sync_to_host`]: a snapshot's
+    /// dirty list describes edits which preceded the snapshot, not the later
+    /// transaction being rolled back, so replaying it cannot restore the live
+    /// descriptors that transaction changed.  Whole-image replacement is safe
+    /// only while every vCPU which can walk this table is quiesced.  The caller
+    /// must issue an appropriately scoped stage-1 TLBI before resuming them.
+    ///
+    /// # Safety
+    /// `host` must point to a writable, non-overlapping mapping of at least
+    /// `self.bytes.len()` bytes which backs this mm's live page tables, and all
+    /// hardware walkers of that backing must remain quiesced for the copy.
+    pub unsafe fn restore_quiesced_snapshot_to_host(&self, host: *mut u8) {
+        use core::sync::atomic::{Ordering, fence};
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.bytes.as_ptr(), host, self.bytes.len());
+        }
+        fence(Ordering::SeqCst);
+    }
+
     /// Byte offset of a PA known to live inside the page-table region.
     fn pa_to_off(&self, pa: u64) -> Result<usize, PageTableError> {
         let end = self.base + self.bytes.len() as u64;
@@ -469,6 +506,23 @@ impl PageTableManager {
     /// when alias regions overlap (16 KiB host rounding) or are non-linearly
     /// aliased.
     pub fn translate(&self, va: u64) -> Option<u64> {
+        self.translate_with_invalid_leaf(va, false)
+    }
+
+    /// Resolve the output address retained in a leaf whose valid bit may have
+    /// been cleared by `munmap`/`PROT_NONE` publication.
+    ///
+    /// The guest MMU must never use an invalid descriptor, so ordinary access
+    /// routes through [`Self::translate`]. Backing maintenance is different: a
+    /// reused anonymous VMA must scrub the exact physical page that the next
+    /// protection commit will revalidate, including a private COW fragment.
+    /// Clearing VALID deliberately preserves that output address; this typed
+    /// lookup exposes it without making the descriptor guest-accessible.
+    pub fn translate_retained_output(&self, va: u64) -> Option<u64> {
+        self.translate_with_invalid_leaf(va, true)
+    }
+
+    fn translate_with_invalid_leaf(&self, va: u64, allow_invalid_leaf: bool) -> Option<u64> {
         let idx = indices(va);
         let mut table_off = 0usize;
         #[allow(clippy::needless_range_loop)]
@@ -479,7 +533,8 @@ impl PageTableManager {
             }
             let desc = self.read_desc(off);
             if desc & VALID == 0 {
-                return None;
+                return (allow_invalid_leaf && level == 3 && desc & PA_MASK_4KIB != 0)
+                    .then_some((desc & PA_MASK_4KIB) | (va & 0xFFF));
             }
             let is_table_or_page = desc & TYPE_BITS == TYPE_TABLE_OR_PAGE;
             if level == 3 {
@@ -704,8 +759,15 @@ impl PageTableManager {
     fn desc_for(op: PtOp, base_pa: u64, level: usize) -> u64 {
         let (_, mask) = Self::level_span(level);
         // Block at L1/L2, page at L3 (type bit differs; USER_PAGE_FLAGS adds it).
+        let kernel_only = matches!(op, PtOp::KernelReadOnly { .. });
         let flags = if level == 3 {
-            USER_PAGE_FLAGS
+            if kernel_only {
+                KERNEL_PAGE_FLAGS
+            } else {
+                USER_PAGE_FLAGS
+            }
+        } else if kernel_only {
+            KERNEL_BLOCK_FLAGS
         } else {
             USER_BLOCK_FLAGS
         };
@@ -717,16 +779,25 @@ impl PageTableManager {
             PtOp::Invalidate => base | (flags & !VALID),
             PtOp::ReadWrite { exec } => base | flags | uxn(exec),
             PtOp::ReadOnly { exec } => base | (flags & !AP_MASK) | AP_RO | uxn(exec),
+            PtOp::ForkReadOnly { exec } => {
+                // Fork arming is a permission restriction, not a remap: a
+                // PROT_NONE descriptor must remain invalid while gaining nG so
+                // a later mprotect-to-write still inherits ASID scoping.
+                base | (flags & !VALID & !AP_MASK) | AP_RO | NON_GLOBAL | uxn(exec)
+            }
+            PtOp::KernelReadOnly { exec } => base | (flags & !AP_MASK) | AP_PRIV_RO | uxn(exec),
         }
     }
 
     /// Does a leaf with `(valid, ap, uxn_set)` already satisfy `op`? Includes the
     /// UXN (execute) bit so a re-protect that only flips PROT_EXEC still applies.
-    fn satisfies(op: PtOp, valid: bool, ap: u64, uxn_set: bool) -> bool {
+    fn satisfies(op: PtOp, valid: bool, ap: u64, uxn_set: bool, non_global: bool) -> bool {
         match op {
             PtOp::Invalidate => !valid,
             PtOp::ReadWrite { exec } => valid && ap == AP_RW && uxn_set != exec,
             PtOp::ReadOnly { exec } => valid && ap == AP_RO && uxn_set != exec,
+            PtOp::ForkReadOnly { exec } => ap == AP_RO && uxn_set != exec && non_global,
+            PtOp::KernelReadOnly { exec } => valid && ap == AP_PRIV_RO && uxn_set != exec,
         }
     }
 
@@ -747,7 +818,13 @@ impl PageTableManager {
             let block_start = cur & mask;
             let block_end = block_start + span;
             let desc = self.read_desc(off);
-            if Self::satisfies(op, desc & VALID != 0, desc & AP_MASK, desc & UXN != 0) {
+            if Self::satisfies(
+                op,
+                desc & VALID != 0,
+                desc & AP_MASK,
+                desc & UXN != 0,
+                desc & NON_GLOBAL != 0,
+            ) {
                 // The covering block is ALREADY at the target — skip its whole
                 // span with no split (this is what keeps RW-on-already-RW, and a
                 // re-protect of an unchanged range, free).
@@ -769,17 +846,34 @@ impl PageTableManager {
                 // arena behaviour.
                 let new_desc = match op {
                     PtOp::Invalidate => desc & !VALID,
-                    PtOp::ReadOnly { exec } | PtOp::ReadWrite { exec } if desc != 0 => {
+                    PtOp::ReadOnly { exec }
+                    | PtOp::ForkReadOnly { exec }
+                    | PtOp::ReadWrite { exec }
+                    | PtOp::KernelReadOnly { exec }
+                        if desc != 0 =>
+                    {
                         let ap = match op {
-                            PtOp::ReadOnly { .. } => AP_RO,
+                            PtOp::ReadOnly { .. } | PtOp::ForkReadOnly { .. } => AP_RO,
+                            PtOp::KernelReadOnly { .. } => AP_PRIV_RO,
                             _ => AP_RW,
                         };
                         let uxn = if exec { 0 } else { UXN };
-                        (desc & !AP_MASK & !UXN) | ap | uxn | VALID
+                        let non_global = if matches!(op, PtOp::ForkReadOnly { .. }) {
+                            NON_GLOBAL
+                        } else {
+                            0
+                        };
+                        let validity = if matches!(op, PtOp::ForkReadOnly { .. }) {
+                            desc & VALID
+                        } else {
+                            VALID
+                        };
+                        (desc & !AP_MASK & !UXN) | ap | uxn | non_global | validity
                     }
-                    PtOp::ReadOnly { .. } | PtOp::ReadWrite { .. } => {
-                        Self::desc_for(op, block_start, level)
-                    }
+                    PtOp::ReadOnly { .. }
+                    | PtOp::ForkReadOnly { .. }
+                    | PtOp::ReadWrite { .. }
+                    | PtOp::KernelReadOnly { .. } => Self::desc_for(op, block_start, level),
                 };
                 self.write_desc(off, new_desc);
                 changed = true;
@@ -910,6 +1004,30 @@ impl PageTableManager {
         self.apply(va, len, PtOp::ReadOnly { exec })
     }
 
+    /// Arm a private fork range read-only and make the descriptor ASID-scoped.
+    /// The output address and all unrelated attributes are preserved, including
+    /// for non-identity aliases and already-read-only mappings.
+    pub fn set_fork_readonly(
+        &mut self,
+        va: u64,
+        len: usize,
+        exec: bool,
+    ) -> Result<bool, PageTableError> {
+        self.apply(va, len, PtOp::ForkReadOnly { exec })
+    }
+
+    /// Mark a Carrick-owned EL1 range read-only without granting EL0 access.
+    /// The AP=10 distinction is architectural under PAN and must survive the
+    /// fork-arm split of the kernel-only 2 MiB boot block.
+    pub fn set_kernel_readonly(
+        &mut self,
+        va: u64,
+        len: usize,
+        exec: bool,
+    ) -> Result<bool, PageTableError> {
+        self.apply(va, len, PtOp::KernelReadOnly { exec })
+    }
+
     /// Restore `[va, va+len)` to a valid RW user page (identity-mapped). `exec`
     /// clears UXN (executable, PROT_EXEC); otherwise UXN is set (NX).
     pub fn set_rw(&mut self, va: u64, len: usize, exec: bool) -> Result<bool, PageTableError> {
@@ -961,7 +1079,7 @@ impl PageTableManager {
         ipa: u64,
         len: u64,
     ) -> Result<bool, PageTableError> {
-        const KERNEL_ATTRS: u64 = (1u64 << 54) | (1 << 10) | (0b11 << 8);
+        const KERNEL_ATTRS: u64 = (1u64 << 54) | NON_GLOBAL | (1 << 10) | (0b11 << 8);
         self.map_aliased_with_flags(
             va,
             ipa,
@@ -969,6 +1087,71 @@ impl PageTableManager {
             KERNEL_ATTRS | TYPE_BLOCK,
             KERNEL_ATTRS | TYPE_TABLE_OR_PAGE,
         )
+    }
+
+    /// Repoint existing 4 KiB leaves to a new linear IPA while preserving every
+    /// non-address attribute: validity, AP, AF, shareability, PXN and UXN.  Frame
+    /// COW uses this before selectively granting write to the semantic pages
+    /// which are currently writable.  That matters when one 16 KiB host
+    /// compound straddles a `brk`, `mprotect`, or partial-unmap boundary.
+    pub fn repoint_preserving_attributes(
+        &mut self,
+        va: u64,
+        ipa: u64,
+        len: u64,
+    ) -> Result<bool, PageTableError> {
+        const FOUR_KIB: u64 = 1 << 12;
+        if va & (FOUR_KIB - 1) != ipa & (FOUR_KIB - 1) {
+            return Err(PageTableError::BadAddress);
+        }
+        let pages = len.div_ceil(FOUR_KIB);
+        let mut changed = false;
+        for index in 0..pages {
+            let page_va = (va & !(FOUR_KIB - 1)) + index * FOUR_KIB;
+            let page_ipa = (ipa & !(FOUR_KIB - 1)) + index * FOUR_KIB;
+            let (off, level) = self.leaf_offset(page_va, true)?;
+            if level != 3 {
+                return Err(PageTableError::BadAddress);
+            }
+            let descriptor = self.read_desc(off);
+            let replacement = (descriptor & !PA_MASK_4KIB) | (page_ipa & PA_MASK_4KIB);
+            if replacement != descriptor {
+                self.write_desc(off, replacement);
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Grant EL0/EL1 write access without changing validity or execute policy.
+    /// The caller has already established that these exact semantic pages are
+    /// writable; preserving UXN/PXN avoids reintroducing execute permission on
+    /// a page whose post-fork `mprotect` state differs from its boot mapping.
+    pub fn set_writable_preserving_attributes(
+        &mut self,
+        va: u64,
+        len: usize,
+    ) -> Result<bool, PageTableError> {
+        const FOUR_KIB: u64 = 1 << 12;
+        let pages = (len as u64).div_ceil(FOUR_KIB);
+        let mut changed = false;
+        for index in 0..pages {
+            let page_va = (va & !(FOUR_KIB - 1)) + index * FOUR_KIB;
+            let (off, level) = self.leaf_offset(page_va, true)?;
+            if level != 3 {
+                return Err(PageTableError::BadAddress);
+            }
+            let descriptor = self.read_desc(off);
+            if descriptor & VALID == 0 {
+                return Err(PageTableError::BadAddress);
+            }
+            let replacement = (descriptor & !AP_MASK) | AP_RW;
+            if replacement != descriptor {
+                self.write_desc(off, replacement);
+                changed = true;
+            }
+        }
+        Ok(changed)
     }
 
     fn map_aliased_with_flags(
@@ -1159,6 +1342,97 @@ mod tests {
     }
 
     #[test]
+    fn fork_readonly_marks_the_per_mm_leaf_non_global() {
+        let mut mgr = manager();
+        let va = LINUX_MMAP_BASE + 0x24_0000;
+        assert_eq!(mgr.debug_walk(va)[3] & (1 << 11), 0);
+
+        mgr.set_fork_readonly(va, 0x1000, false)
+            .expect("arm fork COW");
+
+        let leaf = mgr.debug_walk(va)[3];
+        assert_eq!(leaf & AP_MASK, AP_RO);
+        assert_ne!(leaf & (1 << 11), 0, "per-mm fork leaf must use its ASID");
+    }
+
+    #[test]
+    fn fork_readonly_preserves_prot_none_and_later_write_keeps_non_global() {
+        let mut mgr = manager();
+        let va = LINUX_MMAP_BASE + 0x28_0000;
+        mgr.set_prot_none(va, 0x1000).expect("PROT_NONE");
+        assert!(!mgr.is_valid(va));
+
+        mgr.set_fork_readonly(va, 0x1000, false)
+            .expect("arm invalid fork leaf");
+        assert!(!mgr.is_valid(va), "fork arming must not grant access");
+        assert_ne!(mgr.debug_walk(va)[3] & NON_GLOBAL, 0);
+
+        mgr.set_rw(va, 0x1000, false).expect("mprotect write");
+        assert!(mgr.is_valid(va));
+        assert_ne!(
+            mgr.debug_walk(va)[3] & NON_GLOBAL,
+            0,
+            "mprotect must preserve the fork leaf's ASID scoping"
+        );
+    }
+
+    #[test]
+    fn kernel_cow_arm_and_alias_preserve_el1_only_access() {
+        let mut mgr = manager();
+        let va = crate::memory::LINUX_SYSCALL_MAILBOX_BASE;
+        mgr.set_kernel_readonly(va, 0x4000, false)
+            .expect("arm kernel COW");
+        assert_eq!(mgr.ap_bits(va), AP_PRIV_RO);
+
+        let private_ipa = crate::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE;
+        mgr.map_kernel_aliased(va, private_ipa, 0x4000)
+            .expect("publish kernel COW");
+        assert_eq!(mgr.ap_bits(va), 0, "EL1 is writable and EL0 remains denied");
+        assert_ne!(mgr.debug_walk(va)[3] & NON_GLOBAL, 0);
+        assert_eq!(mgr.translate(va), Some(private_ipa));
+    }
+
+    #[test]
+    fn compound_cow_repoint_preserves_mixed_semantic_permissions() {
+        let mut mgr = manager();
+        let va = LINUX_HEAP_BASE + 0x40_0000;
+        let new_ipa = crate::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE;
+        mgr.set_readonly(va, 0x4000, false)
+            .expect("arm compound read-only");
+        mgr.set_prot_none(va + 0x2000, 0x1000)
+            .expect("semantic hole inside compound");
+        let before = [
+            mgr.debug_walk(va)[3],
+            mgr.debug_walk(va + 0x1000)[3],
+            mgr.debug_walk(va + 0x2000)[3],
+            mgr.debug_walk(va + 0x3000)[3],
+        ];
+
+        mgr.repoint_preserving_attributes(va, new_ipa, 0x4000)
+            .expect("repoint physical compound");
+        mgr.set_writable_preserving_attributes(va, 0x1000)
+            .expect("faulting semantic page becomes writable");
+
+        for index in 0..4_u64 {
+            let leaf = mgr.debug_walk(va + index * 0x1000)[3];
+            assert_eq!(
+                leaf & PA_MASK_4KIB,
+                new_ipa + index * 0x1000,
+                "every leaf follows the copied compound"
+            );
+            assert_eq!(
+                leaf & !(PA_MASK_4KIB | AP_MASK),
+                before[index as usize] & !(PA_MASK_4KIB | AP_MASK),
+                "repoint/write grant preserves validity and execute attributes"
+            );
+        }
+        assert_eq!(mgr.ap_bits(va), AP_RW);
+        assert_eq!(mgr.ap_bits(va + 0x1000), AP_RO);
+        assert!(!mgr.is_valid(va + 0x2000));
+        assert_eq!(mgr.ap_bits(va + 0x3000), AP_RO);
+    }
+
+    #[test]
     fn prot_none_then_rw_remaps() {
         let mut mgr = manager();
         let va = LINUX_MMAP_BASE + 0x30_0000;
@@ -1276,6 +1550,19 @@ mod tests {
         assert_eq!(mgr.translate(va + 0x3000 + 0x10), Some(ipa + 0x3000 + 0x10));
         // One page past the mapping is unmapped.
         assert_eq!(mgr.translate(va + len), None);
+    }
+
+    #[test]
+    fn retained_output_resolves_invalidated_private_alias_without_revalidating_it() {
+        let mut mgr = manager();
+        let va = LINUX_HIGH_VA_THRESHOLD;
+        let ipa = LINUX_ALIAS_IPA_BASE + 0x20_0000;
+        mgr.map_aliased(va, ipa, 0x4000, true).expect("map");
+        mgr.invalidate(va, 0x4000).expect("invalidate");
+
+        assert_eq!(mgr.translate(va + 0x123), None);
+        assert_eq!(mgr.translate_retained_output(va + 0x123), Some(ipa + 0x123));
+        assert_eq!(mgr.debug_walk(va)[3] & VALID, 0);
     }
 
     #[test]
@@ -1542,6 +1829,16 @@ mod tests {
         let bytes = mgr.into_bytes();
         let mut mgr2 = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE);
         assert!(!mgr2.is_valid(va), "edit survived round-trip through bytes");
+    }
+
+    #[test]
+    fn quiesced_snapshot_restore_replaces_every_live_table_byte() {
+        let snapshot = manager();
+        let mut live = vec![0xa5; snapshot.as_bytes().len()];
+
+        unsafe { snapshot.restore_quiesced_snapshot_to_host(live.as_mut_ptr()) };
+
+        assert_eq!(live, snapshot.as_bytes());
     }
 
     #[test]

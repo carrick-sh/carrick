@@ -411,6 +411,7 @@ dependencies = [
  "carrick-mem",
  "carrick-observability",
  "libc",
+ "parking_lot",
 ]
 
 [[package]]

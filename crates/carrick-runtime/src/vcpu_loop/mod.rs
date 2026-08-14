@@ -129,6 +129,78 @@ fn apply_alias_frame_inventory(
         .map(|_| ())
 }
 
+struct KernelFrameCowAuthority {
+    kernel: Arc<crate::kernel::Kernel>,
+    mm: crate::kernel::MmId,
+    kicker: Arc<dyn carrick_hal::VcpuRegistry>,
+    tid: carrick_hal::ThreadId,
+}
+
+impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
+    fn quiesce(
+        &self,
+    ) -> Result<Box<dyn carrick_hal::FrameCowQuiesce>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        if self.kicker.count() <= 1 {
+            return Ok(Box::new(()));
+        }
+        quiesce::acquire_pt_pause(
+            quiesce::pt_barrier(),
+            &*self.kicker,
+            self.tid,
+            Duration::from_millis(500),
+        )
+        .map(|guard| Box::new(guard) as Box<dyn carrick_hal::FrameCowQuiesce>)
+        .map_err(|error| {
+            Box::new(std::io::Error::other(format!(
+                "HVPatch frame-COW vCPU quiesce failed: {error:?}"
+            ))) as Box<dyn std::error::Error + Send + Sync>
+        })
+    }
+
+    fn reserve(
+        &self,
+    ) -> Result<carrick_hal::FrameInventoryReservation, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let capacity = carrick_hal::FrameEventCapacity::for_event_count(2)?;
+        self.kernel
+            .reserve_frame_inventory(1, 1, capacity)
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
+    }
+
+    fn apply(
+        &self,
+        commit: carrick_hal::FrameInventoryCommit<()>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.kernel
+            .frame_inventory()
+            .apply(self.mm, commit)
+            .map(|_| ())
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
+    }
+
+    fn mapping_is_live(
+        &self,
+        mapping: carrick_hal::MappingId,
+        frame: carrick_hal::FrameId,
+        gpa: carrick_guest_mem::Gpa,
+        length: carrick_hal::FrameLength,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self
+            .kernel
+            .frame_inventory()
+            .snapshot_for_mm(self.mm)
+            .mappings
+            .iter()
+            .any(|row| {
+                row.mapping == mapping
+                    && row.frame == frame
+                    && row.gpa == gpa
+                    && row.length == length
+            }))
+    }
+}
+
 pub(super) fn requires_no_unwind_host_exit(kernel: &Kernel, engine_is_forked_child: bool) -> bool {
     !kernel.is_hvpatch_child()
         && kernel.dispatcher.execution_backend() != crate::page_profile::ExecutionBackend::HvPatch
@@ -2892,6 +2964,31 @@ where
         kicker,
         max_traps,
     );
+    if let Some(process) = kernel.hvpatch_process.as_ref() {
+        let context = kernel
+            .dispatcher
+            .capture_kernel_context(state.linux_tid)
+            .map_err(|error| {
+                RuntimeError::Configuration(format!("bind HVPatch frame-COW authority: {error}"))
+            })?;
+        let binding = process.mm_binding().ok_or_else(|| {
+            RuntimeError::Configuration("HVPatch task has no mm binding for frame COW".to_owned())
+        })?;
+        let identity = carrick_hal::FrameCowIdentity {
+            linux_pid: process.pid(),
+            linux_tid: state.this_tid.raw(),
+            mm: context.shared().mm().id().raw(),
+            asid: binding.asid.raw(),
+        };
+        let authority: Arc<dyn carrick_hal::FrameCowAuthority> =
+            Arc::new(KernelFrameCowAuthority {
+                kernel: Arc::clone(context.kernel()),
+                mm: context.shared().mm().id(),
+                kicker: Arc::clone(&state.kicker),
+                tid: state.this_tid,
+            });
+        engine.bind_frame_cow(authority, identity);
+    }
     state.register_vcpu(&engine);
     // Stamp this thread's tid into TPIDR_EL1 for the EL1 gettid fast path (main
     // thread at boot; each worker at spawn). Re-stamped after fork/exec below.
@@ -3030,6 +3127,38 @@ where
                     }
                     continue;
                 }
+                Err(TrapError::Stage1CowFault {
+                    syndrome,
+                    far,
+                    elr,
+                    spsr,
+                }) => {
+                    // Current-EL COW faults originate in Carrick's own vector
+                    // code, so they bypass the ordinary EL0-fault diagnostic
+                    // arm below.  Publish the same exact TTBR + live descriptor
+                    // walk before attempting COW; on a repeated fault after a
+                    // committed transaction this is the structural proof that
+                    // distinguishes a stale permission/TLB from a wrong root.
+                    if let Some((ttbr, descriptors)) = engine.diagnostic_fault_page_tables(far) {
+                        crate::probes::pt_fault_walk(
+                            far,
+                            descriptors[0],
+                            descriptors[1],
+                            descriptors[2],
+                            descriptors[3],
+                        );
+                        crate::probes::pt_fault_ttbr(far, ttbr);
+                    }
+                    if engine.resolve_frame_cow_fault(syndrome, far)? {
+                        continue;
+                    }
+                    return Err(RuntimeError::Trap(TrapError::GuestAtEl1 {
+                        esr_el1: syndrome,
+                        elr_el1: elr,
+                        far_el1: far,
+                        spsr_el1: spsr,
+                    }));
+                }
                 Err(TrapError::EL0Fault {
                     syndrome,
                     elr,
@@ -3037,6 +3166,9 @@ where
                     from_el0_direct,
                     ..
                 }) => {
+                    if engine.resolve_frame_cow_fault(syndrome, far)? {
+                        continue;
+                    }
                     let instruction = engine
                         .read_bytes(elr, 4)
                         .ok()
@@ -3731,6 +3863,9 @@ where
         );
     let mut vcpu_retired_by_hvpatch_cleanup = false;
     if terminal_hvpatch_process {
+        if let Err(error) = &result {
+            tracing::error!(%error, "terminal HVPatch vCPU loop failure");
+        }
         let exit_claim = match kernel.claim_process_exit() {
             Ok(claim) => claim,
             Err(error) => {
@@ -3900,14 +4035,19 @@ where
                 drop(topology);
 
                 if let Some(commit) = retirement_commit
-                    && terminal_context
+                    && let Err(error) = terminal_context
                         .kernel()
                         .frame_inventory()
                         .apply(terminal_mm, commit)
-                        .is_err()
                 {
+                    let snapshot = terminal_context
+                        .kernel()
+                        .frame_inventory()
+                        .snapshot_for_mm(terminal_mm);
                     tracing::error!(
                         pid = process.pid(),
+                        %error,
+                        live_mappings = ?snapshot.mappings,
                         "terminal HVPatch frame inventory publication failed"
                     );
                     std::process::abort();
