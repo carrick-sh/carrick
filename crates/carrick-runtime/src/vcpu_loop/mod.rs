@@ -3136,22 +3136,10 @@ where
                     elr,
                     spsr,
                 }) => {
-                    // Current-EL COW faults originate in Carrick's own vector
-                    // code, so they bypass the ordinary EL0-fault diagnostic
-                    // arm below.  Publish the same exact TTBR + live descriptor
-                    // walk before attempting COW; on a repeated fault after a
-                    // committed transaction this is the structural proof that
-                    // distinguishes a stale permission/TLB from a wrong root.
-                    if let Some((ttbr, descriptors)) = engine.diagnostic_fault_page_tables(far) {
-                        crate::probes::pt_fault_walk(
-                            far,
-                            descriptors[0],
-                            descriptors[1],
-                            descriptors[2],
-                            descriptors[3],
-                        );
-                        crate::probes::pt_fault_ttbr(far, ttbr);
-                    }
+                    // The engine's single COW resolver emits the exact TTBR +
+                    // descriptor pair immediately before its typed trigger.
+                    // Do not duplicate that pair here: the structural consumer
+                    // joins and consumes one sequence per attempted fault.
                     if engine.resolve_frame_cow_fault(syndrome, far)? {
                         continue;
                     }

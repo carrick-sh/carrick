@@ -1147,15 +1147,9 @@ where
             parent_process.kernel_graph().frame_inventory(),
             [inventory_transaction],
         );
-        if let Err(error) = engine.begin_process_inventory(inventory_reservation) {
-            if quiesced {
-                process_barrier.end_quiesce();
-            }
-            process_barrier.end_fork();
-            return Err(RuntimeError::Trap(error));
-        }
         // The reservation and its complete bounded storage exist before this
-        // topology lock. Backend materialization consumes it exactly once.
+        // topology lock. Keep it local until every guest-pointer/pidfd preflight
+        // succeeds, so EFAULT cannot occupy the backend's one process slot.
         let topology = crate::fork_quiesce::acquire_topology_lock(
             carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
             parent_process.pid(),
@@ -1232,6 +1226,22 @@ where
             child_pid,
         );
 
+        if let Err(error) = engine.begin_process_inventory(inventory_reservation) {
+            rollback_pidfd(installed_pidfd);
+            if quiesced {
+                process_barrier.end_quiesce();
+            }
+            process_barrier.end_fork();
+            return Err(RuntimeError::Trap(error));
+        }
+        let rollback_backend_fork = |engine: &mut E| {
+            let _ = engine.cancel_process_inventory();
+            engine.rollback_process_fork().unwrap_or_else(|error| {
+                tracing::error!(%error, "failed to roll back parent HVPatch fork transaction");
+                std::process::abort();
+            });
+        };
+
         fork_stage_started = Instant::now();
         let spec = match engine.build_process_spec(
             carrick_hal::GuestEntryRegs {
@@ -1247,6 +1257,7 @@ where
         ) {
             Ok(spec) => spec,
             Err(error) => {
+                rollback_backend_fork(engine);
                 rollback_pidfd(installed_pidfd);
                 if quiesced {
                     process_barrier.end_quiesce();
@@ -1323,11 +1334,18 @@ where
                         std::process::abort();
                     });
                 if ready_tx.send(Ok(child_inventory_commit)).is_err() {
-                    return;
+                    tracing::error!(
+                        child_pid,
+                        "HVPatch parent disappeared after child materialization commit"
+                    );
+                    std::process::abort();
                 }
                 let Ok(Some((child_kernel, child_process, child_context))) = start_rx.recv() else {
-                    child_engine.destroy_vcpu_on_thread_exit();
-                    return;
+                    tracing::error!(
+                        child_pid,
+                        "HVPatch child start gate disappeared after materialization commit"
+                    );
+                    std::process::abort();
                 };
                 let child_binding = child_process.mm_binding().unwrap_or_else(|| {
                     tracing::error!(child_pid, "published HVPatch child has no mm binding");
@@ -1404,6 +1422,7 @@ where
             }) {
             Ok(handle) => handle,
             Err(error) => {
+                rollback_backend_fork(engine);
                 rollback_pidfd(installed_pidfd);
                 if quiesced {
                     process_barrier.end_quiesce();
@@ -1444,6 +1463,7 @@ where
                     let _ = start_tx.send(None);
                     let _ = handle.join();
                     restore_outputs(engine);
+                    rollback_backend_fork(engine);
                     rollback_pidfd(installed_pidfd);
                     if quiesced {
                         process_barrier.end_quiesce();
@@ -1455,6 +1475,7 @@ where
                     let _ = start_tx.send(None);
                     let _ = handle.join();
                     restore_outputs(engine);
+                    rollback_backend_fork(engine);
                     rollback_pidfd(installed_pidfd);
                     if quiesced {
                         process_barrier.end_quiesce();
@@ -1477,6 +1498,10 @@ where
                 }
             }
         };
+        engine.commit_process_fork().unwrap_or_else(|error| {
+            tracing::error!(%error, "commit parent HVPatch fork transaction");
+            std::process::abort();
+        });
         // Child materialization has released its backend mapping locks. Release
         // global topology serialization before entering runtime inventory
         // authority, then publish to the exact prepared child Mm while its

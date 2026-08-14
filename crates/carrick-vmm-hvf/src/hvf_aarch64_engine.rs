@@ -462,6 +462,10 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.begin_process_inventory(reservation)
     }
 
+    fn cancel_process_inventory(&mut self) -> bool {
+        self.state.cancel_process_inventory()
+    }
+
     fn take_process_inventory(&mut self) -> Option<carrick_hal::FrameInventoryCommit<()>> {
         self.state.take_process_inventory()
     }
@@ -532,8 +536,15 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.arm_frame_cow_ranges(ranges);
     }
 
-    fn disarm_frame_cow_ranges(&mut self, ranges: &[carrick_aarch64::vmm::ForkCowRange]) {
-        self.state.disarm_frame_cow_ranges(ranges);
+    fn frame_cow_arm_snapshot(&self) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
+        self.state.frame_cow_arm_snapshot()
+    }
+
+    fn restore_frame_cow_arm_snapshot(
+        &mut self,
+        snapshot: Vec<carrick_aarch64::vmm::ForkCowRange>,
+    ) {
+        self.state.restore_frame_cow_arm_snapshot(snapshot);
     }
 
     fn armed_frame_cow_ranges(
@@ -907,6 +918,16 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     fn materialize_process(builder: Self::ProcessBuilder) -> Result<(Self, Self::Vcpu), TrapError> {
         let (state, vcpu, mailbox) = HvfVmState::from_process_spec(builder)?;
         Ok((Self { state }, HvfAarch64Vcpu::new(vcpu, mailbox)))
+    }
+
+    fn commit_process_materialization(&mut self) -> Result<(), TrapError> {
+        self.state.commit_process_materialization()
+    }
+
+    fn abort_process_materialization(&mut self, vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {
+        self.state.abort_process_materialization()?;
+        self.state.destroy_vcpu_on_thread_exit(&mut vcpu.inner);
+        Ok(())
     }
 
     fn set_guest_sp(&self, vcpu: &Self::Vcpu, sp: u64) -> Result<(), TrapError> {

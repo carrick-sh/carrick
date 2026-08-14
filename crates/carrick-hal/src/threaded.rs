@@ -741,6 +741,12 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
         ))
     }
 
+    /// Release a backend child-inventory operation slot after a fork attempt
+    /// fails before materialization consumes it.
+    fn cancel_process_inventory(&mut self) -> bool {
+        false
+    }
+
     /// Complete child materialization returns the staged batch through this
     /// seam. VM/vCPU replay never populates it.
     fn take_process_inventory(&mut self) -> Option<crate::FrameInventoryCommit<()>> {
@@ -833,6 +839,18 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
         Err(TrapError::Hypervisor(
             "backend does not support in-process fork".to_owned(),
         ))
+    }
+
+    /// The child is materialized and every remaining fork publication failure
+    /// is fail-closed. Forget the parent's saved pre-arm state.
+    fn commit_process_fork(&mut self) -> Result<(), TrapError> {
+        Ok(())
+    }
+
+    /// Restore parent stage-1 and COW-arm metadata after a recoverable child
+    /// spawn/materialization failure.
+    fn rollback_process_fork(&mut self) -> Result<(), TrapError> {
+        Ok(())
     }
 
     fn kick_handle(&self) -> Self::KickHandle;

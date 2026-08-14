@@ -131,6 +131,16 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
     /// Runtime-published mmap-arena high-water used only for fork footprint
     /// diagnostics. The runtime refreshes it immediately before every fork.
     fork_arena_high_water: u64,
+
+    /// Exact parent state retained across the host-thread spawn/materialization
+    /// window of an in-process fork. Runtime commits it only after the child is
+    /// materialized; a recoverable failure restores both authorities.
+    pending_process_fork: Option<ParentForkCowRollback>,
+}
+
+struct ParentForkCowRollback {
+    page_tables: PageTableManager,
+    armed_ranges: Vec<crate::vmm::ForkCowRange>,
 }
 
 impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
@@ -157,6 +167,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             protections: Arc::new(MemoryProtections::default()),
             reclaim_snapshot: None,
             fork_arena_high_water: u64::MAX,
+            pending_process_fork: None,
         }
     }
 
@@ -267,6 +278,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             protections,
             reclaim_snapshot: None,
             fork_arena_high_water: u64::MAX,
+            pending_process_fork: None,
         }
     }
 
@@ -1661,6 +1673,10 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.vm.begin_process_inventory(reservation)
     }
 
+    fn cancel_process_inventory(&mut self) -> bool {
+        self.vm.cancel_process_inventory()
+    }
+
     fn take_process_inventory(&mut self) -> Option<carrick_hal::FrameInventoryCommit<()>> {
         self.vm.take_process_inventory()
     }
@@ -1792,6 +1808,11 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             HvpatchForkProcessSpecStage, HvpatchForkProcessSpecStagePhase,
         };
 
+        if self.pending_process_fork.is_some() {
+            return Err(TrapError::Hypervisor(
+                "overlapping in-process parent fork transaction".to_owned(),
+            ));
+        }
         let total_started = std::time::Instant::now();
         let emit_stage =
             |phase: HvpatchForkProcessSpecStagePhase, started: std::time::Instant, units: u64| {
@@ -1858,6 +1879,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             TrapError::Hypervisor("hvpatch parent page tables are absent".to_owned())
         })?;
         let parent_page_tables_snapshot = page_tables.clone();
+        let parent_armed_snapshot = self.vm.frame_cow_arm_snapshot();
         emit_stage(
             HvpatchForkProcessSpecStagePhase::ParentPageTablesClone,
             stage_started,
@@ -2011,7 +2033,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
 
             if let Err(error) = publish_parent {
                 let rollback_result = self.pt_edit_and_flush(|manager| {
-                    *manager = parent_page_tables_snapshot;
+                    *manager = parent_page_tables_snapshot.clone();
                     Ok(true)
                 });
                 if let Err(rollback_error) = rollback_result {
@@ -2020,21 +2042,68 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                     );
                     std::process::abort();
                 }
-                self.vm.disarm_frame_cow_ranges(&cow_ranges);
+                self.vm
+                    .restore_frame_cow_arm_snapshot(parent_armed_snapshot);
                 return Err(error);
             }
             self.vm.arm_frame_cow_ranges(&cow_ranges);
+            self.pending_process_fork = Some(ParentForkCowRollback {
+                page_tables: parent_page_tables_snapshot,
+                armed_ranges: parent_armed_snapshot,
+            });
         }
         emit_stage(HvpatchForkProcessSpecStagePhase::Total, total_started, 0);
         Ok(spec)
     }
 
     fn materialize_process(spec: Self::ProcessSpec) -> Result<Self, TrapError> {
-        let (vm, mut vcpu) = V::materialize_process(spec.builder)?;
-        vcpu.restore_thread_start(&spec.snapshot)?;
+        let (mut vm, mut vcpu) = V::materialize_process(spec.builder)?;
+        if let Err(error) = vcpu.restore_thread_start(&spec.snapshot) {
+            vm.abort_process_materialization(&mut vcpu)
+                .unwrap_or_else(|rollback_error| {
+                    eprintln!(
+                        "carrick: FATAL: abort process materialization after register restore failure {error}: {rollback_error}"
+                    );
+                    std::process::abort();
+                });
+            return Err(error);
+        }
+        if let Err(error) = vm.commit_process_materialization() {
+            vm.abort_process_materialization(&mut vcpu)
+                .unwrap_or_else(|rollback_error| {
+                    eprintln!(
+                        "carrick: FATAL: abort process materialization after commit failure {error}: {rollback_error}"
+                    );
+                    std::process::abort();
+                });
+            return Err(error);
+        }
         let mut engine = Self::from_parts_with_shared(vm, vcpu, spec.page_tables, spec.protections);
         engine.process_asid = Some(spec.process_asid);
         Ok(engine)
+    }
+
+    fn commit_process_fork(&mut self) -> Result<(), TrapError> {
+        self.pending_process_fork = None;
+        Ok(())
+    }
+
+    fn rollback_process_fork(&mut self) -> Result<(), TrapError> {
+        let Some(rollback) = self.pending_process_fork.take() else {
+            return Ok(());
+        };
+        self.pt_edit_and_flush(|manager| {
+            *manager = rollback.page_tables;
+            Ok(true)
+        })
+        .map_err(|error| {
+            TrapError::Hypervisor(format!(
+                "restore parent after failed in-process fork: {error}"
+            ))
+        })?;
+        self.vm
+            .restore_frame_cow_arm_snapshot(rollback.armed_ranges);
+        Ok(())
     }
 
     fn kick_handle(&self) -> Self::KickHandle {
