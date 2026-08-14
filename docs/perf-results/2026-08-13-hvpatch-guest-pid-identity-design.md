@@ -109,3 +109,75 @@ shipping it would have broken thread identity on both reference lanes and
 turned a harmless `ESRCH` into a signal aimed at `launchd`. The four objections
 above are each concrete, each cite `file:line`, and each is checkable — which
 is a better starting point than a patch that passes tests for the wrong reason.
+
+---
+
+## RESEED ATTEMPTED, REVERTED — three host-escape blockers
+
+**Recorded 2026-08-13.** With step 1 complete, the reseed was implemented and
+measured. **It works, and it is not safe to land yet.**
+
+### What worked
+
+Seeding the root at `LINUX_BOOTSTRAP_PID` (`hvpatch/mod.rs:626`) produced
+Linux-shaped guest pids for the first time: a forked child reported
+**`pid=2`** where it previously reported 70829 (Docker gives 7). `just` tests
+stayed at 1,553 and the cold `go build` completed.
+
+It also needed a second change, which is the "two allocators" problem biting
+INSIDE the lane rather than across lanes: the thread registry seeds its root
+from `ThreadId::main_from_host_pid()` (`threaded_loop.rs:200`), so with the
+kernel root at 1 the two id spaces disagreed and every signal operation failed
+its context join with `signal operation escaped its captured KernelContext
+tid=ThreadId(21179) task=TaskKey { id: TaskId(1) }`. Seeding the registry root
+to 1 on this lane fixed it — Linux's own rule, that a thread-group leader's tid
+IS its pid.
+
+### Why it was reverted
+
+A read-only sweep found three paths by which a low guest id reaches the HOST,
+each rated *breaks-the-reseed*:
+
+1. **A `debug_assert` hard-codes the coincidence.**
+   `threaded_loop.rs:338-340` asserts the hvpatch root task id EQUALS the host
+   pid. Post-reseed that is `1 != 70828`, so **every non-release build panics at
+   run start** — `just test`, `just test-integration`, `just check`. Release is
+   silent, which is why the smoke tests passed. Twenty lines above it the same
+   file already records that the two agreeing is "a coincidence this must not
+   depend on"; this assert is that dependency, left behind.
+
+2. **Guest pgid 1 negates to the host `kill(2)` BROADCAST sentinel.**
+   pgid and sid are copied from the root task id, so post-reseed `getpgrp()`
+   returns 1. A guest `killpg(getpgrp(), SIGTERM)` — ordinary shell and init
+   behaviour — routes through `SignalTarget::Broadcast` to
+   `libc::kill(-1, SIGTERM)` **on macOS**: every process the user can signal.
+   The step-1 guard is `target > 0` (`signal.rs:2342`) and does not cover
+   negatives. `kill(0, …)` falls through too, precisely when carrick leads its
+   own process group — which is how the conformance harness spawns it.
+
+3. **The xsig nudge signals the host BEFORE that guard.**
+   `should_route_specific_xsig` (`signal.rs:155-166`) has no lane condition; for
+   SIGCHLD, SIGPIPE and every RT signal it enqueues and then calls
+   `xsig_nudge(target)` → `libc::kill(target, …)`
+   (`carrick-signal-core/src/host_glue.rs:178`), returning 30 lines before the
+   guard. Post-reseed a guest `kill(1, SIGCHLD)` sends a real host signal to
+   `launchd`. Secondary defect: the slot is keyed `target_host_pid == 1`, which
+   the drain never matches (`xsig.rs:246-250`), so it is also a permanent
+   256-slot ring leak.
+
+### The chosen order
+
+Guarding group and broadcast targets the way positive pids were guarded would
+return ESRCH for `killpg`, which breaks shells. **The decision is to build
+cross-process signal delivery through the kernel's own tables first**, so group
+and broadcast targets never reach the host at all, and only then reseed. That
+is KS's signal work regardless, and it makes the reseed land without a
+regression.
+
+The pieces already exist: `RegistryState.process_groups` and `.tasks` carry
+membership (`kernel/core.rs:1055`), each task owns a `TaskPendingSignals`
+queue with `enqueue_standard`/`enqueue_realtime`
+(`kernel/objects.rs:1718-1780`), and `raise_process_directed`
+(`dispatch/signal.rs:1113`) is the worked pattern for choosing a recipient
+thread. What is missing is enumeration plus a wake for a target that is not the
+caller.
