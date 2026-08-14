@@ -1,0 +1,28 @@
+tool=/opt/homebrew/opt/llvm/bin/lldb
+core=coredumpfile.core (aarch64, pid 5)
+
+thread #1 tid=5 pc=0x226444 SIGSEGV fault-address=0
+  instruction: str x19, [x0]
+  x0=0x0 x8=0xc00000 x19=0x4d41494e434f5245
+  sp=0xfffffef830 cpsr=0x600003c0
+  v0=45 52 4f 43 4e 49 41 4d 45 52 4f 43 4e 49 41 4d
+  fpsr=0x1 fpcr=0x00c00000
+
+thread #2 tid=7 pc=0x29c26c signal=0
+  instruction: b 0x26d6e8
+  x0=0x0 x8=0x400000 sp=0x6000027a60 cpsr=0x000003c0
+  v0=31 47 4e 49 4e 4e 55 52 31 47 4e 49 4e 4e 55 52
+  fpsr=0x2 fpcr=0x00400000
+
+thread #3 tid=8 pc=0x29c00c signal=0
+  instruction: b 0x2265bc (adjacent svc at 0x29c010)
+  x0=0x4 x8=0x3f sp=0x600004aa50 cpsr=0x200003c0
+  v0=32 44 45 4b 43 4f 4c 42 32 44 45 4b 43 4f 4c 42
+  fpsr=0x4 fpcr=0x00800000
+
+memory navigation at private COW mapping 0x6700000000:
+  0x6700000000: 0x5205cc9df38c4610 0x5e9fada28aeb89c6
+  0x6700000010: 0x0f0cf85bfa3743b7 0x57c468a7b4a890f1
+
+LLDB does not name AArch64 NT_ARM_TLS as a register on this build; the strict
+Carrick validator independently reports TPIDR_EL0 for all three threads.

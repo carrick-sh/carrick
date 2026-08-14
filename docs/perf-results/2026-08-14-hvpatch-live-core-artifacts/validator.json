@@ -1,0 +1,55 @@
+{
+  "path": "docs/perf-results/2026-08-14-hvpatch-live-core-artifacts/coredumpfile.core",
+  "bytes": 11341824,
+  "machine": "aarch64",
+  "pid": 5,
+  "ppid": 4,
+  "comm": "p",
+  "signal": 11,
+  "signal_code": 1,
+  "fault_address": 0,
+  "threads": [
+    {
+      "tid": 5,
+      "current_signal": 11,
+      "pc": 2253892,
+      "sp": 1099511560240,
+      "pstate": 1610613696,
+      "x0": 0,
+      "tpidr_el0": 1229801703532086340,
+      "v0": [5566811214892192325, 5566811214892192325],
+      "fpsr": 1,
+      "fpcr": 12582912
+    },
+    {
+      "tid": 7,
+      "current_signal": 0,
+      "pc": 2736748,
+      "sp": 412317022816,
+      "pstate": 960,
+      "x0": 0,
+      "tpidr_el0": 6148933456521300104,
+      "v0": [5932734182274778929, 5932734182274778929],
+      "fpsr": 2,
+      "fpcr": 4194304
+    },
+    {
+      "tid": 8,
+      "current_signal": 0,
+      "pc": 2736140,
+      "sp": 412317166160,
+      "pstate": 536871872,
+      "x0": 4,
+      "tpidr_el0": 11068065209510513868,
+      "v0": [4777280455177487410, 4777280455177487410],
+      "fpsr": 4,
+      "fpcr": 8388608
+    }
+  ],
+  "auxv_entries": 18,
+  "file_mappings": 9,
+  "load_segments": 26,
+  "load_segments_with_contents": 22,
+  "foreign_notes": 0,
+  "memory_bytes": 11356953
+}

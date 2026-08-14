@@ -1,0 +1,10 @@
+Focused tests at implementation commit 2a84f4cb:
+
+cargo test -p carrick-cli hvpatch_core_profile: 5 passed
+cargo test -p carrick-cli debug_core: 4 passed
+RUST_TEST_THREADS=1 cargo test -p carrick-runtime core_dump --lib: 9 passed
+RUST_TEST_THREADS=1 cargo test -p carrick-runtime core_publication --lib: 3 passed
+RUST_TEST_THREADS=1 cargo test -p carrick-runtime fatal_core_authority --lib: 1 passed
+cargo test -p carrick-vmm-hvf guest_copy_mapping --lib: 1 passed
+
+All commands exited 0.

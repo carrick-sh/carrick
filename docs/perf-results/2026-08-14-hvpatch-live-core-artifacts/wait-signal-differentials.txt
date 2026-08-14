@@ -1,0 +1,14 @@
+Final signed serialized Docker differentials
+
+coredumpbit run=cr-87308-15511 cleanup=0 MATCH
+  SIGABRT/SIGSEGV/SIGQUIT: WCOREDUMP set
+  SIGTERM/SIGKILL: WCOREDUMP clear
+
+waitidspec run=cr-87352-19571 cleanup=0 MATCH
+  exit, killed, WNOWAIT peek/reap, and ECHILD observations all true
+
+sigchld run=cr-87395-6793 cleanup=0 MATCH
+  handler, reap, ignored disposition, and sequential delivery observations all true
+
+signalexit run=cr-87298-28715 cleanup=0 MATCH
+  SIGTERM/SIGKILL wait status and clean exit observations all true

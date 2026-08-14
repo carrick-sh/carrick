@@ -1,0 +1,18 @@
+Final signed RLIMIT_CORE matrix
+
+--core-limit-zero  run=task5-evidence-rlimit-zero-87117
+limit_zero_mode=true
+requested_limit_applied=true
+wcoredump_clear=true
+no_published_core=true
+no_temporary_core=true
+status=0 cleanup=0
+
+--core-limit-small run=task5-evidence-rlimit-small-87117 limit=4096
+failure=core readable regions require at least 11332377 bytes, exceeding RLIMIT_CORE 4096
+limit_too_small_mode=true
+requested_limit_applied=true
+wcoredump_clear=true
+no_published_core=true
+no_temporary_core=true
+status=0 cleanup=0
