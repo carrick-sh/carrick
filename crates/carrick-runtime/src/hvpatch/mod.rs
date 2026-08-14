@@ -92,6 +92,7 @@ pub(crate) enum ProcessThreadExit {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WaitResult {
     Exited(ChildExit),
+    StateChanged(ChildExit),
     StillRunning,
     NoChild,
 }
@@ -123,6 +124,17 @@ impl ProcessContext {
 
     pub(crate) fn task_binding(&self) -> crate::kernel::KernelTaskBinding {
         self.binding.clone()
+    }
+
+    pub(crate) fn wait_until_job_control_resumed(&self) {
+        if let Some(task) = self
+            .kernel_graph()
+            .registry()
+            .task(self.task_id())
+            .filter(|task| task.key() == self.task_key())
+        {
+            task.wait_until_job_control_resumed();
+        }
     }
 
     pub(crate) fn kernel_graph(&self) -> &std::sync::Arc<crate::kernel::Kernel> {
@@ -466,11 +478,17 @@ impl ProcessContext {
         }
     }
 
-    pub(crate) fn wait_child(
+    pub(crate) fn wait_child(&self, target: Option<i32>, nohang: bool, nowait: bool) -> WaitResult {
+        self.wait_child_with_job_control(target, nohang, nowait, false, false)
+    }
+
+    pub(crate) fn wait_child_with_job_control(
         &self,
         target: Option<i32>,
         _nohang: bool,
         nowait: bool,
+        include_stopped: bool,
+        include_continued: bool,
     ) -> WaitResult {
         let target = target.and_then(|raw| crate::kernel::TaskId::from_abi_positive(raw).ok());
         let mode = if nowait {
@@ -480,11 +498,29 @@ impl ProcessContext {
         };
         loop {
             let observed = self.kernel_graph().reservation_epoch();
-            match self.kernel_graph().wait_child(self.task_id(), target, mode) {
+            match self.kernel_graph().wait_child_with_job_control(
+                self.task_id(),
+                target,
+                include_stopped,
+                include_continued,
+                mode,
+            ) {
                 Ok(crate::kernel::WaitOutcome::Exited(zombie)) => {
                     break WaitResult::Exited(ChildExit {
                         pid: zombie.key.id,
                         status: zombie.status.raw(),
+                    });
+                }
+                Ok(crate::kernel::WaitOutcome::Stopped { task, signal }) => {
+                    break WaitResult::StateChanged(ChildExit {
+                        pid: task,
+                        status: (signal.raw() << 8) | 0x7f,
+                    });
+                }
+                Ok(crate::kernel::WaitOutcome::Continued { task }) => {
+                    break WaitResult::StateChanged(ChildExit {
+                        pid: task,
+                        status: 0xffff,
                     });
                 }
                 Ok(crate::kernel::WaitOutcome::StillRunning) => {
@@ -526,6 +562,12 @@ impl ProcessContext {
                         status: zombie.status.raw(),
                     });
                 }
+                Ok(
+                    crate::kernel::WaitOutcome::Stopped { .. }
+                    | crate::kernel::WaitOutcome::Continued { .. },
+                ) => {
+                    break WaitResult::StillRunning;
+                }
                 Ok(crate::kernel::WaitOutcome::StillRunning) => {
                     break WaitResult::StillRunning;
                 }
@@ -543,7 +585,13 @@ impl ProcessContext {
         }
     }
 
-    pub(crate) fn wait_child_in_process_group(&self, group: i32, nowait: bool) -> WaitResult {
+    pub(crate) fn wait_child_in_process_group_with_job_control(
+        &self,
+        group: i32,
+        nowait: bool,
+        include_stopped: bool,
+        include_continued: bool,
+    ) -> WaitResult {
         let Ok(group) = crate::kernel::ProcessGroupId::from_abi_positive(group) else {
             return WaitResult::NoChild;
         };
@@ -556,12 +604,29 @@ impl ProcessContext {
             let observed = self.kernel_graph().reservation_epoch();
             match self
                 .kernel_graph()
-                .wait_child_in_process_group(self.task_id(), group, mode)
-            {
+                .wait_child_in_process_group_with_job_control(
+                    self.task_id(),
+                    group,
+                    include_stopped,
+                    include_continued,
+                    mode,
+                ) {
                 Ok(crate::kernel::WaitOutcome::Exited(zombie)) => {
                     break WaitResult::Exited(ChildExit {
                         pid: zombie.key.id,
                         status: zombie.status.raw(),
+                    });
+                }
+                Ok(crate::kernel::WaitOutcome::Stopped { task, signal }) => {
+                    break WaitResult::StateChanged(ChildExit {
+                        pid: task,
+                        status: (signal.raw() << 8) | 0x7f,
+                    });
+                }
+                Ok(crate::kernel::WaitOutcome::Continued { task }) => {
+                    break WaitResult::StateChanged(ChildExit {
+                        pid: task,
+                        status: 0xffff,
                     });
                 }
                 Ok(crate::kernel::WaitOutcome::StillRunning) => {
@@ -1658,6 +1723,72 @@ mod tests {
         assert_eq!(exit.pid(), child_id);
         assert_eq!(exit.status(), 23 << 8);
         assert_eq!(parent.live_process_count(), 1);
+    }
+
+    #[test]
+    fn process_adapter_reports_task_scoped_stop_and_continue_wait_status() {
+        let (parent, root) = authoritative_root();
+        let prepared_mm = parent.bank_resources().prepare_child().unwrap();
+        let child_tid = crate::thread::ThreadId::synthetic_for_tests(10_002);
+        let published = parent
+            .kernel_graph()
+            .reserve_fork(
+                &root,
+                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
+                    .unwrap(),
+                "job-control-adapter-child".to_owned(),
+                None,
+            )
+            .unwrap()
+            .prepare_with_mm_backend(prepared_mm.backend(), child_tid)
+            .unwrap()
+            .commit()
+            .unwrap();
+        let (child_context, wait) = published.into_parts().unwrap();
+        assert!(wait.is_none());
+        let backend = parent
+            .bank_resources()
+            .publish_child(child_context.task().key(), prepared_mm)
+            .unwrap();
+        let child = parent.published_child_context(&child_context, backend);
+        let sigstop = crate::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGSTOP)
+            .expect("SIGSTOP");
+
+        assert!(
+            parent
+                .kernel_graph()
+                .stop_task_for_job_control(child.task_id(), sigstop)
+        );
+        let WaitResult::StateChanged(stopped) =
+            parent.wait_child_with_job_control(Some(child.pid()), true, false, true, false)
+        else {
+            panic!("task-scoped stop was not waitable");
+        };
+        assert_eq!(
+            stopped.status(),
+            (carrick_abi::LINUX_SIGSTOP << 8) | 0x7f,
+            "adapter publishes the Linux wait-status encoding, not Darwin's signal numbers",
+        );
+
+        let sigcont = crate::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGCONT)
+            .expect("SIGCONT");
+        assert!(
+            parent
+                .kernel_graph()
+                .post_signal_to_task(child.task_id(), sigcont, None)
+        );
+        let WaitResult::StateChanged(continued) =
+            parent.wait_child_with_job_control(Some(child.pid()), true, false, false, true)
+        else {
+            panic!("task-scoped continue was not waitable");
+        };
+        assert_eq!(continued.status(), 0xffff);
+
+        finalize_test_child(&child, 0, child_tid);
+        assert!(matches!(
+            parent.wait_child(Some(child.pid()), true, false),
+            WaitResult::Exited(_)
+        ));
     }
 
     #[test]

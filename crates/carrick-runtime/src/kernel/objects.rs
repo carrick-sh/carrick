@@ -2211,6 +2211,19 @@ struct TaskIdentity {
     session: SessionId,
 }
 
+#[derive(Debug, Default)]
+struct TaskJobControl {
+    stopped_by: Option<LinuxSignal>,
+    pending_stop: Option<LinuxSignal>,
+    pending_continue: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TaskJobControlEvent {
+    Stopped(LinuxSignal),
+    Continued,
+}
+
 /// How the kernel makes a task NOTICE something it has been handed.
 ///
 /// Enqueuing a signal is only half of delivery. A task that reaches a syscall
@@ -2238,6 +2251,14 @@ pub struct Task {
     children: Mutex<BTreeSet<TaskKey>>,
     identity: Mutex<TaskIdentity>,
     lifecycle: Mutex<TaskLifecycle>,
+    /// Process-directed signal permission uses the last published thread-group
+    /// leader credential generation. Keep it after a non-final leader exit; a
+    /// live task must not become ESRCH merely because only siblings remain.
+    process_credentials: ArcSwap<Credentials>,
+    /// Guest job-control state is task scoped. HVPatch cannot lower it to host
+    /// SIGSTOP/SIGCONT because all guest tasks share one Darwin process.
+    job_control: Mutex<TaskJobControl>,
+    job_control_changed: Condvar,
     shared: ArcSwap<TaskShared>,
     threads: Mutex<BTreeMap<LinuxTid, (ThreadKey, ThreadRef)>>,
     cpu: TaskCpu,
@@ -2280,6 +2301,7 @@ impl Task {
         process_group: ProcessGroupId,
         session: SessionId,
         shared: Arc<TaskShared>,
+        process_credentials: Arc<Credentials>,
     ) -> Self {
         Self {
             key,
@@ -2290,6 +2312,9 @@ impl Task {
                 session,
             }),
             lifecycle: Mutex::new(TaskLifecycle::Live),
+            process_credentials: ArcSwap::new(process_credentials),
+            job_control: Mutex::new(TaskJobControl::default()),
+            job_control_changed: Condvar::new(),
             shared: ArcSwap::new(shared),
             threads: Mutex::new(BTreeMap::new()),
             cpu: TaskCpu::default(),
@@ -2436,12 +2461,95 @@ impl Task {
         *self.lifecycle.lock()
     }
 
-    pub(super) fn begin_exit(&self) -> bool {
-        let mut lifecycle = self.lifecycle.lock();
-        if *lifecycle == TaskLifecycle::Exiting {
+    pub(super) fn process_credentials(&self) -> Arc<Credentials> {
+        self.process_credentials.load_full()
+    }
+
+    pub(super) fn replace_process_credentials(&self, credentials: Arc<Credentials>) {
+        self.process_credentials.store(credentials);
+    }
+
+    pub(crate) fn is_job_control_stopped(&self) -> bool {
+        self.job_control.lock().stopped_by.is_some()
+    }
+
+    /// Publish one default-stop transition and a waitable child-state event.
+    /// Repeated stop signals while already stopped do not manufacture another
+    /// WUNTRACED report.
+    pub(super) fn stop_for_job_control(&self, signal: LinuxSignal) -> bool {
+        // Keep the lifecycle lock through publication. Otherwise exit could
+        // clear job control between this check and the state write, leaving a
+        // retired task stopped forever with nobody left to resume it.
+        let lifecycle = self.lifecycle.lock();
+        if *lifecycle != TaskLifecycle::Live {
             return false;
         }
-        *lifecycle = TaskLifecycle::Exiting;
+        let mut state = self.job_control.lock();
+        if state.stopped_by.is_some() {
+            return true;
+        }
+        state.stopped_by = Some(signal);
+        state.pending_stop = Some(signal);
+        true
+    }
+
+    /// Resume a stopped task and publish one waitable WCONTINUED transition.
+    /// SIGCONT against an already-running task remains successful but creates no
+    /// child-state event, matching Linux's state-change semantics.
+    pub(super) fn continue_from_job_control(&self) -> bool {
+        let lifecycle = self.lifecycle.lock();
+        if *lifecycle != TaskLifecycle::Live {
+            return false;
+        }
+        let mut state = self.job_control.lock();
+        let changed = state.stopped_by.take().is_some();
+        if changed {
+            state.pending_continue = true;
+            self.job_control_changed.notify_all();
+        }
+        changed
+    }
+
+    pub(crate) fn wait_until_job_control_resumed(&self) {
+        let mut state = self.job_control.lock();
+        while state.stopped_by.is_some() {
+            self.job_control_changed.wait(&mut state);
+        }
+    }
+
+    pub(super) fn waitable_job_control_event(
+        &self,
+        include_stopped: bool,
+        include_continued: bool,
+        consume: bool,
+    ) -> Option<TaskJobControlEvent> {
+        let mut state = self.job_control.lock();
+        if include_stopped && let Some(signal) = state.pending_stop {
+            if consume {
+                state.pending_stop = None;
+            }
+            return Some(TaskJobControlEvent::Stopped(signal));
+        }
+        if include_continued && state.pending_continue {
+            if consume {
+                state.pending_continue = false;
+            }
+            return Some(TaskJobControlEvent::Continued);
+        }
+        None
+    }
+
+    pub(super) fn begin_exit(&self) -> bool {
+        {
+            let mut lifecycle = self.lifecycle.lock();
+            if *lifecycle == TaskLifecycle::Exiting {
+                return false;
+            }
+            *lifecycle = TaskLifecycle::Exiting;
+        }
+        let mut job_control = self.job_control.lock();
+        job_control.stopped_by = None;
+        self.job_control_changed.notify_all();
         true
     }
 
@@ -3477,19 +3585,20 @@ mod tests {
             let mm = Arc::new(Mm::new_reference(ids.mm_id().expect("mm ID")));
             let sighand = Arc::new(Sighand::new(ids.sighand_id().expect("sighand ID")));
             let shared = Arc::new(TaskShared::new(mm, sighand));
-            let task = Arc::new(Task::new(
-                key,
-                None,
-                ProcessGroupId::from_leader(task_id),
-                SessionId::from_leader(task_id),
-                shared,
-            ));
             let resources = Arc::new(ThreadResources::new(
                 Arc::new(FileTable::new(ids.file_table_id().expect("files ID"))),
                 Arc::new(FsContext::new(ids.fs_context_id().expect("fs ID"))),
                 Arc::new(Credentials::root(
                     ids.credentials_id().expect("credentials ID"),
                 )),
+            ));
+            let task = Arc::new(Task::new(
+                key,
+                None,
+                ProcessGroupId::from_leader(task_id),
+                SessionId::from_leader(task_id),
+                shared,
+                resources.credentials(),
             ));
             let leader = task
                 .attach_thread(

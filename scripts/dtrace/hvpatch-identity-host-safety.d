@@ -13,6 +13,9 @@
  * target 0, broadcast -1, a negative non-init process group, tgkill, and the
  * former early-xsig SIGCHLD shape. A Darwin kill aimed anywhere in the Linux
  * low-ID range [-63, 63] is fatal evidence, including signal-zero probes.
+ * The fixture's task-scoped job-control proof must also populate exact guest
+ * SIGSTOP(19) and SIGCONT(18) sends; a completed target with both populations
+ * proves the shared Darwin carrier was never host-stopped.
  *
  * Perturbation: one USDT probe per guest syscall plus Darwin kill entry. The
  * fixture is tiny; results are correctness evidence, not timing evidence.
@@ -33,6 +36,8 @@ dtrace:::BEGIN
     negative_group = 0;
     tgkills = 0;
     xsig_shapes = 0;
+    stop_signals = 0;
+    continue_signals = 0;
     host_low_kills = 0;
     bounded = 0;
     errors = 0;
@@ -56,6 +61,8 @@ carrick*:::syscall-entry
     broadcast += this->selector == -1;
     negative_group += this->selector < -1;
     xsig_shapes += this->selector > 1 && this->signal == 17;
+    stop_signals += this->signal == 19;
+    continue_signals += this->signal == 18;
 }
 
 carrick*:::syscall-entry
@@ -108,12 +115,14 @@ dtrace:::END
 {
     this->valid = guest_kills > 0 && positive_one > 0 && zero > 0 &&
         broadcast > 0 && negative_group > 0 && tgkills > 0 &&
-        xsig_shapes > 0 && host_low_kills == 0 && bounded == 0 &&
+        xsig_shapes > 0 && stop_signals > 0 && continue_signals > 0 &&
+        host_low_kills == 0 && bounded == 0 &&
         errors == 0 && drops == 0 && target_exited == 1 &&
         target_exit_seen == 1 && target_exit_code == 0;
-    printf("HVPATCHIDENTITY1|summary|status=%s|guest_kills=%d|positive_one=%d|zero=%d|broadcast=%d|negative_group=%d|tgkills=%d|xsig_shapes=%d|host_low_kills=%d|bounded=%d|errors=%d|drops=%d|target_exited=%d|target_exit_seen=%d|target_exit_code=%d|target_exit_reason=%d\n",
+    printf("HVPATCHIDENTITY1|summary|status=%s|guest_kills=%d|positive_one=%d|zero=%d|broadcast=%d|negative_group=%d|tgkills=%d|xsig_shapes=%d|stop_signals=%d|continue_signals=%d|host_low_kills=%d|bounded=%d|errors=%d|drops=%d|target_exited=%d|target_exit_seen=%d|target_exit_code=%d|target_exit_reason=%d\n",
         this->valid ? "ok" : "error", guest_kills, positive_one, zero,
-        broadcast, negative_group, tgkills, xsig_shapes, host_low_kills,
+        broadcast, negative_group, tgkills, xsig_shapes, stop_signals,
+        continue_signals, host_low_kills,
         bounded, errors, drops, target_exited, target_exit_seen,
         target_exit_code, target_exit_reason);
 }

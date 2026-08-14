@@ -11,6 +11,8 @@ use crate::trace_profile::ProfileCaptureStatus;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HvpatchIdentityHostSafetySummary {
     pub(crate) guest_kills: u64,
+    pub(crate) stop_signals: u64,
+    pub(crate) continue_signals: u64,
     pub(crate) host_low_kills: u64,
 }
 
@@ -68,6 +70,8 @@ impl HvpatchIdentityHostSafetySummary {
             "negative_group",
             "tgkills",
             "xsig_shapes",
+            "stop_signals",
+            "continue_signals",
             "host_low_kills",
             "bounded",
             "errors",
@@ -78,6 +82,8 @@ impl HvpatchIdentityHostSafetySummary {
             "target_exit_reason",
         ])?;
         let guest_kills = record.u64("guest_kills")?;
+        let stop_signals = record.u64("stop_signals")?;
+        let continue_signals = record.u64("continue_signals")?;
         let host_low_kills = record.u64("host_low_kills")?;
         let valid = record.value("status")? == "ok"
             && guest_kills > 0
@@ -87,6 +93,8 @@ impl HvpatchIdentityHostSafetySummary {
             && record.u64("negative_group")? > 0
             && record.u64("tgkills")? > 0
             && record.u64("xsig_shapes")? > 0
+            && stop_signals > 0
+            && continue_signals > 0
             && host_low_kills == 0
             && record.u64("bounded")? == 0
             && record.u64("errors")? == 0
@@ -100,14 +108,16 @@ impl HvpatchIdentityHostSafetySummary {
         }
         Ok(Self {
             guest_kills,
+            stop_signals,
+            continue_signals,
             host_low_kills,
         })
     }
 
     pub(crate) fn render_human(self) -> String {
         format!(
-            "HVPatch identity host safety: guest_kills={}, low_guest_id_host_kills={}",
-            self.guest_kills, self.host_low_kills
+            "HVPatch identity host safety: guest_kills={}, guest_sigstops={}, guest_sigconts={}, low_guest_id_host_kills={}",
+            self.guest_kills, self.stop_signals, self.continue_signals, self.host_low_kills
         )
     }
 }
@@ -195,7 +205,7 @@ mod tests {
     use crate::trace_profile::ProfileCaptureStatus;
 
     const HEADER: &str = "HVPATCHIDENTITY1|header|version=1";
-    const VALID: &str = "HVPATCHIDENTITY1|summary|status=ok|guest_kills=8|positive_one=1|zero=1|broadcast=2|negative_group=1|tgkills=2|xsig_shapes=1|host_low_kills=0|bounded=0|errors=0|drops=0|target_exited=1|target_exit_seen=1|target_exit_code=0|target_exit_reason=1";
+    const VALID: &str = "HVPATCHIDENTITY1|summary|status=ok|guest_kills=8|positive_one=1|zero=1|broadcast=2|negative_group=1|tgkills=2|xsig_shapes=1|stop_signals=1|continue_signals=1|host_low_kills=0|bounded=0|errors=0|drops=0|target_exited=1|target_exit_seen=1|target_exit_code=0|target_exit_reason=1";
 
     #[test]
     fn accepts_complete_lossless_host_safe_stream() {
@@ -205,6 +215,8 @@ mod tests {
         )
         .expect("complete host-safety stream");
         assert_eq!(summary.guest_kills, 8);
+        assert_eq!(summary.stop_signals, 1);
+        assert_eq!(summary.continue_signals, 1);
         assert_eq!(summary.host_low_kills, 0);
     }
 
@@ -213,6 +225,8 @@ mod tests {
         for line in [
             VALID.replace("host_low_kills=0", "host_low_kills=1"),
             VALID.replace("negative_group=1", "negative_group=0"),
+            VALID.replace("stop_signals=1", "stop_signals=0"),
+            VALID.replace("continue_signals=1", "continue_signals=0"),
         ] {
             assert!(
                 HvpatchIdentityHostSafetySummary::from_lines(
