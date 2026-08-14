@@ -16,6 +16,17 @@ const SIG_CHLD: u32 = 1 << 3;
 const ALL_CHILD_SIGNALS: u32 = SIG_USR1 | SIG_USR2 | SIG_TERM | SIG_CHLD;
 
 static CHILD_SIGNALS: AtomicU32 = AtomicU32::new(0);
+static ROOT_SIGNALS: AtomicU32 = AtomicU32::new(0);
+
+extern "C" fn root_signal(signum: libc::c_int) {
+    let bit = match signum {
+        libc::SIGUSR1 => SIG_USR1,
+        libc::SIGUSR2 => SIG_USR2,
+        libc::SIGTERM => SIG_TERM,
+        _ => 0,
+    };
+    ROOT_SIGNALS.fetch_or(bit, Ordering::SeqCst);
+}
 
 extern "C" fn child_signal(signum: libc::c_int) {
     let bit = match signum {
@@ -59,9 +70,14 @@ fn exact_write(fd: i32, value: u64) -> bool {
 }
 
 fn exact_read(fd: i32) -> Option<u64> {
-    let mut bytes = [0_u8; 8];
-    let got = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
-    (got == bytes.len() as isize).then(|| u64::from_ne_bytes(bytes))
+    loop {
+        let mut bytes = [0_u8; 8];
+        let got = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+        if got == -1 && errno() == libc::EINTR {
+            continue;
+        }
+        return (got == bytes.len() as isize).then(|| u64::from_ne_bytes(bytes));
+    }
 }
 
 fn make_pipe() -> Option<[i32; 2]> {
@@ -69,16 +85,151 @@ fn make_pipe() -> Option<[i32; 2]> {
     (unsafe { libc::pipe(fds.as_mut_ptr()) } == 0).then_some(fds)
 }
 
+fn wait_for_bits(bits: &AtomicU32, expected: u32) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while bits.load(Ordering::SeqCst) & expected != expected
+        && std::time::Instant::now() < deadline
+    {
+        unsafe { libc::sched_yield() };
+    }
+    bits.load(Ordering::SeqCst) & expected == expected
+}
+
 fn wait_exited(pid: i32) -> Option<i32> {
-    let mut status = 0_i32;
-    let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-    (waited == pid && libc::WIFEXITED(status)).then(|| libc::WEXITSTATUS(status))
+    loop {
+        let mut status = 0_i32;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if waited == -1 && errno() == libc::EINTR {
+            continue;
+        }
+        return (waited == pid && libc::WIFEXITED(status))
+            .then(|| libc::WEXITSTATUS(status));
+    }
 }
 
 fn query_disposition(signum: i32) -> Option<libc::sighandler_t> {
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
     (unsafe { libc::sigaction(signum, std::ptr::null(), &mut action) } == 0)
         .then_some(action.sa_sigaction)
+}
+
+fn self_signal_case(pid: i32, tid: i32) -> (bool, bool) {
+    ROOT_SIGNALS.store(0, Ordering::SeqCst);
+    let handlers = [libc::SIGUSR1, libc::SIGUSR2]
+        .into_iter()
+        .all(|signum| unsafe { install_handler(signum, root_signal, 0) });
+    let kill_ok = unsafe { libc::kill(pid, libc::SIGUSR1) } == 0;
+    let kill_delivered = wait_for_bits(&ROOT_SIGNALS, SIG_USR1);
+    let tgkill_ok = unsafe { libc::syscall(libc::SYS_tgkill, pid, tid, libc::SIGUSR2) } == 0;
+    let tgkill_delivered = wait_for_bits(&ROOT_SIGNALS, SIG_USR1 | SIG_USR2);
+    (
+        handlers && kill_ok && kill_delivered,
+        handlers && tgkill_ok && tgkill_delivered,
+    )
+}
+
+fn child_sends_parent_signal(parent_pid: i32, group: bool) -> bool {
+    let Some(result) = make_pipe() else {
+        return false;
+    };
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        unsafe { libc::close(result[0]) };
+        let own_handler = !group || unsafe { install_handler(libc::SIGTERM, child_signal, 0) };
+        CHILD_SIGNALS.store(0, Ordering::SeqCst);
+        let target = if group { 0 } else { parent_pid };
+        let sent = unsafe { libc::kill(target, libc::SIGTERM) } == 0;
+        let own_delivery = !group || wait_for_bits(&CHILD_SIGNALS, SIG_TERM);
+        let _ = exact_write(result[1], u64::from(own_handler && sent && own_delivery));
+        unsafe { libc::_exit(0) }
+    }
+    unsafe { libc::close(result[1]) };
+    let sent = exact_read(result[0]) == Some(1);
+    sent && wait_exited(child) == Some(0)
+}
+
+fn pid_one_signal_immunity_case(parent_pid: i32) -> (bool, bool, bool, bool) {
+    // Guest init has no SIGTERM handler here. Linux accepts both sends but
+    // suppresses its default-lethal action; the group sender catches its own
+    // copy so the group arm can report success.
+    let default_positive = child_sends_parent_signal(parent_pid, false);
+    let default_group = child_sends_parent_signal(parent_pid, true);
+
+    ROOT_SIGNALS.fetch_and(!SIG_TERM, Ordering::SeqCst);
+    let handler_installed = unsafe { install_handler(libc::SIGTERM, root_signal, 0) };
+    let handled_send = child_sends_parent_signal(parent_pid, false);
+    let handled_delivery = wait_for_bits(&ROOT_SIGNALS, SIG_TERM);
+    (
+        default_positive && default_group,
+        handler_installed,
+        handled_send,
+        handled_delivery,
+    )
+}
+
+fn call_denied(operation: impl FnOnce() -> libc::c_int) -> bool {
+    let result = operation();
+    result == -1 && errno() == libc::EPERM
+}
+
+fn credential_denial_case() -> [bool; 3] {
+    let Some(ready) = make_pipe() else {
+        return [false; 3];
+    };
+    let Some(release) = make_pipe() else {
+        return [false; 3];
+    };
+    let target = unsafe { libc::fork() };
+    if target == 0 {
+        unsafe {
+            libc::close(ready[0]);
+            libc::close(release[1]);
+        }
+        let prepared =
+            unsafe { libc::setpgid(0, 0) } == 0 && unsafe { libc::setuid(2000) } == 0;
+        let announced = exact_write(ready[1], u64::from(prepared));
+        let released = exact_read(release[0]) == Some(1);
+        unsafe { libc::_exit(if prepared && announced && released { 0 } else { 6 }) }
+    }
+    unsafe {
+        libc::close(ready[1]);
+        libc::close(release[0]);
+    }
+    if target <= 0 {
+        return [false; 3];
+    }
+    if exact_read(ready[0]) != Some(1) {
+        let _ = exact_write(release[1], 1);
+        let _ = wait_exited(target);
+        return [false; 3];
+    }
+
+    let Some(result) = make_pipe() else {
+        return [false; 3];
+    };
+    let sender = unsafe { libc::fork() };
+    if sender == 0 {
+        unsafe { libc::close(result[0]) };
+        let changed = unsafe { libc::setuid(1000) } == 0;
+        let positive = call_denied(|| unsafe { libc::kill(target, 0) });
+        let thread = call_denied(|| unsafe {
+            libc::syscall(libc::SYS_tgkill, target, target, 0) as libc::c_int
+        });
+        let group = call_denied(|| unsafe { libc::kill(-target, 0) });
+        let mut bits = 0_u64;
+        bits |= u64::from(changed && positive) << 0;
+        bits |= u64::from(changed && thread) << 1;
+        bits |= u64::from(changed && group) << 2;
+        let _ = exact_write(result[1], bits);
+        unsafe { libc::_exit(0) }
+    }
+    unsafe { libc::close(result[1]) };
+    let bits = exact_read(result[0]).unwrap_or(0);
+    let sender_ok = wait_exited(sender) == Some(0);
+    let released = exact_write(release[1], 1);
+    let target_ok = wait_exited(target) == Some(0);
+    let complete = sender_ok && released && target_ok;
+    std::array::from_fn(|index| complete && bits & (1 << index) != 0)
 }
 
 fn child_identity_and_signal_case(parent_pid: i32, parent_sid: i32) -> (u64, u64, bool, bool) {
@@ -106,12 +257,7 @@ fn child_identity_and_signal_case(parent_pid: i32, parent_sid: i32) -> (u64, u64
         let sid = unsafe { libc::getsid(0) };
         let proc = proc_identity();
         let ready_ok = exact_write(ready[1], 1);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while CHILD_SIGNALS.load(Ordering::SeqCst) != ALL_CHILD_SIGNALS
-            && std::time::Instant::now() < deadline
-        {
-            unsafe { libc::sched_yield() };
-        }
+        let all_signals = wait_for_bits(&CHILD_SIGNALS, ALL_CHILD_SIGNALS);
         let mut bits = 0_u64;
         bits |= u64::from(handlers && group_created && ready_ok) << 0;
         bits |= u64::from(pid > parent_pid && pid < 64) << 1;
@@ -120,7 +266,7 @@ fn child_identity_and_signal_case(parent_pid: i32, parent_sid: i32) -> (u64, u64
         bits |= u64::from(proc.is_some_and(|stat| {
             stat.pid == pid && stat.ppid == ppid && stat.pgrp == pgrp && stat.session == sid
         })) << 4;
-        bits |= u64::from(CHILD_SIGNALS.load(Ordering::SeqCst) == ALL_CHILD_SIGNALS) << 5;
+        bits |= u64::from(all_signals) << 5;
         bits |= u64::from(tid == pid) << 6;
         bits |= u64::from(ppid == parent_pid) << 7;
         let _ = exact_write(result[1], bits);
@@ -266,7 +412,7 @@ fn main() {
     let pgrp = unsafe { libc::getpgrp() };
     let sid = unsafe { libc::getsid(0) };
     let stat = proc_identity();
-    let root_low_linux_id = (1..64).contains(&pid);
+    let root_exact_linux_init = pid == 1 && tid == 1;
     let root_leader_tid_matches = tid == pid;
     let root_group_and_session_are_init = pgrp == 1 && sid == 1;
     let root_proc_identity_matches =
@@ -275,6 +421,14 @@ fn main() {
     let positive_pid_one_live = unsafe { libc::kill(1, 0) } == 0;
     let target_zero_live = unsafe { libc::kill(0, 0) } == 0;
     let selector_errno = errno();
+    let (self_kill_signal_delivered, self_tgkill_signal_delivered) = self_signal_case(pid, tid);
+    let (
+        pid_one_default_signal_immunity,
+        pid_one_handler_installed,
+        pid_one_handled_send_succeeded,
+        pid_one_handled_signal_delivered,
+    ) = pid_one_signal_immunity_case(pid);
+    let credential_results = credential_denial_case();
 
     let (child_bits, signal_call_bits, broadcast_live, negative_pgid_one_live) =
         child_identity_and_signal_case(pid, sid);
@@ -282,7 +436,7 @@ fn main() {
     let (exec_bits, exec_child_exited_zero) = exec_identity_case(&args[0]);
 
     report!(
-        root_low_linux_id = root_low_linux_id,
+        root_exact_linux_init = root_exact_linux_init,
         root_leader_tid_matches = root_leader_tid_matches,
         root_group_and_session_are_init = root_group_and_session_are_init,
         root_proc_identity_matches = root_proc_identity_matches,
@@ -291,6 +445,15 @@ fn main() {
         broadcast_live = broadcast_live,
         negative_pgid_one_live = negative_pgid_one_live,
         selector_errno_nonnegative = selector_errno >= 0,
+        self_kill_signal_delivered = self_kill_signal_delivered,
+        self_tgkill_signal_delivered = self_tgkill_signal_delivered,
+        pid_one_default_signal_immunity = pid_one_default_signal_immunity,
+        pid_one_handler_installed = pid_one_handler_installed,
+        pid_one_handled_send_succeeded = pid_one_handled_send_succeeded,
+        pid_one_handled_signal_delivered = pid_one_handled_signal_delivered,
+        credential_positive_signal_zero_denied = credential_results[0],
+        credential_tgkill_signal_zero_denied = credential_results[1],
+        credential_group_signal_zero_denied = credential_results[2],
         child_setup_ready = child_bits & (1 << 0) != 0,
         child_id_is_linux_shaped = child_bits & (1 << 1) != 0,
         child_tid_ppid_match = child_bits & (1 << 2) != 0,

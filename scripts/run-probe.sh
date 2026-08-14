@@ -20,6 +20,12 @@ bin="$repo/conformance-probes/target/aarch64-unknown-linux-musl/release/$name"
 carrick="$repo/target/release/carrick"
 [ -x "$carrick" ] || { echo "carrick not built/signed: $carrick — run ./scripts/build-signed.sh"; exit 2; }
 snippet='base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p'
+# Identity probes that assert namespace-init semantics need the probe itself,
+# not the decoding shell, to remain PID 1 on both Carrick and Docker. Keep the
+# default byte-for-byte faithful to the conformance harness; opt in explicitly.
+if [ "${CARRICK_PROBE_EXEC_AS_INIT:-0}" = "1" ]; then
+    snippet='base64 -d > /tmp/p && chmod +x /tmp/p && exec /tmp/p'
+fi
 [ -x "$bin" ] || { echo "probe not built: $bin — run scripts/build-probes.sh"; exit 2; }
 export CARRICK_INSECURE_REGISTRIES="${CARRICK_INSECURE_REGISTRIES:-localhost:5050}"
 

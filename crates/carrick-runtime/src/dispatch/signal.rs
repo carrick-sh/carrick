@@ -1152,14 +1152,13 @@ impl SyscallDispatcher {
             };
             kernel.tasks_in_process_group(group)
         };
-        if targets.is_empty() {
-            return Some(DispatchOutcome::errno(LINUX_ESRCH));
-        }
-        if signum == 0 {
-            return Some(DispatchOutcome::Returned { value: 0 });
-        }
-        let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signum as i32) else {
-            return Some(DispatchOutcome::errno(LINUX_EINVAL));
+        let signal = if signum == 0 {
+            None
+        } else {
+            match crate::kernel::LinuxSignal::for_signal_number(signum as i32) {
+                Ok(signal) => Some(signal),
+                Err(_) => return Some(DispatchOutcome::errno(LINUX_EINVAL)),
+            }
         };
         // Linux fills si_pid/si_uid with the SENDER's identity for a
         // kill(2)-delivered signal, so an SA_SIGINFO handler in the target can
@@ -1171,17 +1170,30 @@ impl SyscallDispatcher {
             caller.key().id.raw(),
             creds.ruid,
         );
-        let mut delivered = 0_usize;
+        let mut accepted = 0_usize;
+        let mut denied = 0_usize;
         for target in targets {
-            if kernel.post_signal_to_task(target, signal, Some(info)) {
-                delivered += 1;
+            match kernel.authorize_signal_target(ctx.kernel, target, None, signal) {
+                crate::kernel::SignalTargetAuthorization::Allowed => {
+                    if signal
+                        .is_none_or(|signal| kernel.post_signal_to_task(target, signal, Some(info)))
+                    {
+                        accepted += 1;
+                    }
+                }
+                crate::kernel::SignalTargetAuthorization::DropProtectedInit => accepted += 1,
+                crate::kernel::SignalTargetAuthorization::Denied => denied += 1,
+                crate::kernel::SignalTargetAuthorization::Missing => {}
             }
         }
-        // Every member may have exited between enumeration and delivery.
-        if delivered == 0 {
-            return Some(DispatchOutcome::errno(LINUX_ESRCH));
+        if accepted != 0 {
+            return Some(DispatchOutcome::Returned { value: 0 });
         }
-        Some(DispatchOutcome::Returned { value: 0 })
+        Some(DispatchOutcome::errno(if denied != 0 {
+            LINUX_EPERM
+        } else {
+            LINUX_ESRCH
+        }))
     }
 
     /// Route one positive, non-self HVPatch task target through the kernel.
@@ -1204,22 +1216,36 @@ impl SyscallDispatcher {
             return None;
         }
         let kernel = ctx.kernel.kernel();
-        if signum == 0 {
-            return Some(if kernel.task_is_signalable(target) {
-                DispatchOutcome::Returned { value: 0 }
-            } else {
-                DispatchOutcome::errno(LINUX_ESRCH)
-            });
-        }
-        let signal = match crate::kernel::LinuxSignal::for_signal_number(signum as i32) {
-            Ok(signal) => signal,
-            Err(_) => return Some(DispatchOutcome::errno(LINUX_EINVAL)),
-        };
-        Some(if kernel.post_signal_to_task(target, signal, siginfo) {
-            DispatchOutcome::Returned { value: 0 }
+        let signal = if signum == 0 {
+            None
         } else {
-            DispatchOutcome::errno(LINUX_ESRCH)
-        })
+            match crate::kernel::LinuxSignal::for_signal_number(signum as i32) {
+                Ok(signal) => Some(signal),
+                Err(_) => return Some(DispatchOutcome::errno(LINUX_EINVAL)),
+            }
+        };
+        Some(
+            match kernel.authorize_signal_target(ctx.kernel, target, None, signal) {
+                crate::kernel::SignalTargetAuthorization::Allowed => {
+                    if signal
+                        .is_none_or(|signal| kernel.post_signal_to_task(target, signal, siginfo))
+                    {
+                        DispatchOutcome::Returned { value: 0 }
+                    } else {
+                        DispatchOutcome::errno(LINUX_ESRCH)
+                    }
+                }
+                crate::kernel::SignalTargetAuthorization::DropProtectedInit => {
+                    DispatchOutcome::Returned { value: 0 }
+                }
+                crate::kernel::SignalTargetAuthorization::Denied => {
+                    DispatchOutcome::errno(LINUX_EPERM)
+                }
+                crate::kernel::SignalTargetAuthorization::Missing => {
+                    DispatchOutcome::errno(LINUX_ESRCH)
+                }
+            },
+        )
     }
 
     /// Route a HVPatch thread target by Linux `(tgid, tid)` identity. With no
@@ -1250,18 +1276,34 @@ impl SyscallDispatcher {
         let Some(target_task) = kernel.live_task_for_thread(required_task, tid) else {
             return Some(DispatchOutcome::errno(LINUX_ESRCH));
         };
-        if signum == 0 {
-            return Some(DispatchOutcome::Returned { value: 0 });
-        }
-        let signal = match crate::kernel::LinuxSignal::for_signal_number(signum as i32) {
-            Ok(signal) => signal,
-            Err(_) => return Some(DispatchOutcome::errno(LINUX_EINVAL)),
+        let signal = if signum == 0 {
+            None
+        } else {
+            match crate::kernel::LinuxSignal::for_signal_number(signum as i32) {
+                Ok(signal) => Some(signal),
+                Err(_) => return Some(DispatchOutcome::errno(LINUX_EINVAL)),
+            }
         };
         Some(
-            if kernel.post_signal_to_thread(target_task, tid, signal, siginfo) {
-                DispatchOutcome::Returned { value: 0 }
-            } else {
-                DispatchOutcome::errno(LINUX_ESRCH)
+            match kernel.authorize_signal_target(ctx.kernel, target_task, Some(tid), signal) {
+                crate::kernel::SignalTargetAuthorization::Allowed => {
+                    if signal.is_none_or(|signal| {
+                        kernel.post_signal_to_thread(target_task, tid, signal, siginfo)
+                    }) {
+                        DispatchOutcome::Returned { value: 0 }
+                    } else {
+                        DispatchOutcome::errno(LINUX_ESRCH)
+                    }
+                }
+                crate::kernel::SignalTargetAuthorization::DropProtectedInit => {
+                    DispatchOutcome::Returned { value: 0 }
+                }
+                crate::kernel::SignalTargetAuthorization::Denied => {
+                    DispatchOutcome::errno(LINUX_EPERM)
+                }
+                crate::kernel::SignalTargetAuthorization::Missing => {
+                    DispatchOutcome::errno(LINUX_ESRCH)
+                }
             },
         )
     }
