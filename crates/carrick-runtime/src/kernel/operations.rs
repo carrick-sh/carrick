@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use carrick_abi::LinuxSiginfo;
 use carrick_hal::{KernelTransactionId, ThreadId};
@@ -66,6 +66,25 @@ pub enum SignalTargetAuthorization {
     DropProtectedInit,
     Denied,
     Missing,
+}
+
+/// An authorization result bound to the exact task/thread objects that were
+/// inspected. The allowed ticket's fields stay private so a bare numeric PID
+/// cannot be substituted between policy and enqueue.
+#[derive(Debug)]
+pub(crate) enum ExactSignalTargetAuthorization {
+    Allowed(AuthorizedSignalTarget),
+    DropProtectedInit,
+    Denied,
+    Missing,
+}
+
+#[derive(Debug)]
+pub(crate) struct AuthorizedSignalTarget {
+    domain: Arc<KernelDomain>,
+    task: Weak<Task>,
+    thread: Option<Weak<super::objects::Thread>>,
+    parent: Option<Weak<Task>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -974,6 +993,13 @@ impl Kernel {
         self.registry().state.read().tasks.contains_key(&task_id)
     }
 
+    pub(crate) fn live_task_key(&self, task_id: TaskId) -> Option<TaskKey> {
+        let state = self.registry().state.read();
+        state.tasks.get(&task_id).and_then(|record| {
+            (record.task.lifecycle() == TaskLifecycle::Live).then(|| record.task.key())
+        })
+    }
+
     /// Authorize a process- or thread-directed Linux signal without consulting
     /// host process identity. `target_thread == None` uses the task's retained
     /// leader credential authority; thread-directed calls name the exact target
@@ -985,27 +1011,76 @@ impl Kernel {
         target_thread: Option<LinuxTid>,
         signal: Option<LinuxSignal>,
     ) -> SignalTargetAuthorization {
-        if !std::ptr::eq(self, caller.kernel().as_ref()) {
-            return SignalTargetAuthorization::Missing;
-        }
-        let (target_credentials, target_session, target_sighand) = {
+        let target = {
             let state = self.registry().state.read();
             let Some(record) = state.tasks.get(&target_task) else {
                 return SignalTargetAuthorization::Missing;
             };
-            if record.task.lifecycle() != TaskLifecycle::Live {
-                return SignalTargetAuthorization::Missing;
-            }
-            let credentials = match target_thread {
+            let thread = match target_thread {
                 Some(tid) => {
                     let Some(thread) = record.task.thread(tid) else {
                         return SignalTargetAuthorization::Missing;
                     };
-                    thread.resources().credentials()
+                    Some(thread.key())
                 }
-                None => record.task.process_credentials(),
+                None => None,
             };
+            (record.task.key(), thread)
+        };
+        match self.authorize_signal_target_exact(caller, target.0, target.1, signal) {
+            ExactSignalTargetAuthorization::Allowed(_) => SignalTargetAuthorization::Allowed,
+            ExactSignalTargetAuthorization::DropProtectedInit => {
+                SignalTargetAuthorization::DropProtectedInit
+            }
+            ExactSignalTargetAuthorization::Denied => SignalTargetAuthorization::Denied,
+            ExactSignalTargetAuthorization::Missing => SignalTargetAuthorization::Missing,
+        }
+    }
+
+    /// Resolve signal policy to one unforgeable task/thread generation. The
+    /// returned ticket weakly binds the exact objects inspected here; posting
+    /// through it fails if that generation exits and can never follow a reused
+    /// numeric PID/TID to a different process.
+    pub(crate) fn authorize_signal_target_exact(
+        &self,
+        caller: &KernelContext,
+        target_task: TaskKey,
+        target_thread: Option<ThreadKey>,
+        signal: Option<LinuxSignal>,
+    ) -> ExactSignalTargetAuthorization {
+        if !std::ptr::eq(self, caller.kernel().as_ref()) {
+            return ExactSignalTargetAuthorization::Missing;
+        }
+        let (target, thread, parent, target_credentials, target_session, target_sighand) = {
+            let state = self.registry().state.read();
+            let Some(record) = state.tasks.get(&target_task.id) else {
+                return ExactSignalTargetAuthorization::Missing;
+            };
+            if record.task.key() != target_task || record.task.lifecycle() != TaskLifecycle::Live {
+                return ExactSignalTargetAuthorization::Missing;
+            }
+            let (credentials, thread) = match target_thread {
+                Some(key) => {
+                    let Some(thread) = record.task.thread(key.tid) else {
+                        return ExactSignalTargetAuthorization::Missing;
+                    };
+                    if thread.key() != key {
+                        return ExactSignalTargetAuthorization::Missing;
+                    }
+                    (thread.resources().credentials(), Some(thread))
+                }
+                None => (record.task.process_credentials(), None),
+            };
+            let parent = record
+                .task
+                .parent()
+                .and_then(|key| state.tasks.get(&key.id).map(|record| (key, record)))
+                .filter(|(key, record)| record.task.key() == *key)
+                .map(|(_, record)| Arc::clone(&record.task));
             (
+                Arc::clone(&record.task),
+                thread,
+                parent,
                 credentials,
                 record.task.session(),
                 record.task.shared().sighand(),
@@ -1022,11 +1097,11 @@ impl Kernel {
             signal.raw() == carrick_abi::LINUX_SIGCONT && caller.task().session() == target_session
         });
         if !caller_is_privileged && !uid_match && !same_session_sigcont {
-            return SignalTargetAuthorization::Denied;
+            return ExactSignalTargetAuthorization::Denied;
         }
 
         let init = TaskId::from_abi_positive(carrick_abi::LINUX_BOOTSTRAP_PID as i32).ok();
-        if Some(target_task) == init
+        if Some(target_task.id) == init
             && signal.is_some_and(|signal| {
                 (crate::namespace::pid::is_init_protected_default_signal(signal.raw())
                     || matches!(
@@ -1039,9 +1114,14 @@ impl Kernel {
                         == super::objects::SignalDisposition::Default
             })
         {
-            return SignalTargetAuthorization::DropProtectedInit;
+            return ExactSignalTargetAuthorization::DropProtectedInit;
         }
-        SignalTargetAuthorization::Allowed
+        ExactSignalTargetAuthorization::Allowed(AuthorizedSignalTarget {
+            domain: Arc::clone(self.domain()),
+            task: Arc::downgrade(&target),
+            thread: thread.as_ref().map(Arc::downgrade),
+            parent: parent.as_ref().map(Arc::downgrade),
+        })
     }
 
     /// Apply a default-stop action to one live Linux task without signaling
@@ -1124,18 +1204,25 @@ impl Kernel {
     /// Sorted so delivery order is deterministic; Linux does not specify one,
     /// but a differential oracle needs carrick's to be stable.
     pub fn tasks_in_process_group(&self, group: ProcessGroupId) -> Vec<TaskId> {
+        self.task_keys_in_process_group(group)
+            .into_iter()
+            .map(|key| key.id)
+            .collect()
+    }
+
+    pub(crate) fn task_keys_in_process_group(&self, group: ProcessGroupId) -> Vec<TaskKey> {
         let state = self.registry().state.read();
-        let mut ids: Vec<TaskId> = state
+        let mut keys: Vec<TaskKey> = state
             .tasks
             .iter()
             .filter(|(_, record)| {
                 record.task.lifecycle() == TaskLifecycle::Live
                     && record.task.process_group() == group
             })
-            .map(|(id, _)| *id)
+            .map(|(_, record)| record.task.key())
             .collect();
-        ids.sort_unstable();
-        ids
+        keys.sort_unstable();
+        keys
     }
 
     /// Every LIVE task a broadcast `kill(-1, …)` may target: all of them except
@@ -1146,9 +1233,16 @@ impl Kernel {
     /// guest's own `kill(-1, SIGKILL)` from taking down the container's init
     /// along with everything else.
     pub fn tasks_for_broadcast(&self, caller: TaskId) -> Vec<TaskId> {
+        self.task_keys_for_broadcast(caller)
+            .into_iter()
+            .map(|key| key.id)
+            .collect()
+    }
+
+    pub(crate) fn task_keys_for_broadcast(&self, caller: TaskId) -> Vec<TaskKey> {
         let init = TaskId::from_abi_positive(carrick_abi::LINUX_BOOTSTRAP_PID as i32).ok();
         let state = self.registry().state.read();
-        let mut ids: Vec<TaskId> = state
+        let mut keys: Vec<TaskKey> = state
             .tasks
             .iter()
             .filter(|(id, record)| {
@@ -1156,10 +1250,80 @@ impl Kernel {
                     && Some(**id) != init
                     && record.task.lifecycle() == TaskLifecycle::Live
             })
-            .map(|(id, _)| *id)
+            .map(|(_, record)| record.task.key())
             .collect();
-        ids.sort_unstable();
-        ids
+        keys.sort_unstable();
+        keys
+    }
+
+    /// Enqueue through an exact-generation authorization ticket. The ticket
+    /// upgrades only the weak task/thread references selected by policy, so an
+    /// exit/reap/PID-reuse race can only make this fail; it cannot redirect
+    /// delivery to the new occupant of the same numeric id.
+    pub(crate) fn post_signal_to_authorized_target(
+        &self,
+        target: &AuthorizedSignalTarget,
+        signal: LinuxSignal,
+        siginfo: Option<LinuxSiginfo>,
+    ) -> bool {
+        if !Arc::ptr_eq(self.domain(), &target.domain) {
+            return false;
+        }
+        let Some(task) = target.task.upgrade() else {
+            return false;
+        };
+        let thread = match &target.thread {
+            Some(thread) => {
+                let Some(thread) = thread.upgrade() else {
+                    return false;
+                };
+                Some(thread)
+            }
+            None => None,
+        };
+        let generation = task.lock_signal_generation();
+        if task.lifecycle() != TaskLifecycle::Live {
+            return false;
+        }
+        if let Some(thread) = &thread
+            && task
+                .thread(thread.key().tid)
+                .is_none_or(|current| !Arc::ptr_eq(&current, thread))
+        {
+            return false;
+        }
+        task.discard_opposing_job_control_signals(signal);
+        task.record_job_control_signal_generation(signal);
+        if let Some(thread) = &thread {
+            thread.update_signal_state(|pending| {
+                if signal.is_realtime() {
+                    pending.enqueue_realtime(signal, siginfo);
+                } else {
+                    pending.enqueue_standard(signal, siginfo);
+                }
+            });
+        } else {
+            let pending = task.shared().pending_signals();
+            if signal.is_realtime() {
+                pending.enqueue_realtime(signal, siginfo);
+            } else {
+                pending.enqueue_standard(signal, siginfo);
+            }
+        }
+        let continued = if matches!(
+            signal.raw(),
+            carrick_abi::LINUX_SIGCONT | carrick_abi::LINUX_SIGKILL
+        ) {
+            task.continue_from_job_control()
+        } else {
+            false
+        };
+        drop(generation);
+        task.wake();
+        if continued && let Some(parent) = target.parent.as_ref().and_then(Weak::upgrade) {
+            parent.wake();
+        }
+        true
     }
 
     /// Post `signal` into `target`'s process-directed pending queue and report
@@ -1192,6 +1356,7 @@ impl Kernel {
     /// lock. After, so the woken task cannot look, find an empty queue, and go
     /// back to sleep having consumed its wake; outside, so a waker that blocks
     /// or re-enters the kernel cannot deadlock against the registry.
+    #[cfg(test)]
     pub fn post_signal_to_task(
         &self,
         target: TaskId,
@@ -1253,22 +1418,33 @@ impl Kernel {
         required_task: Option<TaskId>,
         tid: LinuxTid,
     ) -> Option<TaskId> {
+        self.live_keys_for_thread(required_task, tid)
+            .map(|(task, _)| task.id)
+    }
+
+    pub(crate) fn live_keys_for_thread(
+        &self,
+        required_task: Option<TaskId>,
+        tid: LinuxTid,
+    ) -> Option<(TaskKey, ThreadKey)> {
         let state = self.registry().state.read();
         if let Some(task_id) = required_task {
             let record = state.tasks.get(&task_id)?;
-            return (record.task.lifecycle() == TaskLifecycle::Live
-                && record.task.thread(tid).is_some())
-            .then_some(task_id);
+            let thread = record.task.thread(tid)?;
+            return (record.task.lifecycle() == TaskLifecycle::Live)
+                .then_some((record.task.key(), thread.key()));
         }
-        state.tasks.iter().find_map(|(task_id, record)| {
-            (record.task.lifecycle() == TaskLifecycle::Live && record.task.thread(tid).is_some())
-                .then_some(*task_id)
+        state.tasks.values().find_map(|record| {
+            let thread = record.task.thread(tid)?;
+            (record.task.lifecycle() == TaskLifecycle::Live)
+                .then_some((record.task.key(), thread.key()))
         })
     }
 
     /// Post one thread-directed signal to an exact live `(tgid, tid)` pair.
     /// The pending queue is published before the task wake, matching the
     /// process-directed ordering in [`Self::post_signal_to_task`].
+    #[cfg(test)]
     pub fn post_signal_to_thread(
         &self,
         target_task: TaskId,
@@ -3208,6 +3384,109 @@ mod tests {
     }
 
     #[test]
+    fn authorized_signal_never_follows_a_reused_numeric_pid() {
+        let (kernel, root) = bootstrap(78);
+        let root_binding = root.task_binding();
+        let root_tid = root.thread().key().tid;
+        let child_a = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(9_078),
+                "signal-child-a".to_string(),
+                None,
+            )
+            .expect("child A");
+        let child_a_key = child_a.task().key();
+        let sigusr1 = LinuxSignal::for_signal_number(10).expect("SIGUSR1");
+        let ticket =
+            match kernel.authorize_signal_target_exact(&root, child_a_key, None, Some(sigusr1)) {
+                ExactSignalTargetAuthorization::Allowed(ticket) => ticket,
+                other => panic!("child A should authorize before exit: {other:?}"),
+            };
+
+        kernel
+            .exit_task_key_eventually(child_a_key, LinuxWaitStatus::from_wait_encoding(0))
+            .expect("exit child A");
+        drop(child_a);
+        assert!(matches!(
+            kernel.wait_child(
+                root.task().key().id,
+                Some(child_a_key.id),
+                WaitMode::Consume
+            ),
+            Ok(WaitOutcome::Exited(_))
+        ));
+        kernel.sweep_retired_threads();
+        kernel.ids().set_next_for_tests(child_a_key.id.raw());
+
+        let fresh_root = root_binding.capture(root_tid).expect("fresh root context");
+        let child_b = kernel
+            .fork_task(
+                &fresh_root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(9_079),
+                "signal-child-b".to_string(),
+                None,
+            )
+            .expect("child B");
+        assert_eq!(child_b.task().key().id, child_a_key.id);
+        assert_ne!(child_b.task().key(), child_a_key);
+
+        assert!(
+            !kernel.post_signal_to_authorized_target(&ticket, sigusr1, None),
+            "the old-generation authorization ticket must fail closed",
+        );
+        assert!(
+            !child_b
+                .task()
+                .shared()
+                .pending_signals()
+                .present()
+                .contains(sigusr1.raw()),
+            "the reused PID must not receive child A's authorized signal",
+        );
+    }
+
+    #[test]
+    fn exact_authorized_self_signals_preserve_process_and_thread_queue_ownership() {
+        let (kernel, root) = bootstrap(80);
+        let sigusr1 = LinuxSignal::for_signal_number(10).expect("SIGUSR1");
+        let sigusr2 = LinuxSignal::for_signal_number(12).expect("SIGUSR2");
+        let process_ticket = match kernel.authorize_signal_target_exact(
+            &root,
+            root.task().key(),
+            None,
+            Some(sigusr1),
+        ) {
+            ExactSignalTargetAuthorization::Allowed(ticket) => ticket,
+            other => panic!("self process target must authorize: {other:?}"),
+        };
+        let thread_ticket = match kernel.authorize_signal_target_exact(
+            &root,
+            root.task().key(),
+            Some(root.thread().key()),
+            Some(sigusr2),
+        ) {
+            ExactSignalTargetAuthorization::Allowed(ticket) => ticket,
+            other => panic!("self thread target must authorize: {other:?}"),
+        };
+
+        assert!(kernel.post_signal_to_authorized_target(&process_ticket, sigusr1, None));
+        assert!(kernel.post_signal_to_authorized_target(&thread_ticket, sigusr2, None));
+        assert!(
+            root.task()
+                .shared()
+                .pending_signals()
+                .present()
+                .contains(sigusr1.raw())
+        );
+        let thread_pending = root.thread().signal_state().pending();
+        assert!(thread_pending.contains(sigusr2.raw()));
+        assert!(!thread_pending.contains(sigusr1.raw()));
+    }
+
+    #[test]
     fn child_exit_receipt_uses_parent_committed_during_reservation_wait() {
         let (kernel, root) = bootstrap(77);
         let parent = kernel
@@ -3859,6 +4138,100 @@ mod tests {
         assert!(
             !kernel.task_is_job_control_stopped(child_id),
             "the later SIGCONT generation must cancel the stale default-stop action",
+        );
+    }
+
+    #[test]
+    fn sigcont_cancels_every_stop_dequeued_before_its_default_action() {
+        let (kernel, root) = bootstrap(1);
+        let child_id = fork_child(&kernel, &root, "two dequeue race child", 722);
+        let child_tid = LinuxTid::for_task_leader(child_id);
+        let sigstop = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGSTOP).expect("SIGSTOP");
+        let sigtstp = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGTSTP).expect("SIGTSTP");
+        let sigcont = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGCONT).expect("SIGCONT");
+
+        assert!(kernel.post_signal_to_task(child_id, sigstop, None));
+        assert!(kernel.post_signal_to_thread(child_id, child_tid, sigtstp, None));
+        let child = {
+            let state = kernel.registry().state.read();
+            Arc::clone(&state.tasks.get(&child_id).expect("child task").task)
+        };
+        assert!(
+            pending_of(&kernel, child_id)
+                .take_lowest_in(SigSet::EMPTY.with(sigstop.raw()))
+                .is_some(),
+            "model one vCPU dequeuing the process-directed STOP",
+        );
+        assert!(
+            child
+                .thread(child_tid)
+                .expect("child leader")
+                .update_signal_state(|state| {
+                    state
+                        .take_lowest_in(SigSet::EMPTY.with(sigtstp.raw()))
+                        .is_some()
+                }),
+            "model another vCPU dequeuing the thread-directed TSTP",
+        );
+
+        assert!(kernel.post_signal_to_task(child_id, sigcont, None));
+        assert!(kernel.stop_task_for_job_control(child_id, sigstop));
+        assert!(kernel.stop_task_for_job_control(child_id, sigtstp));
+        assert!(
+            !kernel.task_is_job_control_stopped(child_id),
+            "SIGCONT must invalidate every earlier dequeued default-stop action",
+        );
+
+        assert!(kernel.post_signal_to_task(child_id, sigstop, None));
+        assert!(
+            pending_of(&kernel, child_id)
+                .take_lowest_in(SigSet::EMPTY.with(sigstop.raw()))
+                .is_some()
+        );
+        assert!(kernel.stop_task_for_job_control(child_id, sigstop));
+        assert!(
+            kernel.task_is_job_control_stopped(child_id),
+            "a stop generated after SIGCONT must replace the cancellation generation",
+        );
+    }
+
+    #[test]
+    fn sigcont_cancels_a_second_dequeued_stop_after_the_first_stops_the_task() {
+        let (kernel, root) = bootstrap(1);
+        let child_id = fork_child(&kernel, &root, "split dequeue race child", 723);
+        let child_tid = LinuxTid::for_task_leader(child_id);
+        let sigstop = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGSTOP).expect("SIGSTOP");
+        let sigtstp = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGTSTP).expect("SIGTSTP");
+        let sigcont = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGCONT).expect("SIGCONT");
+
+        assert!(kernel.post_signal_to_task(child_id, sigstop, None));
+        assert!(kernel.post_signal_to_thread(child_id, child_tid, sigtstp, None));
+        let child = {
+            let state = kernel.registry().state.read();
+            Arc::clone(&state.tasks.get(&child_id).expect("child task").task)
+        };
+        assert!(
+            pending_of(&kernel, child_id)
+                .take_lowest_in(SigSet::EMPTY.with(sigstop.raw()))
+                .is_some()
+        );
+        assert!(
+            child
+                .thread(child_tid)
+                .expect("child leader")
+                .update_signal_state(|state| state
+                    .take_lowest_in(SigSet::EMPTY.with(sigtstp.raw()))
+                    .is_some())
+        );
+
+        assert!(kernel.stop_task_for_job_control(child_id, sigstop));
+        assert!(kernel.task_is_job_control_stopped(child_id));
+        assert!(kernel.post_signal_to_task(child_id, sigcont, None));
+        assert!(!kernel.task_is_job_control_stopped(child_id));
+        assert!(kernel.stop_task_for_job_control(child_id, sigtstp));
+        assert!(
+            !kernel.task_is_job_control_stopped(child_id),
+            "SIGCONT must invalidate another stop dequeued before the first group stop",
         );
     }
 

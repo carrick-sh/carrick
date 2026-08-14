@@ -2594,12 +2594,18 @@ impl Task {
         let mut state = self.job_control.lock();
         match state.default_stop_generation {
             DefaultStopGeneration::Cancelled => {
-                state.default_stop_generation = DefaultStopGeneration::None;
+                // Cancellation is the latest task-wide generation, not a
+                // one-shot token. More than one vCPU may already have dequeued
+                // a stop signal when SIGCONT is generated; every one of those
+                // delayed default actions must remain stale until a NEW stop
+                // generation replaces this state.
                 return true;
             }
-            DefaultStopGeneration::Pending => {
-                state.default_stop_generation = DefaultStopGeneration::None;
-            }
+            // Retain the pending generation after the first action too. A
+            // second vCPU may have dequeued another stop before this one
+            // published the group stop; a later SIGCONT must still be able to
+            // invalidate that second action.
+            DefaultStopGeneration::Pending => {}
             DefaultStopGeneration::None => {}
         }
         if state.stopped_by.is_some() {

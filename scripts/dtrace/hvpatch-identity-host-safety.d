@@ -14,7 +14,8 @@
  * former early-xsig SIGCHLD shape. A Darwin kill aimed anywhere in the Linux
  * low-ID range [-63, 63] is fatal evidence, including signal-zero probes.
  * The fixture's task-scoped job-control proof must also populate exact guest
- * at least two exact guest SIGSTOP(19) sends and one SIGCONT(18) send. The
+ * at least three exact guest SIGSTOP(19) sends (including a self-target) and
+ * one SIGCONT(18) send. The
  * repeated stop must be discarded by continue generation; a completed target
  * with those populations proves both that rule and that the shared Darwin
  * carrier was never host-stopped.
@@ -117,7 +118,7 @@ dtrace:::END
 {
     this->valid = guest_kills > 0 && positive_one > 0 && zero > 0 &&
         broadcast > 0 && negative_group > 0 && tgkills > 0 &&
-        xsig_shapes > 0 && stop_signals >= 2 && continue_signals > 0 &&
+        xsig_shapes > 0 && stop_signals >= 3 && continue_signals > 0 &&
         host_low_kills == 0 && bounded == 0 &&
         errors == 0 && drops == 0 && target_exited == 1 &&
         target_exit_seen == 1 && target_exit_code == 0;
