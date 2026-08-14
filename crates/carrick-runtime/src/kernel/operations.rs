@@ -1063,6 +1063,7 @@ impl Kernel {
                 .map(|(_, record)| Arc::clone(&record.task));
             (Arc::clone(&record.task), parent)
         };
+        let _generation = task.lock_signal_generation();
         if !task.stop_for_job_control(signal) {
             return false;
         }
@@ -1092,6 +1093,7 @@ impl Kernel {
                 .map(|(_, record)| Arc::clone(&record.task));
             (Arc::clone(&record.task), parent)
         };
+        let _generation = task.lock_signal_generation();
         if !task.continue_from_job_control() {
             return false;
         }
@@ -1196,7 +1198,7 @@ impl Kernel {
         signal: LinuxSignal,
         siginfo: Option<LinuxSiginfo>,
     ) -> bool {
-        let (pending, task) = {
+        let (task, parent) = {
             let state = self.registry().state.read();
             let Some(record) = state.tasks.get(&target) else {
                 return false;
@@ -1204,11 +1206,21 @@ impl Kernel {
             if record.task.lifecycle() != TaskLifecycle::Live {
                 return false;
             }
-            (
-                record.task.shared().pending_signals(),
-                Arc::clone(&record.task),
-            )
+            let parent = record
+                .task
+                .parent()
+                .and_then(|key| state.tasks.get(&key.id).map(|record| (key, record)))
+                .filter(|(key, record)| record.task.key() == *key)
+                .map(|(_, record)| Arc::clone(&record.task));
+            (Arc::clone(&record.task), parent)
         };
+        let generation = task.lock_signal_generation();
+        if task.lifecycle() != TaskLifecycle::Live {
+            return false;
+        }
+        task.discard_opposing_job_control_signals(signal);
+        task.record_job_control_signal_generation(signal);
+        let pending = task.shared().pending_signals();
         if signal.is_realtime() {
             pending.enqueue_realtime(signal, siginfo);
         } else {
@@ -1217,13 +1229,19 @@ impl Kernel {
         // Queue before resume. A stopped task cannot consume the signal yet,
         // and once SIGCONT/SIGKILL releases it the pending action must already
         // be visible so delivery cannot race behind guest execution or exit.
-        if matches!(
+        let continued = if matches!(
             signal.raw(),
             carrick_abi::LINUX_SIGCONT | carrick_abi::LINUX_SIGKILL
         ) {
-            let _ = self.continue_task_from_job_control(target);
-        }
+            task.continue_from_job_control()
+        } else {
+            false
+        };
+        drop(generation);
         task.wake();
+        if continued && let Some(parent) = parent {
+            parent.wake();
+        }
         true
     }
 
@@ -1258,7 +1276,7 @@ impl Kernel {
         signal: LinuxSignal,
         siginfo: Option<LinuxSiginfo>,
     ) -> bool {
-        let (thread, task) = {
+        let (thread, task, parent) = {
             let state = self.registry().state.read();
             let Some(record) = state.tasks.get(&target_task) else {
                 return false;
@@ -1269,8 +1287,24 @@ impl Kernel {
             let Some(thread) = record.task.thread(target_tid) else {
                 return false;
             };
-            (thread, Arc::clone(&record.task))
+            let parent = record
+                .task
+                .parent()
+                .and_then(|key| state.tasks.get(&key.id).map(|record| (key, record)))
+                .filter(|(key, record)| record.task.key() == *key)
+                .map(|(_, record)| Arc::clone(&record.task));
+            (thread, Arc::clone(&record.task), parent)
         };
+        let generation = task.lock_signal_generation();
+        if task.lifecycle() != TaskLifecycle::Live
+            || task
+                .thread(target_tid)
+                .is_none_or(|current| !Arc::ptr_eq(&current, &thread))
+        {
+            return false;
+        }
+        task.discard_opposing_job_control_signals(signal);
+        task.record_job_control_signal_generation(signal);
         thread.update_signal_state(|pending| {
             if signal.is_realtime() {
                 pending.enqueue_realtime(signal, siginfo);
@@ -1278,13 +1312,19 @@ impl Kernel {
                 pending.enqueue_standard(signal, siginfo);
             }
         });
-        if matches!(
+        let continued = if matches!(
             signal.raw(),
             carrick_abi::LINUX_SIGCONT | carrick_abi::LINUX_SIGKILL
         ) {
-            let _ = self.continue_task_from_job_control(target_task);
-        }
+            task.continue_from_job_control()
+        } else {
+            false
+        };
+        drop(generation);
         task.wake();
+        if continued && let Some(parent) = parent {
+            parent.wake();
+        }
         true
     }
 
@@ -3732,6 +3772,93 @@ mod tests {
                 )
                 .expect("wait continued child"),
             WaitOutcome::Continued { task: child_id }
+        );
+    }
+
+    #[test]
+    fn sigcont_generation_discards_pending_stop_signals_task_wide() {
+        let (kernel, root) = bootstrap(1);
+        let child_id = fork_child(&kernel, &root, "continued child", 719);
+        let child_tid = LinuxTid::for_task_leader(child_id);
+        let sigstop = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGSTOP).expect("SIGSTOP");
+        let sigtstp = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGTSTP).expect("SIGTSTP");
+        let sigcont = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGCONT).expect("SIGCONT");
+
+        assert!(kernel.stop_task_for_job_control(child_id, sigstop));
+        assert!(kernel.post_signal_to_task(child_id, sigstop, None));
+        assert!(kernel.post_signal_to_thread(child_id, child_tid, sigtstp, None));
+        assert!(kernel.post_signal_to_task(child_id, sigcont, None));
+
+        let child = {
+            let state = kernel.registry().state.read();
+            Arc::clone(&state.tasks.get(&child_id).expect("child task").task)
+        };
+        assert!(!kernel.task_is_job_control_stopped(child_id));
+        assert!(
+            !pending_of(&kernel, child_id)
+                .present()
+                .contains(sigstop.raw())
+        );
+        assert!(
+            pending_of(&kernel, child_id)
+                .present()
+                .contains(sigcont.raw())
+        );
+        let thread_pending = child
+            .thread(child_tid)
+            .expect("child leader")
+            .signal_state();
+        assert!(!thread_pending.pending().contains(sigtstp.raw()));
+    }
+
+    #[test]
+    fn stop_generation_discards_pending_sigcont_task_wide() {
+        let (kernel, root) = bootstrap(1);
+        let child_id = fork_child(&kernel, &root, "stopped child", 720);
+        let child_tid = LinuxTid::for_task_leader(child_id);
+        let sigstop = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGSTOP).expect("SIGSTOP");
+        let sigcont = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGCONT).expect("SIGCONT");
+
+        assert!(kernel.post_signal_to_task(child_id, sigcont, None));
+        assert!(kernel.post_signal_to_thread(child_id, child_tid, sigcont, None));
+        assert!(kernel.post_signal_to_thread(child_id, child_tid, sigstop, None));
+
+        let child = {
+            let state = kernel.registry().state.read();
+            Arc::clone(&state.tasks.get(&child_id).expect("child task").task)
+        };
+        assert!(
+            !pending_of(&kernel, child_id)
+                .present()
+                .contains(sigcont.raw())
+        );
+        let thread_pending = child
+            .thread(child_tid)
+            .expect("child leader")
+            .signal_state();
+        assert!(!thread_pending.pending().contains(sigcont.raw()));
+        assert!(thread_pending.pending().contains(sigstop.raw()));
+    }
+
+    #[test]
+    fn sigcont_cancels_a_stop_dequeued_before_its_default_action() {
+        let (kernel, root) = bootstrap(1);
+        let child_id = fork_child(&kernel, &root, "dequeue race child", 721);
+        let sigstop = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGSTOP).expect("SIGSTOP");
+        let sigcont = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGCONT).expect("SIGCONT");
+
+        assert!(kernel.post_signal_to_task(child_id, sigstop, None));
+        assert!(
+            pending_of(&kernel, child_id)
+                .take_lowest_in(SigSet::EMPTY.with(sigstop.raw()))
+                .is_some(),
+            "model a vCPU that dequeued STOP before applying its default action",
+        );
+        assert!(kernel.post_signal_to_task(child_id, sigcont, None));
+        assert!(kernel.stop_task_for_job_control(child_id, sigstop));
+        assert!(
+            !kernel.task_is_job_control_stopped(child_id),
+            "the later SIGCONT generation must cancel the stale default-stop action",
         );
     }
 
