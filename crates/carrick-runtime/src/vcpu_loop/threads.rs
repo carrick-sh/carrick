@@ -42,7 +42,7 @@ where
         // Process teardown can remove this thread while the bounded scheduler
         // wait is in progress. Re-check before retrying: otherwise a reclaimed
         // sibling with no vCPU lease can wait forever while its process owner
-        // waits for the sibling's JoinHandle before retiring the process bank.
+        // waits for the sibling's JoinHandle before retiring the mm root slot.
         if thread_should_finish_for_exec_replacement(registry, tid) {
             return None;
         }
@@ -589,7 +589,7 @@ where
                 // process death frees it anyway.
                 // Admission itself must be cancellable. A clone can be queued
                 // here when another thread begins exit_group; an unbounded
-                // acquire leaves its JoinHandle live past the process-bank
+                // acquire leaves its JoinHandle live past the mm root-slot
                 // teardown deadline even though it never created a vCPU.
                 let lease = loop {
                     if child_kernel.process_exiting()
@@ -921,7 +921,8 @@ where
     }
 
     /// Stop every sibling vCPU belonging to this Linux process before its
-    /// process bank is unmapped.  The old `VCPU_LIVE == 1` exec drain is
+    /// mm's stage-1 root and final global frames are unmapped. The old
+    /// `VCPU_LIVE == 1` exec drain is
     /// process-global and therefore cannot distinguish unrelated processes in
     /// a shared VM; this path instead uses the process-private registry,
     /// kicker, and sibling JoinHandles.

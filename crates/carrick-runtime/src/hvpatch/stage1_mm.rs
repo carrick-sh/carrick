@@ -11,33 +11,31 @@ use crate::kernel::{
     SnapshotTable, Stage1Root, Stage1RootError, Ttbr0, VmaRevision,
 };
 
-const PROCESS_BANK_SIZE: u64 = 40 * 1024 * 1024 * 1024;
-const PROCESS_BANK_COUNT: u8 =
-    1 + (carrick_mem::memory::LINUX_PROCESS_BANK_SIZE / PROCESS_BANK_SIZE) as u8;
+/// Per-mm stage-1 table backing. Guest frames never live in this slot.
+const STAGE1_ROOT_SLOT_SIZE: u64 = 2 * 1024 * 1024;
+const STAGE1_ROOT_SLOT_COUNT: u32 =
+    (carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_ARENA_SIZE / STAGE1_ROOT_SLOT_SIZE) as u32;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct ProcessBank(u8);
+pub(crate) struct Stage1RootSlot(u32);
 
-impl ProcessBank {
+impl Stage1RootSlot {
     pub(crate) fn base(self) -> u64 {
-        if self.0 == 0 {
-            carrick_mem::memory::LINUX_PROCESS_AUX_BANK_BASE
-        } else {
-            carrick_mem::memory::LINUX_PROCESS_BANK_BASE + u64::from(self.0 - 1) * PROCESS_BANK_SIZE
-        }
+        carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE
+            + u64::from(self.0) * STAGE1_ROOT_SLOT_SIZE
     }
 
     pub(crate) fn size(self) -> u64 {
-        PROCESS_BANK_SIZE
+        STAGE1_ROOT_SLOT_SIZE
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct BankedMmState {
+pub(crate) struct Stage1MmState {
     binding: RwLock<MmBinding>,
 }
 
-impl BankedMmState {
+impl Stage1MmState {
     fn new(binding: MmBinding) -> Self {
         Self {
             binding: RwLock::new(binding),
@@ -54,27 +52,27 @@ impl BankedMmState {
 }
 
 #[derive(Debug)]
-pub(crate) struct BankedMmLease {
-    state: Arc<BankedMmState>,
-    backend: Arc<BankedMmBackend>,
+pub(crate) struct Stage1MmLease {
+    state: Arc<Stage1MmState>,
+    backend: Arc<Stage1MmBackend>,
     asid: Asid,
-    bank: Option<ProcessBank>,
+    root_slot: Option<Stage1RootSlot>,
     retired: AtomicBool,
 }
 
-impl BankedMmLease {
-    fn new(asid: Asid, stage1_root: Stage1Root, bank: Option<ProcessBank>) -> Self {
-        let state = Arc::new(BankedMmState::new(MmBinding {
+impl Stage1MmLease {
+    fn new(asid: Asid, stage1_root: Stage1Root, root_slot: Option<Stage1RootSlot>) -> Self {
+        let state = Arc::new(Stage1MmState::new(MmBinding {
             asid,
             stage1_root,
             ttbr0: Ttbr0::for_aarch64(asid, stage1_root),
         }));
-        let backend = Arc::new(BankedMmBackend::new(Arc::clone(&state)));
+        let backend = Arc::new(Stage1MmBackend::new(Arc::clone(&state)));
         Self {
             state,
             backend,
             asid,
-            bank,
+            root_slot,
             retired: AtomicBool::new(false),
         }
     }
@@ -83,17 +81,17 @@ impl BankedMmLease {
         self.state.binding()
     }
 
-    pub(crate) fn bank(&self) -> Option<ProcessBank> {
-        self.bank
+    pub(crate) fn root_slot(&self) -> Option<Stage1RootSlot> {
+        self.root_slot
     }
 
-    pub(crate) fn backend(&self) -> Arc<BankedMmBackend> {
+    pub(crate) fn backend(&self) -> Arc<Stage1MmBackend> {
         Arc::clone(&self.backend)
     }
 
-    pub(crate) fn publish_stage1_root(&self, stage1_root: u64) -> Result<MmBinding, BankedMmError> {
+    pub(crate) fn publish_stage1_root(&self, stage1_root: u64) -> Result<MmBinding, Stage1MmError> {
         if self.retired.load(Ordering::Acquire) {
-            return Err(BankedMmError::Retired);
+            return Err(Stage1MmError::Retired);
         }
         let stage1_root = Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa(stage1_root))?;
         let binding = MmBinding {
@@ -107,18 +105,18 @@ impl BankedMmLease {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct BankedMmPool {
-    inner: Arc<Mutex<BankedMmPoolInner>>,
+pub(crate) struct Stage1MmPool {
+    inner: Arc<Mutex<Stage1MmPoolInner>>,
 }
 
 #[derive(Debug)]
-struct BankedMmPoolInner {
+struct Stage1MmPoolInner {
     asids: AsidAllocator,
-    free_banks: BTreeSet<ProcessBank>,
+    free_root_slots: BTreeSet<Stage1RootSlot>,
 }
 
-impl BankedMmPool {
-    pub(crate) fn new_root(stage1_root: u64) -> Result<(Self, Arc<BankedMmLease>), BankedMmError> {
+impl Stage1MmPool {
+    pub(crate) fn new_root(stage1_root: u64) -> Result<(Self, Arc<Stage1MmLease>), Stage1MmError> {
         Self::with_allocator(stage1_root, AsidAllocator::new())
     }
 
@@ -126,74 +124,75 @@ impl BankedMmPool {
     pub(crate) fn new_root_for_tests(
         stage1_root: u64,
         asid_limit: u16,
-    ) -> Result<(Self, Arc<BankedMmLease>), BankedMmError> {
+    ) -> Result<(Self, Arc<Stage1MmLease>), Stage1MmError> {
         Self::with_allocator(stage1_root, AsidAllocator::with_limit_for_tests(asid_limit))
     }
 
     fn with_allocator(
         stage1_root: u64,
         mut asids: AsidAllocator,
-    ) -> Result<(Self, Arc<BankedMmLease>), BankedMmError> {
+    ) -> Result<(Self, Arc<Stage1MmLease>), Stage1MmError> {
         let asid = asids.allocate()?;
         let stage1_root = Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa(stage1_root))?;
-        let root = Arc::new(BankedMmLease::new(asid, stage1_root, None));
+        let root = Arc::new(Stage1MmLease::new(asid, stage1_root, None));
         Ok((
             Self {
-                inner: Arc::new(Mutex::new(BankedMmPoolInner {
+                inner: Arc::new(Mutex::new(Stage1MmPoolInner {
                     asids,
-                    free_banks: (0..PROCESS_BANK_COUNT).map(ProcessBank).collect(),
+                    free_root_slots: (0..STAGE1_ROOT_SLOT_COUNT).map(Stage1RootSlot).collect(),
                 })),
             },
             root,
         ))
     }
 
-    pub(crate) fn prepare_child(&self) -> Result<PreparedBankedMm, BankedMmError> {
+    pub(crate) fn prepare_child(&self) -> Result<PreparedStage1Mm, Stage1MmError> {
         let mut inner = self.inner.lock();
-        let bank = inner
-            .free_banks
+        let root_slot = inner
+            .free_root_slots
             .pop_first()
-            .ok_or(BankedMmError::BankExhausted)?;
-        let stage1_root = match Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa(bank.base())) {
+            .ok_or(Stage1MmError::RootSlotExhausted)?;
+        let stage1_root = match Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa(root_slot.base()))
+        {
             Ok(root) => root,
             Err(error) => {
-                inner.free_banks.insert(bank);
+                inner.free_root_slots.insert(root_slot);
                 return Err(error.into());
             }
         };
         let asid = match inner.asids.allocate() {
             Ok(asid) => asid,
             Err(error) => {
-                inner.free_banks.insert(bank);
+                inner.free_root_slots.insert(root_slot);
                 return Err(error.into());
             }
         };
-        let lease = Arc::new(BankedMmLease::new(asid, stage1_root, Some(bank)));
+        let lease = Arc::new(Stage1MmLease::new(asid, stage1_root, Some(root_slot)));
         drop(inner);
-        Ok(PreparedBankedMm {
+        Ok(PreparedStage1Mm {
             pool: self.clone(),
             lease,
             committed: false,
         })
     }
 
-    fn release_unpublished(&self, lease: &BankedMmLease) -> Result<(), BankedMmError> {
+    fn release_unpublished(&self, lease: &Stage1MmLease) -> Result<(), Stage1MmError> {
         let mut inner = self.inner.lock();
         inner.asids.release_unpublished(lease.asid)?;
-        if let Some(bank) = lease.bank {
-            inner.free_banks.insert(bank);
+        if let Some(root_slot) = lease.root_slot {
+            inner.free_root_slots.insert(root_slot);
         }
         Ok(())
     }
 
     pub(crate) fn retire(
         &self,
-        lease: &BankedMmLease,
-    ) -> Result<BankedMmRetirement, BankedMmError> {
+        lease: &Stage1MmLease,
+    ) -> Result<Stage1MmRetirement, Stage1MmError> {
         lease
             .retired
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| BankedMmError::Retired)?;
+            .map_err(|_| Stage1MmError::Retired)?;
         let mut inner = self.inner.lock();
         let asid = match inner.asids.retire(lease.asid) {
             Ok(asid) => asid,
@@ -202,83 +201,83 @@ impl BankedMmPool {
                 return Err(error.into());
             }
         };
-        Ok(BankedMmRetirement {
+        Ok(Stage1MmRetirement {
             asid,
-            bank: lease.bank,
+            root_slot: lease.root_slot,
         })
     }
 
     pub(crate) fn acknowledge_tlb_flush(
         &self,
-        retirement: BankedMmRetirement,
-    ) -> Result<(), BankedMmError> {
+        retirement: Stage1MmRetirement,
+    ) -> Result<(), Stage1MmError> {
         let mut inner = self.inner.lock();
         inner.asids.acknowledge_tlb_flush(retirement.asid)?;
-        if let Some(bank) = retirement.bank {
-            inner.free_banks.insert(bank);
+        if let Some(root_slot) = retirement.root_slot {
+            inner.free_root_slots.insert(root_slot);
         }
         Ok(())
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct PreparedBankedMm {
-    pool: BankedMmPool,
-    lease: Arc<BankedMmLease>,
+pub(crate) struct PreparedStage1Mm {
+    pool: Stage1MmPool,
+    lease: Arc<Stage1MmLease>,
     committed: bool,
 }
 
-impl PreparedBankedMm {
+impl PreparedStage1Mm {
     pub(crate) fn binding(&self) -> MmBinding {
         self.lease.binding()
     }
 
-    pub(crate) fn bank(&self) -> Option<ProcessBank> {
-        self.lease.bank()
+    pub(crate) fn root_slot(&self) -> Option<Stage1RootSlot> {
+        self.lease.root_slot()
     }
 
-    pub(crate) fn backend(&self) -> Arc<BankedMmBackend> {
+    pub(crate) fn backend(&self) -> Arc<Stage1MmBackend> {
         self.lease.backend()
     }
 
-    pub(crate) fn commit(mut self) -> Arc<BankedMmLease> {
+    pub(crate) fn commit(mut self) -> Arc<Stage1MmLease> {
         self.committed = true;
         Arc::clone(&self.lease)
     }
 }
 
-impl Drop for PreparedBankedMm {
+impl Drop for PreparedStage1Mm {
     fn drop(&mut self) {
         if self.committed {
             return;
         }
         if let Err(error) = self.pool.release_unpublished(&self.lease) {
-            tracing::error!(%error, "failed to release unpublished hvpatch banked mm");
+            tracing::error!(%error, "failed to release unpublished hvpatch mm root slot");
         }
     }
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct BankedMmRetirement {
+pub(crate) struct Stage1MmRetirement {
     asid: RetiredAsid,
-    bank: Option<ProcessBank>,
+    root_slot: Option<Stage1RootSlot>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub(crate) enum BankedMmError {
+pub(crate) enum Stage1MmError {
     #[error("guest ASID space is exhausted")]
     AsidExhausted,
     #[error(transparent)]
     Asid(AsidError),
     #[error(transparent)]
     Stage1Root(#[from] Stage1RootError),
-    #[error("all hvpatch process address-space banks are live or awaiting teardown")]
-    BankExhausted,
-    #[error("hvpatch banked mm is already retired")]
+    #[error("all hvpatch stage-1 root slots are live or awaiting TLB-safe reuse")]
+    RootSlotExhausted,
+    #[error("hvpatch stage-1 mm is already retired")]
     Retired,
 }
 
-impl From<AsidError> for BankedMmError {
+impl From<AsidError> for Stage1MmError {
     fn from(error: AsidError) -> Self {
         match error {
             AsidError::Exhausted => Self::AsidExhausted,
@@ -287,12 +286,12 @@ impl From<AsidError> for BankedMmError {
     }
 }
 
-/// Live K1 observation seam over the existing per-process-bank prototype.
-/// BankResources publishes every binding into this stable per-mm state before
+/// Live K1 observation seam over each ASID-owned stage-1 root.
+/// MmResources publishes every binding into this stable per-mm state before
 /// lifecycle retirement, so draining objects cannot follow PID reuse or regress
 /// to an older root under concurrent observation.
 #[derive(Debug)]
-pub(crate) struct BankedMmBackend {
+pub(crate) struct Stage1MmBackend {
     binding: RwLock<MmBinding>,
     inventory: RwLock<Option<InventoryBinding>>,
     vma_source: RwLock<Option<SharedVmaSnapshotSource>>,
@@ -305,8 +304,8 @@ struct InventoryBinding {
     mm: crate::kernel::MmId,
 }
 
-impl BankedMmBackend {
-    pub(crate) fn new(state: Arc<BankedMmState>) -> Self {
+impl Stage1MmBackend {
+    pub(crate) fn new(state: Arc<Stage1MmState>) -> Self {
         Self::for_binding(state.binding())
     }
 
@@ -408,7 +407,7 @@ impl PreparedVmaFreeze {
 
     pub(crate) fn validate(
         &self,
-        backend: &BankedMmBackend,
+        backend: &Stage1MmBackend,
         deadline: Instant,
     ) -> Result<(), SnapshotError> {
         self.source
@@ -429,7 +428,7 @@ impl PreparedVmaFreeze {
 
     pub(crate) fn commit(
         self,
-        backend: &BankedMmBackend,
+        backend: &Stage1MmBackend,
         deadline: Instant,
     ) -> Result<(), SnapshotError> {
         let Self {
@@ -468,7 +467,7 @@ fn deadline_error(deadline: Instant) -> SnapshotError {
     }
 }
 
-impl MmBackend for BankedMmBackend {
+impl MmBackend for Stage1MmBackend {
     fn snapshot(&self, deadline: Instant) -> Result<MmBackendSnapshot, SnapshotError> {
         let before = self.revision.load(Ordering::Acquire);
         let binding = {
@@ -547,7 +546,7 @@ impl MmBackend for BankedMmBackend {
 mod tests {
     use std::num::NonZeroU64;
 
-    use super::super::bank_resources::BankResources;
+    use super::super::mm_resources::MmResources;
     use super::*;
 
     fn root_key() -> crate::kernel::TaskKey {
@@ -562,7 +561,7 @@ mod tests {
     #[test]
     fn old_observer_keeps_its_binding_after_exec_and_retirement() {
         let task = root_key();
-        let (table, backend) = BankResources::new_root(0x8000).expect("root table");
+        let (table, backend) = MmResources::new_root(0x8000).expect("root table");
         table.publish_root(task).expect("publish root");
         let initial = backend.binding();
 
@@ -580,17 +579,17 @@ mod tests {
     }
 
     #[test]
-    fn dropped_preparation_returns_bank_and_asid_without_retirement_proof() {
-        let (pool, _root) = BankedMmPool::new_root_for_tests(0x8000, 2).expect("root pool");
+    fn dropped_preparation_returns_root_slot_and_asid_without_retirement_proof() {
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
         let prepared = pool.prepare_child().expect("first preparation");
         let first_binding = prepared.binding();
-        let first_bank = prepared.bank();
+        let first_root_slot = prepared.root_slot();
 
         drop(prepared);
 
         let replacement = pool.prepare_child().expect("replacement preparation");
         assert_eq!(replacement.binding().asid, first_binding.asid);
-        assert_eq!(replacement.bank(), first_bank);
+        assert_eq!(replacement.root_slot(), first_root_slot);
         let lease = replacement.commit();
         let retirement = pool.retire(&lease).expect("retire committed lease");
         pool.acknowledge_tlb_flush(retirement)
@@ -598,8 +597,17 @@ mod tests {
     }
 
     #[test]
+    fn page_table_root_slots_scale_to_the_complete_arena() {
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 64).expect("root slot pool");
+        let prepared: Vec<_> = (0..32)
+            .map(|_| pool.prepare_child().expect("dense page-table root slot"))
+            .collect();
+        assert_eq!(prepared.len(), 32);
+    }
+
+    #[test]
     fn fails_closed_when_vma_authority_is_unbound() {
-        let (_table, backend) = BankResources::new_root(0x8000).expect("root table");
+        let (_table, backend) = MmResources::new_root(0x8000).expect("root table");
 
         assert_eq!(
             backend.snapshot(Instant::now() + std::time::Duration::from_secs(1)),

@@ -35,10 +35,11 @@ pub use futex::{
 };
 pub mod threaded;
 pub use threaded::{
-    FutexOutcome, GenericVcpuRegistry, GuestEntryRegs, GuestWaitRegisters, HostForkCoordinator,
-    HostVa, PlatformFutex, PreparedHostFork, RegAccess, SharedFutexLocation, ThreadId,
-    ThreadedEngine, VcpuKick, VcpuKickDyn, VcpuRegistry, X86SignalXstate, X86XstateCapabilities,
-    X86XstateComponent, aarch64_signal_pstate_source, read_aarch64_syscall_frame,
+    FrameCowAuthority, FrameCowIdentity, FrameCowQuiesce, FutexOutcome, GenericVcpuRegistry,
+    GuestEntryRegs, GuestWaitRegisters, HostForkCoordinator, HostVa, PlatformFutex,
+    PreparedHostFork, RegAccess, SharedFutexLocation, ThreadId, ThreadedEngine, VcpuKick,
+    VcpuKickDyn, VcpuRegistry, X86SignalXstate, X86XstateCapabilities, X86XstateComponent,
+    aarch64_signal_pstate_source, read_aarch64_syscall_frame,
 };
 pub mod sigframe;
 pub mod signal_arrival;

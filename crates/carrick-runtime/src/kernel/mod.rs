@@ -1,7 +1,7 @@
 //! Typed Linux kernel-object vocabulary shared by all execution backends.
 //!
-//! K1 introduces identity and reservation contracts here while the HVPatch
-//! process-bank prototype remains the only multi-task backend implementation.
+//! K1 introduces identity and reservation contracts here; HVPatch binds each
+//! mm to an ASID-owned stage-1 root over globally addressed frames.
 
 pub mod address;
 pub mod clone_plan;

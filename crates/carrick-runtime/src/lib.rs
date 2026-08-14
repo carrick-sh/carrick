@@ -419,10 +419,6 @@ pub mod trap {
     /// rebuilds a fresh VM in the child only; no shared-VM union to collect).
     pub fn clear_sibling_fork_mappings() {}
 
-    /// Publish the guest arena high-water so a child snapshot's mincore scan is
-    /// bounded. No-op on Linux (no host-side CoW snapshot).
-    pub fn set_guest_arena_high_water(_addr: u64) {}
-
     /// Dump cross-thread kick statistics at process exit. No-op on Linux.
     pub fn dump_kick_stats() {}
 }

@@ -482,6 +482,15 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     type SiblingBuilder = ThreadSpec;
     type ProcessBuilder = ProcessSpec;
 
+    fn bind_stage1_page_tables(
+        &mut self,
+        page_tables: std::sync::Arc<
+            parking_lot::Mutex<Option<carrick_mem::page_table::PageTableManager>>,
+        >,
+    ) {
+        self.state.bind_stage1_page_tables(page_tables);
+    }
+
     // ── memory windows + stage-2 ──
 
     fn map_stage2(
@@ -513,6 +522,69 @@ impl Aarch64Vmm for HvfAarch64Vmm {
 
     fn protections(&self) -> Option<&MemoryProtections> {
         Some(self.state.protections_ref())
+    }
+
+    fn fork_cow_ranges(&self) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
+        self.state.fork_cow_ranges()
+    }
+
+    fn arm_frame_cow_ranges(&mut self, ranges: &[carrick_aarch64::vmm::ForkCowRange]) {
+        self.state.arm_frame_cow_ranges(ranges);
+    }
+
+    fn armed_frame_cow_ranges(
+        &self,
+        va: u64,
+        len: usize,
+    ) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
+        self.state.armed_frame_cow_ranges(va, len)
+    }
+
+    fn bind_frame_cow(
+        &mut self,
+        authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
+        identity: carrick_hal::FrameCowIdentity,
+    ) {
+        self.state.bind_frame_cow(authority, identity);
+    }
+
+    fn resolve_frame_cow_fault(
+        &mut self,
+        syndrome: u64,
+        far: u64,
+        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+    ) -> Result<bool, TrapError> {
+        self.state
+            .resolve_frame_cow_fault(syndrome, far, flush_stage1)
+    }
+
+    fn ensure_frame_cow_write(
+        &mut self,
+        va: u64,
+        len: usize,
+        intent: carrick_aarch64::vmm::FrameCowWriteIntent,
+        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+    ) -> Result<(), TrapError> {
+        self.state
+            .ensure_frame_cow_write(va, len, intent, flush_stage1)
+    }
+
+    fn observe_frame_cow_protection(
+        &mut self,
+        va: u64,
+        len: usize,
+        prot: u64,
+    ) -> Result<(), TrapError> {
+        self.state.observe_frame_cow_protection(va, len, prot)
+    }
+
+    fn publish_private_repoint(
+        &mut self,
+        va: u64,
+        overlay_ipa: u64,
+        len: usize,
+    ) -> Result<(), TrapError> {
+        self.state.publish_private_repoint(va, overlay_ipa, len)
     }
 
     fn translated_read(&self, va: u64, _ipa: u64, len: usize) -> Result<Vec<u8>, MemoryError> {
@@ -810,14 +882,19 @@ impl Aarch64Vmm for HvfAarch64Vmm {
 
     fn build_process_builder(
         &self,
-        bank_base: u64,
-        bank_size: u64,
+        root_slot_base: u64,
+        root_slot_size: u64,
         page_tables: &mut carrick_mem::page_table::PageTableManager,
         child_pid: i32,
         forking_tid: i32,
     ) -> Result<Self::ProcessBuilder, TrapError> {
-        self.state
-            .build_process_spec(bank_base, bank_size, page_tables, child_pid, forking_tid)
+        self.state.build_process_spec(
+            root_slot_base,
+            root_slot_size,
+            page_tables,
+            child_pid,
+            forking_tid,
+        )
     }
 
     fn materialize_process(builder: Self::ProcessBuilder) -> Result<(Self, Self::Vcpu), TrapError> {

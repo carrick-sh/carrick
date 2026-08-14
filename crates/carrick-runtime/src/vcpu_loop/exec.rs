@@ -684,6 +684,36 @@ where
                         .map(Some);
                     }
                 };
+                // `exec` publishes a new Mm generation while keeping this host
+                // engine/vCPU.  Frame-COW callbacks must therefore move from
+                // the retired mm to the committed replacement before any
+                // identity-page or guest write can fault.  Keeping the old
+                // authority makes a structurally valid COW MappingId belong to
+                // the retired mm and fail closed at replacement-mm teardown.
+                if let Some(process) = kernel.hvpatch_process.as_ref() {
+                    let binding = process.mm_binding().ok_or_else(|| {
+                        RuntimeError::Configuration(
+                            "committed HVPatch exec has no replacement mm binding".to_owned(),
+                        )
+                    })?;
+                    let committed_mm = committed_context.shared().mm().id();
+                    let authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority> =
+                        std::sync::Arc::new(super::KernelFrameCowAuthority {
+                            kernel: std::sync::Arc::clone(committed_context.kernel()),
+                            mm: committed_mm,
+                            kicker: std::sync::Arc::clone(&self.kicker),
+                            tid: self.this_tid,
+                        });
+                    engine.bind_frame_cow(
+                        authority,
+                        carrick_hal::FrameCowIdentity {
+                            linux_pid: process.pid(),
+                            linux_tid: self.this_tid.raw(),
+                            mm: committed_mm.raw(),
+                            asid: binding.asid.raw(),
+                        },
+                    );
+                }
                 emit_runtime_stage(
                     carrick_observability::probes::HvpatchExecRuntimeStagePhase::EngineReplace,
                     engine_replace_started,

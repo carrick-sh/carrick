@@ -23,26 +23,26 @@ use island::passthrough_island_bytes;
 use patcher::{ISLAND_STUB_SIZE, PatchError, PatchSite, patch_svc_zero};
 
 mod asid;
-mod bank_resources;
-mod banked_mm;
 mod info_page;
 mod island;
+mod mm_resources;
 mod patcher;
+mod stage1_mm;
 
-use bank_resources::BankResources;
+use mm_resources::MmResources;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProcessContext {
-    resources: std::sync::Arc<BankResources>,
+    resources: std::sync::Arc<MmResources>,
     binding: crate::kernel::KernelTaskBinding,
-    mm_backend: std::sync::Arc<parking_lot::RwLock<std::sync::Arc<banked_mm::BankedMmBackend>>>,
+    mm_backend: std::sync::Arc<parking_lot::RwLock<std::sync::Arc<stage1_mm::Stage1MmBackend>>>,
 }
 
 #[derive(Debug)]
 pub(crate) struct PreparedProcessExec {
     kernel: crate::kernel::PreparedExec,
-    backend: std::sync::Arc<banked_mm::BankedMmBackend>,
-    old_vmas: banked_mm::PreparedVmaFreeze,
+    backend: std::sync::Arc<stage1_mm::Stage1MmBackend>,
+    old_vmas: stage1_mm::PreparedVmaFreeze,
 }
 
 impl PreparedProcessExec {
@@ -99,9 +99,9 @@ pub(crate) enum WaitResult {
 
 impl ProcessContext {
     fn new(
-        resources: std::sync::Arc<BankResources>,
+        resources: std::sync::Arc<MmResources>,
         binding: crate::kernel::KernelTaskBinding,
-        mm_backend: std::sync::Arc<banked_mm::BankedMmBackend>,
+        mm_backend: std::sync::Arc<stage1_mm::Stage1MmBackend>,
     ) -> Self {
         Self {
             resources,
@@ -141,7 +141,7 @@ impl ProcessContext {
         self.binding.kernel()
     }
 
-    pub(crate) fn bank_resources(&self) -> &std::sync::Arc<BankResources> {
+    pub(crate) fn mm_resources(&self) -> &std::sync::Arc<MmResources> {
         &self.resources
     }
 
@@ -155,7 +155,7 @@ impl ProcessContext {
     pub(crate) fn published_child_context(
         &self,
         context: &crate::kernel::KernelContext,
-        mm_backend: std::sync::Arc<banked_mm::BankedMmBackend>,
+        mm_backend: std::sync::Arc<stage1_mm::Stage1MmBackend>,
     ) -> Self {
         mm_backend.bind_inventory(context.kernel(), context.shared().mm().id());
         Self::new(
@@ -255,12 +255,12 @@ impl ProcessContext {
             return;
         };
         crate::probes::hvpatch_guest_lifecycle(event);
-        if let Some(bank) = self.resources.bank(self.task_key()) {
+        if let Some(root_slot) = self.resources.root_slot(self.task_key()) {
             let address_space = carrick_observability::probes::HvpatchGuestAddressSpace::new(
                 self.pid(),
                 u32::from(binding.asid.raw()),
-                bank.base(),
-                bank.size(),
+                root_slot.base(),
+                root_slot.size(),
                 binding.ttbr0.raw(),
             );
             match address_space {
@@ -380,7 +380,7 @@ impl ProcessContext {
     }
 
     /// Publish the guest-process terminal event only after Kernel status,
-    /// descriptor teardown, and backend bank/ASID retirement have all
+    /// descriptor teardown, and backend root-slot/ASID retirement have all
     /// committed. The event is prepared while the live task/mm identity is
     /// still discoverable, but cannot fire until every terminal authority has
     /// committed.
@@ -394,7 +394,7 @@ impl ProcessContext {
     }
 
     /// Publish Linux lifecycle state before any irreversible backend teardown.
-    /// Bank/ASID retirement is deliberately separate so the runtime can order
+    /// Root-slot/ASID retirement is deliberately separate so the runtime can order
     /// output and fd finalization first, then publish the zombie/pidfd wake,
     /// then serialize backend retirement under the topology lock.
     /// `status` is the Linux `wait(2)` encoding, built by
@@ -741,7 +741,7 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
     })? & TTBR_ROOT_MASK;
     let identity = root_bootstrap_identity(std::process::id())?;
     let pid = identity.pid;
-    let (table, mm_backend) = BankResources::new_root(stage1_root)
+    let (table, mm_backend) = MmResources::new_root(stage1_root)
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
     let table = std::sync::Arc::new(table);
     let root_tid = identity.tid;
@@ -1103,7 +1103,7 @@ mod tests {
 
     fn authoritative_root() -> (ProcessContext, crate::kernel::KernelContext) {
         let pid = 10_000;
-        let (table, backend) = BankResources::new_root(0x4000).unwrap();
+        let (table, backend) = MmResources::new_root(0x4000).unwrap();
         let bootstrap = crate::kernel::RootBootstrap::with_mm_backend(
             pid,
             crate::thread::ThreadId::synthetic_for_tests(pid),
@@ -1136,7 +1136,7 @@ mod tests {
     #[test]
     fn child_wait_retries_an_overlapping_exit_reservation() {
         let (parent, root) = authoritative_root();
-        let prepared_mm = parent.bank_resources().prepare_child().unwrap();
+        let prepared_mm = parent.mm_resources().prepare_child().unwrap();
         let child = parent
             .kernel_graph()
             .reserve_fork(
@@ -1194,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn root_kernel_mm_keeps_the_exact_banked_backend() {
+    fn root_kernel_mm_keeps_the_exact_stage1_backend() {
         let (process, root) = authoritative_root();
         let expected: std::sync::Arc<dyn crate::kernel::MmBackend> =
             process.mm_backend.read().clone();
@@ -1203,7 +1203,7 @@ mod tests {
 
         assert!(
             std::sync::Arc::ptr_eq(actual, &expected),
-            "root bootstrap must not replace the live banked backend with a snapshot"
+            "root bootstrap must not replace the live stage-1 backend with a snapshot"
         );
         assert_eq!(
             actual
@@ -1239,7 +1239,7 @@ mod tests {
             1
         );
 
-        let prepared_mm = parent.bank_resources().prepare_child().unwrap();
+        let prepared_mm = parent.mm_resources().prepare_child().unwrap();
         let child_tid = crate::thread::ThreadId::synthetic_for_tests(10_001);
         let child_context = parent
             .kernel_graph()
@@ -1259,7 +1259,7 @@ mod tests {
             .unwrap()
             .0;
         let child_backend = parent
-            .bank_resources()
+            .mm_resources()
             .publish_child(child_context.task().key(), prepared_mm)
             .unwrap();
         let child = parent.published_child_context(&child_context, child_backend);
@@ -1283,7 +1283,7 @@ mod tests {
     }
 
     #[test]
-    fn banked_mm_reports_authoritative_mapping_ids_for_its_exact_mm() {
+    fn stage1_mm_reports_authoritative_mapping_ids_for_its_exact_mm() {
         let (_process, root) = authoritative_root();
         let capacity = carrick_hal::FrameEventCapacity::for_event_count(2).unwrap();
         let mut reservation = root
@@ -1326,7 +1326,7 @@ mod tests {
             .unwrap();
 
         let mm = root.shared().mm();
-        let backend = mm.backend().expect("banked mm backend");
+        let backend = mm.backend().expect("stage-1 mm backend");
         assert_eq!(
             backend
                 .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(1))
@@ -1516,7 +1516,7 @@ mod tests {
     #[test]
     fn shared_mm_fork_keeps_kernel_mm_and_vfork_release_authoritative() {
         let (parent, root) = authoritative_root();
-        let prepared_mm = parent.bank_resources().prepare_child().unwrap();
+        let prepared_mm = parent.mm_resources().prepare_child().unwrap();
         let plan = crate::kernel::ClonePlan::from_flags(
             carrick_abi::LinuxCloneFlags::VM | carrick_abi::LinuxCloneFlags::VFORK,
         )
@@ -1539,7 +1539,7 @@ mod tests {
         assert_eq!(wait.released_reason(), None);
 
         let backend = parent
-            .bank_resources()
+            .mm_resources()
             .publish_child(child_context.task().key(), prepared_mm)
             .unwrap();
         let child = parent.published_child_context(&child_context, backend);
@@ -1553,7 +1553,7 @@ mod tests {
     #[test]
     fn destructive_exec_releases_the_vfork_parent_gate() {
         let (parent, root) = authoritative_root();
-        let prepared_mm = parent.bank_resources().prepare_child().unwrap();
+        let prepared_mm = parent.mm_resources().prepare_child().unwrap();
         let stage1_root = prepared_mm.binding().stage1_root.gpa().raw();
         let child_tid = crate::thread::ThreadId::synthetic_for_tests(10_001);
         let published = parent
@@ -1576,7 +1576,7 @@ mod tests {
         let wait = wait.expect("vfork parent wait");
         let child_id = child_context.task().key().id;
         let backend = parent
-            .bank_resources()
+            .mm_resources()
             .publish_child(child_context.task().key(), prepared_mm)
             .unwrap();
         let child = parent.published_child_context(&child_context, backend);
@@ -1645,9 +1645,9 @@ mod tests {
     }
 
     #[test]
-    fn copied_mm_fork_keeps_the_prepared_banked_backend() {
+    fn copied_mm_fork_keeps_the_prepared_stage1_backend() {
         let (parent, root) = authoritative_root();
-        let prepared_mm = parent.bank_resources().prepare_child().unwrap();
+        let prepared_mm = parent.mm_resources().prepare_child().unwrap();
         let expected: std::sync::Arc<dyn crate::kernel::MmBackend> = prepared_mm.backend();
         let child = parent
             .kernel_graph()
@@ -1679,7 +1679,7 @@ mod tests {
     #[test]
     fn process_adapter_publishes_and_retires_through_kernel_authority() {
         let (parent, root) = authoritative_root();
-        let prepared_mm = parent.bank_resources().prepare_child().unwrap();
+        let prepared_mm = parent.mm_resources().prepare_child().unwrap();
         let child_tid = crate::thread::ThreadId::synthetic_for_tests(10_001);
         let prepared = parent
             .kernel_graph()
@@ -1698,7 +1698,7 @@ mod tests {
         assert!(wait.is_none());
         let child_id = child_context.task().key().id;
         let backend = parent
-            .bank_resources()
+            .mm_resources()
             .publish_child(child_context.task().key(), prepared_mm)
             .unwrap();
         let child = parent.published_child_context(&child_context, backend);
@@ -1713,8 +1713,8 @@ mod tests {
         finalize_test_child(&child, 23, child_tid);
         assert!(
             parent
-                .bank_resources()
-                .bank(child_context.task().key())
+                .mm_resources()
+                .root_slot(child_context.task().key())
                 .is_none()
         );
         let WaitResult::Exited(exit) = parent.wait_child(Some(child.pid()), true, false) else {
@@ -1728,7 +1728,7 @@ mod tests {
     #[test]
     fn process_adapter_reports_task_scoped_stop_and_continue_wait_status() {
         let (parent, root) = authoritative_root();
-        let prepared_mm = parent.bank_resources().prepare_child().unwrap();
+        let prepared_mm = parent.mm_resources().prepare_child().unwrap();
         let child_tid = crate::thread::ThreadId::synthetic_for_tests(10_002);
         let published = parent
             .kernel_graph()
@@ -1747,7 +1747,7 @@ mod tests {
         let (child_context, wait) = published.into_parts().unwrap();
         assert!(wait.is_none());
         let backend = parent
-            .bank_resources()
+            .mm_resources()
             .publish_child(child_context.task().key(), prepared_mm)
             .unwrap();
         let child = parent.published_child_context(&child_context, backend);

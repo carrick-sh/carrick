@@ -669,7 +669,62 @@ pub struct GuestWaitRegisters {
     pub lr: u64,
 }
 
+/// Runtime authority used by a backend when a private stage-1 write fault (or
+/// a kernel copy-to-user into the same page) must publish one new physical
+/// frame. The backend owns physical allocation/mapping; the runtime owns the
+/// authenticated kernel frame inventory transaction.
+pub trait FrameCowQuiesce {}
+
+impl<T> FrameCowQuiesce for T {}
+
+pub trait FrameCowAuthority: Send + Sync {
+    fn quiesce(&self)
+    -> Result<Box<dyn FrameCowQuiesce>, Box<dyn std::error::Error + Send + Sync>>;
+
+    fn reserve(
+        &self,
+    ) -> Result<crate::FrameInventoryReservation, Box<dyn std::error::Error + Send + Sync>>;
+
+    fn apply(
+        &self,
+        commit: crate::FrameInventoryCommit<()>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Authenticate that the just-published physical mapping is visible in
+    /// the bound mm's kernel-owned graph before the backend advertises a COW
+    /// commit or disarms the permission fault.
+    fn mapping_is_live(
+        &self,
+        mapping: crate::MappingId,
+        frame: crate::FrameId,
+        gpa: carrick_guest_mem::Gpa,
+        length: crate::FrameLength,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrameCowIdentity {
+    pub linux_pid: i32,
+    pub linux_tid: i32,
+    pub mm: u64,
+    pub asid: u16,
+}
+
 pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
+    fn bind_frame_cow(
+        &mut self,
+        _authority: std::sync::Arc<dyn FrameCowAuthority>,
+        _identity: FrameCowIdentity,
+    ) {
+    }
+
+    /// Resolve a synchronous stage-1 write-permission fault. `Ok(true)` means
+    /// the exact mm now owns a writable copied frame and the instruction should
+    /// be retried; `Ok(false)` leaves ordinary fault delivery unchanged.
+    fn resolve_frame_cow_fault(&mut self, _syndrome: u64, _far: u64) -> Result<bool, TrapError> {
+        Ok(false)
+    }
+
     /// Arm the exact child-map transaction before any backend/topology lock is
     /// acquired. HVPatch transfers this non-cloneable reservation through its
     /// process specification; other engines retain the no-op default.
@@ -758,8 +813,8 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
         &mut self,
         _entry: GuestEntryRegs,
         _child_ttbr0: u64,
-        _bank_base: u64,
-        _bank_size: u64,
+        _root_slot_base: u64,
+        _root_slot_size: u64,
         _child_tid: ThreadId,
         _forking_tid: ThreadId,
     ) -> Result<Self::ProcessSpec, TrapError> {

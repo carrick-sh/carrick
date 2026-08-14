@@ -356,6 +356,13 @@ pub enum TrapError {
         sp: u64,
         from_el0_direct: bool,
     },
+    #[error("stage-1 COW fault: esr=0x{syndrome:x} far=0x{far:x}")]
+    Stage1CowFault {
+        syndrome: u64,
+        far: u64,
+        elr: u64,
+        spsr: u64,
+    },
     /// carrick's guest took a SYNCHRONOUS exception while the CPU was at EL1.
     /// The guest itself only ever runs at EL0, and carrick's EL1 trampoline is
     /// just `hvc`/`eret`/shim code — so this is always carrick state corruption

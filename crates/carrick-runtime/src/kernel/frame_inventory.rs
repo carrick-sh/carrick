@@ -346,6 +346,15 @@ fn apply_event(
             permissions,
             ..
         } => {
+            tracing::trace!(
+                ?mm,
+                ?transaction,
+                ?mapping,
+                ?frame,
+                ?gpa,
+                ?length,
+                "frame inventory prepare"
+            );
             if reservation.mappings.binary_search(&mapping).is_err() {
                 return Err(FrameInventoryError::UnreservedMapping(mapping));
             }
@@ -448,6 +457,13 @@ fn apply_event(
             generation,
             ..
         } => {
+            tracing::trace!(
+                ?mm,
+                ?transaction,
+                ?mapping,
+                ?generation,
+                "frame inventory unmap"
+            );
             let frame_id = {
                 let entry = live_mapping_mut(state, mm, mapping)?;
                 require_next_generation(mapping, entry.generation, generation)?;

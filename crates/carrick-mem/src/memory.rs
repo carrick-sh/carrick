@@ -120,6 +120,8 @@ use zerocopy::IntoBytes;
 // with both the regions and the kernel-only first-2 MiB block, so they couldn't
 // run. Moving the hole high frees the low VA range for such binaries.
 pub const LINUX_KERNEL_REGION_BASE: u64 = 0x2D_0000_0000;
+/// Exact stage-1 span governed by the kernel-only AP/PXN regime.
+pub const LINUX_KERNEL_REGION_SIZE: u64 = 0x20_0000;
 // The NULL guard: stage-1 leaves VA 0..0x10000 UNMAPPED (16 4 KiB pages in
 // L3A), mirroring Linux's default `vm.mmap_min_addr` (65536) — a guest NULL
 // deref faults cleanly at stage 1 instead of reading backing memory. Backends
@@ -438,29 +440,23 @@ pub const LINUX_SHARED_FILE_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 pub const LINUX_PRIVATE_OVERLAY_BASE: u64 = 0x98_0000_0000; // 608 GiB
 pub const LINUX_PRIVATE_OVERLAY_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB, mirrors shared
 
-/// Stage-2 IPA window reserved for private address-space banks when multiple
-/// Linux processes share one HVF VM. It is deliberately inside the boot
-/// identity-map ceiling so stage-2 can address it, but every hvpatch process
-/// invalidates this VA range in stage-1 before its first entry. Child-private
-/// pages may therefore live here without becoming reachable through the boot
-/// identity mapping of any process.
-// Ten 40 GiB banks fit above the private-overlay aperture while leaving the
-// initial stack intact. One additional bank lives in the otherwise-unused
-// 320..360 GiB IPA hole between the heap and mmap arena. Banks are IPA-only:
-// every hvpatch page table invalidates both reserved apertures, so no process
-// can reach another process's private stage-2 backing through identity VA.
-pub const LINUX_PROCESS_AUX_BANK_BASE: u64 = 0x50_0000_0000; // 320 GiB
-pub const LINUX_PROCESS_AUX_BANK_SIZE: u64 = 0x0A_0000_0000; // 40 GiB
-pub const LINUX_PROCESS_BANK_BASE: u64 = 0x9A_0000_0000; // 616 GiB
-pub const LINUX_PROCESS_BANK_SIZE: u64 = 0x64_0000_0000; // 400 GiB (10 × 40 GiB)
-pub const LINUX_PROCESS_BANK_END: u64 = LINUX_PROCESS_BANK_BASE + LINUX_PROCESS_BANK_SIZE;
+/// HVPatch stage-1 root slots and global-frame IPA arena.  The first 4 GiB is
+/// a dense pool of 2 MiB per-mm table slots; every guest/kernel data frame is
+/// allocated monotonically from the remaining arena and mapped into stage-2
+/// exactly once.  Neither range is guest-VA identity-accessible.
+pub const LINUX_HVPATCH_ROOT_SLOT_BASE: u64 = 0x9A_0000_0000; // 616 GiB
+pub const LINUX_HVPATCH_ROOT_SLOT_ARENA_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+pub const LINUX_HVPATCH_GLOBAL_FRAME_BASE: u64 =
+    LINUX_HVPATCH_ROOT_SLOT_BASE + LINUX_HVPATCH_ROOT_SLOT_ARENA_SIZE;
+pub const LINUX_HVPATCH_GLOBAL_FRAME_SIZE: u64 = 0x63_0000_0000; // 396 GiB
+pub const LINUX_HVPATCH_RESERVED_END: u64 =
+    LINUX_HVPATCH_GLOBAL_FRAME_BASE + LINUX_HVPATCH_GLOBAL_FRAME_SIZE;
 
-const _: () =
-    assert!(LINUX_PRIVATE_OVERLAY_BASE + LINUX_PRIVATE_OVERLAY_SIZE <= LINUX_PROCESS_BANK_BASE);
-const _: () = assert!(LINUX_HEAP_BASE + LINUX_HEAP_SIZE <= LINUX_PROCESS_AUX_BANK_BASE);
-const _: () = assert!(LINUX_PROCESS_AUX_BANK_BASE + LINUX_PROCESS_AUX_BANK_SIZE <= LINUX_MMAP_BASE);
-const _: () = assert!(LINUX_PROCESS_BANK_END <= 1_u64 << 40);
-const _: () = assert!(LINUX_PROCESS_BANK_END <= LINUX_STACK_TOP - LINUX_STACK_SIZE);
+const _: () = assert!(
+    LINUX_PRIVATE_OVERLAY_BASE + LINUX_PRIVATE_OVERLAY_SIZE <= LINUX_HVPATCH_ROOT_SLOT_BASE
+);
+const _: () = assert!(LINUX_HVPATCH_RESERVED_END <= 1_u64 << 40);
+const _: () = assert!(LINUX_HVPATCH_RESERVED_END <= LINUX_STACK_TOP - LINUX_STACK_SIZE);
 
 /// True if `[va, va+len)` lies entirely within the boot-mapped shared aperture
 /// window. Used by `mmap` to detect a MAP_FIXED|MAP_PRIVATE that overlaps a
