@@ -607,10 +607,7 @@ fn project_vma_summaries(mem: &MemState) -> Vec<crate::kernel::VmaSummary> {
         .address_space_regions
         .iter()
         .flatten()
-        .filter(|map| {
-            !boot_region_is_hidden_reservation(map, mem.layout)
-                || boot_region_is_hidden_heap_backing(map, mem.layout)
-        })
+        .filter(|map| !boot_region_is_hidden_reservation(map, mem.layout))
         .chain(mem.dynamic_maps.iter())
         .filter_map(|map| (map.start < map.end).then_some((map.start, map.end)))
         .collect();
