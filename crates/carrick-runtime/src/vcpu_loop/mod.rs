@@ -4041,7 +4041,7 @@ pub(crate) fn assemble_run_result(
 pub(crate) struct PendingSignalAction {
     pub(crate) term_signal: Option<i32>,
     pub(crate) stop_signal: Option<i32>,
-    pub(crate) stop_generation: Option<crate::kernel::JobControlContinueGeneration>,
+    pub(crate) stop_generation: Option<crate::kernel::JobControlStopInvalidationGeneration>,
 }
 
 impl PendingSignalAction {
@@ -4063,7 +4063,7 @@ impl PendingSignalAction {
 
     pub(super) fn stop(
         signum: i32,
-        generation: Option<crate::kernel::JobControlContinueGeneration>,
+        generation: Option<crate::kernel::JobControlStopInvalidationGeneration>,
     ) -> Self {
         Self {
             term_signal: None,

@@ -2247,7 +2247,7 @@ struct TaskIdentity {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct JobControlContinueGeneration(u64);
+pub(crate) struct JobControlStopInvalidationGeneration(u64);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum DefaultStopGeneration {
@@ -2262,16 +2262,16 @@ struct TaskJobControl {
     stopped_by: Option<LinuxSignal>,
     pending_stop: Option<LinuxSignal>,
     pending_continue: bool,
-    continue_generation: u64,
+    stop_invalidation_generation: u64,
     default_stop_generation: DefaultStopGeneration,
 }
 
-fn advance_job_control_continue_generation(state: &mut TaskJobControl) {
-    let Some(next) = state.continue_generation.checked_add(1) else {
-        tracing::error!("job-control continue generation exhausted");
+fn advance_job_control_stop_invalidation_generation(state: &mut TaskJobControl) {
+    let Some(next) = state.stop_invalidation_generation.checked_add(1) else {
+        tracing::error!("job-control stop invalidation generation exhausted");
         std::process::abort();
     };
-    state.continue_generation = next;
+    state.stop_invalidation_generation = next;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2585,19 +2585,24 @@ impl Task {
                 | carrick_abi::LINUX_SIGTTOU
         ) {
             state.default_stop_generation = DefaultStopGeneration::Pending;
-        } else if signal.raw() == carrick_abi::LINUX_SIGCONT {
-            advance_job_control_continue_generation(&mut state);
+        } else if matches!(
+            signal.raw(),
+            carrick_abi::LINUX_SIGCONT | carrick_abi::LINUX_SIGKILL
+        ) {
+            advance_job_control_stop_invalidation_generation(&mut state);
             state.default_stop_generation = DefaultStopGeneration::Cancelled;
         }
     }
 
-    /// Snapshot the exact SIGCONT epoch in which a stop left a pending queue.
+    /// Snapshot the exact stop-invalidation epoch in which a stop left a
+    /// pending queue. SIGCONT and SIGKILL both advance this epoch: neither may
+    /// allow an already-dequeued stop action to park the task afterward.
     /// The caller holds [`Self::lock_signal_generation`] across dequeue and this
-    /// read, so SIGCONT cannot create an ABA window.
+    /// read, so neither invalidating signal can create an ABA window.
     fn job_control_generation_for_dequeue(
         &self,
         signal: LinuxSignal,
-    ) -> Option<JobControlContinueGeneration> {
+    ) -> Option<JobControlStopInvalidationGeneration> {
         if !matches!(
             signal.raw(),
             carrick_abi::LINUX_SIGSTOP
@@ -2609,9 +2614,9 @@ impl Task {
         }
         let state = self.job_control.lock();
         match state.default_stop_generation {
-            DefaultStopGeneration::Pending => {
-                Some(JobControlContinueGeneration(state.continue_generation))
-            }
+            DefaultStopGeneration::Pending => Some(JobControlStopInvalidationGeneration(
+                state.stop_invalidation_generation,
+            )),
             DefaultStopGeneration::None | DefaultStopGeneration::Cancelled => None,
         }
     }
@@ -2622,7 +2627,7 @@ impl Task {
     pub(super) fn stop_for_job_control(
         &self,
         signal: LinuxSignal,
-        action_generation: Option<JobControlContinueGeneration>,
+        action_generation: Option<JobControlStopInvalidationGeneration>,
     ) -> bool {
         // Keep the lifecycle lock through publication. Otherwise exit could
         // clear job control between this check and the state write, leaving a
@@ -2634,12 +2639,14 @@ impl Task {
         let mut state = self.job_control.lock();
         match action_generation {
             Some(generation)
-                if generation != JobControlContinueGeneration(state.continue_generation) =>
+                if generation
+                    != JobControlStopInvalidationGeneration(state.stop_invalidation_generation) =>
             {
-                // Every dequeued stop action is tied to the SIGCONT epoch in
-                // which it left pending state. A newer stop does not invalidate
-                // it, but any intervening SIGCONT does, even if another stop
-                // has since made the aggregate state Pending again.
+                // Every dequeued stop action is tied to the invalidation epoch
+                // in which it left pending state. A newer stop does not
+                // invalidate it, but any intervening SIGCONT or SIGKILL does,
+                // even if another stop has since made the aggregate state
+                // Pending again.
                 return true;
             }
             None if state.default_stop_generation == DefaultStopGeneration::Cancelled => {
@@ -2655,10 +2662,7 @@ impl Task {
         true
     }
 
-    /// Resume a stopped task and publish one waitable WCONTINUED transition.
-    /// SIGCONT against an already-running task remains successful but creates no
-    /// child-state event, matching Linux's state-change semantics.
-    pub(super) fn continue_from_job_control(&self) -> bool {
+    fn resume_from_job_control(&self, publish_continued: bool) -> bool {
         let lifecycle = self.lifecycle.lock();
         if *lifecycle != TaskLifecycle::Live {
             return false;
@@ -2666,10 +2670,26 @@ impl Task {
         let mut state = self.job_control.lock();
         let changed = state.stopped_by.take().is_some();
         if changed {
-            state.pending_continue = true;
+            if publish_continued {
+                state.pending_continue = true;
+            }
             self.job_control_changed.notify_all();
         }
         changed
+    }
+
+    /// Resume a stopped task and publish one waitable WCONTINUED transition.
+    /// SIGCONT against an already-running task remains successful but creates no
+    /// child-state event, matching Linux's state-change semantics.
+    pub(super) fn continue_from_job_control(&self) -> bool {
+        self.resume_from_job_control(true)
+    }
+
+    /// Release a stopped task so its vCPU can consume a fatal signal without
+    /// manufacturing WCONTINUED. Linux reports the eventual signal death, not
+    /// an intermediate continue transition caused only by SIGKILL delivery.
+    pub(super) fn resume_from_job_control_for_fatal_signal(&self) -> bool {
+        self.resume_from_job_control(false)
     }
 
     pub(crate) fn wait_until_job_control_resumed(&self) {
@@ -3359,7 +3379,7 @@ pub enum SignalPendingOwner {
 pub struct SignalDequeue {
     pub owner: SignalPendingOwner,
     pub pending: PendingSignal,
-    pub(crate) job_control_generation: Option<JobControlContinueGeneration>,
+    pub(crate) job_control_generation: Option<JobControlStopInvalidationGeneration>,
 }
 
 /// Exact signal leaf bundle captured from one [`super::core::KernelContext`].
@@ -3449,7 +3469,8 @@ impl SignalAuthority {
     /// Choose and dequeue one candidate under the canonical thread-then-task
     /// lock order. A same-signum tie is thread-directed, preserving provenance.
     /// Job-control generation stays locked through dequeue so a later default
-    /// action carries the exact SIGCONT epoch in which it left pending state.
+    /// action carries the exact stop-invalidation epoch in which it left
+    /// pending state.
     pub fn take_lowest_in(&self, wanted: SigSet) -> Option<SignalDequeue> {
         let generation_guard = self.task.lock_signal_generation();
         let mut thread = self.thread.signal_state.lock();
