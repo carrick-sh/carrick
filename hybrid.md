@@ -347,8 +347,8 @@ acceptance criteria.
 | 1 — lazy high-VA sharing | **COMPLETE** | `f457295ee`; [evidence](docs/perf-results/2026-08-13-hvpatch-lazy-high-va-shared-anonymous.md); signed advisory-hint MATCH, `just ci` GREEN |
 | 2 — KX fatal errors and evidence | **COMPLETE** | `12ed17b5f`; [fatal-path evidence](docs/perf-results/2026-08-13-hvpatch-exec-failure-red-green.txt) and [six-stage trace](docs/perf-results/2026-08-13-hvpatch-exec-runtime-stages.raw); four signed post-PONR failpoints signal-shaped, genuine exit 127 preserved, exact-six live trace, `just ci` GREEN |
 | 3 — KI identity reseed | **COMPLETE** | `ec4daa24`; [evidence](docs/perf-results/2026-08-14-hvpatch-identity-reseed-and-host-safety.md); signed 64/64 MATCH, strict DTrace host-low/errors/drops=0, Docker SIGKILL WCONTINUED=0/100, `just ci` GREEN |
-| 4 — global frames and stage-1 COW | **IN PROGRESS** | global frame ownership and permission-fault COW architecture next |
-| 5 — live-state crash artifacts | queued | — |
+| 4 — global frames and stage-1 COW | **COMPLETE** | `d66e0850`; [evidence](docs/perf-results/2026-08-14-hvpatch-global-frame-cow.md); signed 15/15 MATCH, mt COW 12/12, exact v5 structural receipt, stage2 118/118, `just ci` GREEN |
+| 5 — live-state crash artifacts | **IN PROGRESS** | authoritative all-thread crash snapshot and live `CoreDump` construction next |
 | 6 — KP shipped proof | queued | — |
 
 **Execution ruling:** Task 4 is mandatory on the structural invariants and KP
@@ -419,10 +419,10 @@ conformance probes.
 
 ### Task 4 — complete the mandatory kernel architecture
 
-- [ ] Keep KM on the critical path. Replace fixed process-bank ownership with
+- [x] Keep KM on the critical path. Replace fixed process-bank ownership with
   stable global frame IPAs and implement writable fork state through stage-1
   read-only sharing plus permission-fault COW, as invariants 4–6 require.
-- [ ] Add structural observability that proves parent and child initially name
+- [x] Add structural observability that proves parent and child initially name
   the same frame, only the writer acquires a new frame, and stage-2 never holds
   per-process duplicate banks. Existing `forkcow`/`forkshared` semantic probes
   remain necessary but are not sufficient evidence for these invariants.
