@@ -76,27 +76,24 @@ fn should_update_host_process_title(is_hvpatch: bool) -> bool {
     !is_hvpatch
 }
 
-/// Diagnostic-only deterministic failures for the three fallible inventory
-/// steps that follow HVPatch sibling teardown. The optional `@PATH` suffix
-/// limits injection to one guest exec target, so a container launcher can
-/// reach the probe before its child crosses the failure point.
+/// Diagnostic-only deterministic failures for fallible operations that follow
+/// HVPatch sibling teardown. A nonempty absolute `@PATH` suffix is mandatory,
+/// so a container launcher can reach the probe before its selected child
+/// crosses the failure point without arming unrelated execs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HvpatchExecInventoryFailureInjection {
     OldCapacity,
     ReplacementReservation,
     BeginInventory,
+    IdentityPage,
 }
 
-fn hvpatch_exec_inventory_failure_injection(
+fn parse_hvpatch_exec_inventory_failure_injection(
+    configured: &str,
     path: &str,
 ) -> Option<HvpatchExecInventoryFailureInjection> {
-    let configured = std::env::var("CARRICK_HVPATCH_EXEC_INVENTORY_FAILURE").ok()?;
-    let (name, target) = configured
-        .split_once('@')
-        .map_or((configured.as_str(), None), |(name, target)| {
-            (name, Some(target))
-        });
-    if target.is_some_and(|target| target != path) {
+    let (name, target) = configured.split_once('@')?;
+    if target.is_empty() || !std::path::Path::new(target).is_absolute() || target != path {
         return None;
     }
     match name {
@@ -105,8 +102,16 @@ fn hvpatch_exec_inventory_failure_injection(
             Some(HvpatchExecInventoryFailureInjection::ReplacementReservation)
         }
         "begin-inventory" => Some(HvpatchExecInventoryFailureInjection::BeginInventory),
+        "identity-page" => Some(HvpatchExecInventoryFailureInjection::IdentityPage),
         _ => None,
     }
+}
+
+fn hvpatch_exec_inventory_failure_injection(
+    path: &str,
+) -> Option<HvpatchExecInventoryFailureInjection> {
+    let configured = std::env::var("CARRICK_HVPATCH_EXEC_INVENTORY_FAILURE").ok()?;
+    parse_hvpatch_exec_inventory_failure_injection(&configured, path)
 }
 
 /// Fail-closed, opt-in proof that the image Carrick prepared for `execve` is
@@ -154,7 +159,53 @@ fn verify_published_exec_image<E: ThreadedEngine>(
 
 #[cfg(test)]
 mod exec_image_verification_tests {
-    use super::{apply_exec_inventory, first_byte_mismatch, should_update_host_process_title};
+    use super::{
+        HvpatchExecInventoryFailureInjection, apply_exec_inventory, first_byte_mismatch,
+        parse_hvpatch_exec_inventory_failure_injection, should_update_host_process_title,
+    };
+
+    #[test]
+    fn hvpatch_exec_failure_injection_requires_known_point_and_absolute_target() {
+        let target = "/bin/execfatalstatus";
+        for (configured, expected) in [
+            (
+                "old-capacity@/bin/execfatalstatus",
+                Some(HvpatchExecInventoryFailureInjection::OldCapacity),
+            ),
+            (
+                "replacement-reservation@/bin/execfatalstatus",
+                Some(HvpatchExecInventoryFailureInjection::ReplacementReservation),
+            ),
+            (
+                "begin-inventory@/bin/execfatalstatus",
+                Some(HvpatchExecInventoryFailureInjection::BeginInventory),
+            ),
+            (
+                "identity-page@/bin/execfatalstatus",
+                Some(HvpatchExecInventoryFailureInjection::IdentityPage),
+            ),
+        ] {
+            assert_eq!(
+                parse_hvpatch_exec_inventory_failure_injection(configured, target),
+                expected
+            );
+        }
+
+        for configured in [
+            "old-capacity",
+            "old-capacity@",
+            "old-capacity@bin/execfatalstatus",
+            "old-capacity@/bin/other",
+            "unknown@/bin/execfatalstatus",
+            "@/bin/execfatalstatus",
+        ] {
+            assert_eq!(
+                parse_hvpatch_exec_inventory_failure_injection(configured, target),
+                None,
+                "malformed injection armed: {configured}"
+            );
+        }
+    }
 
     #[test]
     fn reports_the_first_divergent_exec_byte() {
@@ -484,13 +535,7 @@ where
                     if inventory_failure_injection
                         == Some(HvpatchExecInventoryFailureInjection::BeginInventory)
                     {
-                        drop((retired, replacement));
-                        return Self::exec_failed_past_no_return(
-                            kernel,
-                            engine,
-                            "injected HVPatch begin_exec_inventory failure",
-                        )
-                        .map(Some);
+                        engine.inject_next_begin_exec_inventory_failure();
                     }
                     if let Err(error) = engine.begin_exec_inventory(retired, replacement) {
                         return Self::exec_failed_past_no_return(
@@ -673,7 +718,26 @@ where
                 crate::namespace::pid::mark_self_execed();
                 // execve_into rebuilt a fresh vCPU: re-stamp the identity page
                 // (zeroed) and TPIDR_EL1 (reset) for the same thread/tid.
-                stamp_identity_page(engine, &kernel.dispatcher, &committed_context);
+                let identity_base = if inventory_failure_injection
+                    == Some(HvpatchExecInventoryFailureInjection::IdentityPage)
+                {
+                    u64::MAX - 0x100
+                } else {
+                    crate::memory::LINUX_IDENTITY_PAGE_BASE
+                };
+                if let Err(error) = super::stamp_identity_page_at(
+                    engine,
+                    &kernel.dispatcher,
+                    &committed_context,
+                    identity_base,
+                ) {
+                    return Self::exec_failed_past_no_return(
+                        kernel,
+                        engine,
+                        &format!("stamp HVPatch exec identity page: {error}"),
+                    )
+                    .map(Some);
+                }
                 if let Err(error) = engine.set_guest_thread_id(self.linux_tid.raw() as u64) {
                     return Self::exec_failed_past_no_return(
                         kernel,

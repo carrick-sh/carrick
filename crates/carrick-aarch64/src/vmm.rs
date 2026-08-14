@@ -339,6 +339,8 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         (0, 0)
     }
 
+    fn inject_next_begin_exec_inventory_failure(&mut self) {}
+
     fn begin_exec_inventory(
         &mut self,
         retired: carrick_hal::FrameInventoryReservation,

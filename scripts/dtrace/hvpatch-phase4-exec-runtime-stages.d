@@ -118,19 +118,25 @@ carrick*:::hvpatch-exec-runtime-stage
 { join_errors++; }
 
 carrick*:::hvpatch-guest-lifecycle
+/(pid == $target || progenyof($target)) && arg0 == 2/
+{
+    printf("HVPATCH4RUNTIME|complete|host_pid=%d|host_tid=%d|exec_sequence=%u|guest_pid=%d|guest_tid=%d|asid=%u\n",
+        pid, tid, self->exec_sequence, (int)arg1, (int)arg3, (uint32_t)arg4);
+}
+
+carrick*:::hvpatch-guest-lifecycle
 /(pid == $target || progenyof($target)) && arg0 == 2 &&
- (!self->active || self->guest_pid != (int)arg1)/
+ (!self->active || self->guest_pid != (int)arg1 ||
+  self->guest_tid != (int)arg3 || self->guest_asid != (uint32_t)arg4)/
 { completion_errors++; }
 
 carrick*:::hvpatch-guest-lifecycle
 /(pid == $target || progenyof($target)) && arg0 == 2 && self->active &&
- self->guest_pid == (int)arg1/
+ self->guest_pid == (int)arg1 && self->guest_tid == (int)arg3 &&
+ self->guest_asid == (uint32_t)arg4/
 {
     completion_errors += self->event_count != 6 || self->phase_mask != 63;
     completes++;
-    printf("HVPATCH4RUNTIME|complete|host_pid=%d|host_tid=%d|exec_sequence=%u|guest_pid=%d|guest_tid=%d|asid=%u\n",
-        pid, tid, self->exec_sequence, self->guest_pid, self->guest_tid,
-        self->guest_asid);
     self->active = 0;
     self->guest_pid = 0;
     self->guest_tid = 0;

@@ -2894,6 +2894,7 @@ struct HvpatchFrameInventory {
         carrick_hal::FrameInventoryCommit<()>,
         carrick_hal::FrameInventoryCommit<()>,
     )>,
+    fail_next_begin_exec_inventory: bool,
     retirement_reservation: Option<carrick_hal::FrameInventoryReservation>,
     retirement_commit: Option<carrick_hal::FrameInventoryCommit<()>>,
 }
@@ -3718,6 +3719,11 @@ impl HvfVmState {
         replacement: carrick_hal::FrameInventoryReservation,
     ) -> Result<(), TrapError> {
         let mut inventory = self.frame_inventory.lock();
+        if std::mem::take(&mut inventory.fail_next_begin_exec_inventory) {
+            return Err(TrapError::Hypervisor(
+                "injected HVPatch begin_exec_inventory failure".to_owned(),
+            ));
+        }
         if inventory.retired_reservation.is_some()
             || inventory.replacement_reservation.is_some()
             || inventory.exec_commits.is_some()
@@ -3729,6 +3735,10 @@ impl HvfVmState {
         inventory.retired_reservation = Some(retired);
         inventory.replacement_reservation = Some(replacement);
         Ok(())
+    }
+
+    pub(crate) fn inject_next_begin_exec_inventory_failure(&mut self) {
+        self.frame_inventory.lock().fail_next_begin_exec_inventory = true;
     }
 
     pub(crate) fn frame_inventory_exec_extent_counts(
