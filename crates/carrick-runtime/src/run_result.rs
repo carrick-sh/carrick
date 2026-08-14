@@ -122,3 +122,62 @@ impl RunResult {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(exit_code: i32, terminating_signal: Option<i32>) -> RunResult {
+        RunResult {
+            exit_code,
+            terminating_signal,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            traps: 0,
+            report: Default::default(),
+            trap_limit_hit: false,
+        }
+    }
+
+    /// An `execve` that fails past its point of no return must be
+    /// distinguishable, by the parent, from a program that exited 127.
+    ///
+    /// Carrick used to report an internal exec failure as exit code 127. That
+    /// is `WIFEXITED`, so `wait(2)` said the child exited normally — and 127
+    /// is exactly what a shell reports for "command not found", so an internal
+    /// carrick failure was indistinguishable both from a missing binary and
+    /// from a program that deliberately exited 127. Linux kills the caller
+    /// with SIGSEGV there, which is `WIFSIGNALED` and unambiguous.
+    #[test]
+    fn a_signalled_exec_failure_is_distinguishable_from_exit_127() {
+        let signalled = result(128 + 11, Some(11)).wait_status_encoding(false);
+        let exited_127 = result(127, None).wait_status_encoding(false);
+
+        // WIFSIGNALED: the low 7 bits carry the signal and are nonzero.
+        assert_eq!(signalled & 0x7f, 11, "SIGSEGV in the signal field");
+        // WIFEXITED: the low 7 bits are zero and the code is in bits 8..16.
+        assert_eq!(exited_127 & 0x7f, 0, "a normal exit has no signal");
+        assert_eq!((exited_127 >> 8) & 0xff, 127);
+
+        // The whole point: the two are not the same status word, so a parent
+        // can tell them apart.
+        assert_ne!(signalled, exited_127);
+
+        // And the signalled form must not be mistakable for ANY normal exit —
+        // its exit-code field must not be read as a meaningful code.
+        assert_eq!(
+            signalled & 0x7f,
+            11,
+            "a signalled death never encodes into the exit-code field"
+        );
+    }
+
+    /// The exit-code field is masked to 8 bits, so `128 + signum` stored
+    /// alongside the signal cannot leak into the status word.
+    #[test]
+    fn the_signal_form_ignores_the_companion_exit_code() {
+        let with_code = result(139, Some(11)).wait_status_encoding(false);
+        let without_code = result(0, Some(11)).wait_status_encoding(false);
+        assert_eq!(with_code, without_code);
+    }
+}
