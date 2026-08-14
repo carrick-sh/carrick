@@ -7,7 +7,7 @@
 
 use conformance_probes::{errno, install_handler, install_ign, report};
 use std::ffi::CString;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 const SIG_USR1: u32 = 1 << 0;
 const SIG_USR2: u32 = 1 << 1;
@@ -17,6 +17,7 @@ const ALL_CHILD_SIGNALS: u32 = SIG_USR1 | SIG_USR2 | SIG_TERM | SIG_CHLD;
 
 static CHILD_SIGNALS: AtomicU32 = AtomicU32::new(0);
 static ROOT_SIGNALS: AtomicU32 = AtomicU32::new(0);
+static LEADER_CLEARTID: AtomicI32 = AtomicI32::new(-1);
 
 extern "C" fn root_signal(signum: libc::c_int) {
     let bit = match signum {
@@ -107,6 +108,17 @@ fn wait_exited(pid: i32) -> Option<i32> {
     }
 }
 
+fn wait_status(pid: i32, options: i32) -> Option<i32> {
+    loop {
+        let mut status = 0_i32;
+        let waited = unsafe { libc::waitpid(pid, &mut status, options) };
+        if waited == -1 && errno() == libc::EINTR {
+            continue;
+        }
+        return (waited == pid).then_some(status);
+    }
+}
+
 fn query_disposition(signum: i32) -> Option<libc::sighandler_t> {
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
     (unsafe { libc::sigaction(signum, std::ptr::null(), &mut action) } == 0)
@@ -148,6 +160,26 @@ fn child_sends_parent_signal(parent_pid: i32, group: bool) -> bool {
     sent && wait_exited(child) == Some(0)
 }
 
+fn child_sends_parent_terminal_stop(parent_pid: i32, group: bool) -> bool {
+    let Some(result) = make_pipe() else {
+        return false;
+    };
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        unsafe { libc::close(result[0]) };
+        // The group form targets the sender too. Ignore only the sender's copy;
+        // the parent retains SIG_DFL, which is the PID-1 immunity under test.
+        let prepared = !group || unsafe { install_ign(libc::SIGTSTP) };
+        let target = if group { 0 } else { parent_pid };
+        let sent = unsafe { libc::kill(target, libc::SIGTSTP) } == 0;
+        let _ = exact_write(result[1], u64::from(prepared && sent));
+        unsafe { libc::_exit(0) }
+    }
+    unsafe { libc::close(result[1]) };
+    let sent = exact_read(result[0]) == Some(1);
+    sent && wait_exited(child) == Some(0)
+}
+
 fn pid_one_signal_immunity_case(parent_pid: i32) -> (bool, bool, bool, bool) {
     // Guest init has no SIGTERM handler here. Linux accepts both sends but
     // suppresses its default-lethal action; the group sender catches its own
@@ -165,6 +197,66 @@ fn pid_one_signal_immunity_case(parent_pid: i32) -> (bool, bool, bool, bool) {
         handled_send,
         handled_delivery,
     )
+}
+
+fn pid_one_terminal_stop_immunity_case(parent_pid: i32) -> bool {
+    child_sends_parent_terminal_stop(parent_pid, false)
+        && child_sends_parent_terminal_stop(parent_pid, true)
+}
+
+fn job_control_case(parent_pid: i32) -> [bool; 7] {
+    let Some(ready) = make_pipe() else {
+        return [false; 7];
+    };
+    let Some(release) = make_pipe() else {
+        return [false; 7];
+    };
+    let Some(resumed) = make_pipe() else {
+        return [false; 7];
+    };
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        unsafe {
+            libc::close(ready[0]);
+            libc::close(release[1]);
+            libc::close(resumed[0]);
+        }
+        let announced = exact_write(ready[1], 1);
+        let released = exact_read(release[0]) == Some(1);
+        let resumed_parent = exact_write(resumed[1], u64::from(announced && released));
+        unsafe { libc::_exit(if resumed_parent { 0 } else { 7 }) }
+    }
+    unsafe {
+        libc::close(ready[1]);
+        libc::close(release[0]);
+        libc::close(resumed[1]);
+    }
+    if child <= 0 || exact_read(ready[0]) != Some(1) {
+        return [false; 7];
+    }
+
+    let stop_sent = unsafe { libc::kill(child, libc::SIGSTOP) } == 0;
+    let stopped = stop_sent
+        && wait_status(child, libc::WUNTRACED)
+            .is_some_and(|status| libc::WIFSTOPPED(status) && libc::WSTOPSIG(status) == libc::SIGSTOP);
+    // Reaching this exact task identity after the child stopped proves the
+    // sender stayed runnable; a host-process SIGSTOP would park both tasks.
+    let parent_runnable = stopped && unsafe { libc::getpid() } == parent_pid;
+    let continue_sent = parent_runnable && unsafe { libc::kill(child, libc::SIGCONT) } == 0;
+    let continued = continue_sent
+        && wait_status(child, libc::WCONTINUED).is_some_and(|status| libc::WIFCONTINUED(status));
+    let released = continued && exact_write(release[1], 1);
+    let child_resumed = released && exact_read(resumed[0]) == Some(1);
+    let child_exited = child_resumed && wait_exited(child) == Some(0);
+    [
+        stop_sent,
+        stopped,
+        parent_runnable,
+        continue_sent,
+        continued,
+        child_resumed,
+        child_exited,
+    ]
 }
 
 fn call_denied(operation: impl FnOnce() -> libc::c_int) -> bool {
@@ -230,6 +322,93 @@ fn credential_denial_case() -> [bool; 3] {
     let target_ok = wait_exited(target) == Some(0);
     let complete = sender_ok && released && target_ok;
     std::array::from_fn(|index| complete && bits & (1 << index) != 0)
+}
+
+fn leader_exit_signal_case() -> [bool; 8] {
+    let Some(ready) = make_pipe() else {
+        return [false; 8];
+    };
+    let Some(result) = make_pipe() else {
+        return [false; 8];
+    };
+    let target = unsafe { libc::fork() };
+    if target == 0 {
+        unsafe {
+            libc::close(ready[0]);
+            libc::close(result[0]);
+        }
+        CHILD_SIGNALS.store(0, Ordering::SeqCst);
+        let prepared = unsafe { libc::setpgid(0, 0) } == 0
+            && [libc::SIGUSR1, libc::SIGUSR2]
+                .into_iter()
+                .all(|signum| unsafe { install_handler(signum, child_signal, 0) });
+        let leader_tid = gettid();
+        LEADER_CLEARTID.store(leader_tid, Ordering::SeqCst);
+        let cleartid_armed = unsafe {
+            libc::syscall(
+                libc::SYS_set_tid_address,
+                LEADER_CLEARTID.as_ptr(),
+            ) as i32
+        } == leader_tid;
+        let sibling = std::thread::Builder::new()
+            .name("leader-exit-survivor".to_owned())
+            .spawn(move || {
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(3);
+                while LEADER_CLEARTID.load(Ordering::SeqCst) != 0
+                    && std::time::Instant::now() < deadline
+                {
+                    unsafe { libc::sched_yield() };
+                }
+                let leader_exited = LEADER_CLEARTID.load(Ordering::SeqCst) == 0;
+                let setup = u64::from(prepared && cleartid_armed)
+                    | (u64::from(leader_exited) << 1);
+                let announced = exact_write(ready[1], setup);
+                let delivered = wait_for_bits(&CHILD_SIGNALS, SIG_USR1 | SIG_USR2);
+                let _ = exact_write(result[1], u64::from(announced && delivered));
+                unsafe { libc::_exit(0) }
+            });
+        if sibling.is_err() {
+            let _ = exact_write(ready[1], 0);
+            unsafe { libc::_exit(8) }
+        }
+        // Leave the thread-group leader while the sibling remains live. Linux
+        // keeps the TGID addressable for process/group signals even though the
+        // exact leader TID no longer names a live thread.
+        unsafe {
+            libc::syscall(libc::SYS_exit, 0);
+            libc::_exit(9)
+        }
+    }
+    unsafe {
+        libc::close(ready[1]);
+        libc::close(result[1]);
+    }
+    let setup = exact_read(ready[0]).unwrap_or(0);
+    if target <= 0 || setup == 0 {
+        return [false; 8];
+    }
+    // The ready byte is published only after Linux cleared the leader's exact
+    // set_tid_address word, an authoritative exit barrier, while the sibling
+    // keeps the thread group live.
+    let prepared = setup & 1 != 0;
+    let leader_gone = setup & 2 != 0;
+    let positive_zero = leader_gone && unsafe { libc::kill(target, 0) } == 0;
+    let group_zero = leader_gone && unsafe { libc::kill(-target, 0) } == 0;
+    let positive_signal = leader_gone && unsafe { libc::kill(target, libc::SIGUSR1) } == 0;
+    let group_signal = leader_gone && unsafe { libc::kill(-target, libc::SIGUSR2) } == 0;
+    let sibling_delivered = exact_read(result[0]) == Some(1);
+    let child_exited = wait_exited(target) == Some(0);
+    [
+        prepared,
+        leader_gone,
+        positive_zero,
+        group_zero,
+        positive_signal,
+        group_signal,
+        sibling_delivered,
+        child_exited,
+    ]
 }
 
 fn child_identity_and_signal_case(parent_pid: i32, parent_sid: i32) -> (u64, u64, bool, bool) {
@@ -428,7 +607,10 @@ fn main() {
         pid_one_handled_send_succeeded,
         pid_one_handled_signal_delivered,
     ) = pid_one_signal_immunity_case(pid);
+    let pid_one_terminal_stop_immunity = pid_one_terminal_stop_immunity_case(pid);
+    let job_control = job_control_case(pid);
     let credential_results = credential_denial_case();
+    let leader_exit = leader_exit_signal_case();
 
     let (child_bits, signal_call_bits, broadcast_live, negative_pgid_one_live) =
         child_identity_and_signal_case(pid, sid);
@@ -451,9 +633,25 @@ fn main() {
         pid_one_handler_installed = pid_one_handler_installed,
         pid_one_handled_send_succeeded = pid_one_handled_send_succeeded,
         pid_one_handled_signal_delivered = pid_one_handled_signal_delivered,
+        pid_one_terminal_stop_immunity = pid_one_terminal_stop_immunity,
+        job_control_stop_send_succeeded = job_control[0],
+        job_control_wait_reported_sigstop = job_control[1],
+        job_control_sender_remained_runnable = job_control[2],
+        job_control_continue_send_succeeded = job_control[3],
+        job_control_wait_reported_continued = job_control[4],
+        job_control_child_resumed = job_control[5],
+        job_control_child_exited_zero = job_control[6],
         credential_positive_signal_zero_denied = credential_results[0],
         credential_tgkill_signal_zero_denied = credential_results[1],
         credential_group_signal_zero_denied = credential_results[2],
+        leader_exit_setup_ready = leader_exit[0],
+        leader_exit_observed = leader_exit[1],
+        leader_exit_positive_signal_zero_succeeded = leader_exit[2],
+        leader_exit_group_signal_zero_succeeded = leader_exit[3],
+        leader_exit_positive_signal_succeeded = leader_exit[4],
+        leader_exit_group_signal_succeeded = leader_exit[5],
+        leader_exit_sibling_received_signals = leader_exit[6],
+        leader_exit_child_exited_zero = leader_exit[7],
         child_setup_ready = child_bits & (1 << 0) != 0,
         child_id_is_linux_shaped = child_bits & (1 << 1) != 0,
         child_tid_ppid_match = child_bits & (1 << 2) != 0,

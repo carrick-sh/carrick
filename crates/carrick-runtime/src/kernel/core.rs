@@ -574,6 +574,7 @@ impl Kernel {
             process_group_id,
             session_id,
             Arc::clone(&shared),
+            resources.credentials(),
         ));
         let leader_tid = LinuxTid::for_task_leader(bootstrap.task_id);
         let leader_key = ThreadKey {

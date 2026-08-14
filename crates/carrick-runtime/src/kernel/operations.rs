@@ -17,8 +17,8 @@ use super::core::{
 use super::ids::{LinuxSignal, LinuxTid, MmId, ObjectIdError, ProcessGroupId, SessionId, TaskId};
 use super::objects::{
     Credentials, FileTable, LinuxWaitStatus, Mm, ObjectGraphError, ProcessGroup, Session, Task,
-    TaskKey, TaskLifecycle, TaskRef, TaskShared, TaskSharedCloneError, ThreadKey, ThreadRef,
-    ThreadResources, Zombie,
+    TaskJobControlEvent, TaskKey, TaskLifecycle, TaskRef, TaskShared, TaskSharedCloneError,
+    ThreadKey, ThreadRef, ThreadResources, Zombie,
 };
 use super::registry::{IdError, TaskReservation, ThreadClaim, ThreadReservation};
 
@@ -36,9 +36,24 @@ pub enum WaitMode {
     Consume,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct WaitJobControl {
+    stopped: bool,
+    continued: bool,
+}
+
+impl WaitJobControl {
+    const NONE: Self = Self {
+        stopped: false,
+        continued: false,
+    };
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WaitOutcome {
     Exited(Zombie),
+    Stopped { task: TaskId, signal: LinuxSignal },
+    Continued { task: TaskId },
     StillRunning,
     NoChild,
 }
@@ -487,6 +502,7 @@ impl ForkReservation {
             self.caller_task.process_group(),
             self.caller_task.session(),
             Arc::clone(&child_shared),
+            child_resources.credentials(),
         ));
         let leader_tid = LinuxTid::for_task_leader(self.child_id);
         let leader = child.attach_fork_thread(
@@ -959,8 +975,9 @@ impl Kernel {
     }
 
     /// Authorize a process- or thread-directed Linux signal without consulting
-    /// host process identity. `target_thread == None` uses the task leader's
-    /// credentials; thread-directed calls name the exact target thread.
+    /// host process identity. `target_thread == None` uses the task's retained
+    /// leader credential authority; thread-directed calls name the exact target
+    /// thread.
     pub fn authorize_signal_target(
         &self,
         caller: &KernelContext,
@@ -979,12 +996,17 @@ impl Kernel {
             if record.task.lifecycle() != TaskLifecycle::Live {
                 return SignalTargetAuthorization::Missing;
             }
-            let tid = target_thread.unwrap_or_else(|| LinuxTid::for_task_leader(target_task));
-            let Some(thread) = record.task.thread(tid) else {
-                return SignalTargetAuthorization::Missing;
+            let credentials = match target_thread {
+                Some(tid) => {
+                    let Some(thread) = record.task.thread(tid) else {
+                        return SignalTargetAuthorization::Missing;
+                    };
+                    thread.resources().credentials()
+                }
+                None => record.task.process_credentials(),
             };
             (
-                thread.resources().credentials(),
+                credentials,
                 record.task.session(),
                 record.task.shared().sighand(),
             )
@@ -1006,7 +1028,13 @@ impl Kernel {
         let init = TaskId::from_abi_positive(carrick_abi::LINUX_BOOTSTRAP_PID as i32).ok();
         if Some(target_task) == init
             && signal.is_some_and(|signal| {
-                crate::namespace::pid::is_init_protected_default_signal(signal.raw())
+                (crate::namespace::pid::is_init_protected_default_signal(signal.raw())
+                    || matches!(
+                        signal.raw(),
+                        carrick_abi::LINUX_SIGTSTP
+                            | carrick_abi::LINUX_SIGTTIN
+                            | carrick_abi::LINUX_SIGTTOU
+                    ))
                     && target_sighand.disposition(signal)
                         == super::objects::SignalDisposition::Default
             })
@@ -1014,6 +1042,73 @@ impl Kernel {
             return SignalTargetAuthorization::DropProtectedInit;
         }
         SignalTargetAuthorization::Allowed
+    }
+
+    /// Apply a default-stop action to one live Linux task without signaling
+    /// the host carrier process. The target's vCPU threads and its parent wait
+    /// vehicle are woken only after the task-scoped state is published.
+    pub fn stop_task_for_job_control(&self, target: TaskId, signal: LinuxSignal) -> bool {
+        let (task, parent) = {
+            let state = self.registry().state.read();
+            let Some(record) = state.tasks.get(&target) else {
+                return false;
+            };
+            if record.task.lifecycle() != TaskLifecycle::Live {
+                return false;
+            }
+            let parent_key = record.task.parent();
+            let parent = parent_key
+                .and_then(|key| state.tasks.get(&key.id).map(|record| (key, record)))
+                .filter(|(key, record)| record.task.key() == *key)
+                .map(|(_, record)| Arc::clone(&record.task));
+            (Arc::clone(&record.task), parent)
+        };
+        if !task.stop_for_job_control(signal) {
+            return false;
+        }
+        task.wake();
+        if let Some(parent) = parent {
+            parent.wake();
+        }
+        true
+    }
+
+    /// Resume one stopped Linux task. Returning false means the task was live
+    /// but already running (or absent); SIGCONT delivery itself may still
+    /// succeed and may still invoke a caught handler.
+    pub fn continue_task_from_job_control(&self, target: TaskId) -> bool {
+        let (task, parent) = {
+            let state = self.registry().state.read();
+            let Some(record) = state.tasks.get(&target) else {
+                return false;
+            };
+            if record.task.lifecycle() != TaskLifecycle::Live {
+                return false;
+            }
+            let parent_key = record.task.parent();
+            let parent = parent_key
+                .and_then(|key| state.tasks.get(&key.id).map(|record| (key, record)))
+                .filter(|(key, record)| record.task.key() == *key)
+                .map(|(_, record)| Arc::clone(&record.task));
+            (Arc::clone(&record.task), parent)
+        };
+        if !task.continue_from_job_control() {
+            return false;
+        }
+        task.wake();
+        if let Some(parent) = parent {
+            parent.wake();
+        }
+        true
+    }
+
+    pub fn task_is_job_control_stopped(&self, target: TaskId) -> bool {
+        self.registry()
+            .state
+            .read()
+            .tasks
+            .get(&target)
+            .is_some_and(|record| record.task.is_job_control_stopped())
     }
 
     /// Every LIVE task in `group`, lowest id first.
@@ -1119,6 +1214,15 @@ impl Kernel {
         } else {
             pending.enqueue_standard(signal, siginfo);
         }
+        // Queue before resume. A stopped task cannot consume the signal yet,
+        // and once SIGCONT/SIGKILL releases it the pending action must already
+        // be visible so delivery cannot race behind guest execution or exit.
+        if matches!(
+            signal.raw(),
+            carrick_abi::LINUX_SIGCONT | carrick_abi::LINUX_SIGKILL
+        ) {
+            let _ = self.continue_task_from_job_control(target);
+        }
         task.wake();
         true
     }
@@ -1174,6 +1278,12 @@ impl Kernel {
                 pending.enqueue_standard(signal, siginfo);
             }
         });
+        if matches!(
+            signal.raw(),
+            carrick_abi::LINUX_SIGCONT | carrick_abi::LINUX_SIGKILL
+        ) {
+            let _ = self.continue_task_from_job_control(target_task);
+        }
         task.wake();
         true
     }
@@ -1715,6 +1825,9 @@ impl Kernel {
             let revision = record.revision;
             let task = Arc::clone(&record.task);
             thread.replace_resources(Arc::clone(&resources));
+            if thread.key().tid == LinuxTid::for_task_leader(task_id) {
+                task.replace_process_credentials(resources.credentials());
+            }
             self.observe_thread_publication(&thread, &resources, revision);
             return Ok(KernelContext::from_parts(
                 self.clone(),
@@ -2560,7 +2673,28 @@ impl Kernel {
         target: Option<TaskId>,
         mode: WaitMode,
     ) -> Result<WaitOutcome, KernelOperationError> {
-        self.wait_child_matching(parent_id, target, None, None, mode)
+        self.wait_child_matching(parent_id, target, None, None, WaitJobControl::NONE, mode)
+    }
+
+    pub fn wait_child_with_job_control(
+        &self,
+        parent_id: TaskId,
+        target: Option<TaskId>,
+        include_stopped: bool,
+        include_continued: bool,
+        mode: WaitMode,
+    ) -> Result<WaitOutcome, KernelOperationError> {
+        self.wait_child_matching(
+            parent_id,
+            target,
+            None,
+            None,
+            WaitJobControl {
+                stopped: include_stopped,
+                continued: include_continued,
+            },
+            mode,
+        )
     }
 
     pub fn wait_child_key(
@@ -2569,7 +2703,14 @@ impl Kernel {
         target: TaskKey,
         mode: WaitMode,
     ) -> Result<WaitOutcome, KernelOperationError> {
-        self.wait_child_matching(parent_id, Some(target.id), Some(target), None, mode)
+        self.wait_child_matching(
+            parent_id,
+            Some(target.id),
+            Some(target),
+            None,
+            WaitJobControl::NONE,
+            mode,
+        )
     }
 
     pub fn wait_child_in_process_group(
@@ -2578,7 +2719,35 @@ impl Kernel {
         process_group: ProcessGroupId,
         mode: WaitMode,
     ) -> Result<WaitOutcome, KernelOperationError> {
-        self.wait_child_matching(parent_id, None, None, Some(process_group), mode)
+        self.wait_child_matching(
+            parent_id,
+            None,
+            None,
+            Some(process_group),
+            WaitJobControl::NONE,
+            mode,
+        )
+    }
+
+    pub fn wait_child_in_process_group_with_job_control(
+        &self,
+        parent_id: TaskId,
+        process_group: ProcessGroupId,
+        include_stopped: bool,
+        include_continued: bool,
+        mode: WaitMode,
+    ) -> Result<WaitOutcome, KernelOperationError> {
+        self.wait_child_matching(
+            parent_id,
+            None,
+            None,
+            Some(process_group),
+            WaitJobControl {
+                stopped: include_stopped,
+                continued: include_continued,
+            },
+            mode,
+        )
     }
 
     fn wait_child_matching(
@@ -2587,6 +2756,7 @@ impl Kernel {
         target: Option<TaskId>,
         exact_target: Option<TaskKey>,
         process_group: Option<ProcessGroupId>,
+        job_control: WaitJobControl,
         mode: WaitMode,
     ) -> Result<WaitOutcome, KernelOperationError> {
         self.sweep_retired_threads();
@@ -2633,6 +2803,36 @@ impl Kernel {
                 }
             }
             return Ok(WaitOutcome::Exited(zombie));
+        }
+
+        if job_control.stopped || job_control.continued {
+            let state_change = state.tasks.iter().find_map(|(id, record)| {
+                (record.task.parent() == Some(parent)
+                    && process_group.is_none_or(|group| record.task.process_group() == group)
+                    && exact_target.map_or_else(
+                        || target.is_none_or(|target| target == *id),
+                        |target| target == record.task.key(),
+                    ))
+                .then(|| {
+                    record
+                        .task
+                        .waitable_job_control_event(
+                            job_control.stopped,
+                            job_control.continued,
+                            mode == WaitMode::Consume,
+                        )
+                        .map(|event| match event {
+                            TaskJobControlEvent::Stopped(signal) => {
+                                WaitOutcome::Stopped { task: *id, signal }
+                            }
+                            TaskJobControlEvent::Continued => WaitOutcome::Continued { task: *id },
+                        })
+                })
+                .flatten()
+            });
+            if let Some(state_change) = state_change {
+                return Ok(state_change);
+            }
         }
 
         let live_child = state.tasks.iter().any(|(id, record)| {
@@ -3376,6 +3576,18 @@ mod tests {
             SignalTargetAuthorization::DropProtectedInit,
             "an unhandled default-lethal signal to guest init is accepted but dropped",
         );
+        for signum in [
+            carrick_abi::LINUX_SIGTSTP,
+            carrick_abi::LINUX_SIGTTIN,
+            carrick_abi::LINUX_SIGTTOU,
+        ] {
+            let signal = LinuxSignal::for_signal_number(signum).expect("terminal stop signal");
+            assert_eq!(
+                kernel.authorize_signal_target(&sender, init_id, None, Some(signal)),
+                SignalTargetAuthorization::DropProtectedInit,
+                "default terminal-stop signal {signum} must not stop guest init",
+            );
+        }
         let mut caught = carrick_abi::LinuxSigaction::empty();
         caught.sa_handler = 0x4000;
         init.shared().sighand().install_action(sigterm, caught);
@@ -3383,6 +3595,13 @@ mod tests {
             kernel.authorize_signal_target(&sender, init_id, None, Some(sigterm)),
             SignalTargetAuthorization::Allowed,
             "guest init may receive a signal for which it installed a handler",
+        );
+        let sigtstp = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGTSTP).expect("SIGTSTP");
+        init.shared().sighand().install_action(sigtstp, caught);
+        assert_eq!(
+            kernel.authorize_signal_target(&sender, init_id, None, Some(sigtstp)),
+            SignalTargetAuthorization::Allowed,
+            "guest init may catch a terminal-stop signal",
         );
         for signum in [carrick_abi::LINUX_SIGKILL, carrick_abi::LINUX_SIGSTOP] {
             let signal = LinuxSignal::for_signal_number(signum).expect("uncatchable signal");
@@ -3410,6 +3629,110 @@ mod tests {
             vec![root.task().key().id]
         );
         assert!(kernel.tasks_for_broadcast(root.task().key().id).is_empty());
+    }
+
+    #[test]
+    fn process_signal_authority_survives_leader_thread_exit() {
+        let (kernel, root) = bootstrap(1);
+        let child = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(706),
+                "leader-exit signal target".to_owned(),
+                None,
+            )
+            .expect("fork target");
+        let sibling = kernel
+            .clone_thread(
+                &child,
+                ClonePlan::from_flags(
+                    LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+                )
+                .expect("thread plan"),
+                ThreadId::synthetic_for_tests(707),
+                None,
+            )
+            .expect("clone sibling");
+        let child_id = child.task().key().id;
+        let root = kernel
+            .update_credentials(&root, |credentials| credentials.seed_identity(2000, 2000))
+            .expect("set non-root caller credentials");
+        let child = kernel
+            .update_credentials(&child, |credentials| credentials.seed_identity(2000, 2000))
+            .expect("set leader credentials");
+        kernel
+            .exit_thread(&child, None)
+            .expect("retire non-final leader");
+
+        assert!(sibling.exact_thread_is_live());
+        assert!(
+            kernel
+                .tasks_in_process_group(sibling.task().process_group())
+                .contains(&child_id),
+            "group signal enumeration retains a task whose leader retired",
+        );
+        assert_eq!(
+            kernel.authorize_signal_target(&root, child_id, None, None),
+            SignalTargetAuthorization::Allowed,
+            "positive/group signal-zero uses the retained task credential authority",
+        );
+        let sigusr1 = LinuxSignal::for_signal_number(10).expect("SIGUSR1");
+        assert_eq!(
+            kernel.authorize_signal_target(&root, child_id, None, Some(sigusr1)),
+            SignalTargetAuthorization::Allowed,
+            "positive/group nonzero signals use the retained task credential authority",
+        );
+        assert!(kernel.post_signal_to_task(child_id, sigusr1, None));
+        assert!(
+            sibling
+                .task()
+                .shared()
+                .pending_signals()
+                .take_lowest_in(SigSet::EMPTY.with(sigusr1.raw()))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn job_control_stop_and_continue_are_task_scoped_and_waitable() {
+        let (kernel, root) = bootstrap(1);
+        let child_id = fork_child(&kernel, &root, "job-control child", 708);
+        let sigstop = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGSTOP).expect("SIGSTOP");
+
+        assert!(kernel.stop_task_for_job_control(child_id, sigstop));
+        assert!(kernel.task_is_job_control_stopped(child_id));
+        assert_eq!(
+            kernel
+                .wait_child_with_job_control(
+                    root.task().key().id,
+                    Some(child_id),
+                    true,
+                    false,
+                    WaitMode::Consume,
+                )
+                .expect("wait stopped child"),
+            WaitOutcome::Stopped {
+                task: child_id,
+                signal: sigstop,
+            }
+        );
+
+        let sigcont = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGCONT).expect("SIGCONT");
+        assert!(kernel.post_signal_to_task(child_id, sigcont, None));
+        assert!(!kernel.task_is_job_control_stopped(child_id));
+        assert_eq!(
+            kernel
+                .wait_child_with_job_control(
+                    root.task().key().id,
+                    Some(child_id),
+                    false,
+                    true,
+                    WaitMode::Consume,
+                )
+                .expect("wait continued child"),
+            WaitOutcome::Continued { task: child_id }
+        );
     }
 
     #[test]

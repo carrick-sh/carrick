@@ -2849,7 +2849,8 @@ impl SyscallDispatcher {
                         }
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
-                    crate::hvpatch::WaitResult::StillRunning => {
+                    crate::hvpatch::WaitResult::StateChanged(_)
+                    | crate::hvpatch::WaitResult::StillRunning => {
                         if guest_nohang {
                             if infop_addr.0 != 0 {
                                 (*cx.memory).write_bytes(
@@ -3225,15 +3226,39 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if let Some(process) = this.hvpatch_process() {
+                let include_stopped = options.contains(LinuxWaitOptions::WUNTRACED);
+                let include_continued = options.contains(LinuxWaitOptions::WCONTINUED);
                 let waited = match pid.0 {
-                    -1 => process.wait_child(None, true, false),
-                    value if value > 0 => process.wait_child(Some(value), true, false),
+                    -1 => process.wait_child_with_job_control(
+                        None,
+                        true,
+                        false,
+                        include_stopped,
+                        include_continued,
+                    ),
+                    value if value > 0 => process.wait_child_with_job_control(
+                        Some(value),
+                        true,
+                        false,
+                        include_stopped,
+                        include_continued,
+                    ),
                     0 => match process.process_group(None) {
-                        Ok(group) => process.wait_child_in_process_group(group, false),
+                        Ok(group) => process.wait_child_in_process_group_with_job_control(
+                            group,
+                            false,
+                            include_stopped,
+                            include_continued,
+                        ),
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     },
                     value => match value.checked_abs() {
-                        Some(group) => process.wait_child_in_process_group(group, false),
+                        Some(group) => process.wait_child_in_process_group_with_job_control(
+                            group,
+                            false,
+                            include_stopped,
+                            include_continued,
+                        ),
                         None => {
                             return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ESRCH));
                         }
@@ -3241,7 +3266,8 @@ impl SyscallDispatcher {
                 };
                 let guest_nohang = options.contains(LinuxWaitOptions::WNOHANG);
                 match waited {
-                    crate::hvpatch::WaitResult::Exited(exit) => {
+                    crate::hvpatch::WaitResult::Exited(exit)
+                    | crate::hvpatch::WaitResult::StateChanged(exit) => {
                         if wstatus_addr.0 != 0 {
                             memory.write_bytes(wstatus_addr.0, &exit.status().to_ne_bytes())?;
                         }

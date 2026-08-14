@@ -496,6 +496,12 @@ where
             }
         }
         // No registered handler → the kernel takes the signal's DEFAULT action.
+        // SIGCONT's state transition happens at generation time so a stopped
+        // HVPatch task can wake before any vCPU is available to consume this
+        // queue entry. Delivery itself has no terminate/stop action.
+        None if pending == crate::linux_abi::LINUX_SIGCONT => {
+            Ok(Some(PendingSignalAction::ignored()))
+        }
         None if is_default_ignore_signal(pending) => Ok(Some(PendingSignalAction::ignored())),
         None if is_default_stop_signal(pending) => Ok(Some(PendingSignalAction::stop(pending))),
         None => Ok(Some(PendingSignalAction::terminate(pending))),
@@ -672,5 +678,20 @@ mod tests {
         assert!(libc::WIFSIGNALED(exit_status));
         assert_eq!(libc::WTERMSIG(exit_status), libc::SIGKILL);
         let _ = crate::guest_cpu::reap_child_guest_ns(child as u32);
+    }
+
+    #[test]
+    fn default_sigcont_resumes_without_terminating() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.exact_signal_context_for_test();
+        let tid = ThreadId::main_from_host_pid();
+        dispatcher.mark_signal_pending(&context, tid, crate::linux_abi::LINUX_SIGCONT);
+
+        let action = deliver_pending_signal(&mut NoopTrap, &dispatcher, &context, None, tid, None)
+            .expect("deliver default SIGCONT")
+            .expect("SIGCONT produces an explicit nonterminal action");
+
+        assert_eq!(action.term_signal, None);
+        assert_eq!(action.stop_signal, None);
     }
 }

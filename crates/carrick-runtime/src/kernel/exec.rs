@@ -344,6 +344,9 @@ impl Kernel {
             .transfer_runner_to(&prepared.replacement);
         let old_threads = record.task.publish_exec_thread_set(prepared.thread_set);
         record.task.replace_shared(Arc::clone(&prepared.shared));
+        record
+            .task
+            .replace_process_credentials(prepared.resources.credentials());
         for (tid, (_, thread)) in &old_threads {
             if *tid == leader_tid {
                 continue;

@@ -2950,6 +2950,13 @@ where
             if thread_should_finish_for_exec_replacement(&state.registry, state.this_tid) {
                 return Ok(state.handle_thread_exit(&kernel, &mut engine, 0, traps));
             }
+            // HVPatch hosts every Linux task as threads of one Darwin process,
+            // so guest job control must park only this kernel task. SIGCONT or
+            // SIGKILL clears the task state and notifies this wait before its
+            // pending action is delivered.
+            if let Some(process) = kernel.hvpatch_process.as_ref() {
+                process.wait_until_job_control_resumed();
+            }
             // Lock-safe point: no carrick lock is held here. If another thread is
             // forking a multithreaded guest, release this vCPU (so the forker can
             // hv_vm_destroy), park until the fork completes, then recreate the vCPU
@@ -4100,7 +4107,21 @@ fn service_signals_threaded<E: ThreadedEngine>(
             interrupted_pc,
         )? {
             if let Some(signum) = action.stop_signal {
-                stop_by_signal(signum);
+                if kernel.hvpatch_process.is_some() {
+                    let signal = crate::kernel::LinuxSignal::for_signal_number(signum)
+                        .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+                    if !context
+                        .kernel()
+                        .stop_task_for_job_control(context.task().key().id, signal)
+                    {
+                        return Err(RuntimeError::Configuration(format!(
+                            "HVPatch default-stop lost live task {}",
+                            context.task().key().id.raw()
+                        )));
+                    }
+                } else {
+                    stop_by_signal(signum);
+                }
                 return Ok(None);
             }
             if let Some(signum) = action.term_signal {
