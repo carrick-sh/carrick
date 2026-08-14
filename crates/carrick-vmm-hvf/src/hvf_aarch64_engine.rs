@@ -532,6 +532,10 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.arm_frame_cow_ranges(ranges);
     }
 
+    fn disarm_frame_cow_ranges(&mut self, ranges: &[carrick_aarch64::vmm::ForkCowRange]) {
+        self.state.disarm_frame_cow_ranges(ranges);
+    }
+
     fn armed_frame_cow_ranges(
         &self,
         va: u64,
@@ -552,10 +556,11 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         &mut self,
         syndrome: u64,
         far: u64,
+        ttbr0: u64,
         flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
     ) -> Result<bool, TrapError> {
         self.state
-            .resolve_frame_cow_fault(syndrome, far, flush_stage1)
+            .resolve_frame_cow_fault(syndrome, far, ttbr0, flush_stage1)
     }
 
     fn ensure_frame_cow_write(
@@ -641,11 +646,11 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.shared_futex_location(backing_gpa.raw())
     }
 
-    fn on_unmap(&mut self, va: u64, len: usize) {
+    fn on_unmap(&mut self, va: u64, len: usize) -> Result<(), TrapError> {
         // The shared engine calls this only after checked stage-1 teardown and
         // TLBI succeed. A failed edit therefore retains this process-shared alias
         // owner; successful teardown removes the high-VA lookup (low VA no-op).
-        self.state.unregister_process_alias(va, len);
+        self.state.unregister_process_alias(va, len)
     }
 
     fn add_alias(
@@ -885,6 +890,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         root_slot_base: u64,
         root_slot_size: u64,
         page_tables: &mut carrick_mem::page_table::PageTableManager,
+        cow_ranges: &[carrick_aarch64::vmm::ForkCowRange],
         child_pid: i32,
         forking_tid: i32,
     ) -> Result<Self::ProcessBuilder, TrapError> {
@@ -892,6 +898,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
             root_slot_base,
             root_slot_size,
             page_tables,
+            cow_ranges,
             child_pid,
             forking_tid,
         )

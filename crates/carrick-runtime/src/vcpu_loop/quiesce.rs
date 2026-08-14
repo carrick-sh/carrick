@@ -6,6 +6,44 @@
 
 use super::*;
 
+thread_local! {
+    /// Page-table pause ownership is thread-local because the coordinator is
+    /// the vCPU service thread. Backends can re-enter the authority while a
+    /// mapping syscall already owns the outer Pause-Modify-Resume transaction
+    /// (for example, zero_backing COW during same-VA mmap reuse). Such a nested
+    /// acquisition must borrow the outer pause, never park behind itself.
+    static PT_PAUSE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(super) fn current_thread_holds_pt_pause() -> bool {
+    PT_PAUSE_DEPTH.with(|depth| depth.get() != 0)
+}
+
+pub(super) struct PtPauseGuard {
+    _inner: crate::fork_quiesce::PtPauseGuard,
+}
+
+impl PtPauseGuard {
+    fn new(inner: crate::fork_quiesce::PtPauseGuard) -> Self {
+        PT_PAUSE_DEPTH.with(|depth| {
+            depth.set(depth.get().saturating_add(1));
+        });
+        Self { _inner: inner }
+    }
+}
+
+impl Drop for PtPauseGuard {
+    fn drop(&mut self) {
+        PT_PAUSE_DEPTH.with(|depth| {
+            let current = depth.get();
+            debug_assert!(current != 0, "page-table pause ownership underflow");
+            depth.set(current.saturating_sub(1));
+        });
+        // `_inner` drops next and resumes sibling vCPUs only after the local
+        // ownership marker has been cleared.
+    }
+}
+
 /// Keeps runtime provenance live while a non-cloneable reservation is owned
 /// by the backend. Every pre-publication return abandons the authority record;
 /// successful application has already consumed it, making Drop a no-op.
@@ -66,7 +104,7 @@ pub(super) fn acquire_pt_pause(
     kicker: &dyn carrick_hal::VcpuRegistry,
     tid: ThreadId,
     timeout: Duration,
-) -> Result<crate::fork_quiesce::PtPauseGuard, PtPauseError> {
+) -> Result<PtPauseGuard, PtPauseError> {
     // Serialize editors: at most one stop-the-world at a time. A loser parks
     // (if the winner has raised quiescing) or yields (tiny pre-flag window),
     // then retries. This stays independent of the fork/topology lock.
@@ -104,7 +142,7 @@ pub(super) fn acquire_pt_pause(
         std::thread::yield_now();
     }
     crate::probes::pt_pause_ready(tid.raw(), spins, start.elapsed().as_micros() as i64);
-    Ok(barrier.pause_guard(tid))
+    Ok(PtPauseGuard::new(barrier.pause_guard(tid)))
 }
 
 pub(super) struct ForkRequest {
@@ -126,7 +164,7 @@ where
     /// Pause sibling vCPUs for a stage-1 page-table edit (mmap/mprotect/munmap),
     /// returning an RAII guard that resumes them on drop. A timeout is a typed
     /// clean failure: the barrier request is rolled back and no edit may begin.
-    pub(super) fn pt_pause(&self) -> Result<crate::fork_quiesce::PtPauseGuard, PtPauseError> {
+    pub(super) fn pt_pause(&self) -> Result<PtPauseGuard, PtPauseError> {
         acquire_pt_pause(
             pt_barrier(),
             &*self.kicker,
@@ -1707,13 +1745,19 @@ mod pt_pause_tests {
             Box::new(LeaveGuestOnKick(Arc::clone(&sibling_in_guest))),
         );
 
+        assert!(!current_thread_holds_pt_pause());
         let guard = acquire_pt_pause(barrier, &*registry, coordinator, Duration::from_secs(1))
             .expect("sibling drains exactly after kick");
+        assert!(
+            current_thread_holds_pt_pause(),
+            "nested backend work must borrow the syscall's outer pause",
+        );
         let backend_repoint_calls = AtomicUsize::new(0);
         backend_repoint_calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(backend_repoint_calls.load(Ordering::SeqCst), 1);
         assert!(barrier.is_quiescing());
         drop(guard);
+        assert!(!current_thread_holds_pt_pause());
         assert!(!barrier.is_quiescing());
     }
 }

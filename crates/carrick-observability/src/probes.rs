@@ -503,6 +503,103 @@ pub enum HvpatchFrameCowIntent {
     PrivilegedInternal = 2,
 }
 
+/// Exact authority that triggered a frame-COW transaction. Append only: these
+/// ordinals are part of the signed structural-receipt ABI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchFrameCowTriggerClass {
+    Stage1PermissionFault = 0,
+    SyscallGuestWrite = 1,
+    BackingMaintenance = 2,
+    PrivilegedInternal = 3,
+}
+
+impl HvpatchFrameCowTriggerClass {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Typed cause record emitted once, under the COW topology transaction, before
+/// the first physical mutation. Fault-triggered records bind FAR/ESR/TTBR0 to
+/// the same Linux task/mm identity used by the resulting COW phases.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchFrameCowTrigger {
+    class: HvpatchFrameCowTriggerClass,
+    pid: i32,
+    tid: i32,
+    mm: u64,
+    asid: u32,
+    va: u64,
+    syndrome: u64,
+    far: u64,
+    ttbr0: u64,
+}
+
+impl HvpatchFrameCowTrigger {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        class: HvpatchFrameCowTriggerClass,
+        pid: i32,
+        tid: i32,
+        mm: u64,
+        asid: u32,
+        va: u64,
+        syndrome: u64,
+        far: u64,
+        ttbr0: u64,
+    ) -> Result<Self, HvpatchGuestLifecycleError> {
+        if pid <= 0 || tid <= 0 {
+            return Err(HvpatchGuestLifecycleError::InvalidTaskIdentity);
+        }
+        if mm == 0 {
+            return Err(HvpatchGuestLifecycleError::InvalidFrameReceipt);
+        }
+        if asid == 0 {
+            return Err(HvpatchGuestLifecycleError::InvalidAsid);
+        }
+        Ok(Self {
+            class,
+            pid,
+            tid,
+            mm,
+            asid,
+            va,
+            syndrome,
+            far,
+            ttbr0,
+        })
+    }
+
+    pub const fn class(self) -> HvpatchFrameCowTriggerClass {
+        self.class
+    }
+    pub const fn pid(self) -> i32 {
+        self.pid
+    }
+    pub const fn tid(self) -> i32 {
+        self.tid
+    }
+    pub const fn mm(self) -> u64 {
+        self.mm
+    }
+    pub const fn asid(self) -> u32 {
+        self.asid
+    }
+    pub const fn va(self) -> u64 {
+        self.va
+    }
+    pub const fn syndrome(self) -> u64 {
+        self.syndrome
+    }
+    pub const fn far(self) -> u64 {
+        self.far
+    }
+    pub const fn ttbr0(self) -> u64 {
+        self.ttbr0
+    }
+}
+
 impl HvpatchFrameCowIntent {
     pub const fn raw(self) -> u32 {
         self as u32
@@ -1027,6 +1124,7 @@ pub enum HvpatchTopologyOperation {
     ProcessRetire = 7,
     AliasMap = 8,
     FrameCow = 9,
+    AliasUnmap = 10,
 }
 
 impl HvpatchTopologyOperation {
@@ -3996,6 +4094,10 @@ mod real {
         /// HVPatch frame-COW intent. Emitted immediately before identity/data.
         /// Args: 0 guest-visible, 1 backing maintenance, 2 privileged internal.
         fn hvpatch__frame__cow__intent(_: u32) {}
+        /// COW trigger identity. Args: PID, TID, mm, ASID, trigger class.
+        fn hvpatch__frame__cow__trigger__identity(_: i32, _: i32, _: u64, _: u32, _: u32) {}
+        /// COW trigger data. Args: semantic VA, ESR, FAR, and TTBR0.
+        fn hvpatch__frame__cow__trigger(_: u64, _: u64, _: u64, _: u64) {}
         /// HVPatch frame-COW identity. Args: PID, TID, mm serial, ASID, phase.
         fn hvpatch__frame__cow__identity(_: i32, _: i32, _: u64, _: u32, _: u32) {}
         /// HVPatch frame-COW transition. Args: VA, old/new FrameId, old/new IPA.
@@ -4013,6 +4115,10 @@ mod real {
         /// phase (0=map, 1=unmap), IPA, length, host VA, permissions. Host VA
         /// and permissions are zero on unmap.
         fn hvpatch__global__frame__stage2(_: u32, _: u64, _: u64, _: u64, _: u64) {}
+        /// A non-owning mapping row failed exact global-owner authentication.
+        /// Args: requested IPA/length/host VA and the current owner's host VA
+        /// for that exact IPA/length (zero when the lease is retired).
+        fn hvpatch__global__frame__owner__miss(_: u64, _: u64, _: u64, _: u64) {}
         /// Address-space provenance: guest PID, ASID, root-slot base and size,
         /// TTBR0. Five scalars keep the complete record reliable on macOS.
         fn hvpatch__guest__address__space(_: i32, _: u32, _: u64, _: u64, _: u64) {}
@@ -4123,6 +4229,9 @@ mod real {
         /// means the base held 0x11=17. Lets a trace see the faulting access
         /// WITHOUT an eprintln rebuild. Fires only at the fault.
         fn vcpu__fault__regs(_: u64, _: u64, _: u64, _: u64, _: u32, _: u64) {}
+        /// Companion general-register payload captured at the same fault.
+        /// Args are guest x0..x5.
+        fn vcpu__fault__gprs(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) {}
         /// Native x86 synchronous guest fault captured before fatal-signal
         /// teardown. Args: host pid, guest PC, fault VA, RSP, RCX, RFLAGS.
         /// Scalars remain readable after an immediately exiting fork child.
@@ -4938,6 +5047,23 @@ mod real {
     }
 
     #[inline(never)]
+    pub fn hvpatch_frame_cow_trigger(event: super::HvpatchFrameCowTrigger) {
+        carrick_usdt::hvpatch__frame__cow__trigger__identity!(|| (
+            event.pid(),
+            event.tid(),
+            event.mm(),
+            event.asid(),
+            event.class().raw()
+        ));
+        carrick_usdt::hvpatch__frame__cow__trigger!(|| (
+            event.va(),
+            event.syndrome(),
+            event.far(),
+            event.ttbr0()
+        ));
+    }
+
+    #[inline(never)]
     pub fn hvpatch_frame_cow_copy(old_frame: u64, old_ipa: u64, source: &[u8], dest: &[u8]) {
         fn fnv1a(bytes: &[u8]) -> u64 {
             bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
@@ -4983,6 +5109,21 @@ mod real {
             event.length(),
             event.host_addr(),
             event.permissions()
+        ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_global_frame_owner_miss(
+        ipa: u64,
+        length: u64,
+        host_addr: u64,
+        owner_host_addr: u64,
+    ) {
+        carrick_usdt::hvpatch__global__frame__owner__miss!(|| (
+            ipa,
+            length,
+            host_addr,
+            owner_host_addr
         ));
     }
 
@@ -6097,6 +6238,13 @@ mod real {
         carrick_usdt::vcpu__fault__regs!(|| (esr, elr, far, insn, rn, xrn));
     }
 
+    /// Guest x0..x5 paired with [`vcpu_fault_regs`] on the same host thread.
+    /// This is a separate probe because the USDT backend supports six scalar
+    /// arguments. It is fault-only and therefore adds no happy-path overhead.
+    pub fn vcpu_fault_gprs(x0: u64, x1: u64, x2: u64, x3: u64, x4: u64, x5: u64) {
+        carrick_usdt::vcpu__fault__gprs!(|| (x0, x1, x2, x3, x4, x5));
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn native_x86_fault(
         pc: u64,
@@ -6587,9 +6735,11 @@ mod stub {
     stub!(hvpatch_guest_lifecycle(event: super::HvpatchGuestLifecycle));
     stub!(hvpatch_guest_fault(event: super::HvpatchGuestFault));
     stub!(hvpatch_frame_cow(event: super::HvpatchFrameCow));
+    stub!(hvpatch_frame_cow_trigger(event: super::HvpatchFrameCowTrigger));
     stub!(hvpatch_frame_cow_copy(old_frame: u64, old_ipa: u64, source: &[u8], dest: &[u8]));
     stub!(hvpatch_fork_frame_share(event: super::HvpatchForkFrameShare));
     stub!(hvpatch_global_frame_stage2(event: super::HvpatchGlobalFrameStage2));
+    stub!(hvpatch_global_frame_owner_miss(ipa: u64, length: u64, host_addr: u64, owner_host_addr: u64));
     stub!(hvpatch_guest_address_space(event: super::HvpatchGuestAddressSpace));
     stub!(hvpatch_syscall_service_begin(event: super::HvpatchSyscallService, args: [u64; 6]) -> Option<std::time::Instant> => None);
     stub!(hvpatch_syscall_service(event: super::HvpatchSyscallService));
@@ -6662,6 +6812,7 @@ mod stub {
     stub!(execve_sysregs(sctlr: u64, ttbr0: u64, mair: u64));
     stub!(vcpu_fault(esr: u64, elr: u64, far: u64, x30: u64, sp: u64, tid: i32));
     stub!(vcpu_fault_regs(esr: u64, elr: u64, far: u64, insn: u64, rn: u32, xrn: u64));
+    stub!(vcpu_fault_gprs(x0: u64, x1: u64, x2: u64, x3: u64, x4: u64, x5: u64));
     stub!(pt_alias_walk(va: u64, descs: [u64; 4], flag: i32));
     stub!(pt_alias_receipt(va: u64, leaf: u64, expected_ipa: u64, expected_ap: u64, phase: u32));
     stub!(hv_vm_map_alias(va: u64, ipa: u64, size: u64, rc: i32, forked: i32));
