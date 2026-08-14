@@ -43,6 +43,16 @@ pub enum WaitOutcome {
     NoChild,
 }
 
+/// Result of resolving one Linux signal target against the authoritative
+/// kernel identity, credential, session, and sighand graph.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignalTargetAuthorization {
+    Allowed,
+    DropProtectedInit,
+    Denied,
+    Missing,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Observable identity of one exact task generation.
 ///
@@ -948,13 +958,62 @@ impl Kernel {
         self.registry().state.read().tasks.contains_key(&task_id)
     }
 
-    pub fn task_is_signalable(&self, task_id: TaskId) -> bool {
-        self.registry()
-            .state
-            .read()
-            .tasks
-            .get(&task_id)
-            .is_some_and(|record| record.task.lifecycle() == TaskLifecycle::Live)
+    /// Authorize a process- or thread-directed Linux signal without consulting
+    /// host process identity. `target_thread == None` uses the task leader's
+    /// credentials; thread-directed calls name the exact target thread.
+    pub fn authorize_signal_target(
+        &self,
+        caller: &KernelContext,
+        target_task: TaskId,
+        target_thread: Option<LinuxTid>,
+        signal: Option<LinuxSignal>,
+    ) -> SignalTargetAuthorization {
+        if !std::ptr::eq(self, caller.kernel().as_ref()) {
+            return SignalTargetAuthorization::Missing;
+        }
+        let (target_credentials, target_session, target_sighand) = {
+            let state = self.registry().state.read();
+            let Some(record) = state.tasks.get(&target_task) else {
+                return SignalTargetAuthorization::Missing;
+            };
+            if record.task.lifecycle() != TaskLifecycle::Live {
+                return SignalTargetAuthorization::Missing;
+            }
+            let tid = target_thread.unwrap_or_else(|| LinuxTid::for_task_leader(target_task));
+            let Some(thread) = record.task.thread(tid) else {
+                return SignalTargetAuthorization::Missing;
+            };
+            (
+                thread.resources().credentials(),
+                record.task.session(),
+                record.task.shared().sighand(),
+            )
+        };
+        let caller_credentials = caller.resources().credentials();
+        let caller_is_privileged = caller_credentials.is_privileged();
+        let uid_match = [caller_credentials.ruid(), caller_credentials.euid()]
+            .into_iter()
+            .any(|caller_uid| {
+                caller_uid == target_credentials.ruid() || caller_uid == target_credentials.suid()
+            });
+        let same_session_sigcont = signal.is_some_and(|signal| {
+            signal.raw() == carrick_abi::LINUX_SIGCONT && caller.task().session() == target_session
+        });
+        if !caller_is_privileged && !uid_match && !same_session_sigcont {
+            return SignalTargetAuthorization::Denied;
+        }
+
+        let init = TaskId::from_abi_positive(carrick_abi::LINUX_BOOTSTRAP_PID as i32).ok();
+        if Some(target_task) == init
+            && signal.is_some_and(|signal| {
+                crate::namespace::pid::is_init_protected_default_signal(signal.raw())
+                    && target_sighand.disposition(signal)
+                        == super::objects::SignalDisposition::Default
+            })
+        {
+            return SignalTargetAuthorization::DropProtectedInit;
+        }
+        SignalTargetAuthorization::Allowed
     }
 
     /// Every LIVE task in `group`, lowest id first.
@@ -972,7 +1031,10 @@ impl Kernel {
         let mut ids: Vec<TaskId> = state
             .tasks
             .iter()
-            .filter(|(_, record)| record.task.process_group() == group)
+            .filter(|(_, record)| {
+                record.task.lifecycle() == TaskLifecycle::Live
+                    && record.task.process_group() == group
+            })
             .map(|(id, _)| *id)
             .collect();
         ids.sort_unstable();
@@ -991,9 +1053,13 @@ impl Kernel {
         let state = self.registry().state.read();
         let mut ids: Vec<TaskId> = state
             .tasks
-            .keys()
-            .copied()
-            .filter(|id| *id != caller && Some(*id) != init)
+            .iter()
+            .filter(|(id, record)| {
+                **id != caller
+                    && Some(**id) != init
+                    && record.task.lifecycle() == TaskLifecycle::Live
+            })
+            .map(|(id, _)| *id)
             .collect();
         ids.sort_unstable();
         ids
@@ -3243,6 +3309,107 @@ mod tests {
             .exit_task(child_id, LinuxWaitStatus::from_wait_encoding(0), None)
             .expect("retire child");
         assert_eq!(kernel.tasks_in_process_group(group), vec![root_id]);
+    }
+
+    #[test]
+    fn signal_authorization_uses_kernel_credentials_sessions_and_init_sighand() {
+        let (kernel, root) = bootstrap(1);
+        let child = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(703),
+                "signal authorization child".to_owned(),
+                None,
+            )
+            .expect("fork child");
+        let root = kernel
+            .update_credentials(&root, |credentials| credentials.seed_identity(1000, 1000))
+            .expect("set caller credentials");
+        let child = kernel
+            .update_credentials(&child, |credentials| credentials.seed_identity(2000, 2000))
+            .expect("set target credentials");
+        let child_id = child.task().key().id;
+        let child_tid = child.thread().key().tid;
+        let sigusr1 = LinuxSignal::for_signal_number(10).expect("SIGUSR1");
+        let sigcont = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGCONT).expect("SIGCONT");
+
+        assert_eq!(
+            kernel.authorize_signal_target(&root, child_id, None, Some(sigusr1)),
+            SignalTargetAuthorization::Denied,
+            "process-directed delivery must compare authoritative kernel credentials",
+        );
+        assert_eq!(
+            kernel.authorize_signal_target(&root, child_id, Some(child_tid), None),
+            SignalTargetAuthorization::Denied,
+            "thread-directed signal zero must enforce the target thread credentials",
+        );
+        assert_eq!(
+            kernel.tasks_for_broadcast(root.task().key().id),
+            vec![child_id]
+        );
+        assert_eq!(
+            kernel.authorize_signal_target(&root, child_id, None, None),
+            SignalTargetAuthorization::Denied,
+            "broadcast signal zero must filter a member with forbidden credentials",
+        );
+        assert_eq!(
+            kernel.authorize_signal_target(&root, child_id, Some(child_tid), Some(sigcont)),
+            SignalTargetAuthorization::Allowed,
+            "SIGCONT is permitted within the same authoritative guest session",
+        );
+
+        let (kernel, init) = bootstrap(1);
+        let sender = kernel
+            .fork_task(
+                &init,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(704),
+                "init signal sender".to_owned(),
+                None,
+            )
+            .expect("fork sender");
+        let init_id = init.task().key().id;
+        let sigterm = LinuxSignal::for_signal_number(15).expect("SIGTERM");
+        assert_eq!(
+            kernel.authorize_signal_target(&sender, init_id, None, Some(sigterm)),
+            SignalTargetAuthorization::DropProtectedInit,
+            "an unhandled default-lethal signal to guest init is accepted but dropped",
+        );
+        let mut caught = carrick_abi::LinuxSigaction::empty();
+        caught.sa_handler = 0x4000;
+        init.shared().sighand().install_action(sigterm, caught);
+        assert_eq!(
+            kernel.authorize_signal_target(&sender, init_id, None, Some(sigterm)),
+            SignalTargetAuthorization::Allowed,
+            "guest init may receive a signal for which it installed a handler",
+        );
+        for signum in [carrick_abi::LINUX_SIGKILL, carrick_abi::LINUX_SIGSTOP] {
+            let signal = LinuxSignal::for_signal_number(signum).expect("uncatchable signal");
+            assert_eq!(
+                kernel.authorize_signal_target(&sender, init_id, None, Some(signal)),
+                SignalTargetAuthorization::Allowed,
+                "signal {signum} must not take default-action init immunity",
+            );
+        }
+    }
+
+    #[test]
+    fn signal_target_enumeration_excludes_tasks_that_have_begun_exit() {
+        let (kernel, root) = bootstrap(1);
+        let child_id = fork_child(&kernel, &root, "exiting signal target", 705);
+        let group = root.task().process_group();
+        {
+            let state = kernel.registry().state.read();
+            let child = &state.tasks.get(&child_id).expect("live child").task;
+            assert!(child.begin_exit());
+        }
+
+        assert_eq!(
+            kernel.tasks_in_process_group(group),
+            vec![root.task().key().id]
+        );
+        assert!(kernel.tasks_for_broadcast(root.task().key().id).is_empty());
     }
 
     #[test]

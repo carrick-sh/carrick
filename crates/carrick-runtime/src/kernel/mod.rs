@@ -58,8 +58,8 @@ pub use objects::{
 pub use operations::{
     ChildStartOutcome, ChildStartWait, ForkReservation, KernelFailpoint, KernelOperationError,
     PreparedFork, PreparedTaskExit, PreparedThreadClone, PublishedFork, PublishedThreadClone,
-    ReservedPidfdSubscription, StartedFork, StartedThreadClone, TaskIdentity,
-    TaskOperationReservation, ThreadCloneReservation, WaitMode, WaitOutcome,
+    ReservedPidfdSubscription, SignalTargetAuthorization, StartedFork, StartedThreadClone,
+    TaskIdentity, TaskOperationReservation, ThreadCloneReservation, WaitMode, WaitOutcome,
 };
 pub use registry::{
     IdError, IdRegistry, IdRegistryCounts, ProcessGroupClaim, SessionClaim, TaskClaim,
