@@ -59,6 +59,20 @@ def terminal_descriptor(descriptors: tuple[int, int, int, int]) -> tuple[int, in
     return descriptors[3], 3
 
 
+def descriptor_effective_ipa(descriptor: int, terminal_level: int, va: int) -> int:
+    """Resolve the exact IPA byte named by an AArch64 4 KiB block/page."""
+    shifts = {1: 30, 2: 21, 3: 12}
+    try:
+        shift = shifts[terminal_level]
+    except KeyError as error:
+        raise ReceiptError(
+            f"fault-PTE terminal level {terminal_level} cannot name memory"
+        ) from error
+    offset_mask = (1 << shift) - 1
+    output_mask = PA_MASK_4K & ~offset_mask
+    return (descriptor & output_mask) | (va & offset_mask)
+
+
 def validate(
     raw: bytes, *, require_shared: bool, require_permission_fault: bool = True
 ) -> dict[str, object]:
@@ -334,7 +348,7 @@ def validate(
         "l2",
         "l3",
     }
-    fault_ptes: dict[tuple[int, int, int], tuple[int, int, int, int]] = {}
+    fault_ptes: dict[tuple[int, int, int], tuple[int, int, int, int, int]] = {}
     for kind, values in records:
         if kind != "fault_pte":
             continue
@@ -354,9 +368,10 @@ def validate(
         key = (host_pid, host_tid, sequence)
         if key in fault_ptes:
             raise ReceiptError("duplicate fault-PTE attempt sequence")
-        if not stage2_contains(timestamp, host_pid, leaf & PA_MASK_4K, 4 * 1024):
+        fault_ipa = descriptor_effective_ipa(leaf, terminal_level, va)
+        if not stage2_contains(timestamp, host_pid, fault_ipa & ~0xFFF, 4 * 1024):
             raise ReceiptError("fault-PTE leaf lacks a live stage-2 lifetime")
-        fault_ptes[key] = (timestamp, va, leaf, terminal_level)
+        fault_ptes[key] = (timestamp, va, leaf, terminal_level, fault_ipa)
 
     fault_ttbr_keys = {"ts", "host_pid", "host_tid", "seq", "va", "ttbr0"}
     fault_ttbrs: dict[tuple[int, int, int], tuple[int, int, int]] = {}
@@ -457,7 +472,7 @@ def validate(
             matching_ttbr = fault_ttbrs.get(fault_key)
             if matching_pte is None or matching_ttbr is None:
                 raise ReceiptError("COW permission trigger lacks its exact fault sequence")
-            pte_ts, pte_va, leaf, terminal_level = matching_pte
+            pte_ts, pte_va, leaf, terminal_level, fault_ipa = matching_pte
             ttbr_ts, ttbr_va, fault_ttbr = matching_ttbr
             if not pte_ts <= ttbr_ts <= trigger["ts"]:
                 raise ReceiptError("COW fault sequence is temporally out of order")
@@ -479,6 +494,7 @@ def validate(
                     "COW permission trigger PTE is not a valid non-global read-only leaf"
                 )
             trigger["fault_leaf"] = leaf
+            trigger["fault_ipa"] = fault_ipa
         elif trigger["fault_seq"] or trigger["syndrome"] or trigger["ttbr0"]:
             raise ReceiptError("non-fault COW trigger carries fault-only provenance")
         triggers.append(trigger)
@@ -601,13 +617,10 @@ def validate(
         transaction = matches[0]
         triggered_transactions[transaction] += 1
         if trigger["class"] == 0:
-            leaf_ipa = trigger["fault_leaf"] & PA_MASK_4K
-            if not any(
-                frame == transaction[6] and start <= leaf_ipa < end
-                for frame, start, end in private_frame_extents
-            ):
+            fault_ipa = trigger["fault_ipa"]
+            if not transaction[8] <= fault_ipa < transaction[8] + 16 * 1024:
                 raise ReceiptError(
-                    "permission-fault PTE does not name the authenticated inherited frame"
+                    "permission-fault PTE does not name the exact COW source compound"
                 )
     if set(triggered_transactions) != set(transactions) or any(
         count != 1 for count in triggered_transactions.values()

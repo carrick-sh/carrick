@@ -21,6 +21,7 @@ def capture(
     global_pte: bool = False,
     bad_copy: bool = False,
     cow_offset: int = 0,
+    fault_offset: int | None = None,
     intent: int = 0,
     deferred_phase: int | None = None,
 ) -> bytes:
@@ -42,7 +43,9 @@ def capture(
     )
     trigger_class = {0: 0, 1: 2, 2: 3}[intent]
     if trigger_class == 0:
-        old_leaf = 0xA000000000 | (1 << 11) | 0xC0 | 3
+        if fault_offset is None:
+            fault_offset = cow_offset
+        old_leaf = (0xA000000000 + fault_offset) | (1 << 11) | 0xC0 | 3
         lines.extend(
             [
                 f"HVPATCHFRAMECOW5|fault_pte|ts=5|host_pid=10|host_tid=77|seq=1|va=400000|l0=3|l1=3|l2=3|l3={old_leaf:x}",
@@ -113,6 +116,12 @@ class ValidatorTests(unittest.TestCase):
         receipt = VALIDATOR.validate(capture(cow_offset=0x4000), require_shared=False)
         self.assertEqual(receipt["status"], "validated")
 
+    def test_rejects_fault_pte_on_a_different_compound_of_the_same_frame(self) -> None:
+        with self.assertRaises(VALIDATOR.ReceiptError):
+            VALIDATOR.validate(
+                capture(cow_offset=0x4000, fault_offset=0), require_shared=False
+            )
+
     def test_accepts_permission_fault_on_l2_block_descriptor(self) -> None:
         raw = capture().decode()
         page_leaf = 0xA000000000 | (1 << 11) | 0xC0 | 3
@@ -123,6 +132,13 @@ class ValidatorTests(unittest.TestCase):
         )
         receipt = VALIDATOR.validate(raw.encode(), require_shared=False)
         self.assertEqual(receipt["status"], "validated")
+
+    def test_block_descriptor_effective_ipa_includes_the_fault_va_offset(self) -> None:
+        descriptor = 0xA000000000 | (1 << 11) | 0xC0 | 1
+        self.assertEqual(
+            VALIDATOR.descriptor_effective_ipa(descriptor, 2, 0x414000),
+            0xA000014000,
+        )
 
     def test_accepts_exact_source_retirement_before_committed_receipt(self) -> None:
         raw = capture().decode().replace(
