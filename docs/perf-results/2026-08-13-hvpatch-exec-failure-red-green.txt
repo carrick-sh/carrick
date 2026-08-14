@@ -86,3 +86,69 @@ Full gate:
   runtime integration result=296 passed
   carrick-cli unit result=358 passed
   trace-profile integration result=41 passed
+
+Review-fix refresh (current implementation 025e99ef58347ef0c413a9c7076e4b7b6af59e80):
+  hypothesis 1: completion identity drift was hidden because the D producer
+    printed cached begin identity and checked only PID.
+  correction: completion compares actual PID/TID/ASID and prints the actual
+    completion values; a drift increments completion_errors and the Rust join
+    independently rejects the mismatched identity.
+  hypothesis 2: begin-inventory stayed green without exercising the actual
+    backend operation because injection returned before begin_exec_inventory.
+  correction: the runtime arms the HVPatch backend, then the real
+    begin_exec_inventory consumes the arm and returns TrapError through the
+    production Err branch.
+  hypothesis 3: the failpoint parser armed unrelated execs when @PATH was
+    omitted.
+  correction: only known-point@nonempty-absolute-matching-target arms.
+  hypothesis 4: identity-page write failure was silently discarded after the
+    point of no return.
+  correction: identity stamping returns MemoryError; the HVPatch exec caller
+    routes it through exec_failed_past_no_return.
+
+Review-fix focused RED/GREEN:
+  parser RED: unresolved strict parser + missing IdentityPage variant (E0432,
+    E0599); GREEN focused test 1 passed.
+  engine seam RED: no inject_next_begin_exec_inventory_failure method (E0599);
+    GREEN signed begin-inventory receipt below proves the actual operation Err.
+  identity write RED: no fallible stamp_identity_values helper; GREEN focused
+    test observes MemoryError::OutOfBounds, 1 passed.
+  DTrace/Rust identity fixtures: 6 profile tests passed, including negative
+    TID drift and ASID drift plus empty/missing/duplicate/unbalanced/drop/
+    provider-error/timeout/interruption rejection.
+
+Review-fix signed fatal-shape runs (serial):
+  old-capacity run_id=cr-75334-3509 cleanup=0
+  replacement-reservation run_id=cr-75398-1634 cleanup=0
+  begin-inventory run_id=cr-75460-32527 cleanup=0
+  identity-page run_id=cr-75524-14722 cleanup=0
+  all four Carrick observations:
+    child_exited=false
+    child_exit_status=-1
+    child_signaled=true
+    child_signal=11
+
+Review-fix controls (serial Docker differential):
+  malformed/unscoped old-capacity + execfatalstatus:
+    run_id=cr-75587-30594 cleanup=0 result=MATCH
+    child_exited=true child_exit_status=0 child_signaled=false child_signal=0
+  execfailsurvive:
+    run_id=cr-75649-28719 cleanup=0 result=MATCH survived_all=true
+    final_image_intact=true
+  genuine exitstatus127:
+    run_id=cr-75711-10005 cleanup=0 result=MATCH
+    child_exited=true child_exit_status=127 child_signaled=false child_signal=0
+
+Review-fix live six-stage receipt:
+  CARRICK_RUN_ID=task2-fix-trace-20260813 target/release/carrick trace --profile hvpatch-exec-runtime-stages --trace-out docs/perf-results/2026-08-13-hvpatch-exec-runtime-stages.raw -- run --exec-backend hvpatch ubuntu:24.04 /bin/sh -c 'exec /bin/true'
+  result=accepted completed_execs=1 events=6 events_per_exec=6
+  actual begin identity=guest_pid=75788 guest_tid=75788 asid=1
+  actual completion identity=guest_pid=75788 guest_tid=75788 asid=1
+  summary=status=ok begins=1 completes=1 events=6 phase0=1 phase1=1 phase2=1 phase3=1 phase4=1 phase5=1 join_errors=0 phase_errors=0 duplicate_errors=0 completion_errors=0 lifecycle_errors=0 empty=0 bounded=0 errors=0 drops=0 target_exited=1 target_exit_seen=1 target_exit_code=0
+  signed_binary_sha256=dfcfceac87d91785cb0dc75ec258f25c46a03c5b12de797d03f7f77e0d4ec90c
+  program_sha256=2ad15ce50c6b48e78494ad876b9fd3679423489d913d742a893b27b3f05216b9
+  raw_sha256=ce9fca17064d48cf23bb24e77b7dfbd0a78f7be0408a3500874c5d7e93554cab
+  execfatalstatus_probe_sha256=4782c72b1c23584ed5f14599f2b5ca404fa734fa369b39b20afe0740dd4583b3
+  exitstatus127_probe_sha256=0f5d2a2ac64d02f6e6000e2cabc5a06eb5afd56d43dda7b11e80b1a4e7654fbb
+  entitlements=com.apple.security.hypervisor=true
+  dof_section=__dof_carrick
