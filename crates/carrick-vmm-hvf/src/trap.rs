@@ -10725,6 +10725,29 @@ mod tag_strip_tests {
             (fragment.physical_ipa, fragment.physical_size),
             (ipa, 0xc000)
         );
+        let frame =
+            carrick_hal::FrameId::from_kernel_allocation(std::num::NonZeroU64::new(9011).unwrap());
+        let inventory = std::collections::BTreeMap::from([(
+            (alias.physical_ipa, alias.physical_size as u64),
+            super::InventoryExtent {
+                frame,
+                mapping: carrick_hal::MappingId::from_kernel_allocation(
+                    std::num::NonZeroU64::new(9012).unwrap(),
+                ),
+                backing: alias.inventory_backing,
+            },
+        )]);
+        assert_eq!(
+            inherited_fork_inventory_extent(
+                &super::ThreadMappingDesc::from_alias(fragment).unwrap(),
+                &inventory,
+            )
+            .unwrap()
+            .unwrap()
+            .frame,
+            frame,
+            "the exact suffix must remain forkable through the retained physical extent",
+        );
         unregister_alias(va, 0xc000, None);
     }
 
@@ -10763,6 +10786,29 @@ mod tag_strip_tests {
         assert_eq!(
             (fragment.physical_ipa, fragment.physical_size),
             (ipa, 0xc000)
+        );
+        let frame =
+            carrick_hal::FrameId::from_kernel_allocation(std::num::NonZeroU64::new(9021).unwrap());
+        let inventory = std::collections::BTreeMap::from([(
+            (alias.physical_ipa, alias.physical_size as u64),
+            super::InventoryExtent {
+                frame,
+                mapping: carrick_hal::MappingId::from_kernel_allocation(
+                    std::num::NonZeroU64::new(9022).unwrap(),
+                ),
+                backing: alias.inventory_backing,
+            },
+        )]);
+        assert_eq!(
+            inherited_fork_inventory_extent(
+                &super::ThreadMappingDesc::from_alias(fragment).unwrap(),
+                &inventory,
+            )
+            .unwrap()
+            .unwrap()
+            .frame,
+            frame,
+            "the exact prefix must remain forkable through the retained physical extent",
         );
         unregister_alias(va, 0xc000, None);
     }
