@@ -290,6 +290,12 @@ pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
             dispatcher.cleanup_sysv_ipc_on_process_exit();
             forked_child_die_by_signal(signum, &out, &err);
         }
+        kernel.record_fatal_signal(super::FatalSignalRecord {
+            tid: context.thread().key().tid,
+            signo: signum,
+            code: si_code,
+            addr: si_addr,
+        });
         let result = assemble_run_result(kernel, 128 + signum, Some(signum), traps, false);
         Ok(Some(VcpuLoopOutcome::ProcessExit(Box::new(result))))
     };

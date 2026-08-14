@@ -727,6 +727,11 @@ where
                     close_cloexec_started,
                 );
                 self.linux_tid = committed_context.thread().key().tid;
+                // Crash-register authority follows the replacement Kernel
+                // Thread generation. Keeping the pre-exec Arc would publish a
+                // later capture into a retired object, while the committed
+                // task census correctly waits on the replacement object.
+                self.kernel_thread = Some(std::sync::Arc::clone(committed_context.thread()));
                 // The common run-loop signal boundary must consume the exact
                 // replacement generation, never the pre-exec context retained
                 // at syscall entry. A failed exec leaves that entry context in

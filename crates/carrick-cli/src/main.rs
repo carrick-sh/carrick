@@ -146,6 +146,7 @@ mod debug_exec_stamps;
 mod debug_jit_shape;
 mod debug_layout;
 mod fs_setup;
+mod hvpatch_core_profile;
 // Strict text reader for the bundled one-VM HVPatch K1 lifecycle profile.
 mod hvpatch_exec_runtime_profile;
 mod hvpatch_identity_host_safety_profile;

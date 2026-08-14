@@ -29,13 +29,18 @@
 
 /// ELF note types. `NT_SIGINFO`/`NT_FILE` spell their own names in ASCII.
 pub const NT_PRSTATUS: u32 = 1;
+pub const NT_FPREGSET: u32 = 2;
 pub const NT_PRPSINFO: u32 = 3;
 pub const NT_AUXV: u32 = 6;
+/// AArch64 TLS register note (`TPIDR_EL0`).
+pub const NT_ARM_TLS: u32 = 0x401;
 pub const NT_SIGINFO: u32 = 0x5349_4749;
 pub const NT_FILE: u32 = 0x4649_4c45;
 
-/// Every note in a core file belongs to the `CORE` owner.
+/// Standard process/thread notes use `CORE`; AArch64 TLS uses Linux's
+/// architecture-note `LINUX` owner.
 pub const NOTE_OWNER: &[u8] = b"CORE\0";
+pub const LINUX_NOTE_OWNER: &[u8] = b"LINUX\0";
 
 /// `readelf` reported `align 0x4` on the oracle's PT_NOTE: note fields are
 /// 4-byte aligned even in a 64-bit core.
@@ -57,6 +62,9 @@ const PF_R: u32 = 4;
 pub const ORACLE_PRSTATUS_SIZE: usize = 0x188;
 pub const ORACLE_PRPSINFO_SIZE: usize = 0x88;
 pub const ORACLE_SIGINFO_SIZE: usize = 0x80;
+/// `user_fpsimd_state`: V0-V31, FPSR, FPCR.
+pub const AARCH64_FPREGSET_SIZE: usize = 0x210;
+pub const AARCH64_TLS_SIZE: usize = 0x10;
 
 const EHDR_SIZE: u16 = 64;
 const PHDR_SIZE: u16 = 56;
@@ -79,12 +87,22 @@ pub const AARCH64_GREGS: usize = 34;
 pub struct ThreadRegisters {
     /// `x0`-`x30`, then `sp`, `pc`, `pstate`.
     pub gregs: [u64; AARCH64_GREGS],
+    /// `TPIDR_EL0`, emitted as `NT_ARM_TLS`.
+    pub tpidr_el0: u64,
+    /// V0-V31 in architectural order, emitted as `NT_FPREGSET`.
+    pub vregs: [u128; 32],
+    pub fpsr: u32,
+    pub fpcr: u32,
 }
 
 impl Default for ThreadRegisters {
     fn default() -> Self {
         Self {
             gregs: [0; AARCH64_GREGS],
+            tpidr_el0: 0,
+            vregs: [0; 32],
+            fpsr: 0,
+            fpcr: 0,
         }
     }
 }
@@ -157,22 +175,61 @@ pub struct CoreDump<'a> {
     pub regions: Vec<MemoryRegion<'a>>,
 }
 
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum CoreDumpError {
+    #[error("core snapshot has no threads")]
+    NoThreads,
+    #[error("core snapshot repeats Linux tid {0}")]
+    DuplicateTid(i32),
+    #[error("crashing thread is not first (signal {signal})")]
+    CrashingThreadNotFirst { signal: i32 },
+    #[error("core memory region at {start:#x} has {bytes} bytes for a {size}-byte mapping")]
+    RegionContentsTooLarge { start: u64, bytes: usize, size: u64 },
+    #[error("core requires {required} bytes, exceeding RLIMIT_CORE {limit}")]
+    LimitExceeded { limit: u64, required: u64 },
+}
+
 fn align_up(value: usize, align: usize) -> usize {
     value.div_ceil(align) * align
 }
 
 /// Append one ELF note: `namesz`, `descsz`, `type`, padded name, padded desc.
 fn push_note(out: &mut Vec<u8>, note_type: u32, desc: &[u8]) {
+    push_note_owned(out, NOTE_OWNER, note_type, desc);
+}
+
+fn push_note_owned(out: &mut Vec<u8>, owner: &[u8], note_type: u32, desc: &[u8]) {
     let header = wire::NoteHeader {
-        n_namesz: NOTE_OWNER.len() as u32,
+        n_namesz: owner.len() as u32,
         n_descsz: desc.len() as u32,
         n_type: note_type,
     };
     out.extend_from_slice(as_bytes(&header));
-    out.extend_from_slice(NOTE_OWNER);
+    out.extend_from_slice(owner);
     out.resize(align_up(out.len(), NOTE_ALIGN), 0);
     out.extend_from_slice(desc);
     out.resize(align_up(out.len(), NOTE_ALIGN), 0);
+}
+
+fn fpregset_note(registers: &ThreadRegisters) -> [u8; AARCH64_FPREGSET_SIZE] {
+    let mut note = [0_u8; AARCH64_FPREGSET_SIZE];
+    for (index, register) in registers.vregs.iter().enumerate() {
+        let at = index * size_of::<u128>();
+        note[at..at + size_of::<u128>()].copy_from_slice(&register.to_le_bytes());
+    }
+    let fpsr = 32 * size_of::<u128>();
+    note[fpsr..fpsr + 4].copy_from_slice(&registers.fpsr.to_le_bytes());
+    note[fpsr + 4..fpsr + 8].copy_from_slice(&registers.fpcr.to_le_bytes());
+    note
+}
+
+fn push_thread_arch_notes(out: &mut Vec<u8>, thread: &ThreadState) {
+    push_note(out, NT_FPREGSET, &fpregset_note(&thread.registers));
+    let mut tls = [0_u8; AARCH64_TLS_SIZE];
+    tls[..8].copy_from_slice(&thread.registers.tpidr_el0.to_le_bytes());
+    // The second word is TPIDR2_EL0. Carrick does not expose SME today, so the
+    // architecturally absent register is zero rather than synthesized state.
+    push_note_owned(out, LINUX_NOTE_OWNER, NT_ARM_TLS, &tls);
 }
 
 /// Wire structs for the note payloads.
@@ -356,7 +413,7 @@ fn prstatus_note(dump: &CoreDump<'_>, thread: &ThreadState) -> wire::ElfPrStatus
         pr_cutime: wire::Timeval::default(),
         pr_cstime: wire::Timeval::default(),
         pr_reg: thread.registers.gregs,
-        pr_fpvalid: 0,
+        pr_fpvalid: 1,
         _pad1: 0,
     }
 }
@@ -422,14 +479,55 @@ fn file_note(mappings: &[FileMapping]) -> Vec<u8> {
 }
 
 impl CoreDump<'_> {
+    fn validate(&self) -> Result<(), CoreDumpError> {
+        let Some(crashing) = self.threads.first() else {
+            return Err(CoreDumpError::NoThreads);
+        };
+        if crashing.current_signal != self.signal.signo {
+            return Err(CoreDumpError::CrashingThreadNotFirst {
+                signal: self.signal.signo,
+            });
+        }
+        let mut tids = std::collections::BTreeSet::new();
+        for thread in &self.threads {
+            if !tids.insert(thread.tid) {
+                return Err(CoreDumpError::DuplicateTid(thread.tid));
+            }
+        }
+        for region in &self.regions {
+            if region.bytes.len() as u64 > region.size {
+                return Err(CoreDumpError::RegionContentsTooLarge {
+                    start: region.start,
+                    bytes: region.bytes.len(),
+                    size: region.size,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate and serialise without ever publishing a prefix. `limit` is
+    /// the caller's effective Linux `RLIMIT_CORE`; equality is permitted.
+    pub fn to_bytes_bounded(&self, limit: u64) -> Result<Vec<u8>, CoreDumpError> {
+        self.validate()?;
+        let bytes = self.to_bytes();
+        let required = bytes.len() as u64;
+        if required > limit {
+            return Err(CoreDumpError::LimitExceeded { limit, required });
+        }
+        Ok(bytes)
+    }
+
     /// Serialise the whole core file.
     ///
     /// Layout follows the oracle: ELF header, then the program header table,
     /// then `PT_NOTE`'s contents, then each `PT_LOAD`'s bytes page-aligned.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut notes = Vec::new();
-        // Crashing thread first — `self.threads` is documented to be ordered.
-        for thread in &self.threads {
+        // Match Linux's note order exactly: the crashing thread's PRSTATUS,
+        // process-wide notes, its optional register sets, then each sibling's
+        // PRSTATUS and register sets.
+        if let Some(thread) = self.threads.first() {
             push_note(
                 &mut notes,
                 NT_PRSTATUS,
@@ -448,6 +546,17 @@ impl CoreDump<'_> {
         );
         push_note(&mut notes, NT_AUXV, &auxv_note(&self.auxv));
         push_note(&mut notes, NT_FILE, &file_note(&self.mappings));
+        if let Some(thread) = self.threads.first() {
+            push_thread_arch_notes(&mut notes, thread);
+        }
+        for thread in self.threads.iter().skip(1) {
+            push_note(
+                &mut notes,
+                NT_PRSTATUS,
+                as_bytes(&prstatus_note(self, thread)),
+            );
+            push_thread_arch_notes(&mut notes, thread);
+        }
 
         let phnum = 1 + self.regions.len();
         let phoff = usize::from(EHDR_SIZE);
@@ -548,6 +657,10 @@ mod tests {
                     tid: 42,
                     registers: ThreadRegisters {
                         gregs: [0x1111; AARCH64_GREGS],
+                        tpidr_el0: 0x2222,
+                        vregs: [0x3333; 32],
+                        fpsr: 0x4444,
+                        fpcr: 0x5555,
                     },
                     current_signal: 11,
                 },
@@ -693,6 +806,42 @@ mod tests {
             "p_memsz"
         );
     }
+
+    /// A core is a publication artifact, not a best-effort diagnostic.  The
+    /// writer must reject an incomplete generation instead of serialising a
+    /// structurally plausible file with no architectural authority.
+    #[test]
+    fn bounded_writer_rejects_missing_and_duplicate_thread_authority() {
+        let mut missing = sample();
+        missing.threads.clear();
+        assert!(matches!(
+            missing.to_bytes_bounded(u64::MAX),
+            Err(CoreDumpError::NoThreads)
+        ));
+
+        let mut duplicate = sample();
+        duplicate.threads[1].tid = duplicate.threads[0].tid;
+        assert!(matches!(
+            duplicate.to_bytes_bounded(u64::MAX),
+            Err(CoreDumpError::DuplicateTid(42))
+        ));
+    }
+
+    /// RLIMIT_CORE is a hard byte bound: no prefix is a valid publication.
+    #[test]
+    fn bounded_writer_refuses_a_core_larger_than_the_limit() {
+        let dump = sample();
+        let required = dump.to_bytes().len() as u64;
+        assert!(matches!(
+            dump.to_bytes_bounded(required - 1),
+            Err(CoreDumpError::LimitExceeded { limit, required: actual })
+                if limit == required - 1 && actual == required
+        ));
+        assert_eq!(
+            dump.to_bytes_bounded(required).expect("exact limit"),
+            dump.to_bytes()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -728,6 +877,10 @@ mod oracle_validation {
                     tid: 1234,
                     registers: ThreadRegisters {
                         gregs: [0x4142_4344_4546_4748; AARCH64_GREGS],
+                        tpidr_el0: 0x5152_5354_5556_5758,
+                        vregs: [0x6162_6364_6566_6768; 32],
+                        fpsr: 0x7172_7374,
+                        fpcr: 0x7576_7778,
                     },
                     current_signal: 11,
                 },

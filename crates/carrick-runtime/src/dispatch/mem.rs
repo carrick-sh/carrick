@@ -607,7 +607,10 @@ fn project_vma_summaries(mem: &MemState) -> Vec<crate::kernel::VmaSummary> {
         .address_space_regions
         .iter()
         .flatten()
-        .filter(|map| !boot_region_is_hidden_reservation(map, mem.layout))
+        .filter(|map| {
+            !boot_region_is_hidden_reservation(map, mem.layout)
+                || boot_region_is_hidden_heap_backing(map, mem.layout)
+        })
         .chain(mem.dynamic_maps.iter())
         .filter_map(|map| (map.start < map.end).then_some((map.start, map.end)))
         .collect();
@@ -638,6 +641,32 @@ fn project_vma_summaries(mem: &MemState) -> Vec<crate::kernel::VmaSummary> {
             end: GuestVa(end),
         })
         .collect()
+}
+
+/// Exact Linux-visible mapping metadata used by the live core publisher.
+/// Hidden reservation apertures are implementation backing, not VMAs; the
+/// heap is clamped to `brk`, and dynamic mappings supply the committed pieces
+/// of the hidden mmap arena.
+pub(super) fn project_core_maps(mem: &MemState) -> Vec<ProcMapsEntry> {
+    let mut maps: Vec<ProcMapsEntry> = mem
+        .address_space_regions
+        .iter()
+        .flatten()
+        .filter(|map| {
+            !boot_region_is_hidden_reservation(map, mem.layout)
+                || boot_region_is_hidden_heap_backing(map, mem.layout)
+        })
+        .filter_map(|map| {
+            let mut map = map.clone();
+            if boot_region_is_hidden_heap_backing(&map, mem.layout) {
+                map.end = mem.brk_current;
+            }
+            (map.start < map.end).then_some(map)
+        })
+        .chain(mem.dynamic_maps.iter().cloned())
+        .collect();
+    maps.sort_by_key(|map| (map.start, map.end));
+    maps
 }
 
 fn boot_region_source_intersects_hidden_backing(
@@ -2025,6 +2054,28 @@ impl SyscallDispatcher {
             if !map_flags.contains(LinuxMmapFlags::ANONYMOUS) && this.open_file(fd.0).is_none() {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
+            // `/proc/*/maps` and NT_FILE identify the backing pathname, not
+            // merely that a mapping was file-backed. Preserve the guest path
+            // before the mapping branches borrow or duplicate the descriptor.
+            // Host-backed overlay files carry that guest-relative authority in
+            // RootFsMetadata; never expose the host scratch path from F_GETPATH.
+            let proc_map_path = if map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
+                String::new()
+            } else {
+                this.open_file(fd.0)
+                    .map(|open_file| {
+                        let open = open_file.description.read();
+                        match &*open {
+                            OpenDescription::File { path, .. }
+                            | OpenDescription::SyntheticFile { path, .. } => path.clone(),
+                            OpenDescription::HostFile { metadata, .. } => {
+                                metadata.path.to_string_lossy().into_owned()
+                            }
+                            _ => String::new(),
+                        }
+                    })
+                    .unwrap_or_default()
+            };
 
             // glibc's vDSO getrandom state page is mapped MAP_ANONYMOUS|
             // MAP_DROPPABLE (0x28) with NO MAP_PRIVATE/MAP_SHARED bit; the kernel
@@ -2393,7 +2444,7 @@ impl SyscallDispatcher {
                     len: length,
                     prot: prot_flags,
                     sharing: ProcMapSharing::Private,
-                    path: String::new(),
+                    path: proc_map_path.clone(),
                     locked: locked_range,
                     resident: !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                         || map_flags.contains(LinuxMmapFlags::POPULATE),
@@ -2518,7 +2569,7 @@ impl SyscallDispatcher {
                             len: length,
                             prot: prot_flags,
                             sharing: ProcMapSharing::Shared,
-                            path: String::new(),
+                            path: proc_map_path.clone(),
                             locked: locked_range,
                             resident: true,
                             bus_fault: None,
@@ -3076,7 +3127,7 @@ impl SyscallDispatcher {
                         len: length,
                         prot: prot_flags,
                         sharing: map_sharing.proc_map_sharing(),
-                        path: String::new(),
+                        path: proc_map_path.clone(),
                         locked: locked_range,
                         resident: !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                             || map_flags.contains(LinuxMmapFlags::POPULATE),
@@ -3237,7 +3288,7 @@ impl SyscallDispatcher {
                 length,
                 prot_flags,
                 map_sharing.proc_map_sharing(),
-                String::new(),
+                proc_map_path,
             );
             this.mark_vma_dispatch(&mut host_alias_dispatch);
             Ok(DispatchOutcome::Returned {

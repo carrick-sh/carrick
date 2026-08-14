@@ -10,9 +10,9 @@
 //! there is exactly one definition of the format in the tree.
 
 use carrick_runtime::core_dump::{
-    ELF_CLASS64, EM_AARCH64, ET_CORE, NOTE_ALIGN, NOTE_OWNER, NT_AUXV, NT_FILE, NT_PRPSINFO,
-    NT_PRSTATUS, NT_SIGINFO, ORACLE_PRPSINFO_SIZE, ORACLE_PRSTATUS_SIZE, ORACLE_SIGINFO_SIZE,
-    PT_LOAD, PT_NOTE, wire,
+    AARCH64_FPREGSET_SIZE, AARCH64_TLS_SIZE, ELF_CLASS64, EM_AARCH64, ET_CORE, NOTE_ALIGN,
+    NOTE_OWNER, NT_ARM_TLS, NT_AUXV, NT_FILE, NT_FPREGSET, NT_PRPSINFO, NT_PRSTATUS, NT_SIGINFO,
+    ORACLE_PRPSINFO_SIZE, ORACLE_PRSTATUS_SIZE, ORACLE_SIGINFO_SIZE, PT_LOAD, PT_NOTE, wire,
 };
 use std::path::Path;
 
@@ -52,6 +52,14 @@ pub(crate) enum CoreError {
     NoThreadNotes,
     #[error("core has no {0} note")]
     MissingNote(&'static str),
+    #[error("thread {tid} has no {note} note")]
+    MissingThreadNote { tid: i32, note: &'static str },
+    #[error("thread {tid} repeats {note}")]
+    DuplicateThreadNote { tid: i32, note: &'static str },
+    #[error("{note} appears before any NT_PRSTATUS")]
+    OrphanThreadNote { note: &'static str },
+    #[error("core repeats NT_PRSTATUS for Linux tid {0}")]
+    DuplicateTid(i32),
     #[error("PT_LOAD {index} at file offset {offset} + {filesz} runs past the {len}-byte file")]
     LoadTruncated {
         index: usize,
@@ -69,6 +77,46 @@ pub(crate) struct ThreadSummary {
     /// `pc` and `sp` are the two registers a reader looks at first.
     pub pc: u64,
     pub sp: u64,
+    pub pstate: u64,
+    pub x0: u64,
+    pub tpidr_el0: u64,
+    pub v0: [u64; 2],
+    pub fpsr: u32,
+    pub fpcr: u32,
+}
+
+#[derive(Debug)]
+struct ParsedThread {
+    tid: i32,
+    current_signal: i16,
+    pc: u64,
+    sp: u64,
+    pstate: u64,
+    x0: u64,
+    tpidr_el0: Option<u64>,
+    fp: Option<([u64; 2], u32, u32)>,
+}
+
+impl ParsedThread {
+    fn publish_fp(&mut self, fp: ([u64; 2], u32, u32)) -> Result<(), CoreError> {
+        if self.fp.replace(fp).is_some() {
+            return Err(CoreError::DuplicateThreadNote {
+                tid: self.tid,
+                note: "NT_FPREGSET",
+            });
+        }
+        Ok(())
+    }
+
+    fn publish_tls(&mut self, tpidr_el0: u64) -> Result<(), CoreError> {
+        if self.tpidr_el0.replace(tpidr_el0).is_some() {
+            return Err(CoreError::DuplicateThreadNote {
+                tid: self.tid,
+                note: "NT_ARM_TLS",
+            });
+        }
+        Ok(())
+    }
 }
 
 /// What the validator recovered. Serialised as JSON so it composes with the
@@ -215,7 +263,7 @@ pub(crate) fn validate_bytes(bytes: &[u8], path: &str) -> Result<CoreSummary, Co
     }
     let notes = &bytes[note_offset as usize..(note_offset + note_size) as usize];
 
-    let mut threads = Vec::new();
+    let mut parsed_threads: Vec<ParsedThread> = Vec::new();
     let mut identity = None;
     let mut signal = None;
     let mut auxv_entries = 0_usize;
@@ -241,7 +289,8 @@ pub(crate) fn validate_bytes(bytes: &[u8], path: &str) -> Result<CoreSummary, Co
         // rejecting them made this validator refuse a genuine core at byte
         // 2236. Only `CORE` notes are interpreted; the rest are counted and
         // skipped, which is what any conforming reader does.
-        if owner != NOTE_OWNER {
+        const LINUX_NOTE_OWNER: &[u8] = b"LINUX\0";
+        if owner != NOTE_OWNER && owner != LINUX_NOTE_OWNER {
             foreign_notes += 1;
             at = align_up(desc_at + descsz, NOTE_ALIGN);
             continue;
@@ -256,8 +305,12 @@ pub(crate) fn validate_bytes(bytes: &[u8], path: &str) -> Result<CoreSummary, Co
                     });
                 }
                 let regs_at = std::mem::offset_of!(wire::ElfPrStatus, pr_reg);
-                threads.push(ThreadSummary {
-                    tid: read_u32(desc, std::mem::offset_of!(wire::ElfPrStatus, pr_pid)) as i32,
+                let tid = read_u32(desc, std::mem::offset_of!(wire::ElfPrStatus, pr_pid)) as i32;
+                if parsed_threads.iter().any(|thread| thread.tid == tid) {
+                    return Err(CoreError::DuplicateTid(tid));
+                }
+                parsed_threads.push(ParsedThread {
+                    tid,
                     current_signal: read_u16(
                         desc,
                         std::mem::offset_of!(wire::ElfPrStatus, pr_cursig),
@@ -265,7 +318,43 @@ pub(crate) fn validate_bytes(bytes: &[u8], path: &str) -> Result<CoreSummary, Co
                     // sp and pc are gregs[31] and gregs[32].
                     sp: read_u64(desc, regs_at + 31 * size_of::<u64>()),
                     pc: read_u64(desc, regs_at + 32 * size_of::<u64>()),
+                    pstate: read_u64(desc, regs_at + 33 * size_of::<u64>()),
+                    x0: read_u64(desc, regs_at),
+                    tpidr_el0: None,
+                    fp: None,
                 });
+            }
+            NT_FPREGSET => {
+                if descsz != AARCH64_FPREGSET_SIZE {
+                    return Err(CoreError::NoteWrongSize {
+                        name: "NT_FPREGSET",
+                        actual: descsz,
+                        expected: AARCH64_FPREGSET_SIZE,
+                    });
+                }
+                let thread = parsed_threads
+                    .last_mut()
+                    .ok_or(CoreError::OrphanThreadNote {
+                        note: "NT_FPREGSET",
+                    })?;
+                thread.publish_fp((
+                    [read_u64(desc, 0), read_u64(desc, 8)],
+                    read_u32(desc, 32 * size_of::<u128>()),
+                    read_u32(desc, 32 * size_of::<u128>() + 4),
+                ))?;
+            }
+            NT_ARM_TLS => {
+                if descsz != AARCH64_TLS_SIZE {
+                    return Err(CoreError::NoteWrongSize {
+                        name: "NT_ARM_TLS",
+                        actual: descsz,
+                        expected: AARCH64_TLS_SIZE,
+                    });
+                }
+                let thread = parsed_threads
+                    .last_mut()
+                    .ok_or(CoreError::OrphanThreadNote { note: "NT_ARM_TLS" })?;
+                thread.publish_tls(read_u64(desc, 0))?;
             }
             NT_PRPSINFO => {
                 if descsz != ORACLE_PRPSINFO_SIZE {
@@ -311,8 +400,31 @@ pub(crate) fn validate_bytes(bytes: &[u8], path: &str) -> Result<CoreSummary, Co
         at = align_up(desc_at + descsz, NOTE_ALIGN);
     }
 
-    if threads.is_empty() {
+    if parsed_threads.is_empty() {
         return Err(CoreError::NoThreadNotes);
+    }
+    let mut threads = Vec::with_capacity(parsed_threads.len());
+    for thread in parsed_threads {
+        let tpidr_el0 = thread.tpidr_el0.ok_or(CoreError::MissingThreadNote {
+            tid: thread.tid,
+            note: "NT_ARM_TLS",
+        })?;
+        let (v0, fpsr, fpcr) = thread.fp.ok_or(CoreError::MissingThreadNote {
+            tid: thread.tid,
+            note: "NT_FPREGSET",
+        })?;
+        threads.push(ThreadSummary {
+            tid: thread.tid,
+            current_signal: thread.current_signal,
+            pc: thread.pc,
+            sp: thread.sp,
+            pstate: thread.pstate,
+            x0: thread.x0,
+            tpidr_el0,
+            v0,
+            fpsr,
+            fpcr,
+        });
     }
     let (pid, ppid, comm) = identity.ok_or(CoreError::MissingNote("NT_PRPSINFO"))?;
     let (signo, code, addr) = signal.ok_or(CoreError::MissingNote("NT_SIGINFO"))?;
@@ -349,6 +461,49 @@ pub(crate) fn run_debug_core(path: &Path) -> Result<(), Box<dyn std::error::Erro
 mod tests {
     use super::*;
 
+    fn complete_core() -> Vec<u8> {
+        use carrick_runtime::core_dump::{
+            AARCH64_GREGS, CoreDump, ProcessIdentity, SignalInfo, ThreadRegisters, ThreadState,
+        };
+        let mut gregs = [0_u64; AARCH64_GREGS];
+        gregs[0] = 0x1111;
+        gregs[31] = 0x2222;
+        gregs[32] = 0x3333;
+        gregs[33] = 0x4444;
+        CoreDump {
+            identity: ProcessIdentity {
+                pid: 77,
+                ppid: 1,
+                pgrp: 77,
+                session: 77,
+                comm: "coretest".to_owned(),
+                psargs: "coretest".to_owned(),
+            },
+            signal: SignalInfo {
+                signo: 11,
+                code: 1,
+                errno: 0,
+                addr: 0xdead,
+            },
+            threads: vec![ThreadState {
+                tid: 77,
+                registers: ThreadRegisters {
+                    gregs,
+                    tpidr_el0: 0x5555,
+                    vregs: [0x6666; 32],
+                    fpsr: 0x7777,
+                    fpcr: 0x8888,
+                },
+                current_signal: 11,
+            }],
+            auxv: vec![(6, 4096)],
+            mappings: Vec::new(),
+            regions: Vec::new(),
+        }
+        .to_bytes_bounded(u64::MAX)
+        .expect("complete core")
+    }
+
     /// A validator that accepts anything is not a validator. Each of these is
     /// a corruption a real reader would choke on, and each must be REJECTED
     /// with its own name.
@@ -362,5 +517,49 @@ mod tests {
     fn rejects_a_file_too_short_for_a_header() {
         let error = validate_bytes(b"\x7fELF", "x").unwrap_err();
         assert!(matches!(error, CoreError::TooShortForHeader(4)), "{error}");
+    }
+
+    #[test]
+    fn recovers_full_gpr_fp_and_tls_authority() {
+        let summary = validate_bytes(&complete_core(), "core").expect("validate");
+        let thread = &summary.threads[0];
+        assert_eq!(thread.x0, 0x1111);
+        assert_eq!(thread.sp, 0x2222);
+        assert_eq!(thread.pc, 0x3333);
+        assert_eq!(thread.pstate, 0x4444);
+        assert_eq!(thread.tpidr_el0, 0x5555);
+        assert_eq!(thread.v0, [0x6666, 0]);
+        assert_eq!(thread.fpsr, 0x7777);
+        assert_eq!(thread.fpcr, 0x8888);
+    }
+
+    #[test]
+    fn rejects_duplicate_per_thread_architecture_notes() {
+        let mut thread = ParsedThread {
+            tid: 77,
+            current_signal: 11,
+            pc: 0,
+            sp: 0,
+            pstate: 0,
+            x0: 0,
+            tpidr_el0: None,
+            fp: None,
+        };
+        thread.publish_tls(1).expect("first TLS note");
+        assert!(matches!(
+            thread.publish_tls(2),
+            Err(CoreError::DuplicateThreadNote {
+                tid: 77,
+                note: "NT_ARM_TLS"
+            })
+        ));
+        thread.publish_fp(([1, 2], 3, 4)).expect("first FP note");
+        assert!(matches!(
+            thread.publish_fp(([5, 6], 7, 8)),
+            Err(CoreError::DuplicateThreadNote {
+                tid: 77,
+                note: "NT_FPREGSET"
+            })
+        ));
     }
 }

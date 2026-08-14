@@ -177,6 +177,10 @@ where
         &self,
         engine: &mut E,
     ) -> Result<(), RuntimeError> {
+        // A fatal owner reuses the task-local fork barrier to obtain a real
+        // stop-the-world point. Publish the complete register file before the
+        // kicker unregister makes this sibling count as parked.
+        self.publish_crash_registers_if_requested(engine)?;
         if !engine.supports_in_process_fork() {
             engine.release_vcpu_for_fork()?;
         }
