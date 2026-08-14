@@ -1139,7 +1139,7 @@ impl SyscallDispatcher {
         let kernel = ctx.kernel.kernel();
         let caller = ctx.kernel.task();
         let targets = if pid == -1 {
-            kernel.tasks_for_broadcast(caller.key().id)
+            kernel.task_keys_for_broadcast(caller.key().id)
         } else {
             // pid == 0 is the caller's own group; pid < -1 names `-pid`.
             let group = if pid == 0 {
@@ -1150,7 +1150,7 @@ impl SyscallDispatcher {
                     Err(_) => return Some(DispatchOutcome::errno(LINUX_ESRCH)),
                 }
             };
-            kernel.tasks_in_process_group(group)
+            kernel.task_keys_in_process_group(group)
         };
         let signal = if signum == 0 {
             None
@@ -1173,17 +1173,17 @@ impl SyscallDispatcher {
         let mut accepted = 0_usize;
         let mut denied = 0_usize;
         for target in targets {
-            match kernel.authorize_signal_target(ctx.kernel, target, None, signal) {
-                crate::kernel::SignalTargetAuthorization::Allowed => {
-                    if signal
-                        .is_none_or(|signal| kernel.post_signal_to_task(target, signal, Some(info)))
-                    {
+            match kernel.authorize_signal_target_exact(ctx.kernel, target, None, signal) {
+                crate::kernel::ExactSignalTargetAuthorization::Allowed(ticket) => {
+                    if signal.is_none_or(|signal| {
+                        kernel.post_signal_to_authorized_target(&ticket, signal, Some(info))
+                    }) {
                         accepted += 1;
                     }
                 }
-                crate::kernel::SignalTargetAuthorization::DropProtectedInit => accepted += 1,
-                crate::kernel::SignalTargetAuthorization::Denied => denied += 1,
-                crate::kernel::SignalTargetAuthorization::Missing => {}
+                crate::kernel::ExactSignalTargetAuthorization::DropProtectedInit => accepted += 1,
+                crate::kernel::ExactSignalTargetAuthorization::Denied => denied += 1,
+                crate::kernel::ExactSignalTargetAuthorization::Missing => {}
             }
         }
         if accepted != 0 {
@@ -1196,8 +1196,9 @@ impl SyscallDispatcher {
         }))
     }
 
-    /// Route one positive, non-self HVPatch task target through the kernel.
-    /// `None` leaves self/reference-lane behavior to the established paths.
+    /// Route every positive HVPatch task target through the kernel, including
+    /// self. Falling through for self would reach host `raise(3)`/global
+    /// pending state even though all HVPatch tasks share one carrier process.
     fn hvpatch_specific_process_signal<M: GuestMemory>(
         &self,
         ctx: &SyscallCtx<M>,
@@ -1205,17 +1206,17 @@ impl SyscallDispatcher {
         signum: u64,
         siginfo: Option<LinuxSiginfo>,
     ) -> Option<DispatchOutcome> {
-        if !crate::dispatch::hvpatch_lane_active() || pid <= 0 {
+        if !hvpatch_owns_specific_process_signal(crate::dispatch::hvpatch_lane_active(), pid) {
             return None;
         }
         let target = match crate::kernel::TaskId::from_abi_positive(pid) {
             Ok(target) => target,
             Err(_) => return Some(DispatchOutcome::errno(LINUX_ESRCH)),
         };
-        if target == ctx.kernel.task().key().id {
-            return None;
-        }
         let kernel = ctx.kernel.kernel();
+        let Some(target_key) = kernel.live_task_key(target) else {
+            return Some(DispatchOutcome::errno(LINUX_ESRCH));
+        };
         let signal = if signum == 0 {
             None
         } else {
@@ -1225,23 +1226,23 @@ impl SyscallDispatcher {
             }
         };
         Some(
-            match kernel.authorize_signal_target(ctx.kernel, target, None, signal) {
-                crate::kernel::SignalTargetAuthorization::Allowed => {
-                    if signal
-                        .is_none_or(|signal| kernel.post_signal_to_task(target, signal, siginfo))
-                    {
+            match kernel.authorize_signal_target_exact(ctx.kernel, target_key, None, signal) {
+                crate::kernel::ExactSignalTargetAuthorization::Allowed(ticket) => {
+                    if signal.is_none_or(|signal| {
+                        kernel.post_signal_to_authorized_target(&ticket, signal, siginfo)
+                    }) {
                         DispatchOutcome::Returned { value: 0 }
                     } else {
                         DispatchOutcome::errno(LINUX_ESRCH)
                     }
                 }
-                crate::kernel::SignalTargetAuthorization::DropProtectedInit => {
+                crate::kernel::ExactSignalTargetAuthorization::DropProtectedInit => {
                     DispatchOutcome::Returned { value: 0 }
                 }
-                crate::kernel::SignalTargetAuthorization::Denied => {
+                crate::kernel::ExactSignalTargetAuthorization::Denied => {
                     DispatchOutcome::errno(LINUX_EPERM)
                 }
-                crate::kernel::SignalTargetAuthorization::Missing => {
+                crate::kernel::ExactSignalTargetAuthorization::Missing => {
                     DispatchOutcome::errno(LINUX_ESRCH)
                 }
             },
@@ -1258,7 +1259,7 @@ impl SyscallDispatcher {
         signum: u64,
         siginfo: Option<LinuxSiginfo>,
     ) -> Option<DispatchOutcome> {
-        if !crate::dispatch::hvpatch_lane_active() {
+        if !hvpatch_owns_specific_thread_signal(crate::dispatch::hvpatch_lane_active()) {
             return None;
         }
         let tid = match crate::kernel::LinuxTid::from_abi_positive(tid) {
@@ -1273,7 +1274,8 @@ impl SyscallDispatcher {
             None => None,
         };
         let kernel = ctx.kernel.kernel();
-        let Some(target_task) = kernel.live_task_for_thread(required_task, tid) else {
+        let Some((target_task, target_thread)) = kernel.live_keys_for_thread(required_task, tid)
+        else {
             return Some(DispatchOutcome::errno(LINUX_ESRCH));
         };
         let signal = if signum == 0 {
@@ -1285,23 +1287,28 @@ impl SyscallDispatcher {
             }
         };
         Some(
-            match kernel.authorize_signal_target(ctx.kernel, target_task, Some(tid), signal) {
-                crate::kernel::SignalTargetAuthorization::Allowed => {
+            match kernel.authorize_signal_target_exact(
+                ctx.kernel,
+                target_task,
+                Some(target_thread),
+                signal,
+            ) {
+                crate::kernel::ExactSignalTargetAuthorization::Allowed(ticket) => {
                     if signal.is_none_or(|signal| {
-                        kernel.post_signal_to_thread(target_task, tid, signal, siginfo)
+                        kernel.post_signal_to_authorized_target(&ticket, signal, siginfo)
                     }) {
                         DispatchOutcome::Returned { value: 0 }
                     } else {
                         DispatchOutcome::errno(LINUX_ESRCH)
                     }
                 }
-                crate::kernel::SignalTargetAuthorization::DropProtectedInit => {
+                crate::kernel::ExactSignalTargetAuthorization::DropProtectedInit => {
                     DispatchOutcome::Returned { value: 0 }
                 }
-                crate::kernel::SignalTargetAuthorization::Denied => {
+                crate::kernel::ExactSignalTargetAuthorization::Denied => {
                     DispatchOutcome::errno(LINUX_EPERM)
                 }
-                crate::kernel::SignalTargetAuthorization::Missing => {
+                crate::kernel::ExactSignalTargetAuthorization::Missing => {
                     DispatchOutcome::errno(LINUX_ESRCH)
                 }
             },
@@ -1544,6 +1551,19 @@ impl SyscallDispatcher {
             if !is_valid_signum(signum) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
+            if crate::dispatch::hvpatch_lane_active() {
+                let info = (signum != 0).then(|| {
+                    crate::linux_abi::LinuxSiginfo::kill(
+                        signum as i32,
+                        crate::linux_abi::LINUX_SI_TKILL,
+                        cx.kernel.task().key().id.raw(),
+                        this.cred_snapshot().ruid,
+                    )
+                });
+                return Ok(this
+                    .hvpatch_specific_thread_signal(cx, None, tid as i32, signum, info)
+                    .unwrap_or_else(|| DispatchOutcome::errno(LINUX_ESRCH)));
+            }
             if let Some((routed, _target)) = this.route_thread_signal(cx, tid, signum, true) {
                 return Ok(routed);
             }
@@ -1557,19 +1577,6 @@ impl SyscallDispatcher {
             if names_self_pid(tid) {
                 let self_tid = Self::ctx_tid(cx);
                 return Ok(this.raise_self(cx.kernel, self_tid, signum));
-            }
-            let info = (signum != 0).then(|| {
-                crate::linux_abi::LinuxSiginfo::kill(
-                    signum as i32,
-                    crate::linux_abi::LINUX_SI_TKILL,
-                    cx.kernel.task().key().id.raw(),
-                    this.cred_snapshot().ruid,
-                )
-            });
-            if let Some(outcome) =
-                this.hvpatch_specific_thread_signal(cx, None, tid as i32, signum, info)
-            {
-                return Ok(outcome);
             }
             Ok(bootstrap_signal_send(
                 SignalTarget::GuestTid(NsPid(tid as i32)),
@@ -1588,9 +1595,7 @@ impl SyscallDispatcher {
             if !is_valid_signum(signum) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if crate::dispatch::hvpatch_lane_active()
-                && tgid != i64::from(cx.kernel.task().key().id.raw())
-            {
+            if crate::dispatch::hvpatch_lane_active() {
                 let info = (signum != 0).then(|| {
                     crate::linux_abi::LinuxSiginfo::kill(
                         signum as i32,
@@ -1608,6 +1613,7 @@ impl SyscallDispatcher {
                 ) {
                     return Ok(outcome);
                 }
+                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             // tgid-membership: `tid` must belong to thread group `tgid`. A guest
             // process is one host process whose threads all share tgid == the
@@ -2154,6 +2160,29 @@ impl SyscallDispatcher {
             }
         }
 
+        // Every HVPatch target, including this task and its sibling threads,
+        // is kernel identity. The mature route below publishes through host-
+        // process globals and `SignalThread`, which are shared by unrelated
+        // HVPatch tasks and bypass task-wide signal generation ordering.
+        if crate::dispatch::hvpatch_lane_active() {
+            if is_rt_signal(s) && self.sigpending_limit_exceeded(ctx.kernel) {
+                return DispatchOutcome::errno(LINUX_EAGAIN);
+            }
+            return if tid_directed {
+                self.hvpatch_specific_thread_signal(
+                    ctx,
+                    Some(ns_target as i32),
+                    route_target as i32,
+                    signum,
+                    user_info,
+                )
+                .unwrap_or_else(|| DispatchOutcome::errno(LINUX_ESRCH))
+            } else {
+                self.hvpatch_specific_process_signal(ctx, ns_target as i32, signum, user_info)
+                    .unwrap_or_else(|| DispatchOutcome::errno(LINUX_ESRCH))
+            };
+        }
+
         // Sibling-thread route: deliver directly so the SA_SIGINFO frame carries
         // the original si_value (LTP rt_sigqueueinfo01 / rt_tgsigqueueinfo01).
         if let Some((routed, target_tid)) =
@@ -2171,25 +2200,6 @@ impl SyscallDispatcher {
                 self.record_pending_siginfo(ctx.kernel, target_tid, s, info);
             }
             return routed;
-        }
-
-        if crate::dispatch::hvpatch_lane_active()
-            && ns_target != i64::from(ctx.kernel.task().key().id.raw())
-        {
-            let outcome = if tid_directed {
-                self.hvpatch_specific_thread_signal(
-                    ctx,
-                    Some(ns_target as i32),
-                    route_target as i32,
-                    signum,
-                    user_info,
-                )
-            } else {
-                self.hvpatch_specific_process_signal(ctx, ns_target as i32, signum, user_info)
-            };
-            if let Some(outcome) = outcome {
-                return outcome;
-            }
         }
 
         // PID namespace (§5.3): translate the ns-pid thread-group to its host pid
@@ -2464,6 +2474,14 @@ fn host_signal_transport_allowed(hvpatch_lane: bool, _target: SignalTarget) -> b
     !hvpatch_lane
 }
 
+fn hvpatch_owns_specific_process_signal(hvpatch_lane: bool, pid: i32) -> bool {
+    hvpatch_lane && pid > 0
+}
+
+fn hvpatch_owns_specific_thread_signal(hvpatch_lane: bool) -> bool {
+    hvpatch_lane
+}
+
 pub(crate) fn bootstrap_signal_send(target: SignalTarget, signum: u64) -> DispatchOutcome {
     bootstrap_signal_send_as(target, signum, /*caller_euid=*/ None)
 }
@@ -2659,6 +2677,16 @@ mod tests {
                 "reference lanes must retain their host-process transport for {target:?}",
             );
         }
+        assert!(hvpatch_owns_specific_process_signal(
+            true,
+            carrick_abi::LINUX_BOOTSTRAP_PID as i32,
+        ));
+        assert!(hvpatch_owns_specific_thread_signal(true));
+        assert!(!hvpatch_owns_specific_process_signal(
+            false,
+            carrick_abi::LINUX_BOOTSTRAP_PID as i32,
+        ));
+        assert!(!hvpatch_owns_specific_thread_signal(false));
     }
 
     #[test]

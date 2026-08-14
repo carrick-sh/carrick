@@ -265,6 +265,53 @@ fn job_control_case(parent_pid: i32) -> [bool; 8] {
     ]
 }
 
+fn self_job_control_case(parent_pid: i32) -> [bool; 7] {
+    let Some(ready) = make_pipe() else {
+        return [false; 7];
+    };
+    let Some(resumed) = make_pipe() else {
+        return [false; 7];
+    };
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        unsafe {
+            libc::close(ready[0]);
+            libc::close(resumed[0]);
+        }
+        if !exact_write(ready[1], 1) {
+            unsafe { libc::_exit(8) }
+        }
+        let self_stop_sent = unsafe { libc::kill(libc::getpid(), libc::SIGSTOP) } == 0;
+        let acknowledged = exact_write(resumed[1], u64::from(self_stop_sent));
+        unsafe { libc::_exit(if acknowledged && self_stop_sent { 0 } else { 9 }) }
+    }
+    unsafe {
+        libc::close(ready[1]);
+        libc::close(resumed[1]);
+    }
+    if child <= 0 || exact_read(ready[0]) != Some(1) {
+        return [false; 7];
+    }
+
+    let stopped = wait_status(child, libc::WUNTRACED)
+        .is_some_and(|status| libc::WIFSTOPPED(status) && libc::WSTOPSIG(status) == libc::SIGSTOP);
+    let parent_runnable = stopped && unsafe { libc::getpid() } == parent_pid;
+    let continue_sent = parent_runnable && unsafe { libc::kill(child, libc::SIGCONT) } == 0;
+    let continued = continue_sent
+        && wait_status(child, libc::WCONTINUED).is_some_and(|status| libc::WIFCONTINUED(status));
+    let child_reported_send = continued && exact_read(resumed[0]) == Some(1);
+    let child_exited = child_reported_send && wait_exited(child) == Some(0);
+    [
+        child_reported_send,
+        stopped,
+        parent_runnable,
+        continue_sent,
+        continued,
+        child_reported_send,
+        child_exited,
+    ]
+}
+
 fn call_denied(operation: impl FnOnce() -> libc::c_int) -> bool {
     let result = operation();
     result == -1 && errno() == libc::EPERM
@@ -615,6 +662,7 @@ fn main() {
     ) = pid_one_signal_immunity_case(pid);
     let pid_one_terminal_stop_immunity = pid_one_terminal_stop_immunity_case(pid);
     let job_control = job_control_case(pid);
+    let self_job_control = self_job_control_case(pid);
     let credential_results = credential_denial_case();
     let leader_exit = leader_exit_signal_case();
 
@@ -648,6 +696,13 @@ fn main() {
         job_control_wait_reported_continued = job_control[5],
         job_control_child_resumed = job_control[6],
         job_control_child_exited_zero = job_control[7],
+        self_job_control_stop_send_succeeded = self_job_control[0],
+        self_job_control_wait_reported_sigstop = self_job_control[1],
+        self_job_control_parent_remained_runnable = self_job_control[2],
+        self_job_control_continue_send_succeeded = self_job_control[3],
+        self_job_control_wait_reported_continued = self_job_control[4],
+        self_job_control_child_resumed = self_job_control[5],
+        self_job_control_child_exited_zero = self_job_control[6],
         credential_positive_signal_zero_denied = credential_results[0],
         credential_tgkill_signal_zero_denied = credential_results[1],
         credential_group_signal_zero_denied = credential_results[2],
