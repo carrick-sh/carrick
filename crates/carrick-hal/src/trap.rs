@@ -108,6 +108,10 @@ pub trait SyscallTrap {
         (0, 0)
     }
 
+    /// Diagnostic seam: make the next real `begin_exec_inventory` operation
+    /// fail. Backends without HVPatch inventory ignore the request.
+    fn inject_next_begin_exec_inventory_failure(&mut self) {}
+
     /// Arm independently applicable old-mm retirement and replacement-mm map
     /// transactions. Keeping them separate prevents an exec batch from being
     /// applied to the wrong `MmId`.

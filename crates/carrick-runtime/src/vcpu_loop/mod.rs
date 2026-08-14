@@ -1095,23 +1095,46 @@ pub(crate) fn stamp_identity_page<M: GuestMemory>(
     memory: &mut M,
     dispatcher: &SyscallDispatcher,
     kernel_context: &crate::kernel::KernelContext,
-) {
+) -> Result<(), carrick_guest_mem::MemoryError> {
+    stamp_identity_page_at(
+        memory,
+        dispatcher,
+        kernel_context,
+        crate::memory::LINUX_IDENTITY_PAGE_BASE,
+    )
+}
+
+fn stamp_identity_page_at<M: GuestMemory>(
+    memory: &mut M,
+    dispatcher: &SyscallDispatcher,
+    kernel_context: &crate::kernel::KernelContext,
+    base: u64,
+) -> Result<(), carrick_guest_mem::MemoryError> {
     if !crate::syscall_shim_enabled() {
-        return;
+        return Ok(());
     }
     let id = dispatcher.identity_snapshot(kernel_context);
-    let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
+    stamp_identity_values(
+        memory,
+        base,
+        id.pid,
+        u32::from(dispatcher.identity_fast_path_enabled()),
+    )
+}
+
+fn stamp_identity_values<M: GuestMemory>(
+    memory: &mut M,
+    base: u64,
+    pid: u32,
+    shim_enabled: u32,
+) -> Result<(), carrick_guest_mem::MemoryError> {
     for (off, val) in [
-        (crate::memory::IDENTITY_OFF_PID, id.pid),
-        (
-            crate::memory::IDENTITY_OFF_SHIM_ENABLED,
-            u32::from(dispatcher.identity_fast_path_enabled()),
-        ),
+        (crate::memory::IDENTITY_OFF_PID, pid),
+        (crate::memory::IDENTITY_OFF_SHIM_ENABLED, shim_enabled),
     ] {
-        // Best-effort: the page is only absent when the shim is off (handled
-        // above) or on a non-HVF stub; a stamp failure can't corrupt the guest.
-        let _ = memory.write_bytes(base + off, &val.to_le_bytes());
+        memory.write_bytes(base + off, &val.to_le_bytes())?;
     }
+    Ok(())
 }
 
 /// Stamp the running guest thread's guest-visible tid into the vCPU sysreg that
@@ -4095,6 +4118,18 @@ mod tests {
     use super::*;
     use std::num::NonZeroU64;
     use std::time::Duration;
+
+    #[test]
+    fn identity_page_stamp_surfaces_guest_memory_write_failure() {
+        let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
+        let mut memory = crate::dispatch::LinearMemory::new(base, vec![0; 4]);
+        let error = stamp_identity_values(&mut memory, base, 123, 1)
+            .expect_err("second identity word is outside the backing");
+        assert!(matches!(
+            error,
+            carrick_guest_mem::MemoryError::OutOfBounds { .. }
+        ));
+    }
 
     fn alias_context(pid: i32) -> crate::kernel::KernelContext {
         let bootstrap = crate::kernel::RootBootstrap::for_reference_model(

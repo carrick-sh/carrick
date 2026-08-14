@@ -1027,6 +1027,10 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         self.vm.frame_inventory_exec_extent_counts(new_image)
     }
 
+    fn inject_next_begin_exec_inventory_failure(&mut self) {
+        self.vm.inject_next_begin_exec_inventory_failure();
+    }
+
     fn begin_exec_inventory(
         &mut self,
         retired: carrick_hal::FrameInventoryReservation,

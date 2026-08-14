@@ -804,7 +804,7 @@ fn run_address_space_with_hvf_and_dispatcher(
         let boot_context = dispatcher.capture_one_task_context().map_err(|error| {
             RuntimeError::Configuration(format!("capture boot identity Kernel context: {error}"))
         })?;
-        stamp_identity_page(&mut trap, &dispatcher, &boot_context);
+        let _ = stamp_identity_page(&mut trap, &dispatcher, &boot_context);
         drop(boot_context);
         let run = run_threaded_hvf_loop(trap, dispatcher, max_traps);
         if persistent_vm {
@@ -1327,7 +1327,7 @@ where
                                 std::process::abort();
                             });
                         // Re-stamp from the exact child generation published above.
-                        stamp_identity_page(runtime, &dispatcher, &child_context);
+                        let _ = stamp_identity_page(runtime, &dispatcher, &child_context);
                         if let Some(addr) = parent_tid_addr {
                             let tid = (crate::namespace::pid::self_ns_pid() as i32).to_le_bytes();
                             let _ = runtime.write_bytes(addr, &tid);
@@ -1388,7 +1388,7 @@ where
                         crate::namespace::pid::mark_self_execed();
                         // execve_into rebuilt a fresh (zeroed) identity page;
                         // exec retains the caller's captured credential values.
-                        stamp_identity_page(runtime, &dispatcher, &exec_context);
+                        let _ = stamp_identity_page(runtime, &dispatcher, &exec_context);
                         stop_after_traced_exec(&dispatcher);
                     }
                     Err(errno) => {

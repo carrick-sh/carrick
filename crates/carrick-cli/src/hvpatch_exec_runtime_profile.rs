@@ -602,4 +602,32 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn rejects_completion_guest_tid_drift_reported_by_producer() {
+        let mut lines = valid_lines();
+        lines[8] = COMPLETE.replace("guest_tid=40", "guest_tid=41");
+        *lines.last_mut().expect("summary") = summary(&[
+            ("status", "error"),
+            ("completes", "0"),
+            ("completion_errors", "1"),
+        ]);
+        assert!(
+            HvpatchExecRuntimeSummary::from_lines(lines, ProfileCaptureStatus::default()).is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_completion_guest_asid_drift_reported_by_producer() {
+        let mut lines = valid_lines();
+        lines[8] = COMPLETE.replace("asid=50", "asid=51");
+        *lines.last_mut().expect("summary") = summary(&[
+            ("status", "error"),
+            ("completes", "0"),
+            ("completion_errors", "1"),
+        ]);
+        assert!(
+            HvpatchExecRuntimeSummary::from_lines(lines, ProfileCaptureStatus::default()).is_err()
+        );
+    }
 }

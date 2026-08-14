@@ -740,7 +740,7 @@ where
                         // execve'd or exited. Its child-side identity stamp therefore
                         // overwrote the shared EL1 shim identity page; restore the
                         // parent's getpid/get*id fast-path values before resuming it.
-                        stamp_identity_page(engine, &kernel.dispatcher, kernel_context);
+                        let _ = stamp_identity_page(engine, &kernel.dispatcher, kernel_context);
                         crate::probes::fork_lifecycle(
                             0,
                             9,
@@ -868,7 +868,7 @@ where
                     // retired parent generation.
                     self.service_kernel_context = Some(child_context.retain_exact());
                     // Re-stamp from the exact child generation published above.
-                    stamp_identity_page(engine, &kernel.dispatcher, &child_context);
+                    let _ = stamp_identity_page(engine, &kernel.dispatcher, &child_context);
                     if let Some(addr) = parent_tid_addr {
                         let tid = (crate::namespace::pid::self_ns_pid() as i32).to_le_bytes();
                         let _ = engine.write_bytes(addr, &tid);
@@ -1304,7 +1304,7 @@ where
                 let handle: Box<dyn carrick_hal::VcpuKickDyn> =
                     Box::new(child_engine.kick_handle());
                 child_kicker.register(child_tid, handle);
-                stamp_identity_page(
+                let _ = stamp_identity_page(
                     &mut child_engine,
                     &child_kernel.dispatcher,
                     &child_context,
