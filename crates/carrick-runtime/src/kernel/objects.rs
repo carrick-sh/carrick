@@ -2211,6 +2211,26 @@ struct TaskIdentity {
     session: SessionId,
 }
 
+/// How the kernel makes a task NOTICE something it has been handed.
+///
+/// Enqueuing a signal is only half of delivery. A task that reaches a syscall
+/// or trap boundary polls its own pending queue and finds it; a task parked in
+/// a host wait — a blocking read, a futex, `waitpid`, a kqueue — finds nothing,
+/// because none of those vehicles watch the kernel's queues. Waking it is
+/// unavoidably host-specific (on the kernel lane: unpark the futex table, poke
+/// the wake pipes, force the vCPU out of `hv_vcpu_run`), so the kernel names
+/// the CAPABILITY and each lane supplies it.
+///
+/// Waking is a hint, never a guarantee of consumption: the woken task re-reads
+/// the authoritative queue and decides for itself. That makes a spurious wake
+/// harmless and a missing implementation merely slow rather than wrong — a task
+/// with no waker still notices at its next boundary.
+pub trait TaskWaker: Send + Sync + std::fmt::Debug {
+    /// Kick every vehicle this task may be parked on. Idempotent, and safe to
+    /// call for a task that is running or already awake.
+    fn wake_task(&self);
+}
+
 #[derive(Debug)]
 pub struct Task {
     key: TaskKey,
@@ -2221,6 +2241,10 @@ pub struct Task {
     shared: ArcSwap<TaskShared>,
     threads: Mutex<BTreeMap<LinuxTid, (ThreadKey, ThreadRef)>>,
     cpu: TaskCpu,
+    /// Lane-supplied wake vehicle, absent until the runtime publishes one (and
+    /// on lanes that have none). Held here rather than in a side table so it
+    /// cannot outlive the task or be looked up for a retired one.
+    waker: Mutex<Option<Arc<dyn TaskWaker>>>,
 }
 
 /// The two CPU ledgers Linux keeps for every process, owned by the kernel
@@ -2269,6 +2293,29 @@ impl Task {
             shared: ArcSwap::new(shared),
             threads: Mutex::new(BTreeMap::new()),
             cpu: TaskCpu::default(),
+            waker: Mutex::new(None),
+        }
+    }
+
+    /// Publish the lane's wake vehicle for this task, replacing any previous
+    /// one. The runtime calls this once the task has a vCPU and a futex table
+    /// to kick.
+    pub fn set_waker(&self, waker: Arc<dyn TaskWaker>) {
+        *self.waker.lock() = Some(waker);
+    }
+
+    /// Kick every vehicle this task may be parked on, so it reaches a point
+    /// where it re-reads the kernel's authoritative state.
+    ///
+    /// THE single door for waking a task. A no-op when no waker is published —
+    /// the task then notices at its next syscall or trap boundary, which is
+    /// slower but not wrong. Waking is always a hint: nothing is consumed here
+    /// and the woken task decides for itself what it found, so a spurious call
+    /// is harmless.
+    pub fn wake(&self) {
+        let waker = self.waker.lock().clone();
+        if let Some(waker) = waker {
+            waker.wake_task();
         }
     }
 

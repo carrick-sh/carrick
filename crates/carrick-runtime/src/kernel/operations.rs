@@ -1009,17 +1009,24 @@ impl Kernel {
     ///
     /// [`take_lowest_in`]: super::objects::TaskPendingSignals::take_lowest_in
     ///
-    /// NOTE — this half only makes the signal PENDING. A task that is running
-    /// observes it at its next syscall or trap boundary; a task blocked in a
-    /// host syscall needs a wake, which is deliberately NOT done here because
-    /// the wake is per-lane and this is the lane-neutral kernel.
+    /// The signal is made pending and then the target is WOKEN through its
+    /// lane-supplied [`TaskWaker`], because enqueuing alone reaches only a task
+    /// that gets back to a syscall or trap boundary — one parked in a host wait
+    /// watches pipes, futexes and kqueues, none of which observe the kernel's
+    /// queues. A task with no waker published is not an error: it still notices
+    /// at its next boundary, just not while parked.
+    ///
+    /// The wake happens strictly AFTER the enqueue and outside the registry
+    /// lock. After, so the woken task cannot look, find an empty queue, and go
+    /// back to sleep having consumed its wake; outside, so a waker that blocks
+    /// or re-enters the kernel cannot deadlock against the registry.
     pub fn post_signal_to_task(
         &self,
         target: TaskId,
         signal: LinuxSignal,
         siginfo: Option<LinuxSiginfo>,
     ) -> bool {
-        let pending = {
+        let (pending, task) = {
             let state = self.registry().state.read();
             let Some(record) = state.tasks.get(&target) else {
                 return false;
@@ -1027,13 +1034,17 @@ impl Kernel {
             if record.task.lifecycle() != TaskLifecycle::Live {
                 return false;
             }
-            record.task.shared().pending_signals()
+            (
+                record.task.shared().pending_signals(),
+                Arc::clone(&record.task),
+            )
         };
         if signal.is_realtime() {
             pending.enqueue_realtime(signal, siginfo);
         } else {
             pending.enqueue_standard(signal, siginfo);
         }
+        task.wake();
         true
     }
 
@@ -3262,6 +3273,85 @@ mod tests {
         kernel
             .exit_task(child_id, LinuxWaitStatus::from_wait_encoding(0), None)
             .expect("retire child");
+    }
+
+    /// A task that is parked in a host wait must be WOKEN, and it must be woken
+    /// only once the signal is already pending — otherwise it wakes, looks at
+    /// an empty queue, and parks again having spent its wake. This waker
+    /// records what the queue held at the moment it was kicked, which is the
+    /// ordering the lost-wakeup bug would violate.
+    #[derive(Debug)]
+    struct RecordingWaker {
+        wakes: AtomicUsize,
+        /// The target's REAL queue, so the wake observes exactly what a woken
+        /// guest would observe rather than anything the test staged.
+        queue: Arc<super::super::objects::TaskPendingSignals>,
+        pending_when_woken: AtomicUsize,
+    }
+
+    impl super::super::objects::TaskWaker for RecordingWaker {
+        fn wake_task(&self) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+            self.pending_when_woken
+                .store(self.queue.pending_count(), Ordering::SeqCst);
+        }
+    }
+
+    /// Delivery must WAKE the target, not merely enqueue. A guest parked in a
+    /// blocking read or a futex watches host pipes and futexes; none of them
+    /// observe the kernel's pending queue, so without this a `killpg` to a
+    /// sleeping process is silently deferred until it happens to trap.
+    #[test]
+    fn delivery_wakes_the_target_after_the_signal_is_pending() {
+        let (kernel, root) = bootstrap(1);
+        let child_id = fork_child(&kernel, &root, "parked target", 714);
+        let waker = Arc::new(RecordingWaker {
+            wakes: AtomicUsize::new(0),
+            queue: pending_of(&kernel, child_id),
+            pending_when_woken: AtomicUsize::new(0),
+        });
+
+        {
+            let state = kernel.registry().state.read();
+            let task = &state.tasks.get(&child_id).expect("child").task;
+            task.set_waker(Arc::clone(&waker) as Arc<dyn super::super::objects::TaskWaker>);
+        }
+
+        let pending = pending_of(&kernel, child_id);
+        assert_eq!(waker.wakes.load(Ordering::SeqCst), 0);
+
+        let sigterm = LinuxSignal::for_signal_number(15).expect("SIGTERM");
+        assert!(kernel.post_signal_to_task(child_id, sigterm, None));
+
+        assert_eq!(
+            waker.wakes.load(Ordering::SeqCst),
+            1,
+            "the target is woken exactly once per delivery"
+        );
+        assert_eq!(
+            pending.pending_count(),
+            1,
+            "and the signal is pending for it to find"
+        );
+        assert_eq!(
+            waker.pending_when_woken.load(Ordering::SeqCst),
+            1,
+            "the signal was ALREADY pending when the wake fired — waking first \
+             lets the target look, find nothing, and park again having spent \
+             its wake"
+        );
+
+        // A task with NO waker is not an error: it still notices at its next
+        // syscall boundary, so delivery reports success.
+        let bare_id = fork_child(&kernel, &root, "unwoken target", 715);
+        assert!(kernel.post_signal_to_task(bare_id, sigterm, None));
+        assert!(pending_of(&kernel, bare_id).present().contains(15));
+
+        for id in [child_id, bare_id] {
+            kernel
+                .exit_task(id, LinuxWaitStatus::from_wait_encoding(0), None)
+                .expect("retire child");
+        }
     }
 
     /// An unknown or already-exiting task reports no delivery. For a specific
