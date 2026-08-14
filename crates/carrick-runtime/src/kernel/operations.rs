@@ -947,6 +947,48 @@ impl Kernel {
         self.registry().state.read().tasks.contains_key(&task_id)
     }
 
+    /// Every LIVE task in `group`, lowest id first.
+    ///
+    /// This is the authority a `killpg(2)` must use. The HOST's process groups
+    /// describe carrick itself, not the guest — on the kernel lane every Linux
+    /// process is a thread of one host process, so they are all in the same
+    /// host group and a guest pgid means nothing to `libc::kill`. Worse, a
+    /// guest pgid of 1 negates to `kill(-1, …)`, the host BROADCAST sentinel.
+    ///
+    /// Sorted so delivery order is deterministic; Linux does not specify one,
+    /// but a differential oracle needs carrick's to be stable.
+    pub fn tasks_in_process_group(&self, group: ProcessGroupId) -> Vec<TaskId> {
+        let state = self.registry().state.read();
+        let mut ids: Vec<TaskId> = state
+            .tasks
+            .iter()
+            .filter(|(_, record)| record.task.process_group() == group)
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Every LIVE task a broadcast `kill(-1, …)` may target: all of them except
+    /// the caller and init, lowest id first.
+    ///
+    /// Linux sends `kill(-1)` to every process the caller has permission to
+    /// signal, excluding itself and pid 1. Excluding init is what stops a
+    /// guest's own `kill(-1, SIGKILL)` from taking down the container's init
+    /// along with everything else.
+    pub fn tasks_for_broadcast(&self, caller: TaskId) -> Vec<TaskId> {
+        let init = TaskId::from_abi_positive(carrick_abi::LINUX_BOOTSTRAP_PID as i32).ok();
+        let state = self.registry().state.read();
+        let mut ids: Vec<TaskId> = state
+            .tasks
+            .keys()
+            .copied()
+            .filter(|id| *id != caller && Some(*id) != init)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     pub(super) fn retire_mm_io_state_if_unreferenced(&self, target: &Arc<Mm>) {
         let live = self
             .registry()
@@ -3019,6 +3061,92 @@ mod tests {
         );
         assert!(!kernel.task_is_live(child_id));
         assert_eq!(kernel.registry().task_count(), 1);
+    }
+
+    /// `killpg` must resolve its members from the KERNEL, not the host. On the
+    /// kernel lane every Linux process is a thread of one host process, so they
+    /// share one host process group and a guest pgid means nothing to
+    /// `libc::kill` — and a guest pgid of 1 negates to the host BROADCAST
+    /// sentinel.
+    #[test]
+    fn process_group_membership_comes_from_the_kernel() {
+        let (kernel, root) = bootstrap(7);
+        let root_id = root.task().key().id;
+        let group = root.task().process_group();
+
+        // A lone root is its own group.
+        assert_eq!(kernel.tasks_in_process_group(group), vec![root_id]);
+
+        let reservation = kernel
+            .reserve_fork(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                "group child".to_owned(),
+                None,
+            )
+            .expect("reserve fork");
+        let child_id = reservation.child_id();
+        let mut prepared = reservation
+            .prepare_reference(ThreadId::synthetic_for_tests(701))
+            .expect("prepare fork");
+        let wait = prepared.take_child_start_wait().expect("child wait");
+        let waiter = std::thread::spawn(move || wait.wait());
+        let published = prepared.commit().expect("publish fork");
+        drop(published);
+        waiter.join().expect("join child");
+
+        // A fork inherits its parent's group, so both are members and the order
+        // is deterministic.
+        assert_eq!(
+            kernel.tasks_in_process_group(group),
+            vec![root_id, child_id],
+            "a forked child inherits its parent's process group"
+        );
+
+        // Exiting removes it: a killpg must never target a zombie.
+        kernel
+            .exit_task(child_id, LinuxWaitStatus::from_wait_encoding(0), None)
+            .expect("retire child");
+        assert_eq!(kernel.tasks_in_process_group(group), vec![root_id]);
+    }
+
+    /// `kill(-1)` targets every process the caller may signal EXCEPT itself and
+    /// init. Excluding init is what stops a guest's own broadcast from killing
+    /// the container's init along with everything else.
+    #[test]
+    fn broadcast_excludes_the_caller_and_init() {
+        // Bootstrap AT pid 1 so the root IS init, which is the shape the kernel
+        // lane will have once its id space is seeded at 1.
+        let (kernel, root) = bootstrap(1);
+        let root_id = root.task().key().id;
+
+        let reservation = kernel
+            .reserve_fork(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                "broadcast child".to_owned(),
+                None,
+            )
+            .expect("reserve fork");
+        let child_id = reservation.child_id();
+        let mut prepared = reservation
+            .prepare_reference(ThreadId::synthetic_for_tests(702))
+            .expect("prepare fork");
+        let wait = prepared.take_child_start_wait().expect("child wait");
+        let waiter = std::thread::spawn(move || wait.wait());
+        let published = prepared.commit().expect("publish fork");
+        drop(published);
+        waiter.join().expect("join child");
+
+        // From init: the child, and NOT init itself.
+        assert_eq!(kernel.tasks_for_broadcast(root_id), vec![child_id]);
+        // From the child: init is excluded as init, the child as the caller —
+        // so a lone child broadcasting reaches nobody.
+        assert!(kernel.tasks_for_broadcast(child_id).is_empty());
+
+        kernel
+            .exit_task(child_id, LinuxWaitStatus::from_wait_encoding(0), None)
+            .expect("retire child");
     }
 
     #[test]
