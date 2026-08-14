@@ -88,7 +88,7 @@ pub(crate) struct DispatchPendingSignal {
 /// Real-time signals (`SIGRTMIN`..=`SIGRTMAX`, kernel numbers 32..=64) queue
 /// per POSIX; standard signals (1..=31) coalesce.
 fn is_rt_signal(signum: i32) -> bool {
-    (32..=64).contains(&signum)
+    crate::kernel::LinuxSignal::for_signal_number(signum).is_ok_and(|signal| signal.is_realtime())
 }
 
 /// A cross-process `kill`/`sigqueue` to a *specific* guest process that a plain

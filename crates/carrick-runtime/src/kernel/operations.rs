@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use carrick_abi::LinuxSiginfo;
 use carrick_hal::{KernelTransactionId, ThreadId};
 use parking_lot::{Condvar, Mutex};
 
@@ -13,7 +14,7 @@ use super::core::{
     TaskExitSubscriber, TaskRecord, TaskRevision, VforkChildRelease, VforkParentWait,
     VforkReleaseReason, ZombieRecord,
 };
-use super::ids::{LinuxTid, MmId, ObjectIdError, ProcessGroupId, SessionId, TaskId};
+use super::ids::{LinuxSignal, LinuxTid, MmId, ObjectIdError, ProcessGroupId, SessionId, TaskId};
 use super::objects::{
     Credentials, FileTable, LinuxWaitStatus, Mm, ObjectGraphError, ProcessGroup, Session, Task,
     TaskKey, TaskLifecycle, TaskRef, TaskShared, TaskSharedCloneError, ThreadKey, ThreadRef,
@@ -987,6 +988,53 @@ impl Kernel {
             .collect();
         ids.sort_unstable();
         ids
+    }
+
+    /// Post `signal` into `target`'s process-directed pending queue and report
+    /// whether a live task took it.
+    ///
+    /// This is the delivery half of kernel-internal cross-process signalling:
+    /// on the kernel lane a Linux process is a THREAD of one host process, so
+    /// there is no host pid to `kill(2)` and the signal has to land in the
+    /// kernel's own queue — the same queue [`take_lowest_in`] drains, so a
+    /// signal posted here is indistinguishable from one the task raised on
+    /// itself.
+    ///
+    /// Returns `false` for an unknown or exiting task, which is a `kill(2)`
+    /// `ESRCH` for a specific target and simply "not a member" for a group
+    /// fan-out. The liveness test closes a real race: a task that has begun
+    /// exiting still has a registry entry (it becomes a zombie only once
+    /// reaped), and enqueuing onto it would strand the signal in a queue no
+    /// one will drain.
+    ///
+    /// [`take_lowest_in`]: super::objects::TaskPendingSignals::take_lowest_in
+    ///
+    /// NOTE — this half only makes the signal PENDING. A task that is running
+    /// observes it at its next syscall or trap boundary; a task blocked in a
+    /// host syscall needs a wake, which is deliberately NOT done here because
+    /// the wake is per-lane and this is the lane-neutral kernel.
+    pub fn post_signal_to_task(
+        &self,
+        target: TaskId,
+        signal: LinuxSignal,
+        siginfo: Option<LinuxSiginfo>,
+    ) -> bool {
+        let pending = {
+            let state = self.registry().state.read();
+            let Some(record) = state.tasks.get(&target) else {
+                return false;
+            };
+            if record.task.lifecycle() != TaskLifecycle::Live {
+                return false;
+            }
+            record.task.shared().pending_signals()
+        };
+        if signal.is_realtime() {
+            pending.enqueue_realtime(signal, siginfo);
+        } else {
+            pending.enqueue_standard(signal, siginfo);
+        }
+        true
     }
 
     pub(super) fn retire_mm_io_state_if_unreferenced(&self, target: &Arc<Mm>) {
@@ -3108,6 +3156,137 @@ mod tests {
             .exit_task(child_id, LinuxWaitStatus::from_wait_encoding(0), None)
             .expect("retire child");
         assert_eq!(kernel.tasks_in_process_group(group), vec![root_id]);
+    }
+
+    /// The pending queue of `id`, read the way the task's own drain reads it.
+    fn pending_of(
+        kernel: &Arc<Kernel>,
+        id: TaskId,
+    ) -> Arc<super::super::objects::TaskPendingSignals> {
+        let state = kernel.registry().state.read();
+        state
+            .tasks
+            .get(&id)
+            .expect("task is registered")
+            .task
+            .shared()
+            .pending_signals()
+    }
+
+    /// Fork `parent` and return the child's id, with its start handshake
+    /// completed so the child is a fully published, live task.
+    fn fork_child(kernel: &Arc<Kernel>, parent: &KernelContext, name: &str, tid: i32) -> TaskId {
+        let reservation = kernel
+            .reserve_fork(
+                parent,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                name.to_owned(),
+                None,
+            )
+            .expect("reserve fork");
+        let child_id = reservation.child_id();
+        let mut prepared = reservation
+            .prepare_reference(ThreadId::synthetic_for_tests(tid))
+            .expect("prepare fork");
+        let wait = prepared.take_child_start_wait().expect("child wait");
+        let waiter = std::thread::spawn(move || wait.wait());
+        let published = prepared.commit().expect("publish fork");
+        drop(published);
+        waiter.join().expect("join child");
+        child_id
+    }
+
+    /// The delivery half. A signal posted to another task must land in THAT
+    /// task's pending queue and nowhere else: posting into the sender's queue
+    /// instead is the shape of bug where `killpg` appears to work — the call
+    /// succeeds — while the intended target never sees the signal and the
+    /// SENDER dies of it.
+    #[test]
+    fn a_posted_signal_lands_in_the_target_queue_only() {
+        let (kernel, root) = bootstrap(1);
+        let root_id = root.task().key().id;
+        let child_id = fork_child(&kernel, &root, "signal target", 711);
+
+        let sigterm = LinuxSignal::for_signal_number(15).expect("SIGTERM");
+        assert!(
+            kernel.post_signal_to_task(child_id, sigterm, None),
+            "a live task accepts the signal"
+        );
+
+        assert!(
+            pending_of(&kernel, child_id).present().contains(15),
+            "the signal is pending on the target"
+        );
+        assert!(
+            !pending_of(&kernel, root_id).present().contains(15),
+            "the sender must not have signalled itself"
+        );
+
+        kernel
+            .exit_task(child_id, LinuxWaitStatus::from_wait_encoding(0), None)
+            .expect("retire child");
+    }
+
+    /// Standard signals collapse to a single pending bit however many times
+    /// they are sent; realtime signals QUEUE, one delivery per send. The queue
+    /// picks between the two off `LinuxSignal::is_realtime`, so getting it
+    /// backwards silently drops realtime deliveries (or duplicates standard
+    /// ones) with no error anywhere.
+    #[test]
+    fn realtime_signals_queue_and_standard_signals_collapse() {
+        let (kernel, root) = bootstrap(1);
+        let child_id = fork_child(&kernel, &root, "queue target", 712);
+
+        let sigusr1 = LinuxSignal::for_signal_number(10).expect("SIGUSR1");
+        assert!(!sigusr1.is_realtime());
+        for _ in 0..3 {
+            assert!(kernel.post_signal_to_task(child_id, sigusr1, None));
+        }
+        assert_eq!(
+            pending_of(&kernel, child_id).pending_count(),
+            1,
+            "three sends of a standard signal collapse to one pending delivery"
+        );
+
+        let sigrt = LinuxSignal::for_signal_number(34).expect("SIGRTMIN+2");
+        assert!(sigrt.is_realtime());
+        for _ in 0..3 {
+            assert!(kernel.post_signal_to_task(child_id, sigrt, None));
+        }
+        assert_eq!(
+            pending_of(&kernel, child_id).pending_count(),
+            4,
+            "each realtime send queues its own delivery, alongside the standard one"
+        );
+
+        kernel
+            .exit_task(child_id, LinuxWaitStatus::from_wait_encoding(0), None)
+            .expect("retire child");
+    }
+
+    /// An unknown or already-exiting task reports no delivery. For a specific
+    /// target that is `kill(2)`'s ESRCH; for a group fan-out it is simply "not
+    /// a member". Enqueuing onto an exiting task would strand the signal in a
+    /// queue nobody will drain.
+    #[test]
+    fn posting_to_an_unknown_or_exiting_task_reports_no_delivery() {
+        let (kernel, root) = bootstrap(1);
+        let child_id = fork_child(&kernel, &root, "exiting target", 713);
+        let sigterm = LinuxSignal::for_signal_number(15).expect("SIGTERM");
+
+        let absent = TaskId::from_abi_positive(9_999).expect("unused id");
+        assert!(
+            !kernel.post_signal_to_task(absent, sigterm, None),
+            "a task that does not exist takes no signal"
+        );
+
+        kernel
+            .exit_task(child_id, LinuxWaitStatus::from_wait_encoding(0), None)
+            .expect("retire child");
+        assert!(
+            !kernel.post_signal_to_task(child_id, sigterm, None),
+            "a retired task takes no signal"
+        );
     }
 
     /// `kill(-1)` targets every process the caller may signal EXCEPT itself and
