@@ -216,6 +216,75 @@ pub struct UlockRequeueProbe {
     pub to_logical_wake: u32,
 }
 
+/// Stable outcome boundaries for an HVPatch guest thread clone.
+///
+/// These ordinals are part of the DTrace provider ABI; append, never renumber.
+/// The event names the invoking or reserved Linux tid and carries the errno
+/// returned to the guest (zero at nonterminal progress/success boundaries).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchCloneThreadPhase {
+    AdmissionClosed = 0,
+    AdmissionCancelled = 1,
+    Reserved = 2,
+    HostThreadStarted = 3,
+    ChildCancelledBeforeSlot = 4,
+    Admitted = 5,
+    ChildCancelledBeforeMaterialize = 6,
+    Materialized = 7,
+    ChildCancelledAfterMaterialize = 8,
+    MaterializationFailed = 9,
+    HostThreadSpawnFailed = 10,
+    StartCancelled = 11,
+    ChildPublished = 12,
+    Started = 13,
+    Completed = 14,
+}
+
+impl HvpatchCloneThreadPhase {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Which Linux clone TID output the parent is publishing.
+///
+/// These ordinals are part of the DTrace provider ABI; append, never renumber.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchCloneTidOutput {
+    Parent = 0,
+    Child = 1,
+}
+
+impl HvpatchCloneTidOutput {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Backend result of publishing one Linux clone TID output.
+///
+/// These ordinals mirror `carrick_guest_mem::MemoryError` without exporting
+/// backend error strings through the stable provider ABI. Append, never
+/// renumber.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchCloneTidWriteResult {
+    Success = 0,
+    OutOfBounds = 1,
+    Unsupported = 2,
+    HostMap = 3,
+    SparseBacking = 4,
+    FrameCow = 5,
+}
+
+impl HvpatchCloneTidWriteResult {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
 /// Stable lifecycle phases for Linux processes multiplexed inside one hvpatch VM.
 /// These ordinals are part of the DTrace provider ABI; append, never renumber.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2311,6 +2380,63 @@ mod hvpatch_guest_probe_abi {
     }
 
     #[test]
+    fn mn_clone_outcome_provider_keeps_failure_stages_typed() {
+        assert_eq!(HvpatchCloneThreadPhase::AdmissionClosed.raw(), 0);
+        assert_eq!(HvpatchCloneThreadPhase::AdmissionCancelled.raw(), 1);
+        assert_eq!(HvpatchCloneThreadPhase::Reserved.raw(), 2);
+        assert_eq!(HvpatchCloneThreadPhase::HostThreadStarted.raw(), 3);
+        assert_eq!(HvpatchCloneThreadPhase::ChildCancelledBeforeSlot.raw(), 4);
+        assert_eq!(HvpatchCloneThreadPhase::Admitted.raw(), 5);
+        assert_eq!(
+            HvpatchCloneThreadPhase::ChildCancelledBeforeMaterialize.raw(),
+            6
+        );
+        assert_eq!(HvpatchCloneThreadPhase::Materialized.raw(), 7);
+        assert_eq!(
+            HvpatchCloneThreadPhase::ChildCancelledAfterMaterialize.raw(),
+            8
+        );
+        assert_eq!(HvpatchCloneThreadPhase::MaterializationFailed.raw(), 9);
+        assert_eq!(HvpatchCloneThreadPhase::HostThreadSpawnFailed.raw(), 10);
+        assert_eq!(HvpatchCloneThreadPhase::StartCancelled.raw(), 11);
+        assert_eq!(HvpatchCloneThreadPhase::ChildPublished.raw(), 12);
+        assert_eq!(HvpatchCloneThreadPhase::Started.raw(), 13);
+        assert_eq!(HvpatchCloneThreadPhase::Completed.raw(), 14);
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn mn__clone__outcome(_: i32, _: u32, _: i32) {}",
+            "stub!(mn_clone_outcome(tid: i32, phase: super::HvpatchCloneThreadPhase, errno: i32));",
+        ] {
+            assert!(
+                source.matches(declaration).count() >= 2,
+                "missing M:N clone-outcome ABI declaration {declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn mn_clone_tid_output_provider_keeps_role_and_memory_error_typed() {
+        assert_eq!(HvpatchCloneTidOutput::Parent.raw(), 0);
+        assert_eq!(HvpatchCloneTidOutput::Child.raw(), 1);
+        assert_eq!(HvpatchCloneTidWriteResult::Success.raw(), 0);
+        assert_eq!(HvpatchCloneTidWriteResult::OutOfBounds.raw(), 1);
+        assert_eq!(HvpatchCloneTidWriteResult::Unsupported.raw(), 2);
+        assert_eq!(HvpatchCloneTidWriteResult::HostMap.raw(), 3);
+        assert_eq!(HvpatchCloneTidWriteResult::SparseBacking.raw(), 4);
+        assert_eq!(HvpatchCloneTidWriteResult::FrameCow.raw(), 5);
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn mn__clone__tid__output(_: i32, _: u32, _: u64, _: u32) {}",
+            "stub!(mn_clone_tid_output(",
+        ] {
+            assert!(
+                source.matches(declaration).count() >= 2,
+                "missing M:N clone TID-output ABI declaration {declaration}"
+            );
+        }
+    }
+
+    #[test]
     fn fork_quiesce_detail_keeps_guest_identity_population_and_polling_typed() {
         let event = HvpatchForkQuiesce::new(41, 43, 7, 12, 2_500_000);
         assert_eq!(event.parent_pid(), 41);
@@ -4363,6 +4489,12 @@ mod real {
         /// thread ran on its vCPU while it blocked). A trace can compute the
         /// reclaim/park ratio and spot re-bind storms.
         fn mn__reclaim(_: i32, _: u32, _: u32, _: i32) {}
+        /// HVPatch thread-clone outcome: Linux tid, stable
+        /// `HvpatchCloneThreadPhase` ordinal, and Linux errno (zero on success).
+        fn mn__clone__outcome(_: i32, _: u32, _: i32) {}
+        /// Linux clone TID-output publication: reserved tid, stable output-role
+        /// ordinal, guest address, and stable backend memory-result ordinal.
+        fn mn__clone__tid__output(_: i32, _: u32, _: u64, _: u32) {}
         /// Fires on execve with the joined argv (space-separated), so
         /// dtrace operators can see exactly how the guest invokes a
         /// child (e.g. apt's sqv method calling /usr/bin/sqv).
@@ -4982,6 +5114,19 @@ mod real {
 
     pub fn mn_reclaim(tid: i32, old_slot: u32, new_slot: u32, kind: i32) {
         carrick_usdt::mn__reclaim!(|| (tid, old_slot, new_slot, kind));
+    }
+
+    pub fn mn_clone_outcome(tid: i32, phase: super::HvpatchCloneThreadPhase, errno: i32) {
+        carrick_usdt::mn__clone__outcome!(|| (tid, phase.raw(), errno));
+    }
+
+    pub fn mn_clone_tid_output(
+        tid: i32,
+        output: super::HvpatchCloneTidOutput,
+        address: u64,
+        result: super::HvpatchCloneTidWriteResult,
+    ) {
+        carrick_usdt::mn__clone__tid__output!(|| (tid, output.raw(), address, result.raw()));
     }
 
     /// Per-run lifecycle phase markers (see the `lifecycle` provider doc). Fire one
@@ -6776,6 +6921,13 @@ mod stub {
     stub!(guest_exit(code: i32));
     stub!(mn_admit(tid: i32, slot: u32, budget: u32));
     stub!(mn_reclaim(tid: i32, old_slot: u32, new_slot: u32, kind: i32));
+    stub!(mn_clone_outcome(tid: i32, phase: super::HvpatchCloneThreadPhase, errno: i32));
+    stub!(mn_clone_tid_output(
+        tid: i32,
+        output: super::HvpatchCloneTidOutput,
+        address: u64,
+        result: super::HvpatchCloneTidWriteResult
+    ));
     stub!(lifecycle(phase: u32));
     stub!(hvpatch_guest_lifecycle(event: super::HvpatchGuestLifecycle));
     stub!(hvpatch_guest_fault(event: super::HvpatchGuestFault));

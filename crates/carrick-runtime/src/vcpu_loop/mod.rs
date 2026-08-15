@@ -4287,14 +4287,21 @@ where
                         child_tid_addr,
                         clear_child_tid_addr,
                     )?;
-                    match tid {
+                    let (completed_tid, completed_errno) = match tid {
                         threads::CloneThreadSpawn::Started(tid) => {
                             state.complete_returned(&mut engine, i64::from(tid.raw()))?;
+                            (tid.raw(), 0)
                         }
                         threads::CloneThreadSpawn::Errno(errno) => {
                             state.complete_returned(&mut engine, errno.guest_retval())?;
+                            (state.this_tid.raw(), errno.get())
                         }
-                    }
+                    };
+                    crate::probes::mn_clone_outcome(
+                        completed_tid,
+                        carrick_observability::probes::HvpatchCloneThreadPhase::Completed,
+                        completed_errno,
+                    );
                 }
                 DispatchOutcome::ThreadExit { code } => {
                     return Ok(state.handle_thread_exit(&kernel, &mut engine, code, traps));

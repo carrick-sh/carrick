@@ -138,6 +138,20 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
     pending_process_fork: Option<ParentForkCowRollback>,
 }
 
+/// Bootstrap the live stage-1 editor only when persistent exec left it absent.
+///
+/// Clone publication deliberately writes the parent TID while its vCPU can be
+/// reclaimed. An already-present editor means the sparse backend can resolve an
+/// existing mapping without reading TTBR0 or running maintenance on that parked
+/// vCPU. A genuinely absent editor still takes the historical live-vCPU
+/// bootstrap before any new sparse stage-1 publication.
+fn ensure_sparse_page_table_editor(
+    editor_present: bool,
+    bootstrap: impl FnOnce() -> Result<(), MemoryError>,
+) -> Result<(), MemoryError> {
+    if editor_present { Ok(()) } else { bootstrap() }
+}
+
 struct ParentForkCowRollback {
     page_tables: PageTableManager,
     armed_ranges: Vec<crate::vmm::ForkCowRange>,
@@ -586,10 +600,16 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         if !in_sparse_arena || len == 0 {
             return Ok(());
         }
-        // Persistent exec intentionally drops its software editor. Sparse
-        // materialization publishes new retained outputs, so instantiate the
-        // authoritative manager before the backend transaction begins.
-        self.pt_edit(|_| Ok(false))?;
+        // Persistent exec intentionally drops its software editor. A NEW sparse
+        // materialization needs that editor, so instantiate it before the
+        // backend transaction only when absent. When the editor already exists,
+        // the backend first resolves the process-shared live mapping and does
+        // not invoke the flush closure. This matters at clone publication: the
+        // parent vCPU is deliberately reclaimed while its TID output is written,
+        // so a redundant TTBR0 read from that parked vCPU would fail even though
+        // the target stack is already materialized.
+        let editor_present = self.page_tables.lock().is_some();
+        ensure_sparse_page_table_editor(editor_present, || self.pt_edit(|_| Ok(false)))?;
         let vm = &mut self.vm;
         let vcpu = &mut self.vcpu;
         let mut flush = || Self::run_el1_maintenance_on(vcpu);
@@ -2665,6 +2685,32 @@ mod tests {
             result,
             Err(RepointPrivateError::Indeterminate(MemoryError::HostMap(_)))
         ));
+    }
+
+    #[test]
+    fn existing_sparse_editor_skips_parked_vcpu_bootstrap() {
+        let mut bootstrap_calls = 0;
+        let result = ensure_sparse_page_table_editor(true, || {
+            bootstrap_calls += 1;
+            Err(MemoryError::HostMap(
+                "parked vCPU cannot read TTBR0".to_owned(),
+            ))
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(bootstrap_calls, 0);
+    }
+
+    #[test]
+    fn absent_sparse_editor_preserves_live_vcpu_bootstrap() {
+        let mut bootstrap_calls = 0;
+        let result = ensure_sparse_page_table_editor(false, || {
+            bootstrap_calls += 1;
+            Ok(())
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(bootstrap_calls, 1);
     }
 
     /// The reclaim snapshot (de)serialization round-trips every field bit-exact
