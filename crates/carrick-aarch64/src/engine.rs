@@ -1731,9 +1731,12 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     ) -> Result<Option<carrick_hal::Aarch64CoreRegisters>, TrapError> {
         require_core_fpsimd_authority(self.vm.fpsimd_enabled())?;
         let snapshot = self.vcpu.snapshot()?;
+        let (resume_pc, resume_pstate) = core_resume_pair(self.pending_resume_pc, &snapshot);
         Ok(Some(carrick_hal::Aarch64CoreRegisters {
             gprs: snapshot.gprs,
             sp_el0: snapshot.sp_el0,
+            resume_pc,
+            resume_pstate,
             pc: snapshot.pc,
             pstate: snapshot.pstate,
             elr_el1: snapshot.elr_el1,
@@ -2325,6 +2328,27 @@ fn diagnostic_resume_pc(pending_resume_pc: Option<u64>, live_pc: u64) -> u64 {
     pending_resume_pc.unwrap_or(live_pc)
 }
 
+/// Select the Linux-visible EL0 resume pair for a core note.
+///
+/// A running vCPU force-exited by a cross-thread kick is stopped directly in
+/// EL0: its live PC/PSTATE are current and ELR/SPSR still describe the last
+/// exception (often the pthread entry trampoline). A thread blocked while its
+/// syscall is dispatched is parked in EL1, so the saved ELR/SPSR pair is the
+/// current Linux user state instead. The engine's pending-syscall authority
+/// distinguishes those states without inferring from register values. The
+/// runtime separately binds a synchronous fatal owner's raw ELR/SPSR to its
+/// exact `FatalSignalRecord`.
+fn core_resume_pair(pending_resume_pc: Option<u64>, snapshot: &Aarch64VcpuSnapshot) -> (u64, u64) {
+    if pending_resume_pc.is_some() {
+        (
+            pending_resume_pc.unwrap_or(snapshot.elr_el1),
+            snapshot.spsr_el1,
+        )
+    } else {
+        (snapshot.pc, snapshot.pstate)
+    }
+}
+
 /// Translate a mutable MAP_SHARED futex through the live stage-1 graph.
 ///
 /// Kept separate from `syscall_buffer_ipa`: ordinary high-VA syscall buffers
@@ -2630,6 +2654,26 @@ mod tests {
             0x0040_1234
         );
         assert_eq!(diagnostic_resume_pc(None, 0x0040_5678), 0x0040_5678);
+    }
+
+    #[test]
+    fn core_resume_pair_uses_live_el0_state_outside_a_syscall_trap() {
+        let snapshot = sample();
+        assert_eq!(
+            core_resume_pair(None, &snapshot),
+            (snapshot.pc, snapshot.pstate),
+            "a force-exited running vCPU has a stale ELR from its last exception"
+        );
+    }
+
+    #[test]
+    fn core_resume_pair_uses_saved_el0_state_during_a_syscall_trap() {
+        let snapshot = sample();
+        assert_eq!(
+            core_resume_pair(Some(snapshot.elr_el1), &snapshot),
+            (snapshot.elr_el1, snapshot.spsr_el1),
+            "a dispatcher-blocked vCPU is parked in EL1 with its EL0 pair in ELR/SPSR"
+        );
     }
 
     #[test]

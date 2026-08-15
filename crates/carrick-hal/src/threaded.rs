@@ -690,6 +690,12 @@ pub struct GuestWaitRegisters {
 pub struct Aarch64CoreRegisters {
     pub gprs: [u64; 31],
     pub sp_el0: u64,
+    /// Exact EL0 instruction pointer at the safe point. A vCPU force-exited
+    /// directly from EL0 uses live PC; one parked in a syscall trap uses ELR.
+    pub resume_pc: u64,
+    /// EL0 processor state paired with `resume_pc` (live PSTATE or saved SPSR).
+    pub resume_pstate: u64,
+    /// Raw live vCPU state retained for diagnosis and authority auditing.
     pub pc: u64,
     pub pstate: u64,
     pub elr_el1: u64,
