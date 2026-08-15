@@ -807,7 +807,8 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         // `self.state.reclaim_snapshot` (read by `rebind_to_slot` on the SAME
         // thread), so the engine's serialized bytes are unused — return a zeroed
         // snapshot the engine drops. The vCPU handle is left stale until the wake.
-        self.state.reclaim_park(&mut vcpu.inner)?;
+        self.state
+            .reclaim_park(&mut vcpu.inner, &mut vcpu.mailbox)?;
         Ok(zeroed_snapshot())
     }
 
@@ -815,7 +816,8 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         &mut self,
         vcpu: &mut Self::Vcpu,
     ) -> Result<Aarch64VcpuSnapshot, TrapError> {
-        self.state.shared_wait_park(&mut vcpu.inner)?;
+        self.state
+            .shared_wait_park(&mut vcpu.inner, &mut vcpu.mailbox)?;
         Ok(zeroed_snapshot())
     }
 

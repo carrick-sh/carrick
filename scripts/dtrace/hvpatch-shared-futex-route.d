@@ -12,6 +12,9 @@
  * - carrick*:::hvpatch-syscall-service-clear repeats those four scalars.
  * - carrick*:::futex-route is five scalar CTF values: uint32 host pid,
  *   uint64 guest address, int32 command, int32 shared, uint64 host address.
+ * - carrick*:::mn-admit is three scalar CTF values: int32 Linux tid,
+ *   uint32 slot, uint32 budget; mn-reclaim is int32 Linux tid, uint32 old
+ *   slot, uint32 new slot, int32 kind.
  *
  * PERTURBATION: HIGH for futex-heavy workloads because this prints every futex
  * route. Use only with a small reducer; conclusions are identity/ordering only,
@@ -44,6 +47,22 @@ carrick*:::futex-route
         arg1, (int)arg2, (int)arg3, arg4);
 }
 
+carrick*:::mn-admit
+/(pid == $target || progenyof($target))/
+{
+    admits++;
+    printf("HVPATCHFUTEX1|phase=mn-admit|host_pid=%d|host_tid=%d|linux_tid=%d|slot=%u|budget=%u\n",
+        pid, tid, (int)arg0, (uint32_t)arg1, (uint32_t)arg2);
+}
+
+carrick*:::mn-reclaim
+/(pid == $target || progenyof($target))/
+{
+    reclaims++;
+    printf("HVPATCHFUTEX1|phase=mn-reclaim|host_pid=%d|host_tid=%d|linux_tid=%d|old_slot=%u|new_slot=%u|kind=%d\n",
+        pid, tid, (int)arg0, (uint32_t)arg1, (uint32_t)arg2, (int)arg3);
+}
+
 carrick*:::hvpatch-syscall-service-clear
 /(pid == $target || progenyof($target)) && arg3 == 98/
 {
@@ -55,9 +74,11 @@ carrick*:::hvpatch-syscall-service-clear
 
 tick-1s { seconds++; }
 tick-1s /seconds >= 60/ { timed_out = 1; exit(0); }
+proc:::exit /pid == $target/ { exit(0); }
 
 END
 {
-    printf("HVPATCHFUTEX1|phase=end|routes=%d|timed_out=%d\n", routes, timed_out);
+    printf("HVPATCHFUTEX1|phase=end|routes=%d|admits=%d|reclaims=%d|timed_out=%d\n",
+        routes, admits, reclaims, timed_out);
     exit(routes == 0 ? 1 : 0);
 }

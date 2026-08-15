@@ -7091,6 +7091,32 @@ impl HvfVmState {
             .map_err(hvf_error)
     }
 
+    fn release_mailbox_for_reclaim(&self, binding: &mut MailboxBinding) -> Result<(), TrapError> {
+        binding.release_for_reclaim().map_err(|error| {
+            TrapError::Hypervisor(format!("park AArch64 syscall mailbox: {error}"))
+        })
+    }
+
+    fn reacquire_mailbox_after_vcpu_create(
+        &self,
+        vcpu: &applevisor::vcpu::Vcpu,
+        binding: &mut MailboxBinding,
+    ) -> Result<(), TrapError> {
+        use applevisor::prelude::SysReg;
+
+        let lease = self
+            .mailbox_slots
+            .allocate()
+            .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
+        let address = lease.id().guest_address();
+        let pointer = self.mailbox_host_pointer(lease.id())?;
+        // SAFETY: the allocator lease uniquely owns the complete fixed slot.
+        unsafe { binding.reacquire_after_reclaim(lease, pointer) }.map_err(|error| {
+            TrapError::Hypervisor(format!("resume AArch64 syscall mailbox: {error}"))
+        })?;
+        vcpu.set_sys_reg(SysReg::SP_EL1, address).map_err(hvf_error)
+    }
+
     /// Host pointer backing `[gpa, gpa+len)`, or `None` if unmapped. The
     /// engine's `GuestMemory` copies through this; HVF resolves it via the same
     /// per-thread mapping walk (with the stage-1-IPA disambiguation) the
@@ -8468,6 +8494,7 @@ impl HvfVmState {
     pub(crate) fn reclaim_park(
         &mut self,
         vcpu: &mut applevisor::vcpu::Vcpu,
+        mailbox: &mut MailboxBinding,
     ) -> Result<(), TrapError> {
         let snap = HvfInner::snapshot_vcpu_from(vcpu)?;
         self.reclaim_snapshot = Some(snap);
@@ -8483,6 +8510,7 @@ impl HvfVmState {
                 "reclaim_park: hv_vcpu_destroy rc={rc:#x}"
             )));
         }
+        self.release_mailbox_for_reclaim(mailbox)?;
         Ok(())
     }
 
@@ -8515,7 +8543,7 @@ impl HvfVmState {
         // the (already hv_vcpu_destroy'd) old one — mirror the fork rebuild.
         std::mem::forget(std::mem::replace(vcpu, new_vcpu));
         HvfInner::restore_vcpu_into(vcpu, &snap)?;
-        self.rebind_mailbox_after_vcpu_create(vcpu, mailbox, true)?;
+        self.reacquire_mailbox_after_vcpu_create(vcpu, mailbox)?;
         self.last_exit_class = snap.last_exit_class;
         Ok(())
     }
@@ -8526,6 +8554,7 @@ impl HvfVmState {
     pub(crate) fn shared_wait_park(
         &mut self,
         vcpu: &mut applevisor::vcpu::Vcpu,
+        mailbox: &mut MailboxBinding,
     ) -> Result<(), TrapError> {
         let snap = HvfInner::snapshot_vcpu_from(vcpu)?;
         self.reclaim_snapshot = Some(snap);
@@ -8539,6 +8568,7 @@ impl HvfVmState {
                 "shared_wait_park: hv_vcpu_destroy rc={vcpu_rc:#x}"
             )));
         }
+        self.release_mailbox_for_reclaim(mailbox)?;
         crate::probes::vm_lifecycle(2, -1);
         let vm_rc = unsafe { inventory_hv_vm_destroy() };
         if vm_rc != 0 {
@@ -8708,7 +8738,7 @@ impl HvfVmState {
         }
 
         HvfInner::restore_vcpu_into(vcpu, &snap)?;
-        self.rebind_mailbox_after_vcpu_create(vcpu, mailbox, true)?;
+        self.reacquire_mailbox_after_vcpu_create(vcpu, mailbox)?;
         self.last_exit_class = snap.last_exit_class;
         Ok(())
     }
@@ -13445,9 +13475,9 @@ mod thread_sibling_tests {
         // subtracting the semantic VA selects no word (and routes a shared
         // anonymous futex through the process-private table after fork).
         let view = MappingView {
-            start: 0x9000_0000_00,
-            end: 0x9000_0040_00,
-            ipa: 0xa300_1000_00,
+            start: 0x0090_0000_0000,
+            end: 0x0090_0000_4000,
+            ipa: 0x00a3_0010_0000,
             host_addr: 0x1000usize as *mut u8,
             guest_writable: true,
             sharing: GuestMappingSharing::GlobalShared,
