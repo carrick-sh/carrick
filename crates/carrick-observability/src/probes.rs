@@ -247,6 +247,33 @@ impl HvpatchCloneThreadPhase {
     }
 }
 
+/// Why one HVPatch host vCPU loop stopped representing a Linux thread.
+///
+/// The Linux TID and Carrick `ThreadRegistry` ID are deliberately separate in
+/// the companion probe. They come from independent allocators after a process
+/// fork and cannot be joined by assuming their integer values match. These
+/// ordinals are part of the DTrace provider ABI; append, never renumber.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchThreadTerminalReason {
+    /// The guest issued `exit(2)` for this thread.
+    GuestThreadExit = 0,
+    /// The loop-top liveness check observed that exec removed this registry ID.
+    ExecRegistryGoneAtLoopTop = 1,
+    /// A blocking wait resumed after exec removed this registry ID.
+    ExecRegistryGoneAfterBlockingWait = 2,
+    /// A suspended vfork parent observed true exec/exit cancellation.
+    VforkParentTerminalCancellation = 3,
+    /// Another thread owns process-wide exit or exec teardown.
+    ProcessTerminalLoser = 4,
+}
+
+impl HvpatchThreadTerminalReason {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
 /// Which Linux clone TID output the parent is publishing.
 ///
 /// These ordinals are part of the DTrace provider ABI; append, never renumber.
@@ -2415,6 +2442,34 @@ mod hvpatch_guest_probe_abi {
     }
 
     #[test]
+    fn hvpatch_thread_terminal_provider_keeps_runtime_and_linux_identity_distinct() {
+        assert_eq!(HvpatchThreadTerminalReason::GuestThreadExit.raw(), 0);
+        assert_eq!(
+            HvpatchThreadTerminalReason::ExecRegistryGoneAtLoopTop.raw(),
+            1
+        );
+        assert_eq!(
+            HvpatchThreadTerminalReason::ExecRegistryGoneAfterBlockingWait.raw(),
+            2
+        );
+        assert_eq!(
+            HvpatchThreadTerminalReason::VforkParentTerminalCancellation.raw(),
+            3
+        );
+        assert_eq!(HvpatchThreadTerminalReason::ProcessTerminalLoser.raw(), 4);
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn hvpatch__thread__terminal(_: i32, _: i32, _: i32, _: u32, _: i32) {}",
+            "stub!(hvpatch_thread_terminal(pid: i32, linux_tid: i32, registry_tid: i32, reason: super::HvpatchThreadTerminalReason, detail: i32));",
+        ] {
+            assert!(
+                source.matches(declaration).count() >= 2,
+                "missing HVPatch thread-terminal ABI declaration {declaration}"
+            );
+        }
+    }
+
+    #[test]
     fn mn_clone_tid_output_provider_keeps_role_and_memory_error_typed() {
         assert_eq!(HvpatchCloneTidOutput::Parent.raw(), 0);
         assert_eq!(HvpatchCloneTidOutput::Child.raw(), 1);
@@ -4261,6 +4316,10 @@ mod real {
         /// lets DTrace consumers read and then clear thread-local join state
         /// without relying on action ordering within one probe clause.
         fn hvpatch__syscall__service__clear(_: i32, _: i32, _: u32, _: u64) {}
+        /// Exact reason one HVPatch vCPU loop stopped representing a Linux
+        /// thread. Args: Linux PID, Linux TID, Carrick registry TID, typed
+        /// terminal reason, and reason-specific detail (guest exit code or 0).
+        fn hvpatch__thread__terminal(_: i32, _: i32, _: i32, _: u32, _: i32) {}
         /// Fail-closed Linux core lifecycle. Args: phase, Linux PID/TID,
         /// task-local capture generation, outcome (0=in progress/success,
         /// nonzero=failed at this phase).
@@ -5123,6 +5182,23 @@ mod real {
 
     pub fn mn_clone_outcome(tid: i32, phase: super::HvpatchCloneThreadPhase, errno: i32) {
         carrick_usdt::mn__clone__outcome!(|| (tid, phase.raw(), errno));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_thread_terminal(
+        pid: i32,
+        linux_tid: i32,
+        registry_tid: i32,
+        reason: super::HvpatchThreadTerminalReason,
+        detail: i32,
+    ) {
+        carrick_usdt::hvpatch__thread__terminal!(|| (
+            pid,
+            linux_tid,
+            registry_tid,
+            reason.raw(),
+            detail
+        ));
     }
 
     pub fn mn_clone_tid_output(
@@ -6931,6 +7007,7 @@ mod stub {
     stub!(mn_admit(tid: i32, slot: u32, budget: u32));
     stub!(mn_reclaim(tid: i32, old_slot: u32, new_slot: u32, kind: i32));
     stub!(mn_clone_outcome(tid: i32, phase: super::HvpatchCloneThreadPhase, errno: i32));
+    stub!(hvpatch_thread_terminal(pid: i32, linux_tid: i32, registry_tid: i32, reason: super::HvpatchThreadTerminalReason, detail: i32));
     stub!(mn_clone_tid_output(
         tid: i32,
         output: super::HvpatchCloneTidOutput,

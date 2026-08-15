@@ -140,6 +140,40 @@ fn try_begin_hvpatch_process_fork(
     Some(reserve_hvpatch_process_vcpu_lease(scheduler, tid))
 }
 
+enum ProcessForkStart<'a> {
+    Busy,
+    AdmissionClosed,
+    Admitted {
+        reserved_child_vcpu: ReservedProcessVcpuLease,
+        admission: CloneAdmissionPermit<'a>,
+    },
+}
+
+/// Serialize process forks before enrolling the winner in clone admission.
+///
+/// A losing forker is a registered sibling that the winner must quiesce. It
+/// must therefore own no admission permit while it parks behind the process
+/// barrier; otherwise the winner's admission drain cancels the loser and leaks
+/// an internal arbitration event to Linux as `EAGAIN`.
+fn try_begin_hvpatch_process_fork_with_admission<'a>(
+    barrier: &crate::fork_quiesce::QuiesceBarrier,
+    scheduler: &'static dyn carrick_hal::VcpuScheduler,
+    tid: ThreadId,
+    admission_gate: &'a CloneAdmissionGate,
+) -> ProcessForkStart<'a> {
+    let Some(reserved_child_vcpu) = try_begin_hvpatch_process_fork(barrier, scheduler, tid) else {
+        return ProcessForkStart::Busy;
+    };
+    let Some(admission) = admission_gate.try_enroll_process_fork(tid) else {
+        barrier.end_fork();
+        return ProcessForkStart::AdmissionClosed;
+    };
+    ProcessForkStart::Admitted {
+        reserved_child_vcpu,
+        admission,
+    }
+}
+
 /// Process-wide fork quiesce barrier (defined in `fork_quiesce` so the blocking
 /// wait predicates can reach the same instance).
 pub(crate) fn fork_barrier() -> &'static crate::fork_quiesce::QuiesceBarrier {
@@ -1016,39 +1050,54 @@ where
                 return Ok(Some(crate::linux_abi::LINUX_EINVAL.guest_retval()));
             }
         };
-        // Process forks and thread clones mutate the same authoritative task.
-        // Enroll both in the exec/exit admission gate so exec cannot reserve
-        // the task while a fork is preparing it (and a fork cannot enter once
-        // exec has begun its destructive transaction).
-        let Some(process_fork_admission) = kernel.try_enroll_clone() else {
-            return Ok(Some(crate::linux_abi::LINUX_EAGAIN.guest_retval()));
-        };
-        if kernel.process_exiting() || process_fork_admission.is_cancelled() {
-            return Ok(Some(crate::linux_abi::LINUX_EAGAIN.guest_retval()));
-        }
         // Serialize process forks BEFORE waiting for a child vCPU. A losing
         // concurrent forker is itself one of the registered siblings the
         // winner must drain; if it waits in scheduler admission first, it can
         // never observe the winner's quiesce request and both forks deadlock.
-        // The winner still reserves before quiescing or taking the shared-VM
-        // topology lock: an existing slot owner may need that lock to reach its
-        // blocking-wait reclaim. The lease is not installed in this parent
-        // thread; its RAII owner moves to the child below.
-        let reserved_child_vcpu = loop {
-            if process_fork_admission.is_cancelled() {
-                return Ok(Some(crate::linux_abi::LINUX_EAGAIN.guest_retval()));
-            }
-            if let Some(reserved) = try_begin_hvpatch_process_fork(
+        // Only the coordinator winner enrolls in clone admission. A loser owns
+        // no permit while it parks, so the winner cannot turn ordinary fork
+        // concurrency into a guest-visible EAGAIN. The winner still reserves
+        // child capacity before quiescing or taking the shared-VM topology lock:
+        // an existing slot owner may need that lock to reach a reclaim-safe wait.
+        let (reserved_child_vcpu, process_fork_admission) = loop {
+            match try_begin_hvpatch_process_fork_with_admission(
                 process_barrier,
                 carrick_hal::vcpu_sched::global(),
                 self.this_tid,
+                &kernel.clone_admission,
             ) {
-                break reserved;
+                ProcessForkStart::Admitted {
+                    reserved_child_vcpu,
+                    admission,
+                } => break (reserved_child_vcpu, admission),
+                ProcessForkStart::AdmissionClosed => {
+                    return Ok(Some(crate::linux_abi::LINUX_EAGAIN.guest_retval()));
+                }
+                ProcessForkStart::Busy => {}
             }
             if process_barrier.is_quiescing() {
                 self.release_and_park_vcpu_for_fork(engine)?;
             }
             std::thread::yield_now();
+        };
+        if kernel.process_exiting() || process_fork_admission.is_cancelled() {
+            process_barrier.end_fork();
+            return Ok(Some(crate::linux_abi::LINUX_EAGAIN.guest_retval()));
+        }
+        // The process-fork coordinator above serializes competing forks, but
+        // thread clones can still enroll against the same parent task. Close
+        // clone admission before reserving the kernel transaction, then let
+        // every clone which enrolled before this close finish publication.
+        // Otherwise a new clone can take the task reservation after this fork
+        // starts and then remain registered while waiting for the reservation,
+        // forming a circular wait with sibling quiescence.
+        let fork_clone_admission = match process_fork_admission.close_for_fork(self.this_tid) {
+            Ok(admission) => admission,
+            Err(error) => {
+                process_barrier.end_fork();
+                tracing::warn!(%error, "hvpatch fork lost clone-admission ownership; fork(2) = EAGAIN");
+                return Ok(Some(crate::linux_abi::LINUX_EAGAIN.guest_retval()));
+            }
         };
         let parent_pid = parent_process.pid();
         let forking_tid = self.this_tid.raw();
@@ -1146,7 +1195,20 @@ where
         );
 
         fork_stage_started = Instant::now();
-        let shares_mm = clone_plan.mm() == crate::kernel::CloneObjectMode::Share;
+        if process_fork_admission.is_cancelled() {
+            if quiesced {
+                process_barrier.end_quiesce();
+            }
+            process_barrier.end_fork();
+            return Ok(Some(crate::linux_abi::LINUX_EAGAIN.guest_retval()));
+        }
+        // Clone admission is closed and all previously enrolled clone
+        // publications have drained before quiescence. Take the authoritative
+        // task transaction only after every sibling has either parked or
+        // completed its exit transaction. Reserving it before quiescence forms
+        // a cycle with a sibling which starts exit concurrently: the fork owns
+        // the task and waits for the sibling registration, while the sibling
+        // remains registered waiting for the task reservation.
         let reservation = match parent_process.kernel_graph().reserve_fork(
             parent_context,
             clone_plan,
@@ -1163,6 +1225,7 @@ where
                 return Ok(Some(crate::linux_abi::LINUX_EAGAIN.guest_retval()));
             }
         };
+        let shares_mm = clone_plan.mm() == crate::kernel::CloneObjectMode::Share;
         let child_id = reservation.child_id();
         let child_pid = child_id.raw();
         let prepared_mm = match parent_process.mm_resources().prepare_child() {
@@ -1729,8 +1792,10 @@ where
         }
         process_barrier.end_fork();
         // Publication is now authoritative and the child has its execution
-        // owner. Release admission before a possible vfork parent wait: a
-        // sibling exec must be able to replace a vfork-suspended caller.
+        // owner. Reopen clone admission and release the process-fork permit
+        // before a possible vfork parent wait: a sibling exec must be able to
+        // replace a vfork-suspended caller.
+        drop(fork_clone_admission);
         drop(process_fork_admission);
         child_process.trace_lifecycle(
             carrick_observability::probes::HvpatchGuestLifecyclePhase::Fork,
@@ -1757,7 +1822,7 @@ where
                 // exit retires it. Return the typed no-retval outcome so the run
                 // loop performs ordinary thread cleanup instead of completing
                 // the obsolete fork syscall or waiting forever for the child.
-                if kernel.process_exiting() || kernel.clone_admission_cancelled() {
+                if kernel.process_exiting() || kernel.clone_admission_terminal_cancelled() {
                     return Ok(None);
                 }
                 // A suspended vfork parent still owns a registered vCPU. Let a
@@ -1825,32 +1890,40 @@ mod pt_pause_tests {
     }
 
     #[test]
-    fn losing_hvpatch_fork_does_not_wait_for_child_vcpu_capacity() {
+    fn losing_hvpatch_fork_does_not_enroll_clone_admission_or_wait_for_capacity() {
         use carrick_hal::VcpuScheduler;
 
         let barrier: &'static crate::fork_quiesce::QuiesceBarrier =
             Box::leak(Box::new(crate::fork_quiesce::QuiesceBarrier::new()));
         assert!(barrier.try_begin_fork(), "model winner owns the fork token");
+        let admission: &'static CloneAdmissionGate =
+            Box::leak(Box::new(CloneAdmissionGate::default()));
         let scheduler: &'static carrick_hal::vcpu_sched::HostCondvarScheduler = Box::leak(
             Box::new(carrick_hal::vcpu_sched::HostCondvarScheduler::new(1)),
         );
         let occupied = scheduler.acquire(1_611);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let waiter = std::thread::spawn(move || {
-            tx.send(try_begin_hvpatch_process_fork(
+            tx.send(try_begin_hvpatch_process_fork_with_admission(
                 barrier,
                 scheduler,
                 tid(1_612),
+                admission,
             ))
             .unwrap();
+            admission.state.lock().in_flight
         });
 
         let outcome = rx
             .recv_timeout(Duration::from_millis(20))
             .expect("a losing forker must not wait behind the scheduler");
-        assert!(outcome.is_none());
+        assert!(matches!(outcome, ProcessForkStart::Busy));
         scheduler.release(occupied, carrick_hal::Yield::Exited);
-        waiter.join().unwrap();
+        assert_eq!(
+            waiter.join().unwrap(),
+            0,
+            "the loser owns no admission permit"
+        );
         barrier.end_fork();
     }
 
