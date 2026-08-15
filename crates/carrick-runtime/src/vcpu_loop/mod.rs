@@ -106,6 +106,14 @@ fn should_reclaim_vcpu_for_timed_wait(timeout: Option<Duration>) -> bool {
     }
 }
 
+fn should_keep_vcpu_for_blocking_wait(
+    force_reclaim: bool,
+    has_spare_capacity: bool,
+    has_waiters: bool,
+) -> bool {
+    !force_reclaim && has_spare_capacity && !has_waiters
+}
+
 fn threaded_fd_wait_should_interrupt(fork_quiescing: bool, dispatch_pending: bool) -> bool {
     // Internal stop-the-world edges outrank guest-visible fd readiness. An
     // always-ready host fd can otherwise make the wait return Ready forever,
@@ -2047,10 +2055,20 @@ where
         engine: &mut E,
         park_class: crate::thread::VcpuParkClass,
     ) -> Option<BlockingWaitReclaim> {
+        self.park_vcpu_for_blocking_wait_with_policy(engine, park_class, false)
+    }
+
+    fn park_vcpu_for_blocking_wait_with_policy(
+        &self,
+        engine: &mut E,
+        park_class: crate::thread::VcpuParkClass,
+        force_reclaim: bool,
+    ) -> Option<BlockingWaitReclaim> {
         if !engine.reclaims() {
             return None;
         }
-        // KEEP the vCPU when the pool is uncontended.
+        // KEEP the vCPU when the pool is uncontended, unless the caller has
+        // already classified this wait as long enough to yield proactively.
         //
         // `has_waiters`/`has_spare_capacity` were written for exactly this and
         // then never called from anywhere in the workspace, so every blocking
@@ -2066,7 +2084,11 @@ where
         // future waiter runs would otherwise deadlock that waiter. And an
         // existing waiter means release now, spare capacity or not.
         let scheduler = carrick_hal::vcpu_sched::global();
-        if scheduler.has_spare_capacity() && !scheduler.has_waiters() {
+        if should_keep_vcpu_for_blocking_wait(
+            force_reclaim,
+            scheduler.has_spare_capacity(),
+            scheduler.has_waiters(),
+        ) {
             return None;
         }
         let park_started = std::time::Instant::now();
@@ -2274,7 +2296,7 @@ where
         park_class: crate::thread::VcpuParkClass,
     ) -> Option<BlockingWaitReclaim> {
         if should_reclaim_vcpu_for_timed_wait(timeout) {
-            self.park_vcpu_for_blocking_wait(engine, park_class)
+            self.park_vcpu_for_blocking_wait_with_policy(engine, park_class, true)
         } else {
             None
         }
@@ -5565,6 +5587,13 @@ mod tests {
         assert!(should_reclaim_vcpu_for_timed_wait(Some(
             SHORT_TIMED_WAIT_RECLAIM_CUTOFF + Duration::from_millis(1)
         )));
+        assert!(should_keep_vcpu_for_blocking_wait(false, true, false));
+        assert!(!should_keep_vcpu_for_blocking_wait(false, false, false));
+        assert!(!should_keep_vcpu_for_blocking_wait(false, true, true));
+        assert!(
+            !should_keep_vcpu_for_blocking_wait(true, true, false),
+            "a selected long wait must release its slot before future admissions queue"
+        );
     }
 
     #[test]
