@@ -12990,7 +12990,7 @@ mod hvpatch_in_process_fork_tests {
     }
 
     #[test]
-    fn hvpatch_process_exit_drops_inherited_host_pipe_writer() {
+    fn hvpatch_exit_notification_observes_retired_inherited_pipe_writer() {
         let mut host_fds = [-1; 2];
         assert_eq!(unsafe { libc::pipe(host_fds.as_mut_ptr()) }, 0);
         let read_host_fd = host_fds[0];
@@ -13051,13 +13051,18 @@ mod hvpatch_in_process_fork_tests {
 
         child_context
             .kernel()
-            .exit_task(
-                child_context.task().key().id,
+            .exit_task_key_eventually_notifying(
+                child_context.task().key(),
                 crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
                 None,
+                |_| {
+                    child.retire_hvpatch_process_fds(&child_context);
+                    pollfd.revents = 0;
+                    assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 1);
+                    assert_ne!(pollfd.revents & libc::POLLHUP, 0);
+                },
             )
             .unwrap();
-        child.retire_hvpatch_process_fds(&child_context);
 
         pollfd.revents = 0;
         assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 1);

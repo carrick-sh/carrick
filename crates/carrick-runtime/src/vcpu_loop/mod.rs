@@ -4672,6 +4672,18 @@ where
                 let orphan_adopter = kernel.dispatcher.hvpatch_orphan_adopter();
                 let current_parent =
                     match process.publish_exit_status(published_status, orphan_adopter, |parent| {
+                        // Linux has already closed every child descriptor when
+                        // SIGCHLD or wait(2) makes exit observable. HVPatch
+                        // multiplexes processes in one host, so `_exit` cannot
+                        // supply that ordering for us. The Kernel invokes this
+                        // callback after removing the exact task generation but
+                        // before releasing its exit reservation: retire the
+                        // table here, then wake the parent. Retiring afterward
+                        // lets an interrupted edge-triggered epoll resample the
+                        // pipe before its last writer disappears and lose HUP.
+                        kernel
+                            .dispatcher
+                            .retire_hvpatch_process_fds(&terminal_context);
                         if child {
                             kernel.notify_hvpatch_parent_exit(parent);
                         }
@@ -4712,9 +4724,6 @@ where
                         "published HVPatch Linux core"
                     );
                 }
-                kernel
-                    .dispatcher
-                    .retire_hvpatch_process_fds(&terminal_context);
                 tracing::trace!(
                     pid = process.pid(),
                     exit_code = published_exit_code,
