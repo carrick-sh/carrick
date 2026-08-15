@@ -48,8 +48,8 @@ pub const NOTE_OWNER: &[u8] = b"CORE\0";
 pub const NOTE_ALIGN: usize = 4;
 
 pub const ELF_CLASS64: u8 = 2;
-const ELF_DATA_LSB: u8 = 1;
-const ELF_VERSION_CURRENT: u8 = 1;
+pub const ELF_DATA_LSB: u8 = 1;
+pub const ELF_VERSION_CURRENT: u8 = 1;
 pub const ET_CORE: u16 = 4;
 pub const EM_AARCH64: u16 = 183;
 pub const PT_LOAD: u32 = 1;
@@ -186,6 +186,8 @@ pub enum CoreDumpError {
     CrashingThreadNotFirst { signal: i32 },
     #[error("core memory region at {start:#x} has {bytes} bytes for a {size}-byte mapping")]
     RegionContentsTooLarge { start: u64, bytes: usize, size: u64 },
+    #[error("core memory regions overlap at {start:#x} (previous end {previous_end:#x})")]
+    OverlappingRegions { previous_end: u64, start: u64 },
     #[error("core requires {required} bytes, exceeding RLIMIT_CORE {limit}")]
     LimitExceeded { limit: u64, required: u64 },
     #[error("core has {count} program headers, exceeding ELF64 e_phnum")]
@@ -274,6 +276,7 @@ fn validate_serialized_core(
 
     let mut note_range = None;
     let mut load_count = 0usize;
+    let mut load_vmas = Vec::with_capacity(expected_loads);
     for index in 0..phnum {
         let at = phoff
             .checked_add(
@@ -311,12 +314,24 @@ fn validate_serialized_core(
                 if u64::try_from(filesz).map_or(true, |size| size > memsz) {
                     return Err(invalid("PT_LOAD filesz exceeds memsz"));
                 }
+                let vaddr = read_u64(bytes, at + 16)
+                    .ok_or_else(|| invalid("missing PT_LOAD virtual address"))?;
+                let vma_end = vaddr
+                    .checked_add(memsz)
+                    .ok_or_else(|| invalid("PT_LOAD virtual range overflow"))?;
+                if memsz != 0 {
+                    load_vmas.push((vaddr, vma_end));
+                }
             }
             _ => return Err(invalid("unexpected program-header type")),
         }
     }
     if load_count != expected_loads {
         return Err(invalid("PT_LOAD count differs from snapshot"));
+    }
+    load_vmas.sort_unstable();
+    if load_vmas.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return Err(invalid("overlapping PT_LOAD virtual ranges"));
     }
     let (mut cursor, note_end) = note_range.ok_or_else(|| invalid("missing PT_NOTE"))?;
     let mut note_count = 0usize;
@@ -656,12 +671,29 @@ impl CoreDump<'_> {
                 return Err(CoreDumpError::DuplicateTid(thread.tid));
             }
         }
+        let mut region_vmas = Vec::with_capacity(self.regions.len());
         for region in &self.regions {
             if region.bytes.len() as u64 > region.size {
                 return Err(CoreDumpError::RegionContentsTooLarge {
                     start: region.start,
                     bytes: region.bytes.len(),
                     size: region.size,
+                });
+            }
+            let end = region
+                .start
+                .checked_add(region.size)
+                .ok_or(CoreDumpError::LayoutOverflow)?;
+            if region.size != 0 {
+                region_vmas.push((region.start, end));
+            }
+        }
+        region_vmas.sort_unstable();
+        for pair in region_vmas.windows(2) {
+            if pair[0].1 > pair[1].0 {
+                return Err(CoreDumpError::OverlappingRegions {
+                    previous_end: pair[0].1,
+                    start: pair[1].0,
                 });
             }
         }
@@ -1078,6 +1110,47 @@ mod tests {
         let filesz = phoff + std::mem::offset_of!(wire::Elf64Phdr, p_filesz);
         bad_note[filesz..filesz + 8].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(validate_serialized_core(&bad_note, 0, 0).is_err());
+    }
+
+    #[test]
+    fn writer_and_serialized_validator_reject_overlapping_load_vmas() {
+        let mut overlapping = sample();
+        overlapping.regions = vec![
+            MemoryRegion {
+                start: 0x1000,
+                flags: region_flags(true, true, false),
+                bytes: &[],
+                size: 0x2000,
+            },
+            MemoryRegion {
+                start: 0x2000,
+                flags: region_flags(true, false, false),
+                bytes: &[],
+                size: 0x1000,
+            },
+        ];
+        assert!(overlapping.to_bytes_bounded(u64::MAX).is_err());
+
+        let mut partitioned = sample();
+        partitioned.regions = vec![
+            MemoryRegion {
+                start: 0x1000,
+                flags: region_flags(true, true, false),
+                bytes: &[],
+                size: 0x1000,
+            },
+            MemoryRegion {
+                start: 0x2000,
+                flags: region_flags(true, false, false),
+                bytes: &[],
+                size: 0x1000,
+            },
+        ];
+        let mut bytes = partitioned.to_bytes();
+        let second_load = usize::from(EHDR_SIZE) + (2 * usize::from(PHDR_SIZE));
+        let vaddr = second_load + std::mem::offset_of!(wire::Elf64Phdr, p_vaddr);
+        bytes[vaddr..vaddr + 8].copy_from_slice(&0x1800_u64.to_le_bytes());
+        assert!(validate_serialized_core(&bytes, 2, 10).is_err());
     }
 }
 
