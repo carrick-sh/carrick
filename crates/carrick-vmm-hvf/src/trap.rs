@@ -3998,6 +3998,17 @@ fn release_global_frame_ipa(base: u64, length: u64) -> Result<(), TrapError> {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn release_retired_stage2_ipa(base: u64, length: u64) -> Result<(), TrapError> {
+    // Boot identity mappings and fixed root slots are stage-2 extents but were
+    // never allocated from the reusable global-frame arena. They still need
+    // unmapping; they must not be presented as allocator releases.
+    if !is_reusable_global_frame_extent(base, length) {
+        return Ok(());
+    }
+    release_global_frame_ipa(base, length)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
 struct GlobalFrameStage2Lease {
     base: u64,
@@ -4467,7 +4478,7 @@ impl HvfVmState {
                 "retire HVPatch stage-2 extent IPA 0x{ipa:x} size {size} failed: 0x{rc:x}"
             )));
         }
-        release_global_frame_ipa(ipa, length)?;
+        release_retired_stage2_ipa(ipa, length)?;
         Ok(())
     }
 
@@ -13130,6 +13141,11 @@ mod frame_inventory_backend_tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn fixed_identity_stage2_retirement_does_not_release_global_allocator() {
+        assert!(release_retired_stage2_ipa(0x1_0000_0000, 0x70_0000).is_ok());
     }
 
     #[test]
