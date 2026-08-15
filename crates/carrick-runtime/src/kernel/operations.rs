@@ -1166,6 +1166,95 @@ impl Kernel {
         true
     }
 
+    /// Make the calling task a `PTRACE_TRACEME` tracee owned by its exact
+    /// current parent generation. HVPatch tasks share one host process, so
+    /// this relation must live in the guest task graph rather than Darwin's
+    /// process-wide ptrace state.
+    pub(crate) fn claim_ptrace_traceme(&self, context: &KernelContext) -> bool {
+        if !context.kernel().task_key_is_live(context.task().key()) {
+            return false;
+        }
+        let Some(tracer) = context.task().parent() else {
+            return false;
+        };
+        if self.live_task_key(tracer.id) != Some(tracer) {
+            return false;
+        }
+        context.task().claim_ptrace_traceme(tracer)
+    }
+
+    pub(crate) fn stop_task_for_ptrace(&self, target: TaskId, signal: LinuxSignal) -> bool {
+        let task = {
+            let state = self.registry().state.read();
+            let Some(record) = state.tasks.get(&target) else {
+                return false;
+            };
+            if record.task.lifecycle() != TaskLifecycle::Live {
+                return false;
+            }
+            Arc::clone(&record.task)
+        };
+        if !task.stop_for_ptrace(signal) {
+            return false;
+        }
+        let parent = self.current_parent_task(&task);
+        task.wake();
+        if let Some(parent) = parent {
+            parent.wake();
+        }
+        true
+    }
+
+    pub(crate) fn resume_task_from_ptrace(
+        &self,
+        tracer: TaskKey,
+        target: TaskId,
+        signal: Option<LinuxSignal>,
+    ) -> bool {
+        let task = {
+            let state = self.registry().state.read();
+            let Some(record) = state.tasks.get(&target) else {
+                return false;
+            };
+            if record.task.lifecycle() != TaskLifecycle::Live {
+                return false;
+            }
+            Arc::clone(&record.task)
+        };
+        if !task.resume_from_ptrace(tracer, signal) {
+            return false;
+        }
+        task.wake();
+        true
+    }
+
+    pub(crate) fn detach_task_from_ptrace(&self, tracer: TaskKey, target: TaskId) -> bool {
+        let task = {
+            let state = self.registry().state.read();
+            let Some(record) = state.tasks.get(&target) else {
+                return false;
+            };
+            if record.task.lifecycle() != TaskLifecycle::Live {
+                return false;
+            }
+            Arc::clone(&record.task)
+        };
+        if !task.detach_from_ptrace(tracer) {
+            return false;
+        }
+        task.wake();
+        true
+    }
+
+    pub(crate) fn consume_ptrace_resume_signal(&self, target: TaskId, signal: LinuxSignal) -> bool {
+        self.registry()
+            .state
+            .read()
+            .tasks
+            .get(&target)
+            .is_some_and(|record| record.task.consume_ptrace_resume_signal(signal))
+    }
+
     /// Resume one stopped Linux task. Returning false means the task was live
     /// but already running (or absent); SIGCONT delivery itself may still
     /// succeed and may still invoke a caught handler.
@@ -3190,7 +3279,7 @@ impl Kernel {
             return Ok(WaitOutcome::Exited(zombie));
         }
 
-        if job_control.stopped || job_control.continued {
+        {
             let state_change = state.tasks.iter().find_map(|(id, record)| {
                 (record.task.parent() == Some(parent)
                     && process_group.is_none_or(|group| record.task.process_group() == group)
@@ -4298,6 +4387,53 @@ mod tests {
                 )
                 .expect("wait continued child"),
             WaitOutcome::Continued { task: child_id }
+        );
+    }
+
+    #[test]
+    fn ptrace_stop_is_plain_waitable_and_only_exact_tracer_can_resume() {
+        let (kernel, root) = bootstrap(1);
+        let child = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(7_088),
+                "ptrace child".to_owned(),
+                None,
+            )
+            .expect("fork child");
+        let child_id = child.task().key().id;
+        let signal = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGUSR1).expect("SIGUSR1");
+
+        assert!(kernel.claim_ptrace_traceme(&child));
+        assert!(kernel.stop_task_for_ptrace(child_id, signal));
+        assert_eq!(
+            kernel
+                .wait_child(root.task().key().id, Some(child_id), WaitMode::Consume)
+                .expect("plain wait sees ptrace stop"),
+            WaitOutcome::Stopped {
+                task: child_id,
+                signal,
+            }
+        );
+        assert!(!kernel.resume_task_from_ptrace(child.task().key(), child_id, None,));
+        assert!(kernel.resume_task_from_ptrace(root.task().key(), child_id, Some(signal),));
+        assert!(
+            child
+                .task()
+                .shared()
+                .pending_signals()
+                .take_lowest_in(SigSet::EMPTY.with(signal.raw()))
+                .is_some(),
+            "ptrace signal injection is queued before the stopped task wakes",
+        );
+        assert!(kernel.consume_ptrace_resume_signal(child_id, signal));
+        assert!(!kernel.consume_ptrace_resume_signal(child_id, signal));
+        assert_eq!(
+            kernel
+                .wait_child(root.task().key().id, Some(child_id), WaitMode::Observe)
+                .expect("resumed child remains live"),
+            WaitOutcome::StillRunning,
         );
     }
 

@@ -2261,6 +2261,10 @@ enum DefaultStopGeneration {
 struct TaskJobControl {
     stopped_by: Option<LinuxSignal>,
     pending_stop: Option<LinuxSignal>,
+    pending_stop_is_ptrace: bool,
+    stopped_by_ptrace: bool,
+    ptrace_tracer: Option<TaskKey>,
+    ptrace_resume_signal: Option<LinuxSignal>,
     pending_continue: bool,
     stop_invalidation_generation: u64,
     default_stop_generation: DefaultStopGeneration,
@@ -2531,6 +2535,101 @@ impl Task {
         self.job_control.lock().stopped_by.is_some()
     }
 
+    pub(super) fn claim_ptrace_traceme(&self, tracer: TaskKey) -> bool {
+        let lifecycle = self.lifecycle.lock();
+        if *lifecycle != TaskLifecycle::Live {
+            return false;
+        }
+        let mut state = self.job_control.lock();
+        if state.ptrace_tracer.is_some() {
+            return false;
+        }
+        state.ptrace_tracer = Some(tracer);
+        true
+    }
+
+    pub(super) fn stop_for_ptrace(&self, signal: LinuxSignal) -> bool {
+        let lifecycle = self.lifecycle.lock();
+        if *lifecycle != TaskLifecycle::Live {
+            return false;
+        }
+        let mut state = self.job_control.lock();
+        if state.ptrace_tracer.is_none() {
+            return false;
+        }
+        if state.stopped_by.is_some() {
+            return state.stopped_by_ptrace;
+        }
+        state.stopped_by = Some(signal);
+        state.pending_stop = Some(signal);
+        state.pending_stop_is_ptrace = true;
+        state.stopped_by_ptrace = true;
+        true
+    }
+
+    pub(super) fn resume_from_ptrace(&self, tracer: TaskKey, signal: Option<LinuxSignal>) -> bool {
+        let signal_generation = self.lock_signal_generation();
+        let lifecycle = self.lifecycle.lock();
+        if *lifecycle != TaskLifecycle::Live {
+            return false;
+        }
+        {
+            let state = self.job_control.lock();
+            if state.ptrace_tracer != Some(tracer) || !state.stopped_by_ptrace {
+                return false;
+            }
+        }
+        if let Some(signal) = signal {
+            self.discard_opposing_job_control_signals(signal);
+            self.record_job_control_signal_generation(signal);
+            let pending = self.shared().pending_signals();
+            if signal.is_realtime() {
+                pending.enqueue_realtime(signal, None);
+            } else {
+                pending.enqueue_standard(signal, None);
+            }
+        }
+        {
+            let mut state = self.job_control.lock();
+            state.ptrace_resume_signal = signal;
+            state.stopped_by = None;
+            state.stopped_by_ptrace = false;
+        }
+        drop(lifecycle);
+        drop(signal_generation);
+        self.job_control_changed.notify_all();
+        true
+    }
+
+    pub(super) fn detach_from_ptrace(&self, tracer: TaskKey) -> bool {
+        let lifecycle = self.lifecycle.lock();
+        if *lifecycle != TaskLifecycle::Live {
+            return false;
+        }
+        let mut state = self.job_control.lock();
+        if state.ptrace_tracer != Some(tracer) {
+            return false;
+        }
+        state.ptrace_tracer = None;
+        state.ptrace_resume_signal = None;
+        if state.stopped_by_ptrace {
+            state.stopped_by = None;
+            state.stopped_by_ptrace = false;
+            self.job_control_changed.notify_all();
+        }
+        true
+    }
+
+    pub(super) fn consume_ptrace_resume_signal(&self, signal: LinuxSignal) -> bool {
+        let mut state = self.job_control.lock();
+        if state.ptrace_resume_signal == Some(signal) {
+            state.ptrace_resume_signal = None;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Serialize Linux job-control generation and delivery-state transitions
     /// for this task. The guard is deliberately task-local: distinct Linux
     /// processes in HVPatch remain independent even though they share one host
@@ -2659,6 +2758,8 @@ impl Task {
         }
         state.stopped_by = Some(signal);
         state.pending_stop = Some(signal);
+        state.pending_stop_is_ptrace = false;
+        state.stopped_by_ptrace = false;
         true
     }
 
@@ -2670,6 +2771,8 @@ impl Task {
         let mut state = self.job_control.lock();
         let changed = state.stopped_by.take().is_some();
         if changed {
+            state.stopped_by_ptrace = false;
+            state.ptrace_resume_signal = None;
             if publish_continued {
                 state.pending_continue = true;
             }
@@ -2692,11 +2795,14 @@ impl Task {
         self.resume_from_job_control(false)
     }
 
-    pub(crate) fn wait_until_job_control_resumed(&self) {
+    pub(crate) fn wait_until_job_control_resumed(&self) -> bool {
         let mut state = self.job_control.lock();
+        let mut waited = false;
         while state.stopped_by.is_some() {
+            waited = true;
             self.job_control_changed.wait(&mut state);
         }
+        waited
     }
 
     pub(super) fn waitable_job_control_event(
@@ -2706,9 +2812,12 @@ impl Task {
         consume: bool,
     ) -> Option<TaskJobControlEvent> {
         let mut state = self.job_control.lock();
-        if include_stopped && let Some(signal) = state.pending_stop {
+        if (include_stopped || state.pending_stop_is_ptrace)
+            && let Some(signal) = state.pending_stop
+        {
             if consume {
                 state.pending_stop = None;
+                state.pending_stop_is_ptrace = false;
             }
             return Some(TaskJobControlEvent::Stopped(signal));
         }
@@ -2732,6 +2841,9 @@ impl Task {
         }
         let mut job_control = self.job_control.lock();
         job_control.stopped_by = None;
+        job_control.stopped_by_ptrace = false;
+        job_control.ptrace_tracer = None;
+        job_control.ptrace_resume_signal = None;
         self.job_control_changed.notify_all();
         true
     }
