@@ -1570,6 +1570,10 @@ fn proc_task_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
     let pid_comp = p.strip_prefix("/proc/")?.strip_suffix("/task")?;
     let (_is_self, host_pid) = proc_live_pid(pid_comp)?;
     let tids = synthetic_task_dir(host_pid)?;
+    Some(proc_task_dir_entries_from_tids(tids))
+}
+
+fn proc_task_dir_entries_from_tids(tids: impl IntoIterator<Item = String>) -> Vec<DirEnt> {
     let mut entries = vec![
         DirEnt {
             name: ".".to_string(),
@@ -1584,7 +1588,38 @@ fn proc_task_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
         name: t,
         kind: EntryKind::Directory,
     }));
-    Some(entries)
+    entries
+}
+
+/// Context-aware `/proc/<tgid>/task` listing for HVPatch. Every logical Linux
+/// process shares Carrick's Darwin pid on that lane, so the host-process lookup
+/// used by [`proc_task_dir_entries`] cannot validate a numeric logical tgid.
+/// The open context already carries the exact task generation's identity and
+/// thread snapshot; prefer that authority for self aliases and the matching
+/// numeric tgid, then let the mature host-process path handle other lanes.
+fn proc_task_dir_entries_with_context(
+    path: &str,
+    ctx: &SyntheticProcContext,
+) -> Option<Vec<DirEnt>> {
+    let p = path.strip_suffix('/').unwrap_or(path);
+    let pid_comp = p.strip_prefix("/proc/")?.strip_suffix("/task")?;
+    let identity = ctx.identity?;
+    let names_current_process = matches!(pid_comp, "self" | "thread-self" | "curproc" | "this")
+        || pid_comp.parse::<u32>().ok() == Some(identity.pid);
+    if !names_current_process {
+        return None;
+    }
+    let tids = ctx
+        .threads
+        .as_ref()
+        .map(|threads| {
+            threads
+                .iter()
+                .map(|thread| thread.tid.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec![identity.tid.to_string()]);
+    Some(proc_task_dir_entries_from_tids(tids))
 }
 
 /// Per-process files Carrick exposes under a FOREIGN `/proc/<pid>/` (matching
@@ -2048,6 +2083,12 @@ impl Vfs for ProcVfs {
         if let Some(entries) = sysctl_dir_entries(path)
             .or_else(|| proc_net_dir_entries(path))
             .or_else(|| proc_ns_dir_entries(path))
+            .or_else(|| {
+                proc_task_dir_entries_with_context(
+                    path,
+                    synth_ctx.get_or_init(|| synthetic_proc_context_from_open(ctx)),
+                )
+            })
             .or_else(|| proc_task_dir_entries(path))
             .or_else(|| {
                 proc_pid_dir_entries_with_context(
@@ -3457,6 +3498,18 @@ mod tests {
     #[test]
     fn hvpatch_numeric_self_directory_uses_authoritative_identity() {
         let v = ProcVfs::new();
+        let threads = [
+            SyntheticProcThread {
+                tid: 73,
+                state: 'R',
+                comm: Some("leader".to_owned()),
+            },
+            SyntheticProcThread {
+                tid: 74,
+                state: 'S',
+                comm: Some("waiter".to_owned()),
+            },
+        ];
         let ctx = OpenContext {
             identity: Some(SyntheticProcIdentity {
                 pid: 73,
@@ -3465,6 +3518,7 @@ mod tests {
                 pgrp: 73,
                 session: 73,
             }),
+            threads: Some(&threads),
             ..OpenContext::default()
         };
         let opened = v
@@ -3482,6 +3536,28 @@ mod tests {
             panic!("logical /proc/<self> must be a directory");
         };
         assert!(entries.iter().any(|entry| entry.name == "status"));
+
+        let opened = v
+            .open(
+                "/proc/73/task",
+                OpenFlags {
+                    read: true,
+                    directory: true,
+                    ..OpenFlags::default()
+                },
+                &ctx,
+            )
+            .expect("logical /proc/<self>/task directory must open");
+        let VfsHandle::Directory { entries, .. } = opened else {
+            panic!("logical /proc/<self>/task must be a directory");
+        };
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            [".", "..", "73", "74"]
+        );
     }
 
     #[cfg(target_os = "macos")]
