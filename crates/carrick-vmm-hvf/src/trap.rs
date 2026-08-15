@@ -4201,6 +4201,18 @@ fn fork_translation_has_overlay_owner(
     })
 }
 
+/// The boot-time shared aperture is a physical stage-2 owner, not one dense
+/// guest-visible mapping. Linux `MAP_SHARED` sub-allocations install sparse
+/// stage-1 leaves anywhere inside it, so the aperture's first VA may be absent
+/// even while later leaves are live. Fork copies the parent's stage-1 graph
+/// separately; do not treat the missing *base* leaf as a corrupt child graph.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn fork_mapping_requires_base_translation(start: u64, size: usize, is_dynamic_alias: bool) -> bool {
+    is_dynamic_alias
+        || start != crate::memory::LINUX_SHARED_FILE_BASE
+        || size != crate::memory::LINUX_SHARED_FILE_SIZE as usize
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Clone, Copy, Debug)]
 struct PendingForkFrameReceipt {
@@ -9985,7 +9997,13 @@ impl HvfVmState {
                 // belongs in the child's physical/frame inventory and COW-arm
                 // registry so a later mprotect/remap cannot expose the parent's
                 // frame, but there is no live PTE to authenticate at fork.
-                if self.protections.range_no_access(mapping.start, 1) {
+                if self.protections.range_no_access(mapping.start, 1)
+                    || !fork_mapping_requires_base_translation(
+                        mapping.start,
+                        mapping.size,
+                        mapping.is_dynamic_alias,
+                    )
+                {
                     continue;
                 }
                 return Err(TrapError::Hypervisor(format!(
@@ -15099,6 +15117,25 @@ mod tag_strip_tests {
             ),
             "structural boot mappings do not depend on the dynamic alias registry"
         );
+    }
+
+    #[test]
+    fn sparse_shared_aperture_owner_does_not_require_a_base_leaf() {
+        assert!(!super::fork_mapping_requires_base_translation(
+            crate::memory::LINUX_SHARED_FILE_BASE,
+            crate::memory::LINUX_SHARED_FILE_SIZE as usize,
+            false,
+        ));
+        assert!(super::fork_mapping_requires_base_translation(
+            crate::memory::LINUX_SHARED_FILE_BASE,
+            0x4000,
+            true,
+        ));
+        assert!(super::fork_mapping_requires_base_translation(
+            crate::memory::LINUX_MMAP_BASE,
+            crate::memory::mmap_arena_size() as usize,
+            false,
+        ));
     }
 
     #[test]
