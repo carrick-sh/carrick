@@ -4053,7 +4053,14 @@ where
                         kernel.dispatcher.cleanup_sysv_ipc_on_process_exit();
                         unsafe { libc::_exit(code) };
                     }
-                    let result = assemble_run_result(&kernel, code, None, traps, false);
+                    kernel.record_fatal_signal(FatalSignalRecord {
+                        image_generation: state.fatal_image_generation,
+                        tid: state.linux_tid,
+                        signo: signum,
+                        code: 0,
+                        addr: 0,
+                    });
+                    let result = assemble_run_result(&kernel, code, Some(signum), traps, false);
                     return Ok(VcpuLoopOutcome::ProcessExit(Box::new(result)));
                 }
                 DispatchOutcome::Returned { value } => {
