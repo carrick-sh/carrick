@@ -7655,6 +7655,10 @@ impl SyscallDispatcher {
         let (sig_ignored, sig_caught, sig_shdpnd) =
             (sig_ignored.raw(), sig_caught.raw(), sig_shdpnd.raw());
         let proc = self.proc.lock();
+        // Copy the process binding through the guard we already hold. Calling
+        // `hvpatch_process()` here would recursively acquire `self.proc` and
+        // deadlock every synthetic-file lookup on the HVPatch lane.
+        let hvpatch_process = proc.hvpatch_process.clone();
         let mem = self.mem_snapshot();
         let mut address_space_regions = mem.address_space_regions;
         if !mem.dynamic_maps.is_empty() {
@@ -7665,6 +7669,25 @@ impl SyscallDispatcher {
         }
         let creds = self.cred_snapshot();
         let groups = self.current_groups();
+        let zombies = hvpatch_process.map(|process| {
+            process
+                .kernel_graph()
+                .registry()
+                .zombies()
+                .into_iter()
+                .map(|zombie| crate::vfs::SyntheticProcZombie {
+                    pid: zombie.key.id.raw() as u32,
+                    ppid: zombie
+                        .parent
+                        .map_or(carrick_abi::LINUX_BOOTSTRAP_PID as u32, |parent| {
+                            parent.id.raw() as u32
+                        }),
+                    pgrp: zombie.process_group.raw() as u32,
+                    session: zombie.session.raw() as u32,
+                    comm: zombie.diagnostic_name,
+                })
+                .collect()
+        });
         crate::vfs::SyntheticProcContext {
             executable_path: proc.executable_path.clone(),
             argv: proc.argv.clone(),
@@ -7694,6 +7717,7 @@ impl SyscallDispatcher {
             sig_shdpnd,
             identity: self.synthetic_proc_identity(context),
             threads: self.synthetic_proc_threads(context, None),
+            zombies,
             sysvipc_shm: self.sysvipc_shm_table(),
             sysvipc_sem: self.sysvipc_sem_table(),
             sysvipc_msg: self.sysvipc_msg_table(),
