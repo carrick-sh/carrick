@@ -13483,6 +13483,43 @@ mod hvpatch_in_process_fork_tests {
             interest.contains_key(&read_fd),
             "child dup3 detached the parent's inherited epoll registration"
         );
+        drop(epoll);
+
+        // Drain the child-close wake before making the pipe readable.  The
+        // parent's inherited registration must still arm the host
+        // multiplexer: a level re-sample after the write would hide a deleted
+        // knote/epoll entry, whereas polling the instance fd proves the wake
+        // source itself survived the child's non-final close.
+        let ready_addr = MEM_BASE + 0x1c0;
+        assert_eq!(
+            call!(&parent, 22, [epfd as u64, ready_addr, 1, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let byte_addr = MEM_BASE + 0x1e0;
+        memory.write_bytes(byte_addr, b"x").unwrap();
+        assert_eq!(
+            call!(&parent, 64, [write_fd as u64, byte_addr, 1, 0, 0, 0],),
+            DispatchOutcome::Returned { value: 1 }
+        );
+        let epoll = parent.open_file(epfd).expect("parent epoll fd");
+        let poll_fd = {
+            let epoll = epoll.description.read();
+            let OpenDescription::Epoll { kqueue, .. } = &*epoll else {
+                panic!("epoll fd changed description kind");
+            };
+            kqueue.poll_fd()
+        };
+        let mut pollfd = libc::pollfd {
+            fd: poll_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(
+            unsafe { libc::poll(&mut pollfd, 1, 100) },
+            1,
+            "child non-final close deleted the parent's host epoll registration"
+        );
+        assert_ne!(pollfd.revents & libc::POLLIN, 0);
     }
 }
 

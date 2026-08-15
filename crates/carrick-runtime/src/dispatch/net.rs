@@ -225,40 +225,71 @@ fn host_sockaddr_to_socket_addr(bytes: &[u8]) -> Option<std::net::SocketAddr> {
     let family = u16::from_ne_bytes([bytes[0], bytes[1]]) as i32;
     #[cfg(not(target_os = "linux"))]
     let family = bytes[1] as i32;
-    if family != libc::AF_INET {
-        return None;
-    }
     let port = u16::from_be_bytes([bytes[2], bytes[3]]);
-    let ip = std::net::Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]);
-    Some(std::net::SocketAddr::new(std::net::IpAddr::V4(ip), port))
+    match family {
+        libc::AF_INET if bytes.len() >= 8 => {
+            let ip = std::net::Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]);
+            Some(std::net::SocketAddr::new(std::net::IpAddr::V4(ip), port))
+        }
+        libc::AF_INET6 if bytes.len() >= 24 => {
+            let octets: [u8; 16] = bytes[8..24].try_into().ok()?;
+            let scope_id = if bytes.len() >= 28 {
+                u32::from_ne_bytes(bytes[24..28].try_into().ok()?)
+            } else {
+                0
+            };
+            Some(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                std::net::Ipv6Addr::from(octets),
+                port,
+                0,
+                scope_id,
+            )))
+        }
+        _ => None,
+    }
 }
 
 fn socket_addr_to_host_sockaddr(addr: std::net::SocketAddr) -> Option<Vec<u8>> {
-    let std::net::SocketAddr::V4(v4) = addr else {
-        return None;
-    };
-    let mut out = vec![0_u8; 16];
-    set_host_sockaddr_header(&mut out, libc::AF_INET);
-    out[2..4].copy_from_slice(&v4.port().to_be_bytes());
-    out[4..8].copy_from_slice(&v4.ip().octets());
-    Some(out)
+    match addr {
+        std::net::SocketAddr::V4(v4) => {
+            let mut out = vec![0_u8; 16];
+            set_host_sockaddr_header(&mut out, libc::AF_INET);
+            out[2..4].copy_from_slice(&v4.port().to_be_bytes());
+            out[4..8].copy_from_slice(&v4.ip().octets());
+            Some(out)
+        }
+        std::net::SocketAddr::V6(v6) => {
+            let mut out = vec![0_u8; 28];
+            set_host_sockaddr_header(&mut out, libc::AF_INET6);
+            out[2..4].copy_from_slice(&v6.port().to_be_bytes());
+            out[8..24].copy_from_slice(&v6.ip().octets());
+            out[24..28].copy_from_slice(&v6.scope_id().to_ne_bytes());
+            Some(out)
+        }
+    }
 }
 
 fn socket_addr_to_linux_sockaddr(addr: std::net::SocketAddr) -> Option<Vec<u8>> {
-    let std::net::SocketAddr::V4(v4) = addr else {
-        return None;
-    };
-    let mut out = vec![0_u8; 16];
-    out[0..2].copy_from_slice(&(LINUX_AF_INET as u16).to_ne_bytes());
-    out[2..4].copy_from_slice(&v4.port().to_be_bytes());
-    out[4..8].copy_from_slice(&v4.ip().octets());
-    Some(out)
+    match addr {
+        std::net::SocketAddr::V4(v4) => {
+            let mut out = vec![0_u8; 16];
+            out[0..2].copy_from_slice(&(LINUX_AF_INET as u16).to_ne_bytes());
+            out[2..4].copy_from_slice(&v4.port().to_be_bytes());
+            out[4..8].copy_from_slice(&v4.ip().octets());
+            Some(out)
+        }
+        std::net::SocketAddr::V6(v6) => {
+            let mut out = vec![0_u8; 28];
+            out[0..2].copy_from_slice(&(LINUX_AF_INET6 as u16).to_ne_bytes());
+            out[2..4].copy_from_slice(&v6.port().to_be_bytes());
+            out[8..24].copy_from_slice(&v6.ip().octets());
+            out[24..28].copy_from_slice(&v6.scope_id().to_ne_bytes());
+            Some(out)
+        }
+    }
 }
 
-fn host_socket_addr(host_fd: i32, family: i32, peer: bool) -> Option<std::net::SocketAddr> {
-    if family != libc::AF_INET {
-        return None;
-    }
+fn host_socket_addr(host_fd: i32, _family: i32, peer: bool) -> Option<std::net::SocketAddr> {
     let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
     let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
     let rc = if peer {
@@ -296,6 +327,7 @@ fn epoll_wait_sample_needs_host_rebind(
     clear_write_backpressure: bool,
     edge_drained: bool,
     masked_ready: bool,
+    masked_arrival_source: bool,
 ) -> bool {
     // BSD edge filters use EV_DISPATCH and therefore need an explicit rebind
     // after a delivered event. A masked event whose readiness snapshot did not
@@ -303,11 +335,32 @@ fn epoll_wait_sample_needs_host_rebind(
     // same event when NOTE_LOWAT cannot express `last_read_avail + 1` (for
     // example, a stream socket already at its receive-buffer ceiling). Leave
     // that filter disabled until guest I/O advances the latch; the
-    // consumption path rebinds it through `epoll_rearm_after_io`.
+    // consumption path rebinds it through `epoll_rearm_after_io`. Listening
+    // sockets are different: EVFILT_READ `data` is the pending-connection
+    // count, and the filter must stay armed so NOTE_LOWAT can observe a later
+    // arrival even when a redundant delivery did not change the current count.
     before != raw
         || read_avail_changed
         || clear_write_backpressure
-        || (edge_drained && !masked_ready)
+        || (edge_drained && (!masked_ready || masked_arrival_source))
+}
+
+fn epoll_io_progress_needs_host_rebind(
+    before_ready: u32,
+    after_ready: u32,
+    before_read_avail: u64,
+    after_read_avail: u64,
+) -> bool {
+    before_ready != after_ready || before_read_avail != after_read_avail
+}
+
+fn epoll_ready_sample_is_current(
+    sampled_reg_gen: u32,
+    sampled_io_gen: u64,
+    live_reg_gen: u32,
+    live_io_gen: u64,
+) -> bool {
+    sampled_reg_gen == live_reg_gen && sampled_io_gen == live_io_gen
 }
 
 #[cfg(test)]
@@ -332,6 +385,7 @@ mod epoll_edge_sample_tests {
             false,
             true,
             true,
+            false,
         ));
         assert!(!epoll_wait_sample_needs_host_rebind(
             LINUX_EPOLLIN,
@@ -340,6 +394,7 @@ mod epoll_edge_sample_tests {
             false,
             false,
             true,
+            false,
         ));
         assert!(epoll_wait_sample_needs_host_rebind(
             0,
@@ -348,6 +403,16 @@ mod epoll_edge_sample_tests {
             false,
             true,
             false,
+            false,
+        ));
+        assert!(epoll_wait_sample_needs_host_rebind(
+            LINUX_EPOLLIN,
+            LINUX_EPOLLIN,
+            false,
+            false,
+            true,
+            true,
+            true,
         ));
         assert!(epoll_wait_sample_needs_host_rebind(
             LINUX_EPOLLIN,
@@ -356,7 +421,23 @@ mod epoll_edge_sample_tests {
             false,
             true,
             false,
+            false,
         ));
+    }
+
+    #[test]
+    fn partial_read_progress_rebinds_the_lower_growth_threshold() {
+        assert!(epoll_io_progress_needs_host_rebind(
+            LINUX_EPOLLIN,
+            LINUX_EPOLLIN,
+            8 * 1024 * 1024,
+            3 * 1024 * 1024,
+        ));
+    }
+
+    #[test]
+    fn readiness_sample_before_io_cannot_relatch_consumed_edge() {
+        assert!(!epoll_ready_sample_is_current(7, 11, 7, 12));
     }
 }
 
@@ -552,6 +633,16 @@ impl SyscallDispatcher {
         matches!(
             &*open_file.description.read(),
             OpenDescription::HostPipe { .. } | OpenDescription::HostSocket { .. }
+        )
+    }
+
+    fn fd_is_listening_socket(&self, fd: i32) -> bool {
+        let Some(open_file) = self.open_file(fd) else {
+            return false;
+        };
+        matches!(
+            &*open_file.description.read(),
+            OpenDescription::HostSocket { base, .. } if base.listening()
         )
     }
 
@@ -1037,6 +1128,8 @@ impl SyscallDispatcher {
                                     continue;
                                 };
                                 let before = slot.last_ready;
+                                let before_read_avail = slot.last_read_avail;
+                                slot.io_gen = slot.io_gen.wrapping_add(1);
                                 if clear & READ_CLEAR != 0 {
                                     if let Some(bytes) = read_progress_bytes {
                                         slot.last_read_avail =
@@ -1055,7 +1148,13 @@ impl SyscallDispatcher {
                                 if clear & WRITE_CLEAR != 0 {
                                     slot.write_backpressured = false;
                                 }
-                                if before != slot.last_ready {
+                                if epoll_io_progress_needs_host_rebind(
+                                    before,
+                                    slot.last_ready,
+                                    before_read_avail,
+                                    slot.last_read_avail,
+                                ) || slot.event.events & LINUX_EPOLLET != 0
+                                {
                                     snapshot_changed = true;
                                     #[cfg(any(
                                         feature = "platform-macos",
@@ -1344,6 +1443,20 @@ impl SyscallDispatcher {
                     }
                 }
                 if let Some(host_fd) = detached_host_fd {
+                    // A non-final close after fork is local to the CHILD fd
+                    // table, while the inherited epoll description (and its
+                    // host multiplexer) is shared with the parent.  If this
+                    // table has no other registration for the host fd, deleting
+                    // the filter here deafens the parent's still-valid numeric
+                    // registration.  Rebind only when this table can name a
+                    // surviving registration; a final description close still
+                    // deregisters as usual.
+                    let has_local_registered_survivor = interest.keys().any(|other| {
+                        *other != fd && self.host_fd_for_poll(*other) == Some(host_fd)
+                    });
+                    if !should_auto_detach && !has_local_registered_survivor {
+                        continue;
+                    }
                     #[cfg(any(
                         feature = "platform-macos",
                         feature = "platform-freebsd",
@@ -1793,7 +1906,11 @@ impl SyscallDispatcher {
         // whole UDPLITE suite (native-macOS python skips it — IPPROTO_UDPLITE
         // undefined there); pass-through socket() returned EPROTONOSUPPORT and
         // ERRORed every UDPLITE test at setUp.
-        let host_protocol = if protocol == LINUX_IPPROTO_UDPLITE {
+        let host_protocol = if protocol == LINUX_IPPROTO_UDPLITE
+            || cfg!(carrick_bsd)
+                && matches!(family, LINUX_AF_INET | LINUX_AF_INET6)
+                && base_type == LINUX_SOCK_RAW
+        {
             0
         } else {
             protocol
@@ -3265,7 +3382,7 @@ impl SyscallDispatcher {
             // guest_fd -> (accumulated epoll events, epoll_data); read+write filters
             // for the same fd merge into one returned event.
             let mut acc: HashMap<i32, (u32, u64)> = HashMap::new();
-            type ReadyUpdate = (i32, u32, u32, Option<u64>, bool, bool, bool);
+            type ReadyUpdate = (i32, u32, u64, u32, Option<u64>, bool, bool, bool);
             let mut ready_updates: Vec<ReadyUpdate> = Vec::new();
             let mut host_ready_sampled = std::collections::HashSet::<i32>::new();
             const READ_READY_BITS: u32 =
@@ -3314,16 +3431,16 @@ impl SyscallDispatcher {
                         // here, then the epoll lock is dropped before the per-fd
                         // re-poll so a concurrent epoll_ctl isn't blocked on syscalls.
                         // gfd_info: guest fd -> (host_fd, requested events,
-                        // epoll_data, reg_gen, last_ready, last_read_avail,
+                        // epoll_data, reg_gen, io_gen, last_ready, last_read_avail,
                         // write_backpressured). host_to_gfds: host fd
                         // -> guest fds sharing it (dup fan-out). Types inferred
                         // from the inserts.
                         let (gfd_info, host_to_gfds) = {
                             let open = open_file.description.read();
                             // Per-guest-fd epoll interest snapshot: (host_fd,
-                            // events, epoll data, reg_gen, last_ready,
+                            // events, epoll data, reg_gen, io_gen, last_ready,
                             // last_read_avail, write_backpressured).
-                            type GfdInterest = (i32, u32, u64, u32, u32, u64, bool);
+                            type GfdInterest = (i32, u32, u64, u32, u64, u32, u64, bool);
                             let mut info: HashMap<i32, GfdInterest> = HashMap::new();
                             let mut rev: HashMap<i32, Vec<i32>> = HashMap::new();
                             if let OpenDescription::Epoll { interest, .. } = &*open {
@@ -3336,6 +3453,7 @@ impl SyscallDispatcher {
                                                 slot.event.events,
                                                 slot.event.data,
                                                 slot.reg_gen,
+                                                slot.io_gen,
                                                 slot.last_ready,
                                                 slot.last_read_avail,
                                                 slot.write_backpressured,
@@ -3375,7 +3493,9 @@ impl SyscallDispatcher {
                                 edge_readiness_count.min(i32::MAX as u64) as i32,
                             );
                             match gfd_info.get(&guest_fd) {
-                                Some(&(hfd, _, _, reg_gen, _, _, _)) if reg_gen == generation => {
+                                Some(&(hfd, _, _, reg_gen, _, _, _, _))
+                                    if reg_gen == generation =>
+                                {
                                     if let Some(siblings) = host_to_gfds.get(&hfd) {
                                         for sibling in siblings {
                                             let entry = deliver.entry(*sibling).or_insert((0, 0));
@@ -3413,6 +3533,7 @@ impl SyscallDispatcher {
                                 requested,
                                 data,
                                 reg_gen,
+                                io_gen,
                                 last_ready,
                                 last_read_avail,
                                 write_backpressured,
@@ -3471,6 +3592,7 @@ impl SyscallDispatcher {
                                 ready_updates.push((
                                     gfd,
                                     reg_gen,
+                                    io_gen,
                                     raw,
                                     read_avail_update,
                                     clear_write_backpressure,
@@ -3612,6 +3734,7 @@ impl SyscallDispatcher {
                 ready_updates.push((
                     *fd,
                     interest.reg_gen,
+                    interest.io_gen,
                     raw_ready,
                     read_avail_update,
                     clear_write_backpressure,
@@ -3679,6 +3802,7 @@ impl SyscallDispatcher {
                 ready_updates.push((
                     *fd,
                     interest.reg_gen,
+                    interest.io_gen,
                     raw_ready,
                     Some(0),
                     false,
@@ -3747,6 +3871,7 @@ impl SyscallDispatcher {
                     for (
                         fd,
                         reg_gen,
+                        io_gen,
                         raw,
                         read_avail,
                         clear_write_backpressure,
@@ -3755,7 +3880,12 @@ impl SyscallDispatcher {
                     ) in ready_updates
                     {
                         if let Some(slot) = interest.get_mut(&fd) {
-                            if slot.reg_gen != reg_gen {
+                            if !epoll_ready_sample_is_current(
+                                reg_gen,
+                                io_gen,
+                                slot.reg_gen,
+                                slot.io_gen,
+                            ) {
                                 continue;
                             }
                             let before = slot.last_ready;
@@ -3781,6 +3911,7 @@ impl SyscallDispatcher {
                                     clear_write_backpressure,
                                     edge_drained,
                                     masked_ready,
+                                    this.fd_is_listening_socket(fd),
                                 )
                                 && let Some(host_fd) = this.host_fd_for_poll(fd)
                             {
@@ -4116,6 +4247,7 @@ impl SyscallDispatcher {
                             last_ready: 0,
                             last_read_avail: 0,
                             write_backpressured: false,
+                            io_gen: 0,
                             reg_gen,
                         },
                     );
@@ -4164,6 +4296,7 @@ impl SyscallDispatcher {
                         last_ready: 0,
                         last_read_avail: 0,
                         write_backpressured: false,
+                        io_gen: 0,
                         reg_gen,
                     };
                     // Re-arm visible to a parked waiter: rebuild its park set.
@@ -5422,6 +5555,12 @@ impl SyscallDispatcher {
             if let Err(errno) = rc.host_syscall_errno() {
                 return Ok(DispatchOutcome::errno(errno));
             }
+            if let Some(open_file) = this.open_file(fd.0)
+                && let OpenDescription::HostSocket { base, .. } =
+                    &mut *open_file.description.write()
+            {
+                base.set_listening(true);
+            }
             crate::event_ring::rec(crate::event_ring::LISTEN, host_fd.get(), 0, 0);
             // A listen socket exists only to accept(2); make the HOST socket
             // non-blocking so accept never blocks under the dispatcher lock — the
@@ -5455,6 +5594,32 @@ impl SyscallDispatcher {
             let (host_fd, family) = this.host_socket_lookup(fd)?;
             let mut host_addr = read_linux_sockaddr(memory, addr_addr, addrlen, family)?;
             rewrite_unspecified_connect_loopback(family, &mut host_addr);
+            // BSD requires privilege for a real INET raw socket. Such sockets
+            // use an unprivileged datagram fd as their host carrier, so a raw
+            // connect cannot be handed to the carrier (a raw sockaddr has no
+            // transport port, and Darwin rejects UDP connect-to-port-zero).
+            // Linux raw connect only establishes the default peer identity;
+            // record that identity in the network namespace and leave payload
+            // operations on the carrier. This is sufficient for the ordinary
+            // bind/options/poll/name surface without claiming privileged raw
+            // packet injection.
+            if cfg!(carrick_bsd)
+                && matches!(family, LINUX_AF_INET | LINUX_AF_INET6)
+                && this.socket_guest_type(fd) == Some(LINUX_SOCK_RAW)
+            {
+                let Some(requested) = host_sockaddr_to_socket_addr(&host_addr) else {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                };
+                this.record_rewritten_connect_addresses(
+                    fd,
+                    family,
+                    host_fd.get(),
+                    requested,
+                    HostSocketAddr(requested),
+                    PortProtocol::Udp,
+                );
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
             let mut rewritten_connect: Option<(
                 std::net::SocketAddr,
                 HostSocketAddr,
@@ -5759,6 +5924,26 @@ impl SyscallDispatcher {
             let addr_addr = addr.0;
             let addrlen_addr = addrlen.0;
             let (host_fd, family) = this.host_socket_lookup(fd)?;
+            if cfg!(carrick_bsd)
+                && this.socket_guest_type(fd) == Some(LINUX_SOCK_RAW)
+                && let Ok(Some(guest_peer)) = this.network.provider.guest_visible_peer_addr(fd)
+            {
+                if addr_addr == 0 || addrlen_addr == 0 {
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                }
+                if let Ok(b) = memory.read_bytes(addrlen_addr, 4)
+                    && i32::from_ne_bytes([b[0], b[1], b[2], b[3]]) < 0
+                {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                let Some(linux_bytes) = socket_addr_to_linux_sockaddr(guest_peer.0) else {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                };
+                if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                }
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
             let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
             let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
             let rc =

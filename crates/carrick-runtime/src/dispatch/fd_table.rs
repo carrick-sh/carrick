@@ -107,6 +107,14 @@ pub(super) struct EpollInterest {
     /// suppressing immediate sampled OUT redelivery; the next host write event
     /// is a fresh transition and should be delivered once.
     pub(super) write_backpressured: bool,
+    /// Consumption generation for the software edge latch. `epoll_wait`
+    /// samples readiness without holding the epoll description lock, so an I/O
+    /// syscall can service an edge before that sample is committed. The sample
+    /// carries this generation and may update `last_ready` only if it still
+    /// matches; otherwise it would re-latch an already-consumed edge and hide
+    /// the next arrival. Incremented for every matching read/write consumption,
+    /// including one whose state was already advanced by a concurrent sample.
+    pub(super) io_gen: u64,
     /// Per-registration generation, the high half of this fd's multiplexer
     /// `udata` handle (`pack_epoll_udata`). Guest fd numbers AND host fd numbers
     /// are recycled rapidly under churn, so a drained kqueue/epoll event keyed by
@@ -323,6 +331,11 @@ pub(super) struct OpenDescriptionBase {
     /// SO_PASSCRED: when set, recvmsg attaches an SCM_CREDENTIALS ancillary
     /// message with the peer's `struct ucred`. (audit M2)
     so_passcred: bool,
+    /// True after a successful `listen(2)`. Darwin's EVFILT_READ `data` for a
+    /// listening socket is the pending-connection count, so an EPOLLET filter
+    /// must remain armed to observe that count growing after a redundant
+    /// same-count readiness delivery.
+    listening: bool,
     /// True while carrick has DEFERRED a blocking connect (returned WaitOnFds on
     /// POLLOUT) and is waiting to re-dispatch it. macOS reports EISCONN both when
     /// an async connect completes AND when the guest calls connect() on an
@@ -366,6 +379,7 @@ impl OpenDescriptionBase {
             so_rcvbuf: None,
             so_sndbuf: None,
             so_passcred: false,
+            listening: false,
             connect_in_progress: false,
             pending_socket_error: None,
             socket_error_after_send: None,
@@ -496,6 +510,12 @@ impl OpenDescriptionBase {
     }
     pub(super) fn set_so_passcred(&mut self, on: bool) {
         self.so_passcred = on;
+    }
+    pub(super) fn listening(&self) -> bool {
+        self.listening
+    }
+    pub(super) fn set_listening(&mut self, on: bool) {
+        self.listening = on;
     }
     pub(super) fn connect_in_progress(&self) -> bool {
         self.connect_in_progress
