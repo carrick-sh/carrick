@@ -1219,12 +1219,8 @@ impl SyscallDispatcher {
         if !hvpatch_owns_specific_process_signal(crate::dispatch::hvpatch_lane_active(), pid) {
             return None;
         }
-        let target = match crate::kernel::TaskId::from_abi_positive(pid) {
-            Ok(target) => target,
-            Err(_) => return Some(DispatchOutcome::errno(LINUX_ESRCH)),
-        };
         let kernel = ctx.kernel.kernel();
-        let Some(target_key) = kernel.live_task_key(target) else {
+        let Some(target_key) = hvpatch_process_signal_target(kernel, pid) else {
             return Some(DispatchOutcome::errno(LINUX_ESRCH));
         };
         let signal = if signum == 0 {
@@ -2488,6 +2484,19 @@ fn hvpatch_owns_specific_process_signal(hvpatch_lane: bool, pid: i32) -> bool {
     hvpatch_lane && pid > 0
 }
 
+fn hvpatch_process_signal_target(
+    kernel: &crate::kernel::Kernel,
+    pid: i32,
+) -> Option<crate::kernel::TaskKey> {
+    let target = crate::kernel::TaskId::from_abi_positive(pid).ok()?;
+    kernel.live_task_key(target).or_else(|| {
+        let tid = crate::kernel::LinuxTid::from_abi_positive(pid).ok()?;
+        kernel
+            .live_keys_for_thread(None, tid)
+            .map(|(task, _thread)| task)
+    })
+}
+
 fn hvpatch_owns_specific_thread_signal(hvpatch_lane: bool) -> bool {
     hvpatch_lane
 }
@@ -2697,6 +2706,21 @@ mod tests {
             carrick_abi::LINUX_BOOTSTRAP_PID as i32,
         ));
         assert!(!hvpatch_owns_specific_thread_signal(false));
+    }
+
+    #[test]
+    fn hvpatch_process_signal_target_accepts_live_member_tid() {
+        let dispatcher = SyscallDispatcher::new();
+        let root = dispatcher.capture_one_task_context().unwrap();
+        let registry_id = crate::thread::ThreadId::synthetic_for_tests(8101);
+        let sibling_tid = dispatcher
+            .register_one_task_thread(&root, registry_id)
+            .unwrap();
+
+        assert_eq!(
+            hvpatch_process_signal_target(root.kernel(), sibling_tid.raw()),
+            Some(root.task().key())
+        );
     }
 
     #[test]
