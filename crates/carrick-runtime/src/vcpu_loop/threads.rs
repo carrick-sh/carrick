@@ -22,6 +22,20 @@ fn guest_host_thread_name(process_pid: Option<i32>, tid: ThreadId) -> String {
     )
 }
 
+fn has_dispatch_signal_for_futex_wait(
+    dispatcher: &SyscallDispatcher,
+    context: Option<&crate::kernel::KernelContext>,
+    tid: ThreadId,
+) -> bool {
+    context.is_some_and(|context| {
+        dispatcher.has_deliverable_dispatch_pending_for_wait(
+            context,
+            tid,
+            carrick_abi::WaitSigMask::NONE,
+        )
+    })
+}
+
 fn acquire_vcpu_lease_while_live<A, R>(
     registry: &ThreadRegistry,
     tid: ThreadId,
@@ -84,6 +98,29 @@ mod tests {
 
         assert!(lease.is_none());
         assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn futex_wait_observes_thread_signal_in_dispatch_kernel_state() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.exact_signal_context_for_test();
+        let tid = context.thread().registry_id();
+
+        assert!(!has_dispatch_signal_for_futex_wait(
+            &dispatcher,
+            Some(&context),
+            tid
+        ));
+
+        // HVPatch routes thread-directed signals through the shared kernel
+        // task state, not host_signal's thread-local slot. A parked futex
+        // waiter must observe that queue after its task waker unparks it.
+        dispatcher.mark_signal_pending(&context, tid, 33);
+        assert!(has_dispatch_signal_for_futex_wait(
+            &dispatcher,
+            Some(&context),
+            tid
+        ));
     }
 }
 
@@ -167,6 +204,11 @@ where
                 .futex
                 .wait_prepared_for_thread(wait, timeout, self.this_tid, &|| {
                     crate::host_signal::has_pending_for(self.this_tid.raw())
+                        || has_dispatch_signal_for_futex_wait(
+                            &kernel.dispatcher,
+                            self.service_kernel_context.as_ref(),
+                            self.this_tid,
+                        )
                         || self.fork_is_quiescing()
                         || crate::fork_quiesce::exec_replacing_other_thread(self.this_tid)
                         || !self.registry.is_live(self.this_tid)
