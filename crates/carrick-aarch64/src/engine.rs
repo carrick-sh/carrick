@@ -31,8 +31,8 @@ use carrick_guest_mem::{
 };
 use carrick_hal::guest_arch::GuestArch as _;
 use carrick_hal::{
-    ForkOutcome, GuestEntryRegs, OsError, RawSyscall, Reg, SlotId, SysReg, SyscallTrap, ThreadId,
-    ThreadedEngine, TrapError,
+    ForkOutcome, GuestEntryRegs, OsError, ProcessForkRequest, RawSyscall, Reg, SlotId, SysReg,
+    SyscallTrap, ThreadedEngine, TrapError,
 };
 use carrick_mem::memory::AddressSpace;
 use carrick_mem::page_table::{PageTableError, PageTableManager};
@@ -1851,12 +1851,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
 
     fn build_process_spec(
         &mut self,
-        entry: GuestEntryRegs,
-        child_ttbr0: u64,
-        root_slot_base: u64,
-        root_slot_size: u64,
-        child_tid: ThreadId,
-        forking_tid: ThreadId,
+        request: ProcessForkRequest,
     ) -> Result<Self::ProcessSpec, TrapError> {
         use carrick_observability::probes::{
             HvpatchForkProcessSpecStage, HvpatchForkProcessSpecStagePhase,
@@ -1874,8 +1869,8 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 carrick_observability::probes::hvpatch_fork_process_spec_stage(
                     HvpatchForkProcessSpecStage::new(
                         phase,
-                        child_tid.raw(),
-                        forking_tid.raw(),
+                        request.child_tid.raw(),
+                        request.forking_tid.raw(),
                         elapsed_ns,
                         units,
                     ),
@@ -1905,7 +1900,15 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // Describe the private writable graph now, but do not mutate the live
         // parent yet. Every fallible child-preparation step below operates on an
         // offline clone. The parent arm is the final publication transaction.
-        let cow_ranges = self.vm.fork_cow_ranges();
+        // CLONE_VM keeps one Linux mm. The HVPatch execution adapter still
+        // gives the child a private stage-1 root and per-process EL1 state, but
+        // its user mappings must retain the same writable frames rather than
+        // entering the ordinary fork-COW protocol.
+        let cow_ranges = if request.shares_mm {
+            Vec::new()
+        } else {
+            self.vm.fork_cow_ranges()
+        };
 
         let stage_started = std::time::Instant::now();
         let parent = self.vcpu.snapshot()?;
@@ -1913,10 +1916,10 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // after the trapped clone in EL0. The raw parent snapshot is currently
         // parked in the EL1 syscall vector; using its live PC/PSTATE would send
         // a brand-new vCPU back into that vector as EL0 code and spin forever.
-        let mut snapshot = seed_sibling_snapshot(&parent, entry);
-        snapshot.ttbr0 = child_ttbr0;
-        snapshot.ttbr1 = child_ttbr0;
-        let child_asid = (child_ttbr0 >> 48) as u16;
+        let mut snapshot = seed_sibling_snapshot(&parent, request.entry);
+        snapshot.ttbr0 = request.child_ttbr0;
+        snapshot.ttbr1 = request.child_ttbr0;
+        let child_asid = (request.child_ttbr0 >> 48) as u16;
         if child_asid == 0 {
             return Err(TrapError::Hypervisor(
                 "in-process child ASID zero is reserved".to_owned(),
@@ -1965,7 +1968,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         }
 
         let stage_started = std::time::Instant::now();
-        let child_root = child_ttbr0 & ((1_u64 << 48) - 1);
+        let child_root = request.child_ttbr0 & ((1_u64 << 48) - 1);
         page_tables.rebase(child_root).map_err(|error| {
             TrapError::Hypervisor(format!("rebase child page tables: {error:?}"))
         })?;
@@ -1974,14 +1977,9 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             stage_started,
             carrick_mem::memory::LINUX_PAGE_TABLES_SIZE,
         );
-        let builder = self.vm.build_process_builder(
-            root_slot_base,
-            root_slot_size,
-            &mut page_tables,
-            &cow_ranges,
-            child_tid.raw(),
-            forking_tid.raw(),
-        )?;
+        let builder = self
+            .vm
+            .build_process_builder(request, &mut page_tables, &cow_ranges)?;
         let stage_started = std::time::Instant::now();
         let protections = Arc::new(MemoryProtections::from_snapshot(
             self.protections.snapshot_all(),

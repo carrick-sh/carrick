@@ -3712,13 +3712,18 @@ enum ForkMappingDisposition {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn fork_mapping_disposition(mapping: &ThreadMappingDesc) -> ForkMappingDisposition {
+fn fork_mapping_disposition(
+    mapping: &ThreadMappingDesc,
+    shares_mm: bool,
+) -> ForkMappingDisposition {
     if mapping.sharing.shares_across_fork() {
         ForkMappingDisposition::SharedFrameWritable
     } else if mapping.start == crate::memory::LINUX_PAGE_TABLES_BASE {
         ForkMappingDisposition::IndependentPageTables
     } else if mapping.guest_writable && is_kernel_only_stage1_range(mapping.start, mapping.size) {
         ForkMappingDisposition::IndependentKernelState
+    } else if shares_mm && !is_kernel_only_stage1_range(mapping.start, mapping.size) {
+        ForkMappingDisposition::SharedFrameWritable
     } else {
         ForkMappingDisposition::SharedFrameReadOnly
     }
@@ -4166,6 +4171,7 @@ struct ProcessInventoryDesc {
     stage2_lease: (u64, u64),
     sharing: GuestMappingSharing,
     guest_writable: bool,
+    shared_mm: bool,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4239,9 +4245,11 @@ fn process_mapping_needs_stage2_install(inherited_frame: Option<carrick_hal::Fra
 /// A fork child address space waiting for vCPU materialization on its owning
 /// host thread. Private mappings initially retain the parent's FrameId/global
 /// IPA and are read-only in each mm's independent stage-1 graph; the first
-/// writer receives a new compound frame. Guest-shared mappings retain their
-/// existing IPA and frame without entering private COW. Shared-anonymous aliases
-/// remain mm-scoped; only shared-file mappings use the VM-global alias namespace.
+/// writer receives a new compound frame. A CLONE_VM child instead retains user
+/// frames writable while keeping its stage-1 tables and EL1 control state
+/// independent. Guest-shared mappings retain their existing IPA and frame
+/// without entering private COW. Shared-anonymous aliases remain mm-scoped; only
+/// shared-file mappings use the VM-global alias namespace.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub struct ProcessSpec {
     vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
@@ -9714,12 +9722,9 @@ impl HvfVmState {
 
     pub(crate) fn build_process_spec(
         &self,
-        root_slot_base: u64,
-        root_slot_size: u64,
+        request: carrick_hal::ProcessForkRequest,
         page_tables: &mut crate::page_table::PageTableManager,
         cow_ranges: &[carrick_aarch64::vmm::ForkCowRange],
-        child_pid: i32,
-        forking_tid: i32,
     ) -> Result<ProcessSpec, TrapError> {
         use carrick_observability::probes::{
             HvpatchForkProcessSpecStage, HvpatchForkProcessSpecStagePhase,
@@ -9730,20 +9735,26 @@ impl HvfVmState {
                 let elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
                 crate::probes::hvpatch_fork_process_spec_stage(HvpatchForkProcessSpecStage::new(
                     phase,
-                    child_pid,
-                    forking_tid,
+                    request.child_tid.raw(),
+                    request.forking_tid.raw(),
                     elapsed_ns,
                     units,
                 ));
             };
 
-        crate::probes::hvpatch_fork_snapshot_begin(child_pid, forking_tid);
+        crate::probes::hvpatch_fork_snapshot_begin(
+            request.child_tid.raw(),
+            request.forking_tid.raw(),
+        );
         let stage_started = std::time::Instant::now();
         const STAGE2_PAGE: u64 = 16 * 1024;
-        let root_slot_end = root_slot_base.checked_add(root_slot_size).ok_or_else(|| {
-            TrapError::Hypervisor("hvpatch child stage-1 root slot overflow".to_owned())
-        })?;
-        let mut cursor = root_slot_base;
+        let root_slot_end = request
+            .root_slot_base
+            .checked_add(request.root_slot_size)
+            .ok_or_else(|| {
+                TrapError::Hypervisor("hvpatch child stage-1 root slot overflow".to_owned())
+            })?;
+        let mut cursor = request.root_slot_base;
         let aliases = alias_registry().lock().clone();
         let mut source_mappings: Vec<ThreadMappingDesc> = self
             .mappings
@@ -9822,7 +9833,7 @@ impl HvfVmState {
         });
         for index in order {
             let mapping = &source_mappings[index];
-            let disposition = fork_mapping_disposition(mapping);
+            let disposition = fork_mapping_disposition(mapping, request.shares_mm);
             if matches!(
                 disposition,
                 ForkMappingDisposition::SharedFrameWritable
@@ -9852,6 +9863,7 @@ impl HvfVmState {
                             stage2_lease: (extent.stage2_base, extent.stage2_length),
                             sharing: mapping.sharing,
                             guest_writable: mapping.guest_writable,
+                            shared_mm: request.shares_mm,
                         });
                     }
                 }
@@ -9899,7 +9911,7 @@ impl HvfVmState {
                     if cursor > root_slot_end {
                         return Err(TrapError::Hypervisor(format!(
                             "hvpatch child page tables need more than {}-byte root slot",
-                            root_slot_size
+                            request.root_slot_size
                         )));
                     }
                     (
@@ -10039,12 +10051,13 @@ impl HvfVmState {
                 stage2_lease: (physical_ipa, mapping.physical_size as u64),
                 sharing: GuestMappingSharing::Private,
                 guest_writable: mapping.guest_writable,
+                shared_mm: false,
             });
         }
         emit_stage(
             HvpatchForkProcessSpecStagePhase::FramePlan,
             stage_started,
-            cursor.saturating_sub(root_slot_base),
+            cursor.saturating_sub(request.root_slot_base),
         );
 
         let stage_started = std::time::Instant::now();
@@ -10102,19 +10115,34 @@ impl HvfVmState {
                     page_tables.debug_walk(mapping.start),
                 );
                 if leaf & VALID != 0 {
-                    let expected_ap =
-                        if mapping.guest_writable && mapping.sharing.shares_across_fork() {
-                            AP_USER_RW
-                        } else {
-                            AP_USER_RO
-                        };
-                    if leaf & AP_MASK != expected_ap || leaf & NON_GLOBAL == 0 {
+                    let expected_ap = if request.shares_mm {
+                        // The descriptor can cover mixed ELF permissions; a
+                        // shared-mm child keeps the exact cloned leaf rather
+                        // than deriving AP from the coarse physical owner.
+                        leaf & AP_MASK
+                    } else if mapping.guest_writable && mapping.sharing.shares_across_fork() {
+                        AP_USER_RW
+                    } else {
+                        AP_USER_RO
+                    };
+                    // CLONE_VM deliberately preserves the parent's exact
+                    // user translation, including its global attribute: both
+                    // ASIDs name the same frame until the child exits or execs.
+                    let expected_non_global = !request.shares_mm;
+                    if leaf & AP_MASK != expected_ap
+                        || (expected_non_global && leaf & NON_GLOBAL == 0)
+                    {
                         return Err(TrapError::Hypervisor(format!(
-                            "hvpatch child inherited stage-1 AP mismatch at VA 0x{:x}: leaf=0x{leaf:x} expected_ap=0x{expected_ap:x}",
-                            mapping.start
+                            "hvpatch child inherited stage-1 AP mismatch at VA 0x{:x}: leaf=0x{leaf:x} expected_ap=0x{expected_ap:x} expected_non_global={expected_non_global}",
+                            mapping.start,
                         )));
                     }
-                    child_pte_receipts.push((mapping.start, mapping.ipa, expected_ap));
+                    child_pte_receipts.push((
+                        mapping.start,
+                        mapping.ipa,
+                        expected_ap,
+                        expected_non_global,
+                    ));
                 }
             }
         }
@@ -10138,7 +10166,7 @@ impl HvfVmState {
             .ok_or_else(|| {
                 TrapError::Hypervisor("hvpatch child page-table mapping absent".to_owned())
             })?;
-        if table.ipa != root_slot_base || table_bytes.len() > table.size {
+        if table.ipa != request.root_slot_base || table_bytes.len() > table.size {
             return Err(TrapError::Hypervisor(
                 "hvpatch child page-table root-slot layout mismatch".to_owned(),
             ));
@@ -10150,17 +10178,24 @@ impl HvfVmState {
                 table_bytes.len(),
             );
         }
-        for (va, expected_ipa, expected_ap) in child_pte_receipts {
+        for (va, expected_ipa, expected_ap, expected_non_global) in child_pte_receipts {
             let shadow = page_tables.debug_walk(va);
             let live = unsafe { page_tables.debug_walk_host(table.host.ptr().cast_const(), va) };
             let live_leaf = carrick_mem::page_table::terminal_descriptor(live);
             if shadow != live
-                || live_leaf & 0x0000_FFFF_FFFF_F000 != expected_ipa & 0x0000_FFFF_FFFF_F000
+                // An unmodified CLONE_VM graph may retain an L1/L2 block: its
+                // descriptor carries the block base, while `expected_ipa`
+                // includes the VA's offset inside that block. `shadow == live`
+                // plus the earlier software translation receipt authenticates
+                // the exact address without falsely applying an L3 mask.
+                || (!request.shares_mm
+                    && live_leaf & 0x0000_FFFF_FFFF_F000
+                        != expected_ipa & 0x0000_FFFF_FFFF_F000)
                 || live_leaf & (0b11 << 6) != expected_ap
-                || live_leaf & (1 << 11) == 0
+                || (expected_non_global && live_leaf & (1 << 11) == 0)
             {
                 return Err(TrapError::Hypervisor(format!(
-                    "hvpatch child live stage-1 receipt mismatch at VA 0x{va:x}: shadow={shadow:x?} live={live:x?} expected_ipa=0x{expected_ipa:x} expected_ap=0x{expected_ap:x}"
+                    "hvpatch child live stage-1 receipt mismatch at VA 0x{va:x}: shadow={shadow:x?} live={live:x?} expected_ipa=0x{expected_ipa:x} expected_ap=0x{expected_ap:x} expected_non_global={expected_non_global}"
                 )));
             }
             crate::probes::pt_alias_receipt(va, live_leaf, expected_ipa, expected_ap, 1);
@@ -10172,18 +10207,18 @@ impl HvfVmState {
         );
 
         crate::probes::hvpatch_fork_snapshot_end(
-            child_pid,
+            request.child_tid.raw(),
             local_regions,
             candidate_regions,
             added_regions,
             added_bytes,
         );
         crate::probes::hvpatch_fork_snapshot_shape(
-            child_pid,
+            request.child_tid.raw(),
             private_added_regions,
             shared_added_regions,
             largest_added_bytes,
-            cursor.saturating_sub(root_slot_base),
+            cursor.saturating_sub(request.root_slot_base),
         );
 
         let stage_started = std::time::Instant::now();
@@ -10220,7 +10255,7 @@ impl HvfVmState {
             mailbox_slots: std::sync::Arc::clone(&self.mailbox_slots),
             syscall_transport: self.syscall_transport,
             persistent_vm_lifecycle: self.persistent_vm_lifecycle,
-            mm_root_slot: (root_slot_base, root_slot_size),
+            mm_root_slot: (request.root_slot_base, request.root_slot_size),
             frame_inventory,
             cow_armed: std::sync::Arc::new(parking_lot::Mutex::new(child_cow_armed)),
         };
@@ -10411,7 +10446,7 @@ impl HvfVmState {
                     (mapping.inherited_mapping, mapping.inherited_frame)
                     && (mapping.guest_writable || mapping.sharing.shares_across_fork())
                 {
-                    let kind = if mapping.sharing.shares_across_fork() {
+                    let kind = if mapping.shared_mm || mapping.sharing.shares_across_fork() {
                         carrick_observability::probes::HvpatchForkFrameKind::Shared
                     } else {
                         carrick_observability::probes::HvpatchForkFrameKind::PrivateCow
@@ -13300,15 +13335,25 @@ mod frame_inventory_backend_tests {
         assert_eq!(inherited.backing, backing);
 
         assert_eq!(
-            fork_mapping_disposition(&mapping(GuestMappingSharing::Private)),
+            fork_mapping_disposition(&mapping(GuestMappingSharing::Private), false),
             ForkMappingDisposition::SharedFrameReadOnly,
             "private fork mappings must not take an eager writable snapshot",
+        );
+        assert_eq!(
+            fork_mapping_disposition(&mapping(GuestMappingSharing::Private), true),
+            ForkMappingDisposition::SharedFrameWritable,
+            "CLONE_VM must preserve the parent's writable user-frame identity",
         );
         let mut kernel_state = mapping(GuestMappingSharing::Private);
         kernel_state.start = crate::memory::LINUX_SYSCALL_MAILBOX_BASE;
         kernel_state.end = kernel_state.start + size;
         assert_ne!(
-            fork_mapping_disposition(&kernel_state),
+            fork_mapping_disposition(&kernel_state, true),
+            ForkMappingDisposition::SharedFrameWritable,
+            "CLONE_VM must still isolate per-process EL1 control state",
+        );
+        assert_ne!(
+            fork_mapping_disposition(&kernel_state, false),
             ForkMappingDisposition::SharedFrameReadOnly,
             "EL1-only per-mm control state must not enter fault-driven guest COW",
         );

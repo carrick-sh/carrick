@@ -1293,18 +1293,19 @@ where
         };
 
         fork_stage_started = Instant::now();
-        let spec = match engine.build_process_spec(
-            carrick_hal::GuestEntryRegs {
+        let spec = match engine.build_process_spec(carrick_hal::ProcessForkRequest {
+            entry: carrick_hal::GuestEntryRegs {
                 return_value: 0,
                 stack: (request.child_stack != 0).then_some(request.child_stack),
                 tls: None,
             },
-            child_binding.ttbr0.raw(),
-            root_slot.base(),
-            root_slot.size(),
+            child_ttbr0: child_binding.ttbr0.raw(),
+            root_slot_base: root_slot.base(),
+            root_slot_size: root_slot.size(),
+            shares_mm,
             child_tid,
-            self.this_tid,
-        ) {
+            forking_tid: self.this_tid,
+        }) {
             Ok(spec) => spec,
             Err(error) => {
                 rollback_backend_fork(engine);
@@ -1433,10 +1434,14 @@ where
                 // The child inventory and exact MM/COW authority are now live,
                 // while the child remains behind the start gate and has never
                 // entered guest code. Refresh fork-private backend state here so
-                // any inherited COW frame is split from the parent first.
-                if let Err(error) = child_engine.refresh_fork_process_state() {
-                    tracing::error!(child_pid, %error, "refresh materialized child process state");
-                    std::process::abort();
+                // any inherited COW frame is split from the parent first. A
+                // CLONE_VM child shares that state by definition and must not
+                // split it from the suspended parent.
+                if !shares_mm {
+                    if let Err(error) = child_engine.refresh_fork_process_state() {
+                        tracing::error!(child_pid, %error, "refresh materialized child process state");
+                        std::process::abort();
+                    }
                 }
                 // The child inventory is authoritative before this first
                 // kernel-originated write. If the address lies in a fork-COW
