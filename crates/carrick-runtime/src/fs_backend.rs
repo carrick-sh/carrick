@@ -349,6 +349,13 @@ pub trait FsBackend: Send + Sync {
     /// in the rootfs.
     fn remove_entry(&self, path: &str) -> bool;
 
+    /// Checked form of [`FsBackend::remove_entry`] for transactional cleanup.
+    /// `Ok(false)` means the entry was already absent; an actual backend/path
+    /// failure must remain distinguishable from absence.
+    fn remove_entry_checked(&self, path: &str) -> Result<bool, BackendError> {
+        Ok(self.remove_entry(path))
+    }
+
     /// Tombstone `path` so that subsequent layered lookups treat it as
     /// absent, even if the rootfs still has it underneath.
     fn mark_deleted(&self, path: &str) -> Result<(), BackendError>;
@@ -5194,35 +5201,51 @@ impl FsBackend for HostFsBackend {
     }
 
     fn remove_entry(&self, path: &str) -> bool {
-        let Some(normalized) = normalize(path) else {
-            return false;
-        };
-        let Some(rel) = Self::rel_path(&normalized) else {
-            return false;
-        };
+        self.remove_entry_checked(path).unwrap_or(false)
+    }
+
+    fn remove_entry_checked(&self, path: &str) -> Result<bool, BackendError> {
+        let normalized = normalize(path).ok_or(BackendError::Invalid)?;
+        let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
         // The cap-std scratch is the source of truth (readdir/lookup hit
         // it), so remove from disk unconditionally.
-        let Ok((dir, at_rel)) = self.at(rel) else {
-            return false;
-        };
+        let (dir, at_rel) = self.at(rel).map_err(|_| BackendError::Io)?;
         // Discriminate file from directory rather than testing `is_ok()` on
         // either: only a DIRECTORY removal can invalidate a cached dirfd, and
         // charging the directory generation for every file unlink would flush
         // the cache thousands of times on a build for no reason.
-        let removed_file = dir.remove_file(&at_rel).is_ok();
-        let removed_dir = !removed_file && dir.remove_dir(&at_rel).is_ok();
+        let file_error = dir.remove_file(&at_rel).err();
+        let dir_error = if file_error.is_some() {
+            dir.remove_dir(&at_rel).err()
+        } else {
+            None
+        };
+        let removed_file = file_error.is_none();
+        let removed_dir = file_error.is_some() && dir_error.is_none();
         if removed_dir {
             crate::fs_resolve_cache::bump_dir_generation();
             self.drop_dir_cache();
         }
         let removed = removed_file || removed_dir;
+        if !removed {
+            let absent = file_error
+                .as_ref()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                && dir_error
+                    .as_ref()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+            if absent {
+                return Ok(false);
+            }
+            return Err(BackendError::Io);
+        }
         // Clean up any per-symlink xattr sidecars (non-macOS owner store) so a
         // later entry that reuses the name does not inherit a stale owner.
         #[cfg(not(target_os = "macos"))]
         if removed {
             remove_link_xattr_sidecars(&dir, &at_rel);
         }
-        removed
+        Ok(true)
     }
 
     fn mark_deleted(&self, path: &str) -> Result<(), BackendError> {
@@ -7764,6 +7787,25 @@ mod tests {
         assert!(b.remove_entry(&path), "remove_entry deepest dir");
         let parent = &path[..path.len() - (name.len() + 1)];
         assert!(b.remove_entry(parent), "remove_entry parent dir");
+    }
+
+    #[test]
+    fn host_checked_remove_distinguishes_unlink_failure_from_absence() {
+        let (b, _scratch) = host_backend();
+        b.make_dir("/occupied").unwrap();
+        b.set_file_contents("/occupied/child", b"still-live".to_vec())
+            .unwrap();
+
+        assert_eq!(
+            b.remove_entry_checked("/occupied"),
+            Err(BackendError::Io),
+            "a non-empty durable directory is a real cleanup failure, not absence"
+        );
+        assert_eq!(b.remove_entry_checked("/absent"), Ok(false));
+        assert_eq!(
+            b.remove_entry_checked("relative/path"),
+            Err(BackendError::Invalid)
+        );
     }
 
     #[cfg(target_os = "macos")]
