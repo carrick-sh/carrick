@@ -3941,10 +3941,19 @@ impl GlobalFrameIpaAllocator {
         let arena_base = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE;
         let arena_end =
             arena_base.saturating_add(carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_SIZE);
-        let length = length.next_multiple_of(CowArmedRanges::COMPOUND_SIZE);
-        let end = base.saturating_add(length);
-        if length == 0 || base < arena_base || end > arena_end {
-            return Ok(());
+        let length = align_up(length, CowArmedRanges::COMPOUND_SIZE)?;
+        if length == 0 {
+            return Err(TrapError::Hypervisor(
+                "cannot release an empty global frame IPA extent".to_owned(),
+            ));
+        }
+        let end = base
+            .checked_add(length)
+            .ok_or_else(|| TrapError::Hypervisor("global frame IPA release overflow".to_owned()))?;
+        if base < arena_base || end > arena_end {
+            return Err(TrapError::Hypervisor(format!(
+                "global frame IPA release is outside the arena: base=0x{base:x} length=0x{length:x}"
+            )));
         }
         if self.live.get(&base).copied() != Some(length) {
             return Err(TrapError::Hypervisor(format!(
@@ -13044,6 +13053,24 @@ mod frame_inventory_backend_tests {
     fn global_frame_allocator_rejects_duplicate_or_partial_release() {
         let mut allocator = GlobalFrameIpaAllocator::new();
         let frame = allocator.allocate(0x8000, 0x4000).unwrap();
+        assert!(allocator.release(frame, 0).is_err());
+        assert!(
+            allocator
+                .release(
+                    carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE - 0x4000,
+                    0x4000,
+                )
+                .is_err()
+        );
+        assert!(
+            allocator
+                .release(
+                    carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE
+                        + carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_SIZE,
+                    0x4000,
+                )
+                .is_err()
+        );
         assert!(allocator.release(frame, 0x4000).is_err());
         allocator.release(frame, 0x8000).unwrap();
         assert!(allocator.release(frame, 0x8000).is_err());
