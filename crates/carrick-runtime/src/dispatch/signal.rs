@@ -844,12 +844,19 @@ impl SyscallDispatcher {
             WaitSigMask::Replace(s) => s,
             WaitSigMask::Additive(s) => self.signal_mask_for(context, tid).union(s),
         };
+        // Linux only interrupts a blocking syscall for a signal whose delivery
+        // can run a handler or apply a non-ignore default action. SIGCHLD,
+        // SIGURG, and SIGWINCH at SIG_DFL (plus explicit SIG_IGN) may remain in
+        // the pending set until the next userspace boundary, but their wake is
+        // an internal re-dispatch edge rather than guest-visible EINTR.
+        let non_interrupting =
+            effective_block_mask.union(self.wait_ignored_disposition_mask(context));
         let pending = Self::required_signal_thread(context, tid)
             .signal_state()
             .pending()
             .union(context.shared().pending_signals().present());
         !pending
-            .intersect(effective_block_mask.complement().union(always_deliverable))
+            .intersect(non_interrupting.complement().union(always_deliverable))
             .is_empty()
     }
 
@@ -3367,6 +3374,21 @@ mod tests {
             tid,
             WaitSigMask::Replace(SigSet::EMPTY)
         ));
+    }
+
+    #[test]
+    fn wait_predicate_does_not_interrupt_for_default_ignored_signal() {
+        use carrick_abi::WaitSigMask;
+
+        let d = SyscallDispatcher::new();
+        let context = d.exact_signal_context_for_test();
+        let tid = context.thread().registry_id();
+        d.mark_process_signal_pending(&context, crate::linux_abi::LINUX_SIGCHLD);
+
+        assert!(
+            !d.has_deliverable_dispatch_pending_for_wait(&context, tid, WaitSigMask::NONE),
+            "default-ignored SIGCHLD is pending but cannot interrupt a Linux blocking wait"
+        );
     }
 
     /// Pins the procladder_mt silent-stall root cause: a PROCESS-directed

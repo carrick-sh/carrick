@@ -635,9 +635,12 @@ impl ProcessContext {
     }
 
     /// Publish Linux lifecycle state before any irreversible backend teardown.
-    /// Root-slot/ASID retirement is deliberately separate so the runtime can order
-    /// output and fd finalization first, then publish the zombie/pidfd wake,
-    /// then serialize backend retirement under the topology lock.
+    /// The callback runs after the zombie is durable and the exiting task is no
+    /// longer live, but while the exit reservation still excludes waiters. The
+    /// runtime uses that window to retire the process file table before queueing
+    /// SIGCHLD: Linux closes every process fd before the parent can observe exit.
+    /// Root-slot/ASID retirement remains deliberately separate and follows output
+    /// and fd finalization.
     /// `status` is the Linux `wait(2)` encoding, built by
     /// [`crate::run_result::RunResult::wait_status_encoding`] so that signal death and
     /// normal exit cannot be confused. This used to take a bare exit code and
