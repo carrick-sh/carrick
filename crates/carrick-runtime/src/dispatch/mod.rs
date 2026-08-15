@@ -1352,6 +1352,13 @@ pub enum DispatchOutcome {
     Returned {
         value: i64,
     },
+    /// `sched_yield(2)` reached the threaded runtime. A bounded M:N backend
+    /// must release its current vCPU lease before yielding so a runnable guest
+    /// thread queued behind the budget can make progress; yielding only the
+    /// host pthread retains the scarce lease and can deadlock oversubscribed
+    /// thread groups. Unbounded backends reduce this to the historical host
+    /// `yield_now` fast path.
+    SchedulerYield,
     Errno {
         errno: LinuxErrno,
     },
@@ -1747,6 +1754,7 @@ impl DispatchOutcome {
     fn retval_errno(&self) -> (i64, Option<i32>) {
         match self {
             DispatchOutcome::Returned { value } => (*value, None),
+            DispatchOutcome::SchedulerYield => (0, None),
             DispatchOutcome::Errno { errno } => (errno.guest_retval(), Some(errno.get())),
             DispatchOutcome::Exit { code } => (*code as i64, None),
             DispatchOutcome::SignalDeath { signum } => ((128 + *signum) as i64, None),
@@ -5854,10 +5862,7 @@ impl SyscallDispatcher {
                     DispatchOutcome::Returned { value: 0 }
                 }
             }
-            124 => {
-                std::thread::yield_now();
-                DispatchOutcome::Returned { value: 0 }
-            }
+            124 => DispatchOutcome::SchedulerYield,
             172 => {
                 if self.execution_backend() == crate::page_profile::ExecutionBackend::HvPatch {
                     DispatchOutcome::Returned {
@@ -13815,6 +13820,28 @@ mod container_policy_dispatch_tests {
             )
             .expect("threaded dispatch");
         assert_eq!(outcome, DispatchOutcome::Errno { errno: LINUX_EPERM });
+    }
+
+    #[test]
+    fn threaded_sched_yield_reaches_the_vcpu_scheduler() {
+        let dispatcher = SyscallDispatcher::new();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(2201));
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; 4096]);
+        let outcome = dispatcher
+            .dispatch_threaded(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(124, SyscallArgs([0; 6])),
+                &mut memory,
+                &reporter,
+                registry.main_tid(),
+                &registry,
+                &crate::thread::FutexTable::new(),
+            )
+            .expect("threaded sched_yield dispatch");
+
+        assert_eq!(outcome, DispatchOutcome::SchedulerYield);
     }
 
     #[test]
