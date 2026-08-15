@@ -289,6 +289,27 @@ fn merge_epoll_edge_sample(
     }
 }
 
+fn epoll_wait_sample_needs_host_rebind(
+    before: u32,
+    raw: u32,
+    read_avail_changed: bool,
+    clear_write_backpressure: bool,
+    edge_drained: bool,
+    masked_ready: bool,
+) -> bool {
+    // BSD edge filters use EV_DISPATCH and therefore need an explicit rebind
+    // after a delivered event. A masked event whose readiness snapshot did not
+    // change is different: re-adding the filter can immediately reproduce the
+    // same event when NOTE_LOWAT cannot express `last_read_avail + 1` (for
+    // example, a stream socket already at its receive-buffer ceiling). Leave
+    // that filter disabled until guest I/O advances the latch; the
+    // consumption path rebinds it through `epoll_rearm_after_io`.
+    before != raw
+        || read_avail_changed
+        || clear_write_backpressure
+        || (edge_drained && !masked_ready)
+}
+
 #[cfg(test)]
 mod epoll_edge_sample_tests {
     use super::*;
@@ -300,6 +321,42 @@ mod epoll_edge_sample_tests {
         merge_epoll_edge_sample(&mut accumulated, LINUX_EPOLLOUT, 8 * 1024 * 1024);
 
         assert_eq!(accumulated, (LINUX_EPOLLIN | LINUX_EPOLLOUT, 35));
+    }
+
+    #[test]
+    fn unchanged_masked_edge_stays_disarmed_until_io_progress() {
+        assert!(!epoll_wait_sample_needs_host_rebind(
+            LINUX_EPOLLIN,
+            LINUX_EPOLLIN,
+            false,
+            false,
+            true,
+            true,
+        ));
+        assert!(!epoll_wait_sample_needs_host_rebind(
+            LINUX_EPOLLIN,
+            LINUX_EPOLLIN,
+            false,
+            false,
+            false,
+            true,
+        ));
+        assert!(epoll_wait_sample_needs_host_rebind(
+            0,
+            LINUX_EPOLLIN,
+            true,
+            false,
+            true,
+            false,
+        ));
+        assert!(epoll_wait_sample_needs_host_rebind(
+            LINUX_EPOLLIN,
+            LINUX_EPOLLIN,
+            false,
+            false,
+            true,
+            false,
+        ));
     }
 }
 
@@ -3717,10 +3774,14 @@ impl SyscallDispatcher {
                                 feature = "platform-netbsd"
                             ))]
                             if slot.event.events & LINUX_EPOLLET != 0
-                                && (edge_drained
-                                    || masked_ready
-                                    || before != raw
-                                    || read_avail_changed)
+                                && epoll_wait_sample_needs_host_rebind(
+                                    before,
+                                    raw,
+                                    read_avail_changed,
+                                    clear_write_backpressure,
+                                    edge_drained,
+                                    masked_ready,
+                                )
                                 && let Some(host_fd) = this.host_fd_for_poll(fd)
                             {
                                 host_rearms.push(host_fd.get());
