@@ -1221,6 +1221,9 @@ impl SyscallDispatcher {
         }
         let kernel = ctx.kernel.kernel();
         let Some(target_key) = hvpatch_process_signal_target(kernel, pid) else {
+            if hvpatch_null_signal_observes_zombie(kernel, pid, signum) {
+                return Some(DispatchOutcome::Returned { value: 0 });
+            }
             return Some(DispatchOutcome::errno(LINUX_ESRCH));
         };
         Some(self.hvpatch_exact_process_signal(ctx.kernel, target_key, signum, siginfo))
@@ -2511,6 +2514,22 @@ fn hvpatch_process_signal_target(
     })
 }
 
+fn hvpatch_null_signal_observes_zombie(
+    kernel: &crate::kernel::Kernel,
+    pid: i32,
+    signum: u64,
+) -> bool {
+    // Linux keeps an exited child addressable until its parent consumes the
+    // wait result. Numeric reuse cannot race this lookup: the zombie retains
+    // its TaskClaim until that same consuming wait removes it.
+    if signum != 0 {
+        return false;
+    }
+    crate::kernel::TaskId::from_abi_positive(pid)
+        .ok()
+        .is_some_and(|target| kernel.registry().zombie(target).is_some())
+}
+
 fn hvpatch_owns_specific_thread_signal(hvpatch_lane: bool) -> bool {
     hvpatch_lane
 }
@@ -2735,6 +2754,69 @@ mod tests {
             hvpatch_process_signal_target(root.kernel(), sibling_tid.raw()),
             Some(root.task().key())
         );
+    }
+
+    #[test]
+    fn hvpatch_null_signal_observes_zombie_until_reap() {
+        let dispatcher = SyscallDispatcher::new();
+        let parent = dispatcher.capture_one_task_context().expect("context");
+        let child_thread =
+            crate::thread::ThreadId::synthetic_for_tests(parent.thread().registry_id().raw() + 1);
+        let plan =
+            crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty()).unwrap();
+        let child = parent
+            .kernel()
+            .reserve_fork(&parent, plan, "signal-zombie-fork".to_owned(), None)
+            .unwrap()
+            .prepare_reference(child_thread)
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_parts()
+            .unwrap()
+            .0;
+        let child_id = child.task().key().id;
+        let child_pid = child_id.raw();
+
+        parent
+            .kernel()
+            .exit_task(
+                child_id,
+                crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .expect("child exit");
+
+        assert!(hvpatch_process_signal_target(parent.kernel(), child_pid).is_none());
+        assert!(hvpatch_null_signal_observes_zombie(
+            parent.kernel(),
+            child_pid,
+            0
+        ));
+        assert!(!hvpatch_null_signal_observes_zombie(
+            parent.kernel(),
+            child_pid,
+            crate::linux_abi::LINUX_SIGUSR1 as u64,
+        ));
+        assert!(!hvpatch_null_signal_observes_zombie(
+            parent.kernel(),
+            child_pid + 1000,
+            0,
+        ));
+
+        parent
+            .kernel()
+            .wait_child(
+                parent.task().key().id,
+                Some(child_id),
+                crate::kernel::WaitMode::Consume,
+            )
+            .expect("consume child wait");
+        assert!(!hvpatch_null_signal_observes_zombie(
+            parent.kernel(),
+            child_pid,
+            0,
+        ));
     }
 
     #[test]
