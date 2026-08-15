@@ -1371,12 +1371,21 @@ impl SyscallDispatcher {
         mode: u64,
     ) -> Result<DispatchOutcome, DispatchError> {
         let path = read_guest_c_string(&*cx.memory, pathname)?;
-        self.open_at_path_string(cx.kernel, dirfd, &path, flags, mode, cx.reporter)
+        self.open_at_path_string(
+            cx.kernel,
+            cx.thread.as_ref().map(|thread| thread.registry),
+            dirfd,
+            &path,
+            flags,
+            mode,
+            cx.reporter,
+        )
     }
 
     fn open_at_path_string(
         &self,
         context: &crate::kernel::KernelContext,
+        registry: Option<&crate::thread::ThreadRegistry>,
         dirfd: u64,
         path: &str,
         flags: u64,
@@ -1750,7 +1759,8 @@ impl SyscallDispatcher {
                 _ => {}
             }
         }
-        let vfs_outcome = self.try_vfs_open(context, &path, access, flags, vfs_create_mode);
+        let vfs_outcome =
+            self.try_vfs_open(context, registry, &path, access, flags, vfs_create_mode);
         match vfs_outcome {
             VfsOpenAttempt::Installed(fd) => {
                 // VFS mounts return before the overlay/rootfs O_DIRECTORY gate
@@ -3096,6 +3106,7 @@ impl SyscallDispatcher {
     fn try_vfs_open(
         &self,
         context: &crate::kernel::KernelContext,
+        registry: Option<&crate::thread::ThreadRegistry>,
         path: &str,
         access: u64,
         flags: u64,
@@ -3138,6 +3149,7 @@ impl SyscallDispatcher {
         let sysvipc_shm = self.sysvipc_shm_table();
         let sysvipc_sem = self.sysvipc_sem_table();
         let sysvipc_msg = self.sysvipc_msg_table();
+        let proc_threads = self.synthetic_proc_threads(context, registry);
         let ctx = crate::vfs::OpenContext {
             executable_path: Some(exec_path.as_str()),
             argv: Some(argv.as_slice()),
@@ -3166,6 +3178,7 @@ impl SyscallDispatcher {
             sig_caught,
             sig_shdpnd,
             identity: self.synthetic_proc_identity(context),
+            threads: proc_threads.as_deref(),
             sysvipc_shm: Some(sysvipc_shm.as_str()),
             sysvipc_sem: Some(sysvipc_sem.as_str()),
             sysvipc_msg: Some(sysvipc_msg.as_str()),
@@ -8051,7 +8064,15 @@ impl SyscallDispatcher {
                 Ok(path) => path,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
-            this.open_at_path_string(cx.kernel, arg0, path.as_ref(), flags, mode, cx.reporter)
+            this.open_at_path_string(
+                cx.kernel,
+                cx.thread.as_ref().map(|thread| thread.registry),
+                arg0,
+                path.as_ref(),
+                flags,
+                mode,
+                cx.reporter,
+            )
 
         }
 
@@ -13911,6 +13932,7 @@ mod tests {
         let dispatcher = SyscallDispatcher::new();
         let outcome = dispatcher.try_vfs_open(
             &dispatcher.exact_signal_context_for_test(),
+            None,
             "/tmp/not-a-vfs-mount",
             LINUX_O_RDWR,
             0,
@@ -13944,6 +13966,7 @@ mod tests {
             let outcome = dispatcher
                 .open_at_path_string(
                     &dispatcher.exact_signal_context_for_test(),
+                    None,
                     LINUX_AT_FDCWD,
                     "/bind/target",
                     flags,
@@ -13958,6 +13981,7 @@ mod tests {
         let create = dispatcher
             .open_at_path_string(
                 &dispatcher.exact_signal_context_for_test(),
+                None,
                 LINUX_AT_FDCWD,
                 "/bind/missing",
                 LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_DIRECTORY,
@@ -13972,6 +13996,7 @@ mod tests {
             dispatcher
                 .open_at_path_string(
                     &dispatcher.exact_signal_context_for_test(),
+                    None,
                     LINUX_AT_FDCWD,
                     "/bind",
                     crate::linux_abi::LINUX_O_PATH | LINUX_O_DIRECTORY,

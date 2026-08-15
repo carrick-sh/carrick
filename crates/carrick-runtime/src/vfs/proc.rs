@@ -156,6 +156,17 @@ pub struct SyntheticProcIdentity {
     pub session: u32,
 }
 
+/// One authoritative Linux thread rendered by the in-process HVPatch `/proc`
+/// view. The Linux TID is distinct from the runtime registry id on this lane;
+/// carrying the resolved state/name snapshot prevents `/proc/self/task/<tid>`
+/// from accidentally consulting another HVPatch process's global registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntheticProcThread {
+    pub tid: u32,
+    pub state: char,
+    pub comm: Option<String>,
+}
+
 /// Minimal live state needed by synthetic `/proc` renderers.
 #[derive(Debug, Clone, Default)]
 pub struct SyntheticProcContext {
@@ -205,6 +216,9 @@ pub struct SyntheticProcContext {
     /// Exact task identity for the in-process HVPatch kernel lane. `None`
     /// preserves mature native/VMM host-process rendering byte-for-byte.
     pub identity: Option<SyntheticProcIdentity>,
+    /// Exact live-thread snapshot for the same task. `None` preserves the
+    /// mature one-process-per-host-process registry lookup byte-for-byte.
+    pub threads: Option<Vec<SyntheticProcThread>>,
     pub sysvipc_shm: String,
     pub sysvipc_sem: String,
     pub sysvipc_msg: String,
@@ -831,7 +845,7 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
             }
             let self_comm = context_task_comm(ctx);
             parse_proc_pid_path(path)
-                .and_then(|(pid, rest)| synthetic_proc_pid_file(pid, rest, &self_comm))
+                .and_then(|(pid, rest)| synthetic_proc_pid_file(pid, rest, &self_comm, ctx))
         }
     }
 }
@@ -1979,6 +1993,7 @@ impl Vfs for ProcVfs {
             sig_caught: ctx.sig_caught,
             sig_shdpnd: ctx.sig_shdpnd,
             identity: ctx.identity,
+            threads: ctx.threads.map(|threads| threads.to_vec()),
             sysvipc_shm: ctx.sysvipc_shm.unwrap_or("").to_owned(),
             sysvipc_sem: ctx.sysvipc_sem.unwrap_or("").to_owned(),
             sysvipc_msg: ctx.sysvipc_msg.unwrap_or("").to_owned(),
@@ -2379,7 +2394,11 @@ fn synthetic_proc_self_status(ctx: &SyntheticProcContext) -> String {
     // whether os.fork() must emit the multi-threaded-fork DeprecationWarning
     // (test_threading.test_*_after_fork). Was hardcoded 1, so a guest with live
     // worker threads looked single-threaded and the warning never fired.
-    let nthreads = crate::current_thread_states().len().max(1);
+    let nthreads = ctx
+        .threads
+        .as_ref()
+        .map_or_else(|| crate::current_thread_states().len(), Vec::len)
+        .max(1);
     let ncpu = crate::host_facts::logical_cpu_count();
     let cpus_hex = cpus_allowed_hex(ncpu);
     let cpus_list = cpus_allowed_list(ncpu);
@@ -2575,13 +2594,27 @@ fn synthetic_proc_self_stat(ctx: &SyntheticProcContext) -> String {
     );
     let pgrp = identity.map_or(pid, |identity| identity.pgrp);
     let session = identity.map_or(pid, |identity| identity.session);
-    let thread_states = crate::current_thread_states();
-    let nthreads = thread_states.len().max(1);
-    let state = proc_self_stat_state_from_threads(
-        &thread_states,
-        pid,
-        crate::namespace::pid::self_ns_pid(),
-    );
+    let (nthreads, state) = match ctx.threads.as_ref() {
+        Some(threads) => (
+            threads.len().max(1),
+            threads
+                .iter()
+                .find(|thread| thread.tid == pid)
+                .or_else(|| threads.first())
+                .map_or('R', |thread| thread.state),
+        ),
+        None => {
+            let thread_states = crate::current_thread_states();
+            (
+                thread_states.len().max(1),
+                proc_self_stat_state_from_threads(
+                    &thread_states,
+                    pid,
+                    crate::namespace::pid::self_ns_pid(),
+                ),
+            )
+        }
+    };
     proc_stat_line(
         pid,
         &comm,
@@ -2658,14 +2691,64 @@ fn self_utime_ticks() -> u64 {
     crate::guest_cpu::total_us().saturating_mul(carrick_abi::LINUX_CLK_TCK as u64) / 1_000_000
 }
 
-fn synthetic_proc_pid_file(pid: u32, rest: &str, self_comm: &str) -> Option<Vec<u8>> {
+fn synthetic_proc_pid_file(
+    pid: u32,
+    rest: &str,
+    self_comm: &str,
+    ctx: &SyntheticProcContext,
+) -> Option<Vec<u8>> {
     if let Some(task_rest) = rest.strip_prefix("task/") {
         if let Some((tid_str, file)) = task_rest.split_once('/')
             && let Ok(tid) = tid_str.parse::<u32>()
         {
-            return synthetic_proc_pid_file(tid, file, self_comm);
+            return synthetic_proc_pid_file(tid, file, self_comm, ctx);
         }
         return None;
+    }
+
+    if let Some(threads) = ctx.threads.as_ref()
+        && let Some(thread) = threads.iter().find(|thread| thread.tid == pid)
+    {
+        let identity = ctx.identity?;
+        let name = thread.comm.as_deref().unwrap_or(self_comm);
+        match rest {
+            "stat" => {
+                return Some(
+                    proc_stat_line(
+                        pid,
+                        name,
+                        thread.state,
+                        identity.ppid,
+                        identity.pgrp,
+                        identity.session,
+                        threads.len().max(1),
+                        self_utime_ticks(),
+                    )
+                    .into_bytes(),
+                );
+            }
+            "comm" => return Some(format!("{name}\n").into_bytes()),
+            "cmdline" => {
+                let mut bytes = name.as_bytes().to_vec();
+                bytes.push(0);
+                return Some(bytes);
+            }
+            "status" => {
+                return Some(
+                    format!(
+                        "Name:\t{name}\nState:\t{state} ({long})\nTgid:\t{tgid}\n\
+Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t{count}\n",
+                        state = thread.state,
+                        long = proc_state_long(thread.state),
+                        tgid = identity.pid,
+                        ppid = identity.ppid,
+                        count = threads.len(),
+                    )
+                    .into_bytes(),
+                );
+            }
+            _ => return None,
+        }
     }
 
     let own_threads = crate::current_thread_states();
@@ -3209,6 +3292,40 @@ fn per_thread_comm(tid: crate::thread::ThreadId, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hvpatch_proc_uses_authoritative_linux_thread_snapshot() {
+        let ctx = SyntheticProcContext {
+            task_comm: "fallback".to_owned(),
+            identity: Some(SyntheticProcIdentity {
+                pid: 1,
+                tid: 1,
+                ppid: 0,
+                pgrp: 1,
+                session: 1,
+            }),
+            threads: Some(vec![
+                SyntheticProcThread {
+                    tid: 1,
+                    state: 'R',
+                    comm: Some("mainthread".to_owned()),
+                },
+                SyntheticProcThread {
+                    tid: 2,
+                    state: 'S',
+                    comm: Some("worker-thread".to_owned()),
+                },
+            ]),
+            ..SyntheticProcContext::default()
+        };
+
+        let status = String::from_utf8(synthetic_file("/proc/self/status", &ctx).unwrap()).unwrap();
+        assert!(status.contains("Threads:\t2\n"), "{status}");
+        assert_eq!(
+            synthetic_file("/proc/self/task/2/comm", &ctx).unwrap(),
+            b"worker-thread\n"
+        );
+    }
 
     #[test]
     fn recognizes_proc_self_mem_paths() {
@@ -4296,14 +4413,15 @@ mod tests {
         }
         assert!(zombie_seen, "child never became an unreaped zombie");
 
-        let stat = synthetic_proc_pid_file(child_pid, "stat", "test")
+        let ctx = SyntheticProcContext::default();
+        let stat = synthetic_proc_pid_file(child_pid, "stat", "test", &ctx)
             .expect("stat for an unreaped zombie child must resolve");
         let stat = String::from_utf8(stat).unwrap();
         let state = stat
             .rsplit_once(") ")
             .and_then(|(_, tail)| tail.chars().next())
             .expect("stat line has a state field");
-        let status = synthetic_proc_pid_file(child_pid, "status", "test")
+        let status = synthetic_proc_pid_file(child_pid, "status", "test", &ctx)
             .expect("status for an unreaped zombie child must resolve");
         let status = String::from_utf8(status).unwrap();
 

@@ -7550,6 +7550,55 @@ impl SyscallDispatcher {
             })
     }
 
+    fn synthetic_proc_threads(
+        &self,
+        context: &crate::kernel::KernelContext,
+        registry: Option<&crate::thread::ThreadRegistry>,
+    ) -> Option<Vec<crate::vfs::SyntheticProcThread>> {
+        if self.execution_backend != crate::page_profile::ExecutionBackend::HvPatch {
+            return None;
+        }
+        let registry = registry?;
+        #[cfg(feature = "platform-macos")]
+        let states: std::collections::HashMap<_, _> = registry
+            .thread_ports()
+            .into_iter()
+            .map(|(id, port)| {
+                let state = if port == 0 {
+                    'R'
+                } else {
+                    crate::host_proc::thread_run_state_char(port)
+                };
+                (id, state)
+            })
+            .collect();
+        #[cfg(not(feature = "platform-macos"))]
+        let states: std::collections::HashMap<_, _> =
+            registry.thread_state_chars().into_iter().collect();
+        let mut threads: Vec<_> = context
+            .task()
+            .threads()
+            .into_iter()
+            .map(|thread| {
+                let registry_id = thread.registry_id();
+                let comm = registry.thread_name(registry_id).map(|name| {
+                    let len = name
+                        .iter()
+                        .position(|&byte| byte == 0)
+                        .unwrap_or(name.len());
+                    String::from_utf8_lossy(&name[..len]).into_owned()
+                });
+                crate::vfs::SyntheticProcThread {
+                    tid: thread.key().tid.raw() as u32,
+                    state: states.get(&registry_id).copied().unwrap_or('R'),
+                    comm,
+                }
+            })
+            .collect();
+        threads.sort_by_key(|thread| thread.tid);
+        Some(threads)
+    }
+
     fn mem_snapshot(&self) -> mem::MemState {
         self.mem.lock().clone()
     }
@@ -7606,6 +7655,7 @@ impl SyscallDispatcher {
             sig_caught,
             sig_shdpnd,
             identity: self.synthetic_proc_identity(context),
+            threads: self.synthetic_proc_threads(context, None),
             sysvipc_shm: self.sysvipc_shm_table(),
             sysvipc_sem: self.sysvipc_sem_table(),
             sysvipc_msg: self.sysvipc_msg_table(),
