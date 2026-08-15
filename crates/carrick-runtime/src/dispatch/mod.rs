@@ -2320,7 +2320,7 @@ pub(crate) struct CoreProcessSnapshot {
     pub identity: crate::core_dump::ProcessIdentity,
     pub auxv: Vec<(u64, u64)>,
     pub maps: Vec<ProcMapsEntry>,
-    pub executable_path: String,
+    pub file_mappings: Vec<crate::core_dump::FileMapping>,
     pub cwd: String,
     pub rlimit_core: u64,
     pub dumpable: bool,
@@ -2560,7 +2560,7 @@ mod core_publication_tests {
             },
             auxv: vec![(6, 4096)],
             maps: Vec::new(),
-            executable_path: "/bin/coretest".to_owned(),
+            file_mappings: Vec::new(),
             cwd: "/tmp/coretest".to_owned(),
             rlimit_core: 4096,
             dumpable: true,
@@ -2633,6 +2633,32 @@ mod core_publication_tests {
                 "temporary file after {failpoint}"
             );
         }
+    }
+
+    #[test]
+    fn published_core_remains_rollback_owned_until_wait_commit() {
+        let dispatcher = SyscallDispatcher::new();
+        let snapshot = snapshot();
+        let publication = dispatcher
+            .publish_core_atomic_with_failpoint(&snapshot, 11, b"rollback".to_vec(), None)
+            .expect("publish before wait commit");
+        dispatcher.rollback_core_publication(&publication);
+        assert!(
+            dispatcher
+                .fs
+                .rootfs_vfs
+                .overlay
+                .file_contents(&publication.path)
+                .is_none()
+        );
+        assert!(
+            dispatcher
+                .fs
+                .rootfs_vfs
+                .overlay
+                .file_contents("/tmp/coretest/core.carrick-tmp-91-11")
+                .is_none()
+        );
     }
 
     #[test]
@@ -3573,15 +3599,28 @@ impl SyscallDispatcher {
         self.mem.lock().address_space_regions = Some(regions);
     }
 
+    pub(crate) fn set_address_space_file_mappings(
+        &self,
+        mappings: Vec<crate::core_dump::FileMapping>,
+    ) {
+        self.mem.lock().core_file_mappings = mappings;
+    }
+
     /// Publish a replacement image's complete dispatcher memory generation.
     /// Reset, boot-region metadata and auxv become visible under one authority
     /// write, so K1 observers cannot see the destructive exec midpoint.
-    pub(crate) fn publish_exec_image_state(&self, regions: Vec<ProcMapsEntry>, auxv: Vec<u8>) {
+    pub(crate) fn publish_exec_image_state(
+        &self,
+        regions: Vec<ProcMapsEntry>,
+        auxv: Vec<u8>,
+        file_mappings: Vec<crate::core_dump::FileMapping>,
+    ) {
         let _vma_dispatch = self.begin_vma_dispatch();
         let mut mem = self.mem.lock();
         mem.reset_for_execve();
         mem.address_space_regions = Some(regions);
         mem.linux_auxv_image = auxv;
+        mem.core_file_mappings = file_mappings;
     }
 
     /// Capture the guest's serialized ELF auxv image (from the loaded
@@ -3616,9 +3655,9 @@ impl SyscallDispatcher {
         }
         let comm = linux_task_name_to_string(&proc.task_name);
         let psargs = proc.argv.join(" ");
-        let executable_path = proc.executable_path.clone();
         let dumpable = proc.dumpable != 0;
         let maps = mem::project_core_maps(&mem);
+        let file_mappings = mem.core_file_mappings.clone();
         let cwd = context.resources().fs_context().cwd();
         drop(mem);
         drop(proc);
@@ -3636,7 +3675,7 @@ impl SyscallDispatcher {
             },
             auxv,
             maps,
-            executable_path,
+            file_mappings,
             cwd,
             rlimit_core,
             dumpable,
@@ -3702,7 +3741,13 @@ impl SyscallDispatcher {
             if failpoint == Some("fsync") {
                 return Err(CorePublicationError::Failpoint("fsync"));
             }
-            if let Some(fd) = backend.open_raw_fd(&temp_path, true, false, false) {
+            if let Some(fd) = backend.reopen_for_durability(&temp_path).map_err(|error| {
+                CorePublicationError::Backend {
+                    operation: "reopen-for-fsync",
+                    path: temp_path.clone(),
+                    error,
+                }
+            })? {
                 let result = unsafe { libc::fsync(fd) };
                 let errno = (result < 0)
                     .then(|| std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
@@ -3744,6 +3789,13 @@ impl SyscallDispatcher {
             let _ = backend.remove_entry(&temp_path);
         }
         publication
+    }
+
+    /// Remove a renamed core whose matching authoritative wait status did not
+    /// commit. Publication ownership is not released by rename alone.
+    pub(crate) fn rollback_core_publication(&self, publication: &CorePublication) {
+        let backend = &self.fs.rootfs_vfs.overlay;
+        let _ = backend.remove_entry(&publication.path);
     }
 
     /// High-water mark (bump cursor) of the anonymous mmap arena: the guest has
@@ -10073,6 +10125,7 @@ mod overlay_dispatch_tests {
                 prot: LinuxProtFlags::READ,
                 sharing: ProcMapSharing::Private,
                 path: String::new(),
+                file_page_offset: None,
                 locked: None,
                 resident: false,
                 bus_fault: None,
@@ -10095,6 +10148,7 @@ mod overlay_dispatch_tests {
             prot: LinuxProtFlags::READ,
             sharing: ProcMapSharing::Private,
             path: String::new(),
+            file_page_offset: None,
             locked: None,
             resident: false,
             bus_fault: None,

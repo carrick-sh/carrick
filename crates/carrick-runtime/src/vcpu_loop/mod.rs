@@ -409,7 +409,7 @@ mod macos_helper_stubs {
             },
             machine,
         ) {
-            Ok(raw) => raw,
+            Ok(raw) => raw.with_main_file_path(path.clone()),
             Err(err) => {
                 trace_execve(&path, format_args!("elf-load path={path} err={err:?}"));
                 return Err(LINUX_ENOENT);
@@ -1245,6 +1245,7 @@ pub(crate) fn dispatch_with_panic_backstop(
 /// and /proc/self/auxv reflect it (refreshed on each execve).
 pub(crate) fn apply_image_proc_state(dispatcher: &SyscallDispatcher, image: &AddressSpace) {
     dispatcher.set_address_space_regions(proc_maps_from_address_space(image));
+    dispatcher.set_address_space_file_mappings(core_file_mappings_from_address_space(image));
     dispatcher.set_auxv_image(image.linux_auxv_image().to_vec());
 }
 
@@ -1253,7 +1254,24 @@ pub(crate) fn apply_exec_image_proc_state(dispatcher: &SyscallDispatcher, image:
     dispatcher.publish_exec_image_state(
         proc_maps_from_address_space(image),
         image.linux_auxv_image().to_vec(),
+        core_file_mappings_from_address_space(image),
     );
+}
+
+fn core_file_mappings_from_address_space(
+    image: &AddressSpace,
+) -> Vec<crate::core_dump::FileMapping> {
+    image
+        .file_mappings()
+        .iter()
+        .filter(|mapping| !mapping.path.is_empty())
+        .map(|mapping| crate::core_dump::FileMapping {
+            start: mapping.start,
+            end: mapping.end,
+            file_page_offset: mapping.file_page_offset,
+            path: mapping.path.clone(),
+        })
+        .collect()
 }
 
 /// Stamp the per-process identity page the EL1 syscall shim reads (no-op unless
@@ -1410,6 +1428,13 @@ struct BlockingWaitReclaim {
     single_threaded_process: bool,
 }
 
+struct PreparedCorePublication {
+    snapshot: crate::dispatch::CoreProcessSnapshot,
+    bytes: Vec<u8>,
+    generation: u64,
+    fatal_tid: i32,
+}
+
 /// Return whichever bounded-scheduler slot this host thread owns when its
 /// guest vCPU loop ends.  Process-leader threads created by hvpatch fork do
 /// not necessarily hold a lease at startup, but can acquire one later when a
@@ -1560,12 +1585,12 @@ where
         Ok(())
     }
 
-    fn capture_and_publish_core(
+    fn capture_core_for_publication(
         &self,
         kernel: &Kernel,
         engine: &mut E,
         fatal: FatalSignalRecord,
-    ) -> Result<Option<crate::dispatch::CorePublication>, RuntimeError> {
+    ) -> Result<Option<PreparedCorePublication>, RuntimeError> {
         // Linux default actions that carry a core. Other fatal signals still
         // publish a signal wait status, but never set WCOREDUMP.
         if !matches!(fatal.signo, 3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31) {
@@ -1828,25 +1853,7 @@ where
                     size: map.end.saturating_sub(map.start),
                 })
                 .collect::<Vec<_>>();
-            let mappings = process
-                .maps
-                .iter()
-                .filter_map(|map| {
-                    let path = if !map.path.is_empty() {
-                        map.path.clone()
-                    } else if map.execute {
-                        process.executable_path.clone()
-                    } else {
-                        return None;
-                    };
-                    Some(crate::core_dump::FileMapping {
-                        start: map.start,
-                        end: map.end,
-                        file_page_offset: 0,
-                        path,
-                    })
-                })
-                .collect::<Vec<_>>();
+            let mappings = process.file_mappings.clone();
             let thread_count = u64::try_from(threads.len()).unwrap_or(u64::MAX);
             let mapping_count = u64::try_from(mappings.len()).unwrap_or(u64::MAX);
             let region_count = u64::try_from(regions.len()).unwrap_or(u64::MAX);
@@ -1917,14 +1924,12 @@ where
             );
             crate::probes::hvpatch_core_hash(generation, hash_words);
             lifecycle(3, 0);
-            let publication = kernel
-                .dispatcher
-                .publish_core_atomic(&process, generation, bytes)
-                .map_err(|error| {
-                    RuntimeError::FsBackend(anyhow::anyhow!("publish core: {error}"))
-                })?;
-            lifecycle(4, 0);
-            Ok(Some(publication))
+            Ok(Some(PreparedCorePublication {
+                snapshot: process,
+                bytes,
+                generation,
+                fatal_tid: fatal.tid.raw(),
+            }))
         })();
         if result.is_err() || matches!(&result, Ok(None)) {
             lifecycle(6, if result.is_err() { 1 } else { 2 });
@@ -4434,43 +4439,45 @@ where
                 state.linux_tid,
                 terminating_signal,
             );
-            let core_publication = match fatal_signal {
-                Some(fatal) => match state.capture_and_publish_core(&kernel, &mut engine, fatal) {
-                    Ok(publication) => publication,
-                    Err(error) => {
-                        // Core publication is fail-closed but cannot turn a
-                        // guest signal death into a host/runtime abort. The
-                        // parent receives the original signal with WCOREDUMP
-                        // clear, and no final-path artifact survives.
-                        tracing::warn!(
-                            pid = kernel
-                                .hvpatch_process
-                                .as_ref()
-                                .map_or(0, crate::hvpatch::ProcessContext::pid),
-                            %error,
-                            "HVPatch core publication failed closed"
-                        );
-                        None
+            let mut prepared_core = match fatal_signal {
+                Some(fatal) => {
+                    match state.capture_core_for_publication(&kernel, &mut engine, fatal) {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            // Core preparation is fail-closed but cannot turn a
+                            // guest signal death into a host/runtime abort. The
+                            // parent receives the original signal with WCOREDUMP
+                            // clear, and no final-path artifact survives.
+                            tracing::warn!(
+                                pid = kernel
+                                    .hvpatch_process
+                                    .as_ref()
+                                    .map_or(0, crate::hvpatch::ProcessContext::pid),
+                                %error,
+                                "HVPatch core publication failed closed"
+                            );
+                            None
+                        }
                     }
-                },
+                }
                 None => None,
             };
-            let core_dumped = core_publication.is_some();
-            if let Some(publication) = &core_publication {
-                tracing::info!(
-                    pid = kernel
-                        .hvpatch_process
-                        .as_ref()
-                        .map_or(0, crate::hvpatch::ProcessContext::pid),
-                    path = %publication.path,
-                    bytes = publication.bytes,
-                    "published HVPatch Linux core"
-                );
-            }
 
             if let Err(error) = state.terminate_siblings_for_process_exit(&kernel) {
                 tracing::error!(%error, "terminal owner could not drain sibling vCPUs");
                 std::process::abort();
+            }
+            if std::env::var_os("CARRICK_CORE_FAILPOINT")
+                .is_some_and(|value| value == "sibling-drain")
+                && let Some(prepared) = prepared_core.take()
+            {
+                crate::probes::hvpatch_core_lifecycle(
+                    6,
+                    prepared.snapshot.identity.pid,
+                    prepared.fatal_tid,
+                    prepared.generation,
+                    1,
+                );
             }
 
             // The terminal loop outcome may have snapshotted output before a
@@ -4562,14 +4569,63 @@ where
                         }
                     }
                 }
-                // Publication and the wait bit share the same value. A failed
-                // capture/write/rename therefore cannot leave WCOREDUMP set.
+                // Rename is deliberately after sibling drain and every
+                // fallible terminal-inventory edge. Rollback ownership remains
+                // live until authoritative wait-status commit; no observer can
+                // receive WCOREDUMP for an artifact that was later removed.
+                let mut core_publication = match prepared_core.take() {
+                    Some(prepared) => match kernel.dispatcher.publish_core_atomic(
+                        &prepared.snapshot,
+                        prepared.generation,
+                        prepared.bytes,
+                    ) {
+                        Ok(publication) => {
+                            crate::probes::hvpatch_core_lifecycle(
+                                4,
+                                process.pid(),
+                                prepared.fatal_tid,
+                                prepared.generation,
+                                0,
+                            );
+                            Some(publication)
+                        }
+                        Err(error) => {
+                            crate::probes::hvpatch_core_lifecycle(
+                                6,
+                                process.pid(),
+                                prepared.fatal_tid,
+                                prepared.generation,
+                                1,
+                            );
+                            tracing::warn!(pid = process.pid(), %error, "HVPatch core publication failed closed");
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                if std::env::var_os("CARRICK_CORE_FAILPOINT")
+                    .is_some_and(|value| value == "wait-commit")
+                    && let Some(publication) = core_publication.take()
+                {
+                    kernel.dispatcher.rollback_core_publication(&publication);
+                    crate::probes::hvpatch_core_lifecycle(
+                        6,
+                        process.pid(),
+                        fatal_signal.map_or(state.this_tid.raw(), |fatal| fatal.tid.raw()),
+                        publication.generation,
+                        1,
+                    );
+                }
+                let core_dumped = core_publication.is_some();
                 let published_status = crate::kernel::LinuxWaitStatus::from_wait_encoding(
                     final_result.wait_status_encoding(core_dumped),
                 );
                 let current_parent = match process.publish_exit_status(published_status) {
                     Ok(parent) => parent,
                     Err(error) => {
+                        if let Some(publication) = &core_publication {
+                            kernel.dispatcher.rollback_core_publication(publication);
+                        }
                         tracing::error!(
                             pid = process.pid(),
                             %error,
@@ -4585,6 +4641,12 @@ where
                         fatal_signal.map_or(state.this_tid.raw(), |fatal| fatal.tid.raw()),
                         publication.generation,
                         0,
+                    );
+                    tracing::info!(
+                        pid = process.pid(),
+                        path = %publication.path,
+                        bytes = publication.bytes,
+                        "published HVPatch Linux core"
                     );
                 }
                 kernel
@@ -4827,6 +4889,7 @@ pub(super) fn is_default_stop_signal(signum: i32) -> bool {
 /// Run signal delivery for one iteration of the multi-threaded vCPU loop. Returns
 /// `Some(outcome)` when a default-action (terminate) signal fires and the process
 /// should end; `None` to keep running.
+#[allow(clippy::too_many_arguments)]
 fn service_signals_threaded<E: ThreadedEngine>(
     kernel: &Kernel,
     context: &crate::kernel::KernelContext,
