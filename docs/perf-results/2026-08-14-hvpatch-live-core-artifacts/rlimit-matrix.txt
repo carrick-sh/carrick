@@ -1,6 +1,4 @@
-Final signed RLIMIT_CORE matrix (review round 1)
-
-zero|task5-round1-final-rlimit-zero|PASS|command=0|cleanup=0
+zero|task5-r2-rlimit-zero|PASS|rc=0|cleanup=remaining carrick procs (run-id task5-r2-rlimit-zero) = 0
 limit_zero_mode=true
 limit_too_small_mode=false
 requested_limit_applied=true
@@ -9,8 +7,7 @@ child_died_of_sigsegv=true
 wcoredump_clear=true
 no_published_core=true
 no_temporary_core=true
-
-small|task5-round1-final-rlimit-small|PASS|command=0|cleanup=0
+small|task5-r2-rlimit-small|PASS|rc=0|cleanup=remaining carrick procs (run-id task5-r2-rlimit-small) = 0
 limit_zero_mode=false
 limit_too_small_mode=true
 requested_limit_applied=true
@@ -19,5 +16,4 @@ child_died_of_sigsegv=true
 wcoredump_clear=true
 no_published_core=true
 no_temporary_core=true
-
-2/2 PASS.
+2/2 PASS

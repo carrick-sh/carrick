@@ -1,10 +1,11 @@
-Final signed carrick debug core malformed-input matrix
-source=coredumpfile.core
-
-phentsize-zero|PASS|rc=1|invalid ELF header/program-header geometry: e_phentsize is not Elf64_Phdr
-phentsize-eight|PASS|rc=1|invalid ELF header/program-header geometry: e_phentsize is not Elf64_Phdr
-phoff-overflow|PASS|rc=1|core offset/count arithmetic overflowed
-phnum-max|PASS|rc=1|core contains multiple PT_NOTE segments
-note-desc-overflow|PASS|rc=1|note at byte 0 of PT_NOTE is truncated
-
-5/5 rejected without panic or fatal runtime error.
+ei-data|PASS|rc=1|Error: invalid ELF encoding/version identity: EI_DATA is not little-endian
+ei-version|PASS|rc=1|Error: invalid ELF encoding/version identity: EI_VERSION is not current
+e-version|PASS|rc=1|Error: invalid ELF encoding/version identity: e_version is not current
+phentsize-zero|PASS|rc=1|Error: invalid ELF header/program-header geometry: e_phentsize is not Elf64_Phdr
+phentsize-eight|PASS|rc=1|Error: invalid ELF header/program-header geometry: e_phentsize is not Elf64_Phdr
+phoff-overflow|PASS|rc=1|Error: core offset/count arithmetic overflowed
+phnum-max|PASS|rc=1|Error: core contains multiple PT_NOTE segments
+note-desc-overflow|PASS|rc=1|Error: note at byte 0 of PT_NOTE is truncated
+missing-auxv|PASS|rc=1|Error: core has no NT_AUXV note
+overlapping-loads|PASS|rc=1|Error: PT_LOAD virtual address ranges overlap
+10/10 PASS

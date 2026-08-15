@@ -1,7 +1,4 @@
-Final signed CARRICK_NO_FPSIMD fail-closed control
-run=task5-round1-final-no-fpsimd
-
-warning=complete AArch64 core registers require live FP/SIMD capture; CARRICK_NO_FPSIMD disables that authority
+2026-08-15T01:54:46.686845Z  WARN carrick_runtime::vcpu_loop: HVPatch core publication failed closed pid=5 error=trap engine failed: hypervisor operation failed: complete AArch64 core registers require live FP/SIMD capture; CARRICK_NO_FPSIMD disables that authority
 failpoint_mode=true
 requested_limit_applied=true
 reaped=true
@@ -10,4 +7,4 @@ wcoredump_clear=true
 no_published_core=true
 no_temporary_core=true
 command=0
-cleanup=0
+cleanup=remaining carrick procs (run-id task5-r2-no-fpsimd) = 0

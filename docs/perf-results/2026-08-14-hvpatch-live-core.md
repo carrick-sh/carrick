@@ -282,3 +282,79 @@ All referenced receipts are under
 
 The implementation is independently review-ready after the exact evidence-HEAD
 `RUST_TEST_THREADS=1 just ci` result recorded in the Task 5 handoff report.
+
+## Review round 2/5 — superseding receipt
+
+Review source: clean scoped review of `baa1aa63..9d6a584b`.
+
+Signed code HEAD: `73513869c3c0ce7df933aa40724a9a034abcd8bd`.
+This section supersedes all earlier readiness claims and final hashes above.
+
+### Three Important findings and fixes
+
+1. The strict core reader still accepted the wrong `EI_DATA`, `EI_VERSION`,
+   header `e_version`, and a core with no `NT_AUXV`. It now requires the exact
+   Linux ELF64 little-endian/current-version identity, requires one AUXV note,
+   rejects a duplicate, and keeps all malformed-input paths panic-safe. The
+   actual final core's ten-case mutation matrix additionally includes the
+   prior table/note mutations and an overlapping-PT_LOAD mutation; all ten
+   exit nonzero without panic or fatal runtime error.
+2. The live heap projection clamped hidden backing to `brk_current` but did
+   not subtract a dynamic MAP_FIXED replacement. It now subtracts every live
+   dynamic mapping from the projected boot/heap VMAs before inserting dynamic
+   authority. Both the in-memory writer and the validator that re-reads the
+   actual serialized bytes reject overlapping PT_LOAD virtual ranges. The
+   signed Docker differential now reports
+   `pt_load_vmas_nonoverlapping=true`; the final real core's heap loads are
+   adjacent at `0x4000000000..0x4000001000` and
+   `0x4000001000..0x4000002000`, with their exact no-access versus RW
+   permissions and no duplicate byte authority.
+3. Core rollback discarded the boolean result of host unlink and the host
+   backend collapsed path-resolution and unlink errors into absence. A new
+   checked backend operation reserves `Ok(false)` for actual absence and
+   returns `Invalid`/`Io` for durable failures. Transactional cleanup first
+   attempts unlink, structurally invalidates an unlink-resistant artifact to
+   zero bytes, retries, and returns a named `Cleanup` error if removal remains
+   impossible. HVPatch aborts before authoritative terminal/wait publication
+   on that error; it cannot report a normal Linux terminal result around a
+   still-valid orphan. A real HostFsBackend non-empty-directory/path test and
+   an injected error-capable publication backend cover both post-rename and
+   wait-owned rollback failures.
+
+### Final signed evidence
+
+- Binary SHA-256:
+  `356e2c51d506727e3a8074345cca7febcf0b4f58b1eadff9e012add24c1d5709`.
+- Mach-O UUID: `2BD332EA-99E7-3AD5-8679-62D63F1E68BF`; arm64, codesign
+  valid, designated requirement valid, hypervisor entitlement true, and
+  `__TEXT,__dof_carrick` present.
+- Probe SHA-256:
+  `c005c0ea383d3086ae2b009971e0b5335990212608624857e2328f11f0c615bf`.
+- Same-run core SHA-256 and authenticated lifecycle digest:
+  `717da33d1d0d07811e820209f64d58ef4f6558d6cd0395add05003ae9fcea1cb`.
+- Raw lifecycle SHA-256:
+  `f1ac2ebb9009c82afd783f5e42734e441db300fa141d12aa92c39fe12d60621d`.
+- The 11,350,016-byte artifact has three exact threads, 13 notes, 27
+  non-overlapping PT_LOADs, five exact NT_FILE mappings, and 18 auxv entries.
+- The same run completed trace command and cleanup with status zero. Its
+  sequence 1..9, phases 0..5, generation 1, PID/TID 5/5, mm 496, ASID 5,
+  threads 3/3, and every failure/drift/order/bound/error/drop counter were
+  exact and zero where required.
+- Carrick's reader, LLVM readelf, and Homebrew LLDB 22.1.7 all opened those
+  exact bytes. LLDB recovered tids 5/7/8, the SIGSEGV at `str x19,[x0]`, the
+  three GPR/SIMD/FP markers, and readable private-COW memory.
+- Signed serialized Docker differentials were 5/5 MATCH with cleanup zero:
+  coredumpfile `cr-32493-21915`, coredumpbit `cr-32543-28701`, waitidspec
+  `cr-32594-2718`, sigchld `cr-32645-26342`, and signalexit
+  `cr-32694-16290`.
+- The existing signed failpoint matrix remained 19/19 PASS, RLIMIT remained
+  2/2 PASS, and `CARRICK_NO_FPSIMD=1` remained fail closed with WCOREDUMP
+  clear and no final/temp file.
+- Focused review-round tests all passed: lifecycle 6, reader 7, writer 12,
+  publication/rollback 6, fatal/exec authority 2, VMA partition 1, real host
+  cleanup errors 1, durability reopen 1, FP/SIMD authority 1, file provenance
+  1, and HVPatch memory resolution 1.
+
+Review-round commits: `09bdf72d`, `ae30a2ff`, `8f549a18`, and `73513869`.
+The exact evidence-HEAD `RUST_TEST_THREADS=1 just ci` receipt follows the
+evidence commit and is recorded in the ignored Task 5 report.

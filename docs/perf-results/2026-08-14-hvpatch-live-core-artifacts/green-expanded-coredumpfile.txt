@@ -1,6 +1,6 @@
-CARRICK_PROBE_RUN_ID=cr-20949-13766
-CARRICK_PROBE_CLEANUP_RUN_ID=cr-20949-13766
-remaining carrick procs (run-id cr-20949-13766) = 0
+CARRICK_PROBE_RUN_ID=cr-32493-21915
+CARRICK_PROBE_CLEANUP_RUN_ID=cr-32493-21915
+remaining carrick procs (run-id cr-32493-21915) = 0
 MATCH coredumpfile
   made_dir=true
   chdir_ok=true
@@ -27,6 +27,7 @@ MATCH coredumpfile
   nonzero_offset_file_mapping_exact=true
   anonymous_exec_not_file_labeled=true
   nt_file_symbolizer_truth=true
+  pt_load_vmas_nonoverlapping=true
   auxv_present=true
   private_cow_sample_present=true
   shared_sample_present=true
