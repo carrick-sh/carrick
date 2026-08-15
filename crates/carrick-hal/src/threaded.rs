@@ -738,6 +738,12 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
     ) {
     }
 
+    /// Refresh fork-private backend state after the child frame inventory and
+    /// exact MM/COW authority are live, but before the child enters guest code.
+    fn refresh_fork_process_state(&mut self) -> Result<(), TrapError> {
+        Ok(())
+    }
+
     /// Resolve a synchronous stage-1 write-permission fault. `Ok(true)` means
     /// the exact mm now owns a writable copied frame and the instruction should
     /// be retried; `Ok(false)` leaves ordinary fault delivery unchanged.
