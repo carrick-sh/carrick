@@ -103,10 +103,11 @@ The criterion is **correctness and completeness**, not the CPU bar:
    a startup/version smoke is evidence for a blocker closure, not completion.
 
 **Performance is explicitly NOT the gate.** The 2.3 CPU-s target and the
-`native`-lane comparison are retained below as historical context and as a
-regression floor — work must not make the build dramatically worse — but no
-phase is scheduled, ranked or retained on a CPU number any more. A phase whose
-only claim is speed is off the critical path until the kernel is finished.
+`native`-lane comparison are retained below as historical context only. They
+are not regression gates: the project accepts regressions in the retired
+`native`/DSR and `vmm` lanes while the HVPatch kernel is completed. No phase is
+scheduled, ranked or retained on a CPU number any more. A phase whose only
+claim is speed is off the critical path until the kernel is finished.
 
 ## What changed in this revision, and why
 
@@ -114,11 +115,11 @@ Three things, all forced by measurement or by direction.
 
 **1. The backend question is settled: `hvpatch` is the kernel.** Earlier
 revisions kept `native` and `vmm` as co-equal fallbacks and required parity
-with them. They are now **reference lanes**: `vmm` is the mature correctness
-oracle whose conformance results we still trust, `native` is the historical
-shipped default we still measure against. Neither is a parity obligation for
-the kernel lane, and neither gets new investment. Work that only improves
-`native` or `vmm` is out of scope. The 10x→2x native-DSR plan
+with them. They are now **historical reference lanes**, not supported forward
+targets: their old evidence may explain earlier decisions, but neither parity
+nor regression-freedom is required for HVPatch integration. Both may regress,
+and neither gets new investment. Work that only improves `native` or `vmm` is
+out of scope. The 10x→2x native-DSR plan
 (`proposed-plan.md`) is retired by this decision; its per-workstream analysis
 is superseded by the amplification ledger below, which measures the kernel
 lane directly.
