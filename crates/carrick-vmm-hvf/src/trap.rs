@@ -4319,6 +4319,7 @@ struct PendingForkFrameReceipt {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingFrameCowPublication {
     va: u64,
+    len: usize,
     expected_ipa: u64,
 }
 
@@ -4358,7 +4359,9 @@ struct GlobalExecPlan {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn global_frame_exec_lease_order(mappings: &[GuestMapping], table_index: usize) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..mappings.len()).collect();
+    let mut order: Vec<usize> = (0..mappings.len())
+        .filter(|&index| !is_sparse_hvpatch_mmap_mapping(&mappings[index]))
+        .collect();
     order.sort_by_key(|&index| {
         (
             u8::from(index != table_index),
@@ -4368,6 +4371,13 @@ fn global_frame_exec_lease_order(mappings: &[GuestMapping], table_index: usize) 
         )
     });
     order
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn is_sparse_hvpatch_mmap_mapping(mapping: &GuestMapping) -> bool {
+    mapping.guest_start == crate::memory::LINUX_MMAP_BASE
+        && mapping.mapped_size == crate::memory::mmap_arena_size()
+        && !mapping.shared
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -5231,7 +5241,12 @@ impl HvfVmState {
         new_image: &crate::memory::AddressSpace,
     ) -> (usize, usize) {
         let replacement = GuestMappingPlan::from_address_space(new_image)
-            .map(|plan| plan.mappings.len())
+            .map(|plan| {
+                plan.mappings
+                    .iter()
+                    .filter(|mapping| !is_sparse_hvpatch_mmap_mapping(mapping))
+                    .count()
+            })
             .unwrap_or(0);
         (self.frame_inventory.lock().extents.len(), replacement)
     }
@@ -5344,6 +5359,47 @@ impl HvfVmState {
 
     pub(crate) fn set_persistent_vm_lifecycle(&mut self, enabled: bool) {
         self.persistent_vm_lifecycle = enabled;
+    }
+
+    pub(crate) fn sparse_mmap_arena_enabled(&self) -> bool {
+        self.persistent_vm_lifecycle
+    }
+
+    /// Retire the generic boot loader's hidden 32 GiB mmap backing after the
+    /// runtime selects HVPatch, but before initial frame inventory publication.
+    /// Mature VMM never enables the persistent lifecycle and keeps its existing
+    /// eager identity mapping unchanged.
+    pub(crate) fn retire_initial_mmap_arena(&mut self) -> Result<(), TrapError> {
+        if !self.persistent_vm_lifecycle {
+            return Ok(());
+        }
+        let Some(index) = self.mappings.iter().position(|mapping| {
+            mapping.start == crate::memory::LINUX_MMAP_BASE
+                && mapping.end
+                    == crate::memory::LINUX_MMAP_BASE
+                        .saturating_add(crate::memory::mmap_arena_size())
+                && mapping.physical_ipa == crate::memory::LINUX_MMAP_BASE
+                && mapping.physical_size as u64 == crate::memory::mmap_arena_size()
+                && !mapping.is_dynamic_alias
+        }) else {
+            return Err(TrapError::Hypervisor(
+                "HVPatch initial mmap arena backing is absent or has unexpected shape".to_owned(),
+            ));
+        };
+        let mapping = &self.mappings[index];
+        if mapping.stage2_lease.is_some() || mapping.host_mapping.is_none() {
+            return Err(TrapError::Hypervisor(
+                "HVPatch initial mmap arena has unexpected ownership".to_owned(),
+            ));
+        }
+        let rc = unsafe { inventory_hv_vm_unmap(mapping.physical_ipa, mapping.physical_size) };
+        if rc != 0 {
+            return Err(TrapError::Hypervisor(format!(
+                "unmap HVPatch initial sparse mmap arena: 0x{rc:x}"
+            )));
+        }
+        drop(self.mappings.remove(index));
+        Ok(())
     }
 
     pub(crate) fn page_tables_snapshot(&self) -> Option<crate::page_table::PageTableManager> {
@@ -6166,6 +6222,423 @@ impl HvfVmState {
         Some((unsafe { mapping.host_addr.add(offset) }, physical_ipa))
     }
 
+    /// Materialize private zero backing for the exact accessible pieces of the
+    /// sparse HVPatch mmap arena. One VMA hole becomes one host mapping, one
+    /// stage-2 lease, and one inventory frame; there is no shared source frame
+    /// and therefore no shared-zero COW authority.
+    pub(crate) fn ensure_sparse_mmap_backing(
+        &mut self,
+        va: u64,
+        len: usize,
+        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+    ) -> Result<(), TrapError> {
+        const PAGE_SIZE: u64 = 4 * 1024;
+        if !self.persistent_vm_lifecycle || len == 0 {
+            return Ok(());
+        }
+        let arena_start = crate::memory::LINUX_MMAP_BASE;
+        let arena_end = arena_start
+            .checked_add(crate::memory::mmap_arena_size())
+            .ok_or_else(|| TrapError::Hypervisor("HVPatch mmap arena overflow".to_owned()))?;
+        let requested_end = va
+            .checked_add(len as u64)
+            .ok_or_else(|| TrapError::Hypervisor("sparse mmap range overflow".to_owned()))?;
+        if va < arena_start || requested_end > arena_end {
+            return Ok(());
+        }
+        let mut current = align_down(va, PAGE_SIZE);
+        let end = align_up(requested_end, PAGE_SIZE)?;
+        while current < end {
+            if let Some(mapping) = self.mapping_for_range(current, 1) {
+                let next = mapping.end.min(end);
+                if next <= current {
+                    return Err(TrapError::Hypervisor(format!(
+                        "sparse mmap live mapping made no progress at VA 0x{current:x}"
+                    )));
+                }
+                current = next;
+                continue;
+            }
+
+            // Preserve already-materialized neighbours. The topology lock in
+            // the materializer rechecks this shape before publication.
+            let next_local = self
+                .mappings
+                .iter()
+                .filter(|mapping| mapping.start > current && mapping.start < end)
+                .map(|mapping| mapping.start)
+                .min();
+            let next_alias = alias_registry()
+                .lock()
+                .iter()
+                .filter(|alias| {
+                    alias_matches_process_scope(alias.ownership_scope, self.mm_root_slot)
+                        && alias.start > current
+                        && alias.start < end
+                        && alias_backing_is_live(alias.physical_host_addr)
+                })
+                .map(|alias| alias.start)
+                .min();
+            let hole_end = next_local
+                .into_iter()
+                .chain(next_alias)
+                .min()
+                .unwrap_or(end);
+            current = self.materialize_sparse_mmap_extent(current, hole_end, flush_stage1)?;
+        }
+        Ok(())
+    }
+
+    fn materialize_sparse_mmap_extent(
+        &mut self,
+        start: u64,
+        end: u64,
+        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+    ) -> Result<u64, TrapError> {
+        const PAGE_SIZE: u64 = 4 * 1024;
+        const VALID: u64 = 1;
+        const AP_MASK: u64 = 0b11 << 6;
+        const AP_USER_RO: u64 = 0b11 << 6;
+        const NON_GLOBAL: u64 = 1 << 11;
+
+        if start >= end || !start.is_multiple_of(PAGE_SIZE) || !end.is_multiple_of(PAGE_SIZE) {
+            return Err(TrapError::Hypervisor(format!(
+                "invalid sparse mmap materialization 0x{start:x}..0x{end:x}"
+            )));
+        }
+        let identity = self.cow_identity.ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch sparse mmap has no bound mm identity".to_owned())
+        })?;
+        let authority = self.cow_authority.clone().ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch sparse mmap has no inventory authority".to_owned())
+        })?;
+        let _quiesce = authority.quiesce().map_err(|error| {
+            TrapError::Hypervisor(format!("quiesce HVPatch sparse mmap: {error}"))
+        })?;
+        let _topology = crate::fork_quiesce::acquire_topology_lock(
+            carrick_observability::probes::HvpatchTopologyOperation::AliasMap,
+            identity.linux_pid,
+            identity.linux_tid,
+        );
+        if let Some(mapping) = self.mapping_for_range(start, 1) {
+            return Ok(mapping.end.min(end));
+        }
+
+        // Another vCPU in this mm can publish the physical alias while its
+        // stage-1 receipt is deliberately still invalid.  Such an alias is
+        // invisible to `mapping_for_range` on this sibling until the later
+        // protection commit, so authenticate the process-shared physical owner
+        // directly before allocating a second overlapping frame.
+        let live_alias_end = alias_registry()
+            .lock()
+            .iter()
+            .rev()
+            .find(|alias| {
+                alias_matches_process_scope(alias.ownership_scope, self.mm_root_slot)
+                    && start >= alias.start
+                    && start < alias.start.saturating_add(alias.size as u64)
+                    && global_frame_host_owner_matches(
+                        alias.physical_ipa,
+                        alias.physical_size as u64,
+                        alias.physical_host_addr,
+                    )
+            })
+            .map(|alias| alias.start.saturating_add(alias.size as u64));
+        if let Some(alias_end) = live_alias_end {
+            return Ok(alias_end.min(end));
+        }
+
+        // The caller found this hole before quiescing. Recompute its upper
+        // boundary under the topology lock so a sibling publication between
+        // those two points cannot be overlapped.
+        let next_local = self
+            .mappings
+            .iter()
+            .filter(|mapping| {
+                mapping.start > start
+                    && mapping.start < end
+                    && global_frame_region_owner_matches(mapping)
+            })
+            .map(|mapping| mapping.start)
+            .min();
+        let next_alias = alias_registry()
+            .lock()
+            .iter()
+            .filter(|alias| {
+                alias_matches_process_scope(alias.ownership_scope, self.mm_root_slot)
+                    && alias.start > start
+                    && alias.start < end
+                    && global_frame_host_owner_matches(
+                        alias.physical_ipa,
+                        alias.physical_size as u64,
+                        alias.physical_host_addr,
+                    )
+            })
+            .map(|alias| alias.start)
+            .min();
+        let end = next_local
+            .into_iter()
+            .chain(next_alias)
+            .min()
+            .unwrap_or(end);
+
+        let semantic_len =
+            usize::try_from(end - start).map_err(|_| TrapError::MappingTooLarge(end - start))?;
+        let page_table_host = self
+            .mapping_for_range(
+                crate::memory::LINUX_PAGE_TABLES_BASE,
+                carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+            )
+            .map(|mapping| mapping.host_addr)
+            .ok_or_else(|| {
+                TrapError::Hypervisor("sparse HVPatch mmap has no page-table backing".to_owned())
+            })?;
+        if self.page_tables.lock().is_none() {
+            return Err(TrapError::Hypervisor(
+                "sparse HVPatch mmap page tables are absent".to_owned(),
+            ));
+        }
+        let mut reservation = authority.reserve(1, 1, 2).map_err(|error| {
+            TrapError::Hypervisor(format!("reserve sparse HVPatch mmap inventory: {error}"))
+        })?;
+
+        // A 2 MiB-aligned global-frame base plus the semantic VA's 2 MiB
+        // offset preserves VA/IPA alignment. The stage-1 editor can therefore
+        // use block leaves for the aligned bulk and needs 4 KiB leaves only at
+        // the two edges. This is still one physical/stage-2 lease per VMA.
+        const TWO_MIB: u64 = 2 * 1024 * 1024;
+        let physical_offset = start & (TWO_MIB - 1);
+        let physical_len = align_up(
+            physical_offset
+                .checked_add(end - start)
+                .ok_or_else(|| TrapError::Hypervisor("sparse mmap size overflow".to_owned()))?,
+            HVF_PAGE_SIZE,
+        )?;
+        let physical_size =
+            usize::try_from(physical_len).map_err(|_| TrapError::MappingTooLarge(physical_len))?;
+        let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            physical_size,
+            crate::host_mapping::HostMappingKind::PrivateAnon,
+        )
+        .map_err(|error| {
+            TrapError::Hypervisor(format!("allocate sparse HVPatch mmap backing: {error}"))
+        })?;
+        let physical_host = host_mapping.as_ptr();
+        let semantic_host = unsafe { physical_host.add(physical_offset as usize) };
+        let mut lease = GlobalFrameStage2Lease::reserve(physical_len, TWO_MIB)?;
+        let physical_ipa = lease.base;
+        let semantic_ipa = physical_ipa
+            .checked_add(physical_offset)
+            .ok_or_else(|| TrapError::Hypervisor("sparse mmap IPA overflow".to_owned()))?;
+        let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
+        let map_result = unsafe {
+            inventory_hv_vm_map(
+                physical_host.cast(),
+                physical_ipa,
+                physical_size,
+                u64::from(stage2_perms),
+            )
+        };
+        if map_result != 0 {
+            return Err(TrapError::Hypervisor(format!(
+                "map sparse HVPatch mmap IPA 0x{physical_ipa:x}: 0x{map_result:x}"
+            )));
+        }
+        lease.mark_mapped();
+        register_global_frame_host_owner(lease, host_mapping)?;
+        let mut owner_rollback = GlobalFrameOwnerRollback::default();
+        owner_rollback.record((physical_ipa, physical_len));
+
+        let inventory_mapping = {
+            let mut inventory = self.frame_inventory.lock();
+            Self::stage_mapping(
+                &mut inventory,
+                &mut reservation,
+                InventoryMappingStage {
+                    gpa: physical_ipa,
+                    length: physical_len,
+                    permissions: carrick_hal::MemPerms {
+                        read: true,
+                        write: true,
+                        exec: true,
+                    },
+                    backing: Self::private_backing_identity(),
+                    inherited_frame: None,
+                    stage2_lease: Some((physical_ipa, physical_len)),
+                },
+            )?
+        };
+        let inventory_entry = ((physical_ipa, physical_len), inventory_mapping);
+        let mut rollback_page_tables = None;
+        let publication = (|| {
+            let mut page_tables = self.page_tables.lock();
+            let manager = page_tables.as_mut().ok_or_else(|| {
+                TrapError::Hypervisor("sparse HVPatch mmap page tables are absent".to_owned())
+            })?;
+            rollback_page_tables = Some(manager.clone());
+            let aligned_start = align_up(start, TWO_MIB)?.min(end);
+            if start < aligned_start {
+                manager
+                    .map_private_aliased(start, semantic_ipa, aligned_start - start, false)
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "plan sparse HVPatch mmap leading stage-1 output: {error:?}"
+                        ))
+                    })?;
+            }
+            let aligned_len = (end - aligned_start) / TWO_MIB * TWO_MIB;
+            if aligned_len != 0 {
+                manager
+                    .map_private_aliased(
+                        aligned_start,
+                        semantic_ipa + (aligned_start - start),
+                        aligned_len,
+                        false,
+                    )
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "plan sparse HVPatch mmap bulk stage-1 output: {error:?}"
+                        ))
+                    })?;
+            }
+            let tail_start = aligned_start + aligned_len;
+            if tail_start < end {
+                manager
+                    .map_private_aliased(
+                        tail_start,
+                        semantic_ipa + (tail_start - start),
+                        end - tail_start,
+                        false,
+                    )
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "plan sparse HVPatch mmap trailing stage-1 output: {error:?}"
+                        ))
+                    })?;
+            }
+            manager
+                .set_prot_none(start, semantic_len)
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "keep sparse HVPatch mmap stage-1 invalid: {error:?}"
+                    ))
+                })?;
+            unsafe { manager.sync_to_host(page_table_host) };
+            let mut page = start;
+            while page < end {
+                let expected_ipa = semantic_ipa + (page - start);
+                let shadow = manager.debug_walk(page);
+                let live = unsafe { manager.debug_walk_host(page_table_host.cast_const(), page) };
+                let leaf = carrick_mem::page_table::terminal_descriptor(live);
+                if shadow != live
+                    || manager.translate(page).is_some()
+                    || manager.translate_retained_output(page) != Some(expected_ipa)
+                    || leaf & VALID != 0
+                    || leaf & AP_MASK != AP_USER_RO
+                    || leaf & NON_GLOBAL == 0
+                {
+                    return Err(TrapError::Hypervisor(format!(
+                        "sparse HVPatch mmap publication failed at VA 0x{page:x}: leaf=0x{leaf:x} expected_ipa=0x{expected_ipa:x}"
+                    )));
+                }
+                page = page.saturating_add(PAGE_SIZE);
+            }
+            Ok::<(), TrapError>(())
+        })();
+        if let Err(error) = publication {
+            if let Some(snapshot) = rollback_page_tables {
+                {
+                    let mut page_tables = self.page_tables.lock();
+                    unsafe { snapshot.restore_quiesced_snapshot_to_host(page_table_host) };
+                    *page_tables = Some(snapshot);
+                }
+                if let Err(flush_error) = flush_stage1() {
+                    eprintln!(
+                        "carrick: FATAL: sparse HVPatch mmap rollback TLBI failed: {flush_error}"
+                    );
+                    std::process::abort();
+                }
+            }
+            Self::rollback_unpublished_mappings(
+                &mut self.frame_inventory.lock(),
+                &[inventory_entry],
+            )?;
+            return Err(error);
+        }
+        if let Err(error) = flush_stage1() {
+            eprintln!("carrick: FATAL: sparse HVPatch mmap TLBI failed: {error}");
+            std::process::abort();
+        }
+        if let Err(error) = authority.apply(reservation.commit(())) {
+            eprintln!("carrick: FATAL: sparse HVPatch mmap inventory commit failed: {error}");
+            std::process::abort();
+        }
+        owner_rollback.commit();
+
+        match authority.mapping_is_live(
+            inventory_mapping.mapping,
+            inventory_mapping.frame,
+            carrick_guest_mem::Gpa(physical_ipa),
+            carrick_hal::FrameLength::from_mapping_extent(
+                std::num::NonZeroU64::new(physical_len).unwrap_or_else(|| std::process::abort()),
+            ),
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!("carrick: FATAL: sparse HVPatch mmap absent after commit");
+                std::process::abort();
+            }
+            Err(error) => {
+                eprintln!("carrick: FATAL: authenticate sparse HVPatch mmap: {error}");
+                std::process::abort();
+            }
+        }
+
+        let sharing = GuestMappingSharing::Private;
+        register_shared_alias(AliasBacking {
+            start,
+            ipa: semantic_ipa,
+            host_addr: semantic_host as usize,
+            size: semantic_len,
+            physical_ipa,
+            physical_host_addr: physical_host as usize,
+            physical_size,
+            perms: u64::from(stage2_perms),
+            guest_writable: true,
+            sharing,
+            ownership_scope: alias_ownership_scope(sharing, self.mm_root_slot),
+            inventory_backing: Self::private_backing_identity(),
+            shared_key_base: 0,
+            shared_key_offset: 0,
+        });
+        self.mappings.push(HvfMappedRegion {
+            start,
+            ipa: semantic_ipa,
+            physical_ipa,
+            end,
+            host_addr: semantic_host,
+            size: semantic_len,
+            physical_size,
+            perms: stage2_perms,
+            memory: None,
+            host_mapping: None,
+            stage2_lease: None,
+            is_dynamic_alias: true,
+            sharing,
+            guest_writable: true,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+        });
+        self.cow_deferred_publications
+            .lock()
+            .push(PendingFrameCowPublication {
+                va: start,
+                len: semantic_len,
+                expected_ipa: semantic_ipa,
+            });
+        Ok(end)
+    }
+
     /// Replace an invalid stage-1 output whose exact stage-2 lease was retired
     /// by `munmap` with a fresh zero frame before low-arena same-VA reuse.
     ///
@@ -6472,6 +6945,7 @@ impl HvfVmState {
         while current < span_end {
             pending.push(PendingFrameCowPublication {
                 va: current,
+                len: PAGE_SIZE as usize,
                 expected_ipa: new_ipa + (current - page_va),
             });
             current = current.saturating_add(PAGE_SIZE);
@@ -7017,7 +7491,11 @@ impl HvfVmState {
             if intent == carrick_aarch64::vmm::FrameCowWriteIntent::BackingMaintenance {
                 self.cow_deferred_publications
                     .lock()
-                    .push(PendingFrameCowPublication { va, expected_ipa });
+                    .push(PendingFrameCowPublication {
+                        va,
+                        len: PAGE_SIZE as usize,
+                        expected_ipa,
+                    });
             }
         }
 
@@ -7169,11 +7647,11 @@ impl HvfVmState {
         len: usize,
         prot: u64,
     ) -> Result<(), TrapError> {
-        const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
+        const PAGE_SIZE: u64 = 4 * 1024;
+        const VALID: u64 = 1;
         const AP_MASK: u64 = 0b11 << 6;
         const AP_USER_RW: u64 = 0b01 << 6;
         const AP_USER_RO: u64 = 0b11 << 6;
-        const VALID_PAGE: u64 = 0b11;
         const NON_GLOBAL: u64 = 1 << 11;
 
         if len == 0 {
@@ -7187,7 +7665,12 @@ impl HvfVmState {
             .lock()
             .iter()
             .copied()
-            .filter(|receipt| receipt.va >= va && receipt.va < end)
+            .filter(|receipt| {
+                receipt
+                    .va
+                    .checked_add(receipt.len as u64)
+                    .is_some_and(|receipt_end| receipt.va < end && receipt_end > va)
+            })
             .collect();
         if pending.is_empty() {
             return Ok(());
@@ -7221,33 +7704,86 @@ impl HvfVmState {
         })?;
         let mut authenticated = Vec::with_capacity(pending.len());
         for receipt in pending {
-            let live = unsafe { manager.debug_walk_host(page_table_host.cast_const(), receipt.va) };
-            let leaf = live[3];
-            let access_is_valid = leaf & VALID_PAGE == VALID_PAGE;
-            if leaf & PA_MASK_4KIB != receipt.expected_ipa & PA_MASK_4KIB
-                || leaf & NON_GLOBAL == 0
-                || leaf & AP_MASK != expected_ap
-                || access_is_valid != must_be_valid
-            {
+            let receipt_end = receipt.va.checked_add(receipt.len as u64).ok_or_else(|| {
+                TrapError::Hypervisor("deferred COW receipt range overflow".to_owned())
+            })?;
+            let overlap_start = receipt.va.max(va);
+            let overlap_end = receipt_end.min(end);
+            if !overlap_start.is_multiple_of(PAGE_SIZE) || !overlap_end.is_multiple_of(PAGE_SIZE) {
                 return Err(TrapError::Hypervisor(format!(
-                    "deferred COW protection authentication failed at VA 0x{:x}: leaf=0x{leaf:x} expected_ipa=0x{:x} expected_ap=0x{expected_ap:x} valid={must_be_valid}",
-                    receipt.va, receipt.expected_ipa
+                    "deferred COW receipt/protection is not page aligned: receipt=0x{:x}..0x{receipt_end:x} protection=0x{va:x}..0x{end:x}",
+                    receipt.va
                 )));
             }
-            crate::probes::pt_alias_receipt(
-                receipt.va,
-                leaf,
-                receipt.expected_ipa,
-                expected_ap,
-                phase,
-            );
+            let mut page = overlap_start;
+            let mut first_leaf = None;
+            while page < overlap_end {
+                let expected_ipa = receipt
+                    .expected_ipa
+                    .checked_add(page - receipt.va)
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor("deferred COW receipt IPA range overflow".to_owned())
+                    })?;
+                let shadow = manager.debug_walk(page);
+                let live = unsafe { manager.debug_walk_host(page_table_host.cast_const(), page) };
+                let leaf = carrick_mem::page_table::terminal_descriptor(live);
+                let access_is_valid = leaf & VALID != 0;
+                let translated = if must_be_valid {
+                    manager.translate(page)
+                } else {
+                    manager.translate_retained_output(page)
+                };
+                if shadow != live
+                    || translated != Some(expected_ipa)
+                    || leaf & NON_GLOBAL == 0
+                    || leaf & AP_MASK != expected_ap
+                    || access_is_valid != must_be_valid
+                {
+                    return Err(TrapError::Hypervisor(format!(
+                        "deferred COW protection authentication failed at VA 0x{page:x}: leaf=0x{leaf:x} translated={translated:x?} expected_ipa=0x{expected_ipa:x} expected_ap=0x{expected_ap:x} valid={must_be_valid}"
+                    )));
+                }
+                first_leaf.get_or_insert((page, leaf, expected_ipa));
+                page = page.saturating_add(PAGE_SIZE);
+            }
+            if let Some((page, leaf, expected_ipa)) = first_leaf {
+                crate::probes::pt_alias_receipt(page, leaf, expected_ipa, expected_ap, phase);
+            }
             authenticated.push(receipt);
         }
         drop(page_tables);
 
-        self.cow_deferred_publications
-            .lock()
-            .retain(|receipt| !authenticated.contains(receipt));
+        let mut receipts = self.cow_deferred_publications.lock();
+        let mut remaining = Vec::with_capacity(receipts.len());
+        for receipt in receipts.drain(..) {
+            if !authenticated.contains(&receipt) {
+                remaining.push(receipt);
+                continue;
+            }
+            let receipt_end = receipt.va.saturating_add(receipt.len as u64);
+            let overlap_start = receipt.va.max(va);
+            let overlap_end = receipt_end.min(end);
+            if receipt.va < overlap_start {
+                remaining.push(PendingFrameCowPublication {
+                    va: receipt.va,
+                    len: usize::try_from(overlap_start - receipt.va)
+                        .unwrap_or_else(|_| std::process::abort()),
+                    expected_ipa: receipt.expected_ipa,
+                });
+            }
+            if overlap_end < receipt_end {
+                remaining.push(PendingFrameCowPublication {
+                    va: overlap_end,
+                    len: usize::try_from(receipt_end - overlap_end)
+                        .unwrap_or_else(|_| std::process::abort()),
+                    expected_ipa: receipt
+                        .expected_ipa
+                        .checked_add(overlap_end - receipt.va)
+                        .unwrap_or_else(|| std::process::abort()),
+                });
+            }
+        }
+        *receipts = remaining;
         Ok(())
     }
 
@@ -10714,6 +11250,19 @@ impl HvfVmState {
                 ))
             })?;
         }
+        // The mmap arena is a semantic reservation, not a boot frame.  Keep
+        // its coarse stage-1 coverage invalid until an exact VMA commit gives
+        // that mm private zero backing.  No host mapping, stage-2 entry,
+        // global-frame lease, or frame-inventory identity exists for this
+        // hidden reservation.
+        page_tables
+            .set_prot_none(
+                crate::memory::LINUX_MMAP_BASE,
+                crate::memory::mmap_arena_size() as usize,
+            )
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("reserve sparse HVPatch mmap arena: {error:?}"))
+            })?;
         // The loader deliberately merges overlapping PT_LOAD regions into one
         // writable mapping for the HVF stage-2 backing. Re-aliasing that merged
         // region above therefore grants write at every stage-1 leaf. Restore the
@@ -10721,10 +11270,11 @@ impl HvfVmState {
         // set_readonly edits attributes in place and preserves each aliased IPA.
         reapply_global_exec_readonly_spans(&mut page_tables, &global.ro_spans)?;
         for mapping in &global.mappings {
-            if page_tables.translate(mapping.guest_start) != Some(mapping.ipa_start) {
+            let expected = (!is_sparse_hvpatch_mmap_mapping(mapping)).then_some(mapping.ipa_start);
+            if page_tables.translate(mapping.guest_start) != expected {
                 return Err(TrapError::Hypervisor(format!(
-                    "hvpatch exec translation mismatch for VA 0x{:x}",
-                    mapping.guest_start
+                    "hvpatch exec translation mismatch for VA 0x{:x}: expected={expected:x?}",
+                    mapping.guest_start,
                 )));
             }
         }
@@ -10791,10 +11341,15 @@ impl HvfVmState {
             .elapsed()
             .as_nanos()
             .min(u128::from(u64::MAX)) as u64;
-        let replacement_mapping_count = global_plan.mappings.len() as u64;
+        let replacement_mapping_count = global_plan
+            .mappings
+            .iter()
+            .filter(|mapping| !is_sparse_hvpatch_mmap_mapping(mapping))
+            .count() as u64;
         let replacement_mapped_bytes = global_plan
             .mappings
             .iter()
+            .filter(|mapping| !is_sparse_hvpatch_mmap_mapping(mapping))
             .map(|mapping| mapping.mapped_size)
             .sum::<u64>();
         crate::probes::hvpatch_exec_replace_stage(
@@ -10977,6 +11532,9 @@ impl HvfVmState {
         let map_backings_started = std::time::Instant::now();
         let mut owner_rollback = GlobalFrameOwnerRollback::default();
         for mapping in &plan.mappings {
+            if self.persistent_vm_lifecycle && is_sparse_hvpatch_mmap_mapping(mapping) {
+                continue;
+            }
             let key = (mapping.ipa_start, mapping.mapped_size);
             let mut stage2_lease = if self.persistent_vm_lifecycle {
                 Some(stage2_leases.remove(&key).ok_or_else(|| {
@@ -13170,19 +13728,47 @@ mod frame_inventory_backend_tests {
     }
 
     #[test]
-    fn global_frame_exec_reserves_large_extents_before_small_extents() {
+    fn global_frame_exec_omits_sparse_mmap_arena_and_reserves_large_extents_first() {
         let mappings = vec![
             exec_mapping_for_order(0x10_0000, 0x4000),
             exec_mapping_for_order(crate::memory::LINUX_PAGE_TABLES_BASE, 0x20_0000),
-            exec_mapping_for_order(0x6000_0000_00, 32 * 1024 * 1024 * 1024),
-            exec_mapping_for_order(0x9000_0000_00, 2 * 1024 * 1024 * 1024),
+            exec_mapping_for_order(
+                crate::memory::LINUX_MMAP_BASE,
+                crate::memory::mmap_arena_size(),
+            ),
+            exec_mapping_for_order(0x0090_0000_0000, 2 * 1024 * 1024 * 1024),
         ];
 
         assert_eq!(
             global_frame_exec_lease_order(&mappings, 1),
-            vec![1, 2, 3, 0],
-            "the fixed root slot stays first, then scarce global extents descend by size"
+            vec![1, 3, 0],
+            "the hidden semantic mmap arena must consume no exec frame; backed extents remain size-ordered"
         );
+    }
+
+    #[test]
+    fn sparse_exec_omission_requires_exact_private_hidden_arena() {
+        let exact = exec_mapping_for_order(
+            crate::memory::LINUX_MMAP_BASE,
+            crate::memory::mmap_arena_size(),
+        );
+        assert!(is_sparse_hvpatch_mmap_mapping(&exact));
+
+        let mut shared = exact.clone();
+        shared.shared = true;
+        assert!(!is_sparse_hvpatch_mmap_mapping(&shared));
+
+        let shorter = exec_mapping_for_order(
+            crate::memory::LINUX_MMAP_BASE,
+            crate::memory::mmap_arena_size() - 0x4000,
+        );
+        assert!(!is_sparse_hvpatch_mmap_mapping(&shorter));
+
+        let shifted = exec_mapping_for_order(
+            crate::memory::LINUX_MMAP_BASE + 0x4000,
+            crate::memory::mmap_arena_size(),
+        );
+        assert!(!is_sparse_hvpatch_mmap_mapping(&shifted));
     }
 
     #[test]

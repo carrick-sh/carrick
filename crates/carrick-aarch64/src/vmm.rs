@@ -338,6 +338,31 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// their established rebuild behavior.
     fn set_persistent_vm_lifecycle(&mut self, _enabled: bool) {}
 
+    /// Whether this backend keeps the hidden mmap arena as invalid stage-1
+    /// coverage and materializes only committed VMA backing. HVPatch overrides;
+    /// mature HVF VMM and KVM preserve their eager mappings.
+    fn sparse_mmap_arena_enabled(&self) -> bool {
+        false
+    }
+
+    /// Retire the generic loader's eager mmap-arena mapping after the HVPatch
+    /// backend is selected and stage-1 has been made inaccessible.
+    fn retire_initial_mmap_arena(&mut self) -> Result<(), TrapError> {
+        Ok(())
+    }
+
+    /// Ensure a committed sparse mmap range has private per-mm physical
+    /// backing before stage-1 makes it accessible. Default is a no-op for
+    /// backends whose boot mapping already owns the full arena.
+    fn ensure_sparse_mmap_backing(
+        &mut self,
+        _va: u64,
+        _len: usize,
+        _flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+    ) -> Result<(), TrapError> {
+        Ok(())
+    }
+
     /// Bind the one stage-1 editor shared by the neutral engine and backend
     /// translation/physical-COW paths.  A backend retaining a second optional
     /// manager can otherwise publish through stale/absent authority immediately

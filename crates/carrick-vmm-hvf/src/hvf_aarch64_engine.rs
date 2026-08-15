@@ -411,6 +411,23 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.set_persistent_vm_lifecycle(enabled);
     }
 
+    fn sparse_mmap_arena_enabled(&self) -> bool {
+        self.state.sparse_mmap_arena_enabled()
+    }
+
+    fn retire_initial_mmap_arena(&mut self) -> Result<(), TrapError> {
+        self.state.retire_initial_mmap_arena()
+    }
+
+    fn ensure_sparse_mmap_backing(
+        &mut self,
+        va: u64,
+        len: usize,
+        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+    ) -> Result<(), TrapError> {
+        self.state.ensure_sparse_mmap_backing(va, len, flush_stage1)
+    }
+
     fn frame_inventory_extent_count(&self) -> usize {
         self.state.frame_inventory_extent_count()
     }

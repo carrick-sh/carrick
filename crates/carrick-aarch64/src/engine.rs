@@ -567,11 +567,34 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         len: usize,
         intent: FrameCowWriteIntent,
     ) -> Result<(), MemoryError> {
+        self.ensure_sparse_mmap_backing(va, len)?;
         let vm = &mut self.vm;
         let vcpu = &mut self.vcpu;
         let mut flush = || Self::run_el1_maintenance_on(vcpu);
         vm.ensure_frame_cow_write(va, len, intent, &mut flush)
             .map_err(|error| MemoryError::HostMap(format!("HVPatch frame COW: {error}")))
+    }
+
+    fn ensure_sparse_mmap_backing(&mut self, va: u64, len: usize) -> Result<(), MemoryError> {
+        let in_sparse_arena = self.process_asid.is_some()
+            && self.vm.sparse_mmap_arena_enabled()
+            && va >= carrick_mem::memory::LINUX_MMAP_BASE
+            && va.checked_add(len as u64).is_some_and(|end| {
+                end <= carrick_mem::memory::LINUX_MMAP_BASE
+                    .saturating_add(carrick_mem::memory::mmap_arena_size())
+            });
+        if !in_sparse_arena || len == 0 {
+            return Ok(());
+        }
+        // Persistent exec intentionally drops its software editor. Sparse
+        // materialization publishes new retained outputs, so instantiate the
+        // authoritative manager before the backend transaction begins.
+        self.pt_edit(|_| Ok(false))?;
+        let vm = &mut self.vm;
+        let vcpu = &mut self.vcpu;
+        let mut flush = || Self::run_el1_maintenance_on(vcpu);
+        vm.ensure_sparse_mmap_backing(va, len, &mut flush)
+            .map_err(|error| MemoryError::HostMap(format!("HVPatch sparse mmap backing: {error}")))
     }
 
     /// The IPA a syscall buffer at guest VA `va` resolves to. Identity (`va`) for
@@ -873,6 +896,9 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
         use carrick_abi::{LINUX_PROT_EXEC, LINUX_PROT_READ, LINUX_PROT_WRITE};
         let exec = prot & LINUX_PROT_EXEC != 0;
+        if prot & (LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) != 0 {
+            self.ensure_sparse_mmap_backing(address, len)?;
+        }
         let armed_cow = if prot & LINUX_PROT_WRITE != 0 {
             self.vm.armed_frame_cow_ranges(address, len)
         } else {
@@ -1811,6 +1837,20 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // table bytes, so repeating the edit would rebuild/copy the complete
         // software manager solely to rediscover two no-ops.
         if self.process_asid.is_none() {
+            if self.vm.sparse_mmap_arena_enabled() {
+                self.pt_edit_and_flush(|manager| {
+                    manager.set_prot_none(
+                        carrick_mem::memory::LINUX_MMAP_BASE,
+                        carrick_mem::memory::mmap_arena_size() as usize,
+                    )
+                })
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "reserve sparse HVPatch root mmap arena: {error}"
+                    ))
+                })?;
+                self.vm.retire_initial_mmap_arena()?;
+            }
             self.pt_edit_and_flush(reserve_hvpatch_process_apertures)
                 .map_err(|error| {
                     TrapError::Hypervisor(format!(
