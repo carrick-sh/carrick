@@ -664,8 +664,20 @@ pub(super) fn project_core_maps(mem: &MemState) -> Vec<ProcMapsEntry> {
             }
             (map.start < map.end).then_some(map)
         })
-        .chain(mem.dynamic_maps.iter().cloned())
         .collect();
+    // MAP_FIXED and equivalent committed dynamic mappings replace any
+    // Linux-visible boot VMA they overlap. Hidden reservations themselves stay
+    // alive as implementation backing, so trim the projected/clamped view
+    // rather than mutating that backing authority. The resulting PT_LOADs are
+    // a partition with one permission/backing identity per guest byte.
+    for dynamic in &mem.dynamic_maps {
+        trim_dynamic_maps_for_range(
+            &mut maps,
+            dynamic.start,
+            dynamic.end.saturating_sub(dynamic.start),
+        );
+    }
+    maps.extend(mem.dynamic_maps.iter().cloned());
     maps.sort_by_key(|map| (map.start, map.end));
     maps
 }
@@ -9513,6 +9525,61 @@ mod tests {
                 .windows(2)
                 .all(|rows| rows[0].end.raw() < rows[1].start.raw())
         );
+    }
+
+    #[test]
+    fn core_vma_projection_subtracts_map_fixed_replacement_from_live_heap() {
+        let dispatcher = SyscallDispatcher::new();
+        let layout = dispatcher.mem.lock().layout;
+        dispatcher.set_address_space_regions(vec![ProcMapsEntry {
+            start: layout.heap_base,
+            end: layout.heap_base + layout.heap_size,
+            read: true,
+            write: true,
+            execute: false,
+            sharing: ProcMapSharing::Private,
+            path: "heap-backing".into(),
+        }]);
+        dispatcher.mem.lock().brk_current = layout.heap_base + (2 * LINUX_PAGE_SIZE);
+        dispatcher.record_dynamic_mapping(
+            layout.heap_base,
+            LINUX_PAGE_SIZE,
+            LinuxProtFlags::READ,
+            ProcMapSharing::Private,
+            "fixed-replacement".into(),
+        );
+
+        let maps = project_core_maps(&dispatcher.mem.lock());
+        assert_eq!(maps.len(), 2);
+        assert_eq!(
+            (
+                maps[0].start,
+                maps[0].end,
+                maps[0].write,
+                maps[0].path.as_str()
+            ),
+            (
+                layout.heap_base,
+                layout.heap_base + LINUX_PAGE_SIZE,
+                false,
+                "fixed-replacement",
+            )
+        );
+        assert_eq!(
+            (
+                maps[1].start,
+                maps[1].end,
+                maps[1].write,
+                maps[1].path.as_str()
+            ),
+            (
+                layout.heap_base + LINUX_PAGE_SIZE,
+                layout.heap_base + (2 * LINUX_PAGE_SIZE),
+                true,
+                "heap-backing",
+            )
+        );
+        assert!(maps.windows(2).all(|pair| pair[0].end <= pair[1].start));
     }
 
     #[test]
