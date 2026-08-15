@@ -125,6 +125,21 @@ fn reserve_hvpatch_process_vcpu_lease(
     }
 }
 
+/// Try to become the one process-fork coordinator and reserve its child's
+/// bounded vCPU admission. A losing concurrent forker must return before it
+/// can wait for scheduler capacity: it is itself one of the registered
+/// siblings that the winning coordinator must drain.
+fn try_begin_hvpatch_process_fork(
+    barrier: &crate::fork_quiesce::QuiesceBarrier,
+    scheduler: &'static dyn carrick_hal::VcpuScheduler,
+    tid: ThreadId,
+) -> Option<ReservedProcessVcpuLease> {
+    if !barrier.try_begin_fork() {
+        return None;
+    }
+    Some(reserve_hvpatch_process_vcpu_lease(scheduler, tid))
+}
+
 /// Process-wide fork quiesce barrier (defined in `fork_quiesce` so the blocking
 /// wait predicates can reach the same instance).
 pub(crate) fn fork_barrier() -> &'static crate::fork_quiesce::QuiesceBarrier {
@@ -1001,20 +1016,27 @@ where
                 return Ok(Some(crate::linux_abi::LINUX_EINVAL.guest_retval()));
             }
         };
-        // Reserve a physical vCPU slot BEFORE quiescing this task or taking the
-        // shared-VM topology lock. Reserving inside the child materializer can
-        // deadlock: an existing slot owner may need the topology lock to reach
-        // its blocking-wait reclaim, while the parent holds that lock waiting
-        // for the child to report materialized. The lease is not installed in
-        // this parent thread; its RAII owner moves to the child below.
-        let reserved_child_vcpu =
-            reserve_hvpatch_process_vcpu_lease(carrick_hal::vcpu_sched::global(), self.this_tid);
-        while !process_barrier.try_begin_fork() {
+        // Serialize process forks BEFORE waiting for a child vCPU. A losing
+        // concurrent forker is itself one of the registered siblings the
+        // winner must drain; if it waits in scheduler admission first, it can
+        // never observe the winner's quiesce request and both forks deadlock.
+        // The winner still reserves before quiescing or taking the shared-VM
+        // topology lock: an existing slot owner may need that lock to reach its
+        // blocking-wait reclaim. The lease is not installed in this parent
+        // thread; its RAII owner moves to the child below.
+        let reserved_child_vcpu = loop {
+            if let Some(reserved) = try_begin_hvpatch_process_fork(
+                process_barrier,
+                carrick_hal::vcpu_sched::global(),
+                self.this_tid,
+            ) {
+                break reserved;
+            }
             if process_barrier.is_quiescing() {
                 self.release_and_park_vcpu_for_fork(engine)?;
             }
             std::thread::yield_now();
-        }
+        };
         let parent_pid = parent_process.pid();
         let forking_tid = self.this_tid.raw();
         let emit_fork_runtime_stage =
@@ -1774,6 +1796,36 @@ mod pt_pause_tests {
         waiter.join().unwrap();
         let third = scheduler.acquire(1603);
         scheduler.release(third, carrick_hal::Yield::Exited);
+    }
+
+    #[test]
+    fn losing_hvpatch_fork_does_not_wait_for_child_vcpu_capacity() {
+        use carrick_hal::VcpuScheduler;
+
+        let barrier: &'static crate::fork_quiesce::QuiesceBarrier =
+            Box::leak(Box::new(crate::fork_quiesce::QuiesceBarrier::new()));
+        assert!(barrier.try_begin_fork(), "model winner owns the fork token");
+        let scheduler: &'static carrick_hal::vcpu_sched::HostCondvarScheduler = Box::leak(
+            Box::new(carrick_hal::vcpu_sched::HostCondvarScheduler::new(1)),
+        );
+        let occupied = scheduler.acquire(1_611);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let waiter = std::thread::spawn(move || {
+            tx.send(try_begin_hvpatch_process_fork(
+                barrier,
+                scheduler,
+                tid(1_612),
+            ))
+            .unwrap();
+        });
+
+        let outcome = rx
+            .recv_timeout(Duration::from_millis(20))
+            .expect("a losing forker must not wait behind the scheduler");
+        assert!(outcome.is_none());
+        scheduler.release(occupied, carrick_hal::Yield::Exited);
+        waiter.join().unwrap();
+        barrier.end_fork();
     }
 
     #[test]
