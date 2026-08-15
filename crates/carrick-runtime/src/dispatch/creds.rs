@@ -823,6 +823,14 @@ impl SyscallDispatcher {
         }
 
         fn sys_getppid(this, cx) {
+            if let Some(ppid) = this
+                .hvpatch_process()
+                .and_then(|process| process.parent_pid())
+            {
+                return Ok(DispatchOutcome::Returned {
+                    value: i64::from(ppid),
+                });
+            }
             if let Some(ppid) = this.proc.lock().virtual_ppid {
                 return Ok(DispatchOutcome::Returned {
                     value: i64::from(ppid),

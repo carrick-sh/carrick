@@ -126,6 +126,22 @@ impl ProcessContext {
         self.binding.clone()
     }
 
+    /// Linux-visible parent from the authoritative task graph. Dispatcher
+    /// snapshots remember the creator only for non-kernel lanes; HVPatch must
+    /// observe reparenting performed atomically during task-exit publication.
+    pub(crate) fn parent_pid(&self) -> Option<i32> {
+        self.kernel_graph()
+            .task_identity(self.task_id())
+            .ok()
+            .map(|identity| {
+                identity
+                    .parent
+                    .map_or(carrick_abi::LINUX_BOOTSTRAP_PID as i32, |parent| {
+                        parent.id.raw()
+                    })
+            })
+    }
+
     pub(crate) fn wait_until_job_control_resumed(&self) {
         if let Some(task) = self
             .kernel_graph()
@@ -409,9 +425,16 @@ impl ProcessContext {
     pub(crate) fn publish_exit_status(
         &self,
         status: crate::kernel::LinuxWaitStatus,
+        orphan_adopter: Option<crate::kernel::TaskKey>,
+        notify_parent: impl FnOnce(Option<crate::kernel::TaskKey>),
     ) -> Result<Option<crate::kernel::TaskKey>, String> {
         self.kernel_graph()
-            .exit_task_key_eventually(self.task_key(), status)
+            .exit_task_key_eventually_notifying(
+                self.task_key(),
+                status,
+                orphan_adopter,
+                notify_parent,
+            )
             .map(|zombie| zombie.parent)
             .map_err(|error| error.to_string())
     }
@@ -1126,9 +1149,11 @@ mod tests {
     fn finalize_test_child(process: &ProcessContext, exit_code: i32, tid: crate::thread::ThreadId) {
         let event = process.record_process_exit_begin(exit_code, tid);
         let _ = process
-            .publish_exit_status(crate::kernel::LinuxWaitStatus::from_wait_encoding(
-                (exit_code & 0xff) << 8,
-            ))
+            .publish_exit_status(
+                crate::kernel::LinuxWaitStatus::from_wait_encoding((exit_code & 0xff) << 8),
+                None,
+                |_| {},
+            )
             .unwrap();
         process.retire_address_space(exit_code, tid).unwrap();
         process.record_process_exit_commit(event);
@@ -1229,6 +1254,7 @@ mod tests {
             path: "root".to_owned(),
         }]);
         root_dispatcher.bind_hvpatch_process(parent.clone());
+        root_dispatcher.mark_child_subreaper_for_test();
         assert_eq!(
             parent
                 .mm_backend
@@ -1272,6 +1298,12 @@ mod tests {
         );
         child_dispatcher.bind_hvpatch_process(child.clone());
 
+        assert_eq!(
+            child_dispatcher.hvpatch_orphan_adopter(),
+            Some(parent.task_key()),
+            "the child carries the exact parent generation as its subreaper adopter",
+        );
+
         assert!(
             child
                 .mm_backend
@@ -1280,6 +1312,79 @@ mod tests {
                 .expect("child VMA source")
                 .vma_revision
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn process_parent_pid_follows_authoritative_orphan_reparenting() {
+        let (root_process, root) = authoritative_root();
+        let child_mm = root_process.mm_resources().prepare_child().unwrap();
+        let child_context = root_process
+            .kernel_graph()
+            .reserve_fork(
+                &root,
+                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
+                    .unwrap(),
+                "reparent-child".to_owned(),
+                None,
+            )
+            .unwrap()
+            .prepare_with_mm_backend(
+                child_mm.backend(),
+                crate::thread::ThreadId::synthetic_for_tests(10_101),
+            )
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_parts()
+            .unwrap()
+            .0;
+        let child_backend = root_process
+            .mm_resources()
+            .publish_child(child_context.task().key(), child_mm)
+            .unwrap();
+        let child_process = root_process.published_child_context(&child_context, child_backend);
+
+        let grandchild_mm = child_process.mm_resources().prepare_child().unwrap();
+        let grandchild_context = child_process
+            .kernel_graph()
+            .reserve_fork(
+                &child_context,
+                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
+                    .unwrap(),
+                "reparent-grandchild".to_owned(),
+                None,
+            )
+            .unwrap()
+            .prepare_with_mm_backend(
+                grandchild_mm.backend(),
+                crate::thread::ThreadId::synthetic_for_tests(10_102),
+            )
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_parts()
+            .unwrap()
+            .0;
+        let grandchild_backend = child_process
+            .mm_resources()
+            .publish_child(grandchild_context.task().key(), grandchild_mm)
+            .unwrap();
+        let grandchild_process =
+            child_process.published_child_context(&grandchild_context, grandchild_backend);
+
+        assert_eq!(grandchild_process.parent_pid(), Some(child_process.pid()));
+        child_process
+            .publish_exit_status(
+                crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                None,
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(
+            grandchild_process.parent_pid(),
+            Some(root_process.pid()),
+            "the current kernel parent, not the fork-time dispatcher snapshot, is guest-visible",
         );
     }
 
