@@ -7637,32 +7637,33 @@ impl HvfVmState {
         Ok(())
     }
 
-    /// Host VA of `address` iff it lives in a host-`MAP_SHARED` guest region
+    /// Host VA of `backing_gpa` iff it lives in a host-`MAP_SHARED` guest region
     /// (the boot-mapped shared aperture; shared across carrick processes via
     /// the inherited MAP_SHARED backing). Used to back a cross-process futex
     /// with the public `os_sync_wait_on_address` API (see `crate::ulock`).
     pub(crate) fn shared_futex_location(
         &self,
-        address: u64,
+        backing_gpa: u64,
     ) -> Option<carrick_guest_mem::SharedFutexLocation> {
-        // Fast path: the region is in THIS thread's mapping list.
-        if let Some(mapping) = self.mapping_for_range(address, 4) {
-            return mapping.shared_futex_location(address);
+        // The neutral AArch64 engine has already translated the semantic guest
+        // VA through stage-1 and passes the exact backing GPA here. HVPatch
+        // global frames deliberately have VA != IPA, so this lookup MUST stay
+        // in the raw IPA domain; treating the GPA as a second VA made every
+        // fork-shared futex fall through to the process-private table.
+        if let Some(mapping) = Self::mapping_for_ipa_range(&self.mappings, backing_gpa, 4) {
+            return mapping.shared_futex_location_for_ipa(backing_gpa);
         }
-        // Slow path: a fork rebuild replayed only the forking thread's mappings,
-        // so a MAP_SHARED-file alias mapped by another thread is absent from THIS
-        // thread's list — yet the guest CPU still reaches it via the lazy on-fault
-        // re-map keyed off the process-global alias registry. Recover the host
-        // backing from that same registry so a dispatcher-side futex-word read in
-        // a forked child doesn't spuriously EFAULT (→ glibc futex_fatal_error /
-        // SIGABRT, seen in CPython multiprocessing SyncManager teardown waiting on
-        // a shared semaphore). High-VA aliases sit at the deterministic
-        // ipa = va - HIGH_VA_THRESHOLD + ALIAS_IPA_BASE (the exact mapping the
-        // fault handler inverts).
-        if address >= crate::memory::LINUX_HIGH_VA_THRESHOLD
-            && let Some(b) = lookup_shared_alias_by_va(address, 4, self.mm_root_slot)
-        {
-            return MappingView::from_alias(&b).shared_futex_location(address);
+
+        // A shared-file alias installed by another sibling may be absent from
+        // this thread's mapping Vec. Its global IPA is nevertheless unique and
+        // the live alias registry owns the same translated backing identity.
+        if let Some(alias) = alias_registry().lock().iter().rev().find(|alias| {
+            alias.sharing.has_shared_futex_identity()
+                && backing_gpa >= alias.ipa
+                && backing_gpa.saturating_add(4) <= alias.ipa.saturating_add(alias.size as u64)
+                && alias_backing_is_live(alias.host_addr)
+        }) {
+            return MappingView::from_alias(alias).shared_futex_location_for_ipa(backing_gpa);
         }
         None
     }
@@ -11267,14 +11268,19 @@ impl MappingView {
         }
     }
 
-    fn shared_futex_location(
+    fn shared_futex_location_for_ipa(
         &self,
-        address: u64,
+        backing_gpa: u64,
     ) -> Option<carrick_guest_mem::SharedFutexLocation> {
         if !self.sharing.has_shared_futex_identity() {
             return None;
         }
-        let offset = (address - self.start) as usize;
+        let offset = usize::try_from(backing_gpa.checked_sub(self.ipa)?).ok()?;
+        if offset.checked_add(std::mem::size_of::<u32>())?
+            > self.end.checked_sub(self.start)? as usize
+        {
+            return None;
+        }
         let word = carrick_guest_mem::HostVa(unsafe { self.host_addr.add(offset) } as usize);
         let waiter_key = if self.shared_key_base == 0 {
             word.raw()
@@ -13430,6 +13436,29 @@ mod thread_sibling_tests {
         assert!(copied.memory.is_none());
         assert!(copied.host_mapping.is_none());
         assert_eq!(copied.sharing, GuestMappingSharing::GlobalShared);
+    }
+
+    #[test]
+    fn global_frame_futex_resolves_raw_backing_ipa_not_semantic_va() {
+        // Global-frame HVPatch deliberately has start != ipa. The neutral
+        // AArch64 engine passes the translated backing GPA to the VMM seam, so
+        // subtracting the semantic VA selects no word (and routes a shared
+        // anonymous futex through the process-private table after fork).
+        let view = MappingView {
+            start: 0x9000_0000_00,
+            end: 0x9000_0040_00,
+            ipa: 0xa300_1000_00,
+            host_addr: 0x1000usize as *mut u8,
+            guest_writable: true,
+            sharing: GuestMappingSharing::GlobalShared,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+        };
+        let location = view
+            .shared_futex_location_for_ipa(view.ipa + 4)
+            .expect("global shared frame must expose its translated host word");
+        assert_eq!(location.wait_addr().raw(), 0x1004);
+        assert_eq!(location.waiter_key(), 0x1004);
     }
 
     fn mapped_region(start: u64, end: u64, ipa: u64) -> HvfMappedRegion {
