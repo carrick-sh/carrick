@@ -1559,15 +1559,19 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // instruction fetch aborts. Normalising interrupted_pc to None when at EL1
         // routes saved_pc/PSTATE/handler-entry through the eret path so the handler
         // runs at EL0t. Genuine EL0 kicks (the run loop's CANCELED handler guarantees
-        // is_guest) keep the live-CPSR kick path. (KVM never sets interrupted_pc on
-        // aarch64, so this is inert there.)
+        // is_guest) keep the live-CPSR kick path. A durable wake can race the
+        // caller's post-exit signal drain and reach this function with NO caller
+        // hint while the vCPU is still live at EL0. In that case the exception
+        // level remains authoritative: upgrade to the live PC rather than saving
+        // stale ELR_EL1 and redirecting the handler into an eret that does not
+        // exist. (KVM never sets interrupted_pc on aarch64, so this also makes its
+        // live-EL0 authority explicit rather than caller-dependent.)
         let live_pstate = self.get_reg(Reg::Pstate)?;
-        let interrupted_pc = if carrick_hal::aarch64::ExecLevel::from_pstate(live_pstate).is_guest()
-        {
-            interrupted_pc
-        } else {
-            None
-        };
+        let interrupted_pc =
+            signal_interrupted_pc_for_live_level(live_pstate, interrupted_pc, || {
+                self.get_reg(Reg::Pc)
+                    .map_err(|error| TrapError::Hypervisor(error.to_string()))
+            })?;
         // The interrupted PSTATE to save into the sigframe: KICK path (interrupted_pc
         // set, EL0) → the live CPSR we just read; SYSCALL/eret path → SPSR_EL1 where
         // the `svc`/sigreturn-svc latched the EL0 PSTATE. Single-sourced (F7); reuse
@@ -1612,6 +1616,18 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         carrick_observability::probes::signal_restore(r.saved_pc, r.frame_sp, r.magic);
         self.vcpu.prepare_register_resume()?;
         Ok(r.sigmask)
+    }
+}
+
+fn signal_interrupted_pc_for_live_level(
+    live_pstate: u64,
+    interrupted_pc: Option<u64>,
+    live_pc: impl FnOnce() -> Result<u64, TrapError>,
+) -> Result<Option<u64>, TrapError> {
+    if carrick_hal::aarch64::ExecLevel::from_pstate(live_pstate).is_guest() {
+        interrupted_pc.map_or_else(|| live_pc().map(Some), |pc| Ok(Some(pc)))
+    } else {
+        Ok(None)
     }
 }
 
@@ -2791,6 +2807,39 @@ mod tests {
             .expect_err("zero-fabricated FP/SIMD state cannot be complete core authority");
         assert!(error.to_string().contains("FP/SIMD"));
         assert!(require_core_fpsimd_authority(true).is_ok());
+    }
+
+    #[test]
+    fn live_el0_signal_without_caller_hint_uses_live_pc() {
+        let mut reads = 0;
+        let pc = signal_interrupted_pc_for_live_level(0x2000_03c0, None, || {
+            reads += 1;
+            Ok(0x0055_0e78)
+        })
+        .expect("live EL0 PC authority");
+
+        assert_eq!(pc, Some(0x0055_0e78));
+        assert_eq!(reads, 1);
+    }
+
+    #[test]
+    fn live_el0_signal_preserves_supplied_pc_without_reread() {
+        let pc = signal_interrupted_pc_for_live_level(0x2000_03c0, Some(0x0040_1234), || {
+            panic!("a caller-supplied live PC is already authoritative")
+        })
+        .expect("caller-supplied live EL0 PC");
+
+        assert_eq!(pc, Some(0x0040_1234));
+    }
+
+    #[test]
+    fn el1_signal_ignores_stale_caller_pc() {
+        let pc = signal_interrupted_pc_for_live_level(0x6040_03c5, Some(0x0040_1234), || {
+            panic!("EL1 resumes through ELR_EL1, not live PC")
+        })
+        .expect("EL1 signal route");
+
+        assert_eq!(pc, None);
     }
 
     #[test]
