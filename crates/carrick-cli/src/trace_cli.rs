@@ -60,6 +60,7 @@ pub(crate) struct TraceSudoInvocation<'a> {
     pub(crate) script: Option<&'a Path>,
     pub(crate) profile: Option<TraceProfileKind>,
     pub(crate) summary_jsonl: Option<&'a Path>,
+    pub(crate) core_artifact: Option<&'a Path>,
     pub(crate) profile_bound_seconds: Option<u64>,
     pub(crate) trace_out: Option<&'a Path>,
     pub(crate) native_shape_snapshots: Option<&'a Path>,
@@ -95,6 +96,10 @@ pub(crate) fn trace_sudo_argv(invocation: &TraceSudoInvocation<'_>) -> Vec<OsStr
     }
     if let Some(path) = invocation.summary_jsonl {
         argv.push(OsString::from("--summary-jsonl"));
+        argv.push(path.as_os_str().to_owned());
+    }
+    if let Some(path) = invocation.core_artifact {
+        argv.push(OsString::from("--core-artifact"));
         argv.push(path.as_os_str().to_owned());
     }
     if let Some(seconds) = invocation.profile_bound_seconds {
@@ -283,6 +288,7 @@ mod tests {
             script: None,
             profile: Some(TraceProfileKind::DsrIndirect),
             summary_jsonl: Some(Path::new("/tmp/summary.jsonl")),
+            core_artifact: None,
             profile_bound_seconds: None,
             trace_out: Some(Path::new("/tmp/raw.trace")),
             native_shape_snapshots: None,
@@ -323,6 +329,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn core_artifact_survives_sudo_argv_reconstruction() {
+        let command = ["run-elf".to_owned(), "/tmp/probe".to_owned()];
+        let argv = trace_sudo_argv(&TraceSudoInvocation {
+            executable: Path::new("/tmp/carrick"),
+            store: None,
+            flowindent: false,
+            script: None,
+            profile: Some(TraceProfileKind::HvpatchCoreLifecycle),
+            summary_jsonl: None,
+            core_artifact: Some(Path::new("/tmp/coredumpfile/core")),
+            profile_bound_seconds: None,
+            trace_out: Some(Path::new("/tmp/core.raw")),
+            native_shape_snapshots: None,
+            preflight_quiet_host: false,
+            uid: 501,
+            gid: 20,
+            groups: &[],
+            forwarded_env: &[],
+            command: &command,
+        });
+        let strings = argv
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            strings
+                .windows(2)
+                .any(|pair| { pair == ["--core-artifact", "/tmp/coredumpfile/core"] })
+        );
+    }
+
     /// `carrick trace` auto-sudos by REBUILDING its argv field by field, so a
     /// flag added to the parser but not here is silently dropped and the
     /// capture runs with a different bound than the operator asked for --
@@ -342,6 +380,7 @@ mod tests {
             script: None,
             profile: Some(TraceProfileKind::NativeWall),
             summary_jsonl: None,
+            core_artifact: None,
             profile_bound_seconds: Some(900),
             trace_out: Some(Path::new("/tmp/raw.trace")),
             native_shape_snapshots: None,
@@ -393,6 +432,7 @@ mod tests {
             script: None,
             profile: Some(TraceProfileKind::NativeWall),
             summary_jsonl: None,
+            core_artifact: None,
             profile_bound_seconds: None,
             trace_out: None,
             native_shape_snapshots: None,
@@ -435,6 +475,7 @@ mod tests {
             script: None,
             profile: Some(TraceProfileKind::NativeFault),
             summary_jsonl: None,
+            core_artifact: None,
             profile_bound_seconds: None,
             trace_out: Some(Path::new("/tmp/native-fault.raw")),
             native_shape_snapshots: None,
@@ -483,6 +524,7 @@ mod tests {
             script: None,
             profile: Some(TraceProfileKind::NativeShape),
             summary_jsonl: Some(Path::new("/tmp/native-shape.jsonl")),
+            core_artifact: None,
             profile_bound_seconds: None,
             trace_out: Some(Path::new("/tmp/native-shape.raw")),
             preflight_quiet_host: false,

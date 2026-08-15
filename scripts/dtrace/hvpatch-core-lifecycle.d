@@ -19,9 +19,11 @@
  * carrick*:::hvpatch-core-hash carries generation followed by the exact
  * SHA-256 digest as four big-endian uint64_t words.
  *
- * This script fails closed: zero events, a missing/duplicate phase, generation
- * drift, absent census/hash, any failure edge, timeout, DTrace error/drop, or
- * a nonzero Carrick exit produces status=error and a nonzero DTrace exit.
+ * The authenticated temporal contract is exact: request, quiesce, context,
+ * snapshot, census, hash, serialization, rename, wait-status commit. This
+ * script fails closed on any reordering as well as zero events, a missing or
+ * duplicate phase, generation drift, absent census/hash, any failure edge,
+ * timeout, DTrace error/drop, or a nonzero Carrick exit.
  *
  * Perturbation: six lifecycle events plus one context, one census, and one hash
  * event per crash. No syscall, trap, memory-read, or instruction hot path is
@@ -61,6 +63,8 @@ dtrace:::BEGIN
     hash3 = (uint64_t)0;
     identity_drift = 0;
     join_drift = 0;
+    order_stage = 0;
+    order_errors = 0;
     bounded = 0;
     errors = 0;
     drops = 0;
@@ -74,6 +78,12 @@ dtrace:::BEGIN
 carrick*:::hvpatch-core-lifecycle
 /pid == $target || progenyof($target)/
 {
+    this->expected = arg0 == 0 ? 0 : arg0 == 1 ? 1 :
+        arg0 == 2 ? 3 : arg0 == 3 ? 6 : arg0 == 4 ? 7 :
+        arg0 == 5 ? 8 : -1;
+    this->ordered = this->expected >= 0 && order_stage == this->expected;
+    order_errors += !this->ordered;
+    order_stage += this->ordered;
     lifecycle++;
     requests += arg0 == 0;
     quiesced += arg0 == 1;
@@ -96,6 +106,9 @@ carrick*:::hvpatch-core-lifecycle
 carrick*:::hvpatch-core-census
 /pid == $target || progenyof($target)/
 {
+    this->ordered = order_stage == 4;
+    order_errors += !this->ordered;
+    order_stage += this->ordered;
     censuses++;
     join_drift += (uint64_t)arg0 != generation;
     mappings = (uint64_t)arg1;
@@ -109,6 +122,9 @@ carrick*:::hvpatch-core-census
 carrick*:::hvpatch-core-context
 /pid == $target || progenyof($target)/
 {
+    this->ordered = order_stage == 2;
+    order_errors += !this->ordered;
+    order_stage += this->ordered;
     contexts++;
     join_drift += (uint64_t)arg0 != generation;
     mm = (uint64_t)arg1;
@@ -122,6 +138,9 @@ carrick*:::hvpatch-core-context
 carrick*:::hvpatch-core-hash
 /pid == $target || progenyof($target)/
 {
+    this->ordered = order_stage == 5;
+    order_errors += !this->ordered;
+    order_stage += this->ordered;
     hashes++;
     join_drift += (uint64_t)arg0 != generation;
     hash0 = (uint64_t)arg1;
@@ -157,6 +176,7 @@ proc:::exit
         snapshots == 1 && serialized == 1 && published == 1 &&
         committed == 1 && failed == 0 && contexts == 1 && censuses == 1 && hashes == 1 &&
         generation != 0 && identity_drift == 0 && join_drift == 0 &&
+        order_stage == 9 && order_errors == 0 &&
         mm > 0 && asid > 0 && required_threads >= 3 &&
         collected_threads == required_threads && mappings > 0 &&
         notes == 4 + 3 * collected_threads && loads > 0 && core_bytes > 0 &&
@@ -179,17 +199,18 @@ dtrace:::END
         snapshots == 1 && serialized == 1 && published == 1 &&
         committed == 1 && failed == 0 && contexts == 1 && censuses == 1 && hashes == 1 &&
         generation != 0 && identity_drift == 0 && join_drift == 0 &&
+        order_stage == 9 && order_errors == 0 &&
         mm > 0 && asid > 0 && required_threads >= 3 &&
         collected_threads == required_threads && mappings > 0 &&
         notes == 4 + 3 * collected_threads && loads > 0 && core_bytes > 0 &&
         (hash0 != 0 || hash1 != 0 || hash2 != 0 || hash3 != 0) &&
         bounded == 0 && errors == 0 && drops == 0 &&
         target_exit_seen == 1 && target_exit_code == 0;
-    printf("HVPATCHCORE1|summary|status=%s|lifecycle=%d|requests=%d|quiesced=%d|snapshots=%d|serialized=%d|published=%d|committed=%d|failed=%d|contexts=%d|censuses=%d|hashes=%d|generation=%llu|pid=%d|tid=%d|mm=%llu|asid=%u|required_threads=%llu|collected_threads=%llu|mappings=%llu|notes=%llu|loads=%llu|bytes=%llu|identity_drift=%d|join_drift=%d|bounded=%d|errors=%d|drops=%d|target_exit_seen=%d|target_exit_code=%d|target_exit_reason=%d\n",
+    printf("HVPATCHCORE1|summary|status=%s|lifecycle=%d|requests=%d|quiesced=%d|snapshots=%d|serialized=%d|published=%d|committed=%d|failed=%d|contexts=%d|censuses=%d|hashes=%d|generation=%llu|pid=%d|tid=%d|mm=%llu|asid=%u|required_threads=%llu|collected_threads=%llu|mappings=%llu|notes=%llu|loads=%llu|bytes=%llu|identity_drift=%d|join_drift=%d|order_errors=%d|bounded=%d|errors=%d|drops=%d|target_exit_seen=%d|target_exit_code=%d|target_exit_reason=%d\n",
         valid ? "ok" : "error", lifecycle, requests, quiesced,
         snapshots, serialized, published, committed, failed, contexts,
         censuses, hashes, generation, linux_pid, linux_tid, mm, asid,
         required_threads, collected_threads, mappings, notes, loads,
-        core_bytes, identity_drift, join_drift, bounded, errors,
+        core_bytes, identity_drift, join_drift, order_errors, bounded, errors,
         drops, target_exit_seen, target_exit_code, target_exit_reason);
 }

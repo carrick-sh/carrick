@@ -799,6 +799,11 @@ pub(crate) enum Commands {
         /// Atomically publish the parsed profile as versioned JSONL.
         #[arg(long, value_name = "FILE", requires = "profile")]
         summary_jsonl: Option<std::path::PathBuf>,
+        /// Exact crash-produced core whose bytes the HVPatch lifecycle receipt
+        /// must authenticate. Required for `hvpatch-core-lifecycle` and
+        /// rejected for every other profile.
+        #[arg(long = "core-artifact", value_name = "FILE", requires = "profile")]
+        core_artifact: Option<std::path::PathBuf>,
         /// Override the profile's capture bound, in seconds (multiple of 10).
         /// The `native-wall` profile otherwise stops at its shipped 180 s
         /// ceiling, which cannot hold a workload that runs for minutes.
@@ -1388,15 +1393,26 @@ mod tests {
             "hvpatch-core-lifecycle",
             "--trace-out",
             "/tmp/hvpatch-core.raw",
+            "--core-artifact",
+            "/tmp/coredumpfile/core",
             "--",
             "run",
             "fixture",
         ])
         .expect("HVPatch core lifecycle profile should parse");
-        let Commands::Trace { profile, .. } = cli.command else {
+        let Commands::Trace {
+            profile,
+            core_artifact,
+            ..
+        } = cli.command
+        else {
             panic!("expected trace command");
         };
         assert_eq!(profile, Some(TraceProfileKind::HvpatchCoreLifecycle));
+        assert_eq!(
+            core_artifact.as_deref(),
+            Some(std::path::Path::new("/tmp/coredumpfile/core"))
+        );
     }
 
     #[test]

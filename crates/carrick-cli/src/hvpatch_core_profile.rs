@@ -5,6 +5,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
+use sha2::{Digest, Sha256};
 
 use crate::trace_profile::ProfileCaptureStatus;
 
@@ -118,13 +119,25 @@ pub(crate) struct HvpatchCoreSummary {
 }
 
 impl HvpatchCoreSummary {
-    pub(crate) fn from_path(path: &Path, status: ProfileCaptureStatus) -> Result<Self> {
+    pub(crate) fn from_path(
+        path: &Path,
+        artifact_path: &Path,
+        status: ProfileCaptureStatus,
+    ) -> Result<Self> {
         let contents = fs::read_to_string(path)
             .with_context(|| format!("read HVPatch core stream {}", path.display()))?;
-        Self::from_lines(contents.lines(), status)
+        let artifact = fs::read(artifact_path).with_context(|| {
+            format!(
+                "read explicitly supplied HVPatch core artifact {}",
+                artifact_path.display()
+            )
+        })?;
+        crate::debug_core::validate_bytes(&artifact, &artifact_path.display().to_string())
+            .map_err(|error| anyhow!("supplied HVPatch core artifact is invalid: {error}"))?;
+        Self::from_lines(contents.lines(), &artifact, status)
     }
 
-    fn from_lines<I, S>(lines: I, status: ProfileCaptureStatus) -> Result<Self>
+    fn from_lines<I, S>(lines: I, artifact: &[u8], status: ProfileCaptureStatus) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -132,8 +145,7 @@ impl HvpatchCoreSummary {
         if status != ProfileCaptureStatus::default() {
             bail!("HVPatch core capture is lossy or interrupted: {status:?}");
         }
-        let mut header = false;
-        let mut phases = BTreeMap::new();
+        let mut stage = 0_u8;
         let mut identity = None;
         let mut context = None;
         let mut census = None;
@@ -151,18 +163,25 @@ impl HvpatchCoreSummary {
             match record.tag.as_str() {
                 "header" => {
                     record.exact_fields(&["version"])?;
-                    if header || record.u64("version")? != 1 {
+                    require_stage(stage, 0, "header")?;
+                    if record.u64("version")? != 1 {
                         bail!("duplicate or unsupported HVPATCHCORE1 header");
                     }
-                    header = true;
+                    stage = 1;
                 }
                 "lifecycle" => {
-                    require_header(header)?;
                     record.exact_fields(&["phase", "pid", "tid", "generation", "outcome"])?;
                     let phase = record.u64("phase")?;
-                    if phase > 5 || phases.insert(phase, ()).is_some() {
-                        bail!("invalid or duplicate HVPatch core lifecycle phase {phase}");
-                    }
+                    let (expected_stage, next_stage) = match phase {
+                        0 => (1, 2),
+                        1 => (2, 3),
+                        2 => (4, 5),
+                        3 => (7, 8),
+                        4 => (8, 9),
+                        5 => (9, 10),
+                        _ => bail!("invalid HVPatch core lifecycle phase {phase}"),
+                    };
+                    require_stage(stage, expected_stage, "lifecycle")?;
                     if record.u64("outcome")? != 0 {
                         bail!("HVPatch core lifecycle reports a failure outcome");
                     }
@@ -172,9 +191,10 @@ impl HvpatchCoreSummary {
                         tid: record.i32("tid")?,
                     };
                     join(&mut identity, observed, "lifecycle identity")?;
+                    stage = next_stage;
                 }
                 "context" => {
-                    require_header(header)?;
+                    require_stage(stage, 3, "context")?;
                     record.exact_fields(&[
                         "generation",
                         "mm",
@@ -192,9 +212,10 @@ impl HvpatchCoreSummary {
                     if context.replace(observed).is_some() {
                         bail!("duplicate HVPatch core context");
                     }
+                    stage = 4;
                 }
                 "census" => {
-                    require_header(header)?;
+                    require_stage(stage, 5, "census")?;
                     record.exact_fields(&["generation", "mappings", "notes", "loads", "bytes"])?;
                     let observed = CensusRecord {
                         generation: record.u64("generation")?,
@@ -206,9 +227,10 @@ impl HvpatchCoreSummary {
                     if census.replace(observed).is_some() {
                         bail!("duplicate HVPatch core census");
                     }
+                    stage = 6;
                 }
                 "hash" => {
-                    require_header(header)?;
+                    require_stage(stage, 6, "hash")?;
                     record.exact_fields(&["generation", "sha256"])?;
                     let digest = record.value("sha256")?;
                     if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -220,9 +242,10 @@ impl HvpatchCoreSummary {
                     {
                         bail!("duplicate HVPatch core hash");
                     }
+                    stage = 7;
                 }
                 "summary" => {
-                    require_header(header)?;
+                    require_stage(stage, 10, "summary")?;
                     let fields = [
                         "status",
                         "lifecycle",
@@ -249,6 +272,7 @@ impl HvpatchCoreSummary {
                         "bytes",
                         "identity_drift",
                         "join_drift",
+                        "order_errors",
                         "bounded",
                         "errors",
                         "drops",
@@ -260,17 +284,20 @@ impl HvpatchCoreSummary {
                     if summary.replace(record).is_some() {
                         bail!("duplicate HVPatch core summary");
                     }
+                    stage = 11;
                 }
                 other => bail!("unknown HVPatch core record {other:?}"),
             }
         }
-        if !header || phases.len() != 6 {
-            bail!("HVPatch core stream is zero or missing lifecycle phases");
+        if stage != 11 {
+            bail!("HVPatch core stream is incomplete or temporally out of order");
         }
         let identity = identity.ok_or_else(|| anyhow!("HVPatch core identity is absent"))?;
         let context = context.ok_or_else(|| anyhow!("HVPatch core context is absent"))?;
         let census = census.ok_or_else(|| anyhow!("HVPatch core census is absent"))?;
-        let (hash_generation, _) = hash.ok_or_else(|| anyhow!("HVPatch core hash is absent"))?;
+        let (hash_generation, recorded_hash) =
+            hash.ok_or_else(|| anyhow!("HVPatch core hash is absent"))?;
+        let artifact_hash = format!("{:x}", Sha256::digest(artifact));
         if identity.generation == 0
             || identity.pid <= 0
             || identity.tid <= 0
@@ -284,9 +311,13 @@ impl HvpatchCoreSummary {
             || census.mappings == 0
             || census.loads == 0
             || census.bytes == 0
+            || usize::try_from(census.bytes).ok() != Some(artifact.len())
             || census.notes != 4 + 3 * context.collected_threads
         {
             bail!("HVPatch core joined authority is incomplete or out of generation");
+        }
+        if !recorded_hash.eq_ignore_ascii_case(&artifact_hash) {
+            bail!("HVPatch core receipt digest does not authenticate the supplied artifact");
         }
         let summary = summary.ok_or_else(|| anyhow!("HVPatch core summary is absent"))?;
         validate_summary(&summary, identity, context, census)?;
@@ -307,9 +338,11 @@ impl HvpatchCoreSummary {
     }
 }
 
-fn require_header(header: bool) -> Result<()> {
-    if !header {
-        bail!("HVPatch core data precedes its header");
+fn require_stage(actual: u8, expected: u8, record: &str) -> Result<()> {
+    if actual != expected {
+        bail!(
+            "HVPatch core {record} is temporally out of order (stage {actual}, expected {expected})"
+        );
     }
     Ok(())
 }
@@ -348,6 +381,7 @@ fn validate_summary(
             "failed",
             "identity_drift",
             "join_drift",
+            "order_errors",
             "bounded",
             "errors",
             "drops",
@@ -379,31 +413,47 @@ fn validate_summary(
 mod tests {
     use super::*;
 
-    fn valid() -> Vec<String> {
-        let mut lines = vec!["HVPATCHCORE1|header|version=1".to_owned()];
-        for phase in 0..6 {
-            lines.push(format!(
-                "HVPATCHCORE1|lifecycle|phase={phase}|pid=5|tid=5|generation=1|outcome=0"
-            ));
-        }
-        lines.extend([
+    fn artifact() -> Vec<u8> {
+        vec![0x5a; 4096]
+    }
+
+    fn lifecycle(phase: u8) -> String {
+        format!("HVPATCHCORE1|lifecycle|phase={phase}|pid=5|tid=5|generation=1|outcome=0")
+    }
+
+    fn valid(artifact: &[u8]) -> Vec<String> {
+        vec![
+            "HVPATCHCORE1|header|version=1".to_owned(),
+            lifecycle(0),
+            lifecycle(1),
             "HVPATCHCORE1|context|generation=1|mm=7|asid=2|required_threads=3|collected_threads=3".to_owned(),
+            lifecycle(2),
             "HVPATCHCORE1|census|generation=1|mappings=4|notes=13|loads=8|bytes=4096".to_owned(),
-            format!("HVPATCHCORE1|hash|generation=1|sha256={}", "ab".repeat(32)),
-            "HVPATCHCORE1|summary|status=ok|lifecycle=6|requests=1|quiesced=1|snapshots=1|serialized=1|published=1|committed=1|failed=0|contexts=1|censuses=1|hashes=1|generation=1|pid=5|tid=5|mm=7|asid=2|required_threads=3|collected_threads=3|mappings=4|notes=13|loads=8|bytes=4096|identity_drift=0|join_drift=0|bounded=0|errors=0|drops=0|target_exit_seen=1|target_exit_code=0|target_exit_reason=1".to_owned(),
-        ]);
-        lines
+            format!(
+                "HVPATCHCORE1|hash|generation=1|sha256={:x}",
+                Sha256::digest(artifact)
+            ),
+            lifecycle(3),
+            lifecycle(4),
+            lifecycle(5),
+            "HVPATCHCORE1|summary|status=ok|lifecycle=6|requests=1|quiesced=1|snapshots=1|serialized=1|published=1|committed=1|failed=0|contexts=1|censuses=1|hashes=1|generation=1|pid=5|tid=5|mm=7|asid=2|required_threads=3|collected_threads=3|mappings=4|notes=13|loads=8|bytes=4096|identity_drift=0|join_drift=0|order_errors=0|bounded=0|errors=0|drops=0|target_exit_seen=1|target_exit_code=0|target_exit_reason=1".to_owned(),
+        ]
+    }
+
+    fn parse(lines: Vec<String>, artifact: &[u8]) -> Result<HvpatchCoreSummary> {
+        HvpatchCoreSummary::from_lines(lines, artifact, ProfileCaptureStatus::default())
     }
 
     #[test]
     fn accepts_one_complete_joined_generation() {
-        let summary = HvpatchCoreSummary::from_lines(valid(), ProfileCaptureStatus::default())
-            .expect("valid core stream");
+        let artifact = artifact();
+        let summary = parse(valid(&artifact), &artifact).expect("valid core stream");
         assert_eq!(summary.threads, 3);
     }
 
     #[test]
     fn rejects_every_missing_or_duplicate_record_class() {
+        let artifact = artifact();
         for needle in [
             "|header|",
             "|lifecycle|phase=4",
@@ -412,35 +462,32 @@ mod tests {
             "|hash|",
             "|summary|",
         ] {
-            let lines = valid()
+            let lines = valid(&artifact)
                 .into_iter()
                 .filter(|line| !line.contains(needle))
                 .collect::<Vec<_>>();
-            assert!(
-                HvpatchCoreSummary::from_lines(lines, ProfileCaptureStatus::default()).is_err()
-            );
+            assert!(parse(lines, &artifact).is_err());
 
-            let mut duplicate = valid();
+            let mut duplicate = valid(&artifact);
             let record = duplicate
                 .iter()
                 .find(|line| line.contains(needle))
                 .expect("record class")
                 .clone();
             duplicate.push(record);
-            assert!(
-                HvpatchCoreSummary::from_lines(duplicate, ProfileCaptureStatus::default()).is_err()
-            );
+            assert!(parse(duplicate, &artifact).is_err());
         }
     }
 
     #[test]
     fn rejects_loss_generation_drift_and_producer_failure() {
+        let artifact = artifact();
         let lossy = ProfileCaptureStatus {
             principal_drops: 1,
             ..ProfileCaptureStatus::default()
         };
-        assert!(HvpatchCoreSummary::from_lines(valid(), lossy).is_err());
-        let drift = valid()
+        assert!(HvpatchCoreSummary::from_lines(valid(&artifact), &artifact, lossy).is_err());
+        let drift = valid(&artifact)
             .into_iter()
             .map(|line| {
                 if line.contains("|context|") {
@@ -450,16 +497,17 @@ mod tests {
                 }
             })
             .collect::<Vec<_>>();
-        assert!(HvpatchCoreSummary::from_lines(drift, ProfileCaptureStatus::default()).is_err());
-        let failed = valid()
+        assert!(parse(drift, &artifact).is_err());
+        let failed = valid(&artifact)
             .into_iter()
             .map(|line| line.replace("status=ok", "status=error"))
             .collect::<Vec<_>>();
-        assert!(HvpatchCoreSummary::from_lines(failed, ProfileCaptureStatus::default()).is_err());
+        assert!(parse(failed, &artifact).is_err());
     }
 
     #[test]
     fn rejects_zero_incomplete_bounded_and_failed_authority() {
+        let artifact = artifact();
         for (from, to) in [
             ("generation=1", "generation=0"),
             ("required_threads=3", "required_threads=0"),
@@ -467,34 +515,51 @@ mod tests {
             ("bounded=0", "bounded=1"),
             ("errors=0", "errors=1"),
             ("drops=0", "drops=1"),
+            ("order_errors=0", "order_errors=1"),
             ("outcome=0", "outcome=1"),
         ] {
-            let malformed = valid()
+            let malformed = valid(&artifact)
                 .into_iter()
                 .map(|line| line.replace(from, to))
                 .collect::<Vec<_>>();
             assert!(
-                HvpatchCoreSummary::from_lines(malformed, ProfileCaptureStatus::default()).is_err(),
+                parse(malformed, &artifact).is_err(),
                 "accepted {from} -> {to}"
             );
         }
     }
 
     #[test]
-    fn terminal_summary_is_final_and_requires_an_exit_reason() {
-        let mut reordered = valid();
-        let phase = reordered.remove(1);
-        reordered.push(phase);
-        assert!(
-            HvpatchCoreSummary::from_lines(reordered, ProfileCaptureStatus::default()).is_err()
-        );
+    fn rejects_temporal_reordering_and_requires_an_exit_reason() {
+        let artifact = artifact();
+        let mut reordered = valid(&artifact);
+        reordered.swap(2, 3);
+        assert!(parse(reordered, &artifact).is_err());
 
-        let no_reason = valid()
+        let no_reason = valid(&artifact)
             .into_iter()
             .map(|line| line.replace("target_exit_reason=1", "target_exit_reason=0"))
             .collect::<Vec<_>>();
-        assert!(
-            HvpatchCoreSummary::from_lines(no_reason, ProfileCaptureStatus::default()).is_err()
-        );
+        assert!(parse(no_reason, &artifact).is_err());
+    }
+
+    #[test]
+    fn rejects_syntactically_valid_arbitrary_digest_and_artifact_mutation() {
+        let artifact = artifact();
+        let arbitrary = valid(&artifact)
+            .into_iter()
+            .map(|line| {
+                if line.contains("|hash|") {
+                    format!("HVPATCHCORE1|hash|generation=1|sha256={}", "ab".repeat(32))
+                } else {
+                    line
+                }
+            })
+            .collect();
+        assert!(parse(arbitrary, &artifact).is_err());
+
+        let mut changed_artifact = artifact.clone();
+        changed_artifact[0] ^= 1;
+        assert!(parse(valid(&artifact), &changed_artifact).is_err());
     }
 }

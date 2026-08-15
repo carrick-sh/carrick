@@ -1448,6 +1448,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             script,
             profile,
             summary_jsonl,
+            core_artifact,
             profile_bound_seconds,
             native_shape_snapshots,
             preflight_quiet_host,
@@ -1469,6 +1470,21 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 }
                 let current_directory =
                     std::env::current_dir().context("resolve trace current directory")?;
+                match (profile, core_artifact.as_deref()) {
+                    (Some(crate::trace_profile::TraceProfileKind::HvpatchCoreLifecycle), None) => {
+                        bail!(
+                            "hvpatch-core-lifecycle requires --core-artifact naming the crash-produced core"
+                        )
+                    }
+                    (
+                        Some(crate::trace_profile::TraceProfileKind::HvpatchCoreLifecycle),
+                        Some(_),
+                    )
+                    | (_, None) => {}
+                    (_, Some(_)) => {
+                        bail!("--core-artifact is valid only with --profile hvpatch-core-lifecycle")
+                    }
+                }
                 validate_native_shape_trace_arguments(
                     profile,
                     script.as_deref(),
@@ -1581,6 +1597,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         script: script.as_deref(),
                         profile,
                         summary_jsonl: summary_jsonl.as_deref(),
+                        core_artifact: core_artifact.as_deref(),
                         profile_bound_seconds,
                         trace_out: trace_out.as_deref(),
                         native_shape_snapshots: native_shape_snapshots.as_deref(),
@@ -1976,7 +1993,14 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                                     "the HVPatch core lifecycle profile has no JSON ledger schema; use its strict raw stream and CLI summary"
                                 );
                             }
-                            let summary = HvpatchCoreSummary::from_path(raw_path, capture_status)?;
+                            let artifact_path = core_artifact.as_deref().ok_or_else(|| {
+                                anyhow::anyhow!("HVPatch core artifact path disappeared")
+                            })?;
+                            let summary = HvpatchCoreSummary::from_path(
+                                raw_path,
+                                artifact_path,
+                                capture_status,
+                            )?;
                             eprintln!("{}", summary.render_human());
                         } else if requested_profile
                             == crate::trace_profile::TraceProfileKind::HvpatchIdentityHostSafety
