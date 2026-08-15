@@ -11,10 +11,10 @@
 //! drift.
 
 use carrick_runtime::core_dump::{
-    AARCH64_FPREGSET_SIZE, AARCH64_TLS_SIZE, ELF_CLASS64, EM_AARCH64, ET_CORE,
-    LINUX_ELF_NOTE_OWNER, NOTE_ALIGN, NOTE_OWNER, NT_ARM_TLS, NT_AUXV, NT_FILE, NT_FPREGSET,
-    NT_PRPSINFO, NT_PRSTATUS, NT_SIGINFO, ORACLE_PRPSINFO_SIZE, ORACLE_PRSTATUS_SIZE,
-    ORACLE_SIGINFO_SIZE, PT_LOAD, PT_NOTE, wire,
+    AARCH64_FPREGSET_SIZE, AARCH64_TLS_SIZE, ELF_CLASS64, ELF_DATA_LSB, ELF_VERSION_CURRENT,
+    EM_AARCH64, ET_CORE, LINUX_ELF_NOTE_OWNER, NOTE_ALIGN, NOTE_OWNER, NT_ARM_TLS, NT_AUXV,
+    NT_FILE, NT_FPREGSET, NT_PRPSINFO, NT_PRSTATUS, NT_SIGINFO, ORACLE_PRPSINFO_SIZE,
+    ORACLE_PRSTATUS_SIZE, ORACLE_SIGINFO_SIZE, PT_LOAD, PT_NOTE, wire,
 };
 use std::path::Path;
 
@@ -28,6 +28,8 @@ pub(crate) enum CoreError {
     BadMagic([u8; 4]),
     #[error("not a 64-bit ELF (e_ident[EI_CLASS] = {0})")]
     NotElf64(u8),
+    #[error("invalid ELF encoding/version identity: {0}")]
+    BadElfIdentity(&'static str),
     #[error("not a core file (e_type = {0}, expected ET_CORE = {expected})", expected = ET_CORE)]
     NotCore(u16),
     #[error("not an aarch64 core (e_machine = {0}, expected {expected})", expected = EM_AARCH64)]
@@ -79,6 +81,8 @@ pub(crate) enum CoreError {
         filesz: u64,
         memsz: u64,
     },
+    #[error("PT_LOAD virtual address ranges overlap")]
+    OverlappingLoads,
     #[error("core offset/count arithmetic overflowed")]
     ArithmeticOverflow,
     #[error("malformed {0}")]
@@ -205,6 +209,12 @@ pub(crate) fn validate_bytes(bytes: &[u8], path: &str) -> Result<CoreSummary, Co
     if bytes[4] != ELF_CLASS64 {
         return Err(CoreError::NotElf64(bytes[4]));
     }
+    if bytes[5] != ELF_DATA_LSB {
+        return Err(CoreError::BadElfIdentity("EI_DATA is not little-endian"));
+    }
+    if bytes[6] != ELF_VERSION_CURRENT {
+        return Err(CoreError::BadElfIdentity("EI_VERSION is not current"));
+    }
     let e_type = read_u16(bytes, ehdr(std::mem::offset_of!(wire::Elf64Ehdr, e_type)));
     if e_type != ET_CORE {
         return Err(CoreError::NotCore(e_type));
@@ -215,6 +225,13 @@ pub(crate) fn validate_bytes(bytes: &[u8], path: &str) -> Result<CoreSummary, Co
     );
     if machine != EM_AARCH64 {
         return Err(CoreError::NotAarch64(machine));
+    }
+    let version = read_u32(
+        bytes,
+        ehdr(std::mem::offset_of!(wire::Elf64Ehdr, e_version)),
+    );
+    if version != u32::from(ELF_VERSION_CURRENT) {
+        return Err(CoreError::BadElfIdentity("e_version is not current"));
     }
 
     let phoff = read_u64(bytes, std::mem::offset_of!(wire::Elf64Ehdr, e_phoff));
@@ -253,6 +270,7 @@ pub(crate) fn validate_bytes(bytes: &[u8], path: &str) -> Result<CoreSummary, Co
     let mut load_segments = 0_usize;
     let mut load_with_contents = 0_usize;
     let mut memory_bytes = 0_u64;
+    let mut load_vmas = Vec::new();
     for index in 0..phnum {
         let base = phoff_usize
             .checked_add(
@@ -295,6 +313,16 @@ pub(crate) fn validate_bytes(bytes: &[u8], path: &str) -> Result<CoreSummary, Co
             memory_bytes = memory_bytes
                 .checked_add(memsz)
                 .ok_or(CoreError::ArithmeticOverflow)?;
+            let vaddr = read_u64(
+                bytes,
+                field(base, std::mem::offset_of!(wire::Elf64Phdr, p_vaddr)),
+            );
+            let vma_end = vaddr
+                .checked_add(memsz)
+                .ok_or(CoreError::ArithmeticOverflow)?;
+            if memsz != 0 {
+                load_vmas.push((vaddr, vma_end));
+            }
             if filesz > 0 {
                 load_with_contents = load_with_contents
                     .checked_add(1)
@@ -312,6 +340,10 @@ pub(crate) fn validate_bytes(bytes: &[u8], path: &str) -> Result<CoreSummary, Co
                 }
             }
         }
+    }
+    load_vmas.sort_unstable();
+    if load_vmas.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return Err(CoreError::OverlappingLoads);
     }
 
     let (note_offset, note_size) = note_span.ok_or(CoreError::NoNoteSegment)?;
@@ -332,7 +364,7 @@ pub(crate) fn validate_bytes(bytes: &[u8], path: &str) -> Result<CoreSummary, Co
     let mut parsed_threads: Vec<ParsedThread> = Vec::new();
     let mut identity = None;
     let mut signal = None;
-    let mut auxv_entries = 0_usize;
+    let mut auxv_entries = None;
     let mut file_mappings = None;
     let mut foreign_notes = 0_usize;
 
@@ -480,7 +512,9 @@ pub(crate) fn validate_bytes(bytes: &[u8], path: &str) -> Result<CoreSummary, Co
                 {
                     return Err(CoreError::Malformed("NT_AUXV trailing data"));
                 }
-                auxv_entries = pairs.len() - 1;
+                if auxv_entries.replace(pairs.len() - 1).is_some() {
+                    return Err(CoreError::Malformed("duplicate NT_AUXV"));
+                }
             }
             NT_FILE => {
                 if desc.len() < 16 || read_u64(desc, 8) == 0 {
@@ -543,6 +577,7 @@ pub(crate) fn validate_bytes(bytes: &[u8], path: &str) -> Result<CoreSummary, Co
     }
     let (pid, ppid, comm) = identity.ok_or(CoreError::MissingNote("NT_PRPSINFO"))?;
     let (signo, code, addr) = signal.ok_or(CoreError::MissingNote("NT_SIGINFO"))?;
+    let auxv_entries = auxv_entries.ok_or(CoreError::MissingNote("NT_AUXV"))?;
     let file_mappings = file_mappings.ok_or(CoreError::MissingNote("NT_FILE"))?;
 
     Ok(CoreSummary {
@@ -576,10 +611,11 @@ pub(crate) fn run_debug_core(path: &Path) -> Result<(), Box<dyn std::error::Erro
 mod tests {
     use super::*;
 
-    fn complete_core() -> Vec<u8> {
+    fn core_with_regions(
+        regions: Vec<carrick_runtime::core_dump::MemoryRegion<'static>>,
+    ) -> Vec<u8> {
         use carrick_runtime::core_dump::{
-            AARCH64_GREGS, CoreDump, MemoryRegion, ProcessIdentity, SignalInfo, ThreadRegisters,
-            ThreadState,
+            AARCH64_GREGS, CoreDump, ProcessIdentity, SignalInfo, ThreadRegisters, ThreadState,
         };
         let mut gregs = [0_u64; AARCH64_GREGS];
         gregs[0] = 0x1111;
@@ -614,15 +650,20 @@ mod tests {
             }],
             auxv: vec![(6, 4096)],
             mappings: Vec::new(),
-            regions: vec![MemoryRegion {
-                start: 0x1_0000,
-                flags: 5,
-                bytes: b"authoritative-load",
-                size: 0x1_0000,
-            }],
+            regions,
         }
         .to_bytes_bounded(u64::MAX)
         .expect("complete core")
+    }
+
+    fn complete_core() -> Vec<u8> {
+        use carrick_runtime::core_dump::MemoryRegion;
+        core_with_regions(vec![MemoryRegion {
+            start: 0x1_0000,
+            flags: 5,
+            bytes: b"authoritative-load",
+            size: 0x1_0000,
+        }])
     }
 
     /// A validator that accepts anything is not a validator. Each of these is
@@ -687,8 +728,37 @@ mod tests {
         bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
     }
 
+    fn mutate_u32(bytes: &mut [u8], at: usize, value: u32) {
+        bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
     fn mutate_u64(bytes: &mut [u8], at: usize, value: u64) {
         bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn retag_first_note(bytes: &mut [u8], old_type: u32, new_type: u32) {
+        let phoff = read_u64(bytes, std::mem::offset_of!(wire::Elf64Ehdr, e_phoff)) as usize;
+        let note_offset = read_u64(
+            bytes,
+            phoff + std::mem::offset_of!(wire::Elf64Phdr, p_offset),
+        ) as usize;
+        let note_size = read_u64(
+            bytes,
+            phoff + std::mem::offset_of!(wire::Elf64Phdr, p_filesz),
+        ) as usize;
+        let note_end = note_offset + note_size;
+        let mut at = note_offset;
+        while at < note_end {
+            let namesz = read_u32(bytes, at) as usize;
+            let descsz = read_u32(bytes, at + 4) as usize;
+            if read_u32(bytes, at + 8) == old_type {
+                mutate_u32(bytes, at + 8, new_type);
+                return;
+            }
+            let desc_at = checked_align_up(at + 12 + namesz, NOTE_ALIGN).expect("note name");
+            at = checked_align_up(desc_at + descsz, NOTE_ALIGN).expect("note descriptor");
+        }
+        panic!("note type {old_type:#x} is absent");
     }
 
     #[test]
@@ -755,5 +825,59 @@ mod tests {
         ) as usize;
         note[note_offset + 4..note_offset + 8].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(validate_bytes(&note, "bad-note").is_err());
+
+        use carrick_runtime::core_dump::MemoryRegion;
+        let mut overlapping_loads = core_with_regions(vec![
+            MemoryRegion {
+                start: 0x1_0000,
+                flags: 5,
+                bytes: b"first",
+                size: 0x1_0000,
+            },
+            MemoryRegion {
+                start: 0x2_0000,
+                flags: 3,
+                bytes: b"second",
+                size: 0x1_0000,
+            },
+        ]);
+        let second_load = size_of::<wire::Elf64Ehdr>() + (2 * size_of::<wire::Elf64Phdr>());
+        mutate_u64(
+            &mut overlapping_loads,
+            second_load + std::mem::offset_of!(wire::Elf64Phdr, p_vaddr),
+            0x1_8000,
+        );
+        assert!(matches!(
+            validate_bytes(&overlapping_loads, "overlapping-loads"),
+            Err(CoreError::OverlappingLoads)
+        ));
+    }
+
+    #[test]
+    fn rejects_wrong_elf_identity_and_missing_mandatory_auxv() {
+        for mutate in [
+            |bytes: &mut [u8]| bytes[5] = 2,
+            |bytes: &mut [u8]| bytes[6] = 0,
+            |bytes: &mut [u8]| {
+                mutate_u32(bytes, std::mem::offset_of!(wire::Elf64Ehdr, e_version), 0);
+            },
+        ] {
+            let mut bytes = complete_core();
+            mutate(&mut bytes);
+            assert!(
+                std::panic::catch_unwind(|| validate_bytes(&bytes, "wrong-elf-identity"))
+                    .expect("malformed ELF identity must not panic")
+                    .is_err(),
+                "accepted malformed ELF encoding/version identity"
+            );
+        }
+
+        let mut missing_auxv = complete_core();
+        retag_first_note(&mut missing_auxv, NT_AUXV, 0x7fff_ff01);
+        assert!(matches!(
+            std::panic::catch_unwind(|| validate_bytes(&missing_auxv, "missing-auxv"))
+                .expect("missing mandatory note must not panic"),
+            Err(CoreError::MissingNote("NT_AUXV"))
+        ));
     }
 }
