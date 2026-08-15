@@ -959,7 +959,10 @@ fn identity_operation_errno(
     match error {
         crate::kernel::KernelOperationError::UnknownTask(_) => crate::linux_abi::LINUX_ESRCH,
         crate::kernel::KernelOperationError::IdentityPermission
-        | crate::kernel::KernelOperationError::ChildExeced(_) => crate::linux_abi::LINUX_EPERM,
+        | crate::kernel::KernelOperationError::ChildExeced(_)
+        | crate::kernel::KernelOperationError::AlreadyProcessGroupLeader => {
+            crate::linux_abi::LINUX_EPERM
+        }
         _ => crate::linux_abi::LINUX_EINVAL,
     }
 }
@@ -1327,6 +1330,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_group_leader_setsid_failure_is_eperm() {
+        assert_eq!(
+            identity_operation_errno(
+                crate::kernel::KernelOperationError::AlreadyProcessGroupLeader,
+            ),
+            crate::linux_abi::LINUX_EPERM,
+        );
+    }
     use crate::kernel::MmBackend as _;
     use crate::memory::AddressSpace;
     use carrick_mem::elf::SegmentPerms;
