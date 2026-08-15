@@ -204,6 +204,27 @@ fn publish_for(pid: u32, state: RunState) {
     let _ = claim_record(section, pid, want, false);
 }
 
+/// Publish one HVPatch thread's run state under authoritative Linux identity.
+///
+/// HVPatch multiplexes every Linux process in one Darwin process, so the
+/// process-local [`publish`] cache cannot distinguish fork children. The Linux
+/// task leader owns the process-keyed slot; non-leader threads use the disjoint
+/// TID-keyed slots used by cross-process `/proc/<tid>` reads.
+pub fn publish_task_thread(task_pid: i32, tid: i32, state: RunState) {
+    let (Ok(task_pid), Ok(tid)) = (u32::try_from(task_pid), u32::try_from(tid)) else {
+        return;
+    };
+    if task_pid == 0 || tid == 0 {
+        return;
+    }
+    if tid == task_pid {
+        publish_for(task_pid, state);
+    } else {
+        let section = processes();
+        let _ = claim_record(section, tid, pack_tid(tid, state), true);
+    }
+}
+
 /// Publish a guest-visible WORKER thread id into the shared state table. Worker
 /// ids are not host pids (they can numerically equal another process's pid), so
 /// they go into a KIND_TID-tagged slot disjoint from any process entry — other
@@ -625,6 +646,26 @@ mod tests {
         clear_guest_tid(tid as i32);
         assert_eq!(published(tid), None);
         wipe_id(tid);
+    }
+
+    #[test]
+    fn hvpatch_task_leader_publishes_under_linux_task_id() {
+        // HVPatch hosts every Linux task in one Darwin process. Publishing via
+        // `publish()` would collapse every child onto that shared host pid, so
+        // the task-aware path must key the leader under its authoritative Linux
+        // task id and a worker under its authoritative Linux tid.
+        let task_pid = 0x0BAD_C001;
+        let worker_tid = 0x0BAD_C002;
+        wipe_id(task_pid);
+        wipe_id(worker_tid);
+
+        publish_task_thread(task_pid as i32, task_pid as i32, RunState::Blocked);
+        publish_task_thread(task_pid as i32, worker_tid as i32, RunState::Running);
+
+        assert_eq!(published(task_pid), Some(RunState::Blocked));
+        assert_eq!(published(worker_tid), Some(RunState::Running));
+        wipe_id(task_pid);
+        wipe_id(worker_tid);
     }
 
     #[test]

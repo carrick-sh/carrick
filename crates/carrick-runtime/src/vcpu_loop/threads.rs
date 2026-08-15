@@ -161,12 +161,7 @@ where
             // Genuine guest block (FUTEX_WAIT): publish Blocked so a sibling's
             // /proc/<pid>/stat reads `S`. `Running` is re-published when the vCPU
             // resumes guest code after the wake (run_vcpu_until_exit top).
-            crate::run_state::publish(crate::run_state::RunState::Blocked);
-            crate::thread::set_current_thread_state(self.this_tid, 'S');
-            crate::run_state::publish_guest_tid(
-                self.this_tid.raw(),
-                crate::run_state::RunState::Blocked,
-            );
+            self.publish_thread_run_state(crate::run_state::RunState::Blocked, 'S');
             crate::event_ring::rec_futex_wait(wait.addr, self.this_tid.raw());
             let raw = self
                 .futex
@@ -196,11 +191,7 @@ where
                 0,
                 wait_trace,
             );
-            crate::thread::set_current_thread_state(self.this_tid, 'R');
-            crate::run_state::publish_guest_tid(
-                self.this_tid.raw(),
-                crate::run_state::RunState::Running,
-            );
+            self.publish_thread_run_state(crate::run_state::RunState::Running, 'R');
             if thread_should_finish_for_exec_replacement(&self.registry, self.this_tid) {
                 return Ok(BlockingWaitCompletion::ExecReplacedThread);
             }
@@ -361,12 +352,7 @@ where
                 self.park_vcpu_for_blocking_wait(engine, crate::thread::VcpuParkClass::ReleaseSafe);
 
             let publish_wait_enrolled = || {
-                crate::run_state::publish(crate::run_state::RunState::Blocked);
-                crate::thread::set_current_thread_state(self.this_tid, 'S');
-                crate::run_state::publish_guest_tid(
-                    self.this_tid.raw(),
-                    crate::run_state::RunState::Blocked,
-                );
+                self.publish_thread_run_state(crate::run_state::RunState::Blocked, 'S');
             };
             let retval = self.platform_futex.shared_wait(
                 location,
@@ -376,11 +362,7 @@ where
                 &interrupted,
                 &publish_wait_enrolled,
             );
-            crate::thread::set_current_thread_state(self.this_tid, 'R');
-            crate::run_state::publish_guest_tid(
-                self.this_tid.raw(),
-                crate::run_state::RunState::Running,
-            );
+            self.publish_thread_run_state(crate::run_state::RunState::Running, 'R');
             if thread_should_finish_for_exec_replacement(&self.registry, self.this_tid) {
                 return Ok(SharedWordWaitRaw::ExecReplacedThread);
             }

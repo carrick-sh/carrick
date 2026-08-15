@@ -1392,6 +1392,9 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     process_fork_barrier: Option<Arc<crate::fork_quiesce::QuiesceBarrier>>,
     crash_capture_generation: Option<Arc<std::sync::atomic::AtomicU64>>,
     kernel_thread: Option<crate::kernel::ThreadRef>,
+    /// Authoritative Linux TGID for a task multiplexed by HVPatch. `None` on
+    /// the one-host-process-per-task native/VMM lanes.
+    hvpatch_task_pid: Option<i32>,
     /// Guest-visible identity allocated in the kernel namespace. It is never
     /// inferred from the backend-local thread registry key.
     linux_tid: crate::kernel::LinuxTid,
@@ -1519,6 +1522,7 @@ where
         process_fork_barrier: Option<Arc<crate::fork_quiesce::QuiesceBarrier>>,
         crash_capture_generation: Option<Arc<std::sync::atomic::AtomicU64>>,
         kernel_thread: Option<crate::kernel::ThreadRef>,
+        hvpatch_task_pid: Option<i32>,
         linux_tid: crate::kernel::LinuxTid,
         fatal_image_generation: u64,
         this_tid: ThreadId,
@@ -1535,6 +1539,7 @@ where
             process_fork_barrier,
             crash_capture_generation,
             kernel_thread,
+            hvpatch_task_pid,
             linux_tid,
             fatal_image_generation,
             service_kernel_context: None,
@@ -1556,6 +1561,26 @@ where
             .map_or_else(crate::fork_quiesce::is_quiescing, |barrier| {
                 barrier.is_quiescing()
             })
+    }
+
+    /// Publish this runtime thread's process-visible state without confusing
+    /// HVPatch's shared Darwin pid for the Linux task id.
+    fn publish_process_run_state(&self, state: crate::run_state::RunState) {
+        if let Some(task_pid) = self.hvpatch_task_pid {
+            crate::run_state::publish_task_thread(task_pid, self.linux_tid.raw(), state);
+        } else {
+            crate::run_state::publish(state);
+        }
+    }
+
+    /// Publish both process-visible and per-thread state at the points that
+    /// already maintain the thread registry on mature lanes.
+    fn publish_thread_run_state(&self, state: crate::run_state::RunState, stat: char) {
+        self.publish_process_run_state(state);
+        crate::thread::set_current_thread_state(self.this_tid, stat);
+        if self.hvpatch_task_pid.is_none() {
+            crate::run_state::publish_guest_tid(self.this_tid.raw(), state);
+        }
     }
 
     fn publish_crash_registers_if_requested(&self, engine: &E) -> Result<(), RuntimeError> {
@@ -2454,7 +2479,7 @@ where
             match outcome {
                 DispatchOutcome::BlockingHostWrite(mut write) => {
                     self.waiter.ensure_full();
-                    crate::run_state::publish(crate::run_state::RunState::Blocked);
+                    self.publish_process_run_state(crate::run_state::RunState::Blocked);
                     loop {
                         if self.fork_is_quiescing() {
                             self.release_and_park_vcpu_for_fork(engine)?;
@@ -2505,7 +2530,7 @@ where
                     }
                 }
                 DispatchOutcome::BlockingRecordLock(lock) => {
-                    crate::run_state::publish(crate::run_state::RunState::Blocked);
+                    self.publish_process_run_state(crate::run_state::RunState::Blocked);
                     // FdBacked (conservative): the record-lock wake is a host
                     // blocking fcntl, unproven under a released VM.
                     let reclaim = self.park_vcpu_for_blocking_wait(
@@ -2523,7 +2548,7 @@ where
                     sig_mask,
                 } => {
                     self.waiter.ensure_full();
-                    crate::run_state::publish(crate::run_state::RunState::Blocked);
+                    self.publish_process_run_state(crate::run_state::RunState::Blocked);
                     // A NON-EMPTY fd set is fd-backed (kqueue readiness wake —
                     // vetoes whole-VM release; attribution cluster B); an
                     // EMPTY set (pure signal/timeout wait, e.g. ppoll(NULL))
@@ -2589,7 +2614,7 @@ where
                     clear_on_timeout,
                 } => {
                     self.waiter.ensure_full();
-                    crate::run_state::publish(crate::run_state::RunState::Blocked);
+                    self.publish_process_run_state(crate::run_state::RunState::Blocked);
                     // fd-class rule: see the WaitOnFds arm.
                     let park_class = if fds.is_empty() {
                         crate::thread::VcpuParkClass::ReleaseSafe
@@ -2670,7 +2695,7 @@ where
                             None
                         }
                     };
-                    crate::run_state::publish(crate::run_state::RunState::Blocked);
+                    self.publish_process_run_state(crate::run_state::RunState::Blocked);
                     // fd-class rule: see the WaitOnFds arm. An empty poll set
                     // (ppoll(NULL) — pure signal/timeout wait, e.g.
                     // procladder_mt's pause() sibling) is release-safe.
@@ -2730,7 +2755,7 @@ where
                 }
                 DispatchOutcome::WaitOnProcExit { pid, sig_mask } => {
                     self.waiter.ensure_full();
-                    crate::run_state::publish(crate::run_state::RunState::Blocked);
+                    self.publish_process_run_state(crate::run_state::RunState::Blocked);
                     // FdBacked (conservative): the wake is kqueue
                     // EVFILT_PROC readiness — same kqueue-wake family as the
                     // un-root-caused fd gap (attribution cluster B).
@@ -2775,7 +2800,7 @@ where
                 }
                 DispatchOutcome::WaitOnProcState { sig_mask, .. } => {
                     self.waiter.ensure_full();
-                    crate::run_state::publish(crate::run_state::RunState::Blocked);
+                    self.publish_process_run_state(crate::run_state::RunState::Blocked);
                     let reclaim = self.park_vcpu_for_blocking_wait(
                         engine,
                         crate::thread::VcpuParkClass::FdBacked,
@@ -2813,7 +2838,7 @@ where
                 }
                 DispatchOutcome::WaitOnHvpatchChild { target, sig_mask } => {
                     self.waiter.ensure_full();
-                    crate::run_state::publish(crate::run_state::RunState::Blocked);
+                    self.publish_process_run_state(crate::run_state::RunState::Blocked);
                     if hvpatch_child_wait_trace
                         .as_ref()
                         .is_none_or(|(traced_target, _)| *traced_target != target)
@@ -2913,7 +2938,7 @@ where
                         }
                     };
                     self.waiter.ensure_full();
-                    crate::run_state::publish(crate::run_state::RunState::Blocked);
+                    self.publish_process_run_state(crate::run_state::RunState::Blocked);
                     // Park for reclaim-eligible waits, judged by the GUEST's
                     // overall timeout (None = indefinite sigwait), not the
                     // 50 ms service slice — otherwise signal-wait threads hold
@@ -3124,7 +3149,7 @@ where
                         ));
                     }
                     self.waiter.ensure_full();
-                    crate::run_state::publish(crate::run_state::RunState::Blocked);
+                    self.publish_process_run_state(crate::run_state::RunState::Blocked);
                     // Xsignals live in a fork-shared ring, not an fd. Bound the
                     // sleep wait at the same internal slice as `io_wait` so each
                     // slice services dispatcher-owned pending state.
@@ -3492,6 +3517,7 @@ where
         kernel.process_fork_barrier.clone(),
         kernel.crash_capture_generation.clone(),
         kernel_thread,
+        kernel.hvpatch_process.as_ref().map(|process| process.pid()),
         linux_tid,
         kernel.fatal_signal.current_generation(),
         this_tid,
@@ -3623,12 +3649,7 @@ where
             // post-fork `Booting` state and any prior `Blocked`, so a sibling's
             // /proc/<pid>/stat reads `R`. A genuine guest-blocking wait re-publishes
             // `Blocked` below for the duration of the park (see `block_guard`).
-            crate::run_state::publish(crate::run_state::RunState::Running);
-            crate::thread::set_current_thread_state(state.this_tid, 'R');
-            crate::run_state::publish_guest_tid(
-                state.this_tid.raw(),
-                crate::run_state::RunState::Running,
-            );
+            state.publish_thread_run_state(crate::run_state::RunState::Running, 'R');
             let next = engine.next_syscall();
             // Out of guest now (in host): a coordinator may proceed past us.
             state
