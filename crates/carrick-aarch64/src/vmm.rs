@@ -466,6 +466,13 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         Ok(false)
     }
 
+    /// Attach backend memory-route evidence to a vCPU run failure. The default
+    /// preserves the original error; pointer-backed transports may override to
+    /// distinguish a protocol failure from a stale stage-1/stage-2 route.
+    fn enrich_vcpu_run_error(&self, _vcpu: &Self::Vcpu, error: TrapError) -> TrapError {
+        error
+    }
+
     // ── guest-memory access (the GuestMemory backing seam) ──
     //
     // The PROT_NONE EFAULT gate is keyed on the guest VA and lives in the engine's
@@ -524,6 +531,13 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         _flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
     ) -> Result<bool, TrapError> {
         Ok(false)
+    }
+
+    /// Refresh per-vCPU host pointers whose guest VA may have moved to a new
+    /// physical backing during the just-completed stage-1 COW. Backends without
+    /// host pointers into guest-owned mappings keep the no-op default.
+    fn refresh_vcpu_after_frame_cow(&self, _vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {
+        Ok(())
     }
 
     fn ensure_frame_cow_write(

@@ -852,16 +852,16 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         }) {
             return None;
         }
-        // A futex word must resolve through one physically-contiguous page-table
-        // segment. Passing the original shared-aperture VA here would alias the
-        // stale identity page after `repoint_private`; the exact backing GPA makes
-        // an overlay word private while preserving real MAP_SHARED keys.
-        let (_va, backing_gpa, chunk_len) = self
-            .syscall_buffer_chunk(guest_addr, 0, std::mem::size_of::<u32>())
-            .ok()?;
-        (chunk_len == std::mem::size_of::<u32>())
-            .then(|| self.vm.shared_futex_location(backing_gpa))
-            .flatten()
+        // Futex identity is PHYSICAL, so always walk the live stage-1 tables.
+        // Ordinary syscall buffers deliberately keep high aliases VA-keyed for
+        // backend window lookup, but that policy is wrong here: HVPatch maps a
+        // high guest VA (for example 0x100_0000_0000) to a stable global-frame
+        // IPA. Passing the VA made both parent and child fall through to their
+        // separate process-private FutexTables even though the frame receipt was
+        // shared. A 4-byte-aligned futex word cannot cross a 4 KiB page.
+        let guard = self.page_tables.lock();
+        let backing_gpa = shared_futex_backing_gpa(guard.as_ref()?, guest_addr)?;
+        self.vm.shared_futex_location(backing_gpa)
     }
 
     /// Make a guest `mprotect`/`mmap`'s protection GUEST-visible by editing the
@@ -1147,7 +1147,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
             // times / `/proc` see it. Done ONCE here, so every aarch64 backend on
             // this shared engine gets it for free (mirrors carrick-x86).
             let run_result = carrick_host::guest_cpu::timed_run(|| self.vcpu.run());
-            match run_result? {
+            match run_result.map_err(|error| self.vm.enrich_vcpu_run_error(&self.vcpu, error))? {
                 Aarch64Exit::Syscall { frame, resume_pc } => {
                     // The EL0 `svc` re-entered EL1 and hit the sentinel store. The
                     // hardware already set ELR_EL1 = (svc addr + 4); the EL1
@@ -1661,6 +1661,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let ttbr0 = fault_page_tables.map_or(0, |(ttbr, _)| ttbr);
         let handled = vm.resolve_frame_cow_fault(syndrome, far, ttbr0, &mut flush)?;
         if handled {
+            vm.refresh_vcpu_after_frame_cow(vcpu)?;
             self.last_fault_esr = 0;
         }
         Ok(handled)
@@ -2318,6 +2319,15 @@ fn diagnostic_resume_pc(pending_resume_pc: Option<u64>, live_pc: u64) -> u64 {
     pending_resume_pc.unwrap_or(live_pc)
 }
 
+/// Translate a mutable MAP_SHARED futex through the live stage-1 graph.
+///
+/// Kept separate from `syscall_buffer_ipa`: ordinary high-VA syscall buffers
+/// are intentionally resolved by semantic VA inside several backends, while a
+/// futex key must name the physical backing shared by every address space.
+fn shared_futex_backing_gpa(page_tables: &PageTableManager, guest_addr: u64) -> Option<Gpa> {
+    page_tables.translate(guest_addr).map(Gpa)
+}
+
 fn require_core_fpsimd_authority(enabled: bool) -> Result<(), TrapError> {
     if enabled {
         Ok(())
@@ -2668,6 +2678,27 @@ mod tests {
         assert_eq!(
             manager.translate(carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE),
             None
+        );
+    }
+
+    #[test]
+    fn shared_futex_high_alias_uses_live_stage1_backing_ipa() {
+        let bytes = carrick_mem::memory::stage1_identity_page_tables();
+        let mut manager = PageTableManager::new(bytes, carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
+        let guest_va = carrick_mem::memory::LINUX_HIGH_VA_THRESHOLD;
+        let backing_ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x20_0000;
+        manager
+            .map_aliased(guest_va, backing_ipa, 0x4000, true)
+            .expect("map high shared-file alias into a global frame");
+
+        let resolved = shared_futex_backing_gpa(&manager, guest_va + 4)
+            .expect("shared futex must have a live stage-1 translation");
+
+        assert_eq!(resolved.raw(), backing_ipa + 4);
+        assert_ne!(
+            resolved.raw(),
+            guest_va + 4,
+            "the semantic high VA is not a cross-process physical futex key"
         );
     }
 }
