@@ -3151,6 +3151,25 @@ impl SyscallDispatcher {
         let sysvipc_sem = self.sysvipc_sem_table();
         let sysvipc_msg = self.sysvipc_msg_table();
         let proc_threads = self.synthetic_proc_threads(context, registry);
+        let proc_zombies = self.hvpatch_process().map(|process| {
+            process
+                .kernel_graph()
+                .registry()
+                .zombies()
+                .into_iter()
+                .map(|zombie| crate::vfs::SyntheticProcZombie {
+                    pid: zombie.key.id.raw() as u32,
+                    ppid: zombie
+                        .parent
+                        .map_or(carrick_abi::LINUX_BOOTSTRAP_PID as u32, |parent| {
+                            parent.id.raw() as u32
+                        }),
+                    pgrp: zombie.process_group.raw() as u32,
+                    session: zombie.session.raw() as u32,
+                    comm: zombie.diagnostic_name,
+                })
+                .collect::<Vec<_>>()
+        });
         let ctx = crate::vfs::OpenContext {
             executable_path: Some(exec_path.as_str()),
             argv: Some(argv.as_slice()),
@@ -3180,6 +3199,7 @@ impl SyscallDispatcher {
             sig_shdpnd,
             identity: self.synthetic_proc_identity(context),
             threads: proc_threads.as_deref(),
+            zombies: proc_zombies.as_deref(),
             sysvipc_shm: Some(sysvipc_shm.as_str()),
             sysvipc_sem: Some(sysvipc_sem.as_str()),
             sysvipc_msg: Some(sysvipc_msg.as_str()),

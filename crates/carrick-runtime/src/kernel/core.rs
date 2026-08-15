@@ -985,6 +985,15 @@ impl Registry {
             .map(|record| record.zombie.clone())
     }
 
+    pub(crate) fn zombies(&self) -> Vec<Zombie> {
+        self.state
+            .read()
+            .zombies
+            .values()
+            .map(|record| record.zombie.clone())
+            .collect()
+    }
+
     pub fn process_group(&self, id: ProcessGroupId) -> Option<Arc<ProcessGroup>> {
         self.state
             .read()

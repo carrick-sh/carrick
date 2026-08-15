@@ -167,6 +167,19 @@ pub struct SyntheticProcThread {
     pub comm: Option<String>,
 }
 
+/// One exited-but-unreaped Linux process rendered by the in-process HVPatch
+/// `/proc` view. HVPatch children are host threads, so Darwin's process table
+/// cannot observe their zombie interval; the authoritative Kernel record must
+/// cross the dispatcher/VFS boundary instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntheticProcZombie {
+    pub pid: u32,
+    pub ppid: u32,
+    pub pgrp: u32,
+    pub session: u32,
+    pub comm: String,
+}
+
 /// Minimal live state needed by synthetic `/proc` renderers.
 #[derive(Debug, Clone, Default)]
 pub struct SyntheticProcContext {
@@ -219,6 +232,9 @@ pub struct SyntheticProcContext {
     /// Exact live-thread snapshot for the same task. `None` preserves the
     /// mature one-process-per-host-process registry lookup byte-for-byte.
     pub threads: Option<Vec<SyntheticProcThread>>,
+    /// Exact exited-but-unreaped process snapshot for HVPatch. `None`
+    /// preserves mature native/VMM host-process zombie discovery byte-for-byte.
+    pub zombies: Option<Vec<SyntheticProcZombie>>,
     pub sysvipc_shm: String,
     pub sysvipc_sem: String,
     pub sysvipc_msg: String,
@@ -1994,6 +2010,7 @@ impl Vfs for ProcVfs {
             sig_shdpnd: ctx.sig_shdpnd,
             identity: ctx.identity,
             threads: ctx.threads.map(|threads| threads.to_vec()),
+            zombies: ctx.zombies.map(|zombies| zombies.to_vec()),
             sysvipc_shm: ctx.sysvipc_shm.unwrap_or("").to_owned(),
             sysvipc_sem: ctx.sysvipc_sem.unwrap_or("").to_owned(),
             sysvipc_msg: ctx.sysvipc_msg.unwrap_or("").to_owned(),
@@ -2749,6 +2766,43 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t{count}\n",
             }
             _ => return None,
         }
+    }
+
+    if let Some(zombies) = ctx.zombies.as_ref()
+        && let Some(zombie) = zombies.iter().find(|zombie| zombie.pid == pid)
+    {
+        let name = if zombie.comm.is_empty() {
+            self_comm
+        } else {
+            zombie.comm.as_str()
+        };
+        return match rest {
+            "stat" => Some(
+                proc_stat_line(
+                    pid,
+                    name,
+                    'Z',
+                    zombie.ppid,
+                    zombie.pgrp,
+                    zombie.session,
+                    1,
+                    0,
+                )
+                .into_bytes(),
+            ),
+            "comm" => Some(format!("{name}\n").into_bytes()),
+            // Linux exposes an empty cmdline after the process has exited.
+            "cmdline" => Some(Vec::new()),
+            "status" => Some(
+                format!(
+                    "Name:\t{name}\nState:\tZ (zombie)\nTgid:\t{pid}\n\
+Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t1\n",
+                    ppid = zombie.ppid,
+                )
+                .into_bytes(),
+            ),
+            _ => None,
+        };
     }
 
     let own_threads = crate::current_thread_states();
@@ -4376,6 +4430,28 @@ mod tests {
         assert!(
             btime > 1_600_000_000,
             "btime should be a recent epoch: {btime}"
+        );
+    }
+
+    #[test]
+    fn logical_zombie_is_rendered_without_a_host_process() {
+        let pid = 0x7fff_0001;
+        let ctx = SyntheticProcContext {
+            zombies: Some(vec![SyntheticProcZombie {
+                pid,
+                ppid: 41,
+                pgrp: 40,
+                session: 39,
+                comm: "logical-child".to_owned(),
+            }]),
+            ..SyntheticProcContext::default()
+        };
+        let stat = synthetic_proc_pid_file(pid, "stat", "parent", &ctx)
+            .expect("an authoritative logical zombie must have a proc stat");
+        let stat = String::from_utf8(stat).unwrap();
+        assert!(
+            stat.starts_with("2147418113 (logical-child) Z 41 40 39 "),
+            "logical zombie identity/state was not preserved: {stat:?}"
         );
     }
 

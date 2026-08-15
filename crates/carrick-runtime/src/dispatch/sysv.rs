@@ -357,6 +357,10 @@ struct SemSet {
     cgid: u32,
     ctime: u64,
     otime: u64,
+    /// Linux `sempid` per semaphore. Darwin records the one Carrick host pid,
+    /// which cannot identify an HVPatch logical process; this shared overlay
+    /// preserves the exact task id across in-process fork dispatcher clones.
+    logical_last_operators: Arc<Mutex<Vec<Option<i32>>>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -543,6 +547,37 @@ impl SemSet {
             } else {
                 self.mode.other_writable()
             }
+    }
+
+    fn record_logical_semop(&self, pid: i32, sops: &[carrick_portable::Sembuf]) {
+        let mut operators = self.logical_last_operators.lock();
+        for sop in sops {
+            if let Some(operator) = operators.get_mut(usize::from(sop.sem_num)) {
+                *operator = Some(pid);
+            }
+        }
+    }
+
+    fn record_logical_setval(&self, pid: i32, semnum: i32) {
+        let Ok(index) = usize::try_from(semnum) else {
+            return;
+        };
+        if let Some(operator) = self.logical_last_operators.lock().get_mut(index) {
+            *operator = Some(pid);
+        }
+    }
+
+    fn record_logical_setall(&self, pid: i32) {
+        self.logical_last_operators.lock().fill(Some(pid));
+    }
+
+    fn logical_last_operator(&self, semnum: i32) -> Option<i32> {
+        let index = usize::try_from(semnum).ok()?;
+        self.logical_last_operators
+            .lock()
+            .get(index)
+            .copied()
+            .flatten()
     }
 }
 
@@ -2862,6 +2897,7 @@ impl SyscallDispatcher {
                             cgid: creds.egid,
                             ctime: now,
                             otime: 0,
+                            logical_last_operators: Arc::new(Mutex::new(vec![None; nsems_usize])),
                         },
                     );
                     if key != LINUX_IPC_PRIVATE {
@@ -3441,6 +3477,7 @@ fn sysv_semop<M: GuestMemory>(
     nsops: usize,
     timeout: Option<LinuxTimespec>,
     interrupted: &dyn Fn() -> bool,
+    completed: &dyn Fn(&[carrick_portable::Sembuf]),
 ) -> Result<DispatchOutcome, DispatchError> {
     if nsops == 0 {
         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -3471,7 +3508,10 @@ fn sysv_semop<M: GuestMemory>(
     if timeout.is_none() {
         let rc = unsafe { carrick_portable::semop(semid, sops.as_mut_ptr(), nsops) };
         return match rc.host_syscall_errno() {
-            Ok(_) => Ok(DispatchOutcome::Returned { value: 0 }),
+            Ok(_) => {
+                completed(&sops);
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
             Err(errno) => Ok(DispatchOutcome::errno(errno)),
         };
     }
@@ -3500,7 +3540,10 @@ fn sysv_semop<M: GuestMemory>(
         let mut attempt = nowait.clone();
         let rc = unsafe { carrick_portable::semop(semid, attempt.as_mut_ptr(), nsops) };
         match rc.host_syscall_errno() {
-            Ok(_) => return Ok(DispatchOutcome::Returned { value: 0 }),
+            Ok(_) => {
+                completed(&sops);
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
             Err(e) if e == LINUX_EAGAIN => {
                 saw_would_block = true;
                 if std::time::Instant::now() >= deadline {
@@ -3576,17 +3619,38 @@ impl SyscallDispatcher {
             Ok(host_id) => host_id,
             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
         };
+        let guest_semid = match GuestSemId::from_syscall_arg(semid) {
+            Ok(guest_semid) => guest_semid,
+            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+        };
+        let logical_operator = self
+            .hvpatch_process()
+            .map(|_| cx.kernel.task().key().id.raw());
         let tid = cx.tid();
-        sysv_semop(cx, host_id.raw(), sops_addr, nsops, timeout, &|| {
-            crate::host_signal::has_unblocked_pending_for(
-                tid.raw(),
-                carrick_abi::SigBlockMask::NONE,
-            ) || self.has_deliverable_dispatch_pending_for_wait(
-                cx.kernel,
-                tid,
-                carrick_abi::WaitSigMask::NONE,
-            )
-        })
+        sysv_semop(
+            cx,
+            host_id.raw(),
+            sops_addr,
+            nsops,
+            timeout,
+            &|| {
+                crate::host_signal::has_unblocked_pending_for(
+                    tid.raw(),
+                    carrick_abi::SigBlockMask::NONE,
+                ) || self.has_deliverable_dispatch_pending_for_wait(
+                    cx.kernel,
+                    tid,
+                    carrick_abi::WaitSigMask::NONE,
+                )
+            },
+            &|sops| {
+                if let Some(pid) = logical_operator
+                    && let Some(meta) = self.sysv.lock().semaphores.get(&guest_semid)
+                {
+                    meta.record_logical_semop(pid, sops);
+                }
+            },
+        )
     }
 
     fn sysv_semctl<M: GuestMemory>(
@@ -3663,7 +3727,10 @@ impl SyscallDispatcher {
             Ok(guest_semid) => guest_semid,
             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
         };
-        let host_id = {
+        let logical_operator = self
+            .hvpatch_process()
+            .map(|_| cx.kernel.task().key().id.raw());
+        let (host_id, logical_getpid) = {
             let state = self.sysv.lock();
             let Some(meta) = state.semaphores.get(&guest_semid) else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -3671,10 +3738,20 @@ impl SyscallDispatcher {
             if matches!(cmd, LINUX_IPC_RMID | LINUX_IPC_SET) && !meta.can_admin(creds) {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
-            meta.host_id
+            let logical_getpid = (cmd == LINUX_GETPID && logical_operator.is_some())
+                .then(|| meta.logical_last_operator(semnum))
+                .flatten();
+            (meta.host_id, logical_getpid)
         };
 
-        let out = sysv_semctl(cx, host_id.raw(), semnum, cmd, arg, creds)?;
+        let mut out = sysv_semctl(cx, host_id.raw(), semnum, cmd, arg, creds)?;
+        if matches!(out, DispatchOutcome::Returned { .. })
+            && let Some(pid) = logical_getpid
+        {
+            out = DispatchOutcome::Returned {
+                value: i64::from(pid),
+            };
+        }
         if matches!(out, DispatchOutcome::Returned { value: 0 }) {
             let mut state = self.sysv.lock();
             match cmd {
@@ -3696,6 +3773,20 @@ impl SyscallDispatcher {
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs())
                             .unwrap_or(meta.ctime);
+                    }
+                }
+                LINUX_SETVAL => {
+                    if let Some(pid) = logical_operator
+                        && let Some(meta) = state.semaphores.get(&guest_semid)
+                    {
+                        meta.record_logical_setval(pid, semnum);
+                    }
+                }
+                LINUX_SETALL => {
+                    if let Some(pid) = logical_operator
+                        && let Some(meta) = state.semaphores.get(&guest_semid)
+                    {
+                        meta.record_logical_setall(pid);
                     }
                 }
                 _ => {}
@@ -4118,6 +4209,36 @@ mod ipc_set_tests {
             LINUX_IPC_PRIVATE as libc::key_t,
             "IPC_PRIVATE must stay host-private"
         );
+    }
+
+    #[test]
+    fn logical_sempid_is_shared_across_in_process_fork_clones() {
+        let parent = SemSet {
+            key: LINUX_IPC_PRIVATE,
+            host_id: HostSemId(0),
+            scan_index: SemScanIndex(0),
+            nsems: 3,
+            mode: ShmPermMode::requested(0o600),
+            uid: 0,
+            gid: 0,
+            cuid: 0,
+            cgid: 0,
+            ctime: 0,
+            otime: 0,
+            logical_last_operators: Arc::new(Mutex::new(vec![None; 3])),
+        };
+        let child = parent.clone();
+        child.record_logical_semop(
+            73,
+            &[carrick_portable::Sembuf {
+                sem_num: 2,
+                sem_op: 1,
+                sem_flg: 0,
+            }],
+        );
+
+        assert_eq!(parent.logical_last_operator(0), None);
+        assert_eq!(parent.logical_last_operator(2), Some(73));
     }
 
     #[test]
