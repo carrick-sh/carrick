@@ -348,8 +348,8 @@ acceptance criteria.
 | 2 — KX fatal errors and evidence | **COMPLETE** | `12ed17b5f`; [fatal-path evidence](docs/perf-results/2026-08-13-hvpatch-exec-failure-red-green.txt) and [six-stage trace](docs/perf-results/2026-08-13-hvpatch-exec-runtime-stages.raw); four signed post-PONR failpoints signal-shaped, genuine exit 127 preserved, exact-six live trace, `just ci` GREEN |
 | 3 — KI identity reseed | **COMPLETE** | `ec4daa24`; [evidence](docs/perf-results/2026-08-14-hvpatch-identity-reseed-and-host-safety.md); signed 64/64 MATCH, strict DTrace host-low/errors/drops=0, Docker SIGKILL WCONTINUED=0/100, `just ci` GREEN |
 | 4 — global frames and stage-1 COW | **COMPLETE** | `d66e0850`; [evidence](docs/perf-results/2026-08-14-hvpatch-global-frame-cow.md); signed 15/15 MATCH, mt COW 12/12, exact v5 structural receipt, stage2 118/118, `just ci` GREEN |
-| 5 — live-state crash artifacts | **IN PROGRESS** | authoritative all-thread crash snapshot and live `CoreDump` construction next |
-| 6 — KP shipped proof | queued | — |
+| 5 — live-state crash artifacts | **COMPLETE** | `58740ce6`; [evidence](docs/perf-results/2026-08-14-hvpatch-live-core.md); real 3-thread core/trace hash exact, strict validator/readelf/LLDB, Docker MATCH, 19 failpoints, `just ci` GREEN |
+| 6 — KP shipped proof | **IN PROGRESS** | current signed probe gate, gap closure, CPython source, ecosystems, baseline, and HVPatch default next |
 
 **Execution ruling:** Task 4 is mandatory on the structural invariants and KP
 completion gate even though the inherited KM detail later describes a CPU
@@ -429,14 +429,14 @@ conformance probes.
 
 ### Task 5 — wire KD crash artifacts to live guest state
 
-- [ ] Capture every guest thread's authoritative register file at the crash
+- [x] Capture every guest thread's authoritative register file at the crash
   boundary and construct the already-defined `CoreDump` from kernel task, mm,
   mapping, auxv, signal, and file-map state.
-- [ ] Wire KD's existing `CoreDump` writer to live crash state after the
+- [x] Wire KD's existing `CoreDump` writer to live crash state after the
   register snapshot is complete. Require `coredumpfile` and
   `carrick debug core` to validate an artifact produced by the crash path, not
   a module test or on-demand synthetic writer.
-- [ ] Fail closed when any required thread, register, identity, mapping, or
+- [x] Fail closed when any required thread, register, identity, mapping, or
   note is missing; do not publish a partial core as successful.
 
 ### Task 6 — refresh KP and ship only from current evidence
