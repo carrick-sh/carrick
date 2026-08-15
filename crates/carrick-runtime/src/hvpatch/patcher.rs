@@ -49,9 +49,23 @@ pub(crate) fn patch_svc_zero(
         return Err(PatchError::UnalignedAddress(text_guest_va));
     }
     let mut manifest = Vec::new();
+    let mut skipped_until_word = 0usize;
     for (word_index, bytes) in text.chunks_exact(4).enumerate() {
         let original = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        if original != SVC_ZERO {
+        let skipped_by_forward_branch = word_index < skipped_until_word;
+        if !skipped_by_forward_branch && original & !B_IMMEDIATE_MASK == B_OPCODE {
+            let immediate = original & B_IMMEDIATE_MASK;
+            // imm26 is signed. A positive unconditional branch creates a
+            // branch-over region which may contain executable-section literal
+            // data. Do not interpret words in that region as instructions.
+            if immediate != 0 && immediate & (1 << 25) == 0 {
+                let branch_target = word_index
+                    .checked_add(immediate as usize)
+                    .ok_or(PatchError::AddressOverflow)?;
+                skipped_until_word = skipped_until_word.max(branch_target);
+            }
+        }
+        if original != SVC_ZERO || skipped_by_forward_branch {
             continue;
         }
         let byte_offset = u64::try_from(word_index)
@@ -121,6 +135,17 @@ mod tests {
             u32::from_le_bytes(text[8..12].try_into().unwrap()),
             0xd400_0021
         );
+    }
+
+    #[test]
+    fn preserves_svc_shaped_data_skipped_by_a_forward_branch() {
+        let branch_over_literal = encode_b(0x1000, 0x1008).expect("forward branch");
+        let mut text = words(&[branch_over_literal, SVC_ZERO, 0xd65f_03c0]);
+
+        let manifest = patch_svc_zero(&mut text, 0x1000, 0x8000).expect("scan text");
+
+        assert!(manifest.is_empty());
+        assert_eq!(u32::from_le_bytes(text[4..8].try_into().unwrap()), SVC_ZERO);
     }
 
     #[test]
