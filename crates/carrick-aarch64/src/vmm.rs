@@ -21,8 +21,8 @@ use std::sync::Arc;
 use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::{Aarch64SyscallFrame, Gpa, MemoryError, SharedFutexLocation};
 use carrick_hal::{
-    GuestEntryRegs, GuestVmBackend, MemPerms, Reg, SlotId, SysReg, TrapError, VcpuKick,
-    VcpuRegistry,
+    GuestEntryRegs, GuestVmBackend, MemPerms, ProcessForkRequest, Reg, SlotId, SysReg, TrapError,
+    VcpuKick, VcpuRegistry,
 };
 use carrick_mem::memory::AddressSpace;
 use carrick_mem::page_table::PageTableManager;
@@ -890,12 +890,9 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
 
     fn build_process_builder(
         &self,
-        _root_slot_base: u64,
-        _root_slot_size: u64,
+        _request: ProcessForkRequest,
         _page_tables: &mut carrick_mem::page_table::PageTableManager,
         _cow_ranges: &[ForkCowRange],
-        _child_pid: i32,
-        _forking_tid: i32,
     ) -> Result<Self::ProcessBuilder, TrapError> {
         Err(TrapError::Hypervisor(
             "aarch64 backend does not support in-process fork".to_owned(),

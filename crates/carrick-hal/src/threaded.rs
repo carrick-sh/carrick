@@ -657,6 +657,20 @@ pub struct GuestEntryRegs {
     pub tls: Option<u64>,
 }
 
+/// Complete AArch64 input for materializing a logical process inside one
+/// persistent backend VM. The root-slot fields describe the current HVPatch
+/// execution adapter; other backends retain the default unsupported method.
+#[derive(Clone, Copy, Debug)]
+pub struct ProcessForkRequest {
+    pub entry: GuestEntryRegs,
+    pub child_ttbr0: u64,
+    pub root_slot_base: u64,
+    pub root_slot_size: u64,
+    pub shares_mm: bool,
+    pub child_tid: ThreadId,
+    pub forking_tid: ThreadId,
+}
+
 /// Minimal architecture-neutral register set recorded when a guest thread
 /// enters a host-backed blocking wait. This is deliberately small enough for
 /// the always-on event ring and crash bundles: instruction, stack, and return
@@ -869,12 +883,7 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
 
     fn build_process_spec(
         &mut self,
-        _entry: GuestEntryRegs,
-        _child_ttbr0: u64,
-        _root_slot_base: u64,
-        _root_slot_size: u64,
-        _child_tid: ThreadId,
-        _forking_tid: ThreadId,
+        _request: ProcessForkRequest,
     ) -> Result<Self::ProcessSpec, TrapError> {
         Err(TrapError::Hypervisor(
             "backend does not support in-process fork".to_owned(),

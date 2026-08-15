@@ -34,7 +34,10 @@ use carrick_aarch64::{
 };
 use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::{Gpa, MemoryError, SharedFutexLocation};
-use carrick_hal::{GuestEntryRegs, GuestVmBackend, Reg, SlotId, SysReg, TrapError, VcpuRegistry};
+use carrick_hal::{
+    GuestEntryRegs, GuestVmBackend, ProcessForkRequest, Reg, SlotId, SysReg, TrapError,
+    VcpuRegistry,
+};
 use carrick_mem::memory::AddressSpace;
 
 use crate::syscall_mailbox::{HvfSyscallTransport, MailboxBinding};
@@ -915,21 +918,12 @@ impl Aarch64Vmm for HvfAarch64Vmm {
 
     fn build_process_builder(
         &self,
-        root_slot_base: u64,
-        root_slot_size: u64,
+        request: ProcessForkRequest,
         page_tables: &mut carrick_mem::page_table::PageTableManager,
         cow_ranges: &[carrick_aarch64::vmm::ForkCowRange],
-        child_pid: i32,
-        forking_tid: i32,
     ) -> Result<Self::ProcessBuilder, TrapError> {
-        self.state.build_process_spec(
-            root_slot_base,
-            root_slot_size,
-            page_tables,
-            cow_ranges,
-            child_pid,
-            forking_tid,
-        )
+        self.state
+            .build_process_spec(request, page_tables, cow_ranges)
     }
 
     fn materialize_process(builder: Self::ProcessBuilder) -> Result<(Self, Self::Vcpu), TrapError> {
