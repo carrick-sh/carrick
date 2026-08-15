@@ -1,6 +1,6 @@
 {
   "path": "docs/perf-results/2026-08-14-hvpatch-live-core-artifacts/coredumpfile.core",
-  "bytes": 11341824,
+  "bytes": 11350016,
   "machine": "aarch64",
   "pid": 5,
   "ppid": 4,
@@ -12,8 +12,8 @@
     {
       "tid": 5,
       "current_signal": 11,
-      "pc": 2253892,
-      "sp": 1099511560240,
+      "pc": 2254620,
+      "sp": 1099511560112,
       "pstate": 1610613696,
       "x0": 0,
       "tpidr_el0": 1229801703532086340,
@@ -56,9 +56,9 @@
     }
   ],
   "auxv_entries": 18,
-  "file_mappings": 9,
-  "load_segments": 26,
-  "load_segments_with_contents": 22,
+  "file_mappings": 5,
+  "load_segments": 27,
+  "load_segments_with_contents": 23,
   "foreign_notes": 0,
-  "memory_bytes": 11356953
+  "memory_bytes": 11363513
 }

@@ -1,14 +1,14 @@
-(lldb) target create --core "target/task5-final-0b076654/coredumpfile.core"
-Core file '/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/target/task5-final-0b076654/coredumpfile.core' (aarch64) was loaded.
+(lldb) target create --core "docs/perf-results/2026-08-14-hvpatch-live-core-artifacts/coredumpfile.core"
+Core file '/Volumes/CaseSensitive/carrick/.worktrees/codex-hybrid-kernel/docs/perf-results/2026-08-14-hvpatch-live-core-artifacts/coredumpfile.core' (aarch64) was loaded.
 (lldb) thread list
 Process 5 stopped
-* thread #1: tid = 5, 0x0000000000226444, name = 'p', stop reason = SIGSEGV: address not mapped to object (fault address=0x0)
+* thread #1: tid = 5, 0x000000000022671c, name = 'p', stop reason = SIGSEGV: address not mapped to object (fault address=0x0)
   thread #2: tid = 7, 0x000000000029c26c, stop reason = signal 0
   thread #3: tid = 8, 0x000000000029c00c, stop reason = signal 0
 (lldb) thread select 1
 (lldb) register read pc sp cpsr x0 x8 x19 v0 fpsr fpcr
-      pc = 0x0000000000226444
-      sp = 0x000000fffffef830
+      pc = 0x000000000022671c
+      sp = 0x000000fffffef7b0
     cpsr = 0x600003c0
          = (N = 0, Z = 1, C = 1, V = 0, SS = 0, IL = 0, D = 1, A = 1, I = 1, F = 1, nRW = 0, EL = 0, SP = 0)
       x0 = 0x0000000000000000
@@ -21,19 +21,19 @@ Process 5 stopped
          = (AHP = 0, DN = 0, FZ = 0, RMode = RZ, IDE = 0, IXE = 0, UFE = 0, OFE = 0, DZE = 0, IOE = 0)
 (lldb) disassemble --start-address $pc --count 1
 * thread #1, name = 'p', stop reason = SIGSEGV: address not mapped to object (fault address=0x0)
-    frame #0: 0x0000000000226444
-->  0x226444: str    x19, [x0]
-    0x226448: brk    #0x1
-    0x22644c: add    x8, x3, x3, lsl #1
-    0x226450: lsl    x9, x8, #3
-->  0x226444: str    x19, [x0]
+    frame #0: 0x000000000022671c
+->  0x22671c: str    x19, [x0]
+    0x226720: brk    #0x1
+    0x226724: add    x8, x3, x3, lsl #1
+    0x226728: lsl    x9, x8, #3
+->  0x22671c: str    x19, [x0]
 (lldb) thread select 2
 (lldb) register read pc sp cpsr x0 x8 x19 v0 fpsr fpcr
 * thread #2, stop reason = signal 0
     frame #0: 0x000000000029c26c
-->  0x29c26c: b      0x26d6e8
+->  0x29c26c: b      0x26e068
     0x29c270: svc    #0
-    0x29c274: b      0x26d978
+    0x29c274: b      0x26e2f8
     0x29c278: svc    #0
       pc = 0x000000000029c26c
       sp = 0x0000006000027a60
@@ -48,14 +48,14 @@ Process 5 stopped
     fpcr = 0x00400000
          = (AHP = 0, DN = 0, FZ = 0, RMode = RP, IDE = 0, IXE = 0, UFE = 0, OFE = 0, DZE = 0, IOE = 0)
 (lldb) disassemble --start-address $pc --count 1
-->  0x29c26c: b      0x26d6e8
+->  0x29c26c: b      0x26e068
 (lldb) thread select 3
 (lldb) register read pc sp cpsr x0 x8 x19 v0 fpsr fpcr
 * thread #3, stop reason = signal 0
     frame #0: 0x000000000029c00c
-->  0x29c00c: b      0x2265bc
+->  0x29c00c: b      0x226894
     0x29c010: svc    #0
-    0x29c014: b      0x265a6c
+    0x29c014: b      0x2663f4
     0x29c018: svc    #0
       pc = 0x000000000029c00c
       sp = 0x000000600004aa50
@@ -70,7 +70,7 @@ Process 5 stopped
     fpcr = 0x00800000
          = (AHP = 0, DN = 0, FZ = 0, RMode = RM, IDE = 0, IXE = 0, UFE = 0, OFE = 0, DZE = 0, IOE = 0)
 (lldb) disassemble --start-address $pc --count 2
-->  0x29c00c: b      0x2265bc
+->  0x29c00c: b      0x226894
     0x29c010: svc    #0
 (lldb) memory read --format x --size 8 --count 4 0x6700000000
 0x6700000000: 0x5205cc9df38c4610 0x5e9fada28aeb89c6

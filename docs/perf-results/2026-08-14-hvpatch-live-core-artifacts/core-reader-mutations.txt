@@ -1,0 +1,10 @@
+Final signed carrick debug core malformed-input matrix
+source=coredumpfile.core
+
+phentsize-zero|PASS|rc=1|invalid ELF header/program-header geometry: e_phentsize is not Elf64_Phdr
+phentsize-eight|PASS|rc=1|invalid ELF header/program-header geometry: e_phentsize is not Elf64_Phdr
+phoff-overflow|PASS|rc=1|core offset/count arithmetic overflowed
+phnum-max|PASS|rc=1|core contains multiple PT_NOTE segments
+note-desc-overflow|PASS|rc=1|note at byte 0 of PT_NOTE is truncated
+
+5/5 rejected without panic or fatal runtime error.
