@@ -349,7 +349,7 @@ acceptance criteria.
 | 3 — KI identity reseed | **COMPLETE** | `ec4daa24`; [evidence](docs/perf-results/2026-08-14-hvpatch-identity-reseed-and-host-safety.md); signed 64/64 MATCH, strict DTrace host-low/errors/drops=0, Docker SIGKILL WCONTINUED=0/100, `just ci` GREEN |
 | 4 — global frames and stage-1 COW | **COMPLETE** | `d66e0850`; [evidence](docs/perf-results/2026-08-14-hvpatch-global-frame-cow.md); signed 15/15 MATCH, mt COW 12/12, exact v5 structural receipt, stage2 118/118, `just ci` GREEN |
 | 5 — live-state crash artifacts | **COMPLETE** | `58740ce6`; [evidence](docs/perf-results/2026-08-14-hvpatch-live-core.md); real 3-thread core/trace hash exact, strict validator/readelf/LLDB, Docker MATCH, 19 failpoints, `just ci` GREEN |
-| 6 — KP shipped proof | **IN PROGRESS** | current signed probe gate, gap closure, CPython source, ecosystems, baseline, and HVPatch default next |
+| 6 — KP shipped proof | **IN PROGRESS** | CPython 3.12.13 source/image restored exactly; signed r9 reached 400/400; `def32e41` removes the per-mm 32 GiB physical mmap lease through sparse private materialization and signed `go/types` is 571/571 (3 expected skips). The fresh 194-row signed Go phase is fully accounted: 181 MATCH + 3 existing non-gating DIFF + 10 raw gating; clean reruns clear two and retain eight attributed residuals. See the [resumable Task 6 checkpoint](docs/perf-results/2026-08-15-hvpatch-task6-checkpoint.md). One-host-process topology, Go closure, CPython/Node, baseline/default switch, final CI, and cold-build signal remain |
 
 **Execution ruling:** Task 4 is mandatory on the structural invariants and KP
 completion gate even though the inherited KM detail later describes a CPU
@@ -441,9 +441,9 @@ conformance probes.
 
 ### Task 6 — refresh KP and ship only from current evidence
 
-- [ ] Restore or replace the unavailable CPython registry source without
+- [x] Restore or replace the unavailable CPython registry source without
   changing the declared suite semantics.
-- [ ] On one exact signed binary, rerun the line-exact HVPatch probe gate and
+- [x] On one exact signed binary, rerun the line-exact HVPatch probe gate and
   record a fresh count. The historical **304 PASS / 90 FAIL** result is not a
   current count after the identity, exec, and mmap commits.
 - [ ] Close kernel-lane gaps rather than copying them into a baseline as
