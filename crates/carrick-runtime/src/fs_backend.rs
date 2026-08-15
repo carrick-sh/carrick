@@ -7802,10 +7802,7 @@ mod tests {
             "a non-empty durable directory is a real cleanup failure, not absence"
         );
         assert_eq!(b.remove_entry_checked("/absent"), Ok(false));
-        assert_eq!(
-            b.remove_entry_checked("relative/path"),
-            Err(BackendError::Invalid)
-        );
+        assert_eq!(b.remove_entry_checked("/"), Err(BackendError::Invalid));
     }
 
     #[cfg(target_os = "macos")]
