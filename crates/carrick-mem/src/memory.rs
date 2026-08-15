@@ -2252,10 +2252,13 @@ fn file_mappings_from_load_plan(plan: &LoadPlan, path: &str) -> Vec<AddressSpace
     plan.segments
         .iter()
         .filter_map(|segment| {
+            // Linux retains vm_file only through the page-rounded file image.
+            // Full pages in p_memsz beyond p_filesz are anonymous BSS and must
+            // not acquire a false executable path in NT_FILE.
             let start = segment.virtual_address & !(PAGE - 1);
             let end = segment
                 .virtual_address
-                .checked_add(segment.memory_size)
+                .checked_add(segment.file_size)
                 .and_then(|end| align_up_u64(end, PAGE))?;
             (start < end).then(|| AddressSpaceFileMapping {
                 start,
@@ -3828,7 +3831,7 @@ mod loader_tests {
             file_mappings_from_load_plan(&plan, "/opt/bin/exact"),
             vec![AddressSpaceFileMapping {
                 start: 0x403000,
-                end: 0x405000,
+                end: 0x404000,
                 file_page_offset: 3,
                 path: "/opt/bin/exact".to_owned(),
             }]
