@@ -166,6 +166,10 @@ pub enum MailboxConsumeError {
     MissingRequest,
     #[error("legacy HVF syscall register decode failed: {0}")]
     Legacy(String),
+    #[error("AArch64 syscall mailbox binding is already parked")]
+    AlreadyParked,
+    #[error("AArch64 syscall mailbox binding is not parked")]
+    NotParked,
 }
 
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -181,11 +185,22 @@ fn fresh_generation() -> u64 {
 
 #[derive(Debug)]
 pub struct MailboxBinding {
-    lease: MailboxSlotLease,
+    lease: Option<MailboxSlotLease>,
     host: NonNull<Aarch64SyscallMailbox>,
     generation: u64,
     last_sequence: u64,
     transport: HvfSyscallTransport,
+    parked: Option<ParkedMailbox>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ParkedMailbox {
+    sequence: u64,
+    state: u32,
+    response_action: u32,
+    return_value: u64,
+    resume_x16: u64,
+    resume_x17: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,19 +250,23 @@ impl MailboxBinding {
         transport: HvfSyscallTransport,
     ) -> Self {
         let mut binding = Self {
-            lease,
+            lease: Some(lease),
             host,
             generation: 0,
             last_sequence: 0,
             transport,
+            parked: None,
         };
         // SAFETY: upheld by this constructor's caller.
         unsafe { binding.rebind(host, false) };
         binding
     }
 
-    pub const fn slot(&self) -> MailboxSlotId {
-        self.lease.id()
+    pub fn slot(&self) -> MailboxSlotId {
+        let Some(lease) = self.lease.as_ref() else {
+            std::process::abort();
+        };
+        lease.id()
     }
 
     pub const fn generation(&self) -> u64 {
@@ -260,6 +279,96 @@ impl MailboxBinding {
 
     pub const fn sequence(&self) -> u64 {
         self.last_sequence
+    }
+
+    /// Snapshot the outstanding response vehicle and release this binding's
+    /// finite arena slot while its vCPU is destroyed for an M:N blocking wait.
+    /// The guest is stopped immediately after the HVC, so only the continuation
+    /// payload needs to survive; the next vCPU receives a freshly generated
+    /// binding and resumes the same EL1 continuation from its new `SP_EL1`.
+    pub fn release_for_reclaim(&mut self) -> Result<(), MailboxConsumeError> {
+        if self.lease.is_none() || self.parked.is_some() {
+            return Err(MailboxConsumeError::AlreadyParked);
+        }
+        let state = self.state().load(Ordering::Acquire);
+        if state != MailboxState::RequestReady.raw() && state != MailboxState::ResponseReady.raw() {
+            return Err(MailboxConsumeError::Protocol(
+                MailboxProtocolError::UnexpectedState {
+                    expected: MailboxState::RequestReady,
+                    actual: state,
+                },
+            ));
+        }
+        let mailbox = self.host.as_ptr();
+        // SAFETY: the live lease uniquely owns the complete mailbox and the vCPU
+        // is stopped. Acquire of `state` above makes its preceding guest stores
+        // visible before these field reads.
+        self.parked = Some(unsafe {
+            ParkedMailbox {
+                sequence: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).sequence)),
+                state,
+                response_action: core::ptr::read_volatile(core::ptr::addr_of!(
+                    (*mailbox).response_action
+                )),
+                return_value: core::ptr::read_volatile(core::ptr::addr_of!(
+                    (*mailbox).return_value
+                )),
+                resume_x16: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).resume_x16)),
+                resume_x17: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).resume_x17)),
+            }
+        });
+        drop(self.lease.take());
+        Ok(())
+    }
+
+    /// Attach a newly allocated arena slot after reclaim and restore the exact
+    /// outstanding continuation captured by [`Self::release_for_reclaim`].
+    ///
+    /// # Safety
+    ///
+    /// `host` must name the complete, live mapping for `lease.id()` and remain
+    /// valid for this binding's lifetime.
+    pub unsafe fn reacquire_after_reclaim(
+        &mut self,
+        lease: MailboxSlotLease,
+        host: NonNull<Aarch64SyscallMailbox>,
+    ) -> Result<(), MailboxConsumeError> {
+        if self.lease.is_some() {
+            return Err(MailboxConsumeError::AlreadyParked);
+        }
+        let Some(parked) = self.parked.take() else {
+            return Err(MailboxConsumeError::NotParked);
+        };
+        self.lease = Some(lease);
+        // SAFETY: the caller supplies the complete uniquely leased slot.
+        unsafe { self.rebind(host, false) };
+        self.last_sequence = parked.sequence;
+        let mailbox = self.host.as_ptr();
+        // SAFETY: the newly installed lease uniquely owns this complete slot.
+        unsafe {
+            self.write_volatile(
+                core::ptr::addr_of_mut!((*mailbox).sequence),
+                parked.sequence,
+            );
+            self.write_volatile(
+                core::ptr::addr_of_mut!((*mailbox).response_action),
+                parked.response_action,
+            );
+            self.write_volatile(
+                core::ptr::addr_of_mut!((*mailbox).return_value),
+                parked.return_value,
+            );
+            self.write_volatile(
+                core::ptr::addr_of_mut!((*mailbox).resume_x16),
+                parked.resume_x16,
+            );
+            self.write_volatile(
+                core::ptr::addr_of_mut!((*mailbox).resume_x17),
+                parked.resume_x17,
+            );
+        }
+        self.state().store(parked.state, Ordering::Release);
+        Ok(())
     }
 
     /// Refresh the host pointer and generation after a VM/vCPU rebuild.
@@ -628,6 +737,88 @@ mod tests {
         );
         assert_eq!(
             mailbox.state.load(Ordering::Acquire),
+            MailboxState::ResponseReady.raw()
+        );
+    }
+
+    #[test]
+    fn reclaim_releases_slot_and_moves_outstanding_request_to_a_new_slot() {
+        let allocator = Arc::new(MailboxSlotAllocator::new());
+        let lease = allocator.allocate().expect("initial slot");
+        let mut old_mailbox = Box::new(Aarch64SyscallMailbox {
+            magic: 0,
+            version: 0,
+            size: 0,
+            generation: 0,
+            sequence: 0,
+            state: std::sync::atomic::AtomicU32::new(0),
+            trap_kind: 0,
+            response_action: 0,
+            flags: 0,
+            native_nr: 0,
+            args: [0; 6],
+            x8: 0,
+            resume_pc: 0,
+            spsr: 0,
+            fp: 0,
+            lr: 0,
+            sp: 0,
+            esr: 0,
+            return_value: 0,
+            resume_x16: 0,
+            resume_x17: 0,
+            reserved: [0; 72],
+        });
+        let old_pointer = NonNull::from(old_mailbox.as_mut());
+        let mut binding =
+            unsafe { MailboxBinding::new(lease, old_pointer, HvfSyscallTransport::Mailbox) };
+        publish_valid_request(&binding, &mut old_mailbox);
+        binding.take_request().expect("protocol").expect("request");
+
+        binding.release_for_reclaim().expect("park mailbox");
+        let occupier = allocator.allocate().expect("park released old slot");
+        assert_eq!(occupier.id().raw(), 0);
+        let resumed_lease = allocator.allocate().expect("resume slot");
+        assert_eq!(resumed_lease.id().raw(), 1);
+        let mut resumed_mailbox = Box::new(Aarch64SyscallMailbox {
+            magic: 0,
+            version: 0,
+            size: 0,
+            generation: 0,
+            sequence: 0,
+            state: std::sync::atomic::AtomicU32::new(0),
+            trap_kind: 0,
+            response_action: 0,
+            flags: 0,
+            native_nr: 0,
+            args: [0; 6],
+            x8: 0,
+            resume_pc: 0,
+            spsr: 0,
+            fp: 0,
+            lr: 0,
+            sp: 0,
+            esr: 0,
+            return_value: 0,
+            resume_x16: 0,
+            resume_x17: 0,
+            reserved: [0; 72],
+        });
+        let resumed_pointer = NonNull::from(resumed_mailbox.as_mut());
+        unsafe { binding.reacquire_after_reclaim(resumed_lease, resumed_pointer) }
+            .expect("move outstanding request");
+
+        assert_eq!(binding.slot().raw(), 1);
+        assert_eq!(resumed_mailbox.sequence, 1);
+        assert_eq!(binding.sequence(), 1);
+        assert_eq!(
+            resumed_mailbox.state.load(Ordering::Acquire),
+            MailboxState::RequestReady.raw()
+        );
+        binding.publish_normal_return(77).expect("response");
+        assert_eq!(resumed_mailbox.return_value, 77);
+        assert_eq!(
+            resumed_mailbox.state.load(Ordering::Acquire),
             MailboxState::ResponseReady.raw()
         );
     }

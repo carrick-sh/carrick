@@ -83,6 +83,48 @@ pub(super) fn inventory_capacity_for_extents(
     })
 }
 
+/// A scheduler lease reserved before HVPatch takes the shared-VM topology lock.
+/// It is transferred to the child host thread on successful spawn; every
+/// pre-spawn failure releases it through this guard.
+struct ReservedProcessVcpuLease {
+    scheduler: &'static dyn carrick_hal::VcpuScheduler,
+    lease: Option<carrick_hal::SlotLease>,
+}
+
+impl ReservedProcessVcpuLease {
+    fn install_for_current_thread(mut self) -> carrick_hal::SlotLease {
+        let Some(lease) = self.lease.take() else {
+            std::process::abort();
+        };
+        carrick_hal::vcpu_sched::set_current_lease(lease);
+        lease
+    }
+}
+
+impl Drop for ReservedProcessVcpuLease {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            self.scheduler.release(lease, carrick_hal::Yield::Exited);
+        }
+    }
+}
+
+/// Admit an HVPatch fork child to the same bounded vCPU pool as a clone-thread
+/// sibling before entering the topology transaction. HVPatch keeps every Linux
+/// process in one host process and one HVF VM, so process leaders consume the
+/// same finite `hv_vcpu_create` resource as threads do. Reserving outside the
+/// topology lock is load-bearing: a current slot owner may need that lock to
+/// reach a reclaim-safe wait and free capacity.
+fn reserve_hvpatch_process_vcpu_lease(
+    scheduler: &'static dyn carrick_hal::VcpuScheduler,
+    tid: ThreadId,
+) -> ReservedProcessVcpuLease {
+    ReservedProcessVcpuLease {
+        scheduler,
+        lease: Some(scheduler.acquire(tid.raw() as u64)),
+    }
+}
+
 /// Process-wide fork quiesce barrier (defined in `fork_quiesce` so the blocking
 /// wait predicates can reach the same instance).
 pub(crate) fn fork_barrier() -> &'static crate::fork_quiesce::QuiesceBarrier {
@@ -952,6 +994,21 @@ where
                 "in-process fork requested without a process-local barrier".to_owned(),
             )
         })?;
+        let clone_flags = carrick_abi::LinuxCloneFlags::from_bits_retain(request.flags);
+        let clone_plan = match crate::kernel::ClonePlan::from_flags(clone_flags) {
+            Ok(plan) => plan,
+            Err(_) => {
+                return Ok(Some(crate::linux_abi::LINUX_EINVAL.guest_retval()));
+            }
+        };
+        // Reserve a physical vCPU slot BEFORE quiescing this task or taking the
+        // shared-VM topology lock. Reserving inside the child materializer can
+        // deadlock: an existing slot owner may need the topology lock to reach
+        // its blocking-wait reclaim, while the parent holds that lock waiting
+        // for the child to report materialized. The lease is not installed in
+        // this parent thread; its RAII owner moves to the child below.
+        let reserved_child_vcpu =
+            reserve_hvpatch_process_vcpu_lease(carrick_hal::vcpu_sched::global(), self.this_tid);
         while !process_barrier.try_begin_fork() {
             if process_barrier.is_quiescing() {
                 self.release_and_park_vcpu_for_fork(engine)?;
@@ -1045,17 +1102,6 @@ where
         );
 
         fork_stage_started = Instant::now();
-        let clone_flags = carrick_abi::LinuxCloneFlags::from_bits_retain(request.flags);
-        let clone_plan = match crate::kernel::ClonePlan::from_flags(clone_flags) {
-            Ok(plan) => plan,
-            Err(_) => {
-                if quiesced {
-                    process_barrier.end_quiesce();
-                }
-                process_barrier.end_fork();
-                return Ok(Some(crate::linux_abi::LINUX_EINVAL.guest_retval()));
-            }
-        };
         let shares_mm = clone_plan.mm() == crate::kernel::CloneObjectMode::Share;
         let reservation = match parent_process.kernel_graph().reserve_fork(
             parent_context,
@@ -1322,6 +1368,18 @@ where
         let handle = match std::thread::Builder::new()
             .name(format!("guest-pid-{child_pid}"))
             .spawn(move || {
+                // Transfer the pre-topology reservation onto the child host
+                // thread before `hv_vcpu_create`. The closure owns the RAII
+                // reservation, so a host-thread spawn failure also releases it.
+                let lease = reserved_child_vcpu.install_for_current_thread();
+                let _pre_loop_lease_guard = VcpuLeaseGuard;
+                crate::probes::mn_admit(
+                    child_tid.raw(),
+                    lease.slot,
+                    carrick_hal::vcpu_sched::global()
+                        .budget()
+                        .min(u32::MAX as usize) as u32,
+                );
                 let mut child_engine = match E::materialize_process(spec) {
                     Ok(engine) => engine,
                     Err(error) => {
@@ -1675,6 +1733,34 @@ mod pt_pause_tests {
 
     fn tid(raw: i32) -> ThreadId {
         ThreadId::synthetic_for_tests(raw)
+    }
+
+    #[test]
+    fn hvpatch_process_materialization_waits_for_a_vcpu_lease() {
+        use carrick_hal::VcpuScheduler;
+
+        let scheduler: &'static carrick_hal::vcpu_sched::HostCondvarScheduler = Box::leak(
+            Box::new(carrick_hal::vcpu_sched::HostCondvarScheduler::new(1)),
+        );
+        let first = scheduler.acquire(1601);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let waiter = std::thread::spawn(move || {
+            let lease = reserve_hvpatch_process_vcpu_lease(scheduler, tid(1602));
+            tx.send(lease).unwrap();
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "a fork child must not materialize beyond the bounded vCPU pool"
+        );
+        scheduler.release(first, carrick_hal::Yield::Exited);
+        let second = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("released capacity admits the queued fork child");
+        drop(second);
+        waiter.join().unwrap();
+        let third = scheduler.acquire(1603);
+        scheduler.release(third, carrick_hal::Yield::Exited);
     }
 
     #[test]

@@ -1382,6 +1382,7 @@ impl SyscallDispatcher {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open_at_path_string(
         &self,
         context: &crate::kernel::KernelContext,
