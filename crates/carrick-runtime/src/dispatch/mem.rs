@@ -236,6 +236,12 @@ pub(super) struct MemState {
     /// before it owns host/stage-2 backing. Fork clones both inventories;
     /// munmap/MAP_FIXED replacement trims both atomically.
     host_alias_backed_ranges: Vec<crate::vfs::GuestMemoryRange>,
+    /// Linux VMAs whose guest VA is implemented by a non-identity host alias.
+    /// Unlike `host_alias_backed_ranges`, this also includes lazy PROT_NONE
+    /// reservations that have not acquired a physical frame yet. Keeping the
+    /// routing identity explicit is required for low `MAP_FIXED` VAs: address
+    /// shape alone cannot distinguish a replaced ELF hole from eager RAM.
+    alias_vma_ranges: Vec<crate::vfs::GuestMemoryRange>,
     /// Original bytes for mappings that have used remap_file_pages(2). Carrick's
     /// low fixed MAP_SHARED path is byte-backed guest memory rather than a live
     /// nonlinear VM object, so remap_file_pages copies windows from this stable
@@ -316,6 +322,7 @@ impl MemState {
             address_space_regions: None,
             dynamic_maps: Vec::new(),
             host_alias_backed_ranges: Vec::new(),
+            alias_vma_ranges: Vec::new(),
             remap_snapshots: std::collections::HashMap::new(),
             bus_fault_ranges: Vec::new(),
             locked_ranges: Vec::new(),
@@ -1003,6 +1010,7 @@ fn remove_mapping_metadata_locked(mem: &mut MemState, start: u64, len: u64) {
     remove_fault_range(&mut mem.resident_fault_ranges, remove);
     locked_ranges_remove(&mut mem.write_sealed_shared_maps, remove);
     locked_ranges_remove(&mut mem.host_alias_backed_ranges, remove);
+    locked_ranges_remove(&mut mem.alias_vma_ranges, remove);
 }
 
 fn trim_core_file_mappings_for_range(
@@ -1238,6 +1246,7 @@ impl SyscallDispatcher {
                 .sort_by_key(|mapping| (mapping.start, mapping.end));
         }
         locked_ranges_insert(&mut mem.host_alias_backed_ranges, replacement);
+        locked_ranges_insert(&mut mem.alias_vma_ranges, replacement);
         let entry = ProcMapsEntry {
             start: commit.start,
             end,
@@ -1614,6 +1623,27 @@ impl SyscallDispatcher {
             .host_alias_backed_ranges
             .iter()
             .any(|range| range.start().raw() <= start && range.end().raw() >= end)
+    }
+
+    fn range_is_alias_vma(&self, start: u64, len: u64) -> bool {
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        self.mem
+            .lock()
+            .alias_vma_ranges
+            .iter()
+            .any(|range| range.start().raw() <= start && range.end().raw() >= end)
+    }
+
+    fn record_alias_vma(&self, start: u64, len: u64) {
+        let Some(end) = start.checked_add(len) else {
+            std::process::abort();
+        };
+        let Some(range) = crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)) else {
+            std::process::abort();
+        };
+        locked_ranges_insert(&mut self.mem.lock().alias_vma_ranges, range);
     }
 
     /// Recover the one source VMA `mremap` is allowed to transform. Combining
@@ -2874,9 +2904,13 @@ impl SyscallDispatcher {
             let fixed_anonymous = map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                 && map_flags.contains(LinuxMmapFlags::FIXED);
             let layout = this.mem.lock().layout;
-            if (reused || fixed_anonymous)
-                && !mmap_address_uses_alias(address, length, layout)
-            {
+            let address_uses_alias = mmap_request_uses_alias(
+                this.execution_backend(),
+                map_flags.contains(LinuxMmapFlags::FIXED),
+                mmap_address_uses_alias(address, length, layout),
+                memory.read_bytes_raw(address, 1).is_ok(),
+            );
+            if (reused || fixed_anonymous) && !address_uses_alias {
                 // Scrub the reused region's PHYSICAL backing. MUST bypass the
                 // guest-visible permission: a region just reclaimed from munmap
                 // is stage-1-invalidated (no-access) and a PROT_NONE mmap is not
@@ -2923,6 +2957,7 @@ impl SyscallDispatcher {
                 // benign (KVM/NVMM host-map lazily, HVF maps the arena eagerly).
                 if memory.protect_range(address, length_usize, 0).is_err()
                     && (in_arena || memory.supports_concurrent_exec_protection())
+                    && !address_uses_alias
                 {
                     mark_range_unmapped(memory, address, length_usize);
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
@@ -2936,6 +2971,9 @@ impl SyscallDispatcher {
                     String::new(),
                     None,
                 );
+                if address_uses_alias {
+                    this.record_alias_vma(address, length);
+                }
                 if map_flags.contains(LinuxMmapFlags::GROWSDOWN) {
                     this.record_growdown_mapping(address, length);
                 }
@@ -2946,7 +2984,7 @@ impl SyscallDispatcher {
             }
 
             if map_flags.contains(LinuxMmapFlags::ANONYMOUS)
-                && !mmap_address_uses_alias(address, length, layout)
+                && !address_uses_alias
             {
                 let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
                 memory.set_mapping_protection_and_sharing(
@@ -3030,7 +3068,7 @@ impl SyscallDispatcher {
                 && !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                 && !map_flags.contains(LinuxMmapFlags::GROWSDOWN)
                 && !prot_flags.contains(LinuxProtFlags::EXEC)
-                && !mmap_address_uses_alias(address, length, layout)
+                && !address_uses_alias
                 && mmap_file_backed_lowering_enabled()
                 && let Some(open_file) = this.open_file(fd.0)
             {
@@ -3192,7 +3230,7 @@ impl SyscallDispatcher {
             // aperture use the same machinery so Linux-style advisory hints
             // (notably Go's 0xc000000000 arena probe) are preserved instead of
             // being relocated into the low mmap arena.
-            if mmap_address_uses_alias(address, length, layout) {
+            if address_uses_alias {
                 if prot_flags.contains(LinuxProtFlags::WRITE | LinuxProtFlags::EXEC)
                     && let Some(reason) =
                         this.native16k_write_exec_rejection(&*memory, cx.thread, false, true)
@@ -3540,7 +3578,9 @@ impl SyscallDispatcher {
             // to assert EINVAL) are already rejected by the alignment gate above;
             // addresses >= 2^48 stay EINVAL via the range check below.
             let layout = this.mem.lock().layout;
-            if mmap_address_uses_alias(address.0, length, layout) {
+            if this.range_is_alias_vma(address.0, length)
+                || mmap_address_uses_alias(address.0, length, layout)
+            {
                 let Ok(len_usize) = usize::try_from(aligned_len) else {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
@@ -3908,7 +3948,8 @@ impl SyscallDispatcher {
                         }
                         let unmap_result = if !tracked_shared
                             && !tracked_overlay
-                            && mmap_address_uses_alias(old_address.0, old_size, layout)
+                            && (this.range_is_alias_vma(old_address.0, old_size)
+                                || mmap_address_uses_alias(old_address.0, old_size, layout))
                         {
                             memory.unmap_alias_range(tail_start, tail_len_usize)
                         } else {
@@ -4249,6 +4290,8 @@ impl SyscallDispatcher {
                 .protections()
                 .is_some_and(|p| p.range_unmapped(address.0, len));
             let layout = this.mem.lock().layout;
+            let address_is_alias_vma = this.range_is_alias_vma(address.0, length)
+                || mmap_address_uses_alias(address.0, length, layout);
             // Complete VMA metadata answers whether the Linux address range is
             // mapped; it does NOT answer whether a deliberately-lazy anonymous
             // high-VA reservation has acquired physical alias backing. The
@@ -4259,7 +4302,7 @@ impl SyscallDispatcher {
             // the range, and unmap/replacement trims it with the VMA metadata.
             let lazy_alias_reservation = (!metadata_says_unmapped
                 && !prot_flags.is_empty()
-                && mmap_address_uses_alias(address.0, length, layout)
+                && address_is_alias_vma
                 && !this.range_has_host_alias_backing(address.0, length))
             .then(|| this.mremap_mapping_metadata(cx.memory, address.0, length).ok())
             .flatten();
@@ -4290,7 +4333,7 @@ impl SyscallDispatcher {
                 // answering ENOMEM (LTP mprotect01).
                 if !metadata_says_unmapped
                     && !prot_flags.is_empty()
-                    && mmap_address_uses_alias(address.0, length, layout)
+                    && address_is_alias_vma
                     && let Some(ipa) = alloc_alias_ipa_for_publication(
                         this.execution_backend(),
                         length,
@@ -4362,7 +4405,7 @@ impl SyscallDispatcher {
                     cx.memory,
                     cx.thread,
                     this.range_intersects_shared_mapping(address.0, length),
-                    mmap_address_uses_alias(address.0, length, layout),
+                    address_is_alias_vma,
                 )
             {
                 cx.reporter.record(CompatEvent::partial_syscall(
@@ -4716,6 +4759,7 @@ impl SyscallDispatcher {
                 .iter()
                 .any(|(range, _)| overlaps(range))
             || mem.host_alias_backed_ranges.iter().any(overlaps)
+            || mem.alias_vma_ranges.iter().any(overlaps)
     }
 
     fn mark_range_resident(&self, start: u64, len: u64) {
@@ -5087,6 +5131,23 @@ fn mmap_address_uses_alias(address: u64, length: u64, layout: MemoryLayout) -> b
     range_within(address, length, alias_low_base, stack_base - alias_low_base)
 }
 
+/// HVPatch cannot create a new identity stage-2 mapping at a low arbitrary VA
+/// after vCPU creation. A `MAP_FIXED` request outside the boot backing must use
+/// the same global-frame alias path as high VAs. Other backends retain their
+/// address-shaped policy, and an already-backed HVPatch range stays identity so
+/// ordinary arena/ELF replacements do not allocate needless aliases.
+fn mmap_request_uses_alias(
+    backend: crate::page_profile::ExecutionBackend,
+    fixed: bool,
+    address_uses_alias: bool,
+    has_identity_backing: bool,
+) -> bool {
+    address_uses_alias
+        || (backend == crate::page_profile::ExecutionBackend::HvPatch
+            && fixed
+            && !has_identity_backing)
+}
+
 /// Select the legacy dispatcher IPA token for an alias publication.
 ///
 /// HVPatch assigns the real, reusable global frame IPA in its backend after
@@ -5204,6 +5265,28 @@ mod tests {
             address,
             LINUX_PAGE_SIZE,
             MemoryLayout::hvf_default(),
+        ));
+    }
+
+    #[test]
+    fn hvpatch_low_fixed_hole_uses_alias_but_backed_identity_range_does_not() {
+        assert!(mmap_request_uses_alias(
+            crate::page_profile::ExecutionBackend::HvPatch,
+            true,
+            false,
+            false,
+        ));
+        assert!(!mmap_request_uses_alias(
+            crate::page_profile::ExecutionBackend::HvPatch,
+            true,
+            false,
+            true,
+        ));
+        assert!(!mmap_request_uses_alias(
+            crate::page_profile::ExecutionBackend::Vmm,
+            true,
+            false,
+            false,
         ));
     }
 
@@ -10935,6 +11018,49 @@ mod tests {
             "fresh high-VA anonymous mmap should use the zeroed host anon alias without carrying a zero payload"
         );
         assert_eq!(memory.write_calls.get(), 0);
+        assert_eq!(memory.zero_backing_calls.get(), 0);
+        assert_eq!(memory.protect_calls.get(), 0);
+    }
+
+    #[test]
+    fn hvpatch_low_fixed_hole_maps_a_host_alias() {
+        const SYS_MMAP: u64 = 222;
+        const VA: u64 = 0x1_0000_0000;
+
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_execution_backend(crate::page_profile::ExecutionBackend::HvPatch);
+        let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize);
+        let reporter = CompatReporter::default();
+        let request = SyscallRequest::new(
+            SYS_MMAP,
+            SyscallArgs([
+                VA,
+                LINUX_PAGE_SIZE,
+                LINUX_PROT_READ | LINUX_PROT_WRITE,
+                LINUX_MAP_FIXED | LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                u64::MAX,
+                0,
+            ]),
+        );
+
+        let outcome = dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                request,
+                &mut memory,
+                &reporter,
+            )
+            .expect("low fixed HVPatch mmap dispatch");
+
+        let DispatchOutcome::MapHostAlias {
+            va, len, payload, ..
+        } = outcome
+        else {
+            panic!("expected low fixed hole to use an alias, got {outcome:?}");
+        };
+        assert_eq!(va, GuestVa(VA));
+        assert_eq!(len, LINUX_PAGE_SIZE);
+        assert!(payload.is_empty());
         assert_eq!(memory.zero_backing_calls.get(), 0);
         assert_eq!(memory.protect_calls.get(), 0);
     }
