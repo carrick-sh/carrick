@@ -4662,28 +4662,34 @@ where
                 let published_status = crate::kernel::LinuxWaitStatus::from_wait_encoding(
                     final_result.wait_status_encoding(core_dumped),
                 );
-                let current_parent = match process.publish_exit_status(published_status) {
-                    Ok(parent) => parent,
-                    Err(error) => {
-                        if let Some(publication) = &core_publication {
-                            if let Err(cleanup_error) =
-                                kernel.dispatcher.rollback_core_publication(publication)
-                            {
-                                tracing::error!(
-                                    pid = process.pid(),
-                                    %cleanup_error,
-                                    "HVPatch core rollback also failed during terminal abort"
-                                );
-                            }
+                let orphan_adopter = kernel.dispatcher.hvpatch_orphan_adopter();
+                let current_parent =
+                    match process.publish_exit_status(published_status, orphan_adopter, |parent| {
+                        if child {
+                            kernel.notify_hvpatch_parent_exit(parent);
                         }
-                        tracing::error!(
-                            pid = process.pid(),
-                            %error,
-                            "terminal owner could not publish authoritative Kernel exit"
-                        );
-                        std::process::abort();
-                    }
-                };
+                    }) {
+                        Ok(parent) => parent,
+                        Err(error) => {
+                            if let Some(publication) = &core_publication {
+                                if let Err(cleanup_error) =
+                                    kernel.dispatcher.rollback_core_publication(publication)
+                                {
+                                    tracing::error!(
+                                        pid = process.pid(),
+                                        %cleanup_error,
+                                        "HVPatch core rollback also failed during terminal abort"
+                                    );
+                                }
+                            }
+                            tracing::error!(
+                                pid = process.pid(),
+                                %error,
+                                "terminal owner could not publish authoritative Kernel exit"
+                            );
+                            std::process::abort();
+                        }
+                    };
                 if let Some(publication) = &core_publication {
                     crate::probes::hvpatch_core_lifecycle(
                         5,
@@ -4709,9 +4715,6 @@ where
                     parent = ?current_parent,
                     "finalizing authoritative HVPatch process"
                 );
-                if child {
-                    kernel.notify_hvpatch_parent_exit(current_parent);
-                }
                 kernel.unregister_hvpatch_runtime_endpoint();
 
                 let topology = crate::fork_quiesce::acquire_topology_lock(

@@ -382,6 +382,14 @@ impl PreparedTaskExit {
         let kernel = Arc::clone(&self.reservation.kernel);
         kernel.commit_task_exit(self)
     }
+
+    pub fn commit_notifying(
+        self,
+        notify_parent: impl FnOnce(Option<TaskKey>),
+    ) -> Result<Zombie, KernelOperationError> {
+        let kernel = Arc::clone(&self.reservation.kernel);
+        kernel.commit_task_exit_notifying(self, notify_parent)
+    }
 }
 
 /// Typed permission to prepare work against one exact task topology revision.
@@ -2600,6 +2608,31 @@ impl Kernel {
         status: LinuxWaitStatus,
         failpoint: Option<KernelFailpoint>,
     ) -> Result<PreparedTaskExit, KernelOperationError> {
+        self.prepare_task_exit_key_for_adopter(task_key, status, None, failpoint)
+    }
+
+    /// Reserve an exit that reparents the task's children to one exact live
+    /// ancestor instead of the run root. Linux child subreapers use this path:
+    /// the dispatcher supplies the nearest inherited subreaper as a generation-
+    /// authenticated [`TaskKey`], and the same topology transaction reserves it
+    /// with the exiting task and every child.
+    pub fn prepare_task_exit_key_with_adopter(
+        self: &Arc<Self>,
+        task_key: TaskKey,
+        status: LinuxWaitStatus,
+        adopter: TaskKey,
+        failpoint: Option<KernelFailpoint>,
+    ) -> Result<PreparedTaskExit, KernelOperationError> {
+        self.prepare_task_exit_key_for_adopter(task_key, status, Some(adopter), failpoint)
+    }
+
+    fn prepare_task_exit_key_for_adopter(
+        self: &Arc<Self>,
+        task_key: TaskKey,
+        status: LinuxWaitStatus,
+        explicit_adopter: Option<TaskKey>,
+        failpoint: Option<KernelFailpoint>,
+    ) -> Result<PreparedTaskExit, KernelOperationError> {
         self.sweep_retired_threads();
         let task_id = task_key.id;
         let transaction = self.object_ids().transaction_id()?;
@@ -2628,18 +2661,53 @@ impl Kernel {
         // already become a zombie, the descendant is an orphan with no live
         // adopter; targeting the retired root would make terminal cleanup fail
         // closed after the guest process has already exited.
-        let adopter = (task_key != state.root)
-            .then(|| {
-                state
+        let adopter = if let Some(adopter_key) = explicit_adopter {
+            let adopter_record = state
+                .tasks
+                .get(&adopter_key.id)
+                .ok_or(KernelOperationError::UnknownTask(adopter_key.id))?;
+            if adopter_record.task.key() != adopter_key {
+                return Err(KernelOperationError::StaleTaskGeneration(adopter_key.id));
+            }
+            if adopter_record.task.lifecycle() != TaskLifecycle::Live {
+                return Err(KernelOperationError::UnknownTask(adopter_key.id));
+            }
+
+            // An adopter must already be in the exiting task's authoritative
+            // ancestry. This rejects accidental child/self adoption, which
+            // would introduce a cycle when the children are published below.
+            let mut ancestor = task.parent();
+            let mut authenticated = false;
+            while let Some(ancestor_key) = ancestor {
+                if ancestor_key == adopter_key {
+                    authenticated = true;
+                    break;
+                }
+                let ancestor_record = state
                     .tasks
-                    .get(&state.root.id)
-                    .filter(|record| {
-                        record.task.key() == state.root
-                            && record.task.lifecycle() == TaskLifecycle::Live
-                    })
-                    .map(|record| record.task.key())
-            })
-            .flatten();
+                    .get(&ancestor_key.id)
+                    .filter(|record| record.task.key() == ancestor_key)
+                    .ok_or(KernelOperationError::ExitTopologyChanged(ancestor_key.id))?;
+                ancestor = ancestor_record.task.parent();
+            }
+            if !authenticated {
+                return Err(KernelOperationError::ExitTopologyChanged(adopter_key.id));
+            }
+            Some(adopter_key)
+        } else {
+            (task_key != state.root)
+                .then(|| {
+                    state
+                        .tasks
+                        .get(&state.root.id)
+                        .filter(|record| {
+                            record.task.key() == state.root
+                                && record.task.lifecycle() == TaskLifecycle::Live
+                        })
+                        .map(|record| record.task.key())
+                })
+                .flatten()
+        };
         let mut children = task.children();
         children.sort_by_key(|child| child.serial);
 
@@ -2711,9 +2779,14 @@ impl Kernel {
     /// backend retirement. All expected operational failure is resolved by
     /// `prepare_task_exit`; errors here denote an internal breach of the
     /// reservation contract, not a guest-visible retry condition.
-    fn commit_task_exit(
+    fn commit_task_exit(&self, prepared: PreparedTaskExit) -> Result<Zombie, KernelOperationError> {
+        self.commit_task_exit_notifying(prepared, |_| {})
+    }
+
+    fn commit_task_exit_notifying(
         &self,
         mut prepared: PreparedTaskExit,
+        notify_parent: impl FnOnce(Option<TaskKey>),
     ) -> Result<Zombie, KernelOperationError> {
         let mut state = self.registry().state.write();
         prepared.reservation.validate(&state)?;
@@ -2822,12 +2895,19 @@ impl Kernel {
                 _task_claim: task_claim,
             },
         );
-        prepared.reservation.commit(&mut state)?;
         // Detach this exact task generation's watchers before the zombie can
         // be consumed and its numeric claim eventually reused. Callbacks stay
         // outside the registry lock, but a later generation can no longer be
         // mistaken for this exit.
         let subscribers = self.exit_subscribers.take(prepared.task);
+        drop(state);
+        // Queue the parent's exit notification while every affected task is
+        // still reserved. A consuming wait sees the durable zombie above but
+        // gets TaskBusy until the signal is pending; this matches Linux's
+        // observable ordering for a SIGCHLD handler immediately after waitpid.
+        notify_parent(prepared.result_zombie.parent);
+        let mut state = self.registry().state.write();
+        prepared.reservation.commit(&mut state)?;
         drop(state);
         for files in &exiting_file_tables {
             self.retire_file_table_if_unreferenced(files);
@@ -2863,10 +2943,59 @@ impl Kernel {
         task: TaskKey,
         status: LinuxWaitStatus,
     ) -> Result<Zombie, KernelOperationError> {
+        self.exit_task_key_eventually_for_adopter(task, status, None)
+    }
+
+    /// Publish terminal state and reparent children to one exact live ancestor,
+    /// waiting through overlapping topology reservations just like the default
+    /// run-root adoption path.
+    pub fn exit_task_key_eventually_with_adopter(
+        self: &Arc<Self>,
+        task: TaskKey,
+        status: LinuxWaitStatus,
+        adopter: TaskKey,
+    ) -> Result<Zombie, KernelOperationError> {
+        self.exit_task_key_eventually_for_adopter(task, status, Some(adopter))
+    }
+
+    fn exit_task_key_eventually_for_adopter(
+        self: &Arc<Self>,
+        task: TaskKey,
+        status: LinuxWaitStatus,
+        adopter: Option<TaskKey>,
+    ) -> Result<Zombie, KernelOperationError> {
+        self.exit_task_key_eventually_for_adopter_notifying(task, status, adopter, |_| {})
+    }
+
+    /// Publish terminal state while queueing the exact parent's notification
+    /// before releasing waiters on the exit reservation.
+    pub fn exit_task_key_eventually_notifying(
+        self: &Arc<Self>,
+        task: TaskKey,
+        status: LinuxWaitStatus,
+        adopter: Option<TaskKey>,
+        notify_parent: impl FnOnce(Option<TaskKey>),
+    ) -> Result<Zombie, KernelOperationError> {
+        self.exit_task_key_eventually_for_adopter_notifying(task, status, adopter, notify_parent)
+    }
+
+    fn exit_task_key_eventually_for_adopter_notifying(
+        self: &Arc<Self>,
+        task: TaskKey,
+        status: LinuxWaitStatus,
+        adopter: Option<TaskKey>,
+        notify_parent: impl FnOnce(Option<TaskKey>),
+    ) -> Result<Zombie, KernelOperationError> {
+        let mut notify_parent = Some(notify_parent);
         loop {
             let observed = self.reservation_epoch();
-            match self.prepare_task_exit_key(task, status, None) {
-                Ok(prepared) => return prepared.commit(),
+            match self.prepare_task_exit_key_for_adopter(task, status, adopter, None) {
+                Ok(prepared) => {
+                    let Some(notify_parent) = notify_parent.take() else {
+                        return Err(KernelOperationError::StaleReservation);
+                    };
+                    return prepared.commit_notifying(notify_parent);
+                }
                 Err(KernelOperationError::TaskBusy(_)) => {
                     self.wait_for_reservation_change(observed);
                 }
@@ -3541,6 +3670,84 @@ mod tests {
             .expect("child exit");
         assert_eq!(zombie.parent, Some(root.task().key()));
         assert_ne!(zombie.parent, Some(parent.task().key()));
+    }
+
+    #[test]
+    fn explicit_subreaper_adopts_orphans_at_exit_publication() {
+        let (kernel, root) = bootstrap(78);
+        let fork_plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
+        let subreaper = kernel
+            .fork_task(
+                &root,
+                fork_plan,
+                ThreadId::synthetic_for_tests(9_080),
+                "subreaper".to_string(),
+                None,
+            )
+            .expect("subreaper");
+        let parent = kernel
+            .fork_task(
+                &subreaper,
+                fork_plan,
+                ThreadId::synthetic_for_tests(9_081),
+                "parent".to_string(),
+                None,
+            )
+            .expect("parent");
+        let child = kernel
+            .fork_task(
+                &parent,
+                fork_plan,
+                ThreadId::synthetic_for_tests(9_082),
+                "orphan".to_string(),
+                None,
+            )
+            .expect("orphan");
+
+        let zombie = kernel
+            .exit_task_key_eventually_with_adopter(
+                parent.task().key(),
+                LinuxWaitStatus::from_wait_encoding(0),
+                subreaper.task().key(),
+            )
+            .expect("parent exit through exact subreaper");
+
+        assert_eq!(zombie.parent, Some(subreaper.task().key()));
+        assert_eq!(child.task().parent(), Some(subreaper.task().key()));
+        assert_eq!(kernel.validate_invariants(), Ok(()));
+    }
+
+    #[test]
+    fn exit_notification_precedes_reservation_release() {
+        let (kernel, root) = bootstrap(79);
+        let child = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(9_083),
+                "signal-before-wait".to_string(),
+                None,
+            )
+            .expect("child");
+        let hook_epoch = std::sync::atomic::AtomicU64::new(0);
+
+        kernel
+            .exit_task_key_eventually_notifying(
+                child.task().key(),
+                LinuxWaitStatus::from_wait_encoding(0),
+                None,
+                |parent| {
+                    assert_eq!(parent, Some(root.task().key()));
+                    hook_epoch.store(kernel.reservation_epoch(), Ordering::Release);
+                },
+            )
+            .expect("child exit");
+
+        assert_ne!(hook_epoch.load(Ordering::Acquire), 0);
+        assert!(
+            kernel.reservation_epoch() > hook_epoch.load(Ordering::Acquire),
+            "waiters must be released only after the parent notification hook",
+        );
     }
 
     #[test]

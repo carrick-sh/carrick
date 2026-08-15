@@ -627,15 +627,20 @@ pub(super) struct ProcState {
     /// `prctl(PR_SET_CHILD_SUBREAPER)` flag (0 = not a subreaper, default).
     /// Recorded and echoed back via PR_GET_CHILD_SUBREAPER.
     pub child_subreaper: i64,
-    /// Host pid that set `child_subreaper`. The bit is copied by host `fork`,
-    /// but Linux does not inherit child-subreaper status; the owner separates
-    /// "this process is a subreaper" from "this process has a subreaper
-    /// ancestor".
+    /// Linux-visible pid that set `child_subreaper`. The bit is copied by host
+    /// `fork`, but Linux does not inherit child-subreaper status; the owner
+    /// separates "this process is a subreaper" from "this process has a
+    /// subreaper ancestor". HVPatch uses its logical task id here because many
+    /// Linux processes share one host pid.
     pub child_subreaper_owner: u32,
     /// Nearest subreaper ancestor inherited by fork descendants. This is not
     /// reported by PR_GET_CHILD_SUBREAPER; it is the target used if this
     /// process's direct parent exits.
     pub subreaper_ancestor: u32,
+    /// Exact-generation form of `subreaper_ancestor` for HVPatch. A bare pid
+    /// can be reused before a descendant exits; terminal reparenting must never
+    /// adopt to a different task generation wearing the same number.
+    pub hvpatch_subreaper_ancestor: Option<crate::kernel::TaskKey>,
     /// `prctl(PR_SET_NO_NEW_PRIVS)` bit. Once set it cannot be cleared (one-way
     /// latch). The precondition for an unprivileged seccomp filter install.
     pub no_new_privs: bool,
@@ -802,6 +807,7 @@ impl ProcState {
             child_subreaper: 0,
             child_subreaper_owner: 0,
             subreaper_ancestor: 0,
+            hvpatch_subreaper_ancestor: None,
             no_new_privs: false,
             timerslack: LINUX_DEFAULT_TIMERSLACK_NS,
             timerslack_default: LINUX_DEFAULT_TIMERSLACK_NS,
@@ -829,6 +835,13 @@ impl ProcState {
         } else {
             self.subreaper_ancestor
         };
+        child.hvpatch_subreaper_ancestor = if self.child_subreaper != 0 {
+            self.hvpatch_process
+                .as_ref()
+                .map(crate::hvpatch::ProcessContext::task_key)
+        } else {
+            self.hvpatch_subreaper_ancestor
+        };
         child.child_subreaper = 0;
         child.child_subreaper_owner = 0;
         child.timerslack_default = self.timerslack;
@@ -837,6 +850,10 @@ impl ProcState {
         child.virtual_ptrace_stops.clear();
         child.membarrier_ready = 0;
         child
+    }
+
+    fn logical_pid(&self) -> u32 {
+        self.virtual_pid.unwrap_or_else(std::process::id)
     }
 
     /// The ISA this guest reports about *itself*. A native x86_64 guest
@@ -975,6 +992,9 @@ impl SyscallDispatcher {
             } else {
                 u32::try_from(unsafe { libc::getppid() }).unwrap_or(0)
             };
+            // This path is a real host fork. HVPatch clones ProcState through
+            // `fork_clone_in_process`, which records an exact task generation.
+            proc.hvpatch_subreaper_ancestor = None;
         }
         proc.child_subreaper = 0;
         proc.child_subreaper_owner = 0;
@@ -996,14 +1016,31 @@ impl SyscallDispatcher {
 
     pub(crate) fn subreaper_for_fork_child(&self) -> u32 {
         let proc = self.proc.lock();
-        let current = std::process::id();
+        let current = proc.logical_pid();
         if proc.child_subreaper != 0 && proc.child_subreaper_owner == current {
-            std::process::id()
+            current
         } else if proc.child_subreaper != 0 && proc.child_subreaper_owner != 0 {
             proc.child_subreaper_owner
         } else {
             proc.subreaper_ancestor
         }
+    }
+
+    /// Exact live HVPatch subreaper inherited by this process. Returning no
+    /// adopter deliberately falls back to the kernel run root: a retired exact
+    /// key must not be followed by numeric pid reuse.
+    pub(crate) fn hvpatch_orphan_adopter(&self) -> Option<crate::kernel::TaskKey> {
+        let proc = self.proc.lock();
+        let process = proc.hvpatch_process.as_ref()?;
+        proc.hvpatch_subreaper_ancestor
+            .filter(|adopter| process.kernel_graph().task_key_is_live(*adopter))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_child_subreaper_for_test(&self) {
+        let mut proc = self.proc.lock();
+        proc.child_subreaper = 1;
+        proc.child_subreaper_owner = proc.logical_pid();
     }
 
     pub(crate) fn clone_parent_host_pid(&self) -> u32 {
@@ -1631,7 +1668,7 @@ impl SyscallDispatcher {
                     let mut proc = this.proc.lock();
                     if arg2 != 0 {
                         proc.child_subreaper = 1;
-                        proc.child_subreaper_owner = std::process::id();
+                        proc.child_subreaper_owner = proc.logical_pid();
                     } else {
                         proc.child_subreaper = 0;
                         proc.child_subreaper_owner = 0;
@@ -1642,7 +1679,7 @@ impl SyscallDispatcher {
                     let proc = this.proc.lock();
                     let value = i32::from(
                         proc.child_subreaper != 0
-                            && proc.child_subreaper_owner == std::process::id(),
+                            && proc.child_subreaper_owner == proc.logical_pid(),
                     );
                     memory.write_bytes(arg2, &value.to_ne_bytes())?;
                     DispatchOutcome::Returned { value: 0 }
@@ -4564,12 +4601,27 @@ fn build_linux_sigchld_siginfo(
 
 #[cfg(test)]
 mod hvpatch_identity_tests {
-    use super::hvpatch_reported_tid;
+    use super::{ProcState, hvpatch_reported_tid};
 
     #[test]
     fn hvpatch_gettid_uses_the_kernel_thread_identity_only_on_that_lane() {
         assert_eq!(hvpatch_reported_tid(true, 7), Some(7));
         assert_eq!(hvpatch_reported_tid(false, 7), None);
+    }
+
+    #[test]
+    fn hvpatch_subreaper_inheritance_uses_linux_visible_pid() {
+        let mut parent = ProcState::new();
+        parent.virtual_pid = Some(41);
+        parent.child_subreaper = 1;
+        parent.child_subreaper_owner = parent.logical_pid();
+
+        let child = parent.fork_clone(41, 42);
+
+        assert_eq!(parent.child_subreaper_owner, 41);
+        assert_eq!(child.subreaper_ancestor, 41);
+        assert_eq!(child.child_subreaper, 0);
+        assert_eq!(child.child_subreaper_owner, 0);
     }
 }
 
