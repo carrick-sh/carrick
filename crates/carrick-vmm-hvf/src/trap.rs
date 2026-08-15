@@ -11114,6 +11114,24 @@ impl HvfInner {
         // Enable the MMU last, identically to the parent.
         vcpu.set_sys_reg(SysReg::SCTLR_EL1, snap.core.sctlr)
             .map_err(hvf_error)?;
+        // A new fork/clone vCPU starts with zeroed SIMD/FP state. Preserve the
+        // captured V0-V31 + FPSR/FPCR just as the ordinary restore path does;
+        // otherwise a raw clone loses live vector state in the child.
+        if fpsimd_save_enabled() {
+            let vcpu_id = vcpu.id();
+            for (i, reg) in SIMD_FP_TABLE.iter().enumerate() {
+                let rc = set_simd_fp_reg_v(vcpu_id, *reg, snap.core.vregs[i]);
+                if rc != 0 {
+                    return Err(TrapError::Hypervisor(format!(
+                        "thread-start restore set_simd_fp_reg(q{i}) failed: rc={rc:#x}"
+                    )));
+                }
+            }
+            vcpu.set_reg(Reg::FPSR, u64::from(snap.core.fpsr))
+                .map_err(hvf_error)?;
+            vcpu.set_reg(Reg::FPCR, u64::from(snap.core.fpcr))
+                .map_err(hvf_error)?;
+        }
         Ok(())
     }
 
