@@ -353,17 +353,13 @@ impl SyscallDispatcher {
                     // deletes the EVFILT_TIMER; KVM just clears the slot). No
                     // registered backend (a backing-loop-less unit test) → just
                     // clear the neutral slot.
-                    match crate::timer_delivery::delivery() {
+                    match this.timer_delivery() {
                         Some(d) => d.disarm_itimer(idx),
                         None => crate::itimer::disarm(idx),
                     }
                 } else {
                     let spec_ns = TimerSpecNs::from_durations(value, interval);
                     let needs_periodic = !interval.is_zero() && value != interval;
-                    // Write the neutral slot state FIRST (timer-core), then ask
-                    // the backend to initiate delivery.
-                    let generation = crate::itimer::arm(idx, spec_ns, needs_periodic);
-
                     let signum = crate::itimer::signum_for(idx);
                     let signal_name = match signum {
                         crate::linux_abi::LINUX_SIGVTALRM => "SIGVTALRM",
@@ -384,7 +380,21 @@ impl SyscallDispatcher {
                     // the shared wall-clock fallback thread (KVM, or an HVF
                     // process with no pump kqueue yet). No registered backend (a
                     // backing-loop-less unit test) also falls back.
-                    let owned = crate::timer_delivery::delivery()
+                    let delivery = this.timer_delivery();
+                    // One host process represents one Linux process on the
+                    // mature VMM/native lanes, so their neutral timer-core slot
+                    // remains process-global. HVPatch multiplexes Linux
+                    // processes as host threads: its exact-task delivery owns
+                    // independent slots and must not mutate this global state.
+                    let generation = if delivery
+                        .as_ref()
+                        .is_some_and(|delivery| delivery.owns_itimer_state())
+                    {
+                        0
+                    } else {
+                        crate::itimer::arm(idx, spec_ns, needs_periodic)
+                    };
+                    let owned = delivery
                         .is_some_and(|d| d.arm_itimer(idx, spec_ns, needs_periodic, signum));
                     if !owned {
                         crate::itimer::spawn_fallback_timer(idx, generation, spec_ns);
@@ -403,7 +413,7 @@ impl SyscallDispatcher {
             let previous = x86_alarm_remaining_seconds(this.proc.lock().itimers[idx]);
             if seconds == 0 {
                 this.proc.lock().itimers[idx] = None;
-                match crate::timer_delivery::delivery() {
+                match this.timer_delivery() {
                     Some(d) => d.disarm_itimer(idx),
                     None => crate::itimer::disarm(idx),
                 }
@@ -421,10 +431,17 @@ impl SyscallDispatcher {
             });
 
             let spec_ns = TimerSpecNs::from_durations(value, interval);
-            let generation = crate::itimer::arm(idx, spec_ns, false);
             let signum = crate::itimer::signum_for(idx);
-            let owned = crate::timer_delivery::delivery()
-                .is_some_and(|d| d.arm_itimer(idx, spec_ns, false, signum));
+            let delivery = this.timer_delivery();
+            let generation = if delivery
+                .as_ref()
+                .is_some_and(|delivery| delivery.owns_itimer_state())
+            {
+                0
+            } else {
+                crate::itimer::arm(idx, spec_ns, false)
+            };
+            let owned = delivery.is_some_and(|d| d.arm_itimer(idx, spec_ns, false, signum));
             if !owned {
                 crate::itimer::spawn_fallback_timer(idx, generation, spec_ns);
             }
@@ -572,7 +589,7 @@ impl SyscallDispatcher {
             // registered backend (a backing-loop-less unit test) → arm the
             // neutral registry directly (no firing thread, matching the old
             // pump-less path).
-            let old = match crate::timer_delivery::delivery() {
+            let old = match this.timer_delivery() {
                 Some(d) => d.arm_posix(id, spec_ns),
                 None => crate::posix_timer::arm(id, spec_ns),
             };

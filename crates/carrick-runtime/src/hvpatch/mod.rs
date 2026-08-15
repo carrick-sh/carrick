@@ -38,6 +38,227 @@ pub(crate) struct ProcessContext {
     mm_backend: std::sync::Arc<parking_lot::RwLock<std::sync::Arc<stage1_mm::Stage1MmBackend>>>,
 }
 
+#[derive(Clone)]
+struct ProcessTimerTarget {
+    kernel: std::sync::Weak<crate::kernel::Kernel>,
+    task: crate::kernel::TaskKey,
+}
+
+impl ProcessTimerTarget {
+    fn task(&self) -> Option<std::sync::Arc<crate::kernel::Task>> {
+        let kernel = self.kernel.upgrade()?;
+        if !kernel.task_key_is_live(self.task) {
+            return None;
+        }
+        kernel
+            .registry()
+            .task(self.task.id)
+            .filter(|task| task.key() == self.task)
+    }
+
+    fn cpu_ns(&self, which: usize) -> Option<u64> {
+        let task = self.task()?;
+        let user_ns = task.self_cpu_us().saturating_mul(1_000);
+        Some(if which == carrick_abi::LINUX_ITIMER_PROF as usize {
+            user_ns.saturating_add(task.self_system_cpu_us().saturating_mul(1_000))
+        } else {
+            user_ns
+        })
+    }
+
+    fn deliver(&self, signum: i32) -> bool {
+        if signum == 0 {
+            return self.task().is_some();
+        }
+        let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signum) else {
+            return false;
+        };
+        let Some(kernel) = self.kernel.upgrade() else {
+            return false;
+        };
+        kernel.post_signal_to_task_key(self.task, signal, None)
+    }
+}
+
+struct ProcessItimerSlot {
+    generation: std::sync::atomic::AtomicU64,
+    spec: parking_lot::Mutex<Option<carrick_hal::TimerSpecNs>>,
+}
+
+impl ProcessItimerSlot {
+    fn new() -> Self {
+        Self {
+            generation: std::sync::atomic::AtomicU64::new(0),
+            spec: parking_lot::Mutex::new(None),
+        }
+    }
+
+    fn replace(&self, spec: Option<carrick_hal::TimerSpecNs>) -> u64 {
+        use std::sync::atomic::Ordering;
+        let mut current = self.spec.lock();
+        let generation = self
+            .generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        *current = spec;
+        generation
+    }
+
+    fn generation_matches(&self, generation: u64) -> bool {
+        self.generation.load(std::sync::atomic::Ordering::Acquire) == generation
+    }
+
+    fn retire_one_shot(&self, generation: u64) {
+        let mut current = self.spec.lock();
+        if self.generation_matches(generation) {
+            *current = None;
+        }
+    }
+}
+
+pub(crate) struct ProcessTimerDelivery {
+    target: ProcessTimerTarget,
+    slots: [std::sync::Arc<ProcessItimerSlot>; carrick_timer_core::itimer::ITIMER_COUNT],
+}
+
+impl ProcessTimerDelivery {
+    fn new(process: &ProcessContext) -> Self {
+        Self {
+            target: ProcessTimerTarget {
+                kernel: std::sync::Arc::downgrade(process.kernel_graph()),
+                task: process.task_key(),
+            },
+            slots: std::array::from_fn(|_| std::sync::Arc::new(ProcessItimerSlot::new())),
+        }
+    }
+
+    fn drive_itimer(
+        target: ProcessTimerTarget,
+        slot: std::sync::Arc<ProcessItimerSlot>,
+        which: usize,
+        generation: u64,
+        spec: carrick_hal::TimerSpecNs,
+        signum: i32,
+    ) {
+        let cpu_timer = which == carrick_abi::LINUX_ITIMER_VIRTUAL as usize
+            || which == carrick_abi::LINUX_ITIMER_PROF as usize;
+        let mut due_cpu_ns = if cpu_timer {
+            let Some(now) = target.cpu_ns(which) else {
+                return;
+            };
+            now.saturating_add(spec.value)
+        } else {
+            std::thread::sleep(std::time::Duration::from_nanos(spec.value));
+            0
+        };
+
+        loop {
+            if !slot.generation_matches(generation) {
+                return;
+            }
+            if cpu_timer {
+                let Some(now) = target.cpu_ns(which) else {
+                    return;
+                };
+                if now < due_cpu_ns {
+                    std::thread::sleep(std::time::Duration::from_nanos(
+                        due_cpu_ns.saturating_sub(now).clamp(1, 1_000_000),
+                    ));
+                    continue;
+                }
+            }
+            if !target.deliver(signum) {
+                return;
+            }
+            if spec.interval == 0 {
+                slot.retire_one_shot(generation);
+                return;
+            }
+            if cpu_timer {
+                let Some(now) = target.cpu_ns(which) else {
+                    return;
+                };
+                due_cpu_ns = now.saturating_add(spec.interval);
+            } else {
+                std::thread::sleep(std::time::Duration::from_nanos(spec.interval));
+            }
+        }
+    }
+}
+
+impl Drop for ProcessTimerDelivery {
+    fn drop(&mut self) {
+        for slot in &self.slots {
+            slot.replace(None);
+        }
+    }
+}
+
+impl carrick_hal::TimerDelivery for ProcessTimerDelivery {
+    fn owns_itimer_state(&self) -> bool {
+        true
+    }
+
+    fn arm_itimer(
+        &self,
+        which: usize,
+        spec: carrick_hal::TimerSpecNs,
+        _needs_periodic: bool,
+        signum: i32,
+    ) -> bool {
+        let Some(slot) = self.slots.get(which).cloned() else {
+            return false;
+        };
+        let generation = slot.replace(Some(spec));
+        let target = self.target.clone();
+        let pid = self.target.task.id.raw();
+        let _ = std::thread::Builder::new()
+            .name(format!("carrick-hvpatch-itimer-{pid}-{which}"))
+            .spawn(move || {
+                Self::drive_itimer(target, slot, which, generation, spec, signum);
+            });
+        true
+    }
+
+    fn disarm_itimer(&self, which: usize) {
+        if let Some(slot) = self.slots.get(which) {
+            slot.replace(None);
+        }
+    }
+
+    fn arm_posix(
+        &self,
+        id: i32,
+        spec: carrick_hal::TimerSpecNs,
+    ) -> Option<carrick_hal::PosixTimerSpec> {
+        let armed = carrick_timer_core::posix::arm(id, spec)?;
+        if spec.value > 0 {
+            let target = self.target.clone();
+            let signum = armed.signum;
+            let generation = armed.generation;
+            let slot = armed.slot.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("carrick-hvpatch-ptimer-{id}"))
+                .spawn(move || {
+                    carrick_timer_core::posix::run_fallback(slot, generation, spec, || {
+                        let _ = target.deliver(signum);
+                    });
+                });
+        }
+        Some(armed.old)
+    }
+
+    fn disarm_posix(&self, id: i32) {
+        let _ = carrick_timer_core::posix::arm(id, carrick_hal::TimerSpecNs::DISARM);
+    }
+
+    fn current_arm(&self, _which: usize) -> Option<carrick_hal::TimerArm> {
+        // HVPatch interval timers are not inherited across fork. Exec retains
+        // this delivery object with its dispatcher, so no replay seam is needed.
+        None
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct PreparedProcessExec {
     kernel: crate::kernel::PreparedExec,
@@ -124,6 +345,10 @@ impl ProcessContext {
 
     pub(crate) fn task_binding(&self) -> crate::kernel::KernelTaskBinding {
         self.binding.clone()
+    }
+
+    pub(crate) fn process_timer_delivery(&self) -> std::sync::Arc<dyn carrick_hal::TimerDelivery> {
+        std::sync::Arc::new(ProcessTimerDelivery::new(self))
     }
 
     /// Linux-visible parent from the authoritative task graph. Dispatcher
@@ -1312,6 +1537,66 @@ mod tests {
                 .expect("child VMA source")
                 .vma_revision
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn process_timer_delivery_targets_only_the_exact_hvpatch_task() {
+        let (parent, root) = authoritative_root();
+        let prepared_mm = parent.mm_resources().prepare_child().unwrap();
+        let child_context = parent
+            .kernel_graph()
+            .reserve_fork(
+                &root,
+                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
+                    .unwrap(),
+                "timer-child".to_owned(),
+                None,
+            )
+            .unwrap()
+            .prepare_with_mm_backend(
+                prepared_mm.backend(),
+                crate::thread::ThreadId::synthetic_for_tests(10_001),
+            )
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_parts()
+            .unwrap()
+            .0;
+        let child_backend = parent
+            .mm_resources()
+            .publish_child(child_context.task().key(), prepared_mm)
+            .unwrap();
+        let child = parent.published_child_context(&child_context, child_backend);
+        let delivery = child.process_timer_delivery();
+
+        assert!(delivery.arm_itimer(
+            carrick_abi::LINUX_ITIMER_REAL as usize,
+            carrick_hal::TimerSpecNs {
+                value: 1_000_000,
+                interval: 0,
+            },
+            false,
+            carrick_abi::LINUX_SIGALRM,
+        ));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !child_context
+            .shared()
+            .pending_signals()
+            .present()
+            .contains(carrick_abi::LINUX_SIGALRM)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child timer did not publish to its exact pending queue"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            root.shared().pending_signals().present().is_empty(),
+            "child timer must not publish into the root process"
         );
     }
 
